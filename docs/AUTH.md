@@ -1,7 +1,8 @@
 # ClawChannel — 인증 설계 (AUTH)
 
-> 브라우저 위젯이 게이트웨이 WebSocket에 붙을 때의 **인증·신원(identity)** 모델.
+> 브라우저 클라이언트가 게이트웨이 WebSocket에 붙을 때의 **인증·신원(identity)** 모델.
 > 상태: **결정됨** — 기존 `BACKLOG.md`의 "브라우저 Auth 모델 (완전 OPEN)" 항목을 대체한다.
+> 용어(2026-06-15): "위젯"은 이제 무프레임워크 **`@clawchannel/client`**(`packages/client`)를 가리킨다. React `@clawchannel/widget`는 삭제됨 — `getTicket` 주입점은 client에 그대로 존재.
 > 핵심 원리: 인증을 코어에 하드코딩하지 않고 **주입 가능한 검증기(ConnectionVerifier) 한 점**으로 수렴시키고,
 > 흔한 방식은 **config로 고르는 빌트인 전략**으로 제공한다. (배포된 플러그인은 코드가 아니라 JSON config로 설정되므로)
 
@@ -103,13 +104,13 @@ createClawChannel({
 
 ## 6. 양쪽 패키지의 책임
 
-| | 플러그인 패키지 (서버) | 위젯 패키지 (브라우저) |
+| | 플러그인 패키지 (서버) | 클라이언트 패키지 (브라우저) |
 |---|---|---|
 | 역할 | 검증기(strategy) 실행 | ticket을 **호스트에게 받아** WS에 실어 보냄 |
 | 주입점 | `auth` config / 함수 | `getTicket: () => Promise<string>` 콜백 |
 | 재연결 | — | 끊기면 `getTicket` 재호출 → 새 표로 재연결 |
 
-- 위젯도 인증을 *모른다*. "호스트야 표 줘" 하고 나르기만. `trusted-header`/쿠키 방식이면 `getTicket`은 no-op.
+- 클라이언트도 인증을 *모른다*. "호스트야 표 줘" 하고 나르기만. `trusted-header`/쿠키 방식이면 `getTicket`은 no-op.
 - **ticket 발급 헬퍼:** `issueClawChannelTicket({ sub, secret, ttlSeconds })` — 호스트 백엔드가 서명에 사용.
   서명/검증 코드가 **두 독립 Node 프로세스(SaaS 백엔드 + 게이트웨이 플러그인)**에서 동일해야 하므로 **zero-dep**(SDK 안 물게)으로 제공. → `PACKAGING.md` §3 참조.
 
@@ -135,7 +136,7 @@ createClawChannel({
 | `src/inbound.ts` / `approvals.ts` | per-peer 라우팅 — 답변/progress는 캡처된 `wsKey`, 승인은 `turnSourceTo`(= 출발 peer) |
 | `index.ts` | config `channels.clawchannel.auth` → `resolveVerifier` → `transport.setVerifier` + WS·정적 라우트 |
 | `openclaw.plugin.json` | `channelConfigs.clawchannel.schema.auth`(strategy enum + ticketSecret string\|{env} + ticketParam) |
-| 위젯 `src/lib/useClawChannel.ts` | `getTicket` 주입 → `?ticket=` + 재연결 재발급 |
+| `@clawchannel/client` (`packages/client/src/client.ts`) | `getTicket` 주입 → `?ticket=` + 재연결 재발급. (구 위젯 훅 `useClawChannel.ts`는 삭제) |
 
 → **hmac-ticket E2E 라이브 검증됨(2026-06-15):** 유효 ticket 연결 + 에이전트 응답, 미·오 ticket 거절. (멀티유저 outbound/approval 라우팅 포함 — 더는 미해결 아님)
 
@@ -143,9 +144,9 @@ createClawChannel({
 
 ## 9. 미해결(후속)
 
-- **크로스오리진 게이트웨이 URL:** `useClawChannel`이 `window.location.host`로만 붙음 → 소비처가 게이트웨이와 다른 오리진이면 연결 불가. `url` 옵션 추가 필요(또는 same-origin 리버스 프록시).
-- **SaaS 실연동:** 현재 예제는 **브라우저에서 ticket 발급**(`example/devTicket.ts`, DEV 전용, 시크릿 노출). 실서비스는 SaaS 백엔드가 서버측 `issueClawChannelTicket`로 발급 → 위젯 `getTicket`이 호출. ticket 서명 모듈은 `@clawchannel/ticket`로 분리 후보(`PACKAGING.md` §3).
-- **세션 중 강제 만료(revocation):** 이미 열린 소켓은 자동으로 안 닫힘. SaaS 로그아웃/만료 시 즉시 끊으려면 별도 처리(heartbeat 재검증 또는 서버측 강제 close). 또한 **잘못된 ticket 시 위젯이 재연결 루프**(앰버) — "인증 실패" UX 미구현.
+- **크로스오리진 게이트웨이 URL:** `@clawchannel/client`는 `url` 옵션으로 **해결됨**(다른 오리진 게이트웨이 직접 지정). same-origin이면 `path`만으로 충분.
+- **SaaS 실연동:** 현재 데모는 **브라우저에서 ticket 발급**(`packages/client/demo/devTicket.ts`, DEV 전용, 시크릿 노출). 실서비스는 SaaS 백엔드가 서버측 `issueClawChannelTicket`로 발급 → 클라이언트 `getTicket`이 호출. ticket 서명 모듈은 `@clawchannel/ticket`로 분리 후보(`PACKAGING.md` §3).
+- **세션 중 강제 만료(revocation):** 이미 열린 소켓은 자동으로 안 닫힘. SaaS 로그아웃/만료 시 즉시 끊으려면 별도 처리(heartbeat 재검증 또는 서버측 강제 close). 또한 **잘못된 ticket 시 클라이언트가 재연결 루프**(앰버) — "인증 실패" UX 미구현.
 - `jwt` / `trusted-header` 빌트인, `createClawChannel({auth})` 커스텀 함수 주입은 후순위.
 - 멀티탭 사용자를 같은 peerId로 묶을지/탭별 분리할지 정책.
 

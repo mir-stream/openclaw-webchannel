@@ -3,7 +3,8 @@ import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 /**
- * Static asset serving for the ClawChannel example widget.
+ * Static asset serving for the ClawChannel chat UI (the @clawchannel/client
+ * vanilla demo).
  *
  * This module is intentionally free of `openclaw/plugin-sdk` and `ws` imports:
  * it is pure Node (`node:fs/promises`, `node:path`) so the security-critical
@@ -135,13 +136,13 @@ export function createStaticAssetsHandler(
       }
       if (!distExists) {
         console.warn(
-          "[clawchannel] widget dist not found — build the widget first " +
-            "(npm run build in clawchannel/widget)",
+          "[clawchannel] chat UI dist not found — build the demo first " +
+            "(npm run build:demo in packages/client)",
         );
         res.statusCode = 503;
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
         res.end(
-          "clawchannel: widget not built. Run `npm run build` in clawchannel/widget.",
+          "clawchannel: chat UI not built. Run `npm run build:demo` in packages/client.",
         );
         return true;
       }

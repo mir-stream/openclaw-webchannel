@@ -21,9 +21,9 @@ SaaS 임베드는 SaaS가 발급한 단명 서명 ticket을 플러그인이 검�
 
 ---
 
-## 🖥️ 위젯 호스팅 방식 — ✅ 게이트웨이 서빙 구현됨
+## 🖥️ 채팅 UI 호스팅 방식 — ✅ 게이트웨이 서빙 구현됨
 
-**상태:** 후보 ③(**플러그인이 게이트웨이 포트로 서빙**, `src/static-assets.ts` + `/clawchannel/` 라우트)을 **구현 완료**(PLAN.md Phase 3). dev는 Vite(프록시), 배포는 위젯 `vite build`(base `/clawchannel/`) 산출물을 게이트웨이가 서빙.
+**상태:** 후보 ③(**플러그인이 게이트웨이 포트로 서빙**, `src/static-assets.ts` + `/clawchannel/` 라우트)을 **구현 완료**(PLAN.md Phase 3). dev는 Vite(프록시), 배포는 **client 데모** `npm run build:demo`(→`packages/client/dist-demo`, base `/clawchannel/`) 산출물을 게이트웨이가 서빙. (구 React 위젯 서빙은 위젯 삭제로 대체됨.)
 - 잔여: ② 별도 정적 호스팅 / ④ `<script>` 임베드는 선택지로 남김. 별도 오리진 호스팅 시 **크로스오리진 WS URL 옵션**(아래) 필요.
 
 ---
@@ -31,12 +31,12 @@ SaaS 임베드는 SaaS가 발급한 단명 서명 ticket을 플러그인이 검�
 ## 📦 남은 작업 (2026-06-15 기준)
 
 **SaaS 임베드 경로**
-- **크로스오리진 게이트웨이 URL 옵션** — `useClawChannel`이 same-origin(`window.location.host`)만 지원. 소비처가 다른 오리진이면 `url` 옵션 필요. (`file:`로 외부 프로젝트에 붙일 때 1순위로 부딪힘)
-- **SaaS 실연동** — 백엔드가 서버측 `issueClawChannelTicket`로 발급 → 위젯 `getTicket`. (현재 예제는 브라우저 발급 = DEV 전용)
+- **크로스오리진 게이트웨이 URL 옵션** — `@clawchannel/client`의 `url` 옵션으로 **해결됨**(다른 오리진 게이트웨이 직접 지정).
+- **SaaS 실연동** — 백엔드가 서버측 `issueClawChannelTicket`로 발급 → 클라이언트 `getTicket`. (현재 데모는 브라우저 발급 = DEV 전용)
 - `@clawchannel/ticket` zero-dep 패키지 분리(SaaS 백엔드가 SDK 없이 소비할 때).
 
 **출시 경로(PACKAGING §4 B/F)**
-- 플러그인 publishable: `private` 해제·실 semver·`dist` 빌드·`openclaw` peerDep·`exports`. 위젯 `private` 해제.
+- 플러그인 publishable: `private` 해제·실 semver·`dist` 빌드·`openclaw` peerDep·`exports`. client `private` 해제.
 - 패키지별 README, MIT 라이선스, ClawHub 등록, 호환성 매트릭스, CI.
 
 **기능 잔여(PLAN §7)**

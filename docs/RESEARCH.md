@@ -275,7 +275,7 @@ ls $OC/dist/extensions/ | grep -iE 'telegram|google|microsoft|mattermost'
 - 예제 빌드 base를 `/clawchannel/`로 두면 자산 URL이 그 prefix로 해석됨(`vite.config.ts` build 시).
 
 ### 플러그인 로딩 / 테스트 루프
-- 사용자 게이트웨이는 `plugins.load.paths`(레포 경로) + `openclaw.extensions:["./index.ts"]`로 **TS 소스를 직접 로드** → `openclaw gateway restart`가 소스 변경을 즉시 반영(플러그인은 빌드 불필요; 위젯은 `npm run build` 필요). 상세 E2E 절차는 memory `clawchannel-live-gateway-e2e`.
+- 사용자 게이트웨이는 `plugins.load.paths`(레포 경로) + `openclaw.extensions:["./index.ts"]`로 **TS 소스를 직접 로드** → `openclaw gateway restart`가 소스 변경을 즉시 반영(플러그인은 빌드 불필요; 정적 서빙되는 채팅 UI는 `packages/client`에서 `npm run build:demo` 필요). 상세 E2E 절차는 memory `clawchannel-live-gateway-e2e`.
 
 ### ticket = JWT HS256 (자체 구현, zero-dep)
 - `src/ticket.ts`: `node:crypto` HMAC로 `base64url(header).base64url(payload).base64url(sig)`. 검증 시 **alg를 HS256로 명시 핀**(헤더 신뢰 안 함) + timing-safe 비교 + `exp`. 브라우저측 동일 포맷은 Web Crypto(`crypto.subtle`)로 발급(`example/devTicket.ts`), 크로스런타임 호환성 테스트로 보장(`src/devticket-webcrypto.test.ts`).

@@ -1,7 +1,9 @@
 # ClawChannel — 기획서
 
-> OpenClaw용 셀프호스트 웹 채널 플러그인 + React 위젯
+> OpenClaw용 셀프호스트 웹 채널 플러그인 + 브라우저 클라이언트
 > 외부 위젯 SaaS(Now4real, Stream 등) 없이, 게이트웨이 위에서 바로 도는 웹 채팅 채널.
+
+> ⚠️ **용어 주의(2026-06-15):** 이 문서의 초기 기획은 브라우저 UI를 "React 위젯"으로 상정했다. 실제로는 그 연결/프로토콜 로직을 **무프레임워크 `@clawchannel/client`(`packages/client`, zero-dep)** 로 추출했고, **React `@clawchannel/widget`는 삭제**했다. 아래에서 "위젯"은 대부분 *브라우저 클라이언트*를 가리키는 역사적 표현으로 읽으면 된다. 현재 파일 구조는 §8 참조.
 
 ---
 
@@ -163,14 +165,15 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 - `api.runtime.events.onAgentEvent` 구독 → tool 이벤트 WS forward, 구조화 tool 카드, (옵션) thinking.
 
 ### Phase 3 — 다듬기 🟡
-- ✅ **정적 위젯 자산을 플러그인 라우트(`/clawchannel/`)로 서빙** (단일 배포). 📄 `src/static-assets.ts`
+- ✅ **정적 채팅 UI 자산을 플러그인 라우트(`/clawchannel/`)로 서빙** (단일 배포). 📄 `src/static-assets.ts` — 서빙 대상은 `packages/client/dist-demo`(client vanilla 데모, `npm run build:demo`).
 - ⬜ typing indicator(`heartbeat.sendTyping`), 인터랙티브 버튼 액션, 테마.
 
 ---
 
 ## 8. 구성요소 / 파일 구조 (현재)
 
-두 개의 패키지(서버 플러그인 / 브라우저 위젯). 📄 분리 이유·배포는 `PACKAGING.md`.
+두 개의 패키지(서버 플러그인 / 무프레임워크 브라우저 클라이언트). 📄 분리 이유·배포는 `PACKAGING.md`.
+(과거의 React `@clawchannel/widget`는 2026-06-15 삭제 — `@clawchannel/client`가 대체.)
 
 ```
 openclaw-clawchannel/              # 레포 루트 = 플러그인 패키지(Node)
@@ -186,17 +189,16 @@ openclaw-clawchannel/              # 레포 루트 = 플러그인 패키지(Node
 │   ├── approvals.ts               # approvalCapability (turnSourceTo로 출발 peer 라우팅)
 │   ├── message-adapter.ts         # progress-draft 컨트롤러 / live 어댑터
 │   ├── channel.ts                 # createChatChannelPlugin (security/outbound)
-│   ├── static-assets.ts           # 빌드된 위젯을 /clawchannel/ 로 서빙(traversal-safe)
+│   ├── static-assets.ts           # 빌드된 채팅 UI를 /clawchannel/ 로 서빙(traversal-safe)
 │   └── *.test.ts                  # vitest (auth, ticket, transport, approvals, channel, static-assets, …)
-├── smoke-*.mjs                    # 라이브 게이트웨이 대상 수동 스모크(ws/progress/approval/reconnect/e2e)
-└── clawchannel/widget/            # 브라우저 패키지(@clawchannel/widget)
-    ├── package.json               # exports→dist-lib, react peerDep, build / build:lib
-    ├── vite.config.ts             # 예제 앱 빌드(→dist, base "/clawchannel/")
-    ├── vite.lib.config.ts         # 라이브러리 빌드(→dist-lib, react external)
-    ├── tsconfig.lib.json          # src/lib 의 .d.ts emit
-    └── src/
-        ├── lib/                   # 재사용(출시 대상): index.ts(배럴), useClawChannel.ts, Chat.tsx
-        └── example/               # 데모(미출시): App.tsx(시크릿 입력), devTicket.ts(브라우저 발급, DEV), main.tsx
+├── smoke/                         # 라이브 게이트웨이 대상 수동 스모크(ws/progress/approval/reconnect/e2e/selfclose)
+├── docs/                          # AUTH·PACKAGING·PLAN·RESEARCH·BACKLOG
+└── packages/client/              # 브라우저 패키지(@clawchannel/client, 무프레임워크·zero-dep)
+    ├── package.json               # exports→dist, build(tsc 라이브러리) / build:demo(vite) / test(vitest)
+    ├── vite.config.ts             # 데모 빌드(→dist-demo, base "/clawchannel/") + dev 프록시
+    ├── tsconfig.build.json        # 라이브러리 .d.ts emit(→dist)
+    ├── src/                       # index.ts(배럴), client.ts(ClawChannelClient), types.ts, client.test.ts
+    └── demo/                      # 순수 DOM 데모(미출시): main.ts, devTicket.ts(브라우저 발급, DEV) + index.html
 ```
 
 ### 핵심 SDK 표면

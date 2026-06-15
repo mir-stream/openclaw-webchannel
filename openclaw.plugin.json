@@ -127,7 +127,7 @@
         },
         "execApprovals.enabled": {
           "label": "Native exec approvals",
-          "help": "Render native [Allow once] [Allow always] [Deny] buttons in the widget when a tool/exec needs approval. true|\"auto\" enables; false disables."
+          "help": "Render native [Allow once] [Allow always] [Deny] buttons in the chat UI when a tool/exec needs approval. true|\"auto\" enables; false disables."
         },
         "capabilities.inlineButtons": {
           "label": "Inline buttons",

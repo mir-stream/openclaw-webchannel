@@ -12,7 +12,7 @@
     "channel": {
       "id": "clawchannel",
       "label": "ClawChannel",
-      "blurb": "Self-hosted React web chat channel served on the gateway port."
+      "blurb": "Self-hosted web chat channel served on the gateway port."
     }
   },
   "devDependencies": {

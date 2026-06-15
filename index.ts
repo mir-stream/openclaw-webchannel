@@ -11,11 +11,17 @@ import { resolveVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
 import { createStaticAssetsHandler } from "./src/static-assets.js";
 
-// Resolve the built widget's `dist/` relative to THIS module (the plugin entry
-// at the repo root), so the path is correct regardless of the gateway's cwd.
-// index.ts -> <repo-root>/clawchannel/widget/dist.
+// Resolve the built chat-UI `dist-demo/` relative to THIS module (the plugin
+// entry at the repo root), so the path is correct regardless of the gateway's
+// cwd. index.ts -> <repo-root>/packages/client/dist-demo (the framework-agnostic
+// @clawchannel/client vanilla demo; build it with `npm run build:demo` there).
 const pluginDir = path.dirname(fileURLToPath(import.meta.url));
-const widgetDistRoot = path.join(pluginDir, "clawchannel", "widget", "dist");
+const chatUiDistRoot = path.join(
+  pluginDir,
+  "packages",
+  "client",
+  "dist-demo",
+);
 
 /**
  * Shared transport instance. The channel plugin (outbound) and the HTTP upgrade
@@ -84,9 +90,10 @@ export default defineChannelPluginEntry({
       },
     });
 
-    // Serve the built example widget (chat UI) from the gateway under the
-    // `/clawchannel/` prefix, so the whole demo runs from the gateway port with
-    // no separate web server. These assets are PUBLIC by design (`auth:
+    // Serve the built chat UI (the @clawchannel/client vanilla demo) from the
+    // gateway under the `/clawchannel/` prefix, so the whole demo runs from the
+    // gateway port with no separate web server. These assets are PUBLIC by
+    // design (`auth:
     // "plugin"`): the page and its JS carry no secrets — authentication happens
     // at the WebSocket connect (the verifier seam above). The exact
     // `/clawchannel/ws` route registered first takes precedence over this prefix
@@ -95,7 +102,7 @@ export default defineChannelPluginEntry({
       path: "/clawchannel/",
       auth: "plugin",
       match: "prefix",
-      handler: createStaticAssetsHandler(widgetDistRoot),
+      handler: createStaticAssetsHandler(chatUiDistRoot),
     });
   },
 });
