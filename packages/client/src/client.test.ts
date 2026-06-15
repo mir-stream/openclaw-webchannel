@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ClawChannelClient } from "./index.js";
+import { WebChannelClient } from "./index.js";
 import type { OutboundWsMessage } from "./types.js";
 
 /**
@@ -74,7 +74,7 @@ async function flush(): Promise<void> {
   await Promise.resolve();
 }
 
-const URL = "ws://test.local/clawchannel/ws";
+const URL = "ws://test.local/webchannel/ws";
 
 let originalWebSocket: typeof globalThis.WebSocket;
 
@@ -94,9 +94,9 @@ afterEach(() => {
   globalThis.WebSocket = originalWebSocket;
 });
 
-describe("ClawChannelClient — connect & open", () => {
+describe("WebChannelClient — connect & open", () => {
   it("constructs a WebSocket at the given url and flips to connected on open", async () => {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     const seen: string[] = [];
     client.subscribe((s) => seen.push(s.status));
 
@@ -117,7 +117,7 @@ describe("ClawChannelClient — connect & open", () => {
 
   it("appends an encoded ?ticket= and calls getTicket on every (re)connect", async () => {
     const getTicket = vi.fn(async () => "a b/c");
-    const client = new ClawChannelClient({ url: URL, getTicket });
+    const client = new WebChannelClient({ url: URL, getTicket });
 
     client.connect();
     await flush();
@@ -136,9 +136,9 @@ describe("ClawChannelClient — connect & open", () => {
   });
 });
 
-describe("ClawChannelClient — inbound progress & agent_message", () => {
+describe("WebChannelClient — inbound progress & agent_message", () => {
   async function openClient() {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     client.connect();
     await flush();
     const sock = lastSocket();
@@ -185,9 +185,9 @@ describe("ClawChannelClient — inbound progress & agent_message", () => {
   });
 });
 
-describe("ClawChannelClient — approvals", () => {
+describe("WebChannelClient — approvals", () => {
   async function openClient() {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     client.connect();
     await flush();
     const sock = lastSocket();
@@ -220,9 +220,9 @@ describe("ClawChannelClient — approvals", () => {
   });
 });
 
-describe("ClawChannelClient — send", () => {
+describe("WebChannelClient — send", () => {
   async function openClient() {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     client.connect();
     await flush();
     const sock = lastSocket();
@@ -243,7 +243,7 @@ describe("ClawChannelClient — send", () => {
   });
 
   it("is a no-op when the socket is not OPEN (no state change, no send)", async () => {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     client.connect();
     await flush();
     const sock = lastSocket();
@@ -265,9 +265,9 @@ describe("ClawChannelClient — send", () => {
   });
 });
 
-describe("ClawChannelClient — decide", () => {
+describe("WebChannelClient — decide", () => {
   it("optimistically sets resolvedDecision and sends an approval_decision frame", async () => {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     client.connect();
     await flush();
     const sock = lastSocket();
@@ -294,9 +294,9 @@ describe("ClawChannelClient — decide", () => {
   });
 });
 
-describe("ClawChannelClient — reconnect backoff", () => {
+describe("WebChannelClient — reconnect backoff", () => {
   it("schedules a reconnect on unexpected close; status becomes reconnecting; a new socket opens after the timer", async () => {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     client.connect();
     await flush();
     expect(FakeWebSocket.instances.length).toBe(1);
@@ -314,7 +314,7 @@ describe("ClawChannelClient — reconnect backoff", () => {
     // delay = random() * exp. With random()=1, delay === exp.
     vi.spyOn(Math, "random").mockReturnValue(1);
 
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     client.connect();
     await flush();
 
@@ -341,9 +341,9 @@ describe("ClawChannelClient — reconnect backoff", () => {
   });
 });
 
-describe("ClawChannelClient — close()", () => {
+describe("WebChannelClient — close()", () => {
   it("prevents any further reconnect and closes the live socket", async () => {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     client.connect();
     await flush();
     const sock = lastSocket();
@@ -360,9 +360,9 @@ describe("ClawChannelClient — close()", () => {
   });
 });
 
-describe("ClawChannelClient — orphaned working draft on reconnect", () => {
+describe("WebChannelClient — orphaned working draft on reconnect", () => {
   it("settles a leftover progress draft to working:false when a new socket opens", async () => {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     client.connect();
     await flush();
     const sock1 = lastSocket();
@@ -384,9 +384,9 @@ describe("ClawChannelClient — orphaned working draft on reconnect", () => {
   });
 });
 
-describe("ClawChannelClient — subscribe/unsubscribe", () => {
+describe("WebChannelClient — subscribe/unsubscribe", () => {
   it("unsubscribe stops further notifications", async () => {
-    const client = new ClawChannelClient({ url: URL });
+    const client = new WebChannelClient({ url: URL });
     const calls: number[] = [];
     const unsub = client.subscribe(() => calls.push(1));
 

@@ -1,8 +1,8 @@
 {
-  "id": "clawchannel",
+  "id": "webchannel",
   "kind": "channel",
-  "channels": ["clawchannel"],
-  "name": "ClawChannel",
+  "channels": ["webchannel"],
+  "name": "WebChannel",
   "description": "Self-hosted web chat channel plugin for OpenClaw.",
   "configSchema": {
     "type": "object",
@@ -10,7 +10,7 @@
     "properties": {}
   },
   "channelConfigs": {
-    "clawchannel": {
+    "webchannel": {
       "schema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",

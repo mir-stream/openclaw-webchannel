@@ -1,7 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
-import { CLAWCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
-import type { ClawChannelTransport, InboundWsMessage } from "./transport.js";
+import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
+import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
 
 /** The inbound path only handles user messages; approvals route separately. */
 type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
@@ -18,7 +18,7 @@ import type { ProgressDraftController } from "./message-adapter.js";
  *  1. Resolve the agent route for this channel + peer via
  *     `runtime.channel.routing.resolveAgentRoute(...)`. This honours the
  *     configured dmScope/bindings and yields a channel-scoped `sessionKey`
- *     (e.g. carrying `clawchannel`), instead of `buildAgentSessionKey(...)`
+ *     (e.g. carrying `webchannel`), instead of `buildAgentSessionKey(...)`
  *     which defaults `dmScope` to `"main"` and collapses the key to
  *     `agent:main:main`, discarding channel + peer.
  *  2. Run the turn through `runtime.channel.inbound.run({ adapter })`. The
@@ -60,7 +60,7 @@ import type { ProgressDraftController } from "./message-adapter.js";
  */
 export async function handleInboundMessage(
   api: OpenClawPluginApi,
-  transport: ClawChannelTransport,
+  transport: WebChannelTransport,
   peerId: string,
   message: InboundUserMessage,
 ): Promise<void> {
@@ -73,7 +73,7 @@ export async function handleInboundMessage(
   // Progress-draft wiring (Phase 1 first slice). Core does NOT auto-drive a
   // plugin's `message.live` adapter; the generic seam for a plugin channel is
   // the inbound turn's reply dispatcher callbacks. When the channel is
-  // configured with `channels.clawchannel.streaming.mode:"progress"` we build a
+  // configured with `channels.webchannel.streaming.mode:"progress"` we build a
   // per-turn draft controller and hook `onToolStart`/`onItemEvent`/`onPartialReply`
   // (GetReplyOptions, dist/plugin-sdk/types-BYvUZFDr.d.ts:274-304) via the turn's
   // `replyOptions` (Omit<GetReplyOptions,"onBlockReply">, AssembledChannelTurn,
@@ -81,7 +81,7 @@ export async function handleInboundMessage(
   // rolling draft pushed to the widget as a `progress` frame; the final answer
   // (delivered through `delivery.deliver`) finalizes that same draft id.
   const channelConfig = (api.config.channels as Record<string, unknown> | undefined)?.[
-    CLAWCHANNEL_ID
+    WEBCHANNEL_ID
   ];
   const progressEnabled = resolveStreamingMode(channelConfig) === "progress";
   let draft: ProgressDraftController | undefined;
@@ -93,21 +93,21 @@ export async function handleInboundMessage(
     });
   }
 
-  // Resolve the channel-scoped agent route (carries `clawchannel` + peer in the
+  // Resolve the channel-scoped agent route (carries `webchannel` + peer in the
   // session key per configured dmScope/bindings).
   const route = channelRuntime.routing.resolveAgentRoute({
     cfg: api.config,
-    channel: CLAWCHANNEL_ID,
+    channel: WEBCHANNEL_ID,
     peer: { kind: "direct", id: wsKey },
   });
 
   try {
     await channelRuntime.inbound.run({
-      channel: CLAWCHANNEL_ID,
+      channel: WEBCHANNEL_ID,
       raw: message,
       adapter: {
         ingest: (raw) => ({
-          id: `clawchannel-${Date.now()}`,
+          id: `webchannel-${Date.now()}`,
           timestamp: Date.now(),
           rawText: raw.text,
           textForAgent: raw.text,
@@ -116,7 +116,7 @@ export async function handleInboundMessage(
         }),
         resolveTurn: (input) => {
           const ctxPayload = channelRuntime.inbound.buildContext({
-            channel: CLAWCHANNEL_ID,
+            channel: WEBCHANNEL_ID,
             timestamp: input.timestamp,
             from: wsKey,
             sender: { id: wsKey, name: wsKey },
@@ -144,7 +144,7 @@ export async function handleInboundMessage(
 
           return {
             cfg: api.config,
-            channel: CLAWCHANNEL_ID,
+            channel: WEBCHANNEL_ID,
             agentId: route.agentId,
             routeSessionKey: route.sessionKey,
             storePath,
@@ -213,7 +213,7 @@ export async function handleInboundMessage(
       },
     });
   } catch (err) {
-    api.logger.error?.(`clawchannel: inbound dispatch failed: ${String(err)}`);
+    api.logger.error?.(`webchannel: inbound dispatch failed: ${String(err)}`);
     // BLOCKING recovery: if the turn threw AFTER a progress frame was emitted,
     // the widget is showing a working bubble that will otherwise hang forever
     // (no terminal frame for that id is ever sent and the draft loop keeps
@@ -230,7 +230,7 @@ export async function handleInboundMessage(
         );
       } catch (finalizeErr) {
         api.logger.error?.(
-          `clawchannel: draft error-finalize failed: ${String(finalizeErr)}`,
+          `webchannel: draft error-finalize failed: ${String(finalizeErr)}`,
         );
       }
     }

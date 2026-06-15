@@ -15,68 +15,68 @@ const DIST = path.resolve("/tmp/fakedist");
 
 describe("resolveAssetPath", () => {
   it("maps the bare prefix root to index.html", () => {
-    expect(resolveAssetPath(DIST, "/clawchannel/")).toBe(
+    expect(resolveAssetPath(DIST, "/webchannel/")).toBe(
       path.join(DIST, "index.html"),
     );
-    expect(resolveAssetPath(DIST, "/clawchannel")).toBe(
+    expect(resolveAssetPath(DIST, "/webchannel")).toBe(
       path.join(DIST, "index.html"),
     );
   });
 
   it("strips a query string off the root", () => {
-    expect(resolveAssetPath(DIST, "/clawchannel/?v=1")).toBe(
+    expect(resolveAssetPath(DIST, "/webchannel/?v=1")).toBe(
       path.join(DIST, "index.html"),
     );
   });
 
   it("resolves a normal nested asset inside dist", () => {
-    expect(resolveAssetPath(DIST, "/clawchannel/assets/x.js")).toBe(
+    expect(resolveAssetPath(DIST, "/webchannel/assets/x.js")).toBe(
       path.join(DIST, "assets", "x.js"),
     );
   });
 
   it("resolves an asset with a query string", () => {
-    expect(resolveAssetPath(DIST, "/clawchannel/assets/x.js?hash=abc")).toBe(
+    expect(resolveAssetPath(DIST, "/webchannel/assets/x.js?hash=abc")).toBe(
       path.join(DIST, "assets", "x.js"),
     );
   });
 
   it("rejects plain ../ traversal", () => {
-    expect(resolveAssetPath(DIST, "/clawchannel/../../etc/passwd")).toBeNull();
+    expect(resolveAssetPath(DIST, "/webchannel/../../etc/passwd")).toBeNull();
   });
 
   it("rejects percent-encoded traversal", () => {
     expect(
-      resolveAssetPath(DIST, "/clawchannel/..%2f..%2fetc/passwd"),
+      resolveAssetPath(DIST, "/webchannel/..%2f..%2fetc/passwd"),
     ).toBeNull();
     expect(
-      resolveAssetPath(DIST, "/clawchannel/%2e%2e%2f%2e%2e%2fetc/passwd"),
+      resolveAssetPath(DIST, "/webchannel/%2e%2e%2f%2e%2e%2fetc/passwd"),
     ).toBeNull();
   });
 
   it("rejects an absolute-ish path after the prefix", () => {
-    // Decodes to /clawchannel//etc/passwd -> rest is an absolute path.
-    expect(resolveAssetPath(DIST, "/clawchannel/%2fetc%2fpasswd")).toBeNull();
+    // Decodes to /webchannel//etc/passwd -> rest is an absolute path.
+    expect(resolveAssetPath(DIST, "/webchannel/%2fetc%2fpasswd")).toBeNull();
   });
 
   it("rejects paths containing a null byte", () => {
     expect(
-      resolveAssetPath(DIST, "/clawchannel/index.html%00.png"),
+      resolveAssetPath(DIST, "/webchannel/index.html%00.png"),
     ).toBeNull();
   });
 
   it("rejects the ws sub-path (owned by the exact WS route)", () => {
-    expect(resolveAssetPath(DIST, "/clawchannel/ws")).toBeNull();
-    expect(resolveAssetPath(DIST, "/clawchannel/ws/foo")).toBeNull();
+    expect(resolveAssetPath(DIST, "/webchannel/ws")).toBeNull();
+    expect(resolveAssetPath(DIST, "/webchannel/ws/foo")).toBeNull();
   });
 
   it("rejects paths outside the route prefix", () => {
     expect(resolveAssetPath(DIST, "/other/thing.js")).toBeNull();
-    expect(resolveAssetPath(DIST, "/clawchannelx/thing.js")).toBeNull();
+    expect(resolveAssetPath(DIST, "/webchannelx/thing.js")).toBeNull();
   });
 
   it("rejects malformed percent-encoding", () => {
-    expect(resolveAssetPath(DIST, "/clawchannel/%zz")).toBeNull();
+    expect(resolveAssetPath(DIST, "/webchannel/%zz")).toBeNull();
   });
 
   it("does not leak into a sibling directory sharing the root's prefix", () => {
@@ -88,7 +88,7 @@ describe("resolveAssetPath", () => {
     const root = path.resolve("/var/app/dist");
     const result = resolveAssetPath(
       root,
-      "/clawchannel/..%2fdist-evil%2fsecret.js",
+      "/webchannel/..%2fdist-evil%2fsecret.js",
     );
     if (result !== null) {
       // If anything is returned it must stay strictly inside distRoot.
@@ -103,7 +103,7 @@ describe("resolveAssetPath", () => {
     // a literal filename component inside distRoot. Assert it does not escape.
     const result = resolveAssetPath(
       DIST,
-      "/clawchannel/%252e%252e%2fetc%2fpasswd",
+      "/webchannel/%252e%252e%2fetc%2fpasswd",
     );
     if (result !== null) {
       expect(result === DIST || result.startsWith(DIST + path.sep)).toBe(true);
@@ -113,8 +113,8 @@ describe("resolveAssetPath", () => {
   it("normalizes a non-canonical distRoot (trailing slash / .. segments)", () => {
     // A non-canonical root must not make every lookup fail closed.
     const canonical = path.join(DIST, "index.html");
-    expect(resolveAssetPath(DIST + "/", "/clawchannel/")).toBe(canonical);
-    expect(resolveAssetPath(DIST + "/sub/..", "/clawchannel/")).toBe(canonical);
+    expect(resolveAssetPath(DIST + "/", "/webchannel/")).toBe(canonical);
+    expect(resolveAssetPath(DIST + "/sub/..", "/webchannel/")).toBe(canonical);
   });
 });
 
@@ -151,7 +151,7 @@ describe("createStaticAssetsHandler", () => {
   const appJs = "console.log('hi');";
 
   beforeAll(async () => {
-    tmpDist = await mkdtemp(path.join(tmpdir(), "clawchannel-dist-"));
+    tmpDist = await mkdtemp(path.join(tmpdir(), "webchannel-dist-"));
     await writeFile(path.join(tmpDist, "index.html"), indexHtml);
     await mkdir(path.join(tmpDist, "assets"));
     await writeFile(path.join(tmpDist, "assets", "app.js"), appJs);
@@ -167,7 +167,7 @@ describe("createStaticAssetsHandler", () => {
     const handler = createStaticAssetsHandler(tmpDist);
     const res = makeRes();
     const handled = await handler(
-      makeReq("/clawchannel/"),
+      makeReq("/webchannel/"),
       res as unknown as ServerResponse,
     );
     expect(handled).toBe(true);
@@ -181,7 +181,7 @@ describe("createStaticAssetsHandler", () => {
     const handler = createStaticAssetsHandler(tmpDist);
     const res = makeRes();
     await handler(
-      makeReq("/clawchannel/assets/app.js"),
+      makeReq("/webchannel/assets/app.js"),
       res as unknown as ServerResponse,
     );
     expect(res.statusCode).toBe(200);
@@ -193,7 +193,7 @@ describe("createStaticAssetsHandler", () => {
     const handler = createStaticAssetsHandler(tmpDist);
     const res = makeRes();
     await handler(
-      makeReq("/clawchannel/assets/nope.js"),
+      makeReq("/webchannel/assets/nope.js"),
       res as unknown as ServerResponse,
     );
     expect(res.statusCode).toBe(404);
@@ -204,7 +204,7 @@ describe("createStaticAssetsHandler", () => {
     const handler = createStaticAssetsHandler(tmpDist);
     const res = makeRes();
     await handler(
-      makeReq("/clawchannel/assets"),
+      makeReq("/webchannel/assets"),
       res as unknown as ServerResponse,
     );
     expect(res.statusCode).toBe(404);
@@ -214,7 +214,7 @@ describe("createStaticAssetsHandler", () => {
     const handler = createStaticAssetsHandler(tmpDist);
     const res = makeRes();
     await handler(
-      makeReq("/clawchannel/../../etc/passwd"),
+      makeReq("/webchannel/../../etc/passwd"),
       res as unknown as ServerResponse,
     );
     expect(res.statusCode).not.toBe(200);

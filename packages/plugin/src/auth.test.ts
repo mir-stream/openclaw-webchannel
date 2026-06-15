@@ -7,14 +7,14 @@ import {
   type AuthConfig,
   type AuthLogger,
 } from "./auth.js";
-import { issueClawChannelTicket } from "./ticket.js";
+import { issueWebChannelTicket } from "./ticket.js";
 
 /** Build a minimal IncomingMessage-like object with just a `url`. */
 function fakeReq(url: string): IncomingMessage {
   return { url } as IncomingMessage;
 }
 
-const ENV_VAR = "CLAWCHANNEL_TEST_TICKET_SECRET";
+const ENV_VAR = "WEBCHANNEL_TEST_TICKET_SECRET";
 const SECRET = "shared-hmac-secret";
 
 afterEach(() => {
@@ -44,7 +44,7 @@ describe("anonymous strategy", () => {
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0][0]).toMatch(/anonymous/i);
 
-    const identity = await verifier(fakeReq("/clawchannel/ws"));
+    const identity = await verifier(fakeReq("/webchannel/ws"));
     expect(identity).toEqual({ peerId: ANON_PEER_ID });
   });
 });
@@ -55,13 +55,13 @@ describe("hmac-ticket strategy", () => {
       strategy: "hmac-ticket",
       ticketSecret: SECRET,
     });
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-7",
       secret: SECRET,
       ttlSeconds: 60,
       displayName: "Grace",
     });
-    const identity = await verifier(fakeReq(`/clawchannel/ws?ticket=${token}`));
+    const identity = await verifier(fakeReq(`/webchannel/ws?ticket=${token}`));
     expect(identity).toEqual({ peerId: "user-7", displayName: "Grace" });
   });
 
@@ -71,17 +71,17 @@ describe("hmac-ticket strategy", () => {
       ticketSecret: SECRET,
       ticketParam: "t",
     });
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-7",
       secret: SECRET,
       ttlSeconds: 60,
     });
-    expect(await verifier(fakeReq(`/clawchannel/ws?t=${token}`))).toEqual({
+    expect(await verifier(fakeReq(`/webchannel/ws?t=${token}`))).toEqual({
       peerId: "user-7",
     });
     // Wrong param name => no ticket => reject.
     expect(
-      await verifier(fakeReq(`/clawchannel/ws?ticket=${token}`)),
+      await verifier(fakeReq(`/webchannel/ws?ticket=${token}`)),
     ).toBeNull();
   });
 
@@ -90,7 +90,7 @@ describe("hmac-ticket strategy", () => {
       strategy: "hmac-ticket",
       ticketSecret: SECRET,
     });
-    expect(await verifier(fakeReq("/clawchannel/ws"))).toBeNull();
+    expect(await verifier(fakeReq("/webchannel/ws"))).toBeNull();
   });
 
   it("rejects an expired ticket", async () => {
@@ -98,12 +98,12 @@ describe("hmac-ticket strategy", () => {
       strategy: "hmac-ticket",
       ticketSecret: SECRET,
     });
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-7",
       secret: SECRET,
       ttlSeconds: -1,
     });
-    expect(await verifier(fakeReq(`/clawchannel/ws?ticket=${token}`))).toBeNull();
+    expect(await verifier(fakeReq(`/webchannel/ws?ticket=${token}`))).toBeNull();
   });
 
   it("rejects a tampered ticket", async () => {
@@ -111,14 +111,14 @@ describe("hmac-ticket strategy", () => {
       strategy: "hmac-ticket",
       ticketSecret: SECRET,
     });
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-7",
       secret: SECRET,
       ttlSeconds: 60,
     });
     const tampered = `${token}tampered`;
     expect(
-      await verifier(fakeReq(`/clawchannel/ws?ticket=${tampered}`)),
+      await verifier(fakeReq(`/webchannel/ws?ticket=${tampered}`)),
     ).toBeNull();
   });
 
@@ -128,12 +128,12 @@ describe("hmac-ticket strategy", () => {
       strategy: "hmac-ticket",
       ticketSecret: { env: ENV_VAR },
     });
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-7",
       secret: SECRET,
       ttlSeconds: 60,
     });
-    expect(await verifier(fakeReq(`/clawchannel/ws?ticket=${token}`))).toEqual({
+    expect(await verifier(fakeReq(`/webchannel/ws?ticket=${token}`))).toEqual({
       peerId: "user-7",
     });
   });

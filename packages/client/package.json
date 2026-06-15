@@ -1,8 +1,8 @@
 {
-  "name": "@clawchannel/client",
+  "name": "openclaw-webchannel-client",
   "version": "0.0.0",
   "private": true,
-  "description": "Framework-agnostic, zero-dependency browser client for ClawChannel (headless connection + protocol + state).",
+  "description": "Framework-agnostic, zero-dependency browser client for WebChannel (headless connection + protocol + state).",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",

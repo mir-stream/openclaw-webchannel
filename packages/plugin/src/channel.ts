@@ -4,8 +4,8 @@ import {
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
-import { CLAWCHANNEL_ID } from "./transport.js";
-import type { ClawChannelTransport } from "./transport.js";
+import { WEBCHANNEL_ID } from "./transport.js";
+import type { WebChannelTransport } from "./transport.js";
 import { createClawMessageAdapter } from "./message-adapter.js";
 import {
   createClawApprovalCapability,
@@ -41,7 +41,7 @@ function resolveAccount(
   cfg: OpenClawConfig,
   accountId?: string | null,
 ): ResolvedAccount {
-  const section = (cfg.channels as Record<string, any>)?.[CLAWCHANNEL_ID];
+  const section = (cfg.channels as Record<string, any>)?.[WEBCHANNEL_ID];
   return {
     accountId: accountId ?? null,
     allowFrom: section?.allowFrom ?? [],
@@ -50,7 +50,7 @@ function resolveAccount(
 }
 
 /**
- * Build the ClawChannel ChannelPlugin.
+ * Build the WebChannel ChannelPlugin.
  *
  * Outbound is the load-bearing seam for Phase 0: when the agent replies, core
  * calls `outbound.sendText(ctx)` for this channel, and we forward the text to
@@ -62,7 +62,7 @@ function resolveAccount(
  * Verified: dist/plugin-sdk/core-HhTaqQ72.d.ts:211-219 (ChatChannelAttachedOutboundOptions)
  * and dist/plugin-sdk/outbound.types-BEZiz165.d.ts:105-127 (ChannelOutboundContext).
  */
-export function createClawChannelPlugin(transport: ClawChannelTransport) {
+export function createWebChannelPlugin(transport: WebChannelTransport) {
   return createChatChannelPlugin<ResolvedAccount>({
     // `message` (ChannelMessageAdapter) declares our outbound text send plus the
     // `live` progress-draft capabilities. It is attached on the base object here
@@ -76,7 +76,7 @@ export function createClawChannelPlugin(transport: ClawChannelTransport) {
     // `message.live` for plugin channels and how drafts fire via the inbound
     // turn's reply callbacks instead.
     base: Object.assign(createChannelPluginBase<ResolvedAccount>({
-      id: CLAWCHANNEL_ID,
+      id: WEBCHANNEL_ID,
       // `capabilities` is required on ChannelPlugin (verified:
       // dist/types.plugin-BIHyhl5u.d.ts:22). One web chat surface => direct chats.
       capabilities: { chatTypes: ["direct"], media: false },
@@ -132,7 +132,7 @@ export function createClawChannelPlugin(transport: ClawChannelTransport) {
     // DM security: who may message the bot. Phase 0 uses config allowlist only.
     security: {
       dm: {
-        channelKey: CLAWCHANNEL_ID,
+        channelKey: WEBCHANNEL_ID,
         resolvePolicy: (account) => account.dmPolicy,
         resolveAllowFrom: (account) => account.allowFrom,
         defaultPolicy: "allowlist",
@@ -144,7 +144,7 @@ export function createClawChannelPlugin(transport: ClawChannelTransport) {
 
     outbound: {
       attachedResults: {
-        channel: CLAWCHANNEL_ID,
+        channel: WEBCHANNEL_ID,
         sendText: async (ctx) => {
           // The inbound round-trip delivers replies through the turn's
           // `delivery.deliver` adapter (see src/inbound.ts), NOT here. This
@@ -159,7 +159,7 @@ export function createClawChannelPlugin(transport: ClawChannelTransport) {
           if (!ctx.to || !transport.sendText(ctx.to, ctx.text)) {
             transport.sendTextToAnyOpen(ctx.text);
           }
-          return { messageId: `clawchannel-${Date.now()}` };
+          return { messageId: `webchannel-${Date.now()}` };
         },
       },
       // No media in Phase 0. `deliveryMode` is required on the outbound base

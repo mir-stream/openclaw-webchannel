@@ -41,16 +41,16 @@ import type {
   ChannelOutboundPayloadHint,
 } from "openclaw/plugin-sdk/channel-runtime";
 
-import { CLAWCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
+import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
 import type {
-  ClawChannelTransport,
+  WebChannelTransport,
   ApprovalDecision,
   ApprovalOption,
   ApprovalRequestPayload,
 } from "./transport.js";
 
 /**
- * Native HITL approval capability for ClawChannel (Phase 1, slice 1-C).
+ * Native HITL approval capability for WebChannel (Phase 1, slice 1-C).
  *
  * PATH: idiomatic `approvalCapability.nativeRuntime`. When a tool/exec needs
  * approval the agent run blocks and core surfaces an approval prompt; core's
@@ -120,7 +120,7 @@ function readExecApprovals(
   cfg: OpenClawConfig,
 ): { enabled?: boolean | "auto" } | undefined {
   const section = (cfg.channels as Record<string, any> | undefined)?.[
-    CLAWCHANNEL_ID
+    WEBCHANNEL_ID
   ];
   return section?.execApprovals;
 }
@@ -180,7 +180,7 @@ export function buildApprovalRequestPayload(
  * concurrent users each approval prompt reaches the user who triggered it.
  */
 export function createClawApprovalNativeRuntimeSpec(
-  transport: ClawChannelTransport,
+  transport: WebChannelTransport,
 ): ChannelApprovalNativeRuntimeSpec<
   ApprovalRequestPayload, // TPendingPayload
   { sessionKey: string }, // TPreparedTarget
@@ -231,7 +231,7 @@ export function createClawApprovalNativeRuntimeSpec(
         // single-session deployment still gets its prompt.
         const sessionKey = plannedTarget?.target?.to || ANON_PEER_ID;
         return {
-          dedupeKey: `${CLAWCHANNEL_ID}:${sessionKey}`,
+          dedupeKey: `${WEBCHANNEL_ID}:${sessionKey}`,
           target: { sessionKey },
         };
       },
@@ -243,11 +243,11 @@ export function createClawApprovalNativeRuntimeSpec(
         // target falls back to `web-anon`, `soleOpenSocket` returns undefined,
         // and the prompt is correctly DROPPED rather than misrouted. That drop
         // is otherwise invisible, so log it (no logger in scope here; match the
-        // transport's `[clawchannel]` console style — src/transport.ts safeSend).
+        // transport's `[webchannel]` console style — src/transport.ts safeSend).
         const delivered = transport.sendApprovalRequest(sessionKey, pendingPayload);
         if (!delivered) {
           console.warn(
-            `[clawchannel] approval ${pendingPayload.id} not delivered: no matching open socket for "${sessionKey}"`,
+            `[webchannel] approval ${pendingPayload.id} not delivered: no matching open socket for "${sessionKey}"`,
           );
         }
         return { approvalId: pendingPayload.id, sessionKey };
@@ -298,7 +298,7 @@ export function createClawApprovalNativeAdapter(): ChannelApprovalNativeAdapter 
     resolveOriginTarget: ({ request }) => {
       const src = request.request;
       const channel = src.turnSourceChannel?.toLowerCase();
-      if (channel && channel !== CLAWCHANNEL_ID) return null;
+      if (channel && channel !== WEBCHANNEL_ID) return null;
       const to =
         typeof src.turnSourceTo === "string" && src.turnSourceTo.length > 0
           ? src.turnSourceTo
@@ -317,7 +317,7 @@ export function createClawApprovalNativeAdapter(): ChannelApprovalNativeAdapter 
  * TODO(auth): Phase 1 real approver identity once per-user auth lands — replace
  * with a real per-user authorization check.
  */
-export function createClawApprovalCapability(transport: ClawChannelTransport) {
+export function createClawApprovalCapability(transport: WebChannelTransport) {
   // `createChannelApprovalNativeRuntimeAdapter` returns a STRONGLY typed adapter
   // (our payload/entry generics), but the capability's `nativeRuntime` field is
   // the erased adapter (all generics `unknown`,
@@ -390,7 +390,7 @@ export function createClawApprovalCapability(transport: ClawChannelTransport) {
  * `hasActiveApprovalNativeRouteRuntime`,
  * dist/approval-native-route-coordinator-Bs0VdpS8.js:143). We delegate the
  * decision to the SDK helper, passing OUR config gate so suppression keys on
- * `clawchannel.execApprovals.enabled` rather than the global `approvals.exec`
+ * `webchannel.execApprovals.enabled` rather than the global `approvals.exec`
  * block (and so the helper skips the `approvals.exec.mode` forwarding-mode gate,
  * which does not apply to our origin-surface delivery). Returns true => core
  * drops the in-band `/approve …` text and the user sees only the native widget.
@@ -409,7 +409,7 @@ export function shouldSuppressClawNativeExecApprovalPrompt(params: {
     // Native delivery is enabled exactly when our exec approvals are on.
     isNativeDeliveryEnabled: ({ cfg }) => isExecApprovalsEnabled(cfg),
     // Resolve "approval config" from OUR channel section so the helper's
-    // agent/session filters + enabled check use clawchannel config, and the
+    // agent/session filters + enabled check use webchannel config, and the
     // forwarding-mode gate is bypassed (helper defaults
     // requireApprovalConfigEnabled/enforceForwardingMode to false when
     // resolveApprovalConfig is provided — approval-native-helpers-WitYuyrm.js:40-44).
@@ -449,7 +449,7 @@ export async function startClawApprovalMonitor(
 ): Promise<void> {
   const registry = ctx.channelRuntime?.runtimeContexts;
   const registration = registry?.register({
-    channelId: CLAWCHANNEL_ID,
+    channelId: WEBCHANNEL_ID,
     accountId: ctx.accountId,
     capability: CHANNEL_APPROVAL_NATIVE_RUNTIME_CONTEXT_CAPABILITY,
     // The native runtime spec talks straight to the transport WebSocket session

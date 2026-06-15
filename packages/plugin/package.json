@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-clawchannel",
+  "name": "openclaw-webchannel",
   "version": "0.0.0",
   "description": "Self-hosted web chat channel plugin for OpenClaw (Phase 0 walking skeleton).",
   "private": true,
@@ -10,8 +10,8 @@
     ],
     "setupEntry": "./setup-entry.ts",
     "channel": {
-      "id": "clawchannel",
-      "label": "ClawChannel",
+      "id": "webchannel",
+      "label": "WebChannel",
       "blurb": "Self-hosted web chat channel served on the gateway port."
     }
   },

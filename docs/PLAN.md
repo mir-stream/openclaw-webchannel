@@ -1,15 +1,15 @@
-# ClawChannel — 기획서
+# WebChannel — 기획서
 
 > OpenClaw용 셀프호스트 웹 채널 플러그인 + 브라우저 클라이언트
 > 외부 위젯 SaaS(Now4real, Stream 등) 없이, 게이트웨이 위에서 바로 도는 웹 채팅 채널.
 
-> ⚠️ **용어 주의(2026-06-15):** 이 문서의 초기 기획은 브라우저 UI를 "React 위젯"으로 상정했다. 실제로는 그 연결/프로토콜 로직을 **무프레임워크 `@clawchannel/client`(`packages/client`, zero-dep)** 로 추출했고, **React `@clawchannel/widget`는 삭제**했다. 아래에서 "위젯"은 대부분 *브라우저 클라이언트*를 가리키는 역사적 표현으로 읽으면 된다. 현재 파일 구조는 §8 참조.
+> ⚠️ **용어 주의(2026-06-15):** 이 문서의 초기 기획은 브라우저 UI를 "React 위젯"으로 상정했다. 실제로는 그 연결/프로토콜 로직을 **무프레임워크 `openclaw-webchannel-client`(`packages/client`, zero-dep)** 로 추출했고, **React `openclaw-webchannel-widget`는 삭제**했다. 아래에서 "위젯"은 대부분 *브라우저 클라이언트*를 가리키는 역사적 표현으로 읽으면 된다. 현재 파일 구조는 §8 참조.
 
 ---
 
 ## 1. 개요 (Overview)
 
-**ClawChannel**은 OpenClaw에 React 기반 웹 채팅 위젯을 1급 **Channel**로 붙이는 프로젝트다.
+**WebChannel**은 OpenClaw에 React 기반 웹 채팅 위젯을 1급 **Channel**로 붙이는 프로젝트다.
 슬랙·텔레그램과 동등한 채널로 등록되어 같은 에이전트·세션·라우팅·승인 체계를 그대로 쓰되,
 프론트엔드(React 위젯)와 브라우저 전송(WebSocket)을 직접 소유한다.
 
@@ -32,7 +32,7 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 | `pinchchat` 등 | (채널 아님) | 세션 모니터링용 대시보드 |
 
 이들은 "브라우저에 답을 밀어주는 전송"과 "프론트 위젯"을 외부 서비스에 떠넘긴다.
-**ClawChannel은 그 두 가지를 직접 구현**해 외부 SaaS 0개, 완전 셀프호스트를 달성한다.
+**WebChannel은 그 두 가지를 직접 구현**해 외부 SaaS 0개, 완전 셀프호스트를 달성한다.
 
 ---
 
@@ -59,9 +59,9 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 │  OpenClaw 게이트웨이 프로세스 (단일 포트, 기본 :18789)          │
 │                                                                │
 │   ┌──────────────────────────────────────────────────────┐   │
-│   │  ClawChannel 플러그인  (kind: "channel")              │   │
+│   │  WebChannel 플러그인  (kind: "channel")              │   │
 │   │                                                        │   │
-│   │   registerHttpRoute({ path:"/clawchannel/ws",          │   │
+│   │   registerHttpRoute({ path:"/webchannel/ws",          │   │
 │   │                       handleUpgrade })   ◄── WS 수락    │   │
 │   │   Map<sessionKey, ws>                     연결 추적      │   │
 │   │   createChatChannelPlugin({ security, pairing,         │   │
@@ -83,7 +83,7 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 ```
 
 ### 두 조각
-1. **ClawChannel 플러그인** — 게이트웨이 *안에서* 로드되는 모듈. 별도 실행물 아님.
+1. **WebChannel 플러그인** — 게이트웨이 *안에서* 로드되는 모듈. 별도 실행물 아님.
 2. **React 위젯** — 브라우저 프론트엔드. (정적 자산; 개발 중 Vite, 배포 시 정적 호스팅 또는 플러그인 라우트로 서빙)
 
 ### 전송 = WebSocket (WebRTC 아님)
@@ -107,7 +107,7 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 3. 위젯이 렌더. 답은 항상 지시한 그 위젯으로 돌아감(deterministic routing).
 
 ### 진행상황 (Progress Draft) — 순수 채널 기본 기능
-- `channels.clawchannel.streaming.mode: "progress"` 설정 시,
+- `channels.webchannel.streaming.mode: "progress"` 설정 시,
   에이전트가 일하는 동안 **하나의 갱신 메시지**에 tool 활동 라인 표시:
   ```
   Working…
@@ -153,7 +153,7 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 - ✅ `approvalCapability` 승인 버튼(HITL) — 출발 peer로 라우팅(turnSourceTo).
 - 🟡 DM allowlist(✅) — **pairing(승인 코드)은 미구현**. 신규 사용자 승인은 auth(ticket)로 대체 방향.
 - ✅ 재연결/연결맵 수명주기, **멀티세션(per-peer, auth로 해결)**. ⬜ **미디어 송수신** 미구현.
-- ✅ 설정 스키마(`channels.clawchannel.*`, auth 포함). ⬜ `openclaw channels status` 통합 미확인.
+- ✅ 설정 스키마(`channels.webchannel.*`, auth 포함). ⬜ `openclaw channels status` 통합 미확인.
 
 ### Auth (원래 BACKLOG → 구현됨) ✅  📄 `AUTH.md`
 - ✅ `ConnectionVerifier` seam + 빌트인 `anonymous`/`hmac-ticket` + 안전 기본값 + zero-dep ticket 발급/검증.
@@ -165,7 +165,7 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 - `api.runtime.events.onAgentEvent` 구독 → tool 이벤트 WS forward, 구조화 tool 카드, (옵션) thinking.
 
 ### Phase 3 — 다듬기 🟡
-- ✅ **정적 채팅 UI 자산을 플러그인 라우트(`/clawchannel/`)로 서빙** (단일 배포). 📄 `src/static-assets.ts` — 서빙 대상은 `packages/client/dist-demo`(client vanilla 데모, `npm run build:demo`).
+- ✅ **정적 채팅 UI 자산을 플러그인 라우트(`/webchannel/`)로 서빙** (단일 배포). 📄 `src/static-assets.ts` — 서빙 대상은 `packages/client/dist-demo`(client vanilla 데모, `npm run build:demo`).
 - ⬜ typing indicator(`heartbeat.sendTyping`), 인터랙티브 버튼 액션, 테마.
 
 ---
@@ -173,30 +173,30 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 ## 8. 구성요소 / 파일 구조 (현재)
 
 **npm workspaces 모노레포** — 루트는 워크스페이스 매니저, 두 패키지는 `packages/` 아래 대칭(서버 플러그인 / 무프레임워크 브라우저 클라이언트). 📄 분리 이유·배포는 `PACKAGING.md`.
-(과거의 React `@clawchannel/widget`는 2026-06-15 삭제 — `@clawchannel/client`가 대체.)
+(과거의 React `openclaw-webchannel-widget`는 2026-06-15 삭제 — `openclaw-webchannel-client`가 대체.)
 
 ```
-openclaw-clawchannel/              # 레포 루트 = 워크스페이스 매니저(코드 없음)
+openclaw-webchannel/              # 레포 루트 = 워크스페이스 매니저(코드 없음)
 ├── package.json                   # { "workspaces": ["packages/*"], scripts: test/typecheck/build }
 ├── package-lock.json              # 단일 통합 lock
 ├── smoke/                         # 라이브 게이트웨이 대상 수동 스모크(ws/progress/approval/reconnect/e2e/selfclose)
 ├── docs/                          # AUTH·PACKAGING·PLAN·RESEARCH·BACKLOG
 └── packages/
-    ├── plugin/                    # 서버 패키지(@clawchannel/plugin 후보; 현 name "openclaw-clawchannel", Node)
+    ├── plugin/                    # 서버 패키지(openclaw-webchannel 후보; 현 name "openclaw-webchannel", Node)
     │   ├── package.json           # openclaw.{channel,extensions,setupEntry} = "이게 플러그인이다" 표식
     │   ├── openclaw.plugin.json   # 매니페스트 (channelConfigs: auth/allowFrom/streaming/…)
-    │   ├── index.ts               # registerFull: WS 라우트 + 정적 /clawchannel/ 라우트 + 검증기 주입
+    │   ├── index.ts               # registerFull: WS 라우트 + 정적 /webchannel/ 라우트 + 검증기 주입
     │   ├── setup-entry.ts
     │   └── src/                   # auth, ticket, transport, inbound, approvals, message-adapter, channel, static-assets + *.test.ts
-    └── client/                    # 브라우저 패키지(@clawchannel/client, 무프레임워크·zero-dep)
+    └── client/                    # 브라우저 패키지(openclaw-webchannel-client, 무프레임워크·zero-dep)
         ├── package.json           # exports→dist, build(tsc 라이브러리) / build:demo(vite) / test(vitest)
-        ├── vite.config.ts         # 데모 빌드(→dist-demo, base "/clawchannel/") + dev 프록시
+        ├── vite.config.ts         # 데모 빌드(→dist-demo, base "/webchannel/") + dev 프록시
         ├── tsconfig.build.json    # 라이브러리 .d.ts emit(→dist)
-        ├── src/                   # index.ts(배럴), client.ts(ClawChannelClient), types.ts, client.test.ts
+        ├── src/                   # index.ts(배럴), client.ts(WebChannelClient), types.ts, client.test.ts
         └── demo/                  # 순수 DOM 데모(미출시): main.ts, devTicket.ts(브라우저 발급, DEV) + index.html
 ```
 
-> **게이트웨이 로딩:** `plugins.load.paths`는 이제 `…/openclaw-clawchannel/packages/plugin`(레포 루트가 아니라 플러그인 패키지)을 가리킨다. `openclaw.extensions`는 그 패키지 기준 `./index.ts`. SDK(`openclaw/plugin-sdk`)는 전역 설치본을 가리키는 `node_modules/openclaw` 심링크로 해석(워크스페이스 install이 prune하므로 재생성 필요).
+> **게이트웨이 로딩:** `plugins.load.paths`는 이제 `…/openclaw-webchannel/packages/plugin`(레포 루트가 아니라 플러그인 패키지)을 가리킨다. `openclaw.extensions`는 그 패키지 기준 `./index.ts`. SDK(`openclaw/plugin-sdk`)는 전역 설치본을 가리키는 `node_modules/openclaw` 심링크로 해석(워크스페이스 install이 prune하므로 재생성 필요).
 
 ### 핵심 SDK 표면
 - `openclaw/plugin-sdk/channel-core` — `createChatChannelPlugin`, `defineChannelPluginEntry`
@@ -212,7 +212,7 @@ openclaw-clawchannel/              # 레포 루트 = 워크스페이스 매니�
 ```json5
 {
   channels: {
-    clawchannel: {
+    webchannel: {
       allowFrom: ["user-123"],        // DM allowlist
       dmSecurity: "allowlist",        // DM 정책
       streaming: {

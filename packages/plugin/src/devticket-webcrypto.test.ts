@@ -5,7 +5,7 @@ import { verifyTicket } from "./ticket.js";
 
 /**
  * Cross-runtime compatibility guard for the PoC browser ticket issuer
- * (clawchannel/widget/src/example/devTicket.ts). That issuer signs HS256 tickets with
+ * (webchannel/widget/src/example/devTicket.ts). That issuer signs HS256 tickets with
  * the Web Crypto API (`crypto.subtle`); the server verifies them with
  * `node:crypto`. This test reproduces the exact Web Crypto signing path (here
  * via node:crypto's WebCrypto implementation, the same API surface the browser

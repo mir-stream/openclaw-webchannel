@@ -1,7 +1,7 @@
 import { defineSetupPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
-import { ClawChannelTransport } from "./src/transport.js";
-import { createClawChannelPlugin } from "./src/channel.js";
+import { WebChannelTransport } from "./src/transport.js";
+import { createWebChannelPlugin } from "./src/channel.js";
 
 /**
  * Lightweight setup entry. OpenClaw loads this instead of the full entry when
@@ -10,6 +10,6 @@ import { createClawChannelPlugin } from "./src/channel.js";
  * (that only happens in index.ts `registerFull`); it exists only to satisfy the
  * channel plugin's outbound adapter shape during setup-safe inspection.
  */
-const transport = new ClawChannelTransport();
+const transport = new WebChannelTransport();
 
-export default defineSetupPluginEntry(createClawChannelPlugin(transport));
+export default defineSetupPluginEntry(createWebChannelPlugin(transport));

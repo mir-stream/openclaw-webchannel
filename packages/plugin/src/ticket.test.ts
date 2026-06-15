@@ -1,13 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { createHmac } from "node:crypto";
 
-import { issueClawChannelTicket, verifyTicket } from "./ticket.js";
+import { issueWebChannelTicket, verifyTicket } from "./ticket.js";
 
 const SECRET = "test-shared-secret";
 
-describe("clawchannel ticket sign/verify", () => {
+describe("webchannel ticket sign/verify", () => {
   it("round-trips issue -> verify and returns the sub", () => {
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-42",
       secret: SECRET,
       ttlSeconds: 60,
@@ -17,7 +17,7 @@ describe("clawchannel ticket sign/verify", () => {
   });
 
   it("carries an optional display name as the `name` claim", () => {
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-42",
       secret: SECRET,
       ttlSeconds: 60,
@@ -27,7 +27,7 @@ describe("clawchannel ticket sign/verify", () => {
   });
 
   it("rejects an expired ticket", () => {
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-42",
       secret: SECRET,
       ttlSeconds: -1, // already expired
@@ -36,7 +36,7 @@ describe("clawchannel ticket sign/verify", () => {
   });
 
   it("accepts a just-expired ticket within clock-skew leeway", () => {
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-42",
       secret: SECRET,
       ttlSeconds: -1,
@@ -47,7 +47,7 @@ describe("clawchannel ticket sign/verify", () => {
   });
 
   it("rejects a tampered signature", () => {
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-42",
       secret: SECRET,
       ttlSeconds: 60,
@@ -58,7 +58,7 @@ describe("clawchannel ticket sign/verify", () => {
   });
 
   it("rejects a tampered payload (signature no longer matches)", () => {
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-42",
       secret: SECRET,
       ttlSeconds: 60,
@@ -72,7 +72,7 @@ describe("clawchannel ticket sign/verify", () => {
   });
 
   it("rejects a ticket signed with a different secret", () => {
-    const token = issueClawChannelTicket({
+    const token = issueWebChannelTicket({
       sub: "user-42",
       secret: "other-secret",
       ttlSeconds: 60,

@@ -3,7 +3,7 @@ import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 /**
- * Static asset serving for the ClawChannel chat UI (the @clawchannel/client
+ * Static asset serving for the WebChannel chat UI (the openclaw-webchannel-client
  * vanilla demo).
  *
  * This module is intentionally free of `openclaw/plugin-sdk` and `ws` imports:
@@ -11,7 +11,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
  * path resolver stays trivially unit-testable in isolation.
  */
 
-const ROUTE_PREFIX = "/clawchannel";
+const ROUTE_PREFIX = "/webchannel";
 
 /** Minimal extension -> MIME map for the assets the Vite build emits. */
 const CONTENT_TYPES: Record<string, string> = {
@@ -38,7 +38,7 @@ function contentTypeFor(filePath: string): string {
  * Pure path logic — does NOT touch the filesystem (existence is the caller's
  * job). Returns `null` for anything that must not be served.
  *
- * Traversal containment: after stripping the `/clawchannel` prefix and query
+ * Traversal containment: after stripping the `/webchannel` prefix and query
  * string and percent-decoding, the relative request is joined onto `distRoot`
  * and normalized via `path.resolve`. The normalized absolute result is then
  * verified to be `distRoot` itself or to live strictly beneath it
@@ -75,8 +75,8 @@ export function resolveAssetPath(
   // Reject embedded null bytes (path-poisoning) anywhere in the decoded path.
   if (decoded.includes("\0")) return null;
 
-  // Strip the route prefix. Accept exactly `/clawchannel`, `/clawchannel/`,
-  // or `/clawchannel/<rest>`; anything else is not ours.
+  // Strip the route prefix. Accept exactly `/webchannel`, `/webchannel/`,
+  // or `/webchannel/<rest>`; anything else is not ours.
   let rest: string;
   if (decoded === ROUTE_PREFIX) {
     rest = "";
@@ -86,7 +86,7 @@ export function resolveAssetPath(
     return null;
   }
 
-  // The WebSocket sub-path is owned by the exact `/clawchannel/ws` route.
+  // The WebSocket sub-path is owned by the exact `/webchannel/ws` route.
   // Defensively never serve a file for it.
   if (rest === "ws" || rest.startsWith("ws/")) return null;
 
@@ -114,7 +114,7 @@ export function resolveAssetPath(
  * Build an HTTP handler that serves files from the widget `dist/`.
  *
  * Returns `true` once it has written a response (handled). The caller registers
- * this on a `prefix` route for `/clawchannel/`; the exact `/clawchannel/ws`
+ * this on a `prefix` route for `/webchannel/`; the exact `/webchannel/ws`
  * route takes precedence, so WS upgrades are never seen here.
  */
 export function createStaticAssetsHandler(
@@ -136,13 +136,13 @@ export function createStaticAssetsHandler(
       }
       if (!distExists) {
         console.warn(
-          "[clawchannel] chat UI dist not found — build the demo first " +
+          "[webchannel] chat UI dist not found — build the demo first " +
             "(npm run build:demo in packages/client)",
         );
         res.statusCode = 503;
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
         res.end(
-          "clawchannel: chat UI not built. Run `npm run build:demo` in packages/client.",
+          "webchannel: chat UI not built. Run `npm run build:demo` in packages/client.",
         );
         return true;
       }
@@ -151,7 +151,7 @@ export function createStaticAssetsHandler(
       if (filePath === null) {
         res.statusCode = 404;
         res.setHeader("Content-Type", "text/plain; charset=utf-8");
-        res.end("clawchannel: not found");
+        res.end("webchannel: not found");
         return true;
       }
 
@@ -160,14 +160,14 @@ export function createStaticAssetsHandler(
         body = await readFile(filePath);
       } catch (err) {
         // A missing file (ENOENT) or a request resolving to a directory
-        // (EISDIR — e.g. `/clawchannel/assets`) are both "no such asset" from
+        // (EISDIR — e.g. `/webchannel/assets`) are both "no such asset" from
         // the client's perspective: return 404 rather than falling through to
         // the generic 500.
         const code = (err as NodeJS.ErrnoException)?.code;
         if (code === "ENOENT" || code === "EISDIR") {
           res.statusCode = 404;
           res.setHeader("Content-Type", "text/plain; charset=utf-8");
-          res.end("clawchannel: not found");
+          res.end("webchannel: not found");
           return true;
         }
         throw err;
@@ -178,10 +178,10 @@ export function createStaticAssetsHandler(
       res.end(body);
       return true;
     } catch (err) {
-      console.warn(`[clawchannel] static asset error: ${String(err)}`);
+      console.warn(`[webchannel] static asset error: ${String(err)}`);
       res.statusCode = 500;
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("clawchannel: internal error");
+      res.end("webchannel: internal error");
       return true;
     }
   };

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { WebSocket } from "ws";
 
-import { ClawChannelTransport, ANON_PEER_ID } from "./transport.js";
+import { WebChannelTransport, ANON_PEER_ID } from "./transport.js";
 
 /**
  * Minimal fake of a `ws` WebSocket good enough for the transport's heartbeat,
@@ -45,14 +45,14 @@ function makeFakeSocket(opts?: {
 }
 
 /** Register a fake socket through the (private) registerConnection path. */
-function register(transport: ClawChannelTransport, ws: unknown): void {
+function register(transport: WebChannelTransport, ws: unknown): void {
   (transport as unknown as { registerConnection: (w: unknown) => void })
     .registerConnection(ws);
 }
 
 /** Register a fake socket under a specific peer key (multi-user cases). */
 function registerAs(
-  transport: ClawChannelTransport,
+  transport: WebChannelTransport,
   ws: unknown,
   peerId: string,
 ): void {
@@ -63,13 +63,13 @@ function registerAs(
   ).registerConnection(ws, peerId);
 }
 
-function mapHas(transport: ClawChannelTransport): boolean {
+function mapHas(transport: WebChannelTransport): boolean {
   const sockets = (transport as unknown as { sockets: Map<string, unknown> })
     .sockets;
   return sockets.has(ANON_PEER_ID);
 }
 
-describe("clawchannel transport heartbeat", () => {
+describe("webchannel transport heartbeat", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => {
     vi.clearAllTimers();
@@ -77,7 +77,7 @@ describe("clawchannel transport heartbeat", () => {
   });
 
   it("pings an alive socket each tick", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const ws = makeFakeSocket();
     register(transport, ws);
 
@@ -97,7 +97,7 @@ describe("clawchannel transport heartbeat", () => {
   });
 
   it("terminates a socket that did not pong by the next tick", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const ws = makeFakeSocket();
     register(transport, ws);
 
@@ -114,7 +114,7 @@ describe("clawchannel transport heartbeat", () => {
   });
 
   it("terminate path removes the socket from the map", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const ws = makeFakeSocket();
     register(transport, ws);
     expect(mapHas(transport)).toBe(true);
@@ -128,7 +128,7 @@ describe("clawchannel transport heartbeat", () => {
   });
 
   it("dispose stops the timer and clears sockets", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const ws = makeFakeSocket();
     register(transport, ws);
 
@@ -143,9 +143,9 @@ describe("clawchannel transport heartbeat", () => {
   });
 });
 
-describe("clawchannel transport backpressure (safeSend)", () => {
+describe("webchannel transport backpressure (safeSend)", () => {
   it("sends when buffer is under the cap", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const ws = makeFakeSocket({ bufferedAmount: 0 });
     register(transport, ws);
 
@@ -158,7 +158,7 @@ describe("clawchannel transport backpressure (safeSend)", () => {
   });
 
   it("drops when bufferedAmount exceeds the cap", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     // 2 MB buffered, over the 1 MB cap.
     const ws = makeFakeSocket({ bufferedAmount: 2_000_000 });
     register(transport, ws);
@@ -173,7 +173,7 @@ describe("clawchannel transport backpressure (safeSend)", () => {
   });
 
   it("does not send on a non-OPEN socket", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const ws = makeFakeSocket({ readyState: WebSocket.CLOSING });
     register(transport, ws);
 
@@ -184,9 +184,9 @@ describe("clawchannel transport backpressure (safeSend)", () => {
   });
 });
 
-describe("clawchannel transport multi-peer routing", () => {
+describe("webchannel transport multi-peer routing", () => {
   it("sendText delivers to the exact peer key, never another peer's socket", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const alice = makeFakeSocket();
     const bob = makeFakeSocket();
     registerAs(transport, alice, "peer-alice");
@@ -205,7 +205,7 @@ describe("clawchannel transport multi-peer routing", () => {
   });
 
   it("sendText returns false for an unmapped peer (no wrong-socket fallback)", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const alice = makeFakeSocket();
     const bob = makeFakeSocket();
     registerAs(transport, alice, "peer-alice");
@@ -220,7 +220,7 @@ describe("clawchannel transport multi-peer routing", () => {
   });
 
   it("sendTextToAnyOpen refuses to guess when multiple peers are connected", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const alice = makeFakeSocket();
     const bob = makeFakeSocket();
     registerAs(transport, alice, "peer-alice");
@@ -237,7 +237,7 @@ describe("clawchannel transport multi-peer routing", () => {
   });
 
   it("sendTextToAnyOpen delivers to the sole connection (anonymous case)", () => {
-    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     const only = makeFakeSocket();
     registerAs(transport, only, ANON_PEER_ID);
 

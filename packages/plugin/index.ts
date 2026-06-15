@@ -3,8 +3,8 @@ import path from "node:path";
 
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
-import { ClawChannelTransport } from "./src/transport.js";
-import { createClawChannelPlugin } from "./src/channel.js";
+import { WebChannelTransport } from "./src/transport.js";
+import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
 import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier } from "./src/auth.js";
@@ -15,7 +15,7 @@ import { createStaticAssetsHandler } from "./src/static-assets.js";
 // correct regardless of the gateway's cwd. In the monorepo the plugin lives at
 // packages/plugin/ and the client at packages/client/, so this module's dir
 // (packages/plugin) joins `../client/dist-demo` — the framework-agnostic
-// @clawchannel/client vanilla demo (build it with `npm run build:demo` there).
+// openclaw-webchannel-client vanilla demo (build it with `npm run build:demo` there).
 const pluginDir = path.dirname(fileURLToPath(import.meta.url));
 const chatUiDistRoot = path.join(
   pluginDir,
@@ -28,15 +28,15 @@ const chatUiDistRoot = path.join(
  * Shared transport instance. The channel plugin (outbound) and the HTTP upgrade
  * route (inbound) both reference the same connection map.
  */
-const transport = new ClawChannelTransport();
+const transport = new WebChannelTransport();
 
-const clawChannelPlugin = createClawChannelPlugin(transport);
+const webChannelPlugin = createWebChannelPlugin(transport);
 
 export default defineChannelPluginEntry({
-  id: "clawchannel",
-  name: "ClawChannel",
+  id: "webchannel",
+  name: "WebChannel",
   description: "Self-hosted web chat channel plugin for OpenClaw.",
-  plugin: clawChannelPlugin,
+  plugin: webChannelPlugin,
 
   registerFull(api) {
     // Bridge inbound WS messages into the agent runtime.
@@ -53,7 +53,7 @@ export default defineChannelPluginEntry({
     transport.setApprovalDecisionHandler((_sessionKey, id, decision) => {
       void handleApprovalDecision(api.config, id, decision).catch((err) => {
         api.logger.error?.(
-          `clawchannel: approval resolve failed (${id}): ${String(err)}`,
+          `webchannel: approval resolve failed (${id}): ${String(err)}`,
         );
       });
     });
@@ -65,7 +65,7 @@ export default defineChannelPluginEntry({
     // plugin fails to load loudly rather than serving an open WebSocket.
     const authConfig = (
       api.config.channels as Record<string, unknown> | undefined
-    )?.clawchannel as { auth?: AuthConfig } | undefined;
+    )?.webchannel as { auth?: AuthConfig } | undefined;
     transport.setVerifier(resolveVerifier(authConfig?.auth, api.logger));
 
     // Accept WebSocket upgrades on the gateway's own port. No extra server.
@@ -77,12 +77,12 @@ export default defineChannelPluginEntry({
     // auth: "plugin" — plugin-managed auth: all identity resolution flows
     // through our injected verifier inside `handleUpgrade` (the single seam).
     api.registerHttpRoute({
-      path: "/clawchannel/ws",
+      path: "/webchannel/ws",
       auth: "plugin",
       match: "exact",
       handler: async (_req, res) => {
         res.statusCode = 426; // Upgrade Required
-        res.end("clawchannel: WebSocket upgrade required");
+        res.end("webchannel: WebSocket upgrade required");
         return true;
       },
       handleUpgrade: (req, socket, head) => {
@@ -91,16 +91,16 @@ export default defineChannelPluginEntry({
       },
     });
 
-    // Serve the built chat UI (the @clawchannel/client vanilla demo) from the
-    // gateway under the `/clawchannel/` prefix, so the whole demo runs from the
+    // Serve the built chat UI (the openclaw-webchannel-client vanilla demo) from the
+    // gateway under the `/webchannel/` prefix, so the whole demo runs from the
     // gateway port with no separate web server. These assets are PUBLIC by
     // design (`auth:
     // "plugin"`): the page and its JS carry no secrets — authentication happens
     // at the WebSocket connect (the verifier seam above). The exact
-    // `/clawchannel/ws` route registered first takes precedence over this prefix
+    // `/webchannel/ws` route registered first takes precedence over this prefix
     // route, so WS upgrades are unaffected; the handler also ignores `ws`.
     api.registerHttpRoute({
-      path: "/clawchannel/",
+      path: "/webchannel/",
       auth: "plugin",
       match: "prefix",
       handler: createStaticAssetsHandler(chatUiDistRoot),

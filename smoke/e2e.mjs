@@ -1,16 +1,16 @@
 import { WebSocket } from "ws";
 import crypto from "node:crypto";
 
-// E2E against a live gateway with channels.clawchannel.auth = hmac-ticket.
+// E2E against a live gateway with channels.webchannel.auth = hmac-ticket.
 // Proves: valid ticket connects + round-trips with the agent; missing/wrong
-// ticket is rejected at the WS upgrade. Run with CLAWCHANNEL_TICKET_SECRET set
+// ticket is rejected at the WS upgrade. Run with WEBCHANNEL_TICKET_SECRET set
 // to the same secret the gateway uses (source ~/.openclaw/.env).
-const SECRET = process.env.CLAWCHANNEL_TICKET_SECRET;
+const SECRET = process.env.WEBCHANNEL_TICKET_SECRET;
 if (!SECRET) {
-  console.error("CLAWCHANNEL_TICKET_SECRET not set");
+  console.error("WEBCHANNEL_TICKET_SECRET not set");
   process.exit(3);
 }
-const BASE = "ws://127.0.0.1:18789/clawchannel/ws";
+const BASE = "ws://127.0.0.1:18789/webchannel/ws";
 const b64 = (s) => Buffer.from(s).toString("base64url");
 
 function mint(secret, sub, ttl = 60) {

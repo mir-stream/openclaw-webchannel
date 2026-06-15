@@ -1,14 +1,14 @@
 // Smoke for the BUILT headless client (dist/) against a live gateway with
-// channels.clawchannel.auth = hmac-ticket. Proves the framework-agnostic
-// ClawChannelClient connects (via getTicket), round-trips a user_message, and
+// channels.webchannel.auth = hmac-ticket. Proves the framework-agnostic
+// WebChannelClient connects (via getTicket), round-trips a user_message, and
 // surfaces the agent reply in its subscribed state — all with no DOM, no React.
-// Run with CLAWCHANNEL_TICKET_SECRET set (source ~/.openclaw/.env).
+// Run with WEBCHANNEL_TICKET_SECRET set (source ~/.openclaw/.env).
 import crypto from "node:crypto";
-import { ClawChannelClient } from "./dist/index.js";
+import { WebChannelClient } from "./dist/index.js";
 
-const SECRET = process.env.CLAWCHANNEL_TICKET_SECRET;
+const SECRET = process.env.WEBCHANNEL_TICKET_SECRET;
 if (!SECRET) {
-  console.error("CLAWCHANNEL_TICKET_SECRET not set");
+  console.error("WEBCHANNEL_TICKET_SECRET not set");
   process.exit(3);
 }
 
@@ -22,8 +22,8 @@ function mint(sub, ttl = 60) {
   return `${si}.${sig}`;
 }
 
-const client = new ClawChannelClient({
-  url: "ws://127.0.0.1:18789/clawchannel/ws",
+const client = new WebChannelClient({
+  url: "ws://127.0.0.1:18789/webchannel/ws",
   getTicket: async () => mint("web-anon"),
 });
 

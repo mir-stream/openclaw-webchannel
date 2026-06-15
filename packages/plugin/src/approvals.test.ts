@@ -14,7 +14,7 @@ vi.mock("openclaw/plugin-sdk/approval-handler-runtime", async (importOriginal) =
   return { ...actual, resolveApprovalOverGateway };
 });
 
-import { ClawChannelTransport } from "./transport.js";
+import { WebChannelTransport } from "./transport.js";
 import type { ApprovalRequestPayload } from "./transport.js";
 import {
   createClawApprovalNativeRuntimeSpec,
@@ -50,10 +50,10 @@ function fakePendingExecView(id = "exec-1"): any {
 }
 
 const cfgEnabled: any = {
-  channels: { clawchannel: { execApprovals: { enabled: true } } },
+  channels: { webchannel: { execApprovals: { enabled: true } } },
 };
 
-describe("clawchannel approval payload projection", () => {
+describe("webchannel approval payload projection", () => {
   it("forwards only the offered decisions and drops command text", () => {
     const payload = buildApprovalRequestPayload(fakePendingExecView());
     expect(payload.id).toBe("exec-1");
@@ -72,9 +72,9 @@ describe("clawchannel approval payload projection", () => {
   });
 });
 
-describe("clawchannel native approval runtime", () => {
+describe("webchannel native approval runtime", () => {
   it("emits an approval_request frame with the offered options on delivery", async () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     const requestSpy = vi
       .spyOn(transport, "sendApprovalRequest")
       .mockReturnValue(true);
@@ -132,7 +132,7 @@ describe("clawchannel native approval runtime", () => {
   });
 
   it("emits an approval_resolved frame when the gateway resolves the approval", async () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
     const resolvedSpy = vi
       .spyOn(transport, "sendApprovalResolved")
@@ -184,7 +184,7 @@ describe("clawchannel native approval runtime", () => {
   });
 });
 
-describe("clawchannel native approval origin routing (multi-user)", () => {
+describe("webchannel native approval origin routing (multi-user)", () => {
   // resolveOriginTarget must read the turn source (`turnSourceTo`) so the prompt
   // is routed to the originating peer, not a hardcoded anon key.
   const adapter = createClawApprovalNativeAdapter();
@@ -201,7 +201,7 @@ describe("clawchannel native approval origin routing (multi-user)", () => {
       cfg: cfgEnabled,
       accountId: null,
       approvalKind: "exec",
-      request: execRequest("peer-alice", "clawchannel"),
+      request: execRequest("peer-alice", "webchannel"),
     });
     expect(target).toEqual({ to: "peer-alice" });
   });
@@ -227,7 +227,7 @@ describe("clawchannel native approval origin routing (multi-user)", () => {
   });
 
   it("prepareTarget keys the prompt to the planned per-peer target", async () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     const spec = createClawApprovalNativeRuntimeSpec(transport);
     const prepared = await spec.transport.prepareTarget({
       cfg: cfgEnabled,
@@ -242,11 +242,11 @@ describe("clawchannel native approval origin routing (multi-user)", () => {
     // The prepared session key + dedupeKey are per-peer (bob), so two distinct
     // users never collide and the frame targets bob's socket.
     expect(prepared!.target).toEqual({ sessionKey: "peer-bob" });
-    expect(prepared!.dedupeKey).toBe("clawchannel:peer-bob");
+    expect(prepared!.dedupeKey).toBe("webchannel:peer-bob");
   });
 
   it("delivers the approval_request to the originating peer's socket key", async () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     const requestSpy = vi
       .spyOn(transport, "sendApprovalRequest")
       .mockReturnValue(true);
@@ -287,7 +287,7 @@ describe("clawchannel native approval origin routing (multi-user)", () => {
   });
 });
 
-describe("clawchannel native approval bootstrap (Gate 1)", () => {
+describe("webchannel native approval bootstrap (Gate 1)", () => {
   // The gateway monitor MUST register an `"approval.native"` runtime context on
   // the context registry handed to it via `ctx.channelRuntime`, scoped to the
   // account id, with the abort signal — otherwise core's approval bootstrap
@@ -309,7 +309,7 @@ describe("clawchannel native approval bootstrap (Gate 1)", () => {
 
     expect(register).toHaveBeenCalledTimes(1);
     const params = register.mock.calls[0][0] as any;
-    expect(params.channelId).toBe("clawchannel");
+    expect(params.channelId).toBe("webchannel");
     expect(params.accountId).toBe("default");
     // The capability key MUST be the SDK's "approval.native" constant.
     expect(params.capability).toBe("approval.native");
@@ -326,13 +326,13 @@ describe("clawchannel native approval bootstrap (Gate 1)", () => {
   });
 });
 
-describe("clawchannel native approval surface state (Gate 2)", () => {
+describe("webchannel native approval surface state (Gate 2)", () => {
   // The capability must expose getExecInitiatingSurfaceState /
   // getActionAvailabilityState (read at the CAPABILITY level by core's
   // exec-approval-surface resolver) so we count as a native exec approval
   // client, returning "enabled" when approvals are on.
   it("exposes surface-state hooks returning enabled when execApprovals on", () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     const capability = createClawApprovalCapability(transport) as any;
 
     expect(typeof capability.getExecInitiatingSurfaceState).toBe("function");
@@ -351,10 +351,10 @@ describe("clawchannel native approval surface state (Gate 2)", () => {
   });
 
   it("reports disabled surface state when execApprovals are off", () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     const capability = createClawApprovalCapability(transport) as any;
     const cfgOff: any = {
-      channels: { clawchannel: { execApprovals: { enabled: false } } },
+      channels: { webchannel: { execApprovals: { enabled: false } } },
     };
 
     expect(
@@ -363,7 +363,7 @@ describe("clawchannel native approval surface state (Gate 2)", () => {
   });
 });
 
-describe("clawchannel in-band approval text suppression (Gate 2)", () => {
+describe("webchannel in-band approval text suppression (Gate 2)", () => {
   // A reply payload carrying exec-approval metadata, as core builds for a
   // pending exec approval (channelData.execApproval). getExecApprovalReplyMetadata
   // requires both approvalId + approvalSlug.
@@ -410,7 +410,7 @@ describe("clawchannel in-band approval text suppression (Gate 2)", () => {
 
   it("does NOT suppress when execApprovals are disabled", () => {
     const cfgOff: any = {
-      channels: { clawchannel: { execApprovals: { enabled: false } } },
+      channels: { webchannel: { execApprovals: { enabled: false } } },
     };
     expect(
       shouldSuppressClawNativeExecApprovalPrompt({
@@ -423,7 +423,7 @@ describe("clawchannel in-band approval text suppression (Gate 2)", () => {
   });
 });
 
-describe("clawchannel approval decision -> gateway", () => {
+describe("webchannel approval decision -> gateway", () => {
   beforeEach(() => {
     resolveApprovalOverGateway.mockClear();
   });
@@ -441,7 +441,7 @@ describe("clawchannel approval decision -> gateway", () => {
   });
 
   it("routes an inbound approval_decision frame through the transport handler", () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     const handler = vi.fn();
     transport.setApprovalDecisionHandler(handler);
 

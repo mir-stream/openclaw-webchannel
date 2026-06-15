@@ -1,5 +1,5 @@
 {
-  "name": "clawchannel-monorepo",
+  "name": "webchannel-monorepo",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -10,6 +10,6 @@
     "test": "vitest run",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
-    "build:demo": "npm run build:demo --workspace @clawchannel/client"
+    "build:demo": "npm run build:demo --workspace openclaw-webchannel-client"
   }
 }

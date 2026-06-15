@@ -2,8 +2,8 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   ChatMessage,
-  ClawChannelOptions,
-  ClawChannelState,
+  WebChannelOptions,
+  WebChannelState,
   ConnectionStatus,
   InboundWsMessage,
   Listener,
@@ -11,7 +11,7 @@ import type {
 } from "./types.js";
 
 /** Default WebSocket path on the gateway (same origin). */
-const DEFAULT_WS_PATH = "/clawchannel/ws";
+const DEFAULT_WS_PATH = "/webchannel/ws";
 
 /** Reconnect backoff: base delay, growth factor, and a hard cap. */
 const RECONNECT_BASE_MS = 500;
@@ -19,7 +19,7 @@ const RECONNECT_FACTOR = 2;
 const RECONNECT_CAP_MS = 10_000;
 
 /**
- * Headless ClawChannel client: owns the WebSocket, the reconnect policy, the
+ * Headless WebChannel client: owns the WebSocket, the reconnect policy, the
  * wire-protocol parsing, AND the transcript/approval state. It is framework- and
  * DOM-render-free — consumers `subscribe` to immutable state snapshots and call
  * `send` / `decide`. The React widget and any vanilla/Vue UI are thin views on
@@ -28,16 +28,16 @@ const RECONNECT_CAP_MS = 10_000;
  * Lifecycle: construct → `connect()` → … → `close()`. `connect()`/`close()` are
  * the only lifecycle calls; everything else is driven by socket events.
  *
- *   const client = new ClawChannelClient({ getTicket });
+ *   const client = new WebChannelClient({ getTicket });
  *   const unsub = client.subscribe((state) => render(state));
  *   client.connect();
  *   client.send("hello");
  *   // later: unsub(); client.close();
  */
-export class ClawChannelClient {
-  private readonly options: ClawChannelOptions;
+export class WebChannelClient {
+  private readonly options: WebChannelOptions;
 
-  private state: ClawChannelState = {
+  private state: WebChannelState = {
     messages: [],
     approvals: [],
     status: "connecting",
@@ -65,12 +65,12 @@ export class ClawChannelClient {
    */
   private connecting = false;
 
-  constructor(options: ClawChannelOptions = {}) {
+  constructor(options: WebChannelOptions = {}) {
     this.options = options;
   }
 
   /** The current immutable state snapshot. */
-  getState(): ClawChannelState {
+  getState(): WebChannelState {
     return this.state;
   }
 
@@ -156,7 +156,7 @@ export class ClawChannelClient {
 
   // ── state plumbing ────────────────────────────────────────────────────────
 
-  private setState(patch: Partial<ClawChannelState>): void {
+  private setState(patch: Partial<WebChannelState>): void {
     this.state = { ...this.state, ...patch };
     for (const listener of this.listeners) listener(this.state);
   }

@@ -2,7 +2,7 @@ import { WebSocket } from "ws";
 
 // Mirrors the widget's reconnect logic (exponential backoff + jitter) to prove
 // the reconnect path live: round-trip, survive a gateway restart, round-trip again.
-const URL = process.env.WS_URL || "ws://127.0.0.1:18789/clawchannel/ws";
+const URL = process.env.WS_URL || "ws://127.0.0.1:18789/webchannel/ws";
 const t0 = Date.now();
 const ms = () => `${String(Date.now() - t0).padStart(6)}ms`;
 

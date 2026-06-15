@@ -1,28 +1,28 @@
 /**
- * Vanilla (no-framework) demo for `@clawchannel/client`.
+ * Vanilla (no-framework) demo for `openclaw-webchannel-client`.
  *
- * This is the whole point of the package: drive ClawChannel from plain
- * JavaScript + DOM, with ZERO React. We construct one `ClawChannelClient`,
+ * This is the whole point of the package: drive WebChannel from plain
+ * JavaScript + DOM, with ZERO React. We construct one `WebChannelClient`,
  * `subscribe` to its immutable state, and re-render a tiny transcript UI on each
  * change. `send` / `decide` go straight back to the client.
  *
  * Mirrors the React example's hmac-ticket flow: enter the gateway's shared
  * secret + a user id, the browser mints a short-lived ticket (devTicket.ts) and
- * connects via the same-origin `/clawchannel/ws` path (vite proxies it to the
+ * connects via the same-origin `/webchannel/ws` path (vite proxies it to the
  * gateway). Run with `npm run dev`.
  *
  * ⚠️ DEMO ONLY — minting tickets in the browser exposes the secret. In
  * production your backend issues tickets server-side (AUTH.md §5); pass that as
  * `getTicket`. For a cross-origin gateway, pass `url` instead of using the proxy.
  */
-import { ClawChannelClient } from "../src/index.js";
-import type { ApprovalDecision, ClawChannelState } from "../src/index.js";
+import { WebChannelClient } from "../src/index.js";
+import type { ApprovalDecision, WebChannelState } from "../src/index.js";
 import { makeDevGetTicket } from "./devTicket.js";
 
 const root = document.getElementById("app")!;
 root.style.cssText = "max-width:480px;margin:2rem auto;font-family:system-ui";
 
-let client: ClawChannelClient | null = null;
+let client: WebChannelClient | null = null;
 let unsubscribe: (() => void) | null = null;
 
 // ── connect gate (secret + userId) ────────────────────────────────────────────
@@ -30,10 +30,10 @@ function renderConnectForm(): void {
   client = null;
   root.replaceChildren();
 
-  const h = el("h2", "ClawChannel — vanilla (no React)");
+  const h = el("h2", "WebChannel — vanilla (no React)");
   const note = el(
     "p",
-    "Enter the gateway's shared secret (channels.clawchannel.auth.ticketSecret) and a user id. The browser mints a short-lived ticket and connects.",
+    "Enter the gateway's shared secret (channels.webchannel.auth.ticketSecret) and a user id. The browser mints a short-lived ticket and connects.",
   );
   note.style.cssText = "color:#555;font-size:14px;line-height:1.5";
   const warn = el(
@@ -69,8 +69,8 @@ function renderConnectForm(): void {
 
 // ── live chat (subscribed to the client) ──────────────────────────────────────
 function startSession(secret: string, sub: string): void {
-  client = new ClawChannelClient({
-    path: "/clawchannel/ws",
+  client = new WebChannelClient({
+    path: "/webchannel/ws",
     getTicket: makeDevGetTicket(secret, sub),
   });
 
@@ -122,7 +122,7 @@ function startSession(secret: string, sub: string): void {
 
   root.append(bar, transcript, form);
 
-  const render = (state: ClawChannelState): void => {
+  const render = (state: WebChannelState): void => {
     dot.style.background =
       state.status === "connected"
         ? "#2ecc71"
@@ -146,7 +146,7 @@ function startSession(secret: string, sub: string): void {
 }
 
 // ── render helpers ────────────────────────────────────────────────────────────
-function renderMessage(m: ClawChannelState["messages"][number]): HTMLElement {
+function renderMessage(m: WebChannelState["messages"][number]): HTMLElement {
   const bubble = el("div", m.text);
   const isUser = m.role === "user";
   bubble.style.cssText = [
@@ -179,7 +179,7 @@ function approvalButtonColor(style: string): string {
   }
 }
 
-function renderApproval(a: ClawChannelState["approvals"][number]): HTMLElement {
+function renderApproval(a: WebChannelState["approvals"][number]): HTMLElement {
   const card = el("div");
   card.style.cssText =
     "align-self:flex-start;background:#fff8e1;border:1px solid #f0d98c;" +

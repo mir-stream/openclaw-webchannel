@@ -1,5 +1,5 @@
 /**
- * Public types for the headless ClawChannel client.
+ * Public types for the headless WebChannel client.
  *
  * The wire envelopes (`InboundWsMessage` / `OutboundWsMessage`) mirror the
  * plugin side declared in `src/transport.ts`. They are re-declared here (not
@@ -57,7 +57,7 @@ export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
  * detect updates by identity — and a React adapter can feed it straight into
  * `useSyncExternalStore` without tearing.
  */
-export type ClawChannelState = {
+export type WebChannelState = {
   messages: ChatMessage[];
   approvals: ApprovalRequest[];
   status: ConnectionStatus;
@@ -66,14 +66,14 @@ export type ClawChannelState = {
 };
 
 /** A state-change subscriber. Receives the latest immutable snapshot. */
-export type Listener = (state: ClawChannelState) => void;
+export type Listener = (state: WebChannelState) => void;
 
 /**
  * Client options — all optional. A zero-arg construction connects to
- * `/clawchannel/ws` on the current origin with no ticket (the anonymous dev
+ * `/webchannel/ws` on the current origin with no ticket (the anonymous dev
  * path).
  */
-export type ClawChannelOptions = {
+export type WebChannelOptions = {
   /**
    * Full WebSocket URL (`ws://` or `wss://`), e.g. for a CROSS-ORIGIN gateway.
    * Takes precedence over `path`. Use this when the page and the gateway live on
@@ -82,7 +82,7 @@ export type ClawChannelOptions = {
   url?: string;
   /**
    * WS path on the CURRENT origin (ignored when `url` is set). Defaults to
-   * `/clawchannel/ws`.
+   * `/webchannel/ws`.
    */
   path?: string;
   /**

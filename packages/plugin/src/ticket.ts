@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 /**
- * Zero-dependency HS256 JWT sign/verify for ClawChannel connection tickets.
+ * Zero-dependency HS256 JWT sign/verify for WebChannel connection tickets.
  *
  * Deliberately depends on `node:crypto` ONLY — no `ws`, no plugin SDK. The same
  * code must run in two independent Node processes: the host's SaaS backend (which
@@ -44,7 +44,7 @@ export type IssueTicketInput = {
  * Issue a compact HS256 JWT ticket: `base64url(header).base64url(payload).base64url(sig)`.
  * Payload is `{ sub, iat, exp, name? }` with `exp = iat + ttlSeconds` (seconds).
  */
-export function issueClawChannelTicket(input: IssueTicketInput): string {
+export function issueWebChannelTicket(input: IssueTicketInput): string {
   const { sub, secret, ttlSeconds, displayName } = input;
   const iat = Math.floor(Date.now() / 1000);
   const payload: Record<string, unknown> = {

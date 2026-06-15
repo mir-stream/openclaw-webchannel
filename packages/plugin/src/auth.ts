@@ -61,7 +61,7 @@ function resolveSecret(ref: SecretRef): string {
   if (typeof ref === "string") {
     if (ref.length === 0) {
       throw new Error(
-        "clawchannel: channels.clawchannel.auth.ticketSecret is an empty string. Refusing to start.",
+        "webchannel: channels.webchannel.auth.ticketSecret is an empty string. Refusing to start.",
       );
     }
     return ref;
@@ -70,20 +70,20 @@ function resolveSecret(ref: SecretRef): string {
     const value = process.env[ref.env];
     if (!value) {
       throw new Error(
-        `clawchannel: channels.clawchannel.auth.ticketSecret env "${ref.env}" is unset or empty. Refusing to start.`,
+        `webchannel: channels.webchannel.auth.ticketSecret env "${ref.env}" is unset or empty. Refusing to start.`,
       );
     }
     return value;
   }
   throw new Error(
-    "clawchannel: channels.clawchannel.auth.ticketSecret must be a string or { env: \"VAR_NAME\" }. Refusing to start.",
+    "webchannel: channels.webchannel.auth.ticketSecret must be a string or { env: \"VAR_NAME\" }. Refusing to start.",
   );
 }
 
 /** Read a single query param value from a raw request URL (path+query). */
 function readQueryParam(reqUrl: string | undefined, param: string): string | null {
   if (!reqUrl) return null;
-  // `req.url` is a path+query like "/clawchannel/ws?ticket=...". Resolve against
+  // `req.url` is a path+query like "/webchannel/ws?ticket=...". Resolve against
   // a dummy origin so the URL parser accepts a relative target.
   let url: URL;
   try {
@@ -97,7 +97,7 @@ function readQueryParam(reqUrl: string | undefined, param: string): string | nul
 function makeAnonymousVerifier(logger?: AuthLogger): ConnectionVerifier {
   // Loud opt-in warning (AUTH.md §7): anonymous must never be a quiet default.
   logger?.warn?.(
-    "clawchannel: auth strategy 'anonymous' selected — ALL connections are unauthenticated (single shared peer). Do NOT use in production.",
+    "webchannel: auth strategy 'anonymous' selected — ALL connections are unauthenticated (single shared peer). Do NOT use in production.",
   );
   return async () => ({ peerId: ANON_PEER_ID });
 }
@@ -133,7 +133,7 @@ export function resolveVerifier(
 ): ConnectionVerifier {
   if (!authConfig || typeof authConfig !== "object" || !("strategy" in authConfig)) {
     throw new Error(
-      "clawchannel: channels.clawchannel.auth.strategy is required (anonymous | hmac-ticket). Refusing to start.",
+      "webchannel: channels.webchannel.auth.strategy is required (anonymous | hmac-ticket). Refusing to start.",
     );
   }
 
@@ -144,7 +144,7 @@ export function resolveVerifier(
       return makeHmacTicketVerifier(authConfig);
     default:
       throw new Error(
-        `clawchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected anonymous | hmac-ticket). Refusing to start.`,
+        `webchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected anonymous | hmac-ticket). Refusing to start.`,
       );
   }
 }

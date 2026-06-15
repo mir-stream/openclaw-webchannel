@@ -1,8 +1,8 @@
-# ClawChannel — 인증 설계 (AUTH)
+# WebChannel — 인증 설계 (AUTH)
 
 > 브라우저 클라이언트가 게이트웨이 WebSocket에 붙을 때의 **인증·신원(identity)** 모델.
 > 상태: **결정됨** — 기존 `BACKLOG.md`의 "브라우저 Auth 모델 (완전 OPEN)" 항목을 대체한다.
-> 용어(2026-06-15): "위젯"은 이제 무프레임워크 **`@clawchannel/client`**(`packages/client`)를 가리킨다. React `@clawchannel/widget`는 삭제됨 — `getTicket` 주입점은 client에 그대로 존재.
+> 용어(2026-06-15): "위젯"은 이제 무프레임워크 **`openclaw-webchannel-client`**(`packages/client`)를 가리킨다. React `openclaw-webchannel-widget`는 삭제됨 — `getTicket` 주입점은 client에 그대로 존재.
 > 핵심 원리: 인증을 코어에 하드코딩하지 않고 **주입 가능한 검증기(ConnectionVerifier) 한 점**으로 수렴시키고,
 > 흔한 방식은 **config로 고르는 빌트인 전략**으로 제공한다. (배포된 플러그인은 코드가 아니라 JSON config로 설정되므로)
 
@@ -54,15 +54,15 @@ type ConnectionVerifier = (req: IncomingMessage) => Promise<ConnectionIdentity |
 | `jwt` | JWKS/공개키 + issuer/audience 검증 | 이미 JWT 발급하는 호스트 |
 | `trusted-header` | 프록시가 주입한 신원 헤더 읽기 | 게이트웨이가 trusted-proxy 뒤일 때 |
 
-소비자 OpenClaw config (이 스키마는 `openclaw.plugin.json`의 `channelConfigs.clawchannel.schema`가 검증):
+소비자 OpenClaw config (이 스키마는 `openclaw.plugin.json`의 `channelConfigs.webchannel.schema`가 검증):
 
 ```json5
 channels: {
-  clawchannel: {
+  webchannel: {
     auth: {
       strategy: "hmac-ticket",
       // 시크릿은 평문 금지 — OpenClaw SecretRef(env/file/exec) 사용
-      ticketSecret: { env: "CLAWCHANNEL_TICKET_SECRET" },
+      ticketSecret: { env: "WEBCHANNEL_TICKET_SECRET" },
     },
   },
 }
@@ -75,8 +75,8 @@ channels: {
 빌트인으로 안 되는 인증은 소비자가 자기 얇은 래퍼 플러그인에서 우리 패키지를 *라이브러리로* 사용:
 
 ```ts
-import { createClawChannel } from "@clawchannel/plugin";
-createClawChannel({
+import { createWebChannel } from "openclaw-webchannel";
+createWebChannel({
   auth: async (req) => {
     const id = await myWeirdAuth(req);
     return id ? { peerId: id } : null;
@@ -111,7 +111,7 @@ createClawChannel({
 | 재연결 | — | 끊기면 `getTicket` 재호출 → 새 표로 재연결 |
 
 - 클라이언트도 인증을 *모른다*. "호스트야 표 줘" 하고 나르기만. `trusted-header`/쿠키 방식이면 `getTicket`은 no-op.
-- **ticket 발급 헬퍼:** `issueClawChannelTicket({ sub, secret, ttlSeconds })` — 호스트 백엔드가 서명에 사용.
+- **ticket 발급 헬퍼:** `issueWebChannelTicket({ sub, secret, ttlSeconds })` — 호스트 백엔드가 서명에 사용.
   서명/검증 코드가 **두 독립 Node 프로세스(SaaS 백엔드 + 게이트웨이 플러그인)**에서 동일해야 하므로 **zero-dep**(SDK 안 물게)으로 제공. → `PACKAGING.md` §3 참조.
 
 ---
@@ -131,12 +131,12 @@ createClawChannel({
 | 위치 | 동작 |
 |---|---|
 | `src/auth.ts` | `ConnectionVerifier` 계약 + `anonymous`/`hmac-ticket` 전략 + `resolveVerifier`(안전 기본값) |
-| `src/ticket.ts` | zero-dep HS256 발급(`issueClawChannelTicket`)/검증(`verifyTicket`, alg 핀·timing-safe·exp) |
+| `src/ticket.ts` | zero-dep HS256 발급(`issueWebChannelTicket`)/검증(`verifyTicket`, alg 핀·timing-safe·exp) |
 | `src/transport.ts` `handleUpgrade` | 검증기 실행 → 실패 시 401+destroy, 성공 시 `peerId`로 `registerConnection` |
 | `src/inbound.ts` / `approvals.ts` | per-peer 라우팅 — 답변/progress는 캡처된 `wsKey`, 승인은 `turnSourceTo`(= 출발 peer) |
-| `index.ts` | config `channels.clawchannel.auth` → `resolveVerifier` → `transport.setVerifier` + WS·정적 라우트 |
-| `openclaw.plugin.json` | `channelConfigs.clawchannel.schema.auth`(strategy enum + ticketSecret string\|{env} + ticketParam) |
-| `@clawchannel/client` (`packages/client/src/client.ts`) | `getTicket` 주입 → `?ticket=` + 재연결 재발급. (구 위젯 훅 `useClawChannel.ts`는 삭제) |
+| `index.ts` | config `channels.webchannel.auth` → `resolveVerifier` → `transport.setVerifier` + WS·정적 라우트 |
+| `openclaw.plugin.json` | `channelConfigs.webchannel.schema.auth`(strategy enum + ticketSecret string\|{env} + ticketParam) |
+| `openclaw-webchannel-client` (`packages/client/src/client.ts`) | `getTicket` 주입 → `?ticket=` + 재연결 재발급. (구 위젯 훅 `useWebChannel.ts`는 삭제) |
 
 → **hmac-ticket E2E 라이브 검증됨(2026-06-15):** 유효 ticket 연결 + 에이전트 응답, 미·오 ticket 거절. (멀티유저 outbound/approval 라우팅 포함 — 더는 미해결 아님)
 
@@ -144,10 +144,10 @@ createClawChannel({
 
 ## 9. 미해결(후속)
 
-- **크로스오리진 게이트웨이 URL:** `@clawchannel/client`는 `url` 옵션으로 **해결됨**(다른 오리진 게이트웨이 직접 지정). same-origin이면 `path`만으로 충분.
-- **SaaS 실연동:** 현재 데모는 **브라우저에서 ticket 발급**(`packages/client/demo/devTicket.ts`, DEV 전용, 시크릿 노출). 실서비스는 SaaS 백엔드가 서버측 `issueClawChannelTicket`로 발급 → 클라이언트 `getTicket`이 호출. ticket 서명 모듈은 `@clawchannel/ticket`로 분리 후보(`PACKAGING.md` §3).
+- **크로스오리진 게이트웨이 URL:** `openclaw-webchannel-client`는 `url` 옵션으로 **해결됨**(다른 오리진 게이트웨이 직접 지정). same-origin이면 `path`만으로 충분.
+- **SaaS 실연동:** 현재 데모는 **브라우저에서 ticket 발급**(`packages/client/demo/devTicket.ts`, DEV 전용, 시크릿 노출). 실서비스는 SaaS 백엔드가 서버측 `issueWebChannelTicket`로 발급 → 클라이언트 `getTicket`이 호출. ticket 서명 모듈은 `openclaw-webchannel-ticket`로 분리 후보(`PACKAGING.md` §3).
 - **세션 중 강제 만료(revocation):** 이미 열린 소켓은 자동으로 안 닫힘. SaaS 로그아웃/만료 시 즉시 끊으려면 별도 처리(heartbeat 재검증 또는 서버측 강제 close). 또한 **잘못된 ticket 시 클라이언트가 재연결 루프**(앰버) — "인증 실패" UX 미구현.
-- `jwt` / `trusted-header` 빌트인, `createClawChannel({auth})` 커스텀 함수 주입은 후순위.
+- `jwt` / `trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입은 후순위.
 - 멀티탭 사용자를 같은 peerId로 묶을지/탭별 분리할지 정책.
 
 ---

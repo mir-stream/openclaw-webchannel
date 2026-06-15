@@ -1,6 +1,6 @@
-# ClawChannel — 조사 노트 (RESEARCH)
+# WebChannel — 조사 노트 (RESEARCH)
 
-> 목적: ClawChannel 개발을 이어받는 에이전트가 **재조사 없이** 바로 착수하도록,
+> 목적: WebChannel 개발을 이어받는 에이전트가 **재조사 없이** 바로 착수하도록,
 > OpenClaw 내부에서 직접 확인한 사실·정확한 경로·API 이름을 정리한 레퍼런스.
 > 표기: ✅ = 설치본 소스/문서에서 직접 확인 / ⚠️ = 추론·미확정 / 📄 = 문서 경로.
 > 조사 시점 기준 설치본: **OpenClaw `v2026.6.6` (8c802aa)**.
@@ -93,7 +93,7 @@ createChatChannelPlugin<ResolvedAccount>({
 📄 `docs/plugins/architecture-internals.md` (§Gateway HTTP routes, ~line 620)
 ```ts
 api.registerHttpRoute({
-  path: "/clawchannel/ws",
+  path: "/webchannel/ws",
   auth: "plugin",            // "gateway" | "plugin" (필수)
   match: "exact",            // "exact"(기본) | "prefix"
   handler: async (req, res) => { ... return true },  // 일반 HTTP
@@ -177,7 +177,7 @@ api.registerHttpRoute({
 - **코어가 same-chat `/approve <id> allow-once|allow-always|deny` 무료 제공** ✅ → 채널이 아무것도 안 해도 텍스트 승인 가능.
 - 채널이 **네이티브 버튼**을 원하면 `approvalCapability` 구현(텔레그램 inlineButtons, Matrix 리액션 ✅❌♾️ 등).
 - 승인 ID `plugin:` 접두 → plugin approval, 그 외 → exec approval.
-- 텔레그램 설정 예: `channels.telegram.execApprovals.{enabled,approvers,target:"dm"|"channel"|"both"}`, `capabilities.inlineButtons`. (ClawChannel도 동일 패턴) 📄 `docs/channels/telegram.md`
+- 텔레그램 설정 예: `channels.telegram.execApprovals.{enabled,approvers,target:"dm"|"channel"|"both"}`, `capabilities.inlineButtons`. (WebChannel도 동일 패턴) 📄 `docs/channels/telegram.md`
 - `allowFrom`(대화 허용) ≠ `execApprovals.approvers`(승인 권한). 만료 기본 30분.
 
 ---
@@ -212,14 +212,14 @@ api.registerHttpRoute({
 ### 번들 채널 (이 설치본 `dist/extensions/`)
 존재 확인된 채널: `telegram`, `signal`, `sms`, `imessage`, `irc`, `mattermost`, `clickclack`, `microsoft`, `google` ✅
 - `dist/extensions/telegram/openclaw.plugin.json` 존재 확인 ✅
-- **webhook/HTTP inbound 패턴 참고:** `microsoft`(Teams), `google`(Chat), `mattermost` — ClawChannel의 라우트-기반 inbound와 형태 유사. (문서가 Teams/Google Chat을 inbound 예제로 지목)
+- **webhook/HTTP inbound 패턴 참고:** `microsoft`(Teams), `google`(Chat), `mattermost` — WebChannel의 라우트-기반 inbound와 형태 유사. (문서가 Teams/Google Chat을 inbound 예제로 지목)
 - ⚠️ 번들은 minified 빌드물. 원본 가독 소스는 GitHub `openclaw/openclaw` 레포의 해당 채널 참고 권장.
 
 ### 커뮤니티 (웹 채널 — 전부 외부 SaaS 종속)
 - `now4real/openclaw-now4real` (**MIT**) — 웹 위젯 채널. **구조 템플릿 1순위.** inbound 웹훅(`/now4real/webhook`)+outbound API 호출. 단 위젯·배달은 Now4real 클라우드.
 - `def-initialize/openclaw-channel-streamchat` (GPL-3.0) — Stream Chat 채널. inbound는 Stream에 봇 WS, outbound는 placeholder→progressive update(스트리밍 패턴 참고, 코드는 GPL이라 패턴만).
 - (채널 아님) `MarlBurroW/pinchchat`(대시보드), `Hiich/openclaw-browser-plugin`(크롬확장), `GreenSheep01201/claw-voice-chat`(음성), `actionagentai/openclaw-dashboard`(Next.js operator 대시보드, MIT, `lib/gateway-client.ts`+`use-openclaw-*` 훅+80+ 메서드 타입 — WS 클라이언트 참고용).
-- `openclaw/openclaw` **Issue #49178** — 재사용 WS 클라이언트 SDK 부재(공식 인지). ClawChannel이 채우는 빈칸이 실재함을 확인.
+- `openclaw/openclaw` **Issue #49178** — 재사용 WS 클라이언트 SDK 부재(공식 인지). WebChannel이 채우는 빈칸이 실재함을 확인.
 
 ---
 
@@ -266,16 +266,16 @@ ls $OC/dist/extensions/ | grep -iE 'telegram|google|microsoft|mattermost'
 ### 승인을 "출발 peer"로 라우팅 (멀티유저 핵심)
 - 승인 요청 페이로드(`ExecApprovalRequestPayload`/`PluginApprovalRequestPayload`)에 **`turnSourceChannel` + `turnSourceTo`** 필드가 있음. `turnSourceTo`는 inbound 턴의 `reply.to`에서 채워짐 = 우리가 기록한 peer `wsKey` = **transport 소켓맵 키와 동일**.
   - d.ts: `dist/plugin-sdk/exec-approvals-*.d.ts`(turnSource* 필드), `plugin-approvals-*.d.ts`. 번들 `signal`/`googlechat` 네이티브 어댑터가 동일 패턴 사용.
-- ⇒ `approvalCapability`의 `resolveOriginTarget`/`transport.prepareTarget`에서 `turnSourceChannel==="clawchannel"` 필터 후 `turnSourceTo`를 sessionKey로 쓰면 승인 카드가 **요청한 그 브라우저**로 감. (구현: `src/approvals.ts`)
+- ⇒ `approvalCapability`의 `resolveOriginTarget`/`transport.prepareTarget`에서 `turnSourceChannel==="webchannel"` 필터 후 `turnSourceTo`를 sessionKey로 쓰면 승인 카드가 **요청한 그 브라우저**로 감. (구현: `src/approvals.ts`)
 - 답변·progress draft는 이미 inbound가 캡처한 `wsKey`로 per-peer 전달(`src/inbound.ts`).
 
 ### 정적 자산 서빙 (게이트웨이 단일 배포)
-- `registerHttpRoute`는 **exact `/clawchannel/ws` + prefix `/clawchannel/`가 같은 auth 레벨에서 공존** 가능("fallthrough chains on same auth level"); exact가 우선이라 WS 업그레이드 영향 없음.
+- `registerHttpRoute`는 **exact `/webchannel/ws` + prefix `/webchannel/`가 같은 auth 레벨에서 공존** 가능("fallthrough chains on same auth level"); exact가 우선이라 WS 업그레이드 영향 없음.
 - 게이트웨이 HTTP 레이어가 **라우트 매칭 전에 경로를 정규화/디코드**함 → `..`·인코딩 traversal이 우리 핸들러에 닿기 전에 무력화(루트 대시보드로 떨어짐). 그래도 핸들러 자체 containment 체크 보유(`src/static-assets.ts`).
-- 예제 빌드 base를 `/clawchannel/`로 두면 자산 URL이 그 prefix로 해석됨(`vite.config.ts` build 시).
+- 예제 빌드 base를 `/webchannel/`로 두면 자산 URL이 그 prefix로 해석됨(`vite.config.ts` build 시).
 
 ### 플러그인 로딩 / 테스트 루프
-- 사용자 게이트웨이는 `plugins.load.paths`(레포 경로) + `openclaw.extensions:["./index.ts"]`로 **TS 소스를 직접 로드** → `openclaw gateway restart`가 소스 변경을 즉시 반영(플러그인은 빌드 불필요; 정적 서빙되는 채팅 UI는 `packages/client`에서 `npm run build:demo` 필요). 상세 E2E 절차는 memory `clawchannel-live-gateway-e2e`.
+- 사용자 게이트웨이는 `plugins.load.paths`(레포 경로) + `openclaw.extensions:["./index.ts"]`로 **TS 소스를 직접 로드** → `openclaw gateway restart`가 소스 변경을 즉시 반영(플러그인은 빌드 불필요; 정적 서빙되는 채팅 UI는 `packages/client`에서 `npm run build:demo` 필요). 상세 E2E 절차는 memory `webchannel-live-gateway-e2e`.
 
 ### ticket = JWT HS256 (자체 구현, zero-dep)
 - `src/ticket.ts`: `node:crypto` HMAC로 `base64url(header).base64url(payload).base64url(sig)`. 검증 시 **alg를 HS256로 명시 핀**(헤더 신뢰 안 함) + timing-safe 비교 + `exp`. 브라우저측 동일 포맷은 Web Crypto(`crypto.subtle`)로 발급(`example/devTicket.ts`), 크로스런타임 호환성 테스트로 보장(`src/devticket-webcrypto.test.ts`).

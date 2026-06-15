@@ -15,8 +15,8 @@ import type {
   DraftStreamLoop,
 } from "openclaw/plugin-sdk/channel-outbound";
 
-import { CLAWCHANNEL_ID } from "./transport.js";
-import type { ClawChannelTransport } from "./transport.js";
+import { WEBCHANNEL_ID } from "./transport.js";
+import type { WebChannelTransport } from "./transport.js";
 
 /**
  * Stable per-message id we generate for each outbound logical send. This becomes
@@ -25,7 +25,7 @@ import type { ClawChannelTransport } from "./transport.js";
  * answer share one id.
  */
 function nextMessageId(): string {
-  return `clawchannel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `webchannel-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /**
@@ -40,14 +40,14 @@ function nextMessageId(): string {
  */
 export function buildClawReceipt(id: string): MessageReceipt {
   return createMessageReceiptFromOutboundResults({
-    results: [{ channel: CLAWCHANNEL_ID, messageId: id }],
+    results: [{ channel: WEBCHANNEL_ID, messageId: id }],
     kind: "text",
     sentAt: Date.now(),
   });
 }
 
 /**
- * The ClawChannel `message` adapter.
+ * The WebChannel `message` adapter.
  *
  * Why it exists alongside the lean `outbound.attachedResults` (see channel.ts):
  *
@@ -84,9 +84,9 @@ export function buildClawReceipt(id: string): MessageReceipt {
  * primary id is our generated per-message id; this is also the fallback send
  * used if core ever drives the adapter directly.
  */
-export function createClawMessageAdapter(transport: ClawChannelTransport) {
+export function createClawMessageAdapter(transport: WebChannelTransport) {
   return defineChannelMessageAdapter({
-    id: CLAWCHANNEL_ID,
+    id: WEBCHANNEL_ID,
     // Final delivery is plain text only.
     durableFinal: { capabilities: { text: true, media: false } },
     live: {
@@ -166,7 +166,7 @@ export type ProgressDraftController = {
 };
 
 export function createProgressDraftController(params: {
-  transport: ClawChannelTransport;
+  transport: WebChannelTransport;
   sessionKey: string;
   /** Channel config section (for label/maxLines/line formatting). */
   channelConfig: unknown;

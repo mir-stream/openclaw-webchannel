@@ -11,7 +11,7 @@ import { ANON_PEER_ID } from "./auth.js";
 /**
  * The channel id is the fixed key the rest of OpenClaw uses to route to us.
  */
-export const CLAWCHANNEL_ID = "clawchannel";
+export const WEBCHANNEL_ID = "webchannel";
 
 export { ANON_PEER_ID };
 
@@ -105,7 +105,7 @@ type Liveness = { alive: boolean };
  * The gateway owns the listening socket; we never call `.listen()`. We only
  * handle upgrade requests the gateway hands us via `handleUpgrade`.
  */
-export class ClawChannelTransport {
+export class WebChannelTransport {
   private readonly wss: WebSocketServer;
 
   /**
@@ -224,7 +224,7 @@ export class ClawChannelTransport {
       if (!this.warnedBackpressure) {
         this.warnedBackpressure = true;
         console.warn(
-          "[clawchannel] dropping outbound frame: socket buffer over backpressure cap",
+          "[webchannel] dropping outbound frame: socket buffer over backpressure cap",
         );
       }
       // A progress frame is superseded by the next update/finalize, so dropping

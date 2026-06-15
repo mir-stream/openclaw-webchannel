@@ -1,15 +1,15 @@
 import { describe, it, expect, vi } from "vitest";
 
-import { ClawChannelTransport } from "./transport.js";
-import { createClawChannelPlugin } from "./channel.js";
+import { WebChannelTransport } from "./transport.js";
+import { createWebChannelPlugin } from "./channel.js";
 import { handleInboundMessage } from "./inbound.js";
 
-describe("clawchannel plugin", () => {
+describe("webchannel plugin", () => {
   it("resolves an account from config", () => {
-    const transport = new ClawChannelTransport();
-    const plugin = createClawChannelPlugin(transport);
+    const transport = new WebChannelTransport();
+    const plugin = createWebChannelPlugin(transport);
     const cfg = {
-      channels: { clawchannel: { allowFrom: ["user1"], dmSecurity: "allowlist" } },
+      channels: { webchannel: { allowFrom: ["user1"], dmSecurity: "allowlist" } },
     } as any;
     const account = plugin.config.resolveAccount(cfg, undefined);
     expect(account.allowFrom).toEqual(["user1"]);
@@ -17,9 +17,9 @@ describe("clawchannel plugin", () => {
   });
 
   it("reports configured in Phase 0 (no auth required)", () => {
-    const transport = new ClawChannelTransport();
-    const plugin = createClawChannelPlugin(transport);
-    const cfg = { channels: { clawchannel: {} } } as any;
+    const transport = new WebChannelTransport();
+    const plugin = createWebChannelPlugin(transport);
+    const cfg = { channels: { webchannel: {} } } as any;
     const result = plugin.config.inspectAccount!(cfg, undefined) as {
       configured: boolean;
     };
@@ -27,14 +27,14 @@ describe("clawchannel plugin", () => {
   });
 });
 
-describe("clawchannel transport", () => {
+describe("webchannel transport", () => {
   it("returns false when no socket is mapped for a session", () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     expect(transport.sendText("missing", "hello")).toBe(false);
   });
 });
 
-describe("clawchannel inbound round-trip", () => {
+describe("webchannel inbound round-trip", () => {
   // Minimal fake of the kernel: drive the supplied adapter exactly like
   // `runtime.channel.inbound.run` does (ingest -> resolveTurn -> record +
   // deliver) so we can assert the corrected dispatch path records a route and
@@ -106,7 +106,7 @@ describe("clawchannel inbound round-trip", () => {
 
     return {
       api: {
-        config: { channels: { clawchannel: opts?.channelConfig ?? {} } },
+        config: { channels: { webchannel: opts?.channelConfig ?? {} } },
         runtime: { channel },
         logger: {},
       } as any,
@@ -116,7 +116,7 @@ describe("clawchannel inbound round-trip", () => {
   }
 
   it("resolves a channel-scoped route and delivers the reply to the peer socket", async () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     const sendSpy = vi
       .spyOn(transport, "sendText")
       .mockReturnValue(true);
@@ -132,13 +132,13 @@ describe("clawchannel inbound round-trip", () => {
     // Route was resolved for THIS channel + peer (not via buildAgentSessionKey).
     expect(resolveAgentRoute).toHaveBeenCalledWith(
       expect.objectContaining({
-        channel: "clawchannel",
+        channel: "webchannel",
         peer: { kind: "direct", id: "web-anon" },
       }),
     );
     // An originating session/route was recorded carrying the channel-scoped key.
     expect(recordInboundSession).toHaveBeenCalledTimes(1);
-    expect(captured.recordedSessionKey).toBe("agent:main:clawchannel:web-anon");
+    expect(captured.recordedSessionKey).toBe("agent:main:webchannel:web-anon");
     // The recorded reply `to` lines up with the socket-map key we deliver to.
     expect(captured.recordedTo).toBe("web-anon");
     // The reply was delivered back through THIS channel to the peer's socket.
@@ -147,7 +147,7 @@ describe("clawchannel inbound round-trip", () => {
   });
 
   it("streams a progress draft then finalizes the SAME id when streaming.mode=progress", async () => {
-    const transport = new ClawChannelTransport();
+    const transport = new WebChannelTransport();
     // Simulate an open socket so the draft loop's sends "succeed" (returning
     // false would make createDraftStreamLoop retain pending text and not emit).
     const progressSpy = vi
@@ -195,7 +195,7 @@ describe("clawchannel inbound round-trip", () => {
   it("recovers the working bubble when the turn throws mid-draft in progress mode", async () => {
     vi.useFakeTimers();
     try {
-      const transport = new ClawChannelTransport();
+      const transport = new WebChannelTransport();
       // Open socket simulated: progress/finalize sends "succeed" so the draft
       // actually starts (started=true) and the widget shows a working bubble.
       const progressSpy = vi
