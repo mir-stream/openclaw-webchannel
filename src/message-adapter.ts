@@ -15,7 +15,7 @@ import type {
   DraftStreamLoop,
 } from "openclaw/plugin-sdk/channel-outbound";
 
-import { CLAWCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
+import { CLAWCHANNEL_ID } from "./transport.js";
 import type { ClawChannelTransport } from "./transport.js";
 
 /**
@@ -99,8 +99,13 @@ export function createClawMessageAdapter(transport: ClawChannelTransport) {
     send: {
       text: async (ctx): Promise<ChannelMessageSendResult> => {
         const id = nextMessageId();
-        const sessionKey = ctx.to || ANON_PEER_ID;
-        if (!transport.sendText(sessionKey, ctx.text, id)) {
+        // `ctx.to` is the recorded reply target — the REAL per-peer `wsKey`
+        // (inbound.ts records `reply.to = wsKey`). Target it directly; if it's
+        // absent or has no mapped socket, fall back to `sendTextToAnyOpen`,
+        // which delivers only when exactly ONE connection exists and otherwise
+        // refuses to guess — so we never default to the literal `web-anon` key
+        // when real peers are connected.
+        if (!ctx.to || !transport.sendText(ctx.to, ctx.text, id)) {
           transport.sendTextToAnyOpen(ctx.text);
         }
         return { receipt: buildClawReceipt(id), messageId: id };

@@ -33,9 +33,10 @@ import type { ProgressDraftController } from "./message-adapter.js";
  *
  * Because `delivery.deliver` is a closure over the originating `peerId`, the
  * socket-map key always matches: we never depend on a core-recorded `ctx.to`
- * value lining up with the map. (Phase 1 replaces the single anon peer with a
- * real per-user/per-tab peer id; the recorded `reply.to` already carries that
- * peer so per-peer routing drops in without changing this seam.)
+ * value lining up with the map. The transport now keys sockets by the verified
+ * per-peer id (the anonymous strategy is just the single-peer special case),
+ * and the recorded `reply.to` carries that same peer, so per-peer routing
+ * flows through this seam unchanged.
  *
  * This mirrors the bundled SMS channel's inbound path
  * (`dist/extensions/sms/channel-plugin-api.js`, `channelRuntime.inbound.run`).
@@ -63,7 +64,9 @@ export async function handleInboundMessage(
   peerId: string,
   message: InboundUserMessage,
 ): Promise<void> {
-  // The transport always maps connections to the single anon peer in Phase 0.
+  // `wsKey` is the verified per-peer id the transport uses as its socket-map
+  // key (the anonymous strategy is the single-peer special case, where this
+  // falls back to ANON_PEER_ID).
   const wsKey = peerId || ANON_PEER_ID;
   const channelRuntime = api.runtime.channel;
 

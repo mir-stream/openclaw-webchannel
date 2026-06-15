@@ -175,7 +175,9 @@ export function buildApprovalRequestPayload(
  * Build the strongly typed native runtime spec. `transport` is captured in the
  * closure so delivery/finalize go straight to our WebSocket session map — we do
  * not need the gateway-supplied `context` (which other channels use to reach a
- * platform client). The delivery "target" resolves to our single anon session.
+ * platform client). The delivery target resolves to the ORIGINATING peer's web
+ * session (see `prepareTarget` / `resolveOriginTarget`), so with multiple
+ * concurrent users each approval prompt reaches the user who triggered it.
  */
 export function createClawApprovalNativeRuntimeSpec(
   transport: ClawChannelTransport,
@@ -216,19 +218,38 @@ export function createClawApprovalNativeRuntimeSpec(
       }),
     },
     transport: {
-      // Our only target is the originating web session. Phase 0/1 maps every
-      // connection to the single anon peer, so the prepared target is fixed.
-      // TODO(auth): Phase 1 real approver identity once per-user auth lands —
-      // derive the target session from the approval's origin peer instead.
-      prepareTarget: () => ({
-        dedupeKey: `${CLAWCHANNEL_ID}:${ANON_PEER_ID}`,
-        target: { sessionKey: ANON_PEER_ID },
-      }),
+      // Route the prompt to the ORIGINATING peer's web session. The planned
+      // target's `to` was produced by our `resolveOriginTarget` below, which
+      // reads `request.turnSourceTo` — the real per-peer `wsKey` we recorded as
+      // the inbound turn's `reply.to` (src/inbound.ts buildContext). The
+      // transport socket map is keyed by that same `peerId`, so it lines up.
+      // With 2+ concurrent users this targets the right user's socket; the
+      // dedupeKey is per-peer so distinct users never collide.
+      prepareTarget: ({ plannedTarget }) => {
+        // `plannedTarget.target.to` is the per-peer key resolveOriginTarget
+        // produced; default to the anon peer if it's somehow absent so a
+        // single-session deployment still gets its prompt.
+        const sessionKey = plannedTarget?.target?.to || ANON_PEER_ID;
+        return {
+          dedupeKey: `${CLAWCHANNEL_ID}:${sessionKey}`,
+          target: { sessionKey },
+        };
+      },
       // Emit the `approval_request` frame. Returning a non-null entry tells the
       // runtime the prompt was delivered; the entry is handed back on finalize.
       deliverPending: ({ preparedTarget, pendingPayload }) => {
         const sessionKey = preparedTarget.sessionKey;
-        transport.sendApprovalRequest(sessionKey, pendingPayload);
+        // Fail-closed: with 2+ connections and an absent `turnSourceTo` the
+        // target falls back to `web-anon`, `soleOpenSocket` returns undefined,
+        // and the prompt is correctly DROPPED rather than misrouted. That drop
+        // is otherwise invisible, so log it (no logger in scope here; match the
+        // transport's `[clawchannel]` console style — src/transport.ts safeSend).
+        const delivered = transport.sendApprovalRequest(sessionKey, pendingPayload);
+        if (!delivered) {
+          console.warn(
+            `[clawchannel] approval ${pendingPayload.id} not delivered: no matching open socket for "${sessionKey}"`,
+          );
+        }
         return { approvalId: pendingPayload.id, sessionKey };
       },
       // Finalize: emit `approval_resolved` so the widget disables buttons and
@@ -247,12 +268,13 @@ export function createClawApprovalNativeRuntimeSpec(
 /**
  * Our `native` adapter. The core delivery plan
  * (dist/approval-native-runtime-BKbmE99v.js:21-72) gates on
- * `describeDeliveryCapabilities().enabled` and an origin target; we always
- * report a single origin surface pointing at the anon session so the plan
- * yields exactly one target (our web session). We do NOT use approver-DM
- * machinery (that depends on real approver identity, which `web-anon` lacks).
+ * `describeDeliveryCapabilities().enabled` and an origin target; we report a
+ * single origin surface whose target is the originating peer (see
+ * `resolveOriginTarget`) so the plan yields exactly one target — that user's
+ * web session. We do NOT use approver-DM machinery (that depends on a real
+ * approver allowlist identity, which our web peers don't carry).
  */
-function createClawApprovalNativeAdapter(): ChannelApprovalNativeAdapter {
+export function createClawApprovalNativeAdapter(): ChannelApprovalNativeAdapter {
   return {
     describeDeliveryCapabilities: ({ cfg }: { cfg: OpenClawConfig }) => ({
       enabled: isExecApprovalsEnabled(cfg),
@@ -260,7 +282,29 @@ function createClawApprovalNativeAdapter(): ChannelApprovalNativeAdapter {
       supportsOriginSurface: true,
       supportsApproverDmSurface: false,
     }),
-    resolveOriginTarget: () => ({ to: ANON_PEER_ID }),
+    // Resolve the origin (web) target to the peer that started the turn. Both
+    // ExecApprovalRequest and PluginApprovalRequest carry the turn's source on
+    // `request.request.{turnSourceChannel,turnSourceTo}` (verified:
+    // dist/plugin-sdk/exec-approvals-SqmRBcMF.d.ts:334-335 and
+    // plugin-approvals-TnoTjLH9.d.ts:24-25). `turnSourceTo` is exactly the
+    // `wsKey` we recorded as the inbound turn's `reply.to` (src/inbound.ts),
+    // which is also the transport socket-map key — so it routes the prompt to
+    // the right user even with multiple concurrent connections. This mirrors
+    // the bundled signal/googlechat native adapters' `resolveOriginTarget`
+    // (dist/approval-native-ByN6UwCu.js:35-44). We filter on `turnSourceChannel`
+    // so we never mis-claim an approval that originated on a different channel.
+    // Fall back to the single anon peer when the turn-source is absent (the
+    // anonymous single-session dev path, where `turnSourceTo` is `web-anon`).
+    resolveOriginTarget: ({ request }) => {
+      const src = request.request;
+      const channel = src.turnSourceChannel?.toLowerCase();
+      if (channel && channel !== CLAWCHANNEL_ID) return null;
+      const to =
+        typeof src.turnSourceTo === "string" && src.turnSourceTo.length > 0
+          ? src.turnSourceTo
+          : ANON_PEER_ID;
+      return { to };
+    },
   };
 }
 

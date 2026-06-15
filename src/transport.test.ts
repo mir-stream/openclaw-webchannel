@@ -50,6 +50,19 @@ function register(transport: ClawChannelTransport, ws: unknown): void {
     .registerConnection(ws);
 }
 
+/** Register a fake socket under a specific peer key (multi-user cases). */
+function registerAs(
+  transport: ClawChannelTransport,
+  ws: unknown,
+  peerId: string,
+): void {
+  (
+    transport as unknown as {
+      registerConnection: (w: unknown, peerId: string) => void;
+    }
+  ).registerConnection(ws, peerId);
+}
+
 function mapHas(transport: ClawChannelTransport): boolean {
   const sockets = (transport as unknown as { sockets: Map<string, unknown> })
     .sockets;
@@ -166,6 +179,70 @@ describe("clawchannel transport backpressure (safeSend)", () => {
 
     expect(transport.sendText(ANON_PEER_ID, "hi")).toBe(false);
     expect(ws.sent).toHaveLength(0);
+
+    transport.dispose();
+  });
+});
+
+describe("clawchannel transport multi-peer routing", () => {
+  it("sendText delivers to the exact peer key, never another peer's socket", () => {
+    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const alice = makeFakeSocket();
+    const bob = makeFakeSocket();
+    registerAs(transport, alice, "peer-alice");
+    registerAs(transport, bob, "peer-bob");
+
+    expect(transport.sendText("peer-bob", "for bob")).toBe(true);
+    expect(bob.sent).toHaveLength(1);
+    expect(JSON.parse(bob.sent[0])).toEqual({
+      type: "agent_message",
+      text: "for bob",
+    });
+    // Alice must NOT receive bob's message.
+    expect(alice.sent).toHaveLength(0);
+
+    transport.dispose();
+  });
+
+  it("sendText returns false for an unmapped peer (no wrong-socket fallback)", () => {
+    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const alice = makeFakeSocket();
+    const bob = makeFakeSocket();
+    registerAs(transport, alice, "peer-alice");
+    registerAs(transport, bob, "peer-bob");
+
+    // No socket mapped under this key -> not delivered.
+    expect(transport.sendText("peer-carol", "stray")).toBe(false);
+    expect(alice.sent).toHaveLength(0);
+    expect(bob.sent).toHaveLength(0);
+
+    transport.dispose();
+  });
+
+  it("sendTextToAnyOpen refuses to guess when multiple peers are connected", () => {
+    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const alice = makeFakeSocket();
+    const bob = makeFakeSocket();
+    registerAs(transport, alice, "peer-alice");
+    registerAs(transport, bob, "peer-bob");
+
+    // With 2+ connections the fallback must NOT cross-deliver to an arbitrary
+    // user — this is what protects the channel.ts / message-adapter.ts paths
+    // when `ctx.to` doesn't match a mapped socket.
+    expect(transport.sendTextToAnyOpen("orphan")).toBe(false);
+    expect(alice.sent).toHaveLength(0);
+    expect(bob.sent).toHaveLength(0);
+
+    transport.dispose();
+  });
+
+  it("sendTextToAnyOpen delivers to the sole connection (anonymous case)", () => {
+    const transport = new ClawChannelTransport({ heartbeatMs: 1000 });
+    const only = makeFakeSocket();
+    registerAs(transport, only, ANON_PEER_ID);
+
+    expect(transport.sendTextToAnyOpen("hi")).toBe(true);
+    expect(only.sent).toHaveLength(1);
 
     transport.dispose();
   });

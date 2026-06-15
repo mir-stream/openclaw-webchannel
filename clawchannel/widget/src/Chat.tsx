@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useClawChannel } from "./useClawChannel";
-import type { ApprovalDecision } from "./useClawChannel";
+import type { ApprovalDecision, UseClawChannelOptions } from "./useClawChannel";
 
 /** Map an approval option style hint to a button background color. */
 function approvalButtonColor(style: string, disabled: boolean): string {
@@ -23,9 +23,14 @@ const DECISION_LABEL: Record<ApprovalDecision, string> = {
   deny: "Denied",
 };
 
-export function Chat() {
+/**
+ * `options` are forwarded straight to the connection hook (e.g. a host-supplied
+ * `getTicket` for the hmac-ticket auth strategy). Omitting them keeps the
+ * anonymous dev path: connect with no ticket.
+ */
+export function Chat({ options }: { options?: UseClawChannelOptions } = {}) {
   const { messages, approvals, connected, status, send, decide } =
-    useClawChannel();
+    useClawChannel(options);
   const [input, setInput] = useState("");
 
   // Connection dot: green when connected, amber while (re)connecting, grey when

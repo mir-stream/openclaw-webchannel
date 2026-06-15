@@ -4,7 +4,7 @@ import {
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
-import { CLAWCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
+import { CLAWCHANNEL_ID } from "./transport.js";
 import type { ClawChannelTransport } from "./transport.js";
 import { createClawMessageAdapter } from "./message-adapter.js";
 import {
@@ -146,16 +146,17 @@ export function createClawChannelPlugin(transport: ClawChannelTransport) {
       attachedResults: {
         channel: CLAWCHANNEL_ID,
         sendText: async (ctx) => {
-          // Phase 0: the inbound round-trip delivers replies through the turn's
+          // The inbound round-trip delivers replies through the turn's
           // `delivery.deliver` adapter (see src/inbound.ts), NOT here. This
-          // outbound seam only fires for core-initiated sends. `ctx.to` is the
-          // recorded peer id (we record `web-anon`), so try an exact map lookup
-          // first, then fall back to the single open socket since Phase 0 has
-          // exactly one anonymous connection.
-          // TODO(session): Phase 1 — `ctx.to` becomes a real per-peer id that
-          // always matches a mapped session; drop the single-socket fallback.
-          const sessionKey = ctx.to || ANON_PEER_ID;
-          if (!transport.sendText(sessionKey, ctx.text)) {
+          // outbound seam only fires for core-initiated (untargeted) sends.
+          // `ctx.to` is the recorded reply target — now the REAL per-peer
+          // `wsKey` (inbound.ts records `reply.to = wsKey`), so target it
+          // directly. If it's absent or has no mapped socket, fall back to
+          // `sendTextToAnyOpen`, which only delivers when EXACTLY ONE connection
+          // exists (the anonymous single-peer case) and otherwise refuses to
+          // guess — so we never default an untargeted send to the literal
+          // `web-anon` key when real peers are connected.
+          if (!ctx.to || !transport.sendText(ctx.to, ctx.text)) {
             transport.sendTextToAnyOpen(ctx.text);
           }
           return { messageId: `clawchannel-${Date.now()}` };

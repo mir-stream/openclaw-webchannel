@@ -19,6 +19,7 @@ import type { ApprovalRequestPayload } from "./transport.js";
 import {
   createClawApprovalNativeRuntimeSpec,
   createClawApprovalCapability,
+  createClawApprovalNativeAdapter,
   buildApprovalRequestPayload,
   handleApprovalDecision,
   startClawApprovalMonitor,
@@ -99,7 +100,7 @@ describe("clawchannel native approval runtime", () => {
 
     const prepared = await spec.transport.prepareTarget({
       ...baseCtx,
-      plannedTarget: {} as any,
+      plannedTarget: { surface: "origin", target: { to: "web-anon" } } as any,
       request: {} as any,
       approvalKind: "exec",
       view,
@@ -180,6 +181,109 @@ describe("clawchannel native approval runtime", () => {
     });
 
     expect(resolvedSpy).toHaveBeenCalledWith("web-anon", "exec-1", "allow-once");
+  });
+});
+
+describe("clawchannel native approval origin routing (multi-user)", () => {
+  // resolveOriginTarget must read the turn source (`turnSourceTo`) so the prompt
+  // is routed to the originating peer, not a hardcoded anon key.
+  const adapter = createClawApprovalNativeAdapter();
+
+  function execRequest(turnSourceTo?: string, turnSourceChannel?: string): any {
+    return {
+      id: "exec-1",
+      request: { command: "ls", turnSourceTo, turnSourceChannel },
+    };
+  }
+
+  it("resolves the origin target to the originating peer (turnSourceTo)", () => {
+    const target = adapter.resolveOriginTarget!({
+      cfg: cfgEnabled,
+      accountId: null,
+      approvalKind: "exec",
+      request: execRequest("peer-alice", "clawchannel"),
+    });
+    expect(target).toEqual({ to: "peer-alice" });
+  });
+
+  it("ignores an approval that originated on a different channel", () => {
+    const target = adapter.resolveOriginTarget!({
+      cfg: cfgEnabled,
+      accountId: null,
+      approvalKind: "exec",
+      request: execRequest("+15551234", "signal"),
+    });
+    expect(target).toBeNull();
+  });
+
+  it("falls back to the anon peer when no turn source is present", () => {
+    const target = adapter.resolveOriginTarget!({
+      cfg: cfgEnabled,
+      accountId: null,
+      approvalKind: "exec",
+      request: execRequest(undefined, undefined),
+    });
+    expect(target).toEqual({ to: "web-anon" });
+  });
+
+  it("prepareTarget keys the prompt to the planned per-peer target", async () => {
+    const transport = new ClawChannelTransport();
+    const spec = createClawApprovalNativeRuntimeSpec(transport);
+    const prepared = await spec.transport.prepareTarget({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      plannedTarget: { surface: "origin", target: { to: "peer-bob" } } as any,
+      request: {} as any,
+      approvalKind: "exec",
+      view: fakePendingExecView() as any,
+      pendingPayload: {} as any,
+    });
+    // The prepared session key + dedupeKey are per-peer (bob), so two distinct
+    // users never collide and the frame targets bob's socket.
+    expect(prepared!.target).toEqual({ sessionKey: "peer-bob" });
+    expect(prepared!.dedupeKey).toBe("clawchannel:peer-bob");
+  });
+
+  it("delivers the approval_request to the originating peer's socket key", async () => {
+    const transport = new ClawChannelTransport();
+    const requestSpy = vi
+      .spyOn(transport, "sendApprovalRequest")
+      .mockReturnValue(true);
+    const spec = createClawApprovalNativeRuntimeSpec(transport);
+    const view = fakePendingExecView();
+    const baseCtx = { cfg: cfgEnabled, accountId: null, context: undefined };
+
+    const pendingPayload = (await spec.presentation.buildPendingPayload({
+      ...baseCtx,
+      request: { id: view.approvalId } as any,
+      approvalKind: "exec",
+      nowMs: Date.now(),
+      view,
+    })) as ApprovalRequestPayload;
+
+    const prepared = await spec.transport.prepareTarget({
+      ...baseCtx,
+      plannedTarget: { surface: "origin", target: { to: "peer-bob" } } as any,
+      request: {} as any,
+      approvalKind: "exec",
+      view,
+      pendingPayload,
+    });
+
+    await spec.transport.deliverPending({
+      ...baseCtx,
+      plannedTarget: { surface: "origin", target: { to: "peer-bob" } } as any,
+      preparedTarget: prepared!.target,
+      request: {} as any,
+      approvalKind: "exec",
+      view,
+      pendingPayload,
+    });
+
+    // The frame was sent to bob's session key, NOT the anon default.
+    const [sentKey] = requestSpy.mock.calls[0];
+    expect(sentKey).toBe("peer-bob");
   });
 });
 

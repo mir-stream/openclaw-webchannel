@@ -62,6 +62,24 @@ function wsUrl(path: string): string {
   return `${proto}//${window.location.host}${path}`;
 }
 
+/** Default WebSocket path on the gateway (same origin / Vite proxy). */
+const DEFAULT_WS_PATH = "/clawchannel/ws";
+
+/**
+ * Hook options (all optional — the zero-arg call keeps the anonymous dev path).
+ *
+ *  - `getTicket`: the host (e.g. a SaaS embed) supplies a short-lived signed
+ *    ticket for the `hmac-ticket` server strategy. Called on EVERY (re)connect
+ *    so a reconnect always gets a FRESH ticket (the SaaS session is long-lived;
+ *    the ticket is short-lived — see AUTH.md §5/§6). Returning null/empty (or a
+ *    no-op for cookie/trusted-header auth) connects with no ticket.
+ *  - `path`: override the WS path (defaults to `/clawchannel/ws`).
+ */
+export type UseClawChannelOptions = {
+  getTicket?: () => Promise<string | null>;
+  path?: string;
+};
+
 /** Connection status, richer than a bool, for the UI dot. */
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
 
@@ -78,8 +96,13 @@ const RECONNECT_CAP_MS = 10_000;
  *  - on a dropped socket, reconnects with exponential backoff + jitter
  *
  * No message replay / outbound queue this slice (see send path TODO).
+ *
+ * Auth: when `options.getTicket` is provided it is awaited on every (re)connect
+ * and, if it yields a non-empty token, attached as the `?ticket=` query param
+ * the `hmac-ticket` server strategy reads. With no options the socket opens with
+ * no ticket exactly as before (the anonymous server strategy).
  */
-export function useClawChannel() {
+export function useClawChannel(options?: UseClawChannelOptions) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [connected, setConnected] = useState(false);
@@ -91,6 +114,21 @@ export function useClawChannel() {
   const unmountedRef = useRef(false);
   const attemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // SYNCHRONOUS in-flight sentinel. `connect()` is async and `await`s
+  // getTicket() before it ever assigns wsRef.current, so the wsRef readyState
+  // guard alone can't stop two concurrent connect() calls (StrictMode
+  // mount→unmount→mount with getTicket set) from BOTH passing the post-await
+  // guard and opening two sockets. We set this true at the very top of connect()
+  // before any await and bail synchronously if it's already set; it is reset to
+  // false on EVERY terminal outcome so a reconnect is never permanently blocked.
+  const connectingRef = useRef(false);
+
+  // Keep the latest options in a ref so the connect closure (stable across the
+  // effect's lifetime) always reads the current getTicket/path without needing
+  // them in the effect deps (which would tear down + reconnect on every render).
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
 
   useEffect(() => {
     unmountedRef.current = false;
@@ -117,12 +155,17 @@ export function useClawChannel() {
       attemptsRef.current += 1;
       reconnectTimerRef.current = setTimeout(() => {
         reconnectTimerRef.current = null;
-        connect();
+        // connect() is async (it may await getTicket); it handles its own
+        // failures internally, so a rejection here would be a bug — swallow
+        // defensively so it never surfaces as an unhandled rejection.
+        void connect().catch(() => scheduleReconnect());
       }, delay);
     };
 
     const onOpen = () => {
-      // Successful (re)connect: reset backoff and settle any orphaned drafts.
+      // Successful (re)connect: socket is no longer "connecting", so release the
+      // sentinel; reset backoff and settle any orphaned drafts.
+      connectingRef.current = false;
       attemptsRef.current = 0;
       setConnected(true);
       setStatus("connected");
@@ -138,8 +181,14 @@ export function useClawChannel() {
       );
     };
 
-    function connect() {
+    async function connect() {
       if (unmountedRef.current) return;
+      // SYNCHRONOUS double-connect guard: bail if a connect() is already
+      // in-flight (set before any await, so a second concurrent call sees it
+      // even while the first is mid-`await getTicket()`). This is the only guard
+      // that survives the await window; the wsRef readyState checks below are a
+      // belt-and-suspenders backstop for an already-open/connecting socket.
+      if (connectingRef.current) return;
       // Guard against double-connect (StrictMode double-invoke / overlap): if a
       // live or connecting socket already exists, don't open a second one.
       const existing = wsRef.current;
@@ -150,14 +199,77 @@ export function useClawChannel() {
       ) {
         return;
       }
+      // Claim the in-flight slot before any await.
+      connectingRef.current = true;
 
       setStatus(attemptsRef.current === 0 ? "connecting" : "reconnecting");
-      const ws = new WebSocket(wsUrl("/clawchannel/ws"));
+
+      const opts = optionsRef.current;
+      const path = opts?.path ?? DEFAULT_WS_PATH;
+
+      // Fetch a fresh ticket on EVERY (re)connect (AUTH.md §5: short-lived
+      // ticket vs long-lived SaaS session). A null/empty result connects with
+      // no ticket (anonymous / cookie / trusted-header auth). A throw or a
+      // hard auth failure is treated like a failed connection below.
+      let url = wsUrl(path);
+      if (opts?.getTicket) {
+        let token: string | null;
+        try {
+          token = await opts.getTicket();
+        } catch {
+          // getTicket failed (network/session error). Don't crash — schedule a
+          // reconnect via the normal backoff path. NOTE: a hard auth failure
+          // (e.g. expired SaaS session) currently just retries forever; a real
+          // login-redirect/give-up policy is out of scope for this slice.
+          // Terminal outcome: release the sentinel so the scheduled reconnect
+          // isn't permanently blocked.
+          connectingRef.current = false;
+          scheduleReconnect();
+          return;
+        }
+        // The component may have unmounted while we awaited getTicket; if so,
+        // abort without opening a socket. The effect cleanup also clears the
+        // sentinel, but release it here too so we never leave it dangling.
+        if (unmountedRef.current) {
+          connectingRef.current = false;
+          return;
+        }
+        // Re-check the readyState guard: an OPEN/CONNECTING socket already
+        // exists, so this attempt abandons without opening another. (The
+        // synchronous sentinel makes a true second concurrent connect()
+        // impossible to reach here; this backstops a stale wsRef left CONNECTING
+        // by a prior attempt.) Release the sentinel: THIS attempt set it and is
+        // bailing, and the existing socket drives its own onopen/onclose.
+        const live = wsRef.current;
+        if (
+          live &&
+          (live.readyState === WebSocket.OPEN ||
+            live.readyState === WebSocket.CONNECTING)
+        ) {
+          connectingRef.current = false;
+          return;
+        }
+        if (!token) {
+          // No ticket available — for hmac-ticket the server rejects the
+          // upgrade, so treat it as a failed connection and back off. Terminal
+          // outcome: release the sentinel before scheduling the reconnect.
+          connectingRef.current = false;
+          scheduleReconnect();
+          return;
+        }
+        url = `${url}?ticket=${encodeURIComponent(token)}`;
+      }
+
+      const ws = new WebSocket(url);
       wsRef.current = ws;
 
       ws.onopen = onOpen;
       ws.onclose = () => {
         if (wsRef.current === ws) wsRef.current = null;
+        // Socket left the connecting state (it may never have reached onopen, so
+        // release the sentinel here too); this is a terminal outcome for THIS
+        // connect() attempt. onerror routes through here via ws.close().
+        connectingRef.current = false;
         if (unmountedRef.current) return;
         scheduleReconnect();
       };
@@ -252,13 +364,17 @@ export function useClawChannel() {
       }
     };
 
-    connect();
+    void connect().catch(() => scheduleReconnect());
 
     return () => {
       // (a) prevent any reconnect-after-unmount, (b) clear a pending timer,
       // (c) close the live socket. Null its handlers so the close we trigger
       // here doesn't re-enter scheduleReconnect.
       unmountedRef.current = true;
+      // Release the in-flight sentinel so a remount (StrictMode) can connect()
+      // again — a connect() still mid-`await getTicket()` will see unmountedRef
+      // and bail, but it must not leave the sentinel latched for the next mount.
+      connectingRef.current = false;
       clearReconnectTimer();
       const ws = wsRef.current;
       wsRef.current = null;
