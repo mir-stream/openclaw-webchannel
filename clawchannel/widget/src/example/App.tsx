@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
-import { Chat } from "./Chat";
-import { makeDevGetTicket } from "./devTicket";
-import type { UseClawChannelOptions } from "./useClawChannel";
+import { Chat } from "../lib/index.js";
+import { makeDevGetTicket } from "./devTicket.js";
+import type { UseClawChannelOptions } from "../lib/index.js";
 
 /**
  * Example shell demonstrating the `hmac-ticket` auth flow end-to-end.

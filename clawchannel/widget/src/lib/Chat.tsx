@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { useClawChannel } from "./useClawChannel";
-import type { ApprovalDecision, UseClawChannelOptions } from "./useClawChannel";
+import { useClawChannel } from "./useClawChannel.js";
+import type { ApprovalDecision, UseClawChannelOptions } from "./useClawChannel.js";
 
 /** Map an approval option style hint to a button background color. */
 function approvalButtonColor(style: string, disabled: boolean): string {
