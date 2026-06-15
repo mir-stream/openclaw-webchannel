@@ -12,11 +12,50 @@ export type ChatMessage = {
   working?: boolean;
 };
 
+/** Native HITL approval decision; mirrors the plugin/SDK union. */
+export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
+
+/** One offered approval button. */
+export type ApprovalOption = {
+  decision: ApprovalDecision;
+  label: string;
+  style: string;
+};
+
+/**
+ * A pending (or just-resolved) native approval prompt rendered as a distinct
+ * card in the transcript. `resolvedDecision` flips set once `approval_resolved`
+ * arrives (or we optimistically record the click), disabling the buttons.
+ */
+export type ApprovalRequest = {
+  id: string;
+  kind: "exec" | "plugin";
+  title: string;
+  description?: string;
+  prompt: string;
+  options: ApprovalOption[];
+  expiresAtMs?: number;
+  resolvedDecision?: ApprovalDecision;
+};
+
 /** Mirrors src/transport.ts envelopes on the plugin side. */
-type InboundWsMessage = { type: "user_message"; text: string };
+type InboundWsMessage =
+  | { type: "user_message"; text: string }
+  | { type: "approval_decision"; id: string; decision: ApprovalDecision };
 type OutboundWsMessage =
   | { type: "agent_message"; text: string; id?: string }
-  | { type: "progress"; id: string; text: string };
+  | { type: "progress"; id: string; text: string }
+  | {
+      type: "approval_request";
+      id: string;
+      kind: "exec" | "plugin";
+      title: string;
+      description?: string;
+      prompt: string;
+      options: ApprovalOption[];
+      expiresAtMs?: number;
+    }
+  | { type: "approval_resolved"; id: string; decision: ApprovalDecision };
 
 function wsUrl(path: string): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -33,6 +72,7 @@ function wsUrl(path: string): string {
  */
 export function useClawChannel() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -47,6 +87,38 @@ export function useClawChannel() {
       try {
         parsed = JSON.parse(event.data);
       } catch {
+        return;
+      }
+
+      if (parsed.type === "approval_request") {
+        // Store/replace the pending approval card keyed by id.
+        const req: ApprovalRequest = {
+          id: parsed.id,
+          kind: parsed.kind,
+          title: parsed.title,
+          description: parsed.description,
+          prompt: parsed.prompt,
+          options: parsed.options,
+          expiresAtMs: parsed.expiresAtMs,
+        };
+        setApprovals((prev) => {
+          const idx = prev.findIndex((a) => a.id === req.id);
+          if (idx === -1) return [...prev, req];
+          const next = prev.slice();
+          next[idx] = req;
+          return next;
+        });
+        return;
+      }
+
+      if (parsed.type === "approval_resolved") {
+        // Mark the card resolved: buttons disable, outcome shown.
+        const { id, decision } = parsed;
+        setApprovals((prev) =>
+          prev.map((a) =>
+            a.id === id ? { ...a, resolvedDecision: decision } : a,
+          ),
+        );
         return;
       }
 
@@ -106,5 +178,28 @@ export function useClawChannel() {
     ws.send(JSON.stringify(payload));
   }, []);
 
-  return { messages, connected, send };
+  /**
+   * Send an approval decision for `id`. Optimistically marks the card resolved
+   * so the buttons disable immediately; the authoritative `approval_resolved`
+   * frame from the plugin confirms/overwrites the outcome.
+   */
+  const decide = useCallback((id: string, decision: ApprovalDecision) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    setApprovals((prev) =>
+      prev.map((a) =>
+        a.id === id && a.resolvedDecision === undefined
+          ? { ...a, resolvedDecision: decision }
+          : a,
+      ),
+    );
+    const payload: InboundWsMessage = {
+      type: "approval_decision",
+      id,
+      decision,
+    };
+    ws.send(JSON.stringify(payload));
+  }, []);
+
+  return { messages, approvals, connected, send, decide };
 }

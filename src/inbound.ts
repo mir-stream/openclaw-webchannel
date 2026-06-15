@@ -2,6 +2,9 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import { CLAWCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
 import type { ClawChannelTransport, InboundWsMessage } from "./transport.js";
+
+/** The inbound path only handles user messages; approvals route separately. */
+type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
 import {
   resolveStreamingMode,
   createProgressDraftController,
@@ -58,7 +61,7 @@ export async function handleInboundMessage(
   api: OpenClawPluginApi,
   transport: ClawChannelTransport,
   peerId: string,
-  message: InboundWsMessage,
+  message: InboundUserMessage,
 ): Promise<void> {
   // The transport always maps connections to the single anon peer in Phase 0.
   const wsKey = peerId || ANON_PEER_ID;

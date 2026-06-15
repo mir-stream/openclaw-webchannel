@@ -1,8 +1,30 @@
 import { useState } from "react";
 import { useClawChannel } from "./useClawChannel";
+import type { ApprovalDecision } from "./useClawChannel";
+
+/** Map an approval option style hint to a button background color. */
+function approvalButtonColor(style: string, disabled: boolean): string {
+  if (disabled) return "#ccc";
+  switch (style) {
+    case "success":
+      return "#2ecc71";
+    case "danger":
+      return "#e74c3c";
+    case "primary":
+      return "#0a84ff";
+    default:
+      return "#888";
+  }
+}
+
+const DECISION_LABEL: Record<ApprovalDecision, string> = {
+  "allow-once": "Allowed once",
+  "allow-always": "Allowed always",
+  deny: "Denied",
+};
 
 export function Chat() {
-  const { messages, connected, send } = useClawChannel();
+  const { messages, approvals, connected, send, decide } = useClawChannel();
   const [input, setInput] = useState("");
 
   const onSubmit = (e: React.FormEvent) => {
@@ -58,6 +80,59 @@ export function Chat() {
             {m.text}
           </div>
         ))}
+
+        {approvals.map((a) => {
+          const resolved = a.resolvedDecision !== undefined;
+          return (
+            <div
+              key={`approval-${a.id}`}
+              style={{
+                alignSelf: "flex-start",
+                background: "#fff8e1",
+                border: "1px solid #f0d98c",
+                borderRadius: 12,
+                padding: "10px 12px",
+                maxWidth: "90%",
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+              }}
+            >
+              <div style={{ fontWeight: 600 }}>
+                {a.kind === "exec" ? "Approval required" : "Plugin approval"}
+              </div>
+              <div style={{ whiteSpace: "pre-wrap", color: "#5a4b1f" }}>
+                {a.prompt}
+              </div>
+              {resolved ? (
+                <div style={{ fontStyle: "italic", color: "#7a6f57" }}>
+                  {DECISION_LABEL[a.resolvedDecision!]}
+                </div>
+              ) : (
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {a.options.map((opt) => (
+                    <button
+                      key={opt.decision}
+                      type="button"
+                      disabled={resolved}
+                      onClick={() => decide(a.id, opt.decision)}
+                      style={{
+                        padding: "6px 12px",
+                        borderRadius: 8,
+                        border: "none",
+                        color: "white",
+                        cursor: resolved ? "default" : "pointer",
+                        background: approvalButtonColor(opt.style, resolved),
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       <form onSubmit={onSubmit} style={{ display: "flex", gap: 8, marginTop: 8 }}>

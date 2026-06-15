@@ -29,10 +29,59 @@ export const ANON_PEER_ID = "web-anon";
  * widget can render a SINGLE bubble that updates in place, then transitions to
  * the final text (Phase 1 progress-draft slice).
  */
-export type InboundWsMessage = { type: "user_message"; text: string };
+/**
+ * The three approval decisions the gateway accepts. Matches the SDK's
+ * `ExecApprovalDecision` exactly (verified:
+ * dist/plugin-sdk/exec-approvals-SqmRBcMF.d.ts:484
+ * `"allow-once" | "allow-always" | "deny"`). We re-declare it locally so the
+ * transport has no SDK import; `src/approvals.ts` asserts it stays in sync.
+ */
+export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
+
+/** One offered approval button, projected from `ApprovalActionView`. */
+export type ApprovalOption = {
+  decision: ApprovalDecision;
+  label: string;
+  /** Visual hint; mirrors InteractiveButtonStyle (success|primary|danger|...). */
+  style: string;
+};
+
+/**
+ * Payload for an `approval_request` outbound frame. Built from a
+ * `PendingApprovalView` in src/approvals.ts. `prompt` is a short human-readable
+ * one-liner (title + command/tool) for accessibility / non-button fallback.
+ */
+export type ApprovalRequestPayload = {
+  id: string;
+  kind: "exec" | "plugin";
+  title: string;
+  description?: string;
+  prompt: string;
+  options: ApprovalOption[];
+  expiresAtMs?: number;
+};
+
+export type InboundWsMessage =
+  | { type: "user_message"; text: string }
+  | { type: "approval_decision"; id: string; decision: ApprovalDecision };
 export type OutboundWsMessage =
   | { type: "agent_message"; text: string; id?: string }
-  | { type: "progress"; id: string; text: string };
+  | { type: "progress"; id: string; text: string }
+  | ({ type: "approval_request" } & ApprovalRequestPayload)
+  | { type: "approval_resolved"; id: string; decision: ApprovalDecision };
+
+const APPROVAL_DECISIONS: readonly ApprovalDecision[] = [
+  "allow-once",
+  "allow-always",
+  "deny",
+];
+
+function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  return (
+    typeof value === "string" &&
+    (APPROVAL_DECISIONS as readonly string[]).includes(value)
+  );
+}
 
 /**
  * Owns the (noServer) WebSocketServer and the live connection map.
@@ -53,6 +102,17 @@ export class ClawChannelTransport {
   /** Called when the browser sends a user message on a given sessionKey. */
   private onMessage?: (sessionKey: string, message: InboundWsMessage) => void;
 
+  /**
+   * Called when the browser clicks an approval button (`approval_decision`).
+   * Distinct from the user-message handler so the channel can route the
+   * decision to `resolveApprovalOverGateway` instead of the agent turn path.
+   */
+  private onApprovalDecision?: (
+    sessionKey: string,
+    id: string,
+    decision: ApprovalDecision,
+  ) => void;
+
   constructor() {
     this.wss = new WebSocketServer({ noServer: true });
   }
@@ -61,6 +121,16 @@ export class ClawChannelTransport {
     handler: (sessionKey: string, message: InboundWsMessage) => void,
   ): void {
     this.onMessage = handler;
+  }
+
+  setApprovalDecisionHandler(
+    handler: (
+      sessionKey: string,
+      id: string,
+      decision: ApprovalDecision,
+    ) => void,
+  ): void {
+    this.onApprovalDecision = handler;
   }
 
   /** Wire a raw Node upgrade request (handed over by the gateway) into `ws`. */
@@ -82,13 +152,23 @@ export class ClawChannelTransport {
       } catch {
         return; // ignore malformed frames in Phase 0
       }
+      if (!parsed || typeof parsed !== "object") return;
+      const frame = parsed as Record<string, unknown>;
+      if (frame.type === "user_message" && typeof frame.text === "string") {
+        this.onMessage?.(sessionKey, {
+          type: "user_message",
+          text: frame.text,
+        });
+        return;
+      }
+      // Approval button click. Validate `decision` against the three allowed
+      // strings (same defensive guard as user_message); ignore malformed frames.
       if (
-        parsed &&
-        typeof parsed === "object" &&
-        (parsed as InboundWsMessage).type === "user_message" &&
-        typeof (parsed as InboundWsMessage).text === "string"
+        frame.type === "approval_decision" &&
+        typeof frame.id === "string" &&
+        isApprovalDecision(frame.decision)
       ) {
-        this.onMessage?.(sessionKey, parsed as InboundWsMessage);
+        this.onApprovalDecision?.(sessionKey, frame.id, frame.decision);
       }
     });
 
@@ -165,6 +245,62 @@ export class ClawChannelTransport {
       if (ws.readyState === WebSocket.OPEN) {
         const payload: OutboundWsMessage = { type: "agent_message", text };
         ws.send(JSON.stringify(payload));
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Push a native approval prompt to the browser bound to `sessionKey`. The
+   * widget renders a distinct approval card with one button per offered option;
+   * clicking sends `{type:"approval_decision", id, decision}` back. Returns true
+   * if delivered. Falls back to the single open socket (Phase 0 single anon
+   * peer), mirroring `sendTextToAnyOpen`, so an approval reaches the live tab
+   * even when the captured target key does not line up exactly.
+   */
+  sendApprovalRequest(
+    sessionKey: string,
+    payload: ApprovalRequestPayload,
+  ): boolean {
+    const frame: OutboundWsMessage = { type: "approval_request", ...payload };
+    const ws = this.openSocket(sessionKey);
+    if (ws) {
+      ws.send(JSON.stringify(frame));
+      return true;
+    }
+    for (const candidate of this.sockets.values()) {
+      if (candidate.readyState === WebSocket.OPEN) {
+        candidate.send(JSON.stringify(frame));
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Finalize a delivered approval `id` for `sessionKey`: the widget disables the
+   * buttons and reflects the recorded `decision`. Broadcasts to the single open
+   * socket as a fallback (same rationale as `sendApprovalRequest`).
+   */
+  sendApprovalResolved(
+    sessionKey: string,
+    id: string,
+    decision: ApprovalDecision,
+  ): boolean {
+    const frame: OutboundWsMessage = {
+      type: "approval_resolved",
+      id,
+      decision,
+    };
+    const ws = this.openSocket(sessionKey);
+    if (ws) {
+      ws.send(JSON.stringify(frame));
+      return true;
+    }
+    for (const candidate of this.sockets.values()) {
+      if (candidate.readyState === WebSocket.OPEN) {
+        candidate.send(JSON.stringify(frame));
         return true;
       }
     }

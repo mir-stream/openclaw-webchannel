@@ -44,6 +44,38 @@
                 }
               }
             }
+          },
+          "execApprovals": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "anyOf": [
+                  { "type": "boolean" },
+                  { "type": "string", "const": "auto" }
+                ]
+              },
+              "approvers": {
+                "type": "array",
+                "items": {
+                  "anyOf": [{ "type": "string" }, { "type": "number" }]
+                }
+              },
+              "target": {
+                "type": "string",
+                "enum": ["dm", "channel", "both"]
+              }
+            }
+          },
+          "capabilities": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "inlineButtons": {
+                "type": "string",
+                "enum": ["dm", "group", "allowlist", "all", "off"]
+              }
+            }
           }
         }
       },
@@ -54,6 +86,14 @@
         "streaming.mode": {
           "label": "Streaming mode",
           "help": "Progress draft mode: \"off\" | \"partial\" | \"block\" | \"progress\". Use \"progress\" for a single updating Working… draft that becomes the answer."
+        },
+        "execApprovals.enabled": {
+          "label": "Native exec approvals",
+          "help": "Render native [Allow once] [Allow always] [Deny] buttons in the widget when a tool/exec needs approval. true|\"auto\" enables; false disables."
+        },
+        "capabilities.inlineButtons": {
+          "label": "Inline buttons",
+          "help": "Where to render inline approval buttons: \"all\" | \"dm\" | \"group\" | \"allowlist\" | \"off\"."
         }
       }
     }
