@@ -24,8 +24,18 @@ const DECISION_LABEL: Record<ApprovalDecision, string> = {
 };
 
 export function Chat() {
-  const { messages, approvals, connected, send, decide } = useClawChannel();
+  const { messages, approvals, connected, status, send, decide } =
+    useClawChannel();
   const [input, setInput] = useState("");
+
+  // Connection dot: green when connected, amber while (re)connecting, grey when
+  // disconnected with no reconnect in flight.
+  const dotColor =
+    status === "connected"
+      ? "#2ecc71"
+      : status === "reconnecting" || status === "connecting"
+        ? "#f0ad4e"
+        : "#bbb";
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -38,12 +48,12 @@ export function Chat() {
       <h2 style={{ display: "flex", alignItems: "center", gap: 8 }}>
         ClawChannel
         <span
-          title={connected ? "connected" : "disconnected"}
+          title={status}
           style={{
             width: 10,
             height: 10,
             borderRadius: "50%",
-            background: connected ? "#2ecc71" : "#bbb",
+            background: dotColor,
           }}
         />
       </h2>
@@ -139,7 +149,8 @@ export function Chat() {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Type a message…"
+          disabled={!connected}
+          placeholder={connected ? "Type a message…" : "Connecting…"}
           style={{ flex: 1, padding: 8, borderRadius: 8, border: "1px solid #ccc" }}
         />
         <button type="submit" disabled={!connected} style={{ padding: "8px 16px" }}>

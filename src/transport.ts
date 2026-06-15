@@ -84,6 +84,24 @@ function isApprovalDecision(value: unknown): value is ApprovalDecision {
 }
 
 /**
+ * Heartbeat period. Every tick we evict any socket that did not answer the
+ * previous tick's ping (half-open TCP), then ping the survivors. Overridable
+ * via the constructor so tests can drive it with fake timers on a short period.
+ */
+const DEFAULT_HEARTBEAT_MS = 30_000;
+
+/**
+ * Backpressure cap. If a socket's outbound buffer is already above this many
+ * bytes we DROP the frame rather than pile on (a slow/stalled client must not
+ * make us buffer unboundedly → OOM). 1 MB tolerates a healthy burst of progress
+ * frames while still bounding worst-case memory per socket.
+ */
+const MAX_BUFFERED_BYTES = 1_000_000;
+
+/** Per-connection heartbeat liveness, kept off the (untyped) ws object. */
+type Liveness = { alive: boolean };
+
+/**
  * Owns the (noServer) WebSocketServer and the live connection map.
  *
  * The gateway owns the listening socket; we never call `.listen()`. We only
@@ -113,8 +131,114 @@ export class ClawChannelTransport {
     decision: ApprovalDecision,
   ) => void;
 
-  constructor() {
+  /** Liveness tracking for the ping/pong heartbeat, keyed by socket. */
+  private readonly liveness = new WeakMap<WebSocket, Liveness>();
+
+  /** The single heartbeat interval; started lazily on first connection. */
+  private heartbeat?: ReturnType<typeof setInterval>;
+
+  private readonly heartbeatMs: number;
+
+  /** Set once we've logged a backpressure drop, so we don't spam the log. */
+  private warnedBackpressure = false;
+
+  constructor(options?: { heartbeatMs?: number }) {
     this.wss = new WebSocketServer({ noServer: true });
+    this.heartbeatMs = options?.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  }
+
+  /**
+   * Heartbeat: detect & evict half-open sockets. On each tick, any socket that
+   * did NOT answer last tick's ping with a pong is `terminate()`d (which fires
+   * `close` → existing cleanup removes it from the map); survivors are marked
+   * not-alive and pinged again. The timer is `unref()`d so it never keeps the
+   * process alive, and is a no-op when there are no sockets.
+   */
+  private ensureHeartbeat(): void {
+    if (this.heartbeat) return;
+    this.heartbeat = setInterval(() => {
+      for (const ws of this.sockets.values()) {
+        // A throw here must never escape the interval callback (that would crash
+        // the gateway process). Guard the whole per-socket body; on any failure
+        // drop the offending socket and move on.
+        try {
+          const state = this.liveness.get(ws);
+          if (state && !state.alive) {
+            // Missed the previous round-trip → assume half-open, evict it.
+            ws.terminate();
+            continue;
+          }
+          if (state) state.alive = false;
+          ws.ping();
+        } catch {
+          try {
+            ws.terminate();
+          } catch {
+            // already dead — nothing to do.
+          }
+        }
+      }
+    }, this.heartbeatMs);
+    // Never let the heartbeat hold the event loop open on its own.
+    this.heartbeat.unref?.();
+  }
+
+  /**
+   * Stop the heartbeat timer and drop all connections. Call on plugin/transport
+   * teardown so we don't leak a timer. Idempotent.
+   */
+  dispose(): void {
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = undefined;
+    }
+    for (const ws of this.sockets.values()) {
+      try {
+        ws.terminate();
+      } catch {
+        // ignore — already dead.
+      }
+    }
+    this.sockets.clear();
+  }
+
+  /**
+   * Single send chokepoint. Returns true if the frame was handed to `ws.send`.
+   *
+   * Guards on (1) the socket being OPEN and (2) its outbound buffer staying
+   * under MAX_BUFFERED_BYTES. Under extreme backpressure we DROP the frame and
+   * return false rather than buffer unboundedly. Progress frames are inherently
+   * droppable (the next progress/finalize supersedes them); finalize / legacy /
+   * approval frames are important, but dropping one under sustained
+   * backpressure is still safer than running the process out of memory. Callers
+   * that care about delivery already observe the boolean return.
+   */
+  private safeSend(ws: WebSocket, payload: OutboundWsMessage): boolean {
+    if (ws.readyState !== WebSocket.OPEN) return false;
+    if (ws.bufferedAmount > MAX_BUFFERED_BYTES) {
+      if (!this.warnedBackpressure) {
+        this.warnedBackpressure = true;
+        console.warn(
+          "[clawchannel] dropping outbound frame: socket buffer over backpressure cap",
+        );
+      }
+      // A progress frame is superseded by the next update/finalize, so dropping
+      // it is harmless. But dropping a TERMINAL frame (finalize / legacy answer /
+      // approval) on a socket the heartbeat won't rescue — it still pongs, so it
+      // is never evicted — would wedge the widget (a "working" bubble that never
+      // settles, or an approval prompt the user never sees). Terminate such a
+      // socket so the client reconnects (settling orphaned drafts) and retries.
+      if (payload.type !== "progress") {
+        try {
+          ws.terminate();
+        } catch {
+          // already dead — nothing to do.
+        }
+      }
+      return false;
+    }
+    ws.send(JSON.stringify(payload));
+    return true;
   }
 
   setMessageHandler(
@@ -145,6 +269,15 @@ export class ClawChannelTransport {
     const sessionKey = ANON_PEER_ID;
     this.sockets.set(sessionKey, ws);
 
+    // Start the heartbeat lazily and seed this socket as alive; each pong
+    // re-arms it for the next tick.
+    this.liveness.set(ws, { alive: true });
+    ws.on("pong", () => {
+      const state = this.liveness.get(ws);
+      if (state) state.alive = true;
+    });
+    this.ensureHeartbeat();
+
     ws.on("message", (data) => {
       let parsed: unknown;
       try {
@@ -173,6 +306,7 @@ export class ClawChannelTransport {
     });
 
     const cleanup = () => {
+      this.liveness.delete(ws);
       // Only delete if this exact socket is still the mapped one.
       if (this.sockets.get(sessionKey) === ws) {
         this.sockets.delete(sessionKey);
@@ -203,8 +337,8 @@ export class ClawChannelTransport {
     const payload: OutboundWsMessage = id
       ? { type: "agent_message", text, id }
       : { type: "agent_message", text };
-    ws.send(JSON.stringify(payload));
-    return true;
+    // TODO(reconnect): message replay + idempotency dedupe deferred
+    return this.safeSend(ws, payload);
   }
 
   /**
@@ -219,8 +353,7 @@ export class ClawChannelTransport {
     const ws = this.openSocket(sessionKey);
     if (!ws) return false;
     const payload: OutboundWsMessage = { type: "progress", id, text };
-    ws.send(JSON.stringify(payload));
-    return true;
+    return this.safeSend(ws, payload);
   }
 
   /**
@@ -241,11 +374,10 @@ export class ClawChannelTransport {
    * receives a real per-peer `ctx.to` that always matches a mapped session.
    */
   sendTextToAnyOpen(text: string): boolean {
+    const payload: OutboundWsMessage = { type: "agent_message", text };
     for (const ws of this.sockets.values()) {
       if (ws.readyState === WebSocket.OPEN) {
-        const payload: OutboundWsMessage = { type: "agent_message", text };
-        ws.send(JSON.stringify(payload));
-        return true;
+        return this.safeSend(ws, payload);
       }
     }
     return false;
@@ -266,13 +398,11 @@ export class ClawChannelTransport {
     const frame: OutboundWsMessage = { type: "approval_request", ...payload };
     const ws = this.openSocket(sessionKey);
     if (ws) {
-      ws.send(JSON.stringify(frame));
-      return true;
+      return this.safeSend(ws, frame);
     }
     for (const candidate of this.sockets.values()) {
       if (candidate.readyState === WebSocket.OPEN) {
-        candidate.send(JSON.stringify(frame));
-        return true;
+        return this.safeSend(candidate, frame);
       }
     }
     return false;
@@ -295,13 +425,11 @@ export class ClawChannelTransport {
     };
     const ws = this.openSocket(sessionKey);
     if (ws) {
-      ws.send(JSON.stringify(frame));
-      return true;
+      return this.safeSend(ws, frame);
     }
     for (const candidate of this.sockets.values()) {
       if (candidate.readyState === WebSocket.OPEN) {
-        candidate.send(JSON.stringify(frame));
-        return true;
+        return this.safeSend(candidate, frame);
       }
     }
     return false;
