@@ -1,7 +1,8 @@
 # ClawChannel — 패키지화 / 배포 (PACKAGING)
 
 > ClawChannel을 **남들이 가져다 쓸 수 있는 수준**으로 배포하기 위한 패키지 구조와 작업 목록.
-> 상태: 구조는 **결정됨**, 실행은 진행 예정.
+> 상태(2026-06-15): 구조 **결정됨**. **완료** — auth seam, 위젯 lib/example 분리, 위젯 라이브러리 빌드(`file:`/tarball 소비 가능), 게이트웨이 정적 서빙, hmac-ticket E2E 검증.
+> **미완** — 플러그인 publishable(private 해제·dist 빌드·`openclaw` peerDep·exports), README·라이선스·ClawHub, 크로스오리진 게이트웨이 URL 옵션.
 
 ---
 
@@ -64,59 +65,59 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 | `@clawchannel/ticket` | ticket 서명/검증 zero-dep 모듈 | SaaS 백엔드가 SDK 없이 깨끗이 설치해야 할 때. 그 전엔 플러그인의 SDK-free 서브패스 export |
 | `@clawchannel/client` | 헤드리스 브라우저 WS 클라이언트(React 제거) | non-React 소비자(Vue/순수JS)가 생길 때. 그 전엔 위젯 내부 모듈 |
 
-→ 미리 쪼개면 군더더기. **실제 필요가 보일 때 떼어낸다.**
+→ 미리 쪼개면 군더더기. **실제 필요가 보일 때 떼어낸다.** (위젯 *라이브러리 빌드*는 별도 패키지가 아니라 위젯 패키지 내 빌드 타깃으로 이미 완료 — §4 D. `@clawchannel/ticket`은 SaaS 백엔드 연동 시 가장 먼저 떼어질 후보.)
 
 ---
 
-## 4. publishable 체크리스트  (● 배포 MVP 필수 / ○ 나중)
+## 4. publishable 체크리스트  (✅ 완료 / 🟡 부분 / ⬜ 미착수)
 
 ### A. 구조
-- ● 모노레포(workspaces): `@clawchannel/plugin` + `@clawchannel/widget`
-- ● 현재 루트 코드 → plugin, `clawchannel/widget` → widget으로 정리
-- ● 패키지명/스코프 확정 (현재 `openclaw-clawchannel`)
+- 🟡 `@clawchannel/plugin`(루트) + `@clawchannel/widget`(`clawchannel/widget`) **2-패키지 경계 확립**(각자 package.json). **풀 모노레포 workspaces는 미적용**(필요해지면).
+- ✅ 위젯 내부 `src/lib`(재사용) / `src/example`(데모) 분리 + 공개 배럴.
+- ⬜ 플러그인 패키지명 `openclaw-clawchannel` → 스코프명 확정(`@clawchannel/plugin`?) 미정.
 
-### B. 플러그인 패키지 → publishable
-- ● `"private": true` 제거 + 실제 semver (현재 `0.0.0`)
-- ● 빌드(tsc): TS→`dist/`, `openclaw.extensions`를 `./index.ts`→`./dist/index.js`로, `files` 화이트리스트
-- ● **`openclaw`를 peerDependency로 선언** (현재 의존성 선언 자체 없음) + 테스트 버전(`v2026.6.6`) 기재
-- ● ESM `exports` 맵 + `.d.ts` 동봉
-- ○ SDK 접점을 adapter 한 파일로 격리 (현재 `.d.ts:NNN` 줄번호가 주석에 흩어져 버전업에 취약)
+### B. 플러그인 패키지 → publishable  ⬜ (대부분 미완)
+- ⬜ `"private"`/semver — 플러그인 `package.json`은 아직 `private:true`, `0.0.0`.
+- ⬜ 빌드: `openclaw.extensions`가 아직 `./index.ts`(TS 소스). 게이트웨이가 소스 직접 로드 중이라 동작하지만, 출시엔 `dist/` 빌드 + `files`.
+- ⬜ **`openclaw` peerDependency 선언**(여전히 미선언) + 테스트 버전(`v2026.6.6`).
+- ⬜ ESM `exports`/`.d.ts`.
+- ○ SDK 접점 adapter 격리.
 
-### C. Auth  → 상세는 `AUTH.md`
-- ● `ConnectionVerifier` 계약 + `handleUpgrade` 배선(하드코딩 `ANON_PEER_ID` 제거)
-- ● 빌트인 `anonymous` + `hmac-ticket` (최소 2종) + config 스키마
-- ● **안전 기본값**(strategy 미설정 거부, anonymous loud opt-in)
-- ● ticket 발급 zero-dep 헬퍼
-- ○ `jwt` / `trusted-header` 빌트인, `createClawChannel({auth})` 라이브러리 export
+### C. Auth  ✅  → 상세 `AUTH.md`
+- ✅ `ConnectionVerifier` + `handleUpgrade` 배선(하드코딩 `ANON_PEER_ID` 제거).
+- ✅ 빌트인 `anonymous` + `hmac-ticket` + config 스키마.
+- ✅ 안전 기본값(strategy 미설정 거부, anonymous loud opt-in).
+- ✅ ticket 발급/검증 zero-dep(`src/ticket.ts`) + 브라우저 발급기(`devTicket.ts`, 데모).
+- ⬜ `jwt`/`trusted-header` 빌트인, `createClawChannel({auth})` 커스텀 함수 주입.
 
-### D. 위젯 패키지 → publishable
-- ● Vite library 빌드: ESM + CSS + 타입
-- ● 공개 API: `mount(el, { url, getTicket })` (또는 React 컴포넌트)
-- ● `react`를 peerDependency로 (번들에 React 금지)
-- ● 재연결 시 `getTicket` 재호출
-- ● 와이어 타입 공유: 당장은 복제 + contract test
-- ○ `<script>` 임베드용 UMD / 헤드리스 client 분리
+### D. 위젯 패키지 → 라이브러리 소비 가능  ✅ (file:/tarball)
+- ✅ Vite 라이브러리 빌드(`vite.lib.config.ts` → `dist-lib` ESM, react external) + `tsconfig.lib.json`(.d.ts).
+- ✅ `package.json` `exports`/`types`/`files:["dist-lib"]` + `build:lib`/`prepack`.
+- ✅ 공개 API: `Chat` 컴포넌트 + `useClawChannel({ getTicket, path })` 훅(배럴 export). (`mount()` 형태 아님)
+- ✅ `react` peerDependency. ✅ 재연결 시 `getTicket` 재호출.
+- ✅ 와이어 타입: 위젯/서버 각자 선언 + 서버측 contract test.
+- ⬜ **크로스오리진 게이트웨이 URL 옵션** — 현재 same-origin(`window.location.host`)만. 다른 오리진 소비처면 필요.
+- ⬜ `"private"` 해제(출시 시) / `<script>` 임베드 UMD / 헤드리스 client 분리(○).
 
-### E. 세션 분리
-- ● 단일 `web-anon` → identity별 peerId (C의 검증기 결과에서 자동으로 떨어짐)
-- ○ 멀티탭 정책
+### E. 세션 분리  ✅
+- ✅ 단일 `web-anon` → 검증기 `peerId`. ⬜ 멀티탭 정책.
 
-### F. 배포 위생 / DX
-- ● 패키지별 README(설치법·config·auth 전략표·테스트된 OpenClaw 버전·SaaS 예제)
-- ● 라이선스 MIT
-- ● 테스트 green: smoke + 채널 SDK contract test + auth 전략 유닛테스트
-- ○ ClawHub 등록 / 호환성 매트릭스 / CI / example 호스트 앱
+### F. 배포 위생 / DX  ⬜
+- ⬜ 패키지별 README. ⬜ 라이선스 MIT.
+- ✅ 테스트 green(auth/ticket/transport/approvals/static-assets/channel + 크로스런타임 + smoke). ✅ **hmac-ticket E2E 라이브 검증**(2026-06-15).
+- ⬜ ClawHub 등록 / 호환성 매트릭스 / CI.
+
+### 게이트웨이 정적 서빙 (Phase 3) ✅
+- ✅ `src/static-assets.ts` + `/clawchannel/` prefix 라우트, 예제 빌드 base `/clawchannel/`. traversal-safe(게이트웨이 정규화 + 컨테인먼트 체크). 📄 `PLAN.md` §7 Phase 3.
 
 ---
 
-## 5. 추천 순서 (의존관계 기준)
+## 5. 남은 작업 / 다음 순서
 
-1. **C(auth seam) 먼저** — 검증기 계약/peerId가 세션 분리(E)·위젯 getTicket(D)·ticket 헬퍼의 뿌리. 안전 기본값도 여기.
-2. **A/B(구조 + 플러그인 publishable)** — 코드가 안정됐을 때 패키지 경계를 그음.
-3. **D(위젯)** — plugin의 auth/프로토콜 확정 후 getTicket·재연결.
-4. **F(문서/테스트/배포)** — 마지막에 위생.
+지금까지: C(auth)·A 분리·D 위젯 라이브러리화·게이트웨이 서빙·E2E **완료**. 다음은 목표별:
 
-> 한 줄 요약: **auth를 먼저 코드로 정리 → 그 다음 2패키지로 쪼개고 배포 가능하게.**
+- **SaaS 임베드 목표** → ① 크로스오리진 게이트웨이 URL 옵션(소비처가 다른 오리진일 때 1순위), ② SaaS 백엔드 ticket 발급 연동(`issueClawChannelTicket` 호출 → `getTicket`), 필요 시 ③ `@clawchannel/ticket` zero-dep 패키지 분리.
+- **출시 목표** → B(플러그인 publishable: private 해제·dist 빌드·`openclaw` peerDep·exports) + F(README·MIT·ClawHub·CI) + 위젯 `private` 해제.
 
 ---
 

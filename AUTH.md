@@ -115,32 +115,39 @@ createClawChannel({
 
 ---
 
-## 7. 안전 기본값 (배포 전 필수)
+## 7. 안전 기본값 ✅ (구현됨)
 
-현재는 `auth:"plugin"` + 검증 0 = **배포 시 전세계 오픈** → 채택자를 태우는 지뢰. 배포 전 반드시:
+`resolveVerifier`가 강제한다 (`src/auth.ts`):
 
-- **strategy 명시 강제** — 미설정 시 기동 거부.
-- `anonymous`는 **시끄러운 opt-in** — 명시 플래그 + 경고 로그 + `security audit`에 걸리게. 조용한 기본 오픈 금지.
-- `trusted-header` 사용 시 "게이트웨이가 클라이언트 헤더를 덮어쓰는 프록시 뒤여야 함"을 문서에 명시.
+- **strategy 명시 강제** — `auth` 미설정/미지원 strategy/시크릿 누락 시 **throw → 플러그인 로드 거부**(조용한 전세계 오픈 불가).
+- `anonymous`는 선택 시 **경고 로그** 발생(dev 전용).
+- `trusted-header`(미구현 빌트인) 사용 시 "게이트웨이가 클라이언트 헤더를 덮어쓰는 프록시 뒤여야 함" 문서화 필요.
 
 ---
 
-## 8. 코드 변경 지점 (현재 → 목표)
+## 8. 코드 위치 ✅ (구현됨)
 
-| 위치 | 현재 | 목표 |
-|---|---|---|
-| `src/transport.ts:137` `handleUpgrade` | 무조건 수락 | 검증기 실행, 실패 시 소켓 destroy |
-| `src/transport.ts:145` `ANON_PEER_ID` | 단일 익명 peer 하드코딩 | `identity.peerId`로 교체 |
-| `index.ts:52` 라우트 등록 | `auth:"plugin"` + TODO | strategy 주입 + 검증기 배선 |
-| `openclaw.plugin.json` `channelConfigs.schema` | auth 없음 | `auth` 블록(strategy/secret) 추가 |
+| 위치 | 동작 |
+|---|---|
+| `src/auth.ts` | `ConnectionVerifier` 계약 + `anonymous`/`hmac-ticket` 전략 + `resolveVerifier`(안전 기본값) |
+| `src/ticket.ts` | zero-dep HS256 발급(`issueClawChannelTicket`)/검증(`verifyTicket`, alg 핀·timing-safe·exp) |
+| `src/transport.ts` `handleUpgrade` | 검증기 실행 → 실패 시 401+destroy, 성공 시 `peerId`로 `registerConnection` |
+| `src/inbound.ts` / `approvals.ts` | per-peer 라우팅 — 답변/progress는 캡처된 `wsKey`, 승인은 `turnSourceTo`(= 출발 peer) |
+| `index.ts` | config `channels.clawchannel.auth` → `resolveVerifier` → `transport.setVerifier` + WS·정적 라우트 |
+| `openclaw.plugin.json` | `channelConfigs.clawchannel.schema.auth`(strategy enum + ticketSecret string\|{env} + ticketParam) |
+| 위젯 `src/lib/useClawChannel.ts` | `getTicket` 주입 → `?ticket=` + 재연결 재발급 |
+
+→ **hmac-ticket E2E 라이브 검증됨(2026-06-15):** 유효 ticket 연결 + 에이전트 응답, 미·오 ticket 거절. (멀티유저 outbound/approval 라우팅 포함 — 더는 미해결 아님)
 
 ---
 
 ## 9. 미해결(후속)
 
-- **세션 중 강제 만료(revocation):** 이미 열린 소켓은 자동으로 안 닫힘. SaaS 로그아웃/구독만료 시 즉시 끊으려면 별도 처리(주기적 재검증 heartbeat 또는 서버측 소켓 강제 close). MVP 비대상.
-- `jwt` / `trusted-header` 빌트인은 후순위(우선 `anonymous` + `hmac-ticket`).
-- 멀티탭 사용자를 같은 peerId로 묶을지/탭별 분리할지의 정책.
+- **크로스오리진 게이트웨이 URL:** `useClawChannel`이 `window.location.host`로만 붙음 → 소비처가 게이트웨이와 다른 오리진이면 연결 불가. `url` 옵션 추가 필요(또는 same-origin 리버스 프록시).
+- **SaaS 실연동:** 현재 예제는 **브라우저에서 ticket 발급**(`example/devTicket.ts`, DEV 전용, 시크릿 노출). 실서비스는 SaaS 백엔드가 서버측 `issueClawChannelTicket`로 발급 → 위젯 `getTicket`이 호출. ticket 서명 모듈은 `@clawchannel/ticket`로 분리 후보(`PACKAGING.md` §3).
+- **세션 중 강제 만료(revocation):** 이미 열린 소켓은 자동으로 안 닫힘. SaaS 로그아웃/만료 시 즉시 끊으려면 별도 처리(heartbeat 재검증 또는 서버측 강제 close). 또한 **잘못된 ticket 시 위젯이 재연결 루프**(앰버) — "인증 실패" UX 미구현.
+- `jwt` / `trusted-header` 빌트인, `createClawChannel({auth})` 커스텀 함수 주입은 후순위.
+- 멀티탭 사용자를 같은 peerId로 묶을지/탭별 분리할지 정책.
 
 ---
 

@@ -10,27 +10,36 @@
 흔한 방식은 **config로 고르는 빌트인 전략**(`anonymous`/`hmac-ticket`/`jwt`/`trusted-header`)으로 제공.
 SaaS 임베드는 SaaS가 발급한 단명 서명 ticket을 플러그인이 검증(2차 로그인 아님). 상세 설계는 `AUTH.md`.
 
-**현재 코드 상태(미구현):** WS 라우트는 `auth:"plugin"` + 검증 0 → 누구나 접속 가능(loopback dev 가정),
-모든 연결이 단일 익명 피어 `web-anon`(`transport.ts:18`)으로 매핑됨. **배포 전 검증기 seam으로 교체 필요.**
-⚠️ 그 전까지 **운영 노출 금지** — 게이트웨이는 loopback bind 유지.
+**현재 코드 상태: ✅ 구현됨(2026-06-15).** `src/auth.ts`의 검증기 seam + `anonymous`/`hmac-ticket` 빌트인 + 안전 기본값(미설정 시 로드 거부), per-peer 라우팅, 위젯 `getTicket`. **hmac-ticket E2E 라이브 검증 완료.** (`anonymous`는 dev 전용·경고.)
 
 **잔여(후속, AUTH.md §9):**
-- 세션 중 강제 만료(revocation) — 이미 열린 소켓은 자동으로 안 닫힘.
-- `jwt` / `trusted-header` 빌트인은 후순위(우선 `anonymous` + `hmac-ticket`).
-- 멀티탭 사용자를 같은 peerId로 묶을지/분리할지 정책.
+- `jwt` / `trusted-header` 빌트인, `createClawChannel({auth})` 커스텀 함수 주입.
+- 세션 중 강제 만료(revocation) + **잘못된 ticket 시 재연결 루프 UX**.
+- 멀티탭 정책.
 
 **관련:** `AUTH.md`(상세), `PACKAGING.md`(ticket 헬퍼 패키지화), `PLAN.md` §10·§12.
 
 ---
 
-## 🖥️ 위젯 호스팅 방식 (open)
+## 🖥️ 위젯 호스팅 방식 — ✅ 게이트웨이 서빙 구현됨
 
-**상태:** 개발은 Vite(dev)로 진행, **배포 방식만 추후 확정.**
+**상태:** 후보 ③(**플러그인이 게이트웨이 포트로 서빙**, `src/static-assets.ts` + `/clawchannel/` 라우트)을 **구현 완료**(PLAN.md Phase 3). dev는 Vite(프록시), 배포는 위젯 `vite build`(base `/clawchannel/`) 산출물을 게이트웨이가 서빙.
+- 잔여: ② 별도 정적 호스팅 / ④ `<script>` 임베드는 선택지로 남김. 별도 오리진 호스팅 시 **크로스오리진 WS URL 옵션**(아래) 필요.
 
-후보:
-- ① Vite dev 서버 (개발 기본값)
-- ② 별도 정적 호스팅 (nginx/Netlify/S3)
-- ③ **플러그인이 게이트웨이 포트로 서빙** (`registerHttpRoute`) — 단일 출처·단일 배포, 기획 방향과 가장 부합 (PLAN.md Phase 3)
-- ④ 임베드 `<script>` 스니펫 (남의 사이트에 심는 위젯)
+---
 
-영향: CORS/origin(`gateway.controlUi.allowedOrigins`), 배포 단위, 사용 형태.
+## 📦 남은 작업 (2026-06-15 기준)
+
+**SaaS 임베드 경로**
+- **크로스오리진 게이트웨이 URL 옵션** — `useClawChannel`이 same-origin(`window.location.host`)만 지원. 소비처가 다른 오리진이면 `url` 옵션 필요. (`file:`로 외부 프로젝트에 붙일 때 1순위로 부딪힘)
+- **SaaS 실연동** — 백엔드가 서버측 `issueClawChannelTicket`로 발급 → 위젯 `getTicket`. (현재 예제는 브라우저 발급 = DEV 전용)
+- `@clawchannel/ticket` zero-dep 패키지 분리(SaaS 백엔드가 SDK 없이 소비할 때).
+
+**출시 경로(PACKAGING §4 B/F)**
+- 플러그인 publishable: `private` 해제·실 semver·`dist` 빌드·`openclaw` peerDep·`exports`. 위젯 `private` 해제.
+- 패키지별 README, MIT 라이선스, ClawHub 등록, 호환성 매트릭스, CI.
+
+**기능 잔여(PLAN §7)**
+- 미디어 송수신, DM pairing(승인 코드), `allowFrom` 실유저화(현재 `web-anon`만), `openclaw channels status` 통합.
+- 정적 자산 캐시 헤더(nit), 플러그인 매니페스트 메타데이터 경고(label/blurb/docsPath) 정리.
+- Phase 2: onAgentEvent tool inspector(구조화 카드), thinking 렌더.

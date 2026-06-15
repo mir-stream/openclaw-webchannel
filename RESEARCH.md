@@ -232,7 +232,7 @@ api.registerHttpRoute({
 5. **auth는 결정됨 → 📄 `AUTH.md`.** `auth:"plugin"` + 검증기(ConnectionVerifier) seam + 빌트인 전략(`anonymous`/`hmac-ticket`/`jwt`/`trusted-header`). 게이트웨이 토큰=operator 자격이라 브라우저 직접 노출 금지(불변).
 6. **세션키 매핑:** 검증된 `peerId`가 기본 sessionKey(auth가 동시 해결). 잔여는 멀티탭 정책. `messaging.resolveSessionConversation`이 후크.
 7. **번들은 minified.** 정확한 시그니처는 `dist/**/*.d.ts` grep 또는 GitHub 원본 참고.
-8. 검증 안 한 것(⚠️): outbound media 정확 시그니처, live-preview/receipt contract test 요구, `handleUpgrade`의 정확한 auth 상호작용 디테일 — 구현 시 해당 d.ts/문서 재확인.
+8. 구현으로 **검증됨**: `handleUpgrade` auth 게이팅, 승인 출발-peer 라우팅, 정적 서빙(§13). **여전히 미검증(⚠️)**: outbound **media** 정확 시그니처, live-preview/receipt contract test 요구.
 
 ---
 
@@ -256,3 +256,26 @@ grep -n 'onAgentEvent\|registerAgentEventSubscription' $OC/docs/plugins/sdk-*.md
 # 번들 채널
 ls $OC/dist/extensions/ | grep -iE 'telegram|google|microsoft|mattermost'
 ```
+
+---
+
+## 13. 구현 중 확인된 SDK 사실 ✅ (auth · 승인 라우팅 · 정적 서빙)
+
+> 2026-06-15 구현·E2E로 확인. 미래 에이전트가 재조사 없이 활용할 것.
+
+### 승인을 "출발 peer"로 라우팅 (멀티유저 핵심)
+- 승인 요청 페이로드(`ExecApprovalRequestPayload`/`PluginApprovalRequestPayload`)에 **`turnSourceChannel` + `turnSourceTo`** 필드가 있음. `turnSourceTo`는 inbound 턴의 `reply.to`에서 채워짐 = 우리가 기록한 peer `wsKey` = **transport 소켓맵 키와 동일**.
+  - d.ts: `dist/plugin-sdk/exec-approvals-*.d.ts`(turnSource* 필드), `plugin-approvals-*.d.ts`. 번들 `signal`/`googlechat` 네이티브 어댑터가 동일 패턴 사용.
+- ⇒ `approvalCapability`의 `resolveOriginTarget`/`transport.prepareTarget`에서 `turnSourceChannel==="clawchannel"` 필터 후 `turnSourceTo`를 sessionKey로 쓰면 승인 카드가 **요청한 그 브라우저**로 감. (구현: `src/approvals.ts`)
+- 답변·progress draft는 이미 inbound가 캡처한 `wsKey`로 per-peer 전달(`src/inbound.ts`).
+
+### 정적 자산 서빙 (게이트웨이 단일 배포)
+- `registerHttpRoute`는 **exact `/clawchannel/ws` + prefix `/clawchannel/`가 같은 auth 레벨에서 공존** 가능("fallthrough chains on same auth level"); exact가 우선이라 WS 업그레이드 영향 없음.
+- 게이트웨이 HTTP 레이어가 **라우트 매칭 전에 경로를 정규화/디코드**함 → `..`·인코딩 traversal이 우리 핸들러에 닿기 전에 무력화(루트 대시보드로 떨어짐). 그래도 핸들러 자체 containment 체크 보유(`src/static-assets.ts`).
+- 예제 빌드 base를 `/clawchannel/`로 두면 자산 URL이 그 prefix로 해석됨(`vite.config.ts` build 시).
+
+### 플러그인 로딩 / 테스트 루프
+- 사용자 게이트웨이는 `plugins.load.paths`(레포 경로) + `openclaw.extensions:["./index.ts"]`로 **TS 소스를 직접 로드** → `openclaw gateway restart`가 소스 변경을 즉시 반영(플러그인은 빌드 불필요; 위젯은 `npm run build` 필요). 상세 E2E 절차는 memory `clawchannel-live-gateway-e2e`.
+
+### ticket = JWT HS256 (자체 구현, zero-dep)
+- `src/ticket.ts`: `node:crypto` HMAC로 `base64url(header).base64url(payload).base64url(sig)`. 검증 시 **alg를 HS256로 명시 핀**(헤더 신뢰 안 함) + timing-safe 비교 + `exp`. 브라우저측 동일 포맷은 Web Crypto(`crypto.subtle`)로 발급(`example/devTicket.ts`), 크로스런타임 호환성 테스트로 보장(`src/devticket-webcrypto.test.ts`).

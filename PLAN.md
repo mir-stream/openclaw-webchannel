@@ -141,59 +141,70 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 
 ## 7. 기능 범위 / 단계 (Scope & Phases)
 
-### Phase 0 — 최소 동작 (Walking skeleton)
-- 플러그인 등록(`kind: "channel"`) + `registerHttpRoute`/`handleUpgrade`로 WS 수락.
-- 연결맵 + `outbound.sendText` → 텍스트 1왕복.
-- React 위젯: 입력창 + 메시지 렌더 + WS 연결.
-- **완료 기준:** 위젯에서 보낸 메시지에 에이전트가 답하고, 그 답이 위젯에 뜬다.
+> 상태 표기: ✅ 완료 / 🟡 부분 / ⬜ 미착수. (2026-06-15 기준)
 
-### Phase 1 — 완전한 순수 채널 (MVP, 본 기획의 목표)
-- `streaming.mode: "progress"` → tool 활동 라인 표시.
-- `approvalCapability` → 승인 버튼 왕복(HITL).
-- DM allowlist + pairing(신규 사용자 승인 코드).
-- 미디어 송수신, 재연결/연결맵 수명주기 안정화, 멀티세션.
-- 설정 스키마(`channels.clawchannel.*`) + `openclaw channels status` 통합.
+### Phase 0 — 최소 동작 (Walking skeleton) ✅
+- ✅ 플러그인 등록 + `registerHttpRoute`/`handleUpgrade`로 WS 수락, 연결맵, 텍스트 1왕복, React 위젯.
 
-### Phase 2 — tool inspector 확장 (선택)
-- `api.runtime.events.onAgentEvent` 구독 → 자기 세션의 tool 이벤트를 WS로 forward.
-- React에서 구조화 tool 카드(인자/결과/접기) 렌더.
-- (옵션) `reasoningDefault: "on"|"stream"` 켜고 thinking 블록 렌더.
+### Phase 1 — 완전한 순수 채널 (MVP) 🟡
+- ✅ `streaming.mode: "progress"` tool 활동 라인.
+- ✅ `approvalCapability` 승인 버튼(HITL) — 출발 peer로 라우팅(turnSourceTo).
+- 🟡 DM allowlist(✅) — **pairing(승인 코드)은 미구현**. 신규 사용자 승인은 auth(ticket)로 대체 방향.
+- ✅ 재연결/연결맵 수명주기, **멀티세션(per-peer, auth로 해결)**. ⬜ **미디어 송수신** 미구현.
+- ✅ 설정 스키마(`channels.clawchannel.*`, auth 포함). ⬜ `openclaw channels status` 통합 미확인.
 
-### Phase 3 — 다듬기 (선택)
-- 정적 위젯 자산을 플러그인 라우트로 서빙(완전 단일 배포).
-- typing indicator(`heartbeat.sendTyping`), 인터랙티브 버튼 액션, 테마.
+### Auth (원래 BACKLOG → 구현됨) ✅  📄 `AUTH.md`
+- ✅ `ConnectionVerifier` seam + 빌트인 `anonymous`/`hmac-ticket` + 안전 기본값 + zero-dep ticket 발급/검증.
+- ✅ 멀티유저 outbound/approval per-peer 라우팅. ✅ 위젯 `getTicket` + 재연결 재발급.
+- ✅ **hmac-ticket E2E 라이브 검증**(페이지 서빙 + ticket 연결 + 에이전트 응답 + 미·오 ticket 거절).
+- ⬜ 잔여: `jwt`/`trusted-header` 전략, 커스텀 함수 주입, 세션 revocation, 멀티탭 정책.
+
+### Phase 2 — tool inspector 확장 (선택) ⬜
+- `api.runtime.events.onAgentEvent` 구독 → tool 이벤트 WS forward, 구조화 tool 카드, (옵션) thinking.
+
+### Phase 3 — 다듬기 🟡
+- ✅ **정적 위젯 자산을 플러그인 라우트(`/clawchannel/`)로 서빙** (단일 배포). 📄 `src/static-assets.ts`
+- ⬜ typing indicator(`heartbeat.sendTyping`), 인터랙티브 버튼 액션, 테마.
 
 ---
 
-## 8. 구성요소 / 파일 구조 (제안)
+## 8. 구성요소 / 파일 구조 (현재)
+
+두 개의 패키지(서버 플러그인 / 브라우저 위젯). 📄 분리 이유·배포는 `PACKAGING.md`.
 
 ```
-clawchannel/
-├── package.json              # openclaw.channel 메타데이터
-├── openclaw.plugin.json      # 매니페스트 (kind: "channel", channelConfigs)
-├── index.ts                  # defineChannelPluginEntry / registerFull (WS 라우트)
-├── setup-entry.ts            # defineSetupPluginEntry (경량 셋업 로딩)
+openclaw-clawchannel/              # 레포 루트 = 플러그인 패키지(Node)
+├── package.json                   # openclaw.{channel,extensions,setupEntry}
+├── openclaw.plugin.json           # 매니페스트 (channelConfigs: auth/allowFrom/streaming/…)
+├── index.ts                       # registerFull: WS 라우트 + 정적 /clawchannel/ 라우트 + 검증기 주입
+├── setup-entry.ts
 ├── src/
-│   ├── channel.ts            # createChatChannelPlugin (security/pairing/outbound)
-│   ├── transport.ts          # WebSocketServer(noServer) + Map<sessionKey, ws>
-│   ├── inbound.ts            # WS 메시지 → 채널 inbound dispatch
-│   ├── approvals.ts          # approvalCapability
-│   └── channel.test.ts       # 콜로케이트 테스트
-└── widget/                   # React 위젯 (별도 빌드)
-    ├── src/
-    │   ├── useClawChannel.ts  # WS 클라이언트 훅 (연결/송신/이벤트 디스패치)
-    │   ├── Chat.tsx           # 메시지 렌더 + 입력
-    │   ├── ProgressDraft.tsx  # 진행 라인 렌더
-    │   └── ApprovalPrompt.tsx # [Allow][Deny] 버튼
-    └── (vite 설정)
+│   ├── auth.ts                    # ConnectionVerifier + 전략(anonymous, hmac-ticket) + resolveVerifier
+│   ├── ticket.ts                  # zero-dep HS256 ticket 발급/검증
+│   ├── transport.ts               # WebSocketServer(noServer) + Map<peerId, ws> + 검증기 게이트
+│   ├── inbound.ts                 # WS 메시지 → 채널 inbound dispatch (per-peer)
+│   ├── approvals.ts               # approvalCapability (turnSourceTo로 출발 peer 라우팅)
+│   ├── message-adapter.ts         # progress-draft 컨트롤러 / live 어댑터
+│   ├── channel.ts                 # createChatChannelPlugin (security/outbound)
+│   ├── static-assets.ts           # 빌드된 위젯을 /clawchannel/ 로 서빙(traversal-safe)
+│   └── *.test.ts                  # vitest (auth, ticket, transport, approvals, channel, static-assets, …)
+├── smoke-*.mjs                    # 라이브 게이트웨이 대상 수동 스모크(ws/progress/approval/reconnect/e2e)
+└── clawchannel/widget/            # 브라우저 패키지(@clawchannel/widget)
+    ├── package.json               # exports→dist-lib, react peerDep, build / build:lib
+    ├── vite.config.ts             # 예제 앱 빌드(→dist, base "/clawchannel/")
+    ├── vite.lib.config.ts         # 라이브러리 빌드(→dist-lib, react external)
+    ├── tsconfig.lib.json          # src/lib 의 .d.ts emit
+    └── src/
+        ├── lib/                   # 재사용(출시 대상): index.ts(배럴), useClawChannel.ts, Chat.tsx
+        └── example/               # 데모(미출시): App.tsx(시크릿 입력), devTicket.ts(브라우저 발급, DEV), main.tsx
 ```
 
 ### 핵심 SDK 표면
 - `openclaw/plugin-sdk/channel-core` — `createChatChannelPlugin`, `defineChannelPluginEntry`
 - `openclaw/plugin-sdk/channel-outbound` — outbound 어댑터/receipt
 - `openclaw/plugin-sdk/approval-runtime` — `approvalCapability` 헬퍼
-- `api.registerHttpRoute({ handleUpgrade })` — WS 수락
-- `messaging.resolveSessionConversation(...)` — 세션 그래머
+- `api.registerHttpRoute({ handleUpgrade })` — WS 수락 / `{ match:"prefix", handler }` — 정적 서빙
+- `api.runtime.channel.routing.resolveAgentRoute(...)` — 채널 스코프 세션키(실제 사용; 구 `resolveSessionConversation` 아님)
 
 ---
 
