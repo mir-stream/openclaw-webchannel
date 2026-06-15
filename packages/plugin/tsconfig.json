@@ -14,5 +14,5 @@
     "verbatimModuleSyntax": true
   },
   "include": ["index.ts", "setup-entry.ts", "src/**/*.ts"],
-  "exclude": ["clawchannel/widget", "node_modules"]
+  "exclude": ["node_modules"]
 }

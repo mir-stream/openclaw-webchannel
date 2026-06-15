@@ -172,34 +172,31 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 
 ## 8. 구성요소 / 파일 구조 (현재)
 
-두 개의 패키지(서버 플러그인 / 무프레임워크 브라우저 클라이언트). 📄 분리 이유·배포는 `PACKAGING.md`.
+**npm workspaces 모노레포** — 루트는 워크스페이스 매니저, 두 패키지는 `packages/` 아래 대칭(서버 플러그인 / 무프레임워크 브라우저 클라이언트). 📄 분리 이유·배포는 `PACKAGING.md`.
 (과거의 React `@clawchannel/widget`는 2026-06-15 삭제 — `@clawchannel/client`가 대체.)
 
 ```
-openclaw-clawchannel/              # 레포 루트 = 플러그인 패키지(Node)
-├── package.json                   # openclaw.{channel,extensions,setupEntry}
-├── openclaw.plugin.json           # 매니페스트 (channelConfigs: auth/allowFrom/streaming/…)
-├── index.ts                       # registerFull: WS 라우트 + 정적 /clawchannel/ 라우트 + 검증기 주입
-├── setup-entry.ts
-├── src/
-│   ├── auth.ts                    # ConnectionVerifier + 전략(anonymous, hmac-ticket) + resolveVerifier
-│   ├── ticket.ts                  # zero-dep HS256 ticket 발급/검증
-│   ├── transport.ts               # WebSocketServer(noServer) + Map<peerId, ws> + 검증기 게이트
-│   ├── inbound.ts                 # WS 메시지 → 채널 inbound dispatch (per-peer)
-│   ├── approvals.ts               # approvalCapability (turnSourceTo로 출발 peer 라우팅)
-│   ├── message-adapter.ts         # progress-draft 컨트롤러 / live 어댑터
-│   ├── channel.ts                 # createChatChannelPlugin (security/outbound)
-│   ├── static-assets.ts           # 빌드된 채팅 UI를 /clawchannel/ 로 서빙(traversal-safe)
-│   └── *.test.ts                  # vitest (auth, ticket, transport, approvals, channel, static-assets, …)
+openclaw-clawchannel/              # 레포 루트 = 워크스페이스 매니저(코드 없음)
+├── package.json                   # { "workspaces": ["packages/*"], scripts: test/typecheck/build }
+├── package-lock.json              # 단일 통합 lock
 ├── smoke/                         # 라이브 게이트웨이 대상 수동 스모크(ws/progress/approval/reconnect/e2e/selfclose)
 ├── docs/                          # AUTH·PACKAGING·PLAN·RESEARCH·BACKLOG
-└── packages/client/              # 브라우저 패키지(@clawchannel/client, 무프레임워크·zero-dep)
-    ├── package.json               # exports→dist, build(tsc 라이브러리) / build:demo(vite) / test(vitest)
-    ├── vite.config.ts             # 데모 빌드(→dist-demo, base "/clawchannel/") + dev 프록시
-    ├── tsconfig.build.json        # 라이브러리 .d.ts emit(→dist)
-    ├── src/                       # index.ts(배럴), client.ts(ClawChannelClient), types.ts, client.test.ts
-    └── demo/                      # 순수 DOM 데모(미출시): main.ts, devTicket.ts(브라우저 발급, DEV) + index.html
+└── packages/
+    ├── plugin/                    # 서버 패키지(@clawchannel/plugin 후보; 현 name "openclaw-clawchannel", Node)
+    │   ├── package.json           # openclaw.{channel,extensions,setupEntry} = "이게 플러그인이다" 표식
+    │   ├── openclaw.plugin.json   # 매니페스트 (channelConfigs: auth/allowFrom/streaming/…)
+    │   ├── index.ts               # registerFull: WS 라우트 + 정적 /clawchannel/ 라우트 + 검증기 주입
+    │   ├── setup-entry.ts
+    │   └── src/                   # auth, ticket, transport, inbound, approvals, message-adapter, channel, static-assets + *.test.ts
+    └── client/                    # 브라우저 패키지(@clawchannel/client, 무프레임워크·zero-dep)
+        ├── package.json           # exports→dist, build(tsc 라이브러리) / build:demo(vite) / test(vitest)
+        ├── vite.config.ts         # 데모 빌드(→dist-demo, base "/clawchannel/") + dev 프록시
+        ├── tsconfig.build.json    # 라이브러리 .d.ts emit(→dist)
+        ├── src/                   # index.ts(배럴), client.ts(ClawChannelClient), types.ts, client.test.ts
+        └── demo/                  # 순수 DOM 데모(미출시): main.ts, devTicket.ts(브라우저 발급, DEV) + index.html
 ```
+
+> **게이트웨이 로딩:** `plugins.load.paths`는 이제 `…/openclaw-clawchannel/packages/plugin`(레포 루트가 아니라 플러그인 패키지)을 가리킨다. `openclaw.extensions`는 그 패키지 기준 `./index.ts`. SDK(`openclaw/plugin-sdk`)는 전역 설치본을 가리키는 `node_modules/openclaw` 심링크로 해석(워크스페이스 install이 prune하므로 재생성 필요).
 
 ### 핵심 SDK 표면
 - `openclaw/plugin-sdk/channel-core` — `createChatChannelPlugin`, `defineChannelPluginEntry`

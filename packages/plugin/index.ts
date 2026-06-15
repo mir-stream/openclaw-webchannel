@@ -11,14 +11,15 @@ import { resolveVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
 import { createStaticAssetsHandler } from "./src/static-assets.js";
 
-// Resolve the built chat-UI `dist-demo/` relative to THIS module (the plugin
-// entry at the repo root), so the path is correct regardless of the gateway's
-// cwd. index.ts -> <repo-root>/packages/client/dist-demo (the framework-agnostic
-// @clawchannel/client vanilla demo; build it with `npm run build:demo` there).
+// Resolve the built chat-UI `dist-demo/` relative to THIS module, so the path is
+// correct regardless of the gateway's cwd. In the monorepo the plugin lives at
+// packages/plugin/ and the client at packages/client/, so this module's dir
+// (packages/plugin) joins `../client/dist-demo` — the framework-agnostic
+// @clawchannel/client vanilla demo (build it with `npm run build:demo` there).
 const pluginDir = path.dirname(fileURLToPath(import.meta.url));
 const chatUiDistRoot = path.join(
   pluginDir,
-  "packages",
+  "..",
   "client",
   "dist-demo",
 );

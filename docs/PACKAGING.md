@@ -21,9 +21,10 @@
 npm 패키지는 `dependencies` 목록이 하나라, 한 패키지에 묶으면 프런트 번들이 `openclaw/plugin-sdk`·`ws`(Node 전용)를 끌어들여 **빌드가 깨지거나 비대해진다.** (`@sentry/node` vs `@sentry/browser`, `@trpc/server` vs `@trpc/client`이 같은 이유로 분리됨.)
 
 ```
-@clawchannel/plugin    (서버, Node)            ← 게이트웨이에 설치  (현재 루트 코드: index.ts, src/*)
+@clawchannel/plugin    (서버, Node)            ← 게이트웨이에 설치  (packages/plugin: index.ts, src/*)
 @clawchannel/client    (브라우저, 무프레임워크)  ← 헤드리스 연결/프로토콜/상태  (packages/client)
 ```
+> **npm workspaces 모노레포.** 루트는 워크스페이스 매니저(코드 없음, `workspaces:["packages/*"]`), 두 패키지는 `packages/` 아래 대칭. 게이트웨이 `plugins.load.paths`는 `packages/plugin`을 가리킨다. 📄 구조 트리는 `PLAN.md` §8.
 
 > **2축 (프레임워크)는 이제 패키지 경계가 아니다.** 브라우저 쪽은 **무프레임워크 코어(`client`) 하나**만 배포한다. React/Vue/순수 JS 뷰는 *소비자 쪽*에서 그 위에 얹는다(이 repo가 React 뷰를 떠안지 않는다). `packages/client/demo`가 순수 JS 뷰의 참조 예시. — 과거엔 React `@clawchannel/widget`를 별도 패키지로 뒀으나 2026-06-15 삭제(§4 D).
 
@@ -76,7 +77,7 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 ## 4. publishable 체크리스트  (✅ 완료 / 🟡 부분 / ⬜ 미착수)
 
 ### A. 구조
-- 🟡 `@clawchannel/plugin`(루트) + `@clawchannel/client`(`packages/client`) **2-패키지 경계 확립**(각자 package.json). **풀 모노레포 workspaces는 미적용**(필요해지면).
+- ✅ **npm workspaces 모노레포**(2026-06-15) — `@clawchannel/plugin`(`packages/plugin`) + `@clawchannel/client`(`packages/client`), 루트는 워크스페이스 매니저(`workspaces:["packages/*"]`, 단일 lock). 게이트웨이 load path = `packages/plugin`.
 - ⬜ 플러그인 패키지명 `openclaw-clawchannel` → 스코프명 확정(`@clawchannel/plugin`?) 미정.
 
 ### B. 플러그인 패키지 → publishable  ⬜ (대부분 미완)
