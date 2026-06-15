@@ -2,20 +2,18 @@ import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { WebSocketServer, WebSocket } from "ws";
 
+import type { ConnectionVerifier } from "./auth.js";
+// `ANON_PEER_ID` is owned by the auth module (the anonymous peer is an auth
+// decision). Re-export it here so existing importers (transport.test.ts,
+// inbound.ts) keep their import path. This file stays SDK-free.
+import { ANON_PEER_ID } from "./auth.js";
+
 /**
  * The channel id is the fixed key the rest of OpenClaw uses to route to us.
  */
 export const CLAWCHANNEL_ID = "clawchannel";
 
-/**
- * Phase 0: single anonymous session. Every browser connection is mapped to the
- * same sessionKey peer id. Real multi-tab / per-user session-key mapping is
- * deferred (see PLAN.md §12 "session grammar").
- *
- * TODO(session): Phase 1 — derive a per-user/per-tab peer id from an issued
- * token or cookie instead of a single anonymous peer.
- */
-export const ANON_PEER_ID = "web-anon";
+export { ANON_PEER_ID };
 
 /**
  * Message envelope exchanged with the browser widget.
@@ -130,6 +128,13 @@ export class ClawChannelTransport {
     id: string,
     decision: ApprovalDecision,
   ) => void;
+
+  /**
+   * Verifies each upgrade request and yields the connection identity, or null to
+   * reject. Injected at startup (see `setVerifier`); until set, every upgrade is
+   * rejected — we never accept an unauthenticated connection by accident.
+   */
+  private verifier?: ConnectionVerifier;
 
   /** Liveness tracking for the ping/pong heartbeat, keyed by socket. */
   private readonly liveness = new WeakMap<WebSocket, Liveness>();
@@ -257,16 +262,60 @@ export class ClawChannelTransport {
     this.onApprovalDecision = handler;
   }
 
-  /** Wire a raw Node upgrade request (handed over by the gateway) into `ws`. */
-  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
-    this.wss.handleUpgrade(req, socket, head, (ws) => {
-      this.registerConnection(ws);
-    });
+  /** Inject the connection verifier (run on every upgrade). */
+  setVerifier(verifier: ConnectionVerifier): void {
+    this.verifier = verifier;
   }
 
-  private registerConnection(ws: WebSocket): void {
-    // Phase 0: single anonymous session for every connection.
-    const sessionKey = ANON_PEER_ID;
+  /**
+   * Reject an upgrade by writing a 401 and destroying the raw socket. We never
+   * call `wss.handleUpgrade`, so no WebSocket is ever created for the request.
+   */
+  private rejectUpgrade(socket: Duplex): void {
+    try {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+    } catch {
+      // socket may already be gone — fall through to destroy.
+    }
+    socket.destroy();
+  }
+
+  /**
+   * Wire a raw Node upgrade request (handed over by the gateway) into `ws`.
+   *
+   * The verifier runs BEFORE we accept: on null/throw we reject (401 + destroy)
+   * and never upgrade; on success the resolved `peerId` becomes the session key.
+   * This is the single auth seam (AUTH.md §3).
+   */
+  handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    // Defensive: a missing verifier means startup wiring failed. Refuse rather
+    // than silently accepting an unauthenticated connection.
+    const verifier = this.verifier;
+    if (!verifier) {
+      this.rejectUpgrade(socket);
+      return;
+    }
+    void Promise.resolve()
+      .then(() => verifier(req))
+      .then((identity) => {
+        if (!identity) {
+          this.rejectUpgrade(socket);
+          return;
+        }
+        this.wss.handleUpgrade(req, socket, head, (ws) => {
+          this.registerConnection(ws, identity.peerId);
+        });
+      })
+      .catch(() => {
+        // A throwing verifier is an auth failure, not a crash: reject the socket.
+        this.rejectUpgrade(socket);
+      });
+  }
+
+  private registerConnection(ws: WebSocket, peerId: string = ANON_PEER_ID): void {
+    // The verified per-connection identity is the session key. (Defaults to the
+    // anon peer so the existing single-arg test/usage stays valid.)
+    const sessionKey = peerId;
     this.sockets.set(sessionKey, ws);
 
     // Start the heartbeat lazily and seed this socket as alive; each pong
@@ -324,6 +373,24 @@ export class ClawChannelTransport {
   }
 
   /**
+   * The "any open socket" fallback, made multi-peer safe.
+   *
+   * The Phase-0 fallbacks blindly delivered to whatever socket was open, which
+   * was fine when every connection was the same anon peer. With real per-user
+   * peers that would cross-deliver one user's content to another. So we only
+   * fall back when there is EXACTLY ONE connection (effectively the anonymous
+   * single-peer case); with multiple peers we refuse to guess and return
+   * undefined (the caller treats this as "not delivered").
+   */
+  private soleOpenSocket(): WebSocket | undefined {
+    if (this.sockets.size !== 1) return undefined;
+    for (const ws of this.sockets.values()) {
+      if (ws.readyState === WebSocket.OPEN) return ws;
+    }
+    return undefined;
+  }
+
+  /**
    * Push a final text message to the browser bound to `sessionKey`.
    *
    * If `id` is provided this finalizes an in-flight progress draft (the widget
@@ -366,52 +433,46 @@ export class ClawChannelTransport {
   }
 
   /**
-   * Phase 0 fallback for core-initiated outbound sends whose `ctx.to` does not
-   * exactly match a mapped session key. Since there is exactly one anonymous
-   * connection in Phase 0, deliver to the single open socket.
+   * Fallback for core-initiated outbound sends whose `ctx.to` does not exactly
+   * match a mapped session key. Safe only when there is exactly one connection
+   * (the anonymous single-peer case); with multiple real per-user peers we
+   * refuse to guess a recipient to avoid cross-delivering between users.
    *
-   * TODO(session): Phase 1 — remove this fallback once `outbound.sendText`
-   * receives a real per-peer `ctx.to` that always matches a mapped session.
+   * TODO(session): remove this fallback once `outbound.sendText` always receives
+   * a real per-peer `ctx.to` that matches a mapped session.
    */
   sendTextToAnyOpen(text: string): boolean {
-    const payload: OutboundWsMessage = { type: "agent_message", text };
-    for (const ws of this.sockets.values()) {
-      if (ws.readyState === WebSocket.OPEN) {
-        return this.safeSend(ws, payload);
-      }
-    }
-    return false;
+    const ws = this.soleOpenSocket();
+    if (!ws) return false;
+    return this.safeSend(ws, { type: "agent_message", text });
   }
 
   /**
    * Push a native approval prompt to the browser bound to `sessionKey`. The
    * widget renders a distinct approval card with one button per offered option;
    * clicking sends `{type:"approval_decision", id, decision}` back. Returns true
-   * if delivered. Falls back to the single open socket (Phase 0 single anon
-   * peer), mirroring `sendTextToAnyOpen`, so an approval reaches the live tab
-   * even when the captured target key does not line up exactly.
+   * if delivered. Falls back to the single open socket ONLY when there is
+   * exactly one connection (mirroring `sendTextToAnyOpen`), so an approval
+   * reaches the live anon tab even when the captured target key does not line up
+   * — but never cross-delivers an approval prompt between distinct users.
    */
   sendApprovalRequest(
     sessionKey: string,
     payload: ApprovalRequestPayload,
   ): boolean {
     const frame: OutboundWsMessage = { type: "approval_request", ...payload };
-    const ws = this.openSocket(sessionKey);
+    const ws = this.openSocket(sessionKey) ?? this.soleOpenSocket();
     if (ws) {
       return this.safeSend(ws, frame);
-    }
-    for (const candidate of this.sockets.values()) {
-      if (candidate.readyState === WebSocket.OPEN) {
-        return this.safeSend(candidate, frame);
-      }
     }
     return false;
   }
 
   /**
    * Finalize a delivered approval `id` for `sessionKey`: the widget disables the
-   * buttons and reflects the recorded `decision`. Broadcasts to the single open
-   * socket as a fallback (same rationale as `sendApprovalRequest`).
+   * buttons and reflects the recorded `decision`. Falls back to the single open
+   * socket only when there is exactly one connection (same rationale as
+   * `sendApprovalRequest`).
    */
   sendApprovalResolved(
     sessionKey: string,
@@ -423,14 +484,9 @@ export class ClawChannelTransport {
       id,
       decision,
     };
-    const ws = this.openSocket(sessionKey);
+    const ws = this.openSocket(sessionKey) ?? this.soleOpenSocket();
     if (ws) {
       return this.safeSend(ws, frame);
-    }
-    for (const candidate of this.sockets.values()) {
-      if (candidate.readyState === WebSocket.OPEN) {
-        return this.safeSend(candidate, frame);
-      }
     }
     return false;
   }

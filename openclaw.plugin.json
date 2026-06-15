@@ -16,6 +16,28 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "auth": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "strategy": {
+                "type": "string",
+                "enum": ["anonymous", "hmac-ticket"]
+              },
+              "ticketSecret": {
+                "anyOf": [
+                  { "type": "string" },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "env": { "type": "string" } },
+                    "required": ["env"]
+                  }
+                ]
+              },
+              "ticketParam": { "type": "string" }
+            }
+          },
           "allowFrom": {
             "type": "array",
             "items": { "type": "string" }
@@ -80,6 +102,18 @@
         }
       },
       "uiHints": {
+        "auth.strategy": {
+          "label": "Auth strategy",
+          "help": "How browser connections are verified: \"hmac-ticket\" verifies a short-lived signed ticket from your backend (recommended); \"anonymous\" disables auth (dev/loopback only — all connections share one peer). Required; the plugin refuses to start if unset."
+        },
+        "auth.ticketSecret": {
+          "label": "Ticket secret",
+          "help": "Shared HMAC secret for the \"hmac-ticket\" strategy. Use { \"env\": \"VAR_NAME\" } to read from an environment variable instead of inlining the secret."
+        },
+        "auth.ticketParam": {
+          "label": "Ticket query param",
+          "help": "Query-string parameter the ticket arrives in on the WS upgrade URL. Defaults to \"ticket\"."
+        },
         "allowFrom": {
           "label": "Allowed user ids"
         },

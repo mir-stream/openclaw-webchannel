@@ -4,6 +4,8 @@ import { ClawChannelTransport } from "./src/transport.js";
 import { createClawChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
 import { handleApprovalDecision } from "./src/approvals.js";
+import { resolveVerifier } from "./src/auth.js";
+import type { AuthConfig } from "./src/auth.js";
 
 /**
  * Shared transport instance. The channel plugin (outbound) and the HTTP upgrade
@@ -39,16 +41,24 @@ export default defineChannelPluginEntry({
       });
     });
 
+    // Resolve the configured auth strategy into a ConnectionVerifier and inject
+    // it BEFORE registering the route. `resolveVerifier` enforces the safe
+    // default (AUTH.md §7): if `auth` is unconfigured/unknown — or a ticket
+    // secret is missing — it THROWS, which we deliberately let propagate so the
+    // plugin fails to load loudly rather than serving an open WebSocket.
+    const authConfig = (
+      api.config.channels as Record<string, unknown> | undefined
+    )?.clawchannel as { auth?: AuthConfig } | undefined;
+    transport.setVerifier(resolveVerifier(authConfig?.auth, api.logger));
+
     // Accept WebSocket upgrades on the gateway's own port. No extra server.
     //
     // `handler` is required by OpenClawPluginHttpRouteParams (verified:
     // dist/types-C0dQmare.d.ts:7796). For a WS-only route we reject plain HTTP
     // and let `handleUpgrade` do the real work.
     //
-    // auth: "plugin" — plugin-managed auth. Phase 0 assumes loopback dev and
-    // does NOT verify any token.
-    // TODO(auth): Phase 1 per-user token — verify an issued widget token here
-    // (and in handleUpgrade) before accepting the connection.
+    // auth: "plugin" — plugin-managed auth: all identity resolution flows
+    // through our injected verifier inside `handleUpgrade` (the single seam).
     api.registerHttpRoute({
       path: "/clawchannel/ws",
       auth: "plugin",
@@ -59,7 +69,6 @@ export default defineChannelPluginEntry({
         return true;
       },
       handleUpgrade: (req, socket, head) => {
-        // TODO(auth): Phase 1 — verify per-user widget token from req before upgrade.
         transport.handleUpgrade(req, socket, head);
         return true;
       },
