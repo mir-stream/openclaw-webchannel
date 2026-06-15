@@ -18,7 +18,7 @@
 - 문서: `<설치>/docs/` ✅
 - 번들 플러그인(채널 포함) 빌드 산출물: `<설치>/dist/extensions/` ✅
 - 타입 정의(`.d.ts`)·런타임(`.js`)도 `dist/` 아래. minified지만 타입은 읽을 만함.
-- 작업 디렉토리: `/Users/mircorn/workspace/openclaw-clawchannel` (git 아님, 현재 PLAN.md/BACKLOG.md/RESEARCH.md만). ✅
+- 작업 디렉토리: `/Users/mircorn/workspace/openclaw-webchannel` (npm-workspaces 모노레포; docs는 `docs/` 아래). ✅
 
 > **경로 유도(머신 독립):** 올바른 fnm 노드가 활성일 때 `OC="$(npm root -g)/openclaw"` 로 설치 루트를 구함.
 > fnm 노드 버전(`v24.16.0`)이 올라가면 경로의 버전 세그먼트도 바뀌므로, 절대경로 하드코딩보다 이 방식 권장.
