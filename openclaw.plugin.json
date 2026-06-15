@@ -42,6 +42,10 @@
             "type": "array",
             "items": { "type": "string" }
           },
+          "groupAllowFrom": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
           "dmSecurity": {
             "type": "string"
           },
