@@ -1,11 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export type ChatRole = "user" | "agent";
-export type ChatMessage = { id: string; role: ChatRole; text: string };
+/**
+ * `working: true` marks a live progress-draft bubble (rolling "Working…" + tool
+ * lines). It flips to false when the same id is finalized into the answer.
+ */
+export type ChatMessage = {
+  id: string;
+  role: ChatRole;
+  text: string;
+  working?: boolean;
+};
 
 /** Mirrors src/transport.ts envelopes on the plugin side. */
 type InboundWsMessage = { type: "user_message"; text: string };
-type OutboundWsMessage = { type: "agent_message"; text: string };
+type OutboundWsMessage =
+  | { type: "agent_message"; text: string; id?: string }
+  | { type: "progress"; id: string; text: string };
 
 function wsUrl(path: string): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -38,10 +49,42 @@ export function useClawChannel() {
       } catch {
         return;
       }
+
+      if (parsed.type === "progress") {
+        // Render/replace a SINGLE working bubble keyed by the draft id.
+        const { id, text } = parsed;
+        setMessages((prev) => {
+          const idx = prev.findIndex((m) => m.id === id);
+          if (idx === -1) {
+            return [...prev, { id, role: "agent", text, working: true }];
+          }
+          const next = prev.slice();
+          next[idx] = { ...next[idx], text, working: true };
+          return next;
+        });
+        return;
+      }
+
       if (parsed.type === "agent_message") {
+        const { text } = parsed;
+        // With an id, finalize the matching draft bubble in place (working ->
+        // final answer). Without an id (legacy/no-draft), append a fresh bubble.
+        if (parsed.id) {
+          const id = parsed.id;
+          setMessages((prev) => {
+            const idx = prev.findIndex((m) => m.id === id);
+            if (idx === -1) {
+              return [...prev, { id, role: "agent", text, working: false }];
+            }
+            const next = prev.slice();
+            next[idx] = { ...next[idx], text, working: false };
+            return next;
+          });
+          return;
+        }
         setMessages((prev) => [
           ...prev,
-          { id: `a-${Date.now()}-${prev.length}`, role: "agent", text: parsed.text },
+          { id: `a-${Date.now()}-${prev.length}`, role: "agent", text },
         ]);
       }
     };

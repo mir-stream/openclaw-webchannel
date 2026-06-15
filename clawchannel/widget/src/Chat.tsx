@@ -43,8 +43,12 @@ export function Chat() {
             key={m.id}
             style={{
               alignSelf: m.role === "user" ? "flex-end" : "flex-start",
-              background: m.role === "user" ? "#0a84ff" : "#eee",
-              color: m.role === "user" ? "white" : "black",
+              // A live progress draft renders in a distinct muted/italic style;
+              // it transitions to the normal agent bubble once finalized.
+              background: m.role === "user" ? "#0a84ff" : m.working ? "#f4f0e6" : "#eee",
+              color: m.role === "user" ? "white" : m.working ? "#7a6f57" : "black",
+              fontStyle: m.working ? "italic" : "normal",
+              border: m.working ? "1px dashed #d8cfb8" : "none",
               padding: "6px 10px",
               borderRadius: 12,
               maxWidth: "80%",

@@ -22,12 +22,38 @@
           },
           "dmSecurity": {
             "type": "string"
+          },
+          "streaming": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["off", "partial", "block", "progress"]
+              },
+              "progress": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "label": { "type": ["string", "boolean"] },
+                  "labels": { "type": "array", "items": { "type": "string" } },
+                  "maxLines": { "type": "integer" },
+                  "maxLineChars": { "type": "integer" },
+                  "toolProgress": { "type": "boolean" },
+                  "commandText": { "type": "string", "enum": ["raw", "status"] }
+                }
+              }
+            }
           }
         }
       },
       "uiHints": {
         "allowFrom": {
           "label": "Allowed user ids"
+        },
+        "streaming.mode": {
+          "label": "Streaming mode",
+          "help": "Progress draft mode: \"off\" | \"partial\" | \"block\" | \"progress\". Use \"progress\" for a single updating Working… draft that becomes the answer."
         }
       }
     }

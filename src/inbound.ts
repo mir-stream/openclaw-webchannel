@@ -2,6 +2,11 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import { CLAWCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
 import type { ClawChannelTransport, InboundWsMessage } from "./transport.js";
+import {
+  resolveStreamingMode,
+  createProgressDraftController,
+} from "./message-adapter.js";
+import type { ProgressDraftController } from "./message-adapter.js";
 
 /**
  * Handle one inbound user message from the browser widget.
@@ -58,6 +63,29 @@ export async function handleInboundMessage(
   // The transport always maps connections to the single anon peer in Phase 0.
   const wsKey = peerId || ANON_PEER_ID;
   const channelRuntime = api.runtime.channel;
+
+  // Progress-draft wiring (Phase 1 first slice). Core does NOT auto-drive a
+  // plugin's `message.live` adapter; the generic seam for a plugin channel is
+  // the inbound turn's reply dispatcher callbacks. When the channel is
+  // configured with `channels.clawchannel.streaming.mode:"progress"` we build a
+  // per-turn draft controller and hook `onToolStart`/`onItemEvent`/`onPartialReply`
+  // (GetReplyOptions, dist/plugin-sdk/types-BYvUZFDr.d.ts:274-304) via the turn's
+  // `replyOptions` (Omit<GetReplyOptions,"onBlockReply">, AssembledChannelTurn,
+  // dist/plugin-sdk/types-BVAOMoZy.d.ts:5813). Each event refreshes a single
+  // rolling draft pushed to the widget as a `progress` frame; the final answer
+  // (delivered through `delivery.deliver`) finalizes that same draft id.
+  const channelConfig = (api.config.channels as Record<string, unknown> | undefined)?.[
+    CLAWCHANNEL_ID
+  ];
+  const progressEnabled = resolveStreamingMode(channelConfig) === "progress";
+  let draft: ProgressDraftController | undefined;
+  if (progressEnabled) {
+    draft = createProgressDraftController({
+      transport,
+      sessionKey: wsKey,
+      channelConfig,
+    });
+  }
 
   // Resolve the channel-scoped agent route (carries `clawchannel` + peer in the
   // session key per configured dmScope/bindings).
@@ -118,12 +146,58 @@ export async function handleInboundMessage(
             recordInboundSession: channelRuntime.session.recordInboundSession,
             dispatchReplyWithBufferedBlockDispatcher:
               channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
-            // THIS channel's outbound delivery seam. Forward the assembled
-            // reply text to the originating widget's live socket.
+            // Progress-draft callbacks (only when streaming.mode === "progress").
+            // These fire DURING the agent run and feed the rolling draft. We also
+            // set `suppressDefaultToolProgressMessages` so the agent's own tool
+            // progress text isn't ALSO delivered as separate messages (it lives
+            // inside our draft instead — GetReplyOptions.suppressDefaultToolProgressMessages,
+            // dist/plugin-sdk/types-BYvUZFDr.d.ts:261-265).
+            ...(draft
+              ? {
+                  replyOptions: {
+                    suppressDefaultToolProgressMessages: true,
+                    onToolStart: (p) => {
+                      draft!.pushEvent({
+                        event: "tool",
+                        itemId: p.itemId,
+                        toolCallId: p.toolCallId,
+                        name: p.name,
+                        phase: p.phase,
+                        args: p.args,
+                      });
+                    },
+                    onItemEvent: (p) => {
+                      draft!.pushEvent({
+                        event: "item",
+                        itemId: p.itemId,
+                        itemKind: p.kind,
+                        title: p.title,
+                        name: p.name,
+                        phase: p.phase,
+                        status: p.status,
+                        summary: p.summary,
+                        progressText: p.progressText,
+                        meta: p.meta,
+                      });
+                    },
+                  },
+                }
+              : {}),
+            // THIS channel's outbound delivery seam. Forward the assembled reply
+            // text to the originating widget's live socket. In progress mode we
+            // FINALIZE the in-flight draft (reusing its id) so the widget
+            // transitions the working bubble into the final answer; otherwise we
+            // send a plain no-id agent_message (legacy append path).
             delivery: {
-              deliver: async (payload) => {
+              deliver: async (payload, info) => {
                 const text = payload.text;
                 if (!text) return { visibleReplySent: false };
+                // Only the final reply replaces the draft. Non-final visible
+                // blocks (rare for this channel) fall through to a plain send.
+                if (draft && info?.kind === "final") {
+                  await draft.finalize(text);
+                  return { visibleReplySent: true };
+                }
                 const sent = transport.sendText(wsKey, text);
                 return { visibleReplySent: sent };
               },
@@ -134,5 +208,30 @@ export async function handleInboundMessage(
     });
   } catch (err) {
     api.logger.error?.(`clawchannel: inbound dispatch failed: ${String(err)}`);
+    // BLOCKING recovery: if the turn threw AFTER a progress frame was emitted,
+    // the widget is showing a working bubble that will otherwise hang forever
+    // (no terminal frame for that id is ever sent and the draft loop keeps
+    // running). Reuse the finalize path to send a settling `agent_message` for
+    // the SAME draft id with a short apologetic text, so the widget transitions
+    // the bubble out of its italic "working" state into a settled message.
+    //
+    // `finalize` is idempotent, so on the (impossible-here, but defensive) case
+    // where the normal path already finalized before throwing, this is a no-op.
+    if (draft?.started) {
+      try {
+        await draft.finalize(
+          "Sorry — something went wrong while answering. Please try again.",
+        );
+      } catch (finalizeErr) {
+        api.logger.error?.(
+          `clawchannel: draft error-finalize failed: ${String(finalizeErr)}`,
+        );
+      }
+    }
+  } finally {
+    // Always halt the throttled draft loop so a late background flush can't race
+    // the error handling (or linger after a normal finalize). Idempotent and a
+    // no-op when no draft was created or it was already stopped by finalize().
+    draft?.stop();
   }
 }

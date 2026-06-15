@@ -6,6 +6,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
 import { CLAWCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
 import type { ClawChannelTransport } from "./transport.js";
+import { createClawMessageAdapter } from "./message-adapter.js";
 
 type ResolvedAccount = {
   accountId: string | null;
@@ -50,7 +51,18 @@ function resolveAccount(
  */
 export function createClawChannelPlugin(transport: ClawChannelTransport) {
   return createChatChannelPlugin<ResolvedAccount>({
-    base: createChannelPluginBase<ResolvedAccount>({
+    // `message` (ChannelMessageAdapter) declares our outbound text send plus the
+    // `live` progress-draft capabilities. It is attached on the base object here
+    // (rather than passed into `createChannelPluginBase`, whose typed options
+    // omit `message`: core-HhTaqQ72.d.ts:124-141) because `ChatChannelPluginBase`
+    // = Omit<ChannelPlugin,...> & Partial<...> DOES carry `message`
+    // (core-HhTaqQ72.d.ts:169). It COEXISTS with the legacy `outbound` block
+    // below — the bundled SMS channel ships both (dist/extensions/sms/
+    // channel-plugin-api.js:1242 attaches `message` while also defining
+    // `outbound`). See src/message-adapter.ts for why core does not auto-drive
+    // `message.live` for plugin channels and how drafts fire via the inbound
+    // turn's reply callbacks instead.
+    base: Object.assign(createChannelPluginBase<ResolvedAccount>({
       id: CLAWCHANNEL_ID,
       // `capabilities` is required on ChannelPlugin (verified:
       // dist/types.plugin-BIHyhl5u.d.ts:22). One web chat surface => direct chats.
@@ -78,7 +90,7 @@ export function createClawChannelPlugin(transport: ClawChannelTransport) {
       setup: {
         applyAccountConfig: ({ cfg }) => cfg,
       },
-    }) as ChatChannelBaseParam,
+    }), { message: createClawMessageAdapter(transport) }) as ChatChannelBaseParam,
 
     // DM security: who may message the bot. Phase 0 uses config allowlist only.
     security: {

@@ -19,10 +19,20 @@ export const ANON_PEER_ID = "web-anon";
 
 /**
  * Message envelope exchanged with the browser widget.
- * Phase 0 only needs plain text both directions.
+ *
+ * Inbound stays plain text. Outbound now has three shapes:
+ *  - `agent_message` WITHOUT id  : legacy/no-draft final reply (appended).
+ *  - `progress`     WITH id      : a rolling "working…" draft; same id ⇒ replace.
+ *  - `agent_message` WITH id     : finalize the draft `id` into the final answer.
+ *
+ * The `id` correlates a progress draft with its eventual finalization so the
+ * widget can render a SINGLE bubble that updates in place, then transitions to
+ * the final text (Phase 1 progress-draft slice).
  */
 export type InboundWsMessage = { type: "user_message"; text: string };
-export type OutboundWsMessage = { type: "agent_message"; text: string };
+export type OutboundWsMessage =
+  | { type: "agent_message"; text: string; id?: string }
+  | { type: "progress"; id: string; text: string };
 
 /**
  * Owns the (noServer) WebSocketServer and the live connection map.
@@ -92,13 +102,54 @@ export class ClawChannelTransport {
     ws.on("error", cleanup);
   }
 
-  /** Push a text message to the browser bound to `sessionKey`. Returns true if delivered. */
-  sendText(sessionKey: string, text: string): boolean {
+  /** Resolve the open socket for `sessionKey`, or undefined if none/closed. */
+  private openSocket(sessionKey: string): WebSocket | undefined {
     const ws = this.sockets.get(sessionKey);
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    const payload: OutboundWsMessage = { type: "agent_message", text };
+    if (!ws || ws.readyState !== WebSocket.OPEN) return undefined;
+    return ws;
+  }
+
+  /**
+   * Push a final text message to the browser bound to `sessionKey`.
+   *
+   * If `id` is provided this finalizes an in-flight progress draft (the widget
+   * replaces the draft bubble `id` with the final text). Without `id` it is the
+   * legacy no-draft path: the widget appends a fresh bubble. Returns true if
+   * delivered.
+   */
+  sendText(sessionKey: string, text: string, id?: string): boolean {
+    const ws = this.openSocket(sessionKey);
+    if (!ws) return false;
+    const payload: OutboundWsMessage = id
+      ? { type: "agent_message", text, id }
+      : { type: "agent_message", text };
     ws.send(JSON.stringify(payload));
     return true;
+  }
+
+  /**
+   * Emit one progress-draft frame for `sessionKey`. The widget renders/replaces
+   * a SINGLE bubble keyed by `id`. Returns true if delivered.
+   *
+   * The progress draft id is owned by the per-turn controller in
+   * `message-adapter.ts`, which threads the SAME id through every `sendProgress`
+   * and the eventual `finalizeDraft`; the transport does not track it.
+   */
+  sendProgress(sessionKey: string, id: string, text: string): boolean {
+    const ws = this.openSocket(sessionKey);
+    if (!ws) return false;
+    const payload: OutboundWsMessage = { type: "progress", id, text };
+    ws.send(JSON.stringify(payload));
+    return true;
+  }
+
+  /**
+   * Finalize the progress draft `id` for `sessionKey` into the final answer,
+   * reusing the id so the widget transitions the same bubble. Thin wrapper over
+   * `sendText(..., id)` for call-site clarity.
+   */
+  finalizeDraft(sessionKey: string, id: string, text: string): boolean {
+    return this.sendText(sessionKey, text, id);
   }
 
   /**
