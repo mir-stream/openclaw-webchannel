@@ -1,0 +1,27 @@
+{
+  "name": "openclaw-clawchannel",
+  "version": "0.0.0",
+  "description": "Self-hosted web chat channel plugin for OpenClaw (Phase 0 walking skeleton).",
+  "private": true,
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "setupEntry": "./setup-entry.ts",
+    "channel": {
+      "id": "clawchannel",
+      "label": "ClawChannel",
+      "blurb": "Self-hosted React web chat channel served on the gateway port."
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "id": "clawchannel",
+  "kind": "channel",
+  "channels": ["clawchannel"],
+  "name": "ClawChannel",
+  "description": "Self-hosted web chat channel plugin for OpenClaw.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "clawchannel": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "allowFrom": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "dmSecurity": {
+            "type": "string"
+          }
+        }
+      },
+      "uiHints": {
+        "allowFrom": {
+          "label": "Allowed user ids"
+        }
+      }
+    }
+  }
+}
