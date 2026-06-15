@@ -1,0 +1,150 @@
+# ClawChannel — 인증 설계 (AUTH)
+
+> 브라우저 위젯이 게이트웨이 WebSocket에 붙을 때의 **인증·신원(identity)** 모델.
+> 상태: **결정됨** — 기존 `BACKLOG.md`의 "브라우저 Auth 모델 (완전 OPEN)" 항목을 대체한다.
+> 핵심 원리: 인증을 코어에 하드코딩하지 않고 **주입 가능한 검증기(ConnectionVerifier) 한 점**으로 수렴시키고,
+> 흔한 방식은 **config로 고르는 빌트인 전략**으로 제공한다. (배포된 플러그인은 코드가 아니라 JSON config로 설정되므로)
+
+---
+
+## 1. 인증이 붙을 수 있는 3개 레이어 (요약)
+
+| 레이어 | 개념 | 우리에게 |
+|---|---|---|
+| ① 게이트웨이 연결 auth (`gateway.auth.mode`) | 게이트웨이 본체 | 통과 = **operator(주인) 자격** → 브라우저 직접 노출 금지 |
+| ② 플러그인 라우트 auth (`registerHttpRoute({auth})`) | **우리 플러그인 코드** | ✅ **여기서 인증.** `auth:"plugin"`으로 두고 `handleUpgrade`에서 자체 검증 |
+| ③ allowlist + pairing | 채널 기능 | "이 peer 허용?" 판정 — 단 **누구인지를 ②가 먼저 확정**해야 의미 있음 |
+
+→ ②와 ③은 대체재가 아니라 보완재. ②의 검증 결과(`peerId`)가 ③의 입력이 된다.
+
+---
+
+## 2. 결정 사항
+
+- **라우트는 `auth:"plugin"` 유지.** 모든 신원 해석을 우리 검증기 한 seam(`handleUpgrade`)으로 일관시킨다.
+- 게이트웨이 공유 토큰(`gateway.auth.token`)은 operator 자격이라 **브라우저에 노출하지 않는다** → `auth:"gateway"`를 브라우저 경로에 직접 쓰지 않음.
+- **SaaS 임베드 시나리오(우리 주 사용처):** SaaS가 구글 로그인 등 사용자 신원을 *이미* 소유한다.
+  에이전트 연결은 **2차 로그인이 아니라**, SaaS 백엔드가 발급한 **짧은 수명 서명 ticket**을 플러그인이 검증하는 **신원 전달(handoff)**이다. 로그인은 SaaS 한 곳뿐.
+
+---
+
+## 3. 공개 API = 검증기 계약 (ConnectionVerifier)
+
+빌트인이든 커스텀이든 내부적으로 전부 이 한 줄로 수렴한다. 이것이 우리가 문서화·버전관리하는 **유일한 auth 공개 표면**.
+
+```ts
+type ConnectionIdentity = { peerId: string; displayName?: string };
+type ConnectionVerifier = (req: IncomingMessage) => Promise<ConnectionIdentity | null>;
+// null => WS 업그레이드 거절 (401 / close 1008)
+```
+
+- 실행 위치: `src/transport.ts`의 `handleUpgrade` (현재 `:137`). 통과 시 `identity.peerId`를 sessionKey로 사용.
+- 지금은 무조건 `ANON_PEER_ID`(`transport.ts:145`) 하드코딩 → **이 자리를 "검증기 실행 → 없으면 소켓 destroy, 있으면 peerId 매핑"으로 교체**하는 것이 핵심 변경.
+- ⇒ auth 구멍 하나가 **세션 분리(세션키 매핑)까지 동시 해결**한다.
+
+---
+
+## 4. 빌트인 전략 (config로 선택)
+
+| strategy | 검증 방법 | 누가 씀 |
+|---|---|---|
+| `anonymous` | 검증 없음, 전원 단일 peer | dev/loopback 전용 (현재 동작) |
+| `hmac-ticket` | 호스트 백엔드가 `{sub,exp}` 서명 → 공유 시크릿으로 검증 | **우리 SaaS** |
+| `jwt` | JWKS/공개키 + issuer/audience 검증 | 이미 JWT 발급하는 호스트 |
+| `trusted-header` | 프록시가 주입한 신원 헤더 읽기 | 게이트웨이가 trusted-proxy 뒤일 때 |
+
+소비자 OpenClaw config (이 스키마는 `openclaw.plugin.json`의 `channelConfigs.clawchannel.schema`가 검증):
+
+```json5
+channels: {
+  clawchannel: {
+    auth: {
+      strategy: "hmac-ticket",
+      // 시크릿은 평문 금지 — OpenClaw SecretRef(env/file/exec) 사용
+      ticketSecret: { env: "CLAWCHANNEL_TICKET_SECRET" },
+    },
+  },
+}
+```
+
+→ **우리조차 커스텀 코드 없이 이 config만으로 동작.** 빌트인이 95%를 덮는 것이 목표.
+
+### 커스텀 인증 (코드 탈출구, 드묾)
+
+빌트인으로 안 되는 인증은 소비자가 자기 얇은 래퍼 플러그인에서 우리 패키지를 *라이브러리로* 사용:
+
+```ts
+import { createClawChannel } from "@clawchannel/plugin";
+createClawChannel({
+  auth: async (req) => {
+    const id = await myWeirdAuth(req);
+    return id ? { peerId: id } : null;
+  },
+});
+```
+
+---
+
+## 5. ticket 수명주기 (`hmac-ticket`)
+
+수명이 3층으로 분리된다 — **단명 ticket은 "접속하는 순간"에만 적용**되고 대화 길이와 무관하다.
+
+| | 수명 | 역할 |
+|---|---|---|
+| SaaS 세션(구글 로그인) | 길다 (시간~일) | 진짜 신원. 위젯이 가진 쿠키 |
+| **ticket** | 짧다 (~1분) | 소켓 여는 **한 번**만 쓰는 입장표 |
+| WS 연결 | 열려있는 내내 | 실제 대화 통로 |
+
+- ticket은 `handleUpgrade`에서 검증되고 소켓이 열리는 순간 임무 끝. 이후 만료돼도 **열린 대화엔 영향 없음.**
+- 짧게 두는 이유: ticket은 URL 쿼리 등에 실려 로그에 남을 수 있어 누출 폭을 줄이려는 것.
+- **재연결:** 소켓이 끊기면 위젯이 SaaS에 새 ticket을 요청(`getTicket`)해 재연결. SaaS 세션은 살아있으므로 재로그인 없음.
+
+---
+
+## 6. 양쪽 패키지의 책임
+
+| | 플러그인 패키지 (서버) | 위젯 패키지 (브라우저) |
+|---|---|---|
+| 역할 | 검증기(strategy) 실행 | ticket을 **호스트에게 받아** WS에 실어 보냄 |
+| 주입점 | `auth` config / 함수 | `getTicket: () => Promise<string>` 콜백 |
+| 재연결 | — | 끊기면 `getTicket` 재호출 → 새 표로 재연결 |
+
+- 위젯도 인증을 *모른다*. "호스트야 표 줘" 하고 나르기만. `trusted-header`/쿠키 방식이면 `getTicket`은 no-op.
+- **ticket 발급 헬퍼:** `issueClawChannelTicket({ sub, secret, ttlSeconds })` — 호스트 백엔드가 서명에 사용.
+  서명/검증 코드가 **두 독립 Node 프로세스(SaaS 백엔드 + 게이트웨이 플러그인)**에서 동일해야 하므로 **zero-dep**(SDK 안 물게)으로 제공. → `PACKAGING.md` §3 참조.
+
+---
+
+## 7. 안전 기본값 (배포 전 필수)
+
+현재는 `auth:"plugin"` + 검증 0 = **배포 시 전세계 오픈** → 채택자를 태우는 지뢰. 배포 전 반드시:
+
+- **strategy 명시 강제** — 미설정 시 기동 거부.
+- `anonymous`는 **시끄러운 opt-in** — 명시 플래그 + 경고 로그 + `security audit`에 걸리게. 조용한 기본 오픈 금지.
+- `trusted-header` 사용 시 "게이트웨이가 클라이언트 헤더를 덮어쓰는 프록시 뒤여야 함"을 문서에 명시.
+
+---
+
+## 8. 코드 변경 지점 (현재 → 목표)
+
+| 위치 | 현재 | 목표 |
+|---|---|---|
+| `src/transport.ts:137` `handleUpgrade` | 무조건 수락 | 검증기 실행, 실패 시 소켓 destroy |
+| `src/transport.ts:145` `ANON_PEER_ID` | 단일 익명 peer 하드코딩 | `identity.peerId`로 교체 |
+| `index.ts:52` 라우트 등록 | `auth:"plugin"` + TODO | strategy 주입 + 검증기 배선 |
+| `openclaw.plugin.json` `channelConfigs.schema` | auth 없음 | `auth` 블록(strategy/secret) 추가 |
+
+---
+
+## 9. 미해결(후속)
+
+- **세션 중 강제 만료(revocation):** 이미 열린 소켓은 자동으로 안 닫힘. SaaS 로그아웃/구독만료 시 즉시 끊으려면 별도 처리(주기적 재검증 heartbeat 또는 서버측 소켓 강제 close). MVP 비대상.
+- `jwt` / `trusted-header` 빌트인은 후순위(우선 `anonymous` + `hmac-ticket`).
+- 멀티탭 사용자를 같은 peerId로 묶을지/탭별 분리할지의 정책.
+
+---
+
+## 관련 문서
+- `PACKAGING.md` — 2-패키지 구조, ticket 헬퍼 패키지 분리 트리거, 배포.
+- `RESEARCH.md` §1·§3·§7 — 게이트웨이 auth, `registerHttpRoute` auth 의미, 승인.
+- OpenClaw: `docs/plugins/architecture-internals.md`(라우트 auth), `docs/gateway/trusted-proxy-auth.md`, `docs/gateway/secrets.md`(SecretRef).

@@ -4,30 +4,22 @@
 
 ---
 
-## 🔐 브라우저 Auth 모델 (deferred — 현재 완전 OPEN)
+## 🔐 브라우저 Auth 모델 — ✅ 결정됨 (📄 `AUTH.md`)
 
-**상태:** **결정 보류(TBD). 당분간 인증 완전 OPEN으로 운영.**
-- 현재 WS 라우트는 `auth:"plugin"` + 토큰 검증 없음 → 사실상 누구나 접속 가능(loopback dev 가정).
-- 모든 연결은 단일 익명 피어 `web-anon` 으로 매핑됨(세션 분리 없음).
-- ⚠️ **운영 노출 금지 전제:** 게이트웨이는 loopback bind. 외부 노출 시 반드시 이 항목을 먼저 해결.
-- 채널 `allowFrom:["web-anon"]` allowlist는 형식상 통과용일 뿐 실제 사용자 식별 아님.
+**상태:** **결정 완료.** 인증은 `auth:"plugin"` + `handleUpgrade`의 **검증기(ConnectionVerifier) 한 점**으로 수렴,
+흔한 방식은 **config로 고르는 빌트인 전략**(`anonymous`/`hmac-ticket`/`jwt`/`trusted-header`)으로 제공.
+SaaS 임베드는 SaaS가 발급한 단명 서명 ticket을 플러그인이 검증(2차 로그인 아님). 상세 설계는 `AUTH.md`.
 
-**왜 미루나:** progress draft / 승인(HITL) 같은 가시적 기능을 먼저 검증하려고 의도적으로 뒤로 미룸.
-멀티세션·승인권 분리·pairing 이 전부 "어느 소켓이 어느 사용자냐"에 의존하므로, 그 설계와 함께 한 번에 풀 예정.
+**현재 코드 상태(미구현):** WS 라우트는 `auth:"plugin"` + 검증 0 → 누구나 접속 가능(loopback dev 가정),
+모든 연결이 단일 익명 피어 `web-anon`(`transport.ts:18`)으로 매핑됨. **배포 전 검증기 seam으로 교체 필요.**
+⚠️ 그 전까지 **운영 노출 금지** — 게이트웨이는 loopback bind 유지.
 
-**문제:** React 위젯이 브라우저에서 게이트웨이 WS 라우트에 붙을 때 어떻게 인증할 것인가.
+**잔여(후속, AUTH.md §9):**
+- 세션 중 강제 만료(revocation) — 이미 열린 소켓은 자동으로 안 닫힘.
+- `jwt` / `trusted-header` 빌트인은 후순위(우선 `anonymous` + `hmac-ticket`).
+- 멀티탭 사용자를 같은 peerId로 묶을지/분리할지 정책.
 
-**제약/맥락:**
-- 게이트웨이 공유 토큰(`gateway.auth.token`)은 **operator(owner) 자격**으로 취급됨 → 공개 브라우저에 직접 노출 금지.
-- 플러그인 라우트는 `auth` 명시 필수: `"gateway"`(게이트웨이 공유 auth) vs `"plugin"`(플러그인 자체 인증).
-- 채널은 자체 allowlist + pairing(승인 코드)으로 사용자 정체성을 관리할 수 있음.
-
-**유력 방향(미확정):**
-- `auth: "plugin"` 로 두고 **위젯용 per-user 토큰/세션**을 플러그인이 자체 발급·검증.
-- 채널 allowlist/pairing과 연동해 신규 사용자 승인.
-- 익명/다중 탭 사용자를 어떤 식별자로 sessionKey에 매핑할지와 함께 설계(쿠키 vs 발급 토큰).
-
-**관련:** `PLAN.md` §10 보안, §12 미해결 질문(sessionKey 매핑).
+**관련:** `AUTH.md`(상세), `PACKAGING.md`(ticket 헬퍼 패키지화), `PLAN.md` §10·§12.
 
 ---
 

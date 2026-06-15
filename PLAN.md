@@ -229,13 +229,14 @@ clawchannel/
 
 ## 10. 보안 (Security)
 
-- **라우트 인증:** 플러그인 WS 라우트는 `auth` 명시 필수.
-  - `auth: "gateway"` → 게이트웨이 공유 auth 요구. 단 게이트웨이 토큰=operator 자격이라 **공개 브라우저에 직접 노출 금지.**
-  - `auth: "plugin"` → 플러그인 자체 인증(권장: 위젯용 per-user 토큰/세션 + 채널 allowlist/pairing).
-- **사용자 정체성:** 채널 allowlist + pairing 승인 코드로 신규 사용자 관리.
-- **승인권 분리:** `allowFrom`(대화 허용) ≠ `execApprovals.approvers`(승인 권한).
-- **노출 범위:** 게이트웨이는 기본 loopback bind. 외부 접근은 Tailscale/VPN/리버스 프록시 + 적절한 auth 모드.
-- **전송 보안:** 운영 시 `wss://`(TLS) 종단 — 리버스 프록시 또는 tailnet.
+> 📄 **인증·신원 모델 상세는 `AUTH.md`** (결정됨). 아래는 요약.
+
+- **라우트 인증:** 라우트는 `auth:"plugin"` 유지 — 모든 신원 해석을 `handleUpgrade`의 **검증기(ConnectionVerifier) 한 점**으로 수렴. `auth:"gateway"`는 토큰=operator 자격이라 브라우저 경로에 직접 안 씀.
+- **검증기 = 공개 API:** `(req) => Promise<ConnectionIdentity | null>`. 결과 `peerId`가 곧 sessionKey(세션 분리 동시 해결).
+- **빌트인 전략(config 선택):** `anonymous`(dev) / `hmac-ticket`(SaaS) / `jwt` / `trusted-header`. SaaS 임베드는 SaaS가 발급한 단명 서명 ticket을 검증(2차 로그인 아님, handoff).
+- **안전 기본값:** strategy 미설정 시 기동 거부, `anonymous`는 시끄러운 opt-in+경고. (현재 검증 0 = 전세계 오픈이므로 배포 전 필수 변경)
+- **사용자 정체성:** 검증된 신원 위에 채널 allowlist + pairing. **승인권 분리:** `allowFrom`(대화 허용) ≠ `execApprovals.approvers`(승인 권한).
+- **노출 범위:** 게이트웨이는 기본 loopback bind. 외부 접근은 Tailscale/VPN/리버스 프록시 + 적절한 auth 모드. 운영 시 `wss://`(TLS) 종단.
 
 ---
 
@@ -255,10 +256,10 @@ clawchannel/
 
 - **WS 연결 수명주기:** 끊긴 소켓 정리, 재연결 시 세션 복원, dedupe(코어 idempotency key 활용),
   backpressure(`maxBufferedBytes` 한도). → openclaw 특유 난제 아님, 일반 WS 서버 엔지니어링.
-- **브라우저 auth 모델:** `plugin` auth로 per-user 토큰 발급 방식 설계 필요(게이트웨이 토큰 직접 노출 회피).
-- **위젯 호스팅:** 개발(Vite) vs 배포(정적 호스팅 vs 플러그인 라우트 서빙) 결정.
-- **세션 그래머:** 익명/다중 탭 사용자를 sessionKey로 어떻게 매핑할지(쿠키? 발급 토큰?).
-- **공개 패키지화:** npm/ClawHub 배포 시 이름 충돌·버전 핀 고려(현 시점 공개 클라이언트 패키지 미출시).
+- ~~**브라우저 auth 모델**~~ → **결정됨.** 검증기(ConnectionVerifier) seam + 빌트인 전략. 📄 `AUTH.md`. (잔여: 세션 중 강제 만료, `jwt`/`trusted-header` 빌트인은 후순위)
+- ~~**공개 패키지화**~~ → **결정됨.** 서버/브라우저 2-패키지 분리, npm(+ClawHub) 배포. 📄 `PACKAGING.md`.
+- **세션 그래머:** 검증된 `peerId`가 기본 sessionKey. 잔여는 **멀티탭** 정책(같은 사용자의 여러 탭을 묶을지/분리할지)뿐.
+- **위젯 호스팅:** 개발(Vite) vs 배포(npm 패키지 / `<script>` 임베드 / 플러그인 라우트 서빙) — Phase 3에서 확정.
 
 ---
 

@@ -229,8 +229,8 @@ api.registerHttpRoute({
 2. **MVP는 순수 채널(PLAN.md Phase 1).** tool inspector(onAgentEvent)는 Phase 2. progress draft로 tool 활동은 이미 보임.
 3. **outbound.sendText = `Map<sessionKey, ws>`에서 소켓 찾아 send.** 연결 수명주기(끊김/재연결/dedupe/backpressure)가 진짜 작업량. openclaw 특유 난제 아님.
 4. **승인은 채널 내장.** `/approve`는 코어 무료. 버튼은 `approvalCapability`.
-5. **auth는 미결정**(BACKLOG.md). `auth:"plugin"`+per-user 토큰 방향이 유력. 게이트웨이 토큰=operator 자격이라 브라우저 직접 노출 금지.
-6. **세션키 매핑 미설계**(익명/다중탭). `messaging.resolveSessionConversation`이 후크.
+5. **auth는 결정됨 → 📄 `AUTH.md`.** `auth:"plugin"` + 검증기(ConnectionVerifier) seam + 빌트인 전략(`anonymous`/`hmac-ticket`/`jwt`/`trusted-header`). 게이트웨이 토큰=operator 자격이라 브라우저 직접 노출 금지(불변).
+6. **세션키 매핑:** 검증된 `peerId`가 기본 sessionKey(auth가 동시 해결). 잔여는 멀티탭 정책. `messaging.resolveSessionConversation`이 후크.
 7. **번들은 minified.** 정확한 시그니처는 `dist/**/*.d.ts` grep 또는 GitHub 원본 참고.
 8. 검증 안 한 것(⚠️): outbound media 정확 시그니처, live-preview/receipt contract test 요구, `handleUpgrade`의 정확한 auth 상호작용 디테일 — 구현 시 해당 d.ts/문서 재확인.
 
