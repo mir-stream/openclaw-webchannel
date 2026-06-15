@@ -1,3 +1,6 @@
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { ClawChannelTransport } from "./src/transport.js";
@@ -6,6 +9,13 @@ import { handleInboundMessage } from "./src/inbound.js";
 import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
+import { createStaticAssetsHandler } from "./src/static-assets.js";
+
+// Resolve the built widget's `dist/` relative to THIS module (the plugin entry
+// at the repo root), so the path is correct regardless of the gateway's cwd.
+// index.ts -> <repo-root>/clawchannel/widget/dist.
+const pluginDir = path.dirname(fileURLToPath(import.meta.url));
+const widgetDistRoot = path.join(pluginDir, "clawchannel", "widget", "dist");
 
 /**
  * Shared transport instance. The channel plugin (outbound) and the HTTP upgrade
@@ -72,6 +82,20 @@ export default defineChannelPluginEntry({
         transport.handleUpgrade(req, socket, head);
         return true;
       },
+    });
+
+    // Serve the built example widget (chat UI) from the gateway under the
+    // `/clawchannel/` prefix, so the whole demo runs from the gateway port with
+    // no separate web server. These assets are PUBLIC by design (`auth:
+    // "plugin"`): the page and its JS carry no secrets — authentication happens
+    // at the WebSocket connect (the verifier seam above). The exact
+    // `/clawchannel/ws` route registered first takes precedence over this prefix
+    // route, so WS upgrades are unaffected; the handler also ignores `ws`.
+    api.registerHttpRoute({
+      path: "/clawchannel/",
+      auth: "plugin",
+      match: "prefix",
+      handler: createStaticAssetsHandler(widgetDistRoot),
     });
   },
 });
