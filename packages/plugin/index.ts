@@ -4,8 +4,10 @@ import path from "node:path";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { WebChannelTransport } from "./src/transport.js";
+import type { InboundWsMessage } from "./src/transport.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
+import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
 import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
@@ -40,9 +42,25 @@ export default defineChannelPluginEntry({
 
   registerFull(api) {
     // Bridge inbound WS messages into the agent runtime.
+    //
+    // Same-session inbound MUST be serialized: two `handleInboundMessage` →
+    // `channelRuntime.inbound.run` turns running concurrently for one
+    // `sessionKey` collide on core's per-session reply-operation admission gate
+    // (`admitReplyTurn`), which assumes the channel feeds it one turn at a time
+    // (the bundled Telegram channel gets this for free via its long-poll offset
+    // spool; a WebSocket has no such natural spool). The collision wedges the
+    // channel — a "working" bubble that never settles. So we run each
+    // `user_message` through a per-sessionKey FIFO queue: same-session messages
+    // run one at a time in order, while DIFFERENT sessions still run in
+    // parallel. See src/inbound-queue.ts for the full rationale.
+    const { dispatch: dispatchInbound } = createSerializedInboundDispatcher<
+      Extract<InboundWsMessage, { type: "user_message" }>
+    >((sessionKey, message) =>
+      handleInboundMessage(api, transport, sessionKey, message),
+    );
     transport.setMessageHandler((sessionKey, message) => {
       if (message.type !== "user_message") return; // approvals routed below
-      void handleInboundMessage(api, transport, sessionKey, message);
+      dispatchInbound(sessionKey, message);
     });
 
     // Bridge approval button clicks (`approval_decision`) into the gateway. This
