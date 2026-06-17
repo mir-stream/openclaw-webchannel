@@ -1,0 +1,139 @@
+{
+  "id": "webchannel",
+  "kind": "channel",
+  "channels": ["webchannel"],
+  "name": "WebChannel",
+  "description": "Self-hosted web chat channel plugin for OpenClaw.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "webchannel": {
+      "schema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "auth": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "strategy": {
+                "type": "string",
+                "enum": ["anonymous", "hmac-ticket"]
+              },
+              "ticketSecret": {
+                "anyOf": [
+                  { "type": "string" },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "env": { "type": "string" } },
+                    "required": ["env"]
+                  }
+                ]
+              },
+              "ticketParam": { "type": "string" }
+            }
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "groupAllowFrom": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "dmSecurity": {
+            "type": "string"
+          },
+          "streaming": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": ["off", "partial", "block", "progress"]
+              },
+              "progress": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "label": { "type": ["string", "boolean"] },
+                  "labels": { "type": "array", "items": { "type": "string" } },
+                  "maxLines": { "type": "integer" },
+                  "maxLineChars": { "type": "integer" },
+                  "toolProgress": { "type": "boolean" },
+                  "commandText": { "type": "string", "enum": ["raw", "status"] }
+                }
+              }
+            }
+          },
+          "execApprovals": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "anyOf": [
+                  { "type": "boolean" },
+                  { "type": "string", "const": "auto" }
+                ]
+              },
+              "approvers": {
+                "type": "array",
+                "items": {
+                  "anyOf": [{ "type": "string" }, { "type": "number" }]
+                }
+              },
+              "target": {
+                "type": "string",
+                "enum": ["dm", "channel", "both"]
+              }
+            }
+          },
+          "capabilities": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "inlineButtons": {
+                "type": "string",
+                "enum": ["dm", "group", "allowlist", "all", "off"]
+              }
+            }
+          }
+        }
+      },
+      "uiHints": {
+        "auth.strategy": {
+          "label": "Auth strategy",
+          "help": "How browser connections are verified: \"hmac-ticket\" verifies a short-lived signed ticket from your backend (recommended); \"anonymous\" disables auth (dev/loopback only — all connections share one peer). Required; the plugin refuses to start if unset."
+        },
+        "auth.ticketSecret": {
+          "label": "Ticket secret",
+          "help": "Shared HMAC secret for the \"hmac-ticket\" strategy. Use { \"env\": \"VAR_NAME\" } to read from an environment variable instead of inlining the secret."
+        },
+        "auth.ticketParam": {
+          "label": "Ticket query param",
+          "help": "Query-string parameter the ticket arrives in on the WS upgrade URL. Defaults to \"ticket\"."
+        },
+        "allowFrom": {
+          "label": "Allowed user ids"
+        },
+        "streaming.mode": {
+          "label": "Streaming mode",
+          "help": "Progress draft mode: \"off\" | \"partial\" | \"block\" | \"progress\". Use \"progress\" for a single updating Working… draft that becomes the answer."
+        },
+        "execApprovals.enabled": {
+          "label": "Native exec approvals",
+          "help": "Render native [Allow once] [Allow always] [Deny] buttons in the chat UI when a tool/exec needs approval. true|\"auto\" enables; false disables."
+        },
+        "capabilities.inlineButtons": {
+          "label": "Inline buttons",
+          "help": "Where to render inline approval buttons: \"all\" | \"dm\" | \"group\" | \"allowlist\" | \"off\"."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,243 @@
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+
+import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
+import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
+
+/** The inbound path only handles user messages; approvals route separately. */
+type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
+import {
+  resolveStreamingMode,
+  createProgressDraftController,
+} from "./message-adapter.js";
+import type { ProgressDraftController } from "./message-adapter.js";
+
+/**
+ * Handle one inbound user message from the browser widget.
+ *
+ * Phase 0 inbound path (walking skeleton) — proper channel inbound lifecycle:
+ *  1. Resolve the agent route for this channel + peer via
+ *     `runtime.channel.routing.resolveAgentRoute(...)`. This honours the
+ *     configured dmScope/bindings and yields a channel-scoped `sessionKey`
+ *     (e.g. carrying `webchannel`), instead of `buildAgentSessionKey(...)`
+ *     which defaults `dmScope` to `"main"` and collapses the key to
+ *     `agent:main:main`, discarding channel + peer.
+ *  2. Run the turn through `runtime.channel.inbound.run({ adapter })`. The
+ *     adapter's `resolveTurn` returns a fully assembled `AssembledChannelTurn`
+ *     built from runtime-provided pieces (`recordInboundSession`,
+ *     `dispatchReplyWithBufferedBlockDispatcher`, `resolveStorePath`, and the
+ *     context payload from `inbound.buildContext`). The kernel RECORDS the
+ *     inbound session/route first, then dispatches the reply.
+ *  3. The agent reply is delivered back through THIS channel via the turn's
+ *     `delivery.deliver(payload)` adapter — the proper inbound delivery seam.
+ *     We forward `payload.text` to the live WebSocket for the originating peer.
+ *
+ * Because `delivery.deliver` is a closure over the originating `peerId`, the
+ * socket-map key always matches: we never depend on a core-recorded `ctx.to`
+ * value lining up with the map. The transport now keys sockets by the verified
+ * per-peer id (the anonymous strategy is just the single-peer special case),
+ * and the recorded `reply.to` carries that same peer, so per-peer routing
+ * flows through this seam unchanged.
+ *
+ * This mirrors the bundled SMS channel's inbound path
+ * (`dist/extensions/sms/channel-plugin-api.js`, `channelRuntime.inbound.run`).
+ *
+ * Verified signatures (OpenClaw v2026.6.6):
+ *  - api.runtime.channel.routing.resolveAgentRoute(input): ResolvedAgentRoute
+ *      dist/plugin-sdk/resolve-route-BCF-LST9.d.ts:46 / :11-29
+ *  - api.runtime.channel.inbound.run = runChannelInboundEvent(params:
+ *      RunChannelTurnParams<TRaw>): dist/types-C0dQmare.d.ts:6111-6116,
+ *      dist/plugin-sdk/types-BVAOMoZy.d.ts:5894-5900 (RunChannelTurnParams),
+ *      :5885-5892 (ChannelTurnAdapter), :5799-5823 (AssembledChannelTurn).
+ *  - api.runtime.channel.inbound.buildContext = buildChannelInboundEventContext:
+ *      dist/plugin-sdk/types-BVAOMoZy.d.ts:5924-5947 (params), :5953 (result).
+ *  - api.runtime.channel.session.{recordInboundSession,resolveStorePath}:
+ *      dist/types-C0dQmare.d.ts:6075,6078.
+ *  - api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher:
+ *      dist/types-C0dQmare.d.ts:6022.
+ *  - ChannelEventDeliveryAdapter.deliver(payload: ReplyPayload, info):
+ *      dist/plugin-sdk/types-BVAOMoZy.d.ts:5760-5769; ReplyPayload.text:
+ *      dist/plugin-sdk/types-BYvUZFDr.d.ts:8-9.
+ */
+export async function handleInboundMessage(
+  api: OpenClawPluginApi,
+  transport: WebChannelTransport,
+  peerId: string,
+  message: InboundUserMessage,
+): Promise<void> {
+  // `wsKey` is the verified per-peer id the transport uses as its socket-map
+  // key (the anonymous strategy is the single-peer special case, where this
+  // falls back to ANON_PEER_ID).
+  const wsKey = peerId || ANON_PEER_ID;
+  const channelRuntime = api.runtime.channel;
+
+  // Progress-draft wiring (Phase 1 first slice). Core does NOT auto-drive a
+  // plugin's `message.live` adapter; the generic seam for a plugin channel is
+  // the inbound turn's reply dispatcher callbacks. When the channel is
+  // configured with `channels.webchannel.streaming.mode:"progress"` we build a
+  // per-turn draft controller and hook `onToolStart`/`onItemEvent`/`onPartialReply`
+  // (GetReplyOptions, dist/plugin-sdk/types-BYvUZFDr.d.ts:274-304) via the turn's
+  // `replyOptions` (Omit<GetReplyOptions,"onBlockReply">, AssembledChannelTurn,
+  // dist/plugin-sdk/types-BVAOMoZy.d.ts:5813). Each event refreshes a single
+  // rolling draft pushed to the widget as a `progress` frame; the final answer
+  // (delivered through `delivery.deliver`) finalizes that same draft id.
+  const channelConfig = (api.config.channels as Record<string, unknown> | undefined)?.[
+    WEBCHANNEL_ID
+  ];
+  const progressEnabled = resolveStreamingMode(channelConfig) === "progress";
+  let draft: ProgressDraftController | undefined;
+  if (progressEnabled) {
+    draft = createProgressDraftController({
+      transport,
+      sessionKey: wsKey,
+      channelConfig,
+    });
+  }
+
+  // Resolve the channel-scoped agent route (carries `webchannel` + peer in the
+  // session key per configured dmScope/bindings).
+  const route = channelRuntime.routing.resolveAgentRoute({
+    cfg: api.config,
+    channel: WEBCHANNEL_ID,
+    peer: { kind: "direct", id: wsKey },
+  });
+
+  try {
+    await channelRuntime.inbound.run({
+      channel: WEBCHANNEL_ID,
+      raw: message,
+      adapter: {
+        ingest: (raw) => ({
+          id: `webchannel-${Date.now()}`,
+          timestamp: Date.now(),
+          rawText: raw.text,
+          textForAgent: raw.text,
+          textForCommands: raw.text,
+          raw,
+        }),
+        resolveTurn: (input) => {
+          const ctxPayload = channelRuntime.inbound.buildContext({
+            channel: WEBCHANNEL_ID,
+            timestamp: input.timestamp,
+            from: wsKey,
+            sender: { id: wsKey, name: wsKey },
+            conversation: { kind: "direct", id: wsKey, label: wsKey },
+            route: {
+              agentId: route.agentId,
+              routeSessionKey: route.sessionKey,
+              dispatchSessionKey: route.sessionKey,
+            },
+            // Record a stable reply target for this peer. Delivery itself uses
+            // the captured `wsKey` (below), so this `to` only needs to be a
+            // stable per-peer identifier for route recording.
+            reply: { to: wsKey },
+            message: {
+              rawBody: input.rawText,
+              commandBody: input.textForCommands,
+              bodyForAgent: input.textForAgent,
+            },
+          });
+
+          const storePath = channelRuntime.session.resolveStorePath(
+            api.config.session?.store,
+            { agentId: route.agentId },
+          );
+
+          return {
+            cfg: api.config,
+            channel: WEBCHANNEL_ID,
+            agentId: route.agentId,
+            routeSessionKey: route.sessionKey,
+            storePath,
+            ctxPayload,
+            recordInboundSession: channelRuntime.session.recordInboundSession,
+            dispatchReplyWithBufferedBlockDispatcher:
+              channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
+            // Progress-draft callbacks (only when streaming.mode === "progress").
+            // These fire DURING the agent run and feed the rolling draft. We also
+            // set `suppressDefaultToolProgressMessages` so the agent's own tool
+            // progress text isn't ALSO delivered as separate messages (it lives
+            // inside our draft instead — GetReplyOptions.suppressDefaultToolProgressMessages,
+            // dist/plugin-sdk/types-BYvUZFDr.d.ts:261-265).
+            ...(draft
+              ? {
+                  replyOptions: {
+                    suppressDefaultToolProgressMessages: true,
+                    onToolStart: (p) => {
+                      draft!.pushEvent({
+                        event: "tool",
+                        itemId: p.itemId,
+                        toolCallId: p.toolCallId,
+                        name: p.name,
+                        phase: p.phase,
+                        args: p.args,
+                      });
+                    },
+                    onItemEvent: (p) => {
+                      draft!.pushEvent({
+                        event: "item",
+                        itemId: p.itemId,
+                        itemKind: p.kind,
+                        title: p.title,
+                        name: p.name,
+                        phase: p.phase,
+                        status: p.status,
+                        summary: p.summary,
+                        progressText: p.progressText,
+                        meta: p.meta,
+                      });
+                    },
+                  },
+                }
+              : {}),
+            // THIS channel's outbound delivery seam. Forward the assembled reply
+            // text to the originating widget's live socket. In progress mode we
+            // FINALIZE the in-flight draft (reusing its id) so the widget
+            // transitions the working bubble into the final answer; otherwise we
+            // send a plain no-id agent_message (legacy append path).
+            delivery: {
+              deliver: async (payload, info) => {
+                const text = payload.text;
+                if (!text) return { visibleReplySent: false };
+                // Only the final reply replaces the draft. Non-final visible
+                // blocks (rare for this channel) fall through to a plain send.
+                if (draft && info?.kind === "final") {
+                  await draft.finalize(text);
+                  return { visibleReplySent: true };
+                }
+                const sent = transport.sendText(wsKey, text);
+                return { visibleReplySent: sent };
+              },
+            },
+          };
+        },
+      },
+    });
+  } catch (err) {
+    api.logger.error?.(`webchannel: inbound dispatch failed: ${String(err)}`);
+    // BLOCKING recovery: if the turn threw AFTER a progress frame was emitted,
+    // the widget is showing a working bubble that will otherwise hang forever
+    // (no terminal frame for that id is ever sent and the draft loop keeps
+    // running). Reuse the finalize path to send a settling `agent_message` for
+    // the SAME draft id with a short apologetic text, so the widget transitions
+    // the bubble out of its italic "working" state into a settled message.
+    //
+    // `finalize` is idempotent, so on the (impossible-here, but defensive) case
+    // where the normal path already finalized before throwing, this is a no-op.
+    if (draft?.started) {
+      try {
+        await draft.finalize(
+          "Sorry — something went wrong while answering. Please try again.",
+        );
+      } catch (finalizeErr) {
+        api.logger.error?.(
+          `webchannel: draft error-finalize failed: ${String(finalizeErr)}`,
+        );
+      }
+    }
+  } finally {
+    // Always halt the throttled draft loop so a late background flush can't race
+    // the error handling (or linger after a normal finalize). Idempotent and a
+    // no-op when no draft was created or it was already stopped by finalize().
+    draft?.stop();
+  }
+}
