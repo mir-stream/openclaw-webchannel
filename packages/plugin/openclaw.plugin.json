@@ -127,7 +127,11 @@
         },
         "execApprovals.enabled": {
           "label": "Native exec approvals",
-          "help": "Render native [Allow once] [Allow always] [Deny] buttons in the chat UI when a tool/exec needs approval. true|\"auto\" enables; false disables."
+          "help": "Render native [Allow once] [Allow always] [Deny] buttons in the chat UI when a tool/exec needs approval. true|\"auto\" enables; false disables. Approvers are required (see execApprovals.approvers) — enabling without approvers yields no native approval surface."
+        },
+        "execApprovals.approvers": {
+          "label": "Exec approver peer ids",
+          "help": "Verified webchannel peer ids allowed to resolve an exec approval via the widget. Falls back to commands.ownerAllowFrom when unset. Peer ids come from your verifier (src/auth.js peerId)."
         },
         "capabilities.inlineButtons": {
           "label": "Inline buttons",

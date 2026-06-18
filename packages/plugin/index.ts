@@ -68,8 +68,23 @@ export default defineChannelPluginEntry({
     // resolving the approval unblocks the agent run. The gateway then emits a
     // resolution event that drives the native runtime's `approval_resolved`
     // frame back to the widget, so we do NOT finalize the card here.
-    transport.setApprovalDecisionHandler((_sessionKey, id, decision) => {
-      void handleApprovalDecision(api.config, id, decision).catch((err) => {
+    //
+    // AUTHZ for this path lives in `handleApprovalDecision`, NOT in the
+    // capability's `authorizeActorAction`. `sessionKey` is the verified peer id
+    // (transport.handleUpgrade stamps it from the verifier's peerId in
+    // src/auth.js), and we pass it as `senderId`; `handleApprovalDecision` then
+    // checks it fail-closed against `channels.webchannel.execApprovals.approvers`
+    // (falling back to `commands.ownerAllowFrom`) BEFORE the gateway RPC. The
+    // gateway RPC itself does NOT authorize — `resolveApprovalOverGateway` only
+    // forwards `{id, decision}` and uses `senderId` purely for
+    // `clientDisplayName` (verified:
+    // dist/approval-gateway-resolver-DNNKgGbF.js). The capability's
+    // `authorizeActorAction` only guards the chat `/approve` text-command path
+    // (dist/commands-handlers.runtime-DIVsKJOl.js:784), which the widget never
+    // sends. The sender MUST therefore be threaded through here (the prior
+    // handler ignored `_sessionKey`).
+    transport.setApprovalDecisionHandler((sessionKey, id, decision) => {
+      void handleApprovalDecision(api.config, id, decision, sessionKey).catch((err) => {
         api.logger.error?.(
           `webchannel: approval resolve failed (${id}): ${String(err)}`,
         );
