@@ -6,3 +6,4 @@ dist-demo/
 *.log
 .DS_Store
 .idea/
+references/openclaw/
