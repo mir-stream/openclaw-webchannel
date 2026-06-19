@@ -101,6 +101,21 @@ export async function handleInboundMessage(
     peer: { kind: "direct", id: wsKey },
   });
 
+  // Native "Bot is typing…" affordance. We push the frame right after route
+  // resolution and right before agent dispatch (1) so the widget sees the
+  // indicator as soon as the turn has been accepted — even before the first
+  // `progress` / `agent_message` / `approval_*` frame, which can take seconds
+  // on a long-running tool call — and (2) regardless of which turn exit path
+  // the dispatch takes (the inner try/catch can still throw). The first real
+  // frame from the agent settles the indicator client-side; we never send a
+  // matching "stop" frame.
+  //
+  // The transport gates the frame on `channels.webchannel.capabilities.typing`
+  // (default "on"), so when an operator sets it to "off" this call is a no-op.
+  // It is also best-effort (no ack/retry) and drop-only under backpressure —
+  // we ignore the boolean return.
+  transport.sendTyping(wsKey);
+
   try {
     await channelRuntime.inbound.run({
       channel: WEBCHANNEL_ID,

@@ -12,6 +12,8 @@ import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
 import { createStaticAssetsHandler } from "./src/static-assets.js";
+import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
+import { WEBCHANNEL_ID } from "./src/transport.js";
 
 // Resolve the built chat-UI `dist-demo/` relative to THIS module, so the path is
 // correct regardless of the gateway's cwd. In the monorepo the plugin lives at
@@ -100,6 +102,97 @@ export default defineChannelPluginEntry({
       api.config.channels as Record<string, unknown> | undefined
     )?.webchannel as { auth?: AuthConfig } | undefined;
     transport.setVerifier(resolveVerifier(authConfig?.auth, api.logger));
+
+    // Wire the typing-indicator capability from `channels.webchannel.capabilities.typing`.
+    // The transport defaults to "on"; only an explicit "off" disables it. The
+    // schema (openclaw.plugin.json) defines the default, but we still apply the
+    // default here so a config block that OMITS `capabilities.typing` keeps
+    // typing enabled without us having to depend on the JSON schema being
+    // applied by the gateway.
+    const webchannelSection = (
+      api.config.channels as Record<string, unknown> | undefined
+    )?.webchannel as
+      | { capabilities?: { typing?: "on" | "off" } }
+      | undefined;
+    transport.setTypingEnabled(
+      webchannelSection?.capabilities?.typing !== "off",
+    );
+
+    // Wire the history-pagination capability from
+    // `channels.webchannel.history.{enabled,limit,pageSize}`. The transport
+    // defaults to enabled + 50/50; the schema (openclaw.plugin.json) defines
+    // the same defaults. We apply them here too so a config block that OMITS
+    // the entire `history` key still gets hydrated history on reconnect.
+    const historyConfig = resolveHistoryConfig(webchannelSection);
+    transport.setHistoryEnabled(historyConfig.limit > 0);
+
+    // First-pong snapshot trigger. After the server sees the first pong for a
+    // given connection (proof the socket is alive enough to deliver), push
+    // the initial history snapshot via `history.recent(...)`. The transport's
+    // Liveness dedupe flag ensures this fires EXACTLY ONCE per connection —
+    // late pongs never re-send. Best-effort: `history.recent` itself swallows
+    // store errors and logs via api.logger; we additionally catch here so a
+    // routing-resolution throw NEVER crashes the connection.
+    transport.setFirstLivenessHandler((wsKey) => {
+      try {
+        const route = api.runtime.channel.routing.resolveAgentRoute({
+          cfg: api.config,
+          channel: WEBCHANNEL_ID,
+          peer: { kind: "direct", id: wsKey },
+        });
+        void historyRecent(api, route.sessionKey, historyConfig.limit, api.logger)
+          .then((messages) => {
+            transport.sendHistory(wsKey, messages);
+          })
+          .catch((err) => {
+            api.logger.error?.(
+              `webchannel: history snapshot failed for ${wsKey}: ${String(err)}`,
+            );
+          });
+      } catch (err) {
+        api.logger.error?.(
+          `webchannel: history snapshot setup failed for ${wsKey}: ${String(err)}`,
+        );
+      }
+    });
+
+    // load_history request handler. The widget asks for a page of older
+    // messages; we resolve the route session key (so cross-peer isolation
+    // holds — the SDK scopes `getSessionMessages` by sessionKey) and hand the
+    // page back via `transport.sendHistory`. The handler is fire-and-forget:
+    // errors are logged, never thrown.
+    transport.setLoadHistoryHandler((wsKey, request) => {
+      try {
+        const route = api.runtime.channel.routing.resolveAgentRoute({
+          cfg: api.config,
+          channel: WEBCHANNEL_ID,
+          peer: { kind: "direct", id: wsKey },
+        });
+        const requestedLimit = request.limit ?? historyConfig.pageSize;
+        const fetch = request.before
+          ? historyPageBefore(
+              api,
+              route.sessionKey,
+              request.before,
+              requestedLimit,
+              api.logger,
+            )
+          : historyRecent(api, route.sessionKey, requestedLimit, api.logger);
+        void fetch
+          .then((messages) => {
+            transport.sendHistory(wsKey, messages);
+          })
+          .catch((err) => {
+            api.logger.error?.(
+              `webchannel: load_history failed for ${wsKey}: ${String(err)}`,
+            );
+          });
+      } catch (err) {
+        api.logger.error?.(
+          `webchannel: load_history setup failed for ${wsKey}: ${String(err)}`,
+        );
+      }
+    });
 
     // Accept WebSocket upgrades on the gateway's own port. No extra server.
     //

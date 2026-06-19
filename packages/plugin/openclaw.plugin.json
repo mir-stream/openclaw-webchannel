@@ -100,6 +100,31 @@
               "inlineButtons": {
                 "type": "string",
                 "enum": ["dm", "group", "allowlist", "all", "off"]
+              },
+              "typing": {
+                "type": "string",
+                "enum": ["on", "off"],
+                "default": "on"
+              }
+            }
+          },
+          "history": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true
+              },
+              "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 50
+              },
+              "pageSize": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 50
               }
             }
           }
@@ -136,6 +161,22 @@
         "capabilities.inlineButtons": {
           "label": "Inline buttons",
           "help": "Where to render inline approval buttons: \"all\" | \"dm\" | \"group\" | \"allowlist\" | \"off\"."
+        },
+        "capabilities.typing": {
+          "label": "Typing indicator",
+          "help": "Whether the server pushes a native \"Bot is typing…\" frame at the start of each turn. Default \"on\"; set to \"off\" to disable (typing is then never emitted, regardless of inbound flow)."
+        },
+        "history.enabled": {
+          "label": "History pagination",
+          "help": "Whether the server pushes a snapshot of the last N messages on connect, and responds to `load_history` requests from the widget. Default `true`. When disabled, the widget shows no hydrated history on reconnect."
+        },
+        "history.limit": {
+          "label": "History snapshot size",
+          "help": "Maximum number of messages sent in the initial on-connect history snapshot. Default 50."
+        },
+        "history.pageSize": {
+          "label": "History page size",
+          "help": "Default page size when the widget asks for older messages via `load_history`. Default 50."
         }
       }
     }

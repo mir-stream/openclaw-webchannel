@@ -166,7 +166,9 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 
 ### Phase 3 — 다듬기 🟡
 - ✅ **정적 채팅 UI 자산을 플러그인 라우트(`/webchannel/`)로 서빙** (단일 배포). 📄 `src/static-assets.ts` — 서빙 대상은 `packages/client/dist-demo`(client vanilla 데모, `npm run build:demo`).
-- ⬜ typing indicator(`heartbeat.sendTyping`), 인터랙티브 버튼 액션, 테마.
+- ✅ **typing indicator (native "Bot is typing…")** — 서버는 턴 시작 시 `{type:"typing"}` 프레임을 한 번 푸시, 클라이언트는 `WebChannelState.isTyping`을 true로 플립; 첫 `progress` / `agent_message` (또는 `approval_*`) 도착 시 자동 settle (US1, US2). 기본 ON, 끄려면 `channels.webchannel.capabilities.typing = "off"` (US2 / AC4). 텔레그램·디스코드 패리티: best-effort, no ack/retry, no stop frame. wire envelope: `InboundWsMessage` 불변, `OutboundWsMessage`에 `{type:"typing"}` 케이스 한 개만 추가 (US3 / AC1).
+- ✅ **history pagination (최근 N개 스냅샷 + 페이지네이션)** — 서버는 첫 pong 직후 `{type:"history", messages:[{id,role,text,ts}]}` 스냅샷을 1회 푸시; 클라이언트는 `state.messages` 앞에 prepend + id 중복 가드 (US1, US2). 사용자가 위로 스크롤하면 클라이언트가 `{type:"load_history", before?, limit?}` 발송 → 서버는 같은 포맷으로 회신. 기본 N=50, 페이지=50, `channels.webchannel.history.{enabled,limit,pageSize}` config로 조정 (US3). wire envelope: `InboundWsMessage`에 `load_history` 케이스 추가, `OutboundWsMessage`에 `history` 케이스 추가 — 모든 기존 케이스 회귀 0, history drop-only 그룹(`progress`/`typing`과 동일) — 백프레셔 드롭 시 소켓 유지 (US4 / AC1-AC7).
+- ⬜ 인터랙티브 버튼 액션, 테마.
 
 ---
 
