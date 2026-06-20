@@ -1,6 +1,8 @@
 import type { IncomingMessage } from "node:http";
 
 import { verifyTicket } from "./ticket.js";
+import { verifyJwt } from "./jwt.js";
+import { JWKSCache } from "./jwks.js";
 
 /**
  * The auth seam. AUTH.md §3: every built-in or custom strategy converges to ONE
@@ -48,7 +50,38 @@ export type HmacTicketAuthConfig = {
   ticketParam?: string;
 };
 
-export type AuthConfig = AnonymousAuthConfig | HmacTicketAuthConfig;
+/**
+ * JWT (RS256 / JWKS) auth config. The gateway validates compact JWTs against
+ * an asymmetric public key resolved from a JWKS source. See AUTH.md §10 for
+ * the full operator-facing documentation and IdP integration examples.
+ *
+ * `issuer` / `audience` are required claims: a missing mismatch rejects every
+ * token (intentional fail-closed default — no silent "trust any iss/aud"
+ * fallback). `jwksUrl` / `jwksFile` / `jwks` is the key source (exactly one;
+ * `resolveVerifier` throws if zero or more than one is supplied). `clockSkew`
+ * defaults to 60s, `ticketParam` to "ticket".
+ */
+export type JwtAuthConfig = {
+  strategy: "jwt";
+  jwt: {
+    /** HTTPS URL that returns a JWKS document. Mutually exclusive with `jwksFile`/`jwks`. */
+    jwksUrl?: string;
+    /** Inline JWKS document (object). Mutually exclusive with `jwksUrl`/`jwksFile`. */
+    jwks?: import("./jwks.js").JsonWebKeySet;
+    /** Path to a JWKS file baked into the deployment. Mutually exclusive with the others. */
+    jwksFile?: string;
+    /** Expected `iss` claim. Rejected on mismatch (constant-time compare). */
+    issuer: string;
+    /** Expected `aud` claim — string OR array containing it. */
+    audience: string;
+    /** Allowed clock-skew leeway in seconds when checking `exp`. Default 60. */
+    clockSkew?: number;
+  };
+  /** Query param the JWT arrives in. Default `"ticket"`. */
+  ticketParam?: string;
+};
+
+export type AuthConfig = AnonymousAuthConfig | HmacTicketAuthConfig | JwtAuthConfig;
 
 /**
  * Resolve a `SecretRef` to a concrete secret string at startup. Throws on an
@@ -119,6 +152,71 @@ function makeHmacTicketVerifier(
 }
 
 /**
+ * Build a `ConnectionVerifier` for the `jwt` (RS256 / JWKS) strategy.
+ *
+ * Fail-closed (AC1): throws at construction if any of the three required
+ * `auth.jwt.{issuer, audience, (jwksUrl|jwks|jwksFile)}` fields is missing.
+ * This matches the existing `hmac-ticket` behavior — missing config means the
+ * plugin refuses to start, NOT that the gateway silently accepts unauthed
+ * upgrades.
+ *
+ * The returned verifier resolves the configured JWKS lazily via the injected
+ * `JWKSCache` and calls `verifyJwt` per upgrade. JWKS I/O errors propagate as
+ * rejections (AC5), so a flaky IdP degrades connection establishment rather
+ * than silently authenticating with a stale key.
+ */
+function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
+  const jwtCfg = config.jwt;
+  if (!jwtCfg || typeof jwtCfg !== "object") {
+    throw new Error(
+      "webchannel: channels.webchannel.auth.jwt is required when strategy=\"jwt\". Refusing to start.",
+    );
+  }
+  if (typeof jwtCfg.issuer !== "string" || jwtCfg.issuer.length === 0) {
+    throw new Error(
+      "webchannel: channels.webchannel.auth.jwt.issuer is required (strategy=\"jwt\"). Refusing to start.",
+    );
+  }
+  if (typeof jwtCfg.audience !== "string" || jwtCfg.audience.length === 0) {
+    throw new Error(
+      "webchannel: channels.webchannel.auth.jwt.audience is required (strategy=\"jwt\"). Refusing to start.",
+    );
+  }
+  // Exactly one JWKS source must be supplied. `JWKSCache.create` enforces
+  // this; we call it once here so a misconfig fails at plugin load instead of
+  // every upgrade.
+  const jwksCache = JWKSCache.create(
+    {
+      jwksUrl: jwtCfg.jwksUrl,
+      jwksFile: jwtCfg.jwksFile,
+      jwks: jwtCfg.jwks,
+    },
+    // 5-minute TTL is the documented default; tests / operators can override
+    // by passing a `ttlMs` — but the operator-facing schema (see
+    // openclaw.plugin.json) doesn't expose `ttlMs` yet; that's an intentional
+    // narrowing for v1.
+  );
+  const ticketParam = config.ticketParam ?? "ticket";
+  const issuer = jwtCfg.issuer;
+  const audience = jwtCfg.audience;
+  const clockSkew = jwtCfg.clockSkew;
+  return async (req: IncomingMessage) => {
+    const token = readQueryParam(req.url, ticketParam);
+    if (!token) return null;
+    const identity = await verifyJwt(token, {
+      jwks: jwksCache,
+      issuer,
+      audience,
+      clockSkewSec: clockSkew,
+    });
+    if (!identity) return null;
+    return identity.displayName !== undefined
+      ? { peerId: identity.peerId, displayName: identity.displayName }
+      : { peerId: identity.peerId };
+  };
+}
+
+/**
  * Build the `ConnectionVerifier` for the configured auth block.
  *
  * SAFE DEFAULT (AUTH.md §7): an unconfigured / unknown strategy THROWS rather
@@ -133,7 +231,7 @@ export function resolveVerifier(
 ): ConnectionVerifier {
   if (!authConfig || typeof authConfig !== "object" || !("strategy" in authConfig)) {
     throw new Error(
-      "webchannel: channels.webchannel.auth.strategy is required (anonymous | hmac-ticket). Refusing to start.",
+      "webchannel: channels.webchannel.auth.strategy is required (anonymous | hmac-ticket | jwt). Refusing to start.",
     );
   }
 
@@ -142,9 +240,11 @@ export function resolveVerifier(
       return makeAnonymousVerifier(logger);
     case "hmac-ticket":
       return makeHmacTicketVerifier(authConfig);
+    case "jwt":
+      return makeJwtVerifier(authConfig);
     default:
       throw new Error(
-        `webchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected anonymous | hmac-ticket). Refusing to start.`,
+        `webchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected anonymous | hmac-ticket | jwt). Refusing to start.`,
       );
   }
 }

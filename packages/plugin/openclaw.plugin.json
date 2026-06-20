@@ -22,7 +22,7 @@
             "properties": {
               "strategy": {
                 "type": "string",
-                "enum": ["anonymous", "hmac-ticket"]
+                "enum": ["anonymous", "hmac-ticket", "jwt"]
               },
               "ticketSecret": {
                 "anyOf": [
@@ -35,7 +35,41 @@
                   }
                 ]
               },
-              "ticketParam": { "type": "string" }
+              "ticketParam": { "type": "string" },
+              "jwt": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "jwksUrl": {
+                    "type": "string",
+                    "format": "uri",
+                    "description": "HTTPS URL of the IdP's JWKS endpoint. Exactly one of jwksUrl, jwks, or jwksFile is required."
+                  },
+                  "jwks": {
+                    "type": "object",
+                    "description": "Inline JWKS document (parsed object with a `keys` array). Exactly one of jwksUrl, jwks, or jwksFile is required."
+                  },
+                  "jwksFile": {
+                    "type": "string",
+                    "description": "Filesystem path to a JWKS file baked into the deployment. Exactly one of jwksUrl, jwks, or jwksFile is required."
+                  },
+                  "issuer": {
+                    "type": "string",
+                    "description": "Expected `iss` claim. Tokens with a different iss are rejected (constant-time compare)."
+                  },
+                  "audience": {
+                    "type": "string",
+                    "description": "Expected `aud` claim (string OR array containing it)."
+                  },
+                  "clockSkew": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 60,
+                    "description": "Allowed clock-skew leeway in seconds when checking exp. Default 60."
+                  }
+                },
+                "required": ["issuer", "audience"]
+              }
             }
           },
           "allowFrom": {
@@ -142,6 +176,30 @@
         "auth.ticketParam": {
           "label": "Ticket query param",
           "help": "Query-string parameter the ticket arrives in on the WS upgrade URL. Defaults to \"ticket\"."
+        },
+        "auth.jwt.jwksUrl": {
+          "label": "JWKS URL",
+          "help": "HTTPS URL of the IdP's JWKS endpoint (e.g. https://your-tenant.auth0.com/.well-known/jwks.json). The gateway fetches and caches it with a 5-minute TTL. Exactly one of jwksUrl, jwks, or jwksFile is required."
+        },
+        "auth.jwt.jwks": {
+          "label": "Inline JWKS",
+          "help": "Inline JWKS document (object with `keys: [...]`). Useful for offline deployments and tests. Exactly one of jwksUrl, jwks, or jwksFile is required."
+        },
+        "auth.jwt.jwksFile": {
+          "label": "JWKS file path",
+          "help": "Filesystem path to a JWKS JSON file baked into the deployment. The file is re-read on every refresh (5-minute TTL). Exactly one of jwksUrl, jwks, or jwksFile is required."
+        },
+        "auth.jwt.issuer": {
+          "label": "Issuer (iss)",
+          "help": "Expected `iss` claim. Tokens whose iss does not match (constant-time compare) are rejected. Required."
+        },
+        "auth.jwt.audience": {
+          "label": "Audience (aud)",
+          "help": "Expected `aud` claim. Tokens whose aud is neither this string nor an array containing it are rejected. Required."
+        },
+        "auth.jwt.clockSkew": {
+          "label": "Clock skew (sec)",
+          "help": "Allowed clock-skew leeway in seconds when checking exp. Default 60."
         },
         "allowFrom": {
           "label": "Allowed user ids"

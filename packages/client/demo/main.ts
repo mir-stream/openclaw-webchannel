@@ -6,18 +6,21 @@
  * `subscribe` to its immutable state, and re-render a tiny transcript UI on each
  * change. `send` / `decide` go straight back to the client.
  *
- * Mirrors the React example's hmac-ticket flow: enter the gateway's shared
- * secret + a user id, the browser mints a short-lived ticket (devTicket.ts) and
- * connects via the same-origin `/webchannel/ws` path (vite proxies it to the
- * gateway). Run with `npm run dev`.
+ * Mode: pick between `hmac-ticket` (browser-side HS256 minting, shared secret)
+ * and `jwt` (browser-side RS256 minting with a self-generated keypair). The
+ * gateway is configured server-side — whichever strategy you choose, point it
+ * at the matching auth block. For JWT mode the demo prints its public JWK to
+ * the console so an operator can paste it into the gateway's JWKS file.
  *
- * ⚠️ DEMO ONLY — minting tickets in the browser exposes the secret. In
- * production your backend issues tickets server-side (AUTH.md §5); pass that as
- * `getTicket`. For a cross-origin gateway, pass `url` instead of using the proxy.
+ * ⚠️ DEMO ONLY — minting tickets in the browser exposes the secret (hmac) or
+ * the private key (jwt). In production your backend issues tickets server-side
+ * (AUTH.md §5/§10); pass that as `getTicket`. For a cross-origin gateway, pass
+ * `url` instead of using the proxy.
  */
 import { WebChannelClient } from "../src/index.js";
 import type { ApprovalDecision, WebChannelState } from "../src/index.js";
 import { makeDevGetTicket } from "./devTicket.js";
+import { initDevJwtIssuer, makeDevGetJwtTicket } from "./devTicket.jwt.js";
 
 const root = document.getElementById("app")!;
 root.style.cssText = "max-width:480px;margin:2rem auto;font-family:system-ui";
@@ -26,6 +29,8 @@ let client: WebChannelClient | null = null;
 let unsubscribe: (() => void) | null = null;
 
 // ── connect gate (secret + userId) ────────────────────────────────────────────
+type AuthMode = "hmac-ticket" | "jwt";
+
 function renderConnectForm(): void {
   client = null;
   root.replaceChildren();
@@ -33,45 +38,129 @@ function renderConnectForm(): void {
   const h = el("h2", "WebChannel — vanilla (no React)");
   const note = el(
     "p",
-    "Enter the gateway's shared secret (channels.webchannel.auth.ticketSecret) and a user id. The browser mints a short-lived ticket and connects.",
+    "Pick an auth mode and enter the matching config. The browser mints a short-lived ticket and connects.",
   );
   note.style.cssText = "color:#555;font-size:14px;line-height:1.5";
   const warn = el(
     "p",
-    "⚠️ Demo only — the secret is used in the browser. In production your backend issues tickets server-side.",
+    "⚠️ Demo only — minting tickets in the browser exposes the secret (hmac) or the private key (jwt). In production your backend issues tickets server-side.",
   );
   warn.style.cssText = "color:#a15;font-size:13px;line-height:1.5";
+
+  const modeSelect = document.createElement("select") as HTMLSelectElement;
+  modeSelect.style.cssText = "padding:8px;border-radius:8px;border:1px solid #ccc";
+  for (const value of ["hmac-ticket", "jwt"] as const) {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent =
+      value === "hmac-ticket"
+        ? "hmac-ticket (shared secret)"
+        : "jwt (RS256 + JWKS)";
+    modeSelect.appendChild(opt);
+  }
+  modeSelect.value = "hmac-ticket";
 
   const secret = inputEl("password", "same as gateway ticketSecret");
   const userId = inputEl("text", "alice");
   userId.value = "alice";
 
+  const issuer = inputEl("text", "https://demo.local/");
+  issuer.value = "https://demo.local/";
+  const audience = inputEl("text", "webchannel-demo");
+  audience.value = "webchannel-demo";
+
   const connectBtn = el("button", "Connect") as HTMLButtonElement;
   connectBtn.type = "submit";
   connectBtn.style.cssText = "padding:8px 16px;border-radius:8px";
+  connectBtn.disabled = false;
+
+  // Show/hide the right fields based on the selected mode. The JWT block is
+  // hidden by default because the default mode is hmac-ticket.
+  const hmacBlock = labeled("Shared secret", secret);
+  const jwtBlock = el("div");
+  jwtBlock.style.cssText = "display:none;flex-direction:column;gap:10px";
+  jwtBlock.append(
+    labeled("Issuer (iss)", issuer),
+    labeled("Audience (aud)", audience),
+  );
+
+  modeSelect.onchange = () => {
+    if (modeSelect.value === "jwt") {
+      hmacBlock.style.display = "none";
+      jwtBlock.style.display = "flex";
+    } else {
+      hmacBlock.style.display = "flex";
+      jwtBlock.style.display = "none";
+    }
+  };
 
   const form = document.createElement("form");
   form.style.cssText =
     "display:flex;flex-direction:column;gap:10px;margin-top:16px";
   form.append(
-    labeled("Shared secret", secret),
+    labeled("Auth mode", modeSelect),
+    hmacBlock,
+    jwtBlock,
     labeled("User id (ticket sub)", userId),
     connectBtn,
   );
-  form.onsubmit = (e) => {
+  form.onsubmit = async (e) => {
     e.preventDefault();
-    if (!secret.value.trim() || !userId.value.trim()) return;
-    startSession(secret.value.trim(), userId.value.trim());
+    if (!userId.value.trim()) return;
+    connectBtn.disabled = true;
+    connectBtn.textContent = "Connecting…";
+    try {
+      const mode = modeSelect.value as AuthMode;
+      const sub = userId.value.trim();
+      if (mode === "hmac-ticket") {
+        if (!secret.value.trim()) return;
+        startSession({
+          kind: "hmac-ticket",
+          sub,
+          getTicket: makeDevGetTicket(secret.value.trim(), sub),
+        });
+      } else {
+        if (!issuer.value.trim() || !audience.value.trim()) return;
+        // Generate (or load) the RSA keypair FIRST; only then start the session.
+        // While the keypair is being created we paint a "preparing…" UI so the
+        // user sees why the connect button is unresponsive.
+        const dev = await initDevJwtIssuer({
+          issuer: issuer.value.trim(),
+          audience: audience.value.trim(),
+        });
+        // Print the demo's public JWK to the console so an operator can paste
+        // it into the gateway's JWKS while testing.
+        console.info(
+          "[demo] JWT issuer ready — paste this public JWK into your gateway's JWKS:",
+          dev.publicJwk,
+        );
+        startSession({
+          kind: "jwt",
+          sub,
+          getTicket: makeDevGetJwtTicket(dev, sub),
+        });
+      }
+    } finally {
+      connectBtn.disabled = false;
+      connectBtn.textContent = "Connect";
+    }
   };
 
   root.append(h, note, warn, form);
 }
 
 // ── live chat (subscribed to the client) ──────────────────────────────────────
-function startSession(secret: string, sub: string): void {
+
+type StartSessionInput = {
+  kind: AuthMode;
+  sub: string;
+  getTicket: () => Promise<string | null>;
+};
+
+function startSession(input: StartSessionInput): void {
   client = new WebChannelClient({
     path: "/webchannel/ws",
-    getTicket: makeDevGetTicket(secret, sub),
+    getTicket: input.getTicket,
   });
 
   root.replaceChildren();
@@ -81,7 +170,7 @@ function startSession(secret: string, sub: string): void {
     "display:flex;justify-content:space-between;align-items:center;" +
     "font-size:13px;color:#666;margin-bottom:4px";
   const who = el("span");
-  who.innerHTML = `hmac-ticket · as <strong>${escapeHtml(sub)}</strong>`;
+  who.innerHTML = `${input.kind} · as <strong>${escapeHtml(input.sub)}</strong>`;
   const dot = el("span");
   dot.title = "status";
   dot.style.cssText = "width:10px;height:10px;border-radius:50%;background:#bbb";
@@ -106,18 +195,18 @@ function startSession(secret: string, sub: string): void {
 
   const form = document.createElement("form");
   form.style.cssText = "display:flex;gap:8px;margin-top:8px";
-  const input = inputEl("text", "Connecting…");
-  input.disabled = true;
-  input.style.flex = "1";
+  const chatInput = inputEl("text", "Connecting…");
+  chatInput.disabled = true;
+  chatInput.style.flex = "1";
   const sendBtn = el("button", "Send") as HTMLButtonElement;
   sendBtn.type = "submit";
   sendBtn.disabled = true;
   sendBtn.style.cssText = "padding:8px 16px";
-  form.append(input, sendBtn);
+  form.append(chatInput, sendBtn);
   form.onsubmit = (e) => {
     e.preventDefault();
-    client?.send(input.value);
-    input.value = "";
+    client?.send(chatInput.value);
+    chatInput.value = "";
   };
 
   root.append(bar, transcript, form);
@@ -130,9 +219,9 @@ function startSession(secret: string, sub: string): void {
           ? "#f0ad4e"
           : "#bbb";
     dot.title = state.status;
-    input.disabled = !state.connected;
+    chatInput.disabled = !state.connected;
     sendBtn.disabled = !state.connected;
-    input.placeholder = state.connected ? "Type a message…" : "Connecting…";
+    chatInput.placeholder = state.connected ? "Type a message…" : "Connecting…";
     transcript.replaceChildren(
       ...state.messages.map(renderMessage),
       ...state.approvals.map(renderApproval),
