@@ -10,10 +10,10 @@
 흔한 방식은 **config로 고르는 빌트인 전략**(`anonymous`/`hmac-ticket`/`jwt`/`trusted-header`)으로 제공.
 SaaS 임베드는 SaaS가 발급한 단명 서명 ticket을 플러그인이 검증(2차 로그인 아님). 상세 설계는 `AUTH.md`.
 
-**현재 코드 상태: ✅ 구현됨(2026-06-15).** `src/auth.ts`의 검증기 seam + `anonymous`/`hmac-ticket` 빌트인 + 안전 기본값(미설정 시 로드 거부), per-peer 라우팅, 위젯 `getTicket`. **hmac-ticket E2E 라이브 검증 완료.** (`anonymous`는 dev 전용·경고.)
+**현재 코드 상태: ✅ 구현됨(2026-06-15, jwt 추가 2026-06-20).** `src/auth.ts`의 검증기 seam + `anonymous`/`hmac-ticket`/`jwt` 빌트인 + 안전 기본값(미설정 시 로드 거부), per-peer 라우팅, 위젯 `getTicket`. **hmac-ticket + jwt E2E 라이브 검증 완료.** (`anonymous`는 dev 전용·경고.)
 
 **잔여(후속, AUTH.md §9):**
-- `jwt` / `trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입.
+- `trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입.
 - 세션 중 강제 만료(revocation) + **잘못된 ticket 시 재연결 루프 UX**.
 - 멀티탭 정책.
 

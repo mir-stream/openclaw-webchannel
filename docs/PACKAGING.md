@@ -89,17 +89,17 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 
 ### C. Auth  ✅  → 상세 `AUTH.md`
 - ✅ `ConnectionVerifier` + `handleUpgrade` 배선(하드코딩 `ANON_PEER_ID` 제거).
-- ✅ 빌트인 `anonymous` + `hmac-ticket` + config 스키마.
+- ✅ 빌트인 `anonymous` + `hmac-ticket` + `jwt` + config 스키마.
 - ✅ 안전 기본값(strategy 미설정 거부, anonymous loud opt-in).
-- ✅ ticket 발급/검증 zero-dep(`src/ticket.ts`) + 브라우저 발급기(client `demo/devTicket.ts`, 데모).
-- ⬜ `jwt`/`trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입.
+- ✅ ticket 발급/검증 zero-dep(`src/ticket.ts` for hmac, `src/jwt.ts`+`src/jwks.ts` for RS256+JWKS) + 브라우저 발급기(client `demo/devTicket.ts` for hmac, `demo/devTicket.jwt.ts` for JWT, 데모).
+- ⬜ `trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입.
 
 ### D. 헤드리스 클라이언트 `openclaw-webchannel-client`  ✅ (2026-06-15)
 - ✅ `packages/client` 신규 구현 — **framework-agnostic, zero runtime dep**. ESM, `tsc` 빌드(라이브러리 → `dist/` JS + `.d.ts`).
 - ✅ `WebChannelClient`: `connect()`/`close()`/`send()`/`decide()` + `subscribe(listener)`(불변 상태 스냅샷 push) + `getState()`. (재연결 백오프+지터, 동시-connect sentinel, 매 재연결 `getTicket`, progress 드래프트, 승인 카드, 고아 드래프트 정리, **typing indicator: `WebChannelState.isTyping` + `typing` 케이스 자동 settle**, **history pagination: connect 시 `history` 프레임으로 `state.messages` hydrate + `loadHistory({before?, limit?})` 페이지네이션 메서드, id 중복 가드**.)
 - ✅ **상태 소유권이 클라이언트** — 메시지/승인 리듀서가 여기 단일 출처. 순수 JS/Vue/React 뷰는 얇은 뷰. `state.messages`는 초기 비어있다가 connect 성공 시 서버 `history` 프레임으로 hydrate (스크롤 복원 / 페이지 reload 시 "어제 무슨 얘기했지?" UX 해결).
 - ✅ **크로스오리진 `url` 옵션** + same-origin `path` 옵션.
-- ✅ 순수 DOM 데모(`demo/main.ts`, React 0줄) + `vitest` 유닛 20케이스 + 라이브 게이트웨이 hmac-ticket E2E(`smoke-client.mjs`) 통과.
+- ✅ 순수 DOM 데모(`demo/main.ts`, React 0줄, **auth mode 토글: hmac-ticket | jwt**) + `vitest` 유닛 29케이스 + 라이브 게이트웨이 hmac-ticket + jwt E2E(`smoke-client.mjs`, `smoke/jwt.mjs`) 통과.
 - ✅ **삭제된 React `openclaw-webchannel-widget` 대체.** 위젯(`webchannel/widget`: `useWebChannel` 훅 + `Chat.tsx` + example)은 2026-06-15 삭제. 위젯이 들고 있던 연결 로직은 client에 프레임워크 없이 재구현됐고, 게이트웨이가 서빙하던 위젯 example은 client의 vanilla 데모로 대체됨(아래 Phase 3).
 - ⬜ `"private"` 해제(출시 시) / `<script>` 임베드 UMD / README.
 

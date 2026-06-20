@@ -156,10 +156,10 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 - ✅ 설정 스키마(`channels.webchannel.*`, auth 포함). ⬜ `openclaw channels status` 통합 미확인.
 
 ### Auth (원래 BACKLOG → 구현됨) ✅  📄 `AUTH.md`
-- ✅ `ConnectionVerifier` seam + 빌트인 `anonymous`/`hmac-ticket` + 안전 기본값 + zero-dep ticket 발급/검증.
+- ✅ `ConnectionVerifier` seam + 빌트인 `anonymous`/`hmac-ticket`/`jwt` + 안전 기본값 + zero-dep ticket 발급/검증.
 - ✅ 멀티유저 outbound/approval per-peer 라우팅. ✅ 위젯 `getTicket` + 재연결 재발급.
-- ✅ **hmac-ticket E2E 라이브 검증**(페이지 서빙 + ticket 연결 + 에이전트 응답 + 미·오 ticket 거절).
-- ⬜ 잔여: `jwt`/`trusted-header` 전략, 커스텀 함수 주입, 세션 revocation, 멀티탭 정책.
+- ✅ **hmac-ticket + jwt E2E 라이브 검증**(페이지 서빙 + ticket 연결 + 에이전트 응답 + 미·오 ticket 거절).
+- ⬜ 잔여: `trusted-header` 전략, 커스텀 함수 주입, 세션 revocation, 멀티탭 정책.
 
 ### Phase 2 — tool inspector 확장 (선택) ⬜
 - `api.runtime.events.onAgentEvent` 구독 → tool 이벤트 WS forward, 구조화 tool 카드, (옵션) thinking.
@@ -268,7 +268,7 @@ openclaw-webchannel/              # 레포 루트 = 워크스페이스 매니저
 
 - **WS 연결 수명주기:** 끊긴 소켓 정리, 재연결 시 세션 복원, dedupe(코어 idempotency key 활용),
   backpressure(`maxBufferedBytes` 한도). → openclaw 특유 난제 아님, 일반 WS 서버 엔지니어링.
-- ~~**브라우저 auth 모델**~~ → **결정됨.** 검증기(ConnectionVerifier) seam + 빌트인 전략. 📄 `AUTH.md`. (잔여: 세션 중 강제 만료, `jwt`/`trusted-header` 빌트인은 후순위)
+- ~~**브라우저 auth 모델**~~ → **결정됨.** 검증기(ConnectionVerifier) seam + 빌트인 전략. 📄 `AUTH.md`. (잔여: 세션 중 강제 만료, `trusted-header` 빌트인, 커스텀 함수 주입은 후순위)
 - ~~**공개 패키지화**~~ → **결정됨.** 서버/브라우저 2-패키지 분리, npm(+ClawHub) 배포. 📄 `PACKAGING.md`.
 - **세션 그래머:** 검증된 `peerId`가 기본 sessionKey. 잔여는 **멀티탭** 정책(같은 사용자의 여러 탭을 묶을지/분리할지)뿐.
 - **위젯 호스팅:** 개발(Vite) vs 배포(npm 패키지 / `<script>` 임베드 / 플러그인 라우트 서빙) — Phase 3에서 확정.
