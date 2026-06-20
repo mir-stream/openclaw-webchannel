@@ -1,7 +1,22 @@
 import { WebSocket } from "ws";
+import crypto from "node:crypto";
 
-const URL = process.env.WS_URL || "ws://127.0.0.1:18789/webchannel/ws";
+const BASE_URL = process.env.WS_URL || "ws://127.0.0.1:18789/webchannel/ws";
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 90000);
+const SECRET = process.env.WEBCHANNEL_TICKET_SECRET;
+
+function resolveUrl() {
+  if (!SECRET) return BASE_URL;
+  const b64 = (s) => Buffer.from(s).toString("base64url");
+  const header = b64(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+  const iat = Math.floor(Date.now() / 1000);
+  const payload = b64(JSON.stringify({ sub: "smoke-user", iat, exp: iat + 60 }));
+  const si = `${header}.${payload}`;
+  const sig = crypto.createHmac("sha256", SECRET).update(si).digest("base64url");
+  return `${BASE_URL}?ticket=${encodeURIComponent(`${si}.${sig}`)}`;
+}
+
+const URL = resolveUrl();
 
 const t0 = Date.now();
 const ms = () => `${String(Date.now() - t0).padStart(6)}ms`;
