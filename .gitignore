@@ -3,7 +3,6 @@ dist/
 dist-lib/
 dist-demo/
 .vite/
-.cache/
 *.log
 .DS_Store
 .idea/
