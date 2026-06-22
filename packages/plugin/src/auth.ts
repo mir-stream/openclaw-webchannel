@@ -76,6 +76,12 @@ export type JwtAuthConfig = {
     audience: string;
     /** Allowed clock-skew leeway in seconds when checking `exp`. Default 60. */
     clockSkew?: number;
+    /**
+     * @internal Test-only: override the HTTP fetch implementation used when
+     * resolving a `jwksUrl`. Injected by unit tests to simulate a JWKS server
+     * without opening a real socket. Production code never sets this field.
+     */
+    _fetchImpl?: typeof fetch;
   };
   /** Query param the JWT arrives in. Default `"ticket"`. */
   ticketParam?: string;
@@ -195,6 +201,13 @@ function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
     // by passing a `ttlMs` — but the operator-facing schema (see
     // openclaw.plugin.json) doesn't expose `ttlMs` yet; that's an intentional
     // narrowing for v1.
+    //
+    // `_fetchImpl` is a test-only escape hatch: when set, the JWKSCache uses
+    // the injected function instead of `globalThis.fetch`. This lets unit tests
+    // simulate a JWKS server response without opening a real network socket.
+    jwtCfg._fetchImpl !== undefined
+      ? { fetchImpl: jwtCfg._fetchImpl }
+      : undefined,
   );
   const ticketParam = config.ticketParam ?? "ticket";
   const issuer = jwtCfg.issuer;
