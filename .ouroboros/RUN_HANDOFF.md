@@ -1,8 +1,22 @@
 # Ouroboros Run Handoff — E2E NATS WebChannel
 
-> Self-contained state for resuming after a context compaction. Read this first.
+> ✅ **PHASE A COMPLETE (2026-06-22).** This seed was EXECUTED and LANDED.
+> All 7 ACs implemented, 596 tests pass, typecheck clean, evaluated **APPROVED (0.86)**.
+> Merged into `jwks`: impl `de42140` → merge `eeabec1` → hygiene `01cb5a8` → real-NATS interop test `88a261b`.
+> **Do NOT re-run this seed.** It is the record of the finished **data plane**.
+>
+> ➡️ **NEXT = PHASE B (control plane / onboarding).** See `.ouroboros/PHASE_B_ONBOARDING.md`
+> and the design source `docs/ONBOARDING.md`. Phase B is a NEW interview/seed scoped to the
+> trust-chain + onboarding + real-NATS-auth + channel cut-over — it builds AROUND the Phase A
+> modules, it does not replace them.
+>
+> Evaluator's headline caveat (now Phase B scope): the E2E-NATS stack is a complete,
+> well-tested **parallel layer not yet wired into the live channel** (`transport.ts` still
+> runs the gateway-WS path; NATS subject-permission was tested against a fake broker).
 
-## TL;DR — how to run
+---
+
+## TL;DR — how the seed was run (historical)
 
 - **Runnable seed file (USE THIS):** `.ouroboros/seed_e2e_nats_webchannel.yaml` — QA-passed v (score 0.90).
 - `ooo run` → call `ouroboros_execute_seed` with **`seed_path`** pointing at that file.
