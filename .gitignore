@@ -8,3 +8,4 @@ dist-runtime/
 .DS_Store
 .idea/
 .claude/
+*.tsbuildinfo
