@@ -32,6 +32,20 @@
 
 ---
 
+> **Tenancy**
+>
+> Architecture 강제:
+> - **Channel(플러그인 인스턴스) × 1 ↔ SaaS × 1 친화성.** plugin = 한 trust anchor.
+>   다중 SaaS 필요 시 plugin 인스턴스 여러 개 + 상위 layer에서 routing.
+> - **Bus(NATS account) × 1 ↔ tenant × 1.** tenant 격리의 단위.
+> - **setupTrustChain은 bus 단위로 1회**, SaaS 운영팀이 실행.
+> - **승인은 tenant 스코프** — 운영자는 자기 tenant의 Channel만 보고 승인.
+>
+> "테넌트"의 구체적 의미(조직 / 워크스페이스 / ...)는 **SaaS 책임**.
+> 본 doc은 각 tenant가 자기 bus를 가진다는 사실만 가정.
+
+---
+
 ## 누가 무엇을 쥐나
 
 | 주체 | 보유 | 출처 |
@@ -65,9 +79,9 @@
 
 ```
 #1  버스 세울 때 1회 : setupTrustChain 산출물(config)을 NATS에 꽂기   (운영자, once-ever, per-customer 아님)
-#2  plugin 배포 시   : SAAS_URL 환경변수 1개 → JWKS 자동 pull         (비밀 아님)
-#3  plugin 첫 부팅   : 로그에 verification_uri_complete 표시
-                       → 운영자 대시보드에서 클릭 승인 1번
+#2  plugin 배포 시   : SAAS_URL 설정 (기본: wizard, 대안: 환경변수) → JWKS 자동 pull    (비밀 아님)
+#3  plugin 첫 부팅   : 로그에 verify_url + user_code 표시
+                       → 운영자: 클릭(권장) / 수동 입력 / pending 목록 중 하나로 승인 1번
                        → NATS creds 수령 + 에이전트키 등록 → 로컬 영속 (재시작 시 재페어링 X)
 #4  브라우저 접속    : SaaS bootstrap 자동                            (per-session)
 ```
@@ -79,12 +93,90 @@
 
 ---
 
+## 운영자 walkthrough — "그래서 내가 뭘 하면 돼?"
+
+> 위 결합은 시스템 관점. 여기선 **사람이 보고·클릭·입력하는 일**만 시간순.
+> 비밀 옮겨적기는 어디에도 없음 — 모든 키/creds는 시스템이 만들고 시스템이 보관.
+
+### 0회: 버스 세울 때 (SaaS 운영팀, per-tenant 아님)
+
+NATS config에 SaaS의 account 공개키 박기. 1회, 끝.
+
+### 1회: 플러그인 첫 배포 (그 테넌트 운영자)
+
+**SAAS_URL 설정** — 둘 다 지원, **wizard가 기본**:
+
+| 경로 | 언제 |
+|---|---|
+| **interactive wizard** (기본) | 첫 배포, 1회성. setup이 URL을 물어봄. |
+| **환경변수 / config 파일** (대안) | CI/CD, IaC, 동일 URL 재사용, 비-대화형 부팅 |
+
+플러그인 동작: 환경변수가 있으면 그걸로, 없으면 wizard로 → 어느 쪽이든 같은 JWKS pull. 자동화 친화 순서(환경변수 우선).
+
+플러그인이 JWKS 자동 pull. 끝.
+
+### 1회: 플러그인 첫 부팅
+
+**플러그인이 자동으로 (사람 안 봄):**
+
+1. X25519 신원 키페어 생성 (priv는 디스크, pub는 곧 SaaS로)
+2. enroll 요청 (agent_pub 첨부) → user_code + verify_url + device_code 수령
+3. 로그 출력:
+   ```
+   🔗 saas.com/pair?code=ABCD-1234   ← 클릭 1번 (권장)
+      fallback code: ABCD-1234       ← URL 깨질 때
+   ```
+4. 백그라운드 폴링 시작 (device_code로 /poll, 승인될 때까지)
+
+**운영자가 한다 (1 클릭):**
+
+- SaaS 대시보드 로그인 (이미 로그인돼있을 수 있음 — **테넌트 권한 확인**)
+- **권장:** 로그의 `saas.com/pair?code=ABCD-1234` 클릭 → user_code 자동 채움 → 승인
+- **fallback:** `saas.com/pair`에서 `ABCD-1234` 수동 입력 → 승인 (URL 깨졌을 때)
+- **대안:** SaaS 대시보드의 "Pending enrollments" 목록에서 본인 코드 클릭
+- **한 번의 승인이 atomic하게 두 가지를 처리:**
+  - agent X25519 공개키 **등록** (들어옴) — #4의 키핀 재료
+  - NATS user creds **발급** (나감)
+
+**플러그인이 자동으로 (계속):**
+
+5. 폴링 응답 → approved + creds 수령
+6. 디스크 영속 저장: `creds.jwt` + `identity.key`
+7. NATS 연결
+8. 로그:
+   ```
+   ✅ Pairing complete
+      creds:    /var/lib/webchannel/creds.jwt
+      identity: /var/lib/webchannel/identity.key
+      nats:     connected as user_xxx
+   ```
+
+**소요:** 운영자 클릭 1번 + 1–2분.
+
+### N회: 플러그인 재시작
+
+디스크에서 creds + X25519 키페어 로드 → NATS 연결. **페어링 다시 안 함.**
+
+### per-session: 브라우저 (#4, 후술)
+
+---
+
+> **verify_url 클릭 vs 수동 입력 — Scope 노트**
+>
+> - **plugin scope (이 문서):** user_code를 verify_url과 raw code **둘 다** 표시. URL 깨질 때의 fallback 보장.
+> - **SaaS UI scope (이 문서 밖):** 자동 추출 / 수동 폼 / pending 목록 중 어떤 입력 경로를 제공할지.
+>
+> 어느 쪽이 표준이냐는 운영자 UX 결정. 본질은 "user_code 한 문자열이 plugin→SaaS로 전달" — 전달 매체 디테일은 양단 UI 책임.
+
+---
+
 ## 페어링이 device flow인 이유 (RFC 8628)
 
 - plugin은 ingress-free → 자격을 **push 불가** → 부팅 때 **pull(enroll)**.
 - enrollment에선 plugin = **신청자**, SaaS/운영자 = **권한자** (런타임의 plugin=문지기와 반대).
 - **발급=SaaS**(짧은 user_code + 비밀 device_code 분리 필요), **표시=plugin**(로그), **승인=운영자**(대시보드 로그인=테넌트 권한).
-- `verification_uri_complete`(`saas.com/pair?code=…`)로 **타이핑 없이 클릭 한 번**.
+- `verification_uri_complete`(`saas.com/pair?code=…`)로 **타이핑 없이 클릭 1번 (권장)**.
+  URL 깨질 때 fallback으로 plugin은 user_code를 raw로도 표시 (수동 입력 경로).
 
 ---
 
