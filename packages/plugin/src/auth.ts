@@ -19,6 +19,64 @@ import { JWKSCache } from "./jwks.js";
  */
 export const ANON_PEER_ID = "web-anon";
 
+// ---------------------------------------------------------------------------
+// Device key pin store (SaaS-attested keys from cnf claims)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pinned device public keys (base64url-encoded 32-byte X25519 keys) indexed by
+ * peerId. These are extracted from verified JWT cnf.jwk claims during admission
+ * and MUST be used to verify device keys during ECDH handshake (MITM prevention).
+ */
+const pinnedDeviceKeys: Map<string, string> = new Map();
+
+/**
+ * Store a SaaS-attested device public key for a given peerId.
+ *
+ * Called by the auth layer after successful JWT verification with a cnf claim.
+ * If a key already exists for the peerId, it is replaced (key rotation).
+ *
+ * @param peerId - JWT `sub` claim (stable per-user identity).
+ * @param devicePublicKeyB64 - Device X25519 public key (base64url, 32 bytes).
+ */
+export function storePinnedDeviceKey(peerId: string, devicePublicKeyB64: string): void {
+  if (!peerId || typeof peerId !== "string") {
+    throw new Error("webchannel: peerId must be a non-empty string");
+  }
+  if (!devicePublicKeyB64 || typeof devicePublicKeyB64 !== "string") {
+    throw new Error("webchannel: devicePublicKey must be a non-empty base64url string");
+  }
+  pinnedDeviceKeys.set(peerId, devicePublicKeyB64);
+}
+
+/**
+ * Retrieve the pinned device public key for a given peerId, or `null` if not
+ * yet pinned. Returns the base64url-encoded key (32 bytes when decoded).
+ *
+ * Used during handshake verification to ensure the presented device key matches
+ * the SaaS-attested value.
+ *
+ * @param peerId - JWT `sub` claim.
+ * @returns Pinned device key (base64url), or `null` if not found.
+ */
+export function getPinnedDeviceKey(peerId: string): string | null {
+  return pinnedDeviceKeys.get(peerId) ?? null;
+}
+
+/**
+ * Clear all pinned device keys (e.g. on plugin shutdown or reconfiguration).
+ */
+export function clearPinnedDeviceKeys(): void {
+  pinnedDeviceKeys.clear();
+}
+
+/**
+ * Clear pinned device key for a specific peerId (e.g. on targeted revocation).
+ */
+export function clearPinnedDeviceKeyForPeer(peerId: string): void {
+  pinnedDeviceKeys.delete(peerId);
+}
+
 export type ConnectionIdentity = { peerId: string; displayName?: string };
 export type ConnectionVerifier = (
   req: IncomingMessage,
@@ -134,11 +192,19 @@ function readQueryParam(reqUrl: string | undefined, param: string): string | nul
 }
 
 function makeAnonymousVerifier(logger?: AuthLogger): ConnectionVerifier {
-  // Loud opt-in warning (AUTH.md §7): anonymous must never be a quiet default.
-  logger?.warn?.(
-    "webchannel: auth strategy 'anonymous' selected — ALL connections are unauthenticated (single shared peer). Do NOT use in production.",
-  );
-  return async () => ({ peerId: ANON_PEER_ID });
+  // AC 4: Anonymous strategy is now REJECTED to prevent open-admission security hole.
+  // All connections MUST be authenticated with SaaS-attested keys (cnf claim).
+  // Operators must use 'jwt' or 'hmac-ticket' strategy with proper verification.
+  const errorMsg =
+    "webchannel: auth strategy 'anonymous' is disabled — " +
+    "AC 4 requires SaaS-attested device keys (cnf claim). " +
+    "Use 'jwt' strategy with JWKS verification or 'hmac-ticket' strategy. " +
+    "Refusing to start.";
+  logger?.error?.(errorMsg);
+  throw new Error(errorMsg);
+
+  // NOTE: The function never returns a verifier — anonymous admission is a
+  // security violation in Phase B. Callers must use authenticated strategies.
 }
 
 function makeHmacTicketVerifier(
@@ -223,6 +289,13 @@ function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
       clockSkewSec: clockSkew,
     });
     if (!identity) return null;
+
+    // AC 4: Store the SaaS-attested device public key from cnf claim
+    // This key MUST be used during handshake verification to prevent MITM.
+    if (identity.devicePublicKey) {
+      storePinnedDeviceKey(identity.peerId, identity.devicePublicKey);
+    }
+
     return identity.displayName !== undefined
       ? { peerId: identity.peerId, displayName: identity.displayName }
       : { peerId: identity.peerId };
@@ -237,6 +310,9 @@ function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
  * verification would expose every connection to the world — refusing to start is
  * the safe behavior, and the caller (index.ts) lets this propagate so plugin
  * load fails loudly.
+ *
+ * AC 4: 'anonymous' strategy is disabled — only authenticated strategies
+ * ('jwt' with cnf claim, or 'hmac-ticket') are allowed.
  */
 export function resolveVerifier(
   authConfig: AuthConfig | undefined | null,
@@ -244,12 +320,13 @@ export function resolveVerifier(
 ): ConnectionVerifier {
   if (!authConfig || typeof authConfig !== "object" || !("strategy" in authConfig)) {
     throw new Error(
-      "webchannel: channels.webchannel.auth.strategy is required (anonymous | hmac-ticket | jwt). Refusing to start.",
+      "webchannel: channels.webchannel.auth.strategy is required (jwt | hmac-ticket). Refusing to start.",
     );
   }
 
   switch (authConfig.strategy) {
     case "anonymous":
+      // AC 4: Anonymous is now disabled — throw to prevent open-admission hole
       return makeAnonymousVerifier(logger);
     case "hmac-ticket":
       return makeHmacTicketVerifier(authConfig);
@@ -257,7 +334,7 @@ export function resolveVerifier(
       return makeJwtVerifier(authConfig);
     default:
       throw new Error(
-        `webchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected anonymous | hmac-ticket | jwt). Refusing to start.`,
+        `webchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected jwt | hmac-ticket). Refusing to start.`,
       );
   }
 }

@@ -77,14 +77,51 @@ function base64UrlDecode(input: string): Uint8Array {
 }
 
 /**
+ * RFC 7800 §3.2 confirmation method via embedded JWK (`cnf.jwk`).
+ *
+ * For X25519 (OKP) keys the JWK shape is:
+ *   { kty: "OKP", crv: "X25519", x: "<base64url 32-byte public point>" }
+ *
+ * The `d` (private key) field MUST NOT be present — the device private key
+ * must never appear in a JWT.
+ */
+export type CnfJwk = {
+  readonly kty: "OKP";
+  readonly crv: "X25519";
+  /** base64url-encoded 32-byte X25519 public key (Curve25519 u-coordinate). */
+  readonly x: string;
+};
+
+/**
+ * The cnf (confirmation) claim from a verified JWT.
+ *
+ * RFC 7800 defines multiple confirmation methods; this implementation only
+ * accepts the embedded-JWK form (`cnf.jwk`) because:
+ *   - It makes the public key self-contained in the JWT (no key-fetch round-trip).
+ *   - The relay never receives key material (the key is in the VERIFIED JWT).
+ */
+export type CnfClaim = {
+  readonly jwk: CnfJwk;
+};
+
+/**
  * The public identity `verifyJwt` returns. `peerId` is the gateway's session
  * key — it MUST come from a verified claim, not the request URL. `displayName`
  * is best-effort metadata for the chat UI; missing claims simply omit it.
  *
+ * `devicePublicKey` is the X25519 device public key from the cnf.jwk claim,
+ * base64url-encoded. This key is SaaS-attested and MUST be used for ECDH
+ * key exchange — no other device key may be accepted (MITM prevention).
+ *
  * `verifyJwt` returns `null` on ANY failure; the verifier in `auth.ts` is
  * expected to convert null to a connection rejection.
  */
-export type JwtIdentity = { peerId: string; displayName?: string };
+export type JwtIdentity = {
+  peerId: string;
+  displayName?: string;
+  /** Device X25519 public key from cnf.jwk (base64url, 32 bytes when decoded). */
+  devicePublicKey?: string;
+};
 
 export type VerifyJwtOptions = {
   /**
@@ -243,10 +280,57 @@ export async function verifyJwt(
   // sub — non-empty string (peerId).
   if (typeof payload.sub !== "string" || payload.sub.length === 0) return null;
 
+  // ── cnf claim validation (AC 4: SaaS-attested device key) ───────────────
+
+  let devicePublicKeyB64: string | undefined;
+  const cnf = payload.cnf;
+  if (cnf !== undefined && cnf !== null && typeof cnf === "object" && !Array.isArray(cnf)) {
+    const cnfObj = cnf as Record<string, unknown>;
+
+    // Extract cnf.jwk if present
+    const jwk = cnfObj["jwk"];
+    if (jwk !== undefined && jwk !== null && typeof jwk === "object" && !Array.isArray(jwk)) {
+      const jwkObj = jwk as Record<string, unknown>;
+
+      // Validate kty === "OKP"
+      if (jwkObj["kty"] === "OKP" && jwkObj["crv"] === "X25519") {
+        const x = jwkObj["x"];
+        if (typeof x === "string" && x.length > 0) {
+          // Verify no private key present
+          if (jwkObj["d"] === undefined) {
+            // Verify x decodes to exactly 32 bytes
+            try {
+              const decoded = base64UrlDecode(x);
+              if (decoded.length === 32) {
+                devicePublicKeyB64 = x;
+              }
+              // If decoded length != 32, we reject the cnf claim entirely
+            } catch {
+              // Invalid base64url — reject cnf claim
+            }
+          }
+          // If private key present, we reject the cnf claim entirely (security error)
+        }
+        // If x missing/empty, we reject the cnf claim entirely
+      }
+      // If kty/crv don't match, we reject the cnf claim entirely
+    }
+    // If jwk missing/invalid, we reject the cnf claim entirely
+
+    // If cnf claim is present but validation fails, reject the entire JWT
+    // (a malformed cnf is a security issue — we must not admit unverified keys)
+    if (!devicePublicKeyB64) {
+      return null;
+    }
+  }
+  // If cnf is absent, we proceed without device key (backward compatibility,
+  // but the caller should enforce device key attestation in production).
+
   // displayName — best-effort, prefers `name` then `preferred_username`
   // (OIDC convention). Anything else is ignored silently.
   const identity: JwtIdentity = { peerId: payload.sub };
   const dn = payload.name ?? payload.preferred_username;
   if (typeof dn === "string" && dn.length > 0) identity.displayName = dn;
+  if (devicePublicKeyB64) identity.devicePublicKey = devicePublicKeyB64;
   return identity;
 }
