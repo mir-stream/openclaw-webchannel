@@ -1,7 +1,7 @@
 # Phase B — Control-Plane / Onboarding (handoff for the ONBOARDING interview)
 
 > Self-contained state for resuming after a context compaction. Read this first,
-> then run `ooo interview` with `docs/ONBOARDING.md` as the initial context.
+> then run `ooo interview` with `docs/TRUST_AND_ONBOARDING.md` as the initial context.
 
 ## Where we are
 
@@ -10,7 +10,7 @@
   typecheck clean, evaluator verdict **APPROVED 0.86**. Old artifacts (`.ouroboros/pm.md`,
   `seed_e2e_nats_webchannel.yaml`, `RUN_HANDOFF.md`) are the **record of Phase A — keep, do not
   re-run, do not discard.**
-- **Phase B (control plane) = NEXT.** Design source: **`docs/ONBOARDING.md`** (4-party trust
+- **Phase B (control plane) = NEXT.** Design source: **`docs/TRUST_AND_ONBOARDING.md`** (4-party trust
   coupling + onboarding: browser / OpenClaw plugin / NATS / SaaS; SaaS = single trust anchor).
   Phase B builds AROUND the Phase A modules; it is additive, not a rewrite.
 
@@ -53,7 +53,7 @@ Note: the earlier "Phase 2 (real NATS account isolation A/B)" question is **abso
 - `packages/plugin/src/transport.ts` — the gateway-WS path A1 cuts over.
 - `packages/plugin/src/approvals.ts` — `resolveApprovalOverGateway` is the B2 seam.
 
-## Locked design decisions already in ONBOARDING.md (interview should confirm, not re-open)
+## Locked design decisions already in TRUST_AND_ONBOARDING.md (interview should confirm, not re-open)
 
 - NATS auth = **decentralized operator/account JWT + resolver** (not static accounts, not app-level).
 - Enrollment = **RFC 8628 device flow** (plugin is ingress-free → pulls creds at boot; operator approves with one click; no secret paste).
@@ -63,6 +63,6 @@ Note: the earlier "Phase 2 (real NATS account isolation A/B)" question is **abso
 
 ## Next command
 
-`ooo interview`  → feed `docs/ONBOARDING.md` as initial context + the framing paragraph above.
+`ooo interview`  → feed `docs/TRUST_AND_ONBOARDING.md` as initial context + the framing paragraph above.
 (Then `ooo seed` → `ooo run`.) Tenancy / deployment model context: see memory
 `webchannel-deployment-model` and `e2e-nats-relay-seed`.

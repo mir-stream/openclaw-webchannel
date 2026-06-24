@@ -7,3 +7,4 @@ dist-runtime/
 *.log
 .DS_Store
 .idea/
+.claude/

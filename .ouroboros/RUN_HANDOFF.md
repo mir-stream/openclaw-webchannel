@@ -6,7 +6,7 @@
 > **Do NOT re-run this seed.** It is the record of the finished **data plane**.
 >
 > ➡️ **NEXT = PHASE B (control plane / onboarding).** See `.ouroboros/PHASE_B_ONBOARDING.md`
-> and the design source `docs/ONBOARDING.md`. Phase B is a NEW interview/seed scoped to the
+> and the design source `docs/TRUST_AND_ONBOARDING.md`. Phase B is a NEW interview/seed scoped to the
 > trust-chain + onboarding + real-NATS-auth + channel cut-over — it builds AROUND the Phase A
 > modules, it does not replace them.
 >
