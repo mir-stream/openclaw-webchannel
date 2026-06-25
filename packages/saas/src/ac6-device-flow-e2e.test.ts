@@ -52,6 +52,19 @@ let enrollmentServer: ReturnType<typeof spawn> | null = null;
 let bootstrapServer: ReturnType<typeof spawn> | null = null;
 let natsServer: ReturnType<typeof spawn> | null = null;
 
+// Resolve the tsx binary from node_modules (a bare `npx tsx` is flaky under a
+// spawned shell — it may miss the cache and report "command not found").
+const TSX_BIN = (() => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const p of [
+    join(here, "../node_modules/.bin/tsx"),
+    join(here, "../../../node_modules/.bin/tsx"),
+  ]) {
+    if (existsSync(p)) return p;
+  }
+  return "tsx";
+})();
+
 /**
  * Poll an HTTP endpoint until it responds (any status) or the timeout elapses.
  * Replaces fixed sleeps so spawned servers are awaited deterministically.
@@ -81,7 +94,7 @@ async function startEnrollmentServer(): Promise<void> {
   );
 
   // The reference servers are TypeScript — run them through tsx, not bare node.
-  enrollmentServer = spawn("npx", ["tsx", serverPath], {
+  enrollmentServer = spawn(TSX_BIN, [serverPath], {
     cwd: dirname(fileURLToPath(import.meta.url)),
     env: {
       ...process.env,
@@ -95,7 +108,7 @@ async function startEnrollmentServer(): Promise<void> {
     stdio: "pipe",
   });
 
-  await waitForHttp(`${SAAS_BASE_URL}/enroll`, 10_000);
+  await waitForHttp(`${SAAS_BASE_URL}/enroll`, 30_000);
 
   if (!enrollmentServer.pid) {
     throw new Error("Failed to start enrollment server");
@@ -113,7 +126,7 @@ async function startBootstrapServer(): Promise<void> {
     "../reference/bootstrap-server.ts",
   );
 
-  bootstrapServer = spawn("npx", ["tsx", serverPath], {
+  bootstrapServer = spawn(TSX_BIN, [serverPath], {
     cwd: dirname(fileURLToPath(import.meta.url)),
     env: {
       ...process.env,
@@ -123,7 +136,7 @@ async function startBootstrapServer(): Promise<void> {
     stdio: "pipe",
   });
 
-  await waitForHttp(`${BOOTSTRAP_BASE_URL}/.well-known/jwks.json`, 10_000);
+  await waitForHttp(`${BOOTSTRAP_BASE_URL}/.well-known/jwks.json`, 30_000);
 
   if (!bootstrapServer.pid) {
     throw new Error("Failed to start bootstrap server");
@@ -269,7 +282,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
 
     // Additional wait for servers to be fully ready
     await setTimeout(1000);
-  }, 30_000);
+  }, 60_000);
 
   afterAll(() => {
     stopAllServers();
