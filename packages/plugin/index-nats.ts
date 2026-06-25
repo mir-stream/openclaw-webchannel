@@ -28,6 +28,7 @@ import type { AuthConfig } from "./src/auth.js";
 import { createStaticAssetsHandler } from "./src/static-assets.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { WEBCHANNEL_ID } from "./src/transport.js";
+import type { WebChannelTransport } from "./src/transport.js";
 import { NatsTransport } from "./src/nats-transport.js";
 import { createEnrolledNatsConnection, type EnrolledNatsConnection } from "./src/enrolled-nats-connection.js";
 
@@ -54,13 +55,30 @@ let natsChannel: NatsChannel | null = null;
 let natsConnection: EnrolledNatsConnection | null = null;
 
 /**
- * Create the WebChannel plugin with NATS transport.
+ * Lazy transport facade.
+ *
+ * `createWebChannelPlugin` needs a transport at module-load time, but in NATS
+ * mode the real `NatsChannel` only exists after enrollment (inside
+ * `registerFull`). This Proxy forwards every transport method call to the live
+ * `NatsChannel` once it is bound; before binding, method calls are no-ops
+ * returning `false`. `NatsChannel` implements the outbound surface the plugin's
+ * message/outbound adapters use (sendText, sendTextToAnyOpen, sendProgress,
+ * finalizeDraft, sendTyping, sendApprovalRequest/Resolved).
  */
-const webChannelPlugin = createWebChannelPlugin(
-  // Adapter to make NatsChannel compatible with existing plugin interface
-  // The plugin expects a transport-like interface; we adapt NatsChannel
-  null as any, // We'll handle this differently in NATS mode
-);
+let boundChannel: NatsChannel | null = null;
+const lazyTransport = new Proxy({} as Record<string, unknown>, {
+  get(_t, prop) {
+    const target = boundChannel as unknown as Record<string, unknown> | null;
+    if (!target) return () => false;
+    const value = target[prop as string];
+    return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+  },
+}) as unknown as WebChannelTransport;
+
+/**
+ * Create the WebChannel plugin, backed by the lazy NATS transport facade.
+ */
+const webChannelPlugin = createWebChannelPlugin(lazyTransport);
 
 export default defineChannelPluginEntry({
   id: "webchannel-nats",
@@ -115,6 +133,9 @@ export default defineChannelPluginEntry({
       const tenant = natsConnection.tenant ?? "default-tenant";
 
       natsChannel = new NatsChannel(transport, agentId, tenant);
+      // Bind the live channel into the lazy transport facade so the plugin's
+      // outbound/message/approval adapters now route to NATS.
+      boundChannel = natsChannel;
       console.log("[webchannel] ✓ NATS channel created");
     }
 
@@ -124,13 +145,21 @@ export default defineChannelPluginEntry({
     // Step 3: Wire up inbound message dispatcher
     // -----------------------------------------------------------------------
 
+    // Bridge inbound NATS messages into the OpenClaw agent runtime — the same
+    // seam the WS entry (index.ts) uses. `handleInboundMessage` runs the turn
+    // through `api.runtime.channel.inbound.run` (which reaches the model) and
+    // delivers the agent's reply back via `channel.sendText` (NatsChannel
+    // satisfies the transport surface it touches: sendTyping + sendText).
+    // Serialized per-peer so two turns for one peer never interleave.
     const { dispatch: dispatchInbound } = createSerializedInboundDispatcher<
       Extract<InboundWsMessage, { type: "user_message" }>
     >((peerId, message) =>
-      // In NATS mode, we need to adapt the message handling
-      // The original handleInboundMessage expects WebChannelTransport
-      // We'll need to create an adapter or modify the function
-      console.log("[webchannel] TODO: handle inbound message for peer", peerId),
+      handleInboundMessage(
+        api,
+        channel as unknown as WebChannelTransport,
+        peerId,
+        message,
+      ),
     );
 
     channel.setMessageHandler((peerId, message) => {

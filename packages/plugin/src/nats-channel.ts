@@ -119,6 +119,19 @@ export class NatsChannel {
   }
 
   /**
+   * Send text to the single registered peer, when exactly one is connected.
+   *
+   * Mirrors WebChannelTransport.sendTextToAnyOpen: the outbound seam falls back
+   * here for core-initiated (untargeted) sends. With one peer (the common single
+   * web user) we deliver; with zero or many we refuse to guess and return false.
+   */
+  sendTextToAnyOpen(text: string): boolean {
+    if (this.peerSubscriptions.size !== 1) return false;
+    const [peerId] = this.peerSubscriptions.keys();
+    return this.sendText(peerId, text);
+  }
+
+  /**
    * Send progress update to peer.
    */
   sendProgress(peerId: string, id: string, text: string): boolean {
