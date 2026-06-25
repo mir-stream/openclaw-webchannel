@@ -74,8 +74,8 @@ const enrollment = new DeviceFlowEnrollment({
   saasBaseUrl: SAAS_BASE_URL,
   jwksUrl: `${SAAS_BASE_URL}/.well-known/jwks.json`,
   bootstrapUrl: `${SAAS_BASE_URL}/bootstrap`,
-  expirationSeconds: 600,
-  pollIntervalSeconds: 5,
+  expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
+  pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 5),
   store: enrollmentStore,
 });
 

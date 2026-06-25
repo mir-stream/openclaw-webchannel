@@ -32,24 +32,34 @@ import { getApprovalResolution, clearApprovalResolutions } from "./nats-channel.
  * This is a simplified version of the broker from nats-subject-permissions.test.ts,
  * adapted for the NATS cutover E2E test.
  */
+/** A single registered subscription: subject (may end in `>`/`*`) + its sid. */
+type Subscription = { subject: string; sid: string };
+
 class PermissionedFakeNatsBroker {
   private readonly server: WebSocketServer;
   private readonly connections = new Set<WebSocket>();
-  private readonly permissions = new Map<WebSocket, string>(); // ws -> tenant pattern
+  private readonly permissions = new Map<WebSocket, string>(); // ws -> pub-allow pattern
+  private readonly subs = new Map<WebSocket, Subscription[]>(); // ws -> subscriptions
+  private readonly buffers = new Map<WebSocket, string>(); // ws -> partial wire buffer
 
   constructor(port: number) {
     this.server = new WebSocketServer({ port, host: "127.0.0.1" });
 
     this.server.on("connection", (ws: WebSocket) => {
       this.connections.add(ws);
+      this.subs.set(ws, []);
+      this.buffers.set(ws, "");
 
       ws.on("message", (data: Buffer) => {
-        this.handleMessage(ws, data.toString("utf8"));
+        this.buffers.set(ws, (this.buffers.get(ws) ?? "") + data.toString("utf8"));
+        this.drain(ws);
       });
 
       ws.on("close", () => {
         this.connections.delete(ws);
         this.permissions.delete(ws);
+        this.subs.delete(ws);
+        this.buffers.delete(ws);
       });
 
       // Send INFO
@@ -57,57 +67,100 @@ class PermissionedFakeNatsBroker {
     });
   }
 
-  private handleMessage(ws: WebSocket, data: string): void {
-    const lines = data.split("\r\n");
-    for (const line of lines) {
-      if (!line) continue;
+  /** Parse the per-connection buffer line-by-line, consuming PUB payloads. */
+  private drain(ws: WebSocket): void {
+    let buffer = this.buffers.get(ws) ?? "";
+    let nl: number;
+    while ((nl = buffer.indexOf("\r\n")) !== -1) {
+      const line = buffer.slice(0, nl);
 
-      if (line.startsWith("CONNECT ")) {
-        // Extract JWT and tenant
-        const jsonStr = line.slice(8);
-        try {
-          const connect = JSON.parse(jsonStr);
-          const jwt = connect.jwt as string | undefined;
-          if (jwt) {
-            // Decode JWT (simplified - just extract tenant)
-            const parts = jwt.split(".");
-            if (parts.length === 3) {
-              const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
-              const tenant = (payload as { tenant?: string }).tenant ?? "default";
-              this.permissions.set(ws, `chat.${tenant}.>`);
-            }
-          }
-        } catch {
-          // Invalid JSON - ignore
-        }
-        this.sendLine(ws, "PONG");
-      } else if (line === "PING") {
-        this.sendLine(ws, "PONG");
-      } else if (line.startsWith("PUB ")) {
-        // Check permissions
+      if (line.startsWith("PUB ")) {
+        // PUB <subject> <bytes>\r\n<payload>\r\n — need the full payload buffered.
         const parts = line.split(" ");
-        const subject = parts[1];
-        const pattern = this.permissions.get(ws);
-        if (pattern && !this.subjectMatches(subject, pattern)) {
-          this.sendLine(ws, `-ERR 'Permissions Violation for Publish to "${subject}"'`);
-          return;
+        const subject = parts[1]!;
+        const byteCount = parseInt(parts[parts.length - 1] ?? "0", 10);
+        const headerEnd = nl + 2;
+        if (buffer.length < headerEnd + byteCount + 2) break; // wait for more data
+        const payload = buffer.slice(headerEnd, headerEnd + byteCount);
+        buffer = buffer.slice(headerEnd + byteCount + 2);
+        this.handlePub(ws, subject, payload);
+        continue;
+      }
+
+      // Plain control line.
+      buffer = buffer.slice(nl + 2);
+      this.handleLine(ws, line);
+    }
+    this.buffers.set(ws, buffer);
+  }
+
+  private handleLine(ws: WebSocket, line: string): void {
+    if (!line) return;
+
+    if (line.startsWith("CONNECT ")) {
+      try {
+        const connect = JSON.parse(line.slice(8));
+        const jwt = connect.jwt as string | undefined;
+        if (jwt) {
+          const parts = jwt.split(".");
+          // jwtCredential in these tests is a single base64url JSON segment.
+          const seg = parts.length === 3 ? parts[1]! : parts[0]!;
+          const payload = JSON.parse(Buffer.from(seg, "base64url").toString());
+          const tenant = (payload as { tenant?: string }).tenant ?? "default";
+          this.permissions.set(ws, `webchannel.${tenant}.>`);
         }
-        // In a real server, we would deliver to subscribers
-        // For this test, we just echo back to the sender for simplicity
-        this.sendLine(ws, "+OK");
-      } else if (line.startsWith("SUB ")) {
-        this.sendLine(ws, "+OK");
+      } catch {
+        // Invalid JSON - ignore
+      }
+      this.sendLine(ws, "PONG");
+    } else if (line === "PING") {
+      this.sendLine(ws, "PONG");
+    } else if (line.startsWith("SUB ")) {
+      // SUB <subject> <sid>
+      const parts = line.split(" ");
+      const subject = parts[1]!;
+      const sid = parts[2] ?? "0";
+      this.subs.get(ws)?.push({ subject, sid });
+      this.sendLine(ws, "+OK");
+    } else if (line.startsWith("UNSUB ")) {
+      const sid = line.split(" ")[1];
+      const list = this.subs.get(ws);
+      if (list) this.subs.set(ws, list.filter((s) => s.sid !== sid));
+    }
+  }
+
+  private handlePub(ws: WebSocket, subject: string, payload: string): void {
+    const pattern = this.permissions.get(ws);
+    if (pattern && !this.subjectMatches(subject, pattern)) {
+      this.sendLine(ws, `-ERR 'Permissions Violation for Publish to "${subject}"'`);
+      return;
+    }
+    this.sendLine(ws, "+OK");
+    // Fan out to every matching subscription on every connection.
+    for (const conn of this.connections) {
+      for (const sub of this.subs.get(conn) ?? []) {
+        if (this.subjectMatches(subject, sub.subject)) {
+          this.sendLine(
+            conn,
+            `MSG ${subject} ${sub.sid} ${Buffer.byteLength(payload)}\r\n${payload}`,
+          );
+        }
       }
     }
   }
 
   private subjectMatches(subject: string, pattern: string): boolean {
     if (pattern === subject) return true;
-    if (pattern.endsWith(">")) {
-      const prefix = pattern.slice(0, -1);
-      return subject.startsWith(prefix) && subject.length > prefix.length;
+    const subTokens = subject.split(".");
+    const patTokens = pattern.split(".");
+    for (let i = 0; i < patTokens.length; i++) {
+      const p = patTokens[i];
+      if (p === ">") return true; // matches the rest
+      if (i >= subTokens.length) return false;
+      if (p === "*") continue; // matches one token
+      if (p !== subTokens[i]) return false;
     }
-    return false;
+    return subTokens.length === patTokens.length;
   }
 
   private sendLine(ws: WebSocket, line: string): void {

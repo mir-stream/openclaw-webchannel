@@ -53,6 +53,25 @@ let bootstrapServer: ReturnType<typeof spawn> | null = null;
 let natsServer: ReturnType<typeof spawn> | null = null;
 
 /**
+ * Poll an HTTP endpoint until it responds (any status) or the timeout elapses.
+ * Replaces fixed sleeps so spawned servers are awaited deterministically.
+ */
+async function waitForHttp(url: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastErr: unknown;
+  while (Date.now() < deadline) {
+    try {
+      await fetch(url, { method: "GET" });
+      return; // any HTTP response (even 4xx) means the server is up
+    } catch (err) {
+      lastErr = err;
+      await setTimeout(150);
+    }
+  }
+  throw new Error(`Timed out waiting for ${url}: ${String(lastErr)}`);
+}
+
+/**
  * Start the enrollment HTTP server.
  */
 async function startEnrollmentServer(): Promise<void> {
@@ -61,18 +80,22 @@ async function startEnrollmentServer(): Promise<void> {
     "../reference/enrollment-server.ts",
   );
 
-  enrollmentServer = spawn("node", ["--experimental-modules", serverPath], {
+  // The reference servers are TypeScript — run them through tsx, not bare node.
+  enrollmentServer = spawn("npx", ["tsx", serverPath], {
+    cwd: dirname(fileURLToPath(import.meta.url)),
     env: {
       ...process.env,
       PORT: String(ENROLLMENT_SERVER_PORT),
       SAAS_BASE_URL: SAAS_BASE_URL,
       NATS_URL: "ws://localhost:4222",
+      // Poll instantly in tests so the flow doesn't wait the RFC 8628 5s interval.
+      POLL_INTERVAL_SECONDS: "0",
+      EXPIRATION_SECONDS: "600",
     },
     stdio: "pipe",
   });
 
-  // Wait for server to start
-  await setTimeout(2000);
+  await waitForHttp(`${SAAS_BASE_URL}/enroll`, 10_000);
 
   if (!enrollmentServer.pid) {
     throw new Error("Failed to start enrollment server");
@@ -90,7 +113,8 @@ async function startBootstrapServer(): Promise<void> {
     "../reference/bootstrap-server.ts",
   );
 
-  bootstrapServer = spawn("node", ["--experimental-modules", serverPath], {
+  bootstrapServer = spawn("npx", ["tsx", serverPath], {
+    cwd: dirname(fileURLToPath(import.meta.url)),
     env: {
       ...process.env,
       PORT: String(BOOTSTRAP_SERVER_PORT),
@@ -99,8 +123,7 @@ async function startBootstrapServer(): Promise<void> {
     stdio: "pipe",
   });
 
-  // Wait for server to start
-  await setTimeout(2000);
+  await waitForHttp(`${BOOTSTRAP_BASE_URL}/.well-known/jwks.json`, 10_000);
 
   if (!bootstrapServer.pid) {
     throw new Error("Failed to start bootstrap server");
@@ -161,12 +184,15 @@ async function postJson(url: string, body: unknown): Promise<unknown> {
     body: JSON.stringify(body),
   });
 
-  if (!response.ok) {
-    const text = await response.text();
+  // RFC 8628 device flow returns 400 + a JSON `{error}` body for pending/denied
+  // poll results — those are valid responses, not transport failures. Return any
+  // JSON body regardless of status; only throw when the body isn't JSON.
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
     throw new Error(`HTTP ${response.status}: ${text}`);
   }
-
-  return response.json();
 }
 
 /**
@@ -243,7 +269,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
 
     // Additional wait for servers to be fully ready
     await setTimeout(1000);
-  });
+  }, 30_000);
 
   afterAll(() => {
     stopAllServers();
@@ -254,7 +280,8 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
   // -------------------------------------------------------------------------
 
   it("should have enrollment server running", async () => {
-    const response = await fetch(SAAS_BASE_URL);
+    // The reference server has no `/` route; probe a real endpoint instead.
+    const response = await fetch(`${SAAS_BASE_URL}/enroll`);
     expect(response.ok).toBe(true);
   });
 
@@ -263,7 +290,8 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
   // -------------------------------------------------------------------------
 
   it("should have bootstrap server running", async () => {
-    const response = await fetch(BOOTSTRAP_BASE_URL);
+    // No `/` route on the reference server; the JWKS endpoint is always GET-able.
+    const response = await fetch(`${BOOTSTRAP_BASE_URL}/.well-known/jwks.json`);
     expect(response.ok).toBe(true);
   });
 
@@ -508,8 +536,8 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
 
     expect(denyResponse.success).toBe(true);
 
-    // Poll should return access_denied
-    await setTimeout(5000); // Wait for poll interval
+    // Poll should return access_denied (poll interval is 0 in tests)
+    await setTimeout(50);
 
     const pollResponse = await postJson(`${SAAS_BASE_URL}/api/poll`, {
       device_code,
@@ -567,8 +595,8 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       user_code: enroll1.user_code,
     });
 
-    // Poll plugin 1 should succeed
-    await setTimeout(5000);
+    // Poll plugin 1 should succeed (poll interval is 0 in tests)
+    await setTimeout(50);
     const poll1 = await postJson(`${SAAS_BASE_URL}/api/poll`, {
       device_code: enroll1.device_code,
     });
@@ -607,13 +635,15 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       device_code: string;
     };
 
-    // Wait for expiration
-    await setTimeout(2000);
-
-    // Try to approve after expiration - should fail
-    const approveResponse = await postJson(`${SAAS_BASE_URL}/approve`, {
-      user_code: "EXPIRED-CODE",
+    // Approving an unknown/expired user_code returns success:false with a 404,
+    // so call fetch directly (postJson throws on non-2xx).
+    const approveRaw = await fetch(`${SAAS_BASE_URL}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_code: "EXPIRED-CODE" }),
     });
+    expect(approveRaw.status).toBe(404);
+    const approveResponse = await approveRaw.json();
 
     // Approval should fail (not found or expired)
     expect(approveResponse).toMatchObject({
@@ -653,8 +683,8 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       user_code: enrollResponse.user_code,
     });
 
-    // Step 3: Poll for credentials
-    await setTimeout(5000);
+    // Step 3: Poll for credentials (poll interval is 0 in tests)
+    await setTimeout(50);
     const pollResponse = await postJson(`${SAAS_BASE_URL}/api/poll`, {
       device_code: enrollResponse.device_code,
     }) as {
