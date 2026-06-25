@@ -15,21 +15,17 @@
 import type {
   WebChannelOptions,
   WebChannelState,
-  ConnectionStatus,
   Listener,
   ApprovalDecision,
+  ApprovalOption,
   ChatMessage,
   ApprovalRequest,
 } from "./types.js";
 import {
   WebChannelNatsClient,
-  inboundSubject,
-  outboundSubject,
   type NatsClientOptions,
   type InboundMessage,
-  type OutboundMessage,
 } from "./nats-client.js";
-import type { HistoryMessage } from "./transport.js";
 
 // ---------------------------------------------------------------------------
 // WebChannel NATS Client
@@ -42,7 +38,6 @@ import type { HistoryMessage } from "./transport.js";
  * Uses NATS subjects for per-peer messaging instead of gateway-WS relay.
  */
 export class WebChannelNATSClient {
-  private readonly options: WebChannelOptions;
   private readonly natsOptions: NatsClientOptions;
   private readonly client: WebChannelNatsClient;
 
@@ -56,7 +51,6 @@ export class WebChannelNATSClient {
   private readonly listeners = new Set<Listener>();
 
   constructor(options: WebChannelOptions & NatsClientOptions) {
-    this.options = options;
     this.natsOptions = {
       url: options.natsUrl ?? "wss://nats.example.com",
       jwt: options.bootstrapJwt ?? "",
@@ -222,7 +216,7 @@ export class WebChannelNATSClient {
           title: msg.title ?? "",
           description: msg.description,
           prompt: msg.prompt ?? "",
-          options: msg.options ?? [],
+          options: (msg.options ?? []) as ApprovalOption[],
           expiresAtMs: msg.expiresAtMs,
         };
 
@@ -243,17 +237,19 @@ export class WebChannelNATSClient {
       }
 
       case "approval_resolved": {
-        const { id, decision } = msg;
+        const id = msg.id ?? "";
+        const decision = msg.decision as ApprovalDecision | undefined;
         this.patchApproval(id, (a) => ({ ...a, resolvedDecision: decision }));
         return;
       }
 
       case "progress": {
-        const { id, text } = msg;
+        const { id } = msg;
+        const text = msg.text ?? "";
         this.upsertMessage(
           id ?? "",
           (prev) => ({ ...prev, text, working: true }),
-          { id: id ?? "", role: "agent", text: text ?? "", working: true },
+          { id: id ?? "", role: "agent", text, working: true },
         );
         this.setState({ isTyping: false });
         return;
@@ -283,21 +279,3 @@ export class WebChannelNATSClient {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Extended types for NATS client
-// ---------------------------------------------------------------------------
-
-declare module "./types.js" {
-  interface WebChannelOptions {
-    /** NATS WebSocket URL */
-    natsUrl?: string;
-    /** Bootstrap JWT (RS256-signed) */
-    bootstrapJwt?: string;
-    /** Agent ID (from JWT) */
-    agentId?: string;
-    /** Tenant ID (from JWT) */
-    tenant?: string;
-    /** Peer ID (JWT sub claim) */
-    peerId?: string;
-  }
-}

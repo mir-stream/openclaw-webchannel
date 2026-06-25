@@ -456,14 +456,16 @@ export class DeviceFlowEnrollment {
         true,
         ["sign", "verify"],
       );
+      if (!("publicKey" in keypair)) {
+        throw new Error("Expected CryptoKeyPair from Ed25519 generateKey");
+      }
 
-      // Export the private key seed (32 bytes for Ed25519)
-      const seedBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.privateKey);
-      const seedBase32 = this.encodeNatsBase32(seedBuffer);
+      // Export the private key seed — OKP raw export unsupported, use JWK 'd'
+      const seedBase32 = this.encodeNatsBase32(await this.exportOkpPrivateSeed(keypair.privateKey));
 
       // Export the public key (32 bytes for Ed25519)
       const publicBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.publicKey);
-      const publicBase32 = this.encodeNatsBase32(publicBuffer);
+      const publicBase32 = this.encodeNatsBase32(new Uint8Array(publicBuffer));
 
       // NATS user seed format: "U" + encoded seed (truncated to 22 chars for NATS compatibility)
       // NATS user public format: "U" + encoded public key (truncated to 22 chars)
@@ -482,12 +484,14 @@ export class DeviceFlowEnrollment {
         true,
         ["deriveKey", "deriveBits"],
       );
+      if (!("publicKey" in keypair)) {
+        throw new Error("Expected CryptoKeyPair from X25519 generateKey");
+      }
 
-      const seedBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.privateKey);
-      const seedBase32 = this.encodeNatsBase32(seedBuffer);
+      const seedBase32 = this.encodeNatsBase32(await this.exportOkpPrivateSeed(keypair.privateKey));
 
       const publicBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.publicKey);
-      const publicBase32 = this.encodeNatsBase32(publicBuffer);
+      const publicBase32 = this.encodeNatsBase32(new Uint8Array(publicBuffer));
 
       const seed = `U${seedBase32.substring(0, 22)}`;
       const publicKey = `U${publicBase32.substring(0, 22)}`;
@@ -608,6 +612,25 @@ export class DeviceFlowEnrollment {
       );
       return `${signingInput}.${signature}`;
     }
+  }
+
+  /**
+   * Extract the 32-byte private scalar from an Ed25519/X25519 private key.
+   *
+   * WebCrypto does not support `exportKey("raw", privateKey)` for OKP curves;
+   * the seed is exposed as the base64url `d` parameter of the JWK form.
+   */
+  private async exportOkpPrivateSeed(privateKey: CryptoKey): Promise<Uint8Array> {
+    const jwk = await globalThis.crypto.subtle.exportKey("jwk", privateKey);
+    if (!jwk.d) {
+      throw new Error("OKP private key JWK is missing the 'd' (seed) parameter");
+    }
+    const b64 = jwk.d.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
   }
 
   /**

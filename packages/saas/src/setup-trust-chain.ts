@@ -30,6 +30,7 @@ import type {
   SetupTrustChainResult,
   SaasTrustChainPrivate,
   NatsAccountConfig,
+  NatsResolverConfig,
   JwksDocument,
   JwkRsaPublicKey,
 } from "./types.js";
@@ -83,10 +84,13 @@ async function generateRsaKeypair(
     true,
     ["sign", "verify"],
   );
+  if (!("publicKey" in keypair)) {
+    throw new Error("Expected CryptoKeyPair from RSA generateKey");
+  }
 
   // Export private key as PKCS#8 PEM
   const privateKeyBuffer = await globalThis.crypto.subtle.exportKey("pkcs8", keypair.privateKey);
-  const privateKeyBase64 = bufferToBase64(privateKeyBuffer);
+  const privateKeyBase64 = bufferToBase64(new Uint8Array(privateKeyBuffer));
   const privateKeyPem = `-----BEGIN PRIVATE KEY-----\n${chunk(privateKeyBase64, 64)}\n-----END PRIVATE KEY-----`;
 
   // Export public key as JWK for JWKS
@@ -199,14 +203,16 @@ async function generateNkeySeed(): Promise<{ seed: string; publicKey: string }> 
       true,
       ["sign", "verify"],
     );
+    if (!("publicKey" in keypair)) {
+      throw new Error("Expected CryptoKeyPair from Ed25519 generateKey");
+    }
 
-    // Export seed (private key)
-    const seedBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.privateKey);
-    const seedBase32 = encodeNkeyBase32(seedBuffer);
+    // Export seed (private key) — OKP raw export is unsupported, use JWK 'd'
+    const seedBase32 = encodeNkeyBase32(await exportOkpPrivateSeed(keypair.privateKey));
 
     // Export public key
     const publicBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.publicKey);
-    const publicBase32 = encodeNkeyBase32(publicBuffer);
+    const publicBase32 = encodeNkeyBase32(new Uint8Array(publicBuffer));
 
     // NATS NKEY seed format: "SA" + encoded seed
     // NATS NKEY public format: "SA" + encoded public key
@@ -224,20 +230,47 @@ async function generateNkeySeed(): Promise<{ seed: string; publicKey: string }> 
       true,
       ["deriveKey", "deriveBits"],
     );
+    if (!("publicKey" in keypair)) {
+      throw new Error("Expected CryptoKeyPair from X25519 generateKey");
+    }
 
-    // Export private key
-    const seedBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.privateKey);
-    const seedBase32 = encodeNkeyBase32(seedBuffer);
+    // Export private key — OKP raw export is unsupported, use JWK 'd'
+    const seedBase32 = encodeNkeyBase32(await exportOkpPrivateSeed(keypair.privateKey));
 
     // Export public key
     const publicBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.publicKey);
-    const publicBase32 = encodeNkeyBase32(publicBuffer);
+    const publicBase32 = encodeNkeyBase32(new Uint8Array(publicBuffer));
 
     const seed = `SA${seedBase32}`;
     const publicKey = `SA${publicBase32}`;
 
     return { seed, publicKey };
   }
+}
+
+/**
+ * Extract the 32-byte private scalar (seed) from an Ed25519/X25519 private key.
+ *
+ * WebCrypto does NOT support `exportKey("raw", privateKey)` for OKP curves
+ * (only `"pkcs8"` / `"jwk"`). The JWK form exposes the raw seed in the
+ * base64url-encoded `d` parameter, so we export as JWK and decode `d`.
+ */
+async function exportOkpPrivateSeed(privateKey: CryptoKey): Promise<Uint8Array> {
+  const jwk = await globalThis.crypto.subtle.exportKey("jwk", privateKey);
+  if (!jwk.d) {
+    throw new Error("OKP private key JWK is missing the 'd' (seed) parameter");
+  }
+  return base64UrlToBytes(jwk.d);
+}
+
+/** Decode a base64url string (no padding) to bytes. */
+function base64UrlToBytes(b64url: string): Uint8Array {
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 /**
@@ -368,10 +401,9 @@ export async function setupTrustChain(
   // Step 1: Generate RSA keypair for bootstrap JWT signing
   // -----------------------------------------------------------------------
 
-  const { privateKeyPem, publicKeyJwk, kid } = await generateRsaKeypair(rsaKeySize);
-  if (providedKid) {
-    publicKeyJwk.kid = providedKid;
-  }
+  const { privateKeyPem, publicKeyJwk, kid: generatedKid } = await generateRsaKeypair(rsaKeySize);
+  const kid = providedKid ?? generatedKid;
+  publicKeyJwk.kid = kid;
 
   // -----------------------------------------------------------------------
   // Step 2: Generate NKEY seed for NATS account signing

@@ -366,7 +366,7 @@ export async function verifyJwtAndExtractPeerId(
     throw new Error(`webchannel: cannot verify JWT with strategy "${authConfig.strategy}" (expected "jwt")`);
   }
 
-  const jwtCfg = authConfig as { jwt?: JwtAuthConfig };
+  const jwtCfg: JwtAuthConfig = authConfig;
 
   if (!jwtCfg.jwt || typeof jwtCfg.jwt !== "object") {
     throw new Error("webchannel: auth.jwt block is required for JWT verification");

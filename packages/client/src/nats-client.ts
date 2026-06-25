@@ -253,7 +253,6 @@ export class NatsClient {
   private handleMessage(line: string): void {
     const parts = line.split(" ");
     const hasReplyTo = parts.length === 5;
-    const subject = parts[1] ?? "";
     const byteCount = parseInt(parts[hasReplyTo ? 4 : 3] ?? "0", 10);
 
     if (isNaN(byteCount) || byteCount < 0) return;
@@ -385,6 +384,7 @@ export class WebChannelNatsClient {
 
   /** Disconnect from NATS */
   disconnect(): void {
+    this.client.unsubscribe(this.inboundSub);
     this.client.disconnect();
   }
 

@@ -38,16 +38,15 @@ describe("resolveVerifier safe default", () => {
 });
 
 describe("anonymous strategy", () => {
-  it("returns the anon peer and emits a loud warning", async () => {
-    const warn = vi.fn();
-    const logger: AuthLogger = { warn };
-    const verifier = resolveVerifier({ strategy: "anonymous" }, logger);
+  it("is rejected (AC4): refuses to start and logs an error", () => {
+    const error = vi.fn();
+    const logger: AuthLogger = { error };
 
-    expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0][0]).toMatch(/anonymous/i);
-
-    const identity = await verifier(fakeReq("/webchannel/ws"));
-    expect(identity).toEqual({ peerId: ANON_PEER_ID });
+    // AC 4: anonymous admission is a security hole — resolving the verifier
+    // must throw rather than hand back an open-admission peer.
+    expect(() => resolveVerifier({ strategy: "anonymous" }, logger)).toThrow(/anonymous/i);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error.mock.calls[0][0]).toMatch(/anonymous/i);
   });
 });
 

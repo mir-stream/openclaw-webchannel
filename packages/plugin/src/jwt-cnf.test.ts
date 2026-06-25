@@ -12,10 +12,10 @@
 
 import { describe, it, expect, beforeEach } from "vitest";
 import { verifyJwt, type CnfJwk, type CnfClaim } from "./jwt.js";
-import { JWKSCache } from "./jwks.js";
+import { JWKSCache, type KeyResolver, type JsonWebKey } from "./jwks.js";
 
 // Mock JWKS cache that returns a fixed test key
-class MockJWKSCache implements JWKSCache {
+class MockJWKSCache implements KeyResolver {
   constructor(private readonly testKey: JsonWebKey) {}
 
   async getKey(_kid: string): Promise<JsonWebKey> {
@@ -117,7 +117,7 @@ describe("JWT cnf claim validation (AC 4)", () => {
     expect(validCnf.jwk.kty).toBe("OKP");
     expect(validCnf.jwk.crv).toBe("X25519");
     expect(validCnf.jwk.x).toBeTruthy();
-    expect(validCnf.jwk.d).toBeUndefined(); // No private key
+    expect((validCnf.jwk as Record<string, unknown>).d).toBeUndefined(); // No private key
   });
 
   it("should reject cnf.jwk with kty other than OKP", () => {
@@ -170,7 +170,7 @@ describe("JWT cnf claim validation (AC 4)", () => {
     };
 
     // This would be rejected during JWT verification
-    expect(invalidCnf.jwk.x).toBeUndefined();
+    expect((invalidCnf.jwk as Record<string, unknown>).x).toBeUndefined();
   });
 
   it("should accept JWT without cnf claim (backward compatibility)", async () => {

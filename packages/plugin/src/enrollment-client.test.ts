@@ -32,6 +32,7 @@ const createTestOptions = (override?: Partial<EnrollmentOptions>): EnrollmentOpt
   agentId: "test-agent",
   credentialPath: join(tmpdir(), `openclaw-test-${Date.now()}`, "credentials.json"),
   displayInstructions: false,
+  _minPollIntervalMs: 0,
   ...override,
 });
 
@@ -44,10 +45,13 @@ describe("EnrollmentClient", () => {
   let credentialPath: string;
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    // mockReset (not clearAllMocks) also drains any leftover mockResolvedValueOnce
+    // queue so an unconsumed response can't leak into the next test's enroll call.
+    mockFetch.mockReset();
+    global.fetch = mockFetch;
 
     const options = createTestOptions();
-    credentialPath = options.credentialPath;
+    credentialPath = options.credentialPath!;
     client = new EnrollmentClient(options);
 
     // Ensure credential directory exists
@@ -62,7 +66,7 @@ describe("EnrollmentClient", () => {
     const dir = require("node:path").dirname(credentialPath);
     if (existsSync(dir)) {
       rmSync(dir, { recursive: true, force: true });
-    });
+    }
   });
 
   describe("enroll() - first boot", () => {
@@ -124,47 +128,60 @@ describe("EnrollmentClient", () => {
     });
 
     it("should poll for approval with correct interval", async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          device_code: "test_device_code",
-          user_code: "ABCD-1234",
-          verification_uri: "https://saas.com/enroll",
-          verification_uri_complete: "https://saas.com/enroll?user_code=ABCD-1234",
-          expires_in: 600,
-          interval: 5,
-        }),
-      });
+      // This test asserts the RFC 8628 5s interval floor, so it uses the real
+      // production floor (overriding the test default of 0) and fake timers to
+      // advance virtual time without waiting real seconds.
+      vi.useFakeTimers();
+      try {
+        const intervalClient = new EnrollmentClient(
+          createTestOptions({ _minPollIntervalMs: 5000 }),
+        );
 
-      // First poll: pending
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          error: "authorization_pending",
-        }),
-      });
+        mockFetch.mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            device_code: "test_device_code",
+            user_code: "ABCD-1234",
+            verification_uri: "https://saas.com/enroll",
+            verification_uri_complete: "https://saas.com/enroll?user_code=ABCD-1234",
+            expires_in: 600,
+            interval: 5,
+          }),
+        });
 
-      // Second poll: success
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          creds: {
-            userJwt: "mock_user_jwt",
-            userSeed: "mock_user_seed",
-          },
-          peerId: "mock-peer-id",
-          jwksUrl: "https://saas.com/.well-known/jwks.json",
-          bootstrapUrl: "https://saas.com/bootstrap",
-        }),
-      });
+        // First poll: pending
+        mockFetch.mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            error: "authorization_pending",
+          }),
+        });
 
-      const startTime = Date.now();
-      await client.enroll();
-      const elapsed = Date.now() - startTime;
+        // Second poll: success
+        mockFetch.mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            creds: {
+              userJwt: "mock_user_jwt",
+              userSeed: "mock_user_seed",
+            },
+            peerId: "mock-peer-id",
+            jwksUrl: "https://saas.com/.well-known/jwks.json",
+            bootstrapUrl: "https://saas.com/bootstrap",
+          }),
+        });
 
-      // Should have waited at least 5 seconds (interval)
-      expect(elapsed).toBeGreaterThanOrEqual(5000);
-      expect(elapsed).toBeLessThan(7000); // Allow some margin
+        const enrollPromise = intervalClient.enroll();
+        // Drain microtasks + advance past the two 5s poll intervals.
+        await vi.advanceTimersByTimeAsync(11_000);
+        const result = await enrollPromise;
+
+        expect(result.peerId).toBe("mock-peer-id");
+        // Two poll intervals were scheduled (pending → success).
+        expect(mockFetch).toHaveBeenCalledTimes(3);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it("should persist credentials after approval", async () => {
@@ -245,7 +262,7 @@ describe("EnrollmentClient", () => {
 
   describe("getIdentityKey()", () => {
     it("should return cached identity key after enrollment", async () => {
-      mockFetch.mockResolvedValue({
+      mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           device_code: "test_device_code",
@@ -300,7 +317,7 @@ describe("EnrollmentClient", () => {
 
   describe("getNatsCredentials()", () => {
     it("should return NATS credentials after enrollment", async () => {
-      mockFetch.mockResolvedValue({
+      mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           device_code: "test_device_code",
@@ -348,7 +365,7 @@ describe("EnrollmentClient", () => {
 
   describe("getPeerId()", () => {
     it("should return peer ID after enrollment", async () => {
-      mockFetch.mockResolvedValue({
+      mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           device_code: "test_device_code",
@@ -397,7 +414,7 @@ describe("EnrollmentClient", () => {
     });
 
     it("should throw on enrollment denial", async () => {
-      mockFetch.mockResolvedValue({
+      mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           device_code: "test_device_code",
@@ -421,7 +438,7 @@ describe("EnrollmentClient", () => {
     });
 
     it("should throw on enrollment expiration", async () => {
-      mockFetch.mockResolvedValue({
+      mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           device_code: "test_device_code",
@@ -464,7 +481,7 @@ describe("EnrollmentClient", () => {
 
       const nestedClient = new EnrollmentClient(options);
 
-      mockFetch.mockResolvedValue({
+      mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           device_code: "test_device_code",
@@ -492,15 +509,15 @@ describe("EnrollmentClient", () => {
       await nestedClient.enroll();
 
       // Should have created nested directories
-      expect(existsSync(options.credentialPath)).toBe(true);
+      expect(existsSync(options.credentialPath!)).toBe(true);
 
       // Cleanup
-      const dir = require("node:path").dirname(options.credentialPath);
+      const dir = require("node:path").dirname(options.credentialPath!);
       require("node:fs").rmSync(dir, { recursive: true, force: true });
     });
 
     it("should set restrictive permissions on credential file", async () => {
-      mockFetch.mockResolvedValue({
+      mockFetch.mockResolvedValueOnce({
         ok: true,
         json: async () => ({
           device_code: "test_device_code",

@@ -15,12 +15,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import WebSocket from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 
 import { NatsTransport } from "./nats-transport.js";
 import { NatsChannel } from "./nats-channel.js";
-import type { InboundWsMessage, OutboundWsMessage } from "./nats-channel.js";
-import type { HistoryMessage } from "./transport.js";
+import type { InboundWsMessage, OutboundWsMessage, HistoryMessage } from "./nats-channel.js";
 import { getApprovalResolution, clearApprovalResolutions } from "./nats-channel.js";
 
 // ---------------------------------------------------------------------------
@@ -34,12 +33,12 @@ import { getApprovalResolution, clearApprovalResolutions } from "./nats-channel.
  * adapted for the NATS cutover E2E test.
  */
 class PermissionedFakeNatsBroker {
-  private readonly server: WebSocket.Server;
+  private readonly server: WebSocketServer;
   private readonly connections = new Set<WebSocket>();
   private readonly permissions = new Map<WebSocket, string>(); // ws -> tenant pattern
 
   constructor(port: number) {
-    this.server = new WebSocket.Server({ port, host: "127.0.0.1" });
+    this.server = new WebSocketServer({ port, host: "127.0.0.1" });
 
     this.server.on("connection", (ws: WebSocket) => {
       this.connections.add(ws);
@@ -117,6 +116,19 @@ class PermissionedFakeNatsBroker {
     }
   }
 
+  /** Resolve once the server is bound, returning the actual (ephemeral) port. */
+  async waitUntilListening(): Promise<number> {
+    await new Promise<void>((resolve, reject) => {
+      this.server.once("listening", () => resolve());
+      this.server.once("error", reject);
+    });
+    const addr = this.server.address();
+    if (!addr || typeof addr === "string") {
+      throw new Error("broker did not bind to a TCP port");
+    }
+    return addr.port;
+  }
+
   close(): void {
     for (const ws of this.connections) {
       ws.close();
@@ -138,11 +150,10 @@ describe("AC 5 E2E: NATS Cutover", () => {
   const tenant = "test-tenant";
 
   beforeEach(async () => {
-    // Find an available port
-    brokerPort = 4222;
-
-    // Start fake NATS broker
-    broker = new PermissionedFakeNatsBroker(brokerPort);
+    // Bind to an ephemeral port (0) and read back the actual port — a fixed
+    // port collides under parallel test files and may be sandbox-blocked.
+    broker = new PermissionedFakeNatsBroker(0);
+    brokerPort = await broker.waitUntilListening();
 
     // Create agent NATS transport
     agentTransport = new NatsTransport({
@@ -158,9 +169,9 @@ describe("AC 5 E2E: NATS Cutover", () => {
   });
 
   afterEach(() => {
-    agentTransport.disconnect();
-    broker.close();
-    clearApprovalResolutions(agentChannel);
+    agentTransport?.disconnect();
+    broker?.close();
+    if (agentChannel) clearApprovalResolutions(agentChannel);
   });
 
   // ---------------------------------------------------------------------------
@@ -189,8 +200,11 @@ describe("AC 5 E2E: NATS Cutover", () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     expect(receivedMessage).toBeDefined();
-    expect(receivedMessage?.type).toBe("user_message");
-    expect(receivedMessage?.text).toBe("Hello from browser!");
+    expect(receivedMessage).not.toBeNull();
+    const msg = receivedMessage as unknown as InboundWsMessage;
+    expect(msg.type).toBe("user_message");
+    if (msg.type !== "user_message") throw new Error("expected user_message");
+    expect(msg.text).toBe("Hello from browser!");
 
     agentChannel.unregisterPeer(peerId);
   });
@@ -229,9 +243,13 @@ describe("AC 5 E2E: NATS Cutover", () => {
 
     expect(messages).toHaveLength(2);
     expect(messages[0].peerId).toBe(peer1);
-    expect(messages[0].message.text).toBe("Message from peer1");
+    const m0 = messages[0].message as InboundWsMessage;
+    if (m0.type !== "user_message") throw new Error("expected user_message");
+    expect(m0.text).toBe("Message from peer1");
     expect(messages[1].peerId).toBe(peer2);
-    expect(messages[1].message.text).toBe("Message from peer2");
+    const m1 = messages[1].message as InboundWsMessage;
+    if (m1.type !== "user_message") throw new Error("expected user_message");
+    expect(m1.text).toBe("Message from peer2");
 
     agentChannel.unregisterPeer(peer1);
     agentChannel.unregisterPeer(peer2);
@@ -539,8 +557,12 @@ describe("AC 5 E2E: NATS Cutover", () => {
     // Verify isolation
     expect(messages1).toHaveLength(2);
     expect(messages2).toHaveLength(1);
-    expect(messages1[0].text).toBe("Peer1 message 1");
-    expect(messages2[0].text).toBe("Peer2 message 1");
+    const r1 = messages1[0] as InboundWsMessage;
+    if (r1.type !== "user_message") throw new Error("expected user_message");
+    expect(r1.text).toBe("Peer1 message 1");
+    const r2 = messages2[0] as InboundWsMessage;
+    if (r2.type !== "user_message") throw new Error("expected user_message");
+    expect(r2.text).toBe("Peer2 message 1");
 
     agentChannel.unregisterPeer(peer1);
     agentChannel.unregisterPeer(peer2);

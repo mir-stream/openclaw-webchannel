@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "./device-flow-enrollment.js";
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
-import type { EnrollmentRequest, PollRequest } from "./device-flow-types.js";
+import type { EnrollmentRequest, PollRequest, PendingEnrollment } from "./device-flow-types.js";
 
 // ---------------------------------------------------------------------------
 // Test fixtures
@@ -309,33 +309,47 @@ describe("DeviceFlowEnrollment", () => {
   });
 
   describe("MemoryEnrollmentStore", () => {
+    const makePending = (overrides: Partial<PendingEnrollment> = {}): PendingEnrollment => ({
+      device_code: "test-device-code",
+      user_code: "TEST-CODE",
+      agentPublicKey: validEnrollmentRequest.agentPublicKey,
+      tenant: validEnrollmentRequest.tenant,
+      createdAt: 1_000,
+      expiresAt: 601_000,
+      status: "pending",
+      ...overrides,
+    });
+
     it("should store and retrieve enrollments", async () => {
       const store = new MemoryEnrollmentStore();
-      const enrollment = await enrollment.enroll(validEnrollmentRequest);
+      const pending = makePending();
+      await store.saveEnrollment(pending);
 
-      const retrieved = await store.getEnrollment(enrollment.device_code);
+      const retrieved = await store.getEnrollment(pending.device_code);
 
       expect(retrieved).toMatchObject({
-        device_code: enrollment.device_code,
-        user_code: enrollment.user_code,
+        device_code: pending.device_code,
+        user_code: pending.user_code,
         agentPublicKey: validEnrollmentRequest.agentPublicKey,
       });
     });
 
     it("should retrieve enrollment by user code", async () => {
       const store = new MemoryEnrollmentStore();
-      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+      const pending = makePending();
+      await store.saveEnrollment(pending);
 
-      const retrieved = await store.getEnrollmentByUserCode(enrollResponse.user_code);
+      const retrieved = await store.getEnrollmentByUserCode(pending.user_code);
 
-      expect(retrieved?.device_code).toBe(enrollResponse.device_code);
+      expect(retrieved?.device_code).toBe(pending.device_code);
     });
 
     it("should update enrollment", async () => {
       const store = new MemoryEnrollmentStore();
-      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+      const pending = makePending();
+      await store.saveEnrollment(pending);
 
-      await store.updateEnrollment(enrollResponse.device_code, {
+      await store.updateEnrollment(pending.device_code, {
         status: "approved",
         natsCreds: {
           userJwt: "MOCK_JWT",
@@ -343,7 +357,7 @@ describe("DeviceFlowEnrollment", () => {
         },
       });
 
-      const updated = await store.getEnrollment(enrollResponse.device_code);
+      const updated = await store.getEnrollment(pending.device_code);
 
       expect(updated?.status).toBe("approved");
       expect(updated?.natsCreds).toBeDefined();
@@ -351,11 +365,12 @@ describe("DeviceFlowEnrollment", () => {
 
     it("should delete enrollment", async () => {
       const store = new MemoryEnrollmentStore();
-      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+      const pending = makePending();
+      await store.saveEnrollment(pending);
 
-      await store.deleteEnrollment(enrollResponse.device_code);
+      await store.deleteEnrollment(pending.device_code);
 
-      const deleted = await store.getEnrollment(enrollResponse.device_code);
+      const deleted = await store.getEnrollment(pending.device_code);
       expect(deleted).toBeNull();
     });
   });

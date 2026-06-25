@@ -35,8 +35,8 @@ export type {
   NatsAccountConfig,
   JwksDocument,
   JwkRsaPublicKey,
-  SetupTrustChainOptions,
 } from "./types.js";
+export type { SetupTrustChainOptions } from "./setup-trust-chain.js";
 export type {
   EnrollmentRequest,
   EnrollmentResponse,

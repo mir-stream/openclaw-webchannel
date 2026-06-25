@@ -183,6 +183,13 @@ export type EnrollmentOptions = {
    * Defaults to true for operator convenience.
    */
   displayInstructions?: boolean;
+
+  /**
+   * @internal Test-only: floor (ms) for the poll interval. Production keeps the
+   * RFC 8628 minimum of 5000ms; tests inject a small value to poll without
+   * waiting real seconds. Never set this in production.
+   */
+  _minPollIntervalMs?: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -199,8 +206,12 @@ export type EnrollmentOptions = {
  *  - Reconnection: use stored credentials to reconnect
  */
 export class EnrollmentClient {
-  private readonly options: Required<Omit<EnrollmentOptions, "displayInstructions">> & {
+  private readonly options: Required<
+    Omit<EnrollmentOptions, "displayInstructions" | "agentId" | "_minPollIntervalMs">
+  > & {
     displayInstructions: boolean;
+    agentId?: string;
+    _minPollIntervalMs?: number;
   };
   private credentials?: PluginCredentials;
 
@@ -330,7 +341,12 @@ export class EnrollmentClient {
       device_code: enrollResponse.device_code,
     };
 
-    const intervalMs = Math.max(enrollResponse.interval * 1000, 5000);
+    // Test-only override: when set, it REPLACES the computed interval (tests
+    // inject 0 to poll instantly). Production uses the RFC 8628 5s floor.
+    const intervalMs =
+      this.options._minPollIntervalMs !== undefined
+        ? this.options._minPollIntervalMs
+        : Math.max(enrollResponse.interval * 1000, 5000);
     const expiresAt = Date.now() + enrollResponse.expires_in * 1000;
 
     while (Date.now() < expiresAt) {

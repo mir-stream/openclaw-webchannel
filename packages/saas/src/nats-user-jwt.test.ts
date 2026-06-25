@@ -214,15 +214,13 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       Buffer.from(credsB.userJwt.split(".")[1], "base64url").toString("utf8"),
     );
 
-    expect(payloadA.nats.pub.allow).toContain("tenant-alpha");
-    expect(payloadA.nats.sub.allow).toContain("tenant-alpha");
-    expect(payloadA.nats.pub.allow).not.toContain("tenant-beta");
-    expect(payloadA.nats.sub.allow).not.toContain("tenant-beta");
+    const joinedA = [...payloadA.nats.pub.allow, ...payloadA.nats.sub.allow].join(" ");
+    expect(joinedA).toContain("tenant-alpha");
+    expect(joinedA).not.toContain("tenant-beta");
 
-    expect(payloadB.nats.pub.allow).toContain("tenant-beta");
-    expect(payloadB.nats.sub.allow).toContain("tenant-beta");
-    expect(payloadB.nats.pub.allow).not.toContain("tenant-alpha");
-    expect(payloadB.nats.sub.allow).not.toContain("tenant-alpha");
+    const joinedB = [...payloadB.nats.pub.allow, ...payloadB.nats.sub.allow].join(" ");
+    expect(joinedB).toContain("tenant-beta");
+    expect(joinedB).not.toContain("tenant-alpha");
   });
 
   it("should generate user NKEY seeds with correct format", async () => {

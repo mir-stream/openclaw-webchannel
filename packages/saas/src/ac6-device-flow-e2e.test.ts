@@ -198,6 +198,9 @@ async function generatePluginKeyPair(): Promise<{ publicKey: string; privateKey:
     true,
     ["deriveKey", "deriveBits"],
   );
+  if (!("publicKey" in keyPair)) {
+    throw new Error("Expected CryptoKeyPair from X25519 generateKey");
+  }
 
   const publicKeyBuffer = await globalThis.crypto.subtle.exportKey("raw", keyPair.publicKey);
   const privateKeyBuffer = await globalThis.crypto.subtle.exportKey("pkcs8", keyPair.privateKey);
@@ -219,6 +222,9 @@ async function generateDeviceKey(): Promise<string> {
     true,
     ["deriveKey", "deriveBits"],
   );
+  if (!("publicKey" in keyPair)) {
+    throw new Error("Expected CryptoKeyPair from X25519 generateKey");
+  }
 
   const publicKeyBuffer = await globalThis.crypto.subtle.exportKey("raw", keyPair.publicKey);
   return Buffer.from(publicKeyBuffer).toString("base64url");
