@@ -1,0 +1,25 @@
+{
+  "name": "webchannel-live-e2e-chat",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Runnable demo: a browser and an agent exchange ChaCha20-Poly1305 E2E-encrypted chat over a live NATS bus.",
+  "scripts": {
+    "interop": "tsx interop-check.ts",
+    "agent": "tsx agent/agent.ts",
+    "smoke": "tsx smoke.ts",
+    "web": "vite web",
+    "start": "node run.mjs"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.2.0",
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "vite": "^7.3.6"
+  }
+}
