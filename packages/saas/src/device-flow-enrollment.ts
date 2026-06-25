@@ -17,6 +17,9 @@
  *  - Agent public key binding (cnf in bootstrap JWT)
  */
 
+import { createUser, fromSeed } from "@nats-io/nkeys";
+import { encodeUser } from "@nats-io/jwt";
+
 import type {
   EnrollmentRequest,
   EnrollmentResponse,
@@ -401,42 +404,28 @@ export class DeviceFlowEnrollment {
   private async generateNatsUserCredentials(
     enrollment: PendingEnrollment,
   ): Promise<NatsUserCredentials> {
-    // Generate user NKEY (U... category for users)
-    const userSeed = await this.generateNkeyUserSeed();
-    const userPublicKey = this.deriveNkeyPublic(userSeed);
+    // Mint a real NATS user JWT, signed by the account NKEY, so a real
+    // nats-server accepts the connection and enforces the subject permissions.
+    const accountSigner = fromSeed(
+      new TextEncoder().encode(this.options.saasTrustChain.natsAccountSeed),
+    );
+    const userKp = createUser();
+    const userSeed = new TextDecoder().decode(userKp.getSeed());
 
-    // Extract account public NKEY from account seed (stored in options)
-    // The account seed format is "SA..." where S=operator, A=account
-    const accountPublicKey = this.deriveAccountPublicKey(this.options.saasTrustChain.natsAccountSeed);
+    const pub = [`webchannel.${enrollment.tenant}.outbound.>`];
+    const sub = [`webchannel.${enrollment.tenant}.inbound.>`];
 
-    // Build NATS user JWT claims with tenant-scoped permissions
-    const userClaims = {
-      iss: accountPublicKey, // Issuer: account public NKEY
-      name: `user-${enrollment.tenant}-${enrollment.agentId ?? "unknown"}`,
-      sub: userPublicKey, // Subject: user public NKEY
-      nats: {
-        pub: {
-          allow: [`webchannel.${enrollment.tenant}.outbound.>`],
-        },
-        sub: {
-          allow: [`webchannel.${enrollment.tenant}.inbound.>`],
-        },
-      },
-    };
-
-    // Sign the user JWT with the account NKEY seed
-    const userJwt = await this.signNatsUserJwt(userClaims, this.options.saasTrustChain.natsAccountSeed);
-
-    // Tenant-scoped permissions (also embedded in the JWT for reference)
-    const permissions = {
-      pub: [`webchannel.${enrollment.tenant}.outbound.>`],
-      sub: [`webchannel.${enrollment.tenant}.inbound.>`],
-    };
+    const userJwt = await encodeUser(
+      `user-${enrollment.tenant}-${enrollment.agentId ?? "unknown"}`,
+      userKp,
+      accountSigner,
+      { pub: { allow: pub }, sub: { allow: sub } },
+    );
 
     return {
       userJwt,
       userSeed,
-      permissions,
+      permissions: { pub, sub },
     };
   }
 

@@ -39,15 +39,13 @@ describe("setupTrustChain (AC 1)", () => {
   it("generates NKEY seed with correct format", async () => {
     const result = await setupTrustChain();
 
-    // NKEY seed must start with "SA" (Operator/Account category byte)
+    // A real NATS account seed starts with "SA" (S=seed, A=account) and is
+    // standard base32 (A–Z, 2–7).
     expect(result.private.natsAccountSeed).toMatch(/^SA/);
+    expect(result.private.natsAccountSeed).toMatch(/^[A-Z2-7]+$/);
 
-    // NKEY seed should be base32-like (no vowels, alphanumeric)
-    const seedContent = result.private.natsAccountSeed.slice(2);
-    expect(seedContent).toMatch(/^[CFH23567PR89JKLMNPQTUVWXYZ456789]+$/);
-
-    // Seed length should be reasonable (Ed25519 key in base32)
-    expect(seedContent.length).toBeGreaterThan(40);
+    // Ed25519 seed encoded as base32 is 58 chars.
+    expect(result.private.natsAccountSeed.length).toBeGreaterThan(40);
   });
 
   it("emits operator JWT with required claims", async () => {
@@ -60,20 +58,20 @@ describe("setupTrustChain (AC 1)", () => {
     const parts = result.natsConfig.operatorJwt.split(".");
     expect(parts).toHaveLength(3);
 
-    // Decode header (without verification for structure check)
+    // Decode header — real NATS JWTs use typ "JWT" and an ed25519-nkey alg.
     const header = JSON.parse(atob(parts[0]!));
     expect(header).toMatchObject({
-      typ: "jwt",
+      typ: "JWT",
       alg: expect.any(String),
     });
 
-    // Decode payload
+    // Decode payload — operator JWT is self-issued: iss === sub === operator
+    // public NKEY (starts with "O").
     const payload = JSON.parse(atob(parts[1]!));
-    expect(payload).toMatchObject({
-      iss: expect.stringMatching(/^SA/), // Operator public NKEY
-      name: expect.any(String),
-      sub: expect.stringMatching(/^SA/), // Operator public NKEY
-    });
+    expect(payload.iss).toMatch(/^O/);
+    expect(payload.sub).toMatch(/^O/);
+    expect(payload.iss).toBe(payload.sub);
+    expect(payload.name).toEqual(expect.any(String));
   });
 
   it("emits account JWT with required claims", async () => {
@@ -86,16 +84,13 @@ describe("setupTrustChain (AC 1)", () => {
     const parts = result.natsConfig.accountJwt.split(".");
     expect(parts).toHaveLength(3);
 
-    // Decode payload
+    // Decode payload — account JWT is issued BY the operator (iss starts "O")
+    // FOR the account (sub starts "A"), with NATS limits.
     const payload = JSON.parse(atob(parts[1]!));
-    expect(payload).toMatchObject({
-      iss: expect.stringMatching(/^SA/), // Operator public NKEY
-      name: expect.any(String),
-      sub: expect.stringMatching(/^SA/), // Account public NKEY
-      nats: expect.objectContaining({
-        limits: expect.any(Object),
-      }),
-    });
+    expect(payload.iss).toMatch(/^O/);
+    expect(payload.sub).toMatch(/^A/);
+    expect(payload.name).toEqual(expect.any(String));
+    expect(payload.nats).toEqual(expect.objectContaining({ limits: expect.any(Object) }));
   });
 
   it("emits resolver config mapping account NKEY to account JWT", async () => {
@@ -111,9 +106,9 @@ describe("setupTrustChain (AC 1)", () => {
 
     const [accountPublicKey, accountJwt] = entries[0]!;
 
-    // Key must be the account public NKEY
+    // Key must be the account public NKEY (starts with "A")
     expect(accountPublicKey).toBe(result.natsConfig.accountPublicKey);
-    expect(accountPublicKey).toMatch(/^SA/);
+    expect(accountPublicKey).toMatch(/^A/);
 
     // Value must be the account JWT
     expect(accountJwt).toBe(result.natsConfig.accountJwt);
@@ -207,12 +202,11 @@ describe("setupTrustChain (AC 1)", () => {
     expect(jwk!.kid).toBe(customKid);
   });
 
-  it("generates deterministic account public NKEY from seed", async () => {
+  it("generates account public NKEY paired with its seed", async () => {
     const result = await setupTrustChain();
 
-    // The account public NKEY should be derivable from the seed
-    // (This is a structural check — actual derivation happens in generateNkeySeed)
-    expect(result.natsConfig.accountPublicKey).toMatch(/^SA/);
+    // Account public NKEY starts with "A"; the account seed with "SA".
+    expect(result.natsConfig.accountPublicKey).toMatch(/^A/);
     expect(result.private.natsAccountSeed).toMatch(/^SA/);
 
     // Public key and seed should be different (seed includes private material)

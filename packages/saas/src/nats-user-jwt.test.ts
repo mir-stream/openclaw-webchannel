@@ -47,7 +47,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     expect(creds.userJwt).toBeTruthy();
     expect(creds.userJwt).not.toBe("PLACEHOLDER_USER_JWT");
     expect(creds.userSeed).toBeTruthy();
-    expect(creds.userSeed).toMatch(/^U/); // User NKEY prefix
+    expect(creds.userSeed).toMatch(/^SU/); // User NKEY seed prefix (S=seed, U=user)
     expect(creds.permissions).toBeDefined();
     expect(creds.permissions?.pub).toEqual([
       "webchannel.tenant-abc.outbound.>",
@@ -252,7 +252,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       seeds.push(creds.userSeed);
 
       // Verify format
-      expect(creds.userSeed).toMatch(/^U/); // User NKEY prefix
+      expect(creds.userSeed).toMatch(/^SU/); // User NKEY seed prefix (S=seed, U=user)
       expect(creds.userSeed.length).toBeGreaterThan(20); // Substantial length
     }
 

@@ -11,6 +11,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { createAccount } from "@nats-io/nkeys";
 import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "./device-flow-enrollment.js";
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import type { EnrollmentRequest, PollRequest, PendingEnrollment } from "./device-flow-types.js";
@@ -19,9 +20,12 @@ import type { EnrollmentRequest, PollRequest, PendingEnrollment } from "./device
 // Test fixtures
 // ---------------------------------------------------------------------------
 
+// A real account NKEY seed — generateNatsUserCredentials signs user JWTs with
+// it via @nats-io/nkeys, which rejects non-NKEY strings ("invalid checksum").
+const mockAccountKp = createAccount();
 const mockTrustChain: SaasTrustChainPrivate = {
   rsaPrivateKeyPem: "-----BEGIN PRIVATE KEY-----\nMOCK_PRIVATE_KEY\n-----END PRIVATE KEY-----",
-  natsAccountSeed: "SAMOCKACCOUNTSEEDFORTESTING",
+  natsAccountSeed: new TextDecoder().decode(mockAccountKp.getSeed()),
 };
 
 const mockNatsConfig: NatsAccountConfig = {

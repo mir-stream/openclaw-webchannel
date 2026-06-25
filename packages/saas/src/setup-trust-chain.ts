@@ -26,6 +26,9 @@
  *   - RFC 7518 (JWK RSA)
  */
 
+import { createOperator, createAccount } from "@nats-io/nkeys";
+import { encodeOperator, encodeAccount } from "@nats-io/jwt";
+
 import type {
   SetupTrustChainResult,
   SaasTrustChainPrivate,
@@ -406,51 +409,51 @@ export async function setupTrustChain(
   publicKeyJwk.kid = kid;
 
   // -----------------------------------------------------------------------
-  // Step 2: Generate NKEY seed for NATS account signing
+  // Step 2: Generate operator + account NKEYs (ed25519, NATS standard)
   // -----------------------------------------------------------------------
+  //
+  // The operator is the trust root; the account is signed BY the operator.
+  // They are DISTINCT keypairs (a real nats-server rejects a self-issued
+  // account). The account signing seed is what later mints user JWTs.
 
-  const { seed: natsAccountSeed, publicKey: natsAccountPublicKey } =
-    await generateNkeySeed();
-
-  // -----------------------------------------------------------------------
-  // Step 3: Create NATS operator JWT
-  // -----------------------------------------------------------------------
-
-  const operatorClaims = {
-    iss: natsAccountPublicKey, // Operator public NKEY
-    name: operatorName,
-    sub: natsAccountPublicKey, // Operator public NKEY
-    nats: {
-      server: {
-        id: `${operatorName}-server`,
-      },
-    },
-  };
-
-  const operatorJwt = await signNatsJwtWithNkey(operatorClaims, natsAccountSeed);
+  const operatorKp = createOperator();
+  const accountKp = createAccount();
+  const operatorPublicKey = operatorKp.getPublicKey();
+  const natsAccountPublicKey = accountKp.getPublicKey();
+  const natsAccountSeed = new TextDecoder().decode(accountKp.getSeed());
+  const operatorSeed = new TextDecoder().decode(operatorKp.getSeed());
 
   // -----------------------------------------------------------------------
-  // Step 4: Create NATS account JWT
+  // Step 3: Encode the operator JWT (self-signed by the operator NKEY)
   // -----------------------------------------------------------------------
 
-  const accountClaims = {
-    iss: natsAccountPublicKey, // Operator public NKEY
-    name: accountName,
-    sub: natsAccountPublicKey, // Account public NKEY
-    nats: {
+  const operatorJwt = await encodeOperator(operatorName, operatorKp, {});
+
+  // -----------------------------------------------------------------------
+  // Step 4: Encode the account JWT (signed by the operator NKEY)
+  // -----------------------------------------------------------------------
+
+  const accountJwt = await encodeAccount(
+    accountName,
+    accountKp,
+    {
+      // Unlimited account resources (-1); the default JWT caps connections at 0.
       limits: {
-        conn: -1, // Unlimited connections
-        subs: -1, // Unlimited subscriptions
-        data: -1, // Unlimited data
-        payload: -1, // Unlimited payload
+        conn: -1,
+        subs: -1,
+        data: -1,
+        payload: -1,
+        imports: -1,
+        exports: -1,
+        wildcards: true,
+        leaf: -1,
       },
     },
-  };
-
-  const accountJwt = await signNatsJwtWithNkey(accountClaims, natsAccountSeed);
+    { signer: operatorKp },
+  );
 
   // -----------------------------------------------------------------------
-  // Step 5: Create resolver config
+  // Step 5: Create resolver config (account NKEY → account JWT)
   // -----------------------------------------------------------------------
 
   const resolverConfig: NatsResolverConfig = {

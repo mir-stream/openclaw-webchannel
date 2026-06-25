@@ -30,6 +30,8 @@ import { existsSync, mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
+import { fromSeed, createUser } from "@nats-io/nkeys";
+import { encodeUser } from "@nats-io/jwt";
 
 import { setupTrustChain } from "./setup-trust-chain.js";
 import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
@@ -85,28 +87,46 @@ async function waitFor(
 async function connectWithJwt(
   jwt: string,
   seed: string,
-  clientName: string,
+  _clientName: string,
 ): Promise<{ ws: WebSocket; ready: Promise<void> }> {
   const ws = new WebSocket(WS_URL);
+  const userKp = fromSeed(new TextEncoder().encode(seed));
 
   const ready = new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Connection timeout")), 5000);
+    const timeout = setTimeout(() => reject(new Error("Connection timeout")), 4000);
+    let authed = false;
 
-    ws.on("open", () => {
-      // Send CONNECT with JWT
-      const connectMsg = `CONNECT {"jwt":"${jwt}","nkey":"${derivePublicNkey(seed)}","sig":"placeholder"}\r\nPING\r\n`;
-      ws.send(connectMsg);
-
-      // Wait for PONG
-      const onMessage = (data: Buffer) => {
-        if (data.toString().includes("PONG")) {
-          clearTimeout(timeout);
-          ws.off("message", onMessage);
-          resolve();
+    const onMessage = (data: Buffer) => {
+      const text = data.toString();
+      // The server greets with INFO {...,"nonce":"..."}; sign the nonce with the
+      // user NKEY seed and reply with CONNECT — this is real NATS JWT auth.
+      if (!authed && text.startsWith("INFO ")) {
+        authed = true;
+        let nonce = "";
+        try {
+          nonce = (JSON.parse(text.slice(5).trim()) as { nonce?: string }).nonce ?? "";
+        } catch {
+          /* no nonce */
         }
-      };
-      ws.on("message", onMessage);
-    });
+        const sig = nonce
+          ? Buffer.from(userKp.sign(new TextEncoder().encode(nonce))).toString("base64url")
+          : "";
+        const connect = { jwt, sig, nkey: "", verbose: false, pedantic: false };
+        ws.send(`CONNECT ${JSON.stringify(connect)}\r\nPING\r\n`);
+        return;
+      }
+      if (text.includes("PONG")) {
+        clearTimeout(timeout);
+        ws.off("message", onMessage);
+        resolve();
+      }
+      if (text.includes("-ERR")) {
+        clearTimeout(timeout);
+        ws.off("message", onMessage);
+        reject(new Error(text.trim()));
+      }
+    };
+    ws.on("message", onMessage);
 
     ws.on("error", (err) => {
       clearTimeout(timeout);
@@ -115,17 +135,6 @@ async function connectWithJwt(
   });
 
   return { ws, ready };
-}
-
-/**
- * Derive public NKEY from seed (simplified).
- */
-function derivePublicNkey(seed: string): string {
-  if (!seed.startsWith("U") && !seed.startsWith("SA")) {
-    throw new Error(`Invalid NKEY seed format: ${seed}`);
-  }
-  // Simplified: just return a derived format
-  return seed.substring(0, 23);
 }
 
 // ---------------------------------------------------------------------------
@@ -144,13 +153,6 @@ beforeAll(async () => {
     accountName: "test-account",
   });
 
-  // Write resolver config
-  const resolverPath = join(testDir, "resolver.conf");
-  writeFileSync(
-    resolverPath,
-    JSON.stringify(trustChain.natsConfig.resolverConfig, null, 2),
-  );
-
   // Write operator JWT
   const operatorJwtPath = join(testDir, "operator.jwt");
   writeFileSync(operatorJwtPath, trustChain.natsConfig.operatorJwt);
@@ -164,7 +166,12 @@ beforeAll(async () => {
     bootstrapUrl: "https://saas.test.com/bootstrap",
   });
 
-  // Create nats-server config with JWT authentication
+  // Create nats-server config with JWT authentication. A real nats-server needs
+  // a trusted `operator` JWT plus a MEMORY resolver preloaded with each account
+  // JWT keyed by its public NKEY (not a bare file path).
+  const preload = Object.entries(trustChain.natsConfig.resolverConfig)
+    .map(([accPub, accJwt]) => `  ${accPub}: "${accJwt}"`)
+    .join("\n");
   const confPath = join(testDir, "nats.conf");
   writeFileSync(
     confPath,
@@ -174,8 +181,11 @@ beforeAll(async () => {
       `  port: ${WS_PORT}`,
       `  no_tls: true`,
       `}`,
-      `operator="${operatorJwtPath}"`,
-      `resolver="${resolverPath}"`,
+      `operator: "${operatorJwtPath}"`,
+      `resolver: MEMORY`,
+      `resolver_preload: {`,
+      preload,
+      `}`,
       "",
     ].join("\n"),
   );
@@ -187,13 +197,17 @@ beforeAll(async () => {
 
   // Wait for "Server is ready"
   let ready = false;
+  let serverLog = "";
   const onData = (buf: Buffer) => {
+    serverLog += buf.toString();
     if (buf.toString().includes("Server is ready")) ready = true;
   };
   server.stdout?.on("data", onData);
   server.stderr?.on("data", onData);
 
-  await waitFor(() => ready, 10000, 100);
+  await waitFor(() => ready, 10000, 100).catch(() => {
+    throw new Error(`nats-server did not become ready:\n${serverLog}`);
+  });
 }, 20000);
 
 afterAll(async () => {
@@ -248,6 +262,30 @@ async function generateTestCredentials(tenant: string): Promise<NatsUserCredenti
   // Use the private method to generate credentials
   // @ts-ignore - accessing private method for testing
   return await enrollment.generateNatsUserCredentials(mockEnrollment);
+}
+
+/**
+ * Generate AGENT-role NATS credentials for a tenant — the mirror of a browser:
+ * publishes to `inbound`, subscribes to `outbound`. Needed to exercise a real
+ * message round-trip, since the browser role (pub=outbound, sub=inbound) cannot
+ * subscribe to its own outbound by design (loopback prevention).
+ */
+async function generateAgentCredentials(
+  tenant: string,
+): Promise<NatsUserCredentials> {
+  if (!trustChain) throw new Error("Trust chain not initialized");
+  const accountSigner = fromSeed(
+    new TextEncoder().encode(trustChain.private.natsAccountSeed),
+  );
+  const userKp = createUser();
+  const userSeed = new TextDecoder().decode(userKp.getSeed());
+  const pub = [`webchannel.${tenant}.inbound.>`];
+  const sub = [`webchannel.${tenant}.outbound.>`];
+  const userJwt = await encodeUser(`agent-${tenant}`, userKp, accountSigner, {
+    pub: { allow: pub },
+    sub: { allow: sub },
+  });
+  return { userJwt, userSeed, permissions: { pub, sub } };
 }
 
 // ---------------------------------------------------------------------------
@@ -321,24 +359,18 @@ describe.skipIf(!NATS_SERVER_BIN)(
         credsA.userSeed,
         "tenant-a-pub",
       );
+      // The subscriber is the AGENT role (sub=outbound); a browser cannot
+      // subscribe to its own outbound by design.
+      const agentA = await generateAgentCredentials(TENANT_A);
       const { ws: sub, ready: readySub } = await connectWithJwt(
-        credsA.userJwt,
-        credsA.userSeed,
-        "tenant-a-sub",
+        agentA.userJwt,
+        agentA.userSeed,
+        "tenant-a-agent-sub",
       );
 
       await Promise.all([readyPub, readySub]);
 
-      // Subscribe
-      sub.send(`SUB ${A_OUTBOUND} 1\r\n`);
-      await new Promise((r) => setTimeout(r, 100));
-
-      // Publish
-      const payload = "test message from tenant A";
-      const pubMsg = `PUB ${A_OUTBOUND} ${payload.length}\r\n${payload}\r\n`;
-      pub.send(pubMsg);
-
-      // Wait for message
+      // Collect messages BEFORE publishing so nothing is missed.
       const messages: string[] = [];
       sub.on("message", (data: Buffer) => {
         const msg = data.toString();
@@ -346,6 +378,15 @@ describe.skipIf(!NATS_SERVER_BIN)(
           messages.push(msg);
         }
       });
+
+      // Subscribe (agent → outbound)
+      sub.send(`SUB ${A_OUTBOUND} 1\r\n`);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Publish (browser → outbound)
+      const payload = "test message from tenant A";
+      const pubMsg = `PUB ${A_OUTBOUND} ${payload.length}\r\n${payload}\r\n`;
+      pub.send(pubMsg);
 
       await waitFor(() => messages.length > 0, 2000);
 
@@ -398,24 +439,15 @@ describe.skipIf(!NATS_SERVER_BIN)(
         credsB.userSeed,
         "tenant-b-pub",
       );
+      const agentB = await generateAgentCredentials(TENANT_B);
       const { ws: sub, ready: readySub } = await connectWithJwt(
-        credsB.userJwt,
-        credsB.userSeed,
-        "tenant-b-sub",
+        agentB.userJwt,
+        agentB.userSeed,
+        "tenant-b-agent-sub",
       );
 
       await Promise.all([readyPub, readySub]);
 
-      // Subscribe to tenant B's subject
-      sub.send(`SUB ${B_OUTBOUND} 1\r\n`);
-      await new Promise((r) => setTimeout(r, 100));
-
-      // Publish to tenant B's subject
-      const payload = "tenant B private message";
-      const pubMsg = `PUB ${B_OUTBOUND} ${payload.length}\r\n${payload}\r\n`;
-      pub.send(pubMsg);
-
-      // Wait for message
       const messages: string[] = [];
       sub.on("message", (data: Buffer) => {
         const msg = data.toString();
@@ -423,6 +455,15 @@ describe.skipIf(!NATS_SERVER_BIN)(
           messages.push(msg);
         }
       });
+
+      // Subscribe to tenant B's outbound (agent role)
+      sub.send(`SUB ${B_OUTBOUND} 1\r\n`);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Publish to tenant B's outbound (browser role)
+      const payload = "tenant B private message";
+      const pubMsg = `PUB ${B_OUTBOUND} ${payload.length}\r\n${payload}\r\n`;
+      pub.send(pubMsg);
 
       await waitFor(() => messages.length > 0, 2000);
 
@@ -437,19 +478,21 @@ describe.skipIf(!NATS_SERVER_BIN)(
     it("full cross-tenant isolation: A and B cannot interfere", async () => {
       const credsA = await generateTestCredentials(TENANT_A);
       const credsB = await generateTestCredentials(TENANT_B);
+      const agentA = await generateAgentCredentials(TENANT_A);
+      const agentB = await generateAgentCredentials(TENANT_B);
 
-      // Tenant A subscriber
+      // Tenant A subscriber (agent role — subscribes to outbound)
       const { ws: subA, ready: readySubA } = await connectWithJwt(
-        credsA.userJwt,
-        credsA.userSeed,
-        "tenant-a-sub",
+        agentA.userJwt,
+        agentA.userSeed,
+        "tenant-a-agent-sub",
       );
 
-      // Tenant B subscriber
+      // Tenant B subscriber (agent role)
       const { ws: subB, ready: readySubB } = await connectWithJwt(
-        credsB.userJwt,
-        credsB.userSeed,
-        "tenant-b-sub",
+        agentB.userJwt,
+        agentB.userSeed,
+        "tenant-b-agent-sub",
       );
 
       await Promise.all([readySubA, readySubB]);

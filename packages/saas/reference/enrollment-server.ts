@@ -29,8 +29,8 @@
  */
 
 import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../src/device-flow-enrollment.js";
+import { setupTrustChain } from "../src/setup-trust-chain.js";
 import type { EnrollmentRequest, PollRequest } from "../src/device-flow-types.js";
-import type { SaasTrustChainPrivate, NatsAccountConfig } from "../src/types.js";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
@@ -48,20 +48,15 @@ const SAAS_BASE_URL = process.env.SAAS_BASE_URL || `http://localhost:${PORT}`;
 const NATS_URL = process.env.NATS_URL || "wss://nats.example.com";
 
 // ---------------------------------------------------------------------------
-// Mock trust chain (for demonstration)
+// Trust chain (real, generated once at boot — issues genuine NATS user creds)
 // ---------------------------------------------------------------------------
 
-const mockTrustChain: SaasTrustChainPrivate = {
-  rsaPrivateKeyPem: "-----BEGIN PRIVATE KEY-----\nMOCK_PRIVATE_KEY_FOR_DEMO_ONLY\n-----END PRIVATE KEY-----",
-  natsAccountSeed: "SAMOCKACCOUNTSEEDFORDEMONSTRATION",
-};
-
-const mockNatsConfig: NatsAccountConfig = {
-  operatorJwt: "MOCK_OPERATOR_JWT_FOR_DEMO",
-  accountJwt: "MOCK_ACCOUNT_JWT_FOR_DEMO",
-  resolverConfig: {},
-  accountPublicKey: "AAACCOUNTMOCKPUBLICKEY",
-};
+const trustChain = await setupTrustChain({
+  operatorName: "reference-operator",
+  accountName: "reference-account",
+});
+const mockTrustChain = trustChain.private;
+const mockNatsConfig = trustChain.natsConfig;
 
 // ---------------------------------------------------------------------------
 // Enrollment service
