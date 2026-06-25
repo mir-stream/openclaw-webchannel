@@ -166,6 +166,23 @@ This AC 2 implementation integrates with:
 - **AC 5** (Bootstrap JWT): Includes agent public key in cnf.jwk claim
 - **AC 6** (E2E testing): Provides real-HTTP device-flow E2E tests
 
+## Reference HTTP Server Harness
+
+**NEW**: Added complete reference HTTP server implementation in `packages/saas/reference/enrollment-server.ts`:
+
+- ✅ **HTTP Endpoints**: `/api/enroll`, `/api/poll`, `/enroll` (UI), `/approve`, `/deny`
+- ✅ **Web UI**: Beautiful operator approval interface at `packages/saas/reference/enrollment-ui.html`
+- ✅ **CORS Support**: Configured for cross-origin requests
+- ✅ **Error Handling**: Comprehensive error responses
+- ✅ **Console Logging**: Detailed request/response logging
+- ✅ **Graceful Shutdown**: SIGINT handling
+
+**Plugin Example**: Added enrollment example script at `packages/plugin/examples/enrollment-example.ts`:
+- ✅ **Complete Flow**: Demonstrates enrollment from start to finish
+- ✅ **Credential Persistence**: Shows local storage and reuse
+- ✅ **Console Output**: Clear progress messages
+- ✅ **Environment Config**: Configurable URLs and IDs
+
 ## Known Limitations (Phase B Scope)
 
 1. **NKEY Signing**: Placeholder implementation for NATS JWT signing. In production, this would use the official `nats.js` library's JWT signing functions. The structure and permissions are correct for NATS compatibility.
@@ -174,7 +191,7 @@ This AC 2 implementation integrates with:
 
 3. **In-Memory Store**: Default enrollment store is in-memory. Production deployments should use a persistent store (Redis, database, etc.) via the `EnrollmentStore` interface.
 
-4. **HTTP Reference**: HTTP helpers are reference implementations. Production SaaS may use different web frameworks (Express, Cloudflare Workers, etc.) - the core enrollment logic is framework-agnostic.
+4. **HTTP Reference**: HTTP server is for demonstration only. Production SaaS should use proper web frameworks with TLS, authentication, and production-grade error handling.
 
 ## Verification Steps
 
@@ -201,7 +218,7 @@ To verify AC 2 implementation once dependencies are installed:
    node packages/saas/dist/reference/enrollment-server.js
 
    # In another terminal, start plugin with enrollment
-   node packages/plugin/dist/enrollment-example.js
+   node packages/plugin/dist/examples/enrollment-example.js
    ```
 
 5. **Verify credential persistence**:
@@ -211,7 +228,17 @@ To verify AC 2 implementation once dependencies are installed:
    # Should show: -rw------- (0o600)
 
    # Restart plugin - should skip enrollment and use stored credentials
-   node packages/plugin/dist/enrollment-example.js
+   node packages/plugin/dist/examples/enrollment-example.js
+   ```
+
+6. **Test operator approval UI**:
+   ```bash
+   # With enrollment server running, visit:
+   # http://localhost:3000/enroll?user_code=ABCD-1234
+   #
+   # The UI will show the user code and allow you to:
+   # - Click "Approve" to issue NATS credentials
+   # - Click "Deny" to reject the enrollment
    ```
 
 ## File Structure
@@ -221,11 +248,15 @@ To verify AC 2 implementation once dependencies are installed:
 - `src/device-flow-enrollment.ts` - Core enrollment service
 - `src/device-flow-enrollment.test.ts` - Comprehensive tests
 - `src/index.ts` - Public API exports
+- `reference/enrollment-server.ts` - HTTP server harness
+- `reference/enrollment-ui.html` - Operator approval UI
+- `reference/setup-trust-chain.ts` - Trust chain CLI harness
 
 **Plugin Package (packages/plugin/):**
 - `src/enrollment-client.ts` - Plugin enrollment client
 - `src/enrollment-client.test.ts` - Comprehensive tests
 - `src/enrolled-nats-connection.ts` - Integrated enrollment + NATS connection
+- `examples/enrollment-example.ts` - Enrollment flow demonstration
 
 ## Conclusion
 

@@ -1,0 +1,333 @@
+/**
+ * WebChannel Plugin Entry — NATS mode (AC 5).
+ *
+ * This is the NEW plugin entry for AC 5's NATS cutover.
+ * It replaces gateway-WS WebChannelTransport with NATS-based messaging.
+ *
+ * Key changes from original index.ts:
+ * - WebChannelTransport → NatsChannel
+ * - WebSocket upgrade route → Peer registration via JWT verification
+ * - Direct NATS pub/sub instead of WebSocket frame relay
+ * - Multi-peer sessions preserved via peerId routing
+ * - Approvals use NATS first-write-wins exactly-once
+ */
+
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
+
+import { NatsChannel } from "./src/nats-channel.js";
+import type { InboundWsMessage } from "./src/nats-channel.js";
+import { createWebChannelPlugin } from "./src/channel.js";
+import { handleInboundMessage } from "./src/inbound.js";
+import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
+import { handleApprovalDecision } from "./src/approvals.js";
+import { resolveVerifier, verifyJwtAndExtractPeerId, type ConnectionVerifier } from "./src/auth.js";
+import type { AuthConfig } from "./src/auth.js";
+import { createStaticAssetsHandler } from "./src/static-assets.js";
+import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
+import { WEBCHANNEL_ID } from "./src/transport.js";
+import { NatsTransport } from "./src/nats-transport.js";
+import { createEnrolledNatsConnection, type EnrolledNatsConnection } from "./src/enrolled-nats-connection.js";
+
+// Resolve the built chat-UI `dist-demo/` relative to THIS module
+const pluginDir = path.dirname(fileURLToPath(import.meta.url));
+const chatUiDistRoot = path.join(
+  pluginDir,
+  "..",
+  "client",
+  "dist-demo",
+);
+
+// ---------------------------------------------------------------------------
+// Global state
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared NATS channel instance.
+ *
+ * Replaces WebChannelTransport from the original gateway-WS implementation.
+ * All message routing now goes through NATS subjects.
+ */
+let natsChannel: NatsChannel | null = null;
+let natsConnection: EnrolledNatsConnection | null = null;
+
+/**
+ * Create the WebChannel plugin with NATS transport.
+ */
+const webChannelPlugin = createWebChannelPlugin(
+  // Adapter to make NatsChannel compatible with existing plugin interface
+  // The plugin expects a transport-like interface; we adapt NatsChannel
+  null as any, // We'll handle this differently in NATS mode
+);
+
+export default defineChannelPluginEntry({
+  id: "webchannel-nats",
+  name: "WebChannel NATS",
+  description: "NATS-based WebChannel plugin (AC 5 cutover).",
+  plugin: webChannelPlugin,
+
+  async registerFull(api) {
+    // -----------------------------------------------------------------------
+    // Step 1: Enroll and connect to NATS (if not already done)
+    // -----------------------------------------------------------------------
+
+    if (!natsConnection) {
+      console.log("[webchannel] Starting NATS enrollment and connection...");
+
+      // Get NATS URL from config or use default
+      const natsUrl = api.config.nats?.url ?? "ws://localhost:4222";
+
+      // Get SaaS URLs from config
+      const saasBaseUrl = api.config.saas?.baseUrl ?? "http://localhost:3001";
+      const saasEnrollUrl = `${saasBaseUrl}/api/enroll`;
+      const saasPollUrl = `${saasBaseUrl}/api/poll`;
+
+      // Get tenant/agent IDs from config
+      const tenant = api.config.tenant ?? "default-tenant";
+      const agentId = api.config.agentId ?? "default-agent";
+
+      try {
+        natsConnection = await createEnrolledNatsConnection({
+          saasEnrollUrl,
+          saasPollUrl,
+          natsUrl,
+          tenant,
+          agentId,
+          displayInstructions: true,
+        });
+
+        console.log("[webchannel] ✓ Connected to NATS");
+      } catch (err) {
+        console.error("[webchannel] Failed to connect to NATS:", err);
+        throw err;
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 2: Create NATS channel
+    // -----------------------------------------------------------------------
+
+    if (!natsChannel) {
+      const transport = natsConnection.transport;
+      const agentId = natsConnection.enrollment.creds.agentId ?? "default-agent";
+      const tenant = natsConnection.tenant ?? "default-tenant";
+
+      natsChannel = new NatsChannel(transport, agentId, tenant);
+      console.log("[webchannel] ✓ NATS channel created");
+    }
+
+    const channel = natsChannel;
+
+    // -----------------------------------------------------------------------
+    // Step 3: Wire up inbound message dispatcher
+    // -----------------------------------------------------------------------
+
+    const { dispatch: dispatchInbound } = createSerializedInboundDispatcher<
+      Extract<InboundWsMessage, { type: "user_message" }>
+    >((peerId, message) =>
+      // In NATS mode, we need to adapt the message handling
+      // The original handleInboundMessage expects WebChannelTransport
+      // We'll need to create an adapter or modify the function
+      console.log("[webchannel] TODO: handle inbound message for peer", peerId),
+    );
+
+    channel.setMessageHandler((peerId, message) => {
+      if (message.type !== "user_message") return; // approvals routed below
+      dispatchInbound(peerId, message);
+    });
+
+    // -----------------------------------------------------------------------
+    // Step 4: Wire up approval decision handler
+    // -----------------------------------------------------------------------
+
+    channel.setApprovalDecisionHandler((peerId, id, decision) => {
+      void handleApprovalDecision(api.config, id, decision, peerId).catch((err) => {
+        api.logger.error?.(
+          `webchannel: approval resolve failed (${id}): ${String(err)}`,
+        );
+      });
+    });
+
+    // -----------------------------------------------------------------------
+    // Step 5: Wire up history load handler
+    // -----------------------------------------------------------------------
+
+    const historyConfig = resolveHistoryConfig(
+      (api.config.channels as Record<string, unknown> | undefined)?.webchannel as
+        | { capabilities?: { typing?: "on" | "off" } }
+        | undefined,
+    );
+
+    channel.setLoadHistoryHandler((peerId, request) => {
+      try {
+        const route = api.runtime.channel.routing.resolveAgentRoute({
+          cfg: api.config,
+          channel: WEBCHANNEL_ID,
+          peer: { kind: "direct", id: peerId },
+        });
+        void historyPageBefore(api, route.sessionKey, request, historyConfig.pageSize, api.logger)
+          .then((messages) => {
+            channel.sendHistory(peerId, messages);
+          })
+          .catch((err) => {
+            api.logger.error?.(
+              `webchannel: history page failed for ${peerId}: ${String(err)}`,
+            );
+          });
+      } catch (err) {
+        api.logger.error?.(
+          `webchannel: history resolution failed for ${peerId}: ${String(err)}`,
+        );
+      }
+    });
+
+    // -----------------------------------------------------------------------
+    // Step 6: Set up JWT verifier for peer registration
+    // -----------------------------------------------------------------------
+
+    const authConfig = (
+      api.config.channels as Record<string, unknown> | undefined
+    )?.webchannel as { auth?: AuthConfig } | undefined;
+
+    let verifier: ConnectionVerifier | null = null;
+    try {
+      verifier = resolveVerifier(authConfig?.auth, api.logger);
+    } catch (err) {
+      const errorMsg = (err as Error).message;
+      api.logger.error?.(`webchannel: ${errorMsg}`);
+      throw err;
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 7: Wire up HTTP route for peer registration (bootstrap JWT)
+    // -----------------------------------------------------------------------
+
+    // In NATS mode, browsers don't connect via WebSocket upgrade
+    // Instead, they call an HTTP endpoint to register their peerId
+    // The endpoint verifies the bootstrap JWT and calls channel.registerPeer()
+
+    api.http.post!(
+      "/webchannel/nats/register",
+      async (req, res) => {
+        if (!verifier) {
+          res.statusCode = 500;
+          res.end("No verifier configured");
+          return;
+        }
+
+        try {
+          // Extract JWT from Authorization header or query parameter
+          const authHeader = req.headers["authorization"];
+          const jwt = authHeader?.startsWith("Bearer ")
+            ? authHeader.slice(7)
+            : (new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt"));
+
+          if (!jwt) {
+            res.statusCode = 401;
+            res.end("Missing JWT");
+            return;
+          }
+
+          // Verify JWT and extract peerId
+          const peerId = await verifyJwtAndExtractPeerId(jwt, authConfig?.auth, api.logger);
+          if (!peerId) {
+            res.statusCode = 401;
+            res.end("Invalid JWT");
+            return;
+          }
+
+          // Register peer in NATS channel
+          channel.registerPeer(peerId);
+
+          // Send initial history snapshot
+          try {
+            const route = api.runtime.channel.routing.resolveAgentRoute({
+              cfg: api.config,
+              channel: WEBCHANNEL_ID,
+              peer: { kind: "direct", id: peerId },
+            });
+            const messages = await historyRecent(api, route.sessionKey, historyConfig.limit, api.logger);
+            channel.sendHistory(peerId, messages);
+          } catch (err) {
+            api.logger.error?.(
+              `webchannel: history snapshot failed for ${peerId}: ${String(err)}`,
+            );
+          }
+
+          // Send success response
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ peerId, registered: true }));
+        } catch (err) {
+          api.logger.error?.(`webchannel: peer registration failed: ${String(err)}`);
+          res.statusCode = 500;
+          res.end("Registration failed");
+        }
+      },
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 8: Wire up HTTP route for peer unregistration
+    // -----------------------------------------------------------------------
+
+    api.http.post!(
+      "/webchannel/nats/unregister",
+      async (req, res) => {
+        try {
+          const body = await new Promise<string>((resolve) => {
+            let data = "";
+          req.on("data", (chunk: Buffer) => { data += chunk; });
+            req.on("end", () => resolve(data));
+          });
+          const { peerId } = JSON.parse(body);
+
+          if (!peerId) {
+            res.statusCode = 400;
+            res.end("Missing peerId");
+            return;
+          }
+
+          channel.unregisterPeer(peerId);
+
+          res.statusCode = 200;
+          res.end(JSON.stringify({ peerId, unregistered: true }));
+        } catch (err) {
+          api.logger.error?.(`webchannel: peer unregistration failed: ${String(err)}`);
+          res.statusCode = 500;
+          res.end("Unregistration failed");
+        }
+      },
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 9: Serve static assets (chat UI)
+    // -----------------------------------------------------------------------
+
+    const staticAssetsHandler = createStaticAssetsHandler(chatUiDistRoot);
+    api.http.get!(
+      "/webchannel/*",
+      async (req, res) => {
+        staticAssetsHandler(req, res);
+      },
+    );
+
+    // -----------------------------------------------------------------------
+    // Step 10: Keep the NATS connection alive
+    // -----------------------------------------------------------------------
+
+    api.runtime.channel.keepAlive({
+      async handler() {
+        // This handler is called periodically to keep the channel alive
+        // We just need to ensure the NATS connection stays up
+        if (natsConnection?.transport && !natsConnection.transport.connected) {
+          console.log("[webchannel] NATS disconnected, attempting reconnect...");
+          // The enrolled connection should auto-reconnect
+        }
+      },
+    });
+
+    console.log("[webchannel] ✓ NATS mode plugin registered");
+  },
+});

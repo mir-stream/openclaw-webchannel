@@ -338,3 +338,70 @@ export function resolveVerifier(
       );
   }
 }
+
+/**
+ * Verify a JWT and extract the peerId (for NATS peer registration).
+ *
+ * This is a helper function for AC 5's NATS mode where browsers register
+ * their peerId via HTTP POST with a bootstrap JWT. The function verifies
+ * the JWT signature and claims, then returns the peerId from the `sub` claim.
+ *
+ * @param jwt - The compact JWT string.
+ * @param authConfig - The auth configuration (must be 'jwt' strategy).
+ * @param logger - Optional logger.
+ * @returns The peerId from the JWT `sub` claim, or `null` if verification fails.
+ *
+ * @throws If authConfig is not configured or strategy is not 'jwt'.
+ */
+export async function verifyJwtAndExtractPeerId(
+  jwt: string,
+  authConfig: AuthConfig | undefined | null,
+  logger?: AuthLogger,
+): Promise<string | null> {
+  if (!authConfig || typeof authConfig !== "object") {
+    throw new Error("webchannel: auth config is required for JWT verification");
+  }
+
+  if (authConfig.strategy !== "jwt") {
+    throw new Error(`webchannel: cannot verify JWT with strategy "${authConfig.strategy}" (expected "jwt")`);
+  }
+
+  const jwtCfg = authConfig as { jwt?: JwtAuthConfig };
+
+  if (!jwtCfg.jwt || typeof jwtCfg.jwt !== "object") {
+    throw new Error("webchannel: auth.jwt block is required for JWT verification");
+  }
+
+  // Build JWKS cache
+  const jwksCache = JWKSCache.create(
+    {
+      jwksUrl: jwtCfg.jwt.jwksUrl,
+      jwksFile: jwtCfg.jwt.jwksFile,
+      jwks: jwtCfg.jwt.jwks,
+    },
+    jwtCfg.jwt._fetchImpl !== undefined
+      ? { fetchImpl: jwtCfg.jwt._fetchImpl }
+      : undefined,
+  );
+
+  // Verify JWT
+  const identity = await verifyJwt(jwt, {
+    jwks: jwksCache,
+    issuer: jwtCfg.jwt.issuer,
+    audience: jwtCfg.jwt.audience,
+    clockSkewSec: jwtCfg.jwt.clockSkew,
+  });
+
+  if (!identity) {
+    logger?.error?.("webchannel: JWT verification failed");
+    return null;
+  }
+
+  // Store device public key from cnf claim (AC 4)
+  if (identity.devicePublicKey) {
+    storePinnedDeviceKey(identity.peerId, identity.devicePublicKey);
+  }
+
+  logger?.info?.(`webchannel: JWT verified for peerId="${identity.peerId}"`);
+  return identity.peerId;
+}

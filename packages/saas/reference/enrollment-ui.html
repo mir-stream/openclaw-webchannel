@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebChannel Plugin Enrollment</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 600px;
+      margin: 50px auto;
+      padding: 20px;
+      text-align: center;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      box-sizing: border-box;
+    }
+    .container {
+      background: white;
+      border-radius: 12px;
+      padding: 40px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+    }
+    h1 {
+      color: #333;
+      margin-bottom: 30px;
+      font-size: 28px;
+    }
+    .user-code {
+      font-size: 48px;
+      font-weight: bold;
+      letter-spacing: 8px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 30px;
+      border-radius: 12px;
+      margin: 30px 0;
+      font-family: "Courier New", monospace;
+      text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+    }
+    .button-group {
+      margin: 40px 0;
+      display: flex;
+      gap: 20px;
+      justify-content: center;
+    }
+    button {
+      font-size: 18px;
+      padding: 16px 32px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: bold;
+      transition: all 0.3s ease;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+    }
+    .approve {
+      background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+      color: white;
+    }
+    .deny {
+      background: linear-gradient(135deg, #f44336 0%, #da190b 100%);
+      color: white;
+    }
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+    }
+    button:active {
+      transform: translateY(0);
+    }
+    .info {
+      background: #e3f2fd;
+      padding: 20px;
+      border-radius: 8px;
+      margin: 20px 0;
+      text-align: left;
+      border-left: 4px solid #2196F3;
+    }
+    .info h3 {
+      margin-top: 0;
+      color: #1976D2;
+    }
+    .info ul {
+      margin: 10px 0;
+      padding-left: 20px;
+    }
+    .info li {
+      margin: 8px 0;
+    }
+    #status {
+      margin: 30px 0;
+      padding: 20px;
+      border-radius: 8px;
+      font-weight: bold;
+    }
+    .pending {
+      background: #fff3cd;
+      color: #856404;
+      border: 2px solid #ffc107;
+    }
+    .approved {
+      background: #d4edda;
+      color: #155724;
+      border: 2px solid #28a745;
+    }
+    .denied {
+      background: #f8d7da;
+      color: #721c24;
+      border: 2px solid #dc3545;
+    }
+    .details {
+      text-align: left;
+      margin-top: 20px;
+      padding: 15px;
+      background: #f8f9fa;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    .details strong {
+      color: #495057;
+    }
+    .spinner {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 3px solid rgba(0,0,0,0.3);
+      border-radius: 50%;
+      border-top-color: #000;
+      animation: spin 1s ease-in-out infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🔐 WebChannel Plugin Enrollment</h1>
+
+    <div class="info">
+      <h3>Plugin Enrollment Request</h3>
+      <p>A WebChannel plugin is requesting enrollment. Review the details below and approve or deny the request.</p>
+    </div>
+
+    <div class="user-code">{{USER_CODE}}</div>
+
+    <div class="button-group">
+      <button class="approve" onclick="approveEnrollment()">✓ Approve</button>
+      <button class="deny" onclick="denyEnrollment()">✗ Deny</button>
+    </div>
+
+    <div id="status"></div>
+
+    <div class="info">
+      <h3>What happens when you approve?</h3>
+      <ul>
+        <li>🔑 Plugin receives NATS user credentials for secure messaging</li>
+        <li>🔒 Plugin's X25519 public key is registered with SaaS</li>
+        <li>🆔 Unique Peer ID is generated for session routing</li>
+        <li>🌐 Plugin can now connect to NATS and handle browser requests</li>
+        <li>✨ No secrets to copy-paste - everything is automated</li>
+      </ul>
+    </div>
+
+    <div class="info">
+      <h3>Security & Privacy</h3>
+      <ul>
+        <li>🔐 Plugin is ingress-free (outbound-only connections)</li>
+        <li>🛡️ X25519 encryption for end-to-end secure messaging</li>
+        <li>📝 Enrollment follows RFC 8628 device authorization grant</li>
+        <li>⏱️ User codes expire after 10 minutes</li>
+        <li>🚫 No credentials stored in browser - tokens only in plugin memory</li>
+      </ul>
+    </div>
+  </div>
+
+  <script>
+    const userCode = "{{USER_CODE}}";
+    const statusEl = document.getElementById("status");
+
+    async function approveEnrollment() {
+      statusEl.className = "pending";
+      statusEl.innerHTML = '<div class="spinner"></div> Processing approval...';
+
+      try {
+        const res = await fetch("/approve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_code: userCode })
+        });
+
+        const result = await res.json();
+
+        if (result.success) {
+          statusEl.className = "approved";
+          statusEl.innerHTML = "✓ Enrollment Approved!<br><br>" +
+            '<div class="details">' +
+            "<strong>Plugin Details:</strong><br>" +
+            "Agent ID: " + (result.agentId || "N/A") + "<br>" +
+            "Tenant: " + (result.tenant || "N/A") + "<br>" +
+            "Peer ID: " + result.peerId + "<br>" +
+            "</div>";
+
+          // Disable buttons
+          document.querySelectorAll("button").forEach(btn => {
+            btn.disabled = true;
+            btn.style.opacity = "0.5";
+            btn.style.cursor = "not-allowed";
+          });
+        } else {
+          statusEl.className = "denied";
+          statusEl.textContent = "✗ Approval failed: " + (result.error || "Unknown error");
+        }
+      } catch (err) {
+        statusEl.className = "denied";
+        statusEl.textContent = "✗ Network error: " + err.message;
+      }
+    }
+
+    async function denyEnrollment() {
+      statusEl.className = "pending";
+      statusEl.innerHTML = '<div class="spinner"></div> Processing denial...';
+
+      try {
+        const res = await fetch("/deny", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_code: userCode })
+        });
+
+        const result = await res.json();
+
+        if (result.success) {
+          statusEl.className = "denied";
+          statusEl.textContent = "✗ Enrollment Denied";
+
+          // Disable buttons
+          document.querySelectorAll("button").forEach(btn => {
+            btn.disabled = true;
+            btn.style.opacity = "0.5";
+            btn.style.cursor = "not-allowed";
+          });
+        } else {
+          statusEl.className = "denied";
+          statusEl.textContent = "✗ Denial failed: " + (result.error || "Unknown error");
+        }
+      } catch (err) {
+        statusEl.className = "denied";
+        statusEl.textContent = "✗ Network error: " + err.message;
+      }
+    }
+
+    // Auto-refresh status if enrollment is pending
+    let checkInterval = setInterval(async () => {
+      try {
+        const res = await fetch("/api/poll", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ device_code: "placeholder" }) // This would need real device code
+        });
+        // Note: In a real implementation, we'd poll with the actual device code
+        // For this reference UI, we rely on explicit operator action
+      } catch (err) {
+        // Ignore polling errors in this reference implementation
+      }
+    }, 5000);
+
+    // Stop polling when user leaves page
+    window.addEventListener("beforeunload", () => {
+      clearInterval(checkInterval);
+    });
+  </script>
+</body>
+</html>

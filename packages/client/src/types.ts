@@ -107,6 +107,31 @@ export type WebChannelOptions = {
    * trusted-header auth).
    */
   getTicket?: () => Promise<string | null>;
+  // -----------------------------------------------------------------------
+  // NATS mode options (AC 5: NATS cutover)
+  // -----------------------------------------------------------------------
+  /**
+   * NATS WebSocket URL. When provided, client connects directly to NATS
+   * instead of gateway-WS. Requires bootstrapJwt, agentId, tenant, and peerId.
+   */
+  natsUrl?: string;
+  /**
+   * Bootstrap JWT (RS256-signed) from SaaS. Required for NATS mode.
+   * Contains cnf.jwk claim with device public key.
+   */
+  bootstrapJwt?: string;
+  /**
+   * Agent ID (from JWT claims). Required for NATS mode.
+   */
+  agentId?: string;
+  /**
+   * Tenant ID (from JWT claims). Required for NATS mode.
+   */
+  tenant?: string;
+  /**
+   * Peer ID (JWT sub claim). Required for NATS mode.
+   */
+  peerId?: string;
 };
 
 /** Wire envelope sent TO the gateway. Mirrors `src/transport.ts`. */
