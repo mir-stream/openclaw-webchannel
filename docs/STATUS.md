@@ -24,8 +24,10 @@ this file, **this file is correct.**
   refuses to boot without encryption; `NatsChannel` answers a per-peer X25519 handshake and
   ChaCha20-Poly1305-seals every frame) AND the browser (`WebChannelNatsClient` handshakes, seals
   outbound, decrypts inbound, buffers sends until the key exists). Neither ever emits plaintext.
-- **Not done:** real ClawHub/npm publish (needs registry creds), and the PoP producer-side wiring
-  (SaaS mint + browser sign) for a live register-route test.
+- **Proof-of-Possession is complete on both sides** — the gate (verify) rejects bad/missing/expired
+  proofs, and the producer (SaaS mints `pop_jwk`; the browser `registerWithPop` signs the nonce
+  challenge) makes the positive path work, proven against a faithful verifier replica.
+- **Not done:** real ClawHub/npm publish (needs registry creds). Everything else hermetic is green.
 
 ## What works (verified)
 
@@ -42,16 +44,16 @@ this file, **this file is correct.**
 | **Encrypted NATS entry (encrypt-by-construction) + fail-closed boot (AC 3a)** — agent answers a per-peer X25519 handshake, seals/opens every frame, drops anything it can't decrypt; `index-nats.ts` refuses to boot when encryption is disabled | `nats-channel.ts` crypto mode + `e2e-session.ts` + `encryption-policy.ts` + `index-nats.ts`; `nats-channel-crypto.test.ts` (7, incl. wiretap-ciphertext-only + tampered-AAD drop) + `encryption-policy.test.ts` (4). `3c78c64`. |
 | **AAD-mismatch fails decryption (AC 2)** — tampering any plaintext routing field after sealing breaks the canonical-AAD binding and the frame is dropped | `nats-channel-crypto.test.ts` (tampered-routing drop + untampered-accept control); codec-level binding in `e2e-envelope.ts` `canonicalAad`. `3c78c64`. |
 | **Production browser client is encrypted + fail-closed** — `WebChannelNatsClient` does the X25519 handshake, seals outbound to `.in`, decrypts inbound from `.out`, buffers sends until the key exists; also fixes two latent bugs (binary ws frames; reversed subject direction) | `nats-client.ts` + shared `e2e-crypto-browser.ts`; `nats-client-crypto.test.ts` (8: handshake round-trip, ciphertext-only wire, fail-closed buffering, drop-on-bad-decrypt, AAD/KDF spec conformance). `6308867`. |
+| **PoP producer side (gap ① positive path)** — SaaS mints `pop_jwk` (Ed25519) alongside `cnf.jwk`; the browser generates a device Ed25519 key and `registerWithPop` runs challenge→sign→register | `saas/bootstrap-claims.ts` + `client/pop-register.ts`; `pop-register.test.ts` (7, interop vs a node:crypto verifier replicating `PopChallengeStore.verify`) + `bootstrap-claims.test.ts` (5). `4edba6e`. |
 
-**Test suite: 762 unit passing (+ 8 e2e under nats-server), typecheck clean across all 3 workspaces.**
+**Test suite: 774 unit passing (+ 8 e2e under nats-server), typecheck clean across all 3 workspaces.**
 
 ## What does NOT work yet
 
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
-| PoP producer-side wiring | The PoP *gate* (verification) is done + tested. The *producer* side — SaaS minting the device Ed25519 key into the bootstrap JWT `pop_jwk`, and the browser doing the challenge→sign round-trip — is not yet wired, so there is no live register-route end-to-end test (only the gate's unit tests). |
-| Production pair not yet on the live nats-server gate | Both production ends now encrypt and are unit-tested (incl. a fake-nats handshake round-trip), but the *live* gate still drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` seam against a real nats-server. Pointing the live gate at `WebChannelNatsClient` ↔ `index-nats` is a follow-up (the two seams share one wire protocol, so interop holds transitively). |
+| Production pair not yet on the live nats-server gate | Both production ends now encrypt + PoP, and are unit-tested (incl. fake-nats handshake round-trip and a faithful PoP verifier replica), but the *live* gate still drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` seam against a real nats-server. Pointing the live gate at `WebChannelNatsClient` ↔ `index-nats` (incl. a real HTTP register-route hop) is a follow-up — the seams share one wire protocol, so interop holds transitively. |
 
 ## Coverage note
 
@@ -84,10 +86,10 @@ agent side made this worse and was removed in `ee89ba3`.)
 3. ✅ Explicit AAD-mismatch negative test (AC 2) — **done** (`3c78c64`).
 4. ✅ Encrypt the production browser client (`WebChannelNatsClient`): handshake + seal + fail-closed,
    matching the agent — **done** (`6308867`; also fixed binary-frame + reversed-subject bugs).
-5. Wire the PoP **producer** side: SaaS mints the device Ed25519 key into the bootstrap JWT
-   `pop_jwk`; the browser performs the challenge→sign round-trip. Then add a live register-route test.
+5. ✅ Wire the PoP **producer** side (SaaS mints `pop_jwk`; browser `registerWithPop` signs the
+   challenge) — **done** (`4edba6e`).
 6. (Optional) Point the live nats-server gate at the production pair (`WebChannelNatsClient` ↔
-   `index-nats`) instead of the parallel e2e seam.
+   `index-nats`, incl. a real HTTP register-route hop) instead of the parallel e2e seam.
 7. Packaging + **real** ClawHub/npm publish (registry creds) — or accept `DonePublishDeferred`.
 8. Merge `ooo/orch_554cce15442a` → `jwks`.
 
@@ -104,3 +106,4 @@ agent side made this worse and was removed in `ee89ba3`.)
 | `d49add0` | Ed25519 signed-nonce PoP at registration (AC3 gap ①) |
 | `3c78c64` | Encrypt-by-construction NATS entry + fail-closed boot guard (AC 3a) + AAD-mismatch test (AC 2) |
 | `6308867` | Encrypt the production browser client (handshake + seal + fail-closed); fix binary-frame + reversed-subject bugs |
+| `4edba6e` | PoP producer side — SaaS mints `pop_jwk`; browser `registerWithPop` signs the nonce challenge |
