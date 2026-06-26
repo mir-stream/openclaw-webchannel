@@ -91,12 +91,15 @@ export async function hkdfSha256(
   info: string,
   length: number,
 ): Promise<Uint8Array> {
-  const baseKey = await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]);
+  // Copy into fresh ArrayBuffer-backed views so the Web Crypto `BufferSource`
+  // typing is satisfied across TS versions (TS 5.7+ makes Uint8Array generic
+  // over ArrayBufferLike, which excludes SharedArrayBuffer-backed views).
+  const baseKey = await crypto.subtle.importKey("raw", new Uint8Array(ikm), "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
     {
       name: "HKDF",
       hash: "SHA-256",
-      salt: salt ?? new Uint8Array(32), // RFC 5869 default salt = 32 zero bytes
+      salt: new Uint8Array(salt ?? new Uint8Array(32)), // RFC 5869 default salt = 32 zero bytes
       info: new TextEncoder().encode(info),
     },
     baseKey,
