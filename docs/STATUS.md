@@ -1,23 +1,28 @@
 # Project Status — single source of truth
 
-_Last updated: 2026-06-26._
+_Last updated: 2026-06-27._
 
 This document supersedes any "AC 100% / complete / verified" claim found in commit messages,
 Ouroboros seeds (`.ouroboros/*`), evaluator scores, or older notes. Where those conflict with
 this file, **this file is correct.**
 
-> **Branch note:** the Phase B live-E2E work below is on branch `ooo/orch_554cce15442a`
-> (seed `seed_06e6a09afebf`), **not yet merged to `jwks`**. On `jwks` itself the NATS path
-> is still the older "components-only" state.
+> **Branch note:** Phase B (seed `seed_06e6a09afebf`) is **merged to `jwks`** (`c20b552`).
+> The production NATS pair is additionally **live-verified in a real openclaw gateway**
+> (`e384198`) — see "PRODUCTION pair live in REAL openclaw" below. To reproduce that live test,
+> see [`e2e/local/README.md`](../e2e/local/README.md).
 
 ## TL;DR
 
 - **The Gateway-WS path works end-to-end** (browser ↔ OpenClaw ↔ Claude) — the always-on baseline.
-- **The NATS E2E path now works end-to-end in an automated gate** (on this branch): a real
-  headless-Chromium browser dials a real `nats-server`, round-trips a ChaCha20-Poly1305 message
-  through the real openclaw agent loop, and decrypts the reply — in **both** dev/open-NATS and
-  enrolled-JWT modes, with the relay observing ciphertext only. This is the gap that was open for
-  months; it is closed and tested.
+- **The production NATS pair is live in a REAL openclaw gateway** (`e384198`): a real headless-Chromium
+  browser running the production `WebChannelNatsClient` round-trips an encrypted message through the
+  `index-nats` plugin loaded in a real openclaw gateway → real `inbound.run` → (deterministic echo
+  model) → back, decrypted. This closed the project's core "never run live" gap. Reproduce via
+  [`e2e/local/`](../e2e/local/README.md).
+- **The NATS E2E path also has an automated gate** (separate demo seam): a real headless-Chromium
+  browser dials a real `nats-server`, round-trips a ChaCha20-Poly1305 message through an in-repo echo
+  agent, and decrypts the reply — in **both** dev/open-NATS and enrolled-JWT modes, ciphertext-only on
+  the wire. (This gate uses `e2e-browser-client`/`e2e-roundtrip-agent`, not the production pair yet.)
 - **Authz is enforced** (default-deny allowlist at the inbound seam; Ed25519 signed-nonce PoP at
   registration).
 - **Both production ends are now encrypt-by-construction and fail-closed** — the agent (`index-nats.ts`
@@ -90,10 +95,23 @@ agent side made this worse and was removed in `ee89ba3`.)
    matching the agent — **done** (`6308867`; also fixed binary-frame + reversed-subject bugs).
 5. ✅ Wire the PoP **producer** side (SaaS mints `pop_jwk`; browser `registerWithPop` signs the
    challenge) — **done** (`4edba6e`).
-6. (Optional) Point the live nats-server gate at the production pair (`WebChannelNatsClient` ↔
-   `index-nats`, incl. a real HTTP register-route hop) instead of the parallel e2e seam.
-7. Packaging + **real** ClawHub/npm publish (registry creds) — or accept `DonePublishDeferred`.
-8. Merge `ooo/orch_554cce15442a` → `jwks`.
+6. ✅ Merge `ooo/orch_554cce15442a` → `jwks` — **done** (`c20b552`; + TS 5.9 fix `5bd7634`).
+7. ✅ Run the production pair (`WebChannelNatsClient` ↔ `index-nats`) live in a real openclaw
+   gateway — **done** (`e384198`; harness in `e2e/local/`).
+
+### Remaining follow-ups (none block the hermetic ACs)
+
+8. **Unblock openclaw plain-HTTP plugin routes** so the HTTP register + PoP hop is reachable live.
+   openclaw 2026.6.10 only dispatches WS-upgrade plugin routes; the dev path uses wildcard
+   auto-register as a stand-in. This is the one thing between "dev round-trip" and "full production
+   path incl. JWT/PoP registration over HTTP".
+9. **Fold `e2e/local` into the CI gate** (or point the existing gate at the production pair). The
+   automated gate still drives the parallel `e2e-browser-client`/`e2e-roundtrip-agent` demo seam.
+10. **Converge the demo pair into the production pair** (remove the parallel `e2e-roundtrip-agent` /
+    `e2e-browser-client` implementations; point `e2e-browser-client` crypto at shared `e2e-crypto-browser`).
+11. **Wire `registerWithPop` into the browser connect flow** (currently a standalone export; meaningful
+    once #8 lands).
+12. Packaging + **real** ClawHub/npm publish (registry creds) — or accept `DonePublishDeferred`.
 
 ## Commit landmarks
 
@@ -109,3 +127,6 @@ agent side made this worse and was removed in `ee89ba3`.)
 | `3c78c64` | Encrypt-by-construction NATS entry + fail-closed boot guard (AC 3a) + AAD-mismatch test (AC 2) |
 | `6308867` | Encrypt the production browser client (handshake + seal + fail-closed); fix binary-frame + reversed-subject bugs |
 | `4edba6e` | PoP producer side — SaaS mints `pop_jwk`; browser `registerWithPop` signs the nonce challenge |
+| `c20b552` | **Merge Phase B branch → `jwks`** (--no-ff) |
+| `5bd7634` | Fix browser HKDF typecheck under TS 5.7+ (`BufferSource`); surfaced by the merge's newer TS |
+| `e384198` | **Production pair live in REAL openclaw** + index-nats fixes (id, `registerHttpRoute`, `keepAlive` guard, dev/open-NATS, wildcard); `e2e/local` harness |

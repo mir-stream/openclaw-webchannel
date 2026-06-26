@@ -302,6 +302,12 @@ export default defineChannelPluginEntry({
     // In NATS mode, browsers don't connect via WebSocket upgrade
     // Instead, they call an HTTP endpoint to register their peerId
     // The endpoint verifies the bootstrap JWT and calls channel.registerPeer()
+    //
+    // KNOWN GAP (openclaw 2026.6.10): these plain-HTTP plugin routes register
+    // fine but are NOT dispatched by the gateway — only WS-upgrade plugin routes
+    // are. So this register/PoP hop is not reachable live yet; the dev/open-NATS
+    // path uses `channel.subscribeWildcard()` to auto-register peers instead.
+    // See docs/STATUS.md "follow-ups" and e2e/local/README.md.
 
     // PoP challenge (gap ①): issue a single-use nonce bound to the verified
     // peerId. The browser signs it with the device Ed25519 key and presents the

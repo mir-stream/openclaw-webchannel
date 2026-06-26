@@ -26,9 +26,11 @@ STATUS.md.
 ## Status
 
 - Gateway-WS channel: works (run it via an OpenClaw gateway with this plugin loaded in WS mode).
-- NATS entry: typecheck-clean, the inbound→agent and outbound seams are wired, but it is not
-  integration-tested and has no dev/open-NATS path — `index-nats.ts` hardcodes
-  `createEnrolledNatsConnection`, which requires the SaaS enrollment server + JWT.
+  This is the shipped default entry (`package.json` → `openclaw.extensions = ["./index.ts"]`).
+- NATS entry (`index-nats.ts`): **live-verified** in a real openclaw gateway (`e384198`). It has an
+  enrolled-creds path (SaaS device flow, default) AND an env-gated **dev/open-NATS** path
+  (`WEBCHANNEL_NATS_DEV_OPEN=1`) that connects to a plain local `nats-server` with no enrollment —
+  see [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
 ## Enrollment & credentials (NATS mode)
