@@ -1,0 +1,163 @@
+goal: Make the openclaw-webchannel Phase B browser↔NATS-relay↔plugin↔agent encrypted round-trip live-E2E-verified, secure-by-default (fail-closed), and authz-enforced, then wire and gate a real packaging/publish flow and a single blocking CI gate on top of the shipping Phase A (Gateway-WS) baseline to declare the plugin "done".
+task_type: code
+constraints:
+- Relay is nats-server's own built-in WebSocket listener (no separate relay process to build)
+- Browser dial seam uses the hand-rolled NATS wire-protocol client over native WebSocket (packages/client/src/nats-client.ts), NOT official nats.ws/@nats-io
+- Only packages/saas may use official @nats-io/nkeys+@nats-io/jwt (trust-chain only, not data-plane)
+- E2E gate must run hermetically in CI with NO hosted infra (setupTrustChain mints enrolled creds locally)
+- Gate must pass in BOTH dev/open-NATS mode AND locally-minted enrolled-JWT mode
+- 'Relay must observe ciphertext only: plaintext routing metadata allowed, envelope content must be ChaCha20-Poly1305 ciphertext'
+- 'Subject namespace is fixed in code (webchannel dot tenant dot agentId dot peerId dot in/out) and not reopened'
+- 'E2E envelope is fixed v1 JSON format (nonce 12B, ciphertext, tag 16B, base64url) shared with at-rest storage'
+- Agent must be the REAL openclaw runtime (inbound.run kernel) driven by a deterministic in-repo echo model provider — no live LLM, no network
+- The gate must drive a real headless Chromium browser through the dial seam (pure Node-only tests are insufficient)
+- The single blocking CI gate provisions a real nats-server v2.14 (installed/cached in CI); the existing silent describe.skipIf skip MUST become a hard fail
+- Real registry credentials (npm token + ClawHub auth) required as CI secrets for the publish step
+- Published packages must declare a pinned engines.node range matching the CI toolchain (engines currently unset)
+- 'AAD binding is canonical(routingMetadata) — tenant, agentId, sub, messageId, envelopeType, ts — so an AAD mismatch fails decryption'
+acceptance_criteria:
+- The full encrypted round-trip works live; a real browser (headless Chromium) sends a message and receives the agent's reply decrypted to the exact expected text, through a real nats-server and the real openclaw runtime, in both dev/open-NATS and locally-minted enrolled-JWT modes
+- The relay only ever sees ciphertext; an independent same-tenant subscriber observing the wire captures genuine ChaCha20-Poly1305 envelopes (valid AEAD, never the plaintext probe) and a tampered/mismatched AAD fails decryption, while only routing metadata stays visible
+- The channel is secure-by-default with three enforced negative paths, each asserted and reported independently — (a) a deployment without encryption refuses to start and never emits plaintext to the relay (fail-closed), (b) a non-allowlisted sender receives no reply and never reaches the agent (default-deny allowlist at the inbound seam), and (c) a sender with a wrong/missing/expired proof-of-possession is rejected and never registered (signed-nonce challenge at peer registration)
+- The three packages publish to ClawHub and npm on a release tag, gated behind the green E2E gate (semver not 0.0.0, private false, openclaw peerDependency, pinned engines.node, dist/exports/files + README + license per package); the publish job is wired and gated and either executes on publish or is deferred only when registry secrets are absent
+- The shipping Phase A behavior never regresses; all pre-existing test suites stay green with no reduction from the seed-time baseline of 712 tests on the jwks branch (across all 3 packages) and the 3-package typecheck passes, enforced by the single blocking gate
+ontology_schema:
+  name: WebChannelEncryptedRoundTrip
+  description: End-to-end encrypted message round-trip and trust-chain domain for the openclaw-webchannel NATS relay path
+  fields:
+  - name: tenant
+    type: string
+    description: NATS account scope isolating one SaaS tenant
+    required: true
+  - name: agentId
+    type: string
+    description: Routing key identifying the target openclaw agent
+    required: true
+  - name: peerId
+    type: string
+    description: Stable per-user browser session id equal to JWT sub
+    required: true
+  - name: subjectIn
+    type: string
+    description: Per-peer inbound NATS subject the plugin subscribes to
+    required: true
+  - name: subjectOut
+    type: string
+    description: Per-peer outbound NATS subject the plugin publishes to
+    required: true
+  - name: envelopeVersion
+    type: string
+    description: E2E envelope schema version v1
+    required: true
+  - name: routingMetadata
+    type: object
+    description: Plaintext relay-visible fields (agentId, tenant, sub, messageId, envelopeType, ts) and the canonical AAD source
+    required: true
+  - name: content
+    type: object
+    description: Ciphertext payload (nonce 12B, ciphertext, tag 16B base64url) ChaCha20-Poly1305 that the wiretap asserts
+    required: true
+  - name: aad
+    type: string
+    description: AAD equals canonical routingMetadata (tenant, agentId, sub, messageId, envelopeType, ts); authenticated but not carried; mismatch fails decryption
+    required: true
+  - name: authMode
+    type: string
+    description: dev/open-NATS or enrolled-JWT
+    required: true
+  - name: cnfJwk
+    type: object
+    description: Device public key pinned in bootstrap JWT cnf claim per RFC 7800
+    required: true
+  - name: popChallenge
+    type: object
+    description: Single-use short-TTL nonce bound to peerId signed by device private key for proof-of-possession
+    required: true
+  - name: allowFrom
+    type: array
+    description: Allowlist of permitted senders via security.dm.resolveAllowFrom with default-deny
+    required: true
+  - name: mentionDecision
+    type: object
+    description: Result of the inbound mention/DM gating decision whose shouldSkip blocks the kernel run
+    required: true
+  - name: encryptionRequired
+    type: boolean
+    description: Whether the channel must run encrypted (fail-closed if unmet)
+    required: true
+  - name: cryptoNatsChannel
+    type: object
+    description: Encrypt-by-construction channel the NATS entry must wire instead of the plaintext NatsChannel
+    required: true
+  - name: echoProvider
+    type: object
+    description: Deterministic in-repo openclaw model provider giving predictable replies with no live LLM
+    required: true
+  - name: releaseTag
+    type: string
+    description: Version/release tag gating the real npm and ClawHub publish job
+    required: true
+  - name: enginesNode
+    type: string
+    description: Pinned engines.node range declared by published packages matching the CI toolchain
+    required: true
+  - name: baselineTestCount
+    type: integer
+    description: Seed-time green pre-existing test count (712 on jwks across all 3 packages) the gate must preserve with no regressions
+    required: true
+  - name: e2eGate
+    type: object
+    description: The single blocking CI gate provisioning a real nats-server and running the live E2E plus negative paths across both modes
+    required: true
+evaluation_principles:
+- name: LiveSeamFidelity
+  description: Gate exercises the real hand-rolled browser dial seam and real openclaw inbound.run kernel with no test-doubles
+  weight: 0.95
+- name: CiphertextEvidence
+  description: Relay content proven genuine valid AEAD ciphertext (positive decrypt + negative non-plaintext + AAD-mismatch via wiretap)
+  weight: 0.9
+- name: SecureByDefaultFailClosed
+  description: Omitting encryption refuses to boot and never leaks plaintext; enrolled-JWT plus E2E is the default
+  weight: 0.9
+- name: AuthzCompleteness
+  description: Both negatives enforced at correct distinct seams (allowlist at inbound, PoP at registration) with default-deny
+  weight: 0.85
+- name: HermeticCIRunnability
+  description: Entire gate runs in CI with no hosted infra and no silent skips; absent nats-server hard-fails
+  weight: 0.85
+- name: ModeParity
+  description: All positive and negative assertions pass identically in both dev/open-NATS and enrolled-JWT modes
+  weight: 0.8
+- name: ReleaseCompleteness
+  description: Real npm and ClawHub publish with semver, peerDependency, dist/exports, README/license, pinned engines.node
+  weight: 0.7
+exit_conditions:
+- name: GateGreen
+  description: The single blocking E2E CI gate passes end-to-end
+  criteria: Live round-trip decrypts to expected plaintext in both modes AND all three negative paths (fail-closed no-boot/no-plaintext, allowlist deny, PoP reject) pass AND wiretap confirms ciphertext-only including AAD-mismatch failure
+- name: EncryptedChannelWired
+  description: NATS entry no longer emits plaintext
+  criteria: The NATS entry constructs the encrypt-by-construction channel and refuses to start when encryption is unconfigured, satisfying criterion 3a
+- name: BaselineIntact
+  description: Existing verification still holds
+  criteria: All pre-existing test suites remain green (at least the 712 seed-time baseline, no regressions) and all 3 packages typecheck-clean with the nats-server binary present
+- name: NodePinned
+  description: Engines version is pinned and verifiable
+  criteria: Each published package.json declares an engines.node range matching the CI toolchain and CI runs on that version
+- name: Done
+  description: Primary terminal state — plugin declared done
+  criteria: GateGreen holds AND all 3 packages are actually published to npm and ClawHub on a release tag with semver, peerDep, README/license, and pinned engines.node
+- name: DonePublishDeferred
+  description: Sole sanctioned alternative terminal state, supersedes Done ONLY when registry CI secrets/account are absent
+  criteria: GateGreen holds and the publish job is fully wired and gated but unexecuted because npm/ClawHub credentials are unavailable; everything hermetic is satisfied and only the registry push remains
+metadata:
+  seed_id: seed_06e6a09afebf
+  version: 1.0.4
+  ambiguity_score: 0.073
+  qa_score: 0.89
+  qa_threshold: 0.90
+  qa_accepted_below_threshold: true
+  qa_iterations: 5
+  interview_id: interview_20260626_005756
+  pm_id: pm_seed_interview_20260626_004643
+  created_at: '2026-06-26T01:22:15Z'

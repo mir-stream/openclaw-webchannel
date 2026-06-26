@@ -1,56 +1,58 @@
-# 3-패키지 상태 신뢰성 진단 판정 문서 (openclaw-webchannel)
+# openclaw-webchannel Phase B Completion (NATS E2E + Packaging/CI)
 
-*Created At: 2026-06-26T00:05:43.547697+00:00*
+*Created At: 2026-06-26T00:55:51.478038+00:00*
 
 ## Goal
 
-빌드/테스트는 통과하지만 저장소 상태를 신뢰할 수 없는 openclaw-webchannel(plugin/web/saas 3패키지) 프로젝트에 대해, 4개 완료조건 각각의 통과/불통과 여부와 근거를 담은 진단 판정 문서를 산출하여 PM이 후속 정리·병합을 결정할 근거를 제공한다.
+Close the gap to declare openclaw-webchannel 'done': make the Phase B browser↔NATS-relay↔plugin↔agent encrypted round-trip live-E2E-verified and secure-by-default, then complete packaging/publish and CI on top of the already-shipping Phase A (Gateway-WS) baseline.
 
 ## User Stories
 
-1. **As a** PM, **I want to** 현재 무엇이 진짜 동작 상태인지 4개 조건별 통과/불통과와 근거가 적힌 진단 판정 문서를 받는다, **so that** 주니어가 어지럽힌 저장소 상태를 신뢰할 수 있는지 판단하고 후속 remediation을 스스로 결정하기 위해.
-2. **As a** PM, **I want to** 녹색 게이트 3종(typecheck+build+test 731 passing)이 재현 가능하게 통과하는지 검증된 결과를 본다, **so that** 코드 동작 기반선이 신뢰 가능함을 확정하기 위해.
-3. **As a** PM, **I want to** 흩어진 AC 보고서 .md 난립 대신 STATUS.md 단일 진실원 정리 여부 판정을 받는다, **so that** 현재 상태의 단일 출처를 확보하기 위해.
-4. **As a** PM, **I want to** plugin/web/saas 3패키지의 빌드·의존·인터페이스 계약 일치 여부(특히 plugin build 스크립트 부재가 의도인지 누락인지) 판정을 받는다, **so that** 패키지 간 계약 모순을 식별하기 위해.
-5. **As a** PM, **I want to** 런타임 데모 실증 조건이 현재 가장 큰 신뢰 공백으로 기록된 진단을 본다, **so that** 데모 복구 및 증거 기준을 별도로 의사결정하기 위해.
+1. **As a** End-user (SaaS web visitor), **I want to** chat with the embedded openclaw agent over a NATS relay where the relay only ever sees ciphertext, **so that** private agent conversations whose confidentiality is not exposed to the relay infrastructure.
+2. **As a** Browser client integrator, **I want to** have the client library dial NATS directly from the browser via a wired, headless-Chromium-tested seam, **so that** the real browser-NATS path is exercised, not bypassed by a Node-only test.
+3. **As a** Platform/security owner, **I want to** have agent-side cnf/PoP verification enforced so messages with wrong/missing PoP are rejected, **so that** the live pipeline is authenticated, not just confidential.
+4. **As a** Tenant administrator, **I want to** have allowlist authorization wired through the plugin (resolveAccount + security.dm policy) with default-deny so non-allowlisted senders are denied, **so that** no open-by-default trust boundary is shipped.
+5. **As a** Developer / CI, **I want to** run the full E2E suite locally against an unauthenticated dev/open-NATS relay and locally-minted enrolled-JWT creds with no hosted infra, **so that** the completion gate is reproducible and gateable in CI.
+6. **As a** Plugin consumer, **I want to** install the published openclaw-webchannel plugin with proper dist/exports, peerDep, README and license from ClawHub, **so that** the plugin can be adopted as a real public package.
 
 ## Constraints
 
-- 산출물 범위는 진단 판정까지만 — .md 정리/jwks→main 머지/plugin build 결정 등 실제 remediation 수행은 포함하지 않음
-- 프로젝트는 openclaw plugin / web(client) 라이브러리 / saas 라이브러리 3개 패키지로 구성됨
-- 모든 실작업이 main이 아닌 jwks feature 브랜치에 미머지로 쌓여있음(main 대비 약 40,841줄 추가 / 약 27커밋)
-- 루트에 AC2~AC6 보고서 .md 9개가 추적된 채로 존재하고 packages/saas에도 AC1~AC3_*.md 중복 존재
-- plugin 패키지에는 build 스크립트가 없어 client·saas만 빌드됨
-- 조건 1·3·4는 에이전트가 자율 검증 가능(명령 재현, 파일 존재/내용 대조, 계약 비교)
-- 헤드리스 캡처 수단(playwright/puppeteer)이 저장소에 없음
-- 브라우저↔에이전트 데모가 현재 0개 — examples/live-e2e-chat가 ee89ba3에서 삭제됨(echo-bot이 진짜 OpenClaw가 아니라 아키텍처 오해 유발)
+- Phase A (Gateway-WS) is the shipping baseline and is already done; scope is gap-closing, not greenfield.
+- Authorization responsibility is split per OpenClaw channel-plugin docs: core evaluates policy via resolveInboundMentionDecision({facts, policy}); the plugin owns identity normalization, supplying allowlist data, and wiring the security seam.
+- The completion gate must be CI-runnable with NO hosted infra; enrolled-JWT creds are minted locally via setupTrustChain().
+- E2E gate must drive the client's real browser-NATS dial seam through headless Chromium (Playwright) against a real nats-server; Node-only tests are insufficient.
+- The relay must observe ciphertext only (E2E crypto: X25519+HKDF+ChaCha20Poly1305).
+- Default-deny is the shipped authorization posture.
+- Plugin must declare openclaw as a peerDep.
 
 ## Success Criteria
 
-1. 조건1(녹색 게이트 3종): typecheck(3패키지 clean) + build(client·saas 통과) + test(731 tests/39 files 전부 통과, 실제 nats-server AC6 device-flow E2E 포함)가 재현 가능하게 통과
-2. 조건2(런타임 데모 실증): 실제 브라우저↔에이전트 채팅이 NATS 경유로 최소 1회 도는 것 확인 — 현재 '검증 불가(미충족)'로 판정하고 biggest gap으로 기록
-3. 조건3(문서 단일 진실원): STATUS.md 하나가 현재 상태의 단일 출처로 정리됨
-4. 조건4(3-패키지 계약 일치): plugin/web/saas의 빌드·의존·인터페이스 계약이 서로 모순 없음, plugin build 스크립트 부재가 의도인지 누락인지 판정 포함
-5. 진단 문서가 4개 조건 각각에 대해 통과/불통과 여부와 근거를 명시
+1. Automated, CI-runnable test exercises the full round-trip 'browser msg → NATS relay → plugin → agent → reply → relay → browser' via Playwright/headless Chromium against a real nats-server, asserting relay observes ciphertext only.
+2. The same E2E test passes in BOTH dev/open-NATS mode and locally-minted enrolled-JWT mode.
+3. Dev/open-NATS path is implemented as a required deliverable (unauthenticated local relay for CI).
+4. Browser-dialing-NATS is wired in the client library.
+5. Gap ① (agent-side cnf/PoP verification) implemented with negative E2E test: wrong/missing PoP confirmation is REJECTED.
+6. Gap ③ (allowlist authz) implemented via plugin seam (resolveAccount + security.dm.resolveAllowFrom/resolvePolicy, defaultPolicy:'allowlist', honoring core decision) with negative E2E test: non-allowlisted sender is DENIED.
+7. Both negative tests (① and ③) run in both dev-NATS and enrolled-JWT modes within the Playwright + real nats-server harness.
+8. CI (.github workflows) exists and runs the gate.
+9. Packaging complete: plugin private:true→public, versioned (not 0.0.0), dist build/exports, README, license, openclaw peerDep declared, published to ClawHub.
 
 ## Assumptions
 
-- '뭔가 잘못됐다'는 코드가 깨진 문제가 아니라 '상태를 신뢰할 수 없는' 문제로 추정됨
-- 진짜 문제는 '무엇이 깨졌나'가 아니라 '지금 무엇이 진짜 동작 상태인지를 어떻게 신뢰/확정하느냐'로 추정됨
-- 조건 1·3·4는 자율 워크플로(에이전트)가 증거를 수집해 판정할 수 있다고 가정
-- index-nats.ts↔OpenClaw 에이전트 루프는 코드 seam만 구현된 상태이며 실행 런처/데모 없이 테스트로만 커버됨
+- docs/STATUS.md (updated 2026-06-26) is authoritative over saved memory; Phase B is component-verified but NOT live-E2E-verified, so Phase B is the central open gap.
+- Test-count drift (712 on jwks vs 731 @0041b37) is incidental churn, immaterial to scope.
+- The jwks branch is the working basis; index-nats.ts inbound/outbound seams are wired (commit 22133b5) and typecheck-clean but never run live.
+- Component-level results still hold: AC3 cross-tenant isolation enforced by real nats-server, device-flow E2E 10/10, AC1-6 typecheck-clean.
+- setupTrustChain() can mint enrolled creds locally, enabling enrolled-JWT mode to be gated in CI without hosted infra.
+- The OpenClaw plugin authorization split (core policy eval + plugin identity/allowlist wiring) makes gap ③ a real in-repo, E2E-testable seam rather than fully core-delegated.
 
 ## Decide Later
 
 The following items were deferred or identified as premature at this stage. They should be revisited when more context is available:
 
-- 조건 2(런타임 데모 실증)의 '통과' 판정에 인정되는 증거의 형태는 무엇인가요? (a) 사람(PM) 육안 서면 확인, (b) 에이전트 headless 캡처 로그·스크린샷, (c) 검증 불가(decide-later) — 증거 기준 및 데모 복구 여부는 진단 이후 PM이 별도 결정
-- AC 보고서 .md 파일 정리(루트 9개 + packages/saas 중복)
-- jwks feature 브랜치 → main 머지
-- plugin build 스크립트 추가/유지 결정
-- 삭제된 브라우저 데모(examples/live-e2e-chat) 복구 여부
-- headless 캡처 도구(playwright/puppeteer) 도입
+- Negative/rejection enforcement tests beyond what is gated — NOT deferred; folded in-gate (recorded as the rejected option 2/3).
+- A live manual demo against deployed/enrolled NATS infra (option c) is optional evidence, explicitly NOT part of the completion gate.
 
 ---
-*PM ID: pm_seed_interview_20260625_235505*
-*Interview ID: interview_20260625_235505*
+*PM ID: pm_seed_interview_20260626_004643*
+*Interview ID: interview_20260626_004643*
