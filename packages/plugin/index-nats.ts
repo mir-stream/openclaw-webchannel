@@ -12,9 +12,6 @@
  * - Approvals use NATS first-write-wins exactly-once
  */
 
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { NatsChannel } from "./src/nats-channel.js";
@@ -25,21 +22,11 @@ import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
 import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier, verifyJwtAndExtractPeerId, type ConnectionVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
-import { createStaticAssetsHandler } from "./src/static-assets.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { WEBCHANNEL_ID } from "./src/transport.js";
 import type { WebChannelTransport } from "./src/transport.js";
 import { NatsTransport } from "./src/nats-transport.js";
 import { createEnrolledNatsConnection, type EnrolledNatsConnection } from "./src/enrolled-nats-connection.js";
-
-// Resolve the built chat-UI `dist-demo/` relative to THIS module
-const pluginDir = path.dirname(fileURLToPath(import.meta.url));
-const chatUiDistRoot = path.join(
-  pluginDir,
-  "..",
-  "client",
-  "dist-demo",
-);
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -331,19 +318,7 @@ export default defineChannelPluginEntry({
     );
 
     // -----------------------------------------------------------------------
-    // Step 9: Serve static assets (chat UI)
-    // -----------------------------------------------------------------------
-
-    const staticAssetsHandler = createStaticAssetsHandler(chatUiDistRoot);
-    api.http.get!(
-      "/webchannel/*",
-      async (req, res) => {
-        staticAssetsHandler(req, res);
-      },
-    );
-
-    // -----------------------------------------------------------------------
-    // Step 10: Keep the NATS connection alive
+    // Step 9: Keep the NATS connection alive
     // -----------------------------------------------------------------------
 
     api.runtime.channel.keepAlive({

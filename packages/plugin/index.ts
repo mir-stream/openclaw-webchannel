@@ -1,6 +1,3 @@
-import { fileURLToPath } from "node:url";
-import path from "node:path";
-
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { WebChannelTransport } from "./src/transport.js";
@@ -11,22 +8,8 @@ import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
 import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
-import { createStaticAssetsHandler } from "./src/static-assets.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { WEBCHANNEL_ID } from "./src/transport.js";
-
-// Resolve the built chat-UI `dist-demo/` relative to THIS module, so the path is
-// correct regardless of the gateway's cwd. In the monorepo the plugin lives at
-// packages/plugin/ and the client at packages/client/, so this module's dir
-// (packages/plugin) joins `../client/dist-demo` — the framework-agnostic
-// openclaw-webchannel-client vanilla demo (build it with `npm run build:demo` there).
-const pluginDir = path.dirname(fileURLToPath(import.meta.url));
-const chatUiDistRoot = path.join(
-  pluginDir,
-  "..",
-  "client",
-  "dist-demo",
-);
 
 /**
  * Shared transport instance. The channel plugin (outbound) and the HTTP upgrade
@@ -215,21 +198,6 @@ export default defineChannelPluginEntry({
         transport.handleUpgrade(req, socket, head);
         return true;
       },
-    });
-
-    // Serve the built chat UI (the openclaw-webchannel-client vanilla demo) from the
-    // gateway under the `/webchannel/` prefix, so the whole demo runs from the
-    // gateway port with no separate web server. These assets are PUBLIC by
-    // design (`auth:
-    // "plugin"`): the page and its JS carry no secrets — authentication happens
-    // at the WebSocket connect (the verifier seam above). The exact
-    // `/webchannel/ws` route registered first takes precedence over this prefix
-    // route, so WS upgrades are unaffected; the handler also ignores `ws`.
-    api.registerHttpRoute({
-      path: "/webchannel/",
-      auth: "plugin",
-      match: "prefix",
-      handler: createStaticAssetsHandler(chatUiDistRoot),
     });
   },
 });

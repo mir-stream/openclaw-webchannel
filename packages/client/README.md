@@ -97,15 +97,13 @@ optional `isTyping` flag.
 
 ```bash
 npm run build       # tsc library build -> dist/ (JS + .d.ts)
-npm run build:demo  # vite build of the vanilla demo -> dist-demo/ (served by the gateway under /webchannel/)
-npm run dev         # vite dev server for the demo (proxies /webchannel/ws to ws://127.0.0.1:18789)
 npm run typecheck   # tsc --noEmit
 npm test            # vitest unit tests
 ```
 
-`index.html` is the entry for the vanilla (no-framework) Vite demo; the
-gateway statically serves the `dist-demo/` build under the `/webchannel/` path
-prefix.
+This package is a headless library only — there is no bundled demo UI. A
+consumer imports `WebChannelClient` and wires it into their own page (vanilla
+DOM, Vue, or a thin React `useSyncExternalStore` hook).
 
 `smoke-client.mjs` is a live round-trip against a running gateway with
 `hmac-ticket` auth — run it with `WEBCHANNEL_TICKET_SECRET` set (from

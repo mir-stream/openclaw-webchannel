@@ -113,6 +113,5 @@ npm test              # vitest run
 `package.json`); the plugin is loaded as TypeScript via OpenClaw's plugin loader. Packaging /
 publish to ClawHub is a known open question — see `../../docs/PACKAGING.md` and STATUS.md.
 
-The browser chat UI consumed by both entries is built separately in `packages/client`
-(`npm run build:demo` there, output `dist-demo/`), which `index.ts` / `index-nats.ts` serve from
-the gateway under `/webchannel/`.
+The plugin serves no static UI. It exposes the `/webchannel/ws` WebSocket route; a consumer
+wires the headless `packages/client` library into their own page (see that package's README).

@@ -57,9 +57,10 @@ This is the path that works today. It needs an OpenClaw gateway with this plugin
    - `plugins.load.paths`: `["<abs path>/packages/plugin"]`, `plugins.entries.webchannel.enabled: true`
    - `agents.defaults.model.primary`: a Claude model (e.g. `anthropic/claude-opus-4-8`), or reuse
      the Claude Code CLI login via `agentRuntime: { id: "claude-cli" }` (no API key needed)
-3. Build the chat UI: `npm run build:demo`
-4. Start the gateway: `openclaw gateway run` (defaults to `ws://127.0.0.1:18789`)
-5. Open the served chat UI in the browser.
+3. Start the gateway: `openclaw gateway run` (defaults to `ws://127.0.0.1:18789`)
+4. Connect over `/webchannel/ws`: run `node packages/client/smoke-client.mjs` to round-trip a
+   message, or wire the `openclaw-webchannel-client` library into your own page. (This repo ships
+   no browser chat UI — a consumer builds their own on top of the client library.)
 
 ## Develop / test
 

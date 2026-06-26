@@ -9,7 +9,6 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "build": "npm run build --workspaces --if-present",
-    "build:demo": "npm run build:demo --workspace openclaw-webchannel-client"
+    "build": "npm run build --workspaces --if-present"
   }
 }

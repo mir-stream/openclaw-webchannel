@@ -35,8 +35,7 @@ this file, **this file is correct.**
 | NATS plugin entry → agent bridge (`packages/plugin/index-nats.ts`) | Was a **skeleton**: inbound handler was `console.log("TODO: handle inbound message")` and the outbound transport was `null as any`. The two seams are **now implemented** (`22133b5`): inbound routes through `handleInboundMessage` → `api.runtime.channel.inbound.run`; a lazy `Proxy` transport binds to the live `NatsChannel` in `registerFull`. **Typecheck-clean, but not run live and not integration-tested.** |
 | NATS connection path for a local run | `index-nats.ts` hardcodes `createEnrolledNatsConnection` (requires the SaaS enrollment server + JWT). No dev/open-NATS path exists for a quick local run. |
 | Peer auth on the NATS register route | Requires a `jwt`/JWKS strategy; `anonymous`/`hmac-ticket` are rejected there. |
-| Browser dialing NATS in the live client | The client can speak the NATS WS protocol, but the live demo client is not wired to dial NATS / pub-sub the channel subjects. |
-| Built chat UI for NATS mode | `packages/client/dist-demo/` (served by `index-nats.ts`) is not built. |
+| Browser dialing NATS in the live client | The client library can speak the NATS WS protocol, but it is not wired to dial NATS / pub-sub the channel subjects. (A browser chat UI is consumer/product work — a consumer builds their own page on the client library; this repo ships no demo UI.) |
 | Agent-side cnf/PoP verification wiring (gap ①), allowlist authz (gap ③) | See `docs/TRUST_AND_ONBOARDING.md:186`. Authz is a core-delegated stub. |
 | Packaging / ClawHub publish | See `docs/PACKAGING.md` (marked 미완). |
 
@@ -71,7 +70,7 @@ agent side made this worse and was removed in `ee89ba3`.)
 
 1. ✅ Implement the inbound→agent and outbound seams in `index-nats.ts` — **done** (`22133b5`).
 2. Add a dev/open-NATS connection path (skip SaaS enrollment + JWT for local runs).
-3. Build the client chat UI (`dist-demo`) and wire it to dial NATS + pub/sub the channel subjects.
+3. Wire the client library to dial NATS + pub/sub the channel subjects (a browser UI on top is consumer product work, not part of this repo).
 4. Run an OpenClaw gateway with the NATS entry + a Claude model (the `claude-cli` runtime needs no
    API key).
 5. Add an **end-to-end integration test** for the full chain so this gap can't reopen silently.

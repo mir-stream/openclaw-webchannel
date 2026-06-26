@@ -141,7 +141,7 @@ createWebChannel({
 | `index.ts` | config `channels.webchannel.auth` → `resolveVerifier` → `transport.setVerifier` + WS·정적 라우트 |
 | `openclaw.plugin.json` | `channelConfigs.webchannel.schema.auth`(strategy enum + ticketSecret string\|{env} + ticketParam + `auth.jwt.{jwksUrl,jwks,jwksFile,issuer,audience,clockSkew}`) |
 | `openclaw-webchannel-client` (`packages/client/src/client.ts`) | `getTicket` 주입 → `?ticket=` + 재연결 재발급. (구 위젯 훅 `useWebChannel.ts`는 삭제) |
-| `packages/client/demo/devTicket.jwt.ts` | 데모용 RS256 발급 + 자체 키페어 영속 (브라우저 localStorage / Node `demo/.cache/`) |
+| `smoke/jwt.mjs`, `smoke-client.mjs` | node smoke 스크립트가 발급측(RS256 / hmac)을 수행해 라이브 게이트웨이 E2E 검증 |
 
 → **hmac-ticket E2E 라이브 검증됨(2026-06-15):** 유효 ticket 연결 + 에이전트 응답, 미·오 ticket 거절. (멀티유저 outbound/approval 라우팅 포함 — 더는 미해결 아님)
 → **jwt 빌트인 검증됨(2026-06-20):** vitest 53 케이스(RS256 7종 거절 + JWKS TTL·fail-closed·kid 회전 + auth fail-closed) 모두 통과. hmac-ticket 회귀 없음.
@@ -151,7 +151,7 @@ createWebChannel({
 ## 9. 미해결(후속)
 
 - **크로스오리진 게이트웨이 URL:** `openclaw-webchannel-client`는 `url` 옵션으로 **해결됨**(다른 오리진 게이트웨이 직접 지정). same-origin이면 `path`만으로 충분.
-- **SaaS 실연동:** 현재 데모는 **브라우저에서 ticket 발급**(`packages/client/demo/devTicket.ts`, DEV 전용, 시크릿 노출). 실서비스는 SaaS 백엔드가 서버측 `issueWebChannelTicket`로 발급 → 클라이언트 `getTicket`이 호출. ticket 서명 모듈은 `openclaw-webchannel-ticket`로 분리 후보(`PACKAGING.md` §3).
+- **SaaS 실연동:** 현재 발급측 검증은 **node smoke 스크립트**(`smoke/jwt.mjs` 등, DEV 전용)가 수행. 실서비스는 SaaS 백엔드가 서버측 `issueWebChannelTicket`로 발급 → 클라이언트 `getTicket`이 호출. ticket 서명 모듈은 `openclaw-webchannel-ticket`로 분리 후보(`PACKAGING.md` §3).
 - **세션 중 강제 만료(revocation):** 이미 열린 소켓은 자동으로 안 닫힘. SaaS 로그아웃/만료 시 즉시 끊으려면 별도 처리(heartbeat 재검증 또는 서버측 강제 close). 또한 **잘못된 ticket 시 클라이언트가 재연결 루프**(앰버) — "인증 실패" UX 미구현.
 - `trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입은 후순위.
 - 멀티탭 사용자를 같은 peerId로 묶을지/탭별 분리할지 정책.
@@ -218,9 +218,9 @@ IdP가 새 키로 회전하면:
 - 3-segment / base64url 디코드 / JSON 파싱 어느 하나 실패해도 모두 `null` 반환 (절대 throw 안 함 — 인프라 에러는 JWKS 레이어에서 throw).
 - `verifyJwt`는 항상 `Promise<JwtIdentity | null>` — `verifyTicket`(HS256)과 동일한 fail-soft 시맨틱.
 
-### 10.5 데모
+### 10.5 검증
 
-`packages/client/demo/devTicket.jwt.ts` 가 자체 RSA-2048 키페어를 생성하고 브라우저에서 RS256 JWT를 self-issue 한다 (DEV 전용, 개인키 노출). 데모는 mode 토글로 `hmac-ticket` / `jwt` 둘 다 선택 가능. console에 public JWK를 출력하므로 운영자는 그 JWK를 게이트웨이 JWKS 파일에 복사해 붙여 넣으면 데모 → 게이트웨이 E2E 검증이 된다.
+node smoke 스크립트(`smoke/jwt.mjs`)가 자체 RSA-2048 키페어를 생성해 RS256 JWT를 발급하고, 그 public JWK를 게이트웨이 JWKS 소스에 넣어 라이브 게이트웨이 E2E를 검증한다 (DEV 전용).
 
 테스트: `packages/plugin/src/jwt.test.ts` (33) + `packages/plugin/src/jwks.test.ts` (20).
 
