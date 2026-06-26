@@ -121,6 +121,12 @@ export type JwtIdentity = {
   displayName?: string;
   /** Device X25519 public key from cnf.jwk (base64url, 32 bytes when decoded). */
   devicePublicKey?: string;
+  /**
+   * Device Ed25519 PoP public key from the `pop_jwk` claim (OKP/Ed25519). Used
+   * to verify the signed-nonce proof-of-possession at peer registration. This
+   * is a SIGNING key, distinct from the X25519 `cnf.jwk` (which cannot sign).
+   */
+  popPublicJwk?: { kty: string; crv: string; x: string };
 };
 
 export type VerifyJwtOptions = {
@@ -332,5 +338,16 @@ export async function verifyJwt(
   const dn = payload.name ?? payload.preferred_username;
   if (typeof dn === "string" && dn.length > 0) identity.displayName = dn;
   if (devicePublicKeyB64) identity.devicePublicKey = devicePublicKeyB64;
+
+  // pop_jwk — Ed25519 PoP public key (RFC 7800-style split key). Best-effort:
+  // a malformed claim is omitted (the register route fails closed when a PoP is
+  // required but the key is absent). An OKP/Ed25519 jwk with a non-empty `x`.
+  const popJwk = (payload as Record<string, unknown>)["pop_jwk"];
+  if (popJwk && typeof popJwk === "object" && !Array.isArray(popJwk)) {
+    const p = popJwk as Record<string, unknown>;
+    if (p["kty"] === "OKP" && p["crv"] === "Ed25519" && typeof p["x"] === "string" && p["x"].length > 0) {
+      identity.popPublicJwk = { kty: "OKP", crv: "Ed25519", x: p["x"] };
+    }
+  }
   return identity;
 }

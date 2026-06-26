@@ -2,6 +2,7 @@ import type { IncomingMessage } from "node:http";
 
 import { verifyTicket } from "./ticket.js";
 import { verifyJwt } from "./jwt.js";
+import type { JwtIdentity } from "./jwt.js";
 import { JWKSCache } from "./jwks.js";
 
 /**
@@ -358,6 +359,20 @@ export async function verifyJwtAndExtractPeerId(
   authConfig: AuthConfig | undefined | null,
   logger?: AuthLogger,
 ): Promise<string | null> {
+  const identity = await verifyJwtAndExtractIdentity(jwt, authConfig, logger);
+  return identity?.peerId ?? null;
+}
+
+/**
+ * Like {@link verifyJwtAndExtractPeerId} but returns the full verified identity
+ * (peerId + devicePublicKey + popPublicJwk). Used by the NATS register route to
+ * obtain the Ed25519 PoP key for the signed-nonce challenge.
+ */
+export async function verifyJwtAndExtractIdentity(
+  jwt: string,
+  authConfig: AuthConfig | undefined | null,
+  logger?: AuthLogger,
+): Promise<JwtIdentity | null> {
   if (!authConfig || typeof authConfig !== "object") {
     throw new Error("webchannel: auth config is required for JWT verification");
   }
@@ -403,5 +418,5 @@ export async function verifyJwtAndExtractPeerId(
   }
 
   logger?.info?.(`webchannel: JWT verified for peerId="${identity.peerId}"`);
-  return identity.peerId;
+  return identity;
 }
