@@ -27,6 +27,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 
+import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -42,7 +44,8 @@ const SAAS_BASE_URL = process.env.SAAS_BASE_URL || `http://localhost:${PORT}`;
 // ---------------------------------------------------------------------------
 
 type BootstrapRequest = {
-  devicePublicKey: string; // base64url-encoded X25519 public key
+  devicePublicKey: string; // base64url-encoded X25519 public key (→ cnf.jwk)
+  devicePopPublicKey?: string; // base64url-encoded Ed25519 PoP public key (→ pop_jwk)
   agentId: string;
   tenant: string;
   pop?: string; // Proof of possession (signature) - optional for this demo
@@ -155,28 +158,23 @@ async function handleBootstrap(req: any, res: any): Promise<void> {
       sendJson(res, { error: "devicePublicKey must be 32 bytes" }, 400);
       return;
     }
+    if (request.devicePopPublicKey && Buffer.from(request.devicePopPublicKey, "base64url").length !== 32) {
+      sendJson(res, { error: "devicePopPublicKey must be 32 bytes" }, 400);
+      return;
+    }
 
     // Generate peer ID (JWT sub claim)
     const peerId = `user-${randomBytes(8).toString("hex")}`;
 
-    // Create JWT payload with cnf.jwk claim
-    const now = Math.floor(Date.now() / 1000);
-    const jwtPayload = {
+    // Create JWT payload with cnf.jwk (+ pop_jwk when the device sent its PoP key).
+    const jwtPayload = buildBootstrapClaims({
       iss: SAAS_BASE_URL,
-      sub: peerId,
-      aud: request.agentId,
-      exp: now + 300, // 5 minutes
-      iat: now,
+      peerId,
       agentId: request.agentId,
       tenant: request.tenant,
-      cnf: {
-        jwk: {
-          kty: "OKP",
-          crv: "X25519",
-          x: request.devicePublicKey,
-        },
-      },
-    };
+      deviceX25519PublicKey: request.devicePublicKey,
+      devicePopPublicKey: request.devicePopPublicKey,
+    });
 
     const jwt = createMockJwt(jwtPayload);
 

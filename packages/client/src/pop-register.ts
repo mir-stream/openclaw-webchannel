@@ -1,0 +1,134 @@
+/**
+ * Proof-of-Possession registration — the browser PRODUCER side of the PoP gate.
+ *
+ * The plugin's register routes (`packages/plugin/index-nats.ts` +
+ * `pop-challenge.ts`) reject any peer whose bootstrap JWT carries a `pop_jwk`
+ * unless the caller proves possession of the matching Ed25519 PRIVATE key by
+ * signing a server-issued, single-use nonce. This module is the device half:
+ *
+ *   1. `generateDevicePopKeyPair()` — the device makes its Ed25519 PoP key. The
+ *      PUBLIC key (JWK) is sent to SaaS at bootstrap (→ `pop_jwk`); the PRIVATE
+ *      key never leaves the device.
+ *   2. `registerWithPop()` — GET a nonce from `/register/challenge`, sign
+ *      `webchannel-pop:<peerId>:<nonce>` with the device key, and POST it to
+ *      `/register`. On a wrong/missing/expired proof the plugin returns 401.
+ *
+ * The signed-message format MUST match the plugin's `popSignedMessage`
+ * (`webchannel-pop:${peerId}:${nonce}`) byte-for-byte — see the conformance test.
+ */
+
+import { base64urlEncode } from "./e2e-crypto-browser.js";
+
+/** Device Ed25519 PoP public key in JWK form (matches the plugin's `pop_jwk`). */
+export type DevicePopJwk = {
+  kty: "OKP";
+  crv: "Ed25519";
+  x: string;
+};
+
+export type DevicePopKeyPair = {
+  /** Non-extractable Ed25519 signing key — never leaves the device. */
+  privateKey: CryptoKey;
+  /** Public JWK to send to SaaS at bootstrap (becomes the JWT `pop_jwk`). */
+  publicJwk: DevicePopJwk;
+};
+
+/**
+ * Generate the device's Ed25519 Proof-of-Possession key pair (Web Crypto).
+ * The private key is non-extractable; only the public JWK is exported.
+ */
+export async function generateDevicePopKeyPair(): Promise<DevicePopKeyPair> {
+  const kp = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const jwk = await crypto.subtle.exportKey("jwk", kp.publicKey);
+  const x = (jwk as { x?: string }).x;
+  if (!x) throw new Error("pop-register: Ed25519 public JWK is missing 'x'");
+  return { privateKey: kp.privateKey, publicJwk: { kty: "OKP", crv: "Ed25519", x } };
+}
+
+/**
+ * The exact message the device signs. MUST match the plugin's
+ * `popSignedMessage`: binding peerId stops a captured signature registering a
+ * different peer, and binding the nonce stops replay.
+ */
+export function popSignedMessage(peerId: string, nonce: string): string {
+  return `webchannel-pop:${peerId}:${nonce}`;
+}
+
+/** Sign `popSignedMessage(peerId, nonce)` with the device Ed25519 key → base64url. */
+export async function signPop(
+  privateKey: CryptoKey,
+  peerId: string,
+  nonce: string,
+): Promise<string> {
+  const sig = await crypto.subtle.sign(
+    { name: "Ed25519" },
+    privateKey,
+    new TextEncoder().encode(popSignedMessage(peerId, nonce)),
+  );
+  return base64urlEncode(new Uint8Array(sig));
+}
+
+export type RegisterWithPopOptions = {
+  /** Base URL where the plugin serves its register routes (no trailing slash). */
+  registerBaseUrl: string;
+  /** The bootstrap JWT (RS256) carrying sub=peerId, cnf.jwk and pop_jwk. */
+  jwt: string;
+  /** peerId = JWT `sub` (the message binding). */
+  peerId: string;
+  /** Device Ed25519 private key from `generateDevicePopKeyPair()`. */
+  devicePrivateKey: CryptoKey;
+  /** Injectable fetch (defaults to global fetch) — for tests / non-browser hosts. */
+  fetchImpl?: typeof fetch;
+};
+
+/** Thrown when the plugin rejects the proof (HTTP 401 at /register). */
+export class PopRejectedError extends Error {
+  constructor(message = "Proof-of-Possession rejected at registration (401)") {
+    super(message);
+    this.name = "PopRejectedError";
+  }
+}
+
+/**
+ * Run the full PoP registration handshake: challenge → sign → register.
+ *
+ * @returns `{ peerId, registered: true }` on success.
+ * @throws {PopRejectedError} on a 401 from /register (bad/missing/expired proof).
+ * @throws {Error} on transport / non-401 HTTP failures.
+ */
+export async function registerWithPop(
+  opts: RegisterWithPopOptions,
+): Promise<{ peerId: string; registered: true }> {
+  const f = opts.fetchImpl ?? fetch;
+  const base = opts.registerBaseUrl.replace(/\/+$/, "");
+  const authHeader = { Authorization: `Bearer ${opts.jwt}` };
+
+  // 1. Challenge — obtain a single-use nonce bound to our peerId.
+  const challengeRes = await f(`${base}/webchannel/nats/register/challenge`, {
+    method: "POST",
+    headers: authHeader,
+  });
+  if (!challengeRes.ok) {
+    throw new Error(`pop-register: challenge failed (HTTP ${challengeRes.status})`);
+  }
+  const { nonce } = (await challengeRes.json()) as { nonce?: string };
+  if (!nonce) throw new Error("pop-register: challenge response missing nonce");
+
+  // 2. Sign the bound message with the device Ed25519 key.
+  const signature = await signPop(opts.devicePrivateKey, opts.peerId, nonce);
+
+  // 3. Register — present the proof.
+  const registerRes = await f(`${base}/webchannel/nats/register`, {
+    method: "POST",
+    headers: { ...authHeader, "Content-Type": "application/json" },
+    body: JSON.stringify({ nonce, signature }),
+  });
+  if (registerRes.status === 401) throw new PopRejectedError();
+  if (!registerRes.ok) {
+    throw new Error(`pop-register: registration failed (HTTP ${registerRes.status})`);
+  }
+  return { peerId: opts.peerId, registered: true };
+}

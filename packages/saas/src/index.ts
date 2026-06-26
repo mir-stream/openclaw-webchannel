@@ -29,6 +29,13 @@
 
 export { setupTrustChain } from "./setup-trust-chain.js";
 export { DeviceFlowEnrollment, MemoryEnrollmentStore, type EnrollmentStore } from "./device-flow-enrollment.js";
+export { buildBootstrapClaims } from "./bootstrap-claims.js";
+export type {
+  BootstrapClaims,
+  BootstrapClaimsInput,
+  DeviceCnfJwk,
+  DevicePopJwk,
+} from "./bootstrap-claims.js";
 export type {
   SetupTrustChainResult,
   SaasTrustChainPrivate,

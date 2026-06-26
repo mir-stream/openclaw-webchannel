@@ -6,6 +6,16 @@
  */
 export { WebChannelClient } from "./client.js";
 export { WebChannelNATSClient } from "./nats-client-wrapper.js";
+export {
+  generateDevicePopKeyPair,
+  popSignedMessage,
+  signPop,
+  registerWithPop,
+  PopRejectedError,
+  type DevicePopKeyPair,
+  type DevicePopJwk,
+  type RegisterWithPopOptions,
+} from "./pop-register.js";
 export type {
   ChatRole,
   ChatMessage,
