@@ -12,8 +12,21 @@
  * - Outbound-only connection (browser dials NATS)
  * - JWT-based authentication (bootstrap JWT from SaaS)
  * - Per-peer NATS subjects (tenant-keyed routing)
- * - E2E encryption via CryptoNatsChannel (Phase A data plane)
+ * - E2E encryption: per-peer X25519 handshake + MessageEnvelope v1 sealing,
+ *   matching the agent (`packages/plugin/src/nats-channel.ts` crypto mode). The
+ *   client is FAIL-CLOSED — it buffers sends until the handshake completes and
+ *   never publishes or accepts plaintext on the relay.
  */
+
+import {
+  generateX25519KeyPair,
+  deriveConversationKey,
+  keyExchangeFrame,
+  parseKeyExchange,
+  sealMessage,
+  openMessage,
+  type BrowserKeyPair,
+} from "./e2e-crypto-browser.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,8 +70,11 @@ export type OutboundMessage =
   | { type: "approval_decision"; id: string; decision: string }
   | { type: "load_history"; before?: string; limit?: number };
 
-/** Message listener callback */
+/** Message listener callback (decrypted, high-level). */
 export type MessageListener = (msg: InboundMessage) => void;
+
+/** Raw NATS message listener: (subject, payload) before any decryption. */
+export type RawMessageListener = (subject: string, payload: string) => void;
 
 /** Connection state listener callback */
 export type StateListener = (connected: boolean) => void;
@@ -81,7 +97,7 @@ export class NatsClient {
   private readonly options: NatsClientOptions;
   private ws: WebSocket | null = null;
   private connected = false;
-  private messageListeners = new Set<MessageListener>();
+  private rawListeners = new Set<RawMessageListener>();
   private stateListeners = new Set<StateListener>();
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -147,10 +163,10 @@ export class NatsClient {
     }
   }
 
-  /** Add message listener */
-  onMessage(listener: MessageListener): () => void {
-    this.messageListeners.add(listener);
-    return () => { this.messageListeners.delete(listener); };
+  /** Add a raw (subject, payload) message listener. */
+  onRawMessage(listener: RawMessageListener): () => void {
+    this.rawListeners.add(listener);
+    return () => { this.rawListeners.delete(listener); };
   }
 
   /** Add connection state listener */
@@ -169,6 +185,10 @@ export class NatsClient {
     }
 
     const ws = new WebSocket(this.options.url);
+    // nats-server speaks the NATS protocol over BINARY WebSocket frames. The
+    // default binaryType ("blob") coerces to "[object Blob]" in the text buffer
+    // and breaks the parser — request ArrayBuffer and decode to UTF-8.
+    ws.binaryType = "arraybuffer";
     this.ws = ws;
 
     ws.onopen = () => {
@@ -176,9 +196,11 @@ export class NatsClient {
       this.sendConnect();
     };
 
-    ws.onmessage = (event) => {
-      const chunk = event.data;
-      this.buffer += chunk;
+    ws.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
+      this.buffer +=
+        typeof event.data === "string"
+          ? event.data
+          : new TextDecoder().decode(new Uint8Array(event.data));
       this.drainBuffer();
     };
 
@@ -253,6 +275,7 @@ export class NatsClient {
   private handleMessage(line: string): void {
     const parts = line.split(" ");
     const hasReplyTo = parts.length === 5;
+    const subject = parts[1] ?? "";
     const byteCount = parseInt(parts[hasReplyTo ? 4 : 3] ?? "0", 10);
 
     if (isNaN(byteCount) || byteCount < 0) return;
@@ -265,12 +288,9 @@ export class NatsClient {
     const payload = this.buffer.slice(0, byteCount);
     this.buffer = this.buffer.slice(byteCount + 2);
 
-    try {
-      const message = JSON.parse(payload);
-      this.notifyMessageListeners(message);
-    } catch (err) {
-      console.error("[nats-client] Failed to parse message:", err);
-    }
+    // Deliver the raw payload; decryption/parsing happens in WebChannelNatsClient
+    // (the envelope must be decrypted before it is meaningful).
+    this.notifyRawListeners(subject, payload);
   }
 
   private resubscribeAll(): void {
@@ -305,10 +325,10 @@ export class NatsClient {
     }
   }
 
-  private notifyMessageListeners(msg: InboundMessage): void {
-    this.messageListeners.forEach((listener) => {
+  private notifyRawListeners(subject: string, payload: string): void {
+    this.rawListeners.forEach((listener) => {
       try {
-        listener(msg);
+        listener(subject, payload);
       } catch (err) {
         console.error("[nats-client] Listener error:", err);
       }
@@ -359,63 +379,162 @@ export function handshakeSubject(tenant: string, agentId: string, peerId: string
 // ---------------------------------------------------------------------------
 
 /**
- * High-level WebChannel NATS client.
+ * High-level, E2E-encrypted WebChannel NATS client.
  *
- * Wraps NatsClient with WebChannel-specific message handling.
+ * Wraps `NatsClient` and adds the per-peer X25519 handshake + MessageEnvelope v1
+ * sealing the agent expects. It is FAIL-CLOSED:
+ *   - outbound sends are buffered until the handshake establishes a session key,
+ *     and are only ever published as ciphertext (never plaintext);
+ *   - inbound frames are dropped until the session key exists and are decrypted
+ *     before delivery.
+ *
+ * Subject direction (matching the agent): the browser PUBLISHES to `.in`,
+ * SUBSCRIBES to `.out`, and exchanges keys on `.handshake`.
  */
 export class WebChannelNatsClient {
   private readonly client: NatsClient;
-  private readonly inboundSub: number;
   private readonly options: NatsClientOptions;
+  private readonly messageListeners = new Set<MessageListener>();
+
+  private keyPair: BrowserKeyPair | null = null;
+  private sessionKey: Uint8Array | null = null;
+  private outboundQueue: OutboundMessage[] = [];
+  private outSub = -1;
+  private handshakeSub = -1;
 
   constructor(options: NatsClientOptions) {
     this.options = options;
     this.client = new NatsClient(options);
-
-    // Subscribe to inbound messages
-    const inSubject = inboundSubject(options.tenant, options.agentId, options.peerId);
-    this.inboundSub = this.client.subscribe(inSubject);
+    this.client.onRawMessage((subject, payload) => {
+      void this.handleRaw(subject, payload);
+    });
+    this.client.onState((connected) => {
+      if (connected) void this.onConnected();
+      else this.resetSession();
+    });
   }
 
-  /** Connect to NATS */
+  /** Connect to NATS (the handshake begins automatically once connected). */
   connect(): void {
     this.client.connect();
   }
 
-  /** Disconnect from NATS */
+  /** Disconnect from NATS and drop the session. */
   disconnect(): void {
-    this.client.unsubscribe(this.inboundSub);
+    if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
+    if (this.handshakeSub >= 0) this.client.unsubscribe(this.handshakeSub);
+    this.outSub = -1;
+    this.handshakeSub = -1;
+    this.resetSession();
     this.client.disconnect();
   }
 
-  /** Send user message */
+  /** Send user message (buffered until the handshake completes). */
   sendUserMessage(text: string): void {
-    const outSubject = outboundSubject(this.options.tenant, this.options.agentId, this.options.peerId);
-    const payload = JSON.stringify({ type: "user_message", text });
-    this.client.publish(outSubject, payload);
+    this.enqueue({ type: "user_message", text });
   }
 
-  /** Send approval decision */
+  /** Send approval decision (buffered until the handshake completes). */
   sendApprovalDecision(id: string, decision: string): void {
-    const outSubject = outboundSubject(this.options.tenant, this.options.agentId, this.options.peerId);
-    const payload = JSON.stringify({ type: "approval_decision", id, decision });
-    this.client.publish(outSubject, payload);
+    this.enqueue({ type: "approval_decision", id, decision });
   }
 
-  /** Request history page */
+  /** Request history page (buffered until the handshake completes). */
   loadHistory(before?: string, limit?: number): void {
-    const outSubject = outboundSubject(this.options.tenant, this.options.agentId, this.options.peerId);
-    const payload = JSON.stringify({ type: "load_history", before, limit });
-    this.client.publish(outSubject, payload);
+    this.enqueue({ type: "load_history", before, limit });
   }
 
-  /** Add message listener */
+  /** Add decrypted-message listener. */
   onMessage(listener: MessageListener): () => void {
-    return this.client.onMessage(listener);
+    this.messageListeners.add(listener);
+    return () => { this.messageListeners.delete(listener); };
   }
 
-  /** Add connection state listener */
+  /** Add connection state listener. */
   onState(listener: StateListener): () => void {
     return this.client.onState(listener);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal — handshake + crypto
+  // ---------------------------------------------------------------------------
+
+  private resetSession(): void {
+    this.sessionKey = null;
+    this.keyPair = null;
+  }
+
+  private async onConnected(): Promise<void> {
+    const { tenant, agentId, peerId } = this.options;
+    // (Re)subscribe idempotently: unsubscribe stale sids so a reconnect never
+    // leaves duplicate subscriptions delivering the same MSG twice.
+    if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
+    if (this.handshakeSub >= 0) this.client.unsubscribe(this.handshakeSub);
+    this.outSub = this.client.subscribe(outboundSubject(tenant, agentId, peerId));
+    this.handshakeSub = this.client.subscribe(handshakeSubject(tenant, agentId, peerId));
+
+    // Fresh connection → fresh key exchange.
+    this.resetSession();
+    this.keyPair = await generateX25519KeyPair();
+    this.client.publish(
+      handshakeSubject(tenant, agentId, peerId),
+      keyExchangeFrame(this.keyPair.publicKeyB64url),
+    );
+  }
+
+  private async handleRaw(subject: string, payload: string): Promise<void> {
+    const { tenant, agentId, peerId } = this.options;
+
+    if (subject === handshakeSubject(tenant, agentId, peerId)) {
+      if (this.sessionKey || !this.keyPair) return; // already established / not ready
+      const agentPubKey = parseKeyExchange(payload);
+      if (!agentPubKey) return;
+      this.sessionKey = await deriveConversationKey(this.keyPair.privateKey, agentPubKey);
+      this.flushQueue();
+      return;
+    }
+
+    if (subject === outboundSubject(tenant, agentId, peerId)) {
+      if (!this.sessionKey) return; // fail-closed: cannot read before handshake
+      const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
+      if (msg) this.notifyMessageListeners(msg);
+      return;
+    }
+  }
+
+  private enqueue(message: OutboundMessage): void {
+    if (!this.sessionKey) {
+      this.outboundQueue.push(message);
+      return;
+    }
+    this.seal(message);
+  }
+
+  private flushQueue(): void {
+    if (!this.sessionKey) return;
+    const queued = this.outboundQueue;
+    this.outboundQueue = [];
+    for (const message of queued) this.seal(message);
+  }
+
+  private seal(message: OutboundMessage): void {
+    if (!this.sessionKey) {
+      // Fail-closed: never publish plaintext; re-queue until the key exists.
+      this.outboundQueue.push(message);
+      return;
+    }
+    const { tenant, agentId, peerId } = this.options;
+    const wire = sealMessage({ agentId, tenant, sub: peerId }, this.sessionKey, message);
+    this.client.publish(inboundSubject(tenant, agentId, peerId), wire);
+  }
+
+  private notifyMessageListeners(msg: InboundMessage): void {
+    this.messageListeners.forEach((listener) => {
+      try {
+        listener(msg);
+      } catch (err) {
+        console.error("[nats-client] Listener error:", err);
+      }
+    });
   }
 }
