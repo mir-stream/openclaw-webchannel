@@ -41,7 +41,7 @@ this file, **this file is correct.**
 | **Proof-of-Possession (gap ①)** — Ed25519 signed-nonce at registration (401 on missing/invalid/expired/replayed) | `pop-challenge.ts` + register-route wiring; `pop-challenge.test.ts` (7). `d49add0`. |
 | **Encrypted NATS entry (encrypt-by-construction) + fail-closed boot (AC 3a)** — agent answers a per-peer X25519 handshake, seals/opens every frame, drops anything it can't decrypt; `index-nats.ts` refuses to boot when encryption is disabled | `nats-channel.ts` crypto mode + `e2e-session.ts` + `encryption-policy.ts` + `index-nats.ts`; `nats-channel-crypto.test.ts` (7, incl. wiretap-ciphertext-only + tampered-AAD drop) + `encryption-policy.test.ts` (4). `3c78c64`. |
 | **AAD-mismatch fails decryption (AC 2)** — tampering any plaintext routing field after sealing breaks the canonical-AAD binding and the frame is dropped | `nats-channel-crypto.test.ts` (tampered-routing drop + untampered-accept control); codec-level binding in `e2e-envelope.ts` `canonicalAad`. `3c78c64`. |
-| **Production browser client is encrypted + fail-closed** — `WebChannelNatsClient` does the X25519 handshake, seals outbound to `.in`, decrypts inbound from `.out`, buffers sends until the key exists; also fixes two latent bugs (binary ws frames; reversed subject direction) | `nats-client.ts` + shared `e2e-crypto-browser.ts`; `nats-client-crypto.test.ts` (8: handshake round-trip, ciphertext-only wire, fail-closed buffering, drop-on-bad-decrypt, AAD/KDF spec conformance). `<this commit>`. |
+| **Production browser client is encrypted + fail-closed** — `WebChannelNatsClient` does the X25519 handshake, seals outbound to `.in`, decrypts inbound from `.out`, buffers sends until the key exists; also fixes two latent bugs (binary ws frames; reversed subject direction) | `nats-client.ts` + shared `e2e-crypto-browser.ts`; `nats-client-crypto.test.ts` (8: handshake round-trip, ciphertext-only wire, fail-closed buffering, drop-on-bad-decrypt, AAD/KDF spec conformance). `6308867`. |
 
 **Test suite: 762 unit passing (+ 8 e2e under nats-server), typecheck clean across all 3 workspaces.**
 
@@ -83,7 +83,7 @@ agent side made this worse and was removed in `ee89ba3`.)
 2. ✅ Encrypt-by-construction `index-nats.ts` entry + fail-closed boot guard (AC 3a) — **done** (`3c78c64`).
 3. ✅ Explicit AAD-mismatch negative test (AC 2) — **done** (`3c78c64`).
 4. ✅ Encrypt the production browser client (`WebChannelNatsClient`): handshake + seal + fail-closed,
-   matching the agent — **done** (`<this commit>`; also fixed binary-frame + reversed-subject bugs).
+   matching the agent — **done** (`6308867`; also fixed binary-frame + reversed-subject bugs).
 5. Wire the PoP **producer** side: SaaS mints the device Ed25519 key into the bootstrap JWT
    `pop_jwk`; the browser performs the challenge→sign round-trip. Then add a live register-route test.
 6. (Optional) Point the live nats-server gate at the production pair (`WebChannelNatsClient` ↔
@@ -103,4 +103,4 @@ agent side made this worse and was removed in `ee89ba3`.)
 | `ff61d1e` | Default-deny DM allowlist at the inbound seam (AC3 gap ③) |
 | `d49add0` | Ed25519 signed-nonce PoP at registration (AC3 gap ①) |
 | `3c78c64` | Encrypt-by-construction NATS entry + fail-closed boot guard (AC 3a) + AAD-mismatch test (AC 2) |
-| `<this commit>` | Encrypt the production browser client (handshake + seal + fail-closed); fix binary-frame + reversed-subject bugs |
+| `6308867` | Encrypt the production browser client (handshake + seal + fail-closed); fix binary-frame + reversed-subject bugs |
