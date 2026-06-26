@@ -45,6 +45,7 @@ this file, **this file is correct.**
 | **AAD-mismatch fails decryption (AC 2)** — tampering any plaintext routing field after sealing breaks the canonical-AAD binding and the frame is dropped | `nats-channel-crypto.test.ts` (tampered-routing drop + untampered-accept control); codec-level binding in `e2e-envelope.ts` `canonicalAad`. `3c78c64`. |
 | **Production browser client is encrypted + fail-closed** — `WebChannelNatsClient` does the X25519 handshake, seals outbound to `.in`, decrypts inbound from `.out`, buffers sends until the key exists; also fixes two latent bugs (binary ws frames; reversed subject direction) | `nats-client.ts` + shared `e2e-crypto-browser.ts`; `nats-client-crypto.test.ts` (8: handshake round-trip, ciphertext-only wire, fail-closed buffering, drop-on-bad-decrypt, AAD/KDF spec conformance). `6308867`. |
 | **PoP producer side (gap ① positive path)** — SaaS mints `pop_jwk` (Ed25519) alongside `cnf.jwk`; the browser generates a device Ed25519 key and `registerWithPop` runs challenge→sign→register | `saas/bootstrap-claims.ts` + `client/pop-register.ts`; `pop-register.test.ts` (7, interop vs a node:crypto verifier replicating `PopChallengeStore.verify`) + `bootstrap-claims.test.ts` (5). `4edba6e`. |
+| **PRODUCTION pair live in REAL openclaw** — a real headless-Chromium browser running the production `WebChannelNatsClient` round-trips an encrypted message through the `index-nats` plugin loaded in a real openclaw gateway → real `inbound.run` agent loop (deterministic echo model) → back, decrypted. The reply carries openclaw's real prompt construction, proving it is the real agent path, not the demo echo agent. Fixed plugin-id, `api.registerHttpRoute`, `keepAlive` guard, and added a dev/open-NATS path. | `e2e/local/*` harness (echo OpenAI server + Node + Playwright drivers), run against an isolated `OPENCLAW_HOME` gateway. `e384198`. |
 
 **Test suite: 774 unit passing (+ 8 e2e under nats-server), typecheck clean across all 3 workspaces.**
 
@@ -53,7 +54,8 @@ this file, **this file is correct.**
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
-| Production pair not yet on the live nats-server gate | Both production ends now encrypt + PoP, and are unit-tested (incl. fake-nats handshake round-trip and a faithful PoP verifier replica), but the *live* gate still drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` seam against a real nats-server. Pointing the live gate at `WebChannelNatsClient` ↔ `index-nats` (incl. a real HTTP register-route hop) is a follow-up — the seams share one wire protocol, so interop holds transitively. |
+| HTTP register/challenge routes not served by the gateway | `index-nats` now registers them via the correct `api.registerHttpRoute`, but openclaw 2026.6.10 only dispatches *WS-upgrade* plugin routes — plain-HTTP plugin routes 404. So the PoP/JWT HTTP registration hop is not reachable yet; the live local round-trip uses a dev wildcard auto-register instead. Needs an openclaw-side HTTP-route path (or a different registration transport). |
+| Production pair not yet in the CI gate | The production pair is now live-verified **locally** (see "What works", `e384198`), but the automated CI gate still drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` seam. Folding the `e2e/local` harness into CI (needs a built openclaw + browser) is a follow-up. |
 
 ## Coverage note
 

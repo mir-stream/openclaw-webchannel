@@ -14,11 +14,14 @@ This package ships two plugin entries:
 | Entry | Mode | Status |
 |---|---|---|
 | `index.ts` | **Gateway-WS** — browser connects via a WebSocket upgrade on the gateway's own port | ✅ **Works end-to-end today** (browser ↔ OpenClaw ↔ Claude) |
-| `index-nats.ts` | **NATS E2E** — both sides connect to a shared NATS bus; relay sees ciphertext only | 🚧 **Seams implemented (`22133b5`), but never run live** |
+| `index-nats.ts` | **NATS E2E** — both sides connect to a shared NATS bus; relay sees ciphertext only | ✅ **Run live (`e384198`)** — real browser ↔ NATS ↔ this plugin in a real openclaw gateway ↔ `inbound.run` ↔ back, encrypted, via the `e2e/local` harness (echo model). Not yet in the CI gate. |
 
-The NATS path's components (crypto, transport, enrollment, trust chain) are built and tested in
-isolation, but a browser message has **never** travelled over NATS → plugin → agent → Claude →
-back. Do not read "731 tests pass" as "NATS works." See STATUS.md for the full reconciliation.
+As of `e384198`, a real headless-Chromium message HAS travelled browser → NATS → this plugin →
+`inbound.run` → (echo model) → back. Earlier the NATS entry assumed APIs that don't exist
+(`api.http.post`, a `webchannel-nats` id, `keepAlive`) — fixed there. Two caveats remain: the
+deterministic echo model stands in for a live LLM (by design), and openclaw 2026.6.10 doesn't
+serve the plugin's plain-HTTP register routes (the dev path uses wildcard auto-register). See
+STATUS.md.
 
 ## Status
 
