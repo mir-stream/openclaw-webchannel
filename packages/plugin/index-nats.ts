@@ -15,7 +15,9 @@
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { NatsChannel } from "./src/nats-channel.js";
-import type { InboundWsMessage } from "./src/nats-channel.js";
+import type { InboundWsMessage, NatsChannelCryptoOptions } from "./src/nats-channel.js";
+import { resolveEncryptionPolicy } from "./src/encryption-policy.js";
+import type { WebchannelEncryptionConfig } from "./src/encryption-policy.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
 import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
@@ -93,6 +95,28 @@ export default defineChannelPluginEntry({
 
   async registerFull(api) {
     // -----------------------------------------------------------------------
+    // Step 0: Fail-closed encryption guard (AC 3a / EncryptedChannelWired)
+    // -----------------------------------------------------------------------
+
+    // The NATS relay is untrusted and must only ever observe ciphertext. Resolve
+    // the encryption policy BEFORE connecting to NATS: a deployment that disables
+    // encryption throws here and the entry refuses to start — it never connects,
+    // never registers a peer, and therefore never emits plaintext to the relay.
+    const webchannelCfg = (
+      api.config.channels as Record<string, unknown> | undefined
+    )?.webchannel as
+      | { encryption?: WebchannelEncryptionConfig; auth?: AuthConfig }
+      | undefined;
+
+    let cryptoOptions: NatsChannelCryptoOptions;
+    try {
+      cryptoOptions = resolveEncryptionPolicy(webchannelCfg?.encryption).crypto;
+    } catch (err) {
+      api.logger.error?.(`webchannel: ${(err as Error).message}`);
+      throw err;
+    }
+
+    // -----------------------------------------------------------------------
     // Step 1: Enroll and connect to NATS (if not already done)
     // -----------------------------------------------------------------------
 
@@ -137,11 +161,14 @@ export default defineChannelPluginEntry({
       const agentId = natsConnection.enrollment.creds.agentId ?? "default-agent";
       const tenant = natsConnection.tenant ?? "default-tenant";
 
-      natsChannel = new NatsChannel(transport, agentId, tenant);
+      // Encrypt-by-construction: the channel performs the per-peer X25519
+      // handshake and ChaCha20-Poly1305-seals every frame. It is fail-closed —
+      // it never publishes or processes plaintext on the relay.
+      natsChannel = new NatsChannel(transport, agentId, tenant, cryptoOptions);
       // Bind the live channel into the lazy transport facade so the plugin's
       // outbound/message/approval adapters now route to NATS.
       boundChannel = natsChannel;
-      console.log("[webchannel] ✓ NATS channel created");
+      console.log("[webchannel] ✓ Encrypted NATS channel created");
     }
 
     const channel = natsChannel;
