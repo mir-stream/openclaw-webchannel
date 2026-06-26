@@ -1,5 +1,7 @@
 # WebChannel — Gap Analysis (vs. in-repo channel extensions + 4 external reference channels)
 
+> 📌 **Single source of truth for current working state: [`STATUS.md`](STATUS.md).** This is a research artifact (2026-06-19); its adopt-candidates are recommendations, not committed scope.
+
 > Status: draft (2026-06-19). Single-pass research + documentation. No code changes.
 > Generated as the "gap-analysis" research seed deliverable
 > (`.ouroboros/seeds/openclaw-webchannel-gap-analysis-extensions.seed.yaml`).
@@ -58,8 +60,8 @@
     sendchataction-401-backoff.ts,action-runtime.ts}`,
     `imessage/src/chat.ts` (typing gated by RPC method),
     `sms/src/channel.ts` (`media: false`).
-- **Read** the planning/contract docs: `docs/{AUTH,BACKLOG,PLAN,RESEARCH,
-  PACKAGING}.md`.
+- **Read** the planning/contract docs: `docs/{AUTH,PLAN,RESEARCH,
+  PACKAGING,STATUS}.md`.
 - **No** code/build/lint/dependency changes. **No** new files outside
   `docs/GAP_ANALYSIS.md` and `.ouroboros/seeds/gap-analysis-*.seed.yaml`.
 
@@ -76,7 +78,7 @@
 
 ### 1.3 What is *deliberately out of scope*
 
-- **Auth axis** (per AC6). Compared by way of existing `AUTH.md` + `BACKLOG.md`
+- **Auth axis** (per AC6). Compared by way of existing `AUTH.md`
   + the in-flight `openclaw-webchannel-jwt-jwks.seed.yaml` — NOT in the body.
   Critical issues only as a one-liner (see §6).
 - Voice (call signaling) and push (HTTP-only) representatives are used as
@@ -251,7 +253,7 @@ as a single line and is **not** promoted to an adopt candidate.
 
 > DANGER: `packages/client/src/client.ts:90-93,213-229` keeps backing off
 > forever on a 401 — the widget enters an amber reconnect loop until the
-> page is reloaded. This is already tracked in `AUTH.md §9` and `BACKLOG.md`
+> page is reloaded. This is already tracked in `AUTH.md §9`
 > ("잘못된 ticket 시 재연결 루프 UX") and is the highest-impact residual on the
 > auth side; fix together with the `jwt`/`trusted-header` strategies.
 

@@ -1,5 +1,7 @@
 # WebChannel — 패키지화 / 배포 (PACKAGING)
 
+> 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 배포 구조·체크리스트 기준이며 명시된 날짜 시점 기준이다.
+
 > WebChannel을 **남들이 가져다 쓸 수 있는 수준**으로 배포하기 위한 패키지 구조와 작업 목록.
 > 상태(2026-06-15): 구조 **결정됨**. **완료** — auth seam, **헤드리스 `openclaw-webchannel-client`(framework-agnostic, zero-dep)** 구현·라이브 E2E, 게이트웨이 정적 서빙(이제 client의 vanilla 데모를 서빙), hmac-ticket E2E 검증.
 > **변경** — 기존 React `openclaw-webchannel-widget`는 **삭제**(2026-06-15). 사용자가 원한 건 React 위젯이 아니라 *기능*이었고, 그 기능은 `openclaw-webchannel-client`가 프레임워크 없이 제공한다. 게이트웨이 채팅 UI는 위젯 example → **client vanilla 데모**로 갈아끼운 뒤 삭제(서빙 검증 완료).

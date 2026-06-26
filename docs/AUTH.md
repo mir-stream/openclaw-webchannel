@@ -1,7 +1,9 @@
 # WebChannel — 인증 설계 (AUTH)
 
+> 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 인증 설계 기준 문서다.
+
 > 브라우저 클라이언트가 게이트웨이 WebSocket에 붙을 때의 **인증·신원(identity)** 모델.
-> 상태: **결정됨** — 기존 `BACKLOG.md`의 "브라우저 Auth 모델 (완전 OPEN)" 항목을 대체한다.
+> 상태: **결정됨** — 구 `BACKLOG.md`(삭제됨)의 "브라우저 Auth 모델 (완전 OPEN)" 항목을 대체한다.
 > 용어(2026-06-15): "위젯"은 이제 무프레임워크 **`openclaw-webchannel-client`**(`packages/client`)를 가리킨다. React `openclaw-webchannel-widget`는 삭제됨 — `getTicket` 주입점은 client에 그대로 존재.
 > 핵심 원리: 인증을 코어에 하드코딩하지 않고 **주입 가능한 검증기(ConnectionVerifier) 한 점**으로 수렴시키고,
 > 흔한 방식은 **config로 고르는 빌트인 전략**으로 제공한다. (배포된 플러그인은 코드가 아니라 JSON config로 설정되므로)

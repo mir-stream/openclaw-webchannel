@@ -1,5 +1,7 @@
 # WebChannel — 기획서
 
+> 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 설계·계획 기준이며 명시된 날짜 시점 기준이다.
+
 > OpenClaw용 셀프호스트 웹 채널 플러그인 + 브라우저 클라이언트
 > 외부 위젯 SaaS(Now4real, Stream 등) 없이, 게이트웨이 위에서 바로 도는 웹 채팅 채널.
 
@@ -182,7 +184,7 @@ openclaw-webchannel/              # 레포 루트 = 워크스페이스 매니저
 ├── package.json                   # { "workspaces": ["packages/*"], scripts: test/typecheck/build }
 ├── package-lock.json              # 단일 통합 lock
 ├── smoke/                         # 라이브 게이트웨이 대상 수동 스모크(ws/progress/approval/reconnect/e2e/selfclose)
-├── docs/                          # AUTH·PACKAGING·PLAN·RESEARCH·BACKLOG
+├── docs/                          # STATUS(진실원)·AUTH·PACKAGING·PLAN·RESEARCH·GAP_ANALYSIS·TRUST_AND_ONBOARDING
 └── packages/
     ├── plugin/                    # 서버 패키지(openclaw-webchannel 후보; 현 name "openclaw-webchannel", Node)
     │   ├── package.json           # openclaw.{channel,extensions,setupEntry} = "이게 플러그인이다" 표식
