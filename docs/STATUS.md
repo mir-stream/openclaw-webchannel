@@ -20,8 +20,14 @@ this file, **this file is correct.**
   months; it is closed and tested.
 - **Authz is enforced** (default-deny allowlist at the inbound seam; Ed25519 signed-nonce PoP at
   registration).
-- **Not done:** real ClawHub/npm publish (needs registry creds), an explicit AAD-mismatch negative
-  test, and the PoP producer-side wiring (SaaS mint + browser sign) for a live register-route test.
+- **The production NATS entry is now encrypt-by-construction and fail-closed** — `index-nats.ts`
+  refuses to boot without encryption and wires the encrypted channel; the agent answers a per-peer
+  X25519 handshake and ChaCha20-Poly1305-seals every frame, never emitting plaintext to the relay.
+- **Not done:** real ClawHub/npm publish (needs registry creds), the PoP producer-side wiring (SaaS
+  mint + browser sign) for a live register-route test, and the production browser client
+  (`WebChannelNatsClient`) still speaks plaintext — it needs the same handshake+seal upgrade as the
+  agent so the production browser↔agent pair is coherent (the green live gate uses the separate
+  `e2e-browser-client` crypto seam).
 
 ## What works (verified)
 
@@ -35,8 +41,10 @@ this file, **this file is correct.**
 | **Live NATS E2E round-trip** (browser → nats-server → plugin/agent → reply → browser), dev/open-NATS + enrolled-JWT, ciphertext-only on the wire | `e2e/dev-nats-roundtrip.test.ts` + `e2e/enrolled-jwt-roundtrip.test.ts` — real headless Chromium (playwright-core) + real `nats-server` + real openclaw echo agent. `96339e6`. |
 | **DM allowlist authz (gap ③)** — default-deny at the inbound seam | `dm-allowlist.ts` + `inbound.ts` gating; `dm-allowlist.test.ts` + `channel.test.ts`. `ff61d1e`. |
 | **Proof-of-Possession (gap ①)** — Ed25519 signed-nonce at registration (401 on missing/invalid/expired/replayed) | `pop-challenge.ts` + register-route wiring; `pop-challenge.test.ts` (7). `d49add0`. |
+| **Encrypted NATS entry (encrypt-by-construction) + fail-closed boot (AC 3a)** — agent answers a per-peer X25519 handshake, seals/opens every frame, drops anything it can't decrypt; `index-nats.ts` refuses to boot when encryption is disabled | `nats-channel.ts` crypto mode + `e2e-session.ts` + `encryption-policy.ts` + `index-nats.ts`; `nats-channel-crypto.test.ts` (7, incl. wiretap-ciphertext-only + tampered-AAD drop) + `encryption-policy.test.ts` (4). `3c78c64`. |
+| **AAD-mismatch fails decryption (AC 2)** — tampering any plaintext routing field after sealing breaks the canonical-AAD binding and the frame is dropped | `nats-channel-crypto.test.ts` (tampered-routing drop + untampered-accept control); codec-level binding in `e2e-envelope.ts` `canonicalAad`. `3c78c64`. |
 
-**Test suite: 751 passing, typecheck clean across all 3 workspaces.**
+**Test suite: 754 unit passing (+ 8 e2e under nats-server), typecheck clean across all 3 workspaces.**
 
 ## What does NOT work yet
 
@@ -44,8 +52,7 @@ this file, **this file is correct.**
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
 | PoP producer-side wiring | The PoP *gate* (verification) is done + tested. The *producer* side — SaaS minting the device Ed25519 key into the bootstrap JWT `pop_jwk`, and the browser doing the challenge→sign round-trip — is not yet wired, so there is no live register-route end-to-end test (only the gate's unit tests). |
-| Explicit AAD-mismatch negative test (AC2) | Wire-opacity (ciphertext-only) is covered; a dedicated "tampered AAD fails decryption" assertion is not yet separate. |
-| Real `index-nats` entry uses plaintext `NatsChannel` | The live E2E uses a deterministic echo agent. The production `index-nats.ts` still wires the plaintext `NatsChannel` (not `CryptoNatsChannel`) and lacks the fail-closed-no-crypto guard — AC-scoped but not yet applied to the real entry. |
+| Production browser client still plaintext | `WebChannelNatsClient` (`packages/client/src/nats-client.ts`) publishes/parses plaintext JSON and never does the handshake — it needs the same X25519-handshake + envelope-seal upgrade the agent (`NatsChannel`) just got, so the production browser↔agent pair is coherent. (The live gate's browser seam is the separate, already-encrypted `e2e-browser-client.ts`.) |
 
 ## Coverage note
 
@@ -74,12 +81,14 @@ agent side made this worse and was removed in `ee89ba3`.)
 ## To fully close Phase B
 
 1. ✅ Live NATS E2E round-trip (dev + enrolled), authz gates — **done** (`96339e6`/`ff61d1e`/`d49add0`).
-2. Wire the PoP **producer** side: SaaS mints the device Ed25519 key into the bootstrap JWT
+2. ✅ Encrypt-by-construction `index-nats.ts` entry + fail-closed boot guard (AC 3a) — **done** (`3c78c64`).
+3. ✅ Explicit AAD-mismatch negative test (AC 2) — **done** (`3c78c64`).
+4. Upgrade the production browser client (`WebChannelNatsClient`) to handshake + seal, matching the
+   agent, so the production browser↔agent pair is coherent end-to-end.
+5. Wire the PoP **producer** side: SaaS mints the device Ed25519 key into the bootstrap JWT
    `pop_jwk`; the browser performs the challenge→sign round-trip. Then add a live register-route test.
-3. Add the explicit AAD-mismatch negative test (AC2).
-4. Apply `CryptoNatsChannel` + fail-closed-no-crypto guard to the real `index-nats.ts` entry.
-5. Packaging + **real** ClawHub/npm publish (registry creds) — or accept `DonePublishDeferred`.
-6. Merge `ooo/orch_554cce15442a` → `jwks`.
+6. Packaging + **real** ClawHub/npm publish (registry creds) — or accept `DonePublishDeferred`.
+7. Merge `ooo/orch_554cce15442a` → `jwks`.
 
 ## Commit landmarks
 
@@ -92,3 +101,4 @@ agent side made this worse and was removed in `ee89ba3`.)
 | `96339e6` | **Live NATS E2E round-trip gate (AC1 green) + 4 e2e bug fixes** (branch `ooo/orch_554cce15442a`) |
 | `ff61d1e` | Default-deny DM allowlist at the inbound seam (AC3 gap ③) |
 | `d49add0` | Ed25519 signed-nonce PoP at registration (AC3 gap ①) |
+| `3c78c64` | Encrypt-by-construction NATS entry + fail-closed boot guard (AC 3a) + AAD-mismatch test (AC 2) |

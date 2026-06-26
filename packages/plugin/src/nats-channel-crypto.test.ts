@@ -228,6 +228,30 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     expect(h.inbound).toEqual([]);
   });
 
+  it("fail-closed: drops a frame whose routing (AAD) was tampered after sealing (AC2)", () => {
+    const h = makeHarness();
+    h.doHandshake();
+    const key = h.browserSessionKey()!;
+
+    // Seal legitimately, then tamper a plaintext routing field WITHOUT re-encrypting.
+    // The agent recomputes canonical AAD from the (tampered) routing, so the
+    // ChaCha20-Poly1305 tag no longer authenticates → decryption fails → dropped.
+    const sealed = sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, key, {
+      type: "user_message",
+      text: "authentic",
+    });
+    const env = JSON.parse(sealed.toString("utf8")) as Record<string, unknown>;
+    env["messageId"] = `${String(env["messageId"])}-tampered`; // routing/AAD mutation
+    h.browser.publish(inSubj, Buffer.from(JSON.stringify(env)));
+
+    expect(h.inbound).toEqual([]);
+
+    // And a control: the same payload, untampered, IS accepted — proving the drop
+    // above is specifically due to the AAD mismatch, not a structural reject.
+    h.browser.publish(inSubj, sealed);
+    expect(h.inbound).toEqual([{ type: "user_message", text: "authentic" }]);
+  });
+
   it("fail-closed: drops a frame sealed with the wrong key after handshake", () => {
     const h = makeHarness();
     h.doHandshake();
