@@ -324,6 +324,40 @@ function validateEnvelope(raw: unknown): MessageEnvelope {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical AAD construction
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the canonical Additional Authenticated Data (AAD) for an envelope.
+ *
+ * The AAD is the UTF-8 encoding of a JSON object containing the six routing
+ * fields in FIXED key order:
+ *   {tenant, agentId, sub, messageId, envelopeType, ts}
+ *
+ * AAD is authenticated but NOT encrypted and NOT stored in the envelope. Both
+ * the sender (browser) and receiver (agent) independently compute the same AAD
+ * from the plaintext routing fields. An AAD mismatch causes decryption to throw.
+ *
+ * Key order is fixed (tenant first) to ensure JSON serialization is deterministic
+ * across all JavaScript engines (V8, SpiderMonkey, JSC, Node.js).
+ *
+ * @param routing  Plaintext routing metadata extracted from a `MessageEnvelope`.
+ * @returns        UTF-8-encoded canonical AAD bytes.
+ */
+export function canonicalAad(routing: EnvelopeRouting): Uint8Array {
+  return new TextEncoder().encode(
+    JSON.stringify({
+      tenant:       routing.tenant,
+      agentId:      routing.agentId,
+      sub:          routing.sub,
+      messageId:    routing.messageId,
+      envelopeType: routing.envelopeType,
+      ts:           routing.ts,
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Base64url helpers (internal)
 // ---------------------------------------------------------------------------
 

@@ -120,10 +120,10 @@ export class NatsClient {
       return;
     }
 
-    const buf = Buffer.from(payload, "utf-8");
-    this.ws.send(`PUB ${subject} ${buf.length}\r\n`);
-    this.ws.send(buf);
-    this.ws.send("\r\n");
+    // Use TextEncoder for byte-length (browser-compatible; Node.js ≥18 also
+    // has globalThis.TextEncoder). NATS PUB requires the UTF-8 byte count.
+    const byteLen = new TextEncoder().encode(payload).length;
+    this.ws.send(`PUB ${subject} ${byteLen}\r\n${payload}\r\n`);
   }
 
   /** Subscribe to NATS subject */

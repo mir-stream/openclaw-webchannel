@@ -37,6 +37,24 @@ export type NatsConnectOptions = {
    */
   jwtCredential?: string;
   /**
+   * NKEY challenge-response signing callback for enrolled-JWT mode.
+   *
+   * When the NATS server requires JWT authentication, it sends a nonce in the
+   * INFO message. The client must sign the nonce with the user's NKEY private
+   * key and include the signature in the CONNECT command.
+   *
+   * This callback receives the nonce string and returns a base64url-encoded
+   * Ed25519 signature. When provided, the transport waits for the server's
+   * INFO message before sending CONNECT (rather than sending immediately on
+   * WebSocket open) — this is the correct NATS JWT auth flow.
+   *
+   * Example (using @nats-io/nkeys, allowed in packages/saas):
+   *   const kp = fromSeed(new TextEncoder().encode(userSeed));
+   *   nkeySigningCallback: (nonce) =>
+   *     Promise.resolve(Buffer.from(kp.sign(new TextEncoder().encode(nonce))).toString("base64url"))
+   */
+  nkeySigningCallback?: (nonce: string) => Promise<string>;
+  /**
    * Client name reported to the NATS server (INFO-visible, debug aid only).
    * Defaults to 'openclaw-webchannel-agent'.
    */
@@ -95,8 +113,12 @@ export class NatsTransport extends EventEmitter {
   // Whether the NATS handshake (INFO→CONNECT→PONG) has completed.
   private _connected = false;
 
+  // Prevents sending CONNECT twice in JWT mode (INFO may arrive in fragments).
+  private _connectSent = false;
+
   private readonly url: string;
   private readonly jwtCredential?: string;
+  private readonly nkeySigningCallback?: (nonce: string) => Promise<string>;
   private readonly clientName: string;
   private readonly wsFactory: (url: string) => WebSocket;
 
@@ -104,6 +126,7 @@ export class NatsTransport extends EventEmitter {
     super();
     this.url = options.url;
     this.jwtCredential = options.jwtCredential;
+    this.nkeySigningCallback = options.nkeySigningCallback;
     this.clientName = options.clientName ?? "openclaw-webchannel-agent";
     // Default factory: real outbound WebSocket CLIENT connection.
     this.wsFactory = options._wsFactory ?? ((url) => new WebSocket(url));
@@ -129,6 +152,7 @@ export class NatsTransport extends EventEmitter {
    * process has ZERO new TCP sockets in LISTEN state.
    */
   connect(): Promise<void> {
+    this._connectSent = false;
     return new Promise<void>((resolve, reject) => {
       // ── Outbound WebSocket CLIENT connection ────────────────────────────
       // `wsFactory(url)` dials the remote NATS server. The default factory
@@ -155,24 +179,34 @@ export class NatsTransport extends EventEmitter {
       };
 
       ws.on("open", () => {
-        // ── NATS CONNECT command ─────────────────────────────────────────
-        // Sent immediately after the WebSocket handshake. This is the NATS
-        // client authentication / negotiation payload.
-        const connectPayload: Record<string, unknown> = {
-          verbose: false,
-          pedantic: false,
-          lang: "typescript",
-          version: "1.0.0",
-          protocol: 1,
-          echo: false,
-          name: this.clientName,
-        };
-        if (this.jwtCredential) {
-          connectPayload["jwt"] = this.jwtCredential;
+        if (this.nkeySigningCallback) {
+          // ── JWT auth mode: wait for INFO with nonce before sending CONNECT ──
+          // In enrolled-JWT mode the real nats-server sends INFO (containing a
+          // challenge nonce) as the first message. We MUST sign that nonce and
+          // include the signature in CONNECT before the server will accept us.
+          // Nothing to send here — drainBuffer will fire sendConnectWithJwt()
+          // when the first INFO line arrives.
+        } else {
+          // ── Open NATS mode: send CONNECT immediately on WebSocket open ──────
+          // For unauthenticated / open servers (dev mode) we can send CONNECT
+          // right away. The FakeNatsBroker used in integration tests also relies
+          // on this ordering (it responds to PING with INFO + PONG).
+          const connectPayload: Record<string, unknown> = {
+            verbose: false,
+            pedantic: false,
+            lang: "typescript",
+            version: "1.0.0",
+            protocol: 1,
+            echo: false,
+            name: this.clientName,
+          };
+          if (this.jwtCredential) {
+            connectPayload["jwt"] = this.jwtCredential;
+          }
+          ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
+          // Initiate the round-trip that proves the connection is ready.
+          ws.send("PING\r\n");
         }
-        ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
-        // Initiate the round-trip that proves the connection is ready.
-        ws.send("PING\r\n");
       });
 
       ws.on("message", (data: Buffer | string) => {
@@ -225,8 +259,14 @@ export class NatsTransport extends EventEmitter {
       if (!line) continue;
 
       if (line.startsWith("INFO ")) {
-        // Server INFO — carried as JSON after "INFO ". We don't need its
-        // contents for basic connectivity (no TLS upgrade required here).
+        // Server INFO — carried as JSON after "INFO ".
+        // In JWT auth mode, the INFO contains a challenge nonce that we must
+        // sign before sending CONNECT. sendConnectWithJwt() is idempotent
+        // (guarded by _connectSent) so repeated INFO lines are safe.
+        if (this.nkeySigningCallback && !this._connectSent) {
+          this._connectSent = true;
+          void this.sendConnectWithJwt(line, onFirstPong);
+        }
         continue;
       }
 
@@ -381,6 +421,60 @@ export class NatsTransport extends EventEmitter {
   // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * Build and send CONNECT after receiving the server's INFO (JWT auth mode).
+   *
+   * Extracts the nonce from the INFO JSON, calls `nkeySigningCallback` to sign
+   * it, then sends `CONNECT {jwt, sig, ...}` + `PING`.
+   *
+   * This method is called asynchronously from drainBuffer (via `void`) and
+   * resolves or rejects the outer connect() Promise via the `settle` callback.
+   */
+  private async sendConnectWithJwt(
+    infoLine: string,
+    settle?: (err?: Error) => void,
+  ): Promise<void> {
+    try {
+      // Extract nonce from INFO JSON: INFO {"nonce":"abc123",...}
+      let nonce = "";
+      try {
+        const infoJson = JSON.parse(infoLine.slice(5).trim()) as {
+          nonce?: string;
+        };
+        nonce = infoJson.nonce ?? "";
+      } catch {
+        /* no nonce field — proceed without sig (open NATS on wrong code path) */
+      }
+
+      // Sign the nonce with the user NKEY private key.
+      let sig = "";
+      if (nonce && this.nkeySigningCallback) {
+        sig = await this.nkeySigningCallback(nonce);
+      }
+
+      const connectPayload: Record<string, unknown> = {
+        verbose: false,
+        pedantic: false,
+        lang: "typescript",
+        version: "1.0.0",
+        protocol: 1,
+        echo: false,
+        name: this.clientName,
+      };
+      if (this.jwtCredential) {
+        connectPayload["jwt"] = this.jwtCredential;
+      }
+      if (sig) {
+        connectPayload["sig"] = sig;
+      }
+
+      this.ws!.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
+      this.ws!.send("PING\r\n");
+    } catch (err) {
+      settle?.(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
 
   private assertOpen(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {

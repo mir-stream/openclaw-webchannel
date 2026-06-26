@@ -1,0 +1,261 @@
+################################################################################
+# e2e-gate.yml — Single blocking CI gate for openclaw-webchannel Phase B.
+#
+# Enforces:
+#  - All pre-existing test suites stay green (≥712 test baseline across 3 pkgs)
+#  - 3-package typecheck passes clean
+#  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
+#  - Both dev/open-NATS mode AND enrolled-JWT mode covered
+#
+# The gate runs on every push and PR to main/master branches.
+# NEVER disable or skip this gate — it is the definition of "plugin done".
+################################################################################
+
+name: E2E Gate
+
+on:
+  push:
+    branches: [main, master, jwks]
+  pull_request:
+    branches: [main, master, jwks]
+
+# Only one gate run per branch/PR at a time; cancel stale in-progress runs.
+concurrency:
+  group: e2e-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: E2E Gate (nats-server v2.14 + Typecheck + Tests)
+    runs-on: ubuntu-latest
+
+    # Pin the Node.js version — must match the engines.node range declared
+    # in each published package.json.
+    env:
+      NODE_VERSION: "22"
+      # nats-server release to provision (pinned — never use "latest").
+      NATS_SERVER_VERSION: "v2.14.0"
+      # Signal to real-server test suites that nats-server MUST be present.
+      CI: "true"
+
+    steps:
+      # ──────────────────────────────────────────────────────────────────────
+      # 1. Checkout
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 2. Node.js setup (pinned to engines.node baseline)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 3. Install nats-server v2.14 (cached)
+      #    Required by:
+      #      - packages/plugin/src/nats-transport-realserver.test.ts
+      #      - packages/saas/src/nats-permissions-realserver.test.ts
+      #      - packages/saas/src/ac6-device-flow-e2e.test.ts
+      #    Without this binary the real-server suites HARD FAIL (not skip).
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Cache nats-server binary
+        id: cache-nats
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/nats-server
+          key: nats-server-${{ env.NATS_SERVER_VERSION }}-linux-amd64
+
+      - name: Install nats-server ${{ env.NATS_SERVER_VERSION }}
+        if: steps.cache-nats.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${NATS_SERVER_VERSION}"
+          TARBALL="nats-server-${VERSION}-linux-amd64.tar.gz"
+          URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${TARBALL}"
+          echo "Downloading nats-server ${VERSION} from ${URL}"
+          curl -fsSL "${URL}" -o "/tmp/${TARBALL}"
+          tar -xzf "/tmp/${TARBALL}" -C /tmp
+          sudo mv "/tmp/nats-server-${VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
+          sudo chmod +x /usr/local/bin/nats-server
+          rm -rf "/tmp/${TARBALL}" "/tmp/nats-server-${VERSION}-linux-amd64"
+
+      - name: Verify nats-server is on PATH
+        run: |
+          which nats-server
+          nats-server --version
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 4. Install dependencies (all workspaces)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: npm ci
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 4b. Install Playwright Chromium for E2E tests
+      #
+      # The E2E gate drives a real headless Chromium browser through the NATS
+      # dial seam.  playwright-core is bundled with the `openclaw` dependency;
+      # we use its CLI to download and cache the managed Chromium binary.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Cache Playwright browsers
+        id: cache-playwright
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # Key includes the playwright-core version so the cache invalidates
+          # when playwright is upgraded in the openclaw package.
+          key: playwright-chromium-${{ hashFiles('node_modules/openclaw/node_modules/playwright-core/package.json') }}
+
+      - name: Install Playwright Chromium
+        if: steps.cache-playwright.outputs.cache-hit != 'true'
+        run: |
+          node node_modules/openclaw/node_modules/playwright-core/cli.js install chromium
+
+      - name: Install Playwright Chromium system dependencies
+        # Always install system deps — they live outside the browser cache.
+        run: |
+          node node_modules/openclaw/node_modules/playwright-core/cli.js install-deps chromium
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 5. Typecheck — all 3 packages must be clean
+      #    packages/client  → tsc --noEmit
+      #    packages/plugin  → tsc --noEmit
+      #    packages/saas    → tsc --noEmit
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Typecheck (client)
+        run: npm run typecheck --workspace=packages/client
+
+      - name: Typecheck (plugin)
+        run: npm run typecheck --workspace=packages/plugin
+
+      - name: Typecheck (saas)
+        run: npm run typecheck --workspace=packages/saas
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 6. Run all test suites with JSON output for baseline verification
+      #    - Baseline: ≥712 tests across all 3 packages
+      #    - Real-server suites (skipIf removed in CI) now run against the
+      #      real nats-server binary installed in step 3.
+      #    - Sub-AC 1: e2e/dev-nats-roundtrip.test.ts — open-NATS E2E gate
+      #    - Sub-AC 2: e2e/enrolled-jwt-roundtrip.test.ts — enrolled-JWT E2E gate
+      #      (both drive real headless Chromium via playwright-core installed above)
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Run full test suite
+        run: npx vitest run --reporter=default --reporter=json --outputFile=/tmp/vitest-results.json
+        env:
+          # Ensure real-server suites see the binary at /usr/local/bin/nats-server
+          # The test files probe NATS_SERVER_CANDIDATES which includes this path.
+          CI: "true"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 7. Verify test count meets baseline (≥712 tests passed)
+      #    Fails the gate if the count regresses below the seed-time baseline.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Verify test baseline (≥712 tests)
+        if: always()
+        run: |
+          set -euo pipefail
+          node - << 'EOF'
+          const fs = require('fs');
+          const BASELINE = 712;
+          let data;
+          try {
+            data = JSON.parse(fs.readFileSync('/tmp/vitest-results.json', 'utf8'));
+          } catch (e) {
+            console.error('FATAL: Could not read vitest results JSON:', e.message);
+            process.exit(1);
+          }
+          const passed = data.numPassedTests ?? 0;
+          const total  = data.numTotalTests  ?? 0;
+          const skipped = data.numSkippedTests ?? 0;
+          console.log(`Test results: ${passed} passed / ${total} total / ${skipped} skipped`);
+          if (passed < BASELINE) {
+            console.error(`FATAL: ${passed} passing tests < ${BASELINE} baseline. Regression detected.`);
+            process.exit(1);
+          }
+          console.log(`Baseline check passed: ${passed} >= ${BASELINE}`);
+          EOF
+
+################################################################################
+# Publish job — gated on the E2E gate passing + release tag
+# Only runs when a semver tag is pushed (e.g. v1.0.0).
+# Requires: NPM_TOKEN and CLAWHUB_AUTH_TOKEN secrets.
+################################################################################
+
+  publish:
+    name: Publish to npm + ClawHub
+    needs: gate
+    runs-on: ubuntu-latest
+    # Only publish on semver release tags; skip for branch pushes/PRs.
+    if: >-
+      github.event_name == 'push' &&
+      startsWith(github.ref, 'refs/tags/v')
+
+    env:
+      NODE_VERSION: "22"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build packages
+        run: npm run build --workspaces --if-present
+
+      - name: Extract release version from tag
+        id: version
+        run: |
+          # Strip leading 'v' from tag name (e.g. v1.0.0 → 1.0.0)
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: ${VERSION}"
+
+      - name: Update package versions to release tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Update all workspace package versions to the release semver.
+          npm version "${VERSION}" --workspaces --no-git-tag-version
+
+      - name: Publish openclaw-webchannel-client to npm
+        run: npm publish --workspace=packages/client --access=public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish openclaw-webchannel (plugin) to npm
+        run: npm publish --workspace=packages/plugin --access=public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @openclaw/webchannel-saas to npm
+        run: npm publish --workspace=packages/saas --access=public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish plugin to ClawHub
+        run: |
+          # ClawHub publish uses the openclaw.plugin.json manifest.
+          # The auth token is provided via CLAWHUB_AUTH_TOKEN.
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "Publishing openclaw-webchannel@${VERSION} to ClawHub..."
+          # ClawHub CLI publish — requires auth token in env.
+          npx clawhub-publish \
+            --manifest packages/plugin/openclaw.plugin.json \
+            --version "${VERSION}" \
+            --token "${CLAWHUB_AUTH_TOKEN}"
+        env:
+          CLAWHUB_AUTH_TOKEN: ${{ secrets.CLAWHUB_AUTH_TOKEN }}
+        # Don't fail the gate if ClawHub credentials are absent (DonePublishDeferred).
+        continue-on-error: ${{ secrets.CLAWHUB_AUTH_TOKEN == '' }}
