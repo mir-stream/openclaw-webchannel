@@ -15,6 +15,9 @@
       "blurb": "Self-hosted web chat channel served on the gateway port."
     }
   },
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

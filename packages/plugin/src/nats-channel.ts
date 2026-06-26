@@ -18,6 +18,15 @@
 
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
 import type { ApprovalDecision } from "./transport.js";
+import { generateKeyPair } from "./e2e-crypto.js";
+import type { KeyPair } from "./e2e-crypto.js";
+import {
+  deriveConversationKey,
+  keyExchangeFrame,
+  parseKeyExchange,
+  sealEnvelope,
+  openEnvelope,
+} from "./e2e-session.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,6 +57,23 @@ export type HistoryMessage = {
 // ---------------------------------------------------------------------------
 
 /**
+ * Encrypt-by-construction options for `NatsChannel`.
+ *
+ * When supplied, the channel runs in E2E-encrypted mode (the production NATS
+ * entry's required mode): every peer must complete an X25519 handshake before
+ * any message flows, all outbound is ChaCha20-Poly1305-sealed, all inbound is
+ * decrypted, and the channel is FAIL-CLOSED — it never publishes or processes
+ * plaintext on the relay. Omit to keep the legacy plaintext-JSON behaviour.
+ */
+export type NatsChannelCryptoOptions = {
+  /**
+   * Optional pre-generated agent X25519 key pair. One is generated per channel
+   * instance when omitted (the common case).
+   */
+  keyPair?: KeyPair;
+};
+
+/**
  * NATS-based message channel for WebChannel.
  *
  * Replaces gateway-WS WebSocketServer with NATS pub/sub.
@@ -64,15 +90,33 @@ export class NatsChannel {
   // Per-peer approval deduplication (approvalId -> peerId who first resolved)
   private readonly approvalResolutions = new Map<string, string>();
 
+  // ---- Encrypt-by-construction state (only populated in crypto mode) --------
+
+  /** When true, the channel is E2E-encrypted and fail-closed (no plaintext). */
+  private readonly encryptionRequired: boolean;
+  /** Agent X25519 key pair used to answer per-peer handshakes (null = plaintext mode). */
+  private readonly agentKeyPair: KeyPair | null;
+  /** Per-peer established conversation keys (peerId -> 32-byte session key). */
+  private readonly peerSessionKeys = new Map<string, Uint8Array>();
+  /** Per-peer handshake subscriptions (peerId -> sid). */
+  private readonly handshakeSubscriptions = new Map<string, number>();
+
   // Message handlers
   private onMessage?: (peerId: string, message: InboundWsMessage) => void;
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
   private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
 
-  constructor(transport: NatsTransport, agentId: string, tenant: string) {
+  constructor(
+    transport: NatsTransport,
+    agentId: string,
+    tenant: string,
+    crypto?: NatsChannelCryptoOptions,
+  ) {
     this.transport = transport;
     this.agentId = agentId;
     this.tenant = tenant;
+    this.encryptionRequired = crypto != null;
+    this.agentKeyPair = crypto ? (crypto.keyPair ?? generateKeyPair()) : null;
 
     // Wire up NATS message handler
     this.transport.on("message", (msg: NatsMessage) => this.handleNatsMessage(msg));
@@ -93,6 +137,14 @@ export class NatsChannel {
     const inboundSubject = this.inboundSubject(peerId);
     const sid = this.transport.subscribe(inboundSubject);
     this.peerSubscriptions.set(peerId, sid);
+
+    // In crypto mode also subscribe to the peer's handshake subject so the
+    // X25519 key exchange can complete before any message is sealed/opened.
+    if (this.encryptionRequired) {
+      const hsSubject = this.handshakeSubject(peerId);
+      const hsSid = this.transport.subscribe(hsSubject);
+      this.handshakeSubscriptions.set(peerId, hsSid);
+    }
     console.log(`[nats-channel] Registered peer ${peerId}, subscribed to ${inboundSubject}`);
   }
 
@@ -106,6 +158,13 @@ export class NatsChannel {
       this.peerSubscriptions.delete(peerId);
       console.log(`[nats-channel] Unregistered peer ${peerId}`);
     }
+    const hsSid = this.handshakeSubscriptions.get(peerId);
+    if (hsSid) {
+      this.transport.unsubscribe(hsSid);
+      this.handshakeSubscriptions.delete(peerId);
+    }
+    // Drop the session key so a reconnecting peer must re-handshake.
+    this.peerSessionKeys.delete(peerId);
   }
 
   /**
@@ -245,6 +304,10 @@ export class NatsChannel {
     return `webchannel.${this.tenant}.${this.agentId}.${peerId}.out`;
   }
 
+  private handshakeSubject(peerId: string): string {
+    return `webchannel.${this.tenant}.${this.agentId}.${peerId}.handshake`;
+  }
+
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
     if (!this.transport.connected) {
       console.warn("[nats-channel] Transport not connected, cannot send");
@@ -252,10 +315,28 @@ export class NatsChannel {
     }
 
     const subject = this.outboundSubject(peerId);
-    const serialized = JSON.stringify(payload);
 
     try {
-      this.transport.publish(subject, serialized);
+      if (this.encryptionRequired) {
+        // Fail-closed: refuse to publish until the peer's handshake established a
+        // session key. We NEVER fall back to plaintext on the relay.
+        const key = this.peerSessionKeys.get(peerId);
+        if (!key) {
+          console.warn(
+            `[nats-channel] Refusing to send to ${peerId}: no session key yet (fail-closed, no plaintext)`,
+          );
+          return false;
+        }
+        const wire = sealEnvelope(
+          { agentId: this.agentId, tenant: this.tenant, sub: peerId },
+          key,
+          payload,
+        );
+        this.transport.publish(subject, wire);
+        return true;
+      }
+
+      this.transport.publish(subject, JSON.stringify(payload));
       return true;
     } catch (err) {
       console.error(`[nats-channel] Failed to send to peer ${peerId}:`, err);
@@ -264,8 +345,7 @@ export class NatsChannel {
   }
 
   private handleNatsMessage(msg: NatsMessage): void {
-    // Extract peerId from subject
-    // Subject format: webchannel.{tenant}.{agentId}.{peerId}.in
+    // Subject format: webchannel.{tenant}.{agentId}.{peerId}.{in|handshake}
     const parts = msg.subject.split(".");
     if (parts.length < 5) {
       console.warn(`[nats-channel] Invalid subject format: ${msg.subject}`);
@@ -273,28 +353,92 @@ export class NatsChannel {
     }
 
     const peerId = parts[3];
+    const suffix = parts[parts.length - 1];
 
+    if (this.encryptionRequired) {
+      if (suffix === "handshake") {
+        this.handleHandshake(msg, peerId);
+        return;
+      }
+      this.handleEncryptedInbound(msg, peerId);
+      return;
+    }
+
+    // Plaintext mode (legacy / gateway-parity): payload is JSON.
     try {
       const message = JSON.parse(msg.payload.toString()) as InboundWsMessage;
-
-      switch (message.type) {
-        case "user_message":
-          this.onMessage?.(peerId, message);
-          break;
-
-        case "approval_decision":
-          this.onApprovalDecision?.(peerId, message.id, message.decision);
-          break;
-
-        case "load_history":
-          this.onLoadHistory?.(peerId, { before: message.before, limit: message.limit });
-          break;
-
-        default:
-          console.warn(`[nats-channel] Unknown message type: ${(message as { type: string }).type}`);
-      }
+      this.dispatchInbound(peerId, message);
     } catch (err) {
       console.error(`[nats-channel] Failed to parse message from ${peerId}:`, err);
+    }
+  }
+
+  /**
+   * Crypto mode: answer a peer's X25519 handshake.
+   *
+   * Derives the conversation key from the browser's public key, stores it, and
+   * publishes the agent's public key back on the same handshake subject.
+   */
+  private handleHandshake(msg: NatsMessage, peerId: string): void {
+    if (!this.agentKeyPair) return;
+    const browserPubKey = parseKeyExchange(msg.payload);
+    if (!browserPubKey) {
+      console.warn(`[nats-channel] Ignoring malformed handshake from ${peerId}`);
+      return;
+    }
+    const sessionKey = deriveConversationKey(this.agentKeyPair.privateKey, browserPubKey);
+    this.peerSessionKeys.set(peerId, sessionKey);
+    this.transport.publish(
+      this.handshakeSubject(peerId),
+      keyExchangeFrame(this.agentKeyPair.publicKey),
+    );
+    console.log(`[nats-channel] Completed handshake with peer ${peerId}`);
+  }
+
+  /**
+   * Crypto mode: decrypt an inbound envelope and dispatch it.
+   *
+   * Fail-closed: a message that arrives before the handshake completes (no
+   * session key) or that fails to decrypt/parse is dropped — never processed as
+   * plaintext.
+   */
+  private handleEncryptedInbound(msg: NatsMessage, peerId: string): void {
+    const key = this.peerSessionKeys.get(peerId);
+    if (!key) {
+      console.warn(
+        `[nats-channel] Dropping inbound from ${peerId}: no session key (handshake not completed)`,
+      );
+      return;
+    }
+    let message: InboundWsMessage;
+    try {
+      message = openEnvelope(msg.payload, key).message as InboundWsMessage;
+    } catch (err) {
+      console.warn(
+        `[nats-channel] Dropping inbound from ${peerId}: decrypt/parse failed: ${String(err)}`,
+      );
+      return;
+    }
+    this.dispatchInbound(peerId, message);
+  }
+
+  /** Route a decoded inbound message to the registered handler. */
+  private dispatchInbound(peerId: string, message: InboundWsMessage): void {
+    switch (message.type) {
+      case "user_message":
+        this.onMessage?.(peerId, message);
+        break;
+
+      case "approval_decision":
+        this.onApprovalDecision?.(peerId, message.id, message.decision);
+        break;
+
+      case "load_history":
+        this.onLoadHistory?.(peerId, { before: message.before, limit: message.limit });
+        break;
+
+      default:
+        console.warn(`[nats-channel] Unknown message type: ${(message as { type: string }).type}`);
     }
   }
 }

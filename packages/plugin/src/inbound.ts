@@ -2,6 +2,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
 import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
+import { resolveDmAdmission } from "./dm-allowlist.js";
 
 /** The inbound path only handles user messages; approvals route separately. */
 type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
@@ -83,6 +84,24 @@ export async function handleInboundMessage(
   const channelConfig = (api.config.channels as Record<string, unknown> | undefined)?.[
     WEBCHANNEL_ID
   ];
+
+  // DM allowlist admission (split-authz, plugin-owned half). When the operator
+  // sets `channels.webchannel.dmSecurity: "allowlist"`, a non-allowlisted peer
+  // is denied here — BEFORE the agent turn runs — so `inbound.run` is never
+  // invoked and no reply is emitted (default-deny). With no `dmSecurity` set,
+  // admission is open, preserving the shipping Gateway-WS behavior.
+  const cc = channelConfig as { allowFrom?: readonly string[]; dmSecurity?: string } | undefined;
+  const admission = resolveDmAdmission(wsKey, {
+    allowFrom: cc?.allowFrom,
+    dmSecurity: cc?.dmSecurity,
+  });
+  if (!admission.allowed) {
+    api.logger?.info?.(
+      `webchannel: inbound denied for peer ${wsKey} (${admission.reason}); turn not dispatched`,
+    );
+    return;
+  }
+
   const progressEnabled = resolveStreamingMode(channelConfig) === "progress";
   let draft: ProgressDraftController | undefined;
   if (progressEnabled) {

@@ -34,7 +34,14 @@ import {
 } from "./e2e-crypto.js";
 
 // ---------------------------------------------------------------------------
-// Locate the nats-server binary (skip the suite if unavailable)
+// Locate the nats-server binary
+//
+// In CI (process.env.CI === "true") the binary MUST be present — the CI gate
+// provisions nats-server v2.14 before running tests, so a missing binary is a
+// gate configuration error and we hard-fail rather than silently skip.
+//
+// In local dev, absence of the binary silently skips the suite (developer
+// convenience — install with `brew install nats-server` to enable).
 // ---------------------------------------------------------------------------
 
 const NATS_SERVER_CANDIDATES = [
@@ -44,6 +51,15 @@ const NATS_SERVER_CANDIDATES = [
 ];
 const NATS_SERVER_BIN =
   NATS_SERVER_CANDIDATES.find((p) => existsSync(p)) ?? null;
+
+// Hard-fail in CI if nats-server is absent — silent skips are not allowed.
+if (!NATS_SERVER_BIN && process.env.CI === "true") {
+  throw new Error(
+    "FATAL: nats-server binary not found in CI.\n" +
+    "The e2e-gate.yml workflow must install nats-server v2.14 before running tests.\n" +
+    "Searched paths:\n  " + NATS_SERVER_CANDIDATES.join("\n  "),
+  );
+}
 
 // Dedicated ports for this suite (avoid clashing with any dev server on 4222/8080).
 const CLIENT_PORT = 14223;

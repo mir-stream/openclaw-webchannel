@@ -115,6 +115,48 @@ describe("webchannel inbound round-trip", () => {
     };
   }
 
+  it("default-deny allowlist (gap ③): a non-allowlisted peer is denied — inbound.run never runs, no reply", async () => {
+    const transport = new WebChannelTransport();
+    const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api, resolveAgentRoute } = makeFakeApi(captured, {
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["alice"] },
+    });
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    await handleInboundMessage(api, transport, "mallory", {
+      type: "user_message",
+      text: "let me in",
+    });
+
+    // Denied before dispatch: the agent turn is never invoked and nothing is sent.
+    expect(inboundRun).not.toHaveBeenCalled();
+    expect(resolveAgentRoute).not.toHaveBeenCalled();
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it("default-deny allowlist (gap ③): an allowlisted peer is admitted — inbound.run runs and reply is delivered", async () => {
+    const transport = new WebChannelTransport();
+    const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["alice"] },
+    });
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    await handleInboundMessage(api, transport, "alice", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(inboundRun).toHaveBeenCalledOnce();
+    expect(sendSpy).toHaveBeenCalled();
+  });
+
   it("resolves a channel-scoped route and delivers the reply to the peer socket", async () => {
     const transport = new WebChannelTransport();
     const sendSpy = vi

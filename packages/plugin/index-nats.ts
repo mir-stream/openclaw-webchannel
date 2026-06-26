@@ -15,13 +15,16 @@
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { NatsChannel } from "./src/nats-channel.js";
-import type { InboundWsMessage } from "./src/nats-channel.js";
+import type { InboundWsMessage, NatsChannelCryptoOptions } from "./src/nats-channel.js";
+import { resolveEncryptionPolicy } from "./src/encryption-policy.js";
+import type { WebchannelEncryptionConfig } from "./src/encryption-policy.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
 import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
 import { handleApprovalDecision } from "./src/approvals.js";
-import { resolveVerifier, verifyJwtAndExtractPeerId, type ConnectionVerifier } from "./src/auth.js";
+import { resolveVerifier, verifyJwtAndExtractPeerId, verifyJwtAndExtractIdentity, type ConnectionVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
+import { PopChallengeStore } from "./src/pop-challenge.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { WEBCHANNEL_ID } from "./src/transport.js";
 import type { WebChannelTransport } from "./src/transport.js";
@@ -40,6 +43,23 @@ import { createEnrolledNatsConnection, type EnrolledNatsConnection } from "./src
  */
 let natsChannel: NatsChannel | null = null;
 let natsConnection: EnrolledNatsConnection | null = null;
+
+/**
+ * Proof-of-Possession nonce store (gap ①). Single-use, short-TTL nonces bound
+ * to a peerId; the register route verifies an Ed25519 signature over the nonce
+ * against the bootstrap JWT's `pop_jwk`.
+ */
+const popChallenges = new PopChallengeStore();
+
+/** Read and JSON-parse a request body. Throws on invalid JSON / empty body. */
+async function readJsonBody(req: { on(ev: string, cb: (chunk?: Buffer) => void): void }): Promise<unknown> {
+  const raw = await new Promise<string>((resolve) => {
+    let data = "";
+    req.on("data", (chunk?: Buffer) => { if (chunk) data += chunk.toString(); });
+    req.on("end", () => resolve(data));
+  });
+  return JSON.parse(raw);
+}
 
 /**
  * Lazy transport facade.
@@ -74,6 +94,28 @@ export default defineChannelPluginEntry({
   plugin: webChannelPlugin,
 
   async registerFull(api) {
+    // -----------------------------------------------------------------------
+    // Step 0: Fail-closed encryption guard (AC 3a / EncryptedChannelWired)
+    // -----------------------------------------------------------------------
+
+    // The NATS relay is untrusted and must only ever observe ciphertext. Resolve
+    // the encryption policy BEFORE connecting to NATS: a deployment that disables
+    // encryption throws here and the entry refuses to start — it never connects,
+    // never registers a peer, and therefore never emits plaintext to the relay.
+    const webchannelCfg = (
+      api.config.channels as Record<string, unknown> | undefined
+    )?.webchannel as
+      | { encryption?: WebchannelEncryptionConfig; auth?: AuthConfig }
+      | undefined;
+
+    let cryptoOptions: NatsChannelCryptoOptions;
+    try {
+      cryptoOptions = resolveEncryptionPolicy(webchannelCfg?.encryption).crypto;
+    } catch (err) {
+      api.logger.error?.(`webchannel: ${(err as Error).message}`);
+      throw err;
+    }
+
     // -----------------------------------------------------------------------
     // Step 1: Enroll and connect to NATS (if not already done)
     // -----------------------------------------------------------------------
@@ -119,11 +161,14 @@ export default defineChannelPluginEntry({
       const agentId = natsConnection.enrollment.creds.agentId ?? "default-agent";
       const tenant = natsConnection.tenant ?? "default-tenant";
 
-      natsChannel = new NatsChannel(transport, agentId, tenant);
+      // Encrypt-by-construction: the channel performs the per-peer X25519
+      // handshake and ChaCha20-Poly1305-seals every frame. It is fail-closed —
+      // it never publishes or processes plaintext on the relay.
+      natsChannel = new NatsChannel(transport, agentId, tenant, cryptoOptions);
       // Bind the live channel into the lazy transport facade so the plugin's
       // outbound/message/approval adapters now route to NATS.
       boundChannel = natsChannel;
-      console.log("[webchannel] ✓ NATS channel created");
+      console.log("[webchannel] ✓ Encrypted NATS channel created");
     }
 
     const channel = natsChannel;
@@ -224,6 +269,40 @@ export default defineChannelPluginEntry({
     // Instead, they call an HTTP endpoint to register their peerId
     // The endpoint verifies the bootstrap JWT and calls channel.registerPeer()
 
+    // PoP challenge (gap ①): issue a single-use nonce bound to the verified
+    // peerId. The browser signs it with the device Ed25519 key and presents the
+    // signature to /register.
+    api.http.post!(
+      "/webchannel/nats/register/challenge",
+      async (req, res) => {
+        try {
+          const authHeader = req.headers["authorization"];
+          const jwt = authHeader?.startsWith("Bearer ")
+            ? authHeader.slice(7)
+            : new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt");
+          if (!jwt) {
+            res.statusCode = 401;
+            res.end("Missing JWT");
+            return;
+          }
+          const peerId = await verifyJwtAndExtractPeerId(jwt, authConfig?.auth, api.logger);
+          if (!peerId) {
+            res.statusCode = 401;
+            res.end("Invalid JWT");
+            return;
+          }
+          const nonce = popChallenges.issue(peerId);
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ nonce }));
+        } catch (err) {
+          api.logger.error?.(`webchannel: PoP challenge failed: ${String(err)}`);
+          res.statusCode = 500;
+          res.end("Challenge failed");
+        }
+      },
+    );
+
     api.http.post!(
       "/webchannel/nats/register",
       async (req, res) => {
@@ -246,12 +325,47 @@ export default defineChannelPluginEntry({
             return;
           }
 
-          // Verify JWT and extract peerId
-          const peerId = await verifyJwtAndExtractPeerId(jwt, authConfig?.auth, api.logger);
-          if (!peerId) {
+          // Verify JWT and extract the full identity (peerId + PoP key)
+          const identity = await verifyJwtAndExtractIdentity(jwt, authConfig?.auth, api.logger);
+          if (!identity) {
             res.statusCode = 401;
             res.end("Invalid JWT");
             return;
+          }
+          const peerId = identity.peerId;
+
+          // Proof-of-Possession (gap ①): when the bootstrap JWT carries an
+          // Ed25519 `pop_jwk`, the caller MUST prove possession of the device
+          // private key by signing the issued nonce. Missing / invalid /
+          // expired / replayed → 401 and the peer is NOT registered.
+          if (identity.popPublicJwk) {
+            let proof: { nonce?: unknown; signature?: unknown } = {};
+            try {
+              proof = (await readJsonBody(req)) as typeof proof;
+            } catch {
+              /* empty / invalid body → treated as missing proof below */
+            }
+            const nonce = typeof proof.nonce === "string" ? proof.nonce : "";
+            const signature = typeof proof.signature === "string" ? proof.signature : "";
+            if (!nonce || !signature) {
+              res.statusCode = 401;
+              res.end("Missing proof-of-possession");
+              return;
+            }
+            const verdict = popChallenges.verify({
+              peerId,
+              nonce,
+              signatureB64Url: signature,
+              popPublicJwk: identity.popPublicJwk,
+            });
+            if (!verdict.ok) {
+              api.logger.error?.(
+                `webchannel: PoP verification failed for ${peerId} (${verdict.reason})`,
+              );
+              res.statusCode = 401;
+              res.end("Invalid proof-of-possession");
+              return;
+            }
           }
 
           // Register peer in NATS channel
