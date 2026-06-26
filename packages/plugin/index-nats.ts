@@ -43,6 +43,10 @@ import { createEnrolledNatsConnection, type EnrolledNatsConnection } from "./src
  */
 let natsChannel: NatsChannel | null = null;
 let natsConnection: EnrolledNatsConnection | null = null;
+/** Live transport (from enrolled connection OR the dev/open-NATS path). */
+let natsTransport: NatsTransport | null = null;
+let channelTenant = "default-tenant";
+let channelAgentId = "default-agent";
 
 /**
  * Proof-of-Possession nonce store (gap ①). Single-use, short-TTL nonces bound
@@ -59,6 +63,19 @@ async function readJsonBody(req: { on(ev: string, cb: (chunk?: Buffer) => void):
     req.on("end", () => resolve(data));
   });
   return JSON.parse(raw);
+}
+
+/**
+ * Adapt a void-returning (req,res) handler to the boolean contract that
+ * `api.registerHttpRoute` expects (return true = "this route handled it").
+ */
+function asRoute(
+  handler: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => Promise<void>,
+): (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => Promise<boolean> {
+  return async (req, res) => {
+    await handler(req, res);
+    return true;
+  };
 }
 
 /**
@@ -88,7 +105,7 @@ const lazyTransport = new Proxy({} as Record<string, unknown>, {
 const webChannelPlugin = createWebChannelPlugin(lazyTransport);
 
 export default defineChannelPluginEntry({
-  id: "webchannel-nats",
+  id: "webchannel",
   name: "WebChannel NATS",
   description: "NATS-based WebChannel plugin (AC 5 cutover).",
   plugin: webChannelPlugin,
@@ -117,39 +134,54 @@ export default defineChannelPluginEntry({
     }
 
     // -----------------------------------------------------------------------
-    // Step 1: Enroll and connect to NATS (if not already done)
+    // Step 1: Connect to NATS — enrolled by default; dev/open-NATS when configured
     // -----------------------------------------------------------------------
 
-    if (!natsConnection) {
-      console.log("[webchannel] Starting NATS enrollment and connection...");
+    // `channels.webchannel.nats.devOpen: true` (or WEBCHANNEL_NATS_DEV_OPEN=1)
+    // connects to a plain local nats-server with NO enrollment / NO JWT, for
+    // LOCAL integration testing only. Production keeps the enrolled-creds path.
+    const natsCfg = (
+      api.config.nats as { url?: string; devOpen?: boolean } | undefined
+    );
+    const wcNatsCfg = (webchannelCfg as { nats?: { devOpen?: boolean; url?: string } } | undefined)?.nats;
+    const devOpenNats =
+      natsCfg?.devOpen === true ||
+      wcNatsCfg?.devOpen === true ||
+      process.env["WEBCHANNEL_NATS_DEV_OPEN"] === "1";
 
-      // Get NATS URL from config or use default
-      const natsUrl = api.config.nats?.url ?? "ws://localhost:4222";
+    if (!natsTransport) {
+      const natsUrl =
+        process.env["WEBCHANNEL_NATS_URL"] ?? wcNatsCfg?.url ?? natsCfg?.url ?? "ws://127.0.0.1:4222";
+      channelTenant = process.env["WEBCHANNEL_TENANT"] ?? api.config.tenant ?? "default-tenant";
+      channelAgentId = process.env["WEBCHANNEL_AGENT_ID"] ?? api.config.agentId ?? "default-agent";
 
-      // Get SaaS URLs from config
-      const saasBaseUrl = api.config.saas?.baseUrl ?? "http://localhost:3001";
-      const saasEnrollUrl = `${saasBaseUrl}/api/enroll`;
-      const saasPollUrl = `${saasBaseUrl}/api/poll`;
-
-      // Get tenant/agent IDs from config
-      const tenant = api.config.tenant ?? "default-tenant";
-      const agentId = api.config.agentId ?? "default-agent";
-
-      try {
-        natsConnection = await createEnrolledNatsConnection({
-          saasEnrollUrl,
-          saasPollUrl,
-          natsUrl,
-          tenant,
-          agentId,
-          displayInstructions: true,
+      if (devOpenNats) {
+        console.log(`[webchannel] DEV open-NATS mode → ${natsUrl} (no enrollment, no JWT)`);
+        const transport = new NatsTransport({
+          url: natsUrl,
+          clientName: "openclaw-webchannel-agent-dev",
         });
-
-        console.log("[webchannel] ✓ Connected to NATS");
-      } catch (err) {
-        console.error("[webchannel] Failed to connect to NATS:", err);
-        throw err;
+        await transport.connect();
+        natsTransport = transport;
+      } else {
+        console.log("[webchannel] Starting NATS enrollment and connection...");
+        const saasBaseUrl = api.config.saas?.baseUrl ?? "http://localhost:3001";
+        try {
+          natsConnection = await createEnrolledNatsConnection({
+            saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
+            saasPollUrl: `${saasBaseUrl}/api/poll`,
+            natsUrl,
+            tenant: channelTenant,
+            agentId: channelAgentId,
+            displayInstructions: true,
+          });
+          natsTransport = natsConnection.transport;
+        } catch (err) {
+          console.error("[webchannel] Failed to connect to NATS:", err);
+          throw err;
+        }
       }
+      console.log("[webchannel] ✓ Connected to NATS");
     }
 
     // -----------------------------------------------------------------------
@@ -157,14 +189,10 @@ export default defineChannelPluginEntry({
     // -----------------------------------------------------------------------
 
     if (!natsChannel) {
-      const transport = natsConnection.transport;
-      const agentId = natsConnection.enrollment.creds.agentId ?? "default-agent";
-      const tenant = natsConnection.tenant ?? "default-tenant";
-
       // Encrypt-by-construction: the channel performs the per-peer X25519
       // handshake and ChaCha20-Poly1305-seals every frame. It is fail-closed —
       // it never publishes or processes plaintext on the relay.
-      natsChannel = new NatsChannel(transport, agentId, tenant, cryptoOptions);
+      natsChannel = new NatsChannel(natsTransport, channelAgentId, channelTenant, cryptoOptions);
       // Bind the live channel into the lazy transport facade so the plugin's
       // outbound/message/approval adapters now route to NATS.
       boundChannel = natsChannel;
@@ -198,6 +226,12 @@ export default defineChannelPluginEntry({
       if (message.type !== "user_message") return; // approvals routed below
       dispatchInbound(peerId, message);
     });
+
+    // Dev/open-NATS: there is no HTTP registration step, so subscribe to the
+    // tenant/agent wildcard and let peers auto-register on their handshake.
+    if (devOpenNats) {
+      channel.subscribeWildcard();
+    }
 
     // -----------------------------------------------------------------------
     // Step 4: Wire up approval decision handler
@@ -272,9 +306,11 @@ export default defineChannelPluginEntry({
     // PoP challenge (gap ①): issue a single-use nonce bound to the verified
     // peerId. The browser signs it with the device Ed25519 key and presents the
     // signature to /register.
-    api.http.post!(
-      "/webchannel/nats/register/challenge",
-      async (req, res) => {
+    api.registerHttpRoute({
+      path: "/webchannel/nats/register/challenge",
+      auth: "plugin",
+      match: "exact",
+      handler: asRoute(async (req, res) => {
         try {
           const authHeader = req.headers["authorization"];
           const jwt = authHeader?.startsWith("Bearer ")
@@ -300,12 +336,14 @@ export default defineChannelPluginEntry({
           res.statusCode = 500;
           res.end("Challenge failed");
         }
-      },
-    );
+      }),
+    });
 
-    api.http.post!(
-      "/webchannel/nats/register",
-      async (req, res) => {
+    api.registerHttpRoute({
+      path: "/webchannel/nats/register",
+      auth: "plugin",
+      match: "exact",
+      handler: asRoute(async (req, res) => {
         if (!verifier) {
           res.statusCode = 500;
           res.end("No verifier configured");
@@ -395,16 +433,18 @@ export default defineChannelPluginEntry({
           res.statusCode = 500;
           res.end("Registration failed");
         }
-      },
-    );
+      }),
+    });
 
     // -----------------------------------------------------------------------
     // Step 8: Wire up HTTP route for peer unregistration
     // -----------------------------------------------------------------------
 
-    api.http.post!(
-      "/webchannel/nats/unregister",
-      async (req, res) => {
+    api.registerHttpRoute({
+      path: "/webchannel/nats/unregister",
+      auth: "plugin",
+      match: "exact",
+      handler: asRoute(async (req, res) => {
         try {
           const body = await new Promise<string>((resolve) => {
             let data = "";
@@ -428,23 +468,25 @@ export default defineChannelPluginEntry({
           res.statusCode = 500;
           res.end("Unregistration failed");
         }
-      },
-    );
+      }),
+    });
 
     // -----------------------------------------------------------------------
     // Step 9: Keep the NATS connection alive
     // -----------------------------------------------------------------------
 
-    api.runtime.channel.keepAlive({
-      async handler() {
-        // This handler is called periodically to keep the channel alive
-        // We just need to ensure the NATS connection stays up
-        if (natsConnection?.transport && !natsConnection.transport.connected) {
-          console.log("[webchannel] NATS disconnected, attempting reconnect...");
-          // The enrolled connection should auto-reconnect
-        }
-      },
-    });
+    // keepAlive is optional — not all gateway runtimes expose it. The NATS
+    // transport maintains its own connection, so this is best-effort.
+    const keepAlive = (api.runtime.channel as { keepAlive?: (opts: { handler: () => Promise<void> }) => void }).keepAlive;
+    if (typeof keepAlive === "function") {
+      keepAlive({
+        async handler() {
+          if (natsTransport && !natsTransport.connected) {
+            console.log("[webchannel] NATS disconnected, attempting reconnect...");
+          }
+        },
+      });
+    }
 
     console.log("[webchannel] ✓ NATS mode plugin registered");
   },

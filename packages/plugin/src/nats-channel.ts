@@ -149,6 +149,24 @@ export class NatsChannel {
   }
 
   /**
+   * Subscribe to the tenant/agent WILDCARD subjects so any peer is handled
+   * without an explicit `registerPeer` (peers auto-register on their handshake).
+   *
+   * Used by the dev/open-NATS path where there is no HTTP registration step.
+   * Per-peer routing still works because `handleNatsMessage` derives the peerId
+   * from the subject, and the inbound allowlist gate still runs downstream.
+   */
+  subscribeWildcard(): void {
+    const inWild = `webchannel.${this.tenant}.${this.agentId}.*.in`;
+    this.transport.subscribe(inWild);
+    if (this.encryptionRequired) {
+      const hsWild = `webchannel.${this.tenant}.${this.agentId}.*.handshake`;
+      this.transport.subscribe(hsWild);
+    }
+    console.log(`[nats-channel] Subscribed to wildcard ${inWild}`);
+  }
+
+  /**
    * Unregister a peer (browser session disconnected).
    */
   unregisterPeer(peerId: string): void {
