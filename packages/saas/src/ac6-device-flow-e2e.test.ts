@@ -33,6 +33,12 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { setTimeout } from "node:timers/promises";
 
+// Cross-package import: prove real-issuer ↔ real-verifier interop at the unit
+// level. The plugin's RS256 verifier + JWKS resolver MUST admit the JWT the
+// reference bootstrap-server issues, against the JWKS it serves.
+import { verifyJwt } from "../../plugin/src/jwt.js";
+import { JWKSCache } from "../../plugin/src/jwks.js";
+
 // ---------------------------------------------------------------------------
 // Test configuration
 // ---------------------------------------------------------------------------
@@ -448,12 +454,14 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       bootstrapRequest,
     ) as {
       jwt: string;
+      peerId: string;
       agentPublicKey: string;
       jwksUrl: string;
       natsUrl: string;
     };
 
     expect(bootstrapResponse.jwt).toBeDefined();
+    expect(bootstrapResponse.peerId).toBeDefined();
     expect(bootstrapResponse.agentPublicKey).toBeDefined();
     expect(bootstrapResponse.jwksUrl).toContain("/.well-known/jwks.json");
     expect(bootstrapResponse.natsUrl).toContain("nats");
@@ -462,6 +470,14 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     const jwtParts = bootstrapResponse.jwt.split(".");
     expect(jwtParts).toHaveLength(3);
 
+    // Header MUST carry a real kid that matches the served JWKS (not "demo-key-id").
+    const header = JSON.parse(
+      Buffer.from(jwtParts[0], "base64url").toString("utf-8"),
+    );
+    expect(header.alg).toBe("RS256");
+    expect(header.kid).toBeDefined();
+    expect(header.kid).not.toBe("demo-key-id");
+
     // Decode payload and verify cnf claim
     const payload = JSON.parse(
       Buffer.from(jwtParts[1], "base64url").toString("utf-8"),
@@ -469,7 +485,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
 
     expect(payload).toMatchObject({
       iss: expect.any(String),
-      sub: expect.any(String), // peerId
+      sub: bootstrapResponse.peerId, // peerId is threaded into sub
       aud: TEST_AGENT_ID,
       agentId: TEST_AGENT_ID,
       tenant: TEST_TENANT,
@@ -482,8 +498,52 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       },
     });
 
+    // The signature must NOT be the old mock placeholder.
+    expect(Buffer.from(jwtParts[2], "base64url").toString("utf-8")).not.toBe("mock-signature");
+
     console.log(`[AC6 E2E] Bootstrap JWT issued for peerId: ${payload.sub}`);
     console.log(`[AC6 E2E] cnf.jwk claim verified for device key`);
+  });
+
+  // -------------------------------------------------------------------------
+  // Test 5b: Real issuer ↔ real verifier interop (cross-package)
+  //
+  // The strongest unit-level proof: the JWT minted+signed by the REAL
+  // bootstrap-server VERIFIES against the JWKS it serves, using the PLUGIN's
+  // own RS256 verifier + JWKS resolver. This is the same code path the live
+  // register hop exercises, asserted directly without spinning up a gateway.
+  // -------------------------------------------------------------------------
+
+  it("issued JWT verifies against served JWKS via the plugin's verifyJwt", async () => {
+    const devicePublicKey = await generateDeviceKey();
+
+    const bootstrapResponse = await postJson(
+      `${BOOTSTRAP_BASE_URL}/bootstrap`,
+      { devicePublicKey, agentId: TEST_AGENT_ID, tenant: TEST_TENANT },
+    ) as { jwt: string; peerId: string };
+
+    // The plugin resolves keys by kid from the live JWKS URL (fail-closed cache).
+    const jwks = JWKSCache.create({
+      jwksUrl: `${BOOTSTRAP_BASE_URL}/.well-known/jwks.json`,
+    });
+
+    // Recover the issuer the server actually used (env-configurable) from the JWT.
+    const payload = JSON.parse(
+      Buffer.from(bootstrapResponse.jwt.split(".")[1], "base64url").toString("utf-8"),
+    ) as { iss: string };
+
+    const identity = await verifyJwt(bootstrapResponse.jwt, {
+      jwks,
+      issuer: payload.iss,
+      audience: TEST_AGENT_ID,
+    });
+
+    // A real RS256 signature over a real RSA key → verifyJwt returns the identity.
+    expect(identity).not.toBeNull();
+    expect(identity?.peerId).toBe(bootstrapResponse.peerId);
+    expect(identity?.devicePublicKey).toBe(devicePublicKey);
+
+    console.log(`[AC6 E2E] verifyJwt admitted real-issuer JWT for peerId: ${identity?.peerId}`);
   });
 
   // -------------------------------------------------------------------------
@@ -512,10 +572,26 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       use: "sig",
       kid: expect.any(String),
       n: expect.any(String),
-      e: expect.any(String),
+      e: "AQAB",
     });
 
-    console.log(`[AC6 E2E] JWKS endpoint serves RSA public key with kid: ${rsaKey.kid}`);
+    // The served modulus must be a REAL RSA-2048 modulus — not the old mock.
+    expect(rsaKey.n).not.toBe("mock-modulus-base64url-encoded");
+    expect(rsaKey.kid).not.toBe("demo-key-id");
+    // RSA-2048 modulus is 256 bytes → ~342 base64url chars; assert it's plausibly real.
+    expect(Buffer.from(rsaKey.n, "base64url").length).toBeGreaterThanOrEqual(256);
+    // The served key's kid MUST match the kid the issuer stamps into JWT headers.
+    const devicePublicKey = await generateDeviceKey();
+    const boot = await postJson(
+      `${BOOTSTRAP_BASE_URL}/bootstrap`,
+      { devicePublicKey, agentId: TEST_AGENT_ID, tenant: TEST_TENANT },
+    ) as { jwt: string };
+    const jwtHeader = JSON.parse(
+      Buffer.from(boot.jwt.split(".")[0], "base64url").toString("utf-8"),
+    ) as { kid: string };
+    expect(jwtHeader.kid).toBe(rsaKey.kid);
+
+    console.log(`[AC6 E2E] JWKS endpoint serves REAL RSA public key with kid: ${rsaKey.kid}`);
   });
 
   // -------------------------------------------------------------------------

@@ -146,6 +146,27 @@ agent side made this worse and was removed in `ee89ba3`.)
     folded into CI — see #9.)
     Production behavior is unchanged: enrolled production runs `devOpenNats=false`, so the wildcard
     was already off there.
+14. ✅ **Real-SaaS-issuer live e2e (real bootstrap-server RS256 + real JWKS-over-HTTP)** —
+    **Node-driver variant done**. The reference bootstrap-server
+    (`packages/saas/reference/bootstrap-server.ts`) is now **real, no longer a mock**: at boot it
+    derives a real RSA keypair via `setupTrustChain()`, holds the importable RS256 private key in
+    memory, RS256-signs each `/bootstrap` JWT with header `kid` = trust-chain kid (`sub` = the
+    `peerId` it returns, derived from the device key when not supplied), and serves the **real**
+    public RSA JWK at `/.well-known/jwks.json` (the old `createMockJwt` / hardcoded-`mock-…` JWKS
+    paths are gone). The new hermetic harness `e2e/local/run-saas-issuer-register.sh` +
+    driver `e2e/local/saas-issuer-roundtrip.ts` boot that server live and point the gateway's
+    `channels.webchannel.auth.jwt.jwksUrl` at its JWKS endpoint (HTTP, not a `jwksFile`), so the
+    plugin's `verifyJwt` fetches the signing key by `kid` over HTTP from the **real issuer** and
+    admits the token through the live HTTP register hop for an encrypted round-trip (exits 0 with
+    `[PROOF] real-SaaS-issued JWT (RS256, real JWKS) admitted via live register hop`). Unit-level
+    twin: `packages/saas/src/ac6-device-flow-e2e.test.ts` now cross-imports the plugin's `verifyJwt`
+    + `JWKSCache` and asserts the issued JWT verifies against the served JWKS (real-issuer↔real-verifier
+    interop), and its JWKS/bootstrap assertions are strengthened (real `n` ≥ 256 bytes, kid ≠
+    `demo-key-id`, header.kid == served kid, signature ≠ `mock-signature`). JWT issuance is kept
+    **independent of NATS transport** (devOpen NATS stays). Remaining: the full
+    **enrolled-NATS-transport (device-flow)** variant, and the real **browser/Playwright** JWT
+    variant against this real issuer (deferred — Playwright cannot pass an Ed25519 `CryptoKey` across
+    the page boundary).
 
 ## Commit landmarks
 

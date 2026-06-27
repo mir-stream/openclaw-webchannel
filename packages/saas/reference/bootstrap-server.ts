@@ -1,19 +1,26 @@
 #!/usr/bin/env node
 /**
- * SaaS Bootstrap JWT issuance endpoint.
+ * SaaS Bootstrap JWT issuance endpoint — REAL RS256 issuer + REAL JWKS.
  *
- * This endpoint validates device PoP (proof of possession) and issues
- * RS256-signed bootstrap JWTs containing cnf.jwk claims.
+ * This server validates device PoP (proof of possession) inputs and issues
+ * RS256-signed bootstrap JWTs containing cnf.jwk (X25519) + pop_jwk (Ed25519)
+ * claims. It is NOT a mock: at startup it derives a real trust chain via
+ * `setupTrustChain()` (real RSA keypair + real JWKS), holds the importable RSA
+ * private key in memory, and signs each JWT with it. The matching public RSA JWK
+ * is served at `/.well-known/jwks.json` so the plugin's `verifyJwt` (resolving by
+ * `kid`) admits the token. The header `kid` ALWAYS equals the trust chain's kid.
  *
  * USAGE:
- *   node dist/reference/bootstrap-server.js
+ *   node --import tsx packages/saas/reference/bootstrap-server.ts
  *
  * ENDPOINTS:
- *   POST /bootstrap - Issue bootstrap JWT (browser → SaaS)
+ *   POST /bootstrap                 - Issue bootstrap JWT (browser/device → SaaS)
+ *   GET  /.well-known/jwks.json     - Real RSA public key (RFC 7517) for verifiers
  *
  * ENVIRONMENT VARIABLES:
- *   PORT              - Server port (default: 3001)
- *   SAAS_BASE_URL     - SaaS base URL (default: http://localhost:3001)
+ *   PORT          - Server port (default: 3001)
+ *   SAAS_ISSUER   - Token issuer (`iss` claim). Default http://localhost:<PORT>.
+ *   SAAS_BASE_URL - Base URL for response convenience fields (default http://localhost:<PORT>).
  *
  * SECURITY NOTES:
  *   - This reference uses HTTP for demonstration. Use TLS in production.
@@ -22,15 +29,11 @@
  */
 
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
-import { randomBytes } from "node:crypto";
+import { createHash, webcrypto } from "node:crypto";
 
 import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+import { setupTrustChain } from "../src/setup-trust-chain.js";
+import type { JwksDocument } from "../src/types.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -38,6 +41,11 @@ const __dirname = dirname(__filename);
 
 const PORT = parseInt(process.env.PORT || "3001", 10);
 const SAAS_BASE_URL = process.env.SAAS_BASE_URL || `http://localhost:${PORT}`;
+// `iss` claim the plugin checks against `channels.webchannel.auth.jwt.issuer`.
+const SAAS_ISSUER = process.env.SAAS_ISSUER || SAAS_BASE_URL;
+
+const JWKS_URL = `${SAAS_BASE_URL}/.well-known/jwks.json`;
+const NATS_URL = process.env.NATS_URL || "wss://nats.example.com";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,48 +56,85 @@ type BootstrapRequest = {
   devicePopPublicKey?: string; // base64url-encoded Ed25519 PoP public key (→ pop_jwk)
   agentId: string;
   tenant: string;
+  peerId?: string; // optional caller-supplied peerId; else derived from device key
   pop?: string; // Proof of possession (signature) - optional for this demo
 };
 
 type BootstrapResponse = {
   jwt: string; // RS256-signed bootstrap JWT
-  agentPublicKey: string; // SaaS-attested agent public key
+  peerId: string; // = JWT `sub`; returned so the driver stays consistent
+  agentPublicKey: string; // SaaS-attested agent public key (placeholder for demo)
   jwksUrl: string; // JWKS endpoint URL
   natsUrl: string; // NATS WebSocket URL
 };
 
 // ---------------------------------------------------------------------------
-// Mock trust chain (for demonstration)
+// Real trust chain (derived once at startup, held in memory)
 // ---------------------------------------------------------------------------
 
-const MOCK_RSA_PRIVATE_KEY = `-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDE3VRjIIlGsGXVs
-LG+mDdpFWVYxwhDjelsI4mPMqG0HQQv8+dKVZ+6vCnFhQRI6eBKdQYZLVxfPHQf3
-MqBvYQXlGpCqQ5oTVW5p4m7NTvWq8fJxVFE8VvRwqBPv7FQRRBVGRoEcVd5ZgY3q4
-ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3
-ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3
-ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3ZQ+dZ4Z3
------END PRIVATE KEY-----`;
+type RealTrustChain = {
+  /** Importable RSA private key (RSASSA-PKCS1-v1_5, SHA-256, ["sign"]). */
+  rsaPrivateKey: webcrypto.CryptoKey;
+  /** Public RSA JWKS document (single key, matching kid). */
+  jwks: JwksDocument;
+  /** Key ID — equals the JWKS key kid and the JWT header kid. */
+  kid: string;
+};
 
-const MOCK_AGENT_PUBLIC_KEY = "mock-agent-x25519-public-key-32-bytes-base64urlencoded";
+/** Import a PKCS#8 PEM RSA private key into a webcrypto signing key. */
+async function importRsaPrivateKeyFromPem(pem: string): Promise<webcrypto.CryptoKey> {
+  const body = pem
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/\s/g, "");
+  const der = Buffer.from(body, "base64");
+  return webcrypto.subtle.importKey(
+    "pkcs8",
+    new Uint8Array(der),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+}
 
-const MOCK_JWKS_URL = `${SAAS_BASE_URL}/.well-known/jwks.json`;
-const MOCK_NATS_URL = "wss://nats.example.com";
+/** Derive a real trust chain (real RSA keypair + real JWKS) once at boot. */
+async function initTrustChain(): Promise<RealTrustChain> {
+  const chain = await setupTrustChain();
+  const rsaPrivateKey = await importRsaPrivateKeyFromPem(chain.private.rsaPrivateKeyPem);
+  return { rsaPrivateKey, jwks: chain.jwks, kid: chain.kid };
+}
 
 // ---------------------------------------------------------------------------
-// JWT helpers (simplified for demo - use jsonwebtoken in production)
+// JWT signing (RS256, real signature with the trust-chain private key)
 // ---------------------------------------------------------------------------
 
-function createBase64Url(data: string): string {
+function b64url(data: Uint8Array): string {
   return Buffer.from(data).toString("base64url");
 }
 
-function createMockJwt(payload: Record<string, unknown>): string {
-  const header = { alg: "RS256", typ: "JWT", kid: "demo-key-id" };
-  const headerB64 = createBase64Url(JSON.stringify(header));
-  const payloadB64 = createBase64Url(JSON.stringify(payload));
-  const signatureB64 = createBase64Url("mock-signature"); // In production, sign with RSA private key
-  return `${headerB64}.${payloadB64}.${signatureB64}`;
+function b64urlJson(obj: unknown): string {
+  return Buffer.from(JSON.stringify(obj)).toString("base64url");
+}
+
+/** RS256-sign a claims payload, embedding the trust chain's kid in the header. */
+async function signBootstrapJwt(
+  payload: Record<string, unknown>,
+  trustChain: RealTrustChain,
+): Promise<string> {
+  const header = { alg: "RS256", typ: "JWT", kid: trustChain.kid };
+  const signingInput = `${b64urlJson(header)}.${b64urlJson(payload)}`;
+  const sig = await webcrypto.subtle.sign(
+    { name: "RSASSA-PKCS1-v1_5" },
+    trustChain.rsaPrivateKey,
+    new TextEncoder().encode(signingInput),
+  );
+  return `${signingInput}.${b64url(new Uint8Array(sig))}`;
+}
+
+/** Deterministic peerId derived from the device key (stable per device). */
+function derivePeerId(devicePublicKey: string): string {
+  const digest = createHash("sha256").update(devicePublicKey).digest("hex");
+  return `user-${digest.slice(0, 16)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +157,7 @@ function sendJson(res: any, data: unknown, status = 200): void {
 // Bootstrap endpoint
 // ---------------------------------------------------------------------------
 
-async function handleBootstrap(req: any, res: any): Promise<void> {
+async function handleBootstrap(req: any, res: any, trustChain: RealTrustChain): Promise<void> {
   if (req.method === "OPTIONS") {
     setCorsHeaders(res);
     res.writeHead(200);
@@ -163,12 +208,16 @@ async function handleBootstrap(req: any, res: any): Promise<void> {
       return;
     }
 
-    // Generate peer ID (JWT sub claim)
-    const peerId = `user-${randomBytes(8).toString("hex")}`;
+    // peerId = JWT `sub`. Accept a caller-supplied peerId; otherwise derive a
+    // deterministic one from the device key (stable across re-bootstraps).
+    const peerId =
+      typeof request.peerId === "string" && request.peerId.length > 0
+        ? request.peerId
+        : derivePeerId(request.devicePublicKey);
 
     // Create JWT payload with cnf.jwk (+ pop_jwk when the device sent its PoP key).
     const jwtPayload = buildBootstrapClaims({
-      iss: SAAS_BASE_URL,
+      iss: SAAS_ISSUER,
       peerId,
       agentId: request.agentId,
       tenant: request.tenant,
@@ -176,17 +225,19 @@ async function handleBootstrap(req: any, res: any): Promise<void> {
       devicePopPublicKey: request.devicePopPublicKey,
     });
 
-    const jwt = createMockJwt(jwtPayload);
+    // REAL RS256 signature with the trust-chain private key; header.kid = trust kid.
+    const jwt = await signBootstrapJwt(jwtPayload, trustChain);
 
     const response: BootstrapResponse = {
       jwt,
-      agentPublicKey: MOCK_AGENT_PUBLIC_KEY,
-      jwksUrl: MOCK_JWKS_URL,
-      natsUrl: MOCK_NATS_URL,
+      peerId,
+      agentPublicKey: "saas-attested-agent-x25519-public-key",
+      jwksUrl: JWKS_URL,
+      natsUrl: NATS_URL,
     };
 
     sendJson(res, response);
-    console.log(`[bootstrap] Issued bootstrap JWT for peerId=${peerId}, tenant=${request.tenant}`);
+    console.log(`[bootstrap] Issued RS256 bootstrap JWT (kid=${trustChain.kid}) for peerId=${peerId}, tenant=${request.tenant}`);
   } catch (err) {
     console.error("[bootstrap] Error:", err);
     sendJson(res, { error: "Internal server error" }, 500);
@@ -194,39 +245,27 @@ async function handleBootstrap(req: any, res: any): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// JWKS endpoint
+// JWKS endpoint — serve the REAL public RSA JWK (matching kid)
 // ---------------------------------------------------------------------------
 
-async function handleJwks(req: any, res: any): Promise<void> {
+function handleJwks(req: any, res: any, trustChain: RealTrustChain): void {
   setCorsHeaders(res);
-
-  const jwks = {
-    keys: [
-      {
-        kty: "RSA",
-        kid: "demo-key-id",
-        alg: "RS256",
-        use: "sig",
-        n: "mock-modulus-base64url-encoded",
-        e: "AQAB",
-      },
-    ],
-  };
-
-  sendJson(res, jwks);
+  sendJson(res, trustChain.jwks);
 }
 
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
+const trustChain = await initTrustChain();
+
 const server = createServer((req, res) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
 
   if (url.pathname === "/bootstrap") {
-    void handleBootstrap(req, res);
+    void handleBootstrap(req, res, trustChain);
   } else if (url.pathname === "/.well-known/jwks.json") {
-    void handleJwks(req, res);
+    handleJwks(req, res, trustChain);
   } else {
     setCorsHeaders(res);
     res.writeHead(404).end("Not found");
@@ -235,6 +274,8 @@ const server = createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[bootstrap] SaaS Bootstrap server listening on http://localhost:${PORT}`);
+  console.log(`[bootstrap] Issuer (iss): ${SAAS_ISSUER}`);
+  console.log(`[bootstrap] Signing kid: ${trustChain.kid}`);
   console.log(`[bootstrap] Bootstrap endpoint: http://localhost:${PORT}/bootstrap`);
   console.log(`[bootstrap] JWKS endpoint: http://localhost:${PORT}/.well-known/jwks.json`);
 });

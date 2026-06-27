@@ -121,6 +121,46 @@ through the HTTP hop. The driver prints `[PROOF] agent registered peer via HTTP 
 This does **not** change production behavior: enrolled production runs `devOpenNats=false`, so the
 wildcard is already off there. The gate only tightens the devOpen+jwt test so the proof is real.
 
+### Real-SaaS-issuer scenario (real bootstrap-server, real JWKS over HTTP)
+
+`run-saas-issuer-register.sh` is the **stronger sibling** of `run-jwt-register.sh`. Same
+live register hop, same wildcard-OFF jwt path, same encrypted round-trip — but the bootstrap
+JWT is **not self-minted from a static fixture**. It is minted + RS256-signed by the **real**
+reference bootstrap-server (`packages/saas/reference/bootstrap-server.ts`), which derives a
+real RSA keypair via `setupTrustChain()` and serves the matching public JWKS at
+`/.well-known/jwks.json`. The gateway is configured with
+`channels.webchannel.auth.jwt.jwksUrl` pointing **at that live JWKS endpoint** (not a
+`jwksFile`), so the plugin's `verifyJwt` fetches the signing key by header `kid` **over HTTP
+from the real issuer**.
+
+```bash
+./e2e/local/run-saas-issuer-register.sh   # exits 0 iff the real-issuer JWT is admitted
+```
+
+What it proves end-to-end: **real bootstrap-server RS256 issuance → real JWKS-over-HTTP
+verification → live HTTP register hop → encrypted echo** — the real issuer↔verifier↔register
+loop, not a fixture. The driver prints
+`[PROOF] real-SaaS-issued JWT (RS256, real JWKS) admitted via live register hop`.
+
+How it differs from `run-jwt-register.sh`:
+
+| | `run-jwt-register.sh` | `run-saas-issuer-register.sh` |
+|---|---|---|
+| JWT source | self-minted in the driver from `gen-jwt-fixtures.mjs` | **real bootstrap-server** (`/bootstrap`) |
+| JWKS source | static `auth.jwt.jwksFile` | **live** `auth.jwt.jwksUrl` (HTTP fetch) |
+| Issuer | `https://e2e-issuer.test` (fixed) | `SAAS_ISSUER` (env, default `https://saas.local/issuer`) |
+| peerId | hardcoded `web-jwt-peer` | driver sends a fixed `peerId`; server threads it into JWT `sub`; allowlisted |
+| Ports | gw 18799 / nats 18222 / echo 18900 | gw 18899 / nats 18322 / echo 18901 / bootstrap 3911 |
+
+The unit-level twin of this proof lives in `packages/saas/src/ac6-device-flow-e2e.test.ts`
+("issued JWT verifies against served JWKS via the plugin's verifyJwt"), which cross-imports
+the plugin's `verifyJwt` + `JWKSCache` and asserts the real-issuer JWT verifies against the
+served JWKS without a gateway.
+
+JWT issuance is **independent of NATS transport**: this harness keeps devOpen NATS (no
+enrollment). The full **enrolled-NATS-transport (device-flow)** variant — a JWT-auth
+nats-server fed by the device-flow `/enroll`+`/poll` credentials — remains a follow-up.
+
 ## dev/open-NATS contract (how `index-nats` skips enrollment)
 
 Production `index-nats` connects via `createEnrolledNatsConnection` (SaaS device-flow + JWT).
