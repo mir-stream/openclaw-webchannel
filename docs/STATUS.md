@@ -60,7 +60,7 @@ this file, **this file is correct.**
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
 | HTTP-register hop now exercised via Node driver; browser/Playwright variant deferred | The plain-HTTP register/challenge/unregister routes **are served live** (fix `5597466`), the client **is wired** to call `registerWithPop` (`9aa4b67`), and the JWT-register round-trip is now **exercised end-to-end** by `e2e/local/run-jwt-register.sh` + `jwt-register-roundtrip.ts`: with `auth.strategy="jwt"` the agent does NOT `subscribeWildcard` (gated in `index-nats.ts` / `src/wildcard-gate.ts`), so a successful round-trip proves `registerPeer` happened ONLY via the live HTTP hop (RS256 bootstrap JWT minted via `packages/saas` + RS256 JWKS fixture). Remaining: the **real browser/Playwright** JWT variant (deferred — Playwright cannot pass an Ed25519 `CryptoKey` across the page boundary) against a **real SaaS issuer**. See follow-up #13. |
-| Production pair not yet in the CI gate | The production pair is now live-verified **locally** (see "What works", `e384198`), but the automated CI gate still drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` seam. Folding the `e2e/local` harness into CI (needs a built openclaw + browser) is a follow-up. |
+| Production pair partly in the CI gate | The **JWT-register** real-gateway harness (`e2e/local/run-jwt-register.sh`) is now run by the CI gate (step "Real-gateway live e2e (JWT register hop)"), so the real `openclaw gateway` + `index-nats` + `inbound.run` path is regression-guarded. The gate still ALSO drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` vitest seam, and the hmac/browser real-gateway harnesses remain manual (follow-up #9). |
 
 ## Coverage note
 
@@ -110,8 +110,14 @@ agent side made this worse and was removed in `ee89ba3`.)
    populated after async setup. Verified live: `GET /webchannel/nats/register/challenge` → our
    `401 Missing JWT`; the browser↔agent round-trip still passes. (Diagnosis method: instrumented
    the openclaw dist registry/dispatch and bisected sync-vs-after-await registration.)
-9. **Fold `e2e/local` into the CI gate** (or point the existing gate at the production pair). The
-   automated gate still drives the parallel `e2e-browser-client`/`e2e-roundtrip-agent` demo seam.
+9. **Fold `e2e/local` into the CI gate** — **JWT-register harness done / in CI**. The gate
+   (`.github/workflows/e2e-gate.yml`, step "Real-gateway live e2e (JWT register hop)", after the
+   test-baseline check) now runs `e2e/local/run-jwt-register.sh`, so the **real** `openclaw gateway`
+   + `index-nats` + `inbound.run` path is regression-guarded (any non-zero exit fails the gate;
+   fully hermetic, no secret). The gate still ALSO drives the parallel
+   `e2e-browser-client`/`e2e-roundtrip-agent` vitest seam. Remaining: CI coverage for the hmac
+   `drive-roundtrip` + browser `browser-roundtrip` real-gateway harnesses, and the
+   browser/Playwright JWT variant (see #13).
 10. **Converge the demo pair into the production pair** (remove the parallel `e2e-roundtrip-agent` /
     `e2e-browser-client` implementations; point `e2e-browser-client` crypto at shared `e2e-crypto-browser`).
 11. ✅ **Wire `registerWithPop` into the browser connect flow** — **done** (`9aa4b67`).
@@ -136,7 +142,8 @@ agent side made this worse and was removed in `ee89ba3`.)
     and round-trips an encrypted message. Because the wildcard is OFF on the jwt path, a successful
     round-trip proves `registerPeer` happened ONLY via the HTTP register hop. Remaining: the real
     **browser/Playwright** JWT variant (deferred — Playwright cannot pass an Ed25519 `CryptoKey`
-    across the page boundary) against a **real SaaS issuer**, plus folding this into CI (#9).
+    across the page boundary) against a **real SaaS issuer**. (The Node-driver harness itself is now
+    folded into CI — see #9.)
     Production behavior is unchanged: enrolled production runs `devOpenNats=false`, so the wildcard
     was already off there.
 

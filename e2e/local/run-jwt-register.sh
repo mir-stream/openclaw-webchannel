@@ -29,7 +29,7 @@ cleanup() {
   # Belt-and-braces: nuke any leftover procs from a previous flaky run.
   pkill -f "nats-server -c $OCH/nats.conf" 2>/dev/null || true
   pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
-  pkill -f "openclaw gateway --port $GW_PORT" 2>/dev/null || true
+  pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
   # Restore the plugin package.json entry.
   if [ -f "$PKG_BAK" ]; then
     cp "$PKG_BAK" "$PKG_JSON"
@@ -44,7 +44,7 @@ pkill -f "nats-server -c $OCH/nats.conf" 2>/dev/null || true
 pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
 # NOTE: GW_PORT=18799 is the dedicated dev-harness port; this pkill would also
 # kill a developer's own gateway if they happen to run one on 18799.
-pkill -f "openclaw gateway --port $GW_PORT" 2>/dev/null || true
+pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
 
@@ -139,8 +139,8 @@ OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
 GW_PID=$!
 echo "[run-jwt-register] gateway pid=$GW_PID — waiting for plugin registration…"
 
-# Poll the gateway log for the readiness line (max ~30s).
-for i in $(seq 1 60); do
+# Poll the gateway log for the readiness line (max ~60s).
+for i in $(seq 1 120); do
   if grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$OCH/gateway.log" 2>/dev/null; then
     echo "[run-jwt-register] gateway ready"
     break
@@ -149,7 +149,7 @@ for i in $(seq 1 60); do
     echo "[run-jwt-register] gateway died early — log:"; cat "$OCH/gateway.log"; exit 2
   fi
   sleep 0.5
-  if [ "$i" -eq 60 ]; then
+  if [ "$i" -eq 120 ]; then
     echo "[run-jwt-register] TIMEOUT waiting for gateway — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done

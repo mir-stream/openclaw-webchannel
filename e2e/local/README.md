@@ -149,4 +149,10 @@ Encryption stays **on** (encrypt-by-construction default); the relay only ever s
   done; the client is wired to call `registerWithPop` — #11 done.) The remaining gap (#13) shrinks
   to: a real **browser/Playwright** JWT variant against a **real SaaS issuer** — deferred because
   Playwright cannot pass an Ed25519 `CryptoKey` across the page boundary (the Node driver can).
-- **Not in CI yet** — this is a local manual harness; folding it into the gate is follow-up #9.
+- **In CI (JWT-register harness)** — `run-jwt-register.sh` is now run by the CI gate
+  (`.github/workflows/e2e-gate.yml`, step "Real-gateway live e2e (JWT register hop)"), so the
+  real-gateway + `inbound.run` path is regression-guarded on every push/PR (follow-up #9, done for
+  this harness). Still manual (smaller remaining follow-up): the hmac `drive-roundtrip.ts` /
+  browser `browser-roundtrip.mjs` real-gateway variants, and the real **browser/Playwright** JWT
+  variant against a real SaaS issuer (#13 — Playwright cannot pass an Ed25519 `CryptoKey` across the
+  page boundary).

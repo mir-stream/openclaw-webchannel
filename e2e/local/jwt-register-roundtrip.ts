@@ -98,7 +98,15 @@ const reply = new Promise<{ type: string; text?: string }>((resolve) => {
 });
 
 client.connect();
-await new Promise((r) => setTimeout(r, 2500)); // NATS connect + HTTP register + X25519 handshake
+// No sleep before sending: timing-robustness comes from the production client's
+// send-buffering, not a magic delay. WebChannelNatsClient.sendUserMessage →
+// enqueue() pushes onto outboundQueue while sessionKey === null (pre-handshake),
+// and flushQueue() seals + publishes the whole queue the moment the X25519
+// handshake derives the session key (handleRaw → flushQueue). So sending
+// immediately after connect() is safe — the message rides the buffer through
+// NATS connect + HTTP PoP register + handshake and is never lost on a slow runner.
+// (A registration failure still fires onError → exit(4) below; the reply still
+// times out → exit(3). This only removes the fragile fixed sleep.)
 console.log("[send] 'hello via jwt register'");
 client.sendUserMessage("hello via jwt register");
 

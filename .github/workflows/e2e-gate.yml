@@ -180,6 +180,21 @@ jobs:
           console.log(`Baseline check passed: ${passed} >= ${BASELINE}`);
           EOF
 
+      # ──────────────────────────────────────────────────────────────────────
+      # 8. Real-gateway live e2e (JWT register hop)
+      #    Covers the REAL `openclaw gateway` binary + `index-nats` plugin +
+      #    real `inbound.run` agent path — the one thing the vitest e2e above
+      #    does NOT (those use the deterministic `e2e-roundtrip-agent` seam).
+      #    Boots an isolated gateway (auth.strategy="jwt", wildcard OFF) and
+      #    round-trips through the live HTTP /webchannel/nats/register hop.
+      #    Reuses the already-installed nats-server (on PATH), npm deps, and the
+      #    openclaw binary in node_modules/.bin. Fully hermetic under /tmp/oc-e2e
+      #    (echo model, no LLM, no registry) — needs NO secret. Any non-zero exit
+      #    FAILS the gate (no continue-on-error).
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Real-gateway live e2e (JWT register hop)
+        run: bash e2e/local/run-jwt-register.sh
+
 ################################################################################
 # Publish job — gated on the E2E gate passing + release tag
 # Only runs when a semver tag is pushed (e.g. v1.0.0).
