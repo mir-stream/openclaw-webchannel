@@ -59,7 +59,7 @@ this file, **this file is correct.**
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
-| HTTP-register hop now exercised via Node driver; browser/Playwright variant deferred | The plain-HTTP register/challenge/unregister routes **are served live** (fix `5597466`), the client **is wired** to call `registerWithPop` (`9aa4b67`), and the JWT-register round-trip is now **exercised end-to-end** by `e2e/local/run-jwt-register.sh` + `jwt-register-roundtrip.ts`: with `auth.strategy="jwt"` the agent does NOT `subscribeWildcard` (gated in `index-nats.ts` / `src/wildcard-gate.ts`), so a successful round-trip proves `registerPeer` happened ONLY via the live HTTP hop. The bootstrap JWT is minted both via an RS256 JWKS **fixture** (`run-jwt-register.sh`, #13) AND via the **real** reference bootstrap-server with real JWKS-over-HTTP (`run-saas-issuer-register.sh`, **#14 done**). Remaining: the **real browser/Playwright** JWT variant (#16, deferred — Playwright cannot pass an Ed25519 `CryptoKey` across the page boundary). The full **enrolled-NATS-transport** variant (#15) is **done** (`4a70b9b`, `e2e/local/run-enrolled-transport.sh`). |
+| HTTP-register hop exercised by BOTH a Node driver AND a real headless browser | The plain-HTTP register/challenge/unregister routes **are served live** (fix `5597466`), the client **is wired** to call `registerWithPop` (`9aa4b67`), and the JWT-register round-trip is **exercised end-to-end** by `e2e/local/run-jwt-register.sh` + `jwt-register-roundtrip.ts`: with `auth.strategy="jwt"` the agent does NOT `subscribeWildcard` (gated in `index-nats.ts` / `src/wildcard-gate.ts`), so a successful round-trip proves `registerPeer` happened ONLY via the live HTTP hop. The bootstrap JWT is minted via an RS256 JWKS **fixture** (`run-jwt-register.sh`, #13) AND via the **real** reference bootstrap-server with real JWKS-over-HTTP (`run-saas-issuer-register.sh`, **#14 done**). The **real browser/Playwright** JWT variant is **done** (#16, `c4f0a6b`, `e2e/local/run-browser-jwt-register.sh` — added gateway-register CORS), and the full **enrolled-NATS-transport** variant is **done** (#15, `4a70b9b`, `e2e/local/run-enrolled-transport.sh`). |
 | Production pair partly in the CI gate | The **JWT-register** real-gateway harness (`e2e/local/run-jwt-register.sh`) is now run by the CI gate (step "Real-gateway live e2e (JWT register hop)"), so the real `openclaw gateway` + `index-nats` + `inbound.run` path is regression-guarded. The gate still ALSO drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` vitest seam, and the hmac/browser real-gateway harnesses remain manual (follow-up #9). |
 
 ## Coverage note
@@ -181,22 +181,31 @@ agent side made this worse and was removed in `ee89ba3`.)
     `plugin/src/nkey-sign.ts` (byte-identical to `@nats-io/nkeys`, kept out of plugin deps; parity test
     in `saas/src/nkey-sign-parity.test.ts`), `nkeySigningCallback` threading, an `EnrollmentClient`
     ctor crash fix, `WEBCHANNEL_SAAS_BASE_URL`, and a NATS perm-scope correction to `webchannel.{tenant}.>`.
-    **Finding (gates #16):** the production browser `WebChannelNatsClient` cannot NATS-layer NKEY-auth
-    (its CONNECT only carries the bootstrap JWT, no nonce-sig), so the all-real browser-over-JWT-auth-nats
-    fusion belongs to #16, not here. Pre-existing security follow-ups (require-PoP config; tenant-token
-    sanitization) tracked separately. Remaining runtime stand-ins: the echo LLM + the Node-hosted client (#16).
-16. ⏭️ **NEXT — real-browser (Playwright) JWT+PoP register variant.** Removes the
-    "client runs in Node" stand-in. The headless-Chromium scaffolding exists
-    (`e2e/local/browser-roundtrip.mjs` / `browser-entry.ts`) but only drives the hmac/wildcard path.
-    Drive the real browser through the **JWT+PoP register hop**. Blocker: Playwright cannot serialize
-    an Ed25519 `CryptoKey` across the Node↔page boundary, so a **2-phase keygen** is required: (1) the
-    browser generates its Ed25519 PoP keypair in-page and exports the public JWK to Node; (2) Node /
-    the real SaaS issuer mints the bootstrap JWT embedding that `pop_jwk` and injects the JWT into the
-    page; (3) the in-page `WebChannelNatsClient` runs `registerWithPop` with its own non-extractable
-    private key + the JWT, does the X25519 handshake, and round-trips. (cnf.jwk X25519 can be a
-    throwaway — the NATS `handleHandshake` does not pin against it.) Layer this on the #15 enrolled
-    stack to culminate in ONE "all-real" harness: real browser + real enrollment + real bootstrap
-    issuer, only the echo LLM a stand-in by design.
+    **Finding (gates the all-real fusion):** the production browser `WebChannelNatsClient` cannot
+    NATS-layer NKEY-auth (its CONNECT only carries the bootstrap JWT, no nonce-sig), so the all-real
+    browser-over-JWT-auth-nats fusion (real browser #16 layered on this enrolled #15 stack) needs
+    NKEY-auth added to the browser client first — that's the next real-browser step, beyond #16's
+    register-hop variant. Pre-existing security follow-ups (require-PoP config; tenant-token
+    sanitization; CORS origin allowlist) tracked in task #20.
+16. ✅ **DONE (`c4f0a6b`) — real-browser (Playwright) JWT+PoP register variant.** Removes the
+    "client runs in Node" stand-in. A real headless Chromium runs the **production**
+    `WebChannelNatsClient` through the **JWT+PoP register hop** against a real gateway (index-nats jwt
+    mode) + real reference SaaS issuer + real nats-server + echo, completing an encrypted round-trip —
+    `e2e/local/run-browser-jwt-register.sh` + `browser-jwt-register.mjs` + browser entry
+    `packages/client/src/browser-jwt-entry.ts`. The original "Playwright can't serialize an Ed25519
+    `CryptoKey`" 2-phase-keygen blocker **dissolved**: the whole flow (in-page keygen → issuer
+    `/bootstrap` fetch → client w/ registration path → round-trip) runs IN-PAGE, so the non-extractable
+    PoP private key never crosses the Node↔page boundary. **Production gap fixed (only a real browser
+    reveals it — Node fetch ignores CORS):** the gateway register routes lacked CORS, so a real
+    cross-origin browser (widget page origin ≠ gateway origin, per the deployment model) was blocked.
+    Added `setRegisterCors` (reflects Origin / `*`, allows Authorization+Content-Type, OPTIONS
+    preflight → 204 pre-auth) to `/webchannel/nats/register{,/challenge}`; no `Allow-Credentials`
+    (safe — admission still needs an unforgeable Bearer bootstrap-JWT + PoP sig); auth/PoP logic
+    untouched. Origin-allowlist hardening tracked in the security follow-up (task #20).
+    **Remaining (NOT this item) — the "all-real over JWT-auth-nats" fusion:** layering the real browser
+    onto the #15 enrolled JWT-auth-NATS stack needs NKEY-auth added to the browser `WebChannelNatsClient`
+    (today it can't NATS-layer authenticate — see the #15 finding). That's the next real-browser step;
+    after it, the only stand-in left is the echo LLM by design.
 
 ## Commit landmarks
 
