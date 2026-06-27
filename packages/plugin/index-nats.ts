@@ -25,6 +25,7 @@ import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier, verifyJwtAndExtractPeerId, verifyJwtAndExtractIdentity, type ConnectionVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
 import { PopChallengeStore } from "./src/pop-challenge.js";
+import { shouldSubscribeWildcard } from "./src/wildcard-gate.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { WEBCHANNEL_ID } from "./src/transport.js";
 import type { WebChannelTransport } from "./src/transport.js";
@@ -427,12 +428,25 @@ export default defineChannelPluginEntry({
       dispatchInbound(peerId, message);
     });
 
-    // Dev/open-NATS convenience: the local harness browser connects with an
-    // hmac-ticket and does NOT call the HTTP register hop, so subscribe to the
+    // Dev/open-NATS convenience: the wildcard subscription is PURELY the
+    // hmac-ticket dev shortcut — the local harness browser connects with an
+    // hmac-ticket and does NOT call the HTTP register hop, so we subscribe to the
     // tenant/agent wildcard and let peers auto-register on their handshake (the
-    // allowlist gate still runs). The enrolled/JWT path uses the real
-    // /webchannel/nats/register route (registered in Step A) instead.
-    if (devOpenNats) {
+    // allowlist gate still runs).
+    //
+    // When `auth.strategy === "jwt"`, the HTTP `/webchannel/nats/register` route
+    // (registered in Step A) is the REAL admission path even under open-NATS —
+    // the enrolled/JWT producer is expected to drive challenge → PoP-signed
+    // register so the agent calls `registerPeer` for that peer. If we left the
+    // wildcard ON in that scenario the agent would already be subscribed to every
+    // peer, so a successful round-trip would prove nothing about the register
+    // hop. We therefore turn the wildcard OFF whenever the strategy is jwt.
+    //
+    // This does NOT change production behavior: enrolled production runs with
+    // devOpenNats=false, so the wildcard is already off there. It only tightens
+    // the devOpen+jwt test scenario so the HTTP hop is the sole admission path.
+    const authStrategy = (webchannelCfg?.auth as { strategy?: string } | undefined)?.strategy;
+    if (shouldSubscribeWildcard(devOpenNats, authStrategy)) {
       channel.subscribeWildcard();
     }
 

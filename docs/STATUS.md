@@ -59,7 +59,7 @@ this file, **this file is correct.**
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
-| Live HTTP-register round-trip not yet exercised end-to-end | The plain-HTTP register/challenge/unregister routes **are served live** (fix `5597466`; `GET /webchannel/nats/register/challenge` → `401 Missing JWT` in a real gateway), and the browser client **is now wired** to call `registerWithPop` when given a `registration` config (`9aa4b67`). What remains is a live e2e with a **real SaaS bootstrap JWT** proving the browser registers over HTTP (not the wildcard), plus gating the agent so the production path drops `subscribeWildcard`. Closing this is follow-up #13. |
+| HTTP-register hop now exercised via Node driver; browser/Playwright variant deferred | The plain-HTTP register/challenge/unregister routes **are served live** (fix `5597466`), the client **is wired** to call `registerWithPop` (`9aa4b67`), and the JWT-register round-trip is now **exercised end-to-end** by `e2e/local/run-jwt-register.sh` + `jwt-register-roundtrip.ts`: with `auth.strategy="jwt"` the agent does NOT `subscribeWildcard` (gated in `index-nats.ts` / `src/wildcard-gate.ts`), so a successful round-trip proves `registerPeer` happened ONLY via the live HTTP hop (RS256 bootstrap JWT minted via `packages/saas` + RS256 JWKS fixture). Remaining: the **real browser/Playwright** JWT variant (deferred — Playwright cannot pass an Ed25519 `CryptoKey` across the page boundary) against a **real SaaS issuer**. See follow-up #13. |
 | Production pair not yet in the CI gate | The production pair is now live-verified **locally** (see "What works", `e384198`), but the automated CI gate still drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` seam. Folding the `e2e/local` harness into CI (needs a built openclaw + browser) is a follow-up. |
 
 ## Coverage note
@@ -124,13 +124,21 @@ agent side made this worse and was removed in `ee89ba3`.)
     flow publish a stale handshake. The no-`registration` path is unchanged (dev/open-NATS wildcard).
     149 client tests pass.
 12. Packaging + **real** ClawHub/npm publish (registry creds) — or accept `DonePublishDeferred`.
-13. **Live e2e of the browser HTTP register hop + retire the wildcard on the production path.** #11
-    wired the client library; what remains is an end-to-end proof: mint a real SaaS bootstrap JWT
-    (RS256, `sub=peerId`, `cnf.jwk` X25519, `pop_jwk` Ed25519) via `packages/saas`, drive the
-    `e2e/local` browser with a `registration` config, and assert the agent registers the peer over the
-    live HTTP route (not the wildcard) and the round-trip succeeds — then gate `index-nats` so the
-    production/enrolled path does **not** `subscribeWildcard` (the wildcard stays only for the
-    hmac-ticket dev harness).
+13. ✅ **Live e2e of the HTTP register hop + retire the wildcard on the jwt path** — **Node-driver
+    variant done**. `index-nats` now gates the dev/open-NATS wildcard: `subscribeWildcard()` is taken
+    only when `auth.strategy !== "jwt"` (extracted to `packages/plugin/src/wildcard-gate.ts`
+    `shouldSubscribeWildcard`; +5 unit tests in `wildcard-gate.test.ts`). The new hermetic harness
+    `e2e/local/run-jwt-register.sh` boots an isolated gateway with `auth.strategy="jwt"` +
+    `jwksFile` (fixtures via `e2e/local/gen-jwt-fixtures.mjs`), then drives the production
+    `WebChannelNatsClient` with a `registration` config from `e2e/local/jwt-register-roundtrip.ts`:
+    it mints an RS256 bootstrap JWT (`sub=peerId`, `cnf.jwk` X25519, `pop_jwk` Ed25519) via
+    `packages/saas/bootstrap-claims`, runs challenge → PoP-signed register over the live HTTP route,
+    and round-trips an encrypted message. Because the wildcard is OFF on the jwt path, a successful
+    round-trip proves `registerPeer` happened ONLY via the HTTP register hop. Remaining: the real
+    **browser/Playwright** JWT variant (deferred — Playwright cannot pass an Ed25519 `CryptoKey`
+    across the page boundary) against a **real SaaS issuer**, plus folding this into CI (#9).
+    Production behavior is unchanged: enrolled production runs `devOpenNats=false`, so the wildcard
+    was already off there.
 
 ## Commit landmarks
 

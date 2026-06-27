@@ -87,6 +87,40 @@ node e2e/local/browser-roundtrip.mjs    # exits 0 iff the reply echoes the sent 
 
 Both drivers print `[REPLY] echo: …<your message>`, proving the round-trip.
 
+## JWT-register scenario (HTTP hop as sole admission)
+
+`run-jwt-register.sh` proves the **HTTP `/webchannel/nats/register` route is the SOLE
+peer-admission path** — no wildcard shortcut. It is a sibling of the hmac round-trip above,
+but boots the gateway with `channels.webchannel.auth.strategy = "jwt"`. The wildcard is gated
+off on the jwt path (`index-nats.ts` / `src/wildcard-gate.ts` `shouldSubscribeWildcard`):
+under `auth.strategy="jwt"` the agent does **not** call `subscribeWildcard()`, so it is
+subscribed to NO peer subjects until something calls `channel.registerPeer(peerId)` — and the
+only thing that does is the live HTTP register route.
+
+```bash
+./e2e/local/run-jwt-register.sh     # exits 0 iff the JWT+PoP register hop admits the peer
+```
+
+What it does, hermetically (isolated `OPENCLAW_HOME=/tmp/oc-e2e`, self-cleaning trap):
+
+1. `gen-jwt-fixtures.mjs` mints an RS256 keypair → `jwks.json` (gateway's `auth.jwt.jwksFile`)
+   + `rs256-private.jwk.json` (the driver re-imports it to sign), **before** the gateway boots.
+2. Boots nats-server + the echo provider + an isolated gateway whose `channels.webchannel.auth`
+   is `{ strategy:"jwt", jwt:{ jwksFile, issuer:"https://e2e-issuer.test", audience:"default-agent" } }`,
+   with `dmSecurity:"allowlist"`, `allowFrom:["web-jwt-peer"]`. (`devOpen` stays env-driven —
+   `WEBCHANNEL_NATS_DEV_OPEN=1` — since the schema rejects unknown `channels.webchannel` keys.)
+3. `jwt-register-roundtrip.ts` runs the **production** `WebChannelNatsClient` with a `registration`
+   config: it generates device X25519 (→ `cnf.jwk`) + Ed25519 PoP (→ `pop_jwk`) keys, builds the
+   bootstrap claims via `packages/saas/bootstrap-claims`, RS256-signs the JWT (`kid` matches the
+   JWKS), and on connect drives challenge → PoP-signed register over the live HTTP route, then
+   round-trips one encrypted message. A register failure fires `onError` → non-zero exit (loud).
+
+Because the wildcard is OFF, the reply (`echo: …`) can only mean the agent registered the peer
+through the HTTP hop. The driver prints `[PROOF] agent registered peer via HTTP hop (wildcard OFF)`.
+
+This does **not** change production behavior: enrolled production runs `devOpenNats=false`, so the
+wildcard is already off there. The gate only tightens the devOpen+jwt test so the proof is real.
+
 ## dev/open-NATS contract (how `index-nats` skips enrollment)
 
 Production `index-nats` connects via `createEnrolledNatsConnection` (SaaS device-flow + JWT).
@@ -105,12 +139,14 @@ Encryption stays **on** (encrypt-by-construction default); the relay only ever s
 ## Known gaps (why this is "live" but not yet "full production")
 
 - **Echo model, not a live LLM** — by design (hermetic). The agent path is real; only the brain is dumb.
-- **Wildcard auto-register, not the HTTP register hop** — the dev harness browser connects with an
-  hmac-ticket and does not call the HTTP register route, so the dev path uses
-  `NatsChannel.subscribeWildcard()` (the allowlist gate still runs). NOTE: the plain-HTTP
-  `/webchannel/nats/register*` routes themselves now **work live** (follow-up #8 — done; they were
-  being dropped by registering after an `await` in `registerFull`, outside openclaw's synchronous
-  registration window), and the browser client is **wired** to call `registerWithPop` when given a
-  `registration` config (#11 — done). What remains (#13) is exercising that path here with a real
-  SaaS bootstrap JWT and dropping the agent-side wildcard on the production path.
+- **Wildcard auto-register (hmac harness only) vs. the HTTP register hop (now exercised)** — the
+  hmac dev harness browser connects with an hmac-ticket and does not call the HTTP register route,
+  so that path uses `NatsChannel.subscribeWildcard()` (the allowlist gate still runs). The HTTP
+  register hop is now **exercised end-to-end** by the JWT-register scenario above
+  (`run-jwt-register.sh`): under `auth.strategy="jwt"` the wildcard is gated OFF
+  (`src/wildcard-gate.ts`), so the round-trip there proves `registerPeer` happens **only** via the
+  live HTTP route. (Background: the plain-HTTP `/webchannel/nats/register*` routes work live — #8
+  done; the client is wired to call `registerWithPop` — #11 done.) The remaining gap (#13) shrinks
+  to: a real **browser/Playwright** JWT variant against a **real SaaS issuer** — deferred because
+  Playwright cannot pass an Ed25519 `CryptoKey` across the page boundary (the Node driver can).
 - **Not in CI yet** — this is a local manual harness; folding it into the gate is follow-up #9.
