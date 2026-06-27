@@ -110,6 +110,7 @@ Encryption stays **on** (encrypt-by-construction default); the relay only ever s
   `NatsChannel.subscribeWildcard()` (the allowlist gate still runs). NOTE: the plain-HTTP
   `/webchannel/nats/register*` routes themselves now **work live** (follow-up #8 — done; they were
   being dropped by registering after an `await` in `registerFull`, outside openclaw's synchronous
-  registration window). What remains (#11) is wiring the browser to call `registerWithPop` instead
-  of relying on the wildcard.
+  registration window), and the browser client is **wired** to call `registerWithPop` when given a
+  `registration` config (#11 — done). What remains (#13) is exercising that path here with a real
+  SaaS bootstrap JWT and dropping the agent-side wildcard on the production path.
 - **Not in CI yet** — this is a local manual harness; folding it into the gate is follow-up #9.

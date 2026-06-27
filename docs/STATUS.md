@@ -52,14 +52,14 @@ this file, **this file is correct.**
 | **PoP producer side (gap ① positive path)** — SaaS mints `pop_jwk` (Ed25519) alongside `cnf.jwk`; the browser generates a device Ed25519 key and `registerWithPop` runs challenge→sign→register | `saas/bootstrap-claims.ts` + `client/pop-register.ts`; `pop-register.test.ts` (7, interop vs a node:crypto verifier replicating `PopChallengeStore.verify`) + `bootstrap-claims.test.ts` (5). `4edba6e`. |
 | **PRODUCTION pair live in REAL openclaw** — a real headless-Chromium browser running the production `WebChannelNatsClient` round-trips an encrypted message through the `index-nats` plugin loaded in a real openclaw gateway → real `inbound.run` agent loop (deterministic echo model) → back, decrypted. The reply carries openclaw's real prompt construction, proving it is the real agent path, not the demo echo agent. Fixed plugin-id, `api.registerHttpRoute`, `keepAlive` guard, and added a dev/open-NATS path. | `e2e/local/*` harness (echo OpenAI server + Node + Playwright drivers), run against an isolated `OPENCLAW_HOME` gateway. `e384198`. |
 
-**Test suite: 774 unit passing (+ 8 e2e under nats-server), typecheck clean across all 3 workspaces.**
+**Test suite: 778 unit passing (+ 8 e2e under nats-server), typecheck clean across all 3 workspaces.**
 
 ## What does NOT work yet
 
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
-| Browser connect flow not yet wired to the HTTP register hop | The plain-HTTP register/challenge/unregister routes **are now served live** (fixed — see below); a `GET /webchannel/nats/register/challenge` returns our handler's `401 Missing JWT` in a real gateway. What remains is product wiring: the browser client still relies on the dev **wildcard auto-register** instead of calling `registerWithPop` → the HTTP route. Closing this is follow-up #11. |
+| Live HTTP-register round-trip not yet exercised end-to-end | The plain-HTTP register/challenge/unregister routes **are served live** (fix `5597466`; `GET /webchannel/nats/register/challenge` → `401 Missing JWT` in a real gateway), and the browser client **is now wired** to call `registerWithPop` when given a `registration` config (`9aa4b67`). What remains is a live e2e with a **real SaaS bootstrap JWT** proving the browser registers over HTTP (not the wildcard), plus gating the agent so the production path drops `subscribeWildcard`. Closing this is follow-up #13. |
 | Production pair not yet in the CI gate | The production pair is now live-verified **locally** (see "What works", `e384198`), but the automated CI gate still drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` seam. Folding the `e2e/local` harness into CI (needs a built openclaw + browser) is a follow-up. |
 
 ## Coverage note
@@ -114,10 +114,23 @@ agent side made this worse and was removed in `ee89ba3`.)
    automated gate still drives the parallel `e2e-browser-client`/`e2e-roundtrip-agent` demo seam.
 10. **Converge the demo pair into the production pair** (remove the parallel `e2e-roundtrip-agent` /
     `e2e-browser-client` implementations; point `e2e-browser-client` crypto at shared `e2e-crypto-browser`).
-11. **Wire `registerWithPop` into the browser connect flow** (currently a standalone export). Now
-    unblocked — #8 landed, so the HTTP register route it targets is live. This is the last step to
-    replace the dev wildcard auto-register with the real JWT/PoP HTTP registration in the browser.
+11. ✅ **Wire `registerWithPop` into the browser connect flow** — **done** (`9aa4b67`).
+    `WebChannelNatsClient.onConnected` takes an optional `registration` config and awaits
+    `registerWithPop` (JWT + PoP HTTP register) **after** subscribing to `.out`/`.handshake` but
+    **before** publishing the X25519 handshake (order is load-bearing — NATS has no retention, and the
+    agent only subscribes to a peer's subjects after `registerPeer`). Fail-closed + terminal on failure
+    (fires `onError`, tears the connection down — a rejected PoP/JWT is a permanent credential problem,
+    so it does not hammer-retry); a `connectionEpoch` guard stops a drop+reconnect from letting a stale
+    flow publish a stale handshake. The no-`registration` path is unchanged (dev/open-NATS wildcard).
+    149 client tests pass.
 12. Packaging + **real** ClawHub/npm publish (registry creds) — or accept `DonePublishDeferred`.
+13. **Live e2e of the browser HTTP register hop + retire the wildcard on the production path.** #11
+    wired the client library; what remains is an end-to-end proof: mint a real SaaS bootstrap JWT
+    (RS256, `sub=peerId`, `cnf.jwk` X25519, `pop_jwk` Ed25519) via `packages/saas`, drive the
+    `e2e/local` browser with a `registration` config, and assert the agent registers the peer over the
+    live HTTP route (not the wildcard) and the round-trip succeeds — then gate `index-nats` so the
+    production/enrolled path does **not** `subscribeWildcard` (the wildcard stays only for the
+    hmac-ticket dev harness).
 
 ## Commit landmarks
 
@@ -136,3 +149,5 @@ agent side made this worse and was removed in `ee89ba3`.)
 | `c20b552` | **Merge Phase B branch → `jwks`** (--no-ff) |
 | `5bd7634` | Fix browser HKDF typecheck under TS 5.7+ (`BufferSource`); surfaced by the merge's newer TS |
 | `e384198` | **Production pair live in REAL openclaw** + index-nats fixes (id, `registerHttpRoute`, `keepAlive` guard, dev/open-NATS, wildcard); `e2e/local` harness |
+| `5597466` | **Serve index-nats HTTP register routes** — register synchronously in `registerFull` (post-`await` calls were silently dropped); corrects the "openclaw 404s plain-HTTP routes" misdiagnosis (#8) |
+| `9aa4b67` | **Wire PoP HTTP registration into the browser NATS connect flow** (`registerWithPop` after subscribe / before handshake; fail-closed + terminal; epoch guard) (#11) |

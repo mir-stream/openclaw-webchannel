@@ -23,9 +23,10 @@ routes (`/webchannel/nats/register*`) are now **served live** too: they were sil
 because `registerFull` called `api.registerHttpRoute` *after* `await`-ing the NATS connect, and
 openclaw only honors route registration during the **synchronous** `registerFull` window — the
 fix registers them up front (handlers read live state via a holder). This was *not* an openclaw
-limitation on plain-HTTP routes; those dispatch fine. Two caveats remain: the deterministic echo
-model stands in for a live LLM (by design), and the browser dev harness still uses wildcard
-auto-register rather than calling the HTTP register hop. See STATUS.md.
+limitation on plain-HTTP routes; those dispatch fine. The browser client is also **wired** to
+register over this hop (`registerWithPop`, `9aa4b67`). Two caveats remain: the deterministic echo
+model stands in for a live LLM (by design), and the local dev harness still drives the wildcard
+auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See STATUS.md.
 
 ## Status
 
