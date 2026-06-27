@@ -67,6 +67,36 @@ async function readJsonBody(req: { on(ev: string, cb: (chunk?: Buffer) => void):
 }
 
 /**
+ * Apply permissive CORS headers to the browser-driven register hop.
+ *
+ * The SaaS-embed widget runs on a page whose origin differs from the gateway
+ * origin (per the deployment model), so a real browser issues a cross-origin
+ * preflight + request carrying an `Authorization: Bearer <jwt>` header and a
+ * JSON body. Without these headers the browser blocks the register call (Node
+ * `fetch` ignored CORS, which is why the Node drivers never hit this). We reflect
+ * the request `Origin` (falling back to `*`) and allow the `Authorization` +
+ * `Content-Type` headers the PoP flow uses.
+ *
+ * FOLLOW-UP (production hardening, tracked separately): restrict
+ * Access-Control-Allow-Origin to the configured SaaS origins instead of
+ * reflecting any origin. Do NOT build a config schema for that here.
+ *
+ * NOTE: `/webchannel/nats/unregister` intentionally does NOT call this — no
+ * browser path hits it over HTTP today (production teardown `disconnect()` is
+ * pure-NATS). A future browser HTTP-teardown path MUST add `setRegisterCors`
+ * here too, or it will fail the cross-origin preflight silently.
+ */
+function setRegisterCors(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+): void {
+  const origin = req.headers["origin"];
+  res.setHeader("Access-Control-Allow-Origin", typeof origin === "string" && origin ? origin : "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+}
+
+/**
  * Adapt a void-returning (req,res) handler to the boolean contract that
  * `api.registerHttpRoute` expects (return true = "this route handled it").
  */
@@ -143,6 +173,14 @@ export default defineChannelPluginEntry({
       auth: "plugin",
       match: "exact",
       handler: asRoute(async (req, res) => {
+        // CORS: reflect origin on every response path; answer the browser's
+        // preflight (sent because of the Authorization header) without a JWT.
+        setRegisterCors(req, res);
+        if (req.method === "OPTIONS") {
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
         try {
           const authHeader = req.headers["authorization"];
           const jwt = authHeader?.startsWith("Bearer ")
@@ -176,6 +214,14 @@ export default defineChannelPluginEntry({
       auth: "plugin",
       match: "exact",
       handler: asRoute(async (req, res) => {
+        // CORS: reflect origin on every response path (including 401/500/503);
+        // answer the browser's preflight without requiring a JWT/body.
+        setRegisterCors(req, res);
+        if (req.method === "OPTIONS") {
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
         const channel = live.channel;
         const verifier = live.verifier;
         if (!channel || !live.historyConfig) {
