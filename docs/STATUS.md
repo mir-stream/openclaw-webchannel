@@ -59,7 +59,7 @@ this file, **this file is correct.**
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
-| HTTP-register hop now exercised via Node driver; browser/Playwright variant deferred | The plain-HTTP register/challenge/unregister routes **are served live** (fix `5597466`), the client **is wired** to call `registerWithPop` (`9aa4b67`), and the JWT-register round-trip is now **exercised end-to-end** by `e2e/local/run-jwt-register.sh` + `jwt-register-roundtrip.ts`: with `auth.strategy="jwt"` the agent does NOT `subscribeWildcard` (gated in `index-nats.ts` / `src/wildcard-gate.ts`), so a successful round-trip proves `registerPeer` happened ONLY via the live HTTP hop. The bootstrap JWT is minted both via an RS256 JWKS **fixture** (`run-jwt-register.sh`, #13) AND via the **real** reference bootstrap-server with real JWKS-over-HTTP (`run-saas-issuer-register.sh`, **#14 done**). Remaining: the **real browser/Playwright** JWT variant (#16, deferred — Playwright cannot pass an Ed25519 `CryptoKey` across the page boundary) and the full **enrolled-NATS-transport** variant (#15). |
+| HTTP-register hop now exercised via Node driver; browser/Playwright variant deferred | The plain-HTTP register/challenge/unregister routes **are served live** (fix `5597466`), the client **is wired** to call `registerWithPop` (`9aa4b67`), and the JWT-register round-trip is now **exercised end-to-end** by `e2e/local/run-jwt-register.sh` + `jwt-register-roundtrip.ts`: with `auth.strategy="jwt"` the agent does NOT `subscribeWildcard` (gated in `index-nats.ts` / `src/wildcard-gate.ts`), so a successful round-trip proves `registerPeer` happened ONLY via the live HTTP hop. The bootstrap JWT is minted both via an RS256 JWKS **fixture** (`run-jwt-register.sh`, #13) AND via the **real** reference bootstrap-server with real JWKS-over-HTTP (`run-saas-issuer-register.sh`, **#14 done**). Remaining: the **real browser/Playwright** JWT variant (#16, deferred — Playwright cannot pass an Ed25519 `CryptoKey` across the page boundary). The full **enrolled-NATS-transport** variant (#15) is **done** (`4a70b9b`, `e2e/local/run-enrolled-transport.sh`). |
 | Production pair partly in the CI gate | The **JWT-register** real-gateway harness (`e2e/local/run-jwt-register.sh`) is now run by the CI gate (step "Real-gateway live e2e (JWT register hop)"), so the real `openclaw gateway` + `index-nats` + `inbound.run` path is regression-guarded. The gate still ALSO drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` vitest seam, and the hmac/browser real-gateway harnesses remain manual (follow-up #9). |
 
 ## Coverage note
@@ -164,26 +164,28 @@ agent side made this worse and was removed in `ee89ba3`.)
     interop), and its JWKS/bootstrap assertions are strengthened (real `n` ≥ 256 bytes, kid ≠
     `demo-key-id`, header.kid == served kid, signature ≠ `mock-signature`). JWT issuance is kept
     **independent of NATS transport** (devOpen NATS stays). Remaining: the full
-    **enrolled-NATS-transport (device-flow)** variant, and the real **browser/Playwright** JWT
-    variant against this real issuer (deferred — Playwright cannot pass an Ed25519 `CryptoKey` across
-    the page boundary).
-15. ⏭️ **NEXT (sequenced first) — full enrolled-NATS-transport (device-flow) integration.** The
-    "heavy" variant that removes the last transport stand-in. All live e2e today use **devOpen NATS**
-    (plugin connects to a plain open nats-server, no auth). Production instead: the plugin
-    **device-enrolls (RFC 8628)** with the SaaS enrollment-server to receive tenant-scoped NATS user
-    credentials, and connects to a nats-server configured with the SaaS operator/account JWT
-    **resolver** (rejects unenrolled connections) via the plugin's production
-    `createEnrolledNatsConnection` path (the non-devOpen `else` branch in `index-nats.ts`). Each layer
-    is already proven SEPARATELY — enrollment live in `packages/saas/src/ac6-device-flow-e2e.test.ts`,
-    JWT-auth NATS + tenant isolation in `packages/saas/src/nats-permissions-realserver.test.ts` — but
-    never wired into ONE running gateway. Build a hermetic harness that: shares ONE `setupTrustChain()`
-    trust chain between the enrollment-server and the nats-server resolver config; boots the real
-    enrollment-server with **programmatic auto-approve** (`POST /approve`); boots a JWT-auth
-    nats-server; sets the gateway config devOpen-OFF + `saas.baseUrl` → enrollment-server; lets the
-    plugin enroll → connect with real creds; then layers the real-issuer bootstrap-JWT register hop
-    (#14) + encrypted round-trip on top. Hard parts: trust-chain sharing, device-flow auto-approve
-    orchestration, enroll-poll timing. After this, the only runtime stand-in left is the echo LLM.
-16. ⏭️ **NEXT (sequenced second) — real-browser (Playwright) JWT+PoP register variant.** Removes the
+    **enrolled-NATS-transport (device-flow)** variant (**#15, now done — `4a70b9b`**), and the real
+    **browser/Playwright** JWT variant against this real issuer (#16, deferred — Playwright cannot pass
+    an Ed25519 `CryptoKey` across the page boundary).
+15. ✅ **DONE (`4a70b9b`) — full enrolled-NATS-transport (device-flow) integration.** Removes the
+    agent-side **devOpen NATS** transport stand-in. The plugin now **device-enrolls (RFC 8628)** with
+    the SaaS enrollment-server for tenant-scoped NATS user credentials and connects to a JWT-auth
+    nats-server (SaaS operator/account JWT **resolver**, rejects unenrolled connections) via the
+    plugin's production `createEnrolledNatsConnection` path — proven live in ONE running gateway by the
+    hermetic harness `e2e/local/run-enrolled-transport.sh` + `enrolled-transport-roundtrip.ts`. ONE
+    `setupTrustChain()` feeds the enrollment-server, the nats-server resolver (via `NATS_CONFIG_OUT`),
+    the gateway JWKS, and the driver creds; auto-approve scrapes the user_code from the gateway log →
+    `POST /approve`; encrypted round-trip with a NKEY-authed driver peer. Delta over
+    `enrolled-jwt-roundtrip.test.ts`: real device-flow (not in-test `encodeUser`) + real plugin (not
+    echo kernel) + production connection code. Production fixes landed: dependency-free NKEY signer
+    `plugin/src/nkey-sign.ts` (byte-identical to `@nats-io/nkeys`, kept out of plugin deps; parity test
+    in `saas/src/nkey-sign-parity.test.ts`), `nkeySigningCallback` threading, an `EnrollmentClient`
+    ctor crash fix, `WEBCHANNEL_SAAS_BASE_URL`, and a NATS perm-scope correction to `webchannel.{tenant}.>`.
+    **Finding (gates #16):** the production browser `WebChannelNatsClient` cannot NATS-layer NKEY-auth
+    (its CONNECT only carries the bootstrap JWT, no nonce-sig), so the all-real browser-over-JWT-auth-nats
+    fusion belongs to #16, not here. Pre-existing security follow-ups (require-PoP config; tenant-token
+    sanitization) tracked separately. Remaining runtime stand-ins: the echo LLM + the Node-hosted client (#16).
+16. ⏭️ **NEXT — real-browser (Playwright) JWT+PoP register variant.** Removes the
     "client runs in Node" stand-in. The headless-Chromium scaffolding exists
     (`e2e/local/browser-roundtrip.mjs` / `browser-entry.ts`) but only drives the hmac/wildcard path.
     Drive the real browser through the **JWT+PoP register hop**. Blocker: Playwright cannot serialize
