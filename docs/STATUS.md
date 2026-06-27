@@ -167,6 +167,34 @@ agent side made this worse and was removed in `ee89ba3`.)
     **enrolled-NATS-transport (device-flow)** variant, and the real **browser/Playwright** JWT
     variant against this real issuer (deferred — Playwright cannot pass an Ed25519 `CryptoKey` across
     the page boundary).
+15. ⏭️ **NEXT (sequenced first) — full enrolled-NATS-transport (device-flow) integration.** The
+    "heavy" variant that removes the last transport stand-in. All live e2e today use **devOpen NATS**
+    (plugin connects to a plain open nats-server, no auth). Production instead: the plugin
+    **device-enrolls (RFC 8628)** with the SaaS enrollment-server to receive tenant-scoped NATS user
+    credentials, and connects to a nats-server configured with the SaaS operator/account JWT
+    **resolver** (rejects unenrolled connections) via the plugin's production
+    `createEnrolledNatsConnection` path (the non-devOpen `else` branch in `index-nats.ts`). Each layer
+    is already proven SEPARATELY — enrollment live in `packages/saas/src/ac6-device-flow-e2e.test.ts`,
+    JWT-auth NATS + tenant isolation in `packages/saas/src/nats-permissions-realserver.test.ts` — but
+    never wired into ONE running gateway. Build a hermetic harness that: shares ONE `setupTrustChain()`
+    trust chain between the enrollment-server and the nats-server resolver config; boots the real
+    enrollment-server with **programmatic auto-approve** (`POST /approve`); boots a JWT-auth
+    nats-server; sets the gateway config devOpen-OFF + `saas.baseUrl` → enrollment-server; lets the
+    plugin enroll → connect with real creds; then layers the real-issuer bootstrap-JWT register hop
+    (#14) + encrypted round-trip on top. Hard parts: trust-chain sharing, device-flow auto-approve
+    orchestration, enroll-poll timing. After this, the only runtime stand-in left is the echo LLM.
+16. ⏭️ **NEXT (sequenced second) — real-browser (Playwright) JWT+PoP register variant.** Removes the
+    "client runs in Node" stand-in. The headless-Chromium scaffolding exists
+    (`e2e/local/browser-roundtrip.mjs` / `browser-entry.ts`) but only drives the hmac/wildcard path.
+    Drive the real browser through the **JWT+PoP register hop**. Blocker: Playwright cannot serialize
+    an Ed25519 `CryptoKey` across the Node↔page boundary, so a **2-phase keygen** is required: (1) the
+    browser generates its Ed25519 PoP keypair in-page and exports the public JWK to Node; (2) Node /
+    the real SaaS issuer mints the bootstrap JWT embedding that `pop_jwk` and injects the JWT into the
+    page; (3) the in-page `WebChannelNatsClient` runs `registerWithPop` with its own non-extractable
+    private key + the JWT, does the X25519 handshake, and round-trips. (cnf.jwk X25519 can be a
+    throwaway — the NATS `handleHandshake` does not pin against it.) Layer this on the #15 enrolled
+    stack to culminate in ONE "all-real" harness: real browser + real enrollment + real bootstrap
+    issuer, only the echo LLM a stand-in by design.
 
 ## Commit landmarks
 
