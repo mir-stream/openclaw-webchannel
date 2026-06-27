@@ -412,8 +412,17 @@ export class DeviceFlowEnrollment {
     const userKp = createUser();
     const userSeed = new TextDecoder().decode(userKp.getSeed());
 
-    const pub = [`webchannel.${enrollment.tenant}.outbound.>`];
-    const sub = [`webchannel.${enrollment.tenant}.inbound.>`];
+    // Tenant-scoped pub/sub. The agent serves EVERY peer of its tenant/agent, so
+    // it must pub/sub the live channel subjects
+    // `webchannel.{tenant}.{agentId}.{peerId}.{in,out,handshake}` (see
+    // packages/plugin/src/nats-channel.ts). A `webchannel.{tenant}.>` grant covers
+    // those while preserving cross-tenant isolation (a different tenant's account
+    // JWT cannot pub/sub here). This matches the credential scope used by the
+    // working enrolled-JWT round-trip (e2e/enrolled-jwt-roundtrip.test.ts); the
+    // older `outbound.>`/`inbound.>` scheme never matched the channel's actual
+    // subject layout, so a real JWT-auth nats-server denied the agent's pub/sub.
+    const pub = [`webchannel.${enrollment.tenant}.>`];
+    const sub = [`webchannel.${enrollment.tenant}.>`];
 
     const userJwt = await encodeUser(
       `user-${enrollment.tenant}-${enrollment.agentId ?? "unknown"}`,

@@ -216,10 +216,15 @@ export class EnrollmentClient {
   private credentials?: PluginCredentials;
 
   constructor(options: EnrollmentOptions) {
+    // Spread FIRST, then apply defaults with nullish-coalescing: an explicit
+    // `credentialPath: undefined` / `displayInstructions: undefined` in `options`
+    // (the common case from createEnrolledNatsConnection) must NOT clobber the
+    // default to `undefined` — that previously crashed saveCredentials with
+    // `dirname(undefined)`.
     this.options = {
-      credentialPath: this.defaultCredentialPath(),
-      displayInstructions: true,
       ...options,
+      credentialPath: options.credentialPath ?? this.defaultCredentialPath(),
+      displayInstructions: options.displayInstructions ?? true,
     };
   }
 

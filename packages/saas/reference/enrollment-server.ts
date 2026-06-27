@@ -30,11 +30,15 @@
 
 import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../src/device-flow-enrollment.js";
 import { setupTrustChain } from "../src/setup-trust-chain.js";
+import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
+import { mintNatsUserCreds, type NatsUserRole } from "../src/nats-user-creds.js";
 import type { EnrollmentRequest, PollRequest } from "../src/device-flow-types.js";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
+import { writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { webcrypto } from "node:crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -46,6 +50,16 @@ const __dirname = dirname(__filename);
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const SAAS_BASE_URL = process.env.SAAS_BASE_URL || `http://localhost:${PORT}`;
 const NATS_URL = process.env.NATS_URL || "wss://nats.example.com";
+// `iss` claim for bootstrap JWTs (the gateway checks this against
+// channels.webchannel.auth.jwt.issuer). Defaults to the base URL.
+const SAAS_ISSUER = process.env.SAAS_ISSUER || SAAS_BASE_URL;
+// When set, TEST-ONLY routes (/test/nats-user, /test/bootstrap-jwt) are served.
+// Leave unset in any real deployment.
+const ENABLE_TEST_ROUTES = process.env.ENABLE_TEST_ROUTES === "1";
+// When set, the operator JWT + memory-resolver config are written here at boot so
+// a harness can build a JWT-auth nats.conf from the SAME trust chain this issuer
+// uses. Only public NATS config is written — never the RSA key or account seed.
+const NATS_CONFIG_OUT = process.env.NATS_CONFIG_OUT || "";
 
 // ---------------------------------------------------------------------------
 // Trust chain (real, generated once at boot — issues genuine NATS user creds)
@@ -57,6 +71,67 @@ const trustChain = await setupTrustChain({
 });
 const mockTrustChain = trustChain.private;
 const mockNatsConfig = trustChain.natsConfig;
+
+// ---------------------------------------------------------------------------
+// Publish public NATS config (operator JWT + memory resolver) for a harness
+// ---------------------------------------------------------------------------
+//
+// A JWT-auth nats-server must trust the SAME operator/account this issuer mints
+// user creds for. When NATS_CONFIG_OUT is set we write the two PUBLIC artifacts
+// the server needs — never any private material.
+if (NATS_CONFIG_OUT) {
+  mkdirSync(NATS_CONFIG_OUT, { recursive: true });
+  const operatorJwtPath = join(NATS_CONFIG_OUT, "operator.jwt");
+  const resolverPath = join(NATS_CONFIG_OUT, "resolver.json");
+  writeFileSync(operatorJwtPath, trustChain.natsConfig.operatorJwt);
+  writeFileSync(resolverPath, JSON.stringify(trustChain.natsConfig.resolverConfig, null, 2));
+  console.log(`[nats-config] wrote operator JWT → ${operatorJwtPath}`);
+  console.log(`[nats-config] wrote memory resolver (${Object.keys(trustChain.natsConfig.resolverConfig).length} account) → ${resolverPath}`);
+}
+
+// ---------------------------------------------------------------------------
+// RS256 bootstrap-JWT signing (TEST-ONLY) — reuses THIS issuer's trust chain
+// ---------------------------------------------------------------------------
+//
+// The reference register hop (`/webchannel/nats/register`) verifies a bootstrap
+// JWT against the gateway's configured JWKS — which is THIS issuer's
+// `/.well-known/jwks.json`. So a harness that drives the register hop needs a
+// bootstrap JWT signed by the SAME RSA key. We import it once at boot (held in
+// memory; never served/logged).
+const bootstrapRsaPrivateKey: webcrypto.CryptoKey | null = ENABLE_TEST_ROUTES
+  ? await importRsaPrivateKeyFromPem(trustChain.private.rsaPrivateKeyPem)
+  : null;
+const bootstrapKid = trustChain.kid;
+
+/** Import a PKCS#8 PEM RSA private key into a webcrypto signing key. */
+async function importRsaPrivateKeyFromPem(pem: string): Promise<webcrypto.CryptoKey> {
+  const body = pem
+    .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+    .replace(/-----END PRIVATE KEY-----/g, "")
+    .replace(/\s/g, "");
+  const der = Buffer.from(body, "base64");
+  return webcrypto.subtle.importKey(
+    "pkcs8",
+    new Uint8Array(der),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+}
+
+/** RS256-sign a claims payload with this issuer's RSA key (header.kid = trust kid). */
+async function signBootstrapJwt(payload: Record<string, unknown>): Promise<string> {
+  if (!bootstrapRsaPrivateKey) throw new Error("bootstrap signing disabled (set ENABLE_TEST_ROUTES=1)");
+  const header = { alg: "RS256", typ: "JWT", kid: bootstrapKid };
+  const b64urlJson = (obj: unknown): string => Buffer.from(JSON.stringify(obj)).toString("base64url");
+  const signingInput = `${b64urlJson(header)}.${b64urlJson(payload)}`;
+  const sig = await webcrypto.subtle.sign(
+    { name: "RSASSA-PKCS1-v1_5" },
+    bootstrapRsaPrivateKey,
+    new TextEncoder().encode(signingInput),
+  );
+  return `${signingInput}.${Buffer.from(new Uint8Array(sig)).toString("base64url")}`;
+}
 
 // ---------------------------------------------------------------------------
 // Enrollment service
@@ -475,6 +550,104 @@ const server = createServer(async (req, res) => {
     }
 
     // ---------------------------------------------------------------------
+    // GET /.well-known/jwks.json - Public RSA JWKS (for JWT verifiers)
+    // ---------------------------------------------------------------------
+    if (path === "/.well-known/jwks.json" && req.method === "GET") {
+      sendJson(res, trustChain.jwks);
+      return;
+    }
+
+    // ---------------------------------------------------------------------
+    // POST /test/nats-user - TEST-ONLY NATS user creds for a driver/browser peer
+    // ---------------------------------------------------------------------
+    if (path === "/test/nats-user" && req.method === "POST") {
+      if (!ENABLE_TEST_ROUTES) {
+        sendJson(res, { error: "Not found" }, 404);
+        return;
+      }
+      parseJsonBody(req, (body) => {
+        if (!body || typeof body !== "object") {
+          sendJson(res, { error: "Invalid JSON body" }, 400);
+          return;
+        }
+        const { tenant, role } = body as { tenant?: string; role?: NatsUserRole };
+        if (!tenant) {
+          sendJson(res, { error: "Missing tenant" }, 400);
+          return;
+        }
+        mintNatsUserCreds({
+          accountSeed: mockTrustChain.natsAccountSeed,
+          tenant,
+          role: role === "agent" ? "agent" : "browser",
+        })
+          .then((creds) => {
+            console.log(`[test/nats-user] minted ${role ?? "browser"} creds for tenant=${tenant}`);
+            sendJson(res, creds);
+          })
+          .catch((err) => {
+            console.error("[test/nats-user] Error:", err);
+            sendJson(res, { error: "Internal server error" }, 500);
+          });
+      });
+      return;
+    }
+
+    // ---------------------------------------------------------------------
+    // POST /test/bootstrap-jwt - TEST-ONLY RS256 bootstrap JWT for the register hop
+    // ---------------------------------------------------------------------
+    if (path === "/test/bootstrap-jwt" && req.method === "POST") {
+      if (!ENABLE_TEST_ROUTES) {
+        sendJson(res, { error: "Not found" }, 404);
+        return;
+      }
+      parseJsonBody(req, (body) => {
+        if (!body || typeof body !== "object") {
+          sendJson(res, { error: "Invalid JSON body" }, 400);
+          return;
+        }
+        const { tenant, agentId, peerId, deviceX25519PublicKey, devicePopPublicKey } = body as {
+          tenant?: string;
+          agentId?: string;
+          peerId?: string;
+          deviceX25519PublicKey?: string;
+          devicePopPublicKey?: string;
+        };
+        if (!tenant || !agentId || !peerId || !deviceX25519PublicKey) {
+          sendJson(
+            res,
+            { error: "Missing required fields: tenant, agentId, peerId, deviceX25519PublicKey" },
+            400,
+          );
+          return;
+        }
+        let claims;
+        try {
+          claims = buildBootstrapClaims({
+            iss: SAAS_ISSUER,
+            peerId,
+            agentId,
+            tenant,
+            deviceX25519PublicKey,
+            devicePopPublicKey,
+          });
+        } catch (err) {
+          sendJson(res, { error: `Invalid claims: ${(err as Error).message}` }, 400);
+          return;
+        }
+        signBootstrapJwt(claims as unknown as Record<string, unknown>)
+          .then((jwt) => {
+            console.log(`[test/bootstrap-jwt] issued JWT (kid=${bootstrapKid}) for peerId=${peerId}, tenant=${tenant}`);
+            sendJson(res, { jwt, peerId, kid: bootstrapKid });
+          })
+          .catch((err) => {
+            console.error("[test/bootstrap-jwt] Error:", err);
+            sendJson(res, { error: "Internal server error" }, 500);
+          });
+      });
+      return;
+    }
+
+    // ---------------------------------------------------------------------
     // 404 - Not found
     // ---------------------------------------------------------------------
     sendJson(res, { error: "Not found" }, 404);
@@ -518,6 +691,23 @@ server.listen(PORT, () => {
   console.log("Press Ctrl+C to stop");
   console.log("==============================================");
   console.log("");
+
+  if (ENABLE_TEST_ROUTES) {
+    console.warn("");
+    console.warn("################################################################");
+    console.warn("# ⚠️  ENABLE_TEST_ROUTES=1 — UNAUTHENTICATED TEST ROUTES ENABLED");
+    console.warn("################################################################");
+    console.warn("#   POST /test/nats-user      — mints tenant-scoped NATS user creds");
+    console.warn("#   POST /test/bootstrap-jwt   — mints RS256 bootstrap JWTs");
+    console.warn("#");
+    console.warn("#   These routes have NO authentication and will mint credentials");
+    console.warn("#   for ANY tenant on request — a cross-tenant credential-minting");
+    console.warn("#   oracle. They exist ONLY for hermetic E2E harnesses.");
+    console.warn("#");
+    console.warn("#   NEVER set ENABLE_TEST_ROUTES=1 in a real deployment.");
+    console.warn("################################################################");
+    console.warn("");
+  }
 });
 
 // Graceful shutdown

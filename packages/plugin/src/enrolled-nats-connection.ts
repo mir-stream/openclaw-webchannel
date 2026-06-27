@@ -21,6 +21,7 @@
 
 import { EnrollmentClient, type EnrollmentOptions, type PluginCredentials } from "./enrollment-client.js";
 import { NatsTransport } from "./nats-transport.js";
+import { makeNkeySigningCallback } from "./nkey-sign.js";
 import type { KeyPair } from "./e2e-crypto.js";
 
 // ---------------------------------------------------------------------------
@@ -141,11 +142,18 @@ export async function createEnrolledNatsConnection(
   console.log("[connection] Getting identity key...");
   const identityKey = enrollmentClient.getIdentityKey();
 
-  // Step 3: Connect to NATS with user credentials
+  // Step 3: Connect to NATS with user credentials.
+  //
+  // A JWT-auth nats-server challenges the client with a nonce in INFO; the client
+  // must return an Ed25519 signature over that nonce (signed with the user NKEY
+  // seed) in CONNECT, or the server rejects the connection. We derive that signing
+  // callback from the enrolled user seed so the production enrolled path
+  // authenticates against a real JWT-auth nats-server (not only an open dev one).
   console.log("[connection] Connecting to NATS...");
   const transport = new NatsTransport({
     url: options.natsUrl,
     jwtCredential: enrollment.creds.userJwt,
+    nkeySigningCallback: makeNkeySigningCallback(enrollment.creds.userSeed),
     clientName: options.natsClientName ?? "openclaw-webchannel-agent",
   });
 

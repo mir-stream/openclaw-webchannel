@@ -50,10 +50,10 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     expect(creds.userSeed).toMatch(/^SU/); // User NKEY seed prefix (S=seed, U=user)
     expect(creds.permissions).toBeDefined();
     expect(creds.permissions?.pub).toEqual([
-      "webchannel.tenant-abc.outbound.>",
+      "webchannel.tenant-abc.>",
     ]);
     expect(creds.permissions?.sub).toEqual([
-      "webchannel.tenant-abc.inbound.>",
+      "webchannel.tenant-abc.>",
     ]);
   });
 
@@ -98,11 +98,11 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     expect(payload.nats).toBeDefined();
     expect(payload.nats.pub).toBeDefined();
     expect(payload.nats.pub.allow).toEqual([
-      "webchannel.tenant-xyz.outbound.>",
+      "webchannel.tenant-xyz.>",
     ]);
     expect(payload.nats.sub).toBeDefined();
     expect(payload.nats.sub.allow).toEqual([
-      "webchannel.tenant-xyz.inbound.>",
+      "webchannel.tenant-xyz.>",
     ]);
   });
 
@@ -193,17 +193,17 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
 
     // Verify tenant-scoped permissions
     expect(credsA.permissions?.pub).toEqual([
-      "webchannel.tenant-alpha.outbound.>",
+      "webchannel.tenant-alpha.>",
     ]);
     expect(credsA.permissions?.sub).toEqual([
-      "webchannel.tenant-alpha.inbound.>",
+      "webchannel.tenant-alpha.>",
     ]);
 
     expect(credsB.permissions?.pub).toEqual([
-      "webchannel.tenant-beta.outbound.>",
+      "webchannel.tenant-beta.>",
     ]);
     expect(credsB.permissions?.sub).toEqual([
-      "webchannel.tenant-beta.inbound.>",
+      "webchannel.tenant-beta.>",
     ]);
 
     // Parse JWTs to verify tenant is in the claims

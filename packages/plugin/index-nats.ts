@@ -366,7 +366,11 @@ export default defineChannelPluginEntry({
         natsTransport = transport;
       } else {
         console.log("[webchannel] Starting NATS enrollment and connection...");
-        const saasBaseUrl = api.config.saas?.baseUrl ?? "http://localhost:3001";
+        // `WEBCHANNEL_SAAS_BASE_URL` env override mirrors the other WEBCHANNEL_*
+        // envs (NATS_URL/TENANT/AGENT_ID); useful where the host config schema
+        // does not carry a top-level `saas` block.
+        const saasBaseUrl =
+          process.env["WEBCHANNEL_SAAS_BASE_URL"] ?? api.config.saas?.baseUrl ?? "http://localhost:3001";
         try {
           natsConnection = await createEnrolledNatsConnection({
             saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
