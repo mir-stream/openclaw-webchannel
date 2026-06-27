@@ -18,10 +18,14 @@ This package ships two plugin entries:
 
 As of `e384198`, a real headless-Chromium message HAS travelled browser → NATS → this plugin →
 `inbound.run` → (echo model) → back. Earlier the NATS entry assumed APIs that don't exist
-(`api.http.post`, a `webchannel-nats` id, `keepAlive`) — fixed there. Two caveats remain: the
-deterministic echo model stands in for a live LLM (by design), and openclaw 2026.6.10 doesn't
-serve the plugin's plain-HTTP register routes (the dev path uses wildcard auto-register). See
-STATUS.md.
+(`api.http.post`, a `webchannel-nats` id, `keepAlive`) — fixed there. The plain-HTTP register
+routes (`/webchannel/nats/register*`) are now **served live** too: they were silently dropped
+because `registerFull` called `api.registerHttpRoute` *after* `await`-ing the NATS connect, and
+openclaw only honors route registration during the **synchronous** `registerFull` window — the
+fix registers them up front (handlers read live state via a holder). This was *not* an openclaw
+limitation on plain-HTTP routes; those dispatch fine. Two caveats remain: the deterministic echo
+model stands in for a live LLM (by design), and the browser dev harness still uses wildcard
+auto-register rather than calling the HTTP register hop. See STATUS.md.
 
 ## Status
 

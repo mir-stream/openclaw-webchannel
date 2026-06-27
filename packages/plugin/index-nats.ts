@@ -112,6 +112,206 @@ export default defineChannelPluginEntry({
 
   async registerFull(api) {
     // -----------------------------------------------------------------------
+    // Step A: Register HTTP routes SYNCHRONOUSLY, before any `await`.
+    // -----------------------------------------------------------------------
+
+    // CRITICAL: openclaw only honors `api.registerHttpRoute` during the
+    // SYNCHRONOUS execution window of `registerFull`. Any call made after an
+    // `await` (e.g. after `await transport.connect()`) is silently dropped —
+    // openclaw's plugin-registration side-effect scope has already closed, so
+    // `api.registerHttpRoute` resolves to a no-op and the route never reaches
+    // the gateway's serving registry (→ 404 at request time). This is NOT an
+    // openclaw limitation on plain-HTTP plugin routes (they dispatch fine, same
+    // as the WS-upgrade route in index.ts); it was a latent ordering bug here.
+    //
+    // The route HANDLERS only run at request time — long after async setup
+    // completes — so they read live state through the `live` holder, populated
+    // at the end of `registerFull`. Until setup finishes, handlers reply 503.
+    const live: {
+      channel: NatsChannel | null;
+      verifier: ConnectionVerifier | null;
+      auth: AuthConfig | undefined;
+      historyConfig: ReturnType<typeof resolveHistoryConfig> | null;
+    } = { channel: null, verifier: null, auth: undefined, historyConfig: null };
+
+    // PoP challenge (gap ①): issue a single-use nonce bound to the verified
+    // peerId. The browser signs it with the device Ed25519 key and presents the
+    // signature to /register.
+    api.registerHttpRoute({
+      path: "/webchannel/nats/register/challenge",
+      auth: "plugin",
+      match: "exact",
+      handler: asRoute(async (req, res) => {
+        try {
+          const authHeader = req.headers["authorization"];
+          const jwt = authHeader?.startsWith("Bearer ")
+            ? authHeader.slice(7)
+            : new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt");
+          if (!jwt) {
+            res.statusCode = 401;
+            res.end("Missing JWT");
+            return;
+          }
+          const peerId = await verifyJwtAndExtractPeerId(jwt, live.auth, api.logger);
+          if (!peerId) {
+            res.statusCode = 401;
+            res.end("Invalid JWT");
+            return;
+          }
+          const nonce = popChallenges.issue(peerId);
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ nonce }));
+        } catch (err) {
+          api.logger.error?.(`webchannel: PoP challenge failed: ${String(err)}`);
+          res.statusCode = 500;
+          res.end("Challenge failed");
+        }
+      }),
+    });
+
+    api.registerHttpRoute({
+      path: "/webchannel/nats/register",
+      auth: "plugin",
+      match: "exact",
+      handler: asRoute(async (req, res) => {
+        const channel = live.channel;
+        const verifier = live.verifier;
+        if (!channel || !live.historyConfig) {
+          res.statusCode = 503;
+          res.end("WebChannel starting up");
+          return;
+        }
+        if (!verifier) {
+          res.statusCode = 500;
+          res.end("No verifier configured");
+          return;
+        }
+
+        try {
+          // Extract JWT from Authorization header or query parameter
+          const authHeader = req.headers["authorization"];
+          const jwt = authHeader?.startsWith("Bearer ")
+            ? authHeader.slice(7)
+            : (new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt"));
+
+          if (!jwt) {
+            res.statusCode = 401;
+            res.end("Missing JWT");
+            return;
+          }
+
+          // Verify JWT and extract the full identity (peerId + PoP key)
+          const identity = await verifyJwtAndExtractIdentity(jwt, live.auth, api.logger);
+          if (!identity) {
+            res.statusCode = 401;
+            res.end("Invalid JWT");
+            return;
+          }
+          const peerId = identity.peerId;
+
+          // Proof-of-Possession (gap ①): when the bootstrap JWT carries an
+          // Ed25519 `pop_jwk`, the caller MUST prove possession of the device
+          // private key by signing the issued nonce. Missing / invalid /
+          // expired / replayed → 401 and the peer is NOT registered.
+          if (identity.popPublicJwk) {
+            let proof: { nonce?: unknown; signature?: unknown } = {};
+            try {
+              proof = (await readJsonBody(req)) as typeof proof;
+            } catch {
+              /* empty / invalid body → treated as missing proof below */
+            }
+            const nonce = typeof proof.nonce === "string" ? proof.nonce : "";
+            const signature = typeof proof.signature === "string" ? proof.signature : "";
+            if (!nonce || !signature) {
+              res.statusCode = 401;
+              res.end("Missing proof-of-possession");
+              return;
+            }
+            const verdict = popChallenges.verify({
+              peerId,
+              nonce,
+              signatureB64Url: signature,
+              popPublicJwk: identity.popPublicJwk,
+            });
+            if (!verdict.ok) {
+              api.logger.error?.(
+                `webchannel: PoP verification failed for ${peerId} (${verdict.reason})`,
+              );
+              res.statusCode = 401;
+              res.end("Invalid proof-of-possession");
+              return;
+            }
+          }
+
+          // Register peer in NATS channel
+          channel.registerPeer(peerId);
+
+          // Send initial history snapshot
+          try {
+            const route = api.runtime.channel.routing.resolveAgentRoute({
+              cfg: api.config,
+              channel: WEBCHANNEL_ID,
+              peer: { kind: "direct", id: peerId },
+            });
+            const messages = await historyRecent(api, route.sessionKey, live.historyConfig.limit, api.logger);
+            channel.sendHistory(peerId, messages);
+          } catch (err) {
+            api.logger.error?.(
+              `webchannel: history snapshot failed for ${peerId}: ${String(err)}`,
+            );
+          }
+
+          // Send success response
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ peerId, registered: true }));
+        } catch (err) {
+          api.logger.error?.(`webchannel: peer registration failed: ${String(err)}`);
+          res.statusCode = 500;
+          res.end("Registration failed");
+        }
+      }),
+    });
+
+    api.registerHttpRoute({
+      path: "/webchannel/nats/unregister",
+      auth: "plugin",
+      match: "exact",
+      handler: asRoute(async (req, res) => {
+        const channel = live.channel;
+        if (!channel) {
+          res.statusCode = 503;
+          res.end("WebChannel starting up");
+          return;
+        }
+        try {
+          const body = await new Promise<string>((resolve) => {
+            let data = "";
+          req.on("data", (chunk: Buffer) => { data += chunk; });
+            req.on("end", () => resolve(data));
+          });
+          const { peerId } = JSON.parse(body);
+
+          if (!peerId) {
+            res.statusCode = 400;
+            res.end("Missing peerId");
+            return;
+          }
+
+          channel.unregisterPeer(peerId);
+
+          res.statusCode = 200;
+          res.end(JSON.stringify({ peerId, unregistered: true }));
+        } catch (err) {
+          api.logger.error?.(`webchannel: peer unregistration failed: ${String(err)}`);
+          res.statusCode = 500;
+          res.end("Unregistration failed");
+        }
+      }),
+    });
+
+    // -----------------------------------------------------------------------
     // Step 0: Fail-closed encryption guard (AC 3a / EncryptedChannelWired)
     // -----------------------------------------------------------------------
 
@@ -227,8 +427,11 @@ export default defineChannelPluginEntry({
       dispatchInbound(peerId, message);
     });
 
-    // Dev/open-NATS: there is no HTTP registration step, so subscribe to the
-    // tenant/agent wildcard and let peers auto-register on their handshake.
+    // Dev/open-NATS convenience: the local harness browser connects with an
+    // hmac-ticket and does NOT call the HTTP register hop, so subscribe to the
+    // tenant/agent wildcard and let peers auto-register on their handshake (the
+    // allowlist gate still runs). The enrolled/JWT path uses the real
+    // /webchannel/nats/register route (registered in Step A) instead.
     if (devOpenNats) {
       channel.subscribeWildcard();
     }
@@ -296,186 +499,17 @@ export default defineChannelPluginEntry({
     }
 
     // -----------------------------------------------------------------------
-    // Step 7: Wire up HTTP route for peer registration (bootstrap JWT)
+    // Step 7: Publish live state to the HTTP route handlers registered in Step A
     // -----------------------------------------------------------------------
 
-    // In NATS mode, browsers don't connect via WebSocket upgrade
-    // Instead, they call an HTTP endpoint to register their peerId
-    // The endpoint verifies the bootstrap JWT and calls channel.registerPeer()
-    //
-    // KNOWN GAP (openclaw 2026.6.10): these plain-HTTP plugin routes register
-    // fine but are NOT dispatched by the gateway — only WS-upgrade plugin routes
-    // are. So this register/PoP hop is not reachable live yet; the dev/open-NATS
-    // path uses `channel.subscribeWildcard()` to auto-register peers instead.
-    // See docs/STATUS.md "follow-ups" and e2e/local/README.md.
-
-    // PoP challenge (gap ①): issue a single-use nonce bound to the verified
-    // peerId. The browser signs it with the device Ed25519 key and presents the
-    // signature to /register.
-    api.registerHttpRoute({
-      path: "/webchannel/nats/register/challenge",
-      auth: "plugin",
-      match: "exact",
-      handler: asRoute(async (req, res) => {
-        try {
-          const authHeader = req.headers["authorization"];
-          const jwt = authHeader?.startsWith("Bearer ")
-            ? authHeader.slice(7)
-            : new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt");
-          if (!jwt) {
-            res.statusCode = 401;
-            res.end("Missing JWT");
-            return;
-          }
-          const peerId = await verifyJwtAndExtractPeerId(jwt, authConfig?.auth, api.logger);
-          if (!peerId) {
-            res.statusCode = 401;
-            res.end("Invalid JWT");
-            return;
-          }
-          const nonce = popChallenges.issue(peerId);
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ nonce }));
-        } catch (err) {
-          api.logger.error?.(`webchannel: PoP challenge failed: ${String(err)}`);
-          res.statusCode = 500;
-          res.end("Challenge failed");
-        }
-      }),
-    });
-
-    api.registerHttpRoute({
-      path: "/webchannel/nats/register",
-      auth: "plugin",
-      match: "exact",
-      handler: asRoute(async (req, res) => {
-        if (!verifier) {
-          res.statusCode = 500;
-          res.end("No verifier configured");
-          return;
-        }
-
-        try {
-          // Extract JWT from Authorization header or query parameter
-          const authHeader = req.headers["authorization"];
-          const jwt = authHeader?.startsWith("Bearer ")
-            ? authHeader.slice(7)
-            : (new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt"));
-
-          if (!jwt) {
-            res.statusCode = 401;
-            res.end("Missing JWT");
-            return;
-          }
-
-          // Verify JWT and extract the full identity (peerId + PoP key)
-          const identity = await verifyJwtAndExtractIdentity(jwt, authConfig?.auth, api.logger);
-          if (!identity) {
-            res.statusCode = 401;
-            res.end("Invalid JWT");
-            return;
-          }
-          const peerId = identity.peerId;
-
-          // Proof-of-Possession (gap ①): when the bootstrap JWT carries an
-          // Ed25519 `pop_jwk`, the caller MUST prove possession of the device
-          // private key by signing the issued nonce. Missing / invalid /
-          // expired / replayed → 401 and the peer is NOT registered.
-          if (identity.popPublicJwk) {
-            let proof: { nonce?: unknown; signature?: unknown } = {};
-            try {
-              proof = (await readJsonBody(req)) as typeof proof;
-            } catch {
-              /* empty / invalid body → treated as missing proof below */
-            }
-            const nonce = typeof proof.nonce === "string" ? proof.nonce : "";
-            const signature = typeof proof.signature === "string" ? proof.signature : "";
-            if (!nonce || !signature) {
-              res.statusCode = 401;
-              res.end("Missing proof-of-possession");
-              return;
-            }
-            const verdict = popChallenges.verify({
-              peerId,
-              nonce,
-              signatureB64Url: signature,
-              popPublicJwk: identity.popPublicJwk,
-            });
-            if (!verdict.ok) {
-              api.logger.error?.(
-                `webchannel: PoP verification failed for ${peerId} (${verdict.reason})`,
-              );
-              res.statusCode = 401;
-              res.end("Invalid proof-of-possession");
-              return;
-            }
-          }
-
-          // Register peer in NATS channel
-          channel.registerPeer(peerId);
-
-          // Send initial history snapshot
-          try {
-            const route = api.runtime.channel.routing.resolveAgentRoute({
-              cfg: api.config,
-              channel: WEBCHANNEL_ID,
-              peer: { kind: "direct", id: peerId },
-            });
-            const messages = await historyRecent(api, route.sessionKey, historyConfig.limit, api.logger);
-            channel.sendHistory(peerId, messages);
-          } catch (err) {
-            api.logger.error?.(
-              `webchannel: history snapshot failed for ${peerId}: ${String(err)}`,
-            );
-          }
-
-          // Send success response
-          res.statusCode = 200;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ peerId, registered: true }));
-        } catch (err) {
-          api.logger.error?.(`webchannel: peer registration failed: ${String(err)}`);
-          res.statusCode = 500;
-          res.end("Registration failed");
-        }
-      }),
-    });
-
-    // -----------------------------------------------------------------------
-    // Step 8: Wire up HTTP route for peer unregistration
-    // -----------------------------------------------------------------------
-
-    api.registerHttpRoute({
-      path: "/webchannel/nats/unregister",
-      auth: "plugin",
-      match: "exact",
-      handler: asRoute(async (req, res) => {
-        try {
-          const body = await new Promise<string>((resolve) => {
-            let data = "";
-          req.on("data", (chunk: Buffer) => { data += chunk; });
-            req.on("end", () => resolve(data));
-          });
-          const { peerId } = JSON.parse(body);
-
-          if (!peerId) {
-            res.statusCode = 400;
-            res.end("Missing peerId");
-            return;
-          }
-
-          channel.unregisterPeer(peerId);
-
-          res.statusCode = 200;
-          res.end(JSON.stringify({ peerId, unregistered: true }));
-        } catch (err) {
-          api.logger.error?.(`webchannel: peer unregistration failed: ${String(err)}`);
-          res.statusCode = 500;
-          res.end("Unregistration failed");
-        }
-      }),
-    });
+    // The register / challenge / unregister routes were registered synchronously
+    // at the top of registerFull (Step A) — they MUST be, or openclaw drops them.
+    // Now that async setup is complete, hand them the live channel + verifier so
+    // requests stop replying 503 and start admitting peers (JWT + PoP).
+    live.channel = channel;
+    live.verifier = verifier;
+    live.auth = authConfig?.auth;
+    live.historyConfig = historyConfig;
 
     // -----------------------------------------------------------------------
     // Step 9: Keep the NATS connection alive

@@ -105,8 +105,11 @@ Encryption stays **on** (encrypt-by-construction default); the relay only ever s
 ## Known gaps (why this is "live" but not yet "full production")
 
 - **Echo model, not a live LLM** — by design (hermetic). The agent path is real; only the brain is dumb.
-- **Wildcard auto-register, not the HTTP register hop** — openclaw 2026.6.10 only dispatches
-  *WS-upgrade* plugin routes, so the plugin's plain-HTTP `/webchannel/nats/register*` routes 404.
-  The dev path uses `NatsChannel.subscribeWildcard()` (the allowlist gate still runs). Closing this
-  is follow-up #8 in `docs/STATUS.md`; it's what unblocks live JWT/PoP registration.
+- **Wildcard auto-register, not the HTTP register hop** — the dev harness browser connects with an
+  hmac-ticket and does not call the HTTP register route, so the dev path uses
+  `NatsChannel.subscribeWildcard()` (the allowlist gate still runs). NOTE: the plain-HTTP
+  `/webchannel/nats/register*` routes themselves now **work live** (follow-up #8 — done; they were
+  being dropped by registering after an `await` in `registerFull`, outside openclaw's synchronous
+  registration window). What remains (#11) is wiring the browser to call `registerWithPop` instead
+  of relying on the wildcard.
 - **Not in CI yet** — this is a local manual harness; folding it into the gate is follow-up #9.

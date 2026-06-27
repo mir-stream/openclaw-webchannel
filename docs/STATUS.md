@@ -59,7 +59,7 @@ this file, **this file is correct.**
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
-| HTTP register/challenge routes not served by the gateway | `index-nats` now registers them via the correct `api.registerHttpRoute`, but openclaw 2026.6.10 only dispatches *WS-upgrade* plugin routes — plain-HTTP plugin routes 404. So the PoP/JWT HTTP registration hop is not reachable yet; the live local round-trip uses a dev wildcard auto-register instead. Needs an openclaw-side HTTP-route path (or a different registration transport). |
+| Browser connect flow not yet wired to the HTTP register hop | The plain-HTTP register/challenge/unregister routes **are now served live** (fixed — see below); a `GET /webchannel/nats/register/challenge` returns our handler's `401 Missing JWT` in a real gateway. What remains is product wiring: the browser client still relies on the dev **wildcard auto-register** instead of calling `registerWithPop` → the HTTP route. Closing this is follow-up #11. |
 | Production pair not yet in the CI gate | The production pair is now live-verified **locally** (see "What works", `e384198`), but the automated CI gate still drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` seam. Folding the `e2e/local` harness into CI (needs a built openclaw + browser) is a follow-up. |
 
 ## Coverage note
@@ -101,16 +101,22 @@ agent side made this worse and was removed in `ee89ba3`.)
 
 ### Remaining follow-ups (none block the hermetic ACs)
 
-8. **Unblock openclaw plain-HTTP plugin routes** so the HTTP register + PoP hop is reachable live.
-   openclaw 2026.6.10 only dispatches WS-upgrade plugin routes; the dev path uses wildcard
-   auto-register as a stand-in. This is the one thing between "dev round-trip" and "full production
-   path incl. JWT/PoP registration over HTTP".
+8. ✅ **Unblock the HTTP register + PoP hop so it is reachable live** — **done**. Root cause was
+   **not** an openclaw limitation: openclaw dispatches plain-HTTP plugin routes fine (a2ui / canvas /
+   `/webchannel/ws` all do). The real bug was ours — `index-nats` called `api.registerHttpRoute`
+   **after `await transport.connect()`**, and openclaw only honors route registration during the
+   **synchronous** `registerFull` window; post-`await` calls silently no-op. Fix: register all three
+   routes synchronously at the top of `registerFull` (Step A), handlers read live state via a holder
+   populated after async setup. Verified live: `GET /webchannel/nats/register/challenge` → our
+   `401 Missing JWT`; the browser↔agent round-trip still passes. (Diagnosis method: instrumented
+   the openclaw dist registry/dispatch and bisected sync-vs-after-await registration.)
 9. **Fold `e2e/local` into the CI gate** (or point the existing gate at the production pair). The
    automated gate still drives the parallel `e2e-browser-client`/`e2e-roundtrip-agent` demo seam.
 10. **Converge the demo pair into the production pair** (remove the parallel `e2e-roundtrip-agent` /
     `e2e-browser-client` implementations; point `e2e-browser-client` crypto at shared `e2e-crypto-browser`).
-11. **Wire `registerWithPop` into the browser connect flow** (currently a standalone export; meaningful
-    once #8 lands).
+11. **Wire `registerWithPop` into the browser connect flow** (currently a standalone export). Now
+    unblocked — #8 landed, so the HTTP register route it targets is live. This is the last step to
+    replace the dev wildcard auto-register with the real JWT/PoP HTTP registration in the browser.
 12. Packaging + **real** ClawHub/npm publish (registry creds) — or accept `DonePublishDeferred`.
 
 ## Commit landmarks
