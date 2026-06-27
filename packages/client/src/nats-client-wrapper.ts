@@ -57,6 +57,7 @@ export class WebChannelNATSClient {
       agentId: options.agentId ?? "default-agent",
       tenant: options.tenant ?? "default-tenant",
       peerId: options.peerId ?? "anonymous-peer",
+      registration: options.registration,
     };
 
     this.client = new WebChannelNatsClient(this.natsOptions);
@@ -70,6 +71,16 @@ export class WebChannelNATSClient {
         status: connected ? "connected" : "reconnecting",
         connected,
       });
+    });
+
+    // Surface a failed PoP registration. The underlying client tears the
+    // connection fully down (registration failure is terminal — see
+    // nats-client.ts onConnected), so nothing is reconnecting. ConnectionStatus
+    // has no terminal/disconnected value, so we do NOT claim "reconnecting"
+    // here: the matching `onState(false)` from the teardown already moves status
+    // out of "connected", and we just log the error.
+    this.client.onError((err: Error) => {
+      console.error("[nats-wrapper] registration error:", err);
     });
   }
 

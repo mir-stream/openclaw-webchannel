@@ -27,6 +27,7 @@ import {
   openMessage,
   type BrowserKeyPair,
 } from "./e2e-crypto-browser.js";
+import { registerWithPop } from "./pop-register.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,6 +48,22 @@ export type NatsClientOptions = {
   reconnectBaseMs?: number;
   /** Reconnect backoff cap (ms) */
   reconnectCapMs?: number;
+  /**
+   * Optional PoP HTTP registration. When present, the client performs the
+   * JWT + Proof-of-Possession registration against the plugin's HTTP register
+   * route after connecting (and before the handshake), so the agent subscribes
+   * to this peer's subjects. When absent, registration is skipped (dev/open-NATS
+   * uses the agent's wildcard auto-register instead). `jwt` and `peerId` come
+   * from the existing NatsClientOptions fields.
+   */
+  registration?: {
+    /** Base URL where the plugin serves its register routes (no trailing slash). */
+    registerBaseUrl: string;
+    /** Device Ed25519 private key paired with the bootstrap JWT's pop_jwk. */
+    devicePrivateKey: CryptoKey;
+    /** Injectable fetch (tests / non-browser hosts). Defaults to global fetch. */
+    fetchImpl?: typeof fetch;
+  };
 };
 
 export type InboundMessage = {
@@ -78,6 +95,9 @@ export type RawMessageListener = (subject: string, payload: string) => void;
 
 /** Connection state listener callback */
 export type StateListener = (connected: boolean) => void;
+
+/** Error listener callback (e.g. PoP registration failure). */
+export type ErrorListener = (err: Error) => void;
 
 // ---------------------------------------------------------------------------
 // WebSocket-based NATS client (browser-compatible)
@@ -395,12 +415,20 @@ export class WebChannelNatsClient {
   private readonly client: NatsClient;
   private readonly options: NatsClientOptions;
   private readonly messageListeners = new Set<MessageListener>();
+  private readonly errorListeners = new Set<ErrorListener>();
 
   private keyPair: BrowserKeyPair | null = null;
   private sessionKey: Uint8Array | null = null;
   private outboundQueue: OutboundMessage[] = [];
   private outSub = -1;
   private handshakeSub = -1;
+  /**
+   * Bumped on every `onConnected()` so a stale async continuation (resumed after
+   * the socket dropped and a reconnect spawned a fresh flow) can detect it is no
+   * longer current and bail instead of overwriting `keyPair` / publishing a
+   * stale handshake.
+   */
+  private connectionEpoch = 0;
 
   constructor(options: NatsClientOptions) {
     this.options = options;
@@ -455,6 +483,12 @@ export class WebChannelNatsClient {
     return this.client.onState(listener);
   }
 
+  /** Add error listener (e.g. PoP registration failure). */
+  onError(listener: ErrorListener): () => void {
+    this.errorListeners.add(listener);
+    return () => { this.errorListeners.delete(listener); };
+  }
+
   // ---------------------------------------------------------------------------
   // Internal — handshake + crypto
   // ---------------------------------------------------------------------------
@@ -466,6 +500,10 @@ export class WebChannelNatsClient {
 
   private async onConnected(): Promise<void> {
     const { tenant, agentId, peerId } = this.options;
+    // Mark this flow as the current connection generation. Any `await` below
+    // re-checks `this.connectionEpoch === epoch` so a continuation resumed after
+    // a drop+reconnect bails instead of clobbering the fresh flow's state.
+    const epoch = ++this.connectionEpoch;
     // (Re)subscribe idempotently: unsubscribe stale sids so a reconnect never
     // leaves duplicate subscriptions delivering the same MSG twice.
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
@@ -475,7 +513,44 @@ export class WebChannelNatsClient {
 
     // Fresh connection → fresh key exchange.
     this.resetSession();
-    this.keyPair = await generateX25519KeyPair();
+
+    // PoP HTTP registration (production). MUST complete AFTER we subscribe to
+    // .out/.handshake (above) but BEFORE we publish the handshake — the agent
+    // only subscribes to this peer's subjects once registered, and NATS has no
+    // retention, so a handshake published earlier would be lost. Fail-closed: if
+    // registration throws, registration failure is TERMINAL for this connection.
+    // A PoP/JWT rejection is typically a permanent credential problem, so we do
+    // NOT silently retry (no auto-retry/hammering): we tear the connection fully
+    // down via the raw NatsClient.disconnect() (clears the reconnect timer +
+    // closes the socket, leaving connected === false). The application must react
+    // to onError and re-initialize with fresh credentials (a new bootstrap JWT).
+    const { registration } = this.options;
+    if (registration) {
+      try {
+        await registerWithPop({
+          registerBaseUrl: registration.registerBaseUrl,
+          jwt: this.options.jwt,
+          peerId,
+          devicePrivateKey: registration.devicePrivateKey,
+          fetchImpl: registration.fetchImpl,
+        });
+      } catch (err) {
+        console.error("[nats-client] PoP registration failed:", err);
+        this.notifyErrorListeners(err as Error);
+        this.client.disconnect();
+        return;
+      }
+      // The socket may have dropped during the register round-trip; a reconnect
+      // would have spawned a newer onConnected. Bail so this stale flow does not
+      // publish a handshake for a connection generation that is no longer current.
+      if (this.connectionEpoch !== epoch) return;
+    }
+
+    const keyPair = await generateX25519KeyPair();
+    // Same guard after the keygen await: do not clobber a fresher flow's keyPair
+    // or publish a stale handshake.
+    if (this.connectionEpoch !== epoch) return;
+    this.keyPair = keyPair;
     this.client.publish(
       handshakeSubject(tenant, agentId, peerId),
       keyExchangeFrame(this.keyPair.publicKeyB64url),
@@ -534,6 +609,16 @@ export class WebChannelNatsClient {
         listener(msg);
       } catch (err) {
         console.error("[nats-client] Listener error:", err);
+      }
+    });
+  }
+
+  private notifyErrorListeners(err: Error): void {
+    this.errorListeners.forEach((listener) => {
+      try {
+        listener(err);
+      } catch (e) {
+        console.error("[nats-client] Error listener error:", e);
       }
     });
   }
