@@ -54,6 +54,8 @@ import { encodeUser } from "@nats-io/jwt";
 // Paths
 // ---------------------------------------------------------------------------
 
+const E2E_TIMEOUT_MS = 60000; // CI headroom: each test cold-launches headless Chromium, which is slow on shared runners
+
 const _thisDir = dirname(fileURLToPath(import.meta.url));   // e2e/
 const _root    = join(_thisDir, "..");                       // workspace root
 
@@ -332,7 +334,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
         res.end("<!doctype html><html><head><meta charset=\"utf-8\"></head><body>webchannel-e2e</body></html>");
       });
       await new Promise<void>((resolve) => pageServer!.listen(PAGE_PORT, "127.0.0.1", resolve));
-    }, 40000);
+    }, E2E_TIMEOUT_MS);
 
     afterAll(async () => {
       if (natsServer) {
@@ -451,7 +453,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
           await browser?.close();
         }
       },
-      40000,
+      E2E_TIMEOUT_MS,
     );
 
     // -----------------------------------------------------------------------
@@ -526,7 +528,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
           await browser?.close();
         }
       },
-      25000,
+      E2E_TIMEOUT_MS,
     );
 
     // -----------------------------------------------------------------------
@@ -620,7 +622,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
           await browser?.close();
         }
       },
-      45000,
+      E2E_TIMEOUT_MS,
     );
 
   },
