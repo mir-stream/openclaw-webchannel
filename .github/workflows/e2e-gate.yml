@@ -203,7 +203,7 @@ jobs:
       #    /tmp/oc-saas-e2e (port 18899) — hermetic, no secret. Any non-zero
       #    exit FAILS the gate.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Live e2e: real SaaS issuer register
+      - name: "Live e2e: real SaaS issuer register"
         run: bash e2e/local/run-saas-issuer-register.sh
 
       # ──────────────────────────────────────────────────────────────────────
@@ -214,7 +214,7 @@ jobs:
       #    Isolated under /tmp/oc-enrolled-e2e (port 18999) — hermetic, no
       #    secret. Any non-zero exit FAILS the gate.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Live e2e: enrolled-NATS-transport (device-flow)
+      - name: "Live e2e: enrolled-NATS-transport (device-flow)"
         run: bash e2e/local/run-enrolled-transport.sh
 
       # ──────────────────────────────────────────────────────────────────────
@@ -224,7 +224,7 @@ jobs:
       #    CORS). Isolated under /tmp/oc-browser-e2e (port 19099) — hermetic, no
       #    secret. Any non-zero exit FAILS the gate.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Live e2e: real-browser JWT+PoP register
+      - name: "Live e2e: real-browser JWT+PoP register"
         run: bash e2e/local/run-browser-jwt-register.sh
 
       # ──────────────────────────────────────────────────────────────────────
@@ -236,7 +236,7 @@ jobs:
       #    /tmp/oc-allreal-e2e (port 19199) — hermetic, no secret. Any non-zero
       #    exit FAILS the gate.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Live e2e: ALL-REAL fusion
+      - name: "Live e2e: ALL-REAL fusion"
         run: bash e2e/local/run-all-real.sh
 
 ################################################################################
