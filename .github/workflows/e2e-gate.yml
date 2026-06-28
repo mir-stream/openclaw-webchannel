@@ -195,6 +195,50 @@ jobs:
       - name: Real-gateway live e2e (JWT register hop)
         run: bash e2e/local/run-jwt-register.sh
 
+      # ──────────────────────────────────────────────────────────────────────
+      # 8b. Live e2e: real SaaS issuer register
+      #    Sibling of step 8 but the JWT SOURCE is the REAL reference
+      #    bootstrap-server (real RS256 issuance + real JWKS-over-HTTP verify),
+      #    not a static fixture. Node driver, no Chromium. Isolated under
+      #    /tmp/oc-saas-e2e (port 18899) — hermetic, no secret. Any non-zero
+      #    exit FAILS the gate.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Live e2e: real SaaS issuer register
+        run: bash e2e/local/run-saas-issuer-register.sh
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 8c. Live e2e: enrolled-NATS-transport (device-flow)
+      #    devOpen OFF: the plugin obtains tenant-scoped NATS creds via the REAL
+      #    device-flow enrollment-server and NKEY-connects to a JWT-auth
+      #    nats-server from ONE shared trust chain. Node driver, no Chromium.
+      #    Isolated under /tmp/oc-enrolled-e2e (port 18999) — hermetic, no
+      #    secret. Any non-zero exit FAILS the gate.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Live e2e: enrolled-NATS-transport (device-flow)
+        run: bash e2e/local/run-enrolled-transport.sh
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 8d. Live e2e: real-browser JWT+PoP register
+      #    A REAL headless Chromium running the production WebChannelNatsClient
+      #    drives the JWT + Proof-of-Possession register hop (in-page keygen +
+      #    CORS). Isolated under /tmp/oc-browser-e2e (port 19099) — hermetic, no
+      #    secret. Any non-zero exit FAILS the gate.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Live e2e: real-browser JWT+PoP register
+        run: bash e2e/local/run-browser-jwt-register.sh
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 8e. Live e2e: ALL-REAL fusion
+      #    Fuses the enrolled-transport server topology with the real-browser
+      #    driver: the Chromium peer NKEY-auths to the JWT-auth nats-server AND
+      #    drives the PoP register hop against a REAL enrolled plugin — all from
+      #    ONE trust chain (only the echo LLM is a stand-in). Isolated under
+      #    /tmp/oc-allreal-e2e (port 19199) — hermetic, no secret. Any non-zero
+      #    exit FAILS the gate.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Live e2e: ALL-REAL fusion
+        run: bash e2e/local/run-all-real.sh
+
 ################################################################################
 # Publish job — gated on the E2E gate passing + release tag
 # Only runs when a semver tag is pushed (e.g. v1.0.0).

@@ -12,7 +12,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OCH=/tmp/oc-e2e
 PKG_JSON="$REPO/packages/plugin/package.json"
-PKG_BAK="$OCH/package.json.bak"
+# Keep the backup OUTSIDE $OCH: $OCH is rm -rf'd at startup, so a backup living
+# inside it would be wiped by the NEXT run before we could restore the original —
+# permanently stranding the swapped (index-nats.ts) package.json in git.
+PKG_BAK=/tmp/oc-e2e.pkgbak.json
 
 GW_PORT=18799
 NATS_WS=18222
@@ -49,6 +52,14 @@ rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
 
 # 0. Point the webchannel plugin entry at index-nats.ts (restore on exit).
+#    Crash recovery: if a prior run was hard-killed mid-swap, $PKG_BAK still holds
+#    the ORIGINAL package.json while the tracked one is left swapped. Restore it
+#    first, THEN take a fresh backup — so this swap is itself crash-recoverable.
+if [ -f "$PKG_BAK" ]; then
+  echo "[run-jwt-register] stale $PKG_BAK found — restoring original package.json before re-swapping"
+  cp "$PKG_BAK" "$PKG_JSON"
+  rm -f "$PKG_BAK"
+fi
 cp "$PKG_JSON" "$PKG_BAK"
 node -e '
   const fs = require("fs");
