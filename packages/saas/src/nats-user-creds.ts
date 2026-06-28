@@ -34,8 +34,14 @@ export type MintNatsUserCredsOptions = {
 export type MintedNatsUserCreds = {
   /** NATS user JWT (compact), signed by the account NKEY. */
   userJwt: string;
-  /** NATS user NKEY seed ("SU…"). */
+  /** NATS user NKEY seed ("SU…") — base32, for `@nats-io/nkeys` `fromSeed`. */
   userSeed: string;
+  /**
+   * base64url of the raw 32-byte Ed25519 user-NKEY seed. Browser-friendly: a
+   * web client can wrap this in a PKCS#8 header and sign the server nonce with
+   * `crypto.subtle` alone — no base32/CRC NKEY decoder, no `@nats-io/*`.
+   */
+  userSeedRaw: string;
   /** The pub/sub allow-lists embedded in the JWT. */
   permissions: { pub: string[]; sub: string[] };
 };
@@ -54,6 +60,13 @@ export async function mintNatsUserCreds(
   const accountSigner = fromSeed(new TextEncoder().encode(opts.accountSeed));
   const userKp = createUser();
   const userSeed = new TextDecoder().decode(userKp.getSeed());
+  // Browser-friendly raw seed (base64url of the 32-byte Ed25519 seed). Never log.
+  // `getRawSeed()` is the KeyPair's public accessor for the exact 32-byte
+  // Ed25519 seed (identical to bytes [2,34) of the decoded base32 NKEY seed).
+  // The concrete KP class exposes it but the public `KeyPair` interface omits
+  // it, so we narrow the type to reach the public method.
+  const userKpRaw = userKp as unknown as { getRawSeed(): Uint8Array };
+  const userSeedRaw = Buffer.from(userKpRaw.getRawSeed()).toString("base64url");
 
   const pub = [`webchannel.${opts.tenant}.>`];
   const sub = [`webchannel.${opts.tenant}.>`];
@@ -63,5 +76,5 @@ export async function mintNatsUserCreds(
     sub: { allow: sub },
   });
 
-  return { userJwt, userSeed, permissions: { pub, sub } };
+  return { userJwt, userSeed, userSeedRaw, permissions: { pub, sub } };
 }

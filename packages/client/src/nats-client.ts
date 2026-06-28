@@ -25,8 +25,10 @@ import {
   parseKeyExchange,
   sealMessage,
   openMessage,
+  base64urlDecode,
   type BrowserKeyPair,
 } from "./e2e-crypto-browser.js";
+import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
 import { registerWithPop } from "./pop-register.js";
 
 // ---------------------------------------------------------------------------
@@ -63,6 +65,24 @@ export type NatsClientOptions = {
     devicePrivateKey: CryptoKey;
     /** Injectable fetch (tests / non-browser hosts). Defaults to global fetch. */
     fetchImpl?: typeof fetch;
+  };
+  /**
+   * Optional NATS-layer NKEY authentication for a JWT-auth nats-server.
+   *
+   * When present, the client defers CONNECT until the server's `INFO` line
+   * arrives, extracts the `nonce`, signs it with the user NKEY seed, and sends
+   * CONNECT carrying `{ jwt: userJwt, sig }` (NATS challenge-response). When
+   * ABSENT, the client keeps its original behaviour byte-for-byte: CONNECT is
+   * sent on ws-open with `jwt: options.jwt` and no signature (open / dev-NATS).
+   *
+   * `userSeedRaw` is the **base64url-encoded raw 32-byte Ed25519 seed** (NOT the
+   * base32 "SU…" NKEY string), so the browser needs no base32/CRC NKEY decoder.
+   */
+  natsCredentials?: {
+    /** NATS user JWT (compact), signed by the account NKEY. */
+    userJwt: string;
+    /** base64url of the raw 32-byte Ed25519 user-NKEY seed. */
+    userSeedRaw: string;
   };
 };
 
@@ -124,6 +144,12 @@ export class NatsClient {
   private subscriptions = new Map<number, string>(); // sid -> subject
   private sidCounter = 0;
   private buffer = "";
+  /**
+   * NKEY-auth only: guards the signed CONNECT so it is sent exactly once per
+   * socket even if the server emits multiple INFO lines. Reset on each
+   * (re)connect. Unused on the no-natsCredentials path.
+   */
+  private connectSent = false;
 
   constructor(options: NatsClientOptions) {
     this.options = options;
@@ -210,10 +236,16 @@ export class NatsClient {
     // and breaks the parser — request ArrayBuffer and decode to UTF-8.
     ws.binaryType = "arraybuffer";
     this.ws = ws;
+    this.connectSent = false;
 
     ws.onopen = () => {
       console.log("[nats-client] WebSocket connected");
-      this.sendConnect();
+      // No NKEY auth: send CONNECT immediately (original path, byte-for-byte).
+      // With NKEY auth we MUST wait for the server's INFO nonce before signing,
+      // so CONNECT is deferred to the INFO handler in drainBuffer().
+      if (!this.options.natsCredentials) {
+        this.sendConnect();
+      }
     };
 
     ws.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
@@ -252,6 +284,49 @@ export class NatsClient {
     this.ws.send("PING\r\n");
   }
 
+  /**
+   * NKEY-auth CONNECT: triggered by the server's INFO line. Extracts the nonce,
+   * signs it with the user NKEY seed, and sends CONNECT carrying the user JWT +
+   * signature (NATS challenge-response), then PING to provoke the PONG that
+   * flips us to `connected`. Only invoked when `natsCredentials` is set.
+   */
+  private async sendSignedConnect(infoLine: string): Promise<void> {
+    const creds = this.options.natsCredentials;
+    // Capture the socket BEFORE the crypto await: a (theoretical) reconnect
+    // during the await could swap `this.ws`, and we must send CONNECT on the
+    // same socket that produced this INFO nonce — never a replacement.
+    const ws = this.ws;
+    if (!ws || !creds) return;
+
+    let nonce = "";
+    try {
+      nonce = (JSON.parse(infoLine.slice(5).trim()) as { nonce?: string }).nonce ?? "";
+    } catch {
+      /* INFO without a parseable nonce — sign nothing (server will reject). */
+    }
+
+    let sig = "";
+    if (nonce) {
+      const privateKey = await importEd25519SeedKey(base64urlDecode(creds.userSeedRaw));
+      sig = await signNonce(privateKey, nonce);
+    }
+
+    const connectPayload: Record<string, unknown> = {
+      verbose: false,
+      pedantic: false,
+      lang: "typescript",
+      version: "1.0.0",
+      protocol: 1,
+      echo: false,
+      jwt: creds.userJwt,
+    };
+    if (sig) connectPayload["sig"] = sig;
+
+    // Send on the captured socket (the one that produced this INFO nonce).
+    ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
+    ws.send("PING\r\n");
+  }
+
   private drainBuffer(): void {
     let crlfPos: number;
     while ((crlfPos = this.buffer.indexOf("\r\n")) !== -1) {
@@ -261,6 +336,11 @@ export class NatsClient {
       if (!line) continue;
 
       if (line.startsWith("INFO ")) {
+        // NKEY auth: the INFO nonce is our cue to send the signed CONNECT (once).
+        if (this.options.natsCredentials && !this.connectSent) {
+          this.connectSent = true;
+          void this.sendSignedConnect(line);
+        }
         continue;
       }
 
