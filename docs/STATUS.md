@@ -202,10 +202,20 @@ agent side made this worse and was removed in `ee89ba3`.)
     preflight → 204 pre-auth) to `/webchannel/nats/register{,/challenge}`; no `Allow-Credentials`
     (safe — admission still needs an unforgeable Bearer bootstrap-JWT + PoP sig); auth/PoP logic
     untouched. Origin-allowlist hardening tracked in the security follow-up (task #20).
-    **Remaining (NOT this item) — the "all-real over JWT-auth-nats" fusion:** layering the real browser
-    onto the #15 enrolled JWT-auth-NATS stack needs NKEY-auth added to the browser `WebChannelNatsClient`
-    (today it can't NATS-layer authenticate — see the #15 finding). That's the next real-browser step;
-    after it, the only stand-in left is the echo LLM by design.
+17. ✅ **DONE (`b861fd4`) — ALL-REAL fusion; the all-real end state is reached.** Layered the real
+    browser (#16) onto the enrolled JWT-auth-NATS stack (#15) into ONE harness
+    (`e2e/local/run-all-real.sh` + `all-real.mjs` + `browser-jwt-entry.ts` `runAllReal()`): a real
+    headless Chromium running the **production** `WebChannelNatsClient` NATS-layer **NKEY-authenticates**
+    to a real JWT-auth nats-server AND drives the JWT+PoP register hop, while the real plugin (gateway,
+    devOpen OFF) is enrolled to that same nats-server via `createEnrolledNatsConnection` — all from ONE
+    `setupTrustChain()` — encrypted round-trip GREEN. New production capability that unblocked it:
+    NATS-layer NKEY-auth in the browser client (`nats-client.ts` `natsCredentials{userJwt,userSeedRaw}`
+    → deferred signed CONNECT over the INFO nonce; absent → byte-for-byte unchanged = zero regression;
+    shared `nats-nkey-browser.ts`, webcrypto only, no @nats-io; issuer returns `userSeedRaw` so the
+    browser needs no base32 NKEY decoder). **After this, the only runtime stand-in is the echo LLM, by
+    design.** Verified GREEN alongside #15/#16 harnesses (no regression); client 151 + saas 66 unit pass;
+    real `~/.openclaw` + gateway:18789 untouched. Open follow-ups (none blocking): fold the live harnesses
+    into CI; security hardening (task #20); AC4 publish (creds-gated, deferred).
 
 ## Commit landmarks
 
