@@ -36,6 +36,22 @@
                 ]
               },
               "ticketParam": { "type": "string" },
+              "requirePoP": {
+                "type": "boolean",
+                "default": true,
+                "description": "Require Proof-of-Possession at the NATS register route. Default true (secure-by-default): a verified bootstrap JWT with no pop_jwk is rejected (401) before any peer is registered. Set false to restore legacy optional-PoP behavior (dev only)."
+              },
+              "cors": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "allowedOrigins": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Allowlist of browser Origins permitted on the register routes. Unset/empty reflects the request Origin (permissive). When non-empty, only an in-list Origin receives an Access-Control-Allow-Origin header."
+                  }
+                }
+              },
               "jwt": {
                 "type": "object",
                 "additionalProperties": false,

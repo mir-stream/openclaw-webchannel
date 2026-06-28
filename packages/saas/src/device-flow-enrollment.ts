@@ -30,6 +30,7 @@ import type {
   DeviceFlowError,
 } from "./device-flow-types.js";
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
+import { assertValidSubjectToken } from "./subject-token.js";
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -228,6 +229,12 @@ export class DeviceFlowEnrollment {
    * The plugin polls /poll until the operator approves the enrollment.
    */
   async enroll(request: EnrollmentRequest): Promise<EnrollmentResponse> {
+    // Reject tenant/agentId tokens that would break the NATS subject hierarchy
+    // or cross tenant boundaries before they are persisted or used in a grant.
+    assertValidSubjectToken(request.tenant, "tenant");
+    if (request.agentId !== undefined) {
+      assertValidSubjectToken(request.agentId, "agentId");
+    }
     const device_code = await this.generateDeviceCode();
     const user_code = this.generateUserCode();
     const now = Date.now();
@@ -404,6 +411,9 @@ export class DeviceFlowEnrollment {
   private async generateNatsUserCredentials(
     enrollment: PendingEnrollment,
   ): Promise<NatsUserCredentials> {
+    // Defense-in-depth: re-validate the tenant immediately before building the
+    // `webchannel.{tenant}.>` grant (enroll() also validates at ingress).
+    assertValidSubjectToken(enrollment.tenant, "tenant");
     // Mint a real NATS user JWT, signed by the account NKEY, so a real
     // nats-server accepts the connection and enforces the subject permissions.
     const accountSigner = fromSeed(

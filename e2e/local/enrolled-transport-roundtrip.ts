@@ -33,6 +33,7 @@ import {
   sealMessage,
   openMessage,
 } from "../../packages/client/src/e2e-crypto-browser.js";
+import { generateDevicePopKeyPair, registerWithPop } from "../../packages/client/src/pop-register.js";
 
 const NATS_WS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18422";
 const GW_URL = process.env.WEBCHANNEL_GW_URL ?? "http://127.0.0.1:18999";
@@ -69,30 +70,40 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
 // 1. Device X25519 key → cnf.jwk in the bootstrap JWT AND the handshake key.
 const deviceKp = await generateX25519KeyPair();
 
-// 2. Mint a bootstrap JWT from THIS issuer's trust chain (no pop_jwk → the
-//    register hop verifies the JWT and registers the peer without a PoP step).
+// 1b. Device Ed25519 PoP key → pop_jwk. The gateway now requires PoP by default
+//     (auth.requirePoP defaults true), so the bootstrap JWT MUST carry pop_jwk and
+//     the register hop MUST present a signed-nonce proof. Mirrors how
+//     jwt-register-roundtrip.ts / runAllReal drive the production PoP path.
+const popKeyPair = await generateDevicePopKeyPair();
+
+// 2. Mint a bootstrap JWT from THIS issuer's trust chain, INCLUDING pop_jwk.
 const boot = await postJson(`${ISSUER}/test/bootstrap-jwt`, {
   tenant: TENANT,
   agentId: AGENT_ID,
   peerId: PEER_ID,
   deviceX25519PublicKey: deviceKp.publicKeyB64url,
+  devicePopPublicKey: popKeyPair.publicJwk.x,
 });
 if (boot.status !== 200 || !boot.json?.jwt) {
   fail(2, `bootstrap-jwt mint failed: HTTP ${boot.status} ${boot.text}`);
 }
 const bootstrapJwt: string = boot.json.jwt;
-console.log(`[driver] minted bootstrap JWT (kid=${boot.json.kid}) for peerId=${PEER_ID}`);
+console.log(`[driver] minted bootstrap JWT (kid=${boot.json.kid}, pop_jwk) for peerId=${PEER_ID}`);
 
-// 3. Drive the REAL HTTP register hop so the agent subscribes to this peer.
-const reg = await postJson(
-  `${GW_URL}/webchannel/nats/register`,
-  {},
-  { Authorization: `Bearer ${bootstrapJwt}` },
-);
-if (reg.status !== 200 || reg.json?.registered !== true) {
-  fail(2, `register hop failed: HTTP ${reg.status} ${reg.text}`);
+// 3. Drive the REAL HTTP register hop with PoP (challenge → sign nonce → register)
+//    so the agent subscribes to this peer. Uses the same production producer-side
+//    helper the browser client uses; a bad/missing proof would 401.
+try {
+  await registerWithPop({
+    registerBaseUrl: GW_URL,
+    jwt: bootstrapJwt,
+    peerId: PEER_ID,
+    devicePrivateKey: popKeyPair.privateKey,
+  });
+} catch (err) {
+  fail(2, `register hop (PoP) failed: ${(err as Error).message}`);
 }
-console.log(`[driver] register hop OK → agent subscribed to ${PEER_ID}`);
+console.log(`[driver] PoP register hop OK → agent subscribed to ${PEER_ID}`);
 
 // 4. Fetch this driver's NATS user creds (browser role) from the issuer.
 const cred = await postJson(`${ISSUER}/test/nats-user`, { tenant: TENANT, role: "browser" });

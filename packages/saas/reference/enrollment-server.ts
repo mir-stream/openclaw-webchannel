@@ -32,6 +32,7 @@ import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../src/device-flow-
 import { setupTrustChain } from "../src/setup-trust-chain.js";
 import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
 import { mintNatsUserCreds, type NatsUserRole } from "../src/nats-user-creds.js";
+import { assertValidSubjectToken } from "../src/subject-token.js";
 import type { EnrollmentRequest, PollRequest } from "../src/device-flow-types.js";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -401,6 +402,18 @@ const server = createServer(async (req, res) => {
         // Validate request
         if (!enrollRequest.agentPublicKey || !enrollRequest.tenant) {
           sendJson(res, { error: "Missing required fields: agentPublicKey, tenant" }, 400);
+          return;
+        }
+
+        // Reject tenant/agentId that would break the NATS subject hierarchy or
+        // cross tenant boundaries (subject-injection guard) — 400, not 500.
+        try {
+          assertValidSubjectToken(enrollRequest.tenant, "tenant");
+          if (enrollRequest.agentId !== undefined) {
+            assertValidSubjectToken(enrollRequest.agentId, "agentId");
+          }
+        } catch (err) {
+          sendJson(res, { error: (err as Error).message }, 400);
           return;
         }
 

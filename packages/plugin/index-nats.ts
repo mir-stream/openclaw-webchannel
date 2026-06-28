@@ -25,6 +25,9 @@ import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier, verifyJwtAndExtractPeerId, verifyJwtAndExtractIdentity, type ConnectionVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
 import { PopChallengeStore } from "./src/pop-challenge.js";
+import { resolveRequirePoP, popRequirementUnmet } from "./src/register-pop-gate.js";
+import { resolveAllowOrigin } from "./src/register-cors.js";
+import { assertValidSubjectToken } from "./src/subject-token.js";
 import { shouldSubscribeWildcard } from "./src/wildcard-gate.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { WEBCHANNEL_ID } from "./src/transport.js";
@@ -77,9 +80,11 @@ async function readJsonBody(req: { on(ev: string, cb: (chunk?: Buffer) => void):
  * the request `Origin` (falling back to `*`) and allow the `Authorization` +
  * `Content-Type` headers the PoP flow uses.
  *
- * FOLLOW-UP (production hardening, tracked separately): restrict
- * Access-Control-Allow-Origin to the configured SaaS origins instead of
- * reflecting any origin. Do NOT build a config schema for that here.
+ * HARDENING (Item 3): when `auth.cors.allowedOrigins` is configured and non-empty,
+ * the allow-origin header is set ONLY for an in-list Origin (out-of-list / missing
+ * Origin ⇒ no header ⇒ the browser blocks the response). When unset/empty the
+ * behavior is the original permissive one (reflect Origin / `*`) — zero regression.
+ * The allowlist decision lives in `resolveAllowOrigin` (see register-cors.ts).
  *
  * NOTE: `/webchannel/nats/unregister` intentionally does NOT call this — no
  * browser path hits it over HTTP today (production teardown `disconnect()` is
@@ -89,11 +94,27 @@ async function readJsonBody(req: { on(ev: string, cb: (chunk?: Buffer) => void):
 function setRegisterCors(
   req: import("node:http").IncomingMessage,
   res: import("node:http").ServerResponse,
+  allowedOrigins?: string[],
 ): void {
   const origin = req.headers["origin"];
-  res.setHeader("Access-Control-Allow-Origin", typeof origin === "string" && origin ? origin : "*");
+  const allow = resolveAllowOrigin(typeof origin === "string" ? origin : undefined, allowedOrigins);
+  // Omit Access-Control-Allow-Origin entirely when the allowlist excludes the
+  // Origin — setting it to a wrong value would still let the browser through.
+  if (allow !== null) {
+    res.setHeader("Access-Control-Allow-Origin", allow);
+  }
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+}
+
+/**
+ * Read the optional CORS allowlist defensively off the live auth config. The
+ * schema places `cors` at the `auth` level (any strategy), so this reads it via
+ * a cast without assuming a strategy; the register hop only runs under `jwt` in
+ * practice. Absent/undefined ⇒ permissive default.
+ */
+function corsAllowedOrigins(auth: AuthConfig | undefined): string[] | undefined {
+  return (auth as { cors?: { allowedOrigins?: string[] } } | undefined)?.cors?.allowedOrigins;
 }
 
 /**
@@ -173,9 +194,10 @@ export default defineChannelPluginEntry({
       auth: "plugin",
       match: "exact",
       handler: asRoute(async (req, res) => {
-        // CORS: reflect origin on every response path; answer the browser's
-        // preflight (sent because of the Authorization header) without a JWT.
-        setRegisterCors(req, res);
+        // CORS: reflect origin (or honor the configured allowlist) on every
+        // response path; answer the browser's preflight (sent because of the
+        // Authorization header) without a JWT.
+        setRegisterCors(req, res, corsAllowedOrigins(live.auth));
         if (req.method === "OPTIONS") {
           res.statusCode = 204;
           res.end();
@@ -214,9 +236,10 @@ export default defineChannelPluginEntry({
       auth: "plugin",
       match: "exact",
       handler: asRoute(async (req, res) => {
-        // CORS: reflect origin on every response path (including 401/500/503);
-        // answer the browser's preflight without requiring a JWT/body.
-        setRegisterCors(req, res);
+        // CORS: reflect origin (or honor the configured allowlist) on every
+        // response path (including 401/500/503); answer the browser's preflight
+        // without requiring a JWT/body.
+        setRegisterCors(req, res, corsAllowedOrigins(live.auth));
         if (req.method === "OPTIONS") {
           res.statusCode = 204;
           res.end();
@@ -256,6 +279,32 @@ export default defineChannelPluginEntry({
             return;
           }
           const peerId = identity.peerId;
+
+          // Defense-in-depth (Item 2): peerId comes from the verified JWT `sub`,
+          // but a loose/compromised issuer could place a `.`/`*`/`>` there and
+          // widen the agent's subscriptions. Reject it BEFORE any subject use.
+          try {
+            assertValidSubjectToken(peerId, "peerId");
+          } catch (err) {
+            api.logger.error?.(`webchannel: ${(err as Error).message}`);
+            res.statusCode = 400;
+            res.end("Invalid peerId");
+            return;
+          }
+
+          // Proof-of-Possession gate (Item 1, secure-by-default): PoP is REQUIRED
+          // unless an operator explicitly sets auth.requirePoP=false. A verified
+          // bootstrap JWT minted WITHOUT `pop_jwk` is otherwise freely replayable,
+          // so with the default (true) we reject it here BEFORE registering.
+          const requirePoP = resolveRequirePoP(live.auth as { requirePoP?: boolean } | undefined);
+          if (popRequirementUnmet(requirePoP, Boolean(identity.popPublicJwk))) {
+            api.logger.error?.(
+              `webchannel: register rejected for ${peerId} — proof-of-possession required (JWT has no pop_jwk)`,
+            );
+            res.statusCode = 401;
+            res.end("Proof-of-possession required");
+            return;
+          }
 
           // Proof-of-Possession (gap ①): when the bootstrap JWT carries an
           // Ed25519 `pop_jwk`, the caller MUST prove possession of the device

@@ -144,6 +144,23 @@ export type JwtAuthConfig = {
   };
   /** Query param the JWT arrives in. Default `"ticket"`. */
   ticketParam?: string;
+  /**
+   * Require Proof-of-Possession at the NATS register route. Secure-by-default:
+   * when unset the plugin behaves as `true`, so a verified bootstrap JWT that
+   * carries no `pop_jwk` is REJECTED (401) before any peer is registered. Set
+   * to `false` to restore the legacy optional-PoP behavior (dev only).
+   */
+  requirePoP?: boolean;
+  /** Optional CORS hardening for the browser-driven register hop. */
+  cors?: {
+    /**
+     * Allowlist of browser Origins permitted on the register routes. When
+     * unset/empty the register hop reflects the request Origin (permissive,
+     * unchanged). When non-empty, only an in-list Origin receives an
+     * `Access-Control-Allow-Origin` header.
+     */
+    allowedOrigins?: string[];
+  };
 };
 
 export type AuthConfig = AnonymousAuthConfig | HmacTicketAuthConfig | JwtAuthConfig;

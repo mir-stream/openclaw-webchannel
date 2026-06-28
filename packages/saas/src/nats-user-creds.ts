@@ -19,6 +19,8 @@
 import { createUser, fromSeed } from "@nats-io/nkeys";
 import { encodeUser } from "@nats-io/jwt";
 
+import { assertValidSubjectToken } from "./subject-token.js";
+
 /** Logical role of the minted peer — informational only (perms are identical). */
 export type NatsUserRole = "browser" | "agent";
 
@@ -57,6 +59,9 @@ export async function mintNatsUserCreds(
   opts: MintNatsUserCredsOptions,
 ): Promise<MintedNatsUserCreds> {
   const role = opts.role ?? "browser";
+  // Reject any tenant that would break the subject hierarchy before it is
+  // spliced into the `webchannel.{tenant}.>` permission grant.
+  assertValidSubjectToken(opts.tenant, "tenant");
   const accountSigner = fromSeed(new TextEncoder().encode(opts.accountSeed));
   const userKp = createUser();
   const userSeed = new TextDecoder().decode(userKp.getSeed());
