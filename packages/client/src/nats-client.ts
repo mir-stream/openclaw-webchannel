@@ -38,8 +38,16 @@ import { registerWithPop } from "./pop-register.js";
 export type NatsClientOptions = {
   /** NATS WebSocket URL */
   url: string;
-  /** Bootstrap JWT (RS256-signed, contains cnf.jwk claim) */
-  jwt: string;
+  /**
+   * Bootstrap JWT (RS256-signed, contains cnf.jwk claim).
+   *
+   * Optional: only the SaaS register-hop path needs it (it is the credential the
+   * `registration` PoP round-trip presents, and the value CONNECT sends when no
+   * NATS-layer `natsCredentials` are supplied). When connecting to a bring-your-
+   * own-NATS with `natsCredentials` and NO `registration`, the bootstrap JWT is
+   * unused — omit it. REQUIRED whenever `registration` is present.
+   */
+  jwt?: string;
   /** Agent ID (from JWT) */
   agentId: string;
   /** Tenant ID (from JWT) */
@@ -270,15 +278,18 @@ export class NatsClient {
   private sendConnect(): void {
     if (!this.ws) return;
 
-    const connectPayload = {
+    const connectPayload: Record<string, unknown> = {
       verbose: false,
       pedantic: false,
       lang: "typescript",
       version: "1.0.0",
       protocol: 1,
       echo: false,
-      jwt: this.options.jwt,
     };
+    // Include the bootstrap JWT only when present. When set, the wire output is
+    // byte-for-byte the original; when absent (BYO-NATS via natsCredentials, which
+    // takes the deferred-CONNECT path instead) the field is simply omitted.
+    if (this.options.jwt) connectPayload["jwt"] = this.options.jwt;
 
     this.ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
     this.ws.send("PING\r\n");
@@ -606,6 +617,16 @@ export class WebChannelNatsClient {
     // to onError and re-initialize with fresh credentials (a new bootstrap JWT).
     const { registration } = this.options;
     if (registration) {
+      // The register hop presents the bootstrap JWT; it is REQUIRED here even
+      // though the type makes `jwt` optional (it is unused on the BYO-NATS path).
+      if (!this.options.jwt) {
+        const err = new Error(
+          "[nats-client] registration requires a bootstrap `jwt` (none provided)",
+        );
+        this.notifyErrorListeners(err);
+        this.client.disconnect();
+        return;
+      }
       try {
         await registerWithPop({
           registerBaseUrl: registration.registerBaseUrl,

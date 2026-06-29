@@ -43,7 +43,6 @@ auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See 
   production. Its dev demo lives in `e2e/local/live-chat*.{mjs,html}` +
   `packages/client/src/browser-live-entry.ts`.
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
-- Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
 ## Enrollment & credentials (NATS mode)
 
@@ -105,6 +104,77 @@ The agent admits **only SaaS-attested device keys** and detects relay MITM at ha
 attacker skips bootstrap → no admission without a SaaS-attested key; forged `cnf` → JWT signature
 verification fails; timing oracle → constant-time compare. **Out of scope:** SaaS key compromise
 / revocation (deferred to re-enrollment); real-time allowlist authz is a core-delegated stub.
+
+## Bring-your-own NATS (e.g. Synadia Cloud / NGS)
+
+The agent's NATS connection is decoupled from the SaaS issuer along **two orthogonal
+axes**, so you can point the plugin at **any** NATS with just a URL + static user
+credentials — **no SaaS issuer required**.
+
+- **Axis A — credential source** (`src/nats-credential-source.ts`): how the *agent*
+  authenticates to NATS. One of `open` (dev, no auth), `static` (BYO-NATS — url +
+  user JWT + NKEY seed, or a `.creds` file, given directly), or `enrolled` (the SaaS
+  device-flow, still the default). The plugin is *given* static creds; it never mints
+  them (no import from `packages/saas`).
+- **Axis B — peer admission** (`src/nats-admission.ts`): which browser peers the agent
+  serves. `register-hop` (SaaS bootstrap JWT + PoP) or `auto` (subscribe the
+  tenant/agent wildcard; serve any peer that completes the X25519 handshake **and**
+  passes the `dmSecurity` allowlist). Static creds default to `auto`. Security here
+  rests on **NATS subject permissions + the allowlist + E2E encryption** — not on an
+  issuer. E2E encryption stays fail-closed regardless of source.
+
+### Agent (static creds, no issuer)
+
+```jsonc
+// channels.webchannel
+{
+  "auth": { "strategy": "hmac-ticket", "ticketSecret": { "env": "WC_TICKET_SECRET" } },
+  "nats": {
+    "url": "wss://connect.ngs.global",
+    "credentials": {
+      "mode": "static",
+      // Prefer env/file over inlining secrets:
+      "userJwt":  { "env": "WEBCHANNEL_NATS_USER_JWT" },
+      "userSeed": { "env": "WEBCHANNEL_NATS_USER_SEED" }
+      // …or point at a standard NATS .creds file instead:
+      // "credsFile": "/etc/openclaw/synadia.creds"
+    }
+    // admission defaults to "auto" for static creds; override with
+    // "admission": "register-hop" if you run the SaaS JWT bootstrap.
+  }
+}
+```
+
+Env overrides (take precedence over config) — secrets need not live in committed config:
+
+| Env var | Meaning |
+|---------|---------|
+| `WEBCHANNEL_NATS_URL` | NATS WebSocket URL |
+| `WEBCHANNEL_NATS_USER_JWT` | static user JWT |
+| `WEBCHANNEL_NATS_USER_SEED` | static user NKEY seed (`SU…`) |
+| `WEBCHANNEL_NATS_CREDS` | path to a NATS `.creds` file (JWT + seed) |
+| `WEBCHANNEL_NATS_DEV_OPEN=1` | dev open-NATS (no auth) |
+| `WEBCHANNEL_SAAS_BASE_URL` | enrolled-mode SaaS base URL |
+
+### Browser (natsCredentials, no registration)
+
+```ts
+new WebChannelNatsClient({
+  url: "wss://connect.ngs.global",
+  agentId, tenant, peerId,
+  // No bootstrap `jwt` and no `registration` — the bootstrap JWT is now optional
+  // and only needed for the SaaS register-hop path.
+  natsCredentials: {
+    userJwt,       // browser-scoped NATS user JWT
+    userSeedRaw,   // base64url of the raw 32-byte Ed25519 seed
+  },
+});
+```
+
+> **Synadia permissions:** the static user must have **pub + sub** permission on the
+> `webchannel.<tenant>.<agent>.*` subjects (the agent subscribes to `…*.in` /
+> `…*.handshake` and publishes `…*.out`; the browser is the mirror). Without the
+> wildcard sub permission the agent's `auto` admission cannot receive peers.
 
 ## NATS subject namespace
 

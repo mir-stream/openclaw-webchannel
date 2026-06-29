@@ -28,12 +28,19 @@ import { PopChallengeStore } from "./src/pop-challenge.js";
 import { resolveRequirePoP, popRequirementUnmet } from "./src/register-pop-gate.js";
 import { resolveAllowOrigin } from "./src/register-cors.js";
 import { assertValidSubjectToken } from "./src/subject-token.js";
-import { shouldSubscribeWildcard } from "./src/wildcard-gate.js";
+import { resolveAdmissionMode } from "./src/nats-admission.js";
+import { isDmPostureOpen } from "./src/dm-allowlist.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { WEBCHANNEL_ID } from "./src/transport.js";
 import type { WebChannelTransport } from "./src/transport.js";
-import { NatsTransport } from "./src/nats-transport.js";
-import { createEnrolledNatsConnection, type EnrolledNatsConnection } from "./src/enrolled-nats-connection.js";
+import type { NatsTransport } from "./src/nats-transport.js";
+import type { EnrolledNatsConnection } from "./src/enrolled-nats-connection.js";
+import {
+  resolveNatsCredentialSource,
+  connectNatsCredentialSource,
+  type NatsCredentialSource,
+  type WebchannelNatsConfig,
+} from "./src/nats-credential-source.js";
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -430,69 +437,60 @@ export default defineChannelPluginEntry({
     }
 
     // -----------------------------------------------------------------------
-    // Step 1: Connect to NATS — enrolled by default; dev/open-NATS when configured
+    // Step 1: Resolve the credential SOURCE (Axis A), then connect.
     // -----------------------------------------------------------------------
 
-    // `channels.webchannel.nats.devOpen: true` (or WEBCHANNEL_NATS_DEV_OPEN=1)
-    // connects to a plain local nats-server with NO enrollment / NO JWT, for
-    // LOCAL integration testing only. Production keeps the enrolled-creds path.
-    const natsCfg = (
-      api.config.nats as { url?: string; devOpen?: boolean } | undefined
-    );
-    const wcNatsCfg = (webchannelCfg as { nats?: { devOpen?: boolean; url?: string } } | undefined)?.nats;
-    const devOpenNats =
-      natsCfg?.devOpen === true ||
-      wcNatsCfg?.devOpen === true ||
-      process.env["WEBCHANNEL_NATS_DEV_OPEN"] === "1";
+    // Axis A (`nats-credential-source.ts`) decouples HOW the agent authenticates
+    // to NATS from the connection itself. The legacy two intertwined branches
+    // (devOpen vs. enrolled device-flow) are now ONE resolver + connector, with a
+    // co-equal `static` source for bring-your-own-NATS (Synadia/NGS): url + user
+    // JWT + NKEY seed (or a `.creds` file), GIVEN directly — no SaaS issuer. Env
+    // overrides config: WEBCHANNEL_NATS_URL / _USER_JWT / _USER_SEED / _CREDS /
+    // _DEV_OPEN / WEBCHANNEL_SAAS_BASE_URL.
+    const wcNatsCfg = (webchannelCfg as { nats?: WebchannelNatsConfig } | undefined)?.nats;
+    const legacyNats = api.config.nats as { url?: string; devOpen?: boolean } | undefined;
+
+    // Tracks the resolved credential source mode so the admission decision
+    // (Axis B, Step 3) is made explicitly rather than inferred from devOpen.
+    let credentialMode: NatsCredentialSource["mode"] = "enrolled";
 
     if (!natsTransport) {
-      const natsUrl =
-        process.env["WEBCHANNEL_NATS_URL"] ?? wcNatsCfg?.url ?? natsCfg?.url ?? "ws://127.0.0.1:4222";
       channelTenant = process.env["WEBCHANNEL_TENANT"] ?? api.config.tenant ?? "default-tenant";
       channelAgentId = process.env["WEBCHANNEL_AGENT_ID"] ?? api.config.agentId ?? "default-agent";
 
-      if (devOpenNats) {
-        console.log(`[webchannel] DEV open-NATS mode → ${natsUrl} (no enrollment, no JWT)`);
-        const transport = new NatsTransport({
-          url: natsUrl,
-          clientName: "openclaw-webchannel-agent-dev",
+      try {
+        const source = resolveNatsCredentialSource({
+          natsConfig: wcNatsCfg,
+          legacyNats,
+          // Pass the top-level config value RAW; the resolver owns the full
+          // saasBaseUrl precedence (env > nats.credentials.saasBaseUrl > this > default).
+          saasBaseUrl: api.config.saas?.baseUrl,
+          tenant: channelTenant,
+          agentId: channelAgentId,
         });
-        await transport.connect();
-        natsTransport = transport;
-      } else {
-        console.log("[webchannel] Starting NATS enrollment and connection...");
-        // `WEBCHANNEL_SAAS_BASE_URL` env override mirrors the other WEBCHANNEL_*
-        // envs (NATS_URL/TENANT/AGENT_ID); useful where the host config schema
-        // does not carry a top-level `saas` block.
-        const saasBaseUrl =
-          process.env["WEBCHANNEL_SAAS_BASE_URL"] ?? api.config.saas?.baseUrl ?? "http://localhost:3001";
-        try {
-          natsConnection = await createEnrolledNatsConnection({
-            saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
-            saasPollUrl: `${saasBaseUrl}/api/poll`,
-            natsUrl,
-            tenant: channelTenant,
-            agentId: channelAgentId,
-            displayInstructions: true,
-          });
-          natsTransport = natsConnection.transport;
-        } catch (err) {
-          // Non-fatal: a failed NATS connection disables the webchannel for THIS
-          // process instead of crashing it. This matters because openclaw loads
-          // this channel entry in EVERY context — not just the serving gateway,
-          // but also local `openclaw chat`/TUI/CLI runs, which have no
-          // WEBCHANNEL_* env and so fall back to a URL with no usable NATS. Before
-          // this guard, the throw propagated out of registerFull as an unhandled
-          // rejection and took the whole process down (TUI wouldn't even start).
-          // The serving gateway stays up too (other channels keep working); the
-          // register routes reply 503 until a connection is established. The
-          // encryption fail-closed guard (Step 0) is separate and still throws.
-          const msg = err instanceof Error ? err.message : String(err);
-          (api.logger?.warn ?? api.logger?.error ?? console.warn)?.(
-            `[webchannel] NATS connection failed — channel inactive for this process (${msg})`,
-          );
-          return;
-        }
+        credentialMode = source.mode;
+        console.log(`[webchannel] NATS credential source: ${source.mode} → ${source.url}`);
+
+        const connected = await connectNatsCredentialSource(source);
+        natsTransport = connected.transport;
+        if (connected.enrolled) natsConnection = connected.enrolled;
+      } catch (err) {
+        // Non-fatal (graceful degradation): a failed resolve/connect disables the
+        // webchannel for THIS process instead of crashing it — applied uniformly
+        // to ALL credential sources (open / static / enrolled). This matters
+        // because openclaw loads this channel entry in EVERY context — not just
+        // the serving gateway, but also local `openclaw chat`/TUI/CLI runs, which
+        // have no WEBCHANNEL_* env and so fall back to a URL with no usable NATS.
+        // Without this guard the throw propagates out of registerFull as an
+        // unhandled rejection and takes the whole process down (TUI wouldn't even
+        // start). The serving gateway stays up too (other channels keep working);
+        // the register routes reply 503 until a connection is established. The
+        // encryption fail-closed guard (Step 0) is separate and still throws.
+        const msg = err instanceof Error ? err.message : String(err);
+        (api.logger?.warn ?? api.logger?.error ?? console.warn)?.(
+          `[webchannel] NATS connection failed — channel inactive for this process (${msg})`,
+        );
+        return;
       }
       console.log("[webchannel] ✓ Connected to NATS");
     }
@@ -540,26 +538,43 @@ export default defineChannelPluginEntry({
       dispatchInbound(peerId, message);
     });
 
-    // Dev/open-NATS convenience: the wildcard subscription is PURELY the
-    // hmac-ticket dev shortcut — the local harness browser connects with an
-    // hmac-ticket and does NOT call the HTTP register hop, so we subscribe to the
-    // tenant/agent wildcard and let peers auto-register on their handshake (the
-    // allowlist gate still runs).
-    //
-    // When `auth.strategy === "jwt"`, the HTTP `/webchannel/nats/register` route
-    // (registered in Step A) is the REAL admission path even under open-NATS —
-    // the enrolled/JWT producer is expected to drive challenge → PoP-signed
-    // register so the agent calls `registerPeer` for that peer. If we left the
-    // wildcard ON in that scenario the agent would already be subscribed to every
-    // peer, so a successful round-trip would prove nothing about the register
-    // hop. We therefore turn the wildcard OFF whenever the strategy is jwt.
-    //
-    // This does NOT change production behavior: enrolled production runs with
-    // devOpenNats=false, so the wildcard is already off there. It only tightens
-    // the devOpen+jwt test scenario so the HTTP hop is the sole admission path.
+    // Axis B — PEER ADMISSION (`nats-admission.ts`), decided EXPLICITLY and
+    // independently of the credential source:
+    //   - `register-hop`: a peer must complete the SaaS JWT + PoP round-trip at
+    //     `/webchannel/nats/register*` before the agent subscribes to it. The
+    //     production default for `auth.strategy === "jwt"`.
+    //   - `auto`: the agent subscribes to the tenant/agent wildcard and serves any
+    //     peer that completes the X25519 handshake AND passes the dmSecurity
+    //     allowlist (security = subject permissions + allowlist + E2E encryption).
+    //     This is now available for a real external NATS with `static` creds — NOT
+    //     just devOpen — which the legacy devOpen-gated wildcard could never do.
+    // An explicit `nats.admission` override wins. Existing flows are unchanged:
+    // enrolled+jwt → register-hop; devOpen+jwt → register-hop; devOpen+hmac → auto.
     const authStrategy = (webchannelCfg?.auth as { strategy?: string } | undefined)?.strategy;
-    if (shouldSubscribeWildcard(devOpenNats, authStrategy)) {
+    // Derive Axis B's capability from Axis A WITHOUT leaking credential-mode names
+    // into the admission module: an issuer-backed register hop is viable for every
+    // source EXCEPT bring-your-own static creds (which has no issuer to run).
+    const registerHopAvailable = credentialMode !== "static";
+    const admission = resolveAdmissionMode({
+      authStrategy,
+      registerHopAvailable,
+      explicitOverride: wcNatsCfg?.admission,
+    });
+    if (admission === "auto") {
       channel.subscribeWildcard();
+    }
+
+    // SAFETY: surface the open admission posture exactly once at startup. When
+    // admission is `auto` AND no dmSecurity allowlist gates senders (notably the
+    // static + auto BYO-NATS case), the agent serves ANY peer that can reach the
+    // subjects and complete the handshake — the boundary is then purely NATS
+    // subject permissions. Do NOT warn for register-hop or when an allowlist is set.
+    const dmSecurity = (webchannelCfg as { dmSecurity?: string } | undefined)?.dmSecurity;
+    if (admission === "auto" && isDmPostureOpen(dmSecurity)) {
+      api.logger.warn?.(
+        "webchannel: admission=auto with no dmSecurity allowlist — any peer with NATS " +
+          "access + a valid handshake is served; rely on NATS subject permissions as the boundary.",
+      );
     }
 
     // -----------------------------------------------------------------------

@@ -9,7 +9,7 @@
 // and auth.jwt.jwksUrl pointing AT the bootstrap-server's live JWKS endpoint. So
 // the plugin's verifyJwt resolves the signing key (by header kid) over HTTP from
 // the real issuer and admits the token. With auth.strategy="jwt" the wildcard is
-// gated OFF (see index-nats.ts / wildcard-gate.ts), so the agent subscribes to NO
+// gated OFF (see index-nats.ts / nats-admission.ts), so the agent subscribes to NO
 // peer subjects until channel.registerPeer(peerId) runs — and the only thing that
 // does so is the live HTTP POST /webchannel/nats/register route, driven by the
 // production client's `registration` (PoP) path. Therefore a successful encrypted
