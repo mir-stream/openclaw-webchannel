@@ -16,7 +16,11 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { setupTrustChain, type SetupTrustChainOptions } from "./setup-trust-chain.js";
-import type { SetupTrustChainResult } from "./types.js";
+import type {
+  SetupTrustChainResult,
+  NatsSelfContainedAccountConfig,
+  ExternalNatsAccount,
+} from "./types.js";
 
 /**
  * Load a persisted trust chain from `path`, or create + persist a new one.
@@ -28,23 +32,50 @@ import type { SetupTrustChainResult } from "./types.js";
  * restarts — the invariant a launchd-managed issuer (and the live gateway that
  * depends on it) requires.
  */
+// Overloads mirror setupTrustChain: a self-contained caller (no external
+// account) keeps the concrete operator/account/resolver fields.
+export function loadOrCreateTrustChain(
+  path: string,
+  options?: SetupTrustChainOptions & { externalNatsAccount?: undefined },
+): Promise<SetupTrustChainResult & { natsConfig: NatsSelfContainedAccountConfig }>;
+export function loadOrCreateTrustChain(
+  path: string,
+  options: SetupTrustChainOptions & { externalNatsAccount: ExternalNatsAccount },
+): Promise<SetupTrustChainResult>;
+export function loadOrCreateTrustChain(
+  path: string,
+  options: SetupTrustChainOptions,
+): Promise<SetupTrustChainResult>;
 export async function loadOrCreateTrustChain(
   path: string,
   options: SetupTrustChainOptions = {},
 ): Promise<SetupTrustChainResult> {
+  // External mode: the SaaS does not own the account; the signing seed is a
+  // secret provided via env/config. We NEVER persist that seed — the file holds
+  // only the RSA key + JWKS + account id, and the seed is re-overlaid from the
+  // env-provided material on every load/create.
+  const external = options.externalNatsAccount;
+
   if (existsSync(path)) {
     const parsed = JSON.parse(readFileSync(path, "utf-8")) as SetupTrustChainResult;
-    // Minimal shape guard: a truncated/legacy file must fail loudly, not silently
-    // yield an issuer that mints creds no nats-server will accept.
-    if (
-      !parsed?.private?.rsaPrivateKeyPem ||
-      !parsed?.private?.natsAccountSeed ||
-      !parsed?.natsConfig?.operatorJwt ||
-      !parsed?.natsConfig?.accountJwt ||
-      !parsed?.natsConfig?.resolverConfig ||
-      !parsed?.kid
-    ) {
-      throw new Error(`persisted trust chain at ${path} is missing required fields`);
+    // Legacy files predate the `mode` discriminator — treat them as self-contained.
+    if (parsed?.natsConfig && parsed.natsConfig.mode === undefined) {
+      (parsed.natsConfig as { mode?: string }).mode = "self-contained";
+    }
+    assertPersistedShape(parsed, path);
+    if (parsed.natsConfig.mode === "external" && !external) {
+      // The signing seed is never written to disk, so an external file is
+      // unusable without the env-provided secret. Fail fast and clearly here
+      // rather than minting later with an empty seed (cryptic nkeys error).
+      throw new Error(
+        `external trust chain at ${path} requires the signing seed ` +
+          `(NATS_ACCOUNT_SIGNING_SEED) — refusing to load without it`,
+      );
+    }
+    if (external) {
+      // Re-inject the env secret + account id (stripped before persistence).
+      parsed.private.natsAccountSeed = external.signingSeed;
+      parsed.natsConfig = { mode: "external", accountPublicKey: external.accountId };
     }
     return parsed;
   }
@@ -52,6 +83,37 @@ export async function loadOrCreateTrustChain(
   const chain = await setupTrustChain(options);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(path, JSON.stringify(chain, null, 2), { mode: 0o600 });
+  // In external mode, strip the signing seed before writing it to disk. The
+  // in-memory `chain` we return keeps it.
+  const toPersist: SetupTrustChainResult = external
+    ? { ...chain, private: { ...chain.private, natsAccountSeed: "" } }
+    : chain;
+  writeFileSync(path, JSON.stringify(toPersist, null, 2), { mode: 0o600 });
   return chain;
+}
+
+/**
+ * Fail loudly on a truncated/legacy file rather than silently yielding an issuer
+ * that mints creds no nats-server will accept. External-mode files legitimately
+ * lack the operator/account/resolver fields and the persisted account seed.
+ */
+function assertPersistedShape(parsed: SetupTrustChainResult, path: string): void {
+  const baseOk = parsed?.private?.rsaPrivateKeyPem && parsed?.kid && parsed?.natsConfig;
+  if (!baseOk) {
+    throw new Error(`persisted trust chain at ${path} is missing required fields`);
+  }
+  if (parsed.natsConfig.mode === "external") {
+    if (!parsed.natsConfig.accountPublicKey) {
+      throw new Error(`persisted external trust chain at ${path} is missing accountPublicKey`);
+    }
+    return;
+  }
+  if (
+    !parsed.private.natsAccountSeed ||
+    !parsed.natsConfig.operatorJwt ||
+    !parsed.natsConfig.accountJwt ||
+    !parsed.natsConfig.resolverConfig
+  ) {
+    throw new Error(`persisted trust chain at ${path} is missing required fields`);
+  }
 }

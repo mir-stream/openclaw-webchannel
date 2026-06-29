@@ -26,16 +26,19 @@
  *   - RFC 7518 (JWK RSA)
  */
 
-import { createOperator, createAccount } from "@nats-io/nkeys";
+import { createOperator, createAccount, fromSeed, fromPublic } from "@nats-io/nkeys";
 import { encodeOperator, encodeAccount } from "@nats-io/jwt";
 
 import type {
   SetupTrustChainResult,
   SaasTrustChainPrivate,
   NatsAccountConfig,
+  NatsSelfContainedAccountConfig,
+  NatsExternalAccountConfig,
   NatsResolverConfig,
   JwksDocument,
   JwkRsaPublicKey,
+  ExternalNatsAccount,
 } from "./types.js";
 
 /**
@@ -62,6 +65,21 @@ export type SetupTrustChainOptions = {
    * Key ID for the RSA keypair. Generated as UUID if omitted.
    */
   kid?: string;
+
+  /**
+   * Externally-managed NATS account (e.g. Synadia Cloud / NGS).
+   *
+   * When provided, setupTrustChain does NOT generate its own operator/account
+   * and does NOT emit operator/account JWTs or resolver config (Synadia hosts
+   * the nats-server). Instead it uses the supplied signing seed + account id as
+   * the NATS account material and mints user JWTs on the account's behalf. The
+   * RSA keypair + JWKS for bootstrap-JWT signing are generated exactly as in the
+   * default mode. Omit for the default self-contained behavior.
+   *
+   * `signingSeed` is a SECRET (read from env/config) — never logged, never
+   * written to any output file.
+   */
+  externalNatsAccount?: ExternalNatsAccount;
 };
 
 // ---------------------------------------------------------------------------
@@ -390,6 +408,17 @@ async function signRs256Jwt(
  *
  * @throws if crypto operations fail
  */
+// Overloads narrow the result by mode so existing self-contained callers keep
+// the concrete operator/account/resolver fields without manual narrowing.
+export function setupTrustChain(
+  options?: SetupTrustChainOptions & { externalNatsAccount?: undefined },
+): Promise<SetupTrustChainResult & { natsConfig: NatsSelfContainedAccountConfig }>;
+export function setupTrustChain(
+  options: SetupTrustChainOptions & { externalNatsAccount: ExternalNatsAccount },
+): Promise<SetupTrustChainResult & { natsConfig: NatsExternalAccountConfig }>;
+export function setupTrustChain(
+  options: SetupTrustChainOptions,
+): Promise<SetupTrustChainResult>;
 export async function setupTrustChain(
   options: SetupTrustChainOptions = {},
 ): Promise<SetupTrustChainResult> {
@@ -398,15 +427,31 @@ export async function setupTrustChain(
     accountName = "openclaw-webchannel-account",
     rsaKeySize = 2048,
     kid: providedKid,
+    externalNatsAccount,
   } = options;
 
   // -----------------------------------------------------------------------
   // Step 1: Generate RSA keypair for bootstrap JWT signing
   // -----------------------------------------------------------------------
+  // Unchanged in BOTH modes: bootstrap-JWT signing is the SaaS's job regardless
+  // of who runs the nats-server.
 
   const { privateKeyPem, publicKeyJwk, kid: generatedKid } = await generateRsaKeypair(rsaKeySize);
   const kid = providedKid ?? generatedKid;
   publicKeyJwk.kid = kid;
+
+  const jwks: JwksDocument = { keys: [publicKeyJwk] };
+
+  // -----------------------------------------------------------------------
+  // External mode (Synadia Cloud / NGS): the SaaS does NOT run the nats-server.
+  // -----------------------------------------------------------------------
+  // We do NOT generate an operator/account, and we do NOT emit operator/account
+  // JWTs or resolver config (the managed server already trusts the account).
+  // We only mint user JWTs on the account's behalf — so all we keep is the
+  // signing seed (to sign) + the account identity public (the issuer_account).
+  if (externalNatsAccount) {
+    return buildExternalTrustChain(externalNatsAccount, privateKeyPem, jwks, kid);
+  }
 
   // -----------------------------------------------------------------------
   // Step 2: Generate operator + account NKEYs (ed25519, NATS standard)
@@ -461,15 +506,7 @@ export async function setupTrustChain(
   };
 
   // -----------------------------------------------------------------------
-  // Step 6: Create JWKS document
-  // -----------------------------------------------------------------------
-
-  const jwks: JwksDocument = {
-    keys: [publicKeyJwk],
-  };
-
-  // -----------------------------------------------------------------------
-  // Return complete trust chain
+  // Return complete trust chain (JWKS was built in Step 1)
   // -----------------------------------------------------------------------
 
   const privateKey: SaasTrustChainPrivate = {
@@ -478,6 +515,7 @@ export async function setupTrustChain(
   };
 
   const natsConfig: NatsAccountConfig = {
+    mode: "self-contained",
     operatorJwt,
     accountJwt,
     resolverConfig,
@@ -487,6 +525,61 @@ export async function setupTrustChain(
   return {
     private: privateKey,
     natsConfig,
+    jwks,
+    kid,
+  };
+}
+
+/**
+ * Build a trust chain for an externally-managed NATS account (Synadia/NGS).
+ *
+ * No operator/account is generated and no operator/account JWT or resolver
+ * config is emitted — the managed nats-server already trusts the account. The
+ * RSA/JWKS bootstrap material is generated by the caller and passed through
+ * unchanged. The returned `private.natsAccountSeed` is the provided signing
+ * seed (a secret), used by mintNatsUserCreds to sign user JWTs whose
+ * `nats.issuer_account` is `accountId`.
+ */
+function buildExternalTrustChain(
+  external: ExternalNatsAccount,
+  rsaPrivateKeyPem: string,
+  jwks: JwksDocument,
+  kid: string,
+): SetupTrustChainResult {
+  const signingSeed = external.signingSeed?.trim();
+  const accountId = external.accountId?.trim();
+
+  // Validate the supplied material is real NATS account material (a fatal
+  // misconfig should fail loudly here, not when nats-server rejects the creds).
+  if (!signingSeed || !signingSeed.startsWith("SA")) {
+    throw new Error(
+      "externalNatsAccount.signingSeed must be a NATS account signing-key seed (starts with 'SA')",
+    );
+  }
+  if (!accountId || !accountId.startsWith("A")) {
+    throw new Error(
+      "externalNatsAccount.accountId must be a NATS account identity public key (starts with 'A')",
+    );
+  }
+  // `fromSeed`/`fromPublic` throw on a malformed (bad CRC/length) nkey. The
+  // signing key is an account-type key; its public is a DISTINCT `A…` key from
+  // the account identity (that is the whole point of a signing key), so we do
+  // NOT assert they are equal.
+  const signingKp = fromSeed(new TextEncoder().encode(signingSeed));
+  if (signingKp.getPublicKey()[0] !== "A") {
+    throw new Error("externalNatsAccount.signingSeed is not an account ('A') key");
+  }
+  fromPublic(accountId); // throws if accountId is not a valid public nkey
+
+  return {
+    private: {
+      rsaPrivateKeyPem,
+      natsAccountSeed: signingSeed,
+    },
+    natsConfig: {
+      mode: "external",
+      accountPublicKey: accountId,
+    },
     jwks,
     kid,
   };

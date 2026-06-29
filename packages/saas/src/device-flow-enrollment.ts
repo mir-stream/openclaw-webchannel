@@ -17,9 +17,6 @@
  *  - Agent public key binding (cnf in bootstrap JWT)
  */
 
-import { createUser, fromSeed } from "@nats-io/nkeys";
-import { encodeUser } from "@nats-io/jwt";
-
 import type {
   EnrollmentRequest,
   EnrollmentResponse,
@@ -31,6 +28,7 @@ import type {
 } from "./device-flow-types.js";
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import { assertValidSubjectToken } from "./subject-token.js";
+import { mintNatsUserCreds } from "./nats-user-creds.js";
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -164,6 +162,16 @@ export type DeviceFlowOptions = {
   natsAccountConfig: NatsAccountConfig;
 
   /**
+   * Account IDENTITY public NKEY (`A…`) for an externally-managed NATS account
+   * (Synadia Cloud / NGS). When set, the agent's minted user JWT is signed by
+   * `saasTrustChain.natsAccountSeed` (treated as a signing key) and stamped with
+   * `nats.issuer_account` = this id. Unset → self-signed self-contained mode.
+   *
+   * In external mode this is `natsAccountConfig.accountPublicKey`.
+   */
+  natsIssuerAccountId?: string;
+
+  /**
    * Enrollment expiration time in seconds (default: 600 = 10 minutes).
    */
   expirationSeconds?: number;
@@ -209,9 +217,11 @@ export type DeviceFlowOptions = {
  * Handles RFC 8628 device authorization grants for plugin enrollment.
  */
 export class DeviceFlowEnrollment {
-  private readonly options: Required<Omit<DeviceFlowOptions, "store">>;
+  // `natsIssuerAccountId` stays optional (external mode only); everything else
+  // is defaulted, hence Required.
+  private readonly options: Required<Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId">> &
+    Pick<DeviceFlowOptions, "natsIssuerAccountId">;
   private readonly store: EnrollmentStore;
-  private readonly nkeyPublicCache = new Map<string, string>(); // Seed -> Public NKEY
 
   constructor(options: DeviceFlowOptions) {
     this.options = {
@@ -413,298 +423,33 @@ export class DeviceFlowEnrollment {
   ): Promise<NatsUserCredentials> {
     // Defense-in-depth: re-validate the tenant immediately before building the
     // `webchannel.{tenant}.>` grant (enroll() also validates at ingress).
+    // mintNatsUserCreds re-validates too; this keeps the guard local & explicit.
     assertValidSubjectToken(enrollment.tenant, "tenant");
-    // Mint a real NATS user JWT, signed by the account NKEY, so a real
-    // nats-server accepts the connection and enforces the subject permissions.
-    const accountSigner = fromSeed(
-      new TextEncoder().encode(this.options.saasTrustChain.natsAccountSeed),
-    );
-    const userKp = createUser();
-    const userSeed = new TextDecoder().decode(userKp.getSeed());
 
-    // Tenant-scoped pub/sub. The agent serves EVERY peer of its tenant/agent, so
-    // it must pub/sub the live channel subjects
-    // `webchannel.{tenant}.{agentId}.{peerId}.{in,out,handshake}` (see
-    // packages/plugin/src/nats-channel.ts). A `webchannel.{tenant}.>` grant covers
-    // those while preserving cross-tenant isolation (a different tenant's account
-    // JWT cannot pub/sub here). This matches the credential scope used by the
-    // working enrolled-JWT round-trip (e2e/enrolled-jwt-roundtrip.test.ts); the
-    // older `outbound.>`/`inbound.>` scheme never matched the channel's actual
-    // subject layout, so a real JWT-auth nats-server denied the agent's pub/sub.
-    const pub = [`webchannel.${enrollment.tenant}.>`];
-    const sub = [`webchannel.${enrollment.tenant}.>`];
-
-    const userJwt = await encodeUser(
-      `user-${enrollment.tenant}-${enrollment.agentId ?? "unknown"}`,
-      userKp,
-      accountSigner,
-      { pub: { allow: pub }, sub: { allow: sub } },
-    );
+    // Single minting code path shared with the browser/`/test/nats-user` path
+    // (nats-user-creds.ts). It mints a real, tenant-scoped NATS user JWT:
+    //   - self-contained mode (no natsIssuerAccountId): signed by the account
+    //     NKEY, `iss` = account public — accepted by a SaaS-run nats-server.
+    //   - external mode (natsIssuerAccountId set): signed by the account signing
+    //     key with `nats.issuer_account` = the managed account id — accepted by
+    //     Synadia's nats-server.
+    //
+    // Tenant scope `webchannel.{tenant}.>` covers the live per-peer channel
+    // subjects `webchannel.{tenant}.{agentId}.{peerId}.{in,out,handshake}` (see
+    // packages/plugin/src/nats-channel.ts) while preserving cross-tenant
+    // isolation. Matches e2e/enrolled-jwt-roundtrip.test.ts.
+    const minted = await mintNatsUserCreds({
+      accountSeed: this.options.saasTrustChain.natsAccountSeed,
+      tenant: enrollment.tenant,
+      role: "agent",
+      issuerAccountId: this.options.natsIssuerAccountId,
+    });
 
     return {
-      userJwt,
-      userSeed,
-      permissions: { pub, sub },
+      userJwt: minted.userJwt,
+      userSeed: minted.userSeed,
+      permissions: minted.permissions,
     };
-  }
-
-  /**
-   * Generate a NATS user NKEY seed.
-   * Format: "U..." + 22 bytes encoded in NATS base32 alphabet.
-   *
-   * User NKEYs are Ed25519 keypairs encoded in NATS's custom base32 alphabet.
-   * The prefix byte 'U' indicates this is a user key (as opposed to 'S' for server,
-   * 'A' for account, etc.).
-   */
-  private async generateNkeyUserSeed(): Promise<string> {
-    try {
-      // Try Ed25519 (preferred, available in modern browsers/Node 19+)
-      const keypair = await globalThis.crypto.subtle.generateKey(
-        { name: "Ed25519" },
-        true,
-        ["sign", "verify"],
-      );
-      if (!("publicKey" in keypair)) {
-        throw new Error("Expected CryptoKeyPair from Ed25519 generateKey");
-      }
-
-      // Export the private key seed — OKP raw export unsupported, use JWK 'd'
-      const seedBase32 = this.encodeNatsBase32(await this.exportOkpPrivateSeed(keypair.privateKey));
-
-      // Export the public key (32 bytes for Ed25519)
-      const publicBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.publicKey);
-      const publicBase32 = this.encodeNatsBase32(new Uint8Array(publicBuffer));
-
-      // NATS user seed format: "U" + encoded seed (truncated to 22 chars for NATS compatibility)
-      // NATS user public format: "U" + encoded public key (truncated to 22 chars)
-      const seed = `U${seedBase32.substring(0, 22)}`;
-      const publicKey = `U${publicBase32.substring(0, 22)}`;
-
-      // Cache the public key mapping for later use
-      this.nkeyPublicCache.set(seed, publicKey);
-
-      return seed;
-    } catch (err) {
-      // Fallback for environments without Ed25519 support
-      // Use X25519 as a substitute (still provides keypair semantics)
-      const keypair = await globalThis.crypto.subtle.generateKey(
-        { name: "X25519" },
-        true,
-        ["deriveKey", "deriveBits"],
-      );
-      if (!("publicKey" in keypair)) {
-        throw new Error("Expected CryptoKeyPair from X25519 generateKey");
-      }
-
-      const seedBase32 = this.encodeNatsBase32(await this.exportOkpPrivateSeed(keypair.privateKey));
-
-      const publicBuffer = await globalThis.crypto.subtle.exportKey("raw", keypair.publicKey);
-      const publicBase32 = this.encodeNatsBase32(new Uint8Array(publicBuffer));
-
-      const seed = `U${seedBase32.substring(0, 22)}`;
-      const publicKey = `U${publicBase32.substring(0, 22)}`;
-
-      this.nkeyPublicCache.set(seed, publicKey);
-      return seed;
-    }
-  }
-
-  /**
-   * Derive public NKEY from a seed.
-   *
-   * For user NKEYs, this extracts the public key portion that was computed during
-   * seed generation. The format is "U" + 22 chars of base32-encoded public key.
-   */
-  private deriveNkeyPublic(seed: string): string {
-    // Check if we have this seed cached
-    const cached = this.nkeyPublicCache.get(seed);
-    if (cached) {
-      return cached;
-    }
-
-    // Fallback: derive from seed format "U..."
-    // In production, this would use proper NKEY library to derive public key
-    // For Phase B, we reconstruct from cache or return a placeholder
-    if (!seed.startsWith("U")) {
-      throw new Error(`Invalid user NKEY seed format: ${seed}`);
-    }
-
-    // Return a derived public key (placeholder for Phase B)
-    // In production, this would compute the actual Ed25519 public key
-    return `U${seed.substring(1, 23)}`;
-  }
-
-  /**
-   * Derive account public NKEY from account seed.
-   *
-   * Account seeds have format "SA..." (S=operator/category, A=account type).
-   * This extracts the public key portion for use as the issuer in user JWTs.
-   */
-  private deriveAccountPublicKey(accountSeed: string): string {
-    // Account seed format: "SA" + encoded seed
-    // Account public format: "AA" + encoded public key
-    if (!accountSeed.startsWith("SA")) {
-      throw new Error(`Invalid account seed format: ${accountSeed}`);
-    }
-
-    // In production, this would derive the actual public key from the seed
-    // For Phase B, we derive the expected public key format
-    // The account public key starts with "AA" (account category)
-    return `AA${accountSeed.substring(2, 24)}`;
-  }
-
-  /**
-   * Sign a NATS user JWT using the account NKEY seed.
-   *
-   * Creates a NATS-compatible user JWT with Ed25519 signature.
-   * The JWT includes tenant-scoped pub/sub permissions.
-   */
-  private async signNatsUserJwt(
-    claims: Record<string, unknown>,
-    accountSeed: string,
-  ): Promise<string> {
-    // NATS JWT header
-    const header = {
-      typ: "JWT",
-      alg: "Ed25519", // NATS uses Ed25519 for JWT signatures
-    };
-
-    const headerSegment = this.bufferToBase64Url(
-      new TextEncoder().encode(JSON.stringify(header)),
-    );
-    const payloadSegment = this.bufferToBase64Url(
-      new TextEncoder().encode(JSON.stringify(claims)),
-    );
-    const signingInput = `${headerSegment}.${payloadSegment}`;
-
-    // Sign with account NKEY (Ed25519)
-    // For Phase B, we use a simplified signature approach
-    // In production, this would use the nats.js signing library
-    try {
-      // Try to import the account seed as an Ed25519 key for signing
-      const seedBytes = this.decodeNatsBase32(accountSeed.substring(2)); // Remove "SA" prefix
-
-      let signature: string;
-      try {
-        // Try Ed25519 signing
-        const keyData = seedBytes.slice(0, 32);
-        const key = await globalThis.crypto.subtle.importKey(
-          "raw",
-          keyData,
-          { name: "Ed25519" },
-          false,
-          ["sign"],
-        );
-
-        const signatureBuffer = await globalThis.crypto.subtle.sign(
-          { name: "Ed25519" },
-          key,
-          new TextEncoder().encode(signingInput),
-        );
-
-        signature = this.bufferToBase64Url(new Uint8Array(signatureBuffer));
-      } catch {
-        // Fallback: use a placeholder signature for Phase B
-        // In production, this would require proper NATS JWT library integration
-        signature = this.bufferToBase64Url(
-          await this.sha256Hash(new TextEncoder().encode(signingInput)),
-        );
-      }
-
-      return `${signingInput}.${signature}`;
-    } catch (error) {
-      // Final fallback: placeholder signature for Phase B compatibility
-      console.warn("[enrollment] Using placeholder JWT signature (Phase B scope):", error);
-      const signature = this.bufferToBase64Url(
-        await this.sha256Hash(new TextEncoder().encode(signingInput)),
-      );
-      return `${signingInput}.${signature}`;
-    }
-  }
-
-  /**
-   * Extract the 32-byte private scalar from an Ed25519/X25519 private key.
-   *
-   * WebCrypto does not support `exportKey("raw", privateKey)` for OKP curves;
-   * the seed is exposed as the base64url `d` parameter of the JWK form.
-   */
-  private async exportOkpPrivateSeed(privateKey: CryptoKey): Promise<Uint8Array> {
-    const jwk = await globalThis.crypto.subtle.exportKey("jwk", privateKey);
-    if (!jwk.d) {
-      throw new Error("OKP private key JWK is missing the 'd' (seed) parameter");
-    }
-    const b64 = jwk.d.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
-    const binary = atob(padded);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  }
-
-  /**
-   * Encode bytes using NATS base32 alphabet.
-   *
-   * NATS uses a custom base32 alphabet: "CFH23567PR89JKLMNPQTUVWXYZ456789"
-   * (no vowels to avoid accidental words, different from standard base32).
-   */
-  private encodeNatsBase32(bytes: Uint8Array): string {
-    const alphabet = "CFH23567PR89JKLMNPQTUVWXYZ456789";
-    let result = "";
-    let bits = 0;
-    let value = 0;
-
-    for (const byte of bytes) {
-      value = (value << 8) | byte;
-      bits += 8;
-
-      while (bits >= 5) {
-        bits -= 5;
-        result += alphabet[(value >>> bits) & 0x1f]!;
-      }
-    }
-
-    if (bits > 0) {
-      result += alphabet[(value << (5 - bits)) & 0x1f]!;
-    }
-
-    return result;
-  }
-
-  /**
-   * Decode NATS base32 string to bytes.
-   */
-  private decodeNatsBase32(encoded: string): Uint8Array {
-    const alphabet = "CFH23567PR89JKLMNPQTUVWXYZ456789";
-    const lookup = new Map<string, number>();
-    for (let i = 0; i < alphabet.length; i++) {
-      lookup.set(alphabet[i]!, i);
-    }
-
-    const bits: string = encoded
-      .split("")
-      .map((char) => {
-        const index = lookup.get(char);
-        if (index === undefined) {
-          throw new Error(`Invalid NATS base32 character: ${char}`);
-        }
-        return index.toString(2).padStart(5, "0");
-      })
-      .join("");
-
-    const bytes = new Uint8Array(Math.floor(bits.length / 8));
-    for (let i = 0; i < bytes.length; i++) {
-      bytes[i] = parseInt(bits.substring(i * 8, (i + 1) * 8), 2);
-    }
-
-    return bytes;
-  }
-
-  /**
-   * Compute SHA-256 hash of data.
-   */
-  private async sha256Hash(data: Uint8Array): Promise<Uint8Array> {
-    const hashBuffer = await globalThis.crypto.subtle.digest("SHA-256", data);
-    return new Uint8Array(hashBuffer);
   }
 
   /**

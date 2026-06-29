@@ -34,6 +34,7 @@ import { fromSeed, createUser } from "@nats-io/nkeys";
 import { encodeUser } from "@nats-io/jwt";
 
 import { setupTrustChain } from "./setup-trust-chain.js";
+import type { SetupTrustChainResult, NatsSelfContainedAccountConfig } from "./types.js";
 import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
 import type { NatsUserCredentials } from "./device-flow-types.js";
 
@@ -77,7 +78,12 @@ let testDir: string | null = null;
 // Trust chain and enrollment service
 // ---------------------------------------------------------------------------
 
-let trustChain: Awaited<ReturnType<typeof setupTrustChain>> | null = null;
+// This suite only exercises the self-contained mode, so pin natsConfig to the
+// self-contained shape (the overloaded setupTrustChain otherwise widens via
+// ReturnType to the self-contained | external union).
+let trustChain:
+  | (SetupTrustChainResult & { natsConfig: NatsSelfContainedAccountConfig })
+  | null = null;
 let enrollment: DeviceFlowEnrollment | null = null;
 
 async function waitFor(

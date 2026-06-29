@@ -40,6 +40,9 @@ export type {
   SetupTrustChainResult,
   SaasTrustChainPrivate,
   NatsAccountConfig,
+  NatsSelfContainedAccountConfig,
+  NatsExternalAccountConfig,
+  ExternalNatsAccount,
   JwksDocument,
   JwkRsaPublicKey,
 } from "./types.js";

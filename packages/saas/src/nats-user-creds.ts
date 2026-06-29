@@ -2,10 +2,18 @@
  * Shared NATS user-credential minting helper.
  *
  * Mints a real NATS user JWT (signed by the SaaS account NKEY from
- * `setupTrustChain`) plus its NKEY seed, scoped to a tenant. This is the single
- * place the reference enrollment-server's TEST-ONLY `/test/nats-user` route uses
- * to issue creds for a non-agent peer (e.g. a browser/driver) so it can complete
- * an encrypted round-trip with an enrolled agent over a real JWT-auth nats-server.
+ * `setupTrustChain`) plus its NKEY seed, scoped to a tenant. This is the SINGLE
+ * minting code path for BOTH peers:
+ *   - the browser/driver (reference enrollment-server's TEST-ONLY
+ *     `/test/nats-user` route), and
+ *   - the enrolled agent (DeviceFlowEnrollment.approve →
+ *     generateNatsUserCredentials), so the agent and browser are minted
+ *     identically.
+ *
+ * Supports two account modes (see `issuerAccountId`):
+ *   - self-contained: the account is self-signed (SaaS runs the nats-server).
+ *   - external (Synadia Cloud / NGS): signed by an account signing key with
+ *     `nats.issuer_account` set to the managed account identity.
  *
  * Subject scope: tenant-wide (`webchannel.{tenant}.>`). This is the same scope
  * the working enrolled-JWT round-trip uses (e2e/enrolled-jwt-roundtrip.test.ts)
@@ -16,7 +24,7 @@
  * `@nats-io/*` lives in packages/saas (+ e2e) only; never in packages/plugin.
  */
 
-import { createUser, fromSeed } from "@nats-io/nkeys";
+import { createUser, fromSeed, fromPublic } from "@nats-io/nkeys";
 import { encodeUser } from "@nats-io/jwt";
 
 import { assertValidSubjectToken } from "./subject-token.js";
@@ -31,6 +39,19 @@ export type MintNatsUserCredsOptions = {
   tenant: string;
   /** Logical role (default "browser"). Embedded in the JWT name for debugging. */
   role?: NatsUserRole;
+  /**
+   * Optional account IDENTITY public NKEY (`A…`) for an externally-managed
+   * account (Synadia Cloud / NGS).
+   *
+   * - When PRESENT: `accountSeed` is treated as an account SIGNING-key seed.
+   *   The user JWT is signed by that signing key (so `iss` = signing-key
+   *   public) and stamped with `nats.issuer_account = issuerAccountId`, so a
+   *   managed resolver that lists the signing key for this account accepts it.
+   * - When ABSENT: byte-for-byte the original self-signed behavior — the user
+   *   JWT is signed by `accountSeed`'s own keypair (`iss` = account public, no
+   *   `issuer_account`).
+   */
+  issuerAccountId?: string;
 };
 
 export type MintedNatsUserCreds = {
@@ -62,7 +83,10 @@ export async function mintNatsUserCreds(
   // Reject any tenant that would break the subject hierarchy before it is
   // spliced into the `webchannel.{tenant}.>` permission grant.
   assertValidSubjectToken(opts.tenant, "tenant");
-  const accountSigner = fromSeed(new TextEncoder().encode(opts.accountSeed));
+  // The signing key (always present): an account-type keypair whose public key
+  // becomes the JWT `iss`. In self-contained mode it IS the account identity;
+  // in external mode it is a signing key listed on the managed account.
+  const signingKp = fromSeed(new TextEncoder().encode(opts.accountSeed));
   const userKp = createUser();
   const userSeed = new TextDecoder().decode(userKp.getSeed());
   // Browser-friendly raw seed (base64url of the 32-byte Ed25519 seed). Never log.
@@ -75,11 +99,22 @@ export async function mintNatsUserCreds(
 
   const pub = [`webchannel.${opts.tenant}.>`];
   const sub = [`webchannel.${opts.tenant}.>`];
+  const perms = { pub: { allow: pub }, sub: { allow: sub } };
 
-  const userJwt = await encodeUser(`${role}-${opts.tenant}`, userKp, accountSigner, {
-    pub: { allow: pub },
-    sub: { allow: sub },
-  });
+  // External mode: sign with the signing key but issue ON BEHALF OF the account
+  // identity. `@nats-io/jwt`'s encodeUser, given `opts.signer`, sets
+  // `iss` = signer public and `nats.issuer_account` = the `issuer` arg's public
+  // (the account identity). The identity key only needs to be PUBLIC (`A…`).
+  // Self-contained mode: no signer → `iss` = account public, no issuer_account.
+  const userJwt = opts.issuerAccountId
+    ? await encodeUser(
+        `${role}-${opts.tenant}`,
+        userKp,
+        fromPublic(opts.issuerAccountId),
+        perms,
+        { signer: signingKp },
+      )
+    : await encodeUser(`${role}-${opts.tenant}`, userKp, signingKp, perms);
 
   return { userJwt, userSeed, userSeedRaw, permissions: { pub, sub } };
 }

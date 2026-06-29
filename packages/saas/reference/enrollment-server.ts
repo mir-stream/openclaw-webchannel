@@ -19,7 +19,13 @@
  * ENVIRONMENT VARIABLES:
  *   PORT              - Server port (default: 3000)
  *   SAAS_BASE_URL     - SaaS base URL (default: http://localhost:3000)
- *   NATS_URL          - NATS WebSocket URL (default: wss://nats.example.com)
+ *   NATS_URL          - NATS WebSocket URL (default: wss://nats.example.com).
+ *                       In external mode, point this at the Synadia wss:// URL.
+ *   NATS_ACCOUNT_SIGNING_SEED - (external mode) account signing-key seed ("SA…").
+ *                       SECRET. When set together with NATS_ACCOUNT_ID, the
+ *                       issuer runs in EXTERNAL mode: it mints Synadia-valid
+ *                       user creds and emits NO operator/account/resolver config.
+ *   NATS_ACCOUNT_ID   - (external mode) account identity public key ("A…").
  *
  * SECURITY NOTES:
  *   - This reference uses HTTP for demonstration. Use TLS in production.
@@ -68,21 +74,36 @@ const NATS_CONFIG_OUT = process.env.NATS_CONFIG_OUT || "";
 // agent's cached NATS creds and every issued bootstrap JWT on restart. Unset keeps
 // the original ephemeral behavior (fresh chain each boot) for hermetic harnesses.
 const TRUST_CHAIN_PATH = process.env.TRUST_CHAIN_PATH || "";
+// External (managed) NATS account (Synadia Cloud / NGS). When BOTH are set the
+// issuer mints user creds on behalf of this account and writes NO
+// operator/account/resolver config. The signing seed is a SECRET — never logged.
+const NATS_ACCOUNT_SIGNING_SEED = process.env.NATS_ACCOUNT_SIGNING_SEED || "";
+const NATS_ACCOUNT_ID = process.env.NATS_ACCOUNT_ID || "";
+const EXTERNAL_NATS_ACCOUNT =
+  NATS_ACCOUNT_SIGNING_SEED && NATS_ACCOUNT_ID
+    ? { signingSeed: NATS_ACCOUNT_SIGNING_SEED, accountId: NATS_ACCOUNT_ID }
+    : undefined;
 
 // ---------------------------------------------------------------------------
 // Trust chain (real — issues genuine NATS user creds). Persisted when
 // TRUST_CHAIN_PATH is set, else generated fresh at boot (harness default).
+// External mode is selected by NATS_ACCOUNT_SIGNING_SEED + NATS_ACCOUNT_ID.
 // ---------------------------------------------------------------------------
 
 const trustChainOptions = {
   operatorName: "reference-operator",
   accountName: "reference-account",
+  externalNatsAccount: EXTERNAL_NATS_ACCOUNT,
 };
 const trustChain = TRUST_CHAIN_PATH
   ? await loadOrCreateTrustChain(TRUST_CHAIN_PATH, trustChainOptions)
   : await setupTrustChain(trustChainOptions);
 const mockTrustChain = trustChain.private;
 const mockNatsConfig = trustChain.natsConfig;
+// In external mode every minted user JWT must carry issuer_account = the managed
+// account id (so Synadia's resolver accepts it). Undefined → self-signed mode.
+const natsIssuerAccountId =
+  mockNatsConfig.mode === "external" ? mockNatsConfig.accountPublicKey : undefined;
 
 // ---------------------------------------------------------------------------
 // Publish public NATS config (operator JWT + memory resolver) for a harness
@@ -92,13 +113,21 @@ const mockNatsConfig = trustChain.natsConfig;
 // user creds for. When NATS_CONFIG_OUT is set we write the two PUBLIC artifacts
 // the server needs — never any private material.
 if (NATS_CONFIG_OUT) {
-  mkdirSync(NATS_CONFIG_OUT, { recursive: true });
-  const operatorJwtPath = join(NATS_CONFIG_OUT, "operator.jwt");
-  const resolverPath = join(NATS_CONFIG_OUT, "resolver.json");
-  writeFileSync(operatorJwtPath, trustChain.natsConfig.operatorJwt);
-  writeFileSync(resolverPath, JSON.stringify(trustChain.natsConfig.resolverConfig, null, 2));
-  console.log(`[nats-config] wrote operator JWT → ${operatorJwtPath}`);
-  console.log(`[nats-config] wrote memory resolver (${Object.keys(trustChain.natsConfig.resolverConfig).length} account) → ${resolverPath}`);
+  if (mockNatsConfig.mode === "external") {
+    // Synadia hosts the nats-server and already trusts the account — there is no
+    // operator JWT / resolver to emit. Writing one would be meaningless.
+    console.log(
+      "[nats-config] external mode — skipping operator/resolver output (Synadia hosts the server)",
+    );
+  } else {
+    mkdirSync(NATS_CONFIG_OUT, { recursive: true });
+    const operatorJwtPath = join(NATS_CONFIG_OUT, "operator.jwt");
+    const resolverPath = join(NATS_CONFIG_OUT, "resolver.json");
+    writeFileSync(operatorJwtPath, mockNatsConfig.operatorJwt);
+    writeFileSync(resolverPath, JSON.stringify(mockNatsConfig.resolverConfig, null, 2));
+    console.log(`[nats-config] wrote operator JWT → ${operatorJwtPath}`);
+    console.log(`[nats-config] wrote memory resolver (${Object.keys(mockNatsConfig.resolverConfig).length} account) → ${resolverPath}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +182,7 @@ const enrollmentStore = new MemoryEnrollmentStore();
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: mockTrustChain,
   natsAccountConfig: mockNatsConfig,
+  natsIssuerAccountId,
   saasBaseUrl: SAAS_BASE_URL,
   jwksUrl: `${SAAS_BASE_URL}/.well-known/jwks.json`,
   bootstrapUrl: `${SAAS_BASE_URL}/bootstrap`,
@@ -603,6 +633,7 @@ const server = createServer(async (req, res) => {
           accountSeed: mockTrustChain.natsAccountSeed,
           tenant,
           role: role === "agent" ? "agent" : "browser",
+          issuerAccountId: natsIssuerAccountId,
         })
           .then((creds) => {
             console.log(`[test/nats-user] minted ${role ?? "browser"} creds for tenant=${tenant}`);
@@ -701,6 +732,7 @@ server.listen(PORT, () => {
   console.log(`  POST ${SAAS_BASE_URL}/deny       - Deny enrollment (operator)`);
   console.log("");
   console.log("Configuration:");
+  console.log(`  NATS account mode: ${mockNatsConfig.mode}${mockNatsConfig.mode === "external" ? ` (account ${mockNatsConfig.accountPublicKey})` : ""}`);
   console.log(`  NATS URL: ${NATS_URL}`);
   console.log(`  Enrollment expiration: 600 seconds`);
   console.log(`  Poll interval: 5 seconds`);
