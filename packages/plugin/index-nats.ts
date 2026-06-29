@@ -477,8 +477,21 @@ export default defineChannelPluginEntry({
           });
           natsTransport = natsConnection.transport;
         } catch (err) {
-          console.error("[webchannel] Failed to connect to NATS:", err);
-          throw err;
+          // Non-fatal: a failed NATS connection disables the webchannel for THIS
+          // process instead of crashing it. This matters because openclaw loads
+          // this channel entry in EVERY context — not just the serving gateway,
+          // but also local `openclaw chat`/TUI/CLI runs, which have no
+          // WEBCHANNEL_* env and so fall back to a URL with no usable NATS. Before
+          // this guard, the throw propagated out of registerFull as an unhandled
+          // rejection and took the whole process down (TUI wouldn't even start).
+          // The serving gateway stays up too (other channels keep working); the
+          // register routes reply 503 until a connection is established. The
+          // encryption fail-closed guard (Step 0) is separate and still throws.
+          const msg = err instanceof Error ? err.message : String(err);
+          (api.logger?.warn ?? api.logger?.error ?? console.warn)?.(
+            `[webchannel] NATS connection failed — channel inactive for this process (${msg})`,
+          );
+          return;
         }
       }
       console.log("[webchannel] ✓ Connected to NATS");
