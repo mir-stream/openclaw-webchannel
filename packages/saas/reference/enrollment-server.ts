@@ -30,6 +30,7 @@
 
 import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../src/device-flow-enrollment.js";
 import { setupTrustChain } from "../src/setup-trust-chain.js";
+import { loadOrCreateTrustChain } from "../src/persistent-trust-chain.js";
 import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
 import { mintNatsUserCreds, type NatsUserRole } from "../src/nats-user-creds.js";
 import { assertValidSubjectToken } from "../src/subject-token.js";
@@ -61,15 +62,25 @@ const ENABLE_TEST_ROUTES = process.env.ENABLE_TEST_ROUTES === "1";
 // a harness can build a JWT-auth nats.conf from the SAME trust chain this issuer
 // uses. Only public NATS config is written — never the RSA key or account seed.
 const NATS_CONFIG_OUT = process.env.NATS_CONFIG_OUT || "";
+// When set, the trust chain is PERSISTED here (generated once, reloaded verbatim
+// on every later boot) instead of regenerated each start. A long-lived / launchd
+// issuer MUST set this: a regenerated chain would invalidate every already-enrolled
+// agent's cached NATS creds and every issued bootstrap JWT on restart. Unset keeps
+// the original ephemeral behavior (fresh chain each boot) for hermetic harnesses.
+const TRUST_CHAIN_PATH = process.env.TRUST_CHAIN_PATH || "";
 
 // ---------------------------------------------------------------------------
-// Trust chain (real, generated once at boot — issues genuine NATS user creds)
+// Trust chain (real — issues genuine NATS user creds). Persisted when
+// TRUST_CHAIN_PATH is set, else generated fresh at boot (harness default).
 // ---------------------------------------------------------------------------
 
-const trustChain = await setupTrustChain({
+const trustChainOptions = {
   operatorName: "reference-operator",
   accountName: "reference-account",
-});
+};
+const trustChain = TRUST_CHAIN_PATH
+  ? await loadOrCreateTrustChain(TRUST_CHAIN_PATH, trustChainOptions)
+  : await setupTrustChain(trustChainOptions);
 const mockTrustChain = trustChain.private;
 const mockNatsConfig = trustChain.natsConfig;
 

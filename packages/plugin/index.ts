@@ -1,3 +1,17 @@
+/**
+ * WebChannel Plugin Entry — Gateway-WS mode (DEV-ONLY).
+ *
+ * ⚠️ NOT the production transport. The production default is `index-nats.ts`
+ * (NATS E2E, no inbound port). This Gateway-WS entry serves a WebSocket upgrade
+ * on the gateway's own port, so the browser must reach an INBOUND gateway port —
+ * same-host/LAN only. It therefore does NOT satisfy the project's no-inbound-port
+ * premise and must never be the default/production entry.
+ *
+ * Keep it for zero-infra local round-trips (no NATS relay, no SaaS issuer): its
+ * dev demo is `e2e/local/live-chat*.{mjs,html}` + `packages/client/src/browser-live-entry.ts`.
+ * The live gateway runs `index-nats.ts`; `package.json` defaults to it.
+ */
+
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { WebChannelTransport } from "./src/transport.js";

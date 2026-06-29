@@ -9,12 +9,14 @@ OpenClaw agent (Claude) from the browser.
 
 ## Two transports
 
-This package ships two plugin entries:
+This package ships two plugin entries. **`index-nats.ts` is the production default**
+(`package.json` → `openclaw.extensions = ["./index-nats.ts"]`); `index.ts` is a **dev-only**
+zero-infra fallback.
 
-| Entry | Mode | Status |
+| Entry | Mode | Role |
 |---|---|---|
-| `index.ts` | **Gateway-WS** — browser connects via a WebSocket upgrade on the gateway's own port | ✅ **Works end-to-end today** (browser ↔ OpenClaw ↔ Claude) |
-| `index-nats.ts` | **NATS E2E** — both sides connect to a shared NATS bus; relay sees ciphertext only | ✅ **Run live (`e384198`)** — real browser ↔ NATS ↔ this plugin in a real openclaw gateway ↔ `inbound.run` ↔ back, encrypted, via the `e2e/local` harness (echo model). Not yet in the CI gate. |
+| `index-nats.ts` | **NATS E2E** — both sides dial OUT to a shared NATS bus (no inbound port); relay sees ciphertext only | ✅ **Production default.** Cut over live on the real gateway (`:18789`): real browser ↔ NATS ↔ this plugin ↔ `inbound.run` ↔ back, E2E-encrypted, device-flow enrolled. Satisfies the no-inbound-port premise. |
+| `index.ts` | **Gateway-WS** — browser connects via a WebSocket upgrade on the gateway's own port | 🔧 **Dev-only.** Requires a reachable inbound gateway port (same-host/LAN only) — does **not** satisfy the no-inbound-port premise, so it is NOT a production transport. Keep for zero-infra local round-trips. |
 
 As of `e384198`, a real headless-Chromium message HAS travelled browser → NATS → this plugin →
 `inbound.run` → (echo model) → back. Earlier the NATS entry assumed APIs that don't exist
@@ -30,12 +32,17 @@ auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See 
 
 ## Status
 
-- Gateway-WS channel: works (run it via an OpenClaw gateway with this plugin loaded in WS mode).
-  This is the shipped default entry (`package.json` → `openclaw.extensions = ["./index.ts"]`).
-- NATS entry (`index-nats.ts`): **live-verified** in a real openclaw gateway (`e384198`). It has an
-  enrolled-creds path (SaaS device flow, default) AND an env-gated **dev/open-NATS** path
+- NATS entry (`index-nats.ts`) — **production default, cut over live** on the real gateway
+  (`:18789`): enrolled via the SaaS device flow against a persistent local trust chain
+  (`nats-server` + reference issuer), credentials cached at `~/.openclaw-webchannel/credentials.json`
+  so restarts reconnect with no re-approval. Also has an env-gated **dev/open-NATS** path
   (`WEBCHANNEL_NATS_DEV_OPEN=1`) that connects to a plain local `nats-server` with no enrollment —
   see [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
+- Gateway-WS channel (`index.ts`) — **dev-only** zero-infra fallback (run it via an OpenClaw gateway
+  with this plugin loaded in WS mode). Needs a reachable inbound port, so it is NOT used in
+  production. Its dev demo lives in `e2e/local/live-chat*.{mjs,html}` +
+  `packages/client/src/browser-live-entry.ts`.
+- Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
 ## Enrollment & credentials (NATS mode)
