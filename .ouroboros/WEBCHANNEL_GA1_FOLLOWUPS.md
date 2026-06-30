@@ -59,11 +59,22 @@
 
 ## C. 큰 옵션 (요구 발생 시)
 
-### C1. 가-2 — subject 중간 세그먼트 agentId → accountId 개명
+### C1. 가-2 — subject 중간 세그먼트 agentId → accountId 개명 ✅ DONE (`6e6280e`, 브랜치 `feature/webchannel-ga2-accountid-wire`)
 - account ≠ agent 유연성(한 전송 엔드포인트 뒤 여러 agent, 또는 agent 공유)이 필요해질 때.
   subject `webchannel.{tenant}.{agentId}.{peerId}` → `…{accountId}…`. SaaS + client + plugin
-  **동시 배포** 필요한 breaking 와이어 변경. 현재 account=agent 1:1이라 불필요.
+  **동시 배포** 필요한 breaking 와이어 변경. 현재 account=agent 1:1이라 불필요. → **구현됨**:
+  단일 와이어 신원(subject 중간/JWT aud/enroll 식별자/envelope plaintext routing+history triple)을
+  기존 `--account` 키로 대체, `channels add`에서 agentId 제거 → 처리 agent는 `agents bind` 전용
+  (telegram 동형). 클린 브레이크(라이브 배포 없음, 와이어 back-compat 없음). audToAccount 기본
+  항등 매핑(설정 jwt.audience 매핑+first-wins 충돌가드 유지), multiplex의 missing/duplicate-agentId
+  skip 제거(accountId는 config map 키라 구조적으로 유일), creds-missing/connection/encryption graceful
+  skip 불변. 2라운드 리뷰 PASS(와이어 대칭+auth+grep 완전성). typecheck clean, tests 968(plugin 724/
+  client 155/saas 89). **미push/PR.**
 - 가-1은 가-2의 strict subset(버릴 작업 없음); 개명만 추가하면 됨.
+
+### C2. (가-2 후속, 사소) 테스트 픽스처 `const AGENT_ID = "agent1"` 잔존
+- 여러 plugin 테스트에 stale 변수명 `AGENT_ID`가 남음 — 값은 `accountId:` 필드에 할당(와이어 read 아님,
+  버그 아님). `account-config.test.ts`의 `agentId` merge-passthrough 키도 임의 key일 뿐. 정리 시 ACCOUNT_ID로 개명.
 
 ## D. 프로세스
 - 브랜치 `feature/webchannel-channels-add-onboarding` push 완료, PR 생성.
