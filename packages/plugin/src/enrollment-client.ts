@@ -457,6 +457,23 @@ export class EnrollmentClient {
 
     if (!response.ok) {
       const text = await response.text();
+      // RFC 8628 device-flow poll responses use HTTP 400 with a JSON `error`
+      // code (authorization_pending / slow_down / access_denied / expired_token)
+      // as NORMAL control flow, not a transport failure. Surface such a body to
+      // the caller so the poll loop can branch on `pollResult.error`; only a
+      // non-JSON or error-less body is a genuine failure worth throwing.
+      try {
+        const parsed = JSON.parse(text) as unknown;
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          typeof (parsed as { error?: unknown }).error === "string"
+        ) {
+          return parsed as T;
+        }
+      } catch {
+        // not JSON — fall through to throw
+      }
       throw new Error(`HTTP ${response.status}: ${text}`);
     }
 
