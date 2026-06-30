@@ -206,6 +206,15 @@ Success:
 Creds are cached at `~/.openclaw-webchannel/credentials.json` (mode 0600) — **restarts
 reconnect with no re-approval**.
 
+> **Harmless noise — repeating `Polling for approval...` after success.** OpenClaw
+> pre-warms plugins, so `registerFull` can run more than once per boot, starting more
+> than one enrolled connection. Exactly **one** binds the live `NatsChannel` (the
+> `✓ … registered` line appears once — there is no double message-processing); any extra
+> enroll loop just polls an unapproved code until its ~600s expiry, then gives up
+> gracefully. The repeating `Polling for approval...` lines are that orphaned loop and can
+> be ignored. _(Known gap — pending an idempotency guard so the enrolled connection starts
+> once per process.)_
+
 > The connection (the NATS socket) is held for as long as `gateway run` runs — exactly
 > like a Telegram channel holds its connection while the gateway is up. Config = *where/how*;
 > pairing = *one-time*; connecting = *every run*.
@@ -286,6 +295,7 @@ The `#token=` fragment auto-authenticates; a missing/wrong token → `AUTH_RATE_
 | `NATS connection failed (fetch failed)` | wrong `saasBaseUrl` / issuer down | issuer up? container → `host.docker.internal`, not `127.0.0.1` |
 | approve → `Enrollment not found … {{USER_CODE}}` | opened bare `/enroll`, or cached approval page | open the full `?user_code=…` URL / hard-refresh / curl `/approve` |
 | polls re-enroll every ~5s, never pairs | client treated `authorization_pending` (HTTP 400) as a hard error | ensure poll handles the 400 `{error}` body (don't throw) |
+| `Polling for approval...` keeps printing **after** a successful connect | pre-warm ran `registerFull` more than once → a duplicate enroll loop polling an unapproved code | harmless (one channel binds; no double-processing) — self-terminates at ~600s expiry; known gap, needs an idempotency guard |
 | register `/challenge` → 404 + CORS | `registerHttpRoute` no-op on 2026.6.10 | use `admission: auto` (no register hop) |
 | dashboard `AUTH_RATE_LIMITED` / `token mismatch` | no/!wrong `#token=`, or hitting a different gateway on the same port | use the right gateway's token; resolve the `:18789` collision (§7) |
 
