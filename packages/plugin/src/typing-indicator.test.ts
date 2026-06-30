@@ -236,7 +236,7 @@ const AGENT_ID = "agent1";
 const USER_SUB = "user42";
 
 /** Conversation identifier for the test user. */
-const CONV: ConversationId = { agentId: AGENT_ID, tenant: TENANT, sub: USER_SUB };
+const CONV: ConversationId = { accountId: AGENT_ID, tenant: TENANT, sub: USER_SUB };
 
 /** NATS subjects (plaintext routing metadata per design). */
 const SUBJECTS = {
@@ -274,8 +274,8 @@ async function makeRig(broker: FakeNatsBroker): Promise<TestRig> {
 
   await Promise.all([agentTransport.connect(), browserTransport.connect()]);
 
-  const agentChannel   = new CryptoNatsChannel(agentTransport,   sessionKey, { agentId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
-  const browserChannel = new CryptoNatsChannel(browserTransport, sessionKey, { agentId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
+  const agentChannel   = new CryptoNatsChannel(agentTransport,   sessionKey, { accountId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
+  const browserChannel = new CryptoNatsChannel(browserTransport, sessionKey, { accountId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
 
   const store = new HistoryStore();
 
@@ -532,8 +532,8 @@ describe("TypingIndicator — ephemeral NATS signals (Sub-AC 2)", () => {
       await Promise.all([deviceBTransport.connect(), deviceCTransport.connect()]);
       teardown.push(deviceBTransport, deviceCTransport);
 
-      const deviceBChannel = new CryptoNatsChannel(deviceBTransport, rig.sessionKey, { agentId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
-      const deviceCChannel = new CryptoNatsChannel(deviceCTransport, rig.sessionKey, { agentId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
+      const deviceBChannel = new CryptoNatsChannel(deviceBTransport, rig.sessionKey, { accountId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
+      const deviceCChannel = new CryptoNatsChannel(deviceCTransport, rig.sessionKey, { accountId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
 
       // Each device has its own HistoryStore instance (isolated stores per device).
       const storeB = new HistoryStore();
@@ -596,7 +596,7 @@ describe("TypingIndicator — ephemeral NATS signals (Sub-AC 2)", () => {
       teardown.push(lateDeviceTransport); // disconnect in afterEach (idempotent)
       await lateDeviceTransport.connect();
 
-      const lateChannel = new CryptoNatsChannel(lateDeviceTransport, rig.sessionKey, { agentId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
+      const lateChannel = new CryptoNatsChannel(lateDeviceTransport, rig.sessionKey, { accountId: AGENT_ID, tenant: TENANT, sub: USER_SUB });
       const storeAgent = new HistoryStore();
       const storeLate  = new HistoryStore();
 
@@ -643,7 +643,7 @@ describe("TypingIndicator — ephemeral NATS signals (Sub-AC 2)", () => {
       // Helper to build a minimal MessageEnvelope with a given envelopeType.
       const makeEnv = (type: MessageEnvelope["envelopeType"]): MessageEnvelope => ({
         v: 1,
-        agentId: AGENT_ID,
+        accountId: AGENT_ID,
         tenant: TENANT,
         sub: USER_SUB,
         messageId: `msg-${type}`,
@@ -686,7 +686,7 @@ describe("TypingIndicator — ephemeral NATS signals (Sub-AC 2)", () => {
 
       const makeEnv = (type: MessageEnvelope["envelopeType"], id: string): MessageEnvelope => ({
         v: 1,
-        agentId: AGENT_ID,
+        accountId: AGENT_ID,
         tenant: TENANT,
         sub: USER_SUB,
         messageId: id,

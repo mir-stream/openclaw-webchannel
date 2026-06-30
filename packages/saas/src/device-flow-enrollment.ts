@@ -239,11 +239,11 @@ export class DeviceFlowEnrollment {
    * The plugin polls /poll until the operator approves the enrollment.
    */
   async enroll(request: EnrollmentRequest): Promise<EnrollmentResponse> {
-    // Reject tenant/agentId tokens that would break the NATS subject hierarchy
+    // Reject tenant/accountId tokens that would break the NATS subject hierarchy
     // or cross tenant boundaries before they are persisted or used in a grant.
     assertValidSubjectToken(request.tenant, "tenant");
-    if (request.agentId !== undefined) {
-      assertValidSubjectToken(request.agentId, "agentId");
+    if (request.accountId !== undefined) {
+      assertValidSubjectToken(request.accountId, "accountId");
     }
     const device_code = await this.generateDeviceCode();
     const user_code = this.generateUserCode();
@@ -254,7 +254,7 @@ export class DeviceFlowEnrollment {
       device_code,
       user_code,
       agentPublicKey: request.agentPublicKey,
-      agentId: request.agentId,
+      accountId: request.accountId,
       tenant: request.tenant,
       createdAt: now,
       expiresAt,
@@ -435,7 +435,7 @@ export class DeviceFlowEnrollment {
     //     Synadia's nats-server.
     //
     // Tenant scope `webchannel.{tenant}.>` covers the live per-peer channel
-    // subjects `webchannel.{tenant}.{agentId}.{peerId}.{in,out,handshake}` (see
+    // subjects `webchannel.{tenant}.{accountId}.{peerId}.{in,out,handshake}` (see
     // packages/plugin/src/nats-channel.ts) while preserving cross-tenant
     // isolation. Matches e2e/enrolled-jwt-roundtrip.test.ts.
     const minted = await mintNatsUserCreds({

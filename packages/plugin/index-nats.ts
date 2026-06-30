@@ -56,14 +56,13 @@ import {
 /**
  * Per-account serving runtime. One `gateway run` builds ONE of these per
  * configured webchannel account (Phase 3 multiplex), each with its own NATS
- * connection, encrypted channel, tenant/agentId subject namespace, verifier,
+ * connection, encrypted channel, tenant/accountId subject namespace, verifier,
  * and per-account config. The single HTTP register route dispatches to the
- * right runtime by JWT `aud` (= agentId).
+ * right runtime by JWT `aud` (= accountId).
  */
 type AccountRuntime = {
   accountId: string;
   tenant: string;
-  agentId: string;
   channel: NatsChannel;
   transport: NatsTransport;
   enrolled?: EnrolledNatsConnection;
@@ -75,7 +74,7 @@ type AccountRuntime = {
 
 /** accountId → runtime, built once per process (idempotent across re-warms). */
 const accountRuntimes = new Map<string, AccountRuntime>();
-/** aud (= agentId, and the configured jwt.audience) → accountId dispatch map. */
+/** aud (= accountId, and the configured jwt.audience) → accountId dispatch map. */
 const audToAccount = new Map<string, string>();
 /** Idempotency guard: the async per-account build runs once per process. */
 let accountsBuildStarted = false;
@@ -501,22 +500,15 @@ export default defineChannelPluginEntry({
 
     const legacyNats = api.config.nats as { url?: string; devOpen?: boolean } | undefined;
 
-    // Phase 3 planning (pure): list accounts + apply the structural skip rules
-    // (named-account-without-own-agentId, duplicate-agentId). The plan order is
-    // deterministic so duplicate-agentId resolution is stable.
+    // Phase 3 planning (pure): list accounts. The wire identity is the accountId
+    // itself (unique by construction), so there are no structural pre-I/O skips.
+    // Order is deterministic (sorted accountIds).
     const plans = planAccounts(api.config, {
       warn: (msg) => (api.logger?.warn ?? console.warn)?.(msg),
     });
 
     for (const plan of plans) {
-      if (plan.status === "skip") {
-        // Account-scoped graceful skip (structural misconfig). Other accounts +
-        // the process are unaffected.
-        (api.logger?.warn ?? api.logger?.error ?? console.warn)?.(plan.message);
-        continue;
-      }
-
-      const { accountId, tenant, agentId, account } = plan;
+      const { accountId, tenant, account } = plan;
       const accountAuth = account.auth as AuthConfig | undefined;
       const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
@@ -549,7 +541,7 @@ export default defineChannelPluginEntry({
           legacyNats,
           saasBaseUrl: plan.saasBaseUrl ?? api.config.saas?.baseUrl,
           tenant,
-          agentId,
+          accountId,
         });
         credentialMode = source.mode;
         console.log(
@@ -578,11 +570,11 @@ export default defineChannelPluginEntry({
       }
 
       // ---- Step 2 (per account): create the encrypted NATS channel ---------
-      // Subject namespace is webchannel.{tenant}.{agentId}.{peerId} (UNCHANGED
-      // wire shape — one namespace per account).
-      const channel = new NatsChannel(transport, agentId, tenant, cryptoOptions);
+      // Subject namespace is webchannel.{tenant}.{accountId}.{peerId} — the
+      // accountId is the wire identity (one namespace per account).
+      const channel = new NatsChannel(transport, accountId, tenant, cryptoOptions);
       console.log(
-        `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, agentId=${agentId})`,
+        `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, accountId=${accountId})`,
       );
 
       // ---- Step 3 (per account): inbound dispatcher (accountId-threaded) ----
@@ -669,7 +661,6 @@ export default defineChannelPluginEntry({
       accountRuntimes.set(accountId, {
         accountId,
         tenant,
-        agentId,
         channel,
         transport,
         ...(enrolled ? { enrolled } : {}),
@@ -678,13 +669,13 @@ export default defineChannelPluginEntry({
         historyConfig,
         allowedOrigins,
       });
-      // Dispatch keys: the agentId (= subject/wire key) AND the configured
-      // jwt.audience (what the bootstrap JWT actually carries) if it differs.
-      // First-wins on collision (C1): a shared IdP audience across accounts (or
-      // an agentId clobbering a prior account's audience key) is kept for the
-      // FIRST account + logged, never silently overwritten (which would misroute).
+      // Dispatch keys: the accountId (= subject/wire key, also the JWT `aud`) AND
+      // the configured jwt.audience (what the bootstrap JWT actually carries) if
+      // it differs. First-wins on collision (C1): a shared IdP audience across
+      // accounts is kept for the FIRST account + logged, never silently
+      // overwritten (which would misroute).
       const onAudCollision = (msg: string) => (api.logger?.warn ?? console.warn)?.(msg);
-      addAudMapping(audToAccount, agentId, accountId, onAudCollision);
+      addAudMapping(audToAccount, accountId, accountId, onAudCollision);
       const configuredAud = (accountAuth as { jwt?: { audience?: string } } | undefined)?.jwt?.audience;
       if (typeof configuredAud === "string" && configuredAud.length > 0) {
         addAudMapping(audToAccount, configuredAud, accountId, onAudCollision);
@@ -732,7 +723,7 @@ export default defineChannelPluginEntry({
     if (accountRuntimes.size === 0) {
       (api.logger?.error ?? console.error)?.(
         `[webchannel] NO webchannel accounts are serving — all ${plans.length} configured ` +
-          `account(s) were skipped (misconfig: missing/duplicate agentId, encryption ` +
+          `account(s) were skipped (misconfig: encryption ` +
           `policy, missing credentials, or connection failure). The register routes will ` +
           `reply 503 until fixed; review the per-account skip logs above and re-run ` +
           `'openclaw channels add --channel webchannel'.`,

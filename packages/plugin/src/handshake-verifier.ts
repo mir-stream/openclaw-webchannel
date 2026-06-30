@@ -23,7 +23,7 @@
  * Wire format
  * ───────────
  * The `handshake_hello` message is published to a per-user NATS subject
- * (e.g. `webchannel.{tenant}.{agentId}.{userId}.handshake`). The message
+ * (e.g. `webchannel.{tenant}.{accountId}.{userId}.handshake`). The message
  * contains the device's X25519 public key, which is the UNTRUSTED input that
  * this module validates against the TRUSTED SaaS-pinned value.
  *
@@ -69,7 +69,7 @@ export class HandshakeMitmError extends Error {
  * this peer. The `devicePublicKey` is the UNTRUSTED input that the agent MUST
  * validate against SaaS-pinned values before proceeding.
  *
- * Subject convention: `webchannel.{tenant}.{agentId}.{userId}.handshake`
+ * Subject convention: `webchannel.{tenant}.{accountId}.{userId}.handshake`
  * (exact subject grammar is deferred to the operator configuration layer).
  */
 export type HandshakeHelloMessage = {

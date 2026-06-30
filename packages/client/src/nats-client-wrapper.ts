@@ -54,7 +54,7 @@ export class WebChannelNATSClient {
     this.natsOptions = {
       url: options.natsUrl ?? "wss://nats.example.com",
       jwt: options.bootstrapJwt ?? "",
-      agentId: options.agentId ?? "default-agent",
+      accountId: options.accountId ?? "default-account",
       tenant: options.tenant ?? "default-tenant",
       peerId: options.peerId ?? "anonymous-peer",
       registration: options.registration,

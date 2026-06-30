@@ -45,7 +45,7 @@
  * same symmetric conversationKey and can decrypt any broadcast envelope.
  *
  * Subject schema (plaintext routing metadata per design):
- *   chat.<tenant>.<agentId>.<sub>.<direction>
+ *   chat.<tenant>.<accountId>.<sub>.<direction>
  *
  * All devices of the same user share the same subject because `sub` is the
  * stable per-user identity (JWT sub claim, multi-device-invariant).
@@ -257,7 +257,7 @@ function makeConversationKey(
 // ---------------------------------------------------------------------------
 // Canonical NATS subjects (plaintext routing metadata per design).
 //
-// Subject schema:  chat.<tenant>.<agentId>.<sub>.<direction>
+// Subject schema:  chat.<tenant>.<accountId>.<sub>.<direction>
 //
 // All devices of the same user share the SAME outbound subject because `sub`
 // is the stable per-user JWT identity.  Publishing to `chat.t.a.user42.out`
@@ -338,7 +338,7 @@ function routing(
   ts = 1_718_000_000_000,
 ): EnvelopeRouting {
   return {
-    agentId: AGENT_ID,
+    accountId: AGENT_ID,
     tenant: TENANT,
     sub: USER_SUB,
     messageId,
@@ -864,7 +864,7 @@ describe("1:N Multi-device Broadcast Sync (Sub-AC 5.1)", () => {
         serializeEnvelope(
           encodeEnvelope(
             {
-              agentId: AGENT_ID,
+              accountId: AGENT_ID,
               tenant: TENANT,
               sub: OTHER_USER_SUB,
               messageId: "msg-user99-private",

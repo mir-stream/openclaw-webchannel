@@ -361,7 +361,7 @@ export async function verifyJwt(
  * ── Why an UNVERIFIED peek is safe here ─────────────────────────────────────
  * The single `/webchannel/nats/register*` route serves multiple accounts; it
  * must pick WHICH account's verifier to run, and each account's verifier checks
- * a different expected `aud` (= that account's agentId). This helper only
+ * a different expected `aud` (= that account's accountId). This helper only
  * ROUTES the request to a candidate account. The selected account's verifier
  * then performs the full, signature-checked verification (issuer + `aud` +
  * signature + exp), so a forged/altered `aud` can at most select an account whose

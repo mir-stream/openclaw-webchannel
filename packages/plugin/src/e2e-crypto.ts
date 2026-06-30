@@ -12,7 +12,7 @@
  * Security model
  * ──────────────
  * The NATS relay operator observes only ciphertext and plaintext routing
- * metadata (subject names / agentId / tenant). Content plaintext is
+ * metadata (subject names / accountId / tenant). Content plaintext is
  * readable only by parties that completed the X25519 key exchange.
  *
  * Typical usage pattern

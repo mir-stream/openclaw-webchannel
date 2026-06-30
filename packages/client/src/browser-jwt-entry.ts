@@ -23,7 +23,7 @@ export type RunJwtRegisterOptions = {
   issuerUrl: string;
   /** Gateway base URL serving the PoP register routes. */
   gwUrl: string;
-  agentId: string;
+  accountId: string;
   tenant: string;
   peerId: string;
   /** Message text to send; the echo model returns it for the assertion. */
@@ -77,7 +77,7 @@ export async function runJwtRegister(
     body: JSON.stringify({
       devicePublicKey,
       devicePopPublicKey,
-      agentId: opts.agentId,
+      accountId: opts.accountId,
       tenant: opts.tenant,
       peerId: opts.peerId,
     }),
@@ -96,7 +96,7 @@ export async function runJwtRegister(
   const client = new WebChannelNatsClient({
     url: opts.natsUrl,
     jwt,
-    agentId: opts.agentId,
+    accountId: opts.accountId,
     tenant: opts.tenant,
     peerId,
     registration: {
@@ -146,7 +146,7 @@ export type RunAllRealOptions = {
   issuerUrl: string;
   /** Gateway base URL serving the PoP register routes. */
   gwUrl: string;
-  agentId: string;
+  accountId: string;
   tenant: string;
   peerId: string;
   /** Message text to send; the echo model returns it for the assertion. */
@@ -210,7 +210,7 @@ export async function runAllReal(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       tenant: opts.tenant,
-      agentId: opts.agentId,
+      accountId: opts.accountId,
       peerId: opts.peerId,
       deviceX25519PublicKey,
       devicePopPublicKey,
@@ -226,7 +226,7 @@ export async function runAllReal(
   const client = new WebChannelNatsClient({
     url: opts.natsUrl,
     jwt,
-    agentId: opts.agentId,
+    accountId: opts.accountId,
     tenant: opts.tenant,
     peerId,
     natsCredentials: { userJwt, userSeedRaw },

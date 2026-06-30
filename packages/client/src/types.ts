@@ -112,7 +112,7 @@ export type WebChannelOptions = {
   // -----------------------------------------------------------------------
   /**
    * NATS WebSocket URL. When provided, client connects directly to NATS
-   * instead of gateway-WS. Requires bootstrapJwt, agentId, tenant, and peerId.
+   * instead of gateway-WS. Requires bootstrapJwt, accountId, tenant, and peerId.
    */
   natsUrl?: string;
   /**
@@ -121,9 +121,10 @@ export type WebChannelOptions = {
    */
   bootstrapJwt?: string;
   /**
-   * Agent ID (from JWT claims). Required for NATS mode.
+   * Account (deployment) id — the wire identity (from JWT claims). Required for
+   * NATS mode.
    */
-  agentId?: string;
+  accountId?: string;
   /**
    * Tenant ID (from JWT claims). Required for NATS mode.
    */

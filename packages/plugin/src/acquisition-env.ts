@@ -2,7 +2,7 @@
  * Acquisition-identity env precedence (가-1 Cycle 1, deliverable 6).
  *
  * ── The footgun this removes ────────────────────────────────────────────────
- * `WEBCHANNEL_TENANT` / `WEBCHANNEL_AGENT_ID` / `WEBCHANNEL_SAAS_BASE_URL` used
+ * `WEBCHANNEL_TENANT` / `WEBCHANNEL_SAAS_BASE_URL` used
  * to unconditionally override the config-derived acquisition identity. With
  * per-account config (가-1) that is a wrong-tenant footgun: a stale env var
  * would silently mis-route an explicitly-configured account.
@@ -28,7 +28,6 @@ import {
 
 const ACQUISITION_IDENTITY_ENV_KEYS = [
   "WEBCHANNEL_TENANT",
-  "WEBCHANNEL_AGENT_ID",
   "WEBCHANNEL_SAAS_BASE_URL",
 ] as const;
 
@@ -90,7 +89,6 @@ export function resolveAcquisitionEnvPrecedence(
   const identity: WebchannelAcquisitionIdentity = {
     accountId,
     tenant: env["WEBCHANNEL_TENANT"] ?? "default-tenant",
-    agentId: env["WEBCHANNEL_AGENT_ID"] ?? "default-agent",
     ...(env["WEBCHANNEL_SAAS_BASE_URL"] !== undefined
       ? { saasBaseUrl: env["WEBCHANNEL_SAAS_BASE_URL"] }
       : {}),

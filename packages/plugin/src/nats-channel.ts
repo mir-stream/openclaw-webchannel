@@ -10,8 +10,8 @@
  * - Wires Phase A CryptoNatsChannel for E2E encryption
  *
  * Architecture:
- * - Plugin subscribes to webchannel.{tenant}.{agentId}.{peerId}.in
- * - Plugin publishes to webchannel.{tenant}.{agentId}.{peerId}.out
+ * - Plugin subscribes to webchannel.{tenant}.{accountId}.{peerId}.in
+ * - Plugin publishes to webchannel.{tenant}.{accountId}.{peerId}.out
  * - Multi-peer support: each peerId gets its own subject pair
  * - Approval deduplication: approvalId-based first-write-wins exactly-once
  */
@@ -81,7 +81,7 @@ export type NatsChannelCryptoOptions = {
  */
 export class NatsChannel {
   private readonly transport: NatsTransport;
-  private readonly agentId: string;
+  private readonly accountId: string;
   private readonly tenant: string;
 
   // Per-peer subscriptions (peerId -> sid)
@@ -108,12 +108,12 @@ export class NatsChannel {
 
   constructor(
     transport: NatsTransport,
-    agentId: string,
+    accountId: string,
     tenant: string,
     crypto?: NatsChannelCryptoOptions,
   ) {
     this.transport = transport;
-    this.agentId = agentId;
+    this.accountId = accountId;
     this.tenant = tenant;
     this.encryptionRequired = crypto != null;
     this.agentKeyPair = crypto ? (crypto.keyPair ?? generateKeyPair()) : null;
@@ -157,10 +157,10 @@ export class NatsChannel {
    * from the subject, and the inbound allowlist gate still runs downstream.
    */
   subscribeWildcard(): void {
-    const inWild = `webchannel.${this.tenant}.${this.agentId}.*.in`;
+    const inWild = `webchannel.${this.tenant}.${this.accountId}.*.in`;
     this.transport.subscribe(inWild);
     if (this.encryptionRequired) {
-      const hsWild = `webchannel.${this.tenant}.${this.agentId}.*.handshake`;
+      const hsWild = `webchannel.${this.tenant}.${this.accountId}.*.handshake`;
       this.transport.subscribe(hsWild);
     }
     console.log(`[nats-channel] Subscribed to wildcard ${inWild}`);
@@ -315,15 +315,15 @@ export class NatsChannel {
   // ---------------------------------------------------------------------------
 
   private inboundSubject(peerId: string): string {
-    return `webchannel.${this.tenant}.${this.agentId}.${peerId}.in`;
+    return `webchannel.${this.tenant}.${this.accountId}.${peerId}.in`;
   }
 
   private outboundSubject(peerId: string): string {
-    return `webchannel.${this.tenant}.${this.agentId}.${peerId}.out`;
+    return `webchannel.${this.tenant}.${this.accountId}.${peerId}.out`;
   }
 
   private handshakeSubject(peerId: string): string {
-    return `webchannel.${this.tenant}.${this.agentId}.${peerId}.handshake`;
+    return `webchannel.${this.tenant}.${this.accountId}.${peerId}.handshake`;
   }
 
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
@@ -346,7 +346,7 @@ export class NatsChannel {
           return false;
         }
         const wire = sealEnvelope(
-          { agentId: this.agentId, tenant: this.tenant, sub: peerId },
+          { accountId: this.accountId, tenant: this.tenant, sub: peerId },
           key,
           payload,
         );
@@ -363,7 +363,7 @@ export class NatsChannel {
   }
 
   private handleNatsMessage(msg: NatsMessage): void {
-    // Subject format: webchannel.{tenant}.{agentId}.{peerId}.{in|handshake}
+    // Subject format: webchannel.{tenant}.{accountId}.{peerId}.{in|handshake}
     const parts = msg.subject.split(".");
     if (parts.length < 5) {
       console.warn(`[nats-channel] Invalid subject format: ${msg.subject}`);

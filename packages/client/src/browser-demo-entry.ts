@@ -27,7 +27,7 @@ export type RunDemoOptions = {
   issuerUrl: string;
   /** Gateway base URL serving the PoP register routes. */
   gwUrl: string;
-  agentId: string;
+  accountId: string;
   tenant: string;
   peerId: string;
 };
@@ -115,7 +115,7 @@ export async function runDemo(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       tenant: opts.tenant,
-      agentId: opts.agentId,
+      accountId: opts.accountId,
       peerId: opts.peerId,
       deviceX25519PublicKey,
       devicePopPublicKey,
@@ -137,7 +137,7 @@ export async function runDemo(
   const clientOpts = {
     url: opts.natsUrl,
     jwt,
-    agentId: opts.agentId,
+    accountId: opts.accountId,
     tenant: opts.tenant,
     peerId,
     natsCredentials: { userJwt, userSeedRaw },

@@ -53,13 +53,9 @@ export type EnrolledNatsConnectionOptions = {
   tenant: string;
 
   /**
-   * Agent ID (optional, for debugging).
-   */
-  agentId?: string;
-
-  /**
-   * Account id (가-1). Threaded into the credential-path resolution so the
-   * connection reads the account-scoped creds. Defaults to `"default"`.
+   * Account (deployment) id — the wire identity (가-1/가-2). Sent to the SaaS
+   * enrollment AND threaded into credential-path resolution so the connection
+   * reads the account-scoped creds. Defaults to `"default"`.
    */
   accountId?: string;
 
@@ -137,7 +133,6 @@ export async function createEnrolledNatsConnection(
     saasEnrollUrl: options.saasEnrollUrl,
     saasPollUrl: options.saasPollUrl,
     tenant: options.tenant,
-    agentId: options.agentId,
     accountId: options.accountId,
     credentialPath: options.credentialPath,
     displayInstructions: options.displayInstructions,

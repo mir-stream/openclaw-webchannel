@@ -86,7 +86,7 @@ From the package entry (`src/index.ts`):
 
 Key `WebChannelOptions`: `url` (full cross-origin WS URL), `path` (same-origin
 WS path), `getTicket` (per-connect ticket supplier). NATS-mode options
-(`natsUrl`, `bootstrapJwt`, `agentId`, `tenant`, `peerId`) exist but are not
+(`natsUrl`, `bootstrapJwt`, `accountId`, `tenant`, `peerId`) exist but are not
 wired live.
 
 `WebChannelState` exposes `messages`, `approvals`, `status`

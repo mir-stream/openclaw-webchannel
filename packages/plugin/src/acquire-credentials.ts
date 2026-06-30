@@ -31,14 +31,16 @@ import { accountCredentialPath, DEFAULT_ACCOUNT_ID } from "./account-config.js";
 export type AcquireLog = (...args: unknown[]) => void;
 
 export type AcquireCredentialsOptions = {
-  /** Account id the creds are acquired for (path is account-scoped). */
+  /**
+   * Account id the creds are acquired for. This is ALSO the wire identity
+   * (JWT aud / NATS subject key) sent to the SaaS enrollment. The credential
+   * path is account-scoped on the same value.
+   */
   accountId?: string;
   /** SaaS issuer base URL; `/api/enroll` + `/api/poll` are derived from it. */
   saasBaseUrl: string;
   /** Deployment tenant identifier. */
   tenant: string;
-  /** Agent id (JWT aud / wire key). Optional for the device flow. */
-  agentId?: string;
   /**
    * Override the persisted credential path. Defaults to the per-account path
    * `~/.openclaw-webchannel/<account>/credentials.json`.
@@ -90,7 +92,7 @@ export async function acquireCredentials(
     saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
     saasPollUrl: `${saasBaseUrl}/api/poll`,
     tenant: options.tenant,
-    agentId: options.agentId,
+    accountId,
     credentialPath,
     // Non-interactive: the EnrollmentClient already prints the user_code +
     // verification URI to the console. Keep that on so CI/operators see it.

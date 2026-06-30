@@ -18,7 +18,7 @@
  * Subject scope: tenant-wide (`webchannel.{tenant}.>`). This is the same scope
  * the working enrolled-JWT round-trip uses (e2e/enrolled-jwt-roundtrip.test.ts)
  * and it covers the channel's per-peer subjects
- * (`webchannel.{tenant}.{agentId}.{peerId}.{in,out,handshake}`) while preserving
+ * (`webchannel.{tenant}.{accountId}.{peerId}.{in,out,handshake}`) while preserving
  * cross-tenant isolation — a different tenant's account/JWT cannot pub/sub here.
  *
  * `@nats-io/*` lives in packages/saas (+ e2e) only; never in packages/plugin.

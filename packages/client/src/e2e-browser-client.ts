@@ -407,7 +407,7 @@ class BrowserNatsClient {
 // ---------------------------------------------------------------------------
 
 type EnvelopeRouting = {
-  agentId: string;
+  accountId: string;
   tenant: string;
   sub: string;
   messageId: string;
@@ -417,7 +417,7 @@ type EnvelopeRouting = {
 
 type MessageEnvelope = {
   v: 1;
-  agentId: string;
+  accountId: string;
   tenant: string;
   sub: string;
   messageId: string;
@@ -428,13 +428,13 @@ type MessageEnvelope = {
 
 /**
  * Canonical AAD for a message envelope.
- * AAD = UTF-8 bytes of JSON.stringify({tenant, agentId, sub, messageId, envelopeType, ts})
+ * AAD = UTF-8 bytes of JSON.stringify({tenant, accountId, sub, messageId, envelopeType, ts})
  * with keys in canonical order.
  */
 function canonicalAad(routing: EnvelopeRouting): Uint8Array {
   const canonical = JSON.stringify({
     tenant:       routing.tenant,
-    agentId:      routing.agentId,
+    accountId:    routing.accountId,
     sub:          routing.sub,
     messageId:    routing.messageId,
     envelopeType: routing.envelopeType,
@@ -469,7 +469,7 @@ function encodeEnvelope(
 
 function decodeEnvelope(env: MessageEnvelope, sessionKey: Uint8Array): string {
   const routing: EnvelopeRouting = {
-    agentId:      env.agentId,
+    accountId:    env.accountId,
     tenant:       env.tenant,
     sub:          env.sub,
     messageId:    env.messageId,
@@ -496,7 +496,7 @@ export type RoundTripOptions = {
   natsUrl: string;
   /** Routing fields for the test envelope */
   tenant: string;
-  agentId: string;
+  accountId: string;
   peerId: string;
   /** Timeout for waiting for the agent's reply (ms) */
   timeoutMs?: number;
@@ -543,12 +543,12 @@ export type RoundTripResult = {
  * Called from Playwright via page.evaluate().
  */
 export async function runEncryptedRoundTrip(opts: RoundTripOptions): Promise<RoundTripResult> {
-  const { natsUrl, tenant, agentId, peerId, messageText, preSharedKey } = opts;
+  const { natsUrl, tenant, accountId, peerId, messageText, preSharedKey } = opts;
   const timeoutMs = opts.timeoutMs ?? 10000;
 
-  const inboundSubj  = `webchannel.${tenant}.${agentId}.${peerId}.in`;
-  const outboundSubj = `webchannel.${tenant}.${agentId}.${peerId}.out`;
-  const handshakeSubj = `webchannel.${tenant}.${agentId}.${peerId}.handshake`;
+  const inboundSubj  = `webchannel.${tenant}.${accountId}.${peerId}.in`;
+  const outboundSubj = `webchannel.${tenant}.${accountId}.${peerId}.out`;
+  const handshakeSubj = `webchannel.${tenant}.${accountId}.${peerId}.handshake`;
 
   // --- Connect to NATS (open or enrolled-JWT mode) ---
   const nats = new BrowserNatsClient({
@@ -618,7 +618,7 @@ export async function runEncryptedRoundTrip(opts: RoundTripOptions): Promise<Rou
 
   // --- Send encrypted message to agent ---
   const routing: EnvelopeRouting = {
-    agentId,
+    accountId,
     tenant,
     sub:          peerId,
     messageId:    Array.from(randomBytes(8)).map((b) => b.toString(16).padStart(2, "0")).join(""),

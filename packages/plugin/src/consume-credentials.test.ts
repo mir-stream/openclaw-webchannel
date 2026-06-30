@@ -18,7 +18,7 @@ describe("consumeCredentialSource", () => {
       url: "ws://relay",
       saasBaseUrl: "http://s",
       tenant: "t",
-      agentId: "a",
+      accountId: "a",
     };
 
     const result = await consumeCredentialSource(source, "acctA", {
@@ -44,7 +44,7 @@ describe("consumeCredentialSource", () => {
       url: "ws://relay",
       saasBaseUrl: "http://s",
       tenant: "t",
-      agentId: "a",
+      accountId: "a",
     };
 
     const result = await consumeCredentialSource(source, "acctMissing", {

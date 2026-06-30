@@ -29,10 +29,10 @@ export type EnrollmentRequest = {
   agentPublicKey: string;
 
   /**
-   * Agent/Plugin identifier (optional but recommended).
+   * Account (deployment) identifier — the wire identity (optional but recommended).
    * Useful for debugging and logging; not part of the trust chain.
    */
-  agentId?: string;
+  accountId?: string;
 
   /**
    * Tenant identifier (required for multi-tenant SaaS).
@@ -123,9 +123,9 @@ export type PendingEnrollment = {
   agentPublicKey: string;
 
   /**
-   * Agent identifier (optional).
+   * Account (deployment) identifier — the wire identity (optional).
    */
-  agentId?: string;
+  accountId?: string;
 
   /**
    * Tenant identifier.

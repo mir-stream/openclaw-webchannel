@@ -6,7 +6,10 @@
  * drives this adapter:
  *
  *   1. `applyAccountConfig` (sync) shapes the account's config from the CLI flags
- *      (identity: saasBaseUrl / tenant / agentId, plus credential mode). This is
+ *      (identity: saasBaseUrl / tenant, plus credential mode). The wire identity
+ *      is the `--account` id itself (가-2); the handling agent is decoupled into a
+ *      pure `agents bind` concern (`agents bind --bind webchannel:<account>
+ *      --agent <agent>`). This is
  *      the config WRITE. Per core's canonical model, a NAMED account is written
  *      under `channels.webchannel.accounts.<accountId>`; the `"default"` account
  *      stays at the channel-level (the shared/implicit-default base) so a
@@ -24,19 +27,19 @@
  * `ChannelSetupInput` (token / secret / url / base-url / …); a NON-bundled
  * plugin cannot register custom commander flags through the host CLI (the bundled
  * metadata loader filters `origin: "bundled"`). So we read identity from BOTH:
- *   - dedicated input keys (`saasBaseUrl` / `tenant` / `agentId`) — present when
- *     the flags ARE registered (future/bundled, or a programmatic caller), AND
+ *   - dedicated input keys (`saasBaseUrl` / `tenant`) — present when the flags
+ *     ARE registered (future/bundled, or a programmatic caller), AND
  *   - the generic flags as a fallback mapping:
  *         --base-url  → saasBaseUrl
  *         --url       → tenant
- *         --token     → agentId
- * Because the generic-flag mapping is semantically surprising (and `--help` still
- * reads "Channel setup URL"/"Channel token"), `afterAccountConfigWritten` ECHOES
- * the RESOLVED tenant/agentId/saasBaseUrl (non-secret) before enrolling so a
+ * The wire identity is the `--account` id itself (가-2) — there is no `--token`
+ * → agentId mapping anymore. The handling agent is a separate `agents bind`
+ * concern. Because the generic-flag mapping is semantically surprising (and
+ * `--help` still reads "Channel setup URL"), `afterAccountConfigWritten` ECHOES
+ * the RESOLVED tenant/accountId/saasBaseUrl (non-secret) before enrolling so a
  * mis-mapping is visible. The unambiguous alternative is the acquisition env
- * (WEBCHANNEL_TENANT / WEBCHANNEL_AGENT_ID / WEBCHANNEL_SAAS_BASE_URL), honored
- * only when no webchannel config exists (see acquisition-env.ts). The mapping is
- * documented in README.md.
+ * (WEBCHANNEL_TENANT / WEBCHANNEL_SAAS_BASE_URL), honored only when no webchannel
+ * config exists (see acquisition-env.ts). The mapping is documented in README.md.
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
@@ -61,11 +64,9 @@ type WebchannelSetupInput = {
   // Dedicated identity keys (preferred when present).
   saasBaseUrl?: string;
   tenant?: string;
-  agentId?: string;
   // Generic CLI flags (fallback mapping).
   baseUrl?: string;
   url?: string;
-  token?: string;
   // Connection / credential-mode passthrough.
   credentialsMode?: "enrolled" | "static" | "open";
 } & Record<string, unknown>;
@@ -80,12 +81,10 @@ const NESTED_PATCH_KEYS = ["nats", "saas"] as const;
 export function resolveSetupIdentity(input: WebchannelSetupInput): {
   saasBaseUrl?: string;
   tenant?: string;
-  agentId?: string;
 } {
   return {
     saasBaseUrl: input.saasBaseUrl ?? input.baseUrl,
     tenant: input.tenant ?? input.url,
-    agentId: input.agentId ?? input.token,
   };
 }
 
@@ -98,7 +97,6 @@ export function buildAccountPatch(input: WebchannelSetupInput): Record<string, u
   const identity = resolveSetupIdentity(input);
   const patch: Record<string, unknown> = {};
   if (identity.tenant !== undefined) patch.tenant = identity.tenant;
-  if (identity.agentId !== undefined) patch.agentId = identity.agentId;
   if (identity.saasBaseUrl !== undefined) {
     // saasBaseUrl lives under `saas.baseUrl` (the same place
     // resolveAcquisitionIdentity / resolveAccountNatsConfig read it from).
@@ -260,7 +258,6 @@ export const webchannelSetup = {
     const identity = resolveSetupIdentity(input);
     const tenant =
       identity.tenant ?? (account.tenant as string | undefined) ?? "default-tenant";
-    const agentId = identity.agentId ?? (account.agentId as string | undefined);
     const saasBaseUrl =
       identity.saasBaseUrl ??
       (account.saas as { baseUrl?: string } | undefined)?.baseUrl ??
@@ -271,17 +268,17 @@ export const webchannelSetup = {
       runtime.log(
         `[webchannel] account "${id}": no saas-base-url provided; cannot run ` +
           `device-flow acquisition. Re-run: openclaw channels add --channel ` +
-          `webchannel --account ${id} --base-url <saas-url> --url <tenant> ` +
-          `--token <agent-id>`,
+          `webchannel --account ${id} --base-url <saas-url> --url <tenant>`,
       );
       return;
     }
 
     // Echo the RESOLVED identity (non-secret) so the generic-flag mapping is
-    // never silent — a mis-mapped --url/--token/--base-url is visible here.
+    // never silent — a mis-mapped --url/--base-url is visible here. The wire
+    // identity is the account id itself (가-2).
     runtime.log(
       `[webchannel] account "${id}" resolved acquisition identity: ` +
-        `tenant=${tenant}, agentId=${agentId ?? "(none)"}, saasBaseUrl=${saasBaseUrl}`,
+        `accountId=${id}, tenant=${tenant}, saasBaseUrl=${saasBaseUrl}`,
     );
 
     try {
@@ -289,7 +286,6 @@ export const webchannelSetup = {
         accountId: id,
         saasBaseUrl,
         tenant,
-        agentId,
         log: (...args) => runtime.log(...args),
       });
     } catch (err) {

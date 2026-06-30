@@ -9,16 +9,7 @@ beforeEach(() => {
 
 /** Helper: collect the served plans (status === "serve"). */
 function served(entries: ReturnType<typeof planAccounts>) {
-  return entries.filter((e) => e.status === "serve") as Extract<
-    ReturnType<typeof planAccounts>[number],
-    { status: "serve" }
-  >[];
-}
-function skipped(entries: ReturnType<typeof planAccounts>) {
-  return entries.filter((e) => e.status === "skip") as Extract<
-    ReturnType<typeof planAccounts>[number],
-    { status: "skip" }
-  >[];
+  return entries.filter((e) => e.status === "serve");
 }
 
 describe("planAccounts: single default (regression)", () => {
@@ -27,7 +18,6 @@ describe("planAccounts: single default (regression)", () => {
       channels: {
         webchannel: {
           tenant: "t",
-          agentId: "agent-default",
           auth: { strategy: "jwt" },
         },
       },
@@ -37,7 +27,6 @@ describe("planAccounts: single default (regression)", () => {
     expect(served(plans)[0]).toMatchObject({
       accountId: "default",
       tenant: "t",
-      agentId: "agent-default",
     });
   });
 
@@ -47,7 +36,6 @@ describe("planAccounts: single default (regression)", () => {
       {
         env: {
           WEBCHANNEL_TENANT: "envT",
-          WEBCHANNEL_AGENT_ID: "envAgent",
           WEBCHANNEL_SAAS_BASE_URL: "http://env",
         },
       },
@@ -56,28 +44,27 @@ describe("planAccounts: single default (regression)", () => {
     expect(served(plans)[0]).toMatchObject({
       accountId: "default",
       tenant: "envT",
-      agentId: "envAgent",
       saasBaseUrl: "http://env",
     });
   });
 });
 
 describe("planAccounts: multi-account (Phase 3)", () => {
-  it("plans N accounts with their own per-account tenant/agentId", () => {
+  it("plans N accounts with their own per-account tenant (accountId is the wire identity)", () => {
     const cfg = {
       channels: {
         webchannel: {
           accounts: {
-            acctA: { tenant: "tA", agentId: "agentA", saas: { baseUrl: "http://a" } },
-            acctB: { tenant: "tB", agentId: "agentB" },
+            acctA: { tenant: "tA", saas: { baseUrl: "http://a" } },
+            acctB: { tenant: "tB" },
           },
         },
       },
     };
     const plans = served(planAccounts(cfg, { env: {} }));
     expect(plans.map((p) => p.accountId)).toEqual(["acctA", "acctB"]);
-    expect(plans[0]).toMatchObject({ accountId: "acctA", tenant: "tA", agentId: "agentA", saasBaseUrl: "http://a" });
-    expect(plans[1]).toMatchObject({ accountId: "acctB", tenant: "tB", agentId: "agentB" });
+    expect(plans[0]).toMatchObject({ accountId: "acctA", tenant: "tA", saasBaseUrl: "http://a" });
+    expect(plans[1]).toMatchObject({ accountId: "acctB", tenant: "tB" });
   });
 
   it("serves the default (channel-level) account alongside named accounts", () => {
@@ -85,15 +72,14 @@ describe("planAccounts: multi-account (Phase 3)", () => {
       channels: {
         webchannel: {
           tenant: "tDef",
-          agentId: "agentDef",
-          accounts: { acctA: { tenant: "tA", agentId: "agentA" } },
+          accounts: { acctA: { tenant: "tA" } },
         },
       },
     };
     const plans = served(planAccounts(cfg, { env: {} }));
     expect(plans.map((p) => p.accountId).sort()).toEqual(["acctA", "default"]);
     const def = plans.find((p) => p.accountId === "default");
-    expect(def).toMatchObject({ agentId: "agentDef", tenant: "tDef" });
+    expect(def).toMatchObject({ accountId: "default", tenant: "tDef" });
   });
 
   it("carries the merged per-account config (shared base inherited)", () => {
@@ -101,7 +87,7 @@ describe("planAccounts: multi-account (Phase 3)", () => {
       channels: {
         webchannel: {
           auth: { strategy: "jwt" },
-          accounts: { acctA: { tenant: "tA", agentId: "agentA", dmSecurity: "allowlist" } },
+          accounts: { acctA: { tenant: "tA", dmSecurity: "allowlist" } },
         },
       },
     };
@@ -111,67 +97,37 @@ describe("planAccounts: multi-account (Phase 3)", () => {
   });
 });
 
-describe("planAccounts: named-account-without-own-agentId skip (Rule 1)", () => {
-  it("skips a named account that does not declare its OWN agentId", () => {
+describe("planAccounts: 가-2 decoupled handling agent", () => {
+  it("serves a named account that declares NO agentId (agent is a bind concern)", () => {
+    // 가-2: the wire identity is the accountId itself, so a named account needs no
+    // per-account agentId — the handling agent is selected purely via `agents bind`.
     const cfg = {
       channels: {
         webchannel: {
-          // channel-level agentId would be inherited by acctA via merge — must NOT.
-          agentId: "shared-agent",
           accounts: { acctA: { tenant: "tA" } },
         },
       },
     };
     const plans = planAccounts(cfg, { env: {} });
-    const sk = skipped(plans).find((s) => s.accountId === "acctA");
-    expect(sk?.reason).toBe("missing-agent-id");
-    expect(sk?.message).toContain("--agent-id");
-    expect(served(plans).some((p) => p.accountId === "acctA")).toBe(false);
+    expect(served(plans).map((p) => p.accountId)).toEqual(["acctA"]);
   });
 
-  it("does NOT skip the default account for using channel-level identity", () => {
-    const cfg = { channels: { webchannel: { agentId: "shared-agent", tenant: "t" } } };
-    const plans = planAccounts(cfg, { env: {} });
-    expect(served(plans).map((p) => p.accountId)).toEqual(["default"]);
-  });
-});
-
-describe("planAccounts: duplicate-agentId skip (Rule 2)", () => {
-  it("skips the later account that collides on agentId; keeps the first", () => {
+  it("silently ignores a leftover (legacy) agentId field in account config", () => {
+    // A stale `agentId` from an old config must not crash and must not affect the
+    // served plan — accountId is the only wire coordinate.
     const cfg = {
       channels: {
         webchannel: {
+          agentId: "legacy-shared",
           accounts: {
-            acctA: { tenant: "tA", agentId: "dup" },
-            acctB: { tenant: "tB", agentId: "dup" },
+            acctA: { tenant: "tA", agentId: "legacy-a" },
+            acctB: { tenant: "tB", agentId: "legacy-a" }, // duplicate legacy value: harmless now
           },
         },
       },
     };
     const plans = planAccounts(cfg, { env: {} });
-    // Sorted order: acctA first wins "dup"; acctB skipped.
-    expect(served(plans).map((p) => p.accountId)).toEqual(["acctA"]);
-    const sk = skipped(plans).find((s) => s.accountId === "acctB");
-    expect(sk?.reason).toBe("duplicate-agent-id");
-    expect(sk?.message).toContain("acctA");
-  });
-
-  it("detects collision between a named account and the default", () => {
-    const cfg = {
-      channels: {
-        webchannel: {
-          agentId: "dup", // default's agentId
-          accounts: { acctA: { tenant: "tA", agentId: "dup" } },
-        },
-      },
-    };
-    const plans = planAccounts(cfg, { env: {} });
-    // Sorted: "acctA" < "default" → acctA keeps "dup", default skipped.
-    const servedIds = served(plans).map((p) => p.accountId);
-    expect(servedIds).toContain("acctA");
-    expect(servedIds).not.toContain("default");
-    expect(skipped(plans).find((s) => s.accountId === "default")?.reason).toBe(
-      "duplicate-agent-id",
-    );
+    // Both named accounts serve; the wire identity is their (unique) accountId.
+    expect(served(plans).map((p) => p.accountId).sort()).toEqual(["acctA", "acctB"]);
   });
 });

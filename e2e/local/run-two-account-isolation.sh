@@ -2,11 +2,13 @@
 # 가-1 Cycle 3 — 2-ACCOUNT ROUTING-ISOLATION E2E (AC6, the completion gate).
 #
 # Stands up ONE openclaw gateway (index-nats plugin) serving TWO webchannel
-# accounts simultaneously — acctA (agentId=agentA) and acctB (agentId=agentB) —
-# each with its own auth.jwt audience, bound to a DISTINCT agent via
-# `binding.account` (webchannel:acctA→agentA, webchannel:acctB→agentB). Each agent
-# uses a DISTINCT echo model (distinct ECHO_PREFIX) so the agent that handled a
-# turn is observable in the reply text.
+# accounts simultaneously — acctA and acctB — each with its own auth.jwt audience
+# (= the account id itself), bound to a DISTINCT agent via `binding.account`
+# (the equivalent of `openclaw agents bind --bind webchannel:acctA --agent agentA`
+# / `--bind webchannel:acctB --agent agentB`). The handling agent is DECOUPLED
+# from the wire identity: the wire identity IS the accountId, and the agent is a
+# pure `agents bind` concern (telegram-like). Each agent uses a DISTINCT echo model
+# (distinct ECHO_PREFIX) so the agent that handled a turn is observable in the reply.
 #
 # Then a Node driver (the PRODUCTION WebChannelNatsClient) drives a message into
 # EACH account and asserts ROUTING ISOLATION:
@@ -15,8 +17,8 @@
 #
 # This exercises the REAL stack (no unit mocks):
 #   - registerFull MULTIPLEX  → two NatsChannels, one per account
-#   - single register route's JWT-aud→account DISPATCH → aud=agentA hits acctA's
-#     channel.registerPeer (Cycle 2 C2 invariant), aud=agentB hits acctB's
+#   - single register route's JWT-aud→account DISPATCH → aud=acctA hits acctA's
+#     channel.registerPeer (Cycle 2 C2 invariant), aud=acctB hits acctB's
 #   - binding.account ROUTING → resolveAgentRoute(accountId) picks the bound agent
 #
 # Credential source is dev/open-NATS (WEBCHANNEL_NATS_DEV_OPEN=1), as in the
@@ -124,7 +126,10 @@ ECHO_B_PID=$!
 echo "[run-two-acct] echo servers: A pid=$ECHO_A_PID ($ECHO_A_PORT), B pid=$ECHO_B_PID ($ECHO_B_PORT)"
 
 # 4. Isolated config: TWO providers + TWO agents + TWO webchannel accounts + TWO
-#    account-scoped bindings. Per-account auth.jwt audience = that account's agentId.
+#    account-scoped bindings (the persisted form of `agents bind --bind
+#    webchannel:<acct> --agent <agent>`). Per-account auth.jwt audience = the
+#    account id itself (the wire identity); the handling agent is decoupled and
+#    selected ONLY via the bindings below — no per-account config agentId.
 cat > "$OCH/.openclaw/openclaw.json" <<JSON
 {
   "gateway": { "mode": "local", "bind": "loopback" },
@@ -167,17 +172,15 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
       "accounts": {
         "$ACCT_A": {
           "tenant": "$TENANT",
-          "agentId": "$AGENT_A",
           "auth": { "strategy": "jwt", "jwt": {
-            "jwksFile": "$OCH/jwks.json", "issuer": "$ISS", "audience": "$AGENT_A" } },
+            "jwksFile": "$OCH/jwks.json", "issuer": "$ISS", "audience": "$ACCT_A" } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$PEER_A"]
         },
         "$ACCT_B": {
           "tenant": "$TENANT",
-          "agentId": "$AGENT_B",
           "auth": { "strategy": "jwt", "jwt": {
-            "jwksFile": "$OCH/jwks.json", "issuer": "$ISS", "audience": "$AGENT_B" } },
+            "jwksFile": "$OCH/jwks.json", "issuer": "$ISS", "audience": "$ACCT_B" } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$PEER_B"]
         }
@@ -219,14 +222,16 @@ if ! grep -q "account \"$ACCT_A\" ✓ encrypted NATS channel" "$OCH/gateway.log"
 fi
 
 run_account() {
-  local label="$1" peer="$2" agent="$3" expect="$4" forbid="$5"
-  echo "[run-two-acct] driving $label (peer=$peer, agent=$agent)…"
+  # The wire identity is the ACCOUNT id (= JWT aud); the handling agent is chosen
+  # by the binding (webchannel:<acct> → <agent>), NOT carried on the wire.
+  local label="$1" peer="$2" acct="$3" expect="$4" forbid="$5"
+  echo "[run-two-acct] driving $label (peer=$peer, account=$acct)…"
   set +e
   WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
   WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
   WEBCHANNEL_RS256_PRIVATE="$OCH/rs256-private.jwk.json" \
   WEBCHANNEL_ISSUER="$ISS" WEBCHANNEL_TENANT="$TENANT" \
-  WEBCHANNEL_PEER_ID="$peer" WEBCHANNEL_AGENT_ID="$agent" \
+  WEBCHANNEL_PEER_ID="$peer" WEBCHANNEL_ACCOUNT_ID="$acct" \
   EXPECT_PREFIX="$expect" FORBID_PREFIX="$forbid" \
   SEND_MESSAGE="hello from $label" \
     node --import tsx "$REPO/e2e/local/two-account-isolation-roundtrip.ts"
@@ -236,11 +241,11 @@ run_account() {
 }
 
 # 6. Drive acctA → MUST reach agentA (A prefix), MUST NOT reach agentB (no B prefix).
-run_account "acctA" "$PEER_A" "$AGENT_A" "$ECHO_A_PREFIX" "$ECHO_B_PREFIX" || {
+run_account "acctA" "$PEER_A" "$ACCT_A" "$ECHO_A_PREFIX" "$ECHO_B_PREFIX" || {
   echo "[run-two-acct] acctA isolation FAILED — gateway log tail:"; tail -40 "$OCH/gateway.log"; exit 3
 }
 # 7. Drive acctB → MUST reach agentB (B prefix), MUST NOT reach agentA (no A prefix).
-run_account "acctB" "$PEER_B" "$AGENT_B" "$ECHO_B_PREFIX" "$ECHO_A_PREFIX" || {
+run_account "acctB" "$PEER_B" "$ACCT_B" "$ECHO_B_PREFIX" "$ECHO_A_PREFIX" || {
   echo "[run-two-acct] acctB isolation FAILED — gateway log tail:"; tail -40 "$OCH/gateway.log"; exit 3
 }
 

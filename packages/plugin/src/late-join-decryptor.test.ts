@@ -90,7 +90,7 @@ function routing(
   ts = 1_718_000_000_000,
 ): EnvelopeRouting {
   return {
-    agentId: "agent-late-join",
+    accountId: "agent-late-join",
     tenant: "tenant-acme",
     sub: "user-42",
     messageId,

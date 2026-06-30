@@ -72,7 +72,7 @@ node e2e/local/echo-openai-server.mjs 18900 &
 # 4. boot the isolated gateway in dev/open-NATS mode (env-driven — see the contract below)
 OPENCLAW_HOME="$OCH" WEBCHANNEL_TICKET_SECRET=e2e-ticket-secret OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_DEV_OPEN=1 WEBCHANNEL_NATS_URL=ws://127.0.0.1:18222 \
-  WEBCHANNEL_TENANT=default-tenant WEBCHANNEL_AGENT_ID=default-agent \
+  WEBCHANNEL_TENANT=default-tenant WEBCHANNEL_ACCOUNT_ID=default-agent \
   node_modules/.bin/openclaw gateway --port 18799 --force &
 # wait for: "[webchannel] ✓ NATS mode plugin registered"
 
@@ -172,7 +172,7 @@ against the plugin schema and rejects unknown keys (so you cannot put `nats`/`en
 |---|---|
 | `WEBCHANNEL_NATS_DEV_OPEN=1` | enable the dev/open-NATS path (no enrollment, no JWT) |
 | `WEBCHANNEL_NATS_URL` | nats-server ws URL (default `ws://127.0.0.1:4222`) |
-| `WEBCHANNEL_TENANT` / `WEBCHANNEL_AGENT_ID` | subject-namespace fields (must match the browser client) |
+| `WEBCHANNEL_TENANT` / `WEBCHANNEL_ACCOUNT_ID` | subject-namespace fields (`accountId` = the wire identity; must match the browser client) |
 
 Encryption stays **on** (encrypt-by-construction default); the relay only ever sees ciphertext.
 

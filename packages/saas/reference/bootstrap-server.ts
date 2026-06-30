@@ -54,7 +54,7 @@ const NATS_URL = process.env.NATS_URL || "wss://nats.example.com";
 type BootstrapRequest = {
   devicePublicKey: string; // base64url-encoded X25519 public key (→ cnf.jwk)
   devicePopPublicKey?: string; // base64url-encoded Ed25519 PoP public key (→ pop_jwk)
-  agentId: string;
+  accountId: string;
   tenant: string;
   peerId?: string; // optional caller-supplied peerId; else derived from device key
   pop?: string; // Proof of possession (signature) - optional for this demo
@@ -187,8 +187,8 @@ async function handleBootstrap(req: any, res: any, trustChain: RealTrustChain): 
       return;
     }
 
-    if (!request.agentId || typeof request.agentId !== "string") {
-      sendJson(res, { error: "invalid agentId" }, 400);
+    if (!request.accountId || typeof request.accountId !== "string") {
+      sendJson(res, { error: "invalid accountId" }, 400);
       return;
     }
 
@@ -219,7 +219,7 @@ async function handleBootstrap(req: any, res: any, trustChain: RealTrustChain): 
     const jwtPayload = buildBootstrapClaims({
       iss: SAAS_ISSUER,
       peerId,
-      agentId: request.agentId,
+      accountId: request.accountId,
       tenant: request.tenant,
       deviceX25519PublicKey: request.devicePublicKey,
       devicePopPublicKey: request.devicePopPublicKey,

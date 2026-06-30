@@ -14,7 +14,7 @@
  * NATS transport, AAD binding) production-identical.
  *
  * AAD binding: BOTH browser and agent compute
- *   canonicalAad = UTF-8(JSON.stringify({tenant, agentId, sub, messageId, envelopeType, ts}))
+ *   canonicalAad = UTF-8(JSON.stringify({tenant, accountId, sub, messageId, envelopeType, ts}))
  * using the SAME key order. An AAD mismatch fails decryption.
  */
 
@@ -44,7 +44,7 @@ import type { NatsMessage } from "./nats-transport.js";
  * Canonical AAD binding for a message envelope.
  *
  * AAD = UTF-8 bytes of JSON-serialized routing metadata with FIXED key order:
- *   {tenant, agentId, sub, messageId, envelopeType, ts}
+ *   {tenant, accountId, sub, messageId, envelopeType, ts}
  *
  * An AAD mismatch causes ChaCha20-Poly1305 decryption to throw. Both browser
  * and agent MUST derive AAD from the SAME fields in the SAME key order.
@@ -55,7 +55,7 @@ export function canonicalAad(routing: EnvelopeRouting): Uint8Array {
   return new TextEncoder().encode(
     JSON.stringify({
       tenant:       routing.tenant,
-      agentId:      routing.agentId,
+      accountId:    routing.accountId,
       sub:          routing.sub,
       messageId:    routing.messageId,
       envelopeType: routing.envelopeType,
@@ -73,7 +73,7 @@ export type E2EAgentOptions = {
   natsUrl: string;
   /** Subject namespace routing fields */
   tenant: string;
-  agentId: string;
+  accountId: string;
   /**
    * Optional pre-shared 32-byte session key.
    * When provided, the agent skips X25519 key exchange and uses this key
@@ -126,7 +126,7 @@ export type E2EAgentHandle = {
  * Returns an `E2EAgentHandle` for teardown via `handle.stop()`.
  */
 export async function startE2EAgent(opts: E2EAgentOptions): Promise<E2EAgentHandle> {
-  const { tenant, agentId, echoPrefix = "echo: " } = opts;
+  const { tenant, accountId, echoPrefix = "echo: " } = opts;
 
   const transport = new NatsTransport({
     url: opts.natsUrl,
@@ -137,8 +137,8 @@ export async function startE2EAgent(opts: E2EAgentOptions): Promise<E2EAgentHand
   await transport.connect();
 
   // NATS subject patterns
-  const inboundWildcard   = `webchannel.${tenant}.${agentId}.*.in`;
-  const handshakeWildcard = `webchannel.${tenant}.${agentId}.*.handshake`;
+  const inboundWildcard   = `webchannel.${tenant}.${accountId}.*.in`;
+  const handshakeWildcard = `webchannel.${tenant}.${accountId}.*.handshake`;
 
   // Subscribe to inbound messages from any peer
   transport.subscribe(inboundWildcard);
@@ -162,7 +162,7 @@ export async function startE2EAgent(opts: E2EAgentOptions): Promise<E2EAgentHand
     // Determine message type from subject suffix
     const parts = msg.subject.split(".");
     const suffix = parts[parts.length - 1];      // "in", "out", "handshake"
-    const peerId = parts[3] ?? "";               // webchannel.{tenant}.{agentId}.{peerId}.*
+    const peerId = parts[3] ?? "";               // webchannel.{tenant}.{accountId}.{peerId}.*
 
     if (!peerId) return;
 
@@ -194,7 +194,7 @@ export async function startE2EAgent(opts: E2EAgentOptions): Promise<E2EAgentHand
       // Respond with agent's public key on the SAME handshake subject
       const agentPubKeyB64 = Buffer.from(agentKP.publicKey).toString("base64url");
       transport.publish(
-        `webchannel.${tenant}.${agentId}.${peerId}.handshake`,
+        `webchannel.${tenant}.${accountId}.${peerId}.handshake`,
         JSON.stringify({ type: "key_exchange", pubKey: agentPubKeyB64 }),
       );
     } catch {
@@ -240,7 +240,7 @@ export async function startE2EAgent(opts: E2EAgentOptions): Promise<E2EAgentHand
 
     // --- Construct reply routing ---
     const replyRouting: EnvelopeRouting = {
-      agentId:      routing.agentId,
+      accountId:    routing.accountId,
       tenant:       routing.tenant,
       sub:          routing.sub,
       messageId:    randomBytes(8).toString("hex"),
@@ -254,7 +254,7 @@ export async function startE2EAgent(opts: E2EAgentOptions): Promise<E2EAgentHand
     const replyWire = serializeEnvelope(replyEnvelope);
 
     // --- Publish to outbound subject ---
-    transport.publish(`webchannel.${tenant}.${agentId}.${peerId}.out`, replyWire);
+    transport.publish(`webchannel.${tenant}.${accountId}.${peerId}.out`, replyWire);
   }
 
   return {

@@ -36,14 +36,14 @@
  * Zero-plaintext guarantee
  * ────────────────────────
  * The serialized envelope passed to NatsTransport.publish() contains ONLY:
- *   - Plaintext routing fields (agentId / tenant / sub / messageId /
+ *   - Plaintext routing fields (accountId / tenant / sub / messageId /
  *     envelopeType / ts) — visible to the NATS relay operator for routing.
  *   - Encrypted content block (nonce / ciphertext / tag) — opaque to the relay.
  *
  * No approval payload field (title / prompt / options / decision / body)
  * appears in the NATS wire bytes.  The relay operator learns ONLY that an
  * approval message of type `approval_request|approval_decision|approval_resolved`
- * was exchanged for the given agentId/tenant/sub combination; the actual
+ * was exchanged for the given accountId/tenant/sub combination; the actual
  * content is sealed inside the ciphertext.
  */
 

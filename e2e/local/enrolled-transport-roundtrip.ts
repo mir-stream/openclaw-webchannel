@@ -39,14 +39,14 @@ const NATS_WS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18422";
 const GW_URL = process.env.WEBCHANNEL_GW_URL ?? "http://127.0.0.1:18999";
 const ISSUER = process.env.WEBCHANNEL_ISSUER_URL ?? "http://127.0.0.1:3921";
 const TENANT = process.env.WEBCHANNEL_TENANT ?? "default-tenant";
-const AGENT_ID = process.env.WEBCHANNEL_AGENT_ID ?? "default-agent";
+const ACCOUNT_ID = process.env.WEBCHANNEL_ACCOUNT_ID ?? "default-agent";
 const PEER_ID = process.env.WEBCHANNEL_PEER_ID ?? "enrolled-driver-peer";
 
 const MESSAGE = "hello via enrolled transport";
 
-const inboundSubj = `webchannel.${TENANT}.${AGENT_ID}.${PEER_ID}.in`;
-const outboundSubj = `webchannel.${TENANT}.${AGENT_ID}.${PEER_ID}.out`;
-const handshakeSubj = `webchannel.${TENANT}.${AGENT_ID}.${PEER_ID}.handshake`;
+const inboundSubj = `webchannel.${TENANT}.${ACCOUNT_ID}.${PEER_ID}.in`;
+const outboundSubj = `webchannel.${TENANT}.${ACCOUNT_ID}.${PEER_ID}.out`;
+const handshakeSubj = `webchannel.${TENANT}.${ACCOUNT_ID}.${PEER_ID}.handshake`;
 
 function fail(code: number, msg: string): never {
   console.error(`[FAIL] ${msg}`);
@@ -79,7 +79,7 @@ const popKeyPair = await generateDevicePopKeyPair();
 // 2. Mint a bootstrap JWT from THIS issuer's trust chain, INCLUDING pop_jwk.
 const boot = await postJson(`${ISSUER}/test/bootstrap-jwt`, {
   tenant: TENANT,
-  agentId: AGENT_ID,
+  accountId: ACCOUNT_ID,
   peerId: PEER_ID,
   deviceX25519PublicKey: deviceKp.publicKeyB64url,
   devicePopPublicKey: popKeyPair.publicJwk.x,
@@ -139,7 +139,7 @@ const replyText = new Promise<string>((resolve, reject) => {
       if (!agentPub) return;
       void deriveConversationKey(deviceKp.privateKey, agentPub).then((key) => {
         sessionKey = key;
-        const wire = sealMessage({ agentId: AGENT_ID, tenant: TENANT, sub: PEER_ID }, key, {
+        const wire = sealMessage({ accountId: ACCOUNT_ID, tenant: TENANT, sub: PEER_ID }, key, {
           type: "user_message",
           text: MESSAGE,
         });

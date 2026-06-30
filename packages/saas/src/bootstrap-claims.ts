@@ -37,8 +37,8 @@ export type BootstrapClaimsInput = {
   iss: string;
   /** Stable per-user identity = peerId = JWT `sub`. */
   peerId: string;
-  /** Target agent (also the JWT `aud`). */
-  agentId: string;
+  /** Account (deployment) identity = wire identity (also the JWT `aud`). */
+  accountId: string;
   /** Tenant scope. */
   tenant: string;
   /** Device X25519 public key (base64url 32 bytes) → `cnf.jwk`. */
@@ -62,7 +62,7 @@ export type BootstrapClaims = {
   aud: string;
   exp: number;
   iat: number;
-  agentId: string;
+  accountId: string;
   tenant: string;
   cnf: { jwk: DeviceCnfJwk };
   pop_jwk?: DevicePopJwk;
@@ -93,10 +93,10 @@ export function buildBootstrapClaims(input: BootstrapClaimsInput): BootstrapClai
   const claims: BootstrapClaims = {
     iss: input.iss,
     sub: input.peerId,
-    aud: input.agentId,
+    aud: input.accountId,
     exp: now + ttl,
     iat: now,
-    agentId: input.agentId,
+    accountId: input.accountId,
     tenant: input.tenant,
     cnf: { jwk: { kty: "OKP", crv: "X25519", x: input.deviceX25519PublicKey } },
   };

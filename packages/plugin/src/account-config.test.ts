@@ -208,14 +208,13 @@ describe("account-config: resolveAcquisitionIdentity", () => {
     const cfg = {
       channels: {
         webchannel: {
-          accounts: { acctA: { tenant: "tA", agentId: "aA", saas: { baseUrl: "http://s" } } },
+          accounts: { acctA: { tenant: "tA", saas: { baseUrl: "http://s" } } },
         },
       },
     };
     expect(resolveAcquisitionIdentity(cfg, "acctA")).toEqual({
       accountId: "acctA",
       tenant: "tA",
-      agentId: "aA",
       saasBaseUrl: "http://s",
     });
   });
@@ -223,14 +222,12 @@ describe("account-config: resolveAcquisitionIdentity", () => {
   it("falls back to top-level cfg for the default account only", () => {
     const cfg = {
       tenant: "topTenant",
-      agentId: "topAgent",
       saas: { baseUrl: "http://top" },
       channels: { webchannel: { allowFrom: ["a"] } },
     };
     expect(resolveAcquisitionIdentity(cfg, "default")).toEqual({
       accountId: "default",
       tenant: "topTenant",
-      agentId: "topAgent",
       saasBaseUrl: "http://top",
     });
   });
@@ -238,12 +235,12 @@ describe("account-config: resolveAcquisitionIdentity", () => {
   it("does NOT use top-level fallback for a non-default account with no own identity", () => {
     const cfg = {
       tenant: "topTenant",
-      agentId: "topAgent",
       channels: { webchannel: { accounts: { acctB: {} } } },
     };
     const id = resolveAcquisitionIdentity(cfg, "acctB");
     expect(id.tenant).toBe("default-tenant");
-    expect(id.agentId).toBe("default-agent");
+    // accountId is the wire identity (가-2); the handling agent is a bind concern.
+    expect(id.accountId).toBe("acctB");
     expect(id.saasBaseUrl).toBeUndefined();
   });
 
@@ -251,7 +248,6 @@ describe("account-config: resolveAcquisitionIdentity", () => {
     expect(resolveAcquisitionIdentity({}, "default")).toEqual({
       accountId: "default",
       tenant: "default-tenant",
-      agentId: "default-agent",
       saasBaseUrl: undefined,
     });
   });

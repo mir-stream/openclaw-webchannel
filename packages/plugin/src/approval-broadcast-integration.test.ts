@@ -11,7 +11,7 @@
  *
  * All devices of user `<sub>` subscribe to the same approval subject:
  *
- *   chat.<tenant>.<agentId>.<sub>.approval
+ *   chat.<tenant>.<accountId>.<sub>.approval
  *
  * The agent publishes ONE encrypted `approval_request` envelope to this
  * subject. The NATS broker fans it out to every subscriber. No per-device
@@ -296,7 +296,7 @@ function approvalRouting(
   sub = USER_A_SUB,
   ts = 1_718_000_000_000,
 ) {
-  return { agentId: AGENT_ID, tenant: TENANT, sub, messageId: approvalId, ts };
+  return { accountId: AGENT_ID, tenant: TENANT, sub, messageId: approvalId, ts };
 }
 
 // ---------------------------------------------------------------------------
@@ -390,7 +390,7 @@ describe("Approval Multi-device Broadcast (Sub-AC 7.2)", () => {
 
       // All N devices subscribe to the shared approval subject.
       // This is the NATS subject/subscription pattern: one subject per (tenant,
-      // agentId, sub) — all devices of the same user share it.
+      // accountId, sub) — all devices of the same user share it.
       const perDeviceReceived = subscribeAll(devices, APPROVAL_A);
 
       // Agent publishes ONE encrypted approval_request.
@@ -862,7 +862,7 @@ describe("Approval Multi-device Broadcast (Sub-AC 7.2)", () => {
       // Routing metadata IS plaintext (per design).
       expect(wireJson).toContain("approval_request");    // envelopeType
       expect(wireJson).toContain(approvalId);             // messageId
-      expect(wireJson).toContain(AGENT_ID);               // agentId
+      expect(wireJson).toContain(AGENT_ID);               // accountId
       expect(wireJson).toContain(TENANT);                 // tenant
 
       // Content block is structurally opaque: exactly {nonce, ciphertext, tag}.

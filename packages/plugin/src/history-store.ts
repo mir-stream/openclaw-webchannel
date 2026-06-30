@@ -11,8 +11,8 @@
  * Storage model
  * ─────────────
  * Envelopes are stored per-conversation in insertion order (append-only).
- * A conversation is identified by the triple (agentId, tenant, sub):
- *   - agentId — SaaS-issued agent identity.
+ * A conversation is identified by the triple (accountId, tenant, sub):
+ *   - accountId — SaaS-issued account (deployment) identity.
  *   - tenant  — Tenant scope (NATS account boundary).
  *   - sub     — JWT sub claim (stable per-user identity across devices).
  *
@@ -60,13 +60,13 @@ import type { MessageEnvelope } from "./e2e-envelope.js";
 /**
  * Identifies a conversation stored in the HistoryStore.
  *
- * The triple (agentId, tenant, sub) uniquely scopes a conversation:
- *   - agentId: SaaS-issued agent identity (from JWT agentId claim).
+ * The triple (accountId, tenant, sub) uniquely scopes a conversation:
+ *   - accountId: SaaS-issued account (deployment) identity (from JWT accountId claim).
  *   - tenant:  Tenant scope (from JWT tenant claim; NATS account boundary).
  *   - sub:     Stable per-user JWT sub claim (multi-device invariant).
  */
 export type ConversationId = {
-  readonly agentId: string;
+  readonly accountId: string;
   readonly tenant: string;
   readonly sub: string;
 };
@@ -119,7 +119,7 @@ export class HistoryStore {
    * Envelopes are stored in the order they are appended. The caller MUST
    * ensure `envelope.content` is a valid E2E ciphertext block (never plaintext).
    *
-   * @param conv     - Conversation identifier (agentId + tenant + sub).
+   * @param conv     - Conversation identifier (accountId + tenant + sub).
    * @param envelope - The `MessageEnvelope` to store. Content must be ciphertext.
    */
   append(conv: ConversationId, envelope: MessageEnvelope): void {
@@ -143,7 +143,7 @@ export class HistoryStore {
    * position immediately after the cursor (`before`). This supports forward
    * pagination for full backlog replay in chronological order.
    *
-   * @param conv   - Conversation to query (agentId + tenant + sub).
+   * @param conv   - Conversation to query (accountId + tenant + sub).
    * @param before - Cursor from the previous page's `nextCursor`. Pass `null`
    *                 to start from the beginning (oldest envelopes first).
    *                 Pass the `nextCursor` from a previous `loadHistory` call
@@ -221,10 +221,10 @@ export class HistoryStore {
    * Derive a stable string key from a ConversationId.
    *
    * Uses NUL bytes as field separators to prevent collisions between fields
-   * that might otherwise compose to the same string (e.g., agentId="a\0b",
-   * tenant="c" vs agentId="a", tenant="b\0c").
+   * that might otherwise compose to the same string (e.g., accountId="a\0b",
+   * tenant="c" vs accountId="a", tenant="b\0c").
    */
   #conversationKey(id: ConversationId): string {
-    return `${id.agentId}\0${id.tenant}\0${id.sub}`;
+    return `${id.accountId}\0${id.tenant}\0${id.sub}`;
   }
 }

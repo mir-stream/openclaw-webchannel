@@ -31,7 +31,7 @@
  * ────────
  * Typing signals are encrypted like any other envelope (ChaCha20-Poly1305 via
  * CryptoNatsChannel).  The relay operator sees only ciphertext and the plaintext
- * routing metadata (`envelopeType: "typing"`, subject, agentId/tenant/sub).
+ * routing metadata (`envelopeType: "typing"`, subject, accountId/tenant/sub).
  * Content (`{ typing: true }`) is not observable without the session key.
  *
  * Deferred
@@ -94,7 +94,7 @@ export function isEphemeralEnvelope(envelope: MessageEnvelope): boolean {
  * `{ typing: false }` when they have stopped (e.g. deleted their draft).
  *
  * @param channel   - A connected `CryptoNatsChannel` (auto-encrypts the payload).
- * @param subject   - NATS typing subject, e.g. `"chat.<tenant>.<agentId>.<sub>.typing"`.
+ * @param subject   - NATS typing subject, e.g. `"chat.<tenant>.<accountId>.<sub>.typing"`.
  * @param typing    - `true` = user is typing; `false` = user stopped typing.
  * @param messageId - Optional stable message ID (defaults to random 8-byte hex).
  *                    Callers that need dedup or idempotency may supply a fixed id.
@@ -137,7 +137,7 @@ export function sendTypingSignal(
  * whose `envelopeType === "typing"`.
  *
  * @param store    - The authority `HistoryStore` instance.
- * @param conv     - Conversation identifier (agentId + tenant + sub).
+ * @param conv     - Conversation identifier (accountId + tenant + sub).
  * @param envelope - The raw `MessageEnvelope` (always ciphertext; never plaintext).
  */
 export function persistIfNotEphemeral(

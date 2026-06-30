@@ -48,7 +48,7 @@ const BOOTSTRAP_SERVER_PORT = 3457;
 const SAAS_BASE_URL = `http://localhost:${ENROLLMENT_SERVER_PORT}`;
 const BOOTSTRAP_BASE_URL = `http://localhost:${BOOTSTRAP_SERVER_PORT}`;
 const TEST_TENANT = "test-tenant";
-const TEST_AGENT_ID = "test-agent";
+const TEST_ACCOUNT_ID = "test-agent";
 
 // ---------------------------------------------------------------------------
 // Process management for HTTP servers
@@ -324,7 +324,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     const enrollRequest = {
       agentPublicKey: pluginKeyPair.publicKey,
       tenant: TEST_TENANT,
-      agentId: TEST_AGENT_ID,
+      accountId: TEST_ACCOUNT_ID,
     };
 
     const enrollResponse = await postJson(
@@ -360,7 +360,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       {
         agentPublicKey: pluginKeyPair.publicKey,
         tenant: TEST_TENANT,
-        agentId: TEST_AGENT_ID,
+        accountId: TEST_ACCOUNT_ID,
       },
     ) as {
       device_code: string;
@@ -380,13 +380,13 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       success: boolean;
       peerId: string;
       tenant: string;
-      agentId: string;
+      accountId: string;
     };
 
     expect(approveResponse.success).toBe(true);
     expect(approveResponse.peerId).toBeDefined();
     expect(approveResponse.tenant).toBe(TEST_TENANT);
-    expect(approveResponse.agentId).toBe(TEST_AGENT_ID);
+    expect(approveResponse.accountId).toBe(TEST_ACCOUNT_ID);
 
     console.log(`[AC6 E2E] Step 2: Enrollment approved, peerId: ${approveResponse.peerId}`);
 
@@ -445,7 +445,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
 
     const bootstrapRequest = {
       devicePublicKey,
-      agentId: TEST_AGENT_ID,
+      accountId: TEST_ACCOUNT_ID,
       tenant: TEST_TENANT,
     };
 
@@ -486,8 +486,8 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     expect(payload).toMatchObject({
       iss: expect.any(String),
       sub: bootstrapResponse.peerId, // peerId is threaded into sub
-      aud: TEST_AGENT_ID,
-      agentId: TEST_AGENT_ID,
+      aud: TEST_ACCOUNT_ID,
+      accountId: TEST_ACCOUNT_ID,
       tenant: TEST_TENANT,
       cnf: {
         jwk: {
@@ -519,7 +519,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
 
     const bootstrapResponse = await postJson(
       `${BOOTSTRAP_BASE_URL}/bootstrap`,
-      { devicePublicKey, agentId: TEST_AGENT_ID, tenant: TEST_TENANT },
+      { devicePublicKey, accountId: TEST_ACCOUNT_ID, tenant: TEST_TENANT },
     ) as { jwt: string; peerId: string };
 
     // The plugin resolves keys by kid from the live JWKS URL (fail-closed cache).
@@ -535,7 +535,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     const identity = await verifyJwt(bootstrapResponse.jwt, {
       jwks,
       issuer: payload.iss,
-      audience: TEST_AGENT_ID,
+      audience: TEST_ACCOUNT_ID,
     });
 
     // A real RS256 signature over a real RSA key → verifyJwt returns the identity.
@@ -584,7 +584,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     const devicePublicKey = await generateDeviceKey();
     const boot = await postJson(
       `${BOOTSTRAP_BASE_URL}/bootstrap`,
-      { devicePublicKey, agentId: TEST_AGENT_ID, tenant: TEST_TENANT },
+      { devicePublicKey, accountId: TEST_ACCOUNT_ID, tenant: TEST_TENANT },
     ) as { jwt: string };
     const jwtHeader = JSON.parse(
       Buffer.from(boot.jwt.split(".")[0], "base64url").toString("utf-8"),
@@ -607,7 +607,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       {
         agentPublicKey: pluginKeyPair.publicKey,
         tenant: TEST_TENANT,
-        agentId: TEST_AGENT_ID,
+        accountId: TEST_ACCOUNT_ID,
       },
     ) as {
       device_code: string;
@@ -655,7 +655,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       {
         agentPublicKey: plugin1.publicKey,
         tenant: "tenant-1",
-        agentId: "agent-1",
+        accountId: "agent-1",
       },
     ) as {
       device_code: string;
@@ -668,7 +668,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       {
         agentPublicKey: plugin2.publicKey,
         tenant: "tenant-2",
-        agentId: "agent-2",
+        accountId: "agent-2",
       },
     ) as {
       device_code: string;
@@ -718,7 +718,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       {
         agentPublicKey: pluginKeyPair.publicKey,
         tenant: TEST_TENANT,
-        agentId: TEST_AGENT_ID,
+        accountId: TEST_ACCOUNT_ID,
       },
     ) as {
       device_code: string;
@@ -760,7 +760,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       {
         agentPublicKey: pluginKeyPair.publicKey,
         tenant: TEST_TENANT,
-        agentId: TEST_AGENT_ID,
+        accountId: TEST_ACCOUNT_ID,
       },
     ) as {
       device_code: string;
@@ -792,7 +792,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       `${BOOTSTRAP_BASE_URL}/bootstrap`,
       {
         devicePublicKey: deviceKey,
-        agentId: TEST_AGENT_ID,
+        accountId: TEST_ACCOUNT_ID,
         tenant: TEST_TENANT,
       },
     ) as {

@@ -274,7 +274,7 @@ async function generateTestCredentials(tenant: string): Promise<NatsUserCredenti
     device_code: "test-device-code",
     user_code: "TEST-1234",
     agentPublicKey: "test-public-key",
-    agentId: "test-agent",
+    accountId: "test-agent",
     tenant,
     createdAt: Date.now(),
     expiresAt: Date.now() + 600000,

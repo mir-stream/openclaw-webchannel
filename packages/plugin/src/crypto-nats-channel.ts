@@ -10,7 +10,7 @@
  * The NATS relay operator (or any on-wire observer) sees only the
  * `MessageEnvelope` wire format, which contains only base64url-encoded
  * ChaCha20-Poly1305 ciphertext in its `content` block — never any plaintext.
- * Routing metadata (agentId / tenant / sub / messageId / envelopeType / ts)
+ * Routing metadata (accountId / tenant / sub / messageId / envelopeType / ts)
  * remain as plaintext for NATS subject routing and account isolation.
  *
  * Security model
@@ -31,7 +31,7 @@
  *
  *   // Wrap the transport with the crypto layer.
  *   const channel = new CryptoNatsChannel(transport, sessionKey, {
- *     agentId: 'agent-1', tenant: 'acme', sub: 'user-42',
+ *     accountId: 'acct-1', tenant: 'acme', sub: 'user-42',
  *   });
  *
  *   // Send (auto-encrypts):
@@ -118,7 +118,7 @@ export class CryptoNatsChannel extends EventEmitter {
    * @param sessionKey     - 32-byte ChaCha20-Poly1305 session key derived from
    *                         the X25519 ECDH key exchange + HKDF-SHA256.
    * @param routingDefaults - Stable routing fields shared by all messages this
-   *                         channel sends (agentId, tenant, sub).
+   *                         channel sends (accountId, tenant, sub).
    */
   constructor(
     transport: NatsTransport,

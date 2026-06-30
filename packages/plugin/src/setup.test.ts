@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Mock the acquisition routine so afterAccountConfigWritten is testable without
 // a real SaaS / device flow.
 const acquireMock = vi.fn(
-  async (_opts: { accountId?: string; saasBaseUrl: string; tenant: string; agentId?: string }) => ({
+  async (_opts: { accountId?: string; saasBaseUrl: string; tenant: string }) => ({
     creds: { userJwt: "JWT", userSeed: "SEED" },
     peerId: "p",
     jwksUrl: "j",
@@ -40,26 +40,24 @@ describe("setup: resolveSetupIdentity", () => {
       resolveSetupIdentity({
         saasBaseUrl: "http://s",
         tenant: "t",
-        agentId: "a",
         baseUrl: "http://ignored",
         url: "ignored",
-        token: "ignored",
       }),
-    ).toEqual({ saasBaseUrl: "http://s", tenant: "t", agentId: "a" });
+    ).toEqual({ saasBaseUrl: "http://s", tenant: "t" });
   });
 
   it("falls back to generic flags when dedicated keys are absent", () => {
     expect(
-      resolveSetupIdentity({ baseUrl: "http://s", url: "tenant-x", token: "agent-y" }),
-    ).toEqual({ saasBaseUrl: "http://s", tenant: "tenant-x", agentId: "agent-y" });
+      resolveSetupIdentity({ baseUrl: "http://s", url: "tenant-x" }),
+    ).toEqual({ saasBaseUrl: "http://s", tenant: "tenant-x" });
   });
 });
 
 describe("setup: buildAccountPatch", () => {
   it("maps identity into the account config shape", () => {
     expect(
-      buildAccountPatch({ saasBaseUrl: "http://s", tenant: "t", agentId: "a" }),
-    ).toEqual({ tenant: "t", agentId: "a", saas: { baseUrl: "http://s" } });
+      buildAccountPatch({ saasBaseUrl: "http://s", tenant: "t" }),
+    ).toEqual({ tenant: "t", saas: { baseUrl: "http://s" } });
   });
 
   it("includes only defined fields", () => {
@@ -94,10 +92,10 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     const next = webchannelSetup.applyAccountConfig({
       cfg,
       accountId: "accta",
-      input: { saasBaseUrl: "http://s", tenant: "t", agentId: "a" },
+      input: { saasBaseUrl: "http://s", tenant: "t" },
     });
     expect(section(next)).toEqual({
-      accounts: { accta: { tenant: "t", agentId: "a", saas: { baseUrl: "http://s" } } },
+      accounts: { accta: { tenant: "t", saas: { baseUrl: "http://s" } } },
     });
   });
 
@@ -141,13 +139,13 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     const next = webchannelSetup.applyAccountConfig({
       cfg,
       accountId: "acctb",
-      input: { tenant: "tB", agentId: "aB" },
+      input: { tenant: "tB" },
     });
     const s = section(next);
     expect(s.auth).toEqual({ strategy: "jwt" });
     expect(s.accounts).toEqual({
       default: { allowFrom: ["x"] },
-      acctb: { tenant: "tB", agentId: "aB" },
+      acctb: { tenant: "tB" },
     });
   });
 
@@ -205,7 +203,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       previousCfg: cfg,
       cfg,
       accountId: "accta",
-      input: { saasBaseUrl: "http://s", tenant: "tA", agentId: "aA" },
+      input: { saasBaseUrl: "http://s", tenant: "tA" },
       runtime,
     });
     expect(acquireMock).toHaveBeenCalledOnce();
@@ -213,7 +211,6 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       accountId: "accta",
       saasBaseUrl: "http://s",
       tenant: "tA",
-      agentId: "aA",
     });
   });
 
@@ -225,8 +222,9 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       previousCfg: cfg,
       cfg,
       accountId: "accta",
-      // Generic-flag mapping: --base-url/--url/--token.
-      input: { baseUrl: "http://s", url: "tenant-x", token: "agent-y" },
+      // Generic-flag mapping: --base-url/--url. The wire identity is the account
+      // id itself (가-2) — there is no --token → agentId mapping anymore.
+      input: { baseUrl: "http://s", url: "tenant-x" },
       runtime,
     });
     const echoed = runtime.log.mock.calls.find((c) =>
@@ -234,7 +232,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     );
     expect(echoed).toBeDefined();
     expect(String(echoed![0])).toContain("tenant=tenant-x");
-    expect(String(echoed![0])).toContain("agentId=agent-y");
+    expect(String(echoed![0])).toContain("accountId=accta");
     expect(String(echoed![0])).toContain("saasBaseUrl=http://s");
   });
 

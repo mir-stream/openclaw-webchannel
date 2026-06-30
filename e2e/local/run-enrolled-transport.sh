@@ -34,7 +34,7 @@ ECHO_PORT=18902
 ISSUER_PORT=3921
 
 TENANT=default-tenant
-AGENT_ID=default-agent
+ACCOUNT_ID=default-agent
 PEER_ID=enrolled-driver-peer
 SAAS_ISSUER="https://saas.local/enrolled-issuer"
 
@@ -212,7 +212,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
         "jwt": {
           "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
           "issuer": "$SAAS_ISSUER",
-          "audience": "$AGENT_ID"
+          "audience": "$ACCOUNT_ID"
         }
       },
       "dmSecurity": "allowlist",
@@ -230,15 +230,14 @@ echo "[run-enrolled] wrote $OCH/.openclaw/openclaw.json"
 #    `openclaw channels add`. HOME=$OCH so creds persist to
 #    $OCH/.openclaw-webchannel/<account>/credentials.json, which the gateway
 #    (also HOME=$OCH) consumes. Identity is passed via the generic CLI flags the
-#    webchannel setup adapter maps: --base-url→saas.baseUrl, --url→tenant,
-#    --token→agentId (the dedicated --tenant/--agent-id/--saas-base-url flags are
-#    declared in the manifest but the host only registers cliAddOptions for
-#    bundled channels, so the generic mapping is the headless path today).
+#    webchannel setup adapter maps: --base-url→saas.baseUrl, --url→tenant. The
+#    wire identity is the --account value itself (no --token→agentId mapping
+#    anymore — the handling agent is selected separately via `agents bind`).
 # ---------------------------------------------------------------------------
 echo "[run-enrolled] channels add (config-time device-flow enroll)…"
 HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account default \
-    --base-url "http://127.0.0.1:$ISSUER_PORT" --url "$TENANT" --token "$AGENT_ID" \
+  "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account "$ACCOUNT_ID" \
+    --base-url "http://127.0.0.1:$ISSUER_PORT" --url "$TENANT" \
   >"$OCH/channels-add.log" 2>&1 &
 ADD_PID=$!
 echo "[run-enrolled] channels add pid=$ADD_PID — waiting for enrollment user_code…"
@@ -267,13 +266,13 @@ ADD_PID=""
 if [ "$ADD_RC" -ne 0 ]; then
   echo "[run-enrolled] channels add failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add.log"; exit 2
 fi
-CRED_FILE="$OCH/.openclaw-webchannel/default/credentials.json"
+CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
 [ -f "$CRED_FILE" ] || { echo "[run-enrolled] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-enrolled] ✓ credentials persisted at $CRED_FILE"
 
 # ---------------------------------------------------------------------------
 # 6c. Boot the isolated gateway — CONSUME-ONLY. No acquisition env
-#     (WEBCHANNEL_SAAS_BASE_URL/_TENANT/_AGENT_ID): identity now lives in the
+#     (WEBCHANNEL_SAAS_BASE_URL/_TENANT/_ACCOUNT_ID): identity now lives in the
 #     config that `channels add` wrote. Only the connection override
 #     WEBCHANNEL_NATS_URL is passed. No user_code at gateway boot anymore.
 # ---------------------------------------------------------------------------
@@ -306,7 +305,7 @@ set +e
 WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
 WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
 WEBCHANNEL_ISSUER_URL="http://127.0.0.1:$ISSUER_PORT" \
-WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_AGENT_ID="$AGENT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
+WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
   node --import tsx "$REPO/e2e/local/enrolled-transport-roundtrip.ts"
 RC=$?
 set -e

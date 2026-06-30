@@ -13,7 +13,7 @@
  *   SAAS_POLL_URL     - SaaS poll endpoint (default: http://localhost:3000/api/poll)
  *   NATS_URL          - NATS WebSocket URL (default: wss://nats.example.com)
  *   TENANT            - Tenant identifier (default: demo-tenant)
- *   AGENT_ID          - Agent ID (optional, default: demo-agent)
+ *   ACCOUNT_ID        - Account (deployment) id — the wire identity (optional, default: demo-account)
  *
  * DEMO FLOW:
  *   1. Check for existing credentials
@@ -36,7 +36,7 @@ const SAAS_ENROLL_URL = process.env.SAAS_ENROLL_URL || "http://localhost:3000/ap
 const SAAS_POLL_URL = process.env.SAAS_POLL_URL || "http://localhost:3000/api/poll";
 const NATS_URL = process.env.NATS_URL || "wss://nats.example.com";
 const TENANT = process.env.TENANT || "demo-tenant";
-const AGENT_ID = process.env.AGENT_ID || "demo-agent";
+const ACCOUNT_ID = process.env.ACCOUNT_ID || "demo-account";
 
 // ---------------------------------------------------------------------------
 // Main enrollment flow
@@ -53,7 +53,7 @@ async function main() {
   console.log(`  SaaS Poll URL:   ${SAAS_POLL_URL}`);
   console.log(`  NATS URL:        ${NATS_URL}`);
   console.log(`  Tenant:          ${TENANT}`);
-  console.log(`  Agent ID:        ${AGENT_ID}`);
+  console.log(`  Account ID:      ${ACCOUNT_ID}`);
   console.log("");
   console.log("==============================================");
   console.log("");
@@ -69,7 +69,7 @@ async function main() {
       saasEnrollUrl: SAAS_ENROLL_URL,
       saasPollUrl: SAAS_POLL_URL,
       tenant: TENANT,
-      agentId: AGENT_ID,
+      accountId: ACCOUNT_ID,
       displayInstructions: true,
     });
 

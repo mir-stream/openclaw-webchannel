@@ -170,7 +170,7 @@ describe("DeviceFlowEnrollment — agent path mints against the external account
 
     const { user_code } = await enrollment.enroll({
       agentPublicKey: "agent-x25519-pub",
-      agentId: "agent-1",
+      accountId: "agent-1",
       tenant: "tenant-ext",
     });
     const result = await enrollment.approve(user_code);

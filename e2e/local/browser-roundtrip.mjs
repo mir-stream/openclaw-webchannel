@@ -27,7 +27,7 @@ await page.goto(`http://127.0.0.1:${PAGE_PORT}/`);
 console.log("[browser] running production WebChannelNatsClient in headless Chromium…");
 const reply = await page.evaluate(
   async (opts) => await globalThis.runWeb(opts),
-  { natsUrl: "ws://127.0.0.1:18222", jwt, agentId: "default-agent", tenant: "default-tenant", peerId: "web-anon", text: "hello from a real browser" },
+  { natsUrl: "ws://127.0.0.1:18222", jwt, accountId: "default-agent", tenant: "default-tenant", peerId: "web-anon", text: "hello from a real browser" },
 );
 console.log("\n[BROWSER REPLY]", JSON.stringify(reply).slice(0, 300));
 console.log("\nContains the message echoed back? ", reply.includes("hello from a real browser"));

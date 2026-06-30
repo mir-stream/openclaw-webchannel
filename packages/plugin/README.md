@@ -77,7 +77,8 @@ credentials and skips enrollment.
 - **Permissions:** written with mode `0o600` (owner read/write only)
 - **Shape** (`PluginCredentials`): `identityKey { publicKey, privateKey }` (base64url X25519),
   optional `enrollment { creds, peerId, jwksUrl, bootstrapUrl }`, plus `tenant`, `saasEnrollUrl`,
-  `saasPollUrl`, optional `agentId`. The private key is generated locally and never transmitted.
+  `saasPollUrl`, optional `accountId` (the wire identity). The private key is generated locally
+  and never transmitted.
 
 ## E2E security model (admission + handshake)
 
@@ -161,7 +162,7 @@ Env overrides (take precedence over config) — secrets need not live in committ
 ```ts
 new WebChannelNatsClient({
   url: "wss://connect.ngs.global",
-  agentId, tenant, peerId,
+  accountId, tenant, peerId,
   // No bootstrap `jwt` and no `registration` — the bootstrap JWT is now optional
   // and only needed for the SaaS register-hop path.
   natsCredentials: {
@@ -172,21 +173,27 @@ new WebChannelNatsClient({
 ```
 
 > **Synadia permissions:** the static user must have **pub + sub** permission on the
-> `webchannel.<tenant>.<agent>.*` subjects (the agent subscribes to `…*.in` /
+> `webchannel.<tenant>.<accountId>.*` subjects (the agent subscribes to `…*.in` /
 > `…*.handshake` and publishes `…*.out`; the browser is the mirror). Without the
 > wildcard sub permission the agent's `auto` admission cannot receive peers.
 
 ## NATS subject namespace
 
-`src/nats-channel.ts` routes per-peer over tenant- and agent-scoped subjects:
+`src/nats-channel.ts` routes per-peer over tenant- and account-scoped subjects:
 
 ```
-webchannel.{tenant}.{agentId}.{peerId}.in    # browser → agent (plugin subscribes)
-webchannel.{tenant}.{agentId}.{peerId}.out   # agent → browser (plugin publishes)
+webchannel.{tenant}.{accountId}.{peerId}.in    # browser → agent (plugin subscribes)
+webchannel.{tenant}.{accountId}.{peerId}.out   # agent → browser (plugin publishes)
 ```
 
 Each peer (browser session) gets its own subject pair; tenant isolation is enforced by the NATS
 user credentials' pub/sub permissions minted during enrollment.
+
+> **Handling agent vs. wire identity.** The `accountId` is the on-wire/admission identity
+> (the deployment). Which OpenClaw agent actually answers is **decoupled** and selected via
+> `openclaw agents bind --bind webchannel:<accountId> --agent <agent>` (telegram-like) — not a
+> per-account config `agentId`. Inbound routing calls `resolveAgentRoute({ accountId, … })`,
+> which honours those bindings.
 
 ## Develop / test
 

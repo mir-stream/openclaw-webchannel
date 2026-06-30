@@ -1,7 +1,7 @@
 /**
  * NATS-subject token validator (defense against subject-hierarchy injection).
  *
- * Live channel subjects are `webchannel.{tenant}.{agentId}.{peerId}.{in|out|handshake}`.
+ * Live channel subjects are `webchannel.{tenant}.{accountId}.{peerId}.{in|out|handshake}`.
  * A token containing a `.` (subject separator), `*`/`>` (NATS wildcards), or
  * whitespace/control chars would break the subject hierarchy and could cross
  * tenant boundaries (e.g. a `tenant` of `a.*` would widen a `webchannel.{tenant}.>`
@@ -19,7 +19,7 @@ const SAFE_SUBJECT_TOKEN = /^[A-Za-z0-9_-]{1,128}$/;
 /**
  * Throw if `token` is unsafe to interpolate into a NATS subject / permission.
  *
- * @param token - The untrusted token (e.g. tenant, agentId).
+ * @param token - The untrusted token (e.g. tenant, accountId).
  * @param label - Human-readable field name for the error message.
  * @throws {Error} when the token is empty or contains a disallowed character.
  */

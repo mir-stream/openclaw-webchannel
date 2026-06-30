@@ -32,7 +32,7 @@ import { DEFAULT_ACCOUNT_ID, resolveReadCredentialPath } from "./account-config.
  */
 type EnrollmentRequest = {
   agentPublicKey: string;
-  agentId?: string;
+  accountId?: string;
   tenant: string;
 };
 
@@ -128,9 +128,9 @@ export type PluginCredentials = {
   };
 
   /**
-   * Agent ID (optional, for debugging).
+   * Account (deployment) id — the wire identity (optional, for debugging).
    */
-  agentId?: string;
+  accountId?: string;
 
   /**
    * Tenant ID.
@@ -174,14 +174,11 @@ export type EnrollmentOptions = {
   tenant: string;
 
   /**
-   * Agent ID (optional, for debugging).
-   */
-  agentId?: string;
-
-  /**
-   * Account id (가-1). When `credentialPath` is omitted, the default path is
-   * account-scoped: `~/.openclaw-webchannel/<account>/credentials.json`.
-   * Defaults to `"default"`.
+   * Account (deployment) id — the wire identity (JWT aud / NATS subject key)
+   * sent to the SaaS enrollment. Also scopes the default credential path:
+   * `~/.openclaw-webchannel/<account>/credentials.json` (가-1). When
+   * `credentialPath` is omitted the path is derived from this. Defaults to
+   * `"default"`.
    */
   accountId?: string;
 
@@ -224,10 +221,9 @@ export type EnrollmentOptions = {
  */
 export class EnrollmentClient {
   private readonly options: Required<
-    Omit<EnrollmentOptions, "displayInstructions" | "agentId" | "accountId" | "_minPollIntervalMs">
+    Omit<EnrollmentOptions, "displayInstructions" | "accountId" | "_minPollIntervalMs">
   > & {
     displayInstructions: boolean;
-    agentId?: string;
     accountId?: string;
     _minPollIntervalMs?: number;
   };
@@ -322,7 +318,7 @@ export class EnrollmentClient {
         publicKey: this.bufferToBase64Url(identityKey.publicKey),
         privateKey: this.bufferToBase64Url(identityKey.privateKey),
       },
-      agentId: this.options.agentId,
+      accountId: this.options.accountId,
       tenant: this.options.tenant,
       saasEnrollUrl: this.options.saasEnrollUrl,
       saasPollUrl: this.options.saasPollUrl,
@@ -331,7 +327,7 @@ export class EnrollmentClient {
     // Initiate enrollment
     const enrollRequest: EnrollmentRequest = {
       agentPublicKey: this.bufferToBase64Url(identityKey.publicKey),
-      agentId: this.options.agentId,
+      accountId: this.options.accountId,
       tenant: this.options.tenant,
     };
 

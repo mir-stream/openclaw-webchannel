@@ -50,10 +50,10 @@ export function unionAllowedOrigins(
 /**
  * Add an `aud → accountId` dispatch entry with DETERMINISTIC FIRST-WINS on
  * collision (C1). Two served accounts can share an `auth.jwt.audience` (same
- * IdP), or one account's agentId key can equal another's configured audience —
+ * IdP), or one account's accountId key can equal another's configured audience —
  * a blind overwrite would silently misroute every token carrying that aud to
  * whichever account was registered last. Instead we keep the first binding and
- * log an actionable collision warning (mirrors the duplicate-agentId treatment).
+ * log an actionable collision warning.
  *
  * Returns `true` if the entry was added, `false` if it was a collision (skipped).
  */
@@ -69,7 +69,7 @@ export function addAudMapping(
       onCollision?.(
         `[webchannel] audience "${aud}" is already mapped to account "${existing}"; ` +
           `account "${accountId}" wants the same audience — keeping the first (first-wins). ` +
-          `Give each account a distinct jwt.audience / agentId to avoid register misrouting.`,
+          `Give each account a distinct jwt.audience / accountId to avoid register misrouting.`,
       );
     }
     return false;

@@ -15,7 +15,6 @@ describe("resolveAcquisitionEnvPrecedence", () => {
     const { identity, usedLegacyEnv } = resolveAcquisitionEnvPrecedence({}, "default", {
       env: {
         WEBCHANNEL_TENANT: "envTenant",
-        WEBCHANNEL_AGENT_ID: "envAgent",
         WEBCHANNEL_SAAS_BASE_URL: "http://env-saas",
       },
       warn,
@@ -23,7 +22,6 @@ describe("resolveAcquisitionEnvPrecedence", () => {
     expect(identity).toEqual({
       accountId: "default",
       tenant: "envTenant",
-      agentId: "envAgent",
       saasBaseUrl: "http://env-saas",
     });
     expect(usedLegacyEnv).toBe(true);
@@ -37,7 +35,7 @@ describe("resolveAcquisitionEnvPrecedence", () => {
       warn: () => {},
     });
     expect(identity.tenant).toBe("default-tenant");
-    expect(identity.agentId).toBe("default-agent");
+    expect(identity.accountId).toBe("default");
     expect(identity.saasBaseUrl).toBeUndefined();
     expect(usedLegacyEnv).toBe(true);
   });
@@ -45,14 +43,13 @@ describe("resolveAcquisitionEnvPrecedence", () => {
   it("IGNORES env and uses config when a webchannel config exists", () => {
     const warn = vi.fn();
     const cfg = {
-      channels: { webchannel: { tenant: "cfgTenant", agentId: "cfgAgent" } },
+      channels: { webchannel: { tenant: "cfgTenant" } },
     };
     const { identity, usedLegacyEnv } = resolveAcquisitionEnvPrecedence(cfg, "default", {
-      env: { WEBCHANNEL_TENANT: "envTenant", WEBCHANNEL_AGENT_ID: "envAgent" },
+      env: { WEBCHANNEL_TENANT: "envTenant" },
       warn,
     });
     expect(identity.tenant).toBe("cfgTenant");
-    expect(identity.agentId).toBe("cfgAgent");
     expect(usedLegacyEnv).toBe(false);
     // One-time deprecation warning emitted (env set + config present).
     expect(warn).toHaveBeenCalledOnce();

@@ -38,6 +38,6 @@ describe("assertValidSubjectToken (saas — subject-injection guard)", () => {
   });
 
   it("names the offending field in the error", () => {
-    expect(() => assertValidSubjectToken("a.b", "agentId")).toThrow(/agentId/);
+    expect(() => assertValidSubjectToken("a.b", "accountId")).toThrow(/accountId/);
   });
 });

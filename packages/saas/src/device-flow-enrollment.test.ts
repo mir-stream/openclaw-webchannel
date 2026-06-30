@@ -50,7 +50,7 @@ const createEnrollment = () => {
 const validEnrollmentRequest: EnrollmentRequest = {
   agentPublicKey: "mock_public_key_base64url",
   tenant: "test-tenant",
-  agentId: "test-agent",
+  accountId: "test-agent",
 };
 
 // ---------------------------------------------------------------------------

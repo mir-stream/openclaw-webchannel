@@ -33,7 +33,7 @@ const ROOT = join(__dirname, "..", "..");
 const NATS_URL   = process.env.WEBCHANNEL_NATS_URL   ?? "ws://127.0.0.1:18722";
 const ISSUER_URL = process.env.WEBCHANNEL_ISSUER_URL ?? "http://127.0.0.1:3942";
 const GW_URL     = process.env.WEBCHANNEL_GW_URL     ?? "http://127.0.0.1:19299";
-const AGENT_ID   = process.env.WEBCHANNEL_AGENT_ID   ?? "default-agent";
+const ACCOUNT_ID   = process.env.WEBCHANNEL_ACCOUNT_ID   ?? "default-agent";
 const TENANT     = process.env.WEBCHANNEL_TENANT     ?? "default-tenant";
 const PEER_ID    = process.env.WEBCHANNEL_PEER_ID    ?? "web-allreal-peer";
 const PAGE_PORT  = parseInt(process.env.WEBCHANNEL_PAGE_PORT ?? "19393", 10);
@@ -79,7 +79,7 @@ const configScript =
     natsUrl: NATS_URL,
     issuerUrl: ISSUER_URL,
     gwUrl: GW_URL,
-    agentId: AGENT_ID,
+    accountId: ACCOUNT_ID,
     tenant: TENANT,
     peerId: PEER_ID,
   })};</script>`;

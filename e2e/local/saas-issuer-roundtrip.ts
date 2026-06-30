@@ -22,7 +22,7 @@ const NATS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18322";
 const GW_URL = process.env.WEBCHANNEL_GW_URL ?? "http://127.0.0.1:18899";
 const BOOTSTRAP_URL = process.env.WEBCHANNEL_BOOTSTRAP_URL ?? "http://127.0.0.1:3911";
 
-const AGENT_ID = "default-agent";
+const ACCOUNT_ID = "default-agent";
 const TENANT = "default-tenant";
 // Fixed peerId so the gateway's dmSecurity allowlist can name it. The real
 // bootstrap-server accepts an optional peerId and threads it into the JWT `sub`.
@@ -52,7 +52,7 @@ const devicePopPublicKey = edPubJwk.x;
 const bootstrapRes = await fetch(`${BOOTSTRAP_URL}/bootstrap`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ devicePublicKey, devicePopPublicKey, agentId: AGENT_ID, tenant: TENANT, peerId: PEER_ID }),
+  body: JSON.stringify({ devicePublicKey, devicePopPublicKey, accountId: ACCOUNT_ID, tenant: TENANT, peerId: PEER_ID }),
 });
 if (!bootstrapRes.ok) {
   console.error("[FAIL] bootstrap-server returned", bootstrapRes.status, await bootstrapRes.text());
@@ -78,7 +78,7 @@ console.log(`[bootstrap] real SaaS issuer minted JWT for peerId=${peerId} (sub m
 const client = new WebChannelNatsClient({
   url: NATS,
   jwt,
-  agentId: AGENT_ID,
+  accountId: ACCOUNT_ID,
   tenant: TENANT,
   peerId,
   registration: {
