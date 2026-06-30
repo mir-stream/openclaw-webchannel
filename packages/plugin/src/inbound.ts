@@ -2,6 +2,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
 import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
+import { resolveDmAdmission } from "./dm-allowlist.js";
 
 /** The inbound path only handles user messages; approvals route separately. */
 type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
@@ -83,6 +84,24 @@ export async function handleInboundMessage(
   const channelConfig = (api.config.channels as Record<string, unknown> | undefined)?.[
     WEBCHANNEL_ID
   ];
+
+  // DM allowlist admission (split-authz, plugin-owned half). When the operator
+  // sets `channels.webchannel.dmSecurity: "allowlist"`, a non-allowlisted peer
+  // is denied here — BEFORE the agent turn runs — so `inbound.run` is never
+  // invoked and no reply is emitted (default-deny). With no `dmSecurity` set,
+  // admission is open, preserving the shipping Gateway-WS behavior.
+  const cc = channelConfig as { allowFrom?: readonly string[]; dmSecurity?: string } | undefined;
+  const admission = resolveDmAdmission(wsKey, {
+    allowFrom: cc?.allowFrom,
+    dmSecurity: cc?.dmSecurity,
+  });
+  if (!admission.allowed) {
+    api.logger?.info?.(
+      `webchannel: inbound denied for peer ${wsKey} (${admission.reason}); turn not dispatched`,
+    );
+    return;
+  }
+
   const progressEnabled = resolveStreamingMode(channelConfig) === "progress";
   let draft: ProgressDraftController | undefined;
   if (progressEnabled) {
@@ -100,6 +119,21 @@ export async function handleInboundMessage(
     channel: WEBCHANNEL_ID,
     peer: { kind: "direct", id: wsKey },
   });
+
+  // Native "Bot is typing…" affordance. We push the frame right after route
+  // resolution and right before agent dispatch (1) so the widget sees the
+  // indicator as soon as the turn has been accepted — even before the first
+  // `progress` / `agent_message` / `approval_*` frame, which can take seconds
+  // on a long-running tool call — and (2) regardless of which turn exit path
+  // the dispatch takes (the inner try/catch can still throw). The first real
+  // frame from the agent settles the indicator client-side; we never send a
+  // matching "stop" frame.
+  //
+  // The transport gates the frame on `channels.webchannel.capabilities.typing`
+  // (default "on"), so when an operator sets it to "off" this call is a no-op.
+  // It is also best-effort (no ack/retry) and drop-only under backpressure —
+  // we ignore the boolean return.
+  transport.sendTyping(wsKey);
 
   try {
     await channelRuntime.inbound.run({

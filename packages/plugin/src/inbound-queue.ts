@@ -1,0 +1,119 @@
+/**
+ * Per-session FIFO serialization for inbound user messages.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * The transport's `onMessage` callback is fire-and-forget: every inbound
+ * `user_message` frame immediately kicks off a `handleInboundMessage` →
+ * `channelRuntime.inbound.run` turn (see index.ts / inbound.ts). If a user
+ * sends two messages back-to-back on the SAME socket, two such turns would run
+ * CONCURRENTLY for the same `sessionKey`.
+ *
+ * OpenClaw core does not tolerate that. Its per-session reply-operation
+ * admission gate (`admitReplyTurn`, dispatch-DO0Fpkbp.js) assumes the channel
+ * serializes its OWN inbound — that one session never has two turns in flight
+ * at once. The bundled Telegram channel satisfies this implicitly: its
+ * long-poll offset spool only ever hands the runtime one update at a time, so
+ * a turn fully settles before the next is fetched. We have no such natural
+ * spool — a WebSocket delivers frames as fast as the client sends them — so two
+ * same-session turns collide on that gate and the channel wedges (a "working"
+ * progress bubble that never settles).
+ *
+ * The fix is to give each `sessionKey` its own promise-chain FIFO queue: a new
+ * message chains onto the tail of its session's chain and only starts once the
+ * previous turn for that session has settled. DIFFERENT sessions keep their own
+ * independent chains, so distinct users still run fully in parallel — we only
+ * serialize WITHIN a session, matching the one-turn-at-a-time invariant core
+ * expects.
+ */
+
+/**
+ * A per-session serializing dispatcher.
+ *
+ * `dispatch` has the same fire-and-forget shape the transport's
+ * `setMessageHandler` expects, but internally enqueues each call onto a
+ * promise chain keyed by `sessionKey`, so same-session calls run strictly in
+ * order, one at a time.
+ *
+ * `pendingSessions` is a minimal introspection accessor for tests and
+ * diagnostics ONLY — it reports how many sessions currently have an
+ * undrained chain entry. Production code must not depend on it; it exists so
+ * the drain/cleanup invariant (the map returns to 0 once a session fully
+ * drains) is observable and testable.
+ */
+export interface SerializedInboundDispatcher<Message> {
+  dispatch: (sessionKey: string, message: Message) => void;
+  /** Test/diagnostics only: number of sessions with a live (undrained) chain. */
+  pendingSessions: () => number;
+}
+
+/**
+ * Build a per-session serializing dispatcher around `handler`.
+ *
+ * @param handler Runs one inbound turn. It is expected to settle (resolve or
+ *   reject) when the turn is fully done; the NEXT same-session message waits on
+ *   that settlement. `handleInboundMessage` already catches its own errors
+ *   internally, but we defend against rejection — AND synchronous throws — here
+ *   too (a poisoned link must never block the rest of the chain or leak its map
+ *   entry; see below).
+ */
+export function createSerializedInboundDispatcher<Message>(
+  handler: (sessionKey: string, message: Message) => Promise<void>,
+): SerializedInboundDispatcher<Message> {
+  // sessionKey -> tail of that session's promise chain. The value is the
+  // promise for the LAST-enqueued turn; the next message chains off it. Entries
+  // are removed when a session's chain fully drains (see cleanup below) so this
+  // map does not grow without bound as transient sessions come and go.
+  const chains = new Map<string, Promise<unknown>>();
+
+  const dispatch = (sessionKey: string, message: Message) => {
+    // Chain off whatever is currently queued for this session (or a resolved
+    // promise if the session is idle). We attach via `.then` with NO rejection
+    // handler on `previous` itself — instead the previous link is made
+    // non-rejecting before being stored (see `settled` below), so a failed turn
+    // never blocks the ones queued behind it. Defensive even though
+    // `handleInboundMessage` already swallows its own errors.
+    const previous = chains.get(sessionKey) ?? Promise.resolve();
+
+    // `settled` resolves when THIS turn is fully done, success or failure. We
+    // store this (not the raw handler promise) as the new tail so the next
+    // message waits for completion regardless of outcome, and the chain never
+    // carries a rejection forward.
+    //
+    // We invoke `handler` inside `Promise.resolve().then(...)` so that even a
+    // SYNCHRONOUS throw (a non-async handler that throws before returning a
+    // promise) is funneled into the promise's rejection path rather than
+    // escaping the `previous.then()` callback. Without this, a sync throw would
+    // reject `settled` directly — permanently poisoning the chain tail (wedging
+    // every later same-session turn) AND skipping the success-only cleanup
+    // below (leaking the map entry). The trailing `.catch(() => {})` then
+    // swallows both async rejections and the funneled sync throw: a single
+    // failed turn must not wedge the session's queue. The handler is responsible
+    // for its own user-facing error recovery (inbound.ts finalizes the working
+    // bubble on failure).
+    const settled = previous.then(() =>
+      Promise.resolve()
+        .then(() => handler(sessionKey, message))
+        .catch(() => {}),
+    );
+
+    chains.set(sessionKey, settled);
+
+    // Drain cleanup: once THIS turn settles, drop the map entry IF it is still
+    // the tail — i.e. no newer message has replaced it in the meantime. Without
+    // the identity check we would race-delete an entry a later message already
+    // overwrote, orphaning that message's chain and losing serialization.
+    // Because `settled` is non-rejecting (see above), this cleanup runs for
+    // EVERY turn, including ones whose handler threw synchronously.
+    void settled.then(() => {
+      if (chains.get(sessionKey) === settled) {
+        chains.delete(sessionKey);
+      }
+    });
+  };
+
+  return {
+    dispatch,
+    pendingSessions: () => chains.size,
+  };
+}

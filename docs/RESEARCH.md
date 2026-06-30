@@ -1,5 +1,7 @@
 # WebChannel — 조사 노트 (RESEARCH)
 
+> 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 레퍼런스/조사 노트이며 명시된 설치본 시점 기준이다.
+
 > 목적: WebChannel 개발을 이어받는 에이전트가 **재조사 없이** 바로 착수하도록,
 > OpenClaw 내부에서 직접 확인한 사실·정확한 경로·API 이름을 정리한 레퍼런스.
 > 표기: ✅ = 설치본 소스/문서에서 직접 확인 / ⚠️ = 추론·미확정 / 📄 = 문서 경로.
@@ -232,7 +234,7 @@ api.registerHttpRoute({
 5. **auth는 결정됨 → 📄 `AUTH.md`.** `auth:"plugin"` + 검증기(ConnectionVerifier) seam + 빌트인 전략(`anonymous`/`hmac-ticket`/`jwt`/`trusted-header`). 게이트웨이 토큰=operator 자격이라 브라우저 직접 노출 금지(불변).
 6. **세션키 매핑:** 검증된 `peerId`가 기본 sessionKey(auth가 동시 해결). 잔여는 멀티탭 정책. `messaging.resolveSessionConversation`이 후크.
 7. **번들은 minified.** 정확한 시그니처는 `dist/**/*.d.ts` grep 또는 GitHub 원본 참고.
-8. 구현으로 **검증됨**: `handleUpgrade` auth 게이팅, 승인 출발-peer 라우팅, 정적 서빙(§13). **여전히 미검증(⚠️)**: outbound **media** 정확 시그니처, live-preview/receipt contract test 요구.
+8. 구현으로 **검증됨**: `handleUpgrade` auth 게이팅, 승인 출발-peer 라우팅(§13). **여전히 미검증(⚠️)**: outbound **media** 정확 시그니처, live-preview/receipt contract test 요구.
 
 ---
 
@@ -259,7 +261,7 @@ ls $OC/dist/extensions/ | grep -iE 'telegram|google|microsoft|mattermost'
 
 ---
 
-## 13. 구현 중 확인된 SDK 사실 ✅ (auth · 승인 라우팅 · 정적 서빙)
+## 13. 구현 중 확인된 SDK 사실 ✅ (auth · 승인 라우팅)
 
 > 2026-06-15 구현·E2E로 확인. 미래 에이전트가 재조사 없이 활용할 것.
 
@@ -269,13 +271,8 @@ ls $OC/dist/extensions/ | grep -iE 'telegram|google|microsoft|mattermost'
 - ⇒ `approvalCapability`의 `resolveOriginTarget`/`transport.prepareTarget`에서 `turnSourceChannel==="webchannel"` 필터 후 `turnSourceTo`를 sessionKey로 쓰면 승인 카드가 **요청한 그 브라우저**로 감. (구현: `src/approvals.ts`)
 - 답변·progress draft는 이미 inbound가 캡처한 `wsKey`로 per-peer 전달(`src/inbound.ts`).
 
-### 정적 자산 서빙 (게이트웨이 단일 배포)
-- `registerHttpRoute`는 **exact `/webchannel/ws` + prefix `/webchannel/`가 같은 auth 레벨에서 공존** 가능("fallthrough chains on same auth level"); exact가 우선이라 WS 업그레이드 영향 없음.
-- 게이트웨이 HTTP 레이어가 **라우트 매칭 전에 경로를 정규화/디코드**함 → `..`·인코딩 traversal이 우리 핸들러에 닿기 전에 무력화(루트 대시보드로 떨어짐). 그래도 핸들러 자체 containment 체크 보유(`src/static-assets.ts`).
-- 예제 빌드 base를 `/webchannel/`로 두면 자산 URL이 그 prefix로 해석됨(`vite.config.ts` build 시).
-
 ### 플러그인 로딩 / 테스트 루프
-- 사용자 게이트웨이는 `plugins.load.paths`(레포 경로) + `openclaw.extensions:["./index.ts"]`로 **TS 소스를 직접 로드** → `openclaw gateway restart`가 소스 변경을 즉시 반영(플러그인은 빌드 불필요; 정적 서빙되는 채팅 UI는 `packages/client`에서 `npm run build:demo` 필요). 상세 E2E 절차는 memory `webchannel-live-gateway-e2e`.
+- 사용자 게이트웨이는 `plugins.load.paths`(레포 경로) + `openclaw.extensions:["./index.ts"]`로 **TS 소스를 직접 로드** → `openclaw gateway restart`가 소스 변경을 즉시 반영(플러그인은 빌드 불필요). 상세 E2E 절차는 memory `webchannel-live-gateway-e2e`.
 
 ### ticket = JWT HS256 (자체 구현, zero-dep)
-- `src/ticket.ts`: `node:crypto` HMAC로 `base64url(header).base64url(payload).base64url(sig)`. 검증 시 **alg를 HS256로 명시 핀**(헤더 신뢰 안 함) + timing-safe 비교 + `exp`. 브라우저측 동일 포맷은 Web Crypto(`crypto.subtle`)로 발급(`example/devTicket.ts`), 크로스런타임 호환성 테스트로 보장(`src/devticket-webcrypto.test.ts`).
+- `src/ticket.ts`: `node:crypto` HMAC로 `base64url(header).base64url(payload).base64url(sig)`. 검증 시 **alg를 HS256로 명시 핀**(헤더 신뢰 안 함) + timing-safe 비교 + `exp`. 브라우저측 동일 포맷(Web Crypto `crypto.subtle` 서명)과의 크로스런타임 호환성은 `src/devticket-webcrypto.test.ts`가 보장(서명 경로를 인라인 재현).

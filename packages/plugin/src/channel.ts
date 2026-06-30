@@ -19,7 +19,14 @@ import {
 // approval bootstrap (dist/server-channels-g1oRRKIH.js:330-331, :339-341). We
 // register the `approval.native` runtime context from that monitor; see
 // startClawApprovalMonitor in src/approvals.ts.
-const DEFAULT_ACCOUNT_ID = "default";
+//
+// Exported so src/approvals.ts can pass the same account id to the SDK's
+// `createApproverRestrictedNativeApprovalCapability` (`listAccountIds`) without
+// duplicating the literal. The channel→approvals import edge already exists, so
+// approvals.ts reading this back adds no new module cycle (and it's only
+// dereferenced at runtime inside createClawApprovalCapability, so ESM live
+// bindings resolve it well after module evaluation).
+export const DEFAULT_ACCOUNT_ID = "default";
 
 type ResolvedAccount = {
   accountId: string | null;

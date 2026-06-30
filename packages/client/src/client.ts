@@ -154,6 +154,28 @@ export class WebChannelClient {
     ws.send(JSON.stringify(payload));
   }
 
+  /**
+   * Ask the server for older messages (history pagination). The server
+   * replies with a `history` frame carrying the page; the client prepends
+   * the messages and deduplicates by id.
+   *
+   * Per the seed this method is UI-triggered (scroll-to-top, "Load more"
+   * button). The client does NOT auto-fire it on its own; the host app
+   * decides when the user has asked for more context. When the socket is
+   * not OPEN the call is a no-op (history is best-effort — the user can
+   * retry once the connection is back).
+   */
+  loadHistory(request?: { before?: string; limit?: number }): void {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const payload: InboundWsMessage = {
+      type: "load_history",
+      ...(request?.before !== undefined ? { before: request.before } : {}),
+      ...(request?.limit !== undefined ? { limit: request.limit } : {}),
+    };
+    ws.send(JSON.stringify(payload));
+  }
+
   // ── state plumbing ────────────────────────────────────────────────────────
 
   private setState(patch: Partial<WebChannelState>): void {
@@ -339,6 +361,56 @@ export class WebChannelClient {
     }
 
     switch (parsed.type) {
+      case "history": {
+        // Initial on-connect snapshot OR a `load_history` response. We PREPEND
+        // messages to the transcript (the server returns oldest-first within
+        // a page; prepending keeps each page in the right slot relative to
+        // existing newer bubbles already on screen) and DEDUPLICATE by id —
+        // overlapping windows between the snapshot and a later page (or a
+        // duplicate frame after a reconnect) become a no-op.
+        //
+        // We never clobber `isTyping` or the user's draft: history is a
+        // transcript-only update. `working:false` is forced on every hydrated
+        // message — a stale "working" flag from a prior session would render
+        // a spinner forever.
+        const incoming = Array.isArray(parsed.messages) ? parsed.messages : [];
+        if (incoming.length === 0) return;
+        const existing = this.state.messages;
+        const seen = new Set(existing.map((m) => m.id));
+        // Dedup + coerce: keep only messages whose id is new (and not the
+        // pending draft id we currently own client-side), and force `working`
+        // to false — history snapshots are settled bubbles, not live drafts.
+        const fresh: ChatMessage[] = [];
+        for (const m of incoming) {
+          if (!m || typeof m !== "object") continue;
+          if (typeof m.id !== "string" || m.id.length === 0) continue;
+          if (m.role !== "user" && m.role !== "agent") continue;
+          if (typeof m.text !== "string") continue;
+          if (seen.has(m.id)) continue;
+          seen.add(m.id);
+          fresh.push({ id: m.id, role: m.role, text: m.text, ts: m.ts, working: false });
+        }
+        if (fresh.length === 0) return;
+        // Prepend in arrival order — the server returns oldest-first within a
+        // page, so `[...fresh, ...existing]` puts each page in its correct
+        // slot above the newer bubbles.
+        this.setState({ messages: [...fresh, ...existing] });
+        return;
+      }
+
+      case "typing": {
+        // Native "Bot is typing…" affordance. The server pushes this once at
+        // the START of a turn (after route resolution, before agent dispatch);
+        // the first real frame from the agent (progress / agent_message /
+        // approval_*) clears it via the per-case `isTyping: false` patch below.
+        // We always flip to true on a fresh typing frame (idempotent — even if
+        // a duplicate arrives after progress has already settled, the next
+        // incoming frame simply re-clears it). This keeps the logic tiny and
+        // matches Telegram/Discord semantics: best-effort, no ack, no stop.
+        this.setState({ isTyping: true });
+        return;
+      }
+
       case "approval_request": {
         const req: ApprovalRequest = {
           id: parsed.id,
@@ -352,11 +424,17 @@ export class WebChannelClient {
         const approvals = this.state.approvals;
         const idx = approvals.findIndex((a) => a.id === req.id);
         if (idx === -1) {
-          this.setState({ approvals: [...approvals, req] });
+          this.setState({
+            approvals: [...approvals, req],
+            // The agent is no longer "typing" — it is BLOCKED on the user, not
+            // still working. Clear the indicator so a UI doesn't show both a
+            // spinner and an approval card at once.
+            isTyping: false,
+          });
         } else {
           const next = approvals.slice();
           next[idx] = req;
-          this.setState({ approvals: next });
+          this.setState({ approvals: next, isTyping: false });
         }
         return;
       }
@@ -368,20 +446,28 @@ export class WebChannelClient {
       }
 
       case "progress": {
-        // Render/replace a SINGLE working bubble keyed by the draft id.
+        // Render/replace a SINGLE working bubble keyed by the draft id. The
+        // first `progress` frame settles the typing indicator: a working
+        // bubble supersedes "Bot is typing…", and a duplicate typing frame
+        // arriving afterwards will just re-arm it (no harm — the next real
+        // frame clears it again).
         const { id, text } = parsed;
         this.upsertMessage(
           id,
           (prev) => ({ ...prev, text, working: true }),
           { id, role: "agent", text, working: true },
         );
+        this.setState({ isTyping: false });
         return;
       }
 
       case "agent_message": {
         const { text } = parsed;
         // With an id, finalize the matching draft (working → final answer).
-        // Without an id (legacy/no-draft), append a fresh bubble.
+        // Without an id (legacy/no-draft), append a fresh bubble. The first
+        // `agent_message` (with or without id) settles the typing indicator
+        // — the final answer is here, the agent is done working.
+        this.setState({ isTyping: false });
         if (parsed.id) {
           const id = parsed.id;
           this.upsertMessage(

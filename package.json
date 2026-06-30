@@ -9,7 +9,9 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "build": "npm run build --workspaces --if-present",
-    "build:demo": "npm run build:demo --workspace openclaw-webchannel-client"
+    "build": "npm run build --workspaces --if-present"
+  },
+  "optionalDependencies": {
+    "@rollup/rollup-linux-x64-gnu": "4.62.0"
   }
 }

@@ -1,8 +1,10 @@
 # WebChannel — 패키지화 / 배포 (PACKAGING)
 
+> 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 배포 구조·체크리스트 기준이며 명시된 날짜 시점 기준이다.
+
 > WebChannel을 **남들이 가져다 쓸 수 있는 수준**으로 배포하기 위한 패키지 구조와 작업 목록.
-> 상태(2026-06-15): 구조 **결정됨**. **완료** — auth seam, **헤드리스 `openclaw-webchannel-client`(framework-agnostic, zero-dep)** 구현·라이브 E2E, 게이트웨이 정적 서빙(이제 client의 vanilla 데모를 서빙), hmac-ticket E2E 검증.
-> **변경** — 기존 React `openclaw-webchannel-widget`는 **삭제**(2026-06-15). 사용자가 원한 건 React 위젯이 아니라 *기능*이었고, 그 기능은 `openclaw-webchannel-client`가 프레임워크 없이 제공한다. 게이트웨이 채팅 UI는 위젯 example → **client vanilla 데모**로 갈아끼운 뒤 삭제(서빙 검증 완료).
+> 상태(2026-06-15): 구조 **결정됨**. **완료** — auth seam, **헤드리스 `openclaw-webchannel-client`(framework-agnostic, zero-dep)** 구현, hmac-ticket E2E 검증(node smoke 스크립트).
+> **변경** — 기존 React `openclaw-webchannel-widget`는 **삭제**(2026-06-15). 사용자가 원한 건 React 위젯이 아니라 *기능*이었고, 그 기능은 `openclaw-webchannel-client`가 프레임워크 없이 제공한다. (브라우저 UI는 소비자가 client 라이브러리 위에 직접 얹는다 — 이 repo는 데모 UI를 배포하지 않는다.)
 > **미완** — 플러그인 publishable(private 해제·dist 빌드·`openclaw` peerDep·exports), README·라이선스·ClawHub.
 
 ---
@@ -26,7 +28,7 @@ openclaw-webchannel-client    (브라우저, 무프레임워크)  ← 헤드리�
 ```
 > **npm workspaces 모노레포.** 루트는 워크스페이스 매니저(코드 없음, `workspaces:["packages/*"]`), 두 패키지는 `packages/` 아래 대칭. 게이트웨이 `plugins.load.paths`는 `packages/plugin`을 가리킨다. 📄 구조 트리는 `PLAN.md` §8.
 
-> **2축 (프레임워크)는 이제 패키지 경계가 아니다.** 브라우저 쪽은 **무프레임워크 코어(`client`) 하나**만 배포한다. React/Vue/순수 JS 뷰는 *소비자 쪽*에서 그 위에 얹는다(이 repo가 React 뷰를 떠안지 않는다). `packages/client/demo`가 순수 JS 뷰의 참조 예시. — 과거엔 React `openclaw-webchannel-widget`를 별도 패키지로 뒀으나 2026-06-15 삭제(§4 D).
+> **2축 (프레임워크)는 이제 패키지 경계가 아니다.** 브라우저 쪽은 **무프레임워크 코어(`client`) 하나**만 배포한다. React/Vue/순수 JS 뷰는 *소비자 쪽*에서 그 위에 얹는다(이 repo가 React 뷰를 떠안지 않는다). — 과거엔 React `openclaw-webchannel-widget`를 별도 패키지로 뒀으나 2026-06-15 삭제(§4 D).
 
 ---
 
@@ -89,18 +91,18 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 
 ### C. Auth  ✅  → 상세 `AUTH.md`
 - ✅ `ConnectionVerifier` + `handleUpgrade` 배선(하드코딩 `ANON_PEER_ID` 제거).
-- ✅ 빌트인 `anonymous` + `hmac-ticket` + config 스키마.
+- ✅ 빌트인 `anonymous` + `hmac-ticket` + `jwt` + config 스키마.
 - ✅ 안전 기본값(strategy 미설정 거부, anonymous loud opt-in).
-- ✅ ticket 발급/검증 zero-dep(`src/ticket.ts`) + 브라우저 발급기(client `demo/devTicket.ts`, 데모).
-- ⬜ `jwt`/`trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입.
+- ✅ ticket 발급/검증 zero-dep(`src/ticket.ts` for hmac, `src/jwt.ts`+`src/jwks.ts` for RS256+JWKS). node smoke 스크립트(`smoke/jwt.mjs` 등)가 발급측을 수행해 E2E 검증.
+- ⬜ `trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입.
 
 ### D. 헤드리스 클라이언트 `openclaw-webchannel-client`  ✅ (2026-06-15)
 - ✅ `packages/client` 신규 구현 — **framework-agnostic, zero runtime dep**. ESM, `tsc` 빌드(라이브러리 → `dist/` JS + `.d.ts`).
-- ✅ `WebChannelClient`: `connect()`/`close()`/`send()`/`decide()` + `subscribe(listener)`(불변 상태 스냅샷 push) + `getState()`. (재연결 백오프+지터, 동시-connect sentinel, 매 재연결 `getTicket`, progress 드래프트, 승인 카드, 고아 드래프트 정리.)
-- ✅ **상태 소유권이 클라이언트** — 메시지/승인 리듀서가 여기 단일 출처. 순수 JS/Vue/React 뷰는 얇은 뷰.
+- ✅ `WebChannelClient`: `connect()`/`close()`/`send()`/`decide()` + `subscribe(listener)`(불변 상태 스냅샷 push) + `getState()`. (재연결 백오프+지터, 동시-connect sentinel, 매 재연결 `getTicket`, progress 드래프트, 승인 카드, 고아 드래프트 정리, **typing indicator: `WebChannelState.isTyping` + `typing` 케이스 자동 settle**, **history pagination: connect 시 `history` 프레임으로 `state.messages` hydrate + `loadHistory({before?, limit?})` 페이지네이션 메서드, id 중복 가드**.)
+- ✅ **상태 소유권이 클라이언트** — 메시지/승인 리듀서가 여기 단일 출처. 순수 JS/Vue/React 뷰는 얇은 뷰. `state.messages`는 초기 비어있다가 connect 성공 시 서버 `history` 프레임으로 hydrate (스크롤 복원 / 페이지 reload 시 "어제 무슨 얘기했지?" UX 해결).
 - ✅ **크로스오리진 `url` 옵션** + same-origin `path` 옵션.
-- ✅ 순수 DOM 데모(`demo/main.ts`, React 0줄) + `vitest` 유닛 15케이스 + 라이브 게이트웨이 hmac-ticket E2E(`smoke-client.mjs`) 통과.
-- ✅ **삭제된 React `openclaw-webchannel-widget` 대체.** 위젯(`webchannel/widget`: `useWebChannel` 훅 + `Chat.tsx` + example)은 2026-06-15 삭제. 위젯이 들고 있던 연결 로직은 client에 프레임워크 없이 재구현됐고, 게이트웨이가 서빙하던 위젯 example은 client의 vanilla 데모로 대체됨(아래 Phase 3).
+- ✅ `vitest` 유닛 29케이스 + 라이브 게이트웨이 hmac-ticket + jwt E2E(node smoke 스크립트 `smoke-client.mjs`, `smoke/jwt.mjs`) 통과. (브라우저 UI는 소비자가 client 라이브러리 위에 직접 구성 — 이 repo는 데모 페이지를 배포하지 않는다.)
+- ✅ **삭제된 React `openclaw-webchannel-widget` 대체.** 위젯(`webchannel/widget`: `useWebChannel` 훅 + `Chat.tsx` + example)은 2026-06-15 삭제. 위젯이 들고 있던 연결 로직은 client에 프레임워크 없이 재구현됐다.
 - ⬜ `"private"` 해제(출시 시) / `<script>` 임베드 UMD / README.
 
 ### E. 세션 분리  ✅
@@ -108,18 +110,14 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 
 ### F. 배포 위생 / DX  ⬜
 - ⬜ 패키지별 README. ⬜ 라이선스 MIT.
-- ✅ 테스트 green(auth/ticket/transport/approvals/static-assets/channel + 크로스런타임 + client 유닛 + smoke). ✅ **hmac-ticket E2E 라이브 검증**(2026-06-15).
+- ✅ 테스트 green(auth/ticket/transport/approvals/channel + 크로스런타임 + client 유닛 + smoke). ✅ **hmac-ticket E2E 라이브 검증**(2026-06-15).
 - ⬜ ClawHub 등록 / 호환성 매트릭스 / CI.
-
-### 게이트웨이 정적 서빙 (Phase 3) ✅
-- ✅ `src/static-assets.ts` + `/webchannel/` prefix 라우트. traversal-safe(게이트웨이 정규화 + 컨테인먼트 체크). 📄 `PLAN.md` §7 Phase 3.
-- ✅ **서빙 대상 = `packages/client/dist-demo`** (client의 vanilla 데모; `npm run build:demo`, base `/webchannel/`). `index.ts`의 `chatUiDistRoot`가 가리킴. (이전엔 `webchannel/widget/dist` — 위젯 삭제로 갈아끼움, 게이트웨이 재시작 후 `GET /webchannel/` 200 검증.)
 
 ---
 
 ## 5. 남은 작업 / 다음 순서
 
-지금까지: C(auth)·A 분리·D 헤드리스 클라이언트(+ 위젯 삭제·서빙 대체)·게이트웨이 서빙·E2E **완료**. 다음은 목표별:
+지금까지: C(auth)·A 분리·D 헤드리스 클라이언트(+ 위젯 삭제)·E2E **완료**. 다음은 목표별:
 
 - **SaaS 임베드 목표** → ① 크로스오리진은 client `url` 옵션으로 **완료**, ② SaaS 백엔드 ticket 발급 연동(`issueWebChannelTicket` 호출 → `getTicket`), 필요 시 ③ `openclaw-webchannel-ticket` zero-dep 패키지 분리.
 - **출시 목표** → B(플러그인 publishable: private 해제·dist 빌드·`openclaw` peerDep·exports) + D(client `private` 해제·README) + F(라이선스·ClawHub·CI).

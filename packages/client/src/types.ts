@@ -13,11 +13,17 @@ export type ChatRole = "user" | "agent";
  * One transcript bubble. `working: true` marks a live progress draft (the
  * rolling "Working…" bubble); it flips to false when the same id is finalized
  * into the agent's answer.
+ *
+ * `ts` is hydration metadata: server-recorded millisecond timestamp carried
+ * over from the core session transcript. The server uses it to sort the
+ * initial snapshot in recency order. Local sends (a user typing in the
+ * widget) keep `ts` absent — the server stamps it on receive.
  */
 export type ChatMessage = {
   id: string;
   role: ChatRole;
   text: string;
+  ts?: number;
   working?: boolean;
 };
 
@@ -63,6 +69,14 @@ export type WebChannelState = {
   status: ConnectionStatus;
   /** Convenience mirror of `status === "connected"`. */
   connected: boolean;
+  /**
+   * Native "Bot is typing…" affordance. The server pushes a single `typing`
+   * frame at the start of a turn, which flips this to `true`. The first
+   * `progress` / `agent_message` (or `approval_*`) frame automatically flips
+   * it back to `false`; the field is absent before the first typing frame
+   * arrives, and stays `false` once it has settled.
+   */
+  isTyping?: boolean;
 };
 
 /** A state-change subscriber. Receives the latest immutable snapshot. */
@@ -93,12 +107,46 @@ export type WebChannelOptions = {
    * trusted-header auth).
    */
   getTicket?: () => Promise<string | null>;
+  // -----------------------------------------------------------------------
+  // NATS mode options (AC 5: NATS cutover)
+  // -----------------------------------------------------------------------
+  /**
+   * NATS WebSocket URL. When provided, client connects directly to NATS
+   * instead of gateway-WS. Requires bootstrapJwt, agentId, tenant, and peerId.
+   */
+  natsUrl?: string;
+  /**
+   * Bootstrap JWT (RS256-signed) from SaaS. Required for NATS mode.
+   * Contains cnf.jwk claim with device public key.
+   */
+  bootstrapJwt?: string;
+  /**
+   * Agent ID (from JWT claims). Required for NATS mode.
+   */
+  agentId?: string;
+  /**
+   * Tenant ID (from JWT claims). Required for NATS mode.
+   */
+  tenant?: string;
+  /**
+   * Peer ID (JWT sub claim). Required for NATS mode.
+   */
+  peerId?: string;
 };
 
 /** Wire envelope sent TO the gateway. Mirrors `src/transport.ts`. */
 export type InboundWsMessage =
   | { type: "user_message"; text: string }
-  | { type: "approval_decision"; id: string; decision: ApprovalDecision };
+  | { type: "approval_decision"; id: string; decision: ApprovalDecision }
+  /**
+   * History pagination request. The widget emits this when the user scrolls
+   * up past the hydrated bubble list and asks for more. `before` is the
+   * oldest message id currently visible in the widget; `limit` is the page
+   * size (the server falls back to its configured `pageSize` when omitted).
+   * The SDK does NOT auto-fire this on the client's behalf — UI code calls
+   * `client.loadHistory(...)` on user action (e.g. scroll-to-top button).
+   */
+  | { type: "load_history"; before?: string; limit?: number };
 
 /** Wire envelope received FROM the gateway. Mirrors `src/transport.ts`. */
 export type OutboundWsMessage =
@@ -114,4 +162,13 @@ export type OutboundWsMessage =
       options: ApprovalOption[];
       expiresAtMs?: number;
     }
-  | { type: "approval_resolved"; id: string; decision: ApprovalDecision };
+  | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
+  /** Native typing affordance; see `WebChannelState.isTyping`. */
+  | { type: "typing" }
+  /**
+   * History snapshot / pagination response. Emitted exactly ONCE per
+   * connection after the first heartbeat (initial snapshot) AND in response
+   * to `load_history` requests (older pages). The widget prepends `messages`
+   * to its transcript, deduplicating by id.
+   */
+  | { type: "history"; messages: ChatMessage[] };
