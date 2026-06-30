@@ -239,6 +239,19 @@ jobs:
       - name: "Live e2e: ALL-REAL fusion"
         run: bash e2e/local/run-all-real.sh
 
+      # ──────────────────────────────────────────────────────────────────────
+      # 8f. Live e2e: 2-account routing isolation (가-1 Cycle 3 — AC6 gate)
+      #    ONE gateway serves TWO webchannel accounts (acctA→agentA, acctB→agentB),
+      #    each bound to a DISTINCT agent (distinct echo prefix) via binding.account.
+      #    A Node driver messages each account and asserts ROUTING ISOLATION: acctA's
+      #    reply carries agentA's prefix and NOT agentB's (and symmetrically). Proves
+      #    the REAL registerFull multiplex + single-route JWT-aud→account dispatch +
+      #    binding.account routing (no mocks). Node-only (no Chromium). Isolated under
+      #    /tmp/oc-two-acct-e2e (port 19299) — hermetic, no secret. Non-zero exit FAILS.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Live e2e: 2-account routing isolation"
+        run: bash e2e/local/run-two-account-isolation.sh
+
 ################################################################################
 # Publish job — gated on the E2E gate passing + release tag
 # Only runs when a semver tag is pushed (e.g. v1.0.0).
