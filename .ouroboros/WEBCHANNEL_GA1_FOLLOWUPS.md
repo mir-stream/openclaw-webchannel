@@ -42,6 +42,21 @@
 - 모든 account가 skip되면(예: encryption 오설정) 현재 503 + error 로그로 프로세스 유지(seed의
   무크래시 제약). 운영 정책상 "어떤 account든 unencrypted면 즉시 crash"를 원하면 opt-in 추가.
 
+### B6. 무인증 cross-tenant unregister DoS (PR #4 리뷰)
+- `/webchannel/nats/unregister`는 teardown 경로라 JWT 없음(pre-existing). 이 델타에서 단일 채널 →
+  **모든 account 런타임 루프**(`packages/plugin/index-nats.ts:471-475`)로 확대됨. peerId(=JWT `sub`,
+  비밀 아님)를 아는 무인증 호출자가 해당 peer를 *모든 테넌트*에서 강제 연결해제 가능(연결해제 DoS,
+  데이터 노출 아님).
+- **완화 방향**: teardown에 토큰이 없어 깔끔한 account 해석이 안 됨 → (택1) peer→account 역인덱스로
+  소속 account만 unregister, 또는 unregister에도 경량 auth(자기 peer만 teardown) 요구.
+
+### B7. 동일 audience accounts cross-register (PR #4 리뷰)
+- 두 account가 같은 `jwt.audience`(같은 IdP)를 쓰면 first-wins aud→account 매핑
+  (`index-nats.ts:~705` + `register-dispatch.ts:60-79`)으로 두 번째 account 유저가 첫 account
+  채널에 등록됨. `planAccounts`는 agentId 중복은 막지만 **audience 중복은 미차단**.
+- 현재 완화: 충돌 시 경고 로그 + 문서. **근본 해결**: `planAccounts`에서 served account 간 distinct
+  `jwt.audience` 강제(중복이면 skip + error).
+
 ## C. 큰 옵션 (요구 발생 시)
 
 ### C1. 가-2 — subject 중간 세그먼트 agentId → accountId 개명
