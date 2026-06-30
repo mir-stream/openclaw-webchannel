@@ -237,7 +237,7 @@ async function renderApprovalPage(userCode?: string): Promise<string> {
   try {
     const template = await readFile(templatePath, "utf-8");
     if (userCode) {
-      return template.replace("{{USER_CODE}}", userCode);
+      return template.replaceAll("{{USER_CODE}}", userCode);
     }
     return template;
   } catch (err) {
