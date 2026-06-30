@@ -41,33 +41,57 @@ import {
   type WebchannelNatsConfig,
 } from "./src/nats-credential-source.js";
 import { consumeCredentialSource } from "./src/consume-credentials.js";
+import { planAccounts } from "./src/multiplex.js";
 import {
-  resolveAccountNatsConfig,
-  resolveServingAccountId,
-} from "./src/account-config.js";
-import { resolveAcquisitionEnvPrecedence } from "./src/acquisition-env.js";
+  resolveAccountIdForJwt,
+  unionAllowedOrigins as unionAllowedOriginsOf,
+  addAudMapping,
+  resolveAndVerifyRegister,
+} from "./src/register-dispatch.js";
 
 // ---------------------------------------------------------------------------
-// Global state
+// Global state — multi-account multiplex (가-1 Cycle 2)
 // ---------------------------------------------------------------------------
 
 /**
- * Shared NATS channel instance.
- *
- * Replaces WebChannelTransport from the original gateway-WS implementation.
- * All message routing now goes through NATS subjects.
+ * Per-account serving runtime. One `gateway run` builds ONE of these per
+ * configured webchannel account (Phase 3 multiplex), each with its own NATS
+ * connection, encrypted channel, tenant/agentId subject namespace, verifier,
+ * and per-account config. The single HTTP register route dispatches to the
+ * right runtime by JWT `aud` (= agentId).
  */
-let natsChannel: NatsChannel | null = null;
-let natsConnection: EnrolledNatsConnection | null = null;
-/** Live transport (from enrolled connection OR the dev/open-NATS path). */
-let natsTransport: NatsTransport | null = null;
-let channelTenant = "default-tenant";
-let channelAgentId = "default-agent";
+type AccountRuntime = {
+  accountId: string;
+  tenant: string;
+  agentId: string;
+  channel: NatsChannel;
+  transport: NatsTransport;
+  enrolled?: EnrolledNatsConnection;
+  verifier: ConnectionVerifier;
+  auth: AuthConfig | undefined;
+  historyConfig: ReturnType<typeof resolveHistoryConfig>;
+  allowedOrigins: string[] | undefined;
+};
+
+/** accountId → runtime, built once per process (idempotent across re-warms). */
+const accountRuntimes = new Map<string, AccountRuntime>();
+/** aud (= agentId, and the configured jwt.audience) → accountId dispatch map. */
+const audToAccount = new Map<string, string>();
+/** Idempotency guard: the async per-account build runs once per process. */
+let accountsBuildStarted = false;
 
 /**
  * Proof-of-Possession nonce store (gap ①). Single-use, short-TTL nonces bound
  * to a peerId; the register route verifies an Ed25519 signature over the nonce
  * against the bootstrap JWT's `pop_jwk`.
+ *
+ * NOTE (multi-account): this store is PROCESS-WIDE, not per-account. It is keyed
+ * by peerId (the verified JWT `sub`) and only proves possession of the device
+ * key for that nonce — it is NOT an account-authorization decision. The full
+ * per-account verify (issuer + aud + signature via the resolved account's
+ * verifier) still gates every register, so a shared nonce store is not
+ * exploitable across accounts; a cross-account peerId collision could at most
+ * let a peer consume a nonce it also legitimately holds the device key for.
  */
 const popChallenges = new PopChallengeStore();
 
@@ -164,6 +188,22 @@ const lazyTransport = new Proxy({} as Record<string, unknown>, {
 }) as unknown as WebChannelTransport;
 
 /**
+ * Resolve the account runtime a bootstrap JWT targets, by peeking its
+ * (unverified) `aud` claim and mapping it to an account. The SELECTED account's
+ * verifier then performs full signature+aud+issuer verification, so this peek
+ * only routes — it never grants trust (see `peekUnverifiedJwtAudiences`).
+ */
+function accountForJwt(jwt: string | null | undefined): AccountRuntime | undefined {
+  const accountId = resolveAccountIdForJwt(jwt, audToAccount);
+  return accountId !== undefined ? accountRuntimes.get(accountId) : undefined;
+}
+
+/** CORS allowlist for the no-JWT preflight path (union over served accounts). */
+function unionAllowedOrigins(): string[] | undefined {
+  return unionAllowedOriginsOf([...accountRuntimes.values()].map((rt) => rt.allowedOrigins));
+}
+
+/**
  * Create the WebChannel plugin, backed by the lazy NATS transport facade.
  */
 const webChannelPlugin = createWebChannelPlugin(lazyTransport);
@@ -189,43 +229,53 @@ export default defineChannelPluginEntry({
     // as the WS-upgrade route in index.ts); it was a latent ordering bug here.
     //
     // The route HANDLERS only run at request time — long after async setup
-    // completes — so they read live state through the `live` holder, populated
-    // at the end of `registerFull`. Until setup finishes, handlers reply 503.
-    const live: {
-      channel: NatsChannel | null;
-      verifier: ConnectionVerifier | null;
-      auth: AuthConfig | undefined;
-      historyConfig: ReturnType<typeof resolveHistoryConfig> | null;
-    } = { channel: null, verifier: null, auth: undefined, historyConfig: null };
+    // completes — so they read live state through the module-level
+    // `accountRuntimes` / `audToAccount` maps (populated by the async build).
+    // Readiness is derived from the map at REQUEST time (not a per-call flag) so
+    // a re-warmed `registerFull` whose build is still in flight can never leave a
+    // stale handler stuck at 503. Until the first build populates the map, the
+    // handlers reply 503. A single route set serves ALL accounts; the handler
+    // dispatches to the right account by JWT `aud` (가-2 stays single-route).
+    const accountsReady = () => accountRuntimes.size > 0;
 
     // PoP challenge (gap ①): issue a single-use nonce bound to the verified
     // peerId. The browser signs it with the device Ed25519 key and presents the
-    // signature to /register.
+    // signature to /register. Dispatched to the account named by the JWT `aud`.
     api.registerHttpRoute({
       path: "/webchannel/nats/register/challenge",
       auth: "plugin",
       match: "exact",
       handler: asRoute(async (req, res) => {
-        // CORS: reflect origin (or honor the configured allowlist) on every
-        // response path; answer the browser's preflight (sent because of the
-        // Authorization header) without a JWT.
-        setRegisterCors(req, res, corsAllowedOrigins(live.auth));
+        const authHeader = req.headers["authorization"];
+        const jwt = authHeader?.startsWith("Bearer ")
+          ? authHeader.slice(7)
+          : new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt");
+        const account = accountForJwt(jwt);
+        // CORS: use the resolved account's allowlist when known, else the union
+        // (preflight / unmapped). Set on every response path including 401/503.
+        setRegisterCors(req, res, account ? account.allowedOrigins : unionAllowedOrigins());
         if (req.method === "OPTIONS") {
           res.statusCode = 204;
           res.end();
           return;
         }
+        if (!accountsReady()) {
+          res.statusCode = 503;
+          res.end("WebChannel starting up");
+          return;
+        }
         try {
-          const authHeader = req.headers["authorization"];
-          const jwt = authHeader?.startsWith("Bearer ")
-            ? authHeader.slice(7)
-            : new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt");
           if (!jwt) {
             res.statusCode = 401;
             res.end("Missing JWT");
             return;
           }
-          const peerId = await verifyJwtAndExtractPeerId(jwt, live.auth, api.logger);
+          if (!account) {
+            res.statusCode = 401;
+            res.end("No account for token audience");
+            return;
+          }
+          const peerId = await verifyJwtAndExtractPeerId(jwt, account.auth, api.logger);
           if (!peerId) {
             res.statusCode = 401;
             res.end("Invalid JWT");
@@ -248,48 +298,58 @@ export default defineChannelPluginEntry({
       auth: "plugin",
       match: "exact",
       handler: asRoute(async (req, res) => {
-        // CORS: reflect origin (or honor the configured allowlist) on every
-        // response path (including 401/500/503); answer the browser's preflight
-        // without requiring a JWT/body.
-        setRegisterCors(req, res, corsAllowedOrigins(live.auth));
+        // Extract JWT first so we can resolve the target account for CORS +
+        // dispatch. CORS is set on every response path (including 401/500/503).
+        const authHeader = req.headers["authorization"];
+        const jwt = authHeader?.startsWith("Bearer ")
+          ? authHeader.slice(7)
+          : (new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt"));
+        const corsAccount = accountForJwt(jwt);
+        setRegisterCors(req, res, corsAccount ? corsAccount.allowedOrigins : unionAllowedOrigins());
         if (req.method === "OPTIONS") {
           res.statusCode = 204;
           res.end();
           return;
         }
-        const channel = live.channel;
-        const verifier = live.verifier;
-        if (!channel || !live.historyConfig) {
+        if (!accountsReady()) {
           res.statusCode = 503;
           res.end("WebChannel starting up");
           return;
         }
-        if (!verifier) {
-          res.statusCode = 500;
-          res.end("No verifier configured");
-          return;
-        }
 
         try {
-          // Extract JWT from Authorization header or query parameter
-          const authHeader = req.headers["authorization"];
-          const jwt = authHeader?.startsWith("Bearer ")
-            ? authHeader.slice(7)
-            : (new URL(req.url!, `http://${req.headers.host}`).searchParams.get("jwt"));
-
-          if (!jwt) {
+          // Resolve-and-verify in ONE step (S1 invariant, locked by
+          // register-dispatch.test.ts): the account a token's aud routes to is
+          // the SAME account it is verified against AND registered into. A token
+          // routed to account B can never be verified against / registered into
+          // account A — they are one `resolved.account`.
+          const resolved = await resolveAndVerifyRegister({
+            jwt,
+            audToAccount,
+            getAccount: (id) => accountRuntimes.get(id),
+            verify: (j, a) => verifyJwtAndExtractIdentity(j, a as AuthConfig | undefined, api.logger),
+          });
+          if (resolved.status === "no-jwt") {
             res.statusCode = 401;
             res.end("Missing JWT");
             return;
           }
-
-          // Verify JWT and extract the full identity (peerId + PoP key)
-          const identity = await verifyJwtAndExtractIdentity(jwt, live.auth, api.logger);
-          if (!identity) {
+          if (resolved.status === "no-account" || resolved.status === "non-jwt") {
+            // No served account for this aud, or the account isn't a jwt-strategy
+            // register-hop account (clearer 401 than letting verify throw → 500).
+            res.statusCode = 401;
+            res.end("No account for token audience");
+            return;
+          }
+          if (resolved.status === "invalid") {
             res.statusCode = 401;
             res.end("Invalid JWT");
             return;
           }
+          const account = resolved.account;
+          const channel = account.channel;
+          const auth = account.auth;
+          const identity = resolved.identity;
           const peerId = identity.peerId;
 
           // Defense-in-depth (Item 2): peerId comes from the verified JWT `sub`,
@@ -308,7 +368,7 @@ export default defineChannelPluginEntry({
           // unless an operator explicitly sets auth.requirePoP=false. A verified
           // bootstrap JWT minted WITHOUT `pop_jwk` is otherwise freely replayable,
           // so with the default (true) we reject it here BEFORE registering.
-          const requirePoP = resolveRequirePoP(live.auth as { requirePoP?: boolean } | undefined);
+          const requirePoP = resolveRequirePoP(auth as { requirePoP?: boolean } | undefined);
           if (popRequirementUnmet(requirePoP, Boolean(identity.popPublicJwk))) {
             api.logger.error?.(
               `webchannel: register rejected for ${peerId} — proof-of-possession required (JWT has no pop_jwk)`,
@@ -352,17 +412,19 @@ export default defineChannelPluginEntry({
             }
           }
 
-          // Register peer in NATS channel
+          // Register peer in THIS account's NATS channel.
           channel.registerPeer(peerId);
 
-          // Send initial history snapshot
+          // Send initial history snapshot, scoped to this account's route
+          // (accountId activates binding.account + per-account session key).
           try {
             const route = api.runtime.channel.routing.resolveAgentRoute({
               cfg: api.config,
               channel: WEBCHANNEL_ID,
+              accountId: account.accountId,
               peer: { kind: "direct", id: peerId },
             });
-            const messages = await historyRecent(api, route.sessionKey, live.historyConfig.limit, api.logger);
+            const messages = await historyRecent(api, route.sessionKey, account.historyConfig.limit, api.logger);
             channel.sendHistory(peerId, messages);
           } catch (err) {
             api.logger.error?.(
@@ -387,8 +449,7 @@ export default defineChannelPluginEntry({
       auth: "plugin",
       match: "exact",
       handler: asRoute(async (req, res) => {
-        const channel = live.channel;
-        if (!channel) {
+        if (!accountsReady()) {
           res.statusCode = 503;
           res.end("WebChannel starting up");
           return;
@@ -407,7 +468,11 @@ export default defineChannelPluginEntry({
             return;
           }
 
-          channel.unregisterPeer(peerId);
+          // No JWT on the teardown path, so unregister the peer from EVERY
+          // account's channel (idempotent — a peer lives in exactly one).
+          for (const rt of accountRuntimes.values()) {
+            rt.channel.unregisterPeer(peerId);
+          }
 
           res.statusCode = 200;
           res.end(JSON.stringify({ peerId, unregistered: true }));
@@ -420,288 +485,263 @@ export default defineChannelPluginEntry({
     });
 
     // -----------------------------------------------------------------------
-    // Step 0: Fail-closed encryption guard (AC 3a / EncryptedChannelWired)
+    // Steps 0–7 (per account): build ONE serving runtime per configured account
     // -----------------------------------------------------------------------
 
-    // The NATS relay is untrusted and must only ever observe ciphertext. Resolve
-    // the encryption policy BEFORE connecting to NATS: a deployment that disables
-    // encryption throws here and the entry refuses to start — it never connects,
-    // never registers a peer, and therefore never emits plaintext to the relay.
-    const webchannelCfg = (
-      api.config.channels as Record<string, unknown> | undefined
-    )?.webchannel as
-      | { encryption?: WebchannelEncryptionConfig; auth?: AuthConfig }
-      | undefined;
-
-    let cryptoOptions: NatsChannelCryptoOptions;
-    try {
-      cryptoOptions = resolveEncryptionPolicy(webchannelCfg?.encryption).crypto;
-    } catch (err) {
-      api.logger.error?.(`webchannel: ${(err as Error).message}`);
-      throw err;
+    // Idempotency: openclaw pre-warms plugins, so `registerFull` can run more
+    // than once per process. Build the per-account runtimes exactly once; later
+    // invocations are a no-op — their freshly-registered route handlers read the
+    // shared module-level maps via `accountsReady()`, so they see the accounts
+    // built by the first invocation with no per-call state to go stale.
+    if (accountsBuildStarted) {
+      console.log("[webchannel] ✓ NATS mode plugin registered (accounts already built)");
+      return;
     }
+    accountsBuildStarted = true;
 
-    // -----------------------------------------------------------------------
-    // Step 1: Resolve the credential SOURCE (Axis A), then connect.
-    // -----------------------------------------------------------------------
-
-    // Axis A (`nats-credential-source.ts`) decouples HOW the agent authenticates
-    // to NATS from the connection itself. 가-1 makes `gateway run` CONSUME-ONLY:
-    // the `enrolled` source no longer enrolls at runtime — it LOADS the persisted
-    // per-account creds (acquisition moved to `openclaw channels add`). The
-    // `open` / `static` sources are unchanged (auth material is already present).
-    // Connection/static env keeps its override meaning: WEBCHANNEL_NATS_URL /
-    // _USER_JWT / _USER_SEED / _CREDS / _DEV_OPEN.
-    const wcNatsCfg = (webchannelCfg as { nats?: WebchannelNatsConfig } | undefined)?.nats;
     const legacyNats = api.config.nats as { url?: string; devOpen?: boolean } | undefined;
 
-    // Tracks the resolved credential source mode so the admission decision
-    // (Axis B, Step 3) is made explicitly rather than inferred from devOpen.
-    let credentialMode: NatsCredentialSource["mode"] = "enrolled";
+    // Phase 3 planning (pure): list accounts + apply the structural skip rules
+    // (named-account-without-own-agentId, duplicate-agentId). The plan order is
+    // deterministic so duplicate-agentId resolution is stable.
+    const plans = planAccounts(api.config, {
+      warn: (msg) => (api.logger?.warn ?? console.warn)?.(msg),
+    });
 
-    if (!natsTransport) {
-      // Cycle 1 serves the single serving account (`"default"` when listed, else
-      // the first listed account). A flat/legacy config resolves to `"default"`.
-      // Cycle 2 multiplexes ALL listed accounts (the list seam already exists).
-      const accountId = resolveServingAccountId(api.config);
+    for (const plan of plans) {
+      if (plan.status === "skip") {
+        // Account-scoped graceful skip (structural misconfig). Other accounts +
+        // the process are unaffected.
+        (api.logger?.warn ?? api.logger?.error ?? console.warn)?.(plan.message);
+        continue;
+      }
 
-      // Acquisition identity with deterministic config-over-env precedence
-      // (deliverable 6): config wins when present; the legacy WEBCHANNEL_TENANT/
-      // _AGENT_ID/_SAAS_BASE_URL env only synthesizes a `"default"` identity when
-      // there is NO webchannel config (one-time deprecation warning otherwise).
-      const { identity } = resolveAcquisitionEnvPrecedence(api.config, accountId, {
-        warn: (msg) => (api.logger?.warn ?? console.warn)?.(msg),
-      });
-      channelTenant = identity.tenant;
-      channelAgentId = identity.agentId;
+      const { accountId, tenant, agentId, account } = plan;
+      const accountAuth = account.auth as AuthConfig | undefined;
+      const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
+      const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
+      const accountDmSecurity = account.dmSecurity as string | undefined;
 
-      // Prefer the account-scoped nats config; fall back to the flat block.
-      const accountNatsCfg = resolveAccountNatsConfig(api.config, accountId) ?? wcNatsCfg;
+      // ---- Step 0 (per account): fail-closed encryption guard --------------
+      // The NATS relay must only ever observe ciphertext. If an account disables
+      // encryption, we SKIP that account (it is never served, never connects,
+      // never emits plaintext) rather than crashing the whole process — this
+      // keeps the fail-closed invariant (no plaintext) while isolating the
+      // misconfig from other accounts/channels.
+      let cryptoOptions: NatsChannelCryptoOptions;
+      try {
+        cryptoOptions = resolveEncryptionPolicy(accountEncryption).crypto;
+      } catch (err) {
+        (api.logger?.error ?? console.error)?.(
+          `[webchannel] account "${accountId}" encryption misconfig — skipping ` +
+            `(refusing to serve without E2E encryption): ${(err as Error).message}`,
+        );
+        continue;
+      }
 
+      // ---- Step 1 (per account): resolve credential source + CONSUME -------
+      let transport: NatsTransport;
+      let enrolled: EnrolledNatsConnection | undefined;
+      let credentialMode: NatsCredentialSource["mode"];
       try {
         const source = resolveNatsCredentialSource({
           natsConfig: accountNatsCfg,
           legacyNats,
-          // Pass the config-derived saasBaseUrl RAW; the resolver owns the full
-          // saasBaseUrl precedence (env > nats.credentials.saasBaseUrl > this > default).
-          saasBaseUrl: identity.saasBaseUrl ?? api.config.saas?.baseUrl,
-          tenant: channelTenant,
-          agentId: channelAgentId,
+          saasBaseUrl: plan.saasBaseUrl ?? api.config.saas?.baseUrl,
+          tenant,
+          agentId,
         });
         credentialMode = source.mode;
-        console.log(`[webchannel] NATS credential source: ${source.mode} → ${source.url}`);
-
-        // CONSUME-only: enrolled → load persisted per-account creds (no enroll).
+        console.log(
+          `[webchannel] account "${accountId}" credential source: ${source.mode} → ${source.url}`,
+        );
         const consumed = await consumeCredentialSource(source, accountId);
         if (consumed.status === "creds-missing") {
-          // Account-scoped graceful degradation: skip serving THIS account with
-          // an actionable log (skipped account id + remediation command). No
-          // runtime enroll, no polling, no hang. Other accounts/channels and the
-          // gateway process are unaffected — we just return without binding a
-          // transport, so the register routes reply 503 for this account.
+          // Account-scoped graceful degradation (creds missing/expired): skip
+          // serving THIS account with an actionable log. No runtime enroll, no
+          // polling, no hang; other accounts/channels and the process are fine.
           (api.logger?.warn ?? api.logger?.error ?? console.warn)?.(
             `[webchannel] account "${consumed.accountId}" has no enrolled credentials — ` +
               `skipping serving this account. Run: openclaw channels add --channel ` +
               `webchannel --account ${consumed.accountId}`,
           );
-          return;
+          continue;
         }
-        natsTransport = consumed.connection.transport;
-        if (consumed.connection.enrolled) natsConnection = consumed.connection.enrolled;
+        transport = consumed.connection.transport;
+        if (consumed.connection.enrolled) enrolled = consumed.connection.enrolled;
       } catch (err) {
-        // Non-fatal (graceful degradation): a failed resolve/connect disables the
-        // webchannel for THIS process instead of crashing it — applied uniformly
-        // to ALL credential sources (open / static / enrolled-consume). This
-        // matters because openclaw loads this channel entry in EVERY context —
-        // not just the serving gateway, but also local `openclaw chat`/TUI/CLI
-        // runs. Without this guard the throw propagates out of registerFull as an
-        // unhandled rejection and takes the whole process down (TUI wouldn't even
-        // start). The serving gateway stays up too (other channels keep working);
-        // the register routes reply 503 until a connection is established. The
-        // encryption fail-closed guard (Step 0) is separate and still throws.
         const msg = err instanceof Error ? err.message : String(err);
         (api.logger?.warn ?? api.logger?.error ?? console.warn)?.(
-          `[webchannel] NATS connection failed — channel inactive for this process (${msg})`,
+          `[webchannel] account "${accountId}" NATS connection failed — skipping this account (${msg})`,
         );
-        return;
+        continue;
       }
-      console.log("[webchannel] ✓ Connected to NATS");
-    }
 
-    // -----------------------------------------------------------------------
-    // Step 2: Create NATS channel
-    // -----------------------------------------------------------------------
-
-    if (!natsChannel) {
-      // Encrypt-by-construction: the channel performs the per-peer X25519
-      // handshake and ChaCha20-Poly1305-seals every frame. It is fail-closed —
-      // it never publishes or processes plaintext on the relay.
-      natsChannel = new NatsChannel(natsTransport, channelAgentId, channelTenant, cryptoOptions);
-      // Bind the live channel into the lazy transport facade so the plugin's
-      // outbound/message/approval adapters now route to NATS.
-      boundChannel = natsChannel;
-      console.log("[webchannel] ✓ Encrypted NATS channel created");
-    }
-
-    const channel = natsChannel;
-
-    // -----------------------------------------------------------------------
-    // Step 3: Wire up inbound message dispatcher
-    // -----------------------------------------------------------------------
-
-    // Bridge inbound NATS messages into the OpenClaw agent runtime — the same
-    // seam the WS entry (index.ts) uses. `handleInboundMessage` runs the turn
-    // through `api.runtime.channel.inbound.run` (which reaches the model) and
-    // delivers the agent's reply back via `channel.sendText` (NatsChannel
-    // satisfies the transport surface it touches: sendTyping + sendText).
-    // Serialized per-peer so two turns for one peer never interleave.
-    const { dispatch: dispatchInbound } = createSerializedInboundDispatcher<
-      Extract<InboundWsMessage, { type: "user_message" }>
-    >((peerId, message) =>
-      handleInboundMessage(
-        api,
-        channel as unknown as WebChannelTransport,
-        peerId,
-        message,
-      ),
-    );
-
-    channel.setMessageHandler((peerId, message) => {
-      if (message.type !== "user_message") return; // approvals routed below
-      dispatchInbound(peerId, message);
-    });
-
-    // Axis B — PEER ADMISSION (`nats-admission.ts`), decided EXPLICITLY and
-    // independently of the credential source:
-    //   - `register-hop`: a peer must complete the SaaS JWT + PoP round-trip at
-    //     `/webchannel/nats/register*` before the agent subscribes to it. The
-    //     production default for `auth.strategy === "jwt"`.
-    //   - `auto`: the agent subscribes to the tenant/agent wildcard and serves any
-    //     peer that completes the X25519 handshake AND passes the dmSecurity
-    //     allowlist (security = subject permissions + allowlist + E2E encryption).
-    //     This is now available for a real external NATS with `static` creds — NOT
-    //     just devOpen — which the legacy devOpen-gated wildcard could never do.
-    // An explicit `nats.admission` override wins. Existing flows are unchanged:
-    // enrolled+jwt → register-hop; devOpen+jwt → register-hop; devOpen+hmac → auto.
-    const authStrategy = (webchannelCfg?.auth as { strategy?: string } | undefined)?.strategy;
-    // Derive Axis B's capability from Axis A WITHOUT leaking credential-mode names
-    // into the admission module: an issuer-backed register hop is viable for every
-    // source EXCEPT bring-your-own static creds (which has no issuer to run).
-    const registerHopAvailable = credentialMode !== "static";
-    const admission = resolveAdmissionMode({
-      authStrategy,
-      registerHopAvailable,
-      explicitOverride: wcNatsCfg?.admission,
-    });
-    if (admission === "auto") {
-      channel.subscribeWildcard();
-    }
-
-    // SAFETY: surface the open admission posture exactly once at startup. When
-    // admission is `auto` AND no dmSecurity allowlist gates senders (notably the
-    // static + auto BYO-NATS case), the agent serves ANY peer that can reach the
-    // subjects and complete the handshake — the boundary is then purely NATS
-    // subject permissions. Do NOT warn for register-hop or when an allowlist is set.
-    const dmSecurity = (webchannelCfg as { dmSecurity?: string } | undefined)?.dmSecurity;
-    if (admission === "auto" && isDmPostureOpen(dmSecurity)) {
-      api.logger.warn?.(
-        "webchannel: admission=auto with no dmSecurity allowlist — any peer with NATS " +
-          "access + a valid handshake is served; rely on NATS subject permissions as the boundary.",
+      // ---- Step 2 (per account): create the encrypted NATS channel ---------
+      // Subject namespace is webchannel.{tenant}.{agentId}.{peerId} (UNCHANGED
+      // wire shape — one namespace per account).
+      const channel = new NatsChannel(transport, agentId, tenant, cryptoOptions);
+      console.log(
+        `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, agentId=${agentId})`,
       );
-    }
 
-    // -----------------------------------------------------------------------
-    // Step 4: Wire up approval decision handler
-    // -----------------------------------------------------------------------
-
-    channel.setApprovalDecisionHandler((peerId, id, decision) => {
-      void handleApprovalDecision(api.config, id, decision, peerId).catch((err) => {
-        api.logger.error?.(
-          `webchannel: approval resolve failed (${id}): ${String(err)}`,
-        );
+      // ---- Step 3 (per account): inbound dispatcher (accountId-threaded) ----
+      // Each account gets its OWN serialized dispatcher bound to its channel and
+      // accountId, so inbound turns resolve THIS account's route (binding.account)
+      // and replies deliver back over THIS account's channel.
+      const { dispatch: dispatchInbound } = createSerializedInboundDispatcher<
+        Extract<InboundWsMessage, { type: "user_message" }>
+      >((peerId, message) =>
+        handleInboundMessage(
+          api,
+          channel as unknown as WebChannelTransport,
+          peerId,
+          message,
+          accountId,
+        ),
+      );
+      channel.setMessageHandler((peerId, message) => {
+        if (message.type !== "user_message") return; // approvals routed below
+        dispatchInbound(peerId, message);
       });
-    });
 
-    // -----------------------------------------------------------------------
-    // Step 5: Wire up history load handler
-    // -----------------------------------------------------------------------
-
-    const historyConfig = resolveHistoryConfig(
-      (api.config.channels as Record<string, unknown> | undefined)?.webchannel as
-        | { capabilities?: { typing?: "on" | "off" } }
-        | undefined,
-    );
-
-    channel.setLoadHistoryHandler((peerId, request) => {
-      try {
-        const route = api.runtime.channel.routing.resolveAgentRoute({
-          cfg: api.config,
-          channel: WEBCHANNEL_ID,
-          peer: { kind: "direct", id: peerId },
-        });
-        void historyPageBefore(api, route.sessionKey, request, historyConfig.pageSize, api.logger)
-          .then((messages) => {
-            channel.sendHistory(peerId, messages);
-          })
-          .catch((err) => {
-            api.logger.error?.(
-              `webchannel: history page failed for ${peerId}: ${String(err)}`,
-            );
-          });
-      } catch (err) {
-        api.logger.error?.(
-          `webchannel: history resolution failed for ${peerId}: ${String(err)}`,
+      // ---- Axis B (per account): peer admission ----------------------------
+      const registerHopAvailable = credentialMode !== "static";
+      const admission = resolveAdmissionMode({
+        authStrategy: (accountAuth as { strategy?: string } | undefined)?.strategy,
+        registerHopAvailable,
+        explicitOverride: accountNatsCfg?.admission,
+      });
+      if (admission === "auto") {
+        channel.subscribeWildcard();
+      }
+      if (admission === "auto" && isDmPostureOpen(accountDmSecurity)) {
+        api.logger.warn?.(
+          `webchannel: account "${accountId}" admission=auto with no dmSecurity allowlist — ` +
+            "any peer with NATS access + a valid handshake is served; rely on NATS subject permissions.",
         );
       }
-    });
 
-    // -----------------------------------------------------------------------
-    // Step 6: Set up JWT verifier for peer registration
-    // -----------------------------------------------------------------------
+      // ---- Step 4 (per account): approval decision handler -----------------
+      channel.setApprovalDecisionHandler((peerId, id, decision) => {
+        void handleApprovalDecision(api.config, id, decision, peerId).catch((err) => {
+          api.logger.error?.(`webchannel: approval resolve failed (${id}): ${String(err)}`);
+        });
+      });
 
-    const authConfig = (
-      api.config.channels as Record<string, unknown> | undefined
-    )?.webchannel as { auth?: AuthConfig } | undefined;
+      // ---- Step 5 (per account): history load handler ----------------------
+      const historyConfig = resolveHistoryConfig(
+        account as { capabilities?: { typing?: "on" | "off" } } | undefined,
+      );
+      channel.setLoadHistoryHandler((peerId, request) => {
+        try {
+          const route = api.runtime.channel.routing.resolveAgentRoute({
+            cfg: api.config,
+            channel: WEBCHANNEL_ID,
+            accountId,
+            peer: { kind: "direct", id: peerId },
+          });
+          void historyPageBefore(api, route.sessionKey, request, historyConfig.pageSize, api.logger)
+            .then((messages) => {
+              channel.sendHistory(peerId, messages);
+            })
+            .catch((err) => {
+              api.logger.error?.(`webchannel: history page failed for ${peerId}: ${String(err)}`);
+            });
+        } catch (err) {
+          api.logger.error?.(`webchannel: history resolution failed for ${peerId}: ${String(err)}`);
+        }
+      });
 
-    let verifier: ConnectionVerifier | null = null;
-    try {
-      verifier = resolveVerifier(authConfig?.auth, api.logger);
-    } catch (err) {
-      const errorMsg = (err as Error).message;
-      api.logger.error?.(`webchannel: ${errorMsg}`);
-      throw err;
+      // ---- Step 6 (per account): JWT verifier ------------------------------
+      let verifier: ConnectionVerifier;
+      try {
+        verifier = resolveVerifier(accountAuth, api.logger);
+      } catch (err) {
+        (api.logger?.error ?? console.error)?.(
+          `[webchannel] account "${accountId}" verifier misconfig — skipping: ${(err as Error).message}`,
+        );
+        continue;
+      }
+
+      // ---- Publish this account's runtime + aud→account dispatch entries ----
+      const allowedOrigins = corsAllowedOrigins(accountAuth);
+      accountRuntimes.set(accountId, {
+        accountId,
+        tenant,
+        agentId,
+        channel,
+        transport,
+        ...(enrolled ? { enrolled } : {}),
+        verifier,
+        auth: accountAuth,
+        historyConfig,
+        allowedOrigins,
+      });
+      // Dispatch keys: the agentId (= subject/wire key) AND the configured
+      // jwt.audience (what the bootstrap JWT actually carries) if it differs.
+      // First-wins on collision (C1): a shared IdP audience across accounts (or
+      // an agentId clobbering a prior account's audience key) is kept for the
+      // FIRST account + logged, never silently overwritten (which would misroute).
+      const onAudCollision = (msg: string) => (api.logger?.warn ?? console.warn)?.(msg);
+      addAudMapping(audToAccount, agentId, accountId, onAudCollision);
+      const configuredAud = (accountAuth as { jwt?: { audience?: string } } | undefined)?.jwt?.audience;
+      if (typeof configuredAud === "string" && configuredAud.length > 0) {
+        addAudMapping(audToAccount, configuredAud, accountId, onAudCollision);
+      }
     }
 
-    // -----------------------------------------------------------------------
-    // Step 7: Publish live state to the HTTP route handlers registered in Step A
-    // -----------------------------------------------------------------------
+    // Bind the lazy transport facade to a PRIMARY channel for core-initiated
+    // (untargeted) outbound + the approval capability, which use the single
+    // facade. Inbound replies already route per-account via each channel's own
+    // dispatcher (so AC6's inbound routing is unaffected). Prefer "default", else
+    // the first built account.
+    //
+    // Cycle 3 follow-up: this is primary-only. A peerId that happens to be
+    // registered on BOTH the primary AND a non-primary account could receive the
+    // primary account's PROACTIVE / APPROVAL outbound (the untargeted facade
+    // can't disambiguate by account). Per-account proactive-outbound + approval
+    // routing needs an accountId-aware outbound facade (Cycle 3).
+    const primary = accountRuntimes.get("default") ?? [...accountRuntimes.values()][0];
+    boundChannel = primary ? primary.channel : null;
 
-    // The register / challenge / unregister routes were registered synchronously
-    // at the top of registerFull (Step A) — they MUST be, or openclaw drops them.
-    // Now that async setup is complete, hand them the live channel + verifier so
-    // requests stop replying 503 and start admitting peers (JWT + PoP).
-    live.channel = channel;
-    live.verifier = verifier;
-    live.auth = authConfig?.auth;
-    live.historyConfig = historyConfig;
+    // Route handlers become ready automatically: `accountsReady()` reads the
+    // `accountRuntimes` map populated above, so as soon as ≥1 account is built
+    // the register/challenge/unregister routes stop replying 503.
 
     // -----------------------------------------------------------------------
-    // Step 9: Keep the NATS connection alive
+    // Step 9: Keep the NATS connections alive (best-effort, all accounts)
     // -----------------------------------------------------------------------
-
-    // keepAlive is optional — not all gateway runtimes expose it. The NATS
-    // transport maintains its own connection, so this is best-effort.
     const keepAlive = (api.runtime.channel as { keepAlive?: (opts: { handler: () => Promise<void> }) => void }).keepAlive;
     if (typeof keepAlive === "function") {
       keepAlive({
         async handler() {
-          if (natsTransport && !natsTransport.connected) {
-            console.log("[webchannel] NATS disconnected, attempting reconnect...");
+          for (const rt of accountRuntimes.values()) {
+            if (!rt.transport.connected) {
+              console.log(`[webchannel] account "${rt.accountId}" NATS disconnected, awaiting reconnect...`);
+            }
           }
         },
       });
     }
 
-    console.log("[webchannel] ✓ NATS mode plugin registered");
+    // S2: restore operator visibility. A green ✓ with "0 serving" would mask a
+    // misconfig (e.g. a single-"default" encryption fat-finger) as a healthy-
+    // looking permanent 503. When NOTHING serves, emit an ERROR (not ✓) naming
+    // the cause; keep the ✓ only when ≥1 account actually serves.
+    if (accountRuntimes.size === 0) {
+      (api.logger?.error ?? console.error)?.(
+        `[webchannel] NO webchannel accounts are serving — all ${plans.length} configured ` +
+          `account(s) were skipped (misconfig: missing/duplicate agentId, encryption ` +
+          `policy, missing credentials, or connection failure). The register routes will ` +
+          `reply 503 until fixed; review the per-account skip logs above and re-run ` +
+          `'openclaw channels add --channel webchannel'.`,
+      );
+    } else {
+      console.log(
+        `[webchannel] ✓ NATS mode plugin registered (${accountRuntimes.size} of ` +
+          `${plans.length} configured account(s) serving)`,
+      );
+    }
   },
 });

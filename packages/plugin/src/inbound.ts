@@ -3,6 +3,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
 import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
+import { DEFAULT_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
 
 /** The inbound path only handles user messages; approvals route separately. */
 type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
@@ -64,6 +65,7 @@ export async function handleInboundMessage(
   transport: WebChannelTransport,
   peerId: string,
   message: InboundUserMessage,
+  accountId: string = DEFAULT_ACCOUNT_ID,
 ): Promise<void> {
   // `wsKey` is the verified per-peer id the transport uses as its socket-map
   // key (the anonymous strategy is the single-peer special case, where this
@@ -81,9 +83,11 @@ export async function handleInboundMessage(
   // dist/plugin-sdk/types-BVAOMoZy.d.ts:5813). Each event refreshes a single
   // rolling draft pushed to the widget as a `progress` frame; the final answer
   // (delivered through `delivery.deliver`) finalizes that same draft id.
-  const channelConfig = (api.config.channels as Record<string, unknown> | undefined)?.[
-    WEBCHANNEL_ID
-  ];
+  // 가-1 Cycle 2: read the PER-ACCOUNT resolved config (channel-level shared
+  // base merged under this account's override), not the flat block, so each
+  // account's streaming/dmSecurity/allowFrom apply to its own turns. For the
+  // single `"default"` account this is identical to the flat block (regression).
+  const channelConfig = resolveWebchannelAccountConfig(api.config, accountId);
 
   // DM allowlist admission (split-authz, plugin-owned half). When the operator
   // sets `channels.webchannel.dmSecurity: "allowlist"`, a non-allowlisted peer
@@ -112,11 +116,16 @@ export async function handleInboundMessage(
     });
   }
 
-  // Resolve the channel-scoped agent route (carries `webchannel` + peer in the
-  // session key per configured dmScope/bindings).
+  // Resolve the channel-scoped agent route (carries `webchannel` + account +
+  // peer in the session key per configured dmScope/bindings). Threading
+  // `accountId` activates openclaw's `binding.account` routing tier, so
+  // `agents bind --agent X --bind webchannel:<account>` routes THIS account's
+  // inbound to agent X, and accountId enters the sessionKey (per-account
+  // session isolation). For `"default"` this matches the Cycle 1 route.
   const route = channelRuntime.routing.resolveAgentRoute({
     cfg: api.config,
     channel: WEBCHANNEL_ID,
+    accountId,
     peer: { kind: "direct", id: wsKey },
   });
 

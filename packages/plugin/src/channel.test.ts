@@ -188,6 +188,89 @@ describe("webchannel inbound round-trip", () => {
     expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back");
   });
 
+  it("threads accountId into resolveAgentRoute (binding.account routing — Cycle 2)", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api, resolveAgentRoute } = makeFakeApi(captured, {
+      // Per-account config lives under accounts.<id>; acctA inherits no base here.
+      channelConfig: { accounts: { acctA: {} } },
+    });
+
+    await handleInboundMessage(
+      api,
+      transport,
+      "alice",
+      { type: "user_message", text: "hello" },
+      "acctA",
+    );
+
+    // The route is resolved for THIS account, activating openclaw's
+    // binding.account tier (agents bind --bind webchannel:acctA).
+    expect(resolveAgentRoute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "webchannel",
+        accountId: "acctA",
+        peer: { kind: "direct", id: "alice" },
+      }),
+    );
+  });
+
+  it("applies PER-ACCOUNT dmSecurity allowlist (account isolation — Cycle 2)", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: {
+        accounts: { acctA: { dmSecurity: "allowlist", allowFrom: ["alice"] } },
+      },
+    });
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    // A non-allowlisted peer on acctA is denied (per-account allowlist applied).
+    await handleInboundMessage(
+      api,
+      transport,
+      "mallory",
+      { type: "user_message", text: "let me in" },
+      "acctA",
+    );
+    expect(inboundRun).not.toHaveBeenCalled();
+
+    // The allowlisted peer on acctA is admitted.
+    await handleInboundMessage(
+      api,
+      transport,
+      "alice",
+      { type: "user_message", text: "hi" },
+      "acctA",
+    );
+    expect(inboundRun).toHaveBeenCalledOnce();
+  });
+
+  it("default account keeps reading the flat (channel-level) config (regression)", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    // Flat config (no accounts map) — the default account resolves it as base.
+    const { api, resolveAgentRoute } = makeFakeApi(captured, {
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["alice"] },
+    });
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    // No accountId arg → defaults to "default", reads the flat block.
+    await handleInboundMessage(api, transport, "alice", { type: "user_message", text: "hi" });
+    expect(inboundRun).toHaveBeenCalledOnce();
+    expect(resolveAgentRoute).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId: "default" }),
+    );
+  });
+
   it("streams a progress draft then finalizes the SAME id when streaming.mode=progress", async () => {
     const transport = new WebChannelTransport();
     // Simulate an open socket so the draft loop's sends "succeed" (returning
