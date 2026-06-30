@@ -2,7 +2,11 @@ node_modules/
 dist/
 dist-lib/
 dist-demo/
+dist-runtime/
 .vite/
 *.log
 .DS_Store
 .idea/
+.claude/
+*.tsbuildinfo
+.reindex-swap-lock

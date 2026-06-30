@@ -115,6 +115,48 @@ describe("webchannel inbound round-trip", () => {
     };
   }
 
+  it("default-deny allowlist (gap ③): a non-allowlisted peer is denied — inbound.run never runs, no reply", async () => {
+    const transport = new WebChannelTransport();
+    const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api, resolveAgentRoute } = makeFakeApi(captured, {
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["alice"] },
+    });
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    await handleInboundMessage(api, transport, "mallory", {
+      type: "user_message",
+      text: "let me in",
+    });
+
+    // Denied before dispatch: the agent turn is never invoked and nothing is sent.
+    expect(inboundRun).not.toHaveBeenCalled();
+    expect(resolveAgentRoute).not.toHaveBeenCalled();
+    expect(sendSpy).not.toHaveBeenCalled();
+  });
+
+  it("default-deny allowlist (gap ③): an allowlisted peer is admitted — inbound.run runs and reply is delivered", async () => {
+    const transport = new WebChannelTransport();
+    const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["alice"] },
+    });
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    await handleInboundMessage(api, transport, "alice", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(inboundRun).toHaveBeenCalledOnce();
+    expect(sendSpy).toHaveBeenCalled();
+  });
+
   it("resolves a channel-scoped route and delivers the reply to the peer socket", async () => {
     const transport = new WebChannelTransport();
     const sendSpy = vi
@@ -144,6 +186,89 @@ describe("webchannel inbound round-trip", () => {
     // The reply was delivered back through THIS channel to the peer's socket.
     // No-progress config => plain no-id agent_message (legacy append path).
     expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back");
+  });
+
+  it("threads accountId into resolveAgentRoute (binding.account routing — Cycle 2)", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api, resolveAgentRoute } = makeFakeApi(captured, {
+      // Per-account config lives under accounts.<id>; acctA inherits no base here.
+      channelConfig: { accounts: { acctA: {} } },
+    });
+
+    await handleInboundMessage(
+      api,
+      transport,
+      "alice",
+      { type: "user_message", text: "hello" },
+      "acctA",
+    );
+
+    // The route is resolved for THIS account, activating openclaw's
+    // binding.account tier (agents bind --bind webchannel:acctA).
+    expect(resolveAgentRoute).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "webchannel",
+        accountId: "acctA",
+        peer: { kind: "direct", id: "alice" },
+      }),
+    );
+  });
+
+  it("applies PER-ACCOUNT dmSecurity allowlist (account isolation — Cycle 2)", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: {
+        accounts: { acctA: { dmSecurity: "allowlist", allowFrom: ["alice"] } },
+      },
+    });
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    // A non-allowlisted peer on acctA is denied (per-account allowlist applied).
+    await handleInboundMessage(
+      api,
+      transport,
+      "mallory",
+      { type: "user_message", text: "let me in" },
+      "acctA",
+    );
+    expect(inboundRun).not.toHaveBeenCalled();
+
+    // The allowlisted peer on acctA is admitted.
+    await handleInboundMessage(
+      api,
+      transport,
+      "alice",
+      { type: "user_message", text: "hi" },
+      "acctA",
+    );
+    expect(inboundRun).toHaveBeenCalledOnce();
+  });
+
+  it("default account keeps reading the flat (channel-level) config (regression)", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    // Flat config (no accounts map) — the default account resolves it as base.
+    const { api, resolveAgentRoute } = makeFakeApi(captured, {
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["alice"] },
+    });
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    // No accountId arg → defaults to "default", reads the flat block.
+    await handleInboundMessage(api, transport, "alice", { type: "user_message", text: "hi" });
+    expect(inboundRun).toHaveBeenCalledOnce();
+    expect(resolveAgentRoute).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId: "default" }),
+    );
   });
 
   it("streams a progress draft then finalizes the SAME id when streaming.mode=progress", async () => {
@@ -242,5 +367,129 @@ describe("webchannel inbound round-trip", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("sends exactly one typing frame after route resolution, before agent dispatch (AC2)", async () => {
+    const transport = new WebChannelTransport();
+    const typingSpy = vi
+      .spyOn(transport, "sendTyping")
+      .mockReturnValue(true);
+    // Spy the EXISTING text send to detect the call order: typing must fire
+    // BEFORE the agent's reply is delivered (route → typing → dispatch).
+    const sendTextSpy = vi
+      .spyOn(transport, "sendText")
+      .mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api, resolveAgentRoute } = makeFakeApi(captured);
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    // Route was resolved first (proves the typing call is after route
+    // resolution, not before it).
+    expect(resolveAgentRoute).toHaveBeenCalledTimes(1);
+    // Typing was sent exactly once, with the originating peer (wsKey).
+    expect(typingSpy).toHaveBeenCalledTimes(1);
+    expect(typingSpy).toHaveBeenCalledWith("web-anon");
+    // The agent's reply (via sendText) was delivered — proves the typing
+    // call is BEFORE agent dispatch, not after.
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    // Strict order: typing < sendText.
+    const typingOrder = typingSpy.mock.invocationCallOrder[0];
+    const sendTextOrder = sendTextSpy.mock.invocationCallOrder[0];
+    expect(typingOrder).toBeLessThan(sendTextOrder);
+  });
+
+  it("still sends the typing frame when the turn throws mid-dispatch (AC2)", async () => {
+    const transport = new WebChannelTransport();
+    const typingSpy = vi
+      .spyOn(transport, "sendTyping")
+      .mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, { throwAfterProgress: false });
+
+    // Make the fake kernel THROW (e.g. channelRuntime.inbound.run explodes).
+    const channel = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+    channel.mockRejectedValueOnce(new Error("kernel exploded"));
+
+    // The handler swallows the dispatch error (logs it); it must NOT reject.
+    await expect(
+      handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        text: "hello",
+      }),
+    ).resolves.toBeUndefined();
+
+    // Typing was still pushed exactly once — the seed spec mandates "turn
+    // 종료 경로와 무관하게 typing은 한 번 이상 발송" (regardless of termination
+    // path, typing is sent at least once). The user must see the affordance
+    // even if the turn blows up; the first real frame from a subsequent turn
+    // (or a manual reload) will clear it.
+    expect(typingSpy).toHaveBeenCalledTimes(1);
+    expect(typingSpy).toHaveBeenCalledWith("web-anon");
+  });
+
+  it("history snapshot wiring lives in index.ts (transport hooks are exposed)", () => {
+    // The seed AC3 (first-pong → sendHistory) is wired in index.ts, not in
+    // handleInboundMessage. This test is a structural guard: we verify the
+    // transport exposes BOTH the first-liveness hook AND the load-history
+    // hook, so index.ts can wire them up without further transport changes.
+    const transport = new WebChannelTransport();
+    expect(typeof transport.setFirstLivenessHandler).toBe("function");
+    expect(typeof transport.setLoadHistoryHandler).toBe("function");
+    expect(typeof transport.sendHistory).toBe("function");
+    expect(typeof transport.setHistoryEnabled).toBe("function");
+
+    // Also pin the surface: handlers can be registered (the throw is expected
+    // if invoked without a socket — proves they're real methods, not stubs).
+    transport.setFirstLivenessHandler(() => undefined);
+    transport.setLoadHistoryHandler(() => undefined);
+    expect(transport.sendHistory("missing", [])).toBe(false);
+  });
+
+  it("load_history inbound wire frame dispatches to the registered handler (AC3 integration)", () => {
+    // Drive the transport's ws.on("message", ...) path with a synthetic
+    // `load_history` frame and confirm the registered handler fires with the
+    // validated { before, limit } shape. This is the wire-side companion to
+    // the unit test in transport.test.ts and locks the parse contract from
+    // the transport's POV.
+    const transport = new WebChannelTransport({ heartbeatMs: 60_000 });
+    const handler = vi.fn();
+    transport.setLoadHistoryHandler(handler);
+
+    // Minimal event-emitter fake: only the surface transport.registerConnection
+    // needs. Holds listeners on a Map and emits with a typed iterator.
+    type FakeWs = {
+      on: (event: string, listener: (arg?: unknown) => void) => unknown;
+      emit: (event: string, arg?: unknown) => void;
+    };
+    const fakeWs: FakeWs = (() => {
+      const listeners = new Map<string, Array<(arg?: unknown) => void>>();
+      return {
+        on(event, listener) {
+          const arr = listeners.get(event) ?? [];
+          arr.push(listener);
+          listeners.set(event, arr);
+          return this;
+        },
+        emit(event, arg) {
+          for (const fn of listeners.get(event) ?? []) fn(arg);
+        },
+      };
+    })();
+
+    (transport as unknown as {
+      registerConnection: (w: unknown, id: string) => void;
+    }).registerConnection(fakeWs, "peer-test");
+
+    fakeWs.emit("message", JSON.stringify({ type: "load_history", before: "m-9", limit: 25 }));
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler).toHaveBeenCalledWith("peer-test", { before: "m-9", limit: 25 });
   });
 });

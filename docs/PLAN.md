@@ -1,5 +1,7 @@
 # WebChannel — 기획서
 
+> 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 설계·계획 기준이며 명시된 날짜 시점 기준이다.
+
 > OpenClaw용 셀프호스트 웹 채널 플러그인 + 브라우저 클라이언트
 > 외부 위젯 SaaS(Now4real, Stream 등) 없이, 게이트웨이 위에서 바로 도는 웹 채팅 채널.
 
@@ -156,17 +158,18 @@ OpenClaw에는 슬랙·텔레그램·디스코드·매트릭스 등 다양한 �
 - ✅ 설정 스키마(`channels.webchannel.*`, auth 포함). ⬜ `openclaw channels status` 통합 미확인.
 
 ### Auth (원래 BACKLOG → 구현됨) ✅  📄 `AUTH.md`
-- ✅ `ConnectionVerifier` seam + 빌트인 `anonymous`/`hmac-ticket` + 안전 기본값 + zero-dep ticket 발급/검증.
+- ✅ `ConnectionVerifier` seam + 빌트인 `anonymous`/`hmac-ticket`/`jwt` + 안전 기본값 + zero-dep ticket 발급/검증.
 - ✅ 멀티유저 outbound/approval per-peer 라우팅. ✅ 위젯 `getTicket` + 재연결 재발급.
-- ✅ **hmac-ticket E2E 라이브 검증**(페이지 서빙 + ticket 연결 + 에이전트 응답 + 미·오 ticket 거절).
-- ⬜ 잔여: `jwt`/`trusted-header` 전략, 커스텀 함수 주입, 세션 revocation, 멀티탭 정책.
+- ✅ **hmac-ticket + jwt E2E 라이브 검증**(페이지 서빙 + ticket 연결 + 에이전트 응답 + 미·오 ticket 거절).
+- ⬜ 잔여: `trusted-header` 전략, 커스텀 함수 주입, 세션 revocation, 멀티탭 정책.
 
 ### Phase 2 — tool inspector 확장 (선택) ⬜
 - `api.runtime.events.onAgentEvent` 구독 → tool 이벤트 WS forward, 구조화 tool 카드, (옵션) thinking.
 
 ### Phase 3 — 다듬기 🟡
-- ✅ **정적 채팅 UI 자산을 플러그인 라우트(`/webchannel/`)로 서빙** (단일 배포). 📄 `src/static-assets.ts` — 서빙 대상은 `packages/client/dist-demo`(client vanilla 데모, `npm run build:demo`).
-- ⬜ typing indicator(`heartbeat.sendTyping`), 인터랙티브 버튼 액션, 테마.
+- ✅ **typing indicator (native "Bot is typing…")** — 서버는 턴 시작 시 `{type:"typing"}` 프레임을 한 번 푸시, 클라이언트는 `WebChannelState.isTyping`을 true로 플립; 첫 `progress` / `agent_message` (또는 `approval_*`) 도착 시 자동 settle (US1, US2). 기본 ON, 끄려면 `channels.webchannel.capabilities.typing = "off"` (US2 / AC4). 텔레그램·디스코드 패리티: best-effort, no ack/retry, no stop frame. wire envelope: `InboundWsMessage` 불변, `OutboundWsMessage`에 `{type:"typing"}` 케이스 한 개만 추가 (US3 / AC1).
+- ✅ **history pagination (최근 N개 스냅샷 + 페이지네이션)** — 서버는 첫 pong 직후 `{type:"history", messages:[{id,role,text,ts}]}` 스냅샷을 1회 푸시; 클라이언트는 `state.messages` 앞에 prepend + id 중복 가드 (US1, US2). 사용자가 위로 스크롤하면 클라이언트가 `{type:"load_history", before?, limit?}` 발송 → 서버는 같은 포맷으로 회신. 기본 N=50, 페이지=50, `channels.webchannel.history.{enabled,limit,pageSize}` config로 조정 (US3). wire envelope: `InboundWsMessage`에 `load_history` 케이스 추가, `OutboundWsMessage`에 `history` 케이스 추가 — 모든 기존 케이스 회귀 0, history drop-only 그룹(`progress`/`typing`과 동일) — 백프레셔 드롭 시 소켓 유지 (US4 / AC1-AC7).
+- ⬜ 인터랙티브 버튼 액션, 테마.
 
 ---
 
@@ -180,20 +183,18 @@ openclaw-webchannel/              # 레포 루트 = 워크스페이스 매니저
 ├── package.json                   # { "workspaces": ["packages/*"], scripts: test/typecheck/build }
 ├── package-lock.json              # 단일 통합 lock
 ├── smoke/                         # 라이브 게이트웨이 대상 수동 스모크(ws/progress/approval/reconnect/e2e/selfclose)
-├── docs/                          # AUTH·PACKAGING·PLAN·RESEARCH·BACKLOG
+├── docs/                          # STATUS(진실원)·AUTH·PACKAGING·PLAN·RESEARCH·GAP_ANALYSIS·TRUST_AND_ONBOARDING
 └── packages/
     ├── plugin/                    # 서버 패키지(openclaw-webchannel 후보; 현 name "openclaw-webchannel", Node)
     │   ├── package.json           # openclaw.{channel,extensions,setupEntry} = "이게 플러그인이다" 표식
     │   ├── openclaw.plugin.json   # 매니페스트 (channelConfigs: auth/allowFrom/streaming/…)
-    │   ├── index.ts               # registerFull: WS 라우트 + 정적 /webchannel/ 라우트 + 검증기 주입
+    │   ├── index.ts               # registerFull: WS 라우트(/webchannel/ws) + 검증기 주입
     │   ├── setup-entry.ts
-    │   └── src/                   # auth, ticket, transport, inbound, approvals, message-adapter, channel, static-assets + *.test.ts
+    │   └── src/                   # auth, ticket, transport, inbound, approvals, message-adapter, channel + *.test.ts
     └── client/                    # 브라우저 패키지(openclaw-webchannel-client, 무프레임워크·zero-dep)
-        ├── package.json           # exports→dist, build(tsc 라이브러리) / build:demo(vite) / test(vitest)
-        ├── vite.config.ts         # 데모 빌드(→dist-demo, base "/webchannel/") + dev 프록시
+        ├── package.json           # exports→dist, build(tsc 라이브러리) / test(vitest)
         ├── tsconfig.build.json    # 라이브러리 .d.ts emit(→dist)
-        ├── src/                   # index.ts(배럴), client.ts(WebChannelClient), types.ts, client.test.ts
-        └── demo/                  # 순수 DOM 데모(미출시): main.ts, devTicket.ts(브라우저 발급, DEV) + index.html
+        └── src/                   # index.ts(배럴), client.ts(WebChannelClient), types.ts, client.test.ts
 ```
 
 > **게이트웨이 로딩:** `plugins.load.paths`는 이제 `…/openclaw-webchannel/packages/plugin`(레포 루트가 아니라 플러그인 패키지)을 가리킨다. `openclaw.extensions`는 그 패키지 기준 `./index.ts`. SDK(`openclaw/plugin-sdk`)는 전역 설치본을 가리키는 `node_modules/openclaw` 심링크로 해석(워크스페이스 install이 prune하므로 재생성 필요).
@@ -202,7 +203,7 @@ openclaw-webchannel/              # 레포 루트 = 워크스페이스 매니저
 - `openclaw/plugin-sdk/channel-core` — `createChatChannelPlugin`, `defineChannelPluginEntry`
 - `openclaw/plugin-sdk/channel-outbound` — outbound 어댑터/receipt
 - `openclaw/plugin-sdk/approval-runtime` — `approvalCapability` 헬퍼
-- `api.registerHttpRoute({ handleUpgrade })` — WS 수락 / `{ match:"prefix", handler }` — 정적 서빙
+- `api.registerHttpRoute({ handleUpgrade })` — `/webchannel/ws` WS 수락
 - `api.runtime.channel.routing.resolveAgentRoute(...)` — 채널 스코프 세션키(실제 사용; 구 `resolveSessionConversation` 아님)
 
 ---
@@ -266,7 +267,7 @@ openclaw-webchannel/              # 레포 루트 = 워크스페이스 매니저
 
 - **WS 연결 수명주기:** 끊긴 소켓 정리, 재연결 시 세션 복원, dedupe(코어 idempotency key 활용),
   backpressure(`maxBufferedBytes` 한도). → openclaw 특유 난제 아님, 일반 WS 서버 엔지니어링.
-- ~~**브라우저 auth 모델**~~ → **결정됨.** 검증기(ConnectionVerifier) seam + 빌트인 전략. 📄 `AUTH.md`. (잔여: 세션 중 강제 만료, `jwt`/`trusted-header` 빌트인은 후순위)
+- ~~**브라우저 auth 모델**~~ → **결정됨.** 검증기(ConnectionVerifier) seam + 빌트인 전략. 📄 `AUTH.md`. (잔여: 세션 중 강제 만료, `trusted-header` 빌트인, 커스텀 함수 주입은 후순위)
 - ~~**공개 패키지화**~~ → **결정됨.** 서버/브라우저 2-패키지 분리, npm(+ClawHub) 배포. 📄 `PACKAGING.md`.
 - **세션 그래머:** 검증된 `peerId`가 기본 sessionKey. 잔여는 **멀티탭** 정책(같은 사용자의 여러 탭을 묶을지/분리할지)뿐.
 - **위젯 호스팅:** 개발(Vite) vs 배포(npm 패키지 / `<script>` 임베드 / 플러그인 라우트 서빙) — Phase 3에서 확정.

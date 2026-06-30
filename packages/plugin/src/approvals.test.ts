@@ -19,11 +19,12 @@ import type { ApprovalRequestPayload } from "./transport.js";
 import {
   createClawApprovalNativeRuntimeSpec,
   createClawApprovalCapability,
-  createClawApprovalNativeAdapter,
   buildApprovalRequestPayload,
   handleApprovalDecision,
   startClawApprovalMonitor,
   shouldSuppressClawNativeExecApprovalPrompt,
+  getWebChannelExecApprovalApprovers,
+  isWebChannelExecApprovalApprover,
 } from "./approvals.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
@@ -50,7 +51,7 @@ function fakePendingExecView(id = "exec-1"): any {
 }
 
 const cfgEnabled: any = {
-  channels: { webchannel: { execApprovals: { enabled: true } } },
+  channels: { webchannel: { execApprovals: { enabled: true, approvers: ["web-anon"] } } },
 };
 
 describe("webchannel approval payload projection", () => {
@@ -83,10 +84,18 @@ describe("webchannel native approval runtime", () => {
     const view = fakePendingExecView();
     const baseCtx = { cfg: cfgEnabled, accountId: null, context: undefined };
 
-    // availability gates on execApprovals.enabled
+    // availability gates on execApprovals.enabled AND configured approvers AND
+    // the request matching this channel (inner spec gate mirrors the outer
+    // lazy adapter via shouldHandleWebChannelApprovalRequest).
     expect(spec.availability.isConfigured(baseCtx as any)).toBe(true);
     expect(
-      spec.availability.shouldHandle({ ...baseCtx, request: {} } as any),
+      spec.availability.shouldHandle({
+        ...baseCtx,
+        request: {
+          id: view.approvalId,
+          request: { command: "ls", turnSourceChannel: "webchannel" },
+        } as any,
+      }),
     ).toBe(true);
 
     // Drive presentation -> transport exactly like core's handler does.
@@ -186,8 +195,13 @@ describe("webchannel native approval runtime", () => {
 
 describe("webchannel native approval origin routing (multi-user)", () => {
   // resolveOriginTarget must read the turn source (`turnSourceTo`) so the prompt
-  // is routed to the originating peer, not a hardcoded anon key.
-  const adapter = createClawApprovalNativeAdapter();
+  // is routed to the originating peer, not a hardcoded anon key. The capability
+  // built by createApproverRestrictedNativeApprovalCapability exposes the
+  // resolver we passed in as `native.resolveOriginTarget`, so exercise it there
+  // (the old standalone createClawApprovalNativeAdapter was removed).
+  const transport = new WebChannelTransport();
+  const capability = createClawApprovalCapability(transport) as any;
+  const resolveOriginTarget = capability.native.resolveOriginTarget;
 
   function execRequest(turnSourceTo?: string, turnSourceChannel?: string): any {
     return {
@@ -197,7 +211,7 @@ describe("webchannel native approval origin routing (multi-user)", () => {
   }
 
   it("resolves the origin target to the originating peer (turnSourceTo)", () => {
-    const target = adapter.resolveOriginTarget!({
+    const target = resolveOriginTarget({
       cfg: cfgEnabled,
       accountId: null,
       approvalKind: "exec",
@@ -207,7 +221,7 @@ describe("webchannel native approval origin routing (multi-user)", () => {
   });
 
   it("ignores an approval that originated on a different channel", () => {
-    const target = adapter.resolveOriginTarget!({
+    const target = resolveOriginTarget({
       cfg: cfgEnabled,
       accountId: null,
       approvalKind: "exec",
@@ -217,7 +231,7 @@ describe("webchannel native approval origin routing (multi-user)", () => {
   });
 
   it("falls back to the anon peer when no turn source is present", () => {
-    const target = adapter.resolveOriginTarget!({
+    const target = resolveOriginTarget({
       cfg: cfgEnabled,
       accountId: null,
       approvalKind: "exec",
@@ -327,11 +341,12 @@ describe("webchannel native approval bootstrap (Gate 1)", () => {
 });
 
 describe("webchannel native approval surface state (Gate 2)", () => {
-  // The capability must expose getExecInitiatingSurfaceState /
-  // getActionAvailabilityState (read at the CAPABILITY level by core's
-  // exec-approval-surface resolver) so we count as a native exec approval
-  // client, returning "enabled" when approvals are on.
-  it("exposes surface-state hooks returning enabled when execApprovals on", () => {
+  // The capability built by createApproverRestrictedNativeApprovalCapability
+  // derives the surface state from BOTH execApprovals.enabled AND configured
+  // approvers (an enabled account with no approvers is NOT a usable native
+  // approval client). These hooks live at the CAPABILITY level and are read by
+  // core's exec-approval-surface resolver.
+  it("exposes surface-state hooks returning enabled when execApprovals on + approvers configured", () => {
     const transport = new WebChannelTransport();
     const capability = createClawApprovalCapability(transport) as any;
 
@@ -354,11 +369,23 @@ describe("webchannel native approval surface state (Gate 2)", () => {
     const transport = new WebChannelTransport();
     const capability = createClawApprovalCapability(transport) as any;
     const cfgOff: any = {
-      channels: { webchannel: { execApprovals: { enabled: false } } },
+      channels: { webchannel: { execApprovals: { enabled: false, approvers: ["web-anon"] } } },
     };
 
     expect(
       capability.getExecInitiatingSurfaceState({ cfg: cfgOff, action: "approve" }),
+    ).toEqual({ kind: "disabled" });
+  });
+
+  it("reports disabled surface state when enabled but NO approvers configured", () => {
+    const transport = new WebChannelTransport();
+    const capability = createClawApprovalCapability(transport) as any;
+    const cfgNoApprovers: any = {
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    };
+
+    expect(
+      capability.getExecInitiatingSurfaceState({ cfg: cfgNoApprovers, action: "approve" }),
     ).toEqual({ kind: "disabled" });
   });
 });
@@ -429,14 +456,37 @@ describe("webchannel approval decision -> gateway", () => {
   });
 
   it("resolves the approval over the gateway on a widget button click", async () => {
-    await handleApprovalDecision(cfgEnabled, "exec-1", "deny");
+    // senderId is now required (per-peer authorization); pass the anon peer.
+    await handleApprovalDecision(cfgEnabled, "exec-1", "deny", "web-anon");
     expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
     expect(resolveApprovalOverGateway).toHaveBeenCalledWith(
       expect.objectContaining({
         approvalId: "exec-1",
         decision: "deny",
         allowPluginFallback: true,
+        senderId: "web-anon",
       }),
+    );
+  });
+
+  it("REJECTS a widget click from a non-approver (the real attack path)", async () => {
+    const cfgWithApprovers = {
+      channels: { webchannel: { execApprovals: { enabled: true, approvers: ["alice"] } } },
+    };
+    await expect(
+      handleApprovalDecision(cfgWithApprovers as any, "exec-1", "deny", "eve"),
+    ).rejects.toThrow(/not a configured exec approver/);
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+  });
+
+  it("allows a widget click from a configured approver and forwards senderId", async () => {
+    const cfgWithApprovers = {
+      channels: { webchannel: { execApprovals: { enabled: true, approvers: ["alice"] } } },
+    };
+    await handleApprovalDecision(cfgWithApprovers as any, "exec-1", "deny", "alice");
+    expect(resolveApprovalOverGateway).toHaveBeenCalledTimes(1);
+    expect(resolveApprovalOverGateway).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: "exec-1", decision: "deny", senderId: "alice" }),
     );
   });
 
@@ -467,5 +517,144 @@ describe("webchannel approval decision -> gateway", () => {
       JSON.stringify({ type: "approval_decision", id: "exec-9", decision: "bogus" }),
     );
     expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+describe("webchannel approver resolution", () => {
+  it("reads approvers from channels.webchannel.execApprovals.approvers", () => {
+    const cfg = {
+      channels: { webchannel: { execApprovals: { approvers: ["alice", "bob"] } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg: cfg as any })).toEqual([
+      "alice",
+      "bob",
+    ]);
+  });
+
+  it("falls back to commands.ownerAllowFrom when channel approvers unset", () => {
+    const cfg = {
+      commands: { ownerAllowFrom: ["owner"] },
+      channels: { webchannel: {} },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg: cfg as any })).toEqual([
+      "owner",
+    ]);
+  });
+
+  it("prefers channel approvers over ownerAllowFrom", () => {
+    const cfg = {
+      commands: { ownerAllowFrom: ["owner"] },
+      channels: { webchannel: { execApprovals: { approvers: ["alice"] } } },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg: cfg as any })).toEqual([
+      "alice",
+    ]);
+  });
+
+  it("returns empty when neither source configured", () => {
+    expect(getWebChannelExecApprovalApprovers({ cfg: {} as any })).toEqual([]);
+  });
+
+  it("trims and drops empty entries", () => {
+    const cfg = {
+      channels: {
+        webchannel: { execApprovals: { approvers: ["  alice  ", "", "bob"] } },
+      },
+    };
+    expect(getWebChannelExecApprovalApprovers({ cfg: cfg as any })).toEqual([
+      "alice",
+      "bob",
+    ]);
+  });
+});
+
+describe("webchannel exec approval authorization", () => {
+  const cfgWithApprovers = {
+    channels: {
+      webchannel: { execApprovals: { enabled: true, approvers: ["alice", "bob"] } },
+    },
+  };
+
+  it("approves a configured approver", () => {
+    expect(
+      isWebChannelExecApprovalApprover({
+        cfg: cfgWithApprovers as any,
+        senderId: "alice",
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects an unknown peer", () => {
+    expect(
+      isWebChannelExecApprovalApprover({
+        cfg: cfgWithApprovers as any,
+        senderId: "eve",
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects empty/whitespace senderId", () => {
+    expect(
+      isWebChannelExecApprovalApprover({
+        cfg: cfgWithApprovers as any,
+        senderId: "  ",
+      }),
+    ).toBe(false);
+    expect(
+      isWebChannelExecApprovalApprover({ cfg: cfgWithApprovers as any }),
+    ).toBe(false);
+  });
+});
+
+describe("webchannel capability authorizeActorAction", () => {
+  const cfgWithApprovers = {
+    channels: {
+      webchannel: { execApprovals: { enabled: true, approvers: ["alice"] } },
+    },
+  };
+
+  it("authorizes a configured approver", () => {
+    const transport = new WebChannelTransport();
+    const capability = createClawApprovalCapability(transport) as any;
+    const result = capability.authorizeActorAction({
+      cfg: cfgWithApprovers,
+      accountId: null,
+      senderId: "alice",
+      action: "approve",
+      approvalKind: "exec",
+    });
+    expect(result).toEqual({ authorized: true });
+  });
+
+  it("capability.authorizeActorAction rejects a non-approver", () => {
+    const transport = new WebChannelTransport();
+    const capability = createClawApprovalCapability(transport) as any;
+    const result = capability.authorizeActorAction({
+      cfg: cfgWithApprovers,
+      accountId: null,
+      senderId: "eve",
+      action: "approve",
+      approvalKind: "exec",
+    });
+    expect(result).toEqual({
+      authorized: false,
+      reason: expect.stringContaining("not authorized"),
+    });
+  });
+
+  it("rejects when no approvers configured", () => {
+    const transport = new WebChannelTransport();
+    const capability = createClawApprovalCapability(transport) as any;
+    const cfgEmpty = {
+      channels: { webchannel: { execApprovals: { enabled: true } } },
+    };
+    const result = capability.authorizeActorAction({
+      cfg: cfgEmpty,
+      accountId: null,
+      senderId: "anyone",
+      action: "approve",
+      approvalKind: "exec",
+    });
+    expect(result).toEqual({ authorized: false, reason: expect.any(String) });
   });
 });

@@ -2,6 +2,8 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
 import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
+import { resolveDmAdmission } from "./dm-allowlist.js";
+import { DEFAULT_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
 
 /** The inbound path only handles user messages; approvals route separately. */
 type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
@@ -63,6 +65,7 @@ export async function handleInboundMessage(
   transport: WebChannelTransport,
   peerId: string,
   message: InboundUserMessage,
+  accountId: string = DEFAULT_ACCOUNT_ID,
 ): Promise<void> {
   // `wsKey` is the verified per-peer id the transport uses as its socket-map
   // key (the anonymous strategy is the single-peer special case, where this
@@ -80,9 +83,29 @@ export async function handleInboundMessage(
   // dist/plugin-sdk/types-BVAOMoZy.d.ts:5813). Each event refreshes a single
   // rolling draft pushed to the widget as a `progress` frame; the final answer
   // (delivered through `delivery.deliver`) finalizes that same draft id.
-  const channelConfig = (api.config.channels as Record<string, unknown> | undefined)?.[
-    WEBCHANNEL_ID
-  ];
+  // 가-1 Cycle 2: read the PER-ACCOUNT resolved config (channel-level shared
+  // base merged under this account's override), not the flat block, so each
+  // account's streaming/dmSecurity/allowFrom apply to its own turns. For the
+  // single `"default"` account this is identical to the flat block (regression).
+  const channelConfig = resolveWebchannelAccountConfig(api.config, accountId);
+
+  // DM allowlist admission (split-authz, plugin-owned half). When the operator
+  // sets `channels.webchannel.dmSecurity: "allowlist"`, a non-allowlisted peer
+  // is denied here — BEFORE the agent turn runs — so `inbound.run` is never
+  // invoked and no reply is emitted (default-deny). With no `dmSecurity` set,
+  // admission is open, preserving the shipping Gateway-WS behavior.
+  const cc = channelConfig as { allowFrom?: readonly string[]; dmSecurity?: string } | undefined;
+  const admission = resolveDmAdmission(wsKey, {
+    allowFrom: cc?.allowFrom,
+    dmSecurity: cc?.dmSecurity,
+  });
+  if (!admission.allowed) {
+    api.logger?.info?.(
+      `webchannel: inbound denied for peer ${wsKey} (${admission.reason}); turn not dispatched`,
+    );
+    return;
+  }
+
   const progressEnabled = resolveStreamingMode(channelConfig) === "progress";
   let draft: ProgressDraftController | undefined;
   if (progressEnabled) {
@@ -93,13 +116,33 @@ export async function handleInboundMessage(
     });
   }
 
-  // Resolve the channel-scoped agent route (carries `webchannel` + peer in the
-  // session key per configured dmScope/bindings).
+  // Resolve the channel-scoped agent route (carries `webchannel` + account +
+  // peer in the session key per configured dmScope/bindings). Threading
+  // `accountId` activates openclaw's `binding.account` routing tier, so
+  // `agents bind --agent X --bind webchannel:<account>` routes THIS account's
+  // inbound to agent X, and accountId enters the sessionKey (per-account
+  // session isolation). For `"default"` this matches the Cycle 1 route.
   const route = channelRuntime.routing.resolveAgentRoute({
     cfg: api.config,
     channel: WEBCHANNEL_ID,
+    accountId,
     peer: { kind: "direct", id: wsKey },
   });
+
+  // Native "Bot is typing…" affordance. We push the frame right after route
+  // resolution and right before agent dispatch (1) so the widget sees the
+  // indicator as soon as the turn has been accepted — even before the first
+  // `progress` / `agent_message` / `approval_*` frame, which can take seconds
+  // on a long-running tool call — and (2) regardless of which turn exit path
+  // the dispatch takes (the inner try/catch can still throw). The first real
+  // frame from the agent settles the indicator client-side; we never send a
+  // matching "stop" frame.
+  //
+  // The transport gates the frame on `channels.webchannel.capabilities.typing`
+  // (default "on"), so when an operator sets it to "off" this call is a no-op.
+  // It is also best-effort (no ack/retry) and drop-only under backpressure —
+  // we ignore the boolean return.
+  transport.sendTyping(wsKey);
 
   try {
     await channelRuntime.inbound.run({

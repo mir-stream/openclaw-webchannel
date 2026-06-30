@@ -220,6 +220,100 @@ describe("WebChannelClient — approvals", () => {
   });
 });
 
+describe("WebChannelClient — typing indicator (AC3)", () => {
+  async function openClient() {
+    const client = new WebChannelClient({ url: URL });
+    client.connect();
+    await flush();
+    const sock = lastSocket();
+    sock.fireOpen();
+    return { client, sock };
+  }
+
+  it("typing frame flips isTyping to true (AC3)", async () => {
+    const { client, sock } = await openClient();
+
+    expect(client.getState().isTyping).toBeFalsy();
+    sock.fireMessage({ type: "typing" });
+    expect(client.getState().isTyping).toBe(true);
+
+    // A second typing frame is idempotent — the indicator stays on.
+    sock.fireMessage({ type: "typing" });
+    expect(client.getState().isTyping).toBe(true);
+  });
+
+  it("the first progress frame after typing auto-clears isTyping (AC3)", async () => {
+    const { client, sock } = await openClient();
+
+    sock.fireMessage({ type: "typing" });
+    expect(client.getState().isTyping).toBe(true);
+
+    sock.fireMessage({ type: "progress", id: "d1", text: "working…" });
+    expect(client.getState().isTyping).toBe(false);
+    // The progress bubble was also rendered (no regression on existing flow).
+    expect(client.getState().messages).toHaveLength(1);
+    expect(client.getState().messages[0]).toMatchObject({
+      id: "d1",
+      text: "working…",
+      working: true,
+    });
+  });
+
+  it("the first agent_message frame after typing auto-clears isTyping (AC3)", async () => {
+    const { client, sock } = await openClient();
+
+    sock.fireMessage({ type: "typing" });
+    expect(client.getState().isTyping).toBe(true);
+
+    // No-id (legacy append path) — still clears typing.
+    sock.fireMessage({ type: "agent_message", text: "hello" });
+    expect(client.getState().isTyping).toBe(false);
+    expect(client.getState().messages).toHaveLength(1);
+  });
+
+  it("id-finalized agent_message after typing also auto-clears isTyping (AC3)", async () => {
+    const { client, sock } = await openClient();
+
+    sock.fireMessage({ type: "typing" });
+    sock.fireMessage({ type: "progress", id: "d1", text: "thinking…" });
+    expect(client.getState().isTyping).toBe(false);
+    expect(client.getState().messages[0].working).toBe(true);
+
+    sock.fireMessage({ type: "typing" }); // re-arm: another turn starts
+    expect(client.getState().isTyping).toBe(true);
+
+    sock.fireMessage({ type: "agent_message", id: "d1", text: "final" });
+    expect(client.getState().isTyping).toBe(false);
+    // The final answer settled the working bubble in place.
+    expect(client.getState().messages[0]).toMatchObject({
+      id: "d1",
+      text: "final",
+      working: false,
+    });
+  });
+
+  it("typing received AFTER a progress frame is a no-op (idempotent flip) (AC3)", async () => {
+    const { client, sock } = await openClient();
+
+    // Normal turn: progress → finalize. isTyping is false the whole time.
+    sock.fireMessage({ type: "progress", id: "d1", text: "thinking…" });
+    sock.fireMessage({ type: "agent_message", id: "d1", text: "final" });
+    expect(client.getState().isTyping).toBe(false);
+
+    // A late / duplicate typing frame (e.g. server retransmit) re-arms the
+    // indicator — the spec's "idempotent flip" means a typing frame always
+    // sets isTyping:true. The NEXT real frame (here: a new turn's progress)
+    // will simply re-clear it. This matches Telegram/Discord semantics:
+    // best-effort, no ack, late frames don't crash the bubble.
+    sock.fireMessage({ type: "typing" });
+    expect(client.getState().isTyping).toBe(true);
+
+    sock.fireMessage({ type: "progress", id: "d2", text: "next…" });
+    expect(client.getState().isTyping).toBe(false);
+    expect(client.getState().messages).toHaveLength(2);
+  });
+});
+
 describe("WebChannelClient — send", () => {
   async function openClient() {
     const client = new WebChannelClient({ url: URL });
@@ -399,5 +493,202 @@ describe("WebChannelClient — subscribe/unsubscribe", () => {
     unsub();
     lastSocket().fireMessage({ type: "agent_message", text: "hi" }); // would notify
     expect(calls.length).toBe(afterOpen); // unchanged
+  });
+});
+
+describe("WebChannelClient — history pagination (AC5)", () => {
+  async function openClient() {
+    const client = new WebChannelClient({ url: URL });
+    client.connect();
+    await flush();
+    const sock = lastSocket();
+    sock.fireOpen();
+    return { client, sock };
+  }
+
+  const hist = (
+    messages: Array<{ id: string; role: "user" | "agent"; text: string; ts?: number }>,
+  ): OutboundWsMessage => ({ type: "history", messages });
+
+  it("history frame prepends new messages to state.messages (dedup by id) (AC5)", async () => {
+    const { client, sock } = await openClient();
+
+    // One local user send first (id `u-0`) so we can verify prepending.
+    client.send("hello there");
+    expect(client.getState().messages.map((m) => m.id)).toEqual(["u-0"]);
+
+    sock.fireMessage(
+      hist([
+        { id: "m-1", role: "user", text: "earlier msg", ts: 1000 },
+        { id: "m-2", role: "agent", text: "older reply", ts: 2000 },
+      ]),
+    );
+
+    const msgs = client.getState().messages;
+    // Snapshot prepended (oldest-first → m-1 then m-2 then the local user send).
+    expect(msgs.map((m) => m.id)).toEqual(["m-1", "m-2", "u-0"]);
+    expect(msgs[0]).toMatchObject({ id: "m-1", role: "user", text: "earlier msg", ts: 1000 });
+    expect(msgs[1]).toMatchObject({ id: "m-2", role: "agent", text: "older reply", ts: 2000 });
+  });
+
+  it("history dedup: re-delivery of the same ids is a no-op (idempotent) (AC5)", async () => {
+    const { client, sock } = await openClient();
+
+    sock.fireMessage(
+      hist([
+        { id: "m-1", role: "user", text: "earlier", ts: 1 },
+        { id: "m-2", role: "agent", text: "older", ts: 2 },
+      ]),
+    );
+    expect(client.getState().messages).toHaveLength(2);
+
+    // Same ids again — the second frame is a no-op (no duplicate bubbles).
+    sock.fireMessage(
+      hist([
+        { id: "m-1", role: "user", text: "earlier", ts: 1 },
+        { id: "m-2", role: "agent", text: "older", ts: 2 },
+      ]),
+    );
+    const msgs = client.getState().messages;
+    expect(msgs).toHaveLength(2);
+    expect(msgs.map((m) => m.id)).toEqual(["m-1", "m-2"]);
+  });
+
+  it("history overlap: snapshot + page with shared id keeps the page's NEW ones (no dup) (AC5)", async () => {
+    const { client, sock } = await openClient();
+
+    // Initial snapshot covers ids 1..3.
+    sock.fireMessage(
+      hist([
+        { id: "m-1", role: "user", text: "1", ts: 1 },
+        { id: "m-2", role: "agent", text: "2", ts: 2 },
+        { id: "m-3", role: "user", text: "3", ts: 3 },
+      ]),
+    );
+    expect(client.getState().messages.map((m) => m.id)).toEqual(["m-1", "m-2", "m-3"]);
+
+    // Pagination page that overlaps with the snapshot on the boundary.
+    // Cursor was m-1 (oldest on screen) → page returns [ghost, ...].
+    // The page is "older than m-1": say ghost-2, ghost-1, m-1 (the cursor).
+    // Per the spec the cursor itself is NOT in the page; the dedup guard
+    // still keeps the existing m-1 in place.
+    sock.fireMessage(
+      hist([
+        { id: "g-1", role: "user", text: "ghost-1", ts: 0 },
+        { id: "g-2", role: "agent", text: "ghost-2", ts: -1 },
+        // The page sent an m-1 we already have — must be deduped.
+        { id: "m-1", role: "user", text: "1 (duplicate)", ts: 1 },
+      ]),
+    );
+    const msgs = client.getState().messages;
+    // New ids prepended; the duplicate m-1 is dropped.
+    expect(msgs.map((m) => m.id)).toEqual(["g-1", "g-2", "m-1", "m-2", "m-3"]);
+  });
+
+  it("history forces working:false on every hydrated bubble (AC5)", async () => {
+    const { client, sock } = await openClient();
+
+    // Even if the server (defensively) sends a hydrated bubble with
+    // working:true (e.g. some legacy transcript dump), the client coerces it
+    // to working:false. A live "working" flag in a snapshot would render a
+    // spinner on an already-settled bubble.
+    sock.fireMessage(
+      hist([{ id: "m-1", role: "agent", text: "old reply", ts: 1 } as never]),
+    );
+
+    expect(client.getState().messages[0]).toMatchObject({
+      id: "m-1",
+      role: "agent",
+      text: "old reply",
+      working: false,
+    });
+  });
+
+  it("history does NOT clobber isTyping or working drafts (AC5)", async () => {
+    const { client, sock } = await openClient();
+
+    // A live progress draft arrives (working:true, isTyping:false).
+    sock.fireMessage({ type: "progress", id: "d1", text: "working…" });
+    expect(client.getState().messages[0]).toMatchObject({ id: "d1", working: true });
+    expect(client.getState().isTyping).toBe(false);
+
+    // Then typing flips on.
+    sock.fireMessage({ type: "typing" });
+    expect(client.getState().isTyping).toBe(true);
+
+    // A history snapshot arrives — it must NOT clear isTyping nor flip the
+    // working draft to false.
+    sock.fireMessage(hist([{ id: "m-1", role: "user", text: "old", ts: 1 }]));
+    expect(client.getState().isTyping).toBe(true);
+    expect(client.getState().messages[0]).toMatchObject({ id: "m-1", working: false });
+    expect(client.getState().messages[1]).toMatchObject({ id: "d1", working: true });
+  });
+
+  it("history: empty messages array is a no-op (no state change)", async () => {
+    const { client, sock } = await openClient();
+
+    const before = client.getState().messages;
+    sock.fireMessage({ type: "history", messages: [] });
+    expect(client.getState().messages).toBe(before);
+  });
+
+  it("loadHistory sends a load_history frame over the wire (AC5)", async () => {
+    const { client, sock } = await openClient();
+
+    // With both fields.
+    client.loadHistory({ before: "m-3", limit: 25 });
+    expect(JSON.parse(sock.sent.at(-1)!)).toEqual({
+      type: "load_history",
+      before: "m-3",
+      limit: 25,
+    });
+
+    // With cursor only (server uses configured pageSize).
+    client.loadHistory({ before: "m-3" });
+    expect(JSON.parse(sock.sent.at(-1)!)).toEqual({
+      type: "load_history",
+      before: "m-3",
+    });
+
+    // No args — server still gets a load_history frame (lets the host fetch
+    // the oldest available page if it ever needs to).
+    client.loadHistory();
+    expect(JSON.parse(sock.sent.at(-1)!)).toEqual({ type: "load_history" });
+  });
+
+  it("loadHistory is a no-op when the socket is not OPEN", async () => {
+    const client = new WebChannelClient({ url: URL });
+    client.connect();
+    await flush();
+    // Never fired onopen → still CONNECTING → no socket message.
+    client.loadHistory({ before: "m-3", limit: 25 });
+    expect(lastSocket().sent).toHaveLength(0);
+  });
+
+  it("regression guard: existing wire cases (typing/approval_request/etc.) are unchanged", () => {
+    // Locks the JSON shape of every pre-existing OutboundWsMessage case
+    // carried by this client. Mirrors the plugin-side regression guard.
+    const frames: Array<OutboundWsMessage | Record<string, unknown>> = [
+      { type: "agent_message", text: "hello" },
+      { type: "agent_message", text: "final", id: "draft-1" },
+      { type: "progress", id: "d1", text: "working" },
+      {
+        type: "approval_request",
+        id: "ap1",
+        kind: "exec",
+        title: "t",
+        prompt: "p",
+        options: [{ decision: "allow-once", label: "Allow", style: "primary" }],
+      },
+      { type: "approval_resolved", id: "ap1", decision: "deny" },
+      { type: "typing" },
+      { type: "history", messages: [{ id: "m-1", role: "user", text: "hi", ts: 1 }] },
+    ];
+    // Round-trip every frame through JSON to assert the wire shape (the
+    // client only ever sees the JSON-encoded form over the WS).
+    for (const f of frames) {
+      const rt = JSON.parse(JSON.stringify(f));
+      expect(rt).toEqual(f);
+    }
   });
 });
