@@ -37,10 +37,15 @@ import type { NatsTransport } from "./src/nats-transport.js";
 import type { EnrolledNatsConnection } from "./src/enrolled-nats-connection.js";
 import {
   resolveNatsCredentialSource,
-  connectNatsCredentialSource,
   type NatsCredentialSource,
   type WebchannelNatsConfig,
 } from "./src/nats-credential-source.js";
+import { consumeCredentialSource } from "./src/consume-credentials.js";
+import {
+  resolveAccountNatsConfig,
+  resolveServingAccountId,
+} from "./src/account-config.js";
+import { resolveAcquisitionEnvPrecedence } from "./src/acquisition-env.js";
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -441,12 +446,12 @@ export default defineChannelPluginEntry({
     // -----------------------------------------------------------------------
 
     // Axis A (`nats-credential-source.ts`) decouples HOW the agent authenticates
-    // to NATS from the connection itself. The legacy two intertwined branches
-    // (devOpen vs. enrolled device-flow) are now ONE resolver + connector, with a
-    // co-equal `static` source for bring-your-own-NATS (Synadia/NGS): url + user
-    // JWT + NKEY seed (or a `.creds` file), GIVEN directly — no SaaS issuer. Env
-    // overrides config: WEBCHANNEL_NATS_URL / _USER_JWT / _USER_SEED / _CREDS /
-    // _DEV_OPEN / WEBCHANNEL_SAAS_BASE_URL.
+    // to NATS from the connection itself. 가-1 makes `gateway run` CONSUME-ONLY:
+    // the `enrolled` source no longer enrolls at runtime — it LOADS the persisted
+    // per-account creds (acquisition moved to `openclaw channels add`). The
+    // `open` / `static` sources are unchanged (auth material is already present).
+    // Connection/static env keeps its override meaning: WEBCHANNEL_NATS_URL /
+    // _USER_JWT / _USER_SEED / _CREDS / _DEV_OPEN.
     const wcNatsCfg = (webchannelCfg as { nats?: WebchannelNatsConfig } | undefined)?.nats;
     const legacyNats = api.config.nats as { url?: string; devOpen?: boolean } | undefined;
 
@@ -455,33 +460,61 @@ export default defineChannelPluginEntry({
     let credentialMode: NatsCredentialSource["mode"] = "enrolled";
 
     if (!natsTransport) {
-      channelTenant = process.env["WEBCHANNEL_TENANT"] ?? api.config.tenant ?? "default-tenant";
-      channelAgentId = process.env["WEBCHANNEL_AGENT_ID"] ?? api.config.agentId ?? "default-agent";
+      // Cycle 1 serves the single serving account (`"default"` when listed, else
+      // the first listed account). A flat/legacy config resolves to `"default"`.
+      // Cycle 2 multiplexes ALL listed accounts (the list seam already exists).
+      const accountId = resolveServingAccountId(api.config);
+
+      // Acquisition identity with deterministic config-over-env precedence
+      // (deliverable 6): config wins when present; the legacy WEBCHANNEL_TENANT/
+      // _AGENT_ID/_SAAS_BASE_URL env only synthesizes a `"default"` identity when
+      // there is NO webchannel config (one-time deprecation warning otherwise).
+      const { identity } = resolveAcquisitionEnvPrecedence(api.config, accountId, {
+        warn: (msg) => (api.logger?.warn ?? console.warn)?.(msg),
+      });
+      channelTenant = identity.tenant;
+      channelAgentId = identity.agentId;
+
+      // Prefer the account-scoped nats config; fall back to the flat block.
+      const accountNatsCfg = resolveAccountNatsConfig(api.config, accountId) ?? wcNatsCfg;
 
       try {
         const source = resolveNatsCredentialSource({
-          natsConfig: wcNatsCfg,
+          natsConfig: accountNatsCfg,
           legacyNats,
-          // Pass the top-level config value RAW; the resolver owns the full
+          // Pass the config-derived saasBaseUrl RAW; the resolver owns the full
           // saasBaseUrl precedence (env > nats.credentials.saasBaseUrl > this > default).
-          saasBaseUrl: api.config.saas?.baseUrl,
+          saasBaseUrl: identity.saasBaseUrl ?? api.config.saas?.baseUrl,
           tenant: channelTenant,
           agentId: channelAgentId,
         });
         credentialMode = source.mode;
         console.log(`[webchannel] NATS credential source: ${source.mode} → ${source.url}`);
 
-        const connected = await connectNatsCredentialSource(source);
-        natsTransport = connected.transport;
-        if (connected.enrolled) natsConnection = connected.enrolled;
+        // CONSUME-only: enrolled → load persisted per-account creds (no enroll).
+        const consumed = await consumeCredentialSource(source, accountId);
+        if (consumed.status === "creds-missing") {
+          // Account-scoped graceful degradation: skip serving THIS account with
+          // an actionable log (skipped account id + remediation command). No
+          // runtime enroll, no polling, no hang. Other accounts/channels and the
+          // gateway process are unaffected — we just return without binding a
+          // transport, so the register routes reply 503 for this account.
+          (api.logger?.warn ?? api.logger?.error ?? console.warn)?.(
+            `[webchannel] account "${consumed.accountId}" has no enrolled credentials — ` +
+              `skipping serving this account. Run: openclaw channels add --channel ` +
+              `webchannel --account ${consumed.accountId}`,
+          );
+          return;
+        }
+        natsTransport = consumed.connection.transport;
+        if (consumed.connection.enrolled) natsConnection = consumed.connection.enrolled;
       } catch (err) {
         // Non-fatal (graceful degradation): a failed resolve/connect disables the
         // webchannel for THIS process instead of crashing it — applied uniformly
-        // to ALL credential sources (open / static / enrolled). This matters
-        // because openclaw loads this channel entry in EVERY context — not just
-        // the serving gateway, but also local `openclaw chat`/TUI/CLI runs, which
-        // have no WEBCHANNEL_* env and so fall back to a URL with no usable NATS.
-        // Without this guard the throw propagates out of registerFull as an
+        // to ALL credential sources (open / static / enrolled-consume). This
+        // matters because openclaw loads this channel entry in EVERY context —
+        // not just the serving gateway, but also local `openclaw chat`/TUI/CLI
+        // runs. Without this guard the throw propagates out of registerFull as an
         // unhandled rejection and takes the whole process down (TUI wouldn't even
         // start). The serving gateway stays up too (other channels keep working);
         // the register routes reply 503 until a connection is established. The

@@ -58,7 +58,13 @@ export type EnrolledNatsConnectionOptions = {
   agentId?: string;
 
   /**
-   * Local credential storage path.
+   * Account id (가-1). Threaded into the credential-path resolution so the
+   * connection reads the account-scoped creds. Defaults to `"default"`.
+   */
+  accountId?: string;
+
+  /**
+   * Local credential storage path. Overrides the account-scoped default.
    */
   credentialPath?: string;
 
@@ -132,6 +138,7 @@ export async function createEnrolledNatsConnection(
     saasPollUrl: options.saasPollUrl,
     tenant: options.tenant,
     agentId: options.agentId,
+    accountId: options.accountId,
     credentialPath: options.credentialPath,
     displayInstructions: options.displayInstructions,
   });

@@ -12,6 +12,12 @@ import {
   startClawApprovalMonitor,
   shouldSuppressClawNativeExecApprovalPrompt,
 } from "./approvals.js";
+import {
+  DEFAULT_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_ACCOUNT_ID,
+  listWebchannelAccountIds,
+  resolveWebchannelAccountConfig,
+} from "./account-config.js";
+import { webchannelSetup } from "./setup.js";
 
 // Single default account id for Phase 1. `listAccountIds` MUST return ≥1 entry
 // and the plugin MUST expose `gateway.startAccount`, otherwise core's channel
@@ -26,7 +32,7 @@ import {
 // approvals.ts reading this back adds no new module cycle (and it's only
 // dereferenced at runtime inside createClawApprovalCapability, so ESM live
 // bindings resolve it well after module evaluation).
-export const DEFAULT_ACCOUNT_ID = "default";
+export const DEFAULT_ACCOUNT_ID = ACCOUNT_CONFIG_DEFAULT_ACCOUNT_ID;
 
 type ResolvedAccount = {
   accountId: string | null;
@@ -48,11 +54,18 @@ function resolveAccount(
   cfg: OpenClawConfig,
   accountId?: string | null,
 ): ResolvedAccount {
-  const section = (cfg.channels as Record<string, any>)?.[WEBCHANNEL_ID];
+  // 가-1: account-aware resolution. A flat (legacy single-account) config is
+  // treated as the `"default"` account; a per-account config resolves the named
+  // account's leaf fields. `resolveWebchannelAccountConfig` owns the shape
+  // detection so a single-account deployment is a regression-free pass-through.
+  const account = resolveWebchannelAccountConfig(
+    cfg,
+    accountId ?? DEFAULT_ACCOUNT_ID,
+  );
   return {
     accountId: accountId ?? null,
-    allowFrom: section?.allowFrom ?? [],
-    dmPolicy: section?.dmSecurity,
+    allowFrom: (account.allowFrom as string[] | undefined) ?? [],
+    dmPolicy: account.dmSecurity as string | undefined,
   };
 }
 
@@ -94,10 +107,12 @@ export function createWebChannelPlugin(transport: WebChannelTransport) {
       // dist/types.adapters-B6PMXit1.d.ts:127 (ChannelConfigAdapter) and
       // dist/types.plugin-BIHyhl5u.d.ts:33-35 (config required, setup optional).
       config: {
-        // Must be non-empty so core's channel monitor actually runs the
-        // start-account task (and thus the native approval bootstrap). A single
-        // default account models our one web surface.
-        listAccountIds: () => [DEFAULT_ACCOUNT_ID],
+        // 가-1: list the configured accounts. A flat (legacy) config yields the
+        // single `"default"` account; a per-account config lists its children.
+        // MUST be non-empty so core's channel monitor runs the start-account
+        // task (and thus the native approval bootstrap) — `listWebchannelAccountIds`
+        // always synthesizes `"default"` when nothing else is configured.
+        listAccountIds: (cfg: OpenClawConfig) => listWebchannelAccountIds(cfg),
         resolveAccount,
         inspectAccount: (_cfg: OpenClawConfig, _accountId?: string | null) => {
           // Phase 0: no token/auth required (loopback dev). Always "configured".
@@ -106,13 +121,11 @@ export function createWebChannelPlugin(transport: WebChannelTransport) {
         },
       },
       // `setup` (ChannelSetupAdapter) is required by CreateChannelPluginBaseOptions
-      // and owns config writes during the setup wizard. Phase 0 has no wizard, so
-      // applyAccountConfig is a no-op pass-through. Verified:
-      // dist/types.adapters-B6PMXit1.d.ts:104 (applyAccountConfig required).
-      // TODO(setup): Phase 1 — real setup wizard for allowlist/token config.
-      setup: {
-        applyAccountConfig: ({ cfg }) => cfg,
-      },
+      // and owns config writes for `openclaw channels add`. 가-1: this is where
+      // config-time credential acquisition now lives (applyAccountConfig writes
+      // the account, afterAccountConfigWritten runs the headless device-flow
+      // enroll). See src/setup.ts.
+      setup: webchannelSetup,
     }), {
       message: createClawMessageAdapter(transport),
       // `approvalCapability` is a top-level ChannelPlugin field (sibling of
