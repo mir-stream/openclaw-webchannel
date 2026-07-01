@@ -13,9 +13,9 @@ more-realistic split topology.
 ```
   ┌─────────────────────── Mac (host) ───────────────────────┐        ┌──── container ────┐
   │  docker/mac-demo.sh:                                      │        │  node:24-bookworm │
-  │   • SaaS issuer (real trust chain)   http://<LAN_IP>:PORT │◄───────┤  openclaw gateway │
-  │   • JWT-auth nats-server (ws 0.0.0.0) ws://<LAN_IP>:NATS  │◄───────┤  + this plugin    │
-  │   • web chat page                    http://127.0.0.1:PAGE│        │  (index-nats)     │
+  │   • SaaS issuer + unified web page    http://<LAN_IP>:PORT│◄───────┤  openclaw gateway │
+  │       (approve panel + chat widget, ONE origin)          │        │  + this plugin    │
+  │   • JWT-auth nats-server (ws 0.0.0.0) ws://<LAN_IP>:NATS  │◄───────┤  (index-nats)     │
   │        browser ─────────────► ws://<LAN_IP>:NATS ◄────────┼────────┘                   │
   └──────────────────────────────────────────────────────────┘        └───────────────────┘
         relay sees ciphertext only · agent has NO inbound port (outbound dial only)
@@ -46,15 +46,16 @@ This boots (all under `/tmp/oc-mac-demo`, self-cleaning on Ctrl+C):
 
 1. the **real** reference SaaS issuer (`packages/saas/reference/enrollment-server.ts`) with a
    real `setupTrustChain()`, serving JWKS + the enrollment `/api/enroll` + `/api/poll` routes,
-   booted with `NATS_URL=ws://<LAN_IP>:<NATS_WS>` so the URL it *delivers* is LAN-resolvable;
+   booted with `NATS_URL=ws://<LAN_IP>:<NATS_WS>` so the URL it *delivers* is LAN-resolvable.
+   With `ENABLE_DEMO_UI=1` this SAME issuer origin ALSO serves the unified web page (`GET /`),
+   the chat-widget bundle (`GET /widget.js`), and the live enrollment list (`GET /demo/enrollments`)
+   — one origin, no separate web server. `DEMO_GW_URL=""` → no HTTP register hop (`auto`
+   admission + `dmSecurity` allowlist do the gating);
 2. a **JWT-auth `nats-server`** built from that trust chain's operator + resolver, websocket
-   listener bound `0.0.0.0:<NATS_WS>`;
-3. the **web chat page** (`e2e/local/demo-server.mjs`), which reads the relay URL from the issuer
-   (so it too dials the LAN IP) and connects with `WEBCHANNEL_GW_URL=""` → no HTTP register hop
-   (`auto` admission + `dmSecurity` allowlist do the gating).
+   listener bound `0.0.0.0:<NATS_WS>`.
 
 It prints the values the container needs (SaaS base URL, tenant, account, peer id, browser URL).
-Defaults: issuer port `3942`, NATS ws `18722`, page `19394`, tenant `default-tenant`, account
+Defaults: issuer/web port `3942`, NATS ws `18722`, tenant `default-tenant`, account
 `default-agent`, peer `web-allreal-peer`.
 
 ## Container side (agent)
@@ -77,8 +78,9 @@ openclaw channels add --channel webchannel \
   --base-url http://192.168.10.5:3942 \
   --url default-tenant
 
-# 3. approve the enrollment (on the host) at the URL the plugin logs:
-#      http://<host>:3942/enroll?user_code=<CODE>
+# 3. approve the enrollment on the host by opening http://<LAN_IP>:3942/ and
+#    clicking ✓ Approve in the LEFT panel (the pending agent appears there
+#    automatically — no user_code to copy).
 
 # 4. bind an OpenClaw agent to this account (the handling agent is decoupled
 #    from the wire identity — telegram-like):
@@ -105,6 +107,6 @@ round-trips** (silent, no error). Same goes for `tenant` and the browser `peerId
 
 ## Verify
 
-Open the browser URL the host script printed (e.g. `http://127.0.0.1:19394/`), send a message,
-and you should get the agent's reply back — ciphertext-only on the wire, the agent reachable with
-no inbound port.
+Open the browser URL the host script printed (e.g. `http://<LAN_IP>:3942/`), approve the pending
+agent in the left panel, then send a message in the right chat panel — you should get the agent's
+reply back, ciphertext-only on the wire, the agent reachable with no inbound port.

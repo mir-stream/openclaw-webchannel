@@ -16,7 +16,6 @@ LAN_IP="${LAN_IP:-192.168.10.5}"
 ISSUER_PORT="${ISSUER_PORT:-3942}"
 NATS_WS="${NATS_WS:-18722}"
 NATS_TCP="${NATS_TCP:-14722}"
-PAGE_PORT="${PAGE_PORT:-19394}"
 
 TENANT="${TENANT:-default-tenant}"
 ACCOUNT_ID="${ACCOUNT_ID:-default-agent}"
@@ -26,10 +25,9 @@ SAAS_ISSUER="${SAAS_ISSUER:-https://saas.local/demo-issuer}"
 NATS_URL="ws://${LAN_IP}:${NATS_WS}"
 SAAS_BASE_URL="http://${LAN_IP}:${ISSUER_PORT}"
 
-ISSUER_PID=""; NATS_PID=""; WEB_PID=""
+ISSUER_PID=""; NATS_PID=""
 cleanup() {
   echo "[mac-demo] cleanup…"
-  [ -n "$WEB_PID" ]    && kill "$WEB_PID"    2>/dev/null || true
   [ -n "$NATS_PID" ]   && kill "$NATS_PID"   2>/dev/null || true
   [ -n "$ISSUER_PID" ] && kill "$ISSUER_PID" 2>/dev/null || true
   pkill -f "nats-server -c $OCH/nats.conf" 2>/dev/null || true
@@ -43,6 +41,9 @@ rm -rf "$OCH"; mkdir -p "$OCH"
 # 1. SaaS issuer (real trust chain). NATS_URL points at the LAN IP so the URL it
 #    delivers to plugin+browser is resolvable from BOTH the container and the Mac.
 #    ENABLE_TEST_ROUTES=1 → /test/nats-user + /test/bootstrap-jwt for the browser.
+#    ENABLE_DEMO_UI=1 → this SAME issuer also serves the unified web page (approve
+#    panel + chat widget) on its own origin — no separate web server. DEMO_GW_URL
+#    is EMPTY (agent stays ingress-free; admission = auto + dmSecurity allowlist).
 #    Node http.Server binds 0.0.0.0 by default → reachable from the container.
 # ---------------------------------------------------------------------------
 PORT="$ISSUER_PORT" \
@@ -52,6 +53,13 @@ NATS_URL="$NATS_URL" \
 NATS_CONFIG_OUT="$OCH" \
 ENABLE_TEST_ROUTES=1 \
 POLL_INTERVAL_SECONDS=1 \
+ENABLE_DEMO_UI=1 \
+DEMO_APP_HTML="$REPO/e2e/local/demo-app.html" \
+DEMO_CLIENT_ENTRY="$REPO/packages/client/src/browser-demo-entry.ts" \
+DEMO_GW_URL="" \
+DEMO_ACCOUNT_ID="$ACCOUNT_ID" \
+DEMO_TENANT="$TENANT" \
+DEMO_PEER_ID="$PEER_ID" \
   node --import tsx "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
 ISSUER_PID=$!
 echo "[mac-demo] issuer pid=$ISSUER_PID — waiting for JWKS + NATS config…"
@@ -92,31 +100,18 @@ for i in $(seq 1 120); do
 done
 
 # ---------------------------------------------------------------------------
-# 3. Web chat page. gwUrl EMPTY → no HTTP register hop (agent stays ingress-free;
-#    admission = auto + dmSecurity allowlist on the container gateway). The browser
-#    reads the relay URL from /test/nats-user (our rework), so it too dials the LAN IP.
+# 3. (No separate web server.) The issuer from step 1 already serves the unified
+#    web page — the browser reads the relay URL from /test/nats-user (our rework),
+#    so it too dials the LAN IP. The container gateway stays ingress-free.
 # ---------------------------------------------------------------------------
-WEBCHANNEL_GW_URL="" \
-WEBCHANNEL_NATS_URL="$NATS_URL" \
-WEBCHANNEL_ISSUER_URL="$SAAS_BASE_URL" \
-WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
-WEBCHANNEL_PAGE_PORT="$PAGE_PORT" \
-  node "$REPO/e2e/local/demo-server.mjs" >"$OCH/web.log" 2>&1 &
-WEB_PID=$!
-echo "[mac-demo] web pid=$WEB_PID — waiting…"
-for i in $(seq 1 120); do
-  curl -fsS "http://127.0.0.1:$PAGE_PORT/" >/dev/null 2>&1 && { echo "[mac-demo] web ready"; break; }
-  kill -0 "$WEB_PID" 2>/dev/null || { echo "[mac-demo] web died:"; cat "$OCH/web.log"; exit 2; }
-  sleep 0.25
-  [ "$i" -eq 120 ] && { echo "[mac-demo] TIMEOUT web:"; cat "$OCH/web.log"; exit 2; }
-done
 
 cat <<EOF
 
 ===================================================================
-  Mac-side demo UP (issuer + NATS + web). Gateway runs in CONTAINER.
+  Mac-side demo UP (issuer+web on ONE origin + NATS). Gateway → CONTAINER.
 
-  Browser (open on the Mac):   http://127.0.0.1:${PAGE_PORT}/
+  Browser (open on the Mac):   ${SAAS_BASE_URL}/
+      (127.0.0.1:${ISSUER_PORT} also works — CORS is open)
 
   Container must point at (LAN IP, reachable from Docker):
     SaaS baseUrl :  ${SAAS_BASE_URL}
@@ -130,8 +125,8 @@ cat <<EOF
   Gateway webchannel config must allow the browser peer:
     dmSecurity: allowlist,  allowFrom: ["${PEER_ID}"],  nats.admission: auto
 
-  Approve enrollment at:  ${SAAS_BASE_URL}/enroll?user_code=<CODE>
-  Ctrl+C to tear the Mac side down.
+  Approve the enrollment in the LEFT panel of the page (no CODE to copy);
+  the RIGHT chat panel unlocks once you approve. Ctrl+C to tear down.
 ===================================================================
 EOF
 

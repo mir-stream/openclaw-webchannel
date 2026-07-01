@@ -26,10 +26,13 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 `OPENCLAW_HOME`.
 
 > **Want to actually chat with the agent?** `./run-demo.sh` is the **single interactive demo** —
-> it boots this same enrolled-NATS topology against your real model/provider config and serves a
-> browser chat page (Ctrl+C tears it down). For the split host(Mac)/container variant see
-> [`../../docs/SPLIT_DEMO.md`](../../docs/SPLIT_DEMO.md). The harnesses below are headless
-> one-shot proofs, not the interactive demo.
+> it boots this same enrolled-NATS topology against your real model/provider config and the SaaS
+> issuer serves ONE unified web page (`ENABLE_DEMO_UI=1`): a left panel where you approve the
+> agent's enrollment and a right panel where you then chat with it — one origin, no separate chat
+> server (Ctrl+C tears it down). The unified page lives at `demo-app.html`; the SaaS bundles the
+> browser client (`packages/client/src/browser-demo-entry.ts`) into `/widget.js`. For the split
+> host(Mac)/container variant see [`../../docs/SPLIT_DEMO.md`](../../docs/SPLIT_DEMO.md). The
+> harnesses below are headless one-shot proofs, not the interactive demo.
 
 ## Files
 
