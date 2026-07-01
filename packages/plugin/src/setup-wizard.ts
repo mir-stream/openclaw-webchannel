@@ -7,9 +7,13 @@
  * before `channels add`. This declarative wizard drives the interactive path:
  * bare `openclaw channels add` → pick WebChannel → prompt for tenant + SaaS base
  * URL (plus advanced JWT issuer/audience overrides) → `finalize` writes the
- * COMPLETE, enroll-ready block. The device-flow enroll then runs from the shared
- * `webchannelSetup.afterAccountConfigWritten` hook, now fed a wizard-populated
- * `saas.baseUrl` + `tenant`.
+ * COMPLETE, enroll-ready block.
+ *
+ * NOTE: the interactive wizard writes CONFIG ONLY. Core runs the device-flow
+ * enroll (`webchannelSetup.afterAccountConfigWritten`) only on the non-interactive
+ * `--flag` path — the declarative wizard adapter core builds has no
+ * `afterConfigWritten` hook. So after authoring config via the bare wizard,
+ * complete enrollment by running the `--flag` form (or re-running acquisition).
  *
  * ── Two seams, one writer ───────────────────────────────────────────────────
  * The NON-interactive `--flag` form does NOT run this wizard (core only runs the

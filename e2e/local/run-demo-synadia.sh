@@ -78,13 +78,14 @@ if port_busy "$PORT"; then
   exit 1
 fi
 
-# Resolve the JWT `iss` claim (defaulting to SAAS_BASE_URL, then the doc default)
-# and the base URL ONCE, here in the shell. Both are passed EXPLICITLY into node's
-# env below (inline, so they win), so the minted JWT's `iss`, the issuer's listen
-# PORT, the readiness poll, and the printed config guidance all use the IDENTICAL
-# resolved values — a synadia.env that omits PORT/SAAS_ISSUER can't make the printed
-# `issuer`/port diverge from what the process actually mints/binds.
-SAAS_ISSUER="${SAAS_ISSUER:-${SAAS_BASE_URL:-http://127.0.0.1:$PORT}}"
+# Resolve the base URL and the JWT `iss` claim ONCE here; both are passed inline to
+# node below (so they win over synadia.env). §2's `channels add --base-url
+# http://host.docker.internal:$PORT` now DERIVES the config-side auth.jwt.issuer from
+# that container-facing base URL, so the SaaS must stamp the SAME `iss` for the two to
+# agree. (Under admission=auto the register-hop verifier isn't built, so `iss` is not
+# actually checked — but we keep them consistent so the written config stays correct
+# if you switch to admission=register-hop.) An explicit SAAS_ISSUER in synadia.env wins.
+SAAS_ISSUER="${SAAS_ISSUER:-http://host.docker.internal:$PORT}"
 SAAS_BASE_URL="${SAAS_BASE_URL:-http://127.0.0.1:$PORT}"
 
 # ---------------------------------------------------------------------------
@@ -165,49 +166,22 @@ cat <<EOF
      docker exec -it $CONTAINER sh -c "cd /root/plugin && npm install --omit=dev"
      docker exec -it $CONTAINER openclaw plugins install --link /root/plugin
 
-  2) Configure the webchannel channel (LOGIN flow, admission auto — no register hop):
-     docker exec -i $CONTAINER openclaw config patch --stdin <<'JSON'
-{
-  "channels": {
-    "webchannel": {
-      "accounts": {
-        "default-agent": {
-          "tenant": "default-tenant",
-          "saas": { "baseUrl": "http://host.docker.internal:$PORT" },
-          "auth": {
-            "strategy": "jwt",
-            "jwt": {
-              "jwksUrl": "http://host.docker.internal:$PORT/.well-known/jwks.json",
-              "issuer": "$SAAS_ISSUER",
-              "audience": "default-agent"
-            }
-          },
-          "dmSecurity": "open",
-          "nats": {
-            "url": "wss://connect.ngs.global:443",
-            "admission": "auto",
-            "credentials": { "mode": "enrolled" }
-          }
-        }
-      }
-    }
-  }
-}
-JSON
+  2) Configure + enroll in ONE command. WebChannel now ships a channels-add setup
+     writer: passing --base-url/--url writes the FULL account config (auth.jwt
+     derived, admission=auto, dmSecurity=open, credentials.mode=enrolled) AND runs
+     the device-flow enroll — no hand-written 'config patch' anymore. It prints a
+     user_code and BLOCKS until you approve it in the browser (step 5, LEFT panel):
+     docker exec -it $CONTAINER openclaw channels add --channel webchannel --account default-agent --base-url http://host.docker.internal:$PORT --url default-tenant
 
-  3) Enroll (device flow). Prints a user_code and BLOCKS until you approve it in
-     the browser (step 6, LEFT panel):
-     docker exec -it $CONTAINER openclaw channels add --channel webchannel --account default-agent
-
-  4) Bind YOUR handling agent to the account (configure its model/provider inside
+  3) Bind YOUR handling agent to the account (configure its model/provider inside
      the container first — this script does NOT copy your host ~/.openclaw):
      docker exec -it $CONTAINER openclaw agents bind --bind webchannel:default-agent --agent <your-agent>
 
-  5) Run the gateway (consumes the cached creds, connects to Synadia):
+  4) Run the gateway (consumes the cached creds, connects to Synadia):
      docker exec -it $CONTAINER openclaw gateway run
 
-  6) In your browser, open:  http://127.0.0.1:$PORT/
-       - LEFT panel:  Approve the pending code from step 3.
+  5) In your browser, open:  http://127.0.0.1:$PORT/
+       - LEFT panel:  Approve the pending code from step 2.
                       (Also try the "User access (aud)" sub-panel to grant/revoke
                        which accounts a login may reach.)
        - RIGHT panel: LOG IN as  alice  or  bob  (password: demo), then chat.

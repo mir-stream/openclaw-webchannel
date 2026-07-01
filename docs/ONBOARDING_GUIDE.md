@@ -23,7 +23,8 @@ device flow against your own issuer.
  │   subjects: webchannel.{tenant}.{accountId}.{peerId}.*   │
  └─────────────────────────────────────────────────────────┘
    ▲                                              ▲
-   │ /test/nats-user, /test/bootstrap-jwt         │ /api/enroll, /api/poll, /.well-known/jwks.json
+   │ login → /nats-user, /bootstrap               │ /api/enroll, /api/poll, /.well-known/jwks.json
+   │ (server-derived peerId)                      │
    └───────────────  SaaS issuer  (:3951) ────────┘
 ```
 
@@ -76,9 +77,22 @@ export NATS_URL='wss://connect.ngs.global:443'
 export PORT='3951'
 export SAAS_BASE_URL='http://127.0.0.1:3951'
 export SAAS_ISSUER='https://saas.local/webchannel-issuer'   # JWT `iss` claim (a string, not a URL to fetch)
-export ENABLE_TEST_ROUTES='1'                   # exposes /test/nats-user + /test/bootstrap-jwt for the browser demo
+# Browser demo surface — the login flow (§6). Under ENABLE_DEMO_UI the
+# unauthenticated /test/* mint routes are OFF; the human LOGS IN instead. This one
+# issuer then serves BOTH the /approve pairing UI (§5) and the login/chat page (§6).
+export ENABLE_DEMO_UI='1'
+export DEMO_APP_HTML="$PWD/e2e/local/demo-app.html"          # required by ENABLE_DEMO_UI
+export DEMO_CLIENT_ENTRY="$PWD/packages/client/src/browser-demo-entry.ts"   # required by ENABLE_DEMO_UI
 export TRUST_CHAIN_PATH="$HOME/.openclaw-webchannel-saas/trust-chain-synadia.json"
 ```
+
+> `SAAS_ISSUER` is the `iss` the SaaS stamps. On the `channels add` happy path the
+> config's `auth.jwt.issuer` is **derived from `--base-url`** (fact: issuer defaults to
+> the SaaS base URL), so with `admission: register-hop` the two must agree — set
+> `SAAS_ISSUER` to your SaaS base URL (as `e2e/local/run-demo-synadia.sh` does). Under
+> `admission: auto` (the happy-path default) `iss` is not verified, so a divergent value
+> like the one above is harmless. `e2e/local/run-demo-synadia.sh` is the canonical,
+> already-updated example of the full demo env block.
 
 Run it (stays in the foreground; restart wipes the in-memory enrollment store):
 
@@ -94,8 +108,11 @@ Verify:
 curl -s http://127.0.0.1:3951/.well-known/jwks.json | head -c 80   # → {"keys":[{"kty":"RSA",…
 ```
 
-> ⚠️ `ENABLE_TEST_ROUTES=1` mints creds for **any** tenant with no auth — dev/lab only.
-> The signing seed is the crown jewel: keep it in the 0600 env file, never in chat/logs/disk-as-plaintext.
+> ⚠️ The signing seed is the crown jewel: keep it in the 0600 env file, never in
+> chat/logs/disk-as-plaintext. (The legacy `ENABLE_TEST_ROUTES=1` mints creds for **any**
+> tenant with no auth — dev/lab only; it is superseded by the login-gated demo flow and is
+> 404'd whenever `ENABLE_DEMO_UI=1`. It stays available for the headless harnesses only —
+> see §5's footnote.)
 
 ---
 
@@ -127,11 +144,94 @@ docker exec <container> openclaw plugins install --link /root/plugin
 
 ## 4. Configure the channel
 
-WebChannel is a **plugin channel**. Configure its connection/auth once with
-`openclaw config patch` (objects deep-merge, arrays/scalars replace, `null` deletes), then
-acquire NATS credentials **at config time** with `openclaw channels add` (see the next
-subsection). Credential acquisition no longer happens at `gateway run` — `gateway run` only
-**consumes** persisted per-account creds.
+WebChannel is a **plugin channel**. On the happy path you configure it **and** enroll it in
+a **single command**: `openclaw channels add` with `--base-url` writes the COMPLETE account
+config block and then runs the device-flow enroll. Credential acquisition no longer happens
+at `gateway run` — `gateway run` only **consumes** persisted per-account creds. A
+hand-written `config patch` is only needed for the advanced cases in the last subsection.
+
+### Recommended: one command writes config + enrolls (`openclaw channels add`)
+
+The `--account <id>` value **is** the wire identity (the `accountId`): omit `--account` for
+the `"default"` account, or pass `--account <id>` for a named account (creds persist to
+`~/.openclaw-webchannel/<account>/credentials.json`). There is **no `--token`** — the
+handling agent is bound separately (below).
+
+```bash
+openclaw channels add --channel webchannel \
+  --account  default-agent \           # → accountId (the wire identity)
+  --base-url http://127.0.0.1:3951 \   # → saas.baseUrl (SaaS issuer)
+  --url      default-tenant            # → tenant
+# With --base-url present the plugin (1) writes the FULL account block, then
+# (2) runs the RFC 8628 device flow headlessly (prints the user_code), persists creds, exits 0.
+```
+
+When `--base-url` (the SaaS base URL) is present, the setup adapter writes the COMPLETE,
+enroll-ready block and **derives** every field you would otherwise hand-write:
+
+| Field | Derived value |
+|---|---|
+| `auth.strategy` | `jwt` |
+| `auth.jwt.jwksUrl` | `<base-url>/.well-known/jwks.json` |
+| `auth.jwt.issuer` | `<base-url>` (default) |
+| `auth.jwt.audience` | `<accountId>` (default) |
+| `dmSecurity` | `open` |
+| `nats.admission` | `auto` |
+| `nats.credentials.mode` | `enrolled` |
+| `nats.url` | **omitted** — the SaaS delivers the relay URL with the creds at enroll |
+
+Then bind the handling agent to that account (telegram-like — decoupled from the wire):
+
+```bash
+openclaw agents bind --bind webchannel:default-agent --agent my-agent
+```
+
+Approve the device code exactly as in §5; on success creds are persisted and `channels add`
+exits 0. `gateway run` then consumes them with no re-approval.
+
+**CLI flag mapping (important).** WebChannel is an installed (non-bundled) plugin, so
+OpenClaw's `channels add` does not register custom `--saas-base-url`/`--tenant` flags today;
+the plugin maps the **generic** flags onto its identity fields:
+
+| Generic flag | Maps to | Config location written |
+|---|---|---|
+| `--account <id>` | `accountId` (wire identity) | `channels.webchannel.accounts.<id>` (the account key) |
+| `--base-url <url>` | `saasBaseUrl` | `channels.webchannel[.accounts.<id>].saas.baseUrl` |
+| `--url <tenant>` | `tenant` | `channels.webchannel[.accounts.<id>].tenant` |
+
+`channels add` echoes the **resolved** identity before enrolling
+(`[webchannel] account "<id>" resolved acquisition identity: accountId=… tenant=… saasBaseUrl=…`)
+so a mis-mapped flag is visible. The dedicated `--saas-base-url`/`--tenant`
+flags are declared in the manifest and will work automatically if/when the host registers
+non-bundled `cliAddOptions`.
+
+**Interactive wizard — guided alternative for authoring config.** Running **bare**
+`openclaw channels add` (no flags) launches the interactive setup wizard: pick **webchannel**,
+then answer prompts for the account id, tenant, and SaaS base URL — plus **advanced** JWT
+`issuer`/`audience` overrides (the two fields the flag form cannot express; see the advanced
+subsection). The wizard writes the **same** full block through the shared builder, but the
+device-flow enroll fires on the `--flag` path — so after authoring config with the wizard,
+complete enrollment by running the flag form above (or re-running acquisition). Use the
+wizard when you need a custom `issuer`/`audience`; use the flag form for config **and** enroll
+in one shot.
+
+**Unambiguous alternative — acquisition env (legacy):** when there is **no** `channels.webchannel`
+config at all, `WEBCHANNEL_TENANT` / `WEBCHANNEL_SAAS_BASE_URL` synthesize the `"default"`
+account's identity. Once any webchannel config exists, these are **ignored** (config wins)
+with a one-time deprecation warning. (Connection/static env —
+`WEBCHANNEL_NATS_URL`/`_USER_JWT`/`_USER_SEED`/`_CREDS`/`_DEV_OPEN` — keep their runtime meaning.)
+
+Approve the device code exactly as in §5; on success creds are persisted and `channels add`
+exits 0. `gateway run` then consumes them with no re-approval.
+
+### Advanced / manual override (register-hop, custom issuer, allowlist)
+
+The flag form maps only the generic `--account`/`--base-url`/`--url` flags — there is **no**
+`--issuer`/`--audience`/`--admission` flag. So for the cases the derived defaults can't
+express — `admission: register-hop`, an `issuer` that is **not** the SaaS base URL, or
+`dmSecurity: allowlist` — either use the interactive wizard's advanced `issuer`/`audience`
+prompts, or hand-write the account block with `openclaw config patch` (objects deep-merge,
+arrays/scalars replace, `null` deletes):
 
 ```bash
 openclaw config patch --stdin <<'JSON'
@@ -171,54 +271,12 @@ openclaw config get channels.webchannel    # verify
 > **Container caveat:** from inside a container the SaaS is **not** `127.0.0.1` — use
 > `host.docker.internal:3951` for `saasBaseUrl` **and** `jwksUrl`. The `issuer` value
 > stays as-is (it is a JWT claim string, not an address). NATS is public so its URL is
-> unchanged.
+> unchanged. On the `channels add` happy path, pass
+> `--base-url http://host.docker.internal:3951` so the **derived** `jwksUrl`/`issuer` come
+> out container-correct.
 
-### Acquire credentials at config time (`openclaw channels add`)
-
-The device flow runs during **`channels add`**, not at `gateway run`. The `--account <id>`
-value **is** the wire identity (the `accountId`): omit `--account` for the `"default"`
-account, or pass `--account <id>` for a named account (creds persist to
-`~/.openclaw-webchannel/<account>/credentials.json`). There is **no `--token`** anymore —
-the handling agent is bound separately (next step).
-
-```bash
-openclaw channels add --channel webchannel \
-  --account  default-agent \           # → accountId (the wire identity)
-  --base-url http://127.0.0.1:3951 \   # → saas.baseUrl (SaaS issuer)
-  --url      default-tenant            # → tenant
-# runs the RFC 8628 device flow headlessly (prints the user_code), persists creds, exits 0
-```
-
-Then bind the handling agent to that account (telegram-like — decoupled from the wire):
-
-```bash
-openclaw agents bind --bind webchannel:default-agent --agent my-agent
-```
-
-**CLI flag mapping (important).** WebChannel is an installed (non-bundled) plugin, so
-OpenClaw's `channels add` does not register custom `--saas-base-url`/`--tenant` flags today;
-the plugin maps the **generic** flags onto its identity fields:
-
-| Generic flag | Maps to | Config location written |
-|---|---|---|
-| `--account <id>` | `accountId` (wire identity) | `channels.webchannel.accounts.<id>` (the account key) |
-| `--base-url <url>` | `saasBaseUrl` | `channels.webchannel[.accounts.<id>].saas.baseUrl` |
-| `--url <tenant>` | `tenant` | `channels.webchannel[.accounts.<id>].tenant` |
-
-`channels add` echoes the **resolved** identity before enrolling
-(`[webchannel] account "<id>" resolved acquisition identity: tenant=… accountId=… saasBaseUrl=…`)
-so a mis-mapped flag is visible. The dedicated `--saas-base-url`/`--tenant`
-flags are declared in the manifest and will work automatically if/when the host registers
-non-bundled `cliAddOptions`.
-
-**Unambiguous alternative — acquisition env (legacy):** when there is **no** `channels.webchannel`
-config at all, `WEBCHANNEL_TENANT` / `WEBCHANNEL_SAAS_BASE_URL` synthesize the `"default"`
-account's identity. Once any webchannel config exists, these are **ignored** (config wins)
-with a one-time deprecation warning. (Connection/static env —
-`WEBCHANNEL_NATS_URL`/`_USER_JWT`/`_USER_SEED`/`_CREDS`/`_DEV_OPEN` — keep their runtime meaning.)
-
-Approve the device code exactly as in §5; on success creds are persisted and `channels add`
-exits 0. `gateway run` then consumes them with no re-approval.
+After hand-writing config this way, still enroll with `openclaw channels add` (§5) — the
+device flow is what persists the creds `gateway run` consumes.
 
 ---
 
@@ -297,25 +355,31 @@ separate web server:
 PORT='3951' \
 SAAS_BASE_URL='http://127.0.0.1:3951' \
 NATS_URL='wss://connect.ngs.global:443' \
-ENABLE_TEST_ROUTES=1 \
 ENABLE_DEMO_UI=1 \
 DEMO_APP_HTML="$PWD/e2e/local/demo-app.html" \
 DEMO_CLIENT_ENTRY="$PWD/packages/client/src/browser-demo-entry.ts" \
-DEMO_GW_URL='http://127.0.0.1:18789' \
+DEMO_GW_URL='' \                                            # '' = admission auto (the §4 default); set a gateway URL only for register-hop
 DEMO_TENANT='default-tenant' \
 DEMO_ACCOUNT_ID='default-agent' \
-DEMO_PEER_ID='web-human-1' \
 node --import tsx packages/saas/reference/enrollment-server.ts
 # → unified demo page at http://127.0.0.1:3951/
 ```
 
+> Under `ENABLE_DEMO_UI` the human **logs in** (there is no client-declared peerId), so the
+> old `DEMO_PEER_ID` no longer controls the human's identity — the server derives it. Leave
+> it unset; the reference SaaS still accepts it only as a headless-harness hint.
+
 > For a **turnkey local run** that boots the whole stack (issuer+web, NATS, gateway, enrolled
 > plugin) against your real model config, just use `./e2e/local/run-demo.sh` — it sets all of the
-> above for you.
+> above for you. The Synadia sibling is `./e2e/local/run-demo-synadia.sh` (its env block is the
+> canonical demo example).
 
-The page: approve the agent in the left panel → the right chat panel generates keys → mints NATS
-creds from `issuer/test/nats-user` → mints a PoP bootstrap JWT from `issuer/test/bootstrap-jwt` →
-connects to NATS → (register hop) → chat. Use the **same `tenant`+`accountId`** as the agent.
+The page: approve the agent in the left panel → in the right panel **log in** as `alice` or
+`bob` (password `demo`). The browser then generates keys → mints NATS creds from `issuer/nats-user`
+→ mints a PoP bootstrap JWT from `issuer/bootstrap` → connects to NATS → (register hop, if any) →
+chat. The **peerId is derived server-side** from the logged-in user (its `uuid`) — any
+client-declared peerId is ignored — and the SaaS enforces the user↔`accountId` authz at
+JWT-mint time (`canAccess` → `403`). Use the **same `tenant`+`accountId`** as the agent.
 
 ### Two admission models
 
@@ -382,8 +446,9 @@ The `#token=` fragment auto-authenticates; a missing/wrong token → `AUTH_RATE_
 `WEBCHANNEL_NATS_URL`, `WEBCHANNEL_NATS_USER_JWT`, `WEBCHANNEL_NATS_USER_SEED`,
 `WEBCHANNEL_NATS_CREDS`, `WEBCHANNEL_NATS_DEV_OPEN=1`, `WEBCHANNEL_SAAS_BASE_URL`,
 `WEBCHANNEL_TENANT`. (Acquisition no longer reads `WEBCHANNEL_AGENT_ID` — the wire identity
-is the `accountId`, set via `channels add --account <id>`; the demo browser server reads
-`WEBCHANNEL_ACCOUNT_ID`.)
+is the `accountId`, set via `channels add --account <id>`. The **login-flow demo** server is
+configured with `DEMO_ACCOUNT_ID`/`DEMO_TENANT`; `WEBCHANNEL_ACCOUNT_ID` is a **headless
+harness** var read by the `e2e/local/*` drivers.)
 
 **Subjects:** `webchannel.{tenant}.{accountId}.{peerId}.{in,out,handshake}`
 (agent subscribes `…*.in`/`…*.handshake`, publishes `…*.out`; browser is the mirror).
@@ -391,5 +456,9 @@ is the `accountId`, set via `channels add --account <id>`; the demo browser serv
 **Credential modes** (`nats.credentials.mode`): `enrolled` (SaaS device flow, default) ·
 `static` (BYO url + user JWT + NKEY seed / `.creds` file, no issuer) · `open` (dev, no auth).
 
-**Issuer endpoints:** `/api/enroll`, `/api/poll`, `/approve`, `/.well-known/jwks.json`,
-and (test-only) `/test/nats-user`, `/test/bootstrap-jwt`.
+**Issuer endpoints:** `/api/enroll`, `/api/poll`, `/approve`, `/.well-known/jwks.json`.
+Under `ENABLE_DEMO_UI` the browser login flow adds `/login`, `/nats-user`, `/bootstrap`
+(server-derived peerId + user↔`accountId` authz at JWT-mint). The unauthenticated
+`/test/nats-user` + `/test/bootstrap-jwt` are **headless-harness only** (used by
+`e2e/local/run-all-real.sh` and `browser-jwt-entry.ts`) and are `404`'d whenever
+`ENABLE_DEMO_UI=1`.
