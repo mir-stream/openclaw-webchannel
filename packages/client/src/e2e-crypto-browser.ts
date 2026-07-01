@@ -11,7 +11,7 @@
  *   - handshake frame: {type:"key_exchange", pubKey:<b64url X25519>}
  *   - session key:     hkdfSha256(ecdh, null, "webchannel-conversation-v1", 32)
  *   - wire envelope:   MessageEnvelope v1 JSON, content = ChaCha20-Poly1305
- *   - AAD:             canonical(routing) = {tenant,agentId,sub,messageId,envelopeType,ts}
+ *   - AAD:             canonical(routing) = {tenant,accountId,sub,messageId,envelopeType,ts}
  */
 
 import { chacha20poly1305Encrypt, chacha20poly1305Decrypt } from "./chacha20poly1305.js";
@@ -147,7 +147,7 @@ export function parseKeyExchange(payload: string): string | null {
 // ---------------------------------------------------------------------------
 
 export type EnvelopeRouting = {
-  agentId: string;
+  accountId: string;
   tenant: string;
   sub: string;
   messageId: string;
@@ -157,7 +157,7 @@ export type EnvelopeRouting = {
 
 export type MessageEnvelope = {
   v: 1;
-  agentId: string;
+  accountId: string;
   tenant: string;
   sub: string;
   messageId: string;
@@ -167,14 +167,14 @@ export type MessageEnvelope = {
 };
 
 /**
- * Canonical AAD: UTF-8(JSON.stringify({tenant,agentId,sub,messageId,envelopeType,ts}))
+ * Canonical AAD: UTF-8(JSON.stringify({tenant,accountId,sub,messageId,envelopeType,ts}))
  * with fixed key order. Must match every other endpoint byte-for-byte.
  */
 export function canonicalAad(routing: EnvelopeRouting): Uint8Array {
   return new TextEncoder().encode(
     JSON.stringify({
       tenant: routing.tenant,
-      agentId: routing.agentId,
+      accountId: routing.accountId,
       sub: routing.sub,
       messageId: routing.messageId,
       envelopeType: routing.envelopeType,
@@ -209,7 +209,7 @@ export function encodeEnvelope(
 
 export function decodeEnvelope(env: MessageEnvelope, sessionKey: Uint8Array): string {
   const routing: EnvelopeRouting = {
-    agentId: env.agentId,
+    accountId: env.accountId,
     tenant: env.tenant,
     sub: env.sub,
     messageId: env.messageId,
@@ -232,13 +232,13 @@ export function decodeEnvelope(env: MessageEnvelope, sessionKey: Uint8Array): st
  * for `publish()`. `messageId`/`ts` are generated per call.
  */
 export function sealMessage(
-  routing: { agentId: string; tenant: string; sub: string },
+  routing: { accountId: string; tenant: string; sub: string },
   sessionKey: Uint8Array,
   message: unknown,
   envelopeType = "conversation",
 ): string {
   const fullRouting: EnvelopeRouting = {
-    agentId: routing.agentId,
+    accountId: routing.accountId,
     tenant: routing.tenant,
     sub: routing.sub,
     messageId: Array.from(randomBytes(8), (b) => b.toString(16).padStart(2, "0")).join(""),

@@ -174,7 +174,7 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     const key = h.browserSessionKey()!;
 
     // Browser → agent (sealed)
-    h.browser.publish(inSubj, sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, key, {
+    h.browser.publish(inSubj, sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, {
       type: "user_message",
       text: "hello agent",
     }));
@@ -189,7 +189,7 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     const h = makeHarness();
     h.doHandshake();
     const key = h.browserSessionKey()!;
-    h.browser.publish(inSubj, sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, key, {
+    h.browser.publish(inSubj, sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, {
       type: "user_message",
       text: "topsecret-probe",
     }));
@@ -224,7 +224,7 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     h.browser.publish(inSubj, Buffer.from(JSON.stringify({ type: "user_message", text: "x" })));
     // Sealed-with-some-key attempt before any key exchange.
     const someKey = deriveConversationKey(generateKeyPair().privateKey, generateKeyPair().publicKey);
-    h.browser.publish(inSubj, sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, someKey, { type: "user_message", text: "y" }));
+    h.browser.publish(inSubj, sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, someKey, { type: "user_message", text: "y" }));
     expect(h.inbound).toEqual([]);
   });
 
@@ -236,7 +236,7 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     // Seal legitimately, then tamper a plaintext routing field WITHOUT re-encrypting.
     // The agent recomputes canonical AAD from the (tampered) routing, so the
     // ChaCha20-Poly1305 tag no longer authenticates → decryption fails → dropped.
-    const sealed = sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, key, {
+    const sealed = sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, {
       type: "user_message",
       text: "authentic",
     });
@@ -257,7 +257,7 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     h.doHandshake();
     // Wrong key (not the negotiated session key) → decrypt fails → dropped.
     const wrongKey = deriveConversationKey(generateKeyPair().privateKey, generateKeyPair().publicKey);
-    h.browser.publish(inSubj, sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, wrongKey, {
+    h.browser.publish(inSubj, sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, wrongKey, {
       type: "user_message",
       text: "tampered",
     }));

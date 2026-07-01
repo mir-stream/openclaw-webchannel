@@ -30,7 +30,7 @@ ISSUER_PORT=3942
 PAGE_PORT=19394
 
 TENANT=default-tenant
-AGENT_ID=default-agent
+ACCOUNT_ID=default-agent
 PEER_ID=web-allreal-peer
 SAAS_ISSUER="https://saas.local/demo-issuer"
 
@@ -180,7 +180,7 @@ echo "[run-demo] set plugin extensions → ./index-nats.ts"
 REAL_CONFIG="${OPENCLAW_REAL_CONFIG:-$HOME/.openclaw/openclaw.json}"
 [ -f "$REAL_CONFIG" ] || { echo "[run-demo] FATAL: real openclaw config not found at $REAL_CONFIG — cannot inherit the real agent/model. Set OPENCLAW_REAL_CONFIG."; exit 3; }
 OCH="$OCH" REPO="$REPO" REAL_CONFIG="$REAL_CONFIG" \
-ISSUER_PORT="$ISSUER_PORT" SAAS_ISSUER="$SAAS_ISSUER" AGENT_ID="$AGENT_ID" PEER_ID="$PEER_ID" \
+ISSUER_PORT="$ISSUER_PORT" SAAS_ISSUER="$SAAS_ISSUER" ACCOUNT_ID="$ACCOUNT_ID" PEER_ID="$PEER_ID" \
 node -e '
   const fs = require("fs");
   const real = JSON.parse(fs.readFileSync(process.env.REAL_CONFIG, "utf8"));
@@ -216,7 +216,7 @@ node -e '
           jwt: {
             jwksUrl: "http://127.0.0.1:" + process.env.ISSUER_PORT + "/.well-known/jwks.json",
             issuer: process.env.SAAS_ISSUER,
-            audience: process.env.AGENT_ID,
+            audience: process.env.ACCOUNT_ID,
           },
         },
         dmSecurity: "allowlist",
@@ -254,11 +254,17 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Boot the isolated gateway. NO WEBCHANNEL_NATS_DEV_OPEN → enrolled path runs.
 #    HOME=$OCH isolates the plugin's enrollment credential store under $OCH.
+#
+#    NOTE: we deliberately do NOT pass WEBCHANNEL_NATS_URL. The SaaS is the
+#    rendezvous authority — the enrolled plugin receives the relay URL inside its
+#    EnrollmentResult (the issuer was booted with NATS_URL=ws://…:$NATS_WS in
+#    step 1) and dials THAT. The only SaaS coordinate the plugin still needs is
+#    where the SaaS itself lives (WEBCHANNEL_SAAS_BASE_URL). This is the whole
+#    point of the rework: the operator no longer configures the NATS URL.
 # ---------------------------------------------------------------------------
 HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
   WEBCHANNEL_SAAS_BASE_URL="http://127.0.0.1:$ISSUER_PORT" \
-  WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_AGENT_ID="$AGENT_ID" \
+  WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" \
   WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &
@@ -305,7 +311,7 @@ echo "[run-demo] starting interactive chat server…"
 WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
 WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
 WEBCHANNEL_ISSUER_URL="http://127.0.0.1:$ISSUER_PORT" \
-WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_AGENT_ID="$AGENT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
+WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
 WEBCHANNEL_PAGE_PORT="$PAGE_PORT" \
   node "$REPO/e2e/local/demo-server.mjs" >"$OCH/demo-server.log" 2>&1 &
 DEMO_PID=$!

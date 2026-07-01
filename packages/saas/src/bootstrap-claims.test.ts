@@ -12,7 +12,7 @@ const ED25519 = Buffer.alloc(32, 2).toString("base64url");
 const base = {
   iss: "https://saas.example",
   peerId: "user-7",
-  agentId: "agent-1",
+  accountId: "agent-1",
   tenant: "acme",
   deviceX25519PublicKey: X25519,
   nowSeconds: 1_000_000,

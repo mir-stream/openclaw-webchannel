@@ -36,7 +36,7 @@ export const CONVERSATION_KDF_INFO = "webchannel-conversation-v1";
 
 /** Stable routing identity shared by every envelope a peer session emits. */
 export type SessionRouting = {
-  readonly agentId: string;
+  readonly accountId: string;
   readonly tenant: string;
   /** JWT `sub` — equal to the peerId in the WebChannel subject grammar. */
   readonly sub: string;
@@ -97,7 +97,7 @@ export function sealEnvelope(
   envelopeType: EnvelopeType = "conversation",
 ): Buffer {
   const fullRouting: EnvelopeRouting = {
-    agentId: routing.agentId,
+    accountId: routing.accountId,
     tenant: routing.tenant,
     sub: routing.sub,
     messageId: randomBytes(8).toString("hex"),

@@ -15,7 +15,31 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "additionalProperties": false,
+        "description": "WebChannel config (OpenClaw multi-account model). The channel-level (flat) fields are the shared base AND the implicit \"default\" account; named accounts live under `accounts.<accountId>` and inherit the channel-level base. Acquisition identity (tenant/accountId/saas.baseUrl) and credentials are set via 'openclaw channels add --channel webchannel'.",
         "properties": {
+          "accounts": {
+            "type": "object",
+            "description": "Per-account overrides keyed by accountId (channels.webchannel.accounts.<id>). Each account inherits the channel-level (flat) fields as a shared base; account fields override. By design the per-account leaf schema is NOT enumerated here (additionalProperties:true / unvalidated) — it mirrors the channel-level fields; validating it twice would couple the two trees. Named accounts are created by 'openclaw channels add --channel webchannel --account <id>'.",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "tenant": {
+            "type": "string",
+            "description": "Deployment tenant identifier (acquisition identity). Set via 'openclaw channels add --channel webchannel --tenant <t>' (or the mapped --url flag)."
+          },
+          "saas": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "SaaS issuer settings for enrolled-mode acquisition.",
+            "properties": {
+              "baseUrl": {
+                "type": "string",
+                "description": "SaaS issuer base URL (the /api/enroll + /api/poll endpoints are derived from it). Set via 'openclaw channels add --channel webchannel --saas-base-url <url>' (or the mapped --base-url flag). Env override (legacy, config wins): WEBCHANNEL_SAAS_BASE_URL."
+              }
+            }
+          },
           "auth": {
             "type": "object",
             "additionalProperties": false,
@@ -185,7 +209,7 @@
             "properties": {
               "url": {
                 "type": "string",
-                "description": "NATS WebSocket URL (ws://… / wss://…). Env override: WEBCHANNEL_NATS_URL. Default ws://127.0.0.1:4222."
+                "description": "NATS WebSocket URL (ws://… / wss://…) for static/open modes. For ENROLLED mode the SaaS is the rendezvous authority and DELIVERS the relay URL with the minted creds (EnrollmentResult.natsUrl); that wins, and this / WEBCHANNEL_NATS_URL is only a dev override / back-compat fallback. Default ws://127.0.0.1:4222."
               },
               "devOpen": {
                 "type": "boolean",
@@ -247,11 +271,11 @@
       "uiHints": {
         "auth.strategy": {
           "label": "Auth strategy",
-          "help": "How browser connections are verified: \"hmac-ticket\" verifies a short-lived signed ticket from your backend (recommended); \"anonymous\" disables auth (dev/loopback only — all connections share one peer). Required; the plugin refuses to start if unset."
+          "help": "How browser connections are verified. Production runs the NATS path (index-nats): use \"jwt\" for the register-hop admission, or set NO auth at all for `auto` admission (browser is gated by NATS subject-permissioned creds + the X25519 handshake). \"hmac-ticket\" is LEGACY — it belongs to the dev-only Gateway-WS entry (index.ts) and is inert on the NATS path. \"anonymous\" is REJECTED at load (the plugin refuses to start)."
         },
         "auth.ticketSecret": {
           "label": "Ticket secret",
-          "help": "Shared HMAC secret for the \"hmac-ticket\" strategy. Use { \"env\": \"VAR_NAME\" } to read from an environment variable instead of inlining the secret."
+          "help": "Shared HMAC secret for the LEGACY dev-only \"hmac-ticket\" (Gateway-WS) strategy. Not used on the production NATS path. Use { \"env\": \"VAR_NAME\" } to read from an environment variable instead of inlining the secret."
         },
         "auth.ticketParam": {
           "label": "Ticket query param",
@@ -318,5 +342,18 @@
         }
       }
     }
+  },
+  "packageChannel": {
+    "id": "webchannel",
+    "cliAddOptions": [
+      {
+        "flags": "--saas-base-url <url>",
+        "description": "WebChannel: SaaS issuer base URL for enrolled-mode credential acquisition (config-time). Maps to channels.webchannel.<account>.saas.baseUrl."
+      },
+      {
+        "flags": "--tenant <tenant>",
+        "description": "WebChannel: deployment tenant identifier. Maps to channels.webchannel.<account>.tenant."
+      }
+    ]
   }
 }

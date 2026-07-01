@@ -117,8 +117,8 @@ class FakeNatsWS {
 }
 
 // An "agent" that mirrors the plugin: handshake → derive key → (no echo needed). */
-function makeHandshakeAgent(tenant: string, agentId: string, peerId: string): ServerHandler {
-  const hs = handshakeSubject(tenant, agentId, peerId);
+function makeHandshakeAgent(tenant: string, accountId: string, peerId: string): ServerHandler {
+  const hs = handshakeSubject(tenant, accountId, peerId);
   return async (subject, payload, server) => {
     if (subject === hs) {
       const browserPub = parseKeyExchange(payload);
@@ -190,7 +190,7 @@ describe("WebChannelNatsClient PoP HTTP registration wiring", () => {
     const client = new WebChannelNatsClient({
       url: "ws://127.0.0.1:4222",
       jwt: JWT,
-      agentId: AGENT,
+      accountId: AGENT,
       tenant: TENANT,
       peerId: PEER,
       registration: { registerBaseUrl: BASE, devicePrivateKey: device.privateKey, fetchImpl },
@@ -239,7 +239,7 @@ describe("WebChannelNatsClient PoP HTTP registration wiring", () => {
     const client = new WebChannelNatsClient({
       url: "ws://127.0.0.1:4222",
       jwt: JWT,
-      agentId: AGENT,
+      accountId: AGENT,
       tenant: TENANT,
       peerId: PEER,
       registration: { registerBaseUrl: BASE, devicePrivateKey: device.privateKey, fetchImpl },
@@ -282,7 +282,7 @@ describe("WebChannelNatsClient PoP HTTP registration wiring", () => {
     const client = new WebChannelNatsClient({
       url: "ws://127.0.0.1:4222",
       jwt: JWT,
-      agentId: AGENT,
+      accountId: AGENT,
       tenant: TENANT,
       peerId: PEER,
       registration: { registerBaseUrl: BASE, devicePrivateKey: device.privateKey, fetchImpl },
@@ -329,7 +329,7 @@ describe("WebChannelNatsClient PoP HTTP registration wiring", () => {
       const client = new WebChannelNatsClient({
         url: "ws://127.0.0.1:4222",
         jwt: JWT,
-        agentId: AGENT,
+        accountId: AGENT,
         tenant: TENANT,
         peerId: PEER,
         // Note: NO `registration` field.

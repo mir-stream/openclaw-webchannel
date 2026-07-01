@@ -119,14 +119,14 @@ class FakeNatsWS {
 // An "agent" that mirrors the plugin: handshake → derive key → echo replies.
 function makeAgentSim(
   tenant: string,
-  agentId: string,
+  accountId: string,
   peerId: string,
   echoPrefix = "echo: ",
 ): ServerHandler {
   let sessionKey: Uint8Array | null = null;
-  const hs = handshakeSubject(tenant, agentId, peerId);
-  const inS = inboundSubject(tenant, agentId, peerId);
-  const outS = outboundSubject(tenant, agentId, peerId);
+  const hs = handshakeSubject(tenant, accountId, peerId);
+  const inS = inboundSubject(tenant, accountId, peerId);
+  const outS = outboundSubject(tenant, accountId, peerId);
   return async (subject, payload, server) => {
     if (subject === hs) {
       const browserPub = parseKeyExchange(payload);
@@ -139,7 +139,7 @@ function makeAgentSim(
     if (subject === inS && sessionKey) {
       const msg = openMessage(payload, sessionKey) as { type?: string; text?: string } | null;
       if (msg?.type === "user_message") {
-        const reply = sealMessage({ agentId, tenant, sub: peerId }, sessionKey, {
+        const reply = sealMessage({ accountId, tenant, sub: peerId }, sessionKey, {
           type: "agent_message",
           text: `${echoPrefix}${msg.text}`,
         });
@@ -173,7 +173,7 @@ function startClient(): { client: WebChannelNatsClient; server: FakeNatsWS; rece
   const client = new WebChannelNatsClient({
     url: "ws://127.0.0.1:4222",
     jwt: "",
-    agentId: AGENT,
+    accountId: AGENT,
     tenant: TENANT,
     peerId: PEER,
   });
@@ -267,7 +267,7 @@ describe("e2e-crypto-browser spec conformance", () => {
 
   it("computes canonical AAD with the fixed key order", () => {
     const routing = {
-      agentId: "a",
+      accountId: "a",
       tenant: "t",
       sub: "s",
       messageId: "m",
@@ -276,7 +276,7 @@ describe("e2e-crypto-browser spec conformance", () => {
     };
     const expected = JSON.stringify({
       tenant: "t",
-      agentId: "a",
+      accountId: "a",
       sub: "s",
       messageId: "m",
       envelopeType: "conversation",
@@ -290,7 +290,7 @@ describe("e2e-crypto-browser spec conformance", () => {
       (await generateX25519KeyPair()).privateKey,
       (await generateX25519KeyPair()).publicKeyB64url,
     );
-    const wire = sealMessage({ agentId: "a", tenant: "t", sub: "s" }, key, {
+    const wire = sealMessage({ accountId: "a", tenant: "t", sub: "s" }, key, {
       type: "user_message",
       text: "round-trips",
     });
@@ -307,7 +307,7 @@ describe("e2e-crypto-browser spec conformance", () => {
       (await generateX25519KeyPair()).privateKey,
       (await generateX25519KeyPair()).publicKeyB64url,
     );
-    const wire = sealMessage({ agentId: "a", tenant: "t", sub: "s" }, key, { type: "user_message", text: "x" });
+    const wire = sealMessage({ accountId: "a", tenant: "t", sub: "s" }, key, { type: "user_message", text: "x" });
     expect(openMessage(wire, otherKey)).toBeNull();
   });
 });

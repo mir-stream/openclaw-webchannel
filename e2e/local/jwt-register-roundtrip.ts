@@ -22,7 +22,7 @@ const PRIV_PATH = process.env.WEBCHANNEL_RS256_PRIVATE ?? "/tmp/oc-e2e/rs256-pri
 
 const ISS = "https://e2e-issuer.test";
 const PEER_ID = "web-jwt-peer";
-const AGENT_ID = "default-agent";
+const ACCOUNT_ID = "default";
 const TENANT = "default-tenant";
 const KID = "webchannel-e2e-rs256";
 
@@ -61,7 +61,7 @@ const devicePopPublicKey = edPubJwk.x;
 const claims = buildBootstrapClaims({
   iss: ISS,
   peerId: PEER_ID,
-  agentId: AGENT_ID,
+  accountId: ACCOUNT_ID,
   tenant: TENANT,
   deviceX25519PublicKey,
   devicePopPublicKey,
@@ -79,7 +79,7 @@ const jwt = `${signingInput}.${b64url(sig)}`;
 const client = new WebChannelNatsClient({
   url: NATS,
   jwt,
-  agentId: AGENT_ID,
+  accountId: ACCOUNT_ID,
   tenant: TENANT,
   peerId: PEER_ID,
   registration: {

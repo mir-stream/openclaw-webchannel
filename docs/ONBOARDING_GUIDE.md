@@ -20,7 +20,7 @@ device flow against your own issuer.
    ▼                                              ▼
  ┌─────────────────────────────────────────────────────────┐
  │   Synadia / NGS  (wss://connect.ngs.global:443)          │  ← relay sees ciphertext only
- │   subjects: webchannel.{tenant}.{agentId}.{peerId}.*     │
+ │   subjects: webchannel.{tenant}.{accountId}.{peerId}.*   │
  └─────────────────────────────────────────────────────────┘
    ▲                                              ▲
    │ /test/nats-user, /test/bootstrap-jwt         │ /api/enroll, /api/poll, /.well-known/jwks.json
@@ -32,12 +32,16 @@ Three identities, three different sources (this trips everyone up):
 | Token | Who picks it | Enforced by |
 |---|---|---|
 | `tenant` | agent config; **sent at enrollment** | NATS creds permission `webchannel.{tenant}.>` (cross-tenant isolation) |
-| `agentId` | agent config (a label) | nothing at the NATS layer — addressing only; admission JWT `aud` if register-hop |
+| `accountId` | the `--account` flag of `channels add` (the deployment/wire identity) | NATS subject addressing; admission JWT `aud` on the register hop |
 | `peerId` | the **browser**, per session | — |
 
-> The agent **subscribes** on `{tenant}/{agentId}`; the browser **sends** to the same
-> `{tenant}/{agentId}` it is told. They must match. Security rests on **tenant creds +
-> E2E encryption + handshake/allowlist**, not on `agentId`.
+> The agent **subscribes** on `{tenant}/{accountId}`; the browser **sends** to the same
+> `{tenant}/{accountId}` it is told. They must match. Security rests on **tenant creds +
+> E2E encryption + handshake/allowlist**, not on `accountId`.
+>
+> The **handling agent is decoupled** from the wire identity (telegram-like): the
+> `accountId` is the on-wire/admission identity, and which OpenClaw agent answers is a
+> separate `openclaw agents bind --bind webchannel:<accountId> --agent <agent>` concern.
 
 ---
 
@@ -123,9 +127,11 @@ docker exec <container> openclaw plugins install --link /root/plugin
 
 ## 4. Configure the channel
 
-WebChannel is a **plugin channel**, not built-in — there is no `openclaw channels add`
-for it. Configure it once with `openclaw config patch` (objects deep-merge, arrays/scalars
-replace, `null` deletes):
+WebChannel is a **plugin channel**. Configure its connection/auth once with
+`openclaw config patch` (objects deep-merge, arrays/scalars replace, `null` deletes), then
+acquire NATS credentials **at config time** with `openclaw channels add` (see the next
+subsection). Credential acquisition no longer happens at `gateway run` — `gateway run` only
+**consumes** persisted per-account creds.
 
 ```bash
 openclaw config patch --stdin <<'JSON'
@@ -167,18 +173,62 @@ openclaw config get channels.webchannel    # verify
 > stays as-is (it is a JWT claim string, not an address). NATS is public so its URL is
 > unchanged.
 
+### Acquire credentials at config time (`openclaw channels add`)
+
+The device flow runs during **`channels add`**, not at `gateway run`. The `--account <id>`
+value **is** the wire identity (the `accountId`): omit `--account` for the `"default"`
+account, or pass `--account <id>` for a named account (creds persist to
+`~/.openclaw-webchannel/<account>/credentials.json`). There is **no `--token`** anymore —
+the handling agent is bound separately (next step).
+
+```bash
+openclaw channels add --channel webchannel \
+  --account  default-agent \           # → accountId (the wire identity)
+  --base-url http://127.0.0.1:3951 \   # → saas.baseUrl (SaaS issuer)
+  --url      default-tenant            # → tenant
+# runs the RFC 8628 device flow headlessly (prints the user_code), persists creds, exits 0
+```
+
+Then bind the handling agent to that account (telegram-like — decoupled from the wire):
+
+```bash
+openclaw agents bind --bind webchannel:default-agent --agent my-agent
+```
+
+**CLI flag mapping (important).** WebChannel is an installed (non-bundled) plugin, so
+OpenClaw's `channels add` does not register custom `--saas-base-url`/`--tenant` flags today;
+the plugin maps the **generic** flags onto its identity fields:
+
+| Generic flag | Maps to | Config location written |
+|---|---|---|
+| `--account <id>` | `accountId` (wire identity) | `channels.webchannel.accounts.<id>` (the account key) |
+| `--base-url <url>` | `saasBaseUrl` | `channels.webchannel[.accounts.<id>].saas.baseUrl` |
+| `--url <tenant>` | `tenant` | `channels.webchannel[.accounts.<id>].tenant` |
+
+`channels add` echoes the **resolved** identity before enrolling
+(`[webchannel] account "<id>" resolved acquisition identity: tenant=… accountId=… saasBaseUrl=…`)
+so a mis-mapped flag is visible. The dedicated `--saas-base-url`/`--tenant`
+flags are declared in the manifest and will work automatically if/when the host registers
+non-bundled `cliAddOptions`.
+
+**Unambiguous alternative — acquisition env (legacy):** when there is **no** `channels.webchannel`
+config at all, `WEBCHANNEL_TENANT` / `WEBCHANNEL_SAAS_BASE_URL` synthesize the `"default"`
+account's identity. Once any webchannel config exists, these are **ignored** (config wins)
+with a one-time deprecation warning. (Connection/static env —
+`WEBCHANNEL_NATS_URL`/`_USER_JWT`/`_USER_SEED`/`_CREDS`/`_DEV_OPEN` — keep their runtime meaning.)
+
+Approve the device code exactly as in §5; on success creds are persisted and `channels add`
+exits 0. `gateway run` then consumes them with no re-approval.
+
 ---
 
 ## 5. Pair the agent (RFC 8628 device flow)
 
-```bash
-openclaw gateway run        # NO env needed — connection config lives in config (step 4)
-```
-
-The plugin logs a connection target and a pairing prompt:
+Pairing runs during **`channels add`** (§4), which prints the pairing prompt:
 
 ```
-[webchannel] NATS credential source: enrolled → wss://connect.ngs.global:443
+[webchannel] account "default" resolved acquisition identity: tenant=default-tenant, accountId=default-agent, saasBaseUrl=http://127.0.0.1:3951
+[webchannel] Acquiring credentials for account "default" (tenant=default-tenant, saas=http://127.0.0.1:3951)
 [enrollment] User code: ABCD-EFGH
 [enrollment] Verification URI: http://127.0.0.1:3951/enroll?user_code=ABCD-EFGH
 [enrollment] Polling for approval...
@@ -195,20 +245,39 @@ The plugin logs a connection target and a pairing prompt:
 - **browser:** open the **full Verification URI** (with `?user_code=…`) and click **Approve**.
   Opening bare `/enroll` shows an unfilled page — don't. Hard-refresh if you opened it before.
 
-Success:
+Success (acquisition persists creds; it does **not** open the NATS connection — that happens
+later at `gateway run`):
 
 ```
 [enrollment] ✓ Enrollment complete!
-[connection] ✓ Connected to NATS
-[webchannel] ✓ Encrypted NATS channel created
+[webchannel] ✓ Credentials acquired for account "default" → ~/.openclaw-webchannel/default/credentials.json (peerId=…)
 ```
 
-Creds are cached at `~/.openclaw-webchannel/credentials.json` (mode 0600) — **restarts
-reconnect with no re-approval**.
+Creds are cached at `~/.openclaw-webchannel/<account>/credentials.json` (mode 0600;
+`"default"` also falls back to the legacy `~/.openclaw-webchannel/credentials.json` if
+present). Then start the gateway — it **consumes** the persisted creds, never re-enrolls:
+
+```bash
+openclaw gateway run        # connection config lives in config (§4); creds were acquired in §4
+```
+
+```
+[webchannel] NATS credential source: enrolled → wss://connect.ngs.global:443
+[webchannel] ✓ Connected to NATS
+[webchannel] ✓ Encrypted NATS channel created
+[webchannel] ✓ NATS mode plugin registered
+```
+
+> **No more runtime enroll / "Polling…" noise.** Because acquisition moved to `channels add`
+> (가-1), `gateway run` no longer starts an enroll loop — the duplicate-enroll "Polling for
+> approval…" noise from `registerFull` pre-warming is gone. If an account's creds are
+> **missing/expired**, that account is skipped with an actionable log
+> (`account "<id>" has no enrolled credentials — … Run: openclaw channels add --channel
+> webchannel --account <id>`); the gateway, other accounts, and other channels stay up.
 
 > The connection (the NATS socket) is held for as long as `gateway run` runs — exactly
 > like a Telegram channel holds its connection while the gateway is up. Config = *where/how*;
-> pairing = *one-time*; connecting = *every run*.
+> pairing = *one-time at `channels add`*; connecting = *every run*.
 
 ---
 
@@ -222,7 +291,7 @@ WEBCHANNEL_NATS_URL='wss://connect.ngs.global:443' \
 WEBCHANNEL_ISSUER_URL='http://127.0.0.1:3951' \
 WEBCHANNEL_GW_URL='http://127.0.0.1:18789' \
 WEBCHANNEL_TENANT='default-tenant' \
-WEBCHANNEL_AGENT_ID='default-agent' \
+WEBCHANNEL_ACCOUNT_ID='default-agent' \
 WEBCHANNEL_PEER_ID='web-human-1' \
 WEBCHANNEL_PAGE_PORT='19393' \
 node e2e/local/demo-server.mjs
@@ -231,7 +300,7 @@ node e2e/local/demo-server.mjs
 
 The page: generates keys → mints NATS creds from `issuer/test/nats-user` → mints a PoP
 bootstrap JWT from `issuer/test/bootstrap-jwt` → connects to NATS → (register hop) → chat.
-Use the **same `tenant`+`agentId`** as the agent.
+Use the **same `tenant`+`accountId`** as the agent.
 
 ### Two admission models
 
@@ -286,6 +355,7 @@ The `#token=` fragment auto-authenticates; a missing/wrong token → `AUTH_RATE_
 | `NATS connection failed (fetch failed)` | wrong `saasBaseUrl` / issuer down | issuer up? container → `host.docker.internal`, not `127.0.0.1` |
 | approve → `Enrollment not found … {{USER_CODE}}` | opened bare `/enroll`, or cached approval page | open the full `?user_code=…` URL / hard-refresh / curl `/approve` |
 | polls re-enroll every ~5s, never pairs | client treated `authorization_pending` (HTTP 400) as a hard error | ensure poll handles the 400 `{error}` body (don't throw) |
+| `Polling for approval...` keeps printing **after** a successful connect | pre-warm ran `registerFull` more than once → a duplicate enroll loop polling an unapproved code | harmless (one channel binds; no double-processing) — self-terminates at ~600s expiry; known gap, needs an idempotency guard |
 | register `/challenge` → 404 + CORS | `registerHttpRoute` no-op on 2026.6.10 | use `admission: auto` (no register hop) |
 | dashboard `AUTH_RATE_LIMITED` / `token mismatch` | no/!wrong `#token=`, or hitting a different gateway on the same port | use the right gateway's token; resolve the `:18789` collision (§7) |
 
@@ -296,9 +366,11 @@ The `#token=` fragment auto-authenticates; a missing/wrong token → `AUTH_RATE_
 **Env overrides** (take precedence over config; keep secrets out of committed config):
 `WEBCHANNEL_NATS_URL`, `WEBCHANNEL_NATS_USER_JWT`, `WEBCHANNEL_NATS_USER_SEED`,
 `WEBCHANNEL_NATS_CREDS`, `WEBCHANNEL_NATS_DEV_OPEN=1`, `WEBCHANNEL_SAAS_BASE_URL`,
-`WEBCHANNEL_TENANT`, `WEBCHANNEL_AGENT_ID`.
+`WEBCHANNEL_TENANT`. (Acquisition no longer reads `WEBCHANNEL_AGENT_ID` — the wire identity
+is the `accountId`, set via `channels add --account <id>`; the demo browser server reads
+`WEBCHANNEL_ACCOUNT_ID`.)
 
-**Subjects:** `webchannel.{tenant}.{agentId}.{peerId}.{in,out,handshake}`
+**Subjects:** `webchannel.{tenant}.{accountId}.{peerId}.{in,out,handshake}`
 (agent subscribes `…*.in`/`…*.handshake`, publishes `…*.out`; browser is the mirror).
 
 **Credential modes** (`nats.credentials.mode`): `enrolled` (SaaS device flow, default) ·

@@ -60,7 +60,7 @@ const TEST_KEY = new Uint8Array(32).fill(0x42);
 
 /** A minimal valid routing object for test envelopes. */
 const TEST_ROUTING: EnvelopeRouting = {
-  agentId: "agent-abc123",
+  accountId: "agent-abc123",
   tenant: "tenant-xyz",
   sub: "user-42",
   messageId: "msg-uuid-0001",
@@ -148,7 +148,7 @@ describe("MessageEnvelope: serialized JSON has no plaintext content", () => {
     const serialized = serializeEnvelope(env).toString("utf8");
 
     // These routing fields should appear in the plaintext JSON.
-    expect(serialized).toContain(TEST_ROUTING.agentId);
+    expect(serialized).toContain(TEST_ROUTING.accountId);
     expect(serialized).toContain(TEST_ROUTING.tenant);
     expect(serialized).toContain(TEST_ROUTING.sub);
     expect(serialized).toContain(TEST_ROUTING.messageId);
@@ -227,7 +227,7 @@ describe("getEnvelopeRouting: plaintext routing fields require no key", () => {
     const env = encodeEnvelope(TEST_ROUTING, TEST_CONTENT, TEST_KEY);
     const routing = getEnvelopeRouting(env);
 
-    expect(routing.agentId).toBe(TEST_ROUTING.agentId);
+    expect(routing.accountId).toBe(TEST_ROUTING.accountId);
     expect(routing.tenant).toBe(TEST_ROUTING.tenant);
     expect(routing.sub).toBe(TEST_ROUTING.sub);
     expect(routing.messageId).toBe(TEST_ROUTING.messageId);
@@ -241,7 +241,7 @@ describe("getEnvelopeRouting: plaintext routing fields require no key", () => {
     const restored = deserializeEnvelope(wireBytes);
     const routing = getEnvelopeRouting(restored);
 
-    expect(routing.agentId).toBe(TEST_ROUTING.agentId);
+    expect(routing.accountId).toBe(TEST_ROUTING.accountId);
     expect(routing.sub).toBe(TEST_ROUTING.sub);
   });
 
@@ -267,7 +267,7 @@ describe("serializeEnvelope / deserializeEnvelope round-trip", () => {
     const restored = deserializeEnvelope(bytes);
 
     expect(restored.v).toBe(ENVELOPE_VERSION);
-    expect(restored.agentId).toBe(TEST_ROUTING.agentId);
+    expect(restored.accountId).toBe(TEST_ROUTING.accountId);
     expect(restored.tenant).toBe(TEST_ROUTING.tenant);
     expect(restored.sub).toBe(TEST_ROUTING.sub);
     expect(restored.messageId).toBe(TEST_ROUTING.messageId);
@@ -528,7 +528,7 @@ describe("deserializeEnvelope: content field validation", () => {
 
 describe("deserializeEnvelope: routing field validation", () => {
   const ROUTING_FIELDS = [
-    "agentId",
+    "accountId",
     "tenant",
     "sub",
     "messageId",
@@ -597,7 +597,7 @@ describe("Full E2E pipeline: X25519 → HKDF-SHA256 → envelope codec", () => {
     // Browser encodes a message.
     const message = "Secret conversation content!";
     const routing: EnvelopeRouting = {
-      agentId: "agent-007",
+      accountId: "agent-007",
       tenant: "acme",
       sub: "user-browser-1",
       messageId: "msg-full-pipeline-1",
@@ -764,7 +764,7 @@ describe("structural invariants", () => {
 
     // All expected top-level keys must be present.
     expect(keys.has("v")).toBe(true);
-    expect(keys.has("agentId")).toBe(true);
+    expect(keys.has("accountId")).toBe(true);
     expect(keys.has("tenant")).toBe(true);
     expect(keys.has("sub")).toBe(true);
     expect(keys.has("messageId")).toBe(true);
@@ -775,7 +775,7 @@ describe("structural invariants", () => {
     // No unexpected top-level keys (no content leaking to top level).
     const expected = new Set([
       "v",
-      "agentId",
+      "accountId",
       "tenant",
       "sub",
       "messageId",

@@ -27,7 +27,7 @@ export type RunDemoOptions = {
   issuerUrl: string;
   /** Gateway base URL serving the PoP register routes. */
   gwUrl: string;
-  agentId: string;
+  accountId: string;
   tenant: string;
   peerId: string;
 };
@@ -103,11 +103,18 @@ export async function runDemo(
   if (!credsRes.ok) {
     throw new Error(`nats-user failed: HTTP ${credsRes.status} ${await credsRes.text()}`);
   }
-  const { userJwt, userSeedRaw } = (await credsRes.json()) as {
+  const { userJwt, userSeedRaw, natsUrl: deliveredNatsUrl } = (await credsRes.json()) as {
     userJwt?: string;
     userSeedRaw?: string;
+    natsUrl?: string;
   };
   if (!userJwt || !userSeedRaw) throw new Error("nats-user response missing userJwt/userSeedRaw");
+
+  // The SaaS is the rendezvous authority: it returns the relay URL alongside the
+  // minted creds, so the browser dials where the SaaS says rather than a
+  // page-configured `opts.natsUrl` (now only a back-compat fallback). This is the
+  // web mirror of the enrolled plugin consuming `EnrollmentResult.natsUrl`.
+  const natsUrl = deliveredNatsUrl ?? opts.natsUrl;
 
   // 4. PoP bootstrap JWT (RS256, this issuer's trust chain) for the register hop.
   const bootRes = await fetch(`${opts.issuerUrl}/test/bootstrap-jwt`, {
@@ -115,7 +122,7 @@ export async function runDemo(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       tenant: opts.tenant,
-      agentId: opts.agentId,
+      accountId: opts.accountId,
       peerId: opts.peerId,
       deviceX25519PublicKey,
       devicePopPublicKey,
@@ -135,9 +142,9 @@ export async function runDemo(
   //    original register-hop path is used verbatim (backward compatible).
   //    Unlike runAllReal, we keep this client alive for the whole chat session.
   const clientOpts = {
-    url: opts.natsUrl,
+    url: natsUrl,
     jwt,
-    agentId: opts.agentId,
+    accountId: opts.accountId,
     tenant: opts.tenant,
     peerId,
     natsCredentials: { userJwt, userSeedRaw },

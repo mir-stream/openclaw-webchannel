@@ -13,7 +13,7 @@
  *       the MessageEnvelope (at-rest format identical to wire format) stores
  *       only nonce/ciphertext/tag inside `content`; no plaintext bytes at rest.
  *
- *   (c) Routing metadata fields (agentId/tenant/sub) remain readable in
+ *   (c) Routing metadata fields (accountId/tenant/sub) remain readable in
  *       plaintext — the relay operator can observe them (used for NATS subject
  *       routing / account isolation) but cannot read any content.
  *
@@ -184,7 +184,7 @@ class FakeNatsBroker {
 //
 // The relay operator can:
 //  • Subscribe to any subject and receive raw NatsMessage payloads.
-//  • Parse the envelope JSON and read routing metadata (agentId/tenant/sub).
+//  • Parse the envelope JSON and read routing metadata (accountId/tenant/sub).
 //  • Observe the ciphertext blob inside content.
 //
 // The relay operator CANNOT:
@@ -264,7 +264,7 @@ const SUBJECTS = {
 
 /** Plaintext routing metadata embedded in every envelope header. */
 const BASE_ROUTING: EnvelopeRouting = {
-  agentId:      "agent1",
+  accountId:      "agent1",
   tenant:       "tenant1",
   sub:          "user42",
   messageId:    "msg-opacity-base",
@@ -314,7 +314,7 @@ function assertRoutingIsPlaintext(
   routing: EnvelopeRouting,
   label: string,
 ): void {
-  expect(rawJson, `[${label}] agentId in plaintext`).toContain(routing.agentId);
+  expect(rawJson, `[${label}] accountId in plaintext`).toContain(routing.accountId);
   expect(rawJson, `[${label}] tenant in plaintext`).toContain(routing.tenant);
   expect(rawJson, `[${label}] sub in plaintext`).toContain(routing.sub);
   expect(rawJson, `[${label}] messageId in plaintext`).toContain(routing.messageId);
@@ -622,14 +622,14 @@ describe("Relay-opacity compliance (Sub-AC 3)", () => {
         expect(atRestJson, `[${label}] "sensitive stored" not at rest`).not.toContain("sensitive stored");
 
         // Routing metadata IS present at rest (needed for replay/pagination).
-        expect(atRestJson, `[${label}] agentId at rest`).toContain("agent1");
+        expect(atRestJson, `[${label}] accountId at rest`).toContain("agent1");
         expect(atRestJson, `[${label}] tenant at rest`).toContain("tenant1");
         expect(atRestJson, `[${label}] sub at rest`).toContain("user42");
         expect(atRestJson, `[${label}] messageId at rest`).toContain(`msg-atrest-${i + 1}`);
 
         // At-rest top-level keys are exactly the envelope schema keys.
         const storedKeys = new Set(Object.keys(stored));
-        const allowedKeys = new Set(["v", "agentId", "tenant", "sub", "messageId", "envelopeType", "ts", "content"]);
+        const allowedKeys = new Set(["v", "accountId", "tenant", "sub", "messageId", "envelopeType", "ts", "content"]);
         for (const k of storedKeys) {
           expect(allowedKeys.has(k), `[${label}] unexpected top-level at-rest key "${k}"`).toBe(true);
         }
@@ -640,7 +640,7 @@ describe("Relay-opacity compliance (Sub-AC 3)", () => {
   // ── Test 6: Routing metadata is plaintext-readable by the relay operator ──
 
   it(
-    "(c) routing metadata (agentId, tenant, sub, envelopeType) is plaintext-readable in all transit payloads",
+    "(c) routing metadata (accountId, tenant, sub, envelopeType) is plaintext-readable in all transit payloads",
     async () => {
       const broker = new FakeNatsBroker();
       brokers.push(broker);
@@ -664,7 +664,7 @@ describe("Relay-opacity compliance (Sub-AC 3)", () => {
       for (let i = 0; i < cases.length; i++) {
         const { type, subject, sender } = cases[i]!;
         const routing: EnvelopeRouting = {
-          agentId: "agent1", tenant: "tenant1", sub: "user42",
+          accountId: "agent1", tenant: "tenant1", sub: "user42",
           messageId: `msg-routing-${i + 1}`,
           envelopeType: type,
           ts: 1_718_000_000_000 + i,
@@ -687,7 +687,7 @@ describe("Relay-opacity compliance (Sub-AC 3)", () => {
 
         // (c) All routing metadata is plaintext-readable.
         assertRoutingIsPlaintext(rawJson, {
-          agentId: "agent1", tenant: "tenant1", sub: "user42",
+          accountId: "agent1", tenant: "tenant1", sub: "user42",
           messageId: `msg-routing-${i + 1}`,
           envelopeType: cases[i]!.type,
           ts: 1_718_000_000_000 + i,
@@ -888,7 +888,7 @@ describe("Relay-opacity compliance (Sub-AC 3)", () => {
       const { rawJson, parsed } = rig.relay.captured[0]!;
 
       // Relay operator CAN read routing metadata (it's plaintext).
-      expect(parsed!.agentId).toBe("agent1");
+      expect(parsed!.accountId).toBe("agent1");
       expect(parsed!.tenant).toBe("tenant1");
       expect(parsed!.sub).toBe("user42");
 

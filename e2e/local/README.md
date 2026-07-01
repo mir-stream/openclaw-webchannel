@@ -25,6 +25,12 @@ registration uses a wildcard subscription instead of the HTTP register hop (see 
 Your real `~/.openclaw` and gateway are **never touched** — everything runs under an isolated
 `OPENCLAW_HOME`.
 
+> **Want to actually chat with the agent?** `./run-demo.sh` is the **single interactive demo** —
+> it boots this same enrolled-NATS topology against your real model/provider config and serves a
+> browser chat page (Ctrl+C tears it down). For the split host(Mac)/container variant see
+> [`../../docs/SPLIT_DEMO.md`](../../docs/SPLIT_DEMO.md). The harnesses below are headless
+> one-shot proofs, not the interactive demo.
+
 ## Files
 
 | File | Role |
@@ -66,13 +72,13 @@ node e2e/local/echo-openai-server.mjs 18900 &
 #    - channels.webchannel = { auth: { strategy: "hmac-ticket", ticketSecret: { env: "WEBCHANNEL_TICKET_SECRET" } },
 #        dmSecurity: "allowlist", allowFrom: ["web-anon"] }     # NOTE: no `nats`/`encryption` keys — schema rejects them
 #    - plugins.load.paths = ["<repo>/packages/plugin"]
-#    Point the webchannel plugin entry at index-nats: temporarily set
-#    packages/plugin/package.json  openclaw.extensions = ["./index-nats.ts"]  (revert after).
+#    The plugin entry is ALREADY index-nats.ts by default
+#    (packages/plugin/package.json openclaw.extensions = ["./index-nats.ts"]) — nothing to swap.
 
 # 4. boot the isolated gateway in dev/open-NATS mode (env-driven — see the contract below)
 OPENCLAW_HOME="$OCH" WEBCHANNEL_TICKET_SECRET=e2e-ticket-secret OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_DEV_OPEN=1 WEBCHANNEL_NATS_URL=ws://127.0.0.1:18222 \
-  WEBCHANNEL_TENANT=default-tenant WEBCHANNEL_AGENT_ID=default-agent \
+  WEBCHANNEL_TENANT=default-tenant WEBCHANNEL_ACCOUNT_ID=default-agent \
   node_modules/.bin/openclaw gateway --port 18799 --force &
 # wait for: "[webchannel] ✓ NATS mode plugin registered"
 
@@ -172,7 +178,7 @@ against the plugin schema and rejects unknown keys (so you cannot put `nats`/`en
 |---|---|
 | `WEBCHANNEL_NATS_DEV_OPEN=1` | enable the dev/open-NATS path (no enrollment, no JWT) |
 | `WEBCHANNEL_NATS_URL` | nats-server ws URL (default `ws://127.0.0.1:4222`) |
-| `WEBCHANNEL_TENANT` / `WEBCHANNEL_AGENT_ID` | subject-namespace fields (must match the browser client) |
+| `WEBCHANNEL_TENANT` / `WEBCHANNEL_ACCOUNT_ID` | subject-namespace fields (`accountId` = the wire identity; must match the browser client) |
 
 Encryption stays **on** (encrypt-by-construction default); the relay only ever sees ciphertext.
 

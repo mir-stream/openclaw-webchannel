@@ -351,3 +351,36 @@ export async function verifyJwt(
   }
   return identity;
 }
+/**
+ * Decode a JWT's `aud` claim WITHOUT verifying the signature (가-2 Cycle 2).
+ *
+ * Returns the audiences as a normalized string array (`aud` may be a string or
+ * an array per RFC 7519). Returns `[]` on any decode failure or a missing/
+ * malformed `aud`.
+ *
+ * ── Why an UNVERIFIED peek is safe here ─────────────────────────────────────
+ * The single `/webchannel/nats/register*` route serves multiple accounts; it
+ * must pick WHICH account's verifier to run, and each account's verifier checks
+ * a different expected `aud` (= that account's accountId). This helper only
+ * ROUTES the request to a candidate account. The selected account's verifier
+ * then performs the full, signature-checked verification (issuer + `aud` +
+ * signature + exp), so a forged/altered `aud` can at most select an account whose
+ * verifier will then REJECT the token. It never grants trust on its own.
+ */
+export function peekUnverifiedJwtAudiences(token: unknown): string[] {
+  if (typeof token !== "string" || token.length === 0) return [];
+  const parts = token.split(".");
+  const payloadSegment = parts[1];
+  if (parts.length !== 3 || !payloadSegment) return [];
+  try {
+    const decoded = base64UrlDecode(payloadSegment);
+    const parsed = JSON.parse(new TextDecoder().decode(decoded)) as unknown;
+    if (!parsed || typeof parsed !== "object") return [];
+    const aud = (parsed as Record<string, unknown>)["aud"];
+    if (typeof aud === "string") return aud.length > 0 ? [aud] : [];
+    if (Array.isArray(aud)) return aud.filter((a): a is string => typeof a === "string" && a.length > 0);
+    return [];
+  } catch {
+    return [];
+  }
+}

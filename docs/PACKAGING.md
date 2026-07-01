@@ -84,7 +84,7 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 
 ### B. 플러그인 패키지 → publishable  ⬜ (대부분 미완)
 - ⬜ `"private"`/semver — 플러그인 `package.json`은 아직 `private:true`, `0.0.0`.
-- ⬜ 빌드: `openclaw.extensions`가 아직 `./index.ts`(TS 소스). 게이트웨이가 소스 직접 로드 중이라 동작하지만, 출시엔 `dist/` 빌드 + `files`.
+- ⬜ 빌드: `openclaw.extensions`가 아직 TS 소스. 게이트웨이가 소스 직접 로드 중이라 동작하지만, 출시엔 `dist/` 빌드 + `files`. **(superseded — entry는 이제 `./index-nats.ts`가 기본값이고 `./index.ts`(Gateway-WS)는 legacy dev-only; `STATUS.md` 참조.)**
 - ⬜ **`openclaw` peerDependency 선언**(여전히 미선언) + 테스트 버전(`v2026.6.6`).
 - ⬜ ESM `exports`/`.d.ts`.
 - ○ SDK 접점 adapter 격리.

@@ -93,7 +93,7 @@ describe("NatsClient — optional bootstrap jwt", () => {
     const userSeedRaw = await makeUserSeedRaw();
     const client = new NatsClient({
       url: "ws://127.0.0.1:4222",
-      agentId: "a",
+      accountId: "a",
       tenant: "t",
       peerId: "p",
       // No `jwt` field at all — BYO-NATS.
@@ -116,7 +116,7 @@ describe("NatsClient — optional bootstrap jwt", () => {
     FakeNatsWS.sendInfo = false; // no NKEY auth → CONNECT on open
     const client = new NatsClient({
       url: "ws://127.0.0.1:4222",
-      agentId: "a",
+      accountId: "a",
       tenant: "t",
       peerId: "p",
       // No `jwt`, no `natsCredentials`.
@@ -140,7 +140,7 @@ describe("NatsClient — optional bootstrap jwt", () => {
     const client = new NatsClient({
       url: "ws://127.0.0.1:4222",
       jwt: "bootstrap-jwt",
-      agentId: "a",
+      accountId: "a",
       tenant: "t",
       peerId: "p",
     });
@@ -166,7 +166,7 @@ describe("WebChannelNatsClient — registration without a bootstrap jwt", () => 
 
     const client = new WebChannelNatsClient({
       url: "ws://127.0.0.1:4222",
-      agentId: "a",
+      accountId: "a",
       tenant: "t",
       peerId: "p",
       // NO bootstrap `jwt`, but `registration` is present → guard must trip.

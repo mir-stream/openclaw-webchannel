@@ -16,7 +16,7 @@
  */
 import { describe, it, expect } from "vitest";
 
-import { resolveAdmissionMode } from "./nats-admission.js";
+import { resolveAdmissionMode, admissionServingPlan } from "./nats-admission.js";
 
 describe("resolveAdmissionMode", () => {
   it("explicit override always wins", () => {
@@ -59,5 +59,67 @@ describe("resolveAdmissionMode", () => {
     expect(resolveAdmissionMode({ registerHopAvailable: true, authStrategy: "jwt" })).toBe("register-hop");
     // devOpen (open) + hmac → auto (wildcard auto-register convenience).
     expect(resolveAdmissionMode({ registerHopAvailable: true, authStrategy: "hmac-ticket" })).toBe("auto");
+  });
+});
+
+/**
+ * Serving-plan tests — the structural consequence of the admission decision that
+ * the per-account build loop in index-nats.ts consumes.
+ *
+ * These lock the fix: the `channels.webchannel.auth` verifier and the register
+ * route's `aud → account` dispatch entry are meaningful ONLY for a `register-hop`
+ * account. A pure-`auto` account is served (wildcard subscribed, dispatcher
+ * wired) with NO verifier and NO aud mapping — never skipped for "missing auth".
+ */
+describe("admissionServingPlan", () => {
+  it("INVARIANT 1 — auto ⇒ wildcard subscribed, NO verifier built, NO aud mapping", () => {
+    // An enrolled/open account whose admission is `auto` is served purely via the
+    // NATS wildcard + handshake. It must NOT require or build the auth verifier,
+    // and must NOT claim an aud dispatch entry.
+    expect(admissionServingPlan("auto")).toEqual({
+      subscribeWildcard: true,
+      buildVerifier: false,
+      populateAudMapping: false,
+    });
+  });
+
+  it("INVARIANT 2 — register-hop ⇒ verifier built + aud mapping populated, NO wildcard", () => {
+    // A jwt register-hop account keeps the verifier + register-route dispatch
+    // exactly as before (peers gated by the HTTP hop, not the wildcard).
+    expect(admissionServingPlan("register-hop")).toEqual({
+      subscribeWildcard: false,
+      buildVerifier: true,
+      populateAudMapping: true,
+    });
+  });
+
+  it("INVARIANT 4 — no auth.strategy + no nats.admission ⇒ auto ⇒ served, no verifier", () => {
+    // An account with neither `auth` nor `nats.admission` set: resolveAdmissionMode
+    // returns `auto`, and its serving plan builds no verifier and subscribes the
+    // wildcard — i.e. it IS served end-to-end without any auth ceremony.
+    const admission = resolveAdmissionMode({
+      authStrategy: undefined,
+      registerHopAvailable: true, // enrolled/open: a hop is viable but unused (no jwt strategy)
+      explicitOverride: undefined,
+    });
+    expect(admission).toBe("auto");
+    const plan = admissionServingPlan(admission);
+    expect(plan.buildVerifier).toBe(false);
+    expect(plan.subscribeWildcard).toBe(true);
+    expect(plan.populateAudMapping).toBe(false);
+  });
+
+  it("INVARIANT 3 — a jwt account with a viable hop stays register-hop (verifier IS required)", () => {
+    // A misconfigured jwt account still resolves to register-hop, so buildVerifier
+    // is true → resolveVerifier runs (and throws → the account is skipped, loud).
+    // The verifier is skipped only for a GENUINE `auto` decision, never as a
+    // catch-all for verifier errors.
+    const admission = resolveAdmissionMode({
+      authStrategy: "jwt",
+      registerHopAvailable: true,
+      explicitOverride: undefined,
+    });
+    expect(admission).toBe("register-hop");
+    expect(admissionServingPlan(admission).buildVerifier).toBe(true);
   });
 });

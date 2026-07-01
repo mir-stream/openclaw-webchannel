@@ -201,6 +201,14 @@ export type DeviceFlowOptions = {
   bootstrapUrl: string;
 
   /**
+   * NATS WebSocket URL the enrolled plugin must dial. Delivered to the plugin in
+   * the `EnrollmentResult` so the relay location travels with the minted creds
+   * (the SaaS is the rendezvous authority — the URL is not plugin-side config).
+   * Example: "wss://nats.saas.com"
+   */
+  natsUrl: string;
+
+  /**
    * Enrollment store (defaults to in-memory).
    * Use a persistent store (Redis, DB) for production deployments.
    */
@@ -239,11 +247,11 @@ export class DeviceFlowEnrollment {
    * The plugin polls /poll until the operator approves the enrollment.
    */
   async enroll(request: EnrollmentRequest): Promise<EnrollmentResponse> {
-    // Reject tenant/agentId tokens that would break the NATS subject hierarchy
+    // Reject tenant/accountId tokens that would break the NATS subject hierarchy
     // or cross tenant boundaries before they are persisted or used in a grant.
     assertValidSubjectToken(request.tenant, "tenant");
-    if (request.agentId !== undefined) {
-      assertValidSubjectToken(request.agentId, "agentId");
+    if (request.accountId !== undefined) {
+      assertValidSubjectToken(request.accountId, "accountId");
     }
     const device_code = await this.generateDeviceCode();
     const user_code = this.generateUserCode();
@@ -254,7 +262,7 @@ export class DeviceFlowEnrollment {
       device_code,
       user_code,
       agentPublicKey: request.agentPublicKey,
-      agentId: request.agentId,
+      accountId: request.accountId,
       tenant: request.tenant,
       createdAt: now,
       expiresAt,
@@ -313,6 +321,7 @@ export class DeviceFlowEnrollment {
         peerId: enrollment.peerId,
         jwksUrl: this.options.jwksUrl,
         bootstrapUrl: this.options.bootstrapUrl,
+        natsUrl: this.options.natsUrl,
       };
     }
 
@@ -353,6 +362,7 @@ export class DeviceFlowEnrollment {
       peerId,
       jwksUrl: this.options.jwksUrl,
       bootstrapUrl: this.options.bootstrapUrl,
+      natsUrl: this.options.natsUrl,
     };
   }
 
@@ -435,7 +445,7 @@ export class DeviceFlowEnrollment {
     //     Synadia's nats-server.
     //
     // Tenant scope `webchannel.{tenant}.>` covers the live per-peer channel
-    // subjects `webchannel.{tenant}.{agentId}.{peerId}.{in,out,handshake}` (see
+    // subjects `webchannel.{tenant}.{accountId}.{peerId}.{in,out,handshake}` (see
     // packages/plugin/src/nats-channel.ts) while preserving cross-tenant
     // isolation. Matches e2e/enrolled-jwt-roundtrip.test.ts.
     const minted = await mintNatsUserCreds({

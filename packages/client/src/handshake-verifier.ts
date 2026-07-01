@@ -28,7 +28,7 @@
  * Wire format
  * ───────────
  * The `handshake_hello` message is published to a per-user NATS subject
- * (e.g. `chat.<tenant>.<agentId>.<userId>.handshake`).  Routing metadata
+ * (e.g. `chat.<tenant>.<accountId>.<userId>.handshake`).  Routing metadata
  * (peerId, version) is plaintext; the key material (agentPublicKey,
  * devicePublicKey) is the UNTRUSTED input that this module validates against
  * the TRUSTED SaaS-pinned values.
@@ -86,7 +86,7 @@ export class HandshakeMitmError extends Error {
  * are the UNTRUSTED inputs that the receiver MUST validate against SaaS-pinned
  * values before trusting.
  *
- * Subject convention: `chat.<tenant>.<agentId>.<userId>.handshake`
+ * Subject convention: `chat.<tenant>.<accountId>.<userId>.handshake`
  * (exact subject grammar is deferred to the operator configuration layer).
  */
 export type HandshakeHelloMessage = {

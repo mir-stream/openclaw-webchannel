@@ -186,6 +186,7 @@ const enrollment = new DeviceFlowEnrollment({
   saasBaseUrl: SAAS_BASE_URL,
   jwksUrl: `${SAAS_BASE_URL}/.well-known/jwks.json`,
   bootstrapUrl: `${SAAS_BASE_URL}/bootstrap`,
+  natsUrl: NATS_URL,
   expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 5),
   store: enrollmentStore,
@@ -352,7 +353,7 @@ function fallbackApprovalTemplate(userCode?: string): string {
         if (result.success) {
           statusEl.className = "approved";
           statusEl.innerHTML = "✓ Enrollment Approved!<br><br>" +
-            "Plugin: " + result.agentId + "<br>" +
+            "Plugin: " + result.accountId + "<br>" +
             "Tenant: " + result.tenant + "<br>" +
             "Peer ID: " + result.peerId;
         } else {
@@ -446,12 +447,12 @@ const server = createServer(async (req, res) => {
           return;
         }
 
-        // Reject tenant/agentId that would break the NATS subject hierarchy or
+        // Reject tenant/accountId that would break the NATS subject hierarchy or
         // cross tenant boundaries (subject-injection guard) — 400, not 500.
         try {
           assertValidSubjectToken(enrollRequest.tenant, "tenant");
-          if (enrollRequest.agentId !== undefined) {
-            assertValidSubjectToken(enrollRequest.agentId, "agentId");
+          if (enrollRequest.accountId !== undefined) {
+            assertValidSubjectToken(enrollRequest.accountId, "accountId");
           }
         } catch (err) {
           sendJson(res, { error: (err as Error).message }, 400);
@@ -550,7 +551,7 @@ const server = createServer(async (req, res) => {
                   success: true,
                   peerId: result.peerId,
                   tenant: enrollment?.tenant,
-                  agentId: enrollment?.agentId,
+                  accountId: enrollment?.accountId,
                 });
               });
             } else {
@@ -637,7 +638,10 @@ const server = createServer(async (req, res) => {
         })
           .then((creds) => {
             console.log(`[test/nats-user] minted ${role ?? "browser"} creds for tenant=${tenant}`);
-            sendJson(res, creds);
+            // The relay URL travels WITH the minted creds (SaaS = rendezvous
+            // authority) so the browser dials where the SaaS says, not a
+            // page-configured URL. Mirrors the enrolled plugin's EnrollmentResult.
+            sendJson(res, { ...creds, natsUrl: NATS_URL });
           })
           .catch((err) => {
             console.error("[test/nats-user] Error:", err);
@@ -660,17 +664,17 @@ const server = createServer(async (req, res) => {
           sendJson(res, { error: "Invalid JSON body" }, 400);
           return;
         }
-        const { tenant, agentId, peerId, deviceX25519PublicKey, devicePopPublicKey } = body as {
+        const { tenant, accountId, peerId, deviceX25519PublicKey, devicePopPublicKey } = body as {
           tenant?: string;
-          agentId?: string;
+          accountId?: string;
           peerId?: string;
           deviceX25519PublicKey?: string;
           devicePopPublicKey?: string;
         };
-        if (!tenant || !agentId || !peerId || !deviceX25519PublicKey) {
+        if (!tenant || !accountId || !peerId || !deviceX25519PublicKey) {
           sendJson(
             res,
-            { error: "Missing required fields: tenant, agentId, peerId, deviceX25519PublicKey" },
+            { error: "Missing required fields: tenant, accountId, peerId, deviceX25519PublicKey" },
             400,
           );
           return;
@@ -680,7 +684,7 @@ const server = createServer(async (req, res) => {
           claims = buildBootstrapClaims({
             iss: SAAS_ISSUER,
             peerId,
-            agentId,
+            accountId,
             tenant,
             deviceX25519PublicKey,
             devicePopPublicKey,

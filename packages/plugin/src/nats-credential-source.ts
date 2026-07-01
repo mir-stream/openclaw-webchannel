@@ -102,7 +102,7 @@ export type NatsCredentialSource =
       url: string;
       saasBaseUrl: string;
       tenant: string;
-      agentId: string;
+      accountId: string;
     };
 
 // ---------------------------------------------------------------------------
@@ -122,9 +122,9 @@ export type ResolveNatsCredentialSourceInput = {
    *   let the resolver layer env + the `credentials.saasBaseUrl` field on top.
    */
   saasBaseUrl?: string;
-  /** Tenant + agent id (enrolled mode). */
+  /** Tenant + account id (enrolled mode; accountId is the wire identity). */
   tenant: string;
-  agentId: string;
+  accountId: string;
   /** Env bag (defaults to `process.env`). Injectable for tests. */
   env?: Record<string, string | undefined>;
   /** File reader for `.creds` files (defaults to `fs.readFileSync`). Injectable. */
@@ -321,7 +321,7 @@ export function resolveNatsCredentialSource(
     url,
     saasBaseUrl,
     tenant: input.tenant,
-    agentId: input.agentId,
+    accountId: input.accountId,
   };
 }
 
@@ -402,7 +402,7 @@ export async function connectNatsCredentialSource(
         saasPollUrl: `${source.saasBaseUrl}/api/poll`,
         natsUrl: source.url,
         tenant: source.tenant,
-        agentId: source.agentId,
+        accountId: source.accountId,
         displayInstructions: true,
       });
       return { transport: enrolled.transport, enrolled };

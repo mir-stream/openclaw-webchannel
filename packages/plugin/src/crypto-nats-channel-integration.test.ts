@@ -287,7 +287,7 @@ const SUBJECTS = {
 
 /** Stable routing defaults for the test rig. */
 const ROUTING_DEFAULTS = {
-  agentId: "agent1",
+  accountId: "agent1",
   tenant:  "tenant1",
   sub:     "user42",
 } as const;
@@ -404,7 +404,7 @@ describe("CryptoNatsChannel: E2E crypto integration over NATS-WS (Sub-AC 2)", ()
       assertEnvelopeIsOpaque(parsed, "test-1");
 
       // ── Assertion C: routing metadata IS present (plaintext per design) ───────
-      expect(rawJson, "agentId must be in plaintext").toContain("agent1");
+      expect(rawJson, "accountId must be in plaintext").toContain("agent1");
       expect(rawJson, "tenant must be in plaintext").toContain("tenant1");
       expect(rawJson, "sub must be in plaintext").toContain("user42");
       expect(rawJson, "envelopeType must be in plaintext").toContain("conversation");
@@ -450,7 +450,7 @@ describe("CryptoNatsChannel: E2E crypto integration over NATS-WS (Sub-AC 2)", ()
       expect(decryptedText, "decrypted plaintext must match original").toBe(plaintextSent);
 
       // Routing metadata must be accessible from the DecryptedMessage.
-      expect(received.routing.agentId).toBe("agent1");
+      expect(received.routing.accountId).toBe("agent1");
       expect(received.routing.tenant).toBe("tenant1");
       expect(received.routing.sub).toBe("user42");
       expect(received.routing.messageId).toBe("msg-test-2");

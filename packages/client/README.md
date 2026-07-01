@@ -11,19 +11,24 @@ framework dependency**. The client owns the chat state; wrap it in whatever view
 layer you like (vanilla DOM, Vue, or a thin React `useSyncExternalStore` hook).
 It is zero-dependency at runtime.
 
-Today it works against the **Gateway-WS** transport (`WebChannelClient`), the
-path the rest of the repo runs end-to-end.
+The production transport is **NATS E2E** (`WebChannelNatsClient`): the browser
+dials a shared NATS bus, does an X25519 handshake, and exchanges
+ChaCha20-Poly1305 ciphertext with the agent. A **legacy dev-only** Gateway-WS
+client (`WebChannelClient`) also ships for zero-infra local round-trips.
 
 ## Status
 
 Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md), the single source of
 truth for what is and isn't done.
 
-- `WebChannelClient` (Gateway-WS) — works end-to-end and is exercised by a live
-  round-trip smoke (`smoke-client.mjs`).
-- `WebChannelNATSClient` (NATS mode) — the type surface and a wrapper exist, but
-  **the browser-dials-NATS path is not wired live yet.** No browser message has
-  travelled over NATS into the agent and back. Treat NATS mode as not ready.
+- `WebChannelNatsClient` (NATS mode) — **the production client, live end-to-end.**
+  A real browser running this class has round-tripped an encrypted message over a
+  real JWT-auth `nats-server` into the enrolled `index-nats` plugin and back
+  (NATS-layer NKEY-auth + X25519 handshake + PoP register hop). Ciphertext-only on
+  the wire.
+- `WebChannelClient` (Gateway-WS) — **legacy / dev-only.** A zero-infra WS
+  round-trip exercised by `smoke-client.mjs`. No production role; slated for
+  removal (see the repo `docs/BACKLOG.md`).
 
 ## Usage (Gateway-WS)
 
@@ -64,8 +69,12 @@ From the package entry (`src/index.ts`):
 
 **Classes**
 
-- `WebChannelClient` — the Gateway-WS client.
-- `WebChannelNATSClient` — NATS-mode wrapper (see Status; not wired live).
+- `WebChannelNatsClient` — the production NATS-mode client (see Status; live).
+  Defined in `src/nats-client.ts`. The package barrel currently re-exports it via
+  a thin wrapper class exported under the name `WebChannelNATSClient`
+  (`src/nats-client-wrapper.ts`) — the two names refer to the same NATS client;
+  the casing should be unified in a later cleanup.
+- `WebChannelClient` — legacy Gateway-WS client (dev-only).
 
 **Client methods** (same surface on both classes)
 
@@ -86,8 +95,8 @@ From the package entry (`src/index.ts`):
 
 Key `WebChannelOptions`: `url` (full cross-origin WS URL), `path` (same-origin
 WS path), `getTicket` (per-connect ticket supplier). NATS-mode options
-(`natsUrl`, `bootstrapJwt`, `agentId`, `tenant`, `peerId`) exist but are not
-wired live.
+(`natsUrl`, `accountId`, `tenant`, `peerId`, `natsCredentials`, optional
+`registration`) drive the live `WebChannelNatsClient`.
 
 `WebChannelState` exposes `messages`, `approvals`, `status`
 (`"connecting"` | `"connected"` | `"reconnecting"`), `connected`, and an

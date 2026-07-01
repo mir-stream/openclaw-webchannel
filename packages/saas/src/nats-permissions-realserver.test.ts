@@ -186,6 +186,7 @@ beforeAll(async () => {
     saasBaseUrl: "https://saas.test.com",
     jwksUrl: "https://saas.test.com/.well-known/jwks.json",
     bootstrapUrl: "https://saas.test.com/bootstrap",
+    natsUrl: "wss://nats.test.com",
   });
 
   // Create nats-server config with JWT authentication. A real nats-server needs
@@ -274,7 +275,7 @@ async function generateTestCredentials(tenant: string): Promise<NatsUserCredenti
     device_code: "test-device-code",
     user_code: "TEST-1234",
     agentPublicKey: "test-public-key",
-    agentId: "test-agent",
+    accountId: "test-agent",
     tenant,
     createdAt: Date.now(),
     expiresAt: Date.now() + 600000,

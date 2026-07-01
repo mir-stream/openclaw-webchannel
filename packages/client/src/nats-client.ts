@@ -48,8 +48,8 @@ export type NatsClientOptions = {
    * unused — omit it. REQUIRED whenever `registration` is present.
    */
   jwt?: string;
-  /** Agent ID (from JWT) */
-  agentId: string;
+  /** Account (deployment) id — the wire identity (from JWT) */
+  accountId: string;
   /** Tenant ID (from JWT) */
   tenant: string;
   /** Peer ID (JWT sub claim) */
@@ -463,26 +463,26 @@ export class NatsClient {
 
 /**
  * Derive inbound NATS subject for a peer.
- * Format: webchannel.{tenant}.{agentId}.{peerId}.in
+ * Format: webchannel.{tenant}.{accountId}.{peerId}.in
  */
-export function inboundSubject(tenant: string, agentId: string, peerId: string): string {
-  return `webchannel.${tenant}.${agentId}.${peerId}.in`;
+export function inboundSubject(tenant: string, accountId: string, peerId: string): string {
+  return `webchannel.${tenant}.${accountId}.${peerId}.in`;
 }
 
 /**
  * Derive outbound NATS subject for a peer.
- * Format: webchannel.{tenant}.{agentId}.{peerId}.out
+ * Format: webchannel.{tenant}.{accountId}.{peerId}.out
  */
-export function outboundSubject(tenant: string, agentId: string, peerId: string): string {
-  return `webchannel.${tenant}.${agentId}.${peerId}.out`;
+export function outboundSubject(tenant: string, accountId: string, peerId: string): string {
+  return `webchannel.${tenant}.${accountId}.${peerId}.out`;
 }
 
 /**
  * Derive handshake NATS subject for a peer.
- * Format: webchannel.{tenant}.{agentId}.{peerId}.handshake
+ * Format: webchannel.{tenant}.{accountId}.{peerId}.handshake
  */
-export function handshakeSubject(tenant: string, agentId: string, peerId: string): string {
-  return `webchannel.${tenant}.${agentId}.${peerId}.handshake`;
+export function handshakeSubject(tenant: string, accountId: string, peerId: string): string {
+  return `webchannel.${tenant}.${accountId}.${peerId}.handshake`;
 }
 
 // ---------------------------------------------------------------------------
@@ -590,7 +590,7 @@ export class WebChannelNatsClient {
   }
 
   private async onConnected(): Promise<void> {
-    const { tenant, agentId, peerId } = this.options;
+    const { tenant, accountId, peerId } = this.options;
     // Mark this flow as the current connection generation. Any `await` below
     // re-checks `this.connectionEpoch === epoch` so a continuation resumed after
     // a drop+reconnect bails instead of clobbering the fresh flow's state.
@@ -599,8 +599,8 @@ export class WebChannelNatsClient {
     // leaves duplicate subscriptions delivering the same MSG twice.
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
     if (this.handshakeSub >= 0) this.client.unsubscribe(this.handshakeSub);
-    this.outSub = this.client.subscribe(outboundSubject(tenant, agentId, peerId));
-    this.handshakeSub = this.client.subscribe(handshakeSubject(tenant, agentId, peerId));
+    this.outSub = this.client.subscribe(outboundSubject(tenant, accountId, peerId));
+    this.handshakeSub = this.client.subscribe(handshakeSubject(tenant, accountId, peerId));
 
     // Fresh connection → fresh key exchange.
     this.resetSession();
@@ -653,15 +653,15 @@ export class WebChannelNatsClient {
     if (this.connectionEpoch !== epoch) return;
     this.keyPair = keyPair;
     this.client.publish(
-      handshakeSubject(tenant, agentId, peerId),
+      handshakeSubject(tenant, accountId, peerId),
       keyExchangeFrame(this.keyPair.publicKeyB64url),
     );
   }
 
   private async handleRaw(subject: string, payload: string): Promise<void> {
-    const { tenant, agentId, peerId } = this.options;
+    const { tenant, accountId, peerId } = this.options;
 
-    if (subject === handshakeSubject(tenant, agentId, peerId)) {
+    if (subject === handshakeSubject(tenant, accountId, peerId)) {
       if (this.sessionKey || !this.keyPair) return; // already established / not ready
       const agentPubKey = parseKeyExchange(payload);
       if (!agentPubKey) return;
@@ -670,7 +670,7 @@ export class WebChannelNatsClient {
       return;
     }
 
-    if (subject === outboundSubject(tenant, agentId, peerId)) {
+    if (subject === outboundSubject(tenant, accountId, peerId)) {
       if (!this.sessionKey) return; // fail-closed: cannot read before handshake
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
       if (msg) this.notifyMessageListeners(msg);
@@ -699,9 +699,9 @@ export class WebChannelNatsClient {
       this.outboundQueue.push(message);
       return;
     }
-    const { tenant, agentId, peerId } = this.options;
-    const wire = sealMessage({ agentId, tenant, sub: peerId }, this.sessionKey, message);
-    this.client.publish(inboundSubject(tenant, agentId, peerId), wire);
+    const { tenant, accountId, peerId } = this.options;
+    const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, message);
+    this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
   }
 
   private notifyMessageListeners(msg: InboundMessage): void {

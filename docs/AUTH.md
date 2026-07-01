@@ -2,6 +2,15 @@
 
 > 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 인증 설계 기준 문서다.
 
+> ⚠️ **범위 주의 (production vs legacy).** 이 문서(§1–9)는 **legacy Gateway-WS** 경로의
+> 인증(ConnectionVerifier + `hmac-ticket`/`jwt`/`trusted-header` 전략)을 기술한다. **production
+> 경로는 NATS E2E**(`index-nats.ts`, 기본값)이며 그 admission은 다르다: enrolled 경로는
+> `auto` admission으로 **`channels.webchannel.auth` 블록이 아예 필요 없고**(verifier는
+> `register-hop` admission일 때만 빌드됨), 브라우저 admission = NATS subject-permissioned NKEY
+> creds + X25519 핸드셰이크 (+ 선택적 `dmSecurity` allowlist). register-hop admission일 때만
+> bootstrap-JWT(RS256/JWKS + PoP)를 검증한다. `hmac-ticket`/`anonymous`는 **legacy Gateway-WS
+> 전용**이며 NATS 경로에서는 아무 역할도 없다.
+
 > 브라우저 클라이언트가 게이트웨이 WebSocket에 붙을 때의 **인증·신원(identity)** 모델.
 > 상태: **결정됨** — 구 `BACKLOG.md`(삭제됨)의 "브라우저 Auth 모델 (완전 OPEN)" 항목을 대체한다.
 > 용어(2026-06-15): "위젯"은 이제 무프레임워크 **`openclaw-webchannel-client`**(`packages/client`)를 가리킨다. React `openclaw-webchannel-widget`는 삭제됨 — `getTicket` 주입점은 client에 그대로 존재.
@@ -51,7 +60,7 @@ type ConnectionVerifier = (req: IncomingMessage) => Promise<ConnectionIdentity |
 
 | strategy | 검증 방법 | 누가 씀 |
 |---|---|---|
-| `anonymous` | 검증 없음, 전원 단일 peer | dev/loopback 전용 (현재 동작) |
+| `anonymous` | ~~검증 없음, 전원 단일 peer~~ — **load 시 throw로 거부됨** (`src/auth.ts`) | 실질적으로 사용 불가 (아래 §7 참조) |
 | `hmac-ticket` | 호스트 백엔드가 `{sub,exp}` 서명 → 공유 시크릿으로 검증 | **우리 SaaS** |
 | `jwt` ✅ 구현됨 | RS256 + JWKS 공개키 + `iss`/`aud` 검증 | 이미 JWT 발급하는 호스트 (Auth0 / Clerk / Keycloak / 자체 IdP) |
 | `trusted-header` | 프록시가 주입한 신원 헤더 읽기 | 게이트웨이가 trusted-proxy 뒤일 때 |
@@ -123,7 +132,7 @@ createWebChannel({
 `resolveVerifier`가 강제한다 (`src/auth.ts`):
 
 - **strategy 명시 강제** — `auth` 미설정/미지원 strategy/시크릿 누락 시 **throw → 플러그인 로드 거부**(조용한 전세계 오픈 불가).
-- `anonymous`는 선택 시 **경고 로그** 발생(dev 전용).
+- `anonymous`는 선택 시 **load 시점에 throw → 플러그인 로드 거부**(`makeAnonymousVerifier`가 verifier를 반환하지 않음). "경고만 하고 동작"하지 **않는다** — 조용한 오픈은 불가능.
 - `trusted-header`(미구현 빌트인) 사용 시 "게이트웨이가 클라이언트 헤더를 덮어쓰는 프록시 뒤여야 함" 문서화 필요.
 
 ---

@@ -1,11 +1,11 @@
 /**
  * NATS-subject token validator (defense-in-depth against subject injection).
  *
- * Live channel subjects are `webchannel.{tenant}.{agentId}.{peerId}.{in|out|handshake}`.
+ * Live channel subjects are `webchannel.{tenant}.{accountId}.{peerId}.{in|out|handshake}`.
  * A token containing a `.` (subject separator), `*`/`>` (NATS wildcards), or
  * whitespace/control chars would break the subject hierarchy and could cross
  * tenant boundaries. On the plugin side, `peerId` derives from the verified JWT
- * `sub`; tenant/agentId come from trusted operator config. We still validate the
+ * `sub`; tenant/accountId come from trusted operator config. We still validate the
  * untrusted `peerId` before it is spliced into a subject so a loose/compromised
  * issuer that puts a wildcard in `sub` cannot widen the agent's subscriptions.
  *

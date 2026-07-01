@@ -56,7 +56,7 @@ function makePayload(
     aud: "openclaw-webchannel",
     exp: Math.floor(Date.now() / 1000) + 300,
     iat: Math.floor(Date.now() / 1000),
-    agentId: "agent-abc",
+    accountId: "agent-abc",
     tenant: "tenant-xyz",
     cnf: {
       jwk: {

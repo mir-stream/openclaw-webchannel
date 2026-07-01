@@ -34,14 +34,15 @@ ECHO_PORT=18902
 ISSUER_PORT=3921
 
 TENANT=default-tenant
-AGENT_ID=default-agent
+ACCOUNT_ID=default-agent
 PEER_ID=enrolled-driver-peer
 SAAS_ISSUER="https://saas.local/enrolled-issuer"
 
-NATS_PID=""; ECHO_PID=""; ISSUER_PID=""; GW_PID=""
+NATS_PID=""; ECHO_PID=""; ISSUER_PID=""; GW_PID=""; ADD_PID=""
 
 cleanup() {
   echo "[run-enrolled] cleanup…"
+  [ -n "$ADD_PID" ]    && kill "$ADD_PID"    2>/dev/null || true
   [ -n "$GW_PID" ]     && kill "$GW_PID"     2>/dev/null || true
   [ -n "$ISSUER_PID" ] && kill "$ISSUER_PID" 2>/dev/null || true
   [ -n "$ECHO_PID" ]   && kill "$ECHO_PID"   2>/dev/null || true
@@ -211,7 +212,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
         "jwt": {
           "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
           "issuer": "$SAAS_ISSUER",
-          "audience": "$AGENT_ID"
+          "audience": "$ACCOUNT_ID"
         }
       },
       "dmSecurity": "allowlist",
@@ -223,41 +224,68 @@ JSON
 echo "[run-enrolled] wrote $OCH/.openclaw/openclaw.json"
 
 # ---------------------------------------------------------------------------
-# 6. Boot the isolated gateway. NO WEBCHANNEL_NATS_DEV_OPEN → enrolled path runs.
-#    HOME=$OCH isolates the plugin's enrollment credential store under $OCH.
+# 6. CONFIG-TIME credential acquisition via `openclaw channels add` (가-1).
+#    After Cycle 1/2 the gateway is CONSUME-ONLY — it no longer enrolls. The
+#    device flow runs HERE, at config time, exactly as a production operator runs
+#    `openclaw channels add`. HOME=$OCH so creds persist to
+#    $OCH/.openclaw-webchannel/<account>/credentials.json, which the gateway
+#    (also HOME=$OCH) consumes. Identity is passed via the generic CLI flags the
+#    webchannel setup adapter maps: --base-url→saas.baseUrl, --url→tenant. The
+#    wire identity is the --account value itself (no --token→agentId mapping
+#    anymore — the handling agent is selected separately via `agents bind`).
 # ---------------------------------------------------------------------------
+echo "[run-enrolled] channels add (config-time device-flow enroll)…"
 HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
-  WEBCHANNEL_SAAS_BASE_URL="http://127.0.0.1:$ISSUER_PORT" \
-  WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_AGENT_ID="$AGENT_ID" \
-  WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
-  "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
-  >"$OCH/gateway.log" 2>&1 &
-GW_PID=$!
-echo "[run-enrolled] gateway pid=$GW_PID — waiting for enrollment user_code…"
+  "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account "$ACCOUNT_ID" \
+    --base-url "http://127.0.0.1:$ISSUER_PORT" --url "$TENANT" \
+  >"$OCH/channels-add.log" 2>&1 &
+ADD_PID=$!
+echo "[run-enrolled] channels add pid=$ADD_PID — waiting for enrollment user_code…"
 
-# 6a. Auto-approve: scrape the user_code the plugin prints (displayInstructions),
-#     then POST it to the issuer's /approve route.
+# 6a. Auto-approve: scrape the user_code the device flow prints to the
+#     channels-add output (NOT gateway.log anymore), POST it to /approve.
 USER_CODE=""
 for i in $(seq 1 240); do
-  USER_CODE="$(grep -oE 'User code: [A-Z]{4}-[A-Z]{4}' "$OCH/gateway.log" 2>/dev/null | head -1 | awk '{print $3}' || true)"
+  USER_CODE="$(grep -oE 'User code: [A-Z]{4}-[A-Z]{4}' "$OCH/channels-add.log" 2>/dev/null | head -1 | awk '{print $3}' || true)"
   if [ -n "$USER_CODE" ]; then break; fi
-  if ! kill -0 "$GW_PID" 2>/dev/null; then
-    echo "[run-enrolled] gateway died before enrollment — log:"; cat "$OCH/gateway.log"; exit 2
+  if ! kill -0 "$ADD_PID" 2>/dev/null; then
+    echo "[run-enrolled] channels add exited before user_code — log:"; cat "$OCH/channels-add.log"; exit 2
   fi
   sleep 0.25
 done
-[ -z "$USER_CODE" ] && { echo "[run-enrolled] TIMEOUT waiting for user_code — gateway log:"; cat "$OCH/gateway.log"; exit 2; }
+[ -z "$USER_CODE" ] && { echo "[run-enrolled] TIMEOUT waiting for user_code — channels-add log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-enrolled] enrollment user_code=$USER_CODE — approving…"
 APPROVE="$(curl -fsS -X POST "http://127.0.0.1:$ISSUER_PORT/approve" \
   -H 'Content-Type: application/json' -d "{\"user_code\":\"$USER_CODE\"}" || true)"
 echo "[run-enrolled] approve response: $APPROVE"
 
-# 6b. Wait for the plugin to poll, receive creds, NKEY-connect, and register.
-echo "[run-enrolled] waiting for plugin registration (enrolled NATS connect)…"
+# 6b. Let `channels add` finish: it polls /poll, receives creds, persists them,
+#     and exits 0 (no NATS connect happens here — acquisition only).
+set +e; wait "$ADD_PID"; ADD_RC=$?; set -e
+ADD_PID=""
+if [ "$ADD_RC" -ne 0 ]; then
+  echo "[run-enrolled] channels add failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add.log"; exit 2
+fi
+CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
+[ -f "$CRED_FILE" ] || { echo "[run-enrolled] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
+echo "[run-enrolled] ✓ credentials persisted at $CRED_FILE"
+
+# ---------------------------------------------------------------------------
+# 6c. Boot the isolated gateway — CONSUME-ONLY. No acquisition env
+#     (WEBCHANNEL_SAAS_BASE_URL/_TENANT/_ACCOUNT_ID): identity now lives in the
+#     config that `channels add` wrote. Only the connection override
+#     WEBCHANNEL_NATS_URL is passed. No user_code at gateway boot anymore.
+# ---------------------------------------------------------------------------
+HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
+  WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
+  WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
+  "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
+  >"$OCH/gateway.log" 2>&1 &
+GW_PID=$!
+echo "[run-enrolled] gateway pid=$GW_PID — waiting for plugin registration (consume persisted creds)…"
 for i in $(seq 1 240); do
   if grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$OCH/gateway.log" 2>/dev/null; then
-    echo "[run-enrolled] gateway ready (enrolled + connected)"
+    echo "[run-enrolled] gateway ready (consumed creds + connected)"
     break
   fi
   if ! kill -0 "$GW_PID" 2>/dev/null; then
@@ -277,7 +305,7 @@ set +e
 WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
 WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
 WEBCHANNEL_ISSUER_URL="http://127.0.0.1:$ISSUER_PORT" \
-WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_AGENT_ID="$AGENT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
+WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
   node --import tsx "$REPO/e2e/local/enrolled-transport-roundtrip.ts"
 RC=$?
 set -e

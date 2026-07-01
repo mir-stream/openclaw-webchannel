@@ -14,7 +14,7 @@
  * NatsTransport.publish()) and asserts that:
  *   - No approval-specific field value appears in the JSON wire string.
  *   - The `content` block contains only nonce / ciphertext / tag.
- *   - Routing metadata (agentId / tenant / sub / messageId / envelopeType) IS
+ *   - Routing metadata (accountId / tenant / sub / messageId / envelopeType) IS
  *     present as plaintext (allowed per the security model).
  *
  * Tests
@@ -78,7 +78,7 @@ const APPROVAL_INFO = APPROVAL_KEY_INFO;
 
 /** Base routing fields shared across tests. */
 const BASE_ROUTING = {
-  agentId:   "agent-007",
+  accountId:   "agent-007",
   tenant:    "tenant-acme",
   sub:       "user-42",
   messageId: "approval-abc123",
@@ -606,12 +606,12 @@ describe("Content block structural invariants: only nonce / ciphertext / tag", (
 
 describe("Routing metadata: plaintext-readable for NATS relay routing decisions", () => {
   it(
-    "(12) agentId / tenant / sub / messageId / envelopeType are all plaintext in the wire JSON",
+    "(12) accountId / tenant / sub / messageId / envelopeType are all plaintext in the wire JSON",
     () => {
       const env     = encryptApprovalRequest(BASE_ROUTING, SAMPLE_REQUEST, TEST_KEY);
       const wireJson = serializeApprovalEnvelope(env).toString("utf8");
 
-      expect(wireJson).toContain(BASE_ROUTING.agentId);    // "agent-007"
+      expect(wireJson).toContain(BASE_ROUTING.accountId);    // "agent-007"
       expect(wireJson).toContain(BASE_ROUTING.tenant);     // "tenant-acme"
       expect(wireJson).toContain(BASE_ROUTING.sub);        // "user-42"
       expect(wireJson).toContain(BASE_ROUTING.messageId);  // "approval-abc123"
@@ -684,7 +684,7 @@ describe("serialize → deserialize round-trip: all envelope fields preserved", 
 
       // All routing fields preserved.
       expect(restored.v).toBe(1);
-      expect(restored.agentId).toBe(BASE_ROUTING.agentId);
+      expect(restored.accountId).toBe(BASE_ROUTING.accountId);
       expect(restored.tenant).toBe(BASE_ROUTING.tenant);
       expect(restored.sub).toBe(BASE_ROUTING.sub);
       expect(restored.messageId).toBe(BASE_ROUTING.messageId);

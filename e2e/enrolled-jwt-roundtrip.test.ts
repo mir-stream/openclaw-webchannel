@@ -367,7 +367,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
         const agent = await startE2EAgent({
           natsUrl:             NATS_WS_URL,
           tenant:              TENANT,
-          agentId:             AGENT_ID,
+          accountId:             AGENT_ID,
           preSharedKey:        sessionKey,
           jwtCredential:       agentCreds!.userJwt,
           nkeySigningCallback: agentCreds!.nkeySigningCallback,
@@ -400,17 +400,17 @@ describe.skipIf(!NATS_SERVER_BIN)(
           };
 
           const result = await page.evaluate<EvalResult, EvalArgs>(
-            async ([natsUrl, keyArr, msgText, tenant, agentId, peerId, userJwt, rawNkeyPrivateKey]) => {
+            async ([natsUrl, keyArr, msgText, tenant, accountId, peerId, userJwt, rawNkeyPrivateKey]) => {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               const { runEncryptedRoundTrip } = (globalThis as any)["E2EBrowserClient"] as {
                 runEncryptedRoundTrip: (opts: {
-                  natsUrl: string; tenant: string; agentId: string; peerId: string;
+                  natsUrl: string; tenant: string; accountId: string; peerId: string;
                   messageText: string; preSharedKey: number[]; timeoutMs: number;
                   userJwt: string; rawNkeyPrivateKey: number[];
                 }) => Promise<EvalResult>;
               };
               return runEncryptedRoundTrip({
-                natsUrl, tenant, agentId, peerId,
+                natsUrl, tenant, accountId, peerId,
                 messageText: msgText,
                 preSharedKey: keyArr,
                 timeoutMs: 12000,
@@ -441,7 +441,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
           // 3. Wire payload is a valid MessageEnvelope v1
           const wireEnv = JSON.parse(result.wirePayloadJson) as Record<string, unknown>;
           expect(wireEnv["v"]).toBe(1);
-          expect(wireEnv["agentId"]).toBe(AGENT_ID);
+          expect(wireEnv["accountId"]).toBe(AGENT_ID);
           expect(wireEnv["tenant"]).toBe(TENANT);
           const content = wireEnv["content"] as Record<string, unknown>;
           expect(typeof content["nonce"]).toBe("string");
@@ -491,7 +491,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 const { runEncryptedRoundTrip } = (globalThis as any)["E2EBrowserClient"] as {
                   runEncryptedRoundTrip: (opts: {
-                    natsUrl: string; tenant: string; agentId: string; peerId: string;
+                    natsUrl: string; tenant: string; accountId: string; peerId: string;
                     messageText: string; preSharedKey: number[]; timeoutMs: number;
                     // No userJwt / rawNkeyPrivateKey → unauthenticated
                   }) => Promise<unknown>;
@@ -499,7 +499,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
                 await runEncryptedRoundTrip({
                   natsUrl,
                   tenant: "test",
-                  agentId: "agent1",
+                  accountId: "agent1",
                   peerId: "peer1",
                   messageText: "should be rejected",
                   preSharedKey: Array.from(new Uint8Array(32)),
@@ -548,7 +548,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
         const agent = await startE2EAgent({
           natsUrl:             NATS_WS_URL,
           tenant:              TENANT,
-          agentId:             AGENT_ID,
+          accountId:             AGENT_ID,
           // no preSharedKey → X25519 key exchange via handshake subject
           jwtCredential:       agentCreds!.userJwt,
           nkeySigningCallback: agentCreds!.nkeySigningCallback,
@@ -576,17 +576,17 @@ describe.skipIf(!NATS_SERVER_BIN)(
           type EvalResult4 = { replyText: string; wirePayloadJson: string; isOpaqueOnWire: boolean };
 
           const result = await page.evaluate<EvalResult4, EvalArgs4>(
-            async ([natsUrl, msgText, tenant, agentId, peerId, userJwt, rawNkeyPrivateKey]) => {
+            async ([natsUrl, msgText, tenant, accountId, peerId, userJwt, rawNkeyPrivateKey]) => {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               const { runEncryptedRoundTrip } = (globalThis as any)["E2EBrowserClient"] as {
                 runEncryptedRoundTrip: (opts: {
-                  natsUrl: string; tenant: string; agentId: string; peerId: string;
+                  natsUrl: string; tenant: string; accountId: string; peerId: string;
                   messageText: string; timeoutMs: number;
                   userJwt: string; rawNkeyPrivateKey: number[];
                 }) => Promise<EvalResult4>;
               };
               return runEncryptedRoundTrip({
-                natsUrl, tenant, agentId, peerId,
+                natsUrl, tenant, accountId, peerId,
                 messageText: msgText,
                 // no preSharedKey → X25519 key exchange
                 timeoutMs: 15000,
@@ -648,7 +648,7 @@ it(
     } = await import("../packages/plugin/src/e2e-envelope.js");
 
     const routing = {
-      agentId:      AGENT_ID,
+      accountId:      AGENT_ID,
       tenant:       TENANT,
       sub:          PEER_ID,
       messageId:    "msg-enrolled-jwt-aad-001",

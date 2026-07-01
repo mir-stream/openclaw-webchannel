@@ -19,9 +19,8 @@
 import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { pathToFileURL } from "node:url";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
+import { DEFAULT_ACCOUNT_ID, resolveReadCredentialPath } from "./account-config.js";
 
 // ---------------------------------------------------------------------------
 // Import SaaS types for type safety
@@ -33,7 +32,7 @@ import { fileURLToPath } from "node:url";
  */
 type EnrollmentRequest = {
   agentPublicKey: string;
-  agentId?: string;
+  accountId?: string;
   tenant: string;
 };
 
@@ -64,7 +63,20 @@ type EnrollmentResult = {
   peerId: string;
   jwksUrl: string;
   bootstrapUrl: string;
+  /**
+   * NATS WebSocket URL delivered by the SaaS. The relay location travels with
+   * the minted creds (the SaaS is the rendezvous authority); the enrolled plugin
+   * dials THIS rather than a local `nats.url` / `WEBCHANNEL_NATS_URL`.
+   */
+  natsUrl: string;
 };
+
+/**
+ * Public alias for the enrollment result, exported for callers (e.g.
+ * `acquireCredentials`) that need to name the resolved shape without depending
+ * on the internal `EnrollmentResult` declaration.
+ */
+export type EnrollmentResultLike = EnrollmentResult;
 
 /**
  * SaaS NATS user credentials (matches server-side type).
@@ -119,12 +131,13 @@ export type PluginCredentials = {
     peerId: string;
     jwksUrl: string;
     bootstrapUrl: string;
+    natsUrl: string;
   };
 
   /**
-   * Agent ID (optional, for debugging).
+   * Account (deployment) id — the wire identity (optional, for debugging).
    */
-  agentId?: string;
+  accountId?: string;
 
   /**
    * Tenant ID.
@@ -168,13 +181,21 @@ export type EnrollmentOptions = {
   tenant: string;
 
   /**
-   * Agent ID (optional, for debugging).
+   * Account (deployment) id — the wire identity (JWT aud / NATS subject key)
+   * sent to the SaaS enrollment. Also scopes the default credential path:
+   * `~/.openclaw-webchannel/<account>/credentials.json` (가-1). When
+   * `credentialPath` is omitted the path is derived from this. Defaults to
+   * `"default"`.
    */
-  agentId?: string;
+  accountId?: string;
 
   /**
    * Local credential storage path.
-   * Defaults to ~/.openclaw-webchannel/credentials.json
+   * Defaults to the account-scoped path
+   * `~/.openclaw-webchannel/<account>/credentials.json`, with a backward-compat
+   * fallback to the legacy `~/.openclaw-webchannel/credentials.json` for the
+   * `"default"` account when the per-account file is absent but the legacy one
+   * exists.
    */
   credentialPath?: string;
 
@@ -207,10 +228,10 @@ export type EnrollmentOptions = {
  */
 export class EnrollmentClient {
   private readonly options: Required<
-    Omit<EnrollmentOptions, "displayInstructions" | "agentId" | "_minPollIntervalMs">
+    Omit<EnrollmentOptions, "displayInstructions" | "accountId" | "_minPollIntervalMs">
   > & {
     displayInstructions: boolean;
-    agentId?: string;
+    accountId?: string;
     _minPollIntervalMs?: number;
   };
   private credentials?: PluginCredentials;
@@ -223,7 +244,8 @@ export class EnrollmentClient {
     // `dirname(undefined)`.
     this.options = {
       ...options,
-      credentialPath: options.credentialPath ?? this.defaultCredentialPath(),
+      credentialPath:
+        options.credentialPath ?? this.defaultCredentialPath(options.accountId),
       displayInstructions: options.displayInstructions ?? true,
     };
   }
@@ -303,7 +325,7 @@ export class EnrollmentClient {
         publicKey: this.bufferToBase64Url(identityKey.publicKey),
         privateKey: this.bufferToBase64Url(identityKey.privateKey),
       },
-      agentId: this.options.agentId,
+      accountId: this.options.accountId,
       tenant: this.options.tenant,
       saasEnrollUrl: this.options.saasEnrollUrl,
       saasPollUrl: this.options.saasPollUrl,
@@ -312,7 +334,7 @@ export class EnrollmentClient {
     // Initiate enrollment
     const enrollRequest: EnrollmentRequest = {
       agentPublicKey: this.bufferToBase64Url(identityKey.publicKey),
-      agentId: this.options.agentId,
+      accountId: this.options.accountId,
       tenant: this.options.tenant,
     };
 
@@ -431,12 +453,16 @@ export class EnrollmentClient {
   }
 
   /**
-   * Get default credential path.
-   * ~/.openclaw-webchannel/credentials.json
+   * Get the default credential path for an account (가-1).
+   *
+   * Account-scoped: `~/.openclaw-webchannel/<account>/credentials.json`. For the
+   * `"default"` account, falls back to the legacy single-file
+   * `~/.openclaw-webchannel/credentials.json` when the per-account file is absent
+   * but the legacy one exists (so an already-enrolled deployment keeps working
+   * without re-enrolling). Delegated to `resolveReadCredentialPath`.
    */
-  private defaultCredentialPath(): string {
-    const homedir = require("node:os").homedir();
-    return join(homedir, ".openclaw-webchannel", "credentials.json");
+  private defaultCredentialPath(accountId?: string): string {
+    return resolveReadCredentialPath(accountId ?? DEFAULT_ACCOUNT_ID);
   }
 
   // ---------------------------------------------------------------------------

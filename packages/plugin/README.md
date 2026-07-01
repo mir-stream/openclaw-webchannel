@@ -40,8 +40,8 @@ auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See 
   see [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Gateway-WS channel (`index.ts`) — **dev-only** zero-infra fallback (run it via an OpenClaw gateway
   with this plugin loaded in WS mode). Needs a reachable inbound port, so it is NOT used in
-  production. Its dev demo lives in `e2e/local/live-chat*.{mjs,html}` +
-  `packages/client/src/browser-live-entry.ts`.
+  production. Exercise it via the `smoke/*.mjs` WS round-trip scripts; the single interactive
+  chat demo is the NATS path (`e2e/local/run-demo.sh`).
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
 ## Enrollment & credentials (NATS mode)
@@ -77,7 +77,8 @@ credentials and skips enrollment.
 - **Permissions:** written with mode `0o600` (owner read/write only)
 - **Shape** (`PluginCredentials`): `identityKey { publicKey, privateKey }` (base64url X25519),
   optional `enrollment { creds, peerId, jwksUrl, bootstrapUrl }`, plus `tenant`, `saasEnrollUrl`,
-  `saasPollUrl`, optional `agentId`. The private key is generated locally and never transmitted.
+  `saasPollUrl`, optional `accountId` (the wire identity). The private key is generated locally
+  and never transmitted.
 
 ## E2E security model (admission + handshake)
 
@@ -128,7 +129,11 @@ credentials — **no SaaS issuer required**.
 ```jsonc
 // channels.webchannel
 {
-  "auth": { "strategy": "hmac-ticket", "ticketSecret": { "env": "WC_TICKET_SECRET" } },
+  // NO `auth` block needed: static creds resolve admission to "auto", and the
+  // ConnectionVerifier is only built for the "register-hop" admission mode.
+  // Browser admission here = NATS subject permissions + X25519 handshake
+  // (+ an optional `dmSecurity` allowlist). hmac-ticket/anonymous are legacy
+  // Gateway-WS strategies and are INERT on the NATS path.
   "nats": {
     "url": "wss://connect.ngs.global",
     "credentials": {
@@ -161,7 +166,7 @@ Env overrides (take precedence over config) — secrets need not live in committ
 ```ts
 new WebChannelNatsClient({
   url: "wss://connect.ngs.global",
-  agentId, tenant, peerId,
+  accountId, tenant, peerId,
   // No bootstrap `jwt` and no `registration` — the bootstrap JWT is now optional
   // and only needed for the SaaS register-hop path.
   natsCredentials: {
@@ -172,21 +177,27 @@ new WebChannelNatsClient({
 ```
 
 > **Synadia permissions:** the static user must have **pub + sub** permission on the
-> `webchannel.<tenant>.<agent>.*` subjects (the agent subscribes to `…*.in` /
+> `webchannel.<tenant>.<accountId>.*` subjects (the agent subscribes to `…*.in` /
 > `…*.handshake` and publishes `…*.out`; the browser is the mirror). Without the
 > wildcard sub permission the agent's `auto` admission cannot receive peers.
 
 ## NATS subject namespace
 
-`src/nats-channel.ts` routes per-peer over tenant- and agent-scoped subjects:
+`src/nats-channel.ts` routes per-peer over tenant- and account-scoped subjects:
 
 ```
-webchannel.{tenant}.{agentId}.{peerId}.in    # browser → agent (plugin subscribes)
-webchannel.{tenant}.{agentId}.{peerId}.out   # agent → browser (plugin publishes)
+webchannel.{tenant}.{accountId}.{peerId}.in    # browser → agent (plugin subscribes)
+webchannel.{tenant}.{accountId}.{peerId}.out   # agent → browser (plugin publishes)
 ```
 
 Each peer (browser session) gets its own subject pair; tenant isolation is enforced by the NATS
 user credentials' pub/sub permissions minted during enrollment.
+
+> **Handling agent vs. wire identity.** The `accountId` is the on-wire/admission identity
+> (the deployment). Which OpenClaw agent actually answers is **decoupled** and selected via
+> `openclaw agents bind --bind webchannel:<accountId> --agent <agent>` (telegram-like) — not a
+> per-account config `agentId`. Inbound routing calls `resolveAgentRoute({ accountId, … })`,
+> which honours those bindings.
 
 ## Develop / test
 
@@ -200,5 +211,9 @@ npm test              # vitest run
 `package.json`); the plugin is loaded as TypeScript via OpenClaw's plugin loader. Packaging /
 publish to ClawHub is a known open question — see `../../docs/PACKAGING.md` and STATUS.md.
 
-The plugin serves no static UI. It exposes the `/webchannel/ws` WebSocket route; a consumer
-wires the headless `packages/client` library into their own page (see that package's README).
+The plugin serves no static UI. The **production** entry (`index-nats.ts`) exposes the
+plain-HTTP register routes `/webchannel/nats/register`, `/webchannel/nats/register/challenge`,
+and `/webchannel/nats/unregister` (used only by the `register-hop` admission mode; the browser
+otherwise reaches the agent over NATS, not HTTP). The **legacy dev-only** entry (`index.ts`)
+exposes the `/webchannel/ws` WebSocket route instead. Either way a consumer wires the headless
+`packages/client` library into their own page (see that package's README).

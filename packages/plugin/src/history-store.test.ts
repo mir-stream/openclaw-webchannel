@@ -46,7 +46,7 @@ function makeOpaqueEnvelope(
   const opaqueContent = Buffer.from(messageId, "utf8").toString("base64url");
   return {
     v: 1,
-    agentId: conv.agentId,
+    accountId: conv.accountId,
     tenant: conv.tenant,
     sub: conv.sub,
     messageId,
@@ -104,9 +104,9 @@ function drainStore(
 // Test fixtures
 // ---------------------------------------------------------------------------
 
-const CONV: ConversationId = { agentId: "agent1", tenant: "tenant1", sub: "user42" };
-const CONV_B: ConversationId = { agentId: "agent1", tenant: "tenant1", sub: "user99" };
-const CONV_C: ConversationId = { agentId: "agent2", tenant: "tenant1", sub: "user42" };
+const CONV: ConversationId = { accountId: "agent1", tenant: "tenant1", sub: "user42" };
+const CONV_B: ConversationId = { accountId: "agent1", tenant: "tenant1", sub: "user99" };
+const CONV_C: ConversationId = { accountId: "agent2", tenant: "tenant1", sub: "user42" };
 
 // ---------------------------------------------------------------------------
 // Suite 1: Core cursor-pagination invariant (Sub-AC 2a primary assertion)
@@ -368,10 +368,10 @@ describe("HistoryStore — load_history cursor-pagination (Sub-AC 2a)", () => {
     },
   );
 
-  // ── Test 12: Cross-conversation isolation (different agentId) ─────────────
+  // ── Test 12: Cross-conversation isolation (different accountId) ─────────────
 
   it(
-    "blobs stored for agent1 do not appear in load_history for agent2 (agentId isolation)",
+    "blobs stored for agent1 do not appear in load_history for agent2 (accountId isolation)",
     () => {
       const store = new HistoryStore();
 
@@ -382,11 +382,11 @@ describe("HistoryStore — load_history cursor-pagination (Sub-AC 2a)", () => {
 
       const { allEnvelopes: allA } = drainStore(store, CONV, 10);
       expect(allA).toHaveLength(3);
-      for (const env of allA) expect(env.agentId).toBe(CONV.agentId);
+      for (const env of allA) expect(env.accountId).toBe(CONV.accountId);
 
       const { allEnvelopes: allC } = drainStore(store, CONV_C, 10);
       expect(allC).toHaveLength(2);
-      for (const env of allC) expect(env.agentId).toBe(CONV_C.agentId);
+      for (const env of allC) expect(env.accountId).toBe(CONV_C.accountId);
     },
   );
 
@@ -456,7 +456,7 @@ describe("HistoryStore — load_history cursor-pagination (Sub-AC 2a)", () => {
 
       const envs = types.map((type, i) => ({
         v: 1 as const,
-        agentId: CONV.agentId,
+        accountId: CONV.accountId,
         tenant: CONV.tenant,
         sub: CONV.sub,
         messageId: `msg-type-${i + 1}`,

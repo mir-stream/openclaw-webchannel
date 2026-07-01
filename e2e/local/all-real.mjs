@@ -26,7 +26,7 @@ const require = createRequire(import.meta.url);
 const NATS_URL   = process.env.WEBCHANNEL_NATS_URL   ?? "ws://127.0.0.1:18622";
 const ISSUER_URL = process.env.WEBCHANNEL_ISSUER_URL ?? "http://127.0.0.1:3941";
 const GW_URL     = process.env.WEBCHANNEL_GW_URL     ?? "http://127.0.0.1:19199";
-const AGENT_ID   = process.env.WEBCHANNEL_AGENT_ID   ?? "default-agent";
+const ACCOUNT_ID   = process.env.WEBCHANNEL_ACCOUNT_ID   ?? "default-agent";
 const TENANT     = process.env.WEBCHANNEL_TENANT     ?? "default-tenant";
 const PEER_ID    = process.env.WEBCHANNEL_PEER_ID    ?? "web-allreal-peer";
 const PAGE_PORT  = parseInt(process.env.WEBCHANNEL_PAGE_PORT ?? "19393", 10);
@@ -115,7 +115,7 @@ try {
       natsUrl: NATS_URL,
       issuerUrl: ISSUER_URL,
       gwUrl: GW_URL,
-      agentId: AGENT_ID,
+      accountId: ACCOUNT_ID,
       tenant: TENANT,
       peerId: PEER_ID,
       text: TEXT,

@@ -37,7 +37,7 @@ PAGE_PORT=19293
 SAAS_ISSUER="https://saas.local/browser-issuer"
 
 TENANT=default-tenant
-AGENT_ID=default-agent
+ACCOUNT_ID=default-agent
 PEER_ID=web-browser-peer
 
 NATS_PID=""; ECHO_PID=""; BOOT_PID=""; GW_PID=""
@@ -166,7 +166,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
         "jwt": {
           "jwksUrl": "http://127.0.0.1:$BOOTSTRAP_PORT/.well-known/jwks.json",
           "issuer": "$SAAS_ISSUER",
-          "audience": "$AGENT_ID"
+          "audience": "$ACCOUNT_ID"
         }
       },
       "dmSecurity": "allowlist",
@@ -180,7 +180,7 @@ echo "[run-browser-jwt] wrote $OCH/.openclaw/openclaw.json"
 # 5. Boot the isolated gateway in dev/open-NATS + jwt mode.
 OPENCLAW_HOME="$OCH" HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_DEV_OPEN=1 WEBCHANNEL_NATS_URL=ws://127.0.0.1:$NATS_WS \
-  WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_AGENT_ID="$AGENT_ID" \
+  WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" \
   WEBCHANNEL_GW_URL=http://127.0.0.1:$GW_PORT \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &
@@ -208,7 +208,7 @@ set +e
 WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
 WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
 WEBCHANNEL_ISSUER_URL="http://127.0.0.1:$BOOTSTRAP_PORT" \
-WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_AGENT_ID="$AGENT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
+WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
 WEBCHANNEL_PAGE_PORT="$PAGE_PORT" \
   node "$REPO/e2e/local/browser-jwt-register.mjs"
 RC=$?

@@ -29,7 +29,7 @@ const createTestOptions = (override?: Partial<EnrollmentOptions>): EnrollmentOpt
   saasEnrollUrl: "https://saas.com/api/enroll",
   saasPollUrl: "https://saas.com/api/poll",
   tenant: "test-tenant",
-  agentId: "test-agent",
+  accountId: "test-agent",
   credentialPath: join(tmpdir(), `openclaw-test-${Date.now()}`, "credentials.json"),
   displayInstructions: false,
   _minPollIntervalMs: 0,

@@ -29,10 +29,10 @@ export type EnrollmentRequest = {
   agentPublicKey: string;
 
   /**
-   * Agent/Plugin identifier (optional but recommended).
+   * Account (deployment) identifier — the wire identity (optional but recommended).
    * Useful for debugging and logging; not part of the trust chain.
    */
-  agentId?: string;
+  accountId?: string;
 
   /**
    * Tenant identifier (required for multi-tenant SaaS).
@@ -123,9 +123,9 @@ export type PendingEnrollment = {
   agentPublicKey: string;
 
   /**
-   * Agent identifier (optional).
+   * Account (deployment) identifier — the wire identity (optional).
    */
-  agentId?: string;
+  accountId?: string;
 
   /**
    * Tenant identifier.
@@ -229,6 +229,18 @@ export type EnrollmentResult = {
    * Browsers request bootstrap JWTs from this endpoint.
    */
   bootstrapUrl: string;
+
+  /**
+   * NATS WebSocket URL the plugin must dial to reach the relay.
+   *
+   * The SaaS is the rendezvous authority ("Lagrange point"): the relay URL is
+   * NOT a plugin-side configuration value. The same SaaS that mints the NATS
+   * user credentials (`creds`) also tells the plugin WHERE that relay lives, so
+   * the credentials and their destination always travel together and can never
+   * drift. The plugin consumes this in preference to any local
+   * `nats.url` / `WEBCHANNEL_NATS_URL` (those remain dev-only overrides).
+   */
+  natsUrl: string;
 };
 
 /**

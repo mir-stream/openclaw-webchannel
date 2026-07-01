@@ -5,11 +5,12 @@
 > 전제: 에이전트(plugin)는 **고객 인프라**에서 ingress-free로 돌고, 콘텐츠는 **E2E**라
 > NATS·SaaS 어느 인프라도 평문을 못 본다. 단일 신뢰 앵커 = **SaaS**.
 
-> ⚠️ **설계 문서 — 아직 E2E로 실행된 적 없음.** 아래 신뢰 모델(§1–4)은 권위 있고 컴포넌트
-> 단위로 테스트됐지만, "온보딩 / 기동 순서" 워크스루는 **NATS 경로가 한 번도 end-to-end로
-> 돌아간 적 없는** 상태의 *목표 설계*다. 브라우저 메시지가 NATS→플러그인→에이전트→응답까지
-> 실제로 흐른 적은 없다. 현재 무엇이 되고 안 되는지의 **단일 진실원은 [`STATUS.md`](STATUS.md)**
-> ("What does NOT work yet"의 갭 ①–③ 참조). 이 문서는 NATS 경로 *구현 레퍼런스*로 읽을 것.
+> ✅ **라이브 검증됨 (live-proven).** 아래 신뢰 모델(§1–4)은 권위 있고, 온보딩 / 기동 순서는
+> 이제 **실제 하드웨어에서 end-to-end로 돌아간다**: 실제 브라우저가 device-flow로 enroll된
+> 플러그인 + 실제 openclaw 게이트웨이와 실제 JWT-auth `nats-server`를 거쳐 실제 LLM 응답까지
+> 왕복한다(브라우저→NATS→플러그인→에이전트→응답, 전 구간 E2E 암호화). 현재 무엇이 되고 안
+> 되는지의 **단일 진실원은 [`STATUS.md`](STATUS.md)**; 분할 호스트/컨테이너 재현은
+> [`SPLIT_DEMO.md`](SPLIT_DEMO.md). 이 문서는 신뢰 결합·온보딩의 *구현/설계 레퍼런스*로 읽을 것.
 
 ```
 [브라우저]──┐                          ┌──[OpenClaw plugin = 에이전트]
@@ -189,5 +190,7 @@ NATS config에 SaaS의 account 공개키 박기. 1회, 끝.
 ## 범위 밖 / 미해결
 
 - E2E crypto 세부(cnf 검증·키핀·핸드셰이크·키 wrap)는 `AUTH.md`/seed 참조. 본 문서는 **결합·온보딩**만.
-- 현재 갭: ① 에이전트측 cnf 검증 wiring, ② 브라우저 NATS dial(아직 게이트웨이 WS), ③ allowlist 인가(코어 위임 stub).
+- 브라우저 NATS dial + cnf 검증 wiring + allowlist 인가는 모두 **구현·라이브 검증됨** (production
+  `WebChannelNatsClient`가 직접 NATS를 dial하고 X25519 핸드셰이크·PoP register hop을 수행; `auto`
+  admission + `dmSecurity` allowlist가 실제로 게이트한다). 더는 갭 아님 — `STATUS.md` 참조.
 - 키 로테이션/revocation은 enrollment 엔드포인트 재호출로 흡수 예정(deferred).
