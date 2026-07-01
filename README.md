@@ -3,36 +3,38 @@
 A self-hosted **web chat channel plugin for [OpenClaw](https://openclaw.ai)** — embed a
 chat widget on a web page and talk to an OpenClaw agent (Claude) from the browser.
 
-> **Read [`docs/STATUS.md`](docs/STATUS.md) first.** This project has two transports — one
-> that works today and one that is still being built. The status doc is the single source of
-> truth for what is and isn't done; AC scores and seed files elsewhere describe component-level
-> completion, not end-to-end functionality.
+> **Read [`docs/STATUS.md`](docs/STATUS.md) first.** This project has two transports — the
+> **NATS E2E** path (production default, live-proven end-to-end) and a **legacy dev-only**
+> Gateway-WS fallback. The status doc is the single source of truth for what is and isn't done;
+> AC scores and seed files elsewhere describe component-level completion, not end-to-end
+> functionality.
 
 ## Two transports
 
-| | **A. Gateway-WS** (`packages/plugin/index.ts`) | **B. NATS E2E** (`packages/plugin/index-nats.ts`) |
+| | **B. NATS E2E** (`packages/plugin/index-nats.ts`) | **A. Gateway-WS** (`packages/plugin/index.ts`) |
 |---|---|---|
-| How the browser reaches the agent | Direct WebSocket to the gateway port | Both sides connect to a shared NATS bus |
-| Agent-side ingress | Yes (gateway exposes a port) | **No** (the goal of this rework) |
-| Content visible to the relay | n/a (gateway is the endpoint) | **No — ChaCha20-Poly1305 ciphertext only** |
-| **Status** | ✅ **Works end-to-end today** | 🚧 **Not live yet** (see STATUS.md) |
+| How the browser reaches the agent | Both sides connect to a shared NATS bus | Direct WebSocket to the gateway port |
+| Agent-side ingress | **No** (outbound dial only) | Yes (gateway exposes a port) |
+| Content visible to the relay | **No — ChaCha20-Poly1305 ciphertext only** | n/a (gateway is the endpoint) |
+| **Status** | ✅ **Production default — live end-to-end** | 🔧 **Legacy / dev-only** zero-infra WS round-trip |
 
-The whole point of Phase A/B is to move from **A → B**: remove agent-side ingress and route
-browser↔agent traffic over an untrusted NATS relay with end-to-end encryption, anchored by a
-SaaS trust chain. That migration is **partially built** — the data plane, crypto, and trust
-chain are done and component-tested, but the NATS plugin entry was only just wired to the agent
-loop and has **not been run live**.
+The NATS E2E path is the production default (`packages/plugin/package.json` →
+`openclaw.extensions = ["./index-nats.ts"]`) and is **live-proven on real hardware**: a real
+browser on a Mac talked to a real OpenClaw gateway + this plugin (running in a container) over a
+real JWT-auth `nats-server` and got a real LLM reply — ingress-free, end-to-end encrypted, and
+device-flow enrolled. The Gateway-WS entry (`index.ts`) is a **legacy, dev-only** zero-infra WS
+round-trip (exercised by `smoke/*.mjs`); it still exists but has no production role. Its full
+removal is a separate backlog item ([`docs/BACKLOG.md`](docs/BACKLOG.md)).
 
 ## Status at a glance
 
 | Area | State |
 |---|---|
-| Gateway-WS channel (browser ↔ OpenClaw ↔ Claude) | ✅ works |
+| **NATS E2E path end-to-end** (browser ↔ NATS ↔ plugin ↔ `inbound.run` ↔ back) | ✅ **production default, live-proven on real hardware** |
 | E2E crypto (X25519 + HKDF + ChaCha20-Poly1305), envelope, NATS transport | ✅ done, component-tested |
 | Trust chain (`packages/saas`): `setupTrustChain`, device-flow enrollment, NATS user creds | ✅ done, tested on a real nats-server |
-| NATS plugin entry → OpenClaw agent bridge (`index-nats.ts`) | 🟡 seams implemented (`22133b5`), **not run live** |
-| Browser dialing NATS in the live client | ❌ not wired |
-| Live NATS path end-to-end (browser ↔ Claude over NATS) | ❌ **never worked yet** |
+| Browser dialing NATS in the production client (`WebChannelNatsClient`) | ✅ live (NKEY-auth + X25519 handshake, ciphertext-only) |
+| Gateway-WS channel (`index.ts`, hmac-ticket) | 🔧 legacy / dev-only zero-infra WS round-trip |
 | Packaging / publish to ClawHub | ❌ incomplete (`docs/PACKAGING.md`) |
 
 Full detail, and reconciliation of the conflicting "AC 100% / complete" signals, is in
@@ -41,26 +43,29 @@ Full detail, and reconciliation of the conflicting "AC 100% / complete" signals,
 ## Repository layout
 
 ```
-packages/plugin   The OpenClaw channel plugin (index.ts = WS mode, index-nats.ts = NATS mode)
+packages/plugin   The OpenClaw channel plugin (index-nats.ts = NATS mode [default], index.ts = legacy WS)
 packages/client   Framework-agnostic browser client (headless connection + protocol + state)
 packages/saas     Trust-chain core + reference enrollment/bootstrap servers (reference, NOT prod)
 docs/             Design + status docs (start with STATUS.md and TRUST_AND_ONBOARDING.md)
 .ouroboros/       Ouroboros seeds / handoffs that drove the build (historical record)
 ```
 
-## Run the working path (Gateway-WS)
+## Run it (the production NATS path)
 
-This is the path that works today. It needs an OpenClaw gateway with this plugin loaded.
+The single interactive demo boots the full production topology — SaaS issuer + JWT-auth
+`nats-server` + the real enrolled `index-nats` plugin in a real gateway — and lets you chat with
+a live agent in your browser:
 
-1. Install: `npm install`
-2. Configure the gateway (`~/.openclaw/openclaw.json`) to load this plugin and a model:
-   - `plugins.load.paths`: `["<abs path>/packages/plugin"]`, `plugins.entries.webchannel.enabled: true`
-   - `agents.defaults.model.primary`: a Claude model (e.g. `anthropic/claude-opus-4-8`), or reuse
-     the Claude Code CLI login via `agentRuntime: { id: "claude-cli" }` (no API key needed)
-3. Start the gateway: `openclaw gateway run` (defaults to `ws://127.0.0.1:18789`)
-4. Connect over `/webchannel/ws`: run `node packages/client/smoke-client.mjs` to round-trip a
-   message, or wire the `openclaw-webchannel-client` library into your own page. (This repo ships
-   no browser chat UI — a consumer builds their own on top of the client library.)
+```bash
+npm install
+./e2e/local/run-demo.sh    # prints a URL; open it and chat. Ctrl+C tears it all down.
+```
+
+It reuses your real `~/.openclaw` model/provider config (so the agent answers with a real LLM)
+while keeping everything else under an isolated `OPENCLAW_HOME`. For the split host/container
+walkthrough (real browser on the Mac ↔ agent in a container over the LAN), see
+[`docs/SPLIT_DEMO.md`](docs/SPLIT_DEMO.md). The legacy Gateway-WS round-trip lives in
+`smoke/*.mjs` and `packages/client/smoke-client.mjs` (dev-only).
 
 ## Develop / test
 

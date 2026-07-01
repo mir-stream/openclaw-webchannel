@@ -209,7 +209,7 @@
             "properties": {
               "url": {
                 "type": "string",
-                "description": "NATS WebSocket URL (ws://… / wss://…). Env override: WEBCHANNEL_NATS_URL. Default ws://127.0.0.1:4222."
+                "description": "NATS WebSocket URL (ws://… / wss://…) for static/open modes. For ENROLLED mode the SaaS is the rendezvous authority and DELIVERS the relay URL with the minted creds (EnrollmentResult.natsUrl); that wins, and this / WEBCHANNEL_NATS_URL is only a dev override / back-compat fallback. Default ws://127.0.0.1:4222."
               },
               "devOpen": {
                 "type": "boolean",
@@ -271,11 +271,11 @@
       "uiHints": {
         "auth.strategy": {
           "label": "Auth strategy",
-          "help": "How browser connections are verified: \"hmac-ticket\" verifies a short-lived signed ticket from your backend (recommended); \"anonymous\" disables auth (dev/loopback only — all connections share one peer). Required; the plugin refuses to start if unset."
+          "help": "How browser connections are verified. Production runs the NATS path (index-nats): use \"jwt\" for the register-hop admission, or set NO auth at all for `auto` admission (browser is gated by NATS subject-permissioned creds + the X25519 handshake). \"hmac-ticket\" is LEGACY — it belongs to the dev-only Gateway-WS entry (index.ts) and is inert on the NATS path. \"anonymous\" is REJECTED at load (the plugin refuses to start)."
         },
         "auth.ticketSecret": {
           "label": "Ticket secret",
-          "help": "Shared HMAC secret for the \"hmac-ticket\" strategy. Use { \"env\": \"VAR_NAME\" } to read from an environment variable instead of inlining the secret."
+          "help": "Shared HMAC secret for the LEGACY dev-only \"hmac-ticket\" (Gateway-WS) strategy. Not used on the production NATS path. Use { \"env\": \"VAR_NAME\" } to read from an environment variable instead of inlining the secret."
         },
         "auth.ticketParam": {
           "label": "Ticket query param",

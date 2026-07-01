@@ -129,7 +129,11 @@ credentials — **no SaaS issuer required**.
 ```jsonc
 // channels.webchannel
 {
-  "auth": { "strategy": "hmac-ticket", "ticketSecret": { "env": "WC_TICKET_SECRET" } },
+  // NO `auth` block needed: static creds resolve admission to "auto", and the
+  // ConnectionVerifier is only built for the "register-hop" admission mode.
+  // Browser admission here = NATS subject permissions + X25519 handshake
+  // (+ an optional `dmSecurity` allowlist). hmac-ticket/anonymous are legacy
+  // Gateway-WS strategies and are INERT on the NATS path.
   "nats": {
     "url": "wss://connect.ngs.global",
     "credentials": {
@@ -207,5 +211,9 @@ npm test              # vitest run
 `package.json`); the plugin is loaded as TypeScript via OpenClaw's plugin loader. Packaging /
 publish to ClawHub is a known open question — see `../../docs/PACKAGING.md` and STATUS.md.
 
-The plugin serves no static UI. It exposes the `/webchannel/ws` WebSocket route; a consumer
-wires the headless `packages/client` library into their own page (see that package's README).
+The plugin serves no static UI. The **production** entry (`index-nats.ts`) exposes the
+plain-HTTP register routes `/webchannel/nats/register`, `/webchannel/nats/register/challenge`,
+and `/webchannel/nats/unregister` (used only by the `register-hop` admission mode; the browser
+otherwise reaches the agent over NATS, not HTTP). The **legacy dev-only** entry (`index.ts`)
+exposes the `/webchannel/ws` WebSocket route instead. Either way a consumer wires the headless
+`packages/client` library into their own page (see that package's README).

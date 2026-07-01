@@ -25,6 +25,12 @@ registration uses a wildcard subscription instead of the HTTP register hop (see 
 Your real `~/.openclaw` and gateway are **never touched** — everything runs under an isolated
 `OPENCLAW_HOME`.
 
+> **Want to actually chat with the agent?** `./run-demo.sh` is the **single interactive demo** —
+> it boots this same enrolled-NATS topology against your real model/provider config and serves a
+> browser chat page (Ctrl+C tears it down). For the split host(Mac)/container variant see
+> [`../../docs/SPLIT_DEMO.md`](../../docs/SPLIT_DEMO.md). The harnesses below are headless
+> one-shot proofs, not the interactive demo.
+
 ## Files
 
 | File | Role |
@@ -66,8 +72,8 @@ node e2e/local/echo-openai-server.mjs 18900 &
 #    - channels.webchannel = { auth: { strategy: "hmac-ticket", ticketSecret: { env: "WEBCHANNEL_TICKET_SECRET" } },
 #        dmSecurity: "allowlist", allowFrom: ["web-anon"] }     # NOTE: no `nats`/`encryption` keys — schema rejects them
 #    - plugins.load.paths = ["<repo>/packages/plugin"]
-#    Point the webchannel plugin entry at index-nats: temporarily set
-#    packages/plugin/package.json  openclaw.extensions = ["./index-nats.ts"]  (revert after).
+#    The plugin entry is ALREADY index-nats.ts by default
+#    (packages/plugin/package.json openclaw.extensions = ["./index-nats.ts"]) — nothing to swap.
 
 # 4. boot the isolated gateway in dev/open-NATS mode (env-driven — see the contract below)
 OPENCLAW_HOME="$OCH" WEBCHANNEL_TICKET_SECRET=e2e-ticket-secret OPENCLAW_DISABLE_BONJOUR=1 \

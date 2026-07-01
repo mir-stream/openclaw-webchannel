@@ -197,7 +197,9 @@ openclaw-webchannel/              # 레포 루트 = 워크스페이스 매니저
         └── src/                   # index.ts(배럴), client.ts(WebChannelClient), types.ts, client.test.ts
 ```
 
-> **게이트웨이 로딩:** `plugins.load.paths`는 이제 `…/openclaw-webchannel/packages/plugin`(레포 루트가 아니라 플러그인 패키지)을 가리킨다. `openclaw.extensions`는 그 패키지 기준 `./index.ts`. SDK(`openclaw/plugin-sdk`)는 전역 설치본을 가리키는 `node_modules/openclaw` 심링크로 해석(워크스페이스 install이 prune하므로 재생성 필요).
+> **게이트웨이 로딩:** `plugins.load.paths`는 이제 `…/openclaw-webchannel/packages/plugin`(레포 루트가 아니라 플러그인 패키지)을 가리킨다. `openclaw.extensions`는 그 패키지 기준 진입점. SDK(`openclaw/plugin-sdk`)는 전역 설치본을 가리키는 `node_modules/openclaw` 심링크로 해석(워크스페이스 install이 prune하므로 재생성 필요).
+>
+> **(superseded — 진입점은 이제 `./index-nats.ts`(NATS E2E)가 production 기본값이고, `./index.ts`(Gateway-WS, hmac-ticket)는 legacy dev-only. 아래 index.ts/hmac 언급은 역사적 스냅샷; 현행 상태는 `STATUS.md` 참조.)**
 
 ### 핵심 SDK 표면
 - `openclaw/plugin-sdk/channel-core` — `createChatChannelPlugin`, `defineChannelPluginEntry`
