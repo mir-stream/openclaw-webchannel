@@ -100,11 +100,11 @@ export type WebChannelOptions = {
    */
   path?: string;
   /**
-   * Supplies a short-lived signed ticket for the `hmac-ticket` server strategy.
-   * Called on EVERY (re)connect so a reconnect always gets a FRESH ticket (the
-   * host session is long-lived, the ticket is short-lived — AUTH.md §5/§6).
-   * Returning null/empty connects with no ticket (anonymous / cookie /
-   * trusted-header auth).
+   * Supplies a short-lived token for the `jwt` server strategy (delivered on the
+   * WS upgrade URL as `?ticket=<jwt>`). Called on EVERY (re)connect so a
+   * reconnect always gets a FRESH token (the host session is long-lived, the
+   * token is short-lived — AUTH.md §5). Returning null/empty connects with no
+   * token (cookie / trusted-header auth).
    */
   getTicket?: () => Promise<string | null>;
   // -----------------------------------------------------------------------

@@ -1,6 +1,5 @@
 import type { IncomingMessage } from "node:http";
 
-import { verifyTicket } from "./ticket.js";
 import { verifyJwt } from "./jwt.js";
 import type { JwtIdentity } from "./jwt.js";
 import { JWKSCache } from "./jwks.js";
@@ -10,7 +9,7 @@ import { JWKSCache } from "./jwks.js";
  * contract — a `ConnectionVerifier` run in `transport.handleUpgrade`. Its result
  * (`peerId`) becomes the session key, so closing the auth hole also gives us
  * per-user session separation. This file is SDK-free and `ws`-free; it needs
- * only `node:http` types + `./ticket.js`.
+ * only `node:http` types + `./jwt.js`.
  */
 
 /**
@@ -96,18 +95,12 @@ export type AuthLogger = {
 /**
  * A secret may be given inline (a plain string, discouraged) or as an env
  * reference resolved from `process.env` at startup. Richer SecretRef forms
- * (file/exec) are intentionally out of scope here.
+ * (file/exec) are intentionally out of scope here. Consumed by the NATS
+ * static-credential source (`nats-credential-source.ts`).
  */
 export type SecretRef = string | { env: string };
 
 export type AnonymousAuthConfig = { strategy: "anonymous" };
-
-export type HmacTicketAuthConfig = {
-  strategy: "hmac-ticket";
-  ticketSecret: SecretRef;
-  /** Query param the ticket arrives in. Default `"ticket"`. */
-  ticketParam?: string;
-};
 
 /**
  * JWT (RS256 / JWKS) auth config. The gateway validates compact JWTs against
@@ -163,37 +156,7 @@ export type JwtAuthConfig = {
   };
 };
 
-export type AuthConfig = AnonymousAuthConfig | HmacTicketAuthConfig | JwtAuthConfig;
-
-/**
- * Resolve a `SecretRef` to a concrete secret string at startup. Throws on an
- * empty/missing value so misconfiguration fails loudly at plugin load rather
- * than silently producing a verifier that rejects every connection.
- */
-function resolveSecret(ref: SecretRef): string {
-  // TODO(secretref): support OpenClaw's richer SecretRef forms (file/exec) once
-  // the seam needs them; env + inline cover the SaaS handoff case today.
-  if (typeof ref === "string") {
-    if (ref.length === 0) {
-      throw new Error(
-        "webchannel: channels.webchannel.auth.ticketSecret is an empty string. Refusing to start.",
-      );
-    }
-    return ref;
-  }
-  if (ref && typeof ref === "object" && typeof ref.env === "string") {
-    const value = process.env[ref.env];
-    if (!value) {
-      throw new Error(
-        `webchannel: channels.webchannel.auth.ticketSecret env "${ref.env}" is unset or empty. Refusing to start.`,
-      );
-    }
-    return value;
-  }
-  throw new Error(
-    "webchannel: channels.webchannel.auth.ticketSecret must be a string or { env: \"VAR_NAME\" }. Refusing to start.",
-  );
-}
+export type AuthConfig = AnonymousAuthConfig | JwtAuthConfig;
 
 /** Read a single query param value from a raw request URL (path+query). */
 function readQueryParam(reqUrl: string | undefined, param: string): string | null {
@@ -212,11 +175,11 @@ function readQueryParam(reqUrl: string | undefined, param: string): string | nul
 function makeAnonymousVerifier(logger?: AuthLogger): ConnectionVerifier {
   // AC 4: Anonymous strategy is now REJECTED to prevent open-admission security hole.
   // All connections MUST be authenticated with SaaS-attested keys (cnf claim).
-  // Operators must use 'jwt' or 'hmac-ticket' strategy with proper verification.
+  // Operators must use the 'jwt' strategy with proper verification.
   const errorMsg =
     "webchannel: auth strategy 'anonymous' is disabled — " +
     "AC 4 requires SaaS-attested device keys (cnf claim). " +
-    "Use 'jwt' strategy with JWKS verification or 'hmac-ticket' strategy. " +
+    "Use the 'jwt' strategy with JWKS verification. " +
     "Refusing to start.";
   logger?.error?.(errorMsg);
   throw new Error(errorMsg);
@@ -225,30 +188,13 @@ function makeAnonymousVerifier(logger?: AuthLogger): ConnectionVerifier {
   // security violation in Phase B. Callers must use authenticated strategies.
 }
 
-function makeHmacTicketVerifier(
-  config: HmacTicketAuthConfig,
-): ConnectionVerifier {
-  const secret = resolveSecret(config.ticketSecret);
-  const ticketParam = config.ticketParam ?? "ticket";
-  return async (req: IncomingMessage) => {
-    const token = readQueryParam(req.url, ticketParam);
-    if (!token) return null;
-    const identity = verifyTicket(token, secret);
-    if (!identity) return null;
-    return identity.name !== undefined
-      ? { peerId: identity.sub, displayName: identity.name }
-      : { peerId: identity.sub };
-  };
-}
-
 /**
  * Build a `ConnectionVerifier` for the `jwt` (RS256 / JWKS) strategy.
  *
  * Fail-closed (AC1): throws at construction if any of the three required
  * `auth.jwt.{issuer, audience, (jwksUrl|jwks|jwksFile)}` fields is missing.
- * This matches the existing `hmac-ticket` behavior — missing config means the
- * plugin refuses to start, NOT that the gateway silently accepts unauthed
- * upgrades.
+ * Missing config means the plugin refuses to start, NOT that the gateway
+ * silently accepts unauthed upgrades.
  *
  * The returned verifier resolves the configured JWKS lazily via the injected
  * `JWKSCache` and calls `verifyJwt` per upgrade. JWKS I/O errors propagate as
@@ -329,8 +275,8 @@ function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
  * the safe behavior, and the caller (index.ts) lets this propagate so plugin
  * load fails loudly.
  *
- * AC 4: 'anonymous' strategy is disabled — only authenticated strategies
- * ('jwt' with cnf claim, or 'hmac-ticket') are allowed.
+ * AC 4: 'anonymous' strategy is disabled — only the authenticated 'jwt'
+ * strategy (with cnf claim) is allowed.
  */
 export function resolveVerifier(
   authConfig: AuthConfig | undefined | null,
@@ -338,7 +284,7 @@ export function resolveVerifier(
 ): ConnectionVerifier {
   if (!authConfig || typeof authConfig !== "object" || !("strategy" in authConfig)) {
     throw new Error(
-      "webchannel: channels.webchannel.auth.strategy is required (jwt | hmac-ticket). Refusing to start.",
+      "webchannel: channels.webchannel.auth.strategy is required (jwt). Refusing to start.",
     );
   }
 
@@ -346,13 +292,11 @@ export function resolveVerifier(
     case "anonymous":
       // AC 4: Anonymous is now disabled — throw to prevent open-admission hole
       return makeAnonymousVerifier(logger);
-    case "hmac-ticket":
-      return makeHmacTicketVerifier(authConfig);
     case "jwt":
       return makeJwtVerifier(authConfig);
     default:
       throw new Error(
-        `webchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected jwt | hmac-ticket). Refusing to start.`,
+        `webchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected jwt). Refusing to start.`,
       );
   }
 }

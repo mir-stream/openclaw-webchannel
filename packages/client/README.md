@@ -27,14 +27,13 @@ truth for what is and isn't done.
   (NATS-layer NKEY-auth + X25519 handshake + PoP register hop). Ciphertext-only on
   the wire.
 - `WebChannelClient` (Gateway-WS) — **legacy / dev-only.** A zero-infra WS
-  round-trip exercised by `smoke-client.mjs`. No production role; slated for
-  removal (see the repo `docs/BACKLOG.md`).
+  round-trip. No production role; slated for removal (see the repo
+  `docs/BACKLOG.md`).
 
 ## Usage (Gateway-WS)
 
 The client takes options and pushes immutable state snapshots to subscribers.
-This mirrors `smoke-client.mjs`, a working round-trip against a live gateway with
-the `hmac-ticket` auth strategy:
+A working round-trip against a live gateway with the `jwt` auth strategy:
 
 ```js
 import { WebChannelClient } from "openclaw-webchannel-client";
@@ -43,9 +42,9 @@ const client = new WebChannelClient({
   // Cross-origin gateway. For same-origin, use `path` instead (defaults to
   // "/webchannel/ws").
   url: "ws://127.0.0.1:18789/webchannel/ws",
-  // Called on every (re)connect to mint a FRESH short-lived ticket. Return
-  // null/empty to connect anonymously (when the gateway allows it).
-  getTicket: async () => mintTicket("web-anon"),
+  // Called on every (re)connect to supply a FRESH short-lived JWT for the
+  // `jwt` server strategy (delivered as `?ticket=<jwt>`).
+  getTicket: async () => mintJwt("web-anon"),
 });
 
 // State is owned by the client; subscribe for immutable snapshots.
@@ -114,6 +113,5 @@ This package is a headless library only — there is no bundled demo UI. A
 consumer imports `WebChannelClient` and wires it into their own page (vanilla
 DOM, Vue, or a thin React `useSyncExternalStore` hook).
 
-`smoke-client.mjs` is a live round-trip against a running gateway with
-`hmac-ticket` auth — run it with `WEBCHANNEL_TICKET_SECRET` set (from
-`~/.openclaw/.env`) after `npm run build`.
+For a live round-trip against a running gateway with `jwt` auth, supply a signed
+JWT via `getTicket` (see the repo `smoke/jwt.mjs`) after `npm run build`.

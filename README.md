@@ -34,7 +34,7 @@ removal is a separate backlog item ([`docs/BACKLOG.md`](docs/BACKLOG.md)).
 | E2E crypto (X25519 + HKDF + ChaCha20-Poly1305), envelope, NATS transport | ✅ done, component-tested |
 | Trust chain (`packages/saas`): `setupTrustChain`, device-flow enrollment, NATS user creds | ✅ done, tested on a real nats-server |
 | Browser dialing NATS in the production client (`WebChannelNatsClient`) | ✅ live (NKEY-auth + X25519 handshake, ciphertext-only) |
-| Gateway-WS channel (`index.ts`, hmac-ticket) | 🔧 legacy / dev-only zero-infra WS round-trip |
+| Gateway-WS channel (`index.ts`, `jwt` upgrade) | 🔧 legacy / dev-only zero-infra WS round-trip |
 | Packaging / publish to ClawHub | ❌ incomplete (`docs/PACKAGING.md`) |
 
 Full detail, and reconciliation of the conflicting "AC 100% / complete" signals, is in
@@ -65,7 +65,7 @@ It reuses your real `~/.openclaw` model/provider config (so the agent answers wi
 while keeping everything else under an isolated `OPENCLAW_HOME`. For the split host/container
 walkthrough (real browser on the Mac ↔ agent in a container over the LAN), see
 [`docs/SPLIT_DEMO.md`](docs/SPLIT_DEMO.md). The legacy Gateway-WS round-trip lives in
-`smoke/*.mjs` and `packages/client/smoke-client.mjs` (dev-only).
+`smoke/*.mjs` (dev-only; `smoke/jwt.mjs` is the `jwt`-auth WS smoke).
 
 ## Develop / test
 

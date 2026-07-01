@@ -3,12 +3,14 @@
 > 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 인증 설계 기준 문서다.
 
 > ⚠️ **범위 주의 (production vs legacy).** 이 문서(§1–9)는 **legacy Gateway-WS** 경로의
-> 인증(ConnectionVerifier + `hmac-ticket`/`jwt`/`trusted-header` 전략)을 기술한다. **production
-> 경로는 NATS E2E**(`index-nats.ts`, 기본값)이며 그 admission은 다르다: enrolled 경로는
+> 인증(ConnectionVerifier + `jwt`/`trusted-header` 전략)을 기술한다. (구 `hmac-ticket` 전략은
+> legacy로 **완전히 제거됨** — `src/ticket.ts` 및 `src/auth.ts`의 hmac 설정/검증기/switch case,
+> 스키마 enum·`ticketSecret` 모두 삭제.) **production 경로는 NATS E2E**(`index-nats.ts`, 기본값)이며
+> 그 admission은 다르다: enrolled 경로는
 > `auto` admission으로 **`channels.webchannel.auth` 블록이 아예 필요 없고**(verifier는
 > `register-hop` admission일 때만 빌드됨), 브라우저 admission = NATS subject-permissioned NKEY
 > creds + X25519 핸드셰이크 (+ 선택적 `dmSecurity` allowlist). register-hop admission일 때만
-> bootstrap-JWT(RS256/JWKS + PoP)를 검증한다. `hmac-ticket`/`anonymous`는 **legacy Gateway-WS
+> bootstrap-JWT(RS256/JWKS + PoP)를 검증한다. `anonymous`는 **legacy Gateway-WS
 > 전용**이며 NATS 경로에서는 아무 역할도 없다.
 
 > 브라우저 클라이언트가 게이트웨이 WebSocket에 붙을 때의 **인증·신원(identity)** 모델.
@@ -61,8 +63,7 @@ type ConnectionVerifier = (req: IncomingMessage) => Promise<ConnectionIdentity |
 | strategy | 검증 방법 | 누가 씀 |
 |---|---|---|
 | `anonymous` | ~~검증 없음, 전원 단일 peer~~ — **load 시 throw로 거부됨** (`src/auth.ts`) | 실질적으로 사용 불가 (아래 §7 참조) |
-| `hmac-ticket` | 호스트 백엔드가 `{sub,exp}` 서명 → 공유 시크릿으로 검증 | **우리 SaaS** |
-| `jwt` ✅ 구현됨 | RS256 + JWKS 공개키 + `iss`/`aud` 검증 | 이미 JWT 발급하는 호스트 (Auth0 / Clerk / Keycloak / 자체 IdP) |
+| `jwt` ✅ 구현됨 | RS256 + JWKS 공개키 + `iss`/`aud` 검증 | 이미 JWT 발급하는 호스트 (Auth0 / Clerk / Keycloak / 자체 IdP) · **우리 SaaS** |
 | `trusted-header` | 프록시가 주입한 신원 헤더 읽기 | 게이트웨이가 trusted-proxy 뒤일 때 |
 
 소비자 OpenClaw config (이 스키마는 `openclaw.plugin.json`의 `channelConfigs.webchannel.schema`가 검증):
@@ -71,9 +72,13 @@ type ConnectionVerifier = (req: IncomingMessage) => Promise<ConnectionIdentity |
 channels: {
   webchannel: {
     auth: {
-      strategy: "hmac-ticket",
-      // 시크릿은 평문 금지 — OpenClaw SecretRef(env/file/exec) 사용
-      ticketSecret: { env: "WEBCHANNEL_TICKET_SECRET" },
+      strategy: "jwt",
+      jwt: {
+        // 정확히 1개 필수 (jwksUrl | jwksFile | jwks)
+        jwksUrl: "https://your-tenant.auth0.com/.well-known/jwks.json",
+        issuer: "https://your-tenant.auth0.com/",
+        audience: "https://api.your-saas.example/webchannel",
+      },
     },
   },
 }
@@ -97,14 +102,15 @@ createWebChannel({
 
 ---
 
-## 5. ticket 수명주기 (`hmac-ticket`)
+## 5. 토큰 수명주기 (`jwt`)
 
-수명이 3층으로 분리된다 — **단명 ticket은 "접속하는 순간"에만 적용**되고 대화 길이와 무관하다.
+수명이 3층으로 분리된다 — **단명 토큰은 "접속하는 순간"에만 적용**되고 대화 길이와 무관하다.
+(jwt 전략 역시 접속 시 `?ticket=`로 짧은 수명 서명 토큰을 실어 보내므로 동일한 구조를 따른다.)
 
 | | 수명 | 역할 |
 |---|---|---|
 | SaaS 세션(구글 로그인) | 길다 (시간~일) | 진짜 신원. 위젯이 가진 쿠키 |
-| **ticket** | 짧다 (~1분) | 소켓 여는 **한 번**만 쓰는 입장표 |
+| **토큰 (jwt)** | 짧다 (분 단위) | 소켓 여는 **한 번**만 쓰는 입장표 (RS256 서명 JWT) |
 | WS 연결 | 열려있는 내내 | 실제 대화 통로 |
 
 - ticket은 `handleUpgrade`에서 검증되고 소켓이 열리는 순간 임무 끝. 이후 만료돼도 **열린 대화엔 영향 없음.**
@@ -122,8 +128,8 @@ createWebChannel({
 | 재연결 | — | 끊기면 `getTicket` 재호출 → 새 표로 재연결 |
 
 - 클라이언트도 인증을 *모른다*. "호스트야 표 줘" 하고 나르기만. `trusted-header`/쿠키 방식이면 `getTicket`은 no-op.
-- **ticket 발급 헬퍼:** `issueWebChannelTicket({ sub, secret, ttlSeconds })` — 호스트 백엔드가 서명에 사용.
-  서명/검증 코드가 **두 독립 Node 프로세스(SaaS 백엔드 + 게이트웨이 플러그인)**에서 동일해야 하므로 **zero-dep**(SDK 안 물게)으로 제공. → `PACKAGING.md` §3 참조.
+- **토큰 발급:** 호스트(SaaS) 백엔드가 자체 IdP/서명키로 짧은 수명 RS256 JWT를 발급하고,
+  게이트웨이 플러그인은 **JWKS 공개키로 검증만** 한다(공유 시크릿 없음 — 비대칭 서명). → §10 `jwt` 빌트인 참조.
 
 ---
 
@@ -141,26 +147,25 @@ createWebChannel({
 
 | 위치 | 동작 |
 |---|---|
-| `src/auth.ts` | `ConnectionVerifier` 계약 + `anonymous`/`hmac-ticket`/`jwt` 전략 + `resolveVerifier`(안전 기본값) |
-| `src/ticket.ts` | zero-dep HS256 발급(`issueWebChannelTicket`)/검증(`verifyTicket`, alg 핀·timing-safe·exp) |
+| `src/auth.ts` | `ConnectionVerifier` 계약 + `anonymous`/`jwt` 전략 + `resolveVerifier`(안전 기본값) |
 | `src/jwt.ts` | zero-dep RS256 검증(`verifyJwt`, alg 핀 RS256·constant-time iss/aud·exp·Web Crypto `verify`) |
 | `src/jwks.ts` | JWKS fetcher + 5분 TTL 캐시 + kid 조회 + fail-closed (`JWKSCache`); URL / 파일 / 인라인 3종 소스 |
 | `src/transport.ts` `handleUpgrade` | 검증기 실행 → 실패 시 401+destroy, 성공 시 `peerId`로 `registerConnection` |
 | `src/inbound.ts` / `approvals.ts` | per-peer 라우팅 — 답변/progress는 캡처된 `wsKey`, 승인은 `turnSourceTo`(= 출발 peer) |
 | `index.ts` | config `channels.webchannel.auth` → `resolveVerifier` → `transport.setVerifier` + WS·정적 라우트 |
-| `openclaw.plugin.json` | `channelConfigs.webchannel.schema.auth`(strategy enum + ticketSecret string\|{env} + ticketParam + `auth.jwt.{jwksUrl,jwks,jwksFile,issuer,audience,clockSkew}`) |
+| `openclaw.plugin.json` | `channelConfigs.webchannel.schema.auth`(strategy enum + ticketParam + `auth.jwt.{jwksUrl,jwks,jwksFile,issuer,audience,clockSkew}`) |
 | `openclaw-webchannel-client` (`packages/client/src/client.ts`) | `getTicket` 주입 → `?ticket=` + 재연결 재발급. (구 위젯 훅 `useWebChannel.ts`는 삭제) |
-| `smoke/jwt.mjs`, `smoke-client.mjs` | node smoke 스크립트가 발급측(RS256 / hmac)을 수행해 라이브 게이트웨이 E2E 검증 |
+| `smoke/jwt.mjs` | node smoke 스크립트가 발급측(RS256)을 수행해 라이브 게이트웨이 E2E 검증 |
 
-→ **hmac-ticket E2E 라이브 검증됨(2026-06-15):** 유효 ticket 연결 + 에이전트 응답, 미·오 ticket 거절. (멀티유저 outbound/approval 라우팅 포함 — 더는 미해결 아님)
-→ **jwt 빌트인 검증됨(2026-06-20):** vitest 53 케이스(RS256 7종 거절 + JWKS TTL·fail-closed·kid 회전 + auth fail-closed) 모두 통과. hmac-ticket 회귀 없음.
+→ **jwt 빌트인 검증됨(2026-06-20):** vitest 53 케이스(RS256 7종 거절 + JWKS TTL·fail-closed·kid 회전 + auth fail-closed) 모두 통과. (멀티유저 outbound/approval 라우팅 포함 — 더는 미해결 아님)
+→ 구 `hmac-ticket` 전략은 legacy로 제거됨(§4 참조) — 이 표의 `src/ticket.ts`/hmac smoke 항목도 함께 삭제.
 
 ---
 
 ## 9. 미해결(후속)
 
 - **크로스오리진 게이트웨이 URL:** `openclaw-webchannel-client`는 `url` 옵션으로 **해결됨**(다른 오리진 게이트웨이 직접 지정). same-origin이면 `path`만으로 충분.
-- **SaaS 실연동:** 현재 발급측 검증은 **node smoke 스크립트**(`smoke/jwt.mjs` 등, DEV 전용)가 수행. 실서비스는 SaaS 백엔드가 서버측 `issueWebChannelTicket`로 발급 → 클라이언트 `getTicket`이 호출. ticket 서명 모듈은 `openclaw-webchannel-ticket`로 분리 후보(`PACKAGING.md` §3).
+- **SaaS 실연동:** 현재 발급측 검증은 **node smoke 스크립트**(`smoke/jwt.mjs` 등, DEV 전용)가 수행. 실서비스는 SaaS 백엔드가 자기 개인키로 RS256 JWT를 서명해 발급 → 클라이언트 `getTicket`이 호출 → 게이트웨이가 JWKS 공개키로 검증(공유 시크릿 없음).
 - **세션 중 강제 만료(revocation):** 이미 열린 소켓은 자동으로 안 닫힘. SaaS 로그아웃/만료 시 즉시 끊으려면 별도 처리(heartbeat 재검증 또는 서버측 강제 close). 또한 **잘못된 ticket 시 클라이언트가 재연결 루프**(앰버) — "인증 실패" UX 미구현.
 - `trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입은 후순위.
 - 멀티탭 사용자를 같은 peerId로 묶을지/탭별 분리할지 정책.
@@ -198,7 +203,7 @@ channels: {
 - `issuer` / `audience`: 필수. `aud`는 string 또는 배열 모두 허용 (배열인 경우 expected audience가 하나라도 포함되면 통과).
 - `clockSkew`: exp leeway (초). 기본 60.
 - 셋 중 어느 JWKS 소스도 없거나 2개 이상이면 `resolveVerifier`가 throw → 플러그인 로드 실패 (fail-closed).
-- ticketParam 기본값 `"ticket"` — hmac-ticket과 동일.
+- ticketParam 기본값 `"ticket"` — jwt 전략이 `?ticket=` 캐리어로 토큰을 전달할 때 쓰는 쿼리 키.
 
 ### 10.2 외부 IdP 연동
 
@@ -225,7 +230,7 @@ IdP가 새 키로 회전하면:
 - `sub` 비어 있으면 거절.
 - `displayName` = `name` 또는 `preferred_username` (OIDC 관례) → 있으면 채워서 반환.
 - 3-segment / base64url 디코드 / JSON 파싱 어느 하나 실패해도 모두 `null` 반환 (절대 throw 안 함 — 인프라 에러는 JWKS 레이어에서 throw).
-- `verifyJwt`는 항상 `Promise<JwtIdentity | null>` — `verifyTicket`(HS256)과 동일한 fail-soft 시맨틱.
+- `verifyJwt`는 항상 `Promise<JwtIdentity | null>` — 인증 실패는 예외가 아니라 `null` 반환(fail-soft).
 
 ### 10.5 검증
 

@@ -32,7 +32,7 @@ describe("resolveAdmissionMode", () => {
 
   it("no register hop available → auto (static / BYO-NATS — no issuer / register hop)", () => {
     // static maps to registerHopAvailable=false for every strategy.
-    expect(resolveAdmissionMode({ registerHopAvailable: false, authStrategy: "hmac-ticket" })).toBe("auto");
+    expect(resolveAdmissionMode({ registerHopAvailable: false, authStrategy: "anonymous" })).toBe("auto");
     expect(resolveAdmissionMode({ registerHopAvailable: false, authStrategy: undefined })).toBe("auto");
     // Even if someone configures jwt strategy, no viable hop biases toward auto.
     expect(resolveAdmissionMode({ registerHopAvailable: false, authStrategy: "jwt" })).toBe("auto");
@@ -45,9 +45,7 @@ describe("resolveAdmissionMode", () => {
     expect(resolveAdmissionMode({ registerHopAvailable: true, authStrategy: "jwt" })).toBe("register-hop");
   });
 
-  it("non-jwt with a viable hop → auto (hmac-ticket / anonymous / open)", () => {
-    // open (devOpen) + hmac → auto.
-    expect(resolveAdmissionMode({ registerHopAvailable: true, authStrategy: "hmac-ticket" })).toBe("auto");
+  it("non-jwt with a viable hop → auto (anonymous / no-strategy / open)", () => {
     // open (devOpen) + anonymous → auto.
     expect(resolveAdmissionMode({ registerHopAvailable: true, authStrategy: "anonymous" })).toBe("auto");
     // enrolled + no strategy → auto.
@@ -57,8 +55,8 @@ describe("resolveAdmissionMode", () => {
   it("preserves the legacy devOpen-harness decisions exactly", () => {
     // devOpen (open, registerHopAvailable=true) + jwt → register-hop (HTTP hop is sole path).
     expect(resolveAdmissionMode({ registerHopAvailable: true, authStrategy: "jwt" })).toBe("register-hop");
-    // devOpen (open) + hmac → auto (wildcard auto-register convenience).
-    expect(resolveAdmissionMode({ registerHopAvailable: true, authStrategy: "hmac-ticket" })).toBe("auto");
+    // devOpen (open) + non-jwt → auto (wildcard auto-register convenience).
+    expect(resolveAdmissionMode({ registerHopAvailable: true, authStrategy: "anonymous" })).toBe("auto");
   });
 });
 

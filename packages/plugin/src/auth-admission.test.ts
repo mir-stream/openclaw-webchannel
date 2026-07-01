@@ -118,11 +118,11 @@ describe("Anonymous strategy rejection (AC 4)", () => {
     );
   });
 
-  it("should throw error suggesting jwt or hmac-ticket strategies", () => {
+  it("should throw error suggesting the jwt strategy", () => {
     const anonConfig: AuthConfig = { strategy: "anonymous" };
 
     expect(() => resolveVerifier(anonConfig)).toThrow(
-      /Use 'jwt' strategy with JWKS verification or 'hmac-ticket' strategy/,
+      /Use the 'jwt' strategy with JWKS verification/,
     );
   });
 
@@ -142,22 +142,6 @@ describe("Anonymous strategy rejection (AC 4)", () => {
       };
 
       const verifier = resolveVerifier(jwtConfig);
-      expect(verifier).toBeDefined(); // Should not throw at strategy selection
-    } catch (e: unknown) {
-      // If it throws, it should be due to missing config, not strategy rejection
-      expect((e as Error).message).not.toContain(/unknown auth strategy/);
-    }
-  });
-
-  it("should accept hmac-ticket strategy", () => {
-    // This test verifies that hmac-ticket strategy is still accepted
-    try {
-      const hmacConfig: AuthConfig = {
-        strategy: "hmac-ticket",
-        ticketSecret: "test-secret",
-      };
-
-      const verifier = resolveVerifier(hmacConfig);
       expect(verifier).toBeDefined(); // Should not throw at strategy selection
     } catch (e: unknown) {
       // If it throws, it should be due to missing config, not strategy rejection
