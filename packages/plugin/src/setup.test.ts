@@ -87,15 +87,112 @@ describe("setup: resolveAccountId (canonicalization / trust boundary)", () => {
 });
 
 describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
-  it("writes a NAMED account under accounts.<id>", () => {
+  it("writes a NAMED account under accounts.<id> (full block when saasBaseUrl present)", () => {
     const cfg = { channels: {} } as never;
     const next = webchannelSetup.applyAccountConfig({
       cfg,
       accountId: "accta",
       input: { saasBaseUrl: "http://s", tenant: "t" },
     });
+    // saasBaseUrl present ⇒ the complete enroll-ready block is written under the
+    // named account (derived issuer = saasBaseUrl, audience = accountId).
     expect(section(next)).toEqual({
-      accounts: { accta: { tenant: "t", saas: { baseUrl: "http://s" } } },
+      accounts: {
+        accta: {
+          tenant: "t",
+          saas: { baseUrl: "http://s" },
+          auth: {
+            strategy: "jwt",
+            jwt: {
+              jwksUrl: "http://s/.well-known/jwks.json",
+              issuer: "http://s",
+              audience: "accta",
+            },
+          },
+          dmSecurity: "open",
+          nats: { admission: "auto", credentials: { mode: "enrolled" } },
+        },
+      },
+    });
+  });
+
+  it("writes only a PARTIAL block when saasBaseUrl is absent", () => {
+    const cfg = { channels: {} } as never;
+    const next = webchannelSetup.applyAccountConfig({
+      cfg,
+      accountId: "accta",
+      input: { tenant: "t" },
+    });
+    // No saasBaseUrl ⇒ partial write only (no auth/nats/dmSecurity emitted).
+    expect((section(next).accounts as Record<string, unknown>).accta).toEqual({
+      tenant: "t",
+    });
+  });
+
+  it("does NOT clobber a hand-tuned auth.jwt.issuer/audience on a full-block re-run", () => {
+    // Operator previously wrote a custom issuer/audience; a re-run that only
+    // updates identity (no explicit issuer/audience override) must preserve them.
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              auth: {
+                strategy: "jwt",
+                jwt: {
+                  jwksUrl: "http://s/.well-known/jwks.json",
+                  issuer: "http://custom-issuer",
+                  audience: "custom-aud",
+                },
+              },
+            },
+          },
+        },
+      },
+    } as never;
+    const next = webchannelSetup.applyAccountConfig({
+      cfg,
+      accountId: "accta",
+      input: { saasBaseUrl: "http://s", tenant: "t2" },
+    });
+    const accta = (section(next).accounts as Record<string, unknown>).accta as Record<
+      string,
+      unknown
+    >;
+    expect(accta.auth).toEqual({
+      strategy: "jwt",
+      jwt: {
+        jwksUrl: "http://s/.well-known/jwks.json",
+        issuer: "http://custom-issuer",
+        audience: "custom-aud",
+      },
+    });
+    expect(accta.tenant).toBe("t2");
+  });
+
+  it("lets an explicit issuer/audience override win on a full-block write", () => {
+    const cfg = { channels: {} } as never;
+    const next = webchannelSetup.applyAccountConfig({
+      cfg,
+      accountId: "accta",
+      input: {
+        saasBaseUrl: "http://host.docker.internal:3951",
+        tenant: "t",
+        issuer: "http://127.0.0.1:3951",
+        audience: "custom-aud",
+      },
+    });
+    const accta = (section(next).accounts as Record<string, unknown>).accta as Record<
+      string,
+      unknown
+    >;
+    expect(accta.auth).toEqual({
+      strategy: "jwt",
+      jwt: {
+        jwksUrl: "http://host.docker.internal:3951/.well-known/jwks.json",
+        issuer: "http://127.0.0.1:3951",
+        audience: "custom-aud",
+      },
     });
   });
 

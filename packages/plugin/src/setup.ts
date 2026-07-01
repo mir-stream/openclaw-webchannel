@@ -67,6 +67,11 @@ type WebchannelSetupInput = {
   // Generic CLI flags (fallback mapping).
   baseUrl?: string;
   url?: string;
+  // JWT auth overrides (advanced). Absent on the happy path — derived defaults
+  // (issuer = saasBaseUrl, audience = accountId) are used instead. Preserved
+  // across a re-run so a hand-tuned issuer/audience is never clobbered.
+  issuer?: string;
+  audience?: string;
   // Connection / credential-mode passthrough.
   credentialsMode?: "enrolled" | "static" | "open";
 } & Record<string, unknown>;
@@ -75,7 +80,17 @@ type WebchannelSetupInput = {
 type SetupRuntime = { log: (...args: unknown[]) => void };
 
 /** Keys whose nested object values are shallow-merged when writing a patch. */
-const NESTED_PATCH_KEYS = ["nats", "saas"] as const;
+const NESTED_PATCH_KEYS = ["nats", "saas", "auth"] as const;
+
+/**
+ * Sub-keys merged ONE MORE level deep under a nested patch key, so writing e.g.
+ * `nats.credentials.mode` does not drop a sibling `nats.credentials.saasBaseUrl`,
+ * and writing `auth.jwt.audience` does not drop a hand-tuned `auth.jwt.issuer`.
+ */
+const DEEP_PATCH_SUBKEYS: Record<string, readonly string[]> = {
+  nats: ["credentials"],
+  auth: ["jwt"],
+};
 
 /** Resolve the acquisition identity from a setup input (dedicated > generic). */
 export function resolveSetupIdentity(input: WebchannelSetupInput): {
@@ -108,7 +123,18 @@ export function buildAccountPatch(input: WebchannelSetupInput): Record<string, u
   return patch;
 }
 
-/** Shallow-merge a patch onto an account object, one level deep for nats/saas. */
+/** True for a plain (non-array) object we can shallow-merge into. */
+function isMergeableObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Shallow-merge a patch onto an account object, one level deep for nats/saas/auth
+ * and one further level for the known compound children (`nats.credentials`,
+ * `auth.jwt`) so a full-block write MERGES onto existing config rather than
+ * clobbering sibling fields (e.g. a re-run preserves a hand-tuned
+ * `auth.jwt.issuer` when only `auth.jwt.audience` is being written).
+ */
 function mergePatch(
   prev: Record<string, unknown>,
   patch: Record<string, unknown>,
@@ -117,18 +143,63 @@ function mergePatch(
   for (const key of NESTED_PATCH_KEYS) {
     const prevVal = prev[key];
     const patchVal = patch[key];
-    if (
-      prevVal &&
-      typeof prevVal === "object" &&
-      !Array.isArray(prevVal) &&
-      patchVal &&
-      typeof patchVal === "object" &&
-      !Array.isArray(patchVal)
-    ) {
-      next[key] = { ...(prevVal as object), ...(patchVal as object) };
+    if (isMergeableObject(prevVal) && isMergeableObject(patchVal)) {
+      const merged: Record<string, unknown> = { ...prevVal, ...patchVal };
+      for (const sub of DEEP_PATCH_SUBKEYS[key] ?? []) {
+        const prevSub = prevVal[sub];
+        const patchSub = patchVal[sub];
+        if (isMergeableObject(prevSub) && isMergeableObject(patchSub)) {
+          merged[sub] = { ...prevSub, ...patchSub };
+        }
+      }
+      next[key] = merged;
     }
   }
   return next;
+}
+
+/** Join a base URL and a path, collapsing any duplicated slash at the seam. */
+function joinUrl(baseUrl: string, path: string): string {
+  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
+}
+
+/**
+ * Build the COMPLETE, enroll-ready account block — the proven demo config
+ * (`e2e/local/run-demo-synadia.sh`): tenant + saas.baseUrl + jwt auth (jwksUrl
+ * derived from the SaaS base URL; issuer defaulting to the SaaS base URL;
+ * audience defaulting to the account id) + `dmSecurity: "open"` + enrolled NATS
+ * credentials under `admission: "auto"`.
+ *
+ * `nats.url` is intentionally OMITTED — the SaaS delivers the relay URL together
+ * with the enrolled credentials at device-flow time (it is the rendezvous
+ * authority), so pinning it in config would be redundant and drift-prone.
+ *
+ * Pure: no config read/write, no I/O. The two write seams (the non-interactive
+ * `applyAccountConfig` and the interactive wizard `finalize`) both funnel their
+ * full-block writes through this one builder.
+ */
+export function buildFullAccountPatch(params: {
+  tenant: string;
+  saasBaseUrl: string;
+  accountId: string;
+  issuer?: string;
+  audience?: string;
+}): Record<string, unknown> {
+  const { tenant, saasBaseUrl, accountId, issuer, audience } = params;
+  return {
+    tenant,
+    saas: { baseUrl: saasBaseUrl },
+    auth: {
+      strategy: "jwt",
+      jwt: {
+        jwksUrl: joinUrl(saasBaseUrl, ".well-known/jwks.json"),
+        issuer: issuer ?? saasBaseUrl,
+        audience: audience ?? accountId,
+      },
+    },
+    dmSecurity: "open",
+    nats: { admission: "auto", credentials: { mode: "enrolled" } },
+  };
 }
 
 /**
@@ -183,7 +254,22 @@ export const webchannelSetup = {
   resolveAccountId: ({ accountId }: { accountId?: string }): string =>
     canonicalizeAccountId(accountId),
 
-  /** Sync config WRITE: shape the account from flags. */
+  /**
+   * Sync config WRITE: shape the account from flags.
+   *
+   * This is the NON-INTERACTIVE (`--flag`) write seam. The interactive wizard
+   * writes atomically in its `finalize` (its text inputs use no-op `applySet`s
+   * and never reach here), so the two cases are distinguished purely by whether a
+   * `saasBaseUrl` is present in the input:
+   *   - `saasBaseUrl` PRESENT (`channels add --base-url <saas> …`) ⇒ write the
+   *     COMPLETE enroll-ready block (`buildFullAccountPatch`), MERGED onto any
+   *     existing account so a re-run preserves a hand-tuned `auth.jwt.issuer/
+   *     audience` (only fields we actually supply win).
+   *   - `saasBaseUrl` ABSENT (a genuine partial `--flag` run — e.g. setting only
+   *     `--url <tenant>` or the credential mode) ⇒ fall back to the partial
+   *     `buildAccountPatch` write. This guard is REQUIRED so a partial run never
+   *     emits a broken full block before a `saasBaseUrl` has been supplied.
+   */
   applyAccountConfig: ({
     cfg,
     accountId,
@@ -196,6 +282,24 @@ export const webchannelSetup = {
     // Defensive: even though core/our resolveAccountId canonicalizes, re-derive
     // here so a direct/programmatic caller can never inject a raw id.
     const id = canonicalizeAccountId(accountId);
+    const identity = resolveSetupIdentity(input);
+
+    if (identity.saasBaseUrl !== undefined) {
+      // Full-block seam. Read the existing account so a re-run preserves the
+      // operator's manual issuer/audience unless the flags explicitly override.
+      const existing = resolveWebchannelAccountConfig(cfg, id);
+      const existingJwt = (existing.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
+        ?.jwt;
+      const patch = buildFullAccountPatch({
+        tenant: identity.tenant ?? (existing.tenant as string | undefined) ?? "default-tenant",
+        saasBaseUrl: identity.saasBaseUrl,
+        accountId: id,
+        issuer: input.issuer ?? existingJwt?.issuer,
+        audience: input.audience ?? existingJwt?.audience,
+      });
+      return writeAccountConfig(cfg, id, patch);
+    }
+
     const patch = buildAccountPatch(input);
     // Always write (even an empty patch) so the account exists for `gateway run`
     // to list. For default with an empty patch on an empty config this is a no-op
