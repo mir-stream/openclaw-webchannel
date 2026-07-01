@@ -46,18 +46,7 @@
             "properties": {
               "strategy": {
                 "type": "string",
-                "enum": ["anonymous", "hmac-ticket", "jwt"]
-              },
-              "ticketSecret": {
-                "anyOf": [
-                  { "type": "string" },
-                  {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": { "env": { "type": "string" } },
-                    "required": ["env"]
-                  }
-                ]
+                "enum": ["anonymous", "jwt"]
               },
               "ticketParam": { "type": "string" },
               "requirePoP": {
@@ -271,15 +260,11 @@
       "uiHints": {
         "auth.strategy": {
           "label": "Auth strategy",
-          "help": "How browser connections are verified. Production runs the NATS path (index-nats): use \"jwt\" for the register-hop admission, or set NO auth at all for `auto` admission (browser is gated by NATS subject-permissioned creds + the X25519 handshake). \"hmac-ticket\" is LEGACY — it belongs to the dev-only Gateway-WS entry (index.ts) and is inert on the NATS path. \"anonymous\" is REJECTED at load (the plugin refuses to start)."
-        },
-        "auth.ticketSecret": {
-          "label": "Ticket secret",
-          "help": "Shared HMAC secret for the LEGACY dev-only \"hmac-ticket\" (Gateway-WS) strategy. Not used on the production NATS path. Use { \"env\": \"VAR_NAME\" } to read from an environment variable instead of inlining the secret."
+          "help": "How browser connections are verified. Production runs the NATS path (index-nats): use \"jwt\" for the register-hop admission, or set NO auth at all for `auto` admission (browser is gated by NATS subject-permissioned creds + the X25519 handshake). \"anonymous\" is REJECTED at load (the plugin refuses to start)."
         },
         "auth.ticketParam": {
           "label": "Ticket query param",
-          "help": "Query-string parameter the ticket arrives in on the WS upgrade URL. Defaults to \"ticket\"."
+          "help": "Query-string parameter the JWT arrives in on the WS upgrade URL. Defaults to \"ticket\"."
         },
         "auth.jwt.jwksUrl": {
           "label": "JWKS URL",

@@ -192,7 +192,7 @@ describe("resolveAndVerifyRegister (C2 — verify-and-register-into-SAME-account
 
   it("non-jwt-strategy resolved account → non-jwt (clearer 401, not a 500)", async () => {
     const accounts = new Map([
-      ["acctH", { accountId: "acctH", auth: { strategy: "hmac-ticket" }, channel: { registerPeer: vi.fn() } }],
+      ["acctH", { accountId: "acctH", auth: { strategy: "anonymous" }, channel: { registerPeer: vi.fn() } }],
     ]);
     const verify = vi.fn(async () => ({ peerId: "p" }));
     const res = await resolveAndVerifyRegister({

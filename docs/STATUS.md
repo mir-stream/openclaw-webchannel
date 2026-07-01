@@ -26,14 +26,15 @@ this file, **this file is correct.**
   verifier is only built for the `register-hop` admission mode. Browser admission there = NATS
   subject-permissioned NKEY creds + X25519 handshake (+ optional `dmSecurity` allowlist).
 - **The interactive demo is a single script**: [`e2e/local/run-demo.sh`](../e2e/local/README.md)
-  (enrolled NATS + real model). The old hmac Gateway-WS live-chat demo trio was deleted.
+  (enrolled NATS + real model). The old legacy Gateway-WS live-chat demo trio was deleted.
 - **The production NATS pair is also live in a REAL openclaw gateway** (`e384198`): a real
   headless-Chromium browser running the production `WebChannelNatsClient` round-trips an encrypted
   message through the `index-nats` plugin loaded in a real openclaw gateway → real `inbound.run` →
   (deterministic echo model) → back, decrypted. Reproduce via [`e2e/local/`](../e2e/local/README.md).
 - **The Gateway-WS path is LEGACY / dev-only** — a zero-infra WS round-trip (`smoke/*.mjs`), no
-  production role. `hmac-ticket` and `anonymous` belong to it. Full removal is tracked in
-  [`BACKLOG.md`](BACKLOG.md).
+  production role. `anonymous` belongs to it (the `hmac-ticket` auth strategy has since been
+  **removed** — `ticket.ts` + the `auth.ts` hmac config/verifier/switch + schema enum are gone).
+  Full removal of the transport itself is tracked in [`BACKLOG.md`](BACKLOG.md).
 - **The NATS E2E path also has an automated gate** (separate demo seam): a real headless-Chromium
   browser dials a real `nats-server`, round-trips a ChaCha20-Poly1305 message through an in-repo echo
   agent, and decrypts the reply — in **both** dev/open-NATS and enrolled-JWT modes, ciphertext-only on
@@ -53,7 +54,7 @@ this file, **this file is correct.**
 
 | Capability | Evidence |
 |---|---|
-| Gateway-WS channel: browser ↔ OpenClaw agent ↔ Claude | Runs on `ws://127.0.0.1:18789`; `packages/client/smoke-client.mjs` round-trips a message against a live gateway. `~/.openclaw/openclaw.json` loads the plugin in WS mode. |
+| Gateway-WS channel: browser ↔ OpenClaw agent ↔ Claude | Runs on `ws://127.0.0.1:18789`; `smoke/jwt.mjs` round-trips a message against a live gateway (`jwt` auth). `~/.openclaw/openclaw.json` loads the plugin in WS mode. |
 | E2E crypto: X25519 + HKDF-SHA256 + ChaCha20-Poly1305 (`packages/plugin/src/e2e-crypto.ts`, `e2e-envelope.ts`) | Unit-tested. |
 | NATS transport (`nats-transport.ts`), channel framing (`nats-channel.ts`, `crypto-nats-channel.ts`) | Unit + integration tests vs a real `nats-server`. |
 | Trust chain (`packages/saas`): `setupTrustChain` (operator/account JWTs, MEMORY resolver, JWKS), device-flow enrollment (RFC 8628), NATS user-cred minting | AC3 real-server permission isolation 7/7, AC6 device-flow E2E 10/10 — on a real `nats-server` (`@nats-io/nkeys` + `@nats-io/jwt`). |
@@ -78,8 +79,8 @@ this file, **this file is correct.**
 > Everything else that used to live here is now **done**. The live NATS E2E path (browser → NATS
 > → plugin/agent → reply → browser) is the production default and has run end-to-end on real
 > hardware (split host/container, real JWT-auth `nats-server`, real LLM). Full removal of the
-> legacy Gateway-WS + `hmac-ticket` transport is the only remaining structural cleanup — tracked
-> in [`BACKLOG.md`](BACKLOG.md), not a functional gap.
+> legacy Gateway-WS transport is the only remaining structural cleanup (the `hmac-ticket` auth
+> strategy is already removed) — tracked in [`BACKLOG.md`](BACKLOG.md), not a functional gap.
 
 ### Previously-open items, now closed
 
@@ -144,8 +145,9 @@ echo-bot demo built 2026-06-25 to fake the agent side made this worse and was re
    test-baseline check) now runs `e2e/local/run-jwt-register.sh`, so the **real** `openclaw gateway`
    + `index-nats` + `inbound.run` path is regression-guarded (any non-zero exit fails the gate;
    fully hermetic, no secret). The gate still ALSO drives the parallel
-   `e2e-browser-client`/`e2e-roundtrip-agent` vitest seam. Remaining: CI coverage for the hmac
-   `drive-roundtrip` + browser `browser-roundtrip` real-gateway harnesses, and the
+   `e2e-browser-client`/`e2e-roundtrip-agent` vitest seam. Remaining: CI coverage for the
+   `drive-roundtrip` (self-signed dev token, open-NATS path) + browser `browser-roundtrip`
+   real-gateway harnesses, and the
    browser/Playwright JWT variant (see #13).
 10. **Converge the demo pair into the production pair** (remove the parallel `e2e-roundtrip-agent` /
     `e2e-browser-client` implementations; point `e2e-browser-client` crypto at shared `e2e-crypto-browser`).

@@ -1,6 +1,8 @@
 # WebChannel — 기획서
 
 > 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 설계·계획 기준이며 명시된 날짜 시점 기준이다.
+>
+> ⚠️ **superseded — `hmac-ticket` 전략은 이후 완전히 제거됨.** 아래 `hmac-ticket`/`index.ts` 인증 관련 서술은 역사 스냅샷이며, 현행 인증은 `jwt`뿐이다 ([`AUTH.md`](AUTH.md) §4, [`BACKLOG.md`](BACKLOG.md)).
 
 > OpenClaw용 셀프호스트 웹 채널 플러그인 + 브라우저 클라이언트
 > 외부 위젯 SaaS(Now4real, Stream 등) 없이, 게이트웨이 위에서 바로 도는 웹 채팅 채널.

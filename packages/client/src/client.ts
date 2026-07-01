@@ -302,8 +302,8 @@ export class WebChannelClient {
         return;
       }
       if (!token) {
-        // No ticket → for hmac-ticket the server rejects the upgrade. Treat as a
-        // failed connection and back off.
+        // No token → for the jwt strategy the server rejects the upgrade. Treat
+        // as a failed connection and back off.
         this.connecting = false;
         this.scheduleReconnect();
         return;

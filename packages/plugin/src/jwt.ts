@@ -6,7 +6,7 @@
  * the compact JWT via `?ticket=` and the gateway validates it against a JWKS
  * public key resolved by `kid`.
  *
- * CONSTRAINTS (mirroring ticket.ts, src/jwt.ts's HMAC sibling):
+ * CONSTRAINTS:
  *  - Use only `globalThis.crypto.subtle` (Cloudflare Workers + Node 18+ both
  *    expose it as part of the Web Crypto API surface).
  *  - Pin `alg === "RS256"` — reject `none`, `HS256` (algorithm-confusion), and
@@ -148,8 +148,6 @@ export type VerifyJwtOptions = {
   audience: string;
   /**
    * Allowed clock-skew leeway in seconds when checking `exp`. Default 60.
-   * Mirrors the ticket.ts verifier's behavior so an operator gets consistent
-   * behavior between `hmac-ticket` and `jwt`.
    */
   clockSkewSec?: number;
 };

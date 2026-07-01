@@ -584,8 +584,8 @@ function waitForAbort(signal: AbortSignal): Promise<void> {
  * native runtime's `updateEntry` -> `approval_resolved`, so we do NOT emit the
  * resolved frame here (avoids double-finalize).
  *
- * `senderId` is REQUIRED: with hmac-ticket auth LIVE it is the verified peer id
- * (the WS sessionKey — see index.ts).
+ * `senderId` is REQUIRED: it is the verified peer id — the `jwt`-authenticated
+ * `sub` on the register hop, or the X25519-handshake peer on the NATS path.
  *
  * THIS FUNCTION IS THE AUTHORIZATION ENFORCEMENT POINT for the widget-click
  * path. The capability's `authorizeActorAction` hook does NOT protect this path:

@@ -38,7 +38,7 @@
  * by the caller as "the credential source is NOT bring-your-own static creds"):
  *   - enrolled production (jwt, hop available)   → register-hop (unchanged).
  *   - devOpen + jwt harness (hop available)      → register-hop (HTTP hop is sole path).
- *   - devOpen + hmac/anon harness                → auto (wildcard auto-register).
+ *   - devOpen + anon / no-strategy harness       → auto (wildcard auto-register).
  * and ADDS the new capability: static creds (no hop) + any strategy → auto.
  */
 

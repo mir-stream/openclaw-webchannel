@@ -98,8 +98,7 @@ The agent admits **only SaaS-attested device keys** and detects relay MITM at ha
   constant-time byte-equality; a mismatch (or missing pin, or bad length) throws
   `HandshakeMitmError` and aborts the handshake before any ECDH.
 - **No anonymous admission:** the `anonymous` auth strategy throws at plugin load
-  (`makeAnonymousVerifier` never returns a verifier) — connections must use `jwt` or
-  `hmac-ticket`.
+  (`makeAnonymousVerifier` never returns a verifier) — connections must use `jwt`.
 
 **Threat model (handled):** relay substitutes the device key → caught by the handshake compare;
 attacker skips bootstrap → no admission without a SaaS-attested key; forged `cnf` → JWT signature
@@ -132,8 +131,8 @@ credentials — **no SaaS issuer required**.
   // NO `auth` block needed: static creds resolve admission to "auto", and the
   // ConnectionVerifier is only built for the "register-hop" admission mode.
   // Browser admission here = NATS subject permissions + X25519 handshake
-  // (+ an optional `dmSecurity` allowlist). hmac-ticket/anonymous are legacy
-  // Gateway-WS strategies and are INERT on the NATS path.
+  // (+ an optional `dmSecurity` allowlist). The `jwt` register-hop strategy is
+  // the only alternative; it is INERT on this static/auto NATS path.
   "nats": {
     "url": "wss://connect.ngs.global",
     "credentials": {

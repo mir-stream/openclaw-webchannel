@@ -72,8 +72,9 @@ node e2e/local/echo-openai-server.mjs 18900 &
 #        models: [{ id: "echo", contextWindow: 200000, maxTokens: 8192 }] }
 #    - agents.defaults.model.primary = "echo-local/echo"
 #    - agents.defaults.compaction.reserveTokensFloor = 20000   # else tiny-context compaction errors
-#    - channels.webchannel = { auth: { strategy: "hmac-ticket", ticketSecret: { env: "WEBCHANNEL_TICKET_SECRET" } },
-#        dmSecurity: "allowlist", allowFrom: ["web-anon"] }     # NOTE: no `nats`/`encryption` keys — schema rejects them
+#    - channels.webchannel = { dmSecurity: "allowlist", allowFrom: ["web-anon"] }
+#        # NOTE: no `auth` block on the open-NATS `auto` path (no verifier is built);
+#        # no `nats`/`encryption` keys either — the schema rejects them here.
 #    - plugins.load.paths = ["<repo>/packages/plugin"]
 #    The plugin entry is ALREADY index-nats.ts by default
 #    (packages/plugin/package.json openclaw.extensions = ["./index-nats.ts"]) — nothing to swap.
@@ -99,7 +100,7 @@ Both drivers print `[REPLY] echo: …<your message>`, proving the round-trip.
 ## JWT-register scenario (HTTP hop as sole admission)
 
 `run-jwt-register.sh` proves the **HTTP `/webchannel/nats/register` route is the SOLE
-peer-admission path** — no wildcard shortcut. It is a sibling of the hmac round-trip above,
+peer-admission path** — no wildcard shortcut. It is a sibling of the open-NATS round-trip above,
 but boots the gateway with `channels.webchannel.auth.strategy = "jwt"`. The wildcard is gated
 off on the jwt path (`index-nats.ts` / `src/wildcard-gate.ts` `shouldSubscribeWildcard`):
 under `auth.strategy="jwt"` the agent does **not** call `subscribeWildcard()`, so it is
@@ -188,8 +189,8 @@ Encryption stays **on** (encrypt-by-construction default); the relay only ever s
 ## Known gaps (why this is "live" but not yet "full production")
 
 - **Echo model, not a live LLM** — by design (hermetic). The agent path is real; only the brain is dumb.
-- **Wildcard auto-register (hmac harness only) vs. the HTTP register hop (now exercised)** — the
-  hmac dev harness browser connects with an hmac-ticket and does not call the HTTP register route,
+- **Wildcard auto-register (open-NATS harness only) vs. the HTTP register hop (now exercised)** — the
+  open-NATS dev harness connects on the wildcard path and does not call the HTTP register route,
   so that path uses `NatsChannel.subscribeWildcard()` (the allowlist gate still runs). The HTTP
   register hop is now **exercised end-to-end** by the JWT-register scenario above
   (`run-jwt-register.sh`): under `auth.strategy="jwt"` the wildcard is gated OFF
@@ -201,7 +202,7 @@ Encryption stays **on** (encrypt-by-construction default); the relay only ever s
 - **In CI (JWT-register harness)** — `run-jwt-register.sh` is now run by the CI gate
   (`.github/workflows/e2e-gate.yml`, step "Real-gateway live e2e (JWT register hop)"), so the
   real-gateway + `inbound.run` path is regression-guarded on every push/PR (follow-up #9, done for
-  this harness). Still manual (smaller remaining follow-up): the hmac `drive-roundtrip.ts` /
+  this harness). Still manual (smaller remaining follow-up): the open-NATS `drive-roundtrip.ts` /
   browser `browser-roundtrip.mjs` real-gateway variants, and the real **browser/Playwright** JWT
   variant against a real SaaS issuer (#13 — Playwright cannot pass an Ed25519 `CryptoKey` across the
   page boundary).

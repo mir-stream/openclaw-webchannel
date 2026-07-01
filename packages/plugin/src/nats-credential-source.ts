@@ -49,8 +49,8 @@ import {
 /**
  * Credential-source config under `channels.webchannel.nats.credentials`.
  *
- * Secrets (`userJwt` / `userSeed`) accept the same `string | { env }` SecretRef
- * shape as `auth.ticketSecret`, so operators never have to inline a secret in
+ * Secrets (`userJwt` / `userSeed`) accept the `string | { env }` `SecretRef`
+ * shape (see `auth.ts`), so operators never have to inline a secret in
  * committed config — they can reference an env var or point at a `.creds` file.
  */
 export type WebchannelNatsCredentialsConfig = {

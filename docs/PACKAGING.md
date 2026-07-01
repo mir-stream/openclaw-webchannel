@@ -1,6 +1,8 @@
 # WebChannel — 패키지화 / 배포 (PACKAGING)
 
 > 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 배포 구조·체크리스트 기준이며 명시된 날짜 시점 기준이다.
+>
+> ⚠️ **superseded — `hmac-ticket` 전략은 이후 완전히 제거됨.** 아래 `hmac-ticket`·`ticket.ts`·`smoke-client.mjs` 관련 서술은 스냅샷 당시의 역사 기록이며, 현행 인증은 `jwt`뿐이다 ([`AUTH.md`](AUTH.md) §4, [`BACKLOG.md`](BACKLOG.md)).
 
 > WebChannel을 **남들이 가져다 쓸 수 있는 수준**으로 배포하기 위한 패키지 구조와 작업 목록.
 > 상태(2026-06-15): 구조 **결정됨**. **완료** — auth seam, **헤드리스 `openclaw-webchannel-client`(framework-agnostic, zero-dep)** 구현, hmac-ticket E2E 검증(node smoke 스크립트).
