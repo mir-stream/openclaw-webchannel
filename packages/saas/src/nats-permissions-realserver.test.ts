@@ -186,6 +186,7 @@ beforeAll(async () => {
     saasBaseUrl: "https://saas.test.com",
     jwksUrl: "https://saas.test.com/.well-known/jwks.json",
     bootstrapUrl: "https://saas.test.com/bootstrap",
+    natsUrl: "wss://nats.test.com",
   });
 
   // Create nats-server config with JWT authentication. A real nats-server needs

@@ -24,6 +24,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     // Create a mock enrollment
@@ -66,6 +67,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     const mockEnrollment = {
@@ -115,6 +117,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     const mockEnrollment1 = {
@@ -162,6 +165,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     const tenantAMock = {
@@ -232,6 +236,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     const mockEnrollment = {

@@ -186,6 +186,7 @@ const enrollment = new DeviceFlowEnrollment({
   saasBaseUrl: SAAS_BASE_URL,
   jwksUrl: `${SAAS_BASE_URL}/.well-known/jwks.json`,
   bootstrapUrl: `${SAAS_BASE_URL}/bootstrap`,
+  natsUrl: NATS_URL,
   expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 5),
   store: enrollmentStore,
@@ -637,7 +638,10 @@ const server = createServer(async (req, res) => {
         })
           .then((creds) => {
             console.log(`[test/nats-user] minted ${role ?? "browser"} creds for tenant=${tenant}`);
-            sendJson(res, creds);
+            // The relay URL travels WITH the minted creds (SaaS = rendezvous
+            // authority) so the browser dials where the SaaS says, not a
+            // page-configured URL. Mirrors the enrolled plugin's EnrollmentResult.
+            sendJson(res, { ...creds, natsUrl: NATS_URL });
           })
           .catch((err) => {
             console.error("[test/nats-user] Error:", err);

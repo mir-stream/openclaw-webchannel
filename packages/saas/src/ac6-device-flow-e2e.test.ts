@@ -408,6 +408,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       peerId?: string;
       jwksUrl?: string;
       bootstrapUrl?: string;
+      natsUrl?: string;
       error?: string;
     };
 
@@ -418,6 +419,10 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     expect(pollResponse.creds?.userSeed).toBeDefined();
     expect(pollResponse.peerId).toBe(approveResponse.peerId);
     expect(pollResponse.jwksUrl).toContain("/.well-known/jwks.json");
+    // The SaaS is the rendezvous authority: the relay URL travels WITH the minted
+    // creds, so the plugin never has to be told where NATS lives out-of-band. This
+    // is the exact NATS_URL the enrollment-server was booted with (see env above).
+    expect(pollResponse.natsUrl).toBe("ws://localhost:4222");
 
     console.log(`[AC6 E2E] Step 3: Plugin received NATS credentials for peerId: ${pollResponse.peerId}`);
 

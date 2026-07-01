@@ -42,6 +42,7 @@ const createEnrollment = () => {
     saasBaseUrl: "https://saas.com",
     jwksUrl: "https://saas.com/.well-known/jwks.json",
     bootstrapUrl: "https://saas.com/bootstrap",
+    natsUrl: "wss://nats.saas.com",
     expirationSeconds: 600,
     pollIntervalSeconds: 5,
   });
@@ -116,6 +117,7 @@ describe("DeviceFlowEnrollment", () => {
         saasBaseUrl: "https://saas.com",
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
         expirationSeconds: 300, // 5 minutes
         pollIntervalSeconds: 10,
       });
@@ -165,6 +167,7 @@ describe("DeviceFlowEnrollment", () => {
         peerId: expect.any(String),
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
       });
     });
 
@@ -189,6 +192,7 @@ describe("DeviceFlowEnrollment", () => {
         saasBaseUrl: "https://saas.com",
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
         expirationSeconds: 0, // Expire immediately
         pollIntervalSeconds: 5,
       });
@@ -244,6 +248,7 @@ describe("DeviceFlowEnrollment", () => {
         peerId: expect.any(String),
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
       });
     });
 
@@ -272,6 +277,7 @@ describe("DeviceFlowEnrollment", () => {
         saasBaseUrl: "https://saas.com",
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
         expirationSeconds: 0,
         pollIntervalSeconds: 5,
       });

@@ -201,6 +201,14 @@ export type DeviceFlowOptions = {
   bootstrapUrl: string;
 
   /**
+   * NATS WebSocket URL the enrolled plugin must dial. Delivered to the plugin in
+   * the `EnrollmentResult` so the relay location travels with the minted creds
+   * (the SaaS is the rendezvous authority — the URL is not plugin-side config).
+   * Example: "wss://nats.saas.com"
+   */
+  natsUrl: string;
+
+  /**
    * Enrollment store (defaults to in-memory).
    * Use a persistent store (Redis, DB) for production deployments.
    */
@@ -313,6 +321,7 @@ export class DeviceFlowEnrollment {
         peerId: enrollment.peerId,
         jwksUrl: this.options.jwksUrl,
         bootstrapUrl: this.options.bootstrapUrl,
+        natsUrl: this.options.natsUrl,
       };
     }
 
@@ -353,6 +362,7 @@ export class DeviceFlowEnrollment {
       peerId,
       jwksUrl: this.options.jwksUrl,
       bootstrapUrl: this.options.bootstrapUrl,
+      natsUrl: this.options.natsUrl,
     };
   }
 
