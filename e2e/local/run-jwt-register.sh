@@ -129,7 +129,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
         "jwt": {
           "jwksFile": "$OCH/jwks.json",
           "issuer": "https://e2e-issuer.test",
-          "audience": "default-agent"
+          "audience": "default"
         }
       },
       "dmSecurity": "allowlist",
@@ -143,7 +143,7 @@ echo "[run-jwt-register] wrote $OCH/.openclaw/openclaw.json"
 # 5. Boot the isolated gateway in dev/open-NATS + jwt mode.
 OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_DEV_OPEN=1 WEBCHANNEL_NATS_URL=ws://127.0.0.1:$NATS_WS \
-  WEBCHANNEL_TENANT=default-tenant WEBCHANNEL_ACCOUNT_ID=default-agent \
+  WEBCHANNEL_TENANT=default-tenant \
   WEBCHANNEL_GW_URL=http://127.0.0.1:$GW_PORT \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &

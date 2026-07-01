@@ -22,7 +22,7 @@ const PRIV_PATH = process.env.WEBCHANNEL_RS256_PRIVATE ?? "/tmp/oc-e2e/rs256-pri
 
 const ISS = "https://e2e-issuer.test";
 const PEER_ID = "web-jwt-peer";
-const ACCOUNT_ID = "default-agent";
+const ACCOUNT_ID = "default";
 const TENANT = "default-tenant";
 const KID = "webchannel-e2e-rs256";
 
