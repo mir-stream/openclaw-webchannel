@@ -611,6 +611,49 @@ const server = createServer(async (req, res) => {
     }
 
     // ---------------------------------------------------------------------
+    // GET /demo/users - non-secret directory view for the admin panel.
+    // POST /demo/users/:username/accounts - edit a user's allowedAccounts.
+    //
+    // These DEMONSTRATE the user↔aud (account) authorization capability at the
+    // SaaS: the operator grants/revokes which accounts a login may reach, and the
+    // change takes effect on that user's next bootstrap (canAccess is checked at
+    // JWT-mint). In-memory + NO auth, consistent with the existing unauthenticated
+    // approve/deny demo UI; production would authenticate the operator and persist.
+    // ---------------------------------------------------------------------
+    if (ENABLE_DEMO_UI && req.method === "GET" && path === "/demo/users") {
+      sendJson(res, userDir!.list());
+      return;
+    }
+    if (
+      ENABLE_DEMO_UI &&
+      req.method === "POST" &&
+      path.startsWith("/demo/users/") &&
+      path.endsWith("/accounts")
+    ) {
+      // Path shape: /demo/users/<username>/accounts
+      const username = decodeURIComponent(path.slice("/demo/users/".length, -"/accounts".length));
+      parseJsonBody(req, (body) => {
+        if (!body || typeof body !== "object") {
+          sendJson(res, { error: "Invalid JSON body" }, 400);
+          return;
+        }
+        const { accounts } = body as { accounts?: unknown };
+        if (!Array.isArray(accounts) || !accounts.every((a) => typeof a === "string")) {
+          sendJson(res, { error: "accounts must be an array of strings" }, 400);
+          return;
+        }
+        if (!userDir!.setAllowedAccounts(username, accounts as string[])) {
+          sendJson(res, { error: `unknown user "${username}"` }, 404);
+          return;
+        }
+        const updated = userDir!.get(username);
+        console.log(`[demo-users] ${username} allowedAccounts → [${(updated?.allowedAccounts ?? []).join(", ")}]`);
+        sendJson(res, { ok: true, username, allowedAccounts: updated?.allowedAccounts ?? [] });
+      });
+      return;
+    }
+
+    // ---------------------------------------------------------------------
     // POST /login - Demo user login (ENABLE_DEMO_UI) → sets the `sid` cookie.
     // The peerId is DERIVED from the authenticated user (its uuid), never from
     // the request — closing the client-supplied-peerId spoof.

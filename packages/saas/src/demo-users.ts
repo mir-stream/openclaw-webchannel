@@ -67,6 +67,30 @@ export class DemoUserDirectory {
   canAccess(user: DemoUser, accountId: string): boolean {
     return user.allowedAccounts.includes(accountId);
   }
+
+  /**
+   * A non-secret view of the directory for the demo admin panel: username +
+   * allowedAccounts only. Deliberately omits `passwordSha256` and `uuid` so the
+   * unauthenticated demo route can't leak the password hash or the stable peerId.
+   */
+  list(): { username: string; allowedAccounts: string[] }[] {
+    return Array.from(this.byUsername.values()).map((u) => ({
+      username: u.username,
+      allowedAccounts: [...u.allowedAccounts],
+    }));
+  }
+
+  /**
+   * Replace a user's allowedAccounts (the canAccess set), live. Dedupes and keeps
+   * only strings. Returns false for an unknown user, true on success. Mutates the
+   * stored DemoUser in place so subsequent canAccess()/mint checks see the change.
+   */
+  setAllowedAccounts(username: string, accounts: string[]): boolean {
+    const user = this.byUsername.get(username);
+    if (!user) return false;
+    user.allowedAccounts = Array.from(new Set(accounts.filter((a) => typeof a === "string")));
+    return true;
+  }
 }
 
 /**

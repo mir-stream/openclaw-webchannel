@@ -26,6 +26,40 @@ describe("DemoUserDirectory (reference demo login domain)", () => {
     expect(dir.canAccess(alice, OTHER)).toBe(false);
   });
 
+  it("list() returns usernames + allowedAccounts without leaking secrets", () => {
+    const view = new DemoUserDirectory(seedDemoUsers(ACCOUNT)).list();
+    const alice = view.find((u) => u.username === "alice");
+    expect(alice).toBeTruthy();
+    expect(alice!.allowedAccounts).toEqual([ACCOUNT]);
+    // No secret fields (passwordSha256 / uuid) escape through the view.
+    for (const row of view) {
+      expect(row).not.toHaveProperty("passwordSha256");
+      expect(row).not.toHaveProperty("uuid");
+    }
+  });
+
+  it("setAllowedAccounts updates canAccess live (grant then revoke)", () => {
+    const d = new DemoUserDirectory(seedDemoUsers(ACCOUNT));
+    const alice = () => d.get("alice")!;
+    expect(d.canAccess(alice(), OTHER)).toBe(false);
+
+    // Grant OTHER.
+    expect(d.setAllowedAccounts("alice", [ACCOUNT, OTHER])).toBe(true);
+    expect(d.canAccess(alice(), OTHER)).toBe(true);
+
+    // Revoke everything.
+    expect(d.setAllowedAccounts("alice", [])).toBe(true);
+    expect(d.canAccess(alice(), ACCOUNT)).toBe(false);
+    expect(d.canAccess(alice(), OTHER)).toBe(false);
+  });
+
+  it("setAllowedAccounts dedupes and returns false for an unknown user", () => {
+    const d = new DemoUserDirectory(seedDemoUsers(ACCOUNT));
+    expect(d.setAllowedAccounts("alice", [OTHER, OTHER, ACCOUNT])).toBe(true);
+    expect(d.list().find((u) => u.username === "alice")!.allowedAccounts).toEqual([OTHER, ACCOUNT]);
+    expect(d.setAllowedAccounts("mallory", [ACCOUNT])).toBe(false);
+  });
+
   it("seedDemoUsers gives alice & bob distinct, stable uuids", () => {
     const users = seedDemoUsers(ACCOUNT);
     const alice = users.find((u) => u.username === "alice");
