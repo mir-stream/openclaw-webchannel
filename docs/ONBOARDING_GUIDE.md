@@ -283,24 +283,39 @@ openclaw gateway run        # connection config lives in config (§4); creds wer
 
 ## 6. Chat from the browser
 
-The chat UI is a **web page you host** (the headless `packages/client` library), **not** a
-SaaS URL. The demo server builds the browser bundle and serves it:
+In production the chat UI is a **web page the customer hosts** (the headless `packages/client`
+library embedded on their site) and the **SaaS serves the widget bundle**. The reference SaaS
+server mirrors this: with `ENABLE_DEMO_UI=1` it serves the unified page (`GET /`), the browser
+bundle (`GET /widget.js`), and the live enrollment list on its OWN origin — one origin for both
+the approve flow and the chat. So the chat page is served **by the issuer you already run**, not a
+separate web server:
 
 ```bash
-WEBCHANNEL_NATS_URL='wss://connect.ngs.global:443' \
-WEBCHANNEL_ISSUER_URL='http://127.0.0.1:3951' \
-WEBCHANNEL_GW_URL='http://127.0.0.1:18789' \
-WEBCHANNEL_TENANT='default-tenant' \
-WEBCHANNEL_ACCOUNT_ID='default-agent' \
-WEBCHANNEL_PEER_ID='web-human-1' \
-WEBCHANNEL_PAGE_PORT='19393' \
-node e2e/local/demo-server.mjs
-# → chat UI at http://127.0.0.1:19393/
+# Start the SaaS issuer with the demo web surface enabled. It bundles the browser
+# client into /widget.js and serves the two-panel page at /. Point DEMO_* at the
+# same NATS/gateway/tenant/account your agent uses.
+PORT='3951' \
+SAAS_BASE_URL='http://127.0.0.1:3951' \
+NATS_URL='wss://connect.ngs.global:443' \
+ENABLE_TEST_ROUTES=1 \
+ENABLE_DEMO_UI=1 \
+DEMO_APP_HTML="$PWD/e2e/local/demo-app.html" \
+DEMO_CLIENT_ENTRY="$PWD/packages/client/src/browser-demo-entry.ts" \
+DEMO_GW_URL='http://127.0.0.1:18789' \
+DEMO_TENANT='default-tenant' \
+DEMO_ACCOUNT_ID='default-agent' \
+DEMO_PEER_ID='web-human-1' \
+node --import tsx packages/saas/reference/enrollment-server.ts
+# → unified demo page at http://127.0.0.1:3951/
 ```
 
-The page: generates keys → mints NATS creds from `issuer/test/nats-user` → mints a PoP
-bootstrap JWT from `issuer/test/bootstrap-jwt` → connects to NATS → (register hop) → chat.
-Use the **same `tenant`+`accountId`** as the agent.
+> For a **turnkey local run** that boots the whole stack (issuer+web, NATS, gateway, enrolled
+> plugin) against your real model config, just use `./e2e/local/run-demo.sh` — it sets all of the
+> above for you.
+
+The page: approve the agent in the left panel → the right chat panel generates keys → mints NATS
+creds from `issuer/test/nats-user` → mints a PoP bootstrap JWT from `issuer/test/bootstrap-jwt` →
+connects to NATS → (register hop) → chat. Use the **same `tenant`+`accountId`** as the agent.
 
 ### Two admission models
 
@@ -317,7 +332,7 @@ Use the **same `tenant`+`accountId`** as the agent.
   JSON
   # restart the gateway to apply
   ```
-  …and run the demo server with `WEBCHANNEL_GW_URL=''` so the browser skips registration.
+  …and start the issuer with `DEMO_GW_URL=''` so the browser skips registration.
 
 Type a message → the **real configured model** replies (verify the agent's model is a live
 provider, e.g. `openclaw config get` / the `agent model:` startup log — not an echo stand-in).

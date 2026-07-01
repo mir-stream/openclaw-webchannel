@@ -43,7 +43,9 @@ import { assertValidSubjectToken } from "../src/subject-token.js";
 import type { EnrollmentRequest, PollRequest } from "../src/device-flow-types.js";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { webcrypto } from "node:crypto";
@@ -64,6 +66,24 @@ const SAAS_ISSUER = process.env.SAAS_ISSUER || SAAS_BASE_URL;
 // When set, TEST-ONLY routes (/test/nats-user, /test/bootstrap-jwt) are served.
 // Leave unset in any real deployment.
 const ENABLE_TEST_ROUTES = process.env.ENABLE_TEST_ROUTES === "1";
+// When set, the SaaS server ALSO serves the unified single-origin DEMO surface:
+//   GET /                 → the two-panel demo app (operator approves + visitor chats)
+//   GET /widget.js        → the browser client bundle (esbuild IIFE, global WebDemo)
+//   GET /demo/enrollments → live list of enrollment requests (for the admin panel)
+// This mirrors production, where the SaaS is ONE web origin hosting both the admin
+// dashboard and the embeddable chat widget. Demo-only (conflates two personas onto
+// one page) so it stays behind a flag; the real approval/enroll routes are unchanged.
+const ENABLE_DEMO_UI = process.env.ENABLE_DEMO_UI === "1";
+// Path to the unified demo HTML (served at GET /). Required when ENABLE_DEMO_UI=1.
+const DEMO_APP_HTML = process.env.DEMO_APP_HTML || "";
+// Path to the browser client entry esbuild bundles into /widget.js.
+const DEMO_CLIENT_ENTRY = process.env.DEMO_CLIENT_ENTRY || "";
+// Chat-widget config injected into the demo page as globalThis.__DEMO_CONFIG__.
+// natsUrl/issuerUrl are derived (NATS_URL / SAAS_BASE_URL); the rest come from env.
+const DEMO_GW_URL = process.env.DEMO_GW_URL || "";
+const DEMO_ACCOUNT_ID = process.env.DEMO_ACCOUNT_ID || "default-agent";
+const DEMO_TENANT = process.env.DEMO_TENANT || "default-tenant";
+const DEMO_PEER_ID = process.env.DEMO_PEER_ID || "web-allreal-peer";
 // When set, the operator JWT + memory-resolver config are written here at boot so
 // a harness can build a JWT-auth nats.conf from the SAME trust chain this issuer
 // uses. Only public NATS config is written — never the RSA key or account seed.
@@ -408,6 +428,93 @@ function fallbackApprovalTemplate(userCode?: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Unified demo surface (ENABLE_DEMO_UI) — one origin serving admin + widget.
+// ---------------------------------------------------------------------------
+//
+// Production-shaped mirror: the SaaS hosts BOTH the operator approval flow and the
+// embeddable chat widget. We keep a lightweight in-server view of enrollment
+// requests (the MemoryEnrollmentStore has no "list pending" API) so the admin panel
+// can render live cards + Approve/Deny — a stand-in for a real SaaS dashboard.
+
+type DemoEnrollStatus = "pending" | "approved" | "denied";
+interface DemoEnroll {
+  userCode: string;
+  tenant?: string;
+  accountId?: string;
+  status: DemoEnrollStatus;
+}
+// Keyed by user_code, preserves insertion order for stable rendering.
+const demoEnrollments = new Map<string, DemoEnroll>();
+// Flipped true by the demo harness once `gateway run` is actually serving the
+// enrolled account, so the page's chat panel unlocks only AFTER the agent is live
+// (approval alone is not enough — the gateway still has to boot + connect).
+let demoAgentReady = false;
+
+function trackDemoEnroll(userCode: string, tenant?: string, accountId?: string): void {
+  if (!ENABLE_DEMO_UI) return;
+  demoEnrollments.set(userCode, { userCode, tenant, accountId, status: "pending" });
+}
+function markDemoEnroll(userCode: string, status: DemoEnrollStatus): void {
+  if (!ENABLE_DEMO_UI) return;
+  const e = demoEnrollments.get(userCode);
+  if (e) e.status = status;
+}
+
+// esbuild the browser client entry → IIFE bundle (global `WebDemo`), once at boot.
+function buildDemoBundle(): string {
+  const root = join(__dirname, "..", "..", "..");
+  const candidates = [
+    join(root, "node_modules/.bin/esbuild"),
+    join(root, "node_modules/tsx/node_modules/esbuild/bin/esbuild"),
+  ];
+  const esbuildBin = candidates.find((p) => {
+    try {
+      readFileSync(p);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (!esbuildBin) throw new Error("esbuild binary not found under node_modules");
+  const outFile = join(tmpdir(), `webchannel-widget-${process.pid}.js`);
+  execFileSync(esbuildBin, [
+    DEMO_CLIENT_ENTRY,
+    "--bundle",
+    "--platform=browser",
+    "--format=iife",
+    "--global-name=WebDemo",
+    "--footer:js=;globalThis.WebDemo=WebDemo;",
+    `--outfile=${outFile}`,
+    "--log-level=warning",
+  ]);
+  return readFileSync(outFile, "utf8");
+}
+
+let demoBundle = "";
+let demoPageHtml = "";
+if (ENABLE_DEMO_UI) {
+  if (!DEMO_APP_HTML || !DEMO_CLIENT_ENTRY) {
+    console.error(
+      "[demo-ui] ENABLE_DEMO_UI=1 requires DEMO_APP_HTML and DEMO_CLIENT_ENTRY env paths",
+    );
+    process.exit(4);
+  }
+  demoBundle = buildDemoBundle();
+  const rawHtml = readFileSync(DEMO_APP_HTML, "utf8");
+  const configScript = `<script>globalThis.__DEMO_CONFIG__=${JSON.stringify({
+    natsUrl: NATS_URL,
+    issuerUrl: SAAS_BASE_URL,
+    gwUrl: DEMO_GW_URL,
+    accountId: DEMO_ACCOUNT_ID,
+    tenant: DEMO_TENANT,
+    peerId: DEMO_PEER_ID,
+  })};</script>`;
+  // Inject into <head> so __DEMO_CONFIG__ exists before the /widget.js <script> (in <body>) runs.
+  demoPageHtml = rawHtml.replace(/<head[^>]*>/i, (m) => `${m}\n  ${configScript}`);
+  console.log("[demo-ui] unified demo surface enabled (GET / + /widget.js + /demo/enrollments)");
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
@@ -429,6 +536,34 @@ const server = createServer(async (req, res) => {
   console.log(`[${req.method}] ${path}`);
 
   try {
+    // ---------------------------------------------------------------------
+    // Unified demo surface (only when ENABLE_DEMO_UI=1)
+    // ---------------------------------------------------------------------
+    if (ENABLE_DEMO_UI && req.method === "GET" && (path === "/" || path === "/index.html")) {
+      sendHtml(res, demoPageHtml);
+      return;
+    }
+    if (ENABLE_DEMO_UI && req.method === "GET" && path === "/widget.js") {
+      res.setHeader("Content-Type", "text/javascript; charset=utf-8");
+      res.writeHead(200);
+      res.end(demoBundle);
+      return;
+    }
+    if (ENABLE_DEMO_UI && req.method === "GET" && path === "/demo/enrollments") {
+      sendJson(res, Array.from(demoEnrollments.values()));
+      return;
+    }
+    if (ENABLE_DEMO_UI && req.method === "GET" && path === "/demo/status") {
+      sendJson(res, { agentReady: demoAgentReady });
+      return;
+    }
+    if (ENABLE_DEMO_UI && req.method === "POST" && path === "/demo/agent-ready") {
+      demoAgentReady = true;
+      console.log("[demo-ui] agent-ready flag set — chat panel may unlock");
+      sendJson(res, { agentReady: true });
+      return;
+    }
+
     // ---------------------------------------------------------------------
     // POST /api/enroll - Initiate enrollment (plugin → SaaS)
     // ---------------------------------------------------------------------
@@ -464,6 +599,7 @@ const server = createServer(async (req, res) => {
           .enroll(enrollRequest)
           .then((enrollResponse) => {
             console.log(`[enroll] Created enrollment: ${enrollResponse.user_code}`);
+            trackDemoEnroll(enrollResponse.user_code, enrollRequest.tenant, enrollRequest.accountId);
             sendJson(res, enrollResponse);
           })
           .catch((err) => {
@@ -544,6 +680,7 @@ const server = createServer(async (req, res) => {
           .then((result) => {
             if (result) {
               console.log(`[approve] Approved enrollment: ${user_code}`);
+              markDemoEnroll(user_code, "approved");
 
               // Get enrollment details for response
               enrollmentStore.getEnrollmentByUserCode(user_code).then((enrollment) => {
@@ -590,6 +727,7 @@ const server = createServer(async (req, res) => {
           .then((success) => {
             if (success) {
               console.log(`[deny] Denied enrollment: ${user_code}`);
+              markDemoEnroll(user_code, "denied");
               sendJson(res, { success: true });
             } else {
               console.log(`[deny] Enrollment not found: ${user_code}`);
@@ -734,6 +872,10 @@ server.listen(PORT, () => {
   console.log(`  GET  ${SAAS_BASE_URL}/enroll      - Approval UI (operator)`);
   console.log(`  POST ${SAAS_BASE_URL}/approve    - Approve enrollment (operator)`);
   console.log(`  POST ${SAAS_BASE_URL}/deny       - Deny enrollment (operator)`);
+  if (ENABLE_DEMO_UI) {
+    console.log(`  GET  ${SAAS_BASE_URL}/           - Unified demo (approve + chat, one origin)`);
+    console.log(`  GET  ${SAAS_BASE_URL}/widget.js  - Browser chat widget bundle`);
+  }
   console.log("");
   console.log("Configuration:");
   console.log(`  NATS account mode: ${mockNatsConfig.mode}${mockNatsConfig.mode === "external" ? ` (account ${mockNatsConfig.accountPublicKey})` : ""}`);

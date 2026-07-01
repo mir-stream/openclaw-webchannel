@@ -2,11 +2,14 @@
 # INTERACTIVE chat demo — the human-facing sibling of run-all-real.sh.
 #
 # Boots the SAME ALL-REAL server topology (unified issuer + JWT-auth nats-server
-# from ONE setupTrustChain + echo model + REAL enrolled webchannel plugin, devOpen
-# OFF) but, instead of running a headless one-shot round-trip and exiting, it
-# launches a persistent chat server (demo-server.mjs) and BLOCKS so a HUMAN can
-# open the printed URL in a browser and chat with the live (echo) agent. Ctrl+C
-# tears the whole stack down (EXIT trap).
+# from ONE setupTrustChain + real model + REAL enrolled webchannel plugin, devOpen
+# OFF) but, instead of running a headless one-shot round-trip and exiting, the SaaS
+# issuer ALSO serves — on its OWN origin (ENABLE_DEMO_UI=1) — a single unified web
+# page with TWO panels: the operator approves the agent's enrollment (left) and an
+# end user chats with that agent (right). This mirrors production, where the SaaS is
+# one web origin hosting both the admin flow and the embedded chat widget. There is
+# NO separate chat server. The script BLOCKS so a HUMAN can open the ONE printed URL,
+# approve, and chat with the live agent. Ctrl+C tears the whole stack down (EXIT trap).
 #
 # Uses a DISTINCT isolated dir (/tmp/oc-demo-e2e) and DISTINCT ports so it can run
 # alongside the all-real harness without collision. Self-cleaning (trap on EXIT).
@@ -21,24 +24,24 @@ PKG_JSON="$REPO/packages/plugin/package.json"
 PKG_BAK=/tmp/oc-demo-e2e.pkgbak.json
 
 # Distinct ports — no collision with the all-real harness
-# (19199/18622/14622/18904/3941/19393).
+# (19199/18622/14622/18904/3941). The SaaS issuer origin (ISSUER_PORT) now also
+# serves the web UI, so there is no separate page port.
 GW_PORT=19299
 NATS_WS=18722
 NATS_TCP=14722
 ECHO_PORT=18905
 ISSUER_PORT=3942
-PAGE_PORT=19394
 
 TENANT=default-tenant
 ACCOUNT_ID=default-agent
 PEER_ID=web-allreal-peer
 SAAS_ISSUER="https://saas.local/demo-issuer"
 
-NATS_PID=""; ECHO_PID=""; ISSUER_PID=""; GW_PID=""; DEMO_PID=""
+NATS_PID=""; ECHO_PID=""; ISSUER_PID=""; GW_PID=""; ADD_PID=""
 
 cleanup() {
   echo "[run-demo] cleanup…"
-  [ -n "$DEMO_PID" ]   && kill "$DEMO_PID"   2>/dev/null || true
+  [ -n "$ADD_PID" ]    && kill "$ADD_PID"    2>/dev/null || true
   [ -n "$GW_PID" ]     && kill "$GW_PID"     2>/dev/null || true
   [ -n "$ISSUER_PID" ] && kill "$ISSUER_PID" 2>/dev/null || true
   [ -n "$ECHO_PID" ]   && kill "$ECHO_PID"   2>/dev/null || true
@@ -69,6 +72,9 @@ mkdir -p "$OCH/.openclaw"
 #    NATS config to $OCH and serves JWKS + TEST routes (/test/nats-user +
 #    /test/bootstrap-jwt for the browser peer).
 # ---------------------------------------------------------------------------
+# ENABLE_DEMO_UI=1 makes THIS SaaS server the single web origin: it serves both the
+# operator approval flow AND the embedded chat widget (GET / + /widget.js +
+# /demo/enrollments). No separate chat server — mirrors production (SaaS = one origin).
 PORT="$ISSUER_PORT" \
 SAAS_BASE_URL="http://127.0.0.1:$ISSUER_PORT" \
 SAAS_ISSUER="$SAAS_ISSUER" \
@@ -76,6 +82,13 @@ NATS_URL="ws://127.0.0.1:$NATS_WS" \
 NATS_CONFIG_OUT="$OCH" \
 ENABLE_TEST_ROUTES=1 \
 POLL_INTERVAL_SECONDS=1 \
+ENABLE_DEMO_UI=1 \
+DEMO_APP_HTML="$REPO/e2e/local/demo-app.html" \
+DEMO_CLIENT_ENTRY="$REPO/packages/client/src/browser-demo-entry.ts" \
+DEMO_GW_URL="http://127.0.0.1:$GW_PORT" \
+DEMO_ACCOUNT_ID="$ACCOUNT_ID" \
+DEMO_TENANT="$TENANT" \
+DEMO_PEER_ID="$PEER_ID" \
   node --import tsx "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
 ISSUER_PID=$!
 echo "[run-demo] enrollment-server pid=$ISSUER_PID — waiting for JWKS + NATS config…"
@@ -180,7 +193,7 @@ echo "[run-demo] set plugin extensions → ./index-nats.ts"
 REAL_CONFIG="${OPENCLAW_REAL_CONFIG:-$HOME/.openclaw/openclaw.json}"
 [ -f "$REAL_CONFIG" ] || { echo "[run-demo] FATAL: real openclaw config not found at $REAL_CONFIG — cannot inherit the real agent/model. Set OPENCLAW_REAL_CONFIG."; exit 3; }
 OCH="$OCH" REPO="$REPO" REAL_CONFIG="$REAL_CONFIG" \
-ISSUER_PORT="$ISSUER_PORT" SAAS_ISSUER="$SAAS_ISSUER" ACCOUNT_ID="$ACCOUNT_ID" PEER_ID="$PEER_ID" \
+ISSUER_PORT="$ISSUER_PORT" SAAS_ISSUER="$SAAS_ISSUER" ACCOUNT_ID="$ACCOUNT_ID" TENANT="$TENANT" PEER_ID="$PEER_ID" \
 node -e '
   const fs = require("fs");
   const real = JSON.parse(fs.readFileSync(process.env.REAL_CONFIG, "utf8"));
@@ -210,17 +223,34 @@ node -e '
       entries: { webchannel: { enabled: true } },
     },
     channels: {
+      // 가-2 named-account shape: EVERYTHING lives under accounts.<accountId> and
+      // there are NO channel-level (flat) webchannel fields. Any flat field
+      // (auth/dmSecurity/allowFrom/tenant/saas…) would synthesize a phantom
+      // "default" account (listWebchannelAccountIds), which — having no creds —
+      // logs a noisy skip. One clean account = exactly one accounts.<id> entry.
+      //
+      // Under openclaw 2026.6.10 `gateway run` does NOT enroll; it only CONSUMES
+      // cached creds. Enrollment happens at `openclaw channels add` (step 5c),
+      // which reads the identity below (tenant + saas.baseUrl) and device-flow
+      // enrolls. `nats.credentials.mode:"enrolled"` selects that path.
       webchannel: {
-        auth: {
-          strategy: "jwt",
-          jwt: {
-            jwksUrl: "http://127.0.0.1:" + process.env.ISSUER_PORT + "/.well-known/jwks.json",
-            issuer: process.env.SAAS_ISSUER,
-            audience: process.env.ACCOUNT_ID,
+        accounts: {
+          [process.env.ACCOUNT_ID]: {
+            tenant: process.env.TENANT,
+            saas: { baseUrl: "http://127.0.0.1:" + process.env.ISSUER_PORT },
+            auth: {
+              strategy: "jwt",
+              jwt: {
+                jwksUrl: "http://127.0.0.1:" + process.env.ISSUER_PORT + "/.well-known/jwks.json",
+                issuer: process.env.SAAS_ISSUER,
+                audience: process.env.ACCOUNT_ID,
+              },
+            },
+            dmSecurity: "allowlist",
+            allowFrom: [process.env.PEER_ID],
+            nats: { credentials: { mode: "enrolled" } },
           },
         },
-        dmSecurity: "allowlist",
-        allowFrom: [process.env.PEER_ID],
       },
     },
   };
@@ -252,46 +282,70 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Boot the isolated gateway. NO WEBCHANNEL_NATS_DEV_OPEN → enrolled path runs.
-#    HOME=$OCH isolates the plugin's enrollment credential store under $OCH.
-#
-#    NOTE: we deliberately do NOT pass WEBCHANNEL_NATS_URL. The SaaS is the
-#    rendezvous authority — the enrolled plugin receives the relay URL inside its
-#    EnrollmentResult (the issuer was booted with NATS_URL=ws://…:$NATS_WS in
-#    step 1) and dials THAT. The only SaaS coordinate the plugin still needs is
-#    where the SaaS itself lives (WEBCHANNEL_SAAS_BASE_URL). This is the whole
-#    point of the rework: the operator no longer configures the NATS URL.
+# 5c. ENROLL via `openclaw channels add` (openclaw 2026.6.10 model). This — NOT
+#     `gateway run` — is what device-flow enrolls: it reads the account identity
+#     written in step 5 (tenant + saas.baseUrl), calls the issuer /api/enroll
+#     (so the request appears in the unified page's LEFT panel), prints a
+#     user_code, and BLOCKS polling /api/poll until a human approves. HOME=$OCH so
+#     the acquired creds cache in the SAME isolated store `gateway run` reads.
 # ---------------------------------------------------------------------------
 HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  WEBCHANNEL_SAAS_BASE_URL="http://127.0.0.1:$ISSUER_PORT" \
-  WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" \
-  WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
-  "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
-  >"$OCH/gateway.log" 2>&1 &
-GW_PID=$!
-echo "[run-demo] gateway pid=$GW_PID — waiting for enrollment user_code…"
+  "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account "$ACCOUNT_ID" \
+  >"$OCH/channels-add.log" 2>&1 &
+ADD_PID=$!
+echo "[run-demo] channels add pid=$ADD_PID — enrolling (waiting for the SaaS enroll request)…"
 
-# 6a. Auto-approve: scrape the user_code the plugin prints, POST it to /approve.
+# Health check: wait until the enroll request has reached the SaaS (a pending
+# enrollment now shows in the LEFT panel). We do NOT approve here — approval is a
+# real human click in the unified web UI.
 USER_CODE=""
 for i in $(seq 1 240); do
-  USER_CODE="$(grep -oE 'User code: [A-Z]{4}-[A-Z]{4}' "$OCH/gateway.log" 2>/dev/null | head -1 | awk '{print $3}' || true)"
+  USER_CODE="$(grep -oiE 'user[_ ]code:?[[:space:]]*[A-Z0-9]{4}-[A-Z0-9]{4}' "$OCH/channels-add.log" 2>/dev/null | head -1 | grep -oE '[A-Z0-9]{4}-[A-Z0-9]{4}' || true)"
   if [ -n "$USER_CODE" ]; then break; fi
-  if ! kill -0 "$GW_PID" 2>/dev/null; then
-    echo "[run-demo] gateway died before enrollment — log:"; cat "$OCH/gateway.log"; exit 2
+  if ! kill -0 "$ADD_PID" 2>/dev/null; then
+    echo "[run-demo] channels add exited before enroll request — log:"; cat "$OCH/channels-add.log"; exit 2
   fi
   sleep 0.25
 done
-[ -z "$USER_CODE" ] && { echo "[run-demo] TIMEOUT waiting for user_code — gateway log:"; cat "$OCH/gateway.log"; exit 2; }
-echo "[run-demo] enrollment user_code=$USER_CODE — approving…"
-APPROVE="$(curl -fsS -X POST "http://127.0.0.1:$ISSUER_PORT/approve" \
-  -H 'Content-Type: application/json' -d "{\"user_code\":\"$USER_CODE\"}" || true)"
-echo "[run-demo] approve response: $APPROVE"
+[ -z "$USER_CODE" ] && { echo "[run-demo] TIMEOUT waiting for enroll user_code — channels-add log:"; cat "$OCH/channels-add.log"; exit 2; }
 
-# 6b. Wait for the plugin to poll, receive creds, NKEY-connect, and register.
-echo "[run-demo] waiting for plugin registration (enrolled NATS connect)…"
+echo ""
+echo "==================================================================="
+echo "  WebChannel unified demo is UP (single SaaS origin)."
+echo ""
+echo "    Open this in your browser:"
+echo ""
+echo "        http://127.0.0.1:$ISSUER_PORT/"
+echo ""
+echo "    1. LEFT panel  — click ✓ Approve on the pending agent ($USER_CODE)."
+echo "    2. RIGHT panel — chat unlocks once the agent connects."
+echo ""
+echo "  Ctrl+C to tear everything down."
+echo "==================================================================="
+echo ""
+echo "[run-demo] waiting for you to approve in the browser…"
+
+# Block until `channels add` finishes (creds acquired = you approved). If it fails
+# (deny / timeout), it exits non-zero and we surface the log.
+if ! wait "$ADD_PID"; then
+  echo "[run-demo] enrollment did not complete (denied or timed out) — channels-add log:"
+  cat "$OCH/channels-add.log"; exit 2
+fi
+echo "[run-demo] ✓ enrolled (credentials cached). Booting the gateway…"
+
+# ---------------------------------------------------------------------------
+# 6. Boot the isolated gateway — it CONSUMES the cached creds (no enroll). NO
+#    WEBCHANNEL_NATS_URL: the SaaS is the rendezvous authority; the enrolled creds
+#    carry the relay URL. HOME=$OCH keeps the credential store isolated.
+# ---------------------------------------------------------------------------
+HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
+  "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
+  >"$OCH/gateway.log" 2>&1 &
+GW_PID=$!
+echo "[run-demo] gateway pid=$GW_PID — waiting for it to consume creds + connect…"
 for i in $(seq 1 240); do
   if grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$OCH/gateway.log" 2>/dev/null; then
-    echo "[run-demo] gateway ready (enrolled + connected)"
+    echo "[run-demo] gateway ready (enrolled account serving over NATS)"
     break
   fi
   if ! kill -0 "$GW_PID" 2>/dev/null; then
@@ -303,45 +357,12 @@ for i in $(seq 1 240); do
   fi
 done
 
-# ---------------------------------------------------------------------------
-# 7. Launch the PERSISTENT chat server (NOT a headless one-shot driver) and BLOCK
-#    so a human can open the URL and chat. Ctrl+C → EXIT trap tears it all down.
-# ---------------------------------------------------------------------------
-echo "[run-demo] starting interactive chat server…"
-WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
-WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
-WEBCHANNEL_ISSUER_URL="http://127.0.0.1:$ISSUER_PORT" \
-WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
-WEBCHANNEL_PAGE_PORT="$PAGE_PORT" \
-  node "$REPO/e2e/local/demo-server.mjs" >"$OCH/demo-server.log" 2>&1 &
-DEMO_PID=$!
-echo "[run-demo] demo-server pid=$DEMO_PID — waiting for it to serve…"
+# 6a. Signal the unified page that the agent is live, so the RIGHT chat panel
+#     unlocks only AFTER the gateway is actually serving (not merely on approval).
+curl -fsS -X POST "http://127.0.0.1:$ISSUER_PORT/demo/agent-ready" \
+  -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
+echo "[run-demo] agent is live — the chat panel is now enabled. Say hello!"
 
-for i in $(seq 1 120); do
-  if curl -fsS "http://127.0.0.1:$PAGE_PORT/" >/dev/null 2>&1; then
-    break
-  fi
-  if ! kill -0 "$DEMO_PID" 2>/dev/null; then
-    echo "[run-demo] demo-server died early — log:"; cat "$OCH/demo-server.log"; exit 2
-  fi
-  sleep 0.25
-  if [ "$i" -eq 120 ]; then
-    echo "[run-demo] TIMEOUT waiting for demo-server — log:"; cat "$OCH/demo-server.log"; exit 2
-  fi
-done
-
-echo ""
-echo "==================================================================="
-echo "  WebChannel live chat demo is UP."
-echo ""
-echo "    Open this in your browser and chat with the agent:"
-echo ""
-echo "        http://127.0.0.1:$PAGE_PORT/"
-echo ""
-echo "  Ctrl+C to tear everything down."
-echo "==================================================================="
-echo ""
-
-# Block until the user Ctrl+C (EXIT trap then cleans up). `wait` on the demo
-# server PID keeps us alive and exits if the server itself dies.
-wait "$DEMO_PID"
+# Block until the user Ctrl+C (EXIT trap then cleans up). `wait` on the gateway
+# PID keeps us alive and exits if the gateway itself dies.
+wait "$GW_PID"
