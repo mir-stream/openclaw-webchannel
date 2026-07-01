@@ -75,3 +75,42 @@ export function resolveAdmissionMode(input: ResolveAdmissionModeInput): Admissio
     ? "register-hop"
     : "auto";
 }
+
+/**
+ * What the per-account serving loop must wire up for a resolved admission mode.
+ *
+ * This makes the ONE structural fact behind the admission decision testable and
+ * explicit: the `channels.webchannel.auth` verifier and the HTTP register hop's
+ * `aud → account` dispatch entry are meaningful ONLY for a `register-hop`
+ * account. An `auto` account admits peers purely via the NATS wildcard + the
+ * X25519 handshake (+ optional `dmSecurity` allowlist), so `auth` gates nothing
+ * on its path — it must be served with NO verifier built and NO aud mapping,
+ * never skipped for "missing auth".
+ *
+ *   - `register-hop` → { subscribeWildcard: false, buildVerifier: true,  populateAudMapping: true  }
+ *   - `auto`         → { subscribeWildcard: true,  buildVerifier: false, populateAudMapping: false }
+ */
+export type AdmissionServingPlan = {
+  /** `auto` subscribes the tenant/accountId wildcard; `register-hop` does not. */
+  subscribeWildcard: boolean;
+  /**
+   * Build (and require) the `channels.webchannel.auth` `ConnectionVerifier`.
+   * True ONLY for `register-hop`, so a pure-`auto` account is served with no
+   * `auth` config at all, and a misconfigured jwt account still fails loudly on
+   * the register-hop path (its verifier throw skips it) rather than being
+   * silently downgraded to `auto`.
+   */
+  buildVerifier: boolean;
+  /** Populate the register route's `aud → account` dispatch map. `register-hop` only. */
+  populateAudMapping: boolean;
+};
+
+/** Derive the serving plan for an admission mode. See {@link AdmissionServingPlan}. */
+export function admissionServingPlan(admission: AdmissionMode): AdmissionServingPlan {
+  const registerHop = admission === "register-hop";
+  return {
+    subscribeWildcard: !registerHop,
+    buildVerifier: registerHop,
+    populateAudMapping: registerHop,
+  };
+}

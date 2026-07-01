@@ -28,7 +28,7 @@ import { PopChallengeStore } from "./src/pop-challenge.js";
 import { resolveRequirePoP, popRequirementUnmet } from "./src/register-pop-gate.js";
 import { resolveAllowOrigin } from "./src/register-cors.js";
 import { assertValidSubjectToken } from "./src/subject-token.js";
-import { resolveAdmissionMode } from "./src/nats-admission.js";
+import { resolveAdmissionMode, admissionServingPlan } from "./src/nats-admission.js";
 import { isDmPostureOpen } from "./src/dm-allowlist.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { WEBCHANNEL_ID } from "./src/transport.js";
@@ -66,7 +66,14 @@ type AccountRuntime = {
   channel: NatsChannel;
   transport: NatsTransport;
   enrolled?: EnrolledNatsConnection;
-  verifier: ConnectionVerifier;
+  /**
+   * The `channels.webchannel.auth` verifier — built ONLY for a `register-hop`
+   * account (admission gated by the HTTP register hop). An `auto` account admits
+   * peers via the NATS wildcard + X25519 handshake and has no verifier, so this
+   * is optional. (The register route verifies via `verifyJwtAndExtractIdentity`
+   * against `auth`, not this field; it is retained for register-hop accounts.)
+   */
+  verifier?: ConnectionVerifier;
   auth: AuthConfig | undefined;
   historyConfig: ReturnType<typeof resolveHistoryConfig>;
   allowedOrigins: string[] | undefined;
@@ -607,7 +614,12 @@ export default defineChannelPluginEntry({
         registerHopAvailable,
         explicitOverride: accountNatsCfg?.admission,
       });
-      if (admission === "auto") {
+      // The serving plan makes the ONE structural consequence of `admission`
+      // explicit and testable: only a `register-hop` account builds a verifier
+      // and an aud→account dispatch entry; an `auto` account subscribes the
+      // wildcard and is served with NO `channels.webchannel.auth` config.
+      const servingPlan = admissionServingPlan(admission);
+      if (servingPlan.subscribeWildcard) {
         channel.subscribeWildcard();
       }
       if (admission === "auto" && isDmPostureOpen(accountDmSecurity)) {
@@ -648,15 +660,23 @@ export default defineChannelPluginEntry({
         }
       });
 
-      // ---- Step 6 (per account): JWT verifier ------------------------------
-      let verifier: ConnectionVerifier;
-      try {
-        verifier = resolveVerifier(accountAuth, api.logger);
-      } catch (err) {
-        (api.logger?.error ?? console.error)?.(
-          `[webchannel] account "${accountId}" verifier misconfig — skipping: ${(err as Error).message}`,
-        );
-        continue;
+      // ---- Step 6 (per account): JWT verifier (register-hop accounts only) --
+      // Only a `register-hop` account is gated by `channels.webchannel.auth`, so
+      // only then do we build (and require) its verifier. A misconfigured jwt
+      // auth on a register-hop account still fails loudly here — resolveVerifier
+      // throws and we skip the account (never silently downgrading a broken jwt
+      // account to auto). An `auto` account builds NO verifier and is served with
+      // no `auth` config at all (invariant 1).
+      let verifier: ConnectionVerifier | undefined;
+      if (servingPlan.buildVerifier) {
+        try {
+          verifier = resolveVerifier(accountAuth, api.logger);
+        } catch (err) {
+          (api.logger?.error ?? console.error)?.(
+            `[webchannel] account "${accountId}" verifier misconfig — skipping: ${(err as Error).message}`,
+          );
+          continue;
+        }
       }
 
       // ---- Publish this account's runtime + aud→account dispatch entries ----
@@ -667,21 +687,26 @@ export default defineChannelPluginEntry({
         channel,
         transport,
         ...(enrolled ? { enrolled } : {}),
-        verifier,
+        ...(verifier ? { verifier } : {}),
         auth: accountAuth,
         historyConfig,
         allowedOrigins,
       });
-      // Dispatch keys: the accountId (= subject/wire key, also the JWT `aud`) AND
-      // the configured jwt.audience (what the bootstrap JWT actually carries) if
-      // it differs. First-wins on collision (C1): a shared IdP audience across
-      // accounts is kept for the FIRST account + logged, never silently
-      // overwritten (which would misroute).
-      const onAudCollision = (msg: string) => (api.logger?.warn ?? console.warn)?.(msg);
-      addAudMapping(audToAccount, accountId, accountId, onAudCollision);
-      const configuredAud = (accountAuth as { jwt?: { audience?: string } } | undefined)?.jwt?.audience;
-      if (typeof configuredAud === "string" && configuredAud.length > 0) {
-        addAudMapping(audToAccount, configuredAud, accountId, onAudCollision);
+      // Dispatch keys are populated for register-hop accounts ONLY: the register
+      // route dispatches a bootstrap JWT by `aud`, and an `auto` account has no
+      // register hop, so it must NOT claim an aud (that would misroute a token to
+      // an account whose handler would 401 it as "non-jwt"). Keys: the accountId
+      // (= subject/wire key, also the JWT `aud`) AND the configured jwt.audience
+      // (what the bootstrap JWT actually carries) if it differs. First-wins on
+      // collision (C1): a shared IdP audience across accounts is kept for the
+      // FIRST account + logged, never silently overwritten (which would misroute).
+      if (servingPlan.populateAudMapping) {
+        const onAudCollision = (msg: string) => (api.logger?.warn ?? console.warn)?.(msg);
+        addAudMapping(audToAccount, accountId, accountId, onAudCollision);
+        const configuredAud = (accountAuth as { jwt?: { audience?: string } } | undefined)?.jwt?.audience;
+        if (typeof configuredAud === "string" && configuredAud.length > 0) {
+          addAudMapping(audToAccount, configuredAud, accountId, onAudCollision);
+        }
       }
     }
 
