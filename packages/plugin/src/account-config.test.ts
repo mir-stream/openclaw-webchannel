@@ -325,6 +325,29 @@ describe("account-config: loadPersistedEnrolledCreds", () => {
     expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
   });
 
+  it("threads the SaaS-delivered natsUrl through when persisted", () => {
+    // EnrollmentResult.natsUrl is persisted under `enrollment.natsUrl`; the
+    // consumer dials it in preference to local config, so the loader must surface
+    // it. (Absent → omitted, exercised by the back-compat fixtures above.)
+    const withUrl = JSON.stringify({
+      enrollment: {
+        creds: { userJwt: "JWT", userSeed: "SEED" },
+        natsUrl: "wss://saas-delivered-relay",
+      },
+    });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const creds = loadPersistedEnrolledCreds("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => withUrl,
+    });
+    expect(creds).toEqual({
+      userJwt: "JWT",
+      userSeed: "SEED",
+      natsUrl: "wss://saas-delivered-relay",
+    });
+  });
+
   it("loads from the legacy file for the default account (backward-compat)", () => {
     const legacy = legacyCredentialPath(HOME);
     const creds = loadPersistedEnrolledCreds("default", {

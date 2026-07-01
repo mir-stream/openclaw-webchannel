@@ -87,14 +87,23 @@ export async function runJwtRegister(
       `bootstrap failed: HTTP ${bootstrapRes.status} ${await bootstrapRes.text()}`,
     );
   }
-  const { jwt, peerId } = (await bootstrapRes.json()) as { jwt?: string; peerId?: string };
+  const { jwt, peerId, natsUrl: deliveredNatsUrl } = (await bootstrapRes.json()) as {
+    jwt?: string;
+    peerId?: string;
+    natsUrl?: string;
+  };
   if (!jwt || !peerId) throw new Error("bootstrap response missing jwt/peerId");
+
+  // The SaaS is the rendezvous authority: dial the relay URL it returned in the
+  // bootstrap response, falling back to the page-supplied `opts.natsUrl` only when
+  // the issuer didn't send one (back-compat).
+  const natsUrl = deliveredNatsUrl ?? opts.natsUrl;
 
   // 4. Production client with the `registration` (PoP HTTP register) path. The
   //    in-page Ed25519 private key is handed straight to the client — no
   //    serialization, no boundary crossing.
   const client = new WebChannelNatsClient({
-    url: opts.natsUrl,
+    url: natsUrl,
     jwt,
     accountId: opts.accountId,
     tenant: opts.tenant,
@@ -198,11 +207,15 @@ export async function runAllReal(
   if (!credsRes.ok) {
     throw new Error(`nats-user failed: HTTP ${credsRes.status} ${await credsRes.text()}`);
   }
-  const { userJwt, userSeedRaw } = (await credsRes.json()) as {
+  const { userJwt, userSeedRaw, natsUrl: deliveredNatsUrl } = (await credsRes.json()) as {
     userJwt?: string;
     userSeedRaw?: string;
+    natsUrl?: string;
   };
   if (!userJwt || !userSeedRaw) throw new Error("nats-user response missing userJwt/userSeedRaw");
+
+  // SaaS-delivered relay URL wins over the page-supplied `opts.natsUrl` (fallback).
+  const natsUrl = deliveredNatsUrl ?? opts.natsUrl;
 
   // 4. PoP bootstrap JWT (RS256, this issuer's trust chain) for the register hop.
   const bootRes = await fetch(`${opts.issuerUrl}/test/bootstrap-jwt`, {
@@ -224,7 +237,7 @@ export async function runAllReal(
 
   // 5. Production client with BOTH NATS-layer NKEY auth AND the PoP register hop.
   const client = new WebChannelNatsClient({
-    url: opts.natsUrl,
+    url: natsUrl,
     jwt,
     accountId: opts.accountId,
     tenant: opts.tenant,

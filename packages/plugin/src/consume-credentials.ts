@@ -36,7 +36,17 @@ import {
 
 /** Outcome of consuming a credential source at runtime. */
 export type ConsumeResult =
-  | { status: "connected"; connection: ConnectedNats }
+  | {
+      status: "connected";
+      connection: ConnectedNats;
+      /**
+       * The URL actually dialed. For `enrolled` this is the SaaS-delivered
+       * `natsUrl` when present (else the resolver fallback); for `open`/`static`
+       * it is `source.url`. Surfaced so callers can log the EFFECTIVE relay,
+       * which — for enrolled — may differ from the resolver's `source.url`.
+       */
+      dialedUrl: string;
+    }
   | { status: "creds-missing"; accountId: string };
 
 export type ConsumeCredentialSourceDeps = ConnectNatsDeps & {
@@ -62,7 +72,7 @@ export async function consumeCredentialSource(
   if (source.mode !== "enrolled") {
     // open / static: connect directly (auth material is already present).
     const connection = await connectNatsCredentialSource(source, deps);
-    return { status: "connected", connection };
+    return { status: "connected", connection, dialedUrl: source.url };
   }
 
   const loadPersisted = deps.loadPersisted ?? loadPersistedEnrolledCreds;
@@ -75,14 +85,22 @@ export async function consumeCredentialSource(
 
   // Connect with the persisted enrolled creds via the static branch — identical
   // transport primitive (jwtCredential + NKEY signing callback), no enroll.
+  //
+  // The SaaS is the rendezvous authority: the relay URL was delivered with the
+  // minted creds (persisted as `enrollment.natsUrl`), so we dial THAT in
+  // preference to the resolver's `source.url` (derived from `nats.url` /
+  // `WEBCHANNEL_NATS_URL` — now a dev-only override / back-compat fallback for
+  // creds enrolled before natsUrl was delivered). This is the load-bearing
+  // consume-time half of "the operator does not configure the NATS URL".
+  const dialedUrl = persisted.natsUrl ?? source.url;
   const connection = await connectNatsCredentialSource(
     {
       mode: "static",
-      url: source.url,
+      url: dialedUrl,
       userJwt: persisted.userJwt,
       userSeed: persisted.userSeed,
     },
     deps,
   );
-  return { status: "connected", connection };
+  return { status: "connected", connection, dialedUrl };
 }

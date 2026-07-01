@@ -355,6 +355,14 @@ export function resolveReadCredentialPath(
 export type PersistedEnrolledCreds = {
   userJwt: string;
   userSeed: string;
+  /**
+   * NATS relay URL the SaaS delivered alongside the creds (EnrollmentResult.natsUrl,
+   * persisted under `enrollment.natsUrl`). The SaaS is the rendezvous authority, so
+   * the consume path dials THIS in preference to any local `nats.url` /
+   * `WEBCHANNEL_NATS_URL`. Absent for creds enrolled before this field existed —
+   * the consumer then falls back to the resolver URL (back-compat).
+   */
+  natsUrl?: string;
 };
 
 /**
@@ -386,7 +394,10 @@ export function loadPersistedEnrolledCreds(
   if (!exists(path)) return undefined;
   try {
     const parsed = JSON.parse(read(path)) as {
-      enrollment?: { creds?: { userJwt?: unknown; userSeed?: unknown } };
+      enrollment?: {
+        creds?: { userJwt?: unknown; userSeed?: unknown };
+        natsUrl?: unknown;
+      };
     };
     const creds = parsed.enrollment?.creds;
     if (
@@ -396,7 +407,14 @@ export function loadPersistedEnrolledCreds(
       creds.userJwt.length > 0 &&
       creds.userSeed.length > 0
     ) {
-      return { userJwt: creds.userJwt, userSeed: creds.userSeed };
+      // Thread the SaaS-delivered relay URL through when present. Kept optional so
+      // already-persisted (pre-natsUrl) creds still load and fall back gracefully.
+      const natsUrl = parsed.enrollment?.natsUrl;
+      return {
+        userJwt: creds.userJwt,
+        userSeed: creds.userSeed,
+        ...(typeof natsUrl === "string" && natsUrl.length > 0 ? { natsUrl } : {}),
+      };
     }
     return undefined;
   } catch {

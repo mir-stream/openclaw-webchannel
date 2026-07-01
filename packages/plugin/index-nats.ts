@@ -544,9 +544,6 @@ export default defineChannelPluginEntry({
           accountId,
         });
         credentialMode = source.mode;
-        console.log(
-          `[webchannel] account "${accountId}" credential source: ${source.mode} → ${source.url}`,
-        );
         const consumed = await consumeCredentialSource(source, accountId);
         if (consumed.status === "creds-missing") {
           // Account-scoped graceful degradation (creds missing/expired): skip
@@ -559,6 +556,12 @@ export default defineChannelPluginEntry({
           );
           continue;
         }
+        // Log the EFFECTIVE relay (consumed.dialedUrl), not the resolver's
+        // `source.url`: for enrolled mode the SaaS-delivered `natsUrl` wins, so
+        // these can differ — printing the dialed URL keeps the log truthful.
+        console.log(
+          `[webchannel] account "${accountId}" credential source: ${source.mode} → ${consumed.dialedUrl}`,
+        );
         transport = consumed.connection.transport;
         if (consumed.connection.enrolled) enrolled = consumed.connection.enrolled;
       } catch (err) {

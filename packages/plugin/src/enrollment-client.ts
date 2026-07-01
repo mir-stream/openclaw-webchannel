@@ -63,6 +63,12 @@ type EnrollmentResult = {
   peerId: string;
   jwksUrl: string;
   bootstrapUrl: string;
+  /**
+   * NATS WebSocket URL delivered by the SaaS. The relay location travels with
+   * the minted creds (the SaaS is the rendezvous authority); the enrolled plugin
+   * dials THIS rather than a local `nats.url` / `WEBCHANNEL_NATS_URL`.
+   */
+  natsUrl: string;
 };
 
 /**
@@ -125,6 +131,7 @@ export type PluginCredentials = {
     peerId: string;
     jwksUrl: string;
     bootstrapUrl: string;
+    natsUrl: string;
   };
 
   /**
