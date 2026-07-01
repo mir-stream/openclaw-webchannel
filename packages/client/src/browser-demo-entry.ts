@@ -23,13 +23,19 @@ import { WebChannelNatsClient } from "./nats-client.js";
 export type RunDemoOptions = {
   /** JWT-auth NATS WebSocket URL (NKEY challenge-response required). */
   natsUrl: string;
-  /** Unified reference issuer (serves /test/nats-user + /test/bootstrap-jwt, CORS `*`). */
+  /** Unified reference issuer base URL (fallback; the same-origin location.origin
+   *  is preferred at runtime so the session cookie is never dropped). */
   issuerUrl: string;
   /** Gateway base URL serving the PoP register routes. */
   gwUrl: string;
   accountId: string;
   tenant: string;
-  peerId: string;
+  /**
+   * IGNORED — the peerId is now derived server-side from the login session
+   * (user.uuid). Kept only for config back-compat; the client uses the peerId the
+   * /bootstrap response returns.
+   */
+  peerId?: string;
 };
 
 /** Callbacks the host UI provides to receive replies / errors / status updates. */
@@ -61,8 +67,8 @@ function b64url(input: ArrayBuffer | Uint8Array): string {
 /**
  * Run the interactive ALL-REAL setup and return a live chat controller.
  *
- * Reuses steps 1–5 of `runAllReal` (keygen → /test/nats-user →
- * /test/bootstrap-jwt → construct the production client) but KEEPS the client
+ * Reuses steps 1–5 of `runAllReal` (keygen → session-gated /nats-user →
+ * /bootstrap → construct the production client) but KEEPS the client
  * alive: it never sends on its own and never disconnects on the first reply.
  *
  * @returns a `{ send, disconnect }` controller.
@@ -92,10 +98,20 @@ export async function runDemo(
   if (!edPubJwk.x) throw new Error("Ed25519 public JWK missing 'x'");
   const devicePopPublicKey = edPubJwk.x;
 
+  // Derive the issuer base from the page origin so /nats-user + /bootstrap are
+  // truly same-origin: the login `sid` cookie is bound to location.origin, and a
+  // localhost/127.0.0.1 mismatch with opts.issuerUrl would silently drop it.
+  // Fall back to opts.issuerUrl only when window is unavailable (non-browser).
+  const issuerBase =
+    typeof window !== "undefined" && window.location?.origin
+      ? window.location.origin
+      : opts.issuerUrl;
+
   // 3. Tenant-scoped NATS user creds (for NATS-layer NKEY auth). userSeedRaw is
   //    base64url of the raw 32-byte Ed25519 seed — browser signs with it directly.
+  //    Session-gated (/nats-user relies on the same-origin login cookie).
   callbacks.onStatus("fetching creds");
-  const credsRes = await fetch(`${opts.issuerUrl}/test/nats-user`, {
+  const credsRes = await fetch(`${issuerBase}/nats-user`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ tenant: opts.tenant, role: "browser" }),
@@ -117,19 +133,20 @@ export async function runDemo(
   const natsUrl = deliveredNatsUrl ?? opts.natsUrl;
 
   // 4. PoP bootstrap JWT (RS256, this issuer's trust chain) for the register hop.
-  const bootRes = await fetch(`${opts.issuerUrl}/test/bootstrap-jwt`, {
+  //    Session-gated: the peerId is derived server-side from the login session
+  //    (user.uuid), so we send NO peerId — only the account/tenant/device keys.
+  const bootRes = await fetch(`${issuerBase}/bootstrap`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       tenant: opts.tenant,
       accountId: opts.accountId,
-      peerId: opts.peerId,
       deviceX25519PublicKey,
       devicePopPublicKey,
     }),
   });
   if (!bootRes.ok) {
-    throw new Error(`bootstrap-jwt failed: HTTP ${bootRes.status} ${await bootRes.text()}`);
+    throw new Error(`bootstrap failed: HTTP ${bootRes.status} ${await bootRes.text()}`);
   }
   const { jwt, peerId } = (await bootRes.json()) as { jwt?: string; peerId?: string };
   if (!jwt || !peerId) throw new Error("bootstrap-jwt response missing jwt/peerId");

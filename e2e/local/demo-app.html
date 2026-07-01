@@ -108,6 +108,43 @@
     .badge.approved { background: #0f2a18; color: var(--ok); }
     .badge.denied   { background: #2c1416; color: var(--err); }
 
+    /* ---- User↔account (aud) authz sub-panel ---- */
+    .users {
+      border-top: 1px solid var(--border);
+      padding: 12px 14px;
+      max-height: 40%;
+      overflow-y: auto;
+      flex: none;
+    }
+    .users h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 4px; }
+    .users .cap { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+    .user-row {
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 12px; background: #12151b; margin-bottom: 8px;
+    }
+    .user-row .name { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #1c2230; border: 1px solid var(--border); color: var(--text);
+      border-radius: 999px; padding: 3px 6px 3px 10px; font-size: 12px;
+    }
+    .chip.empty { color: var(--muted); border-style: dashed; }
+    .chip button {
+      border: 0; background: transparent; color: var(--err);
+      cursor: pointer; font: inherit; font-weight: 700; line-height: 1; padding: 0 2px;
+    }
+    .grant { display: flex; gap: 6px; }
+    .grant input {
+      flex: 1; min-width: 0; background: #0f1115; border: 1px solid var(--border);
+      color: var(--text); border-radius: 8px; padding: 6px 9px; font: inherit; font-size: 12px; outline: none;
+    }
+    .grant input:focus { border-color: var(--accent); }
+    .grant button {
+      border: 0; border-radius: 8px; padding: 6px 12px; font: inherit; font-size: 12px;
+      font-weight: 600; cursor: pointer; background: var(--accent); color: #fff;
+    }
+
     /* ---- Visitor (chat) panel ---- */
     .status {
       display: flex; align-items: center; gap: 8px;
@@ -142,6 +179,21 @@
       padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer;
     }
     #input:disabled, #send:disabled { opacity: 0.5; cursor: not-allowed; }
+    /* ---- Login gate ---- */
+    #loginForm {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      padding: 12px 14px; border-bottom: 1px solid var(--border);
+    }
+    #loginForm input {
+      flex: 1; min-width: 120px; background: #12151b; border: 1px solid var(--border);
+      color: var(--text); border-radius: 10px; padding: 9px 12px; font: inherit; outline: none;
+    }
+    #loginForm input:focus { border-color: var(--accent); }
+    #loginBtn {
+      background: var(--accent); color: #fff; border: 0; border-radius: 10px;
+      padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer;
+    }
+    #loginStatus { color: var(--err); font-size: 12px; flex-basis: 100%; }
     .chat-body { padding: 0; }
     .chat-wrap { display: flex; flex-direction: column; height: 100%; }
     .chat-scroll { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
@@ -168,6 +220,11 @@
         <div class="body" id="enrollList">
           <div class="enroll-empty" id="enrollEmpty">Waiting for an agent to request enrollment…</div>
         </div>
+        <div class="users" id="usersPanel">
+          <h3>User access (aud)</h3>
+          <p class="cap">Grant/revoke which accounts (aud) a user may reach — takes effect on their next login (bootstrap).</p>
+          <div id="usersList"></div>
+        </div>
       </section>
 
       <!-- ================= VISITOR / CHAT ================= -->
@@ -178,14 +235,21 @@
         </div>
         <div class="body chat-body">
           <div class="chat-wrap">
+            <!-- Login gate: the SaaS derives a stable peerId from this user. -->
+            <form id="loginForm">
+              <input id="username" type="text" placeholder="username (alice / bob)" autocomplete="off" />
+              <input id="password" type="password" placeholder="password: demo" autocomplete="off" />
+              <button id="loginBtn" type="submit">Log in</button>
+              <span id="loginStatus"></span>
+            </form>
             <div class="chat-scroll" id="log">
               <div class="status" style="margin-bottom:6px;">
                 <span class="dot" id="dot"></span>
-                <span id="statusText">waiting for agent approval…</span>
+                <span id="statusText">log in to start chatting…</span>
               </div>
             </div>
             <form id="form">
-              <input id="input" type="text" placeholder="Approve the agent first…" autocomplete="off" disabled />
+              <input id="input" type="text" placeholder="Log in to chat…" autocomplete="off" disabled />
               <button id="send" type="submit" disabled>Send</button>
             </form>
           </div>
@@ -275,6 +339,73 @@
       poll();
 
       // -------------------------------------------------------------------
+      // USER↔ACCOUNT (aud) ADMIN — GET /demo/users, edit allowedAccounts.
+      // Demonstrates the SaaS authorization boundary: which accounts a login
+      // may reach. Edits POST the FULL new array; changes apply at next login.
+      // -------------------------------------------------------------------
+      var usersListEl = document.getElementById("usersList");
+
+      function esc(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+      }
+
+      function postAccounts(username, accounts) {
+        return fetch("/demo/users/" + encodeURIComponent(username) + "/accounts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ accounts: accounts }),
+        }).then(function () { loadUsers(); });
+      }
+
+      function renderUsers(users) {
+        usersListEl.innerHTML = "";
+        (users || []).forEach(function (u) {
+          var accounts = u.allowedAccounts || [];
+          var row = document.createElement("div");
+          row.className = "user-row";
+          var chips = accounts.length
+            ? accounts.map(function (a) {
+                return '<span class="chip">' + esc(a) +
+                  '<button data-user="' + esc(u.username) + '" data-acct="' + esc(a) + '" title="revoke">×</button></span>';
+              }).join("")
+            : '<span class="chip empty">no accounts</span>';
+          row.innerHTML =
+            '<div class="name">' + esc(u.username) + "</div>" +
+            '<div class="chips">' + chips + "</div>" +
+            '<form class="grant" data-user="' + esc(u.username) + '">' +
+            '<input type="text" placeholder="account id (aud)…" autocomplete="off" />' +
+            "<button type=\"submit\">Grant</button></form>";
+          usersListEl.appendChild(row);
+
+          // Wire revoke chips.
+          row.querySelectorAll(".chip button").forEach(function (btn) {
+            btn.addEventListener("click", function () {
+              var next = accounts.filter(function (a) { return a !== btn.getAttribute("data-acct"); });
+              postAccounts(btn.getAttribute("data-user"), next);
+            });
+          });
+          // Wire grant form.
+          var grantForm = row.querySelector("form.grant");
+          grantForm.addEventListener("submit", function (e) {
+            e.preventDefault();
+            var val = grantForm.querySelector("input").value.trim();
+            if (!val || accounts.indexOf(val) !== -1) return;
+            postAccounts(grantForm.getAttribute("data-user"), accounts.concat([val]));
+          });
+        });
+      }
+
+      function loadUsers() {
+        fetch("/demo/users")
+          .then(function (r) { return r.json(); })
+          .then(renderUsers)
+          .catch(function () { /* demo route unavailable — leave panel empty */ });
+      }
+      loadUsers();
+
+      // -------------------------------------------------------------------
       // VISITOR PANEL — chat, unlocked once an agent is approved.
       // -------------------------------------------------------------------
       var logEl = document.getElementById("log");
@@ -287,6 +418,8 @@
       var controller = null;
       var ready = false;
       var chatStarted = false;
+      // Chat starts once the user has logged in.
+      var loggedIn = false;
 
       function scrollDown() { logEl.scrollTop = logEl.scrollHeight; }
       function append(kind, text) {
@@ -320,7 +453,7 @@
             setStatus("connected", "ok");
             if (!ready) {
               setReady(true);
-              append("note", "Connected. Say hello — the agent will reply.");
+              append("note", "Connected to the relay — your messages send as soon as your agent comes online.");
             }
           } else if (status === "connecting") {
             setStatus("connecting…", "");
@@ -345,25 +478,17 @@
           });
       }
 
-      function onAgentApproved() {
-        if (chatStarted) return;
+      // Chat starts on LOGIN (so the SaaS has a session to derive the peerId + mint
+      // creds). The client then reports live connection status and buffers outbound
+      // until the E2E handshake completes — so we don't gate on the agent here.
+      function maybeStartChat() {
+        if (chatStarted || !loggedIn) return;
         chatStarted = true;
-        append("note", "Agent approved. Waiting for it to connect to the relay…");
-        setStatus("agent connecting…", "");
-        // Approval alone isn't enough: the operator's `channels add` must finish and
-        // `gateway run` must boot + subscribe before the browser publishes. Poll the
-        // SaaS demo status until the harness signals the agent is live, THEN connect.
-        var waitReady = setInterval(function () {
-          fetch("/demo/status")
-            .then(function (r) { return r.json(); })
-            .then(function (s) {
-              if (s && s.agentReady) {
-                clearInterval(waitReady);
-                startChatClient();
-              }
-            })
-            .catch(function () { /* keep waiting */ });
-        }, 1500);
+        startChatClient();
+      }
+
+      function onAgentApproved() {
+        append("note", "Agent approved.");
       }
 
       formEl.addEventListener("submit", function (e) {
@@ -378,6 +503,43 @@
         }
         inputEl.value = "";
         inputEl.focus();
+      });
+
+      // -------------------------------------------------------------------
+      // LOGIN — POST /login (same-origin, so the sid cookie is set). On success
+      // the SaaS binds a stable peerId to this user; chat may then start.
+      // -------------------------------------------------------------------
+      var loginFormEl = document.getElementById("loginForm");
+      var usernameEl = document.getElementById("username");
+      var passwordEl = document.getElementById("password");
+      var loginStatusEl = document.getElementById("loginStatus");
+
+      loginFormEl.addEventListener("submit", function (e) {
+        e.preventDefault();
+        var username = usernameEl.value.trim();
+        var password = passwordEl.value;
+        loginStatusEl.textContent = "";
+        fetch("/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: username, password: password }),
+        })
+          .then(function (r) {
+            return r.json().then(function (data) { return { ok: r.ok, data: data }; });
+          })
+          .then(function (res) {
+            if (!res.ok) {
+              loginStatusEl.textContent = (res.data && res.data.error) || "login failed";
+              return;
+            }
+            loggedIn = true;
+            loginFormEl.style.display = "none";
+            append("note", "Logged in as " + res.data.username + " — peerId is now bound to this user");
+            maybeStartChat();
+          })
+          .catch(function (err) {
+            loginStatusEl.textContent = "login error: " + ((err && err.message) || String(err));
+          });
       });
     })();
   </script>

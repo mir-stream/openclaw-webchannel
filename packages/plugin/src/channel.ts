@@ -18,6 +18,7 @@ import {
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { webchannelSetup } from "./setup.js";
+import { webchannelSetupWizard } from "./setup-wizard.js";
 
 // Single default account id for Phase 1. `listAccountIds` MUST return ≥1 entry
 // and the plugin MUST expose `gateway.startAccount`, otherwise core's channel
@@ -126,6 +127,12 @@ export function createWebChannelPlugin(transport: WebChannelTransport) {
       // the account, afterAccountConfigWritten runs the headless device-flow
       // enroll). See src/setup.ts.
       setup: webchannelSetup,
+      // `setupWizard` (ChannelSetupWizard) drives the INTERACTIVE `channels add`
+      // flow: bare `channels add` → prompt tenant/saasBaseUrl (+ advanced jwt
+      // overrides) → finalize writes the full enroll-ready block. Forwarded onto
+      // the plugin via createChannelPluginBase (openclaw core.ts:502/841/817).
+      // See src/setup-wizard.ts.
+      setupWizard: webchannelSetupWizard,
     }), {
       message: createClawMessageAdapter(transport),
       // `approvalCapability` is a top-level ChannelPlugin field (sibling of

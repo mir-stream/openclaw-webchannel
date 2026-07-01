@@ -38,6 +38,7 @@ import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../src/device-flow-
 import { setupTrustChain } from "../src/setup-trust-chain.js";
 import { loadOrCreateTrustChain } from "../src/persistent-trust-chain.js";
 import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
+import { DemoUserDirectory, seedDemoUsers, type DemoUser } from "../src/demo-users.js";
 import { mintNatsUserCreds, type NatsUserRole } from "../src/nats-user-creds.js";
 import { assertValidSubjectToken } from "../src/subject-token.js";
 import type { EnrollmentRequest, PollRequest } from "../src/device-flow-types.js";
@@ -159,9 +160,13 @@ if (NATS_CONFIG_OUT) {
 // `/.well-known/jwks.json`. So a harness that drives the register hop needs a
 // bootstrap JWT signed by the SAME RSA key. We import it once at boot (held in
 // memory; never served/logged).
-const bootstrapRsaPrivateKey: webcrypto.CryptoKey | null = ENABLE_TEST_ROUTES
-  ? await importRsaPrivateKeyFromPem(trustChain.private.rsaPrivateKeyPem)
-  : null;
+// Also import under ENABLE_DEMO_UI so the session-gated `/bootstrap` route can
+// sign real bootstrap JWTs from the login flow (the demo replaces the
+// unauthenticated `/test/bootstrap-jwt` forgery route with a login-gated one).
+const bootstrapRsaPrivateKey: webcrypto.CryptoKey | null =
+  ENABLE_TEST_ROUTES || ENABLE_DEMO_UI
+    ? await importRsaPrivateKeyFromPem(trustChain.private.rsaPrivateKeyPem)
+    : null;
 const bootstrapKid = trustChain.kid;
 
 /** Import a PKCS#8 PEM RSA private key into a webcrypto signing key. */
@@ -445,10 +450,6 @@ interface DemoEnroll {
 }
 // Keyed by user_code, preserves insertion order for stable rendering.
 const demoEnrollments = new Map<string, DemoEnroll>();
-// Flipped true by the demo harness once `gateway run` is actually serving the
-// enrolled account, so the page's chat panel unlocks only AFTER the agent is live
-// (approval alone is not enough — the gateway still has to boot + connect).
-let demoAgentReady = false;
 
 function trackDemoEnroll(userCode: string, tenant?: string, accountId?: string): void {
   if (!ENABLE_DEMO_UI) return;
@@ -515,6 +516,47 @@ if (ENABLE_DEMO_UI) {
 }
 
 // ---------------------------------------------------------------------------
+// Demo login (ENABLE_DEMO_UI) — the SaaS user-domain behind the interactive demo.
+// ---------------------------------------------------------------------------
+//
+// A browser visitor logs in (id/pw); the SaaS derives a STABLE peerId from the
+// authenticated user (its stored uuid) and mints a bootstrap JWT ONLY after a
+// server-side canAccess(user, accountId) check. peerId is taken from the SESSION,
+// never from the request body — so it can't be spoofed. Sessions are in-memory
+// (demo-grade); a real SaaS would use a signed/DB-backed session store.
+const userDir = ENABLE_DEMO_UI ? new DemoUserDirectory(seedDemoUsers(DEMO_ACCOUNT_ID)) : null;
+const sessions = new Map<string, string>(); // sid → username
+
+/** Fresh 256-bit session token, base64url. */
+function newSessionToken(): string {
+  const bytes = new Uint8Array(32);
+  webcrypto.getRandomValues(bytes);
+  return Buffer.from(bytes).toString("base64url");
+}
+
+/** Read a single cookie value from the request `Cookie` header. */
+function readCookie(req: any, name: string): string | undefined {
+  const header: string | undefined = req.headers.cookie;
+  if (!header) return undefined;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return undefined;
+}
+
+/** Resolve the logged-in DemoUser from the request's `sid` cookie, or null. */
+function sessionUser(req: any): DemoUser | null {
+  if (!userDir) return null;
+  const sid = readCookie(req, "sid");
+  if (!sid) return null;
+  const username = sessions.get(sid);
+  if (!username) return null;
+  return userDir.get(username) ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
@@ -553,14 +595,187 @@ const server = createServer(async (req, res) => {
       sendJson(res, Array.from(demoEnrollments.values()));
       return;
     }
-    if (ENABLE_DEMO_UI && req.method === "GET" && path === "/demo/status") {
-      sendJson(res, { agentReady: demoAgentReady });
+
+    // ---------------------------------------------------------------------
+    // GET /demo/users - non-secret directory view for the admin panel.
+    // POST /demo/users/:username/accounts - edit a user's allowedAccounts.
+    //
+    // These DEMONSTRATE the user↔aud (account) authorization capability at the
+    // SaaS: the operator grants/revokes which accounts a login may reach, and the
+    // change takes effect on that user's next bootstrap (canAccess is checked at
+    // JWT-mint). In-memory + NO auth, consistent with the existing unauthenticated
+    // approve/deny demo UI; production would authenticate the operator and persist.
+    // ---------------------------------------------------------------------
+    if (ENABLE_DEMO_UI && req.method === "GET" && path === "/demo/users") {
+      sendJson(res, userDir!.list());
       return;
     }
-    if (ENABLE_DEMO_UI && req.method === "POST" && path === "/demo/agent-ready") {
-      demoAgentReady = true;
-      console.log("[demo-ui] agent-ready flag set — chat panel may unlock");
-      sendJson(res, { agentReady: true });
+    if (
+      ENABLE_DEMO_UI &&
+      req.method === "POST" &&
+      path.startsWith("/demo/users/") &&
+      path.endsWith("/accounts")
+    ) {
+      // Path shape: /demo/users/<username>/accounts
+      const username = decodeURIComponent(path.slice("/demo/users/".length, -"/accounts".length));
+      parseJsonBody(req, (body) => {
+        if (!body || typeof body !== "object") {
+          sendJson(res, { error: "Invalid JSON body" }, 400);
+          return;
+        }
+        const { accounts } = body as { accounts?: unknown };
+        if (!Array.isArray(accounts) || !accounts.every((a) => typeof a === "string")) {
+          sendJson(res, { error: "accounts must be an array of strings" }, 400);
+          return;
+        }
+        if (!userDir!.setAllowedAccounts(username, accounts as string[])) {
+          sendJson(res, { error: `unknown user "${username}"` }, 404);
+          return;
+        }
+        const updated = userDir!.get(username);
+        console.log(`[demo-users] ${username} allowedAccounts → [${(updated?.allowedAccounts ?? []).join(", ")}]`);
+        sendJson(res, { ok: true, username, allowedAccounts: updated?.allowedAccounts ?? [] });
+      });
+      return;
+    }
+
+    // ---------------------------------------------------------------------
+    // POST /login - Demo user login (ENABLE_DEMO_UI) → sets the `sid` cookie.
+    // The peerId is DERIVED from the authenticated user (its uuid), never from
+    // the request — closing the client-supplied-peerId spoof.
+    // ---------------------------------------------------------------------
+    if (ENABLE_DEMO_UI && req.method === "POST" && path === "/login") {
+      parseJsonBody(req, (body) => {
+        if (!body || typeof body !== "object") {
+          sendJson(res, { error: "Invalid JSON body" }, 400);
+          return;
+        }
+        const { username, password } = body as { username?: string; password?: string };
+        if (!username || !password) {
+          sendJson(res, { error: "Missing username or password" }, 400);
+          return;
+        }
+        const user = userDir!.authenticate(username, password);
+        if (!user) {
+          sendJson(res, { error: "invalid credentials" }, 401);
+          return;
+        }
+        const sid = newSessionToken();
+        sessions.set(sid, user.username);
+        // HttpOnly (no JS access) + SameSite=Lax; same-origin so no `Secure`/CORS creds.
+        res.setHeader("Set-Cookie", `sid=${sid}; HttpOnly; Path=/; SameSite=Lax; Max-Age=86400`);
+        console.log(`[login] ${user.username} → peerId=${user.uuid}`);
+        sendJson(res, { ok: true, username: user.username });
+      });
+      return;
+    }
+
+    // ---------------------------------------------------------------------
+    // POST /nats-user - Session-gated NATS user creds (ENABLE_DEMO_UI). The
+    // login-gated replacement for /test/nats-user: mirrors its minting but
+    // requires a valid session (no unauthenticated cross-tenant oracle).
+    // ---------------------------------------------------------------------
+    if (ENABLE_DEMO_UI && req.method === "POST" && path === "/nats-user") {
+      const user = sessionUser(req);
+      if (!user) {
+        sendJson(res, { error: "not authenticated" }, 401);
+        return;
+      }
+      parseJsonBody(req, (body) => {
+        if (!body || typeof body !== "object") {
+          sendJson(res, { error: "Invalid JSON body" }, 400);
+          return;
+        }
+        const { tenant, role } = body as { tenant?: string; role?: NatsUserRole };
+        if (!tenant) {
+          sendJson(res, { error: "Missing tenant" }, 400);
+          return;
+        }
+        mintNatsUserCreds({
+          accountSeed: mockTrustChain.natsAccountSeed,
+          tenant,
+          role: role === "agent" ? "agent" : "browser",
+          issuerAccountId: natsIssuerAccountId,
+        })
+          .then((creds) => {
+            console.log(`[nats-user] minted ${role ?? "browser"} creds for ${user.username} tenant=${tenant}`);
+            // The relay URL travels WITH the minted creds (SaaS = rendezvous authority).
+            sendJson(res, { ...creds, natsUrl: NATS_URL });
+          })
+          .catch((err) => {
+            console.error("[nats-user] Error:", err);
+            sendJson(res, { error: "Internal server error" }, 500);
+          });
+      });
+      return;
+    }
+
+    // ---------------------------------------------------------------------
+    // POST /bootstrap - Session-gated bootstrap JWT (ENABLE_DEMO_UI). peerId is
+    // DERIVED from the session (user.uuid) and the JWT is minted ONLY after a
+    // server-side canAccess(user, accountId) authorization check. Body peerId is
+    // ignored. Replaces the unauthenticated /test/bootstrap-jwt forgery route.
+    // ---------------------------------------------------------------------
+    if (ENABLE_DEMO_UI && req.method === "POST" && path === "/bootstrap") {
+      const user = sessionUser(req);
+      if (!user) {
+        sendJson(res, { error: "not authenticated" }, 401);
+        return;
+      }
+      if (!bootstrapRsaPrivateKey) {
+        sendJson(res, { error: "bootstrap signing disabled" }, 500);
+        return;
+      }
+      parseJsonBody(req, (body) => {
+        if (!body || typeof body !== "object") {
+          sendJson(res, { error: "Invalid JSON body" }, 400);
+          return;
+        }
+        // IGNORE any body peerId — the identity is the authenticated user's uuid.
+        const { tenant, accountId, deviceX25519PublicKey, devicePopPublicKey } = body as {
+          tenant?: string;
+          accountId?: string;
+          deviceX25519PublicKey?: string;
+          devicePopPublicKey?: string;
+        };
+        if (!tenant || !accountId || !deviceX25519PublicKey) {
+          sendJson(
+            res,
+            { error: "Missing required fields: tenant, accountId, deviceX25519PublicKey" },
+            400,
+          );
+          return;
+        }
+        // The user↔aud (account) ownership gate — the authorization boundary.
+        if (!userDir!.canAccess(user, accountId)) {
+          console.warn(`[bootstrap] ${user.username} DENIED for account "${accountId}" (not authorized)`);
+          sendJson(res, { error: `user not authorized for account "${accountId}"` }, 403);
+          return;
+        }
+        let claims;
+        try {
+          claims = buildBootstrapClaims({
+            iss: SAAS_ISSUER,
+            peerId: user.uuid,
+            accountId,
+            tenant,
+            deviceX25519PublicKey,
+            devicePopPublicKey,
+          });
+        } catch (err) {
+          sendJson(res, { error: `Invalid claims: ${(err as Error).message}` }, 400);
+          return;
+        }
+        signBootstrapJwt(claims as unknown as Record<string, unknown>)
+          .then((jwt) => {
+            console.log(`[bootstrap] issued JWT (kid=${bootstrapKid}) for ${user.username} peerId=${user.uuid}, account=${accountId}`);
+            sendJson(res, { jwt, peerId: user.uuid });
+          })
+          .catch((err) => {
+            console.error("[bootstrap] Error:", err);
+            sendJson(res, { error: "Internal server error" }, 500);
+          });
+      });
       return;
     }
 
@@ -754,7 +969,10 @@ const server = createServer(async (req, res) => {
     // POST /test/nats-user - TEST-ONLY NATS user creds for a driver/browser peer
     // ---------------------------------------------------------------------
     if (path === "/test/nats-user" && req.method === "POST") {
-      if (!ENABLE_TEST_ROUTES) {
+      // Disabled under ENABLE_DEMO_UI: the demo replaces this unauthenticated
+      // mint oracle with the session-gated POST /nats-user below. Serving both
+      // would leave the login gate bypassable.
+      if (!ENABLE_TEST_ROUTES || ENABLE_DEMO_UI) {
         sendJson(res, { error: "Not found" }, 404);
         return;
       }
@@ -793,7 +1011,10 @@ const server = createServer(async (req, res) => {
     // POST /test/bootstrap-jwt - TEST-ONLY RS256 bootstrap JWT for the register hop
     // ---------------------------------------------------------------------
     if (path === "/test/bootstrap-jwt" && req.method === "POST") {
-      if (!ENABLE_TEST_ROUTES) {
+      // Disabled under ENABLE_DEMO_UI: this route trusts a client-supplied peerId
+      // (unauthenticated forgery of any identity). The demo replaces it with the
+      // session-gated POST /bootstrap below, which derives peerId server-side.
+      if (!ENABLE_TEST_ROUTES || ENABLE_DEMO_UI) {
         sendJson(res, { error: "Not found" }, 404);
         return;
       }
