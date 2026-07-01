@@ -254,9 +254,15 @@ fi
 # ---------------------------------------------------------------------------
 # 6. Boot the isolated gateway. NO WEBCHANNEL_NATS_DEV_OPEN → enrolled path runs.
 #    HOME=$OCH isolates the plugin's enrollment credential store under $OCH.
+#
+#    NOTE: we deliberately do NOT pass WEBCHANNEL_NATS_URL. The SaaS is the
+#    rendezvous authority — the enrolled plugin receives the relay URL inside its
+#    EnrollmentResult (the issuer was booted with NATS_URL=ws://…:$NATS_WS in
+#    step 1) and dials THAT. The only SaaS coordinate the plugin still needs is
+#    where the SaaS itself lives (WEBCHANNEL_SAAS_BASE_URL). This is the whole
+#    point of the rework: the operator no longer configures the NATS URL.
 # ---------------------------------------------------------------------------
 HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
   WEBCHANNEL_SAAS_BASE_URL="http://127.0.0.1:$ISSUER_PORT" \
   WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" \
   WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \

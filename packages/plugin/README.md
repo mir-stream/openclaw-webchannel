@@ -40,8 +40,8 @@ auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See 
   see [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Gateway-WS channel (`index.ts`) — **dev-only** zero-infra fallback (run it via an OpenClaw gateway
   with this plugin loaded in WS mode). Needs a reachable inbound port, so it is NOT used in
-  production. Its dev demo lives in `e2e/local/live-chat*.{mjs,html}` +
-  `packages/client/src/browser-live-entry.ts`.
+  production. Exercise it via the `smoke/*.mjs` WS round-trip scripts; the single interactive
+  chat demo is the NATS path (`e2e/local/run-demo.sh`).
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
 ## Enrollment & credentials (NATS mode)

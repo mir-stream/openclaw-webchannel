@@ -7,9 +7,11 @@
  * same-host/LAN only. It therefore does NOT satisfy the project's no-inbound-port
  * premise and must never be the default/production entry.
  *
- * Keep it for zero-infra local round-trips (no NATS relay, no SaaS issuer): its
- * dev demo is `e2e/local/live-chat*.{mjs,html}` + `packages/client/src/browser-live-entry.ts`.
- * The live gateway runs `index-nats.ts`; `package.json` defaults to it.
+ * Keep it for zero-infra local round-trips (no NATS relay, no SaaS issuer):
+ * exercise it via the `smoke/*.mjs` WS scripts against a gateway with this plugin
+ * loaded in WS mode. The single interactive demo is the NATS path
+ * (`e2e/local/run-demo.sh`); the live gateway runs `index-nats.ts` and
+ * `package.json` defaults to it.
  */
 
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
