@@ -69,8 +69,9 @@ mkdir -p "$OCH/.openclaw"
 
 # ---------------------------------------------------------------------------
 # 1. REAL device-flow enrollment-server (single trust chain). Writes the public
-#    NATS config to $OCH and serves JWKS + TEST routes (/test/nats-user +
-#    /test/bootstrap-jwt for the browser peer).
+#    NATS config to $OCH and serves JWKS + the session-gated demo login routes
+#    (/login → /nats-user + /bootstrap for the browser peer). ENABLE_DEMO_UI
+#    disables the unauthenticated /test/* forgery routes.
 # ---------------------------------------------------------------------------
 # ENABLE_DEMO_UI=1 makes THIS SaaS server the single web origin: it serves both the
 # operator approval flow AND the embedded chat widget (GET / + /widget.js +
@@ -80,7 +81,6 @@ SAAS_BASE_URL="http://127.0.0.1:$ISSUER_PORT" \
 SAAS_ISSUER="$SAAS_ISSUER" \
 NATS_URL="ws://127.0.0.1:$NATS_WS" \
 NATS_CONFIG_OUT="$OCH" \
-ENABLE_TEST_ROUTES=1 \
 POLL_INTERVAL_SECONDS=1 \
 ENABLE_DEMO_UI=1 \
 DEMO_APP_HTML="$REPO/e2e/local/demo-app.html" \
@@ -246,8 +246,9 @@ node -e '
                 audience: process.env.ACCOUNT_ID,
               },
             },
-            dmSecurity: "allowlist",
-            allowFrom: [process.env.PEER_ID],
+            // user↔account authz now lives at SaaS JWT-mint (canAccess); the
+            // verified aud-scoped bootstrap JWT + PoP is the sole admission proof.
+            dmSecurity: "open",
             nats: { credentials: { mode: "enrolled" } },
           },
         },
