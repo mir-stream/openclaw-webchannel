@@ -15,7 +15,7 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "additionalProperties": false,
-        "description": "WebChannel config (OpenClaw multi-account model). The channel-level (flat) fields are the shared base AND the implicit \"default\" account; named accounts live under `accounts.<accountId>` and inherit the channel-level base. Acquisition identity (tenant/agentId/saas.baseUrl) and credentials are set via 'openclaw channels add --channel webchannel'.",
+        "description": "WebChannel config (OpenClaw multi-account model). The channel-level (flat) fields are the shared base AND the implicit \"default\" account; named accounts live under `accounts.<accountId>` and inherit the channel-level base. Acquisition identity (tenant/accountId/saas.baseUrl) and credentials are set via 'openclaw channels add --channel webchannel'.",
         "properties": {
           "accounts": {
             "type": "object",
@@ -28,10 +28,6 @@
           "tenant": {
             "type": "string",
             "description": "Deployment tenant identifier (acquisition identity). Set via 'openclaw channels add --channel webchannel --tenant <t>' (or the mapped --url flag)."
-          },
-          "agentId": {
-            "type": "string",
-            "description": "Agent id for this account — the JWT aud / wire key. Set via 'openclaw channels add --channel webchannel --agent-id <a>' (or the mapped --token flag)."
           },
           "saas": {
             "type": "object",
@@ -357,10 +353,6 @@
       {
         "flags": "--tenant <tenant>",
         "description": "WebChannel: deployment tenant identifier. Maps to channels.webchannel.<account>.tenant."
-      },
-      {
-        "flags": "--agent-id <id>",
-        "description": "WebChannel: agent id (JWT aud / wire key) for this account. Maps to channels.webchannel.<account>.agentId."
       }
     ]
   }
