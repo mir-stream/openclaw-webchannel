@@ -4,7 +4,7 @@
  * `run-demo.sh` / `mac-demo.sh` turn the reference SaaS server into the SINGLE
  * web origin for the demo: it serves the two-panel page, esbuild-bundles the
  * browser client into `/widget.js`, tracks enrollment requests for the admin
- * panel, and gates chat-unlock via `/demo/status` + `/demo/agent-ready`. That
+ * panel. That
  * whole surface is exercised ONLY by the manual `run-demo.sh` (real browser +
  * human approval + real model), so nothing in CI catches it breaking.
  *
@@ -12,7 +12,7 @@
  * from `packages/client/src/browser-demo-entry.ts`'s import graph. A browser-
  * unsafe `node:` import sneaking into that graph, or a moved entry/`nats-client`,
  * breaks `run-demo.sh` at boot with nothing to notice. This hermetic smoke boots
- * the server with `ENABLE_DEMO_UI=1` and asserts the four demo behaviors over
+ * the server with `ENABLE_DEMO_UI=1` and asserts the three demo behaviors over
  * plain HTTP — no browser, no NATS, no model, no human.
  */
 
@@ -105,7 +105,7 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
       stdio: "pipe",
     });
     // Only listens AFTER the trust chain + the /widget.js esbuild bundle are built.
-    await waitForHttp(`${BASE}/demo/status`, 60_000);
+    await waitForHttp(`${BASE}/demo/enrollments`, 60_000);
   }, 70_000);
 
   afterAll(() => {
@@ -169,20 +169,5 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
     expect(deny.ok).toBe(true);
     const denied = (await enrollments()).find((e) => e.userCode === code);
     expect(denied!.status).toBe("denied");
-  });
-
-  it("gates chat-unlock via /demo/status + /demo/agent-ready", async () => {
-    const before = (await (await fetch(`${BASE}/demo/status`)).json()) as { agentReady: boolean };
-    expect(before.agentReady).toBe(false);
-
-    const post = await fetch(`${BASE}/demo/agent-ready`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    expect(post.ok).toBe(true);
-
-    const after = (await (await fetch(`${BASE}/demo/status`)).json()) as { agentReady: boolean };
-    expect(after.agentReady).toBe(true);
   });
 });

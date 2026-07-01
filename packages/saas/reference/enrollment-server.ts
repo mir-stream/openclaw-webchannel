@@ -450,10 +450,6 @@ interface DemoEnroll {
 }
 // Keyed by user_code, preserves insertion order for stable rendering.
 const demoEnrollments = new Map<string, DemoEnroll>();
-// Flipped true by the demo harness once `gateway run` is actually serving the
-// enrolled account, so the page's chat panel unlocks only AFTER the agent is live
-// (approval alone is not enough — the gateway still has to boot + connect).
-let demoAgentReady = false;
 
 function trackDemoEnroll(userCode: string, tenant?: string, accountId?: string): void {
   if (!ENABLE_DEMO_UI) return;
@@ -597,16 +593,6 @@ const server = createServer(async (req, res) => {
     }
     if (ENABLE_DEMO_UI && req.method === "GET" && path === "/demo/enrollments") {
       sendJson(res, Array.from(demoEnrollments.values()));
-      return;
-    }
-    if (ENABLE_DEMO_UI && req.method === "GET" && path === "/demo/status") {
-      sendJson(res, { agentReady: demoAgentReady });
-      return;
-    }
-    if (ENABLE_DEMO_UI && req.method === "POST" && path === "/demo/agent-ready") {
-      demoAgentReady = true;
-      console.log("[demo-ui] agent-ready flag set — chat panel may unlock");
-      sendJson(res, { agentReady: true });
       return;
     }
 

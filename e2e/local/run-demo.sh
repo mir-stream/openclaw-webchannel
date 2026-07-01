@@ -358,11 +358,7 @@ for i in $(seq 1 240); do
   fi
 done
 
-# 6a. Signal the unified page that the agent is live, so the RIGHT chat panel
-#     unlocks only AFTER the gateway is actually serving (not merely on approval).
-curl -fsS -X POST "http://127.0.0.1:$ISSUER_PORT/demo/agent-ready" \
-  -H 'Content-Type: application/json' -d '{}' >/dev/null 2>&1 || true
-echo "[run-demo] agent is live — the chat panel is now enabled. Say hello!"
+echo "[run-demo] gateway is serving — open the page and LOG IN to chat."
 
 # Block until the user Ctrl+C (EXIT trap then cleans up). `wait` on the gateway
 # PID keeps us alive and exits if the gateway itself dies.

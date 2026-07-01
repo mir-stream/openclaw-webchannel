@@ -245,11 +245,11 @@
             <div class="chat-scroll" id="log">
               <div class="status" style="margin-bottom:6px;">
                 <span class="dot" id="dot"></span>
-                <span id="statusText">waiting for agent approval…</span>
+                <span id="statusText">log in to start chatting…</span>
               </div>
             </div>
             <form id="form">
-              <input id="input" type="text" placeholder="Approve the agent first…" autocomplete="off" disabled />
+              <input id="input" type="text" placeholder="Log in to chat…" autocomplete="off" disabled />
               <button id="send" type="submit" disabled>Send</button>
             </form>
           </div>
@@ -418,8 +418,8 @@
       var controller = null;
       var ready = false;
       var chatStarted = false;
-      // Chat only starts once BOTH the user has logged in AND the agent is live.
-      var loggedIn = false, agentReady = false;
+      // Chat starts once the user has logged in.
+      var loggedIn = false;
 
       function scrollDown() { logEl.scrollTop = logEl.scrollHeight; }
       function append(kind, text) {
@@ -453,7 +453,7 @@
             setStatus("connected", "ok");
             if (!ready) {
               setReady(true);
-              append("note", "Connected. Say hello — the agent will reply.");
+              append("note", "Connected to the relay — your messages send as soon as your agent comes online.");
             }
           } else if (status === "connecting") {
             setStatus("connecting…", "");
@@ -478,32 +478,17 @@
           });
       }
 
-      // Chat can only start once the user is logged in (so the SaaS has a session
-      // to derive the peerId + mint creds) AND the agent is live on the relay.
+      // Chat starts on LOGIN (so the SaaS has a session to derive the peerId + mint
+      // creds). The client then reports live connection status and buffers outbound
+      // until the E2E handshake completes — so we don't gate on the agent here.
       function maybeStartChat() {
-        if (chatStarted || !loggedIn || !agentReady) return;
+        if (chatStarted || !loggedIn) return;
         chatStarted = true;
         startChatClient();
       }
 
       function onAgentApproved() {
-        append("note", "Agent approved. Waiting for it to connect to the relay…");
-        setStatus("agent connecting…", "");
-        // Approval alone isn't enough: the operator's `channels add` must finish and
-        // `gateway run` must boot + subscribe before the browser publishes. Poll the
-        // SaaS demo status until the harness signals the agent is live, THEN unlock.
-        var waitReady = setInterval(function () {
-          fetch("/demo/status")
-            .then(function (r) { return r.json(); })
-            .then(function (s) {
-              if (s && s.agentReady) {
-                clearInterval(waitReady);
-                agentReady = true;
-                maybeStartChat();
-              }
-            })
-            .catch(function () { /* keep waiting */ });
-        }, 1500);
+        append("note", "Agent approved.");
       }
 
       formEl.addEventListener("submit", function (e) {
