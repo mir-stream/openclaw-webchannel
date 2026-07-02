@@ -26,7 +26,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 const HERE = dirname(fileURLToPath(import.meta.url)); // packages/saas/src
 const REPO_ROOT = join(HERE, "..", "..", "..");
 const SERVER_PATH = join(HERE, "..", "reference", "enrollment-server.ts");
-const DEMO_APP_HTML = join(REPO_ROOT, "e2e", "local", "demo-app.html");
+const DEMO_APP_HTML = join(REPO_ROOT, "e2e", "local", "ci-smoke.html");
 const DEMO_CLIENT_ENTRY = join(REPO_ROOT, "packages", "client", "src", "browser-demo-entry.ts");
 
 // Unique port (avoid the other saas HTTP-server tests: 3456/3457 etc.).

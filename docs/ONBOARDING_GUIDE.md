@@ -86,7 +86,7 @@ export SAAS_ISSUER='https://saas.local/webchannel-issuer'   # JWT `iss` claim (a
 # unauthenticated /test/* mint routes are OFF; the human LOGS IN instead. This one
 # issuer then serves BOTH the /approve pairing UI (§5) and the login/chat page (§6).
 export ENABLE_DEMO_UI='1'
-export DEMO_APP_HTML="$PWD/e2e/local/demo-app.html"          # required by ENABLE_DEMO_UI
+export DEMO_APP_HTML="$PWD/e2e/local/ci-smoke.html"          # required by ENABLE_DEMO_UI
 export DEMO_CLIENT_ENTRY="$PWD/packages/client/src/browser-demo-entry.ts"   # required by ENABLE_DEMO_UI
 export TRUST_CHAIN_PATH="$HOME/.openclaw-webchannel-saas/trust-chain-synadia.json"
 ```
@@ -361,7 +361,7 @@ PORT='3951' \
 SAAS_BASE_URL='http://127.0.0.1:3951' \
 NATS_URL='wss://connect.ngs.global:443' \
 ENABLE_DEMO_UI=1 \
-DEMO_APP_HTML="$PWD/e2e/local/demo-app.html" \
+DEMO_APP_HTML="$PWD/e2e/local/ci-smoke.html" \
 DEMO_CLIENT_ENTRY="$PWD/packages/client/src/browser-demo-entry.ts" \
 DEMO_GW_URL='' \                                            # '' = admission auto (the §4 default); set a gateway URL only for register-hop
 DEMO_TENANT='default-tenant' \
