@@ -22,7 +22,9 @@ The NATS E2E path is the production default (`packages/plugin/package.json` →
 `openclaw.extensions = ["./index-nats.ts"]`) and is **live-proven on real hardware**: a real
 browser on a Mac talked to a real OpenClaw gateway + this plugin (running in a container) over a
 real JWT-auth `nats-server` and got a real LLM reply — ingress-free, end-to-end encrypted, and
-device-flow enrolled. The Gateway-WS entry (`index.ts`) is a **legacy, dev-only** zero-infra WS
+device-flow enrolled. (E2E today = confidentiality against a *passive* relay; active-relay MITM
+protection requires the authenticated handshake tracked as **C2** in
+[`docs/BACKLOG.md`](docs/BACKLOG.md), a prerequisite before running on a third-party relay.) The Gateway-WS entry (`index.ts`) is a **legacy, dev-only** zero-infra WS
 round-trip (exercised by `smoke/*.mjs`); it still exists but has no production role. Its full
 removal is a separate backlog item ([`docs/BACKLOG.md`](docs/BACKLOG.md)).
 

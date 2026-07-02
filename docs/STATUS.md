@@ -75,12 +75,15 @@ this file, **this file is correct.**
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
+| **Stability/security hardening (review 2026-07-02)** | Full-code review found deploy-blocking issues on the live NATS path — notably **C1** (a listener-less `emit("error")` can crash the whole gateway process) and **A1** (unauthenticated `/enroll` grows unbounded → OOM), plus **C2** (the E2E handshake is unauthenticated → active-relay MITM; accepted-risk while the relay is self-operated). Full findings, verification status, and fix order: [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md). C2 backlog: [`BACKLOG.md`](BACKLOG.md). |
 
-> Everything else that used to live here is now **done**. The live NATS E2E path (browser → NATS
-> → plugin/agent → reply → browser) is the production default and has run end-to-end on real
-> hardware (split host/container, real JWT-auth `nats-server`, real LLM). Full removal of the
-> legacy Gateway-WS transport is the only remaining structural cleanup (the `hmac-ticket` auth
-> strategy is already removed) — tracked in [`BACKLOG.md`](BACKLOG.md), not a functional gap.
+> The live NATS E2E path (browser → NATS → plugin/agent → reply → browser) is the production
+> default and has run end-to-end on real hardware (split host/container, real JWT-auth
+> `nats-server`, real LLM) — the **happy path is proven**. What the 2026-07-02 review surfaced is
+> **operational hardening under stress** (server restart, connection churn, long uptime) rather
+> than happy-path gaps: see the row above and [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md).
+> Separately, full removal of the legacy Gateway-WS transport is a structural cleanup (the
+> `hmac-ticket` auth strategy is already removed) — tracked in [`BACKLOG.md`](BACKLOG.md).
 
 ### Previously-open items, now closed
 

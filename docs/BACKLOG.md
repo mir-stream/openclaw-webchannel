@@ -3,6 +3,47 @@
 Follow-up work that is deferred, not a functional gap. The single source of truth for current
 state is [`STATUS.md`](STATUS.md).
 
+## C2 — Authenticated handshake (mutual key attestation) — **SECURITY, hard blocker for untrusted relay**
+
+**Status: accepted-risk (option A) for now.** The E2E channel currently provides confidentiality
+against a *passive* relay only. The live X25519 handshake is **unauthenticated in both
+directions**, so an *active* relay can MITM every conversation and approval. This is acceptable
+**only while the relay is operated by a trusted party** (own `nats-server` / own Synadia account).
+**This item MUST be closed before any deployment on a third-party-operated relay** (e.g. Synadia
+NGS external mode where Synadia operates the relay). Until then, docs claiming "untrusted relay"
+E2E have been softened (README.md, docs/ONBOARDING_GUIDE.md, packages/plugin/README.md,
+packages/client/README.md).
+
+**Root cause (verified 2026-07-02).** The verification machinery is ~70% built but not wired:
+- `parseAndVerifyHandshake` / `verifyDeviceKey` (plugin) and `verifyAgentKey` /
+  `parseAndStorePinnedKeys` / `getPinnedKeys` (client) have **zero non-test callers**.
+- The live agent handshake (`packages/plugin/src/nats-channel.ts` `handleHandshake`) feeds the wire
+  key straight into `deriveConversationKey` with no verification.
+- The live wire frame is `{type:"key_exchange", pubKey}` (`e2e-session.ts`) — no `peerId`, no
+  envelope — while the verifier expects a `handshake_hello` message with `devicePublicKey` +
+  `peerId`. **Wire format must be reconciled**, not just "call the function".
+- `jwt.ts` still admits bootstrap JWTs with **no `cnf` at all** (backward-compat) → often no pin to
+  check.
+- **Net-new work:** the SaaS receives the agent's X25519 key at enrollment
+  (`device-flow-enrollment.ts:264`) but **never attests it back to the browser** — the browser has
+  no trusted source for the agent key, so `verifyAgentKey` has nothing to check against.
+
+**Scope of the fix (mutual attestation — option C):**
+- [ ] browser→agent: make `cnf.jwk` mandatory in `jwt.ts` (drop the no-cnf backward-compat path, or
+  gate it behind an explicit insecure flag); reconcile the `key_exchange` frame with the
+  `handshake_hello` shape (add `peerId` or switch the live frame); call `parseAndVerifyHandshake`
+  in `handleHandshake` **before** `deriveConversationKey`.
+- [ ] agent→browser: SaaS signs/attests the enrollment-captured `agentPublicKey` to the browser
+  (embed in the bootstrap JWT the browser already verifies, or a signed sidecar); browser calls
+  `parseAndStorePinnedKeys` then `verifyAgentKey` before deriving the key.
+- [ ] wire eviction for the pinned-key stores on disconnect (ties into the plugin unbounded-map
+  cleanup).
+- [ ] add an integration test that a substituted key on either leg aborts with `HandshakeMitmError`.
+
+**Do NOT ship the browser→agent leg alone as an end state** — asymmetric authentication leaves the
+agent-impersonation direction open while implying MITM is handled (false sense of security). It is
+acceptable only as an intermediate commit toward the full mutual fix.
+
 ## Remove the legacy Gateway-WS transport (`hmac-ticket` strategy: DONE)
 
 **Rationale.** The NATS E2E path (`index-nats.ts`) is now the production default and is

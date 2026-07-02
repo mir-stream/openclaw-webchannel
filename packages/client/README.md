@@ -25,7 +25,10 @@ truth for what is and isn't done.
   A real browser running this class has round-tripped an encrypted message over a
   real JWT-auth `nats-server` into the enrolled `index-nats` plugin and back
   (NATS-layer NKEY-auth + X25519 handshake + PoP register hop). Ciphertext-only on
-  the wire.
+  the wire. **Note:** the X25519 handshake is currently *unauthenticated* — the
+  client does not verify the agent's key against a SaaS-attested pin, so E2E today
+  protects against a passive relay but **not** an active MITM. Authenticated
+  handshake is tracked as **C2** in the repo `docs/BACKLOG.md`.
 - `WebChannelClient` (Gateway-WS) — **legacy / dev-only.** A zero-infra WS
   round-trip. No production role; slated for removal (see the repo
   `docs/BACKLOG.md`).

@@ -1,8 +1,13 @@
 # WebChannel Onboarding Guide (BYO-NATS / Synadia)
 
 A reproducible, hands-on runbook for standing up a **browser ↔ OpenClaw agent** chat
-over an **untrusted NATS relay** (Synadia/NGS), end-to-end encrypted, with a **SaaS
-issuer** minting credentials. This is the practical sibling of the conceptual
+over a NATS relay (Synadia/NGS), end-to-end encrypted, with a **SaaS
+issuer** minting credentials.
+
+> ⚠️ **Relay trust caveat:** the E2E channel currently provides confidentiality against a
+> *passive* relay only. Active-relay MITM protection (authenticated handshake) is **not yet
+> wired** — see **C2** in [`BACKLOG.md`](./BACKLOG.md). Until then, run this against a relay you
+> operate (your own `nats-server` or your own Synadia account), not a genuinely untrusted one. This is the practical sibling of the conceptual
 [`TRUST_AND_ONBOARDING.md`](./TRUST_AND_ONBOARDING.md).
 
 By the end you will have: a real browser page talking to a real OpenClaw agent

@@ -82,7 +82,19 @@ credentials and skips enrollment.
 
 ## E2E security model (admission + handshake)
 
-The agent admits **only SaaS-attested device keys** and detects relay MITM at handshake time.
+> ⚠️ **Current status — handshake authentication is NOT wired into the live NATS path.**
+> The machinery below (`cnf` extraction, pinned-key store, `handshake-verifier.ts`) exists and is
+> unit-tested, but the live handshake (`nats-channel.ts` `handleHandshake`) derives the session key
+> directly from the wire key **without calling `parseAndVerifyHandshake`/`verifyDeviceKey`**, and the
+> browser never verifies the agent's key (the SaaS does not yet attest an agent key to the browser).
+> **What you get today:** confidentiality against a *passive* relay. **What is NOT yet provided:**
+> protection against an *active* relay MITM — a malicious relay can substitute keys in both
+> directions and transparently read/rewrite traffic. This is acceptable **only while the relay is
+> operated by a trusted party** (your own `nats-server` or your own Synadia account). Wiring the
+> mutual attestation below is tracked as **[docs/BACKLOG.md → C2: authenticated handshake](../../docs/BACKLOG.md)**
+> and is a hard prerequisite before any deployment on a third-party-operated relay.
+
+The design below describes the intended end state (mostly built, not yet wired):
 
 - **`cnf` claim verification** (`src/jwt.ts`): after the bootstrap JWT's signature is verified,
   `verifyJwt` extracts the RFC 7800 `cnf.jwk` confirmation claim. Types `CnfJwk` / `CnfClaim`;
@@ -96,14 +108,18 @@ The agent admits **only SaaS-attested device keys** and detects relay MITM at ha
 - **Constant-time handshake check** (`src/handshake-verifier.ts`): `verifyDeviceKey` and
   `parseAndVerifyHandshake` compare the key a peer presents against the pinned value using
   constant-time byte-equality; a mismatch (or missing pin, or bad length) throws
-  `HandshakeMitmError` and aborts the handshake before any ECDH.
+  `HandshakeMitmError` and aborts the handshake before any ECDH. **⚠️ Not yet called by the live
+  handshake — see the status note above.**
 - **No anonymous admission:** the `anonymous` auth strategy throws at plugin load
   (`makeAnonymousVerifier` never returns a verifier) — connections must use `jwt`.
 
-**Threat model (handled):** relay substitutes the device key → caught by the handshake compare;
-attacker skips bootstrap → no admission without a SaaS-attested key; forged `cnf` → JWT signature
-verification fails; timing oracle → constant-time compare. **Out of scope:** SaaS key compromise
-/ revocation (deferred to re-enrollment); real-time allowlist authz is a core-delegated stub.
+**Threat model — once the handshake check is wired (see status note):** relay substitutes the
+device key → caught by the handshake compare; attacker skips bootstrap → no admission without a
+SaaS-attested key; forged `cnf` → JWT signature verification fails; timing oracle → constant-time
+compare. **Not yet handled today (C2 backlog):** active relay MITM in either direction (verifier
+unwired; agent key not attested to the browser; `cnf` still optional). **Out of scope:** SaaS key
+compromise / revocation (deferred to re-enrollment); real-time allowlist authz is a core-delegated
+stub.
 
 ## Bring-your-own NATS (e.g. Synadia Cloud / NGS)
 
