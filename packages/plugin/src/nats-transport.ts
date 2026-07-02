@@ -60,6 +60,29 @@ export type NatsConnectOptions = {
    */
   clientName?: string;
   /**
+   * Auto-reconnect after an ESTABLISHED connection drops (review 2026-07-02 S1).
+   *
+   * When `true`, a post-handshake close/error schedules a re-dial with
+   * exponential backoff and, on success, replays the active subscriptions so
+   * inbound delivery resumes transparently. When `false` (default) a dropped
+   * connection stays down until the caller calls `connect()` again — the
+   * pre-S1 behaviour, preserved so existing callers/tests are unaffected.
+   *
+   * NOTE: this governs only reconnection of an already-established connection.
+   * The INITIAL `connect()` never auto-retries — its promise resolves/rejects
+   * so the caller keeps control of first-connect failure handling.
+   */
+  reconnect?: boolean;
+  /** Base backoff before the first reconnect attempt, ms. Default 500. */
+  reconnectBaseMs?: number;
+  /** Maximum backoff between reconnect attempts, ms. Default 15_000. */
+  reconnectCapMs?: number;
+  /**
+   * Give up after this many consecutive failed reconnect attempts (then emit a
+   * terminal `error`). Default `Infinity` — keep retrying with capped backoff.
+   */
+  maxReconnectAttempts?: number;
+  /**
    * Seam for dependency injection in tests. When provided, this factory is
    * called instead of `new WebSocket(url)`. Allows tests to drive the
    * transport with a fake WebSocket without spying on the module's default
@@ -94,6 +117,8 @@ export type NatsMessage = {
  * Events:
  *  - 'connect'    (): NATS handshake complete, ready to pub/sub.
  *  - 'disconnect' (): connection dropped (network or server close).
+ *  - 'reconnect'  (): a dropped connection was re-established and its
+ *                     subscriptions replayed (only when `reconnect: true`).
  *  - 'message'    (NatsMessage): inbound message on a subscribed subject.
  *  - 'error'      (Error): protocol or connection error.
  */
@@ -122,12 +147,28 @@ export class NatsTransport extends EventEmitter {
   private readonly clientName: string;
   private readonly wsFactory: (url: string) => WebSocket;
 
+  // ── Reconnect state (S1) ───────────────────────────────────────────────────
+  private readonly reconnectEnabled: boolean;
+  private readonly reconnectBaseMs: number;
+  private readonly reconnectCapMs: number;
+  private readonly maxReconnectAttempts: number;
+  // Set once disconnect() is called — stops any further reconnection.
+  private closed = false;
+  // Consecutive failed reconnect attempts; reset to 0 on a successful reconnect.
+  private reconnectAttempts = 0;
+  // Pending backoff timer, if a reconnect is scheduled.
+  private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+
   constructor(options: NatsConnectOptions) {
     super();
     this.url = options.url;
     this.jwtCredential = options.jwtCredential;
     this.nkeySigningCallback = options.nkeySigningCallback;
     this.clientName = options.clientName ?? "openclaw-webchannel-agent";
+    this.reconnectEnabled = options.reconnect ?? false;
+    this.reconnectBaseMs = options.reconnectBaseMs ?? 500;
+    this.reconnectCapMs = options.reconnectCapMs ?? 15_000;
+    this.maxReconnectAttempts = options.maxReconnectAttempts ?? Infinity;
     // Default factory: real outbound WebSocket CLIENT connection.
     this.wsFactory = options._wsFactory ?? ((url) => new WebSocket(url));
   }
@@ -237,6 +278,14 @@ export class NatsTransport extends EventEmitter {
         // If the socket closed before the handshake completed, the promise
         // is still pending — reject it.
         settle(new Error("NatsTransport: connection closed before NATS handshake"));
+        // S1: auto-reconnect ONLY for an ESTABLISHED connection that dropped.
+        // `handshakeDone` is per-socket, so a close during the INITIAL connect
+        // (or a failed reconnect attempt's own handshake) does NOT schedule here
+        // — first-connect failure is the caller's to handle, and a failed
+        // reconnect attempt reschedules from reconnectOnce()'s catch instead.
+        if (this.reconnectEnabled && !this.closed && handshakeDone) {
+          this.scheduleReconnect();
+        }
       });
     });
   }
@@ -403,8 +452,17 @@ export class NatsTransport extends EventEmitter {
 
   /**
    * Disconnect from the NATS server and clean up. Idempotent.
+   *
+   * Marks the transport permanently closed so any in-flight or scheduled
+   * reconnect (S1) is cancelled — an explicit disconnect must never be
+   * undone by the auto-reconnect loop.
    */
   disconnect(): void {
+    this.closed = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
     this._connected = false;
     this.subs.clear();
     this.buffer = "";
@@ -416,6 +474,78 @@ export class NatsTransport extends EventEmitter {
       }
       this.ws = null;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto-reconnect (S1)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Schedule a reconnect attempt with exponential backoff (capped).
+   *
+   * Idempotent while a timer is already pending. The timer is `unref`'d so a
+   * pending reconnect never keeps the process alive on its own. After
+   * `maxReconnectAttempts` consecutive failures it stops and emits a terminal
+   * `error` (crash-safe via `emitError`).
+   */
+  private scheduleReconnect(): void {
+    if (this.closed) return;
+    if (this.reconnectTimer) return; // already scheduled
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.emitError(
+        new Error(
+          `NatsTransport: giving up reconnect after ${this.reconnectAttempts} attempts`,
+        ),
+      );
+      return;
+    }
+    // Exponential backoff: base * 2^attempts, capped. attempts starts at 0.
+    const delay = Math.min(
+      this.reconnectBaseMs * 2 ** this.reconnectAttempts,
+      this.reconnectCapMs,
+    );
+    this.reconnectAttempts++;
+    const timer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      void this.reconnectOnce();
+    }, delay);
+    if (typeof timer.unref === "function") timer.unref();
+    this.reconnectTimer = timer;
+  }
+
+  /**
+   * Perform a single reconnect attempt: re-dial, redo the NATS handshake, and
+   * on success replay the active subscriptions so inbound delivery resumes.
+   * On failure, schedule the next backoff.
+   */
+  private async reconnectOnce(): Promise<void> {
+    if (this.closed) return;
+    // Capture the subjects we WANT subscribed. We do NOT clear `this.subs` yet:
+    // if this attempt fails, the entries must survive so the NEXT attempt can
+    // still recover them (clearing early would lose all subscriptions after a
+    // single failed re-dial). Dedupe — a subject may map to several sids.
+    const desiredSubjects = [...new Set(this.subs.values())];
+    try {
+      await this.connect();
+    } catch {
+      // Handshake failed — the fresh socket's close handler won't reschedule
+      // (its handshakeDone stayed false), so we do it here with backoff.
+      this.scheduleReconnect();
+      return;
+    }
+    if (this.closed) {
+      // Raced with an explicit disconnect() during the handshake — stand down.
+      this.disconnect();
+      return;
+    }
+    // Success — replace the stale sid→subject entries with fresh subscriptions
+    // on the new socket, then reset the backoff counter.
+    this.subs.clear();
+    for (const subject of desiredSubjects) {
+      this.subscribe(subject);
+    }
+    this.reconnectAttempts = 0;
+    this.emit("reconnect");
   }
 
   // ---------------------------------------------------------------------------

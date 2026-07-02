@@ -487,4 +487,111 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
     expect(errors[0]!.message).toBe("boom");
     expect(t.connected).toBe(false);
   });
+
+  // ── S1: auto-reconnect after an established connection drops ───────────────
+  // Review 2026-07-02 finding S1. A dropped NATS connection must re-dial with
+  // backoff and replay subscriptions, instead of wedging until gateway restart.
+
+  /** Complete the NATS handshake on a fake ws (open → INFO → PONG). */
+  function completeHandshake(ws: FakeWebSocket): void {
+    ws.fireOpen();
+    ws.fireServerFrame("INFO {}\r\nPONG\r\n");
+  }
+
+  /** Poll until `cond()` is true (reconnect is timer-driven + async). */
+  async function waitFor(cond: () => boolean, timeoutMs = 1000): Promise<void> {
+    const start = Date.now();
+    while (!cond()) {
+      if (Date.now() - start > timeoutMs) throw new Error("waitFor: timed out");
+      await new Promise((r) => setTimeout(r, 2));
+    }
+  }
+
+  /** A transport whose factory hands out a FRESH fake ws per dial (for reconnect). */
+  function makeReconnectTransport(opts?: {
+    reconnectBaseMs?: number;
+    reconnectCapMs?: number;
+    maxReconnectAttempts?: number;
+  }): { t: NatsTransport; instances: FakeWebSocket[] } {
+    const instances: FakeWebSocket[] = [];
+    const t = new NatsTransport({
+      url: "ws://fake-nats:4222",
+      reconnect: true,
+      reconnectBaseMs: opts?.reconnectBaseMs ?? 1,
+      reconnectCapMs: opts?.reconnectCapMs ?? 5,
+      ...(opts?.maxReconnectAttempts !== undefined
+        ? { maxReconnectAttempts: opts.maxReconnectAttempts }
+        : {}),
+      _wsFactory: () => {
+        const ws = makeFakeWs();
+        instances.push(ws);
+        return ws as unknown as WebSocket;
+      },
+    });
+    return { t, instances };
+  }
+
+  it("reconnects after an established connection drops and replays subscriptions", async () => {
+    const { t, instances } = makeReconnectTransport();
+    teardown.push(t);
+
+    const cp = t.connect();
+    completeHandshake(instances[0]!);
+    await cp;
+    expect(t.connected).toBe(true);
+    t.subscribe("webchannel.t.a.p.in");
+
+    let reconnected = 0;
+    t.on("reconnect", () => reconnected++);
+
+    // The established connection drops.
+    instances[0]!.close();
+    expect(t.connected).toBe(false);
+
+    // Backoff timer fires → reconnectOnce() dials a SECOND socket.
+    await waitFor(() => instances.length === 2);
+    completeHandshake(instances[1]!);
+    await waitFor(() => t.connected === true);
+
+    expect(reconnected).toBe(1);
+    // The subscription was replayed on the NEW socket.
+    const subFrames = instances[1]!.sent.filter(
+      (s): s is string => typeof s === "string" && s.startsWith("SUB "),
+    );
+    expect(subFrames.some((s) => s.includes("webchannel.t.a.p.in"))).toBe(true);
+  });
+
+  it("disconnect() during backoff cancels the pending reconnect", async () => {
+    const { t, instances } = makeReconnectTransport({ reconnectBaseMs: 50 });
+
+    const cp = t.connect();
+    completeHandshake(instances[0]!);
+    await cp;
+
+    instances[0]!.close(); // schedules a reconnect ~50ms out
+    t.disconnect(); // must cancel it
+
+    await new Promise((r) => setTimeout(r, 90));
+    // No second dial happened — the reconnect was cancelled.
+    expect(instances.length).toBe(1);
+  });
+
+  it("does NOT reconnect when reconnect is disabled (default)", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+
+    const cp = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n");
+    await cp;
+
+    let reconnected = 0;
+    t.on("reconnect", () => reconnected++);
+
+    fakeWs.close();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(t.connected).toBe(false);
+    expect(reconnected).toBe(0);
+  });
 });

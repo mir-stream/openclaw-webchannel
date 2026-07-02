@@ -381,6 +381,8 @@ export async function connectNatsCredentialSource(
       const transport = transportFactory({
         url: source.url,
         clientName: "openclaw-webchannel-agent-dev",
+        // S1: auto-reconnect a dropped connection (replays subscriptions).
+        reconnect: true,
       });
       await transport.connect();
       return { transport };
@@ -391,6 +393,8 @@ export async function connectNatsCredentialSource(
         jwtCredential: source.userJwt,
         nkeySigningCallback: makeSigner(source.userSeed),
         clientName: "openclaw-webchannel-agent",
+        // S1: auto-reconnect a dropped connection (replays subscriptions).
+        reconnect: true,
       });
       await transport.connect();
       return { transport };

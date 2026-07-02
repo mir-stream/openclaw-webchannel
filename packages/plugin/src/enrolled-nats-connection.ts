@@ -166,6 +166,9 @@ export async function createEnrolledNatsConnection(
     jwtCredential: enrollment.creds.userJwt,
     nkeySigningCallback: makeNkeySigningCallback(enrollment.creds.userSeed),
     clientName: options.natsClientName ?? "openclaw-webchannel-agent",
+    // S1: survive a NATS blip (server restart / TCP reset) — re-dial with
+    // backoff and replay subscriptions instead of wedging until gateway restart.
+    reconnect: true,
   });
 
   await transport.connect();
