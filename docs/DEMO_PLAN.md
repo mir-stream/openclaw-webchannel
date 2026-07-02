@@ -1,0 +1,279 @@
+# Showcase Demo Plan — one demo, three packages, six "power scenes"
+
+> Status: plan v2 (2026-07-03) — v1 reviewed by two sub-agents (fact-check +
+> capability sweep); corrections R1/R2/R5-R7 and three new scenes folded in.
+> Replaces the deleted demo launchers (`114b03c`) with a **from-scratch** demo
+> under `demo/`. Zero reuse of the retired demo assets (`ci-smoke.html`,
+> `browser-demo-entry.ts` `runDemo`, `ENABLE_DEMO_UI` surface) — the demo
+> composes **production primitives only** (`packages/{saas,plugin,client}`).
+> CI harnesses (`e2e/local/*`) are untouched.
+
+## Goal
+
+One page that weaves the three packages into a story a viewer cannot mistake for a
+toy: SaaS is the trust authority, the plugin is an ingress-free agent fleet, the
+client is a full-protocol widget — and the relay between them needs no trust
+beyond availability (passive-hostile; see Honest-demo notes on C2).
+
+**Base layer** (table stakes, all on the production `WebChannelNatsClientWrapper`
+state): login → typing indicator → streaming progress draft → real-LLM answer,
+HITL exec-approval cards, `/help` slash command, page-reload → history hydration,
+status/terminal-error surfacing.
+
+**Power scenes** (the non-obvious freedoms):
+
+| # | Scene | Freedom proven |
+|---|---|---|
+| ① | One identity, an agent fleet — admin grants/revokes agents per user live; widget grows/loses lanes | SaaS as sole access authority (`aud` as list) |
+| ② | Agents appear from anywhere — a NEW agent enrolls live from "another machine", approved (or denied) in the admin panel, instantly reachable | Ingress-free dial-out + SaaS-delivered rendezvous (`natsUrl` + register URL per account) |
+| ③ | The relay may be hostile — ciphertext-only wiretap; injected tamper silently dropped (AAD); **stolen-JWT replay defeated by PoP**; relay restart mid-chat self-heals **with the user's in-flight message queued and delivered**; cross-tenant subscribe → live `-ERR Permissions Violation`; encryption-off config refuses to boot | Confidentiality (vs passive relay) + integrity + authentication + availability |
+| ④ | Many users, one agent — user A's exec approval card appears only in A's widget; non-approver's decision is rejected fail-closed; different users' turns run in parallel, each user's turns in order | Per-peer routing + HITL approver authz on a shared agent |
+| ⑤ | Time-bounded trust — a short-TTL credential lapses: the widget flips to a terminal "credentials expired" state (no eternal spinner), one re-auth click restores the lane | Short-lived creds + honest terminal-error UX (CL2) |
+| ⑥ | E2E *and* multi-device — a second tab/device syncs live ciphertext and decrypts backlog via per-device key-wrap | E2E crypto compatible with multi-device + history (deferred product milestone) |
+
+## Relay: self-hosted default, Synadia optional
+
+- **Default `DEMO_RELAY=local`**: a demo-owned JWT-auth `nats-server` fed by the
+  demo trust chain. (Bootstrap step runs trust-chain setup with
+  `NATS_CONFIG_OUT=<dir>` — an env-driven output directory producing
+  operator.jwt + resolver preload — and the runner assembles the nats-server
+  config from those, as in `e2e/local/run-all-real.sh:89-127`.) Required for
+  scene ③ (we must own the relay to kill/tamper it) and consistent with the C2
+  accepted-risk posture (self-operated relay only until the authenticated
+  handshake lands).
+- **Optional `DEMO_RELAY=synadia`**: external managed-account mode via the proven
+  `mintNatsUserCreds({ issuerAccountId, accountSeed: <signing seed> })` path
+  (`packages/saas/src/nats-user-creds.ts:46-54,109-117`,
+  `external-nats-account.test.ts`). Needs `SYNADIA_ACCOUNT_ID` +
+  `SYNADIA_SIGNING_SEED` + `SYNADIA_NATS_URL`. Scene ③ chaos controls are
+  disabled in this mode; the wiretap pane still works (ciphertext-only is *more*
+  persuasive on a real third-party relay). Call out C2 explicitly in the demo
+  README when this mode is used.
+
+## Topology constraint (load-bearing)
+
+**One gateway per agent for the fleet scenes.** The register route dispatches by
+aud peek, FIRST match wins (`resolveAccountIdForJwt`,
+`packages/plugin/src/register-dispatch.ts:21-31`) and ignores any client-supplied
+accountId — so a single multi-aud JWT registers into only ONE account per
+gateway. The fleet therefore runs each agent on its own gateway process
+(19299/19399/…), and the SaaS `/me`/`/bootstrap` response delivers a **per-account
+rendezvous map** `accountId → { natsUrl, registerBaseUrl }`; each widget lane's
+`registration.registerBaseUrl` points at that account's gateway. (This also IS
+the scene-② story: agents are independent processes on independent machines.)
+True single-gateway multi-agent-from-one-login would need a register-route
+change — out of scope. A single gateway multiplexing several accounts
+(`planAccounts`, `packages/plugin/src/multiplex.ts:50-77`) remains real and may
+be shown as an aside with *different users* per account, but the fleet-from-one-
+login story spans gateways.
+
+Admission for every demo account stays `register-hop` (the default for
+`auth.strategy="jwt"`): only the register hop populates the aud map + verifier
+(`index-nats.ts:690-729`), and an `admission:"auto"` account would 401 the
+bootstrap JWT. run.sh must not set `admission:"auto"`.
+
+## Layout
+
+```
+demo/
+  README.md            demo script (the 6-scene walkthrough) + run instructions
+  run.sh               boots everything; Ctrl+C tears down; DEMO_RELAY switch
+  add-agent.sh         scene ②: boot another gateway ("another machine") that device-flow enrolls
+  chaos.sh             scene ③: kill-relay | restart-relay | tamper | replay-jwt | cross-tenant
+  saas-server.ts       fresh demo SaaS: trust chain + enrollment + users/grants + bootstrap + static web
+  web/
+    index.html         one page: admin panel | chat widget | attacker/wiretap pane
+    src/app.ts         UI shell: login, agent switcher, panel wiring
+    src/widget.ts      chat widget rendering WebChannelNatsClientWrapper state
+    src/admin.ts       enrollment approve/deny + user↔agent grant/revoke chips
+    src/wiretap.ts     raw NATS subscription pane (ciphertext hex) + attacker buttons
+```
+
+Build: esbuild IIFE bundle (same toolchain the repo already uses), no framework,
+served by `saas-server.ts`. `demo/` joins the root `npm run typecheck`.
+
+Ports (fresh block, no harness collisions): gateway₁ 19299, gateway₂ 19399,
+gateway₃ 19499, NATS ws 18722 / tcp 14722, demo SaaS 3961, echo fallback 18905.
+
+## Phase 1 — skeleton (base layer + wiretap)
+
+Everything here is demo-side; **zero product-code changes.**
+
+1. `demo/saas-server.ts` — compose `packages/saas` primitives directly:
+   - `loadOrCreateTrustChain()` (`persistent-trust-chain.ts:49`) under the demo
+     home → operator/account JWTs, JWKS at `/.well-known/jwks.json`. A bootstrap
+     step runs it with `NATS_CONFIG_OUT=<dir>` so the runner can assemble the
+     nats-server config (operator.jwt + resolver preload), per
+     `e2e/local/run-all-real.sh:89-127`.
+   - `DeviceFlowEnrollment` + `POST /admin/enrollments/:code/{approve,deny}`;
+     approved enrollments mint tenant-scoped NATS user creds. Deny + the 10-min
+     code expiry (`device-flow-enrollment.ts:402-405,509-515`) are surfaced too
+     (scene ②'s "authority can say no").
+   - User directory (id/pw, session cookie, server-derived stable `peerId` =
+     user uuid) + `GET /bootstrap` minting the RS256 bootstrap JWT
+     (`cnf.jwk` X25519 + `pop_jwk` Ed25519). Phase 1 mints a single-account `aud`;
+     phase 2 makes it a list. The response also carries the per-account
+     rendezvous map `accountId → { natsUrl, registerBaseUrl }` (see Topology
+     constraint) so the browser never learns the relay/gateway from local config.
+   - `/admin/users` grant/revoke API (in-memory, seeded).
+   - Serves `demo/web` + the demo config.
+2. `demo/run.sh` — isolated `OPENCLAW_HOME`; boot order: saas-server → nats-server
+   (from the assembled config) → LLM (real model when a provider env key is
+   present — `ZAI_API_KEY` env beats agent-stamped sqlite provider auth — else the
+   e2e echo fallback) → `openclaw channels add` for `agent-dev` (device-flow
+   enroll, auto-approved on first boot only) → `gateway run` (consume-only).
+   Gateway config: `auth.strategy="jwt"` (⇒ `register-hop` admission — do NOT set
+   `admission:"auto"`), `execApprovals.enabled` + `execApprovals.approvers` = the
+   demo peer ids, history on.
+3. `demo/web/` — widget on `WebChannelNatsClientWrapper` (full protocol already
+   reduced to state, `nats-client-wrapper.ts:207-311`): message list with
+   working-draft bubbles, isTyping row, approval cards
+   (allow-once/always/deny), history hydration on reload, status pill incl.
+   terminal `error` + reason. Wiretap pane: a second NATS connection on
+   demo-minted observer creds (pub+sub on `webchannel.{tenant}.>`,
+   `nats-user-creds.ts:100-101`) subscribes the conversation subject and renders
+   raw frames as hex — visibly ciphertext while the chat pane shows plaintext.
+   A fail-closed aside: flipping `encryption.mode="disabled"`
+   (`encryption-policy.ts:43-68`) makes the gateway refuse to boot.
+
+**Exit criteria:** `./demo/run.sh` → login → full-UX chat with a real model;
+reload restores history; wiretap shows ciphertext only.
+
+## Phase 2 — fleet + shared agent (scenes ①, ②, ④)
+
+The only product-code change before phase 6:
+
+1. `packages/saas/src/bootstrap-claims.ts` — `aud: string` (`:62`, set at `:96`)
+   → mint `aud` as an array; keep a single-string overload for back-compat. The
+   plugin verifier is already array-aware (`jwt.ts:259-274`) and the multi-aud
+   router exists (`peekUnverifiedJwtAudiences` `jwt.ts:368` →
+   `resolveAccountIdForJwt` `register-dispatch.ts:21`). Decide whether the
+   dangling top-level `accountId` claim (`bootstrap-claims.ts:65,99`, read only by
+   `device-flow-enrollment.ts:354`, NOT by routing) stays as "primary" or drops.
+   Unit tests beside `bootstrap-claims.test.ts`.
+2. Demo server: grants become a list; `/bootstrap` mints the full granted `aud`
+   list + the per-account rendezvous map; `/me` exposes it for the switcher;
+   grant/revoke mutate it.
+3. Widget: agent switcher — one lazily-connected wrapper client per granted
+   account, each pointed at its account's gateway via the rendezvous map. Revoke →
+   that lane goes terminal on its next register/bootstrap (proven revoke→403);
+   grant → a new lane appears on the next `/me` poll.
+4. **Pre-boot BOTH agent gateways at phase start** (R7 sequencing): `agent-dev`
+   (19299) and `agent-ops` (19399), disjoint aud maps. Scene ① grants/revokes
+   across this 2-lane fleet.
+5. `demo/add-agent.sh` (scene ②): boots a THIRD gateway under its own
+   `OPENCLAW_HOME` (the "laptop/container" narrative) running `channels add` for
+   `agent-docs` (19499) — its device-flow request pops in the admin panel;
+   approving it makes the agent selectable in the already-open widget; denying it
+   shows the authority refusing. No ports, no browser config touched.
+6. **Scene ④ (many users → one agent), works-today wiring:** open two browsers on
+   the SAME agent. User A triggers an exec approval — the card is delivered only
+   to A's originating peer (`approvals.ts:464-479`, `prepareTarget:361-370`), not
+   B. A non-approver's decision is rejected fail-closed before any gateway RPC
+   (`handleApprovalDecision:602-622`). Different users' turns run in parallel,
+   each user's in order (`inbound-queue.ts:60-119`).
+
+**Exit criteria:** one login reaches two agents; live grant/revoke adds/kills
+lanes; a new agent enrolled mid-demo becomes reachable without touching the
+browser; a shared agent isolates per-user approvals.
+
+## Phase 3 — chaos + authentication (scene ③)
+
+Demo-side scripting only; all primitives ship today.
+
+- `chaos.sh restart-relay` — kill + restart `nats-server` mid-conversation. The
+  widget shows `reconnecting → connected` (CL3 keepalive `nats-client.ts:539-560`
+  + client backoff), the gateway self-heals (S1), and — the strong beat — a
+  message TYPED while the relay is down is queued and delivered in order on
+  reconnect, only ever as ciphertext, never lost (`nats-client.ts:845-869`
+  buffered-seal + `connectionEpoch` guard).
+- `chaos.sh tamper` — publish a bit-flipped copy of a captured ciphertext frame to
+  the peer's `.out` using observer creds; wiretap highlights the injected frame;
+  chat pane stays clean (AEAD-open returns null → dropped, `nats-client.ts:837-842`).
+- `chaos.sh replay-jwt` — **authentication leg**: replay a captured
+  `/webchannel/nats/register` POST (or the same signed nonce twice). Server
+  returns 401 — the nonce is single-use and burned even on a bad signature
+  (`pop-challenge.ts:106-154`) — while the real browser registered fine. A stolen
+  bootstrap JWT off the wiretap can't register a peer without the device key.
+- `chaos.sh cross-tenant` — mint tenant-b creds, attempt to subscribe
+  `webchannel.tenant-a.>`, surface the live `-ERR Permissions Violation`
+  (`nats-permissions-realserver.test.ts` enforces this).
+
+**Exit criteria:** all four run against a live conversation without breaking it.
+
+## Phase 4 — time-bounded trust (scene ⑤)
+
+Demo-side wiring; client logic done.
+
+- Mint a short-TTL credential; on lapse the client classifies NATS
+  `Authentication Expired` / `Authorization Violation` as TERMINAL
+  (`nats-client.ts:425-441` → `failTerminally:512-532`), stops reconnecting, and
+  the wrapper promotes it to a sticky `status:"error"` with reason
+  (`nats-client-wrapper.ts:103-106`). The widget shows a distinct "credentials
+  expired — re-authenticate" state (NOT the reconnect spinner). One re-bootstrap
+  click restores the lane.
+
+**Exit criteria:** an expiring credential yields an honest terminal state, not an
+eternal spinner; re-auth recovers.
+
+## Phase 5 — optional operator asides (pick per audience)
+
+Low-cost extras that deepen the "SaaS is the authority" story; none block the
+narrative:
+
+- **JWKS rotation, zero downtime** (`jwks.ts:14-22`): rotate the demo signing key;
+  a JWT under the new `kid` works after one live refetch, one under the evicted
+  key is rejected (never falls back to a stale cache). Cost: a rotate-key control
+  on the demo SaaS (medium).
+- **One gateway, many accounts** (`multiplex.ts:50-77`, `index-nats.ts:604`):
+  show a single gateway serving several accounts with *different users* per
+  account — process-level tenancy, distinct from scene ②'s per-machine story.
+- **BYO-NATS static creds** (`openclaw.plugin.json:216-249`): point an agent at
+  Synadia/NGS with operator-supplied creds and NO SaaS issuer — the other end of
+  the `DEMO_RELAY=synadia` spectrum.
+- **Agent-initiated outbound** (`index-nats.ts:732-744`, primary account): an
+  agent-side event pushes an unsolicited message into the open widget over the
+  E2E relay. Needs a verified core outbound trigger (e.g. `messages send`) — flag
+  as needs-verification before committing to it on stage.
+
+## Phase 6 — multi-device / late-join E2E (scene ⑥; real product work)
+
+Separate milestone with its own design pass. The crypto components are done and
+tested (`late-join-decryptor.ts` key-wrap; `multidevice-broadcast.test.ts:40-52`)
+but **not wired into `index-nats`/`nats-channel` or the client wrapper**.
+
+**Correction (both halves are ONE milestone):** live-sync is NOT cheaper than
+backlog. A second tab derives its own X25519 session key, so it cannot decrypt a
+live broadcast without the wrapped conversation key either — the shared key must
+be distributed to it exactly as for backlog (`multidevice-broadcast.test.ts:40-52`).
+Scope live-sync + backlog together.
+
+Needs: a key-wrap delivery wire frame, agent-side wrapped-key issuance on
+second-device register, wrapper-side conversation-key unwrap + backlog decryption.
+When C2 pinning also lands, note that a single `/bootstrap` currently carries ONE
+agentPublicKey (`saas-bootstrap.ts:121,222`) — a fleet will then need an
+`accountId → agentPublicKey` map. Land as product commits first; the demo then
+adds the two-device scene consuming it. Not blocking phases 1–5.
+
+## Honest-demo notes
+
+- **Active-MITM is NOT claimed (C2).** The E2E session key is derived from
+  whatever pubkey arrives on `.handshake`; the client does not yet pin it against
+  the SaaS-attested `agentPublicKey` that `saas-bootstrap.ts:222` already extracts
+  (`nats-client.ts:828-834`). So scene ③ proves confidentiality vs a **passive**
+  wiretap + integrity vs **blind** tamper (AAD drop) + authentication (PoP) +
+  availability — but an **active** relay substituting its own handshake key could
+  decrypt. That is the deferred C2 hardening; the demo must not claim active-MITM
+  resistance. `DEMO_RELAY=synadia` inherits this caveat (call it out in README).
+- **Revoke is enforced at the rendezvous** (bootstrap/register), not by killing an
+  established E2E session mid-flight — browser NATS creds are tenant-wide today.
+  Per-account NATS creds + live session kill is a known follow-up; the demo
+  narrates what is actually enforced.
+- **The echo LLM fallback** exists so the demo boots creds-free, but the scripted
+  walkthrough assumes a real model (approvals + slash commands need one).
+- **Scene ③'s tamper proves *drop*, not *detection UX*** — a dropped-frames
+  counter in the client is optional polish, not claimed.
+- **`capabilities.typing:"off"` is silently ignored on the NATS path**
+  (`nats-channel.ts:293` sends unconditionally) — irrelevant to the demo (wants
+  typing ON), noted only so the off-knob isn't advertised as working. Pre-existing
+  latent bug, outside this effort.
