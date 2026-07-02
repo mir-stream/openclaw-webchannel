@@ -50,7 +50,12 @@ export class WebChannelNATSClient {
 
   private readonly listeners = new Set<Listener>();
 
-  constructor(options: WebChannelOptions & NatsClientOptions) {
+  // `url` and `jwt` are supplied through the WebChannelOptions aliases
+  // `natsUrl` / `bootstrapJwt`, so they are Omitted from the NatsClientOptions
+  // half — otherwise the intersection would require the caller to ALSO pass a
+  // raw `url` the wrapper ignores. Everything else (accountId, tenant, peerId,
+  // registration, natsCredentials, reconnect tuning) is forwarded as-is.
+  constructor(options: WebChannelOptions & Omit<NatsClientOptions, "url" | "jwt">) {
     this.natsOptions = {
       url: options.natsUrl ?? "wss://nats.example.com",
       jwt: options.bootstrapJwt ?? "",
@@ -58,6 +63,15 @@ export class WebChannelNATSClient {
       tenant: options.tenant ?? "default-tenant",
       peerId: options.peerId ?? "anonymous-peer",
       registration: options.registration,
+      // CL1: forward the NATS-layer NKEY credentials + reconnect tuning. A
+      // production JWT-auth nats-server REQUIRES `natsCredentials` — without it
+      // CONNECT ships only the bootstrap JWT with no signed nonce, the server
+      // returns `-ERR Authorization Violation`, and the client enters an
+      // unwinnable reconnect loop. Dropping these silently made the public
+      // wrapper unusable against any real (non-open) NATS deployment.
+      natsCredentials: options.natsCredentials,
+      reconnectBaseMs: options.reconnectBaseMs,
+      reconnectCapMs: options.reconnectCapMs,
     };
 
     this.client = new WebChannelNatsClient(this.natsOptions);
