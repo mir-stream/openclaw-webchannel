@@ -22,11 +22,37 @@ sketch → acceptance*.
 2. **Server defaults are ON.** `packages/plugin/openclaw.plugin.json` ships `history.enabled:true`,
    `capabilities.typing:"on"`, `execApprovals`/`inlineButtons`, and a `streaming.mode:"progress"`
    option. `index-nats.ts` wires `sendHistory`/`setLoadHistoryHandler`/`setApprovalDecisionHandler`/
-   typing. The demo just doesn't render any of it.
+   typing. The demo just doesn't render any of it. *(Two server-side caveats found in the
+   2026-07-02 review — see "Review corrections" below.)*
 
 3. **Slash commands already execute.** Traced through openclaw core
    (`commands-text-routing.ts:40-48`): text commands are on by default and WebChannel is not a
    native-command surface, so `/help` typed in the browser already runs. **P0-3 is discovery-only.**
+
+## Review corrections (2026-07-02)
+
+A code-verification review re-checked ~30 `file:line` claims across both repos (all held) and
+found four corrections, now folded into the P0/P1 files:
+
+1. **P0-2 is 🟢, not 🟡** — the server pager `pageBefore` (`history.ts:206-229`) only ever
+   fetches the newest `limit*2` messages (no real cursor in the SDK seam), so pagination
+   silently stops after ~2 pages; its cursor-miss fallback also returns the *newest* slice
+   while the comment claims *oldest*. P0-2 now includes a server fix (step 0).
+2. **`capabilities.typing:"off"` is silently ignored on the NATS path** — the gate exists only
+   on the legacy WS transport (`transport.ts:187-197`); `NatsChannel.sendTyping` is ungated and
+   `index-nats.ts:641` (cited as the gate) is actually a typing-shaped cast passed to
+   `resolveHistoryConfig`. P0-6 now includes wiring the gate.
+3. **P0-3 choice (B) was mischaracterized** — declaring `nativeCommands` alone does NOT disable
+   text-command handling (`cfg.commands?.text !== false` wins first); it also lives in the
+   channel registration object (`channel.ts:103`), not `openclaw.plugin.json`.
+4. **P1-1's "reuse core IR" path is now conditional** — importing
+   `openclaw/plugin-sdk/text-chunking` into the deliberately openclaw-free browser client is an
+   unverified bundle-feasibility bet; verify with an esbuild spike or use a standalone
+   sanitizing lib.
+
+Two open questions were also resolved: `run-demo.sh` runs **register-hop** (`DEMO_GW_URL` set at
+`:88`), so the P0-1 history-snapshot trigger fires; and it sets **no `streaming` config**, so
+P0-5 really does need the flag flip.
 
 ## Reuse principle
 

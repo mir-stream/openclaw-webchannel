@@ -34,9 +34,9 @@ The **server/agent side (NATS path) is already mature.** `NatsChannel`
 |---|---|---|
 | history snapshot on connect | `sendHistory()` — `:237` | `:434` (on `/webchannel/nats/register`) |
 | history pagination | `setLoadHistoryHandler()` — `:307` | `:643` → `historyPageBefore` |
-| typing | `sendTyping()` — `:229` | capability gate `:641`; sent in `inbound.ts:145` |
+| typing | `sendTyping()` — `:229` | sent in `inbound.ts:145` (⚠️ `capabilities.typing` gate NOT wired on the NATS path — see P0-6) |
 | streaming draft | `sendProgress()` `:214` / `finalizeDraft()` `:222` | `inbound.ts:109-269` (gated on `streaming.mode:"progress"`) |
-| approval request | `sendApprovalRequest()` — `:245` | emitted by `approvals.ts:371` |
+| approval request | `sendApprovalRequest()` — `:245` | emitted by `approvals.ts:373-380` (`deliverPending`) |
 | approval decision | `setApprovalDecisionHandler()` — `:298` | `:633` → `handleApprovalDecision` |
 
 **The full inbound/outbound wire contract already exists** in both the production client
@@ -107,7 +107,7 @@ server-side; only P0-5 needs a one-line flag flip.** From the manifest:
 | Capability | Manifest default | Gap is purely… |
 |---|---|---|
 | `history.enabled` | **`true`** (limit 50, pageSize 50) | client render (P0-1/2) |
-| `capabilities.typing` | **`"on"`** | client render (P0-6) |
+| `capabilities.typing` | **`"on"`** | client render (P0-6) — but the `"off"` toggle is NOT wired on the NATS path (see P0-6 ⚠️) |
 | `execApprovals` + `capabilities.inlineButtons` | first-class config, buttons documented | client render (P0-4) |
 | `streaming.mode` | option exists (`off\|partial\|block\|progress`) — **not defaulted to `progress`** | set `"progress"` + render (P0-5) |
 
@@ -166,8 +166,9 @@ handler (`index-nats.ts:422-434`), **after** `registerPeer` but the browser must
 subscribed to `.out` — it is (`nats-client.ts:602`, subscribe happens in `onConnected` before
 the register hop). Good. But if you switch to `admission:"auto"` (no register hop), **nothing
 triggers the snapshot** — you'd need to send history on first handshake completion instead. The
-demo uses the register hop only when `gwUrl` is set (`browser-demo-entry.ts:168`). Confirm which
-mode `run-demo.sh` uses.
+demo uses the register hop only when `gwUrl` is set (`browser-demo-entry.ts:168`).
+**Resolved (2026-07-02 review):** `run-demo.sh:88` sets `DEMO_GW_URL="http://127.0.0.1:$GW_PORT"`
+→ the demo runs register-hop, so the snapshot trigger fires as designed.
 
 ---
 
@@ -175,7 +176,9 @@ mode `run-demo.sh` uses.
 
 **Symptom.** Even if the snapshot works, there's no way to see older-than-snapshot turns.
 
-**Classification.** 🟡 Wiring gap. Client method + server handler both exist; no UI trigger.
+**Classification.** 🟢 Partial. Client method + server handler + wire frame all exist and no UI
+trigger exists — but the server pager has a **hard depth cap** (below), so this is NOT pure
+client wiring: real pagination needs a server fix too.
 
 **Where it stands today.**
 - Outbound frame exists: `{ type: "load_history", before?, limit? }` (`nats-client.ts:116`).
@@ -184,6 +187,16 @@ mode `run-demo.sh` uses.
 - Server handler exists: `setLoadHistoryHandler` (`index-nats.ts:643-661`) →
   `historyPageBefore(api, sessionKey, request, pageSize, logger)` → `sendHistory` (reuses the
   same `history` frame, so P0-1's renderer handles the response).
+- ⚠️ **Server pager depth cap (found in 2026-07-02 review).** `pageBefore`
+  (`history.ts:206-229`): the SDK seam (`runtime.subagent.getSessionMessages`) has no `before`
+  cursor, so it always fetches only the **newest `limit*2`** messages and slices within that
+  window. Consequences:
+  - (a) pagination can never reach further back than ~2 pages from the newest message — page 3+
+    silently returns nothing new;
+  - (b) when the cursor falls outside the window, the fallback `window.slice(-limit)`
+    (`history.ts:222-228`) returns the **newest** `limit` messages, while the comment at
+    `history.ts:224-227` claims "oldest" — a comment/code contradiction. The client's dedup
+    swallows the duplicates, so the visible symptom is "load more silently stops", not wrong data.
 - **No UI trigger and `runDemo` doesn't expose `loadHistory`.** The `DemoController`
   (`browser-demo-entry.ts:52-57`) only has `send` / `disconnect`.
 
@@ -197,6 +210,12 @@ novel — model it on standard chat "scroll to top → fetch older page, prepend
 anchor."
 
 **Implementation sketch.**
+0. **Server: fix `pageBefore` depth cap** (`history.ts:206-229`). Either grow the fetch window
+   until the cursor is found (iterative deepening: `limit*2`, `limit*4`, … up to a sane max) or
+   page over the full transcript if the SDK seam grows a real cursor. Also fix the cursor-miss
+   fallback to match its comment (return the *oldest* window slice, or better: an empty page so
+   the client can render "beginning of conversation"). Without this, steps 1–3 only ever load
+   ONE extra page.
 1. `DemoController`: add `loadHistory: (before?: string) => void` →
    `client.loadHistory(before)`.
 2. `demo-app.html`: on `#log` scroll near top, call `loadHistory(oldestMessageId)`; the
@@ -205,8 +224,10 @@ anchor."
 3. Track `oldestMessageId` = first message id currently rendered; pass as `before`. `pageSize`
    defaults from `resolveHistoryConfig` server-side.
 
-**Acceptance.** With >1 page of history, scrolling to the top fetches and prepends the previous
-page without the viewport jumping; fetching past the beginning is a no-op (empty page).
+**Acceptance.** With >2 pages of history, repeatedly scrolling to the top keeps fetching and
+prepending older pages (beyond the old `limit*2` window) without the viewport jumping; fetching
+past the beginning is a no-op (empty page). If step 0 is deferred, scope acceptance down to one
+extra page and note the cap in the demo.
 
 ---
 
@@ -226,10 +247,15 @@ page without the viewport jumping; fetching past the beginning is a no-op (empty
    if (params.cfg.commands?.text !== false) return true;   // ← text commands ON by default
    return !isNativeCommandSurface(params.surface);
    ```
-3. `isNativeCommandSurface` returns true only for plugins whose manifest declares
-   `capabilities.nativeCommands === true` (`commands-text-routing.ts:28-32`). **Our manifest
-   (`packages/plugin/openclaw.plugin.json`) declares NO such capability** → webchannel is NOT a
-   native surface → text slash commands stay active.
+3. `isNativeCommandSurface` returns true only for channel plugins whose **registration object**
+   declares `capabilities.nativeCommands === true` (`commands-text-routing.ts:28-32` reads
+   `listChannelPlugins()` → `plugin.capabilities`, i.e. the capabilities passed to
+   `createChatChannelPlugin`, NOT the JSON manifest). **Our registration
+   (`packages/plugin/src/channel.ts:103`) declares `{ chatTypes: ["direct"], media: false }` —
+   no `nativeCommands`** → webchannel is NOT a native surface → text slash commands stay active.
+   (Note also `commands-text-routing.ts:44`: `cfg.commands?.text !== false` returns true
+   *before* the surface check ever runs — so with default config, text commands are on for
+   EVERY surface, native or not.)
 
 **Conclusion:** typing `/help` in the browser is **already routed to core's text-command
 handler and executes**, returning output as an `agent_message` (which the demo already renders).
@@ -270,11 +296,15 @@ via `bot-native-command-deps.runtime.js` (`bot-native-commands.ts:14`). Catalog 
 - **(A) Stay a text-command surface (recommended for P0).** Keep the manifest as-is (no
   `nativeCommands` capability). Commands execute as text (already working). Add discovery only.
   Lowest risk; no core dispatch to own.
-- **(B) Become a native-command surface.** Set `capabilities.nativeCommands: true` in
-  `openclaw.plugin.json`. This **turns OFF** core text-command handling for webchannel
-  (`shouldHandleTextCommands` → `!isNativeCommandSurface` → false) and makes US responsible for
-  dispatching commands + rendering arg-menus (the full `bot-native-commands.ts` model). More
-  power (inline arg menus for `/model`, `/thinking`), much more work. **Defer to P1/P2.**
+- **(B) Become a native-command surface.** Declare `capabilities.nativeCommands: true` in the
+  channel **registration object** (`packages/plugin/src/channel.ts:103` — NOT
+  `openclaw.plugin.json`; `isNativeCommandSurface` reads the registry entry). ⚠️ **Corrected
+  (2026-07-02 review):** this alone does NOT turn off core text-command handling — in
+  `shouldHandleTextCommands` (`commands-text-routing.ts:40-48`) the `cfg.commands?.text !== false`
+  check fires *first*, so text commands stay ON for native surfaces unless the operator ALSO sets
+  `commands.text: false`. Full (B) = declare `nativeCommands` + set `commands.text: false` + own
+  command dispatch and arg-menu rendering (the full `bot-native-commands.ts` model). More power
+  (inline arg menus for `/model`, `/thinking`), much more work. **Defer to P1/P2.**
 
 **Implementation sketch (choice A).**
 1. **Confirm execution** (manual test above — 30s).
@@ -305,8 +335,9 @@ the turn appears to hang.
 `approval_decision`; the demo renders neither.
 
 **Where it stands today.**
-- Server emits the card: `approvals.ts:371` builds the `PendingApprovalView` →
-  `nats-channel.sendApprovalRequest()` (`nats-channel.ts:245-270`). Frame shape at
+- Server emits the card: `approvals.ts:373-380` (`deliverPending`) sends the built
+  `PendingApprovalView` payload via `nats-channel.sendApprovalRequest()`
+  (`nats-channel.ts:245-270`). Frame shape at
   `nats-client.ts:100-107`: `{ type:"approval_request", id, kind:"exec"|"plugin", title,
   description?, prompt, options:[{decision,label,style}], expiresAtMs? }`.
 - Server handles the decision: `index-nats.ts:633-637` `setApprovalDecisionHandler` →
@@ -384,8 +415,9 @@ and the demo config likely doesn't enable it.
   finalize reuses `agent_message` with the same `id` (`nats-channel.ts:222` `finalizeDraft`).
 - Crash-safety: `inbound.ts:260-269` finalizes an in-flight draft with an apologetic text if the
   turn throws after a progress frame (so the widget never spins forever).
-- **Demo drops `progress`** (`browser-demo-entry.ts:181`) and almost certainly doesn't set
-  `streaming.mode:"progress"` in `run-demo.sh` config (grep found no `streaming` there).
+- **Demo drops `progress`** (`browser-demo-entry.ts:181`) and `run-demo.sh` sets no `streaming`
+  config (**verified 2026-07-02** — no `streaming` key anywhere in the script), so progress mode
+  is not enabled in the demo.
 
 **Reference implementation (our rich path — copy this).** `client.ts:448-462` `case "progress"`:
 upsert a **single working bubble keyed by draft `id`** (`working:true`), and the matching
@@ -424,9 +456,16 @@ spinner if the turn errors.
 
 **Where it stands today.**
 - Server sends it at turn start: `inbound.ts:145` `transport.sendTyping(wsKey)` (best-effort,
-  drop-only, gated on `capabilities.typing`, default "on" — `inbound.ts:141`,
-  `index-nats.ts:641`). Emit method `nats-channel.ts:229` `sendTyping`.
+  drop-only). Emit method `nats-channel.ts:229` `sendTyping`.
 - Frame exists: `{ type: "typing" }` (`nats-client.ts`, `nats-channel.ts:230`).
+- ⚠️ **The `capabilities.typing` gate is NOT enforced on the NATS path (found in 2026-07-02
+  review).** The gate exists only on the legacy WS transport (`transport.ts:187-197`
+  `typingEnabled` + `setTypingEnabled`). `NatsChannel.sendTyping` (`nats-channel.ts:229`) is
+  **ungated** and `index-nats.ts` never wires any typing gate — the only "typing" mention there
+  is `index-nats.ts:641`, a typing-shaped cast passed to `resolveHistoryConfig` (a mis-wiring
+  smell, not a gate; the comment in `inbound.ts:141-142` claiming "the transport gates the
+  frame" is only true for the legacy transport). Net effect: default-on behavior works, but an
+  operator setting `capabilities.typing:"off"` is **silently ignored** on the NATS path.
 - **Demo drops it** (`browser-demo-entry.ts:181`).
 
 **Reference implementation (our rich path — copy this).** `client.ts:401-412` `case "typing"`:
@@ -444,9 +483,15 @@ Telegram-API-specific; we only need the on/off signal.
 2. `demo-app.html`: on `typing`, show an animated "agent is typing…" affordance (reuse the
    existing status dot `#dot` / a three-dot bubble); **clear it on the next `progress` /
    `agent_message` / `approval_request`**. Don't leave it up indefinitely.
+3. **Server: wire the missing gate on the NATS path.** Add a `typingEnabled` gate to
+   `NatsChannel` (mirror `transport.ts:187-197`), set it from the account's
+   `capabilities.typing` during account setup in `index-nats.ts`, and clean up the stray
+   typing-shaped cast at `index-nats.ts:641` (it belongs to this gate, not to
+   `resolveHistoryConfig`).
 
 **Acceptance.** Sending a message immediately shows "typing…"; it disappears the instant the
-first real frame (progress/answer/approval) arrives.
+first real frame (progress/answer/approval) arrives. With `capabilities.typing:"off"` on the
+account, no `typing` frame is ever emitted on the NATS path.
 
 ---
 
@@ -518,6 +563,9 @@ work. If demo-polish is the priority, P0-1/4/5/6 (pure wiring) land first; P0-7 
 | 5 | P0-2 history pagination | S | Builds on P0-1's renderer. |
 | 6 | P0-3 slash commands | S–M | **Execution already works (verified); discovery-only.** Catalog route + typeahead. |
 | 7 | P0-7 send reliability | L | Client + server; do last as the reliability milestone. |
+
+> **Before starting row 1:** do P0-3's 30-second execution check first (`run-demo.sh`, type
+> `/help`) — it's free, and if execution unexpectedly does NOT work it reorders everything.
 
 ## Cross-cutting: extend the demo callback contract once
 

@@ -60,7 +60,14 @@ already in the `agent_message` text).
 1. Pick a markdown renderer. Two paths:
    - **Reuse core IR:** import `openclaw/plugin-sdk/text-chunking` `markdownToIR()`, walk the IR,
      emit DOM. Guarantees parity with how the agent "thinks" about its own output and with other
-     channels. Preferred.
+     channels. **Preferred ONLY IF bundle feasibility is verified first** — ⚠️ the client
+     package is deliberately openclaw-free and browser-safe (`openclaw` is the *plugin's* peer
+     dep, Node-side; see `openclaw-plugin-dependency` refactor). This path adds `openclaw` as a
+     client-package dependency and requires the transitive graph of `text-chunking.ts`'s
+     re-exports (`packages/markdown-core`, `shared/text/*`, `infra/system-message.ts`, …) to be
+     node-free and tree-shakeable — **unverified**. Do a 30-minute esbuild spike (import
+     `markdownToIR` in the browser bundle, check it builds and the size delta) before committing;
+     if it fails or bloats, fall back to the standalone lib (the likelier outcome).
    - **Standalone lib:** a small sanitizing markdown→HTML lib (must sanitize — see below).
 2. In `demo-app.html`, replace `d.textContent = text` with a `renderMarkdown(text)` that produces
    sanitized HTML. Keep `.msg.user` bubbles plain (user input isn't markdown).
