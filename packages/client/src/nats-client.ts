@@ -275,6 +275,12 @@ export class NatsClient {
     ws.binaryType = "arraybuffer";
     this.ws = ws;
     this.connectSent = false;
+    // A fresh socket starts a fresh NATS protocol stream. Any bytes left in the
+    // buffer from a socket torn down mid-frame (the half-open case CL3's
+    // heartbeat forces a reconnect on) would otherwise corrupt the new stream's
+    // INFO/PONG parse — on the NKEY path a mangled INFO means the signed CONNECT
+    // is never sent → server auth timeout. Start clean.
+    this.buffer = "";
 
     ws.onopen = () => {
       console.log("[nats-client] WebSocket connected");
@@ -407,18 +413,25 @@ export class NatsClient {
       }
 
       if (line.startsWith("MSG ")) {
-        this.handleMessage(line);
+        // handleMessage returns false when the payload hasn't fully arrived yet
+        // (it re-buffers the header). We MUST break, not continue: continuing
+        // would re-extract the same header from the same buffer forever — a
+        // synchronous infinite loop that freezes the tab. Break and wait for the
+        // next ws.onmessage to append the rest.
+        if (!this.handleMessage(line)) break;
         continue;
       }
 
       if (line.startsWith("-ERR ")) {
         console.error("[nats-client] NATS error:", line);
         // CL2: distinguish an authoritative AUTH rejection (terminal — the same
-        // credentials will never be accepted) from a per-subject permissions
-        // error (non-fatal; the connection stays up). Only auth rejections stop
-        // reconnecting and surface to the embedder. A "Permissions Violation"
-        // contains neither token, so it correctly falls through as non-terminal.
-        if (/authorization violation|authentication/i.test(line)) {
+        // credentials will never be accepted) from failures that a reconnect CAN
+        // fix. Terminal = "Authorization Violation" (bad creds/perms) or
+        // "Authentication Expired" (User/Account expired). NON-terminal and
+        // deliberately excluded: "Authentication Timeout"/"Cancelled" (a slow or
+        // sleeping client that just missed the auth window — retrying works) and
+        // "Permissions Violation" (per-subject, connection stays up).
+        if (/authorization violation|authentication expired/i.test(line)) {
           this.failTerminally(
             `NATS authorization rejected: ${line.slice(5).trim()} ` +
               `(credentials invalid/expired — reconnecting cannot help)`,
@@ -429,17 +442,23 @@ export class NatsClient {
     }
   }
 
-  private handleMessage(line: string): void {
+  /**
+   * Parse a `MSG` line + its payload. Returns `true` when a full message was
+   * consumed (caller continues draining) and `false` when the payload has not
+   * fully arrived yet (the header is re-buffered; caller must STOP draining and
+   * wait for more socket data — see the break in drainBuffer).
+   */
+  private handleMessage(line: string): boolean {
     const parts = line.split(" ");
     const hasReplyTo = parts.length === 5;
     const subject = parts[1] ?? "";
     const byteCount = parseInt(parts[hasReplyTo ? 4 : 3] ?? "0", 10);
 
-    if (isNaN(byteCount) || byteCount < 0) return;
+    if (isNaN(byteCount) || byteCount < 0) return true; // malformed header: drop, keep draining
 
     if (this.buffer.length < byteCount + 2) {
       this.buffer = `${line}\r\n${this.buffer}`;
-      return;
+      return false; // need more bytes
     }
 
     const payload = this.buffer.slice(0, byteCount);
@@ -448,6 +467,7 @@ export class NatsClient {
     // Deliver the raw payload; decryption/parsing happens in WebChannelNatsClient
     // (the envelope must be decrypted before it is meaningful).
     this.notifyRawListeners(subject, payload);
+    return true;
   }
 
   private resubscribeAll(): void {
@@ -503,8 +523,12 @@ export class NatsClient {
       try { this.ws.close(); } catch { /* already closing */ }
       this.ws = null;
     }
-    this.notifyStateListeners();
+    // Notify the ERROR first so a downstream wrapper is already in its terminal
+    // "error" status before the state event lands — otherwise the state event
+    // (connected=false) would momentarily flash "reconnecting" (the wrapper's
+    // sticky-error guard keys off the already-set "error" status).
     this.notifyErrorListeners(new Error(message));
+    this.notifyStateListeners();
   }
 
   /**

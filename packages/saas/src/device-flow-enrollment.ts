@@ -435,15 +435,18 @@ export class DeviceFlowEnrollment {
    * Called by the SaaS approval UI when the operator clicks "Approve".
    * Generates NATS user credentials and updates enrollment status.
    *
-   * A2: idempotent + race-safe. `/approve` is an unauthenticated, repeatable
-   * action (double-click, retry, replay). Re-minting creds/peerId on a repeat
-   * would hand the already-connected plugin a DIFFERENT identity on its next
-   * poll and break the live session, so:
+   * A2: idempotent + race-safe WITHIN the enrollment's validity window.
+   * `/approve` is an unauthenticated, repeatable action (double-click, retry,
+   * replay). Re-minting creds/peerId on a repeat would hand the already-connected
+   * plugin a DIFFERENT identity on its next poll and break the live session, so:
    *  - a repeat AFTER the first approval returns the SAME credentials (status
    *    guard on the persisted enrollment), and
    *  - two CONCURRENT approvals of the same enrollment are coalesced onto one
    *    in-flight promise so they can't each mint a distinct identity in the
    *    read-mint-write window (last-writer-wins).
+   * Past `expiresAt` this returns null (the expiry check precedes the guard) —
+   * consistent with `poll()`, which also fails an expired record; the whole
+   * enroll→approve→poll cycle must complete inside the device-flow window.
    */
   async approve(userCode: string): Promise<EnrollmentResult | null> {
     const inFlight = this.approvalsInFlight.get(userCode);

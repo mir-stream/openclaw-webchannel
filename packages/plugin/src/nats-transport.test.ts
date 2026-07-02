@@ -233,9 +233,10 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
     const afterClose = await quietListenCountForPid(pid);
     if (afterClose < after) {
       // disconnect() freed LISTEN socket(s) → the transport had opened one.
-      // Surface it as a real failure (this assertion always fails here).
-      expect(afterClose).toBeGreaterThanOrEqual(after);
-      return;
+      expect.fail(
+        `transport opened a LISTEN socket: count dropped from ${after} to ${afterClose} ` +
+          `after disconnect() (baseline ${baseline})`,
+      );
     }
     // Nothing freed → the rise was independent worker noise, not the transport.
     ctx.skip();

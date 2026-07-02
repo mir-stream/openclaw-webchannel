@@ -72,6 +72,10 @@ export class WebChannelNATSClient {
       natsCredentials: options.natsCredentials,
       reconnectBaseMs: options.reconnectBaseMs,
       reconnectCapMs: options.reconnectCapMs,
+      // CL3: forward the keepalive interval too (same drop-on-the-floor class as
+      // the CL1 natsCredentials bug — the wrapper rebuilds the options object, so
+      // any NatsClientOptions field it doesn't name is silently lost).
+      heartbeatIntervalMs: options.heartbeatIntervalMs,
     };
 
     this.client = new WebChannelNatsClient(this.natsOptions);

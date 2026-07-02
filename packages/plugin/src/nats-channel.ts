@@ -179,7 +179,11 @@ export class NatsChannel {
     // S2: enforce the peer ceiling BEFORE adding. Evict the oldest-registered
     // peer(s) — most likely already disconnected (no NATS leave signal) — so a
     // churn/abuse stream can't grow the peer maps without bound. Logged, never
-    // silent (an evicted live peer simply re-registers on its next hop).
+    // silent. NOTE: if the evicted peer is in fact still live, this DROPS its
+    // session until it reconnects (the browser only re-registers in onConnected,
+    // and the client heartbeat keeps a healthy socket from reconnecting) — an
+    // acceptable last-resort under abuse-level churn, not self-healing. The 10k
+    // default keeps this off the path for real single-tenant load.
     while (this.peerSubscriptions.size >= this.maxPeers) {
       const oldest = this.peerSubscriptions.keys().next().value as string | undefined;
       if (oldest === undefined) break;
@@ -473,6 +477,29 @@ export class NatsChannel {
       return;
     }
     const sessionKey = deriveConversationKey(this.agentKeyPair.privateKey, browserPubKey);
+    // S2: this is the ONLY writer of peerSessionKeys and — on the wildcard /
+    // `admission:"auto"` path (the live gateway's mode), where peers never call
+    // registerPeer — the only per-peer growth vector at all. So the session-key
+    // ceiling must be enforced HERE, not just in registerPeer (which the
+    // wildcard path bypasses). Evict the oldest peer when a NEW peerId would
+    // exceed the cap; a returning peer simply re-handshakes.
+    if (!this.peerSessionKeys.has(peerId)) {
+      while (this.peerSessionKeys.size >= this.maxPeers) {
+        const oldest = this.peerSessionKeys.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        console.warn(
+          `[nats-channel] session-key cap ${this.maxPeers} reached; evicting oldest peer ${oldest}`,
+        );
+        // Registered-mode peer → full teardown (also unsubscribes); wildcard-mode
+        // peer has no subscription, so just drop its key + pin.
+        if (this.peerSubscriptions.has(oldest)) {
+          this.unregisterPeer(oldest);
+        } else {
+          this.peerSessionKeys.delete(oldest);
+          clearPinnedDeviceKeyForPeer(oldest);
+        }
+      }
+    }
     this.peerSessionKeys.set(peerId, sessionKey);
     this.transport.publish(
       this.handshakeSubject(peerId),

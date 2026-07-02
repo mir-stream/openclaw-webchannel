@@ -53,6 +53,19 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
     expect(built.reconnectCapMs).toBe(8_000);
   });
 
+  it("forwards heartbeatIntervalMs (CL3)", () => {
+    const wrapper = new WebChannelNATSClient({
+      natsUrl: "wss://nats.prod.example.com",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "acct-1",
+      tenant: "tenant-1",
+      peerId: "peer-1",
+      heartbeatIntervalMs: 0, // e.g. an embedder disabling the heartbeat
+    });
+    const built = wrapper["natsOptions"] as NatsClientOptions;
+    expect(built.heartbeatIntervalMs).toBe(0);
+  });
+
   it("leaves natsCredentials undefined for open/dev NATS (unchanged behavior)", () => {
     const wrapper = new WebChannelNATSClient({
       natsUrl: "wss://nats.dev.example.com",

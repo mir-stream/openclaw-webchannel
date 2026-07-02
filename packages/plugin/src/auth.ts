@@ -56,10 +56,14 @@ export function storePinnedDeviceKey(peerId: string, devicePublicKeyB64: string)
   if (!devicePublicKeyB64 || typeof devicePublicKeyB64 !== "string") {
     throw new Error("webchannel: devicePublicKey must be a non-empty base64url string");
   }
+  // Delete-then-set so a re-pin moves the peer to the NEWEST insertion slot:
+  // that makes the size-cap eviction below LRU-ish (evict least-recently-pinned)
+  // instead of pure-FIFO, so an actively re-pinning peer is never the one
+  // dropped in favor of a stale abandoned pin.
+  pinnedDeviceKeys.delete(peerId);
   pinnedDeviceKeys.set(peerId, devicePublicKeyB64);
-  // S2: FIFO ceiling. Re-pinning an existing peerId just refreshes its value
-  // (no growth); only distinct new peerIds grow the map, so evict the oldest
-  // once over the cap.
+  // S2: size ceiling. Distinct new peerIds grow the map; evict the
+  // least-recently-pinned once over the cap.
   while (pinnedDeviceKeys.size > MAX_PINNED_DEVICE_KEYS) {
     const oldest = pinnedDeviceKeys.keys().next().value as string | undefined;
     if (oldest === undefined) break;

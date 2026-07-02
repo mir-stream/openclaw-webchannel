@@ -145,6 +145,81 @@ describe("CL2 — terminal auth failure", () => {
 
     client.disconnect();
   });
+
+  it("treats an -ERR 'Authentication Timeout' as TRANSIENT, not terminal", async () => {
+    const client = new NatsClient({
+      url: "ws://127.0.0.1:4222",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+      heartbeatIntervalMs: 0,
+    });
+    const errors: Error[] = [];
+    client.onError((e) => errors.push(e));
+
+    client.connect();
+    await flush();
+    const ws = FakeWS.instances[0];
+
+    // A slow/sleeping client can miss the auth window — retrying WILL work, so
+    // this must not become terminal (review finding #2).
+    ws.serverEmit("-ERR 'Authentication Timeout'\r\n");
+    await flush();
+
+    expect(errors).toHaveLength(0);
+    expect(ws.closed).toBe(false);
+
+    client.disconnect();
+  });
+
+  it("treats an -ERR 'User Authentication Expired' as terminal", async () => {
+    const client = new NatsClient({
+      url: "ws://127.0.0.1:4222",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+      heartbeatIntervalMs: 0,
+    });
+    const errors: Error[] = [];
+    client.onError((e) => errors.push(e));
+
+    client.connect();
+    await flush();
+    FakeWS.instances[0].serverEmit("-ERR 'User Authentication Expired'\r\n");
+    await flush();
+
+    expect(errors).toHaveLength(1); // expired creds → terminal
+  });
+});
+
+describe("NatsClient — partial MSG framing (no infinite loop)", () => {
+  it("handles a MSG payload split across two socket frames without hanging", async () => {
+    const client = new NatsClient({
+      url: "ws://127.0.0.1:4222",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+      heartbeatIntervalMs: 0,
+    });
+    const got: Array<[string, string]> = [];
+    client.onRawMessage((s, p) => got.push([s, p]));
+
+    client.connect();
+    await flush();
+    const ws = FakeWS.instances[0];
+
+    // Header + only PART of the 5-byte payload. Before the fix, drainBuffer would
+    // re-extract the same header forever (synchronous infinite loop → tab freeze).
+    ws.serverEmit("MSG foo.bar 1 5\r\nHel");
+    await flush();
+    expect(got).toHaveLength(0); // incomplete, but crucially did NOT hang
+
+    ws.serverEmit("lo\r\n"); // remainder arrives
+    await flush();
+    expect(got).toEqual([["foo.bar", "Hello"]]);
+
+    client.disconnect();
+  });
 });
 
 describe("CL3 — heartbeat liveness", () => {

@@ -13,6 +13,8 @@ import { describe, it, expect, beforeEach } from "vitest";
 
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
+import { generateKeyPair } from "./e2e-crypto.js";
+import { keyExchangeFrame } from "./e2e-session.js";
 import {
   storePinnedDeviceKey,
   getPinnedDeviceKey,
@@ -67,6 +69,40 @@ describe("S2 — NatsChannel memory bounds", () => {
     expect(transport.subs.size).toBe(3);
     // Its SaaS-attested pin was released.
     expect(getPinnedDeviceKey("peer-0")).toBeNull();
+  });
+
+  it("bounds peerSessionKeys on the wildcard/auto path (handshake, no registerPeer)", () => {
+    // The live gateway runs admission:"auto" → subscribeWildcard, so peers never
+    // call registerPeer; their only footprint is a session key set in
+    // handleHandshake. The cap must hold on THIS path too (review finding #1).
+    const agentKP = generateKeyPair();
+    const transport = new FakeTransport();
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport,
+      "acct",
+      "tenant",
+      { keyPair: agentKP },
+      { maxPeers: 3 },
+    );
+    const sessionKeys = channel["peerSessionKeys"] as Map<string, Uint8Array>;
+    const subs = channel["peerSubscriptions"] as Map<string, number>;
+
+    // Five distinct browsers complete a handshake via the wildcard subject —
+    // messages arrive on the transport, NOT through registerPeer.
+    for (let i = 0; i < 5; i++) {
+      const browserKP = generateKeyPair();
+      transport.emit("message", {
+        subject: `webchannel.tenant.acct.peer-${i}.handshake`,
+        payload: Buffer.from(keyExchangeFrame(browserKP.publicKey)),
+      });
+    }
+
+    // Without the wildcard-path bound this would be 5 (unbounded leak).
+    expect(sessionKeys.size).toBe(3);
+    expect(sessionKeys.has("peer-0")).toBe(false); // oldest evicted
+    expect(sessionKeys.has("peer-4")).toBe(true);
+    // registerPeer was never involved on this path.
+    expect(subs.size).toBe(0);
   });
 
   it("never evicts under normal (sub-cap) load", () => {
