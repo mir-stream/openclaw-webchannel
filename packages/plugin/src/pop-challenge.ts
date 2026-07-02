@@ -71,9 +71,36 @@ export class PopChallengeStore {
 
   /** Issue (and persist) a fresh nonce bound to `peerId`. Overwrites any prior. */
   issue(peerId: string): string {
+    // S2: opportunistically evict expired nonces on every issue. A nonce that is
+    // issued but never verified (client abandons the register hop) would
+    // otherwise linger until that same peerId issues again — unbounded across
+    // distinct peerIds over a long-lived gateway's life. The sweep keeps the
+    // store bounded by the count of *live* (unexpired) challenges only.
+    this.sweep();
     const nonce = randomBytes(32).toString("base64url");
     this.store.set(peerId, { nonce, expiresAt: this.now() + this.ttlMs });
     return nonce;
+  }
+
+  /**
+   * Evict every nonce whose TTL has elapsed. Called opportunistically on
+   * {@link issue}; also exposed for an optional periodic sweeper / tests.
+   * Returns the number evicted.
+   */
+  sweep(now: number = this.now()): number {
+    let evicted = 0;
+    for (const [peerId, entry] of this.store) {
+      if (now > entry.expiresAt) {
+        this.store.delete(peerId);
+        evicted += 1;
+      }
+    }
+    return evicted;
+  }
+
+  /** Current number of stored (issued, not-yet-consumed) nonces. */
+  get size(): number {
+    return this.store.size;
   }
 
   /** Consume the stored nonce (single-use). */

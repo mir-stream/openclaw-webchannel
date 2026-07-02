@@ -5,6 +5,9 @@ import { webcrypto } from "node:crypto";
 import {
   resolveVerifier,
   verifyJwtAndExtractIdentity,
+  storePinnedDeviceKey,
+  getPinnedDeviceKey,
+  clearPinnedDeviceKeys,
   type AuthConfig,
   type AuthLogger,
 } from "./auth.js";
@@ -281,5 +284,32 @@ describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", ()
     // Each account's config keys its own cache — one fetch apiece, no bleed.
     expect(a.count()).toBe(1);
     expect(b.count()).toBe(1);
+  });
+});
+
+describe("S2 — pinned device key store is bounded (FIFO)", () => {
+  const MAX = 10_000; // must mirror MAX_PINNED_DEVICE_KEYS in auth.ts
+
+  it("re-pinning the same peerId does not grow the store", () => {
+    clearPinnedDeviceKeys();
+    storePinnedDeviceKey("peer-x", "keyA");
+    storePinnedDeviceKey("peer-x", "keyB"); // rotation, not growth
+    expect(getPinnedDeviceKey("peer-x")).toBe("keyB");
+  });
+
+  it("evicts the oldest pins once the cap is exceeded", () => {
+    clearPinnedDeviceKeys();
+    // The two oldest, then fill exactly to the cap with fresh peers → the two
+    // oldest are pushed out.
+    storePinnedDeviceKey("peer-oldest-0", "k0");
+    storePinnedDeviceKey("peer-oldest-1", "k1");
+    for (let i = 0; i < MAX; i++) {
+      storePinnedDeviceKey(`filler-${i}`, "k");
+    }
+    // Two oldest evicted; a recent one survives.
+    expect(getPinnedDeviceKey("peer-oldest-0")).toBeNull();
+    expect(getPinnedDeviceKey("peer-oldest-1")).toBeNull();
+    expect(getPinnedDeviceKey(`filler-${MAX - 1}`)).toBe("k");
+    clearPinnedDeviceKeys();
   });
 });

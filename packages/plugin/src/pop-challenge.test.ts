@@ -81,4 +81,33 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
     expect(store.verify({ peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: x25519Jwk }))
       .toEqual({ ok: false, reason: "not-ed25519" });
   });
+
+  // S2: an issued-but-never-verified nonce must not linger past its TTL.
+  describe("S2 — TTL sweep bounds abandoned nonces", () => {
+    it("sweep() evicts only expired nonces", () => {
+      let clock = 1_000;
+      const store = new PopChallengeStore(100, () => clock);
+      store.issue("alice"); // expires at 1_100
+      clock = 1_050;
+      store.issue("bob"); // expires at 1_150
+      expect(store.size).toBe(2);
+
+      clock = 1_120; // alice expired, bob still live
+      expect(store.sweep()).toBe(1);
+      expect(store.size).toBe(1);
+    });
+
+    it("issue() opportunistically sweeps so abandoned nonces don't accumulate", () => {
+      let clock = 0;
+      const store = new PopChallengeStore(100, () => clock);
+      // Distinct peers each abandon their challenge; without the sweep the store
+      // would grow by one per distinct peerId forever.
+      for (let i = 0; i < 20; i++) {
+        clock = i * 1_000; // each issue is well past the previous TTL
+        store.issue(`peer-${i}`);
+      }
+      // Only the most-recent issue survives (all prior ones swept as expired).
+      expect(store.size).toBe(1);
+    });
+  });
 });

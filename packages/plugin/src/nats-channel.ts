@@ -20,6 +20,7 @@ import type { NatsTransport, NatsMessage } from "./nats-transport.js";
 import type { ApprovalDecision } from "./transport.js";
 import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
+import { clearPinnedDeviceKeyForPeer } from "./auth.js";
 import {
   deriveConversationKey,
   keyExchangeFrame,
@@ -74,6 +75,30 @@ export type NatsChannelCryptoOptions = {
 };
 
 /**
+ * S2: optional memory ceilings, decoupled from crypto mode so a caller can tune
+ * the bounds (or a test can exercise them) without turning on encryption.
+ */
+export type NatsChannelLimits = {
+  /**
+   * Upper bound on concurrently-tracked peers before the oldest-registered one
+   * is evicted (default 10_000). The NATS path has no disconnect signal, so
+   * without a cap peer subscriptions/session keys grow with churn. Real
+   * single-tenant load stays far below this.
+   */
+  maxPeers?: number;
+  /**
+   * Upper bound on remembered approval resolutions before the oldest is evicted
+   * (default 10_000). Resolutions are additive per approval and were never
+   * cleaned, so this map was the clearest unbounded leak.
+   */
+  maxApprovalResolutions?: number;
+};
+
+/** S2 defaults — high enough that normal operation never evicts. */
+const DEFAULT_MAX_PEERS = 10_000;
+const DEFAULT_MAX_APPROVAL_RESOLUTIONS = 10_000;
+
+/**
  * NATS-based message channel for WebChannel.
  *
  * Replaces gateway-WS WebSocketServer with NATS pub/sub.
@@ -89,6 +114,19 @@ export class NatsChannel {
 
   // Per-peer approval deduplication (approvalId -> peerId who first resolved)
   private readonly approvalResolutions = new Map<string, string>();
+
+  /**
+   * S2: unconditional memory bounds. The NATS path has no peer-disconnect
+   * signal, so these maps would otherwise grow monotonically with peer/session
+   * churn on a long-lived gateway. We cap each by size and evict the OLDEST
+   * entry (Map is insertion-ordered, so the oldest is the most likely to be
+   * already-disconnected) when a cap is exceeded. Under normal load (few peers,
+   * approvals resolved and forgotten) the caps NEVER trigger, so there is no
+   * behavior change for real operation — the bound only engages under genuine
+   * unbounded growth (churn or abuse), turning a slow OOM into a fixed ceiling.
+   */
+  private readonly maxPeers: number;
+  private readonly maxApprovalResolutions: number;
 
   // ---- Encrypt-by-construction state (only populated in crypto mode) --------
 
@@ -111,12 +149,16 @@ export class NatsChannel {
     accountId: string,
     tenant: string,
     crypto?: NatsChannelCryptoOptions,
+    limits?: NatsChannelLimits,
   ) {
     this.transport = transport;
     this.accountId = accountId;
     this.tenant = tenant;
     this.encryptionRequired = crypto != null;
     this.agentKeyPair = crypto ? (crypto.keyPair ?? generateKeyPair()) : null;
+    this.maxPeers = limits?.maxPeers ?? DEFAULT_MAX_PEERS;
+    this.maxApprovalResolutions =
+      limits?.maxApprovalResolutions ?? DEFAULT_MAX_APPROVAL_RESOLUTIONS;
 
     // Wire up NATS message handler
     this.transport.on("message", (msg: NatsMessage) => this.handleNatsMessage(msg));
@@ -132,6 +174,19 @@ export class NatsChannel {
     if (this.peerSubscriptions.has(peerId)) {
       console.warn(`[nats-channel] Peer ${peerId} already registered`);
       return;
+    }
+
+    // S2: enforce the peer ceiling BEFORE adding. Evict the oldest-registered
+    // peer(s) — most likely already disconnected (no NATS leave signal) — so a
+    // churn/abuse stream can't grow the peer maps without bound. Logged, never
+    // silent (an evicted live peer simply re-registers on its next hop).
+    while (this.peerSubscriptions.size >= this.maxPeers) {
+      const oldest = this.peerSubscriptions.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      console.warn(
+        `[nats-channel] peer cap ${this.maxPeers} reached; evicting oldest peer ${oldest}`,
+      );
+      this.unregisterPeer(oldest);
     }
 
     const inboundSubject = this.inboundSubject(peerId);
@@ -183,6 +238,11 @@ export class NatsChannel {
     }
     // Drop the session key so a reconnecting peer must re-handshake.
     this.peerSessionKeys.delete(peerId);
+    // S2: release this peer's SaaS-attested pinned device key too, so the
+    // module-global pin store is bounded by the peer lifecycle rather than
+    // growing per unique peerId forever. A returning peer re-pins on its next
+    // verified JWT.
+    clearPinnedDeviceKeyForPeer(peerId);
   }
 
   /**
@@ -279,6 +339,14 @@ export class NatsChannel {
     } else {
       // First resolution: record it
       this.approvalResolutions.set(id, peerId);
+      // S2: bound the dedup map. It only needs to remember an id long enough to
+      // drop near-simultaneous duplicate resolutions; evicting the oldest once
+      // over the cap keeps memory fixed without weakening that window.
+      while (this.approvalResolutions.size > this.maxApprovalResolutions) {
+        const oldest = this.approvalResolutions.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        this.approvalResolutions.delete(oldest);
+      }
     }
 
     const payload: OutboundWsMessage = { type: "approval_resolved", id, decision };

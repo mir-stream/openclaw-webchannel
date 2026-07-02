@@ -31,6 +31,16 @@ export const ANON_PEER_ID = "web-anon";
 const pinnedDeviceKeys: Map<string, string> = new Map();
 
 /**
+ * S2: upper bound on pinned keys. `NatsChannel.unregisterPeer` releases a peer's
+ * pin on the normal lifecycle, but a JWT that is verified (pin stored) without a
+ * following register hop would otherwise leak per distinct peerId forever. This
+ * FIFO ceiling evicts the oldest pin once exceeded — a defense-in-depth bound so
+ * the module-global store can't grow without limit. High enough that real
+ * single-tenant load never trips it.
+ */
+const MAX_PINNED_DEVICE_KEYS = 10_000;
+
+/**
  * Store a SaaS-attested device public key for a given peerId.
  *
  * Called by the auth layer after successful JWT verification with a cnf claim.
@@ -47,6 +57,14 @@ export function storePinnedDeviceKey(peerId: string, devicePublicKeyB64: string)
     throw new Error("webchannel: devicePublicKey must be a non-empty base64url string");
   }
   pinnedDeviceKeys.set(peerId, devicePublicKeyB64);
+  // S2: FIFO ceiling. Re-pinning an existing peerId just refreshes its value
+  // (no growth); only distinct new peerIds grow the map, so evict the oldest
+  // once over the cap.
+  while (pinnedDeviceKeys.size > MAX_PINNED_DEVICE_KEYS) {
+    const oldest = pinnedDeviceKeys.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    pinnedDeviceKeys.delete(oldest);
+  }
 }
 
 /**
