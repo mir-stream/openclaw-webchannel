@@ -1,6 +1,7 @@
 import { WebSocket } from "ws";
+import { requireWsUrl } from "./_ws-url.mjs";
 
-const URL = process.env.WS_URL || "ws://127.0.0.1:18789/webchannel/ws";
+const URL = requireWsUrl();
 const TEXT = process.env.MSG || "Reply with exactly: PONG-WEBCHANNEL";
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 120000);
 

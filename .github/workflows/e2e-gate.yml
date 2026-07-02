@@ -7,17 +7,21 @@
 #  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
 #  - Both dev/open-NATS mode AND enrolled-JWT mode covered
 #
-# The gate runs on every push and PR to main/master branches.
-# NEVER disable or skip this gate — it is the definition of "plugin done".
+# The gate runs on every push and PR to the integration branches AND to the
+# working branches where development actually happens (develop, feature/**) —
+# review 2026-07-02 (O1): previously it triggered only on main/master/jwks, so
+# the branch all work lands on (develop) and every feature/* branch shipped
+# with the gate never running. NEVER disable or skip this gate — it is the
+# definition of "plugin done".
 ################################################################################
 
 name: E2E Gate
 
 on:
   push:
-    branches: [main, master, jwks]
+    branches: [main, master, develop, "feature/**"]
   pull_request:
-    branches: [main, master, jwks]
+    branches: [main, master, develop]
 
 # Only one gate run per branch/PR at a time; cancel stale in-progress runs.
 concurrency:
