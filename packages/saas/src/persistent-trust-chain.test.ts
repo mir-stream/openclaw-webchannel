@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -53,5 +53,25 @@ describe("loadOrCreateTrustChain", () => {
     const flat = join(dir, "trust-chain.json"); // dir already exists (mkdtemp)
     writeFileSync(flat, JSON.stringify({ private: {} }));
     await expect(loadOrCreateTrustChain(flat)).rejects.toThrow(/missing required fields/);
+  });
+
+  // A3: a corrupt (non-JSON) file must fail with an actionable message, not a
+  // raw JSON SyntaxError — and must NOT be silently regenerated.
+  it("throws a legible, recovery-guiding error on a corrupt (non-JSON) file", async () => {
+    const flat = join(dir, "trust-chain.json");
+    writeFileSync(flat, "{ this is not json"); // e.g. a half-written file
+    await expect(loadOrCreateTrustChain(flat)).rejects.toThrow(
+      /corrupt \(not valid JSON\)[\s\S]*delete the file/,
+    );
+  });
+
+  // A3: the write is atomic — after a successful create, only the real file
+  // exists (no leftover *.tmp partial that a later boot could trip over).
+  it("writes atomically, leaving no leftover temp file", async () => {
+    await loadOrCreateTrustChain(path);
+    const nestedDir = join(dir, "nested");
+    const entries = readdirSync(nestedDir);
+    expect(entries).toEqual(["trust-chain.json"]);
+    expect(entries.some((f) => f.includes(".tmp"))).toBe(false);
   });
 });

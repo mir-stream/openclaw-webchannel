@@ -290,6 +290,60 @@ describe("DeviceFlowEnrollment", () => {
       const result = await shortLivedEnrollment.approve(enrollResponse.user_code);
       expect(result).toBeNull();
     });
+
+    // A2: approve must be idempotent — a repeat click/retry/replay must NOT
+    // re-mint a new identity that would break the plugin's already-live session.
+    it("is idempotent: a second approve returns the SAME creds/peerId", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+
+      const first = await enrollment.approve(enrollResponse.user_code);
+      const second = await enrollment.approve(enrollResponse.user_code);
+
+      expect(first).not.toBeNull();
+      expect(second).not.toBeNull();
+      expect(second!.peerId).toBe(first!.peerId);
+      expect(second!.creds).toEqual(first!.creds);
+
+      // And the persisted record was not overwritten with a fresh identity.
+      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.peerId).toBe(first!.peerId);
+      expect(persisted?.natsCreds).toEqual(first!.creds);
+    });
+
+    // A2: two CONCURRENT approvals of the same enrollment (double-click race)
+    // must coalesce onto one identity, not mint two and last-writer-win.
+    it("coalesces concurrent approvals onto a single identity", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+
+      const [a, b] = await Promise.all([
+        enrollment.approve(enrollResponse.user_code),
+        enrollment.approve(enrollResponse.user_code),
+      ]);
+
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      expect(a!.peerId).toBe(b!.peerId);
+      expect(a!.creds).toEqual(b!.creds);
+
+      // The persisted identity matches what both callers received.
+      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.peerId).toBe(a!.peerId);
+    });
+
+    // A2: the plugin's next poll after approval must see the SAME identity the
+    // approver returned (this is the invariant a re-mint would violate).
+    it("poll after a repeat approve returns the first-minted identity", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+
+      const approved = await enrollment.approve(enrollResponse.user_code);
+      await enrollment.approve(enrollResponse.user_code); // repeat
+      const polled = await enrollment.poll({ device_code: enrollResponse.device_code });
+
+      expect("peerId" in polled! && polled.peerId).toBe(approved!.peerId);
+      expect("creds" in polled! && polled.creds).toEqual(approved!.creds);
+    });
   });
 
   describe("deny()", () => {

@@ -328,6 +328,8 @@ export class DeviceFlowEnrollment {
   private readonly options: Required<Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId">> &
     Pick<DeviceFlowOptions, "natsIssuerAccountId">;
   private readonly store: EnrollmentStore;
+  /** A2: in-flight approvals keyed by userCode, to coalesce concurrent clicks. */
+  private readonly approvalsInFlight = new Map<string, Promise<EnrollmentResult | null>>();
 
   constructor(options: DeviceFlowOptions) {
     this.options = {
@@ -432,8 +434,28 @@ export class DeviceFlowEnrollment {
    *
    * Called by the SaaS approval UI when the operator clicks "Approve".
    * Generates NATS user credentials and updates enrollment status.
+   *
+   * A2: idempotent + race-safe. `/approve` is an unauthenticated, repeatable
+   * action (double-click, retry, replay). Re-minting creds/peerId on a repeat
+   * would hand the already-connected plugin a DIFFERENT identity on its next
+   * poll and break the live session, so:
+   *  - a repeat AFTER the first approval returns the SAME credentials (status
+   *    guard on the persisted enrollment), and
+   *  - two CONCURRENT approvals of the same enrollment are coalesced onto one
+   *    in-flight promise so they can't each mint a distinct identity in the
+   *    read-mint-write window (last-writer-wins).
    */
   async approve(userCode: string): Promise<EnrollmentResult | null> {
+    const inFlight = this.approvalsInFlight.get(userCode);
+    if (inFlight) return inFlight;
+    const promise = this.approveInner(userCode).finally(() => {
+      this.approvalsInFlight.delete(userCode);
+    });
+    this.approvalsInFlight.set(userCode, promise);
+    return promise;
+  }
+
+  private async approveInner(userCode: string): Promise<EnrollmentResult | null> {
     const enrollment = await this.store.getEnrollmentByUserCode(userCode);
     if (!enrollment) return null;
 
@@ -441,6 +463,18 @@ export class DeviceFlowEnrollment {
     if (Date.now() > enrollment.expiresAt) {
       await this.store.updateEnrollment(enrollment.device_code, { status: "expired" });
       return null;
+    }
+
+    // A2: already approved → return the credentials minted the first time
+    // instead of overwriting them with a fresh identity.
+    if (enrollment.status === "approved" && enrollment.natsCreds && enrollment.peerId) {
+      return {
+        creds: enrollment.natsCreds,
+        peerId: enrollment.peerId,
+        jwksUrl: this.options.jwksUrl,
+        bootstrapUrl: this.options.bootstrapUrl,
+        natsUrl: this.options.natsUrl,
+      };
     }
 
     // Generate NATS user credentials

@@ -12,7 +12,7 @@
  * simply: generate once, JSON-serialize to a 0600 file, reload thereafter.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { setupTrustChain, type SetupTrustChainOptions } from "./setup-trust-chain.js";
@@ -57,7 +57,7 @@ export async function loadOrCreateTrustChain(
   const external = options.externalNatsAccount;
 
   if (existsSync(path)) {
-    const parsed = JSON.parse(readFileSync(path, "utf-8")) as SetupTrustChainResult;
+    const parsed = parsePersistedFile(path);
     // Legacy files predate the `mode` discriminator — treat them as self-contained.
     if (parsed?.natsConfig && parsed.natsConfig.mode === undefined) {
       (parsed.natsConfig as { mode?: string }).mode = "self-contained";
@@ -88,8 +88,56 @@ export async function loadOrCreateTrustChain(
   const toPersist: SetupTrustChainResult = external
     ? { ...chain, private: { ...chain.private, natsAccountSeed: "" } }
     : chain;
-  writeFileSync(path, JSON.stringify(toPersist, null, 2), { mode: 0o600 });
+  writeFileAtomic(path, JSON.stringify(toPersist, null, 2));
   return chain;
+}
+
+/**
+ * A3: read + parse the persisted file, turning a raw `JSON.parse` SyntaxError
+ * into an actionable error. Failing loudly on a corrupt file is intended (§ the
+ * comment on {@link assertPersistedShape}) — a silently-regenerated chain would
+ * invalidate every enrolled agent. This just makes the failure legible: which
+ * file, that it's corrupt, and how to recover.
+ */
+function parsePersistedFile(path: string): SetupTrustChainResult {
+  const raw = readFileSync(path, "utf-8");
+  try {
+    return JSON.parse(raw) as SetupTrustChainResult;
+  } catch (err) {
+    throw new Error(
+      `persisted trust chain at ${path} is corrupt (not valid JSON): ${(err as Error).message}. ` +
+        `This usually means a previous write was interrupted. Restore it from backup, or — only if ` +
+        `you accept re-enrolling every agent — delete the file to mint a fresh chain on next boot.`,
+    );
+  }
+}
+
+/**
+ * A3: write `path` atomically so an interrupted write (crash / disk-full) can
+ * NEVER leave a partial file that bricks every subsequent boot. We write to a
+ * process-unique temp file in the SAME directory (so `rename` is a same-filesystem
+ * atomic swap) and rename it into place; readers only ever see a fully-written
+ * file or the previous one, never a truncated mix. The temp is cleaned up on a
+ * write failure.
+ *
+ * Note: this eliminates corruption from a partial write. Two processes doing a
+ * concurrent FIRST boot (no file yet) still race on the final rename (last writer
+ * wins, loser runs an in-memory chain not on disk) — acceptable because the
+ * deployment model is a single launchd-managed issuer.
+ */
+function writeFileAtomic(path: string, data: string): void {
+  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
+  try {
+    writeFileSync(tmp, data, { mode: 0o600 });
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      if (existsSync(tmp)) unlinkSync(tmp);
+    } catch {
+      // best-effort temp cleanup; surface the original write error below
+    }
+    throw err;
+  }
 }
 
 /**
