@@ -79,22 +79,26 @@ export class WebChannelNATSClient {
     // Wire up message listener
     this.client.onMessage((msg: InboundMessage) => this.handleMessage(msg));
 
-    // Wire up state listener
+    // Wire up state listener. Once we are in the terminal `"error"` status
+    // (CL2), a trailing `onState(false)` from the connection teardown must NOT
+    // downgrade it back to "reconnecting" — the client is not reconnecting.
     this.client.onState((connected: boolean) => {
+      if (!connected && this.state.status === "error") return;
       this.setState({
         status: connected ? "connected" : "reconnecting",
         connected,
       });
     });
 
-    // Surface a failed PoP registration. The underlying client tears the
-    // connection fully down (registration failure is terminal — see
-    // nats-client.ts onConnected), so nothing is reconnecting. ConnectionStatus
-    // has no terminal/disconnected value, so we do NOT claim "reconnecting"
-    // here: the matching `onState(false)` from the teardown already moves status
-    // out of "connected", and we just log the error.
+    // CL2: surface a TERMINAL failure to the embedder. The underlying client
+    // fires onError for non-retryable failures — a failed PoP registration or an
+    // authoritative NATS auth rejection (`-ERR Authorization Violation`, expired
+    // creds) — and has stopped reconnecting. We move to the terminal `"error"`
+    // status with a reason so the app can prompt for fresh credentials instead
+    // of showing an eternal reconnect spinner.
     this.client.onError((err: Error) => {
-      console.error("[nats-wrapper] registration error:", err);
+      console.error("[nats-wrapper] terminal connection error:", err);
+      this.setState({ status: "error", connected: false, error: err.message });
     });
   }
 

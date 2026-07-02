@@ -59,6 +59,15 @@ export type NatsClientOptions = {
   /** Reconnect backoff cap (ms) */
   reconnectCapMs?: number;
   /**
+   * CL3: client-side keepalive interval (ms). While connected the client sends a
+   * PING every interval and expects a PONG before the next tick; a missed PONG
+   * means the socket is half-open (tab sleep/wake, NAT/mobile flap) and is torn
+   * down so a reconnect fires — otherwise `connected` stays wrongly true and
+   * published messages vanish into the retention-less relay. Default 20_000; set
+   * to 0 to disable.
+   */
+  heartbeatIntervalMs?: number;
+  /**
    * Optional PoP HTTP registration. When present, the client performs the
    * JWT + Proof-of-Possession registration against the plugin's HTTP register
    * route after connecting (and before the handshake), so the agent subscribes
@@ -159,8 +168,26 @@ export class NatsClient {
    */
   private connectSent = false;
 
+  /** CL2: terminal auth failure — stop reconnecting; only a fresh client helps. */
+  private terminal = false;
+  /** CL2: listeners notified on a terminal (non-retryable) failure. */
+  private readonly errorListeners = new Set<ErrorListener>();
+  /** CL3: keepalive timer + outstanding-PING flag. */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private pongPending = false;
+
   constructor(options: NatsClientOptions) {
     this.options = options;
+  }
+
+  /**
+   * CL2: subscribe to terminal (non-retryable) connection failures — an
+   * authoritative auth rejection where reconnecting with the same credentials
+   * cannot succeed. After this fires the client has stopped reconnecting.
+   */
+  onError(listener: ErrorListener): () => void {
+    this.errorListeners.add(listener);
+    return () => { this.errorListeners.delete(listener); };
   }
 
   /** Connect to NATS server */
@@ -171,6 +198,7 @@ export class NatsClient {
   /** Disconnect and cleanup */
   disconnect(): void {
     this.clearReconnectTimer();
+    this.stopHeartbeat();
     if (this.ws) {
       this.ws.onopen = null;
       this.ws.onmessage = null;
@@ -234,6 +262,8 @@ export class NatsClient {
   // ---------------------------------------------------------------------------
 
   private connectInternal(): void {
+    // CL2: a terminal auth failure is not retryable — refuse to redial.
+    if (this.terminal) return;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
@@ -270,6 +300,7 @@ export class NatsClient {
 
     ws.onclose = () => {
       this.connected = false;
+      this.stopHeartbeat();
       this.notifyStateListeners();
       this.scheduleReconnect();
     };
@@ -356,12 +387,16 @@ export class NatsClient {
       }
 
       if (line === "PONG") {
+        // CL3: any PONG proves the link is alive — clear the outstanding-ping
+        // flag so the next heartbeat tick does not declare a dead link.
+        this.pongPending = false;
         if (!this.connected) {
           this.connected = true;
           this.reconnectAttempts = 0;
           console.log("[nats-client] Connected to NATS");
           this.notifyStateListeners();
           this.resubscribeAll();
+          this.startHeartbeat();
         }
         continue;
       }
@@ -378,6 +413,17 @@ export class NatsClient {
 
       if (line.startsWith("-ERR ")) {
         console.error("[nats-client] NATS error:", line);
+        // CL2: distinguish an authoritative AUTH rejection (terminal — the same
+        // credentials will never be accepted) from a per-subject permissions
+        // error (non-fatal; the connection stays up). Only auth rejections stop
+        // reconnecting and surface to the embedder. A "Permissions Violation"
+        // contains neither token, so it correctly falls through as non-terminal.
+        if (/authorization violation|authentication/i.test(line)) {
+          this.failTerminally(
+            `NATS authorization rejected: ${line.slice(5).trim()} ` +
+              `(credentials invalid/expired — reconnecting cannot help)`,
+          );
+        }
         continue;
       }
     }
@@ -413,6 +459,8 @@ export class NatsClient {
   }
 
   private scheduleReconnect(): void {
+    // CL2: never reconnect after a terminal auth failure.
+    if (this.terminal) return;
     if (this.reconnectTimer) return;
 
     const baseMs = this.options.reconnectBaseMs ?? 500;
@@ -434,6 +482,94 @@ export class NatsClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
+
+  /**
+   * CL2: enter the terminal state. Stops all reconnect activity, tears the
+   * socket down, and notifies error listeners. No further redial happens until a
+   * brand-new client is constructed.
+   */
+  private failTerminally(message: string): void {
+    if (this.terminal) return; // fire once
+    this.terminal = true;
+    this.clearReconnectTimer();
+    this.stopHeartbeat();
+    this.connected = false;
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null; // suppress the onclose→scheduleReconnect path
+      try { this.ws.close(); } catch { /* already closing */ }
+      this.ws = null;
+    }
+    this.notifyStateListeners();
+    this.notifyErrorListeners(new Error(message));
+  }
+
+  /**
+   * CL3: start the keepalive loop. Each tick, if the previous PING is still
+   * unanswered the link is half-open → force a reconnect; otherwise send a fresh
+   * PING and expect a PONG before the next tick.
+   */
+  private startHeartbeat(): void {
+    const interval = this.options.heartbeatIntervalMs ?? 20_000;
+    if (interval <= 0) return; // disabled
+    this.stopHeartbeat();
+    this.pongPending = false;
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (this.pongPending) {
+        // No PONG since the last tick → the socket is dead but never fired
+        // onclose (half-open). Force the teardown+reconnect ourselves.
+        console.warn("[nats-client] heartbeat timeout — link is half-open, forcing reconnect");
+        this.forceReconnect();
+        return;
+      }
+      this.pongPending = true;
+      try {
+        this.ws.send("PING\r\n");
+      } catch {
+        this.forceReconnect();
+      }
+    }, interval);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    this.pongPending = false;
+  }
+
+  /**
+   * CL3: tear a half-open socket down and schedule a reconnect. Unlike a clean
+   * onclose we must drive it manually because the browser never signalled close.
+   */
+  private forceReconnect(): void {
+    this.stopHeartbeat();
+    this.connected = false;
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null; // we drive the reconnect; avoid a double-fire
+      try { this.ws.close(); } catch { /* already closing */ }
+      this.ws = null;
+    }
+    this.notifyStateListeners();
+    this.scheduleReconnect();
+  }
+
+  private notifyErrorListeners(err: Error): void {
+    this.errorListeners.forEach((listener) => {
+      try {
+        listener(err);
+      } catch (e) {
+        console.error("[nats-client] Error listener threw:", e);
+      }
+    });
   }
 
   private notifyRawListeners(subject: string, payload: string): void {
@@ -531,6 +667,10 @@ export class WebChannelNatsClient {
       if (connected) void this.onConnected();
       else this.resetSession();
     });
+    // CL2: forward the low-level client's terminal auth failures to our own
+    // error listeners, so an embedder learns credentials died (not just PoP
+    // registration failures, which already flow through notifyErrorListeners).
+    this.client.onError((err) => this.notifyErrorListeners(err));
   }
 
   /** Connect to NATS (the handshake begins automatically once connected). */

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 import type { NatsClientOptions } from "./nats-client.js";
@@ -64,5 +64,79 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
 
     const built = wrapper["natsOptions"] as NatsClientOptions;
     expect(built.natsCredentials).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CL2: a terminal auth failure must surface as the sticky "error" status.
+// ---------------------------------------------------------------------------
+class FakeWS {
+  static instances: FakeWS[] = [];
+  static readonly OPEN = 1;
+  static readonly CLOSED = 3;
+  url: string;
+  binaryType = "blob";
+  readyState = 0;
+  onopen: (() => void) | null = null;
+  onmessage: ((e: { data: string }) => void) | null = null;
+  onerror: ((e: unknown) => void) | null = null;
+  onclose: (() => void) | null = null;
+  constructor(url: string) {
+    this.url = url;
+    FakeWS.instances.push(this);
+    queueMicrotask(() => {
+      this.readyState = FakeWS.OPEN;
+      this.onopen?.();
+    });
+  }
+  send(data: string): void {
+    if (data.startsWith("PING")) this.onmessage?.({ data: "PONG\r\n" });
+  }
+  close(): void {
+    this.readyState = FakeWS.CLOSED;
+    this.onclose?.();
+  }
+  serverEmit(frame: string): void {
+    this.onmessage?.({ data: frame });
+  }
+}
+
+describe("WebChannelNATSClient — CL2 terminal error status", () => {
+  let originalWebSocket: unknown;
+  beforeEach(() => {
+    originalWebSocket = (globalThis as { WebSocket?: unknown }).WebSocket;
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWS;
+    FakeWS.instances = [];
+  });
+  afterEach(() => {
+    (globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket;
+  });
+
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  it("moves to sticky status \"error\" with a reason on an auth -ERR", async () => {
+    const wrapper = new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+      heartbeatIntervalMs: 0,
+    });
+    wrapper.connect();
+    await flush();
+    expect(wrapper.getState().status).toBe("connected");
+
+    FakeWS.instances[0].serverEmit("-ERR 'Authorization Violation'\r\n");
+    await flush();
+
+    const state = wrapper.getState();
+    expect(state.status).toBe("error");
+    expect(state.connected).toBe(false);
+    expect(state.error).toMatch(/authorization/i);
+
+    // Sticky: a trailing teardown state event must not downgrade it.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(wrapper.getState().status).toBe("error");
   });
 });

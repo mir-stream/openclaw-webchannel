@@ -54,8 +54,16 @@ export type ApprovalRequest = {
   resolvedDecision?: ApprovalDecision;
 };
 
-/** Connection status, richer than a bool (drives the UI status dot). */
-export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
+/**
+ * Connection status, richer than a bool (drives the UI status dot).
+ *
+ * `"error"` is TERMINAL (CL2): the connection failed in a way retrying can't fix
+ * — an authoritative auth rejection (expired/invalid credentials, `-ERR
+ * Authorization Violation`) or a failed PoP registration. The client stops
+ * reconnecting and the embedder must re-initialize with fresh credentials; the
+ * accompanying `WebChannelState.error` carries a human-readable reason.
+ */
+export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "error";
 
 /**
  * The full client state, recomputed immutably on every change. A new object is
@@ -69,6 +77,12 @@ export type WebChannelState = {
   status: ConnectionStatus;
   /** Convenience mirror of `status === "connected"`. */
   connected: boolean;
+  /**
+   * Set only when `status === "error"` (CL2): a human-readable reason for the
+   * terminal failure (e.g. "authorization rejected by NATS server"). Lets the
+   * embedder show a real message instead of an eternal reconnect spinner.
+   */
+  error?: string;
   /**
    * Native "Bot is typing…" affordance. The server pushes a single `typing`
    * frame at the start of a turn, which flips this to `true`. The first
