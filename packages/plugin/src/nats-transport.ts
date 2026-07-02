@@ -227,7 +227,7 @@ export class NatsTransport extends EventEmitter {
         } else {
           // Post-handshake error — emit to registered listeners.
           this._connected = false;
-          this.emit("error", err);
+          this.emitError(err);
         }
       });
 
@@ -331,7 +331,7 @@ export class NatsTransport extends EventEmitter {
         } else {
           // Post-handshake NATS error (e.g. Permissions Violation for Publish/
           // Subscription) — emit to registered listeners so callers can react.
-          this.emit("error", err);
+          this.emitError(err);
         }
         continue;
       }
@@ -479,6 +479,33 @@ export class NatsTransport extends EventEmitter {
   private assertOpen(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error("NatsTransport: not connected — call connect() first");
+    }
+  }
+
+  /**
+   * Emit a post-handshake `error` event WITHOUT risking a process crash.
+   *
+   * Node's EventEmitter rethrows an emitted `"error"` as an uncaught exception
+   * when NO `"error"` listener is registered. On the live NATS path a single
+   * transient failure (NATS restart → TCP reset; a post-connect
+   * `-ERR Permissions Violation`) would otherwise kill the WHOLE gateway
+   * process — every channel, every account — not just the affected connection
+   * (review 2026-07-02 finding C1).
+   *
+   * This backstop guarantees that can never happen: if a listener is present
+   * the error is delivered normally; if not, it is logged instead of thrown.
+   * Consumers SHOULD still attach an `"error"` listener (for structured logging
+   * and reconnect); this guard only protects against a consumer that forgot to.
+   */
+  private emitError(err: Error): void {
+    if (this.listenerCount("error") > 0) {
+      this.emit("error", err);
+    } else {
+      // Last-resort backstop — a consumer forgot to attach an "error" listener.
+      // Log instead of letting Node rethrow as an uncaught exception.
+      console.error(
+        `[NatsTransport] unhandled connection error (no "error" listener attached): ${err.message}`,
+      );
     }
   }
 }

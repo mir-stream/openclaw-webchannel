@@ -13,7 +13,7 @@
  *  4. Unit: outbound pub/sub wiring with a fake WebSocket (_wsFactory seam).
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import { platform } from "node:os";
 import WebSocket from "ws";
@@ -416,6 +416,75 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
 
     expect(t.connected).toBe(true);
     t.disconnect();
+    expect(t.connected).toBe(false);
+  });
+
+  // ── C1: listener-less post-handshake error must NEVER crash the process ────
+  // Regression for review 2026-07-02 finding C1. Node's EventEmitter rethrows
+  // an emitted "error" as an uncaught exception when no "error" listener is
+  // registered. On the live NATS path that would kill the WHOLE gateway (every
+  // account/channel) on a single transient failure. The transport must instead
+  // log and stay alive when no listener is attached.
+
+  it("post-handshake WebSocket error with NO listener does not throw (C1 crash guard)", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+
+    const connectPromise = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n");
+    await connectPromise;
+    expect(t.connected).toBe(true);
+
+    // Deliberately attach NO "error" listener. Silence the backstop log so the
+    // test output stays clean, and assert the emit does not throw (old code
+    // would rethrow as an uncaught exception → gateway process death).
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(() => fakeWs.fireError(new Error("simulated TCP reset"))).not.toThrow();
+    expect(t.connected).toBe(false);
+    expect(errSpy).toHaveBeenCalledWith(
+      expect.stringContaining("simulated TCP reset"),
+    );
+    errSpy.mockRestore();
+  });
+
+  it("post-handshake -ERR with NO listener does not throw (C1 crash guard)", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+
+    const connectPromise = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n");
+    await connectPromise;
+    expect(t.connected).toBe(true);
+
+    // A post-connect Permissions Violation arrives with no "error" listener.
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(() =>
+      fakeWs.fireServerFrame("-ERR 'Permissions Violation for Subscription'\r\n"),
+    ).not.toThrow();
+    expect(errSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Permissions Violation"),
+    );
+    errSpy.mockRestore();
+  });
+
+  it("post-handshake error IS delivered when an 'error' listener is attached", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+
+    const connectPromise = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n");
+    await connectPromise;
+
+    const errors: Error[] = [];
+    t.on("error", (err: Error) => errors.push(err));
+
+    fakeWs.fireError(new Error("boom"));
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.message).toBe("boom");
     expect(t.connected).toBe(false);
   });
 });

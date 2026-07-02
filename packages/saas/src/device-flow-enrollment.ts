@@ -64,6 +64,19 @@ const USER_CODE_FORMAT = "XXXX-XXXX";
  */
 const DEVICE_CODE_BYTES = 32;
 
+/**
+ * How often the in-memory store's background sweeper runs (default 60s).
+ */
+const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * How long past `expiresAt` an enrollment is retained before eviction
+ * (default 5 min). A grace window so a plugin polling shortly after expiry
+ * still observes the correct `expired_token` error rather than the confusing
+ * `invalid_device_code` ("not found"). After the window the record is reclaimed.
+ */
+const DEFAULT_RETENTION_MS = 300_000;
+
 // ---------------------------------------------------------------------------
 // Enrollment store interface
 // ---------------------------------------------------------------------------
@@ -101,14 +114,93 @@ export interface EnrollmentStore {
 }
 
 /**
+ * Options for {@link MemoryEnrollmentStore}.
+ */
+export type MemoryEnrollmentStoreOptions = {
+  /** Background sweep cadence in ms. Default 60_000. */
+  sweepIntervalMs?: number;
+  /**
+   * Retention past `expiresAt` before an enrollment is evicted, in ms.
+   * Default 300_000 (5 min grace window). See {@link DEFAULT_RETENTION_MS}.
+   */
+  retentionMs?: number;
+  /**
+   * Start the background interval sweeper automatically (default `true`).
+   * Set `false` in tests that want to drive {@link MemoryEnrollmentStore.sweep}
+   * deterministically without a live timer.
+   */
+  autoSweep?: boolean;
+};
+
+/**
  * In-memory enrollment store implementation.
  *
  * Suitable for single-process deployments. For multi-process, use a persistent
  * store (Redis, database, etc.) that implements the EnrollmentStore interface.
+ *
+ * Review 2026-07-02 (A1): a background TTL sweeper bounds memory. Without it the
+ * `enrollments`/`userCodeIndex` maps grew forever — expired, denied, and consumed
+ * records were never removed and `deleteEnrollment` had no caller — so an
+ * UNAUTHENTICATED `/enroll` endpoint was an OOM vector (each request added an
+ * entry that never left). The sweeper evicts every record once its `expiresAt`
+ * plus a grace window has elapsed, regardless of status, so a long-lived issuer's
+ * footprint stays bounded even under sustained (or hostile) enrollment traffic.
  */
 export class MemoryEnrollmentStore implements EnrollmentStore {
   private readonly enrollments = new Map<string, PendingEnrollment>();
   private readonly userCodeIndex = new Map<string, string>(); // user_code -> device_code
+  private readonly retentionMs: number;
+  private readonly sweepIntervalMs: number;
+  private sweepTimer: ReturnType<typeof setInterval> | undefined;
+
+  constructor(options: MemoryEnrollmentStoreOptions = {}) {
+    this.retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
+    this.sweepIntervalMs = options.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
+    if (options.autoSweep ?? true) this.startSweeper();
+  }
+
+  /**
+   * Evict every enrollment whose retention window (`expiresAt + retentionMs`)
+   * has fully elapsed, in BOTH maps. Pure and deterministic — pass `now` in
+   * tests. Returns the number of records evicted. Deleting from a Map during
+   * its own iteration is well-defined in JS.
+   */
+  sweep(now: number = Date.now()): number {
+    let evicted = 0;
+    for (const [deviceCode, enrollment] of this.enrollments) {
+      if (now > enrollment.expiresAt + this.retentionMs) {
+        this.userCodeIndex.delete(enrollment.user_code);
+        this.enrollments.delete(deviceCode);
+        evicted++;
+      }
+    }
+    return evicted;
+  }
+
+  /**
+   * Start the background sweeper. The timer is `unref`'d so it NEVER keeps the
+   * process alive on its own (a long-lived issuer exits cleanly on SIGINT).
+   * Idempotent.
+   */
+  startSweeper(): void {
+    if (this.sweepTimer) return;
+    const timer = setInterval(() => {
+      this.sweep();
+    }, this.sweepIntervalMs);
+    if (typeof timer.unref === "function") timer.unref();
+    this.sweepTimer = timer;
+  }
+
+  /**
+   * Stop the background sweeper. Call on shutdown (or in tests that started it).
+   * Idempotent.
+   */
+  close(): void {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = undefined;
+    }
+  }
 
   async saveEnrollment(enrollment: PendingEnrollment): Promise<void> {
     this.enrollments.set(enrollment.device_code, enrollment);

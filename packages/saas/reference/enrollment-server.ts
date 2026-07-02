@@ -1136,6 +1136,7 @@ server.listen(PORT, () => {
 // Graceful shutdown
 process.on("SIGINT", () => {
   console.log("\n\nShutting down server...");
+  enrollmentStore.close(); // stop the A1 background sweeper
   server.close(() => {
     console.log("Server stopped");
     process.exit(0);

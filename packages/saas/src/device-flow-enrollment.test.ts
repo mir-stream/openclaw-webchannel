@@ -383,6 +383,52 @@ describe("DeviceFlowEnrollment", () => {
       const deleted = await store.getEnrollment(pending.device_code);
       expect(deleted).toBeNull();
     });
+
+    // ── A1: TTL sweeper bounds memory (review 2026-07-02) ──────────────────
+    // makePending() has expiresAt = 601_000; default retention = 300_000, so a
+    // record is eligible for eviction once now > 901_000.
+
+    it("sweep() evicts records past expiresAt + retention from BOTH maps", async () => {
+      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      const pending = makePending();
+      await store.saveEnrollment(pending);
+
+      // Just past expiry but INSIDE the grace window — retained so a late poll
+      // still sees `expired_token`.
+      expect(store.sweep(601_001)).toBe(0);
+      expect(await store.getEnrollment(pending.device_code)).not.toBeNull();
+
+      // Past the retention window — evicted from both the device-code map and
+      // the user-code index.
+      expect(store.sweep(901_001)).toBe(1);
+      expect(await store.getEnrollment(pending.device_code)).toBeNull();
+      expect(await store.getEnrollmentByUserCode(pending.user_code)).toBeNull();
+    });
+
+    it("sweep() leaves not-yet-stale records untouched", async () => {
+      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      const fresh = makePending({ device_code: "fresh", user_code: "FRESH" });
+      const stale = makePending({
+        device_code: "stale",
+        user_code: "STALE",
+        expiresAt: 100, // long past; 100 + 300_000 < now below
+      });
+      await store.saveEnrollment(fresh);
+      await store.saveEnrollment(stale);
+
+      const evicted = store.sweep(601_000); // stale eligible, fresh not
+      expect(evicted).toBe(1);
+      expect(await store.getEnrollment("stale")).toBeNull();
+      expect(await store.getEnrollment("fresh")).not.toBeNull();
+    });
+
+    it("close() is idempotent and stops the sweeper", () => {
+      const store = new MemoryEnrollmentStore(); // autoSweep on by default
+      expect(() => {
+        store.close();
+        store.close();
+      }).not.toThrow();
+    });
   });
 
   describe("User code generation", () => {
