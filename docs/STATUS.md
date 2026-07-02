@@ -75,13 +75,16 @@ this file, **this file is correct.**
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
-| **Stability/security hardening (review 2026-07-02)** | Full-code review found deploy-blocking issues on the live NATS path — notably **C1** (a listener-less `emit("error")` can crash the whole gateway process) and **A1** (unauthenticated `/enroll` grows unbounded → OOM), plus **C2** (the E2E handshake is unauthenticated → active-relay MITM; accepted-risk while the relay is self-operated). Full findings, verification status, and fix order: [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md). C2 backlog: [`BACKLOG.md`](BACKLOG.md). |
+| **Stability/security hardening (review 2026-07-02)** | Full-code review found deploy-blocking issues on the live NATS path. **FIXED (develop, uncommitted-upstream):** **C1** gateway-crash guard, **S1** auto-reconnect, **A1** `/enroll` OOM sweeper, plus ops **O1** (CI gate on dev branches), **O3** (smoke refuse-by-default), **O-min8** (flaky port-scan). **Still open:** **C2** (E2E handshake unauthenticated → active-relay MITM; accepted-risk while the relay is self-operated, hard-blocker before a third-party relay — code milestone-gated) and the un-started findings (S2/S3, A2/A3, CL1-3, SEC1-5, J8, …). Full findings + per-item FIXED status: [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md). C2 backlog: [`BACKLOG.md`](BACKLOG.md). |
 
 > The live NATS E2E path (browser → NATS → plugin/agent → reply → browser) is the production
 > default and has run end-to-end on real hardware (split host/container, real JWT-auth
 > `nats-server`, real LLM) — the **happy path is proven**. What the 2026-07-02 review surfaced is
 > **operational hardening under stress** (server restart, connection churn, long uptime) rather
-> than happy-path gaps: see the row above and [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md).
+> than happy-path gaps: see the row above and [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md). The
+> top-severity items (crash on error emit, no reconnect, `/enroll` OOM) are now fixed; the
+> remaining work is C2 (relay MITM, accepted-risk) plus deeper hardening (map eviction, JWKS
+> cache, idempotent approve, client terminal-error surfacing).
 > Separately, full removal of the legacy Gateway-WS transport is a structural cleanup (the
 > `hmac-ticket` auth strategy is already removed) — tracked in [`BACKLOG.md`](BACKLOG.md).
 
