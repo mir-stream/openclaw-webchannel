@@ -106,9 +106,13 @@ echo "[run-browser-jwt] echo server pid=$ECHO_PID"
 
 # 3. REAL bootstrap-server (real RS256 issuance + real JWKS). MUST be up before
 #    the gateway loads the plugin (which fetches its JWKS).
+#    NATS_URL: the SaaS is the rendezvous authority — the browser dials the
+#    relay URL the SaaS delivers (a placeholder default here would send the
+#    browser to wss://nats.example.com and the round-trip would never meet).
 PORT="$BOOTSTRAP_PORT" \
 SAAS_ISSUER="$SAAS_ISSUER" \
 SAAS_BASE_URL="http://127.0.0.1:$BOOTSTRAP_PORT" \
+NATS_URL="ws://127.0.0.1:$NATS_WS" \
   node --import tsx "$REPO/packages/saas/reference/bootstrap-server.ts" >"$OCH/bootstrap.log" 2>&1 &
 BOOT_PID=$!
 echo "[run-browser-jwt] bootstrap-server pid=$BOOT_PID — waiting for JWKS…"
@@ -161,16 +165,21 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
   },
   "channels": {
     "webchannel": {
-      "auth": {
-        "strategy": "jwt",
-        "jwt": {
-          "jwksUrl": "http://127.0.0.1:$BOOTSTRAP_PORT/.well-known/jwks.json",
-          "issuer": "$SAAS_ISSUER",
-          "audience": "$ACCOUNT_ID"
+      "accounts": {
+        "$ACCOUNT_ID": {
+          "tenant": "$TENANT",
+          "auth": {
+            "strategy": "jwt",
+            "jwt": {
+              "jwksUrl": "http://127.0.0.1:$BOOTSTRAP_PORT/.well-known/jwks.json",
+              "issuer": "$SAAS_ISSUER",
+              "audience": "$ACCOUNT_ID"
+            }
+          },
+          "dmSecurity": "allowlist",
+          "allowFrom": ["$PEER_ID"]
         }
-      },
-      "dmSecurity": "allowlist",
-      "allowFrom": ["$PEER_ID"]
+      }
     }
   }
 }
@@ -180,7 +189,6 @@ echo "[run-browser-jwt] wrote $OCH/.openclaw/openclaw.json"
 # 5. Boot the isolated gateway in dev/open-NATS + jwt mode.
 OPENCLAW_HOME="$OCH" HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_DEV_OPEN=1 WEBCHANNEL_NATS_URL=ws://127.0.0.1:$NATS_WS \
-  WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" \
   WEBCHANNEL_GW_URL=http://127.0.0.1:$GW_PORT \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &

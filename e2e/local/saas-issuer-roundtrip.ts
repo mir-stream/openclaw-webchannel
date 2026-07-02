@@ -22,7 +22,11 @@ const NATS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18322";
 const GW_URL = process.env.WEBCHANNEL_GW_URL ?? "http://127.0.0.1:18899";
 const BOOTSTRAP_URL = process.env.WEBCHANNEL_BOOTSTRAP_URL ?? "http://127.0.0.1:3911";
 
-const ACCOUNT_ID = "default-agent";
+// "default" = the account key a flat (single-account) channels.webchannel
+// config resolves to since the accounts refactor — the wire subject uses the
+// account key, so this must match the gateway side (see run-jwt-register.sh,
+// which uses the same flat-config + "default" pattern).
+const ACCOUNT_ID = "default";
 const TENANT = "default-tenant";
 // Fixed peerId so the gateway's dmSecurity allowlist can name it. The real
 // bootstrap-server accepts an optional peerId and threads it into the JWT `sub`.

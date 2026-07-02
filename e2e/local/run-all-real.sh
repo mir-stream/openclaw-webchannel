@@ -216,16 +216,21 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
   },
   "channels": {
     "webchannel": {
-      "auth": {
-        "strategy": "jwt",
-        "jwt": {
-          "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
-          "issuer": "$SAAS_ISSUER",
-          "audience": "$ACCOUNT_ID"
+      "accounts": {
+        "$ACCOUNT_ID": {
+          "tenant": "$TENANT",
+          "auth": {
+            "strategy": "jwt",
+            "jwt": {
+              "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
+              "issuer": "$SAAS_ISSUER",
+              "audience": "$ACCOUNT_ID"
+            }
+          },
+          "dmSecurity": "allowlist",
+          "allowFrom": ["$PEER_ID"]
         }
-      },
-      "dmSecurity": "allowlist",
-      "allowFrom": ["$PEER_ID"]
+      }
     }
   }
 }
@@ -277,6 +282,24 @@ fi
 CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
 [ -f "$CRED_FILE" ] || { echo "[run-all-real] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-all-real] ✓ credentials persisted at $CRED_FILE"
+
+# 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
+#      setup adapter writes the demo-proven block (`admission: "auto"`,
+#      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
+#      override that disables the HTTP register hop (no aud→account dispatch
+#      entry ⇒ challenge 401 "No account for token audience"), and this harness
+#      drives the register hop. Restore the pre-add intent.
+node -e '
+  const fs = require("fs");
+  const p = process.argv[1], acct = process.argv[2], peer = process.argv[3];
+  const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+  const a = cfg.channels.webchannel.accounts[acct];
+  a.nats = { ...(a.nats ?? {}), admission: "register-hop" };
+  a.dmSecurity = "allowlist";
+  a.allowFrom = [peer];
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+' "$OCH/.openclaw/openclaw.json" "$ACCOUNT_ID" "$PEER_ID"
+echo "[run-all-real] ✓ re-asserted admission=register-hop + dmSecurity=allowlist for account $ACCOUNT_ID"
 
 # ---------------------------------------------------------------------------
 # 6c. Boot the isolated gateway — CONSUME-ONLY. No acquisition env: identity

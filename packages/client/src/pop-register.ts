@@ -112,7 +112,10 @@ export async function registerWithPop(
     headers: authHeader,
   });
   if (!challengeRes.ok) {
-    throw new Error(`pop-register: challenge failed (HTTP ${challengeRes.status})`);
+    const body = await challengeRes.text().catch(() => "");
+    throw new Error(
+      `pop-register: challenge failed (HTTP ${challengeRes.status}${body ? `: ${body}` : ""})`,
+    );
   }
   const { nonce } = (await challengeRes.json()) as { nonce?: string };
   if (!nonce) throw new Error("pop-register: challenge response missing nonce");
