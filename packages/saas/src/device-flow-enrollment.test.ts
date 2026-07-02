@@ -422,6 +422,25 @@ describe("DeviceFlowEnrollment", () => {
       expect(await store.getEnrollment("fresh")).not.toBeNull();
     });
 
+    it("sweep() does not orphan a newer enrollment that reuses a swept user_code", async () => {
+      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      const old = makePending({
+        device_code: "old",
+        user_code: "SAME-CODE",
+        expiresAt: 100, // stale — eligible for eviction below
+      });
+      await store.saveEnrollment(old);
+      // A later enrollment collides on user_code: the index now points at
+      // "fresh". Sweeping "old" must NOT delete that index entry.
+      const fresh = makePending({ device_code: "fresh", user_code: "SAME-CODE" });
+      await store.saveEnrollment(fresh);
+
+      expect(store.sweep(601_000)).toBe(1); // evicts only "old"
+      expect(await store.getEnrollment("old")).toBeNull();
+      const byUserCode = await store.getEnrollmentByUserCode("SAME-CODE");
+      expect(byUserCode?.device_code).toBe("fresh");
+    });
+
     it("close() is idempotent and stops the sweeper", () => {
       const store = new MemoryEnrollmentStore(); // autoSweep on by default
       expect(() => {

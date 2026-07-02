@@ -193,6 +193,11 @@ export class NatsTransport extends EventEmitter {
    * process has ZERO new TCP sockets in LISTEN state.
    */
   connect(): Promise<void> {
+    // Re-arm auto-reconnect: an explicit connect() undoes a prior explicit
+    // disconnect(). Without this, a transport reused via disconnect() →
+    // connect() would silently lose S1 auto-reconnect forever (`closed` was
+    // only ever set, never cleared).
+    this.closed = false;
     this._connectSent = false;
     return new Promise<void>((resolve, reject) => {
       // ── Outbound WebSocket CLIENT connection ────────────────────────────
@@ -265,19 +270,28 @@ export class NatsTransport extends EventEmitter {
         // caller hasn't added a listener yet).
         if (!handshakeDone) {
           settle(err);
-        } else {
-          // Post-handshake error — emit to registered listeners.
+        } else if (this.ws === ws) {
+          // Post-handshake error — emit to registered listeners. Identity
+          // guard: after disconnect() (ws → null) or a newer connect(), this
+          // is a STALE socket's error — it must not touch the live state.
           this._connected = false;
           this.emitError(err);
         }
       });
 
       ws.on("close", () => {
+        // If the socket closed before the handshake completed, the promise
+        // is still pending — reject it. Always settle OUR OWN dial's promise,
+        // even if the transport has since moved on to a newer socket.
+        settle(new Error("NatsTransport: connection closed before NATS handshake"));
+        // Stale-socket guard: ws close events fire ASYNC, so after an explicit
+        // disconnect() (ws → null) or a newer connect() replaced this.ws, this
+        // close belongs to a PREVIOUS socket — it must not flip the live
+        // connection's state, emit a spurious "disconnect", or schedule a
+        // reconnect alongside the live socket.
+        if (this.ws !== ws) return;
         this._connected = false;
         this.emit("disconnect");
-        // If the socket closed before the handshake completed, the promise
-        // is still pending — reject it.
-        settle(new Error("NatsTransport: connection closed before NATS handshake"));
         // S1: auto-reconnect ONLY for an ESTABLISHED connection that dropped.
         // `handshakeDone` is per-socket, so a close during the INITIAL connect
         // (or a failed reconnect attempt's own handshake) does NOT schedule here
@@ -527,9 +541,19 @@ export class NatsTransport extends EventEmitter {
     const desiredSubjects = [...new Set(this.subs.values())];
     try {
       await this.connect();
-    } catch {
+    } catch (err) {
       // Handshake failed — the fresh socket's close handler won't reschedule
       // (its handshakeDone stayed false), so we do it here with backoff.
+      // Throttled visibility: an outage that outlives the backoff cap retries
+      // forever (maxReconnectAttempts defaults to Infinity) — e.g. a JWT that
+      // expired during a long outage fails every attempt — and would otherwise
+      // do so in total silence. Log the 1st and every 10th failed attempt.
+      if (this.reconnectAttempts === 1 || this.reconnectAttempts % 10 === 0) {
+        console.error(
+          `[NatsTransport] reconnect attempt ${this.reconnectAttempts} failed: ` +
+            `${err instanceof Error ? err.message : String(err)} — retrying with backoff`,
+        );
+      }
       this.scheduleReconnect();
       return;
     }

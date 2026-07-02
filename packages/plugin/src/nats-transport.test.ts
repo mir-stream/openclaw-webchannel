@@ -619,6 +619,28 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
     expect(instances.length).toBe(1);
   });
 
+  it("connect() after an explicit disconnect() re-arms auto-reconnect", async () => {
+    const { t, instances } = makeReconnectTransport();
+    teardown.push(t);
+
+    const cp1 = t.connect();
+    completeHandshake(instances[0]!);
+    await cp1;
+    t.disconnect(); // sets `closed` — reconnect disarmed
+
+    // Explicit reuse: connect() must clear `closed`, or auto-reconnect would
+    // be silently lost for the rest of the transport's life.
+    const cp2 = t.connect();
+    completeHandshake(instances[1]!);
+    await cp2;
+    expect(t.connected).toBe(true);
+
+    instances[1]!.close(); // the re-established connection drops
+    await waitFor(() => instances.length === 3); // auto-reconnect re-dialed
+    completeHandshake(instances[2]!);
+    await waitFor(() => t.connected === true);
+  });
+
   it("does NOT reconnect when reconnect is disabled (default)", async () => {
     const { t, fakeWs } = makeTestTransport();
     teardown.push(t);

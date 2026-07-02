@@ -573,15 +573,21 @@ export default defineChannelPluginEntry({
         if (consumed.connection.enrolled) enrolled = consumed.connection.enrolled;
         // Review 2026-07-02 (C1): attach a post-handshake "error" listener so a
         // transient NATS failure (server restart → TCP reset; a post-connect
-        // `-ERR Permissions Violation`) is logged with account context and
-        // transitions this account to disconnected — instead of crashing the
-        // WHOLE gateway process. NatsTransport also self-guards against a
-        // missing listener, but attaching one here gives structured operator
-        // logging and is the seam a future reconnect (S1) hooks into.
+        // `-ERR Permissions Violation`) is logged with account context —
+        // instead of crashing the WHOLE gateway process. NatsTransport also
+        // self-guards against a missing listener, but attaching one here gives
+        // structured operator logging.
         transport.on("error", (err: Error) => {
           (api.logger?.error ?? console.error)?.(
             `[webchannel] account "${accountId}" NATS transport error: ${err.message} ` +
-              `(connection dropped; account will not serve until the gateway reconnects)`,
+              `(connection dropped; auto-reconnect with backoff is active — S1)`,
+          );
+        });
+        // S1: log recovery too — without this the operator sees the drop but
+        // never learns the account healed itself.
+        transport.on("reconnect", () => {
+          (api.logger?.info ?? console.log)?.(
+            `[webchannel] account "${accountId}" NATS connection re-established; subscriptions replayed`,
           );
         });
       } catch (err) {

@@ -169,7 +169,13 @@ export class MemoryEnrollmentStore implements EnrollmentStore {
     let evicted = 0;
     for (const [deviceCode, enrollment] of this.enrollments) {
       if (now > enrollment.expiresAt + this.retentionMs) {
-        this.userCodeIndex.delete(enrollment.user_code);
+        // Only drop the user-code index entry if it still points at THIS
+        // record: on a user_code collision, saveEnrollment overwrote the index
+        // with a newer enrollment's device_code — deleting unconditionally
+        // here would orphan that live record (unreachable by user_code).
+        if (this.userCodeIndex.get(enrollment.user_code) === deviceCode) {
+          this.userCodeIndex.delete(enrollment.user_code);
+        }
         this.enrollments.delete(deviceCode);
         evicted++;
       }
