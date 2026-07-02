@@ -201,6 +201,46 @@ function makeAnonymousVerifier(logger?: AuthLogger): ConnectionVerifier {
  * rejections (AC5), so a flaky IdP degrades connection establishment rather
  * than silently authenticating with a stale key.
  */
+/**
+ * S3: one long-lived {@link JWKSCache} per account auth config.
+ *
+ * The live NATS register/challenge routes call `verifyJwtAndExtractIdentity`
+ * per pairing. Building a fresh empty cache each call defeated the 5-minute TTL,
+ * so every pairing (and every reconnect storm) turned into 2+ JWKS fetches
+ * against the IdP — the IdP became a per-request hot dependency.
+ *
+ * Keyed on the `JwtAuthConfig` object identity: each account's `auth` block is a
+ * stable reference for the plugin's lifetime, so this yields exactly one cache
+ * per account, shared by the challenge route and the register route. The WeakMap
+ * lets the cache be collected when the account config is (no manual eviction).
+ */
+const jwksCacheByAuthConfig = new WeakMap<JwtAuthConfig, JWKSCache>();
+
+function jwksCacheFor(config: JwtAuthConfig): JWKSCache {
+  let cache = jwksCacheByAuthConfig.get(config);
+  if (cache === undefined) {
+    // `JWKSCache.create` enforces the "exactly one source" invariant; calling it
+    // here (rather than on every upgrade) means a misconfig still fails on the
+    // FIRST use — which for the WS path is plugin load — instead of silently
+    // deferring the throw to each request.
+    cache = JWKSCache.create(
+      {
+        jwksUrl: config.jwt.jwksUrl,
+        jwksFile: config.jwt.jwksFile,
+        jwks: config.jwt.jwks,
+      },
+      // `_fetchImpl` is a test-only escape hatch: when set, the JWKSCache uses
+      // the injected function instead of `globalThis.fetch`. This lets unit
+      // tests simulate a JWKS server response without opening a real socket.
+      config.jwt._fetchImpl !== undefined
+        ? { fetchImpl: config.jwt._fetchImpl }
+        : undefined,
+    );
+    jwksCacheByAuthConfig.set(config, cache);
+  }
+  return cache;
+}
+
 function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
   const jwtCfg = config.jwt;
   if (!jwtCfg || typeof jwtCfg !== "object") {
@@ -218,27 +258,11 @@ function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
       "webchannel: channels.webchannel.auth.jwt.audience is required (strategy=\"jwt\"). Refusing to start.",
     );
   }
-  // Exactly one JWKS source must be supplied. `JWKSCache.create` enforces
-  // this; we call it once here so a misconfig fails at plugin load instead of
-  // every upgrade.
-  const jwksCache = JWKSCache.create(
-    {
-      jwksUrl: jwtCfg.jwksUrl,
-      jwksFile: jwtCfg.jwksFile,
-      jwks: jwtCfg.jwks,
-    },
-    // 5-minute TTL is the documented default; tests / operators can override
-    // by passing a `ttlMs` — but the operator-facing schema (see
-    // openclaw.plugin.json) doesn't expose `ttlMs` yet; that's an intentional
-    // narrowing for v1.
-    //
-    // `_fetchImpl` is a test-only escape hatch: when set, the JWKSCache uses
-    // the injected function instead of `globalThis.fetch`. This lets unit tests
-    // simulate a JWKS server response without opening a real network socket.
-    jwtCfg._fetchImpl !== undefined
-      ? { fetchImpl: jwtCfg._fetchImpl }
-      : undefined,
-  );
+  // Exactly one JWKS source must be supplied. `jwksCacheFor` calls
+  // `JWKSCache.create` (which enforces this) once per account and memoizes the
+  // result, so a misconfig fails at plugin load instead of every upgrade, and
+  // the 5-minute TTL is honored across upgrades rather than reset each time.
+  const jwksCache = jwksCacheFor(config);
   const ticketParam = config.ticketParam ?? "ticket";
   const issuer = jwtCfg.issuer;
   const audience = jwtCfg.audience;
@@ -348,17 +372,10 @@ export async function verifyJwtAndExtractIdentity(
     throw new Error("webchannel: auth.jwt block is required for JWT verification");
   }
 
-  // Build JWKS cache
-  const jwksCache = JWKSCache.create(
-    {
-      jwksUrl: jwtCfg.jwt.jwksUrl,
-      jwksFile: jwtCfg.jwt.jwksFile,
-      jwks: jwtCfg.jwt.jwks,
-    },
-    jwtCfg.jwt._fetchImpl !== undefined
-      ? { fetchImpl: jwtCfg.jwt._fetchImpl }
-      : undefined,
-  );
+  // S3: reuse the account's long-lived JWKS cache (keyed on this config object)
+  // instead of rebuilding an empty one per register/challenge call, which
+  // defeated the TTL and re-fetched the IdP on every pairing.
+  const jwksCache = jwksCacheFor(jwtCfg);
 
   // Verify JWT
   const identity = await verifyJwt(jwt, {

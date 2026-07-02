@@ -4,6 +4,7 @@ import { webcrypto } from "node:crypto";
 
 import {
   resolveVerifier,
+  verifyJwtAndExtractIdentity,
   type AuthConfig,
   type AuthLogger,
 } from "./auth.js";
@@ -198,5 +199,87 @@ describe("jwt strategy (AC2 — happy path)", () => {
       jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rsaJwks },
     });
     expect(await verifier(fakeReq("/webchannel/ws"))).toBeNull();
+  });
+});
+
+describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", () => {
+  beforeAll(async () => {
+    await ensureRsaKeys();
+  });
+
+  /** A JWKS-URL fetch impl that counts how many times the IdP is hit. */
+  function countingFetch(): { impl: typeof fetch; count: () => number } {
+    let calls = 0;
+    const impl = (async () => {
+      calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => rsaJwks,
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return { impl, count: () => calls };
+  }
+
+  it("reuses one cache across register/challenge calls sharing the same auth config", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signRs256({
+      iss: ISSUER,
+      aud: AUDIENCE,
+      sub: "user-cache",
+      iat: now,
+      exp: now + 60,
+    });
+    const { impl, count } = countingFetch();
+    // One stable config object == one account. The live NATS path calls
+    // verifyJwtAndExtractIdentity per pairing with THIS same object.
+    const authConfig: AuthConfig = {
+      strategy: "jwt",
+      jwt: {
+        issuer: ISSUER,
+        audience: AUDIENCE,
+        jwksUrl: "https://idp.test/jwks.json",
+        _fetchImpl: impl,
+      },
+    };
+
+    const first = await verifyJwtAndExtractIdentity(token, authConfig);
+    const second = await verifyJwtAndExtractIdentity(token, authConfig);
+    const third = await verifyJwtAndExtractIdentity(token, authConfig);
+
+    expect(first?.peerId).toBe("user-cache");
+    expect(second?.peerId).toBe("user-cache");
+    expect(third?.peerId).toBe("user-cache");
+    // Before S3 every call rebuilt an empty cache → 3 fetches. Now the TTL is
+    // honored across calls: the IdP is hit exactly once.
+    expect(count()).toBe(1);
+  });
+
+  it("keeps a separate cache per distinct auth config object (accounts don't share)", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signRs256({
+      iss: ISSUER,
+      aud: AUDIENCE,
+      sub: "user-b",
+      iat: now,
+      exp: now + 60,
+    });
+    const a = countingFetch();
+    const b = countingFetch();
+    const configA: AuthConfig = {
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, audience: AUDIENCE, jwksUrl: "https://idp.test/jwks.json", _fetchImpl: a.impl },
+    };
+    const configB: AuthConfig = {
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, audience: AUDIENCE, jwksUrl: "https://idp.test/jwks.json", _fetchImpl: b.impl },
+    };
+
+    await verifyJwtAndExtractIdentity(token, configA);
+    await verifyJwtAndExtractIdentity(token, configB);
+
+    // Each account's config keys its own cache — one fetch apiece, no bleed.
+    expect(a.count()).toBe(1);
+    expect(b.count()).toBe(1);
   });
 });
