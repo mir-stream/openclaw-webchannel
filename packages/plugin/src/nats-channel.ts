@@ -33,6 +33,18 @@ import {
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Plain byte-equality for two locally-derived session keys. NOT constant-time —
+ * this only decides whether a handshake produced a NEW session (fire the initial
+ * snapshot) or a duplicate (skip it); both operands are values the agent computed
+ * itself, so there is no secret to leak by timing.
+ */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 export type InboundWsMessage =
   | { type: "user_message"; text: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
@@ -492,6 +504,12 @@ export class NatsChannel {
       return;
     }
     const sessionKey = deriveConversationKey(this.agentKeyPair.privateKey, browserPubKey);
+    // Capture the prior key BEFORE we overwrite it, to decide whether this is a
+    // NEW session (fresh key) or a duplicate handshake (client republished the
+    // same key_exchange — e.g. the browser's bounded handshake retry when the
+    // first frame was dropped, or a relay RTT > the retry interval). Only a new
+    // session should trigger the initial history snapshot below.
+    const prevKey = this.peerSessionKeys.get(peerId);
     // S2: this is the ONLY writer of peerSessionKeys and — on the wildcard /
     // `admission:"auto"` path (the live gateway's mode), where peers never call
     // registerPeer — the only per-peer growth vector at all. So the session-key
@@ -523,8 +541,18 @@ export class NatsChannel {
     console.log(`[nats-channel] Completed handshake with peer ${peerId}`);
     // Session key is now established → the initial history snapshot can finally
     // be encrypted to this peer. (Sent from here, not the register hop, which
-    // runs before the handshake — see setHandshakeCompleteHandler.)
-    this.onHandshakeComplete?.(peerId);
+    // runs before the handshake — see setHandshakeCompleteHandler.) TWO guards:
+    //  1. REGISTERED peers only (`peerSubscriptions` — the register-hop / PoP-
+    //     authenticated path). The wildcard / `admission:"auto"` path never calls
+    //     registerPeer, so a peer there is unauthenticated (any tenant-creds holder
+    //     can handshake for any peerId); it must NOT receive stored history.
+    //  2. NEW session key only — a duplicate handshake (client retry / RTT race)
+    //     derives the SAME key, so we skip re-sending the whole backlog. A genuine
+    //     reconnect brings a fresh browser key → new session → re-hydrates.
+    const isNewSession = !prevKey || !bytesEqual(prevKey, sessionKey);
+    if (this.peerSubscriptions.has(peerId) && isNewSession) {
+      this.onHandshakeComplete?.(peerId);
+    }
   }
 
   /**

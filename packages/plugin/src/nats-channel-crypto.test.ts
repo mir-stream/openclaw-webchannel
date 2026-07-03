@@ -30,6 +30,18 @@ import {
 // In-memory NATS broker (echo:false, exact-subject routing)
 // ---------------------------------------------------------------------------
 
+/** NATS subject match: `*` matches one token, `>` matches the rest. */
+function subjectMatches(pattern: string, subject: string): boolean {
+  const p = pattern.split(".");
+  const s = subject.split(".");
+  for (let i = 0; i < p.length; i++) {
+    if (p[i] === ">") return true;
+    if (i >= s.length) return false;
+    if (p[i] !== "*" && p[i] !== s[i]) return false;
+  }
+  return p.length === s.length;
+}
+
 class FakeBroker {
   readonly clients: FakeTransport[] = [];
   register(t: FakeTransport): void {
@@ -68,7 +80,7 @@ class FakeTransport extends EventEmitter {
     this.broker.route(subject, buf, this);
   }
   matches(subject: string): boolean {
-    for (const s of this.subs.values()) if (s === subject) return true;
+    for (const s of this.subs.values()) if (subjectMatches(s, subject)) return true;
     return false;
   }
   deliver(subject: string, payload: Buffer): void {
@@ -99,7 +111,7 @@ type Harness = {
   doHandshake: () => void;
 };
 
-function makeHarness(): Harness {
+function makeHarness(opts: { admission?: "register" | "wildcard" } = {}): Harness {
   const broker = new FakeBroker();
 
   // Agent transport + crypto channel.
@@ -116,7 +128,11 @@ function makeHarness(): Harness {
     // Echo a reply so we can verify the outbound seal path.
     channel.sendText(_peer, `reply:${msg.type === "user_message" ? msg.text : ""}`);
   });
-  channel.registerPeer(PEER);
+  if (opts.admission === "wildcard") {
+    channel.subscribeWildcard(); // `admission:"auto"` — no per-peer registerPeer
+  } else {
+    channel.registerPeer(PEER);
+  }
 
   // Passive wiretap (the untrusted relay's vantage point).
   const wiretap = new FakeTransport(broker);
@@ -208,6 +224,35 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     expect(h.browserReplies).toEqual([
       { type: "history", messages: [{ id: "m1", role: "user", text: "earlier turn" }] },
     ]);
+  });
+
+  it("does NOT re-fire the snapshot for a duplicate handshake (client retry / RTT race)", () => {
+    const h = makeHarness();
+    const firedFor: string[] = [];
+    h.channel.setHandshakeCompleteHandler((peerId) => firedFor.push(peerId));
+
+    // Same browser key republished (the bounded handshake retry, or two frames
+    // both arriving on a relay slower than the retry interval).
+    h.doHandshake();
+    h.doHandshake();
+
+    // Derives the SAME session key both times → snapshot fires exactly once, so
+    // the browser is not spammed with a duplicate backlog.
+    expect(firedFor).toEqual([PEER]);
+  });
+
+  it("does NOT fire the snapshot for an unregistered (wildcard/auto) peer — no at-rest history to an unauthenticated peer", () => {
+    const h = makeHarness({ admission: "wildcard" });
+    const firedFor: string[] = [];
+    h.channel.setHandshakeCompleteHandler((peerId) => firedFor.push(peerId));
+
+    h.doHandshake();
+
+    // The handshake completes (live chat still works on the wildcard path), but
+    // the peer never went through the PoP register hop, so the initial stored-
+    // history snapshot MUST NOT be sent to it.
+    expect(h.browserSessionKey()).not.toBeNull();
+    expect(firedFor).toEqual([]);
   });
 
   it("only ever puts ciphertext on the wire (relay sees no plaintext)", () => {
