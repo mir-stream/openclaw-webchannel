@@ -37,6 +37,8 @@
 
 import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../packages/saas/src/device-flow-enrollment.js";
 import { loadOrCreateTrustChain } from "../packages/saas/src/persistent-trust-chain.js";
+import { generateRsaKeypair } from "../packages/saas/src/setup-trust-chain.js";
+import type { JwkRsaPublicKey } from "../packages/saas/src/types.js";
 import { buildBootstrapClaims } from "../packages/saas/src/bootstrap-claims.js";
 import {
   DemoUserDirectory,
@@ -139,8 +141,15 @@ if (NATS_CONFIG_OUT) {
 // RS256 bootstrap-JWT signing — reuses THIS SaaS's trust chain RSA key.
 // ---------------------------------------------------------------------------
 
-const bootstrapRsaPrivateKey = await importRsaPrivateKeyFromPem(privateChain.rsaPrivateKeyPem);
-const bootstrapKid = trustChain.kid;
+// Active bootstrap-JWT signer + the served JWKS. Both are MUTABLE so the demo
+// can rotate the signing key at runtime (Phase 5 aside). `jwksKeys` is what
+// `/.well-known/jwks.json` serves; the active signer is always jwksKeys[0]'s
+// private half. On rotation a fresh key is prepended (grace: old kids still
+// verify → zero downtime) and, when evicted, older kids drop out of the JWKS so
+// a JWT under them fails closed at the gateway (plugin refetch finds no kid).
+let activeSigner = await importRsaPrivateKeyFromPem(privateChain.rsaPrivateKeyPem);
+let activeKid = trustChain.kid;
+let jwksKeys: JwkRsaPublicKey[] = [...trustChain.jwks.keys];
 
 async function importRsaPrivateKeyFromPem(pem: string): Promise<webcrypto.CryptoKey> {
   const body = pem
@@ -158,15 +167,38 @@ async function importRsaPrivateKeyFromPem(pem: string): Promise<webcrypto.Crypto
 }
 
 async function signBootstrapJwt(payload: Record<string, unknown>): Promise<string> {
-  const header = { alg: "RS256", typ: "JWT", kid: bootstrapKid };
+  const header = { alg: "RS256", typ: "JWT", kid: activeKid };
   const b64urlJson = (obj: unknown): string => Buffer.from(JSON.stringify(obj)).toString("base64url");
   const signingInput = `${b64urlJson(header)}.${b64urlJson(payload)}`;
   const sig = await webcrypto.subtle.sign(
     { name: "RSASSA-PKCS1-v1_5" },
-    bootstrapRsaPrivateKey,
+    activeSigner,
     new TextEncoder().encode(signingInput),
   );
   return `${signingInput}.${Buffer.from(new Uint8Array(sig)).toString("base64url")}`;
+}
+
+/**
+ * Rotate the RS256 bootstrap signing key. Mints a fresh RSA key + kid, makes it
+ * the active signer, and republishes the JWKS.
+ *
+ * - grace (default): the new key is PREPENDED, prior keys stay in the JWKS, so a
+ *   JWT under any still-published kid keeps verifying — zero-downtime rotation.
+ * - evictPrevious: the JWKS is reduced to ONLY the new key, so a JWT signed under
+ *   a now-evicted kid is rejected (the gateway's JWKS cache refetches once, still
+ *   can't find the kid, and fails closed).
+ *
+ * Only the RS256 key rotates; the NATS account seed (and thus every enrolled
+ * agent's NKEY creds) is untouched, so live NATS sessions are unaffected.
+ */
+async function rotateSigningKey(evictPrevious: boolean): Promise<{ kid: string; jwksKids: string[] }> {
+  const fresh = await generateRsaKeypair();
+  activeSigner = await importRsaPrivateKeyFromPem(fresh.privateKeyPem);
+  activeKid = fresh.kid;
+  jwksKeys = evictPrevious ? [fresh.publicKeyJwk] : [fresh.publicKeyJwk, ...jwksKeys];
+  const jwksKids = jwksKeys.map((k) => k.kid);
+  console.log(`[rotate] active kid=${activeKid} evictPrevious=${evictPrevious} jwks=[${jwksKids.join(", ")}]`);
+  return { kid: activeKid, jwksKids };
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +426,7 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (path === "/.well-known/jwks.json" && req.method === "GET") {
-      sendJson(res, trustChain.jwks);
+      sendJson(res, { keys: jwksKeys });
       return;
     }
 
@@ -609,6 +641,27 @@ const server = createServer(async (req, res) => {
               sendJson(res, { error: "Internal server error" }, 500);
             });
         }
+        return;
+      }
+
+      // GET /admin/signing-key — current active kid + the kids published in JWKS.
+      if (req.method === "GET" && path === "/admin/signing-key") {
+        return sendJson(res, { activeKid, jwksKids: jwksKeys.map((k) => k.kid) });
+      }
+      // POST /admin/rotate-key — rotate the RS256 bootstrap signing key (Phase 5
+      // aside). Body { evictPrevious?: boolean }: grace (default) keeps old kids
+      // in the JWKS for zero-downtime rotation; evict drops them so a JWT under an
+      // old kid is rejected. Only the RS256 key rotates — NATS creds are untouched.
+      if (req.method === "POST" && path === "/admin/rotate-key") {
+        parseJsonBody(req, (body) => {
+          const evictPrevious = Boolean((body as { evictPrevious?: unknown } | null)?.evictPrevious);
+          rotateSigningKey(evictPrevious)
+            .then((r) => sendJson(res, { ok: true, ...r }))
+            .catch((err) => {
+              console.error("[admin/rotate-key] Error:", err);
+              sendJson(res, { error: "Internal server error" }, 500);
+            });
+        });
         return;
       }
 
