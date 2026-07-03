@@ -11,8 +11,11 @@
 >
 > **⚠️ Re-anchored 2026-07-03.** The integrated showcase demo rewrote the demo surface (now
 > `demo/web/src/widget.ts` over the `WebChannelNATSClient` reducer). **P1-7 (error/reconnect UX) is
-> mostly built** by that work (marked ✅). Markdown/media/reasoning/doctor remain open. `file:line`
-> re-pointed at the current tree.
+> mostly built** by that work (marked ✅). Markdown/media/reasoning/doctor remain open.
+>
+> **⚠️ Line numbers drift.** The demo is still being built, so `file:line` anchors are approximate
+> and keep moving — trust the file + symbol name and search if a line has shifted. Not re-anchored
+> per demo change.
 >
 > **Classification.** 🔴 missing entirely · 🟡 client-render-done / server-left · 🟢 partial polish ·
 > ✅ built by the integrated demo (number retained as anchor).

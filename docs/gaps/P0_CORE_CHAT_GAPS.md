@@ -10,8 +10,11 @@
 >
 > **⚠️ Re-anchored 2026-07-03.** The integrated showcase demo rewrote the demo surface. The demo
 > now drives the production `WebChannelNATSClient` state reducer, so **most P0 client render is
-> built** (marked ✅). Every `file:line` below points at the current tree. What remains is
-> server-side (P0-2/5/6) or net-new (P0-3/7).
+> built** (marked ✅). What remains is server-side (P0-2/5/6) or net-new (P0-3/7).
+>
+> **⚠️ Line numbers drift.** The demo is still being built, so `file:line` anchors are approximate
+> and keep moving — trust the file + symbol name and search if a line has shifted. Not re-anchored
+> per demo change.
 >
 > **How to read each gap.** *Symptom → Classification → Where it stands today (`file:line`) →
 > Telegram reference (`file:line`) → Implementation sketch → Acceptance.*
@@ -53,7 +56,7 @@ The **server/agent side (NATS path)** lives in the package-root composition entr
 
 | Capability | Emit (`nats-channel.ts`) | Wired in `index-nats.ts` (root) |
 |---|---|---|
-| history snapshot on connect | `sendHistory()` `:302` | on-liveness `historyRecent`→`sendHistory` `:713-716` |
+| history snapshot on connect | `sendHistory()` | **from the register route** (stateless): `historyRecent`→`sendHistory`, detached read |
 | history pagination | — | `setLoadHistoryHandler` `:677` → `historyPageBefore` `:686` → `sendHistory` `:689` |
 | typing | `sendTyping()` `:294` (⚠️ ungated on NATS — see P0-6) | `inbound.ts:145` |
 | streaming draft | `sendProgress()` `:279` / `finalizeDraft()` `:287` | `inbound.ts:109-269` (gated on `streaming.mode:"progress"`) |
@@ -107,8 +110,12 @@ Our plugin already imports `openclaw/plugin-sdk/channel-core` (`inbound.ts`, `ch
 it; the widget renders it.
 
 **Where it stands today.**
-- Server sends a snapshot on first liveness: `index-nats.ts:713-716`
-  (`historyRecent(api, route.sessionKey, historyConfig.limit, …)` → `channel.sendHistory(peerId, messages)`).
+- Server sends the snapshot **from the register route** (Phase 6 stateless-register change — it used
+  to fire on first liveness / handshake-complete, that wiring is now gone). Every register (first
+  join, reload, reconnect) gets the bounded snapshot: `historyRecent(api, route.sessionKey,
+  historyConfig.limit, …)` → `channel.sendHistory(peerId, messages)`, run as a detached read
+  (`runDetachedHistoryRead`) so it authorizes against a synthetic operator client. The client's
+  message-id-idempotent hydration absorbs the duplicate snapshots across reconnects.
 - `historyRecent` reads the openclaw session store: `src/history.ts` (`recent`, config via
   `resolveHistoryConfig` `:35`).
 - Wire frame: `{ type:"history"; messages:[{id,role,text,ts}] }`.
@@ -127,10 +134,11 @@ the source of truth and the server reads it.
 **Acceptance (met).** Send 2 messages → reload → both prior turns + agent replies reappear in
 order; no duplicate bubbles on a mid-session reconnect.
 
-**Watch out.** The snapshot fires on first liveness (`onFirstLiveness`), which requires the register
-hop. `demo/run.sh` runs register-hop (`accounts.<acct>.nats.admission="register-hop"`,
-`run.sh:254`), so the trigger fires. If you switch to `admission:"auto"`, re-confirm the snapshot
-trigger.
+**Watch out.** The snapshot now fires **inside the register route**, so it requires the register hop.
+`demo/run.sh` runs register-hop (`accounts.<acct>.nats.admission="register-hop"`), so the trigger
+fires. If you switch to `admission:"auto"` (no register hop), the snapshot never sends — re-wire it
+onto whatever path replaces register. The client must have its `.out` subscription active *before* it
+calls register (`WebChannelNatsClient.onConnected` ordering) or the snapshot is lost.
 
 ---
 

@@ -10,9 +10,13 @@ sketch → acceptance*.
 > nearly-finished **integrated showcase demo**, which *rewrote the entire demo surface*. Most of
 > what P0 originally described as unrendered "wiring gaps" is now **built** — the demo no longer
 > uses the thin `runDemo` path; it drives the production `WebChannelNATSClient` state reducer and
-> already renders history, typing, approvals, streaming drafts, and terminal-error UX. Every
-> `file:line` below has been re-pointed at the current tree. See
+> already renders history, typing, approvals, streaming drafts, and terminal-error UX. See
 > **["What the integrated demo already closed"](#what-the-integrated-demo-already-closed)**.
+>
+> **⚠️ Line numbers drift — trust the symbol, not the number.** The demo is still under active
+> development, so every `file:line` anchor in these docs is approximate and *will* keep moving. The
+> file paths, symbol names, and behavioral claims are the source of truth; if a cited line has
+> shifted, search for the quoted symbol. Line numbers are not re-anchored on every demo change.
 
 | File | Covers | Headline |
 |---|---|---|
@@ -39,7 +43,7 @@ which glues together the split modules:
 |---|---|
 | plugin registration + outbound seam | `src/channel.ts` (`createWebChannelPlugin` `:86`) |
 | NATS outbound frames | `src/nats-channel.ts` (`NatsChannel` — `sendText` `:256`, `sendProgress` `:279`, `finalizeDraft` `:287`, `sendTyping` `:294`, `sendHistory` `:302`, `sendApprovalRequest` `:310`, `sendApprovalResolved` `:336`) |
-| register hop + handler wiring | `packages/plugin/index-nats.ts` (`registerHttpRoute` `:278/:330/:468`, `NatsChannel` construct `:619`, `setApprovalDecisionHandler` `:667`, `setLoadHistoryHandler` `:677`, on-liveness snapshot `historyRecent`→`sendHistory` `:713-716`) |
+| register hop + handler wiring | `packages/plugin/index-nats.ts` (`registerHttpRoute`, `NatsChannel` construct, `setApprovalDecisionHandler`, `setLoadHistoryHandler`, **register-route snapshot** `historyRecent`→`sendHistory` — stateless, detached read) |
 | inbound turn / streaming / typing | `src/inbound.ts` (`progressEnabled` `:109`, `sendTyping` `:145`, `commandBody` `:178`) |
 | history store | `src/history.ts` (`resolveHistoryConfig` `:35`, `recent`, `pageBefore` `:214`) |
 | multi-account multiplex | `src/multiplex.ts` (`planAccounts`) |
@@ -53,7 +57,7 @@ every inbound frame; the widget renders each.
 
 | Gap | Status now | Where |
 |---|---|---|
-| **P0-1** history restore | ✅ **built** (client reduce + render; server snapshot on liveness) | reducer `case "history"` `nats-client-wrapper.ts:209`; server `index-nats.ts:713-716` |
+| **P0-1** history restore | ✅ **built** (client reduce + render; server snapshot from the register route, stateless) | reducer `case "history"` `nats-client-wrapper.ts`; server snapshot in the register route (`index-nats.ts`) |
 | **P0-2** history pagination | 🟡 **UI + client + server handler built**; server **depth cap still open** | "Load older" `widget.ts:49,203`; `loadHistory` `:155`; cap `history.ts:214` |
 | **P0-4** approval cards | ✅ **built** (card render + `decide`) | `renderApproval` `widget.ts:74`; reducer `:245/:272`; `decide` `:145` |
 | **P0-5** streaming drafts | 🟡 **client render built**; **demo doesn't set `streaming.mode:"progress"`** so it isn't exercised | reducer `case "progress"` `:279`; working bubble `widget.ts:136`; server gate `inbound.ts:109` |
