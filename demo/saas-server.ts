@@ -608,6 +608,38 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      // POST /admin/chaos/nats-user — mint creds for an ARBITRARY tenant (chaos
+      // scene ③ cross-tenant: tenant-b creds that the relay must refuse to let
+      // subscribe to tenant-a). Admin-gated; demo-only. Real deployments never
+      // expose an arbitrary-tenant mint oracle.
+      if (req.method === "POST" && path === "/admin/chaos/nats-user") {
+        parseJsonBody(req, (body) => {
+          if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
+          const { tenant, role } = body as { tenant?: string; role?: NatsUserRole };
+          if (!tenant) return sendJson(res, { error: "Missing tenant" }, 400);
+          try {
+            assertValidSubjectToken(tenant, "tenant");
+          } catch (err) {
+            return sendJson(res, { error: (err as Error).message }, 400);
+          }
+          mintNatsUserCreds({
+            accountSeed: privateChain.natsAccountSeed,
+            tenant,
+            role: role === "agent" ? "agent" : "browser",
+            issuerAccountId: natsIssuerAccountId,
+          })
+            .then((creds) => {
+              console.log(`[chaos] minted ${role ?? "browser"} creds for tenant=${tenant}`);
+              sendJson(res, { ...creds, natsUrl: NATS_URL });
+            })
+            .catch((err) => {
+              console.error("[chaos/nats-user] Error:", err);
+              sendJson(res, { error: "Internal server error" }, 500);
+            });
+        });
+        return;
+      }
+
       // POST /admin/accounts — register a runtime-added account's rendezvous
       // (scene ②: add-agent.sh calls this after a new agent is approved, so an
       // open widget can dial the new gateway). In-memory, admin-gated.

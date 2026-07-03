@@ -318,6 +318,20 @@ gap (below).
   serves late-join/multi-device, Phase 6). **Owner decision pending** on option
   (1) vs filing (3) upstream vs backlog.
 
+## Phase 2 status (2026-07-03) — fleet built + verified
+
+`bootstrap-claims.ts` aud→`string|string[]` landed (9 tests). run.sh boots a
+2-gateway fleet (agent-dev + agent-ops) via `boot_agent()`; app.ts is an agent
+switcher (tab per granted account, `/me`-poll for live grant/revoke); add-agent.sh
+enrolls a 3rd (agent-docs) that registers its rendezvous via the new admin-gated
+`POST /admin/accounts`. Verified live with headless drivers: **scene ① grant grows
+a tab / revoke shrinks it + the new lane echoes ✓; scene ② add-agent → approve →
+rendezvous-register → grant → selectable + echoes ✓; scene ④ two browsers on one
+agent get their own echo with NO cross-peer leak ✓.** scene ④'s exec-approval
+isolation leg needs a real tool-calling model (echo issues no exec) — the wiring
+exists (`approvals.ts` prepareTarget + handleApprovalDecision, widget renders
+cards); demo it on a real model.
+
 ## Honest-demo notes
 
 - **Active-MITM is NOT claimed (C2).** The E2E session key is derived from
