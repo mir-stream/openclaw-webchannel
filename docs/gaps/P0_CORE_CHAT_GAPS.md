@@ -33,7 +33,7 @@ retired.
 
 | Layer | File | Handles |
 |---|---|---|
-| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS, E2E handshake, `onMessage`/`onError`/`onState`, `loadHistory` `:726`, `sendApprovalDecision`, terminal-auth classify `:171/:427` |
+| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS, E2E handshake, `onMessage`/`onError`/`onState`, `loadHistory` `:768`, `sendApprovalDecision`, terminal-auth classify `:444-460` |
 | **State reducer wrapper** | `packages/client/src/nats-client-wrapper.ts` (`WebChannelNATSClient`) | reduces full protocol → `WebChannelState`; `getState` `:110`, `subscribe` `:115`, `send` `:131`, `decide` `:145`, `loadHistory` `:155` |
 | Demo widget | `demo/web/src/widget.ts` | `subscribe(render)` → bubbles, typing, approval cards, "Load older", terminal re-auth |
 | **Retired** | `packages/client/src/browser-demo-entry.ts` (`runDemo`) | old drop-all path; only a SaaS smoke test + `e2e/local/ci-smoke.html` still reference it |
@@ -43,11 +43,11 @@ The **wrapper reduces every inbound frame** (`nats-client-wrapper.ts`):
 | Frame | Reducer case | Effect |
 |---|---|---|
 | `history` | `:209` | dedup by `id`, coerce `working:false`, prepend oldest-first |
-| `typing` | `:240` | `isTyping:true` |
-| `approval_request` | `:245` | upsert into `approvals[]`, clear `isTyping` |
-| `approval_resolved` | `:272` | mark card resolved |
-| `progress` | `:279` | upsert working bubble keyed by draft `id` |
-| `agent_message` | `:291` | finalize draft / append |
+| `typing` | `:332` | `isTyping:true` |
+| `approval_request` | `:337` | upsert into `approvals[]`, clear `isTyping` |
+| `approval_resolved` | `:364` | mark card resolved |
+| `progress` | `:371` | upsert working bubble keyed by draft `id` |
+| `agent_message` | `:383` | finalize draft / append |
 
 Terminal auth failure → `onError` (`:103`) sets `status:"error"` (no eternal spinner).
 
@@ -57,11 +57,11 @@ The **server/agent side (NATS path)** lives in the package-root composition entr
 | Capability | Emit (`nats-channel.ts`) | Wired in `index-nats.ts` (root) |
 |---|---|---|
 | history snapshot on connect | `sendHistory()` | **from the register route** (stateless): `historyRecent`→`sendHistory`, detached read |
-| history pagination | — | `setLoadHistoryHandler` `:677` → `historyPageBefore` `:686` → `sendHistory` `:689` |
-| typing | `sendTyping()` `:294` (⚠️ ungated on NATS — see P0-6) | `inbound.ts:145` |
-| streaming draft | `sendProgress()` `:279` / `finalizeDraft()` `:287` | `inbound.ts:109-269` (gated on `streaming.mode:"progress"`) |
-| approval request | `sendApprovalRequest()` `:310` | emitted by `approvals.ts` `deliverPending` |
-| approval decision | `setApprovalDecisionHandler()` (channel `:371`) | `index-nats.ts:667` → `handleApprovalDecision` |
+| history pagination | — | `setLoadHistoryHandler` `:769` → `historyPageBefore` `:778` → `sendHistory` `:781` |
+| typing | `sendTyping()` `:337` (⚠️ ungated on NATS — see P0-6) | `inbound.ts:145` |
+| streaming draft | `sendProgress()` `:322` / `finalizeDraft()` `:330` | `inbound.ts:109-269` (gated on `streaming.mode:"progress"`) |
+| approval request | `sendApprovalRequest()` `:353` | emitted by `approvals.ts` `deliverPending` |
+| approval decision | `setApprovalDecisionHandler()` (channel `:414`) | `index-nats.ts:759` → `handleApprovalDecision` |
 
 **The full wire contract** lives in the client (`nats-client.ts`) and channel
 (`nats-channel.ts`):
@@ -74,12 +74,12 @@ Outbound (browser → agent): user_message  | approval_decision | load_history
 ### ⭐ Server defaults are ON; the demo enables the important ones
 
 `packages/plugin/openclaw.plugin.json` ships every P0 server capability with a sane default, and
-`demo/run.sh:200-217` turns on the ones that matter:
+`demo/run.sh:232-249` turns on the ones that matter:
 
 | Capability | Manifest default | Demo config (`run.sh`) | P0 status |
 |---|---|---|---|
-| `history.enabled` | **`true`** (`:174-178`) | **`true`** (`:202`) | ✅ P0-1 works E2E |
-| `execApprovals` + `capabilities.inlineButtons` | first-class (`:137/:163`) | **enabled + approvers** (`:203`) | ✅ P0-4 works E2E |
+| `history.enabled` | **`true`** (`:174-178`) | **`true`** (`:234`) | ✅ P0-1 works E2E |
+| `execApprovals` + `capabilities.inlineButtons` | first-class (`:137/:163`) | **enabled + approvers** (`:235`) | ✅ P0-4 works E2E |
 | `capabilities.typing` | **`"on"`** (`:167-170`) | unset → default on | ✅ P0-6 (client) |
 | `streaming.mode` | option only (`:115-123`), **not defaulted to `progress`** | **unset** | 🟡 P0-5 — not exercised |
 
@@ -122,7 +122,7 @@ it; the widget renders it.
 - **Reducer hydrates it:** `nats-client-wrapper.ts:209` `case "history"` — dedups by `id`, forces
   `working:false`, prepends oldest-first.
 - **Widget renders it:** `demo/web/src/widget.ts:126-140` maps `state.messages` → bubbles.
-- Demo config enables it: `demo/run.sh:202` `history.enabled:true`.
+- Demo config enables it: `demo/run.sh:234` `history.enabled:true`.
 
 **Telegram reference.** `session-transcript-context.ts`, `message-cache.ts`,
 `bot-message-context.session.ts`. We don't need the reply-chain machinery — our session store is
@@ -135,8 +135,10 @@ the source of truth and the server reads it.
 order; no duplicate bubbles on a mid-session reconnect.
 
 **Watch out.** The snapshot now fires **inside the register route**, so it requires the register hop.
-`demo/run.sh` runs register-hop (`accounts.<acct>.nats.admission="register-hop"`), so the trigger
-fires. If you switch to `admission:"auto"` (no register hop), the snapshot never sends — re-wire it
+`demo/run.sh` uses register-hop admission — but **not in the config heredoc**: the `channels add`
+setup adapter may write `admission:auto`, so `run.sh:286` re-asserts
+`accounts.<acct>.nats.admission="register-hop"` programmatically after enrollment, and the trigger
+fires because of that re-assertion. If you switch to `admission:"auto"` (no register hop), the snapshot never sends — re-wire it
 onto whatever path replaces register. The client must have its `.out` subscription active *before* it
 calls register (`WebChannelNatsClient.onConnected` ordering) or the snapshot is lost.
 
@@ -151,18 +153,18 @@ depth cap** that still needs fixing.
 
 **Where it stands today.**
 - Outbound frame + client method exist: `WebChannelNatsClient.loadHistory(before?, limit?)`
-  (`nats-client.ts:726`); wrapper `loadHistory({before,limit})` (`nats-client-wrapper.ts:155`).
+  (`nats-client.ts:768`); wrapper `loadHistory({before,limit})` (`nats-client-wrapper.ts:155`).
 - **UI trigger exists:** the "Load older" button (`widget.ts:49`) → `historyBtn.onclick`
-  (`widget.ts:203-206`) passes the oldest non-working message id as `before`.
-- Server handler exists: `index-nats.ts:677` `setLoadHistoryHandler` →
-  `historyPageBefore(api, sessionKey, request, historyConfig.pageSize, …)` `:686` → `sendHistory`
-  `:689` (reuses the `history` frame, so P0-1's reducer handles the response).
+  (`widget.ts:211-214`) passes the oldest non-working message id as `before`.
+- Server handler exists: `index-nats.ts:769` `setLoadHistoryHandler` →
+  `historyPageBefore(api, sessionKey, request, historyConfig.pageSize, …)` `:778` → `sendHistory`
+  `:781` (reuses the `history` frame, so P0-1's reducer handles the response).
 - ⚠️ **Server pager depth cap.** `pageBefore` (`history.ts:214-226`): the SDK seam
   (`runtime.subagent.getSessionMessages`) has no `before` cursor, so it always fetches only the
   newest `limit*2` (`:214`) and slices within that window. Consequences:
   - (a) pagination never reaches further than ~2 pages from the newest message;
   - (b) the cursor-miss fallback `window.slice(-limit)` (`:226`) returns the **newest** `limit`
-    while the comment at `:195/:224` claims **oldest**. The client's dedup swallows the duplicates,
+    while the comment at `:198/:224` claims **oldest**. The client's dedup swallows the duplicates,
     so the visible symptom is "load more silently stops".
 
 **Reference implementation (our reducer).** `nats-client-wrapper.ts:209` already prepends + dedups a
@@ -206,7 +208,7 @@ output as an `agent_message` (which the widget renders). The gap is **discovery 
 
 **What's genuinely missing.**
 1. **A command catalog surfaced to the browser** — a `/webchannel/commands` HTTP route (pattern:
-   `index-nats.ts` `registerHttpRoute` at `:278/:330/:468`) returning `[{name,description,args?}]`
+   `index-nats.ts` `registerHttpRoute` at `:279/:331/:539`) returning `[{name,description,args?}]`
    from `openclaw/plugin-sdk/native-command-registry`, filtered by `resolveNativeCommandsEnabled`.
    **Do not hard-code a command array.**
 2. **A typeahead in `demo/web/src/widget.ts`** — when `input.value` starts with `/`, fetch the
@@ -241,18 +243,18 @@ history snapshot is empty on next reconnect).
 
 **Where it stands today.**
 - Server emits the card: `approvals.ts` `deliverPending` → `nats-channel.sendApprovalRequest()`
-  (`:310`). Frame: `{ type:"approval_request", id, kind, title, description?, prompt,
+  (`:353`). Frame: `{ type:"approval_request", id, kind, title, description?, prompt,
   options:[{decision,label,style}], expiresAtMs? }`.
-- Server handles the decision: `index-nats.ts:667` `setApprovalDecisionHandler` →
+- Server handles the decision: `index-nats.ts:759` `setApprovalDecisionHandler` →
   `handleApprovalDecision(...)`.
-- Resolution echo: `sendApprovalResolved` (`nats-channel.ts:336`) → `{ type:"approval_resolved", id,
+- Resolution echo: `sendApprovalResolved` (`nats-channel.ts:379`) → `{ type:"approval_resolved", id,
   decision }`.
-- **Reducer:** `nats-client-wrapper.ts:245` `case "approval_request"` (upsert, clear `isTyping`);
-  `:272` `case "approval_resolved"` (mark resolved). `decide(id, decision)` `:145`.
+- **Reducer:** `nats-client-wrapper.ts:337` `case "approval_request"` (upsert, clear `isTyping`);
+  `:364` `case "approval_resolved"` (mark resolved). `decide(id, decision)` `:145`.
 - **Widget:** `renderApproval` (`widget.ts:74-98`) renders title/prompt + one button per option
   (danger/primary styling), disables on resolve, and calls `client.decide(a.id, opt.decision)`
   (`widget.ts:81`).
-- Demo config: `execApprovals.enabled:true` + approvers (`run.sh:203`), so approvals run E2E.
+- Demo config: `execApprovals.enabled:true` + approvers (`run.sh:235`), so approvals run E2E.
 - Types: `ApprovalRequest`/`ApprovalOption`/`ApprovalDecision` (`types.ts:31-54`); `decision ∈
   "allow-once" | "allow-always" | "deny"`.
 
@@ -270,7 +272,7 @@ mapping `approval-native.ts:132-159`.
 turn; Deny surfaces denial; buttons disable on click and reflect the authoritative resolution.
 
 **Watch out.** Approval authz is server-side. The demo's logged-in user must be an eligible approver
-(`execApprovals.approvers`, `run.sh:203` lists Alice/Bob/Admin uuids) or decisions are rejected. See
+(`execApprovals.approvers`, `run.sh:235` lists Alice/Bob/Admin uuids) or decisions are rejected. See
 memory `demo-user-login`.
 
 ---
@@ -287,13 +289,13 @@ isn't exercised.
   `const progressEnabled = resolveStreamingMode(channelConfig) === "progress"`. When enabled,
   `inbound.ts:110-269` builds a `ProgressDraftController` that pushes rolling `progress` frames then
   finalizes the same draft id with the final answer.
-- Frames: `{ type:"progress", id, text }` (`nats-channel.ts:279`); finalize reuses `agent_message`
-  with the same `id` (`finalizeDraft` `:287`).
-- **Reducer:** `nats-client-wrapper.ts:279` `case "progress"` upserts a working bubble keyed by draft
-  `id`; the matching `agent_message` (`:291`) finalizes it.
+- Frames: `{ type:"progress", id, text }` (`nats-channel.ts:322`); finalize reuses `agent_message`
+  with the same `id` (`finalizeDraft` `:330`).
+- **Reducer:** `nats-client-wrapper.ts:371` `case "progress"` upserts a working bubble keyed by draft
+  `id`; the matching `agent_message` (`:383`) finalizes it.
 - **Widget:** working bubbles render italic/dimmed (`widget.ts:136` `m.working` → `opacity:.7;
   font-style:italic`).
-- ⚠️ **Demo doesn't set `streaming.mode`.** The account block (`run.sh:200-217`) has
+- ⚠️ **Demo doesn't set `streaming.mode`.** The account block (`run.sh:232-249`) has
   `history`/`execApprovals`/`auth`/`dmSecurity` but **no `streaming.mode:"progress"`**, so
   `progressEnabled` is false in the demo — progress frames are never emitted.
 
@@ -303,12 +305,12 @@ isn't exercised.
 **Implementation sketch (remaining).**
 1. **Enable server streaming in the demo:** add
    `channels.webchannel.accounts.<acct>.streaming.mode:"progress"` to the `run.sh` config heredoc
-   (`run.sh:200-217`) — or set it in the setup wizard (memory `webchannel-setup-wizard-backlog`).
+   (`run.sh:232-249`) — or set it in the setup wizard (memory `webchannel-setup-wizard-backlog`).
 2. Optional: a subtle "working" affordance (cursor/shimmer) beyond the current italic dim.
 
 **Acceptance.** With `streaming.mode:"progress"` set, a multi-step / tool-using turn shows
 incremental text in a single bubble that finalizes into the answer — no duplicate bubbles, no
-infinite spinner if the turn errors (`inbound.ts:260-269` finalizes an in-flight draft on error).
+infinite spinner if the turn errors (`inbound.ts:258-283` finalizes an in-flight draft on error).
 
 ---
 
@@ -321,16 +323,16 @@ is **not wired on the NATS path** (default-on works; the off toggle is silently 
 
 **Where it stands today.**
 - Server sends it at turn start: `inbound.ts:145` `transport.sendTyping(wsKey)`. Emit method
-  `nats-channel.ts:294`.
-- **Reducer:** `nats-client-wrapper.ts:240` `case "typing"` → `isTyping:true`; every subsequent
+  `nats-channel.ts:337`.
+- **Reducer:** `nats-client-wrapper.ts:332` `case "typing"` → `isTyping:true`; every subsequent
   real frame clears it (`approval_request`/`progress`/`agent_message` set `isTyping:false`).
-- **Widget:** `widget.ts:141-145` pushes an "agent is typing…" line when `state.isTyping`.
+- **Widget:** `widget.ts:141-143` pushes an "agent is typing…" line when `state.isTyping`.
 - Demo: `capabilities.typing` unset → default `"on"`, so typing shows.
 - ⚠️ **The `capabilities.typing` gate is NOT enforced on the NATS path.** The gate exists only on
-  the legacy WS transport (`transport.ts:187-199` `typingEnabled` + `setTypingEnabled`).
-  `NatsChannel` (`nats-channel.ts`) has **no gate field**, `NatsChannel.sendTyping` (`:294`) is
+  the legacy WS transport (`transport.ts:193/:360/:610` `typingEnabled` + `setTypingEnabled`).
+  `NatsChannel` (`nats-channel.ts`) has **no gate field**, `NatsChannel.sendTyping` (`:337`) is
   ungated, and `index-nats.ts` never wires one. Net: an operator setting `capabilities.typing:"off"`
-  is **silently ignored on the NATS path** (the `inbound.ts:141-142` comment "the transport gates
+  is **silently ignored on the NATS path** (the `inbound.ts:140-141` comment "the transport gates
   the frame" is only true for the WS transport).
 - (Note: `src/typing-indicator.ts` is an **unrelated** feature — ephemeral client↔client typing
   envelopes — not this agent→browser gate.)
@@ -339,9 +341,9 @@ is **not wired on the NATS path** (default-on works; the off toggle is silently 
 The backoff machinery is Telegram-specific; we only need the on/off signal.
 
 **Implementation sketch (remaining — server only).**
-1. Add a `typingEnabled` gate to `NatsChannel` (mirror `transport.ts:187-199`), set it from the
+1. Add a `typingEnabled` gate to `NatsChannel` (mirror `transport.ts:193/:360/:610`), set it from the
    account's `capabilities.typing` during account setup in `index-nats.ts`, and gate
-   `NatsChannel.sendTyping` (`nats-channel.ts:294`) on it.
+   `NatsChannel.sendTyping` (`nats-channel.ts:337`) on it.
 
 **Acceptance.** Sending shows "typing…" that clears on the first real frame; with
 `capabilities.typing:"off"` on the account, no `typing` frame is emitted on the NATS path.
@@ -400,7 +402,7 @@ rapid double-submit of the same logical message is deduped server-side.
 
 ## Cross-cutting: the reducer is the shared seam
 
-All render extensions now go through one place — the reducer (`nats-client-wrapper.ts:163-300`) and
+All render extensions now go through one place — the reducer (`nats-client-wrapper.ts:207-405`) and
 the widget's `render(state)` (`widget.ts:100-148`). New frame types (e.g. P1-5 `presentation`,
-P1-3 `reasoning`) add: a `case` in the reducer, a field on `WebChannelState` (`types.ts:74-97`), and
+P1-3 `reasoning`) add: a `case` in the reducer, a field on `WebChannelState` (`types.ts:74-94`), and
 a branch in `render`. There is no thin path to re-wire.

@@ -30,7 +30,7 @@ There is **one production client path**, and the demo uses it.
 
 | Layer | File | Role |
 |---|---|---|
-| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS + E2E handshake + `onMessage`/`onError`/`onState`; terminal-vs-transient auth classification (`:171-172`, `:427-430`). |
+| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS + E2E handshake + `onMessage`/`onError`/`onState`; terminal-vs-transient auth classification (`:444-460`, `:531`). |
 | **State reducer wrapper** | `packages/client/src/nats-client-wrapper.ts` (`WebChannelNATSClient`) | reduces the full protocol into an immutable `WebChannelState { messages, approvals, status, isTyping }`; exposes `subscribe`/`getState`/`send`/`decide`/`loadHistory`. **This is the "Option 2 reducer" the old doc deferred — it now exists for the NATS path.** |
 | Demo widget | `demo/web/src/widget.ts` | `client.subscribe(render)` → renders bubbles, typing, approval cards, "Load older", terminal-error re-auth. |
 | **Retired** | `packages/client/src/browser-demo-entry.ts` (`runDemo`) | the old thin "drop everything but `agent_message`" path. **No longer the demo** — only a SaaS smoke test + `e2e/local/ci-smoke.html` still reference it. |
@@ -42,32 +42,32 @@ which glues together the split modules:
 | Concern | Module (current) |
 |---|---|
 | plugin registration + outbound seam | `src/channel.ts` (`createWebChannelPlugin` `:86`) |
-| NATS outbound frames | `src/nats-channel.ts` (`NatsChannel` — `sendText` `:256`, `sendProgress` `:279`, `finalizeDraft` `:287`, `sendTyping` `:294`, `sendHistory` `:302`, `sendApprovalRequest` `:310`, `sendApprovalResolved` `:336`) |
+| NATS outbound frames | `src/nats-channel.ts` (`NatsChannel` — `sendText` `:299`, `sendProgress` `:322`, `finalizeDraft` `:330`, `sendTyping` `:337`, `sendHistory` `:345`, `sendApprovalRequest` `:353`, `sendApprovalResolved` `:379`) |
 | register hop + handler wiring | `packages/plugin/index-nats.ts` (`registerHttpRoute`, `NatsChannel` construct, `setApprovalDecisionHandler`, `setLoadHistoryHandler`, **register-route snapshot** `historyRecent`→`sendHistory` — stateless, detached read) |
 | inbound turn / streaming / typing | `src/inbound.ts` (`progressEnabled` `:109`, `sendTyping` `:145`, `commandBody` `:178`) |
-| history store | `src/history.ts` (`resolveHistoryConfig` `:35`, `recent`, `pageBefore` `:214`) |
+| history store | `src/history.ts` (`resolveHistoryConfig` `:35`, `recent`, `pageBefore` `:206`) |
 | multi-account multiplex | `src/multiplex.ts` (`planAccounts`) |
-| legacy WS transport (retained) | `src/transport.ts` (`typingEnabled`/`historyEnabled` gates `:187-207`) |
+| legacy WS transport (retained) | `src/transport.ts` (`typingEnabled`/`historyEnabled` gates `:193-201,:610-634`) |
 
 ## What the integrated demo already closed
 
-The demo config (`demo/run.sh:200-217`) ships `history.enabled:true` and `execApprovals` with
+The demo config (`demo/run.sh:232-249`) ships `history.enabled:true` and `execApprovals` with
 approvers, so these run **end-to-end** in the demo. The reducer (`nats-client-wrapper.ts`) handles
 every inbound frame; the widget renders each.
 
 | Gap | Status now | Where |
 |---|---|---|
 | **P0-1** history restore | ✅ **built** (client reduce + render; server snapshot from the register route, stateless) | reducer `case "history"` `nats-client-wrapper.ts`; server snapshot in the register route (`index-nats.ts`) |
-| **P0-2** history pagination | 🟡 **UI + client + server handler built**; server **depth cap still open** | "Load older" `widget.ts:49,203`; `loadHistory` `:155`; cap `history.ts:214` |
-| **P0-4** approval cards | ✅ **built** (card render + `decide`) | `renderApproval` `widget.ts:74`; reducer `:245/:272`; `decide` `:145` |
-| **P0-5** streaming drafts | 🟡 **client render built**; **demo doesn't set `streaming.mode:"progress"`** so it isn't exercised | reducer `case "progress"` `:279`; working bubble `widget.ts:136`; server gate `inbound.ts:109` |
-| **P0-6** typing indicator | ✅ **client built**; server **NATS gate still open** (`typing:"off"` ignored on NATS) | reducer `case "typing"` `:240`; `widget.ts:141`; ungated `nats-channel.ts:294` |
-| **P1-7** error / reconnect UX | ✅ **mostly built** (status pill + terminal "Credentials expired" + re-auth) | `widget.ts:100-119`; terminal classify `nats-client.ts:427-430` |
+| **P0-2** history pagination | 🟡 **UI + client + server handler built**; server **depth cap still open** | "Load older" `widget.ts:49,211`; `loadHistory` `:155`; cap `history.ts:214` |
+| **P0-4** approval cards | ✅ **built** (card render + `decide`) | `renderApproval` `widget.ts:74`; reducer `:337/:364`; `decide` `:145` |
+| **P0-5** streaming drafts | 🟡 **client render built**; **demo doesn't set `streaming.mode:"progress"`** so it isn't exercised | reducer `case "progress"` `:371`; working bubble `widget.ts:136`; server gate `inbound.ts:109` |
+| **P0-6** typing indicator | ✅ **client built**; server **NATS gate still open** (`typing:"off"` ignored on NATS) | reducer `case "typing"` `:332`; `widget.ts:141`; ungated `nats-channel.ts:337` |
+| **P1-7** error / reconnect UX | ✅ **mostly built** (status pill + terminal "Credentials expired" + re-auth) | `widget.ts:100-119`; terminal classify `nats-client.ts:444-460` |
 
 **Still genuinely open** (net-new work, accurately described in the files): **P0-3** slash-command
 discovery, **P0-7** send idempotency/replay, **P1-1** markdown rendering (`widget.ts:138` is still
 `textContent`), **P1-8** turn control (`/stop` abort + inbound debounce — Telegram parity;
-`/stop` currently queues behind the running turn at `index-nats.ts:639`), **P1-9** pending-message
+`/stop` currently queues behind the running turn at `index-nats.ts:742`), **P1-9** pending-message
 retraction / unsend (web advantage — no Telegram equivalent), **P1-2/3/4/6**, and the **server-side**
 halves of P0-2/P0-5/P0-6.
 
@@ -87,7 +87,7 @@ halves of P0-2/P0-5/P0-6.
 
 2. **Server defaults are ON.** `packages/plugin/openclaw.plugin.json` ships `history.enabled:true`
    (`:174-178`), `capabilities.typing:"on"` (`:167-170`), `execApprovals`/`inlineButtons`
-   (`:137/:163`), and a `streaming.mode` option (`off|partial|block|progress`, `:115-123`) that is
+   (`:137/:163`), and a `streaming.mode` option (`off|partial|block|progress`, `:115-122`) that is
    **not defaulted to `progress`** and **not set by the demo** (P0-5).
 
 3. **Slash commands already execute.** Traced through openclaw core
@@ -105,12 +105,12 @@ Re-verified 2026-07-03 against the current tree:
    fallback `window.slice(-limit)` (`:226`) returns the *newest* slice while the comment claims
    *oldest*. Client dedup hides it as "load-more stops".
 2. **P0-6 typing gate** — the gate lives only on the legacy WS transport
-   (`transport.ts:187-199` `typingEnabled`). `NatsChannel` (`nats-channel.ts`) has **no gate field**
-   and `NatsChannel.sendTyping` (`:294`) is ungated; `index-nats.ts` never wires one. So
-   `capabilities.typing:"off"` is **silently ignored on the NATS path** (the `inbound.ts:141-142`
+   (`transport.ts:193/:360/:610` `typingEnabled`). `NatsChannel` (`nats-channel.ts`) has **no gate field**
+   and `NatsChannel.sendTyping` (`:337`) is ungated; `index-nats.ts` never wires one. So
+   `capabilities.typing:"off"` is **silently ignored on the NATS path** (the `inbound.ts:140-141`
    comment "the transport gates the frame" is only true for the WS transport).
 3. **P0-5 streaming flag** — `demo/run.sh` sets no `streaming` config (the account block at
-   `:200-217` has `history`/`execApprovals`/`auth`/`dmSecurity` but no `streaming.mode`), so
+   `:232-249` has `history`/`execApprovals`/`auth`/`dmSecurity` but no `streaming.mode`), so
    `resolveStreamingMode(...)==="progress"` (`inbound.ts:109`) is false in the demo. The client
    renders progress drafts, but the demo never emits them.
 

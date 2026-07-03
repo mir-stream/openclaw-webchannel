@@ -38,7 +38,7 @@ IR and the button/media *shapes*, not the chunking/nesting machinery.
 **Where P1 renders now.** All client render lands in the reducer
 (`packages/client/src/nats-client-wrapper.ts`) + the widget `render(state)`
 (`demo/web/src/widget.ts:100-148`). New signals add a reducer `case`, a `WebChannelState` field
-(`packages/client/src/types.ts:74-97`), and a `render` branch.
+(`packages/client/src/types.ts:74-94`), and a `render` branch.
 
 ---
 
@@ -52,10 +52,10 @@ already in the `agent_message` text).
 
 **Where it stands today.**
 - The agent's reply text is markdown (openclaw agents emit markdown); it arrives intact in
-  `agent_message.text` and the reducer stores it verbatim (`nats-client-wrapper.ts:291`).
+  `agent_message.text` and the reducer stores it verbatim (`nats-client-wrapper.ts:383`).
 - **The widget renders it as a text node:** `demo/web/src/widget.ts:126-140` builds each bubble with
   `[m.text]` as a child (`white-space:pre-wrap`), so all markup is literal. `ChatMessage` only
-  carries `text` (`types.ts:22-27`).
+  carries `text` (`types.ts:22-28`).
 
 **Telegram reference (content model — NOT the transport limits).**
 - `format.ts:158` `markdownToTelegramHtml()` / `:1132` `markdownToTelegramRichHtml()`.
@@ -122,7 +122,7 @@ the layout, and streaming growth doesn't yank the viewport.
 
 **Where it stands today.** Our progress/answer path (`inbound.ts:109-269`) streams one draft; no
 reasoning/answer split. The `progress` frame is a single text stream (reducer `case "progress"`,
-`nats-client-wrapper.ts:279`).
+`nats-client-wrapper.ts:371`).
 
 **Telegram reference.**
 - `reasoning-lane-coordinator.ts:68` `splitTelegramReasoningText()` — splits `{reasoningText,
@@ -264,16 +264,18 @@ rejection) were hard to distinguish from transient ones.
   jitter).
 - **Terminal vs transient classified:** `WebChannelNatsClient` treats PoP/NKEY registration failure
   as terminal (tears down, no retry) and distinguishes it from a transient
-  "Authentication Expired" (`nats-client.ts:171-172`, `:427-430`, `:482`), surfacing via `onError`.
+  `Authentication Timeout` / `Permissions Violation` (the `-ERR` classifier at `nats-client.ts:444-460`;
+  `authorization violation` / `authentication expired` → terminal `failTerminally` `:531`, while
+  timeout/cancelled/permissions stay transient), surfacing via `onError`.
 - **Wrapper maps it to state:** `nats-client-wrapper.ts:103-105` `onError` → `status:"error"` +
   `error` message; `onState` → `connected`/`reconnecting` (guards against a trailing `onState(false)`
-  downgrading a terminal error, `:87-93`).
+  downgrading a terminal error, `:89-95`).
 - **Widget renders distinct states:** a status pill (`connecting…`/`connected`/`reconnecting…`/
   `error`, `widget.ts:23-28,100-105`), and on `status==="error"` a distinct **"Credentials expired"**
   box with a one-click **Re-authenticate** button that mints a fresh credential
   (`widget.ts:109-119`); input/send disabled while terminal.
 - `ConnectionStatus` union in the type (`types.ts:66`); `WebChannelState.error` carries the reason
-  (`types.ts:81-93`).
+  (`types.ts:85`).
 
 **Telegram reference.**
 - `network-errors.ts` — `isRecoverableTelegramNetworkError()` (`:305`), `readTelegramRetryAfterMs()`
@@ -307,7 +309,7 @@ coalescing. This is a **Telegram parity gap** (Telegram has both).
 **Where it stands today — why `/stop` is not "already there".**
 - Every `user_message` is enqueued with **no content inspection**:
   ```js
-  // packages/plugin/index-nats.ts:639-642
+  // packages/plugin/index-nats.ts:742-745
   channel.setMessageHandler((peerId, message) => {
     if (message.type !== "user_message") return;
     dispatchInbound(peerId, message);        // → per-session FIFO, unconditionally
@@ -341,12 +343,12 @@ coalescing. This is a **Telegram parity gap** (Telegram has both).
   `debounceLane`) — rapid same-sender/same-conversation messages are batched before the turn runs.
 
 **Implementation sketch.**
-1. **`/stop` abort (out-of-band).** In `channel.setMessageHandler` (`index-nats.ts:639`), **before**
+1. **`/stop` abort (out-of-band).** In `channel.setMessageHandler` (`index-nats.ts:742`), **before**
    `dispatchInbound`, check `isAbortRequestText(message.text)` (import from
    `openclaw/plugin-sdk/reply-runtime`, re-exported from `command-primitives-runtime`). If true:
    resolve the session key (`channelRuntime.routing.resolveAgentRoute`, as `inbound.ts:125`) and call
    `abortReplyRunBySessionId(sessionKey)` **without enqueuing**. Optionally finalize the in-flight
-   working draft via the existing `inbound.ts:260-269` path with a "⏹ stopped" text.
+   working draft via the existing `inbound.ts:258-283` path with a "⏹ stopped" text.
 2. **Client "Stop" affordance.** In `demo/web/src/widget.ts`, while `state.isTyping` or a working
    draft exists, toggle the Send button to **Stop**; on click call a new
    `client.stop()` on the wrapper (`nats-client-wrapper.ts`) that sends a stop signal. **Wire
@@ -385,7 +387,7 @@ offer genuine retraction — a superset of Telegram. Distinct from P1-8: retract
 **not-yet-started** queued message; aborting the **in-flight** turn is P1-8.
 
 **Where it stands today.**
-- The widget publishes immediately: `widget.ts:208-217` `submit()` → `client.send(text)` →
+- The widget publishes immediately: `widget.ts:216-221` `submit()` → `client.send(text)` →
   `nats-client-wrapper.ts:131` → publishes over NATS at once. Nothing is held locally.
 - Queueing happens **server-side** (`inbound-queue.ts` per-session FIFO). Once published, the message
   is committed to that chain and there is **no dequeue signal** (`types.ts:153` outbound union has
@@ -398,7 +400,7 @@ item is scoped from our own transport, not benchmarked.
 - **(A) Client-side hold (RECOMMENDED — zero wire/server change).** While `state.isTyping` or a
   working draft is active, the widget does **not** publish the next message; it holds it locally as a
   "pending" chip with an **✕ retract** control, and publishes it only when the prior turn finalizes
-  (the `agent_message`/finalize in `nats-client-wrapper.ts:291`). Retract = delete the local chip. No
+  (the `agent_message`/finalize in `nats-client-wrapper.ts:383`). Retract = delete the local chip. No
   server or wire change; the "queue" becomes visible and controllable in the client. Trade-off: "sent"
   now means "queued for send" — surface that in the chip label.
 - **(B) Server-side dequeue.** Publish immediately (today's behavior), stamp each `user_message` with
