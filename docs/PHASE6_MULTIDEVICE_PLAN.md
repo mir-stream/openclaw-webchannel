@@ -1,10 +1,20 @@
 # Phase 6 — Multi-Device E2E — Design Plan
 
-Status: **DESIGN COMPLETE — ready to implement. All decisions closed.**
+Status: **IMPLEMENTED (2026-07-03, branch `feature/showcase-demo`) — all W1–W7
+landed; §12 acceptance PASSED** (Playwright scene `demo/verify-multidevice.mjs`
+6/6 · K-restart + divergence unit tests · all 6 live e2e harnesses · all 6 demo
+drivers · suites 727 plugin / 130 client / 115 saas green).
 Interview: `interview_20260703_043054` (ambiguity 0.06, Restate gate passed).
-Owner decided to SKIP `ooo seed` — THIS DOCUMENT is the implementation spec.
-Branch: `feature/showcase-demo` (Phase 6 will branch from here or from `develop`).
+Owner decided to SKIP `ooo seed` — THIS DOCUMENT was the implementation spec.
 Memory ref: [[phase6-multidevice-design]] · related: [[showcase-demo-build]], [[e2e-nats-relay-seed]]
+
+**Post-implementation finding (demo config, pre-existing):** openclaw
+`session.dmScope` defaults to `"main"`, so ALL direct peers of an agent shared
+ONE session — bob's register snapshot contained alice's conversation (re-sealed
+with bob's K; crypto isolation held, session scoping didn't). openclaw's own
+channel audit flags exactly this. Fixed in `demo/run.sh` with
+`"session": { "dmScope": "per-channel-peer" }`; any multi-user deployment needs
+the same setting.
 
 **Decision summary (details in §8/§11):** option B register-only; auto-admission keeps
 legacy handshake untouched (F5=a); wrapped-K delivered in the register HTTP response

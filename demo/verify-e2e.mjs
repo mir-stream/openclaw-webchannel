@@ -84,9 +84,10 @@ try {
   await page.screenshot({ path: "/tmp/demo-phase1.png", fullPage: true });
   console.log("[verify] screenshot (chat+wiretap) → /tmp/demo-phase1.png");
 
-  // Reload → history hydration restores the prior turn. This is sent from the
-  // E2E handshake-complete handler (not the pre-handshake register hop) and reads
-  // the core session store in a detached async-context so `sessions.get` authorizes
+  // Reload → history hydration restores the prior turn. Phase 6: the snapshot
+  // is sent from the REGISTER route (stateless register — the conversation key
+  // K is established there; no handshake on this path) and reads the core
+  // session store in a detached async-context so `sessions.get` authorizes
   // against a synthetic operator client. Hard criterion: it MUST restore.
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForSelector("#app:not(.hidden)", { timeout: 15000 });

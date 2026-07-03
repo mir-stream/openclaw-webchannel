@@ -221,6 +221,7 @@ boot_agent() {
   cat > "$home/.openclaw/openclaw.json" <<JSON
 {
   "gateway": { "mode": "local", "bind": "loopback" },
+  "session": { "dmScope": "per-channel-peer" },
   "models": { "providers": { $PROVIDER_BLOCK } },
   "agents": { "defaults": { "model": { "primary": "$PRIMARY_MODEL" }, "compaction": { "reserveTokensFloor": 20000 } } },
   "plugins": {
