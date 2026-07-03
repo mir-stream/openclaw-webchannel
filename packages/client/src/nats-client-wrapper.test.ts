@@ -153,3 +153,89 @@ describe("WebChannelNATSClient — CL2 terminal error status", () => {
     expect(wrapper.getState().status).toBe("error");
   });
 });
+
+// ---------------------------------------------------------------------------
+// W6 (Phase 6): idempotent history hydration under the stateless register —
+// a snapshot triggered by ANY device's register arrives mid-session on the
+// shared .out and must never duplicate bubbles.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
+  type HistoryFrame = {
+    type: "history";
+    messages: Array<{ id: string; role: string; text: string; ts?: number }>;
+  };
+
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+
+  /** Drive the private inbound dispatcher directly (no socket needed). */
+  function deliver(wrapper: WebChannelNATSClient, frame: HistoryFrame): void {
+    (wrapper as unknown as { handleMessage: (m: HistoryFrame) => void }).handleMessage(frame);
+  }
+
+  it("re-delivered snapshot is a no-op (dedup by server id)", () => {
+    const wrapper = makeWrapper();
+    const snapshot: HistoryFrame = {
+      type: "history",
+      messages: [
+        { id: "m1", role: "user", text: "hello", ts: 1 },
+        { id: "m2", role: "agent", text: "hi there", ts: 2 },
+      ],
+    };
+    deliver(wrapper, snapshot);
+    expect(wrapper.getState().messages).toHaveLength(2);
+    // Stateless register: the SAME snapshot arrives again (this device's
+    // reconnect, or another device joining) — nothing may duplicate.
+    deliver(wrapper, snapshot);
+    expect(wrapper.getState().messages).toHaveLength(2);
+  });
+
+  it("adopts the server id onto a locally-echoed user message instead of duplicating it", () => {
+    const wrapper = makeWrapper();
+    wrapper.send("hello agent"); // local echo → synthetic id "u-0"
+    expect(wrapper.getState().messages).toEqual([
+      expect.objectContaining({ id: "u-0", role: "user", text: "hello agent" }),
+    ]);
+
+    // Mid-session snapshot carries the SAME message under its server id.
+    deliver(wrapper, {
+      type: "history",
+      messages: [{ id: "srv-9", role: "user", text: "hello agent", ts: 42 }],
+    });
+
+    const messages = wrapper.getState().messages;
+    expect(messages).toHaveLength(1); // no duplicate bubble
+    expect(messages[0].id).toBe("srv-9"); // canonical id adopted
+    // A THIRD delivery of the same snapshot is now a plain id-dedup no-op.
+    deliver(wrapper, {
+      type: "history",
+      messages: [{ id: "srv-9", role: "user", text: "hello agent", ts: 42 }],
+    });
+    expect(wrapper.getState().messages).toHaveLength(1);
+  });
+
+  it("does not adopt across different texts, and repeated identical texts adopt one-to-one", () => {
+    const wrapper = makeWrapper();
+    wrapper.send("ping"); // u-0
+    wrapper.send("ping"); // u-1 (repeated identical text)
+    deliver(wrapper, {
+      type: "history",
+      messages: [
+        { id: "s1", role: "user", text: "ping", ts: 1 },
+        { id: "s2", role: "user", text: "ping", ts: 2 },
+        { id: "s3", role: "user", text: "other text", ts: 3 },
+      ],
+    });
+    const messages = wrapper.getState().messages;
+    // Two local echoes adopted (s1, s2) + one genuinely-new bubble (s3).
+    expect(messages).toHaveLength(3);
+    expect(messages.map((m) => m.id).sort()).toEqual(["s1", "s2", "s3"]);
+  });
+});

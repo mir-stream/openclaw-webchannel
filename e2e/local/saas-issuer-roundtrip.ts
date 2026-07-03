@@ -88,6 +88,8 @@ const client = new WebChannelNatsClient({
   registration: {
     registerBaseUrl: GW_URL,
     devicePrivateKey: ed25519.privateKey,
+    // Phase 6: register-delivered conversation key (no handshake).
+    deviceX25519PrivateKey: x25519.privateKey,
   },
 });
 

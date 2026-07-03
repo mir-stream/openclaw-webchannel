@@ -212,6 +212,26 @@ export class WebChannelNATSClient {
 
         const existing = this.state.messages;
         const seen = new Set(existing.map((m) => m.id));
+
+        // Phase 6 (stateless register, shared conversation key): a snapshot
+        // triggered by ANY device's register — this device's reconnect or a
+        // second device joining — arrives at every device mid-session on the
+        // shared `.out`. Messages the user sent from THIS device sit in state
+        // under synthetic local-echo ids (`u-<n>`) while the snapshot carries
+        // their server-canonical ids, so plain id-dedup would duplicate them.
+        // Instead, adopt the server id onto the first text-matching local echo
+        // (oldest first) — same bubble, now canonical for all future dedup.
+        const next = existing.slice();
+        const adoptable = new Map<string, number[]>();
+        next.forEach((m, i) => {
+          if (m.role === "user" && m.id.startsWith("u-")) {
+            const idxs = adoptable.get(m.text) ?? [];
+            idxs.push(i);
+            adoptable.set(m.text, idxs);
+          }
+        });
+
+        let adopted = false;
         const fresh: ChatMessage[] = [];
 
         for (const m of incoming) {
@@ -222,6 +242,15 @@ export class WebChannelNATSClient {
           if (seen.has(m.id)) continue;
 
           seen.add(m.id);
+          if (m.role === "user") {
+            const idxs = adoptable.get(m.text);
+            if (idxs && idxs.length > 0) {
+              const idx = idxs.shift()!;
+              next[idx] = { ...next[idx], id: m.id, ts: m.ts };
+              adopted = true;
+              continue;
+            }
+          }
           fresh.push({
             id: m.id,
             role: m.role,
@@ -231,9 +260,9 @@ export class WebChannelNATSClient {
           });
         }
 
-        if (fresh.length === 0) return;
+        if (fresh.length === 0 && !adopted) return;
 
-        this.setState({ messages: [...fresh, ...existing] });
+        this.setState({ messages: [...fresh, ...next] });
         return;
       }
 

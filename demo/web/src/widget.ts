@@ -192,7 +192,12 @@ export async function createWidget(
       tenant: config.tenant,
       peerId: boot.data.peerId,
       natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
-      registration: { registerBaseUrl, devicePrivateKey: ed25519.privateKey },
+      registration: {
+        registerBaseUrl,
+        devicePrivateKey: ed25519.privateKey,
+        // Phase 6: register-delivered conversation key (no handshake).
+        deviceX25519PrivateKey: x25519.privateKey,
+      },
     });
     client.subscribe(render);
     render(client.getState());

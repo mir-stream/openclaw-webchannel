@@ -26,6 +26,7 @@ import {
   sealMessage,
   openMessage,
   base64urlDecode,
+  unwrapConversationKey,
   type BrowserKeyPair,
 } from "./e2e-crypto-browser.js";
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
@@ -88,6 +89,16 @@ export type NatsClientOptions = {
     registerBaseUrl: string;
     /** Device Ed25519 private key paired with the bootstrap JWT's pop_jwk. */
     devicePrivateKey: CryptoKey;
+    /**
+     * Phase 6 (multi-device): the device X25519 PRIVATE key whose PUBLIC half
+     * was minted into the bootstrap JWT `cnf.jwk`. When present, the session
+     * key is the agent-owned conversation key K delivered WRAPPED to this key
+     * in the register response (`unwrapConversationKey`) — no `.handshake`
+     * negotiation happens at all, so one user's multiple devices share one
+     * stable K. When absent, the legacy per-connection X25519 handshake runs
+     * (old-plugin compat; the auto-admission path never registers anyway).
+     */
+    deviceX25519PrivateKey?: CryptoKey;
     /** Injectable fetch (tests / non-browser hosts). Defaults to global fetch. */
     fetchImpl?: typeof fetch;
   };
@@ -778,27 +789,39 @@ export class WebChannelNatsClient {
     // re-checks `this.connectionEpoch === epoch` so a continuation resumed after
     // a drop+reconnect bails instead of clobbering the fresh flow's state.
     const epoch = ++this.connectionEpoch;
+    const { registration } = this.options;
+    // Phase 6 (multi-device): when the JWT-cnf X25519 private key is supplied,
+    // the session key is the agent-owned conversation key K, delivered WRAPPED
+    // in the register response — the `.handshake` subject is never subscribed
+    // nor published on this path (the plugin's register-admission channel does
+    // not answer handshakes anymore).
+    const registerDeliveredKey = Boolean(registration?.deviceX25519PrivateKey);
+
     // (Re)subscribe idempotently: unsubscribe stale sids so a reconnect never
-    // leaves duplicate subscriptions delivering the same MSG twice.
+    // leaves duplicate subscriptions delivering the same MSG twice. `.out` MUST
+    // be active BEFORE the register hop: the agent sends the initial history
+    // snapshot from the register route, and core NATS has no retention.
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
     if (this.handshakeSub >= 0) this.client.unsubscribe(this.handshakeSub);
+    this.handshakeSub = -1;
     this.outSub = this.client.subscribe(outboundSubject(tenant, accountId, peerId));
-    this.handshakeSub = this.client.subscribe(handshakeSubject(tenant, accountId, peerId));
+    if (!registerDeliveredKey) {
+      this.handshakeSub = this.client.subscribe(handshakeSubject(tenant, accountId, peerId));
+    }
 
-    // Fresh connection → fresh key exchange.
+    // Fresh connection → fresh key establishment.
     this.resetSession();
 
     // PoP HTTP registration (production). MUST complete AFTER we subscribe to
-    // .out/.handshake (above) but BEFORE we publish the handshake — the agent
-    // only subscribes to this peer's subjects once registered, and NATS has no
-    // retention, so a handshake published earlier would be lost. Fail-closed: if
-    // registration throws, registration failure is TERMINAL for this connection.
-    // A PoP/JWT rejection is typically a permanent credential problem, so we do
-    // NOT silently retry (no auto-retry/hammering): we tear the connection fully
-    // down via the raw NatsClient.disconnect() (clears the reconnect timer +
-    // closes the socket, leaving connected === false). The application must react
-    // to onError and re-initialize with fresh credentials (a new bootstrap JWT).
-    const { registration } = this.options;
+    // .out (above) but BEFORE any key flows — the agent only subscribes to this
+    // peer's subjects once registered, and NATS has no retention. Fail-closed:
+    // if registration throws, registration failure is TERMINAL for this
+    // connection. A PoP/JWT rejection is typically a permanent credential
+    // problem, so we do NOT silently retry (no auto-retry/hammering): we tear
+    // the connection fully down via the raw NatsClient.disconnect() (clears the
+    // reconnect timer + closes the socket, leaving connected === false). The
+    // application must react to onError and re-initialize with fresh
+    // credentials (a new bootstrap JWT).
     if (registration) {
       // The register hop presents the bootstrap JWT; it is REQUIRED here even
       // though the type makes `jwt` optional (it is unused on the BYO-NATS path).
@@ -810,8 +833,9 @@ export class WebChannelNatsClient {
         this.client.disconnect();
         return;
       }
+      let registerResult: Awaited<ReturnType<typeof registerWithPop>>;
       try {
-        await registerWithPop({
+        registerResult = await registerWithPop({
           registerBaseUrl: registration.registerBaseUrl,
           jwt: this.options.jwt,
           peerId,
@@ -826,10 +850,46 @@ export class WebChannelNatsClient {
       }
       // The socket may have dropped during the register round-trip; a reconnect
       // would have spawned a newer onConnected. Bail so this stale flow does not
-      // publish a handshake for a connection generation that is no longer current.
+      // establish a key for a connection generation that is no longer current.
       if (this.connectionEpoch !== epoch) return;
+
+      if (registerDeliveredKey) {
+        // Register-delivered key: unwrap K with the cnf device private key.
+        // Fail-closed and TERMINAL on any miss — we never fall back to the
+        // handshake here (the plugin does not answer it on this path, and a
+        // downgrade would let a tampering relay strip the delivered key).
+        const wrapped = registerResult.wrappedConversationKey;
+        if (!wrapped) {
+          const err = new Error(
+            "[nats-client] register response carried no wrappedConversationKey " +
+              "(plugin does not support the register-delivered key model)",
+          );
+          this.notifyErrorListeners(err);
+          this.client.disconnect();
+          return;
+        }
+        let key: Uint8Array;
+        try {
+          key = await unwrapConversationKey(
+            wrapped,
+            registration.deviceX25519PrivateKey!,
+          );
+        } catch (err) {
+          console.error("[nats-client] conversation-key unwrap failed:", err);
+          this.notifyErrorListeners(err as Error);
+          this.client.disconnect();
+          return;
+        }
+        if (this.connectionEpoch !== epoch) return;
+        this.sessionKey = key;
+        this.flushQueue();
+        return;
+      }
     }
 
+    // Legacy per-connection X25519 handshake (no registration at all — the
+    // wildcard/auto-admission path — or an embedder that has not supplied the
+    // cnf device key yet).
     const keyPair = await generateX25519KeyPair();
     // Same guard after the keygen await: do not clobber a fresher flow's keyPair
     // or publish a stale handshake.

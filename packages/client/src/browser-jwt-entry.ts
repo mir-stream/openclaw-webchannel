@@ -111,6 +111,9 @@ export async function runJwtRegister(
     registration: {
       registerBaseUrl: opts.gwUrl,
       devicePrivateKey: ed25519.privateKey,
+      // Phase 6: the cnf X25519 private key — the session key K arrives
+      // wrapped in the register response (no handshake on this path).
+      deviceX25519PrivateKey: x25519.privateKey,
     },
   });
 
@@ -246,6 +249,8 @@ export async function runAllReal(
     registration: {
       registerBaseUrl: opts.gwUrl,
       devicePrivateKey: ed25519.privateKey,
+      // Phase 6: register-delivered conversation key (no handshake).
+      deviceX25519PrivateKey: x25519.privateKey,
     },
   });
 

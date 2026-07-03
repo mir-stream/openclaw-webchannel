@@ -170,6 +170,8 @@ export async function runDemo(
           registration: {
             registerBaseUrl: opts.gwUrl,
             devicePrivateKey: ed25519.privateKey,
+            // Phase 6: register-delivered conversation key (no handshake).
+            deviceX25519PrivateKey: x25519.privateKey,
           },
         }
       : {}),

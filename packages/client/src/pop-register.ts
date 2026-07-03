@@ -18,6 +18,7 @@
  */
 
 import { base64urlEncode } from "./e2e-crypto-browser.js";
+import type { WrappedConversationKey } from "./e2e-crypto-browser.js";
 
 /** Device Ed25519 PoP public key in JWK form (matches the plugin's `pop_jwk`). */
 export type DevicePopJwk = {
@@ -92,16 +93,30 @@ export class PopRejectedError extends Error {
   }
 }
 
+/** Successful register-hop result (parsed register HTTP response). */
+export type RegisterWithPopResult = {
+  peerId: string;
+  registered: true;
+  /**
+   * Phase 6 (multi-device): the peer's conversation key K, wrapped by the
+   * agent to THIS device's X25519 `cnf` public key. Present when the plugin
+   * runs the register-delivered key model; the caller unwraps it with the
+   * device private key (`unwrapConversationKey`) instead of handshaking.
+   */
+  wrappedConversationKey?: WrappedConversationKey;
+};
+
 /**
  * Run the full PoP registration handshake: challenge → sign → register.
  *
- * @returns `{ peerId, registered: true }` on success.
+ * @returns the parsed register response (`peerId`, `registered`, and the
+ *          agent-wrapped conversation key when the plugin delivers one).
  * @throws {PopRejectedError} on a 401 from /register (bad/missing/expired proof).
  * @throws {Error} on transport / non-401 HTTP failures.
  */
 export async function registerWithPop(
   opts: RegisterWithPopOptions,
-): Promise<{ peerId: string; registered: true }> {
+): Promise<RegisterWithPopResult> {
   const f = opts.fetchImpl ?? fetch;
   const base = opts.registerBaseUrl.replace(/\/+$/, "");
   const authHeader = { Authorization: `Bearer ${opts.jwt}` };
@@ -133,5 +148,18 @@ export async function registerWithPop(
   if (!registerRes.ok) {
     throw new Error(`pop-register: registration failed (HTTP ${registerRes.status})`);
   }
-  return { peerId: opts.peerId, registered: true };
+  // Parse the response body for the Phase 6 wrapped conversation key. A body
+  // that fails to parse is treated as an old-plugin response (no wrapped key).
+  let wrappedConversationKey: WrappedConversationKey | undefined;
+  try {
+    const body = (await registerRes.json()) as {
+      wrappedConversationKey?: WrappedConversationKey;
+    };
+    wrappedConversationKey = body.wrappedConversationKey;
+  } catch {
+    /* old plugin / non-JSON body — legacy handshake path */
+  }
+  return wrappedConversationKey
+    ? { peerId: opts.peerId, registered: true, wrappedConversationKey }
+    : { peerId: opts.peerId, registered: true };
 }
