@@ -10,12 +10,13 @@
 //
 // WHAT THIS DRIVER PROVES: a NKEY-authenticated peer can complete an encrypted
 // MessageEnvelope round-trip with that enrolled agent. It:
-//   1. mints a bootstrap JWT (RS256, this issuer's trust chain) and drives the
-//      real HTTP register hop so the agent subscribes to this peer's subjects
-//      (the wildcard is OFF on the enrolled/jwt path — registration is the only
-//      admission path);
-//   2. fetches a NATS user cred for itself and connects to the JWT-auth
+//   1. fetches a NATS user cred for itself and connects to the JWT-auth
 //      nats-server using the production NatsTransport's NKEY challenge-response;
+//   2. mints a bootstrap JWT (RS256, this issuer's trust chain) and drives the
+//      real register hop over NATS request/reply (on the account's
+//      `…{peerId}.register` subject) so the agent subscribes to this peer's
+//      subjects (the wildcard is OFF on the enrolled/jwt path — registration is
+//      the only admission path);
 //   3. unwraps the register-delivered conversation key K (Phase 6 — the
 //      register-hop path has NO X25519 handshake; K arrives wrapped to the
 //      device cnf key in the register HTTP response) and runs the
@@ -23,6 +24,8 @@
 //      client), asserting the decrypted echo.
 //
 // Exit codes: 0 ok · 2 setup/HTTP failure · 3 timeout · 5 decrypt/mismatch.
+
+import { randomBytes } from "node:crypto";
 
 import { fromSeed } from "@nats-io/nkeys";
 
@@ -37,7 +40,6 @@ import {
 import { generateDevicePopKeyPair, registerWithPop } from "../../packages/client/src/pop-register.js";
 
 const NATS_WS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18422";
-const GW_URL = process.env.WEBCHANNEL_GW_URL ?? "http://127.0.0.1:18999";
 const ISSUER = process.env.WEBCHANNEL_ISSUER_URL ?? "http://127.0.0.1:3921";
 const TENANT = process.env.WEBCHANNEL_TENANT ?? "default-tenant";
 const ACCOUNT_ID = process.env.WEBCHANNEL_ACCOUNT_ID ?? "default-agent";
@@ -91,14 +93,61 @@ if (boot.status !== 200 || !boot.json?.jwt) {
 const bootstrapJwt: string = boot.json.jwt;
 console.log(`[driver] minted bootstrap JWT (kid=${boot.json.kid}, pop_jwk) for peerId=${PEER_ID}`);
 
-// 3. Drive the REAL HTTP register hop with PoP (challenge → sign nonce → register)
-//    so the agent subscribes to this peer. Uses the same production producer-side
-//    helper the browser client uses; a bad/missing proof would 401. Phase 6: the
-//    response carries the conversation key K wrapped to our cnf X25519 key.
+// 3. Fetch this driver's NATS user creds (browser role) and connect to the
+//    JWT-auth nats-server via NKEY challenge-response FIRST — the register hop
+//    now rides NATS request/reply, so the transport must be up to drive it.
+const cred = await postJson(`${ISSUER}/test/nats-user`, { tenant: TENANT, role: "browser", peerId: PEER_ID });
+if (cred.status !== 200 || !cred.json?.userJwt || !cred.json?.userSeed) {
+  fail(2, `nats-user mint failed: HTTP ${cred.status} ${cred.text}`);
+}
+const userJwt: string = cred.json.userJwt;
+const userSeed: string = cred.json.userSeed;
+console.log("[driver] obtained NATS user creds (browser role)");
+
+const userKp = fromSeed(new TextEncoder().encode(userSeed));
+const transport = new NatsTransport({
+  url: NATS_WS,
+  jwtCredential: userJwt,
+  nkeySigningCallback: (nonce: string) =>
+    Promise.resolve(Buffer.from(userKp.sign(new TextEncoder().encode(nonce))).toString("base64url")),
+  clientName: "enrolled-driver",
+});
+transport.on("error", (e: Error) => console.error("[driver][nats-error]", e.message));
+await transport.connect().catch((e) => fail(2, `NATS connect failed: ${(e as Error).message}`));
+console.log("[driver] NKEY-authenticated to JWT-auth nats-server");
+
+// 4. Drive the REAL register hop with PoP over NATS request/reply (challenge →
+//    sign nonce → register) so the agent subscribes to this peer. Uses the same
+//    production producer-side helper the browser client uses; a bad/missing proof
+//    replies a generic `unauthorized`. Phase 6: the reply carries the conversation
+//    key K wrapped to our cnf X25519 key. The reply-to inbox is in-namespace
+//    (covered by the per-peer creds `webchannel.{tenant}.*.{peerId}.>` — no `_INBOX` grant).
+const registerSubj = `webchannel.${TENANT}.${ACCOUNT_ID}.${PEER_ID}.register`;
+const replyPrefix = `webchannel.${TENANT}.${ACCOUNT_ID}.${PEER_ID}.reginbox`;
+const natsRegisterRequest = (body: unknown): Promise<unknown> =>
+  new Promise((resolve, reject) => {
+    const replySubject = `${replyPrefix}.${randomBytes(12).toString("hex")}`;
+    const sid = transport.subscribe(replySubject);
+    const onMsg = (msg: NatsMessage): void => {
+      if (msg.subject !== replySubject) return;
+      clearTimeout(timer);
+      transport.off("message", onMsg);
+      transport.unsubscribe(sid);
+      resolve(JSON.parse(msg.payload.toString("utf8")));
+    };
+    const timer = setTimeout(() => {
+      transport.off("message", onMsg);
+      transport.unsubscribe(sid);
+      reject(new Error("[driver] register request timeout"));
+    }, 5000);
+    transport.on("message", onMsg);
+    transport.publishWithReply(registerSubj, replySubject, JSON.stringify(body));
+  });
+
 let registerResult: Awaited<ReturnType<typeof registerWithPop>>;
 try {
   registerResult = await registerWithPop({
-    registerBaseUrl: GW_URL,
+    request: natsRegisterRequest,
     jwt: bootstrapJwt,
     peerId: PEER_ID,
     devicePrivateKey: popKeyPair.privateKey,
@@ -113,31 +162,9 @@ const sessionKey = await unwrapConversationKey(
   registerResult.wrappedConversationKey,
   deviceKp.privateKey,
 ).catch((e: Error) => fail(5, `conversation-key unwrap failed: ${e.message}`));
-console.log(`[driver] PoP register hop OK → agent subscribed to ${PEER_ID}, K unwrapped`);
+console.log(`[driver] PoP register hop (NATS) OK → agent subscribed to ${PEER_ID}, K unwrapped`);
 
-// 4. Fetch this driver's NATS user creds (browser role) from the issuer.
-const cred = await postJson(`${ISSUER}/test/nats-user`, { tenant: TENANT, role: "browser" });
-if (cred.status !== 200 || !cred.json?.userJwt || !cred.json?.userSeed) {
-  fail(2, `nats-user mint failed: HTTP ${cred.status} ${cred.text}`);
-}
-const userJwt: string = cred.json.userJwt;
-const userSeed: string = cred.json.userSeed;
-console.log("[driver] obtained NATS user creds (browser role)");
-
-// 5. Connect to the JWT-auth nats-server via NKEY challenge-response.
-const userKp = fromSeed(new TextEncoder().encode(userSeed));
-const transport = new NatsTransport({
-  url: NATS_WS,
-  jwtCredential: userJwt,
-  nkeySigningCallback: (nonce: string) =>
-    Promise.resolve(Buffer.from(userKp.sign(new TextEncoder().encode(nonce))).toString("base64url")),
-  clientName: "enrolled-driver",
-});
-transport.on("error", (e: Error) => console.error("[driver][nats-error]", e.message));
-await transport.connect().catch((e) => fail(2, `NATS connect failed: ${(e as Error).message}`));
-console.log("[driver] NKEY-authenticated to JWT-auth nats-server");
-
-// 6. Encrypted round-trip sealed with the register-delivered K — NO handshake
+// 5. Encrypted round-trip sealed with the register-delivered K — NO handshake
 //    frame is published (and the register-hop agent would not answer one).
 const replyText = new Promise<string>((resolve, reject) => {
   const timer = setTimeout(() => reject(new Error("TIMEOUT waiting for agent reply")), 30000);

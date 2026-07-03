@@ -1,9 +1,10 @@
 // Drives the PRODUCTION WebChannelNatsClient through the JWT + Proof-of-Possession
-// HTTP register hop — but unlike jwt-register-roundtrip.ts, the bootstrap JWT is
-// NOT self-minted from a static fixture. It is minted + RS256-signed by the REAL
-// reference bootstrap-server (packages/saas/reference/bootstrap-server.ts), which
-// derives a real RSA keypair via setupTrustChain() and serves the matching public
-// JWKS at /.well-known/jwks.json.
+// register hop (NATS request/reply) — but unlike jwt-register-roundtrip.ts, the
+// bootstrap JWT is NOT self-minted from a static fixture. It is minted +
+// RS256-signed by the REAL reference bootstrap-server
+// (packages/saas/reference/bootstrap-server.ts), which derives a real RSA keypair
+// via setupTrustChain() and serves the matching public JWKS at
+// /.well-known/jwks.json.
 //
 // WHAT THIS PROVES: the gateway boots with channels.webchannel.auth.strategy="jwt"
 // and auth.jwt.jwksUrl pointing AT the bootstrap-server's live JWKS endpoint. So
@@ -11,15 +12,15 @@
 // the real issuer and admits the token. With auth.strategy="jwt" the wildcard is
 // gated OFF (see index-nats.ts / nats-admission.ts), so the agent subscribes to NO
 // peer subjects until channel.registerPeer(peerId) runs — and the only thing that
-// does so is the live HTTP POST /webchannel/nats/register route, driven by the
-// production client's `registration` (PoP) path. Therefore a successful encrypted
-// round-trip means: real bootstrap-server RS256 issuance → real JWKS-over-HTTP
-// verification → live register hop → encrypted echo, end-to-end. Not a fixture.
+// does so is a register request on the account's `…{peerId}.register` NATS subject,
+// driven by the production client's `registration` (PoP) path. Therefore a
+// successful encrypted round-trip means: real bootstrap-server RS256 issuance →
+// real JWKS-over-HTTP verification → live NATS register hop → encrypted echo,
+// end-to-end. Not a fixture.
 import { webcrypto } from "node:crypto";
 import { WebChannelNatsClient } from "../../packages/client/src/nats-client.js";
 
 const NATS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18322";
-const GW_URL = process.env.WEBCHANNEL_GW_URL ?? "http://127.0.0.1:18899";
 const BOOTSTRAP_URL = process.env.WEBCHANNEL_BOOTSTRAP_URL ?? "http://127.0.0.1:3911";
 
 // "default" = the account key a flat (single-account) channels.webchannel
@@ -78,7 +79,7 @@ if (subFromJwt !== peerId) {
 }
 console.log(`[bootstrap] real SaaS issuer minted JWT for peerId=${peerId} (sub matches)`);
 
-// 5. Production client with the `registration` path enabled (PoP HTTP register).
+// 5. Production client with the `registration` path enabled (PoP register over NATS).
 const client = new WebChannelNatsClient({
   url: NATS,
   jwt,
@@ -86,7 +87,8 @@ const client = new WebChannelNatsClient({
   tenant: TENANT,
   peerId,
   registration: {
-    registerBaseUrl: GW_URL,
+    // The client derives the register subject from tenant/accountId/peerId and
+    // drives challenge→register over NATS request/reply (no gateway URL).
     devicePrivateKey: ed25519.privateKey,
     // Phase 6: register-delivered conversation key (no handshake).
     deviceX25519PrivateKey: x25519.privateKey,
@@ -104,7 +106,7 @@ const reply = new Promise<{ type: string; text?: string }>((resolve) => {
 
 client.connect();
 // No fixed sleep: the production client's send-buffering carries the message
-// through NATS connect + HTTP PoP register + handshake (see jwt-register-roundtrip.ts).
+// through NATS connect + the NATS PoP register hop + key delivery (see jwt-register-roundtrip.ts).
 console.log("[send] 'hello via real saas issuer'");
 client.sendUserMessage("hello via real saas issuer");
 

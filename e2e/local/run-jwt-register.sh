@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Hermetic JWT-register E2E: prove the HTTP /webchannel/nats/register hop is the
-# SOLE peer-admission path. With channels.webchannel.auth.strategy="jwt" the agent
-# does NOT subscribeWildcard (see index-nats.ts wildcard gate), so a successful
-# round-trip means registerPeer happened ONLY via the live HTTP register route,
-# driven by the production client's `registration` (PoP) path.
+# Hermetic JWT-register E2E: prove the NATS register hop (request/reply on
+# `…{peerId}.register`) is the SOLE peer-admission path. With
+# channels.webchannel.auth.strategy="jwt" the agent does NOT subscribeWildcard
+# (see index-nats.ts wildcard gate), so a successful round-trip means registerPeer
+# happened ONLY via the register hop, driven by the client's `registration` (PoP) path.
 #
 # Everything runs under an isolated OPENCLAW_HOME=/tmp/oc-e2e; your real
 # ~/.openclaw is never touched. Idempotent + self-cleaning (trap on EXIT).

@@ -97,9 +97,9 @@ node e2e/local/browser-roundtrip.mjs    # exits 0 iff the reply echoes the sent 
 
 Both drivers print `[REPLY] echo: …<your message>`, proving the round-trip.
 
-## JWT-register scenario (HTTP hop as sole admission)
+## JWT-register scenario (NATS register hop as sole admission)
 
-`run-jwt-register.sh` proves the **HTTP `/webchannel/nats/register` route is the SOLE
+`run-jwt-register.sh` proves the **NATS register hop (`…{peerId}.register`) is the SOLE
 peer-admission path** — no wildcard shortcut. It is a sibling of the open-NATS round-trip above,
 but boots the gateway with `channels.webchannel.auth.strategy = "jwt"`. The wildcard is gated
 off on the jwt path (`index-nats.ts` / `src/wildcard-gate.ts` `shouldSubscribeWildcard`):
@@ -195,8 +195,9 @@ Encryption stays **on** (encrypt-by-construction default); the relay only ever s
   register hop is now **exercised end-to-end** by the JWT-register scenario above
   (`run-jwt-register.sh`): under `auth.strategy="jwt"` the wildcard is gated OFF
   (`src/wildcard-gate.ts`), so the round-trip there proves `registerPeer` happens **only** via the
-  live HTTP route. (Background: the plain-HTTP `/webchannel/nats/register*` routes work live — #8
-  done; the client is wired to call `registerWithPop` — #11 done.) The remaining gap (#13) shrinks
+  register hop. (Background: register admission rides NATS request/reply on
+  `…{peerId}.register` — the HTTP routes were retired; the client is wired to call `registerWithPop`
+  over that seam — #11 done.) The remaining gap (#13) shrinks
   to: a real **browser/Playwright** JWT variant against a **real SaaS issuer** — deferred because
   Playwright cannot pass an Ed25519 `CryptoKey` across the page boundary (the Node driver can).
 - **In CI (JWT-register harness)** — `run-jwt-register.sh` is now run by the CI gate
