@@ -1,20 +1,47 @@
 # Phase 6 — Multi-Device E2E — Design Plan
 
-Status: **IMPLEMENTED (2026-07-03, branch `feature/showcase-demo`) — all W1–W7
-landed; §12 acceptance PASSED** (Playwright scene `demo/verify-multidevice.mjs`
-6/6 · K-restart + divergence unit tests · all 6 live e2e harnesses · all 6 demo
-drivers · suites 727 plugin / 130 client / 115 saas green).
+Status: **DONE (2026-07-03, branch `feature/showcase-demo`, 7 commits
+`9603f2f..56d5a84`) — all W1–W7 landed, §12 acceptance PASSED, fresh-agent
+review PASSED (0 critical; all 5 findings fixed in `56d5a84`).**
+Verified: `demo/verify-multidevice.mjs` 6/6 × 4 consecutive runs · K-restart +
+divergence + race unit tests · all 6 live e2e harnesses · all 6 demo drivers ·
+suites 736 plugin / 136 client / 115 saas green · secret scan clean.
 Interview: `interview_20260703_043054` (ambiguity 0.06, Restate gate passed).
 Owner decided to SKIP `ooo seed` — THIS DOCUMENT was the implementation spec.
 Memory ref: [[phase6-multidevice-design]] · related: [[showcase-demo-build]], [[e2e-nats-relay-seed]]
 
-**Post-implementation finding (demo config, pre-existing):** openclaw
-`session.dmScope` defaults to `"main"`, so ALL direct peers of an agent shared
-ONE session — bob's register snapshot contained alice's conversation (re-sealed
-with bob's K; crypto isolation held, session scoping didn't). openclaw's own
-channel audit flags exactly this. Fixed in `demo/run.sh` with
-`"session": { "dmScope": "per-channel-peer" }`; any multi-user deployment needs
-the same setting.
+**Follow-ups (out of Phase 6 scope):** live-gateway migration auto→register
+admission (MUST include `session.dmScope: "per-channel-peer"`), K rotation.
+
+### Post-implementation findings (durable — verified against code/live runs)
+
+1. **Cross-user history leak via `session.dmScope: "main"` (pre-existing).**
+   openclaw's default collapses ALL direct peers into ONE agent session, so the
+   register history snapshot (and `load_history`) delivers the SHARED transcript
+   to every user, re-sealed to each requester's own K — crypto isolation held,
+   session scoping didn't. Fixed in `demo/run.sh`
+   (`"session": { "dmScope": "per-channel-peer" }`) and the plugin now WARNS at
+   startup for any register-hop account still on `"main"`
+   (`crossUserHistoryWarning`, `nats-admission.ts`). Hard requirement for any
+   multi-user deployment.
+2. **Live agent frame ≠ transcript (review finding 3, was real).** openclaw
+   strips metadata sections from live replies but stores the raw model output,
+   AND never stores the plugin's live frame id — so neither id- nor exact-text
+   matching can pair a live agent bubble with its snapshot copy. Fix: 3-tier
+   snapshot matching in `nats-client-wrapper.ts` (id → exact text+role →
+   POSITIONAL: an agent reply follows its matched predecessor; adopt onto the
+   live-id agent bubble at anchor+1, converging to the canonical stored text).
+3. **Snapshot-vs-key race (review finding 2).** The register snapshot travels
+   NATS while the wrapped K travels the HTTP response — no ordering guarantee.
+   The client buffers (bounded 64) undecryptable `.out` frames and drains them
+   the moment the session key is set (`pendingInbound`, `nats-client.ts`).
+4. **Mid-turn-join gap (accepted).** The register snapshot reflects the core
+   transcript at register time; a turn still flushing lands via live frames
+   only, so a device joining mid-turn misses that turn's USER bubble until its
+   next re-register/reload. Inherent to snapshot-at-register; the acceptance
+   scene settles ~3s after an echo before register-triggering steps.
+5. The demo widget exposes `globalThis.__webchannelState()` as a driver hook
+   for state-level (id-accurate) assertions in verify drivers.
 
 **Decision summary (details in §8/§11):** option B register-only; auto-admission keeps
 legacy handshake untouched (F5=a); wrapped-K delivered in the register HTTP response
