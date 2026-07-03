@@ -332,6 +332,27 @@ isolation leg needs a real tool-calling model (echo issues no exec) — the wiri
 exists (`approvals.ts` prepareTarget + handleApprovalDecision, widget renders
 cards); demo it on a real model.
 
+## Phase 3–4 status (2026-07-03) — chaos + short-TTL built + verified
+
+**Phase 3 (scene ③) — chaos 4/4 verified.** chaos.sh + chaos-nats.ts (raw
+NATS-over-WS + register-hop replay). All verified live: **restart-relay**
+(availability — queued-during-outage message delivered on reconnect);
+**cross-tenant** (isolation — `-ERR Permissions Violation` for tenant-b on
+tenant-a); **tamper** (integrity — bit-flipped .out frame AEAD-dropped, chat
+clean); **replay-jwt** (authentication — register nonce single-use, first 200 +
+replay 401). Active-MITM still out of scope (C2).
+
+**Phase 4 (scene ⑤) — short-TTL verified.** Product: `mintNatsUserCreds`
+gains opt-in `ttlSeconds` → user JWT `exp` (non-expiring by default, 15 tests
+unchanged). Demo: `/nats-user` accepts a bounded ttl; widget.ts `connectLane()`
++ a "⏱ short-lived" control reconnect with a 12s credential. Verified live: the
+credential lapses → `-ERR 'User Authentication Expired'` → terminal "Credentials
+expired" box (no eternal spinner) → one-click Re-authenticate restores the lane.
+
+**Scene coverage: base layer + ①②③④⑤ all built + verified** (④'s exec-approval
+isolation leg needs a real tool-calling model; ⑥ multi-device is Phase 6, out of
+this scope).
+
 ## Honest-demo notes
 
 - **Active-MITM is NOT claimed (C2).** The E2E session key is derived from
