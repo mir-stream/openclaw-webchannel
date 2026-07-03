@@ -2,12 +2,14 @@
 /**
  * Phase 5 aside #2 driver — one gateway, many accounts.
  *
- * With ./demo/multiplex.sh --auto-approve running, a SINGLE gateway (:19599)
- * serves team-sales AND team-support. This asserts:
- *  1. alice's rendezvous for team-sales and bob's for team-support point at the
- *     SAME registerBaseUrl (:19599) ⇒ one gateway process, two accounts.
- *  2. Each user actually chats on their account (echo round-trip), so the
- *     multiplex is live end-to-end, not just configured.
+ * With ./demo/multiplex.sh --auto-approve running, a SINGLE gateway serves
+ * team-sales AND team-support (it subscribes BOTH accounts' register subjects).
+ * Register admission is over NATS now, so the rendezvous carries no per-account
+ * gateway URL to compare — the multiplex is proven END-TO-END instead:
+ *  1. alice's rendezvous exposes team-sales and bob's exposes team-support (both
+ *     grantable, each on the shared relay).
+ *  2. Each user actually chats on their account (echo round-trip) through the one
+ *     gateway multiplex.sh launched ⇒ one process, two accounts, live.
  *
  * Not part of CI — a local smoke for the demo during development.
  */
@@ -19,7 +21,6 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const { chromium } = require(`${ROOT}/node_modules/openclaw/node_modules/playwright-core`);
 
 const URL = process.env.DEMO_URL ?? "http://127.0.0.1:3961";
-const GW_PORT = process.env.MULTIPLEX_PORT ?? "19599";
 
 async function meFor(username) {
   const login = await fetch(`${URL}/login`, {
@@ -68,20 +69,24 @@ let code = 1;
 try {
   const alice = await meFor("alice");
   const bob = await meFor("bob");
-  const salesUrl = alice.accounts?.["team-sales"]?.registerBaseUrl ?? "";
-  const supportUrl = bob.accounts?.["team-support"]?.registerBaseUrl ?? "";
-  const sameGateway = salesUrl.includes(`:${GW_PORT}`) && supportUrl.includes(`:${GW_PORT}`);
-  console.log(`[multiplex] alice team-sales → ${salesUrl}`);
-  console.log(`[multiplex] bob   team-support → ${supportUrl}`);
-  console.log(`[multiplex] same gateway (:${GW_PORT}) = ${sameGateway}`);
+  // Structural sanity: each user's account is present + dialable (shared relay).
+  const salesReady = Boolean(alice.accounts?.["team-sales"]?.natsUrl);
+  const supportReady = Boolean(bob.accounts?.["team-support"]?.natsUrl);
+  console.log(`[multiplex] alice team-sales → ${alice.accounts?.["team-sales"]?.natsUrl ?? "(missing)"}`);
+  console.log(`[multiplex] bob   team-support → ${bob.accounts?.["team-support"]?.natsUrl ?? "(missing)"}`);
+  if (!salesReady || !supportReady) {
+    throw new Error("expected both accounts in the rendezvous (team-sales for alice, team-support for bob)");
+  }
 
+  // The real multiplex proof: both users chat end-to-end through the ONE gateway
+  // multiplex.sh launched (subscribing both accounts' register subjects).
   await chatOn(browser, "alice", "team-sales", "sales hello");
   console.log("[multiplex] ✓ alice chatted on team-sales (echo)");
   await chatOn(browser, "bob", "team-support", "support hello");
   console.log("[multiplex] ✓ bob chatted on team-support (echo)");
 
-  code = sameGateway ? 0 : 3;
-  console.log(`[multiplex] result: one-gateway-two-accounts=${sameGateway ? "OK" : "FAIL"} both-chat=OK`);
+  code = 0;
+  console.log("[multiplex] result: both accounts served by the single gateway (both-chat=OK)");
 } catch (err) {
   console.error("[multiplex] FAIL:", err?.message ?? err);
   code = 2;

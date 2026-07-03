@@ -150,9 +150,10 @@ for acct in "${ACCOUNTS[@]}"; do
 done
 
 # ONE gateway serves BOTH accounts (registerFull multiplex).
+# NOTE: no WEBCHANNEL_GW_URL is exported — register/admission rides the plugin's
+# outbound NATS connection, so nothing dials this port for webchannel.
 HOME="$HOME_DIR" OPENCLAW_HOME="$HOME_DIR" OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
-  WEBCHANNEL_GW_URL="http://127.0.0.1:$PORT" \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$PORT" --force >"$HOME_DIR/gateway.log" 2>&1 &
 GW_PID=$!
 echo "[multiplex] gateway pid=$GW_PID serving ${#ACCOUNTS[@]} accounts — waiting…"
@@ -165,12 +166,14 @@ for i in $(seq 1 240); do
   [ "$i" -eq 240 ] && { echo "[multiplex] gateway TIMEOUT:"; tail -20 "$HOME_DIR/gateway.log"; exit 2; }
 done
 
-# Point BOTH accounts' rendezvous at the SAME gateway + grant each to its user.
+# Declare BOTH accounts into the SaaS directory + grant each to its user. There
+# is no per-account URL — the ONE gateway subscribes both accounts' register
+# subjects, so declaring them into the directory is enough to make them dialable.
 for idx in "${!ACCOUNTS[@]}"; do
   acct="${ACCOUNTS[$idx]}"; grantee="${GRANTEES[$idx]}"
   curl -fsS -b "$OCH/multiplex.jar" -X POST "$SAAS_URL/admin/accounts" \
     -H 'Content-Type: application/json' \
-    -d "{\"accountId\":\"$acct\",\"registerBaseUrl\":\"http://127.0.0.1:$PORT\"}" >/dev/null || true
+    -d "{\"accountId\":\"$acct\"}" >/dev/null || true
   if [ "$AUTO_APPROVE" = 1 ]; then
     # Grant = replace the user's account set with (existing ∪ acct). Read then write.
     cur="$(curl -fsS -b "$OCH/multiplex.jar" "$SAAS_URL/admin/users" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const u=JSON.parse(s).users.find(x=>x.username===process.argv[1]);process.stdout.write(JSON.stringify(u?u.allowedAccounts:[]))})' "$grantee")"

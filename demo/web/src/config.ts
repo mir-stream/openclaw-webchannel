@@ -1,10 +1,12 @@
 /**
  * Demo runtime config — injected by saas-server.ts into the page <head> as
  * `globalThis.__DEMO_CONFIG__` before /app.js runs. The browser never learns the
- * relay/gateway from anything but this SaaS-delivered config (SaaS = rendezvous
- * authority): per-account `{ natsUrl, registerBaseUrl }` travels with the account.
+ * relay from anything but this SaaS-delivered config (SaaS = rendezvous
+ * authority): per-account `{ natsUrl }` travels with the account. Registration
+ * now rides NATS request/reply on the account's own subject (no gateway URL to
+ * dial), so `natsUrl` is the sole rendezvous value.
  */
-export type RendezvousEntry = { natsUrl: string; registerBaseUrl: string };
+export type RendezvousEntry = { natsUrl: string };
 
 export type DemoConfig = {
   issuerUrl: string;

@@ -8,7 +8,8 @@
 #                   is queued and delivered in order on reconnect — never lost,
 #                   only ever ciphertext. Proves AVAILABILITY.
 #   tamper          publish a bit-flipped copy of a captured ciphertext frame to
-#                   a peer's .out using observer creds. AEAD-open returns null →
+#                   a peer's .out (wire-position adversary → agent creds, since
+#                   browser creds are per-peer scoped). AEAD-open returns null →
 #                   the widget silently drops it; the chat stays clean. INTEGRITY.
 #   replay-jwt      replay a register challenge/response (reuse a burned nonce).
 #                   The gateway returns 401 — the nonce is single-use. AUTH.

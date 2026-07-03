@@ -146,9 +146,11 @@ node -e '
   fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
 ' "$HOME_DIR/.openclaw/openclaw.json" "$ACCOUNT"
 
+# NOTE: no WEBCHANNEL_GW_URL is exported — register/admission rides the plugin's
+# outbound NATS connection, so nothing dials this port for webchannel (the plugin
+# no longer reads it). The --port still binds openclaw's own local gateway.
 HOME="$HOME_DIR" OPENCLAW_HOME="$HOME_DIR" OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
-  WEBCHANNEL_GW_URL="http://127.0.0.1:$PORT" \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$PORT" --force >"$HOME_DIR/gateway.log" 2>&1 &
 GW_PID=$!
 echo "[add-agent] $ACCOUNT gateway pid=$GW_PID — waiting for registration…"
@@ -160,15 +162,17 @@ for i in $(seq 1 240); do
   [ "$i" -eq 240 ] && { echo "[add-agent] gateway TIMEOUT:"; tail -20 "$HOME_DIR/gateway.log"; exit 2; }
 done
 
-# Register this new account's rendezvous with the SaaS so an open widget can dial
-# it (scene ②: "selectable in the already-open widget"). Needs an admin session.
+# Declare this new account into the SaaS directory so an open widget can dial it
+# (scene ②: "selectable in the already-open widget"). Register admission is over
+# NATS — this gateway subscribes the account's register subject — so declaring it
+# into the directory (no URL) makes it dialable. Needs an admin session.
 curl -fsS -c "$OCH/addagent.jar" -X POST "$SAAS_URL/login" \
   -H 'Content-Type: application/json' -d '{"username":"admin","password":"demo"}' >/dev/null
 curl -fsS -b "$OCH/addagent.jar" -X POST "$SAAS_URL/admin/accounts" \
   -H 'Content-Type: application/json' \
-  -d "{\"accountId\":\"$ACCOUNT\",\"registerBaseUrl\":\"http://127.0.0.1:$PORT\"}" >/dev/null \
-  && echo "[add-agent] ✓ $ACCOUNT rendezvous registered with SaaS (now grantable/selectable)" \
-  || echo "[add-agent] ⚠ failed to register rendezvous with SaaS"
+  -d "{\"accountId\":\"$ACCOUNT\"}" >/dev/null \
+  && echo "[add-agent] ✓ $ACCOUNT declared into the SaaS directory (now grantable/selectable)" \
+  || echo "[add-agent] ⚠ failed to declare account into SaaS directory"
 
 echo ""
 echo "  ✓ agent-docs added. It appears in the admin panel; grant it to a user to"

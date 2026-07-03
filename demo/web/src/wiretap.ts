@@ -32,14 +32,25 @@ export async function createWiretap(
   const statusLine = el("div", { style: "font-size:11px;color:var(--muted);margin-bottom:8px" }, ["connecting observer…"]);
   const note = el("div", {
     style: "font-size:11px;color:var(--muted);margin-bottom:8px;line-height:1.4",
-  }, ["Observer creds subscribe the entire tenant subtree. The routing envelope is plaintext (the relay must route it), but every message body is ciphertext — decode the hex and you never find what was typed."]);
+  }, [
+    "Observer creds subscribe the entire tenant subtree. The routing envelope is plaintext (the relay must route it), but every message body is ciphertext — decode the hex and you never find what was typed. ",
+    // Register/admission now rides the relay too — so the observer SEES it happen
+    // and still can't break in: the bootstrap JWT is single-use (PoP: signed over a
+    // one-time nonce) + short-TTL, and the delivered conversation key is wrapped to
+    // the device key. Tagged ✦admission frames below.
+    el("span", { style: "color:var(--warn)" }, ["✦admission"]),
+    " frames (register / reginbox) are the enrollment exchange on the relay — visible, but replaying the JWT fails (single-use nonce) and the wrapped key is useless without the device key.",
+  ]);
   const frames = el("div", { style: "display:flex;flex-direction:column;gap:6px;font-family:var(--mono)" });
   bodyEl.append(statusLine, note, frames);
 
-  // Observer creds: a browser-role NATS user (pub/sub webchannel.{tenant}.>).
+  // Observer creds: a SUB-only NATS user (sub webchannel.{tenant}.>, NO pub). The
+  // wiretap must never publish — observer is strictly weaker than a browser (which
+  // is now pinned to its own peer subtree), so it can read every frame but can't
+  // inject one.
   const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
     "/nats-user",
-    { method: "POST", body: { role: "browser" } },
+    { method: "POST", body: { role: "observer" } },
   );
   if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
     statusLine.textContent = `observer creds failed (HTTP ${creds.status})`;
@@ -76,10 +87,21 @@ export async function createWiretap(
 
   client.onRawMessage((subject: string, payload: string) => {
     const leaf = subject.split(".").slice(-2).join(".");
+    // The admission exchange (register request + reginbox reply) rides the relay
+    // now — tag it so a viewer notices the JWT/PoP handshake is visible yet safe.
+    // Match BOTH the request (`…{peerId}.register`) and the reply, whose subject
+    // is `…{peerId}.reginbox.{token}` (ends in the token, not `.reginbox`), via a
+    // segment check rather than an end-anchored test.
+    const isAdmission = subject.split(".").some((s) => s === "register" || s === "reginbox");
     const row = el("div", {
-      style: "border:1px solid var(--border);border-radius:5px;padding:6px 8px;font-size:11px",
+      style:
+        "border:1px solid " + (isAdmission ? "var(--warn)" : "var(--border)") +
+        ";border-radius:5px;padding:6px 8px;font-size:11px",
     }, [
-      el("div", { style: "color:var(--accent);margin-bottom:3px" }, [leaf]),
+      el("div", { style: "color:var(--accent);margin-bottom:3px" }, [
+        ...(isAdmission ? [el("span", { style: "color:var(--warn)" }, ["✦admission "])] : []),
+        leaf,
+      ]),
       el("div", { style: "color:var(--muted);word-break:break-all;line-height:1.5" }, [toHex(payload)]),
     ]);
     frames.prepend(row);

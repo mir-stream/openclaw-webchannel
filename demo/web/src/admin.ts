@@ -3,6 +3,10 @@
  *
  *  - Enrollment requests: live list with Approve / Deny (scene ②'s "authority
  *    can say no"), plus the terminal states (approved / denied / expired).
+ *  - Agent directory: EVERY account the SaaS knows — boot-seeded, admin-added,
+ *    and (crucially) accounts that entered via an APPROVED ENROLLMENT. Register
+ *    admission rides NATS (no gateway URL to set), so an account in the directory
+ *    is immediately grantable — approve an enrollment and it just works.
  *  - User↔account grants: per-user account chips the operator toggles; the
  *    change takes effect at the user's next bootstrap (canAccess at JWT-mint).
  *
@@ -18,6 +22,10 @@ type Enroll = {
 };
 type UserRow = { username: string; allowedAccounts: string[] };
 type UsersResponse = { accounts: string[]; users: UserRow[] };
+type AccountRow = {
+  accountId: string;
+  source: "boot" | "enrolled" | "admin";
+};
 
 const STATUS_COLOR: Record<Enroll["status"], string> = {
   pending: "var(--warn)",
@@ -66,6 +74,13 @@ export function createAdminPanel(bodyEl: HTMLElement, _config: DemoConfig): () =
     enrollList,
   );
 
+  const acctSection = el("div", { style: "margin-bottom:18px" });
+  const acctList = el("div", { style: "display:flex;flex-direction:column;gap:8px" });
+  acctSection.append(
+    el("div", { style: "font-size:11px;text-transform:uppercase;color:var(--muted);margin-bottom:8px" }, ["Agent directory"]),
+    acctList,
+  );
+
   const usersSection = el("div");
   const usersList = el("div", { style: "display:flex;flex-direction:column;gap:10px" });
   usersSection.append(
@@ -73,7 +88,7 @@ export function createAdminPanel(bodyEl: HTMLElement, _config: DemoConfig): () =
     usersList,
   );
 
-  bodyEl.append(signingSection, enrollSection, usersSection);
+  bodyEl.append(signingSection, enrollSection, acctSection, usersSection);
 
   async function refreshEnrollments(): Promise<void> {
     const { ok, data } = await api<Enroll[]>("/admin/enrollments");
@@ -117,6 +132,42 @@ export function createAdminPanel(bodyEl: HTMLElement, _config: DemoConfig): () =
     );
   }
 
+  // Guarded re-render: the poll only repaints when the server data actually
+  // changed. Register admission is over NATS, so an account in the directory is
+  // immediately dialable — the row is just identity (accountId + how it entered).
+  let lastAccountsJson = "";
+  async function refreshAccounts(): Promise<void> {
+    const { ok, data } = await api<AccountRow[]>("/admin/accounts");
+    if (!ok || !Array.isArray(data)) return;
+    const json = JSON.stringify(data);
+    if (json === lastAccountsJson) return;
+    const changed = lastAccountsJson !== "";
+    lastAccountsJson = json;
+    if (data.length === 0) {
+      acctList.replaceChildren(
+        el("div", { style: "font-size:12px;color:var(--muted)" }, ["(none yet — approve an enrollment and it appears here)"]),
+      );
+      return;
+    }
+    acctList.replaceChildren(
+      ...data.map((a) => {
+        const row = el("div", { style: "border:1px solid var(--border);border-radius:6px;padding:8px 10px" });
+        row.append(
+          el("div", { style: "display:flex;align-items:center;gap:6px" }, [
+            el("code", { style: "font-size:12px;font-weight:600" }, [a.accountId]),
+            el("span", { style: "font-size:10px;color:var(--muted);border:1px solid var(--border);border-radius:8px;padding:1px 6px" }, [a.source]),
+            el("span", { style: "flex:1" }),
+            el("span", { style: "font-size:11px;color:var(--good)" }, ["grantable"]),
+          ]),
+        );
+        return row;
+      }),
+    );
+    // A newly-appeared account (e.g. an approved enrollment) is now grantable —
+    // refresh the grant chips so the operator can grant it immediately.
+    if (changed) await refreshUsers();
+  }
+
   async function refreshUsers(): Promise<void> {
     const { ok, data } = await api<UsersResponse>("/admin/users");
     if (!ok || !Array.isArray(data.users)) return;
@@ -158,8 +209,12 @@ export function createAdminPanel(bodyEl: HTMLElement, _config: DemoConfig): () =
 
   refreshSigningKey();
   refreshEnrollments();
+  refreshAccounts();
   refreshUsers();
-  const enrollTimer = setInterval(refreshEnrollments, 2000);
+  const enrollTimer = setInterval(() => {
+    refreshEnrollments();
+    refreshAccounts();
+  }, 2000);
 
   return () => {
     clearInterval(enrollTimer);

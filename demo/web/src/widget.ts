@@ -6,9 +6,9 @@
  *
  * The full connect handshake is production: generate device keys in-page, mint
  * browser NATS creds + a PoP bootstrap JWT from the SaaS, then drive the wrapper
- * with BOTH natsCredentials (NATS-layer NKEY auth) and registration (HTTP PoP
- * register hop). The Ed25519 PoP private key is non-extractable and never leaves
- * the page.
+ * with BOTH natsCredentials (NATS-layer NKEY auth) and registration (PoP register
+ * hop over NATS request/reply). The Ed25519 PoP private key is non-extractable
+ * and never leaves the page.
  *
  * Scene ⑤ (short-lived trust): the "short-lived" control reconnects the lane with
  * a short-TTL NATS credential. When it lapses the relay refuses it, the client
@@ -55,6 +55,13 @@ export async function createWidget(
     shortBtn,
     historyBtn,
   ]);
+  // Multi-device hint (scene ⑥): each tab generates its own device keys and gets
+  // its own register-delivered conversation key, so the same user in a second tab
+  // is a distinct device that still decrypts the shared backlog. No extra wiring —
+  // the capability is inherent; this line just tells the viewer to try it.
+  const mdHint = el("div", {
+    style: "font-size:11px;color:var(--muted);margin-bottom:8px",
+  }, ["↔ multi-device: open another tab as the same user — it syncs (each tab is its own device key)"]);
   const list = el("div", { style: "display:flex;flex-direction:column;gap:8px;min-height:120px" });
   const approvalsBox = el("div", { style: "display:flex;flex-direction:column;gap:8px" });
   const errBox = el("div", {
@@ -66,7 +73,7 @@ export async function createWidget(
   const input = el("input", { placeholder: "Type a message…", style: "flex:1" }) as HTMLInputElement;
   const sendBtn = el("button", { class: "primary" }, ["Send"]) as HTMLButtonElement;
   const composer = el("div", { style: "display:flex;gap:8px;margin-top:10px" }, [input, sendBtn]);
-  bodyEl.append(topBar, errBox, list, approvalsBox, composer);
+  bodyEl.append(topBar, mdHint, errBox, list, approvalsBox, composer);
 
   let client: WebChannelNATSClient | null = null;
 
@@ -174,7 +181,7 @@ export async function createWidget(
     if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
       throw new Error(`nats-user failed (HTTP ${creds.status})`);
     }
-    const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string; registerBaseUrl?: string }>(
+    const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string }>(
       "/bootstrap",
       { method: "POST", body: { accountId, deviceX25519PublicKey, devicePopPublicKey } },
     );
@@ -183,7 +190,6 @@ export async function createWidget(
     }
 
     const natsUrl = boot.data.natsUrl ?? creds.data.natsUrl ?? rv.natsUrl;
-    const registerBaseUrl = boot.data.registerBaseUrl ?? rv.registerBaseUrl;
 
     client = new WebChannelNATSClient({
       natsUrl,
@@ -193,7 +199,8 @@ export async function createWidget(
       peerId: boot.data.peerId,
       natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
       registration: {
-        registerBaseUrl,
+        // The register subject is derived from tenant/accountId/peerId; the
+        // client drives challenge→register over NATS request/reply (no gateway URL).
         devicePrivateKey: ed25519.privateKey,
         // Phase 6: register-delivered conversation key (no handshake).
         deviceX25519PrivateKey: x25519.privateKey,

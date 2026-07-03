@@ -5,18 +5,23 @@
  *                  answers -ERR Permissions Violation (tenant ISOLATION).
  *   tamper         capture a live ciphertext .out frame with observer creds,
  *                  bit-flip it, republish → the widget AEAD-drops it (INTEGRITY).
- *   replay-jwt     (see chaos.sh note) register replay — separate HTTP flow.
+ *   replay-jwt     drive the register hop over NATS request/reply, then REPLAY
+ *                  the same nonce+signature → the burned nonce is rejected with
+ *                  the generic `unauthorized` (single-use nonce; NO oracle).
  *
  * Uses a MINIMAL raw NATS-over-WebSocket client (NKEY challenge-response reusing
  * the production nats-nkey-browser signing), because the production NatsClient
  * only surfaces TERMINAL -ERR via onError — a per-subject "Permissions Violation"
  * is non-terminal and never reaches a callback, so we read raw protocol lines.
+ * The same raw client's `request()` drives the register hop's challenge/register
+ * request/reply (the register HTTP route is gone).
  */
 import { importEd25519SeedKey, signNonce } from "../packages/client/src/nats-nkey-browser.js";
 import { generateDevicePopKeyPair, signPop } from "../packages/client/src/pop-register.js";
 
 const SAAS_URL = process.env.SAAS_URL || "http://127.0.0.1:3961";
 const TENANT = process.env.DEMO_TENANT || "demo-tenant";
+const ACCOUNT = process.env.DEMO_ACCOUNT || "agent-dev";
 
 function b64urlDecode(s: string): Uint8Array {
   return new Uint8Array(Buffer.from(s, "base64url"));
@@ -27,6 +32,14 @@ type Creds = { userJwt: string; userSeedRaw: string; natsUrl: string };
 type RawNats = {
   sub: (subject: string) => void;
   pub: (subject: string, payload: string) => void;
+  /**
+   * NATS request/reply: SUB a fresh in-namespace reply inbox (derived from
+   * `replyPrefix`, covered by the tenant-wide creds — no `_INBOX` grant), PUB
+   * `payload` to `subject` with that inbox as reply-to, and resolve with the
+   * first reply payload (or reject on timeout). This is the raw analogue of the
+   * production client's `NatsClient.request` — the register hop now rides it.
+   */
+  request: (subject: string, replyPrefix: string, payload: string, timeoutMs?: number) => Promise<string>;
   onLine: (h: (line: string) => void) => void;
   onMsg: (h: (subject: string, payload: string) => void) => void;
   close: () => void;
@@ -53,10 +66,39 @@ function rawConnect(creds: Creds): Promise<RawNats> {
     let ready = false;
     const lineHandlers = new Set<(line: string) => void>();
     const msgHandlers = new Set<(subject: string, payload: string) => void>();
+    let sidCounter = 1;
+
+    const rand = (): string => Buffer.from(crypto.getRandomValues(new Uint8Array(12))).toString("hex");
 
     const api: RawNats = {
       sub: (s) => ws.send(`SUB ${s} 1\r\n`),
       pub: (s, p) => ws.send(`PUB ${s} ${Buffer.byteLength(p, "binary")}\r\n${p}\r\n`),
+      request: (subject, replyPrefix, payload, timeoutMs = 5000) =>
+        new Promise<string>((resolveReq, rejectReq) => {
+          const replySubject = `${replyPrefix}.${rand()}`;
+          const sid = ++sidCounter;
+          let settled = false;
+          const onReply = (subj: string, pl: string): void => {
+            if (subj !== replySubject || settled) return;
+            settled = true;
+            clearTimeout(timer);
+            msgHandlers.delete(onReply);
+            ws.send(`UNSUB ${sid}\r\n`);
+            resolveReq(pl);
+          };
+          const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            msgHandlers.delete(onReply);
+            ws.send(`UNSUB ${sid}\r\n`);
+            rejectReq(new Error("request timeout"));
+          }, timeoutMs);
+          msgHandlers.add(onReply);
+          ws.send(`SUB ${replySubject} ${sid}\r\n`);
+          ws.send(
+            `PUB ${subject} ${replySubject} ${Buffer.byteLength(payload, "binary")}\r\n${payload}\r\n`,
+          );
+        }),
       onLine: (h) => lineHandlers.add(h),
       onMsg: (h) => msgHandlers.add(h),
       close: () => ws.close(),
@@ -134,13 +176,17 @@ async function crossTenant(): Promise<number> {
 
 async function tamper(): Promise<number> {
   const cookie = await adminCookie();
-  // Observer creds for THIS tenant (admin session). Same mint the wiretap uses.
+  // Wire-position adversary: this scene captures ANOTHER peer's `.out` frame and
+  // republishes a bit-flipped copy, modelling a tampering relay. That needs
+  // tenant-wide read AND write, so it uses AGENT creds — browser creds are now
+  // pinned to the caller's own peer subtree (per-peer scoping) and observer creds
+  // are sub-only, so neither can write to a victim peer's `.out`.
   const res = await fetch(`${SAAS_URL}/nats-user`, {
     method: "POST",
     headers: { "Content-Type": "application/json", cookie },
-    body: JSON.stringify({ role: "browser" }),
+    body: JSON.stringify({ role: "agent" }),
   });
-  if (!res.ok) throw new Error(`observer mint failed: HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`tamper mint failed: HTTP ${res.status}`);
   const creds = (await res.json()) as Creds;
   const nats = await rawConnect(creds);
   let captured: { subject: string; payload: string } | null = null;
@@ -168,15 +214,26 @@ function b64urlBytes(buf: ArrayBuffer | Uint8Array): string {
   return Buffer.from(bytes).toString("base64url");
 }
 
+type RegisterReply = {
+  nonce?: string;
+  peerId?: string;
+  registered?: boolean;
+  error?: string;
+  code?: number;
+};
+
 async function replayJwt(): Promise<number> {
   const cookie = await adminCookie();
-  // The gateway register base URL for agent-dev, from the SaaS rendezvous.
-  const me = (await (await fetch(`${SAAS_URL}/me`, { headers: { cookie } })).json()) as {
-    accounts?: Record<string, { registerBaseUrl: string }>;
-  };
-  const rv = me.accounts?.["agent-dev"];
-  if (!rv) throw new Error("admin has no agent-dev rendezvous — is the demo up + granted?");
-  const gwUrl = rv.registerBaseUrl;
+  // Mint this-tenant browser creds so we can dial the relay and drive the register
+  // hop over NATS request/reply (the register HTTP route is gone — admission now
+  // rides `webchannel.{tenant}.{account}.{peer}.register`).
+  const credRes = await fetch(`${SAAS_URL}/nats-user`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", cookie },
+    body: JSON.stringify({ role: "browser" }),
+  });
+  if (!credRes.ok) throw new Error(`nats-user mint failed: HTTP ${credRes.status}`);
+  const creds = (await credRes.json()) as Creds;
 
   // Device keys: an X25519 (cnf.jwk) + an Ed25519 PoP pair the register hop proves.
   const x = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
@@ -187,35 +244,44 @@ async function replayJwt(): Promise<number> {
   const bootRes = await fetch(`${SAAS_URL}/bootstrap`, {
     method: "POST",
     headers: { "Content-Type": "application/json", cookie },
-    body: JSON.stringify({ accountId: "agent-dev", deviceX25519PublicKey, devicePopPublicKey: pop.publicJwk.x }),
+    body: JSON.stringify({ accountId: ACCOUNT, deviceX25519PublicKey, devicePopPublicKey: pop.publicJwk.x }),
   });
   if (!bootRes.ok) throw new Error(`bootstrap failed: HTTP ${bootRes.status}`);
   const { jwt, peerId } = (await bootRes.json()) as { jwt: string; peerId: string };
 
-  // 1. Get a single-use challenge nonce.
-  const chRes = await fetch(`${gwUrl}/webchannel/nats/register/challenge`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${jwt}` },
-  });
-  if (!chRes.ok) throw new Error(`challenge failed: HTTP ${chRes.status}`);
-  const { nonce } = (await chRes.json()) as { nonce: string };
-  const signature = await signPop(pop.privateKey, peerId, nonce);
-  const body = JSON.stringify({ nonce, signature });
-  const hdr = { Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" };
+  const nats = await rawConnect(creds);
+  const registerSubj = `webchannel.${TENANT}.${ACCOUNT}.${peerId}.register`;
+  const replyPrefix = `webchannel.${TENANT}.${ACCOUNT}.${peerId}.reginbox`;
+  const parse = (raw: string): RegisterReply => JSON.parse(raw) as RegisterReply;
 
-  // 2. Register once with the valid proof — should succeed (burns the nonce).
-  const r1 = await fetch(`${gwUrl}/webchannel/nats/register`, { method: "POST", headers: hdr, body });
-  console.log(`[chaos] first register (valid proof) → HTTP ${r1.status}`);
-  // 3. Replay the SAME nonce+signature — the burned nonce must be rejected.
-  const r2 = await fetch(`${gwUrl}/webchannel/nats/register`, { method: "POST", headers: hdr, body });
-  console.log(`[chaos] replayed register (same nonce+sig) → HTTP ${r2.status}`);
+  try {
+    // 1. Get a single-use challenge nonce.
+    const ch = parse(await nats.request(registerSubj, replyPrefix, JSON.stringify({ op: "challenge", token: jwt })));
+    if (!ch.nonce) throw new Error(`challenge returned no nonce: ${JSON.stringify(ch)}`);
+    const signature = await signPop(pop.privateKey, peerId, ch.nonce);
+    const registerBody = JSON.stringify({ op: "register", token: jwt, nonce: ch.nonce, signature });
 
-  if (r1.ok && r2.status === 401) {
-    console.log("[chaos] ✓ replay defeated: the nonce is single-use (burned on first use).");
-    return 0;
+    // 2. Register once with the valid proof — should succeed (burns the nonce).
+    const r1 = parse(await nats.request(registerSubj, replyPrefix, registerBody));
+    console.log(`[chaos] first register (valid proof) → ${JSON.stringify(r1)}`);
+    // 3. Replay the SAME nonce+signature — the burned nonce must be rejected with
+    //    the generic `unauthorized` (the reply is never an oracle).
+    const r2 = parse(await nats.request(registerSubj, replyPrefix, registerBody));
+    console.log(`[chaos] replayed register (same nonce+sig) → ${JSON.stringify(r2)}`);
+
+    const firstOk = r1.registered === true && !r1.error;
+    const replayRejected = r2.error === "unauthorized" || r2.code === 401;
+    if (firstOk && replayRejected) {
+      console.log("[chaos] ✓ replay defeated: the nonce is single-use (burned on first use).");
+      return 0;
+    }
+    console.error(
+      `[chaos] ✗ expected first=registered + replay=unauthorized, got ${JSON.stringify(r1)} / ${JSON.stringify(r2)}`,
+    );
+    return 3;
+  } finally {
+    nats.close();
   }
-  console.error(`[chaos] ✗ expected first=2xx + replay=401, got ${r1.status}/${r2.status}`);
-  return 3;
 }
 
 const cmd = process.argv[2];

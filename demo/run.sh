@@ -21,20 +21,35 @@
 # Set ZAI_API_KEY (+ optional ZAI_BASE_URL / ZAI_MODEL) for a real model.
 set -euo pipefail
 
+# `--live` = the integrated REAL demo: same isolated-home topology, but a real
+# model is mandatory (fail fast if ZAI_API_KEY is unset). Without it, the demo
+# falls back to the echo LLM. Everything else (DEMO_RELAY, ZAI_* overrides) still
+# composes: `DEMO_RELAY=synadia ZAI_API_KEY=… ./demo/run.sh --live`.
+LIVE_MODE=0
+for arg in "$@"; do
+  case "$arg" in
+    --live) LIVE_MODE=1 ;;
+    *) echo "[demo] unknown argument: $arg (only --live is supported)" >&2; exit 2 ;;
+  esac
+done
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OCH=/tmp/oc-demo
 PKG_JSON="$REPO/packages/plugin/package.json"
 PKG_BAK=/tmp/oc-demo.pkgbak.json
 
-# Fresh port block — no collision with the e2e harnesses.
-SAAS_PORT=3961
-NATS_WS=18722
-NATS_TCP=14722
-ECHO_PORT=18905
+# Fresh port block — no collision with the e2e harnesses. Env-overridable so a
+# second demo (or a verification run) can use an alternate port block without
+# fighting an already-running instance (e.g. a live SaaS squatting :3961).
+SAAS_PORT="${SAAS_PORT:-3961}"
+NATS_WS="${NATS_WS:-18722}"
+NATS_TCP="${NATS_TCP:-14722}"
+ECHO_PORT="${ECHO_PORT:-18905}"
 
 # The fleet: "account:port" pairs. agent-dev + agent-ops pre-boot; add-agent.sh
-# adds agent-docs (19499) live.
-FLEET=("agent-dev:19299" "agent-ops:19399")
+# adds agent-docs (19499) live. Ports env-overridable so a re-run can dodge a
+# TIME_WAIT/kernel-hold on the default block from a just-killed instance.
+FLEET=("agent-dev:${DEV_PORT:-19299}" "agent-ops:${OPS_PORT:-19399}")
 
 TENANT=demo-tenant
 SAAS_ISSUER="https://saas.local/demo-issuer"
@@ -96,10 +111,21 @@ for pair in "${FLEET[@]}"; do pkill -f "gateway --port ${pair##*:}" 2>/dev/null 
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
 
+# --live requires a real model — fail fast with a friendly message rather than
+# silently booting the echo LLM (which would defeat the point of --live).
+if [ "$LIVE_MODE" = 1 ] && [ -z "${ZAI_API_KEY:-}" ]; then
+  echo "[demo] --live needs a real model but ZAI_API_KEY is not set." >&2
+  echo "[demo]   run:  ZAI_API_KEY=… ./demo/run.sh --live" >&2
+  echo "[demo]   (ZAI_BASE_URL / ZAI_MODEL override the z.ai endpoint + model;" >&2
+  echo "[demo]    drop --live to run the creds-free echo demo instead.)" >&2
+  exit 2
+fi
+
 # LLM mode banner + provider block (shared across gateways).
+LIVE_TAG=""; [ "$LIVE_MODE" = 1 ] && LIVE_TAG=" (--live)"
 if [ -n "${ZAI_API_KEY:-}" ]; then
   LLM_MODE=real
-  echo "[demo] LLM: REAL (z.ai) — $ZAI_MODEL @ $ZAI_BASE_URL"
+  echo "[demo] LLM: REAL (z.ai) — $ZAI_MODEL @ $ZAI_BASE_URL$LIVE_TAG"
   PROVIDER_BLOCK="\"zai\": { \"baseUrl\": \"$ZAI_BASE_URL\", \"api\": \"openai-completions\", \"apiKey\": \"$ZAI_API_KEY\", \"models\": [{ \"id\": \"$ZAI_MODEL\", \"name\": \"GLM\", \"reasoning\": false, \"input\": [\"text\"], \"cost\": { \"input\": 0, \"output\": 0, \"cacheRead\": 0, \"cacheWrite\": 0 }, \"contextWindow\": 200000, \"maxTokens\": 8192 }] }"
   PRIMARY_MODEL="zai/$ZAI_MODEL"
 else
@@ -109,11 +135,14 @@ else
   PRIMARY_MODEL="echo-local/echo"
 fi
 
-# Rendezvous map (accountId → registerBaseUrl) for the SaaS. Built from FLEET.
+# Boot agent directory (set of accountIds) for the SaaS. Built from FLEET. The
+# value is an empty object per account — register admission is over NATS now, so
+# there is no per-account gateway URL; only the KEY set (which accounts exist)
+# matters. The shared relay natsUrl is delivered by the SaaS with the creds.
 DEMO_ACCOUNTS="{"
 for pair in "${FLEET[@]}"; do
-  acct="${pair%%:*}"; port="${pair##*:}"
-  DEMO_ACCOUNTS="$DEMO_ACCOUNTS\"$acct\":{\"registerBaseUrl\":\"http://127.0.0.1:$port\"},"
+  acct="${pair%%:*}"
+  DEMO_ACCOUNTS="$DEMO_ACCOUNTS\"$acct\":{},"
 done
 DEMO_ACCOUNTS="${DEMO_ACCOUNTS%,}}"
 
@@ -218,6 +247,12 @@ boot_agent() {
   local home="$OCH/$acct"
   mkdir -p "$home/.openclaw"
 
+  # NOTE: the global session.dmScope below is now REDUNDANT for webchannel —
+  # the plugin FORCES its own per-account-channel-peer session scope on every
+  # inbound/history site (packages/plugin/src/session-route.ts), so it self-
+  # isolates users regardless of this setting. Kept (not removed) because the
+  # full browser roundtrip could not be re-verified without it in this env;
+  # it is harmless (it only affects non-webchannel channels + the core doctor).
   cat > "$home/.openclaw/openclaw.json" <<JSON
 {
   "gateway": { "mode": "local", "bind": "loopback" },
@@ -287,9 +322,11 @@ JSON
     fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
   ' "$home/.openclaw/openclaw.json" "$acct"
 
+  # NOTE: no gateway URL is exported — register/admission rides the plugin's
+  # outbound NATS connection now, so nothing (browser or SaaS) dials this port
+  # for webchannel. The --port still binds openclaw's own local gateway.
   HOME="$home" OPENCLAW_HOME="$home" OPENCLAW_DISABLE_BONJOUR=1 \
     WEBCHANNEL_NATS_URL="$RELAY_NATS_URL" \
-    WEBCHANNEL_GW_URL="http://127.0.0.1:$port" \
     "$REPO/node_modules/.bin/openclaw" gateway --port "$port" --force >"$home/gateway.log" 2>&1 &
   local gw_pid=$!
   GW_PIDS+=("$gw_pid")
@@ -312,10 +349,10 @@ done
 
 echo ""
 echo "=============================================================="
-echo "  ✓ demo is up — fleet: ${FLEET[*]}"
+echo "  ✓ demo is up${LIVE_TAG:+  [integrated live demo]} — fleet: ${FLEET[*]}"
 echo "    open:   $SAAS_URL"
 echo "    logins: alice / bob (chat) · admin (approve/grant)  — pw: demo"
-echo "    LLM:    $LLM_MODE"
+echo "    LLM:    $LLM_MODE$LIVE_TAG"
 echo "    add another agent live:  ./demo/add-agent.sh"
 echo "  Ctrl+C to tear everything down."
 echo "=============================================================="

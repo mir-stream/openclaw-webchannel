@@ -11,9 +11,11 @@
  *   - The SINGLE web origin for the demo: serves the 3-pane app (admin · chat ·
  *     wiretap) at GET / and the esbuild widget bundle at GET /app.js.
  *   - A rendezvous authority: every credential/bootstrap response carries the
- *     relay URL and (per account) the gateway register URL, so the browser never
- *     learns the relay/gateway from page-local config. GET /me returns the
- *     per-account rendezvous map for the agent switcher.
+ *     shared relay URL and NOTHING else — no gateway/register URL, because register
+ *     admission rides the agent's outbound NATS connection now (request/reply on the
+ *     account's `.register` subject). So the browser never learns the relay from
+ *     page-local config, and there is no agent address to learn at all. GET /me
+ *     returns the per-account rendezvous map (`{ natsUrl }`) for the agent switcher.
  *   - Admin-gated: /admin/* requires an admin session (seeded `admin` login).
  *
  * Everything here is demo-side; it changes NO product code. Passwords are
@@ -22,14 +24,19 @@
  *
  * Boot env (set by run.sh):
  *   PORT                 demo SaaS port (default 3961)
- *   SAAS_ISSUER          `iss` claim for bootstrap JWTs (gateway checks this)
+ *   SAAS_ISSUER          `iss` claim for bootstrap JWTs (gateway checks this).
+ *                        DEFAULTS to SAAS_BASE_URL — the plugin derives the
+ *                        expected issuer from the SaaS URL, so leave it UNSET for
+ *                        the zero-config trust-anchor path (§4 change 3).
  *   NATS_URL             relay ws:// URL delivered WITH minted creds
  *   NATS_CONFIG_OUT      dir to write operator.jwt + resolver.json (for nats-server)
  *   TRUST_CHAIN_PATH     persist the trust chain here (stable across restarts)
  *   DEMO_TENANT          tenant scope (default demo-tenant)
- *   DEMO_ACCOUNTS        JSON: { "<accountId>": { "registerBaseUrl": "http://…" } }
- *                        the per-account rendezvous map (gateway URLs). Phase 1
- *                        seeds a single account; phase 2 grows the list.
+ *   DEMO_ACCOUNTS        JSON object keyed by accountId (value ignored, e.g.
+ *                        { "<accountId>": {} }) — the boot agent directory. Only
+ *                        the key set matters (register admission is over NATS, so
+ *                        there is no per-account URL). Phase 1 seeds a single
+ *                        account; phase 2 grows the list.
  *   DEMO_LLM_MODE        "echo" | "real" — surfaced to the UI as a badge
  *   DEMO_APP_HTML        path to web/index.html (the 3-pane shell)
  *   DEMO_CLIENT_ENTRY    path to web/src/app.ts (esbuild → /app.js IIFE)
@@ -65,6 +72,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const PORT = parseInt(process.env.PORT || "3961", 10);
 const SAAS_BASE_URL = process.env.SAAS_BASE_URL || `http://127.0.0.1:${PORT}`;
+// TRUST-ANCHOR INVARIANT (design §4 change 3): the bootstrap-JWT issuer DEFAULTS
+// to the SaaS base URL. The plugin now DERIVES `auth.jwt.issuer` from the anchor
+// as `issuer == saas.baseUrl` (deriveAccountAuth), so a boot that leaves
+// SAAS_ISSUER unset yields an issuer that matches the derivation with zero
+// openclaw.json edits — this is the code default precisely so no boot can
+// reintroduce the old fake-issuer mismatch. An explicit SAAS_ISSUER override is
+// still honored (proxy / custom-domain), but if it differs from SAAS_BASE_URL the
+// agent MUST pin the SAME value in `auth.jwt.issuer` (config-present-wins) or JWT
+// verify will fail — which is exactly what demo/run.sh does for the fake docker
+// issuer.
 const SAAS_ISSUER = process.env.SAAS_ISSUER || SAAS_BASE_URL;
 const NATS_URL = process.env.NATS_URL || "ws://127.0.0.1:18722";
 const NATS_CONFIG_OUT = process.env.NATS_CONFIG_OUT || "";
@@ -74,21 +91,33 @@ const DEMO_LLM_MODE = process.env.DEMO_LLM_MODE === "real" ? "real" : "echo";
 const DEMO_APP_HTML = process.env.DEMO_APP_HTML || join(__dirname, "web", "index.html");
 const DEMO_CLIENT_ENTRY = process.env.DEMO_CLIENT_ENTRY || join(__dirname, "web", "src", "app.ts");
 
-// Per-account rendezvous map: accountId → { registerBaseUrl }. The relay URL is
-// shared (one demo-owned nats-server) so it is merged in at response time from
-// NATS_URL. Phase 1 seeds a single account; run.sh grows this for the fleet.
-type RendezvousEntry = { registerBaseUrl: string };
-// Mutable: the fleet can grow at runtime (scene ② — add-agent.sh registers a new
-// account's rendezvous via POST /admin/accounts so an open widget can reach it).
+// Agent directory: accountId → how it entered. Registration now rides NATS
+// request/reply on the account's own subject, so there is NO per-account gateway
+// URL to dial — the only rendezvous value is the shared relay `natsUrl` (one
+// demo-owned nats-server), merged in at response time. An account in this map is
+// therefore immediately dialable (and grantable). Phase 1 seeds a single account;
+// run.sh grows this for the fleet.
+type RendezvousEntry = { source: "boot" | "enrolled" | "admin" };
+// Mutable: the directory grows at runtime. An account enters it EITHER seeded at
+// boot (DEMO_ACCOUNTS env), OR automatically when its enrollment is APPROVED, OR
+// via an explicit POST /admin/accounts (scene ②'s add-agent). No URL step — the
+// moment it is in the directory it is reachable over NATS.
 const DEMO_ACCOUNTS: Record<string, RendezvousEntry> = (() => {
-  const raw = process.env.DEMO_ACCOUNTS;
-  if (!raw) return { "agent-dev": { registerBaseUrl: "http://127.0.0.1:19299" } };
-  try {
-    return JSON.parse(raw) as Record<string, RendezvousEntry>;
-  } catch (err) {
-    console.error("[demo-saas] DEMO_ACCOUNTS is not valid JSON — falling back to agent-dev:", err);
-    return { "agent-dev": { registerBaseUrl: "http://127.0.0.1:19299" } };
-  }
+  // DEMO_ACCOUNTS is a JSON object keyed by accountId; the value is ignored
+  // (kept as `{}` for readability) — only the KEY set matters now.
+  const parseKeys = (): string[] => {
+    const raw = process.env.DEMO_ACCOUNTS;
+    if (!raw) return ["agent-dev"];
+    try {
+      return Object.keys(JSON.parse(raw) as Record<string, unknown>);
+    } catch (err) {
+      console.error("[demo-saas] DEMO_ACCOUNTS is not valid JSON — falling back to agent-dev:", err);
+      return ["agent-dev"];
+    }
+  };
+  const out: Record<string, RendezvousEntry> = {};
+  for (const id of parseKeys()) out[id] = { source: "boot" };
+  return out;
 })();
 // Snapshot of the accounts present at boot — used only to seed alice/bob/admin.
 // Runtime-added accounts (scene ②) are NOT auto-granted; an admin grants them.
@@ -97,11 +126,12 @@ const SEED_ACCOUNT_IDS = Object.keys(DEMO_ACCOUNTS);
 function accountIds(): string[] {
   return Object.keys(DEMO_ACCOUNTS);
 }
-// The full rendezvous map handed to the browser (relay URL merged in per entry).
-function rendezvousMap(): Record<string, { natsUrl: string; registerBaseUrl: string }> {
-  const out: Record<string, { natsUrl: string; registerBaseUrl: string }> = {};
-  for (const [id, entry] of Object.entries(DEMO_ACCOUNTS)) {
-    out[id] = { natsUrl: NATS_URL, registerBaseUrl: entry.registerBaseUrl };
+// The full rendezvous map handed to the browser. Every directory account is
+// dialable over NATS, so each entry carries only the shared relay `natsUrl`.
+function rendezvousMap(): Record<string, { natsUrl: string }> {
+  const out: Record<string, { natsUrl: string }> = {};
+  for (const id of Object.keys(DEMO_ACCOUNTS)) {
+    out[id] = { natsUrl: NATS_URL };
   }
   return out;
 }
@@ -482,7 +512,7 @@ const server = createServer(async (req, res) => {
       if (!user) return sendJson(res, { error: "not authenticated" }, 401);
       const map = rendezvousMap();
       // Only the accounts this login is authorized for.
-      const mine: Record<string, { natsUrl: string; registerBaseUrl: string }> = {};
+      const mine: Record<string, { natsUrl: string }> = {};
       for (const id of user.allowedAccounts) if (map[id]) mine[id] = map[id];
       sendJson(res, {
         username: user.username,
@@ -504,10 +534,17 @@ const server = createServer(async (req, res) => {
         // Optional short lifetime (scene ⑤): a bounded, positive TTL yields an
         // expiring credential; anything else mints a normal non-expiring one.
         const ttl = typeof ttlSeconds === "number" && ttlSeconds > 0 && ttlSeconds <= 3600 ? ttlSeconds : undefined;
+        // Role → scope: "observer" (wiretap) is tenant-wide sub-only; "agent" is
+        // tenant-wide; "browser" (default) is pinned to THIS session's peerId
+        // (user.uuid — the authenticated subject, never client input) so a browser
+        // cannot forge another peer's register reply or tear down its subject.
+        const resolvedRole: NatsUserRole =
+          role === "agent" ? "agent" : role === "observer" ? "observer" : "browser";
         mintNatsUserCreds({
           accountSeed: privateChain.natsAccountSeed,
           tenant: DEMO_TENANT,
-          role: role === "agent" ? "agent" : "browser",
+          role: resolvedRole,
+          ...(resolvedRole === "browser" ? { peerId: user.uuid } : {}),
           issuerAccountId: natsIssuerAccountId,
           ttlSeconds: ttl,
         })
@@ -557,9 +594,10 @@ const server = createServer(async (req, res) => {
         }
         signBootstrapJwt(claims as unknown as Record<string, unknown>)
           .then((jwt) => {
-            const rv = rendezvousMap()[accountId];
             console.log(`[bootstrap] issued JWT for ${user.username} peerId=${user.uuid} account=${accountId}`);
-            sendJson(res, { jwt, peerId: user.uuid, natsUrl: NATS_URL, registerBaseUrl: rv?.registerBaseUrl });
+            // The client derives the register subject from tenant/accountId/peerId
+            // and dials the shared relay — no gateway URL travels in the response.
+            sendJson(res, { jwt, peerId: user.uuid, natsUrl: NATS_URL });
           })
           .catch((err) => {
             console.error("[bootstrap] Error:", err);
@@ -638,6 +676,14 @@ const server = createServer(async (req, res) => {
             .then((result) => {
               if (result) {
                 markEnroll(userCode, "approved");
+                // An approved enrollment IS the account entering the directory —
+                // no separate registration or URL step. Register admission is over
+                // NATS, so the moment it is in the directory it is dialable + grantable.
+                const tracked = demoEnrollments.get(userCode);
+                if (tracked?.accountId && !DEMO_ACCOUNTS[tracked.accountId]) {
+                  DEMO_ACCOUNTS[tracked.accountId] = { source: "enrolled" };
+                  console.log(`[admin] account "${tracked.accountId}" entered the directory (enrolled → grantable)`);
+                }
                 console.log(`[admin] approved ${userCode} → peer ${result.peerId}`);
                 sendJson(res, { ok: true, peerId: result.peerId });
               } else {
@@ -703,10 +749,16 @@ const server = createServer(async (req, res) => {
           } catch (err) {
             return sendJson(res, { error: (err as Error).message }, 400);
           }
+          const chaosRole: NatsUserRole =
+            role === "agent" ? "agent" : role === "observer" ? "observer" : "browser";
           mintNatsUserCreds({
             accountSeed: privateChain.natsAccountSeed,
             tenant,
-            role: role === "agent" ? "agent" : "browser",
+            role: chaosRole,
+            // Cross-tenant chaos: the boundary under test is the tenant segment,
+            // not the peer subtree — a fixed synthetic peerId satisfies the
+            // per-peer browser scope without affecting what the probe proves.
+            ...(chaosRole === "browser" ? { peerId: "chaos-probe" } : {}),
             issuerAccountId: natsIssuerAccountId,
           })
             .then((creds) => {
@@ -721,23 +773,35 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      // POST /admin/accounts — register a runtime-added account's rendezvous
-      // (scene ②: add-agent.sh calls this after a new agent is approved, so an
-      // open widget can dial the new gateway). In-memory, admin-gated.
+      // GET /admin/accounts — the full agent directory (boot-seeded + enrolled +
+      // admin-added). Every entry is dialable over NATS, so a row is just identity.
+      if (req.method === "GET" && path === "/admin/accounts") {
+        return sendJson(
+          res,
+          Object.entries(DEMO_ACCOUNTS).map(([accountId, e]) => ({
+            accountId,
+            source: e.source ?? "boot",
+          })),
+        );
+      }
+      // POST /admin/accounts — declare a runtime-added account into the directory
+      // (scene ②'s add-agent.sh calls this after approval). There is NO URL to
+      // set — register admission is over NATS, so entering the directory makes the
+      // account immediately dialable + grantable. In-memory, admin-gated.
       if (req.method === "POST" && path === "/admin/accounts") {
         parseJsonBody(req, (body) => {
           if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
-          const { accountId, registerBaseUrl } = body as { accountId?: string; registerBaseUrl?: string };
-          if (!accountId || !registerBaseUrl) {
-            return sendJson(res, { error: "Missing accountId or registerBaseUrl" }, 400);
+          const { accountId } = body as { accountId?: string };
+          if (!accountId) {
+            return sendJson(res, { error: "Missing accountId" }, 400);
           }
           try {
             assertValidSubjectToken(accountId, "accountId");
           } catch (err) {
             return sendJson(res, { error: (err as Error).message }, 400);
           }
-          DEMO_ACCOUNTS[accountId] = { registerBaseUrl };
-          console.log(`[admin] registered account "${accountId}" → ${registerBaseUrl}`);
+          if (!DEMO_ACCOUNTS[accountId]) DEMO_ACCOUNTS[accountId] = { source: "admin" };
+          console.log(`[admin] declared account "${accountId}" into the directory`);
           sendJson(res, { ok: true, accountId, accounts: accountIds() });
         });
         return;

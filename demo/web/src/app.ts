@@ -14,7 +14,7 @@ import { createWidget } from "./widget.js";
 import { createAdminPanel } from "./admin.js";
 import { createWiretap } from "./wiretap.js";
 
-type Rendezvous = { natsUrl: string; registerBaseUrl: string };
+type Rendezvous = { natsUrl: string };
 type Me = {
   username: string;
   isAdmin: boolean;
