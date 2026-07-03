@@ -279,10 +279,12 @@ narrative:
   republishes the handshake (500ms × 5) until answered. Local sub-ms latency always
   hid it. `openclaw.plugin.json:216-249` BYO-NATS (fully SaaS-issuer-less static
   creds) is the further end of this spectrum, not yet built.
-- **Agent-initiated outbound** (`index-nats.ts:732-744`, primary account): an
-  agent-side event pushes an unsolicited message into the open widget over the
-  E2E relay. Needs a verified core outbound trigger (e.g. `messages send`) — flag
-  as needs-verification before committing to it on stage.
+- **Agent-initiated outbound** (`index-nats.ts:732-744`, primary account) —
+  **DESCOPED (owner decision, 2026-07-03).** The plugin's core-initiated outbound
+  seam (`channel.ts:175`) is already wired; what stayed unverified is whether an
+  openclaw cron `agentTurn`/`CronDelivery announce` (or a tool-send) populates
+  `ctx.to` for a specific browser peer and binds the session. Left as a documented
+  future scene rather than built. **Phase 5 is closed at 3 of 4 asides built.**
 
 ## Phase 6 — multi-device / late-join E2E (scene ⑥; real product work)
 
