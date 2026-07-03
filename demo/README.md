@@ -68,6 +68,12 @@ draft → answer, `/help`, exec-approval cards, status pill incl. terminal error
   so live sessions keep running. Drivers: `node demo/verify-rotate.mjs`,
   `node demo/verify-evict.mjs`.
 
+- **One gateway, many accounts.** `./demo/multiplex.sh --auto-approve` (in a 2nd
+  terminal, while `run.sh` is up) boots ONE gateway that serves two accounts —
+  team-sales + team-support. Log in as alice → team-sales, bob → team-support:
+  both tabs are the SAME openclaw process (process-level tenancy). Driver:
+  `node demo/verify-multiplex.mjs`.
+
 ## Honest-demo notes (short)
 
 - **No active-MITM claim (C2):** scene ③ proves confidentiality vs a *passive*

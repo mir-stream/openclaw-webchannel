@@ -258,9 +258,14 @@ narrative:
   `generateRsaKeypair` (additive) + `auth.ts` maps a verify-time throw (unknown
   kid) to a 401 not a 500. Drivers: `demo/verify-rotate.mjs` (zero-downtime),
   `demo/verify-evict.mjs` (evicted-kid rejected). Both verified live.
-- **One gateway, many accounts** (`multiplex.ts:50-77`, `index-nats.ts:604`):
-  show a single gateway serving several accounts with *different users* per
-  account — process-level tenancy, distinct from scene ②'s per-machine story.
+- **One gateway, many accounts — BUILT (`demo/multiplex.sh`).** ONE gateway
+  (:19599) enrolls team-sales + team-support under a single OPENCLAW_HOME;
+  `planAccounts` builds one NatsChannel per account and the single register route
+  dispatches each browser by JWT `aud`. alice → team-sales, bob → team-support,
+  both served by the SAME process (their rendezvous both resolve to :19599).
+  Process-level tenancy, distinct from scene ②'s per-machine story. No product
+  change — pure orchestration. Driver `demo/verify-multiplex.mjs` (verified live:
+  one-gateway-two-accounts=OK, both users chat).
 - **BYO-NATS static creds** (`openclaw.plugin.json:216-249`): point an agent at
   Synadia/NGS with operator-supplied creds and NO SaaS issuer — the other end of
   the `DEMO_RELAY=synadia` spectrum.
