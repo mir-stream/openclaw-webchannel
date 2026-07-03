@@ -21,6 +21,9 @@ import type { ApprovalDecision } from "./transport.js";
 import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import { clearPinnedDeviceKeyForPeer } from "./auth.js";
+import type { ConversationKeyStore } from "./conversation-key-store.js";
+import { wrapConversationKey } from "./late-join-decryptor.js";
+import type { WrappedConversationKey } from "./late-join-decryptor.js";
 import {
   deriveConversationKey,
   keyExchangeFrame,
@@ -84,6 +87,18 @@ export type NatsChannelCryptoOptions = {
    * instance when omitted (the common case).
    */
   keyPair?: KeyPair;
+  /**
+   * Phase 6 (multi-device): agent-owned per-peerId conversation-key store.
+   *
+   * When supplied, the channel runs the REGISTER-admission key model:
+   * `registerPeer` loads/creates the peer's stable key K from this store (so a
+   * second device of the same user never overwrites the first one's key), and
+   * the per-device X25519 `.handshake` negotiation is DISABLED — devices
+   * receive K wrapped to their JWT-cnf pubkey via the register HTTP response
+   * (`wrapConversationKeyForDevice`) instead. Omit for auto-admission accounts,
+   * which keep the legacy handshake (F5 decision — see PHASE6_MULTIDEVICE_PLAN §8).
+   */
+  keyStore?: ConversationKeyStore;
 };
 
 /**
@@ -146,6 +161,11 @@ export class NatsChannel {
   private readonly encryptionRequired: boolean;
   /** Agent X25519 key pair used to answer per-peer handshakes (null = plaintext mode). */
   private readonly agentKeyPair: KeyPair | null;
+  /**
+   * Phase 6: agent-owned conversation-key store (register-admission accounts
+   * only; null = legacy handshake key model). See NatsChannelCryptoOptions.
+   */
+  private readonly keyStore: ConversationKeyStore | null;
   /** Per-peer established conversation keys (peerId -> 32-byte session key). */
   private readonly peerSessionKeys = new Map<string, Uint8Array>();
   /** Per-peer handshake subscriptions (peerId -> sid). */
@@ -169,6 +189,7 @@ export class NatsChannel {
     this.tenant = tenant;
     this.encryptionRequired = crypto != null;
     this.agentKeyPair = crypto ? (crypto.keyPair ?? generateKeyPair()) : null;
+    this.keyStore = crypto?.keyStore ?? null;
     this.maxPeers = limits?.maxPeers ?? DEFAULT_MAX_PEERS;
     this.maxApprovalResolutions =
       limits?.maxApprovalResolutions ?? DEFAULT_MAX_APPROVAL_RESOLUTIONS;
@@ -184,6 +205,15 @@ export class NatsChannel {
    * connects with its bootstrap JWT (peerId from JWT sub claim).
    */
   registerPeer(peerId: string): void {
+    // Phase 6 (keyStore mode): establish the peer's STABLE conversation key K
+    // from the agent-owned store — load if known, generate-once if new. Runs
+    // even for an already-registered peer so a lost in-memory key (never
+    // expected) self-heals on re-register. Crucially this SETS but never
+    // re-derives: a second device registering the same peerId leaves K
+    // untouched, which is the whole multi-device fix.
+    if (this.encryptionRequired && this.keyStore) {
+      this.peerSessionKeys.set(peerId, this.keyStore.getOrCreate(peerId));
+    }
     if (this.peerSubscriptions.has(peerId)) {
       console.warn(`[nats-channel] Peer ${peerId} already registered`);
       return;
@@ -210,9 +240,12 @@ export class NatsChannel {
     const sid = this.transport.subscribe(inboundSubject);
     this.peerSubscriptions.set(peerId, sid);
 
-    // In crypto mode also subscribe to the peer's handshake subject so the
-    // X25519 key exchange can complete before any message is sealed/opened.
-    if (this.encryptionRequired) {
+    // Legacy crypto mode (no keyStore) also subscribes the peer's handshake
+    // subject so the X25519 key exchange can complete before any message is
+    // sealed/opened. In keyStore mode there is NO handshake: K was established
+    // from the store above and is wrap-delivered in the register HTTP response,
+    // so the register path must never answer handshake frames (F5 divergence).
+    if (this.encryptionRequired && !this.keyStore) {
       const hsSubject = this.handshakeSubject(peerId);
       const hsSid = this.transport.subscribe(hsSubject);
       this.handshakeSubscriptions.set(peerId, hsSid);
@@ -231,7 +264,9 @@ export class NatsChannel {
   subscribeWildcard(): void {
     const inWild = `webchannel.${this.tenant}.${this.accountId}.*.in`;
     this.transport.subscribe(inWild);
-    if (this.encryptionRequired) {
+    // keyStore mode never listens for handshakes (F5: handshake is the AUTO
+    // path's key model; a keyStore channel delivers K via the register hop).
+    if (this.encryptionRequired && !this.keyStore) {
       const hsWild = `webchannel.${this.tenant}.${this.accountId}.*.handshake`;
       this.transport.subscribe(hsWild);
     }
@@ -253,7 +288,9 @@ export class NatsChannel {
       this.transport.unsubscribe(hsSid);
       this.handshakeSubscriptions.delete(peerId);
     }
-    // Drop the session key so a reconnecting peer must re-handshake.
+    // Drop the in-memory session key: a reconnecting peer must re-handshake
+    // (legacy mode) or re-register, which reloads the STABLE key K from the
+    // keyStore (Phase 6 mode — the persisted K itself is never dropped here).
     this.peerSessionKeys.delete(peerId);
     // S2: release this peer's SaaS-attested pinned device key too, so the
     // module-global pin store is bounded by the peer lifecycle rather than
@@ -409,6 +446,36 @@ export class NatsChannel {
     this.onHandshakeComplete = handler;
   }
 
+  /**
+   * Phase 6 (keyStore mode): wrap the peer's conversation key K to a specific
+   * device's X25519 public key for delivery in the register HTTP response.
+   *
+   * Must be called AFTER `registerPeer(peerId)` (which establishes K). The
+   * wrap targets exactly the key presented in THIS request's verified JWT cnf
+   * claim — never a stored/pinned lookup, so two devices of the same peerId
+   * can never receive a wrap meant for the other (audit F2).
+   *
+   * @param peerId - registered peer whose K to wrap.
+   * @param devicePublicKey - raw 32-byte X25519 device public key (from cnf.jwk).
+   * @returns the wrapped key, or `null` when the channel is not in keyStore
+   *          mode or the peer has no established key (caller treats as a
+   *          server-side registration fault).
+   */
+  wrapConversationKeyForDevice(
+    peerId: string,
+    devicePublicKey: Uint8Array,
+  ): WrappedConversationKey | null {
+    if (!this.encryptionRequired || !this.keyStore) return null;
+    if (devicePublicKey.length !== 32) {
+      throw new Error(
+        `webchannel: device public key must be 32 bytes (got ${devicePublicKey.length})`,
+      );
+    }
+    const key = this.peerSessionKeys.get(peerId);
+    if (!key) return null;
+    return wrapConversationKey(key, devicePublicKey);
+  }
+
   // ---------------------------------------------------------------------------
   // Internal implementation
   // ---------------------------------------------------------------------------
@@ -498,6 +565,17 @@ export class NatsChannel {
    */
   private handleHandshake(msg: NatsMessage, peerId: string): void {
     if (!this.agentKeyPair) return;
+    // Phase 6 defense-in-depth: a keyStore-mode channel never subscribes a
+    // handshake subject, so no frame should arrive here — but if one does
+    // (misuse/misconfig), REFUSE it. Answering would let a relay-level writer
+    // overwrite the agent-owned stable key K with an attacker-derived one.
+    if (this.keyStore) {
+      console.warn(
+        `[nats-channel] Dropping handshake from ${peerId}: channel uses the ` +
+          `register-delivered conversation key (keyStore mode, no handshake)`,
+      );
+      return;
+    }
     const browserPubKey = parseKeyExchange(msg.payload);
     if (!browserPubKey) {
       console.warn(`[nats-channel] Ignoring malformed handshake from ${peerId}`);

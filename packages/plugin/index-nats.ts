@@ -18,6 +18,7 @@ import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { NatsChannel } from "./src/nats-channel.js";
 import type { InboundWsMessage, NatsChannelCryptoOptions } from "./src/nats-channel.js";
+import { ConversationKeyStore } from "./src/conversation-key-store.js";
 import { resolveEncryptionPolicy } from "./src/encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./src/encryption-policy.js";
 import { createWebChannelPlugin } from "./src/channel.js";
@@ -446,17 +447,87 @@ export default defineChannelPluginEntry({
             }
           }
 
-          // Register peer in THIS account's NATS channel. The initial history
-          // snapshot is NOT sent here: registration precedes the E2E crypto
-          // handshake, so a snapshot sent now is fail-closed dropped ("no session
-          // key yet"). It is sent from the handshake-complete handler instead
-          // (see setHandshakeCompleteHandler wiring below).
+          // Phase 6 (multi-device): the register response IS the key-delivery
+          // channel. The device's X25519 pubkey arrives in the verified JWT's
+          // `cnf` claim; the agent wraps the peer's STABLE conversation key K
+          // to exactly that key. A register-admission token without `cnf` has
+          // no key path at all (the handshake is auto-mode-only now), so it is
+          // rejected up front instead of registering a peer that can never
+          // decrypt anything.
+          if (!identity.devicePublicKey) {
+            api.logger.error?.(
+              `webchannel: register rejected for ${peerId} — JWT has no cnf device key (key delivery impossible)`,
+            );
+            res.statusCode = 401;
+            res.end("Device key (cnf) required");
+            return;
+          }
+          const devicePublicKey = new Uint8Array(
+            Buffer.from(identity.devicePublicKey, "base64url"),
+          );
+          if (devicePublicKey.length !== 32) {
+            res.statusCode = 400;
+            res.end("Invalid device key");
+            return;
+          }
+
+          // Register peer in THIS account's NATS channel — this loads/creates
+          // the per-peerId conversation key K from the agent-owned store, so a
+          // second device of the same user never rotates the first one's key.
           channel.registerPeer(peerId);
 
-          // Send success response
+          // Wrap K to THIS request's attested device key — never a pin-store
+          // lookup, which is peerId-keyed and would collide two devices of the
+          // same user (audit F2).
+          const wrappedConversationKey = channel.wrapConversationKeyForDevice(
+            peerId,
+            devicePublicKey,
+          );
+          if (!wrappedConversationKey) {
+            api.logger.error?.(
+              `webchannel: no conversation key established for ${peerId} at register`,
+            );
+            res.statusCode = 500;
+            res.end("Registration failed");
+            return;
+          }
+
+          // Initial history snapshot — STATELESS register: every register gets
+          // the bounded snapshot (first join, reload, reconnect); the client's
+          // message-id-idempotent hydration absorbs duplicates. K is already
+          // established above so the frame seals right now, and the client has
+          // its `.out` subscription active BEFORE it calls this route (see
+          // WebChannelNatsClient.onConnected ordering), so nothing is lost.
+          // The read runs detached so `sessions.get` authorizes against a
+          // synthetic operator client (see historyReadScope).
+          try {
+            const route = api.runtime.channel.routing.resolveAgentRoute({
+              cfg: api.config,
+              channel: WEBCHANNEL_ID,
+              accountId: account.accountId,
+              peer: { kind: "direct", id: peerId },
+            });
+            void runDetachedHistoryRead(() =>
+              historyRecent(api, route.sessionKey, account.historyConfig.limit, api.logger),
+            )
+              .then((messages) => {
+                if (messages.length > 0) channel.sendHistory(peerId, messages);
+              })
+              .catch((err) => {
+                api.logger.error?.(
+                  `webchannel: history snapshot failed for ${peerId}: ${String(err)}`,
+                );
+              });
+          } catch (err) {
+            api.logger.error?.(
+              `webchannel: history snapshot resolution failed for ${peerId}: ${String(err)}`,
+            );
+          }
+
+          // Send success response carrying the wrapped conversation key.
           res.statusCode = 200;
           res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ peerId, registered: true }));
+          res.end(JSON.stringify({ peerId, registered: true, wrappedConversationKey }));
         } catch (err) {
           api.logger.error?.(`webchannel: peer registration failed: ${String(err)}`);
           res.statusCode = 500;
@@ -613,10 +684,33 @@ export default defineChannelPluginEntry({
         continue;
       }
 
+      // ---- Axis B (per account): peer admission -----------------------------
+      // Resolved BEFORE the channel is built (Phase 6): a `register-hop`
+      // account gets an agent-owned ConversationKeyStore — its peers' stable
+      // key K is wrap-delivered via the register HTTP response and the legacy
+      // `.handshake` is disabled — while an `auto` account gets NO store and
+      // keeps the per-device handshake untouched (F5 decision).
+      const registerHopAvailable = credentialMode !== "static";
+      const admission = resolveAdmissionMode({
+        authStrategy: (accountAuth as { strategy?: string } | undefined)?.strategy,
+        registerHopAvailable,
+        explicitOverride: accountNatsCfg?.admission,
+      });
+      // The serving plan makes the ONE structural consequence of `admission`
+      // explicit and testable: only a `register-hop` account builds a verifier
+      // and an aud→account dispatch entry; an `auto` account subscribes the
+      // wildcard and is served with NO `channels.webchannel.auth` config.
+      const servingPlan = admissionServingPlan(admission);
+
       // ---- Step 2 (per account): create the encrypted NATS channel ---------
       // Subject namespace is webchannel.{tenant}.{accountId}.{peerId} — the
       // accountId is the wire identity (one namespace per account).
-      const channel = new NatsChannel(transport, accountId, tenant, cryptoOptions);
+      const channel = new NatsChannel(transport, accountId, tenant, {
+        ...cryptoOptions,
+        ...(admission === "register-hop"
+          ? { keyStore: new ConversationKeyStore({ accountId }) }
+          : {}),
+      });
       console.log(
         `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, accountId=${accountId})`,
       );
@@ -641,18 +735,7 @@ export default defineChannelPluginEntry({
         dispatchInbound(peerId, message);
       });
 
-      // ---- Axis B (per account): peer admission ----------------------------
-      const registerHopAvailable = credentialMode !== "static";
-      const admission = resolveAdmissionMode({
-        authStrategy: (accountAuth as { strategy?: string } | undefined)?.strategy,
-        registerHopAvailable,
-        explicitOverride: accountNatsCfg?.admission,
-      });
-      // The serving plan makes the ONE structural consequence of `admission`
-      // explicit and testable: only a `register-hop` account builds a verifier
-      // and an aud→account dispatch entry; an `auto` account subscribes the
-      // wildcard and is served with NO `channels.webchannel.auth` config.
-      const servingPlan = admissionServingPlan(admission);
+      // ---- Axis B consequence: wildcard subscription (auto accounts) --------
       if (servingPlan.subscribeWildcard) {
         channel.subscribeWildcard();
       }
@@ -696,32 +779,12 @@ export default defineChannelPluginEntry({
         }
       });
 
-      // Initial history snapshot — sent once the E2E handshake establishes the
-      // per-peer session key (the earliest point sendHistory can encrypt). The
-      // read runs in `runDetachedHistoryRead` so `sessions.get` authorizes against
-      // a synthetic operator client rather than the request-scoped plugin client
-      // that lacks `operator.read`.
-      channel.setHandshakeCompleteHandler((peerId) => {
-        try {
-          const route = api.runtime.channel.routing.resolveAgentRoute({
-            cfg: api.config,
-            channel: WEBCHANNEL_ID,
-            accountId,
-            peer: { kind: "direct", id: peerId },
-          });
-          void runDetachedHistoryRead(() =>
-            historyRecent(api, route.sessionKey, historyConfig.limit, api.logger),
-          )
-            .then((messages) => {
-              if (messages.length > 0) channel.sendHistory(peerId, messages);
-            })
-            .catch((err) => {
-              api.logger.error?.(`webchannel: history snapshot failed for ${peerId}: ${String(err)}`);
-            });
-        } catch (err) {
-          api.logger.error?.(`webchannel: history snapshot resolution failed for ${peerId}: ${String(err)}`);
-        }
-      });
+      // NOTE (Phase 6): the initial history snapshot is now sent from the
+      // REGISTER route (stateless register — K is established there, and the
+      // client subscribes `.out` before registering). The old
+      // `setHandshakeCompleteHandler` snapshot wiring is gone: registered
+      // peers no longer handshake at all, and the channel only ever fired that
+      // callback for registered peers, so it could never fire again.
 
       // ---- Step 6 (per account): JWT verifier (register-hop accounts only) --
       // Only a `register-hop` account is gated by `channels.webchannel.auth`, so
