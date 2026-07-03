@@ -66,9 +66,12 @@ draft → answer, `/help`, exec-approval cards, status pill incl. terminal error
   substitutes its own handshake key.
 - **Echo LLM** lets the demo boot creds-free; the UI shows an "Echo mode" badge.
   Approvals + slash commands need a real model.
-- **Reload history hydration** is a known openclaw scope limitation (the plugin's
-  self-call to `sessions.get` lacks `operator.read`); the demo degrades gracefully
-  (no history, not a crash). See `docs/DEMO_PLAN.md`.
+- **Reload history hydration** works: reload a chat and the prior turns come back.
+  The snapshot is sent from the E2E handshake-complete handler (the earliest point
+  the per-peer session key exists) and the core session read runs in a detached
+  async-context so `sessions.get` authorizes against a synthetic operator client
+  instead of the request-scoped plugin client. No openclaw core change. See
+  `docs/DEMO_PLAN.md` for the root cause.
 
 ## Verifying (headless drivers)
 

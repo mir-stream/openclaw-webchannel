@@ -185,6 +185,31 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     expect(h.browserReplies).toEqual([{ type: "agent_message", text: "reply:hello agent" }]);
   });
 
+  it("fires the handshake-complete handler once the session key exists, so a snapshot sent from it is encryptable and delivered", () => {
+    const h = makeHarness();
+    // Wire a handshake-complete handler that sends an initial history snapshot —
+    // this is exactly how the plugin defers hydration until the key is ready.
+    const firedFor: string[] = [];
+    h.channel.setHandshakeCompleteHandler((peerId) => {
+      firedFor.push(peerId);
+      h.channel.sendHistory(peerId, [{ id: "m1", role: "user", text: "earlier turn" }]);
+    });
+
+    // Before the handshake the handler has not fired and nothing is deliverable.
+    expect(firedFor).toEqual([]);
+
+    h.doHandshake();
+
+    // It fired exactly once, for this peer, AFTER the session key was set...
+    expect(firedFor).toEqual([PEER]);
+    expect(h.browserSessionKey()).not.toBeNull();
+    // ...and the snapshot it sent decrypts on the browser (would have been
+    // fail-closed "no session key yet" if sent from the pre-handshake register hop).
+    expect(h.browserReplies).toEqual([
+      { type: "history", messages: [{ id: "m1", role: "user", text: "earlier turn" }] },
+    ]);
+  });
+
   it("only ever puts ciphertext on the wire (relay sees no plaintext)", () => {
     const h = makeHarness();
     h.doHandshake();

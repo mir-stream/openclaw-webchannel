@@ -12,6 +12,8 @@
  * - Approvals use NATS first-write-wins exactly-once
  */
 
+import { AsyncResource } from "node:async_hooks";
+
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { NatsChannel } from "./src/nats-channel.js";
@@ -85,6 +87,32 @@ const accountRuntimes = new Map<string, AccountRuntime>();
 const audToAccount = new Map<string, string>();
 /** Idempotency guard: the async per-account build runs once per process. */
 let accountsBuildStarted = false;
+
+/**
+ * Detached async-context for history self-reads.
+ *
+ * History hydration calls `api.runtime.subagent.getSessionMessages`, which
+ * dispatches the gateway `sessions.get` method — and that method authorizes
+ * against whatever operator client is ambient in the current gateway-request
+ * scope. The initial-snapshot read happens inside the `/webchannel/nats/register`
+ * HTTP route, whose ambient client is the plugin-auth client (no `operator.read`),
+ * so the dispatch is rejected with `missing scope: operator.read` and history
+ * silently degrades to `[]`.
+ *
+ * openclaw's own `deleteSession` sidesteps this by forcing a synthetic operator
+ * client, but `getSessionMessages` exposes no such option to plugins. The one
+ * lever a plugin has is the *calling context*: with NO ambient scoped client the
+ * dispatcher falls through to a synthetic `operator.write` client (which implies
+ * `operator.read`) and the read succeeds.
+ *
+ * This `AsyncResource` is constructed at module-evaluation time — before any HTTP
+ * request scope can exist — so `runInAsyncScope` re-establishes that clean,
+ * client-less context. Running the history read inside it escapes the request's
+ * restricted client without touching openclaw core. See `docs/DEMO_PLAN.md`.
+ */
+const historyReadScope = new AsyncResource("webchannel:history-read");
+const runDetachedHistoryRead = <T>(fn: () => Promise<T>): Promise<T> =>
+  historyReadScope.runInAsyncScope(fn);
 
 /**
  * Proof-of-Possession nonce store (gap ①). Single-use, short-TTL nonces bound
@@ -418,25 +446,12 @@ export default defineChannelPluginEntry({
             }
           }
 
-          // Register peer in THIS account's NATS channel.
+          // Register peer in THIS account's NATS channel. The initial history
+          // snapshot is NOT sent here: registration precedes the E2E crypto
+          // handshake, so a snapshot sent now is fail-closed dropped ("no session
+          // key yet"). It is sent from the handshake-complete handler instead
+          // (see setHandshakeCompleteHandler wiring below).
           channel.registerPeer(peerId);
-
-          // Send initial history snapshot, scoped to this account's route
-          // (accountId activates binding.account + per-account session key).
-          try {
-            const route = api.runtime.channel.routing.resolveAgentRoute({
-              cfg: api.config,
-              channel: WEBCHANNEL_ID,
-              accountId: account.accountId,
-              peer: { kind: "direct", id: peerId },
-            });
-            const messages = await historyRecent(api, route.sessionKey, account.historyConfig.limit, api.logger);
-            channel.sendHistory(peerId, messages);
-          } catch (err) {
-            api.logger.error?.(
-              `webchannel: history snapshot failed for ${peerId}: ${String(err)}`,
-            );
-          }
 
           // Send success response
           res.statusCode = 200;
@@ -667,7 +682,9 @@ export default defineChannelPluginEntry({
             accountId,
             peer: { kind: "direct", id: peerId },
           });
-          void historyPageBefore(api, route.sessionKey, request, historyConfig.pageSize, api.logger)
+          void runDetachedHistoryRead(() =>
+            historyPageBefore(api, route.sessionKey, request, historyConfig.pageSize, api.logger),
+          )
             .then((messages) => {
               channel.sendHistory(peerId, messages);
             })
@@ -676,6 +693,33 @@ export default defineChannelPluginEntry({
             });
         } catch (err) {
           api.logger.error?.(`webchannel: history resolution failed for ${peerId}: ${String(err)}`);
+        }
+      });
+
+      // Initial history snapshot — sent once the E2E handshake establishes the
+      // per-peer session key (the earliest point sendHistory can encrypt). The
+      // read runs in `runDetachedHistoryRead` so `sessions.get` authorizes against
+      // a synthetic operator client rather than the request-scoped plugin client
+      // that lacks `operator.read`.
+      channel.setHandshakeCompleteHandler((peerId) => {
+        try {
+          const route = api.runtime.channel.routing.resolveAgentRoute({
+            cfg: api.config,
+            channel: WEBCHANNEL_ID,
+            accountId,
+            peer: { kind: "direct", id: peerId },
+          });
+          void runDetachedHistoryRead(() =>
+            historyRecent(api, route.sessionKey, historyConfig.limit, api.logger),
+          )
+            .then((messages) => {
+              if (messages.length > 0) channel.sendHistory(peerId, messages);
+            })
+            .catch((err) => {
+              api.logger.error?.(`webchannel: history snapshot failed for ${peerId}: ${String(err)}`);
+            });
+        } catch (err) {
+          api.logger.error?.(`webchannel: history snapshot resolution failed for ${peerId}: ${String(err)}`);
         }
       });
 

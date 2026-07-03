@@ -293,30 +293,40 @@ Playwright driver (`verify-e2e.mjs`) confirms the working exit criteria: **login
 chat → echo reply ✓, wiretap ciphertext ✓**. One criterion is a known openclaw
 gap (below).
 
-- **History hydration fails with `missing scope: operator.read` — ROOT CAUSE
-  found; needs a plugin/openclaw CODE change, NOT config (open).** Sub-agent trace:
-  `historyRecent` runs inside webchannel's `auth:"plugin"` HTTP route handler
-  (`index-nats.ts:304,433`). openclaw wraps every plugin-route handler in an
-  async-local gateway scope whose client scopes are `[]` whenever
-  `route.auth !== "gateway"` (`plugins-http-CM1BGr1B.js:37`); the in-process
-  `sessions.get` dispatch (`getSessionMessages`) inherits that empty-scope operator
-  client, which shadows the fallback synthetic `operator.write` client
-  (`server-plugins-CLZE4NgR.js:221,233`), so `operator.read` is denied
-  (`core-descriptors:791`, `method-scopes:95-103`). NOT the runtime token / NOT
-  `gateway.auth.mode` — **no openclaw.json key or gateway flag fixes it.** The
-  demo code is correct (graceful `[]`, demo not broken; only past turns don't
-  reappear on reload). Fix options, all code: (1) plugin-side — a dedicated
-  INTERNAL `auth:"gateway"` + `gatewayRuntimeScopeSurface:"trusted-operator"`
-  route for the history read (`plugin-route-runtime-scopes-Dd01rqFD.js:6-9` grants
-  full operator scopes), kept separate from the browser-facing register route; (2)
-  plugin-side minimal — run the read OUTSIDE the plugin-route ALS so the synthetic
-  `operator.write` fallback applies (awkward: openclaw doesn't expose the ALS
-  seam); (3) openclaw upstream — `getSessionMessages` should dispatch with
-  `forceSyntheticClient:true` + read `syntheticScopes` exactly as `deleteSession`
-  already does (`server-plugins-CLZE4NgR.js:363-372`); today it omits both — an
-  openclaw asymmetry worth filing. It is NOT the plugin-side `HistoryStore` (that
-  serves late-join/multi-device, Phase 6). **Owner decision pending** on option
-  (1) vs filing (3) upstream vs backlog.
+- **History hydration on reload — RESOLVED (2026-07-03), plugin-only, no openclaw
+  core change.** Two independent causes were stacked; fixing the first exposed the
+  second.
+
+  **Cause 1 — scope (`missing scope: operator.read`).** `historyRecent` runs inside
+  webchannel's `auth:"plugin"` HTTP register route. openclaw wraps every plugin-route
+  handler in an async-local (ALS) gateway scope whose operator client scopes are `[]`
+  whenever `route.auth !== "gateway"` (`plugins-http-CM1BGr1B.js:37`); the in-process
+  `sessions.get` dispatch (`getSessionMessages`) inherits that empty-scope client,
+  which shadows the fallback synthetic `operator.write` client
+  (`server-plugins-CLZE4NgR.js:221,233`), so `operator.read` is denied. No
+  openclaw.json key or gateway flag changes it — `getSessionMessages` (unlike
+  `deleteSession`, `server-plugins:363-372`) exposes no `forceSyntheticClient`.
+  **Fix:** run the read inside a `node:async_hooks` `AsyncResource` constructed at
+  module-evaluation time — before any request scope exists — so `runInAsyncScope`
+  re-establishes that clean, client-less context. With no ambient scoped client the
+  dispatcher falls through to the synthetic `operator.write` client (which implies
+  `operator.read`) and the read succeeds. This is option (2) from the original
+  trace; the "openclaw doesn't expose the ALS seam" caveat was wrong — `AsyncResource`
+  IS the seam. See `runDetachedHistoryRead` in `index-nats.ts`.
+
+  **Cause 2 — timing (fail-closed `no session key yet`).** With the read fixed, the
+  snapshot was still dropped: it was sent from the register hop, which completes
+  BEFORE the E2E X25519 handshake, so `sendHistory` had no per-peer session key and
+  fail-closed (correctly — never plaintext). **Fix:** send the initial snapshot from
+  a new `NatsChannel.setHandshakeCompleteHandler` (fires at the end of
+  `handleHandshake`, once `peerSessionKeys` is set) instead of the register hop. That
+  handler also runs outside the HTTP request scope, so it composes cleanly with the
+  detached read.
+
+  Verified end-to-end (`demo/verify-e2e.mjs`, now a HARD criterion): reload restores
+  the prior turn. Not the plugin-side `HistoryStore` (that serves late-join/multi-device,
+  Phase 6). No upstream dependency; the openclaw `getSessionMessages`/`deleteSession`
+  asymmetry remains worth filing but is no longer blocking.
 
 ## Phase 2 status (2026-07-03) — fleet built + verified
 

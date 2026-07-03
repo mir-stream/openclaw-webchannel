@@ -143,6 +143,7 @@ export class NatsChannel {
   private onMessage?: (peerId: string, message: InboundWsMessage) => void;
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
   private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
+  private onHandshakeComplete?: (peerId: string) => void;
 
   constructor(
     transport: NatsTransport,
@@ -382,6 +383,20 @@ export class NatsChannel {
     this.onLoadHistory = handler;
   }
 
+  /**
+   * Set the handshake-complete handler.
+   *
+   * Fires once the per-peer E2E session key is established (see
+   * `handleHandshake`) — the earliest point at which `sendHistory` can actually
+   * encrypt a frame to this peer. The initial history snapshot MUST be sent from
+   * here, not from the register hop: registration completes before the crypto
+   * handshake, so a snapshot sent at register time is fail-closed dropped ("no
+   * session key yet").
+   */
+  setHandshakeCompleteHandler(handler: (peerId: string) => void): void {
+    this.onHandshakeComplete = handler;
+  }
+
   // ---------------------------------------------------------------------------
   // Internal implementation
   // ---------------------------------------------------------------------------
@@ -506,6 +521,10 @@ export class NatsChannel {
       keyExchangeFrame(this.agentKeyPair.publicKey),
     );
     console.log(`[nats-channel] Completed handshake with peer ${peerId}`);
+    // Session key is now established → the initial history snapshot can finally
+    // be encrypted to this peer. (Sent from here, not the register hop, which
+    // runs before the handshake — see setHandshakeCompleteHandler.)
+    this.onHandshakeComplete?.(peerId);
   }
 
   /**

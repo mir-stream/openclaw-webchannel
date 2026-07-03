@@ -58,11 +58,10 @@ try {
   await page.screenshot({ path: "/tmp/demo-phase1.png", fullPage: true });
   console.log("[verify] screenshot (chat+wiretap) → /tmp/demo-phase1.png");
 
-  // Reload → history hydration should restore the prior turn. KNOWN LIMITATION:
-  // openclaw's core session read (sessions.get) requires operator.read scope that
-  // the gateway's runtime token lacks, so hydration returns []. The demo code is
-  // correct (graceful []); this is a gateway-scope config gap, not a demo bug. We
-  // warn instead of failing so the driver still greenlights the working criteria.
+  // Reload → history hydration restores the prior turn. This is sent from the
+  // E2E handshake-complete handler (not the pre-handshake register hop) and reads
+  // the core session store in a detached async-context so `sessions.get` authorizes
+  // against a synthetic operator client. Hard criterion: it MUST restore.
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForSelector("#app:not(.hidden)", { timeout: 15000 });
   let historyOk = false;
@@ -70,16 +69,16 @@ try {
     await page.waitForFunction(
       (t) => document.querySelector("#chat-body")?.textContent?.includes(t),
       TEXT,
-      { timeout: 8000 },
+      { timeout: 10000 },
     );
     historyOk = true;
     console.log("[verify] ✓ history restored after reload");
   } catch {
-    console.warn("[verify] ⚠ history NOT restored (openclaw operator.read scope gap — known)");
+    console.error("[verify] ✗ history NOT restored after reload");
   }
 
-  code = sawHex ? 0 : 3;
-  console.log(`[verify] result: reply=OK wiretap=${sawHex ? "OK" : "FAIL"} history=${historyOk ? "OK" : "known-gap"}`);
+  code = sawHex && historyOk ? 0 : 3;
+  console.log(`[verify] result: reply=OK wiretap=${sawHex ? "OK" : "FAIL"} history=${historyOk ? "OK" : "FAIL"}`);
 } catch (err) {
   console.error("[verify] FAIL:", err?.message ?? err);
   code = 2;
