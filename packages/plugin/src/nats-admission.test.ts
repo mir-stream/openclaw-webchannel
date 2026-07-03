@@ -16,7 +16,7 @@
  */
 import { describe, it, expect } from "vitest";
 
-import { resolveAdmissionMode, admissionServingPlan, crossUserHistoryWarning } from "./nats-admission.js";
+import { resolveAdmissionMode, admissionServingPlan } from "./nats-admission.js";
 
 describe("resolveAdmissionMode", () => {
   it("explicit override always wins", () => {
@@ -73,21 +73,21 @@ describe("admissionServingPlan", () => {
   it("INVARIANT 1 — auto ⇒ wildcard subscribed, NO verifier built, NO aud mapping", () => {
     // An enrolled/open account whose admission is `auto` is served purely via the
     // NATS wildcard + handshake. It must NOT require or build the auth verifier,
-    // and must NOT claim an aud dispatch entry.
+    // and must NOT subscribe the `.register` admission subject.
     expect(admissionServingPlan("auto")).toEqual({
       subscribeWildcard: true,
       buildVerifier: false,
-      populateAudMapping: false,
+      subscribeRegister: false,
     });
   });
 
-  it("INVARIANT 2 — register-hop ⇒ verifier built + aud mapping populated, NO wildcard", () => {
-    // A jwt register-hop account keeps the verifier + register-route dispatch
-    // exactly as before (peers gated by the HTTP hop, not the wildcard).
+  it("INVARIANT 2 — register-hop ⇒ verifier built + register subscription, NO wildcard", () => {
+    // A jwt register-hop account keeps the verifier + subscribes its `.register`
+    // admission subject (peers gated by the NATS register hop, not the wildcard).
     expect(admissionServingPlan("register-hop")).toEqual({
       subscribeWildcard: false,
       buildVerifier: true,
-      populateAudMapping: true,
+      subscribeRegister: true,
     });
   });
 
@@ -104,7 +104,7 @@ describe("admissionServingPlan", () => {
     const plan = admissionServingPlan(admission);
     expect(plan.buildVerifier).toBe(false);
     expect(plan.subscribeWildcard).toBe(true);
-    expect(plan.populateAudMapping).toBe(false);
+    expect(plan.subscribeRegister).toBe(false);
   });
 
   it("INVARIANT 3 — a jwt account with a viable hop stays register-hop (verifier IS required)", () => {
@@ -123,30 +123,13 @@ describe("admissionServingPlan", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Phase 6 review finding 1 — cross-user history leak guard (dmScope)
+// Phase 6 review finding 1 — cross-user history leak guard.
+//
+// RETIRED: `crossUserHistoryWarning` used to warn a register-hop account whose
+// global session.dmScope was "main". Webchannel now FORCES its own
+// per-account-channel-peer session scope at every session-key site
+// (`src/session-route.ts`), so that leak is structurally impossible and the
+// warning has been removed. The enforced-key isolation is covered by
+// `session-route.test.ts` and `channel.test.ts` (the recorded session key), and
+// the truthful readiness line by `preflight.test.ts`.
 // ---------------------------------------------------------------------------
-
-describe("crossUserHistoryWarning (Phase 6 — dmScope leak guard)", () => {
-  it("warns for a register-hop account when dmScope is unset (openclaw default 'main')", () => {
-    const msg = crossUserHistoryWarning({ admission: "register-hop", accountId: "acct-a" });
-    expect(msg).toMatch(/acct-a/);
-    expect(msg).toMatch(/dmScope/);
-    expect(msg).toMatch(/per-channel-peer/);
-  });
-
-  it("warns for a register-hop account when dmScope is explicitly 'main'", () => {
-    expect(
-      crossUserHistoryWarning({ admission: "register-hop", accountId: "a", dmScope: "main" }),
-    ).not.toBeNull();
-  });
-
-  it("stays silent for any non-'main' scope (per-channel-peer / per-account-channel-peer)", () => {
-    for (const dmScope of ["per-channel-peer", "per-account-channel-peer"]) {
-      expect(crossUserHistoryWarning({ admission: "register-hop", accountId: "a", dmScope })).toBeNull();
-    }
-  });
-
-  it("stays silent for auto admission (no snapshot/history path gated here)", () => {
-    expect(crossUserHistoryWarning({ admission: "auto", accountId: "a" })).toBeNull();
-  });
-});

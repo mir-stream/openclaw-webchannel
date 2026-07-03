@@ -356,14 +356,19 @@ export async function verifyJwt(
  * an array per RFC 7519). Returns `[]` on any decode failure or a missing/
  * malformed `aud`.
  *
- * ── Why an UNVERIFIED peek is safe here ─────────────────────────────────────
- * The single `/webchannel/nats/register*` route serves multiple accounts; it
- * must pick WHICH account's verifier to run, and each account's verifier checks
- * a different expected `aud` (= that account's accountId). This helper only
- * ROUTES the request to a candidate account. The selected account's verifier
- * then performs the full, signature-checked verification (issuer + `aud` +
- * signature + exp), so a forged/altered `aud` can at most select an account whose
- * verifier will then REJECT the token. It never grants trust on its own.
+ * ── Why an UNVERIFIED peek is safe ──────────────────────────────────────────
+ * A caller that serves multiple accounts can use this to pick WHICH account's
+ * verifier to run, where each account's verifier checks a different expected
+ * `aud` (= that account's accountId). This helper only ROUTES to a candidate
+ * account; the selected account's verifier then performs the full,
+ * signature-checked verification (issuer + `aud` + signature + exp), so a
+ * forged/altered `aud` can at most select an account whose verifier will then
+ * REJECT the token. It never grants trust on its own.
+ *
+ * NOTE: since register admission moved to a per-account NATS `.register` subject
+ * (the subject namespace already pins the account), production no longer routes
+ * by aud — each account verifies against its own auth directly. This peek is
+ * retained for any future multi-account-single-entry routing and its own tests.
  */
 export function peekUnverifiedJwtAudiences(token: unknown): string[] {
   if (typeof token !== "string" || token.length === 0) return [];

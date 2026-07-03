@@ -20,13 +20,12 @@ zero-infra fallback.
 
 As of `e384198`, a real headless-Chromium message HAS travelled browser → NATS → this plugin →
 `inbound.run` → (echo model) → back. Earlier the NATS entry assumed APIs that don't exist
-(`api.http.post`, a `webchannel-nats` id, `keepAlive`) — fixed there. The plain-HTTP register
-routes (`/webchannel/nats/register*`) are now **served live** too: they were silently dropped
-because `registerFull` called `api.registerHttpRoute` *after* `await`-ing the NATS connect, and
-openclaw only honors route registration during the **synchronous** `registerFull` window — the
-fix registers them up front (handlers read live state via a holder). This was *not* an openclaw
-limitation on plain-HTTP routes; those dispatch fine. The browser client is also **wired** to
-register over this hop (`registerWithPop`, `9aa4b67`). Two caveats remain: the deterministic echo
+(`api.http.post`, a `webchannel-nats` id, `keepAlive`) — fixed there. Register admission is now
+**fully over NATS**: a register-hop account subscribes its own
+`webchannel.{tenant}.{accountId}.*.register` subject and the browser drives challenge/register/
+unregister via NATS request/reply on `…{peerId}.register` (the old inbound HTTP register routes
+are deleted — the agent makes ONLY outbound connections). The browser client is wired to register
+over this hop (`registerWithPop`). Two caveats remain: the deterministic echo
 model stands in for a live LLM (by design), and the local dev harness still drives the wildcard
 auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See STATUS.md.
 
@@ -86,20 +85,24 @@ Phase 6 (multi-device) split key establishment by admission mode:
 
 - **Register admission (production / SaaS path) — register-delivered conversation key.**
   The agent OWNS a stable per-peerId key K (`src/conversation-key-store.ts`, persisted at
-  `~/.openclaw-webchannel/<account>/conversation-keys.json`, 0600). The HTTP register route wraps
-  K (`src/late-join-decryptor.ts` — X25519 ECDH + HKDF-SHA256 `webchannel-key-wrap-v1` +
-  ChaCha20-Poly1305) to the device key attested in **that request's** verified JWT `cnf` claim and
-  returns it in the register response. There is **no `.handshake` on this path** — the
-  keyStore-mode channel neither subscribes nor answers it — so an active relay cannot substitute
-  keys: K only ever travels wrapped to a JWT-attested device key, over authenticated HTTPS, never
-  over NATS. This resolves review finding **C2** structurally for register deployments. One user's
+  `~/.openclaw-webchannel/<account>/conversation-keys.json`, 0600). The register handler (a NATS
+  request/reply on the account's `…{peerId}.register` subject) wraps K (`src/late-join-decryptor.ts`
+  — X25519 ECDH + HKDF-SHA256 `webchannel-key-wrap-v1` + ChaCha20-Poly1305) to the device key
+  attested in **that request's** verified JWT `cnf` claim and returns it in the register reply.
+  There is **no `.handshake` on this path** — the keyStore-mode channel neither subscribes nor
+  answers it — so an active relay cannot substitute keys: K only ever travels **wrapped to a
+  JWT-attested device key**, and the wrap target comes from the SaaS-signed JWT `cnf`, not from
+  anything the transport controls. So even though register now rides NATS (visible to the relay),
+  the relay/observer sees only ciphertext + a wrapped key it cannot open, and cannot coax K to be
+  wrapped to a key it holds. This resolves review finding **C2** structurally for register
+  deployments. One user's
   devices all receive the SAME K, so multi-device decryption works and a second device no longer
   overwrites the first one's key.
   - **`cnf` claim verification** (`src/jwt.ts`): after the bootstrap JWT's signature is verified,
     `verifyJwt` extracts the RFC 7800 `cnf.jwk` confirmation claim. The claim must be
     `kty: "OKP"`, `crv: "X25519"`, with a 32-byte `x`; a `d` (private) field, wrong length, or
     any malformed `cnf` causes the **whole JWT to be rejected** (fail-closed). The validated key
-    surfaces as `JwtIdentity.devicePublicKey`; the register route REQUIRES it (401 without) and
+    surfaces as `JwtIdentity.devicePublicKey`; the register handler REQUIRES it (401 without) and
     wraps per-request. There is deliberately **no cross-request pinned-key store** — the old
     peerId-keyed pin store collided two devices of one user and was removed (with the never-wired
     `handshake-verifier.ts`) in Phase 6 W7.
@@ -231,9 +234,9 @@ npm test              # vitest run
 `package.json`); the plugin is loaded as TypeScript via OpenClaw's plugin loader. Packaging /
 publish to ClawHub is a known open question — see `../../docs/PACKAGING.md` and STATUS.md.
 
-The plugin serves no static UI. The **production** entry (`index-nats.ts`) exposes the
-plain-HTTP register routes `/webchannel/nats/register`, `/webchannel/nats/register/challenge`,
-and `/webchannel/nats/unregister` (used only by the `register-hop` admission mode; the browser
-otherwise reaches the agent over NATS, not HTTP). The **legacy dev-only** entry (`index.ts`)
-exposes the `/webchannel/ws` WebSocket route instead. Either way a consumer wires the headless
-`packages/client` library into their own page (see that package's README).
+The plugin serves no static UI and, in the **production** entry (`index-nats.ts`), no inbound
+HTTP routes at all: register admission (`register-hop` mode) rides NATS request/reply on the
+account's `webchannel.{tenant}.{accountId}.{peerId}.register` subject, so the agent makes only
+outbound connections. The **legacy dev-only** entry (`index.ts`) still exposes the `/webchannel/ws`
+WebSocket upgrade route instead. Either way a consumer wires the headless `packages/client`
+library into their own page (see that package's README).

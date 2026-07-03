@@ -460,6 +460,21 @@ export class NatsTransport extends EventEmitter {
     this.ws!.send("\r\n");
   }
 
+  /**
+   * Publish with a NATS reply-to subject (the requester half of request/reply):
+   *   PUB <subject> <reply-to> <byte-count>\r\n<payload>\r\n
+   * The subscriber sees `msg.replyTo` and publishes its response there. Symmetric
+   * with the receive-side reply-to parsing already in the MSG handler. Used by
+   * e2e drivers that drive the NATS register hop (`…{peerId}.register`).
+   */
+  publishWithReply(subject: string, replyTo: string, payload: string | Buffer): void {
+    this.assertOpen();
+    const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, "utf8");
+    this.ws!.send(`PUB ${subject} ${replyTo} ${buf.length}\r\n`);
+    this.ws!.send(buf);
+    this.ws!.send("\r\n");
+  }
+
   // ---------------------------------------------------------------------------
   // Teardown
   // ---------------------------------------------------------------------------

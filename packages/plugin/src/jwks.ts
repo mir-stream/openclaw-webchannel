@@ -24,6 +24,22 @@
 import { readFile } from "node:fs/promises";
 
 /**
+ * A JWKS SOURCE was unreachable — network error, non-2xx response, non-JSON
+ * body, or a file read/decode failure. This is a TRANSIENT infrastructure fault
+ * ("I could not check the key"), distinct from a genuine key MISS ("this kid does
+ * not exist", a plain `Error`) or a bad token. Callers use this to answer a
+ * retryable "unavailable" instead of a terminal "unauthorized", so a momentary
+ * IdP/JWKS hiccup doesn't permanently kill a session — WITHOUT becoming an oracle
+ * (both outcomes are still non-admit; only the retry disposition differs).
+ */
+export class JwksUnavailableError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options as ErrorOptions);
+    this.name = "JwksUnavailableError";
+  }
+}
+
+/**
  * A single JWK with the subset of fields we care about. Mirrors RFC 7517 / 7518
  * §6.3.1 (RSA public key). `kid` is optional in the spec but required here for
  * lookup; `alg` is enforced at verify-time, not here. We keep the type narrow
@@ -105,7 +121,16 @@ async function fetchJwks(
   url: string,
   fetchImpl: typeof fetch,
 ): Promise<JsonWebKeySet> {
-  const res = await fetchImpl(url);
+  let res: Awaited<ReturnType<typeof fetchImpl>>;
+  try {
+    res = await fetchImpl(url);
+  } catch (err) {
+    // Network-level failure (DNS, connection refused, timeout) — transient.
+    throw new JwksUnavailableError(
+      `webchannel: JWKS fetch failed for ${url}: ${(err as Error).message}`,
+      { cause: err },
+    );
+  }
   if (!res.ok) {
     // Consume + discard so the body isn't leaked, then throw.
     try {
@@ -113,7 +138,8 @@ async function fetchJwks(
     } catch {
       /* ignore — we're already failing */
     }
-    throw new Error(
+    // A non-2xx from the JWKS endpoint is an infra fault, not a token verdict.
+    throw new JwksUnavailableError(
       `webchannel: JWKS fetch failed for ${url}: HTTP ${res.status}`,
     );
   }
@@ -121,8 +147,9 @@ async function fetchJwks(
   try {
     doc = await res.json();
   } catch (err) {
-    throw new Error(
+    throw new JwksUnavailableError(
       `webchannel: JWKS fetch from ${url} returned non-JSON body: ${(err as Error).message}`,
+      { cause: err },
     );
   }
   return parseJwks(doc);
@@ -134,16 +161,19 @@ async function loadJwksFile(path: string, readFileImpl: (p: string) => Promise<U
   try {
     bytes = await readFileImpl(path);
   } catch (err) {
-    throw new Error(
+    // A missing/unreadable file is an infra fault (deploy/mount), not a verdict.
+    throw new JwksUnavailableError(
       `webchannel: JWKS file read failed for ${path}: ${(err as Error).message}`,
+      { cause: err },
     );
   }
   let text: string;
   try {
     text = new TextDecoder("utf-8").decode(bytes);
   } catch (err) {
-    throw new Error(
+    throw new JwksUnavailableError(
       `webchannel: JWKS file at ${path} is not valid UTF-8: ${(err as Error).message}`,
+      { cause: err },
     );
   }
   let parsed: unknown;
@@ -278,6 +308,24 @@ export class JWKSCache implements KeyResolver {
       );
     }
     return refreshedHit;
+  }
+
+  /**
+   * Preflight warm-up: resolve the JWKS document ONCE (honoring the TTL cache)
+   * and return it, so a startup/enroll-time gate can COUNT keys or surface a
+   * fetch failure eagerly — instead of the failure only appearing lazily on the
+   * first browser register. This reuses the EXACT same "best-effort doc" path
+   * `getKey` step 1 uses (inline → fresh cache → one fetch), so it opens no
+   * second fetcher and primes the very cache the register/challenge routes read.
+   *
+   * THROWS `JwksUnavailableError` on a transient fetch/file failure (fail-closed;
+   * never returns a stale doc). A successful resolve may legitimately return a
+   * document with ZERO keys — the caller decides that is a hard preflight FAIL
+   * ("cannot verify any bootstrap JWT"), which this method does NOT itself treat
+   * as an error (an empty-but-served JWKS is not an I/O fault).
+   */
+  async warm(): Promise<JsonWebKeySet> {
+    return (await this.maybeLoadFromCache()) ?? (await this.loadFresh());
   }
 
   /**

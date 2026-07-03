@@ -2,7 +2,22 @@ import type { IncomingMessage } from "node:http";
 
 import { verifyJwt } from "./jwt.js";
 import type { JwtIdentity } from "./jwt.js";
-import { JWKSCache } from "./jwks.js";
+import { JWKSCache, JwksUnavailableError } from "./jwks.js";
+
+/**
+ * Verification could NOT be performed because a dependency (the JWKS source) was
+ * unavailable — a transient infrastructure fault, NOT a decision about the token.
+ * The register handler answers this with a distinct retryable code (503) rather
+ * than a terminal 401, so a momentary JWKS/IdP hiccup doesn't permanently kill a
+ * session. It is NOT an oracle: a transient failure and a genuine reject are both
+ * non-admit; only the client's retry disposition differs (503 → retry, 401 → stop).
+ */
+export class TransientVerifyError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options as ErrorOptions);
+    this.name = "TransientVerifyError";
+  }
+}
 
 /**
  * The auth seam. AUTH.md §3: every built-in or custom strategy converges to ONE
@@ -89,22 +104,12 @@ export type JwtAuthConfig = {
   /** Query param the JWT arrives in. Default `"ticket"`. */
   ticketParam?: string;
   /**
-   * Require Proof-of-Possession at the NATS register route. Secure-by-default:
+   * Require Proof-of-Possession at the NATS register hop. Secure-by-default:
    * when unset the plugin behaves as `true`, so a verified bootstrap JWT that
-   * carries no `pop_jwk` is REJECTED (401) before any peer is registered. Set
-   * to `false` to restore the legacy optional-PoP behavior (dev only).
+   * carries no `pop_jwk` is REJECTED before any peer is registered. Set to
+   * `false` to restore the legacy optional-PoP behavior (dev only).
    */
   requirePoP?: boolean;
-  /** Optional CORS hardening for the browser-driven register hop. */
-  cors?: {
-    /**
-     * Allowlist of browser Origins permitted on the register routes. When
-     * unset/empty the register hop reflects the request Origin (permissive,
-     * unchanged). When non-empty, only an in-list Origin receives an
-     * `Access-Control-Allow-Origin` header.
-     */
-    allowedOrigins?: string[];
-  };
 };
 
 export type AuthConfig = AnonymousAuthConfig | JwtAuthConfig;
@@ -190,6 +195,28 @@ function jwksCacheFor(config: JwtAuthConfig): JWKSCache {
     jwksCacheByAuthConfig.set(config, cache);
   }
   return cache;
+}
+
+/**
+ * Preflight (Gate B — gateway start): resolve the account's JWKS ONCE and count
+ * the keys, reusing the account's long-lived {@link JWKSCache} (keyed on this
+ * exact `JwtAuthConfig` object — the same instance the register/challenge routes
+ * verify against). This is the readiness gate's most useful diagnostic: an empty
+ * or unreachable JWKS means NO bootstrap JWT can ever verify, and surfacing it at
+ * startup (not lazily on the first browser register) is the whole point.
+ *
+ * Does NOT open a second fetcher — it drives {@link JWKSCache.warm}, so warming
+ * here also primes the cache the live verify path reuses. A transient fetch
+ * failure propagates as {@link JwksUnavailableError} (fail-closed; the caller
+ * reports `JWKS FETCH FAILED` and keeps serving — the account is already
+ * fail-closed because with no keys every register verify returns non-admit).
+ */
+export async function preflightResolveJwks(
+  config: JwtAuthConfig,
+): Promise<{ keyCount: number }> {
+  const cache = jwksCacheFor(config);
+  const doc = await cache.warm();
+  return { keyCount: doc.keys.length };
 }
 
 function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
@@ -322,11 +349,15 @@ export async function verifyJwtAndExtractIdentity(
   // defeated the TTL and re-fetched the IdP on every pairing.
   const jwksCache = jwksCacheFor(jwtCfg);
 
-  // Verify JWT. A verification-time throw (e.g. the JWKS resolver failing closed
-  // on an unknown/evicted `kid`, or an IdP fetch error) is a fail-to-authenticate
-  // condition, NOT a server fault: treat it exactly like a `null` verdict so the
-  // caller returns a clean 401 instead of letting the throw escape to a 500. The
-  // config guards above still throw (a deploy error, correctly surfaced).
+  // Verify JWT. Two distinct throw classes must NOT be conflated:
+  //  - JwksUnavailableError (JWKS source unreachable — network/non-2xx/file I/O):
+  //    verification could not be PERFORMED. Re-thrown as TransientVerifyError so
+  //    the register handler answers a retryable 503, not a terminal 401 — a
+  //    momentary IdP hiccup must not permanently kill a session.
+  //  - any OTHER throw (e.g. an unknown/evicted `kid` that IS a genuine key miss)
+  //    or a `null` verdict (bad signature / claims): a fail-to-authenticate
+  //    condition → treat as `null` so the caller returns a clean 401 (never a 500).
+  // The config guards above still throw (a deploy error, correctly surfaced).
   let identity: Awaited<ReturnType<typeof verifyJwt>>;
   try {
     identity = await verifyJwt(jwt, {
@@ -336,6 +367,13 @@ export async function verifyJwtAndExtractIdentity(
       clockSkewSec: jwtCfg.jwt.clockSkew,
     });
   } catch (err) {
+    if (err instanceof JwksUnavailableError) {
+      logger?.error?.(`webchannel: JWT verification unavailable (transient): ${String(err)}`);
+      throw new TransientVerifyError(
+        "JWKS source unavailable — verification could not be performed",
+        { cause: err },
+      );
+    }
     logger?.error?.(`webchannel: JWT verification error (fail-closed): ${String(err)}`);
     return null;
   }

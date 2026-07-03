@@ -175,6 +175,18 @@ export class NatsChannel {
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
   private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
   private onHandshakeComplete?: (peerId: string) => void;
+  /**
+   * Register-hop admission over NATS (replaces the deleted HTTP register routes).
+   * Fired for a plaintext JSON request on `…{peerId}.register`; the handler runs
+   * the full JWT + Proof-of-Possession verify and replies via the `reply`
+   * callback (published to the request's NATS reply-to inbox). See
+   * `subscribeRegister` and `handleRegister`.
+   */
+  private onRegisterRequest?: (
+    peerId: string,
+    payload: string,
+    reply: (response: string) => void,
+  ) => void;
 
   constructor(
     transport: NatsTransport,
@@ -270,6 +282,37 @@ export class NatsChannel {
       this.transport.subscribe(hsWild);
     }
     console.log(`[nats-channel] Subscribed to wildcard ${inWild}`);
+  }
+
+  /**
+   * Subscribe to the register-admission wildcard `webchannel.{tenant}.{accountId}.*.register`.
+   *
+   * This is the always-on NATS analogue of the deleted HTTP register routes:
+   * register-hop accounts call it at channel start so a browser can drive the
+   * JWT + Proof-of-Possession admission round-trip over NATS request/reply
+   * (browser publishes with a reply-to inbox; `handleRegister` replies there).
+   * The subject namespace already encodes tenant+accountId, so the request is
+   * pinned to THIS account — identity still comes only from the verified JWT.
+   */
+  subscribeRegister(): void {
+    const regWild = `webchannel.${this.tenant}.${this.accountId}.*.register`;
+    this.transport.subscribe(regWild);
+    console.log(`[nats-channel] Subscribed to register wildcard ${regWild}`);
+  }
+
+  /**
+   * Set the register-request handler (register-hop admission over NATS).
+   *
+   * The handler receives the subject's peerId segment, the raw request payload
+   * (plaintext JSON — the browser has no session key yet), and a `reply` callback
+   * that publishes the response to the request's NATS reply-to inbox. Identity
+   * MUST be derived from the verified JWT inside the handler, never from the
+   * subject peerId (see the register handler's subject-spoofing guard).
+   */
+  setRegisterRequestHandler(
+    handler: (peerId: string, payload: string, reply: (response: string) => void) => void,
+  ): void {
+    this.onRegisterRequest = handler;
   }
 
   /**
@@ -533,6 +576,15 @@ export class NatsChannel {
     const peerId = parts[3];
     const suffix = parts[parts.length - 1];
 
+    // Register-hop admission (plaintext JSON, no session key yet) is handled
+    // before the crypto branch: the browser can't encrypt until it has K, and
+    // K is delivered BY this round-trip. Routing is by subject; identity comes
+    // from the verified JWT inside the handler.
+    if (suffix === "register") {
+      this.handleRegister(msg, peerId);
+      return;
+    }
+
     if (this.encryptionRequired) {
       if (suffix === "handshake") {
         this.handleHandshake(msg, peerId);
@@ -549,6 +601,24 @@ export class NatsChannel {
     } catch (err) {
       console.error(`[nats-channel] Failed to parse message from ${peerId}:`, err);
     }
+  }
+
+  /**
+   * Register-hop admission over NATS: hand the plaintext request to the
+   * registered handler and route its reply to the NATS reply-to inbox.
+   *
+   * The reply is published to `msg.replyTo` (the browser's request-scoped inbox
+   * subject), never to a peerId-derived subject, so a spoofed subject peerId can
+   * never redirect a reply. A request with no reply-to (e.g. fire-and-forget
+   * `unregister`) simply gets a no-op reply callback.
+   */
+  private handleRegister(msg: NatsMessage, peerId: string): void {
+    if (!this.onRegisterRequest) return;
+    const replyTo = msg.replyTo;
+    const reply = (response: string): void => {
+      if (replyTo) this.transport.publish(replyTo, response);
+    };
+    this.onRegisterRequest(peerId, msg.payload.toString(), reply);
   }
 
   /**

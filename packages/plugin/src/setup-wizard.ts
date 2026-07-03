@@ -99,8 +99,8 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       const account = resolveWebchannelAccountConfig(cfg, id);
       const hasJwt = Boolean((account.auth as { jwt?: unknown } | undefined)?.jwt);
       if (hasJwt) return true;
-      // Enrolled creds on disk also count as configured (auth may be inert under
-      // admission=auto, but the account is usable).
+      // Enrolled creds on disk also count as configured (the account is usable
+      // under admission=register-hop even before jwt auth is fully wired).
       return existsSync(resolveReadCredentialPath(id));
     },
     resolveStatusLines: ({ cfg, accountId, configured }) => {

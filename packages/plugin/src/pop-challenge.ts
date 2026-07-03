@@ -11,13 +11,13 @@
  * `cnf.jwk` is a separate key (E2E encryption + handshake pinning) and is NOT a
  * signing key, so PoP needs its own Ed25519 key.
  *
- * Flow:
- *   1. GET  /webchannel/nats/register/challenge?jwt=…  → server issues a nonce
- *      bound to peerId (single-use, short TTL).
+ * Flow (over NATS request/reply on the account's `…{peerId}.register` subject):
+ *   1. `{op:"challenge", token}` → server issues a nonce bound to peerId
+ *      (single-use, short TTL).
  *   2. Browser signs `popSignedMessage(peerId, nonce)` with the Ed25519 device
  *      private key.
- *   3. POST /webchannel/nats/register with the signature → server verifies it
- *      against the JWT's `pop_jwk`. Missing/invalid/expired/replayed → 401.
+ *   3. `{op:"register", token, nonce, signature}` → server verifies the signature
+ *      against the JWT's `pop_jwk`. Missing/invalid/expired/replayed → rejected.
  */
 
 import { randomBytes, createPublicKey, verify as edVerify } from "node:crypto";

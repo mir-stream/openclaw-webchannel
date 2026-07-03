@@ -25,7 +25,8 @@ import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
-import { WEBCHANNEL_ID } from "./src/transport.js";
+import { DEFAULT_ACCOUNT_ID } from "./src/account-config.js";
+import { resolveWebchannelSessionRoute } from "./src/session-route.js";
 
 /**
  * Shared transport instance. The channel plugin (outbound) and the HTTP upgrade
@@ -134,11 +135,12 @@ export default defineChannelPluginEntry({
     // routing-resolution throw NEVER crashes the connection.
     transport.setFirstLivenessHandler((wsKey) => {
       try {
-        const route = api.runtime.channel.routing.resolveAgentRoute({
-          cfg: api.config,
-          channel: WEBCHANNEL_ID,
-          peer: { kind: "direct", id: wsKey },
-        });
+        // Same forced per-account-channel-peer key as the inbound WRITE path
+        // (handleInboundMessage → resolveWebchannelSessionRoute with the default
+        // account), so the legacy Gateway-WS snapshot reads THIS peer's session,
+        // not the shared "main" one. DEFAULT_ACCOUNT_ID matches the accountId the
+        // inbound dispatcher uses here, keeping WRITE and READ keys identical.
+        const route = resolveWebchannelSessionRoute(api, DEFAULT_ACCOUNT_ID, wsKey);
         void historyRecent(api, route.sessionKey, historyConfig.limit, api.logger)
           .then((messages) => {
             transport.sendHistory(wsKey, messages);
@@ -162,11 +164,9 @@ export default defineChannelPluginEntry({
     // errors are logged, never thrown.
     transport.setLoadHistoryHandler((wsKey, request) => {
       try {
-        const route = api.runtime.channel.routing.resolveAgentRoute({
-          cfg: api.config,
-          channel: WEBCHANNEL_ID,
-          peer: { kind: "direct", id: wsKey },
-        });
+        // Same forced key as the snapshot + WRITE sites — legacy pagination reads
+        // THIS peer's session (see resolveWebchannelSessionRoute).
+        const route = resolveWebchannelSessionRoute(api, DEFAULT_ACCOUNT_ID, wsKey);
         const requestedLimit = request.limit ?? historyConfig.pageSize;
         const fetch = request.before
           ? historyPageBefore(
