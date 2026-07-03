@@ -25,11 +25,11 @@ status/terminal-error surfacing.
 | # | Scene | Freedom proven |
 |---|---|---|
 | ① | One identity, an agent fleet — admin grants/revokes agents per user live; widget grows/loses lanes | SaaS as sole access authority (`aud` as list) |
-| ② | Agents appear from anywhere — a NEW agent enrolls live from "another machine", approved (or denied) in the admin panel, instantly reachable | Ingress-free dial-out + SaaS-delivered rendezvous (`natsUrl` + register URL per account) |
+| ② | Agents appear from anywhere — a NEW agent enrolls live from "another machine", approved (or denied) in the admin panel, instantly reachable | Zero inbound listeners: admission rides the agent's outbound NATS connection (register is NATS request/reply) — the SaaS-delivered rendezvous is only the shared relay `natsUrl`, no gateway URL |
 | ③ | The relay may be hostile — ciphertext-only wiretap; injected tamper silently dropped (AAD); **stolen-JWT replay defeated by PoP**; relay restart mid-chat self-heals **with the user's in-flight message queued and delivered**; cross-tenant subscribe → live `-ERR Permissions Violation`; encryption-off config refuses to boot | Confidentiality (vs passive relay) + integrity + authentication + availability |
 | ④ | Many users, one agent — user A's exec approval card appears only in A's widget; non-approver's decision is rejected fail-closed; different users' turns run in parallel, each user's turns in order | Per-peer routing + HITL approver authz on a shared agent |
 | ⑤ | Time-bounded trust — a short-TTL credential lapses: the widget flips to a terminal "credentials expired" state (no eternal spinner), one re-auth click restores the lane | Short-lived creds + honest terminal-error UX (CL2) |
-| ⑥ | E2E *and* multi-device — a second tab/device syncs live ciphertext and decrypts backlog via per-device key-wrap | E2E crypto compatible with multi-device + history (deferred product milestone) |
+| ⑥ | E2E *and* multi-device — a second tab/device syncs live ciphertext and decrypts backlog via per-device key-wrap (Phase 6 — **built + verified**; `demo/verify-multidevice.mjs`) | E2E crypto compatible with multi-device + history |
 
 ## Locked decisions (2026-07-03 review with owner)
 
@@ -80,15 +80,17 @@ status/terminal-error surfacing.
 
 ## Topology constraint (load-bearing)
 
-**One gateway per agent for the fleet scenes.** The register route dispatches by
+**One gateway per agent for the fleet scenes.** The register handler dispatches by
 aud peek, FIRST match wins (`resolveAccountIdForJwt`,
 `packages/plugin/src/register-dispatch.ts:21-31`) and ignores any client-supplied
 accountId — so a single multi-aud JWT registers into only ONE account per
 gateway. The fleet therefore runs each agent on its own gateway process
-(19299/19399/…), and the SaaS `/me`/`/bootstrap` response delivers a **per-account
-rendezvous map** `accountId → { natsUrl, registerBaseUrl }`; each widget lane's
-`registration.registerBaseUrl` points at that account's gateway. (This also IS
-the scene-② story: agents are independent processes on independent machines.)
+(19299/19399/…). Register is a **NATS request/reply** on the account's
+`.register` subject (not an HTTP route), so the SaaS `/me`/`/bootstrap` response
+delivers only the shared relay `natsUrl` per account — there is **no `registerBaseUrl`
+and no gateway URL**; the widget lane derives its register subject from
+`tenant/accountId/peerId`. (This also IS the scene-② story: agents are independent
+processes on independent machines, reachable with zero inbound listeners.)
 True single-gateway multi-agent-from-one-login would need a register-route
 change — out of scope. A single gateway multiplexing several accounts
 (`planAccounts`, `packages/plugin/src/multiplex.ts:50-77`) remains real and may
@@ -141,8 +143,9 @@ Everything here is demo-side; **zero product-code changes.**
      user uuid) + `GET /bootstrap` minting the RS256 bootstrap JWT
      (`cnf.jwk` X25519 + `pop_jwk` Ed25519). Phase 1 mints a single-account `aud`;
      phase 2 makes it a list. The response also carries the per-account
-     rendezvous map `accountId → { natsUrl, registerBaseUrl }` (see Topology
-     constraint) so the browser never learns the relay/gateway from local config.
+     rendezvous map `accountId → { natsUrl }` (see Topology constraint) — only the
+     shared relay URL, no gateway URL — so the browser never learns the relay from
+     local config and never dials the agent directly.
    - `/admin/users` grant/revoke API (in-memory, seeded).
    - Serves `demo/web` + the demo config.
 2. `demo/run.sh` — isolated `OPENCLAW_HOME`; boot order: saas-server → nats-server
@@ -260,12 +263,14 @@ narrative:
   `demo/verify-evict.mjs` (evicted-kid rejected). Both verified live.
 - **One gateway, many accounts — BUILT (`demo/multiplex.sh`).** ONE gateway
   (:19599) enrolls team-sales + team-support under a single OPENCLAW_HOME;
-  `planAccounts` builds one NatsChannel per account and the single register route
-  dispatches each browser by JWT `aud`. alice → team-sales, bob → team-support,
-  both served by the SAME process (their rendezvous both resolve to :19599).
-  Process-level tenancy, distinct from scene ②'s per-machine story. No product
-  change — pure orchestration. Driver `demo/verify-multiplex.mjs` (verified live:
-  one-gateway-two-accounts=OK, both users chat).
+  `planAccounts` builds one NatsChannel per account and the single register
+  handler (on each account's `.register` NATS subject) dispatches each browser by
+  JWT `aud`. alice → team-sales, bob → team-support, both served by the SAME
+  process. There is no gateway URL to compare anymore (rendezvous is only
+  `natsUrl`), so the driver proves the single-process claim by driving both live
+  chats. Process-level tenancy, distinct from scene ②'s per-machine story. No
+  product change — pure orchestration. Driver `demo/verify-multiplex.mjs` (verified
+  live: one-gateway-two-accounts=OK, both users chat).
 - **Real managed relay — BUILT (`DEMO_RELAY=synadia`, `9db3a42`).** The whole demo
   runs over Synadia Cloud / NGS instead of the demo-owned nats-server: the SaaS
   still owns the RSA/JWKS bootstrap chain but mints NATS user creds signed by an
@@ -317,10 +322,13 @@ gap (below).
 
 - **History hydration on reload — RESOLVED (2026-07-03), plugin-only, no openclaw
   core change.** Two independent causes were stacked; fixing the first exposed the
-  second.
+  second. (This trace predates the register-over-NATS migration — the register hop
+  named below was an HTTP plugin route at the time; it is now a NATS request/reply,
+  but the detached-async-context read and handshake-complete snapshot carried
+  forward unchanged, and Phase 6 later added the register-delivered snapshot on top.)
 
   **Cause 1 — scope (`missing scope: operator.read`).** `historyRecent` runs inside
-  webchannel's `auth:"plugin"` HTTP register route. openclaw wraps every plugin-route
+  webchannel's `auth:"plugin"` register route. openclaw wraps every plugin-route
   handler in an async-local (ALS) gateway scope whose operator client scopes are `[]`
   whenever `route.auth !== "gateway"` (`plugins-http-CM1BGr1B.js:37`); the in-process
   `sessions.get` dispatch (`getSessionMessages`) inherits that empty-scope client,
