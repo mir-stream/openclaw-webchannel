@@ -31,6 +31,34 @@ status/terminal-error surfacing.
 | ⑤ | Time-bounded trust — a short-TTL credential lapses: the widget flips to a terminal "credentials expired" state (no eternal spinner), one re-auth click restores the lane | Short-lived creds + honest terminal-error UX (CL2) |
 | ⑥ | E2E *and* multi-device — a second tab/device syncs live ciphertext and decrypts backlog via per-device key-wrap | E2E crypto compatible with multi-device + history (deferred product milestone) |
 
+## Locked decisions (2026-07-03 review with owner)
+
+- **Scope:** phases 1–4. Phase 5 asides picked per-audience after the demo runs;
+  phase 6 (multi-device E2E) is its own milestone.
+- **Gateway model — self-contained, with the connect experience surfaced.**
+  webchannel is an *openclaw plugin*, not a standalone app, so the demo MUST have
+  at least one openclaw gateway process to host it. `run.sh` boots that gateway
+  itself under an **isolated `OPENCLAW_HOME`** (`node_modules/.bin/openclaw`,
+  the devDep `2026.6.10`) — the user's real `~/.openclaw` is never touched — for
+  one-click reproducibility. The "connect to openclaw" experience is preserved by
+  **echoing the real `openclaw channels add webchannel` / `gateway run` commands
+  to the console** as run.sh executes them, so a viewer sees exactly the two lines
+  that attach the plugin to a gateway. **BYO-gateway** (a `--byo-gateway` flag
+  where run.sh boots only the SaaS and the operator attaches their *own* openclaw)
+  is deferred to **backlog** — documented, not built this pass.
+- **`aud` scalar (phase 2):** when `aud` becomes an array, the top-level
+  `accountId` claim stays as `aud[0]` ("primary"). It is read only by
+  `device-flow-enrollment.ts:354` (subject-token validation), never by routing.
+- **LLM echo fallback is a config/orchestration concern, zero product change.**
+  The agent talks to whatever OpenAI-completions endpoint `openclaw.json` names.
+  `run.sh` points that provider at the real z.ai endpoint when `ZAI_API_KEY` is
+  set, else at `e2e/local/echo-openai-server.mjs` (a fake completions server) and
+  passes `DEMO_LLM_MODE=echo` → SaaS injects it into `__DEMO_CONFIG__` → the web
+  UI shows an "Echo mode (no real model)" badge. No plugin/client code touched.
+- **Admin surface:** a seeded `admin` login gates `/admin/*` (session-checked).
+  The single-page 3-pane layout (admin · chat · wiretap) renders the admin pane
+  only for an admin session, so one screen shows approve → chat → wiretap.
+
 ## Relay: self-hosted default, Synadia optional
 
 - **Default `DEMO_RELAY=local`**: a demo-owned JWT-auth `nats-server` fed by the
@@ -254,6 +282,28 @@ When C2 pinning also lands, note that a single `/bootstrap` currently carries ON
 agentPublicKey (`saas-bootstrap.ts:121,222`) — a fleet will then need an
 `accountId → agentPublicKey` map. Land as product commits first; the demo then
 adds the two-device scene consuming it. Not blocking phases 1–5.
+
+## Phase 1 status (2026-07-03) — built + verified
+
+`demo/{saas-server.ts, run.sh, tsconfig.json, verify-e2e.mjs}` + `demo/web/{index.html,
+src/{config,app,widget,admin,wiretap}.ts}` all land; `demo/` joins root
+`npm run typecheck`. `./demo/run.sh` boots the full stack (saas → nats-server →
+echo → `channels add` → admin-approved → gateway registered) and a headless
+Playwright driver (`verify-e2e.mjs`) confirms the working exit criteria: **login →
+chat → echo reply ✓, wiretap ciphertext ✓**. One criterion is a known openclaw
+gap (below).
+
+- **History hydration needs a gateway `operator.read` scope (open).** The
+  reload-history path calls openclaw core `sessions.get`
+  (`api.runtime.subagent.getSessionMessages` in `history.ts:146-166`), which
+  requires `operator.read`; the gateway's auto-generated runtime token lacks it, so
+  hydration returns `[]` (graceful, per `history.recent`'s best-effort contract —
+  the demo does NOT break, only past turns don't reappear on reload). The demo code
+  is correct; granting the gateway an `operator.read`/`operator.write` scope (or a
+  paired device identity) makes reload-history work with **no demo change**. It is
+  NOT the plugin-side `HistoryStore` (that serves late-join/multi-device, Phase 6).
+  Tracked as a run.sh/gateway-config follow-up, pending owner input on the openclaw
+  scope-granting mechanism.
 
 ## Honest-demo notes
 
