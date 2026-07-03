@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # Showcase demo — one-click boot of the whole stack under an ISOLATED
 # OPENCLAW_HOME. Your real ~/.openclaw is never touched. Ctrl+C tears everything
-# down. webchannel is an openclaw PLUGIN, so the demo boots a real openclaw
-# gateway (from node_modules/.bin/openclaw) to host it; the two commands that
+# down. webchannel is an openclaw PLUGIN, so the demo boots real openclaw
+# gateways (from node_modules/.bin/openclaw) to host it; the two commands that
 # attach the plugin — `openclaw channels add` and `openclaw gateway` — are echoed
 # to the console so you can see exactly how it connects to an openclaw.
 #
-# Boot order (Phase 1):
+# Topology (DEMO_PLAN "Topology constraint"): one gateway PER agent. The fleet
+# runs agent-dev (19299) and agent-ops (19399) as independent gateway processes
+# under their own OPENCLAW_HOME, each serving ONE account, all sharing the demo
+# SaaS trust chain + nats-server. The SaaS delivers a per-account rendezvous map
+# so a widget lane dials the right gateway.
+#
+# Boot order:
 #   saas-server → nats-server → LLM (echo, or real when ZAI_API_KEY is set)
-#   → channels add agent-dev (device-flow enroll, admin-approved) → gateway run
+#   → for each agent: channels add (device-flow, admin-approved) → gateway run
 #
 # LLM mode: with no provider key the agent talks to a fake OpenAI-completions
 # server (echo) so the demo boots creds-free; the UI shows an "Echo mode" badge.
@@ -22,13 +28,15 @@ PKG_BAK=/tmp/oc-demo.pkgbak.json
 
 # Fresh port block — no collision with the e2e harnesses.
 SAAS_PORT=3961
-GW_PORT=19299
 NATS_WS=18722
 NATS_TCP=14722
 ECHO_PORT=18905
 
+# The fleet: "account:port" pairs. agent-dev + agent-ops pre-boot; add-agent.sh
+# adds agent-docs (19499) live.
+FLEET=("agent-dev:19299" "agent-ops:19399")
+
 TENANT=demo-tenant
-ACCOUNT_ID=agent-dev
 SAAS_ISSUER="https://saas.local/demo-issuer"
 SAAS_URL="http://127.0.0.1:$SAAS_PORT"
 # Seeded demo user uuids (peer ids) = the exec-approval approvers.
@@ -41,19 +49,19 @@ UUID_ADMIN="99999999-9999-4999-8999-999999999999"
 ZAI_BASE_URL="${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4}"
 ZAI_MODEL="${ZAI_MODEL:-glm-4.6}"
 
-SAAS_PID=""; NATS_PID=""; ECHO_PID=""; GW_PID=""; ADD_PID=""
+SAAS_PID=""; NATS_PID=""; ECHO_PID=""
+GW_PIDS=()
 
 cleanup() {
   echo ""
   echo "[demo] tearing down…"
-  [ -n "$ADD_PID" ]  && kill "$ADD_PID"  2>/dev/null || true
-  [ -n "$GW_PID" ]   && kill "$GW_PID"   2>/dev/null || true
+  for pid in "${GW_PIDS[@]:-}"; do [ -n "$pid" ] && kill "$pid" 2>/dev/null || true; done
   [ -n "$ECHO_PID" ] && kill "$ECHO_PID" 2>/dev/null || true
   [ -n "$NATS_PID" ] && kill "$NATS_PID" 2>/dev/null || true
   [ -n "$SAAS_PID" ] && kill "$SAAS_PID" 2>/dev/null || true
   pkill -f "nats-server -c $OCH/nats.conf" 2>/dev/null || true
   pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
-  pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
+  for pair in "${FLEET[@]}"; do pkill -f "gateway --port ${pair##*:}" 2>/dev/null || true; done
   if [ -f "$PKG_BAK" ]; then
     cp "$PKG_BAK" "$PKG_JSON"; rm -f "$PKG_BAK"
     echo "[demo] restored $PKG_JSON"
@@ -64,22 +72,33 @@ trap cleanup EXIT
 # Pre-clean.
 pkill -f "nats-server -c $OCH/nats.conf" 2>/dev/null || true
 pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
-pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
+for pair in "${FLEET[@]}"; do pkill -f "gateway --port ${pair##*:}" 2>/dev/null || true; done
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
 
-# LLM mode banner.
+# LLM mode banner + provider block (shared across gateways).
 if [ -n "${ZAI_API_KEY:-}" ]; then
   LLM_MODE=real
   echo "[demo] LLM: REAL (z.ai) — $ZAI_MODEL @ $ZAI_BASE_URL"
+  PROVIDER_BLOCK="\"zai\": { \"baseUrl\": \"$ZAI_BASE_URL\", \"api\": \"openai-completions\", \"apiKey\": \"$ZAI_API_KEY\", \"models\": [{ \"id\": \"$ZAI_MODEL\", \"name\": \"GLM\", \"reasoning\": false, \"input\": [\"text\"], \"cost\": { \"input\": 0, \"output\": 0, \"cacheRead\": 0, \"cacheWrite\": 0 }, \"contextWindow\": 200000, \"maxTokens\": 8192 }] }"
+  PRIMARY_MODEL="zai/$ZAI_MODEL"
 else
   LLM_MODE=echo
   echo "[demo] LLM: ECHO (no provider key) — set ZAI_API_KEY for a real model"
+  PROVIDER_BLOCK="\"echo-local\": { \"baseUrl\": \"http://127.0.0.1:$ECHO_PORT/v1\", \"api\": \"openai-completions\", \"models\": [{ \"id\": \"echo\", \"name\": \"Echo\", \"reasoning\": false, \"input\": [\"text\"], \"cost\": { \"input\": 0, \"output\": 0, \"cacheRead\": 0, \"cacheWrite\": 0 }, \"contextWindow\": 200000, \"maxTokens\": 8192 }] }"
+  PRIMARY_MODEL="echo-local/echo"
 fi
+
+# Rendezvous map (accountId → registerBaseUrl) for the SaaS. Built from FLEET.
+DEMO_ACCOUNTS="{"
+for pair in "${FLEET[@]}"; do
+  acct="${pair%%:*}"; port="${pair##*:}"
+  DEMO_ACCOUNTS="$DEMO_ACCOUNTS\"$acct\":{\"registerBaseUrl\":\"http://127.0.0.1:$port\"},"
+done
+DEMO_ACCOUNTS="${DEMO_ACCOUNTS%,}}"
 
 # ---------------------------------------------------------------------------
 # 1. Demo SaaS — trust chain + enrollment + users + bootstrap + web surface.
-#    Writes operator.jwt + resolver.json to $OCH for the nats-server.
 # ---------------------------------------------------------------------------
 PORT="$SAAS_PORT" \
 SAAS_BASE_URL="$SAAS_URL" \
@@ -88,7 +107,7 @@ NATS_URL="ws://127.0.0.1:$NATS_WS" \
 NATS_CONFIG_OUT="$OCH" \
 TRUST_CHAIN_PATH="$OCH/trust-chain.json" \
 DEMO_TENANT="$TENANT" \
-DEMO_ACCOUNTS="{\"$ACCOUNT_ID\":{\"registerBaseUrl\":\"http://127.0.0.1:$GW_PORT\"}}" \
+DEMO_ACCOUNTS="$DEMO_ACCOUNTS" \
 DEMO_LLM_MODE="$LLM_MODE" \
 DEMO_APP_HTML="$REPO/demo/web/index.html" \
 DEMO_CLIENT_ENTRY="$REPO/demo/web/src/app.ts" \
@@ -98,8 +117,7 @@ echo "[demo] saas-server pid=$SAAS_PID — waiting for JWKS + NATS config…"
 for i in $(seq 1 120); do
   if curl -fsS "$SAAS_URL/.well-known/jwks.json" >/dev/null 2>&1 \
      && [ -f "$OCH/operator.jwt" ] && [ -f "$OCH/resolver.json" ]; then
-    echo "[demo] saas-server ready"
-    break
+    echo "[demo] saas-server ready"; break
   fi
   kill -0 "$SAAS_PID" 2>/dev/null || { echo "[demo] saas-server died — log:"; cat "$OCH/saas.log"; exit 2; }
   sleep 0.25
@@ -107,7 +125,7 @@ for i in $(seq 1 120); do
 done
 
 # ---------------------------------------------------------------------------
-# 2. JWT-auth nats-server, assembled from the SaaS trust chain's operator+resolver.
+# 2. JWT-auth nats-server, assembled from the SaaS trust chain.
 # ---------------------------------------------------------------------------
 OCH="$OCH" NATS_TCP="$NATS_TCP" NATS_WS="$NATS_WS" node -e '
   const fs = require("fs");
@@ -135,7 +153,7 @@ for i in $(seq 1 120); do
 done
 
 # ---------------------------------------------------------------------------
-# 3. LLM: echo fake OpenAI-completions server (no provider key needed).
+# 3. LLM: echo fake OpenAI-completions server (echo mode only).
 # ---------------------------------------------------------------------------
 if [ "$LLM_MODE" = echo ]; then
   node "$REPO/e2e/local/echo-openai-server.mjs" "$ECHO_PORT" >"$OCH/echo.log" 2>&1 &
@@ -155,50 +173,25 @@ node -e '
   fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
 ' "$PKG_JSON"
 
-# ---------------------------------------------------------------------------
-# 5. Isolated openclaw config: provider + agent + webchannel(jwt) + approvals.
-# ---------------------------------------------------------------------------
-if [ "$LLM_MODE" = real ]; then
-  PROVIDER_BLOCK=$(cat <<JSON
-      "zai": {
-        "baseUrl": "$ZAI_BASE_URL",
-        "api": "openai-completions",
-        "apiKey": "$ZAI_API_KEY",
-        "models": [{ "id": "$ZAI_MODEL", "name": "GLM", "reasoning": false, "input": ["text"],
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-          "contextWindow": 200000, "maxTokens": 8192 }]
-      }
-JSON
-)
-  PRIMARY_MODEL="zai/$ZAI_MODEL"
-else
-  PROVIDER_BLOCK=$(cat <<JSON
-      "echo-local": {
-        "baseUrl": "http://127.0.0.1:$ECHO_PORT/v1",
-        "api": "openai-completions",
-        "models": [{ "id": "echo", "name": "Echo", "reasoning": false, "input": ["text"],
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-          "contextWindow": 200000, "maxTokens": 8192 }]
-      }
-JSON
-)
-  PRIMARY_MODEL="echo-local/echo"
-fi
+# Admin session (cookie jar) — approves every agent's enrollment (SaaS authority).
+curl -fsS -c "$OCH/admin.jar" -X POST "$SAAS_URL/login" \
+  -H 'Content-Type: application/json' -d '{"username":"admin","password":"demo"}' >/dev/null
+echo "[demo] admin session established"
 
-cat > "$OCH/.openclaw/openclaw.json" <<JSON
+# ---------------------------------------------------------------------------
+# boot_agent <account> <port> — write config, enroll (admin-approve), run gateway.
+#   Each agent lives under its own OPENCLAW_HOME=$OCH/<account>.
+# ---------------------------------------------------------------------------
+boot_agent() {
+  local acct="$1" port="$2"
+  local home="$OCH/$acct"
+  mkdir -p "$home/.openclaw"
+
+  cat > "$home/.openclaw/openclaw.json" <<JSON
 {
   "gateway": { "mode": "local", "bind": "loopback" },
-  "models": {
-    "providers": {
-$PROVIDER_BLOCK
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": { "primary": "$PRIMARY_MODEL" },
-      "compaction": { "reserveTokensFloor": 20000 }
-    }
-  },
+  "models": { "providers": { $PROVIDER_BLOCK } },
+  "agents": { "defaults": { "model": { "primary": "$PRIMARY_MODEL" }, "compaction": { "reserveTokensFloor": 20000 } } },
   "plugins": {
     "load": { "paths": ["$REPO/packages/plugin"] },
     "allow": ["webchannel"],
@@ -207,21 +200,15 @@ $PROVIDER_BLOCK
   "channels": {
     "webchannel": {
       "history": { "enabled": true },
-      "execApprovals": {
-        "enabled": true,
-        "approvers": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"]
-      },
+      "execApprovals": { "enabled": true, "approvers": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"] },
       "accounts": {
-        "$ACCOUNT_ID": {
+        "$acct": {
           "tenant": "$TENANT",
-          "auth": {
-            "strategy": "jwt",
-            "jwt": {
-              "jwksUrl": "$SAAS_URL/.well-known/jwks.json",
-              "issuer": "$SAAS_ISSUER",
-              "audience": "$ACCOUNT_ID"
-            }
-          },
+          "auth": { "strategy": "jwt", "jwt": {
+            "jwksUrl": "$SAAS_URL/.well-known/jwks.json",
+            "issuer": "$SAAS_ISSUER",
+            "audience": "$acct"
+          } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"]
         }
@@ -230,94 +217,80 @@ $PROVIDER_BLOCK
   }
 }
 JSON
-echo "[demo] wrote $OCH/.openclaw/openclaw.json"
+
+  echo ""
+  echo "  ┌─ attaching webchannel account '$acct' to a gateway ───────────────"
+  echo "  │ \$ openclaw channels add --channel webchannel --account $acct \\"
+  echo "  │     --base-url $SAAS_URL --url $TENANT"
+  echo "  │ \$ openclaw gateway --port $port"
+  echo "  └───────────────────────────────────────────────────────────────────"
+
+  local addlog="$home/channels-add.log"
+  HOME="$home" OPENCLAW_HOME="$home" OPENCLAW_DISABLE_BONJOUR=1 \
+    "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account "$acct" \
+      --base-url "$SAAS_URL" --url "$TENANT" >"$addlog" 2>&1 &
+  local add_pid=$!
+
+  local user_code=""
+  for i in $(seq 1 240); do
+    user_code="$(grep -oE 'User code: [A-Z]{4}-[A-Z]{4}' "$addlog" 2>/dev/null | head -1 | awk '{print $3}' || true)"
+    [ -n "$user_code" ] && break
+    kill -0 "$add_pid" 2>/dev/null || { echo "[demo] $acct channels add exited early — log:"; cat "$addlog"; exit 2; }
+    sleep 0.25
+  done
+  [ -z "$user_code" ] && { echo "[demo] $acct TIMEOUT waiting for user_code"; cat "$addlog"; exit 2; }
+  echo "[demo] $acct user_code=$user_code — admin approving…"
+  curl -fsS -b "$OCH/admin.jar" -X POST "$SAAS_URL/admin/enrollments/$user_code/approve" >/dev/null || true
+
+  set +e; wait "$add_pid"; local rc=$?; set -e
+  [ "$rc" -ne 0 ] && { echo "[demo] $acct channels add failed (rc=$rc):"; cat "$addlog"; exit 2; }
+  [ -f "$home/.openclaw-webchannel/$acct/credentials.json" ] || { echo "[demo] $acct creds not persisted"; cat "$addlog"; exit 2; }
+
+  # Re-assert register-hop admission (setup adapter may write admission:auto).
+  node -e '
+    const fs = require("fs"); const p = process.argv[1], acct = process.argv[2];
+    const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+    const a = cfg.channels.webchannel.accounts[acct];
+    a.nats = { ...(a.nats ?? {}), admission: "register-hop" };
+    fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+  ' "$home/.openclaw/openclaw.json" "$acct"
+
+  HOME="$home" OPENCLAW_HOME="$home" OPENCLAW_DISABLE_BONJOUR=1 \
+    WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
+    WEBCHANNEL_GW_URL="http://127.0.0.1:$port" \
+    "$REPO/node_modules/.bin/openclaw" gateway --port "$port" --force >"$home/gateway.log" 2>&1 &
+  local gw_pid=$!
+  GW_PIDS+=("$gw_pid")
+  echo "[demo] $acct gateway pid=$gw_pid — waiting for registration…"
+  for i in $(seq 1 240); do
+    grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$home/gateway.log" 2>/dev/null \
+      && { echo "[demo] $acct gateway ready"; return 0; }
+    kill -0 "$gw_pid" 2>/dev/null || { echo "[demo] $acct gateway died:"; tail -30 "$home/gateway.log"; exit 2; }
+    sleep 0.5
+    [ "$i" -eq 240 ] && { echo "[demo] $acct gateway TIMEOUT:"; tail -30 "$home/gateway.log"; exit 2; }
+  done
+}
 
 # ---------------------------------------------------------------------------
-# 6. Attach the plugin to openclaw — the CONNECT experience (echoed verbatim).
-#    `channels add` runs the device-flow enroll; the demo admin approves it.
+# 5. Pre-boot the fleet.
 # ---------------------------------------------------------------------------
-echo ""
-echo "  ┌─ this is how webchannel attaches to an openclaw gateway ──────────"
-echo "  │ \$ openclaw channels add --channel webchannel --account $ACCOUNT_ID \\"
-echo "  │     --base-url $SAAS_URL --url $TENANT"
-echo "  └───────────────────────────────────────────────────────────────────"
-echo ""
-HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account "$ACCOUNT_ID" \
-    --base-url "$SAAS_URL" --url "$TENANT" \
-  >"$OCH/channels-add.log" 2>&1 &
-ADD_PID=$!
-echo "[demo] channels add pid=$ADD_PID — waiting for the enrollment user_code…"
-
-USER_CODE=""
-for i in $(seq 1 240); do
-  USER_CODE="$(grep -oE 'User code: [A-Z]{4}-[A-Z]{4}' "$OCH/channels-add.log" 2>/dev/null | head -1 | awk '{print $3}' || true)"
-  [ -n "$USER_CODE" ] && break
-  kill -0 "$ADD_PID" 2>/dev/null || { echo "[demo] channels add exited early — log:"; cat "$OCH/channels-add.log"; exit 2; }
-  sleep 0.25
-done
-[ -z "$USER_CODE" ] && { echo "[demo] TIMEOUT waiting for user_code — log:"; cat "$OCH/channels-add.log"; exit 2; }
-echo "[demo] enrollment user_code=$USER_CODE — admin approving (SaaS authority)…"
-
-# The demo admin logs in (session cookie) and approves via the admin-gated route —
-# exactly the production shape (an operator approves in the SaaS dashboard).
-curl -fsS -c "$OCH/admin.jar" -X POST "$SAAS_URL/login" \
-  -H 'Content-Type: application/json' -d '{"username":"admin","password":"demo"}' >/dev/null
-APPROVE="$(curl -fsS -b "$OCH/admin.jar" -X POST \
-  "$SAAS_URL/admin/enrollments/$USER_CODE/approve" || true)"
-echo "[demo] approve → $APPROVE"
-
-set +e; wait "$ADD_PID"; ADD_RC=$?; set -e
-ADD_PID=""
-[ "$ADD_RC" -ne 0 ] && { echo "[demo] channels add failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add.log"; exit 2; }
-CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
-[ -f "$CRED_FILE" ] || { echo "[demo] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
-echo "[demo] ✓ credentials persisted"
-
-# 6b. Re-assert register-hop admission (the setup adapter may write admission:auto,
-#     which disables the HTTP register hop the browser drives). See run-all-real.sh.
-node -e '
-  const fs = require("fs");
-  const p = process.argv[1], acct = process.argv[2];
-  const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
-  const a = cfg.channels.webchannel.accounts[acct];
-  a.nats = { ...(a.nats ?? {}), admission: "register-hop" };
-  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
-' "$OCH/.openclaw/openclaw.json" "$ACCOUNT_ID"
-echo "[demo] ✓ admission=register-hop re-asserted"
-
-# ---------------------------------------------------------------------------
-# 7. Boot the gateway — CONSUME-ONLY (loads the persisted creds).
-# ---------------------------------------------------------------------------
-echo ""
-echo "  ┌─ and this runs the gateway that hosts the plugin ─────────────────"
-echo "  │ \$ openclaw gateway --port $GW_PORT"
-echo "  └───────────────────────────────────────────────────────────────────"
-echo ""
-HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
-  WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
-  "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
-  >"$OCH/gateway.log" 2>&1 &
-GW_PID=$!
-echo "[demo] gateway pid=$GW_PID — waiting for plugin registration…"
-for i in $(seq 1 240); do
-  grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$OCH/gateway.log" 2>/dev/null \
-    && { echo "[demo] gateway ready"; break; }
-  kill -0 "$GW_PID" 2>/dev/null || { echo "[demo] gateway died — log:"; tail -40 "$OCH/gateway.log"; exit 2; }
-  sleep 0.5
-  [ "$i" -eq 240 ] && { echo "[demo] TIMEOUT waiting for gateway — log:"; tail -40 "$OCH/gateway.log"; exit 2; }
+for pair in "${FLEET[@]}"; do
+  boot_agent "${pair%%:*}" "${pair##*:}"
 done
 
 echo ""
 echo "=============================================================="
-echo "  ✓ demo is up"
+echo "  ✓ demo is up — fleet: ${FLEET[*]}"
 echo "    open:   $SAAS_URL"
 echo "    logins: alice / bob (chat) · admin (approve/grant)  — pw: demo"
 echo "    LLM:    $LLM_MODE"
+echo "    add another agent live:  ./demo/add-agent.sh"
 echo "  Ctrl+C to tear everything down."
 echo "=============================================================="
 echo ""
 
-# Idle until Ctrl+C (cleanup runs on EXIT).
-while kill -0 "$GW_PID" 2>/dev/null; do sleep 1; done
+# Idle until all gateways exit (cleanup runs on EXIT).
+while :; do
+  for pid in "${GW_PIDS[@]}"; do kill -0 "$pid" 2>/dev/null || exit 0; done
+  sleep 1
+done

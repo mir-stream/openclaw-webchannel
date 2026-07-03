@@ -293,17 +293,30 @@ Playwright driver (`verify-e2e.mjs`) confirms the working exit criteria: **login
 chat → echo reply ✓, wiretap ciphertext ✓**. One criterion is a known openclaw
 gap (below).
 
-- **History hydration needs a gateway `operator.read` scope (open).** The
-  reload-history path calls openclaw core `sessions.get`
-  (`api.runtime.subagent.getSessionMessages` in `history.ts:146-166`), which
-  requires `operator.read`; the gateway's auto-generated runtime token lacks it, so
-  hydration returns `[]` (graceful, per `history.recent`'s best-effort contract —
-  the demo does NOT break, only past turns don't reappear on reload). The demo code
-  is correct; granting the gateway an `operator.read`/`operator.write` scope (or a
-  paired device identity) makes reload-history work with **no demo change**. It is
-  NOT the plugin-side `HistoryStore` (that serves late-join/multi-device, Phase 6).
-  Tracked as a run.sh/gateway-config follow-up, pending owner input on the openclaw
-  scope-granting mechanism.
+- **History hydration fails with `missing scope: operator.read` — ROOT CAUSE
+  found; needs a plugin/openclaw CODE change, NOT config (open).** Sub-agent trace:
+  `historyRecent` runs inside webchannel's `auth:"plugin"` HTTP route handler
+  (`index-nats.ts:304,433`). openclaw wraps every plugin-route handler in an
+  async-local gateway scope whose client scopes are `[]` whenever
+  `route.auth !== "gateway"` (`plugins-http-CM1BGr1B.js:37`); the in-process
+  `sessions.get` dispatch (`getSessionMessages`) inherits that empty-scope operator
+  client, which shadows the fallback synthetic `operator.write` client
+  (`server-plugins-CLZE4NgR.js:221,233`), so `operator.read` is denied
+  (`core-descriptors:791`, `method-scopes:95-103`). NOT the runtime token / NOT
+  `gateway.auth.mode` — **no openclaw.json key or gateway flag fixes it.** The
+  demo code is correct (graceful `[]`, demo not broken; only past turns don't
+  reappear on reload). Fix options, all code: (1) plugin-side — a dedicated
+  INTERNAL `auth:"gateway"` + `gatewayRuntimeScopeSurface:"trusted-operator"`
+  route for the history read (`plugin-route-runtime-scopes-Dd01rqFD.js:6-9` grants
+  full operator scopes), kept separate from the browser-facing register route; (2)
+  plugin-side minimal — run the read OUTSIDE the plugin-route ALS so the synthetic
+  `operator.write` fallback applies (awkward: openclaw doesn't expose the ALS
+  seam); (3) openclaw upstream — `getSessionMessages` should dispatch with
+  `forceSyntheticClient:true` + read `syntheticScopes` exactly as `deleteSession`
+  already does (`server-plugins-CLZE4NgR.js:363-372`); today it omits both — an
+  openclaw asymmetry worth filing. It is NOT the plugin-side `HistoryStore` (that
+  serves late-join/multi-device, Phase 6). **Owner decision pending** on option
+  (1) vs filing (3) upstream vs backlog.
 
 ## Honest-demo notes
 

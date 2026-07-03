@@ -1,25 +1,36 @@
 /**
  * Demo app shell — login → three panes (admin · chat · wiretap).
  *
- * The admin pane renders only for an admin session; alice/bob get chat + wiretap
- * on their granted account. Everything downstream is production: the widget and
- * wiretap drive the real client against the SaaS-delivered rendezvous.
+ * The chat pane is an agent SWITCHER: one tab per granted account, each a
+ * lazily-connected production WebChannelNATSClient lane. A background /me poll
+ * reflects live grant/revoke (scene ①) — a granted account grows a new tab, a
+ * revoked one loses its tab (and its lane goes terminal on its next
+ * register/bootstrap, proven revoke→403). The wiretap observes the whole tenant
+ * subtree, so it is account-independent and mounts once. The admin pane renders
+ * only for an admin session.
  */
 import { api, readConfig, el, type DemoConfig } from "./config.js";
 import { createWidget } from "./widget.js";
 import { createAdminPanel } from "./admin.js";
 import { createWiretap } from "./wiretap.js";
 
+type Rendezvous = { natsUrl: string; registerBaseUrl: string };
 type Me = {
   username: string;
   isAdmin: boolean;
   tenant: string;
   llmMode: "echo" | "real";
-  accounts: Record<string, { natsUrl: string; registerBaseUrl: string }>;
+  accounts: Record<string, Rendezvous>;
 };
 
 const config: DemoConfig = readConfig();
-const teardowns: (() => void)[] = [];
+
+// Teardowns for long-lived panes (admin, wiretap) vs the active chat lane.
+const paneTeardowns: (() => void)[] = [];
+let laneTeardown: (() => void) | null = null;
+let activeAccount: string | null = null;
+let grantedAccounts: string[] = [];
+let mePollTimer: number | null = null;
 
 function $(id: string): HTMLElement {
   const node = document.getElementById(id);
@@ -38,56 +49,130 @@ function renderLlmBadge(): void {
   }
 }
 
-async function teardownAll(): Promise<void> {
-  while (teardowns.length) teardowns.pop()?.();
+/** (Re)mount the active chat lane for `accountId`, tearing down the prior one. */
+async function mountLane(accountId: string): Promise<void> {
+  if (laneTeardown) {
+    laneTeardown();
+    laneTeardown = null;
+  }
+  activeAccount = accountId;
+  const laneBody = $("chat-lane");
+  laneBody.replaceChildren(el("div", { style: "color:var(--muted);font-size:12px" }, ["connecting…"]));
+  try {
+    laneTeardown = await createWidget(laneBody, config, accountId);
+  } catch (err) {
+    laneBody.replaceChildren(
+      el("div", { style: "color:var(--bad);font-size:12px" }, [`lane failed: ${(err as Error).message}`]),
+    );
+  }
+}
+
+/** Render the account tab bar over the current grant set. */
+function renderTabs(): void {
+  const tabBar = $("chat-tabs");
+  if (grantedAccounts.length === 0) {
+    tabBar.replaceChildren(
+      el("div", { style: "color:var(--muted);font-size:12px" }, ["No agent granted — ask an admin to grant one."]),
+    );
+    return;
+  }
+  tabBar.replaceChildren(
+    ...grantedAccounts.map((acct) => {
+      const active = acct === activeAccount;
+      const tab = el(
+        "button",
+        {
+          style:
+            "font-size:12px;padding:5px 12px;border-radius:6px 6px 0 0;" +
+            (active
+              ? "background:#21262d;border-color:var(--accent);color:var(--fg)"
+              : "opacity:.6;border-bottom-color:transparent"),
+        },
+        [acct],
+      );
+      tab.onclick = () => {
+        if (acct !== activeAccount) {
+          renderTabsWithActive(acct);
+          void mountLane(acct);
+        }
+      };
+      return tab;
+    }),
+  );
+}
+function renderTabsWithActive(acct: string): void {
+  activeAccount = acct;
+  renderTabs();
+}
+
+/**
+ * Reconcile the tab set to a fresh grant list. Adds/removes tabs; if the active
+ * account was revoked, switches to the first remaining (or clears the lane).
+ */
+async function reconcileGrants(accounts: string[]): Promise<void> {
+  const prev = grantedAccounts.join(",");
+  grantedAccounts = accounts;
+  if (accounts.join(",") === prev) return; // no change
+
+  if (activeAccount && !accounts.includes(activeAccount)) {
+    // Active lane was revoked.
+    if (laneTeardown) { laneTeardown(); laneTeardown = null; }
+    activeAccount = null;
+    $("chat-lane").replaceChildren();
+  }
+  if (!activeAccount && accounts.length > 0) {
+    activeAccount = accounts[0];
+    await mountLane(accounts[0]);
+  }
+  renderTabs();
 }
 
 async function mountForSession(me: Me): Promise<void> {
   const appEl = $("app");
-  const adminPane = $("admin-pane");
-
-  // Whoami + logout.
   const who = $("whoami");
   who.textContent = `${me.username}${me.isAdmin ? " (admin)" : ""}`;
   who.classList.remove("hidden");
   $("logout").classList.remove("hidden");
 
-  // The chat/wiretap lane uses the session's first granted account. (Phase 2
-  // turns this into a switcher across the granted fleet.)
-  const accountId = Object.keys(me.accounts)[0];
+  // Chat pane scaffold: a tab bar + a lane container.
+  const chatBody = $("chat-body");
+  chatBody.replaceChildren(
+    el("div", { id: "chat-tabs", style: "display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:10px" }),
+    el("div", { id: "chat-lane" }),
+  );
 
   if (me.isAdmin) {
-    adminPane.classList.remove("hidden");
+    $("admin-pane").classList.remove("hidden");
     appEl.classList.remove("no-admin");
-    teardowns.push(createAdminPanel($("admin-body"), config));
+    paneTeardowns.push(createAdminPanel($("admin-body"), config));
   } else {
-    adminPane.classList.add("hidden");
+    $("admin-pane").classList.add("hidden");
     appEl.classList.add("no-admin");
   }
 
-  if (accountId) {
+  grantedAccounts = Object.keys(me.accounts);
+  renderTabs();
+  if (grantedAccounts.length > 0) {
+    await mountLane(grantedAccounts[0]);
+    renderTabs();
+    // Wiretap watches the whole tenant subtree — account-independent, mount once.
     try {
-      teardowns.push(await createWidget($("chat-body"), config, accountId));
-    } catch (err) {
-      $("chat-body").replaceChildren(
-        el("div", { style: "color:var(--bad);font-size:12px" }, [`widget failed: ${(err as Error).message}`]),
-      );
-    }
-    try {
-      teardowns.push(await createWiretap($("wiretap-body"), config, accountId));
+      paneTeardowns.push(await createWiretap($("wiretap-body"), config, grantedAccounts[0]));
     } catch (err) {
       $("wiretap-body").replaceChildren(
         el("div", { style: "color:var(--bad);font-size:12px" }, [`wiretap failed: ${(err as Error).message}`]),
       );
     }
-  } else {
-    $("chat-body").replaceChildren(
-      el("div", { style: "color:var(--muted);font-size:12px" }, ["No agent granted to this login yet — ask an admin to grant one."]),
-    );
   }
 
   $("login").classList.add("hidden");
   appEl.classList.remove("hidden");
+
+  // Poll /me for live grant/revoke (scene ①).
+  mePollTimer = window.setInterval(async () => {
+    const res = await api<Me>("/me");
+    if (res.ok && res.data.accounts) await reconcileGrants(Object.keys(res.data.accounts));
+  }, 3000);
 }
 
 async function tryResumeSession(): Promise<void> {
@@ -123,7 +208,9 @@ function wireLogin(): void {
 
 function wireLogout(): void {
   $("logout").onclick = async () => {
-    await teardownAll();
+    if (mePollTimer !== null) clearInterval(mePollTimer);
+    if (laneTeardown) laneTeardown();
+    while (paneTeardowns.length) paneTeardowns.pop()?.();
     location.reload();
   };
 }
