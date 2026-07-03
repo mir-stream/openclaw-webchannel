@@ -151,12 +151,12 @@ export async function runDemo(
   const { jwt, peerId } = (await bootRes.json()) as { jwt?: string; peerId?: string };
   if (!jwt || !peerId) throw new Error("bootstrap-jwt response missing jwt/peerId");
 
-  // 5. Production client with NATS-layer NKEY auth, and — only when a gateway
-  //    register URL is supplied — the PoP register hop. With `admission: "auto"`
-  //    on the agent there is no register hop: omit `gwUrl` (empty string) and the
-  //    client connects with `natsCredentials` only, relying on the X25519
-  //    handshake + dmSecurity allowlist for admission. When `gwUrl` is present the
-  //    original register-hop path is used verbatim (backward compatible).
+  // 5. Production client with NATS-layer NKEY auth, and — only when `gwUrl` is
+  //    set (now a register-hop TOGGLE, not a URL: the register hop rides NATS on
+  //    the account's `.register` subject, so no gateway URL is dialed) — the PoP
+  //    register hop. With `admission: "auto"` on the agent there is no register
+  //    hop: leave `gwUrl` empty and the client connects with `natsCredentials`
+  //    only, relying on the X25519 handshake + dmSecurity allowlist for admission.
   //    Unlike runAllReal, we keep this client alive for the whole chat session.
   const clientOpts = {
     url: natsUrl,
@@ -168,7 +168,6 @@ export async function runDemo(
     ...(opts.gwUrl
       ? {
           registration: {
-            registerBaseUrl: opts.gwUrl,
             devicePrivateKey: ed25519.privateKey,
             // Phase 6: register-delivered conversation key (no handshake).
             deviceX25519PrivateKey: x25519.privateKey,

@@ -40,6 +40,23 @@ import { registerWithPop } from "./pop-register.js";
 const HANDSHAKE_RETRY_MS = 500;
 const HANDSHAKE_MAX_RETRIES = 5;
 
+/**
+ * A random, subject-safe token for a request/reply inbox segment (hex only, so
+ * it never contains a `.`/`*`/`>` that would break the subject hierarchy).
+ * Prefers `crypto.getRandomValues`; falls back to `Math.random` in hosts without
+ * WebCrypto (the reply subject is not a secret — it only needs to be unguessable
+ * enough to avoid collisions).
+ */
+function randomInboxToken(): string {
+  const g = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto;
+  if (g?.getRandomValues) {
+    const b = new Uint8Array(12);
+    g.getRandomValues(b);
+    return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  }
+  return `${Math.random().toString(16).slice(2)}${Date.now().toString(16)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -77,30 +94,28 @@ export type NatsClientOptions = {
    */
   heartbeatIntervalMs?: number;
   /**
-   * Optional PoP HTTP registration. When present, the client performs the
-   * JWT + Proof-of-Possession registration against the plugin's HTTP register
-   * route after connecting (and before the handshake), so the agent subscribes
-   * to this peer's subjects. When absent, registration is skipped (dev/open-NATS
-   * uses the agent's wildcard auto-register instead). `jwt` and `peerId` come
-   * from the existing NatsClientOptions fields.
+   * Optional PoP registration. When present, the client performs the JWT +
+   * Proof-of-Possession registration over NATS request/reply on the account's
+   * `…{peerId}.register` subject after connecting (and before any key flows), so
+   * the agent subscribes to this peer's subjects. When absent, registration is
+   * skipped (dev/open-NATS uses the agent's wildcard auto-register instead).
+   * `jwt`, `tenant`, `accountId` and `peerId` come from the existing
+   * NatsClientOptions fields — the register subject is derived from them, so
+   * there is no gateway URL to configure (the agent is reached over NATS only).
    */
   registration?: {
-    /** Base URL where the plugin serves its register routes (no trailing slash). */
-    registerBaseUrl: string;
     /** Device Ed25519 private key paired with the bootstrap JWT's pop_jwk. */
     devicePrivateKey: CryptoKey;
     /**
      * Phase 6 (multi-device): the device X25519 PRIVATE key whose PUBLIC half
      * was minted into the bootstrap JWT `cnf.jwk`. When present, the session
      * key is the agent-owned conversation key K delivered WRAPPED to this key
-     * in the register response (`unwrapConversationKey`) — no `.handshake`
+     * in the register reply (`unwrapConversationKey`) — no `.handshake`
      * negotiation happens at all, so one user's multiple devices share one
      * stable K. When absent, the legacy per-connection X25519 handshake runs
      * (old-plugin compat; the auto-admission path never registers anyway).
      */
     deviceX25519PrivateKey?: CryptoKey;
-    /** Injectable fetch (tests / non-browser hosts). Defaults to global fetch. */
-    fetchImpl?: typeof fetch;
   };
   /**
    * Optional NATS-layer NKEY authentication for a JWT-auth nats-server.
@@ -241,6 +256,65 @@ export class NatsClient {
     // has globalThis.TextEncoder). NATS PUB requires the UTF-8 byte count.
     const byteLen = new TextEncoder().encode(payload).length;
     this.ws.send(`PUB ${subject} ${byteLen}\r\n${payload}\r\n`);
+  }
+
+  /**
+   * Publish with a NATS reply-to subject (`PUB <subject> <reply-to> <len>`).
+   * The subscriber's transport surfaces `reply-to`, so the agent can publish its
+   * response back to it — this is the request half of `request()`.
+   */
+  publishWithReply(subject: string, replyTo: string, payload: string): void {
+    if (!this.connected || !this.ws) {
+      console.warn("[nats-client] Not connected, cannot publish");
+      return;
+    }
+    const byteLen = new TextEncoder().encode(payload).length;
+    this.ws.send(`PUB ${subject} ${replyTo} ${byteLen}\r\n${payload}\r\n`);
+  }
+
+  /**
+   * NATS request/reply: publish `payload` to `subject` with a fresh reply-to
+   * inbox, and resolve with the first reply payload (or reject on timeout).
+   *
+   * The reply inbox is derived from `replyPrefix` (an in-namespace subject the
+   * browser's tenant-wide creds already cover for BOTH pub and sub — so no
+   * `_INBOX.>` grant is needed). A single round-trip with NO internal retry:
+   * the caller (registerWithPop) owns the retry/backoff policy so it can restart
+   * from a fresh challenge on a lost reply.
+   */
+  request(
+    subject: string,
+    payload: string,
+    opts: { timeoutMs?: number; replyPrefix: string },
+  ): Promise<string> {
+    const timeoutMs = opts.timeoutMs ?? 5000;
+    if (!this.connected || !this.ws) {
+      return Promise.reject(new Error("[nats-client] request: not connected"));
+    }
+    const replySubject = `${opts.replyPrefix}.${randomInboxToken()}`;
+    const sid = this.subscribe(replySubject);
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let off: () => void = () => {};
+      let timer: ReturnType<typeof setTimeout>;
+      const cleanup = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        off();
+        this.unsubscribe(sid);
+      };
+      off = this.onRawMessage((subj, pl) => {
+        if (subj !== replySubject) return;
+        cleanup();
+        resolve(pl);
+      });
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("[nats-client] request timeout"));
+      }, timeoutMs);
+      this.publishWithReply(subject, replySubject, payload);
+    });
   }
 
   /** Subscribe to NATS subject */
@@ -664,6 +738,17 @@ export function handshakeSubject(tenant: string, accountId: string, peerId: stri
   return `webchannel.${tenant}.${accountId}.${peerId}.handshake`;
 }
 
+/**
+ * Derive the register-admission NATS subject for a peer (register-hop mode).
+ * Format: webchannel.{tenant}.{accountId}.{peerId}.register
+ *
+ * The browser drives challenge/register/unregister here via request/reply; the
+ * agent subscribes the `…*.register` wildcard.
+ */
+export function registerSubject(tenant: string, accountId: string, peerId: string): string {
+  return `webchannel.${tenant}.${accountId}.${peerId}.register`;
+}
+
 // ---------------------------------------------------------------------------
 // WebChannel NATS client (high-level API)
 // ---------------------------------------------------------------------------
@@ -844,16 +929,16 @@ export class WebChannelNatsClient {
     // Fresh connection → fresh key establishment.
     this.resetSession();
 
-    // PoP HTTP registration (production). MUST complete AFTER we subscribe to
-    // .out (above) but BEFORE any key flows — the agent only subscribes to this
-    // peer's subjects once registered, and NATS has no retention. Fail-closed:
-    // if registration throws, registration failure is TERMINAL for this
-    // connection. A PoP/JWT rejection is typically a permanent credential
-    // problem, so we do NOT silently retry (no auto-retry/hammering): we tear
-    // the connection fully down via the raw NatsClient.disconnect() (clears the
-    // reconnect timer + closes the socket, leaving connected === false). The
-    // application must react to onError and re-initialize with fresh
-    // credentials (a new bootstrap JWT).
+    // PoP registration over NATS request/reply (production). MUST complete AFTER
+    // we subscribe to .out (above) but BEFORE any key flows — the agent only
+    // subscribes to this peer's subjects once registered, and NATS has no
+    // retention. Fail-closed: if registration throws, registration failure is
+    // TERMINAL for this connection. A PoP/JWT rejection is typically a permanent
+    // credential problem, so beyond registerWithPop's own bounded retry-on-
+    // timeout we do NOT silently loop: we tear the connection fully down via the
+    // raw NatsClient.disconnect() (clears the reconnect timer + closes the
+    // socket, leaving connected === false). The application must react to onError
+    // and re-initialize with fresh credentials (a new bootstrap JWT).
     if (registration) {
       // The register hop presents the bootstrap JWT; it is REQUIRED here even
       // though the type makes `jwt` optional (it is unused on the BYO-NATS path).
@@ -867,12 +952,22 @@ export class WebChannelNatsClient {
       }
       let registerResult: Awaited<ReturnType<typeof registerWithPop>>;
       try {
+        const registerSubj = registerSubject(tenant, accountId, peerId);
+        // In-namespace reply inbox: the browser's tenant-wide creds already cover
+        // pub+sub on `webchannel.{tenant}.>`, so no separate `_INBOX.>` grant is
+        // needed (and none is broadened across tenants).
+        const replyPrefix = `webchannel.${tenant}.${accountId}.${peerId}.reginbox`;
         registerResult = await registerWithPop({
-          registerBaseUrl: registration.registerBaseUrl,
+          request: async (body) => {
+            const raw = await this.client.request(registerSubj, JSON.stringify(body), {
+              timeoutMs: 5000,
+              replyPrefix,
+            });
+            return JSON.parse(raw) as unknown;
+          },
           jwt: this.options.jwt,
           peerId,
           devicePrivateKey: registration.devicePrivateKey,
-          fetchImpl: registration.fetchImpl,
         });
       } catch (err) {
         console.error("[nats-client] PoP registration failed:", err);

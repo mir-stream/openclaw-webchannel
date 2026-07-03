@@ -2,21 +2,21 @@
  * Production browser NATS client — register-delivered conversation key tests
  * (Phase 6 multi-device).
  *
- * When `registration.deviceX25519PrivateKey` is supplied, the session key is
- * the agent-owned conversation key K, delivered WRAPPED in the register HTTP
- * response. Proves:
+ * When `registration.deviceX25519PrivateKey` is supplied, the session key is the
+ * agent-owned conversation key K, delivered WRAPPED in the register reply (now
+ * over NATS request/reply, not HTTP). Proves:
  *   - the client unwraps K and seals/opens with it, publishing NO `.handshake`
  *     frame and never subscribing the handshake subject (register↔auto
  *     divergence, client half);
  *   - two clients (devices) given the SAME K each decrypt the same broadcast
  *     ciphertext — the multi-device property end-to-end at the client layer;
- *   - fail-closed terminals: a register response with NO wrapped key, or a
- *     TAMPERED wrapped key, never falls back to the handshake and surfaces via
- *     onError with the socket torn down;
+ *   - fail-closed terminals: a register reply with NO wrapped key, or a TAMPERED
+ *     wrapped key, never falls back to the handshake and surfaces via onError with
+ *     the socket torn down;
  *   - wrap conformance: a wrap produced the AGENT's way (node:crypto X25519 +
  *     HKDF-SHA256 "webchannel-key-wrap-v1" + chacha20-poly1305, mirroring
- *     packages/plugin/src/late-join-decryptor.ts) unwraps byte-identically in
- *     the browser implementation.
+ *     packages/plugin/src/late-join-decryptor.ts) unwraps byte-identically in the
+ *     browser implementation.
  */
 
 import {
@@ -35,6 +35,7 @@ import {
   inboundSubject,
   outboundSubject,
   handshakeSubject,
+  registerSubject,
 } from "./nats-client.js";
 import {
   generateX25519KeyPair,
@@ -104,6 +105,13 @@ function wrapLikeAgent(
 // Fake nats-server over a fake WebSocket (mirrors nats-client-register.test.ts)
 // ---------------------------------------------------------------------------
 
+type ServerHandler = (
+  subject: string,
+  payload: string,
+  server: FakeNatsWS,
+  replyTo?: string,
+) => void | Promise<void>;
+
 class FakeNatsWS {
   static instances: FakeNatsWS[] = [];
   static readonly CONNECTING = 0;
@@ -120,7 +128,8 @@ class FakeNatsWS {
   onclose: (() => void) | null = null;
 
   private readonly subs = new Map<string, number>();
-  readonly published: Array<{ subject: string; payload: string }> = [];
+  readonly published: Array<{ subject: string; payload: string; replyTo?: string }> = [];
+  handler: ServerHandler = () => {};
 
   constructor(url: string) {
     this.url = url;
@@ -150,10 +159,12 @@ class FakeNatsWS {
     }
     if (data.startsWith("PUB ")) {
       const idx = data.indexOf("\r\n");
-      const header = data.slice(0, idx).split(" ");
+      const header = data.slice(0, idx).split(" "); // PUB <subject> [reply-to] <len>
       const subject = header[1];
+      const replyTo = header.length === 4 ? header[2] : undefined;
       const payload = data.slice(idx + 2).replace(/\r\n$/, "");
-      this.published.push({ subject, payload });
+      this.published.push({ subject, payload, replyTo });
+      void this.handler(subject, payload, this, replyTo);
       return;
     }
   }
@@ -183,39 +194,44 @@ const TENANT = "acme";
 const AGENT = "agent-1";
 const PEER = "user-42";
 const JWT = "bootstrap.jwt.token";
-const BASE = "http://127.0.0.1:18789";
 
 async function settle(rounds = 8): Promise<void> {
   for (let i = 0; i < rounds; i++) await new Promise((r) => setTimeout(r, 5));
 }
 
-function jsonResponse(obj: unknown, status = 200): Response {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-/** Register-route mock returning `wrapped` (or omitting it when null). */
-function makeRegisterFetch(wrapped: () => WrappedConversationKey | null): typeof fetch {
-  return (async (url: string | URL | Request) => {
-    const u = String(url);
-    if (u.endsWith("/webchannel/nats/register/challenge")) {
-      return jsonResponse({ nonce: "nonce-abc" });
+/**
+ * Register-agent handler over the reply-to inbox: challenge → nonce, register →
+ * `{peerId, registered, wrappedConversationKey?}` from `wrapped()` (omitted when
+ * it returns null). `gate`, when provided, holds the register REPLY so a test can
+ * race the NATS `.out` snapshot ahead of the delivered key.
+ */
+function registerAgentHandler(
+  peerId: string,
+  wrapped: () => WrappedConversationKey | null,
+  gate?: Promise<void>,
+): ServerHandler {
+  const reg = registerSubject(TENANT, AGENT, peerId);
+  return async (subject, payload, server, replyTo) => {
+    if (subject !== reg || !replyTo) return;
+    const body = JSON.parse(payload) as { op?: string };
+    if (body.op === "challenge") {
+      server.deliverToClient(replyTo, JSON.stringify({ nonce: "nonce-abc" }));
+      return;
     }
-    if (u.endsWith("/webchannel/nats/register")) {
+    if (body.op === "register") {
+      if (gate) await gate;
       const w = wrapped();
-      return jsonResponse(
-        w
-          ? { peerId: PEER, registered: true, wrappedConversationKey: w }
-          : { peerId: PEER, registered: true },
+      server.deliverToClient(
+        replyTo,
+        JSON.stringify(
+          w ? { peerId, registered: true, wrappedConversationKey: w } : { peerId, registered: true },
+        ),
       );
     }
-    return new Response("not found", { status: 404 });
-  }) as unknown as typeof fetch;
+  };
 }
 
-async function makeClient(wrapped: () => WrappedConversationKey | null): Promise<{
+async function makeClient(): Promise<{
   client: WebChannelNatsClient;
   deviceKP: Awaited<ReturnType<typeof generateX25519KeyPair>>;
 }> {
@@ -228,10 +244,8 @@ async function makeClient(wrapped: () => WrappedConversationKey | null): Promise
     tenant: TENANT,
     peerId: PEER,
     registration: {
-      registerBaseUrl: BASE,
       devicePrivateKey: pop.privateKey,
       deviceX25519PrivateKey: deviceKP.privateKey,
-      fetchImpl: makeRegisterFetch(wrapped),
     },
   });
   return { client, deviceKP };
@@ -254,18 +268,15 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", () => {
-  it("unwraps K from the register response, seals with it, and never touches .handshake", async () => {
+  it("unwraps K from the register reply, seals with it, and never touches .handshake", async () => {
     const K = new Uint8Array(randomBytes(32));
-    let deviceKPRef: Awaited<ReturnType<typeof generateX25519KeyPair>> | null = null;
-    const { client, deviceKP } = await makeClient(() =>
-      wrapLikeAgent(K, deviceKPRef!.publicKeyBytes),
-    );
-    deviceKPRef = deviceKP;
+    const { client, deviceKP } = await makeClient();
 
     const received: unknown[] = [];
     client.onMessage((m) => received.push(m));
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
+    server.handler = registerAgentHandler(PEER, () => wrapLikeAgent(K, deviceKP.publicKeyBytes));
     client.sendUserMessage("hello agent");
     await settle();
 
@@ -298,12 +309,8 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
 
   it("multi-device: two clients with the SAME K both decrypt one broadcast ciphertext", async () => {
     const K = new Uint8Array(randomBytes(32));
-    let kpA: Awaited<ReturnType<typeof generateX25519KeyPair>> | null = null;
-    let kpB: Awaited<ReturnType<typeof generateX25519KeyPair>> | null = null;
-    const a = await makeClient(() => wrapLikeAgent(K, kpA!.publicKeyBytes));
-    kpA = a.deviceKP;
-    const b = await makeClient(() => wrapLikeAgent(K, kpB!.publicKeyBytes));
-    kpB = b.deviceKP;
+    const a = await makeClient();
+    const b = await makeClient();
 
     const gotA: unknown[] = [];
     const gotB: unknown[] = [];
@@ -311,8 +318,10 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     b.client.onMessage((m) => gotB.push(m));
     a.client.connect();
     const serverA = FakeNatsWS.instances.at(-1)!;
+    serverA.handler = registerAgentHandler(PEER, () => wrapLikeAgent(K, a.deviceKP.publicKeyBytes));
     b.client.connect();
     const serverB = FakeNatsWS.instances.at(-1)!;
+    serverB.handler = registerAgentHandler(PEER, () => wrapLikeAgent(K, b.deviceKP.publicKeyBytes));
     await settle();
 
     // ONE ciphertext, fanned out to both device sockets.
@@ -332,47 +341,27 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     b.client.disconnect();
   });
 
-  it("buffers a snapshot that beats the key unwrap, and delivers it once K is set (HTTP-vs-NATS race)", async () => {
+  it("buffers a snapshot that beats the key unwrap, and delivers it once K is set (snapshot-vs-key race)", async () => {
     // Phase 6 race (review finding 2): the register-triggered history snapshot
-    // travels NATS `.out` while the wrapped key travels the HTTP response —
-    // if the snapshot lands first it must be BUFFERED, not dropped.
+    // travels NATS `.out` while the wrapped key travels the register reply — if
+    // the snapshot lands first it must be BUFFERED, not dropped.
     const K = new Uint8Array(randomBytes(32));
-    const pop = await generateDevicePopKeyPair();
-    const deviceKP = await generateX25519KeyPair();
+    const { client, deviceKP } = await makeClient();
     let releaseRegister = () => {};
     const gate = new Promise<void>((r) => { releaseRegister = r; });
-    const fetchImpl = (async (url: string | URL | Request) => {
-      const u = String(url);
-      if (u.endsWith("/webchannel/nats/register/challenge")) return jsonResponse({ nonce: "n" });
-      if (u.endsWith("/webchannel/nats/register")) {
-        await gate; // hold the HTTP response while the NATS snapshot races ahead
-        return jsonResponse({
-          peerId: PEER,
-          registered: true,
-          wrappedConversationKey: wrapLikeAgent(K, deviceKP.publicKeyBytes),
-        });
-      }
-      return new Response("not found", { status: 404 });
-    }) as unknown as typeof fetch;
 
-    const client = new WebChannelNatsClient({
-      url: "ws://127.0.0.1:4222",
-      jwt: JWT,
-      accountId: AGENT,
-      tenant: TENANT,
-      peerId: PEER,
-      registration: {
-        registerBaseUrl: BASE,
-        devicePrivateKey: pop.privateKey,
-        deviceX25519PrivateKey: deviceKP.privateKey,
-        fetchImpl,
-      },
-    });
     const received: unknown[] = [];
     client.onMessage((m) => received.push(m));
     client.connect();
-    await settle(4); // connected, .out subscribed, register in-flight (gated)
+    // Set the handler synchronously (before the challenge/register round-trip)
+    // so the register REPLY (the wrapped key) is gated while the snapshot races.
     const server = FakeNatsWS.instances.at(-1)!;
+    server.handler = registerAgentHandler(
+      PEER,
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes),
+      gate,
+    );
+    await settle(4); // connected, .out subscribed, register in-flight (gated)
 
     const snapshot = {
       type: "history",
@@ -392,12 +381,13 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     client.disconnect();
   });
 
-  it("fail-closed terminal: register response without wrappedConversationKey → onError, no handshake fallback", async () => {
-    const { client } = await makeClient(() => null);
+  it("fail-closed terminal: register reply without wrappedConversationKey → onError, no handshake fallback", async () => {
+    const { client } = await makeClient();
     const errors: Error[] = [];
     client.onError((e) => errors.push(e));
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
+    server.handler = registerAgentHandler(PEER, () => null);
     client.sendUserMessage("never-sent");
     await settle();
 
@@ -411,20 +401,19 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
 
   it("fail-closed terminal: tampered wrapped key (Poly1305 reject) → onError, nothing published", async () => {
     const K = new Uint8Array(randomBytes(32));
-    let kpRef: Awaited<ReturnType<typeof generateX25519KeyPair>> | null = null;
-    const { client, deviceKP } = await makeClient(() => {
-      const w = wrapLikeAgent(K, kpRef!.publicKeyBytes);
-      // Flip a ciphertext byte → tag verification must fail on unwrap.
-      const bad = base64urlDecode(w.ciphertext);
-      bad[0] ^= 0xff;
-      return { ...w, ciphertext: Buffer.from(bad).toString("base64url") };
-    });
-    kpRef = deviceKP;
+    const { client, deviceKP } = await makeClient();
 
     const errors: Error[] = [];
     client.onError((e) => errors.push(e));
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
+    server.handler = registerAgentHandler(PEER, () => {
+      const w = wrapLikeAgent(K, deviceKP.publicKeyBytes);
+      // Flip a ciphertext byte → tag verification must fail on unwrap.
+      const bad = base64urlDecode(w.ciphertext);
+      bad[0] ^= 0xff;
+      return { ...w, ciphertext: Buffer.from(bad).toString("base64url") };
+    });
     client.sendUserMessage("never-sent");
     await settle();
 

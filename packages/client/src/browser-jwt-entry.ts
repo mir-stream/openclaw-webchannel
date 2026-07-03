@@ -109,10 +109,9 @@ export async function runJwtRegister(
     tenant: opts.tenant,
     peerId,
     registration: {
-      registerBaseUrl: opts.gwUrl,
       devicePrivateKey: ed25519.privateKey,
       // Phase 6: the cnf X25519 private key — the session key K arrives
-      // wrapped in the register response (no handshake on this path).
+      // wrapped in the register reply (no handshake on this path).
       deviceX25519PrivateKey: x25519.privateKey,
     },
   });
@@ -205,7 +204,8 @@ export async function runAllReal(
   const credsRes = await fetch(`${opts.issuerUrl}/test/nats-user`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ tenant: opts.tenant, role: "browser" }),
+    // Per-peer browser creds: scope to the peerId we bootstrap under below.
+    body: JSON.stringify({ tenant: opts.tenant, role: "browser", peerId: opts.peerId }),
   });
   if (!credsRes.ok) {
     throw new Error(`nats-user failed: HTTP ${credsRes.status} ${await credsRes.text()}`);
@@ -247,7 +247,6 @@ export async function runAllReal(
     peerId,
     natsCredentials: { userJwt, userSeedRaw },
     registration: {
-      registerBaseUrl: opts.gwUrl,
       devicePrivateKey: ed25519.privateKey,
       // Phase 6: register-delivered conversation key (no handshake).
       deviceX25519PrivateKey: x25519.privateKey,
