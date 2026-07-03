@@ -200,6 +200,9 @@ export async function createWidget(
       },
     });
     client.subscribe(render);
+    // Driver/debug hook: the verify-*.mjs drivers read message ids to make
+    // dedup assertions stronger than DOM text matching allows.
+    (globalThis as unknown as Record<string, unknown>).__webchannelState = () => client?.getState();
     render(client.getState());
     client.connect();
   }

@@ -31,7 +31,7 @@ import { PopChallengeStore } from "./src/pop-challenge.js";
 import { resolveRequirePoP, popRequirementUnmet } from "./src/register-pop-gate.js";
 import { resolveAllowOrigin } from "./src/register-cors.js";
 import { assertValidSubjectToken } from "./src/subject-token.js";
-import { resolveAdmissionMode, admissionServingPlan } from "./src/nats-admission.js";
+import { resolveAdmissionMode, admissionServingPlan, crossUserHistoryWarning } from "./src/nats-admission.js";
 import { isDmPostureOpen } from "./src/dm-allowlist.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { WEBCHANNEL_ID } from "./src/transport.js";
@@ -701,6 +701,15 @@ export default defineChannelPluginEntry({
       // and an aud→account dispatch entry; an `auto` account subscribes the
       // wildcard and is served with NO `channels.webchannel.auth` config.
       const servingPlan = admissionServingPlan(admission);
+      // Phase 6 review finding 1: a multi-user (register-hop) account with
+      // openclaw's default session.dmScope="main" leaks the SHARED transcript
+      // to every user via the history snapshot — warn loudly at startup.
+      const dmScopeWarning = crossUserHistoryWarning({
+        admission,
+        accountId,
+        dmScope: (api.config as { session?: { dmScope?: string } }).session?.dmScope,
+      });
+      if (dmScopeWarning) (api.logger?.warn ?? console.warn)?.(dmScopeWarning);
 
       // ---- Step 2 (per account): create the encrypted NATS channel ---------
       // Subject namespace is webchannel.{tenant}.{accountId}.{peerId} — the

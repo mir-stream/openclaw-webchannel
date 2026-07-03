@@ -690,6 +690,19 @@ export class WebChannelNatsClient {
   private keyPair: BrowserKeyPair | null = null;
   private sessionKey: Uint8Array | null = null;
   private outboundQueue: OutboundMessage[] = [];
+  /**
+   * Ciphertext `.out` frames that arrived BEFORE the session key existed.
+   *
+   * Phase 6 race: the wrapped conversation key travels the HTTP register
+   * response while the register-triggered history snapshot travels NATS —
+   * two transports with no ordering guarantee, so the snapshot can land a
+   * beat before `unwrapConversationKey` resolves. Dropping it would silently
+   * lose the primary hydration path until the next reconnect. We buffer a
+   * bounded number of frames and drain them the moment the key is set;
+   * frames that still fail to decrypt are dropped (fail-closed, as ever).
+   */
+  private pendingInbound: string[] = [];
+  private static readonly MAX_PENDING_INBOUND = 64;
   private outSub = -1;
   private handshakeSub = -1;
   /**
@@ -781,6 +794,25 @@ export class WebChannelNatsClient {
     this.clearHandshakeRetry();
     this.sessionKey = null;
     this.keyPair = null;
+    // Frames buffered for a dead session are ciphertext under a key we no
+    // longer (or never will) hold — drop them; the fresh register/handshake
+    // re-hydrates.
+    this.pendingInbound = [];
+  }
+
+  /**
+   * Decrypt + deliver the `.out` frames that arrived before the session key
+   * was established (see `pendingInbound`). Called immediately after the key
+   * is set on either path (register-delivered K or legacy handshake).
+   */
+  private drainPendingInbound(): void {
+    if (!this.sessionKey || this.pendingInbound.length === 0) return;
+    const pending = this.pendingInbound;
+    this.pendingInbound = [];
+    for (const payload of pending) {
+      const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
+      if (msg) this.notifyMessageListeners(msg);
+    }
   }
 
   private async onConnected(): Promise<void> {
@@ -882,6 +914,7 @@ export class WebChannelNatsClient {
         }
         if (this.connectionEpoch !== epoch) return;
         this.sessionKey = key;
+        this.drainPendingInbound();
         this.flushQueue();
         return;
       }
@@ -935,12 +968,21 @@ export class WebChannelNatsClient {
       if (!agentPubKey) return;
       this.sessionKey = await deriveConversationKey(this.keyPair.privateKey, agentPubKey);
       this.clearHandshakeRetry();
+      this.drainPendingInbound();
       this.flushQueue();
       return;
     }
 
     if (subject === outboundSubject(tenant, accountId, peerId)) {
-      if (!this.sessionKey) return; // fail-closed: cannot read before handshake
+      if (!this.sessionKey) {
+        // Fail-closed, but not lossy: buffer (bounded) until the key exists —
+        // the register-triggered snapshot can beat the HTTP-delivered key by a
+        // beat (see `pendingInbound`). Never processed as plaintext.
+        if (this.pendingInbound.length < WebChannelNatsClient.MAX_PENDING_INBOUND) {
+          this.pendingInbound.push(payload);
+        }
+        return;
+      }
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
       if (msg) this.notifyMessageListeners(msg);
       return;

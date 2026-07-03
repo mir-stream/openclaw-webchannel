@@ -16,7 +16,7 @@
  */
 import { describe, it, expect } from "vitest";
 
-import { resolveAdmissionMode, admissionServingPlan } from "./nats-admission.js";
+import { resolveAdmissionMode, admissionServingPlan, crossUserHistoryWarning } from "./nats-admission.js";
 
 describe("resolveAdmissionMode", () => {
   it("explicit override always wins", () => {
@@ -119,5 +119,34 @@ describe("admissionServingPlan", () => {
     });
     expect(admission).toBe("register-hop");
     expect(admissionServingPlan(admission).buildVerifier).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 6 review finding 1 — cross-user history leak guard (dmScope)
+// ---------------------------------------------------------------------------
+
+describe("crossUserHistoryWarning (Phase 6 — dmScope leak guard)", () => {
+  it("warns for a register-hop account when dmScope is unset (openclaw default 'main')", () => {
+    const msg = crossUserHistoryWarning({ admission: "register-hop", accountId: "acct-a" });
+    expect(msg).toMatch(/acct-a/);
+    expect(msg).toMatch(/dmScope/);
+    expect(msg).toMatch(/per-channel-peer/);
+  });
+
+  it("warns for a register-hop account when dmScope is explicitly 'main'", () => {
+    expect(
+      crossUserHistoryWarning({ admission: "register-hop", accountId: "a", dmScope: "main" }),
+    ).not.toBeNull();
+  });
+
+  it("stays silent for any non-'main' scope (per-channel-peer / per-account-channel-peer)", () => {
+    for (const dmScope of ["per-channel-peer", "per-account-channel-peer"]) {
+      expect(crossUserHistoryWarning({ admission: "register-hop", accountId: "a", dmScope })).toBeNull();
+    }
+  });
+
+  it("stays silent for auto admission (no snapshot/history path gated here)", () => {
+    expect(crossUserHistoryWarning({ admission: "auto", accountId: "a" })).toBeNull();
   });
 });

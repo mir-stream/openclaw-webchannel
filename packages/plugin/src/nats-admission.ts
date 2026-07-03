@@ -114,3 +114,37 @@ export function admissionServingPlan(admission: AdmissionMode): AdmissionServing
     populateAudMapping: registerHop,
   };
 }
+
+/**
+ * Phase 6 guard: cross-user history leak via openclaw's default DM session scope.
+ *
+ * A `register-hop` account serves MANY users (one peerId per user), but openclaw's
+ * `session.dmScope` defaults to `"main"` — every direct peer resolves to the SAME
+ * agent session. The register-time history snapshot (and `load_history`) reads
+ * `route.sessionKey`, so under `"main"` it returns the SHARED transcript and the
+ * agent re-seals OTHER USERS' messages to each requester's own conversation key.
+ * Per-peer E2E encryption cannot protect against this: the leak happens before
+ * sealing, at session scoping. openclaw's own channel audit flags the same
+ * misconfig.
+ *
+ * Returns the operator warning to log, or `null` when the account is safe
+ * (auto admission has no snapshot/history path gated here, and any non-"main"
+ * scope isolates DM sessions per sender).
+ */
+export function crossUserHistoryWarning(input: {
+  admission: AdmissionMode;
+  accountId: string;
+  /** `session.dmScope` from the openclaw config (undefined = openclaw default "main"). */
+  dmScope?: string;
+}): string | null {
+  if (input.admission !== "register-hop") return null;
+  const dmScope = input.dmScope ?? "main";
+  if (dmScope !== "main") return null;
+  return (
+    `webchannel: account "${input.accountId}" uses register admission (multi-user) but ` +
+    `session.dmScope is "main" — ALL peers share ONE agent session, so the history ` +
+    `snapshot and load_history return OTHER USERS' messages re-sealed to each requester ` +
+    `(cross-user transcript leak; E2E encryption cannot prevent it). ` +
+    `Run: openclaw config set session.dmScope "per-channel-peer"`
+  );
+}

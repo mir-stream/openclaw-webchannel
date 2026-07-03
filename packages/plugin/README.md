@@ -80,46 +80,51 @@ credentials and skips enrollment.
   `saasPollUrl`, optional `accountId` (the wire identity). The private key is generated locally
   and never transmitted.
 
-## E2E security model (admission + handshake)
+## E2E security model (admission + key establishment)
 
-> ⚠️ **Current status — handshake authentication is NOT wired into the live NATS path.**
-> The machinery below (`cnf` extraction, pinned-key store, `handshake-verifier.ts`) exists and is
-> unit-tested, but the live handshake (`nats-channel.ts` `handleHandshake`) derives the session key
-> directly from the wire key **without calling `parseAndVerifyHandshake`/`verifyDeviceKey`**, and the
-> browser never verifies the agent's key (the SaaS does not yet attest an agent key to the browser).
-> **What you get today:** confidentiality against a *passive* relay. **What is NOT yet provided:**
-> protection against an *active* relay MITM — a malicious relay can substitute keys in both
-> directions and transparently read/rewrite traffic. This is acceptable **only while the relay is
-> operated by a trusted party** (your own `nats-server` or your own Synadia account). Wiring the
-> mutual attestation below is tracked as **[docs/BACKLOG.md → C2: authenticated handshake](../../docs/BACKLOG.md)**
-> and is a hard prerequisite before any deployment on a third-party-operated relay.
+Phase 6 (multi-device) split key establishment by admission mode:
 
-The design below describes the intended end state (mostly built, not yet wired):
-
-- **`cnf` claim verification** (`src/jwt.ts`): after the bootstrap JWT's signature is verified,
-  `verifyJwt` extracts the RFC 7800 `cnf.jwk` confirmation claim. Types `CnfJwk` / `CnfClaim`;
-  the validated device key surfaces as `JwtIdentity.devicePublicKey`. The claim must be
-  `kty: "OKP"`, `crv: "X25519"`, with a 32-byte `x`; a `d` (private) field, wrong length, or any
-  malformed `cnf` causes the **whole JWT to be rejected** (fail-closed). A JWT with no `cnf` is
-  allowed (backward compatibility).
-- **Pinned device-key store** (`src/auth.ts`): on successful JWT admission the attested key is
-  pinned by `peerId` via `storePinnedDeviceKey` / `getPinnedDeviceKey` /
-  `clearPinnedDeviceKeys` / `clearPinnedDeviceKeyForPeer`.
-- **Constant-time handshake check** (`src/handshake-verifier.ts`): `verifyDeviceKey` and
-  `parseAndVerifyHandshake` compare the key a peer presents against the pinned value using
-  constant-time byte-equality; a mismatch (or missing pin, or bad length) throws
-  `HandshakeMitmError` and aborts the handshake before any ECDH. **⚠️ Not yet called by the live
-  handshake — see the status note above.**
+- **Register admission (production / SaaS path) — register-delivered conversation key.**
+  The agent OWNS a stable per-peerId key K (`src/conversation-key-store.ts`, persisted at
+  `~/.openclaw-webchannel/<account>/conversation-keys.json`, 0600). The HTTP register route wraps
+  K (`src/late-join-decryptor.ts` — X25519 ECDH + HKDF-SHA256 `webchannel-key-wrap-v1` +
+  ChaCha20-Poly1305) to the device key attested in **that request's** verified JWT `cnf` claim and
+  returns it in the register response. There is **no `.handshake` on this path** — the
+  keyStore-mode channel neither subscribes nor answers it — so an active relay cannot substitute
+  keys: K only ever travels wrapped to a JWT-attested device key, over authenticated HTTPS, never
+  over NATS. This resolves review finding **C2** structurally for register deployments. One user's
+  devices all receive the SAME K, so multi-device decryption works and a second device no longer
+  overwrites the first one's key.
+  - **`cnf` claim verification** (`src/jwt.ts`): after the bootstrap JWT's signature is verified,
+    `verifyJwt` extracts the RFC 7800 `cnf.jwk` confirmation claim. The claim must be
+    `kty: "OKP"`, `crv: "X25519"`, with a 32-byte `x`; a `d` (private) field, wrong length, or
+    any malformed `cnf` causes the **whole JWT to be rejected** (fail-closed). The validated key
+    surfaces as `JwtIdentity.devicePublicKey`; the register route REQUIRES it (401 without) and
+    wraps per-request. There is deliberately **no cross-request pinned-key store** — the old
+    peerId-keyed pin store collided two devices of one user and was removed (with the never-wired
+    `handshake-verifier.ts`) in Phase 6 W7.
+  - **Session scoping caveat:** a register account serves many users, so openclaw's
+    `session.dmScope` MUST be `"per-channel-peer"` (or the per-account variant). The default
+    `"main"` collapses every peer into ONE agent session, and the register history snapshot then
+    delivers the shared transcript to every user (re-sealed to each requester's own K —
+    encryption cannot prevent a scoping leak). The plugin warns loudly at startup when it detects
+    this (`crossUserHistoryWarning`).
+- **Auto admission (`admission:"auto"`, bring-your-own-NATS) — legacy per-device X25519
+  handshake, unchanged.** The handshake is unauthenticated (any tenant-creds holder can complete
+  it), so auto mode gives confidentiality against a *passive* relay only; an *active* relay MITM
+  can substitute keys. Acceptable **only while the relay is operated by a trusted party** (your
+  own `nats-server` or your own Synadia account). Migrating auto deployments to register
+  admission is the follow-up that closes this.
 - **No anonymous admission:** the `anonymous` auth strategy throws at plugin load
   (`makeAnonymousVerifier` never returns a verifier) — connections must use `jwt`.
 
-**Threat model — once the handshake check is wired (see status note):** relay substitutes the
-device key → caught by the handshake compare; attacker skips bootstrap → no admission without a
-SaaS-attested key; forged `cnf` → JWT signature verification fails; timing oracle → constant-time
-compare. **Not yet handled today (C2 backlog):** active relay MITM in either direction (verifier
-unwired; agent key not attested to the browser; `cnf` still optional). **Out of scope:** SaaS key
-compromise / revocation (deferred to re-enrollment); real-time allowlist authz is a core-delegated
-stub.
+**Threat model (register path):** relay substitutes a key → impossible, K is wrapped to the
+JWT-attested `cnf` key and never negotiated on the wire; attacker skips bootstrap → no admission
+(register requires a verified JWT + PoP); forged `cnf` → JWT signature verification fails;
+tampered wrapped key → Poly1305 reject, client fails closed (terminal error, no handshake
+downgrade). **Auto path:** active relay MITM remains possible (see above). **Out of scope:** SaaS
+key compromise / revocation (deferred to re-enrollment); K rotation (deferred — fixed key first);
+real-time allowlist authz is a core-delegated stub.
 
 ## Bring-your-own NATS (e.g. Synadia Cloud / NGS)
 

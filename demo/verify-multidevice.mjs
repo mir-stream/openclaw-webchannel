@@ -86,6 +86,21 @@ function exactBubbleCount(page, text) {
   }, text);
 }
 
+/**
+ * Count AGENT bubbles (leaf divs starting with "echo:") that contain `text` —
+ * the W6/F7 target proper: a duplicated agent reply after another device's
+ * register-triggered snapshot shows up as a count > 1 (review finding 3).
+ */
+function echoBubbleCount(page, text) {
+  return page.evaluate((t) => {
+    let n = 0;
+    for (const d of document.querySelectorAll("#chat-body div")) {
+      if (d.childElementCount === 0 && d.textContent.startsWith("echo:") && d.textContent.includes(t)) n++;
+    }
+    return n;
+  }, text);
+}
+
 const browser = await chromium.launch({
   headless: true,
   args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
@@ -98,6 +113,12 @@ try {
   await send(pageA, M1);
   await awaitEcho(pageA, M1);
   console.log("[md] device A: first message echoed");
+  // Let the M1 turn FLUSH to the core transcript before B registers: the
+  // register snapshot reads the transcript at that moment, and a turn still
+  // finalizing would be absent from it (B would show E1 as a live frame but no
+  // M1 user bubble — the accepted mid-turn-join gap, not the dedup property
+  // this scene asserts).
+  await pageA.waitForTimeout(3000);
 
   // ── Device B (alice again — SAME peerId) joins SECOND ────────────────────
   const ctxB = await browser.newContext();
@@ -147,9 +168,25 @@ try {
       console.error(`  [md] device ${dev}: expected ${want} bubble(s) for ${JSON.stringify(text)}, found ${n}`);
     }
   }
+  // ...and AGENT bubbles (the F7 target proper): B's register snapshot re-sent
+  // the transcript on the shared .out, so a live-vs-history id mismatch would
+  // duplicate the echo bubbles on A.
+  const echoChecks = [
+    ["A", pageA, M1, 1], ["A", pageA, M2, 1],
+    ["B", pageB, M1, 1], ["B", pageB, M2, 1],
+  ];
+  for (const [dev, page, text, want] of echoChecks) {
+    const n = await echoBubbleCount(page, text);
+    if (n !== want) {
+      noDupes = false;
+      console.error(`  [md] device ${dev}: expected ${want} AGENT echo bubble(s) for ${JSON.stringify(text)}, found ${n}`);
+    }
+  }
   check("3. no duplicate message bubbles on either device (W6 idempotent hydration)", noDupes);
 
   // 4. Device B reloads mid-session → full history + live decrypt, no manual steps.
+  // Same transcript-flush settle for the M2 turn before the reload snapshot.
+  await pageB.waitForTimeout(3000);
   await pageB.reload({ waitUntil: "domcontentloaded" });
   await pageB.waitForSelector("#app:not(.hidden)", { timeout: 15000 });
   let bRecovered = true;
@@ -171,6 +208,16 @@ try {
   if (m2OnB !== 1) {
     bRecovered = false;
     console.error(`  [md] device B post-reload: expected 1 bubble for M2, found ${m2OnB}`);
+  }
+  // B's reload triggered yet another snapshot on the shared .out — device A
+  // decrypted it too, so A must STILL show exactly one bubble of each kind.
+  for (const [text] of [[M1], [M2]]) {
+    const u = await exactBubbleCount(pageA, text);
+    const e = await echoBubbleCount(pageA, text);
+    if (u !== 1 || e !== 1) {
+      bRecovered = false;
+      console.error(`  [md] device A after B's reload snapshot: ${JSON.stringify(text)} user=${u} echo=${e} (want 1/1)`);
+    }
   }
   // ...and B decrypts LIVE traffic sent after its reload.
   await pageB.waitForTimeout(1500);

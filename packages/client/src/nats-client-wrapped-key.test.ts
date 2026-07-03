@@ -332,6 +332,66 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     b.client.disconnect();
   });
 
+  it("buffers a snapshot that beats the key unwrap, and delivers it once K is set (HTTP-vs-NATS race)", async () => {
+    // Phase 6 race (review finding 2): the register-triggered history snapshot
+    // travels NATS `.out` while the wrapped key travels the HTTP response —
+    // if the snapshot lands first it must be BUFFERED, not dropped.
+    const K = new Uint8Array(randomBytes(32));
+    const pop = await generateDevicePopKeyPair();
+    const deviceKP = await generateX25519KeyPair();
+    let releaseRegister = () => {};
+    const gate = new Promise<void>((r) => { releaseRegister = r; });
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.endsWith("/webchannel/nats/register/challenge")) return jsonResponse({ nonce: "n" });
+      if (u.endsWith("/webchannel/nats/register")) {
+        await gate; // hold the HTTP response while the NATS snapshot races ahead
+        return jsonResponse({
+          peerId: PEER,
+          registered: true,
+          wrappedConversationKey: wrapLikeAgent(K, deviceKP.publicKeyBytes),
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const client = new WebChannelNatsClient({
+      url: "ws://127.0.0.1:4222",
+      jwt: JWT,
+      accountId: AGENT,
+      tenant: TENANT,
+      peerId: PEER,
+      registration: {
+        registerBaseUrl: BASE,
+        devicePrivateKey: pop.privateKey,
+        deviceX25519PrivateKey: deviceKP.privateKey,
+        fetchImpl,
+      },
+    });
+    const received: unknown[] = [];
+    client.onMessage((m) => received.push(m));
+    client.connect();
+    await settle(4); // connected, .out subscribed, register in-flight (gated)
+    const server = FakeNatsWS.instances.at(-1)!;
+
+    const snapshot = {
+      type: "history",
+      messages: [{ id: "h1", role: "agent", text: "hydrated", ts: 1 }],
+    };
+    server.deliverToClient(
+      outboundSubject(TENANT, AGENT, PEER),
+      sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, K, snapshot),
+    );
+    await settle(2);
+    expect(received).toHaveLength(0); // no key yet — buffered, never plaintext-processed
+
+    releaseRegister();
+    await settle();
+    expect(received).toEqual([snapshot]); // drained right after unwrap
+
+    client.disconnect();
+  });
+
   it("fail-closed terminal: register response without wrappedConversationKey → onError, no handshake fallback", async () => {
     const { client } = await makeClient(() => null);
     const errors: Error[] = [];
