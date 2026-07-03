@@ -249,10 +249,15 @@ eternal spinner; re-auth recovers.
 Low-cost extras that deepen the "SaaS is the authority" story; none block the
 narrative:
 
-- **JWKS rotation, zero downtime** (`jwks.ts:14-22`): rotate the demo signing key;
-  a JWT under the new `kid` works after one live refetch, one under the evicted
-  key is rejected (never falls back to a stale cache). Cost: a rotate-key control
-  on the demo SaaS (medium).
+- **JWKS rotation + eviction — BUILT (`c3d320c`, `d64d291`).** Admin pane has a
+  "Signing key" control: **Rotate key** (grace — new `kid` prepended, old kept →
+  a fresh JWT verifies after the gateway's one live JWKS refetch, ZERO downtime)
+  and **Rotate + evict old** (JWKS reduced to the new kid → a JWT under the evicted
+  kid is rejected with a clean 401). Only the RS256 key rotates; NATS creds are
+  untouched, so live sessions are unaffected. Product touch: export
+  `generateRsaKeypair` (additive) + `auth.ts` maps a verify-time throw (unknown
+  kid) to a 401 not a 500. Drivers: `demo/verify-rotate.mjs` (zero-downtime),
+  `demo/verify-evict.mjs` (evicted-kid rejected). Both verified live.
 - **One gateway, many accounts** (`multiplex.ts:50-77`, `index-nats.ts:604`):
   show a single gateway serving several accounts with *different users* per
   account — process-level tenancy, distinct from scene ②'s per-machine story.

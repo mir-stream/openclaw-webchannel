@@ -59,6 +59,15 @@ draft → answer, `/help`, exec-approval cards, status pill incl. terminal error
 ./demo/chaos.sh replay-jwt      # authentication (register nonce single-use)
 ```
 
+## Operator asides (Phase 5)
+
+- **Signing-key rotation (JWKS).** In the admin pane, **Rotate key** mints a fresh
+  RS256 kid (old kept → zero downtime: a new-kid JWT verifies after the gateway's
+  one live JWKS refetch). **Rotate + evict old** drops the old kid so a JWT under
+  it is rejected (clean 401). Only the RS256 key rotates — NATS creds are untouched,
+  so live sessions keep running. Drivers: `node demo/verify-rotate.mjs`,
+  `node demo/verify-evict.mjs`.
+
 ## Honest-demo notes (short)
 
 - **No active-MITM claim (C2):** scene ③ proves confidentiality vs a *passive*
