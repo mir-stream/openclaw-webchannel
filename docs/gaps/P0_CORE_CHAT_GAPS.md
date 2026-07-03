@@ -167,22 +167,52 @@ depth cap** that still needs fixing.
     while the comment at `:198/:224` claims **oldest**. The client's dedup swallows the duplicates,
     so the visible symptom is "load more silently stops".
 
+**⚠️ This gap is upstream-constrained, not ours to close unilaterally.** `openclaw` is a third-party
+npm peer dependency (see memory `openclaw-plugin-dependency`) — we do not vendor or patch its
+source. The plugin-facing contract `PluginRuntime.subagent.getSessionMessages`
+(`openclaw/src/plugins/runtime/types.ts:87-89`, backed by `openclaw/src/gateway/server-plugins.ts:589`)
+is a **closed, published type**: `{ sessionKey, limit }` only — no `before`/`offset`/cursor field
+exists on it today, so we cannot add one from this repo.
+
+Investigated 2026-07-03 (read into openclaw core, not just the type): the *underlying* JSONL
+transcript store already has an ordered, id-carrying, byte-offset-seekable index
+(`session-transcript-index.fs.ts`) and a cursor-capable reader
+(`readSessionMessagesPageWithStatsAsync`, `session-utils.fs.ts:822`) — proven in production by
+`chat.history`/`chat.startup` (`server-methods/chat.ts:2786-2925`), which already call it with an
+`offset` param. So real cursor pagination is *technically* easy — but only from inside the openclaw
+repo. For us it means: file an upstream feature request/PR against openclaw to add `before`/`offset`
+to `sessions.get` → `getSessionMessages`, then consume it once released. Out of our control/timeline.
+
+**Practical workaround available entirely within this repo (no upstream change needed).**
+`getSessionMessages` does accept a bigger `limit` — capped upstream at
+`PLUGIN_SUBAGENT_SESSION_MESSAGES_MAX_LIMIT = 1000` (`server-plugins.ts:586`) — and it's a plain
+tail fetch (most-recent-N), not a windowed one. So instead of `fetchLimit = limit * 2` (`:214`,
+currently 100 with the demo's default `limit:50`), we can fetch up to the 1000-message ceiling in
+one call, find the `beforeId` cursor inside that larger window, and slice. This turns "~2 pages then
+silently stops" into "up to ~1000 messages of history, no upstream change required" — more than
+enough for any realistic session (confirmed acceptable by user 2026-07-03). Only conversations
+exceeding 1000 turns would still hit a hard wall, and *that* residual case needs the upstream cursor
+above.
+
 **Reference implementation (our reducer).** `nats-client-wrapper.ts:209` already prepends + dedups a
 `history` page; the "Load older" response reuses it.
 
 **Telegram reference.** `message-cache.ts` builds bounded history windows on demand; Telegram has no
 user-facing "load more" (the client is Telegram itself), so our scroll-to-top pagination UX is novel.
 
-**Implementation sketch (remaining).**
-0. **Server: fix the `pageBefore` depth cap** (`history.ts:214-226`). Either grow the fetch window
-   until the cursor is found (iterative deepening `limit*2, limit*4, …`) or page over the full
-   transcript if the SDK seam grows a real cursor. Fix the cursor-miss fallback to match its comment
-   (return the *oldest* slice, or an empty page so the client renders "beginning of conversation").
+**Implementation sketch (remaining, all within this repo).**
+0. **Server: raise the `pageBefore` fetch window to the 1000-message ceiling** (`history.ts:214-226`)
+   instead of `limit*2`, and find/slice the cursor within it (iterative deepening — `limit*2, *4, …`
+   up to 1000 — is an equally valid way to avoid always paying the cost of a full 1000-fetch on
+   every page). Fix the cursor-miss fallback to match its comment (return the *oldest* slice, or an
+   empty page so the client renders "beginning of conversation") for the case where the cursor truly
+   isn't in the last 1000 messages.
 1. **Scroll UX (optional polish):** trigger `loadHistory` on scroll-near-top instead of only the
    button, and preserve scroll position (measure `scrollHeight` before prepend, restore after).
 
-**Acceptance.** With >2 pages of history, repeatedly loading older keeps fetching+prepending beyond
-the old `limit*2` window; fetching past the beginning is a no-op (empty page).
+**Acceptance.** With >2 pages of history (up to the ~1000-message ceiling), repeatedly loading older
+keeps fetching+prepending; fetching past the beginning (or past the 1000-message ceiling) is a no-op
+(empty page) rather than a silent stop with no explanation.
 
 ---
 
@@ -393,7 +423,7 @@ rapid double-submit of the same logical message is deduped server-side.
 |---|---|---|---|
 | 1 | P0-5 streaming demo flag | XS | One-line `streaming.mode:"progress"` in `run.sh` unlocks the already-built render. |
 | 2 | P0-6 NATS typing gate | S | Small server gate; makes `typing:"off"` honored. |
-| 3 | P0-2 server depth cap | S–M | Real pagination beyond `limit*2`. |
+| 3 | P0-2 server depth cap | S–M | Raise fetch window to the 1000-msg ceiling (in-repo fix); true unbounded cursor is upstream-blocked. |
 | 4 | P0-3 slash discovery | S–M | Catalog route + typeahead (execution already works). |
 | 5 | P0-7 send reliability | L | Client replay + server dedupe; the reliability milestone. |
 
