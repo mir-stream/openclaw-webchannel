@@ -4,22 +4,18 @@
  * The live NATS path has no peer-disconnect signal, so peer subscriptions,
  * session keys, and approval-dedup entries would otherwise grow monotonically
  * with churn on a long-lived gateway. These tests drive the size ceilings and
- * assert the oldest entry is evicted (and its subscription torn down / pinned
- * key released) once a cap is exceeded.
+ * assert the oldest entry is evicted (and its subscription torn down) once a
+ * cap is exceeded. (The pinned-device-key store these tests also covered is
+ * gone — Phase 6 / W7 removed it with the handshake-verification model.)
  */
 
 import { EventEmitter } from "node:events";
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect } from "vitest";
 
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
 import { generateKeyPair } from "./e2e-crypto.js";
 import { keyExchangeFrame } from "./e2e-session.js";
-import {
-  storePinnedDeviceKey,
-  getPinnedDeviceKey,
-  clearPinnedDeviceKeys,
-} from "./auth.js";
 
 /** Minimal transport: records SUB/UNSUB sids, swallows PUB. */
 class FakeTransport extends EventEmitter {
@@ -40,19 +36,12 @@ class FakeTransport extends EventEmitter {
 }
 
 describe("S2 — NatsChannel memory bounds", () => {
-  beforeEach(() => {
-    clearPinnedDeviceKeys();
-  });
-
-  it("caps tracked peers and evicts the oldest (unsub + pin release)", () => {
+  it("caps tracked peers and evicts the oldest (unsub)", () => {
     const transport = new FakeTransport();
     const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant", undefined, {
       maxPeers: 3,
     });
     const subs = channel["peerSubscriptions"] as Map<string, number>;
-
-    // The oldest peer also holds a pinned device key — eviction must release it.
-    storePinnedDeviceKey("peer-0", "AAAApinned0");
 
     channel.registerPeer("peer-0");
     channel.registerPeer("peer-1");
@@ -67,8 +56,6 @@ describe("S2 — NatsChannel memory bounds", () => {
     expect(subs.has("peer-3")).toBe(true);
     // Its NATS subscription was torn down (no leaked SUB).
     expect(transport.subs.size).toBe(3);
-    // Its SaaS-attested pin was released.
-    expect(getPinnedDeviceKey("peer-0")).toBeNull();
   });
 
   it("bounds peerSessionKeys on the wildcard/auto path (handshake, no registerPeer)", () => {

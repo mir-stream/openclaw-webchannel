@@ -19,85 +19,14 @@ import { JWKSCache } from "./jwks.js";
  */
 export const ANON_PEER_ID = "web-anon";
 
-// ---------------------------------------------------------------------------
-// Device key pin store (SaaS-attested keys from cnf claims)
-// ---------------------------------------------------------------------------
-
-/**
- * Pinned device public keys (base64url-encoded 32-byte X25519 keys) indexed by
- * peerId. These are extracted from verified JWT cnf.jwk claims during admission
- * and MUST be used to verify device keys during ECDH handshake (MITM prevention).
- */
-const pinnedDeviceKeys: Map<string, string> = new Map();
-
-/**
- * S2: upper bound on pinned keys. `NatsChannel.unregisterPeer` releases a peer's
- * pin on the normal lifecycle, but a JWT that is verified (pin stored) without a
- * following register hop would otherwise leak per distinct peerId forever. This
- * FIFO ceiling evicts the oldest pin once exceeded — a defense-in-depth bound so
- * the module-global store can't grow without limit. High enough that real
- * single-tenant load never trips it.
- */
-const MAX_PINNED_DEVICE_KEYS = 10_000;
-
-/**
- * Store a SaaS-attested device public key for a given peerId.
- *
- * Called by the auth layer after successful JWT verification with a cnf claim.
- * If a key already exists for the peerId, it is replaced (key rotation).
- *
- * @param peerId - JWT `sub` claim (stable per-user identity).
- * @param devicePublicKeyB64 - Device X25519 public key (base64url, 32 bytes).
- */
-export function storePinnedDeviceKey(peerId: string, devicePublicKeyB64: string): void {
-  if (!peerId || typeof peerId !== "string") {
-    throw new Error("webchannel: peerId must be a non-empty string");
-  }
-  if (!devicePublicKeyB64 || typeof devicePublicKeyB64 !== "string") {
-    throw new Error("webchannel: devicePublicKey must be a non-empty base64url string");
-  }
-  // Delete-then-set so a re-pin moves the peer to the NEWEST insertion slot:
-  // that makes the size-cap eviction below LRU-ish (evict least-recently-pinned)
-  // instead of pure-FIFO, so an actively re-pinning peer is never the one
-  // dropped in favor of a stale abandoned pin.
-  pinnedDeviceKeys.delete(peerId);
-  pinnedDeviceKeys.set(peerId, devicePublicKeyB64);
-  // S2: size ceiling. Distinct new peerIds grow the map; evict the
-  // least-recently-pinned once over the cap.
-  while (pinnedDeviceKeys.size > MAX_PINNED_DEVICE_KEYS) {
-    const oldest = pinnedDeviceKeys.keys().next().value as string | undefined;
-    if (oldest === undefined) break;
-    pinnedDeviceKeys.delete(oldest);
-  }
-}
-
-/**
- * Retrieve the pinned device public key for a given peerId, or `null` if not
- * yet pinned. Returns the base64url-encoded key (32 bytes when decoded).
- *
- * Used during handshake verification to ensure the presented device key matches
- * the SaaS-attested value.
- *
- * @param peerId - JWT `sub` claim.
- * @returns Pinned device key (base64url), or `null` if not found.
- */
-export function getPinnedDeviceKey(peerId: string): string | null {
-  return pinnedDeviceKeys.get(peerId) ?? null;
-}
-
-/**
- * Clear all pinned device keys (e.g. on plugin shutdown or reconfiguration).
- */
-export function clearPinnedDeviceKeys(): void {
-  pinnedDeviceKeys.clear();
-}
-
-/**
- * Clear pinned device key for a specific peerId (e.g. on targeted revocation).
- */
-export function clearPinnedDeviceKeyForPeer(peerId: string): void {
-  pinnedDeviceKeys.delete(peerId);
-}
+// NOTE (Phase 6 / W7): the module-global "pinned device key" store that lived
+// here is GONE. It was peerId-keyed (so two devices of one user collided,
+// last-writer-wins — audit F2) and its only intended consumer, the
+// handshake-time verifier (`handshake-verifier.ts`), was never wired (review
+// finding C2). The register-delivered key model replaces both: the register
+// route wraps the conversation key to the device key presented in THAT
+// request's verified JWT `cnf` claim (`identity.devicePublicKey`), so there is
+// no cross-request key store to poison or collide.
 
 export type ConnectionIdentity = { peerId: string; displayName?: string };
 export type ConnectionVerifier = (
@@ -300,12 +229,6 @@ function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
     });
     if (!identity) return null;
 
-    // AC 4: Store the SaaS-attested device public key from cnf claim
-    // This key MUST be used during handshake verification to prevent MITM.
-    if (identity.devicePublicKey) {
-      storePinnedDeviceKey(identity.peerId, identity.devicePublicKey);
-    }
-
     return identity.displayName !== undefined
       ? { peerId: identity.peerId, displayName: identity.displayName }
       : { peerId: identity.peerId };
@@ -422,11 +345,9 @@ export async function verifyJwtAndExtractIdentity(
     return null;
   }
 
-  // Store device public key from cnf claim (AC 4)
-  if (identity.devicePublicKey) {
-    storePinnedDeviceKey(identity.peerId, identity.devicePublicKey);
-  }
-
+  // The cnf device public key rides on the returned identity itself
+  // (`identity.devicePublicKey`) — the register route wraps the conversation
+  // key to it per-request (Phase 6); nothing is stored module-globally.
   logger?.info?.(`webchannel: JWT verified for peerId="${identity.peerId}"`);
   return identity;
 }

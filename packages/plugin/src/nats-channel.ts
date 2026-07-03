@@ -20,7 +20,6 @@ import type { NatsTransport, NatsMessage } from "./nats-transport.js";
 import type { ApprovalDecision } from "./transport.js";
 import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
-import { clearPinnedDeviceKeyForPeer } from "./auth.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
 import { wrapConversationKey } from "./late-join-decryptor.js";
 import type { WrappedConversationKey } from "./late-join-decryptor.js";
@@ -292,11 +291,6 @@ export class NatsChannel {
     // (legacy mode) or re-register, which reloads the STABLE key K from the
     // keyStore (Phase 6 mode — the persisted K itself is never dropped here).
     this.peerSessionKeys.delete(peerId);
-    // S2: release this peer's SaaS-attested pinned device key too, so the
-    // module-global pin store is bounded by the peer lifecycle rather than
-    // growing per unique peerId forever. A returning peer re-pins on its next
-    // verified JWT.
-    clearPinnedDeviceKeyForPeer(peerId);
   }
 
   /**
@@ -602,12 +596,11 @@ export class NatsChannel {
           `[nats-channel] session-key cap ${this.maxPeers} reached; evicting oldest peer ${oldest}`,
         );
         // Registered-mode peer → full teardown (also unsubscribes); wildcard-mode
-        // peer has no subscription, so just drop its key + pin.
+        // peer has no subscription, so just drop its key.
         if (this.peerSubscriptions.has(oldest)) {
           this.unregisterPeer(oldest);
         } else {
           this.peerSessionKeys.delete(oldest);
-          clearPinnedDeviceKeyForPeer(oldest);
         }
       }
     }
