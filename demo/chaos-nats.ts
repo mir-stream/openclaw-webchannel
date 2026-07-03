@@ -13,6 +13,7 @@
  * is non-terminal and never reaches a callback, so we read raw protocol lines.
  */
 import { importEd25519SeedKey, signNonce } from "../packages/client/src/nats-nkey-browser.js";
+import { generateDevicePopKeyPair, signPop } from "../packages/client/src/pop-register.js";
 
 const SAAS_URL = process.env.SAAS_URL || "http://127.0.0.1:3961";
 const TENANT = process.env.DEMO_TENANT || "demo-tenant";
@@ -161,15 +162,69 @@ async function tamper(): Promise<number> {
   return 0;
 }
 
+/** b64url of raw bytes. */
+function b64urlBytes(buf: ArrayBuffer | Uint8Array): string {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  return Buffer.from(bytes).toString("base64url");
+}
+
+async function replayJwt(): Promise<number> {
+  const cookie = await adminCookie();
+  // The gateway register base URL for agent-dev, from the SaaS rendezvous.
+  const me = (await (await fetch(`${SAAS_URL}/me`, { headers: { cookie } })).json()) as {
+    accounts?: Record<string, { registerBaseUrl: string }>;
+  };
+  const rv = me.accounts?.["agent-dev"];
+  if (!rv) throw new Error("admin has no agent-dev rendezvous — is the demo up + granted?");
+  const gwUrl = rv.registerBaseUrl;
+
+  // Device keys: an X25519 (cnf.jwk) + an Ed25519 PoP pair the register hop proves.
+  const x = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const deviceX25519PublicKey = b64urlBytes(await crypto.subtle.exportKey("raw", x.publicKey));
+  const pop = await generateDevicePopKeyPair();
+
+  // Session-gated bootstrap JWT (admin → agent-dev). peerId is server-derived.
+  const bootRes = await fetch(`${SAAS_URL}/bootstrap`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", cookie },
+    body: JSON.stringify({ accountId: "agent-dev", deviceX25519PublicKey, devicePopPublicKey: pop.publicJwk.x }),
+  });
+  if (!bootRes.ok) throw new Error(`bootstrap failed: HTTP ${bootRes.status}`);
+  const { jwt, peerId } = (await bootRes.json()) as { jwt: string; peerId: string };
+
+  // 1. Get a single-use challenge nonce.
+  const chRes = await fetch(`${gwUrl}/webchannel/nats/register/challenge`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${jwt}` },
+  });
+  if (!chRes.ok) throw new Error(`challenge failed: HTTP ${chRes.status}`);
+  const { nonce } = (await chRes.json()) as { nonce: string };
+  const signature = await signPop(pop.privateKey, peerId, nonce);
+  const body = JSON.stringify({ nonce, signature });
+  const hdr = { Authorization: `Bearer ${jwt}`, "Content-Type": "application/json" };
+
+  // 2. Register once with the valid proof — should succeed (burns the nonce).
+  const r1 = await fetch(`${gwUrl}/webchannel/nats/register`, { method: "POST", headers: hdr, body });
+  console.log(`[chaos] first register (valid proof) → HTTP ${r1.status}`);
+  // 3. Replay the SAME nonce+signature — the burned nonce must be rejected.
+  const r2 = await fetch(`${gwUrl}/webchannel/nats/register`, { method: "POST", headers: hdr, body });
+  console.log(`[chaos] replayed register (same nonce+sig) → HTTP ${r2.status}`);
+
+  if (r1.ok && r2.status === 401) {
+    console.log("[chaos] ✓ replay defeated: the nonce is single-use (burned on first use).");
+    return 0;
+  }
+  console.error(`[chaos] ✗ expected first=2xx + replay=401, got ${r1.status}/${r2.status}`);
+  return 3;
+}
+
 const cmd = process.argv[2];
 let exit = 1;
 try {
   if (cmd === "cross-tenant") exit = await crossTenant();
   else if (cmd === "tamper") exit = await tamper();
-  else if (cmd === "replay-jwt") {
-    console.error("[chaos] replay-jwt is not implemented in chaos-nats.ts yet (register-challenge flow).");
-    exit = 3;
-  } else {
+  else if (cmd === "replay-jwt") exit = await replayJwt();
+  else {
     console.error(`[chaos] unknown command: ${cmd}`);
     exit = 1;
   }
