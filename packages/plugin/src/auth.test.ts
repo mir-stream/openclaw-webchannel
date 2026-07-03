@@ -205,6 +205,28 @@ describe("jwt strategy (AC2 — happy path)", () => {
   });
 });
 
+describe("fail-closed when the signing kid is unknown/evicted", () => {
+  beforeAll(async () => {
+    await ensureRsaKeys();
+  });
+
+  it("returns null (not throws) so the register route yields a clean 401, not a 500", async () => {
+    // A JWKS that has been rotated away from the token's kid: the resolver throws
+    // on the kid miss (fail-closed). verifyJwtAndExtractIdentity must translate
+    // that throw into a null verdict — an unknown/evicted kid is an auth failure
+    // (401), not a server fault (500). Mirrors JWKS key eviction in the demo.
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signRs256({ iss: ISSUER, aud: AUDIENCE, sub: "user-evicted", iat: now, exp: now + 60 });
+    const rotatedAwayJwks: JsonWebKeySet = { keys: [{ ...rsaJwks.keys[0]!, kid: "some-other-kid" }] };
+    const authConfig: AuthConfig = {
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rotatedAwayJwks },
+    };
+
+    await expect(verifyJwtAndExtractIdentity(token, authConfig)).resolves.toBeNull();
+  });
+});
+
 describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", () => {
   beforeAll(async () => {
     await ensureRsaKeys();

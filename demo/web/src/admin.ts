@@ -29,6 +29,36 @@ const STATUS_COLOR: Record<Enroll["status"], string> = {
 export function createAdminPanel(bodyEl: HTMLElement, _config: DemoConfig): () => void {
   bodyEl.replaceChildren();
 
+  // ── Signing-key rotation (SaaS-as-authority; Phase 5 aside) ───────────────
+  const signingSection = el("div", { style: "margin-bottom:18px" });
+  const kidLine = el("div", { style: "font-size:11px;color:var(--muted);margin-bottom:6px;word-break:break-all" });
+  const rotateBtn = el("button", { class: "primary", style: "font-size:11px;padding:3px 10px" }, ["Rotate key"]) as HTMLButtonElement;
+  const evictBtn = el("button", { style: "font-size:11px;padding:3px 10px;margin-left:6px;border-color:var(--bad)" }, ["Rotate + evict old"]) as HTMLButtonElement;
+  signingSection.append(
+    el("div", { style: "font-size:11px;text-transform:uppercase;color:var(--muted);margin-bottom:8px" }, ["Signing key (JWKS)"]),
+    kidLine,
+    el("div", {}, [rotateBtn, evictBtn]),
+  );
+
+  async function refreshSigningKey(): Promise<void> {
+    const { ok, data } = await api<{ activeKid: string; jwksKids: string[] }>("/admin/signing-key");
+    if (!ok || !data?.activeKid) return;
+    const short = (k: string) => k.slice(0, 8);
+    kidLine.replaceChildren(
+      el("span", {}, [`active kid `]),
+      el("code", { style: "color:var(--good)" }, [short(data.activeKid)]),
+      el("span", {}, [`  ·  JWKS: ${data.jwksKids.map(short).join(", ")}`]),
+    );
+  }
+  const rotate = (evictPrevious: boolean) => async () => {
+    rotateBtn.disabled = evictBtn.disabled = true;
+    await api("/admin/rotate-key", { method: "POST", body: { evictPrevious } });
+    await refreshSigningKey();
+    rotateBtn.disabled = evictBtn.disabled = false;
+  };
+  rotateBtn.onclick = rotate(false);
+  evictBtn.onclick = rotate(true);
+
   const enrollSection = el("div", { style: "margin-bottom:18px" });
   const enrollList = el("div", { style: "display:flex;flex-direction:column;gap:8px" });
   enrollSection.append(
@@ -43,7 +73,7 @@ export function createAdminPanel(bodyEl: HTMLElement, _config: DemoConfig): () =
     usersList,
   );
 
-  bodyEl.append(enrollSection, usersSection);
+  bodyEl.append(signingSection, enrollSection, usersSection);
 
   async function refreshEnrollments(): Promise<void> {
     const { ok, data } = await api<Enroll[]>("/admin/enrollments");
@@ -126,6 +156,7 @@ export function createAdminPanel(bodyEl: HTMLElement, _config: DemoConfig): () =
     );
   }
 
+  refreshSigningKey();
   refreshEnrollments();
   refreshUsers();
   const enrollTimer = setInterval(refreshEnrollments, 2000);

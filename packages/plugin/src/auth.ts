@@ -399,13 +399,23 @@ export async function verifyJwtAndExtractIdentity(
   // defeated the TTL and re-fetched the IdP on every pairing.
   const jwksCache = jwksCacheFor(jwtCfg);
 
-  // Verify JWT
-  const identity = await verifyJwt(jwt, {
-    jwks: jwksCache,
-    issuer: jwtCfg.jwt.issuer,
-    audience: jwtCfg.jwt.audience,
-    clockSkewSec: jwtCfg.jwt.clockSkew,
-  });
+  // Verify JWT. A verification-time throw (e.g. the JWKS resolver failing closed
+  // on an unknown/evicted `kid`, or an IdP fetch error) is a fail-to-authenticate
+  // condition, NOT a server fault: treat it exactly like a `null` verdict so the
+  // caller returns a clean 401 instead of letting the throw escape to a 500. The
+  // config guards above still throw (a deploy error, correctly surfaced).
+  let identity: Awaited<ReturnType<typeof verifyJwt>>;
+  try {
+    identity = await verifyJwt(jwt, {
+      jwks: jwksCache,
+      issuer: jwtCfg.jwt.issuer,
+      audience: jwtCfg.jwt.audience,
+      clockSkewSec: jwtCfg.jwt.clockSkew,
+    });
+  } catch (err) {
+    logger?.error?.(`webchannel: JWT verification error (fail-closed): ${String(err)}`);
+    return null;
+  }
 
   if (!identity) {
     logger?.error?.("webchannel: JWT verification failed");
