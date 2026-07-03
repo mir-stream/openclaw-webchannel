@@ -444,15 +444,19 @@ const server = createServer(async (req, res) => {
       if (!user) return sendJson(res, { error: "not authenticated" }, 401);
       parseJsonBody(req, (body) => {
         if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
-        const { role } = body as { role?: NatsUserRole };
+        const { role, ttlSeconds } = body as { role?: NatsUserRole; ttlSeconds?: number };
+        // Optional short lifetime (scene ⑤): a bounded, positive TTL yields an
+        // expiring credential; anything else mints a normal non-expiring one.
+        const ttl = typeof ttlSeconds === "number" && ttlSeconds > 0 && ttlSeconds <= 3600 ? ttlSeconds : undefined;
         mintNatsUserCreds({
           accountSeed: privateChain.natsAccountSeed,
           tenant: DEMO_TENANT,
           role: role === "agent" ? "agent" : "browser",
           issuerAccountId: natsIssuerAccountId,
+          ttlSeconds: ttl,
         })
           .then((creds) => {
-            console.log(`[nats-user] minted ${role ?? "browser"} creds for ${user.username}`);
+            console.log(`[nats-user] minted ${role ?? "browser"} creds for ${user.username}${ttl ? ` (ttl=${ttl}s)` : ""}`);
             sendJson(res, { ...creds, natsUrl: NATS_URL });
           })
           .catch((err) => {

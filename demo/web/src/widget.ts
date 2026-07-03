@@ -9,6 +9,12 @@
  * with BOTH natsCredentials (NATS-layer NKEY auth) and registration (HTTP PoP
  * register hop). The Ed25519 PoP private key is non-extractable and never leaves
  * the page.
+ *
+ * Scene ⑤ (short-lived trust): the "short-lived" control reconnects the lane with
+ * a short-TTL NATS credential. When it lapses the relay refuses it, the client
+ * classifies `-ERR Authentication Expired` as TERMINAL (no eternal spinner), and
+ * the widget shows a distinct "credentials expired" state with a one-click
+ * re-authenticate that mints a fresh, normal credential.
  */
 import { WebChannelNATSClient } from "../../../packages/client/src/index.js";
 import type { WebChannelState, ApprovalRequest } from "../../../packages/client/src/types.js";
@@ -20,6 +26,9 @@ const STATUS_LABEL: Record<WebChannelState["status"], string> = {
   reconnecting: "reconnecting…",
   error: "error",
 };
+
+// The demo's short-lived-credential TTL (seconds) for the scene ⑤ control.
+const SHORT_TTL_SECONDS = 12;
 
 /**
  * Mount a chat lane for `accountId` into `bodyEl`. Returns a teardown fn that
@@ -38,10 +47,12 @@ export async function createWidget(
   // ── UI scaffold ─────────────────────────────────────────────────────────
   const statusPill = el("span", { class: "status-pill", style: "font-size:11px;color:var(--muted)" });
   const historyBtn = el("button", { style: "font-size:11px;padding:3px 8px" }, ["Load older"]);
+  const shortBtn = el("button", { style: "font-size:11px;padding:3px 8px" }, ["⏱ short-lived"]) as HTMLButtonElement;
   const topBar = el("div", { style: "display:flex;align-items:center;gap:8px;margin-bottom:8px" }, [
     el("strong", { style: "font-size:12px" }, [accountId]),
     statusPill,
     el("span", { style: "flex:1" }),
+    shortBtn,
     historyBtn,
   ]);
   const list = el("div", { style: "display:flex;flex-direction:column;gap:8px;min-height:120px" });
@@ -57,63 +68,18 @@ export async function createWidget(
   const composer = el("div", { style: "display:flex;gap:8px;margin-top:10px" }, [input, sendBtn]);
   bodyEl.append(topBar, errBox, list, approvalsBox, composer);
 
-  // ── Device keys (in-page; PoP private key non-extractable) ───────────────
-  const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
-    "deriveBits",
-  ])) as CryptoKeyPair;
-  const deviceX25519PublicKey = b64url(await crypto.subtle.exportKey("raw", x25519.publicKey));
-  const ed25519 = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, [
-    "sign",
-    "verify",
-  ])) as CryptoKeyPair;
-  const edPubJwk = (await crypto.subtle.exportKey("jwk", ed25519.publicKey)) as { x?: string };
-  if (!edPubJwk.x) throw new Error("Ed25519 public JWK missing 'x'");
-  const devicePopPublicKey = edPubJwk.x;
-
-  // ── SaaS-gated creds + bootstrap JWT (session cookie carried) ────────────
-  const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
-    "/nats-user",
-    { method: "POST", body: { role: "browser" } },
-  );
-  if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
-    throw new Error(`nats-user failed (HTTP ${creds.status})`);
-  }
-  const boot = await api<{
-    jwt?: string;
-    peerId?: string;
-    natsUrl?: string;
-    registerBaseUrl?: string;
-  }>("/bootstrap", {
-    method: "POST",
-    body: { accountId, deviceX25519PublicKey, devicePopPublicKey },
-  });
-  if (!boot.ok || !boot.data.jwt || !boot.data.peerId) {
-    throw new Error(`bootstrap failed (HTTP ${boot.status}) ${JSON.stringify(boot.data)}`);
-  }
-
-  const natsUrl = boot.data.natsUrl ?? creds.data.natsUrl ?? rv.natsUrl;
-  const registerBaseUrl = boot.data.registerBaseUrl ?? rv.registerBaseUrl;
-
-  const client = new WebChannelNATSClient({
-    natsUrl,
-    bootstrapJwt: boot.data.jwt,
-    accountId,
-    tenant: config.tenant,
-    peerId: boot.data.peerId,
-    natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
-    registration: { registerBaseUrl, devicePrivateKey: ed25519.privateKey },
-  });
+  let client: WebChannelNATSClient | null = null;
 
   // ── Render ───────────────────────────────────────────────────────────────
   function renderApproval(a: ApprovalRequest): HTMLElement {
     const resolved = a.resolvedDecision !== undefined;
     const buttons = a.options.map((opt) => {
-      const b = el("button", {}, [opt.label]) as HTMLButtonElement;
-      if (opt.style === "danger") b.style.borderColor = "var(--bad)";
-      if (opt.style === "success" || opt.style === "primary") b.className = "primary";
-      b.disabled = resolved;
-      b.onclick = () => client.decide(a.id, opt.decision);
-      return b;
+      const bt = el("button", {}, [opt.label]) as HTMLButtonElement;
+      if (opt.style === "danger") bt.style.borderColor = "var(--bad)";
+      if (opt.style === "success" || opt.style === "primary") bt.className = "primary";
+      bt.disabled = resolved;
+      bt.onclick = () => client?.decide(a.id, opt.decision);
+      return bt;
     });
     return el(
       "div",
@@ -138,13 +104,17 @@ export async function createWidget(
       : state.status === "error" ? "var(--bad)"
       : "var(--warn)";
 
-    // Terminal error → distinct box (scene ⑤ honest terminal-error UX).
+    // Terminal error → distinct "credentials expired" box with a re-auth button
+    // (scene ⑤ honest terminal-error UX — NOT the reconnect spinner).
     if (state.status === "error") {
-      errBox.classList.remove("hidden");
+      const reauth = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
+      reauth.onclick = () => { void connectLane(); };
       errBox.replaceChildren(
-        el("div", { style: "font-weight:600;margin-bottom:4px" }, ["Connection failed"]),
-        el("div", {}, [state.error ?? "credentials rejected — re-authenticate"]),
+        el("div", { style: "font-weight:600;margin-bottom:4px" }, ["Credentials expired"]),
+        el("div", {}, [state.error ?? "the relay rejected the credential — re-authenticate to continue"]),
+        reauth,
       );
+      errBox.classList.remove("hidden");
       input.disabled = true;
       sendBtn.disabled = true;
     } else {
@@ -174,21 +144,71 @@ export async function createWidget(
       );
     }
     list.replaceChildren(...bubbles);
-
     approvalsBox.replaceChildren(...state.approvals.map(renderApproval));
   }
 
-  client.subscribe(render);
-  render(client.getState());
+  /**
+   * (Re)connect the lane. With `ttlSeconds` the NATS credential is short-lived
+   * (scene ⑤); without it, a normal non-expiring credential (the re-auth path).
+   * Device keys are regenerated per connect; the prior client is disconnected.
+   */
+  async function connectLane(ttlSeconds?: number): Promise<void> {
+    client?.close();
+    client = null;
+    statusPill.textContent = "● connecting…";
+    statusPill.style.color = "var(--warn)";
+    errBox.classList.add("hidden");
 
+    // Device keys (PoP private key non-extractable).
+    const x25519 = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+    const deviceX25519PublicKey = b64url(await crypto.subtle.exportKey("raw", x25519.publicKey));
+    const ed25519 = (await crypto.subtle.generateKey({ name: "Ed25519" }, false, ["sign", "verify"])) as CryptoKeyPair;
+    const edPubJwk = (await crypto.subtle.exportKey("jwk", ed25519.publicKey)) as { x?: string };
+    if (!edPubJwk.x) throw new Error("Ed25519 public JWK missing 'x'");
+    const devicePopPublicKey = edPubJwk.x;
+
+    const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
+      "/nats-user",
+      { method: "POST", body: ttlSeconds ? { role: "browser", ttlSeconds } : { role: "browser" } },
+    );
+    if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
+      throw new Error(`nats-user failed (HTTP ${creds.status})`);
+    }
+    const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string; registerBaseUrl?: string }>(
+      "/bootstrap",
+      { method: "POST", body: { accountId, deviceX25519PublicKey, devicePopPublicKey } },
+    );
+    if (!boot.ok || !boot.data.jwt || !boot.data.peerId) {
+      throw new Error(`bootstrap failed (HTTP ${boot.status}) ${JSON.stringify(boot.data)}`);
+    }
+
+    const natsUrl = boot.data.natsUrl ?? creds.data.natsUrl ?? rv.natsUrl;
+    const registerBaseUrl = boot.data.registerBaseUrl ?? rv.registerBaseUrl;
+
+    client = new WebChannelNATSClient({
+      natsUrl,
+      bootstrapJwt: boot.data.jwt,
+      accountId,
+      tenant: config.tenant,
+      peerId: boot.data.peerId,
+      natsCredentials: { userJwt: creds.data.userJwt, userSeedRaw: creds.data.userSeedRaw },
+      registration: { registerBaseUrl, devicePrivateKey: ed25519.privateKey },
+    });
+    client.subscribe(render);
+    render(client.getState());
+    client.connect();
+  }
+
+  // ── Wiring ────────────────────────────────────────────────────────────────
   historyBtn.onclick = () => {
-    const oldest = client.getState().messages.find((m) => !m.working);
-    client.loadHistory({ before: oldest?.id, limit: 20 });
+    const oldest = client?.getState().messages.find((m) => !m.working);
+    client?.loadHistory({ before: oldest?.id, limit: 20 });
   };
+  shortBtn.onclick = () => { void connectLane(SHORT_TTL_SECONDS); };
   const submit = () => {
     const text = input.value.trim();
     if (!text) return;
-    client.send(text);
+    client?.send(text);
     input.value = "";
   };
   sendBtn.onclick = submit;
@@ -196,10 +216,10 @@ export async function createWidget(
     if ((e as KeyboardEvent).key === "Enter") submit();
   };
 
-  client.connect();
+  await connectLane();
 
   return () => {
-    client.close();
+    client?.close();
     bodyEl.replaceChildren();
   };
 }
