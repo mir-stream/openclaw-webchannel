@@ -34,6 +34,11 @@ try {
   await page.waitForSelector("#app:not(.hidden)", { timeout: 15000 });
   console.log("[verify] logged in, app visible");
 
+  // Give the chat + wiretap lanes a moment to subscribe before sending. On a
+  // real relay (DEMO_RELAY=synadia) the observer's SUB can otherwise miss the
+  // first frame; on the local relay this is a negligible settle.
+  await page.waitForTimeout(2000);
+
   // Send a message, await the echo reply bubble.
   await page.fill("#chat-body input", TEXT);
   await page.click("#chat-body button.primary");
@@ -50,9 +55,30 @@ try {
   );
   console.log("[verify] ✓ echo reply received");
 
-  // Wiretap should show at least one ciphertext frame (hex).
-  const wiretapText = await page.textContent("#wiretap-body");
-  const sawHex = /[0-9a-f]{2} [0-9a-f]{2} [0-9a-f]{2}/.test(wiretapText ?? "");
+  // Wiretap should show at least one ciphertext frame (hex). Poll rather than
+  // read once: on a real relay (synadia) the observer's frame can render a beat
+  // after the echo, and a second message keeps traffic flowing while we wait.
+  let sawHex = false;
+  try {
+    await page.waitForFunction(
+      () => /[0-9a-f]{2} [0-9a-f]{2} [0-9a-f]{2}/.test(document.querySelector("#wiretap-body")?.textContent ?? ""),
+      undefined,
+      { timeout: 12000, polling: 500 },
+    );
+    sawHex = true;
+  } catch {
+    // one more nudge — send again so the wiretap has fresh traffic to capture
+    await page.fill("#chat-body input", "wiretap nudge");
+    await page.click("#chat-body button.primary");
+    try {
+      await page.waitForFunction(
+        () => /[0-9a-f]{2} [0-9a-f]{2} [0-9a-f]{2}/.test(document.querySelector("#wiretap-body")?.textContent ?? ""),
+        undefined,
+        { timeout: 12000, polling: 500 },
+      );
+      sawHex = true;
+    } catch { /* leave false */ }
+  }
   console.log(sawHex ? "[verify] ✓ wiretap shows ciphertext frames" : "[verify] ✗ wiretap had no hex frames");
 
   await page.screenshot({ path: "/tmp/demo-phase1.png", fullPage: true });

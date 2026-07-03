@@ -111,23 +111,46 @@ function rendezvousMap(): Record<string, { natsUrl: string; registerBaseUrl: str
 // TRUST_CHAIN_PATH is set so a restart keeps every enrolled agent's creds valid.
 // ---------------------------------------------------------------------------
 
+// Relay mode. `local` (default) = demo-owned self-contained account + nats-server.
+// `synadia` = an externally-managed account (Synadia Cloud / NGS): the SaaS still
+// owns the RSA/JWKS bootstrap-signing chain but mints NATS user creds signed by an
+// operator-supplied account SIGNING seed, so browser + agent connect to the real
+// managed relay (NATS_URL points at its wss). The signing seed is a SECRET — it is
+// never persisted to the trust-chain file (see loadOrCreateTrustChain external mode).
+const DEMO_RELAY = (process.env.DEMO_RELAY ?? "local").toLowerCase();
+const externalNatsAccount =
+  DEMO_RELAY === "synadia"
+    ? (() => {
+        const signingSeed = process.env.NATS_ACCOUNT_SIGNING_SEED;
+        const accountId = process.env.NATS_ACCOUNT_ID;
+        if (!signingSeed || !accountId) {
+          throw new Error(
+            "DEMO_RELAY=synadia requires NATS_ACCOUNT_SIGNING_SEED + NATS_ACCOUNT_ID (see synadia.env)",
+          );
+        }
+        return { signingSeed, accountId };
+      })()
+    : undefined;
+
 const trustChainOptions = {
   operatorName: "demo-operator",
   accountName: "demo-account",
+  ...(externalNatsAccount ? { externalNatsAccount } : {}),
 };
-const trustChain = TRUST_CHAIN_PATH
-  ? await loadOrCreateTrustChain(TRUST_CHAIN_PATH, trustChainOptions)
-  : await loadOrCreateTrustChain(join(tmpdir(), `demo-trust-${process.pid}.json`), trustChainOptions);
+// Separate persisted file per relay mode so a self-contained chain is never
+// reused as an external one (they share the RSA key but differ in NATS account).
+const trustChainPath =
+  TRUST_CHAIN_PATH ?? join(tmpdir(), `demo-trust-${DEMO_RELAY}-${process.pid}.json`);
+const trustChain = await loadOrCreateTrustChain(trustChainPath, trustChainOptions);
 const privateChain = trustChain.private;
-// Self-contained trust chain (demo owns the relay). The account seed IS the
-// account identity, so there is no external issuer_account. Synadia/external
-// mode is a later option (see DEMO_PLAN "Relay: Synadia optional").
 const natsConfig = trustChain.natsConfig;
-const natsIssuerAccountId: string | undefined = undefined;
+// self-contained → no external issuer_account; synadia → the managed account id.
+const natsIssuerAccountId: string | undefined = externalNatsAccount?.accountId;
 
 // Publish the public NATS config (operator JWT + memory resolver) so run.sh can
 // assemble a JWT-auth nats-server that trusts the SAME account this SaaS mints for.
-if (NATS_CONFIG_OUT) {
+// Only meaningful for a self-contained account — a managed relay runs its own server.
+if (NATS_CONFIG_OUT && natsConfig.mode !== "external") {
   mkdirSync(NATS_CONFIG_OUT, { recursive: true });
   writeFileSync(join(NATS_CONFIG_OUT, "operator.jwt"), natsConfig.operatorJwt);
   writeFileSync(
@@ -136,6 +159,7 @@ if (NATS_CONFIG_OUT) {
   );
   console.log(`[demo-saas] wrote operator.jwt + resolver.json → ${NATS_CONFIG_OUT}`);
 }
+console.log(`[demo-saas] relay mode: ${DEMO_RELAY}${externalNatsAccount ? ` (account ${externalNatsAccount.accountId.slice(0, 8)}…)` : ""} → ${NATS_URL}`);
 
 // ---------------------------------------------------------------------------
 // RS256 bootstrap-JWT signing — reuses THIS SaaS's trust chain RSA key.

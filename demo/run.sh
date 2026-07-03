@@ -49,6 +49,26 @@ UUID_ADMIN="99999999-9999-4999-8999-999999999999"
 ZAI_BASE_URL="${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4}"
 ZAI_MODEL="${ZAI_MODEL:-glm-4.6}"
 
+# Relay mode. `local` (default): a demo-owned self-contained nats-server. `synadia`:
+# a real externally-managed account (Synadia Cloud / NGS) — the SaaS mints user
+# creds signed by the operator's account signing seed, so browser + agents connect
+# to the managed relay. Secrets come from synadia.env (never committed). Scene ③
+# chaos (kill/tamper the relay) is disabled in synadia mode — we don't own it — but
+# the wiretap pane is MORE persuasive over a real third-party relay (ciphertext only).
+DEMO_RELAY="${DEMO_RELAY:-local}"
+if [ "$DEMO_RELAY" = synadia ]; then
+  SYNADIA_ENV="${SYNADIA_ENV:-$HOME/.openclaw-webchannel-saas/synadia.env}"
+  [ -f "$SYNADIA_ENV" ] || { echo "[demo] DEMO_RELAY=synadia but $SYNADIA_ENV not found"; exit 1; }
+  set -a; . "$SYNADIA_ENV"; set +a
+  [ -n "${NATS_ACCOUNT_SIGNING_SEED:-}" ] && [ -n "${NATS_ACCOUNT_ID:-}" ] && [ -n "${NATS_URL:-}" ] \
+    || { echo "[demo] synadia.env must export NATS_ACCOUNT_SIGNING_SEED, NATS_ACCOUNT_ID, NATS_URL"; exit 1; }
+  RELAY_NATS_URL="$NATS_URL"
+  echo "[demo] relay: SYNADIA (managed) → $RELAY_NATS_URL"
+else
+  RELAY_NATS_URL="ws://127.0.0.1:$NATS_WS"
+  echo "[demo] relay: local (self-contained nats-server)"
+fi
+
 SAAS_PID=""; NATS_PID=""; ECHO_PID=""
 GW_PIDS=()
 
@@ -103,9 +123,10 @@ DEMO_ACCOUNTS="${DEMO_ACCOUNTS%,}}"
 PORT="$SAAS_PORT" \
 SAAS_BASE_URL="$SAAS_URL" \
 SAAS_ISSUER="$SAAS_ISSUER" \
-NATS_URL="ws://127.0.0.1:$NATS_WS" \
+DEMO_RELAY="$DEMO_RELAY" \
+NATS_URL="$RELAY_NATS_URL" \
 NATS_CONFIG_OUT="$OCH" \
-TRUST_CHAIN_PATH="$OCH/trust-chain.json" \
+TRUST_CHAIN_PATH="$OCH/trust-chain-$DEMO_RELAY.json" \
 DEMO_TENANT="$TENANT" \
 DEMO_ACCOUNTS="$DEMO_ACCOUNTS" \
 DEMO_LLM_MODE="$LLM_MODE" \
@@ -113,20 +134,29 @@ DEMO_APP_HTML="$REPO/demo/web/index.html" \
 DEMO_CLIENT_ENTRY="$REPO/demo/web/src/app.ts" \
   node --import tsx "$REPO/demo/saas-server.ts" >"$OCH/saas.log" 2>&1 &
 SAAS_PID=$!
-echo "[demo] saas-server pid=$SAAS_PID — waiting for JWKS + NATS config…"
+echo "[demo] saas-server pid=$SAAS_PID — waiting for readiness…"
 for i in $(seq 1 120); do
-  if curl -fsS "$SAAS_URL/.well-known/jwks.json" >/dev/null 2>&1 \
-     && [ -f "$OCH/operator.jwt" ] && [ -f "$OCH/resolver.json" ]; then
-    echo "[demo] saas-server ready"; break
+  ready=0
+  if curl -fsS "$SAAS_URL/.well-known/jwks.json" >/dev/null 2>&1; then
+    if [ "$DEMO_RELAY" = synadia ]; then
+      ready=1   # managed relay: no operator.jwt/resolver.json to wait for
+    elif [ -f "$OCH/operator.jwt" ] && [ -f "$OCH/resolver.json" ]; then
+      ready=1
+    fi
   fi
+  [ "$ready" = 1 ] && { echo "[demo] saas-server ready"; break; }
   kill -0 "$SAAS_PID" 2>/dev/null || { echo "[demo] saas-server died — log:"; cat "$OCH/saas.log"; exit 2; }
   sleep 0.25
   [ "$i" -eq 120 ] && { echo "[demo] TIMEOUT waiting for saas-server — log:"; cat "$OCH/saas.log"; exit 2; }
 done
 
 # ---------------------------------------------------------------------------
-# 2. JWT-auth nats-server, assembled from the SaaS trust chain.
+# 2. Relay. local: a JWT-auth nats-server assembled from the SaaS trust chain.
+#    synadia: the managed relay is already running — nothing to boot here.
 # ---------------------------------------------------------------------------
+if [ "$DEMO_RELAY" = synadia ]; then
+  echo "[demo] relay: using managed Synadia server — skipping local nats-server"
+else
 OCH="$OCH" NATS_TCP="$NATS_TCP" NATS_WS="$NATS_WS" node -e '
   const fs = require("fs");
   const dir = process.env.OCH;
@@ -151,6 +181,7 @@ for i in $(seq 1 120); do
   sleep 0.25
   [ "$i" -eq 120 ] && { echo "[demo] TIMEOUT waiting for nats-server — log:"; cat "$OCH/nats.log"; exit 2; }
 done
+fi
 
 # ---------------------------------------------------------------------------
 # 3. LLM: echo fake OpenAI-completions server (echo mode only).
@@ -256,7 +287,7 @@ JSON
   ' "$home/.openclaw/openclaw.json" "$acct"
 
   HOME="$home" OPENCLAW_HOME="$home" OPENCLAW_DISABLE_BONJOUR=1 \
-    WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
+    WEBCHANNEL_NATS_URL="$RELAY_NATS_URL" \
     WEBCHANNEL_GW_URL="http://127.0.0.1:$port" \
     "$REPO/node_modules/.bin/openclaw" gateway --port "$port" --force >"$home/gateway.log" 2>&1 &
   local gw_pid=$!

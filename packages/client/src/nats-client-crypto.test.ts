@@ -190,6 +190,35 @@ function startClient(): { client: WebChannelNatsClient; server: FakeNatsWS; rece
 // ---------------------------------------------------------------------------
 
 describe("WebChannelNatsClient (E2E encrypted)", () => {
+  it("republishes the handshake until the agent answers (no-retention relay race)", async () => {
+    const { client, server, received } = startClient();
+    // Simulate a real relay where the FIRST handshake frame is lost (the agent's
+    // per-peer SUB was not yet server-active): drop the first, answer the second.
+    const agent = makeAgentSim(TENANT, AGENT, PEER);
+    const hsSubj = handshakeSubject(TENANT, AGENT, PEER);
+    let hsSeen = 0;
+    server.handler = async (subject, payload, srv) => {
+      if (subject === hsSubj) {
+        hsSeen += 1;
+        if (hsSeen === 1) return; // first handshake dropped
+      }
+      return agent(subject, payload, srv);
+    };
+
+    await settle();
+    client.sendUserMessage("hi"); // buffered until the handshake completes
+    // No session yet — the first handshake was dropped and nothing reached .in.
+    expect(server.published.filter((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toEqual([]);
+
+    // Let the retry fire (~500ms) — the second handshake gets through.
+    await new Promise((r) => setTimeout(r, 650));
+    await settle();
+
+    expect(hsSeen).toBeGreaterThanOrEqual(2);
+    expect(received).toContainEqual({ type: "agent_message", text: "echo: hi" });
+    client.disconnect();
+  });
+
   it("handshakes, seals to .in, and decrypts the agent reply from .out", async () => {
     const { client, server, received } = startClient();
     await settle();

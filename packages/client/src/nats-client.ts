@@ -31,6 +31,14 @@ import {
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
 import { registerWithPop } from "./pop-register.js";
 
+// Handshake retry (core NATS has no retention — the one-shot key_exchange can be
+// dropped if the agent's per-peer SUB is not yet server-active when we publish,
+// which a real, higher-latency relay makes possible). Republish a few times until
+// the agent answers. ~2.6s total worst case (500ms × 5) — well under any human
+// perception of "did it connect?", and it stops instantly once the key arrives.
+const HANDSHAKE_RETRY_MS = 500;
+const HANDSHAKE_MAX_RETRIES = 5;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -674,6 +682,16 @@ export class WebChannelNatsClient {
   private outSub = -1;
   private handshakeSub = -1;
   /**
+   * Handshake retry timer. The initial `key_exchange` is a one-shot publish, but
+   * core NATS has NO retention: if the agent's per-peer subscription is not yet
+   * active on the server when we publish (a real, higher-latency relay makes the
+   * SUB→handshake ordering non-deterministic even though we register first), the
+   * frame is dropped and — with no retry — the session would wedge forever. So we
+   * republish on a bounded schedule until the agent answers (sessionKey is set) or
+   * the attempt cap is hit. Cleared on session establishment, reconnect, or close.
+   */
+  private handshakeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
    * Bumped on every `onConnected()` so a stale async continuation (resumed after
    * the socket dropped and a reconnect spawned a fresh flow) can detect it is no
    * longer current and bail instead of overwriting `keyPair` / publishing a
@@ -749,6 +767,7 @@ export class WebChannelNatsClient {
   // ---------------------------------------------------------------------------
 
   private resetSession(): void {
+    this.clearHandshakeRetry();
     this.sessionKey = null;
     this.keyPair = null;
   }
@@ -816,10 +835,35 @@ export class WebChannelNatsClient {
     // or publish a stale handshake.
     if (this.connectionEpoch !== epoch) return;
     this.keyPair = keyPair;
+    this.publishHandshakeWithRetry(epoch, 0);
+  }
+
+  /**
+   * Publish the `key_exchange` handshake frame and, if the agent has not answered
+   * (no session key) within a short window, republish — up to `HANDSHAKE_MAX_RETRIES`
+   * times. Guarded by the connection epoch so a stale flow never republishes onto a
+   * newer connection. Stops as soon as `handleRaw` establishes the session key.
+   */
+  private publishHandshakeWithRetry(epoch: number, attempt: number): void {
+    if (this.connectionEpoch !== epoch || this.sessionKey || !this.keyPair) return;
+    const { tenant, accountId, peerId } = this.options;
     this.client.publish(
       handshakeSubject(tenant, accountId, peerId),
       keyExchangeFrame(this.keyPair.publicKeyB64url),
     );
+    if (attempt >= HANDSHAKE_MAX_RETRIES) return;
+    if (this.handshakeRetryTimer) clearTimeout(this.handshakeRetryTimer);
+    this.handshakeRetryTimer = setTimeout(() => {
+      this.handshakeRetryTimer = null;
+      this.publishHandshakeWithRetry(epoch, attempt + 1);
+    }, HANDSHAKE_RETRY_MS);
+  }
+
+  private clearHandshakeRetry(): void {
+    if (this.handshakeRetryTimer) {
+      clearTimeout(this.handshakeRetryTimer);
+      this.handshakeRetryTimer = null;
+    }
   }
 
   private async handleRaw(subject: string, payload: string): Promise<void> {
@@ -830,6 +874,7 @@ export class WebChannelNatsClient {
       const agentPubKey = parseKeyExchange(payload);
       if (!agentPubKey) return;
       this.sessionKey = await deriveConversationKey(this.keyPair.privateKey, agentPubKey);
+      this.clearHandshakeRetry();
       this.flushQueue();
       return;
     }
