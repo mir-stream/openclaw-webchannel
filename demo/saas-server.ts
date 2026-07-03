@@ -76,6 +76,8 @@ const DEMO_CLIENT_ENTRY = process.env.DEMO_CLIENT_ENTRY || join(__dirname, "web"
 // shared (one demo-owned nats-server) so it is merged in at response time from
 // NATS_URL. Phase 1 seeds a single account; run.sh grows this for the fleet.
 type RendezvousEntry = { registerBaseUrl: string };
+// Mutable: the fleet can grow at runtime (scene ② — add-agent.sh registers a new
+// account's rendezvous via POST /admin/accounts so an open widget can reach it).
 const DEMO_ACCOUNTS: Record<string, RendezvousEntry> = (() => {
   const raw = process.env.DEMO_ACCOUNTS;
   if (!raw) return { "agent-dev": { registerBaseUrl: "http://127.0.0.1:19299" } };
@@ -86,7 +88,13 @@ const DEMO_ACCOUNTS: Record<string, RendezvousEntry> = (() => {
     return { "agent-dev": { registerBaseUrl: "http://127.0.0.1:19299" } };
   }
 })();
-const ACCOUNT_IDS = Object.keys(DEMO_ACCOUNTS);
+// Snapshot of the accounts present at boot — used only to seed alice/bob/admin.
+// Runtime-added accounts (scene ②) are NOT auto-granted; an admin grants them.
+const SEED_ACCOUNT_IDS = Object.keys(DEMO_ACCOUNTS);
+/** All account ids known right now (boot + runtime-added). */
+function accountIds(): string[] {
+  return Object.keys(DEMO_ACCOUNTS);
+}
 // The full rendezvous map handed to the browser (relay URL merged in per entry).
 function rendezvousMap(): Record<string, { natsUrl: string; registerBaseUrl: string }> {
   const out: Record<string, { natsUrl: string; registerBaseUrl: string }> = {};
@@ -230,12 +238,12 @@ function enrollmentSnapshot(): DemoEnroll[] {
 const ADMIN_USERNAME = "admin";
 const ADMIN_USERS = new Set<string>([ADMIN_USERNAME]);
 const seededUsers: DemoUser[] = [
-  ...seedDemoUsers(ACCOUNT_IDS[0] ?? "agent-dev"),
+  ...seedDemoUsers(SEED_ACCOUNT_IDS[0] ?? "agent-dev"),
   {
     username: ADMIN_USERNAME,
     uuid: "99999999-9999-4999-8999-999999999999",
     passwordSha256: sha256hex("demo"),
-    allowedAccounts: [...ACCOUNT_IDS],
+    allowedAccounts: [...SEED_ACCOUNT_IDS],
   },
 ];
 const userDir = new DemoUserDirectory(seededUsers);
@@ -600,9 +608,31 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      // POST /admin/accounts — register a runtime-added account's rendezvous
+      // (scene ②: add-agent.sh calls this after a new agent is approved, so an
+      // open widget can dial the new gateway). In-memory, admin-gated.
+      if (req.method === "POST" && path === "/admin/accounts") {
+        parseJsonBody(req, (body) => {
+          if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
+          const { accountId, registerBaseUrl } = body as { accountId?: string; registerBaseUrl?: string };
+          if (!accountId || !registerBaseUrl) {
+            return sendJson(res, { error: "Missing accountId or registerBaseUrl" }, 400);
+          }
+          try {
+            assertValidSubjectToken(accountId, "accountId");
+          } catch (err) {
+            return sendJson(res, { error: (err as Error).message }, 400);
+          }
+          DEMO_ACCOUNTS[accountId] = { registerBaseUrl };
+          console.log(`[admin] registered account "${accountId}" → ${registerBaseUrl}`);
+          sendJson(res, { ok: true, accountId, accounts: accountIds() });
+        });
+        return;
+      }
+
       // GET /admin/users — non-secret directory (username + allowedAccounts)
       if (req.method === "GET" && path === "/admin/users") {
-        return sendJson(res, { accounts: ACCOUNT_IDS, users: userDir.list() });
+        return sendJson(res, { accounts: accountIds(), users: userDir.list() });
       }
       // POST /admin/users/:username/accounts — grant/revoke (replace the set)
       const grantMatch = path.match(/^\/admin\/users\/([^/]+)\/accounts$/);
@@ -643,7 +673,7 @@ server.listen(PORT, () => {
   console.log(`  Issuer:     ${SAAS_ISSUER}`);
   console.log(`  Relay:      ${NATS_URL}`);
   console.log(`  Tenant:     ${DEMO_TENANT}`);
-  console.log(`  Accounts:   ${ACCOUNT_IDS.join(", ")}`);
+  console.log(`  Accounts:   ${accountIds().join(", ")}`);
   console.log(`  LLM mode:   ${DEMO_LLM_MODE}`);
   console.log(`  NATS mode:  ${natsConfig.mode}`);
   console.log("");

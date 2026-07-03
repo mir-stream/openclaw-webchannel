@@ -160,6 +160,16 @@ for i in $(seq 1 240); do
   [ "$i" -eq 240 ] && { echo "[add-agent] gateway TIMEOUT:"; tail -20 "$HOME_DIR/gateway.log"; exit 2; }
 done
 
+# Register this new account's rendezvous with the SaaS so an open widget can dial
+# it (scene ②: "selectable in the already-open widget"). Needs an admin session.
+curl -fsS -c "$OCH/addagent.jar" -X POST "$SAAS_URL/login" \
+  -H 'Content-Type: application/json' -d '{"username":"admin","password":"demo"}' >/dev/null
+curl -fsS -b "$OCH/addagent.jar" -X POST "$SAAS_URL/admin/accounts" \
+  -H 'Content-Type: application/json' \
+  -d "{\"accountId\":\"$ACCOUNT\",\"registerBaseUrl\":\"http://127.0.0.1:$PORT\"}" >/dev/null \
+  && echo "[add-agent] ✓ $ACCOUNT rendezvous registered with SaaS (now grantable/selectable)" \
+  || echo "[add-agent] ⚠ failed to register rendezvous with SaaS"
+
 echo ""
 echo "  ✓ agent-docs added. It appears in the admin panel; grant it to a user to"
 echo "    make its tab show up in their open widget. Ctrl+C to remove it."

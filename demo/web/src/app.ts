@@ -150,6 +150,9 @@ async function mountForSession(me: Me): Promise<void> {
     appEl.classList.add("no-admin");
   }
 
+  // /me carries the live rendezvous (incl. runtime-added accounts, scene ②);
+  // merge it into the static page config so widget/wiretap can dial new gateways.
+  Object.assign(config.accounts, me.accounts);
   grantedAccounts = Object.keys(me.accounts);
   renderTabs();
   if (grantedAccounts.length > 0) {
@@ -171,7 +174,10 @@ async function mountForSession(me: Me): Promise<void> {
   // Poll /me for live grant/revoke (scene ①).
   mePollTimer = window.setInterval(async () => {
     const res = await api<Me>("/me");
-    if (res.ok && res.data.accounts) await reconcileGrants(Object.keys(res.data.accounts));
+    if (res.ok && res.data.accounts) {
+      Object.assign(config.accounts, res.data.accounts); // pick up runtime-added rendezvous
+      await reconcileGrants(Object.keys(res.data.accounts));
+    }
   }, 3000);
 }
 
