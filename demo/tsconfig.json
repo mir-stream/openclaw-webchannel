@@ -13,6 +13,6 @@
     "allowImportingTsExtensions": false,
     "verbatimModuleSyntax": true
   },
-  "include": ["saas-server.ts", "web/src/**/*"],
+  "include": ["saas-server.ts", "chaos-nats.ts", "web/src/**/*"],
   "exclude": ["node_modules"]
 }
