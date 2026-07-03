@@ -74,6 +74,14 @@ draft → answer, `/help`, exec-approval cards, status pill incl. terminal error
   both tabs are the SAME openclaw process (process-level tenancy). Driver:
   `node demo/verify-multiplex.mjs`.
 
+- **Real managed relay (Synadia).** `DEMO_RELAY=synadia ./demo/run.sh` runs the
+  entire demo over Synadia Cloud / NGS instead of the local nats-server — the SaaS
+  mints creds signed by your account signing seed and browser + agents connect to
+  `wss://connect.ngs.global`. The wiretap over a real third-party relay is the most
+  persuasive proof of ciphertext-only. Needs `synadia.env` (account signing seed +
+  id + wss URL) outside the repo; see `SYNADIA_ENV`. Scene ③ chaos is disabled (we
+  don't own the relay).
+
 ## Honest-demo notes (short)
 
 - **No active-MITM claim (C2):** scene ③ proves confidentiality vs a *passive*

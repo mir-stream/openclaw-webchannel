@@ -266,9 +266,19 @@ narrative:
   Process-level tenancy, distinct from scene ②'s per-machine story. No product
   change — pure orchestration. Driver `demo/verify-multiplex.mjs` (verified live:
   one-gateway-two-accounts=OK, both users chat).
-- **BYO-NATS static creds** (`openclaw.plugin.json:216-249`): point an agent at
-  Synadia/NGS with operator-supplied creds and NO SaaS issuer — the other end of
-  the `DEMO_RELAY=synadia` spectrum.
+- **Real managed relay — BUILT (`DEMO_RELAY=synadia`, `9db3a42`).** The whole demo
+  runs over Synadia Cloud / NGS instead of the demo-owned nats-server: the SaaS
+  still owns the RSA/JWKS bootstrap chain but mints NATS user creds signed by an
+  operator's account signing seed (external mode), so browser + agents connect to
+  `wss://connect.ngs.global`. The wiretap over a real third-party relay is the star
+  — ciphertext only. Secrets live in `synadia.env` (outside the repo, never
+  committed). Verified live: reply/wiretap/history all OK. **Surfaced + fixed a
+  latent product race:** the one-shot X25519 handshake could be dropped on a real
+  (higher-latency) relay because core NATS has no retention and the agent's per-peer
+  SUB may not be server-active when the browser publishes; the client now
+  republishes the handshake (500ms × 5) until answered. Local sub-ms latency always
+  hid it. `openclaw.plugin.json:216-249` BYO-NATS (fully SaaS-issuer-less static
+  creds) is the further end of this spectrum, not yet built.
 - **Agent-initiated outbound** (`index-nats.ts:732-744`, primary account): an
   agent-side event pushes an unsolicited message into the open widget over the
   E2E relay. Needs a verified core outbound trigger (e.g. `messages send`) — flag
