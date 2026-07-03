@@ -52,6 +52,14 @@ export type MintNatsUserCredsOptions = {
    *   `issuer_account`).
    */
   issuerAccountId?: string;
+  /**
+   * Optional lifetime (seconds) → the user JWT's `exp` claim. Omit for a
+   * non-expiring credential (the original behavior, byte-for-byte). When set, the
+   * relay refuses the credential once it lapses; the client classifies the
+   * resulting `-ERR Authentication Expired` as TERMINAL and surfaces a re-auth
+   * prompt (short-lived-credential UX).
+   */
+  ttlSeconds?: number;
 };
 
 export type MintedNatsUserCreds = {
@@ -106,15 +114,24 @@ export async function mintNatsUserCreds(
   // `iss` = signer public and `nats.issuer_account` = the `issuer` arg's public
   // (the account identity). The identity key only needs to be PUBLIC (`A…`).
   // Self-contained mode: no signer → `iss` = account public, no issuer_account.
+  // Optional expiry → the JWT `exp` claim (unix seconds). Undefined ttl keeps the
+  // original non-expiring behavior.
+  const exp = opts.ttlSeconds ? Math.floor(Date.now() / 1000) + opts.ttlSeconds : undefined;
   const userJwt = opts.issuerAccountId
     ? await encodeUser(
         `${role}-${opts.tenant}`,
         userKp,
         fromPublic(opts.issuerAccountId),
         perms,
-        { signer: signingKp },
+        exp ? { signer: signingKp, exp } : { signer: signingKp },
       )
-    : await encodeUser(`${role}-${opts.tenant}`, userKp, signingKp, perms);
+    : await encodeUser(
+        `${role}-${opts.tenant}`,
+        userKp,
+        signingKp,
+        perms,
+        exp ? { exp } : undefined,
+      );
 
   return { userJwt, userSeed, userSeedRaw, permissions: { pub, sub } };
 }
