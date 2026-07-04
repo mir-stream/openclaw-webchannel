@@ -116,6 +116,24 @@ agent-initiated outbound is built. Until the approvals leg lands, the interim po
 approvals on a multi-account gateway deliver via the primary channel only (misroute/drop for
 non-primary turns).
 
+**Telegram benchmark (2026-07-04, analysis only — deferred):** Telegram has no equivalent
+ambiguity: (1) its addressing is account-scoped by construction (a chatId belongs to one
+bot/account; the same human on two bots = two chatIds/sessions — no shared cross-account
+identity, unlike webchannel's `webchannel.{tenant}.*.{peerId}.>` where one peerId spans N
+accounts); (2) it has NO broadcast — `sendTextToAnyOpen`/`soleOpenSocket` exist only in the
+webchannel plugin; telegram always dials a recorded chatId; (3) a proactive/cron (system-event)
+send resolves BOTH `to` AND `accountId` from the session's persisted delivery context
+(`effective-reply-route.ts`: `accountId: ctx.AccountId ?? deliveryContext.accountId ?? entry.lastAccountId`).
+**Portable finding:** S1 already laid the data — core persists `lastAccountId`/`deliveryContext.accountId`
+per turn from `ctx.AccountId`, which the S1 inbound stamp now populates for webchannel, and webchannel
+already forces `per-account-channel-peer` session keys (account encoded in the key). So the leg splits:
+(a) SESSION-BOUND proactive/cron sends (incl. F3's cron approval) → adopt telegram's model, resolve
+accountId from the session's delivery context → send on that ONE account's channel (small scope,
+closes F3); (b) TRULY untargeted `sendTextToAnyOpen` → telegram has no such operation, so the
+defensible default is to retire/constrain blind broadcast in multi-account (require an account /
+startup-guard the ambiguous combo, never primary-only fanout). The "peerId spans N accounts → which
+one?" question is webchannel-unique and stays a product decision.
+
 ## ✅ N2 — register reply-to redirect guard tightened to own-reginbox-only (DONE)
 
 **Origin:** PR #6 review (2026-07-04). Closed same day, stricter than originally scoped: the
