@@ -391,6 +391,14 @@ export class JWKSCache implements KeyResolver {
    * `fetchTimeoutMsOverride` lets a specific caller widen/narrow the per-request
    * timeout without changing the instance default — used by the startup warm to
    * give a cold IdP a longer budget than the latency-sensitive live-verify path.
+   *
+   * CAVEAT (inflight sharing vs override): a joiner inherits the STARTER's
+   * timeout — its own override is ignored. So a live verify that lands while the
+   * 10s startup warm's fetch is in flight can wait up to 10s, past the browser's
+   * 5s register window. Accepted: the window is boot-only (warm runs before
+   * traffic), the client times out + retries, and by then the warm has resolved
+   * (cache hit) or failed (next fetch uses the tight instance default). Racing a
+   * second, shorter fetch instead would defeat the dedup this exists for.
    */
   private async loadFresh(fetchTimeoutMsOverride?: number): Promise<JsonWebKeySet> {
     if (this.inflightRefetch) return this.inflightRefetch;
