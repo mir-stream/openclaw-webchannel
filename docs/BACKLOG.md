@@ -66,17 +66,36 @@ account A's content (encrypted with the peer's conversation key, so it decrypts 
 That is cross-account content disclosure to the *right user* but the *wrong deployment/tenant
 boundary*, and an approval prompt surfacing in the wrong UI context invites a mis-scoped approval.
 
-**Why deferred:** requires threading an `accountId` through the core→transport outbound seam (the
-core's outbound adapters are account-blind today), i.e. an interface change in the plugin core, not
-a plugin-local patch. Single-account deployments (the common case today) are unaffected.
+**Why deferred (REVISED 2026-07-04):** the original assessment ("requires a core seam change") was
+WRONG for the approval leg. The openclaw SDK approval pipeline is already fully account-aware —
+the approval request carries `turnSourceAccountId` (`plugin-approvals.d.ts`), and the SAME factory
+we use (`createApproverRestrictedNativeApprovalCapability`) passes `{cfg, accountId}` to every hook
+(`listAccountIds`, `hasApprovers`, `isNativeDeliveryEnabled`, `resolveOriginTarget`,
+`deliverPending`). The bundled Telegram channel is the reference implementation: it enumerates real
+accounts via `listAccountIds`, reads per-account `execApprovals`, and `deliverPending` resolves
+`accountId → that account's client` at send time. Our plugin simply doesn't consume the seam —
+"account-agnostic Phase 1" (`approvals.ts`): `listAccountIds: () => ["default"]`, hooks ignore the
+`accountId` param, and delivery is closure-bound to the single primary-channel facade. The fix is
+**plugin-local**; no openclaw core change needed for approvals.
 
-**Scope of the fix:**
-- [ ] make the outbound facade accountId-aware: either per-account transport instances handed to
-  the core, or an explicit `accountId` on the outbound adapter calls (core seam change)
-- [ ] route approvals per-account (the approval capability must carry the originating account)
-- [ ] decide semantics for genuinely untargeted broadcast (all accounts? primary? explicit config?)
-- [ ] regression test: two accounts, shared peerId → account-B session never receives account-A
-  proactive/approval traffic
+**Scope of the fix (approvals leg — Telegram pattern):**
+- [ ] `inbound.ts` `buildContext`: pass `accountId` (top-level `BuildChannelInboundEventContextParams.accountId`
+  and/or `route.accountId` — both fields exist in core, we currently pass neither), so the core
+  stamps `turnSourceAccountId` on webchannel turns; verify the stamp end-to-end
+- [ ] `approvals.ts` `listAccountIds`: return the real configured account ids (not `["default"]`)
+- [ ] make the capability hooks account-aware: per-account `execApprovals` config reads
+  (`readExecApprovals` is channel-global today — needs `accounts.<id>.execApprovals` support)
+- [ ] `deliverPending`/`updateEntry`: resolve `accountId → accountRuntimes.get(accountId).channel`
+  instead of the closure facade (needs an account→channel registry visible to the capability)
+- [ ] regression test: two accounts, shared peerId → account-B turn's approval prompt delivers on
+  account B's channel only
+
+**Proactive/untargeted outbound leg (separate, still open):** core-initiated untargeted sends
+(`sendTextToAnyOpen` etc.) may still be account-blind at a different seam — decide semantics
+(all accounts? per-account targeting? startup guard on the unsupported combination?) when
+agent-initiated outbound is built. Until the approvals leg lands, the interim posture stands:
+approvals on a multi-account gateway deliver via the primary channel only (misroute/drop for
+non-primary turns).
 
 ## N2 — tighten the register reply-to redirect guard to `reginbox`-only
 
