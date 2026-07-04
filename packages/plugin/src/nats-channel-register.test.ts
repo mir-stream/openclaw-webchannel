@@ -123,6 +123,15 @@ describe("NatsChannel register-hop wiring", () => {
       .toHaveLength(0);
   });
 
+  it("drops an own-reginbox reply-to whose token is not a single valid subject token", () => {
+    // Wildcards / extra segments / whitespace after `reginbox.` start with the
+    // prefix but would make the agent publish a malformed or wildcard subject.
+    const base = `webchannel.${TENANT}.${ACCOUNT}.${PEER}.reginbox.`;
+    for (const token of [">", "*", "tok.extra", "tok.extra.out", ".", "has space", "tok\t"]) {
+      expect(deliverChallenge(`${base}${token}`).published).toHaveLength(0);
+    }
+  });
+
   it("drops a reginbox reply-to under a DIFFERENT peerId, including a prefix-peerId", () => {
     // `user-4` is a strict prefix of `user-42` — the trailing dot in the
     // allowlist prefix must keep these distinct.

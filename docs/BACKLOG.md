@@ -112,6 +112,21 @@ reginbox, non-empty token) instead of the planned "confine in-namespace, pass th
   token, foreign-peer/prefix-peerId reginbox)
 - [x] consumer sweep (precondition): all drivers reginbox-only, nothing broken
 - [x] verified live: `run-enrolled-transport.sh` full register hop + encrypted round-trip PASS
+- [x] adversarial review (3 lenses + a second reviewer): core property unbreakable, no availability
+  regression; both flagged the SAME residual → token after `reginbox.` was prefix+non-empty checked
+  but not validated as a single subject token, so `…reginbox.>` / dotted / whitespace tokens made
+  the agent publish a wildcard/malformed subject (harmless to other peers — stays in the requester's
+  own subtree — but emits an invalid-publish `-ERR` the transport only logs). Fixed: guard now
+  `isValidSubjectToken(token)` (`subject-token.ts` new non-throwing predicate); +1 test case set.
+
+**Residual (defense-in-depth, NOT this change):** the guard derives its allowlist prefix from
+`peerId = parts[3]` (subject-routing segment) and its soundness leans on the browser-cred scoping
+(`webchannel.{tenant}.*.{peerId}.>`, enforced in `packages/saas/src/nats-user-creds.ts`, test-pinned
+against a real nats-server). Pre-JWT error replies (`nats-register.ts` bad-JSON/op paths) fire before
+the `subjectPeerId === verifiedPeerId` check, so they rely entirely on that cred pin to stay in the
+requester's own subtree. A BYO-NATS operator who loosens creds to tenant-wide would reopen a
+low-impact cross-peer error-string leak. Optional hardening: hoist the subject==verified-peerId check
+ahead of every reply so the guard is self-sufficient. Bundle with the NATS-cred-scoping follow-up.
 
 ## Remove the legacy Gateway-WS transport (`hmac-ticket` strategy: DONE)
 

@@ -30,6 +30,7 @@ import {
   sealEnvelope,
   openEnvelope,
 } from "./e2e-session.js";
+import { isValidSubjectToken } from "./subject-token.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -630,6 +631,13 @@ export class NatsChannel {
    * browser's NATS creds are scoped `webchannel.{tenant}.*.{peerId}.>`, pinning
    * the peerId segment it can publish a `.register` on to its OWN peerId — so
    * the reply can only reach that requester's own reginbox.
+   *
+   * The token AFTER `reginbox.` must itself be a single valid subject token (no
+   * `.`/`*`/`>`/whitespace). A crafted reply-to like `…reginbox.>` would start
+   * with the prefix yet make the agent PUBLISH a wildcard/malformed subject —
+   * harmless to other peers (it stays in the requester's own subtree) but it
+   * emits an invalid-publish `-ERR` the transport only logs, so we reject it
+   * here. A real client's token is always dotless (`randomInboxToken`).
    */
   private handleRegister(msg: NatsMessage, peerId: string): void {
     if (!this.onRegisterRequest) return;
@@ -637,8 +645,12 @@ export class NatsChannel {
     const ownReginboxPrefix = `webchannel.${this.tenant}.${this.accountId}.${peerId}.reginbox.`;
     const reply = (response: string): void => {
       if (!replyTo) return; // fire-and-forget (e.g. unregister)
-      // Allowlist: own reginbox with a non-empty token, nothing else.
-      if (!replyTo.startsWith(ownReginboxPrefix) || replyTo.length === ownReginboxPrefix.length) {
+      // Allowlist: own reginbox prefix + a single valid subject token (the token
+      // check also rejects the empty token, so `…reginbox.` alone is dropped).
+      if (
+        !replyTo.startsWith(ownReginboxPrefix) ||
+        !isValidSubjectToken(replyTo.slice(ownReginboxPrefix.length))
+      ) {
         console.warn(
           `[nats-channel] Dropping register reply for ${peerId}: reply-to "${replyTo}" ` +
             `is not the requester's own reginbox (expected "${ownReginboxPrefix}{token}")`,
