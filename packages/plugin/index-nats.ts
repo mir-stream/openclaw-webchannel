@@ -27,7 +27,7 @@ import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
 import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier, verifyJwtAndExtractIdentity, preflightResolveJwks, type ConnectionVerifier } from "./src/auth.js";
 import type { AuthConfig, JwtAuthConfig } from "./src/auth.js";
-import { formatAccountReadiness, type JwksReadiness } from "./src/preflight.js";
+import { formatAccountReadiness, deriveJwksUrl, deriveIssuer, type JwksReadiness } from "./src/preflight.js";
 import { PopChallengeStore } from "./src/pop-challenge.js";
 import { handleRegisterRequest } from "./src/nats-register.js";
 import { resolveAdmissionMode, admissionServingPlan } from "./src/nats-admission.js";
@@ -112,26 +112,6 @@ const runDetachedHistoryRead = <T>(fn: () => Promise<T>): Promise<T> =>
   historyReadScope.runInAsyncScope(fn);
 
 /**
- * Proof-of-Possession nonce store (gap ①). Single-use, short-TTL nonces bound
- * to a peerId; the register route verifies an Ed25519 signature over the nonce
- * against the bootstrap JWT's `pop_jwk`.
- *
- * NOTE (multi-account): this store is PROCESS-WIDE, not per-account. It is keyed
- * by peerId (the verified JWT `sub`) and only proves possession of the device
- * key for that nonce — it is NOT an account-authorization decision. The full
- * per-account verify (issuer + aud + signature via the resolved account's
- * verifier) still gates every register, so a shared nonce store is not
- * exploitable across accounts; a cross-account peerId collision could at most
- * let a peer consume a nonce it also legitimately holds the device key for.
- */
-const popChallenges = new PopChallengeStore();
-
-/** Join a base URL and a path, collapsing any duplicated slash at the seam. */
-function joinUrl(baseUrl: string, path: string): string {
-  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
-}
-
-/**
  * Trust-anchor derivation (design §4 change 1): fill the ABSENT JWT-verify params
  * from `{saas.baseUrl, accountId}` — CONFIG-PRESENT-WINS. These are trust FACTS,
  * not settings, and cannot legitimately mismatch:
@@ -173,9 +153,13 @@ function deriveAccountAuth(
     ...raw,
     jwt: {
       ...jwt,
-      issuer: jwt.issuer ?? saasBaseUrl,
+      // Derive issuer via the shared canonical helper (trailing-slash stripped),
+      // matching the jwksUrl derivation — otherwise an operator's trailing-slash
+      // --base-url would pin a non-canonical issuer that mismatches the SaaS's
+      // minted `iss` and rejects every bootstrap JWT (silent issuer-mismatch).
+      issuer: jwt.issuer ?? deriveIssuer(saasBaseUrl),
       audience: jwt.audience ?? accountId,
-      ...(hasKeySource ? {} : { jwksUrl: joinUrl(saasBaseUrl, ".well-known/jwks.json") }),
+      ...(hasKeySource ? {} : { jwksUrl: deriveJwksUrl(saasBaseUrl) }),
     },
   } as AuthConfig;
 }
@@ -315,6 +299,20 @@ export default defineChannelPluginEntry({
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
       const accountDmSecurity = account.dmSecurity as string | undefined;
 
+      // Obsolete-config tidy: the register hop moved from HTTP to NATS, so the
+      // old `auth.cors` browser-origin allowlist no longer applies and is silently
+      // ignored. Warn (once per account, at startup) so an operator carrying a
+      // stale block isn't misled into thinking origin restriction is still active.
+      const rawAuth = account.auth as Record<string, unknown> | undefined;
+      if (rawAuth && typeof rawAuth === "object" && "cors" in rawAuth) {
+        (api.logger?.warn ?? console.warn)?.(
+          `[webchannel] account "${accountId}": auth.cors is OBSOLETE and IGNORED — the ` +
+            `register hop moved from HTTP to NATS, so browser-origin allowlisting no longer ` +
+            `applies. Remove the auth.cors block. Access control is the SaaS-minted per-peer ` +
+            `NATS credential scope.`,
+        );
+      }
+
       // ---- Step 0 (per account): fail-closed encryption guard --------------
       // The NATS relay must only ever observe ciphertext. If an account disables
       // encryption, we SKIP that account (it is never served, never connects,
@@ -425,7 +423,12 @@ export default defineChannelPluginEntry({
         const issuer = jwtBlock?.issuer;
         const audience = jwtBlock?.audience;
         if (issuer && audience) {
-          const key = `${issuer} ${audience}`;
+          // Normalize the issuer the SAME way verifyJwt compares it (trailing
+          // slash collapsed) — otherwise a config-pinned "https://x/" and a
+          // derived "https://x" would key as DISTINCT here yet CROSS-VERIFY at
+          // runtime, so this guard would miss exactly the collision it exists to
+          // name (a bootstrap JWT for one account admitting on the other's subject).
+          const key = `${deriveIssuer(issuer)} ${audience}`;
           const firstAccount = registerHopAudClaims.get(key);
           if (firstAccount && firstAccount !== accountId) {
             (api.logger?.warn ?? console.warn)?.(
@@ -574,6 +577,13 @@ export default defineChannelPluginEntry({
       // its own `.register` wildcard (the NATS analogue of the old HTTP route).
       // An `auto` account does neither — it admits via the wildcard + handshake.
       if (servingPlan.subscribeRegister) {
+        // PER-ACCOUNT PoP nonce store (NOT process-wide). Scoping the store to
+        // this account means its per-peer cap evicts only THIS account's own
+        // peers' nonces — so an attacker flooding `challenge` in account A can
+        // never evict a victim's in-flight nonce in account B, even if their IdPs
+        // mint a colliding `sub`/peerId. (A process-wide store keyed by bare
+        // peerId would re-open that cross-account eviction across a sub collision.)
+        const accountPopChallenges = new PopChallengeStore();
         channel.setRegisterRequestHandler((subjectPeerId, payload, reply) => {
           // The handler is internally guarded (it replies REGISTER_FAILED on any
           // throw), but attach a `.catch` here too as defense-in-depth: a future
@@ -584,7 +594,7 @@ export default defineChannelPluginEntry({
             payload,
             reply,
             verifyIdentity: (jwt, a) => verifyJwtAndExtractIdentity(jwt, a, api.logger),
-            popChallenges,
+            popChallenges: accountPopChallenges,
             registerPeer: (pid) => channel.registerPeer(pid),
             wrapConversationKeyForDevice: (pid, key) =>
               channel.wrapConversationKeyForDevice(pid, key),

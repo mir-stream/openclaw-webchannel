@@ -5,7 +5,10 @@
  * nats-register.ts): `subscribeRegister` subscribes the `.register` wildcard, a
  * request on `…{peerId}.register` is routed to the handler with the subject
  * peerId + raw payload, and the handler's reply is published to the request's
- * NATS reply-to inbox (never a peerId subject).
+ * NATS reply-to inbox — which must lie within the requester's OWN peer subtree
+ * (`webchannel.{tenant}.{accountId}.{peerId}.…`, e.g. the production
+ * `…{peerId}.reginbox.{token}`); a reply-to aimed at another peer's webchannel
+ * subtree is dropped (redirect guard).
  */
 
 import { EventEmitter } from "node:events";
@@ -74,6 +77,36 @@ describe("NatsChannel register-hop wiring", () => {
       payload: JSON.stringify({ nonce: "n1" }),
     });
     expect(transport.published.some((p) => p.subject.includes(PEER))).toBe(false);
+  });
+
+  it("drops a reply-to that targets ANOTHER peer's webchannel subtree (redirect guard)", () => {
+    const { channel, transport } = makeChannel();
+    channel.setRegisterRequestHandler((_peerId, _payload, reply) => {
+      reply(JSON.stringify({ nonce: "n1" }));
+    });
+    channel.subscribeRegister();
+
+    // Attacker publishes on their OWN register subject but sets reply-to to a
+    // victim's `.out` — the agent must refuse to publish there.
+    const victimOut = `webchannel.${TENANT}.${ACCOUNT}.victim-99.out`;
+    transport.deliver(regSubj, JSON.stringify({ op: "challenge", token: "jwt" }), victimOut);
+    expect(transport.published.some((p) => p.subject === victimOut)).toBe(false);
+    expect(transport.published).toHaveLength(0);
+  });
+
+  it("allows an in-namespace reginbox reply-to within the requester's own subtree", () => {
+    const { channel, transport } = makeChannel();
+    channel.setRegisterRequestHandler((_peerId, _payload, reply) => {
+      reply(JSON.stringify({ nonce: "n1" }));
+    });
+    channel.subscribeRegister();
+
+    const ownInbox = `webchannel.${TENANT}.${ACCOUNT}.${PEER}.reginbox.tok123`;
+    transport.deliver(regSubj, JSON.stringify({ op: "challenge", token: "jwt" }), ownInbox);
+    expect(transport.published).toContainEqual({
+      subject: ownInbox,
+      payload: JSON.stringify({ nonce: "n1" }),
+    });
   });
 
   it("a request with no reply-to gets a no-op reply (fire-and-forget, no publish, no throw)", () => {

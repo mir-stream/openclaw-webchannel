@@ -172,6 +172,24 @@ function makeAnonymousVerifier(logger?: AuthLogger): ConnectionVerifier {
  */
 const jwksCacheByAuthConfig = new WeakMap<JwtAuthConfig, JWKSCache>();
 
+/**
+ * JWKS-fetch timeout for the account's shared cache. Kept UNDER the browser's
+ * hard 5s register-request timeout (nats-client `request({timeoutMs:5000})`) so
+ * that on a cold/expired cache + slow IdP the agent can VERIFY (or fail with a
+ * retryable 503) and reply INSIDE the client's window, instead of blocking past
+ * 5s and publishing to a reginbox the browser has already abandoned. The Gate B
+ * startup warm uses this same cache; 4s is still generous for a healthy IdP.
+ */
+const LIVE_JWKS_FETCH_TIMEOUT_MS = 4000;
+
+/**
+ * Longer JWKS-fetch budget for the browserless Gate B STARTUP warm (no client is
+ * waiting), so a healthy-but-cold IdP (serverless cold start, 5–8s) doesn't get a
+ * spurious `JWKS FETCH FAILED` readiness line at boot. Applied per-call via
+ * `warm(override)`, so it does NOT loosen the 4s hot-path (live-verify) bound.
+ */
+const STARTUP_WARM_JWKS_TIMEOUT_MS = 10_000;
+
 function jwksCacheFor(config: JwtAuthConfig): JWKSCache {
   let cache = jwksCacheByAuthConfig.get(config);
   if (cache === undefined) {
@@ -188,9 +206,10 @@ function jwksCacheFor(config: JwtAuthConfig): JWKSCache {
       // `_fetchImpl` is a test-only escape hatch: when set, the JWKSCache uses
       // the injected function instead of `globalThis.fetch`. This lets unit
       // tests simulate a JWKS server response without opening a real socket.
-      config.jwt._fetchImpl !== undefined
-        ? { fetchImpl: config.jwt._fetchImpl }
-        : undefined,
+      {
+        fetchTimeoutMs: LIVE_JWKS_FETCH_TIMEOUT_MS,
+        ...(config.jwt._fetchImpl !== undefined ? { fetchImpl: config.jwt._fetchImpl } : {}),
+      },
     );
     jwksCacheByAuthConfig.set(config, cache);
   }
@@ -215,7 +234,9 @@ export async function preflightResolveJwks(
   config: JwtAuthConfig,
 ): Promise<{ keyCount: number }> {
   const cache = jwksCacheFor(config);
-  const doc = await cache.warm();
+  // Startup warm gets the generous budget (no browser is waiting); the same
+  // cache's live-verify path keeps the tight 4s default set at construction.
+  const doc = await cache.warm(STARTUP_WARM_JWKS_TIMEOUT_MS);
   return { keyCount: doc.keys.length };
 }
 
