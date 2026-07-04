@@ -44,6 +44,71 @@ packages/client/README.md).
 agent-impersonation direction open while implying MITM is handled (false sense of security). It is
 acceptable only as an intermediate commit toward the full mutual fix.
 
+## S1 — accountId-aware outbound facade (proactive/approval outbound is primary-account-only) — **cross-account disclosure risk**
+
+**Origin:** PR #5 (multiplex / 가-2 rename) adversarial review, 2026-07-01. Deferred, previously
+untracked (this entry is the first written record outside the session notes).
+
+**Current behavior** (`packages/plugin/index-nats.ts`, "lazy transport facade"): the plugin core
+is created once at module load against a single `lazyTransport` Proxy; after `registerFull` builds
+one `NatsChannel` per account, the Proxy is bound to **one PRIMARY channel** (`"default"`, else the
+first built account). Everything the core initiates **without a per-message account context** rides
+that one channel: untargeted/proactive outbound (`sendTextToAnyOpen`), typing/progress fan-out, and
+the **approval capability** (`sendApprovalRequest`/`Resolved`). Inbound is NOT affected — replies
+route per-account via each channel's own dispatcher.
+
+**Failure scenario:** one gateway serves accounts A (primary) and B; the same `peerId` is
+registered on both (same user granted both deployments — normal under the multiplex model, one
+peerId spans a user's granted accounts). A **proactive** message or an **approval prompt**
+originating from account A's agent context is emitted through the primary facade, which cannot
+disambiguate by account — a browser session attached to account B for that peerId can receive
+account A's content (encrypted with the peer's conversation key, so it decrypts fine and renders).
+That is cross-account content disclosure to the *right user* but the *wrong deployment/tenant
+boundary*, and an approval prompt surfacing in the wrong UI context invites a mis-scoped approval.
+
+**Why deferred:** requires threading an `accountId` through the core→transport outbound seam (the
+core's outbound adapters are account-blind today), i.e. an interface change in the plugin core, not
+a plugin-local patch. Single-account deployments (the common case today) are unaffected.
+
+**Scope of the fix:**
+- [ ] make the outbound facade accountId-aware: either per-account transport instances handed to
+  the core, or an explicit `accountId` on the outbound adapter calls (core seam change)
+- [ ] route approvals per-account (the approval capability must carry the originating account)
+- [ ] decide semantics for genuinely untargeted broadcast (all accounts? primary? explicit config?)
+- [ ] regression test: two accounts, shared peerId → account-B session never receives account-A
+  proactive/approval traffic
+
+## N2 — tighten the register reply-to redirect guard to `reginbox`-only
+
+**Origin:** PR #6 review (2026-07-04). Non-blocking hardening; safe today, but the safety argument
+rests on NATS credential scoping rather than on the guard itself.
+
+**Current behavior** (`packages/plugin/src/nats-channel.ts` `handleRegister`): a register
+request's reply-to that lands inside the webchannel namespace is confined to the requester's OWN
+peer subtree (`webchannel.{tenant}.{accountId}.{peerId}.`); anything outside is dropped, and
+non-webchannel subjects (`_INBOX.*`, used by test/e2e drivers) pass through. This blocks the real
+attack (redirecting the plaintext register reply onto another peer's encrypted `.out`), **but**
+still allows a peer to point the reply at its own `.in` / `.handshake` / `.register`, bouncing the
+reply through the agent's own handlers.
+
+**Why it's harmless today (verified):** no privilege gain — the peer can already publish to its own
+subtree directly with its own creds; a `.register` bounce terminates in one hop (the redelivered
+message carries no reply-to); `.in`/`.handshake` bounces fail decrypt/parse and are dropped. The
+residual value of tightening is defense-in-depth: today's argument depends on browser creds being
+scoped `webchannel.{tenant}.*.{peerId}.>` and agent creds being webchannel-scoped — if either scope
+is ever loosened, the guard is the only line left.
+
+**Do when:** touching NATS credential scoping (the tenant-wide→per-peer follow-up, live-gateway
+admission migration) or next time the register path is edited.
+
+**Scope of the fix:**
+- [ ] in-namespace reply-to must contain a `reginbox` segment (one-line guard condition change);
+  the production client already uses `…{peerId}.reginbox.{token}` exclusively
+- [ ] update the "allows an in-namespace reginbox reply-to" test's sibling (own-subtree non-reginbox
+  → now dropped)
+- [ ] sweep e2e/demo drivers first: `_INBOX.*` users are unaffected, but verify none use an
+  in-namespace non-reginbox reply-to
+
 ## Remove the legacy Gateway-WS transport (`hmac-ticket` strategy: DONE)
 
 **Rationale.** The NATS E2E path (`index-nats.ts`) is now the production default and is
