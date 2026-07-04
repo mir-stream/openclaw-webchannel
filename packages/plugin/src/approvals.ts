@@ -32,8 +32,9 @@ import { createLazyChannelApprovalNativeRuntimeAdapter } from "openclaw/plugin-s
 // (ApproverRestrictedNativeApprovalParams) and :108 (factory).
 import { createApproverRestrictedNativeApprovalCapability } from "openclaw/plugin-sdk/approval-delivery-runtime";
 // Account/channel match gate used by shouldHandleWebChannelApprovalRequest.
-// Verified: dist/plugin-sdk/approval-request-account-binding-C7tzAA5p.d.ts:19-24
-// (accountId optional, so the account-agnostic Phase 1 path omits it).
+// Verified: dist/plugin-sdk/approval-request-account-binding-DUl0SBjl.d.ts:19-24
+// (S1: we now pass the handler's accountId so it is compared against the
+// request's turnSourceAccountId — stamped by src/inbound.ts buildContext).
 import { doesApprovalRequestMatchChannelAccount } from "openclaw/plugin-sdk/approval-native-runtime";
 // Idiomatic helper that decides whether a channel-native exec approval route
 // replaces (suppresses) the local in-band `/approve …` text prompt. Verified:
@@ -76,7 +77,73 @@ import type {
   ApprovalOption,
   ApprovalRequestPayload,
 } from "./transport.js";
-import { DEFAULT_ACCOUNT_ID } from "./channel.js";
+import {
+  DEFAULT_ACCOUNT_ID,
+  listWebchannelAccountIds,
+  resolveWebchannelAccountConfig,
+} from "./account-config.js";
+
+/**
+ * Resolve the transport a given account's approval frames should ride. `null`/
+ * `undefined` accountId means "unscoped" (legacy single-account callers); a
+ * resolver may map that to the default account. Returning `undefined` makes the
+ * caller fall back to the capability's closure-bound transport (the single-
+ * account / legacy-WS path), so a missing resolver or unknown account degrades
+ * to today's behavior instead of dropping the frame.
+ */
+export type ResolveAccountTransport = (
+  accountId: string | null | undefined,
+) => WebChannelTransport | undefined;
+
+/**
+ * approvalId → account it was DELIVERED on (S1 adversarial-round F1). The
+ * widget-click reverse path (`handleApprovalDecision`) resolves an approval over
+ * the gateway RPC, which does NO per-approval authz — it forwards `{id, decision}`
+ * blind. So an approver on account B could otherwise resolve account A's exec by
+ * replaying A's approvalId onto B's channel (ids are `crypto.randomUUID()`, so
+ * this needs an id leak — a transcript/log — but the per-account boundary S1
+ * claims must hold regardless). We record which account each approval was
+ * delivered on at `deliverPending`, and `handleApprovalDecision` refuses a
+ * decision arriving on a DIFFERENT account than the one that showed the card.
+ *
+ * Normalized to "default" (null/unscoped ⇒ default) so the single-account /
+ * legacy-WS path compares consistently. Entries are removed on resolve/expire
+ * (`updateEntry`, which fires for BOTH phases); the cap is a safety backstop for
+ * an abandoned approval whose finalize never runs — approvals are agent-minted
+ * (a browser can't forge one), so this is not a client-reachable growth vector.
+ */
+const APPROVAL_ACCOUNT_BINDING_CAP = 4096;
+const deliveredApprovalAccounts = new Map<string, string>();
+
+/** Normalize an account id for binding comparison (null/unscoped ⇒ "default"). */
+function bindingAccountKey(accountId: string | null | undefined): string {
+  return accountId ?? DEFAULT_ACCOUNT_ID;
+}
+
+/**
+ * @internal Test seam for the approval→account binding (F1). Production code
+ * populates it only via `deliverPending`; tests that exercise
+ * `handleApprovalDecision` in isolation seed/reset it here so they drive the
+ * SAME map the real delivery path writes.
+ */
+export const __approvalAccountBindingTestHook = {
+  record: (approvalId: string, accountId: string | null | undefined) =>
+    recordApprovalAccount(approvalId, accountId),
+  clear: () => deliveredApprovalAccounts.clear(),
+};
+
+/** Record which account an approval was delivered on (bounded; evicts oldest). */
+function recordApprovalAccount(approvalId: string, accountId: string | null | undefined): void {
+  // Insertion-ordered Map: delete-then-set moves a repeat id to the newest slot
+  // so a re-delivery (stateless register / retry) refreshes rather than dupes.
+  deliveredApprovalAccounts.delete(approvalId);
+  while (deliveredApprovalAccounts.size >= APPROVAL_ACCOUNT_BINDING_CAP) {
+    const oldest = deliveredApprovalAccounts.keys().next().value;
+    if (oldest === undefined) break;
+    deliveredApprovalAccounts.delete(oldest);
+  }
+  deliveredApprovalAccounts.set(approvalId, bindingAccountKey(accountId));
+}
 
 /**
  * Native HITL approval capability for WebChannel.
@@ -130,6 +197,13 @@ import { DEFAULT_ACCOUNT_ID } from "./channel.js";
 type ClawApprovalEntry = {
   approvalId: string;
   sessionKey: string;
+  /**
+   * The account this entry was DELIVERED on (normalized; null = unscoped
+   * legacy). `updateEntry` re-resolves the same account's transport from this
+   * (preferring the live hook context's accountId), so the resolved/expired
+   * finalize frame always lands on the channel that showed the prompt.
+   */
+  accountId: string | null;
 };
 
 /** Final payload carried by `update` actions; the decision drives the widget. */
@@ -151,19 +225,25 @@ type _AssertDecisionInSync = ApprovalDecision extends ApprovalActionView["decisi
 const _assertDecisionInSync: _AssertDecisionInSync = true;
 void _assertDecisionInSync;
 
-/** Read the channel's `execApprovals` block from config (account-agnostic Phase 1). */
+/**
+ * Read an ACCOUNT's effective `execApprovals` block (S1: account-aware).
+ * `resolveWebchannelAccountConfig` merges the channel-level shared base under
+ * the `accounts.<id>` override (execApprovals is one of its NESTED_OBJECT_KEYS,
+ * so per-field account overrides compose with channel-wide defaults). A null/
+ * absent accountId reads the `"default"` account, which for a flat single-
+ * account config is exactly the old channel-level read (regression-free).
+ */
 function readExecApprovals(
   cfg: OpenClawConfig,
+  accountId?: string | null,
 ): {
   enabled?: boolean | "auto";
   approvers?: (string | number)[];
   agentFilter?: string[];
   sessionFilter?: string[];
 } | undefined {
-  const section = (cfg.channels as Record<string, any> | undefined)?.[
-    WEBCHANNEL_ID
-  ];
-  return section?.execApprovals;
+  const account = resolveWebchannelAccountConfig(cfg, accountId ?? DEFAULT_ACCOUNT_ID);
+  return account.execApprovals as ReturnType<typeof readExecApprovals>;
 }
 
 /**
@@ -175,8 +255,8 @@ function readExecApprovals(
  * configured approvers (see isWebChannelExecApprovalClientEnabled via
  * shouldHandleWebChannelApprovalRequest + the capability's surface hooks).
  */
-function isExecApprovalsEnabled(cfg: OpenClawConfig): boolean {
-  const enabled = readExecApprovals(cfg)?.enabled;
+function isExecApprovalsEnabled(cfg: OpenClawConfig, accountId?: string | null): boolean {
+  const enabled = readExecApprovals(cfg, accountId)?.enabled;
   return enabled === true || enabled === "auto";
 }
 
@@ -193,8 +273,9 @@ function isExecApprovalsEnabled(cfg: OpenClawConfig): boolean {
  */
 export function getWebChannelExecApprovalApprovers(params: {
   cfg: OpenClawConfig;
+  accountId?: string | null;
 }): string[] {
-  const explicit = readExecApprovals(params.cfg)?.approvers;
+  const explicit = readExecApprovals(params.cfg, params.accountId)?.approvers;
   const source: readonly (string | number)[] =
     Array.isArray(explicit) && explicit.length > 0
       ? explicit
@@ -211,18 +292,22 @@ export function getWebChannelExecApprovalApprovers(params: {
   });
 }
 
-/** Whether `senderId` is one of the configured webchannel approvers. */
+/** Whether `senderId` is one of the ACCOUNT's configured webchannel approvers. */
 export function isWebChannelExecApprovalApprover(params: {
   cfg: OpenClawConfig;
   senderId?: string | null;
+  accountId?: string | null;
 }): boolean {
   const senderId = params.senderId?.trim();
   if (!senderId) return false;
-  return getWebChannelExecApprovalApprovers({ cfg: params.cfg }).includes(senderId);
+  return getWebChannelExecApprovalApprovers({
+    cfg: params.cfg,
+    accountId: params.accountId,
+  }).includes(senderId);
 }
 
-function hasConfiguredApprovers(cfg: OpenClawConfig): boolean {
-  return getWebChannelExecApprovalApprovers({ cfg }).length > 0;
+function hasConfiguredApprovers(cfg: OpenClawConfig, accountId?: string | null): boolean {
+  return getWebChannelExecApprovalApprovers({ cfg, accountId }).length > 0;
 }
 
 /**
@@ -235,19 +320,34 @@ function hasConfiguredApprovers(cfg: OpenClawConfig): boolean {
 export function shouldHandleWebChannelApprovalRequest(params: {
   cfg: OpenClawConfig;
   request: ExecApprovalRequest | PluginApprovalRequest;
+  accountId?: string | null;
 }): boolean {
-  const { cfg, request } = params;
+  const { cfg, request, accountId } = params;
+  // S1: pass the handler's accountId so the SDK matcher compares it against the
+  // request's `turnSourceAccountId` (stamped by our inbound buildContext) — an
+  // account-B turn's approval is claimed ONLY by account B's handler, never A's.
+  //
+  // KNOWN RESIDUAL (adversarial-round F3, deferred): the SDK matcher returns
+  // TRUE for EVERY account's handler when a request has NEITHER a
+  // `turnSourceAccountId` NOR a session-bound accountId — so an approval with no
+  // account linkage fans out to all served accounts' channels. That only arises
+  // for AGENT-INITIATED / cron approvals (a user turn always carries the account
+  // via inbound.ts's stamp), which is exactly the still-open "proactive/
+  // untargeted outbound" leg (docs/BACKLOG.md S1). The F2 fail-closed delivery
+  // above bounds the blast radius to accounts with a LIVE channel; fully
+  // resolving the fan-out needs the outbound-account semantics that leg defines.
   if (
     !doesApprovalRequestMatchChannelAccount({
       cfg,
       request,
       channel: WEBCHANNEL_ID,
+      accountId,
     })
   ) {
     return false;
   }
-  const config = readExecApprovals(cfg);
-  const approvers = getWebChannelExecApprovalApprovers({ cfg });
+  const config = readExecApprovals(cfg, accountId);
+  const approvers = getWebChannelExecApprovalApprovers({ cfg, accountId });
   if (
     !isChannelExecApprovalClientEnabledFromConfig({
       enabled: config?.enabled,
@@ -309,6 +409,7 @@ export function buildApprovalRequestPayload(
  */
 export function createClawApprovalNativeRuntimeSpec(
   transport: WebChannelTransport,
+  resolveAccountTransport?: ResolveAccountTransport,
 ): ChannelApprovalNativeRuntimeSpec<
   ApprovalRequestPayload, // TPendingPayload
   { sessionKey: string }, // TPreparedTarget
@@ -316,6 +417,23 @@ export function createClawApprovalNativeRuntimeSpec(
   unknown, // TBinding (no interactive binding to clear; we own the widget card)
   ClawApprovalFinalPayload // TFinalPayload
 > {
+  // S1 delivery routing: core starts ONE native handler per account (the
+  // bootstrap's per-account start passes `accountId` into every hook context),
+  // so delivery resolves THAT account's channel.
+  //
+  // FAIL-CLOSED (adversarial-round F2): when a resolver IS wired (the NATS
+  // multi-account entry), a MISS returns `undefined` and the caller DROPS the
+  // frame — it must NEVER fall back to the closure `transport` (the primary
+  // channel), or an account that `registerFull` skipped (creds-missing /
+  // connect-fail) would have its prompt delivered on the PRIMARY account's
+  // channel — re-opening the exact cross-account misroute S1 closes. Only the
+  // legacy single-transport WS entry (no resolver) uses the closure transport,
+  // where there is exactly one account and no misroute is possible.
+  const hasResolver = typeof resolveAccountTransport === "function";
+  const transportFor = (
+    accountId: string | null | undefined,
+  ): WebChannelTransport | undefined =>
+    hasResolver ? resolveAccountTransport!(accountId) : transport;
   return {
     // We can render BOTH exec and plugin approvals natively in the widget.
     eventKinds: ["exec", "plugin"],
@@ -326,10 +444,10 @@ export function createClawApprovalNativeRuntimeSpec(
       // Core reads the outer adapter in production, but keeping the inner spec
       // aligned avoids a misleading "enabled-but-no-approvers" half-state if the
       // spec is ever consumed directly (and documents the true invariant).
-      isConfigured: ({ cfg }) =>
-        hasConfiguredApprovers(cfg) && isExecApprovalsEnabled(cfg),
-      shouldHandle: ({ cfg, request }) =>
-        shouldHandleWebChannelApprovalRequest({ cfg, request }),
+      isConfigured: ({ cfg, accountId }) =>
+        hasConfiguredApprovers(cfg, accountId) && isExecApprovalsEnabled(cfg, accountId),
+      shouldHandle: ({ cfg, accountId, request }) =>
+        shouldHandleWebChannelApprovalRequest({ cfg, accountId, request }),
     },
     presentation: {
       // Turn the SDK view into our WS payload.
@@ -358,37 +476,69 @@ export function createClawApprovalNativeRuntimeSpec(
       // The transport socket map is keyed by that same `peerId`, so it lines up.
       // With 2+ concurrent users this targets the right user's socket; the
       // dedupeKey is per-peer so distinct users never collide.
-      prepareTarget: ({ plannedTarget }) => {
+      prepareTarget: ({ accountId, plannedTarget }) => {
         // `plannedTarget.target.to` is the per-peer key resolveOriginTarget
         // produced; default to the anon peer if it's somehow absent so a
         // single-session deployment still gets its prompt.
         const sessionKey = plannedTarget?.target?.to || ANON_PEER_ID;
         return {
-          dedupeKey: `${WEBCHANNEL_ID}:${sessionKey}`,
+          // Scope the dedupe key by account: the SAME peerId registered on two
+          // accounts is two distinct delivery targets (each account's channel),
+          // never one deduped entry.
+          dedupeKey: `${WEBCHANNEL_ID}:${accountId ?? DEFAULT_ACCOUNT_ID}:${sessionKey}`,
           target: { sessionKey },
         };
       },
-      // Emit the `approval_request` frame. Returning a non-null entry tells the
-      // runtime the prompt was delivered; the entry is handed back on finalize.
-      deliverPending: ({ preparedTarget, pendingPayload }) => {
+      // Emit the `approval_request` frame ON THE ORIGINATING ACCOUNT's channel.
+      // Returning a non-null entry tells the runtime the prompt was delivered;
+      // the entry is handed back on finalize.
+      deliverPending: ({ accountId, preparedTarget, pendingPayload }) => {
         const sessionKey = preparedTarget.sessionKey;
+        // Bind this approval to its delivering account BEFORE sending, so the
+        // widget-click reverse path can enforce the per-account boundary (F1)
+        // even if the frame itself never reaches a socket.
+        recordApprovalAccount(pendingPayload.id, accountId);
+        const channel = transportFor(accountId);
+        if (!channel) {
+          // F2 fail-closed: no live channel for this account (skipped/unknown).
+          // Refuse to misroute onto the primary channel; drop with a warn.
+          console.warn(
+            `[webchannel] approval ${pendingPayload.id} not delivered: no live channel for ` +
+              `account "${accountId ?? DEFAULT_ACCOUNT_ID}" (skipped or unknown) — refusing to misroute`,
+          );
+          return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
+        }
         // Fail-closed: with 2+ connections and an absent `turnSourceTo` the
         // target falls back to `web-anon`, `soleOpenSocket` returns undefined,
         // and the prompt is correctly DROPPED rather than misrouted. That drop
         // is otherwise invisible, so log it (no logger in scope here; match the
         // transport's `[webchannel]` console style — src/transport.ts safeSend).
-        const delivered = transport.sendApprovalRequest(sessionKey, pendingPayload);
+        const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload);
         if (!delivered) {
           console.warn(
-            `[webchannel] approval ${pendingPayload.id} not delivered: no matching open socket for "${sessionKey}"`,
+            `[webchannel] approval ${pendingPayload.id} not delivered: no matching open ` +
+              `socket for "${sessionKey}" (account "${accountId ?? DEFAULT_ACCOUNT_ID}")`,
           );
         }
-        return { approvalId: pendingPayload.id, sessionKey };
+        return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
       },
       // Finalize: emit `approval_resolved` so the widget disables buttons and
       // shows the outcome. Fires for both resolved and expired `update` actions.
-      updateEntry: async ({ entry, payload }) => {
-        transport.sendApprovalResolved(
+      // Route via the DELIVERING account's channel (context accountId, with the
+      // entry's recorded account as fallback) so finalize matches delivery.
+      updateEntry: async ({ entry, payload, accountId }) => {
+        // Finalize is terminal for this approval — release the id→account
+        // binding (resolved AND expired both route here).
+        deliveredApprovalAccounts.delete(entry.approvalId);
+        const channel = transportFor(accountId ?? entry.accountId);
+        if (!channel) {
+          console.warn(
+            `[webchannel] approval ${entry.approvalId} resolve frame dropped: no live channel ` +
+              `for account "${accountId ?? entry.accountId ?? DEFAULT_ACCOUNT_ID}"`,
+          );
+          return;
+        }
+        channel.sendApprovalResolved(
           entry.sessionKey,
           entry.approvalId,
           payload.decision,
@@ -420,16 +570,19 @@ export function createClawApprovalNativeRuntimeSpec(
  * peer that started the turn, never via DM). Mirrors Discord's
  * createDiscordApprovalCapability (discord/src/approval-native.ts).
  */
-export function createClawApprovalCapability(transport: WebChannelTransport) {
+export function createClawApprovalCapability(
+  transport: WebChannelTransport,
+  resolveAccountTransport?: ResolveAccountTransport,
+) {
   const nativeRuntime = createLazyChannelApprovalNativeRuntimeAdapter({
     eventKinds: ["exec", "plugin"],
-    isConfigured: ({ cfg }) =>
-      hasConfiguredApprovers(cfg) && isExecApprovalsEnabled(cfg),
-    shouldHandle: ({ cfg, request }) =>
-      shouldHandleWebChannelApprovalRequest({ cfg, request }),
+    isConfigured: ({ cfg, accountId }) =>
+      hasConfiguredApprovers(cfg, accountId) && isExecApprovalsEnabled(cfg, accountId),
+    shouldHandle: ({ cfg, accountId, request }) =>
+      shouldHandleWebChannelApprovalRequest({ cfg, accountId, request }),
     load: async () => {
       // Build the strongly-typed spec lazily so cold startup doesn't pay for it.
-      const spec = createClawApprovalNativeRuntimeSpec(transport);
+      const spec = createClawApprovalNativeRuntimeSpec(transport, resolveAccountTransport);
       // The capability's nativeRuntime field is generic-erased (all unknown),
       // so widen with a cast. Pure generic-erasure — core calls the hooks with
       // the exact runtime values we produce. (See the former cast at the old
@@ -454,12 +607,13 @@ export function createClawApprovalCapability(transport: WebChannelTransport) {
     // (above, which requires approvers AND enabled) BEFORE the native handler
     // starts, so with no approvers configured the delivery hooks never run and
     // no prompt is shown — `listAccountIds` just enumerates which accounts to
-    // probe. The single default account models our one web surface.
-    listAccountIds: () => [DEFAULT_ACCOUNT_ID],
-    hasApprovers: ({ cfg }) => hasConfiguredApprovers(cfg),
-    isExecAuthorizedSender: ({ cfg, senderId }) =>
-      isWebChannelExecApprovalApprover({ cfg, senderId }),
-    isNativeDeliveryEnabled: ({ cfg }) => isExecApprovalsEnabled(cfg),
+    // probe. S1: enumerate the REAL configured accounts (Telegram pattern) so
+    // the SDK's surface-state scans see every deployment, not just "default".
+    listAccountIds: (cfg) => listWebchannelAccountIds(cfg),
+    hasApprovers: ({ cfg, accountId }) => hasConfiguredApprovers(cfg, accountId),
+    isExecAuthorizedSender: ({ cfg, accountId, senderId }) =>
+      isWebChannelExecApprovalApprover({ cfg, accountId, senderId }),
+    isNativeDeliveryEnabled: ({ cfg, accountId }) => isExecApprovalsEnabled(cfg, accountId),
     resolveNativeDeliveryMode: () => "channel",
     resolveOriginTarget: ({ request }) => {
       // The ORIGINATING peer's web session. `request.request.turnSourceTo` is
@@ -507,14 +661,15 @@ export function shouldSuppressClawNativeExecApprovalPrompt(params: {
     accountId: params.accountId,
     payload: params.payload,
     hint: params.hint,
-    // Native delivery is enabled exactly when our exec approvals are on.
-    isNativeDeliveryEnabled: ({ cfg }) => isExecApprovalsEnabled(cfg),
-    // Resolve "approval config" from OUR channel section so the helper's
-    // agent/session filters + enabled check use webchannel config, and the
-    // forwarding-mode gate is bypassed (helper defaults
+    // Native delivery is enabled exactly when the ACCOUNT's exec approvals are on.
+    isNativeDeliveryEnabled: ({ cfg, accountId }) => isExecApprovalsEnabled(cfg, accountId),
+    // Resolve "approval config" from OUR channel section (account-scoped) so the
+    // helper's agent/session filters + enabled check use webchannel config, and
+    // the forwarding-mode gate is bypassed (helper defaults
     // requireApprovalConfigEnabled/enforceForwardingMode to false when
     // resolveApprovalConfig is provided).
-    resolveApprovalConfig: ({ cfg }) => readExecApprovals(cfg) ?? { enabled: true },
+    resolveApprovalConfig: ({ cfg, accountId }) =>
+      readExecApprovals(cfg, accountId) ?? { enabled: true },
   });
 }
 
@@ -604,12 +759,42 @@ export async function handleApprovalDecision(
   approvalId: string,
   decision: ApprovalDecision,
   senderId: string,
+  accountId?: string | null,
 ): Promise<void> {
-  // FAIL-CLOSED: see JSDoc — the gateway RPC does not authz, so the channel
-  // boundary must. A non-approver gets rejected before any RPC is issued.
-  if (!isWebChannelExecApprovalApprover({ cfg, senderId })) {
+  // FAIL-CLOSED #1 (adversarial-round F1): the approval must be resolved on the
+  // SAME account it was delivered on. The gateway RPC resolves by id with NO
+  // per-approval authz, so without this an approver on account B could replay
+  // account A's approvalId onto B's channel and resolve A's exec (ids are random
+  // UUIDs, so this needs an id leak — but the per-account boundary must hold
+  // regardless). Absence of a binding is ALWAYS a reject: an id we never
+  // delivered (foreign/forged), or one already finalized, or (rare) one whose
+  // in-memory binding was lost to an agent restart mid-approval — all fail
+  // closed. A real widget click always follows a `deliverPending` in the same
+  // process, so a legitimate resolve holds its binding.
+  const boundAccount = deliveredApprovalAccounts.get(approvalId);
+  if (boundAccount === undefined) {
     throw new Error(
-      `webchannel: peer "${senderId}" is not a configured exec approver`,
+      `webchannel: approval "${approvalId}" is unknown or already resolved ` +
+        `(no live delivery binding) — refusing to resolve`,
+    );
+  }
+  if (boundAccount !== bindingAccountKey(accountId)) {
+    throw new Error(
+      `webchannel: approval "${approvalId}" was delivered on account ` +
+        `"${boundAccount}", not "${bindingAccountKey(accountId)}" — refusing cross-account resolve`,
+    );
+  }
+
+  // FAIL-CLOSED #2: see JSDoc — the gateway RPC does not authz, so the channel
+  // boundary must. A non-approver gets rejected before any RPC is issued.
+  // S1: the decision frame arrives on a specific ACCOUNT's channel (the NATS
+  // handler passes its accountId), so the approver set is that account's —
+  // an approver configured only on account A cannot resolve via account B's
+  // channel. Legacy callers omit accountId and keep the default-account read.
+  if (!isWebChannelExecApprovalApprover({ cfg, senderId, accountId })) {
+    throw new Error(
+      `webchannel: peer "${senderId}" is not a configured exec approver` +
+        (accountId ? ` for account "${accountId}"` : ""),
     );
   }
   await resolveApprovalOverGateway({

@@ -25,6 +25,7 @@ import {
   shouldSuppressClawNativeExecApprovalPrompt,
   getWebChannelExecApprovalApprovers,
   isWebChannelExecApprovalApprover,
+  __approvalAccountBindingTestHook,
 } from "./approvals.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
@@ -253,10 +254,14 @@ describe("webchannel native approval origin routing (multi-user)", () => {
       view: fakePendingExecView() as any,
       pendingPayload: {} as any,
     });
-    // The prepared session key + dedupeKey are per-peer (bob), so two distinct
-    // users never collide and the frame targets bob's socket.
+    // The prepared session key + dedupeKey are per-ACCOUNT-per-peer (S1), so two
+    // distinct users never collide. NOTE: the SDK's dedupe set is scoped to a
+    // single handler's single delivery plan (approval-native-runtime), so the
+    // account segment is not what separates accounts — that comes from the
+    // per-account handler instances. The segment just keeps the key unambiguous
+    // and self-documents the account. An unscoped (null) context keys default.
     expect(prepared!.target).toEqual({ sessionKey: "peer-bob" });
-    expect(prepared!.dedupeKey).toBe("webchannel:peer-bob");
+    expect(prepared!.dedupeKey).toBe("webchannel:default:peer-bob");
   });
 
   it("delivers the approval_request to the originating peer's socket key", async () => {
@@ -453,6 +458,12 @@ describe("webchannel in-band approval text suppression (Gate 2)", () => {
 describe("webchannel approval decision -> gateway", () => {
   beforeEach(() => {
     resolveApprovalOverGateway.mockClear();
+    // F1: handleApprovalDecision now requires a live delivery binding (an
+    // approval must have been delivered before it can be resolved). Reset the
+    // shared binding map and seed "exec-1" on the default account so these
+    // isolation tests drive the same map the real deliverPending writes.
+    __approvalAccountBindingTestHook.clear();
+    __approvalAccountBindingTestHook.record("exec-1", null);
   });
 
   it("resolves the approval over the gateway on a widget button click", async () => {
@@ -656,5 +667,309 @@ describe("webchannel capability authorizeActorAction", () => {
       approvalKind: "exec",
     });
     expect(result).toEqual({ authorized: false, reason: expect.any(String) });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S1: accountId-aware approvals (multi-account gateway)
+//
+// Failure scenario being pinned: one gateway serves accounts "a" (primary) and
+// "b"; the same peerId is registered on both. Before S1, account-B turns'
+// approval prompts were claimed by the account-agnostic handler and delivered
+// via the PRIMARY channel — cross-deployment disclosure + a mis-scoped
+// approval surface. Now each account's handler claims only its own turns
+// (turnSourceAccountId match) and delivers on its own channel.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
+  // Two accounts, each with its own approver set; the channel-level base has
+  // NO execApprovals so nothing leaks between accounts via the shared base.
+  const cfgTwoAccounts: any = {
+    channels: {
+      webchannel: {
+        accounts: {
+          a: { execApprovals: { enabled: true, approvers: ["ann"] } },
+          b: { execApprovals: { enabled: true, approvers: ["bob"] } },
+        },
+      },
+    },
+  };
+
+  function makeAccountTransports() {
+    const transportA = new WebChannelTransport();
+    const transportB = new WebChannelTransport();
+    const sentA = vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
+    const sentB = vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue(true);
+    const resolvedA = vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
+    const resolvedB = vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
+    const fallback = new WebChannelTransport();
+    const sentFallback = vi.spyOn(fallback, "sendApprovalRequest").mockReturnValue(true);
+    const byAccount: Record<string, WebChannelTransport> = { a: transportA, b: transportB };
+    const spec = createClawApprovalNativeRuntimeSpec(
+      fallback,
+      (accountId) => byAccount[accountId ?? "default"],
+    );
+    return { spec, sentA, sentB, resolvedA, resolvedB, sentFallback };
+  }
+
+  it("each account's handler claims ONLY its own turns (turnSourceAccountId match)", () => {
+    const { spec } = makeAccountTransports();
+    const requestFromB: any = {
+      id: "exec-b1",
+      request: {
+        command: "ls",
+        turnSourceChannel: "webchannel",
+        turnSourceAccountId: "b",
+      },
+    };
+    const ctx = (accountId: string) => ({ cfg: cfgTwoAccounts, accountId, context: undefined });
+    // Account A's handler must NOT claim an account-B turn's approval…
+    expect(spec.availability.shouldHandle({ ...ctx("a"), request: requestFromB })).toBe(false);
+    // …and account B's handler must.
+    expect(spec.availability.shouldHandle({ ...ctx("b"), request: requestFromB })).toBe(true);
+  });
+
+  it("isConfigured gates PER account (approvers on A only ⇒ B not configured)", () => {
+    const cfgOnlyA: any = {
+      channels: {
+        webchannel: {
+          accounts: {
+            a: { execApprovals: { enabled: true, approvers: ["ann"] } },
+            b: {},
+          },
+        },
+      },
+    };
+    const { spec } = makeAccountTransports();
+    expect(spec.availability.isConfigured({ cfg: cfgOnlyA, accountId: "a" } as any)).toBe(true);
+    expect(spec.availability.isConfigured({ cfg: cfgOnlyA, accountId: "b" } as any)).toBe(false);
+  });
+
+  it("an account with no execApprovals override INHERITS the channel-level base", () => {
+    const cfgSharedBase: any = {
+      channels: {
+        webchannel: {
+          execApprovals: { enabled: true, approvers: ["ops"] },
+          accounts: { a: {} },
+        },
+      },
+    };
+    expect(
+      getWebChannelExecApprovalApprovers({ cfg: cfgSharedBase, accountId: "a" }),
+    ).toEqual(["ops"]);
+    expect(
+      isWebChannelExecApprovalApprover({ cfg: cfgSharedBase, accountId: "a", senderId: "ops" }),
+    ).toBe(true);
+  });
+
+  it("delivers the prompt on the ORIGINATING account's channel (shared peerId, B-turn ⇒ B channel only)", async () => {
+    const { spec, sentA, sentB, sentFallback } = makeAccountTransports();
+    const view = fakePendingExecView("exec-b2");
+    const ctxB = { cfg: cfgTwoAccounts, accountId: "b", context: undefined };
+
+    const pendingPayload = (await spec.presentation.buildPendingPayload({
+      ...ctxB,
+      request: { id: view.approvalId } as any,
+      approvalKind: "exec",
+      nowMs: Date.now(),
+      view,
+    })) as ApprovalRequestPayload;
+
+    const prepared = await spec.transport.prepareTarget({
+      ...ctxB,
+      plannedTarget: { surface: "origin", target: { to: "alice" }, reason: "preferred" } as any,
+      request: {} as any,
+      approvalKind: "exec",
+      view: view as any,
+      pendingPayload,
+    });
+    // Account-scoped dedupe KEY (delivery separation itself comes from the
+    // per-account handler instances, not this key — see the prepareTarget note).
+    expect(prepared!.dedupeKey).toBe("webchannel:b:alice");
+
+    const entry = await spec.transport.deliverPending({
+      ...ctxB,
+      plannedTarget: { surface: "origin", target: { to: "alice" }, reason: "preferred" } as any,
+      preparedTarget: prepared!.target,
+      request: {} as any,
+      approvalKind: "exec",
+      view: view as any,
+      pendingPayload,
+    });
+
+    expect(sentB).toHaveBeenCalledWith("alice", pendingPayload);
+    expect(sentA).not.toHaveBeenCalled();
+    expect(sentFallback).not.toHaveBeenCalled();
+    // The entry records the delivering account for the finalize leg.
+    expect(entry).toEqual({ approvalId: "exec-b2", sessionKey: "alice", accountId: "b" });
+  });
+
+  it("finalizes (approval_resolved) on the SAME account's channel — entry fallback when ctx is unscoped", async () => {
+    const { spec, resolvedA, resolvedB } = makeAccountTransports();
+    const entry = { approvalId: "exec-b3", sessionKey: "alice", accountId: "b" };
+
+    // Normal path: hook context carries the account.
+    await spec.transport.updateEntry!({
+      cfg: cfgTwoAccounts,
+      accountId: "b",
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase: "resolved",
+    } as any);
+    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b3", "deny");
+    expect(resolvedA).not.toHaveBeenCalled();
+
+    // Defensive path: unscoped context falls back to the entry's recorded account.
+    resolvedB.mockClear();
+    await spec.transport.updateEntry!({
+      cfg: cfgTwoAccounts,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: { decision: "allow-once" },
+      phase: "resolved",
+    } as any);
+    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b3", "allow-once");
+    expect(resolvedA).not.toHaveBeenCalled();
+  });
+
+  it("F2: unknown account is fail-closed (dropped), NEVER delivered on the fallback/primary", async () => {
+    // When a resolver is wired (multi-account NATS entry), an unknown account is
+    // a MISS → drop. It must NOT fall back to the closure transport (which is
+    // the primary channel) — that would re-open the cross-account misroute.
+    const { spec, sentA, sentB, sentFallback } = makeAccountTransports();
+    const view = fakePendingExecView("exec-x");
+    const ctxUnknown = { cfg: cfgTwoAccounts, accountId: "ghost", context: undefined };
+    await spec.transport.deliverPending({
+      ...ctxUnknown,
+      plannedTarget: { surface: "origin", target: { to: "alice" }, reason: "preferred" } as any,
+      preparedTarget: { sessionKey: "alice" },
+      request: {} as any,
+      approvalKind: "exec",
+      view: view as any,
+      pendingPayload: buildApprovalRequestPayload(view),
+    });
+    expect(sentFallback).not.toHaveBeenCalled();
+    expect(sentA).not.toHaveBeenCalled();
+    expect(sentB).not.toHaveBeenCalled();
+  });
+
+  it("legacy WS (no resolver) still delivers on the single closure transport", async () => {
+    // The legacy single-account WS entry passes NO resolver → every account uses
+    // the closure transport (there is exactly one account, no misroute possible).
+    const only = new WebChannelTransport();
+    const onlySent = vi.spyOn(only, "sendApprovalRequest").mockReturnValue(true);
+    const spec = createClawApprovalNativeRuntimeSpec(only); // no resolver
+    const view = fakePendingExecView("exec-legacy");
+    await spec.transport.deliverPending({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      plannedTarget: { surface: "origin", target: { to: "web-anon" }, reason: "preferred" } as any,
+      preparedTarget: { sessionKey: "web-anon" },
+      request: {} as any,
+      approvalKind: "exec",
+      view: view as any,
+      pendingPayload: buildApprovalRequestPayload(view),
+    });
+    expect(onlySent).toHaveBeenCalledWith("web-anon", expect.objectContaining({ id: "exec-legacy" }));
+  });
+
+  it("widget-click authz is PER ACCOUNT: account-A approver cannot resolve via account B", async () => {
+    resolveApprovalOverGateway.mockClear();
+    // exec-b4 was delivered on account b (seed the binding as deliverPending would).
+    __approvalAccountBindingTestHook.clear();
+    __approvalAccountBindingTestHook.record("exec-b4", "b");
+
+    // ann is an approver on account a, NOT on account b.
+    await expect(
+      handleApprovalDecision(cfgTwoAccounts, "exec-b4", "deny", "ann", "b"),
+    ).rejects.toThrow(/not a configured exec approver for account "b"/);
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+
+    // bob IS account b's approver — resolves fine, senderId forwarded.
+    await handleApprovalDecision(cfgTwoAccounts, "exec-b4", "allow-once", "bob", "b");
+    expect(resolveApprovalOverGateway).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: "exec-b4", decision: "allow-once", senderId: "bob" }),
+    );
+  });
+
+  it("F1: rejects a cross-account approvalId replay (B-approver resolving A's approval on B's channel)", async () => {
+    resolveApprovalOverGateway.mockClear();
+    // exec-a9 was delivered on account a's channel…
+    __approvalAccountBindingTestHook.clear();
+    __approvalAccountBindingTestHook.record("exec-a9", "a");
+
+    // …bob (a valid approver on B) replays a's id onto B's channel. Even though
+    // bob IS a B approver, the id was NOT delivered on B → fail-closed reject
+    // BEFORE the approver check, and NO gateway RPC is issued.
+    await expect(
+      handleApprovalDecision(cfgTwoAccounts, "exec-a9", "allow-once", "bob", "b"),
+    ).rejects.toThrow(/was delivered on account "a", not "b" — refusing cross-account resolve/);
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+  });
+
+  it("F1: rejects an unknown/never-delivered approvalId (forged or already-resolved)", async () => {
+    resolveApprovalOverGateway.mockClear();
+    __approvalAccountBindingTestHook.clear();
+    await expect(
+      handleApprovalDecision(cfgTwoAccounts, "exec-ghost", "deny", "bob", "b"),
+    ).rejects.toThrow(/unknown or already resolved/);
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+  });
+
+  it("F1: a finalize (updateEntry) releases the binding so a later replay is rejected", async () => {
+    const { spec, resolvedB } = makeAccountTransports();
+    __approvalAccountBindingTestHook.clear();
+    const entry = { approvalId: "exec-b7", sessionKey: "alice", accountId: "b" };
+    __approvalAccountBindingTestHook.record("exec-b7", "b");
+
+    await spec.transport.updateEntry!({
+      cfg: cfgTwoAccounts,
+      accountId: "b",
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase: "resolved",
+    } as any);
+    expect(resolvedB).toHaveBeenCalledWith("alice", "exec-b7", "deny");
+
+    // Binding released → a post-finalize resolve attempt is rejected.
+    resolveApprovalOverGateway.mockClear();
+    await expect(
+      handleApprovalDecision(cfgTwoAccounts, "exec-b7", "allow-once", "bob", "b"),
+    ).rejects.toThrow(/unknown or already resolved/);
+    expect(resolveApprovalOverGateway).not.toHaveBeenCalled();
+  });
+
+  it("F2: a skipped account (no live channel) DROPS its prompt instead of misrouting to primary", async () => {
+    // Resolver knows accounts a+b, but 'b' is 'skipped' (returns undefined) as
+    // if registerFull skipped it (creds-missing). The closure/fallback transport
+    // is the PRIMARY (a). A prompt for b must NOT land on the fallback.
+    const primary = new WebChannelTransport();
+    const primarySent = vi.spyOn(primary, "sendApprovalRequest").mockReturnValue(true);
+    const transportA = new WebChannelTransport();
+    const aSent = vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
+    const spec = createClawApprovalNativeRuntimeSpec(
+      primary,
+      (accountId) => (accountId === "a" ? transportA : undefined), // 'b' → undefined (skipped)
+    );
+    const view = fakePendingExecView("exec-b8");
+    const entry = await spec.transport.deliverPending({
+      cfg: cfgTwoAccounts,
+      accountId: "b",
+      context: undefined,
+      plannedTarget: { surface: "origin", target: { to: "alice" }, reason: "preferred" } as any,
+      preparedTarget: { sessionKey: "alice" },
+      request: {} as any,
+      approvalKind: "exec",
+      view: view as any,
+      pendingPayload: buildApprovalRequestPayload(view),
+    });
+    // Neither the primary/fallback NOR account a's channel received b's prompt.
+    expect(primarySent).not.toHaveBeenCalled();
+    expect(aSent).not.toHaveBeenCalled();
+    // The binding is still recorded (so a stray resolve is still account-checked).
+    expect(entry).toEqual({ approvalId: "exec-b8", sessionKey: "alice", accountId: "b" });
   });
 });

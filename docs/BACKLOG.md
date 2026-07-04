@@ -78,17 +78,36 @@ accounts via `listAccountIds`, reads per-account `execApprovals`, and `deliverPe
 `accountId` param, and delivery is closure-bound to the single primary-channel facade. The fix is
 **plugin-local**; no openclaw core change needed for approvals.
 
-**Scope of the fix (approvals leg — Telegram pattern):**
-- [ ] `inbound.ts` `buildContext`: pass `accountId` (top-level `BuildChannelInboundEventContextParams.accountId`
-  and/or `route.accountId` — both fields exist in core, we currently pass neither), so the core
-  stamps `turnSourceAccountId` on webchannel turns; verify the stamp end-to-end
-- [ ] `approvals.ts` `listAccountIds`: return the real configured account ids (not `["default"]`)
-- [ ] make the capability hooks account-aware: per-account `execApprovals` config reads
-  (`readExecApprovals` is channel-global today — needs `accounts.<id>.execApprovals` support)
-- [ ] `deliverPending`/`updateEntry`: resolve `accountId → accountRuntimes.get(accountId).channel`
-  instead of the closure facade (needs an account→channel registry visible to the capability)
-- [ ] regression test: two accounts, shared peerId → account-B turn's approval prompt delivers on
-  account B's channel only
+**Scope of the fix (approvals leg — Telegram pattern) — ✅ DONE 2026-07-04 (3-lens adversarial review):**
+- [x] `inbound.ts` `buildContext`: pass `accountId` (top-level `BuildChannelInboundEventContextParams.accountId`),
+  so core stamps `turnSourceAccountId` on webchannel turns. Verified end-to-end through the dist
+  bundle: `buildContext.accountId → ctx.AccountId → request.accountId → turnSourceAccountId`.
+- [x] `approvals.ts` `listAccountIds`: return the real configured account ids (`listWebchannelAccountIds(cfg)`).
+- [x] capability hooks account-aware: `readExecApprovals(cfg, accountId)` reads the merged
+  `accounts.<id>.execApprovals` (execApprovals is a NESTED_OBJECT_KEY, so per-field account
+  overrides compose with the channel-level base).
+- [x] `deliverPending`/`updateEntry`: resolve `accountId → accountRuntimes.get(accountId).channel`
+  via a `resolveApprovalTransport` resolver threaded `index-nats.ts → channel.ts → approvals.ts`.
+- [x] widget-click authz `handleApprovalDecision` reads THIS account's approver set (index-nats
+  passes the channel's accountId).
+- [x] regression tests: two accounts + shared peerId → B-turn approval delivers on B's channel only;
+  per-account isConfigured/approver gates; shared-base inheritance; legacy WS single-transport.
+
+**Adversarial-round hardening (F1/F2 fixed same day; F3 documented + deferred):**
+- [x] **F1** — id↔account binding: `handleApprovalDecision` now refuses a decision whose approvalId
+  was not DELIVERED on the resolving account (the gateway RPC does no per-approval authz, so an
+  approver on account B could otherwise replay A's random-UUID approvalId onto B's channel). A
+  module-level `deliveredApprovalAccounts` map records the delivering account at `deliverPending`
+  and is released at `updateEntry`.
+- [x] **F2** — fail-closed delivery: when the resolver MISSES (an account core started a handler for
+  but `registerFull` skipped — creds-missing/connect-fail), the prompt is DROPPED, never routed to
+  the closure/primary channel (which would re-open the misroute). Legacy WS (no resolver) keeps the
+  single closure transport.
+- [ ] **F3 (residual, deferred to the outbound leg)** — an approval with NEITHER `turnSourceAccountId`
+  NOR a session-bound account is claimed by every account's handler (SDK matcher) → fans out to all
+  LIVE accounts' channels. Only reachable via AGENT-INITIATED / cron approvals (a user turn always
+  carries the account). Belongs to the proactive/untargeted outbound leg below (needs outbound-
+  account semantics). F2 bounds the blast radius to live channels.
 
 **Proactive/untargeted outbound leg (separate, still open):** core-initiated untargeted sends
 (`sendTextToAnyOpen` etc.) may still be account-blind at a different seam — decide semantics

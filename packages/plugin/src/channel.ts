@@ -12,6 +12,7 @@ import {
   startClawApprovalMonitor,
   shouldSuppressClawNativeExecApprovalPrompt,
 } from "./approvals.js";
+import type { ResolveAccountTransport } from "./approvals.js";
 import {
   DEFAULT_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_ACCOUNT_ID,
   listWebchannelAccountIds,
@@ -83,7 +84,18 @@ function resolveAccount(
  * Verified: dist/plugin-sdk/core-HhTaqQ72.d.ts:211-219 (ChatChannelAttachedOutboundOptions)
  * and dist/plugin-sdk/outbound.types-BEZiz165.d.ts:105-127 (ChannelOutboundContext).
  */
-export function createWebChannelPlugin(transport: WebChannelTransport) {
+export function createWebChannelPlugin(
+  transport: WebChannelTransport,
+  opts?: {
+    /**
+     * S1 (accountId-aware approvals): resolve a specific account's transport
+     * for native approval delivery/finalize. The NATS entry passes a resolver
+     * over its per-account runtimes; the legacy single-transport WS entry omits
+     * it and every account falls back to `transport` (unchanged behavior).
+     */
+    resolveApprovalTransport?: ResolveAccountTransport;
+  },
+) {
   return createChatChannelPlugin<ResolvedAccount>({
     // `message` (ChannelMessageAdapter) declares our outbound text send plus the
     // `live` progress-draft capabilities. It is attached on the base object here
@@ -142,7 +154,10 @@ export function createWebChannelPlugin(transport: WebChannelTransport) {
       // (core-HhTaqQ72.d.ts:169), so attaching it here flows through — same
       // mechanism the `message` adapter uses. The HITL native runtime delivers
       // approval prompts over our WebSocket; see src/approvals.ts.
-      approvalCapability: createClawApprovalCapability(transport),
+      approvalCapability: createClawApprovalCapability(
+        transport,
+        opts?.resolveApprovalTransport,
+      ),
       // `gateway.startAccount` is the monitor core's channel runtime starts per
       // account. We use it solely to register the `approval.native` runtime
       // context (which arms the native approval handler) and then stay alive for

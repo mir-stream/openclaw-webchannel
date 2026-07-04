@@ -224,6 +224,36 @@ describe("webchannel inbound round-trip", () => {
     );
   });
 
+  it("stamps accountId on the turn context AND the run params (S1: turnSourceAccountId)", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { accounts: { acctB: {} } },
+    });
+
+    await handleInboundMessage(
+      api,
+      transport,
+      "alice",
+      { type: "user_message", text: "hello" },
+      "acctB",
+    );
+
+    const inbound = (api as any).runtime.channel.inbound;
+    // Core copies buildContext's accountId into ctx.AccountId, which becomes the
+    // agent request's accountId and, on an exec approval, turnSourceAccountId —
+    // the field each account's approval handler matches on. Without this stamp,
+    // account-B approvals fall back to the primary handler (the S1 misroute).
+    expect(inbound.run).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: "webchannel", accountId: "acctB" }),
+    );
+    expect(inbound.buildContext).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: "webchannel", accountId: "acctB" }),
+    );
+  });
+
   it("applies PER-ACCOUNT dmSecurity allowlist (account isolation — Cycle 2)", async () => {
     const transport = new WebChannelTransport();
     vi.spyOn(transport, "sendText").mockReturnValue(true);

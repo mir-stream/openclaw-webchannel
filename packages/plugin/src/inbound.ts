@@ -146,6 +146,7 @@ export async function handleInboundMessage(
   try {
     await channelRuntime.inbound.run({
       channel: WEBCHANNEL_ID,
+      accountId,
       raw: message,
       adapter: {
         ingest: (raw) => ({
@@ -159,6 +160,12 @@ export async function handleInboundMessage(
         resolveTurn: (input) => {
           const ctxPayload = channelRuntime.inbound.buildContext({
             channel: WEBCHANNEL_ID,
+            // S1: stamp the serving account on the turn context. Core copies
+            // this into `ctx.AccountId` → the agent-run request's `accountId`
+            // → the approval request's `turnSourceAccountId`, which is what
+            // lets each account's native approval handler claim ONLY its own
+            // turns' approvals (and the prompt deliver on the right channel).
+            accountId,
             timestamp: input.timestamp,
             from: wsKey,
             sender: { id: wsKey, name: wsKey },

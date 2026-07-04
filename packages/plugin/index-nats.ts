@@ -187,8 +187,22 @@ const lazyTransport = new Proxy({} as Record<string, unknown>, {
 
 /**
  * Create the WebChannel plugin, backed by the lazy NATS transport facade.
+ *
+ * S1 (accountId-aware approvals): the approval capability additionally gets a
+ * PER-ACCOUNT transport resolver over `accountRuntimes`, so each account's
+ * native approval handler (core starts one per configured account) delivers
+ * and finalizes prompts on ITS OWN channel — never the primary facade. The
+ * resolver reads the live map at call time (the map fills in `registerFull`,
+ * well before any approval can fire); an unscoped (null) context reads the
+ * `"default"` account, and an unknown account falls back to the lazy facade
+ * inside the capability (legacy primary behavior, never a dropped frame).
  */
-const webChannelPlugin = createWebChannelPlugin(lazyTransport);
+const webChannelPlugin = createWebChannelPlugin(lazyTransport, {
+  resolveApprovalTransport: (accountId) =>
+    accountRuntimes.get(accountId ?? "default")?.channel as unknown as
+      | WebChannelTransport
+      | undefined,
+});
 
 export default defineChannelPluginEntry({
   id: "webchannel",
@@ -489,8 +503,11 @@ export default defineChannelPluginEntry({
       }
 
       // ---- Step 4 (per account): approval decision handler -----------------
+      // S1: pass THIS account's id so the fail-closed approver check reads the
+      // account's own `execApprovals.approvers` — a peer who is an approver on
+      // another account cannot resolve approvals via this account's channel.
       channel.setApprovalDecisionHandler((peerId, id, decision) => {
-        void handleApprovalDecision(api.config, id, decision, peerId).catch((err) => {
+        void handleApprovalDecision(api.config, id, decision, peerId, accountId).catch((err) => {
           api.logger.error?.(`webchannel: approval resolve failed (${id}): ${String(err)}`);
         });
       });
@@ -649,16 +666,18 @@ export default defineChannelPluginEntry({
     }
 
     // Bind the lazy transport facade to a PRIMARY channel for core-initiated
-    // (untargeted) outbound + the approval capability, which use the single
-    // facade. Inbound replies already route per-account via each channel's own
-    // dispatcher (so AC6's inbound routing is unaffected). Prefer "default", else
-    // the first built account.
+    // (untargeted) outbound. Inbound replies already route per-account via each
+    // channel's own dispatcher, and APPROVALS now route per-account too (S1):
+    // the approval capability resolves the originating account's channel via
+    // `resolveApprovalTransport` above, so the facade only backstops an
+    // unknown-account fallback there. Prefer "default", else the first built
+    // account.
     //
-    // Cycle 3 follow-up: this is primary-only. A peerId that happens to be
-    // registered on BOTH the primary AND a non-primary account could receive the
-    // primary account's PROACTIVE / APPROVAL outbound (the untargeted facade
-    // can't disambiguate by account). Per-account proactive-outbound + approval
-    // routing needs an accountId-aware outbound facade (Cycle 3).
+    // Remaining follow-up (S1 outbound leg): core-initiated UNTARGETED sends
+    // (`sendTextToAnyOpen` etc.) are still primary-only — a peerId registered on
+    // BOTH the primary AND a non-primary account could receive the primary
+    // account's proactive outbound. Decide semantics when agent-initiated
+    // outbound is built (docs/BACKLOG.md S1).
     const primary = accountRuntimes.get("default") ?? [...accountRuntimes.values()][0];
     boundChannel = primary ? primary.channel : null;
 
