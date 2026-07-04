@@ -50,6 +50,15 @@ function constantTimeEqual(a: string, b: string): boolean {
 }
 
 /**
+ * Collapse any trailing slash(es) from a URL-style issuer so `https://x` and
+ * `https://x/` compare equal. Used ONLY for the `iss` claim comparison — a
+ * trailing slash is not a meaningful part of an origin identifier.
+ */
+function stripTrailingSlashes(s: string): string {
+  return s.replace(/\/+$/, "");
+}
+
+/**
  * RFC 4648 §5 base64url decode that tolerates missing padding. We can't use
  * Node's `Buffer.from(..., "base64url")` because that path isn't available in
  * Cloudflare Workers; the Web Crypto API only gives us raw bytes via
@@ -252,9 +261,18 @@ export async function verifyJwt(
     return null;
   }
 
-  // iss — constant-time compare against expected issuer.
+  // iss — constant-time compare against expected issuer, tolerant of a trailing
+  // slash. A URL issuer `https://x` and `https://x/` denote the same origin, but
+  // the SaaS mints `iss` verbatim from its base URL while the gateway derives its
+  // EXPECTED issuer from a possibly-differently-slashed `--base-url`; an exact
+  // compare turns that cosmetic difference into a silent reject-every-token trap.
+  // Collapsing trailing slashes on BOTH sides removes it for every deployment
+  // (including external IdPs the plugin can't normalize). NOT a relaxation: it
+  // only equates trailing-slash variants of the SAME issuer, never distinct hosts.
   if (typeof payload.iss !== "string") return null;
-  if (!constantTimeEqual(payload.iss, opts.issuer)) return null;
+  if (!constantTimeEqual(stripTrailingSlashes(payload.iss), stripTrailingSlashes(opts.issuer))) {
+    return null;
+  }
 
   // aud — string OR array. We accept if the expected audience appears anywhere.
   const aud = payload.aud;

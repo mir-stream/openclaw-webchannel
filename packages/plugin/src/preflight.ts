@@ -52,6 +52,19 @@ export function deriveJwksUrl(saasBaseUrl: string): string {
   return joinUrl(saasBaseUrl, ".well-known/jwks.json");
 }
 
+/**
+ * The JWT `issuer` derived from a SaaS base URL (invariant: issuer = SaaS base
+ * URL). Trailing slashes are stripped so the derivation is CANONICAL and matches
+ * the (slash-collapsed) `deriveJwksUrl` — otherwise `--base-url https://x/`
+ * would pin `iss="https://x/"` while a SaaS that mints the canonical
+ * `iss="https://x"` gets rejected on every bootstrap JWT (the silent
+ * issuer-mismatch trap). Single source of truth for both preflight and the
+ * runtime `deriveAccountAuth`.
+ */
+export function deriveIssuer(saasBaseUrl: string): string {
+  return saasBaseUrl.replace(/\/+$/, "");
+}
+
 // ===========================================================================
 // Gate B — gateway-start readiness reporter (PURE)
 // ===========================================================================
@@ -360,7 +373,7 @@ export async function runAddPreflight(
   opts: RunAddPreflightOptions,
 ): Promise<AddPreflightReport> {
   const timeoutMs = opts.timeoutMs ?? 5000;
-  const effectiveIssuer = opts.pinnedIssuer ?? opts.saasBaseUrl;
+  const effectiveIssuer = opts.pinnedIssuer ?? deriveIssuer(opts.saasBaseUrl);
   const effectiveAudience = opts.pinnedAudience ?? opts.accountId;
   const derivedJwksUrl = deriveJwksUrl(opts.saasBaseUrl);
 
@@ -369,7 +382,13 @@ export async function runAddPreflight(
   try {
     const cache = JWKSCache.create(
       { jwksUrl: derivedJwksUrl },
-      opts.fetchImpl !== undefined ? { fetchImpl: opts.fetchImpl } : undefined,
+      // Bound the JWKS fetch by the SAME budget as the relay dial so `channels add`
+      // stays responsive (otherwise the default 10s JWKS timeout would run before
+      // the 5s dial, blowing the operator-facing budget).
+      {
+        fetchTimeoutMs: timeoutMs,
+        ...(opts.fetchImpl !== undefined ? { fetchImpl: opts.fetchImpl } : {}),
+      },
     );
     const doc = await cache.warm();
     jwks = { keyCount: doc.keys.length };

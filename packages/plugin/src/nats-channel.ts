@@ -608,15 +608,39 @@ export class NatsChannel {
    * registered handler and route its reply to the NATS reply-to inbox.
    *
    * The reply is published to `msg.replyTo` (the browser's request-scoped inbox
-   * subject), never to a peerId-derived subject, so a spoofed subject peerId can
-   * never redirect a reply. A request with no reply-to (e.g. fire-and-forget
-   * `unregister`) simply gets a no-op reply callback.
+   * subject). A request with no reply-to (e.g. fire-and-forget `unregister`)
+   * simply gets a no-op reply callback.
+   *
+   * SECURITY (reply-to redirect): NATS does NOT constrain a requester's reply-to
+   * against its publish permissions, and the agent publishes with tenant-wide
+   * creds. Left unchecked, a caller could set reply-to to a subject in ANOTHER
+   * peer's tree (e.g. `…{other}.out`) and make the agent inject a plaintext
+   * register reply onto that peer's E2E-encrypted channel → decrypt-failure /
+   * reconnect churn. So a reply-to that lands INSIDE the webchannel namespace is
+   * confined to the SUBJECT's own peer subtree (`webchannel.{tenant}.{accountId}.
+   * {peerId}.…`). `peerId` here is the subject-routing segment, NOT the JWT
+   * identity (that is verified later, in `handleRegisterRequest`); the confinement
+   * is nonetheless sound because a browser's NATS creds are scoped
+   * `webchannel.{tenant}.*.{peerId}.>`, pinning the peerId segment it can publish
+   * a `.register` on to its OWN peerId — so the subject peerId == the requester's
+   * own peerId, and the reply can only reach that requester's subtree. A standard
+   * `_INBOX.*` (or any non-webchannel subject, used by test/e2e drivers) is left
+   * alone (harmless: it can't address another peer's encrypted `.out`).
    */
   private handleRegister(msg: NatsMessage, peerId: string): void {
     if (!this.onRegisterRequest) return;
     const replyTo = msg.replyTo;
+    const ownSubtreePrefix = `webchannel.${this.tenant}.${this.accountId}.${peerId}.`;
     const reply = (response: string): void => {
-      if (replyTo) this.transport.publish(replyTo, response);
+      if (!replyTo) return; // fire-and-forget (e.g. unregister)
+      if (replyTo.startsWith("webchannel.") && !replyTo.startsWith(ownSubtreePrefix)) {
+        console.warn(
+          `[nats-channel] Dropping register reply for ${peerId}: reply-to "${replyTo}" ` +
+            `targets a subject outside the requester's own subtree`,
+        );
+        return;
+      }
+      this.transport.publish(replyTo, response);
     };
     this.onRegisterRequest(peerId, msg.payload.toString(), reply);
   }
