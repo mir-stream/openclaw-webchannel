@@ -5,10 +5,11 @@
  * nats-register.ts): `subscribeRegister` subscribes the `.register` wildcard, a
  * request on `…{peerId}.register` is routed to the handler with the subject
  * peerId + raw payload, and the handler's reply is published to the request's
- * NATS reply-to inbox — which must lie within the requester's OWN peer subtree
- * (`webchannel.{tenant}.{accountId}.{peerId}.…`, e.g. the production
- * `…{peerId}.reginbox.{token}`); a reply-to aimed at another peer's webchannel
- * subtree is dropped (redirect guard).
+ * NATS reply-to inbox — which is ALLOWLISTED to the requester's OWN reginbox
+ * (`webchannel.{tenant}.{accountId}.{peerId}.reginbox.{token}`, the one shape
+ * the production client and every e2e/demo driver use). Any other reply-to —
+ * another peer's subtree, the requester's own non-reginbox subjects, `_INBOX.*`
+ * — is dropped (redirect guard).
  */
 
 import { EventEmitter } from "node:events";
@@ -21,6 +22,8 @@ const ACCOUNT = "agent-1";
 const PEER = "user-42";
 const regSubj = `webchannel.${TENANT}.${ACCOUNT}.${PEER}.register`;
 const regWild = `webchannel.${TENANT}.${ACCOUNT}.*.register`;
+const ownReginbox = (token: string): string =>
+  `webchannel.${TENANT}.${ACCOUNT}.${PEER}.reginbox.${token}`;
 
 class FakeTransport extends EventEmitter {
   connected = true;
@@ -50,6 +53,17 @@ function makeChannel(): { channel: NatsChannel; transport: FakeTransport } {
   return { channel, transport };
 }
 
+/** Wire a handler that replies `{nonce:"n1"}`, subscribe, and deliver one request. */
+function deliverChallenge(replyTo?: string): FakeTransport {
+  const { channel, transport } = makeChannel();
+  channel.setRegisterRequestHandler((_peerId, _payload, reply) => {
+    reply(JSON.stringify({ nonce: "n1" }));
+  });
+  channel.subscribeRegister();
+  transport.deliver(regSubj, JSON.stringify({ op: "challenge", token: "jwt" }), replyTo);
+  return transport;
+}
+
 describe("NatsChannel register-hop wiring", () => {
   it("subscribeRegister subscribes the `.register` wildcard", () => {
     const { channel, transport } = makeChannel();
@@ -57,7 +71,7 @@ describe("NatsChannel register-hop wiring", () => {
     expect(transport.subs).toContain(regWild);
   });
 
-  it("routes a register request to the handler and publishes the reply to the reply-to inbox", () => {
+  it("routes a register request to the handler and publishes the reply to the requester's own reginbox", () => {
     const { channel, transport } = makeChannel();
     const seen: Array<{ peerId: string; payload: string }> = [];
     channel.setRegisterRequestHandler((peerId, payload, reply) => {
@@ -67,44 +81,61 @@ describe("NatsChannel register-hop wiring", () => {
     channel.subscribeRegister();
 
     const body = JSON.stringify({ op: "challenge", token: "jwt" });
-    transport.deliver(regSubj, body, "_INBOX.abc");
+    transport.deliver(regSubj, body, ownReginbox("tok123"));
 
     // Handler saw the subject peerId + raw payload.
     expect(seen).toEqual([{ peerId: PEER, payload: body }]);
-    // The reply was published to the request's reply-to inbox, NOT a peer subject.
-    expect(transport.published).toContainEqual({
-      subject: "_INBOX.abc",
-      payload: JSON.stringify({ nonce: "n1" }),
-    });
-    expect(transport.published.some((p) => p.subject.includes(PEER))).toBe(false);
+    // The reply went to the request's reply-to inbox and nowhere else.
+    expect(transport.published).toEqual([
+      { subject: ownReginbox("tok123"), payload: JSON.stringify({ nonce: "n1" }) },
+    ]);
   });
 
   it("drops a reply-to that targets ANOTHER peer's webchannel subtree (redirect guard)", () => {
-    const { channel, transport } = makeChannel();
-    channel.setRegisterRequestHandler((_peerId, _payload, reply) => {
-      reply(JSON.stringify({ nonce: "n1" }));
-    });
-    channel.subscribeRegister();
-
     // Attacker publishes on their OWN register subject but sets reply-to to a
     // victim's `.out` — the agent must refuse to publish there.
     const victimOut = `webchannel.${TENANT}.${ACCOUNT}.victim-99.out`;
-    transport.deliver(regSubj, JSON.stringify({ op: "challenge", token: "jwt" }), victimOut);
-    expect(transport.published.some((p) => p.subject === victimOut)).toBe(false);
+    const transport = deliverChallenge(victimOut);
     expect(transport.published).toHaveLength(0);
   });
 
-  it("allows an in-namespace reginbox reply-to within the requester's own subtree", () => {
-    const { channel, transport } = makeChannel();
-    channel.setRegisterRequestHandler((_peerId, _payload, reply) => {
-      reply(JSON.stringify({ nonce: "n1" }));
-    });
-    channel.subscribeRegister();
+  it("drops a reply-to in the requester's OWN subtree that is not its reginbox (no self-bounce)", () => {
+    // Own `.in` / `.register` etc. would bounce the plaintext reply back through
+    // the agent's own handlers — allowlist rejects everything but reginbox.
+    for (const subject of [
+      `webchannel.${TENANT}.${ACCOUNT}.${PEER}.in`,
+      `webchannel.${TENANT}.${ACCOUNT}.${PEER}.register`,
+      `webchannel.${TENANT}.${ACCOUNT}.${PEER}.handshake`,
+    ]) {
+      expect(deliverChallenge(subject).published).toHaveLength(0);
+    }
+  });
 
-    const ownInbox = `webchannel.${TENANT}.${ACCOUNT}.${PEER}.reginbox.tok123`;
-    transport.deliver(regSubj, JSON.stringify({ op: "challenge", token: "jwt" }), ownInbox);
+  it("drops a reply-to outside the webchannel namespace (`_INBOX.*` etc.)", () => {
+    // No real consumer uses `_INBOX` (the reginbox is in-namespace precisely so
+    // browser creds need no `_INBOX.>` grant); the guard is an allowlist.
+    expect(deliverChallenge("_INBOX.abc").published).toHaveLength(0);
+    expect(deliverChallenge("orders.create").published).toHaveLength(0);
+  });
+
+  it("drops an own-reginbox reply-to with an EMPTY token (invalid subject shape)", () => {
+    expect(deliverChallenge(`webchannel.${TENANT}.${ACCOUNT}.${PEER}.reginbox.`).published)
+      .toHaveLength(0);
+  });
+
+  it("drops a reginbox reply-to under a DIFFERENT peerId, including a prefix-peerId", () => {
+    // `user-4` is a strict prefix of `user-42` — the trailing dot in the
+    // allowlist prefix must keep these distinct.
+    expect(deliverChallenge(`webchannel.${TENANT}.${ACCOUNT}.other.reginbox.t`).published)
+      .toHaveLength(0);
+    expect(deliverChallenge(`webchannel.${TENANT}.${ACCOUNT}.user-4.reginbox.t`).published)
+      .toHaveLength(0);
+  });
+
+  it("allows the requester's own reginbox reply-to", () => {
+    const transport = deliverChallenge(ownReginbox("tok123"));
     expect(transport.published).toContainEqual({
-      subject: ownInbox,
+      subject: ownReginbox("tok123"),
       payload: JSON.stringify({ nonce: "n1" }),
     });
   });
@@ -132,7 +163,7 @@ describe("NatsChannel register-hop wiring", () => {
     });
     channel.subscribeRegister();
 
-    transport.deliver(regSubj, JSON.stringify({ op: "challenge", token: "jwt" }), "_INBOX.x");
+    transport.deliver(regSubj, JSON.stringify({ op: "challenge", token: "jwt" }), ownReginbox("x"));
     expect(handlerCalls).toBe(1);
   });
 });

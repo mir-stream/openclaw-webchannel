@@ -613,30 +613,35 @@ export class NatsChannel {
    *
    * SECURITY (reply-to redirect): NATS does NOT constrain a requester's reply-to
    * against its publish permissions, and the agent publishes with tenant-wide
-   * creds. Left unchecked, a caller could set reply-to to a subject in ANOTHER
-   * peer's tree (e.g. `…{other}.out`) and make the agent inject a plaintext
-   * register reply onto that peer's E2E-encrypted channel → decrypt-failure /
-   * reconnect churn. So a reply-to that lands INSIDE the webchannel namespace is
-   * confined to the SUBJECT's own peer subtree (`webchannel.{tenant}.{accountId}.
-   * {peerId}.…`). `peerId` here is the subject-routing segment, NOT the JWT
-   * identity (that is verified later, in `handleRegisterRequest`); the confinement
-   * is nonetheless sound because a browser's NATS creds are scoped
-   * `webchannel.{tenant}.*.{peerId}.>`, pinning the peerId segment it can publish
-   * a `.register` on to its OWN peerId — so the subject peerId == the requester's
-   * own peerId, and the reply can only reach that requester's subtree. A standard
-   * `_INBOX.*` (or any non-webchannel subject, used by test/e2e drivers) is left
-   * alone (harmless: it can't address another peer's encrypted `.out`).
+   * creds — an unchecked reply-to would let a caller aim the agent's plaintext
+   * register reply at an arbitrary subject (another peer's E2E-encrypted `.out`
+   * → decrypt-failure/reconnect churn, or any subject the caller can't publish
+   * to itself, riding the agent's broader creds). The guard is an ALLOWLIST of
+   * the ONE shape every real consumer uses: the requester's own
+   * `webchannel.{tenant}.{accountId}.{peerId}.reginbox.{token}` (production
+   * client `nats-client.ts` and all e2e/demo drivers; the reginbox is
+   * in-namespace precisely so browser creds need no `_INBOX.>` grant — the
+   * agent's own creds may not even cover `_INBOX.*`). Everything else is
+   * dropped with a warn: another peer's subtree, the requester's own
+   * `.in`/`.handshake`/`.register` (a self-bounce through the agent's handlers),
+   * `_INBOX.*`, foreign namespaces. `peerId` here is the subject-routing
+   * segment, NOT the JWT identity (that is verified later, in
+   * `handleRegisterRequest`); the confinement is nonetheless sound because a
+   * browser's NATS creds are scoped `webchannel.{tenant}.*.{peerId}.>`, pinning
+   * the peerId segment it can publish a `.register` on to its OWN peerId — so
+   * the reply can only reach that requester's own reginbox.
    */
   private handleRegister(msg: NatsMessage, peerId: string): void {
     if (!this.onRegisterRequest) return;
     const replyTo = msg.replyTo;
-    const ownSubtreePrefix = `webchannel.${this.tenant}.${this.accountId}.${peerId}.`;
+    const ownReginboxPrefix = `webchannel.${this.tenant}.${this.accountId}.${peerId}.reginbox.`;
     const reply = (response: string): void => {
       if (!replyTo) return; // fire-and-forget (e.g. unregister)
-      if (replyTo.startsWith("webchannel.") && !replyTo.startsWith(ownSubtreePrefix)) {
+      // Allowlist: own reginbox with a non-empty token, nothing else.
+      if (!replyTo.startsWith(ownReginboxPrefix) || replyTo.length === ownReginboxPrefix.length) {
         console.warn(
           `[nats-channel] Dropping register reply for ${peerId}: reply-to "${replyTo}" ` +
-            `targets a subject outside the requester's own subtree`,
+            `is not the requester's own reginbox (expected "${ownReginboxPrefix}{token}")`,
         );
         return;
       }

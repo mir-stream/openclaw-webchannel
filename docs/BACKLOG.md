@@ -97,36 +97,21 @@ agent-initiated outbound is built. Until the approvals leg lands, the interim po
 approvals on a multi-account gateway deliver via the primary channel only (misroute/drop for
 non-primary turns).
 
-## N2 — tighten the register reply-to redirect guard to `reginbox`-only
+## ✅ N2 — register reply-to redirect guard tightened to own-reginbox-only (DONE)
 
-**Origin:** PR #6 review (2026-07-04). Non-blocking hardening; safe today, but the safety argument
-rests on NATS credential scoping rather than on the guard itself.
+**Origin:** PR #6 review (2026-07-04). Closed same day, stricter than originally scoped: the
+consumer sweep found EVERY real consumer (production client `nats-client.ts` + all e2e/demo
+drivers) uses exactly `webchannel.{tenant}.{accountId}.{peerId}.reginbox.{token}`, and `_INBOX.*`
+appeared only in two unit tests — so the guard became a pure ALLOWLIST of that one shape (own
+reginbox, non-empty token) instead of the planned "confine in-namespace, pass through the rest".
 
-**Current behavior** (`packages/plugin/src/nats-channel.ts` `handleRegister`): a register
-request's reply-to that lands inside the webchannel namespace is confined to the requester's OWN
-peer subtree (`webchannel.{tenant}.{accountId}.{peerId}.`); anything outside is dropped, and
-non-webchannel subjects (`_INBOX.*`, used by test/e2e drivers) pass through. This blocks the real
-attack (redirecting the plaintext register reply onto another peer's encrypted `.out`), **but**
-still allows a peer to point the reply at its own `.in` / `.handshake` / `.register`, bouncing the
-reply through the agent's own handlers.
-
-**Why it's harmless today (verified):** no privilege gain — the peer can already publish to its own
-subtree directly with its own creds; a `.register` bounce terminates in one hop (the redelivered
-message carries no reply-to); `.in`/`.handshake` bounces fail decrypt/parse and are dropped. The
-residual value of tightening is defense-in-depth: today's argument depends on browser creds being
-scoped `webchannel.{tenant}.*.{peerId}.>` and agent creds being webchannel-scoped — if either scope
-is ever loosened, the guard is the only line left.
-
-**Do when:** touching NATS credential scoping (the tenant-wide→per-peer follow-up, live-gateway
-admission migration) or next time the register path is edited.
-
-**Scope of the fix:**
-- [ ] in-namespace reply-to must contain a `reginbox` segment (one-line guard condition change);
-  the production client already uses `…{peerId}.reginbox.{token}` exclusively
-- [ ] update the "allows an in-namespace reginbox reply-to" test's sibling (own-subtree non-reginbox
-  → now dropped)
-- [ ] sweep e2e/demo drivers first: `_INBOX.*` users are unaffected, but verify none use an
-  in-namespace non-reginbox reply-to
+- [x] `handleRegister` allowlist guard (own reginbox + non-empty token; everything else dropped
+  with a warn — other peers' subtrees, own `.in`/`.handshake`/`.register` self-bounce, `_INBOX.*`,
+  foreign namespaces)
+- [x] tests rewritten to the allowlist semantics (+5 cases: self-bounce, `_INBOX` drop, empty
+  token, foreign-peer/prefix-peerId reginbox)
+- [x] consumer sweep (precondition): all drivers reginbox-only, nothing broken
+- [x] verified live: `run-enrolled-transport.sh` full register hop + encrypted round-trip PASS
 
 ## Remove the legacy Gateway-WS transport (`hmac-ticket` strategy: DONE)
 
