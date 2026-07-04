@@ -7,7 +7,7 @@
  *   - Type exports: Trust chain artifacts and enrollment types
  *
  * USAGE:
- *   import { setupTrustChain, DeviceFlowEnrollment } from '@openclaw/webchannel-saas';
+ *   import { setupTrustChain, DeviceFlowEnrollment } from '@mir-stream/webchannel-saas';
  *
  *   const trustChain = await setupTrustChain({
  *     operatorName: 'my-saas-operator',

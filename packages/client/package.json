@@ -1,9 +1,17 @@
 {
-  "name": "openclaw-webchannel-client",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@mir-stream/webchannel-client",
+  "version": "0.1.0",
   "description": "Framework-agnostic, zero-dependency browser client for WebChannel (headless connection + protocol + state).",
+  "license": "UNLICENSED",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mir-stream/openclaw-webchannel.git",
+    "directory": "packages/client"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",

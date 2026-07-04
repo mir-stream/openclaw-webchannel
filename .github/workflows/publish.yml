@@ -1,0 +1,55 @@
+################################################################################
+# publish.yml — Publish @mir-stream/webchannel-client and
+# @mir-stream/webchannel-saas to GitHub Packages (private npm registry).
+#
+# Trigger: push a tag like v0.1.0 (both packages share one version), or run
+# manually via workflow_dispatch. Uses the built-in GITHUB_TOKEN — no PAT or
+# npm creds needed on the publish side; packages inherit the repo's private
+# visibility.
+#
+# Consumers need an .npmrc pointing @mir-stream at npm.pkg.github.com plus a
+# read:packages token — see docs/PUBLISHING.md.
+################################################################################
+
+name: Publish Packages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: "@mir-stream"
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build -w packages/client -w packages/saas
+
+      - name: Unit tests (client + saas)
+        run: |
+          npm test -w packages/client
+          npm test -w packages/saas
+        env:
+          # Real-server suites self-skip when nats-server is absent; the full
+          # gate (e2e-gate.yml) covers them on every push already.
+          CI: "true"
+
+      - name: Publish to GitHub Packages
+        run: npm publish -w packages/client -w packages/saas
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

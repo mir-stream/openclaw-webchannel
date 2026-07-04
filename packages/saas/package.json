@@ -1,14 +1,27 @@
 {
-  "name": "@openclaw/webchannel-saas",
-  "version": "0.0.0",
+  "name": "@mir-stream/webchannel-saas",
+  "version": "0.1.0",
   "description": "Headless SaaS trust chain core + reference harness for WebChannel NATS relay",
-  "private": true,
+  "license": "UNLICENSED",
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./src/index.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mir-stream/openclaw-webchannel.git",
+    "directory": "packages/saas"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   },
   "engines": {
     "node": ">=22.0.0"
@@ -16,8 +29,9 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "build": "tsc",
-    "setup-trust-chain": "node ./dist/reference/setup-trust-chain.js"
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "setup-trust-chain": "tsx ./reference/setup-trust-chain.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
