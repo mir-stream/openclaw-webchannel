@@ -140,6 +140,24 @@ jobs:
         run: npm run typecheck --workspace=packages/saas
 
       # ──────────────────────────────────────────────────────────────────────
+      # 5b. Build the publishable packages (dist/) and run the examples'
+      #     CONSUMER tests with their own runner (plain node, node:test/TAP).
+      #     They import @mir-stream/* by package ENTRY (main/exports → dist/),
+      #     exactly like a downstream consumer — no dist ⇒ no resolve. They are
+      #     deliberately EXCLUDED from the root vitest sweep (vitest.config.ts):
+      #     vite's resolver doesn't produce the node error codes they assert.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Build packages (saas + client dist for examples tests)
+        run: |
+          npm run build --workspace=packages/saas
+          npm run build --workspace=packages/client
+
+      - name: Examples consumer tests (public-API boundary)
+        run: |
+          npm test --workspace=examples/minimal-consumer
+          npm test --workspace=examples/webchannel-app
+
+      # ──────────────────────────────────────────────────────────────────────
       # 6. Run all test suites with JSON output for baseline verification
       #    - Baseline: ≥712 tests across all 3 packages
       #    - Real-server suites (skipIf removed in CI) now run against the
