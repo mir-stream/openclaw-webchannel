@@ -38,6 +38,13 @@ export type {
   DeviceCnfJwk,
   DevicePopJwk,
 } from "./bootstrap-claims.js";
+// 0.1.2 additive public API: RS256 bootstrap-JWT signer + browser NATS creds.
+export { createBootstrapIssuer, type BootstrapIssuer } from "./bootstrap-issuer.js";
+export {
+  issueBrowserCredentials,
+  type BrowserCredentials,
+  type IssueBrowserCredentialsOptions,
+} from "./nats-user-creds.js";
 export type {
   SetupTrustChainResult,
   SaasTrustChainPrivate,

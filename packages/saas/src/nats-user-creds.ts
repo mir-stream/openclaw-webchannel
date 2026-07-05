@@ -191,3 +191,93 @@ export async function mintNatsUserCreds(
 
   return { userJwt, userSeed, userSeedRaw, permissions: { pub, sub } };
 }
+
+// ---------------------------------------------------------------------------
+// Public API (barrel-exported): browser-login NATS credentials.
+// ---------------------------------------------------------------------------
+
+/**
+ * Browser NATS credentials returned by {@link issueBrowserCredentials}.
+ *
+ * Only the fields a browser `WebChannelNATSClient` needs. The base32 `userSeed`
+ * (`SU…`) is deliberately DROPPED — the browser signs the server nonce from the
+ * raw seed via `crypto.subtle` alone, so it never touches an NKEY decoder. A Node
+ * consumer that needs the base32 form must mint through the internal helper.
+ */
+export type BrowserCredentials = {
+  /** NATS user JWT (compact), signed by the account NKEY. */
+  userJwt: string;
+  /** base64url of the raw 32-byte Ed25519 user-NKEY seed — `WebChannelNATSClient` requires it. */
+  userSeedRaw: string;
+  /** The pub/sub allow-lists embedded in the JWT. */
+  permissions: { pub: string[]; sub: string[] };
+};
+
+/**
+ * Options for {@link issueBrowserCredentials}.
+ */
+export type IssueBrowserCredentialsOptions = {
+  /** SaaS NATS account signing seed (`loadOrCreateTrustChain().private.natsAccountSeed`). */
+  accountSeed: string;
+  /** Tenant the browser is scoped to. */
+  tenant: string;
+  /**
+   * The browser peer's STABLE identity (the authenticated session/JWT `sub` =
+   * user uuid). REQUIRED: the grant is pinned to `webchannel.{tenant}.*.{peerId}.>`
+   * so the browser can only touch its own peer subtree. MUST come from the
+   * authenticated session — NEVER from client input — or a peer can impersonate
+   * another and forge its register replies.
+   */
+  peerId: string;
+  /**
+   * Optional account IDENTITY public NKEY (`A…`) for an externally-managed account
+   * (Synadia Cloud / NGS). Present ONLY in external mode — a self-contained demo
+   * leaves it unset (setting it couples the creds to a managed resolver).
+   */
+  issuerAccountId?: string;
+  /**
+   * Optional lifetime (seconds). When set it MUST be a finite positive number —
+   * a `0`/negative/NaN/Infinity value would mint a NON-expiring or malformed-exp
+   * credential (a footgun), so this wrapper rejects it. Omit for a non-expiring
+   * credential.
+   */
+  ttlSeconds?: number;
+};
+
+/**
+ * Mint browser-login NATS credentials — the first public path for issuing a
+ * per-peer-scoped browser credential (`role:"browser"`, pinned to
+ * `webchannel.{tenant}.*.{peerId}.>`). A thin, safe wrapper over the internal
+ * `mintNatsUserCreds`: `peerId` is type-required, `ttlSeconds` (if present) must
+ * be `> 0`, and only the browser-relevant fields are returned ({@link BrowserCredentials}).
+ *
+ * The raw NKEY mint / role selection stays internal — an operator can only ever
+ * mint a correctly-scoped browser credential through this door.
+ */
+export async function issueBrowserCredentials(
+  o: IssueBrowserCredentialsOptions,
+): Promise<BrowserCredentials> {
+  if (o.ttlSeconds !== undefined && !(Number.isFinite(o.ttlSeconds) && o.ttlSeconds > 0)) {
+    // NaN/Infinity/fractional-or-negative all slip past a naive `<= 0` check and
+    // would mint a silently non-expiring or malformed-exp credential.
+    throw new Error(
+      "issueBrowserCredentials: ttlSeconds must be a finite positive number when provided (0/NaN/Infinity/negative would mint a non-expiring or malformed credential)",
+    );
+  }
+  if (!o.peerId) {
+    throw new Error("issueBrowserCredentials: peerId is required (the authenticated session subject)");
+  }
+  const minted = await mintNatsUserCreds({
+    role: "browser",
+    accountSeed: o.accountSeed,
+    tenant: o.tenant,
+    peerId: o.peerId,
+    ...(o.issuerAccountId ? { issuerAccountId: o.issuerAccountId } : {}),
+    ...(o.ttlSeconds ? { ttlSeconds: o.ttlSeconds } : {}),
+  });
+  return {
+    userJwt: minted.userJwt,
+    userSeedRaw: minted.userSeedRaw,
+    permissions: minted.permissions,
+  };
+}
