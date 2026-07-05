@@ -1,6 +1,8 @@
 # Project Status — single source of truth
 
-_Last updated: 2026-07-01._
+_Last updated: 2026-07-01 (publishing rows corrected 2026-07-05 — packages are now LIVE; the
+rest of this file has NOT been re-audited since 07-01 and lags the demo/multidevice/publishing
+work on `develop`)._
 
 This document supersedes any "AC 100% / complete / verified" claim found in commit messages,
 Ouroboros seeds (`.ouroboros/*`), evaluator scores, or older notes. Where those conflict with
@@ -48,7 +50,9 @@ this file, **this file is correct.**
 - **Proof-of-Possession is complete on both sides** — the gate (verify) rejects bad/missing/expired
   proofs, and the producer (SaaS mints `pop_jwk`; the browser `registerWithPop` signs the nonce
   challenge) makes the positive path work, proven against a faithful verifier replica.
-- **Not done:** real ClawHub/npm publish (needs registry creds). Everything else hermetic is green.
+- ~~**Not done:** real ClawHub/npm publish (needs registry creds).~~ **DONE (2026-07-04/05):**
+  plugin `openclaw-webchannel@0.1.0` LIVE on ClawHub; `@mir-stream/webchannel-{saas,client}@0.1.3`
+  LIVE on GitHub Packages (tag-triggered `publish.yml`). See `docs/PUBLISHING.md`.
 
 ## What works (verified)
 
@@ -74,7 +78,7 @@ this file, **this file is correct.**
 
 | Gap | Detail |
 |---|---|
-| Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
+| ~~Real ClawHub / npm publish~~ | **RESOLVED 2026-07-04/05** — the old `DonePublishDeferred` deferral is retired. Plugin `openclaw-webchannel@0.1.0` published to ClawHub (`clawhub:mir-stream/openclaw-webchannel`); libraries `@mir-stream/webchannel-{saas,client}@0.1.3` published to GitHub Packages via the tag-triggered `publish.yml` (auth = built-in `GITHUB_TOKEN`; consumers need a classic `read:packages` PAT while private). See `docs/PUBLISHING.md` (supersedes `docs/PACKAGING.md` for distribution). |
 | **Stability/security hardening (review 2026-07-02)** | Full-code review found deploy-blocking issues on the live NATS path. **FIXED (develop, uncommitted-upstream):** **C1** gateway-crash guard, **S1** auto-reconnect, **A1** `/enroll` OOM sweeper, plus ops **O1** (CI gate on dev branches), **O3** (smoke refuse-by-default), **O-min8** (flaky port-scan). **Still open:** **C2** (E2E handshake unauthenticated → active-relay MITM; accepted-risk while the relay is self-operated, hard-blocker before a third-party relay — code milestone-gated) and the un-started findings (S2/S3, A2/A3, CL1-3, SEC1-5, J8, …). Full findings + per-item FIXED status: [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md). C2 backlog: [`BACKLOG.md`](BACKLOG.md). |
 
 > The live NATS E2E path (browser → NATS → plugin/agent → reply → browser) is the production
@@ -166,7 +170,8 @@ echo-bot demo built 2026-06-25 to fake the agent side made this worse and was re
     so it does not hammer-retry); a `connectionEpoch` guard stops a drop+reconnect from letting a stale
     flow publish a stale handshake. The no-`registration` path is unchanged (dev/open-NATS wildcard).
     149 client tests pass.
-12. Packaging + **real** ClawHub/npm publish (registry creds) — or accept `DonePublishDeferred`.
+12. ✅ Packaging + **real** ClawHub/npm publish — DONE 2026-07-04/05 (ClawHub plugin 0.1.0;
+    GitHub Packages saas+client 0.1.3). The `DonePublishDeferred` escape hatch was never needed.
 13. ✅ **Live e2e of the HTTP register hop + retire the wildcard on the jwt path** — **Node-driver
     variant done**. `index-nats` now gates the dev/open-NATS wildcard: `subscribeWildcard()` is taken
     only when `auth.strategy !== "jwt"` (extracted to `packages/plugin/src/wildcard-gate.ts`
