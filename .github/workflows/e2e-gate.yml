@@ -7,17 +7,21 @@
 #  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
 #  - Both dev/open-NATS mode AND enrolled-JWT mode covered
 #
-# The gate runs on every push and PR to main/master branches.
-# NEVER disable or skip this gate — it is the definition of "plugin done".
+# The gate runs on every push and PR to the integration branches AND to the
+# working branches where development actually happens (develop, feature/**) —
+# review 2026-07-02 (O1): previously it triggered only on main/master/jwks, so
+# the branch all work lands on (develop) and every feature/* branch shipped
+# with the gate never running. NEVER disable or skip this gate — it is the
+# definition of "plugin done".
 ################################################################################
 
 name: E2E Gate
 
 on:
   push:
-    branches: [main, master, jwks]
+    branches: [main, master, develop, "feature/**"]
   pull_request:
-    branches: [main, master, jwks]
+    branches: [main, master, develop]
 
 # Only one gate run per branch/PR at a time; cancel stale in-progress runs.
 concurrency:
@@ -136,6 +140,24 @@ jobs:
         run: npm run typecheck --workspace=packages/saas
 
       # ──────────────────────────────────────────────────────────────────────
+      # 5b. Build the publishable packages (dist/) and run the examples'
+      #     CONSUMER tests with their own runner (plain node, node:test/TAP).
+      #     They import @mir-stream/* by package ENTRY (main/exports → dist/),
+      #     exactly like a downstream consumer — no dist ⇒ no resolve. They are
+      #     deliberately EXCLUDED from the root vitest sweep (vitest.config.ts):
+      #     vite's resolver doesn't produce the node error codes they assert.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Build packages (saas + client dist for examples tests)
+        run: |
+          npm run build --workspace=packages/saas
+          npm run build --workspace=packages/client
+
+      - name: Examples consumer tests (public-API boundary)
+        run: |
+          npm test --workspace=examples/minimal-consumer
+          npm test --workspace=examples/webchannel-app
+
+      # ──────────────────────────────────────────────────────────────────────
       # 6. Run all test suites with JSON output for baseline verification
       #    - Baseline: ≥712 tests across all 3 packages
       #    - Real-server suites (skipIf removed in CI) now run against the
@@ -186,7 +208,7 @@ jobs:
       #    real `inbound.run` agent path — the one thing the vitest e2e above
       #    does NOT (those use the deterministic `e2e-roundtrip-agent` seam).
       #    Boots an isolated gateway (auth.strategy="jwt", wildcard OFF) and
-      #    round-trips through the live HTTP /webchannel/nats/register hop.
+      #    round-trips through the live NATS register hop (`…{peerId}.register`).
       #    Reuses the already-installed nats-server (on PATH), npm deps, and the
       #    openclaw binary in node_modules/.bin. Fully hermetic under /tmp/oc-e2e
       #    (echo model, no LLM, no registry) — needs NO secret. Any non-zero exit
@@ -251,6 +273,20 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
       - name: "Live e2e: 2-account routing isolation"
         run: bash e2e/local/run-two-account-isolation.sh
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 8g. Live e2e: DERIVED trust anchor (zero hand-written JWT trust facts)
+      #    The ONLY harness that exercises `deriveAccountAuth` end-to-end: a fresh
+      #    `openclaw channels add` writes NO issuer/jwksUrl/audience (config-present-
+      #    wins would mask derivation otherwise). Asserts the on-disk config holds
+      #    zero trust facts, the Gate-B readiness line reports the DERIVED
+      #    issuer=<saasBaseUrl> · JWKS N>=1 keys · aud=<accountId> · register-hop,
+      #    then round-trips a real headless-Chromium encrypted register through the
+      #    live hop. Isolated under /tmp/oc-derived-e2e (port 19399) — hermetic, no
+      #    secret. Any non-zero exit FAILS the gate.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Live e2e: DERIVED trust anchor (zero hand-written trust facts)"
+        run: bash e2e/local/run-derived-trust.sh
 
 ################################################################################
 # Publish job — gated on the E2E gate passing + release tag

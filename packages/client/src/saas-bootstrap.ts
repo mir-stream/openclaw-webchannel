@@ -11,7 +11,7 @@
  *      by signing a SaaS-issued challenge with its X25519 private key.
  *   2. SaaS verifies the PoP, then issues a bootstrap JWT (RS256) that carries:
  *        • sub    — stable per-user identity (peerId) across devices.
- *        • agentId / tenant — routing scope claims.
+ *        • accountId / tenant — routing scope claims.
  *        • cnf.jwk — RFC 7800 confirmation claim binding the device's X25519
  *          public key.  This is the SINGLE source of truth for the device key;
  *          it MUST NOT be accepted from any channel other than this JWT.
@@ -84,7 +84,7 @@ export type CnfClaim = {
  *
  * `jwt` is the RS256 compact JWT issued by SaaS, containing:
  *   - Standard claims: iss, sub, aud, exp, iat, kid
- *   - Custom claims:   agentId, tenant
+ *   - Custom claims:   accountId, tenant
  *   - cnf.jwk:         device X25519 public key (RFC 7800)
  *
  * `agentPublicKey` is the agent's X25519 identity public key, attested and

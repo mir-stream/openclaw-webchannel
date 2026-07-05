@@ -32,7 +32,7 @@ SUAGMOCN73OQKB2ABCDEFGHIJKLMNOPQRSTUVWXYZ234567ABCDE
 
 const BASE = {
   tenant: "t1",
-  agentId: "a1",
+  accountId: "a1",
 } as const;
 
 describe("parseNatsCredsFile", () => {
@@ -180,7 +180,7 @@ describe("resolveNatsCredentialSource — enrolled (default)", () => {
       url: "ws://127.0.0.1:4222",
       saasBaseUrl: "https://saas.example",
       tenant: "t1",
-      agentId: "a1",
+      accountId: "a1",
     });
   });
 
@@ -268,7 +268,7 @@ describe("connectNatsCredentialSource — static branch", () => {
         url: "wss://n",
         saasBaseUrl: "https://saas.example",
         tenant: "t1",
-        agentId: "a1",
+        accountId: "a1",
       },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       { createEnrolled: createEnrolled as any },
@@ -279,7 +279,7 @@ describe("connectNatsCredentialSource — static branch", () => {
         saasPollUrl: "https://saas.example/api/poll",
         natsUrl: "wss://n",
         tenant: "t1",
-        agentId: "a1",
+        accountId: "a1",
       }),
     );
     expect(result.transport).toBe(fakeTransport);

@@ -1,5 +1,6 @@
 import { WebSocket } from "ws";
-const URL = "ws://127.0.0.1:18789/webchannel/ws";
+import { requireWsUrl } from "./_ws-url.mjs";
+const URL = requireWsUrl();
 const t0 = Date.now(); const ms = () => `${String(Date.now()-t0).padStart(6)}ms`;
 let phase = 1, got1=false, got2=false, ws;
 const log = s => console.log(`[${ms()}] ${s}`);

@@ -14,8 +14,9 @@
 
 import { WebSocket } from "ws";
 import fs from "node:fs";
+import { requireWsUrl } from "./_ws-url.mjs";
 
-const URL_BASE = process.env.WS_URL || "ws://127.0.0.1:18789/webchannel/ws";
+const URL_BASE = requireWsUrl();
 const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 30000);
 
 const boot = fs.readFileSync("/tmp/jwt-smoke.json", "utf8").trim().split("\n");

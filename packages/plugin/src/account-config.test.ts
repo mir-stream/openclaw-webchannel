@@ -208,14 +208,13 @@ describe("account-config: resolveAcquisitionIdentity", () => {
     const cfg = {
       channels: {
         webchannel: {
-          accounts: { acctA: { tenant: "tA", agentId: "aA", saas: { baseUrl: "http://s" } } },
+          accounts: { acctA: { tenant: "tA", saas: { baseUrl: "http://s" } } },
         },
       },
     };
     expect(resolveAcquisitionIdentity(cfg, "acctA")).toEqual({
       accountId: "acctA",
       tenant: "tA",
-      agentId: "aA",
       saasBaseUrl: "http://s",
     });
   });
@@ -223,14 +222,12 @@ describe("account-config: resolveAcquisitionIdentity", () => {
   it("falls back to top-level cfg for the default account only", () => {
     const cfg = {
       tenant: "topTenant",
-      agentId: "topAgent",
       saas: { baseUrl: "http://top" },
       channels: { webchannel: { allowFrom: ["a"] } },
     };
     expect(resolveAcquisitionIdentity(cfg, "default")).toEqual({
       accountId: "default",
       tenant: "topTenant",
-      agentId: "topAgent",
       saasBaseUrl: "http://top",
     });
   });
@@ -238,12 +235,12 @@ describe("account-config: resolveAcquisitionIdentity", () => {
   it("does NOT use top-level fallback for a non-default account with no own identity", () => {
     const cfg = {
       tenant: "topTenant",
-      agentId: "topAgent",
       channels: { webchannel: { accounts: { acctB: {} } } },
     };
     const id = resolveAcquisitionIdentity(cfg, "acctB");
     expect(id.tenant).toBe("default-tenant");
-    expect(id.agentId).toBe("default-agent");
+    // accountId is the wire identity (가-2); the handling agent is a bind concern.
+    expect(id.accountId).toBe("acctB");
     expect(id.saasBaseUrl).toBeUndefined();
   });
 
@@ -251,7 +248,6 @@ describe("account-config: resolveAcquisitionIdentity", () => {
     expect(resolveAcquisitionIdentity({}, "default")).toEqual({
       accountId: "default",
       tenant: "default-tenant",
-      agentId: "default-agent",
       saasBaseUrl: undefined,
     });
   });
@@ -325,6 +321,71 @@ describe("account-config: loadPersistedEnrolledCreds", () => {
       home: HOME,
       exists: (p) => p === perAccount,
       read: () => validFile,
+    });
+    expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
+  });
+
+  it("threads the SaaS-delivered natsUrl through when persisted", () => {
+    // EnrollmentResult.natsUrl is persisted under `enrollment.natsUrl`; the
+    // consumer dials it in preference to local config, so the loader must surface
+    // it. (Absent → omitted, exercised by the back-compat fixtures above.)
+    const withUrl = JSON.stringify({
+      enrollment: {
+        creds: { userJwt: "JWT", userSeed: "SEED" },
+        natsUrl: "wss://saas-delivered-relay",
+      },
+    });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const creds = loadPersistedEnrolledCreds("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => withUrl,
+    });
+    expect(creds).toEqual({
+      userJwt: "JWT",
+      userSeed: "SEED",
+      natsUrl: "wss://saas-delivered-relay",
+    });
+  });
+
+  it("threads the SaaS-delivered issuer through when persisted (VERBATIM)", () => {
+    // EnrollmentResult.issuer is persisted under `enrollment.issuer`; the runtime
+    // verifies bootstrap JWTs against it (pin > delivered > derived), so the
+    // loader must surface it — verbatim, trailing slash and all (verify compares
+    // slash-insensitively; the loader must not "helpfully" canonicalize).
+    const withIssuer = JSON.stringify({
+      enrollment: {
+        creds: { userJwt: "JWT", userSeed: "SEED" },
+        natsUrl: "wss://saas-delivered-relay",
+        issuer: "https://saas.local/demo-issuer/",
+      },
+    });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const creds = loadPersistedEnrolledCreds("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => withIssuer,
+    });
+    expect(creds).toEqual({
+      userJwt: "JWT",
+      userSeed: "SEED",
+      natsUrl: "wss://saas-delivered-relay",
+      issuer: "https://saas.local/demo-issuer/",
+    });
+  });
+
+  it("omits issuer for pre-issuer persisted creds and non-string junk (back-compat)", () => {
+    const junk = JSON.stringify({
+      enrollment: {
+        creds: { userJwt: "JWT", userSeed: "SEED" },
+        issuer: 42,
+      },
+    });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const creds = loadPersistedEnrolledCreds("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => junk,
     });
     expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
   });

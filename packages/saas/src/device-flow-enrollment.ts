@@ -64,6 +64,19 @@ const USER_CODE_FORMAT = "XXXX-XXXX";
  */
 const DEVICE_CODE_BYTES = 32;
 
+/**
+ * How often the in-memory store's background sweeper runs (default 60s).
+ */
+const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * How long past `expiresAt` an enrollment is retained before eviction
+ * (default 5 min). A grace window so a plugin polling shortly after expiry
+ * still observes the correct `expired_token` error rather than the confusing
+ * `invalid_device_code` ("not found"). After the window the record is reclaimed.
+ */
+const DEFAULT_RETENTION_MS = 300_000;
+
 // ---------------------------------------------------------------------------
 // Enrollment store interface
 // ---------------------------------------------------------------------------
@@ -101,14 +114,99 @@ export interface EnrollmentStore {
 }
 
 /**
+ * Options for {@link MemoryEnrollmentStore}.
+ */
+export type MemoryEnrollmentStoreOptions = {
+  /** Background sweep cadence in ms. Default 60_000. */
+  sweepIntervalMs?: number;
+  /**
+   * Retention past `expiresAt` before an enrollment is evicted, in ms.
+   * Default 300_000 (5 min grace window). See {@link DEFAULT_RETENTION_MS}.
+   */
+  retentionMs?: number;
+  /**
+   * Start the background interval sweeper automatically (default `true`).
+   * Set `false` in tests that want to drive {@link MemoryEnrollmentStore.sweep}
+   * deterministically without a live timer.
+   */
+  autoSweep?: boolean;
+};
+
+/**
  * In-memory enrollment store implementation.
  *
  * Suitable for single-process deployments. For multi-process, use a persistent
  * store (Redis, database, etc.) that implements the EnrollmentStore interface.
+ *
+ * Review 2026-07-02 (A1): a background TTL sweeper bounds memory. Without it the
+ * `enrollments`/`userCodeIndex` maps grew forever — expired, denied, and consumed
+ * records were never removed and `deleteEnrollment` had no caller — so an
+ * UNAUTHENTICATED `/enroll` endpoint was an OOM vector (each request added an
+ * entry that never left). The sweeper evicts every record once its `expiresAt`
+ * plus a grace window has elapsed, regardless of status, so a long-lived issuer's
+ * footprint stays bounded even under sustained (or hostile) enrollment traffic.
  */
 export class MemoryEnrollmentStore implements EnrollmentStore {
   private readonly enrollments = new Map<string, PendingEnrollment>();
   private readonly userCodeIndex = new Map<string, string>(); // user_code -> device_code
+  private readonly retentionMs: number;
+  private readonly sweepIntervalMs: number;
+  private sweepTimer: ReturnType<typeof setInterval> | undefined;
+
+  constructor(options: MemoryEnrollmentStoreOptions = {}) {
+    this.retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
+    this.sweepIntervalMs = options.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
+    if (options.autoSweep ?? true) this.startSweeper();
+  }
+
+  /**
+   * Evict every enrollment whose retention window (`expiresAt + retentionMs`)
+   * has fully elapsed, in BOTH maps. Pure and deterministic — pass `now` in
+   * tests. Returns the number of records evicted. Deleting from a Map during
+   * its own iteration is well-defined in JS.
+   */
+  sweep(now: number = Date.now()): number {
+    let evicted = 0;
+    for (const [deviceCode, enrollment] of this.enrollments) {
+      if (now > enrollment.expiresAt + this.retentionMs) {
+        // Only drop the user-code index entry if it still points at THIS
+        // record: on a user_code collision, saveEnrollment overwrote the index
+        // with a newer enrollment's device_code — deleting unconditionally
+        // here would orphan that live record (unreachable by user_code).
+        if (this.userCodeIndex.get(enrollment.user_code) === deviceCode) {
+          this.userCodeIndex.delete(enrollment.user_code);
+        }
+        this.enrollments.delete(deviceCode);
+        evicted++;
+      }
+    }
+    return evicted;
+  }
+
+  /**
+   * Start the background sweeper. The timer is `unref`'d so it NEVER keeps the
+   * process alive on its own (a long-lived issuer exits cleanly on SIGINT).
+   * Idempotent.
+   */
+  startSweeper(): void {
+    if (this.sweepTimer) return;
+    const timer = setInterval(() => {
+      this.sweep();
+    }, this.sweepIntervalMs);
+    if (typeof timer.unref === "function") timer.unref();
+    this.sweepTimer = timer;
+  }
+
+  /**
+   * Stop the background sweeper. Call on shutdown (or in tests that started it).
+   * Idempotent.
+   */
+  close(): void {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = undefined;
+    }
+  }
 
   async saveEnrollment(enrollment: PendingEnrollment): Promise<void> {
     this.enrollments.set(enrollment.device_code, enrollment);
@@ -201,11 +299,44 @@ export type DeviceFlowOptions = {
   bootstrapUrl: string;
 
   /**
+   * NATS WebSocket URL the enrolled plugin must dial. Delivered to the plugin in
+   * the `EnrollmentResult` so the relay location travels with the minted creds
+   * (the SaaS is the rendezvous authority — the URL is not plugin-side config).
+   * Example: "wss://nats.saas.com"
+   */
+  natsUrl: string;
+
+  /**
+   * The exact `iss` this SaaS puts in the bootstrap JWTs it mints, delivered
+   * to the plugin in the `EnrollmentResult` (same rendezvous-authority
+   * principle as `natsUrl`). Defaults to the trailing-slash-stripped
+   * `saasBaseUrl` — which matches the plugin's derivation, so a SaaS whose
+   * minted `iss` is its base URL needs no config here.
+   *
+   * CONTRACT: this MUST equal the `iss` you pass to `buildBootstrapClaims`.
+   * The library cannot enforce that (minting is a separate per-call
+   * parameter), so derive BOTH from one variable in your server — otherwise
+   * enrollment delivers a promise the mint breaks, and every agent rejects
+   * every bootstrap JWT with an opaque `unauthorized`.
+   */
+  issuer?: string;
+
+  /**
    * Enrollment store (defaults to in-memory).
    * Use a persistent store (Redis, DB) for production deployments.
    */
   store?: EnrollmentStore;
 };
+
+/**
+ * The delivered-issuer default: trailing-slash-stripped base URL. MUST mirror
+ * the plugin's `deriveIssuer` (packages/plugin/src/preflight.ts) so the
+ * default-configured SaaS delivers exactly what a default-configured plugin
+ * would have derived.
+ */
+function defaultIssuer(saasBaseUrl: string): string {
+  return saasBaseUrl.replace(/\/+$/, "");
+}
 
 // ---------------------------------------------------------------------------
 // Core enrollment service
@@ -222,12 +353,19 @@ export class DeviceFlowEnrollment {
   private readonly options: Required<Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId">> &
     Pick<DeviceFlowOptions, "natsIssuerAccountId">;
   private readonly store: EnrollmentStore;
+  /** A2: in-flight approvals keyed by userCode, to coalesce concurrent clicks. */
+  private readonly approvalsInFlight = new Map<string, Promise<EnrollmentResult | null>>();
 
   constructor(options: DeviceFlowOptions) {
     this.options = {
       expirationSeconds: DEFAULT_EXPIRATION_SECONDS,
       pollIntervalSeconds: MIN_POLL_INTERVAL_SECONDS,
       ...options,
+      // After the spread so an absent (or explicitly-undefined) `issuer` gets
+      // the derivation, keeping the `Required<>` cast honest. An explicit
+      // issuer is kept VERBATIM (no canonicalization — the SaaS declares the
+      // exact string it mints).
+      issuer: options.issuer ?? defaultIssuer(options.saasBaseUrl),
     };
     this.store = options.store ?? new MemoryEnrollmentStore();
   }
@@ -239,11 +377,11 @@ export class DeviceFlowEnrollment {
    * The plugin polls /poll until the operator approves the enrollment.
    */
   async enroll(request: EnrollmentRequest): Promise<EnrollmentResponse> {
-    // Reject tenant/agentId tokens that would break the NATS subject hierarchy
+    // Reject tenant/accountId tokens that would break the NATS subject hierarchy
     // or cross tenant boundaries before they are persisted or used in a grant.
     assertValidSubjectToken(request.tenant, "tenant");
-    if (request.agentId !== undefined) {
-      assertValidSubjectToken(request.agentId, "agentId");
+    if (request.accountId !== undefined) {
+      assertValidSubjectToken(request.accountId, "accountId");
     }
     const device_code = await this.generateDeviceCode();
     const user_code = this.generateUserCode();
@@ -254,7 +392,7 @@ export class DeviceFlowEnrollment {
       device_code,
       user_code,
       agentPublicKey: request.agentPublicKey,
-      agentId: request.agentId,
+      accountId: request.accountId,
       tenant: request.tenant,
       createdAt: now,
       expiresAt,
@@ -313,6 +451,8 @@ export class DeviceFlowEnrollment {
         peerId: enrollment.peerId,
         jwksUrl: this.options.jwksUrl,
         bootstrapUrl: this.options.bootstrapUrl,
+        natsUrl: this.options.natsUrl,
+        issuer: this.options.issuer,
       };
     }
 
@@ -325,8 +465,31 @@ export class DeviceFlowEnrollment {
    *
    * Called by the SaaS approval UI when the operator clicks "Approve".
    * Generates NATS user credentials and updates enrollment status.
+   *
+   * A2: idempotent + race-safe WITHIN the enrollment's validity window.
+   * `/approve` is an unauthenticated, repeatable action (double-click, retry,
+   * replay). Re-minting creds/peerId on a repeat would hand the already-connected
+   * plugin a DIFFERENT identity on its next poll and break the live session, so:
+   *  - a repeat AFTER the first approval returns the SAME credentials (status
+   *    guard on the persisted enrollment), and
+   *  - two CONCURRENT approvals of the same enrollment are coalesced onto one
+   *    in-flight promise so they can't each mint a distinct identity in the
+   *    read-mint-write window (last-writer-wins).
+   * Past `expiresAt` this returns null (the expiry check precedes the guard) —
+   * consistent with `poll()`, which also fails an expired record; the whole
+   * enroll→approve→poll cycle must complete inside the device-flow window.
    */
   async approve(userCode: string): Promise<EnrollmentResult | null> {
+    const inFlight = this.approvalsInFlight.get(userCode);
+    if (inFlight) return inFlight;
+    const promise = this.approveInner(userCode).finally(() => {
+      this.approvalsInFlight.delete(userCode);
+    });
+    this.approvalsInFlight.set(userCode, promise);
+    return promise;
+  }
+
+  private async approveInner(userCode: string): Promise<EnrollmentResult | null> {
     const enrollment = await this.store.getEnrollmentByUserCode(userCode);
     if (!enrollment) return null;
 
@@ -334,6 +497,19 @@ export class DeviceFlowEnrollment {
     if (Date.now() > enrollment.expiresAt) {
       await this.store.updateEnrollment(enrollment.device_code, { status: "expired" });
       return null;
+    }
+
+    // A2: already approved → return the credentials minted the first time
+    // instead of overwriting them with a fresh identity.
+    if (enrollment.status === "approved" && enrollment.natsCreds && enrollment.peerId) {
+      return {
+        creds: enrollment.natsCreds,
+        peerId: enrollment.peerId,
+        jwksUrl: this.options.jwksUrl,
+        bootstrapUrl: this.options.bootstrapUrl,
+        natsUrl: this.options.natsUrl,
+        issuer: this.options.issuer,
+      };
     }
 
     // Generate NATS user credentials
@@ -353,6 +529,8 @@ export class DeviceFlowEnrollment {
       peerId,
       jwksUrl: this.options.jwksUrl,
       bootstrapUrl: this.options.bootstrapUrl,
+      natsUrl: this.options.natsUrl,
+      issuer: this.options.issuer,
     };
   }
 
@@ -435,7 +613,7 @@ export class DeviceFlowEnrollment {
     //     Synadia's nats-server.
     //
     // Tenant scope `webchannel.{tenant}.>` covers the live per-peer channel
-    // subjects `webchannel.{tenant}.{agentId}.{peerId}.{in,out,handshake}` (see
+    // subjects `webchannel.{tenant}.{accountId}.{peerId}.{in,out,handshake}` (see
     // packages/plugin/src/nats-channel.ts) while preserving cross-tenant
     // isolation. Matches e2e/enrolled-jwt-roundtrip.test.ts.
     const minted = await mintNatsUserCreds({

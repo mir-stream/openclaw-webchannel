@@ -1,6 +1,7 @@
 import { WebSocket } from "ws";
+import { requireWsUrl } from "./_ws-url.mjs";
 
-const URL = process.env.WS_URL || "ws://127.0.0.1:18789/webchannel/ws";
+const URL = requireWsUrl();
 const TEXT =
   process.env.MSG ||
   "Use your tools to list the files in your workspace directory, then tell me how many there are.";

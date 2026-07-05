@@ -11,27 +11,26 @@
 //     inbound did NOT leak to the other account's agent.
 //
 // This exercises the REAL stack end-to-end: registerFull multiplex (two NatsChannels),
-// the single register route's JWT-aud→account dispatch (aud=agentA routes to
-// acctA's channel), and binding.account routing (resolveAgentRoute(accountId)
-// → the agent bound via webchannel:<account>). No unit mocks.
+// the single register route's JWT-aud→account dispatch (aud=accta routes to
+// acctA's channel — the aud IS the accountId), and binding.account routing
+// (resolveAgentRoute(accountId) → the agent bound via webchannel:<account>). No unit mocks.
 import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { WebChannelNatsClient } from "../../packages/client/src/nats-client.js";
 import { buildBootstrapClaims } from "../../packages/saas/src/bootstrap-claims.js";
 
 const NATS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18222";
-const GW_URL = process.env.WEBCHANNEL_GW_URL ?? "http://127.0.0.1:18799";
 const PRIV_PATH = process.env.WEBCHANNEL_RS256_PRIVATE ?? "/tmp/oc-two-acct-e2e/rs256-private.jwk.json";
 
 const ISS = process.env.WEBCHANNEL_ISSUER ?? "https://e2e-issuer.test";
 const PEER_ID = process.env.WEBCHANNEL_PEER_ID ?? "web-acctA-peer";
-const AGENT_ID = process.env.WEBCHANNEL_AGENT_ID ?? "agentA";
+const ACCOUNT_ID = process.env.WEBCHANNEL_ACCOUNT_ID ?? "accta";
 const TENANT = process.env.WEBCHANNEL_TENANT ?? "default-tenant";
 const KID = "webchannel-e2e-rs256";
 
 const EXPECT_PREFIX = process.env.EXPECT_PREFIX ?? "";
 const FORBID_PREFIX = process.env.FORBID_PREFIX ?? "";
-const MESSAGE = process.env.SEND_MESSAGE ?? `hello ${AGENT_ID}`;
+const MESSAGE = process.env.SEND_MESSAGE ?? `hello ${ACCOUNT_ID}`;
 
 if (!EXPECT_PREFIX || !FORBID_PREFIX) {
   console.error("[FAIL] EXPECT_PREFIX and FORBID_PREFIX env are required");
@@ -66,11 +65,11 @@ const ed25519 = (await webcrypto.subtle.generateKey({ name: "Ed25519" }, false, 
 const edPubJwk = (await webcrypto.subtle.exportKey("jwk", ed25519.publicKey)) as { x?: string };
 if (!edPubJwk.x) throw new Error("Ed25519 public JWK missing 'x'");
 
-// 4. Bootstrap JWT with aud=AGENT_ID (this account's agentId → register dispatch).
+// 4. Bootstrap JWT with aud=ACCOUNT_ID (this account's accountId → register dispatch).
 const claims = buildBootstrapClaims({
   iss: ISS,
   peerId: PEER_ID,
-  agentId: AGENT_ID,
+  accountId: ACCOUNT_ID,
   tenant: TENANT,
   deviceX25519PublicKey,
   devicePopPublicKey: edPubJwk.x,
@@ -88,17 +87,20 @@ const jwt = `${signingInput}.${b64url(sig)}`;
 const client = new WebChannelNatsClient({
   url: NATS,
   jwt,
-  agentId: AGENT_ID,
+  accountId: ACCOUNT_ID,
   tenant: TENANT,
   peerId: PEER_ID,
   registration: {
-    registerBaseUrl: GW_URL,
+    // The client derives the register subject from tenant/accountId/peerId and
+    // drives challenge→register over NATS request/reply (no gateway URL).
     devicePrivateKey: ed25519.privateKey,
+    // Phase 6: register-delivered conversation key (no handshake).
+    deviceX25519PrivateKey: x25519.privateKey,
   },
 });
 
 client.onError((e) => {
-  console.error(`[register-FAIL:${AGENT_ID}]`, e.message);
+  console.error(`[register-FAIL:${ACCOUNT_ID}]`, e.message);
   process.exit(4);
 });
 
@@ -107,7 +109,7 @@ const reply = new Promise<{ type: string; text?: string }>((resolve) => {
 });
 
 client.connect();
-console.log(`[send:${AGENT_ID}] ${JSON.stringify(MESSAGE)} (peer=${PEER_ID})`);
+console.log(`[send:${ACCOUNT_ID}] ${JSON.stringify(MESSAGE)} (peer=${PEER_ID})`);
 client.sendUserMessage(MESSAGE);
 
 const result = (await Promise.race([
@@ -116,17 +118,17 @@ const result = (await Promise.race([
     setTimeout(() => rej(new Error("TIMEOUT waiting for agent reply")), 25000),
   ),
 ]).catch((e) => {
-  console.error(`[FAIL:${AGENT_ID}]`, e.message);
+  console.error(`[FAIL:${ACCOUNT_ID}]`, e.message);
   process.exit(3);
 })) as { type: string; text?: string };
 
 const text = result.text ?? "";
-console.log(`[REPLY:${AGENT_ID}] ${JSON.stringify(text)}`);
+console.log(`[REPLY:${ACCOUNT_ID}] ${JSON.stringify(text)}`);
 
 // ── Isolation assertions ──────────────────────────────────────────────────
 if (!text.includes(EXPECT_PREFIX)) {
   console.error(
-    `[ISOLATION-FAIL] account "${AGENT_ID}" reply did NOT carry the expected ` +
+    `[ISOLATION-FAIL] account "${ACCOUNT_ID}" reply did NOT carry the expected ` +
       `agent prefix ${JSON.stringify(EXPECT_PREFIX)} — routing reached the wrong agent.`,
   );
   client.disconnect();
@@ -134,7 +136,7 @@ if (!text.includes(EXPECT_PREFIX)) {
 }
 if (text.includes(FORBID_PREFIX)) {
   console.error(
-    `[ISOLATION-FAIL] account "${AGENT_ID}" reply LEAKED the other agent's prefix ` +
+    `[ISOLATION-FAIL] account "${ACCOUNT_ID}" reply LEAKED the other agent's prefix ` +
       `${JSON.stringify(FORBID_PREFIX)} — inbound crossed account boundaries.`,
   );
   client.disconnect();
@@ -142,7 +144,7 @@ if (text.includes(FORBID_PREFIX)) {
 }
 
 console.log(
-  `[PROOF:${AGENT_ID}] inbound routed to the bound agent (prefix ${JSON.stringify(EXPECT_PREFIX)}) ` +
+  `[PROOF:${ACCOUNT_ID}] inbound routed to the bound agent (prefix ${JSON.stringify(EXPECT_PREFIX)}) ` +
     `and did NOT reach the other account's agent — multiplex + JWT-aud dispatch + binding.account isolation OK`,
 );
 client.disconnect();

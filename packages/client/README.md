@@ -11,25 +11,32 @@ framework dependency**. The client owns the chat state; wrap it in whatever view
 layer you like (vanilla DOM, Vue, or a thin React `useSyncExternalStore` hook).
 It is zero-dependency at runtime.
 
-Today it works against the **Gateway-WS** transport (`WebChannelClient`), the
-path the rest of the repo runs end-to-end.
+The production transport is **NATS E2E** (`WebChannelNatsClient`): the browser
+dials a shared NATS bus, does an X25519 handshake, and exchanges
+ChaCha20-Poly1305 ciphertext with the agent. A **legacy dev-only** Gateway-WS
+client (`WebChannelClient`) also ships for zero-infra local round-trips.
 
 ## Status
 
 Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md), the single source of
 truth for what is and isn't done.
 
-- `WebChannelClient` (Gateway-WS) — works end-to-end and is exercised by a live
-  round-trip smoke (`smoke-client.mjs`).
-- `WebChannelNATSClient` (NATS mode) — the type surface and a wrapper exist, but
-  **the browser-dials-NATS path is not wired live yet.** No browser message has
-  travelled over NATS into the agent and back. Treat NATS mode as not ready.
+- `WebChannelNatsClient` (NATS mode) — **the production client, live end-to-end.**
+  A real browser running this class has round-tripped an encrypted message over a
+  real JWT-auth `nats-server` into the enrolled `index-nats` plugin and back
+  (NATS-layer NKEY-auth + X25519 handshake + PoP register hop). Ciphertext-only on
+  the wire. **Note:** the X25519 handshake is currently *unauthenticated* — the
+  client does not verify the agent's key against a SaaS-attested pin, so E2E today
+  protects against a passive relay but **not** an active MITM. Authenticated
+  handshake is tracked as **C2** in the repo `docs/BACKLOG.md`.
+- `WebChannelClient` (Gateway-WS) — **legacy / dev-only.** A zero-infra WS
+  round-trip. No production role; slated for removal (see the repo
+  `docs/BACKLOG.md`).
 
 ## Usage (Gateway-WS)
 
 The client takes options and pushes immutable state snapshots to subscribers.
-This mirrors `smoke-client.mjs`, a working round-trip against a live gateway with
-the `hmac-ticket` auth strategy:
+A working round-trip against a live gateway with the `jwt` auth strategy:
 
 ```js
 import { WebChannelClient } from "openclaw-webchannel-client";
@@ -38,9 +45,9 @@ const client = new WebChannelClient({
   // Cross-origin gateway. For same-origin, use `path` instead (defaults to
   // "/webchannel/ws").
   url: "ws://127.0.0.1:18789/webchannel/ws",
-  // Called on every (re)connect to mint a FRESH short-lived ticket. Return
-  // null/empty to connect anonymously (when the gateway allows it).
-  getTicket: async () => mintTicket("web-anon"),
+  // Called on every (re)connect to supply a FRESH short-lived JWT for the
+  // `jwt` server strategy (delivered as `?ticket=<jwt>`).
+  getTicket: async () => mintJwt("web-anon"),
 });
 
 // State is owned by the client; subscribe for immutable snapshots.
@@ -64,8 +71,12 @@ From the package entry (`src/index.ts`):
 
 **Classes**
 
-- `WebChannelClient` — the Gateway-WS client.
-- `WebChannelNATSClient` — NATS-mode wrapper (see Status; not wired live).
+- `WebChannelNatsClient` — the production NATS-mode client (see Status; live).
+  Defined in `src/nats-client.ts`. The package barrel currently re-exports it via
+  a thin wrapper class exported under the name `WebChannelNATSClient`
+  (`src/nats-client-wrapper.ts`) — the two names refer to the same NATS client;
+  the casing should be unified in a later cleanup.
+- `WebChannelClient` — legacy Gateway-WS client (dev-only).
 
 **Client methods** (same surface on both classes)
 
@@ -86,8 +97,8 @@ From the package entry (`src/index.ts`):
 
 Key `WebChannelOptions`: `url` (full cross-origin WS URL), `path` (same-origin
 WS path), `getTicket` (per-connect ticket supplier). NATS-mode options
-(`natsUrl`, `bootstrapJwt`, `agentId`, `tenant`, `peerId`) exist but are not
-wired live.
+(`natsUrl`, `accountId`, `tenant`, `peerId`, `natsCredentials`, optional
+`registration`) drive the live `WebChannelNatsClient`.
 
 `WebChannelState` exposes `messages`, `approvals`, `status`
 (`"connecting"` | `"connected"` | `"reconnecting"`), `connected`, and an
@@ -105,6 +116,5 @@ This package is a headless library only — there is no bundled demo UI. A
 consumer imports `WebChannelClient` and wires it into their own page (vanilla
 DOM, Vue, or a thin React `useSyncExternalStore` hook).
 
-`smoke-client.mjs` is a live round-trip against a running gateway with
-`hmac-ticket` auth — run it with `WEBCHANNEL_TICKET_SECRET` set (from
-`~/.openclaw/.env`) after `npm run build`.
+For a live round-trip against a running gateway with `jwt` auth, supply a signed
+JWT via `getTicket` (see the repo `smoke/jwt.mjs`) after `npm run build`.

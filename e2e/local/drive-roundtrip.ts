@@ -18,7 +18,7 @@ function mint(sub: string): string {
 const jwt = mint("web-anon");
 
 const client = new WebChannelNatsClient({
-  url: NATS, jwt, agentId: "default-agent", tenant: "default-tenant", peerId: "web-anon",
+  url: NATS, jwt, accountId: "default-agent", tenant: "default-tenant", peerId: "web-anon",
 });
 const reply = new Promise<{ type: string; text?: string }>((resolve) => {
   client.onMessage((m) => { if (m.type === "agent_message") resolve(m); });

@@ -199,7 +199,7 @@ describe("AC 5 E2E: NATS Cutover", () => {
   let brokerPort: number;
   let agentTransport: NatsTransport;
   let agentChannel: NatsChannel;
-  const agentId = "test-agent";
+  const accountId = "test-agent";
   const tenant = "test-tenant";
 
   beforeEach(async () => {
@@ -218,7 +218,7 @@ describe("AC 5 E2E: NATS Cutover", () => {
     await agentTransport.connect();
 
     // Create agent NATS channel
-    agentChannel = new NatsChannel(agentTransport, agentId, tenant);
+    agentChannel = new NatsChannel(agentTransport, accountId, tenant);
   });
 
   afterEach(() => {
@@ -243,7 +243,7 @@ describe("AC 5 E2E: NATS Cutover", () => {
     });
 
     // Simulate browser sending a message
-    const inboundSubject = `webchannel.${tenant}.${agentId}.${peerId}.in`;
+    const inboundSubject = `webchannel.${tenant}.${accountId}.${peerId}.in`;
     agentTransport.publish(inboundSubject, JSON.stringify({
       type: "user_message",
       text: "Hello from browser!",
@@ -281,13 +281,13 @@ describe("AC 5 E2E: NATS Cutover", () => {
 
     // Simulate peer1 sending a message
     agentTransport.publish(
-      `webchannel.${tenant}.${agentId}.${peer1}.in`,
+      `webchannel.${tenant}.${accountId}.${peer1}.in`,
       JSON.stringify({ type: "user_message", text: "Message from peer1" }),
     );
 
     // Simulate peer2 sending a message
     agentTransport.publish(
-      `webchannel.${tenant}.${agentId}.${peer2}.in`,
+      `webchannel.${tenant}.${accountId}.${peer2}.in`,
       JSON.stringify({ type: "user_message", text: "Message from peer2" }),
     );
 
@@ -320,7 +320,7 @@ describe("AC 5 E2E: NATS Cutover", () => {
 
     // Subscribe to outbound messages for this peer
     const outboundSub = agentTransport.subscribe(
-      `webchannel.${tenant}.${agentId}.${peerId}.out`,
+      `webchannel.${tenant}.${accountId}.${peerId}.out`,
     );
 
     agentTransport.on("message", (msg) => {
@@ -388,7 +388,7 @@ describe("AC 5 E2E: NATS Cutover", () => {
 
     let receivedPayload: string | null = null;
     const outboundSub = agentTransport.subscribe(
-      `webchannel.${tenant}.${agentId}.${peerId}.out`,
+      `webchannel.${tenant}.${accountId}.${peerId}.out`,
     );
 
     agentTransport.on("message", (msg) => {
@@ -420,7 +420,7 @@ describe("AC 5 E2E: NATS Cutover", () => {
 
     let receivedPayload: string | null = null;
     const outboundSub = agentTransport.subscribe(
-      `webchannel.${tenant}.${agentId}.${peerId}.out`,
+      `webchannel.${tenant}.${accountId}.${peerId}.out`,
     );
 
     agentTransport.on("message", (msg) => {
@@ -458,7 +458,7 @@ describe("AC 5 E2E: NATS Cutover", () => {
 
     const payloads: string[] = [];
     const outboundSub = agentTransport.subscribe(
-      `webchannel.${tenant}.${agentId}.${peerId}.out`,
+      `webchannel.${tenant}.${accountId}.${peerId}.out`,
     );
 
     agentTransport.on("message", (msg) => {
@@ -507,10 +507,10 @@ describe("AC 5 E2E: NATS Cutover", () => {
     const payloads2: string[] = [];
 
     const sub1 = agentTransport.subscribe(
-      `webchannel.${tenant}.${agentId}.${peer1}.out`,
+      `webchannel.${tenant}.${accountId}.${peer1}.out`,
     );
     const sub2 = agentTransport.subscribe(
-      `webchannel.${tenant}.${agentId}.${peer2}.out`,
+      `webchannel.${tenant}.${accountId}.${peer2}.out`,
     );
 
     agentTransport.on("message", (msg) => {
@@ -591,17 +591,17 @@ describe("AC 5 E2E: NATS Cutover", () => {
 
     // Peer1 sends messages
     agentTransport.publish(
-      `webchannel.${tenant}.${agentId}.${peer1}.in`,
+      `webchannel.${tenant}.${accountId}.${peer1}.in`,
       JSON.stringify({ type: "user_message", text: "Peer1 message 1" }),
     );
     agentTransport.publish(
-      `webchannel.${tenant}.${agentId}.${peer1}.in`,
+      `webchannel.${tenant}.${accountId}.${peer1}.in`,
       JSON.stringify({ type: "user_message", text: "Peer1 message 2" }),
     );
 
     // Peer2 sends messages
     agentTransport.publish(
-      `webchannel.${tenant}.${agentId}.${peer2}.in`,
+      `webchannel.${tenant}.${accountId}.${peer2}.in`,
       JSON.stringify({ type: "user_message", text: "Peer2 message 1" }),
     );
 

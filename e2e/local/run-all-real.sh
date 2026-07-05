@@ -43,7 +43,7 @@ ISSUER_PORT=3941
 PAGE_PORT=19393
 
 TENANT=default-tenant
-AGENT_ID=default-agent
+ACCOUNT_ID=default-agent
 PEER_ID=web-allreal-peer
 SAAS_ISSUER="https://saas.local/allreal-issuer"
 
@@ -216,16 +216,21 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
   },
   "channels": {
     "webchannel": {
-      "auth": {
-        "strategy": "jwt",
-        "jwt": {
-          "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
-          "issuer": "$SAAS_ISSUER",
-          "audience": "$AGENT_ID"
+      "accounts": {
+        "$ACCOUNT_ID": {
+          "tenant": "$TENANT",
+          "auth": {
+            "strategy": "jwt",
+            "jwt": {
+              "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
+              "issuer": "$SAAS_ISSUER",
+              "audience": "$ACCOUNT_ID"
+            }
+          },
+          "dmSecurity": "allowlist",
+          "allowFrom": ["$PEER_ID"]
         }
-      },
-      "dmSecurity": "allowlist",
-      "allowFrom": ["$PEER_ID"]
+      }
     }
   }
 }
@@ -239,12 +244,14 @@ echo "[run-all-real] wrote $OCH/.openclaw/openclaw.json"
 #    `openclaw channels add`). HOME=$OCH so creds persist to
 #    $OCH/.openclaw-webchannel/<account>/credentials.json, which the gateway
 #    (also HOME=$OCH) consumes. Identity via the generic flags the webchannel
-#    setup adapter maps: --base-url→saas.baseUrl, --url→tenant, --token→agentId.
+#    setup adapter maps: --base-url→saas.baseUrl, --url→tenant. The wire identity
+#    is the --account value itself (no --token→agentId mapping anymore — the
+#    handling agent is selected separately via `agents bind`).
 # ---------------------------------------------------------------------------
 echo "[run-all-real] channels add (config-time device-flow enroll)…"
 HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account default \
-    --base-url "http://127.0.0.1:$ISSUER_PORT" --url "$TENANT" --token "$AGENT_ID" \
+  "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account "$ACCOUNT_ID" \
+    --base-url "http://127.0.0.1:$ISSUER_PORT" --url "$TENANT" \
   >"$OCH/channels-add.log" 2>&1 &
 ADD_PID=$!
 echo "[run-all-real] channels add pid=$ADD_PID — waiting for enrollment user_code…"
@@ -272,9 +279,27 @@ ADD_PID=""
 if [ "$ADD_RC" -ne 0 ]; then
   echo "[run-all-real] channels add failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add.log"; exit 2
 fi
-CRED_FILE="$OCH/.openclaw-webchannel/default/credentials.json"
+CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
 [ -f "$CRED_FILE" ] || { echo "[run-all-real] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-all-real] ✓ credentials persisted at $CRED_FILE"
+
+# 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
+#      setup adapter writes the demo-proven block (`admission: "auto"`,
+#      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
+#      override that disables the HTTP register hop (no aud→account dispatch
+#      entry ⇒ challenge 401 "No account for token audience"), and this harness
+#      drives the register hop. Restore the pre-add intent.
+node -e '
+  const fs = require("fs");
+  const p = process.argv[1], acct = process.argv[2], peer = process.argv[3];
+  const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
+  const a = cfg.channels.webchannel.accounts[acct];
+  a.nats = { ...(a.nats ?? {}), admission: "register-hop" };
+  a.dmSecurity = "allowlist";
+  a.allowFrom = [peer];
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2));
+' "$OCH/.openclaw/openclaw.json" "$ACCOUNT_ID" "$PEER_ID"
+echo "[run-all-real] ✓ re-asserted admission=register-hop + dmSecurity=allowlist for account $ACCOUNT_ID"
 
 # ---------------------------------------------------------------------------
 # 6c. Boot the isolated gateway — CONSUME-ONLY. No acquisition env: identity
@@ -310,7 +335,7 @@ set +e
 WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
 WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
 WEBCHANNEL_ISSUER_URL="http://127.0.0.1:$ISSUER_PORT" \
-WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_AGENT_ID="$AGENT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
+WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" WEBCHANNEL_PEER_ID="$PEER_ID" \
 WEBCHANNEL_PAGE_PORT="$PAGE_PORT" \
   node "$REPO/e2e/local/all-real.mjs"
 RC=$?

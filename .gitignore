@@ -10,3 +10,4 @@ dist-runtime/
 .claude/
 *.tsbuildinfo
 .reindex-swap-lock
+docker/plugin/

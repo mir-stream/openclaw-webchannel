@@ -119,14 +119,14 @@ class FakeNatsWS {
 // An "agent" that mirrors the plugin: handshake → derive key → echo replies.
 function makeAgentSim(
   tenant: string,
-  agentId: string,
+  accountId: string,
   peerId: string,
   echoPrefix = "echo: ",
 ): ServerHandler {
   let sessionKey: Uint8Array | null = null;
-  const hs = handshakeSubject(tenant, agentId, peerId);
-  const inS = inboundSubject(tenant, agentId, peerId);
-  const outS = outboundSubject(tenant, agentId, peerId);
+  const hs = handshakeSubject(tenant, accountId, peerId);
+  const inS = inboundSubject(tenant, accountId, peerId);
+  const outS = outboundSubject(tenant, accountId, peerId);
   return async (subject, payload, server) => {
     if (subject === hs) {
       const browserPub = parseKeyExchange(payload);
@@ -139,7 +139,7 @@ function makeAgentSim(
     if (subject === inS && sessionKey) {
       const msg = openMessage(payload, sessionKey) as { type?: string; text?: string } | null;
       if (msg?.type === "user_message") {
-        const reply = sealMessage({ agentId, tenant, sub: peerId }, sessionKey, {
+        const reply = sealMessage({ accountId, tenant, sub: peerId }, sessionKey, {
           type: "agent_message",
           text: `${echoPrefix}${msg.text}`,
         });
@@ -173,7 +173,7 @@ function startClient(): { client: WebChannelNatsClient; server: FakeNatsWS; rece
   const client = new WebChannelNatsClient({
     url: "ws://127.0.0.1:4222",
     jwt: "",
-    agentId: AGENT,
+    accountId: AGENT,
     tenant: TENANT,
     peerId: PEER,
   });
@@ -190,6 +190,35 @@ function startClient(): { client: WebChannelNatsClient; server: FakeNatsWS; rece
 // ---------------------------------------------------------------------------
 
 describe("WebChannelNatsClient (E2E encrypted)", () => {
+  it("republishes the handshake until the agent answers (no-retention relay race)", async () => {
+    const { client, server, received } = startClient();
+    // Simulate a real relay where the FIRST handshake frame is lost (the agent's
+    // per-peer SUB was not yet server-active): drop the first, answer the second.
+    const agent = makeAgentSim(TENANT, AGENT, PEER);
+    const hsSubj = handshakeSubject(TENANT, AGENT, PEER);
+    let hsSeen = 0;
+    server.handler = async (subject, payload, srv) => {
+      if (subject === hsSubj) {
+        hsSeen += 1;
+        if (hsSeen === 1) return; // first handshake dropped
+      }
+      return agent(subject, payload, srv);
+    };
+
+    await settle();
+    client.sendUserMessage("hi"); // buffered until the handshake completes
+    // No session yet — the first handshake was dropped and nothing reached .in.
+    expect(server.published.filter((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toEqual([]);
+
+    // Let the retry fire (~500ms) — the second handshake gets through.
+    await new Promise((r) => setTimeout(r, 650));
+    await settle();
+
+    expect(hsSeen).toBeGreaterThanOrEqual(2);
+    expect(received).toContainEqual({ type: "agent_message", text: "echo: hi" });
+    client.disconnect();
+  });
+
   it("handshakes, seals to .in, and decrypts the agent reply from .out", async () => {
     const { client, server, received } = startClient();
     await settle();
@@ -267,7 +296,7 @@ describe("e2e-crypto-browser spec conformance", () => {
 
   it("computes canonical AAD with the fixed key order", () => {
     const routing = {
-      agentId: "a",
+      accountId: "a",
       tenant: "t",
       sub: "s",
       messageId: "m",
@@ -276,7 +305,7 @@ describe("e2e-crypto-browser spec conformance", () => {
     };
     const expected = JSON.stringify({
       tenant: "t",
-      agentId: "a",
+      accountId: "a",
       sub: "s",
       messageId: "m",
       envelopeType: "conversation",
@@ -290,7 +319,7 @@ describe("e2e-crypto-browser spec conformance", () => {
       (await generateX25519KeyPair()).privateKey,
       (await generateX25519KeyPair()).publicKeyB64url,
     );
-    const wire = sealMessage({ agentId: "a", tenant: "t", sub: "s" }, key, {
+    const wire = sealMessage({ accountId: "a", tenant: "t", sub: "s" }, key, {
       type: "user_message",
       text: "round-trips",
     });
@@ -307,7 +336,7 @@ describe("e2e-crypto-browser spec conformance", () => {
       (await generateX25519KeyPair()).privateKey,
       (await generateX25519KeyPair()).publicKeyB64url,
     );
-    const wire = sealMessage({ agentId: "a", tenant: "t", sub: "s" }, key, { type: "user_message", text: "x" });
+    const wire = sealMessage({ accountId: "a", tenant: "t", sub: "s" }, key, { type: "user_message", text: "x" });
     expect(openMessage(wire, otherKey)).toBeNull();
   });
 });

@@ -115,7 +115,7 @@ describe("NatsClient — NKEY-auth CONNECT (natsCredentials present)", () => {
     const client = new NatsClient({
       url: "ws://127.0.0.1:4222",
       jwt: "bootstrap-jwt-should-not-be-used",
-      agentId: "a",
+      accountId: "a",
       tenant: "t",
       peerId: "p",
       natsCredentials: { userJwt, userSeedRaw },
@@ -158,7 +158,7 @@ describe("NatsClient — no-natsCredentials path is unchanged (zero regression)"
     const client = new NatsClient({
       url: "ws://127.0.0.1:4222",
       jwt: "bootstrap-jwt-value",
-      agentId: "a",
+      accountId: "a",
       tenant: "t",
       peerId: "p",
     });

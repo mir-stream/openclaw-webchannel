@@ -2,7 +2,7 @@
  * E2E Message Envelope Codec — Sub-AC 2.
  *
  * Serializes / deserializes the NATS wire format where:
- *  - Routing metadata (agentId, tenant, sub, messageId, envelopeType, ts)
+ *  - Routing metadata (accountId, tenant, sub, messageId, envelopeType, ts)
  *    is PLAINTEXT — visible to the NATS relay operator and needed for subject
  *    routing / account isolation.
  *  - Message content is the ChaCha20-Poly1305 CIPHERTEXT produced by the
@@ -12,7 +12,7 @@
  *
  *   {
  *     "v": 1,                         // schema version
- *     "agentId": "agent-abc",         // plaintext — NATS subject routing
+ *     "accountId": "acct-abc",        // plaintext — NATS subject routing
  *     "tenant": "tenant-xyz",         // plaintext — NATS account isolation
  *     "sub": "user-42",               // plaintext — JWT sub (user scope)
  *     "messageId": "msg-uuid-...",    // plaintext — correlation / dedup
@@ -29,7 +29,7 @@
  * ────────────────────────
  * The "content" object contains ONLY binary-encoded ciphertext components.
  * No field inside "content" holds any part of the original message text.
- * The relay operator may observe agentId / tenant / sub (routing metadata)
+ * The relay operator may observe accountId / tenant / sub (routing metadata)
  * but cannot observe any conversation or approval content.
  *
  * AAD binding
@@ -77,8 +77,8 @@ export type EnvelopeType =
  * This is what the NATS relay operator can observe; it contains ZERO content.
  */
 export type EnvelopeRouting = {
-  /** SaaS-issued agent identity (agentId claim). Plaintext — used for NATS subject routing. */
-  readonly agentId: string;
+  /** SaaS-issued account (deployment) identity (accountId claim). Plaintext — used for NATS subject routing. */
+  readonly accountId: string;
   /** Tenant scope (tenant claim). Plaintext — used for NATS account isolation. */
   readonly tenant: string;
   /** JWT `sub` claim — stable per-user identity across devices. Plaintext. */
@@ -112,7 +112,7 @@ export type EncryptedContentBlock = {
  *
  * Invariants:
  *  - `v` is always `1` (schema version, this revision).
- *  - Routing fields (agentId / tenant / sub / messageId / envelopeType / ts)
+ *  - Routing fields (accountId / tenant / sub / messageId / envelopeType / ts)
  *    are PLAINTEXT and MUST NOT carry any conversation content.
  *  - `content` is CIPHERTEXT only — zero plaintext content anywhere inside it.
  */
@@ -134,10 +134,10 @@ export type MessageEnvelope = {
  * encrypted with ChaCha20-Poly1305 using a 12-byte random nonce; the
  * resulting ciphertext is base64url-encoded and stored in `content`.
  *
- * The routing fields (agentId, tenant, sub, messageId, envelopeType, ts) are
+ * The routing fields (accountId, tenant, sub, messageId, envelopeType, ts) are
  * embedded as-is in the plaintext JSON envelope — they are never encrypted.
  *
- * @param routing   - Plaintext routing metadata (agentId, tenant, sub, …).
+ * @param routing   - Plaintext routing metadata (accountId, tenant, sub, …).
  * @param plaintext - Content to encrypt. Pass a string (UTF-8) or Uint8Array.
  * @param key       - 32-byte ChaCha20-Poly1305 encryption key (output of
  *                    `hkdfSha256(sharedSecret, …)`).
@@ -183,7 +183,7 @@ export function encodeEnvelope(
 /**
  * Extract plaintext routing metadata from an envelope WITHOUT a decryption key.
  *
- * The routing fields (agentId, tenant, sub, messageId, envelopeType, ts) are
+ * The routing fields (accountId, tenant, sub, messageId, envelopeType, ts) are
  * always plaintext. Use this for dispatch / routing logic at the receiver
  * before deciding whether and how to decrypt the content.
  *
@@ -192,7 +192,7 @@ export function encodeEnvelope(
  */
 export function getEnvelopeRouting(env: MessageEnvelope): EnvelopeRouting {
   return {
-    agentId: env.agentId,
+    accountId: env.accountId,
     tenant: env.tenant,
     sub: env.sub,
     messageId: env.messageId,
@@ -291,7 +291,7 @@ function validateEnvelope(raw: unknown): MessageEnvelope {
   }
 
   const stringFields = [
-    "agentId",
+    "accountId",
     "tenant",
     "sub",
     "messageId",
@@ -332,7 +332,7 @@ function validateEnvelope(raw: unknown): MessageEnvelope {
  *
  * The AAD is the UTF-8 encoding of a JSON object containing the six routing
  * fields in FIXED key order:
- *   {tenant, agentId, sub, messageId, envelopeType, ts}
+ *   {tenant, accountId, sub, messageId, envelopeType, ts}
  *
  * AAD is authenticated but NOT encrypted and NOT stored in the envelope. Both
  * the sender (browser) and receiver (agent) independently compute the same AAD
@@ -348,7 +348,7 @@ export function canonicalAad(routing: EnvelopeRouting): Uint8Array {
   return new TextEncoder().encode(
     JSON.stringify({
       tenant:       routing.tenant,
-      agentId:      routing.agentId,
+      accountId:    routing.accountId,
       sub:          routing.sub,
       messageId:    routing.messageId,
       envelopeType: routing.envelopeType,

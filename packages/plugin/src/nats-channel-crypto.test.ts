@@ -30,6 +30,18 @@ import {
 // In-memory NATS broker (echo:false, exact-subject routing)
 // ---------------------------------------------------------------------------
 
+/** NATS subject match: `*` matches one token, `>` matches the rest. */
+function subjectMatches(pattern: string, subject: string): boolean {
+  const p = pattern.split(".");
+  const s = subject.split(".");
+  for (let i = 0; i < p.length; i++) {
+    if (p[i] === ">") return true;
+    if (i >= s.length) return false;
+    if (p[i] !== "*" && p[i] !== s[i]) return false;
+  }
+  return p.length === s.length;
+}
+
 class FakeBroker {
   readonly clients: FakeTransport[] = [];
   register(t: FakeTransport): void {
@@ -68,7 +80,7 @@ class FakeTransport extends EventEmitter {
     this.broker.route(subject, buf, this);
   }
   matches(subject: string): boolean {
-    for (const s of this.subs.values()) if (s === subject) return true;
+    for (const s of this.subs.values()) if (subjectMatches(s, subject)) return true;
     return false;
   }
   deliver(subject: string, payload: Buffer): void {
@@ -99,7 +111,7 @@ type Harness = {
   doHandshake: () => void;
 };
 
-function makeHarness(): Harness {
+function makeHarness(opts: { admission?: "register" | "wildcard" } = {}): Harness {
   const broker = new FakeBroker();
 
   // Agent transport + crypto channel.
@@ -116,7 +128,11 @@ function makeHarness(): Harness {
     // Echo a reply so we can verify the outbound seal path.
     channel.sendText(_peer, `reply:${msg.type === "user_message" ? msg.text : ""}`);
   });
-  channel.registerPeer(PEER);
+  if (opts.admission === "wildcard") {
+    channel.subscribeWildcard(); // `admission:"auto"` — no per-peer registerPeer
+  } else {
+    channel.registerPeer(PEER);
+  }
 
   // Passive wiretap (the untrusted relay's vantage point).
   const wiretap = new FakeTransport(broker);
@@ -174,7 +190,7 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     const key = h.browserSessionKey()!;
 
     // Browser → agent (sealed)
-    h.browser.publish(inSubj, sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, key, {
+    h.browser.publish(inSubj, sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, {
       type: "user_message",
       text: "hello agent",
     }));
@@ -185,11 +201,65 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     expect(h.browserReplies).toEqual([{ type: "agent_message", text: "reply:hello agent" }]);
   });
 
+  it("fires the handshake-complete handler once the session key exists, so a snapshot sent from it is encryptable and delivered", () => {
+    const h = makeHarness();
+    // Wire a handshake-complete handler that sends an initial history snapshot —
+    // this is exactly how the plugin defers hydration until the key is ready.
+    const firedFor: string[] = [];
+    h.channel.setHandshakeCompleteHandler((peerId) => {
+      firedFor.push(peerId);
+      h.channel.sendHistory(peerId, [{ id: "m1", role: "user", text: "earlier turn" }]);
+    });
+
+    // Before the handshake the handler has not fired and nothing is deliverable.
+    expect(firedFor).toEqual([]);
+
+    h.doHandshake();
+
+    // It fired exactly once, for this peer, AFTER the session key was set...
+    expect(firedFor).toEqual([PEER]);
+    expect(h.browserSessionKey()).not.toBeNull();
+    // ...and the snapshot it sent decrypts on the browser (would have been
+    // fail-closed "no session key yet" if sent from the pre-handshake register hop).
+    expect(h.browserReplies).toEqual([
+      { type: "history", messages: [{ id: "m1", role: "user", text: "earlier turn" }] },
+    ]);
+  });
+
+  it("does NOT re-fire the snapshot for a duplicate handshake (client retry / RTT race)", () => {
+    const h = makeHarness();
+    const firedFor: string[] = [];
+    h.channel.setHandshakeCompleteHandler((peerId) => firedFor.push(peerId));
+
+    // Same browser key republished (the bounded handshake retry, or two frames
+    // both arriving on a relay slower than the retry interval).
+    h.doHandshake();
+    h.doHandshake();
+
+    // Derives the SAME session key both times → snapshot fires exactly once, so
+    // the browser is not spammed with a duplicate backlog.
+    expect(firedFor).toEqual([PEER]);
+  });
+
+  it("does NOT fire the snapshot for an unregistered (wildcard/auto) peer — no at-rest history to an unauthenticated peer", () => {
+    const h = makeHarness({ admission: "wildcard" });
+    const firedFor: string[] = [];
+    h.channel.setHandshakeCompleteHandler((peerId) => firedFor.push(peerId));
+
+    h.doHandshake();
+
+    // The handshake completes (live chat still works on the wildcard path), but
+    // the peer never went through the PoP register hop, so the initial stored-
+    // history snapshot MUST NOT be sent to it.
+    expect(h.browserSessionKey()).not.toBeNull();
+    expect(firedFor).toEqual([]);
+  });
+
   it("only ever puts ciphertext on the wire (relay sees no plaintext)", () => {
     const h = makeHarness();
     h.doHandshake();
     const key = h.browserSessionKey()!;
-    h.browser.publish(inSubj, sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, key, {
+    h.browser.publish(inSubj, sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, {
       type: "user_message",
       text: "topsecret-probe",
     }));
@@ -224,7 +294,7 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     h.browser.publish(inSubj, Buffer.from(JSON.stringify({ type: "user_message", text: "x" })));
     // Sealed-with-some-key attempt before any key exchange.
     const someKey = deriveConversationKey(generateKeyPair().privateKey, generateKeyPair().publicKey);
-    h.browser.publish(inSubj, sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, someKey, { type: "user_message", text: "y" }));
+    h.browser.publish(inSubj, sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, someKey, { type: "user_message", text: "y" }));
     expect(h.inbound).toEqual([]);
   });
 
@@ -236,7 +306,7 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     // Seal legitimately, then tamper a plaintext routing field WITHOUT re-encrypting.
     // The agent recomputes canonical AAD from the (tampered) routing, so the
     // ChaCha20-Poly1305 tag no longer authenticates → decryption fails → dropped.
-    const sealed = sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, key, {
+    const sealed = sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, {
       type: "user_message",
       text: "authentic",
     });
@@ -257,7 +327,7 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     h.doHandshake();
     // Wrong key (not the negotiated session key) → decrypt fails → dropped.
     const wrongKey = deriveConversationKey(generateKeyPair().privateKey, generateKeyPair().publicKey);
-    h.browser.publish(inSubj, sealEnvelope({ agentId: AGENT, tenant: TENANT, sub: PEER }, wrongKey, {
+    h.browser.publish(inSubj, sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, wrongKey, {
       type: "user_message",
       text: "tampered",
     }));

@@ -25,7 +25,6 @@ describe("acquireCredentials", () => {
       accountId: "acctA",
       saasBaseUrl: "http://saas.example",
       tenant: "tA",
-      agentId: "aA",
       home: HOME,
       log,
       _clientFactory: (opts) => {
@@ -40,7 +39,8 @@ describe("acquireCredentials", () => {
     expect(capturedOpts?.saasEnrollUrl).toBe("http://saas.example/api/enroll");
     expect(capturedOpts?.saasPollUrl).toBe("http://saas.example/api/poll");
     expect(capturedOpts?.tenant).toBe("tA");
-    expect(capturedOpts?.agentId).toBe("aA");
+    // The wire identity sent to enrollment is the accountId (가-2).
+    expect(capturedOpts?.accountId).toBe("acctA");
     // Account-scoped persistence path.
     expect(capturedOpts?.credentialPath).toBe(
       join(HOME, ".openclaw-webchannel", "acctA", "credentials.json"),

@@ -37,8 +37,17 @@ export type BootstrapClaimsInput = {
   iss: string;
   /** Stable per-user identity = peerId = JWT `sub`. */
   peerId: string;
-  /** Target agent (also the JWT `aud`). */
-  agentId: string;
+  /**
+   * Account (deployment) identity = wire identity = the JWT `aud`.
+   *
+   * A single string mints a single-audience token (`aud` is that string), the
+   * original behaviour byte-for-byte. An ARRAY mints a multi-audience token
+   * (`aud` is the array), for one login authorized across a fleet of accounts —
+   * the plugin verifier and multi-aud router are already array-aware. A
+   * single-element array is treated as multi (yields an array `aud`); pass a bare
+   * string for the scalar form.
+   */
+  accountId: string | string[];
   /** Tenant scope. */
   tenant: string;
   /** Device X25519 public key (base64url 32 bytes) → `cnf.jwk`. */
@@ -59,10 +68,18 @@ export type BootstrapClaimsInput = {
 export type BootstrapClaims = {
   iss: string;
   sub: string;
-  aud: string;
+  /** JWT audience — a single account (string) or a fleet (string array). */
+  aud: string | string[];
   exp: number;
   iat: number;
-  agentId: string;
+  /**
+   * Top-level account id — a DEAD claim nobody in the routing/verify path reads
+   * (verified by grep; the router uses `aud`). Kept only for back-compat of the
+   * scalar case: the single account id for a string `aud`, and `""` for a
+   * multi-aud token (no single "primary" account to name). Do NOT start reading
+   * this — full removal from the type is a tracked backlog item.
+   */
+  accountId: string;
   tenant: string;
   cnf: { jwk: DeviceCnfJwk };
   pop_jwk?: DevicePopJwk;
@@ -90,13 +107,22 @@ export function buildBootstrapClaims(input: BootstrapClaimsInput): BootstrapClai
   const now = input.nowSeconds ?? Math.floor(Date.now() / 1000);
   const ttl = input.ttlSeconds ?? DEFAULT_TTL_SECONDS;
 
+  // Multi-aud (array) → `aud` is the array, dead top-level `accountId` = "".
+  // Scalar (string) → original behaviour byte-for-byte (`aud` = accountId = id).
+  const audience = input.accountId;
+  const isMulti = Array.isArray(audience);
+  if (isMulti && audience.length === 0) {
+    throw new Error("bootstrap-claims: accountId array must be non-empty");
+  }
+  const primaryAccountId = isMulti ? "" : audience;
+
   const claims: BootstrapClaims = {
     iss: input.iss,
     sub: input.peerId,
-    aud: input.agentId,
+    aud: audience,
     exp: now + ttl,
     iat: now,
-    agentId: input.agentId,
+    accountId: primaryAccountId,
     tenant: input.tenant,
     cnf: { jwk: { kty: "OKP", crv: "X25519", x: input.deviceX25519PublicKey } },
   };

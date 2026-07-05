@@ -14,7 +14,7 @@
  * NON-default account core runs `moveSingleAccountChannelSectionToDefaultAccount`
  * BEFORE the plugin's `applyAccountConfig`, promoting an allowlisted subset of
  * channel-level keys into `accounts.default`; the channel-level fields it does
- * NOT promote (for webchannel: auth / nats / tenant / agentId / dmSecurity / …)
+ * NOT promote (for webchannel: auth / nats / tenant / dmSecurity / …)
  * remain at channel level and are inherited as the shared base via the merge.
  * Reading through `resolveWebchannelAccountConfig` reconstructs the full account
  * config regardless of which fields ended up where.
@@ -123,7 +123,6 @@ const DEFAULT_ACCOUNT_MARKER_KEYS = [
   "encryption",
   "saas",
   "tenant",
-  "agentId",
 ] as const;
 
 /** A single resolved account's raw config object. */
@@ -135,9 +134,9 @@ export type WebchannelAccountConfig = Record<string, unknown>;
  * precedence (env > nats.credentials.saasBaseUrl > … > default).
  */
 export type WebchannelAcquisitionIdentity = {
+  /** Account (deployment) id — the wire identity (JWT aud / NATS subject key). */
   accountId: string;
   tenant: string;
-  agentId: string;
   saasBaseUrl?: string;
 };
 
@@ -254,14 +253,13 @@ export function resolveWebchannelAccountConfig(
 }
 
 /**
- * Resolve the acquisition identity (saasBaseUrl / tenant / agentId) for an
+ * Resolve the acquisition identity (accountId / tenant / saasBaseUrl) for an
  * account from its merged config. Falls back to legacy top-level
- * `cfg.tenant`/`cfg.agentId`/`cfg.saas.baseUrl` ONLY for the `"default"` account.
+ * `cfg.tenant`/`cfg.saas.baseUrl` ONLY for the `"default"` account.
  *
- * NOTE (Cycle 2): the merged config inherits channel-level tenant/agentId as a
- * shared base, so a NAMED account that does not set its own agentId would
- * inherit the default's. Cycle 2 multiplex routing must require each named
- * account to declare its own agentId (no cross-account identity inheritance).
+ * 가-2: the wire identity is the `accountId` itself (the `--account` flag / the
+ * `accounts.<id>` key). The handling agent is decoupled — it is now purely an
+ * `agents bind` concern (telegram-like), so no per-account `agentId` is read.
  */
 export function resolveAcquisitionIdentity(
   cfg: unknown,
@@ -269,7 +267,7 @@ export function resolveAcquisitionIdentity(
 ): WebchannelAcquisitionIdentity {
   const account = resolveWebchannelAccountConfig(cfg, accountId);
   const top = cfg as
-    | { tenant?: string; agentId?: string; saas?: { baseUrl?: string } }
+    | { tenant?: string; saas?: { baseUrl?: string } }
     | undefined;
   const accountSaas = (account.saas as { baseUrl?: string } | undefined)?.baseUrl;
 
@@ -280,10 +278,6 @@ export function resolveAcquisitionIdentity(
       (account.tenant as string | undefined) ??
       (isDefault ? top?.tenant : undefined) ??
       "default-tenant",
-    agentId:
-      (account.agentId as string | undefined) ??
-      (isDefault ? top?.agentId : undefined) ??
-      "default-agent",
     saasBaseUrl: accountSaas ?? (isDefault ? top?.saas?.baseUrl : undefined),
   };
 }
@@ -361,6 +355,25 @@ export function resolveReadCredentialPath(
 export type PersistedEnrolledCreds = {
   userJwt: string;
   userSeed: string;
+  /**
+   * NATS relay URL the SaaS delivered alongside the creds (EnrollmentResult.natsUrl,
+   * persisted under `enrollment.natsUrl`). The SaaS is the rendezvous authority, so
+   * the consume path dials THIS in preference to any local `nats.url` /
+   * `WEBCHANNEL_NATS_URL`. Absent for creds enrolled before this field existed —
+   * the consumer then falls back to the resolver URL (back-compat).
+   */
+  natsUrl?: string;
+  /**
+   * Bootstrap-JWT issuer the SaaS delivered alongside the creds
+   * (EnrollmentResult.issuer, persisted under `enrollment.issuer`). Same
+   * rendezvous-authority principle as `natsUrl`: the SaaS declares the exact
+   * `iss` it mints, so the runtime verifies against THIS instead of deriving
+   * issuer = saas.baseUrl and hoping the two agree. Precedence: operator pin
+   * (`auth.jwt.issuer`) > this delivered value > derived. Absent for creds
+   * enrolled before this field existed — the runtime then derives (back-compat).
+   * Used VERBATIM (verify already compares slash-insensitively).
+   */
+  issuer?: string;
 };
 
 /**
@@ -392,7 +405,11 @@ export function loadPersistedEnrolledCreds(
   if (!exists(path)) return undefined;
   try {
     const parsed = JSON.parse(read(path)) as {
-      enrollment?: { creds?: { userJwt?: unknown; userSeed?: unknown } };
+      enrollment?: {
+        creds?: { userJwt?: unknown; userSeed?: unknown };
+        natsUrl?: unknown;
+        issuer?: unknown;
+      };
     };
     const creds = parsed.enrollment?.creds;
     if (
@@ -402,7 +419,17 @@ export function loadPersistedEnrolledCreds(
       creds.userJwt.length > 0 &&
       creds.userSeed.length > 0
     ) {
-      return { userJwt: creds.userJwt, userSeed: creds.userSeed };
+      // Thread the SaaS-delivered relay URL + issuer through when present. Kept
+      // optional so already-persisted (pre-natsUrl / pre-issuer) creds still
+      // load and fall back gracefully.
+      const natsUrl = parsed.enrollment?.natsUrl;
+      const issuer = parsed.enrollment?.issuer;
+      return {
+        userJwt: creds.userJwt,
+        userSeed: creds.userSeed,
+        ...(typeof natsUrl === "string" && natsUrl.length > 0 ? { natsUrl } : {}),
+        ...(typeof issuer === "string" && issuer.length > 0 ? { issuer } : {}),
+      };
     }
     return undefined;
   } catch {

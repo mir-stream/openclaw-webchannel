@@ -1,15 +1,16 @@
 // Drives the PRODUCTION WebChannelNatsClient through the JWT + Proof-of-Possession
-// HTTP register hop against the live local openclaw gateway (index-nats plugin) +
-// nats-server + echo provider.
+// register hop (NATS request/reply) against the live local openclaw gateway
+// (index-nats plugin) + nats-server + echo provider.
 //
 // WHAT THIS PROVES: the gateway is booted with channels.webchannel.auth.strategy
 // = "jwt", which (see index-nats.ts wildcard gate) means the agent does NOT call
 // subscribeWildcard() even under dev/open-NATS. So the agent is subscribed to NO
 // peer subjects until something calls channel.registerPeer(peerId) — and the only
-// thing that does so is the live HTTP POST /webchannel/nats/register route. The
-// production client's `registration` path drives that route (challenge → sign the
-// nonce with the device Ed25519 PoP key → register with Bearer JWT). Therefore a
-// successful round-trip means registerPeer happened ONLY through the live HTTP
+// thing that does so is a register request on the account's
+// `webchannel.{tenant}.{accountId}.{peerId}.register` subject. The production
+// client's `registration` path drives that request/reply (challenge → sign the
+// nonce with the device Ed25519 PoP key → register with the bootstrap JWT).
+// Therefore a successful round-trip means registerPeer happened ONLY through the
 // register hop. If registration fails, onError fires and we exit non-zero loudly.
 import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -17,12 +18,11 @@ import { WebChannelNatsClient } from "../../packages/client/src/nats-client.js";
 import { buildBootstrapClaims } from "../../packages/saas/src/bootstrap-claims.js";
 
 const NATS = "ws://127.0.0.1:18222";
-const GW_URL = process.env.WEBCHANNEL_GW_URL ?? "http://127.0.0.1:18799";
 const PRIV_PATH = process.env.WEBCHANNEL_RS256_PRIVATE ?? "/tmp/oc-e2e/rs256-private.jwk.json";
 
 const ISS = "https://e2e-issuer.test";
 const PEER_ID = "web-jwt-peer";
-const AGENT_ID = "default-agent";
+const ACCOUNT_ID = "default";
 const TENANT = "default-tenant";
 const KID = "webchannel-e2e-rs256";
 
@@ -61,7 +61,7 @@ const devicePopPublicKey = edPubJwk.x;
 const claims = buildBootstrapClaims({
   iss: ISS,
   peerId: PEER_ID,
-  agentId: AGENT_ID,
+  accountId: ACCOUNT_ID,
   tenant: TENANT,
   deviceX25519PublicKey,
   devicePopPublicKey,
@@ -79,12 +79,15 @@ const jwt = `${signingInput}.${b64url(sig)}`;
 const client = new WebChannelNatsClient({
   url: NATS,
   jwt,
-  agentId: AGENT_ID,
+  accountId: ACCOUNT_ID,
   tenant: TENANT,
   peerId: PEER_ID,
   registration: {
-    registerBaseUrl: GW_URL,
+    // The client derives the register subject from tenant/accountId/peerId and
+    // drives challenge→register over NATS request/reply (no gateway URL).
     devicePrivateKey: ed25519.privateKey,
+    // Phase 6: register-delivered conversation key (no handshake).
+    deviceX25519PrivateKey: x25519.privateKey,
   },
 });
 
@@ -100,13 +103,13 @@ const reply = new Promise<{ type: string; text?: string }>((resolve) => {
 client.connect();
 // No sleep before sending: timing-robustness comes from the production client's
 // send-buffering, not a magic delay. WebChannelNatsClient.sendUserMessage →
-// enqueue() pushes onto outboundQueue while sessionKey === null (pre-handshake),
-// and flushQueue() seals + publishes the whole queue the moment the X25519
-// handshake derives the session key (handleRaw → flushQueue). So sending
+// enqueue() pushes onto outboundQueue while sessionKey === null (pre-key), and
+// flushQueue() seals + publishes the whole queue the moment the conversation key
+// K is established (register-delivered, Phase 6 — no handshake). So sending
 // immediately after connect() is safe — the message rides the buffer through
-// NATS connect + HTTP PoP register + handshake and is never lost on a slow runner.
-// (A registration failure still fires onError → exit(4) below; the reply still
-// times out → exit(3). This only removes the fragile fixed sleep.)
+// NATS connect + the NATS PoP register hop + key delivery and is never lost on a
+// slow runner. (A registration failure still fires onError → exit(4) below; the
+// reply still times out → exit(3). This only removes the fragile fixed sleep.)
 console.log("[send] 'hello via jwt register'");
 client.sendUserMessage("hello via jwt register");
 
@@ -116,6 +119,6 @@ const result = await Promise.race([
 ]).catch((e) => { console.error("[FAIL]", e.message); process.exit(3); });
 
 console.log("[REPLY]", JSON.stringify(result));
-console.log("[PROOF] agent registered peer via HTTP hop (wildcard OFF)");
+console.log("[PROOF] agent registered peer via NATS register hop (wildcard OFF)");
 client.disconnect();
 process.exit(0);

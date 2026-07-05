@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Hermetic REAL-SaaS-issuer E2E: prove the reference bootstrap-server (NOT a
 # fixture) mints an RS256 bootstrap JWT, served via its REAL JWKS endpoint, that
-# the plugin verifies over HTTP (auth.jwt.jwksUrl) through the live HTTP
-# /webchannel/nats/register hop — admitting the peer for an encrypted round-trip.
+# the plugin verifies over HTTP (auth.jwt.jwksUrl) through the live NATS register
+# hop (`…{peerId}.register`) — admitting the peer for an encrypted round-trip.
 #
 # This is the sibling of run-jwt-register.sh (which self-mints from a static
 # jwksFile). Here the JWT SOURCE is the real bootstrap-server; everything else
@@ -160,7 +160,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
         "jwt": {
           "jwksUrl": "http://127.0.0.1:$BOOTSTRAP_PORT/.well-known/jwks.json",
           "issuer": "$SAAS_ISSUER",
-          "audience": "default-agent"
+          "audience": "default"
         }
       },
       "dmSecurity": "allowlist",
@@ -174,7 +174,6 @@ echo "[run-saas-issuer] wrote $OCH/.openclaw/openclaw.json"
 # 5. Boot the isolated gateway in dev/open-NATS + jwt mode.
 OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_DEV_OPEN=1 WEBCHANNEL_NATS_URL=ws://127.0.0.1:$NATS_WS \
-  WEBCHANNEL_TENANT=default-tenant WEBCHANNEL_AGENT_ID=default-agent \
   WEBCHANNEL_GW_URL=http://127.0.0.1:$GW_PORT \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &

@@ -6,7 +6,7 @@
  * the compact JWT via `?ticket=` and the gateway validates it against a JWKS
  * public key resolved by `kid`.
  *
- * CONSTRAINTS (mirroring ticket.ts, src/jwt.ts's HMAC sibling):
+ * CONSTRAINTS:
  *  - Use only `globalThis.crypto.subtle` (Cloudflare Workers + Node 18+ both
  *    expose it as part of the Web Crypto API surface).
  *  - Pin `alg === "RS256"` — reject `none`, `HS256` (algorithm-confusion), and
@@ -47,6 +47,15 @@ function constantTimeEqual(a: string, b: string): boolean {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return diff === 0;
+}
+
+/**
+ * Collapse any trailing slash(es) from a URL-style issuer so `https://x` and
+ * `https://x/` compare equal. Used ONLY for the `iss` claim comparison — a
+ * trailing slash is not a meaningful part of an origin identifier.
+ */
+function stripTrailingSlashes(s: string): string {
+  return s.replace(/\/+$/, "");
 }
 
 /**
@@ -148,8 +157,6 @@ export type VerifyJwtOptions = {
   audience: string;
   /**
    * Allowed clock-skew leeway in seconds when checking `exp`. Default 60.
-   * Mirrors the ticket.ts verifier's behavior so an operator gets consistent
-   * behavior between `hmac-ticket` and `jwt`.
    */
   clockSkewSec?: number;
 };
@@ -254,9 +261,18 @@ export async function verifyJwt(
     return null;
   }
 
-  // iss — constant-time compare against expected issuer.
+  // iss — constant-time compare against expected issuer, tolerant of a trailing
+  // slash. A URL issuer `https://x` and `https://x/` denote the same origin, but
+  // the SaaS mints `iss` verbatim from its base URL while the gateway derives its
+  // EXPECTED issuer from a possibly-differently-slashed `--base-url`; an exact
+  // compare turns that cosmetic difference into a silent reject-every-token trap.
+  // Collapsing trailing slashes on BOTH sides removes it for every deployment
+  // (including external IdPs the plugin can't normalize). NOT a relaxation: it
+  // only equates trailing-slash variants of the SAME issuer, never distinct hosts.
   if (typeof payload.iss !== "string") return null;
-  if (!constantTimeEqual(payload.iss, opts.issuer)) return null;
+  if (!constantTimeEqual(stripTrailingSlashes(payload.iss), stripTrailingSlashes(opts.issuer))) {
+    return null;
+  }
 
   // aud — string OR array. We accept if the expected audience appears anywhere.
   const aud = payload.aud;
@@ -358,14 +374,19 @@ export async function verifyJwt(
  * an array per RFC 7519). Returns `[]` on any decode failure or a missing/
  * malformed `aud`.
  *
- * ── Why an UNVERIFIED peek is safe here ─────────────────────────────────────
- * The single `/webchannel/nats/register*` route serves multiple accounts; it
- * must pick WHICH account's verifier to run, and each account's verifier checks
- * a different expected `aud` (= that account's agentId). This helper only
- * ROUTES the request to a candidate account. The selected account's verifier
- * then performs the full, signature-checked verification (issuer + `aud` +
- * signature + exp), so a forged/altered `aud` can at most select an account whose
- * verifier will then REJECT the token. It never grants trust on its own.
+ * ── Why an UNVERIFIED peek is safe ──────────────────────────────────────────
+ * A caller that serves multiple accounts can use this to pick WHICH account's
+ * verifier to run, where each account's verifier checks a different expected
+ * `aud` (= that account's accountId). This helper only ROUTES to a candidate
+ * account; the selected account's verifier then performs the full,
+ * signature-checked verification (issuer + `aud` + signature + exp), so a
+ * forged/altered `aud` can at most select an account whose verifier will then
+ * REJECT the token. It never grants trust on its own.
+ *
+ * NOTE: since register admission moved to a per-account NATS `.register` subject
+ * (the subject namespace already pins the account), production no longer routes
+ * by aud — each account verifies against its own auth directly. This peek is
+ * retained for any future multi-account-single-entry routing and its own tests.
  */
 export function peekUnverifiedJwtAudiences(token: unknown): string[] {
   if (typeof token !== "string" || token.length === 0) return [];

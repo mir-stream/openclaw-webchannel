@@ -53,13 +53,9 @@ export type EnrolledNatsConnectionOptions = {
   tenant: string;
 
   /**
-   * Agent ID (optional, for debugging).
-   */
-  agentId?: string;
-
-  /**
-   * Account id (가-1). Threaded into the credential-path resolution so the
-   * connection reads the account-scoped creds. Defaults to `"default"`.
+   * Account (deployment) id — the wire identity (가-1/가-2). Sent to the SaaS
+   * enrollment AND threaded into credential-path resolution so the connection
+   * reads the account-scoped creds. Defaults to `"default"`.
    */
   accountId?: string;
 
@@ -103,6 +99,7 @@ export type EnrolledNatsConnection = {
     peerId: string;
     jwksUrl: string;
     bootstrapUrl: string;
+    natsUrl: string;
   };
 
   /**
@@ -137,7 +134,6 @@ export async function createEnrolledNatsConnection(
     saasEnrollUrl: options.saasEnrollUrl,
     saasPollUrl: options.saasPollUrl,
     tenant: options.tenant,
-    agentId: options.agentId,
     accountId: options.accountId,
     credentialPath: options.credentialPath,
     displayInstructions: options.displayInstructions,
@@ -151,17 +147,28 @@ export async function createEnrolledNatsConnection(
 
   // Step 3: Connect to NATS with user credentials.
   //
+  // The SaaS is the rendezvous authority: the enrollment response carries the
+  // relay URL alongside the minted creds, so the two never drift. We dial that
+  // SaaS-delivered `enrollment.natsUrl` in preference to any locally-configured
+  // `options.natsUrl` (which the resolver derives from `nats.url` /
+  // `WEBCHANNEL_NATS_URL` — now a dev-only override / back-compat fallback for an
+  // older issuer that does not yet return a URL).
+  //
   // A JWT-auth nats-server challenges the client with a nonce in INFO; the client
   // must return an Ed25519 signature over that nonce (signed with the user NKEY
   // seed) in CONNECT, or the server rejects the connection. We derive that signing
   // callback from the enrolled user seed so the production enrolled path
   // authenticates against a real JWT-auth nats-server (not only an open dev one).
-  console.log("[connection] Connecting to NATS...");
+  const natsUrl = enrollment.natsUrl ?? options.natsUrl;
+  console.log(`[connection] Connecting to NATS at ${natsUrl}...`);
   const transport = new NatsTransport({
-    url: options.natsUrl,
+    url: natsUrl,
     jwtCredential: enrollment.creds.userJwt,
     nkeySigningCallback: makeNkeySigningCallback(enrollment.creds.userSeed),
     clientName: options.natsClientName ?? "openclaw-webchannel-agent",
+    // S1: survive a NATS blip (server restart / TCP reset) — re-dial with
+    // backoff and replay subscriptions instead of wedging until gateway restart.
+    reconnect: true,
   });
 
   await transport.connect();

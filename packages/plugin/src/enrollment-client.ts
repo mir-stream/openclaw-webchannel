@@ -32,7 +32,7 @@ import { DEFAULT_ACCOUNT_ID, resolveReadCredentialPath } from "./account-config.
  */
 type EnrollmentRequest = {
   agentPublicKey: string;
-  agentId?: string;
+  accountId?: string;
   tenant: string;
 };
 
@@ -63,6 +63,21 @@ type EnrollmentResult = {
   peerId: string;
   jwksUrl: string;
   bootstrapUrl: string;
+  /**
+   * NATS WebSocket URL delivered by the SaaS. The relay location travels with
+   * the minted creds (the SaaS is the rendezvous authority); the enrolled plugin
+   * dials THIS rather than a local `nats.url` / `WEBCHANNEL_NATS_URL`.
+   */
+  natsUrl: string;
+  /**
+   * The exact `iss` the SaaS puts in the bootstrap JWTs it mints (same
+   * rendezvous-authority principle as `natsUrl`). OPTIONAL here (unlike the
+   * server-side type, where it is required) because a pre-issuer SaaS omits
+   * it — the runtime then falls back to deriving issuer = saas.baseUrl.
+   * Precedence at verify time: operator pin > this delivered value > derived.
+   * Used VERBATIM — never canonicalized.
+   */
+  issuer?: string;
 };
 
 /**
@@ -125,12 +140,15 @@ export type PluginCredentials = {
     peerId: string;
     jwksUrl: string;
     bootstrapUrl: string;
+    natsUrl: string;
+    /** SaaS-delivered bootstrap-JWT issuer (absent for pre-issuer enrollments). */
+    issuer?: string;
   };
 
   /**
-   * Agent ID (optional, for debugging).
+   * Account (deployment) id — the wire identity (optional, for debugging).
    */
-  agentId?: string;
+  accountId?: string;
 
   /**
    * Tenant ID.
@@ -174,14 +192,11 @@ export type EnrollmentOptions = {
   tenant: string;
 
   /**
-   * Agent ID (optional, for debugging).
-   */
-  agentId?: string;
-
-  /**
-   * Account id (가-1). When `credentialPath` is omitted, the default path is
-   * account-scoped: `~/.openclaw-webchannel/<account>/credentials.json`.
-   * Defaults to `"default"`.
+   * Account (deployment) id — the wire identity (JWT aud / NATS subject key)
+   * sent to the SaaS enrollment. Also scopes the default credential path:
+   * `~/.openclaw-webchannel/<account>/credentials.json` (가-1). When
+   * `credentialPath` is omitted the path is derived from this. Defaults to
+   * `"default"`.
    */
   accountId?: string;
 
@@ -224,10 +239,9 @@ export type EnrollmentOptions = {
  */
 export class EnrollmentClient {
   private readonly options: Required<
-    Omit<EnrollmentOptions, "displayInstructions" | "agentId" | "accountId" | "_minPollIntervalMs">
+    Omit<EnrollmentOptions, "displayInstructions" | "accountId" | "_minPollIntervalMs">
   > & {
     displayInstructions: boolean;
-    agentId?: string;
     accountId?: string;
     _minPollIntervalMs?: number;
   };
@@ -322,7 +336,7 @@ export class EnrollmentClient {
         publicKey: this.bufferToBase64Url(identityKey.publicKey),
         privateKey: this.bufferToBase64Url(identityKey.privateKey),
       },
-      agentId: this.options.agentId,
+      accountId: this.options.accountId,
       tenant: this.options.tenant,
       saasEnrollUrl: this.options.saasEnrollUrl,
       saasPollUrl: this.options.saasPollUrl,
@@ -331,7 +345,7 @@ export class EnrollmentClient {
     // Initiate enrollment
     const enrollRequest: EnrollmentRequest = {
       agentPublicKey: this.bufferToBase64Url(identityKey.publicKey),
-      agentId: this.options.agentId,
+      accountId: this.options.accountId,
       tenant: this.options.tenant,
     };
 

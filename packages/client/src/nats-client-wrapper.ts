@@ -50,14 +50,32 @@ export class WebChannelNATSClient {
 
   private readonly listeners = new Set<Listener>();
 
-  constructor(options: WebChannelOptions & NatsClientOptions) {
+  // `url` and `jwt` are supplied through the WebChannelOptions aliases
+  // `natsUrl` / `bootstrapJwt`, so they are Omitted from the NatsClientOptions
+  // half — otherwise the intersection would require the caller to ALSO pass a
+  // raw `url` the wrapper ignores. Everything else (accountId, tenant, peerId,
+  // registration, natsCredentials, reconnect tuning) is forwarded as-is.
+  constructor(options: WebChannelOptions & Omit<NatsClientOptions, "url" | "jwt">) {
     this.natsOptions = {
       url: options.natsUrl ?? "wss://nats.example.com",
       jwt: options.bootstrapJwt ?? "",
-      agentId: options.agentId ?? "default-agent",
+      accountId: options.accountId ?? "default-account",
       tenant: options.tenant ?? "default-tenant",
       peerId: options.peerId ?? "anonymous-peer",
       registration: options.registration,
+      // CL1: forward the NATS-layer NKEY credentials + reconnect tuning. A
+      // production JWT-auth nats-server REQUIRES `natsCredentials` — without it
+      // CONNECT ships only the bootstrap JWT with no signed nonce, the server
+      // returns `-ERR Authorization Violation`, and the client enters an
+      // unwinnable reconnect loop. Dropping these silently made the public
+      // wrapper unusable against any real (non-open) NATS deployment.
+      natsCredentials: options.natsCredentials,
+      reconnectBaseMs: options.reconnectBaseMs,
+      reconnectCapMs: options.reconnectCapMs,
+      // CL3: forward the keepalive interval too (same drop-on-the-floor class as
+      // the CL1 natsCredentials bug — the wrapper rebuilds the options object, so
+      // any NatsClientOptions field it doesn't name is silently lost).
+      heartbeatIntervalMs: options.heartbeatIntervalMs,
     };
 
     this.client = new WebChannelNatsClient(this.natsOptions);
@@ -65,22 +83,26 @@ export class WebChannelNATSClient {
     // Wire up message listener
     this.client.onMessage((msg: InboundMessage) => this.handleMessage(msg));
 
-    // Wire up state listener
+    // Wire up state listener. Once we are in the terminal `"error"` status
+    // (CL2), a trailing `onState(false)` from the connection teardown must NOT
+    // downgrade it back to "reconnecting" — the client is not reconnecting.
     this.client.onState((connected: boolean) => {
+      if (!connected && this.state.status === "error") return;
       this.setState({
         status: connected ? "connected" : "reconnecting",
         connected,
       });
     });
 
-    // Surface a failed PoP registration. The underlying client tears the
-    // connection fully down (registration failure is terminal — see
-    // nats-client.ts onConnected), so nothing is reconnecting. ConnectionStatus
-    // has no terminal/disconnected value, so we do NOT claim "reconnecting"
-    // here: the matching `onState(false)` from the teardown already moves status
-    // out of "connected", and we just log the error.
+    // CL2: surface a TERMINAL failure to the embedder. The underlying client
+    // fires onError for non-retryable failures — a failed PoP registration or an
+    // authoritative NATS auth rejection (`-ERR Authorization Violation`, expired
+    // creds) — and has stopped reconnecting. We move to the terminal `"error"`
+    // status with a reason so the app can prompt for fresh credentials instead
+    // of showing an eternal reconnect spinner.
     this.client.onError((err: Error) => {
-      console.error("[nats-wrapper] registration error:", err);
+      console.error("[nats-wrapper] terminal connection error:", err);
+      this.setState({ status: "error", connected: false, error: err.message });
     });
   }
 
@@ -190,16 +212,107 @@ export class WebChannelNATSClient {
 
         const existing = this.state.messages;
         const seen = new Set(existing.map((m) => m.id));
+
+        // Phase 6 (stateless register, shared conversation key): a snapshot
+        // triggered by ANY device's register — this device's reconnect or a
+        // second device joining — arrives at every device mid-session on the
+        // shared `.out`. Messages already rendered LIVE on this device sit in
+        // state under LOCAL id namespaces while the snapshot carries the core
+        // transcript's canonical ids, so plain id-dedup would duplicate them:
+        //   - user sends → synthetic local echo ids (`u-<n>`);
+        //   - agent replies → the plugin's live-frame ids (`webchannel-…`
+        //     from nextMessageId(), or `a-<n>` when a frame had no id) — the
+        //     core transcript NEVER stores that platform id, so history ids
+        //     can never match live ids for agent messages either.
+        // Matching happens in three tiers, in snapshot order:
+        //   1. id — a message whose canonical id we already hold (a prior
+        //      snapshot placed or adopted it) is a no-op;
+        //   2. exact text+role — adopt the server id onto the first
+        //      text-matching local bubble (covers user echoes always; covers
+        //      agent replies only when live text == stored text);
+        //   3. POSITIONAL (agent only) — openclaw's live reply text is NOT
+        //      byte-equal to the stored transcript text (core strips metadata
+        //      sections from live replies but stores the raw model output), so
+        //      tier 2 can miss agent bubbles entirely. Structure saves us: an
+        //      agent reply in the snapshot immediately FOLLOWS the message it
+        //      answered, and that predecessor matched some local index i via
+        //      tier 1/2 — so if the local message at i+1 is a live-id agent
+        //      bubble, it IS this reply's live rendering; adopt onto it (and
+        //      keep the canonical stored text). Chains across multi-frame
+        //      replies because each adoption advances the anchor.
+        // A `working:true` progress draft is never an adoption target: its
+        // live id must survive for the upcoming progress/final upserts.
+        // Known cosmetic edge (accepted): if TWO devices send the identical
+        // text near-simultaneously, text-only matching can adopt the OTHER
+        // device's server id onto this device's bubble — the ids swap between
+        // the two bubbles, but the bubble COUNT stays exactly right and every
+        // later snapshot still dedups, so nothing duplicates or disappears.
+        const isLocalLiveId = (m: ChatMessage): boolean =>
+          m.role === "user"
+            ? m.id.startsWith("u-")
+            : !m.working && (m.id.startsWith("a-") || m.id.startsWith("webchannel-"));
+        const adoptKey = (role: string, text: string): string => `${role} ${text}`;
+
+        const next = existing.slice();
+        const localIndexById = new Map<string, number>();
+        next.forEach((m, i) => localIndexById.set(m.id, i));
+        const claimed = new Set<number>();
+        const adoptable = new Map<string, number[]>();
+        next.forEach((m, i) => {
+          if ((m.role === "user" || m.role === "agent") && isLocalLiveId(m)) {
+            const key = adoptKey(m.role, m.text);
+            const idxs = adoptable.get(key) ?? [];
+            idxs.push(i);
+            adoptable.set(key, idxs);
+          }
+        });
+
+        let adopted = false;
         const fresh: ChatMessage[] = [];
+        /** Local index the PREVIOUS snapshot message resolved to (tier-3 anchor). */
+        let anchor: number | null = null;
+
+        const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
+          // Keep the canonical stored text on adoption, so this device
+          // converges to exactly what a reloading device would render.
+          next[idx] = { ...next[idx], id: m.id, text: m.text, ts: m.ts };
+          claimed.add(idx);
+          localIndexById.set(m.id, idx);
+          adopted = true;
+          anchor = idx;
+        };
 
         for (const m of incoming) {
           if (!m || typeof m !== "object") continue;
           if (typeof m.id !== "string" || m.id.length === 0) continue;
           if (m.role !== "user" && m.role !== "agent") continue;
           if (typeof m.text !== "string") continue;
-          if (seen.has(m.id)) continue;
+          if (seen.has(m.id)) {
+            anchor = localIndexById.get(m.id) ?? null;
+            continue;
+          }
 
           seen.add(m.id);
+          // Tier 2: exact text+role.
+          const idxs = adoptable.get(adoptKey(m.role, m.text));
+          while (idxs && idxs.length > 0 && claimed.has(idxs[0])) idxs.shift();
+          if (idxs && idxs.length > 0) {
+            adoptAt(idxs.shift()!, m);
+            continue;
+          }
+          // Tier 3: positional (agent replies whose live text was reformatted).
+          if (m.role === "agent" && anchor !== null) {
+            const cand = anchor + 1;
+            if (
+              cand < next.length &&
+              !claimed.has(cand) &&
+              next[cand].role === "agent" &&
+              isLocalLiveId(next[cand])
+            ) {
+              adoptAt(cand, m);
+              continue;
+            }
+          }
           fresh.push({
             id: m.id,
             role: m.role,
@@ -207,11 +320,12 @@ export class WebChannelNATSClient {
             ts: m.ts,
             working: false,
           });
+          anchor = null;
         }
 
-        if (fresh.length === 0) return;
+        if (fresh.length === 0 && !adopted) return;
 
-        this.setState({ messages: [...fresh, ...existing] });
+        this.setState({ messages: [...fresh, ...next] });
         return;
       }
 

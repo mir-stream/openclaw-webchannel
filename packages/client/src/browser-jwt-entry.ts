@@ -23,7 +23,7 @@ export type RunJwtRegisterOptions = {
   issuerUrl: string;
   /** Gateway base URL serving the PoP register routes. */
   gwUrl: string;
-  agentId: string;
+  accountId: string;
   tenant: string;
   peerId: string;
   /** Message text to send; the echo model returns it for the assertion. */
@@ -77,7 +77,7 @@ export async function runJwtRegister(
     body: JSON.stringify({
       devicePublicKey,
       devicePopPublicKey,
-      agentId: opts.agentId,
+      accountId: opts.accountId,
       tenant: opts.tenant,
       peerId: opts.peerId,
     }),
@@ -87,21 +87,32 @@ export async function runJwtRegister(
       `bootstrap failed: HTTP ${bootstrapRes.status} ${await bootstrapRes.text()}`,
     );
   }
-  const { jwt, peerId } = (await bootstrapRes.json()) as { jwt?: string; peerId?: string };
+  const { jwt, peerId, natsUrl: deliveredNatsUrl } = (await bootstrapRes.json()) as {
+    jwt?: string;
+    peerId?: string;
+    natsUrl?: string;
+  };
   if (!jwt || !peerId) throw new Error("bootstrap response missing jwt/peerId");
+
+  // The SaaS is the rendezvous authority: dial the relay URL it returned in the
+  // bootstrap response, falling back to the page-supplied `opts.natsUrl` only when
+  // the issuer didn't send one (back-compat).
+  const natsUrl = deliveredNatsUrl ?? opts.natsUrl;
 
   // 4. Production client with the `registration` (PoP HTTP register) path. The
   //    in-page Ed25519 private key is handed straight to the client — no
   //    serialization, no boundary crossing.
   const client = new WebChannelNatsClient({
-    url: opts.natsUrl,
+    url: natsUrl,
     jwt,
-    agentId: opts.agentId,
+    accountId: opts.accountId,
     tenant: opts.tenant,
     peerId,
     registration: {
-      registerBaseUrl: opts.gwUrl,
       devicePrivateKey: ed25519.privateKey,
+      // Phase 6: the cnf X25519 private key — the session key K arrives
+      // wrapped in the register reply (no handshake on this path).
+      deviceX25519PrivateKey: x25519.privateKey,
     },
   });
 
@@ -146,7 +157,7 @@ export type RunAllRealOptions = {
   issuerUrl: string;
   /** Gateway base URL serving the PoP register routes. */
   gwUrl: string;
-  agentId: string;
+  accountId: string;
   tenant: string;
   peerId: string;
   /** Message text to send; the echo model returns it for the assertion. */
@@ -193,16 +204,21 @@ export async function runAllReal(
   const credsRes = await fetch(`${opts.issuerUrl}/test/nats-user`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ tenant: opts.tenant, role: "browser" }),
+    // Per-peer browser creds: scope to the peerId we bootstrap under below.
+    body: JSON.stringify({ tenant: opts.tenant, role: "browser", peerId: opts.peerId }),
   });
   if (!credsRes.ok) {
     throw new Error(`nats-user failed: HTTP ${credsRes.status} ${await credsRes.text()}`);
   }
-  const { userJwt, userSeedRaw } = (await credsRes.json()) as {
+  const { userJwt, userSeedRaw, natsUrl: deliveredNatsUrl } = (await credsRes.json()) as {
     userJwt?: string;
     userSeedRaw?: string;
+    natsUrl?: string;
   };
   if (!userJwt || !userSeedRaw) throw new Error("nats-user response missing userJwt/userSeedRaw");
+
+  // SaaS-delivered relay URL wins over the page-supplied `opts.natsUrl` (fallback).
+  const natsUrl = deliveredNatsUrl ?? opts.natsUrl;
 
   // 4. PoP bootstrap JWT (RS256, this issuer's trust chain) for the register hop.
   const bootRes = await fetch(`${opts.issuerUrl}/test/bootstrap-jwt`, {
@@ -210,7 +226,7 @@ export async function runAllReal(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       tenant: opts.tenant,
-      agentId: opts.agentId,
+      accountId: opts.accountId,
       peerId: opts.peerId,
       deviceX25519PublicKey,
       devicePopPublicKey,
@@ -224,15 +240,16 @@ export async function runAllReal(
 
   // 5. Production client with BOTH NATS-layer NKEY auth AND the PoP register hop.
   const client = new WebChannelNatsClient({
-    url: opts.natsUrl,
+    url: natsUrl,
     jwt,
-    agentId: opts.agentId,
+    accountId: opts.accountId,
     tenant: opts.tenant,
     peerId,
     natsCredentials: { userJwt, userSeedRaw },
     registration: {
-      registerBaseUrl: opts.gwUrl,
       devicePrivateKey: ed25519.privateKey,
+      // Phase 6: register-delivered conversation key (no handshake).
+      deviceX25519PrivateKey: x25519.privateKey,
     },
   });
 

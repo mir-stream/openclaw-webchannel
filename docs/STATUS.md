@@ -1,6 +1,6 @@
 # Project Status — single source of truth
 
-_Last updated: 2026-06-27._
+_Last updated: 2026-07-01._
 
 This document supersedes any "AC 100% / complete / verified" claim found in commit messages,
 Ouroboros seeds (`.ouroboros/*`), evaluator scores, or older notes. Where those conflict with
@@ -13,12 +13,28 @@ this file, **this file is correct.**
 
 ## TL;DR
 
-- **The Gateway-WS path works end-to-end** (browser ↔ OpenClaw ↔ Claude) — the always-on baseline.
-- **The production NATS pair is live in a REAL openclaw gateway** (`e384198`): a real headless-Chromium
-  browser running the production `WebChannelNatsClient` round-trips an encrypted message through the
-  `index-nats` plugin loaded in a real openclaw gateway → real `inbound.run` → (deterministic echo
-  model) → back, decrypted. This closed the project's core "never run live" gap. Reproduce via
-  [`e2e/local/`](../e2e/local/README.md).
+- **The NATS E2E path is the PRODUCTION DEFAULT** (`packages/plugin/package.json` →
+  `openclaw.extensions = ["./index-nats.ts"]`) and is **live-proven on real hardware**: a real
+  browser on a Mac talked to a real openclaw gateway + this plugin running in a container, over a
+  real JWT-auth `nats-server`, and got a real (zai) LLM reply — ingress-free, E2E-encrypted,
+  device-flow enrolled. See [`SPLIT_DEMO.md`](SPLIT_DEMO.md) to reproduce the split host/container run.
+- **The NATS relay URL is SaaS-delivered.** The enrolled plugin receives `natsUrl` inside its
+  device-flow `EnrollmentResult` and dials that; the operator does NOT configure the NATS URL on
+  the enrolled path. Local `nats.url` / `WEBCHANNEL_NATS_URL` is now a dev-only override /
+  back-compat fallback (still the live value for static/open modes).
+- **On the enrolled `auto`-admission path, NO `channels.webchannel.auth` block is needed** — the
+  verifier is only built for the `register-hop` admission mode. Browser admission there = NATS
+  subject-permissioned NKEY creds + X25519 handshake (+ optional `dmSecurity` allowlist).
+- **The interactive demo is a single script**: [`e2e/local/run-demo.sh`](../e2e/local/README.md)
+  (enrolled NATS + real model). The old legacy Gateway-WS live-chat demo trio was deleted.
+- **The production NATS pair is also live in a REAL openclaw gateway** (`e384198`): a real
+  headless-Chromium browser running the production `WebChannelNatsClient` round-trips an encrypted
+  message through the `index-nats` plugin loaded in a real openclaw gateway → real `inbound.run` →
+  (deterministic echo model) → back, decrypted. Reproduce via [`e2e/local/`](../e2e/local/README.md).
+- **The Gateway-WS path is LEGACY / dev-only** — a zero-infra WS round-trip (`smoke/*.mjs`), no
+  production role. `anonymous` belongs to it (the `hmac-ticket` auth strategy has since been
+  **removed** — `ticket.ts` + the `auth.ts` hmac config/verifier/switch + schema enum are gone).
+  Full removal of the transport itself is tracked in [`BACKLOG.md`](BACKLOG.md).
 - **The NATS E2E path also has an automated gate** (separate demo seam): a real headless-Chromium
   browser dials a real `nats-server`, round-trips a ChaCha20-Poly1305 message through an in-repo echo
   agent, and decrypts the reply — in **both** dev/open-NATS and enrolled-JWT modes, ciphertext-only on
@@ -38,7 +54,7 @@ this file, **this file is correct.**
 
 | Capability | Evidence |
 |---|---|
-| Gateway-WS channel: browser ↔ OpenClaw agent ↔ Claude | Runs on `ws://127.0.0.1:18789`; `packages/client/smoke-client.mjs` round-trips a message against a live gateway. `~/.openclaw/openclaw.json` loads the plugin in WS mode. |
+| Gateway-WS channel: browser ↔ OpenClaw agent ↔ Claude | Runs on `ws://127.0.0.1:18789`; `smoke/jwt.mjs` round-trips a message against a live gateway (`jwt` auth). `~/.openclaw/openclaw.json` loads the plugin in WS mode. |
 | E2E crypto: X25519 + HKDF-SHA256 + ChaCha20-Poly1305 (`packages/plugin/src/e2e-crypto.ts`, `e2e-envelope.ts`) | Unit-tested. |
 | NATS transport (`nats-transport.ts`), channel framing (`nats-channel.ts`, `crypto-nats-channel.ts`) | Unit + integration tests vs a real `nats-server`. |
 | Trust chain (`packages/saas`): `setupTrustChain` (operator/account JWTs, MEMORY resolver, JWKS), device-flow enrollment (RFC 8628), NATS user-cred minting | AC3 real-server permission isolation 7/7, AC6 device-flow E2E 10/10 — on a real `nats-server` (`@nats-io/nkeys` + `@nats-io/jwt`). |
@@ -59,8 +75,25 @@ this file, **this file is correct.**
 | Gap | Detail |
 |---|---|
 | Real ClawHub / npm publish | Needs registry credentials (CI secrets) + a ClawHub account. The seed sanctions a `DonePublishDeferred` terminal state when creds are absent. See `docs/PACKAGING.md`. |
-| HTTP-register hop exercised by BOTH a Node driver AND a real headless browser | The plain-HTTP register/challenge/unregister routes **are served live** (fix `5597466`), the client **is wired** to call `registerWithPop` (`9aa4b67`), and the JWT-register round-trip is **exercised end-to-end** by `e2e/local/run-jwt-register.sh` + `jwt-register-roundtrip.ts`: with `auth.strategy="jwt"` the agent does NOT `subscribeWildcard` (gated in `index-nats.ts` / `src/wildcard-gate.ts`), so a successful round-trip proves `registerPeer` happened ONLY via the live HTTP hop. The bootstrap JWT is minted via an RS256 JWKS **fixture** (`run-jwt-register.sh`, #13) AND via the **real** reference bootstrap-server with real JWKS-over-HTTP (`run-saas-issuer-register.sh`, **#14 done**). The **real browser/Playwright** JWT variant is **done** (#16, `c4f0a6b`, `e2e/local/run-browser-jwt-register.sh` — added gateway-register CORS), and the full **enrolled-NATS-transport** variant is **done** (#15, `4a70b9b`, `e2e/local/run-enrolled-transport.sh`). |
-| **ALL 5 live harnesses in the CI gate** | The CI gate (`e2e-gate.yml`) runs all five real-gateway harnesses as named steps every push — `run-jwt-register`, `run-saas-issuer-register`, `run-enrolled-transport`, `run-browser-jwt-register`, `run-all-real` (incl. the 2 headless-Chromium ones) — so the real `openclaw gateway → index-nats → inbound.run` path, device-flow enrollment, JWT-auth NATS, the register hop, and the ALL-REAL fusion are all regression-guarded. Verified GREEN on the ubuntu runner (`7bbacc4`+`01a197e`, run `28307005273`). The gate ALSO drives the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` vitest seam + the ≥712 unit baseline. |
+| **Stability/security hardening (review 2026-07-02)** | Full-code review found deploy-blocking issues on the live NATS path. **FIXED (develop, uncommitted-upstream):** **C1** gateway-crash guard, **S1** auto-reconnect, **A1** `/enroll` OOM sweeper, plus ops **O1** (CI gate on dev branches), **O3** (smoke refuse-by-default), **O-min8** (flaky port-scan). **Still open:** **C2** (E2E handshake unauthenticated → active-relay MITM; accepted-risk while the relay is self-operated, hard-blocker before a third-party relay — code milestone-gated) and the un-started findings (S2/S3, A2/A3, CL1-3, SEC1-5, J8, …). Full findings + per-item FIXED status: [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md). C2 backlog: [`BACKLOG.md`](BACKLOG.md). |
+
+> The live NATS E2E path (browser → NATS → plugin/agent → reply → browser) is the production
+> default and has run end-to-end on real hardware (split host/container, real JWT-auth
+> `nats-server`, real LLM) — the **happy path is proven**. What the 2026-07-02 review surfaced is
+> **operational hardening under stress** (server restart, connection churn, long uptime) rather
+> than happy-path gaps: see the row above and [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md). The
+> top-severity items (crash on error emit, no reconnect, `/enroll` OOM) are now fixed; the
+> remaining work is C2 (relay MITM, accepted-risk) plus deeper hardening (map eviction, JWKS
+> cache, idempotent approve, client terminal-error surfacing).
+> Separately, full removal of the legacy Gateway-WS transport is a structural cleanup (the
+> `hmac-ticket` auth strategy is already removed) — tracked in [`BACKLOG.md`](BACKLOG.md).
+
+### Previously-open items, now closed
+
+| Was open | Now |
+|---|---|
+| HTTP-register hop exercised by BOTH a Node driver AND a real headless browser | **Done.** Routes served live (`5597466`); client wired to `registerWithPop` (`9aa4b67`); round-trip proven with the wildcard gated OFF on the jwt path (`run-jwt-register.sh`), via a real bootstrap-server + real JWKS-over-HTTP (`run-saas-issuer-register.sh`, #14), a real browser/Playwright (#16, `c4f0a6b`), and the full enrolled-NATS-transport variant (#15, `4a70b9b`). |
+| **ALL 5 live harnesses in the CI gate** | **Done & GREEN** (`7bbacc4`+`01a197e`, run `28307005273`). The gate runs `run-jwt-register`, `run-saas-issuer-register`, `run-enrolled-transport`, `run-browser-jwt-register`, `run-all-real` as named steps, plus the parallel `e2e-browser-client` ↔ `e2e-roundtrip-agent` vitest seam + the ≥712 unit baseline. |
 
 ## Coverage note
 
@@ -77,14 +110,17 @@ runs). The contradiction you may have noticed:
 
 - **"Done" signals:** Phase B committed as `feat(phase-b): AC4-6 ... (UNVERIFIED)` (`053920e`);
   the evaluator scored Phase A "APPROVED 0.86, AC 100%"; seeds list "AC1-6 done."
-- **"Not done" signals (correct):** `docs/TRUST_AND_ONBOARDING.md:186` lists open gaps including
-  "browser NATS dial (still gateway WS)"; `.ouroboros/RUN_HANDOFF.md` calls the E2E-NATS stack a
-  "complete but **unwired** parallel layer."
+- **"Not done" signals (correct *at the time*):** older `docs/TRUST_AND_ONBOARDING.md` notes and
+  `.ouroboros/RUN_HANDOFF.md` called the E2E-NATS stack a "complete but **unwired** parallel
+  layer" (browser NATS dial still gateway-WS). **Those caveats are now stale** — the NATS path is
+  wired, live-proven, and the production default (see TL;DR). They are kept here only to explain
+  the historical contradiction.
 
 The AC/test framing measured the ACs that were defined — none of which was the end-to-end NATS
 integration — so a high score coexisted with an honestly-noted "unwired" caveat. The score won
-the narrative; the caveat was buried. (A throwaway echo-bot demo built 2026-06-25 to fake the
-agent side made this worse and was removed in `ee89ba3`.)
+the narrative; the caveat was buried. That gap has since been closed end-to-end. (A throwaway
+echo-bot demo built 2026-06-25 to fake the agent side made this worse and was removed in
+`ee89ba3`.)
 
 ## To fully close Phase B
 
@@ -115,8 +151,9 @@ agent side made this worse and was removed in `ee89ba3`.)
    test-baseline check) now runs `e2e/local/run-jwt-register.sh`, so the **real** `openclaw gateway`
    + `index-nats` + `inbound.run` path is regression-guarded (any non-zero exit fails the gate;
    fully hermetic, no secret). The gate still ALSO drives the parallel
-   `e2e-browser-client`/`e2e-roundtrip-agent` vitest seam. Remaining: CI coverage for the hmac
-   `drive-roundtrip` + browser `browser-roundtrip` real-gateway harnesses, and the
+   `e2e-browser-client`/`e2e-roundtrip-agent` vitest seam. Remaining: CI coverage for the
+   `drive-roundtrip` (self-signed dev token, open-NATS path) + browser `browser-roundtrip`
+   real-gateway harnesses, and the
    browser/Playwright JWT variant (see #13).
 10. **Converge the demo pair into the production pair** (remove the parallel `e2e-roundtrip-agent` /
     `e2e-browser-client` implementations; point `e2e-browser-client` crypto at shared `e2e-crypto-browser`).

@@ -37,6 +37,7 @@ import { setupTrustChain } from "./setup-trust-chain.js";
 import type { SetupTrustChainResult, NatsSelfContainedAccountConfig } from "./types.js";
 import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
 import type { NatsUserCredentials } from "./device-flow-types.js";
+import { mintNatsUserCreds } from "./nats-user-creds.js";
 
 // ---------------------------------------------------------------------------
 // Locate the nats-server binary
@@ -186,6 +187,7 @@ beforeAll(async () => {
     saasBaseUrl: "https://saas.test.com",
     jwksUrl: "https://saas.test.com/.well-known/jwks.json",
     bootstrapUrl: "https://saas.test.com/bootstrap",
+    natsUrl: "wss://nats.test.com",
   });
 
   // Create nats-server config with JWT authentication. A real nats-server needs
@@ -274,7 +276,7 @@ async function generateTestCredentials(tenant: string): Promise<NatsUserCredenti
     device_code: "test-device-code",
     user_code: "TEST-1234",
     agentPublicKey: "test-public-key",
-    agentId: "test-agent",
+    accountId: "test-agent",
     tenant,
     createdAt: Date.now(),
     expiresAt: Date.now() + 600000,
@@ -579,3 +581,119 @@ describe.skipIf(!NATS_SERVER_BIN)(
     });
   },
 );
+
+// ---------------------------------------------------------------------------
+// Per-peer browser scoping + observer role (register-reply forgery defense).
+//
+// Browser creds are scoped to `webchannel.{tenant}.*.{peerId}.>` so a browser
+// can only touch its OWN peer subtree — it cannot publish a forged register
+// reply to (or subscribe) another peerId's reginbox/register. Observer creds are
+// sub-only (tenant-wide read, no publish). Agent creds stay tenant-wide.
+// ---------------------------------------------------------------------------
+
+const T = "tenant-a";
+const ACCT = "acct-x";
+const SELF = "peer-self";
+const OTHER = "peer-other";
+
+/** Connect, drive one command, and report whether the server rejected it. */
+async function probe(
+  creds: { userJwt: string; userSeed: string },
+  command: string,
+): Promise<{ denied: boolean; errors: string[] }> {
+  const { ws, ready } = await connectWithJwt(creds.userJwt, creds.userSeed, "probe");
+  await ready;
+  const errors: string[] = [];
+  ws.on("message", (data: Buffer) => {
+    const msg = data.toString();
+    if (msg.includes("-ERR")) errors.push(msg.trim());
+  });
+  ws.send(command);
+  // Round-trip a PING so the server has processed the command by the time PONG
+  // returns (and any Permissions Violation has been delivered).
+  ws.send("PING\r\n");
+  await new Promise((r) => setTimeout(r, 300));
+  ws.close();
+  return { denied: errors.some((e) => /Permissions Violation/i.test(e)), errors };
+}
+
+describe.skipIf(!NATS_SERVER_BIN)("Per-peer browser + observer scoping", () => {
+  async function browserCreds(peerId: string) {
+    return mintNatsUserCreds({
+      accountSeed: trustChain!.private.natsAccountSeed,
+      tenant: T,
+      role: "browser",
+      peerId,
+    });
+  }
+
+  it("browser P can publish to its OWN register subject", async () => {
+    const creds = await browserCreds(SELF);
+    const { denied } = await probe(creds, `PUB webchannel.${T}.${ACCT}.${SELF}.register 2\r\nhi\r\n`);
+    expect(denied).toBe(false);
+  });
+
+  it("browser P can subscribe its OWN reginbox subtree", async () => {
+    const creds = await browserCreds(SELF);
+    const { denied } = await probe(creds, `SUB webchannel.${T}.${ACCT}.${SELF}.reginbox.> 1\r\n`);
+    expect(denied).toBe(false);
+  });
+
+  it("browser P CANNOT publish a forged reply to another peer's register", async () => {
+    const creds = await browserCreds(SELF);
+    const { denied } = await probe(creds, `PUB webchannel.${T}.${ACCT}.${OTHER}.register 2\r\nhi\r\n`);
+    expect(denied).toBe(true);
+  });
+
+  it("browser P CANNOT subscribe another peer's reginbox subtree", async () => {
+    const creds = await browserCreds(SELF);
+    const { denied } = await probe(creds, `SUB webchannel.${T}.${ACCT}.${OTHER}.reginbox.> 1\r\n`);
+    expect(denied).toBe(true);
+  });
+
+  it("browser P scope spans all accounts of the tenant (multi-account grant)", async () => {
+    // One peerId is the same across every account the user is granted, so the
+    // `*` (accountId) wildcard must cover a SECOND account's own-peer subtree.
+    const creds = await browserCreds(SELF);
+    const { denied } = await probe(creds, `PUB webchannel.${T}.acct-y.${SELF}.register 2\r\nhi\r\n`);
+    expect(denied).toBe(false);
+  });
+
+  it("observer can subscribe tenant-wide", async () => {
+    const creds = await mintNatsUserCreds({
+      accountSeed: trustChain!.private.natsAccountSeed,
+      tenant: T,
+      role: "observer",
+    });
+    const { denied } = await probe(creds, `SUB webchannel.${T}.> 1\r\n`);
+    expect(denied).toBe(false);
+  });
+
+  it("observer CANNOT publish anything", async () => {
+    const creds = await mintNatsUserCreds({
+      accountSeed: trustChain!.private.natsAccountSeed,
+      tenant: T,
+      role: "observer",
+    });
+    const { denied } = await probe(creds, `PUB webchannel.${T}.${ACCT}.${SELF}.out 2\r\nhi\r\n`);
+    expect(denied).toBe(true);
+  });
+
+  it("agent creds remain tenant-wide (pub + sub)", async () => {
+    const creds = await mintNatsUserCreds({
+      accountSeed: trustChain!.private.natsAccountSeed,
+      tenant: T,
+      role: "agent",
+    });
+    const pub = await probe(creds, `PUB webchannel.${T}.${ACCT}.${OTHER}.out 2\r\nhi\r\n`);
+    expect(pub.denied).toBe(false);
+    const sub = await probe(creds, `SUB webchannel.${T}.> 1\r\n`);
+    expect(sub.denied).toBe(false);
+  });
+
+  it("mintNatsUserCreds throws for role 'browser' without a peerId", async () => {
+    await expect(
+      mintNatsUserCreds({ accountSeed: trustChain!.private.natsAccountSeed, tenant: T, role: "browser" }),
+    ).rejects.toThrow(/peerId/);
+  });
+});

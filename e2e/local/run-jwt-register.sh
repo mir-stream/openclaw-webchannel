@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Hermetic JWT-register E2E: prove the HTTP /webchannel/nats/register hop is the
-# SOLE peer-admission path. With channels.webchannel.auth.strategy="jwt" the agent
-# does NOT subscribeWildcard (see index-nats.ts wildcard gate), so a successful
-# round-trip means registerPeer happened ONLY via the live HTTP register route,
-# driven by the production client's `registration` (PoP) path.
+# Hermetic JWT-register E2E: prove the NATS register hop (request/reply on
+# `…{peerId}.register`) is the SOLE peer-admission path. With
+# channels.webchannel.auth.strategy="jwt" the agent does NOT subscribeWildcard
+# (see index-nats.ts wildcard gate), so a successful round-trip means registerPeer
+# happened ONLY via the register hop, driven by the client's `registration` (PoP) path.
 #
 # Everything runs under an isolated OPENCLAW_HOME=/tmp/oc-e2e; your real
 # ~/.openclaw is never touched. Idempotent + self-cleaning (trap on EXIT).
@@ -129,7 +129,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
         "jwt": {
           "jwksFile": "$OCH/jwks.json",
           "issuer": "https://e2e-issuer.test",
-          "audience": "default-agent"
+          "audience": "default"
         }
       },
       "dmSecurity": "allowlist",
@@ -143,7 +143,7 @@ echo "[run-jwt-register] wrote $OCH/.openclaw/openclaw.json"
 # 5. Boot the isolated gateway in dev/open-NATS + jwt mode.
 OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_DEV_OPEN=1 WEBCHANNEL_NATS_URL=ws://127.0.0.1:$NATS_WS \
-  WEBCHANNEL_TENANT=default-tenant WEBCHANNEL_AGENT_ID=default-agent \
+  WEBCHANNEL_TENANT=default-tenant \
   WEBCHANNEL_GW_URL=http://127.0.0.1:$GW_PORT \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &

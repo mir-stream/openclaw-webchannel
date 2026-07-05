@@ -6,7 +6,10 @@
  * drives this adapter:
  *
  *   1. `applyAccountConfig` (sync) shapes the account's config from the CLI flags
- *      (identity: saasBaseUrl / tenant / agentId, plus credential mode). This is
+ *      (identity: saasBaseUrl / tenant, plus credential mode). The wire identity
+ *      is the `--account` id itself (가-2); the handling agent is decoupled into a
+ *      pure `agents bind` concern (`agents bind --bind webchannel:<account>
+ *      --agent <agent>`). This is
  *      the config WRITE. Per core's canonical model, a NAMED account is written
  *      under `channels.webchannel.accounts.<accountId>`; the `"default"` account
  *      stays at the channel-level (the shared/implicit-default base) so a
@@ -24,19 +27,19 @@
  * `ChannelSetupInput` (token / secret / url / base-url / …); a NON-bundled
  * plugin cannot register custom commander flags through the host CLI (the bundled
  * metadata loader filters `origin: "bundled"`). So we read identity from BOTH:
- *   - dedicated input keys (`saasBaseUrl` / `tenant` / `agentId`) — present when
- *     the flags ARE registered (future/bundled, or a programmatic caller), AND
+ *   - dedicated input keys (`saasBaseUrl` / `tenant`) — present when the flags
+ *     ARE registered (future/bundled, or a programmatic caller), AND
  *   - the generic flags as a fallback mapping:
  *         --base-url  → saasBaseUrl
  *         --url       → tenant
- *         --token     → agentId
- * Because the generic-flag mapping is semantically surprising (and `--help` still
- * reads "Channel setup URL"/"Channel token"), `afterAccountConfigWritten` ECHOES
- * the RESOLVED tenant/agentId/saasBaseUrl (non-secret) before enrolling so a
+ * The wire identity is the `--account` id itself (가-2) — there is no `--token`
+ * → agentId mapping anymore. The handling agent is a separate `agents bind`
+ * concern. Because the generic-flag mapping is semantically surprising (and
+ * `--help` still reads "Channel setup URL"), `afterAccountConfigWritten` ECHOES
+ * the RESOLVED tenant/accountId/saasBaseUrl (non-secret) before enrolling so a
  * mis-mapping is visible. The unambiguous alternative is the acquisition env
- * (WEBCHANNEL_TENANT / WEBCHANNEL_AGENT_ID / WEBCHANNEL_SAAS_BASE_URL), honored
- * only when no webchannel config exists (see acquisition-env.ts). The mapping is
- * documented in README.md.
+ * (WEBCHANNEL_TENANT / WEBCHANNEL_SAAS_BASE_URL), honored only when no webchannel
+ * config exists (see acquisition-env.ts). The mapping is documented in README.md.
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
@@ -51,6 +54,7 @@ import {
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
+import { runAddPreflight } from "./preflight.js";
 
 /**
  * The slice of `ChannelSetupInput` this adapter reads. The host type is a closed
@@ -61,11 +65,14 @@ type WebchannelSetupInput = {
   // Dedicated identity keys (preferred when present).
   saasBaseUrl?: string;
   tenant?: string;
-  agentId?: string;
   // Generic CLI flags (fallback mapping).
   baseUrl?: string;
   url?: string;
-  token?: string;
+  // JWT auth overrides (advanced). Absent on the happy path — derived defaults
+  // (issuer = saasBaseUrl, audience = accountId) are used instead. Preserved
+  // across a re-run so a hand-tuned issuer/audience is never clobbered.
+  issuer?: string;
+  audience?: string;
   // Connection / credential-mode passthrough.
   credentialsMode?: "enrolled" | "static" | "open";
 } & Record<string, unknown>;
@@ -74,18 +81,26 @@ type WebchannelSetupInput = {
 type SetupRuntime = { log: (...args: unknown[]) => void };
 
 /** Keys whose nested object values are shallow-merged when writing a patch. */
-const NESTED_PATCH_KEYS = ["nats", "saas"] as const;
+const NESTED_PATCH_KEYS = ["nats", "saas", "auth"] as const;
+
+/**
+ * Sub-keys merged ONE MORE level deep under a nested patch key, so writing e.g.
+ * `nats.credentials.mode` does not drop a sibling `nats.credentials.saasBaseUrl`,
+ * and writing `auth.jwt.audience` does not drop a hand-tuned `auth.jwt.issuer`.
+ */
+const DEEP_PATCH_SUBKEYS: Record<string, readonly string[]> = {
+  nats: ["credentials"],
+  auth: ["jwt"],
+};
 
 /** Resolve the acquisition identity from a setup input (dedicated > generic). */
 export function resolveSetupIdentity(input: WebchannelSetupInput): {
   saasBaseUrl?: string;
   tenant?: string;
-  agentId?: string;
 } {
   return {
     saasBaseUrl: input.saasBaseUrl ?? input.baseUrl,
     tenant: input.tenant ?? input.url,
-    agentId: input.agentId ?? input.token,
   };
 }
 
@@ -98,7 +113,6 @@ export function buildAccountPatch(input: WebchannelSetupInput): Record<string, u
   const identity = resolveSetupIdentity(input);
   const patch: Record<string, unknown> = {};
   if (identity.tenant !== undefined) patch.tenant = identity.tenant;
-  if (identity.agentId !== undefined) patch.agentId = identity.agentId;
   if (identity.saasBaseUrl !== undefined) {
     // saasBaseUrl lives under `saas.baseUrl` (the same place
     // resolveAcquisitionIdentity / resolveAccountNatsConfig read it from).
@@ -110,7 +124,18 @@ export function buildAccountPatch(input: WebchannelSetupInput): Record<string, u
   return patch;
 }
 
-/** Shallow-merge a patch onto an account object, one level deep for nats/saas. */
+/** True for a plain (non-array) object we can shallow-merge into. */
+function isMergeableObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Shallow-merge a patch onto an account object, one level deep for nats/saas/auth
+ * and one further level for the known compound children (`nats.credentials`,
+ * `auth.jwt`) so a full-block write MERGES onto existing config rather than
+ * clobbering sibling fields (e.g. a re-run preserves a hand-tuned
+ * `auth.jwt.issuer` when only `auth.jwt.audience` is being written).
+ */
 function mergePatch(
   prev: Record<string, unknown>,
   patch: Record<string, unknown>,
@@ -119,18 +144,92 @@ function mergePatch(
   for (const key of NESTED_PATCH_KEYS) {
     const prevVal = prev[key];
     const patchVal = patch[key];
-    if (
-      prevVal &&
-      typeof prevVal === "object" &&
-      !Array.isArray(prevVal) &&
-      patchVal &&
-      typeof patchVal === "object" &&
-      !Array.isArray(patchVal)
-    ) {
-      next[key] = { ...(prevVal as object), ...(patchVal as object) };
+    if (isMergeableObject(prevVal) && isMergeableObject(patchVal)) {
+      const merged: Record<string, unknown> = { ...prevVal, ...patchVal };
+      for (const sub of DEEP_PATCH_SUBKEYS[key] ?? []) {
+        const prevSub = prevVal[sub];
+        const patchSub = patchVal[sub];
+        if (isMergeableObject(prevSub) && isMergeableObject(patchSub)) {
+          merged[sub] = { ...prevSub, ...patchSub };
+        }
+      }
+      next[key] = merged;
     }
   }
   return next;
+}
+
+/**
+ * Build the COMPLETE, enroll-ready account block — the proven demo config
+ * (`e2e/local/run-demo-synadia.sh`): tenant + saas.baseUrl + jwt auth strategy +
+ * `dmSecurity: "open"` + enrolled NATS credentials under `admission:
+ * "register-hop"`.
+ *
+ * TRUST-ANCHOR (design §4 change 2): the builder NO LONGER writes the JWT-verify
+ * params (`issuer` / `jwksUrl` / `audience`). Those are trust FACTS derived at
+ * RUNTIME from the anchor `{saas.baseUrl, accountId}` — `deriveAccountAuth` in
+ * `index-nats.ts` fills them in when absent (issuer = saas.baseUrl, audience =
+ * accountId, jwksUrl = saas.baseUrl + /.well-known/jwks.json). Writing guesses
+ * here was the source of the silent issuer-mismatch trap, so we stop guessing.
+ *
+ * `issuer` / `audience` are now OPTIONAL OPERATOR PINS, not defaults: they are
+ * written ONLY when the caller explicitly supplies them (the escape hatch for a
+ * proxy / custom-domain / logical-issuer deployment, threaded through
+ * `applyAccountConfig` and preserved across re-runs). When neither is supplied
+ * the `auth.jwt` sub-object is OMITTED ENTIRELY so nothing is guessed — only
+ * `auth.strategy: "jwt"` is written (runtime derivation supplies the rest).
+ *
+ * `admission` is pinned to `register-hop` because this builder ALWAYS emits a
+ * SaaS-enrolled jwt account (`auth.strategy: "jwt"`, `credentials.mode: "enrolled"`)
+ * — exactly the case `resolveAdmissionMode` would infer register-hop for (jwt +
+ * a viable register hop). Pinning it makes the register-over-NATS chat path work
+ * out of the box; the legacy `auto` (X25519-handshake, no `.register` subject)
+ * would silently break the browser's register request. Static/BYO-NATS accounts
+ * do NOT reach this builder (they take the partial `buildAccountPatch` path), so
+ * their `auto` default is unaffected.
+ *
+ * `nats.url` is intentionally OMITTED — the SaaS delivers the relay URL together
+ * with the enrolled credentials at device-flow time (it is the rendezvous
+ * authority), so pinning it in config would be redundant and drift-prone.
+ *
+ * Pure: no config read/write, no I/O. The two write seams (the non-interactive
+ * `applyAccountConfig` and the interactive wizard `finalize`) both funnel their
+ * full-block writes through this one builder.
+ */
+export function buildFullAccountPatch(params: {
+  tenant: string;
+  saasBaseUrl: string;
+  accountId: string;
+  /**
+   * OPERATOR PIN (optional). When present, written as `auth.jwt.issuer` to force
+   * a specific issuer; when absent, issuer DERIVES at runtime from saas.baseUrl.
+   */
+  issuer?: string;
+  /**
+   * OPERATOR PIN (optional). When present, written as `auth.jwt.audience`; when
+   * absent, audience DERIVES at runtime from the accountId.
+   */
+  audience?: string;
+}): Record<string, unknown> {
+  // `accountId` remains a required param (callers pass it, and it documents that
+  // audience derives from it at runtime) but is no longer read here — the runtime
+  // deriver owns `audience = accountId`.
+  const { tenant, saasBaseUrl, issuer, audience } = params;
+  // Emit auth.jwt ONLY for the explicit operator pins (issuer/audience). jwksUrl
+  // is never written here — it derives at runtime. If neither pin is supplied,
+  // omit auth.jwt entirely so nothing is guessed (strategy alone is written).
+  const jwtPins: Record<string, unknown> = {};
+  if (issuer !== undefined) jwtPins.issuer = issuer;
+  if (audience !== undefined) jwtPins.audience = audience;
+  const auth: Record<string, unknown> = { strategy: "jwt" };
+  if (Object.keys(jwtPins).length > 0) auth.jwt = jwtPins;
+  return {
+    tenant,
+    saas: { baseUrl: saasBaseUrl },
+    auth,
+    dmSecurity: "open",
+    nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
+  };
 }
 
 /**
@@ -185,7 +284,22 @@ export const webchannelSetup = {
   resolveAccountId: ({ accountId }: { accountId?: string }): string =>
     canonicalizeAccountId(accountId),
 
-  /** Sync config WRITE: shape the account from flags. */
+  /**
+   * Sync config WRITE: shape the account from flags.
+   *
+   * This is the NON-INTERACTIVE (`--flag`) write seam. The interactive wizard
+   * writes atomically in its `finalize` (its text inputs use no-op `applySet`s
+   * and never reach here), so the two cases are distinguished purely by whether a
+   * `saasBaseUrl` is present in the input:
+   *   - `saasBaseUrl` PRESENT (`channels add --base-url <saas> …`) ⇒ write the
+   *     COMPLETE enroll-ready block (`buildFullAccountPatch`), MERGED onto any
+   *     existing account so a re-run preserves a hand-tuned `auth.jwt.issuer/
+   *     audience` (only fields we actually supply win).
+   *   - `saasBaseUrl` ABSENT (a genuine partial `--flag` run — e.g. setting only
+   *     `--url <tenant>` or the credential mode) ⇒ fall back to the partial
+   *     `buildAccountPatch` write. This guard is REQUIRED so a partial run never
+   *     emits a broken full block before a `saasBaseUrl` has been supplied.
+   */
   applyAccountConfig: ({
     cfg,
     accountId,
@@ -198,6 +312,24 @@ export const webchannelSetup = {
     // Defensive: even though core/our resolveAccountId canonicalizes, re-derive
     // here so a direct/programmatic caller can never inject a raw id.
     const id = canonicalizeAccountId(accountId);
+    const identity = resolveSetupIdentity(input);
+
+    if (identity.saasBaseUrl !== undefined) {
+      // Full-block seam. Read the existing account so a re-run preserves the
+      // operator's manual issuer/audience unless the flags explicitly override.
+      const existing = resolveWebchannelAccountConfig(cfg, id);
+      const existingJwt = (existing.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
+        ?.jwt;
+      const patch = buildFullAccountPatch({
+        tenant: identity.tenant ?? (existing.tenant as string | undefined) ?? "default-tenant",
+        saasBaseUrl: identity.saasBaseUrl,
+        accountId: id,
+        issuer: input.issuer ?? existingJwt?.issuer,
+        audience: input.audience ?? existingJwt?.audience,
+      });
+      return writeAccountConfig(cfg, id, patch);
+    }
+
     const patch = buildAccountPatch(input);
     // Always write (even an empty patch) so the account exists for `gateway run`
     // to list. For default with an empty patch on an empty config this is a no-op
@@ -260,7 +392,6 @@ export const webchannelSetup = {
     const identity = resolveSetupIdentity(input);
     const tenant =
       identity.tenant ?? (account.tenant as string | undefined) ?? "default-tenant";
-    const agentId = identity.agentId ?? (account.agentId as string | undefined);
     const saasBaseUrl =
       identity.saasBaseUrl ??
       (account.saas as { baseUrl?: string } | undefined)?.baseUrl ??
@@ -271,25 +402,54 @@ export const webchannelSetup = {
       runtime.log(
         `[webchannel] account "${id}": no saas-base-url provided; cannot run ` +
           `device-flow acquisition. Re-run: openclaw channels add --channel ` +
-          `webchannel --account ${id} --base-url <saas-url> --url <tenant> ` +
-          `--token <agent-id>`,
+          `webchannel --account ${id} --base-url <saas-url> --url <tenant>`,
       );
       return;
     }
 
     // Echo the RESOLVED identity (non-secret) so the generic-flag mapping is
-    // never silent — a mis-mapped --url/--token/--base-url is visible here.
+    // never silent — a mis-mapped --url/--base-url is visible here. The wire
+    // identity is the account id itself (가-2).
     runtime.log(
       `[webchannel] account "${id}" resolved acquisition identity: ` +
-        `tenant=${tenant}, agentId=${agentId ?? "(none)"}, saasBaseUrl=${saasBaseUrl}`,
+        `accountId=${id}, tenant=${tenant}, saasBaseUrl=${saasBaseUrl}`,
     );
 
     try {
-      await acquireCredentials({
+      const enrollment = await acquireCredentials({
         accountId: id,
         saasBaseUrl,
         tenant,
-        agentId,
+        log: (...args) => runtime.log(...args),
+      });
+
+      // Gate A (design §4 change 4): the achievable add-time preflight, run
+      // POST-enroll (creds are now persisted) and BEFORE declaring the add
+      // done, so any residual trust misconfig is self-explaining while the
+      // operator is watching. It checks issuer/aud internal consistency, the
+      // derived JWKS (reachable + non-empty + matching the SaaS's advertised
+      // url — the issuer-mismatch trap), and a real relay dial with the enrolled
+      // creds. A true end-to-end register round-trip is INFEASIBLE at add-time
+      // (no running gateway ⇒ no `*.register` subscriber, and no browser
+      // bootstrap JWT yet) — see `preflight.ts` runAddPreflight for the honest
+      // scope. Never throws (matches this hook's non-fatal contract); a FAIL is a
+      // loud, actionable log line.
+      const existingJwt = (account.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
+        ?.jwt;
+      await runAddPreflight({
+        accountId: id,
+        tenant,
+        saasBaseUrl,
+        enrollment: {
+          userJwt: enrollment.creds.userJwt,
+          userSeed: enrollment.creds.userSeed,
+          ...(enrollment.natsUrl !== undefined ? { natsUrl: enrollment.natsUrl } : {}),
+          ...(enrollment.jwksUrl !== undefined ? { jwksUrl: enrollment.jwksUrl } : {}),
+          ...(enrollment.issuer !== undefined ? { issuer: enrollment.issuer } : {}),
+        },
+        // Config-present-wins: an operator PIN overrides the derivation.
+        ...(existingJwt?.issuer !== undefined ? { pinnedIssuer: existingJwt.issuer } : {}),
+        ...(existingJwt?.audience !== undefined ? { pinnedAudience: existingJwt.audience } : {}),
         log: (...args) => runtime.log(...args),
       });
     } catch (err) {

@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebChannel — Unified Demo (SaaS + Web)</title>
+  <!-- The SaaS server injects globalThis.__DEMO_CONFIG__ here, BEFORE the bundle. -->
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --border: #262b36;
+      --text: #e6e8ec;
+      --muted: #9aa3b2;
+      --accent: #4f8cff;
+      --agent: #232834;
+      --ok: #3fb950;
+      --err: #f85149;
+      --warn: #d29922;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    .shell {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 16px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .top {
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .top h1 { font-size: 18px; margin: 0 0 4px; font-weight: 600; }
+    .top .sub { color: var(--muted); font-size: 12px; }
+    .cols {
+      flex: 1;
+      display: flex;
+      gap: 16px;
+      min-height: 0;
+      padding-top: 12px;
+    }
+    .col {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .col > .head {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .col > .head .role {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+    .col > .head .title { font-size: 15px; font-weight: 600; margin-top: 2px; }
+    .col > .body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    /* ---- Admin (enrollment) panel ---- */
+    .enroll-empty { color: var(--muted); font-size: 13px; }
+    .enroll {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 13px;
+      background: #12151b;
+    }
+    .enroll .code {
+      font: 22px/1 "SF Mono", ui-monospace, "Courier New", monospace;
+      letter-spacing: 4px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .enroll .meta { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    .enroll .meta code { color: var(--text); }
+    .enroll .actions { display: flex; gap: 8px; margin-top: 12px; }
+    .enroll button {
+      border: 0; border-radius: 8px; padding: 8px 16px;
+      font: inherit; font-weight: 600; cursor: pointer;
+    }
+    .enroll .approve { background: var(--ok); color: #06210f; }
+    .enroll .deny { background: transparent; color: var(--err); border: 1px solid var(--err); }
+    .enroll button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .badge {
+      display: inline-block; font-size: 11px; font-weight: 700;
+      padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.05em;
+    }
+    .badge.pending  { background: #3a2f0a; color: var(--warn); }
+    .badge.approved { background: #0f2a18; color: var(--ok); }
+    .badge.denied   { background: #2c1416; color: var(--err); }
+
+    /* ---- User↔account (aud) authz sub-panel ---- */
+    .users {
+      border-top: 1px solid var(--border);
+      padding: 12px 14px;
+      max-height: 40%;
+      overflow-y: auto;
+      flex: none;
+    }
+    .users h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0 0 4px; }
+    .users .cap { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+    .user-row {
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: 10px 12px; background: #12151b; margin-bottom: 8px;
+    }
+    .user-row .name { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .chip {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: #1c2230; border: 1px solid var(--border); color: var(--text);
+      border-radius: 999px; padding: 3px 6px 3px 10px; font-size: 12px;
+    }
+    .chip.empty { color: var(--muted); border-style: dashed; }
+    .chip button {
+      border: 0; background: transparent; color: var(--err);
+      cursor: pointer; font: inherit; font-weight: 700; line-height: 1; padding: 0 2px;
+    }
+    .grant { display: flex; gap: 6px; }
+    .grant input {
+      flex: 1; min-width: 0; background: #0f1115; border: 1px solid var(--border);
+      color: var(--text); border-radius: 8px; padding: 6px 9px; font: inherit; font-size: 12px; outline: none;
+    }
+    .grant input:focus { border-color: var(--accent); }
+    .grant button {
+      border: 0; border-radius: 8px; padding: 6px 12px; font: inherit; font-size: 12px;
+      font-weight: 600; cursor: pointer; background: var(--accent); color: #fff;
+    }
+
+    /* ---- Visitor (chat) panel ---- */
+    .status {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 13px; color: var(--muted);
+    }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); flex: none; }
+    .dot.ok { background: var(--ok); }
+    .dot.err { background: var(--err); }
+    #log { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+    .msg {
+      max-width: 82%; padding: 9px 13px; border-radius: 14px;
+      white-space: pre-wrap; word-wrap: break-word;
+    }
+    .msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+    .msg.agent { align-self: flex-start; background: var(--agent); border-bottom-left-radius: 4px; }
+    .msg.err {
+      align-self: center; background: transparent; color: var(--err);
+      font-size: 13px; border: 1px solid var(--err); max-width: 92%;
+    }
+    .msg.note { align-self: center; background: transparent; color: var(--muted); font-size: 12px; text-align: center; }
+    form {
+      display: flex; gap: 8px; padding: 12px 14px;
+      border-top: 1px solid var(--border);
+    }
+    #input {
+      flex: 1; background: #12151b; border: 1px solid var(--border); color: var(--text);
+      border-radius: 10px; padding: 11px 13px; font: inherit; outline: none;
+    }
+    #input:focus { border-color: var(--accent); }
+    #send {
+      background: var(--accent); color: #fff; border: 0; border-radius: 10px;
+      padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer;
+    }
+    #input:disabled, #send:disabled { opacity: 0.5; cursor: not-allowed; }
+    /* ---- Login gate ---- */
+    #loginForm {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+      padding: 12px 14px; border-bottom: 1px solid var(--border);
+    }
+    #loginForm input {
+      flex: 1; min-width: 120px; background: #12151b; border: 1px solid var(--border);
+      color: var(--text); border-radius: 10px; padding: 9px 12px; font: inherit; outline: none;
+    }
+    #loginForm input:focus { border-color: var(--accent); }
+    #loginBtn {
+      background: var(--accent); color: #fff; border: 0; border-radius: 10px;
+      padding: 9px 16px; font: inherit; font-weight: 600; cursor: pointer;
+    }
+    #loginStatus { color: var(--err); font-size: 12px; flex-basis: 100%; }
+    .chat-body { padding: 0; }
+    .chat-wrap { display: flex; flex-direction: column; height: 100%; }
+    .chat-scroll { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="top">
+      <h1>WebChannel — Unified Demo</h1>
+      <div class="sub">
+        One SaaS origin serves both surfaces. <strong>Left</strong>: the operator approves the
+        agent's enrollment (SaaS admin). <strong>Right</strong>: an end user chats with that agent
+        (embedded web widget). Approving on the left unlocks chat on the right — E2E encrypted over NATS.
+      </div>
+    </div>
+
+    <div class="cols">
+      <!-- ================= ADMIN / ENROLLMENT ================= -->
+      <section class="col">
+        <div class="head">
+          <div class="role">Operator · SaaS admin</div>
+          <div class="title">Connect your agent</div>
+        </div>
+        <div class="body" id="enrollList">
+          <div class="enroll-empty" id="enrollEmpty">Waiting for an agent to request enrollment…</div>
+        </div>
+        <div class="users" id="usersPanel">
+          <h3>User access (aud)</h3>
+          <p class="cap">Grant/revoke which accounts (aud) a user may reach — takes effect on their next login (bootstrap).</p>
+          <div id="usersList"></div>
+        </div>
+      </section>
+
+      <!-- ================= VISITOR / CHAT ================= -->
+      <section class="col">
+        <div class="head">
+          <div class="role">End user · embedded widget</div>
+          <div class="title">Chat with the agent</div>
+        </div>
+        <div class="body chat-body">
+          <div class="chat-wrap">
+            <!-- Login gate: the SaaS derives a stable peerId from this user. -->
+            <form id="loginForm">
+              <input id="username" type="text" placeholder="username (alice / bob)" autocomplete="off" />
+              <input id="password" type="password" placeholder="password: demo" autocomplete="off" />
+              <button id="loginBtn" type="submit">Log in</button>
+              <span id="loginStatus"></span>
+            </form>
+            <div class="chat-scroll" id="log">
+              <div class="status" style="margin-bottom:6px;">
+                <span class="dot" id="dot"></span>
+                <span id="statusText">log in to start chatting…</span>
+              </div>
+            </div>
+            <form id="form">
+              <input id="input" type="text" placeholder="Log in to chat…" autocomplete="off" disabled />
+              <button id="send" type="submit" disabled>Send</button>
+            </form>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- The bundle (IIFE) defines globalThis.WebDemo.runDemo. -->
+  <script src="/widget.js"></script>
+  <script>
+    (function () {
+      var config = (typeof globalThis !== "undefined" && globalThis.__DEMO_CONFIG__) || {};
+
+      // -------------------------------------------------------------------
+      // ADMIN PANEL — poll /demo/enrollments, render, approve/deny.
+      // -------------------------------------------------------------------
+      var enrollListEl = document.getElementById("enrollList");
+      var enrollEmptyEl = document.getElementById("enrollEmpty");
+      var anyApproved = false;
+      var busyCodes = {}; // user_code -> true while an approve/deny is in flight
+
+      function badge(status) {
+        return '<span class="badge ' + status + '">' + status + "</span>";
+      }
+
+      function renderEnrollments(items) {
+        if (!items || !items.length) {
+          enrollListEl.innerHTML = "";
+          enrollListEl.appendChild(enrollEmptyEl);
+          enrollEmptyEl.style.display = "";
+          return;
+        }
+        enrollEmptyEl.style.display = "none";
+        enrollListEl.innerHTML = "";
+        items.forEach(function (e) {
+          var card = document.createElement("div");
+          card.className = "enroll";
+          var pending = e.status === "pending";
+          var disabled = busyCodes[e.userCode] ? "disabled" : "";
+          card.innerHTML =
+            '<div class="code">' + e.userCode + "</div>" +
+            '<div class="meta">tenant <code>' + (e.tenant || "—") + "</code> · " +
+            "account <code>" + (e.accountId || "—") + "</code> · " + badge(e.status) + "</div>" +
+            (pending
+              ? '<div class="actions">' +
+                '<button class="approve" data-code="' + e.userCode + '" data-act="approve" ' + disabled + ">✓ Approve</button>" +
+                '<button class="deny" data-code="' + e.userCode + '" data-act="deny" ' + disabled + ">✗ Deny</button>" +
+                "</div>"
+              : e.status === "approved"
+              ? '<div class="meta" style="color:var(--ok)">Agent admitted — the widget on the right is now live.</div>'
+              : "");
+          enrollListEl.appendChild(card);
+        });
+        enrollListEl.querySelectorAll("button[data-code]").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            act(btn.getAttribute("data-code"), btn.getAttribute("data-act"));
+          });
+        });
+      }
+
+      function act(userCode, action) {
+        busyCodes[userCode] = true;
+        fetch("/" + action, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_code: userCode }),
+        })
+          .then(function (r) { return r.json(); })
+          .catch(function () { /* surfaced on next poll */ })
+          .finally(function () { delete busyCodes[userCode]; poll(); });
+      }
+
+      function poll() {
+        fetch("/demo/enrollments")
+          .then(function (r) { return r.json(); })
+          .then(function (items) {
+            renderEnrollments(items);
+            if (!anyApproved && items.some(function (e) { return e.status === "approved"; })) {
+              anyApproved = true;
+              onAgentApproved();
+            }
+          })
+          .catch(function () { /* keep polling */ });
+      }
+      setInterval(poll, 1500);
+      poll();
+
+      // -------------------------------------------------------------------
+      // USER↔ACCOUNT (aud) ADMIN — GET /demo/users, edit allowedAccounts.
+      // Demonstrates the SaaS authorization boundary: which accounts a login
+      // may reach. Edits POST the FULL new array; changes apply at next login.
+      // -------------------------------------------------------------------
+      var usersListEl = document.getElementById("usersList");
+
+      function esc(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+          return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+      }
+
+      function postAccounts(username, accounts) {
+        return fetch("/demo/users/" + encodeURIComponent(username) + "/accounts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ accounts: accounts }),
+        }).then(function () { loadUsers(); });
+      }
+
+      function renderUsers(users) {
+        usersListEl.innerHTML = "";
+        (users || []).forEach(function (u) {
+          var accounts = u.allowedAccounts || [];
+          var row = document.createElement("div");
+          row.className = "user-row";
+          var chips = accounts.length
+            ? accounts.map(function (a) {
+                return '<span class="chip">' + esc(a) +
+                  '<button data-user="' + esc(u.username) + '" data-acct="' + esc(a) + '" title="revoke">×</button></span>';
+              }).join("")
+            : '<span class="chip empty">no accounts</span>';
+          row.innerHTML =
+            '<div class="name">' + esc(u.username) + "</div>" +
+            '<div class="chips">' + chips + "</div>" +
+            '<form class="grant" data-user="' + esc(u.username) + '">' +
+            '<input type="text" placeholder="account id (aud)…" autocomplete="off" />' +
+            "<button type=\"submit\">Grant</button></form>";
+          usersListEl.appendChild(row);
+
+          // Wire revoke chips.
+          row.querySelectorAll(".chip button").forEach(function (btn) {
+            btn.addEventListener("click", function () {
+              var next = accounts.filter(function (a) { return a !== btn.getAttribute("data-acct"); });
+              postAccounts(btn.getAttribute("data-user"), next);
+            });
+          });
+          // Wire grant form.
+          var grantForm = row.querySelector("form.grant");
+          grantForm.addEventListener("submit", function (e) {
+            e.preventDefault();
+            var val = grantForm.querySelector("input").value.trim();
+            if (!val || accounts.indexOf(val) !== -1) return;
+            postAccounts(grantForm.getAttribute("data-user"), accounts.concat([val]));
+          });
+        });
+      }
+
+      function loadUsers() {
+        fetch("/demo/users")
+          .then(function (r) { return r.json(); })
+          .then(renderUsers)
+          .catch(function () { /* demo route unavailable — leave panel empty */ });
+      }
+      loadUsers();
+
+      // -------------------------------------------------------------------
+      // VISITOR PANEL — chat, unlocked once an agent is approved.
+      // -------------------------------------------------------------------
+      var logEl = document.getElementById("log");
+      var inputEl = document.getElementById("input");
+      var sendBtn = document.getElementById("send");
+      var formEl = document.getElementById("form");
+      var dotEl = document.getElementById("dot");
+      var statusEl = document.getElementById("statusText");
+
+      var controller = null;
+      var ready = false;
+      var chatStarted = false;
+      // Chat starts once the user has logged in.
+      var loggedIn = false;
+
+      function scrollDown() { logEl.scrollTop = logEl.scrollHeight; }
+      function append(kind, text) {
+        var d = document.createElement("div");
+        d.className = "msg " + kind;
+        d.textContent = text;
+        logEl.appendChild(d);
+        scrollDown();
+      }
+      function setStatus(text, state) {
+        statusEl.textContent = text;
+        dotEl.className = "dot" + (state ? " " + state : "");
+      }
+      function setReady(isReady) {
+        ready = isReady;
+        inputEl.disabled = !isReady;
+        sendBtn.disabled = !isReady;
+        inputEl.placeholder = isReady ? "Type a message…" : "Connecting…";
+        if (isReady) inputEl.focus();
+      }
+
+      var callbacks = {
+        onReply: function (text) { append("agent", text); },
+        onError: function (err) {
+          setStatus("error", "err");
+          append("err", (err && err.message) ? err.message : String(err));
+          setReady(false);
+        },
+        onStatus: function (status) {
+          if (status === "connected" || status === "ready") {
+            setStatus("connected", "ok");
+            if (!ready) {
+              setReady(true);
+              append("note", "Connected to the relay — your messages send as soon as your agent comes online.");
+            }
+          } else if (status === "connecting") {
+            setStatus("connecting…", "");
+          } else {
+            setStatus(status + "…", "");
+          }
+        },
+      };
+
+      function startChatClient() {
+        if (!globalThis.WebDemo || typeof globalThis.WebDemo.runDemo !== "function") {
+          setStatus("bundle failed to load", "err");
+          append("err", "Demo bundle (/widget.js) did not load or is missing runDemo.");
+          return;
+        }
+        setStatus("connecting…", "");
+        globalThis.WebDemo.runDemo(config, callbacks)
+          .then(function (ctrl) { controller = ctrl; })
+          .catch(function (err) {
+            setStatus("failed to start", "err");
+            append("err", "Setup failed: " + ((err && err.message) || String(err)));
+          });
+      }
+
+      // Chat starts on LOGIN (so the SaaS has a session to derive the peerId + mint
+      // creds). The client then reports live connection status and buffers outbound
+      // until the E2E handshake completes — so we don't gate on the agent here.
+      function maybeStartChat() {
+        if (chatStarted || !loggedIn) return;
+        chatStarted = true;
+        startChatClient();
+      }
+
+      function onAgentApproved() {
+        append("note", "Agent approved.");
+      }
+
+      formEl.addEventListener("submit", function (e) {
+        e.preventDefault();
+        var text = inputEl.value.trim();
+        if (!text || !ready || !controller) return;
+        append("user", text);
+        try {
+          controller.send(text);
+        } catch (err) {
+          append("err", "send failed: " + ((err && err.message) || String(err)));
+        }
+        inputEl.value = "";
+        inputEl.focus();
+      });
+
+      // -------------------------------------------------------------------
+      // LOGIN — POST /login (same-origin, so the sid cookie is set). On success
+      // the SaaS binds a stable peerId to this user; chat may then start.
+      // -------------------------------------------------------------------
+      var loginFormEl = document.getElementById("loginForm");
+      var usernameEl = document.getElementById("username");
+      var passwordEl = document.getElementById("password");
+      var loginStatusEl = document.getElementById("loginStatus");
+
+      loginFormEl.addEventListener("submit", function (e) {
+        e.preventDefault();
+        var username = usernameEl.value.trim();
+        var password = passwordEl.value;
+        loginStatusEl.textContent = "";
+        fetch("/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: username, password: password }),
+        })
+          .then(function (r) {
+            return r.json().then(function (data) { return { ok: r.ok, data: data }; });
+          })
+          .then(function (res) {
+            if (!res.ok) {
+              loginStatusEl.textContent = (res.data && res.data.error) || "login failed";
+              return;
+            }
+            loggedIn = true;
+            loginFormEl.style.display = "none";
+            append("note", "Logged in as " + res.data.username + " — peerId is now bound to this user");
+            maybeStartChat();
+          })
+          .catch(function (err) {
+            loginStatusEl.textContent = "login error: " + ((err && err.message) || String(err));
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

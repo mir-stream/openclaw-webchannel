@@ -93,7 +93,7 @@ plugin receives NATS credentials it persists locally for re-connection.
 ```
 plugin                              SaaS                         operator
   │ POST /enroll (agentPublicKey,    │                              │
-  │   tenant, agentId?)              │                              │
+  │   tenant, accountId?)            │                              │
   │ ───────────────────────────────►│  create PendingEnrollment    │
   │ ◄─────────────────────────────── │  status=pending              │
   │   device_code, user_code,        │                              │
@@ -124,7 +124,7 @@ restart the plugin reloads stored creds and reconnects with no re-pairing.
 Exported from `device-flow-types.ts` for type-safety across the SaaS ↔ plugin
 boundary:
 
-- `EnrollmentRequest` — `{ agentPublicKey, tenant, agentId? }`
+- `EnrollmentRequest` — `{ agentPublicKey, tenant, accountId? }`
 - `EnrollmentResponse` — `device_code`, `user_code`, `verification_uri`,
   `verification_uri_complete`, `expires_in`, `interval`
 - `PollRequest` — `{ device_code }`

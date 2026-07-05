@@ -24,6 +24,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     // Create a mock enrollment
@@ -31,7 +32,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       device_code: "test-device-code",
       user_code: "TEST-1234",
       agentPublicKey: "test-public-key",
-      agentId: "test-agent",
+      accountId: "test-agent",
       tenant: "tenant-abc",
       createdAt: Date.now(),
       expiresAt: Date.now() + 600000,
@@ -66,13 +67,14 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     const mockEnrollment = {
       device_code: "test-device-code",
       user_code: "TEST-1234",
       agentPublicKey: "test-public-key",
-      agentId: "agent-123",
+      accountId: "agent-123",
       tenant: "tenant-xyz",
       createdAt: Date.now(),
       expiresAt: Date.now() + 600000,
@@ -115,13 +117,14 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     const mockEnrollment1 = {
       device_code: "test-device-code-1",
       user_code: "TEST-1111",
       agentPublicKey: "test-public-key-1",
-      agentId: "agent-1",
+      accountId: "agent-1",
       tenant: "tenant-a",
       createdAt: Date.now(),
       expiresAt: Date.now() + 600000,
@@ -132,7 +135,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       device_code: "test-device-code-2",
       user_code: "TEST-2222",
       agentPublicKey: "test-public-key-2",
-      agentId: "agent-2",
+      accountId: "agent-2",
       tenant: "tenant-a",
       createdAt: Date.now(),
       expiresAt: Date.now() + 600000,
@@ -162,13 +165,14 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     const tenantAMock = {
       device_code: "test-device-code-a",
       user_code: "TEST-AAAA",
       agentPublicKey: "test-public-key-a",
-      agentId: "agent-a",
+      accountId: "agent-a",
       tenant: "tenant-alpha",
       createdAt: Date.now(),
       expiresAt: Date.now() + 600000,
@@ -179,7 +183,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       device_code: "test-device-code-b",
       user_code: "TEST-BBBB",
       agentPublicKey: "test-public-key-b",
-      agentId: "agent-b",
+      accountId: "agent-b",
       tenant: "tenant-beta",
       createdAt: Date.now(),
       expiresAt: Date.now() + 600000,
@@ -232,6 +236,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
       saasBaseUrl: "https://saas.test.com",
       jwksUrl: "https://saas.test.com/.well-known/jwks.json",
       bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
     });
 
     const mockEnrollment = {

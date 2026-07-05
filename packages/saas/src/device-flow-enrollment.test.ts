@@ -42,6 +42,7 @@ const createEnrollment = () => {
     saasBaseUrl: "https://saas.com",
     jwksUrl: "https://saas.com/.well-known/jwks.json",
     bootstrapUrl: "https://saas.com/bootstrap",
+    natsUrl: "wss://nats.saas.com",
     expirationSeconds: 600,
     pollIntervalSeconds: 5,
   });
@@ -50,7 +51,7 @@ const createEnrollment = () => {
 const validEnrollmentRequest: EnrollmentRequest = {
   agentPublicKey: "mock_public_key_base64url",
   tenant: "test-tenant",
-  agentId: "test-agent",
+  accountId: "test-agent",
 };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +117,7 @@ describe("DeviceFlowEnrollment", () => {
         saasBaseUrl: "https://saas.com",
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
         expirationSeconds: 300, // 5 minutes
         pollIntervalSeconds: 10,
       });
@@ -165,7 +167,53 @@ describe("DeviceFlowEnrollment", () => {
         peerId: expect.any(String),
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
+        // Delivered issuer: unset in options → derived from saasBaseUrl.
+        issuer: "https://saas.com",
       });
+    });
+
+    it("delivers an explicit issuer VERBATIM (proxy / logical-issuer deployments)", async () => {
+      const customIssuerEnrollment = new DeviceFlowEnrollment({
+        saasTrustChain: mockTrustChain,
+        natsAccountConfig: mockNatsConfig,
+        saasBaseUrl: "https://saas.com",
+        jwksUrl: "https://saas.com/.well-known/jwks.json",
+        bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
+        issuer: "https://id.example.com/logical-issuer/",
+      });
+
+      const enrollResponse = await customIssuerEnrollment.enroll(validEnrollmentRequest);
+      await customIssuerEnrollment.approve(enrollResponse.user_code);
+      const pollResult = await customIssuerEnrollment.poll({
+        device_code: enrollResponse.device_code,
+      });
+
+      // VERBATIM — including the trailing slash. The SaaS declares the exact
+      // string it mints; nobody canonicalizes it in transit.
+      expect(pollResult).toMatchObject({
+        issuer: "https://id.example.com/logical-issuer/",
+      });
+    });
+
+    it("derives the default issuer with trailing slashes stripped (matches the plugin's deriveIssuer)", async () => {
+      const slashEnrollment = new DeviceFlowEnrollment({
+        saasTrustChain: mockTrustChain,
+        natsAccountConfig: mockNatsConfig,
+        saasBaseUrl: "https://saas.com///",
+        jwksUrl: "https://saas.com/.well-known/jwks.json",
+        bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
+      });
+
+      const enrollResponse = await slashEnrollment.enroll(validEnrollmentRequest);
+      await slashEnrollment.approve(enrollResponse.user_code);
+      const pollResult = await slashEnrollment.poll({
+        device_code: enrollResponse.device_code,
+      });
+
+      expect(pollResult).toMatchObject({ issuer: "https://saas.com" });
     });
 
     it("should return invalid_device_code for non-existent enrollment", async () => {
@@ -189,6 +237,7 @@ describe("DeviceFlowEnrollment", () => {
         saasBaseUrl: "https://saas.com",
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
         expirationSeconds: 0, // Expire immediately
         pollIntervalSeconds: 5,
       });
@@ -244,6 +293,7 @@ describe("DeviceFlowEnrollment", () => {
         peerId: expect.any(String),
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
       });
     });
 
@@ -272,6 +322,7 @@ describe("DeviceFlowEnrollment", () => {
         saasBaseUrl: "https://saas.com",
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
         expirationSeconds: 0,
         pollIntervalSeconds: 5,
       });
@@ -283,6 +334,60 @@ describe("DeviceFlowEnrollment", () => {
 
       const result = await shortLivedEnrollment.approve(enrollResponse.user_code);
       expect(result).toBeNull();
+    });
+
+    // A2: approve must be idempotent — a repeat click/retry/replay must NOT
+    // re-mint a new identity that would break the plugin's already-live session.
+    it("is idempotent: a second approve returns the SAME creds/peerId", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+
+      const first = await enrollment.approve(enrollResponse.user_code);
+      const second = await enrollment.approve(enrollResponse.user_code);
+
+      expect(first).not.toBeNull();
+      expect(second).not.toBeNull();
+      expect(second!.peerId).toBe(first!.peerId);
+      expect(second!.creds).toEqual(first!.creds);
+
+      // And the persisted record was not overwritten with a fresh identity.
+      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.peerId).toBe(first!.peerId);
+      expect(persisted?.natsCreds).toEqual(first!.creds);
+    });
+
+    // A2: two CONCURRENT approvals of the same enrollment (double-click race)
+    // must coalesce onto one identity, not mint two and last-writer-win.
+    it("coalesces concurrent approvals onto a single identity", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+
+      const [a, b] = await Promise.all([
+        enrollment.approve(enrollResponse.user_code),
+        enrollment.approve(enrollResponse.user_code),
+      ]);
+
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      expect(a!.peerId).toBe(b!.peerId);
+      expect(a!.creds).toEqual(b!.creds);
+
+      // The persisted identity matches what both callers received.
+      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.peerId).toBe(a!.peerId);
+    });
+
+    // A2: the plugin's next poll after approval must see the SAME identity the
+    // approver returned (this is the invariant a re-mint would violate).
+    it("poll after a repeat approve returns the first-minted identity", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+
+      const approved = await enrollment.approve(enrollResponse.user_code);
+      await enrollment.approve(enrollResponse.user_code); // repeat
+      const polled = await enrollment.poll({ device_code: enrollResponse.device_code });
+
+      expect("peerId" in polled! && polled.peerId).toBe(approved!.peerId);
+      expect("creds" in polled! && polled.creds).toEqual(approved!.creds);
     });
   });
 
@@ -376,6 +481,71 @@ describe("DeviceFlowEnrollment", () => {
 
       const deleted = await store.getEnrollment(pending.device_code);
       expect(deleted).toBeNull();
+    });
+
+    // ── A1: TTL sweeper bounds memory (review 2026-07-02) ──────────────────
+    // makePending() has expiresAt = 601_000; default retention = 300_000, so a
+    // record is eligible for eviction once now > 901_000.
+
+    it("sweep() evicts records past expiresAt + retention from BOTH maps", async () => {
+      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      const pending = makePending();
+      await store.saveEnrollment(pending);
+
+      // Just past expiry but INSIDE the grace window — retained so a late poll
+      // still sees `expired_token`.
+      expect(store.sweep(601_001)).toBe(0);
+      expect(await store.getEnrollment(pending.device_code)).not.toBeNull();
+
+      // Past the retention window — evicted from both the device-code map and
+      // the user-code index.
+      expect(store.sweep(901_001)).toBe(1);
+      expect(await store.getEnrollment(pending.device_code)).toBeNull();
+      expect(await store.getEnrollmentByUserCode(pending.user_code)).toBeNull();
+    });
+
+    it("sweep() leaves not-yet-stale records untouched", async () => {
+      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      const fresh = makePending({ device_code: "fresh", user_code: "FRESH" });
+      const stale = makePending({
+        device_code: "stale",
+        user_code: "STALE",
+        expiresAt: 100, // long past; 100 + 300_000 < now below
+      });
+      await store.saveEnrollment(fresh);
+      await store.saveEnrollment(stale);
+
+      const evicted = store.sweep(601_000); // stale eligible, fresh not
+      expect(evicted).toBe(1);
+      expect(await store.getEnrollment("stale")).toBeNull();
+      expect(await store.getEnrollment("fresh")).not.toBeNull();
+    });
+
+    it("sweep() does not orphan a newer enrollment that reuses a swept user_code", async () => {
+      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      const old = makePending({
+        device_code: "old",
+        user_code: "SAME-CODE",
+        expiresAt: 100, // stale — eligible for eviction below
+      });
+      await store.saveEnrollment(old);
+      // A later enrollment collides on user_code: the index now points at
+      // "fresh". Sweeping "old" must NOT delete that index entry.
+      const fresh = makePending({ device_code: "fresh", user_code: "SAME-CODE" });
+      await store.saveEnrollment(fresh);
+
+      expect(store.sweep(601_000)).toBe(1); // evicts only "old"
+      expect(await store.getEnrollment("old")).toBeNull();
+      const byUserCode = await store.getEnrollmentByUserCode("SAME-CODE");
+      expect(byUserCode?.device_code).toBe("fresh");
+    });
+
+    it("close() is idempotent and stops the sweeper", () => {
+      const store = new MemoryEnrollmentStore(); // autoSweep on by default
+      expect(() => {
+        store.close();
+        store.close();
+      }).not.toThrow();
     });
   });
 

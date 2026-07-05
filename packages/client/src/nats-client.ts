@@ -26,10 +26,36 @@ import {
   sealMessage,
   openMessage,
   base64urlDecode,
+  unwrapConversationKey,
   type BrowserKeyPair,
 } from "./e2e-crypto-browser.js";
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
 import { registerWithPop } from "./pop-register.js";
+
+// Handshake retry (core NATS has no retention — the one-shot key_exchange can be
+// dropped if the agent's per-peer SUB is not yet server-active when we publish,
+// which a real, higher-latency relay makes possible). Republish a few times until
+// the agent answers. ~2.6s total worst case (500ms × 5) — well under any human
+// perception of "did it connect?", and it stops instantly once the key arrives.
+const HANDSHAKE_RETRY_MS = 500;
+const HANDSHAKE_MAX_RETRIES = 5;
+
+/**
+ * A random, subject-safe token for a request/reply inbox segment (hex only, so
+ * it never contains a `.`/`*`/`>` that would break the subject hierarchy).
+ * Prefers `crypto.getRandomValues`; falls back to `Math.random` in hosts without
+ * WebCrypto (the reply subject is not a secret — it only needs to be unguessable
+ * enough to avoid collisions).
+ */
+function randomInboxToken(): string {
+  const g = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto;
+  if (g?.getRandomValues) {
+    const b = new Uint8Array(12);
+    g.getRandomValues(b);
+    return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  }
+  return `${Math.random().toString(16).slice(2)}${Date.now().toString(16)}`;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,8 +74,8 @@ export type NatsClientOptions = {
    * unused — omit it. REQUIRED whenever `registration` is present.
    */
   jwt?: string;
-  /** Agent ID (from JWT) */
-  agentId: string;
+  /** Account (deployment) id — the wire identity (from JWT) */
+  accountId: string;
   /** Tenant ID (from JWT) */
   tenant: string;
   /** Peer ID (JWT sub claim) */
@@ -59,20 +85,37 @@ export type NatsClientOptions = {
   /** Reconnect backoff cap (ms) */
   reconnectCapMs?: number;
   /**
-   * Optional PoP HTTP registration. When present, the client performs the
-   * JWT + Proof-of-Possession registration against the plugin's HTTP register
-   * route after connecting (and before the handshake), so the agent subscribes
-   * to this peer's subjects. When absent, registration is skipped (dev/open-NATS
-   * uses the agent's wildcard auto-register instead). `jwt` and `peerId` come
-   * from the existing NatsClientOptions fields.
+   * CL3: client-side keepalive interval (ms). While connected the client sends a
+   * PING every interval and expects a PONG before the next tick; a missed PONG
+   * means the socket is half-open (tab sleep/wake, NAT/mobile flap) and is torn
+   * down so a reconnect fires — otherwise `connected` stays wrongly true and
+   * published messages vanish into the retention-less relay. Default 20_000; set
+   * to 0 to disable.
+   */
+  heartbeatIntervalMs?: number;
+  /**
+   * Optional PoP registration. When present, the client performs the JWT +
+   * Proof-of-Possession registration over NATS request/reply on the account's
+   * `…{peerId}.register` subject after connecting (and before any key flows), so
+   * the agent subscribes to this peer's subjects. When absent, registration is
+   * skipped (dev/open-NATS uses the agent's wildcard auto-register instead).
+   * `jwt`, `tenant`, `accountId` and `peerId` come from the existing
+   * NatsClientOptions fields — the register subject is derived from them, so
+   * there is no gateway URL to configure (the agent is reached over NATS only).
    */
   registration?: {
-    /** Base URL where the plugin serves its register routes (no trailing slash). */
-    registerBaseUrl: string;
     /** Device Ed25519 private key paired with the bootstrap JWT's pop_jwk. */
     devicePrivateKey: CryptoKey;
-    /** Injectable fetch (tests / non-browser hosts). Defaults to global fetch. */
-    fetchImpl?: typeof fetch;
+    /**
+     * Phase 6 (multi-device): the device X25519 PRIVATE key whose PUBLIC half
+     * was minted into the bootstrap JWT `cnf.jwk`. When present, the session
+     * key is the agent-owned conversation key K delivered WRAPPED to this key
+     * in the register reply (`unwrapConversationKey`) — no `.handshake`
+     * negotiation happens at all, so one user's multiple devices share one
+     * stable K. When absent, the legacy per-connection X25519 handshake runs
+     * (old-plugin compat; the auto-admission path never registers anyway).
+     */
+    deviceX25519PrivateKey?: CryptoKey;
   };
   /**
    * Optional NATS-layer NKEY authentication for a JWT-auth nats-server.
@@ -159,8 +202,26 @@ export class NatsClient {
    */
   private connectSent = false;
 
+  /** CL2: terminal auth failure — stop reconnecting; only a fresh client helps. */
+  private terminal = false;
+  /** CL2: listeners notified on a terminal (non-retryable) failure. */
+  private readonly errorListeners = new Set<ErrorListener>();
+  /** CL3: keepalive timer + outstanding-PING flag. */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private pongPending = false;
+
   constructor(options: NatsClientOptions) {
     this.options = options;
+  }
+
+  /**
+   * CL2: subscribe to terminal (non-retryable) connection failures — an
+   * authoritative auth rejection where reconnecting with the same credentials
+   * cannot succeed. After this fires the client has stopped reconnecting.
+   */
+  onError(listener: ErrorListener): () => void {
+    this.errorListeners.add(listener);
+    return () => { this.errorListeners.delete(listener); };
   }
 
   /** Connect to NATS server */
@@ -171,6 +232,7 @@ export class NatsClient {
   /** Disconnect and cleanup */
   disconnect(): void {
     this.clearReconnectTimer();
+    this.stopHeartbeat();
     if (this.ws) {
       this.ws.onopen = null;
       this.ws.onmessage = null;
@@ -194,6 +256,65 @@ export class NatsClient {
     // has globalThis.TextEncoder). NATS PUB requires the UTF-8 byte count.
     const byteLen = new TextEncoder().encode(payload).length;
     this.ws.send(`PUB ${subject} ${byteLen}\r\n${payload}\r\n`);
+  }
+
+  /**
+   * Publish with a NATS reply-to subject (`PUB <subject> <reply-to> <len>`).
+   * The subscriber's transport surfaces `reply-to`, so the agent can publish its
+   * response back to it — this is the request half of `request()`.
+   */
+  publishWithReply(subject: string, replyTo: string, payload: string): void {
+    if (!this.connected || !this.ws) {
+      console.warn("[nats-client] Not connected, cannot publish");
+      return;
+    }
+    const byteLen = new TextEncoder().encode(payload).length;
+    this.ws.send(`PUB ${subject} ${replyTo} ${byteLen}\r\n${payload}\r\n`);
+  }
+
+  /**
+   * NATS request/reply: publish `payload` to `subject` with a fresh reply-to
+   * inbox, and resolve with the first reply payload (or reject on timeout).
+   *
+   * The reply inbox is derived from `replyPrefix` (an in-namespace subject the
+   * browser's tenant-wide creds already cover for BOTH pub and sub — so no
+   * `_INBOX.>` grant is needed). A single round-trip with NO internal retry:
+   * the caller (registerWithPop) owns the retry/backoff policy so it can restart
+   * from a fresh challenge on a lost reply.
+   */
+  request(
+    subject: string,
+    payload: string,
+    opts: { timeoutMs?: number; replyPrefix: string },
+  ): Promise<string> {
+    const timeoutMs = opts.timeoutMs ?? 5000;
+    if (!this.connected || !this.ws) {
+      return Promise.reject(new Error("[nats-client] request: not connected"));
+    }
+    const replySubject = `${opts.replyPrefix}.${randomInboxToken()}`;
+    const sid = this.subscribe(replySubject);
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let off: () => void = () => {};
+      let timer: ReturnType<typeof setTimeout>;
+      const cleanup = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        off();
+        this.unsubscribe(sid);
+      };
+      off = this.onRawMessage((subj, pl) => {
+        if (subj !== replySubject) return;
+        cleanup();
+        resolve(pl);
+      });
+      timer = setTimeout(() => {
+        cleanup();
+        reject(new Error("[nats-client] request timeout"));
+      }, timeoutMs);
+      this.publishWithReply(subject, replySubject, payload);
+    });
   }
 
   /** Subscribe to NATS subject */
@@ -234,6 +355,8 @@ export class NatsClient {
   // ---------------------------------------------------------------------------
 
   private connectInternal(): void {
+    // CL2: a terminal auth failure is not retryable — refuse to redial.
+    if (this.terminal) return;
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
@@ -245,6 +368,12 @@ export class NatsClient {
     ws.binaryType = "arraybuffer";
     this.ws = ws;
     this.connectSent = false;
+    // A fresh socket starts a fresh NATS protocol stream. Any bytes left in the
+    // buffer from a socket torn down mid-frame (the half-open case CL3's
+    // heartbeat forces a reconnect on) would otherwise corrupt the new stream's
+    // INFO/PONG parse — on the NKEY path a mangled INFO means the signed CONNECT
+    // is never sent → server auth timeout. Start clean.
+    this.buffer = "";
 
     ws.onopen = () => {
       console.log("[nats-client] WebSocket connected");
@@ -270,6 +399,7 @@ export class NatsClient {
 
     ws.onclose = () => {
       this.connected = false;
+      this.stopHeartbeat();
       this.notifyStateListeners();
       this.scheduleReconnect();
     };
@@ -356,12 +486,16 @@ export class NatsClient {
       }
 
       if (line === "PONG") {
+        // CL3: any PONG proves the link is alive — clear the outstanding-ping
+        // flag so the next heartbeat tick does not declare a dead link.
+        this.pongPending = false;
         if (!this.connected) {
           this.connected = true;
           this.reconnectAttempts = 0;
           console.log("[nats-client] Connected to NATS");
           this.notifyStateListeners();
           this.resubscribeAll();
+          this.startHeartbeat();
         }
         continue;
       }
@@ -372,28 +506,52 @@ export class NatsClient {
       }
 
       if (line.startsWith("MSG ")) {
-        this.handleMessage(line);
+        // handleMessage returns false when the payload hasn't fully arrived yet
+        // (it re-buffers the header). We MUST break, not continue: continuing
+        // would re-extract the same header from the same buffer forever — a
+        // synchronous infinite loop that freezes the tab. Break and wait for the
+        // next ws.onmessage to append the rest.
+        if (!this.handleMessage(line)) break;
         continue;
       }
 
       if (line.startsWith("-ERR ")) {
         console.error("[nats-client] NATS error:", line);
+        // CL2: distinguish an authoritative AUTH rejection (terminal — the same
+        // credentials will never be accepted) from failures that a reconnect CAN
+        // fix. Terminal = "Authorization Violation" (bad creds/perms) or
+        // "Authentication Expired" (User/Account expired). NON-terminal and
+        // deliberately excluded: "Authentication Timeout"/"Cancelled" (a slow or
+        // sleeping client that just missed the auth window — retrying works) and
+        // "Permissions Violation" (per-subject, connection stays up).
+        if (/authorization violation|authentication expired/i.test(line)) {
+          this.failTerminally(
+            `NATS authorization rejected: ${line.slice(5).trim()} ` +
+              `(credentials invalid/expired — reconnecting cannot help)`,
+          );
+        }
         continue;
       }
     }
   }
 
-  private handleMessage(line: string): void {
+  /**
+   * Parse a `MSG` line + its payload. Returns `true` when a full message was
+   * consumed (caller continues draining) and `false` when the payload has not
+   * fully arrived yet (the header is re-buffered; caller must STOP draining and
+   * wait for more socket data — see the break in drainBuffer).
+   */
+  private handleMessage(line: string): boolean {
     const parts = line.split(" ");
     const hasReplyTo = parts.length === 5;
     const subject = parts[1] ?? "";
     const byteCount = parseInt(parts[hasReplyTo ? 4 : 3] ?? "0", 10);
 
-    if (isNaN(byteCount) || byteCount < 0) return;
+    if (isNaN(byteCount) || byteCount < 0) return true; // malformed header: drop, keep draining
 
     if (this.buffer.length < byteCount + 2) {
       this.buffer = `${line}\r\n${this.buffer}`;
-      return;
+      return false; // need more bytes
     }
 
     const payload = this.buffer.slice(0, byteCount);
@@ -402,6 +560,7 @@ export class NatsClient {
     // Deliver the raw payload; decryption/parsing happens in WebChannelNatsClient
     // (the envelope must be decrypted before it is meaningful).
     this.notifyRawListeners(subject, payload);
+    return true;
   }
 
   private resubscribeAll(): void {
@@ -413,6 +572,8 @@ export class NatsClient {
   }
 
   private scheduleReconnect(): void {
+    // CL2: never reconnect after a terminal auth failure.
+    if (this.terminal) return;
     if (this.reconnectTimer) return;
 
     const baseMs = this.options.reconnectBaseMs ?? 500;
@@ -434,6 +595,98 @@ export class NatsClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
+
+  /**
+   * CL2: enter the terminal state. Stops all reconnect activity, tears the
+   * socket down, and notifies error listeners. No further redial happens until a
+   * brand-new client is constructed.
+   */
+  private failTerminally(message: string): void {
+    if (this.terminal) return; // fire once
+    this.terminal = true;
+    this.clearReconnectTimer();
+    this.stopHeartbeat();
+    this.connected = false;
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null; // suppress the onclose→scheduleReconnect path
+      try { this.ws.close(); } catch { /* already closing */ }
+      this.ws = null;
+    }
+    // Notify the ERROR first so a downstream wrapper is already in its terminal
+    // "error" status before the state event lands — otherwise the state event
+    // (connected=false) would momentarily flash "reconnecting" (the wrapper's
+    // sticky-error guard keys off the already-set "error" status).
+    this.notifyErrorListeners(new Error(message));
+    this.notifyStateListeners();
+  }
+
+  /**
+   * CL3: start the keepalive loop. Each tick, if the previous PING is still
+   * unanswered the link is half-open → force a reconnect; otherwise send a fresh
+   * PING and expect a PONG before the next tick.
+   */
+  private startHeartbeat(): void {
+    const interval = this.options.heartbeatIntervalMs ?? 20_000;
+    if (interval <= 0) return; // disabled
+    this.stopHeartbeat();
+    this.pongPending = false;
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (this.pongPending) {
+        // No PONG since the last tick → the socket is dead but never fired
+        // onclose (half-open). Force the teardown+reconnect ourselves.
+        console.warn("[nats-client] heartbeat timeout — link is half-open, forcing reconnect");
+        this.forceReconnect();
+        return;
+      }
+      this.pongPending = true;
+      try {
+        this.ws.send("PING\r\n");
+      } catch {
+        this.forceReconnect();
+      }
+    }, interval);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    this.pongPending = false;
+  }
+
+  /**
+   * CL3: tear a half-open socket down and schedule a reconnect. Unlike a clean
+   * onclose we must drive it manually because the browser never signalled close.
+   */
+  private forceReconnect(): void {
+    this.stopHeartbeat();
+    this.connected = false;
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null; // we drive the reconnect; avoid a double-fire
+      try { this.ws.close(); } catch { /* already closing */ }
+      this.ws = null;
+    }
+    this.notifyStateListeners();
+    this.scheduleReconnect();
+  }
+
+  private notifyErrorListeners(err: Error): void {
+    this.errorListeners.forEach((listener) => {
+      try {
+        listener(err);
+      } catch (e) {
+        console.error("[nats-client] Error listener threw:", e);
+      }
+    });
   }
 
   private notifyRawListeners(subject: string, payload: string): void {
@@ -463,26 +716,37 @@ export class NatsClient {
 
 /**
  * Derive inbound NATS subject for a peer.
- * Format: webchannel.{tenant}.{agentId}.{peerId}.in
+ * Format: webchannel.{tenant}.{accountId}.{peerId}.in
  */
-export function inboundSubject(tenant: string, agentId: string, peerId: string): string {
-  return `webchannel.${tenant}.${agentId}.${peerId}.in`;
+export function inboundSubject(tenant: string, accountId: string, peerId: string): string {
+  return `webchannel.${tenant}.${accountId}.${peerId}.in`;
 }
 
 /**
  * Derive outbound NATS subject for a peer.
- * Format: webchannel.{tenant}.{agentId}.{peerId}.out
+ * Format: webchannel.{tenant}.{accountId}.{peerId}.out
  */
-export function outboundSubject(tenant: string, agentId: string, peerId: string): string {
-  return `webchannel.${tenant}.${agentId}.${peerId}.out`;
+export function outboundSubject(tenant: string, accountId: string, peerId: string): string {
+  return `webchannel.${tenant}.${accountId}.${peerId}.out`;
 }
 
 /**
  * Derive handshake NATS subject for a peer.
- * Format: webchannel.{tenant}.{agentId}.{peerId}.handshake
+ * Format: webchannel.{tenant}.{accountId}.{peerId}.handshake
  */
-export function handshakeSubject(tenant: string, agentId: string, peerId: string): string {
-  return `webchannel.${tenant}.${agentId}.${peerId}.handshake`;
+export function handshakeSubject(tenant: string, accountId: string, peerId: string): string {
+  return `webchannel.${tenant}.${accountId}.${peerId}.handshake`;
+}
+
+/**
+ * Derive the register-admission NATS subject for a peer (register-hop mode).
+ * Format: webchannel.{tenant}.{accountId}.{peerId}.register
+ *
+ * The browser drives challenge/register/unregister here via request/reply; the
+ * agent subscribes the `…*.register` wildcard.
+ */
+export function registerSubject(tenant: string, accountId: string, peerId: string): string {
+  return `webchannel.${tenant}.${accountId}.${peerId}.register`;
 }
 
 // ---------------------------------------------------------------------------
@@ -511,8 +775,31 @@ export class WebChannelNatsClient {
   private keyPair: BrowserKeyPair | null = null;
   private sessionKey: Uint8Array | null = null;
   private outboundQueue: OutboundMessage[] = [];
+  /**
+   * Ciphertext `.out` frames that arrived BEFORE the session key existed.
+   *
+   * Phase 6 race: the wrapped conversation key travels the HTTP register
+   * response while the register-triggered history snapshot travels NATS —
+   * two transports with no ordering guarantee, so the snapshot can land a
+   * beat before `unwrapConversationKey` resolves. Dropping it would silently
+   * lose the primary hydration path until the next reconnect. We buffer a
+   * bounded number of frames and drain them the moment the key is set;
+   * frames that still fail to decrypt are dropped (fail-closed, as ever).
+   */
+  private pendingInbound: string[] = [];
+  private static readonly MAX_PENDING_INBOUND = 64;
   private outSub = -1;
   private handshakeSub = -1;
+  /**
+   * Handshake retry timer. The initial `key_exchange` is a one-shot publish, but
+   * core NATS has NO retention: if the agent's per-peer subscription is not yet
+   * active on the server when we publish (a real, higher-latency relay makes the
+   * SUB→handshake ordering non-deterministic even though we register first), the
+   * frame is dropped and — with no retry — the session would wedge forever. So we
+   * republish on a bounded schedule until the agent answers (sessionKey is set) or
+   * the attempt cap is hit. Cleared on session establishment, reconnect, or close.
+   */
+  private handshakeRetryTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * Bumped on every `onConnected()` so a stale async continuation (resumed after
    * the socket dropped and a reconnect spawned a fresh flow) can detect it is no
@@ -531,6 +818,10 @@ export class WebChannelNatsClient {
       if (connected) void this.onConnected();
       else this.resetSession();
     });
+    // CL2: forward the low-level client's terminal auth failures to our own
+    // error listeners, so an embedder learns credentials died (not just PoP
+    // registration failures, which already flow through notifyErrorListeners).
+    this.client.onError((err) => this.notifyErrorListeners(err));
   }
 
   /** Connect to NATS (the handshake begins automatically once connected). */
@@ -585,37 +876,69 @@ export class WebChannelNatsClient {
   // ---------------------------------------------------------------------------
 
   private resetSession(): void {
+    this.clearHandshakeRetry();
     this.sessionKey = null;
     this.keyPair = null;
+    // Frames buffered for a dead session are ciphertext under a key we no
+    // longer (or never will) hold — drop them; the fresh register/handshake
+    // re-hydrates.
+    this.pendingInbound = [];
+  }
+
+  /**
+   * Decrypt + deliver the `.out` frames that arrived before the session key
+   * was established (see `pendingInbound`). Called immediately after the key
+   * is set on either path (register-delivered K or legacy handshake).
+   */
+  private drainPendingInbound(): void {
+    if (!this.sessionKey || this.pendingInbound.length === 0) return;
+    const pending = this.pendingInbound;
+    this.pendingInbound = [];
+    for (const payload of pending) {
+      const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
+      if (msg) this.notifyMessageListeners(msg);
+    }
   }
 
   private async onConnected(): Promise<void> {
-    const { tenant, agentId, peerId } = this.options;
+    const { tenant, accountId, peerId } = this.options;
     // Mark this flow as the current connection generation. Any `await` below
     // re-checks `this.connectionEpoch === epoch` so a continuation resumed after
     // a drop+reconnect bails instead of clobbering the fresh flow's state.
     const epoch = ++this.connectionEpoch;
+    const { registration } = this.options;
+    // Phase 6 (multi-device): when the JWT-cnf X25519 private key is supplied,
+    // the session key is the agent-owned conversation key K, delivered WRAPPED
+    // in the register response — the `.handshake` subject is never subscribed
+    // nor published on this path (the plugin's register-admission channel does
+    // not answer handshakes anymore).
+    const registerDeliveredKey = Boolean(registration?.deviceX25519PrivateKey);
+
     // (Re)subscribe idempotently: unsubscribe stale sids so a reconnect never
-    // leaves duplicate subscriptions delivering the same MSG twice.
+    // leaves duplicate subscriptions delivering the same MSG twice. `.out` MUST
+    // be active BEFORE the register hop: the agent sends the initial history
+    // snapshot from the register route, and core NATS has no retention.
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
     if (this.handshakeSub >= 0) this.client.unsubscribe(this.handshakeSub);
-    this.outSub = this.client.subscribe(outboundSubject(tenant, agentId, peerId));
-    this.handshakeSub = this.client.subscribe(handshakeSubject(tenant, agentId, peerId));
+    this.handshakeSub = -1;
+    this.outSub = this.client.subscribe(outboundSubject(tenant, accountId, peerId));
+    if (!registerDeliveredKey) {
+      this.handshakeSub = this.client.subscribe(handshakeSubject(tenant, accountId, peerId));
+    }
 
-    // Fresh connection → fresh key exchange.
+    // Fresh connection → fresh key establishment.
     this.resetSession();
 
-    // PoP HTTP registration (production). MUST complete AFTER we subscribe to
-    // .out/.handshake (above) but BEFORE we publish the handshake — the agent
-    // only subscribes to this peer's subjects once registered, and NATS has no
-    // retention, so a handshake published earlier would be lost. Fail-closed: if
-    // registration throws, registration failure is TERMINAL for this connection.
-    // A PoP/JWT rejection is typically a permanent credential problem, so we do
-    // NOT silently retry (no auto-retry/hammering): we tear the connection fully
-    // down via the raw NatsClient.disconnect() (clears the reconnect timer +
-    // closes the socket, leaving connected === false). The application must react
-    // to onError and re-initialize with fresh credentials (a new bootstrap JWT).
-    const { registration } = this.options;
+    // PoP registration over NATS request/reply (production). MUST complete AFTER
+    // we subscribe to .out (above) but BEFORE any key flows — the agent only
+    // subscribes to this peer's subjects once registered, and NATS has no
+    // retention. Fail-closed: if registration throws, registration failure is
+    // TERMINAL for this connection. A PoP/JWT rejection is typically a permanent
+    // credential problem, so beyond registerWithPop's own bounded retry-on-
+    // timeout we do NOT silently loop: we tear the connection fully down via the
+    // raw NatsClient.disconnect() (clears the reconnect timer + closes the
+    // socket, leaving connected === false). The application must react to onError
+    // and re-initialize with fresh credentials (a new bootstrap JWT).
     if (registration) {
       // The register hop presents the bootstrap JWT; it is REQUIRED here even
       // though the type makes `jwt` optional (it is unused on the BYO-NATS path).
@@ -627,13 +950,24 @@ export class WebChannelNatsClient {
         this.client.disconnect();
         return;
       }
+      let registerResult: Awaited<ReturnType<typeof registerWithPop>>;
       try {
-        await registerWithPop({
-          registerBaseUrl: registration.registerBaseUrl,
+        const registerSubj = registerSubject(tenant, accountId, peerId);
+        // In-namespace reply inbox: the browser's tenant-wide creds already cover
+        // pub+sub on `webchannel.{tenant}.>`, so no separate `_INBOX.>` grant is
+        // needed (and none is broadened across tenants).
+        const replyPrefix = `webchannel.${tenant}.${accountId}.${peerId}.reginbox`;
+        registerResult = await registerWithPop({
+          request: async (body) => {
+            const raw = await this.client.request(registerSubj, JSON.stringify(body), {
+              timeoutMs: 5000,
+              replyPrefix,
+            });
+            return JSON.parse(raw) as unknown;
+          },
           jwt: this.options.jwt,
           peerId,
           devicePrivateKey: registration.devicePrivateKey,
-          fetchImpl: registration.fetchImpl,
         });
       } catch (err) {
         console.error("[nats-client] PoP registration failed:", err);
@@ -643,35 +977,107 @@ export class WebChannelNatsClient {
       }
       // The socket may have dropped during the register round-trip; a reconnect
       // would have spawned a newer onConnected. Bail so this stale flow does not
-      // publish a handshake for a connection generation that is no longer current.
+      // establish a key for a connection generation that is no longer current.
       if (this.connectionEpoch !== epoch) return;
+
+      if (registerDeliveredKey) {
+        // Register-delivered key: unwrap K with the cnf device private key.
+        // Fail-closed and TERMINAL on any miss — we never fall back to the
+        // handshake here (the plugin does not answer it on this path, and a
+        // downgrade would let a tampering relay strip the delivered key).
+        const wrapped = registerResult.wrappedConversationKey;
+        if (!wrapped) {
+          const err = new Error(
+            "[nats-client] register response carried no wrappedConversationKey " +
+              "(plugin does not support the register-delivered key model)",
+          );
+          this.notifyErrorListeners(err);
+          this.client.disconnect();
+          return;
+        }
+        let key: Uint8Array;
+        try {
+          key = await unwrapConversationKey(
+            wrapped,
+            registration.deviceX25519PrivateKey!,
+          );
+        } catch (err) {
+          console.error("[nats-client] conversation-key unwrap failed:", err);
+          this.notifyErrorListeners(err as Error);
+          this.client.disconnect();
+          return;
+        }
+        if (this.connectionEpoch !== epoch) return;
+        this.sessionKey = key;
+        this.drainPendingInbound();
+        this.flushQueue();
+        return;
+      }
     }
 
+    // Legacy per-connection X25519 handshake (no registration at all — the
+    // wildcard/auto-admission path — or an embedder that has not supplied the
+    // cnf device key yet).
     const keyPair = await generateX25519KeyPair();
     // Same guard after the keygen await: do not clobber a fresher flow's keyPair
     // or publish a stale handshake.
     if (this.connectionEpoch !== epoch) return;
     this.keyPair = keyPair;
+    this.publishHandshakeWithRetry(epoch, 0);
+  }
+
+  /**
+   * Publish the `key_exchange` handshake frame and, if the agent has not answered
+   * (no session key) within a short window, republish — up to `HANDSHAKE_MAX_RETRIES`
+   * times. Guarded by the connection epoch so a stale flow never republishes onto a
+   * newer connection. Stops as soon as `handleRaw` establishes the session key.
+   */
+  private publishHandshakeWithRetry(epoch: number, attempt: number): void {
+    if (this.connectionEpoch !== epoch || this.sessionKey || !this.keyPair) return;
+    const { tenant, accountId, peerId } = this.options;
     this.client.publish(
-      handshakeSubject(tenant, agentId, peerId),
+      handshakeSubject(tenant, accountId, peerId),
       keyExchangeFrame(this.keyPair.publicKeyB64url),
     );
+    if (attempt >= HANDSHAKE_MAX_RETRIES) return;
+    if (this.handshakeRetryTimer) clearTimeout(this.handshakeRetryTimer);
+    this.handshakeRetryTimer = setTimeout(() => {
+      this.handshakeRetryTimer = null;
+      this.publishHandshakeWithRetry(epoch, attempt + 1);
+    }, HANDSHAKE_RETRY_MS);
+  }
+
+  private clearHandshakeRetry(): void {
+    if (this.handshakeRetryTimer) {
+      clearTimeout(this.handshakeRetryTimer);
+      this.handshakeRetryTimer = null;
+    }
   }
 
   private async handleRaw(subject: string, payload: string): Promise<void> {
-    const { tenant, agentId, peerId } = this.options;
+    const { tenant, accountId, peerId } = this.options;
 
-    if (subject === handshakeSubject(tenant, agentId, peerId)) {
+    if (subject === handshakeSubject(tenant, accountId, peerId)) {
       if (this.sessionKey || !this.keyPair) return; // already established / not ready
       const agentPubKey = parseKeyExchange(payload);
       if (!agentPubKey) return;
       this.sessionKey = await deriveConversationKey(this.keyPair.privateKey, agentPubKey);
+      this.clearHandshakeRetry();
+      this.drainPendingInbound();
       this.flushQueue();
       return;
     }
 
-    if (subject === outboundSubject(tenant, agentId, peerId)) {
-      if (!this.sessionKey) return; // fail-closed: cannot read before handshake
+    if (subject === outboundSubject(tenant, accountId, peerId)) {
+      if (!this.sessionKey) {
+        // Fail-closed, but not lossy: buffer (bounded) until the key exists —
+        // the register-triggered snapshot can beat the HTTP-delivered key by a
+        // beat (see `pendingInbound`). Never processed as plaintext.
+        if (this.pendingInbound.length < WebChannelNatsClient.MAX_PENDING_INBOUND) {
+          this.pendingInbound.push(payload);
+        }
+        return;
+      }
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
       if (msg) this.notifyMessageListeners(msg);
       return;
@@ -699,9 +1105,9 @@ export class WebChannelNatsClient {
       this.outboundQueue.push(message);
       return;
     }
-    const { tenant, agentId, peerId } = this.options;
-    const wire = sealMessage({ agentId, tenant, sub: peerId }, this.sessionKey, message);
-    this.client.publish(inboundSubject(tenant, agentId, peerId), wire);
+    const { tenant, accountId, peerId } = this.options;
+    const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, message);
+    this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
   }
 
   private notifyMessageListeners(msg: InboundMessage): void {

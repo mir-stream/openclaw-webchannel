@@ -24,6 +24,22 @@
 import { readFile } from "node:fs/promises";
 
 /**
+ * A JWKS SOURCE was unreachable — network error, non-2xx response, non-JSON
+ * body, or a file read/decode failure. This is a TRANSIENT infrastructure fault
+ * ("I could not check the key"), distinct from a genuine key MISS ("this kid does
+ * not exist", a plain `Error`) or a bad token. Callers use this to answer a
+ * retryable "unavailable" instead of a terminal "unauthorized", so a momentary
+ * IdP/JWKS hiccup doesn't permanently kill a session — WITHOUT becoming an oracle
+ * (both outcomes are still non-admit; only the retry disposition differs).
+ */
+export class JwksUnavailableError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options as ErrorOptions);
+    this.name = "JwksUnavailableError";
+  }
+}
+
+/**
  * A single JWK with the subset of fields we care about. Mirrors RFC 7517 / 7518
  * §6.3.1 (RSA public key). `kid` is optional in the spec but required here for
  * lookup; `alg` is enforced at verify-time, not here. We keep the type narrow
@@ -78,10 +94,19 @@ export type JWKSCacheOptions = {
    * Workers environments).
    */
   readFileImpl?: (path: string) => Promise<Uint8Array>;
+  /**
+   * Per-request JWKS-fetch timeout in ms (default 10s). Bounds a slow/hanging
+   * IdP so it cannot stall the caller — critical now that the warm path runs on
+   * gateway startup. A timeout is a transient `JwksUnavailableError` (fail-closed).
+   */
+  fetchTimeoutMs?: number;
 };
 
 /** Default TTL: 5 minutes, matching the spec and the OWASP JWT guidance. */
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
+
+/** Default JWKS-fetch timeout: 10s — generous for a slow IdP, bounded for boot. */
+const DEFAULT_FETCH_TIMEOUT_MS = 10 * 1000;
 
 /**
  * The fetch / file / inline union. Construct via the static `JWKSCache.create`
@@ -100,32 +125,66 @@ export type JWKSCacheOptionsFull = JWKSCacheOptions & {
  * Fetch a JWKS document from a URL. Throws on any non-2xx status or network
  * failure. The fetch response is consumed and closed before we return so a
  * half-consumed stream can't leak the connection (Workers edge case).
+ *
+ * BOUNDED: an `AbortController` caps the request at `timeoutMs`. Without it a
+ * slow / black-hole IdP could hang the caller for the OS socket timeout — and
+ * this path now runs on gateway STARTUP (the Gate B readiness warm, per account,
+ * serially), so an unbounded fetch would stall the whole boot. A timeout turns
+ * that into a bounded, fail-closed `JwksUnavailableError`.
  */
 async function fetchJwks(
   url: string,
   fetchImpl: typeof fetch,
+  timeoutMs: number,
 ): Promise<JsonWebKeySet> {
-  const res = await fetchImpl(url);
-  if (!res.ok) {
-    // Consume + discard so the body isn't leaked, then throw.
-    try {
-      await res.text();
-    } catch {
-      /* ignore — we're already failing */
-    }
-    throw new Error(
-      `webchannel: JWKS fetch failed for ${url}: HTTP ${res.status}`,
-    );
-  }
-  let doc: unknown;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // The signal stays armed across BOTH the connect/headers phase AND the body
+  // read: a black-hole IdP can return 200 headers then trickle the body forever,
+  // so clearing the timer after `fetch()` resolves (headers) would leave the
+  // `res.json()` body read unbounded — exactly the boot-stall we're closing.
+  // `clearTimeout` therefore lives in the outer `finally`, after the body parse.
   try {
-    doc = await res.json();
-  } catch (err) {
-    throw new Error(
-      `webchannel: JWKS fetch from ${url} returned non-JSON body: ${(err as Error).message}`,
-    );
+    let res: Awaited<ReturnType<typeof fetchImpl>>;
+    try {
+      res = await fetchImpl(url, { signal: controller.signal });
+    } catch (err) {
+      // Network-level failure (DNS, connection refused) OR the abort timeout.
+      throw new JwksUnavailableError(
+        controller.signal.aborted
+          ? `webchannel: JWKS fetch timed out for ${url} after ${timeoutMs}ms`
+          : `webchannel: JWKS fetch failed for ${url}: ${(err as Error).message}`,
+        { cause: err },
+      );
+    }
+    if (!res.ok) {
+      // Consume + discard so the body isn't leaked, then throw.
+      try {
+        await res.text();
+      } catch {
+        /* ignore — we're already failing */
+      }
+      // A non-2xx from the JWKS endpoint is an infra fault, not a token verdict.
+      throw new JwksUnavailableError(
+        `webchannel: JWKS fetch failed for ${url}: HTTP ${res.status}`,
+      );
+    }
+    let doc: unknown;
+    try {
+      doc = await res.json();
+    } catch (err) {
+      // A hung body read trips the same abort timer → surface it as a timeout.
+      throw new JwksUnavailableError(
+        controller.signal.aborted
+          ? `webchannel: JWKS fetch timed out for ${url} after ${timeoutMs}ms (body read)`
+          : `webchannel: JWKS fetch from ${url} returned non-JSON body: ${(err as Error).message}`,
+        { cause: err },
+      );
+    }
+    return parseJwks(doc);
+  } finally {
+    clearTimeout(timer);
   }
-  return parseJwks(doc);
 }
 
 /** Read + parse a JWKS file from disk. Throws on missing file or bad JSON. */
@@ -134,16 +193,19 @@ async function loadJwksFile(path: string, readFileImpl: (p: string) => Promise<U
   try {
     bytes = await readFileImpl(path);
   } catch (err) {
-    throw new Error(
+    // A missing/unreadable file is an infra fault (deploy/mount), not a verdict.
+    throw new JwksUnavailableError(
       `webchannel: JWKS file read failed for ${path}: ${(err as Error).message}`,
+      { cause: err },
     );
   }
   let text: string;
   try {
     text = new TextDecoder("utf-8").decode(bytes);
   } catch (err) {
-    throw new Error(
+    throw new JwksUnavailableError(
       `webchannel: JWKS file at ${path} is not valid UTF-8: ${(err as Error).message}`,
+      { cause: err },
     );
   }
   let parsed: unknown;
@@ -174,6 +236,7 @@ export class JWKSCache implements KeyResolver {
   private readonly ttlMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly readFileImpl: (path: string) => Promise<Uint8Array>;
+  private readonly fetchTimeoutMs: number;
 
   /**
    * The cached document + the wall-clock time (ms) we captured it. We store the
@@ -196,6 +259,7 @@ export class JWKSCache implements KeyResolver {
   private constructor(opts: JWKSCacheOptionsFull) {
     this.source = opts.source;
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
+    this.fetchTimeoutMs = opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.readFileImpl =
       opts.readFileImpl ??
@@ -281,6 +345,27 @@ export class JWKSCache implements KeyResolver {
   }
 
   /**
+   * Preflight warm-up: resolve the JWKS document ONCE (honoring the TTL cache)
+   * and return it, so a startup/enroll-time gate can COUNT keys or surface a
+   * fetch failure eagerly — instead of the failure only appearing lazily on the
+   * first browser register. This reuses the EXACT same "best-effort doc" path
+   * `getKey` step 1 uses (inline → fresh cache → one fetch), so it opens no
+   * second fetcher and primes the very cache the register/challenge routes read.
+   *
+   * THROWS `JwksUnavailableError` on a transient fetch/file failure (fail-closed;
+   * never returns a stale doc). A successful resolve may legitimately return a
+   * document with ZERO keys — the caller decides that is a hard preflight FAIL
+   * ("cannot verify any bootstrap JWT"), which this method does NOT itself treat
+   * as an error (an empty-but-served JWKS is not an I/O fault).
+   */
+  async warm(fetchTimeoutMsOverride?: number): Promise<JsonWebKeySet> {
+    return (
+      (await this.maybeLoadFromCache()) ??
+      (await this.loadFresh(fetchTimeoutMsOverride))
+    );
+  }
+
+  /**
    * Return the cached document if it's still fresh. Returns `null` if there is
    * no cache or the cache has expired (in which case the caller will refetch).
    *
@@ -302,15 +387,31 @@ export class JWKSCache implements KeyResolver {
    * Force a fresh fetch from the underlying source, updating the cache on
    * success and clearing it on failure. Concurrent callers share the same
    * in-flight promise so a kid miss during a fan-out triggers one fetch, not N.
+   *
+   * `fetchTimeoutMsOverride` lets a specific caller widen/narrow the per-request
+   * timeout without changing the instance default — used by the startup warm to
+   * give a cold IdP a longer budget than the latency-sensitive live-verify path.
+   *
+   * CAVEAT (inflight sharing vs override): a joiner inherits the STARTER's
+   * timeout — its own override is ignored. So a live verify that lands while the
+   * 10s startup warm's fetch is in flight can wait up to 10s, past the browser's
+   * 5s register window. Accepted: the window is boot-only (warm runs before
+   * traffic), the client times out + retries, and by then the warm has resolved
+   * (cache hit) or failed (next fetch uses the tight instance default). Racing a
+   * second, shorter fetch instead would defeat the dedup this exists for.
    */
-  private async loadFresh(): Promise<JsonWebKeySet> {
+  private async loadFresh(fetchTimeoutMsOverride?: number): Promise<JsonWebKeySet> {
     if (this.inflightRefetch) return this.inflightRefetch;
 
     const promise = (async (): Promise<JsonWebKeySet> => {
       try {
         let doc: JsonWebKeySet;
         if (this.source.kind === "url") {
-          doc = await fetchJwks(this.source.url, this.fetchImpl);
+          doc = await fetchJwks(
+            this.source.url,
+            this.fetchImpl,
+            fetchTimeoutMsOverride ?? this.fetchTimeoutMs,
+          );
         } else if (this.source.kind === "file") {
           doc = await loadJwksFile(this.source.path, this.readFileImpl);
         } else {

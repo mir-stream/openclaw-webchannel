@@ -1,6 +1,8 @@
 # WebChannel — 기획서
 
 > 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 설계·계획 기준이며 명시된 날짜 시점 기준이다.
+>
+> ⚠️ **superseded — `hmac-ticket` 전략은 이후 완전히 제거됨.** 아래 `hmac-ticket`/`index.ts` 인증 관련 서술은 역사 스냅샷이며, 현행 인증은 `jwt`뿐이다 ([`AUTH.md`](AUTH.md) §4, [`BACKLOG.md`](BACKLOG.md)).
 
 > OpenClaw용 셀프호스트 웹 채널 플러그인 + 브라우저 클라이언트
 > 외부 위젯 SaaS(Now4real, Stream 등) 없이, 게이트웨이 위에서 바로 도는 웹 채팅 채널.
@@ -197,7 +199,9 @@ openclaw-webchannel/              # 레포 루트 = 워크스페이스 매니저
         └── src/                   # index.ts(배럴), client.ts(WebChannelClient), types.ts, client.test.ts
 ```
 
-> **게이트웨이 로딩:** `plugins.load.paths`는 이제 `…/openclaw-webchannel/packages/plugin`(레포 루트가 아니라 플러그인 패키지)을 가리킨다. `openclaw.extensions`는 그 패키지 기준 `./index.ts`. SDK(`openclaw/plugin-sdk`)는 전역 설치본을 가리키는 `node_modules/openclaw` 심링크로 해석(워크스페이스 install이 prune하므로 재생성 필요).
+> **게이트웨이 로딩:** `plugins.load.paths`는 이제 `…/openclaw-webchannel/packages/plugin`(레포 루트가 아니라 플러그인 패키지)을 가리킨다. `openclaw.extensions`는 그 패키지 기준 진입점. SDK(`openclaw/plugin-sdk`)는 전역 설치본을 가리키는 `node_modules/openclaw` 심링크로 해석(워크스페이스 install이 prune하므로 재생성 필요).
+>
+> **(superseded — 진입점은 이제 `./index-nats.ts`(NATS E2E)가 production 기본값이고, `./index.ts`(Gateway-WS, hmac-ticket)는 legacy dev-only. 아래 index.ts/hmac 언급은 역사적 스냅샷; 현행 상태는 `STATUS.md` 참조.)**
 
 ### 핵심 SDK 표면
 - `openclaw/plugin-sdk/channel-core` — `createChatChannelPlugin`, `defineChannelPluginEntry`

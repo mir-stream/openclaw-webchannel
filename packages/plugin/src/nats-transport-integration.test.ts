@@ -347,7 +347,7 @@ describe(
     });
 
     // Subject naming convention (plaintext routing metadata per design):
-    //   chat.<tenant>.<agentId>.<userId>.<direction>
+    //   chat.<tenant>.<accountId>.<userId>.<direction>
     const INBOUND = "chat.tenant1.agent1.user42.in"; // browser → agent
     const OUTBOUND = "chat.tenant1.agent1.user42.out"; // agent → browser
     const HISTORY = "chat.tenant1.agent1.user42.history"; // backlog replay channel

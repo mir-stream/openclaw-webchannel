@@ -7,9 +7,11 @@
  * same-host/LAN only. It therefore does NOT satisfy the project's no-inbound-port
  * premise and must never be the default/production entry.
  *
- * Keep it for zero-infra local round-trips (no NATS relay, no SaaS issuer): its
- * dev demo is `e2e/local/live-chat*.{mjs,html}` + `packages/client/src/browser-live-entry.ts`.
- * The live gateway runs `index-nats.ts`; `package.json` defaults to it.
+ * Keep it for zero-infra local round-trips (no NATS relay, no SaaS issuer):
+ * exercise it via the `smoke/*.mjs` WS scripts against a gateway with this plugin
+ * loaded in WS mode. The single interactive demo is the NATS path
+ * (`e2e/local/run-demo.sh`); the live gateway runs `index-nats.ts` and
+ * `package.json` defaults to it.
  */
 
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
@@ -23,7 +25,8 @@ import { handleApprovalDecision } from "./src/approvals.js";
 import { resolveVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
-import { WEBCHANNEL_ID } from "./src/transport.js";
+import { DEFAULT_ACCOUNT_ID } from "./src/account-config.js";
+import { resolveWebchannelSessionRoute } from "./src/session-route.js";
 
 /**
  * Shared transport instance. The channel plugin (outbound) and the HTTP upgrade
@@ -132,11 +135,12 @@ export default defineChannelPluginEntry({
     // routing-resolution throw NEVER crashes the connection.
     transport.setFirstLivenessHandler((wsKey) => {
       try {
-        const route = api.runtime.channel.routing.resolveAgentRoute({
-          cfg: api.config,
-          channel: WEBCHANNEL_ID,
-          peer: { kind: "direct", id: wsKey },
-        });
+        // Same forced per-account-channel-peer key as the inbound WRITE path
+        // (handleInboundMessage → resolveWebchannelSessionRoute with the default
+        // account), so the legacy Gateway-WS snapshot reads THIS peer's session,
+        // not the shared "main" one. DEFAULT_ACCOUNT_ID matches the accountId the
+        // inbound dispatcher uses here, keeping WRITE and READ keys identical.
+        const route = resolveWebchannelSessionRoute(api, DEFAULT_ACCOUNT_ID, wsKey);
         void historyRecent(api, route.sessionKey, historyConfig.limit, api.logger)
           .then((messages) => {
             transport.sendHistory(wsKey, messages);
@@ -160,11 +164,9 @@ export default defineChannelPluginEntry({
     // errors are logged, never thrown.
     transport.setLoadHistoryHandler((wsKey, request) => {
       try {
-        const route = api.runtime.channel.routing.resolveAgentRoute({
-          cfg: api.config,
-          channel: WEBCHANNEL_ID,
-          peer: { kind: "direct", id: wsKey },
-        });
+        // Same forced key as the snapshot + WRITE sites — legacy pagination reads
+        // THIS peer's session (see resolveWebchannelSessionRoute).
+        const route = resolveWebchannelSessionRoute(api, DEFAULT_ACCOUNT_ID, wsKey);
         const requestedLimit = request.limit ?? historyConfig.pageSize;
         const fetch = request.before
           ? historyPageBefore(

@@ -15,7 +15,7 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "additionalProperties": false,
-        "description": "WebChannel config (OpenClaw multi-account model). The channel-level (flat) fields are the shared base AND the implicit \"default\" account; named accounts live under `accounts.<accountId>` and inherit the channel-level base. Acquisition identity (tenant/agentId/saas.baseUrl) and credentials are set via 'openclaw channels add --channel webchannel'.",
+        "description": "WebChannel config (OpenClaw multi-account model). The channel-level (flat) fields are the shared base AND the implicit \"default\" account; named accounts live under `accounts.<accountId>` and inherit the channel-level base. Acquisition identity (tenant/accountId/saas.baseUrl) and credentials are set via 'openclaw channels add --channel webchannel'.",
         "properties": {
           "accounts": {
             "type": "object",
@@ -28,10 +28,6 @@
           "tenant": {
             "type": "string",
             "description": "Deployment tenant identifier (acquisition identity). Set via 'openclaw channels add --channel webchannel --tenant <t>' (or the mapped --url flag)."
-          },
-          "agentId": {
-            "type": "string",
-            "description": "Agent id for this account — the JWT aud / wire key. Set via 'openclaw channels add --channel webchannel --agent-id <a>' (or the mapped --token flag)."
           },
           "saas": {
             "type": "object",
@@ -50,35 +46,13 @@
             "properties": {
               "strategy": {
                 "type": "string",
-                "enum": ["anonymous", "hmac-ticket", "jwt"]
-              },
-              "ticketSecret": {
-                "anyOf": [
-                  { "type": "string" },
-                  {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": { "env": { "type": "string" } },
-                    "required": ["env"]
-                  }
-                ]
+                "enum": ["anonymous", "jwt"]
               },
               "ticketParam": { "type": "string" },
               "requirePoP": {
                 "type": "boolean",
                 "default": true,
-                "description": "Require Proof-of-Possession at the NATS register route. Default true (secure-by-default): a verified bootstrap JWT with no pop_jwk is rejected (401) before any peer is registered. Set false to restore legacy optional-PoP behavior (dev only)."
-              },
-              "cors": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "allowedOrigins": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Allowlist of browser Origins permitted on the register routes. Unset/empty reflects the request Origin (permissive). When non-empty, only an in-list Origin receives an Access-Control-Allow-Origin header."
-                  }
-                }
+                "description": "Require Proof-of-Possession at the NATS register hop. Default true (secure-by-default): a verified bootstrap JWT with no pop_jwk is rejected before any peer is registered. Set false to restore legacy optional-PoP behavior (dev only)."
               },
               "jwt": {
                 "type": "object",
@@ -213,7 +187,7 @@
             "properties": {
               "url": {
                 "type": "string",
-                "description": "NATS WebSocket URL (ws://… / wss://…). Env override: WEBCHANNEL_NATS_URL. Default ws://127.0.0.1:4222."
+                "description": "NATS WebSocket URL (ws://… / wss://…) for static/open modes. For ENROLLED mode the SaaS is the rendezvous authority and DELIVERS the relay URL with the minted creds (EnrollmentResult.natsUrl); that wins, and this / WEBCHANNEL_NATS_URL is only a dev override / back-compat fallback. Default ws://127.0.0.1:4222."
               },
               "devOpen": {
                 "type": "boolean",
@@ -222,7 +196,7 @@
               "admission": {
                 "type": "string",
                 "enum": ["auto", "register-hop"],
-                "description": "Peer-admission override. \"register-hop\": peers must complete the SaaS bootstrap JWT + Proof-of-Possession register hop at /webchannel/nats/register* before being served. \"auto\": the agent subscribes to the tenant/agent wildcard and serves any peer that completes the X25519 handshake and passes the dmSecurity allowlist. Default: register-hop when auth.strategy=\"jwt\"; auto otherwise; static credentials always default to auto."
+                "description": "Peer-admission override. \"register-hop\": peers must complete the SaaS bootstrap JWT + Proof-of-Possession register hop over NATS request/reply on the webchannel.{tenant}.{accountId}.{peerId}.register subject before being served. \"auto\": the agent subscribes to the tenant/agent wildcard and serves any peer that completes the X25519 handshake and passes the dmSecurity allowlist. Default: register-hop when auth.strategy=\"jwt\"; auto otherwise; static credentials always default to auto."
               },
               "credentials": {
                 "type": "object",
@@ -275,19 +249,15 @@
       "uiHints": {
         "auth.strategy": {
           "label": "Auth strategy",
-          "help": "How browser connections are verified: \"hmac-ticket\" verifies a short-lived signed ticket from your backend (recommended); \"anonymous\" disables auth (dev/loopback only — all connections share one peer). Required; the plugin refuses to start if unset."
-        },
-        "auth.ticketSecret": {
-          "label": "Ticket secret",
-          "help": "Shared HMAC secret for the \"hmac-ticket\" strategy. Use { \"env\": \"VAR_NAME\" } to read from an environment variable instead of inlining the secret."
+          "help": "How browser connections are verified. Production runs the NATS path (index-nats): use \"jwt\" for the register-hop admission, or set NO auth at all for `auto` admission (browser is gated by NATS subject-permissioned creds + the X25519 handshake). \"anonymous\" is REJECTED at load (the plugin refuses to start)."
         },
         "auth.ticketParam": {
           "label": "Ticket query param",
-          "help": "Query-string parameter the ticket arrives in on the WS upgrade URL. Defaults to \"ticket\"."
+          "help": "Query-string parameter the JWT arrives in on the WS upgrade URL. Defaults to \"ticket\"."
         },
         "auth.jwt.jwksUrl": {
           "label": "JWKS URL",
-          "help": "HTTPS URL of the IdP's JWKS endpoint (e.g. https://your-tenant.auth0.com/.well-known/jwks.json). The gateway fetches and caches it with a 5-minute TTL. Exactly one of jwksUrl, jwks, or jwksFile is required."
+          "help": "HTTPS URL of the IdP's JWKS endpoint (e.g. https://your-tenant.auth0.com/.well-known/jwks.json). The gateway fetches and caches it with a 5-minute TTL. DERIVED at runtime as `<saas.baseUrl>/.well-known/jwks.json` when no key source is configured; set this (or jwks/jwksFile) only to override. Exactly one of jwksUrl, jwks, or jwksFile is used."
         },
         "auth.jwt.jwks": {
           "label": "Inline JWKS",
@@ -299,11 +269,11 @@
         },
         "auth.jwt.issuer": {
           "label": "Issuer (iss)",
-          "help": "Expected `iss` claim. Tokens whose iss does not match (constant-time compare) are rejected. Required."
+          "help": "Expected `iss` claim. Tokens whose iss does not match (constant-time compare) are rejected. DERIVED at runtime from the SaaS base URL (`issuer == saas.baseUrl`) when omitted; set this only to pin a different issuer (proxy / custom-domain)."
         },
         "auth.jwt.audience": {
           "label": "Audience (aud)",
-          "help": "Expected `aud` claim. Tokens whose aud is neither this string nor an array containing it are rejected. Required."
+          "help": "Expected `aud` claim. Tokens whose aud is neither this string nor an array containing it are rejected. DERIVED at runtime from the account id (`audience == accountId`) when omitted; set this only to pin a different audience."
         },
         "auth.jwt.clockSkew": {
           "label": "Clock skew (sec)",
@@ -357,10 +327,6 @@
       {
         "flags": "--tenant <tenant>",
         "description": "WebChannel: deployment tenant identifier. Maps to channels.webchannel.<account>.tenant."
-      },
-      {
-        "flags": "--agent-id <id>",
-        "description": "WebChannel: agent id (JWT aud / wire key) for this account. Maps to channels.webchannel.<account>.agentId."
       }
     ]
   }

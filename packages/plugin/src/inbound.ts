@@ -4,6 +4,7 @@ import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
 import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
 import { DEFAULT_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
+import { resolveWebchannelSessionRoute } from "./session-route.js";
 
 /** The inbound path only handles user messages; approvals route separately. */
 type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
@@ -116,18 +117,16 @@ export async function handleInboundMessage(
     });
   }
 
-  // Resolve the channel-scoped agent route (carries `webchannel` + account +
-  // peer in the session key per configured dmScope/bindings). Threading
-  // `accountId` activates openclaw's `binding.account` routing tier, so
-  // `agents bind --agent X --bind webchannel:<account>` routes THIS account's
-  // inbound to agent X, and accountId enters the sessionKey (per-account
-  // session isolation). For `"default"` this matches the Cycle 1 route.
-  const route = channelRuntime.routing.resolveAgentRoute({
-    cfg: api.config,
-    channel: WEBCHANNEL_ID,
-    accountId,
-    peer: { kind: "direct", id: wsKey },
-  });
+  // Resolve the channel-scoped agent route, then FORCE the per-account-channel-
+  // peer session scope (see `resolveWebchannelSessionRoute`). Binding-based agent
+  // routing is preserved (`agents bind --agent X --bind webchannel:<account>`
+  // still routes THIS account's inbound to agent X), but the session key NEVER
+  // inherits the operator's global `session.dmScope="main"` — every user's uuid
+  // gets its OWN agent session, so the cross-user transcript leak on the history
+  // snapshot / load_history read paths cannot happen. This is the WRITE site: the
+  // turn is dispatched under this key, and the history READ sites resolve the
+  // SAME key via the SAME helper, so paging/snapshot stay consistent.
+  const route = resolveWebchannelSessionRoute(api, accountId, wsKey);
 
   // Native "Bot is typing…" affordance. We push the frame right after route
   // resolution and right before agent dispatch (1) so the widget sees the
@@ -147,6 +146,7 @@ export async function handleInboundMessage(
   try {
     await channelRuntime.inbound.run({
       channel: WEBCHANNEL_ID,
+      accountId,
       raw: message,
       adapter: {
         ingest: (raw) => ({
@@ -160,6 +160,12 @@ export async function handleInboundMessage(
         resolveTurn: (input) => {
           const ctxPayload = channelRuntime.inbound.buildContext({
             channel: WEBCHANNEL_ID,
+            // S1: stamp the serving account on the turn context. Core copies
+            // this into `ctx.AccountId` → the agent-run request's `accountId`
+            // → the approval request's `turnSourceAccountId`, which is what
+            // lets each account's native approval handler claim ONLY its own
+            // turns' approvals (and the prompt deliver on the right channel).
+            accountId,
             timestamp: input.timestamp,
             from: wsKey,
             sender: { id: wsKey, name: wsKey },

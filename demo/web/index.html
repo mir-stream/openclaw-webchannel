@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebChannel — Showcase Demo</title>
+  <style>
+    :root {
+      --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3;
+      --muted: #8b949e; --accent: #2f81f7; --good: #3fb950; --warn: #d29922;
+      --bad: #f85149; --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      height: 100vh; display: flex; flex-direction: column;
+    }
+    header {
+      display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+      border-bottom: 1px solid var(--border); background: var(--panel);
+    }
+    header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+    header .spacer { flex: 1; }
+    .badge {
+      font-size: 11px; padding: 3px 8px; border-radius: 10px; font-weight: 600;
+      border: 1px solid var(--border);
+    }
+    .badge.echo { background: rgba(210,153,34,.15); color: var(--warn); border-color: var(--warn); }
+    .badge.real { background: rgba(63,185,80,.15); color: var(--good); border-color: var(--good); }
+    .badge.who { background: rgba(47,129,247,.15); color: var(--accent); border-color: var(--accent); }
+    button {
+      font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 6px;
+      border: 1px solid var(--border); background: #21262d; color: var(--fg); cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button:disabled { opacity: .5; cursor: default; }
+    input {
+      font: inherit; font-size: 13px; padding: 7px 10px; border-radius: 6px;
+      border: 1px solid var(--border); background: #0d1117; color: var(--fg);
+    }
+    #login {
+      margin: auto; display: flex; flex-direction: column; gap: 10px;
+      padding: 28px; border: 1px solid var(--border); border-radius: 10px;
+      background: var(--panel); min-width: 300px;
+    }
+    #login h2 { margin: 0 0 4px; font-size: 16px; }
+    #login .hint { color: var(--muted); font-size: 12px; }
+    #login .err { color: var(--bad); font-size: 12px; min-height: 14px; }
+    #app { flex: 1; display: grid; grid-template-columns: 320px 1fr 360px; min-height: 0; }
+    #app.no-admin { grid-template-columns: 1fr 360px; }
+    .pane { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+    .pane:last-child { border-right: none; }
+    .pane > h3 {
+      margin: 0; padding: 10px 14px; font-size: 12px; text-transform: uppercase;
+      letter-spacing: .5px; color: var(--muted); border-bottom: 1px solid var(--border);
+    }
+    .pane-body { flex: 1; overflow-y: auto; padding: 12px 14px; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>WebChannel <span style="color:var(--muted);font-weight:400">— Showcase Demo</span></h1>
+    <span id="llm-badge" class="badge"></span>
+    <div class="spacer"></div>
+    <span id="whoami" class="badge who hidden"></span>
+    <button id="logout" class="hidden">Log out</button>
+  </header>
+
+  <div id="login">
+    <h2>Sign in</h2>
+    <div class="hint">alice · bob (chat) — admin (approve/grant). password: <code>demo</code></div>
+    <input id="username" placeholder="username" autocomplete="username" />
+    <input id="password" type="password" placeholder="password" autocomplete="current-password" />
+    <button id="login-btn" class="primary">Sign in</button>
+    <div id="login-err" class="err"></div>
+  </div>
+
+  <div id="app" class="hidden">
+    <section id="admin-pane" class="pane hidden">
+      <h3>Admin — SaaS authority</h3>
+      <div class="pane-body" id="admin-body"></div>
+    </section>
+    <section class="pane">
+      <h3>Chat widget</h3>
+      <div class="pane-body" id="chat-body"></div>
+    </section>
+    <section class="pane">
+      <h3>Wiretap — raw relay frames</h3>
+      <div class="pane-body" id="wiretap-body"></div>
+    </section>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

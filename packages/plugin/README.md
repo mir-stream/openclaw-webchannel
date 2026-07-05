@@ -20,13 +20,12 @@ zero-infra fallback.
 
 As of `e384198`, a real headless-Chromium message HAS travelled browser → NATS → this plugin →
 `inbound.run` → (echo model) → back. Earlier the NATS entry assumed APIs that don't exist
-(`api.http.post`, a `webchannel-nats` id, `keepAlive`) — fixed there. The plain-HTTP register
-routes (`/webchannel/nats/register*`) are now **served live** too: they were silently dropped
-because `registerFull` called `api.registerHttpRoute` *after* `await`-ing the NATS connect, and
-openclaw only honors route registration during the **synchronous** `registerFull` window — the
-fix registers them up front (handlers read live state via a holder). This was *not* an openclaw
-limitation on plain-HTTP routes; those dispatch fine. The browser client is also **wired** to
-register over this hop (`registerWithPop`, `9aa4b67`). Two caveats remain: the deterministic echo
+(`api.http.post`, a `webchannel-nats` id, `keepAlive`) — fixed there. Register admission is now
+**fully over NATS**: a register-hop account subscribes its own
+`webchannel.{tenant}.{accountId}.*.register` subject and the browser drives challenge/register/
+unregister via NATS request/reply on `…{peerId}.register` (the old inbound HTTP register routes
+are deleted — the agent makes ONLY outbound connections). The browser client is wired to register
+over this hop (`registerWithPop`). Two caveats remain: the deterministic echo
 model stands in for a live LLM (by design), and the local dev harness still drives the wildcard
 auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See STATUS.md.
 
@@ -40,8 +39,8 @@ auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See 
   see [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Gateway-WS channel (`index.ts`) — **dev-only** zero-infra fallback (run it via an OpenClaw gateway
   with this plugin loaded in WS mode). Needs a reachable inbound port, so it is NOT used in
-  production. Its dev demo lives in `e2e/local/live-chat*.{mjs,html}` +
-  `packages/client/src/browser-live-entry.ts`.
+  production. Exercise it via the `smoke/*.mjs` WS round-trip scripts; the single interactive
+  chat demo is the NATS path (`e2e/local/run-demo.sh`).
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
 ## Enrollment & credentials (NATS mode)
@@ -77,33 +76,58 @@ credentials and skips enrollment.
 - **Permissions:** written with mode `0o600` (owner read/write only)
 - **Shape** (`PluginCredentials`): `identityKey { publicKey, privateKey }` (base64url X25519),
   optional `enrollment { creds, peerId, jwksUrl, bootstrapUrl }`, plus `tenant`, `saasEnrollUrl`,
-  `saasPollUrl`, optional `agentId`. The private key is generated locally and never transmitted.
+  `saasPollUrl`, optional `accountId` (the wire identity). The private key is generated locally
+  and never transmitted.
 
-## E2E security model (admission + handshake)
+## E2E security model (admission + key establishment)
 
-The agent admits **only SaaS-attested device keys** and detects relay MITM at handshake time.
+Phase 6 (multi-device) split key establishment by admission mode:
 
-- **`cnf` claim verification** (`src/jwt.ts`): after the bootstrap JWT's signature is verified,
-  `verifyJwt` extracts the RFC 7800 `cnf.jwk` confirmation claim. Types `CnfJwk` / `CnfClaim`;
-  the validated device key surfaces as `JwtIdentity.devicePublicKey`. The claim must be
-  `kty: "OKP"`, `crv: "X25519"`, with a 32-byte `x`; a `d` (private) field, wrong length, or any
-  malformed `cnf` causes the **whole JWT to be rejected** (fail-closed). A JWT with no `cnf` is
-  allowed (backward compatibility).
-- **Pinned device-key store** (`src/auth.ts`): on successful JWT admission the attested key is
-  pinned by `peerId` via `storePinnedDeviceKey` / `getPinnedDeviceKey` /
-  `clearPinnedDeviceKeys` / `clearPinnedDeviceKeyForPeer`.
-- **Constant-time handshake check** (`src/handshake-verifier.ts`): `verifyDeviceKey` and
-  `parseAndVerifyHandshake` compare the key a peer presents against the pinned value using
-  constant-time byte-equality; a mismatch (or missing pin, or bad length) throws
-  `HandshakeMitmError` and aborts the handshake before any ECDH.
+- **Register admission (production / SaaS path) — register-delivered conversation key.**
+  The agent OWNS a stable per-peerId key K (`src/conversation-key-store.ts`, persisted at
+  `~/.openclaw-webchannel/<account>/conversation-keys.json`, 0600). The register handler (a NATS
+  request/reply on the account's `…{peerId}.register` subject) wraps K (`src/late-join-decryptor.ts`
+  — X25519 ECDH + HKDF-SHA256 `webchannel-key-wrap-v1` + ChaCha20-Poly1305) to the device key
+  attested in **that request's** verified JWT `cnf` claim and returns it in the register reply.
+  There is **no `.handshake` on this path** — the keyStore-mode channel neither subscribes nor
+  answers it — so an active relay cannot substitute keys: K only ever travels **wrapped to a
+  JWT-attested device key**, and the wrap target comes from the SaaS-signed JWT `cnf`, not from
+  anything the transport controls. So even though register now rides NATS (visible to the relay),
+  the relay/observer sees only ciphertext + a wrapped key it cannot open, and cannot coax K to be
+  wrapped to a key it holds. This resolves review finding **C2** structurally for register
+  deployments. One user's
+  devices all receive the SAME K, so multi-device decryption works and a second device no longer
+  overwrites the first one's key.
+  - **`cnf` claim verification** (`src/jwt.ts`): after the bootstrap JWT's signature is verified,
+    `verifyJwt` extracts the RFC 7800 `cnf.jwk` confirmation claim. The claim must be
+    `kty: "OKP"`, `crv: "X25519"`, with a 32-byte `x`; a `d` (private) field, wrong length, or
+    any malformed `cnf` causes the **whole JWT to be rejected** (fail-closed). The validated key
+    surfaces as `JwtIdentity.devicePublicKey`; the register handler REQUIRES it (401 without) and
+    wraps per-request. There is deliberately **no cross-request pinned-key store** — the old
+    peerId-keyed pin store collided two devices of one user and was removed (with the never-wired
+    `handshake-verifier.ts`) in Phase 6 W7.
+  - **Session scoping caveat:** a register account serves many users, so openclaw's
+    `session.dmScope` MUST be `"per-channel-peer"` (or the per-account variant). The default
+    `"main"` collapses every peer into ONE agent session, and the register history snapshot then
+    delivers the shared transcript to every user (re-sealed to each requester's own K —
+    encryption cannot prevent a scoping leak). The plugin warns loudly at startup when it detects
+    this (`crossUserHistoryWarning`).
+- **Auto admission (`admission:"auto"`, bring-your-own-NATS) — legacy per-device X25519
+  handshake, unchanged.** The handshake is unauthenticated (any tenant-creds holder can complete
+  it), so auto mode gives confidentiality against a *passive* relay only; an *active* relay MITM
+  can substitute keys. Acceptable **only while the relay is operated by a trusted party** (your
+  own `nats-server` or your own Synadia account). Migrating auto deployments to register
+  admission is the follow-up that closes this.
 - **No anonymous admission:** the `anonymous` auth strategy throws at plugin load
-  (`makeAnonymousVerifier` never returns a verifier) — connections must use `jwt` or
-  `hmac-ticket`.
+  (`makeAnonymousVerifier` never returns a verifier) — connections must use `jwt`.
 
-**Threat model (handled):** relay substitutes the device key → caught by the handshake compare;
-attacker skips bootstrap → no admission without a SaaS-attested key; forged `cnf` → JWT signature
-verification fails; timing oracle → constant-time compare. **Out of scope:** SaaS key compromise
-/ revocation (deferred to re-enrollment); real-time allowlist authz is a core-delegated stub.
+**Threat model (register path):** relay substitutes a key → impossible, K is wrapped to the
+JWT-attested `cnf` key and never negotiated on the wire; attacker skips bootstrap → no admission
+(register requires a verified JWT + PoP); forged `cnf` → JWT signature verification fails;
+tampered wrapped key → Poly1305 reject, client fails closed (terminal error, no handshake
+downgrade). **Auto path:** active relay MITM remains possible (see above). **Out of scope:** SaaS
+key compromise / revocation (deferred to re-enrollment); K rotation (deferred — fixed key first);
+real-time allowlist authz is a core-delegated stub.
 
 ## Bring-your-own NATS (e.g. Synadia Cloud / NGS)
 
@@ -128,7 +152,11 @@ credentials — **no SaaS issuer required**.
 ```jsonc
 // channels.webchannel
 {
-  "auth": { "strategy": "hmac-ticket", "ticketSecret": { "env": "WC_TICKET_SECRET" } },
+  // NO `auth` block needed: static creds resolve admission to "auto", and the
+  // ConnectionVerifier is only built for the "register-hop" admission mode.
+  // Browser admission here = NATS subject permissions + X25519 handshake
+  // (+ an optional `dmSecurity` allowlist). The `jwt` register-hop strategy is
+  // the only alternative; it is INERT on this static/auto NATS path.
   "nats": {
     "url": "wss://connect.ngs.global",
     "credentials": {
@@ -161,7 +189,7 @@ Env overrides (take precedence over config) — secrets need not live in committ
 ```ts
 new WebChannelNatsClient({
   url: "wss://connect.ngs.global",
-  agentId, tenant, peerId,
+  accountId, tenant, peerId,
   // No bootstrap `jwt` and no `registration` — the bootstrap JWT is now optional
   // and only needed for the SaaS register-hop path.
   natsCredentials: {
@@ -172,21 +200,27 @@ new WebChannelNatsClient({
 ```
 
 > **Synadia permissions:** the static user must have **pub + sub** permission on the
-> `webchannel.<tenant>.<agent>.*` subjects (the agent subscribes to `…*.in` /
+> `webchannel.<tenant>.<accountId>.*` subjects (the agent subscribes to `…*.in` /
 > `…*.handshake` and publishes `…*.out`; the browser is the mirror). Without the
 > wildcard sub permission the agent's `auto` admission cannot receive peers.
 
 ## NATS subject namespace
 
-`src/nats-channel.ts` routes per-peer over tenant- and agent-scoped subjects:
+`src/nats-channel.ts` routes per-peer over tenant- and account-scoped subjects:
 
 ```
-webchannel.{tenant}.{agentId}.{peerId}.in    # browser → agent (plugin subscribes)
-webchannel.{tenant}.{agentId}.{peerId}.out   # agent → browser (plugin publishes)
+webchannel.{tenant}.{accountId}.{peerId}.in    # browser → agent (plugin subscribes)
+webchannel.{tenant}.{accountId}.{peerId}.out   # agent → browser (plugin publishes)
 ```
 
 Each peer (browser session) gets its own subject pair; tenant isolation is enforced by the NATS
 user credentials' pub/sub permissions minted during enrollment.
+
+> **Handling agent vs. wire identity.** The `accountId` is the on-wire/admission identity
+> (the deployment). Which OpenClaw agent actually answers is **decoupled** and selected via
+> `openclaw agents bind --bind webchannel:<accountId> --agent <agent>` (telegram-like) — not a
+> per-account config `agentId`. Inbound routing calls `resolveAgentRoute({ accountId, … })`,
+> which honours those bindings.
 
 ## Develop / test
 
@@ -200,5 +234,9 @@ npm test              # vitest run
 `package.json`); the plugin is loaded as TypeScript via OpenClaw's plugin loader. Packaging /
 publish to ClawHub is a known open question — see `../../docs/PACKAGING.md` and STATUS.md.
 
-The plugin serves no static UI. It exposes the `/webchannel/ws` WebSocket route; a consumer
-wires the headless `packages/client` library into their own page (see that package's README).
+The plugin serves no static UI and, in the **production** entry (`index-nats.ts`), no inbound
+HTTP routes at all: register admission (`register-hop` mode) rides NATS request/reply on the
+account's `webchannel.{tenant}.{accountId}.{peerId}.register` subject, so the agent makes only
+outbound connections. The **legacy dev-only** entry (`index.ts`) still exposes the `/webchannel/ws`
+WebSocket upgrade route instead. Either way a consumer wires the headless `packages/client`
+library into their own page (see that package's README).

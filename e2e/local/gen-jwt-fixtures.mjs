@@ -2,8 +2,8 @@
 /**
  * RS256 signing-key + JWKS fixture generator for the JWT-register E2E.
  *
- * The plugin's `/webchannel/nats/register*` routes verify the bootstrap JWT
- * against `channels.webchannel.auth.jwt` — here a `jwksFile`. This script mints
+ * The plugin's NATS register hop (`…{peerId}.register`) verifies the bootstrap
+ * JWT against `channels.webchannel.auth.jwt` — here a `jwksFile`. This script mints
  * the RS256 keypair the scenario needs:
  *
  *   - `jwks.json`             → the PUBLIC key as a JWK (kid="webchannel-e2e-rs256",

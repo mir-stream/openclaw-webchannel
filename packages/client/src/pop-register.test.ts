@@ -1,10 +1,12 @@
 /**
  * PoP producer ↔ consumer interop tests.
  *
- * The fake plugin server verifies the device's signature with node:crypto
- * EXACTLY as the real plugin does (`pop-challenge.ts` →
+ * The fake agent verifies the device's signature with node:crypto EXACTLY as the
+ * real plugin does (`pop-challenge.ts` →
  * `edVerify(null, popSignedMessage(peerId, nonce), pubFromJwk, sig)`), so a green
  * `registerWithPop` here proves the browser producer satisfies the real verifier.
+ * The HTTP transport is gone — registration now rides a `request(payload)` NATS
+ * request/reply seam, so the fake is a request handler, not a fetch mock.
  */
 
 import { describe, it, expect } from "vitest";
@@ -17,42 +19,34 @@ import {
   registerWithPop,
   PopRejectedError,
   type DevicePopJwk,
+  type RegisterRequestFn,
 } from "./pop-register.js";
 
-function jsonResponse(obj: unknown, status = 200): Response {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
 /**
- * Faithful replica of the plugin's register routes: issues a single-use nonce,
- * then verifies the Ed25519 signature over `webchannel-pop:<peerId>:<nonce>`
- * against `serverPopJwk` — the same check `PopChallengeStore.verify` runs.
+ * Faithful replica of the plugin's register handler over the request/reply seam:
+ * `{op:"challenge"}` issues a single-use nonce, `{op:"register"}` verifies the
+ * Ed25519 signature over `webchannel-pop:<peerId>:<nonce>` against `serverPopJwk`
+ * — the same check `PopChallengeStore.verify` runs. A used nonce is single-use.
  */
-function makeFakePlugin(opts: { peerId: string; serverPopJwk: DevicePopJwk }) {
+function makeFakeAgent(opts: { peerId: string; serverPopJwk: DevicePopJwk }) {
   let issuedNonce: string | null = null;
   const calls = { challenge: 0, register: 0 };
-  const seen: { authHeader?: string; body?: { nonce?: string; signature?: string } } = {};
+  const seen: { token?: string; nonce?: string; signature?: string } = {};
 
-  const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
-    const u = String(url);
-    const auth = (init?.headers as Record<string, string> | undefined)?.["Authorization"];
-
-    if (u.endsWith("/webchannel/nats/register/challenge")) {
+  const request: RegisterRequestFn = async (payload) => {
+    const body = payload as { op?: string; token?: string; nonce?: string; signature?: string };
+    if (body.op === "challenge") {
       calls.challenge++;
-      seen.authHeader = auth;
+      seen.token = body.token;
       issuedNonce = `nonce-${calls.challenge}-${Buffer.from([calls.challenge, 7, 42]).toString("hex")}`;
-      return jsonResponse({ nonce: issuedNonce });
+      return { nonce: issuedNonce };
     }
-
-    if (u.endsWith("/webchannel/nats/register")) {
+    if (body.op === "register") {
       calls.register++;
-      const body = JSON.parse(String(init?.body)) as { nonce?: string; signature?: string };
-      seen.body = body;
+      seen.nonce = body.nonce;
+      seen.signature = body.signature;
       // single-use nonce
-      if (!issuedNonce || body.nonce !== issuedNonce) return new Response("", { status: 401 });
+      if (!issuedNonce || body.nonce !== issuedNonce) return { error: "unauthorized", code: 401 };
       const nonce = issuedNonce;
       issuedNonce = null;
       const pub = createPublicKey({ key: opts.serverPopJwk, format: "jwk" });
@@ -62,86 +56,175 @@ function makeFakePlugin(opts: { peerId: string; serverPopJwk: DevicePopJwk }) {
         pub,
         Buffer.from(String(body.signature), "base64url"),
       );
-      return ok ? jsonResponse({ peerId: opts.peerId, registered: true }) : new Response("", { status: 401 });
+      return ok ? { peerId: opts.peerId, registered: true } : { error: "unauthorized", code: 401 };
     }
+    return { error: "unauthorized", code: 401 };
+  };
 
-    return new Response("not found", { status: 404 });
-  }) as unknown as typeof fetch;
-
-  return { fetchImpl, calls, seen };
+  return { request, calls, seen };
 }
 
 const PEER = "user-42";
-const BASE = "http://127.0.0.1:18789";
 
 describe("registerWithPop (producer ↔ consumer interop)", () => {
   it("registers when the device signs with the key pinned in pop_jwk", async () => {
     const device = await generateDevicePopKeyPair();
-    const plugin = makeFakePlugin({ peerId: PEER, serverPopJwk: device.publicJwk });
+    const agent = makeFakeAgent({ peerId: PEER, serverPopJwk: device.publicJwk });
 
     const result = await registerWithPop({
-      registerBaseUrl: BASE,
+      request: agent.request,
       jwt: "bootstrap.jwt.token",
       peerId: PEER,
       devicePrivateKey: device.privateKey,
-      fetchImpl: plugin.fetchImpl,
     });
 
     expect(result).toEqual({ peerId: PEER, registered: true });
-    expect(plugin.calls).toEqual({ challenge: 1, register: 1 });
-    expect(plugin.seen.authHeader).toBe("Bearer bootstrap.jwt.token");
-    expect(typeof plugin.seen.body?.signature).toBe("string");
+    expect(agent.calls).toEqual({ challenge: 1, register: 1 });
+    expect(agent.seen.token).toBe("bootstrap.jwt.token");
+    expect(typeof agent.seen.signature).toBe("string");
   });
 
   it("is rejected (401 → PopRejectedError) when signing with the wrong device key", async () => {
     const pinned = await generateDevicePopKeyPair();
     const attacker = await generateDevicePopKeyPair();
     // Server pins `pinned`'s public key, but the caller signs with `attacker`.
-    const plugin = makeFakePlugin({ peerId: PEER, serverPopJwk: pinned.publicJwk });
+    const agent = makeFakeAgent({ peerId: PEER, serverPopJwk: pinned.publicJwk });
 
     await expect(
       registerWithPop({
-        registerBaseUrl: BASE,
+        request: agent.request,
         jwt: "jwt",
         peerId: PEER,
         devicePrivateKey: attacker.privateKey,
-        fetchImpl: plugin.fetchImpl,
       }),
     ).rejects.toBeInstanceOf(PopRejectedError);
   });
 
-  it("throws when the challenge endpoint fails", async () => {
+  it("throws PopRejectedError when the challenge returns an error reply (bad JWT)", async () => {
     const device = await generateDevicePopKeyPair();
-    const failingFetch = (async () => new Response("", { status: 500 })) as unknown as typeof fetch;
+    const request: RegisterRequestFn = async () => ({ error: "unauthorized", code: 401 });
     await expect(
       registerWithPop({
-        registerBaseUrl: BASE,
+        request,
         jwt: "jwt",
         peerId: PEER,
         devicePrivateKey: device.privateKey,
-        fetchImpl: failingFetch,
       }),
-    ).rejects.toThrow(/challenge failed/);
+    ).rejects.toBeInstanceOf(PopRejectedError);
   });
 
-  it("strips a trailing slash from the base URL", async () => {
+  it("retries the whole unit on a lost reply (request timeout) and recovers", async () => {
+    // Model a dropped register reply: the FIRST register round-trip times out
+    // (throws), so registerWithPop must restart from a fresh challenge and
+    // succeed on the second attempt (server register is idempotent).
     const device = await generateDevicePopKeyPair();
-    const seenUrls: string[] = [];
-    const plugin = makeFakePlugin({ peerId: PEER, serverPopJwk: device.publicJwk });
-    const wrapped = (async (url: string | URL | Request, init?: RequestInit) => {
-      seenUrls.push(String(url));
-      return plugin.fetchImpl(url as RequestInfo, init);
-    }) as unknown as typeof fetch;
+    const agent = makeFakeAgent({ peerId: PEER, serverPopJwk: device.publicJwk });
+    let registerAttempts = 0;
+    const request: RegisterRequestFn = async (payload) => {
+      const body = payload as { op?: string };
+      if (body.op === "register") {
+        registerAttempts++;
+        if (registerAttempts === 1) throw new Error("[nats-client] request timeout");
+      }
+      return agent.request(payload);
+    };
 
-    await registerWithPop({
-      registerBaseUrl: `${BASE}/`,
+    const result = await registerWithPop({
+      request,
       jwt: "jwt",
       peerId: PEER,
       devicePrivateKey: device.privateKey,
-      fetchImpl: wrapped,
     });
-    expect(seenUrls).toContain(`${BASE}/webchannel/nats/register/challenge`);
-    expect(seenUrls).toContain(`${BASE}/webchannel/nats/register`);
+
+    expect(result).toEqual({ peerId: PEER, registered: true });
+    // Two challenges (fresh nonce per attempt), two register round-trips.
+    expect(agent.calls.challenge).toBe(2);
+    expect(registerAttempts).toBe(2);
+  });
+
+  it("retries a transient 503 at register (like a timeout) and recovers", async () => {
+    // A transient infra fault (agent's JWKS unreachable) replies 503; the client
+    // must RETRY it (not treat it as terminal) and succeed once it clears.
+    const device = await generateDevicePopKeyPair();
+    const agent = makeFakeAgent({ peerId: PEER, serverPopJwk: device.publicJwk });
+    let registerAttempts = 0;
+    const request: RegisterRequestFn = async (payload) => {
+      const body = payload as { op?: string };
+      if (body.op === "register") {
+        registerAttempts++;
+        if (registerAttempts === 1) return { error: "unavailable", code: 503 };
+      }
+      return agent.request(payload);
+    };
+
+    const result = await registerWithPop({
+      request,
+      jwt: "jwt",
+      peerId: PEER,
+      devicePrivateKey: device.privateKey,
+    });
+
+    expect(result).toEqual({ peerId: PEER, registered: true });
+    expect(registerAttempts).toBe(2); // first 503 retried, second succeeds
+  });
+
+  it("retries a transient 503 at challenge (like a timeout) and recovers", async () => {
+    const device = await generateDevicePopKeyPair();
+    const agent = makeFakeAgent({ peerId: PEER, serverPopJwk: device.publicJwk });
+    let challengeAttempts = 0;
+    const request: RegisterRequestFn = async (payload) => {
+      const body = payload as { op?: string };
+      if (body.op === "challenge") {
+        challengeAttempts++;
+        if (challengeAttempts === 1) return { error: "unavailable", code: 503 };
+      }
+      return agent.request(payload);
+    };
+
+    const result = await registerWithPop({
+      request,
+      jwt: "jwt",
+      peerId: PEER,
+      devicePrivateKey: device.privateKey,
+    });
+
+    expect(result).toEqual({ peerId: PEER, registered: true });
+    expect(challengeAttempts).toBe(2);
+  });
+
+  it("a 503 at register that never clears exhausts retries and throws (not PopRejected)", async () => {
+    const device = await generateDevicePopKeyPair();
+    const agent = makeFakeAgent({ peerId: PEER, serverPopJwk: device.publicJwk });
+    const request: RegisterRequestFn = async (payload) => {
+      const body = payload as { op?: string };
+      if (body.op === "register") return { error: "unavailable", code: 503 };
+      return agent.request(payload);
+    };
+    await expect(
+      registerWithPop({
+        request,
+        jwt: "jwt",
+        peerId: PEER,
+        devicePrivateKey: device.privateKey,
+        retries: 1,
+      }),
+    ).rejects.not.toBeInstanceOf(PopRejectedError);
+  });
+
+  it("throws after exhausting retries when every round-trip times out", async () => {
+    const device = await generateDevicePopKeyPair();
+    const request: RegisterRequestFn = async () => {
+      throw new Error("[nats-client] request timeout");
+    };
+    await expect(
+      registerWithPop({
+        request,
+        jwt: "jwt",
+        peerId: PEER,
+        devicePrivateKey: device.privateKey,
+        retries: 1,
+      }),
+    ).rejects.toThrow(/timeout/);
   });
 });
 

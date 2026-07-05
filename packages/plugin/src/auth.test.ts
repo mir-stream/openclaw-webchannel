@@ -4,11 +4,10 @@ import { webcrypto } from "node:crypto";
 
 import {
   resolveVerifier,
-  ANON_PEER_ID,
+  verifyJwtAndExtractIdentity,
   type AuthConfig,
   type AuthLogger,
 } from "./auth.js";
-import { issueWebChannelTicket } from "./ticket.js";
 import type { JsonWebKeySet } from "./jwks.js";
 
 /** Build a minimal IncomingMessage-like object with just a `url`. */
@@ -16,11 +15,7 @@ function fakeReq(url: string): IncomingMessage {
   return { url } as IncomingMessage;
 }
 
-const ENV_VAR = "WEBCHANNEL_TEST_TICKET_SECRET";
-const SECRET = "shared-hmac-secret";
-
 afterEach(() => {
-  delete process.env[ENV_VAR];
   vi.restoreAllMocks();
 });
 
@@ -47,111 +42,6 @@ describe("anonymous strategy", () => {
     expect(() => resolveVerifier({ strategy: "anonymous" }, logger)).toThrow(/anonymous/i);
     expect(error).toHaveBeenCalledTimes(1);
     expect(error.mock.calls[0][0]).toMatch(/anonymous/i);
-  });
-});
-
-describe("hmac-ticket strategy", () => {
-  it("accepts a freshly issued ticket and maps sub -> peerId", async () => {
-    const verifier = resolveVerifier({
-      strategy: "hmac-ticket",
-      ticketSecret: SECRET,
-    });
-    const token = issueWebChannelTicket({
-      sub: "user-7",
-      secret: SECRET,
-      ttlSeconds: 60,
-      displayName: "Grace",
-    });
-    const identity = await verifier(fakeReq(`/webchannel/ws?ticket=${token}`));
-    expect(identity).toEqual({ peerId: "user-7", displayName: "Grace" });
-  });
-
-  it("honors a custom ticketParam", async () => {
-    const verifier = resolveVerifier({
-      strategy: "hmac-ticket",
-      ticketSecret: SECRET,
-      ticketParam: "t",
-    });
-    const token = issueWebChannelTicket({
-      sub: "user-7",
-      secret: SECRET,
-      ttlSeconds: 60,
-    });
-    expect(await verifier(fakeReq(`/webchannel/ws?t=${token}`))).toEqual({
-      peerId: "user-7",
-    });
-    // Wrong param name => no ticket => reject.
-    expect(
-      await verifier(fakeReq(`/webchannel/ws?ticket=${token}`)),
-    ).toBeNull();
-  });
-
-  it("rejects a missing ticket", async () => {
-    const verifier = resolveVerifier({
-      strategy: "hmac-ticket",
-      ticketSecret: SECRET,
-    });
-    expect(await verifier(fakeReq("/webchannel/ws"))).toBeNull();
-  });
-
-  it("rejects an expired ticket", async () => {
-    const verifier = resolveVerifier({
-      strategy: "hmac-ticket",
-      ticketSecret: SECRET,
-    });
-    const token = issueWebChannelTicket({
-      sub: "user-7",
-      secret: SECRET,
-      ttlSeconds: -1,
-    });
-    expect(await verifier(fakeReq(`/webchannel/ws?ticket=${token}`))).toBeNull();
-  });
-
-  it("rejects a tampered ticket", async () => {
-    const verifier = resolveVerifier({
-      strategy: "hmac-ticket",
-      ticketSecret: SECRET,
-    });
-    const token = issueWebChannelTicket({
-      sub: "user-7",
-      secret: SECRET,
-      ttlSeconds: 60,
-    });
-    const tampered = `${token}tampered`;
-    expect(
-      await verifier(fakeReq(`/webchannel/ws?ticket=${tampered}`)),
-    ).toBeNull();
-  });
-
-  it("resolves the secret from an env SecretRef", async () => {
-    process.env[ENV_VAR] = SECRET;
-    const verifier = resolveVerifier({
-      strategy: "hmac-ticket",
-      ticketSecret: { env: ENV_VAR },
-    });
-    const token = issueWebChannelTicket({
-      sub: "user-7",
-      secret: SECRET,
-      ttlSeconds: 60,
-    });
-    expect(await verifier(fakeReq(`/webchannel/ws?ticket=${token}`))).toEqual({
-      peerId: "user-7",
-    });
-  });
-
-  it("throws when the env SecretRef is missing", () => {
-    expect(() =>
-      resolveVerifier({
-        strategy: "hmac-ticket",
-        ticketSecret: { env: ENV_VAR },
-      }),
-    ).toThrow(/is unset or empty/);
-  });
-
-  it("throws on an empty inline secret", () => {
-    expect(() =>
-      resolveVerifier({ strategy: "hmac-ticket", ticketSecret: "" }),
-    ).toThrow(/empty string/);
   });
 });
 
@@ -311,3 +201,112 @@ describe("jwt strategy (AC2 — happy path)", () => {
     expect(await verifier(fakeReq("/webchannel/ws"))).toBeNull();
   });
 });
+
+describe("fail-closed when the signing kid is unknown/evicted", () => {
+  beforeAll(async () => {
+    await ensureRsaKeys();
+  });
+
+  it("returns null (not throws) so the register route yields a clean 401, not a 500", async () => {
+    // A JWKS that has been rotated away from the token's kid: the resolver throws
+    // on the kid miss (fail-closed). verifyJwtAndExtractIdentity must translate
+    // that throw into a null verdict — an unknown/evicted kid is an auth failure
+    // (401), not a server fault (500). Mirrors JWKS key eviction in the demo.
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signRs256({ iss: ISSUER, aud: AUDIENCE, sub: "user-evicted", iat: now, exp: now + 60 });
+    const rotatedAwayJwks: JsonWebKeySet = { keys: [{ ...rsaJwks.keys[0]!, kid: "some-other-kid" }] };
+    const authConfig: AuthConfig = {
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rotatedAwayJwks },
+    };
+
+    await expect(verifyJwtAndExtractIdentity(token, authConfig)).resolves.toBeNull();
+  });
+});
+
+describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", () => {
+  beforeAll(async () => {
+    await ensureRsaKeys();
+  });
+
+  /** A JWKS-URL fetch impl that counts how many times the IdP is hit. */
+  function countingFetch(): { impl: typeof fetch; count: () => number } {
+    let calls = 0;
+    const impl = (async () => {
+      calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => rsaJwks,
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return { impl, count: () => calls };
+  }
+
+  it("reuses one cache across register/challenge calls sharing the same auth config", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signRs256({
+      iss: ISSUER,
+      aud: AUDIENCE,
+      sub: "user-cache",
+      iat: now,
+      exp: now + 60,
+    });
+    const { impl, count } = countingFetch();
+    // One stable config object == one account. The live NATS path calls
+    // verifyJwtAndExtractIdentity per pairing with THIS same object.
+    const authConfig: AuthConfig = {
+      strategy: "jwt",
+      jwt: {
+        issuer: ISSUER,
+        audience: AUDIENCE,
+        jwksUrl: "https://idp.test/jwks.json",
+        _fetchImpl: impl,
+      },
+    };
+
+    const first = await verifyJwtAndExtractIdentity(token, authConfig);
+    const second = await verifyJwtAndExtractIdentity(token, authConfig);
+    const third = await verifyJwtAndExtractIdentity(token, authConfig);
+
+    expect(first?.peerId).toBe("user-cache");
+    expect(second?.peerId).toBe("user-cache");
+    expect(third?.peerId).toBe("user-cache");
+    // Before S3 every call rebuilt an empty cache → 3 fetches. Now the TTL is
+    // honored across calls: the IdP is hit exactly once.
+    expect(count()).toBe(1);
+  });
+
+  it("keeps a separate cache per distinct auth config object (accounts don't share)", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signRs256({
+      iss: ISSUER,
+      aud: AUDIENCE,
+      sub: "user-b",
+      iat: now,
+      exp: now + 60,
+    });
+    const a = countingFetch();
+    const b = countingFetch();
+    const configA: AuthConfig = {
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, audience: AUDIENCE, jwksUrl: "https://idp.test/jwks.json", _fetchImpl: a.impl },
+    };
+    const configB: AuthConfig = {
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, audience: AUDIENCE, jwksUrl: "https://idp.test/jwks.json", _fetchImpl: b.impl },
+    };
+
+    await verifyJwtAndExtractIdentity(token, configA);
+    await verifyJwtAndExtractIdentity(token, configB);
+
+    // Each account's config keys its own cache — one fetch apiece, no bleed.
+    expect(a.count()).toBe(1);
+    expect(b.count()).toBe(1);
+  });
+});
+
+// NOTE (Phase 6 / W7): the "S2 — pinned device key store is bounded" suite is
+// gone with the pin store itself (see auth.ts) — the register route wraps the
+// conversation key per-request from `identity.devicePublicKey`; there is no
+// module-global key store left to bound.

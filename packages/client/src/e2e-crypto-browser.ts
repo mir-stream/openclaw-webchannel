@@ -11,7 +11,7 @@
  *   - handshake frame: {type:"key_exchange", pubKey:<b64url X25519>}
  *   - session key:     hkdfSha256(ecdh, null, "webchannel-conversation-v1", 32)
  *   - wire envelope:   MessageEnvelope v1 JSON, content = ChaCha20-Poly1305
- *   - AAD:             canonical(routing) = {tenant,agentId,sub,messageId,envelopeType,ts}
+ *   - AAD:             canonical(routing) = {tenant,accountId,sub,messageId,envelopeType,ts}
  */
 
 import { chacha20poly1305Encrypt, chacha20poly1305Decrypt } from "./chacha20poly1305.js";
@@ -121,6 +121,60 @@ export async function deriveConversationKey(
 }
 
 // ---------------------------------------------------------------------------
+// Conversation-key unwrap (Phase 6 multi-device — register-delivered key)
+// ---------------------------------------------------------------------------
+
+/**
+ * HKDF `info` for the key-wrap path. MUST match the agent's
+ * `late-join-decryptor.ts` (`KEY_WRAP_INFO`) — domain-separated from the
+ * conversation KDF so one ECDH secret can never serve both purposes.
+ */
+export const KEY_WRAP_INFO = "webchannel-key-wrap-v1";
+
+/**
+ * Wire format of a wrapped conversation key, as returned by the plugin's
+ * register route (`wrappedConversationKey` in the register HTTP response).
+ * All four fields are base64url. Mirrors the agent-side type in
+ * `packages/plugin/src/late-join-decryptor.ts`.
+ */
+export type WrappedConversationKey = {
+  /** b64url 32-byte ephemeral X25519 public key (fresh per wrap). */
+  ephemeralPublicKey: string;
+  /** b64url 12-byte ChaCha20-Poly1305 nonce. */
+  nonce: string;
+  /** b64url 32-byte ciphertext of the conversation key. */
+  ciphertext: string;
+  /** b64url 16-byte Poly1305 tag. */
+  tag: string;
+};
+
+/**
+ * Unwrap (decrypt) the agent-delivered conversation key K with this device's
+ * X25519 private key (the `cnf` key minted into the bootstrap JWT).
+ *
+ * ECDH(device.private, ephemeral.public) → HKDF-SHA256(KEY_WRAP_INFO) →
+ * ChaCha20-Poly1305 open. Poly1305 is verified before anything is returned;
+ * a wrong key or tampered payload throws and the caller MUST treat the
+ * session as failed (fail-closed).
+ */
+export async function unwrapConversationKey(
+  wrapped: WrappedConversationKey,
+  devicePrivateKey: CryptoKey,
+): Promise<Uint8Array> {
+  const rawSecret = await deriveX25519SharedSecret(
+    devicePrivateKey,
+    wrapped.ephemeralPublicKey,
+  );
+  const wrapKey = await hkdfSha256(rawSecret, null, KEY_WRAP_INFO, 32);
+  return chacha20poly1305Decrypt(
+    wrapKey,
+    base64urlDecode(wrapped.nonce),
+    base64urlDecode(wrapped.ciphertext),
+    base64urlDecode(wrapped.tag),
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Handshake frame codec
 // ---------------------------------------------------------------------------
 
@@ -147,7 +201,7 @@ export function parseKeyExchange(payload: string): string | null {
 // ---------------------------------------------------------------------------
 
 export type EnvelopeRouting = {
-  agentId: string;
+  accountId: string;
   tenant: string;
   sub: string;
   messageId: string;
@@ -157,7 +211,7 @@ export type EnvelopeRouting = {
 
 export type MessageEnvelope = {
   v: 1;
-  agentId: string;
+  accountId: string;
   tenant: string;
   sub: string;
   messageId: string;
@@ -167,14 +221,14 @@ export type MessageEnvelope = {
 };
 
 /**
- * Canonical AAD: UTF-8(JSON.stringify({tenant,agentId,sub,messageId,envelopeType,ts}))
+ * Canonical AAD: UTF-8(JSON.stringify({tenant,accountId,sub,messageId,envelopeType,ts}))
  * with fixed key order. Must match every other endpoint byte-for-byte.
  */
 export function canonicalAad(routing: EnvelopeRouting): Uint8Array {
   return new TextEncoder().encode(
     JSON.stringify({
       tenant: routing.tenant,
-      agentId: routing.agentId,
+      accountId: routing.accountId,
       sub: routing.sub,
       messageId: routing.messageId,
       envelopeType: routing.envelopeType,
@@ -209,7 +263,7 @@ export function encodeEnvelope(
 
 export function decodeEnvelope(env: MessageEnvelope, sessionKey: Uint8Array): string {
   const routing: EnvelopeRouting = {
-    agentId: env.agentId,
+    accountId: env.accountId,
     tenant: env.tenant,
     sub: env.sub,
     messageId: env.messageId,
@@ -232,13 +286,13 @@ export function decodeEnvelope(env: MessageEnvelope, sessionKey: Uint8Array): st
  * for `publish()`. `messageId`/`ts` are generated per call.
  */
 export function sealMessage(
-  routing: { agentId: string; tenant: string; sub: string },
+  routing: { accountId: string; tenant: string; sub: string },
   sessionKey: Uint8Array,
   message: unknown,
   envelopeType = "conversation",
 ): string {
   const fullRouting: EnvelopeRouting = {
-    agentId: routing.agentId,
+    accountId: routing.accountId,
     tenant: routing.tenant,
     sub: routing.sub,
     messageId: Array.from(randomBytes(8), (b) => b.toString(16).padStart(2, "0")).join(""),

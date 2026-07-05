@@ -1,6 +1,8 @@
 # WebChannel — 패키지화 / 배포 (PACKAGING)
 
 > 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 배포 구조·체크리스트 기준이며 명시된 날짜 시점 기준이다.
+>
+> ⚠️ **superseded — `hmac-ticket` 전략은 이후 완전히 제거됨.** 아래 `hmac-ticket`·`ticket.ts`·`smoke-client.mjs` 관련 서술은 스냅샷 당시의 역사 기록이며, 현행 인증은 `jwt`뿐이다 ([`AUTH.md`](AUTH.md) §4, [`BACKLOG.md`](BACKLOG.md)).
 
 > WebChannel을 **남들이 가져다 쓸 수 있는 수준**으로 배포하기 위한 패키지 구조와 작업 목록.
 > 상태(2026-06-15): 구조 **결정됨**. **완료** — auth seam, **헤드리스 `openclaw-webchannel-client`(framework-agnostic, zero-dep)** 구현, hmac-ticket E2E 검증(node smoke 스크립트).
@@ -84,7 +86,7 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 
 ### B. 플러그인 패키지 → publishable  ⬜ (대부분 미완)
 - ⬜ `"private"`/semver — 플러그인 `package.json`은 아직 `private:true`, `0.0.0`.
-- ⬜ 빌드: `openclaw.extensions`가 아직 `./index.ts`(TS 소스). 게이트웨이가 소스 직접 로드 중이라 동작하지만, 출시엔 `dist/` 빌드 + `files`.
+- ⬜ 빌드: `openclaw.extensions`가 아직 TS 소스. 게이트웨이가 소스 직접 로드 중이라 동작하지만, 출시엔 `dist/` 빌드 + `files`. **(superseded — entry는 이제 `./index-nats.ts`가 기본값이고 `./index.ts`(Gateway-WS)는 legacy dev-only; `STATUS.md` 참조.)**
 - ⬜ **`openclaw` peerDependency 선언**(여전히 미선언) + 테스트 버전(`v2026.6.6`).
 - ⬜ ESM `exports`/`.d.ts`.
 - ○ SDK 접점 adapter 격리.

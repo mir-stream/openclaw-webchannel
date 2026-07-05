@@ -1,11 +1,11 @@
 /**
  * NATS-subject token validator (defense-in-depth against subject injection).
  *
- * Live channel subjects are `webchannel.{tenant}.{agentId}.{peerId}.{in|out|handshake}`.
+ * Live channel subjects are `webchannel.{tenant}.{accountId}.{peerId}.{in|out|handshake}`.
  * A token containing a `.` (subject separator), `*`/`>` (NATS wildcards), or
  * whitespace/control chars would break the subject hierarchy and could cross
  * tenant boundaries. On the plugin side, `peerId` derives from the verified JWT
- * `sub`; tenant/agentId come from trusted operator config. We still validate the
+ * `sub`; tenant/accountId come from trusted operator config. We still validate the
  * untrusted `peerId` before it is spliced into a subject so a loose/compromised
  * issuer that puts a wildcard in `sub` cannot widen the agent's subscriptions.
  *
@@ -18,6 +18,15 @@
 
 /** Strict safe-token charset: alphanumeric plus `-` and `_`, capped at 128 chars. */
 const SAFE_SUBJECT_TOKEN = /^[A-Za-z0-9_-]{1,128}$/;
+
+/**
+ * Non-throwing predicate: `true` iff `token` is a single, safe NATS subject token
+ * (non-empty, no `.`/`*`/`>`/whitespace/control chars). Use at call sites that
+ * make a control-flow decision (e.g. drop vs publish) rather than fail hard.
+ */
+export function isValidSubjectToken(token: unknown): token is string {
+  return typeof token === "string" && SAFE_SUBJECT_TOKEN.test(token);
+}
 
 /**
  * Throw if `token` is unsafe to interpolate into a NATS subject / permission.

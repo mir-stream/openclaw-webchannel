@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 // Mock the acquisition routine so afterAccountConfigWritten is testable without
 // a real SaaS / device flow.
 const acquireMock = vi.fn(
-  async (_opts: { accountId?: string; saasBaseUrl: string; tenant: string; agentId?: string }) => ({
+  async (_opts: { accountId?: string; saasBaseUrl: string; tenant: string }) => ({
     creds: { userJwt: "JWT", userSeed: "SEED" },
     peerId: "p",
     jwksUrl: "j",
@@ -12,6 +12,16 @@ const acquireMock = vi.fn(
 );
 vi.mock("./acquire-credentials.js", () => ({
   acquireCredentials: (opts: never) => acquireMock(opts),
+}));
+
+// Mock the Gate A preflight so afterAccountConfigWritten is testable without a
+// real SaaS JWKS fetch / NATS relay dial. The real preflight is covered in
+// preflight.test.ts; here we only assert it is INVOKED post-enroll.
+const preflightMock = vi.fn(
+  async (_opts: unknown) => ({ ok: true, line: "channels add preflight: (stub)" }),
+);
+vi.mock("./preflight.js", () => ({
+  runAddPreflight: (opts: never) => preflightMock(opts),
 }));
 
 // Mock node:fs so the "creds already exist" probe is controllable.
@@ -30,6 +40,7 @@ function section(next: unknown): Record<string, unknown> {
 
 beforeEach(() => {
   acquireMock.mockClear();
+  preflightMock.mockClear();
   existsMock.mockReset();
   existsMock.mockReturnValue(false);
 });
@@ -40,26 +51,24 @@ describe("setup: resolveSetupIdentity", () => {
       resolveSetupIdentity({
         saasBaseUrl: "http://s",
         tenant: "t",
-        agentId: "a",
         baseUrl: "http://ignored",
         url: "ignored",
-        token: "ignored",
       }),
-    ).toEqual({ saasBaseUrl: "http://s", tenant: "t", agentId: "a" });
+    ).toEqual({ saasBaseUrl: "http://s", tenant: "t" });
   });
 
   it("falls back to generic flags when dedicated keys are absent", () => {
     expect(
-      resolveSetupIdentity({ baseUrl: "http://s", url: "tenant-x", token: "agent-y" }),
-    ).toEqual({ saasBaseUrl: "http://s", tenant: "tenant-x", agentId: "agent-y" });
+      resolveSetupIdentity({ baseUrl: "http://s", url: "tenant-x" }),
+    ).toEqual({ saasBaseUrl: "http://s", tenant: "tenant-x" });
   });
 });
 
 describe("setup: buildAccountPatch", () => {
   it("maps identity into the account config shape", () => {
     expect(
-      buildAccountPatch({ saasBaseUrl: "http://s", tenant: "t", agentId: "a" }),
-    ).toEqual({ tenant: "t", agentId: "a", saas: { baseUrl: "http://s" } });
+      buildAccountPatch({ saasBaseUrl: "http://s", tenant: "t" }),
+    ).toEqual({ tenant: "t", saas: { baseUrl: "http://s" } });
   });
 
   it("includes only defined fields", () => {
@@ -89,15 +98,109 @@ describe("setup: resolveAccountId (canonicalization / trust boundary)", () => {
 });
 
 describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
-  it("writes a NAMED account under accounts.<id>", () => {
+  it("writes a NAMED account under accounts.<id> (full block when saasBaseUrl present)", () => {
     const cfg = { channels: {} } as never;
     const next = webchannelSetup.applyAccountConfig({
       cfg,
       accountId: "accta",
-      input: { saasBaseUrl: "http://s", tenant: "t", agentId: "a" },
+      input: { saasBaseUrl: "http://s", tenant: "t" },
     });
+    // saasBaseUrl present ⇒ the complete enroll-ready block is written under the
+    // named account. Trust-anchor change 2: issuer/jwksUrl/audience are NOT
+    // written (no operator pins supplied) — they derive at runtime from
+    // {saas.baseUrl, accountId}. Only the anchor + strategy + admission/creds/
+    // dmSecurity are persisted.
     expect(section(next)).toEqual({
-      accounts: { accta: { tenant: "t", agentId: "a", saas: { baseUrl: "http://s" } } },
+      accounts: {
+        accta: {
+          tenant: "t",
+          saas: { baseUrl: "http://s" },
+          auth: { strategy: "jwt" },
+          dmSecurity: "open",
+          nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
+        },
+      },
+    });
+  });
+
+  it("writes only a PARTIAL block when saasBaseUrl is absent", () => {
+    const cfg = { channels: {} } as never;
+    const next = webchannelSetup.applyAccountConfig({
+      cfg,
+      accountId: "accta",
+      input: { tenant: "t" },
+    });
+    // No saasBaseUrl ⇒ partial write only (no auth/nats/dmSecurity emitted).
+    expect((section(next).accounts as Record<string, unknown>).accta).toEqual({
+      tenant: "t",
+    });
+  });
+
+  it("does NOT clobber a hand-tuned auth.jwt.issuer/audience on a full-block re-run", () => {
+    // Operator previously wrote a custom issuer/audience; a re-run that only
+    // updates identity (no explicit issuer/audience override) must preserve them.
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              auth: {
+                strategy: "jwt",
+                jwt: {
+                  jwksUrl: "http://s/.well-known/jwks.json",
+                  issuer: "http://custom-issuer",
+                  audience: "custom-aud",
+                },
+              },
+            },
+          },
+        },
+      },
+    } as never;
+    const next = webchannelSetup.applyAccountConfig({
+      cfg,
+      accountId: "accta",
+      input: { saasBaseUrl: "http://s", tenant: "t2" },
+    });
+    const accta = (section(next).accounts as Record<string, unknown>).accta as Record<
+      string,
+      unknown
+    >;
+    expect(accta.auth).toEqual({
+      strategy: "jwt",
+      jwt: {
+        jwksUrl: "http://s/.well-known/jwks.json",
+        issuer: "http://custom-issuer",
+        audience: "custom-aud",
+      },
+    });
+    expect(accta.tenant).toBe("t2");
+  });
+
+  it("lets an explicit issuer/audience override win on a full-block write", () => {
+    const cfg = { channels: {} } as never;
+    const next = webchannelSetup.applyAccountConfig({
+      cfg,
+      accountId: "accta",
+      input: {
+        saasBaseUrl: "http://host.docker.internal:3951",
+        tenant: "t",
+        issuer: "http://127.0.0.1:3951",
+        audience: "custom-aud",
+      },
+    });
+    const accta = (section(next).accounts as Record<string, unknown>).accta as Record<
+      string,
+      unknown
+    >;
+    // Explicit issuer/audience are operator PINS and ARE written; jwksUrl is
+    // never written by the builder anymore (it derives at runtime).
+    expect(accta.auth).toEqual({
+      strategy: "jwt",
+      jwt: {
+        issuer: "http://127.0.0.1:3951",
+        audience: "custom-aud",
+      },
     });
   });
 
@@ -141,13 +244,13 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     const next = webchannelSetup.applyAccountConfig({
       cfg,
       accountId: "acctb",
-      input: { tenant: "tB", agentId: "aB" },
+      input: { tenant: "tB" },
     });
     const s = section(next);
     expect(s.auth).toEqual({ strategy: "jwt" });
     expect(s.accounts).toEqual({
       default: { allowFrom: ["x"] },
-      acctb: { tenant: "tB", agentId: "aB" },
+      acctb: { tenant: "tB" },
     });
   });
 
@@ -205,7 +308,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       previousCfg: cfg,
       cfg,
       accountId: "accta",
-      input: { saasBaseUrl: "http://s", tenant: "tA", agentId: "aA" },
+      input: { saasBaseUrl: "http://s", tenant: "tA" },
       runtime,
     });
     expect(acquireMock).toHaveBeenCalledOnce();
@@ -213,7 +316,14 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       accountId: "accta",
       saasBaseUrl: "http://s",
       tenant: "tA",
-      agentId: "aA",
+    });
+    // Gate A preflight runs POST-enroll with the derived anchor + enrolled creds.
+    expect(preflightMock).toHaveBeenCalledOnce();
+    expect(preflightMock.mock.calls[0][0]).toMatchObject({
+      accountId: "accta",
+      saasBaseUrl: "http://s",
+      tenant: "tA",
+      enrollment: { userJwt: "JWT", userSeed: "SEED" },
     });
   });
 
@@ -225,8 +335,9 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       previousCfg: cfg,
       cfg,
       accountId: "accta",
-      // Generic-flag mapping: --base-url/--url/--token.
-      input: { baseUrl: "http://s", url: "tenant-x", token: "agent-y" },
+      // Generic-flag mapping: --base-url/--url. The wire identity is the account
+      // id itself (가-2) — there is no --token → agentId mapping anymore.
+      input: { baseUrl: "http://s", url: "tenant-x" },
       runtime,
     });
     const echoed = runtime.log.mock.calls.find((c) =>
@@ -234,7 +345,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     );
     expect(echoed).toBeDefined();
     expect(String(echoed![0])).toContain("tenant=tenant-x");
-    expect(String(echoed![0])).toContain("agentId=agent-y");
+    expect(String(echoed![0])).toContain("accountId=accta");
     expect(String(echoed![0])).toContain("saasBaseUrl=http://s");
   });
 
