@@ -44,6 +44,7 @@ import {
 } from "./src/nats-credential-source.js";
 import { consumeCredentialSource } from "./src/consume-credentials.js";
 import { planAccounts } from "./src/multiplex.js";
+import { loadPersistedEnrolledCreds } from "./src/account-config.js";
 
 // ---------------------------------------------------------------------------
 // Global state — multi-account multiplex (가-1 Cycle 2)
@@ -115,11 +116,17 @@ const runDetachedHistoryRead = <T>(fn: () => Promise<T>): Promise<T> =>
  * Trust-anchor derivation (design §4 change 1): fill the ABSENT JWT-verify params
  * from `{saas.baseUrl, accountId}` — CONFIG-PRESENT-WINS. These are trust FACTS,
  * not settings, and cannot legitimately mismatch:
- *   - issuer  = saas.baseUrl (the SaaS identifies itself by the URL it is reached at)
+ *   - issuer  = SaaS-DELIVERED (EnrollmentResult.issuer, persisted with the
+ *               enrolled creds) when present, else saas.baseUrl (back-compat
+ *               derivation for pre-issuer enrollments / non-enrolled accounts)
  *   - audience = accountId    (bootstrap JWTs are minted with `aud == accountId`)
  *   - jwksUrl  = saas.baseUrl + /.well-known/jwks.json
  * An explicitly-configured value is an operator PIN (proxy / custom-domain /
  * logical-issuer) and ALWAYS wins — we only fill fields that are absent.
+ * Issuer precedence: pin > delivered > derived. The delivered value is used
+ * VERBATIM (verifyJwt compares slash-insensitively) — the SaaS declared the
+ * exact `iss` it mints at enroll time; re-deriving it here from the base URL is
+ * exactly the configuration-by-coincidence this field exists to kill.
  *
  * Returns a NEW object (never mutates the caller's config). Non-jwt (or absent)
  * auth is returned unchanged.
@@ -135,6 +142,7 @@ function deriveAccountAuth(
   raw: AuthConfig | undefined,
   saasBaseUrl: string | undefined,
   accountId: string,
+  deliveredIssuer?: string,
 ): AuthConfig | undefined {
   if (!raw || raw.strategy !== "jwt" || !saasBaseUrl) return raw;
   // Runtime view: a pointer-style account legitimately OMITS these fields (the
@@ -153,11 +161,12 @@ function deriveAccountAuth(
     ...raw,
     jwt: {
       ...jwt,
-      // Derive issuer via the shared canonical helper (trailing-slash stripped),
-      // matching the jwksUrl derivation — otherwise an operator's trailing-slash
-      // --base-url would pin a non-canonical issuer that mismatches the SaaS's
-      // minted `iss` and rejects every bootstrap JWT (silent issuer-mismatch).
-      issuer: jwt.issuer ?? deriveIssuer(saasBaseUrl),
+      // pin > delivered > derived. The derivation goes via the shared canonical
+      // helper (trailing-slash stripped), matching the jwksUrl derivation —
+      // otherwise an operator's trailing-slash --base-url would pin a
+      // non-canonical issuer that mismatches the SaaS's minted `iss` and
+      // rejects every bootstrap JWT (silent issuer-mismatch).
+      issuer: jwt.issuer ?? deliveredIssuer ?? deriveIssuer(saasBaseUrl),
       audience: jwt.audience ?? accountId,
       ...(hasKeySource ? {} : { jwksUrl: deriveJwksUrl(saasBaseUrl) }),
     },
@@ -308,6 +317,12 @@ export default defineChannelPluginEntry({
         // top-level `saas.baseUrl`.
         plan.saasBaseUrl ?? api.config.saas?.baseUrl,
         accountId,
+        // SaaS-delivered issuer, persisted with the enrolled creds at
+        // `channels add` time (EnrollmentResult.issuer). Same loader the
+        // consume step uses later — ONE reader, so the two paths can't drift.
+        // Returns undefined for non-enrolled accounts / pre-issuer creds →
+        // the derivation fallback applies.
+        loadPersistedEnrolledCreds(accountId)?.issuer,
       );
       const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;

@@ -52,6 +52,12 @@ ECHO_PORT="${ECHO_PORT:-18905}"
 FLEET=("agent-dev:${DEV_PORT:-19299}" "agent-ops:${OPS_PORT:-19399}")
 
 TENANT=demo-tenant
+# DELIBERATELY fake (≠ SaaS base URL): with SaaS-delivered issuer
+# (EnrollmentResult.issuer) the agents learn this value at enrollment — no
+# `auth.jwt.issuer` config anywhere. Keeping the fake makes every demo boot a
+# LIVE regression test of the delivered-issuer path: if delivery breaks, the
+# plugin falls back to deriving issuer=baseUrl, mismatches this, and every
+# register is rejected. Do NOT "fix" this to match SAAS_URL.
 SAAS_ISSUER="https://saas.local/demo-issuer"
 SAAS_URL="http://127.0.0.1:$SAAS_PORT"
 # Seeded demo user uuids (peer ids) = the exec-approval approvers.
@@ -273,7 +279,6 @@ boot_agent() {
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
             "jwksUrl": "$SAAS_URL/.well-known/jwks.json",
-            "issuer": "$SAAS_ISSUER",
             "audience": "$acct"
           } },
           "dmSecurity": "allowlist",

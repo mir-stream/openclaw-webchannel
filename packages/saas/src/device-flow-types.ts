@@ -241,6 +241,20 @@ export type EnrollmentResult = {
    * `nats.url` / `WEBCHANNEL_NATS_URL` (those remain dev-only overrides).
    */
   natsUrl: string;
+
+  /**
+   * The exact `iss` value this SaaS puts in the bootstrap JWTs it mints.
+   *
+   * Same rendezvous-authority principle as `natsUrl`: the issuer is a trust
+   * fact MINTED by the SaaS (it may legitimately differ from the base URL
+   * behind a reverse proxy / custom domain / logical issuer), so the SaaS
+   * DECLARES it at enrollment instead of the plugin deriving it from the
+   * base URL and hoping the two independent computations agree. The plugin
+   * verifies bootstrap JWTs against THIS value (unless the operator pins
+   * `auth.jwt.issuer` explicitly — pin > delivered > derived). Delivered and
+   * consumed VERBATIM — never canonicalized on either side.
+   */
+  issuer: string;
 };
 
 /**

@@ -316,7 +316,12 @@ export function evaluateAddPreflight(facts: AddPreflightFacts): AddPreflightRepo
 
   return {
     ok: true,
-    line: `${prefix}: issuer/aud ✓ · JWKS ${facts.jwks.keyCount} keys ✓ · relay dial ✓`,
+    // Surface the EFFECTIVE issuer on the PASS line too (not only on FAIL):
+    // with pin > delivered > derived precedence, the operator should see WHICH
+    // issuer won while still watching the add.
+    line:
+      `${prefix}: issuer/aud ✓ (issuer=${facts.effectiveIssuer}) · ` +
+      `JWKS ${facts.jwks.keyCount} keys ✓ · relay dial ✓`,
   };
 }
 
@@ -328,6 +333,14 @@ export type AddPreflightEnrollment = {
   natsUrl?: string;
   /** SaaS-advertised JWKS url (enrollment.jwksUrl). */
   jwksUrl?: string;
+  /**
+   * SaaS-delivered bootstrap-JWT issuer (enrollment.issuer). Absent for a
+   * pre-issuer SaaS. Preflight MUST honor the same precedence the runtime
+   * (`deriveAccountAuth`) applies — pin > delivered > derived — or Gate A
+   * would report FAIL on a working proxy/custom-issuer setup (and PASS on a
+   * broken one).
+   */
+  issuer?: string;
 };
 
 export type RunAddPreflightOptions = {
@@ -373,9 +386,31 @@ export async function runAddPreflight(
   opts: RunAddPreflightOptions,
 ): Promise<AddPreflightReport> {
   const timeoutMs = opts.timeoutMs ?? 5000;
-  const effectiveIssuer = opts.pinnedIssuer ?? deriveIssuer(opts.saasBaseUrl);
+  // Issuer precedence MUST match the runtime's `deriveAccountAuth`:
+  // pin > SaaS-delivered (enrollment.issuer) > derived from --base-url.
+  const effectiveIssuer =
+    opts.pinnedIssuer ?? opts.enrollment.issuer ?? deriveIssuer(opts.saasBaseUrl);
   const effectiveAudience = opts.pinnedAudience ?? opts.accountId;
   const derivedJwksUrl = deriveJwksUrl(opts.saasBaseUrl);
+
+  // An operator pin that CONTRADICTS what the SaaS just declared it mints is
+  // exactly the misconfig the delivered issuer exists to kill — warn loudly
+  // while the operator is still watching. Slash-insensitive, matching how
+  // verifyJwt compares `iss` (a slash variant is NOT a contradiction). A pin
+  // is legitimate (proxy / logical issuer), so this is a WARN, never a FAIL.
+  if (
+    opts.pinnedIssuer !== undefined &&
+    opts.enrollment.issuer !== undefined &&
+    deriveIssuer(opts.pinnedIssuer) !== deriveIssuer(opts.enrollment.issuer)
+  ) {
+    opts.log(
+      `[webchannel] account "${opts.accountId}" WARN: auth.jwt.issuer is pinned to ` +
+        `"${opts.pinnedIssuer}" but the SaaS declared it mints iss="${opts.enrollment.issuer}" ` +
+        `at enrollment. The pin wins (operator escape hatch) — but if it is stale, every ` +
+        `bootstrap JWT will be rejected with an opaque "unauthorized". Remove the pin to ` +
+        `use the SaaS-delivered issuer.`,
+    );
+  }
 
   // 1. Resolve JWKS against the DERIVED url (reuse the JWKSCache fetch path).
   let jwks: JwksReadiness;

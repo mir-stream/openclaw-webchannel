@@ -72,16 +72,19 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const PORT = parseInt(process.env.PORT || "3961", 10);
 const SAAS_BASE_URL = process.env.SAAS_BASE_URL || `http://127.0.0.1:${PORT}`;
-// TRUST-ANCHOR INVARIANT (design §4 change 3): the bootstrap-JWT issuer DEFAULTS
-// to the SaaS base URL. The plugin now DERIVES `auth.jwt.issuer` from the anchor
-// as `issuer == saas.baseUrl` (deriveAccountAuth), so a boot that leaves
-// SAAS_ISSUER unset yields an issuer that matches the derivation with zero
-// openclaw.json edits — this is the code default precisely so no boot can
-// reintroduce the old fake-issuer mismatch. An explicit SAAS_ISSUER override is
-// still honored (proxy / custom-domain), but if it differs from SAAS_BASE_URL the
-// agent MUST pin the SAME value in `auth.jwt.issuer` (config-present-wins) or JWT
-// verify will fail — which is exactly what demo/run.sh does for the fake docker
-// issuer.
+// THE bootstrap-JWT issuer — the demo's single source of truth for `iss`.
+// Defaults to the SaaS base URL; an explicit SAAS_ISSUER override (proxy /
+// custom-domain / logical issuer) is honored. This ONE variable feeds BOTH
+// consumers so mint and enrollment can never disagree:
+//   1. every `buildBootstrapClaims({ iss: SAAS_ISSUER, ... })` mint below, and
+//   2. `DeviceFlowEnrollment({ issuer: SAAS_ISSUER, ... })` — DELIVERED to the
+//      agent in the EnrollmentResult, so the plugin verifies against the exact
+//      string this server mints (precedence: operator pin > delivered >
+//      derived-from-baseUrl). Agents no longer need `auth.jwt.issuer` config
+//      even when SAAS_ISSUER is a fake/logical issuer ≠ base URL; attaching an
+//      externally-configured openclaw "just works" after enrollment.
+// NOTE: run.sh deliberately keeps a fake SAAS_ISSUER — with delivery in place
+// that is a LIVE regression test of the delivered-issuer path on every boot.
 const SAAS_ISSUER = process.env.SAAS_ISSUER || SAAS_BASE_URL;
 const NATS_URL = process.env.NATS_URL || "ws://127.0.0.1:18722";
 const NATS_CONFIG_OUT = process.env.NATS_CONFIG_OUT || "";
@@ -268,6 +271,9 @@ const enrollment = new DeviceFlowEnrollment({
   jwksUrl: `${SAAS_BASE_URL}/.well-known/jwks.json`,
   bootstrapUrl: `${SAAS_BASE_URL}/bootstrap`,
   natsUrl: NATS_URL,
+  // CONTRACT (DeviceFlowOptions.issuer): must equal the `iss` this server
+  // mints — both read the single SAAS_ISSUER variable, see its comment above.
+  issuer: SAAS_ISSUER,
   expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 2),
   store: enrollmentStore,

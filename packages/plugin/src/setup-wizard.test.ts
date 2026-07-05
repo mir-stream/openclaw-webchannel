@@ -210,7 +210,14 @@ describe("setup-wizard: per-field funnel safety", () => {
     expect((written.auth as { jwt: { audience: string } }).jwt.audience).toBe("accta");
   });
 
-  it("finalize honors an explicit issuer PIN collected from the advanced prompt", () => {
+  it("finalize NEVER writes an issuer pin — even if a stray issuer value is collected", () => {
+    // The issuer prompt was REMOVED (the issuer is SaaS-delivered at
+    // enrollment; an add-time prefill-pin would permanently shadow it).
+    // finalize must not thread a credentialValues issuer through even if one
+    // is present (e.g. a stale harness), and the wizard must not prompt for it.
+    expect(
+      webchannelSetupWizard.textInputs?.some((input) => input.inputKey === ("issuer" as never)),
+    ).toBe(false);
     const cfg = { channels: { webchannel: { accounts: {} } } } as never;
     const finalized = webchannelSetupWizard.finalize?.({
       cfg,
@@ -221,12 +228,32 @@ describe("setup-wizard: per-field funnel safety", () => {
         issuer: "https://custom-domain.example",
       },
     } as never) as { cfg: unknown };
-    // The advanced issuer prompt is an operator pin: when collected it flows
-    // through to auth.jwt.issuer (jwksUrl still derives at runtime, so it is
-    // absent here).
+    const jwt = (account(finalized.cfg, "accta").auth as { jwt?: Record<string, unknown> }).jwt;
+    expect(jwt?.issuer).toBeUndefined();
+  });
+
+  it("finalize preserves an EXISTING issuer pin across a wizard re-run (no clobber)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "t",
+              saas: { baseUrl: "https://saas.example.com" },
+              auth: { strategy: "jwt", jwt: { issuer: "https://logical-issuer.example" } },
+            },
+          },
+        },
+      },
+    } as never;
+    const finalized = webchannelSetupWizard.finalize?.({
+      cfg,
+      accountId: "accta",
+      credentialValues: { tenant: "t", saasBaseUrl: "https://saas.example.com" },
+    } as never) as { cfg: unknown };
+    // The operator's hand-set pin survives the full-block rewrite.
     const jwt = (account(finalized.cfg, "accta").auth as { jwt: Record<string, unknown> }).jwt;
-    expect(jwt.issuer).toBe("https://custom-domain.example");
-    expect(jwt.jwksUrl).toBeUndefined();
+    expect(jwt.issuer).toBe("https://logical-issuer.example");
   });
 });
 

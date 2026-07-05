@@ -130,7 +130,11 @@ describe("evaluateAddPreflight (Gate A, pure)", () => {
       relay: { ok: true },
     });
     expect(r.ok).toBe(true);
-    expect(r.line).toBe("channels add preflight: issuer/aud ✓ · JWKS 3 keys ✓ · relay dial ✓");
+    // The PASS line surfaces the EFFECTIVE issuer (pin > delivered > derived)
+    // so the operator sees which one won while still watching the add.
+    expect(r.line).toBe(
+      "channels add preflight: issuer/aud ✓ (issuer=https://saas.example) · JWKS 3 keys ✓ · relay dial ✓",
+    );
   });
 
   it("pinned audience != accountId → FAIL naming the mismatch", () => {
@@ -245,5 +249,79 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
     });
     expect(report.ok).toBe(false);
     expect(log.mock.calls.some((c) => String(c[0]).includes("no SaaS-delivered relay URL"))).toBe(true);
+  });
+
+  it("uses the SaaS-DELIVERED issuer over the derivation (pin > delivered > derived)", async () => {
+    // Matches the runtime's deriveAccountAuth precedence: a delivered issuer
+    // (EnrollmentResult.issuer) beats issuer=saasBaseUrl derivation, so Gate A
+    // reports the issuer the runtime will actually verify against.
+    const log = vi.fn();
+    const report = await runAddPreflight({
+      accountId: "acme",
+      tenant: "t",
+      saasBaseUrl: "https://saas.example",
+      enrollment: {
+        userJwt: "J",
+        userSeed: "S",
+        natsUrl: "wss://relay.example",
+        jwksUrl: deriveJwksUrl("https://saas.example"),
+        issuer: "https://saas.local/logical-issuer",
+      },
+      log,
+      fetchImpl: okFetch,
+      dial: async () => ({ ok: true }) as const,
+    });
+    expect(report.ok).toBe(true);
+    expect(log.mock.calls.some((c) => String(c[0]).includes("issuer=https://saas.local/logical-issuer"))).toBe(
+      true,
+    );
+    // No pin present ⇒ no pin-vs-delivered contradiction warning.
+    expect(log.mock.calls.some((c) => String(c[0]).includes("WARN: auth.jwt.issuer"))).toBe(false);
+  });
+
+  it("WARNs when an operator pin contradicts the SaaS-delivered issuer (pin still wins)", async () => {
+    const log = vi.fn();
+    const report = await runAddPreflight({
+      accountId: "acme",
+      tenant: "t",
+      saasBaseUrl: "https://saas.example",
+      enrollment: {
+        userJwt: "J",
+        userSeed: "S",
+        natsUrl: "wss://relay.example",
+        jwksUrl: deriveJwksUrl("https://saas.example"),
+        issuer: "https://saas.local/real-issuer",
+      },
+      pinnedIssuer: "https://stale-pin.example",
+      log,
+      fetchImpl: okFetch,
+      dial: async () => ({ ok: true }) as const,
+    });
+    expect(log.mock.calls.some((c) => String(c[0]).includes('WARN: auth.jwt.issuer is pinned to'))).toBe(true);
+    // Pin wins in the report line (operator escape hatch).
+    expect(log.mock.calls.some((c) => String(c[0]).includes("issuer=https://stale-pin.example"))).toBe(true);
+    expect(report).toBeDefined();
+  });
+
+  it("does NOT warn when pin and delivered issuer differ only by trailing slash", async () => {
+    // verifyJwt compares iss slash-insensitively, so a slash variant is not a
+    // contradiction — warning on it would train operators to ignore the warning.
+    const log = vi.fn();
+    await runAddPreflight({
+      accountId: "acme",
+      tenant: "t",
+      saasBaseUrl: "https://saas.example",
+      enrollment: {
+        userJwt: "J",
+        userSeed: "S",
+        natsUrl: "wss://relay.example",
+        issuer: "https://saas.example/",
+      },
+      pinnedIssuer: "https://saas.example",
+      log,
+      fetchImpl: okFetch,
+      dial: async () => ({ ok: true }) as const,
+    });
+    expect(log.mock.calls.some((c) => String(c[0]).includes("WARN: auth.jwt.issuer"))).toBe(false);
   });
 });

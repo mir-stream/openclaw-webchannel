@@ -307,11 +307,36 @@ export type DeviceFlowOptions = {
   natsUrl: string;
 
   /**
+   * The exact `iss` this SaaS puts in the bootstrap JWTs it mints, delivered
+   * to the plugin in the `EnrollmentResult` (same rendezvous-authority
+   * principle as `natsUrl`). Defaults to the trailing-slash-stripped
+   * `saasBaseUrl` — which matches the plugin's derivation, so a SaaS whose
+   * minted `iss` is its base URL needs no config here.
+   *
+   * CONTRACT: this MUST equal the `iss` you pass to `buildBootstrapClaims`.
+   * The library cannot enforce that (minting is a separate per-call
+   * parameter), so derive BOTH from one variable in your server — otherwise
+   * enrollment delivers a promise the mint breaks, and every agent rejects
+   * every bootstrap JWT with an opaque `unauthorized`.
+   */
+  issuer?: string;
+
+  /**
    * Enrollment store (defaults to in-memory).
    * Use a persistent store (Redis, DB) for production deployments.
    */
   store?: EnrollmentStore;
 };
+
+/**
+ * The delivered-issuer default: trailing-slash-stripped base URL. MUST mirror
+ * the plugin's `deriveIssuer` (packages/plugin/src/preflight.ts) so the
+ * default-configured SaaS delivers exactly what a default-configured plugin
+ * would have derived.
+ */
+function defaultIssuer(saasBaseUrl: string): string {
+  return saasBaseUrl.replace(/\/+$/, "");
+}
 
 // ---------------------------------------------------------------------------
 // Core enrollment service
@@ -336,6 +361,11 @@ export class DeviceFlowEnrollment {
       expirationSeconds: DEFAULT_EXPIRATION_SECONDS,
       pollIntervalSeconds: MIN_POLL_INTERVAL_SECONDS,
       ...options,
+      // After the spread so an absent (or explicitly-undefined) `issuer` gets
+      // the derivation, keeping the `Required<>` cast honest. An explicit
+      // issuer is kept VERBATIM (no canonicalization — the SaaS declares the
+      // exact string it mints).
+      issuer: options.issuer ?? defaultIssuer(options.saasBaseUrl),
     };
     this.store = options.store ?? new MemoryEnrollmentStore();
   }
@@ -422,6 +452,7 @@ export class DeviceFlowEnrollment {
         jwksUrl: this.options.jwksUrl,
         bootstrapUrl: this.options.bootstrapUrl,
         natsUrl: this.options.natsUrl,
+        issuer: this.options.issuer,
       };
     }
 
@@ -477,6 +508,7 @@ export class DeviceFlowEnrollment {
         jwksUrl: this.options.jwksUrl,
         bootstrapUrl: this.options.bootstrapUrl,
         natsUrl: this.options.natsUrl,
+        issuer: this.options.issuer,
       };
     }
 
@@ -498,6 +530,7 @@ export class DeviceFlowEnrollment {
       jwksUrl: this.options.jwksUrl,
       bootstrapUrl: this.options.bootstrapUrl,
       natsUrl: this.options.natsUrl,
+      issuer: this.options.issuer,
     };
   }
 

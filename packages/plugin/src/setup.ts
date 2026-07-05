@@ -445,6 +445,7 @@ export const webchannelSetup = {
           userSeed: enrollment.creds.userSeed,
           ...(enrollment.natsUrl !== undefined ? { natsUrl: enrollment.natsUrl } : {}),
           ...(enrollment.jwksUrl !== undefined ? { jwksUrl: enrollment.jwksUrl } : {}),
+          ...(enrollment.issuer !== undefined ? { issuer: enrollment.issuer } : {}),
         },
         // Config-present-wins: an operator PIN overrides the derivation.
         ...(existingJwt?.issuer !== undefined ? { pinnedIssuer: existingJwt.issuer } : {}),
