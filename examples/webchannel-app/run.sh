@@ -14,17 +14,30 @@ REPO="$(cd "$HERE/../.." && pwd)"
 
 PORT="${PORT:-4000}"
 NATS_WS="${NATS_WS:-18790}"
+RELAY="${RELAY:-self-contained}"
 
 echo "[app] building @mir-stream/webchannel-saas + -client (dist is gitignored — always rebuild)…"
 ( cd "$REPO" && npm run build -w packages/saas -w packages/client )
 
-command -v nats-server >/dev/null 2>&1 || {
-  echo "[app] nats-server not found on PATH — install it (brew install nats-server) and retry." >&2
-  exit 1
-}
-
 echo ""
-echo "[app] starting SaaS backend on http://127.0.0.1:$PORT (it boots nats-server on ws://127.0.0.1:$NATS_WS)…"
+if [ "$RELAY" = "synadia" ]; then
+  # External NGS relay: no local nats-server, so it need not be on PATH. The three
+  # NATS_* vars are REQUIRED — index.ts throws a clear error if any are missing.
+  echo "[app] relay mode: synadia (Synadia Cloud / NGS — no local nats-server booted)."
+  echo "[app] browser + agent both connect OUTBOUND to \$NATS_URL; nothing listens for inbound."
+  echo "[app] requires: RELAY=synadia NATS_URL=… NATS_ACCOUNT_ID=A… NATS_ACCOUNT_SIGNING_SEED=SA…"
+  echo "[app]   NATS_URL=${NATS_URL:-<unset!>}  NATS_ACCOUNT_ID=${NATS_ACCOUNT_ID:-<unset!>}  (signing seed is SECRET, not echoed)"
+  echo "[app] starting SaaS backend on http://127.0.0.1:$PORT…"
+else
+  command -v nats-server >/dev/null 2>&1 || {
+    echo "[app] nats-server not found on PATH — install it (brew install nats-server) and retry." >&2
+    echo "[app] (or run against Synadia/NGS instead: RELAY=synadia NATS_URL=… NATS_ACCOUNT_ID=… NATS_ACCOUNT_SIGNING_SEED=… ./run.sh)" >&2
+    exit 1
+  }
+  echo "[app] relay mode: self-contained (boots a local nats-server on ws://127.0.0.1:$NATS_WS)."
+  echo "[app]   external NGS instead: RELAY=synadia NATS_URL=… NATS_ACCOUNT_ID=… NATS_ACCOUNT_SIGNING_SEED=… ./run.sh"
+  echo "[app] starting SaaS backend on http://127.0.0.1:$PORT (it boots nats-server on ws://127.0.0.1:$NATS_WS)…"
+fi
 echo "[app] open http://127.0.0.1:$PORT and log in as alice / password."
 echo ""
 echo "──────────────────────────────────────────────────────────────────────────"

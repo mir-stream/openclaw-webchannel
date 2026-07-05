@@ -40,6 +40,41 @@ attacker-chosen account / victim peer.
 
 Requires `node >= 22` and `nats-server` on PATH.
 
+## Relay modes
+
+The relay is chosen by the `RELAY` env var. Both modes are **zero-inbound**: the
+browser and the openclaw agent each connect **outbound** to the relay; nothing in
+this app or the agent listens for an inbound connection.
+
+- **`self-contained`** (default — unset `RELAY`, or `RELAY=self-contained`): the
+  app boots a **local `nats-server`** (`server/nats.ts`) and mints creds signed by
+  the trust chain's own account. Zero setup; requires `nats-server` on PATH. This
+  is the mode `./run.sh` and the smoke test use.
+
+- **`RELAY=synadia`**: the relay is **Synadia Cloud / NGS** — a managed
+  `nats-server`. No local `nats-server` is booted; the SaaS mints creds signed by
+  a managed-account **signing key**, and the browser + agent both connect outbound
+  to the NGS wss URL. Requires three env vars (the server throws a clear startup
+  error naming any that are missing):
+
+  | Var | Meaning |
+  |-----|---------|
+  | `NATS_URL` | the NGS relay wss URL, e.g. `wss://connect.ngs.global` (delivered to browser + agent with the minted creds) |
+  | `NATS_ACCOUNT_ID` | the managed NGS account identity public key (`A…`) |
+  | `NATS_ACCOUNT_SIGNING_SEED` | the account signing-key seed (`SA…`) — **SECRET**, never logged (only a short prefix appears in the boot line) and never persisted to the trust-chain file |
+
+  ```bash
+  RELAY=synadia \
+    NATS_URL=wss://connect.ngs.global \
+    NATS_ACCOUNT_ID=A... \
+    NATS_ACCOUNT_SIGNING_SEED=SA... \
+    ./run.sh
+  ```
+
+  In synadia mode the boot line reads
+  `[app] relay mode: synadia (account A1b2…) → wss://…`; in self-contained it reads
+  `[app] relay mode: self-contained (local nats-server ws://…)`.
+
 ## The no-agent end state
 
 This app deliberately does **not** boot openclaw — attaching an agent is *your*

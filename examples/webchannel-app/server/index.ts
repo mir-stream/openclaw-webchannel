@@ -35,10 +35,11 @@ import {
   DeviceFlowEnrollment,
   type EnrollmentRequest,
   type PollRequest,
+  type SetupTrustChainResult,
 } from "@mir-stream/webchannel-saas";
 import esbuild from "esbuild";
 
-import { bootNatsServer } from "./nats.js";
+import { bootNatsServer, type NatsHandle } from "./nats.js";
 import { login, canAccess, newSessionToken, type AppUser } from "./users.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -48,6 +49,12 @@ const WEB_DIR = join(__dirname, "..", "web");
 // Config (env-overridable, sensible local defaults).
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.PORT || "4000", 10);
+// Relay mode. Unset or "self-contained" (DEFAULT) → boot a LOCAL nats-server and
+// mint creds signed by the trust chain's own account (zero-setup). "synadia" →
+// the relay is Synadia Cloud / NGS: NO local nats-server is booted, and creds are
+// signed by an operator-supplied managed-account SIGNING key. In BOTH modes the
+// browser and the openclaw agent connect OUTBOUND to the relay (zero-inbound).
+const RELAY = (process.env.RELAY || "self-contained").toLowerCase();
 const NATS_WS = parseInt(process.env.NATS_WS || "18790", 10);
 const NATS_TCP = parseInt(process.env.NATS_TCP || "14790", 10);
 const TENANT = process.env.APP_TENANT || "app-tenant";
@@ -69,23 +76,74 @@ const ADMIN_TOKEN_GENERATED = !process.env.ADMIN_TOKEN;
 
 // ---------------------------------------------------------------------------
 // 1. Trust chain (persistent) + NATS relay + bootstrap issuer + enrollment.
+//
+// Two relay modes, gated on RELAY:
+//   self-contained (default) → build a local account, boot a local nats-server
+//     (server/nats.ts), and mint browser/agent creds signed by that account.
+//   synadia → the relay is an externally-managed NGS account. loadOrCreateTrustChain
+//     is called with `externalNatsAccount` so trustChain.natsConfig.mode ===
+//     "external" (no operator/account/resolver to write, NO local nats-server to
+//     boot); NATS_URL is the env NGS wss; creds carry the managed accountId as
+//     `issuerAccountId` / `natsIssuerAccountId`.
 // ---------------------------------------------------------------------------
-const trustChain = await loadOrCreateTrustChain(TRUST_CHAIN_PATH, {
-  operatorName: "example-operator",
-  accountName: "example-account",
-});
-const privateChain = trustChain.private;
-const natsConfig = trustChain.natsConfig; // NatsSelfContainedAccountConfig
+type RelaySetup = {
+  trustChain: SetupTrustChainResult;
+  natsUrl: string;
+  /** Child nats-server handle — self-contained only; null in synadia mode. */
+  natsHandle: NatsHandle | null;
+  /** Managed account identity (A…) — external mode only; undefined otherwise. */
+  natsIssuerAccountId: string | undefined;
+};
 
-const nats = bootNatsServer({
-  natsConfig,
-  configDir: CONFIG_DIR,
-  wsPort: NATS_WS,
-  tcpPort: NATS_TCP,
-});
-const NATS_URL = nats.natsUrl;
-await nats.ready;
-console.log(`[app] nats-server ready → ${NATS_URL}`);
+async function setupRelay(): Promise<RelaySetup> {
+  if (RELAY === "synadia") {
+    // External NGS mode: browser + agent both connect OUTBOUND to the managed
+    // relay; the SaaS mints creds signed by the account SIGNING key. All three
+    // vars are REQUIRED — fail fast, naming exactly what is missing.
+    const missing = ["NATS_URL", "NATS_ACCOUNT_ID", "NATS_ACCOUNT_SIGNING_SEED"].filter(
+      (n) => !process.env[n],
+    );
+    if (missing.length > 0) {
+      throw new Error(
+        `RELAY=synadia requires ${missing.join(", ")} to be set ` +
+          `(NATS_URL = NGS wss URL, NATS_ACCOUNT_ID = managed account A…, ` +
+          `NATS_ACCOUNT_SIGNING_SEED = account signing seed SA… [SECRET]).`,
+      );
+    }
+    const natsUrl = process.env.NATS_URL as string;
+    const accountId = process.env.NATS_ACCOUNT_ID as string;
+    const signingSeed = process.env.NATS_ACCOUNT_SIGNING_SEED as string;
+    const trustChain = await loadOrCreateTrustChain(TRUST_CHAIN_PATH, {
+      operatorName: "example-operator",
+      accountName: "example-account",
+      // The signing seed is SECRET — never persisted, never logged in full.
+      externalNatsAccount: { signingSeed, accountId },
+    });
+    // No local nats-server: the managed NGS relay runs its own server.
+    console.log(`[app] relay mode: synadia (account ${accountId.slice(0, 6)}…) → ${natsUrl}`);
+    return { trustChain, natsUrl, natsHandle: null, natsIssuerAccountId: accountId };
+  }
+
+  // self-contained (default): local account + local nats-server.
+  const trustChain = await loadOrCreateTrustChain(TRUST_CHAIN_PATH, {
+    operatorName: "example-operator",
+    accountName: "example-account",
+  });
+  // Overload without `externalNatsAccount` narrows natsConfig to the
+  // self-contained shape bootNatsServer needs.
+  const natsHandle = bootNatsServer({
+    natsConfig: trustChain.natsConfig,
+    configDir: CONFIG_DIR,
+    wsPort: NATS_WS,
+    tcpPort: NATS_TCP,
+  });
+  await natsHandle.ready;
+  console.log(`[app] relay mode: self-contained (local nats-server ${natsHandle.natsUrl})`);
+  return { trustChain, natsUrl: natsHandle.natsUrl, natsHandle, natsIssuerAccountId: undefined };
+}
+
+const { trustChain, natsUrl: NATS_URL, natsHandle, natsIssuerAccountId } = await setupRelay();
+const privateChain = trustChain.private;
 
 const issuer = await createBootstrapIssuer({
   rsaPrivateKeyPem: privateChain.rsaPrivateKeyPem,
@@ -94,11 +152,19 @@ const issuer = await createBootstrapIssuer({
 
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: privateChain,
-  natsAccountConfig: natsConfig,
+  natsAccountConfig: trustChain.natsConfig,
+  // In external mode this stamps `nats.issuer_account` on the agent's minted
+  // creds so the managed resolver maps them to the NGS account; undefined
+  // (omitted) in self-contained mode.
+  natsIssuerAccountId,
   saasBaseUrl: SAAS_BASE_URL,
   jwksUrl: `${SAAS_BASE_URL}/.well-known/jwks.json`,
   bootstrapUrl: `${SAAS_BASE_URL}/bootstrap`,
   natsUrl: NATS_URL,
+  // CONTRACT (DeviceFlowOptions.issuer): the issuer DELIVERED to the agent at
+  // enrollment must equal the `iss` minted into bootstrap JWTs below — both
+  // read the single SAAS_ISSUER variable, so they cannot disagree.
+  issuer: SAAS_ISSUER,
 });
 
 // Bundle the browser client (web/app.ts → IIFE) once at boot from dist exports.
@@ -223,6 +289,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       accountSeed: privateChain.natsAccountSeed,
       tenant: TENANT,
       peerId: user.uuid,
+      // External (synadia) mode only — signs the browser creds under the managed
+      // NGS account. Undefined (omitted) in self-contained mode.
+      issuerAccountId: natsIssuerAccountId,
     });
     return sendJson(res, { ...creds, natsUrl: NATS_URL });
   }
@@ -310,21 +379,26 @@ server.listen(PORT, () => {
   }
 });
 
-// Best-effort teardown of the child nats-server. `killChild` is idempotent.
-function killChild(): void {
-  try {
-    nats.proc.kill();
-  } catch {
-    /* ignore */
-  }
+// Best-effort teardown of the child nats-server. Only registered in
+// self-contained mode — in synadia mode no child is spawned (the relay is the
+// managed NGS server), so there is nothing to reap.
+if (natsHandle) {
+  const child = natsHandle;
+  const killChild = (): void => {
+    try {
+      child.proc.kill();
+    } catch {
+      /* ignore */
+    }
+  };
+  const shutdown = (): void => {
+    killChild();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  // Defense-in-depth: reap the child on ANY exit (e.g. an unexpected throw after
+  // bootNatsServer), so the nats-server is never orphaned. `exit` handlers must
+  // be synchronous — kill() is.
+  process.on("exit", killChild);
 }
-function shutdown(): void {
-  killChild();
-  process.exit(0);
-}
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-// Defense-in-depth: reap the child on ANY exit (e.g. an unexpected throw after
-// bootNatsServer), so the nats-server is never orphaned. `exit` handlers must be
-// synchronous — kill() is.
-process.on("exit", killChild);
