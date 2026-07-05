@@ -1,0 +1,18 @@
+{
+  "name": "@mir-stream/webchannel-example-consumer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal downstream consumer proving the public package boundary of @mir-stream/webchannel-{saas,client}.",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node test/boundary.test.mjs"
+  },
+  "dependencies": {
+    "@mir-stream/webchannel-saas": "*",
+    "@mir-stream/webchannel-client": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
