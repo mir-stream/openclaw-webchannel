@@ -25,6 +25,10 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      # Must match e2e-gate.yml — saas real-server suites HARD FAIL (not skip)
+      # in CI when the nats-server binary is missing.
+      NATS_SERVER_VERSION: "v2.14.0"
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +37,26 @@ jobs:
           node-version: 22
           registry-url: https://npm.pkg.github.com
           scope: "@mir-stream"
+
+      - name: Cache nats-server binary
+        id: cache-nats
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/nats-server
+          key: nats-server-${{ env.NATS_SERVER_VERSION }}-linux-amd64
+
+      - name: Install nats-server ${{ env.NATS_SERVER_VERSION }}
+        if: steps.cache-nats.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${NATS_SERVER_VERSION}"
+          TARBALL="nats-server-${VERSION}-linux-amd64.tar.gz"
+          URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${TARBALL}"
+          curl -fsSL "${URL}" -o "/tmp/${TARBALL}"
+          tar -xzf "/tmp/${TARBALL}" -C /tmp
+          sudo mv "/tmp/nats-server-${VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
+          sudo chmod +x /usr/local/bin/nats-server
+          rm -rf "/tmp/${TARBALL}" "/tmp/nats-server-${VERSION}-linux-amd64"
 
       - name: Install
         run: npm ci
@@ -45,8 +69,6 @@ jobs:
           npm test -w packages/client
           npm test -w packages/saas
         env:
-          # Real-server suites self-skip when nats-server is absent; the full
-          # gate (e2e-gate.yml) covers them on every push already.
           CI: "true"
 
       - name: Publish to GitHub Packages
