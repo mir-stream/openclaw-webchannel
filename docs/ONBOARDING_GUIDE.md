@@ -363,7 +363,7 @@ NATS_URL='wss://connect.ngs.global:443' \
 ENABLE_DEMO_UI=1 \
 DEMO_APP_HTML="$PWD/e2e/local/ci-smoke.html" \
 DEMO_CLIENT_ENTRY="$PWD/packages/client/src/browser-demo-entry.ts" \
-DEMO_GW_URL='' \                                            # '' = admission auto (the §4 default); set a gateway URL only for register-hop
+DEMO_GW_URL='' \                                            # register-hop TOGGLE, not a dialed URL: '' = admission auto; any non-empty value = register-hop (which rides NATS on the `.register` subject — no gateway is dialed)
 DEMO_TENANT='default-tenant' \
 DEMO_ACCOUNT_ID='default-agent' \
 node --import tsx packages/saas/reference/enrollment-server.ts
@@ -388,20 +388,27 @@ JWT-mint time (`canAccess` → `403`). Use the **same `tenant`+`accountId`** as 
 
 ### Two admission models
 
-- **`register-hop`** (config default when `auth.strategy=jwt`): the browser must complete
-  an HTTP register hop at the agent's `/webchannel/nats/register*` routes (`WEBCHANNEL_GW_URL`).
-  → **Known issue (openclaw 2026.6.10):** `api.registerHttpRoute` can resolve to a no-op in
-  the plugin-registration context, so those routes **404**. Until the plugin migrates to the
-  2026.6.10 route API, use `auto` instead.
-- **`auto`** (recommended for now): the agent serves any peer that completes the X25519
-  handshake **and** passes the `dmSecurity` allowlist — **no register hop**. Switch with:
+- **`register-hop`** (config default when `auth.strategy=jwt`): the browser completes a
+  register hop as a **NATS request/reply** on the account's `.register` subject — there is
+  **no HTTP route and no gateway URL**. The browser derives the register subject from
+  `tenant/accountId/peerId`, proves possession of its device key (PoP — a signature over a
+  single-use server nonce), the agent validates the bootstrap JWT `aud`, and returns the
+  conversation key **wrapped to the device key**. This rides the same outbound NATS
+  connection as chat, so the agent keeps **zero inbound listeners**. This is what the demo
+  (`demo/run.sh`) and the Synadia runners use — register-hop is fully working.
+  > **History note:** register was originally an HTTP plugin route (`/webchannel/nats/register*`),
+  > and on openclaw 2026.6.10 `api.registerHttpRoute` could resolve to a no-op → 404, which
+  > is why older guidance told you to fall back to `auto`. That is obsolete: register moved
+  > to NATS request/reply and the 404 class is gone.
+- **`auto`**: the agent serves any peer that completes the X25519 handshake **and** passes
+  the `dmSecurity` allowlist — **no register hop, no SaaS bootstrap/PoP**. Simpler, but it
+  drops the PoP + short-TTL admission guarantee. Switch with:
   ```bash
   openclaw config patch --stdin <<'JSON'
   { "channels": { "webchannel": { "dmSecurity": "open", "nats": { "admission": "auto" } } } }
   JSON
   # restart the gateway to apply
   ```
-  …and start the issuer with `DEMO_GW_URL=''` so the browser skips registration.
 
 Type a message → the **real configured model** replies (verify the agent's model is a live
 provider, e.g. `openclaw config get` / the `agent model:` startup log — not an echo stand-in).
@@ -440,7 +447,7 @@ The `#token=` fragment auto-authenticates; a missing/wrong token → `AUTH_RATE_
 | approve → `Enrollment not found … {{USER_CODE}}` | opened bare `/enroll`, or cached approval page | open the full `?user_code=…` URL / hard-refresh / curl `/approve` |
 | polls re-enroll every ~5s, never pairs | client treated `authorization_pending` (HTTP 400) as a hard error | ensure poll handles the 400 `{error}` body (don't throw) |
 | `Polling for approval...` keeps printing **after** a successful connect | pre-warm ran `registerFull` more than once → a duplicate enroll loop polling an unapproved code | harmless (one channel binds; no double-processing) — self-terminates at ~600s expiry; known gap, needs an idempotency guard |
-| register `/challenge` → 404 + CORS | `registerHttpRoute` no-op on 2026.6.10 | use `admission: auto` (no register hop) |
+| register `/challenge` → 404 + CORS | legacy HTTP register path (`registerHttpRoute` no-op on 2026.6.10) | obsolete — register is a NATS request/reply now; ensure the client uses the current `registration` (subject-derived) path, not a `registerBaseUrl` |
 | dashboard `AUTH_RATE_LIMITED` / `token mismatch` | no/!wrong `#token=`, or hitting a different gateway on the same port | use the right gateway's token; resolve the `:18789` collision (§7) |
 
 ---

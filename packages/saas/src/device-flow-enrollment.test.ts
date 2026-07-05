@@ -168,7 +168,52 @@ describe("DeviceFlowEnrollment", () => {
         jwksUrl: "https://saas.com/.well-known/jwks.json",
         bootstrapUrl: "https://saas.com/bootstrap",
         natsUrl: "wss://nats.saas.com",
+        // Delivered issuer: unset in options → derived from saasBaseUrl.
+        issuer: "https://saas.com",
       });
+    });
+
+    it("delivers an explicit issuer VERBATIM (proxy / logical-issuer deployments)", async () => {
+      const customIssuerEnrollment = new DeviceFlowEnrollment({
+        saasTrustChain: mockTrustChain,
+        natsAccountConfig: mockNatsConfig,
+        saasBaseUrl: "https://saas.com",
+        jwksUrl: "https://saas.com/.well-known/jwks.json",
+        bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
+        issuer: "https://id.example.com/logical-issuer/",
+      });
+
+      const enrollResponse = await customIssuerEnrollment.enroll(validEnrollmentRequest);
+      await customIssuerEnrollment.approve(enrollResponse.user_code);
+      const pollResult = await customIssuerEnrollment.poll({
+        device_code: enrollResponse.device_code,
+      });
+
+      // VERBATIM — including the trailing slash. The SaaS declares the exact
+      // string it mints; nobody canonicalizes it in transit.
+      expect(pollResult).toMatchObject({
+        issuer: "https://id.example.com/logical-issuer/",
+      });
+    });
+
+    it("derives the default issuer with trailing slashes stripped (matches the plugin's deriveIssuer)", async () => {
+      const slashEnrollment = new DeviceFlowEnrollment({
+        saasTrustChain: mockTrustChain,
+        natsAccountConfig: mockNatsConfig,
+        saasBaseUrl: "https://saas.com///",
+        jwksUrl: "https://saas.com/.well-known/jwks.json",
+        bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
+      });
+
+      const enrollResponse = await slashEnrollment.enroll(validEnrollmentRequest);
+      await slashEnrollment.approve(enrollResponse.user_code);
+      const pollResult = await slashEnrollment.poll({
+        device_code: enrollResponse.device_code,
+      });
+
+      expect(pollResult).toMatchObject({ issuer: "https://saas.com" });
     });
 
     it("should return invalid_device_code for non-existent enrollment", async () => {

@@ -7,7 +7,7 @@
  *   - Type exports: Trust chain artifacts and enrollment types
  *
  * USAGE:
- *   import { setupTrustChain, DeviceFlowEnrollment } from '@openclaw/webchannel-saas';
+ *   import { setupTrustChain, DeviceFlowEnrollment } from '@mir-stream/webchannel-saas';
  *
  *   const trustChain = await setupTrustChain({
  *     operatorName: 'my-saas-operator',
@@ -28,6 +28,8 @@
  */
 
 export { setupTrustChain } from "./setup-trust-chain.js";
+export { generateRsaKeypair } from "./setup-trust-chain.js";
+export { loadOrCreateTrustChain } from "./persistent-trust-chain.js";
 export { DeviceFlowEnrollment, MemoryEnrollmentStore, type EnrollmentStore } from "./device-flow-enrollment.js";
 export { buildBootstrapClaims } from "./bootstrap-claims.js";
 export type {
@@ -36,6 +38,13 @@ export type {
   DeviceCnfJwk,
   DevicePopJwk,
 } from "./bootstrap-claims.js";
+// 0.1.2 additive public API: RS256 bootstrap-JWT signer + browser NATS creds.
+export { createBootstrapIssuer, type BootstrapIssuer } from "./bootstrap-issuer.js";
+export {
+  issueBrowserCredentials,
+  type BrowserCredentials,
+  type IssueBrowserCredentialsOptions,
+} from "./nats-user-creds.js";
 export type {
   SetupTrustChainResult,
   SaasTrustChainPrivate,

@@ -348,6 +348,48 @@ describe("account-config: loadPersistedEnrolledCreds", () => {
     });
   });
 
+  it("threads the SaaS-delivered issuer through when persisted (VERBATIM)", () => {
+    // EnrollmentResult.issuer is persisted under `enrollment.issuer`; the runtime
+    // verifies bootstrap JWTs against it (pin > delivered > derived), so the
+    // loader must surface it — verbatim, trailing slash and all (verify compares
+    // slash-insensitively; the loader must not "helpfully" canonicalize).
+    const withIssuer = JSON.stringify({
+      enrollment: {
+        creds: { userJwt: "JWT", userSeed: "SEED" },
+        natsUrl: "wss://saas-delivered-relay",
+        issuer: "https://saas.local/demo-issuer/",
+      },
+    });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const creds = loadPersistedEnrolledCreds("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => withIssuer,
+    });
+    expect(creds).toEqual({
+      userJwt: "JWT",
+      userSeed: "SEED",
+      natsUrl: "wss://saas-delivered-relay",
+      issuer: "https://saas.local/demo-issuer/",
+    });
+  });
+
+  it("omits issuer for pre-issuer persisted creds and non-string junk (back-compat)", () => {
+    const junk = JSON.stringify({
+      enrollment: {
+        creds: { userJwt: "JWT", userSeed: "SEED" },
+        issuer: 42,
+      },
+    });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const creds = loadPersistedEnrolledCreds("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => junk,
+    });
+    expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
+  });
+
   it("loads from the legacy file for the default account (backward-compat)", () => {
     const legacy = legacyCredentialPath(HOME);
     const creds = loadPersistedEnrolledCreds("default", {

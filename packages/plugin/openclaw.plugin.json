@@ -52,18 +52,7 @@
               "requirePoP": {
                 "type": "boolean",
                 "default": true,
-                "description": "Require Proof-of-Possession at the NATS register route. Default true (secure-by-default): a verified bootstrap JWT with no pop_jwk is rejected (401) before any peer is registered. Set false to restore legacy optional-PoP behavior (dev only)."
-              },
-              "cors": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "allowedOrigins": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Allowlist of browser Origins permitted on the register routes. Unset/empty reflects the request Origin (permissive). When non-empty, only an in-list Origin receives an Access-Control-Allow-Origin header."
-                  }
-                }
+                "description": "Require Proof-of-Possession at the NATS register hop. Default true (secure-by-default): a verified bootstrap JWT with no pop_jwk is rejected before any peer is registered. Set false to restore legacy optional-PoP behavior (dev only)."
               },
               "jwt": {
                 "type": "object",
@@ -207,7 +196,7 @@
               "admission": {
                 "type": "string",
                 "enum": ["auto", "register-hop"],
-                "description": "Peer-admission override. \"register-hop\": peers must complete the SaaS bootstrap JWT + Proof-of-Possession register hop at /webchannel/nats/register* before being served. \"auto\": the agent subscribes to the tenant/agent wildcard and serves any peer that completes the X25519 handshake and passes the dmSecurity allowlist. Default: register-hop when auth.strategy=\"jwt\"; auto otherwise; static credentials always default to auto."
+                "description": "Peer-admission override. \"register-hop\": peers must complete the SaaS bootstrap JWT + Proof-of-Possession register hop over NATS request/reply on the webchannel.{tenant}.{accountId}.{peerId}.register subject before being served. \"auto\": the agent subscribes to the tenant/agent wildcard and serves any peer that completes the X25519 handshake and passes the dmSecurity allowlist. Default: register-hop when auth.strategy=\"jwt\"; auto otherwise; static credentials always default to auto."
               },
               "credentials": {
                 "type": "object",
@@ -268,7 +257,7 @@
         },
         "auth.jwt.jwksUrl": {
           "label": "JWKS URL",
-          "help": "HTTPS URL of the IdP's JWKS endpoint (e.g. https://your-tenant.auth0.com/.well-known/jwks.json). The gateway fetches and caches it with a 5-minute TTL. Exactly one of jwksUrl, jwks, or jwksFile is required."
+          "help": "HTTPS URL of the IdP's JWKS endpoint (e.g. https://your-tenant.auth0.com/.well-known/jwks.json). The gateway fetches and caches it with a 5-minute TTL. DERIVED at runtime as `<saas.baseUrl>/.well-known/jwks.json` when no key source is configured; set this (or jwks/jwksFile) only to override. Exactly one of jwksUrl, jwks, or jwksFile is used."
         },
         "auth.jwt.jwks": {
           "label": "Inline JWKS",
@@ -280,11 +269,11 @@
         },
         "auth.jwt.issuer": {
           "label": "Issuer (iss)",
-          "help": "Expected `iss` claim. Tokens whose iss does not match (constant-time compare) are rejected. Required."
+          "help": "Expected `iss` claim. Tokens whose iss does not match (constant-time compare) are rejected. DERIVED at runtime from the SaaS base URL (`issuer == saas.baseUrl`) when omitted; set this only to pin a different issuer (proxy / custom-domain)."
         },
         "auth.jwt.audience": {
           "label": "Audience (aud)",
-          "help": "Expected `aud` claim. Tokens whose aud is neither this string nor an array containing it are rejected. Required."
+          "help": "Expected `aud` claim. Tokens whose aud is neither this string nor an array containing it are rejected. DERIVED at runtime from the account id (`audience == accountId`) when omitted; set this only to pin a different audience."
         },
         "auth.jwt.clockSkew": {
           "label": "Clock skew (sec)",

@@ -69,6 +69,15 @@ type EnrollmentResult = {
    * dials THIS rather than a local `nats.url` / `WEBCHANNEL_NATS_URL`.
    */
   natsUrl: string;
+  /**
+   * The exact `iss` the SaaS puts in the bootstrap JWTs it mints (same
+   * rendezvous-authority principle as `natsUrl`). OPTIONAL here (unlike the
+   * server-side type, where it is required) because a pre-issuer SaaS omits
+   * it — the runtime then falls back to deriving issuer = saas.baseUrl.
+   * Precedence at verify time: operator pin > this delivered value > derived.
+   * Used VERBATIM — never canonicalized.
+   */
+  issuer?: string;
 };
 
 /**
@@ -132,6 +141,8 @@ export type PluginCredentials = {
     jwksUrl: string;
     bootstrapUrl: string;
     natsUrl: string;
+    /** SaaS-delivered bootstrap-JWT issuer (absent for pre-issuer enrollments). */
+    issuer?: string;
   };
 
   /**

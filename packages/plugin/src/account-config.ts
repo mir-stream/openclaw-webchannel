@@ -363,6 +363,17 @@ export type PersistedEnrolledCreds = {
    * the consumer then falls back to the resolver URL (back-compat).
    */
   natsUrl?: string;
+  /**
+   * Bootstrap-JWT issuer the SaaS delivered alongside the creds
+   * (EnrollmentResult.issuer, persisted under `enrollment.issuer`). Same
+   * rendezvous-authority principle as `natsUrl`: the SaaS declares the exact
+   * `iss` it mints, so the runtime verifies against THIS instead of deriving
+   * issuer = saas.baseUrl and hoping the two agree. Precedence: operator pin
+   * (`auth.jwt.issuer`) > this delivered value > derived. Absent for creds
+   * enrolled before this field existed — the runtime then derives (back-compat).
+   * Used VERBATIM (verify already compares slash-insensitively).
+   */
+  issuer?: string;
 };
 
 /**
@@ -397,6 +408,7 @@ export function loadPersistedEnrolledCreds(
       enrollment?: {
         creds?: { userJwt?: unknown; userSeed?: unknown };
         natsUrl?: unknown;
+        issuer?: unknown;
       };
     };
     const creds = parsed.enrollment?.creds;
@@ -407,13 +419,16 @@ export function loadPersistedEnrolledCreds(
       creds.userJwt.length > 0 &&
       creds.userSeed.length > 0
     ) {
-      // Thread the SaaS-delivered relay URL through when present. Kept optional so
-      // already-persisted (pre-natsUrl) creds still load and fall back gracefully.
+      // Thread the SaaS-delivered relay URL + issuer through when present. Kept
+      // optional so already-persisted (pre-natsUrl / pre-issuer) creds still
+      // load and fall back gracefully.
       const natsUrl = parsed.enrollment?.natsUrl;
+      const issuer = parsed.enrollment?.issuer;
       return {
         userJwt: creds.userJwt,
         userSeed: creds.userSeed,
         ...(typeof natsUrl === "string" && natsUrl.length > 0 ? { natsUrl } : {}),
+        ...(typeof issuer === "string" && issuer.length > 0 ? { issuer } : {}),
       };
     }
     return undefined;

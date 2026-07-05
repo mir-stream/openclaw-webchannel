@@ -56,8 +56,11 @@ describe("webchannel inbound round-trip", () => {
       agentId: "main",
       channel: input.channel,
       accountId: "",
-      // Emulate a channel-scoped key (resolveAgentRoute keeps channel + peer
-      // rather than collapsing to agent:main:main like buildAgentSessionKey).
+      // resolveWebchannelSessionRoute IGNORES this sessionKey and rebuilds it via
+      // the REAL buildAgentSessionKey with the forced per-account-channel-peer
+      // scope — so the recorded key below is the ENFORCED isolation key
+      // (agent:main:webchannel:<accountId>:direct:<peer>), not this naive value.
+      // We still return a value here to prove the override wins.
       sessionKey: `agent:main:${input.channel}:${input.peer.id}`,
       mainSessionKey: "agent:main:main",
       lastRoutePolicy: "session" as const,
@@ -171,16 +174,20 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
-    // Route was resolved for THIS channel + peer (not via buildAgentSessionKey).
+    // Route was resolved for THIS channel + peer.
     expect(resolveAgentRoute).toHaveBeenCalledWith(
       expect.objectContaining({
         channel: "webchannel",
         peer: { kind: "direct", id: "web-anon" },
       }),
     );
-    // An originating session/route was recorded carrying the channel-scoped key.
+    // An originating session/route was recorded carrying the FORCED
+    // per-account-channel-peer key (webchannel self-isolates regardless of the
+    // global session.dmScope — the empty accountId normalizes to "default").
     expect(recordInboundSession).toHaveBeenCalledTimes(1);
-    expect(captured.recordedSessionKey).toBe("agent:main:webchannel:web-anon");
+    expect(captured.recordedSessionKey).toBe(
+      "agent:main:webchannel:default:direct:web-anon",
+    );
     // The recorded reply `to` lines up with the socket-map key we deliver to.
     expect(captured.recordedTo).toBe("web-anon");
     // The reply was delivered back through THIS channel to the peer's socket.
@@ -214,6 +221,36 @@ describe("webchannel inbound round-trip", () => {
         accountId: "acctA",
         peer: { kind: "direct", id: "alice" },
       }),
+    );
+  });
+
+  it("stamps accountId on the turn context AND the run params (S1: turnSourceAccountId)", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendText").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { accounts: { acctB: {} } },
+    });
+
+    await handleInboundMessage(
+      api,
+      transport,
+      "alice",
+      { type: "user_message", text: "hello" },
+      "acctB",
+    );
+
+    const inbound = (api as any).runtime.channel.inbound;
+    // Core copies buildContext's accountId into ctx.AccountId, which becomes the
+    // agent request's accountId and, on an exec approval, turnSourceAccountId —
+    // the field each account's approval handler matches on. Without this stamp,
+    // account-B approvals fall back to the primary handler (the S1 misroute).
+    expect(inbound.run).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: "webchannel", accountId: "acctB" }),
+    );
+    expect(inbound.buildContext).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: "webchannel", accountId: "acctB" }),
     );
   });
 

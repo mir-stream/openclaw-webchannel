@@ -19,9 +19,10 @@
  * Two admission modes:
  *
  *   - `register-hop` — a peer must complete the SaaS bootstrap JWT + Proof-of-
- *     Possession round-trip at `/webchannel/nats/register*` before the agent
- *     subscribes to its subjects. This is the production default for `jwt` auth
- *     when a register hop is available.
+ *     Possession round-trip over NATS request/reply on the account's
+ *     `webchannel.{tenant}.{accountId}.{peerId}.register` subject before the
+ *     agent subscribes to its subjects. This is the production default for `jwt`
+ *     auth when a register hop is available.
  *
  *   - `auto` — the agent subscribes to the tenant/agent WILDCARD subjects and
  *     serves ANY peer that completes the X25519 handshake AND passes the
@@ -80,15 +81,15 @@ export function resolveAdmissionMode(input: ResolveAdmissionModeInput): Admissio
  * What the per-account serving loop must wire up for a resolved admission mode.
  *
  * This makes the ONE structural fact behind the admission decision testable and
- * explicit: the `channels.webchannel.auth` verifier and the HTTP register hop's
- * `aud → account` dispatch entry are meaningful ONLY for a `register-hop`
- * account. An `auto` account admits peers purely via the NATS wildcard + the
- * X25519 handshake (+ optional `dmSecurity` allowlist), so `auth` gates nothing
- * on its path — it must be served with NO verifier built and NO aud mapping,
+ * explicit: the `channels.webchannel.auth` verifier and the NATS `.register`
+ * admission subscription are meaningful ONLY for a `register-hop` account. An
+ * `auto` account admits peers purely via the NATS wildcard + the X25519
+ * handshake (+ optional `dmSecurity` allowlist), so `auth` gates nothing on its
+ * path — it must be served with NO verifier built and NO register subscription,
  * never skipped for "missing auth".
  *
- *   - `register-hop` → { subscribeWildcard: false, buildVerifier: true,  populateAudMapping: true  }
- *   - `auto`         → { subscribeWildcard: true,  buildVerifier: false, populateAudMapping: false }
+ *   - `register-hop` → { subscribeWildcard: false, buildVerifier: true,  subscribeRegister: true  }
+ *   - `auto`         → { subscribeWildcard: true,  buildVerifier: false, subscribeRegister: false }
  */
 export type AdmissionServingPlan = {
   /** `auto` subscribes the tenant/accountId wildcard; `register-hop` does not. */
@@ -101,8 +102,12 @@ export type AdmissionServingPlan = {
    * silently downgraded to `auto`.
    */
   buildVerifier: boolean;
-  /** Populate the register route's `aud → account` dispatch map. `register-hop` only. */
-  populateAudMapping: boolean;
+  /**
+   * Subscribe the `webchannel.{tenant}.{accountId}.*.register` admission subject
+   * and wire the register-request handler. `register-hop` only — an `auto`
+   * account has no register hop and admits via the wildcard + handshake instead.
+   */
+  subscribeRegister: boolean;
 };
 
 /** Derive the serving plan for an admission mode. See {@link AdmissionServingPlan}. */
@@ -111,6 +116,24 @@ export function admissionServingPlan(admission: AdmissionMode): AdmissionServing
   return {
     subscribeWildcard: !registerHop,
     buildVerifier: registerHop,
-    populateAudMapping: registerHop,
+    subscribeRegister: registerHop,
   };
 }
+
+// ── RETIRED: crossUserHistoryWarning (Phase 6) ──────────────────────────────
+// This guard used to WARN a register-hop account whose global `session.dmScope`
+// was "main" that its history snapshot / load_history would leak OTHER USERS'
+// transcripts (all peers collapsed onto one agent session under "main").
+//
+// That premise is no longer true: webchannel now FORCES its own inbound session
+// scope to `per-account-channel-peer` at every session-key site (see
+// `src/session-route.ts`, mirroring the telegram/synology precedent), so the
+// operator's global `session.dmScope` can never cause a cross-user leak here —
+// each authenticated user uuid always gets its own agent session regardless.
+// The warning was therefore a FALSE alarm and has been removed; the readiness
+// line (`formatAccountReadiness`) now reports the ENFORCED scope truthfully.
+//
+// NOTE (known residual, not fixed here): the CORE `openclaw doctor` / audit
+// `security.dm` collector may still emit its own dmScope="main" advisory because
+// webchannel declares `security.dm` (`src/channel.ts`). That is core code with
+// broader implications; it is left as a follow-up.

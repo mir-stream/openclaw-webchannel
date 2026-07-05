@@ -91,8 +91,8 @@ describe("mintNatsUserCreds — external account (issuer_account)", () => {
 
   it("isolates tenants across the external path", async () => {
     const { accountId, signingSeed } = makeExternalAccount();
-    const a = await mintNatsUserCreds({ accountSeed: signingSeed, tenant: "alpha", issuerAccountId: accountId });
-    const b = await mintNatsUserCreds({ accountSeed: signingSeed, tenant: "beta", issuerAccountId: accountId });
+    const a = await mintNatsUserCreds({ accountSeed: signingSeed, tenant: "alpha", role: "agent", issuerAccountId: accountId });
+    const b = await mintNatsUserCreds({ accountSeed: signingSeed, tenant: "beta", role: "agent", issuerAccountId: accountId });
     expect(decodeUser(a.userJwt).nats.pub?.allow).toEqual(["webchannel.alpha.>"]);
     expect(decodeUser(b.userJwt).nats.pub?.allow).toEqual(["webchannel.beta.>"]);
     // Same issuer_account, distinct users.
@@ -129,6 +129,7 @@ describe("setupTrustChain — external account mode", () => {
     const creds = await mintNatsUserCreds({
       accountSeed: chain.private.natsAccountSeed,
       tenant: "t1",
+      role: "agent",
       issuerAccountId: chain.natsConfig.mode === "external" ? chain.natsConfig.accountPublicKey : undefined,
     });
     const claims = decodeUser(creds.userJwt);

@@ -20,6 +20,15 @@
 const SAFE_SUBJECT_TOKEN = /^[A-Za-z0-9_-]{1,128}$/;
 
 /**
+ * Non-throwing predicate: `true` iff `token` is a single, safe NATS subject token
+ * (non-empty, no `.`/`*`/`>`/whitespace/control chars). Use at call sites that
+ * make a control-flow decision (e.g. drop vs publish) rather than fail hard.
+ */
+export function isValidSubjectToken(token: unknown): token is string {
+  return typeof token === "string" && SAFE_SUBJECT_TOKEN.test(token);
+}
+
+/**
  * Throw if `token` is unsafe to interpolate into a NATS subject / permission.
  *
  * @param token - The untrusted token (e.g. peerId).

@@ -190,7 +190,7 @@ jobs:
       #    real `inbound.run` agent path — the one thing the vitest e2e above
       #    does NOT (those use the deterministic `e2e-roundtrip-agent` seam).
       #    Boots an isolated gateway (auth.strategy="jwt", wildcard OFF) and
-      #    round-trips through the live HTTP /webchannel/nats/register hop.
+      #    round-trips through the live NATS register hop (`…{peerId}.register`).
       #    Reuses the already-installed nats-server (on PATH), npm deps, and the
       #    openclaw binary in node_modules/.bin. Fully hermetic under /tmp/oc-e2e
       #    (echo model, no LLM, no registry) — needs NO secret. Any non-zero exit
@@ -255,6 +255,20 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
       - name: "Live e2e: 2-account routing isolation"
         run: bash e2e/local/run-two-account-isolation.sh
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 8g. Live e2e: DERIVED trust anchor (zero hand-written JWT trust facts)
+      #    The ONLY harness that exercises `deriveAccountAuth` end-to-end: a fresh
+      #    `openclaw channels add` writes NO issuer/jwksUrl/audience (config-present-
+      #    wins would mask derivation otherwise). Asserts the on-disk config holds
+      #    zero trust facts, the Gate-B readiness line reports the DERIVED
+      #    issuer=<saasBaseUrl> · JWKS N>=1 keys · aud=<accountId> · register-hop,
+      #    then round-trips a real headless-Chromium encrypted register through the
+      #    live hop. Isolated under /tmp/oc-derived-e2e (port 19399) — hermetic, no
+      #    secret. Any non-zero exit FAILS the gate.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Live e2e: DERIVED trust anchor (zero hand-written trust facts)"
+        run: bash e2e/local/run-derived-trust.sh
 
 ################################################################################
 # Publish job — gated on the E2E gate passing + release tag

@@ -91,8 +91,14 @@ export type SetupTrustChainOptions = {
  *
  * Returns the private key in PKCS#8 PEM format and extracts the public key
  * modulus (n) and exponent (e) for JWKS.
+ *
+ * Exported as a standalone primitive so callers can mint an additional signing
+ * key WITHOUT rebuilding the whole trust chain — e.g. JWKS key rotation, where a
+ * fresh `{ privateKeyPem, publicKeyJwk, kid }` is added to the served JWKS and
+ * becomes the active bootstrap-JWT signer while the NATS account seed is
+ * untouched. The RSA key is only ever used for RS256 bootstrap-JWT sign/verify.
  */
-async function generateRsaKeypair(
+export async function generateRsaKeypair(
   keySize: number = 2048,
 ): Promise<{ privateKeyPem: string; publicKeyJwk: JwkRsaPublicKey; kid: string }> {
   const keypair = await globalThis.crypto.subtle.generateKey(

@@ -11,7 +11,7 @@
  *      entirely (no `"jwt":undefined`/`null` leaks onto the wire).
  *   3. With `jwt` present (unchanged): CONNECT still carries it byte-for-byte.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { NatsClient, WebChannelNatsClient } from "./nats-client.js";
 import { base64urlEncode } from "./e2e-crypto-browser.js";
@@ -161,8 +161,6 @@ describe("WebChannelNatsClient — registration without a bootstrap jwt", () => 
       "sign",
       "verify",
     ])) as CryptoKeyPair;
-    // fetchImpl is the only path to the register hop — assert it is never called.
-    const fetchSpy = vi.fn(async () => new Response(null, { status: 200 }));
 
     const client = new WebChannelNatsClient({
       url: "ws://127.0.0.1:4222",
@@ -171,9 +169,7 @@ describe("WebChannelNatsClient — registration without a bootstrap jwt", () => 
       peerId: "p",
       // NO bootstrap `jwt`, but `registration` is present → guard must trip.
       registration: {
-        registerBaseUrl: "http://localhost:9999",
         devicePrivateKey: kp.privateKey,
-        fetchImpl: fetchSpy as unknown as typeof fetch,
       },
     });
 
@@ -187,9 +183,7 @@ describe("WebChannelNatsClient — registration without a bootstrap jwt", () => 
 
     expect(captured).toBeInstanceOf(Error);
     expect((captured as unknown as Error).message).toMatch(/registration requires a bootstrap/i);
-    // Did NOT proceed to the register hop…
-    expect(fetchSpy).not.toHaveBeenCalled();
-    // …and tore the connection down (fail-closed).
+    // …and tore the connection down (fail-closed), without proceeding to register.
     expect(lastState).toBe(false);
 
     client.disconnect();

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Hermetic REAL-SaaS-issuer E2E: prove the reference bootstrap-server (NOT a
 # fixture) mints an RS256 bootstrap JWT, served via its REAL JWKS endpoint, that
-# the plugin verifies over HTTP (auth.jwt.jwksUrl) through the live HTTP
-# /webchannel/nats/register hop — admitting the peer for an encrypted round-trip.
+# the plugin verifies over HTTP (auth.jwt.jwksUrl) through the live NATS register
+# hop (`…{peerId}.register`) — admitting the peer for an encrypted round-trip.
 #
 # This is the sibling of run-jwt-register.sh (which self-mints from a static
 # jwksFile). Here the JWT SOURCE is the real bootstrap-server; everything else

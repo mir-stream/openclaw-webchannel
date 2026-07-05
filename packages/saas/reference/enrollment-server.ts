@@ -155,11 +155,11 @@ if (NATS_CONFIG_OUT) {
 // RS256 bootstrap-JWT signing (TEST-ONLY) — reuses THIS issuer's trust chain
 // ---------------------------------------------------------------------------
 //
-// The reference register hop (`/webchannel/nats/register`) verifies a bootstrap
-// JWT against the gateway's configured JWKS — which is THIS issuer's
-// `/.well-known/jwks.json`. So a harness that drives the register hop needs a
-// bootstrap JWT signed by the SAME RSA key. We import it once at boot (held in
-// memory; never served/logged).
+// The register hop (now over NATS request/reply on the account's
+// `…{peerId}.register` subject) verifies a bootstrap JWT against the gateway's
+// configured JWKS — which is THIS issuer's `/.well-known/jwks.json`. So a harness
+// that drives the register hop needs a bootstrap JWT signed by the SAME RSA key.
+// We import it once at boot (held in memory; never served/logged).
 // Also import under ENABLE_DEMO_UI so the session-gated `/bootstrap` route can
 // sign real bootstrap JWTs from the login flow (the demo replaces the
 // unauthenticated `/test/bootstrap-jwt` forgery route with a login-gated one).
@@ -691,14 +691,19 @@ const server = createServer(async (req, res) => {
           sendJson(res, { error: "Missing tenant" }, 400);
           return;
         }
+        // browser creds are pinned to THIS session's peerId (user.uuid — the
+        // authenticated subject, never client input); observer is sub-only.
+        const resolvedRole: NatsUserRole =
+          role === "agent" ? "agent" : role === "observer" ? "observer" : "browser";
         mintNatsUserCreds({
           accountSeed: mockTrustChain.natsAccountSeed,
           tenant,
-          role: role === "agent" ? "agent" : "browser",
+          role: resolvedRole,
+          ...(resolvedRole === "browser" ? { peerId: user.uuid } : {}),
           issuerAccountId: natsIssuerAccountId,
         })
           .then((creds) => {
-            console.log(`[nats-user] minted ${role ?? "browser"} creds for ${user.username} tenant=${tenant}`);
+            console.log(`[nats-user] minted ${resolvedRole} creds for ${user.username} tenant=${tenant}`);
             // The relay URL travels WITH the minted creds (SaaS = rendezvous authority).
             sendJson(res, { ...creds, natsUrl: NATS_URL });
           })
@@ -981,19 +986,28 @@ const server = createServer(async (req, res) => {
           sendJson(res, { error: "Invalid JSON body" }, 400);
           return;
         }
-        const { tenant, role } = body as { tenant?: string; role?: NatsUserRole };
+        const { tenant, role, peerId } = body as { tenant?: string; role?: NatsUserRole; peerId?: string };
         if (!tenant) {
           sendJson(res, { error: "Missing tenant" }, 400);
+          return;
+        }
+        // browser creds are per-peer scoped; the TEST caller supplies the peerId
+        // it will bootstrap under (mirrors the register subject it drives).
+        const resolvedRole: NatsUserRole =
+          role === "agent" ? "agent" : role === "observer" ? "observer" : "browser";
+        if (resolvedRole === "browser" && !peerId) {
+          sendJson(res, { error: "Missing peerId (required for role 'browser')" }, 400);
           return;
         }
         mintNatsUserCreds({
           accountSeed: mockTrustChain.natsAccountSeed,
           tenant,
-          role: role === "agent" ? "agent" : "browser",
+          role: resolvedRole,
+          ...(resolvedRole === "browser" ? { peerId } : {}),
           issuerAccountId: natsIssuerAccountId,
         })
           .then((creds) => {
-            console.log(`[test/nats-user] minted ${role ?? "browser"} creds for tenant=${tenant}`);
+            console.log(`[test/nats-user] minted ${resolvedRole} creds for tenant=${tenant}${peerId ? ` peerId=${peerId}` : ""}`);
             // The relay URL travels WITH the minted creds (SaaS = rendezvous
             // authority) so the browser dials where the SaaS says, not a
             // page-configured URL. Mirrors the enrolled plugin's EnrollmentResult.

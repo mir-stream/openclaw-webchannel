@@ -9,6 +9,7 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 import { buildFullAccountPatch } from "./setup.js";
+import { resolveAdmissionMode } from "./nats-admission.js";
 import { webchannelSetupWizard, validateHttpUrl } from "./setup-wizard.js";
 import { WebChannelTransport } from "./transport.js";
 import { createWebChannelPlugin } from "./channel.js";
@@ -20,10 +21,14 @@ function account(next: unknown, accountId: string): Record<string, unknown> {
 }
 
 describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => {
-  it("emits the complete enroll-ready block with derived jwksUrl/issuer/audience", () => {
-    // Mirrors e2e/local/run-demo-synadia.sh, MINUS nats.url (SaaS-delivered at
-    // enroll — intentionally omitted, see plan Q3) and with the derived issuer
-    // default (= saasBaseUrl).
+  it("(a) with NO issuer/audience: OMITS all JWT-verify params (they derive at runtime)", () => {
+    // Trust-anchor change 2: the builder no longer GUESSES issuer/jwksUrl/audience.
+    // It emits `auth.strategy:"jwt"` but NO `auth.jwt` sub-object — the runtime
+    // deriver (`deriveAccountAuth`) fills issuer=saas.baseUrl, audience=accountId,
+    // jwksUrl=saas.baseUrl+/.well-known/jwks.json from the anchor. What stays: the
+    // anchor (saas.baseUrl), strategy, admission=register-hop, enrolled creds,
+    // dmSecurity=open. Mirrors e2e/local/run-demo-synadia.sh MINUS nats.url
+    // (SaaS-delivered at enroll — intentionally omitted, see plan Q3).
     expect(
       buildFullAccountPatch({
         tenant: "default-tenant",
@@ -33,20 +38,23 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
     ).toEqual({
       tenant: "default-tenant",
       saas: { baseUrl: "http://host.docker.internal:3951" },
-      auth: {
-        strategy: "jwt",
-        jwt: {
-          jwksUrl: "http://host.docker.internal:3951/.well-known/jwks.json",
-          issuer: "http://host.docker.internal:3951",
-          audience: "default-agent",
-        },
-      },
+      auth: { strategy: "jwt" },
       dmSecurity: "open",
-      nats: { admission: "auto", credentials: { mode: "enrolled" } },
+      nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
     });
   });
 
-  it("honors a docker-style issuer override + explicit audience (matches the demo iss)", () => {
+  it("(a) never emits auth.jwt.jwksUrl/issuer/audience when no pins are supplied", () => {
+    const patch = buildFullAccountPatch({
+      tenant: "t",
+      saasBaseUrl: "https://saas.example.com/",
+      accountId: "acct",
+    });
+    // No `auth.jwt` at all — nothing is guessed; the runtime anchor derives it.
+    expect((patch.auth as { jwt?: unknown }).jwt).toBeUndefined();
+  });
+
+  it("(b) with explicit issuer + audience OPERATOR PINS: writes them (pin honored), but never jwksUrl", () => {
     const patch = buildFullAccountPatch({
       tenant: "default-tenant",
       saasBaseUrl: "http://host.docker.internal:3951",
@@ -56,17 +64,61 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
     });
     expect((patch.auth as { jwt: { issuer: string } }).jwt.issuer).toBe("http://127.0.0.1:3951");
     expect((patch.auth as { jwt: { audience: string } }).jwt.audience).toBe("default-agent");
+    // jwksUrl is NEVER written by the builder anymore — it derives at runtime.
+    expect((patch.auth as { jwt: { jwksUrl?: unknown } }).jwt.jwksUrl).toBeUndefined();
   });
 
-  it("joins jwksUrl without a double slash when the base URL has a trailing slash", () => {
+  it("(b) with ONLY an issuer pin: writes issuer, omits audience (audience still derives)", () => {
     const patch = buildFullAccountPatch({
       tenant: "t",
-      saasBaseUrl: "https://saas.example.com/",
+      saasBaseUrl: "http://s",
+      accountId: "acct",
+      issuer: "https://logical-issuer.example",
+    });
+    const jwt = (patch.auth as { jwt: Record<string, unknown> }).jwt;
+    expect(jwt).toEqual({ issuer: "https://logical-issuer.example" });
+  });
+
+  it("pins admission to register-hop — the register-over-NATS chat path, NOT legacy auto", () => {
+    // A `channels add` SaaS-enrolled account MUST admit via the `.register` NATS
+    // subject; the legacy `auto` (X25519 wildcard, no `.register`) times out the
+    // browser's register request → "Credentials expired" in the UI. This is the
+    // ONE assertion that guards the default from regressing back to `auto`.
+    const patch = buildFullAccountPatch({
+      tenant: "t",
+      saasBaseUrl: "http://s",
       accountId: "acct",
     });
-    expect((patch.auth as { jwt: { jwksUrl: string } }).jwt.jwksUrl).toBe(
-      "https://saas.example.com/.well-known/jwks.json",
-    );
+    expect((patch.nats as { admission: string }).admission).toBe("register-hop");
+  });
+
+  it("the builder's output round-trips through resolveAdmissionMode to register-hop", () => {
+    // End-to-end: the emitted block (jwt auth + enrolled creds + the explicit
+    // override) is exactly what the per-account serving loop feeds resolveAdmissionMode,
+    // and it must resolve to register-hop — the override and the inference agree.
+    const patch = buildFullAccountPatch({
+      tenant: "t",
+      saasBaseUrl: "http://s",
+      accountId: "acct",
+    });
+    const auth = patch.auth as { strategy: string };
+    const nats = patch.nats as {
+      admission: "auto" | "register-hop";
+      credentials: { mode: string };
+    };
+    // enrolled creds ⇒ a register hop is viable (registerHopAvailable = mode !== "static").
+    const registerHopAvailable = nats.credentials.mode !== "static";
+    const resolved = resolveAdmissionMode({
+      authStrategy: auth.strategy,
+      registerHopAvailable,
+      explicitOverride: nats.admission,
+    });
+    expect(resolved).toBe("register-hop");
+    // …and even WITHOUT the explicit override the inference alone would pick it,
+    // proving the pin matches (not overrides) the intended default.
+    expect(
+      resolveAdmissionMode({ authStrategy: auth.strategy, registerHopAvailable }),
+    ).toBe("register-hop");
   });
 });
 
@@ -126,26 +178,21 @@ describe("setup-wizard: per-field funnel safety", () => {
     expect((finalized as { cfg: unknown }).cfg).toBe(cfg);
   });
 
-  it("finalize writes the full block from collected values", () => {
+  it("finalize writes the full block from collected values (no pins ⇒ no auth.jwt)", () => {
     const cfg = { channels: { webchannel: { accounts: {} } } } as never;
     const finalized = webchannelSetupWizard.finalize?.({
       cfg,
       accountId: "accta",
       credentialValues: { tenant: "t", saasBaseUrl: "http://s" },
     } as never) as { cfg: unknown };
+    // No issuer/audience collected ⇒ the JWT-verify params are OMITTED and derive
+    // at runtime; only the anchor + strategy + admission/creds/dmSecurity persist.
     expect(account(finalized.cfg, "accta")).toEqual({
       tenant: "t",
       saas: { baseUrl: "http://s" },
-      auth: {
-        strategy: "jwt",
-        jwt: {
-          jwksUrl: "http://s/.well-known/jwks.json",
-          issuer: "http://s",
-          audience: "accta",
-        },
-      },
+      auth: { strategy: "jwt" },
       dmSecurity: "open",
-      nats: { admission: "auto", credentials: { mode: "enrolled" } },
+      nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
     });
   });
 
@@ -163,16 +210,50 @@ describe("setup-wizard: per-field funnel safety", () => {
     expect((written.auth as { jwt: { audience: string } }).jwt.audience).toBe("accta");
   });
 
-  it("finalize flows a trailing-slash saasBaseUrl to a correct jwksUrl", () => {
+  it("finalize NEVER writes an issuer pin — even if a stray issuer value is collected", () => {
+    // The issuer prompt was REMOVED (the issuer is SaaS-delivered at
+    // enrollment; an add-time prefill-pin would permanently shadow it).
+    // finalize must not thread a credentialValues issuer through even if one
+    // is present (e.g. a stale harness), and the wizard must not prompt for it.
+    expect(
+      webchannelSetupWizard.textInputs?.some((input) => input.inputKey === ("issuer" as never)),
+    ).toBe(false);
     const cfg = { channels: { webchannel: { accounts: {} } } } as never;
     const finalized = webchannelSetupWizard.finalize?.({
       cfg,
       accountId: "accta",
-      credentialValues: { tenant: "t", saasBaseUrl: "https://saas.example.com/" },
+      credentialValues: {
+        tenant: "t",
+        saasBaseUrl: "https://saas.example.com/",
+        issuer: "https://custom-domain.example",
+      },
     } as never) as { cfg: unknown };
-    expect(
-      (account(finalized.cfg, "accta").auth as { jwt: { jwksUrl: string } }).jwt.jwksUrl,
-    ).toBe("https://saas.example.com/.well-known/jwks.json");
+    const jwt = (account(finalized.cfg, "accta").auth as { jwt?: Record<string, unknown> }).jwt;
+    expect(jwt?.issuer).toBeUndefined();
+  });
+
+  it("finalize preserves an EXISTING issuer pin across a wizard re-run (no clobber)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "t",
+              saas: { baseUrl: "https://saas.example.com" },
+              auth: { strategy: "jwt", jwt: { issuer: "https://logical-issuer.example" } },
+            },
+          },
+        },
+      },
+    } as never;
+    const finalized = webchannelSetupWizard.finalize?.({
+      cfg,
+      accountId: "accta",
+      credentialValues: { tenant: "t", saasBaseUrl: "https://saas.example.com" },
+    } as never) as { cfg: unknown };
+    // The operator's hand-set pin survives the full-block rewrite.
+    const jwt = (account(finalized.cfg, "accta").auth as { jwt: Record<string, unknown> }).jwt;
+    expect(jwt.issuer).toBe("https://logical-issuer.example");
   });
 });
 

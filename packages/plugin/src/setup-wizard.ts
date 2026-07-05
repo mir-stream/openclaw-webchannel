@@ -6,8 +6,9 @@
  * full `channels.webchannel.accounts.<id>` auth/nats block via `config patch`
  * before `channels add`. This declarative wizard drives the interactive path:
  * bare `openclaw channels add` → pick WebChannel → prompt for tenant + SaaS base
- * URL (plus advanced JWT issuer/audience overrides) → `finalize` writes the
- * COMPLETE, enroll-ready block.
+ * URL (plus an advanced JWT audience override) → `finalize` writes the
+ * COMPLETE, enroll-ready block. There is deliberately NO issuer prompt: the
+ * issuer is SaaS-delivered at enrollment (see the textInputs note).
  *
  * NOTE: the interactive wizard writes CONFIG ONLY. Core runs the device-flow
  * enroll (`webchannelSetup.afterAccountConfigWritten`) only on the non-interactive
@@ -59,7 +60,6 @@ type InputKey = ChannelSetupWizardTextInput["inputKey"];
 const KEY = {
   tenant: "tenant" as InputKey,
   saasBaseUrl: "saasBaseUrl" as InputKey,
-  issuer: "issuer" as InputKey,
   audience: "audience" as InputKey,
 } as const;
 
@@ -99,8 +99,8 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       const account = resolveWebchannelAccountConfig(cfg, id);
       const hasJwt = Boolean((account.auth as { jwt?: unknown } | undefined)?.jwt);
       if (hasJwt) return true;
-      // Enrolled creds on disk also count as configured (auth may be inert under
-      // admission=auto, but the account is usable).
+      // Enrolled creds on disk also count as configured (the account is usable
+      // under admission=register-hop even before jwt auth is fully wired).
       return existsSync(resolveReadCredentialPath(id));
     },
     resolveStatusLines: ({ cfg, accountId, configured }) => {
@@ -135,17 +135,15 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       validate: ({ value }) => validateHttpUrl(value),
       applySet: noopApplySet,
     },
-    {
-      // Advanced: defaults to the SaaS base URL. The docker demo needs the
-      // override (iss = the SaaS's own URL, not the container-dialed host).
-      inputKey: KEY.issuer,
-      message: "JWT issuer (advanced — press enter to default to the SaaS base URL)",
-      required: false,
-      initialValue: ({ cfg, accountId, credentialValues }) =>
-        (resolveWebchannelAccountConfig(cfg, accountId).auth as { jwt?: { issuer?: string } } | undefined)
-          ?.jwt?.issuer ?? credentialValues[KEY.saasBaseUrl],
-      applySet: noopApplySet,
-    },
+    // NO issuer prompt. The issuer is a trust FACT the SaaS DECLARES at
+    // enrollment (EnrollmentResult.issuer, precedence pin > delivered >
+    // derived) — prompting for it here would prefill the base URL and write an
+    // add-time PIN on every interactive add, permanently shadowing the
+    // SaaS-delivered value (including across re-enrollments that change it).
+    // Operators who genuinely need a pin (proxy / logical issuer) use the
+    // non-interactive `--flag` form's issuer param — the pure escape hatch.
+    // An EXISTING pin is never clobbered (buildFullAccountPatch no-clobber
+    // merge), so re-running the wizard on a pinned account is safe.
     {
       // Advanced: defaults to the CANONICAL account id (aud == the canonical
       // `accounts.<id>` key), so a mixed-case id typed at the prompt cannot make
@@ -184,7 +182,7 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       input: {
         baseUrl: saasBaseUrl,
         url: credentialValues[KEY.tenant],
-        issuer: credentialValues[KEY.issuer],
+        // issuer deliberately NOT collected/written — see the textInputs note.
         audience: credentialValues[KEY.audience],
       },
     });

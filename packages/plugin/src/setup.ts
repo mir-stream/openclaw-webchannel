@@ -54,6 +54,7 @@ import {
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
+import { runAddPreflight } from "./preflight.js";
 
 /**
  * The slice of `ChannelSetupInput` this adapter reads. The host type is a closed
@@ -158,17 +159,34 @@ function mergePatch(
   return next;
 }
 
-/** Join a base URL and a path, collapsing any duplicated slash at the seam. */
-function joinUrl(baseUrl: string, path: string): string {
-  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
-}
-
 /**
  * Build the COMPLETE, enroll-ready account block — the proven demo config
- * (`e2e/local/run-demo-synadia.sh`): tenant + saas.baseUrl + jwt auth (jwksUrl
- * derived from the SaaS base URL; issuer defaulting to the SaaS base URL;
- * audience defaulting to the account id) + `dmSecurity: "open"` + enrolled NATS
- * credentials under `admission: "auto"`.
+ * (`e2e/local/run-demo-synadia.sh`): tenant + saas.baseUrl + jwt auth strategy +
+ * `dmSecurity: "open"` + enrolled NATS credentials under `admission:
+ * "register-hop"`.
+ *
+ * TRUST-ANCHOR (design §4 change 2): the builder NO LONGER writes the JWT-verify
+ * params (`issuer` / `jwksUrl` / `audience`). Those are trust FACTS derived at
+ * RUNTIME from the anchor `{saas.baseUrl, accountId}` — `deriveAccountAuth` in
+ * `index-nats.ts` fills them in when absent (issuer = saas.baseUrl, audience =
+ * accountId, jwksUrl = saas.baseUrl + /.well-known/jwks.json). Writing guesses
+ * here was the source of the silent issuer-mismatch trap, so we stop guessing.
+ *
+ * `issuer` / `audience` are now OPTIONAL OPERATOR PINS, not defaults: they are
+ * written ONLY when the caller explicitly supplies them (the escape hatch for a
+ * proxy / custom-domain / logical-issuer deployment, threaded through
+ * `applyAccountConfig` and preserved across re-runs). When neither is supplied
+ * the `auth.jwt` sub-object is OMITTED ENTIRELY so nothing is guessed — only
+ * `auth.strategy: "jwt"` is written (runtime derivation supplies the rest).
+ *
+ * `admission` is pinned to `register-hop` because this builder ALWAYS emits a
+ * SaaS-enrolled jwt account (`auth.strategy: "jwt"`, `credentials.mode: "enrolled"`)
+ * — exactly the case `resolveAdmissionMode` would infer register-hop for (jwt +
+ * a viable register hop). Pinning it makes the register-over-NATS chat path work
+ * out of the box; the legacy `auto` (X25519-handshake, no `.register` subject)
+ * would silently break the browser's register request. Static/BYO-NATS accounts
+ * do NOT reach this builder (they take the partial `buildAccountPatch` path), so
+ * their `auto` default is unaffected.
  *
  * `nats.url` is intentionally OMITTED — the SaaS delivers the relay URL together
  * with the enrolled credentials at device-flow time (it is the rendezvous
@@ -182,23 +200,35 @@ export function buildFullAccountPatch(params: {
   tenant: string;
   saasBaseUrl: string;
   accountId: string;
+  /**
+   * OPERATOR PIN (optional). When present, written as `auth.jwt.issuer` to force
+   * a specific issuer; when absent, issuer DERIVES at runtime from saas.baseUrl.
+   */
   issuer?: string;
+  /**
+   * OPERATOR PIN (optional). When present, written as `auth.jwt.audience`; when
+   * absent, audience DERIVES at runtime from the accountId.
+   */
   audience?: string;
 }): Record<string, unknown> {
-  const { tenant, saasBaseUrl, accountId, issuer, audience } = params;
+  // `accountId` remains a required param (callers pass it, and it documents that
+  // audience derives from it at runtime) but is no longer read here — the runtime
+  // deriver owns `audience = accountId`.
+  const { tenant, saasBaseUrl, issuer, audience } = params;
+  // Emit auth.jwt ONLY for the explicit operator pins (issuer/audience). jwksUrl
+  // is never written here — it derives at runtime. If neither pin is supplied,
+  // omit auth.jwt entirely so nothing is guessed (strategy alone is written).
+  const jwtPins: Record<string, unknown> = {};
+  if (issuer !== undefined) jwtPins.issuer = issuer;
+  if (audience !== undefined) jwtPins.audience = audience;
+  const auth: Record<string, unknown> = { strategy: "jwt" };
+  if (Object.keys(jwtPins).length > 0) auth.jwt = jwtPins;
   return {
     tenant,
     saas: { baseUrl: saasBaseUrl },
-    auth: {
-      strategy: "jwt",
-      jwt: {
-        jwksUrl: joinUrl(saasBaseUrl, ".well-known/jwks.json"),
-        issuer: issuer ?? saasBaseUrl,
-        audience: audience ?? accountId,
-      },
-    },
+    auth,
     dmSecurity: "open",
-    nats: { admission: "auto", credentials: { mode: "enrolled" } },
+    nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
   };
 }
 
@@ -386,10 +416,40 @@ export const webchannelSetup = {
     );
 
     try {
-      await acquireCredentials({
+      const enrollment = await acquireCredentials({
         accountId: id,
         saasBaseUrl,
         tenant,
+        log: (...args) => runtime.log(...args),
+      });
+
+      // Gate A (design §4 change 4): the achievable add-time preflight, run
+      // POST-enroll (creds are now persisted) and BEFORE declaring the add
+      // done, so any residual trust misconfig is self-explaining while the
+      // operator is watching. It checks issuer/aud internal consistency, the
+      // derived JWKS (reachable + non-empty + matching the SaaS's advertised
+      // url — the issuer-mismatch trap), and a real relay dial with the enrolled
+      // creds. A true end-to-end register round-trip is INFEASIBLE at add-time
+      // (no running gateway ⇒ no `*.register` subscriber, and no browser
+      // bootstrap JWT yet) — see `preflight.ts` runAddPreflight for the honest
+      // scope. Never throws (matches this hook's non-fatal contract); a FAIL is a
+      // loud, actionable log line.
+      const existingJwt = (account.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
+        ?.jwt;
+      await runAddPreflight({
+        accountId: id,
+        tenant,
+        saasBaseUrl,
+        enrollment: {
+          userJwt: enrollment.creds.userJwt,
+          userSeed: enrollment.creds.userSeed,
+          ...(enrollment.natsUrl !== undefined ? { natsUrl: enrollment.natsUrl } : {}),
+          ...(enrollment.jwksUrl !== undefined ? { jwksUrl: enrollment.jwksUrl } : {}),
+          ...(enrollment.issuer !== undefined ? { issuer: enrollment.issuer } : {}),
+        },
+        // Config-present-wins: an operator PIN overrides the derivation.
+        ...(existingJwt?.issuer !== undefined ? { pinnedIssuer: existingJwt.issuer } : {}),
+        ...(existingJwt?.audience !== undefined ? { pinnedAudience: existingJwt.audience } : {}),
         log: (...args) => runtime.log(...args),
       });
     } catch (err) {

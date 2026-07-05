@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebChannel reference app</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+      h1 { font-size: 18px; }
+      #status { color: #555; font-size: 13px; margin: 8px 0; }
+      #banner:not(:empty) { padding: 8px 10px; background: #fff7e6; border: 1px solid #f0d090; border-radius: 6px; font-size: 13px; margin: 8px 0; }
+      #banner button { margin-left: 6px; }
+      #chat { display: flex; flex-direction: column; gap: 6px; min-height: 120px; margin: 12px 0; }
+      .msg { padding: 6px 10px; border-radius: 8px; font-size: 13px; max-width: 80%; }
+      .msg.user { align-self: flex-end; background: #2f81f7; color: #fff; }
+      .msg.agent { align-self: flex-start; background: #eee; }
+      form { display: flex; gap: 8px; }
+      input { flex: 1; padding: 6px 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>WebChannel reference app (public API only)</h1>
+    <p style="font-size:13px;color:#555">
+      Login with <code>alice / password</code>. With no openclaw agent attached, the
+      client connects then gracefully waits for an agent.
+    </p>
+
+    <form id="login">
+      <input name="username" placeholder="username" value="alice" />
+      <input name="password" type="password" placeholder="password" value="password" />
+      <button type="submit">Login</button>
+    </form>
+
+    <div id="status"></div>
+    <div id="banner"></div>
+    <div id="chat"></div>
+
+    <form id="composer" style="display:none">
+      <input id="msg" placeholder="Type a message…" autocomplete="off" />
+      <button type="submit">Send</button>
+    </form>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

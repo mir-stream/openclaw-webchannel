@@ -20,7 +20,6 @@ import { WebChannelNatsClient } from "../../packages/client/src/nats-client.js";
 import { buildBootstrapClaims } from "../../packages/saas/src/bootstrap-claims.js";
 
 const NATS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18222";
-const GW_URL = process.env.WEBCHANNEL_GW_URL ?? "http://127.0.0.1:18799";
 const PRIV_PATH = process.env.WEBCHANNEL_RS256_PRIVATE ?? "/tmp/oc-two-acct-e2e/rs256-private.jwk.json";
 
 const ISS = process.env.WEBCHANNEL_ISSUER ?? "https://e2e-issuer.test";
@@ -92,8 +91,11 @@ const client = new WebChannelNatsClient({
   tenant: TENANT,
   peerId: PEER_ID,
   registration: {
-    registerBaseUrl: GW_URL,
+    // The client derives the register subject from tenant/accountId/peerId and
+    // drives challenge→register over NATS request/reply (no gateway URL).
     devicePrivateKey: ed25519.privateKey,
+    // Phase 6: register-delivered conversation key (no handshake).
+    deviceX25519PrivateKey: x25519.privateKey,
   },
 });
 

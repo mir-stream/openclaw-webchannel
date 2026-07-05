@@ -50,4 +50,27 @@ describe("buildBootstrapClaims", () => {
   it("requires a peerId", () => {
     expect(() => buildBootstrapClaims({ ...base, peerId: "" })).toThrow(/peerId/);
   });
+
+  it("scalar accountId keeps the byte-for-byte behaviour: aud === accountId === id", () => {
+    const claims = buildBootstrapClaims(base);
+    expect(claims.aud).toBe("agent-1");
+    expect(claims.accountId).toBe("agent-1");
+  });
+
+  it("array accountId mints a multi-audience token with a dead (empty) top-level accountId", () => {
+    const claims = buildBootstrapClaims({ ...base, accountId: ["agent-dev", "agent-ops"] });
+    expect(claims.aud).toEqual(["agent-dev", "agent-ops"]);
+    // The top-level accountId is a dead claim; multi-aud has no single primary → "".
+    expect(claims.accountId).toBe("");
+  });
+
+  it("a single-element array still yields an array aud (multi form), not a scalar", () => {
+    const claims = buildBootstrapClaims({ ...base, accountId: ["agent-dev"] });
+    expect(claims.aud).toEqual(["agent-dev"]);
+    expect(claims.accountId).toBe("");
+  });
+
+  it("rejects an empty accountId array", () => {
+    expect(() => buildBootstrapClaims({ ...base, accountId: [] })).toThrow(/non-empty/);
+  });
 });

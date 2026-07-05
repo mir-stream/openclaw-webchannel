@@ -5,9 +5,6 @@ import { webcrypto } from "node:crypto";
 import {
   resolveVerifier,
   verifyJwtAndExtractIdentity,
-  storePinnedDeviceKey,
-  getPinnedDeviceKey,
-  clearPinnedDeviceKeys,
   type AuthConfig,
   type AuthLogger,
 } from "./auth.js";
@@ -205,6 +202,28 @@ describe("jwt strategy (AC2 — happy path)", () => {
   });
 });
 
+describe("fail-closed when the signing kid is unknown/evicted", () => {
+  beforeAll(async () => {
+    await ensureRsaKeys();
+  });
+
+  it("returns null (not throws) so the register route yields a clean 401, not a 500", async () => {
+    // A JWKS that has been rotated away from the token's kid: the resolver throws
+    // on the kid miss (fail-closed). verifyJwtAndExtractIdentity must translate
+    // that throw into a null verdict — an unknown/evicted kid is an auth failure
+    // (401), not a server fault (500). Mirrors JWKS key eviction in the demo.
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signRs256({ iss: ISSUER, aud: AUDIENCE, sub: "user-evicted", iat: now, exp: now + 60 });
+    const rotatedAwayJwks: JsonWebKeySet = { keys: [{ ...rsaJwks.keys[0]!, kid: "some-other-kid" }] };
+    const authConfig: AuthConfig = {
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rotatedAwayJwks },
+    };
+
+    await expect(verifyJwtAndExtractIdentity(token, authConfig)).resolves.toBeNull();
+  });
+});
+
 describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", () => {
   beforeAll(async () => {
     await ensureRsaKeys();
@@ -287,29 +306,7 @@ describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", ()
   });
 });
 
-describe("S2 — pinned device key store is bounded (FIFO)", () => {
-  const MAX = 10_000; // must mirror MAX_PINNED_DEVICE_KEYS in auth.ts
-
-  it("re-pinning the same peerId does not grow the store", () => {
-    clearPinnedDeviceKeys();
-    storePinnedDeviceKey("peer-x", "keyA");
-    storePinnedDeviceKey("peer-x", "keyB"); // rotation, not growth
-    expect(getPinnedDeviceKey("peer-x")).toBe("keyB");
-  });
-
-  it("evicts the oldest pins once the cap is exceeded", () => {
-    clearPinnedDeviceKeys();
-    // The two oldest, then fill exactly to the cap with fresh peers → the two
-    // oldest are pushed out.
-    storePinnedDeviceKey("peer-oldest-0", "k0");
-    storePinnedDeviceKey("peer-oldest-1", "k1");
-    for (let i = 0; i < MAX; i++) {
-      storePinnedDeviceKey(`filler-${i}`, "k");
-    }
-    // Two oldest evicted; a recent one survives.
-    expect(getPinnedDeviceKey("peer-oldest-0")).toBeNull();
-    expect(getPinnedDeviceKey("peer-oldest-1")).toBeNull();
-    expect(getPinnedDeviceKey(`filler-${MAX - 1}`)).toBe("k");
-    clearPinnedDeviceKeys();
-  });
-});
+// NOTE (Phase 6 / W7): the "S2 — pinned device key store is bounded" suite is
+// gone with the pin store itself (see auth.ts) — the register route wraps the
+// conversation key per-request from `identity.devicePublicKey`; there is no
+// module-global key store left to bound.

@@ -14,6 +14,16 @@ vi.mock("./acquire-credentials.js", () => ({
   acquireCredentials: (opts: never) => acquireMock(opts),
 }));
 
+// Mock the Gate A preflight so afterAccountConfigWritten is testable without a
+// real SaaS JWKS fetch / NATS relay dial. The real preflight is covered in
+// preflight.test.ts; here we only assert it is INVOKED post-enroll.
+const preflightMock = vi.fn(
+  async (_opts: unknown) => ({ ok: true, line: "channels add preflight: (stub)" }),
+);
+vi.mock("./preflight.js", () => ({
+  runAddPreflight: (opts: never) => preflightMock(opts),
+}));
+
 // Mock node:fs so the "creds already exist" probe is controllable.
 const existsMock = vi.fn((_p: string) => false);
 vi.mock("node:fs", async (importOriginal) => {
@@ -30,6 +40,7 @@ function section(next: unknown): Record<string, unknown> {
 
 beforeEach(() => {
   acquireMock.mockClear();
+  preflightMock.mockClear();
   existsMock.mockReset();
   existsMock.mockReturnValue(false);
 });
@@ -95,22 +106,18 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
       input: { saasBaseUrl: "http://s", tenant: "t" },
     });
     // saasBaseUrl present ⇒ the complete enroll-ready block is written under the
-    // named account (derived issuer = saasBaseUrl, audience = accountId).
+    // named account. Trust-anchor change 2: issuer/jwksUrl/audience are NOT
+    // written (no operator pins supplied) — they derive at runtime from
+    // {saas.baseUrl, accountId}. Only the anchor + strategy + admission/creds/
+    // dmSecurity are persisted.
     expect(section(next)).toEqual({
       accounts: {
         accta: {
           tenant: "t",
           saas: { baseUrl: "http://s" },
-          auth: {
-            strategy: "jwt",
-            jwt: {
-              jwksUrl: "http://s/.well-known/jwks.json",
-              issuer: "http://s",
-              audience: "accta",
-            },
-          },
+          auth: { strategy: "jwt" },
           dmSecurity: "open",
-          nats: { admission: "auto", credentials: { mode: "enrolled" } },
+          nats: { admission: "register-hop", credentials: { mode: "enrolled" } },
         },
       },
     });
@@ -186,10 +193,11 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
       string,
       unknown
     >;
+    // Explicit issuer/audience are operator PINS and ARE written; jwksUrl is
+    // never written by the builder anymore (it derives at runtime).
     expect(accta.auth).toEqual({
       strategy: "jwt",
       jwt: {
-        jwksUrl: "http://host.docker.internal:3951/.well-known/jwks.json",
         issuer: "http://127.0.0.1:3951",
         audience: "custom-aud",
       },
@@ -308,6 +316,14 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       accountId: "accta",
       saasBaseUrl: "http://s",
       tenant: "tA",
+    });
+    // Gate A preflight runs POST-enroll with the derived anchor + enrolled creds.
+    expect(preflightMock).toHaveBeenCalledOnce();
+    expect(preflightMock.mock.calls[0][0]).toMatchObject({
+      accountId: "accta",
+      saasBaseUrl: "http://s",
+      tenant: "tA",
+      enrollment: { userJwt: "JWT", userSeed: "SEED" },
     });
   });
 
