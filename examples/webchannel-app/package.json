@@ -1,0 +1,23 @@
+{
+  "name": "@mir-stream/webchannel-app-example",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference WebChannel app (SaaS backend + browser client) built with ONLY the public @mir-stream/webchannel-{saas,client} API.",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node test/no-internal-imports.test.mjs",
+    "bundle": "esbuild web/app.ts --bundle --format=iife --global-name=WebChannelApp --outfile=web/app.js",
+    "start": "tsx server/index.ts"
+  },
+  "dependencies": {
+    "@mir-stream/webchannel-saas": "*",
+    "@mir-stream/webchannel-client": "*"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  }
+}
