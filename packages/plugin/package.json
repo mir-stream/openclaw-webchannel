@@ -1,8 +1,7 @@
 {
   "name": "openclaw-webchannel",
-  "version": "0.0.0",
-  "description": "Self-hosted web chat channel plugin for OpenClaw (Phase 0 walking skeleton).",
-  "private": true,
+  "version": "0.1.0",
+  "description": "Self-hosted web chat channel plugin for OpenClaw: E2E-encrypted browser chat over a NATS relay.",
   "type": "module",
   "openclaw": {
     "extensions": [
@@ -13,6 +12,14 @@
       "id": "webchannel",
       "label": "WebChannel",
       "blurb": "Self-hosted web chat channel served on the gateway port."
+    },
+    "compat": {
+      "pluginApi": ">=2026.6.10",
+      "minGatewayVersion": "2026.6.10"
+    },
+    "build": {
+      "openclawVersion": "2026.6.10",
+      "pluginSdkVersion": "2026.6.10"
     }
   },
   "engines": {
@@ -20,7 +27,8 @@
   },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "esbuild index-nats.ts setup-entry.ts --bundle --platform=node --format=esm --target=es2023 --outdir=dist --packages=external"
   },
   "peerDependencies": {
     "openclaw": ">=2026.6.10"
