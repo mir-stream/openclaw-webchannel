@@ -1,0 +1,43 @@
+name: Install nats-server
+description: Provision the pinned nats-server binary, with a cross-workflow cache.
+
+inputs:
+  version:
+    description: nats-server release tag to provision (e.g. v2.14.0).
+    # SINGLE SOURCE OF TRUTH for the pinned nats-server version: bump it HERE and
+    # every workflow that uses this action follows. Never "latest" — a floating
+    # server version silently changes what the real-server suites test against.
+    default: "v2.14.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Cache nats-server binary
+      id: cache-nats
+      uses: actions/cache@v4
+      with:
+        path: /usr/local/bin/nats-server
+        # Key resolves to e.g. nats-server-v2.14.0-linux-amd64 — identical to the
+        # keys the workflows used before this action existed, so existing caches
+        # still hit.
+        key: nats-server-${{ inputs.version }}-linux-amd64
+
+    - name: Install nats-server ${{ inputs.version }}
+      if: steps.cache-nats.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        VERSION="${{ inputs.version }}"
+        TARBALL="nats-server-${VERSION}-linux-amd64.tar.gz"
+        URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${TARBALL}"
+        curl -fsSL "${URL}" -o "/tmp/${TARBALL}"
+        tar -xzf "/tmp/${TARBALL}" -C /tmp
+        sudo mv "/tmp/nats-server-${VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
+        sudo chmod +x /usr/local/bin/nats-server
+        rm -rf "/tmp/${TARBALL}" "/tmp/nats-server-${VERSION}-linux-amd64"
+
+    - name: Verify nats-server is on PATH
+      shell: bash
+      run: |
+        which nats-server
+        nats-server --version
