@@ -236,3 +236,54 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     expect(logger.warn.mock.calls[0][0]).toMatch(/history\.pageBefore failed/);
   });
 });
+
+describe("history — read-time sanitization (live/history text parity)", () => {
+  it("normalizes a raw assistant transcript (tool XML + placeholder) to clean text", async () => {
+    const { api } = makeApi([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text:
+              '<tool_call>{"name":"get_roster","arguments":{}}</tool_call>\n' +
+              "[tool calls omitted]\n답변 본문.",
+          },
+        ],
+        timestamp: 1700000000000,
+        __openclaw: { id: "m-1" },
+      },
+    ]);
+    const out = await recent(api, "agent:main:webchannel:web-anon", 10);
+    expect(out).toEqual([
+      { id: "m-1", role: "agent", text: "답변 본문.", ts: 1700000000000 },
+    ]);
+  });
+
+  it("drops a NO_REPLY-only assistant message (not emitted)", async () => {
+    const { api } = makeApi([
+      { role: "user", content: [{ type: "text", text: "hi" }], __openclaw: { id: "u-1" } },
+      { role: "assistant", content: [{ type: "text", text: "NO_REPLY" }], __openclaw: { id: "a-1" } },
+      { role: "assistant", content: [{ type: "text", text: "real reply" }], __openclaw: { id: "a-2" } },
+    ]);
+    const out = await recent(api, "agent:main:webchannel:web-anon", 10);
+    expect(out.map((m) => m.id)).toEqual(["u-1", "a-2"]);
+    expect(out.map((m) => m.text)).toEqual(["hi", "real reply"]);
+  });
+
+  it("strips injected metadata blocks + timestamp from a raw user message, keeping only the body", async () => {
+    // The real inbound shape: sentinel LABEL lines + ```json fences prepended,
+    // then a `[timestamp] body` line. Only the body should survive re-hydration.
+    const rawUser =
+      "Conversation info (untrusted metadata):\n```json\n{\n  \"is_group_chat\": true\n}\n```\n" +
+      "Sender (untrusted metadata):\n```json\n{\n  \"label\": \"bob\"\n}\n```\n" +
+      "\n[Mon 2026-07-06 20:04 GMT+9] 실제 사용자 질문입니다.";
+    const { api } = makeApi([
+      { role: "user", content: [{ type: "text", text: rawUser }], __openclaw: { id: "u-1" } },
+    ]);
+    const out = await recent(api, "agent:main:webchannel:web-anon", 10);
+    expect(out).toEqual([
+      { id: "u-1", role: "user", text: "실제 사용자 질문입니다.", ts: expect.any(Number) },
+    ]);
+  });
+});
