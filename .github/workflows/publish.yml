@@ -7,10 +7,17 @@
 # Trigger: push a tag like v0.1.0 (all three share ONE version), or run the npm
 # leg manually via workflow_dispatch. The npm packages use the built-in
 # GITHUB_TOKEN — no PAT/npm creds. The plugin leg (publish-plugin, gated on the
-# npm leg) publishes to ClawHub via GitHub Actions OIDC trusted publishing — no
-# stored token: the clawhub CLI auto-detects the Actions OIDC env and exchanges
-# a short-lived publish token (requires `id-token: write` + a one-time
-# `clawhub package trusted-publisher set` — see docs/PUBLISHING.md).
+# npm leg) publishes to ClawHub.
+#
+# ClawHub auth is OIDC-first with a stored-token FALLBACK. The clawhub CLI's
+# resolvePackagePublishToken tries an OIDC mint first, then falls back to the
+# stored config token on mint failure. TODAY the fallback is the active path:
+# this repo is PRIVATE, and ClawHub can't register trusted publishing for a
+# private repo (its server-side GitHub lookup 404s), so we authenticate with a
+# `CLAWHUB_TOKEN` repo secret written to a runner-temp config file. `id-token:
+# write` stays wired so that the day the repo goes public and trusted publishing
+# is registered (`clawhub package trusted-publisher set`), OIDC takes over with
+# ZERO workflow change and the secret can be deleted. See docs/PUBLISHING.md.
 #
 # 3-way version lockstep is enforced hard: tag == plugin == client == saas, so
 # the plugin can never drift behind the npm packages again.
@@ -99,10 +106,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # OIDC trusted publishing: the clawhub CLI exchanges a GitHub Actions OIDC
-      # token (audience "clawhub") for a short-lived ClawHub publish token. No
-      # stored secret. Requires the one-time trusted-publisher config on the
-      # registry side (docs/PUBLISHING.md).
+      # Kept wired for forward-compat: the clawhub CLI tries an OIDC mint
+      # (audience "clawhub") FIRST and only falls back to the stored token on
+      # failure. It's inert today because trusted publishing can't be registered
+      # while this repo is private — once the repo is public and registered,
+      # OIDC takes over automatically with no workflow change (docs/PUBLISHING.md).
       id-token: write
     env:
       # Pin the ClawHub CLI so a registry-side CLI release can't silently change
@@ -114,6 +122,11 @@ jobs:
       # under CI when the nats-server binary is missing, so the plugin tests
       # need it installed too.
       NATS_SERVER_VERSION: "v2.14.0"
+      # Point the clawhub CLI at a temp config file we provision below with the
+      # CLAWHUB_TOKEN secret (the OIDC fallback path). The CLI honors this
+      # override (config.js getGlobalConfigPath). Literal /tmp because the
+      # `runner` context is not available in job-level env.
+      CLAWHUB_CONFIG_PATH: /tmp/clawhub-config.json
     steps:
       - uses: actions/checkout@v4
 
@@ -169,6 +182,19 @@ jobs:
         # ClawHub validates dist/ on a real publish (not on --dry-run), and
         # dist/ is gitignored — so it MUST be built here before publishing.
         run: npm run build -w packages/plugin
+
+      - name: Provision ClawHub token (OIDC fallback)
+        # Write the CLI's global config ({registry, token}) to the runner-temp
+        # path CLAWHUB_CONFIG_PATH points at. registry is REQUIRED by the CLI's
+        # schema (a mismatch makes readGlobalConfig return null → "Not logged
+        # in"). The secret is passed via env and written by node — never
+        # interpolated into the shell script body.
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "${CLAWHUB_TOKEN:-}" ] || { echo "::error::CLAWHUB_TOKEN secret is missing"; exit 1; }
+          node -e 'require("fs").writeFileSync(process.env.CLAWHUB_CONFIG_PATH, JSON.stringify({ registry: "https://clawhub.ai", token: process.env.CLAWHUB_TOKEN }), { mode: 0o600 })'
 
       - name: Skip if this version is already on ClawHub (idempotency)
         id: already

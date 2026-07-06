@@ -54,21 +54,36 @@ the ClawHub registry as owner `mir-stream`, family `code-plugin`.
 version equals the plugin, client, and saas `package.json` versions. A mismatch
 aborts the release with a clear error — bump all three to match the tag.
 
-**Authentication — GitHub Actions OIDC trusted publishing (no stored token).**
-The pinned `clawhub` CLI auto-detects the Actions OIDC environment, requests a
-GitHub OIDC token (audience `clawhub`), and exchanges it for a short-lived
-ClawHub publish token. The job therefore only needs `id-token: write`
-permission — there is **no `CLAWHUB_TOKEN` secret** to manage or rotate. If OIDC
-is unavailable the CLI falls back to a stored login token (used only for local
-manual publishes).
+**Authentication — OIDC-first, stored-token fallback (fallback is active today).**
+The pinned `clawhub` CLI tries GitHub Actions OIDC trusted publishing *first*
+(requesting a GitHub OIDC token, audience `clawhub`, and exchanging it for a
+short-lived ClawHub token) and only falls back to a stored config token when
+that mint fails. **Right now the fallback is the active path.** This repo is
+**private**, and ClawHub cannot register trusted publishing for a private repo —
+its server-side GitHub repo lookup 404s — so OIDC has nothing to authenticate
+against and the CLI falls through to the stored token.
 
-**Idempotency.** The job runs `clawhub package inspect openclaw-webchannel
---version <V> --json` first; if that version already exists it logs and skips
-the publish (success). This tolerates re-runs and versions published manually.
+That stored token is a **`CLAWHUB_TOKEN` repo secret** (the raw token string, no
+JSON). The `Provision ClawHub token` step writes it to a temp config file on the runner
+(`{"registry":"https://clawhub.ai","token":"…"}`, mode `0600`) and points the
+CLI at it via the `CLAWHUB_CONFIG_PATH` env var; the secret is passed through
+step env and written by `node`, never interpolated into the shell script. The
+`id-token: write` permission stays wired so the OIDC path lights up
+automatically once the repo is public (see below).
 
-**One-time setup (registry side).** Trusted publishing must be registered once
-so ClawHub trusts this repo's workflow. An owner of the `openclaw-webchannel`
-package runs:
+Rotating the token: mint a fresh one locally with `clawhub token`, then
+`gh secret set CLAWHUB_TOKEN` with the new value. No workflow change needed.
+
+**Idempotency.** Before publishing, the job runs `clawhub package inspect
+openclaw-webchannel --version <V> --json` and confirms the returned JSON
+actually contains that version; if so it logs and skips (success). Anything else
+(missing package/version, parse failure) falls through to publish. This
+tolerates re-runs and versions published manually.
+
+**Upgrading to OIDC (when the repo becomes public).** Once this repo is public,
+register trusted publishing once — then OIDC takes over automatically and the
+`CLAWHUB_TOKEN` secret can be deleted (no workflow change). An owner of the
+`openclaw-webchannel` package runs:
 
 ```sh
 clawhub package trusted-publisher set openclaw-webchannel \
@@ -76,9 +91,9 @@ clawhub package trusted-publisher set openclaw-webchannel \
   --workflow-filename publish.yml
 ```
 
-After this is set, **manual** (local) publishes of the plugin require an
-explicit `--manual-override-reason "<why>"` flag; CI publishes via OIDC need no
-such flag.
+After trusted publishing is registered, **manual** (local) publishes of the
+plugin require an explicit `--manual-override-reason "<why>"` flag; CI publishes
+via OIDC need no such flag.
 
 **CLI pinning.** The workflow pins `clawhub@0.23.1` so a registry-side CLI
 release can't silently change the publish contract mid-release. Bump the pin in
