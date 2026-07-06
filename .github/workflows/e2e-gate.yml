@@ -37,8 +37,6 @@ jobs:
     # in each published package.json.
     env:
       NODE_VERSION: "22"
-      # nats-server release to provision (pinned — never use "latest").
-      NATS_SERVER_VERSION: "v2.14.0"
       # Signal to real-server test suites that nats-server MUST be present.
       CI: "true"
 
@@ -65,32 +63,12 @@ jobs:
       #      - packages/saas/src/nats-permissions-realserver.test.ts
       #      - packages/saas/src/ac6-device-flow-e2e.test.ts
       #    Without this binary the real-server suites HARD FAIL (not skip).
+      #    The pinned version + cache key live in the composite action
+      #    (.github/actions/install-nats-server) — the single source of truth
+      #    shared with publish.yml; the action also verifies it is on PATH.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Cache nats-server binary
-        id: cache-nats
-        uses: actions/cache@v4
-        with:
-          path: /usr/local/bin/nats-server
-          key: nats-server-${{ env.NATS_SERVER_VERSION }}-linux-amd64
-
-      - name: Install nats-server ${{ env.NATS_SERVER_VERSION }}
-        if: steps.cache-nats.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          VERSION="${NATS_SERVER_VERSION}"
-          TARBALL="nats-server-${VERSION}-linux-amd64.tar.gz"
-          URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${TARBALL}"
-          echo "Downloading nats-server ${VERSION} from ${URL}"
-          curl -fsSL "${URL}" -o "/tmp/${TARBALL}"
-          tar -xzf "/tmp/${TARBALL}" -C /tmp
-          sudo mv "/tmp/nats-server-${VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
-          sudo chmod +x /usr/local/bin/nats-server
-          rm -rf "/tmp/${TARBALL}" "/tmp/nats-server-${VERSION}-linux-amd64"
-
-      - name: Verify nats-server is on PATH
-        run: |
-          which nats-server
-          nats-server --version
+      - name: Install nats-server (pinned, cached)
+        uses: ./.github/actions/install-nats-server
 
       # ──────────────────────────────────────────────────────────────────────
       # 4. Install dependencies (all workspaces)

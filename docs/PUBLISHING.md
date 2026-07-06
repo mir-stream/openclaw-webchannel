@@ -22,7 +22,10 @@ One `v*` tag ships **all three** artifacts at a **single, identical version** �
 1. Bump `version` to the **same** value in all three:
    `packages/client/package.json`, `packages/saas/package.json`, and
    `packages/plugin/package.json`.
-2. Commit, then tag and push:
+2. Commit, then tag and push. Use a **lightweight** tag (plain `git tag vX.Y.Z`,
+   not `git tag -a`): on an annotated-tag push `GITHUB_SHA` can reference the tag
+   object instead of the commit, which would pollute the `--source-commit`
+   metadata the plugin leg records.
 
    ```sh
    git tag v0.1.0
@@ -35,8 +38,9 @@ The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs two jobs:
   built-in `GITHUB_TOKEN` (no secrets). Also runnable manually from the Actions
   tab (workflow_dispatch), which ships only the npm packages.
 - **`publish-plugin`** — gated on `publish` succeeding; builds/tests the plugin
-  and publishes it to ClawHub (see next section). Skipped on manual
-  workflow_dispatch runs (no tag to lockstep against).
+  and publishes it to ClawHub (see next section). Skipped on ALL manual
+  workflow_dispatch runs — including one started from a tag ref — since it
+  requires a tag *push* (no tag to lockstep against otherwise).
 
 Note: publishing the **same version twice fails** on GitHub Packages — always
 bump the version before re-tagging. (The ClawHub leg is idempotent — it skips
@@ -50,9 +54,13 @@ leg is reached.)
 The `publish-plugin` job publishes `openclaw-webchannel` (`packages/plugin`) to
 the ClawHub registry as owner `mir-stream`, family `code-plugin`.
 
-**3-way version lockstep.** Before publishing, the job hard-fails unless the tag
-version equals the plugin, client, and saas `package.json` versions. A mismatch
-aborts the release with a clear error — bump all three to match the tag.
+**3-way version lockstep.** The check runs in **both** jobs. In the npm leg
+(`publish`) it runs *before anything is published* — so if the tag version does
+not equal the plugin, client, and saas `package.json` versions, the release
+aborts with a clear error and **nothing ships**; the copy in `publish-plugin` is
+defense-in-depth. Because the abort happens before any artifact is published,
+the tag is not burned: fix the versions to match, then delete and re-push the
+tag to recover.
 
 **Authentication — OIDC-first, stored-token fallback (fallback is active today).**
 The pinned `clawhub` CLI tries GitHub Actions OIDC trusted publishing *first*
