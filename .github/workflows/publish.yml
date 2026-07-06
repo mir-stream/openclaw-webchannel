@@ -1,11 +1,19 @@
 ################################################################################
-# publish.yml — Publish @mir-stream/webchannel-client and
-# @mir-stream/webchannel-saas to GitHub Packages (private npm registry).
+# publish.yml — Publish all three release artifacts from ONE v* tag:
+#   1. @mir-stream/webchannel-client → GitHub Packages (private npm registry)
+#   2. @mir-stream/webchannel-saas   → GitHub Packages (private npm registry)
+#   3. openclaw-webchannel plugin    → ClawHub registry (code-plugin)
 #
-# Trigger: push a tag like v0.1.0 (both packages share one version), or run
-# manually via workflow_dispatch. Uses the built-in GITHUB_TOKEN — no PAT or
-# npm creds needed on the publish side; packages inherit the repo's private
-# visibility.
+# Trigger: push a tag like v0.1.0 (all three share ONE version), or run the npm
+# leg manually via workflow_dispatch. The npm packages use the built-in
+# GITHUB_TOKEN — no PAT/npm creds. The plugin leg (publish-plugin, gated on the
+# npm leg) publishes to ClawHub via GitHub Actions OIDC trusted publishing — no
+# stored token: the clawhub CLI auto-detects the Actions OIDC env and exchanges
+# a short-lived publish token (requires `id-token: write` + a one-time
+# `clawhub package trusted-publisher set` — see docs/PUBLISHING.md).
+#
+# 3-way version lockstep is enforced hard: tag == plugin == client == saas, so
+# the plugin can never drift behind the npm packages again.
 #
 # Consumers need an .npmrc pointing @mir-stream at npm.pkg.github.com plus a
 # read:packages token — see docs/PUBLISHING.md.
@@ -75,3 +83,133 @@ jobs:
         run: npm publish -w packages/client -w packages/saas
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Plugin leg: publish the openclaw-webchannel code-plugin to ClawHub.
+  #
+  # Gated on `needs: publish` — if the npm publish failed the tag is a dud and
+  # the plugin must not ship on its own. Tag-only (`if:` guard) so a manual
+  # workflow_dispatch run, which has no tag/version to lockstep against, skips
+  # this job entirely and only ships the npm packages.
+  # ---------------------------------------------------------------------------
+  publish-plugin:
+    name: Publish plugin to ClawHub
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC trusted publishing: the clawhub CLI exchanges a GitHub Actions OIDC
+      # token (audience "clawhub") for a short-lived ClawHub publish token. No
+      # stored secret. Requires the one-time trusted-publisher config on the
+      # registry side (docs/PUBLISHING.md).
+      id-token: write
+    env:
+      # Pin the ClawHub CLI so a registry-side CLI release can't silently change
+      # the publish contract mid-release. Bump this DELIBERATELY and re-verify
+      # the publish flow when you do.
+      CLAWHUB_CLI: "clawhub@0.23.1"
+      # Must match the publish job's version + cache key (shared cache). The
+      # plugin's nats-transport-realserver.test.ts HARD FAILS at module load
+      # under CI when the nats-server binary is missing, so the plugin tests
+      # need it installed too.
+      NATS_SERVER_VERSION: "v2.14.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci
+
+      - name: Enforce 3-way version lockstep (tag == plugin == client == saas)
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PLUGIN_VERSION="$(node -p "require('./packages/plugin/package.json').version")"
+          CLIENT_VERSION="$(node -p "require('./packages/client/package.json').version")"
+          SAAS_VERSION="$(node -p "require('./packages/saas/package.json').version")"
+          echo "tag=${TAG_VERSION} plugin=${PLUGIN_VERSION} client=${CLIENT_VERSION} saas=${SAAS_VERSION}"
+          if [ "$PLUGIN_VERSION" != "$TAG_VERSION" ] \
+            || [ "$CLIENT_VERSION" != "$TAG_VERSION" ] \
+            || [ "$SAAS_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Version lockstep violation — tag v${TAG_VERSION} must equal plugin/client/saas. Bump all three to match the tag before releasing."
+            exit 1
+          fi
+          echo "VERSION=${TAG_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Cache nats-server binary
+        id: cache-nats
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/nats-server
+          key: nats-server-${{ env.NATS_SERVER_VERSION }}-linux-amd64
+
+      - name: Install nats-server ${{ env.NATS_SERVER_VERSION }}
+        if: steps.cache-nats.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${NATS_SERVER_VERSION}"
+          TARBALL="nats-server-${VERSION}-linux-amd64.tar.gz"
+          URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${TARBALL}"
+          curl -fsSL "${URL}" -o "/tmp/${TARBALL}"
+          tar -xzf "/tmp/${TARBALL}" -C /tmp
+          sudo mv "/tmp/nats-server-${VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
+          sudo chmod +x /usr/local/bin/nats-server
+          rm -rf "/tmp/${TARBALL}" "/tmp/nats-server-${VERSION}-linux-amd64"
+
+      - name: Plugin unit tests
+        run: npm test -w packages/plugin
+        env:
+          CI: "true"
+
+      - name: Build plugin
+        # ClawHub validates dist/ on a real publish (not on --dry-run), and
+        # dist/ is gitignored — so it MUST be built here before publishing.
+        run: npm run build -w packages/plugin
+
+      - name: Skip if this version is already on ClawHub (idempotency)
+        id: already
+        run: |
+          set -uo pipefail
+          # Don't trust the exit code: `package inspect` exits 0 for a missing
+          # PACKAGE (only a missing VERSION is non-zero), so a deleted/renamed
+          # package could be misread as "already published" and skipped forever.
+          # Confirm positively that the returned JSON contains THIS version;
+          # anything else (parse failure / missing package / missing version)
+          # falls through to publish (fail-toward-publish).
+          OUT="$(npx --yes "$CLAWHUB_CLI" package inspect openclaw-webchannel \
+            --version "$VERSION" --json 2>/dev/null || true)"
+          if printf '%s' "$OUT" | VERSION="$VERSION" node -e '
+              let raw = "";
+              process.stdin.on("data", (d) => (raw += d)).on("end", () => {
+                try {
+                  const j = JSON.parse(raw);
+                  if (j && j.version && j.version.version === process.env.VERSION) process.exit(0);
+                } catch {}
+                process.exit(1);
+              });
+            '; then
+            echo "openclaw-webchannel@${VERSION} confirmed on ClawHub — skipping publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "openclaw-webchannel@${VERSION} not confirmed present — will publish."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish plugin to ClawHub
+        if: steps.already.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          npx --yes "$CLAWHUB_CLI" package publish packages/plugin \
+            --family code-plugin \
+            --owner mir-stream \
+            --version "$VERSION" \
+            --source-repo mir-stream/openclaw-webchannel \
+            --source-commit "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF_NAME" \
+            --source-path packages/plugin \
+            --changelog "Release ${GITHUB_REF_NAME} — see repo changelog" \
+            --json
