@@ -93,8 +93,32 @@ jobs:
         env:
           CI: "true"
 
-      - name: Publish to GitHub Packages
-        run: npm publish -w packages/client -w packages/saas
+      # Per-package idempotency guard, same philosophy as the ClawHub leg: skip
+      # ONLY on positive confirmation that the exact version is already on the
+      # registry; any doubt falls through to publish. Don't trust `npm view` exit
+      # codes — missing-version vs missing-package semantics differ across npm
+      # majors (some exit 0 with empty output on a missing version), so we key off
+      # stdout: skip only when it positively equals the wanted version. Anything
+      # else (empty, E404, garbage) publishes, and a real duplicate still 409s
+      # loudly (no worse than before). This makes "Re-run failed jobs" safe after
+      # a partial npm publish (client shipped, saas flaked), and a full re-run of
+      # a fully-shipped tag a green no-op. Each check uses the package.json's own
+      # version (NOT the tag) so it's correct on workflow_dispatch too; lockstep
+      # guarantees package.json == tag on tag runs. `npm view` against GitHub
+      # Packages ALSO needs auth, so NODE_AUTH_TOKEN covers the whole step.
+      - name: Publish to GitHub Packages (idempotent)
+        run: |
+          set -euo pipefail
+          for PKG in client saas; do
+            NAME="$(node -p "require('./packages/${PKG}/package.json').name")"
+            WANT="$(node -p "require('./packages/${PKG}/package.json').version")"
+            GOT="$(npm view "${NAME}@${WANT}" version 2>/dev/null || true)"
+            if [ "$GOT" = "$WANT" ]; then
+              echo "${NAME}@${WANT} already on GitHub Packages — skipping."
+            else
+              npm publish -w "packages/${PKG}"
+            fi
+          done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -42,12 +42,15 @@ The `Publish Packages` workflow (`.github/workflows/publish.yml`) runs two jobs:
   workflow_dispatch runs — including one started from a tag ref — since it
   requires a tag *push* (no tag to lockstep against otherwise).
 
-Note: publishing the **same version twice fails** on GitHub Packages — always
-bump the version before re-tagging. (The ClawHub leg is idempotent — it skips
-an already-published version, so **"Re-run failed jobs"** on `publish-plugin`
-is safe, as is a version that was already published manually. A full-workflow
-re-run of a shipped tag still goes red on the npm duplicate before the plugin
-leg is reached.)
+Note: **all three legs are idempotent.** Each package (client, saas, plugin) is
+skipped when that exact version is positively confirmed already on its registry
+(the npm leg checks each package with `npm view`, the ClawHub leg with `package
+inspect`) — so **"Re-run failed jobs"** is safe anywhere in the workflow,
+including after a partial npm publish (e.g. client shipped but saas flaked), and
+a full re-run of an already-shipped tag is a green no-op end-to-end. An
+already-published version is **never republished** (it is skipped, not
+overwritten): to ship new content you must **bump the version and cut a new
+tag**.
 
 ## Plugin publishing (ClawHub)
 
