@@ -214,12 +214,13 @@ function computeFenceMask(lines: string[]): boolean[] {
  * `sentinel-line + ```json … ```` block wherever it appears, and the trailing
  * untrusted-context suffix.
  *
- * Two code-region-aware guards (finding-driven): the trailing-header BREAK and
- * the sentinel-block OPENING are skipped when the line falls inside a Markdown
- * code region — an agent quoting the envelope inside an outer fence must keep
- * it verbatim, and a fence-quoted header must not truncate the prose after the
- * fence. We compute regions ONCE on the post-active-memory body and check each
- * line's start offset against them, tracking a running offset as we walk.
+ * Every strip in the loop is code-region-gated: the trailing-header BREAK, the
+ * sentinel-block OPENING, and delivery-hint lines are all skipped when the line
+ * falls inside a Markdown code region — an agent quoting any of these artifacts
+ * inside an outer fence must keep them verbatim, and a fence-quoted header must
+ * not truncate the prose after the fence. The gate is a per-line boolean fence
+ * mask (`computeFenceMask`) computed ONCE on the post-active-memory lines;
+ * removed lines never shift it because the loop indexes the original array.
  *
  * Unterminated ```json after a sentinel line: bail (keep the lines) rather than
  * swallow the rest of a truncated message.
@@ -237,7 +238,7 @@ function stripInboundEnvelopes(text: string): string {
     const line = lines[i];
     const inCode = inCodeMask[i];
     if (!inCode && isUntrustedContextHeaderStart(lines, i)) break;
-    if (isMessageToolDeliveryHintLine(line)) continue;
+    if (!inCode && isMessageToolDeliveryHintLine(line)) continue;
     if (
       !inCode &&
       INBOUND_META_SENTINEL_LINE.test(line.trim()) &&

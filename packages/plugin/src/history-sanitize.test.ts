@@ -200,6 +200,14 @@ describe("history-sanitize — delivery-hint lines", () => {
       "[Mon 2026-07-06 20:04 GMT+9] hello";
     expect(sanitizeHistoryText("user", raw)).toBe("hello");
   });
+
+  it("keeps a fence-quoted delivery hint (same code-region gate as the other strips)", () => {
+    const raw =
+      "The runtime injects this line:\n```\n" +
+      "Delivery: to send a message, use the `message` tool.\n" +
+      "```\nEnd of example.";
+    expect(sanitizeHistoryText("agent", raw)).toBe(raw);
+  });
 });
 
 describe("history-sanitize — envelope pass is code-region aware", () => {
