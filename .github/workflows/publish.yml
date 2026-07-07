@@ -1,8 +1,12 @@
 ################################################################################
-# publish.yml — Publish all three release artifacts from ONE v* tag:
+# publish.yml — Publish all release artifacts from ONE v* tag:
 #   1. @mir-stream/webchannel-client → GitHub Packages (private npm registry)
 #   2. @mir-stream/webchannel-saas   → GitHub Packages (private npm registry)
-#   3. openclaw-webchannel plugin    → ClawHub registry (code-plugin)
+#   3. openclaw-webchannel plugin    → public npm registry (registry.npmjs.org,
+#                                      OIDC trusted publishing — no NPM_TOKEN).
+#                                      This is the zero-auth remote-install path:
+#                                      `openclaw plugins install openclaw-webchannel@<v>`.
+#   4. openclaw-webchannel plugin    → ClawHub registry (code-plugin)
 #
 # Trigger: push a tag like v0.1.0 (all three share ONE version), or run the npm
 # leg manually via workflow_dispatch. The npm packages use the built-in
@@ -123,7 +127,116 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ---------------------------------------------------------------------------
-  # Plugin leg: publish the openclaw-webchannel code-plugin to ClawHub.
+  # Plugin leg #1: publish the openclaw-webchannel code-plugin to the PUBLIC npm
+  # registry (registry.npmjs.org) via OIDC Trusted Publishing — NO long-lived
+  # NPM_TOKEN. This is the registry-independent, zero-auth install path
+  # (`openclaw plugins install openclaw-webchannel@<v>`): the plugin is unscoped
+  # so it can't live in GitHub Packages, and ClawHub publishing is currently
+  # blocked by a scanner false-positive on the package.
+  #
+  # PREREQUISITE (one-time, manual, on npmjs.com): a Trusted Publisher must be
+  # configured for the `openclaw-webchannel` package —
+  #   Package → Settings → Trusted Publisher → Add:
+  #     Publisher = GitHub Actions
+  #     Repository = mir-stream/openclaw-webchannel
+  #     Workflow   = publish.yml
+  #     Environment = (blank)
+  # Until that exists, the publish STEP is denied by npm. The idempotency guard
+  # means an already-published version (e.g. the initial local 0.1.8) is skipped,
+  # so this leg only actually publishes — and thus only needs the trusted
+  # publisher — on the FIRST new version after setup. With OIDC + npm >= 11.5.1,
+  # `npm publish` mints short-lived credentials from the id-token automatically.
+  #
+  # Gated like the ClawHub leg: needs the GH-Packages leg, tag PUSH only.
+  # ---------------------------------------------------------------------------
+  publish-plugin-npm:
+    name: Publish plugin to npm (public, OIDC)
+    needs: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC trusted publishing: npm exchanges this id-token for a short-lived
+      # publish credential — no NPM_TOKEN secret in the repo.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing (OIDC) needs npm >= 11.5.1; the npm bundled with
+      # setup-node's Node 22 is older, so upgrade before publishing.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Enforce 3-way version lockstep (tag == plugin == client == saas)
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PLUGIN_VERSION="$(node -p "require('./packages/plugin/package.json').version")"
+          CLIENT_VERSION="$(node -p "require('./packages/client/package.json').version")"
+          SAAS_VERSION="$(node -p "require('./packages/saas/package.json').version")"
+          echo "tag=${TAG_VERSION} plugin=${PLUGIN_VERSION} client=${CLIENT_VERSION} saas=${SAAS_VERSION}"
+          if [ "$PLUGIN_VERSION" != "$TAG_VERSION" ] \
+            || [ "$CLIENT_VERSION" != "$TAG_VERSION" ] \
+            || [ "$SAAS_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Version lockstep violation — tag v${TAG_VERSION} must equal plugin/client/saas. Bump all three to match the tag before releasing."
+            exit 1
+          fi
+          echo "VERSION=${TAG_VERSION}" >> "$GITHUB_ENV"
+
+      # The plugin's nats-transport-realserver.test.ts HARD FAILS at module load
+      # under CI when the nats-server binary is missing — same composite action
+      # (pinned version + cache key) as the other legs.
+      - name: Install nats-server (pinned, cached)
+        uses: ./.github/actions/install-nats-server
+
+      - name: Install
+        run: npm ci
+
+      - name: Plugin unit tests
+        run: npm test -w packages/plugin
+        env:
+          CI: "true"
+
+      - name: Build plugin
+        # dist/ is gitignored and IS the published runtime — build before publish.
+        run: npm run build -w packages/plugin
+
+      - name: Skip if this version is already on public npm (idempotency)
+        id: already
+        run: |
+          set -uo pipefail
+          # Key off stdout, not exit code (npm view semantics differ across
+          # majors). Skip ONLY on a positive version match; anything else
+          # (empty / E404 / garbage) falls through to publish, and a real
+          # duplicate still 409s loudly. Makes "Re-run failed jobs" safe.
+          GOT="$(npm view "openclaw-webchannel@${VERSION}" version 2>/dev/null || true)"
+          if [ "$GOT" = "$VERSION" ]; then
+            echo "openclaw-webchannel@${VERSION} already on public npm — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "openclaw-webchannel@${VERSION} not on public npm — will publish."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish plugin to public npm (OIDC)
+        if: steps.already.outputs.skip != 'true'
+        # No NODE_AUTH_TOKEN: with a configured Trusted Publisher and npm >=
+        # 11.5.1, `npm publish` performs the OIDC exchange itself.
+        # NO --provenance: provenance attestation is restricted to PUBLIC source
+        # repos (and needs a matching package.json `repository`); this repo is
+        # private, and `npm publish --provenance` CANCELS the whole publish if
+        # provenance generation fails. Trusted-publishing auth still works on a
+        # private repo — only the provenance attestation is gated. Add
+        # --provenance here only after the repo is public.
+        run: npm publish -w packages/plugin --access public
+
+  # ---------------------------------------------------------------------------
+  # Plugin leg #2: publish the openclaw-webchannel code-plugin to ClawHub.
   #
   # Gated on `needs: publish` — if the npm publish failed the tag is a dud and
   # the plugin must not ship on its own. The `if:` guard requires a tag PUSH:
