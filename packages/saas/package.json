@@ -1,6 +1,6 @@
 {
   "name": "@mir-stream/webchannel-saas",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Headless SaaS trust chain core + reference harness for WebChannel NATS relay",
   "license": "UNLICENSED",
   "type": "module",
