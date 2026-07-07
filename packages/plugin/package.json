@@ -3,6 +3,11 @@
   "version": "0.1.8",
   "description": "Self-hosted web chat channel plugin for OpenClaw: E2E-encrypted browser chat over a NATS relay.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mir-stream/openclaw-webchannel.git",
+    "directory": "packages/plugin"
+  },
   "files": [
     "dist",
     "index-nats.ts",
