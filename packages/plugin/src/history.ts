@@ -1,5 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
+import { sanitizeHistoryText } from "./history-sanitize.js";
+
 /**
  * History messages that travel on the wire and live in client state.
  *
@@ -122,7 +124,12 @@ function normalize(raw: unknown, idx: number): HistoryMessage | null {
   const r = raw as RawSessionMessage;
   const role = normalizeRole(r.role);
   if (!role) return null;
-  const text = typeof r.text === "string" ? r.text : extractText(r.content);
+  const rawText = typeof r.text === "string" ? r.text : extractText(r.content);
+  if (!rawText) return null;
+  // The transcript is raw model output; the live path never showed it verbatim.
+  // Sanitize at read time so a re-hydrated bubble converges to what the reader
+  // saw live. An empty result (NO_REPLY-only or noise-only) drops the message.
+  const text = sanitizeHistoryText(role, rawText);
   if (!text) return null;
   const ts = extractTs(r.timestamp);
   return {
