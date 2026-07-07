@@ -1,8 +1,13 @@
 {
   "name": "openclaw-webchannel",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Self-hosted web chat channel plugin for OpenClaw: E2E-encrypted browser chat over a NATS relay.",
   "type": "module",
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
   "openclaw": {
     "extensions": [
       "./index-nats.ts"
