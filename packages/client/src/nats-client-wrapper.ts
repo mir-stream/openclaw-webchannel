@@ -354,8 +354,21 @@ export class WebChannelNATSClient {
             isTyping: false,
           });
         } else {
+          // Upsert-preserve (#15): a re-delivered `approval_request` (stateless
+          // register, retry) rebuilds a FRESH entry from the frame, which would
+          // otherwise CLOBBER a locally-set resolution and resurrect actionable
+          // buttons for an already-decided card. Carry the existing resolution
+          // (and its server-confirmed flag) over the refreshed payload.
+          const prev = approvals[idx];
           const next = approvals.slice();
-          next[idx] = req;
+          next[idx] =
+            prev.resolvedDecision !== undefined
+              ? {
+                  ...req,
+                  resolvedDecision: prev.resolvedDecision,
+                  resolutionConfirmed: prev.resolutionConfirmed,
+                }
+              : req;
           this.setState({ approvals: next, isTyping: false });
         }
         return;
@@ -364,7 +377,92 @@ export class WebChannelNATSClient {
       case "approval_resolved": {
         const id = msg.id ?? "";
         const decision = msg.decision as ApprovalDecision | undefined;
-        this.patchApproval(id, (a) => ({ ...a, resolvedDecision: decision }));
+        // Server-confirmed resolution: set the decision AND mark it confirmed, so
+        // the snapshot reconciler treats it as authoritative (never re-sends it
+        // as a lost decision, never overwrites it with "unknown"). (#15)
+        this.patchApproval(id, (a) => ({
+          ...a,
+          resolvedDecision: decision,
+          resolutionConfirmed: true,
+        }));
+        return;
+      }
+
+      case "approval_snapshot": {
+        // Authoritative pending-approval reconciliation (#15). The snapshot is
+        // the account's COMPLETE still-pending set for this peer at publish time;
+        // we reconcile local approval state against it to close three legs:
+        //   A (reload lost the card) — a snapshot id with no local entry is
+        //     rehydrated as pending;
+        //   B (missed approval_resolved) — a local unresolved card ABSENT from
+        //     the snapshot was decided/expired elsewhere → mark it non-actionable
+        //     ("unknown", server-confirmed);
+        //   C (lost decision frame) — a locally-decided but NOT server-confirmed
+        //     card the snapshot STILL lists as pending → the decision frame was
+        //     lost; re-send it and keep the card resolved (every future register
+        //     retries until the server confirms, so it converges hands-free).
+        const incoming = Array.isArray(msg.approvals) ? msg.approvals : [];
+        const snapshotById = new Map<string, ApprovalRequest>();
+        for (const p of incoming) {
+          if (!p || typeof p.id !== "string" || p.id.length === 0) continue;
+          snapshotById.set(p.id, {
+            id: p.id,
+            kind: p.kind ?? "exec",
+            title: p.title ?? "",
+            description: p.description,
+            prompt: p.prompt ?? "",
+            options: (p.options ?? []) as ApprovalOption[],
+            expiresAtMs: p.expiresAtMs,
+          });
+        }
+
+        const existing = this.state.approvals;
+        const seen = new Set<string>();
+        const next: ApprovalRequest[] = [];
+        let changed = false;
+
+        for (const a of existing) {
+          seen.add(a.id);
+          const snap = snapshotById.get(a.id);
+          if (snap) {
+            if (a.resolvedDecision === undefined) {
+              // Present + unresolved: already actionable with the full payload
+              // (an approval is immutable once minted), so keep the existing
+              // entry — a duplicate snapshot stays a no-op.
+              next.push(a);
+            } else if (!a.resolutionConfirmed && a.resolvedDecision !== "unknown") {
+              // Leg C: re-send the lost decision, keep the card resolved. Stays
+              // unconfirmed so the next register retries until the server echoes
+              // an authoritative `approval_resolved`.
+              this.client.sendApprovalDecision(a.id, a.resolvedDecision);
+              next.push(a);
+            } else {
+              // Server-confirmed resolution wins over a stale-by-ms snapshot.
+              next.push(a);
+            }
+          } else if (a.resolvedDecision === undefined) {
+            // Leg B: decided/expired while we weren't looking — no longer
+            // actionable, outcome unknown, server-confirmed (authoritative).
+            next.push({ ...a, resolvedDecision: "unknown", resolutionConfirmed: true });
+            changed = true;
+          } else if (!a.resolutionConfirmed) {
+            // Optimistic decision the server no longer has pending — our decision
+            // (or another device's) won. Confirm it.
+            next.push({ ...a, resolutionConfirmed: true });
+            changed = true;
+          } else {
+            next.push(a);
+          }
+        }
+
+        // Leg A: snapshot ids with no local entry → rehydrate as pending cards.
+        for (const [id, snap] of snapshotById) {
+          if (seen.has(id)) continue;
+          next.push(snap);
+          changed = true;
+        }
+
+        if (changed) this.setState({ approvals: next });
         return;
       }
 

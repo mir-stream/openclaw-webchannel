@@ -17,7 +17,7 @@
  */
 
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
-import type { ApprovalDecision } from "./transport.js";
+import type { ApprovalDecision, ApprovalRequestPayload } from "./transport.js";
 import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
@@ -58,6 +58,10 @@ export type OutboundWsMessage =
   | { type: "progress"; id: string; text: string }
   | { type: "approval_request"; id: string; kind: "exec" | "plugin"; title: string; description?: string; prompt: string; options: Array<{ decision: string; label: string; style: string }>; expiresAtMs?: number }
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
+  // #15 authoritative pending-approval snapshot (see transport.ts for the full
+  // rationale). This union is nats-channel's OWN — it is NOT imported from
+  // transport.ts, so the frame type must be added here independently.
+  | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[] }
   | { type: "typing" }
   | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> };
 
@@ -442,6 +446,22 @@ export class NatsChannel {
     }
 
     const payload: OutboundWsMessage = { type: "approval_resolved", id, decision };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
+   * Send the authoritative pending-approval snapshot to a peer (#15).
+   *
+   * Emitted on every successful register (right after the history snapshot) so a
+   * reloaded/reconnected widget re-hydrates its still-pending approval cards and
+   * retires any it kept actionable after a missed `approval_resolved`. Rides the
+   * same sealed `.out` path as every other outbound frame — fail-closed before
+   * the key is established, E2E-encrypted, and fanned out to all of the peer's
+   * devices for free. An EMPTY `approvals` array is sent deliberately (it is the
+   * "nothing pending" reconciliation signal, not a no-op).
+   */
+  sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[]): boolean {
+    const payload: OutboundWsMessage = { type: "approval_snapshot", approvals };
     return this.sendToPeer(peerId, payload);
   }
 

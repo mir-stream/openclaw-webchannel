@@ -138,7 +138,15 @@ export type NatsClientOptions = {
 };
 
 export type InboundMessage = {
-  type: "agent_message" | "progress" | "approval_request" | "approval_resolved" | "typing" | "history";
+  type:
+    | "agent_message"
+    | "progress"
+    | "approval_request"
+    | "approval_resolved"
+    // #15: authoritative pending-approval snapshot (carries `approvals`).
+    | "approval_snapshot"
+    | "typing"
+    | "history";
   id?: string;
   text?: string;
   kind?: "exec" | "plugin";
@@ -149,6 +157,16 @@ export type InboundMessage = {
   expiresAtMs?: number;
   decision?: string;
   messages?: Array<{ id: string; role: string; text: string; ts?: number }>;
+  /** #15: the still-pending approval set on an `approval_snapshot` frame. */
+  approvals?: Array<{
+    id: string;
+    kind?: "exec" | "plugin";
+    title?: string;
+    description?: string;
+    prompt?: string;
+    options?: Array<{ decision: string; label: string; style: string }>;
+    expiresAtMs?: number;
+  }>;
   before?: string;
   limit?: number;
 };

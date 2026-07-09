@@ -48,6 +48,7 @@ type Harness = {
   registered: string[];
   unregistered: string[];
   snapshots: string[];
+  approvalSnapshots: string[];
   wrapCalls: Array<{ peerId: string; key: Uint8Array }>;
   run: (payload: unknown) => Promise<void>;
 };
@@ -64,6 +65,7 @@ function makeHarness(opts?: {
   const registered: string[] = [];
   const unregistered: string[] = [];
   const snapshots: string[] = [];
+  const approvalSnapshots: string[] = [];
   const wrapCalls: Array<{ peerId: string; key: Uint8Array }> = [];
   const identity =
     opts && "identity" in opts
@@ -86,6 +88,7 @@ function makeHarness(opts?: {
       }),
     unregisterPeer: (pid) => unregistered.push(pid),
     sendHistorySnapshot: (pid) => snapshots.push(pid),
+    sendApprovalSnapshot: (pid) => approvalSnapshots.push(pid),
     logger: { error: () => {} },
   };
 
@@ -94,7 +97,7 @@ function makeHarness(opts?: {
     await handleRegisterRequest(deps);
   };
 
-  return { deps, replies, registered, unregistered, snapshots, wrapCalls, run };
+  return { deps, replies, registered, unregistered, snapshots, approvalSnapshots, wrapCalls, run };
 }
 
 describe("handleRegisterRequest (register over NATS)", () => {
@@ -117,6 +120,9 @@ describe("handleRegisterRequest (register over NATS)", () => {
 
     expect(h.registered).toEqual([PEER]);
     expect(h.snapshots).toEqual([PEER]);
+    // #15: the authoritative pending-approval snapshot fires exactly once, on the
+    // verified peerId, on the same successful register.
+    expect(h.approvalSnapshots).toEqual([PEER]);
     const reply = JSON.parse(h.replies[1]) as {
       peerId: string;
       registered: boolean;
@@ -223,6 +229,17 @@ describe("handleRegisterRequest (register over NATS)", () => {
     const signature = device.sign(popSignedMessage(PEER, nonce));
     await h.run({ op: "register", token: "jwt", nonce, signature });
     expect(h.replies[1]).toBe(REGISTER_FAILED);
+    // #15: a register that FAILS before the success block must NOT emit the
+    // pending-approval snapshot (the key wrap failed → no session established).
+    expect(h.approvalSnapshots).toEqual([]);
+  });
+
+  it("#15: a rejected register (JWT failure) does not emit the approval snapshot", async () => {
+    const h = makeHarness({ identity: null });
+    await h.run({ op: "register", token: "bad-jwt", nonce: "x", signature: "y" });
+    expect(h.replies[0]).toBe(REGISTER_UNAUTHORIZED);
+    expect(h.approvalSnapshots).toEqual([]);
+    expect(h.snapshots).toEqual([]);
   });
 
   it("unregister with a VALID token tears down the verified peer, no reply", async () => {

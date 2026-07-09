@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
-import type { NatsClientOptions } from "./nats-client.js";
+import type { InboundMessage, NatsClientOptions } from "./nats-client.js";
 
 /**
  * CL1 regression: the public wrapper must FORWARD the NATS-layer NKEY
@@ -361,5 +361,161 @@ describe("WebChannelNATSClient — W6 agent-bubble id adoption", () => {
     const messages = wrapper.getState().messages;
     expect(messages).toHaveLength(2);
     expect(messages.some((m) => m.id === "webchannel-2-live")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #15 approval rehydration — the wrapper reconciles its approval state against
+// the authoritative `approval_snapshot` frame (Legs A/B/C).
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+  function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+  }
+  function pendingPayload(id: string) {
+    return {
+      id,
+      kind: "exec" as const,
+      title: "Run",
+      prompt: `cmd-${id}`,
+      options: [{ decision: "allow-once", label: "Allow", style: "success" }],
+      expiresAtMs: 999_999_999_999,
+    };
+  }
+  function requestFrame(id: string): InboundMessage {
+    return { type: "approval_request", ...pendingPayload(id) };
+  }
+  function snapshotFrame(ids: string[]): InboundMessage {
+    return { type: "approval_snapshot", approvals: ids.map(pendingPayload) };
+  }
+  /** Spy on the underlying client's decision sender (for Leg C re-send assertions). */
+  function spyDecision(wrapper: WebChannelNATSClient) {
+    const client = (wrapper as unknown as {
+      client: { sendApprovalDecision: (id: string, d: string) => void };
+    }).client;
+    return vi.spyOn(client, "sendApprovalDecision");
+  }
+
+  it("Leg A: a snapshot hydrates pending cards from a fresh (reloaded) state", () => {
+    const w = makeWrapper();
+    deliver(w, snapshotFrame(["a1", "a2"]));
+    const approvals = w.getState().approvals;
+    expect(approvals.map((a) => a.id)).toEqual(["a1", "a2"]);
+    // Rehydrated cards are actionable (no resolution).
+    expect(approvals.every((a) => a.resolvedDecision === undefined)).toBe(true);
+  });
+
+  it("Leg B: a card absent from the snapshot is marked resolved 'unknown' + confirmed; empty snapshot clears all actionable cards", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    deliver(w, requestFrame("a2"));
+    // Snapshot lists only a2 → a1 was decided/expired elsewhere.
+    deliver(w, snapshotFrame(["a2"]));
+    const byId = Object.fromEntries(w.getState().approvals.map((a) => [a.id, a]));
+    expect(byId["a1"].resolvedDecision).toBe("unknown");
+    expect(byId["a1"].resolutionConfirmed).toBe(true);
+    expect(byId["a2"].resolvedDecision).toBeUndefined(); // still actionable
+
+    // An EMPTY snapshot retires every remaining actionable card.
+    deliver(w, snapshotFrame([]));
+    expect(w.getState().approvals.find((a) => a.id === "a2")?.resolvedDecision).toBe("unknown");
+  });
+
+  it("upsert-preserve: a re-delivered approval_request keeps a locally-set resolution (no button resurrection)", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "allow-once"); // optimistic, unconfirmed
+    expect(w.getState().approvals[0].resolvedDecision).toBe("allow-once");
+
+    // Stateless register re-delivers the SAME approval_request — must NOT clobber
+    // the resolution back to actionable.
+    deliver(w, requestFrame("a1"));
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("allow-once");
+    expect(a.resolutionConfirmed).toBeFalsy();
+  });
+
+  it("a later approval_resolved overwrites an 'unknown' card with the real decision and confirms it", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    deliver(w, snapshotFrame([])); // a1 → unknown + confirmed
+    expect(w.getState().approvals[0].resolvedDecision).toBe("unknown");
+    // The authoritative resolution frame still arrives (order not guaranteed).
+    deliver(w, { type: "approval_resolved", id: "a1", decision: "deny" });
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("deny");
+    expect(a.resolutionConfirmed).toBe(true);
+  });
+
+  it("Leg C: a locally-decided-but-unconfirmed card the snapshot still lists as pending re-sends the decision and stays resolved; absent → confirmed, nothing re-sent", () => {
+    const w = makeWrapper();
+    const spy = spyDecision(w);
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "allow-once"); // optimistic decision → one send
+    spy.mockClear();
+
+    // The lost decision: the snapshot STILL lists a1 as pending → re-send it.
+    deliver(w, snapshotFrame(["a1"]));
+    expect(spy).toHaveBeenCalledWith("a1", "allow-once");
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("allow-once"); // card stays resolved
+    expect(a.resolutionConfirmed).toBeFalsy(); // still unconfirmed → retries next register
+
+    // Now the server has it resolved: a1 is ABSENT → confirm, do NOT re-send.
+    spy.mockClear();
+    deliver(w, snapshotFrame([]));
+    expect(spy).not.toHaveBeenCalled();
+    const after = w.getState().approvals[0];
+    expect(after.resolvedDecision).toBe("allow-once");
+    expect(after.resolutionConfirmed).toBe(true);
+  });
+
+  it("a server-confirmed resolution present in the snapshot does NOT re-send a decision (guards the Leg C gate)", () => {
+    const w = makeWrapper();
+    const spy = spyDecision(w);
+    deliver(w, requestFrame("a1"));
+    // Server-confirmed resolution (an authoritative approval_resolved), NOT an
+    // optimistic decide — so resolutionConfirmed is true.
+    deliver(w, { type: "approval_resolved", id: "a1", decision: "deny" });
+    expect(w.getState().approvals[0].resolutionConfirmed).toBe(true);
+    spy.mockClear();
+    const before = w.getState();
+
+    // The snapshot still lists a1 as pending (stale-by-ms). The confirmed
+    // resolution must WIN: no decision re-send, no state churn.
+    deliver(w, snapshotFrame(["a1"]));
+    expect(spy).not.toHaveBeenCalled();
+    expect(w.getState()).toBe(before); // no setState fired
+    expect(w.getState().approvals[0].resolvedDecision).toBe("deny");
+  });
+
+  it("a duplicate snapshot is a state no-op (register retry after a lost reply)", () => {
+    const w = makeWrapper();
+    deliver(w, snapshotFrame(["a1"]));
+    const s1 = w.getState();
+    deliver(w, snapshotFrame(["a1"]));
+    const s2 = w.getState();
+    // No setState fired → the very same state object reference.
+    expect(s2).toBe(s1);
+    expect(s2.approvals).toHaveLength(1);
+  });
+
+  it("ignores an unrecognized frame type without throwing (forward-compat lock-in)", () => {
+    const w = makeWrapper();
+    expect(() =>
+      deliver(w, { type: "some_future_frame", foo: "bar" } as unknown as InboundMessage),
+    ).not.toThrow();
+    // State is untouched.
+    expect(w.getState().approvals).toEqual([]);
+    expect(w.getState().messages).toEqual([]);
   });
 });
