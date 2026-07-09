@@ -208,6 +208,20 @@ function recordPendingApproval(
   while (pendingApprovals.size >= PENDING_APPROVAL_CAP) {
     const oldest = pendingApprovals.keys().next().value;
     if (oldest === undefined) break;
+    // Warn if we're evicting a GENUINELY-pending approval (not past its
+    // expiry) — the client's next snapshot will authoritatively mark it
+    // "resolved (elsewhere)" even though it may still be awaiting a decision.
+    // Under real single-tenant load the 512 cap never triggers; a warn here
+    // means either abuse-level churn or a finalize-hook leak worth noticing.
+    const evicted = pendingApprovals.get(oldest);
+    const evictedExpiry = evicted?.payload.expiresAtMs;
+    if (evicted && !(typeof evictedExpiry === "number" && evictedExpiry <= Date.now())) {
+      console.warn(
+        `[webchannel] pending-approval cap ${PENDING_APPROVAL_CAP} reached; evicting a ` +
+          `still-pending approval "${evicted.payload.id}" (account "${evicted.accountKey}", ` +
+          `peer "${evicted.sessionKey}") — a client may show it as resolved-elsewhere`,
+      );
+    }
     pendingApprovals.delete(oldest);
   }
   pendingApprovals.set(key, {
@@ -245,6 +259,17 @@ export function listPendingApprovalsForPeer(
     const tooOld =
       expiresAtMs === undefined && now - entry.deliveredAtMs > PENDING_APPROVAL_MAX_AGE_MS;
     if (expired || tooOld) {
+      // A no-expiry entry pruned by the max-age backstop is an ORPHAN whose
+      // finalize hook never fired (e.g. the approval monitor was disposed on
+      // channel stop). Warn so a systematic finalize leak is visible — an
+      // expiry-driven prune is routine and stays quiet.
+      if (tooOld) {
+        console.warn(
+          `[webchannel] pending-approval "${entry.payload.id}" (account "${entry.accountKey}", ` +
+            `peer "${entry.sessionKey}") pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
+            `finalize — likely an orphaned approval (monitor disposed?)`,
+        );
+      }
       pendingApprovals.delete(key);
       continue;
     }
@@ -894,6 +919,24 @@ function waitForAbort(signal: AbortSignal): Promise<void> {
  * (falling back to `commands.ownerAllowFrom`) may resolve an approval. The prior
  * default of `ANON_PEER_ID` is dropped so no caller can bypass this check.
  */
+/**
+ * Thrown by `handleApprovalDecision` when the approval has no live delivery
+ * binding — an id we never delivered, or (the common case) one already finalized.
+ * This is EXPECTED in normal multi-device flows: a Leg C snapshot re-send racing
+ * a finalize, or two devices both clicking the same card. Callers should log it
+ * at warn/info, NOT error — it is not an authz failure. Genuine rejections
+ * (non-approver, cross-account) stay plain `Error` at error level. (#15)
+ */
+export class ApprovalBindingMissingError extends Error {
+  constructor(approvalId: string) {
+    super(
+      `webchannel: approval "${approvalId}" is unknown or already resolved ` +
+        `(no live delivery binding) — refusing to resolve`,
+    );
+    this.name = "ApprovalBindingMissingError";
+  }
+}
+
 export async function handleApprovalDecision(
   cfg: OpenClawConfig,
   approvalId: string,
@@ -913,10 +956,7 @@ export async function handleApprovalDecision(
   // process, so a legitimate resolve holds its binding.
   const boundAccount = deliveredApprovalAccounts.get(approvalId);
   if (boundAccount === undefined) {
-    throw new Error(
-      `webchannel: approval "${approvalId}" is unknown or already resolved ` +
-        `(no live delivery binding) — refusing to resolve`,
-    );
+    throw new ApprovalBindingMissingError(approvalId);
   }
   if (boundAccount !== bindingAccountKey(accountId)) {
     throw new Error(

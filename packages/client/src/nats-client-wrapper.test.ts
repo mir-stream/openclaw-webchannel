@@ -405,13 +405,20 @@ describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () =
     return vi.spyOn(client, "sendApprovalDecision");
   }
 
-  it("Leg A: a snapshot hydrates pending cards from a fresh (reloaded) state", () => {
+  it("Leg A: a snapshot hydrates pending cards from a fresh (reloaded) state and clears the typing indicator", () => {
     const w = makeWrapper();
+    // Simulate a live typing indicator still showing when the snapshot lands.
+    deliver(w, { type: "typing" });
+    expect(w.getState().isTyping).toBe(true);
+
     deliver(w, snapshotFrame(["a1", "a2"]));
     const approvals = w.getState().approvals;
     expect(approvals.map((a) => a.id)).toEqual(["a1", "a2"]);
     // Rehydrated cards are actionable (no resolution).
     expect(approvals.every((a) => a.resolvedDecision === undefined)).toBe(true);
+    // Parity with the live approval_request path: a fresh actionable card clears
+    // the typing indicator (the agent is blocked on the user, not working).
+    expect(w.getState().isTyping).toBe(false);
   });
 
   it("Leg B: a card absent from the snapshot is marked resolved 'unknown' + confirmed; empty snapshot clears all actionable cards", () => {

@@ -24,7 +24,11 @@ import type { WebchannelEncryptionConfig } from "./src/encryption-policy.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
 import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
-import { handleApprovalDecision, listPendingApprovalsForPeer } from "./src/approvals.js";
+import {
+  handleApprovalDecision,
+  listPendingApprovalsForPeer,
+  ApprovalBindingMissingError,
+} from "./src/approvals.js";
 import { resolveVerifier, verifyJwtAndExtractIdentity, preflightResolveJwks, type ConnectionVerifier } from "./src/auth.js";
 import type { AuthConfig, JwtAuthConfig } from "./src/auth.js";
 import { formatAccountReadiness, deriveJwksUrl, deriveIssuer, type JwksReadiness } from "./src/preflight.js";
@@ -523,7 +527,15 @@ export default defineChannelPluginEntry({
       // another account cannot resolve approvals via this account's channel.
       channel.setApprovalDecisionHandler((peerId, id, decision) => {
         void handleApprovalDecision(api.config, id, decision, peerId, accountId).catch((err) => {
-          api.logger.error?.(`webchannel: approval resolve failed (${id}): ${String(err)}`);
+          // A missing delivery binding is EXPECTED in normal multi-device flows
+          // (a Leg C snapshot re-send racing a finalize, or two devices both
+          // clicking) — log it at warn, not error. Genuine authz rejections
+          // (non-approver, cross-account) stay at error.
+          if (err instanceof ApprovalBindingMissingError) {
+            api.logger.warn?.(`webchannel: approval resolve ignored (${id}): ${err.message}`);
+          } else {
+            api.logger.error?.(`webchannel: approval resolve failed (${id}): ${String(err)}`);
+          }
         });
       });
 

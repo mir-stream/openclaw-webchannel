@@ -420,6 +420,11 @@ export class WebChannelNATSClient {
         const seen = new Set<string>();
         const next: ApprovalRequest[] = [];
         let changed = false;
+        // Tracks whether a NEW actionable (pending) card was rehydrated (Leg A),
+        // so we clear the typing indicator in parity with the live
+        // `approval_request` path — a fresh actionable card means the agent is
+        // BLOCKED on the user, not still working.
+        let rehydratedActionable = false;
 
         for (const a of existing) {
           seen.add(a.id);
@@ -460,9 +465,15 @@ export class WebChannelNATSClient {
           if (seen.has(id)) continue;
           next.push(snap);
           changed = true;
+          rehydratedActionable = true;
         }
 
-        if (changed) this.setState({ approvals: next });
+        if (changed) {
+          this.setState({
+            approvals: next,
+            ...(rehydratedActionable ? { isTyping: false } : {}),
+          });
+        }
         return;
       }
 
