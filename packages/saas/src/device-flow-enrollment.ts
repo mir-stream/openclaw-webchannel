@@ -790,6 +790,7 @@ export class DeviceFlowEnrollment {
     return {
       userJwt: minted.userJwt,
       userSeed: minted.userSeed,
+      userPubkey: minted.userPubkey,
       permissions: minted.permissions,
     };
   }

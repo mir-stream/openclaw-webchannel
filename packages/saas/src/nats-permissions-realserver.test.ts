@@ -309,7 +309,7 @@ async function generateAgentCredentials(
     pub: { allow: pub },
     sub: { allow: sub },
   });
-  return { userJwt, userSeed, permissions: { pub, sub } };
+  return { userJwt, userSeed, userPubkey: userKp.getPublicKey(), permissions: { pub, sub } };
 }
 
 // ---------------------------------------------------------------------------

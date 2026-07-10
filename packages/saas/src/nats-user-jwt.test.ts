@@ -227,6 +227,41 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     expect(joinedB).not.toContain("tenant-alpha");
   });
 
+  it("exposes userPubkey ('U…') equal to the JWT sub (issue #12)", async () => {
+    const trustChain = await setupTrustChain();
+
+    const enrollment = new DeviceFlowEnrollment({
+      saasTrustChain: trustChain.private,
+      natsAccountConfig: trustChain.natsConfig,
+      saasBaseUrl: "https://saas.test.com",
+      jwksUrl: "https://saas.test.com/.well-known/jwks.json",
+      bootstrapUrl: "https://saas.test.com/bootstrap",
+      natsUrl: "wss://nats.test.com",
+    });
+
+    const mockEnrollment = {
+      device_code: "test-device-code",
+      user_code: "TEST-1234",
+      agentPublicKey: "test-public-key",
+      accountId: "agent-pk",
+      tenant: "tenant-pk",
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 600000,
+      status: "pending" as const,
+    };
+
+    // @ts-ignore - accessing private method for testing
+    const creds = await enrollment.generateNatsUserCredentials(mockEnrollment);
+
+    // #12: the minted user public NKEY is surfaced so consumers never
+    // hand-decode the JWT payload to find the revocation key.
+    expect(creds.userPubkey).toMatch(/^U/);
+    const sub = JSON.parse(
+      Buffer.from(creds.userJwt.split(".")[1], "base64url").toString("utf8"),
+    ).sub;
+    expect(creds.userPubkey).toBe(sub);
+  });
+
   it("should generate user NKEY seeds with correct format", async () => {
     const trustChain = await setupTrustChain();
 

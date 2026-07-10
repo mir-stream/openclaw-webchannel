@@ -41,6 +41,14 @@ describe("loadOrCreateTrustChain", () => {
     expect(b.private.rsaPrivateKeyPem).toBe(a.private.rsaPrivateKeyPem);
   });
 
+  it("round-trips the opt-in operatorSeed across reload (issue #7)", async () => {
+    const a = await loadOrCreateTrustChain(path, { returnOperatorSeed: true });
+    expect(a.private.operatorSeed).toMatch(/^SO/);
+    // A second load reads it back off disk (private is JSON-serialized wholesale).
+    const b = await loadOrCreateTrustChain(path, { returnOperatorSeed: true });
+    expect(b.private.operatorSeed).toBe(a.private.operatorSeed);
+  });
+
   it("does NOT regenerate when a file already exists", async () => {
     const a = await loadOrCreateTrustChain(path);
     const b = await loadOrCreateTrustChain(path);

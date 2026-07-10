@@ -34,6 +34,17 @@ export type SaasTrustChainPrivate = {
    *   identity (see ExternalNatsAccount). SECRET — never log, never persist it.
    */
   natsAccountSeed: string;
+
+  /**
+   * NATS operator NKEY seed (`SO…`) — the TRUST ROOT that signs the account JWT.
+   * Present ONLY when setupTrustChain({ returnOperatorSeed: true }) in
+   * self-contained mode; undefined otherwise (default, and always in external
+   * mode — a managed account has no operator). SECRET, higher value than
+   * natsAccountSeed: whoever holds it can re-sign/replace the account. Needed to
+   * build per-credential revocation (see addRevocation). Never log; persist only
+   * in the same 0600 store as natsAccountSeed.
+   */
+  operatorSeed?: string;
 };
 
 /**

@@ -181,6 +181,14 @@ export type NatsUserCredentials = {
   userSeed: string;
 
   /**
+   * Minted user public NKEY (`U…`), identical to `userJwt.sub`. This is the
+   * NATS revocation-ledger key: the SaaS refuses this exact credential by
+   * adding `{ [userPubkey]: at }` to the account JWT's `revocations` map (see
+   * addRevocation). Surfaced so consumers never hand-decode the JWT.
+   */
+  userPubkey: string;
+
+  /**
    * NATS account/subject permissions for this user.
    * Defines which subjects the plugin can publish/subscribe to.
    */

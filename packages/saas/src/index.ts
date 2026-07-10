@@ -50,6 +50,7 @@ export {
   type BrowserCredentials,
   type IssueBrowserCredentialsOptions,
 } from "./nats-user-creds.js";
+export { addRevocation } from "./account-revocation.js";
 export type {
   SetupTrustChainResult,
   SaasTrustChainPrivate,
