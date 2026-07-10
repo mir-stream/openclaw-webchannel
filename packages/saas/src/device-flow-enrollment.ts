@@ -77,6 +77,30 @@ const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
  */
 const DEFAULT_RETENTION_MS = 300_000;
 
+/**
+ * Exact wire format of `agentPublicKey`: base64url (no padding) of a 32-byte
+ * X25519 public key = exactly 43 characters. The plugin is the only legitimate
+ * caller (`enrollment-client.ts`) and always sends precisely this, so the form
+ * is pinned strictly — no length range, no padding, no standard-base64 chars.
+ */
+const AGENT_PUBLIC_KEY_FORMAT = /^[A-Za-z0-9_-]{43}$/;
+
+/**
+ * Throw unless `key` is the exact `agentPublicKey` wire format.
+ *
+ * `/enroll` is unauthenticated and `agentPublicKey` is the one field whose
+ * content AND size a hostile caller fully controls. Validating it at ingress
+ * caps store/approval-UI bloat from a multi-megabyte string and fails a
+ * malformed key HERE rather than late at browser-side cnf binding.
+ */
+function assertValidAgentPublicKey(key: unknown): void {
+  if (typeof key !== "string" || !AGENT_PUBLIC_KEY_FORMAT.test(key)) {
+    throw new Error(
+      "webchannel: agentPublicKey must be base64url of a 32-byte X25519 public key",
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Enrollment store interface
 // ---------------------------------------------------------------------------
@@ -375,6 +399,11 @@ export class DeviceFlowEnrollment {
    *
    * Creates a pending enrollment and returns a device code and user code.
    * The plugin polls /poll until the operator approves the enrollment.
+   *
+   * `/enroll` is unauthenticated, so all three attacker-controllable ingress
+   * fields are validated up front before anything is persisted: `tenant` and
+   * `accountId` for NATS-subject safety, and `agentPublicKey` for its exact
+   * X25519-base64url wire format.
    */
   async enroll(request: EnrollmentRequest): Promise<EnrollmentResponse> {
     // Reject tenant/accountId tokens that would break the NATS subject hierarchy
@@ -383,6 +412,9 @@ export class DeviceFlowEnrollment {
     if (request.accountId !== undefined) {
       assertValidSubjectToken(request.accountId, "accountId");
     }
+    // Reject a malformed/oversized agentPublicKey at ingress rather than late at
+    // browser-side cnf binding (and cap store/approval-UI bloat from a huge string).
+    assertValidAgentPublicKey(request.agentPublicKey);
     const device_code = await this.generateDeviceCode();
     const user_code = this.generateUserCode();
     const now = Date.now();
