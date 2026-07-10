@@ -25,6 +25,18 @@ export type ChatMessage = {
   text: string;
   ts?: number;
   working?: boolean;
+  /**
+   * P0-7b: the stable wire `id` the client stamped on the outbound
+   * `user_message` this bubble echoes (user role only). Set at send time so an
+   * `ack` frame can mark the bubble delivered. Absent on server-hydrated bubbles
+   * and on agent messages; not used by the history three-tier adoption.
+   */
+  wireId?: string;
+  /**
+   * P0-7b: flips true once the agent acks this message's `wireId` at ingress
+   * (state-only — a view can render a ✓). Absent until then.
+   */
+  delivered?: boolean;
 };
 
 /** Native HITL approval decision; mirrors the plugin/SDK union. */

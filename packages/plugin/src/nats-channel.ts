@@ -80,7 +80,11 @@ export type OutboundWsMessage =
   | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> }
   // P0-3 slash-command DISCOVERY: the command catalog delivered in reply to a
   // `load_commands` request (config-filtered, alias-free, name-sorted).
-  | { type: "commands"; commands: CommandCatalogEntry[] };
+  | { type: "commands"; commands: CommandCatalogEntry[] }
+  // P0-7b: ingress acknowledgement — the ids of `user_message` frames the agent
+  // admitted at ingress (fresh AND deduped duplicates), so the client can drain
+  // its unacked replay ledger. Delivered on the same sealed `.out` path.
+  | { type: "ack"; ids: string[] };
 
 export type HistoryMessage = {
   id: string;
@@ -522,6 +526,19 @@ export class NatsChannel {
    */
   sendCommands(peerId: string, commands: CommandCatalogEntry[]): boolean {
     const payload: OutboundWsMessage = { type: "commands", commands };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
+   * P0-7b: acknowledge the ingress receipt of `user_message` ids to a peer, so
+   * the client can drain its unacked replay ledger. Rides the same sealed `.out`
+   * path as every other outbound frame — fail-closed before the peer's session
+   * key exists (returns false, never plaintext). An EMPTY `ids` is a no-op that
+   * returns true without publishing (nothing to ack — e.g. an all-id-less batch).
+   */
+  sendAck(peerId: string, ids: string[]): boolean {
+    if (ids.length === 0) return true;
+    const payload: OutboundWsMessage = { type: "ack", ids };
     return this.sendToPeer(peerId, payload);
   }
 

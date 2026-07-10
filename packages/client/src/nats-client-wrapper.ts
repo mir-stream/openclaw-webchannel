@@ -132,13 +132,21 @@ export class WebChannelNATSClient {
     const trimmed = text.trim();
     if (!trimmed) return;
 
+    // P0-7b: capture the wire id so a later `ack` frame can mark this local echo
+    // delivered (the SDK correlates by wireId, never the synthetic local id).
+    // Known/accepted: sendUserMessage publishes BEFORE appendMessage records the
+    // echo, so a SAME-TICK synchronous ack would miss the bubble and `delivered`
+    // would never flip. That can only happen on a synchronous fake transport (a
+    // test); over a real WS/NATS socket the ack is always a later event-loop turn,
+    // so it lands after the echo exists. Not restructured.
+    const wireId = this.client.sendUserMessage(trimmed);
+
     this.appendMessage({
       id: `u-${this.uid()}`,
       role: "user",
       text: trimmed,
+      wireId,
     });
-
-    this.client.sendUserMessage(trimmed);
   }
 
   /** Send approval decision */
@@ -393,6 +401,25 @@ export class WebChannelNATSClient {
         // request just refreshes it). NOT turn activity, so isTyping is left
         // untouched.
         this.setState({ commands: Array.isArray(msg.commands) ? msg.commands : [] });
+        return;
+      }
+
+      case "ack": {
+        // P0-7b: mark the local echoes whose wireId the agent acknowledged at
+        // ingress as delivered (state-only — the demo can render a ✓). Ids we
+        // don't hold locally are a silent no-op.
+        const ids = Array.isArray(msg.ids) ? msg.ids : [];
+        if (ids.length === 0) return;
+        const acked = new Set(ids);
+        let changed = false;
+        const messages = this.state.messages.map((m) => {
+          if (m.wireId !== undefined && acked.has(m.wireId) && !m.delivered) {
+            changed = true;
+            return { ...m, delivered: true };
+          }
+          return m;
+        });
+        if (changed) this.setState({ messages });
         return;
       }
 

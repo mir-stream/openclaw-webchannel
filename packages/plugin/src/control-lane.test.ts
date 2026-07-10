@@ -1,4 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+import { createInboundDebouncer } from "openclaw/plugin-sdk/reply-runtime";
 
 import {
   isControlLaneMessage,
@@ -6,7 +8,11 @@ import {
   shouldDropBufferedInputOnStop,
 } from "./control-lane.js";
 import { resolveCommandGate } from "./command-gate.js";
-import { createSerializedInboundDispatcher } from "./inbound-queue.js";
+import { createSerializedInboundDispatcher, coalesceUserMessages } from "./inbound-queue.js";
+import {
+  createIngressOnFlush,
+  recordCancelledInboundItems,
+} from "./ingress-dedupe.js";
 import type { InboundWsMessage } from "./transport.js";
 
 /**
@@ -157,5 +163,112 @@ describe("control-lane bypass of the per-session FIFO", () => {
     route(userMessage("/stop"), { dispatch, controlLane });
     await new Promise<void>((r) => setTimeout(r, 0));
     expect(ran).toEqual(["fifo:run a long task", "abort:/stop"]);
+  });
+});
+
+describe("control-lane /stop ingress ack (P0-7b)", () => {
+  /**
+   * The control lane bypasses the debouncer/onFlush, so it is never deduped and
+   * never acked there. index-nats.ts acks the control-lane frame directly when it
+   * carries an id, so the client's unacked ledger entry drains (else every
+   * reconnect would replay the /stop). Mirror that routing branch's ack step.
+   */
+  function routeControlLane(
+    message: InboundWsMessage & { id?: string },
+    sendAck: (peerId: string, ids: string[]) => void,
+    peerId = "peer-1",
+  ): void {
+    if (message.type !== "user_message") return;
+    if (!isControlLaneMessage(message)) return;
+    if (message.id) sendAck(peerId, [message.id]);
+  }
+
+  it("acks a /stop that carries an id", () => {
+    const acks: Array<{ peerId: string; ids: string[] }> = [];
+    routeControlLane(
+      { type: "user_message", text: "/stop", id: "wire-9" },
+      (peerId, ids) => acks.push({ peerId, ids }),
+    );
+    expect(acks).toEqual([{ peerId: "peer-1", ids: ["wire-9"] }]);
+  });
+
+  it("does not ack an id-less /stop (older client)", () => {
+    const acks: Array<{ peerId: string; ids: string[] }> = [];
+    routeControlLane(
+      { type: "user_message", text: "/stop" },
+      (peerId, ids) => acks.push({ peerId, ids }),
+    );
+    expect(acks).toEqual([]);
+  });
+});
+
+describe("control-lane /stop cancels debounce-buffered messages without leaving a replay (P0-7b)", () => {
+  type Item = { peerId: string; message: { type: "user_message"; text: string; id?: string } };
+  const item = (peerId: string, text: string, id?: string): Item => ({
+    peerId,
+    message: { type: "user_message", text, ...(id !== undefined ? { id } : {}) },
+  });
+  const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+  /** Namespace-aware fake of checkAndRecord: true first time, false afterwards. */
+  function fakeChecker() {
+    const seen = new Set<string>();
+    return vi.fn(async (key: string, opts?: { namespace?: string }) => {
+      const composite = `${opts?.namespace ?? "global"} ${key}`;
+      if (seen.has(composite)) return false;
+      seen.add(composite);
+      return true;
+    });
+  }
+
+  /**
+   * A debouncer wired exactly as index-nats.ts: onFlush is the REAL
+   * `createIngressOnFlush` (dedupe + ack id-carrying items + dispatch); onCancel
+   * records + acks the dropped items via `recordCancelledInboundItems`. A LONG
+   * debounce keeps a message buffered so `cancelKey` (the /stop path) can drop it
+   * before it ever flushes.
+   */
+  function buildSeam(accountId: string, checkAndRecord: ReturnType<typeof fakeChecker>) {
+    const dispatched: string[] = [];
+    const acks: Array<{ peerId: string; ids: string[] }> = [];
+    const sendAck = (peerId: string, ids: string[]) => acks.push({ peerId, ids });
+    const debouncer = createInboundDebouncer<Item>({
+      debounceMs: 50,
+      serializeImmediate: true,
+      buildKey: (i) => i.peerId,
+      onFlush: createIngressOnFlush<Item>({
+        accountId,
+        checkAndRecord,
+        dispatch: (_peerId, message) => dispatched.push(message.text),
+        coalesce: coalesceUserMessages,
+        sendAck,
+      }),
+      onCancel: (items) => {
+        void recordCancelledInboundItems(items, accountId, checkAndRecord, sendAck);
+      },
+    });
+    return { debouncer, dispatched, acks };
+  }
+
+  it("a /stop-cancelled buffered message is acked, and its later replay is dropped as a duplicate", async () => {
+    const checkAndRecord = fakeChecker();
+    const { debouncer, dispatched, acks } = buildSeam("acct", checkAndRecord);
+
+    // A message enters the (long) debounce window — buffered, not yet flushed.
+    void debouncer.enqueue(item("p1", "please run the long job", "idK"));
+    // The user immediately sends /stop → index-nats calls cancelKey → onCancel.
+    expect(debouncer.cancelKey("p1")).toBe(true);
+    await wait(10);
+
+    // The cancelled message was acked (drains the client ledger) and never ran.
+    expect(acks).toEqual([{ peerId: "p1", ids: ["idK"] }]);
+    expect(dispatched).toEqual([]);
+
+    // The client (not yet knowing the ack, e.g. it was offline) replays the SAME
+    // id after reconnect. It must be dropped as a duplicate — the killed text
+    // must NEVER run a turn.
+    void debouncer.enqueue(item("p1", "please run the long job", "idK"));
+    await wait(80);
+    expect(dispatched).toEqual([]); // still nothing dispatched
   });
 });

@@ -35,7 +35,7 @@ import {
   resolveInboundDebounceMs,
 } from "openclaw/plugin-sdk/reply-runtime";
 import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
-import { createIngressOnFlush } from "./src/ingress-dedupe.js";
+import { createIngressOnFlush, recordCancelledInboundItems } from "./src/ingress-dedupe.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
@@ -646,12 +646,15 @@ export default defineChannelPluginEntry({
         debounceMs: inboundDebounceMs,
         serializeImmediate: true,
         buildKey: (item) => item.peerId,
-        // P0-7a ingress dedupe. The REAL handler is `createIngressOnFlush`
-        // (src/ingress-dedupe.ts) — extracted there so it is tsc-checked and
-        // tested directly. Its doc owns the load-bearing rationale (why the
-        // async dedupe belongs on this same-peer-serialized flush path, the
-        // control-lane bypass, per-id record-before-coalesce). Split log sinks:
-        // routine duplicate drops at info, fail-open faults at warn.
+        // P0-7a ingress dedupe + P0-7b ingress ack. The REAL handler is
+        // `createIngressOnFlush` (src/ingress-dedupe.ts) — extracted there so it
+        // is tsc-checked and tested directly. Its doc owns the load-bearing
+        // rationale (why the async dedupe belongs on this same-peer-serialized
+        // flush path, the control-lane bypass, per-id record-before-coalesce, and
+        // why the ack covers fresh + duplicates alike and precedes dispatch).
+        // Split log sinks: routine duplicate drops at info, fail-open faults at
+        // warn. `sendAck` (P0-7b) drains the client's replay ledger on ingress
+        // ADMISSION (not turn success); P0-7a wired no ack (first half).
         onFlush: createIngressOnFlush<{
           peerId: string;
           message: WebchannelUserMessage;
@@ -660,6 +663,7 @@ export default defineChannelPluginEntry({
           checkAndRecord: (key, opts) => inboundDedupe.checkAndRecord(key, opts),
           dispatch: dispatchInbound,
           coalesce: coalesceUserMessages,
+          sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
           logInfo: (m) => api.logger?.info?.(m),
           logWarn: (m) => api.logger?.warn?.(m),
         }),
@@ -667,6 +671,28 @@ export default defineChannelPluginEntry({
           api.logger.error?.(
             `webchannel: inbound debounce flush failed: ${String(err)}`,
           ),
+        onCancel: (items) => {
+          // P0-7b: a `/stop` cancels debounce-buffered messages that never reached
+          // onFlush, so they were never dedupe-recorded and never acked — yet the
+          // client's replay ledger still holds them. Record their ids (so an
+          // in-flight replay is dropped as a duplicate) and ack them (drain the
+          // ledger). onCancel is sync-shaped and checkAndRecord is async, so this
+          // is best-effort fire-and-forget with a warn — a lost record only
+          // re-opens the pre-existing pre-4b replay window (see the helper). Layer
+          // (b) `clearPending` items are NOT handled here: they were already
+          // acked+recorded at their own onFlush.
+          void recordCancelledInboundItems(
+            items,
+            accountId,
+            (key, opts) => inboundDedupe.checkAndRecord(key, opts),
+            (peerId, ids) => channel.sendAck(peerId, ids),
+            (m) => api.logger?.warn?.(m),
+          ).catch((err) =>
+            api.logger?.warn?.(
+              `webchannel: cancelled-inbound handling failed: ${String(err)}`,
+            ),
+          );
+        },
       });
 
       // Command-gate mirror (P1-8a follow-up), resolved ONCE per account. It
@@ -736,6 +762,12 @@ export default defineChannelPluginEntry({
               );
             }
           }
+          // P0-7b: ack the control-lane frame here too. It bypasses the
+          // debouncer/onFlush (and is never deduped), so without this its
+          // client-side ledger entry would never drain and every reconnect would
+          // replay the /stop. A replayed /stop that lands before this ack is a
+          // harmless no-op abort (accepted).
+          if (message.id) channel.sendAck(peerId, [message.id]);
           void handleInboundMessage(
             api,
             channel as unknown as WebChannelTransport,

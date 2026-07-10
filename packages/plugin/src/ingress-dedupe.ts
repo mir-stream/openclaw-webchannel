@@ -147,6 +147,13 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
   dispatch: (peerId: string, message: T["message"]) => void;
   /** Merge the surviving frames into ONE turn's message (P1-8b coalesce). */
   coalesce: (messages: T["message"][]) => T["message"];
+  /**
+   * P0-7b ingress ACK: drain the client's replay ledger on ingress ADMISSION.
+   * OPTIONAL — P0-7a (first half) wires NO ack; P0-7b wires `channel.sendAck`.
+   * When present, called once per flush with the unique ids across ALL items
+   * (see the ack rationale in the factory doc).
+   */
+  sendAck?: (peerId: string, ids: string[]) => void;
   /** Routine duplicate-drop sink (info). */
   logInfo?: (message: string) => void;
   /** Fail-open fault sink (warn). */
@@ -168,9 +175,19 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
  * serialized flush path, not the raw handler.
  *
  * WHAT IT DOES, per flush batch:
+ *  - P0-7b ACK FIRST (before the dedupe/dispatch): ack EVERY id-carrying item —
+ *    FRESH AND DUPLICATES ALIKE. A deduped duplicate means the ORIGINAL was
+ *    admitted, so the client's replay ledger entry must STILL drain; skipping it
+ *    would make the client replay that message on every reconnect forever.
+ *    Receipt = ingress ADMISSION, NOT turn success, so it is independent of the
+ *    dedupe outcome and correctly precedes it. ONE `sendAck` per flush — the batch
+ *    is same-peer (`buildKey = peerId`), so `items[0].peerId` is the whole batch's
+ *    peer. `sendAck` is optional (P0-7a wires none); id-less items carry no
+ *    ledger entry and are filtered out of the ack.
  *  - filter to FRESH items (drop `${peerId}:${id}` already admitted in the window;
  *    id-less frames pass through; a dedupe fault fails OPEN — keep the message);
- *  - an all-duplicates batch dispatches NOTHING (every item was dropped);
+ *  - an all-duplicates batch dispatches NOTHING (every item was dropped) — but it
+ *    was still ACKED above, so the client stops replaying;
  *  - otherwise coalesce the survivors into one turn and dispatch it to
  *    `fresh[0].peerId`. The batch is one peer's window (same `buildKey`), so the
  *    first survivor's peer is the whole batch's peer.
@@ -178,7 +195,7 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
  * CONTROL-LANE NOTE: `/stop` (and the NL abort vocabulary) BYPASS the debouncer
  * entirely in setMessageHandler, so aborts never reach this path and are never
  * deduped — a duplicate abort is a harmless cosmetic double-bubble, and the abort
- * must not wait on SQLite.
+ * must not wait on SQLite. The control-lane branch acks its own frame separately.
  *
  * Per-id RECORDING happens inside `filterFreshInboundItems` BEFORE the coalesce/
  * dispatch — every id in the batch is recorded as it is checked, so a duplicate
@@ -188,12 +205,84 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
 export function createIngressOnFlush<T extends IngressDedupeItem>(
   deps: IngressOnFlushDeps<T>,
 ): (items: readonly T[]) => Promise<void> {
-  const { accountId, checkAndRecord, dispatch, coalesce, logInfo, logWarn } = deps;
+  const { accountId, checkAndRecord, dispatch, coalesce, sendAck, logInfo, logWarn } = deps;
   const sinks: IngressDedupeLogSinks = { info: logInfo, warn: logWarn };
   return async (items) => {
+    // P0-7b ack first — see the doc. Ack is receipt of ADMISSION and covers all
+    // id-carrying items regardless of the dedupe outcome, so it runs before the
+    // fresh-filter. Guard `items[0]` (an empty flush never fires, but stay total).
+    const anchor = items[0];
+    if (anchor && sendAck) {
+      const ackIds = [
+        ...new Set(
+          items
+            .map((i) => i.message.id)
+            .filter((id): id is string => typeof id === "string" && id.length > 0),
+        ),
+      ];
+      if (ackIds.length > 0) sendAck(anchor.peerId, ackIds);
+    }
     const fresh = await filterFreshInboundItems(items, accountId, checkAndRecord, sinks);
     const first = fresh[0];
     if (!first) return;
     dispatch(first.peerId, coalesce(fresh.map((i) => i.message)));
   };
+}
+
+/**
+ * P0-7b — handle the inbound items a `/stop` CANCELLED out of the debounce window.
+ *
+ * A message that is still buffered in the pre-run debounce window when the user
+ * sends `/stop` is dropped by `cancelKey` (P1-8b's control-lane contract) BEFORE
+ * it ever reaches `onFlush` — so it was never dedupe-recorded and never acked, yet
+ * the client's replay ledger still holds it. Without this, the next reconnect would
+ * replay that killed text, the server would see it as FRESH, ack it, and run a turn
+ * the user explicitly aborted (possibly much later). For each id-carrying dropped
+ * item we:
+ *   1. RECORD `${peerId}:${id}` first — so if an in-flight replay lands before the
+ *      ack, ingress dedupe drops it as a duplicate and the killed text never runs;
+ *   2. THEN `sendAck` the ids — draining the client's ledger when it is still
+ *      connected, so it stops replaying at all.
+ * Record-before-ack is load-bearing: acking first leaves a window where a replay
+ * arrives before the record and runs. (This is the OPPOSITE ordering from the
+ * admit path in `createIngressOnFlush`, where the message IS being admitted so
+ * ack-first is safe — here the message was KILLED, so a pre-record replay would
+ * wrongly run it.)
+ *
+ * Best-effort by design (the caller fires this from the sync-shaped `onCancel`
+ * hook, fire-and-forget): a record that throws is swallowed with a WARN
+ * (`logWarn`, matching the fail-open severity split in `filterFreshInboundItems`)
+ * and does NOT block the ack — a lost record only re-opens the pre-existing
+ * pre-P0-7b replay window (a replay could run), which is strictly no worse than
+ * before this fix. Id-less items are skipped entirely (an older client never
+ * ledgers them, so there is nothing to record or ack). `cancelKey` is per-peer,
+ * but ids are grouped by peer defensively so a single ack frame per peer carries
+ * exactly its own ids.
+ */
+export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
+  items: readonly T[],
+  accountId: string,
+  checkAndRecord: IngressDedupeCheck,
+  sendAck: (peerId: string, ids: string[]) => void,
+  logWarn?: (message: string) => void,
+): Promise<void> {
+  const idsByPeer = new Map<string, string[]>();
+  for (const item of items) {
+    const id = item.message.id;
+    if (!id) continue; // id-less: not replayable by the client — nothing to do.
+    try {
+      await checkAndRecord(`${item.peerId}:${id}`, { namespace: accountId });
+    } catch (err) {
+      logWarn?.(
+        `webchannel: cancelled-inbound dedupe record failed for peer=${item.peerId} id=${id} ` +
+          `(best-effort — the ack still drains the ledger): ${String(err)}`,
+      );
+    }
+    // Ack regardless of the record outcome: the ack drains the client ledger, and
+    // the record is the fallback for when the ack cannot reach a disconnected client.
+    const ids = idsByPeer.get(item.peerId) ?? [];
+    ids.push(id);
+    idsByPeer.set(item.peerId, ids);
+  }
+  for (const [peerId, ids] of idsByPeer) sendAck(peerId, ids);
 }

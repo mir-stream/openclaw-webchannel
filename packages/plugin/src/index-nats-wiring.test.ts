@@ -73,3 +73,22 @@ describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () 
     expect(INDEX_NATS_SOURCE).toMatch(/onFlush:\s*createIngressOnFlush</);
   });
 });
+
+describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
+  it("wires sendAck into the onFlush factory, the debouncer onCancel, and the control-lane branch", () => {
+    // The onFlush factory must be handed a sendAck so admitted (fresh + duplicate)
+    // ids drain the client's replay ledger.
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /sendAck:\s*\(peerId,\s*ids\)\s*=>\s*channel\.sendAck\(peerId,\s*ids\)/,
+    );
+    // The debouncer's onCancel must record+ack /stop-cancelled buffered items via
+    // the tested helper (else a reconnect replays text the user aborted).
+    expect(INDEX_NATS_SOURCE).toMatch(/onCancel:/);
+    expect(INDEX_NATS_SOURCE).toMatch(/recordCancelledInboundItems\(/);
+    // The control-lane branch bypasses the debouncer/onFlush, so it acks its own
+    // id-carrying frame directly (else its ledger entry never drains).
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /if\s*\(message\.id\)\s*channel\.sendAck\(peerId,\s*\[message\.id\]\)/,
+    );
+  });
+});
