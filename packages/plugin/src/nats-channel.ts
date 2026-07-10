@@ -827,6 +827,22 @@ export class NatsChannel {
   }
 }
 
+/**
+ * The exact `NatsChannel` method surface the register-hop wiring reaches to feed
+ * `RegisterHandlerDeps` (see index-nats.ts). The register deps are function-
+ * injected, and index-nats.ts sits OUTSIDE this package's `tsc` include set, so
+ * without this contract nothing would force these methods to keep existing on
+ * `NatsChannel`. Derived via `Pick`, so dropping any listed method from the
+ * class turns THIS type into a compile error in a type-checked file.
+ */
+export type RegisterChannelSurface = Pick<
+  NatsChannel,
+  | "registerPeer"
+  | "unregisterPeer"
+  | "wrapConversationKeyForDevice"
+  | "sendApprovalSnapshot"
+>;
+
 // ---------------------------------------------------------------------------
 // Approval deduplication helpers
 // ---------------------------------------------------------------------------

@@ -582,6 +582,72 @@ describe("webchannel inbound round-trip", () => {
     expect(progressSpy.mock.calls[0][2]).toBe("First");
   });
 
+  it("degrades a MISSING assistant-message boundary to correct accumulation (no clobber, no dup)", async () => {
+    const transport = new WebChannelTransport();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // Two messages with NO boundary event between them. The second message's
+      // cumulative partial ("Second msg") restarts from "" and DIVERGES from
+      // the first ("First msg") — neither is a prefix of the other. Without the
+      // missed-boundary defense this would clobber "First msg".
+      partialSteps: [{ text: "First msg" }, { text: "Second msg" }],
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(progressSpy).toHaveBeenCalled();
+    // The seam was rolled up defensively: the last frame keeps BOTH messages.
+    const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
+    expect(lastFrameText).toBe("First msg\n\nSecond msg");
+    // "First msg" is never dropped once streamed (no clobber) and appears once
+    // per frame (no duplication) in the final joined frame.
+    expect((lastFrameText as string).match(/First msg/g)?.length).toBe(1);
+    expect((lastFrameText as string).match(/Second msg/g)?.length).toBe(1);
+    const progId = progressSpy.mock.calls[0][1];
+    for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+  });
+
+  it("handles a LATE assistant-message boundary idempotently (no double-roll)", async () => {
+    const transport = new WebChannelTransport();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // The boundary arrives LATE — after the second message's first partial has
+      // already been ingested (and rolled up by the missed-boundary defense).
+      // The belated boundary must be a no-op: it must NOT roll "Second msg" a
+      // second time. A subsequent growth partial extends the second message.
+      partialSteps: [
+        { text: "First msg" },
+        { text: "Second msg" },
+        { boundary: true },
+        { text: "Second msg more" },
+      ],
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(progressSpy).toHaveBeenCalled();
+    const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
+    // No double-roll: "First msg" rolled ONCE, second message accumulates in
+    // place — not "First msg\n\nSecond msg\n\nSecond msg more".
+    expect(lastFrameText).toBe("First msg\n\nSecond msg more");
+    expect((lastFrameText as string).match(/First msg/g)?.length).toBe(1);
+  });
+
   it("does NOT stream answer text in progress mode (onPartialReply is not wired — regression)", async () => {
     const transport = new WebChannelTransport();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
