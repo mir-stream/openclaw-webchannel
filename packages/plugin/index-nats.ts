@@ -39,6 +39,7 @@ import { handleRegisterRequest } from "./src/nats-register.js";
 import { resolveAdmissionMode, admissionServingPlan } from "./src/nats-admission.js";
 import { isDmPostureOpen } from "./src/dm-allowlist.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
+import { buildCommandCatalog } from "./src/commands-catalog.js";
 import { resolveWebchannelSessionRoute } from "./src/session-route.js";
 import type { WebChannelTransport } from "./src/transport.js";
 import type { NatsTransport } from "./src/nats-transport.js";
@@ -629,6 +630,22 @@ export default defineChannelPluginEntry({
             });
         } catch (err) {
           api.logger.error?.(`webchannel: history resolution failed for ${peerId}: ${String(err)}`);
+        }
+      });
+
+      // ---- Step 5b (per account): command-catalog load handler (P0-3) ------
+      // Slash-command DISCOVERY. Build the catalog PER REQUEST from the
+      // agent's resolved config (cheap, and always config-fresh — no cache to
+      // invalidate) and seal it back over `.out`. Same error-log-and-continue
+      // robustness as the history handler: a catalog build fault must never
+      // surface as an unhandled throw on the inbound dispatch path.
+      channel.setLoadCommandsHandler((peerId) => {
+        try {
+          channel.sendCommands(peerId, buildCommandCatalog(api.config));
+        } catch (err) {
+          api.logger.error?.(
+            `webchannel: command catalog failed for ${peerId}: ${String(err)}`,
+          );
         }
       });
 

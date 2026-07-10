@@ -755,3 +755,56 @@ describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () =
     expect(w.getState().messages).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// P0-3 slash-command discovery — the wrapper stores the catalog from a
+// `commands` frame and forwards loadCommands() to the underlying client.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P0-3 command discovery", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+  function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+  }
+
+  it("a `commands` frame sets state.commands", () => {
+    const w = makeWrapper();
+    expect(w.getState().commands).toBeUndefined();
+    const commands = [
+      { name: "help", description: "Show available commands." },
+      { name: "model", description: "Show or set the model.", args: [{ name: "model" }] },
+    ];
+    deliver(w, { type: "commands", commands } as unknown as InboundMessage);
+    expect(w.getState().commands).toEqual(commands);
+  });
+
+  it("a later `commands` frame REPLACES the catalog wholesale (idempotent refresh)", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "commands", commands: [{ name: "help", description: "h" }] } as unknown as InboundMessage);
+    deliver(w, { type: "commands", commands: [{ name: "new", description: "n" }] } as unknown as InboundMessage);
+    expect(w.getState().commands?.map((c) => c.name)).toEqual(["new"]);
+  });
+
+  it("a `commands` frame does NOT touch isTyping (not turn activity)", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "typing" });
+    expect(w.getState().isTyping).toBe(true);
+    deliver(w, { type: "commands", commands: [] } as unknown as InboundMessage);
+    expect(w.getState().isTyping).toBe(true); // unchanged
+  });
+
+  it("loadCommands() delegates to the underlying client", () => {
+    const w = makeWrapper();
+    const inner = (w as unknown as { client: { loadCommands: () => void } }).client;
+    const spy = vi.spyOn(inner, "loadCommands");
+    w.loadCommands();
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+});

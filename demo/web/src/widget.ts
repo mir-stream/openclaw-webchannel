@@ -16,7 +16,7 @@
  * the widget shows a distinct "credentials expired" state with a one-click
  * re-authenticate that mints a fresh, normal credential.
  */
-import { WebChannelNATSClient } from "../../../packages/client/src/index.js";
+import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/client/src/index.js";
 import type { WebChannelState, ApprovalRequest } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
 
@@ -72,10 +72,24 @@ export async function createWidget(
   });
   const input = el("input", { placeholder: "Type a message…", style: "flex:1" }) as HTMLInputElement;
   const sendBtn = el("button", { class: "primary" }, ["Send"]) as HTMLButtonElement;
+  // P0-3 slash-command typeahead menu — a column of command buttons rendered
+  // above the composer while the user is typing a `/command`. Hidden otherwise.
+  const cmdMenu = el("div", {
+    class: "hidden",
+    style:
+      "display:flex;flex-direction:column;gap:2px;margin-top:8px;padding:4px;" +
+      "border:1px solid var(--border);border-radius:6px;background:#161b22;max-height:180px;overflow:auto",
+  });
   const composer = el("div", { style: "display:flex;gap:8px;margin-top:10px" }, [input, sendBtn]);
-  bodyEl.append(topBar, mdHint, errBox, list, approvalsBox, composer);
+  bodyEl.append(topBar, mdHint, errBox, list, approvalsBox, cmdMenu, composer);
 
   let client: WebChannelNATSClient | null = null;
+  // P0-3 typeahead state. `commandsRequested` makes catalog discovery LAZY:
+  // requested once per client (reset in connectLane, so a re-auth re-requests
+  // for the fresh client). `menuDismissed` lets Escape hide the menu until the
+  // next keystroke.
+  let commandsRequested = false;
+  let menuDismissed = false;
 
   // ── Render ───────────────────────────────────────────────────────────────
   function renderApproval(a: ApprovalRequest): HTMLElement {
@@ -163,6 +177,66 @@ export async function createWidget(
     }
     list.replaceChildren(...bubbles);
     approvalsBox.replaceChildren(...state.approvals.map(renderApproval));
+    // Keep the typeahead in sync when the catalog frame lands mid-typing.
+    renderMenu();
+  }
+
+  /**
+   * P0-3: (re)render the slash-command typeahead from the CURRENT input value
+   * and the latest catalog in state. Lazily requests the catalog the first time
+   * the user types `/`. Picking an item inserts `/name ` and refocuses the
+   * input; Enter then sends it as an ordinary message (no special-casing).
+   */
+  function renderMenu(): void {
+    const value = input.value;
+    const isSlash = value.startsWith("/");
+
+    // Lazy discovery: fetch the catalog once when the user first starts a
+    // slash-command (per client — reset on reconnect via connectLane). Gated
+    // on `client` existing: a `/` typed during the connect window must NOT
+    // latch `commandsRequested` with no request dispatched (that would
+    // silently disable the typeahead until re-auth) — it stays unlatched and
+    // retries on the next keystroke.
+    if (isSlash && !commandsRequested && client) {
+      commandsRequested = true;
+      client.loadCommands();
+    }
+
+    const matches = menuDismissed
+      ? []
+      : filterCommandCatalog(client?.getState().commands, value);
+
+    if (matches.length === 0) {
+      cmdMenu.classList.add("hidden");
+      cmdMenu.replaceChildren();
+      return;
+    }
+
+    cmdMenu.classList.remove("hidden");
+    cmdMenu.replaceChildren(
+      ...matches.map((c) => {
+        const item = el(
+          "button",
+          {
+            style:
+              "text-align:left;font-size:12px;padding:4px 6px;background:transparent;" +
+              "border:none;border-radius:4px;cursor:pointer;color:var(--fg)",
+          },
+          [
+            el("span", { style: "font-weight:600" }, [`/${c.name}`]),
+            ...(c.description
+              ? [el("span", { style: "color:var(--muted)" }, [` — ${c.description}`])]
+              : []),
+          ],
+        ) as HTMLButtonElement;
+        item.onclick = () => {
+          input.value = `/${c.name} `;
+          input.focus();
+          renderMenu();
+        };
+        return item;
+      }),
+    );
   }
 
   /**
@@ -173,6 +247,10 @@ export async function createWidget(
   async function connectLane(ttlSeconds?: number): Promise<void> {
     client?.close();
     client = null;
+    // Fresh client → re-request the command catalog on the next `/` (its state
+    // starts without a catalog).
+    commandsRequested = false;
+    menuDismissed = false;
     statusPill.textContent = "● connecting…";
     statusPill.style.color = "var(--warn)";
     errBox.classList.add("hidden");
@@ -242,10 +320,22 @@ export async function createWidget(
     if (!text) return;
     client?.send(text);
     input.value = "";
+    renderMenu(); // hide the typeahead once the message is sent
   };
   sendBtn.onclick = submit;
+  // Live-filter the typeahead as the user types (fires AFTER the value updates,
+  // unlike keydown). A keystroke re-arms a menu the user dismissed with Escape.
+  input.oninput = () => {
+    menuDismissed = false;
+    renderMenu();
+  };
   input.onkeydown = (e) => {
-    if ((e as KeyboardEvent).key === "Enter") submit();
+    const key = (e as KeyboardEvent).key;
+    if (key === "Enter") submit();
+    else if (key === "Escape") {
+      menuDismissed = true;
+      renderMenu();
+    }
   };
 
   await connectLane();

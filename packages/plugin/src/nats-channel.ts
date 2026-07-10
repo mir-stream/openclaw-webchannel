@@ -31,6 +31,7 @@ import {
   openEnvelope,
 } from "./e2e-session.js";
 import { isValidSubjectToken } from "./subject-token.js";
+import type { CommandCatalogEntry } from "./commands-catalog.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -51,7 +52,11 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 export type InboundWsMessage =
   | { type: "user_message"; text: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
-  | { type: "load_history"; before?: string; limit?: number };
+  | { type: "load_history"; before?: string; limit?: number }
+  // P0-3 slash-command DISCOVERY: the browser asks for the command catalog (no
+  // params — the catalog is not paged). The agent answers with a `commands`
+  // frame. Discovery only; command EXECUTION is a normal `user_message`.
+  | { type: "load_commands" };
 
 export type OutboundWsMessage =
   | { type: "agent_message"; text: string; id?: string }
@@ -68,7 +73,10 @@ export type OutboundWsMessage =
       resolved?: Array<{ id: string; decision: ApprovalDecision }>;
     }
   | { type: "typing" }
-  | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> };
+  | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> }
+  // P0-3 slash-command DISCOVERY: the command catalog delivered in reply to a
+  // `load_commands` request (config-filtered, alias-free, name-sorted).
+  | { type: "commands"; commands: CommandCatalogEntry[] };
 
 export type HistoryMessage = {
   id: string;
@@ -257,6 +265,7 @@ export class NatsChannel {
   private onMessage?: (peerId: string, message: InboundWsMessage) => void;
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
   private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
+  private onLoadCommands?: (peerId: string) => void;
   private onHandshakeComplete?: (peerId: string) => void;
   /**
    * Register-hop admission over NATS (replaces the deleted HTTP register routes).
@@ -504,6 +513,15 @@ export class NatsChannel {
   }
 
   /**
+   * Send the slash-command catalog to peer (P0-3 discovery). Rides the same
+   * sealed `.out` path as every other outbound frame.
+   */
+  sendCommands(peerId: string, commands: CommandCatalogEntry[]): boolean {
+    const payload: OutboundWsMessage = { type: "commands", commands };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
    * Send approval request to peer.
    */
   sendApprovalRequest(
@@ -609,6 +627,15 @@ export class NatsChannel {
     handler: (peerId: string, request: { before?: string; limit?: number }) => void
   ): void {
     this.onLoadHistory = handler;
+  }
+
+  /**
+   * Set the command-catalog load handler (P0-3 discovery). Fires on a
+   * `load_commands` request; the handler builds the catalog and calls
+   * `sendCommands`.
+   */
+  setLoadCommandsHandler(handler: (peerId: string) => void): void {
+    this.onLoadCommands = handler;
   }
 
   /**
@@ -1001,6 +1028,10 @@ export class NatsChannel {
 
       case "load_history":
         this.onLoadHistory?.(peerId, { before: message.before, limit: message.limit });
+        break;
+
+      case "load_commands":
+        this.onLoadCommands?.(peerId);
         break;
 
       default:
