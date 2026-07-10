@@ -13,7 +13,7 @@
  */
 
 import { EventEmitter } from "node:events";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import { NatsChannel } from "./nats-channel.js";
 import type { InboundWsMessage } from "./nats-channel.js";
@@ -373,5 +373,78 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     const a = encrypt(key, new TextEncoder().encode("same"));
     const b = encrypt(key, new TextEncoder().encode("same"));
     expect(Buffer.from(a.nonce).toString("hex")).not.toBe(Buffer.from(b.nonce).toString("hex"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1 — a malformed handshake pubKey must NEVER crash the gateway
+// ---------------------------------------------------------------------------
+
+/** A `key_exchange` frame whose pubKey base64url-decodes to `len` bytes. */
+function malformedKeyExchange(len: number): Buffer {
+  return Buffer.from(
+    JSON.stringify({
+      type: "key_exchange",
+      pubKey: Buffer.alloc(len, 7).toString("base64url"),
+    }),
+  );
+}
+
+describe("parseKeyExchange (malformed-key hardening)", () => {
+  it("rejects a pubKey that does not decode to exactly 32 bytes", () => {
+    // Non-32-byte keys are what make deriveSharedSecret → createPublicKey throw
+    // synchronously; rejecting them here turns the crash into an ignored frame.
+    for (const len of [0, 1, 16, 31, 33, 64]) {
+      expect(parseKeyExchange(malformedKeyExchange(len))).toBeNull();
+    }
+  });
+
+  it("accepts a genuine 32-byte X25519 public key", () => {
+    const kp = generateKeyPair();
+    const parsed = parseKeyExchange(Buffer.from(keyExchangeFrame(kp.publicKey)));
+    expect(parsed).not.toBeNull();
+    expect(parsed!.length).toBe(32);
+    expect(Buffer.from(parsed!).equals(Buffer.from(kp.publicKey))).toBe(true);
+  });
+});
+
+describe("NatsChannel handshake (F1 crash guard)", () => {
+  it("drops a malformed-key handshake with a warn and keeps serving subsequent frames", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const h = makeHarness();
+
+      // A single normally-routed peer publishes a 1-byte pubKey. Pre-fix this
+      // reached deriveConversationKey → createPublicKey → synchronous throw →
+      // uncaught exception → gateway death. It must now be dropped as malformed.
+      expect(() => h.browser.publish(hsSubj, malformedKeyExchange(1))).not.toThrow();
+      // No key was established (the agent never replied with its pubKey), and a
+      // warn was logged.
+      expect(h.browserSessionKey()).toBeNull();
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("malformed handshake"),
+      );
+
+      // 0-byte and 33-byte variants are equally inert — no throw escapes.
+      expect(() => h.browser.publish(hsSubj, malformedKeyExchange(0))).not.toThrow();
+      expect(() => h.browser.publish(hsSubj, malformedKeyExchange(33))).not.toThrow();
+      expect(h.browserSessionKey()).toBeNull();
+
+      // The channel is still alive: a WELL-FORMED handshake after the bad frames
+      // completes and a sealed round-trip works end-to-end.
+      h.doHandshake();
+      expect(h.browserSessionKey()).not.toBeNull();
+      const key = h.browserSessionKey()!;
+      h.browser.publish(
+        inSubj,
+        sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER }, key, {
+          type: "user_message",
+          text: "still alive",
+        }),
+      );
+      expect(h.inbound).toEqual([{ type: "user_message", text: "still alive" }]);
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

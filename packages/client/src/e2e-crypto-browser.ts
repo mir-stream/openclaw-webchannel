@@ -190,6 +190,12 @@ export function parseKeyExchange(payload: string): string | null {
     if (frame.type !== "key_exchange" || typeof frame.pubKey !== "string" || !frame.pubKey) {
       return null;
     }
+    // An X25519 public key is exactly 32 bytes; a non-32-byte key would throw in
+    // importKey downstream. Reject it here so a malformed frame is ignorable,
+    // mirroring the agent's `parseKeyExchange` (e2e-session.ts).
+    if (base64urlDecode(frame.pubKey).length !== 32) {
+      return null;
+    }
     return frame.pubKey;
   } catch {
     return null;

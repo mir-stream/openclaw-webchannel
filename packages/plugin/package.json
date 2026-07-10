@@ -17,9 +17,9 @@
   ],
   "openclaw": {
     "extensions": [
-      "./index-nats.ts"
+      "./dist/index-nats.js"
     ],
-    "setupEntry": "./setup-entry.ts",
+    "setupEntry": "./dist/setup-entry.js",
     "channel": {
       "id": "webchannel",
       "label": "WebChannel",

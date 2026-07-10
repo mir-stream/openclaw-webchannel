@@ -130,6 +130,18 @@ jobs:
           npm run build --workspace=packages/saas
           npm run build --workspace=packages/client
 
+      # ──────────────────────────────────────────────────────────────────────
+      # 5c. Build the plugin dist/ bundle BEFORE any harness loads it.
+      #     package.json openclaw.extensions/setupEntry point at ./dist/*.js
+      #     (the self-contained esbuild bundle that a remote `plugins install`
+      #     loads); dist/ is gitignored, so `npm ci` alone leaves it absent.
+      #     The live-e2e harnesses (steps 8–8g) swap the entry to the TS source
+      #     for their own runs, but building here keeps dist/ fresh and makes
+      #     the committed entry resolvable in CI.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Build plugin (dist/ bundle)
+        run: npm run build --workspace=packages/plugin
+
       - name: Examples consumer tests (public-API boundary)
         run: |
           npm test --workspace=examples/minimal-consumer
@@ -265,83 +277,3 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
       - name: "Live e2e: DERIVED trust anchor (zero hand-written trust facts)"
         run: bash e2e/local/run-derived-trust.sh
-
-################################################################################
-# Publish job — gated on the E2E gate passing + release tag
-# Only runs when a semver tag is pushed (e.g. v1.0.0).
-# Requires: NPM_TOKEN and CLAWHUB_AUTH_TOKEN secrets.
-################################################################################
-
-  publish:
-    name: Publish to npm + ClawHub
-    needs: gate
-    runs-on: ubuntu-latest
-    # Only publish on semver release tags; skip for branch pushes/PRs.
-    if: >-
-      github.event_name == 'push' &&
-      startsWith(github.ref, 'refs/tags/v')
-
-    env:
-      NODE_VERSION: "22"
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js ${{ env.NODE_VERSION }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: "npm"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build packages
-        run: npm run build --workspaces --if-present
-
-      - name: Extract release version from tag
-        id: version
-        run: |
-          # Strip leading 'v' from tag name (e.g. v1.0.0 → 1.0.0)
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Publishing version: ${VERSION}"
-
-      - name: Update package versions to release tag
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          # Update all workspace package versions to the release semver.
-          npm version "${VERSION}" --workspaces --no-git-tag-version
-
-      - name: Publish openclaw-webchannel-client to npm
-        run: npm publish --workspace=packages/client --access=public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Publish openclaw-webchannel (plugin) to npm
-        run: npm publish --workspace=packages/plugin --access=public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Publish @openclaw/webchannel-saas to npm
-        run: npm publish --workspace=packages/saas --access=public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Publish plugin to ClawHub
-        run: |
-          # ClawHub publish uses the openclaw.plugin.json manifest.
-          # The auth token is provided via CLAWHUB_AUTH_TOKEN.
-          VERSION="${{ steps.version.outputs.version }}"
-          echo "Publishing openclaw-webchannel@${VERSION} to ClawHub..."
-          # ClawHub CLI publish — requires auth token in env.
-          npx clawhub-publish \
-            --manifest packages/plugin/openclaw.plugin.json \
-            --version "${VERSION}" \
-            --token "${CLAWHUB_AUTH_TOKEN}"
-        env:
-          CLAWHUB_AUTH_TOKEN: ${{ secrets.CLAWHUB_AUTH_TOKEN }}
-        # Don't fail the gate if ClawHub credentials are absent (DonePublishDeferred).
-        continue-on-error: ${{ secrets.CLAWHUB_AUTH_TOKEN == '' }}
