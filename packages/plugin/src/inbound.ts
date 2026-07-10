@@ -76,14 +76,25 @@ export async function handleInboundMessage(
 
   // Progress-draft wiring (Phase 1 first slice). Core does NOT auto-drive a
   // plugin's `message.live` adapter; the generic seam for a plugin channel is
-  // the inbound turn's reply dispatcher callbacks. When the channel is
-  // configured with `channels.webchannel.streaming.mode:"progress"` we build a
-  // per-turn draft controller and hook `onToolStart`/`onItemEvent`/`onPartialReply`
+  // the inbound turn's reply dispatcher callbacks. We build a per-turn draft
+  // controller and hook `onToolStart`/`onItemEvent`/`onPartialReply`
   // (GetReplyOptions, dist/plugin-sdk/types-BYvUZFDr.d.ts:274-304) via the turn's
   // `replyOptions` (Omit<GetReplyOptions,"onBlockReply">, AssembledChannelTurn,
   // dist/plugin-sdk/types-BVAOMoZy.d.ts:5813). Each event refreshes a single
   // rolling draft pushed to the widget as a `progress` frame; the final answer
   // (delivered through `delivery.deliver`) finalizes that same draft id.
+  //
+  // `channels.webchannel.streaming.mode` selects WHAT streams, mirroring core's
+  // own distinction (`onPartialReply` is wired only when `draftStream &&
+  // !isProgressMode`, verified: dist/message-handler.process-CcPQD8zK.js:1357):
+  //  - "partial": stream ANSWER TEXT. Draft is created; `onPartialReply` feeds
+  //    `pushAnswerText`, and tool/item events stay wired too, so a mixed turn
+  //    shows "Working… + tool lines" until the first answer text arrives, then
+  //    the answer text replaces the scaffold in the same draft.
+  //  - "progress": tool-lines-only. Draft is created but `onPartialReply` is
+  //    NOT wired — answer text never streams (the deliberate mode distinction).
+  //  - "block"/"off": NO draft. Falls through to the plain no-id `agent_message`
+  //    atomic append (see delivery.deliver below); `replyOptions` is omitted.
   // 가-1 Cycle 2: read the PER-ACCOUNT resolved config (channel-level shared
   // base merged under this account's override), not the flat block, so each
   // account's streaming/dmSecurity/allowFrom apply to its own turns. For the
@@ -107,9 +118,14 @@ export async function handleInboundMessage(
     return;
   }
 
-  const progressEnabled = resolveStreamingMode(channelConfig) === "progress";
+  // Draft enabled for the two streaming modes ("progress" tool-lines-only,
+  // "partial" answer-text); answer-text streaming (onPartialReply) is wired
+  // ONLY in "partial" mode. "block"/"off" take the no-draft fallback.
+  const streamingMode = resolveStreamingMode(channelConfig);
+  const draftEnabled = streamingMode === "progress" || streamingMode === "partial";
+  const answerStreamingEnabled = streamingMode === "partial";
   let draft: ProgressDraftController | undefined;
-  if (progressEnabled) {
+  if (draftEnabled) {
     draft = createProgressDraftController({
       transport,
       sessionKey: wsKey,
@@ -235,14 +251,42 @@ export async function handleInboundMessage(
                         meta: p.meta,
                       });
                     },
+                    // Answer-text streaming — PARTIAL MODE ONLY. Core emits
+                    // `onPartialReply` with the CUMULATIVE assistant text
+                    // (`text`) for final-answer-phase items only (commentary
+                    // goes to item events; shouldStreamAssistantPartial, verified:
+                    // dist/run-attempt-DRhLt3eF.js:4546-4548) — so no filtering
+                    // is needed here. In progress mode this is omitted, so
+                    // answer text never streams (the mode distinction). Guard an
+                    // empty `text` so a trailing empty partial can't clobber the
+                    // draft (PartialReplyPayload.text, dist/plugin-sdk/types-DNy-f8Hr.d.ts:200-203).
+                    ...(answerStreamingEnabled
+                      ? {
+                          onPartialReply: (p) => {
+                            draft!.pushAnswerText(p.text ?? "");
+                          },
+                          // Assistant-message boundary. Core's cumulative
+                          // `text` is per-itemId (restarts from "" on the next
+                          // final_answer message); rolling the prior message's
+                          // text into a prefix here prevents it visibly
+                          // vanishing on a multi-message reply. Fired once per
+                          // message start, incl. before the first (a no-op then)
+                          // — verified: dist/run-attempt-DRhLt3eF.js:4083-4086.
+                          // Partial mode only; NOT wired in progress mode.
+                          onAssistantMessageStart: () => {
+                            draft!.handleAssistantMessageBoundary();
+                          },
+                        }
+                      : {}),
                   },
                 }
               : {}),
             // THIS channel's outbound delivery seam. Forward the assembled reply
-            // text to the originating widget's live socket. In progress mode we
-            // FINALIZE the in-flight draft (reusing its id) so the widget
-            // transitions the working bubble into the final answer; otherwise we
-            // send a plain no-id agent_message (legacy append path).
+            // text to the originating widget's live socket. In either draft mode
+            // (progress/partial) we FINALIZE the in-flight draft (reusing its id)
+            // so the widget transitions the working bubble into the final answer;
+            // otherwise (block/off, no draft) we send a plain no-id agent_message
+            // (legacy append path).
             delivery: {
               deliver: async (payload, info) => {
                 const text = payload.text;
