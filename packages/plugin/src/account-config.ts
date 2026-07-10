@@ -7,7 +7,10 @@
  * fields acting as a SHARED BASE that is merged UNDER each account
  * (core `mergeAccountConfig`: channel base, then the account override wins; the
  * `accounts` key itself is omitted from the base). A flat single-account config
- * with NO `accounts` map is the implicit `"default"` account.
+ * with NO `accounts` map is the implicit `"default"` account. Once the `accounts`
+ * map is present and non-empty, the channel-level leaf fields are the SHARED BASE
+ * ONLY — they never conjure an implicit `"default"` account alongside the named
+ * ones. `"default"` is then listed only when it is an explicit key of `accounts`.
  *
  * We mirror that exactly so `openclaw channels add --channel webchannel
  * --account X` interoperates with core's setup pipeline. In particular, for a
@@ -106,25 +109,6 @@ const NESTED_OBJECT_KEYS = [
  */
 const STRUCTURAL_KEYS = new Set(["accounts", "defaultAccount", "enabled"]);
 
-/**
- * Channel-level leaf fields that signal an implicit `"default"` account is
- * configured (the shared base is itself a usable account).
- */
-const DEFAULT_ACCOUNT_MARKER_KEYS = [
-  "auth",
-  "nats",
-  "allowFrom",
-  "groupAllowFrom",
-  "dmSecurity",
-  "streaming",
-  "execApprovals",
-  "capabilities",
-  "history",
-  "encryption",
-  "saas",
-  "tenant",
-] as const;
-
 /** A single resolved account's raw config object. */
 export type WebchannelAccountConfig = Record<string, unknown>;
 
@@ -168,14 +152,6 @@ function channelLevelBase(
   return base;
 }
 
-/** Does the channel-level base carry any leaf field (⇒ implicit default account)? */
-export function hasChannelLevelAccountFields(
-  section: Record<string, unknown> | undefined,
-): boolean {
-  if (!section) return false;
-  return DEFAULT_ACCOUNT_MARKER_KEYS.some((key) => key in section);
-}
-
 /**
  * Merge the channel-level base under an account override (core-compatible):
  * shallow spread (override wins), then a one-level shallow merge for the known
@@ -207,10 +183,14 @@ function mergeAccountConfig(
 /**
  * List the configured account ids (canonical `accounts.<id>` model).
  *
- *   - keys of `channels.webchannel.accounts`, PLUS
- *   - `"default"` when the channel-level base carries leaf fields (implicit
- *     default), PLUS
- *   - a `["default"]` fallback when nothing else is configured.
+ *   - the keys of `channels.webchannel.accounts`, OR
+ *   - a `["default"]` fallback when that map is empty/absent (the flat
+ *     single-account config, whose channel-level base IS the default account).
+ *
+ * Channel-level leaf fields are the SHARED BASE only: once `accounts` is present
+ * and non-empty they never conjure an implicit `"default"` alongside the named
+ * accounts (issue #17). `"default"` is listed only when it is an explicit key of
+ * `accounts`, or when `accounts` is empty/absent (the fallback).
  *
  * MUST return ≥1 entry (core's channel monitor short-circuits otherwise).
  * Sorted for stable ordering (mirrors core).
@@ -218,7 +198,6 @@ function mergeAccountConfig(
 export function listWebchannelAccountIds(cfg: unknown): string[] {
   const section = readWebchannelSection(cfg);
   const ids = new Set<string>(Object.keys(readAccountsMap(section)).filter(Boolean));
-  if (hasChannelLevelAccountFields(section)) ids.add(DEFAULT_ACCOUNT_ID);
   if (ids.size === 0) return [DEFAULT_ACCOUNT_ID];
   return [...ids].sort((a, b) => a.localeCompare(b));
 }

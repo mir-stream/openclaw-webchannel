@@ -6,7 +6,6 @@ import {
   canonicalizeAccountId,
   isValidAccountId,
   assertValidAccountId,
-  hasChannelLevelAccountFields,
   listWebchannelAccountIds,
   resolveServingAccountId,
   resolveWebchannelAccountConfig,
@@ -67,18 +66,6 @@ describe("account-config: account id validation (TRUST BOUNDARY)", () => {
   });
 });
 
-describe("account-config: hasChannelLevelAccountFields", () => {
-  it("true when a channel-level leaf field is present", () => {
-    expect(hasChannelLevelAccountFields({ auth: {} })).toBe(true);
-    expect(hasChannelLevelAccountFields({ tenant: "t" })).toBe(true);
-  });
-  it("false for an accounts-only or empty section", () => {
-    expect(hasChannelLevelAccountFields({ accounts: { a: {} } })).toBe(false);
-    expect(hasChannelLevelAccountFields({})).toBe(false);
-    expect(hasChannelLevelAccountFields(undefined)).toBe(false);
-  });
-});
-
 describe("account-config: listWebchannelAccountIds", () => {
   it("synthesizes default when there is no webchannel section", () => {
     expect(listWebchannelAccountIds({ channels: {} })).toEqual([DEFAULT_ACCOUNT_ID]);
@@ -96,6 +83,13 @@ describe("account-config: listWebchannelAccountIds", () => {
     ]);
   });
 
+  it("returns default when the accounts map is PRESENT but empty, even with channel-level fields", () => {
+    const cfg = {
+      channels: { webchannel: { auth: { strategy: "jwt" }, accounts: {} } },
+    };
+    expect(listWebchannelAccountIds(cfg)).toEqual([DEFAULT_ACCOUNT_ID]);
+  });
+
   it("lists accounts-map children", () => {
     const cfg = {
       channels: { webchannel: { accounts: { acctA: { auth: {} }, acctB: { allowFrom: [] } } } },
@@ -103,23 +97,42 @@ describe("account-config: listWebchannelAccountIds", () => {
     expect(listWebchannelAccountIds(cfg)).toEqual(["acctA", "acctB"]);
   });
 
-  it("includes implicit default when channel-level base + named accounts coexist", () => {
+  it("treats channel-level base as shared base only — no implicit default beside named accounts", () => {
     const cfg = {
       channels: { webchannel: { auth: { strategy: "jwt" }, accounts: { acctB: {} } } },
     };
-    expect(listWebchannelAccountIds(cfg)).toEqual(["acctB", "default"]);
+    expect(listWebchannelAccountIds(cfg)).toEqual(["acctB"]);
   });
 
   it("honors an explicit `default` account in the accounts map", () => {
     const cfg = { channels: { webchannel: { accounts: { default: { auth: {} }, acctB: {} } } } };
     expect(listWebchannelAccountIds(cfg)).toEqual(["acctB", "default"]);
   });
+
+  it("does NOT conjure a phantom default from channel-level shared tuning keys (issue #17)", () => {
+    const cfg = {
+      channels: {
+        webchannel: { accounts: { for_work: {} }, streaming: { mode: "progress" } },
+      },
+    };
+    expect(listWebchannelAccountIds(cfg)).toEqual(["for_work"]);
+  });
 });
 
 describe("account-config: resolveServingAccountId", () => {
-  it("prefers default when listed", () => {
-    const cfg = { channels: { webchannel: { auth: {}, accounts: { acctB: {} } } } };
+  it("prefers default when explicitly listed", () => {
+    const cfg = { channels: { webchannel: { accounts: { default: { auth: {} }, acctB: {} } } } };
     expect(resolveServingAccountId(cfg)).toBe("default");
+  });
+  it("does not serve a phantom default — resolves the named account (issue #17)", () => {
+    const cfg = { channels: { webchannel: { auth: {}, accounts: { acctB: {} } } } };
+    expect(resolveServingAccountId(cfg)).toBe("acctB");
+  });
+  it("resolves the sole named account when shared tuning keys coexist (issue #17)", () => {
+    const cfg = {
+      channels: { webchannel: { accounts: { for_work: {} }, streaming: { mode: "progress" } } },
+    };
+    expect(resolveServingAccountId(cfg)).toBe("for_work");
   });
   it("falls back to the first listed account when no default", () => {
     const cfg = { channels: { webchannel: { accounts: { acctB: {}, acctC: {} } } } };

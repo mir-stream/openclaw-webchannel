@@ -67,19 +67,23 @@ describe("planAccounts: multi-account (Phase 3)", () => {
     expect(plans[1]).toMatchObject({ accountId: "acctB", tenant: "tB" });
   });
 
-  it("serves the default (channel-level) account alongside named accounts", () => {
+  it("does NOT serve a phantom default from channel-level shared base (issue #17)", () => {
+    // Channel-level fields are the SHARED BASE only; once `accounts` is present
+    // they never conjure an implicit `"default"` account to serve alongside the
+    // named ones (which would then fail credential acquisition for an account
+    // that was never configured).
     const cfg = {
       channels: {
         webchannel: {
           tenant: "tDef",
-          accounts: { acctA: { tenant: "tA" } },
+          accounts: { acctA: {} },
         },
       },
     };
     const plans = served(planAccounts(cfg, { env: {} }));
-    expect(plans.map((p) => p.accountId).sort()).toEqual(["acctA", "default"]);
-    const def = plans.find((p) => p.accountId === "default");
-    expect(def).toMatchObject({ accountId: "default", tenant: "tDef" });
+    expect(plans.map((p) => p.accountId)).toEqual(["acctA"]);
+    // The shared base still merges under the named account.
+    expect(plans[0]).toMatchObject({ accountId: "acctA", tenant: "tDef" });
   });
 
   it("carries the merged per-account config (shared base inherited)", () => {
@@ -129,5 +133,52 @@ describe("planAccounts: 가-2 decoupled handling agent", () => {
     const plans = planAccounts(cfg, { env: {} });
     // Both named accounts serve; the wire identity is their (unique) accountId.
     expect(served(plans).map((p) => p.accountId).sort()).toEqual(["acctA", "acctB"]);
+  });
+});
+
+describe("planAccounts: orphaned-default boot warning (issue #17)", () => {
+  it("warns once when channel-level auth coexists with named accounts and no accounts.default", () => {
+    const warnings: string[] = [];
+    const cfg = {
+      channels: {
+        webchannel: {
+          auth: { strategy: "jwt" },
+          accounts: { for_work: {} },
+        },
+      },
+    };
+    const plans = planAccounts(cfg, { env: {}, warn: (m) => warnings.push(m) });
+    // Only the named account is served — the channel-level default is orphaned.
+    expect(served(plans).map((p) => p.accountId)).toEqual(["for_work"]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("accounts.default");
+  });
+
+  it("does NOT warn when an explicit accounts.default exists", () => {
+    const warnings: string[] = [];
+    const cfg = {
+      channels: {
+        webchannel: {
+          auth: { strategy: "jwt" },
+          accounts: { for_work: {}, default: {} },
+        },
+      },
+    };
+    planAccounts(cfg, { env: {}, warn: (m) => warnings.push(m) });
+    expect(warnings).toEqual([]);
+  });
+
+  it("does NOT warn for a tuning-only shared base (streaming) with named accounts", () => {
+    const warnings: string[] = [];
+    const cfg = {
+      channels: {
+        webchannel: {
+          streaming: { mode: "progress" },
+          accounts: { for_work: {} },
+        },
+      },
+    };
+    planAccounts(cfg, { env: {}, warn: (m) => warnings.push(m) });
+    expect(warnings).toEqual([]);
   });
 });
