@@ -436,8 +436,19 @@ export class DeviceFlowEnrollment {
   private readonly options: Required<Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId">> &
     Pick<DeviceFlowOptions, "natsIssuerAccountId">;
   private readonly store: EnrollmentStore;
-  /** A2: in-flight approvals keyed by userCode, to coalesce concurrent clicks. */
-  private readonly approvalsInFlight = new Map<string, Promise<EnrollmentResult | null>>();
+  /**
+   * #22: per-userCode serialization gate shared by approve() AND deny(). Maps a
+   * userCode to the tail of its running critical-section chain so the next
+   * operator action on the same userCode runs strictly after the previous one
+   * fully settles. This closes the check-then-act race where approve's slow
+   * NATS mint sits between its read and write and a concurrent deny (or a second
+   * approve) interleaves — the #11 status guards alone can't stop it because
+   * both sides read `pending` before either writes. It supersedes the old
+   * approve-only in-flight dedup: a second approve no longer reuses the first's
+   * promise, it re-reads and hits the A2 approved-with-creds re-return path,
+   * which yields the same creds.
+   */
+  private readonly userCodeLocks = new Map<string, Promise<unknown>>();
 
   constructor(options: DeviceFlowOptions) {
     this.options = {
@@ -582,9 +593,14 @@ export class DeviceFlowEnrollment {
    * plugin a DIFFERENT identity on its next poll and break the live session, so:
    *  - a repeat AFTER the first approval returns the SAME credentials (status
    *    guard on the persisted enrollment), and
-   *  - two CONCURRENT approvals of the same enrollment are coalesced onto one
-   *    in-flight promise so they can't each mint a distinct identity in the
-   *    read-mint-write window (last-writer-wins).
+   *  - two CONCURRENT approvals of the same enrollment are SERIALIZED by the
+   *    per-userCode lock (#22), so the second runs only after the first's whole
+   *    read-mint-write span settles and then re-reads → hits the A2 guard and
+   *    re-returns the first-minted identity (never a distinct second one).
+   * The same lock also serializes approve against a concurrent deny (#22): the
+   * two can no longer interleave so that one silently overwrites the other's
+   * terminal write — the loser re-reads and observes the winner via the #11
+   * status guards (deny-after-approve → false, approve-after-deny → null).
    * Past `expiresAt` this returns null (the expiry check precedes the guard) —
    * consistent with `poll()`, which also fails an expired record; the whole
    * enroll→approve→poll cycle must complete inside the device-flow window.
@@ -595,13 +611,40 @@ export class DeviceFlowEnrollment {
    * rejected the record and must not have credentials minted after the fact.
    */
   async approve(userCode: string): Promise<EnrollmentResult | null> {
-    const inFlight = this.approvalsInFlight.get(userCode);
-    if (inFlight) return inFlight;
-    const promise = this.approveInner(userCode).finally(() => {
-      this.approvalsInFlight.delete(userCode);
+    return this.withUserCodeLock(userCode, () => this.approveInner(userCode));
+  }
+
+  /**
+   * #22: run `fn` as the sole holder of `userCode`'s critical section, serialized
+   * against every other approve/deny on the same userCode. The work is chained
+   * onto the userCode's running tail so it starts only after the prior holder
+   * fully settles (success OR failure), and the whole read→write span — including
+   * approve's async NATS mint — is protected.
+   *
+   * The stored tail node swallows `fn`'s outcome, so a thrown mint/store error
+   * propagates to THIS caller (via the returned promise) yet never wedges the
+   * queue: the next waiter still runs. When the node is still the tail after it
+   * settles, it removes itself so the map stays bounded.
+   */
+  private withUserCodeLock<T>(userCode: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.userCodeLocks.get(userCode) ?? Promise.resolve();
+    // Run `fn` after `prev` settles regardless of whether prev resolved or
+    // rejected — a prior failure must not skip our turn.
+    const result = prev.then(fn, fn);
+    // The tail used purely as a sequencing gate: swallow the result so a
+    // rejection can't leave the chain unhandled or block the next holder, and
+    // self-evict once nobody has chained behind us.
+    let node: Promise<void>;
+    node = result.then(
+      () => {},
+      () => {},
+    ).finally(() => {
+      if (this.userCodeLocks.get(userCode) === node) {
+        this.userCodeLocks.delete(userCode);
+      }
     });
-    this.approvalsInFlight.set(userCode, promise);
-    return promise;
+    this.userCodeLocks.set(userCode, node);
+    return result;
   }
 
   private async approveInner(userCode: string): Promise<EnrollmentResult | null> {
@@ -669,6 +712,12 @@ export class DeviceFlowEnrollment {
    * returns false without change.
    */
   async deny(userCode: string): Promise<boolean> {
+    // #22: share approve's per-userCode gate so a deny can't interleave with a
+    // concurrent approve's read→mint→write span (and vice versa).
+    return this.withUserCodeLock(userCode, () => this.denyInner(userCode));
+  }
+
+  private async denyInner(userCode: string): Promise<boolean> {
     const enrollment = await this.store.getEnrollmentByUserCode(userCode);
     if (!enrollment) return false;
 
