@@ -203,16 +203,6 @@ export function listWebchannelAccountIds(cfg: unknown): string[] {
 }
 
 /**
- * Resolve the account id this Cycle-1 process serves. Prefers `"default"` when
- * listed (regression-stable for single-account deployments), else the first
- * listed account. Cycle 2 will multiplex ALL listed accounts.
- */
-export function resolveServingAccountId(cfg: unknown): string {
-  const ids = listWebchannelAccountIds(cfg);
-  return ids.includes(DEFAULT_ACCOUNT_ID) ? DEFAULT_ACCOUNT_ID : (ids[0] ?? DEFAULT_ACCOUNT_ID);
-}
-
-/**
  * Resolve a single account's effective config: the channel-level shared base
  * merged under the account override at `accounts.<accountId>`.
  *

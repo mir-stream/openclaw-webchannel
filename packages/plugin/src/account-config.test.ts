@@ -7,7 +7,6 @@ import {
   isValidAccountId,
   assertValidAccountId,
   listWebchannelAccountIds,
-  resolveServingAccountId,
   resolveWebchannelAccountConfig,
   resolveAcquisitionIdentity,
   resolveAccountNatsConfig,
@@ -116,30 +115,6 @@ describe("account-config: listWebchannelAccountIds", () => {
       },
     };
     expect(listWebchannelAccountIds(cfg)).toEqual(["for_work"]);
-  });
-});
-
-describe("account-config: resolveServingAccountId", () => {
-  it("prefers default when explicitly listed", () => {
-    const cfg = { channels: { webchannel: { accounts: { default: { auth: {} }, acctB: {} } } } };
-    expect(resolveServingAccountId(cfg)).toBe("default");
-  });
-  it("does not serve a phantom default — resolves the named account (issue #17)", () => {
-    const cfg = { channels: { webchannel: { auth: {}, accounts: { acctB: {} } } } };
-    expect(resolveServingAccountId(cfg)).toBe("acctB");
-  });
-  it("resolves the sole named account when shared tuning keys coexist (issue #17)", () => {
-    const cfg = {
-      channels: { webchannel: { accounts: { for_work: {} }, streaming: { mode: "progress" } } },
-    };
-    expect(resolveServingAccountId(cfg)).toBe("for_work");
-  });
-  it("falls back to the first listed account when no default", () => {
-    const cfg = { channels: { webchannel: { accounts: { acctB: {}, acctC: {} } } } };
-    expect(resolveServingAccountId(cfg)).toBe("acctB");
-  });
-  it("returns default for an empty config", () => {
-    expect(resolveServingAccountId({})).toBe("default");
   });
 });
 

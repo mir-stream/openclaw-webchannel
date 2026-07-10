@@ -633,6 +633,139 @@ describe("DeviceFlowEnrollment", () => {
     });
   });
 
+  // #22: approve() and deny() are check-then-act with a real async gap (approve
+  // awaits the NATS mint between its read and write). They must be serialized
+  // JOINTLY per userCode so a concurrent approve+deny cannot interleave and have
+  // one silently overwrite the other's terminal write. The #11 status guards
+  // alone can't close this — both sides read `pending` before either writes.
+  describe("concurrent approve/deny serialization (#22)", () => {
+    // Store whose updateEnrollment can be delayed, forcing the historic
+    // interleave window: the current holder yields to the event loop mid-write,
+    // and without the joint lock the other operation would slip in.
+    class SlowUpdateStore extends MemoryEnrollmentStore {
+      updateDelayMs = 0;
+      override async updateEnrollment(
+        deviceCode: string,
+        updates: Partial<PendingEnrollment>,
+      ): Promise<void> {
+        if (this.updateDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, this.updateDelayMs));
+        }
+        return super.updateEnrollment(deviceCode, updates);
+      }
+    }
+
+    // Store whose FIRST updateEnrollment throws a non-collision error, to prove a
+    // rejected approve releases the userCode's queue (try/finally semantics).
+    class ThrowOnceUpdateStore extends MemoryEnrollmentStore {
+      throwOnce = false;
+      override async updateEnrollment(
+        deviceCode: string,
+        updates: Partial<PendingEnrollment>,
+      ): Promise<void> {
+        if (this.throwOnce) {
+          this.throwOnce = false;
+          throw new Error("store boom");
+        }
+        return super.updateEnrollment(deviceCode, updates);
+      }
+    }
+
+    it("approve+deny fired together: approve (queued first) wins, deny observes approved", async () => {
+      const store = new SlowUpdateStore({ autoSweep: false });
+      const svc = createEnrollment(store);
+      const enrollResponse = await svc.enroll(validEnrollmentRequest);
+
+      // approve holds the lock across a slow write; a broken lock would let deny
+      // read `pending` and flip the record to denied under the approval.
+      store.updateDelayMs = 50;
+      const approveP = svc.approve(enrollResponse.user_code); // acquires first
+      const denyP = svc.deny(enrollResponse.user_code); // queues behind
+      const [approved, denied] = await Promise.all([approveP, denyP]);
+
+      expect(approved).not.toBeNull();
+      expect(denied).toBe(false); // deny re-read the approved record → #11 guard
+
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.status).toBe("approved");
+      expect(persisted?.natsCreds).toEqual(approved!.creds);
+      expect(persisted?.peerId).toBe(approved!.peerId);
+
+      // The live plugin still polls through the approved identity.
+      const polled = await svc.poll({ device_code: enrollResponse.device_code });
+      expect("peerId" in polled! && polled.peerId).toBe(approved!.peerId);
+      store.close();
+    });
+
+    it("deny+approve fired together: deny (queued first) wins, approve observes denied", async () => {
+      const store = new SlowUpdateStore({ autoSweep: false });
+      const svc = createEnrollment(store);
+      const enrollResponse = await svc.enroll(validEnrollmentRequest);
+
+      // deny holds the lock across a slow write; a broken lock would let approve
+      // read `pending`, mint, and overwrite the deny with an approved identity.
+      store.updateDelayMs = 50;
+      const denyP = svc.deny(enrollResponse.user_code); // acquires first
+      const approveP = svc.approve(enrollResponse.user_code); // queues behind
+      const [denied, approved] = await Promise.all([denyP, approveP]);
+
+      expect(denied).toBe(true);
+      expect(approved).toBeNull(); // approve re-read the denied record → #11 guard
+
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.status).toBe("denied");
+      expect(persisted?.natsCreds).toBeUndefined();
+      expect(persisted?.peerId).toBeUndefined();
+
+      // The plugin sees access_denied — no creds were minted after the deny.
+      const polled = await svc.poll({ device_code: enrollResponse.device_code });
+      expect("error" in polled! && polled.error).toBe("access_denied");
+      store.close();
+    });
+
+    it("a rejected approve (store write throws) propagates and does not wedge a later deny", async () => {
+      const store = new ThrowOnceUpdateStore({ autoSweep: false });
+      const svc = createEnrollment(store);
+      const enrollResponse = await svc.enroll(validEnrollmentRequest);
+
+      // approve mints, then its persist throws a non-collision store error: it
+      // must propagate (not be swallowed) AND release the userCode's queue.
+      store.throwOnce = true;
+      await expect(svc.approve(enrollResponse.user_code)).rejects.toThrow("store boom");
+
+      // The record stayed pending (approve never wrote) — the queue is free, so a
+      // subsequent deny on the same userCode still runs to completion.
+      const denied = await svc.deny(enrollResponse.user_code);
+      expect(denied).toBe(true);
+
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.status).toBe("denied");
+      store.close();
+    });
+
+    it("concurrent approve+approve stays coalesced onto one identity under the joint lock", async () => {
+      const store = new SlowUpdateStore({ autoSweep: false });
+      const svc = createEnrollment(store);
+      const enrollResponse = await svc.enroll(validEnrollmentRequest);
+
+      store.updateDelayMs = 30;
+      const [a, b] = await Promise.all([
+        svc.approve(enrollResponse.user_code),
+        svc.approve(enrollResponse.user_code),
+      ]);
+
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      // Second approve re-read and hit the A2 approved-with-creds re-return path.
+      expect(b!.peerId).toBe(a!.peerId);
+      expect(b!.creds).toEqual(a!.creds);
+
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.peerId).toBe(a!.peerId);
+      store.close();
+    });
+  });
+
   describe("MemoryEnrollmentStore", () => {
     const makePending = (overrides: Partial<PendingEnrollment> = {}): PendingEnrollment => ({
       device_code: "test-device-code",
