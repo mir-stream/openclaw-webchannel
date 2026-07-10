@@ -394,8 +394,15 @@ describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () =
   function requestFrame(id: string): InboundMessage {
     return { type: "approval_request", ...pendingPayload(id) };
   }
-  function snapshotFrame(ids: string[]): InboundMessage {
-    return { type: "approval_snapshot", approvals: ids.map(pendingPayload) };
+  function snapshotFrame(
+    ids: string[],
+    resolved?: Array<{ id: string; decision: string }>,
+  ): InboundMessage {
+    return {
+      type: "approval_snapshot",
+      approvals: ids.map(pendingPayload),
+      ...(resolved ? { resolved } : {}),
+    };
   }
   /** Spy on the underlying client's decision sender (for Leg C re-send assertions). */
   function spyDecision(wrapper: WebChannelNATSClient) {
@@ -435,6 +442,76 @@ describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () =
     // An EMPTY snapshot retires every remaining actionable card.
     deliver(w, snapshotFrame([]));
     expect(w.getState().approvals.find((a) => a.id === "a2")?.resolvedDecision).toBe("unknown");
+  });
+
+  it("#19 Leg B: a card absent from pending but present in `resolved` shows the ACTUAL decision", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    // Snapshot: a1 no longer pending, but its resolved outcome is carried.
+    deliver(w, snapshotFrame([], [{ id: "a1", decision: "allow-once" }]));
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("allow-once"); // real verdict, not "unknown"
+    expect(a.resolutionConfirmed).toBe(true);
+  });
+
+  it("#19 Leg B: a card absent from BOTH pending and resolved still falls back to 'unknown'", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    // resolved carries an UNRELATED id → a1 aged out of the server's ring.
+    deliver(w, snapshotFrame([], [{ id: "other", decision: "deny" }]));
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("unknown");
+    expect(a.resolutionConfirmed).toBe(true);
+  });
+
+  it("#19 optimistic-vs-server conflict: the SERVER decision wins and is confirmed", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "allow-once"); // optimistic, unconfirmed
+    // Server resolved it as DENY (e.g. another approver) — absent from pending,
+    // present in resolved with a DIFFERENT decision → server overrides.
+    deliver(w, snapshotFrame([], [{ id: "a1", decision: "deny" }]));
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("deny");
+    expect(a.resolutionConfirmed).toBe(true);
+  });
+
+  it("#19 optimistic matches server: just confirm, no decision change", () => {
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1"));
+    w.decide("a1", "allow-once");
+    deliver(w, snapshotFrame([], [{ id: "a1", decision: "allow-once" }]));
+    const a = w.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("allow-once");
+    expect(a.resolutionConfirmed).toBe(true);
+  });
+
+  it("#19 a `resolved`-list id with NO local card is NOT rehydrated as a card", () => {
+    const w = makeWrapper();
+    // Fresh state, snapshot lists only a resolved outcome for an id we never held.
+    deliver(w, snapshotFrame([], [{ id: "ghost", decision: "deny" }]));
+    expect(w.getState().approvals).toEqual([]);
+  });
+
+  it("#19 defensive: an id in BOTH pending and resolved lists ends RESOLVED (terminal wins), never actionable", () => {
+    // Impossible server-side (finalize is a synchronous delete-then-record), but
+    // the reconciler must fail safe: the resolved outcome wins over the pending
+    // listing, for both an existing card and a no-local-card id.
+    const w = makeWrapper();
+    deliver(w, requestFrame("a1")); // existing unresolved card
+    // a1 in BOTH the pending set AND the resolved set.
+    deliver(w, snapshotFrame(["a1", "a2"], [{ id: "a1", decision: "deny" }]));
+    const byId = Object.fromEntries(w.getState().approvals.map((a) => [a.id, a]));
+    // a1: terminal outcome wins — resolved "deny", confirmed, NOT actionable.
+    expect(byId["a1"].resolvedDecision).toBe("deny");
+    expect(byId["a1"].resolutionConfirmed).toBe(true);
+    // a2: pending-only → rehydrated as an actionable card as usual.
+    expect(byId["a2"].resolvedDecision).toBeUndefined();
+
+    // No-local-card id in BOTH lists → NOT rehydrated as an actionable card.
+    const w2 = makeWrapper();
+    deliver(w2, snapshotFrame(["b1"], [{ id: "b1", decision: "allow-once" }]));
+    expect(w2.getState().approvals).toEqual([]);
   });
 
   it("upsert-preserve: a re-delivered approval_request keeps a locally-set resolution (no button resurrection)", () => {

@@ -60,8 +60,13 @@ export type OutboundWsMessage =
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
   // #15 authoritative pending-approval snapshot (see transport.ts for the full
   // rationale). This union is nats-channel's OWN — it is NOT imported from
-  // transport.ts, so the frame type must be added here independently.
-  | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[] }
+  // transport.ts, so the frame type must be added here independently. `resolved`
+  // (#19, optional) carries recently-resolved outcomes for the client's Leg B.
+  | {
+      type: "approval_snapshot";
+      approvals: ApprovalRequestPayload[];
+      resolved?: Array<{ id: string; decision: ApprovalDecision }>;
+    }
   | { type: "typing" }
   | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> };
 
@@ -459,9 +464,22 @@ export class NatsChannel {
    * the key is established, E2E-encrypted, and fanned out to all of the peer's
    * devices for free. An EMPTY `approvals` array is sent deliberately (it is the
    * "nothing pending" reconciliation signal, not a no-op).
+   *
+   * `resolved` (#19) carries recently-RESOLVED outcomes so the client's Leg B can
+   * render the actual decision instead of a neutral "resolved (elsewhere)". The
+   * field is OMITTED when there is nothing to report (empty/absent), keeping an
+   * old-plugin-shaped frame byte-identical for the back-compat path.
    */
-  sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[]): boolean {
-    const payload: OutboundWsMessage = { type: "approval_snapshot", approvals };
+  sendApprovalSnapshot(
+    peerId: string,
+    approvals: ApprovalRequestPayload[],
+    resolved?: Array<{ id: string; decision: ApprovalDecision }>,
+  ): boolean {
+    const payload: OutboundWsMessage = {
+      type: "approval_snapshot",
+      approvals,
+      ...(resolved && resolved.length > 0 ? { resolved } : {}),
+    };
     return this.sendToPeer(peerId, payload);
   }
 
@@ -747,7 +765,11 @@ export class NatsChannel {
     //  1. REGISTERED peers only (`peerSubscriptions` — the register-hop / PoP-
     //     authenticated path). The wildcard / `admission:"auto"` path never calls
     //     registerPeer, so a peer there is unauthenticated (any tenant-creds holder
-    //     can handshake for any peerId); it must NOT receive stored history.
+    //     can handshake for any peerId); it must NOT receive stored history. For
+    //     the SAME reason approval snapshots (#15/#19) are register-hop-only and
+    //     never fired from here — a handshake-time snapshot would leak pending
+    //     approval ids (and approve capability) to a peerId hijacker. See
+    //     APPROVAL_REHYDRATION_PLAN §3.7.
     //  2. NEW session key only — a duplicate handshake (client retry / RTT race)
     //     derives the SAME key, so we skip re-sending the whole backlog. A genuine
     //     reconnect brings a fresh browser key → new session → re-hydrates.

@@ -30,6 +30,10 @@ import {
   PENDING_APPROVAL_MAX_AGE_MS,
   PENDING_APPROVAL_CAP,
   __pendingApprovalsTestHook,
+  listResolvedApprovalsForPeer,
+  RESOLVED_APPROVAL_MAX_AGE_MS,
+  RESOLVED_APPROVAL_CAP,
+  __resolvedApprovalsTestHook,
 } from "./approvals.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
@@ -1151,5 +1155,189 @@ describe("webchannel pending-approval store (#15)", () => {
     const ids = new Set(listPendingApprovalsForPeer("a", "alice").map((p) => p.id));
     expect(ids.has("id-0")).toBe(false);
     expect(ids.has(`id-${PENDING_APPROVAL_CAP}`)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #19 recently-resolved store — the OUTCOMES half of the register-time
+// `approval_snapshot`. Exercises updateEntry recording (real decision captured),
+// per-account composite-key scoping, cap eviction, max-age prune, and
+// listResolvedApprovalsForPeer filtering.
+// ---------------------------------------------------------------------------
+describe("webchannel recently-resolved store (#19)", () => {
+  beforeEach(() => {
+    __pendingApprovalsTestHook.clear();
+    __resolvedApprovalsTestHook.clear();
+    __approvalAccountBindingTestHook.clear();
+  });
+
+  function payload(id: string): ApprovalRequestPayload {
+    return {
+      id,
+      kind: "exec",
+      title: "t",
+      prompt: "p",
+      options: [{ decision: "allow-once", label: "Allow", style: "success" }],
+    };
+  }
+
+  async function deliver(
+    spec: ReturnType<typeof createClawApprovalNativeRuntimeSpec>,
+    accountId: string | null,
+    sessionKey: string,
+    p: ApprovalRequestPayload,
+  ) {
+    return spec.transport.deliverPending({
+      cfg: cfgEnabled,
+      accountId,
+      context: undefined,
+      plannedTarget: {} as any,
+      preparedTarget: { sessionKey },
+      request: {} as any,
+      approvalKind: "exec",
+      view: fakePendingExecView(p.id) as any,
+      pendingPayload: p,
+    } as any);
+  }
+
+  async function finalize(
+    spec: ReturnType<typeof createClawApprovalNativeRuntimeSpec>,
+    accountId: string | null,
+    entry: unknown,
+    decision: "allow-once" | "allow-always" | "deny",
+    phase: "resolved" | "expired" = "resolved",
+  ) {
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId,
+      context: undefined,
+      entry,
+      payload: { decision },
+      phase,
+    } as any);
+  }
+
+  it("updateEntry records the REAL decision at finalize (captured for the snapshot)", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
+    const spec = createClawApprovalNativeRuntimeSpec(transport);
+
+    const p = payload("exec-r");
+    const entry = await deliver(spec, null, "web-anon", p);
+    // Not resolved yet → nothing in the resolved store.
+    expect(listResolvedApprovalsForPeer(null, "web-anon")).toEqual([]);
+
+    await finalize(spec, null, entry, "allow-always", "resolved");
+    expect(listResolvedApprovalsForPeer(null, "web-anon")).toEqual([
+      { id: "exec-r", decision: "allow-always" },
+    ]);
+  });
+
+  it("an EXPIRY records the decision the builder produces ('deny'), driven through buildExpiredResult", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
+    const spec = createClawApprovalNativeRuntimeSpec(transport);
+
+    // Prove the recorded decision comes from the BUILDER, not a test literal: take
+    // the expiry payload the presentation builder emits and drive updateEntry with
+    // exactly it. If buildExpiredResult ever stops modeling expiry as "deny", this
+    // fails.
+    const expiredAction = spec.presentation.buildExpiredResult!({
+      view: fakePendingExecView("exec-e"),
+    } as any);
+    expect(expiredAction).toEqual({ kind: "update", payload: { decision: "deny" } });
+
+    const p = payload("exec-e");
+    const entry = await deliver(spec, null, "web-anon", p);
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId: null,
+      context: undefined,
+      entry,
+      payload: (expiredAction as { payload: { decision: "allow-once" | "allow-always" | "deny" } })
+        .payload,
+      phase: "expired",
+    } as any);
+    expect(listResolvedApprovalsForPeer(null, "web-anon")).toEqual([
+      { id: "exec-e", decision: "deny" },
+    ]);
+  });
+
+  it("records under the SAME account's composite key: A's finalize doesn't mask B", async () => {
+    const transportA = new WebChannelTransport();
+    const transportB = new WebChannelTransport();
+    vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
+    vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue(true);
+    vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
+    const byAccount: Record<string, WebChannelTransport> = { a: transportA, b: transportB };
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new WebChannelTransport(),
+      (accountId) => byAccount[accountId ?? "default"],
+    );
+
+    // Same id delivered on A and B (the F3 fan-out), same peer.
+    const p = payload("exec-shared");
+    const entryA = await deliver(spec, "a", "alice", p);
+    await deliver(spec, "b", "alice", p);
+
+    // Finalize on A (allow-once) — B stays pending, unrecorded on B's key.
+    await finalize(spec, "a", entryA, "allow-once", "resolved");
+    expect(listResolvedApprovalsForPeer("a", "alice")).toEqual([
+      { id: "exec-shared", decision: "allow-once" },
+    ]);
+    // B has no resolved record; it is still PENDING.
+    expect(listResolvedApprovalsForPeer("b", "alice")).toEqual([]);
+    expect(listPendingApprovalsForPeer("b", "alice")).toEqual([p]);
+  });
+
+  it("listResolvedApprovalsForPeer filters by account AND sessionKey; unknown peer ⇒ []", () => {
+    const now = Date.now();
+    __resolvedApprovalsTestHook.record("a", "id-a-alice", "allow-once", "alice", now);
+    __resolvedApprovalsTestHook.record("a", "id-a-bob", "deny", "bob", now);
+    __resolvedApprovalsTestHook.record("b", "id-b-alice", "allow-always", "alice", now);
+
+    expect(listResolvedApprovalsForPeer("a", "alice")).toEqual([
+      { id: "id-a-alice", decision: "allow-once" },
+    ]);
+    expect(listResolvedApprovalsForPeer("a", "bob")).toEqual([
+      { id: "id-a-bob", decision: "deny" },
+    ]);
+    expect(listResolvedApprovalsForPeer("b", "alice")).toEqual([
+      { id: "id-b-alice", decision: "allow-always" },
+    ]);
+    expect(listResolvedApprovalsForPeer("b", "bob")).toEqual([]);
+    expect(listResolvedApprovalsForPeer("a", "nobody")).toEqual([]);
+  });
+
+  it("lazy-prunes entries older than the max age, keeps fresh ones", () => {
+    const now = Date.now();
+    __resolvedApprovalsTestHook.record(
+      "a",
+      "stale",
+      "deny",
+      "alice",
+      now - RESOLVED_APPROVAL_MAX_AGE_MS - 1_000,
+    );
+    __resolvedApprovalsTestHook.record("a", "fresh", "allow-once", "alice", now);
+
+    expect(listResolvedApprovalsForPeer("a", "alice")).toEqual([
+      { id: "fresh", decision: "allow-once" },
+    ]);
+    // Prune is destructive: the stale entry is gone from the store.
+    expect(__resolvedApprovalsTestHook.size()).toBe(1);
+  });
+
+  it("caps the store, evicting the oldest and retaining the newest", () => {
+    const now = Date.now();
+    for (let i = 0; i < RESOLVED_APPROVAL_CAP + 1; i++) {
+      __resolvedApprovalsTestHook.record("a", `id-${i}`, "deny", "alice", now);
+    }
+    expect(__resolvedApprovalsTestHook.size()).toBe(RESOLVED_APPROVAL_CAP);
+    const ids = new Set(listResolvedApprovalsForPeer("a", "alice").map((r) => r.id));
+    expect(ids.has("id-0")).toBe(false);
+    expect(ids.has(`id-${RESOLVED_APPROVAL_CAP}`)).toBe(true);
   });
 });

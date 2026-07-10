@@ -27,6 +27,7 @@ import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
+  listResolvedApprovalsForPeer,
   ApprovalBindingMissingError,
 } from "./src/approvals.js";
 import { resolveVerifier, verifyJwtAndExtractIdentity, preflightResolveJwks, type ConnectionVerifier } from "./src/auth.js";
@@ -645,18 +646,24 @@ export default defineChannelPluginEntry({
             unregisterPeer: (pid) => channel.unregisterPeer(pid),
             sendHistorySnapshot: (pid) =>
               sendHistorySnapshot(accountId, channel, historyConfig, pid),
-            // #15: authoritative pending-approval snapshot. The store read and
-            // the publish MUST be synchronous — one event-loop turn, NO
-            // await/.then() between them (do NOT imitate sendHistorySnapshot's
-            // detached-read shape above). The §3.4 race analysis holds precisely
-            // BECAUSE finalize deletes the store entry before publishing
-            // `approval_resolved` and this is list→publish atomically, so a
-            // snapshot can never list an approval whose resolve frame preceded
-            // it. Sent even when empty (retires stale cards). NatsChannel reaches
-            // this via `as unknown as` casts, so typecheck won't force the method
-            // to exist — the direct wiring + channel test cover it.
+            // #15/#19: authoritative pending-approval snapshot PLUS recently-
+            // resolved outcomes. BOTH store reads and the publish MUST be
+            // synchronous — one event-loop turn, NO await/.then() between them (do
+            // NOT imitate sendHistorySnapshot's detached-read shape above). The
+            // §3.4 race analysis holds precisely BECAUSE finalize deletes the
+            // pending entry AND records the resolved outcome before publishing
+            // `approval_resolved`, and this is list→list→publish atomically — so a
+            // snapshot can never list an approval whose resolve frame preceded it,
+            // nor omit an approval from BOTH lists while the client awaits it.
+            // Sent even when empty (retires stale cards). NatsChannel reaches this
+            // via `as unknown as` casts, so typecheck won't force the method to
+            // exist — the direct wiring + channel test cover it.
             sendApprovalSnapshot: (pid) =>
-              channel.sendApprovalSnapshot(pid, listPendingApprovalsForPeer(accountId, pid)),
+              channel.sendApprovalSnapshot(
+                pid,
+                listPendingApprovalsForPeer(accountId, pid),
+                listResolvedApprovalsForPeer(accountId, pid),
+              ),
             logger: api.logger,
           }).catch((err) => {
             api.logger?.error?.(

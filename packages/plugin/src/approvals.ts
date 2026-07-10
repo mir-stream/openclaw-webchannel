@@ -297,6 +297,136 @@ export const __pendingApprovalsTestHook = {
   size: () => pendingApprovals.size,
 };
 
+// ── recently-resolved store (#19 resolved outcomes in the snapshot) ───────────
+
+/**
+ * RECENTLY-RESOLVED store — the OUTCOMES half of the register-time
+ * `approval_snapshot` (issue #19, follow-up to #15).
+ *
+ * The #15 snapshot's ABSENCE of an approval only told a reconnecting client
+ * "resolved somehow" — it rendered a neutral "resolved (elsewhere)" without the
+ * actual verdict. This ring remembers each approval's DECISION for a bounded
+ * window so the snapshot can also carry recently-resolved outcomes; the client's
+ * Leg B then shows the real allow/deny instead of the `"unknown"` sentinel.
+ *
+ * Same composite `(normalized accountId, approvalId)` key as `pendingApprovals`
+ * (reusing `pendingApprovalKey`), so per-account resolutions of one id stay
+ * independent — account A's finalize records under A's key, never masking B's.
+ *
+ * The record is written at finalize (`updateEntry`) at the SAME synchronous
+ * point the pending entry is erased and BEFORE `approval_resolved` publishes, so
+ * the snapshot invariant extends: within the ring's cap/TTL, a snapshot can never
+ * both omit an approval from `pending` AND miss it in `resolved` while the client
+ * legitimately awaits its outcome.
+ *
+ * We record whatever `payload.decision` carries — always a real `ApprovalDecision`
+ * (allow-once/allow-always/deny). Expiry is indistinguishable from a plain deny
+ * at `updateEntry` (both arrive as `{decision:"deny"}` — expiry is modeled as
+ * "deny" by `buildExpiredResult`), and that "deny" is exactly what the live
+ * `approval_resolved` frame already carries and the widget already renders for an
+ * expiry, so recording it as-is is consistent and needs NO `"expired"` wire
+ * value. An outcome that ages out of the ring (TTL/cap) simply falls back to
+ * "unknown" on the client — acceptable, matching the old #15 behaviour.
+ *
+ * Bounded and TTL-pruned exactly like the pending store, but eviction/prune here
+ * is ROUTINE — a resolved outcome aging out is expected, not a leak — so unlike
+ * the pending store it warns on NOTHING.
+ *
+ * The cap is GLOBAL across every account and peer of one plugin process (a single
+ * flat map, not per-account), so on a busy multi-account gateway a noisy tenant's
+ * churn can evict a quiet tenant's verdicts sooner than the TTL would. That
+ * degrades gracefully: an evicted outcome just falls back to the client's
+ * "unknown" sentinel — the card is still correctly non-actionable, only its exact
+ * verdict is lost.
+ */
+export const RESOLVED_APPROVAL_MAX_AGE_MS = 60 * 60 * 1000; // 60 min
+export const RESOLVED_APPROVAL_CAP = 512; // matches PENDING_APPROVAL_CAP
+
+type ResolvedApprovalEntry = {
+  /** The approval id (bare, un-prefixed — the composite key holds the account). */
+  id: string;
+  /** The recorded verdict (expiry records as "deny"; see the store docstring). */
+  decision: ApprovalDecision;
+  /** The peer (sessionKey) the approval was delivered to. */
+  sessionKey: string;
+  /** Normalized account the approval was resolved on (matches the composite key). */
+  accountKey: string;
+  /** `Date.now()` at finalize — the TTL prune uses it. */
+  resolvedAtMs: number;
+};
+
+const resolvedApprovals = new Map<string, ResolvedApprovalEntry>();
+
+/** Record (or refresh) a resolved outcome; bounded, evicts oldest at the cap. */
+function recordResolvedApproval(
+  accountId: string | null | undefined,
+  approvalId: string,
+  decision: ApprovalDecision,
+  sessionKey: string,
+  resolvedAtMs: number,
+): void {
+  const key = pendingApprovalKey(accountId, approvalId);
+  // Insertion-ordered Map: delete-then-set moves a re-record to the newest slot
+  // (and never evicts itself). Eviction here is ROUTINE, so no warn (contrast the
+  // pending store, where evicting a still-pending approval is worth noticing).
+  resolvedApprovals.delete(key);
+  while (resolvedApprovals.size >= RESOLVED_APPROVAL_CAP) {
+    const oldest = resolvedApprovals.keys().next().value;
+    if (oldest === undefined) break;
+    resolvedApprovals.delete(oldest);
+  }
+  resolvedApprovals.set(key, {
+    id: approvalId,
+    decision,
+    sessionKey,
+    accountKey: bindingAccountKey(accountId),
+    resolvedAtMs,
+  });
+}
+
+/**
+ * List the recently-RESOLVED outcomes for a specific (account, peer) — the
+ * `resolved` set the register-time `approval_snapshot` carries alongside the
+ * still-pending set. Same (account, sessionKey) filtering discipline as
+ * `listPendingApprovalsForPeer`. Lazy-prunes entries older than
+ * `RESOLVED_APPROVAL_MAX_AGE_MS` as it iterates (routine, no warn).
+ */
+export function listResolvedApprovalsForPeer(
+  accountId: string | null | undefined,
+  sessionKey: string,
+): Array<{ id: string; decision: ApprovalDecision }> {
+  const accountKey = bindingAccountKey(accountId);
+  const now = Date.now();
+  const result: Array<{ id: string; decision: ApprovalDecision }> = [];
+  for (const [key, entry] of resolvedApprovals) {
+    if (now - entry.resolvedAtMs > RESOLVED_APPROVAL_MAX_AGE_MS) {
+      resolvedApprovals.delete(key);
+      continue;
+    }
+    if (entry.accountKey === accountKey && entry.sessionKey === sessionKey) {
+      result.push({ id: entry.id, decision: entry.decision });
+    }
+  }
+  return result;
+}
+
+/**
+ * @internal Test seam for the recently-resolved store (mirrors
+ * `__pendingApprovalsTestHook`). Production code populates it only via
+ * `updateEntry`; register-path tests seed/clear it here.
+ */
+export const __resolvedApprovalsTestHook = {
+  record: (
+    accountId: string | null | undefined,
+    approvalId: string,
+    decision: ApprovalDecision,
+    sessionKey: string,
+    resolvedAtMs?: number,
+  ) => recordResolvedApproval(accountId, approvalId, decision, sessionKey, resolvedAtMs ?? Date.now()),
+  clear: () => resolvedApprovals.clear(),
+  size: () => resolvedApprovals.size,
+};
+
 /**
  * Native HITL approval capability for WebChannel.
  *
@@ -695,6 +825,19 @@ export function createClawApprovalNativeRuntimeSpec(
         // Account-scoped by the SAME normalized key used at delivery, so account
         // A's finalize never erases account B's still-pending entry for the id.
         deletePendingApproval(accountId ?? entry.accountId, entry.approvalId);
+        // #19: record the RESOLVED outcome adjacent to (and synchronously with)
+        // the pending erase and BEFORE `approval_resolved` publishes, so a
+        // snapshot can never omit an approval from BOTH pending and resolved
+        // while the client legitimately awaits its verdict. `payload.decision` is
+        // always a real ApprovalDecision; an expiry records as "deny" (see the
+        // resolved-store docstring), matching the live resolve frame below.
+        recordResolvedApproval(
+          accountId ?? entry.accountId,
+          entry.approvalId,
+          payload.decision,
+          entry.sessionKey,
+          Date.now(),
+        );
         const channel = transportFor(accountId ?? entry.accountId);
         if (!channel) {
           console.warn(

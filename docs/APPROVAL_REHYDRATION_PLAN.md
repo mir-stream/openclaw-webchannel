@@ -314,13 +314,41 @@ One frame, one code path, three legs closed.
 - The legacy dev-only WS path's register-time emission (no stateless register hop).
 - **Auto-admission (`admission:"auto"`) NATS accounts** — no register hop, so no
   snapshot; Legs A/B stay open there, mirroring the existing history-snapshot gap
-  on that path. Cheap follow-up if wanted: `setHandshakeCompleteHandler →
-  sendApprovalSnapshot` (the hook exists and fires once per new session key).
+  on that path. This is EXCLUDED BY DESIGN, not a pending follow-up — see §3.7,
+  which supersedes the earlier "cheap follow-up = `setHandshakeCompleteHandler →
+  sendApprovalSnapshot`" note.
 - **Failed-click feedback:** when `handleApprovalDecision` rejects (unknown/
   finalized/foreign id), the client is never told and the card stays actionable
   until the next register. Fixing it needs a reject frame on the decision path —
   file as a follow-up issue; the max-age prune bounds the zombie-card window this
   plan could otherwise create.
+
+### 3.7 Auto-admission accounts get NO approval rehydration — by design
+
+An `admission:"auto"` NATS account (the live gateway's wildcard/handshake mode)
+is deliberately EXCLUDED from approval snapshotting. This supersedes §3.6's
+earlier "cheap follow-up" note (`setHandshakeCompleteHandler →
+sendApprovalSnapshot`): that hook exists and would technically work, but wiring
+it there is a SECURITY REGRESSION, not a nicety.
+
+In auto mode peer identity is UNAUTHENTICATED — there is no register hop, no JWT,
+no PoP. Any holder of the tenant NATS creds can complete an X25519 handshake as
+any `peerId` and take over its outbound `.out` session (documented at the
+handshake-registered-peers-only guard in `nats-channel.ts` ~line 745, where even
+the history snapshot is withheld from a wildcard peer for exactly this reason). A
+handshake-time approval snapshot would hand such a hijacker:
+
+- the **pending approval ids** for the impersonated peer (an information leak), and
+- **approve capability** — if the impersonated `peerId` is in
+  `execApprovals.approvers`, the snapshot's Leg A rehydrates actionable cards and
+  the hijacker can resolve a real pending exec, whereas today those ids only ever
+  travel in the mint-time live `approval_request` frame the hijacker already
+  missed.
+
+So the snapshot is REGISTER-HOP-ONLY, the same fail-closed precedent as
+history-snapshot-for-registered-peers-only. Auto-admission accounts keep Legs
+A/B/C open; closing them there requires the authenticated-peer semantics the auto
+path by definition lacks.
 
 ## 4. Test plan
 

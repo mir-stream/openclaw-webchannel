@@ -92,13 +92,15 @@ export type RegisterHandlerDeps = {
    */
   sendHistorySnapshot: (peerId: string) => void;
   /**
-   * Fire the authoritative pending-approval snapshot for a just-registered peer
-   * (#15). Injected because it reads the plugin's pending-approval store and
-   * publishes on the account's channel; kept out of this pure handler. Called on
-   * EVERY successful register (an empty pending set is a meaningful signal — it
-   * retires cards a client kept actionable after a missed `approval_resolved`).
-   * The read and the publish MUST be synchronous in one event-loop turn (see the
-   * wiring in index-nats.ts and APPROVAL_REHYDRATION_PLAN §3.2/§3.4).
+   * Fire the authoritative approval snapshot for a just-registered peer (#15/#19).
+   * Injected because it reads the plugin's pending + recently-resolved approval
+   * stores and publishes on the account's channel; kept out of this pure handler.
+   * Called on EVERY successful register (an empty pending set is a meaningful
+   * signal — it retires cards a client kept actionable after a missed
+   * `approval_resolved`; the resolved set (#19) lets the client show the actual
+   * decision rather than a neutral "resolved elsewhere"). The reads and the
+   * publish MUST be synchronous in one event-loop turn (see the wiring in
+   * index-nats.ts and APPROVAL_REHYDRATION_PLAN §3.2/§3.4).
    */
   sendApprovalSnapshot: (peerId: string) => void;
   logger?: { error?: (msg: string) => void };

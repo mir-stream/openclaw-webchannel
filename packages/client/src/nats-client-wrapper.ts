@@ -395,8 +395,10 @@ export class WebChannelNATSClient {
         //   A (reload lost the card) — a snapshot id with no local entry is
         //     rehydrated as pending;
         //   B (missed approval_resolved) — a local unresolved card ABSENT from
-        //     the snapshot was decided/expired elsewhere → mark it non-actionable
-        //     ("unknown", server-confirmed);
+        //     the snapshot was decided/expired elsewhere → mark it non-actionable.
+        //     If the snapshot's `resolved` set (#19) carries the actual outcome,
+        //     show that decision; otherwise (aged out of the server's resolved
+        //     ring) fall back to the "unknown" sentinel. Either way confirmed.
         //   C (lost decision frame) — a locally-decided but NOT server-confirmed
         //     card the snapshot STILL lists as pending → the decision frame was
         //     lost; re-send it and keep the card resolved (every future register
@@ -415,6 +417,15 @@ export class WebChannelNATSClient {
             expiresAtMs: p.expiresAtMs,
           });
         }
+        // #19: the recently-RESOLVED outcomes riding alongside the pending set.
+        // A resolved-list id with no local card is NOT rehydrated (it is done —
+        // nothing actionable); the map only upgrades Leg B / the optimistic branch.
+        const resolvedIncoming = Array.isArray(msg.resolved) ? msg.resolved : [];
+        const resolvedById = new Map<string, ApprovalDecision>();
+        for (const r of resolvedIncoming) {
+          if (!r || typeof r.id !== "string" || r.id.length === 0) continue;
+          resolvedById.set(r.id, r.decision as ApprovalDecision);
+        }
 
         const existing = this.state.approvals;
         const seen = new Set<string>();
@@ -428,7 +439,13 @@ export class WebChannelNATSClient {
 
         for (const a of existing) {
           seen.add(a.id);
-          const snap = snapshotById.get(a.id);
+          // Defense in depth: an id in BOTH the pending `approvals` and the
+          // `resolved` lists is impossible server-side (finalize deletes the
+          // pending entry and records the resolved outcome in ONE synchronous
+          // step before publishing), but if it ever happens the TERMINAL outcome
+          // must win — never keep/make the card actionable. So a resolved-listed
+          // id is routed to the resolved-upgrade branches below, ignoring `snap`.
+          const snap = resolvedById.has(a.id) ? undefined : snapshotById.get(a.id);
           if (snap) {
             if (a.resolvedDecision === undefined) {
               // Present + unresolved: already actionable with the full payload
@@ -447,13 +464,26 @@ export class WebChannelNATSClient {
             }
           } else if (a.resolvedDecision === undefined) {
             // Leg B: decided/expired while we weren't looking — no longer
-            // actionable, outcome unknown, server-confirmed (authoritative).
-            next.push({ ...a, resolvedDecision: "unknown", resolutionConfirmed: true });
+            // actionable, server-confirmed (authoritative). #19: show the ACTUAL
+            // outcome if the snapshot carried it, else the "unknown" sentinel.
+            const outcome = resolvedById.get(a.id);
+            next.push({
+              ...a,
+              resolvedDecision: outcome ?? "unknown",
+              resolutionConfirmed: true,
+            });
             changed = true;
           } else if (!a.resolutionConfirmed) {
             // Optimistic decision the server no longer has pending — our decision
-            // (or another device's) won. Confirm it.
-            next.push({ ...a, resolutionConfirmed: true });
+            // (or another device's) won. #19: if the snapshot's resolved outcome
+            // DIFFERS from our optimistic guess, the SERVER decision wins;
+            // otherwise just confirm what we already showed.
+            const outcome = resolvedById.get(a.id);
+            next.push(
+              outcome !== undefined && outcome !== a.resolvedDecision
+                ? { ...a, resolvedDecision: outcome, resolutionConfirmed: true }
+                : { ...a, resolutionConfirmed: true },
+            );
             changed = true;
           } else {
             next.push(a);
@@ -463,6 +493,9 @@ export class WebChannelNATSClient {
         // Leg A: snapshot ids with no local entry → rehydrate as pending cards.
         for (const [id, snap] of snapshotById) {
           if (seen.has(id)) continue;
+          // Defense in depth (see the loop above): an id present in BOTH lists is
+          // terminal, so do NOT rehydrate an actionable card for it.
+          if (resolvedById.has(id)) continue;
           next.push(snap);
           changed = true;
           rehydratedActionable = true;
