@@ -679,6 +679,7 @@ describe("DeviceFlowEnrollment", () => {
         natsCreds: {
           userJwt: "MOCK_JWT",
           userSeed: "MOCK_SEED",
+          userPubkey: "MOCK_PUBKEY",
         },
       });
 

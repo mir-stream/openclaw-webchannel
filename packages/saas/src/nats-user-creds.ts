@@ -91,6 +91,13 @@ export type MintNatsUserCredsOptions = {
 export type MintedNatsUserCreds = {
   /** NATS user JWT (compact), signed by the account NKEY. */
   userJwt: string;
+  /**
+   * Minted user public NKEY (`U…`), identical to `userJwt.sub`. This is the
+   * NATS-revocation key: it is the key under which an account JWT's
+   * `revocations` map refuses this credential (see addRevocation). Surfaced so
+   * consumers never have to hand-decode the JWT payload to find it.
+   */
+  userPubkey: string;
   /** NATS user NKEY seed ("SU…") — base32, for `@nats-io/nkeys` `fromSeed`. */
   userSeed: string;
   /**
@@ -121,6 +128,9 @@ export async function mintNatsUserCreds(
   const signingKp = fromSeed(new TextEncoder().encode(opts.accountSeed));
   const userKp = createUser();
   const userSeed = new TextDecoder().decode(userKp.getSeed());
+  // Minted user public NKEY (`U…`), identical to the JWT `sub`. The
+  // NATS-revocation key — surfaced so consumers don't hand-decode the JWT.
+  const userPubkey = userKp.getPublicKey();
   // Browser-friendly raw seed (base64url of the 32-byte Ed25519 seed). Never log.
   // `getRawSeed()` is the KeyPair's public accessor for the exact 32-byte
   // Ed25519 seed (identical to bytes [2,34) of the decoded base32 NKEY seed).
@@ -189,7 +199,7 @@ export async function mintNatsUserCreds(
         exp ? { exp } : undefined,
       );
 
-  return { userJwt, userSeed, userSeedRaw, permissions: { pub, sub } };
+  return { userJwt, userPubkey, userSeed, userSeedRaw, permissions: { pub, sub } };
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +217,12 @@ export async function mintNatsUserCreds(
 export type BrowserCredentials = {
   /** NATS user JWT (compact), signed by the account NKEY. */
   userJwt: string;
+  /**
+   * Minted user public NKEY (`U…`) = `userJwt.sub`, the NATS-revocation key.
+   * Included for symmetry with the minting path so a consumer can pin/revoke
+   * this exact browser credential (see addRevocation) without decoding the JWT.
+   */
+  userPubkey: string;
   /** base64url of the raw 32-byte Ed25519 user-NKEY seed — `WebChannelNATSClient` requires it. */
   userSeedRaw: string;
   /** The pub/sub allow-lists embedded in the JWT. */
@@ -277,6 +293,7 @@ export async function issueBrowserCredentials(
   });
   return {
     userJwt: minted.userJwt,
+    userPubkey: minted.userPubkey,
     userSeedRaw: minted.userSeedRaw,
     permissions: minted.permissions,
   };

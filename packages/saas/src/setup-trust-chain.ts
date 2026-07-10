@@ -80,6 +80,19 @@ export type SetupTrustChainOptions = {
    * written to any output file.
    */
   externalNatsAccount?: ExternalNatsAccount;
+
+  /**
+   * Return the operator NKEY seed (`SO…`) in `private.operatorSeed`. Default
+   * false. The operator seed is the TRUST ROOT — strictly higher value than the
+   * account seed — needed ONLY to re-sign the account JWT for per-credential
+   * revocation (see addRevocation). Opt in only if you build revocation; a caller
+   * that never revokes should not hold the root. Ignored in external mode (a
+   * managed account has no operator). PERSISTENCE CAVEAT: with
+   * loadOrCreateTrustChain this only takes effect on the FIRST creation of the
+   * persisted chain — an already-persisted chain is returned verbatim and must be
+   * regenerated to gain the operator seed.
+   */
+  returnOperatorSeed?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -434,6 +447,7 @@ export async function setupTrustChain(
     rsaKeySize = 2048,
     kid: providedKid,
     externalNatsAccount,
+    returnOperatorSeed = false,
   } = options;
 
   // -----------------------------------------------------------------------
@@ -518,6 +532,7 @@ export async function setupTrustChain(
   const privateKey: SaasTrustChainPrivate = {
     rsaPrivateKeyPem: privateKeyPem,
     natsAccountSeed,
+    ...(returnOperatorSeed ? { operatorSeed } : {}),
   };
 
   const natsConfig: NatsAccountConfig = {
