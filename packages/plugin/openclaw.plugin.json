@@ -284,7 +284,7 @@
         },
         "streaming.mode": {
           "label": "Streaming mode",
-          "help": "Progress draft mode: \"off\" | \"partial\" | \"block\" | \"progress\". Use \"progress\" for a single updating Working… draft that becomes the answer."
+          "help": "Progress draft mode: \"off\" | \"partial\" | \"block\" | \"progress\". Use \"partial\" to stream the answer text into a single updating Working… draft that becomes the answer (also carries tool progress lines); \"progress\" streams tool progress lines only — the answer arrives atomically."
         },
         "execApprovals.enabled": {
           "label": "Native exec approvals",
