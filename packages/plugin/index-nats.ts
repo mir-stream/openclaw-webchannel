@@ -50,7 +50,11 @@ import {
 } from "./src/nats-credential-source.js";
 import { consumeCredentialSource } from "./src/consume-credentials.js";
 import { planAccounts } from "./src/multiplex.js";
-import { loadPersistedEnrolledCreds } from "./src/account-config.js";
+import {
+  loadPersistedEnrolledCreds,
+  resolveTypingEnabled,
+  resolveWebchannelAccountConfig,
+} from "./src/account-config.js";
 import type { KeyPair } from "./src/e2e-crypto.js";
 import { devOpenAgentIdentityKeyPair } from "./src/dev-identity.js";
 
@@ -543,6 +547,16 @@ export default defineChannelPluginEntry({
       });
       console.log(
         `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, accountId=${accountId})`,
+      );
+
+      // P0-6: honor `capabilities.typing: "off"` on NATS (previously the gate
+      // existed only on the legacy WS transport, so the off-toggle was silently
+      // ignored here). Read this account's RESOLVED config (channel-level base
+      // merged under the account override), not the flat channel-level section
+      // the legacy WS path reads — each account's capability applies to its own
+      // channel (가-1 Cycle 2).
+      channel.setTypingEnabled(
+        resolveTypingEnabled(resolveWebchannelAccountConfig(api.config, accountId)),
       );
 
       // ---- Step 3 (per account): inbound dispatcher (accountId-threaded) ----

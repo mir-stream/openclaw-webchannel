@@ -221,6 +221,17 @@ export class NatsChannel {
   private readonly maxSeenMessageIdsPerPeer: number;
   private readonly seenMessageIds = new Map<string, Map<string, number>>();
 
+  /**
+   * P0-6: whether `sendTyping(...)` may emit a `typing` frame. Defaults enabled
+   * so the "Bot is typing…" affordance works out of the box; an operator
+   * disables it per-account via `capabilities.typing = "off"`. Toggled once at
+   * channel start (index-nats) from the account's RESOLVED config — unlike the
+   * legacy WS gate (`transport.ts`), which reads the channel-level flat section,
+   * because each `NatsChannel` IS a single account's channel (가-1 Cycle 2).
+   * Previously ungated on NATS, so `typing: "off"` was silently ignored.
+   */
+  private typingEnabled = true;
+
   // ---- Encrypt-by-construction state (only populated in crypto mode) --------
 
   /** When true, the channel is E2E-encrypted and fail-closed (no plaintext). */
@@ -466,9 +477,20 @@ export class NatsChannel {
   }
 
   /**
+   * P0-6: toggle the typing-indicator wire frame for this account's channel.
+   * Called once at channel start (index-nats) with the account's resolved
+   * `capabilities.typing` (default "on"). When disabled, `sendTyping` is a
+   * no-op returning `false`, so callers need not gate at the call site.
+   */
+  setTypingEnabled(enabled: boolean): void {
+    this.typingEnabled = enabled;
+  }
+
+  /**
    * Send typing indicator to peer.
    */
   sendTyping(peerId: string): boolean {
+    if (!this.typingEnabled) return false;
     const payload: OutboundWsMessage = { type: "typing" };
     return this.sendToPeer(peerId, payload);
   }

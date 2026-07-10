@@ -282,7 +282,8 @@ boot_agent() {
             "audience": "$acct"
           } },
           "dmSecurity": "allowlist",
-          "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"]
+          "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"],
+          "streaming": { "mode": "partial" }
         }
       }
     }
