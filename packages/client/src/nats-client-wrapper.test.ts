@@ -365,6 +365,158 @@ describe("WebChannelNATSClient — W6 agent-bubble id adoption", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #16 ordered snapshot insertion — a mid-session snapshot's NEWER tail must
+// append after the matched local prefix (chronological), while pagination and
+// initial hydration keep their previous prepend/ordering behavior.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — #16 ordered history insertion", () => {
+  type AnyFrame = { type: string; [k: string]: unknown };
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+  function deliver(wrapper: WebChannelNATSClient, frame: AnyFrame): void {
+    (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(frame);
+  }
+
+  it("regression: a snapshot's newer tail is APPENDED after the matched local prefix, not prepended", () => {
+    const w = makeWrapper();
+    // Local live state: a turn rendered on THIS device (user echo + agent bubble).
+    w.send("hi"); // u-0
+    deliver(w, { type: "agent_message", id: "webchannel-live-1", text: "hello back" });
+    expect(w.getState().messages.map((m) => m.text)).toEqual(["hi", "hello back"]);
+
+    // Another device registered → snapshot carries the matched prefix PLUS a
+    // newer turn (sent from that other device, or while this tab was away).
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "core-u1", role: "user", text: "hi", ts: 1 },
+        { id: "core-a1", role: "agent", text: "hello back", ts: 2 },
+        { id: "core-u2", role: "user", text: "second question", ts: 3 },
+        { id: "core-a2", role: "agent", text: "second answer", ts: 4 },
+      ],
+    });
+
+    const messages = w.getState().messages;
+    // The two NEW messages land at the BOTTOM, chronologically after the prefix.
+    expect(messages.map((m) => m.id)).toEqual([
+      "core-u1",
+      "core-a1",
+      "core-u2",
+      "core-a2",
+    ]);
+    expect(messages.map((m) => m.text)).toEqual([
+      "hi",
+      "hello back",
+      "second question",
+      "second answer",
+    ]);
+  });
+
+  it("regression via TIER-3: live agent text differs from stored text — positional adoption, then newer tail appends", () => {
+    const w = makeWrapper();
+    // Realistic openclaw turn: user echo + a live agent bubble whose text is the
+    // reformatted (metadata-stripped) live reply, NOT byte-equal to the stored
+    // transcript text → tier-2 exact-text matching MISSES the agent bubble.
+    w.send("hi"); // u-0
+    deliver(w, { type: "agent_message", id: "webchannel-live-1", text: "hello back (live-stripped)" });
+    expect(w.getState().messages.map((m) => m.text)).toEqual([
+      "hi",
+      "hello back (live-stripped)",
+    ]);
+
+    // Snapshot: core-u1 tier-2 matches u-0 (sets the anchor), core-a1 then
+    // adopts onto the live agent bubble POSITIONALLY (tier 3), and the newer
+    // turn must APPEND after it — not prepend.
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "core-u1", role: "user", text: "hi", ts: 1 },
+        { id: "core-a1", role: "agent", text: "hello back RAW stored", ts: 2 },
+        { id: "core-u2", role: "user", text: "newer q", ts: 3 },
+        { id: "core-a2", role: "agent", text: "newer a", ts: 4 },
+      ],
+    });
+
+    const messages = w.getState().messages;
+    expect(messages.map((m) => m.id)).toEqual([
+      "core-u1",
+      "core-a1",
+      "core-u2",
+      "core-a2",
+    ]);
+    // The adopted agent bubble converged to the canonical stored text.
+    expect(messages[1].text).toBe("hello back RAW stored");
+  });
+
+  it("pagination: strictly-older messages with zero overlap prepend at the top, page order preserved", () => {
+    const w = makeWrapper();
+    // Local state holds canonical-id messages (already hydrated).
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "c-10", role: "user", text: "newest question", ts: 10 },
+        { id: "c-11", role: "agent", text: "newest answer", ts: 11 },
+      ],
+    });
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["c-10", "c-11"]);
+
+    // A loadHistory page of strictly-OLDER messages (no id/text overlap).
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "c-1", role: "user", text: "old question", ts: 1 },
+        { id: "c-2", role: "agent", text: "old answer", ts: 2 },
+      ],
+    });
+    // Older page prepends, in page order, ahead of the existing tail.
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["c-1", "c-2", "c-10", "c-11"]);
+  });
+
+  it("initial hydration: snapshot order preserved into empty state", () => {
+    const w = makeWrapper();
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "h-1", role: "user", text: "one", ts: 1 },
+        { id: "h-2", role: "agent", text: "two", ts: 2 },
+        { id: "h-3", role: "user", text: "three", ts: 3 },
+      ],
+    });
+    expect(w.getState().messages.map((m) => m.id)).toEqual(["h-1", "h-2", "h-3"]);
+  });
+
+  it("gap insertion: a fresh message between two matched local messages lands BETWEEN them", () => {
+    const w = makeWrapper();
+    // Two live user echoes on this device (no agent turns between them locally).
+    w.send("first"); // u-0
+    w.send("third"); // u-1
+    expect(w.getState().messages.map((m) => m.text)).toEqual(["first", "third"]);
+
+    // Snapshot: matches local idx 0, a FRESH unseen message, then matches idx 1.
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "s-first", role: "user", text: "first", ts: 1 },
+        { id: "s-mid", role: "agent", text: "second (server-only)", ts: 2 },
+        { id: "s-third", role: "user", text: "third", ts: 3 },
+      ],
+    });
+
+    const messages = w.getState().messages;
+    // The fresh message is spliced BETWEEN the two adopted local echoes.
+    expect(messages.map((m) => m.text)).toEqual(["first", "second (server-only)", "third"]);
+    expect(messages.map((m) => m.id)).toEqual(["s-first", "s-mid", "s-third"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #15 approval rehydration — the wrapper reconciles its approval state against
 // the authoritative `approval_snapshot` frame (Legs A/B/C).
 // ---------------------------------------------------------------------------
