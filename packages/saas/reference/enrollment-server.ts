@@ -39,7 +39,7 @@ import { setupTrustChain } from "../src/setup-trust-chain.js";
 import { loadOrCreateTrustChain } from "../src/persistent-trust-chain.js";
 import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
 import { DemoUserDirectory, seedDemoUsers, type DemoUser } from "../src/demo-users.js";
-import { mintNatsUserCreds, type NatsUserRole } from "../src/nats-user-creds.js";
+import { mintNatsUserCreds, issueBrowserCredentials, type NatsUserRole } from "../src/nats-user-creds.js";
 import { assertValidSubjectToken } from "../src/subject-token.js";
 import type { EnrollmentRequest, PollRequest } from "../src/device-flow-types.js";
 import { createServer } from "node:http";
@@ -671,9 +671,17 @@ const server = createServer(async (req, res) => {
     }
 
     // ---------------------------------------------------------------------
-    // POST /nats-user - Session-gated NATS user creds (ENABLE_DEMO_UI). The
-    // login-gated replacement for /test/nats-user: mirrors its minting but
-    // requires a valid session (no unauthenticated cross-tenant oracle).
+    // POST /nats-user - Session-gated BROWSER NATS creds (ENABLE_DEMO_UI). The
+    // login-gated replacement for /test/nats-user: requires a valid session (no
+    // unauthenticated cross-tenant oracle).
+    //
+    // SECURITY: this is a BROWSER-facing route, so it ALWAYS mints role:"browser"
+    // (per-peer scoped, pinned to `webchannel.{tenant}.*.{peerId}.>`). It routes
+    // through issueBrowserCredentials, which HARDCODES the browser role — a client
+    // cannot escalate to tenant-wide "agent"/"observer" creds via a body `role`.
+    // Operator-only observer/agent creds must be minted behind an operator-auth
+    // check — the SAME operator gate that /approve + /deny require in production —
+    // NEVER from this browser route.
     // ---------------------------------------------------------------------
     if (ENABLE_DEMO_UI && req.method === "POST" && path === "/nats-user") {
       const user = sessionUser(req);
@@ -686,24 +694,38 @@ const server = createServer(async (req, res) => {
           sendJson(res, { error: "Invalid JSON body" }, 400);
           return;
         }
-        const { tenant, role } = body as { tenant?: string; role?: NatsUserRole };
+        const { tenant } = body as { tenant?: string };
         if (!tenant) {
           sendJson(res, { error: "Missing tenant" }, 400);
           return;
         }
+        // Subject-injection guard (mirror /api/enroll): reject a tenant that would
+        // break the `webchannel.{tenant}.>` hierarchy — 400, not 500.
+        try {
+          assertValidSubjectToken(tenant, "tenant");
+        } catch (err) {
+          sendJson(res, { error: (err as Error).message }, 400);
+          return;
+        }
+        // Authorize the tenant the way /bootstrap authorizes accountId (via
+        // canAccess): this single-tenant reference serves ONLY its own tenant, so a
+        // session may not mint creds for an arbitrary one. (The removed cross-tenant
+        // /test/nats-user oracle is exactly what this closes.)
+        if (tenant !== DEMO_TENANT) {
+          console.warn(`[nats-user] ${user.username} DENIED tenant "${tenant}" (server tenant is "${DEMO_TENANT}")`);
+          sendJson(res, { error: `not authorized for tenant "${tenant}"` }, 403);
+          return;
+        }
         // browser creds are pinned to THIS session's peerId (user.uuid — the
-        // authenticated subject, never client input); observer is sub-only.
-        const resolvedRole: NatsUserRole =
-          role === "agent" ? "agent" : role === "observer" ? "observer" : "browser";
-        mintNatsUserCreds({
+        // authenticated subject, never client input).
+        issueBrowserCredentials({
           accountSeed: mockTrustChain.natsAccountSeed,
           tenant,
-          role: resolvedRole,
-          ...(resolvedRole === "browser" ? { peerId: user.uuid } : {}),
+          peerId: user.uuid,
           issuerAccountId: natsIssuerAccountId,
         })
           .then((creds) => {
-            console.log(`[nats-user] minted ${resolvedRole} creds for ${user.username} tenant=${tenant}`);
+            console.log(`[nats-user] minted browser creds for ${user.username} tenant=${tenant}`);
             // The relay URL travels WITH the minted creds (SaaS = rendezvous authority).
             sendJson(res, { ...creds, natsUrl: NATS_URL });
           })

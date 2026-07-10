@@ -175,4 +175,59 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
     const denied = (await enrollments()).find((e) => e.userCode === code);
     expect(denied!.status).toBe("denied");
   });
+
+  // --- F6 role-escalation guard on the browser-facing /nats-user route -------
+  // alice is a seeded demo user (password "demo"); her uuid is the pinned peerId.
+  const ALICE_UUID = "11111111-1111-4111-8111-111111111111";
+  type Creds = { permissions?: { pub: string[]; sub: string[] }; userJwt?: string; error?: string };
+
+  async function loginCookie(username: string, password: string): Promise<string> {
+    const res = await fetch(`${BASE}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    expect(res.ok, `login failed: ${res.status}`).toBe(true);
+    const cookie = res.headers.get("set-cookie")?.split(";")[0];
+    expect(cookie, "login response missing sid cookie").toBeTruthy();
+    return cookie!;
+  }
+
+  async function natsUser(cookie: string, body: Record<string, unknown>): Promise<{ status: number; data: Creds }> {
+    const res = await fetch(`${BASE}/nats-user`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, data: (await res.json()) as Creds };
+  }
+
+  it("mints browser-scoped creds even when a session asks for role:agent (no escalation)", async () => {
+    const cookie = await loginCookie("alice", "demo");
+    const { status, data } = await natsUser(cookie, { tenant: TENANT, role: "agent" });
+    expect(status).toBe(200);
+    const perPeer = `webchannel.${TENANT}.*.${ALICE_UUID}.>`;
+    const tenantWide = `webchannel.${TENANT}.>`;
+    // Pinned to alice's own peer subtree — NOT the tenant-wide agent grant.
+    expect(data.permissions?.pub).toEqual([perPeer]);
+    expect(data.permissions?.sub).toEqual([perPeer]);
+    expect(data.permissions?.pub).not.toContain(tenantWide);
+    expect(data.permissions?.sub).not.toContain(tenantWide);
+  });
+
+  it("mints browser-scoped creds even when a session asks for role:observer (no escalation)", async () => {
+    const cookie = await loginCookie("alice", "demo");
+    const { status, data } = await natsUser(cookie, { tenant: TENANT, role: "observer" });
+    expect(status).toBe(200);
+    const perPeer = `webchannel.${TENANT}.*.${ALICE_UUID}.>`;
+    // observer would be sub-only tenant-wide; the browser route must ignore it.
+    expect(data.permissions?.pub).toEqual([perPeer]);
+    expect(data.permissions?.sub).toEqual([perPeer]);
+  });
+
+  it("rejects /nats-user for a tenant other than the server's own (403)", async () => {
+    const cookie = await loginCookie("alice", "demo");
+    const { status } = await natsUser(cookie, { tenant: "some-other-tenant" });
+    expect(status).toBe(403);
+  });
 });

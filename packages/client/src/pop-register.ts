@@ -110,6 +110,38 @@ export class PopRejectedError extends Error {
   }
 }
 
+/**
+ * Thrown on a non-401, non-503 error reply at register — a server-side failure
+ * (e.g. code 500) that is TERMINAL: restarting the same request with the same
+ * credentials cannot fix it. Distinct from `PopRejectedError` (bad proof/token)
+ * so the caller can classify without matching on message strings. Carries the
+ * reply `code` for diagnostics.
+ */
+export class PopServerError extends Error {
+  readonly code?: number;
+  constructor(code?: number) {
+    super(`pop-register: registration failed (code ${code ?? "?"})`);
+    this.name = "PopServerError";
+    this.code = code;
+  }
+}
+
+/**
+ * Classify a `registerWithPop` throw as TERMINAL (true) vs TRANSIENT (false).
+ *
+ * TERMINAL = a rejected proof/token (`PopRejectedError`) or a non-transient
+ * server failure (`PopServerError`): the SAME bootstrap credentials will never
+ * be accepted, so redialing cannot help — the caller must surface a hard error.
+ *
+ * TRANSIENT = everything else `registerWithPop` throws: a request timeout, a
+ * `503` (JWKS unreachable), or retry-exhaustion because the AGENT is offline
+ * while the relay is healthy. The credentials are fine; the peer was momentarily
+ * unreachable, so the caller should keep reconnecting/re-attempting.
+ */
+export function isTerminalRegisterError(err: unknown): boolean {
+  return err instanceof PopRejectedError || err instanceof PopServerError;
+}
+
 /** Successful register-hop result (parsed register reply). */
 export type RegisterWithPopResult = {
   peerId: string;
@@ -203,7 +235,7 @@ export async function registerWithPop(
         continue;
       }
       if (registerReply.code === 401) throw new PopRejectedError();
-      throw new Error(`pop-register: registration failed (code ${registerReply.code ?? "?"})`);
+      throw new PopServerError(registerReply.code);
     }
     return registerReply.wrappedConversationKey
       ? { peerId: opts.peerId, registered: true, wrappedConversationKey: registerReply.wrappedConversationKey }

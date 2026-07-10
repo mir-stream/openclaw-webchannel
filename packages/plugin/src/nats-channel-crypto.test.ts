@@ -111,7 +111,12 @@ type Harness = {
   doHandshake: () => void;
 };
 
-function makeHarness(opts: { admission?: "register" | "wildcard" } = {}): Harness {
+function makeHarness(
+  opts: {
+    admission?: "register" | "wildcard";
+    limits?: ConstructorParameters<typeof NatsChannel>[4];
+  } = {},
+): Harness {
   const broker = new FakeBroker();
 
   // Agent transport + crypto channel.
@@ -121,6 +126,7 @@ function makeHarness(opts: { admission?: "register" | "wildcard" } = {}): Harnes
     AGENT,
     TENANT,
     {},
+    opts.limits,
   );
   const inbound: InboundWsMessage[] = [];
   channel.setMessageHandler((_peer, msg) => {
@@ -446,5 +452,143 @@ describe("NatsChannel handshake (F1 crash guard)", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F4: anti-replay on inbound E2E frames
+// ---------------------------------------------------------------------------
+
+/** Reach into the private per-peer replay window for assertions. */
+function seenWindow(channel: NatsChannel, peerId: string): Map<string, number> | undefined {
+  return (
+    channel as unknown as { seenMessageIds: Map<string, Map<string, number>> }
+  ).seenMessageIds.get(peerId);
+}
+
+describe("NatsChannel (F4 anti-replay)", () => {
+  const routing = { accountId: AGENT, tenant: TENANT, sub: PEER };
+
+  it("drops a byte-identical replayed sealed frame on the second delivery", () => {
+    const h = makeHarness();
+    h.doHandshake();
+    const key = h.browserSessionKey()!;
+
+    // The relay captures ONE sealed frame and re-publishes the exact same bytes.
+    const frame = sealEnvelope(routing, key, { type: "user_message", text: "run the tool" });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      h.browser.publish(inSubj, frame);
+      h.browser.publish(inSubj, frame); // verbatim replay
+
+      // The turn ran EXACTLY once; the replay was dropped (not re-dispatched).
+      expect(h.inbound).toEqual([{ type: "user_message", text: "run the tool" }]);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("replayed messageId"),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("passes a fresh frame carrying a new messageId", () => {
+    const h = makeHarness();
+    h.doHandshake();
+    const key = h.browserSessionKey()!;
+
+    // Two independently-sealed frames → two distinct random messageIds.
+    h.browser.publish(inSubj, sealEnvelope(routing, key, { type: "user_message", text: "one" }));
+    h.browser.publish(inSubj, sealEnvelope(routing, key, { type: "user_message", text: "two" }));
+
+    expect(h.inbound).toEqual([
+      { type: "user_message", text: "one" },
+      { type: "user_message", text: "two" },
+    ]);
+  });
+
+  it("rejects a frame whose ts is outside the ±window (stale replay / clock skew)", () => {
+    vi.useFakeTimers();
+    try {
+      const t0 = 1_700_000_000_000;
+      vi.setSystemTime(t0);
+      const h = makeHarness();
+      h.doHandshake();
+      const key = h.browserSessionKey()!;
+
+      // Seal at t0, then let the agent's clock advance past the 10-min window
+      // before the (captured) frame is delivered.
+      const stale = sealEnvelope(routing, key, { type: "user_message", text: "too late" });
+      vi.setSystemTime(t0 + 11 * 60 * 1_000);
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        h.browser.publish(inSubj, stale);
+        expect(h.inbound).toEqual([]);
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining("ts outside"),
+        );
+        // A freshly-sealed frame (ts == now) still passes right after.
+        h.browser.publish(inSubj, sealEnvelope(routing, key, { type: "user_message", text: "fresh" }));
+        expect(h.inbound).toEqual([{ type: "user_message", text: "fresh" }]);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds the per-peer seen-messageId cache (cap + LRU-evict)", () => {
+    const h = makeHarness({ limits: { maxSeenMessageIdsPerPeer: 3 } });
+    h.doHandshake();
+    const key = h.browserSessionKey()!;
+
+    // Five distinct fresh frames, cap is 3 → the window never exceeds the cap.
+    for (let i = 0; i < 5; i++) {
+      h.browser.publish(inSubj, sealEnvelope(routing, key, { type: "user_message", text: `m${i}` }));
+    }
+    expect(h.inbound).toHaveLength(5); // all fresh → all dispatched
+    expect(seenWindow(h.channel, PEER)?.size).toBe(3); // memory is bounded
+  });
+
+  it("keeps replay windows strictly per-peer (one peer cannot evict another's)", () => {
+    const h = makeHarness({ admission: "wildcard", limits: { maxSeenMessageIdsPerPeer: 2 } });
+
+    // Peer A = the harness browser (PEER).
+    h.doHandshake();
+    const keyA = h.browserSessionKey()!;
+
+    // Peer B = a second hand-driven browser on the SAME wildcard channel.
+    const PEER_B = "user-99";
+    const inSubjB = `webchannel.${TENANT}.${AGENT}.${PEER_B}.in`;
+    const hsSubjB = `webchannel.${TENANT}.${AGENT}.${PEER_B}.handshake`;
+    const browserB = new FakeTransport(h.broker);
+    browserB.subscribe(hsSubjB);
+    const kpB = generateKeyPair();
+    let keyB: Uint8Array | null = null;
+    browserB.on("message", (m: { subject: string; payload: Buffer }) => {
+      if (m.subject === hsSubjB) {
+        const pub = parseKeyExchange(m.payload);
+        if (pub) keyB = deriveConversationKey(kpB.privateKey, pub);
+      }
+    });
+    browserB.publish(hsSubjB, keyExchangeFrame(kpB.publicKey));
+    expect(keyB).not.toBeNull();
+
+    // Peer B records exactly ONE message.
+    browserB.publish(inSubjB, sealEnvelope({ accountId: AGENT, tenant: TENANT, sub: PEER_B }, keyB!, {
+      type: "user_message",
+      text: "b-only",
+    }));
+    expect(seenWindow(h.channel, PEER_B)?.size).toBe(1);
+
+    // Peer A overflows its own cap (2) with 4 distinct frames.
+    for (let i = 0; i < 4; i++) {
+      h.browser.publish(inSubj, sealEnvelope(routing, keyA, { type: "user_message", text: `a${i}` }));
+    }
+
+    // A's churn evicted only A's entries; B's window is untouched.
+    expect(seenWindow(h.channel, PEER)?.size).toBe(2);
+    expect(seenWindow(h.channel, PEER_B)?.size).toBe(1);
   });
 });

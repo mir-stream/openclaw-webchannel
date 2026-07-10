@@ -180,8 +180,11 @@ async function tamper(): Promise<number> {
   // republishes a bit-flipped copy, modelling a tampering relay. That needs
   // tenant-wide read AND write, so it uses AGENT creds — browser creds are now
   // pinned to the caller's own peer subtree (per-peer scoping) and observer creds
-  // are sub-only, so neither can write to a victim peer's `.out`.
-  const res = await fetch(`${SAAS_URL}/nats-user`, {
+  // are sub-only, so neither can write to a victim peer's `.out`. Tenant-wide agent
+  // creds are OPERATOR-only: they come from the admin-gated /admin/nats-user route
+  // (the browser-facing /nats-user no longer honors a body `role`), so this scene
+  // authenticates as admin first (adminCookie above).
+  const res = await fetch(`${SAAS_URL}/admin/nats-user`, {
     method: "POST",
     headers: { "Content-Type": "application/json", cookie },
     body: JSON.stringify({ role: "agent" }),
