@@ -24,9 +24,16 @@ import { resolveEncryptionPolicy } from "./src/encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./src/encryption-policy.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
-import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
+import {
+  createSerializedInboundDispatcher,
+  coalesceUserMessages,
+} from "./src/inbound-queue.js";
 import { isControlLaneMessage } from "./src/control-lane.js";
 import { resolveCommandGate } from "./src/command-gate.js";
+import {
+  createInboundDebouncer,
+  resolveInboundDebounceMs,
+} from "openclaw/plugin-sdk/reply-runtime";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
@@ -567,17 +574,68 @@ export default defineChannelPluginEntry({
       // Each account gets its OWN serialized dispatcher bound to its channel and
       // accountId, so inbound turns resolve THIS account's route (binding.account)
       // and replies deliver back over THIS account's channel.
-      const { dispatch: dispatchInbound } = createSerializedInboundDispatcher<
-        Extract<InboundWsMessage, { type: "user_message" }>
-      >((peerId, message) =>
-        handleInboundMessage(
-          api,
-          channel as unknown as WebChannelTransport,
-          peerId,
-          message,
-          accountId,
-        ),
-      );
+      type WebchannelUserMessage = Extract<
+        InboundWsMessage,
+        { type: "user_message" }
+      >;
+      const inboundDispatcher =
+        createSerializedInboundDispatcher<WebchannelUserMessage>(
+          (peerId, message) =>
+            handleInboundMessage(
+              api,
+              channel as unknown as WebChannelTransport,
+              peerId,
+              message,
+              accountId,
+            ),
+          {
+            // P1-8b layer (b): busy-time coalesce. A message that arrives while a
+            // turn is already running for its session buffers and is merged into
+            // ONE follow-up turn on completion (Telegram parity), instead of
+            // chaining a separate turn each.
+            coalesce: coalesceUserMessages,
+          },
+        );
+      const dispatchInbound = inboundDispatcher.dispatch;
+
+      // P1-8b layer (a): idle pre-run debounce (Telegram parity), REUSING core's
+      // `createInboundDebouncer`. Sits IN FRONT of the per-session FIFO: rapid
+      // same-peer messages within the debounce window flush together as ONE
+      // merged turn. `resolveInboundDebounceMs` reads the GLOBAL config
+      // (`messages.inbound.byChannel.webchannel ?? messages.inbound.debounceMs ??
+      // 0`) — resolved ONCE here per account. The core default is 0ms, which makes
+      // this layer inert (each message flushes immediately) unless an operator
+      // opts in; layer (b) still coalesces busy-time regardless. We keep that
+      // default (do NOT invent a nonzero one). Items carry `peerId` so `buildKey`
+      // and `onFlush` can route; `serializeImmediate` guarantees same-peer flushes
+      // never reorder even on the 0ms immediate path (core serializes same-key
+      // flushes through its `keyChains`). `onFlush` calls `dispatchInbound`
+      // SYNCHRONOUSLY, so a message arriving during a previous flush's merged turn
+      // lands in layer (b)'s buffer rather than spawning a parallel turn.
+      const inboundDebounceMs = resolveInboundDebounceMs({
+        cfg: api.config,
+        channel: WEBCHANNEL_ID,
+      });
+      const inboundDebouncer = createInboundDebouncer<{
+        peerId: string;
+        message: WebchannelUserMessage;
+      }>({
+        debounceMs: inboundDebounceMs,
+        serializeImmediate: true,
+        buildKey: (item) => item.peerId,
+        onFlush: async (items) => {
+          const first = items[0];
+          if (!first) return;
+          dispatchInbound(
+            first.peerId,
+            coalesceUserMessages(items.map((i) => i.message)),
+          );
+        },
+        onError: (err) =>
+          api.logger.error?.(
+            `webchannel: inbound debounce flush failed: ${String(err)}`,
+          ),
+      });
 
       // Command-gate mirror (P1-8a follow-up), resolved ONCE per account. It
       // depends only on `api.config` + `accountId`, never on the message, so we
@@ -610,6 +668,20 @@ export default defineChannelPluginEntry({
         // as busy. No wedge and no double-delivery — the /stop is simply ignored
         // for an unauthorized sender.
         if (isControlLaneMessage(message)) {
+          // P1-8b: a user who says "/stop" wants the text queued behind the
+          // running turn gone too — mirroring core fast-abort clearing its own
+          // followup lanes. Drop this peer's buffered input on BOTH layers before
+          // dispatching the abort: (a) any messages waiting in the pre-run
+          // debounce window (`cancelKey`), and (b) any messages buffered during
+          // the running turn (`clearPending`). Log at info only when something was
+          // actually dropped.
+          const debounceCancelled = inboundDebouncer.cancelKey(peerId);
+          const pendingDropped = inboundDispatcher.clearPending(peerId);
+          if (debounceCancelled || pendingDropped > 0) {
+            api.logger?.info?.(
+              `webchannel: /stop dropped buffered input for peer ${peerId} (debounced=${debounceCancelled}, pending=${pendingDropped})`,
+            );
+          }
           void handleInboundMessage(
             api,
             channel as unknown as WebChannelTransport,
@@ -645,7 +717,18 @@ export default defineChannelPluginEntry({
           }
           return;
         }
-        dispatchInbound(peerId, message);
+        // Normal inbound: through layer (a) debounce → onFlush → per-session FIFO
+        // (layer (b) coalesce). `enqueue` is fire-and-forget from here; attach a
+        // rejection handler so a flush failure can't surface as an
+        // unhandledRejection (the debouncer already routes onFlush throws to
+        // `onError`, so this is belt-and-suspenders).
+        void inboundDebouncer
+          .enqueue({ peerId, message })
+          .catch((err) =>
+            api.logger.error?.(
+              `webchannel: inbound enqueue failed: ${String(err)}`,
+            ),
+          );
       });
 
       // ---- Axis B consequence: wildcard subscription (auto accounts) --------
