@@ -171,7 +171,8 @@ describe("DeviceFlowEnrollment — agent path mints against the external account
     });
 
     const { user_code } = await enrollment.enroll({
-      agentPublicKey: "agent-x25519-pub",
+      // 43-char base64url — the wire format enroll() enforces at ingress (#13).
+      agentPublicKey: "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo",
       accountId: "agent-1",
       tenant: "tenant-ext",
     });

@@ -48,8 +48,12 @@ const createEnrollment = () => {
   });
 };
 
+// A real 43-char base64url string (base64url of a 32-byte X25519 public key) —
+// the exact wire format enroll() now enforces at ingress (#13).
+const VALID_AGENT_PUBLIC_KEY = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+
 const validEnrollmentRequest: EnrollmentRequest = {
-  agentPublicKey: "mock_public_key_base64url",
+  agentPublicKey: VALID_AGENT_PUBLIC_KEY,
   tenant: "test-tenant",
   accountId: "test-agent",
 };
@@ -126,6 +130,50 @@ describe("DeviceFlowEnrollment", () => {
 
       expect(response.expires_in).toBe(300);
       expect(response.interval).toBe(10);
+    });
+
+    // #13: agentPublicKey is the one enroll() field whose content AND size a
+    // hostile (unauthenticated) caller controls; it is pinned to the exact
+    // 43-char base64url X25519 wire format at ingress, before anything persists.
+    describe("agentPublicKey ingress validation", () => {
+      const enrollWithKey = (agentPublicKey: string) =>
+        enrollment.enroll({ ...validEnrollmentRequest, agentPublicKey });
+
+      const expectRejectedAndUnpersisted = async (agentPublicKey: string) => {
+        await expect(enrollWithKey(agentPublicKey)).rejects.toThrow(
+          /agentPublicKey must be base64url of a 32-byte X25519 public key/,
+        );
+        // Nothing was persisted — the guard runs before saveEnrollment.
+        const store = enrollment["store"] as MemoryEnrollmentStore;
+        expect((store["enrollments"] as Map<string, unknown>).size).toBe(0);
+      };
+
+      it("accepts a valid 43-char base64url key", async () => {
+        const response = await enrollWithKey("EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo");
+        expect(response.user_code).toMatch(/^[A-Z]{4}-[A-Z]{4}$/);
+      });
+
+      it("rejects a 44-char (too-long) key", async () => {
+        await expectRejectedAndUnpersisted("EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSoX");
+      });
+
+      it("rejects a multi-KB key", async () => {
+        await expectRejectedAndUnpersisted("A".repeat(4096));
+      });
+
+      it("rejects standard-base64 charset (+ / =)", async () => {
+        // 43-char length but with non-base64url characters.
+        await expectRejectedAndUnpersisted("EpK8GJc3BntN3yEwx5Gtf+FyIilwIXaKsrWiqYNkz/o");
+        await expectRejectedAndUnpersisted("EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzS=");
+      });
+
+      it("rejects a 42-char (too-short) key", async () => {
+        await expectRejectedAndUnpersisted("EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzS");
+      });
+
+      it("rejects an empty string", async () => {
+        await expectRejectedAndUnpersisted("");
+      });
     });
   });
 

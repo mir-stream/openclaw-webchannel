@@ -61,7 +61,9 @@ export async function runOperatorEnrollment(): Promise<EnrollmentResult> {
   });
 
   const started = await enrollment.enroll({
-    agentPublicKey: "ZXhhbXBsZS1hZ2VudC14MjU1MTktcHVibGljLWtleQ",
+    // 43-char base64url of a 32-byte X25519 public key — the exact wire format
+    // enroll() validates at ingress (real plugins send their identity key here).
+    agentPublicKey: "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo",
     accountId: "example-account",
     tenant: "example-tenant",
   });

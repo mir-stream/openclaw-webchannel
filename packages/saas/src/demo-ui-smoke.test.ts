@@ -68,8 +68,13 @@ async function enroll(accountId: string): Promise<string> {
   const res = await fetch(`${BASE}/api/enroll`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    // agentPublicKey + tenant are the required fields; content is opaque here.
-    body: JSON.stringify({ agentPublicKey: "smoke-agent-pubkey", tenant: TENANT, accountId }),
+    // agentPublicKey must be the 43-char base64url X25519 wire format (#13);
+    // tenant is the other required field.
+    body: JSON.stringify({
+      agentPublicKey: "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo",
+      tenant: TENANT,
+      accountId,
+    }),
   });
   expect(res.ok, `enroll failed: ${res.status}`).toBe(true);
   const body = (await res.json()) as { user_code?: string };
