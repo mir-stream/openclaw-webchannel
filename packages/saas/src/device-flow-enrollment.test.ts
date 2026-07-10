@@ -389,6 +389,42 @@ describe("DeviceFlowEnrollment", () => {
       expect("peerId" in polled! && polled.peerId).toBe(approved!.peerId);
       expect("creds" in polled! && polled.creds).toEqual(approved!.creds);
     });
+
+    // #11: a denied enrollment is terminal — approve must NOT mint creds and
+    // flip it back to approved. The operator's deny stands.
+    it("returns null and mints nothing when approving a denied enrollment", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+      await enrollment.deny(enrollResponse.user_code);
+
+      const result = await enrollment.approve(enrollResponse.user_code);
+      expect(result).toBeNull();
+
+      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.status).toBe("denied");
+      expect(persisted?.natsCreds).toBeUndefined();
+      expect(persisted?.peerId).toBeUndefined();
+
+      // The plugin still sees access_denied on its next poll — no creds leaked.
+      const polled = await enrollment.poll({ device_code: enrollResponse.device_code });
+      expect("error" in polled && polled.error).toBe("access_denied");
+    });
+
+    // #11: the new status guard (not the clock) catches a record already marked
+    // `expired` even while its expiresAt still lies in the future.
+    it("returns null when approving a record whose status is already expired", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+
+      const store = enrollment["store"] as MemoryEnrollmentStore;
+      await store.updateEnrollment(enrollResponse.device_code, { status: "expired" });
+
+      const result = await enrollment.approve(enrollResponse.user_code);
+      expect(result).toBeNull();
+
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.status).toBe("expired");
+      expect(persisted?.natsCreds).toBeUndefined();
+    });
   });
 
   describe("deny()", () => {
@@ -414,6 +450,64 @@ describe("DeviceFlowEnrollment", () => {
     it("should return false for non-existent user code", async () => {
       const result = await enrollment.deny("NON_EXISTENT");
       expect(result).toBe(false);
+    });
+
+    // #11: an approved enrollment has live minted credentials — deny must not
+    // flip it to denied and make the record lie about a working identity.
+    it("returns false and leaves an approved enrollment untouched", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+      const approved = await enrollment.approve(enrollResponse.user_code);
+
+      const result = await enrollment.deny(enrollResponse.user_code);
+      expect(result).toBe(false);
+
+      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.status).toBe("approved");
+
+      // The originally minted credentials still poll through.
+      const polled = await enrollment.poll({ device_code: enrollResponse.device_code });
+      expect("peerId" in polled! && polled.peerId).toBe(approved!.peerId);
+      expect("creds" in polled! && polled.creds).toEqual(approved!.creds);
+    });
+
+    // #11: deny of an already-denied record is a terminal no-op → false.
+    it("returns false when denying an already-denied enrollment", async () => {
+      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
+      await enrollment.deny(enrollResponse.user_code);
+
+      const result = await enrollment.deny(enrollResponse.user_code);
+      expect(result).toBe(false);
+
+      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.status).toBe("denied");
+    });
+
+    // #11: deny of an expired record marks it expired (matching poll()) → false.
+    it("returns false and marks an expired enrollment expired", async () => {
+      const shortLivedEnrollment = new DeviceFlowEnrollment({
+        saasTrustChain: mockTrustChain,
+        natsAccountConfig: mockNatsConfig,
+        saasBaseUrl: "https://saas.com",
+        jwksUrl: "https://saas.com/.well-known/jwks.json",
+        bootstrapUrl: "https://saas.com/bootstrap",
+        natsUrl: "wss://nats.saas.com",
+        expirationSeconds: 0,
+        pollIntervalSeconds: 5,
+      });
+
+      const enrollResponse = await shortLivedEnrollment.enroll(validEnrollmentRequest);
+
+      // Wait for expiration
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const result = await shortLivedEnrollment.deny(enrollResponse.user_code);
+      expect(result).toBe(false);
+
+      const store = shortLivedEnrollment["store"] as MemoryEnrollmentStore;
+      const persisted = await store.getEnrollment(enrollResponse.device_code);
+      expect(persisted?.status).toBe("expired");
     });
   });
 

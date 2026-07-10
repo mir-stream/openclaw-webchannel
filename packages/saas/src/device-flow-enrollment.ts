@@ -478,6 +478,11 @@ export class DeviceFlowEnrollment {
    * Past `expiresAt` this returns null (the expiry check precedes the guard) —
    * consistent with `poll()`, which also fails an expired record; the whole
    * enroll→approve→poll cycle must complete inside the device-flow window.
+   *
+   * Transition rules: approve is honored only from `pending` (mint) and
+   * `approved` (idempotent re-return of the first-minted creds). `denied` and
+   * `expired` are terminal → null; the operator (or the clock) already
+   * rejected the record and must not have credentials minted after the fact.
    */
   async approve(userCode: string): Promise<EnrollmentResult | null> {
     const inFlight = this.approvalsInFlight.get(userCode);
@@ -512,6 +517,13 @@ export class DeviceFlowEnrollment {
       };
     }
 
+    // #11: only a pending enrollment may be (newly) approved. `denied` and
+    // `expired` are terminal — approving them would mint live credentials for a
+    // record the operator (or the clock) already rejected. This also refuses to
+    // re-mint on a corrupt approved-without-creds record (which fell through the
+    // A2 guard above) rather than hand out a second, divergent identity.
+    if (enrollment.status !== "pending") return null;
+
     // Generate NATS user credentials
     const natsCreds = await this.generateNatsUserCredentials(enrollment);
 
@@ -538,10 +550,27 @@ export class DeviceFlowEnrollment {
    * Deny a pending enrollment (operator action).
    *
    * Called by the SaaS approval UI when the operator clicks "Deny".
+   *
+   * Transition rules: deny is a `pending`→`denied` transition only. An already
+   * `approved` enrollment has live minted credentials, so flipping it to
+   * `denied` would make the record lie about an identity that still works →
+   * false, no state change. An expired record is marked `expired` (matching
+   * `poll()`), and any other non-pending status (including already `denied`)
+   * returns false without change.
    */
   async deny(userCode: string): Promise<boolean> {
     const enrollment = await this.store.getEnrollmentByUserCode(userCode);
     if (!enrollment) return false;
+
+    // Check expiration
+    if (Date.now() > enrollment.expiresAt) {
+      await this.store.updateEnrollment(enrollment.device_code, { status: "expired" });
+      return false;
+    }
+
+    // #11: deny is only a pending→denied transition. An approved enrollment has
+    // live credentials — flipping it to denied would make the record lie.
+    if (enrollment.status !== "pending") return false;
 
     await this.store.updateEnrollment(enrollment.device_code, { status: "denied" });
     return true;
