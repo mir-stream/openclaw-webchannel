@@ -11,9 +11,10 @@
 > **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-10 (post-#14/#15/#16/#19 tree).** The integrated
 > showcase demo rewrote the demo surface. The demo now drives the production `WebChannelNATSClient`
 > state reducer, so **most P0 client render is built** (marked ✅). What remains is server-side
-> (P0-2/5/6) or net-new (P0-3/7). Corrected 2026-07-10 for: partial-mode answer-text streaming (#14,
-> P0-5), the `approval_snapshot` rehydration frame (#15/#19, P0-4/§0 wire), the ordered history
-> merge (#16, P0-1/§0), and the NATS register hop replacing `registerHttpRoute` (P0-3).
+> (P0-5/6) or net-new (P0-3/7); P0-2 closed 2026-07-10. Corrected 2026-07-10 for: partial-mode
+> answer-text streaming (#14, P0-5), the `approval_snapshot` rehydration frame (#15/#19, P0-4/§0
+> wire), the ordered history merge (#16, P0-1/§0), and the NATS register hop replacing
+> `registerHttpRoute` (P0-3).
 >
 > **⚠️ Line numbers drift.** The demo is still being built, so `file:line` anchors are approximate
 > and keep moving — trust the file + symbol name and search if a line has shifted. Not re-anchored
@@ -165,28 +166,44 @@ snapshot is lost.
 
 ---
 
-## P0-2 — History pagination (scroll-up "load more") — 🟡 UI BUILT, SERVER CAP OPEN
+## P0-2 — History pagination (scroll-up "load more") — ✅ BUILT (1000-msg ceiling)
 
-**Symptom.** Older-than-snapshot turns can't be reached past ~2 pages.
+**Symptom (original).** Older-than-snapshot turns can't be reached past ~2 pages.
 
-**Classification.** 🟡 Client + UI trigger + server handler all built; the **server pager has a hard
-depth cap** that still needs fixing.
+**Classification.** ✅ Closed 2026-07-10 (branch `feat/p0-2`). Two defects fixed:
+1. **`pageBefore` depth cap + left-edge truncation** (`history.ts`): now a two-phase fetch —
+   phase 1 reads `min(limit*2, 1000)`; the older-slice is returned only when it cannot be
+   left-truncated by the window edge (`idx >= limit`, or the window is already maximal);
+   otherwise (miss OR hit at `idx < limit`) phase 2 widens to the 1000-message upstream ceiling
+   (`MAX_FETCH_WINDOW`, mirrors `PLUGIN_SUBAGENT_SESSION_MESSAGES_MAX_LIMIT`). A cursor absent
+   from the maximal window returns an **empty page** (the honest end-of-history signal; the old
+   `slice(-limit)` newest-N fallback fed the client dedup-swallowed duplicates = silent stop).
+2. **Live NATS call-site bug** (`index-nats.ts` load-history handler): it passed the whole
+   `{before, limit}` request object as `beforeId`, so live-path pagination ALWAYS returned `[]`
+   (masked from tsc — `index-nats.ts` is outside the plugin tsconfig `include`). Now routed
+   through `planHistoryFetch(request, pageSize)` (`history.ts`): validates the wire `limit`
+   (finite, >0, floored, else pageSize) and branches `before` → `pageBefore` / absent → `recent`,
+   matching the legacy `index.ts` handler.
+
+Residual (accepted): conversations >1000 messages hard-wall at the upstream tail-fetch cap —
+true unbounded paging still needs the upstream cursor (below). Follow-ups (LOW, from review):
+type-validate `before` at the plan level (garbage frames currently burn a wasted 1000-fetch
+before the honest `[]`); clamp the wire `limit` upper bound (a 1000-msg `recent` page can exceed
+relay `max_payload`); window-relative synthesized ids (`h-${ts}-${idx}`) can miss OR false-match
+across windows — position-anchored synthesis is the real fix.
 
 **Where it stands today.**
 - Outbound frame + client method exist: `WebChannelNatsClient.loadHistory(before?, limit?)`
   (`nats-client.ts:768`); wrapper `loadHistory({before,limit})` (`nats-client-wrapper.ts:155`).
 - **UI trigger exists:** the "Load older" button (`widget.ts:49`) → `historyBtn.onclick`
   (`widget.ts:211-214`) passes the oldest non-working message id as `before`.
-- Server handler exists: `index-nats.ts:548` `setLoadHistoryHandler` →
-  `historyPageBefore(api, route.sessionKey, request, historyConfig.pageSize, …)` `:554` →
-  `sendHistory` (reuses the `history` frame, so P0-1's reducer handles the response).
-- ⚠️ **Server pager depth cap.** `pageBefore` (`history.ts:213-235`): the SDK seam
-  (`runtime.subagent.getSessionMessages`) has no `before` cursor, so it always fetches only the
-  newest `limit*2` (`fetchLimit` `:221`) and slices within that window. Consequences:
-  - (a) pagination never reaches further than ~2 pages from the newest message;
-  - (b) the cursor-miss fallback `window.slice(-limit)` (`:233`) returns the **newest** `limit`
-    while the comment at `:205/:231` claims **oldest**. The client's #16 ordered merge swallows the
-    duplicates, so the visible symptom is "load more silently stops".
+- Server handler exists: `index-nats.ts:548` `setLoadHistoryHandler` → `planHistoryFetch(request,
+  pageSize)` → `historyPageBefore`/`historyRecent` → `sendHistory` (reuses the `history` frame, so
+  P0-1's reducer handles the response).
+- ✅ **Server pager depth cap — FIXED** (see Classification above). The old `pageBefore` fetched
+  only the newest `limit*2` and its cursor-miss fallback returned the **newest** `limit` (comment
+  claimed oldest) — dedup-swallowed by the client's #16 ordered merge → "load more silently stops"
+  after ~2 pages. Both replaced by the two-phase fetch + empty-page contract.
 
 **⚠️ This gap is upstream-constrained, not ours to close unilaterally.** `openclaw` is a third-party
 npm peer dependency (see memory `openclaw-plugin-dependency`) — we do not vendor or patch its
@@ -222,16 +239,13 @@ zero-overlap page); the "Load older" response reuses it.
 **Telegram reference.** `message-cache.ts` builds bounded history windows on demand; Telegram has no
 user-facing "load more" (the client is Telegram itself), so our scroll-to-top pagination UX is novel.
 
-**Implementation sketch (remaining, all within this repo).**
-0. **Server: raise the `pageBefore` fetch window to the 1000-message ceiling** (`history.ts:213-235`,
-   `fetchLimit` `:221`) instead of `limit*2`, and find/slice the cursor within it (iterative
-   deepening — `limit*2, *4, …`
-   up to 1000 — is an equally valid way to avoid always paying the cost of a full 1000-fetch on
-   every page). Fix the cursor-miss fallback to match its comment (return the *oldest* slice, or an
-   empty page so the client renders "beginning of conversation") for the case where the cursor truly
-   isn't in the last 1000 messages.
-1. **Scroll UX (optional polish):** trigger `loadHistory` on scroll-near-top instead of only the
-   button, and preserve scroll position (measure `scrollHeight` before prepend, restore after).
+**Implementation sketch (remaining).**
+0. ~~Server: raise the `pageBefore` fetch window to the 1000-message ceiling~~ ✅ DONE 2026-07-10
+   (two-phase fetch + left-edge widening + empty-page cursor-miss + `planHistoryFetch` call-site
+   fix in `index-nats.ts` — see Classification).
+1. **Scroll UX (optional polish, still open):** trigger `loadHistory` on scroll-near-top instead of
+   only the button, and preserve scroll position (measure `scrollHeight` before prepend, restore
+   after).
 
 **Acceptance.** With >2 pages of history (up to the ~1000-message ceiling), repeatedly loading older
 keeps fetching+prepending; fetching past the beginning (or past the 1000-message ceiling) is a no-op
@@ -493,12 +507,14 @@ rapid double-submit of the same logical message is deduped server-side.
 |---|---|---|---|
 | 1 | P0-5 streaming demo flag | XS | One-line `streaming.mode:"partial"` in `run.sh` unlocks the already-built (mode-agnostic) render — answer-text streaming; `"progress"` for tool-lines-only. |
 | 2 | P0-6 NATS typing gate | S | Small server gate; makes `typing:"off"` honored. |
-| 3 | P0-2 server depth cap | S–M | Raise fetch window to the 1000-msg ceiling (in-repo fix); true unbounded cursor is upstream-blocked. |
+| 3 | ~~P0-2 server depth cap~~ | — | ✅ DONE 2026-07-10 (`feat/p0-2`): two-phase `pageBefore` to the 1000-msg ceiling + `index-nats.ts` call-site fix; true unbounded cursor stays upstream-blocked. |
 | 4 | P0-3 slash discovery | S–M | Catalog route + typeahead (execution already works). |
 | 5 | P0-7 send reliability | L | Client replay + server dedupe; the reliability milestone. |
 
 > ✅ **Already built by the integrated demo:** P0-1 (history restore), P0-4 (approval cards), P0-6
 > (typing render), P0-5 (progress render). No further client work for those beyond the notes above.
+> ✅ **P0-2 (server depth cap)** closed 2026-07-10 on `feat/p0-2` — only the optional scroll-UX
+> polish remains in that section.
 
 ## Cross-cutting: the reducer is the shared seam
 
