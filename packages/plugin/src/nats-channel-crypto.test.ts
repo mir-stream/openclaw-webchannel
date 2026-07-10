@@ -226,6 +226,31 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     ]);
   });
 
+  it("#15: sendApprovalSnapshot emits {type:'approval_snapshot', approvals} through the sealed .out path", () => {
+    const h = makeHarness();
+    h.doHandshake();
+    expect(h.browserSessionKey()).not.toBeNull();
+
+    const approvals = [
+      {
+        id: "exec-1",
+        kind: "exec" as const,
+        title: "Run command",
+        prompt: "rm -rf /tmp/cache",
+        options: [{ decision: "allow-once" as const, label: "Allow", style: "success" }],
+        expiresAtMs: 1_000,
+      },
+    ];
+    // Guards the un-typechecked facade seam (NatsChannel is reached via
+    // `as unknown as` casts): the frame is E2E-sealed and decrypts on the browser.
+    expect(h.channel.sendApprovalSnapshot(PEER, approvals)).toBe(true);
+    expect(h.browserReplies).toEqual([{ type: "approval_snapshot", approvals }]);
+
+    // An EMPTY snapshot is a meaningful signal and must be delivered too.
+    expect(h.channel.sendApprovalSnapshot(PEER, [])).toBe(true);
+    expect(h.browserReplies.at(-1)).toEqual({ type: "approval_snapshot", approvals: [] });
+  });
+
   it("does NOT re-fire the snapshot for a duplicate handshake (client retry / RTT race)", () => {
     const h = makeHarness();
     const firedFor: string[] = [];

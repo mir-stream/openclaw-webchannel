@@ -138,7 +138,15 @@ export type NatsClientOptions = {
 };
 
 export type InboundMessage = {
-  type: "agent_message" | "progress" | "approval_request" | "approval_resolved" | "typing" | "history";
+  type:
+    | "agent_message"
+    | "progress"
+    | "approval_request"
+    | "approval_resolved"
+    // #15: authoritative pending-approval snapshot (carries `approvals`).
+    | "approval_snapshot"
+    | "typing"
+    | "history";
   id?: string;
   text?: string;
   kind?: "exec" | "plugin";
@@ -149,6 +157,16 @@ export type InboundMessage = {
   expiresAtMs?: number;
   decision?: string;
   messages?: Array<{ id: string; role: string; text: string; ts?: number }>;
+  /** #15: the still-pending approval set on an `approval_snapshot` frame. */
+  approvals?: Array<{
+    id: string;
+    kind?: "exec" | "plugin";
+    title?: string;
+    description?: string;
+    prompt?: string;
+    options?: Array<{ decision: string; label: string; style: string }>;
+    expiresAtMs?: number;
+  }>;
   before?: string;
   limit?: number;
 };
@@ -788,6 +806,8 @@ export class WebChannelNatsClient {
    */
   private pendingInbound: string[] = [];
   private static readonly MAX_PENDING_INBOUND = 64;
+  /** One-time guard so a full pre-key buffer warns once, not per dropped frame. */
+  private warnedPreKeyDrop = false;
   private outSub = -1;
   private handshakeSub = -1;
   /**
@@ -883,6 +903,8 @@ export class WebChannelNatsClient {
     // longer (or never will) hold — drop them; the fresh register/handshake
     // re-hydrates.
     this.pendingInbound = [];
+    // Re-arm the one-time pre-key-drop warning for the next session.
+    this.warnedPreKeyDrop = false;
   }
 
   /**
@@ -1075,6 +1097,16 @@ export class WebChannelNatsClient {
         // beat (see `pendingInbound`). Never processed as plaintext.
         if (this.pendingInbound.length < WebChannelNatsClient.MAX_PENDING_INBOUND) {
           this.pendingInbound.push(payload);
+        } else if (!this.warnedPreKeyDrop) {
+          // Buffer full before the key arrived → this sealed frame is dropped
+          // (never plaintext-processed). Make it observable — a full pre-key
+          // buffer means an unusually slow register/key delivery. Warn once so a
+          // burst doesn't spam; the flag re-arms on the next connection.
+          this.warnedPreKeyDrop = true;
+          console.warn(
+            `[nats-client] pre-key inbound buffer full (${WebChannelNatsClient.MAX_PENDING_INBOUND}); ` +
+              `dropping a sealed frame received before the conversation key was established`,
+          );
         }
         return;
       }

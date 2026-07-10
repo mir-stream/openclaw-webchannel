@@ -24,7 +24,11 @@ import type { WebchannelEncryptionConfig } from "./src/encryption-policy.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
 import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
-import { handleApprovalDecision } from "./src/approvals.js";
+import {
+  handleApprovalDecision,
+  listPendingApprovalsForPeer,
+  ApprovalBindingMissingError,
+} from "./src/approvals.js";
 import { resolveVerifier, verifyJwtAndExtractIdentity, preflightResolveJwks, type ConnectionVerifier } from "./src/auth.js";
 import type { AuthConfig, JwtAuthConfig } from "./src/auth.js";
 import { formatAccountReadiness, deriveJwksUrl, deriveIssuer, type JwksReadiness } from "./src/preflight.js";
@@ -523,7 +527,15 @@ export default defineChannelPluginEntry({
       // another account cannot resolve approvals via this account's channel.
       channel.setApprovalDecisionHandler((peerId, id, decision) => {
         void handleApprovalDecision(api.config, id, decision, peerId, accountId).catch((err) => {
-          api.logger.error?.(`webchannel: approval resolve failed (${id}): ${String(err)}`);
+          // A missing delivery binding is EXPECTED in normal multi-device flows
+          // (a Leg C snapshot re-send racing a finalize, or two devices both
+          // clicking) — log it at warn, not error. Genuine authz rejections
+          // (non-approver, cross-account) stay at error.
+          if (err instanceof ApprovalBindingMissingError) {
+            api.logger.warn?.(`webchannel: approval resolve ignored (${id}): ${err.message}`);
+          } else {
+            api.logger.error?.(`webchannel: approval resolve failed (${id}): ${String(err)}`);
+          }
         });
       });
 
@@ -633,6 +645,18 @@ export default defineChannelPluginEntry({
             unregisterPeer: (pid) => channel.unregisterPeer(pid),
             sendHistorySnapshot: (pid) =>
               sendHistorySnapshot(accountId, channel, historyConfig, pid),
+            // #15: authoritative pending-approval snapshot. The store read and
+            // the publish MUST be synchronous — one event-loop turn, NO
+            // await/.then() between them (do NOT imitate sendHistorySnapshot's
+            // detached-read shape above). The §3.4 race analysis holds precisely
+            // BECAUSE finalize deletes the store entry before publishing
+            // `approval_resolved` and this is list→publish atomically, so a
+            // snapshot can never list an approval whose resolve frame preceded
+            // it. Sent even when empty (retires stale cards). NatsChannel reaches
+            // this via `as unknown as` casts, so typecheck won't force the method
+            // to exist — the direct wiring + channel test cover it.
+            sendApprovalSnapshot: (pid) =>
+              channel.sendApprovalSnapshot(pid, listPendingApprovalsForPeer(accountId, pid)),
             logger: api.logger,
           }).catch((err) => {
             api.logger?.error?.(

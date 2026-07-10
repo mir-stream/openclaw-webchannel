@@ -21,7 +21,7 @@ import type { InboundWsMessage } from "./src/transport.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
 import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
-import { handleApprovalDecision } from "./src/approvals.js";
+import { handleApprovalDecision, ApprovalBindingMissingError } from "./src/approvals.js";
 import { resolveVerifier } from "./src/auth.js";
 import type { AuthConfig } from "./src/auth.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
@@ -87,9 +87,15 @@ export default defineChannelPluginEntry({
     // handler ignored `_sessionKey`).
     transport.setApprovalDecisionHandler((sessionKey, id, decision) => {
       void handleApprovalDecision(api.config, id, decision, sessionKey).catch((err) => {
-        api.logger.error?.(
-          `webchannel: approval resolve failed (${id}): ${String(err)}`,
-        );
+        // A missing delivery binding is EXPECTED (double-click, already
+        // finalized) — warn, not error, matching the NATS path in index-nats.ts.
+        if (err instanceof ApprovalBindingMissingError) {
+          api.logger.warn?.(`webchannel: approval resolve ignored (${id}): ${err.message}`);
+        } else {
+          api.logger.error?.(
+            `webchannel: approval resolve failed (${id}): ${String(err)}`,
+          );
+        }
       });
     });
 

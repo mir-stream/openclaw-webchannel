@@ -432,8 +432,23 @@ export class WebChannelClient {
             isTyping: false,
           });
         } else {
+          // Upsert-preserve (#15): a re-delivered `approval_request` rebuilds a
+          // fresh entry from the frame, which would otherwise CLOBBER a locally
+          // set resolution and resurrect actionable buttons for a decided card.
+          // Carry the existing resolution over the refreshed payload. (This
+          // legacy WS client never receives an `approval_snapshot` — the dev-only
+          // WS server has no stateless register hop that emits one — so it has no
+          // snapshot handler; only the shared clobber hazard is fixed here.)
+          const prev = approvals[idx];
           const next = approvals.slice();
-          next[idx] = req;
+          next[idx] =
+            prev.resolvedDecision !== undefined
+              ? {
+                  ...req,
+                  resolvedDecision: prev.resolvedDecision,
+                  resolutionConfirmed: prev.resolutionConfirmed,
+                }
+              : req;
           this.setState({ approvals: next, isTyping: false });
         }
         return;
@@ -441,7 +456,11 @@ export class WebChannelClient {
 
       case "approval_resolved": {
         const { id, decision } = parsed;
-        this.patchApproval(id, (a) => ({ ...a, resolvedDecision: decision }));
+        this.patchApproval(id, (a) => ({
+          ...a,
+          resolvedDecision: decision,
+          resolutionConfirmed: true,
+        }));
         return;
       }
 

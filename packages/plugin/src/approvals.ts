@@ -145,6 +145,158 @@ function recordApprovalAccount(approvalId: string, accountId: string | null | un
   deliveredApprovalAccounts.set(approvalId, bindingAccountKey(accountId));
 }
 
+// ── pending-approval store (#15 approval rehydration) ─────────────────────────
+
+/**
+ * PENDING-APPROVAL STORE — the authority behind the register-time
+ * `approval_snapshot` frame (docs/APPROVAL_REHYDRATION_PLAN.md).
+ *
+ * The plugin observes every approval's full lifecycle (`deliverPending` →
+ * `updateEntry`) with the complete wire payload in hand, so it can keep an
+ * in-memory record of what is STILL PENDING per (account, peer) and re-emit it
+ * on register. That closes three reload/reconnect gaps a live-only approval
+ * frame leaves open: A (a reloaded widget lost its card), B (a device that
+ * missed `approval_resolved` keeps stale actionable buttons), C (a decision
+ * whose frame was lost — the snapshot lets the client detect and re-send it).
+ *
+ * Keyed by the COMPOSITE `(normalized accountId, approvalId)` (NUL-separated).
+ * One approvalId can be delivered on MULTIPLE accounts — `prepareTarget` scopes
+ * its dedupe key per account, and the F3 residual fans account-less approvals
+ * out to every account's handler — so the key must NOT collapse per-account
+ * deliveries of one id into a single entry (a finalize on account A would then
+ * wrongly erase account B's pending record). approvalIds are `crypto.randomUUID`
+ * and account ids are config keys; neither contains NUL, so the separator is
+ * unambiguous.
+ *
+ * Bounded (evict oldest) exactly like `deliveredApprovalAccounts`: approvals are
+ * agent-minted (a browser cannot forge one), so the cap is a backstop against an
+ * abandoned entry whose finalize never ran, not a client-reachable growth
+ * vector. Entries are erased at finalize (`updateEntry`) and lazily pruned on
+ * read (past-`expiresAtMs`, or no-`expiresAtMs` older than the max age).
+ */
+export const PENDING_APPROVAL_MAX_AGE_MS = 60 * 60 * 1000; // 60 min
+export const PENDING_APPROVAL_CAP = 512;
+const PENDING_APPROVAL_KEY_SEP = "\u0000";
+
+type PendingApprovalEntry = {
+  payload: ApprovalRequestPayload;
+  /** The peer (sessionKey / wsKey) the approval was delivered to. */
+  sessionKey: string;
+  /** Normalized account the approval was delivered on (matches the composite key). */
+  accountKey: string;
+  /** `Date.now()` at delivery — the max-age prune uses it for no-`expiresAtMs` entries. */
+  deliveredAtMs: number;
+};
+
+const pendingApprovals = new Map<string, PendingApprovalEntry>();
+
+function pendingApprovalKey(accountId: string | null | undefined, approvalId: string): string {
+  return `${bindingAccountKey(accountId)}${PENDING_APPROVAL_KEY_SEP}${approvalId}`;
+}
+
+/** Record (or refresh) a pending approval; bounded, evicts oldest at the cap. */
+function recordPendingApproval(
+  accountId: string | null | undefined,
+  payload: ApprovalRequestPayload,
+  sessionKey: string,
+  deliveredAtMs: number,
+): void {
+  const key = pendingApprovalKey(accountId, payload.id);
+  // Insertion-ordered Map: delete-then-set moves a repeat delivery to the newest
+  // slot so a re-delivery refreshes rather than dupes (and never evicts itself).
+  pendingApprovals.delete(key);
+  while (pendingApprovals.size >= PENDING_APPROVAL_CAP) {
+    const oldest = pendingApprovals.keys().next().value;
+    if (oldest === undefined) break;
+    // Warn if we're evicting a GENUINELY-pending approval (not past its
+    // expiry) — the client's next snapshot will authoritatively mark it
+    // "resolved (elsewhere)" even though it may still be awaiting a decision.
+    // Under real single-tenant load the 512 cap never triggers; a warn here
+    // means either abuse-level churn or a finalize-hook leak worth noticing.
+    const evicted = pendingApprovals.get(oldest);
+    const evictedExpiry = evicted?.payload.expiresAtMs;
+    if (evicted && !(typeof evictedExpiry === "number" && evictedExpiry <= Date.now())) {
+      console.warn(
+        `[webchannel] pending-approval cap ${PENDING_APPROVAL_CAP} reached; evicting a ` +
+          `still-pending approval "${evicted.payload.id}" (account "${evicted.accountKey}", ` +
+          `peer "${evicted.sessionKey}") — a client may show it as resolved-elsewhere`,
+      );
+    }
+    pendingApprovals.delete(oldest);
+  }
+  pendingApprovals.set(key, {
+    payload,
+    sessionKey,
+    accountKey: bindingAccountKey(accountId),
+    deliveredAtMs,
+  });
+}
+
+/** Erase this account's pending record for an approval (called at finalize). */
+function deletePendingApproval(accountId: string | null | undefined, approvalId: string): void {
+  pendingApprovals.delete(pendingApprovalKey(accountId, approvalId));
+}
+
+/**
+ * List the approvals STILL PENDING for a specific (account, peer) — the payload
+ * set the register-time `approval_snapshot` carries. Lazy-prunes on read:
+ * an entry whose `expiresAtMs` is in the past (defense in depth — the runtime's
+ * expiry path normally erases it via `updateEntry`), and an entry WITHOUT an
+ * `expiresAtMs` older than `PENDING_APPROVAL_MAX_AGE_MS`, so an orphan whose
+ * finalize never fired (e.g. the approval monitor was disposed on channel stop)
+ * can never be re-delivered as an actionable zombie card forever.
+ */
+export function listPendingApprovalsForPeer(
+  accountId: string | null | undefined,
+  sessionKey: string,
+): ApprovalRequestPayload[] {
+  const accountKey = bindingAccountKey(accountId);
+  const now = Date.now();
+  const result: ApprovalRequestPayload[] = [];
+  for (const [key, entry] of pendingApprovals) {
+    const expiresAtMs = entry.payload.expiresAtMs;
+    const expired = typeof expiresAtMs === "number" && expiresAtMs <= now;
+    const tooOld =
+      expiresAtMs === undefined && now - entry.deliveredAtMs > PENDING_APPROVAL_MAX_AGE_MS;
+    if (expired || tooOld) {
+      // A no-expiry entry pruned by the max-age backstop is an ORPHAN whose
+      // finalize hook never fired (e.g. the approval monitor was disposed on
+      // channel stop). Warn so a systematic finalize leak is visible — an
+      // expiry-driven prune is routine and stays quiet.
+      if (tooOld) {
+        console.warn(
+          `[webchannel] pending-approval "${entry.payload.id}" (account "${entry.accountKey}", ` +
+            `peer "${entry.sessionKey}") pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
+            `finalize — likely an orphaned approval (monitor disposed?)`,
+        );
+      }
+      pendingApprovals.delete(key);
+      continue;
+    }
+    if (entry.accountKey === accountKey && entry.sessionKey === sessionKey) {
+      result.push(entry.payload);
+    }
+  }
+  return result;
+}
+
+/**
+ * @internal Test seam for the pending-approval store. Production code populates
+ * it only via `deliverPending`; register-path tests seed/clear it here so they
+ * drive the SAME map the real delivery path writes (mirrors
+ * `__approvalAccountBindingTestHook`).
+ */
+export const __pendingApprovalsTestHook = {
+  record: (
+    accountId: string | null | undefined,
+    payload: ApprovalRequestPayload,
+    sessionKey: string,
+    deliveredAtMs?: number,
+  ) => recordPendingApproval(accountId, payload, sessionKey, deliveredAtMs ?? Date.now()),
+  clear: () => pendingApprovals.clear(),
+  size: () => pendingApprovals.size,
+};
+
 /**
  * Native HITL approval capability for WebChannel.
  *
@@ -498,6 +650,12 @@ export function createClawApprovalNativeRuntimeSpec(
         // widget-click reverse path can enforce the per-account boundary (F1)
         // even if the frame itself never reaches a socket.
         recordApprovalAccount(pendingPayload.id, accountId);
+        // #15: record the pending approval UNCONDITIONALLY, before the channel
+        // lookup — so it survives the F2 "no live channel" drop and the "no open
+        // socket" drop below too. A prompt that could not be delivered live thus
+        // becomes recoverable on the peer's next register (its register-time
+        // `approval_snapshot`) instead of being permanently lost.
+        recordPendingApproval(accountId, pendingPayload, sessionKey, Date.now());
         const channel = transportFor(accountId);
         if (!channel) {
           // F2 fail-closed: no live channel for this account (skipped/unknown).
@@ -530,6 +688,13 @@ export function createClawApprovalNativeRuntimeSpec(
         // Finalize is terminal for this approval — release the id→account
         // binding (resolved AND expired both route here).
         deliveredApprovalAccounts.delete(entry.approvalId);
+        // #15: drop THIS handler's account-scoped pending record, so a later
+        // register no longer re-delivers a finalized card. Placed next to the
+        // binding delete — BEFORE the channel-resolution early return — so the
+        // erase always runs even when the resolve frame itself can't be sent.
+        // Account-scoped by the SAME normalized key used at delivery, so account
+        // A's finalize never erases account B's still-pending entry for the id.
+        deletePendingApproval(accountId ?? entry.accountId, entry.approvalId);
         const channel = transportFor(accountId ?? entry.accountId);
         if (!channel) {
           console.warn(
@@ -754,6 +919,24 @@ function waitForAbort(signal: AbortSignal): Promise<void> {
  * (falling back to `commands.ownerAllowFrom`) may resolve an approval. The prior
  * default of `ANON_PEER_ID` is dropped so no caller can bypass this check.
  */
+/**
+ * Thrown by `handleApprovalDecision` when the approval has no live delivery
+ * binding — an id we never delivered, or (the common case) one already finalized.
+ * This is EXPECTED in normal multi-device flows: a Leg C snapshot re-send racing
+ * a finalize, or two devices both clicking the same card. Callers should log it
+ * at warn/info, NOT error — it is not an authz failure. Genuine rejections
+ * (non-approver, cross-account) stay plain `Error` at error level. (#15)
+ */
+export class ApprovalBindingMissingError extends Error {
+  constructor(approvalId: string) {
+    super(
+      `webchannel: approval "${approvalId}" is unknown or already resolved ` +
+        `(no live delivery binding) — refusing to resolve`,
+    );
+    this.name = "ApprovalBindingMissingError";
+  }
+}
+
 export async function handleApprovalDecision(
   cfg: OpenClawConfig,
   approvalId: string,
@@ -773,10 +956,7 @@ export async function handleApprovalDecision(
   // process, so a legitimate resolve holds its binding.
   const boundAccount = deliveredApprovalAccounts.get(approvalId);
   if (boundAccount === undefined) {
-    throw new Error(
-      `webchannel: approval "${approvalId}" is unknown or already resolved ` +
-        `(no live delivery binding) — refusing to resolve`,
-    );
+    throw new ApprovalBindingMissingError(approvalId);
   }
   if (boundAccount !== bindingAccountKey(accountId)) {
     throw new Error(

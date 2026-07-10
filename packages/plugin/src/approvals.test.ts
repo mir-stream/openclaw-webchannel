@@ -26,6 +26,10 @@ import {
   getWebChannelExecApprovalApprovers,
   isWebChannelExecApprovalApprover,
   __approvalAccountBindingTestHook,
+  listPendingApprovalsForPeer,
+  PENDING_APPROVAL_MAX_AGE_MS,
+  PENDING_APPROVAL_CAP,
+  __pendingApprovalsTestHook,
 } from "./approvals.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
@@ -971,5 +975,181 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
     expect(aSent).not.toHaveBeenCalled();
     // The binding is still recorded (so a stray resolve is still account-checked).
     expect(entry).toEqual({ approvalId: "exec-b8", sessionKey: "alice", accountId: "b" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #15 pending-approval store — the authority behind the register-time
+// `approval_snapshot`. Exercises deliverPending recording, updateEntry erasure
+// (per-account), listPendingApprovalsForPeer filtering + pruning, and the cap.
+// ---------------------------------------------------------------------------
+describe("webchannel pending-approval store (#15)", () => {
+  beforeEach(() => {
+    __pendingApprovalsTestHook.clear();
+    __approvalAccountBindingTestHook.clear();
+  });
+
+  function payload(id: string, expiresAtMs?: number): ApprovalRequestPayload {
+    return {
+      id,
+      kind: "exec",
+      title: "t",
+      prompt: "p",
+      options: [{ decision: "allow-once", label: "Allow", style: "success" }],
+      ...(expiresAtMs !== undefined ? { expiresAtMs } : {}),
+    };
+  }
+
+  async function deliver(
+    spec: ReturnType<typeof createClawApprovalNativeRuntimeSpec>,
+    accountId: string | null,
+    sessionKey: string,
+    p: ApprovalRequestPayload,
+  ) {
+    return spec.transport.deliverPending({
+      cfg: cfgEnabled,
+      accountId,
+      context: undefined,
+      plannedTarget: {} as any,
+      preparedTarget: { sessionKey },
+      request: {} as any,
+      approvalKind: "exec",
+      view: fakePendingExecView(p.id) as any,
+      pendingPayload: p,
+    } as any);
+  }
+
+  async function finalize(
+    spec: ReturnType<typeof createClawApprovalNativeRuntimeSpec>,
+    accountId: string | null,
+    entry: unknown,
+    phase: "resolved" | "expired" = "resolved",
+  ) {
+    await spec.transport.updateEntry!({
+      cfg: cfgEnabled,
+      accountId,
+      context: undefined,
+      entry,
+      payload: { decision: "deny" },
+      phase,
+    } as any);
+  }
+
+  it("deliverPending records the entry even when the account has NO live channel (F2 drop)", async () => {
+    // Resolver present but returns undefined for this account → F2 fail-closed
+    // drop (no misroute). The pending record must still be written so the prompt
+    // is recoverable on the peer's next register.
+    const fallback = new WebChannelTransport();
+    const spec = createClawApprovalNativeRuntimeSpec(fallback, () => undefined);
+    const p = payload("exec-nc");
+    await deliver(spec, "acct", "alice", p);
+    expect(listPendingApprovalsForPeer("acct", "alice")).toEqual([p]);
+  });
+
+  it("deliverPending records the entry even when the socket send returns false", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(false);
+    const spec = createClawApprovalNativeRuntimeSpec(transport);
+    const p = payload("exec-nf");
+    await deliver(spec, null, "web-anon", p);
+    // null/unscoped normalizes to the "default" account.
+    expect(listPendingApprovalsForPeer(null, "web-anon")).toEqual([p]);
+  });
+
+  it("updateEntry erases the entry for BOTH resolved and expired finalize", async () => {
+    const transport = new WebChannelTransport();
+    vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
+    vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
+    const spec = createClawApprovalNativeRuntimeSpec(transport);
+
+    const resolved = payload("exec-r");
+    const entryR = await deliver(spec, null, "web-anon", resolved);
+    expect(listPendingApprovalsForPeer(null, "web-anon")).toHaveLength(1);
+    await finalize(spec, null, entryR, "resolved");
+    expect(listPendingApprovalsForPeer(null, "web-anon")).toEqual([]);
+
+    const expired = payload("exec-e");
+    const entryE = await deliver(spec, null, "web-anon", expired);
+    expect(listPendingApprovalsForPeer(null, "web-anon")).toHaveLength(1);
+    await finalize(spec, null, entryE, "expired");
+    expect(listPendingApprovalsForPeer(null, "web-anon")).toEqual([]);
+  });
+
+  it("updateEntry erases ONLY its own account's entry (same id on A and B is independent)", async () => {
+    const transportA = new WebChannelTransport();
+    const transportB = new WebChannelTransport();
+    vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
+    vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue(true);
+    vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
+    vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
+    const byAccount: Record<string, WebChannelTransport> = { a: transportA, b: transportB };
+    const spec = createClawApprovalNativeRuntimeSpec(
+      new WebChannelTransport(),
+      (accountId) => byAccount[accountId ?? "default"],
+    );
+
+    // The SAME approval id is delivered on account a AND account b (the F3
+    // account-less fan-out models exactly this), to the same peer.
+    const p = payload("exec-shared");
+    const entryA = await deliver(spec, "a", "alice", p);
+    await deliver(spec, "b", "alice", p);
+    expect(listPendingApprovalsForPeer("a", "alice")).toEqual([p]);
+    expect(listPendingApprovalsForPeer("b", "alice")).toEqual([p]);
+
+    // Finalize on account A must NOT erase account B's still-pending entry.
+    await finalize(spec, "a", entryA, "resolved");
+    expect(listPendingApprovalsForPeer("a", "alice")).toEqual([]);
+    expect(listPendingApprovalsForPeer("b", "alice")).toEqual([p]);
+  });
+
+  it("listPendingApprovalsForPeer filters by account AND sessionKey; unknown peer ⇒ []", () => {
+    const now = Date.now();
+    __pendingApprovalsTestHook.record("a", payload("id-a-alice"), "alice", now);
+    __pendingApprovalsTestHook.record("a", payload("id-a-bob"), "bob", now);
+    __pendingApprovalsTestHook.record("b", payload("id-b-alice"), "alice", now);
+
+    expect(listPendingApprovalsForPeer("a", "alice").map((p) => p.id)).toEqual(["id-a-alice"]);
+    expect(listPendingApprovalsForPeer("a", "bob").map((p) => p.id)).toEqual(["id-a-bob"]);
+    expect(listPendingApprovalsForPeer("b", "alice").map((p) => p.id)).toEqual(["id-b-alice"]);
+    // Wrong account for a real peer, and an entirely unknown peer, both empty.
+    expect(listPendingApprovalsForPeer("b", "bob")).toEqual([]);
+    expect(listPendingApprovalsForPeer("a", "nobody")).toEqual([]);
+  });
+
+  it("listPendingApprovalsForPeer prunes past-expiresAtMs and stale no-expiry entries, keeps fresh ones", () => {
+    const now = Date.now();
+    // Past expiry → pruned even though its deliveredAt is recent.
+    __pendingApprovalsTestHook.record("a", payload("expired", now - 1_000), "alice", now);
+    // No expiry, delivered longer ago than the max age → pruned.
+    __pendingApprovalsTestHook.record(
+      "a",
+      payload("stale-no-expiry"),
+      "alice",
+      now - PENDING_APPROVAL_MAX_AGE_MS - 1_000,
+    );
+    // No expiry, delivered just now → kept.
+    __pendingApprovalsTestHook.record("a", payload("fresh-no-expiry"), "alice", now);
+    // Future expiry → kept.
+    __pendingApprovalsTestHook.record("a", payload("future", now + 60_000), "alice", now);
+
+    expect(listPendingApprovalsForPeer("a", "alice").map((p) => p.id).sort()).toEqual([
+      "fresh-no-expiry",
+      "future",
+    ]);
+    // Prune is destructive: the pruned entries are gone from the store entirely.
+    expect(__pendingApprovalsTestHook.size()).toBe(2);
+  });
+
+  it("caps the store, evicting the oldest and retaining the newest", () => {
+    const now = Date.now();
+    for (let i = 0; i < PENDING_APPROVAL_CAP + 1; i++) {
+      __pendingApprovalsTestHook.record("a", payload(`id-${i}`), "alice", now);
+    }
+    // Size is bounded at the cap; the very first (oldest) entry was evicted and
+    // the last (newest) retained.
+    expect(__pendingApprovalsTestHook.size()).toBe(PENDING_APPROVAL_CAP);
+    const ids = new Set(listPendingApprovalsForPeer("a", "alice").map((p) => p.id));
+    expect(ids.has("id-0")).toBe(false);
+    expect(ids.has(`id-${PENDING_APPROVAL_CAP}`)).toBe(true);
   });
 });

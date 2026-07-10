@@ -42,6 +42,18 @@ export type ApprovalOption = {
  * A pending (or just-resolved) native approval prompt. `resolvedDecision` is set
  * once `approval_resolved` arrives (or the client optimistically records a
  * click), at which point the UI should disable the buttons.
+ *
+ * `"unknown"` (#15) is a resolution SENTINEL: the approval was decided or expired
+ * while this device wasn't looking (a register-time `approval_snapshot` no longer
+ * lists it), so the card is no longer actionable but the actual outcome is not
+ * known. A view should render it as a neutral "resolved elsewhere" state.
+ *
+ * `resolutionConfirmed` distinguishes a SERVER-confirmed resolution (an
+ * `approval_resolved` frame, or a snapshot marking the card resolved) from
+ * `decide()`'s OPTIMISTIC local set. It stays falsy for an optimistic decision
+ * so the snapshot reconciler can detect a lost decision frame (Leg C) and
+ * re-send it. It is internal-ish plumbing; the demo widget still keys its UI
+ * purely off `resolvedDecision !== undefined`.
  */
 export type ApprovalRequest = {
   id: string;
@@ -51,7 +63,8 @@ export type ApprovalRequest = {
   prompt: string;
   options: ApprovalOption[];
   expiresAtMs?: number;
-  resolvedDecision?: ApprovalDecision;
+  resolvedDecision?: ApprovalDecision | "unknown";
+  resolutionConfirmed?: boolean;
 };
 
 /**
@@ -178,6 +191,22 @@ export type OutboundWsMessage =
       expiresAtMs?: number;
     }
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
+  /**
+   * Authoritative pending-approval snapshot (#15). Emitted on every successful
+   * register (NATS path) carrying the peer's COMPLETE still-pending set for the
+   * account. The client reconciles its approval state against it: rehydrate lost
+   * cards, retire cards resolved elsewhere, and re-send a lost decision. An
+   * empty `approvals` array is meaningful (nothing pending → retire stale cards).
+   */
+  | { type: "approval_snapshot"; approvals: Array<{
+      id: string;
+      kind: "exec" | "plugin";
+      title: string;
+      description?: string;
+      prompt: string;
+      options: ApprovalOption[];
+      expiresAtMs?: number;
+    }> }
   /** Native typing affordance; see `WebChannelState.isTyping`. */
   | { type: "typing" }
   /**

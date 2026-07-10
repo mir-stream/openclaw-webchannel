@@ -99,7 +99,18 @@ export async function createWidget(
         el("div", { style: "font-weight:600;font-size:13px;margin-bottom:4px" }, [a.title || "Approval required"]),
         el("div", { style: "font-size:12px;color:var(--muted);margin-bottom:8px;white-space:pre-wrap" }, [a.prompt || a.description || ""]),
         el("div", { style: "display:flex;gap:6px;flex-wrap:wrap" }, buttons),
-        ...(resolved ? [el("div", { style: "font-size:11px;color:var(--good);margin-top:6px" }, [`→ ${a.resolvedDecision}`])] : []),
+        ...(resolved
+          ? [
+              el("div", { style: "font-size:11px;color:var(--good);margin-top:6px" }, [
+                // #15: `"unknown"` means the approval was resolved on another
+                // device / while we were away — outcome not known here. Render a
+                // neutral label rather than the literal sentinel.
+                a.resolvedDecision === "unknown"
+                  ? "→ resolved (elsewhere)"
+                  : `→ ${a.resolvedDecision}`,
+              ]),
+            ]
+          : []),
       ],
     );
   }

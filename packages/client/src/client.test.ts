@@ -217,6 +217,25 @@ describe("WebChannelClient — approvals", () => {
 
     sock.fireMessage({ type: "approval_resolved", id: "ap1", decision: "deny" });
     expect(client.getState().approvals[0].resolvedDecision).toBe("deny");
+    // #15: a server resolution is marked confirmed.
+    expect(client.getState().approvals[0].resolutionConfirmed).toBe(true);
+  });
+
+  it("#15 upsert-preserve: a re-delivered approval_request keeps a locally-set resolution (no button resurrection)", async () => {
+    const { client, sock } = await openClient();
+
+    sock.fireMessage(reqFrame("ap1", "first"));
+    client.decide("ap1", "allow-once"); // optimistic local resolution
+    expect(client.getState().approvals[0].resolvedDecision).toBe("allow-once");
+
+    // A re-delivered approval_request (reconnect / retry) must NOT clobber the
+    // resolution back to actionable.
+    sock.fireMessage(reqFrame("ap1", "updated"));
+    const a = client.getState().approvals[0];
+    expect(a.resolvedDecision).toBe("allow-once");
+    // The refreshed payload still lands (title updated) — only the resolution is
+    // preserved, not the whole stale entry.
+    expect(a.title).toBe("updated");
   });
 });
 

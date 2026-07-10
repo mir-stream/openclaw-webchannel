@@ -381,6 +381,53 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     client.disconnect();
   });
 
+  it("#15: buffers an approval_snapshot that beats the key unwrap and delivers it once K is set", async () => {
+    // The register-time `approval_snapshot` rides the SAME pre-key buffer path as
+    // the history snapshot (this is the COMMON register ordering, not an edge):
+    // it travels `.out` while the wrapped key travels the register reply.
+    const K = new Uint8Array(randomBytes(32));
+    const { client, deviceKP } = await makeClient();
+    let releaseRegister = () => {};
+    const gate = new Promise<void>((r) => { releaseRegister = r; });
+
+    const received: unknown[] = [];
+    client.onMessage((m) => received.push(m));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    server.handler = registerAgentHandler(
+      PEER,
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes),
+      gate,
+    );
+    await settle(4); // connected, .out subscribed, register in-flight (gated)
+
+    const snapshot = {
+      type: "approval_snapshot",
+      approvals: [
+        {
+          id: "exec-1",
+          kind: "exec",
+          title: "Run",
+          prompt: "rm -rf /tmp/cache",
+          options: [{ decision: "allow-once", label: "Allow", style: "success" }],
+          expiresAtMs: 1_000,
+        },
+      ],
+    };
+    server.deliverToClient(
+      outboundSubject(TENANT, AGENT, PEER),
+      sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, K, snapshot),
+    );
+    await settle(2);
+    expect(received).toHaveLength(0); // no key yet — buffered, never plaintext-processed
+
+    releaseRegister();
+    await settle();
+    expect(received).toEqual([snapshot]); // drained right after unwrap
+
+    client.disconnect();
+  });
+
   it("fail-closed terminal: register reply without wrappedConversationKey → onError, no handshake fallback", async () => {
     const { client } = await makeClient();
     const errors: Error[] = [];

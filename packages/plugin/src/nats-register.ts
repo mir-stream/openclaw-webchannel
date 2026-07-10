@@ -91,6 +91,16 @@ export type RegisterHandlerDeps = {
    * needs the gateway `api`; kept out of this pure handler.
    */
   sendHistorySnapshot: (peerId: string) => void;
+  /**
+   * Fire the authoritative pending-approval snapshot for a just-registered peer
+   * (#15). Injected because it reads the plugin's pending-approval store and
+   * publishes on the account's channel; kept out of this pure handler. Called on
+   * EVERY successful register (an empty pending set is a meaningful signal — it
+   * retires cards a client kept actionable after a missed `approval_resolved`).
+   * The read and the publish MUST be synchronous in one event-loop turn (see the
+   * wiring in index-nats.ts and APPROVAL_REHYDRATION_PLAN §3.2/§3.4).
+   */
+  sendApprovalSnapshot: (peerId: string) => void;
   logger?: { error?: (msg: string) => void };
 };
 
@@ -271,6 +281,11 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     // absorbs duplicates. K is established above, and the client subscribed `.out`
     // before registering, so nothing is lost.
     deps.sendHistorySnapshot(peerId);
+
+    // #15: authoritative pending-approval snapshot, right after history and in
+    // the SAME success block (so a throw still replies REGISTER_FAILED). Always
+    // sent — an empty set is the reconciliation signal that retires stale cards.
+    deps.sendApprovalSnapshot(peerId);
 
     reply(JSON.stringify({ peerId, registered: true, wrappedConversationKey }));
   } catch (err) {

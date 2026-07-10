@@ -79,6 +79,16 @@ export type OutboundWsMessage =
   | ({ type: "approval_request" } & ApprovalRequestPayload)
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
   /**
+   * Authoritative pending-approval snapshot (#15). Emitted on every successful
+   * register alongside the history snapshot, carrying the peer's COMPLETE set of
+   * still-pending approvals for that account. An empty `approvals` array is a
+   * meaningful signal — it tells a reconnecting client that nothing is pending,
+   * so a card left actionable by a missed `approval_resolved` is retired. The
+   * client reconciles its approval state against this set (see the client
+   * wrapper's `approval_snapshot` handler).
+   */
+  | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[] }
+  /**
    * Native "agent is typing" affordance. The server pushes exactly one of these
    * at the start of a turn; the client flips `isTyping:true` and lets the first
    * `progress` / `agent_message` (or `approval_*`) frame clear it automatically.
@@ -691,6 +701,27 @@ export class WebChannelTransport {
       id,
       decision,
     };
+    const ws = this.openSocket(sessionKey) ?? this.soleOpenSocket();
+    if (ws) {
+      return this.safeSend(ws, frame);
+    }
+    return false;
+  }
+
+  /**
+   * Push the authoritative pending-approval snapshot for `sessionKey` (#15).
+   * Present on the legacy dev-only WS transport purely for surface parity with
+   * `NatsChannel` — the legacy path has no stateless register hop, so it never
+   * emits this at register time (see APPROVAL_REHYDRATION_PLAN §3.2/§3.6). Falls
+   * back to the single open socket under the same one-connection rule as the
+   * other approval sends. An empty `approvals` array IS delivered (it is the
+   * reconciliation signal); the send only no-ops when no socket is open.
+   */
+  sendApprovalSnapshot(
+    sessionKey: string,
+    approvals: ApprovalRequestPayload[],
+  ): boolean {
+    const frame: OutboundWsMessage = { type: "approval_snapshot", approvals };
     const ws = this.openSocket(sessionKey) ?? this.soleOpenSocket();
     if (ws) {
       return this.safeSend(ws, frame);
