@@ -19,6 +19,7 @@
 import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/client/src/index.js";
 import type { WebChannelState, ApprovalRequest } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
+import { renderMarkdown } from "./markdown.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
   connecting: "connecting…",
@@ -170,21 +171,27 @@ export async function createWidget(
       sendBtn.textContent = inFlight ? "Stop" : "Send";
     }
 
-    const bubbles = state.messages.map((m) =>
-      el(
+    const bubbles = state.messages.map((m) => {
+      // User bubbles stay plain-text (pre-wrap keeps their line breaks). Agent
+      // bubbles — including `working` streaming drafts — render markdown to DOM;
+      // the renderer handles line breaks itself, so no pre-wrap (it'd double up).
+      const isUser = m.role === "user";
+      const child: Node | string = isUser ? m.text : renderMarkdown(m.text);
+      return el(
         "div",
         {
           style:
-            "align-self:" + (m.role === "user" ? "flex-end" : "flex-start") + ";" +
-            "max-width:85%;padding:8px 11px;border-radius:10px;font-size:13px;white-space:pre-wrap;" +
-            (m.role === "user"
+            "align-self:" + (isUser ? "flex-end" : "flex-start") + ";" +
+            "max-width:85%;padding:8px 11px;border-radius:10px;font-size:13px;" +
+            (isUser ? "white-space:pre-wrap;" : "") +
+            (isUser
               ? "background:var(--accent);color:#fff"
               : "background:#21262d;border:1px solid var(--border)") +
             (m.working ? ";opacity:.7;font-style:italic" : ""),
         },
-        [m.text],
-      ),
-    );
+        [child],
+      );
+    });
     if (state.isTyping) {
       bubbles.push(
         el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, ["agent is typing…"]),
