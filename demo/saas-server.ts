@@ -43,6 +43,7 @@
  */
 
 import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../packages/saas/src/device-flow-enrollment.js";
+import { MemoryAgentKeyRegistry } from "../packages/saas/src/agent-key-registry.js";
 import { loadOrCreateTrustChain } from "../packages/saas/src/persistent-trust-chain.js";
 import { generateRsaKeypair } from "../packages/saas/src/setup-trust-chain.js";
 import type { JwkRsaPublicKey } from "../packages/saas/src/types.js";
@@ -53,7 +54,7 @@ import {
   sha256hex,
   type DemoUser,
 } from "../packages/saas/src/demo-users.js";
-import { mintNatsUserCreds, type NatsUserRole } from "../packages/saas/src/nats-user-creds.js";
+import { mintNatsUserCreds, issueBrowserCredentials, type NatsUserRole } from "../packages/saas/src/nats-user-creds.js";
 import { assertValidSubjectToken } from "../packages/saas/src/subject-token.js";
 import type { EnrollmentRequest, PollRequest } from "../packages/saas/src/device-flow-types.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -263,6 +264,10 @@ async function rotateSigningKey(evictPrevious: boolean): Promise<{ kid: string; 
 // ---------------------------------------------------------------------------
 
 const enrollmentStore = new MemoryEnrollmentStore();
+// F2: durable agent identity-key registry. Approval upserts (tenant, accountId) →
+// agentPublicKey here; /bootstrap reads it back to pin the attested agent key into
+// the browser response so the register-delivered K can be authenticated.
+const agentKeyRegistry = new MemoryAgentKeyRegistry();
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: privateChain,
   natsAccountConfig: natsConfig,
@@ -277,6 +282,7 @@ const enrollment = new DeviceFlowEnrollment({
   expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 2),
   store: enrollmentStore,
+  agentKeyRegistry,
 });
 
 // Live view of enrollment requests for the admin panel (the store has no
@@ -530,32 +536,34 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // ── /nats-user — session-gated NATS user creds (observer/browser). ────
+    // ── /nats-user — session-gated BROWSER NATS creds (per-peer scoped). ──
+    // SECURITY: this is a BROWSER-facing route, so it ALWAYS mints role:"browser"
+    // (pinned to `webchannel.{tenant}.*.{peerId}.>`). It routes through
+    // issueBrowserCredentials, which HARDCODES the browser role — a client cannot
+    // escalate to tenant-wide "agent"/"observer" creds via a request-body `role`
+    // (which would let it forge any peer's register reply / read every peer's
+    // frames). Operator-only observer/agent creds live behind the admin-gated
+    // POST /admin/nats-user route below.
     if (req.method === "POST" && path === "/nats-user") {
       const user = sessionUser(req);
       if (!user) return sendJson(res, { error: "not authenticated" }, 401);
       parseJsonBody(req, (body) => {
         if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
-        const { role, ttlSeconds } = body as { role?: NatsUserRole; ttlSeconds?: number };
+        const { ttlSeconds } = body as { ttlSeconds?: number };
         // Optional short lifetime (scene ⑤): a bounded, positive TTL yields an
         // expiring credential; anything else mints a normal non-expiring one.
         const ttl = typeof ttlSeconds === "number" && ttlSeconds > 0 && ttlSeconds <= 3600 ? ttlSeconds : undefined;
-        // Role → scope: "observer" (wiretap) is tenant-wide sub-only; "agent" is
-        // tenant-wide; "browser" (default) is pinned to THIS session's peerId
-        // (user.uuid — the authenticated subject, never client input) so a browser
-        // cannot forge another peer's register reply or tear down its subject.
-        const resolvedRole: NatsUserRole =
-          role === "agent" ? "agent" : role === "observer" ? "observer" : "browser";
-        mintNatsUserCreds({
+        // peerId is the authenticated subject (user.uuid), NEVER client input, so a
+        // browser cannot forge another peer's register reply or tear down its subject.
+        issueBrowserCredentials({
           accountSeed: privateChain.natsAccountSeed,
           tenant: DEMO_TENANT,
-          role: resolvedRole,
-          ...(resolvedRole === "browser" ? { peerId: user.uuid } : {}),
+          peerId: user.uuid,
           issuerAccountId: natsIssuerAccountId,
-          ttlSeconds: ttl,
+          ...(ttl ? { ttlSeconds: ttl } : {}),
         })
           .then((creds) => {
-            console.log(`[nats-user] minted ${role ?? "browser"} creds for ${user.username}${ttl ? ` (ttl=${ttl}s)` : ""}`);
+            console.log(`[nats-user] minted browser creds for ${user.username}${ttl ? ` (ttl=${ttl}s)` : ""}`);
             sendJson(res, { ...creds, natsUrl: NATS_URL });
           })
           .catch((err) => {
@@ -599,11 +607,26 @@ const server = createServer(async (req, res) => {
           return sendJson(res, { error: `Invalid claims: ${(err as Error).message}` }, 400);
         }
         signBootstrapJwt(claims as unknown as Record<string, unknown>)
-          .then((jwt) => {
-            console.log(`[bootstrap] issued JWT for ${user.username} peerId=${user.uuid} account=${accountId}`);
+          .then(async (jwt) => {
+            // F2: deliver the SaaS-attested agent identity public key so the
+            // browser can pin it and authenticate the register-delivered K. Keyed
+            // by (tenant, accountId) — the same account the browser bootstraps for.
+            // Omitted when the account has no enrolled agent key yet (e.g. an
+            // auto/handshake account); the client only requires it on the
+            // register-hop path.
+            const agentPublicKey = await agentKeyRegistry.get(DEMO_TENANT, accountId);
+            console.log(
+              `[bootstrap] issued JWT for ${user.username} peerId=${user.uuid} account=${accountId}` +
+                (agentPublicKey ? " (+agentPublicKey pin)" : ""),
+            );
             // The client derives the register subject from tenant/accountId/peerId
             // and dials the shared relay — no gateway URL travels in the response.
-            sendJson(res, { jwt, peerId: user.uuid, natsUrl: NATS_URL });
+            sendJson(res, {
+              jwt,
+              peerId: user.uuid,
+              natsUrl: NATS_URL,
+              ...(agentPublicKey ? { agentPublicKey } : {}),
+            });
           })
           .catch((err) => {
             console.error("[bootstrap] Error:", err);
@@ -773,6 +796,39 @@ const server = createServer(async (req, res) => {
             })
             .catch((err) => {
               console.error("[chaos/nats-user] Error:", err);
+              sendJson(res, { error: "Internal server error" }, 500);
+            });
+        });
+        return;
+      }
+
+      // POST /admin/nats-user — OPERATOR-gated observer/agent creds for THIS demo's
+      // tenant. The browser-facing /nats-user only ever mints per-peer browser creds
+      // (no role escalation); the tenant-wide "observer" (wiretap read) and "agent"
+      // (tenant-wide pub+sub) roles are minted ONLY here, behind the admin session.
+      // Body { role, ttlSeconds? }. Used by the wiretap pane + the chaos tamper scene.
+      if (req.method === "POST" && path === "/admin/nats-user") {
+        parseJsonBody(req, (body) => {
+          if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
+          const { role, ttlSeconds } = body as { role?: NatsUserRole; ttlSeconds?: number };
+          const ttl = typeof ttlSeconds === "number" && ttlSeconds > 0 && ttlSeconds <= 3600 ? ttlSeconds : undefined;
+          const resolvedRole: NatsUserRole =
+            role === "agent" ? "agent" : role === "observer" ? "observer" : "browser";
+          mintNatsUserCreds({
+            accountSeed: privateChain.natsAccountSeed,
+            tenant: DEMO_TENANT,
+            role: resolvedRole,
+            // A "browser" mint here (rare) stays pinned to the admin's own subject.
+            ...(resolvedRole === "browser" ? { peerId: user.uuid } : {}),
+            issuerAccountId: natsIssuerAccountId,
+            ttlSeconds: ttl,
+          })
+            .then((creds) => {
+              console.log(`[admin/nats-user] minted ${resolvedRole} creds for ${user.username}${ttl ? ` (ttl=${ttl}s)` : ""}`);
+              sendJson(res, { ...creds, natsUrl: NATS_URL });
+            })
+            .catch((err) => {
+              console.error("[admin/nats-user] Error:", err);
               sendJson(res, { error: "Internal server error" }, 500);
             });
         });

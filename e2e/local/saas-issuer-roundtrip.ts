@@ -63,9 +63,17 @@ if (!bootstrapRes.ok) {
   console.error("[FAIL] bootstrap-server returned", bootstrapRes.status, await bootstrapRes.text());
   process.exit(5);
 }
-const { jwt, peerId } = (await bootstrapRes.json()) as { jwt: string; peerId: string };
+const { jwt, peerId, agentPublicKey } = (await bootstrapRes.json()) as {
+  jwt: string;
+  peerId: string;
+  agentPublicKey?: string;
+};
 if (!jwt || !peerId) {
   console.error("[FAIL] bootstrap-server response missing jwt/peerId");
+  process.exit(5);
+}
+if (!agentPublicKey) {
+  console.error("[FAIL] bootstrap-server response missing agentPublicKey (F2 register-hop pin)");
   process.exit(5);
 }
 
@@ -92,6 +100,8 @@ const client = new WebChannelNatsClient({
     devicePrivateKey: ed25519.privateKey,
     // Phase 6: register-delivered conversation key (no handshake).
     deviceX25519PrivateKey: x25519.privateKey,
+    // F2: pin the SaaS-delivered agent identity key to authenticate K.
+    pinnedAgentPublicKey: agentPublicKey,
   },
 });
 

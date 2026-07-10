@@ -78,7 +78,15 @@ export function parseKeyExchange(payload: Buffer | Uint8Array): Uint8Array | nul
     if (frame.type !== "key_exchange" || typeof frame.pubKey !== "string" || !frame.pubKey) {
       return null;
     }
-    return new Uint8Array(Buffer.from(frame.pubKey, "base64url"));
+    const raw = new Uint8Array(Buffer.from(frame.pubKey, "base64url"));
+    // An X25519 public key is exactly 32 bytes. A non-32-byte key would throw
+    // synchronously deep in `deriveSharedSecret` → `createPublicKey` (the SPKI
+    // header hard-codes a 32-byte key), so reject it HERE — a malformed key is
+    // an ignorable frame, same as bad JSON.
+    if (raw.length !== 32) {
+      return null;
+    }
+    return raw;
   } catch {
     return null;
   }

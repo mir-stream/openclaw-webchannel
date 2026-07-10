@@ -337,11 +337,11 @@ export class NatsTransport extends EventEmitter {
         // PONG is the server's reply to our PING, confirming the connection.
         if (!this._connected) {
           this._connected = true;
-          this.emit("connect");
+          this.safeEmit("connect");
           onFirstPong?.();
         } else {
           // Subsequent PONGs are heartbeat replies.
-          this.emit("pong");
+          this.safeEmit("pong");
         }
         continue;
       }
@@ -380,7 +380,7 @@ export class NatsTransport extends EventEmitter {
         this.buffer = this.buffer.slice(byteCount + 2); // consume payload + \r\n
 
         const msg: NatsMessage = { subject, replyTo, payload };
-        this.emit("message", msg);
+        this.safeEmit("message", msg);
         continue;
       }
 
@@ -674,6 +674,27 @@ export class NatsTransport extends EventEmitter {
       // Log instead of letting Node rethrow as an uncaught exception.
       console.error(
         `[NatsTransport] unhandled connection error (no "error" listener attached): ${err.message}`,
+      );
+    }
+  }
+
+  /**
+   * Emit an event without letting a throwing listener kill the read pump.
+   *
+   * `drainBuffer` runs synchronously inside the `ws.on("message")` callback, so
+   * an uncaught throw from ANY listener (e.g. a malformed-frame crypto path in
+   * the channel's `"message"` handler) would propagate out of the socket
+   * callback as an uncaught exception → process death for every account and
+   * user. This is the true root cause of the malformed-handshake crash: a single
+   * peer's bad frame must never be able to take down the whole gateway. Contain
+   * every listener throw here (log + continue); a bad frame degrades to a warn.
+   */
+  private safeEmit(event: string, ...args: unknown[]): void {
+    try {
+      this.emit(event, ...args);
+    } catch (err) {
+      console.error(
+        `[NatsTransport] listener for "${event}" threw (frame dropped, read pump continues): ${String(err)}`,
       );
     }
   }

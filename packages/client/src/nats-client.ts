@@ -30,7 +30,7 @@ import {
   type BrowserKeyPair,
 } from "./e2e-crypto-browser.js";
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
-import { registerWithPop } from "./pop-register.js";
+import { registerWithPop, isTerminalRegisterError } from "./pop-register.js";
 
 // Handshake retry (core NATS has no retention — the one-shot key_exchange can be
 // dropped if the agent's per-peer SUB is not yet server-active when we publish,
@@ -116,6 +116,16 @@ export type NatsClientOptions = {
      * (old-plugin compat; the auto-admission path never registers anyway).
      */
     deviceX25519PrivateKey?: CryptoKey;
+    /**
+     * F2 — the SaaS-PINNED agent X25519 identity public key (base64url, 32 bytes),
+     * taken from the first-party HTTPS bootstrap response. REQUIRED whenever
+     * `deviceX25519PrivateKey` is present: the register-delivered K is unwrapped
+     * by deriving the key SOLELY from THIS pinned value, never from any NATS
+     * frame — so a relay's injected K′ (wrapped under a relay-chosen key) fails
+     * authentication. Absence on the register-delivered path is fail-closed
+     * terminal (the browser cannot authenticate K).
+     */
+    pinnedAgentPublicKey?: string;
   };
   /**
    * Optional NATS-layer NKEY authentication for a JWT-auth nats-server.
@@ -622,6 +632,20 @@ export class NatsClient {
   }
 
   /**
+   * F5: drop the current socket and schedule a reconnect WITHOUT entering the
+   * terminal state — a SOFT reconnect. The register-hop owner
+   * (`WebChannelNatsClient`) calls this to recover from a TRANSIENT registration
+   * failure: the socket may still be healthy (agent offline, relay up) so
+   * `onclose` never fires, and just returning would sit connected-but-keyless
+   * forever. Redialing makes a fresh `onConnected` re-run registration. No-op
+   * once terminal.
+   */
+  reconnect(): void {
+    if (this.terminal) return;
+    this.forceReconnect();
+  }
+
+  /**
    * CL2: enter the terminal state. Stops all reconnect activity, tears the
    * socket down, and notifies error listeners. No further redial happens until a
    * brand-new client is constructed.
@@ -999,8 +1023,33 @@ export class WebChannelNatsClient {
         });
       } catch (err) {
         console.error("[nats-client] PoP registration failed:", err);
-        this.notifyErrorListeners(err as Error);
-        this.client.disconnect();
+        // Epoch guard (mirrors the success path below): a reconnect during the
+        // register round-trip may have already spawned a newer onConnected, so a
+        // stale flow must not tear down or redial the live connection.
+        if (this.connectionEpoch !== epoch) return;
+        if (isTerminalRegisterError(err)) {
+          // Rejected proof/token or a non-transient server failure — the SAME
+          // bootstrap credentials will never be accepted. Terminal: surface the
+          // (original) error and tear the socket fully down. disconnect() clears
+          // the reconnect timer and nulls onclose, so nothing redials; only a
+          // fresh client (new bootstrap JWT) can recover.
+          this.notifyErrorListeners(err as Error);
+          this.client.disconnect();
+          return;
+        }
+        // TRANSIENT (B4): request timeout, 503, or agent-offline retry-
+        // exhaustion. The credentials are fine — the agent/relay was momentarily
+        // unreachable. Critically, registerWithPop can exhaust its bounded
+        // retries while the WS stays UP (agent offline, relay healthy), so
+        // onclose never fires; merely returning here would leave the client
+        // connected-but-keyless FOREVER with messages queueing. Actively redial
+        // (soft reconnect — reconnection stays armed) so a fresh onConnected
+        // re-attempts registration; this loops with backoff until the agent
+        // returns.
+        console.warn(
+          "[nats-client] registration failed transiently — redialing to re-attempt registration",
+        );
+        this.client.reconnect();
         return;
       }
       // The socket may have dropped during the register round-trip; a reconnect
@@ -1023,11 +1072,28 @@ export class WebChannelNatsClient {
           this.client.disconnect();
           return;
         }
+        // F2 fail-closed: the register-delivered K is authenticated by deriving
+        // the unwrap key from the SaaS-pinned agent identity public key. Without
+        // it the browser has no way to distinguish the genuine agent's K from a
+        // relay-injected K′, so a missing pin is TERMINAL (never derive from the
+        // wire). The pin arrives with the first-party HTTPS bootstrap response.
+        if (!registration.pinnedAgentPublicKey) {
+          const err = new Error(
+            "[nats-client] register-delivered key requires a pinned agent public key " +
+              "(bootstrap response carried no agentPublicKey) — refusing to unwrap K " +
+              "against an unauthenticated wire key",
+          );
+          this.notifyErrorListeners(err);
+          this.client.disconnect();
+          return;
+        }
         let key: Uint8Array;
         try {
           key = await unwrapConversationKey(
             wrapped,
             registration.deviceX25519PrivateKey!,
+            registration.pinnedAgentPublicKey,
+            peerId,
           );
         } catch (err) {
           console.error("[nats-client] conversation-key unwrap failed:", err);

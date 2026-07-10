@@ -192,12 +192,16 @@ export async function createWidget(
     if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
       throw new Error(`nats-user failed (HTTP ${creds.status})`);
     }
-    const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string }>(
+    const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string; agentPublicKey?: string }>(
       "/bootstrap",
       { method: "POST", body: { accountId, deviceX25519PublicKey, devicePopPublicKey } },
     );
     if (!boot.ok || !boot.data.jwt || !boot.data.peerId) {
       throw new Error(`bootstrap failed (HTTP ${boot.status}) ${JSON.stringify(boot.data)}`);
+    }
+    // F2: the register hop unwraps K against this SaaS-pinned agent key.
+    if (!boot.data.agentPublicKey) {
+      throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
     }
 
     const natsUrl = boot.data.natsUrl ?? creds.data.natsUrl ?? rv.natsUrl;
@@ -215,6 +219,8 @@ export async function createWidget(
         devicePrivateKey: ed25519.privateKey,
         // Phase 6: register-delivered conversation key (no handshake).
         deviceX25519PrivateKey: x25519.privateKey,
+        // F2: pin the SaaS-attested agent key for K authentication.
+        pinnedAgentPublicKey: boot.data.agentPublicKey,
       },
     });
     client.subscribe(render);

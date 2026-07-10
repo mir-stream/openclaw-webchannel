@@ -534,6 +534,77 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
     errSpy.mockRestore();
   });
 
+  // ── F1: a throwing listener must NEVER kill the read pump ──────────────────
+  // Root-cause guard for the malformed-handshake crash. drainBuffer runs
+  // synchronously inside ws.on("message"); an uncaught throw from ANY listener
+  // (e.g. a bad-frame crypto path in the channel's "message" handler) would
+  // propagate out of the socket callback as an uncaught exception → process
+  // death for every account/user. safeEmit contains it (log + continue).
+
+  it("a throwing 'message' listener does not stop the read pump (F1 crash guard)", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+
+    const cp = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n");
+    await cp;
+
+    const t2 = t.subscribe("webchannel.t.a.p.in");
+
+    // The sole listener throws on the FIRST message but records every call.
+    const seen: string[] = [];
+    t.on("message", (msg: NatsMessage) => {
+      const text = msg.payload.toString("utf8");
+      seen.push(text);
+      if (text === "boom") throw new Error("simulated malformed-frame throw");
+    });
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Two MSG frames arrive in a SINGLE server chunk → both are drained in the
+    // same synchronous while-loop. Without the guard the first frame's throw
+    // escapes drainBuffer and the second is never processed (and fireServerFrame
+    // itself throws). With safeEmit, the throw is caught and the loop continues.
+    expect(() =>
+      fakeWs.fireServerFrame(
+        `MSG webchannel.t.a.p.in ${t2} 4\r\nboom\r\n` +
+          `MSG webchannel.t.a.p.in ${t2} 2\r\nok\r\n`,
+      ),
+    ).not.toThrow();
+
+    // Both frames reached the listener — the read pump kept going past the throw.
+    expect(seen).toEqual(["boom", "ok"]);
+    // The listener throw was logged, not propagated.
+    expect(errSpy).toHaveBeenCalledWith(
+      expect.stringContaining('listener for "message" threw'),
+    );
+    errSpy.mockRestore();
+  });
+
+  it("a throwing 'connect' listener does not escape the read pump (F1 crash guard)", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+
+    // A "connect" listener that throws — emitted from drainBuffer inside the
+    // same ws.on("message") callback, so it must be guarded like "message".
+    t.on("connect", () => {
+      throw new Error("simulated connect-listener throw");
+    });
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cp = t.connect();
+    fakeWs.fireOpen();
+    // The PONG that flips _connected fires "connect" synchronously in drainBuffer.
+    expect(() => fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n")).not.toThrow();
+    await cp;
+
+    expect(t.connected).toBe(true);
+    expect(errSpy).toHaveBeenCalledWith(
+      expect.stringContaining('listener for "connect" threw'),
+    );
+    errSpy.mockRestore();
+  });
+
   it("post-handshake error IS delivered when an 'error' listener is attached", async () => {
     const { t, fakeWs } = makeTestTransport();
     teardown.push(t);
