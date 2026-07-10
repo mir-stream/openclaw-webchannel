@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { recent, pageBefore, resolveHistoryConfig, DEFAULT_HISTORY_CONFIG } from "./history.js";
+import {
+  recent,
+  pageBefore,
+  planHistoryFetch,
+  resolveHistoryConfig,
+  DEFAULT_HISTORY_CONFIG,
+} from "./history.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 /**
@@ -172,6 +178,18 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     { role: "user", content: [{ type: "text", text: "5" }], timestamp: 5000, __openclaw: { id: "m-5" } },
   ];
 
+  // A conversation long enough that a cursor can sit OUTSIDE the phase-1
+  // (`limit * 2`) window but INSIDE the phase-2 (`MAX_FETCH_WINDOW = 1000`)
+  // window — the case that the two-phase widening exists to serve.
+  function makeConversation(n: number): unknown[] {
+    return Array.from({ length: n }, (_, i) => ({
+      role: i % 2 === 0 ? "user" : "assistant",
+      content: [{ type: "text", text: String(i + 1) }],
+      timestamp: (i + 1) * 1000,
+      __openclaw: { id: `m-${i + 1}` },
+    }));
+  }
+
   it("returns messages strictly older than beforeId, never the cursor", async () => {
     const { api, getSessionMessages } = makeApi(FIXTURE);
     // limit=10 → fetchLimit=20 → window = last 20 = ALL 5 items.
@@ -186,32 +204,108 @@ describe("history — pageBefore (AC2 / AC4)", () => {
   });
 
   it("respects the requested page size (limit) cap", async () => {
-    const { api } = makeApi(FIXTURE);
-    // limit=2 → fetchLimit=4 → window = last 4 = [m-2..m-5].
-    // cursor=m-3 (in window at idx=1) → older slice = [m-2] (1 item).
-    // Then cap by limit=2 (we asked for 2 max) → still [m-2].
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-3", 2);
-    expect(out.map((m) => m.id)).toEqual(["m-2"]);
+    // 30 messages, limit=3, cursor m-20. Many older messages exist, but the
+    // page is capped at 3: [m-17, m-18, m-19]. (The cursor is outside the
+    // phase-1 window, so this also exercises the widen path.)
+    const { api } = makeApi(makeConversation(30));
+    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-20", 3);
+    expect(out.map((m) => m.id)).toEqual(["m-17", "m-18", "m-19"]);
   });
 
-  it("falls back to the oldest `limit` items when beforeId is outside the window", async () => {
-    // fetchLimit = limit*2 = 4. window = last 4 of FIXTURE = [m-2..m-5].
-    // The cursor "ghost" is not in the window, so the fallback runs:
-    // returns the OLDEST `limit` items the window has = slice(-2) of
-    // [m-2..m-5] = [m-4, m-5].
-    const { api } = makeApi(FIXTURE);
+  it("returns [] (and re-fetches at the max window) for a cursor nowhere in the store", async () => {
+    // A ghost cursor is in neither the phase-1 (limit*2=4) window nor the
+    // phase-2 (1000) window. The buggy old behavior handed back the newest
+    // `limit` items (which the client dedups → silent stop); the honest
+    // signal is an empty page. Both phases must have run.
+    const { api, getSessionMessages } = makeApi(FIXTURE);
     const out = await pageBefore(api, "agent:main:webchannel:web-anon", "ghost", 2);
-    expect(out.map((m) => m.id)).toEqual(["m-4", "m-5"]);
+    expect(out).toEqual([]);
+    expect(getSessionMessages).toHaveBeenCalledTimes(2);
+    expect(getSessionMessages.mock.calls[0][0].limit).toBe(4);
+    expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
   });
 
-  it("returns the oldest available items when cursor is past the fetched window", async () => {
-    // limit=2, fetchLimit=4. With the limit-respecting mock, window = last 4.
-    // Cursor m-1 is NOT in [m-2..m-5] (m-1 is older than the window).
-    // The fallback returns the OLDEST `limit` items available: slice(-2) of
-    // [m-2..m-5] = [m-4, m-5] — the user keeps making scroll progress.
-    const { api } = makeApi(FIXTURE);
+  it("finds a cursor beyond the phase-1 window via the phase-2 1000-fetch", async () => {
+    // 30-message conversation, limit=2 → phase-1 fetches the last 4
+    // (m-27..m-30). Cursor m-10 is older than that window, so phase 2
+    // re-fetches at limit 1000, finds m-10, and returns the 2 items strictly
+    // older: [m-8, m-9].
+    const { api, getSessionMessages } = makeApi(makeConversation(30));
+    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-10", 2);
+    expect(out.map((m) => m.id)).toEqual(["m-8", "m-9"]);
+    expect(getSessionMessages).toHaveBeenCalledTimes(2);
+    expect(getSessionMessages.mock.calls[0][0].limit).toBe(4);
+    expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
+  });
+
+  it("hits the store exactly once when a FULL page sits inside the phase-1 window", async () => {
+    // 30 messages, limit=2 → phase-1 fetches the last 4 (m-27..m-30). Cursor
+    // m-29 is at idx 2 (>= limit), so a full page of older messages is already
+    // in the window — return [m-27, m-28] with no wasteful 1000-fetch.
+    const { api, getSessionMessages } = makeApi(makeConversation(30));
+    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-29", 2);
+    expect(out.map((m) => m.id)).toEqual(["m-27", "m-28"]);
+    expect(getSessionMessages).toHaveBeenCalledTimes(1);
+    expect(getSessionMessages.mock.calls[0][0].limit).toBe(4);
+  });
+
+  it("widens to phase 2 when the cursor is found at the phase-1 window's LEFT edge", async () => {
+    // Regression guard for the "~2 pages then stops" bug: the cursor is FOUND
+    // in the small window but at its left edge (idx 0), so the older slice
+    // would be truncated by the window boundary, not the store. 30 messages,
+    // limit=2, cursor m-27 → phase-1 window = m-27..m-30 (idx 0). Must widen
+    // and return the real older page [m-25, m-26], not [].
+    const { api, getSessionMessages } = makeApi(makeConversation(30));
+    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-27", 2);
+    expect(out.map((m) => m.id)).toEqual(["m-25", "m-26"]);
+    expect(getSessionMessages).toHaveBeenCalledTimes(2);
+    expect(getSessionMessages.mock.calls[0][0].limit).toBe(4);
+    expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
+  });
+
+  it("clamps a large limit to the 1000 cap and never issues a phase-2 fetch", async () => {
+    // limit=600 → limit*2=1200, clamped to MAX_FETCH_WINDOW=1000. Phase 1
+    // already fetched the maximal window, so a cursor miss returns [] with no
+    // second call.
+    const { api, getSessionMessages } = makeApi(FIXTURE);
+    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "ghost", 600);
+    expect(out).toEqual([]);
+    expect(getSessionMessages).toHaveBeenCalledTimes(1);
+    expect(getSessionMessages.mock.calls[0][0].limit).toBe(1000);
+  });
+
+  it("serves a left-edge hit from the maximal phase-1 window without widening", async () => {
+    // limit=600 → phase-1 fetch is already clamped to 1000 (the max window).
+    // Cursor m-4 sits at idx 3 < limit, but there is no wider window to try, so
+    // the (truncated) older slice IS the genuine answer: [m-1, m-2, m-3], one
+    // call only.
+    const { api, getSessionMessages } = makeApi(FIXTURE);
+    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-4", 600);
+    expect(out.map((m) => m.id)).toEqual(["m-1", "m-2", "m-3"]);
+    expect(getSessionMessages).toHaveBeenCalledTimes(1);
+    expect(getSessionMessages.mock.calls[0][0].limit).toBe(1000);
+  });
+
+  it("returns [] when the cursor is the very oldest message (start of conversation)", async () => {
+    // limit=10 → phase-1 window = all of FIXTURE; cursor m-1 is found at idx 0.
+    // idx < limit, so we cannot trust the small window and MUST widen first;
+    // phase 2 also finds m-1 at idx 0 → nothing older → [] (confirmed wall).
+    const { api, getSessionMessages } = makeApi(FIXTURE);
+    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-1", 10);
+    expect(out).toEqual([]);
+    expect(getSessionMessages).toHaveBeenCalledTimes(2);
+    expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
+  });
+
+  it("returns [] when the cursor is the oldest message but sits OUTSIDE the phase-1 window", async () => {
+    // limit=2 → phase-1 window = last 4 (m-2..m-5); cursor m-1 misses. Phase 2
+    // finds m-1 at idx 0 → older slice empty → [] (genuine wall, not a silent
+    // stop). Two calls confirm the widening ran.
+    const { api, getSessionMessages } = makeApi(FIXTURE);
     const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-1", 2);
-    expect(out.map((m) => m.id)).toEqual(["m-4", "m-5"]);
+    expect(out).toEqual([]);
+    expect(getSessionMessages).toHaveBeenCalledTimes(2);
+    expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
   });
 
   it("scopes every call by sessionKey (no cross-peer leak) (AC4)", async () => {
@@ -234,6 +328,59 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-4", 10, logger);
     expect(out).toEqual([]);
     expect(logger.warn.mock.calls[0][0]).toMatch(/history\.pageBefore failed/);
+  });
+
+  it("catches a throw on the phase-2 fetch too (best-effort holds in both phases)", async () => {
+    // Phase 1 succeeds but the ghost cursor is not in the small window; the
+    // phase-2 1000-fetch then throws. Same warn + [] contract must apply.
+    const getSessionMessages = vi.fn(async (params: { limit?: number }) => {
+      if (params.limit === 1000) throw new Error("store unreachable mid-page");
+      const limit = typeof params.limit === "number" ? params.limit : undefined;
+      return { messages: typeof limit === "number" ? FIXTURE.slice(-limit) : FIXTURE };
+    });
+    const api = { runtime: { subagent: { getSessionMessages } } } as unknown as OpenClawPluginApi;
+    const logger = { warn: vi.fn() };
+    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "ghost", 2, logger);
+    expect(out).toEqual([]);
+    expect(getSessionMessages).toHaveBeenCalledTimes(2);
+    expect(logger.warn.mock.calls[0][0]).toMatch(/history\.pageBefore failed/);
+  });
+});
+
+describe("history — planHistoryFetch (load_history wire → fetch mapping)", () => {
+  // Pins the decision the live NATS load-history handler makes
+  // (index-nats.ts) — that path is a closure inside the channel setup and not
+  // otherwise reachable by a unit test. Regression guard for the bug where the
+  // whole request object was passed as `beforeId`.
+  it("maps a `before` cursor to a page fetch carrying the STRING id", () => {
+    expect(planHistoryFetch({ before: "m-9", limit: 25 }, 50)).toEqual({
+      kind: "page",
+      beforeId: "m-9",
+      limit: 25,
+    });
+  });
+
+  it("maps a request with no cursor to a recent (tail) fetch", () => {
+    expect(planHistoryFetch({ limit: 25 }, 50)).toEqual({ kind: "recent", limit: 25 });
+    expect(planHistoryFetch({}, 50)).toEqual({ kind: "recent", limit: 50 });
+  });
+
+  it("falls back to the page-size limit for NaN / non-finite / negative wire limits", () => {
+    // `NaN <= 0` is false, so these must be rejected here or they slip past
+    // pageBefore's own guard.
+    expect(planHistoryFetch({ before: "m-1", limit: NaN }, 50)).toEqual({
+      kind: "page",
+      beforeId: "m-1",
+      limit: 50,
+    });
+    expect(planHistoryFetch({ before: "m-1", limit: Infinity }, 50).limit).toBe(50);
+    expect(planHistoryFetch({ before: "m-1", limit: -5 }, 50).limit).toBe(50);
+    expect(planHistoryFetch({ before: "m-1", limit: 0 }, 50).limit).toBe(50);
+    expect(planHistoryFetch({ limit: "25" as unknown as number }, 50).limit).toBe(50);
+  });
+
+  it("floors a fractional wire limit (integer-only contract)", () => {
+    expect(planHistoryFetch({ before: "m-1", limit: 25.9 }, 50).limit).toBe(25);
   });
 });
 

@@ -38,7 +38,7 @@ import { PopChallengeStore } from "./src/pop-challenge.js";
 import { handleRegisterRequest } from "./src/nats-register.js";
 import { resolveAdmissionMode, admissionServingPlan } from "./src/nats-admission.js";
 import { isDmPostureOpen } from "./src/dm-allowlist.js";
-import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
+import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig, planHistoryFetch } from "./src/history.js";
 import { resolveWebchannelSessionRoute } from "./src/session-route.js";
 import type { WebChannelTransport } from "./src/transport.js";
 import type { NatsTransport } from "./src/nats-transport.js";
@@ -603,8 +603,13 @@ export default defineChannelPluginEntry({
           // Same forced key as the WRITE + snapshot sites — pagination reads
           // THIS user's session, so older pages never leak another user's turns.
           const route = resolveWebchannelSessionRoute(api, accountId, peerId);
+          // `planHistoryFetch` validates the wire `limit` (the NATS dispatch
+          // forwards it unvalidated) and picks paginate-vs-tail from `before`.
+          const plan = planHistoryFetch(request, historyConfig.pageSize);
           void runDetachedHistoryRead(() =>
-            historyPageBefore(api, route.sessionKey, request, historyConfig.pageSize, api.logger),
+            plan.kind === "page"
+              ? historyPageBefore(api, route.sessionKey, plan.beforeId, plan.limit, api.logger)
+              : historyRecent(api, route.sessionKey, plan.limit, api.logger),
           )
             .then((messages) => {
               channel.sendHistory(peerId, messages);
