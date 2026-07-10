@@ -12,7 +12,12 @@
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createAccount } from "@nats-io/nkeys";
-import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "./device-flow-enrollment.js";
+import {
+  DeviceFlowEnrollment,
+  MemoryEnrollmentStore,
+  UserCodeCollisionError,
+  type EnrollmentStore,
+} from "./device-flow-enrollment.js";
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import type { EnrollmentRequest, PollRequest, PendingEnrollment } from "./device-flow-types.js";
 
@@ -35,7 +40,7 @@ const mockNatsConfig: NatsAccountConfig = {
   accountPublicKey: "MOCK_ACCOUNT_PUBLIC_KEY",
 };
 
-const createEnrollment = () => {
+const createEnrollment = (store?: EnrollmentStore) => {
   return new DeviceFlowEnrollment({
     saasTrustChain: mockTrustChain,
     natsAccountConfig: mockNatsConfig,
@@ -45,6 +50,7 @@ const createEnrollment = () => {
     natsUrl: "wss://nats.saas.com",
     expirationSeconds: 600,
     pollIntervalSeconds: 5,
+    ...(store ? { store } : {}),
   });
 };
 
@@ -173,6 +179,74 @@ describe("DeviceFlowEnrollment", () => {
 
       it("rejects an empty string", async () => {
         await expectRejectedAndUnpersisted("");
+      });
+    });
+
+    // #8: a persistent store with UNIQUE(user_code) surfaces a rare collision as
+    // UserCodeCollisionError; enroll() re-mints and retries (bounded), and treats
+    // ONLY that error as retryable.
+    describe("user_code collision retry", () => {
+      // A store that delegates to a real MemoryEnrollmentStore but runs a hook on
+      // each save (which may throw), and records every attempted enrollment.
+      const trackingStore = (saveHook: (e: PendingEnrollment, attempt: number) => void) => {
+        const inner = new MemoryEnrollmentStore({ autoSweep: false });
+        const saveCalls: PendingEnrollment[] = [];
+        const store: EnrollmentStore = {
+          async saveEnrollment(e) {
+            saveCalls.push(e);
+            saveHook(e, saveCalls.length); // may throw
+            return inner.saveEnrollment(e);
+          },
+          getEnrollment: (d) => inner.getEnrollment(d),
+          getEnrollmentByUserCode: (u) => inner.getEnrollmentByUserCode(u),
+          updateEnrollment: (d, u) => inner.updateEnrollment(d, u),
+          deleteEnrollment: (d) => inner.deleteEnrollment(d),
+        };
+        return { store, saveCalls };
+      };
+
+      it("re-mints a fresh user_code and succeeds after one collision", async () => {
+        const { store, saveCalls } = trackingStore((_e, attempt) => {
+          if (attempt === 1) throw new UserCodeCollisionError("collide");
+        });
+        const response = await createEnrollment(store).enroll(validEnrollmentRequest);
+
+        expect(response.user_code).toMatch(/^[A-Z]{4}-[A-Z]{4}$/);
+        expect(saveCalls).toHaveLength(2);
+        // The retry used a DIFFERENT user_code (re-minted, not reused).
+        expect(saveCalls[1].user_code).not.toBe(saveCalls[0].user_code);
+      });
+
+      it("rejects with UserCodeCollisionError after exactly 5 attempts when it never clears", async () => {
+        const { store, saveCalls } = trackingStore(() => {
+          throw new UserCodeCollisionError("always");
+        });
+        await expect(createEnrollment(store).enroll(validEnrollmentRequest)).rejects.toBeInstanceOf(
+          UserCodeCollisionError,
+        );
+        expect(saveCalls).toHaveLength(5);
+      });
+
+      it("does NOT retry a non-collision store error — rethrows on the first attempt", async () => {
+        const { store, saveCalls } = trackingStore(() => {
+          throw new Error("store outage");
+        });
+        await expect(createEnrollment(store).enroll(validEnrollmentRequest)).rejects.toThrow(
+          "store outage",
+        );
+        expect(saveCalls).toHaveLength(1);
+      });
+
+      it("retries a duck-typed collision (plain Error with name = UserCodeCollisionError)", async () => {
+        const { store, saveCalls } = trackingStore((_e, attempt) => {
+          if (attempt === 1) {
+            const err = new Error("duplicate key");
+            err.name = "UserCodeCollisionError"; // a different class copy across pkg dup
+            throw err;
+          }
+        });
+        await createEnrollment(store).enroll(validEnrollmentRequest);
+        expect(saveCalls).toHaveLength(2);
       });
     });
   });
@@ -663,23 +737,50 @@ describe("DeviceFlowEnrollment", () => {
       expect(await store.getEnrollment("fresh")).not.toBeNull();
     });
 
-    it("sweep() does not orphan a newer enrollment that reuses a swept user_code", async () => {
+    // #8: saveEnrollment now REFUSES a user_code already held by a different live
+    // record (replaces the old silent last-writer-wins that orphaned the loser).
+    it("saveEnrollment throws UserCodeCollisionError on a live user_code collision", async () => {
+      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      const a = makePending({ device_code: "dev-a", user_code: "SAME-CODE" });
+      await store.saveEnrollment(a);
+
+      const b = makePending({ device_code: "dev-b", user_code: "SAME-CODE" });
+      await expect(store.saveEnrollment(b)).rejects.toBeInstanceOf(UserCodeCollisionError);
+
+      // The holder and its index entry are untouched; the loser was not stored.
+      expect((await store.getEnrollmentByUserCode("SAME-CODE"))?.device_code).toBe("dev-a");
+      expect(await store.getEnrollment("dev-b")).toBeNull();
+
+      // Re-saving the SAME device_code is idempotent (not a collision).
+      await expect(store.saveEnrollment(a)).resolves.toBeUndefined();
+
+      // Once the holder is deleted, the code is free to reuse.
+      await store.deleteEnrollment("dev-a");
+      await expect(store.saveEnrollment(b)).resolves.toBeUndefined();
+      expect((await store.getEnrollmentByUserCode("SAME-CODE"))?.device_code).toBe("dev-b");
+    });
+
+    // The sweep-does-not-orphan invariant, under the new no-collision semantics:
+    // a swept user_code is free to reuse, and a later sweep must not drop the
+    // reusing record's index entry.
+    it("a swept user_code is reusable and the reuse survives a later sweep", async () => {
       const store = new MemoryEnrollmentStore({ autoSweep: false });
       const old = makePending({
         device_code: "old",
         user_code: "SAME-CODE",
-        expiresAt: 100, // stale — eligible for eviction below
+        expiresAt: 100, // stale — evicted below (100 + 300_000 retention)
       });
       await store.saveEnrollment(old);
-      // A later enrollment collides on user_code: the index now points at
-      // "fresh". Sweeping "old" must NOT delete that index entry.
+      expect(store.sweep(901_001)).toBe(1); // evicts "old" and clears its index
+
+      // The code is free now, so a fresh enrollment may take it (no collision).
       const fresh = makePending({ device_code: "fresh", user_code: "SAME-CODE" });
       await store.saveEnrollment(fresh);
 
-      expect(store.sweep(601_000)).toBe(1); // evicts only "old"
-      expect(await store.getEnrollment("old")).toBeNull();
-      const byUserCode = await store.getEnrollmentByUserCode("SAME-CODE");
-      expect(byUserCode?.device_code).toBe("fresh");
+      // A later sweep while "fresh" is still within its window must NOT orphan
+      // fresh's index entry (its expiresAt 601_000 + retention → eligible >901_000).
+      expect(store.sweep(602_000)).toBe(0);
+      expect((await store.getEnrollmentByUserCode("SAME-CODE"))?.device_code).toBe("fresh");
     });
 
     it("close() is idempotent and stops the sweeper", () => {
@@ -714,6 +815,34 @@ describe("DeviceFlowEnrollment", () => {
 
       // With 1.2B possible combinations, 100 should be unique
       expect(codes.size).toBe(100);
+    });
+
+    // #8: user codes must be CSPRNG (crypto.getRandomValues), not Math.random,
+    // and rejection-sample away the modulo bias.
+    it("draws from crypto.getRandomValues and rejects bytes ≥ 252 (rejection sampling)", () => {
+      const spy = vi.spyOn(globalThis.crypto, "getRandomValues");
+      // First two bytes (252, 253) are in the biased region (≥ 14*18) and MUST be
+      // skipped; the code then consumes 0 → alphabet[0] ("B"), 17 → alphabet[17]
+      // ("Z"), then 1..6 → C,D,E,G,H,K, with a hyphen after the 4th letter.
+      spy.mockImplementation(((arr: Uint8Array): Uint8Array => {
+        const seq = [252, 253, 0, 17, 1, 2, 3, 4, 5, 6];
+        for (let i = 0; i < arr.length; i++) arr[i] = seq[i] ?? 0;
+        return arr;
+      }) as typeof globalThis.crypto.getRandomValues);
+
+      const code = (enrollment as unknown as { generateUserCode(): string }).generateUserCode();
+
+      expect(spy).toHaveBeenCalled();
+      expect(code).toBe("BZCD-EGHK");
+      // Sanity: no ambiguous chars, correct shape.
+      expect(code).toMatch(/^[A-Z]{4}-[A-Z]{4}$/);
+      spy.mockRestore();
+    });
+
+    it("keeps the ABCD-WXYZ format from the CSPRNG path", () => {
+      // Real (unmocked) crypto — format invariant must hold.
+      const code = (enrollment as unknown as { generateUserCode(): string }).generateUserCode();
+      expect(code).toMatch(/^[A-Z]{4}-[A-Z]{4}$/);
     });
   });
 

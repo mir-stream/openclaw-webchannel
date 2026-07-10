@@ -65,6 +65,14 @@ const USER_CODE_FORMAT = "XXXX-XXXX";
 const DEVICE_CODE_BYTES = 32;
 
 /**
+ * How many times `enroll()` re-mints on a `user_code` collision before giving
+ * up. With a ~1.2B code space a single collision is already rare; 5 attempts
+ * make an enroll-failing collision run astronomically unlikely while bounding
+ * the work under a hostile/degenerate store.
+ */
+const MAX_ENROLL_ATTEMPTS = 5;
+
+/**
  * How often the in-memory store's background sweeper runs (default 60s).
  */
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
@@ -106,6 +114,39 @@ function assertValidAgentPublicKey(key: unknown): void {
 // ---------------------------------------------------------------------------
 
 /**
+ * Thrown by an {@link EnrollmentStore} when a `saveEnrollment` fails because the
+ * `user_code` uniqueness constraint was violated (a rare collision on the
+ * approval-UI lookup key). This is the ONE store failure `enroll()` treats as
+ * retryable: it re-mints a fresh user_code and retries, bounded. Any other
+ * `saveEnrollment` failure is a real store fault and propagates unchanged.
+ *
+ * Persistent stores SHOULD map their backend's unique-violation (e.g. a
+ * Postgres `UNIQUE(user_code)` error) onto this type instead of leaking the
+ * backend error format. A store that holds a DIFFERENT copy of this class
+ * across package duplication can equivalently set `error.name` to
+ * `"UserCodeCollisionError"` — `enroll()` retries on the name too.
+ */
+export class UserCodeCollisionError extends Error {
+  constructor(userCode: string) {
+    super(`webchannel: user_code collision: ${userCode}`);
+    this.name = "UserCodeCollisionError";
+  }
+}
+
+/**
+ * Is `err` a user_code collision `enroll()` should retry on? Matches both an
+ * `instanceof` of our class AND any error whose `name` is
+ * `"UserCodeCollisionError"` — a consumer's store may carry a different copy of
+ * the class across package duplication, so the name is the durable signal.
+ */
+function isUserCodeCollisionError(err: unknown): boolean {
+  return (
+    err instanceof UserCodeCollisionError ||
+    (typeof err === "object" && err !== null && (err as { name?: unknown }).name === "UserCodeCollisionError")
+  );
+}
+
+/**
  * Enrollment store interface.
  *
  * Implementations can be in-memory (for testing) or persistent (Redis, DB, etc.)
@@ -113,6 +154,13 @@ function assertValidAgentPublicKey(key: unknown): void {
 export interface EnrollmentStore {
   /**
    * Store a pending enrollment.
+   *
+   * SHOULD throw {@link UserCodeCollisionError} (or any error with
+   * `name === "UserCodeCollisionError"`) when the save fails specifically
+   * because `user_code` is already taken by a DIFFERENT live enrollment.
+   * `enroll()` catches exactly that, re-mints a fresh user_code, and retries
+   * (bounded); every other error propagates untouched. Re-saving the SAME
+   * device_code (idempotent) must NOT be treated as a collision.
    */
   saveEnrollment(enrollment: PendingEnrollment): Promise<void>;
 
@@ -194,9 +242,11 @@ export class MemoryEnrollmentStore implements EnrollmentStore {
     for (const [deviceCode, enrollment] of this.enrollments) {
       if (now > enrollment.expiresAt + this.retentionMs) {
         // Only drop the user-code index entry if it still points at THIS
-        // record: on a user_code collision, saveEnrollment overwrote the index
-        // with a newer enrollment's device_code — deleting unconditionally
-        // here would orphan that live record (unreachable by user_code).
+        // record. saveEnrollment now REFUSES a colliding user_code (throws
+        // UserCodeCollisionError) so two live records can no longer share one,
+        // and deleteEnrollment clears the index alongside the record — so this
+        // guard is defensive: it keeps sweep correct even if some path ever
+        // leaves the index pointing at a different (still-live) enrollment.
         if (this.userCodeIndex.get(enrollment.user_code) === deviceCode) {
           this.userCodeIndex.delete(enrollment.user_code);
         }
@@ -233,6 +283,15 @@ export class MemoryEnrollmentStore implements EnrollmentStore {
   }
 
   async saveEnrollment(enrollment: PendingEnrollment): Promise<void> {
+    // Honor the EnrollmentStore contract: reject a user_code already held by a
+    // DIFFERENT live enrollment instead of silently overwriting the index
+    // (the old last-writer-wins gave two records the same approval-UI key and
+    // orphaned the loser). Re-saving the same device_code is idempotent, and a
+    // stale index entry (its record already deleted/swept) is free to reuse.
+    const owner = this.userCodeIndex.get(enrollment.user_code);
+    if (owner !== undefined && owner !== enrollment.device_code && this.enrollments.has(owner)) {
+      throw new UserCodeCollisionError(enrollment.user_code);
+    }
     this.enrollments.set(enrollment.device_code, enrollment);
     this.userCodeIndex.set(enrollment.user_code, enrollment.device_code);
   }
@@ -415,23 +474,42 @@ export class DeviceFlowEnrollment {
     // Reject a malformed/oversized agentPublicKey at ingress rather than late at
     // browser-side cnf binding (and cap store/approval-UI bloat from a huge string).
     assertValidAgentPublicKey(request.agentPublicKey);
-    const device_code = await this.generateDeviceCode();
-    const user_code = this.generateUserCode();
     const now = Date.now();
     const expiresAt = now + this.options.expirationSeconds * 1000;
 
-    const enrollment: PendingEnrollment = {
-      device_code,
-      user_code,
-      agentPublicKey: request.agentPublicKey,
-      accountId: request.accountId,
-      tenant: request.tenant,
-      createdAt: now,
-      expiresAt,
-      status: "pending",
-    };
-
-    await this.store.saveEnrollment(enrollment);
+    // Bounded collision-retry: a persistent store with UNIQUE(user_code) can
+    // reject a save on a rare code collision (surfaced as UserCodeCollisionError,
+    // per the EnrollmentStore contract). Re-mint BOTH codes and retry — a
+    // device_code collision is negligible, but re-minting both keeps the loop
+    // trivially correct. ONLY a collision is retried; any other store error is a
+    // real fault and propagates immediately (no retry).
+    let device_code = "";
+    let user_code = "";
+    let lastCollision: unknown;
+    let persisted = false;
+    for (let attempt = 0; attempt < MAX_ENROLL_ATTEMPTS; attempt++) {
+      device_code = await this.generateDeviceCode();
+      user_code = this.generateUserCode();
+      const enrollment: PendingEnrollment = {
+        device_code,
+        user_code,
+        agentPublicKey: request.agentPublicKey,
+        accountId: request.accountId,
+        tenant: request.tenant,
+        createdAt: now,
+        expiresAt,
+        status: "pending",
+      };
+      try {
+        await this.store.saveEnrollment(enrollment);
+        persisted = true;
+        break;
+      } catch (err) {
+        if (!isUserCodeCollisionError(err)) throw err;
+        lastCollision = err;
+      }
+    }
+    if (!persisted) throw lastCollision;
 
     const verification_uri = `${this.options.saasBaseUrl}/enroll`;
     const verification_uri_complete = `${verification_uri}?user_code=${user_code}`;
@@ -625,14 +703,39 @@ export class DeviceFlowEnrollment {
   /**
    * Generate a human-readable user code.
    * Format: "ABCD-WXYZ" using unambiguous characters.
+   *
+   * CSPRNG (`crypto.getRandomValues`) with rejection sampling so the code the
+   * banner calls "cryptographically random" actually is. The 18-char alphabet
+   * does not divide 256, so a plain `byte % 18` would bias the first
+   * `256 % 18 = 4` letters. We keep only bytes below the largest multiple of 18
+   * that fits a byte (`14 * 18 = 252`) and reject the rest, giving a uniform
+   * index. Bytes are drawn in one batch (with a small margin for rejections)
+   * and refilled only if that batch runs dry, so this is not one syscall/char.
    */
   private generateUserCode(): string {
+    const alphabetLen = USER_CODE_ALPHABET.length; // 18
+    const rejectAtOrAbove = 256 - (256 % alphabetLen); // 252 — largest 18-multiple ≤ 256
     const chars: string[] = [];
+
+    let pool = new Uint8Array(0);
+    let poolPos = 0;
+    const nextUniformIndex = (): number => {
+      for (;;) {
+        if (poolPos >= pool.length) {
+          // 8 letters needed; oversize the draw so rejections rarely refill.
+          pool = new Uint8Array(16);
+          globalThis.crypto.getRandomValues(pool);
+          poolPos = 0;
+        }
+        const byte = pool[poolPos++];
+        if (byte < rejectAtOrAbove) return byte % alphabetLen;
+        // else: biased region — reject and draw the next byte.
+      }
+    };
+
     for (let i = 0; i < 8; i++) {
       if (i === 4) chars.push("-"); // Insert hyphen
-      const randomByte = Math.floor(Math.random() * 256);
-      const index = randomByte % USER_CODE_ALPHABET.length;
-      chars.push(USER_CODE_ALPHABET[index]);
+      chars.push(USER_CODE_ALPHABET[nextUniformIndex()]);
     }
     return chars.join("");
   }
