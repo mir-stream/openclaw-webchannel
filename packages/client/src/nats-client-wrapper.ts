@@ -240,6 +240,16 @@ export class WebChannelNATSClient {
         //      bubble, it IS this reply's live rendering; adopt onto it (and
         //      keep the canonical stored text). Chains across multi-frame
         //      replies because each adoption advances the anchor.
+        // PLACEMENT of the unmatched (fresh) messages is ORDERED, not a blanket
+        // prepend (#16). We carry an insertion CURSOR = the index into `next`
+        // before which the next fresh message lands; every match/adoption walks
+        // it to `matchedIndex + 1`. So a mid-session snapshot whose overlapping
+        // prefix matches the local tail inserts its unseen suffix chronologically
+        // AFTER that prefix (a turn sent from another device, or turns that
+        // landed while this tab was disconnected, appear at the bottom — not the
+        // top). Pagination and zero-overlap frames match nothing → the cursor
+        // stays 0 → the whole page prepends in order (unchanged); initial
+        // hydration into empty state inserts everything at 0 in order (unchanged).
         // A `working:true` progress draft is never an adoption target: its
         // live id must survive for the upcoming progress/final upserts.
         // Known cosmetic edge (accepted): if TWO devices send the identical
@@ -268,9 +278,25 @@ export class WebChannelNATSClient {
         });
 
         let adopted = false;
-        const fresh: ChatMessage[] = [];
+        /**
+         * Fresh (unmatched) snapshot messages, grouped by the INSERTION CURSOR
+         * value in effect when each was seen — the index into `next` BEFORE
+         * which they must land. We cannot splice into `next` mid-loop (that
+         * invalidates every cached local index in
+         * `localIndexById`/`claimed`/`adoptable`), so the placement is deferred
+         * to a single rebuild after the loop. Multiple fresh messages sharing a
+         * cursor keep their snapshot order (appended to the same array).
+         */
+        const inserts = new Map<number, ChatMessage[]>();
         /** Local index the PREVIOUS snapshot message resolved to (tier-3 anchor). */
         let anchor: number | null = null;
+        /**
+         * Index into `next` before which the NEXT fresh message is inserted.
+         * Advances to `matchedIndex + 1` past every matched (tier 1) or adopted
+         * (tier 2/3) message, so a snapshot's unseen tail lands chronologically
+         * AFTER the overlapping matched prefix instead of being prepended (#16).
+         */
+        let cursor = 0;
 
         const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
           // Keep the canonical stored text on adoption, so this device
@@ -280,6 +306,7 @@ export class WebChannelNATSClient {
           localIndexById.set(m.id, idx);
           adopted = true;
           anchor = idx;
+          cursor = idx + 1;
         };
 
         for (const m of incoming) {
@@ -288,7 +315,13 @@ export class WebChannelNATSClient {
           if (m.role !== "user" && m.role !== "agent") continue;
           if (typeof m.text !== "string") continue;
           if (seen.has(m.id)) {
-            anchor = localIndexById.get(m.id) ?? null;
+            const li = localIndexById.get(m.id);
+            anchor = li ?? null;
+            // Tier-1 match: walk the cursor past this already-held message so
+            // later fresh messages insert after it. An id we can't locate
+            // locally (should not happen — `seen` is seeded from `next`) leaves
+            // the cursor untouched.
+            if (li !== undefined) cursor = li + 1;
             continue;
           }
 
@@ -313,19 +346,30 @@ export class WebChannelNATSClient {
               continue;
             }
           }
-          fresh.push({
+          const atCursor = inserts.get(cursor) ?? [];
+          atCursor.push({
             id: m.id,
             role: m.role,
             text: m.text,
             ts: m.ts,
             working: false,
           });
+          inserts.set(cursor, atCursor);
           anchor = null;
         }
 
-        if (fresh.length === 0 && !adopted) return;
+        if (inserts.size === 0 && !adopted) return;
 
-        this.setState({ messages: [...fresh, ...next] });
+        // Rebuild `next` with each fresh group spliced in at its cursor. Slot i
+        // holds the messages that must precede `next[i]`; slot `next.length`
+        // holds any tail appended after the last local message.
+        const merged: ChatMessage[] = [];
+        for (let i = 0; i <= next.length; i++) {
+          const ins = inserts.get(i);
+          if (ins) merged.push(...ins);
+          if (i < next.length) merged.push(next[i]);
+        }
+        this.setState({ messages: merged });
         return;
       }
 
