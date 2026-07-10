@@ -197,6 +197,11 @@ export type OutboundWsMessage =
    * account. The client reconciles its approval state against it: rehydrate lost
    * cards, retire cards resolved elsewhere, and re-send a lost decision. An
    * empty `approvals` array is meaningful (nothing pending → retire stale cards).
+   *
+   * `resolved` (#19, OPTIONAL) carries recently-RESOLVED outcomes so the client's
+   * Leg B can render the actual decision instead of a neutral "resolved
+   * (elsewhere)". Optional for back-compat with an older plugin that never sends
+   * it (the client falls back to "unknown").
    */
   | { type: "approval_snapshot"; approvals: Array<{
       id: string;
@@ -206,7 +211,7 @@ export type OutboundWsMessage =
       prompt: string;
       options: ApprovalOption[];
       expiresAtMs?: number;
-    }> }
+    }>; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
   /** Native typing affordance; see `WebChannelState.isTyping`. */
   | { type: "typing" }
   /**

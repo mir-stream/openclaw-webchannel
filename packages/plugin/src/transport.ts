@@ -86,8 +86,17 @@ export type OutboundWsMessage =
    * so a card left actionable by a missed `approval_resolved` is retired. The
    * client reconciles its approval state against this set (see the client
    * wrapper's `approval_snapshot` handler).
+   *
+   * `resolved` (#19, OPTIONAL) carries recently-RESOLVED outcomes so the client's
+   * Leg B can show the actual decision rather than a neutral "resolved
+   * (elsewhere)". Optional so an older client that ignores the field, and an
+   * older plugin that never sends it, both stay compatible.
    */
-  | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[] }
+  | {
+      type: "approval_snapshot";
+      approvals: ApprovalRequestPayload[];
+      resolved?: Array<{ id: string; decision: ApprovalDecision }>;
+    }
   /**
    * Native "agent is typing" affordance. The server pushes exactly one of these
    * at the start of a turn; the client flips `isTyping:true` and lets the first
@@ -716,12 +725,22 @@ export class WebChannelTransport {
    * back to the single open socket under the same one-connection rule as the
    * other approval sends. An empty `approvals` array IS delivered (it is the
    * reconciliation signal); the send only no-ops when no socket is open.
+   *
+   * `resolved` (#19) mirrors `NatsChannel.sendApprovalSnapshot` for surface
+   * parity; the legacy dev-only WS path never emits this frame at register time
+   * (no stateless register hop), so this arg is here only so the two transports
+   * share one signature.
    */
   sendApprovalSnapshot(
     sessionKey: string,
     approvals: ApprovalRequestPayload[],
+    resolved?: Array<{ id: string; decision: ApprovalDecision }>,
   ): boolean {
-    const frame: OutboundWsMessage = { type: "approval_snapshot", approvals };
+    const frame: OutboundWsMessage = {
+      type: "approval_snapshot",
+      approvals,
+      ...(resolved && resolved.length > 0 ? { resolved } : {}),
+    };
     const ws = this.openSocket(sessionKey) ?? this.soleOpenSocket();
     if (ws) {
       return this.safeSend(ws, frame);

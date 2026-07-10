@@ -167,6 +167,12 @@ export type InboundMessage = {
     options?: Array<{ decision: string; label: string; style: string }>;
     expiresAtMs?: number;
   }>;
+  /**
+   * #19: recently-RESOLVED outcomes on an `approval_snapshot` frame. Optional —
+   * an older plugin omits it, and the wrapper falls back to "unknown" for a card
+   * absent from `approvals` but with no matching `resolved` entry.
+   */
+  resolved?: Array<{ id: string; decision: string }>;
   before?: string;
   limit?: number;
 };

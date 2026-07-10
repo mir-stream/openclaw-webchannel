@@ -249,6 +249,14 @@ describe("NatsChannel (encrypt-by-construction)", () => {
     // An EMPTY snapshot is a meaningful signal and must be delivered too.
     expect(h.channel.sendApprovalSnapshot(PEER, [])).toBe(true);
     expect(h.browserReplies.at(-1)).toEqual({ type: "approval_snapshot", approvals: [] });
+
+    // #19: recently-resolved outcomes ride the SAME sealed path when supplied.
+    const resolved = [{ id: "exec-0", decision: "deny" as const }];
+    expect(h.channel.sendApprovalSnapshot(PEER, approvals, resolved)).toBe(true);
+    expect(h.browserReplies.at(-1)).toEqual({ type: "approval_snapshot", approvals, resolved });
+    // An empty/omitted resolved list keeps the frame free of the field (back-compat).
+    expect(h.channel.sendApprovalSnapshot(PEER, approvals, [])).toBe(true);
+    expect(h.browserReplies.at(-1)).toEqual({ type: "approval_snapshot", approvals });
   });
 
   it("does NOT re-fire the snapshot for a duplicate handshake (client retry / RTT race)", () => {
