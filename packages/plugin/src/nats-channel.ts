@@ -108,6 +108,19 @@ export type NatsChannelCryptoOptions = {
    * which keep the legacy handshake (F5 decision — see PHASE6_MULTIDEVICE_PLAN §8).
    */
   keyStore?: ConversationKeyStore;
+  /**
+   * F2 — the agent's SaaS-ATTESTED static X25519 identity key pair, loaded from
+   * the enrolled per-account `credentials.json` (`enrollment-client.ts` persists
+   * it; the browser pins its PUBLIC half via the SaaS bootstrap response). Used
+   * ONLY by `wrapConversationKeyForDevice` to wrap K static-static so the browser
+   * can authenticate that K came from the genuine agent (closes the register-hop
+   * MITM). REQUIRED whenever `keyStore` is set — the channel refuses to construct
+   * a keyStore channel without it (fail-closed). Distinct from the boot-ephemeral
+   * `keyPair` used on the auto/handshake path, which stays untouched (wiring a
+   * static key there buys no auth — the browser doesn't pin it — while trading
+   * away per-boot freshness).
+   */
+  identityKeyPair?: KeyPair;
 };
 
 /**
@@ -219,6 +232,11 @@ export class NatsChannel {
    * only; null = legacy handshake key model). See NatsChannelCryptoOptions.
    */
   private readonly keyStore: ConversationKeyStore | null;
+  /**
+   * F2: agent SaaS-attested static identity key pair used to wrap K to a device
+   * (keyStore mode only). Non-null exactly when `keyStore` is non-null.
+   */
+  private readonly identityKeyPair: KeyPair | null;
   /** Per-peer established conversation keys (peerId -> 32-byte session key). */
   private readonly peerSessionKeys = new Map<string, Uint8Array>();
   /** Per-peer handshake subscriptions (peerId -> sid). */
@@ -255,6 +273,19 @@ export class NatsChannel {
     this.encryptionRequired = crypto != null;
     this.agentKeyPair = crypto ? (crypto.keyPair ?? generateKeyPair()) : null;
     this.keyStore = crypto?.keyStore ?? null;
+    // F2 fail-closed: a keyStore (register-hop) channel MUST have the attested
+    // identity key to wrap K authentically. The entry (index-nats) already skips
+    // serving a register-hop account with no persisted identity key; this is the
+    // last-line assertion so the channel can never be constructed to wrap K under
+    // an unattested key.
+    this.identityKeyPair = crypto?.identityKeyPair ?? null;
+    if (this.keyStore && !this.identityKeyPair) {
+      throw new Error(
+        "webchannel: keyStore (register-hop) channel requires crypto.identityKeyPair " +
+          "(the SaaS-attested agent identity key) to wrap the conversation key — refusing " +
+          "to serve without it (fail-closed; the browser could not authenticate K otherwise).",
+      );
+    }
     this.maxPeers = limits?.maxPeers ?? DEFAULT_MAX_PEERS;
     this.maxApprovalResolutions =
       limits?.maxApprovalResolutions ?? DEFAULT_MAX_APPROVAL_RESOLUTIONS;
@@ -599,7 +630,14 @@ export class NatsChannel {
     }
     const key = this.peerSessionKeys.get(peerId);
     if (!key) return null;
-    return wrapConversationKey(key, devicePublicKey);
+    // F2: static-static wrap under the agent's attested identity key + peerId-bound
+    // AAD. `identityKeyPair` is guaranteed non-null here (constructor asserts it
+    // whenever `keyStore` is set), so the browser can authenticate K against the
+    // SaaS-pinned agent public key and no relay-injected K′ can pass.
+    return wrapConversationKey(key, devicePublicKey, {
+      agentIdentityKeyPair: this.identityKeyPair!,
+      peerId,
+    });
   }
 
   // ---------------------------------------------------------------------------

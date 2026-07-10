@@ -36,6 +36,12 @@ export {
   UserCodeCollisionError,
   type EnrollmentStore,
 } from "./device-flow-enrollment.js";
+export {
+  MemoryAgentKeyRegistry,
+  agentKeyRegistryKey,
+  DEFAULT_REGISTRY_ACCOUNT_ID,
+  type AgentKeyRegistry,
+} from "./agent-key-registry.js";
 export { buildBootstrapClaims } from "./bootstrap-claims.js";
 export type {
   BootstrapClaims,

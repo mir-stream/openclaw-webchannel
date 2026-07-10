@@ -403,6 +403,46 @@ describe("account-config: loadPersistedEnrolledCreds", () => {
     expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
   });
 
+  it("F2: surfaces the agent identity key when both halves decode to 32 bytes", () => {
+    // base64url of a 32-byte X25519 key is 43 chars. Reuse one string for both
+    // halves — the loader only checks decoded length, not that they're a real pair.
+    const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+    const withIdentity = JSON.stringify({
+      identityKey: { publicKey: KEY43, privateKey: KEY43 },
+      enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } },
+    });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const creds = loadPersistedEnrolledCreds("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => withIdentity,
+    });
+    expect(creds?.identityKey).toBeDefined();
+    expect(creds!.identityKey!.publicKey).toBeInstanceOf(Uint8Array);
+    expect(creds!.identityKey!.publicKey.length).toBe(32);
+    expect(creds!.identityKey!.privateKey.length).toBe(32);
+  });
+
+  it("F2: omits the identity key when the block is absent, partial, or the wrong length (fail-closed)", () => {
+    const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const load = (identityKey: unknown) =>
+      loadPersistedEnrolledCreds("acctA", {
+        home: HOME,
+        exists: (p) => p === perAccount,
+        read: () =>
+          JSON.stringify({ identityKey, enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } } }),
+      });
+    // Absent entirely.
+    expect(load(undefined)?.identityKey).toBeUndefined();
+    // Only one half present.
+    expect(load({ publicKey: KEY43 })?.identityKey).toBeUndefined();
+    // Wrong length (31 bytes → not an X25519 key).
+    expect(load({ publicKey: "AAAA", privateKey: "AAAA" })?.identityKey).toBeUndefined();
+    // But the rest of the creds still load (identity is optional at this layer).
+    expect(load(undefined)).toMatchObject({ userJwt: "JWT", userSeed: "SEED" });
+  });
+
   it("loads from the legacy file for the default account (backward-compat)", () => {
     const legacy = legacyCredentialPath(HOME);
     const creds = loadPersistedEnrolledCreds("default", {

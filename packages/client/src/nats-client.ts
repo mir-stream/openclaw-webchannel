@@ -116,6 +116,16 @@ export type NatsClientOptions = {
      * (old-plugin compat; the auto-admission path never registers anyway).
      */
     deviceX25519PrivateKey?: CryptoKey;
+    /**
+     * F2 — the SaaS-PINNED agent X25519 identity public key (base64url, 32 bytes),
+     * taken from the first-party HTTPS bootstrap response. REQUIRED whenever
+     * `deviceX25519PrivateKey` is present: the register-delivered K is unwrapped
+     * by deriving the key SOLELY from THIS pinned value, never from any NATS
+     * frame — so a relay's injected K′ (wrapped under a relay-chosen key) fails
+     * authentication. Absence on the register-delivered path is fail-closed
+     * terminal (the browser cannot authenticate K).
+     */
+    pinnedAgentPublicKey?: string;
   };
   /**
    * Optional NATS-layer NKEY authentication for a JWT-auth nats-server.
@@ -1062,11 +1072,28 @@ export class WebChannelNatsClient {
           this.client.disconnect();
           return;
         }
+        // F2 fail-closed: the register-delivered K is authenticated by deriving
+        // the unwrap key from the SaaS-pinned agent identity public key. Without
+        // it the browser has no way to distinguish the genuine agent's K from a
+        // relay-injected K′, so a missing pin is TERMINAL (never derive from the
+        // wire). The pin arrives with the first-party HTTPS bootstrap response.
+        if (!registration.pinnedAgentPublicKey) {
+          const err = new Error(
+            "[nats-client] register-delivered key requires a pinned agent public key " +
+              "(bootstrap response carried no agentPublicKey) — refusing to unwrap K " +
+              "against an unauthenticated wire key",
+          );
+          this.notifyErrorListeners(err);
+          this.client.disconnect();
+          return;
+        }
         let key: Uint8Array;
         try {
           key = await unwrapConversationKey(
             wrapped,
             registration.deviceX25519PrivateKey!,
+            registration.pinnedAgentPublicKey,
+            peerId,
           );
         } catch (err) {
           console.error("[nats-client] conversation-key unwrap failed:", err);

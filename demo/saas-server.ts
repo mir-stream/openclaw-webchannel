@@ -43,6 +43,7 @@
  */
 
 import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../packages/saas/src/device-flow-enrollment.js";
+import { MemoryAgentKeyRegistry } from "../packages/saas/src/agent-key-registry.js";
 import { loadOrCreateTrustChain } from "../packages/saas/src/persistent-trust-chain.js";
 import { generateRsaKeypair } from "../packages/saas/src/setup-trust-chain.js";
 import type { JwkRsaPublicKey } from "../packages/saas/src/types.js";
@@ -263,6 +264,10 @@ async function rotateSigningKey(evictPrevious: boolean): Promise<{ kid: string; 
 // ---------------------------------------------------------------------------
 
 const enrollmentStore = new MemoryEnrollmentStore();
+// F2: durable agent identity-key registry. Approval upserts (tenant, accountId) →
+// agentPublicKey here; /bootstrap reads it back to pin the attested agent key into
+// the browser response so the register-delivered K can be authenticated.
+const agentKeyRegistry = new MemoryAgentKeyRegistry();
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: privateChain,
   natsAccountConfig: natsConfig,
@@ -277,6 +282,7 @@ const enrollment = new DeviceFlowEnrollment({
   expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 2),
   store: enrollmentStore,
+  agentKeyRegistry,
 });
 
 // Live view of enrollment requests for the admin panel (the store has no
@@ -601,11 +607,26 @@ const server = createServer(async (req, res) => {
           return sendJson(res, { error: `Invalid claims: ${(err as Error).message}` }, 400);
         }
         signBootstrapJwt(claims as unknown as Record<string, unknown>)
-          .then((jwt) => {
-            console.log(`[bootstrap] issued JWT for ${user.username} peerId=${user.uuid} account=${accountId}`);
+          .then(async (jwt) => {
+            // F2: deliver the SaaS-attested agent identity public key so the
+            // browser can pin it and authenticate the register-delivered K. Keyed
+            // by (tenant, accountId) — the same account the browser bootstraps for.
+            // Omitted when the account has no enrolled agent key yet (e.g. an
+            // auto/handshake account); the client only requires it on the
+            // register-hop path.
+            const agentPublicKey = await agentKeyRegistry.get(DEMO_TENANT, accountId);
+            console.log(
+              `[bootstrap] issued JWT for ${user.username} peerId=${user.uuid} account=${accountId}` +
+                (agentPublicKey ? " (+agentPublicKey pin)" : ""),
+            );
             // The client derives the register subject from tenant/accountId/peerId
             // and dials the shared relay — no gateway URL travels in the response.
-            sendJson(res, { jwt, peerId: user.uuid, natsUrl: NATS_URL });
+            sendJson(res, {
+              jwt,
+              peerId: user.uuid,
+              natsUrl: NATS_URL,
+              ...(agentPublicKey ? { agentPublicKey } : {}),
+            });
           })
           .catch((err) => {
             console.error("[bootstrap] Error:", err);

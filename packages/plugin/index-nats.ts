@@ -50,6 +50,8 @@ import {
 import { consumeCredentialSource } from "./src/consume-credentials.js";
 import { planAccounts } from "./src/multiplex.js";
 import { loadPersistedEnrolledCreds } from "./src/account-config.js";
+import type { KeyPair } from "./src/e2e-crypto.js";
+import { devOpenAgentIdentityKeyPair } from "./src/dev-identity.js";
 
 // ---------------------------------------------------------------------------
 // Global state — multi-account multiplex (가-1 Cycle 2)
@@ -368,6 +370,9 @@ export default defineChannelPluginEntry({
       let transport: NatsTransport;
       let enrolled: EnrolledNatsConnection | undefined;
       let credentialMode: NatsCredentialSource["mode"];
+      // F2: the agent's SaaS-attested identity key from the enrolled creds (set
+      // only on the enrolled path). The register-hop channel wraps K under it.
+      let identityKey: KeyPair | undefined;
       try {
         const source = resolveNatsCredentialSource({
           natsConfig: accountNatsCfg,
@@ -397,6 +402,7 @@ export default defineChannelPluginEntry({
         );
         transport = consumed.connection.transport;
         if (consumed.connection.enrolled) enrolled = consumed.connection.enrolled;
+        identityKey = consumed.identityKey;
         // Review 2026-07-02 (C1): attach a post-handshake "error" listener so a
         // transient NATS failure (server restart → TCP reset; a post-connect
         // `-ERR Permissions Violation`) is logged with account context —
@@ -478,13 +484,60 @@ export default defineChannelPluginEntry({
         }
       }
 
+      // ---- F2: resolve the register-hop wrap identity key -------------------
+      // A register-hop account wraps the conversation key K under the agent's
+      // SaaS-attested identity key so the browser can authenticate it. K MUST be
+      // wrapped under an ATTESTED key on every non-dev path:
+      //  - ENROLLED mode (production): the key comes from the persisted creds. If
+      //    it is absent (pre-F2 creds / malformed block) we SKIP serving.
+      //  - STATIC creds + explicit `nats.admission:"register-hop"` (a legitimate
+      //    bring-your-own-NATS production shape — the override is honored verbatim,
+      //    nats-admission.ts): there is a real untrusted relay, so an unattested
+      //    key would re-open the MITM. Also SKIP serving — BYON register-hop still
+      //    requires an enrolled/attested identity key.
+      //  - open mode ONLY (`WEBCHANNEL_NATS_DEV_OPEN` / devOpen / credentials.mode
+      //    "open" — the genuine dev/e2e knob, no untrusted relay in the threat
+      //    model): fall back to the WELL-KNOWN dev identity key so the dev browser
+      //    drivers can pin it. This is the ONLY path that may wrap under the public
+      //    dev key.
+      // Auto accounts never wrap K, so they never reach this block.
+      let registerHopIdentityKey = identityKey;
+      if (admission === "register-hop" && !registerHopIdentityKey) {
+        if (credentialMode === "open") {
+          registerHopIdentityKey = devOpenAgentIdentityKeyPair();
+          (api.logger?.warn ?? console.warn)?.(
+            `[webchannel] account "${accountId}" register-hop on DEV-OPEN NATS with no enrolled ` +
+              `identity key — using the WELL-KNOWN DEV identity key to wrap K (DEV/E2E ONLY, NOT ` +
+              `attested; this key is public, so an untrusted relay could MITM — never use dev-open ` +
+              `in production).`,
+          );
+        } else {
+          // enrolled (production) OR static (BYO-NATS production) with no attested
+          // key → fail closed. Never wrap K under the public dev key on a path that
+          // faces a real relay.
+          (api.logger?.error ?? console.error)?.(
+            `[webchannel] account "${accountId}" is register-hop (${credentialMode}) but has no ` +
+              `agent identity key — refusing to serve (the browser could not authenticate the ` +
+              `conversation key; wrapping under the public dev key would re-open the relay MITM). ` +
+              `Enroll to mint an attested identity key: openclaw channels add --channel webchannel ` +
+              `--account ${accountId}`,
+          );
+          continue;
+        }
+      }
+
       // ---- Step 2 (per account): create the encrypted NATS channel ---------
       // Subject namespace is webchannel.{tenant}.{accountId}.{peerId} — the
       // accountId is the wire identity (one namespace per account).
       const channel = new NatsChannel(transport, accountId, tenant, {
         ...cryptoOptions,
         ...(admission === "register-hop"
-          ? { keyStore: new ConversationKeyStore({ accountId }) }
+          ? {
+              keyStore: new ConversationKeyStore({ accountId }),
+              // Guaranteed present: enrolled/static → persisted attested key (else
+              // skipped above); dev-open → the well-known dev key.
+              identityKeyPair: registerHopIdentityKey,
+            }
           : {}),
       });
       console.log(

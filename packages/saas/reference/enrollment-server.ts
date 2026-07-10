@@ -35,6 +35,7 @@
  */
 
 import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../src/device-flow-enrollment.js";
+import { MemoryAgentKeyRegistry } from "../src/agent-key-registry.js";
 import { setupTrustChain } from "../src/setup-trust-chain.js";
 import { loadOrCreateTrustChain } from "../src/persistent-trust-chain.js";
 import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
@@ -204,6 +205,8 @@ async function signBootstrapJwt(payload: Record<string, unknown>): Promise<strin
 // ---------------------------------------------------------------------------
 
 const enrollmentStore = new MemoryEnrollmentStore();
+// F2: durable agent identity-key registry (see the demo server for rationale).
+const agentKeyRegistry = new MemoryAgentKeyRegistry();
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: mockTrustChain,
   natsAccountConfig: mockNatsConfig,
@@ -215,6 +218,7 @@ const enrollment = new DeviceFlowEnrollment({
   expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 5),
   store: enrollmentStore,
+  agentKeyRegistry,
 });
 
 // ---------------------------------------------------------------------------
@@ -794,9 +798,21 @@ const server = createServer(async (req, res) => {
           return;
         }
         signBootstrapJwt(claims as unknown as Record<string, unknown>)
-          .then((jwt) => {
-            console.log(`[bootstrap] issued JWT (kid=${bootstrapKid}) for ${user.username} peerId=${user.uuid}, account=${accountId}`);
-            sendJson(res, { jwt, peerId: user.uuid });
+          .then(async (jwt) => {
+            // F2: pin the SaaS-attested agent identity key so the browser can
+            // authenticate the register-delivered K. Omitted when the account has
+            // no enrolled agent key yet (the client only requires it on the
+            // register-hop path).
+            const agentPublicKey = await agentKeyRegistry.get(tenant, accountId);
+            console.log(
+              `[bootstrap] issued JWT (kid=${bootstrapKid}) for ${user.username} peerId=${user.uuid}, account=${accountId}` +
+                (agentPublicKey ? " (+agentPublicKey pin)" : ""),
+            );
+            sendJson(res, {
+              jwt,
+              peerId: user.uuid,
+              ...(agentPublicKey ? { agentPublicKey } : {}),
+            });
           })
           .catch((err) => {
             console.error("[bootstrap] Error:", err);
@@ -1059,12 +1075,13 @@ const server = createServer(async (req, res) => {
           sendJson(res, { error: "Invalid JSON body" }, 400);
           return;
         }
-        const { tenant, accountId, peerId, deviceX25519PublicKey, devicePopPublicKey } = body as {
+        const { tenant, accountId, peerId, deviceX25519PublicKey, devicePopPublicKey, agentPublicKey } = body as {
           tenant?: string;
           accountId?: string;
           peerId?: string;
           deviceX25519PublicKey?: string;
           devicePopPublicKey?: string;
+          agentPublicKey?: string;
         };
         if (!tenant || !accountId || !peerId || !deviceX25519PublicKey) {
           sendJson(
@@ -1089,9 +1106,14 @@ const server = createServer(async (req, res) => {
           return;
         }
         signBootstrapJwt(claims as unknown as Record<string, unknown>)
-          .then((jwt) => {
+          .then(async (jwt) => {
+            // F2: this test route bypasses enrollment, so the harness may supply the
+            // agent identity public key directly (the plugin's persisted
+            // `identityKey.publicKey`); otherwise fall back to the registry (if the
+            // harness DID enroll). Echoed so the browser can pin it for K auth.
+            const pin = agentPublicKey ?? (await agentKeyRegistry.get(tenant, accountId)) ?? undefined;
             console.log(`[test/bootstrap-jwt] issued JWT (kid=${bootstrapKid}) for peerId=${peerId}, tenant=${tenant}`);
-            sendJson(res, { jwt, peerId, kid: bootstrapKid });
+            sendJson(res, { jwt, peerId, kid: bootstrapKid, ...(pin ? { agentPublicKey: pin } : {}) });
           })
           .catch((err) => {
             console.error("[test/bootstrap-jwt] Error:", err);

@@ -91,6 +91,13 @@ if (boot.status !== 200 || !boot.json?.jwt) {
   fail(2, `bootstrap-jwt mint failed: HTTP ${boot.status} ${boot.text}`);
 }
 const bootstrapJwt: string = boot.json.jwt;
+// F2: the SaaS delivers the enrolled agent's attested identity public key (from
+// the durable registry, populated at approval) so we can authenticate the
+// register-delivered K against it — never against the wire.
+const agentPublicKey: string | undefined = boot.json.agentPublicKey;
+if (!agentPublicKey) {
+  fail(2, "bootstrap-jwt response carried no agentPublicKey (F2 register-hop pin)");
+}
 console.log(`[driver] minted bootstrap JWT (kid=${boot.json.kid}, pop_jwk) for peerId=${PEER_ID}`);
 
 // 3. Fetch this driver's NATS user creds (browser role) and connect to the
@@ -161,6 +168,8 @@ if (!registerResult.wrappedConversationKey) {
 const sessionKey = await unwrapConversationKey(
   registerResult.wrappedConversationKey,
   deviceKp.privateKey,
+  agentPublicKey!,
+  PEER_ID,
 ).catch((e: Error) => fail(5, `conversation-key unwrap failed: ${e.message}`));
 console.log(`[driver] PoP register hop (NATS) OK → agent subscribed to ${PEER_ID}, K unwrapped`);
 

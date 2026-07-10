@@ -18,6 +18,14 @@ import { webcrypto } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { WebChannelNatsClient } from "../../packages/client/src/nats-client.js";
 import { buildBootstrapClaims } from "../../packages/saas/src/bootstrap-claims.js";
+// F2: dev-open register-hop agent wraps K under the well-known dev identity key.
+// CAVEAT: both accounts here pin the SAME dev key (the dev fallback is process-wide),
+// so this e2e does NOT exercise the per-account identity-key property — that a wrap
+// from account A cannot be authenticated as account B. That property is covered by
+// the plugin unit negative controls (nats-channel-keystore.test.ts: relay/non-pinned
+// key rejected) and the client conformance tests; here we only assert subject-scope
+// isolation on the same pinned key.
+import { devOpenAgentIdentityPublicB64url } from "../../packages/plugin/src/dev-identity.js";
 
 const NATS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18222";
 const PRIV_PATH = process.env.WEBCHANNEL_RS256_PRIVATE ?? "/tmp/oc-two-acct-e2e/rs256-private.jwk.json";
@@ -96,6 +104,8 @@ const client = new WebChannelNatsClient({
     devicePrivateKey: ed25519.privateKey,
     // Phase 6: register-delivered conversation key (no handshake).
     deviceX25519PrivateKey: x25519.privateKey,
+    // F2: authenticate the delivered K against the dev-open agent's identity key.
+    pinnedAgentPublicKey: devOpenAgentIdentityPublicB64url(),
   },
 });
 

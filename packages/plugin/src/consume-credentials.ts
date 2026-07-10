@@ -33,6 +33,7 @@ import {
   DEFAULT_ACCOUNT_ID,
   loadPersistedEnrolledCreds,
 } from "./account-config.js";
+import type { KeyPair } from "./e2e-crypto.js";
 
 /** Outcome of consuming a credential source at runtime. */
 export type ConsumeResult =
@@ -46,6 +47,15 @@ export type ConsumeResult =
        * which — for enrolled — may differ from the resolver's `source.url`.
        */
       dialedUrl: string;
+      /**
+       * F2 — the agent's SaaS-attested static X25519 identity key pair, present
+       * ONLY on the `enrolled` path when the persisted `credentials.json` carries
+       * a valid `identityKey`. The register-hop channel wraps K under this so the
+       * browser can authenticate it. Absent for open/static sources (no enrolled
+       * identity) and for pre-F2 / malformed enrolled creds — a register-hop
+       * account then fail-closed skips serving.
+       */
+      identityKey?: KeyPair;
     }
   | { status: "creds-missing"; accountId: string };
 
@@ -102,5 +112,12 @@ export async function consumeCredentialSource(
     },
     deps,
   );
-  return { status: "connected", connection, dialedUrl };
+  // F2: surface the persisted agent identity key so the entry can wrap K
+  // static-static on the register-hop path. Absent for pre-F2 / malformed creds.
+  return {
+    status: "connected",
+    connection,
+    dialedUrl,
+    ...(persisted.identityKey ? { identityKey: persisted.identityKey } : {}),
+  };
 }

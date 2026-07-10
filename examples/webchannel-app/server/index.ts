@@ -33,6 +33,7 @@ import {
   issueBrowserCredentials,
   buildBootstrapClaims,
   DeviceFlowEnrollment,
+  MemoryAgentKeyRegistry,
   type EnrollmentRequest,
   type PollRequest,
   type SetupTrustChainResult,
@@ -150,6 +151,9 @@ const issuer = await createBootstrapIssuer({
   kid: trustChain.kid,
 });
 
+// F2: durable agent identity-key registry — approval records the attested agent
+// key so /bootstrap can pin it for the browser's register-delivered-K auth.
+const agentKeyRegistry = new MemoryAgentKeyRegistry();
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: privateChain,
   natsAccountConfig: trustChain.natsConfig,
@@ -165,6 +169,7 @@ const enrollment = new DeviceFlowEnrollment({
   // enrollment must equal the `iss` minted into bootstrap JWTs below — both
   // read the single SAAS_ISSUER variable, so they cannot disagree.
   issuer: SAAS_ISSUER,
+  agentKeyRegistry,
 });
 
 // Bundle the browser client (web/app.ts → IIFE) once at boot from dist exports.
@@ -331,7 +336,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return sendJson(res, { error: `Invalid claims: ${(err as Error).message}` }, 400);
     }
     const jwt = await issuer.sign(claims);
-    return sendJson(res, { jwt, peerId: user.uuid, natsUrl: NATS_URL });
+    // F2: pin the SaaS-attested agent key so the browser can authenticate the
+    // register-delivered K. Present once the account's agent has enrolled.
+    const agentPublicKey = await agentKeyRegistry.get(TENANT, accountId);
+    return sendJson(res, {
+      jwt,
+      peerId: user.uuid,
+      natsUrl: NATS_URL,
+      ...(agentPublicKey ? { agentPublicKey } : {}),
+    });
   }
 
   // ── Plugin-facing device-flow enrollment (openclaw gateway) ───────────────

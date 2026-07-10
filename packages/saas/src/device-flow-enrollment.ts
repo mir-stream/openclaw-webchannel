@@ -29,6 +29,7 @@ import type {
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
+import type { AgentKeyRegistry } from "./agent-key-registry.js";
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -409,6 +410,15 @@ export type DeviceFlowOptions = {
    * Use a persistent store (Redis, DB) for production deployments.
    */
   store?: EnrollmentStore;
+
+  /**
+   * F2 — durable agent identity-key registry. When supplied, enrollment APPROVAL
+   * upserts `(tenant, accountId) → agentPublicKey` here so the bootstrap path can
+   * deliver the attested agent key to the browser LONG after the pending-store
+   * eviction. Omit only in tests that don't exercise the bootstrap-pin path.
+   * Production MUST provide a PERSISTENT implementation (survives restarts).
+   */
+  agentKeyRegistry?: AgentKeyRegistry;
 };
 
 /**
@@ -433,9 +443,13 @@ function defaultIssuer(saasBaseUrl: string): string {
 export class DeviceFlowEnrollment {
   // `natsIssuerAccountId` stays optional (external mode only); everything else
   // is defaulted, hence Required.
-  private readonly options: Required<Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId">> &
+  private readonly options: Required<
+    Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId" | "agentKeyRegistry">
+  > &
     Pick<DeviceFlowOptions, "natsIssuerAccountId">;
   private readonly store: EnrollmentStore;
+  /** F2: durable agent identity-key registry (undefined = pin delivery disabled). */
+  private readonly agentKeyRegistry?: AgentKeyRegistry;
   /** A2: in-flight approvals keyed by userCode, to coalesce concurrent clicks. */
   private readonly approvalsInFlight = new Map<string, Promise<EnrollmentResult | null>>();
 
@@ -451,6 +465,7 @@ export class DeviceFlowEnrollment {
       issuer: options.issuer ?? defaultIssuer(options.saasBaseUrl),
     };
     this.store = options.store ?? new MemoryEnrollmentStore();
+    this.agentKeyRegistry = options.agentKeyRegistry;
   }
 
   /**
@@ -645,6 +660,20 @@ export class DeviceFlowEnrollment {
       natsCreds,
       peerId,
     });
+
+    // F2: persist the attested agent identity public key DURABLY so a browser can
+    // pin it at bootstrap long after this pending record is swept. Upsert — a
+    // re-enroll mints a fresh identity key, and this newly-approved record carries
+    // it, so last-writer-wins is exactly right. Done only on the fresh-mint path
+    // (an idempotent re-approve above already returned without re-minting; the key
+    // is unchanged and already registered).
+    if (this.agentKeyRegistry) {
+      await this.agentKeyRegistry.put(
+        enrollment.tenant,
+        enrollment.accountId,
+        enrollment.agentPublicKey,
+      );
+    }
 
     return {
       creds: natsCreds,

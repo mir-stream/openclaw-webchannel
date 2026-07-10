@@ -138,6 +138,10 @@ async function startBootstrapServer(): Promise<void> {
       ...process.env,
       PORT: String(BOOTSTRAP_SERVER_PORT),
       SAAS_BASE_URL: BOOTSTRAP_BASE_URL,
+      // F2: this reference bootstrap-server only serves the well-known DEV agent
+      // pin in dev-open mode (it has no enrollment/registry). This is a dev/e2e
+      // harness, so opt in — the /bootstrap response then carries agentPublicKey.
+      WEBCHANNEL_NATS_DEV_OPEN: "1",
     },
     stdio: "pipe",
   });
