@@ -17,7 +17,10 @@
  */
 
 import {
+  DEFAULT_ACCOUNT_ID,
   listWebchannelAccountIds,
+  readAccountsMap,
+  readWebchannelSection,
   resolveWebchannelAccountConfig,
   type WebchannelAccountConfig,
 } from "./account-config.js";
@@ -53,6 +56,8 @@ export function planAccounts(
 ): AccountPlanEntry[] {
   const accountIds = listWebchannelAccountIds(cfg);
 
+  warnOnOrphanedDefault(cfg, opts.warn);
+
   const entries: AccountPlanEntry[] = [];
 
   for (const accountId of accountIds) {
@@ -74,4 +79,33 @@ export function planAccounts(
   }
 
   return entries;
+}
+
+/**
+ * Warn ONCE when the config carries channel-level `auth`/`nats` alongside named
+ * accounts but has NO explicit `accounts.default`. After core's supported
+ * `channels add --account X` migration an explicit `accounts.default` always
+ * exists, so this shape is only reachable via the OLD plugin writer (which wrote
+ * a default flat beside named accounts) or a hand-edit. Under the issue-#17 read
+ * semantics that channel-level default silently stops being served — even though
+ * its enrolled creds may still exist on disk — so surface it at boot.
+ *
+ * Intentionally narrow: tuning / tenant / saas-only shared bases are legitimate
+ * shapes and stay quiet (that boot noise was the original complaint).
+ */
+function warnOnOrphanedDefault(cfg: unknown, warn?: (msg: string) => void): void {
+  if (!warn) return;
+  const section = readWebchannelSection(cfg);
+  if (!section) return;
+  const accounts = readAccountsMap(section);
+  const hasNamedAccounts = Object.keys(accounts).length > 0;
+  if (!hasNamedAccounts) return;
+  if (DEFAULT_ACCOUNT_ID in accounts) return;
+  const hasIdentityBase = "auth" in section || "nats" in section;
+  if (!hasIdentityBase) return;
+  warn(
+    `webchannel: channel-level auth/nats present but no accounts.default — the ` +
+      `"default" account is NOT served (channel-level fields are shared base only). ` +
+      `If a default account was intended, move its fields under accounts.default.`,
+  );
 }

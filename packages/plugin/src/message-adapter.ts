@@ -14,6 +14,10 @@ import type {
   ChannelProgressDraftLineInput,
   DraftStreamLoop,
 } from "openclaw/plugin-sdk/channel-outbound";
+import {
+  stripReasoningTagsFromText,
+  stripInlineDirectiveTagsForDelivery,
+} from "openclaw/plugin-sdk/text-chunking";
 
 import { WEBCHANNEL_ID } from "./transport.js";
 import type { WebChannelTransport } from "./transport.js";
@@ -150,6 +154,29 @@ export type ProgressDraftController = {
   readonly started: boolean;
   /** Record a structured progress event and refresh the draft. */
   pushEvent: (input: ChannelProgressDraftLineInput) => void;
+  /**
+   * Replace the cumulative answer text and refresh the draft (partial mode).
+   * Core's `onPartialReply` delivers the FULL assistant text so far each call
+   * (`text` is cumulative: `${assistantTextByItem.get(itemId) ?? ""}${delta}`,
+   * verified: dist/run-attempt-DRhLt3eF.js:4088-4097), so we REPLACE rather than
+   * append. Once answer text is present the draft body becomes that answer (the
+   * "Label…"/tool scaffold is dropped — the answer replaces the working view).
+   * Empty/undefined text is a no-op so a trailing empty frame can't clobber a
+   * non-empty draft.
+   */
+  pushAnswerText: (text: string) => void;
+  /**
+   * Mark an assistant-message boundary (partial mode). Core's cumulative
+   * `onPartialReply.text` is PER-itemId: on a reply with multiple `final_answer`
+   * assistant messages, the next item's partials restart from `""`. Without
+   * this, our REPLACE semantics would make the already-streamed text of the
+   * prior message visibly vanish until the final lands. Core fires
+   * `onAssistantMessageStart` once per assistant message start — including
+   * before the FIRST message (verified: dist/run-attempt-DRhLt3eF.js:4083-4086);
+   * so this rolls the current `answerText` into an accumulated prefix and resets
+   * it. The first-message call is a no-op (answerText empty).
+   */
+  handleAssistantMessageBoundary: () => void;
   /** Push the freshest pending draft text to the socket now. */
   flush: () => Promise<void>;
   /**
@@ -182,14 +209,35 @@ export function createProgressDraftController(params: {
 
   // Rolling, de-duplicated tool/item lines (most-recent-last, capped).
   const lines: string[] = [];
+  // Cumulative answer text streamed via onPartialReply (partial mode only).
+  // Non-empty once the agent starts emitting final-answer text; it then owns
+  // the whole draft body (see composeText). `answerPrefix` accumulates the text
+  // of ALREADY-COMPLETED assistant messages (per-itemId partials restart from
+  // ""), so a multi-message reply doesn't visibly drop earlier text — see
+  // handleAssistantMessageBoundary.
+  let answerText = "";
+  let answerPrefix = "";
   let stopped = false;
   let started = false;
   let finalized = false;
 
+  // The full streamed answer body so far = completed messages + current one.
+  const answerBody = (): string => answerPrefix + answerText;
+
   const composeText = (): string => {
+    // Once answer text is streaming, it REPLACES the working scaffold (the
+    // "Label…" header + tool lines) — matching draft.update-style text
+    // replacement. Before any answer text arrives, show the working scaffold.
+    const body = answerBody();
+    if (body.length > 0) return body;
     const shown = lines.slice(-maxLines);
     return [`${label}…`, ...shown].join("\n");
   };
+
+  // True when the draft has any content worth flushing before finalize — a
+  // tool/item line OR pending streamed answer text (a partial-mode no-tool turn
+  // has no lines but must still flush its answer text before finalizing).
+  const hasPendingContent = (): boolean => lines.length > 0 || answerBody().length > 0;
 
   const sendOrEditStreamMessage = async (text: string): Promise<boolean> => {
     if (stopped) return false;
@@ -220,6 +268,48 @@ export function createProgressDraftController(params: {
       if (lines[lines.length - 1] !== line) lines.push(line);
       loop.update(composeText());
     },
+    pushAnswerText: (text) => {
+      // No-op on empty/undefined so a trailing empty partial can't clobber a
+      // non-empty draft. Cumulative REPLACE (not append) — see the doc on the
+      // controller type. Routes through the SAME throttled loop as pushEvent,
+      // so `started` is set on the first emitted frame identically.
+      if (!text) return;
+      // Mirror core's Discord partial hygiene exactly (verified:
+      // dist/message-handler.process-CcPQD8zK.js:687-700): strip reasoning +
+      // inline-directive tags, drop a "Reasoning:\n"-prefixed partial, skip an
+      // identical text, and ignore a SHRINKING cumulative text (a shorter
+      // prefix of the current one) to avoid backwards flicker. Signatures
+      // verified: stripReasoningTagsFromText(text,{mode,trim}): string
+      // (chunk-items-DszNsY2v.d.ts:111-114); stripInlineDirectiveTagsForDelivery(
+      // text): { text } (:153).
+      const cleaned = stripInlineDirectiveTagsForDelivery(
+        stripReasoningTagsFromText(text, { mode: "strict", trim: "both" }),
+      ).text;
+      if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
+      if (cleaned === answerText) return;
+      if (
+        answerText &&
+        answerText.startsWith(cleaned) &&
+        cleaned.length < answerText.length
+      ) {
+        return;
+      }
+      answerText = cleaned;
+      loop.update(composeText());
+    },
+    handleAssistantMessageBoundary: () => {
+      // Roll the just-completed message's text into the prefix and reset the
+      // per-item cumulative buffer for the next message. No-op before the first
+      // message (answerText empty). No loop.update: the composed body is
+      // unchanged at the boundary (answerPrefix += answerText; answerText = "")
+      // so nothing visually changes until the next partial arrives. The final
+      // deliver settles the bubble with the fully assembled reply, so any
+      // prefix-vs-final join divergence (e.g. separator spacing) is transient
+      // and self-correcting.
+      if (answerText.length === 0) return;
+      answerPrefix += answerText + "\n\n";
+      answerText = "";
+    },
     flush: () => loop.flush(),
     finalize: async (text) => {
       // Idempotent: the normal delivery path and the error-recovery path may
@@ -237,7 +327,7 @@ export function createProgressDraftController(params: {
       // that abort finalization — the final answer (and, on the error path, the
       // settling frame) still has to be delivered. So swallow a flush failure
       // and proceed to finalizeDraft regardless.
-      if (lines.length > 0) {
+      if (hasPendingContent()) {
         loop.update(composeText());
         try {
           await loop.flush();

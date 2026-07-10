@@ -11,12 +11,16 @@
  *      pure `agents bind` concern (`agents bind --bind webchannel:<account>
  *      --agent <agent>`). This is
  *      the config WRITE. Per core's canonical model, a NAMED account is written
- *      under `channels.webchannel.accounts.<accountId>`; the `"default"` account
- *      stays at the channel-level (the shared/implicit-default base) so a
- *      single-account deployment's on-disk shape is unchanged (regression-safe).
- *      Core runs `moveSingleAccountChannelSectionToDefaultAccount` BEFORE this
- *      hook for a non-default account, so we only ADD the named account and never
- *      duplicate core's promotion.
+ *      under `channels.webchannel.accounts.<accountId>`. Channel level is the
+ *      SHARED BASE only: the `"default"` account is written flat ONLY while no
+ *      named accounts exist (a single-account deployment's on-disk shape is then
+ *      unchanged, regression-safe); once named accounts exist a `"default"` write
+ *      is scoped under `accounts.default` too, mirroring core, so it is actually
+ *      served and its identity fields never contaminate the named accounts as
+ *      shared base (issue #17). Core runs
+ *      `moveSingleAccountChannelSectionToDefaultAccount` BEFORE this hook for a
+ *      non-default account, so we only ADD the named account and never duplicate
+ *      core's promotion.
  *   2. `afterAccountConfigWritten` (async) runs the device-flow enroll for that
  *      account when its credential mode is `enrolled` (default) and per-account
  *      creds are absent — the headless path CI relies on. Progress streams via
@@ -37,9 +41,12 @@
  * concern. Because the generic-flag mapping is semantically surprising (and
  * `--help` still reads "Channel setup URL"), `afterAccountConfigWritten` ECHOES
  * the RESOLVED tenant/accountId/saasBaseUrl (non-secret) before enrolling so a
- * mis-mapping is visible. The unambiguous alternative is the acquisition env
- * (WEBCHANNEL_TENANT / WEBCHANNEL_SAAS_BASE_URL), honored only when no webchannel
- * config exists (see acquisition-env.ts). The mapping is documented in README.md.
+ * mis-mapping is visible, AND the re-run remediation string spells out that
+ * `--url` carries the tenant id. (The legacy acquisition env WEBCHANNEL_TENANT /
+ * WEBCHANNEL_SAAS_BASE_URL is NOT an onboarding alternative here: it is honored
+ * only at gateway-run time when NO webchannel config exists and is deprecated
+ * once config is present — see acquisition-env.ts.) The mapping is documented in
+ * README.md ("Enrollment & credentials → CLI flag mapping").
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
@@ -235,9 +242,18 @@ export function buildFullAccountPatch(params: {
 /**
  * Write an account's config without mutating the caller's config object.
  *
- *   - `"default"` ⇒ merge the patch into the CHANNEL-LEVEL (flat) fields. This
- *     is the shared/implicit-default base; keeping default flat means a
- *     single-account deployment's shape never changes.
+ *   - `"default"` with NO existing named accounts ⇒ merge the patch into the
+ *     CHANNEL-LEVEL (flat) fields. Channel level is the SHARED BASE; while no
+ *     named accounts exist a flat `"default"` is still servable (via the
+ *     empty/absent-accounts fallback), so a single-account deployment's on-disk
+ *     shape never changes.
+ *   - `"default"` WHEN a named `accounts` map already exists ⇒ write the patch
+ *     under `accounts.default` instead of flat. Once named accounts exist,
+ *     channel-level fields are shared base ONLY and no longer conjure an implicit
+ *     default (issue #17); a flat default write would enroll creds for an account
+ *     that `listWebchannelAccountIds` never serves, and its identity fields would
+ *     contaminate the named accounts as shared base. Scoping to `accounts.default`
+ *     mirrors core's own behavior once named accounts exist.
  *   - named account ⇒ merge the patch into `channels.webchannel.accounts.<id>`,
  *     preserving any existing `accounts` map (core has already promoted the prior
  *     flat single-account fields into `accounts.default` for us).
@@ -250,15 +266,21 @@ function writeAccountConfig(
   const channels = { ...((cfg as { channels?: Record<string, unknown> }).channels ?? {}) };
   const section = { ...(readWebchannelSection(cfg) ?? {}) };
 
-  if (accountId === DEFAULT_ACCOUNT_ID) {
-    // Merge at channel level (excluding the structural `accounts` map).
+  const existingAccounts = readAccountsMap(section);
+  const hasNamedAccounts = Object.keys(existingAccounts).length > 0;
+
+  if (accountId === DEFAULT_ACCOUNT_ID && !hasNamedAccounts) {
+    // Merge at channel level (excluding the structural `accounts` map). Safe only
+    // while no named accounts exist — a flat default is still servable then.
     const { accounts, ...flat } = section as { accounts?: unknown } & Record<string, unknown>;
     const mergedFlat = mergePatch(flat, patch);
     const nextSection: Record<string, unknown> = { ...mergedFlat };
     if (accounts !== undefined) nextSection.accounts = accounts;
     channels[WEBCHANNEL_ID] = nextSection;
   } else {
-    const accounts = { ...readAccountsMap(section) };
+    // Named account, OR the default once named accounts exist: scope under
+    // `accounts.<id>` so it is actually served (issue #17).
+    const accounts = { ...existingAccounts };
     accounts[accountId] = mergePatch(accounts[accountId] ?? {}, patch);
     section.accounts = accounts;
     channels[WEBCHANNEL_ID] = section;
@@ -402,7 +424,9 @@ export const webchannelSetup = {
       runtime.log(
         `[webchannel] account "${id}": no saas-base-url provided; cannot run ` +
           `device-flow acquisition. Re-run: openclaw channels add --channel ` +
-          `webchannel --account ${id} --base-url <saas-url> --url <tenant>`,
+          `webchannel --account ${id} --base-url <saas-url> --url <tenant-uuid> ` +
+          `(--url carries the tenant id, not a URL — the flag name is a host-CLI ` +
+          `limitation; --base-url is the SaaS URL)`,
       );
       return;
     }
@@ -412,7 +436,9 @@ export const webchannelSetup = {
     // identity is the account id itself (가-2).
     runtime.log(
       `[webchannel] account "${id}" resolved acquisition identity: ` +
-        `accountId=${id}, tenant=${tenant}, saasBaseUrl=${saasBaseUrl}`,
+        `accountId=${id}, tenant=${tenant}, saasBaseUrl=${saasBaseUrl} ` +
+        `(reminder: on 'channels add' the tenant id rides the --url flag, the ` +
+        `SaaS URL rides --base-url)`,
     );
 
     try {

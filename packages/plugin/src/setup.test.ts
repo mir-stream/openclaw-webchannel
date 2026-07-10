@@ -32,6 +32,7 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 import { webchannelSetup, buildAccountPatch, resolveSetupIdentity } from "./setup.js";
+import { listWebchannelAccountIds } from "./account-config.js";
 
 type Cfg = { channels: { webchannel?: Record<string, unknown> } };
 function section(next: unknown): Record<string, unknown> {
@@ -204,7 +205,7 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     });
   });
 
-  it("writes the DEFAULT account at channel level (flat — regression-safe)", () => {
+  it("writes the DEFAULT account at channel level (flat — regression-safe) when no named accounts exist", () => {
     const cfg = { channels: { webchannel: { allowFrom: ["x"], auth: { strategy: "jwt" } } } } as never;
     const next = webchannelSetup.applyAccountConfig({
       cfg,
@@ -213,9 +214,15 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     });
     // Stays flat: existing fields preserved + tenant merged in (no `accounts` key).
     expect(section(next)).toEqual({ allowFrom: ["x"], auth: { strategy: "jwt" }, tenant: "t" });
+    // A flat default (no accounts map) is still servable via the fallback.
+    expect(listWebchannelAccountIds(next)).toEqual(["default"]);
   });
 
-  it("preserves an existing accounts map when writing the default account", () => {
+  it("scopes the DEFAULT account under accounts.default when a named accounts map exists (issue #17)", () => {
+    // A flat default write here would enroll creds for an account that
+    // listWebchannelAccountIds never serves, and its identity fields would
+    // contaminate the named account as shared base. It must land under
+    // accounts.default so it is actually served.
     const cfg = {
       channels: { webchannel: { auth: { strategy: "jwt" }, accounts: { acctb: { tenant: "tB" } } } },
     } as never;
@@ -225,9 +232,15 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
       input: { tenant: "tDefault" },
     });
     const s = section(next);
-    expect(s.tenant).toBe("tDefault");
+    // Channel-level shared base untouched; default written under accounts.default.
     expect(s.auth).toEqual({ strategy: "jwt" });
-    expect(s.accounts).toEqual({ acctb: { tenant: "tB" } });
+    expect(s.tenant).toBeUndefined();
+    expect(s.accounts).toEqual({
+      acctb: { tenant: "tB" },
+      default: { tenant: "tDefault" },
+    });
+    // Both accounts are now servable — no phantom, no silent drop.
+    expect(listWebchannelAccountIds(next)).toEqual(["acctb", "default"]);
   });
 
   it("adds a named account alongside core's promoted accounts.default (no clobber)", () => {

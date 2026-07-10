@@ -46,6 +46,18 @@ describe("webchannel inbound round-trip", () => {
       // When set, the fake kernel fires these tool/progress callbacks (if the
       // turn supplied replyOptions) before delivering the final reply.
       fireToolProgress?: boolean;
+      // When set, the fake kernel fires onPartialReply (if the turn wired it)
+      // with each cumulative answer text in sequence, AFTER tool progress but
+      // BEFORE delivering the final reply. Simulates core's final-answer stream.
+      partialTexts?: string[];
+      // A finer-grained answer stream than `partialTexts`: an ordered sequence
+      // mixing cumulative partial texts and assistant-message boundaries, so a
+      // test can drive a MULTI-message reply (boundary → per-item cumulative
+      // restarts from ""). Fired in the same slot as `partialTexts`.
+      partialSteps?: Array<{ text: string } | { boundary: true }>;
+      // Captures the replyOptions the turn supplied, so a test can assert which
+      // callbacks were (or were NOT) wired for a given streaming mode.
+      onReplyOptions?: (replyOptions: any) => void;
       // When set, the fake kernel THROWS after firing tool progress (so a draft
       // working bubble is live) but BEFORE delivering the final reply, to
       // exercise the mid-draft error-recovery path.
@@ -92,10 +104,32 @@ describe("webchannel inbound round-trip", () => {
             ctx: turn.ctxPayload,
             onRecordError: () => {},
           });
-          // In progress mode the turn supplies replyOptions whose tool callbacks
+          // Expose the turn's replyOptions so a test can assert which callbacks
+          // the streaming mode wired (e.g. progress mode must NOT wire onPartialReply).
+          opts?.onReplyOptions?.(turn.replyOptions);
+          // In a draft mode the turn supplies replyOptions whose tool callbacks
           // fire DURING the run; emulate one tool event so the draft starts.
           if (opts?.fireToolProgress && turn.replyOptions?.onToolStart) {
             await turn.replyOptions.onToolStart({ name: "web_search", phase: "start" });
+          }
+          // Answer-text streaming: fire onPartialReply with each cumulative text
+          // (core sends the FULL text-so-far each call). Only wired in partial mode.
+          if (opts?.partialTexts && turn.replyOptions?.onPartialReply) {
+            for (const text of opts.partialTexts) {
+              await turn.replyOptions.onPartialReply({ text });
+            }
+          }
+          // Multi-message answer stream: replay a mixed sequence of cumulative
+          // partials and assistant-message boundaries (each only fires if the
+          // turn wired the matching callback — i.e. partial mode).
+          if (opts?.partialSteps) {
+            for (const step of opts.partialSteps) {
+              if ("boundary" in step) {
+                await turn.replyOptions?.onAssistantMessageStart?.();
+              } else if (turn.replyOptions?.onPartialReply) {
+                await turn.replyOptions.onPartialReply({ text: step.text });
+              }
+            }
           }
           // Simulate the turn blowing up mid-draft (after a progress frame, but
           // before the final reply is delivered).
@@ -354,6 +388,265 @@ describe("webchannel inbound round-trip", () => {
     }
   });
 
+  it("streams ANSWER TEXT as progress frames (one draft id) then finalizes the SAME id when streaming.mode=partial (no-tool turn)", async () => {
+    const transport = new WebChannelTransport();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // No tool events this turn — only cumulative answer-text partials.
+      partialTexts: ["Hel", "Hello wor", "Hello world"],
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    // Answer text streamed as progress frames sharing ONE draft id.
+    expect(progressSpy).toHaveBeenCalled();
+    const progId = progressSpy.mock.calls[0][1];
+    for (const call of progressSpy.mock.calls) {
+      expect(call[0]).toBe("web-anon");
+      expect(call[1]).toBe(progId);
+      // Once answer text exists there is NO "Working…" scaffold — the answer
+      // text OWNS the whole draft body (replacement, not append).
+      expect(call[2]).not.toMatch(/…$/m);
+    }
+    // The last emitted frame carries the latest cumulative answer text.
+    const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
+    expect(lastFrameText).toBe("Hello world");
+
+    // The final answer finalized the SAME draft id (working bubble → final text).
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+  });
+
+  it("strips reasoning tags from streamed partials in partial mode (mirrors core hygiene)", async () => {
+    const transport = new WebChannelTransport();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // Reasoning tags must be stripped before hitting the draft; no frame may
+      // ever expose the hidden reasoning content.
+      partialTexts: ["<think>secret plan</think>Hello world"],
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(progressSpy).toHaveBeenCalled();
+    for (const call of progressSpy.mock.calls) {
+      expect(call[2]).not.toContain("secret plan");
+      expect(call[2]).not.toContain("<think>");
+    }
+    const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
+    expect(lastFrameText).toBe("Hello world");
+    const progId = progressSpy.mock.calls[0][1];
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+  });
+
+  it("ignores a SHRINKING cumulative partial (no backwards flicker) in partial mode", async () => {
+    const transport = new WebChannelTransport();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // The second partial is a shorter prefix of the first — core (and now we)
+      // ignore it so the draft never regresses to the shorter text.
+      partialTexts: ["Hello world", "Hello"],
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(progressSpy).toHaveBeenCalled();
+    // No frame ever regresses to the shorter "Hello"; the draft stays at the
+    // longer cumulative text.
+    for (const call of progressSpy.mock.calls) {
+      expect(call[2]).toBe("Hello world");
+    }
+  });
+
+  it("shows label+tool line first, then the answer text replaces the scaffold when streaming.mode=partial (mixed turn)", async () => {
+    const transport = new WebChannelTransport();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      fireToolProgress: true,
+      partialTexts: ["The answer is 42"],
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(progressSpy).toHaveBeenCalled();
+    // Before answer text arrives the draft is the working scaffold: "<Label>…"
+    // header + the formatted tool line.
+    const firstFrameText = progressSpy.mock.calls[0][2];
+    expect(firstFrameText.split("\n")[0]).toMatch(/…$/);
+    expect(firstFrameText).toMatch(/Web Search/i);
+    // Once answer text streams, a later frame's body is the answer text with NO
+    // "…" scaffold header (the answer replaced the working view).
+    const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
+    expect(lastFrameText).toBe("The answer is 42");
+    // Every frame shares the one draft id.
+    const progId = progressSpy.mock.calls[0][1];
+    for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
+  });
+
+  it("preserves earlier message text across an assistant-message boundary in partial mode (no vanish)", async () => {
+    const transport = new WebChannelTransport();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // Two final_answer messages: the second's cumulative partials restart from
+      // "" after the boundary. The already-streamed "First msg" must NOT vanish.
+      partialSteps: [
+        { text: "First msg" },
+        { boundary: true },
+        { text: "Sec" },
+        { text: "Second msg" },
+      ],
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(progressSpy).toHaveBeenCalled();
+    // Every frame after the boundary keeps the first message as a prefix — the
+    // last emitted frame shows both messages joined (prefix preserved).
+    const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
+    expect(lastFrameText).toBe("First msg\n\nSecond msg");
+    // No frame ever drops "First msg" once it has been streamed (no vanish):
+    // the only frames without it are the pre-first-message ones (there are none
+    // here since the first partial IS "First msg").
+    const firstMsgFrames = progressSpy.mock.calls.filter((c) =>
+      (c[2] as string).includes("First msg"),
+    );
+    expect(firstMsgFrames.length).toBe(progressSpy.mock.calls.length);
+    // All frames share one draft id, and the final settles that same id.
+    const progId = progressSpy.mock.calls[0][1];
+    for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+  });
+
+  it("treats an assistant-message boundary BEFORE the first partial as a no-op (no leading blank prefix)", async () => {
+    const transport = new WebChannelTransport();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // Core fires onAssistantMessageStart before the FIRST message too; that
+      // call must be a no-op (answerText empty) — no leading "\n\n" prefix.
+      partialSteps: [
+        { boundary: true },
+        { text: "First" },
+        { text: "First answer" },
+      ],
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(progressSpy).toHaveBeenCalled();
+    // No frame carries a leading blank prefix from the pre-first boundary.
+    for (const call of progressSpy.mock.calls) {
+      expect((call[2] as string).startsWith("\n\n")).toBe(false);
+    }
+    // The very first frame is exactly the first partial's text (no prefix).
+    expect(progressSpy.mock.calls[0][2]).toBe("First");
+  });
+
+  it("does NOT stream answer text in progress mode (onPartialReply is not wired — regression)", async () => {
+    const transport = new WebChannelTransport();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    let seenReplyOptions: any;
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "progress" } },
+      fireToolProgress: true,
+      // Offer partials, but the kernel only fires them if the turn WIRED
+      // onPartialReply — progress mode must not.
+      partialTexts: ["leaked answer text"],
+      onReplyOptions: (ro) => {
+        seenReplyOptions = ro;
+      },
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    // Progress mode wires tool/item events but NOT onPartialReply.
+    expect(seenReplyOptions?.onToolStart).toBeTypeOf("function");
+    expect(seenReplyOptions?.onPartialReply).toBeUndefined();
+    // No progress frame ever contains the answer text; tool-lines-only holds.
+    expect(progressSpy).toHaveBeenCalled();
+    for (const call of progressSpy.mock.calls) {
+      expect(call[2]).not.toContain("leaked answer text");
+    }
+    // The working scaffold header is still present (tool-lines-only view).
+    expect(progressSpy.mock.calls[0][2].split("\n")[0]).toMatch(/…$/);
+  });
+
+  it("streaming.mode=block takes the plain no-id agent_message path (no draft — regression)", async () => {
+    const transport = new WebChannelTransport();
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    let seenReplyOptions: any = "unset";
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "block" } },
+      fireToolProgress: true,
+      partialTexts: ["should not stream"],
+      onReplyOptions: (ro) => {
+        seenReplyOptions = ro;
+      },
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    // No draft: replyOptions is omitted entirely, and delivery falls through to
+    // the plain no-id agent_message append (sendText), never sendProgress/finalize.
+    expect(seenReplyOptions).toBeUndefined();
+    expect(progressSpy).not.toHaveBeenCalled();
+    expect(finalizeSpy).not.toHaveBeenCalled();
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back");
+  });
+
   it("recovers the working bubble when the turn throws mid-draft in progress mode", async () => {
     vi.useFakeTimers();
     try {
@@ -398,6 +691,54 @@ describe("webchannel inbound round-trip", () => {
 
       // The draft loop was stopped: no late background throttled flush fires
       // after the error handling, so no further progress frames are emitted.
+      const progressCountAfterError = progressSpy.mock.calls.length;
+      await vi.runAllTimersAsync();
+      expect(progressSpy.mock.calls.length).toBe(progressCountAfterError);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers the working bubble when the turn throws mid-draft in partial mode (answer-text-only, no tool events)", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new WebChannelTransport();
+      const progressSpy = vi
+        .spyOn(transport, "sendProgress")
+        .mockReturnValue(true);
+      const finalizeSpy = vi
+        .spyOn(transport, "finalizeDraft")
+        .mockReturnValue(true);
+
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        // No tool events — the draft starts purely from streamed answer text,
+        // then the turn throws before the final reply is delivered.
+        partialTexts: ["Partial ans"],
+        throwAfterProgress: true,
+      });
+
+      await expect(
+        handleInboundMessage(api, transport, "web-anon", {
+          type: "user_message",
+          text: "hello",
+        }),
+      ).resolves.toBeUndefined();
+
+      // A working bubble was shown from answer text alone (draft started)...
+      expect(progressSpy).toHaveBeenCalled();
+      const progId = progressSpy.mock.calls[0][1];
+
+      // ...and the SAME draft id was finalized with a non-empty apology, so the
+      // widget settles instead of hanging on the streamed partial forever.
+      expect(finalizeSpy).toHaveBeenCalledTimes(1);
+      const [finSession, finId, finText] = finalizeSpy.mock.calls[0];
+      expect(finSession).toBe("web-anon");
+      expect(finId).toBe(progId);
+      expect((finText as string).length).toBeGreaterThan(0);
+
+      // Loop stopped: no late background flush after error handling.
       const progressCountAfterError = progressSpy.mock.calls.length;
       await vi.runAllTimersAsync();
       expect(progressSpy.mock.calls.length).toBe(progressCountAfterError);
