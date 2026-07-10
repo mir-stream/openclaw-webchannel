@@ -25,6 +25,7 @@ import type { WebchannelEncryptionConfig } from "./src/encryption-policy.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
 import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
+import { isControlLaneMessage } from "./src/control-lane.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
@@ -562,6 +563,40 @@ export default defineChannelPluginEntry({
       );
       channel.setMessageHandler((peerId, message) => {
         if (message.type !== "user_message") return; // approvals routed below
+        // Control lane (P1-8a): an abort ("/stop"/"stop"/…) must reach core's
+        // fast-abort WHILE the running turn is live, so it must NOT queue behind
+        // that turn on the per-session FIFO. Dispatch it directly, fire-and-
+        // forget, as an authorized control-lane turn. All the testable logic
+        // lives in `isControlLaneMessage` + `handleInboundMessage` (both under
+        // tsc + vitest); this file just routes.
+        //
+        // Unlike the FIFO path (inbound-queue.ts swallows a rejected turn), this
+        // direct dispatch has no chain to absorb a throw, and the pre-try work in
+        // handleInboundMessage (config/admission/route resolution, sendTyping)
+        // runs OUTSIDE its internal try/catch — so we MUST attach a rejection
+        // handler here or an unhandledRejection would take down the gateway.
+        //
+        // Authorization note: if an operator sets `commands.allowFrom` that
+        // EXCLUDES this peer, core's fast-abort returns handled:false (verified
+        // dist-B2e1grFo.js:1281) and the abort frame falls through to a NORMAL
+        // turn that races the running one, hits core's busy gate, and is dropped
+        // as busy. No wedge and no double-delivery — the /stop is simply ignored
+        // for an unauthorized sender.
+        if (isControlLaneMessage(message)) {
+          void handleInboundMessage(
+            api,
+            channel as unknown as WebChannelTransport,
+            peerId,
+            message,
+            accountId,
+            { controlLane: true },
+          ).catch((err) =>
+            api.logger.error?.(
+              `webchannel: control-lane dispatch failed: ${String(err)}`,
+            ),
+          );
+          return;
+        }
         dispatchInbound(peerId, message);
       });
 
