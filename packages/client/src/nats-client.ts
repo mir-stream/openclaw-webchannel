@@ -193,7 +193,10 @@ export type InboundMessage = {
 };
 
 export type OutboundMessage =
-  | { type: "user_message"; text: string }
+  // P0-7a: `id` is a stable, unique id stamped per logical send so the agent can
+  // dedupe a re-delivered frame at ingress. Always set on the send path below;
+  // typed optional to mirror the wire union (older clients omit it).
+  | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: string }
   | { type: "load_history"; before?: string; limit?: number }
   // P0-3: request the slash-command discovery catalog.
@@ -898,7 +901,14 @@ export class WebChannelNatsClient {
 
   /** Send user message (buffered until the handshake completes). */
   sendUserMessage(text: string): void {
-    this.enqueue({ type: "user_message", text });
+    // P0-7a: stamp a stable, unique id per logical send. The agent records it at
+    // ingress and drops a duplicate frame (rapid double-submit; a future replay
+    // queue re-send after reconnect) so it never runs the turn twice. Reuse the
+    // package's existing randomness helper (WebCrypto-preferring, Math.random
+    // fallback) rather than `crypto.randomUUID` so we match the client's
+    // established host assumptions; the id only needs to be collision-unguessable,
+    // not a UUID.
+    this.enqueue({ type: "user_message", text, id: randomInboxToken() });
   }
 
   /** Send approval decision (buffered until the handshake completes). */

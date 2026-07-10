@@ -322,7 +322,14 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     const sent = server.published.filter((p) => p.subject === inS);
     expect(sent).toHaveLength(1);
     expect(sent[0].payload).not.toContain("hello agent");
-    expect(openMessage(sent[0].payload, K)).toEqual({ type: "user_message", text: "hello agent" });
+    // P0-7a: the frame now also carries a stable client `id` for ingress dedupe.
+    const opened = openMessage(sent[0].payload, K) as {
+      type: string;
+      text: string;
+      id?: unknown;
+    };
+    expect(opened).toMatchObject({ type: "user_message", text: "hello agent" });
+    expect(typeof opened.id).toBe("string");
 
     // Inbound sealed with K decrypts and is delivered.
     const outS = outboundSubject(TENANT, AGENT, PEER);

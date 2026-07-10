@@ -34,6 +34,8 @@ import {
   createInboundDebouncer,
   resolveInboundDebounceMs,
 } from "openclaw/plugin-sdk/reply-runtime";
+import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
+import { filterFreshInboundItems } from "./src/ingress-dedupe.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
@@ -598,6 +600,27 @@ export default defineChannelPluginEntry({
         );
       const dispatchInbound = inboundDispatcher.dispatch;
 
+      // P0-7a: per-account ingress idempotency. Each `user_message` carries a
+      // stable client `id`; we record `${peerId}:${id}` at admission with a 7-day
+      // window (Telegram parity) and drop a duplicate frame before it runs a
+      // second turn. ONE instance PER ACCOUNT — namespace = accountId, so ids are
+      // isolated per account and a peer cannot poison another peer's ids. We use
+      // `createPersistentDedupe` (record-at-ingress), NOT `createClaimableDedupe`
+      // (claim/commit); the rationale for at-most-once admission over
+      // claim/forget rollback lives in ingress-dedupe.ts. A disk fault degrades
+      // to memory-only (onDiskError → warn) and never blocks inbound.
+      const inboundDedupe = createPersistentDedupe({
+        pluginId: WEBCHANNEL_ID,
+        ttlMs: 7 * 24 * 60 * 60 * 1000,
+        memoryMaxSize: 2048,
+        stateMaxEntries: 5000,
+        onDiskError: (err) =>
+          api.logger?.warn?.(
+            `webchannel: account "${accountId}" ingress dedupe disk error ` +
+              `(degrading to memory-only): ${String(err)}`,
+          ),
+      });
+
       // P1-8b layer (a): idle pre-run debounce (Telegram parity), REUSING core's
       // `createInboundDebouncer`. Sits IN FRONT of the per-session FIFO: rapid
       // same-peer messages within the debounce window flush together as ONE
@@ -624,11 +647,27 @@ export default defineChannelPluginEntry({
         serializeImmediate: true,
         buildKey: (item) => item.peerId,
         onFlush: async (items) => {
-          const first = items[0];
+          // P0-7a ingress dedupe. Runs HERE (not in setMessageHandler) because
+          // onFlush is same-peer serialized by core's keyChains — so awaiting the
+          // async `checkAndRecord` cannot reorder same-peer messages, whereas a
+          // SQLite miss awaited in the fire-and-forget setMessageHandler could.
+          // Drop items whose `${peerId}:${id}` was already admitted within the
+          // window; id-less items (older clients) pass through; on a dedupe fault
+          // we fail open (keep the message). An all-duplicates batch dispatches
+          // nothing. Control-lane (/stop) frames bypass the debouncer entirely, so
+          // they are never deduped (a duplicate abort is a cosmetic double bubble,
+          // and the abort path must not wait on SQLite).
+          const fresh = await filterFreshInboundItems(
+            items,
+            accountId,
+            (key, opts) => inboundDedupe.checkAndRecord(key, opts),
+            (m) => api.logger?.info?.(m),
+          );
+          const first = fresh[0];
           if (!first) return;
           dispatchInbound(
             first.peerId,
-            coalesceUserMessages(items.map((i) => i.message)),
+            coalesceUserMessages(fresh.map((i) => i.message)),
           );
         },
         onError: (err) =>

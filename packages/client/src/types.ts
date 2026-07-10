@@ -195,7 +195,11 @@ export type WebChannelOptions = {
 
 /** Wire envelope sent TO the gateway. Mirrors `src/transport.ts`. */
 export type InboundWsMessage =
-  | { type: "user_message"; text: string }
+  // P0-7a: `id` is a stable, client-minted unique id per logical send, used for
+  // server-side ingress idempotency (a rapid double-submit or a future replay is
+  // deduped). OPTIONAL for back-compat: an older client omits it and the frame
+  // is not deduped.
+  | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
   /**
    * History pagination request. The widget emits this when the user scrolls

@@ -50,7 +50,11 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 export type InboundWsMessage =
-  | { type: "user_message"; text: string }
+  // P0-7a: `id` is a stable, client-minted unique id for this logical send. It is
+  // OPTIONAL for back-compat — an older client omits it and the frame passes
+  // through un-deduped. When present, the server records `${peerId}:${id}` at
+  // ingress (7-day window) and silently drops a duplicate before it runs a turn.
+  | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
   | { type: "load_history"; before?: string; limit?: number }
   // P0-3 slash-command DISCOVERY: the browser asks for the command catalog (no
