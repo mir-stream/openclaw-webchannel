@@ -217,12 +217,28 @@ export function createProgressDraftController(params: {
   // handleAssistantMessageBoundary.
   let answerText = "";
   let answerPrefix = "";
+  // Count of message boundaries we ALREADY rolled up ourselves because we
+  // detected the seam from the partial stream before core's
+  // `onAssistantMessageStart` arrived (or when it never arrives). A belated
+  // start event for such an already-rolled seam must be a no-op — see
+  // handleAssistantMessageBoundary. Guards against a double-roll.
+  let absorbedMissedBoundaries = 0;
   let stopped = false;
   let started = false;
   let finalized = false;
 
   // The full streamed answer body so far = completed messages + current one.
   const answerBody = (): string => answerPrefix + answerText;
+
+  // Roll the just-completed message's text into the accumulated prefix and
+  // reset the per-item cumulative buffer for the next message. No-op when
+  // there is nothing to roll (answerText empty), so a redundant/leading
+  // boundary never appends an empty "\n\n" segment.
+  const rollCurrentIntoPrefix = (): void => {
+    if (answerText.length === 0) return;
+    answerPrefix += answerText + "\n\n";
+    answerText = "";
+  };
 
   const composeText = (): string => {
     // Once answer text is streaming, it REPLACES the working scaffold (the
@@ -294,6 +310,29 @@ export function createProgressDraftController(params: {
       ) {
         return;
       }
+      // MISSED-BOUNDARY DEFENSE. Correctness of the REPLACE semantics rests on
+      // core rolling the prior message into the prefix (via
+      // handleAssistantMessageBoundary) BEFORE the first partial of a new
+      // message. That is an unpinned cross-package contract; if the boundary
+      // event is late or never fires, a new message's cumulative partial (which
+      // restarts from "") would otherwise CLOBBER the prior message's streamed
+      // text and later duplicate it against the assembled final.
+      //
+      // Within a single message the cumulative `text` only grows, so each
+      // partial has the current body as a PREFIX. A partial that is neither an
+      // extension of `answerText` nor a shrinking prefix of it (both handled
+      // above) has therefore DIVERGED — a new message began without a boundary.
+      // We perform the same prefix-rollup the boundary would have and count it,
+      // so a belated boundary for this seam degrades to a no-op instead of
+      // rolling twice.
+      //
+      // NOTE: core's `onPartialReply` payload carries no itemId in the pinned
+      // dist (PartialReplyPayload = { text; delta? }), so this seam is detected
+      // from the cumulative text, not an itemId compare.
+      if (answerText.length > 0 && !cleaned.startsWith(answerText)) {
+        rollCurrentIntoPrefix();
+        absorbedMissedBoundaries += 1;
+      }
       answerText = cleaned;
       loop.update(composeText());
     },
@@ -306,9 +345,16 @@ export function createProgressDraftController(params: {
       // deliver settles the bubble with the fully assembled reply, so any
       // prefix-vs-final join divergence (e.g. separator spacing) is transient
       // and self-correcting.
-      if (answerText.length === 0) return;
-      answerPrefix += answerText + "\n\n";
-      answerText = "";
+      //
+      // IDEMPOTENCY: if the partial-ingest path already detected and rolled this
+      // seam (a boundary that arrived late, after the new message's first
+      // partial), consume the count and no-op — otherwise we would roll the new
+      // (in-progress) message's text into the prefix a second time.
+      if (absorbedMissedBoundaries > 0) {
+        absorbedMissedBoundaries -= 1;
+        return;
+      }
+      rollCurrentIntoPrefix();
     },
     flush: () => loop.flush(),
     finalize: async (text) => {

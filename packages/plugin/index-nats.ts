@@ -17,6 +17,7 @@ import { AsyncResource } from "node:async_hooks";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
 import { NatsChannel } from "./src/nats-channel.js";
+import type { RegisterChannelSurface } from "./src/nats-channel.js";
 import type { InboundWsMessage, NatsChannelCryptoOptions } from "./src/nats-channel.js";
 import { ConversationKeyStore } from "./src/conversation-key-store.js";
 import { resolveEncryptionPolicy } from "./src/encryption-policy.js";
@@ -629,6 +630,11 @@ export default defineChannelPluginEntry({
         // mint a colliding `sub`/peerId. (A process-wide store keyed by bare
         // peerId would re-open that cross-account eviction across a sub collision.)
         const accountPopChallenges = new PopChallengeStore();
+        // Narrow, typed view of the channel methods the register deps feed. The
+        // `RegisterChannelSurface` contract (Pick over NatsChannel, declared in
+        // a type-checked file) is what makes dropping any of these methods from
+        // NatsChannel a compile error — this file is outside `tsc`'s include set.
+        const registerChannel: RegisterChannelSurface = channel;
         channel.setRegisterRequestHandler((subjectPeerId, payload, reply) => {
           // The handler is internally guarded (it replies REGISTER_FAILED on any
           // throw), but attach a `.catch` here too as defense-in-depth: a future
@@ -640,10 +646,10 @@ export default defineChannelPluginEntry({
             reply,
             verifyIdentity: (jwt, a) => verifyJwtAndExtractIdentity(jwt, a, api.logger),
             popChallenges: accountPopChallenges,
-            registerPeer: (pid) => channel.registerPeer(pid),
+            registerPeer: (pid) => registerChannel.registerPeer(pid),
             wrapConversationKeyForDevice: (pid, key) =>
-              channel.wrapConversationKeyForDevice(pid, key),
-            unregisterPeer: (pid) => channel.unregisterPeer(pid),
+              registerChannel.wrapConversationKeyForDevice(pid, key),
+            unregisterPeer: (pid) => registerChannel.unregisterPeer(pid),
             sendHistorySnapshot: (pid) =>
               sendHistorySnapshot(accountId, channel, historyConfig, pid),
             // #15/#19: authoritative pending-approval snapshot PLUS recently-
@@ -655,11 +661,12 @@ export default defineChannelPluginEntry({
             // `approval_resolved`, and this is list→list→publish atomically — so a
             // snapshot can never list an approval whose resolve frame preceded it,
             // nor omit an approval from BOTH lists while the client awaits it.
-            // Sent even when empty (retires stale cards). NatsChannel reaches this
-            // via `as unknown as` casts, so typecheck won't force the method to
-            // exist — the direct wiring + channel test cover it.
+            // Sent even when empty (retires stale cards). Reached through the
+            // typed `registerChannel` (RegisterChannelSurface) so removing
+            // `sendApprovalSnapshot` from NatsChannel is a compile error at the
+            // contract, not a silent runtime break here.
             sendApprovalSnapshot: (pid) =>
-              channel.sendApprovalSnapshot(
+              registerChannel.sendApprovalSnapshot(
                 pid,
                 listPendingApprovalsForPeer(accountId, pid),
                 listResolvedApprovalsForPeer(accountId, pid),
