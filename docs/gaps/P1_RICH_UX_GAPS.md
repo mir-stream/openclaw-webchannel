@@ -9,9 +9,12 @@
 > **Reference channel.** Telegram extension at `/Users/mircorn/workspace/openclaw/extensions/telegram/src/`.
 > **openclaw core** (peer dep, sibling checkout): `/Users/mircorn/workspace/openclaw/src/`.
 >
-> **⚠️ Re-anchored 2026-07-03.** The integrated showcase demo rewrote the demo surface (now
-> `demo/web/src/widget.ts` over the `WebChannelNATSClient` reducer). **P1-7 (error/reconnect UX) is
-> mostly built** by that work (marked ✅). Markdown/media/reasoning/doctor remain open.
+> **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-10 (post-#14/#15/#16/#19 tree).** The integrated
+> showcase demo rewrote the demo surface (now `demo/web/src/widget.ts` over the `WebChannelNATSClient`
+> reducer). **P1-7 (error/reconnect UX) is mostly built** by that work (marked ✅).
+> Markdown/media/reasoning/doctor remain open. Note (#14): the plugin now has a **partial-mode
+> answer-text stream** (`streaming.mode:"partial"`, `inbound.ts:124-126`) — P1-3's reasoning lane
+> would build on that existing stream, not a net-new one.
 >
 > **⚠️ Line numbers drift.** The demo is still being built, so `file:line` anchors are approximate
 > and keep moving — trust the file + symbol name and search if a line has shifted. Not re-anchored
@@ -52,10 +55,10 @@ already in the `agent_message` text).
 
 **Where it stands today.**
 - The agent's reply text is markdown (openclaw agents emit markdown); it arrives intact in
-  `agent_message.text` and the reducer stores it verbatim (`nats-client-wrapper.ts:383`).
-- **The widget renders it as a text node:** `demo/web/src/widget.ts:126-140` builds each bubble with
-  `[m.text]` as a child (`white-space:pre-wrap`), so all markup is literal. `ChatMessage` only
-  carries `text` (`types.ts:22-28`).
+  `agent_message.text` and the reducer stores it verbatim (`nats-client-wrapper.ts:569`).
+- **The widget renders it as a text node:** `demo/web/src/widget.ts:146-158` builds each bubble with
+  `[m.text]` (`:156`) as a child (`white-space:pre-wrap`, `:150`), so all markup is literal.
+  `ChatMessage` only carries `text` (`types.ts:22-28`).
 
 **Telegram reference (content model — NOT the transport limits).**
 - `format.ts:158` `markdownToTelegramHtml()` / `:1132` `markdownToTelegramRichHtml()`.
@@ -120,9 +123,13 @@ the layout, and streaming growth doesn't yank the viewport.
 **Classification.** 🔴 Missing. Needs a server decision (emit reasoning separately) + client render
 (collapsible lane).
 
-**Where it stands today.** Our progress/answer path (`inbound.ts:109-269`) streams one draft; no
-reasoning/answer split. The `progress` frame is a single text stream (reducer `case "progress"`,
-`nats-client-wrapper.ts:371`).
+**Where it stands today.** Post-#14 the plugin already streams **answer text** in `"partial"` mode
+(`inbound.ts:124-126`, `onPartialReply` → `draft.pushAnswerText`), but there is still **no
+reasoning/answer split** — reasoning is not separated from the answer stream. Both `partial`
+(answer) and `progress` (tool lines) share the single `progress` frame and one working draft (reducer
+`case "progress"`, `nats-client-wrapper.ts:557`). A reasoning lane would build **on top of** that
+existing partial stream (a separate reasoning frame/field feeding a collapsible lane), not a new
+stream from scratch.
 
 **Telegram reference.**
 - `reasoning-lane-coordinator.ts:68` `splitTelegramReasoningText()` — splits `{reasoningText,
@@ -264,18 +271,18 @@ rejection) were hard to distinguish from transient ones.
   jitter).
 - **Terminal vs transient classified:** `WebChannelNatsClient` treats PoP/NKEY registration failure
   as terminal (tears down, no retry) and distinguishes it from a transient
-  `Authentication Timeout` / `Permissions Violation` (the `-ERR` classifier at `nats-client.ts:444-460`;
-  `authorization violation` / `authentication expired` → terminal `failTerminally` `:531`, while
-  timeout/cancelled/permissions stay transient), surfacing via `onError`.
+  `Authentication Timeout` / `Permissions Violation` (the `-ERR` classifier at `nats-client.ts:542`;
+  `authorization violation` / `authentication expired` → terminal `failTerminally` (`:551`, def
+  `:629`), while timeout/cancelled/permissions stay transient), surfacing via `onError`.
 - **Wrapper maps it to state:** `nats-client-wrapper.ts:103-105` `onError` → `status:"error"` +
   `error` message; `onState` → `connected`/`reconnecting` (guards against a trailing `onState(false)`
   downgrading a terminal error, `:89-95`).
 - **Widget renders distinct states:** a status pill (`connecting…`/`connected`/`reconnecting…`/
-  `error`, `widget.ts:23-28,100-105`), and on `status==="error"` a distinct **"Credentials expired"**
+  `error`, `widget.ts:23-28,119-124`), and on `status==="error"` a distinct **"Credentials expired"**
   box with a one-click **Re-authenticate** button that mints a fresh credential
-  (`widget.ts:109-119`); input/send disabled while terminal.
-- `ConnectionStatus` union in the type (`types.ts:66`); `WebChannelState.error` carries the reason
-  (`types.ts:85`).
+  (`widget.ts:127-133`); input/send disabled while terminal.
+- `ConnectionStatus` union in the type (`types.ts:79`); `WebChannelState.error` carries the reason
+  (`types.ts:98`).
 
 **Telegram reference.**
 - `network-errors.ts` — `isRecoverableTelegramNetworkError()` (`:305`), `readTelegramRetryAfterMs()`
@@ -289,7 +296,8 @@ rejection) were hard to distinguish from transient ones.
    distinguishes terminal vs transient internally; thread a cause tag into the callback so the widget
    can label it more specifically than the current single "Credentials expired" copy.
 2. **Send-while-down** — pairs with P0-7; at minimum disable the send button + show "reconnecting…"
-   instead of silently dropping (the terminal case already disables send at `widget.ts:118-119`).
+   instead of silently dropping (the terminal case already disables send in the error box render at
+   `widget.ts:127-133`).
 
 **Acceptance (mostly met).** A network blip shows "reconnecting…"; a credential rejection shows a
 distinct terminal message with a recovery action (✅). Finer per-cause wording is the open slice.
@@ -309,9 +317,9 @@ coalescing. This is a **Telegram parity gap** (Telegram has both).
 **Where it stands today — why `/stop` is not "already there".**
 - Every `user_message` is enqueued with **no content inspection**:
   ```js
-  // packages/plugin/index-nats.ts:742-745
+  // packages/plugin/index-nats.ts:510-513
   channel.setMessageHandler((peerId, message) => {
-    if (message.type !== "user_message") return;
+    if (message.type !== "user_message") return; // approvals routed below
     dispatchInbound(peerId, message);        // → per-session FIFO, unconditionally
   });
   ```
@@ -343,12 +351,13 @@ coalescing. This is a **Telegram parity gap** (Telegram has both).
   `debounceLane`) — rapid same-sender/same-conversation messages are batched before the turn runs.
 
 **Implementation sketch.**
-1. **`/stop` abort (out-of-band).** In `channel.setMessageHandler` (`index-nats.ts:742`), **before**
-   `dispatchInbound`, check `isAbortRequestText(message.text)` (import from
+1. **`/stop` abort (out-of-band).** In `channel.setMessageHandler` (`index-nats.ts:510-513`),
+   **before** `dispatchInbound`, check `isAbortRequestText(message.text)` (import from
    `openclaw/plugin-sdk/reply-runtime`, re-exported from `command-primitives-runtime`). If true:
-   resolve the session key (`channelRuntime.routing.resolveAgentRoute`, as `inbound.ts:125`) and call
+   resolve the session key (`resolveWebchannelSessionRoute`, as `inbound.ts:145`) and call
    `abortReplyRunBySessionId(sessionKey)` **without enqueuing**. Optionally finalize the in-flight
-   working draft via the existing `inbound.ts:258-283` path with a "⏹ stopped" text.
+   working draft via the existing on-error finalize path (the `catch` block at `inbound.ts:309-333`,
+   `draft.finalize` `:321`) with a "⏹ stopped" text.
 2. **Client "Stop" affordance.** In `demo/web/src/widget.ts`, while `state.isTyping` or a working
    draft exists, toggle the Send button to **Stop**; on click call a new
    `client.stop()` on the wrapper (`nats-client-wrapper.ts`) that sends a stop signal. **Wire
