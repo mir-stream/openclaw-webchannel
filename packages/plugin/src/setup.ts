@@ -37,9 +37,12 @@
  * concern. Because the generic-flag mapping is semantically surprising (and
  * `--help` still reads "Channel setup URL"), `afterAccountConfigWritten` ECHOES
  * the RESOLVED tenant/accountId/saasBaseUrl (non-secret) before enrolling so a
- * mis-mapping is visible. The unambiguous alternative is the acquisition env
- * (WEBCHANNEL_TENANT / WEBCHANNEL_SAAS_BASE_URL), honored only when no webchannel
- * config exists (see acquisition-env.ts). The mapping is documented in README.md.
+ * mis-mapping is visible, AND the re-run remediation string spells out that
+ * `--url` carries the tenant id. (The legacy acquisition env WEBCHANNEL_TENANT /
+ * WEBCHANNEL_SAAS_BASE_URL is NOT an onboarding alternative here: it is honored
+ * only at gateway-run time when NO webchannel config exists and is deprecated
+ * once config is present — see acquisition-env.ts.) The mapping is documented in
+ * README.md ("Enrollment & credentials → CLI flag mapping").
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
@@ -402,7 +405,9 @@ export const webchannelSetup = {
       runtime.log(
         `[webchannel] account "${id}": no saas-base-url provided; cannot run ` +
           `device-flow acquisition. Re-run: openclaw channels add --channel ` +
-          `webchannel --account ${id} --base-url <saas-url> --url <tenant>`,
+          `webchannel --account ${id} --base-url <saas-url> --url <tenant-uuid> ` +
+          `(--url carries the tenant id, not a URL — the flag name is a host-CLI ` +
+          `limitation; --base-url is the SaaS URL)`,
       );
       return;
     }
@@ -412,7 +417,9 @@ export const webchannelSetup = {
     // identity is the account id itself (가-2).
     runtime.log(
       `[webchannel] account "${id}" resolved acquisition identity: ` +
-        `accountId=${id}, tenant=${tenant}, saasBaseUrl=${saasBaseUrl}`,
+        `accountId=${id}, tenant=${tenant}, saasBaseUrl=${saasBaseUrl} ` +
+        `(reminder: on 'channels add' the tenant id rides the --url flag, the ` +
+        `SaaS URL rides --base-url)`,
     );
 
     try {

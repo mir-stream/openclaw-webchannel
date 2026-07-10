@@ -48,6 +48,26 @@ auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See 
 `src/enrollment-client.ts` implements plugin-side onboarding over the **RFC 8628 device flow**
 — ingress-free (outbound HTTPS only, no listening sockets, no secret pasting).
 
+### CLI flag mapping (`channels add`)
+
+OpenClaw's `channels add` parses a **fixed generic flag set**, and a non-bundled plugin cannot
+register its own commander flags. So on the non-interactive onboarding command the identity rides
+mapped generic flags — note that **the tenant id goes on `--url`, not `--base-url`**:
+
+```
+openclaw channels add --channel webchannel \
+  --account <accountId>     # the on-wire identity
+  --base-url <saas-url>     # → saasBaseUrl (the SaaS issuer URL)
+  --url     <tenant-uuid>   # → tenant   (yes, the TENANT id — flag name is a host-CLI limitation)
+```
+
+`--url` reading "Channel setup URL" in `--help` is the host CLI's generic text; there is no
+plugin-registered `--tenant`/`--saas-base-url`. `afterAccountConfigWritten` echoes the resolved
+`accountId`/`tenant`/`saasBaseUrl` before enrolling so a mis-mapping is visible immediately. The
+interactive `channels add` **wizard** prompts for tenant by name and avoids the flag entirely.
+(The legacy `WEBCHANNEL_TENANT` env is not an onboarding alternative — it is honored only at
+gateway-run time when no webchannel config exists, and is deprecated once config is present.)
+
 ```ts
 import { EnrollmentClient } from "./src/enrollment-client.js";
 
