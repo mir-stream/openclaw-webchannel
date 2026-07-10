@@ -34,6 +34,7 @@ await ok("saas barrel exposes operator symbols", async () => {
     "generateRsaKeypair",
     "DeviceFlowEnrollment",
     "MemoryEnrollmentStore",
+    "UserCodeCollisionError",
     "buildBootstrapClaims",
   ]) {
     assert.equal(typeof saas[sym], "function", `expected ${sym} to be exported`);

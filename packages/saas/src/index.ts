@@ -30,7 +30,12 @@
 export { setupTrustChain } from "./setup-trust-chain.js";
 export { generateRsaKeypair } from "./setup-trust-chain.js";
 export { loadOrCreateTrustChain } from "./persistent-trust-chain.js";
-export { DeviceFlowEnrollment, MemoryEnrollmentStore, type EnrollmentStore } from "./device-flow-enrollment.js";
+export {
+  DeviceFlowEnrollment,
+  MemoryEnrollmentStore,
+  UserCodeCollisionError,
+  type EnrollmentStore,
+} from "./device-flow-enrollment.js";
 export { buildBootstrapClaims } from "./bootstrap-claims.js";
 export type {
   BootstrapClaims,
