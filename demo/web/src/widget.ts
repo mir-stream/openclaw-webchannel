@@ -84,11 +84,14 @@ export async function createWidget(
   bodyEl.append(topBar, mdHint, errBox, list, approvalsBox, cmdMenu, composer);
 
   let client: WebChannelNATSClient | null = null;
-  // P0-3 typeahead state. `commandsRequested` makes catalog discovery LAZY:
-  // requested once per client (reset in connectLane, so a re-auth re-requests
-  // for the fresh client). `menuDismissed` lets Escape hide the menu until the
-  // next keystroke.
-  let commandsRequested = false;
+  // P0-3 typeahead state. `commandsRequestedAt` makes catalog discovery LAZY
+  // and self-healing: we record WHEN we last asked (reset to null in
+  // connectLane, so a re-auth re-requests for the fresh client). If the catalog
+  // frame never arrives (server-side build failed), we retry on a cooldown
+  // rather than latching dead until reconnect. `menuDismissed` lets Escape hide
+  // the menu until the next keystroke.
+  let commandsRequestedAt: number | null = null;
+  const COMMANDS_REQUEST_COOLDOWN_MS = 3000;
   let menuDismissed = false;
 
   // ── Render ───────────────────────────────────────────────────────────────
@@ -191,15 +194,20 @@ export async function createWidget(
     const value = input.value;
     const isSlash = value.startsWith("/");
 
-    // Lazy discovery: fetch the catalog once when the user first starts a
-    // slash-command (per client — reset on reconnect via connectLane). Gated
-    // on `client` existing: a `/` typed during the connect window must NOT
-    // latch `commandsRequested` with no request dispatched (that would
-    // silently disable the typeahead until re-auth) — it stays unlatched and
-    // retries on the next keystroke.
-    if (isSlash && !commandsRequested && client) {
-      commandsRequested = true;
-      client.loadCommands();
+    // Lazy discovery: fetch the catalog when the user starts a slash-command
+    // (per client — reset on reconnect via connectLane). Gated on `client`
+    // existing: a `/` typed during the connect window must NOT record a request
+    // with nothing dispatched. We re-request only while NO catalog frame has
+    // ever landed — `getState().commands` is undefined until the first
+    // `commands` frame, after which it is an array (even empty) and we stop
+    // asking. If the server-side build failed and no frame arrives, retry on a
+    // cooldown so the typeahead heals without needing a reconnect.
+    if (isSlash && client && client.getState().commands === undefined) {
+      const now = Date.now();
+      if (commandsRequestedAt === null || now - commandsRequestedAt > COMMANDS_REQUEST_COOLDOWN_MS) {
+        commandsRequestedAt = now;
+        client.loadCommands();
+      }
     }
 
     const matches = menuDismissed
@@ -249,7 +257,7 @@ export async function createWidget(
     client = null;
     // Fresh client → re-request the command catalog on the next `/` (its state
     // starts without a catalog).
-    commandsRequested = false;
+    commandsRequestedAt = null;
     menuDismissed = false;
     statusPill.textContent = "● connecting…";
     statusPill.style.color = "var(--warn)";

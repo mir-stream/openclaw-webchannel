@@ -639,6 +639,15 @@ export default defineChannelPluginEntry({
       // invalidate) and seal it back over `.out`. Same error-log-and-continue
       // robustness as the history handler: a catalog build fault must never
       // surface as an unhandled throw on the inbound dispatch path.
+      //
+      // EXPOSURE DECISION (deliberate): unlike the history/approval snapshots —
+      // which are register-hop-gated because they carry the user's own data —
+      // the `commands` frame is served to ANY handshaken peer, including
+      // wildcard / `admission:"auto"` peers. Auto-mode peers never call
+      // registerPeer, so gating discovery on registration would kill the
+      // typeahead in auto mode entirely. The catalog is low-sensitivity command
+      // metadata (names / descriptions / args), already config-filtered by
+      // buildCommandCatalog — so serving it to any handshaken peer is accepted.
       channel.setLoadCommandsHandler((peerId) => {
         try {
           channel.sendCommands(peerId, buildCommandCatalog(api.config));
