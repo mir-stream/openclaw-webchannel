@@ -19,6 +19,7 @@
 import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/client/src/index.js";
 import type { WebChannelState, ApprovalRequest } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
+import { renderMarkdown } from "./markdown.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
   connecting: "connecting…",
@@ -93,6 +94,20 @@ export async function createWidget(
   let commandsRequestedAt: number | null = null;
   const COMMANDS_REQUEST_COOLDOWN_MS = 3000;
   let menuDismissed = false;
+
+  // Per-message memo of rendered markdown DOM, keyed by message id + text.
+  // render() is subscribed to client state and re-runs on EVERY change (each
+  // streaming partial, typing flip, approval, etc.), rebuilding the whole bubble
+  // list each pass. renderMarkdown is a synchronous, worst-case O(n²) parse up to
+  // the 20k cap, so without a memo every stable agent bubble re-parses on every
+  // later partial while it sits in the transcript. Keying by id+text means a
+  // `working` draft (whose text grows each partial) naturally misses and
+  // re-renders — correct — while unchanged messages hit the cache. Reusing the
+  // SAME element instance is fine: the element just moves into the fresh bubble
+  // container on re-append. The cache is rebuilt from the prior one each pass
+  // (see render()), so departed messages drop out and it stays bounded by the
+  // live transcript.
+  let mdCache = new Map<string, HTMLElement>();
 
   // ── Render ───────────────────────────────────────────────────────────────
   function renderApproval(a: ApprovalRequest): HTMLElement {
@@ -170,27 +185,45 @@ export async function createWidget(
       sendBtn.textContent = inFlight ? "Stop" : "Send";
     }
 
-    const bubbles = state.messages.map((m) =>
-      el(
+    // Carry markdown hits over from the previous pass; misses re-parse. Assigned
+    // to `mdCache` after the list is built so it tracks only the live transcript.
+    const nextMdCache = new Map<string, HTMLElement>();
+    const bubbles = state.messages.map((m) => {
+      const isUser = m.role === "user";
+      // User bubbles stay plain-text (pre-wrap keeps their line breaks). Agent
+      // bubbles — including `working` streaming drafts — render markdown to DOM;
+      // the renderer handles line breaks itself, so no pre-wrap (it'd double up).
+      let child: Node | string;
+      if (isUser) {
+        child = m.text;
+      } else {
+        const key = `${m.id}\n${m.text}`;
+        const rendered = mdCache.get(key) ?? renderMarkdown(m.text);
+        nextMdCache.set(key, rendered);
+        child = rendered;
+      }
+      return el(
         "div",
         {
           style:
-            "align-self:" + (m.role === "user" ? "flex-end" : "flex-start") + ";" +
-            "max-width:85%;padding:8px 11px;border-radius:10px;font-size:13px;white-space:pre-wrap;" +
-            (m.role === "user"
+            "align-self:" + (isUser ? "flex-end" : "flex-start") + ";" +
+            "max-width:85%;padding:8px 11px;border-radius:10px;font-size:13px;" +
+            (isUser ? "white-space:pre-wrap;" : "") +
+            (isUser
               ? "background:var(--accent);color:#fff"
               : "background:#21262d;border:1px solid var(--border)") +
             (m.working ? ";opacity:.7;font-style:italic" : ""),
         },
-        [m.text],
-      ),
-    );
+        [child],
+      );
+    });
     if (state.isTyping) {
       bubbles.push(
         el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, ["agent is typing…"]),
       );
     }
     list.replaceChildren(...bubbles);
+    mdCache = nextMdCache;
     approvalsBox.replaceChildren(...state.approvals.map(renderApproval));
     // Keep the typeahead in sync when the catalog frame lands mid-typing.
     renderMenu();
