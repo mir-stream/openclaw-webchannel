@@ -168,7 +168,21 @@ export async function handleInboundMessage(
   // (default "on"), so when an operator sets it to "off" this call is a no-op.
   // It is also best-effort (no ack/retry) and drop-only under backpressure —
   // we ignore the boolean return.
-  transport.sendTyping(wsKey);
+  //
+  // Control lane (P1-8a): NEVER emit typing for an abort turn. An abort is not
+  // the agent "thinking about a reply" — it cancels the turn already in flight,
+  // and its own reply is a single short final ("⚙️ Agent was aborted."). Two
+  // concrete harms if we flashed typing here: (1) it visually contradicts the
+  // Stop the user just pressed (the widget is trying to WIND DOWN, not spin up);
+  // and (2) the widget holds its Stop button armed until a settling frame
+  // arrives — on the paths where the abort's own ack is never delivered (core
+  // returns handled:false for an unauthorized sender; see the allowlist trap in
+  // command-gate.ts / index-nats.ts), a typing frame with no follow-up would
+  // leave the button stuck in Stop mode with nothing to release it. Skipping
+  // typing keeps the abort lane silent unless it has a real terminal frame.
+  if (!controlLane) {
+    transport.sendTyping(wsKey);
+  }
 
   try {
     await channelRuntime.inbound.run({

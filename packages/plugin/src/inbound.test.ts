@@ -107,11 +107,16 @@ function makeFakeTransport(): {
   transport: WebChannelTransport;
   finalizes: Array<{ id: string; text: string }>;
   progress: Array<{ id: string; text: string }>;
+  typing: string[];
 } {
   const finalizes: Array<{ id: string; text: string }> = [];
   const progress: Array<{ id: string; text: string }> = [];
+  const typing: string[] = [];
   const transport = {
-    sendTyping: () => true,
+    sendTyping: (sessionKey: string) => {
+      typing.push(sessionKey);
+      return true;
+    },
     sendText: () => true,
     sendTextToAnyOpen: () => true,
     sendProgress: (_sessionKey: string, id: string, text: string) => {
@@ -122,7 +127,7 @@ function makeFakeTransport(): {
       finalizes.push({ id, text });
     },
   } as unknown as WebChannelTransport;
-  return { transport, finalizes, progress };
+  return { transport, finalizes, progress, typing };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };
@@ -156,6 +161,36 @@ describe("handleInboundMessage — control-lane authorization stamp", () => {
 
     // No `access` key at all — the ordinary path must not touch command authz.
     expect(captured.buildContext?.access).toBeUndefined();
+  });
+});
+
+describe("handleInboundMessage — typing indicator gating", () => {
+  it("sends a typing frame for an ordinary turn", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, typing } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "hello there",
+    });
+
+    // The ordinary path flashes "agent is typing…" keyed by the peer's wsKey.
+    expect(typing).toEqual(["peer-1"]);
+  });
+
+  it("does NOT send a typing frame for a control-lane abort turn", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, typing } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", userMessage, "default", {
+      controlLane: true,
+    });
+
+    // An abort must never flash typing: it winds the turn DOWN, and on the
+    // unauthorized-sender path (core returns handled:false) no settling frame
+    // ever follows, which would otherwise leave the widget's Stop button armed
+    // with nothing to release it.
+    expect(typing).toEqual([]);
   });
 });
 

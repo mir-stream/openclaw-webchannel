@@ -26,6 +26,7 @@ import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
 import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
 import { isControlLaneMessage } from "./src/control-lane.js";
+import { resolveCommandGate } from "./src/command-gate.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
@@ -561,6 +562,16 @@ export default defineChannelPluginEntry({
           accountId,
         ),
       );
+
+      // Command-gate mirror (P1-8a follow-up), resolved ONCE per account. It
+      // depends only on `api.config` + `accountId`, never on the message, so we
+      // build it here rather than per abort. When an operator configures a
+      // commands/owner allowlist, core IGNORES our control-lane
+      // `access.commands.authorized` stamp and a non-listed peer's `/stop`
+      // silently fails — this lets the control-lane branch below detect that and
+      // send the peer a hedged notice. See src/command-gate.ts for the traced
+      // core paths (all testable logic lives there; this file is tsc-blind).
+      const commandGate = resolveCommandGate(api.config, accountId);
       channel.setMessageHandler((peerId, message) => {
         if (message.type !== "user_message") return; // approvals routed below
         // Control lane (P1-8a): an abort ("/stop"/"stop"/…) must reach core's
@@ -595,6 +606,27 @@ export default defineChannelPluginEntry({
               `webchannel: control-lane dispatch failed: ${String(err)}`,
             ),
           );
+          // Feedback-only hedge for the stamp-ignored trap. Core's
+          // `resolveCommandSenderAuthorization` IGNORES our control-lane
+          // `access.commands.authorized` stamp whenever a commands/owner
+          // allowlist is configured (see src/command-gate.ts): a non-listed
+          // peer's /stop returns handled:false, falls through to a normal turn,
+          // and is dropped as busy — the run is NOT aborted and the widget's
+          // Stop button would otherwise sit silently inert with zero feedback.
+          // We STILL dispatch the abort above (core is the authority — the
+          // mirror can be wrong), and here we ADDITIONALLY warn the peer when
+          // our best-effort mirror says core will reject this sender. The gate
+          // is a conservative mirror biased toward showing this notice, so a
+          // false positive is only an extra hedged message, never a missed one.
+          // Best-effort send (ignore the boolean return), matching the rest of
+          // the outbound surface.
+          if (commandGate.delegated && !commandGate.isListed(peerId)) {
+            channel.sendText(
+              peerId,
+              "Stop may not be permitted for this user: this agent restricts " +
+                "commands to an operator allowlist.",
+            );
+          }
           return;
         }
         dispatchInbound(peerId, message);
