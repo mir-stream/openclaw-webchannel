@@ -46,7 +46,7 @@ permissions:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
 
@@ -162,7 +162,7 @@ jobs:
     name: Publish plugin to npm (public, OIDC)
     needs: publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     permissions:
       contents: read
       # OIDC trusted publishing: npm exchanges this id-token for a short-lived
@@ -258,7 +258,7 @@ jobs:
     name: Publish plugin to ClawHub
     needs: publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     permissions:
       contents: read
       # Kept wired for forward-compat: the clawhub CLI tries an OIDC mint
