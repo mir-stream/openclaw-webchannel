@@ -49,3 +49,18 @@ describe("index-nats.ts wiring contract — typing gate (P0-6)", () => {
     );
   });
 });
+
+describe("index-nats.ts wiring contract — command catalog (P0-3)", () => {
+  it("serves load_commands from the MEMOIZED provider, not a per-request build", () => {
+    // The handler must call the memoized provider (`catalogProvider()`), never
+    // rebuild the catalog inline per request. Pin the provider is created and
+    // that the handler serves from it.
+    expect(INDEX_NATS_SOURCE).toMatch(/createCommandCatalogProvider\(\s*api\.config\s*\)/);
+    expect(INDEX_NATS_SOURCE).toMatch(/channel\.sendCommands\(\s*peerId\s*,\s*catalogProvider\(\)\s*\)/);
+    // Guard the anti-pattern: no bare per-request `buildCommandCatalog(api.config)`
+    // inside the send. (buildCommandCatalog now lives behind the provider only.)
+    expect(INDEX_NATS_SOURCE).not.toMatch(
+      /sendCommands\(\s*peerId\s*,\s*buildCommandCatalog\(/,
+    );
+  });
+});

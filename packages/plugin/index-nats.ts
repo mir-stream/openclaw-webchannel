@@ -39,7 +39,7 @@ import { handleRegisterRequest } from "./src/nats-register.js";
 import { resolveAdmissionMode, admissionServingPlan } from "./src/nats-admission.js";
 import { isDmPostureOpen } from "./src/dm-allowlist.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
-import { buildCommandCatalog } from "./src/commands-catalog.js";
+import { createCommandCatalogProvider } from "./src/commands-catalog.js";
 import { resolveWebchannelSessionRoute } from "./src/session-route.js";
 import type { WebChannelTransport } from "./src/transport.js";
 import type { NatsTransport } from "./src/nats-transport.js";
@@ -634,11 +634,18 @@ export default defineChannelPluginEntry({
       });
 
       // ---- Step 5b (per account): command-catalog load handler (P0-3) ------
-      // Slash-command DISCOVERY. Build the catalog PER REQUEST from the
-      // agent's resolved config (cheap, and always config-fresh — no cache to
-      // invalidate) and seal it back over `.out`. Same error-log-and-continue
-      // robustness as the history handler: a catalog build fault must never
-      // surface as an unhandled throw on the inbound dispatch path.
+      // Slash-command DISCOVERY. The catalog is a PURE function of the agent's
+      // resolved config, which is fixed for the process's lifetime, so we build
+      // it ONCE via a memoizing provider (created here, per account) and serve
+      // the cached result on every request. Per-request building was an
+      // event-loop DoS surface: this handler runs inline on the inbound dispatch
+      // path for ANY handshaken peer (see the exposure decision below), so a peer
+      // could flood `load_commands` and re-spin the registry list + sort each
+      // frame. Memoizing removes that without a rate limiter. The provider does
+      // NOT cache a thrown build, so a transient registry fault retries on the
+      // next request rather than latching an empty menu; the try/catch stays the
+      // failure boundary (a build fault must never surface as an unhandled throw
+      // on the dispatch path). See src/commands-catalog.ts for the design.
       //
       // EXPOSURE DECISION (deliberate): unlike the history/approval snapshots —
       // which are register-hop-gated because they carry the user's own data —
@@ -648,9 +655,10 @@ export default defineChannelPluginEntry({
       // typeahead in auto mode entirely. The catalog is low-sensitivity command
       // metadata (names / descriptions / args), already config-filtered by
       // buildCommandCatalog — so serving it to any handshaken peer is accepted.
+      const catalogProvider = createCommandCatalogProvider(api.config);
       channel.setLoadCommandsHandler((peerId) => {
         try {
-          channel.sendCommands(peerId, buildCommandCatalog(api.config));
+          channel.sendCommands(peerId, catalogProvider());
         } catch (err) {
           api.logger.error?.(
             `webchannel: command catalog failed for ${peerId}: ${String(err)}`,
