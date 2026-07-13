@@ -755,3 +755,161 @@ describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () =
     expect(w.getState().messages).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// P0-3 slash-command discovery — the wrapper stores the catalog from a
+// `commands` frame and forwards loadCommands() to the underlying client.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P0-3 command discovery", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+  function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+  }
+
+  it("a `commands` frame sets state.commands", () => {
+    const w = makeWrapper();
+    expect(w.getState().commands).toBeUndefined();
+    const commands = [
+      { name: "help", description: "Show available commands." },
+      { name: "model", description: "Show or set the model.", args: [{ name: "model" }] },
+    ];
+    deliver(w, { type: "commands", commands } as unknown as InboundMessage);
+    expect(w.getState().commands).toEqual(commands);
+  });
+
+  it("a later `commands` frame REPLACES the catalog wholesale (idempotent refresh)", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "commands", commands: [{ name: "help", description: "h" }] } as unknown as InboundMessage);
+    deliver(w, { type: "commands", commands: [{ name: "new", description: "n" }] } as unknown as InboundMessage);
+    expect(w.getState().commands?.map((c) => c.name)).toEqual(["new"]);
+  });
+
+  it("a `commands` frame does NOT touch isTyping (not turn activity)", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "typing" });
+    expect(w.getState().isTyping).toBe(true);
+    deliver(w, { type: "commands", commands: [] } as unknown as InboundMessage);
+    expect(w.getState().isTyping).toBe(true); // unchanged
+  });
+
+  it("loadCommands() delegates to the underlying client", () => {
+    const w = makeWrapper();
+    const inner = (w as unknown as { client: { loadCommands: () => void } }).client;
+    const spy = vi.spyOn(inner, "loadCommands");
+    w.loadCommands();
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0-7b delivery acks — send() stamps the local echo with the wire id, and an
+// `ack` frame marks the matching bubble delivered (state-only).
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P0-7b delivery acks", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+  function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+  }
+
+  it("send() stores the wire id on the local echo", () => {
+    const w = makeWrapper();
+    w.send("hello");
+    const m = w.getState().messages[0];
+    expect(typeof m.wireId).toBe("string");
+    expect(m.wireId).toBeTruthy();
+    expect(m.delivered).toBeUndefined(); // not yet acked
+  });
+
+  it("an ack frame marks the matching bubble delivered and leaves others untouched", () => {
+    const w = makeWrapper();
+    w.send("first");
+    w.send("second");
+    const [m1, m2] = w.getState().messages;
+
+    deliver(w, { type: "ack", ids: [m1.wireId!] });
+    const after = w.getState().messages;
+    expect(after.find((m) => m.id === m1.id)?.delivered).toBe(true);
+    expect(after.find((m) => m.id === m2.id)?.delivered).toBeUndefined(); // unrelated
+  });
+
+  it("an ack with no matching wireId is a state no-op", () => {
+    const w = makeWrapper();
+    w.send("only");
+    const before = w.getState();
+    deliver(w, { type: "ack", ids: ["not-a-wire-id"] });
+    expect(w.getState()).toBe(before); // no setState fired
+  });
+
+  it("an empty ack is a no-op", () => {
+    const w = makeWrapper();
+    w.send("only");
+    const before = w.getState();
+    deliver(w, { type: "ack", ids: [] });
+    expect(w.getState()).toBe(before);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Protocol-version handshake: the register outcome surfaces on WebChannelState
+// so a diagnostics/admin view can read the agent-plugin's versions.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — protocol version on state", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+
+  /** Fire the inner client's protocol listeners (what a real register triggers). */
+  function emitProtocol(
+    wrapper: WebChannelNATSClient,
+    info: { protocolVersion: number | null; pluginVersion: string | null },
+  ): void {
+    (wrapper["client"] as unknown as {
+      notifyProtocolListeners: (i: typeof info) => void;
+    }).notifyProtocolListeners(info);
+  }
+
+  it("initial state exposes null protocol + plugin versions (not yet registered)", () => {
+    const state = makeWrapper().getState();
+    expect(state.agentProtocolVersion).toBeNull();
+    expect(state.agentPluginVersion).toBeNull();
+  });
+
+  it("a matched register exposes both versions on state", () => {
+    const wrapper = makeWrapper();
+    emitProtocol(wrapper, { protocolVersion: 1, pluginVersion: "0.1.8" });
+    const state = wrapper.getState();
+    expect(state.agentProtocolVersion).toBe(1);
+    expect(state.agentPluginVersion).toBe("0.1.8");
+  });
+
+  it("a pre-v1 plugin (null versions) keeps state null without error", () => {
+    const wrapper = makeWrapper();
+    emitProtocol(wrapper, { protocolVersion: null, pluginVersion: null });
+    const state = wrapper.getState();
+    expect(state.agentProtocolVersion).toBeNull();
+    expect(state.agentPluginVersion).toBeNull();
+    expect(state.status).not.toBe("error");
+  });
+});

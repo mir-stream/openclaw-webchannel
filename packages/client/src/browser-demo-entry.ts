@@ -148,8 +148,18 @@ export async function runDemo(
   if (!bootRes.ok) {
     throw new Error(`bootstrap failed: HTTP ${bootRes.status} ${await bootRes.text()}`);
   }
-  const { jwt, peerId } = (await bootRes.json()) as { jwt?: string; peerId?: string };
+  const { jwt, peerId, agentPublicKey } = (await bootRes.json()) as {
+    jwt?: string;
+    peerId?: string;
+    agentPublicKey?: string;
+  };
   if (!jwt || !peerId) throw new Error("bootstrap-jwt response missing jwt/peerId");
+  // F2: register-hop needs the pinned agent key to authenticate the delivered K.
+  // Only required when the register hop is on (gwUrl set); the auto/handshake
+  // path (no gwUrl) never delivers a wrapped K.
+  if (opts.gwUrl && !agentPublicKey) {
+    throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
+  }
 
   // 5. Production client with NATS-layer NKEY auth, and — only when `gwUrl` is
   //    set (now a register-hop TOGGLE, not a URL: the register hop rides NATS on
@@ -171,6 +181,8 @@ export async function runDemo(
             devicePrivateKey: ed25519.privateKey,
             // Phase 6: register-delivered conversation key (no handshake).
             deviceX25519PrivateKey: x25519.privateKey,
+            // F2: pin the SaaS-attested agent key for K authentication.
+            pinnedAgentPublicKey: agentPublicKey,
           },
         }
       : {}),

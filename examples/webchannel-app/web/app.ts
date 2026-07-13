@@ -68,7 +68,7 @@ export function classify(state: WebChannelState): AppUiState {
 // ---------------------------------------------------------------------------
 
 type LoginResponse = { token: string; peerId: string; accountId: string; tenant: string };
-type BootstrapResponse = { jwt: string; peerId: string; natsUrl: string };
+type BootstrapResponse = { jwt: string; peerId: string; natsUrl: string; agentPublicKey?: string };
 type NatsUserResponse = { userJwt: string; userSeedRaw: string; natsUrl: string };
 
 function b64url(buf: ArrayBuffer): string {
@@ -119,6 +119,10 @@ export async function connectLane(
     session.token,
   );
   const creds = await postJson<NatsUserResponse>("/nats-user", {}, session.token);
+  // F2: the register hop unwraps the delivered K against this SaaS-pinned key.
+  if (!boot.agentPublicKey) {
+    throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
+  }
 
   const client = new WebChannelNATSClient({
     natsUrl: boot.natsUrl ?? creds.natsUrl,
@@ -132,6 +136,8 @@ export async function connectLane(
       // is the ECDH key whose public half is pinned in the bootstrap JWT cnf.jwk.
       devicePrivateKey: pop.privateKey,
       deviceX25519PrivateKey: x25519.privateKey,
+      // F2: pin the SaaS-attested agent identity key for K authentication.
+      pinnedAgentPublicKey: boot.agentPublicKey,
     },
   });
   client.subscribe(onState);

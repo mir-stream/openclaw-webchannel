@@ -30,7 +30,9 @@ import {
   type BrowserKeyPair,
 } from "./e2e-crypto-browser.js";
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
-import { registerWithPop } from "./pop-register.js";
+import { registerWithPop, isTerminalRegisterError } from "./pop-register.js";
+import type { CommandCatalogEntry } from "./types.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
 // Handshake retry (core NATS has no retention — the one-shot key_exchange can be
 // dropped if the agent's per-peer SUB is not yet server-active when we publish,
@@ -116,6 +118,16 @@ export type NatsClientOptions = {
      * (old-plugin compat; the auto-admission path never registers anyway).
      */
     deviceX25519PrivateKey?: CryptoKey;
+    /**
+     * F2 — the SaaS-PINNED agent X25519 identity public key (base64url, 32 bytes),
+     * taken from the first-party HTTPS bootstrap response. REQUIRED whenever
+     * `deviceX25519PrivateKey` is present: the register-delivered K is unwrapped
+     * by deriving the key SOLELY from THIS pinned value, never from any NATS
+     * frame — so a relay's injected K′ (wrapped under a relay-chosen key) fails
+     * authentication. Absence on the register-delivered path is fail-closed
+     * terminal (the browser cannot authenticate K).
+     */
+    pinnedAgentPublicKey?: string;
   };
   /**
    * Optional NATS-layer NKEY authentication for a JWT-auth nats-server.
@@ -146,8 +158,16 @@ export type InboundMessage = {
     // #15: authoritative pending-approval snapshot (carries `approvals`).
     | "approval_snapshot"
     | "typing"
-    | "history";
+    | "history"
+    // P0-3: slash-command discovery catalog (carries `commands`).
+    | "commands"
+    // P0-7b: ingress acknowledgement (carries `ids`). The agent acks every
+    // id-carrying `user_message` at ingress so the client can drain its unacked
+    // replay ledger; unknown ids are a silent no-op.
+    | "ack";
   id?: string;
+  /** P0-7b: the acknowledged `user_message` ids on an `ack` frame. */
+  ids?: string[];
   text?: string;
   kind?: "exec" | "plugin";
   title?: string;
@@ -175,12 +195,19 @@ export type InboundMessage = {
   resolved?: Array<{ id: string; decision: string }>;
   before?: string;
   limit?: number;
+  /** P0-3: the slash-command catalog on a `commands` frame. */
+  commands?: CommandCatalogEntry[];
 };
 
 export type OutboundMessage =
-  | { type: "user_message"; text: string }
+  // P0-7a: `id` is a stable, unique id stamped per logical send so the agent can
+  // dedupe a re-delivered frame at ingress. Always set on the send path below;
+  // typed optional to mirror the wire union (older clients omit it).
+  | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: string }
-  | { type: "load_history"; before?: string; limit?: number };
+  | { type: "load_history"; before?: string; limit?: number }
+  // P0-3: request the slash-command discovery catalog.
+  | { type: "load_commands" };
 
 /** Message listener callback (decrypted, high-level). */
 export type MessageListener = (msg: InboundMessage) => void;
@@ -193,6 +220,21 @@ export type StateListener = (connected: boolean) => void;
 
 /** Error listener callback (e.g. PoP registration failure). */
 export type ErrorListener = (err: Error) => void;
+
+/**
+ * The agent-plugin versions learned from a successful register handshake.
+ * Both are `null` until a register completes (or against a pre-reporting
+ * plugin). A protocol version that DISAGREES with the client's
+ * `WEBCHANNEL_PROTOCOL_VERSION` never reaches here — it is surfaced as a
+ * terminal error instead.
+ */
+export type ProtocolInfo = {
+  protocolVersion: number | null;
+  pluginVersion: string | null;
+};
+
+/** Register-handshake protocol/version listener. */
+export type ProtocolListener = (info: ProtocolInfo) => void;
 
 // ---------------------------------------------------------------------------
 // WebSocket-based NATS client (browser-compatible)
@@ -622,6 +664,20 @@ export class NatsClient {
   }
 
   /**
+   * F5: drop the current socket and schedule a reconnect WITHOUT entering the
+   * terminal state — a SOFT reconnect. The register-hop owner
+   * (`WebChannelNatsClient`) calls this to recover from a TRANSIENT registration
+   * failure: the socket may still be healthy (agent offline, relay up) so
+   * `onclose` never fires, and just returning would sit connected-but-keyless
+   * forever. Redialing makes a fresh `onConnected` re-run registration. No-op
+   * once terminal.
+   */
+  reconnect(): void {
+    if (this.terminal) return;
+    this.forceReconnect();
+  }
+
+  /**
    * CL2: enter the terminal state. Stops all reconnect activity, tears the
    * socket down, and notifies error listeners. No further redial happens until a
    * brand-new client is constructed.
@@ -795,10 +851,30 @@ export class WebChannelNatsClient {
   private readonly options: NatsClientOptions;
   private readonly messageListeners = new Set<MessageListener>();
   private readonly errorListeners = new Set<ErrorListener>();
+  private readonly protocolListeners = new Set<ProtocolListener>();
 
   private keyPair: BrowserKeyPair | null = null;
   private sessionKey: Uint8Array | null = null;
   private outboundQueue: OutboundMessage[] = [];
+  /**
+   * P0-7b: published-but-unacked `user_message` ledger (insertion-ordered).
+   *
+   * `seal()` records every published user_message that carries an `id` here; the
+   * agent acks it at ingress (`ack` frame → `drainAcked`) and the entry drops. A
+   * `user_message` sealed but then lost to a mid-session relay outage stays in the
+   * ledger and is REPLAYED at the next `flushQueue()` (session re-establishment)
+   * with the SAME id — 4a's server-side dedupe makes that replay exactly-once.
+   * Only user_messages are tracked: `approval_decision` has its own loss-recovery
+   * (#15 Leg C), and `load_history`/`load_commands` are stale after reconnect (the
+   * register snapshot re-hydrates). `resetSession()` deliberately KEEPS this (a
+   * mid-session drop is exactly when the entries are needed); `disconnect()`
+   * clears it (dead instance).
+   */
+  private readonly unackedLedger = new Map<string, OutboundMessage>();
+  /** P0-7b: cap on the unacked ledger; the oldest entry is evicted (with a warn) past this. */
+  private static readonly MAX_UNACKED = 100;
+  /** P0-7b: one-shot guard so a full ledger warns once per session, not per evicted send. */
+  private warnedUnackedEvict = false;
   /**
    * Ciphertext `.out` frames that arrived BEFORE the session key existed.
    *
@@ -862,12 +938,28 @@ export class WebChannelNatsClient {
     this.outSub = -1;
     this.handshakeSub = -1;
     this.resetSession();
+    // P0-7b: an explicit disconnect retires this instance — drop the unacked
+    // ledger (unlike resetSession, which keeps it across a mid-session drop).
+    this.unackedLedger.clear();
     this.client.disconnect();
   }
 
-  /** Send user message (buffered until the handshake completes). */
-  sendUserMessage(text: string): void {
-    this.enqueue({ type: "user_message", text });
+  /**
+   * Send user message (buffered until the handshake completes). Returns the
+   * stable wire `id` stamped on the frame so the caller can correlate a later
+   * `ack` (P0-7b) back to its local echo.
+   */
+  sendUserMessage(text: string): string {
+    // P0-7a: stamp a stable, unique id per logical send. The agent records it at
+    // ingress and drops a duplicate frame (rapid double-submit; the P0-7b replay
+    // queue re-send after reconnect) so it never runs the turn twice. Reuse the
+    // package's existing randomness helper (WebCrypto-preferring, Math.random
+    // fallback) rather than `crypto.randomUUID` so we match the client's
+    // established host assumptions; the id only needs to be collision-unguessable,
+    // not a UUID.
+    const id = randomInboxToken();
+    this.enqueue({ type: "user_message", text, id });
+    return id;
   }
 
   /** Send approval decision (buffered until the handshake completes). */
@@ -878,6 +970,11 @@ export class WebChannelNatsClient {
   /** Request history page (buffered until the handshake completes). */
   loadHistory(before?: string, limit?: number): void {
     this.enqueue({ type: "load_history", before, limit });
+  }
+
+  /** Request the slash-command catalog (buffered until the handshake completes). */
+  loadCommands(): void {
+    this.enqueue({ type: "load_commands" });
   }
 
   /** Add decrypted-message listener. */
@@ -897,6 +994,17 @@ export class WebChannelNatsClient {
     return () => { this.errorListeners.delete(listener); };
   }
 
+  /**
+   * Add a register-handshake protocol listener. Fires once per successful
+   * register with the agent-plugin's protocol/plugin version (either may be
+   * null against a pre-v1/pre-reporting plugin). A version MISMATCH does not
+   * fire this — it flows through `onError` as a terminal failure.
+   */
+  onProtocol(listener: ProtocolListener): () => void {
+    this.protocolListeners.add(listener);
+    return () => { this.protocolListeners.delete(listener); };
+  }
+
   // ---------------------------------------------------------------------------
   // Internal — handshake + crypto
   // ---------------------------------------------------------------------------
@@ -911,6 +1019,9 @@ export class WebChannelNatsClient {
     this.pendingInbound = [];
     // Re-arm the one-time pre-key-drop warning for the next session.
     this.warnedPreKeyDrop = false;
+    // P0-7b: re-arm the ledger-eviction warning too (the ledger itself SURVIVES
+    // resetSession — this only lets a fresh session warn once again).
+    this.warnedUnackedEvict = false;
   }
 
   /**
@@ -924,8 +1035,24 @@ export class WebChannelNatsClient {
     this.pendingInbound = [];
     for (const payload of pending) {
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
-      if (msg) this.notifyMessageListeners(msg);
+      if (msg) this.deliverInbound(msg);
     }
+  }
+
+  /**
+   * Deliver a decrypted inbound frame. P0-7b: an `ack` frame first drains the
+   * matching ids from the unacked ledger, then (like every other frame) is
+   * forwarded to the message listeners — the wrapper reducer consumes it too.
+   */
+  private deliverInbound(msg: InboundMessage): void {
+    if (msg.type === "ack") this.drainAcked(msg.ids);
+    this.notifyMessageListeners(msg);
+  }
+
+  /** P0-7b: remove acked ids from the unacked ledger; unknown ids are a no-op. */
+  private drainAcked(ids?: string[]): void {
+    if (!ids) return;
+    for (const id of ids) this.unackedLedger.delete(id);
   }
 
   private async onConnected(): Promise<void> {
@@ -999,14 +1126,64 @@ export class WebChannelNatsClient {
         });
       } catch (err) {
         console.error("[nats-client] PoP registration failed:", err);
-        this.notifyErrorListeners(err as Error);
-        this.client.disconnect();
+        // Epoch guard (mirrors the success path below): a reconnect during the
+        // register round-trip may have already spawned a newer onConnected, so a
+        // stale flow must not tear down or redial the live connection.
+        if (this.connectionEpoch !== epoch) return;
+        if (isTerminalRegisterError(err)) {
+          // Rejected proof/token or a non-transient server failure — the SAME
+          // bootstrap credentials will never be accepted. Terminal: surface the
+          // (original) error and tear the socket fully down. disconnect() clears
+          // the reconnect timer and nulls onclose, so nothing redials; only a
+          // fresh client (new bootstrap JWT) can recover.
+          this.notifyErrorListeners(err as Error);
+          this.client.disconnect();
+          return;
+        }
+        // TRANSIENT (B4): request timeout, 503, or agent-offline retry-
+        // exhaustion. The credentials are fine — the agent/relay was momentarily
+        // unreachable. Critically, registerWithPop can exhaust its bounded
+        // retries while the WS stays UP (agent offline, relay healthy), so
+        // onclose never fires; merely returning here would leave the client
+        // connected-but-keyless FOREVER with messages queueing. Actively redial
+        // (soft reconnect — reconnection stays armed) so a fresh onConnected
+        // re-attempts registration; this loops with backoff until the agent
+        // returns.
+        console.warn(
+          "[nats-client] registration failed transiently — redialing to re-attempt registration",
+        );
+        this.client.reconnect();
         return;
       }
       // The socket may have dropped during the register round-trip; a reconnect
       // would have spawned a newer onConnected. Bail so this stale flow does not
       // establish a key for a connection generation that is no longer current.
       if (this.connectionEpoch !== epoch) return;
+
+      // Wire-protocol handshake (mirrors the :1080 pin-failure style). The plugin
+      // echoes its protocol + package versions in the register reply:
+      //   - absent protocolVersion  → pre-v1 plugin; NON-FATAL, expose null.
+      //   - present but mismatched   → TERMINAL: the two sides speak incompatible
+      //     wire contracts, so surface a two-sided diagnostic and disconnect
+      //     (only upgrading the older side, or a fresh client, can recover).
+      //   - match                    → proceed; expose both versions on state.
+      const agentProtocolVersion =
+        typeof registerResult.protocolVersion === "number" ? registerResult.protocolVersion : null;
+      const agentPluginVersion =
+        typeof registerResult.pluginVersion === "string" ? registerResult.pluginVersion : null;
+      if (agentProtocolVersion !== null && agentProtocolVersion !== WEBCHANNEL_PROTOCOL_VERSION) {
+        const err = new Error(
+          `webchannel protocol mismatch: client=${WEBCHANNEL_PROTOCOL_VERSION} ` +
+            `agent-plugin=${agentProtocolVersion}; upgrade the older side`,
+        );
+        this.notifyErrorListeners(err);
+        this.client.disconnect();
+        return;
+      }
+      this.notifyProtocolListeners({
+        protocolVersion: agentProtocolVersion,
+        pluginVersion: agentPluginVersion,
+      });
 
       if (registerDeliveredKey) {
         // Register-delivered key: unwrap K with the cnf device private key.
@@ -1023,11 +1200,28 @@ export class WebChannelNatsClient {
           this.client.disconnect();
           return;
         }
+        // F2 fail-closed: the register-delivered K is authenticated by deriving
+        // the unwrap key from the SaaS-pinned agent identity public key. Without
+        // it the browser has no way to distinguish the genuine agent's K from a
+        // relay-injected K′, so a missing pin is TERMINAL (never derive from the
+        // wire). The pin arrives with the first-party HTTPS bootstrap response.
+        if (!registration.pinnedAgentPublicKey) {
+          const err = new Error(
+            "[nats-client] register-delivered key requires a pinned agent public key " +
+              "(bootstrap response carried no agentPublicKey) — refusing to unwrap K " +
+              "against an unauthenticated wire key",
+          );
+          this.notifyErrorListeners(err);
+          this.client.disconnect();
+          return;
+        }
         let key: Uint8Array;
         try {
           key = await unwrapConversationKey(
             wrapped,
             registration.deviceX25519PrivateKey!,
+            registration.pinnedAgentPublicKey,
+            peerId,
           );
         } catch (err) {
           console.error("[nats-client] conversation-key unwrap failed:", err);
@@ -1117,7 +1311,7 @@ export class WebChannelNatsClient {
         return;
       }
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
-      if (msg) this.notifyMessageListeners(msg);
+      if (msg) this.deliverInbound(msg);
       return;
     }
   }
@@ -1132,6 +1326,17 @@ export class WebChannelNatsClient {
 
   private flushQueue(): void {
     if (!this.sessionKey) return;
+    // P0-7b: replay published-but-unacked user_messages FIRST — this choke point
+    // runs exactly when a session key is (re)established (register-delivered K and
+    // legacy-handshake paths both). Move ledger entries, in insertion order, to
+    // the FRONT of the queue (ahead of anything already queued), then clear the
+    // ledger; each re-enters it as `seal()` re-publishes. Same id on every replay,
+    // so 4a's ingress dedupe makes a re-delivery exactly-once.
+    if (this.unackedLedger.size > 0) {
+      const replay = [...this.unackedLedger.values()];
+      this.unackedLedger.clear();
+      this.outboundQueue = [...replay, ...this.outboundQueue];
+    }
     const queued = this.outboundQueue;
     this.outboundQueue = [];
     for (const message of queued) this.seal(message);
@@ -1144,8 +1349,36 @@ export class WebChannelNatsClient {
       return;
     }
     const { tenant, accountId, peerId } = this.options;
+    // P0-7b: record a user_message in the unacked ledger BEFORE publishing so it
+    // can be replayed if the session drops before the agent acks it. Recording
+    // first (not after publish) means a fast ack can't race ahead of the record
+    // and leave a drained id re-inserted. Only user_messages (see `unackedLedger`);
+    // an id-less frame from a caller that bypassed sendUserMessage is not
+    // replayable and is skipped.
+    if (message.type === "user_message" && message.id) {
+      this.recordUnacked(message.id, message);
+    }
     const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, message);
     this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
+  }
+
+  /** P0-7b: record an unacked user_message, evicting the oldest past the cap. */
+  private recordUnacked(id: string, message: OutboundMessage): void {
+    this.unackedLedger.set(id, message);
+    while (this.unackedLedger.size > WebChannelNatsClient.MAX_UNACKED) {
+      const oldest = this.unackedLedger.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.unackedLedger.delete(oldest);
+      if (!this.warnedUnackedEvict) {
+        // Warn ONCE per session (re-armed in resetSession) — a full ledger means
+        // an unusually long delivery stall; a per-send warn would spam a burst.
+        this.warnedUnackedEvict = true;
+        console.warn(
+          `[nats-client] unacked ledger exceeded ${WebChannelNatsClient.MAX_UNACKED}; ` +
+            `evicting the oldest unacked message(s) — they will not be replayed on reconnect`,
+        );
+      }
+    }
   }
 
   private notifyMessageListeners(msg: InboundMessage): void {
@@ -1164,6 +1397,16 @@ export class WebChannelNatsClient {
         listener(err);
       } catch (e) {
         console.error("[nats-client] Error listener error:", e);
+      }
+    });
+  }
+
+  private notifyProtocolListeners(info: ProtocolInfo): void {
+    this.protocolListeners.forEach((listener) => {
+      try {
+        listener(info);
+      } catch (e) {
+        console.error("[nats-client] Protocol listener error:", e);
       }
     });
   }

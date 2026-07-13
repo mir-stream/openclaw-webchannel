@@ -46,6 +46,9 @@ export class WebChannelNATSClient {
     approvals: [],
     status: "connecting",
     connected: false,
+    // Learned from the register handshake; null until a register completes.
+    agentProtocolVersion: null,
+    agentPluginVersion: null,
   };
 
   private readonly listeners = new Set<Listener>();
@@ -104,6 +107,16 @@ export class WebChannelNATSClient {
       console.error("[nats-wrapper] terminal connection error:", err);
       this.setState({ status: "error", connected: false, error: err.message });
     });
+
+    // Register-handshake outcome: surface the agent-plugin's protocol/plugin
+    // version on state for diagnostics (admin screen). A version MISMATCH never
+    // arrives here — it flows through onError above as a terminal failure.
+    this.client.onProtocol(({ protocolVersion, pluginVersion }) => {
+      this.setState({
+        agentProtocolVersion: protocolVersion,
+        agentPluginVersion: pluginVersion,
+      });
+    });
   }
 
   /** Get current state */
@@ -132,13 +145,21 @@ export class WebChannelNATSClient {
     const trimmed = text.trim();
     if (!trimmed) return;
 
+    // P0-7b: capture the wire id so a later `ack` frame can mark this local echo
+    // delivered (the SDK correlates by wireId, never the synthetic local id).
+    // Known/accepted: sendUserMessage publishes BEFORE appendMessage records the
+    // echo, so a SAME-TICK synchronous ack would miss the bubble and `delivered`
+    // would never flip. That can only happen on a synchronous fake transport (a
+    // test); over a real WS/NATS socket the ack is always a later event-loop turn,
+    // so it lands after the echo exists. Not restructured.
+    const wireId = this.client.sendUserMessage(trimmed);
+
     this.appendMessage({
       id: `u-${this.uid()}`,
       role: "user",
       text: trimmed,
+      wireId,
     });
-
-    this.client.sendUserMessage(trimmed);
   }
 
   /** Send approval decision */
@@ -154,6 +175,16 @@ export class WebChannelNATSClient {
   /** Request history page */
   loadHistory(request?: { before?: string; limit?: number }): void {
     this.client.loadHistory(request?.before, request?.limit);
+  }
+
+  /**
+   * Request the slash-command discovery catalog (P0-3). The agent answers with
+   * a `commands` frame that lands in `state.commands`. UI calls this the first
+   * time the user types `/` (lazy discovery); repeat calls are cheap and simply
+   * refresh the catalog.
+   */
+  loadCommands(): void {
+    this.client.loadCommands();
   }
 
   // ---------------------------------------------------------------------------
@@ -375,6 +406,33 @@ export class WebChannelNATSClient {
 
       case "typing": {
         this.setState({ isTyping: true });
+        return;
+      }
+
+      case "commands": {
+        // P0-3 discovery: replace the catalog wholesale (idempotent — a repeat
+        // request just refreshes it). NOT turn activity, so isTyping is left
+        // untouched.
+        this.setState({ commands: Array.isArray(msg.commands) ? msg.commands : [] });
+        return;
+      }
+
+      case "ack": {
+        // P0-7b: mark the local echoes whose wireId the agent acknowledged at
+        // ingress as delivered (state-only — the demo can render a ✓). Ids we
+        // don't hold locally are a silent no-op.
+        const ids = Array.isArray(msg.ids) ? msg.ids : [];
+        if (ids.length === 0) return;
+        const acked = new Set(ids);
+        let changed = false;
+        const messages = this.state.messages.map((m) => {
+          if (m.wireId !== undefined && acked.has(m.wireId) && !m.delivered) {
+            changed = true;
+            return { ...m, delivered: true };
+          }
+          return m;
+        });
+        if (changed) this.setState({ messages });
         return;
       }
 

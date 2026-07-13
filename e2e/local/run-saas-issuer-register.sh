@@ -101,6 +101,7 @@ echo "[run-saas-issuer] echo server pid=$ECHO_PID"
 PORT="$BOOTSTRAP_PORT" \
 SAAS_ISSUER="$SAAS_ISSUER" \
 SAAS_BASE_URL="http://127.0.0.1:$BOOTSTRAP_PORT" \
+WEBCHANNEL_NATS_DEV_OPEN=1 \
   node --import tsx "$REPO/packages/saas/reference/bootstrap-server.ts" >"$OCH/bootstrap.log" 2>&1 &
 BOOT_PID=$!
 echo "[run-saas-issuer] bootstrap-server pid=$BOOT_PID — waiting for JWKS…"

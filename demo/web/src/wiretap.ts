@@ -47,9 +47,12 @@ export async function createWiretap(
   // Observer creds: a SUB-only NATS user (sub webchannel.{tenant}.>, NO pub). The
   // wiretap must never publish — observer is strictly weaker than a browser (which
   // is now pinned to its own peer subtree), so it can read every frame but can't
-  // inject one.
+  // inject one. Tenant-wide observer creds are an OPERATOR capability: they come
+  // from the admin-gated /admin/nats-user route, NOT the browser-facing /nats-user
+  // (which only ever mints per-peer browser creds). This pane therefore mounts for
+  // admin sessions only (see app.ts).
   const creds = await api<{ userJwt?: string; userSeedRaw?: string; natsUrl?: string }>(
-    "/nats-user",
+    "/admin/nats-user",
     { method: "POST", body: { role: "observer" } },
   );
   if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {

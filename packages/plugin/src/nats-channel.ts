@@ -31,6 +31,7 @@ import {
   openEnvelope,
 } from "./e2e-session.js";
 import { isValidSubjectToken } from "./subject-token.js";
+import type { CommandCatalogEntry } from "./commands-catalog.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,9 +50,17 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 export type InboundWsMessage =
-  | { type: "user_message"; text: string }
+  // P0-7a: `id` is a stable, client-minted unique id for this logical send. It is
+  // OPTIONAL for back-compat — an older client omits it and the frame passes
+  // through un-deduped. When present, the server records `${peerId}:${id}` at
+  // ingress (7-day window) and silently drops a duplicate before it runs a turn.
+  | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
-  | { type: "load_history"; before?: string; limit?: number };
+  | { type: "load_history"; before?: string; limit?: number }
+  // P0-3 slash-command DISCOVERY: the browser asks for the command catalog (no
+  // params — the catalog is not paged). The agent answers with a `commands`
+  // frame. Discovery only; command EXECUTION is a normal `user_message`.
+  | { type: "load_commands" };
 
 export type OutboundWsMessage =
   | { type: "agent_message"; text: string; id?: string }
@@ -68,7 +77,14 @@ export type OutboundWsMessage =
       resolved?: Array<{ id: string; decision: ApprovalDecision }>;
     }
   | { type: "typing" }
-  | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> };
+  | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> }
+  // P0-3 slash-command DISCOVERY: the command catalog delivered in reply to a
+  // `load_commands` request (config-filtered, alias-free, name-sorted).
+  | { type: "commands"; commands: CommandCatalogEntry[] }
+  // P0-7b: ingress acknowledgement — the ids of `user_message` frames the agent
+  // admitted at ingress (fresh AND deduped duplicates), so the client can drain
+  // its unacked replay ledger. Delivered on the same sealed `.out` path.
+  | { type: "ack"; ids: string[] };
 
 export type HistoryMessage = {
   id: string;
@@ -108,6 +124,19 @@ export type NatsChannelCryptoOptions = {
    * which keep the legacy handshake (F5 decision — see PHASE6_MULTIDEVICE_PLAN §8).
    */
   keyStore?: ConversationKeyStore;
+  /**
+   * F2 — the agent's SaaS-ATTESTED static X25519 identity key pair, loaded from
+   * the enrolled per-account `credentials.json` (`enrollment-client.ts` persists
+   * it; the browser pins its PUBLIC half via the SaaS bootstrap response). Used
+   * ONLY by `wrapConversationKeyForDevice` to wrap K static-static so the browser
+   * can authenticate that K came from the genuine agent (closes the register-hop
+   * MITM). REQUIRED whenever `keyStore` is set — the channel refuses to construct
+   * a keyStore channel without it (fail-closed). Distinct from the boot-ephemeral
+   * `keyPair` used on the auto/handshake path, which stays untouched (wiring a
+   * static key there buys no auth — the browser doesn't pin it — while trading
+   * away per-boot freshness).
+   */
+  identityKeyPair?: KeyPair;
 };
 
 /**
@@ -128,11 +157,35 @@ export type NatsChannelLimits = {
    * cleaned, so this map was the clearest unbounded leak.
    */
   maxApprovalResolutions?: number;
+  /**
+   * F4 anti-replay: half-width of the accepted inbound `ts` skew window, in ms
+   * (default 10 min). A sealed frame whose authenticated `ts` (browser wall
+   * clock) is more than this before/after the agent's `now` is dropped as a
+   * replay-or-skew. Generous by design — the messageId LRU is the PRIMARY
+   * defense; this window is the coarse secondary bound that also caps how far
+   * back the LRU must remember (see `maxSeenMessageIdsPerPeer`).
+   */
+  replayWindowMs?: number;
+  /**
+   * F4 anti-replay: per-peer cap on remembered seen-messageIds before the
+   * oldest is LRU-evicted (default 2_000). Strictly per-peer so one peer's
+   * churn can never evict another peer's window. Safe to evict the oldest: a
+   * genuine replay of an evicted (old) messageId is re-caught by the `ts`
+   * window, which by construction only admits frames newer than the window.
+   */
+  maxSeenMessageIdsPerPeer?: number;
 };
 
 /** S2 defaults — high enough that normal operation never evicts. */
 const DEFAULT_MAX_PEERS = 10_000;
 const DEFAULT_MAX_APPROVAL_RESOLUTIONS = 10_000;
+/**
+ * F4 defaults. The ±10-min window tolerates a badly-skewed browser clock while
+ * still bounding replay memory; 2_000 remembered ids/peer covers a very busy
+ * conversation within that window without unbounded growth.
+ */
+const DEFAULT_REPLAY_WINDOW_MS = 10 * 60 * 1_000;
+const DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER = 2_000;
 
 /**
  * NATS-based message channel for WebChannel.
@@ -164,6 +217,37 @@ export class NatsChannel {
   private readonly maxPeers: number;
   private readonly maxApprovalResolutions: number;
 
+  /**
+   * F4 anti-replay state. The untrusted relay can re-publish a captured sealed
+   * `user_message` verbatim; it decrypts under the same per-peer key with an
+   * unchanged AAD, so nothing downstream distinguishes it from a genuine send —
+   * the agent would RE-RUN the turn (duplicate tool calls / side effects / cost).
+   * We enforce freshness on the AUTHENTICATED envelope fields (`messageId`,
+   * `ts`, both inside the AEAD-bound AAD, so a relay can't forge them):
+   *  - a per-peer sliding window of seen messageIds (PRIMARY defense), and
+   *  - a generous ±`replayWindowMs` bound on `ts` (SECONDARY — tolerates a
+   *    skewed browser clock, and caps how far back the LRU must remember).
+   * NOTE: this cache is IN-MEMORY. A replay that arrives AFTER an agent restart
+   * (empty cache) is only stopped by the `ts` window — replay within that window
+   * across a restart is the accepted residual, bounded to `replayWindowMs`.
+   * Keyed per-peer (peerId -> insertion-ordered messageId -> ts) so eviction is
+   * strictly local; cleaned up alongside `peerSessionKeys`.
+   */
+  private readonly replayWindowMs: number;
+  private readonly maxSeenMessageIdsPerPeer: number;
+  private readonly seenMessageIds = new Map<string, Map<string, number>>();
+
+  /**
+   * P0-6: whether `sendTyping(...)` may emit a `typing` frame. Defaults enabled
+   * so the "Bot is typing…" affordance works out of the box; an operator
+   * disables it per-account via `capabilities.typing = "off"`. Toggled once at
+   * channel start (index-nats) from the account's RESOLVED config — unlike the
+   * legacy WS gate (`transport.ts`), which reads the channel-level flat section,
+   * because each `NatsChannel` IS a single account's channel (가-1 Cycle 2).
+   * Previously ungated on NATS, so `typing: "off"` was silently ignored.
+   */
+  private typingEnabled = true;
+
   // ---- Encrypt-by-construction state (only populated in crypto mode) --------
 
   /** When true, the channel is E2E-encrypted and fail-closed (no plaintext). */
@@ -175,6 +259,11 @@ export class NatsChannel {
    * only; null = legacy handshake key model). See NatsChannelCryptoOptions.
    */
   private readonly keyStore: ConversationKeyStore | null;
+  /**
+   * F2: agent SaaS-attested static identity key pair used to wrap K to a device
+   * (keyStore mode only). Non-null exactly when `keyStore` is non-null.
+   */
+  private readonly identityKeyPair: KeyPair | null;
   /** Per-peer established conversation keys (peerId -> 32-byte session key). */
   private readonly peerSessionKeys = new Map<string, Uint8Array>();
   /** Per-peer handshake subscriptions (peerId -> sid). */
@@ -184,6 +273,7 @@ export class NatsChannel {
   private onMessage?: (peerId: string, message: InboundWsMessage) => void;
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
   private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
+  private onLoadCommands?: (peerId: string) => void;
   private onHandshakeComplete?: (peerId: string) => void;
   /**
    * Register-hop admission over NATS (replaces the deleted HTTP register routes).
@@ -211,9 +301,25 @@ export class NatsChannel {
     this.encryptionRequired = crypto != null;
     this.agentKeyPair = crypto ? (crypto.keyPair ?? generateKeyPair()) : null;
     this.keyStore = crypto?.keyStore ?? null;
+    // F2 fail-closed: a keyStore (register-hop) channel MUST have the attested
+    // identity key to wrap K authentically. The entry (index-nats) already skips
+    // serving a register-hop account with no persisted identity key; this is the
+    // last-line assertion so the channel can never be constructed to wrap K under
+    // an unattested key.
+    this.identityKeyPair = crypto?.identityKeyPair ?? null;
+    if (this.keyStore && !this.identityKeyPair) {
+      throw new Error(
+        "webchannel: keyStore (register-hop) channel requires crypto.identityKeyPair " +
+          "(the SaaS-attested agent identity key) to wrap the conversation key — refusing " +
+          "to serve without it (fail-closed; the browser could not authenticate K otherwise).",
+      );
+    }
     this.maxPeers = limits?.maxPeers ?? DEFAULT_MAX_PEERS;
     this.maxApprovalResolutions =
       limits?.maxApprovalResolutions ?? DEFAULT_MAX_APPROVAL_RESOLUTIONS;
+    this.replayWindowMs = limits?.replayWindowMs ?? DEFAULT_REPLAY_WINDOW_MS;
+    this.maxSeenMessageIdsPerPeer =
+      limits?.maxSeenMessageIdsPerPeer ?? DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER;
 
     // Wire up NATS message handler
     this.transport.on("message", (msg: NatsMessage) => this.handleNatsMessage(msg));
@@ -344,6 +450,9 @@ export class NatsChannel {
     // (legacy mode) or re-register, which reloads the STABLE key K from the
     // keyStore (Phase 6 mode — the persisted K itself is never dropped here).
     this.peerSessionKeys.delete(peerId);
+    // F4: drop the peer's replay window with it (bounded memory; a genuine
+    // reconnect re-establishes a fresh window).
+    this.seenMessageIds.delete(peerId);
   }
 
   /**
@@ -385,9 +494,20 @@ export class NatsChannel {
   }
 
   /**
+   * P0-6: toggle the typing-indicator wire frame for this account's channel.
+   * Called once at channel start (index-nats) with the account's resolved
+   * `capabilities.typing` (default "on"). When disabled, `sendTyping` is a
+   * no-op returning `false`, so callers need not gate at the call site.
+   */
+  setTypingEnabled(enabled: boolean): void {
+    this.typingEnabled = enabled;
+  }
+
+  /**
    * Send typing indicator to peer.
    */
   sendTyping(peerId: string): boolean {
+    if (!this.typingEnabled) return false;
     const payload: OutboundWsMessage = { type: "typing" };
     return this.sendToPeer(peerId, payload);
   }
@@ -397,6 +517,28 @@ export class NatsChannel {
    */
   sendHistory(peerId: string, messages: HistoryMessage[]): boolean {
     const payload: OutboundWsMessage = { type: "history", messages };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
+   * Send the slash-command catalog to peer (P0-3 discovery). Rides the same
+   * sealed `.out` path as every other outbound frame.
+   */
+  sendCommands(peerId: string, commands: CommandCatalogEntry[]): boolean {
+    const payload: OutboundWsMessage = { type: "commands", commands };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
+   * P0-7b: acknowledge the ingress receipt of `user_message` ids to a peer, so
+   * the client can drain its unacked replay ledger. Rides the same sealed `.out`
+   * path as every other outbound frame — fail-closed before the peer's session
+   * key exists (returns false, never plaintext). An EMPTY `ids` is a no-op that
+   * returns true without publishing (nothing to ack — e.g. an all-id-less batch).
+   */
+  sendAck(peerId: string, ids: string[]): boolean {
+    if (ids.length === 0) return true;
+    const payload: OutboundWsMessage = { type: "ack", ids };
     return this.sendToPeer(peerId, payload);
   }
 
@@ -509,6 +651,15 @@ export class NatsChannel {
   }
 
   /**
+   * Set the command-catalog load handler (P0-3 discovery). Fires on a
+   * `load_commands` request; the handler builds the catalog and calls
+   * `sendCommands`.
+   */
+  setLoadCommandsHandler(handler: (peerId: string) => void): void {
+    this.onLoadCommands = handler;
+  }
+
+  /**
    * Set the handshake-complete handler.
    *
    * Fires once the per-peer E2E session key is established (see
@@ -549,7 +700,14 @@ export class NatsChannel {
     }
     const key = this.peerSessionKeys.get(peerId);
     if (!key) return null;
-    return wrapConversationKey(key, devicePublicKey);
+    // F2: static-static wrap under the agent's attested identity key + peerId-bound
+    // AAD. `identityKeyPair` is guaranteed non-null here (constructor asserts it
+    // whenever `keyStore` is set), so the browser can authenticate K against the
+    // SaaS-pinned agent public key and no relay-injected K′ can pass.
+    return wrapConversationKey(key, devicePublicKey, {
+      agentIdentityKeyPair: this.identityKeyPair!,
+      peerId,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -724,7 +882,19 @@ export class NatsChannel {
       console.warn(`[nats-channel] Ignoring malformed handshake from ${peerId}`);
       return;
     }
-    const sessionKey = deriveConversationKey(this.agentKeyPair.privateKey, browserPubKey);
+    // Defense-in-depth: `parseKeyExchange` already rejects non-32-byte keys, but
+    // any future crypto path here (a bad key that still decodes to 32 bytes, a
+    // low-order point, etc.) must never escape this handler as an uncaught throw
+    // — that would kill the read pump and the whole gateway process. Contain it.
+    let sessionKey: Uint8Array;
+    try {
+      sessionKey = deriveConversationKey(this.agentKeyPair.privateKey, browserPubKey);
+    } catch (err) {
+      console.warn(
+        `[nats-channel] Dropping handshake from ${peerId}: key derivation failed: ${String(err)}`,
+      );
+      return;
+    }
     // Capture the prior key BEFORE we overwrite it, to decide whether this is a
     // NEW session (fresh key) or a duplicate handshake (client republished the
     // same key_exchange — e.g. the browser's bounded handshake retry when the
@@ -750,6 +920,9 @@ export class NatsChannel {
           this.unregisterPeer(oldest);
         } else {
           this.peerSessionKeys.delete(oldest);
+          // F4: drop the evicted peer's replay window too (unregisterPeer
+          // already does this for the registered-mode branch).
+          this.seenMessageIds.delete(oldest);
         }
       }
     }
@@ -795,15 +968,72 @@ export class NatsChannel {
       return;
     }
     let message: InboundWsMessage;
+    let messageId: string;
+    let ts: number;
     try {
-      message = openEnvelope(msg.payload, key).message as InboundWsMessage;
+      const opened = openEnvelope(msg.payload, key);
+      message = opened.message as InboundWsMessage;
+      messageId = opened.routing.messageId;
+      ts = opened.routing.ts;
     } catch (err) {
       console.warn(
         `[nats-channel] Dropping inbound from ${peerId}: decrypt/parse failed: ${String(err)}`,
       );
       return;
     }
+    // F4: anti-replay. `messageId`/`ts` are in the AEAD-authenticated AAD, so a
+    // relay can neither forge nor mutate them — a replay is a byte-identical
+    // re-publish. Enforce freshness BEFORE dispatch so a captured frame can't
+    // re-run the turn.
+    if (!this.acceptFreshInbound(peerId, messageId, ts)) {
+      return;
+    }
     this.dispatchInbound(peerId, message);
+  }
+
+  /**
+   * F4 freshness gate for an already-decrypted inbound envelope.
+   *
+   * Returns false (caller drops) when the frame is a replay: either its
+   * `messageId` was already seen from this peer, or its `ts` falls outside the
+   * ±`replayWindowMs` window. The messageId LRU is the PRIMARY defense; the ts
+   * window is a generous secondary bound tolerating a skewed browser clock and
+   * capping how far back the LRU must remember. Logging distinguishes the two so
+   * a chronically-skewed client (every frame ts-rejected) is diagnosable versus
+   * a genuine duplicate-id replay. Strictly per-peer: one peer's window can
+   * never evict or admit another's.
+   */
+  private acceptFreshInbound(peerId: string, messageId: string, ts: number): boolean {
+    const skew = Date.now() - ts;
+    if (Math.abs(skew) > this.replayWindowMs) {
+      console.warn(
+        `[nats-channel] Dropping inbound from ${peerId}: ts outside ±${this.replayWindowMs}ms window ` +
+          `(skew=${skew}ms, messageId=${messageId}) — stale replay or client clock skew`,
+      );
+      return false;
+    }
+    let seen = this.seenMessageIds.get(peerId);
+    if (!seen) {
+      seen = new Map<string, number>();
+      this.seenMessageIds.set(peerId, seen);
+    }
+    if (seen.has(messageId)) {
+      console.warn(
+        `[nats-channel] Dropping inbound from ${peerId}: replayed messageId ${messageId}`,
+      );
+      return false;
+    }
+    seen.set(messageId, ts);
+    // Per-peer LRU eviction. Map is insertion-ordered, so the first key is the
+    // oldest-recorded; dropping it is safe because the ts window (which only
+    // admits frames within ±replayWindowMs of now) re-catches any replay of an
+    // evicted old messageId.
+    while (seen.size > this.maxSeenMessageIdsPerPeer) {
+      const oldest = seen.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
+    return true;
   }
 
   /** Route a decoded inbound message to the registered handler. */
@@ -819,6 +1049,10 @@ export class NatsChannel {
 
       case "load_history":
         this.onLoadHistory?.(peerId, { before: message.before, limit: message.limit });
+        break;
+
+      case "load_commands":
+        this.onLoadCommands?.(peerId);
         break;
 
       default:

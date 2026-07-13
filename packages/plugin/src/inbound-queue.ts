@@ -45,6 +45,47 @@ export interface SerializedInboundDispatcher<Message> {
   dispatch: (sessionKey: string, message: Message) => void;
   /** Test/diagnostics only: number of sessions with a live (undrained) chain. */
   pendingSessions: () => number;
+  /**
+   * P1-8b: drop a session's busy-time coalesce buffer, returning how many
+   * pending (not-yet-run) messages were discarded. Used by the `/stop` control
+   * lane — a user who aborts wants the text queued behind the running turn gone
+   * too. Returns 0 when the dispatcher has no `coalesce` (no buffer exists) or
+   * the session has nothing buffered.
+   */
+  clearPending: (sessionKey: string) => number;
+  /**
+   * Test/diagnostics only: number of messages currently sitting in a session's
+   * coalesce buffer (arrived while its turn was running, not yet merged/run).
+   * Always 0 for a dispatcher built without `coalesce`.
+   */
+  pendingBuffered: (sessionKey: string) => number;
+}
+
+/** The inbound frame shape the coalesce merge understands. */
+export type UserMessageLike = { type: "user_message"; text: string };
+
+/**
+ * Merge several buffered `user_message` frames into ONE turn's message.
+ *
+ * P1-8b coalesce (Telegram parity): when a user fires several messages faster
+ * than a turn can run, we run a single turn over their concatenation rather than
+ * one turn each. Texts are joined with a blank line (`"\n\n"`) so the agent sees
+ * them as distinct paragraphs of one prompt, in arrival order.
+ *
+ * Non-text fields of the FIRST frame are preserved (spread), so if the union
+ * member ever grows fields beyond `{ type, text }` the earliest message's
+ * metadata wins — matching "the turn is anchored on the first message". A single
+ * message is returned as-is (identity), so the no-burst path is a pure pass
+ * through. Callers only ever pass a non-empty array (a flush batch / a drained
+ * buffer); an empty array is a contract violation and returns `undefined`.
+ */
+export function coalesceUserMessages<M extends UserMessageLike>(
+  messages: readonly M[],
+): M {
+  const first = messages[0];
+  if (messages.length <= 1) return first;
+  const text = messages.map((m) => m.text).join("\n\n");
+  return { ...first, text };
 }
 
 /**
@@ -59,14 +100,89 @@ export interface SerializedInboundDispatcher<Message> {
  */
 export function createSerializedInboundDispatcher<Message>(
   handler: (sessionKey: string, message: Message) => Promise<void>,
+  options?: {
+    /**
+     * P1-8b busy-time coalesce (Telegram parity). When provided, a message that
+     * arrives while its session already has a turn RUNNING is NOT chained as a
+     * second turn — it is buffered. When the running turn settles, the ENTIRE
+     * buffer is drained, merged via this function, and run as ONE follow-up turn
+     * (which itself becomes the new running turn, so messages arriving during IT
+     * buffer again). When omitted, behavior is exactly the legacy per-session
+     * FIFO below (one queued turn per message).
+     */
+    coalesce?: (messages: Message[]) => Message;
+  },
 ): SerializedInboundDispatcher<Message> {
+  const coalesce = options?.coalesce;
+
   // sessionKey -> tail of that session's promise chain. The value is the
   // promise for the LAST-enqueued turn; the next message chains off it. Entries
   // are removed when a session's chain fully drains (see cleanup below) so this
   // map does not grow without bound as transient sessions come and go.
+  //
+  // Used ONLY on the legacy (no-`coalesce`) path. The coalesce path uses
+  // `running` + `pending` below instead; the two paths are mutually exclusive
+  // for the life of a dispatcher, so at most one of these structures is ever
+  // populated.
   const chains = new Map<string, Promise<unknown>>();
 
-  const dispatch = (sessionKey: string, message: Message) => {
+  // --- Coalesce path state (P1-8b) -----------------------------------------
+  // `running`: sessionKey -> the settled-promise of the turn currently in
+  //   flight for that session. Presence == BUSY. Unlike `chains`, we never queue
+  //   a SECOND turn behind it — at most one turn runs per session at a time; the
+  //   rest wait in `pending`.
+  // `pending`: sessionKey -> messages that arrived while the session was busy,
+  //   in arrival order. Drained (merged into one follow-up turn) when the
+  //   running turn settles. Kept as full Message objects because later phases
+  //   (P0-7 dedupe, P1-9 retraction) will reuse this buffer.
+  const running = new Map<string, Promise<unknown>>();
+  const pending = new Map<string, Message[]>();
+
+  // Start a fresh turn for `message` as the session's running turn, and wire its
+  // settlement to drain the coalesce buffer (or go idle). Recurses to run the
+  // merged follow-up turn, so messages that arrived during THIS turn are handled
+  // as a single next turn. Mirrors the legacy path's poisoned-link defenses:
+  // the handler is invoked inside `Promise.resolve().then(...)` so a SYNCHRONOUS
+  // throw is funneled into the rejection path, and `.catch(() => {})` makes the
+  // stored promise non-rejecting so the drain/cleanup ALWAYS runs (a failed turn
+  // must not wedge the session or strand its buffer).
+  const startCoalesceTurn = (sessionKey: string, message: Message) => {
+    const settled = Promise.resolve()
+      .then(() => handler(sessionKey, message))
+      .catch(() => {});
+    running.set(sessionKey, settled);
+
+    void settled.then(() => {
+      // Identity guard, matching the legacy cleanup: only this turn's own
+      // settlement may advance the session. (Nothing else overwrites `running`
+      // for a live session — dispatch only appends to `pending` while busy — but
+      // keep the guard defensive.)
+      if (running.get(sessionKey) !== settled) return;
+      const buffered = pending.get(sessionKey);
+      if (buffered && buffered.length > 0) {
+        pending.delete(sessionKey);
+        // Recurse: the merged follow-up becomes the new running turn. Messages
+        // that arrive during it will buffer against THIS same session again.
+        startCoalesceTurn(sessionKey, coalesce!(buffered));
+      } else {
+        running.delete(sessionKey);
+      }
+    });
+  };
+
+  const dispatchCoalesced = (sessionKey: string, message: Message) => {
+    if (running.has(sessionKey)) {
+      // Busy: buffer instead of chaining a second turn. `startCoalesceTurn` sets
+      // `running` synchronously, so a same-tick burst reliably lands here.
+      const buf = pending.get(sessionKey);
+      if (buf) buf.push(message);
+      else pending.set(sessionKey, [message]);
+      return;
+    }
+    startCoalesceTurn(sessionKey, message);
+  };
+
+  const dispatchLegacy = (sessionKey: string, message: Message) => {
     // Chain off whatever is currently queued for this session (or a resolved
     // promise if the session is idle). We attach via `.then` with NO rejection
     // handler on `previous` itself — instead the previous link is made
@@ -112,8 +228,20 @@ export function createSerializedInboundDispatcher<Message>(
     });
   };
 
+  const dispatch = coalesce ? dispatchCoalesced : dispatchLegacy;
+
   return {
     dispatch,
-    pendingSessions: () => chains.size,
+    // Only one of the two structures is ever populated for a given dispatcher
+    // (coalesce is fixed at construction), so summing is correct for both paths:
+    // legacy counts live chains; coalesce counts running turns.
+    pendingSessions: () => chains.size + running.size,
+    clearPending: (sessionKey: string) => {
+      const buf = pending.get(sessionKey);
+      if (!buf) return 0;
+      pending.delete(sessionKey);
+      return buf.length;
+    },
+    pendingBuffered: (sessionKey: string) => pending.get(sessionKey)?.length ?? 0,
   };
 }

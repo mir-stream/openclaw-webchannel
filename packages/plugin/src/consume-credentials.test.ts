@@ -77,6 +77,46 @@ describe("consumeCredentialSource", () => {
     }
   });
 
+  it("F2: enrolled + persisted identityKey → surfaced on the connected result", async () => {
+    const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}), connected: true }) as never);
+    const identityKey = {
+      publicKey: new Uint8Array(32).fill(1),
+      privateKey: new Uint8Array(32).fill(2),
+    };
+    const source: NatsCredentialSource = {
+      mode: "enrolled",
+      url: "ws://relay",
+      saasBaseUrl: "http://s",
+      tenant: "t",
+      accountId: "a",
+    };
+    const result = await consumeCredentialSource(source, "acctA", {
+      transportFactory,
+      makeSigner: () => async () => "sig",
+      loadPersisted: () => ({ userJwt: "JWT", userSeed: "SEED", identityKey }),
+    });
+    expect(result.status).toBe("connected");
+    if (result.status === "connected") expect(result.identityKey).toBe(identityKey);
+  });
+
+  it("F2: enrolled without a persisted identityKey → connected result omits identityKey", async () => {
+    const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}), connected: true }) as never);
+    const source: NatsCredentialSource = {
+      mode: "enrolled",
+      url: "ws://relay",
+      saasBaseUrl: "http://s",
+      tenant: "t",
+      accountId: "a",
+    };
+    const result = await consumeCredentialSource(source, "acctA", {
+      transportFactory,
+      makeSigner: () => async () => "sig",
+      loadPersisted: () => ({ userJwt: "JWT", userSeed: "SEED" }),
+    });
+    expect(result.status).toBe("connected");
+    if (result.status === "connected") expect(result.identityKey).toBeUndefined();
+  });
+
   it("enrolled + missing creds → creds-missing (no connect, no enroll)", async () => {
     const transportFactory = vi.fn();
     const createEnrolled = vi.fn();

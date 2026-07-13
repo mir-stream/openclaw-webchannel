@@ -113,16 +113,19 @@ function makeKeyStoreChannel(broker: FakeBroker): {
   channel: NatsChannel;
   agentTransport: FakeTransport;
   store: ConversationKeyStore;
+  identityKP: ReturnType<typeof generateKeyPair>;
 } {
   const agentTransport = new FakeTransport(broker);
   const store = new ConversationKeyStore({ accountId: ACCOUNT, home });
+  // F2: a keyStore channel REQUIRES the agent's attested identity key to wrap K.
+  const identityKP = generateKeyPair();
   const channel = new NatsChannel(
     agentTransport as unknown as ConstructorParameters<typeof NatsChannel>[0],
     ACCOUNT,
     TENANT,
-    { keyStore: store },
+    { keyStore: store, identityKeyPair: identityKP },
   );
-  return { channel, agentTransport, store };
+  return { channel, agentTransport, store, identityKP };
 }
 
 /** A "device": subscribes the shared .out and records what it can decrypt with its key. */
@@ -209,20 +212,62 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     void agentTransport;
   });
 
-  it("wrap→unwrap delivery round-trip: the device recovers exactly K", () => {
+  it("wrap→unwrap delivery round-trip: the device recovers exactly K using the pinned agent key + peerId AAD", () => {
     const broker = new FakeBroker();
-    const { channel, store } = makeKeyStoreChannel(broker);
+    const { channel, store, identityKP } = makeKeyStoreChannel(broker);
     channel.registerPeer(PEER);
     const deviceKP = generateKeyPair();
 
     const wrapped = channel.wrapConversationKeyForDevice(PEER, deviceKP.publicKey);
     expect(wrapped).not.toBeNull();
-    const k = unwrapConversationKey(wrapped!, deviceKP.privateKey);
+    // F2: unwrap derives from the PINNED agent identity public key (not the wire
+    // field) and binds the peerId into the AAD.
+    const k = unwrapConversationKey(wrapped!, deviceKP.privateKey, {
+      agentPublicKey: identityKP.publicKey,
+      peerId: PEER,
+    });
     expect(Buffer.from(k).equals(Buffer.from(store.get(PEER)!))).toBe(true);
 
     // Negative control: a DIFFERENT device's private key cannot unwrap it.
     const otherKP = generateKeyPair();
-    expect(() => unwrapConversationKey(wrapped!, otherKP.privateKey)).toThrow();
+    expect(() =>
+      unwrapConversationKey(wrapped!, otherKP.privateKey, {
+        agentPublicKey: identityKP.publicKey,
+        peerId: PEER,
+      }),
+    ).toThrow();
+
+    // F2 negative control: the RIGHT device but the WRONG (non-pinned) agent key
+    // fails — this is the relay-injected-K′ rejection at the primitive level.
+    const relayKP = generateKeyPair();
+    expect(() =>
+      unwrapConversationKey(wrapped!, deviceKP.privateKey, {
+        agentPublicKey: relayKP.publicKey,
+        peerId: PEER,
+      }),
+    ).toThrow();
+
+    // F2 negative control: correct keys but the WRONG peerId (AAD mismatch) fails.
+    expect(() =>
+      unwrapConversationKey(wrapped!, deviceKP.privateKey, {
+        agentPublicKey: identityKP.publicKey,
+        peerId: "someone-else",
+      }),
+    ).toThrow();
+  });
+
+  it("F2: constructing a keyStore channel WITHOUT an identity key is fail-closed (throws)", () => {
+    const broker = new FakeBroker();
+    const store = new ConversationKeyStore({ accountId: ACCOUNT, home });
+    expect(
+      () =>
+        new NatsChannel(
+          new FakeTransport(broker) as unknown as ConstructorParameters<typeof NatsChannel>[0],
+          ACCOUNT,
+          TENANT,
+          { keyStore: store },
+        ),
+    ).toThrow(/identityKeyPair/);
   });
 
   it("wrapConversationKeyForDevice guards: unregistered peer → null; bad key length → throw; legacy channel → null", () => {
@@ -307,7 +352,7 @@ describe("NatsChannel keyStore mode (register admission)", () => {
       transport2 as unknown as ConstructorParameters<typeof NatsChannel>[0],
       ACCOUNT,
       TENANT,
-      { keyStore: store2 },
+      { keyStore: store2, identityKeyPair: generateKeyPair() },
     );
     channel2.registerPeer(PEER);
     expect(Buffer.from(store2.get(PEER)!).equals(Buffer.from(k))).toBe(true);

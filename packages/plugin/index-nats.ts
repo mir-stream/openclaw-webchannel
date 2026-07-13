@@ -24,7 +24,18 @@ import { resolveEncryptionPolicy } from "./src/encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./src/encryption-policy.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 import { handleInboundMessage } from "./src/inbound.js";
-import { createSerializedInboundDispatcher } from "./src/inbound-queue.js";
+import {
+  createSerializedInboundDispatcher,
+  coalesceUserMessages,
+} from "./src/inbound-queue.js";
+import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./src/control-lane.js";
+import { resolveCommandGate } from "./src/command-gate.js";
+import {
+  createInboundDebouncer,
+  resolveInboundDebounceMs,
+} from "openclaw/plugin-sdk/reply-runtime";
+import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
+import { createIngressOnFlush, recordCancelledInboundItems } from "./src/ingress-dedupe.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
@@ -38,9 +49,10 @@ import { PopChallengeStore } from "./src/pop-challenge.js";
 import { handleRegisterRequest } from "./src/nats-register.js";
 import { resolveAdmissionMode, admissionServingPlan } from "./src/nats-admission.js";
 import { isDmPostureOpen } from "./src/dm-allowlist.js";
-import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
+import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig, planHistoryFetch } from "./src/history.js";
+import { createCommandCatalogProvider } from "./src/commands-catalog.js";
 import { resolveWebchannelSessionRoute } from "./src/session-route.js";
-import type { WebChannelTransport } from "./src/transport.js";
+import { WEBCHANNEL_ID, type WebChannelTransport } from "./src/transport.js";
 import type { NatsTransport } from "./src/nats-transport.js";
 import type { EnrolledNatsConnection } from "./src/enrolled-nats-connection.js";
 import {
@@ -50,7 +62,12 @@ import {
 } from "./src/nats-credential-source.js";
 import { consumeCredentialSource } from "./src/consume-credentials.js";
 import { planAccounts } from "./src/multiplex.js";
-import { loadPersistedEnrolledCreds } from "./src/account-config.js";
+import {
+  loadPersistedEnrolledCreds,
+  resolveTypingEnabled,
+} from "./src/account-config.js";
+import type { KeyPair } from "./src/e2e-crypto.js";
+import { devOpenAgentIdentityKeyPair } from "./src/dev-identity.js";
 
 // ---------------------------------------------------------------------------
 // Global state — multi-account multiplex (가-1 Cycle 2)
@@ -85,6 +102,19 @@ type AccountRuntime = {
   verifier?: ConnectionVerifier;
   auth: AuthConfig | undefined;
   historyConfig: ReturnType<typeof resolveHistoryConfig>;
+};
+
+/**
+ * Top-level config blocks this entry reads that plugin-sdk's `OpenClawConfig`
+ * does not model. The webchannel `channels add` wizard writes a shared `nats`/
+ * `saas` base at the config root (the default account's identity base); the SDK
+ * type only declares core keys, so `api.config` is narrowed once against this at
+ * the point of use. Both fields (and their members) are optional — the runtime
+ * already falls back to per-account config / acquisition env when absent.
+ */
+type WebchannelChannelConfig = {
+  nats?: { url?: string; devOpen?: boolean };
+  saas?: { baseUrl?: string };
 };
 
 /** accountId → runtime, built once per process (idempotent across re-warms). */
@@ -288,7 +318,11 @@ export default defineChannelPluginEntry({
     }
     accountsBuildStarted = true;
 
-    const legacyNats = api.config.nats as { url?: string; devOpen?: boolean } | undefined;
+    // Narrow ONCE against the channel-plugin config extensions plugin-sdk's
+    // `OpenClawConfig` does not declare (see `WebchannelChannelConfig`). Every
+    // top-level `nats`/`saas` read below goes through this local.
+    const config = api.config as typeof api.config & WebchannelChannelConfig;
+    const legacyNats = config.nats;
 
     // Phase 3 planning (pure): list accounts. The wire identity is the accountId
     // itself (unique by construction), so there are no structural pre-I/O skips.
@@ -321,7 +355,7 @@ export default defineChannelPluginEntry({
         // Match the consume block's precedence (:277): plan-resolved base URL
         // (config `saas.baseUrl` over acquisition env) falls back to the flat
         // top-level `saas.baseUrl`.
-        plan.saasBaseUrl ?? api.config.saas?.baseUrl,
+        plan.saasBaseUrl ?? config.saas?.baseUrl,
         accountId,
         // SaaS-delivered issuer, persisted with the enrolled creds at
         // `channels add` time (EnrollmentResult.issuer). Same loader the
@@ -369,11 +403,14 @@ export default defineChannelPluginEntry({
       let transport: NatsTransport;
       let enrolled: EnrolledNatsConnection | undefined;
       let credentialMode: NatsCredentialSource["mode"];
+      // F2: the agent's SaaS-attested identity key from the enrolled creds (set
+      // only on the enrolled path). The register-hop channel wraps K under it.
+      let identityKey: KeyPair | undefined;
       try {
         const source = resolveNatsCredentialSource({
           natsConfig: accountNatsCfg,
           legacyNats,
-          saasBaseUrl: plan.saasBaseUrl ?? api.config.saas?.baseUrl,
+          saasBaseUrl: plan.saasBaseUrl ?? config.saas?.baseUrl,
           tenant,
           accountId,
         });
@@ -398,6 +435,7 @@ export default defineChannelPluginEntry({
         );
         transport = consumed.connection.transport;
         if (consumed.connection.enrolled) enrolled = consumed.connection.enrolled;
+        identityKey = consumed.identityKey;
         // Review 2026-07-02 (C1): attach a post-handshake "error" listener so a
         // transient NATS failure (server restart → TCP reset; a post-connect
         // `-ERR Permissions Violation`) is logged with account context —
@@ -479,37 +517,321 @@ export default defineChannelPluginEntry({
         }
       }
 
+      // ---- F2: resolve the register-hop wrap identity key -------------------
+      // A register-hop account wraps the conversation key K under the agent's
+      // SaaS-attested identity key so the browser can authenticate it. K MUST be
+      // wrapped under an ATTESTED key on every non-dev path:
+      //  - ENROLLED mode (production): the key comes from the persisted creds. If
+      //    it is absent (pre-F2 creds / malformed block) we SKIP serving.
+      //  - STATIC creds + explicit `nats.admission:"register-hop"` (a legitimate
+      //    bring-your-own-NATS production shape — the override is honored verbatim,
+      //    nats-admission.ts): there is a real untrusted relay, so an unattested
+      //    key would re-open the MITM. Also SKIP serving — BYON register-hop still
+      //    requires an enrolled/attested identity key.
+      //  - open mode ONLY (`WEBCHANNEL_NATS_DEV_OPEN` / devOpen / credentials.mode
+      //    "open" — the genuine dev/e2e knob, no untrusted relay in the threat
+      //    model): fall back to the WELL-KNOWN dev identity key so the dev browser
+      //    drivers can pin it. This is the ONLY path that may wrap under the public
+      //    dev key.
+      // Auto accounts never wrap K, so they never reach this block.
+      let registerHopIdentityKey = identityKey;
+      if (admission === "register-hop" && !registerHopIdentityKey) {
+        if (credentialMode === "open") {
+          registerHopIdentityKey = devOpenAgentIdentityKeyPair();
+          (api.logger?.warn ?? console.warn)?.(
+            `[webchannel] account "${accountId}" register-hop on DEV-OPEN NATS with no enrolled ` +
+              `identity key — using the WELL-KNOWN DEV identity key to wrap K (DEV/E2E ONLY, NOT ` +
+              `attested; this key is public, so an untrusted relay could MITM — never use dev-open ` +
+              `in production).`,
+          );
+        } else {
+          // enrolled (production) OR static (BYO-NATS production) with no attested
+          // key → fail closed. Never wrap K under the public dev key on a path that
+          // faces a real relay.
+          (api.logger?.error ?? console.error)?.(
+            `[webchannel] account "${accountId}" is register-hop (${credentialMode}) but has no ` +
+              `agent identity key — refusing to serve (the browser could not authenticate the ` +
+              `conversation key; wrapping under the public dev key would re-open the relay MITM). ` +
+              `Enroll to mint an attested identity key: openclaw channels add --channel webchannel ` +
+              `--account ${accountId}`,
+          );
+          continue;
+        }
+      }
+
       // ---- Step 2 (per account): create the encrypted NATS channel ---------
       // Subject namespace is webchannel.{tenant}.{accountId}.{peerId} — the
       // accountId is the wire identity (one namespace per account).
       const channel = new NatsChannel(transport, accountId, tenant, {
         ...cryptoOptions,
         ...(admission === "register-hop"
-          ? { keyStore: new ConversationKeyStore({ accountId }) }
+          ? {
+              keyStore: new ConversationKeyStore({ accountId }),
+              // Guaranteed present: enrolled/static → persisted attested key (else
+              // skipped above); dev-open → the well-known dev key.
+              identityKeyPair: registerHopIdentityKey,
+            }
           : {}),
       });
       console.log(
         `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, accountId=${accountId})`,
       );
 
+      // P0-6: honor `capabilities.typing: "off"` on NATS (previously the gate
+      // existed only on the legacy WS transport, so the off-toggle was silently
+      // ignored here). `account` (destructured from the serving plan above) IS
+      // this account's RESOLVED config — `resolveWebchannelAccountConfig(cfg,
+      // accountId)` (multiplex.ts), the channel-level base merged under the
+      // account override — so each account's capability applies to its own
+      // channel (가-1 Cycle 2). We reuse that binding rather than re-resolving:
+      // it is already the exact `WebchannelAccountConfig` `resolveTypingEnabled`
+      // takes (the history handler below casts it only because
+      // `resolveHistoryConfig` wants a narrower shape).
+      channel.setTypingEnabled(resolveTypingEnabled(account));
+
       // ---- Step 3 (per account): inbound dispatcher (accountId-threaded) ----
       // Each account gets its OWN serialized dispatcher bound to its channel and
       // accountId, so inbound turns resolve THIS account's route (binding.account)
       // and replies deliver back over THIS account's channel.
-      const { dispatch: dispatchInbound } = createSerializedInboundDispatcher<
-        Extract<InboundWsMessage, { type: "user_message" }>
-      >((peerId, message) =>
-        handleInboundMessage(
-          api,
-          channel as unknown as WebChannelTransport,
-          peerId,
-          message,
+      type WebchannelUserMessage = Extract<
+        InboundWsMessage,
+        { type: "user_message" }
+      >;
+      const inboundDispatcher =
+        createSerializedInboundDispatcher<WebchannelUserMessage>(
+          (peerId, message) =>
+            handleInboundMessage(
+              api,
+              channel as unknown as WebChannelTransport,
+              peerId,
+              message,
+              accountId,
+            ),
+          {
+            // P1-8b layer (b): busy-time coalesce. A message that arrives while a
+            // turn is already running for its session buffers and is merged into
+            // ONE follow-up turn on completion (Telegram parity), instead of
+            // chaining a separate turn each.
+            coalesce: coalesceUserMessages,
+          },
+        );
+      const dispatchInbound = inboundDispatcher.dispatch;
+
+      // P0-7a: per-account ingress idempotency. Each `user_message` carries a
+      // stable client `id`; we record `${peerId}:${id}` at admission with a 7-day
+      // window (Telegram parity) and drop a duplicate frame before it runs a
+      // second turn. ONE instance PER ACCOUNT — namespace = accountId, so ids are
+      // isolated per account and a peer cannot poison another peer's ids. We use
+      // `createPersistentDedupe` (record-at-ingress), NOT `createClaimableDedupe`
+      // (claim/commit); the rationale for at-most-once admission over
+      // claim/forget rollback lives in ingress-dedupe.ts. A disk fault degrades
+      // to memory-only (onDiskError → warn) and never blocks inbound.
+      const inboundDedupe = createPersistentDedupe({
+        pluginId: WEBCHANNEL_ID,
+        ttlMs: 7 * 24 * 60 * 60 * 1000,
+        memoryMaxSize: 2048,
+        stateMaxEntries: 5000,
+        onDiskError: (err) =>
+          api.logger?.warn?.(
+            `webchannel: account "${accountId}" ingress dedupe disk error ` +
+              `(degrading to memory-only): ${String(err)}`,
+          ),
+      });
+
+      // P1-8b layer (a): idle pre-run debounce (Telegram parity), REUSING core's
+      // `createInboundDebouncer`. Sits IN FRONT of the per-session FIFO: rapid
+      // same-peer messages within the debounce window flush together as ONE
+      // merged turn. `resolveInboundDebounceMs` reads the GLOBAL config
+      // (`messages.inbound.byChannel.webchannel ?? messages.inbound.debounceMs ??
+      // 0`) — resolved ONCE here per account. The core default is 0ms, which makes
+      // this layer inert (each message flushes immediately) unless an operator
+      // opts in; layer (b) still coalesces busy-time regardless. We keep that
+      // default (do NOT invent a nonzero one). Items carry `peerId` so `buildKey`
+      // and `onFlush` can route; `serializeImmediate` guarantees same-peer flushes
+      // never reorder even on the 0ms immediate path (core serializes same-key
+      // flushes through its `keyChains`). `onFlush` calls `dispatchInbound`
+      // SYNCHRONOUSLY, so a message arriving during a previous flush's merged turn
+      // lands in layer (b)'s buffer rather than spawning a parallel turn.
+      const inboundDebounceMs = resolveInboundDebounceMs({
+        cfg: api.config,
+        channel: WEBCHANNEL_ID,
+      });
+      const inboundDebouncer = createInboundDebouncer<{
+        peerId: string;
+        message: WebchannelUserMessage;
+      }>({
+        debounceMs: inboundDebounceMs,
+        serializeImmediate: true,
+        buildKey: (item) => item.peerId,
+        // P0-7a ingress dedupe + P0-7b ingress ack. The REAL handler is
+        // `createIngressOnFlush` (src/ingress-dedupe.ts) — extracted there so it
+        // is tsc-checked and tested directly. Its doc owns the load-bearing
+        // rationale (why the async dedupe belongs on this same-peer-serialized
+        // flush path, the control-lane bypass, per-id record-before-coalesce, and
+        // why the ack covers fresh + duplicates alike and precedes dispatch).
+        // Split log sinks: routine duplicate drops at info, fail-open faults at
+        // warn. `sendAck` (P0-7b) drains the client's replay ledger on ingress
+        // ADMISSION (not turn success); P0-7a wired no ack (first half).
+        onFlush: createIngressOnFlush<{
+          peerId: string;
+          message: WebchannelUserMessage;
+        }>({
           accountId,
-        ),
-      );
+          checkAndRecord: (key, opts) => inboundDedupe.checkAndRecord(key, opts),
+          dispatch: dispatchInbound,
+          coalesce: coalesceUserMessages,
+          sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
+          logInfo: (m) => api.logger?.info?.(m),
+          logWarn: (m) => api.logger?.warn?.(m),
+        }),
+        onError: (err) =>
+          api.logger.error?.(
+            `webchannel: inbound debounce flush failed: ${String(err)}`,
+          ),
+        onCancel: (items) => {
+          // P0-7b: a `/stop` cancels debounce-buffered messages that never reached
+          // onFlush, so they were never dedupe-recorded and never acked — yet the
+          // client's replay ledger still holds them. Record their ids (so an
+          // in-flight replay is dropped as a duplicate) and ack them (drain the
+          // ledger). onCancel is sync-shaped and checkAndRecord is async, so this
+          // is best-effort fire-and-forget with a warn — a lost record only
+          // re-opens the pre-existing pre-4b replay window (see the helper). Layer
+          // (b) `clearPending` items are NOT handled here: they were already
+          // acked+recorded at their own onFlush.
+          void recordCancelledInboundItems(
+            items,
+            accountId,
+            (key, opts) => inboundDedupe.checkAndRecord(key, opts),
+            (peerId, ids) => channel.sendAck(peerId, ids),
+            (m) => api.logger?.warn?.(m),
+          ).catch((err) =>
+            api.logger?.warn?.(
+              `webchannel: cancelled-inbound handling failed: ${String(err)}`,
+            ),
+          );
+        },
+      });
+
+      // Command-gate mirror (P1-8a follow-up), resolved ONCE per account. It
+      // depends only on `api.config` + `accountId`, never on the message, so we
+      // build it here rather than per abort. When an operator configures a
+      // commands/owner allowlist, core IGNORES our control-lane
+      // `access.commands.authorized` stamp and a non-listed peer's `/stop`
+      // silently fails — this lets the control-lane branch below detect that and
+      // send the peer a hedged notice. See src/command-gate.ts for the traced
+      // core paths (all testable logic lives there; this file is tsc-blind).
+      const commandGate = resolveCommandGate(api.config, accountId);
       channel.setMessageHandler((peerId, message) => {
         if (message.type !== "user_message") return; // approvals routed below
-        dispatchInbound(peerId, message);
+        // Control lane (P1-8a): an abort ("/stop"/"stop"/…) must reach core's
+        // fast-abort WHILE the running turn is live, so it must NOT queue behind
+        // that turn on the per-session FIFO. Dispatch it directly, fire-and-
+        // forget, as an authorized control-lane turn. All the testable logic
+        // lives in `isControlLaneMessage` + `handleInboundMessage` (both under
+        // tsc + vitest); this file just routes.
+        //
+        // Unlike the FIFO path (inbound-queue.ts swallows a rejected turn), this
+        // direct dispatch has no chain to absorb a throw, and the pre-try work in
+        // handleInboundMessage (config/admission/route resolution, sendTyping)
+        // runs OUTSIDE its internal try/catch — so we MUST attach a rejection
+        // handler here or an unhandledRejection would take down the gateway.
+        //
+        // Authorization note: if an operator sets `commands.allowFrom` that
+        // EXCLUDES this peer, core's fast-abort returns handled:false (verified
+        // dist-B2e1grFo.js:1281) and the abort frame falls through to a NORMAL
+        // turn that races the running one, hits core's busy gate, and is dropped
+        // as busy. No wedge and no double-delivery — the /stop is simply ignored
+        // for an unauthorized sender.
+        if (isControlLaneMessage(message)) {
+          // P1-8b: an EXPLICIT "/stop" (typed, or the widget Stop button which
+          // sends the literal "/stop") wants the text queued behind the running
+          // turn gone too — mirroring core fast-abort clearing its own followup
+          // lanes. Drop this peer's buffered input on BOTH layers before
+          // dispatching the abort: (a) any messages waiting in the pre-run
+          // debounce window (`cancelKey`), and (b) any messages buffered during
+          // the running turn (`clearPending`). Log at info only when something
+          // was actually dropped.
+          //
+          // The destructive drop is gated by `shouldDropBufferedInputOnStop`,
+          // which narrows on TWO axes (both live in the tested predicate):
+          //  1. EXPLICIT "/stop" only, NOT the broader `isControlLaneMessage`
+          //     vocabulary — a "wait"/"stop please" still aborts the running turn
+          //     for core parity, but a false-positive NL match must never
+          //     silently destroy a queued follow-up. Only the unambiguous "/stop"
+          //     opts in.
+          //  2. AUTHZ ASYMMETRY — the drop is all-or-nothing with the abort, and
+          //     the abort is core's call. When a commands/owner allowlist is
+          //     configured, core IGNORES our control-lane stamp (see the hedge
+          //     below + command-gate.ts): a non-listed peer's abort is refused,
+          //     the running turn keeps going. Dropping their buffers then would be
+          //     a PARTIAL /stop — turn survives, queued input destroyed. So we
+          //     drop only when the gate says core will honor this peer's abort
+          //     (`!delegated || isListed`). The mirror is biased toward NOT
+          //     dropping, so its only error is skipping cleanup for a peer whose
+          //     abort actually succeeded (their follow-up runs after the abort) —
+          //     accepted over destroying input for a peer whose turn survives.
+          if (shouldDropBufferedInputOnStop(message, commandGate, peerId)) {
+            const debounceCancelled = inboundDebouncer.cancelKey(peerId);
+            const pendingDropped = inboundDispatcher.clearPending(peerId);
+            if (debounceCancelled || pendingDropped > 0) {
+              api.logger?.info?.(
+                `webchannel: /stop dropped buffered input for peer ${peerId} (debounced=${debounceCancelled}, pending=${pendingDropped})`,
+              );
+            }
+          }
+          // P0-7b: ack the control-lane frame here too. It bypasses the
+          // debouncer/onFlush (and is never deduped), so without this its
+          // client-side ledger entry would never drain and every reconnect would
+          // replay the /stop. A replayed /stop that lands before this ack is a
+          // harmless no-op abort (accepted).
+          if (message.id) channel.sendAck(peerId, [message.id]);
+          void handleInboundMessage(
+            api,
+            channel as unknown as WebChannelTransport,
+            peerId,
+            message,
+            accountId,
+            { controlLane: true },
+          ).catch((err) =>
+            api.logger?.error?.(
+              `webchannel: control-lane dispatch failed: ${String(err)}`,
+            ),
+          );
+          // Feedback-only hedge for the stamp-ignored trap. Core's
+          // `resolveCommandSenderAuthorization` IGNORES our control-lane
+          // `access.commands.authorized` stamp whenever a commands/owner
+          // allowlist is configured (see src/command-gate.ts): a non-listed
+          // peer's /stop returns handled:false, falls through to a normal turn,
+          // and is dropped as busy — the run is NOT aborted and the widget's
+          // Stop button would otherwise sit silently inert with zero feedback.
+          // We STILL dispatch the abort above (core is the authority — the
+          // mirror can be wrong), and here we ADDITIONALLY warn the peer when
+          // our best-effort mirror says core will reject this sender. The gate
+          // is a conservative mirror biased toward showing this notice, so a
+          // false positive is only an extra hedged message, never a missed one.
+          // Best-effort send (ignore the boolean return), matching the rest of
+          // the outbound surface.
+          if (commandGate.delegated && !commandGate.isListed(peerId)) {
+            channel.sendText(
+              peerId,
+              "Stop may not be permitted for this user: this agent restricts " +
+                "commands to an operator allowlist.",
+            );
+          }
+          return;
+        }
+        // Normal inbound: through layer (a) debounce → onFlush → per-session FIFO
+        // (layer (b) coalesce). `enqueue` is fire-and-forget from here; attach a
+        // rejection handler so a flush failure can't surface as an
+        // unhandledRejection (the debouncer already routes onFlush throws to
+        // `onError`, so this is belt-and-suspenders).
+        void inboundDebouncer
+          .enqueue({ peerId, message })
+          .catch((err) =>
+            api.logger?.error?.(
+              `webchannel: inbound enqueue failed: ${String(err)}`,
+            ),
+          );
       });
 
       // ---- Axis B consequence: wildcard subscription (auto accounts) --------
@@ -550,8 +872,13 @@ export default defineChannelPluginEntry({
           // Same forced key as the WRITE + snapshot sites — pagination reads
           // THIS user's session, so older pages never leak another user's turns.
           const route = resolveWebchannelSessionRoute(api, accountId, peerId);
+          // `planHistoryFetch` validates the wire `limit` (the NATS dispatch
+          // forwards it unvalidated) and picks paginate-vs-tail from `before`.
+          const plan = planHistoryFetch(request, historyConfig.pageSize);
           void runDetachedHistoryRead(() =>
-            historyPageBefore(api, route.sessionKey, request, historyConfig.pageSize, api.logger),
+            plan.kind === "page"
+              ? historyPageBefore(api, route.sessionKey, plan.beforeId, plan.limit, api.logger)
+              : historyRecent(api, route.sessionKey, plan.limit, api.logger),
           )
             .then((messages) => {
               channel.sendHistory(peerId, messages);
@@ -561,6 +888,39 @@ export default defineChannelPluginEntry({
             });
         } catch (err) {
           api.logger.error?.(`webchannel: history resolution failed for ${peerId}: ${String(err)}`);
+        }
+      });
+
+      // ---- Step 5b (per account): command-catalog load handler (P0-3) ------
+      // Slash-command DISCOVERY. The catalog is a PURE function of the agent's
+      // resolved config, which is fixed for the process's lifetime, so we build
+      // it ONCE via a memoizing provider (created here, per account) and serve
+      // the cached result on every request. Per-request building was an
+      // event-loop DoS surface: this handler runs inline on the inbound dispatch
+      // path for ANY handshaken peer (see the exposure decision below), so a peer
+      // could flood `load_commands` and re-spin the registry list + sort each
+      // frame. Memoizing removes that without a rate limiter. The provider does
+      // NOT cache a thrown build, so a transient registry fault retries on the
+      // next request rather than latching an empty menu; the try/catch stays the
+      // failure boundary (a build fault must never surface as an unhandled throw
+      // on the dispatch path). See src/commands-catalog.ts for the design.
+      //
+      // EXPOSURE DECISION (deliberate): unlike the history/approval snapshots —
+      // which are register-hop-gated because they carry the user's own data —
+      // the `commands` frame is served to ANY handshaken peer, including
+      // wildcard / `admission:"auto"` peers. Auto-mode peers never call
+      // registerPeer, so gating discovery on registration would kill the
+      // typeahead in auto mode entirely. The catalog is low-sensitivity command
+      // metadata (names / descriptions / args), already config-filtered by
+      // buildCommandCatalog — so serving it to any handshaken peer is accepted.
+      const catalogProvider = createCommandCatalogProvider(api.config);
+      channel.setLoadCommandsHandler((peerId) => {
+        try {
+          channel.sendCommands(peerId, catalogProvider());
+        } catch (err) {
+          api.logger.error?.(
+            `webchannel: command catalog failed for ${peerId}: ${String(err)}`,
+          );
         }
       });
 

@@ -37,6 +37,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { WebchannelNatsConfig } from "./nats-credential-source.js";
+import type { KeyPair } from "./e2e-crypto.js";
 
 /** The single default account id (mirrors core's `"default"`). */
 export const DEFAULT_ACCOUNT_ID = "default";
@@ -251,6 +252,29 @@ export function resolveAcquisitionIdentity(
   };
 }
 
+/**
+ * Resolve whether the typing indicator is enabled for an account (P0-6).
+ *
+ * Reads the account's merged `capabilities.typing` (channel-level shared base
+ * under the account override — pass a config already resolved via
+ * `resolveWebchannelAccountConfig`). Enabled by ANYTHING but an explicit
+ * `"off"`, so an omitted key defaults ON, mirroring the legacy WS wiring at
+ * `index.ts` (`typing !== "off"`) — we apply the default here rather than
+ * depending on the JSON schema being applied.
+ *
+ * Unlike the legacy WS path, which reads the flat CHANNEL-LEVEL section, this
+ * reads the PER-ACCOUNT resolved config so each account's capability applies to
+ * its own channel (가-1 Cycle 2 — see `inbound.ts`). The NATS channel gate
+ * (`NatsChannel.setTypingEnabled`) was previously never wired, so an operator's
+ * `typing: "off"` was silently ignored on NATS.
+ */
+export function resolveTypingEnabled(accountConfig: WebchannelAccountConfig): boolean {
+  const capabilities = accountConfig?.capabilities as
+    | { typing?: "on" | "off" }
+    | undefined;
+  return (capabilities?.typing ?? "on") !== "off";
+}
+
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,
@@ -343,6 +367,17 @@ export type PersistedEnrolledCreds = {
    * Used VERBATIM (verify already compares slash-insensitively).
    */
   issuer?: string;
+  /**
+   * F2 — the agent's SaaS-attested static X25519 identity key pair, read from the
+   * top-level `identityKey.{publicKey,privateKey}` (base64url) that
+   * `enrollment-client.ts` persists in the SAME `credentials.json`. The register
+   * (keyStore) path wraps the conversation key under THIS so the browser can
+   * authenticate K against the SaaS-pinned agent public key. Absent for creds
+   * enrolled before this field existed or a malformed key block — the register-hop
+   * account then fail-closed skips serving (index-nats), while auto/open/static
+   * accounts (which never wrap K) are unaffected.
+   */
+  identityKey?: KeyPair;
 };
 
 /**
@@ -374,6 +409,7 @@ export function loadPersistedEnrolledCreds(
   if (!exists(path)) return undefined;
   try {
     const parsed = JSON.parse(read(path)) as {
+      identityKey?: { publicKey?: unknown; privateKey?: unknown };
       enrollment?: {
         creds?: { userJwt?: unknown; userSeed?: unknown };
         natsUrl?: unknown;
@@ -393,14 +429,43 @@ export function loadPersistedEnrolledCreds(
       // load and fall back gracefully.
       const natsUrl = parsed.enrollment?.natsUrl;
       const issuer = parsed.enrollment?.issuer;
+      // F2: decode the agent identity key pair (top-level, base64url). Only
+      // surfaced when BOTH halves decode to exactly 32 bytes — a partial or
+      // malformed block is treated as absent so the register-hop account
+      // fail-closed skips serving rather than wrapping under a bad key.
+      const identityKey = parseIdentityKey(parsed.identityKey);
       return {
         userJwt: creds.userJwt,
         userSeed: creds.userSeed,
         ...(typeof natsUrl === "string" && natsUrl.length > 0 ? { natsUrl } : {}),
         ...(typeof issuer === "string" && issuer.length > 0 ? { issuer } : {}),
+        ...(identityKey ? { identityKey } : {}),
       };
     }
     return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * F2 — decode a persisted `identityKey.{publicKey,privateKey}` (base64url) into a
+ * raw-bytes `KeyPair`. Returns `undefined` unless BOTH halves are present and
+ * decode to exactly 32 bytes (an X25519 key), so a malformed/partial block is
+ * treated as "no identity key" (fail-closed downstream) rather than surfacing a
+ * bad key into the wrap path.
+ */
+function parseIdentityKey(
+  raw: { publicKey?: unknown; privateKey?: unknown } | undefined,
+): KeyPair | undefined {
+  if (!raw || typeof raw.publicKey !== "string" || typeof raw.privateKey !== "string") {
+    return undefined;
+  }
+  try {
+    const publicKey = new Uint8Array(Buffer.from(raw.publicKey, "base64url"));
+    const privateKey = new Uint8Array(Buffer.from(raw.privateKey, "base64url"));
+    if (publicKey.length !== 32 || privateKey.length !== 32) return undefined;
+    return { publicKey, privateKey };
   } catch {
     return undefined;
   }

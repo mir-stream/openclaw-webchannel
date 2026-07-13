@@ -25,10 +25,46 @@ export type ChatMessage = {
   text: string;
   ts?: number;
   working?: boolean;
+  /**
+   * P0-7b: the stable wire `id` the client stamped on the outbound
+   * `user_message` this bubble echoes (user role only). Set at send time so an
+   * `ack` frame can mark the bubble delivered. Absent on server-hydrated bubbles
+   * and on agent messages; not used by the history three-tier adoption.
+   */
+  wireId?: string;
+  /**
+   * P0-7b: flips true once the agent acks this message's `wireId` at ingress
+   * (state-only — a view can render a ✓). Absent until then.
+   */
+  delivered?: boolean;
 };
 
 /** Native HITL approval decision; mirrors the plugin/SDK union. */
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
+
+/**
+ * One positional argument of a slash command (P0-3 discovery). A trimmed subset
+ * of the plugin's registry arg shape — just what the typeahead needs. Mirrors
+ * `packages/plugin/src/commands-catalog.ts` (re-declared, not imported, so this
+ * package stays Node-free).
+ */
+export type CommandCatalogArg = {
+  name: string;
+  description?: string;
+  required?: boolean;
+  /** Static allowed values (absent when the arg takes free text). */
+  choices?: string[];
+};
+
+/**
+ * One slash command in the discovery catalog (P0-3). `name` is WITHOUT a
+ * leading slash (the registry's shape); a view renders it as `/${name}`.
+ */
+export type CommandCatalogEntry = {
+  name: string;
+  description: string;
+  args?: CommandCatalogArg[];
+};
 
 /** One offered approval button. */
 export type ApprovalOption = {
@@ -104,6 +140,28 @@ export type WebChannelState = {
    * arrives, and stays `false` once it has settled.
    */
   isTyping?: boolean;
+  /**
+   * Slash-command discovery catalog (P0-3). Absent until the UI calls
+   * `client.loadCommands()` and the agent answers with a `commands` frame;
+   * then it holds the config-filtered, alias-free, name-sorted command list a
+   * typeahead menu renders. Replaced wholesale on each `commands` frame.
+   */
+  commands?: CommandCatalogEntry[];
+  /**
+   * The AGENT-plugin's wire-protocol version, learned from the register success
+   * reply (NATS path). `null` until a register completes, and STAYS null against
+   * a pre-v1 plugin whose reply omits the field (non-fatal — see the register
+   * policy in nats-client.ts). A value that DISAGREES with the client's
+   * `WEBCHANNEL_PROTOCOL_VERSION` never lands here: it is a TERMINAL error that
+   * moves `status` to `"error"` instead. Exposed for diagnostics (admin screen).
+   */
+  agentProtocolVersion: number | null;
+  /**
+   * The AGENT-plugin's package version string, reported in the register success
+   * reply for diagnosability. `null` until a register completes or against a
+   * pre-reporting plugin. Advisory only — never gates behavior.
+   */
+  agentPluginVersion: string | null;
 };
 
 /** A state-change subscriber. Receives the latest immutable snapshot. */
@@ -164,7 +222,11 @@ export type WebChannelOptions = {
 
 /** Wire envelope sent TO the gateway. Mirrors `src/transport.ts`. */
 export type InboundWsMessage =
-  | { type: "user_message"; text: string }
+  // P0-7a: `id` is a stable, client-minted unique id per logical send, used for
+  // server-side ingress idempotency (a rapid double-submit or a future replay is
+  // deduped). OPTIONAL for back-compat: an older client omits it and the frame
+  // is not deduped.
+  | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
   /**
    * History pagination request. The widget emits this when the user scrolls
@@ -174,7 +236,14 @@ export type InboundWsMessage =
    * The SDK does NOT auto-fire this on the client's behalf — UI code calls
    * `client.loadHistory(...)` on user action (e.g. scroll-to-top button).
    */
-  | { type: "load_history"; before?: string; limit?: number };
+  | { type: "load_history"; before?: string; limit?: number }
+  /**
+   * Slash-command discovery request (P0-3). The widget emits this the first
+   * time the user types `/`; the agent answers with a `commands` frame. No
+   * params — the catalog is not paged. Fired by UI code via
+   * `client.loadCommands()`, never automatically by the SDK.
+   */
+  | { type: "load_commands" };
 
 /** Wire envelope received FROM the gateway. Mirrors `src/transport.ts`. */
 export type OutboundWsMessage =
@@ -220,4 +289,10 @@ export type OutboundWsMessage =
    * to `load_history` requests (older pages). The widget prepends `messages`
    * to its transcript, deduplicating by id.
    */
-  | { type: "history"; messages: ChatMessage[] };
+  | { type: "history"; messages: ChatMessage[] }
+  /**
+   * Slash-command discovery catalog (P0-3), sent in reply to `load_commands`.
+   * Config-filtered, alias-free, name-sorted. The client replaces
+   * `WebChannelState.commands` wholesale with it.
+   */
+  | { type: "commands"; commands: CommandCatalogEntry[] };

@@ -158,7 +158,11 @@ async function mountForSession(me: Me): Promise<void> {
   if (grantedAccounts.length > 0) {
     await mountLane(grantedAccounts[0]);
     renderTabs();
-    // Wiretap watches the whole tenant subtree — account-independent, mount once.
+  }
+  // Wiretap watches the whole tenant subtree via OPERATOR observer creds (minted
+  // only behind the admin session — the browser-facing /nats-user cannot mint
+  // them). It is account-independent, so mount once — for admins only.
+  if (me.isAdmin && grantedAccounts.length > 0) {
     try {
       paneTeardowns.push(await createWiretap($("wiretap-body"), config, grantedAccounts[0]));
     } catch (err) {
@@ -166,6 +170,12 @@ async function mountForSession(me: Me): Promise<void> {
         el("div", { style: "color:var(--bad);font-size:12px" }, [`wiretap failed: ${(err as Error).message}`]),
       );
     }
+  } else {
+    $("wiretap-body").replaceChildren(
+      el("div", { style: "color:var(--muted);font-size:12px;line-height:1.5" }, [
+        "The wiretap is a tenant-wide observer — an operator capability. Sign in as admin to watch raw relay frames.",
+      ]),
+    );
   }
 
   $("login").classList.add("hidden");

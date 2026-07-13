@@ -29,6 +29,7 @@ import type {
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
+import type { AgentKeyRegistry } from "./agent-key-registry.js";
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -107,6 +108,27 @@ function assertValidAgentPublicKey(key: unknown): void {
       "webchannel: agentPublicKey must be base64url of a 32-byte X25519 public key",
     );
   }
+}
+
+// Advisory version fields ride the same unauthenticated /enroll ingress as
+// agentPublicKey, but they are diagnostics-only (never gate approval, never part
+// of the trust chain). So unlike agentPublicKey — which is REJECTED — a malformed
+// version is SANITIZED-AWAY: we drop it and let enrollment succeed. The bounds
+// exist purely to cap store/approval-UI bloat and keep a control-character string
+// out of an admin listing; 64 chars comfortably fits any real semver + build tag.
+const PLUGIN_VERSION_MAX_LEN = 64;
+const PLUGIN_VERSION_FORMAT = /^[\w.+-]+$/;
+
+/** A reported `pluginVersion` for storage, or undefined if it fails the bound. */
+function sanitizePluginVersion(v: unknown): string | undefined {
+  return typeof v === "string" && v.length > 0 && v.length <= PLUGIN_VERSION_MAX_LEN && PLUGIN_VERSION_FORMAT.test(v)
+    ? v
+    : undefined;
+}
+
+/** A reported `protocolVersion` for storage, or undefined if not a non-negative safe int. */
+function sanitizeProtocolVersion(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +431,15 @@ export type DeviceFlowOptions = {
    * Use a persistent store (Redis, DB) for production deployments.
    */
   store?: EnrollmentStore;
+
+  /**
+   * F2 — durable agent identity-key registry. When supplied, enrollment APPROVAL
+   * upserts `(tenant, accountId) → agentPublicKey` here so the bootstrap path can
+   * deliver the attested agent key to the browser LONG after the pending-store
+   * eviction. Omit only in tests that don't exercise the bootstrap-pin path.
+   * Production MUST provide a PERSISTENT implementation (survives restarts).
+   */
+  agentKeyRegistry?: AgentKeyRegistry;
 };
 
 /**
@@ -433,7 +464,9 @@ function defaultIssuer(saasBaseUrl: string): string {
 export class DeviceFlowEnrollment {
   // `natsIssuerAccountId` stays optional (external mode only); everything else
   // is defaulted, hence Required.
-  private readonly options: Required<Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId">> &
+  private readonly options: Required<
+    Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId" | "agentKeyRegistry">
+  > &
     Pick<DeviceFlowOptions, "natsIssuerAccountId">;
   private readonly store: EnrollmentStore;
   /**
@@ -444,11 +477,13 @@ export class DeviceFlowEnrollment {
    * NATS mint sits between its read and write and a concurrent deny (or a second
    * approve) interleaves — the #11 status guards alone can't stop it because
    * both sides read `pending` before either writes. It supersedes the old
-   * approve-only in-flight dedup: a second approve no longer reuses the first's
-   * promise, it re-reads and hits the A2 approved-with-creds re-return path,
-   * which yields the same creds.
+   * approve-only in-flight dedup (`approvalsInFlight`): a second approve no
+   * longer reuses the first's promise, it re-reads and hits the A2
+   * approved-with-creds re-return path, which yields the same creds.
    */
   private readonly userCodeLocks = new Map<string, Promise<unknown>>();
+  /** F2: durable agent identity-key registry (undefined = pin delivery disabled). */
+  private readonly agentKeyRegistry?: AgentKeyRegistry;
 
   constructor(options: DeviceFlowOptions) {
     this.options = {
@@ -462,6 +497,7 @@ export class DeviceFlowEnrollment {
       issuer: options.issuer ?? defaultIssuer(options.saasBaseUrl),
     };
     this.store = options.store ?? new MemoryEnrollmentStore();
+    this.agentKeyRegistry = options.agentKeyRegistry;
   }
 
   /**
@@ -485,6 +521,11 @@ export class DeviceFlowEnrollment {
     // Reject a malformed/oversized agentPublicKey at ingress rather than late at
     // browser-side cnf binding (and cap store/approval-UI bloat from a huge string).
     assertValidAgentPublicKey(request.agentPublicKey);
+    // Sanitize the advisory version fields ONCE before the mint/retry loop.
+    // Undefined (absent or malformed) → the key is omitted entirely below so it
+    // "stays absent" in the store record rather than persisting an empty slot.
+    const pluginVersion = sanitizePluginVersion(request.pluginVersion);
+    const protocolVersion = sanitizeProtocolVersion(request.protocolVersion);
     const now = Date.now();
     const expiresAt = now + this.options.expirationSeconds * 1000;
 
@@ -510,6 +551,8 @@ export class DeviceFlowEnrollment {
         createdAt: now,
         expiresAt,
         status: "pending",
+        ...(pluginVersion !== undefined ? { pluginVersion } : {}),
+        ...(protocolVersion !== undefined ? { protocolVersion } : {}),
       };
       try {
         await this.store.saveEnrollment(enrollment);
@@ -688,6 +731,20 @@ export class DeviceFlowEnrollment {
       natsCreds,
       peerId,
     });
+
+    // F2: persist the attested agent identity public key DURABLY so a browser can
+    // pin it at bootstrap long after this pending record is swept. Upsert — a
+    // re-enroll mints a fresh identity key, and this newly-approved record carries
+    // it, so last-writer-wins is exactly right. Done only on the fresh-mint path
+    // (an idempotent re-approve above already returned without re-minting; the key
+    // is unchanged and already registered).
+    if (this.agentKeyRegistry) {
+      await this.agentKeyRegistry.put(
+        enrollment.tenant,
+        enrollment.accountId,
+        enrollment.agentPublicKey,
+      );
+    }
 
     return {
       creds: natsCreds,

@@ -16,9 +16,10 @@
  * the widget shows a distinct "credentials expired" state with a one-click
  * re-authenticate that mints a fresh, normal credential.
  */
-import { WebChannelNATSClient } from "../../../packages/client/src/index.js";
+import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/client/src/index.js";
 import type { WebChannelState, ApprovalRequest } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
+import { renderMarkdown } from "./markdown.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
   connecting: "connecting…",
@@ -72,10 +73,41 @@ export async function createWidget(
   });
   const input = el("input", { placeholder: "Type a message…", style: "flex:1" }) as HTMLInputElement;
   const sendBtn = el("button", { class: "primary" }, ["Send"]) as HTMLButtonElement;
+  // P0-3 slash-command typeahead menu — a column of command buttons rendered
+  // above the composer while the user is typing a `/command`. Hidden otherwise.
+  const cmdMenu = el("div", {
+    class: "hidden",
+    style:
+      "display:flex;flex-direction:column;gap:2px;margin-top:8px;padding:4px;" +
+      "border:1px solid var(--border);border-radius:6px;background:#161b22;max-height:180px;overflow:auto",
+  });
   const composer = el("div", { style: "display:flex;gap:8px;margin-top:10px" }, [input, sendBtn]);
-  bodyEl.append(topBar, mdHint, errBox, list, approvalsBox, composer);
+  bodyEl.append(topBar, mdHint, errBox, list, approvalsBox, cmdMenu, composer);
 
   let client: WebChannelNATSClient | null = null;
+  // P0-3 typeahead state. `commandsRequestedAt` makes catalog discovery LAZY
+  // and self-healing: we record WHEN we last asked (reset to null in
+  // connectLane, so a re-auth re-requests for the fresh client). If the catalog
+  // frame never arrives (server-side build failed), we retry on a cooldown
+  // rather than latching dead until reconnect. `menuDismissed` lets Escape hide
+  // the menu until the next keystroke.
+  let commandsRequestedAt: number | null = null;
+  const COMMANDS_REQUEST_COOLDOWN_MS = 3000;
+  let menuDismissed = false;
+
+  // Per-message memo of rendered markdown DOM, keyed by message id + text.
+  // render() is subscribed to client state and re-runs on EVERY change (each
+  // streaming partial, typing flip, approval, etc.), rebuilding the whole bubble
+  // list each pass. renderMarkdown is a synchronous, worst-case O(n²) parse up to
+  // the 20k cap, so without a memo every stable agent bubble re-parses on every
+  // later partial while it sits in the transcript. Keying by id+text means a
+  // `working` draft (whose text grows each partial) naturally misses and
+  // re-renders — correct — while unchanged messages hit the cache. Reusing the
+  // SAME element instance is fine: the element just moves into the fresh bubble
+  // container on re-append. The cache is rebuilt from the prior one each pass
+  // (see render()), so departed messages drop out and it stays bounded by the
+  // live transcript.
+  let mdCache = new Map<string, HTMLElement>();
 
   // ── Render ───────────────────────────────────────────────────────────────
   function renderApproval(a: ApprovalRequest): HTMLElement {
@@ -141,28 +173,123 @@ export async function createWidget(
       sendBtn.disabled = false;
     }
 
-    const bubbles = state.messages.map((m) =>
-      el(
+    // Stop button (P1-8a): while a turn is in flight — the agent is typing, or a
+    // working (unfinalized) progress bubble is live — the primary button becomes
+    // a Stop button. Clicking it sends the literal "/stop" (wire choice (a): the
+    // typed command and the button share one server path). It restores to "Send"
+    // automatically once the terminal frame settles isTyping/working back to
+    // false. In the error state the button is disabled (above), so leave it.
+    if (state.status !== "error") {
+      const inFlight = state.isTyping === true || state.messages.some((m) => m.working);
+      sendBtn.dataset.mode = inFlight ? "stop" : "send";
+      sendBtn.textContent = inFlight ? "Stop" : "Send";
+    }
+
+    // Carry markdown hits over from the previous pass; misses re-parse. Assigned
+    // to `mdCache` after the list is built so it tracks only the live transcript.
+    const nextMdCache = new Map<string, HTMLElement>();
+    const bubbles = state.messages.map((m) => {
+      const isUser = m.role === "user";
+      // User bubbles stay plain-text (pre-wrap keeps their line breaks). Agent
+      // bubbles — including `working` streaming drafts — render markdown to DOM;
+      // the renderer handles line breaks itself, so no pre-wrap (it'd double up).
+      let child: Node | string;
+      if (isUser) {
+        child = m.text;
+      } else {
+        const key = `${m.id}\n${m.text}`;
+        const rendered = mdCache.get(key) ?? renderMarkdown(m.text);
+        nextMdCache.set(key, rendered);
+        child = rendered;
+      }
+      return el(
         "div",
         {
           style:
-            "align-self:" + (m.role === "user" ? "flex-end" : "flex-start") + ";" +
-            "max-width:85%;padding:8px 11px;border-radius:10px;font-size:13px;white-space:pre-wrap;" +
-            (m.role === "user"
+            "align-self:" + (isUser ? "flex-end" : "flex-start") + ";" +
+            "max-width:85%;padding:8px 11px;border-radius:10px;font-size:13px;" +
+            (isUser ? "white-space:pre-wrap;" : "") +
+            (isUser
               ? "background:var(--accent);color:#fff"
               : "background:#21262d;border:1px solid var(--border)") +
             (m.working ? ";opacity:.7;font-style:italic" : ""),
         },
-        [m.text],
-      ),
-    );
+        [child],
+      );
+    });
     if (state.isTyping) {
       bubbles.push(
         el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, ["agent is typing…"]),
       );
     }
     list.replaceChildren(...bubbles);
+    mdCache = nextMdCache;
     approvalsBox.replaceChildren(...state.approvals.map(renderApproval));
+    // Keep the typeahead in sync when the catalog frame lands mid-typing.
+    renderMenu();
+  }
+
+  /**
+   * P0-3: (re)render the slash-command typeahead from the CURRENT input value
+   * and the latest catalog in state. Lazily requests the catalog the first time
+   * the user types `/`. Picking an item inserts `/name ` and refocuses the
+   * input; Enter then sends it as an ordinary message (no special-casing).
+   */
+  function renderMenu(): void {
+    const value = input.value;
+    const isSlash = value.startsWith("/");
+
+    // Lazy discovery: fetch the catalog when the user starts a slash-command
+    // (per client — reset on reconnect via connectLane). Gated on `client`
+    // existing: a `/` typed during the connect window must NOT record a request
+    // with nothing dispatched. We re-request only while NO catalog frame has
+    // ever landed — `getState().commands` is undefined until the first
+    // `commands` frame, after which it is an array (even empty) and we stop
+    // asking. If the server-side build failed and no frame arrives, retry on a
+    // cooldown so the typeahead heals without needing a reconnect.
+    if (isSlash && client && client.getState().commands === undefined) {
+      const now = Date.now();
+      if (commandsRequestedAt === null || now - commandsRequestedAt > COMMANDS_REQUEST_COOLDOWN_MS) {
+        commandsRequestedAt = now;
+        client.loadCommands();
+      }
+    }
+
+    const matches = menuDismissed
+      ? []
+      : filterCommandCatalog(client?.getState().commands, value);
+
+    if (matches.length === 0) {
+      cmdMenu.classList.add("hidden");
+      cmdMenu.replaceChildren();
+      return;
+    }
+
+    cmdMenu.classList.remove("hidden");
+    cmdMenu.replaceChildren(
+      ...matches.map((c) => {
+        const item = el(
+          "button",
+          {
+            style:
+              "text-align:left;font-size:12px;padding:4px 6px;background:transparent;" +
+              "border:none;border-radius:4px;cursor:pointer;color:var(--fg)",
+          },
+          [
+            el("span", { style: "font-weight:600" }, [`/${c.name}`]),
+            ...(c.description
+              ? [el("span", { style: "color:var(--muted)" }, [` — ${c.description}`])]
+              : []),
+          ],
+        ) as HTMLButtonElement;
+        item.onclick = () => {
+          input.value = `/${c.name} `;
+          input.focus();
+          renderMenu();
+        };
+        return item;
+      }),
+    );
   }
 
   /**
@@ -173,6 +300,10 @@ export async function createWidget(
   async function connectLane(ttlSeconds?: number): Promise<void> {
     client?.close();
     client = null;
+    // Fresh client → re-request the command catalog on the next `/` (its state
+    // starts without a catalog).
+    commandsRequestedAt = null;
+    menuDismissed = false;
     statusPill.textContent = "● connecting…";
     statusPill.style.color = "var(--warn)";
     errBox.classList.add("hidden");
@@ -192,12 +323,16 @@ export async function createWidget(
     if (!creds.ok || !creds.data.userJwt || !creds.data.userSeedRaw) {
       throw new Error(`nats-user failed (HTTP ${creds.status})`);
     }
-    const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string }>(
+    const boot = await api<{ jwt?: string; peerId?: string; natsUrl?: string; agentPublicKey?: string }>(
       "/bootstrap",
       { method: "POST", body: { accountId, deviceX25519PublicKey, devicePopPublicKey } },
     );
     if (!boot.ok || !boot.data.jwt || !boot.data.peerId) {
       throw new Error(`bootstrap failed (HTTP ${boot.status}) ${JSON.stringify(boot.data)}`);
+    }
+    // F2: the register hop unwraps K against this SaaS-pinned agent key.
+    if (!boot.data.agentPublicKey) {
+      throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
     }
 
     const natsUrl = boot.data.natsUrl ?? creds.data.natsUrl ?? rv.natsUrl;
@@ -215,6 +350,8 @@ export async function createWidget(
         devicePrivateKey: ed25519.privateKey,
         // Phase 6: register-delivered conversation key (no handshake).
         deviceX25519PrivateKey: x25519.privateKey,
+        // F2: pin the SaaS-attested agent key for K authentication.
+        pinnedAgentPublicKey: boot.data.agentPublicKey,
       },
     });
     client.subscribe(render);
@@ -236,10 +373,31 @@ export async function createWidget(
     if (!text) return;
     client?.send(text);
     input.value = "";
+    renderMenu(); // hide the typeahead once the message is sent
   };
-  sendBtn.onclick = submit;
+  // The primary button is a Send button by default and a Stop button while a
+  // turn is in flight (render() flips `dataset.mode`). Stop sends the literal
+  // "/stop" through the SAME send path a typed "/stop" would take.
+  sendBtn.onclick = () => {
+    if (sendBtn.dataset.mode === "stop") {
+      client?.send("/stop");
+      return;
+    }
+    submit();
+  };
+  // Live-filter the typeahead as the user types (fires AFTER the value updates,
+  // unlike keydown). A keystroke re-arms a menu the user dismissed with Escape.
+  input.oninput = () => {
+    menuDismissed = false;
+    renderMenu();
+  };
   input.onkeydown = (e) => {
-    if ((e as KeyboardEvent).key === "Enter") submit();
+    const key = (e as KeyboardEvent).key;
+    if (key === "Enter") submit();
+    else if (key === "Escape") {
+      menuDismissed = true;
+      renderMenu();
+    }
   };
 
   await connectLane();

@@ -132,13 +132,32 @@ export async function deriveConversationKey(
 export const KEY_WRAP_INFO = "webchannel-key-wrap-v1";
 
 /**
+ * F2 — build the key-wrap AAD that binds K to exactly ONE peerId. MUST be
+ * byte-identical to the agent's `wrapAad` (packages/plugin/src/late-join-decryptor.ts):
+ * plain UTF-8 of the peerId (ASCII on both sides). A wrap minted for peerA cannot
+ * be lifted into peerB's register reply — peerB unwraps with `wrapAad(peerB)` and
+ * Poly1305 fails.
+ */
+export function wrapAad(peerId: string): Uint8Array {
+  return new TextEncoder().encode(peerId);
+}
+
+/**
  * Wire format of a wrapped conversation key, as returned by the plugin's
  * register route (`wrappedConversationKey` in the register HTTP response).
  * All four fields are base64url. Mirrors the agent-side type in
  * `packages/plugin/src/late-join-decryptor.ts`.
  */
 export type WrappedConversationKey = {
-  /** b64url 32-byte ephemeral X25519 public key (fresh per wrap). */
+  /**
+   * b64url 32-byte X25519 public key used for the wrap ECDH. IGNORED here (F2):
+   * the browser derives the unwrap key from the SaaS-PINNED agent public key,
+   * never from this wire field (which an untrusted relay could substitute). Kept
+   * in the type only because an OLD (pre-F2) browser read it — but there is NO
+   * interop with an old browser: the new agent always binds the peerId AAD, which
+   * an old no-AAD unwrap can't satisfy, so old-client + new-agent is a HARD break
+   * (strict 3-way lockstep). The field name is retained; its value is vestigial.
+   */
   ephemeralPublicKey: string;
   /** b64url 12-byte ChaCha20-Poly1305 nonce. */
   nonce: string;
@@ -152,18 +171,32 @@ export type WrappedConversationKey = {
  * Unwrap (decrypt) the agent-delivered conversation key K with this device's
  * X25519 private key (the `cnf` key minted into the bootstrap JWT).
  *
- * ECDH(device.private, ephemeral.public) → HKDF-SHA256(KEY_WRAP_INFO) →
- * ChaCha20-Poly1305 open. Poly1305 is verified before anything is returned;
- * a wrong key or tampered payload throws and the caller MUST treat the
- * session as failed (fail-closed).
+ * F2 — the shared secret is derived from the SaaS-PINNED `agentPublicKeyB64url`
+ * (the agent's identity key attested in the first-party HTTPS bootstrap response),
+ * NEVER from any NATS-carried field. So a relay that injects its own K′ — wrapped
+ * under a relay-chosen key — fails Poly1305 under ECDH(device.private, pinnedAgent):
+ * this single invariant closes the register-hop MITM. The peerId is bound into the
+ * AAD (`wrapAad`) so a genuine wrap cannot be lifted to another peer.
+ *
+ * ECDH(device.private, PINNED agent.public) → HKDF-SHA256(KEY_WRAP_INFO) →
+ * ChaCha20-Poly1305 open (aad = wrapAad(peerId)). Poly1305 is verified before
+ * anything is returned; a wrong key, tampered payload, or peerId mismatch throws
+ * and the caller MUST treat the session as failed (fail-closed).
+ *
+ * @param agentPublicKeyB64url - the SaaS-pinned agent X25519 identity public key
+ *        (base64url, 32 bytes). The caller obtains it from the bootstrap response
+ *        (`parseBootstrapResponse`) and MUST NOT source it from any NATS frame.
+ * @param peerId - this device's authenticated peerId (JWT `sub`), bound into the AAD.
  */
 export async function unwrapConversationKey(
   wrapped: WrappedConversationKey,
   devicePrivateKey: CryptoKey,
+  agentPublicKeyB64url: string,
+  peerId: string,
 ): Promise<Uint8Array> {
   const rawSecret = await deriveX25519SharedSecret(
     devicePrivateKey,
-    wrapped.ephemeralPublicKey,
+    agentPublicKeyB64url,
   );
   const wrapKey = await hkdfSha256(rawSecret, null, KEY_WRAP_INFO, 32);
   return chacha20poly1305Decrypt(
@@ -171,6 +204,7 @@ export async function unwrapConversationKey(
     base64urlDecode(wrapped.nonce),
     base64urlDecode(wrapped.ciphertext),
     base64urlDecode(wrapped.tag),
+    wrapAad(peerId),
   );
 }
 
@@ -188,6 +222,12 @@ export function parseKeyExchange(payload: string): string | null {
   try {
     const frame = JSON.parse(payload) as { type?: unknown; pubKey?: unknown };
     if (frame.type !== "key_exchange" || typeof frame.pubKey !== "string" || !frame.pubKey) {
+      return null;
+    }
+    // An X25519 public key is exactly 32 bytes; a non-32-byte key would throw in
+    // importKey downstream. Reject it here so a malformed frame is ignorable,
+    // mirroring the agent's `parseKeyExchange` (e2e-session.ts).
+    if (base64urlDecode(frame.pubKey).length !== 32) {
       return null;
     }
     return frame.pubKey;

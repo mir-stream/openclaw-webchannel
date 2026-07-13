@@ -265,6 +265,7 @@ boot_agent() {
   "session": { "dmScope": "per-channel-peer" },
   "models": { "providers": { $PROVIDER_BLOCK } },
   "agents": { "defaults": { "model": { "primary": "$PRIMARY_MODEL" }, "compaction": { "reserveTokensFloor": 20000 } } },
+  "messages": { "inbound": { "byChannel": { "webchannel": 300 } } },
   "plugins": {
     "load": { "paths": ["$REPO/packages/plugin"] },
     "allow": ["webchannel"],
@@ -282,7 +283,8 @@ boot_agent() {
             "audience": "$acct"
           } },
           "dmSecurity": "allowlist",
-          "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"]
+          "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"],
+          "streaming": { "mode": "partial" }
         }
       }
     }

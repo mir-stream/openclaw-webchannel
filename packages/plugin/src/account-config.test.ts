@@ -10,6 +10,7 @@ import {
   resolveWebchannelAccountConfig,
   resolveAcquisitionIdentity,
   resolveAccountNatsConfig,
+  resolveTypingEnabled,
   readAccountsMap,
   readWebchannelSection,
   accountCredentialPath,
@@ -62,6 +63,76 @@ describe("account-config: account id validation (TRUST BOUNDARY)", () => {
   it("canonicalizeAccountId lowercases and preserves valid ids", () => {
     expect(canonicalizeAccountId("AcctA")).toBe("accta");
     expect(canonicalizeAccountId("acct-1")).toBe("acct-1");
+  });
+});
+
+describe("account-config: resolveTypingEnabled (P0-6)", () => {
+  it("defaults ON when capabilities is absent", () => {
+    expect(resolveTypingEnabled({})).toBe(true);
+    expect(resolveTypingEnabled({ capabilities: {} })).toBe(true);
+  });
+
+  it("ON for explicit typing:'on'", () => {
+    expect(resolveTypingEnabled({ capabilities: { typing: "on" } })).toBe(true);
+  });
+
+  it("OFF only for explicit typing:'off'", () => {
+    expect(resolveTypingEnabled({ capabilities: { typing: "off" } })).toBe(false);
+  });
+
+  it("honors an account override 'off' over a channel-level 'on' base (through the merge)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { typing: "on" },
+          accounts: {
+            acctA: { capabilities: { typing: "off" } },
+          },
+        },
+      },
+    };
+    expect(resolveTypingEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
+  });
+
+  it("honors an account override 'on' over a channel-level 'off' base (through the merge)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { typing: "off" },
+          accounts: {
+            acctA: { capabilities: { typing: "on" } },
+          },
+        },
+      },
+    };
+    expect(resolveTypingEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(true);
+  });
+
+  it("inherits the channel-level base when the account omits capabilities (shared-base merge)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { typing: "off" },
+          accounts: { acctA: { tenant: "t" } },
+        },
+      },
+    };
+    expect(resolveTypingEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
+  });
+
+  it("keeps the base typing:'off' when the account sets OTHER capabilities (nested merge, no clobber)", () => {
+    // Locks `capabilities` staying in NESTED_OBJECT_KEYS: the account's
+    // capabilities object must MERGE over the base, not replace it — dropping
+    // that would silently regress typing:"off" back to being ignored.
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { typing: "off" },
+          accounts: { acctA: { capabilities: { someOtherKey: "x" } } },
+        },
+      },
+    };
+    expect(resolveTypingEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
   });
 });
 
@@ -376,6 +447,46 @@ describe("account-config: loadPersistedEnrolledCreds", () => {
       read: () => junk,
     });
     expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
+  });
+
+  it("F2: surfaces the agent identity key when both halves decode to 32 bytes", () => {
+    // base64url of a 32-byte X25519 key is 43 chars. Reuse one string for both
+    // halves — the loader only checks decoded length, not that they're a real pair.
+    const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+    const withIdentity = JSON.stringify({
+      identityKey: { publicKey: KEY43, privateKey: KEY43 },
+      enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } },
+    });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const creds = loadPersistedEnrolledCreds("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => withIdentity,
+    });
+    expect(creds?.identityKey).toBeDefined();
+    expect(creds!.identityKey!.publicKey).toBeInstanceOf(Uint8Array);
+    expect(creds!.identityKey!.publicKey.length).toBe(32);
+    expect(creds!.identityKey!.privateKey.length).toBe(32);
+  });
+
+  it("F2: omits the identity key when the block is absent, partial, or the wrong length (fail-closed)", () => {
+    const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const load = (identityKey: unknown) =>
+      loadPersistedEnrolledCreds("acctA", {
+        home: HOME,
+        exists: (p) => p === perAccount,
+        read: () =>
+          JSON.stringify({ identityKey, enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } } }),
+      });
+    // Absent entirely.
+    expect(load(undefined)?.identityKey).toBeUndefined();
+    // Only one half present.
+    expect(load({ publicKey: KEY43 })?.identityKey).toBeUndefined();
+    // Wrong length (31 bytes → not an X25519 key).
+    expect(load({ publicKey: "AAAA", privateKey: "AAAA" })?.identityKey).toBeUndefined();
+    // But the rest of the creds still load (identity is optional at this layer).
+    expect(load(undefined)).toMatchObject({ userJwt: "JWT", userSeed: "SEED" });
   });
 
   it("loads from the legacy file for the default account (backward-compat)", () => {

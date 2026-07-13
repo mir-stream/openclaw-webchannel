@@ -67,12 +67,22 @@ export async function handleInboundMessage(
   peerId: string,
   message: InboundUserMessage,
   accountId: string = DEFAULT_ACCOUNT_ID,
+  options?: { controlLane?: boolean },
 ): Promise<void> {
   // `wsKey` is the verified per-peer id the transport uses as its socket-map
   // key (the anonymous strategy is the single-peer special case, where this
   // falls back to ANON_PEER_ID).
   const wsKey = peerId || ANON_PEER_ID;
   const channelRuntime = api.runtime.channel;
+
+  // Control lane (P1-8a): an out-of-band abort turn ("/stop"). It reaches here
+  // directly (NOT via the per-session FIFO) so core's fast-abort can cancel the
+  // still-live running turn — see `src/control-lane.ts` and index-nats.ts. Two
+  // things differ for a control-lane turn: (1) no progress draft — the abort's
+  // reply is a single short final text, so a "Working…" bubble for it is noise;
+  // (2) we stamp CommandAuthorized on the turn context (see the buildContext
+  // call) so core's fast-abort accepts it.
+  const controlLane = options?.controlLane === true;
 
   // Progress-draft wiring (Phase 1 first slice). Core does NOT auto-drive a
   // plugin's `message.live` adapter; the generic seam for a plugin channel is
@@ -122,7 +132,8 @@ export async function handleInboundMessage(
   // "partial" answer-text); answer-text streaming (onPartialReply) is wired
   // ONLY in "partial" mode. "block"/"off" take the no-draft fallback.
   const streamingMode = resolveStreamingMode(channelConfig);
-  const draftEnabled = streamingMode === "progress" || streamingMode === "partial";
+  const draftEnabled =
+    (streamingMode === "progress" || streamingMode === "partial") && !controlLane;
   const answerStreamingEnabled = streamingMode === "partial";
   let draft: ProgressDraftController | undefined;
   if (draftEnabled) {
@@ -157,7 +168,21 @@ export async function handleInboundMessage(
   // (default "on"), so when an operator sets it to "off" this call is a no-op.
   // It is also best-effort (no ack/retry) and drop-only under backpressure —
   // we ignore the boolean return.
-  transport.sendTyping(wsKey);
+  //
+  // Control lane (P1-8a): NEVER emit typing for an abort turn. An abort is not
+  // the agent "thinking about a reply" — it cancels the turn already in flight,
+  // and its own reply is a single short final ("⚙️ Agent was aborted."). Two
+  // concrete harms if we flashed typing here: (1) it visually contradicts the
+  // Stop the user just pressed (the widget is trying to WIND DOWN, not spin up);
+  // and (2) the widget holds its Stop button armed until a settling frame
+  // arrives — on the paths where the abort's own ack is never delivered (core
+  // returns handled:false for an unauthorized sender; see the allowlist trap in
+  // command-gate.ts / index-nats.ts), a typing frame with no follow-up would
+  // leave the button stuck in Stop mode with nothing to release it. Skipping
+  // typing keeps the abort lane silent unless it has a real terminal frame.
+  if (!controlLane) {
+    transport.sendTyping(wsKey);
+  }
 
   try {
     await channelRuntime.inbound.run({
@@ -182,6 +207,20 @@ export async function handleInboundMessage(
             // lets each account's native approval handler claim ONLY its own
             // turns' approvals (and the prompt deliver on the right channel).
             accountId,
+            // Control lane (P1-8a): stamp CommandAuthorized for THIS turn only.
+            // Core's fast-abort (`tryFastAbortFromMessage`) runs before the
+            // per-session busy gate but requires `resolveCommandAuthorization`'s
+            // `isAuthorizedSender`, which with no `commands.allowFrom` reduces to
+            // `ctx.CommandAuthorized`. `buildContext` sets that to false unless
+            // `access.commands.authorized` is passed. We stamp it ONLY on the
+            // abort lane (not every turn) so we don't broadly enable text
+            // commands for every peer. It is safe here because webchannel peers
+            // are JWT-authenticated with FORCED per-peer session isolation
+            // (`resolveWebchannelSessionRoute`) — an abort can only ever target
+            // the sender's OWN session, never another peer's.
+            ...(controlLane
+              ? { access: { commands: { authorized: true } } }
+              : {}),
             timestamp: input.timestamp,
             from: wsKey,
             sender: { id: wsKey, name: wsKey },
@@ -305,6 +344,31 @@ export async function handleInboundMessage(
         },
       },
     });
+
+    // Draft settle (P1-8a). If `inbound.run` resolves WITHOUT ever calling our
+    // `delivery.deliver` with kind:"final", a started progress draft would hang
+    // as an italic "working" bubble forever (the catch below only fires on a
+    // THROW, not this clean resolve). This happens on two clean-resolve paths we
+    // can't tell apart here: (a) core aborted the run (an out-of-band /stop
+    // reached fast-abort while this turn was live), and (b) a silent completion
+    // — a tool-only turn, or an empty/suppressed answer where `deliver`
+    // early-returns on falsy text. So we settle the bubble with the streamed
+    // SNAPSHOT ALONE and add no marker:
+    //   - a genuine abort already gets explicit feedback — core's "/stop" turn
+    //     separately delivers "⚙️ Agent was aborted." — so this bubble only needs
+    //     to settle with what it streamed, not announce anything; and
+    //   - a silent/tool-only completion is correctly settled by its own streamed
+    //     content, where any "Stopped"-style marker would be a mislabel.
+    // `finalize` is idempotent (message-adapter.ts), so a turn that already
+    // delivered its final answer is a no-op here. The `|| "⏹ Stopped."` fallback
+    // is defensively unreachable (`started === true` implies a progress frame was
+    // sent, and frames always carry non-empty `composeText()` output, so
+    // `snapshotText()` is non-empty) — it exists only so the bubble can never
+    // finalize to empty text.
+    if (draft?.started) {
+      const snapshot = draft.snapshotText();
+      await draft.finalize(snapshot || "⏹ Stopped.");
+    }
   } catch (err) {
     api.logger.error?.(`webchannel: inbound dispatch failed: ${String(err)}`);
     // BLOCKING recovery: if the turn threw AFTER a progress frame was emitted,

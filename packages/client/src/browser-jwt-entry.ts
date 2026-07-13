@@ -87,12 +87,20 @@ export async function runJwtRegister(
       `bootstrap failed: HTTP ${bootstrapRes.status} ${await bootstrapRes.text()}`,
     );
   }
-  const { jwt, peerId, natsUrl: deliveredNatsUrl } = (await bootstrapRes.json()) as {
+  const {
+    jwt,
+    peerId,
+    natsUrl: deliveredNatsUrl,
+    agentPublicKey,
+  } = (await bootstrapRes.json()) as {
     jwt?: string;
     peerId?: string;
     natsUrl?: string;
+    agentPublicKey?: string;
   };
   if (!jwt || !peerId) throw new Error("bootstrap response missing jwt/peerId");
+  // F2: the register-delivered K is authenticated against THIS pinned agent key.
+  if (!agentPublicKey) throw new Error("bootstrap response missing agentPublicKey");
 
   // The SaaS is the rendezvous authority: dial the relay URL it returned in the
   // bootstrap response, falling back to the page-supplied `opts.natsUrl` only when
@@ -113,6 +121,9 @@ export async function runJwtRegister(
       // Phase 6: the cnf X25519 private key — the session key K arrives
       // wrapped in the register reply (no handshake on this path).
       deviceX25519PrivateKey: x25519.privateKey,
+      // F2: pin the SaaS-attested agent key; K is unwrapped against it, never
+      // against any wire-carried key.
+      pinnedAgentPublicKey: agentPublicKey,
     },
   });
 
@@ -235,8 +246,14 @@ export async function runAllReal(
   if (!bootRes.ok) {
     throw new Error(`bootstrap-jwt failed: HTTP ${bootRes.status} ${await bootRes.text()}`);
   }
-  const { jwt, peerId } = (await bootRes.json()) as { jwt?: string; peerId?: string };
+  const { jwt, peerId, agentPublicKey } = (await bootRes.json()) as {
+    jwt?: string;
+    peerId?: string;
+    agentPublicKey?: string;
+  };
   if (!jwt || !peerId) throw new Error("bootstrap-jwt response missing jwt/peerId");
+  // F2: the register-delivered K is authenticated against THIS pinned agent key.
+  if (!agentPublicKey) throw new Error("bootstrap-jwt response missing agentPublicKey");
 
   // 5. Production client with BOTH NATS-layer NKEY auth AND the PoP register hop.
   const client = new WebChannelNatsClient({
@@ -250,6 +267,8 @@ export async function runAllReal(
       devicePrivateKey: ed25519.privateKey,
       // Phase 6: register-delivered conversation key (no handshake).
       deviceX25519PrivateKey: x25519.privateKey,
+      // F2: pin the SaaS-attested agent key for K authentication.
+      pinnedAgentPublicKey: agentPublicKey,
     },
   });
 
