@@ -35,7 +35,7 @@ import {
   resolveInboundDebounceMs,
 } from "openclaw/plugin-sdk/reply-runtime";
 import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
-import { filterFreshInboundItems } from "./src/ingress-dedupe.js";
+import { createIngressOnFlush } from "./src/ingress-dedupe.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
@@ -646,30 +646,23 @@ export default defineChannelPluginEntry({
         debounceMs: inboundDebounceMs,
         serializeImmediate: true,
         buildKey: (item) => item.peerId,
-        onFlush: async (items) => {
-          // P0-7a ingress dedupe. Runs HERE (not in setMessageHandler) because
-          // onFlush is same-peer serialized by core's keyChains — so awaiting the
-          // async `checkAndRecord` cannot reorder same-peer messages, whereas a
-          // SQLite miss awaited in the fire-and-forget setMessageHandler could.
-          // Drop items whose `${peerId}:${id}` was already admitted within the
-          // window; id-less items (older clients) pass through; on a dedupe fault
-          // we fail open (keep the message). An all-duplicates batch dispatches
-          // nothing. Control-lane (/stop) frames bypass the debouncer entirely, so
-          // they are never deduped (a duplicate abort is a cosmetic double bubble,
-          // and the abort path must not wait on SQLite).
-          const fresh = await filterFreshInboundItems(
-            items,
-            accountId,
-            (key, opts) => inboundDedupe.checkAndRecord(key, opts),
-            (m) => api.logger?.info?.(m),
-          );
-          const first = fresh[0];
-          if (!first) return;
-          dispatchInbound(
-            first.peerId,
-            coalesceUserMessages(fresh.map((i) => i.message)),
-          );
-        },
+        // P0-7a ingress dedupe. The REAL handler is `createIngressOnFlush`
+        // (src/ingress-dedupe.ts) — extracted there so it is tsc-checked and
+        // tested directly. Its doc owns the load-bearing rationale (why the
+        // async dedupe belongs on this same-peer-serialized flush path, the
+        // control-lane bypass, per-id record-before-coalesce). Split log sinks:
+        // routine duplicate drops at info, fail-open faults at warn.
+        onFlush: createIngressOnFlush<{
+          peerId: string;
+          message: WebchannelUserMessage;
+        }>({
+          accountId,
+          checkAndRecord: (key, opts) => inboundDedupe.checkAndRecord(key, opts),
+          dispatch: dispatchInbound,
+          coalesce: coalesceUserMessages,
+          logInfo: (m) => api.logger?.info?.(m),
+          logWarn: (m) => api.logger?.warn?.(m),
+        }),
         onError: (err) =>
           api.logger.error?.(
             `webchannel: inbound debounce flush failed: ${String(err)}`,

@@ -5,7 +5,10 @@ import fs from "node:fs";
 import { createInboundDebouncer } from "openclaw/plugin-sdk/reply-runtime";
 import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 
-import { filterFreshInboundItems } from "./ingress-dedupe.js";
+import {
+  filterFreshInboundItems,
+  createIngressOnFlush,
+} from "./ingress-dedupe.js";
 import { coalesceUserMessages, type UserMessageLike } from "./inbound-queue.js";
 
 /**
@@ -14,11 +17,13 @@ import { coalesceUserMessages, type UserMessageLike } from "./inbound-queue.js";
  *  1. `filterFreshInboundItems` in isolation: fresh-vs-duplicate decisions, order
  *     preservation, id-less pass-through (never touching the checker), the
  *     `${peerId}:${id}` / namespace=accountId key shape, and fail-open on a check
- *     rejection.
- *  2. The onFlush seam as wired in index-nats.ts: a REAL `createInboundDebouncer`
- *     with a fake namespace-aware checker — same id twice across two windows
- *     dispatches exactly once; distinct ids both dispatch; id-less always passes;
- *     a throwing checker still dispatches (fail-open end to end).
+ *     rejection (now logged at WARN, not info).
+ *  2. The REAL `createIngressOnFlush` factory — the exact onFlush index-nats.ts
+ *     wires (extracted so it is tsc-checked + tested directly, not reimplemented
+ *     here): duplicate dropped, id-less passthrough, fail-open on throw,
+ *     all-duplicates dispatches nothing, coalesced dispatch to the first peer,
+ *     and per-id recording BEFORE the coalesce. Plus one integration test driving
+ *     it through a REAL `createInboundDebouncer`.
  *  3. One hermetic test against a REAL `createPersistentDedupe` (isolated tmp
  *     state dir) pinning the double-record → true-then-false contract we rely on.
  */
@@ -171,101 +176,159 @@ describe("filterFreshInboundItems", () => {
     expect(out).toHaveLength(2);
   });
 
-  it("fails open: a checker rejection KEEPS the message and logs", async () => {
+  it("fails open: a checker rejection KEEPS the message and logs at WARN (not info)", async () => {
     const checkAndRecord = vi.fn(async () => {
       throw new Error("disk boom");
     });
-    const log = vi.fn();
+    const info = vi.fn();
+    const warn = vi.fn();
     const items = [item("p1", "a", "id1")];
-    const out = await filterFreshInboundItems(items, "acct", checkAndRecord, log);
+    const out = await filterFreshInboundItems(items, "acct", checkAndRecord, { info, warn });
     expect(out).toEqual(items);
-    expect(log).toHaveBeenCalledTimes(1);
-    expect(log.mock.calls[0][0]).toContain("fail-open");
+    // The fault goes to warn, NOT the info drop sink.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![0]).toContain("fail-open");
+    expect(info).not.toHaveBeenCalled();
+  });
+
+  it("logs a routine duplicate DROP at INFO (not warn)", async () => {
+    const { checkAndRecord } = fakeChecker();
+    await checkAndRecord("p1:dup", { namespace: "acct" });
+    const info = vi.fn();
+    const warn = vi.fn();
+    const out = await filterFreshInboundItems(
+      [item("p1", "a", "dup")],
+      "acct",
+      checkAndRecord,
+      { info, warn },
+    );
+    expect(out).toEqual([]);
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls[0]![0]).toContain("dropped duplicate");
+    expect(warn).not.toHaveBeenCalled();
   });
 });
 
-describe("onFlush ingress-dedupe seam — real createInboundDebouncer", () => {
+describe("createIngressOnFlush — the REAL onFlush index-nats.ts wires", () => {
   /**
-   * Mirror index-nats.ts's onFlush: filter the flush batch through
-   * `filterFreshInboundItems`, then coalesce+dispatch the survivors (nothing on
-   * an all-duplicate batch). We drive the REAL debouncer so the wiring's ordering
-   * and merge behavior is exercised, with a fake namespace-aware checker.
+   * Build the real factory with a captured dispatch sink. `dispatched` records
+   * every `(peerId, coalesced message)` the onFlush routes, so we can assert both
+   * WHAT was dispatched and to WHICH peer — using the SAME `coalesceUserMessages`
+   * the production wiring passes.
    */
-  function buildSeam(
+  function makeOnFlush(
     accountId: string,
-    checkAndRecord: (
-      key: string,
-      opts?: { namespace?: string },
-    ) => Promise<boolean>,
-    debounceMs = 10,
+    checkAndRecord: (key: string, opts?: { namespace?: string }) => Promise<boolean>,
   ) {
-    const dispatched: UserMessageLike[] = [];
-    const debouncer = createInboundDebouncer<Item>({
-      debounceMs,
-      serializeImmediate: true,
-      buildKey: (i) => i.peerId,
-      onFlush: async (items) => {
-        const fresh = await filterFreshInboundItems(
-          items,
-          accountId,
-          checkAndRecord,
-        );
-        const first = fresh[0];
-        if (!first) return;
-        dispatched.push(coalesceUserMessages(fresh.map((i) => i.message)));
-      },
+    const dispatched: Array<{ peerId: string; message: UserMessageLike }> = [];
+    const info = vi.fn();
+    const warn = vi.fn();
+    const onFlush = createIngressOnFlush<Item>({
+      accountId,
+      checkAndRecord,
+      dispatch: (peerId, message) => dispatched.push({ peerId, message }),
+      coalesce: coalesceUserMessages,
+      logInfo: info,
+      logWarn: warn,
     });
-    return { debouncer, dispatched };
+    return { onFlush, dispatched, info, warn };
   }
 
-  it("dispatches the same id only ONCE across two flush windows", async () => {
+  it("drops a duplicate across two flushes: same id dispatches only once", async () => {
     const { checkAndRecord } = fakeChecker();
-    const { debouncer, dispatched } = buildSeam("acct", checkAndRecord);
+    const { onFlush, dispatched } = makeOnFlush("acct", checkAndRecord);
+
+    await onFlush([item("p1", "hello", "idA")]);
+    await onFlush([item("p1", "hello", "idA")]); // replay in a later window
+
+    expect(dispatched.map((d) => d.message.text)).toEqual(["hello"]);
+  });
+
+  it("passes id-less frames through un-deduped (never consults the checker)", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const { onFlush, dispatched } = makeOnFlush("acct", checkAndRecord);
+
+    await onFlush([item("p1", "hi")]);
+    await onFlush([item("p1", "hi")]);
+
+    expect(dispatched.map((d) => d.message.text)).toEqual(["hi", "hi"]);
+    expect(checkAndRecord).not.toHaveBeenCalled();
+  });
+
+  it("fails open on a throwing checker: still dispatches, and warns", async () => {
+    const checkAndRecord = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    const { onFlush, dispatched, info, warn } = makeOnFlush("acct", checkAndRecord);
+
+    await onFlush([item("p1", "important", "idX")]);
+
+    expect(dispatched.map((d) => d.message.text)).toEqual(["important"]);
+    expect(warn).toHaveBeenCalledTimes(1); // fault → warn
+    expect(info).not.toHaveBeenCalled();
+  });
+
+  it("dispatches NOTHING when the whole batch is duplicates", async () => {
+    const { checkAndRecord } = fakeChecker();
+    await checkAndRecord("p1:id1", { namespace: "acct" });
+    await checkAndRecord("p1:id2", { namespace: "acct" });
+    const { onFlush, dispatched } = makeOnFlush("acct", checkAndRecord);
+
+    await onFlush([item("p1", "a", "id1"), item("p1", "b", "id2")]);
+
+    expect(dispatched).toEqual([]);
+  });
+
+  it("coalesces the surviving batch into ONE message dispatched to the first peer", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const { onFlush, dispatched } = makeOnFlush("acct", checkAndRecord);
+
+    await onFlush([item("p1", "one", "id1"), item("p1", "two", "id2")]);
+
+    // One coalesced dispatch, joined in arrival order, routed to the first
+    // survivor's peer (the whole same-peer batch's peer).
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]!.peerId).toBe("p1");
+    expect(dispatched[0]!.message.text).toBe("one\n\ntwo");
+  });
+
+  it("records EACH id before the coalesce, so a later replay of a merged id is dropped", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const { onFlush, dispatched } = makeOnFlush("acct", checkAndRecord);
+
+    // First batch: id1 + id2 both fresh → merged into one coalesced turn.
+    await onFlush([item("p1", "a", "id1"), item("p1", "b", "id2")]);
+    // id2 was recorded per-item (not just the coalesce anchor id1): a later
+    // replay carrying id2 is now a known duplicate and dispatches nothing.
+    await onFlush([item("p1", "b-again", "id2")]);
+
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]!.message.text).toBe("a\n\nb");
+  });
+});
+
+describe("createIngressOnFlush — integration through a REAL createInboundDebouncer", () => {
+  it("plugs into the debouncer: same id across two windows dispatches once", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const dispatched: UserMessageLike[] = [];
+    const debouncer = createInboundDebouncer<Item>({
+      debounceMs: 10,
+      serializeImmediate: true,
+      buildKey: (i) => i.peerId,
+      onFlush: createIngressOnFlush<Item>({
+        accountId: "acct",
+        checkAndRecord,
+        dispatch: (_peerId, message) => dispatched.push(message),
+        coalesce: coalesceUserMessages,
+      }),
+    });
 
     void debouncer.enqueue(item("p1", "hello", "idA"));
     await wait(30);
-    // Same logical send re-delivered in a later window (double-submit / replay).
     void debouncer.enqueue(item("p1", "hello", "idA"));
     await wait(30);
 
     expect(dispatched.map((d) => d.text)).toEqual(["hello"]);
-  });
-
-  it("dispatches two distinct ids both", async () => {
-    const { checkAndRecord } = fakeChecker();
-    const { debouncer, dispatched } = buildSeam("acct", checkAndRecord);
-
-    void debouncer.enqueue(item("p1", "one", "id1"));
-    await wait(30);
-    void debouncer.enqueue(item("p1", "two", "id2"));
-    await wait(30);
-
-    expect(dispatched.map((d) => d.text)).toEqual(["one", "two"]);
-  });
-
-  it("always dispatches id-less frames (never deduped)", async () => {
-    const { checkAndRecord } = fakeChecker();
-    const { debouncer, dispatched } = buildSeam("acct", checkAndRecord);
-
-    void debouncer.enqueue(item("p1", "hi"));
-    await wait(30);
-    void debouncer.enqueue(item("p1", "hi"));
-    await wait(30);
-
-    expect(dispatched.map((d) => d.text)).toEqual(["hi", "hi"]);
-    expect(checkAndRecord).not.toHaveBeenCalled();
-  });
-
-  it("fails open end to end: a throwing checker still dispatches", async () => {
-    const checkAndRecord = vi.fn(async () => {
-      throw new Error("boom");
-    });
-    const { debouncer, dispatched } = buildSeam("acct", checkAndRecord);
-
-    void debouncer.enqueue(item("p1", "important", "idX"));
-    await wait(30);
-
-    expect(dispatched.map((d) => d.text)).toEqual(["important"]);
   });
 });
 

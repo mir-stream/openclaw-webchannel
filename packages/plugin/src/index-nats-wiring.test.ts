@@ -64,3 +64,12 @@ describe("index-nats.ts wiring contract — command catalog (P0-3)", () => {
     );
   });
 });
+
+describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () => {
+  it("wires the debouncer onFlush from the extracted createIngressOnFlush factory", () => {
+    // The onFlush must be the tested factory, not an inlined closure (which could
+    // silently drift — e.g. dispatch `items` instead of the deduped survivors, or
+    // drop the accountId namespace). Pin `onFlush: createIngressOnFlush(`.
+    expect(INDEX_NATS_SOURCE).toMatch(/onFlush:\s*createIngressOnFlush</);
+  });
+});
