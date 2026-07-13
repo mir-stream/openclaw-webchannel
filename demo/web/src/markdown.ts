@@ -503,10 +503,11 @@ function renderBlock(b: MdBlock): HTMLElement {
 /**
  * Above this many characters, skip markdown parsing and render plain text.
  * The inline scanner is worst-case O(n²) — each unmatched `[` (parseLink) and
- * space-separated `_` run (findUnderscoreClose) re-scans to end-of-text — and
- * the widget's `render()` re-parses every message on *every* state change, so a
- * single huge/poisoned reply would re-freeze the UI on each keystroke or
- * streaming partial while it sits in the transcript. Quadratic inputs don't
+ * space-separated `_` run (findUnderscoreClose) re-scans to end-of-text. The
+ * widget memoizes rendered bubbles by message text, so a settled reply parses
+ * once; but a live `working` reply grows on every streaming partial, so a single
+ * huge/poisoned draft re-parses on each partial (a cache miss per growth) and
+ * would re-freeze the UI while it streams. Quadratic inputs don't
  * throw (the try/catch below only catches deep-nesting RangeErrors), so this
  * cap is the only guard against them.
  */

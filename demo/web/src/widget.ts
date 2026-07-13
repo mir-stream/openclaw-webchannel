@@ -95,6 +95,20 @@ export async function createWidget(
   const COMMANDS_REQUEST_COOLDOWN_MS = 3000;
   let menuDismissed = false;
 
+  // Per-message memo of rendered markdown DOM, keyed by message id + text.
+  // render() is subscribed to client state and re-runs on EVERY change (each
+  // streaming partial, typing flip, approval, etc.), rebuilding the whole bubble
+  // list each pass. renderMarkdown is a synchronous, worst-case O(n²) parse up to
+  // the 20k cap, so without a memo every stable agent bubble re-parses on every
+  // later partial while it sits in the transcript. Keying by id+text means a
+  // `working` draft (whose text grows each partial) naturally misses and
+  // re-renders — correct — while unchanged messages hit the cache. Reusing the
+  // SAME element instance is fine: the element just moves into the fresh bubble
+  // container on re-append. The cache is rebuilt from the prior one each pass
+  // (see render()), so departed messages drop out and it stays bounded by the
+  // live transcript.
+  let mdCache = new Map<string, HTMLElement>();
+
   // ── Render ───────────────────────────────────────────────────────────────
   function renderApproval(a: ApprovalRequest): HTMLElement {
     const resolved = a.resolvedDecision !== undefined;
@@ -171,12 +185,23 @@ export async function createWidget(
       sendBtn.textContent = inFlight ? "Stop" : "Send";
     }
 
+    // Carry markdown hits over from the previous pass; misses re-parse. Assigned
+    // to `mdCache` after the list is built so it tracks only the live transcript.
+    const nextMdCache = new Map<string, HTMLElement>();
     const bubbles = state.messages.map((m) => {
+      const isUser = m.role === "user";
       // User bubbles stay plain-text (pre-wrap keeps their line breaks). Agent
       // bubbles — including `working` streaming drafts — render markdown to DOM;
       // the renderer handles line breaks itself, so no pre-wrap (it'd double up).
-      const isUser = m.role === "user";
-      const child: Node | string = isUser ? m.text : renderMarkdown(m.text);
+      let child: Node | string;
+      if (isUser) {
+        child = m.text;
+      } else {
+        const key = `${m.id}\n${m.text}`;
+        const rendered = mdCache.get(key) ?? renderMarkdown(m.text);
+        nextMdCache.set(key, rendered);
+        child = rendered;
+      }
       return el(
         "div",
         {
@@ -198,6 +223,7 @@ export async function createWidget(
       );
     }
     list.replaceChildren(...bubbles);
+    mdCache = nextMdCache;
     approvalsBox.replaceChildren(...state.approvals.map(renderApproval));
     // Keep the typeahead in sync when the catalog frame lands mid-typing.
     renderMenu();
