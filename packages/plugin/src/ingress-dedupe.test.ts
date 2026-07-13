@@ -8,6 +8,7 @@ import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 import {
   filterFreshInboundItems,
   createIngressOnFlush,
+  recordCancelledInboundItems,
 } from "./ingress-dedupe.js";
 import { coalesceUserMessages, type UserMessageLike } from "./inbound-queue.js";
 
@@ -55,7 +56,7 @@ function fakeChecker() {
   const checkAndRecord = vi.fn(
     async (key: string, opts?: { namespace?: string }) => {
       calls.push({ key, namespace: opts?.namespace });
-      const composite = `${opts?.namespace ?? "global"}\u0000${key}`;
+      const composite = `${opts?.namespace ?? "global"}:${key}`;
       if (seen.has(composite)) return false;
       seen.add(composite);
       return true;
@@ -329,6 +330,201 @@ describe("createIngressOnFlush — integration through a REAL createInboundDebou
     await wait(30);
 
     expect(dispatched.map((d) => d.text)).toEqual(["hello"]);
+  });
+});
+
+describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messages)", () => {
+  it("records `${peerId}:${id}` (namespace=accountId) AND acks id-carrying items", async () => {
+    const { checkAndRecord, calls } = fakeChecker();
+    const acks: Array<{ peerId: string; ids: string[] }> = [];
+    await recordCancelledInboundItems(
+      [item("p1", "killed-a", "idA"), item("p1", "killed-b", "idB")],
+      "acctZ",
+      checkAndRecord,
+      (peerId, ids) => acks.push({ peerId, ids }),
+    );
+    expect(calls).toEqual([
+      { key: "p1:idA", namespace: "acctZ" },
+      { key: "p1:idB", namespace: "acctZ" },
+    ]);
+    expect(acks).toEqual([{ peerId: "p1", ids: ["idA", "idB"] }]);
+  });
+
+  it("records BEFORE acking (killed text can't slip through a replay)", async () => {
+    const order: string[] = [];
+    const checkAndRecord = vi.fn(async (key: string) => {
+      order.push(`record:${key}`);
+      return true;
+    });
+    await recordCancelledInboundItems(
+      [item("p1", "killed", "idA")],
+      "acct",
+      checkAndRecord,
+      (_peerId, ids) => order.push(`ack:${ids.join(",")}`),
+    );
+    expect(order).toEqual(["record:p1:idA", "ack:idA"]);
+  });
+
+  it("skips id-less items entirely (nothing recorded, nothing acked)", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const acks: Array<{ peerId: string; ids: string[] }> = [];
+    await recordCancelledInboundItems(
+      [item("p1", "no-id")],
+      "acct",
+      checkAndRecord,
+      (peerId, ids) => acks.push({ peerId, ids }),
+    );
+    expect(checkAndRecord).not.toHaveBeenCalled();
+    expect(acks).toEqual([]);
+  });
+
+  it("fails open: a throwing checkAndRecord still acks (best-effort) and logs", async () => {
+    const checkAndRecord = vi.fn(async () => {
+      throw new Error("disk boom");
+    });
+    const acks: Array<{ peerId: string; ids: string[] }> = [];
+    const log = vi.fn();
+    await recordCancelledInboundItems(
+      [item("p1", "killed", "idA")],
+      "acct",
+      checkAndRecord,
+      (peerId, ids) => acks.push({ peerId, ids }),
+      log,
+    );
+    // Record threw, but the ack still fires (drains the ledger) and a warn is logged.
+    expect(acks).toEqual([{ peerId: "p1", ids: ["idA"] }]);
+    expect(log).toHaveBeenCalledTimes(1);
+  });
+
+  it("groups ids by peer into one ack frame each", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const acks: Array<{ peerId: string; ids: string[] }> = [];
+    await recordCancelledInboundItems(
+      [item("p1", "a", "id1"), item("p2", "b", "id2"), item("p1", "c", "id3")],
+      "acct",
+      checkAndRecord,
+      (peerId, ids) => acks.push({ peerId, ids }),
+    );
+    expect(acks).toEqual([
+      { peerId: "p1", ids: ["id1", "id3"] },
+      { peerId: "p2", ids: ["id2"] },
+    ]);
+  });
+});
+
+describe("createIngressOnFlush — P0-7b ingress ACK (fresh + duplicate ids acked before dispatch)", () => {
+  /**
+   * Drive the REAL `createIngressOnFlush` (with its `sendAck` dep) through the REAL
+   * debouncer. The factory acks ALL id-carrying items — fresh AND deduped
+   * duplicates — in ONE frame per flush, BEFORE dispatch, then dispatches only the
+   * survivors. `sendAck`/`dispatch` both record into `order`, so we still observe
+   * the ack-precedes-dispatch guarantee even though it now lives inside the factory.
+   */
+  function buildSeam(
+    accountId: string,
+    checkAndRecord: (key: string, opts?: { namespace?: string }) => Promise<boolean>,
+    debounceMs = 10,
+  ) {
+    const dispatched: UserMessageLike[] = [];
+    const acks: Array<{ peerId: string; ids: string[] }> = [];
+    const order: string[] = []; // records "ack" / "dispatch" interleaving
+    const debouncer = createInboundDebouncer<Item>({
+      debounceMs,
+      serializeImmediate: true,
+      buildKey: (i) => i.peerId,
+      onFlush: createIngressOnFlush<Item>({
+        accountId,
+        checkAndRecord,
+        dispatch: (_peerId, message) => {
+          dispatched.push(message);
+          order.push("dispatch");
+        },
+        coalesce: coalesceUserMessages,
+        sendAck: (peerId, ids) => {
+          acks.push({ peerId, ids });
+          order.push("ack");
+        },
+      }),
+    });
+    return { debouncer, dispatched, acks, order };
+  }
+
+  it("acks a fresh batch in one frame, BEFORE dispatch", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const { debouncer, dispatched, acks, order } = buildSeam("acct", checkAndRecord);
+
+    void debouncer.enqueue(item("p1", "a", "id1"));
+    void debouncer.enqueue(item("p1", "b", "id2"));
+    await wait(30);
+
+    expect(acks).toEqual([{ peerId: "p1", ids: ["id1", "id2"] }]);
+    expect(dispatched.map((d) => d.text)).toEqual(["a\n\nb"]); // coalesced (blank-line join)
+    expect(order).toEqual(["ack", "dispatch"]); // ack precedes dispatch
+  });
+
+  it("acks a DUPLICATE too (so the client's ledger drains) but dispatches nothing", async () => {
+    const { checkAndRecord } = fakeChecker();
+    // Pre-record idDup so the whole later batch is a duplicate.
+    await checkAndRecord("p1:idDup", { namespace: "acct" });
+    const { debouncer, dispatched, acks } = buildSeam("acct", checkAndRecord);
+
+    void debouncer.enqueue(item("p1", "again", "idDup"));
+    await wait(30);
+
+    // The duplicate is still acked (the original arrived — without the ack the
+    // client would replay it forever), but no turn runs.
+    expect(acks).toEqual([{ peerId: "p1", ids: ["idDup"] }]);
+    expect(dispatched).toEqual([]);
+  });
+
+  it("acks fresh + duplicate ids together in one frame", async () => {
+    const { checkAndRecord } = fakeChecker();
+    await checkAndRecord("p1:idOld", { namespace: "acct" }); // pre-seen
+    const { debouncer, dispatched, acks } = buildSeam("acct", checkAndRecord);
+
+    // A window carrying one duplicate (idOld) and one fresh (idNew).
+    void debouncer.enqueue(item("p1", "dup", "idOld"));
+    void debouncer.enqueue(item("p1", "new", "idNew"));
+    await wait(30);
+
+    expect(acks).toEqual([{ peerId: "p1", ids: ["idOld", "idNew"] }]);
+    expect(dispatched.map((d) => d.text)).toEqual(["new"]); // only the fresh one runs
+  });
+
+  it("excludes id-less items from the ack (nothing to ack, no frame)", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const { debouncer, acks } = buildSeam("acct", checkAndRecord);
+
+    void debouncer.enqueue(item("p1", "no-id"));
+    await wait(30);
+
+    expect(acks).toEqual([]); // id-less → no ack frame at all
+  });
+
+  it("acks UNIQUE ids only (a same-window double-submit of one id acks once)", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const { debouncer, acks } = buildSeam("acct", checkAndRecord);
+
+    void debouncer.enqueue(item("p1", "x", "idX"));
+    void debouncer.enqueue(item("p1", "x", "idX"));
+    await wait(30);
+
+    expect(acks).toEqual([{ peerId: "p1", ids: ["idX"] }]); // deduped in the ack set
+  });
+
+  it("does NOT throw and still dispatches when NO sendAck dep is wired (P0-7a first half)", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const dispatched: UserMessageLike[] = [];
+    // No `sendAck` — the P0-7a shape. The factory must simply skip the ack step.
+    const onFlush = createIngressOnFlush<Item>({
+      accountId: "acct",
+      checkAndRecord,
+      dispatch: (_peerId, message) => dispatched.push(message),
+      coalesce: coalesceUserMessages,
+    });
+
+    await expect(onFlush([item("p1", "hi", "id1")])).resolves.toBeUndefined();
+    expect(dispatched.map((d) => d.text)).toEqual(["hi"]);
   });
 });
 

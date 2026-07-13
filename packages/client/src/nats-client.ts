@@ -159,8 +159,14 @@ export type InboundMessage = {
     | "typing"
     | "history"
     // P0-3: slash-command discovery catalog (carries `commands`).
-    | "commands";
+    | "commands"
+    // P0-7b: ingress acknowledgement (carries `ids`). The agent acks every
+    // id-carrying `user_message` at ingress so the client can drain its unacked
+    // replay ledger; unknown ids are a silent no-op.
+    | "ack";
   id?: string;
+  /** P0-7b: the acknowledged `user_message` ids on an `ack` frame. */
+  ids?: string[];
   text?: string;
   kind?: "exec" | "plugin";
   title?: string;
@@ -834,6 +840,25 @@ export class WebChannelNatsClient {
   private sessionKey: Uint8Array | null = null;
   private outboundQueue: OutboundMessage[] = [];
   /**
+   * P0-7b: published-but-unacked `user_message` ledger (insertion-ordered).
+   *
+   * `seal()` records every published user_message that carries an `id` here; the
+   * agent acks it at ingress (`ack` frame → `drainAcked`) and the entry drops. A
+   * `user_message` sealed but then lost to a mid-session relay outage stays in the
+   * ledger and is REPLAYED at the next `flushQueue()` (session re-establishment)
+   * with the SAME id — 4a's server-side dedupe makes that replay exactly-once.
+   * Only user_messages are tracked: `approval_decision` has its own loss-recovery
+   * (#15 Leg C), and `load_history`/`load_commands` are stale after reconnect (the
+   * register snapshot re-hydrates). `resetSession()` deliberately KEEPS this (a
+   * mid-session drop is exactly when the entries are needed); `disconnect()`
+   * clears it (dead instance).
+   */
+  private readonly unackedLedger = new Map<string, OutboundMessage>();
+  /** P0-7b: cap on the unacked ledger; the oldest entry is evicted (with a warn) past this. */
+  private static readonly MAX_UNACKED = 100;
+  /** P0-7b: one-shot guard so a full ledger warns once per session, not per evicted send. */
+  private warnedUnackedEvict = false;
+  /**
    * Ciphertext `.out` frames that arrived BEFORE the session key existed.
    *
    * Phase 6 race: the wrapped conversation key travels the HTTP register
@@ -896,19 +921,28 @@ export class WebChannelNatsClient {
     this.outSub = -1;
     this.handshakeSub = -1;
     this.resetSession();
+    // P0-7b: an explicit disconnect retires this instance — drop the unacked
+    // ledger (unlike resetSession, which keeps it across a mid-session drop).
+    this.unackedLedger.clear();
     this.client.disconnect();
   }
 
-  /** Send user message (buffered until the handshake completes). */
-  sendUserMessage(text: string): void {
+  /**
+   * Send user message (buffered until the handshake completes). Returns the
+   * stable wire `id` stamped on the frame so the caller can correlate a later
+   * `ack` (P0-7b) back to its local echo.
+   */
+  sendUserMessage(text: string): string {
     // P0-7a: stamp a stable, unique id per logical send. The agent records it at
-    // ingress and drops a duplicate frame (rapid double-submit; a future replay
+    // ingress and drops a duplicate frame (rapid double-submit; the P0-7b replay
     // queue re-send after reconnect) so it never runs the turn twice. Reuse the
     // package's existing randomness helper (WebCrypto-preferring, Math.random
     // fallback) rather than `crypto.randomUUID` so we match the client's
     // established host assumptions; the id only needs to be collision-unguessable,
     // not a UUID.
-    this.enqueue({ type: "user_message", text, id: randomInboxToken() });
+    const id = randomInboxToken();
+    this.enqueue({ type: "user_message", text, id });
+    return id;
   }
 
   /** Send approval decision (buffered until the handshake completes). */
@@ -957,6 +991,9 @@ export class WebChannelNatsClient {
     this.pendingInbound = [];
     // Re-arm the one-time pre-key-drop warning for the next session.
     this.warnedPreKeyDrop = false;
+    // P0-7b: re-arm the ledger-eviction warning too (the ledger itself SURVIVES
+    // resetSession — this only lets a fresh session warn once again).
+    this.warnedUnackedEvict = false;
   }
 
   /**
@@ -970,8 +1007,24 @@ export class WebChannelNatsClient {
     this.pendingInbound = [];
     for (const payload of pending) {
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
-      if (msg) this.notifyMessageListeners(msg);
+      if (msg) this.deliverInbound(msg);
     }
+  }
+
+  /**
+   * Deliver a decrypted inbound frame. P0-7b: an `ack` frame first drains the
+   * matching ids from the unacked ledger, then (like every other frame) is
+   * forwarded to the message listeners — the wrapper reducer consumes it too.
+   */
+  private deliverInbound(msg: InboundMessage): void {
+    if (msg.type === "ack") this.drainAcked(msg.ids);
+    this.notifyMessageListeners(msg);
+  }
+
+  /** P0-7b: remove acked ids from the unacked ledger; unknown ids are a no-op. */
+  private drainAcked(ids?: string[]): void {
+    if (!ids) return;
+    for (const id of ids) this.unackedLedger.delete(id);
   }
 
   private async onConnected(): Promise<void> {
@@ -1205,7 +1258,7 @@ export class WebChannelNatsClient {
         return;
       }
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
-      if (msg) this.notifyMessageListeners(msg);
+      if (msg) this.deliverInbound(msg);
       return;
     }
   }
@@ -1220,6 +1273,17 @@ export class WebChannelNatsClient {
 
   private flushQueue(): void {
     if (!this.sessionKey) return;
+    // P0-7b: replay published-but-unacked user_messages FIRST — this choke point
+    // runs exactly when a session key is (re)established (register-delivered K and
+    // legacy-handshake paths both). Move ledger entries, in insertion order, to
+    // the FRONT of the queue (ahead of anything already queued), then clear the
+    // ledger; each re-enters it as `seal()` re-publishes. Same id on every replay,
+    // so 4a's ingress dedupe makes a re-delivery exactly-once.
+    if (this.unackedLedger.size > 0) {
+      const replay = [...this.unackedLedger.values()];
+      this.unackedLedger.clear();
+      this.outboundQueue = [...replay, ...this.outboundQueue];
+    }
     const queued = this.outboundQueue;
     this.outboundQueue = [];
     for (const message of queued) this.seal(message);
@@ -1232,8 +1296,36 @@ export class WebChannelNatsClient {
       return;
     }
     const { tenant, accountId, peerId } = this.options;
+    // P0-7b: record a user_message in the unacked ledger BEFORE publishing so it
+    // can be replayed if the session drops before the agent acks it. Recording
+    // first (not after publish) means a fast ack can't race ahead of the record
+    // and leave a drained id re-inserted. Only user_messages (see `unackedLedger`);
+    // an id-less frame from a caller that bypassed sendUserMessage is not
+    // replayable and is skipped.
+    if (message.type === "user_message" && message.id) {
+      this.recordUnacked(message.id, message);
+    }
     const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, message);
     this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
+  }
+
+  /** P0-7b: record an unacked user_message, evicting the oldest past the cap. */
+  private recordUnacked(id: string, message: OutboundMessage): void {
+    this.unackedLedger.set(id, message);
+    while (this.unackedLedger.size > WebChannelNatsClient.MAX_UNACKED) {
+      const oldest = this.unackedLedger.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.unackedLedger.delete(oldest);
+      if (!this.warnedUnackedEvict) {
+        // Warn ONCE per session (re-armed in resetSession) — a full ledger means
+        // an unusually long delivery stall; a per-send warn would spam a burst.
+        this.warnedUnackedEvict = true;
+        console.warn(
+          `[nats-client] unacked ledger exceeded ${WebChannelNatsClient.MAX_UNACKED}; ` +
+            `evicting the oldest unacked message(s) — they will not be replayed on reconnect`,
+        );
+      }
+    }
   }
 
   private notifyMessageListeners(msg: InboundMessage): void {

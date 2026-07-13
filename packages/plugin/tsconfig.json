@@ -13,6 +13,12 @@
     "allowImportingTsExtensions": false,
     "verbatimModuleSyntax": true
   },
-  "include": ["index.ts", "setup-entry.ts", "src/**/*.ts"],
+  // `index-nats.ts` (the NATS entry) IS in `include` — it was tsc-blind before
+  // (which let a `WEBCHANNEL_ID` ReferenceError and a P0-2 bug ship past
+  // typecheck; issue #32). Plugin-sdk's `OpenClawConfig` doesn't declare channel
+  // config extensions (`nats`/`saas`), so the entry narrows `api.config` once via
+  // its local `WebchannelChannelConfig` — keep new top-level config reads on that
+  // seam, not fresh casts.
+  "include": ["index.ts", "setup-entry.ts", "index-nats.ts", "src/**/*.ts"],
   "exclude": ["node_modules"]
 }

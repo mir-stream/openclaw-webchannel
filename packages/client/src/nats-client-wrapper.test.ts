@@ -808,3 +808,59 @@ describe("WebChannelNATSClient — P0-3 command discovery", () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// P0-7b delivery acks — send() stamps the local echo with the wire id, and an
+// `ack` frame marks the matching bubble delivered (state-only).
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P0-7b delivery acks", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+  function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+  }
+
+  it("send() stores the wire id on the local echo", () => {
+    const w = makeWrapper();
+    w.send("hello");
+    const m = w.getState().messages[0];
+    expect(typeof m.wireId).toBe("string");
+    expect(m.wireId).toBeTruthy();
+    expect(m.delivered).toBeUndefined(); // not yet acked
+  });
+
+  it("an ack frame marks the matching bubble delivered and leaves others untouched", () => {
+    const w = makeWrapper();
+    w.send("first");
+    w.send("second");
+    const [m1, m2] = w.getState().messages;
+
+    deliver(w, { type: "ack", ids: [m1.wireId!] });
+    const after = w.getState().messages;
+    expect(after.find((m) => m.id === m1.id)?.delivered).toBe(true);
+    expect(after.find((m) => m.id === m2.id)?.delivered).toBeUndefined(); // unrelated
+  });
+
+  it("an ack with no matching wireId is a state no-op", () => {
+    const w = makeWrapper();
+    w.send("only");
+    const before = w.getState();
+    deliver(w, { type: "ack", ids: ["not-a-wire-id"] });
+    expect(w.getState()).toBe(before); // no setState fired
+  });
+
+  it("an empty ack is a no-op", () => {
+    const w = makeWrapper();
+    w.send("only");
+    const before = w.getState();
+    deliver(w, { type: "ack", ids: [] });
+    expect(w.getState()).toBe(before);
+  });
+});

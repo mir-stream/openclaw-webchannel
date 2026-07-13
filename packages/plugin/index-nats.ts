@@ -35,7 +35,7 @@ import {
   resolveInboundDebounceMs,
 } from "openclaw/plugin-sdk/reply-runtime";
 import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
-import { createIngressOnFlush } from "./src/ingress-dedupe.js";
+import { createIngressOnFlush, recordCancelledInboundItems } from "./src/ingress-dedupe.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
@@ -102,6 +102,19 @@ type AccountRuntime = {
   verifier?: ConnectionVerifier;
   auth: AuthConfig | undefined;
   historyConfig: ReturnType<typeof resolveHistoryConfig>;
+};
+
+/**
+ * Top-level config blocks this entry reads that plugin-sdk's `OpenClawConfig`
+ * does not model. The webchannel `channels add` wizard writes a shared `nats`/
+ * `saas` base at the config root (the default account's identity base); the SDK
+ * type only declares core keys, so `api.config` is narrowed once against this at
+ * the point of use. Both fields (and their members) are optional — the runtime
+ * already falls back to per-account config / acquisition env when absent.
+ */
+type WebchannelChannelConfig = {
+  nats?: { url?: string; devOpen?: boolean };
+  saas?: { baseUrl?: string };
 };
 
 /** accountId → runtime, built once per process (idempotent across re-warms). */
@@ -305,7 +318,11 @@ export default defineChannelPluginEntry({
     }
     accountsBuildStarted = true;
 
-    const legacyNats = api.config.nats as { url?: string; devOpen?: boolean } | undefined;
+    // Narrow ONCE against the channel-plugin config extensions plugin-sdk's
+    // `OpenClawConfig` does not declare (see `WebchannelChannelConfig`). Every
+    // top-level `nats`/`saas` read below goes through this local.
+    const config = api.config as typeof api.config & WebchannelChannelConfig;
+    const legacyNats = config.nats;
 
     // Phase 3 planning (pure): list accounts. The wire identity is the accountId
     // itself (unique by construction), so there are no structural pre-I/O skips.
@@ -338,7 +355,7 @@ export default defineChannelPluginEntry({
         // Match the consume block's precedence (:277): plan-resolved base URL
         // (config `saas.baseUrl` over acquisition env) falls back to the flat
         // top-level `saas.baseUrl`.
-        plan.saasBaseUrl ?? api.config.saas?.baseUrl,
+        plan.saasBaseUrl ?? config.saas?.baseUrl,
         accountId,
         // SaaS-delivered issuer, persisted with the enrolled creds at
         // `channels add` time (EnrollmentResult.issuer). Same loader the
@@ -393,7 +410,7 @@ export default defineChannelPluginEntry({
         const source = resolveNatsCredentialSource({
           natsConfig: accountNatsCfg,
           legacyNats,
-          saasBaseUrl: plan.saasBaseUrl ?? api.config.saas?.baseUrl,
+          saasBaseUrl: plan.saasBaseUrl ?? config.saas?.baseUrl,
           tenant,
           accountId,
         });
@@ -646,12 +663,15 @@ export default defineChannelPluginEntry({
         debounceMs: inboundDebounceMs,
         serializeImmediate: true,
         buildKey: (item) => item.peerId,
-        // P0-7a ingress dedupe. The REAL handler is `createIngressOnFlush`
-        // (src/ingress-dedupe.ts) — extracted there so it is tsc-checked and
-        // tested directly. Its doc owns the load-bearing rationale (why the
-        // async dedupe belongs on this same-peer-serialized flush path, the
-        // control-lane bypass, per-id record-before-coalesce). Split log sinks:
-        // routine duplicate drops at info, fail-open faults at warn.
+        // P0-7a ingress dedupe + P0-7b ingress ack. The REAL handler is
+        // `createIngressOnFlush` (src/ingress-dedupe.ts) — extracted there so it
+        // is tsc-checked and tested directly. Its doc owns the load-bearing
+        // rationale (why the async dedupe belongs on this same-peer-serialized
+        // flush path, the control-lane bypass, per-id record-before-coalesce, and
+        // why the ack covers fresh + duplicates alike and precedes dispatch).
+        // Split log sinks: routine duplicate drops at info, fail-open faults at
+        // warn. `sendAck` (P0-7b) drains the client's replay ledger on ingress
+        // ADMISSION (not turn success); P0-7a wired no ack (first half).
         onFlush: createIngressOnFlush<{
           peerId: string;
           message: WebchannelUserMessage;
@@ -660,6 +680,7 @@ export default defineChannelPluginEntry({
           checkAndRecord: (key, opts) => inboundDedupe.checkAndRecord(key, opts),
           dispatch: dispatchInbound,
           coalesce: coalesceUserMessages,
+          sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
           logInfo: (m) => api.logger?.info?.(m),
           logWarn: (m) => api.logger?.warn?.(m),
         }),
@@ -667,6 +688,28 @@ export default defineChannelPluginEntry({
           api.logger.error?.(
             `webchannel: inbound debounce flush failed: ${String(err)}`,
           ),
+        onCancel: (items) => {
+          // P0-7b: a `/stop` cancels debounce-buffered messages that never reached
+          // onFlush, so they were never dedupe-recorded and never acked — yet the
+          // client's replay ledger still holds them. Record their ids (so an
+          // in-flight replay is dropped as a duplicate) and ack them (drain the
+          // ledger). onCancel is sync-shaped and checkAndRecord is async, so this
+          // is best-effort fire-and-forget with a warn — a lost record only
+          // re-opens the pre-existing pre-4b replay window (see the helper). Layer
+          // (b) `clearPending` items are NOT handled here: they were already
+          // acked+recorded at their own onFlush.
+          void recordCancelledInboundItems(
+            items,
+            accountId,
+            (key, opts) => inboundDedupe.checkAndRecord(key, opts),
+            (peerId, ids) => channel.sendAck(peerId, ids),
+            (m) => api.logger?.warn?.(m),
+          ).catch((err) =>
+            api.logger?.warn?.(
+              `webchannel: cancelled-inbound handling failed: ${String(err)}`,
+            ),
+          );
+        },
       });
 
       // Command-gate mirror (P1-8a follow-up), resolved ONCE per account. It
@@ -736,6 +779,12 @@ export default defineChannelPluginEntry({
               );
             }
           }
+          // P0-7b: ack the control-lane frame here too. It bypasses the
+          // debouncer/onFlush (and is never deduped), so without this its
+          // client-side ledger entry would never drain and every reconnect would
+          // replay the /stop. A replayed /stop that lands before this ack is a
+          // harmless no-op abort (accepted).
+          if (message.id) channel.sendAck(peerId, [message.id]);
           void handleInboundMessage(
             api,
             channel as unknown as WebChannelTransport,
