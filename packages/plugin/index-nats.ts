@@ -50,7 +50,7 @@ import { isDmPostureOpen } from "./src/dm-allowlist.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig } from "./src/history.js";
 import { createCommandCatalogProvider } from "./src/commands-catalog.js";
 import { resolveWebchannelSessionRoute } from "./src/session-route.js";
-import type { WebChannelTransport } from "./src/transport.js";
+import { WEBCHANNEL_ID, type WebChannelTransport } from "./src/transport.js";
 import type { NatsTransport } from "./src/nats-transport.js";
 import type { EnrolledNatsConnection } from "./src/enrolled-nats-connection.js";
 import {
