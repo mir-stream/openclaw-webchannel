@@ -8,13 +8,17 @@
 > **Reference channel.** OpenClaw Telegram extension at
 > `../openclaw/extensions/telegram/` (absolute: `/Users/mircorn/workspace/openclaw/extensions/telegram/`).
 >
-> **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-10 (post-#14/#15/#16/#19 tree).** The integrated
-> showcase demo rewrote the demo surface. The demo now drives the production `WebChannelNATSClient`
-> state reducer, so **most P0 client render is built** (marked ✅). What remains is server-side
-> (P0-5/6) or net-new (P0-3/7); P0-2 closed 2026-07-10. Corrected 2026-07-10 for: partial-mode
-> answer-text streaming (#14, P0-5), the `approval_snapshot` rehydration frame (#15/#19, P0-4/§0
-> wire), the ordered history merge (#16, P0-1/§0), and the NATS register hop replacing
-> `registerHttpRoute` (P0-3).
+> **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-13 (post-#24…#33 tree).** The integrated
+> showcase demo rewrote the demo surface, and the P0/P1 parity stack has since **landed** — **P0 is
+> now fully built except one residual** (P0-3 argument menus). The demo drives the production
+> `WebChannelNATSClient` state reducer, so all P0 client render is done (marked ✅). Since the 07-10
+> re-verify develop merged: **P0-2 depth cap (#24)**, the **/stop control lane + typing gate + slash
+> discovery + debounce/coalesce + ingress dedupe (#25/#26/#28/#29/#30)**, **markdown (#27, P1)**,
+> **client replay+ack (#31)**, and the **protocol-version handshake (#33)**. Corrected below for:
+> partial-mode answer-text streaming (#14, P0-5 — now enabled in the demo), the `approval_snapshot`
+> rehydration frame (#15/#19, P0-4/§0 wire), the ordered history merge (#16, P0-1/§0), the NATS
+> register hop replacing `registerHttpRoute` (P0-3), and the two new inbound frames (`commands`,
+> `ack`) + register-reply version fields (§0 wire).
 >
 > **⚠️ Line numbers drift.** The demo is still being built, so `file:line` anchors are approximate
 > and keep moving — trust the file + symbol name and search if a line has shifted. Not re-anchored
@@ -53,8 +57,14 @@ The **wrapper reduces every inbound frame** (`nats-client-wrapper.ts`):
 | `approval_snapshot` | `:435` | **#15/#19 rehydration**: Leg A (rehydrate a lost pending card), Leg B (retire a card resolved elsewhere — show actual decision from `resolved`, else `"unknown"`), Leg C (re-send a lost decision frame); clears `isTyping` when a pending card is rehydrated |
 | `progress` | `:557` | upsert working bubble keyed by draft `id` |
 | `agent_message` | `:569` | finalize draft / append |
+| `commands` | `:412` | **P0-3**: replace `state.commands` with the delivered discovery catalog (`CommandCatalogEntry[]`) |
+| `ack` | `:420` | **P0-7b**: flip `delivered:true` on local echo bubbles whose `wireId` the agent acked at ingress |
 
-Terminal auth failure → `onError` (`:103`) sets `status:"error"` (no eternal spinner).
+Terminal auth failure → `onError` (`:103`) sets `status:"error"` (no eternal spinner). A separate
+`onProtocol` listener (not a reducer case) records the register reply's `protocolVersion` /
+`pluginVersion` into `agentProtocolVersion` / `agentPluginVersion` (#33 — the CLIENT enforces the
+version match and goes terminal on mismatch; these fields are plaintext, diagnostic-only, and gate
+nothing on the trust path).
 
 The **server/agent side (NATS path)** lives in the package-root composition entry
 `packages/plugin/index-nats.ts` (the old `src/index-nats.ts` is gone; wiring split into modules):
@@ -64,36 +74,47 @@ The **server/agent side (NATS path)** lives in the package-root composition entr
 | register hop | — | `setRegisterRequestHandler()` `:322` (channel) → wired `:638` (**NATS request/reply — the old HTTP `registerHttpRoute` is gone**) |
 | history snapshot on register | `sendHistory()` `:398` | **from the register success path** (stateless): `historyRecent`→`sendHistory`, detached read |
 | approval snapshot on register | `sendApprovalSnapshot()` `:473` | **from the same register path**, **synchronous** (not detached): `listPendingApprovalsForPeer`/`listResolvedApprovalsForPeer` → `sendApprovalSnapshot` (`:668-673`) |
-| history pagination | — | `setLoadHistoryHandler` `:505`/wired `:548` → `historyPageBefore` → `sendHistory` |
-| typing | `sendTyping()` `:390` (⚠️ ungated on NATS — see P0-6) | `inbound.ts:160` |
-| streaming draft | `sendProgress()` `:375` / `finalizeDraft()` `:383` | `inbound.ts:124-126` (gated on `streaming.mode` — `partial` = answer text, `progress` = tool lines) |
+| history pagination | — | `setLoadHistoryHandler` `:505`/wired `:548` → `planHistoryFetch` → `historyPageBefore`/`historyRecent` → `sendHistory` |
+| command discovery | `sendCommands()` `:527-530` | `setLoadCommandsHandler` `:658` wired `:917-925` → `createCommandCatalogProvider(api.config)()` (memoized, config-filtered) |
+| typing | `sendTyping()` `:509-513` (**now gated** — see P0-6) | gate set `index-nats.ts:590` `channel.setTypingEnabled(resolveTypingEnabled(account))` |
+| streaming draft | `sendProgress()` `:375` / `finalizeDraft()` `:383` | `inbound.ts:124-136` (gated on `streaming.mode` — `partial` = answer text, `progress` = tool lines) |
 | approval request | `sendApprovalRequest()` `:406` | emitted by `approvals.ts` `deliverPending` |
 | approval decision | `setApprovalDecisionHandler()` (channel `:496`) | `index-nats.ts:530` → `handleApprovalDecision` |
+| ingress ack | `sendAck()` `:539-543` | one per debounce flush from `createIngressOnFlush` (`index-nats.ts:675-686`), covering fresh + deduped ids |
 
 **The full wire contract** lives in the client (`nats-client.ts` / `types.ts`) and channel
-(`nats-channel.ts`) — seven inbound frames since #15/#19 added `approval_snapshot`:
+(`nats-channel.ts` `:52-87`) — **nine inbound / four outbound** frames after #30 added `commands`
+(P0-3) and #31 added `ack` (P0-7b):
 
 ```
-Inbound  (agent → browser): agent_message | progress | approval_request | approval_resolved | approval_snapshot | typing | history
-Outbound (browser → agent): user_message  | approval_decision  | load_history
+Inbound  (agent → browser): agent_message | progress | approval_request | approval_resolved | approval_snapshot | typing | history | commands | ack
+Outbound (browser → agent): user_message  | approval_decision  | load_history | load_commands
 ```
 
 `approval_snapshot` = `{ type:"approval_snapshot"; approvals:[…]; resolved?:[{id,decision}] }`
-(`packages/client/src/types.ts:206-214`; plugin side `nats-channel.ts:65-69`). The optional
-`resolved` array is the #19 addition. `ApprovalRequest` also gained `resolvedDecision?:
-ApprovalDecision | "unknown"` and `resolutionConfirmed?:boolean` (`types.ts:66-67`).
+(`packages/client/src/types.ts`; plugin side `nats-channel.ts:74-78`). The optional `resolved` array
+is the #19 addition. `ApprovalRequest` also gained `resolvedDecision?: ApprovalDecision | "unknown"`
+and `resolutionConfirmed?:boolean`. Other wire deltas: `user_message` gained an optional stable `id`
+(`nats-channel.ts:57` — the dedupe/ack key; id-less frames stay back-compatible); `commands` carries
+`CommandCatalogEntry[]` (`:83`); `ack` carries `{ ids: string[] }` (`:87`). **Register reply** (not a
+`.out` frame — the register req/reply) now carries `protocolVersion` + `pluginVersion`
+(`nats-register.ts:306-314`) alongside `{ peerId, registered:true, wrappedConversationKey }`; the
+client enforces the protocol match and goes terminal on mismatch (#33). `WebChannelState` now holds
+`messages` (+`wireId`/`delivered`), `approvals`, `status`, `connected`, `error?`, `isTyping?`,
+`commands?`, `agentProtocolVersion`, `agentPluginVersion` (`types.ts:123-165`).
 
 ### ⭐ Server defaults are ON; the demo enables the important ones
 
 `packages/plugin/openclaw.plugin.json` ships every P0 server capability with a sane default, and
-`demo/run.sh:232-249` turns on the ones that matter:
+`demo/run.sh:268-291` turns on the ones that matter:
 
 | Capability | Manifest default | Demo config (`run.sh`) | P0 status |
 |---|---|---|---|
 | `history.enabled` | **`true`** (`:174-178`) | **`true`** (`:234`) | ✅ P0-1 works E2E |
 | `execApprovals` + `capabilities.inlineButtons` | first-class (`:137/:163`) | **enabled + approvers** (`:235`) | ✅ P0-4 works E2E |
-| `capabilities.typing` | **`"on"`** (`:167-170`) | unset → default on | ✅ P0-6 (client) |
-| `streaming.mode` | option only (enum `off\|partial\|block\|progress`, `:110`), **no default** | **unset** | 🟡 P0-5 — neither `partial` (answer-text stream) nor `progress` (tool lines) exercised |
+| `capabilities.typing` | **`"on"`** (`:167-170`) | unset → default on | ✅ P0-6 — gate now wired on NATS (`typing:"off"` honored) |
+| `streaming.mode` | option only (enum `off\|partial\|block\|progress`, `:110`), **no default** | **`"partial"`** (`run.sh:287`) | ✅ P0-5 — answer-text stream exercised in the demo |
+| `messages.inbound.byChannel.webchannel` (core key) | core default `0` (inert) | **`300`** (`run.sh:268`) | ✅ P1-8b pre-run debounce active |
 
 ### Reuse note — openclaw `plugin-sdk` runtimes (VERIFIED available)
 
@@ -101,15 +122,17 @@ Telegram does **not** hand-roll approvals/commands/dedupe. `openclaw` is our **p
 (`packages/plugin/package.json`, `>=2026.6.10`); the authoritative source is the sibling checkout
 `/Users/mircorn/workspace/openclaw/src/plugin-sdk/`. Importable subpaths:
 
-| Subpath | Key export | Reuse for |
+| Subpath | Key export | Reused by |
 |---|---|---|
-| `openclaw/plugin-sdk/persistent-dedupe` | `createClaimableDedupe` | **P0-7** send idempotency |
-| `openclaw/plugin-sdk/native-command-registry` | command catalog | **P0-3** discovery/catalog |
-| `openclaw/plugin-sdk/reply-dispatch-runtime` | `ReplyPayload`, `resolveChunkMode` | **P0-3/P0-5** dispatch |
+| `openclaw/plugin-sdk/persistent-dedupe` | `createPersistentDedupe` | **P0-7a** ingress dedupe (record-at-ingress — see the decision record in P0-7) |
+| `openclaw/plugin-sdk/native-command-registry` | `listNativeCommandSpecsForConfig` | **P0-3** discovery catalog (`commands-catalog.ts`) |
+| `openclaw/plugin-sdk/command-primitives-runtime` | `isAbortRequestText` | **P1-8a** `/stop` control lane (`control-lane.ts`) |
 | `openclaw/plugin-sdk/approval-delivery-runtime` | `createApproverRestrictedNativeApprovalCapability` | **P0-4** approvals |
-| `openclaw/plugin-sdk/command-auth-native` | `resolveNativeCommandSessionTargets` | **P0-3** command authz |
 
-Our plugin already imports `openclaw/plugin-sdk/channel-core` (`inbound.ts`, `channel.ts`).
+Our plugin already imports `openclaw/plugin-sdk/channel-core` (`inbound.ts`, `channel.ts`). New P0/P1
+modules split into `src/` (tsc + vitest covered, since `index-nats.ts` is outside tsconfig):
+`control-lane.ts`, `command-gate.ts`, `commands-catalog.ts`, `ingress-dedupe.ts`, `protocol.ts`
+(server) and `command-filter.ts` (client), plus `demo/web/src/markdown.ts`.
 **Prefer these runtimes over from-scratch builds.**
 
 ---
@@ -170,18 +193,19 @@ snapshot is lost.
 
 **Symptom (original).** Older-than-snapshot turns can't be reached past ~2 pages.
 
-**Classification.** ✅ Closed 2026-07-10 (branch `feat/p0-2`). Two defects fixed:
-1. **`pageBefore` depth cap + left-edge truncation** (`history.ts`): now a two-phase fetch —
-   phase 1 reads `min(limit*2, 1000)`; the older-slice is returned only when it cannot be
-   left-truncated by the window edge (`idx >= limit`, or the window is already maximal);
-   otherwise (miss OR hit at `idx < limit`) phase 2 widens to the 1000-message upstream ceiling
-   (`MAX_FETCH_WINDOW`, mirrors `PLUGIN_SUBAGENT_SESSION_MESSAGES_MAX_LIMIT`). A cursor absent
-   from the maximal window returns an **empty page** (the honest end-of-history signal; the old
-   `slice(-limit)` newest-N fallback fed the client dedup-swallowed duplicates = silent stop).
+**Classification.** ✅ Closed 2026-07-10 (#24, branch `feat/p0-2`). Two defects fixed:
+1. **`pageBefore` depth cap + left-edge truncation** (`history.ts:277-318`): now a two-phase fetch —
+   phase 1 reads `Math.min(limit*2, MAX_FETCH_WINDOW)` (`:287`); the older-slice is returned only when
+   it cannot be left-truncated by the window edge (`idx >= limit || (found && phase1Limit >=
+   MAX_FETCH_WINDOW)`, `:293`); otherwise (miss OR hit at `idx < limit`) phase 2 widens to the
+   1000-message upstream ceiling (`MAX_FETCH_WINDOW = 1000`, `:240`, mirrors
+   `PLUGIN_SUBAGENT_SESSION_MESSAGES_MAX_LIMIT`) and re-searches. A cursor absent from the maximal
+   window returns an **empty page** (`:313` — the honest end-of-history signal; the old `slice(-limit)`
+   newest-N fallback fed the client dedup-swallowed duplicates = silent stop).
 2. **Live NATS call-site bug** (`index-nats.ts` load-history handler): it passed the whole
    `{before, limit}` request object as `beforeId`, so live-path pagination ALWAYS returned `[]`
    (masked from tsc — `index-nats.ts` is outside the plugin tsconfig `include`). Now routed
-   through `planHistoryFetch(request, pageSize)` (`history.ts`): validates the wire `limit`
+   through `planHistoryFetch(request, pageSize)` (`history.ts:218-231`): validates the wire `limit`
    (finite, >0, floored, else pageSize) and branches `before` → `pageBefore` / absent → `recent`,
    matching the legacy `index.ts` handler.
 
@@ -253,60 +277,54 @@ keeps fetching+prepending; fetching past the beginning (or past the 1000-message
 
 ---
 
-## P0-3 — Slash command discovery (`/help`, `/new`, `/reset`, `/model`, …) — 🔴 DISCOVERY MISSING
+## P0-3 — Slash command discovery (`/help`, `/new`, `/reset`, `/model`, …) — ✅ BUILT (arg menus open)
 
-**Symptom.** Typing `/` shows nothing; no command menu or autocomplete.
+**Symptom (original).** Typing `/` showed nothing; no command menu or autocomplete.
 
-**Classification.** 🔴 **Execution already works (verified by code path); discovery is the real gap.**
+**Classification.** ✅ Built (#30). Execution already worked (commands route as text through core);
+discovery — the real gap — is now closed on **both halves**. One residual: **argument menus** are not
+rendered yet.
 
-**Verified — commands already execute as text.** Traced through openclaw core:
-1. Inbound forwards raw text as a command body: `inbound.ts:173` `textForCommands: raw.text` →
-   `:200` `commandBody: input.textForCommands`.
-2. Core decides via `shouldHandleTextCommands`
-   (`/Users/mircorn/workspace/openclaw/src/auto-reply/commands-text-routing.ts:40-48`):
-   `if (params.cfg.commands?.text !== false) return true;` — text commands ON by default.
-3. `isNativeCommandSurface` is true only for plugins whose **registration object** declares
-   `capabilities.nativeCommands === true`. Our registration
-   (`packages/plugin/src/channel.ts:115`) declares `{ chatTypes:["direct"], media:false }` — no
-   `nativeCommands` → webchannel is NOT a native surface → text slash commands stay active.
+**Execution (unchanged, still true).** `/help` typed in the browser is routed to core's text-command
+handler and returns output as an `agent_message`; webchannel declares no `capabilities.nativeCommands`
+(`channel.ts:115`) so text slash-commands stay active (core `commands-text-routing.ts:40-48`,
+`cfg.commands?.text !== false`). No change was needed here.
 
-**Conclusion:** `/help` in the browser is already routed to core's text-command handler and returns
-output as an `agent_message` (which the widget renders). The gap is **discovery + result fidelity**.
+**Where it stands today — discovery built.**
+- **Server catalog.** New inbound frame `{type:"load_commands"}` (`nats-channel.ts:63`) → outbound
+  `{type:"commands", commands: CommandCatalogEntry[]}` (`:83`); `setLoadCommandsHandler` (`:658`) /
+  `sendCommands` (`:527-530`), wired `index-nats.ts:917-925`. The catalog is built by
+  `buildCommandCatalog` (`src/commands-catalog.ts`) from `listNativeCommandSpecsForConfig`
+  (`openclaw/plugin-sdk/native-command-registry`) — **config-filtered, alias-free, name-sorted, NOT
+  hard-coded**, so a command gated off for the deployment is absent and new core commands appear
+  without touching this plugin. The provider is **memoized per account**
+  (`createCommandCatalogProvider`) — the handler runs inline for any handshaken peer, so per-request
+  rebuilds were an event-loop DoS surface; memoizing removes it without a rate limiter. Entry shape:
+  `{name (no leading slash), description, args?:[{name,description?,required?,choices?}]}`.
+  > **Exposure decision.** The catalog is served to **any handshaken peer**, including wildcard /
+  > `admission:"auto"` peers — deliberately, unlike the history/approval snapshots (which ride the
+  > register-hop admission path). The command set is low-sensitivity (it is the same list core would
+  > run for a typed command), so leaking it to an auto peer carries none of the approval-power risk
+  > that gates the snapshots.
+- **Client typeahead.** `demo/web/src/widget.ts` — a `cmdMenu` element (`:78`) rendered by
+  `renderMenu()` (`:238`); when the input starts with `/` it lazily calls `client.loadCommands()` with
+  a 3s cooldown (`:250-256`), filters with the pure `filterCommandCatalog`
+  (`packages/client/src/command-filter.ts`), dismisses on Escape, and inserts `/name ` on click. State
+  gained `commands?: CommandCatalogEntry[]` (`types.ts:149`), fed by the reducer `case "commands"`
+  (`nats-client-wrapper.ts:412`).
 
-**What's genuinely missing.**
-1. **A command catalog surfaced to the browser** — returning `[{name,description,args?}]` from
-   `openclaw/plugin-sdk/native-command-registry`, filtered by `resolveNativeCommandsEnabled`. **Do not
-   hard-code a command array.** ⚠️ The old sketch's `/webchannel/commands` HTTP route no longer has a
-   pattern to copy: **the NATS path has no HTTP surface** since the register hop moved to NATS
-   request/reply (`registerHttpRoute` is gone from `index-nats.ts`; only the retained legacy WS entry
-   `packages/plugin/index.ts:210` still registers an HTTP upgrade route). Two delivery mechanisms fit:
-   - **(a) A NATS request/reply or inbound frame over the existing channel (recommended)** — e.g. a
-     `load_commands` outbound sibling of `load_history` handled by a new
-     `setLoadCommandsHandler` (mirrors `setLoadHistoryHandler` `nats-channel.ts:505` / wired
-     `index-nats.ts:548`) that replies with a `commands` inbound frame. Keeps the **zero-inbound**
-     agent property (no HTTP surface reintroduced).
-   - **(b) A SaaS-side HTTP route** serving the catalog out-of-band. Simpler wiring, but puts the
-     catalog on a different origin than the agent that owns the command set.
-2. **A typeahead in `demo/web/src/widget.ts`** — when `input.value` starts with `/`, fetch the
-   catalog once, render a filterable menu; on pick, insert; on Enter, send as a normal message.
-3. **Argument menus** (`/model <pick>`, `/thinking <level>`) — a dropdown rendered from the catalog's
-   `args` (ties into P1 buttons / P0-4's control renderer).
+**Telegram reference (UX semantics).** `bot-native-commands.ts` (`registerTelegramNativeCommands`
+`:824`, `setMyCommands` `:1724`, `findCommandByNativeName` `:419`); catalog import
+`openclaw/plugin-sdk/native-command-registry` — the same registry our catalog reads.
 
-**Telegram reference.** `bot-native-commands.ts` (`registerTelegramNativeCommands` `:824`,
-`setMyCommands` `:1724`, `findCommandByNativeName` `:419`); catalog import
-`openclaw/plugin-sdk/native-command-registry`.
+**Residual (still open).** **Argument menus** (`/model <pick>`, `/thinking <level>`): catalog entries
+already carry `args` (with static `choices` where the registry declares them), but the widget only
+inserts the command *name* — it does not yet render a dropdown from `args.choices`. This is the P0-3
+residual; it ties into the P1-5 control renderer (see P0-4).
 
-**Two design choices (mutually exclusive on routing):**
-- **(A) Stay a text-command surface (recommended).** Keep `channel.ts:115` as-is. Commands execute
-  as text (already working); add discovery only. Lowest risk.
-- **(B) Become a native-command surface.** Declare `capabilities.nativeCommands:true` in the
-  **registration object** (`channel.ts:115`). ⚠️ This alone does NOT disable text-command handling
-  (`cfg.commands?.text !== false` wins first in `commands-text-routing.ts:44`) — full (B) also needs
-  `commands.text:false` + owning command dispatch and arg-menu rendering. Defer to P1/P2.
-
-**Acceptance.** Typing `/` shows a menu of at least `/help /new /reset /model /thinking /fast`;
-selecting `/help` sends it and the help text renders; `/reset` clears the server session (verify the
-history snapshot is empty on next reconnect).
+**Acceptance (met, minus arg menus).** Typing `/` shows a filterable menu of the config-enabled
+commands; selecting one inserts it and sending runs it (the help/output renders as an `agent_message`;
+after P1-1, as markdown). Arg-value dropdowns are the open slice.
 
 ---
 
@@ -371,16 +389,19 @@ memory `demo-user-login`.
 
 ---
 
-## P0-5 — Streaming / partial responses (progress drafts) — 🟡 CLIENT BUILT, DEMO FLAG OFF
+## P0-5 — Streaming / partial responses (progress drafts) — ✅ BUILT (demo streams `partial`)
 
-**Symptom.** The reply appears all at once; no live "typing out", no tool-progress feedback.
+**Symptom (original).** The reply appeared all at once; no live "typing out", no tool-progress
+feedback.
 
-**Classification.** 🟡 Client render is built and **mode-agnostic**; the demo **does not enable** any
-server streaming mode, so neither the answer-text stream nor the tool-progress stream is exercised.
+**Classification.** ✅ Built. Client render is mode-agnostic; the server gate has two draft modes; and
+the demo now **sets `streaming.mode:"partial"`** (`demo/run.sh:287`, commit `8671d49`), so the
+answer-text "typing out" stream is exercised end-to-end. One nit: the setup wizard does not offer
+`streaming.mode` (deliberately enroll-only — see below).
 
 **Where it stands today.**
 - Server streaming is **gated on config** with **two distinct draft modes** (post-#14):
-  `inbound.ts:124-126`
+  `inbound.ts:124-136`
   ```ts
   const streamingMode = resolveStreamingMode(channelConfig);
   const draftEnabled = streamingMode === "progress" || streamingMode === "partial";
@@ -402,123 +423,137 @@ server streaming mode, so neither the answer-text stream nor the tool-progress s
 - **Reducer is mode-agnostic:** `nats-client-wrapper.ts:557` `case "progress"` upserts a working
   bubble keyed by draft `id`; the matching `agent_message` (`:569`) finalizes it. **No client work is
   needed to switch the demo to `partial`.**
-- **Widget:** working bubbles render italic/dimmed (`widget.ts:150-154` `m.working` → `opacity:.7;
+- **Widget:** working bubbles render italic/dimmed (`widget.ts:215` `m.working` → `opacity:.7;
   font-style:italic`).
-- ⚠️ **Demo doesn't set `streaming.mode`.** The account block (`run.sh:273-291`) has
-  `history`/`execApprovals`/`auth`/`dmSecurity` but **no `streaming.mode`**, so `draftEnabled` is
-  false in the demo — no draft frames are emitted at all.
+- ✅ **Demo sets `streaming.mode:"partial"`.** The account block (`run.sh:287`) now carries
+  `"streaming": { "mode": "partial" }` alongside `history`/`execApprovals`/`auth`/`dmSecurity`, so
+  `draftEnabled` + `answerStreamingEnabled` are both true and the answer streams into the working
+  bubble.
 
 **Telegram reference.** `draft-stream.ts` `createTelegramDraftStream` (`:176`), throttled edits
 (`DEFAULT_THROTTLE_MS`, min 250ms). Reasoning/answer split is **P1-3**, not P0.
 
-**Implementation sketch (remaining).**
-1. **Enable server streaming in the demo — use `partial`.** Add
-   `channels.webchannel.accounts.<acct>.streaming.mode:"partial"` to the `run.sh` config heredoc
-   (`run.sh:273-291`) — or set it in the setup wizard (memory `webchannel-setup-wizard-backlog`).
-   `"partial"` is what satisfies this section's acceptance (incremental **answer** text that finalizes
-   into the answer); choose `"progress"` only if you specifically want tool-progress-lines-only with
-   an atomic answer.
-2. Optional: a subtle "working" affordance (cursor/shimmer) beyond the current italic dim.
+**Residual (nit).** The setup wizard (`src/setup-wizard.ts`) still does not offer `streaming.mode` —
+it writes CONFIG ONLY and is deliberately enroll-scoped (header comment `:8-15`), so an operator
+enrolling via `channels add` gets no streaming toggle and must set it by hand (as the demo does). Low
+priority. Optional polish: a subtle "working" affordance (cursor/shimmer) beyond the italic dim.
 
-**Acceptance.** With `streaming.mode:"partial"` set, a multi-step / tool-using turn shows incremental
-text in a single bubble that finalizes into the answer — no duplicate bubbles, no infinite spinner if
-the turn errors (the in-flight draft is finalized on error). (With `"progress"`, the same holds for
-tool lines but the answer arrives atomically.)
+**Acceptance (met).** With `streaming.mode:"partial"` set, a multi-step / tool-using turn shows
+incremental text in a single bubble that finalizes into the answer — no duplicate bubbles, no infinite
+spinner if the turn errors (the in-flight draft is finalized on error). (With `"progress"`, the same
+holds for tool lines but the answer arrives atomically.)
 
 ---
 
-## P0-6 — Typing indicator ("agent is typing…") — ✅ CLIENT BUILT, NATS GATE OPEN
+## P0-6 — Typing indicator ("agent is typing…") — ✅ BUILT (NATS gate now wired)
 
 **Symptom (original).** After sending, no feedback that the agent received it.
 
-**Classification.** ✅ Client built and rendered. Server-side, the `capabilities.typing:"off"` gate
-is **not wired on the NATS path** (default-on works; the off toggle is silently ignored).
+**Classification.** ✅ Built. Client renders it, and the server-side `capabilities.typing:"off"` gate
+is **now wired on the NATS path** (#26) — the off toggle is honored, not silently ignored.
 
 **Where it stands today.**
 - Server sends it at turn start: `inbound.ts:160` `transport.sendTyping(wsKey)`. Emit method
-  `nats-channel.ts:390`.
+  `nats-channel.ts:509-513`.
 - **Reducer:** `nats-client-wrapper.ts:376` `case "typing"` → `isTyping:true`; every subsequent
   real frame clears it (`approval_request`/`progress`/`agent_message` set `isTyping:false`;
   `approval_snapshot` clears it only when it rehydrates a pending actionable card).
-- **Widget:** `widget.ts:159` pushes an "agent is typing…" line when `state.isTyping`.
-- Demo: `capabilities.typing` unset → default `"on"`, so typing shows.
-- ⚠️ **The `capabilities.typing` gate is NOT enforced on the NATS path.** The gate exists only on
-  the legacy WS transport (`transport.ts:193/:360/:610` `typingEnabled` + `setTypingEnabled`).
-  `NatsChannel` (`nats-channel.ts`) has **no gate field**, `NatsChannel.sendTyping` (`:390`) is
-  ungated, and `index-nats.ts` never wires one. Net: an operator setting `capabilities.typing:"off"`
-  is **silently ignored on the NATS path** (the `inbound.ts:156-157` comment "the transport gates
-  the frame" is only true for the WS transport).
+- **Widget:** `widget.ts:220` pushes an "agent is typing…" line when `state.isTyping`.
+- ✅ **The `capabilities.typing` gate is now enforced on the NATS path.** `NatsChannel` has a
+  `private typingEnabled = true` field (`nats-channel.ts:249`) and `setTypingEnabled()` (`:502-504`);
+  `sendTyping` (`:509-513`) returns `false` without emitting when disabled. It is wired at account
+  setup: `index-nats.ts:590` `channel.setTypingEnabled(resolveTypingEnabled(account))`, where
+  `resolveTypingEnabled` (`src/account-config.ts:271-276`) reads the **per-account** resolved config
+  = `(capabilities?.typing ?? "on") !== "off"`. So `capabilities.typing:"off"` now suppresses the
+  frame on NATS.
 - (Note: `src/typing-indicator.ts` is an **unrelated** feature — ephemeral client↔client typing
   envelopes — not this agent→browser gate.)
 
 **Telegram reference.** `sendchataction-401-backoff.ts` (typing = `sendChatAction` with 401 backoff).
 The backoff machinery is Telegram-specific; we only need the on/off signal.
 
-**Implementation sketch (remaining — server only).**
-1. Add a `typingEnabled` gate to `NatsChannel` (mirror `transport.ts:193/:360/:610`), set it from the
-   account's `capabilities.typing` during account setup in `index-nats.ts`, and gate
-   `NatsChannel.sendTyping` (`nats-channel.ts:390`) on it.
-
-**Acceptance.** Sending shows "typing…" that clears on the first real frame; with
+**Acceptance (met).** Sending shows "typing…" that clears on the first real frame; with
 `capabilities.typing:"off"` on the account, no `typing` frame is emitted on the NATS path.
 
 ---
 
-## P0-7 — Send reliability across reconnect (replay / idempotency) — 🔴 MISSING
+## P0-7 — Send reliability across reconnect (replay / idempotency) — ✅ BUILT (both halves)
 
-**Symptom.** A message sent while the socket is momentarily down can be dropped; a reconnect could in
-principle re-deliver. No delivery guarantee.
+**Symptom (original).** A message sent while the socket is momentarily down could be dropped; a
+reconnect could re-deliver. No delivery guarantee.
 
-**Classification.** 🔴/🟡. No client replay queue or server dedupe yet.
+**Classification.** ✅ Built — client replay queue (P0-7b, #31) + server ingress dedupe (P0-7a, #30) +
+an ack frame closing the loop. This was the heaviest P0 item and the only one needing both ends.
 
-**Where it stands today.**
-- The NATS client **buffers outbound until the handshake** (fail-closed) — covers the *initial*
-  connect race but **not** a mid-session drop; on reconnect the outbound queue isn't
-  replay-guaranteed.
-- No `messageId`-based idempotency on the browser→agent path (the E2E envelope has a random
-  `messageId` per send, not a server-enforced dedupe key).
-- No dedupe in `inbound.ts` (only `finalize` is idempotent, `inbound.ts:267`).
+**Where it stands today — client (P0-7b).**
+- Each `user_message` is stamped with a stable id (`randomInboxToken()`) in `sendUserMessage()`
+  (`nats-client.ts:960`). `ChatMessage` gained `wireId?` / `delivered?` (`types.ts:34,39`); the
+  wrapper stamps the local echo with its `wireId` (`nats-client-wrapper.ts:155-161`).
+- Replay ledger: `outboundQueue` (`:858`) + `unackedLedger: Map<string,OutboundMessage>` (`:873`,
+  cap `MAX_UNACKED = 100`, oldest-eviction with a one-shot warn `:1365-1378`, user_message only). On
+  session re-establishment `flushQueue()` (`:1327-1342`) prepends the unacked ledger and re-seals
+  each with the **same id**, so a mid-session drop is re-sent.
+- Inbound `ack {ids:string[]}` (`nats-client.ts:1048`) → `drainAcked` (`:1053-1055`) removes acked
+  ids from the ledger; the wrapper's `case "ack"` (`nats-client-wrapper.ts:420-431`) flips
+  `delivered:true` on matching-`wireId` bubbles (state-only, so the demo can render a ✓).
 
-**Telegram reference.** `message-dispatch-dedupe.ts` — a **7-day claimable dedupe window** on
-`openclaw/plugin-sdk/persistent-dedupe` (`createClaimableDedupe`): claim before processing, `forget`
-(rollback) on failure so a retry isn't falsely deduped; key builder
-`buildTelegramMessageDispatchReplayKey(msg)`.
+**Where it stands today — server (P0-7a).**
+- Ingress dedupe via `createPersistentDedupe` (`openclaw/plugin-sdk/persistent-dedupe`,
+  record-at-ingress), per-account (namespace = accountId), 7-day TTL, key `${peerId}:${id}` on the
+  optional `user_message.id` — `index-nats.ts:629-639`, logic in `src/ingress-dedupe.ts`
+  (`filterFreshInboundItems` / `createIngressOnFlush`, wired as the debouncer's `onFlush`
+  `:675-686`). Id-less frames are back-compat pass-through (never recorded); a non-string / >128-char
+  id is treated as id-less to bound SQLite storage amplification.
+- Ack: `{type:"ack", ids}` (`nats-channel.ts:87`, `sendAck` `:539-543`) is sent **once per flush,
+  BEFORE dedupe/dispatch**, covering fresh AND duplicate ids — ack = admission (the original was
+  admitted), not turn success, so a deduped duplicate must still drain the client's ledger. It also
+  acks `/stop`-cancelled buffered items (record-BEFORE-ack, `ingress-dedupe.ts:262-288`) and the
+  control-lane frame itself (`index-nats.ts:787`).
 
-**Reuse — VERIFIED.** `createClaimableDedupe` lives in `openclaw/plugin-sdk/persistent-dedupe`.
+> **Decision record — `createPersistentDedupe`, NOT the sketch's `createClaimableDedupe`.** The
+> original sketch (and Telegram's `message-dispatch-dedupe.ts`) used claim/commit with a `forget`
+> rollback. We deliberately chose **record-at-ingress** (at-most-once) instead
+> (`ingress-dedupe.ts:1-34`): (a) a processing failure already surfaces via the error-finalize path
+> and a human retry is a NEW id, so there is nothing to roll back; (b) the P1-8b coalesce merge keeps
+> only the FIRST message's fields, so a per-id rollback after a merged-turn failure would be lossy
+> anyway; (c) claim/commit's in-flight waiting guards a concurrent same-key race that cannot happen
+> here (the check runs inside the debouncer's same-peer-serialized `onFlush`). The honest tradeoff: a
+> **sub-millisecond crash window** between record and turn-start can lose a message the replay queue
+> then dedups away — accepted because the alternative re-admits duplicates on every crash-after-effect
+> and partial-delivery (far more common). Narrow at-most-once beats wide at-least-once for this
+> surface. (Distinct from the separate F4 in-memory anti-replay window `acceptFreshInbound`,
+> `nats-channel.ts:1006-1037` — a crypto-layer defense; do not conflate the two.)
 
-**Implementation sketch.**
-1. **Stable client message id** — the browser stamps each `user_message` with a stable, monotonic id
-   (survives reconnect); include it in the E2E envelope routing.
-2. **Outbound replay queue (client)** — keep unacked sends; on reconnect+rehandshake, re-send.
-3. **Server-side dedupe (agent)** — in `inbound.ts` / the serialized dispatcher, claim the client id
-   via persistent-dedupe before running the turn; `forget` on failure.
-4. **Ack frame (optional)** — so the client can drop delivered sends from its replay queue.
+**Telegram reference.** `message-dispatch-dedupe.ts` — a 7-day dedupe window on
+`openclaw/plugin-sdk/persistent-dedupe`; key builder `buildTelegramMessageDispatchReplayKey(msg)`. We
+reuse the same runtime, different factory (persistent vs claimable — see the decision record).
 
-**Acceptance.** Send a message, kill the relay mid-send, let it reconnect → delivered exactly once. A
-rapid double-submit of the same logical message is deduped server-side.
+**Acceptance (met).** Send a message, kill the relay mid-send, let it reconnect → the replay ledger
+re-sends and ingress dedupe makes it exactly once. A rapid double-submit of the same id is deduped
+server-side; the ack drains the ledger even for the deduped duplicate.
 
-**Scope note.** The heaviest P0 item and the only one needing both client and server work.
+**Residual (accepted).** The record→turn-start crash window above; and agent-DOWN durability (a
+`user_message` published while the agent is not subscribed is still lost — no JetStream / disk spool)
+remains **P2-4**. P0-7 covers the client→agent replay + idempotency side; P2-4 is the durability side.
 
 ---
 
 ## Suggested execution order (remaining work only)
 
+**P0 is fully closed except one residual.** Every numbered P0 gap is ✅; the only open P0 work is:
+
 | Order | Gap | Effort | Why |
 |---|---|---|---|
-| 1 | P0-5 streaming demo flag | XS | One-line `streaming.mode:"partial"` in `run.sh` unlocks the already-built (mode-agnostic) render — answer-text streaming; `"progress"` for tool-lines-only. |
-| 2 | P0-6 NATS typing gate | S | Small server gate; makes `typing:"off"` honored. |
-| 3 | ~~P0-2 server depth cap~~ | — | ✅ DONE 2026-07-10 (`feat/p0-2`): two-phase `pageBefore` to the 1000-msg ceiling + `index-nats.ts` call-site fix; true unbounded cursor stays upstream-blocked. |
-| 4 | P0-3 slash discovery | S–M | Catalog route + typeahead (execution already works). |
-| 5 | P0-7 send reliability | L | Client replay + server dedupe; the reliability milestone. |
+| 1 | P0-3 argument menus | S | Catalog entries already carry `args.choices`; render a dropdown from them (widget currently inserts the name only). Ties into the P1-5 control renderer. |
 
-> ✅ **Already built by the integrated demo:** P0-1 (history restore), P0-4 (approval cards), P0-6
-> (typing render), P0-5 (progress render). No further client work for those beyond the notes above.
-> ✅ **P0-2 (server depth cap)** closed 2026-07-10 on `feat/p0-2` — only the optional scroll-UX
-> polish remains in that section.
+> ✅ **Done:** P0-1 (history restore), P0-2 (depth cap, #24 — optional scroll-UX polish is all that
+> remains there), P0-3 (slash discovery, #30 — arg menus excepted above), P0-4 (approval cards +
+> rehydration), P0-5 (streaming, demo streams `partial`), P0-6 (typing render + NATS gate, #26),
+> P0-7 (client replay + server dedupe + ack, #30/#31). See each section for the residual notes.
 
 ## Cross-cutting: the reducer is the shared seam
 
-All render extensions now go through one place — the reducer (`nats-client-wrapper.ts:207-405`) and
-the widget's `render(state)` (`widget.ts:100-148`). New frame types (e.g. P1-5 `presentation`,
-P1-3 `reasoning`) add: a `case` in the reducer, a field on `WebChannelState` (`types.ts:74-94`), and
-a branch in `render`. There is no thin path to re-wire.
+All render extensions now go through one place — the reducer (`nats-client-wrapper.ts`) and the
+widget's `render(state)`. New frame types (e.g. P1-5 `presentation`, P1-3 `reasoning`) add: a `case`
+in the reducer, a field on `WebChannelState` (`types.ts:123-165`), and a branch in `render` — exactly
+as #30's `commands` and #31's `ack` did. There is no thin path to re-wire.
