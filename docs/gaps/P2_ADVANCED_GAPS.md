@@ -148,14 +148,20 @@ can edit+resubmit their last message.
 
 **Classification.** 🔴 Missing — and **this is the P2 item that matters most for our transport**,
 because NATS silently drops messages with no live subscriber (unlike Telegram's at-least-once
-getUpdates). Complements P0-7 (which is the *client→agent* replay side); this is the *durability*
-side.
+getUpdates). The gap has **narrowed since P0-7 shipped**: the duplicate / at-least-once-from-client
+side is now covered (see below), so what remains is specifically **agent-down message durability**.
 
-**Where it stands today.**
-- The register handler sends a history snapshot on (re)connect (`index-nats.ts:434`), which papers
-  over *some* loss for the browser side. But an inbound `user_message` published while the agent is
-  restarting is gone. `nats-channel.ts:419-427` explicitly *drops* inbound before handshake.
-- No disk spool, no processed-offset, no claim/lease.
+**Where it stands today (narrowed by P0-7).**
+- **Now covered by P0-7:** the client replay ledger re-sends unacked `user_message`s on reconnect
+  (P0-7b), and server ingress dedupe (`createPersistentDedupe`, SQLite 7-day) + the `ack` frame make
+  a re-sent message exactly-once (P0-7a). So a message dropped by a *transient* client/relay blip is
+  recovered end-to-end, and duplicates from replay are deduped.
+- **Still open (the residual P2-4 gap):** a `user_message` published while the **agent itself is
+  down / not subscribed** is still lost — the client replay only helps if the client is the one that
+  reconnects; nothing spools the inbound subject on the agent side. The register handler sends a
+  history snapshot on (re)connect, papering over *some* browser-side loss, and `nats-channel.ts`
+  drops inbound before handshake. There is **no JetStream stream and no disk spool** — no NATS-native
+  retention, no processed-offset, no claim/lease.
 
 **Telegram reference (the durability model to adopt).**
 - `telegram-ingress-spool.ts` — disk queue with **auto-claimed leases**, stale-claim detection (6h)
@@ -180,7 +186,12 @@ side.
    highest-leverage single change; check whether the deployed nats-server has JetStream enabled.
 2. If not JetStream: on receipt (post-handshake), `ChannelIngressQueue.write` before dispatch;
    `claim` → run turn → `release`/`fail`; recover claims from dead processes on startup.
-3. Pair with P0-7 (client replay) so the two ends give end-to-end at-least-once + idempotent.
+3. ✅ **P0-7 (client replay + ingress dedupe + ack) is already built** — the two ends already give
+   end-to-end at-least-once + idempotent for the *client-reconnect* case. P2-4 adds only the
+   agent-side durability (spool/JetStream) so an agent-down window doesn't lose the message.
+
+The **JetStream-vs-disk-spool decision stays deferred** (it touches the whole NATS topology — see
+memory `nats-cutover-plan`).
 
 **Acceptance.** A message sent while the agent is restarting is processed once the agent is back —
 not lost — and a crash mid-turn re-processes on restart without duplication.

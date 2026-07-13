@@ -9,12 +9,14 @@
 > **Reference channel.** Telegram extension at `/Users/mircorn/workspace/openclaw/extensions/telegram/src/`.
 > **openclaw core** (peer dep, sibling checkout): `/Users/mircorn/workspace/openclaw/src/`.
 >
-> **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-10 (post-#14/#15/#16/#19 tree).** The integrated
-> showcase demo rewrote the demo surface (now `demo/web/src/widget.ts` over the `WebChannelNATSClient`
-> reducer). **P1-7 (error/reconnect UX) is mostly built** by that work (marked ✅).
-> Markdown/media/reasoning/doctor remain open. Note (#14): the plugin now has a **partial-mode
-> answer-text stream** (`streaming.mode:"partial"`, `inbound.ts:124-126`) — P1-3's reasoning lane
-> would build on that existing stream, not a net-new one.
+> **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-13 (post-#24…#33 tree).** The integrated showcase
+> demo rewrote the demo surface (now `demo/web/src/widget.ts` over the `WebChannelNATSClient` reducer),
+> and the parity stack has since landed several P1 items. **Now built:** **P1-1 markdown (#27)**,
+> **P1-7 error/reconnect UX** (mostly), and **P1-8** (`/stop` control lane #25 + debounce/coalesce
+> #29) — all marked ✅. **Still open:** P1-2 long-response, P1-3 reasoning lane (now **unblocked** —
+> its deps P1-1 + P0-5 partial are met), P1-4 media, P1-6 doctor, P1-7 finer wording, P1-9 unsend.
+> Note (#14): the plugin has a partial-mode answer-text stream (`streaming.mode:"partial"`, exercised
+> in the demo) — P1-3's reasoning lane builds on that existing stream, not a net-new one.
 >
 > **⚠️ Line numbers drift.** The demo is still being built, so `file:line` anchors are approximate
 > and keep moving — trust the file + symbol name and search if a line has shifted. Not re-anchored
@@ -40,55 +42,49 @@ IR and the button/media *shapes*, not the chunking/nesting machinery.
 
 **Where P1 renders now.** All client render lands in the reducer
 (`packages/client/src/nats-client-wrapper.ts`) + the widget `render(state)`
-(`demo/web/src/widget.ts:100-148`). New signals add a reducer `case`, a `WebChannelState` field
-(`packages/client/src/types.ts:74-94`), and a `render` branch.
+(`demo/web/src/widget.ts`). New signals add a reducer `case`, a `WebChannelState` field
+(`packages/client/src/types.ts:123-165`), and a `render` branch.
 
 ---
 
-## P1-1 — Rich text / markdown rendering — 🔴 MISSING
+## P1-1 — Rich text / markdown rendering — ✅ BUILT
 
-**Symptom.** Agent replies render as raw plain text — code blocks, lists, links, bold, tables show
-as literal markdown.
+**Symptom (original).** Agent replies rendered as raw plain text — code blocks, lists, links, bold,
+tables showed as literal markdown.
 
-**Classification.** 🔴 Missing (client renders plain text; no server change needed — markdown is
-already in the `agent_message` text).
+**Classification.** ✅ Built (#27). Agent bubbles render sanitized markdown DOM; user bubbles stay
+plain text. No server change (markdown was already in the `agent_message` text).
 
 **Where it stands today.**
-- The agent's reply text is markdown (openclaw agents emit markdown); it arrives intact in
-  `agent_message.text` and the reducer stores it verbatim (`nats-client-wrapper.ts:569`).
-- **The widget renders it as a text node:** `demo/web/src/widget.ts:146-158` builds each bubble with
-  `[m.text]` (`:156`) as a child (`white-space:pre-wrap`, `:150`), so all markup is literal.
-  `ChatMessage` only carries `text` (`types.ts:22-28`).
+- New module `demo/web/src/markdown.ts` (543 lines): `renderMarkdown(text)` walks a block tree into
+  real elements. Rendered at `widget.ts:201` `renderMarkdown(m.text)` for **agent bubbles only** —
+  user bubbles stay plain text (`:197-198`). Supports headings, fenced code with a copy button,
+  lists, tables, blockquotes, hr, inline marks, and links.
+- **Sanitize-by-construction:** the module builds text nodes and elements only, **never `innerHTML`**
+  (`markdown.ts:11`). `isSafeUrl` (`:52`) allows only `http`/`https`/`mailto`; relative, `//`,
+  `javascript:`, and `data:` URLs fall back to plain text; images are never rendered as media.
+- **Bounds:** a 20k-char parse cap (`MARKDOWN_RENDER_MAX_CHARS`, `:514`, `renderMarkdown` `:528-532`)
+  guards the O(n²) inline scan and falls back to plain text past it; a per-bubble memo cache
+  (`widget.ts:110`, `mdCache`) avoids re-parsing on every render pass.
 
-**Telegram reference (content model — NOT the transport limits).**
-- `format.ts:158` `markdownToTelegramHtml()` / `:1132` `markdownToTelegramRichHtml()`.
-- The reusable IR lives in **`openclaw/plugin-sdk/text-chunking`**: `markdownToIR()`,
-  `renderMarkdownIRChunksWithinLimit()`, `findCodeRegions()`. Telegram wraps this in Telegram-HTML;
-  we'd render the same IR to **real DOM**.
-- `format.ts:733` `sanitizeTelegramRichHtml()` — the sanitize policy reference.
-- Telegram's `rich-message.ts` nesting/entity-limit machinery is **transport-specific — skip it.**
+> **Decision record — core-IR path REJECTED; hand-rolled zero-dep won.** The sketch preferred reusing
+> `openclaw/plugin-sdk/text-chunking` `markdownToIR()` *if bundle-feasible*. It is **not**: that
+> module's transitive graph pulls `node:module` / `createRequire` and won't browser-bundle
+> (`markdown.ts:13-16` header). Rather than pull in a third-party markdown lib as the anticipated
+> fallback, the implementation is a **standalone hand-rolled zero-dependency** parser/renderer — no
+> `openclaw` dependency added to the deliberately-Node-free client/demo bundle (see memory
+> `openclaw-plugin-dependency`).
 
-**Implementation sketch.**
-1. Pick a markdown renderer:
-   - **Reuse core IR:** import `openclaw/plugin-sdk/text-chunking` `markdownToIR()`, walk the IR, emit
-     DOM. Guarantees parity with other channels. **Preferred ONLY IF bundle feasibility is verified
-     first** — ⚠️ the client package is deliberately openclaw-free and browser-safe (`openclaw` is
-     the *plugin's* Node-side peer dep; see memory `openclaw-plugin-dependency`). This path adds
-     `openclaw` as a *client-package* dependency and needs the transitive graph of `text-chunking`'s
-     re-exports to be node-free and tree-shakeable — **unverified**. Do a 30-minute esbuild spike
-     before committing; if it fails or bloats, fall back to the standalone lib.
-   - **Standalone lib:** a small sanitizing markdown→HTML lib.
-2. In `widget.ts`, replace the `[m.text]` text child with a `renderMarkdown(text)` producing
-   sanitized HTML for `m.role !== "user"` bubbles (keep user bubbles plain).
-3. **Sanitize.** Agent output is semi-trusted but may contain injected content from tools/web.
-   Allowlist tags (`p, code, pre, strong, em, a, ul, ol, li, blockquote, table…`); strip `script`,
-   event handlers, `javascript:` URLs.
-4. Code blocks: monospace + copy button; syntax highlight is P1-optional.
+**Telegram reference (content model — NOT the transport limits).** `format.ts:158`
+`markdownToTelegramHtml()`; the IR in `openclaw/plugin-sdk/text-chunking`; sanitize policy
+`format.ts:733` `sanitizeTelegramRichHtml()`. Telegram's `rich-message.ts` nesting/entity-limit
+machinery is transport-specific — correctly skipped.
 
-**Acceptance.** Fenced code, inline code, bold/italic, links, lists, tables render as formatted HTML;
-no raw `**`/backticks leak; no XSS from a crafted reply (`<img src=x onerror=alert(1)>` → inert).
+**Acceptance (met).** Fenced code, inline code, bold/italic, links, lists, tables render as formatted
+HTML; no raw `**`/backticks leak; a crafted reply (`<img src=x onerror=alert(1)>`) is inert (text
+nodes only, no `innerHTML`).
 
-**Note.** Unblocks P0-3 command output (`/help` is markdown) and P1-3 (reasoning blocks). Do it early.
+**Note.** Unblocks P0-3 command output (`/help` is markdown) and P1-3 (reasoning blocks).
 
 ---
 
@@ -120,16 +116,17 @@ the layout, and streaming growth doesn't yank the viewport.
 
 **Symptom.** Model "thinking" (when present) is dumped inline with the answer or lost.
 
-**Classification.** 🔴 Missing. Needs a server decision (emit reasoning separately) + client render
-(collapsible lane).
+**Classification.** 🔴 Missing — but **now unblocked.** Its dependencies (P1-1 markdown ✅ and P0-5
+partial ✅, exercised in the demo) are met, so this is the top remaining P1 lift. Needs a server
+decision (emit reasoning separately) + client render (collapsible lane).
 
-**Where it stands today.** Post-#14 the plugin already streams **answer text** in `"partial"` mode
-(`inbound.ts:124-126`, `onPartialReply` → `draft.pushAnswerText`), but there is still **no
-reasoning/answer split** — reasoning is not separated from the answer stream. Both `partial`
-(answer) and `progress` (tool lines) share the single `progress` frame and one working draft (reducer
-`case "progress"`, `nats-client-wrapper.ts:557`). A reasoning lane would build **on top of** that
-existing partial stream (a separate reasoning frame/field feeding a collapsible lane), not a new
-stream from scratch.
+**Where it stands today.** The plugin already streams **answer text** in `"partial"` mode
+(`inbound.ts:124-136`, `onPartialReply` → `draft.pushAnswerText`) — exercised in the demo since P0-5
+set `streaming.mode:"partial"` — but there is still **no reasoning/answer split**: reasoning is not
+separated from the answer stream. Both `partial` (answer) and `progress` (tool lines) share the
+single `progress` frame and one working draft (reducer `case "progress"`, `nats-client-wrapper.ts:557`).
+A reasoning lane builds **on top of** that existing partial stream (a separate reasoning frame/field
+feeding a collapsible lane), not a new stream from scratch.
 
 **Telegram reference.**
 - `reasoning-lane-coordinator.ts:68` `splitTelegramReasoningText()` — splits `{reasoningText,
@@ -271,18 +268,17 @@ rejection) were hard to distinguish from transient ones.
   jitter).
 - **Terminal vs transient classified:** `WebChannelNatsClient` treats PoP/NKEY registration failure
   as terminal (tears down, no retry) and distinguishes it from a transient
-  `Authentication Timeout` / `Permissions Violation` (the `-ERR` classifier at `nats-client.ts:542`;
-  `authorization violation` / `authentication expired` → terminal `failTerminally` (`:551`, def
-  `:629`), while timeout/cancelled/permissions stay transient), surfacing via `onError`.
-- **Wrapper maps it to state:** `nats-client-wrapper.ts:103-105` `onError` → `status:"error"` +
-  `error` message; `onState` → `connected`/`reconnecting` (guards against a trailing `onState(false)`
-  downgrading a terminal error, `:89-95`).
+  `Authentication Timeout` / `Permissions Violation` via the `-ERR` classifier at
+  `nats-client.ts:588-596`: `authorization violation` / `authentication expired` → terminal
+  `failTerminally`, while timeout/cancelled/permissions stay transient. Surfaces via `onError`.
+- **Wrapper maps it to state:** `onError` → `status:"error"` + `error` message; `onState` →
+  `connected`/`reconnecting` (guards against a trailing `onState(false)` downgrading a terminal
+  error).
 - **Widget renders distinct states:** a status pill (`connecting…`/`connected`/`reconnecting…`/
-  `error`, `widget.ts:23-28,119-124`), and on `status==="error"` a distinct **"Credentials expired"**
-  box with a one-click **Re-authenticate** button that mints a fresh credential
-  (`widget.ts:127-133`); input/send disabled while terminal.
-- `ConnectionStatus` union in the type (`types.ts:79`); `WebChannelState.error` carries the reason
-  (`types.ts:98`).
+  `error`), and on `status==="error"` a distinct **"Credentials expired"** heading (`widget.ts:163`)
+  with a one-click **Re-authenticate** button that mints a fresh credential; input/send disabled
+  while terminal.
+- `ConnectionStatus` union in the type (`types.ts:115`); `WebChannelState.error` carries the reason.
 
 **Telegram reference.**
 - `network-errors.ts` — `isRecoverableTelegramNetworkError()` (`:305`), `readTelegramRetryAfterMs()`
@@ -290,95 +286,85 @@ rejection) were hard to distinguish from transient ones.
 - Reusable: **`openclaw/plugin-sdk/error-runtime`** (`formatErrorMessage`, `extractErrorCode`) —
   classifier building blocks; **`openclaw/plugin-sdk/runtime-env`** (`computeBackoff`).
 
-**Remaining polish (optional).**
-1. **Finer cause wording** — distinguish "auth failed — reload to re-login" (terminal) vs "network
-   blip — reconnecting" vs "rate-limited" using `error-runtime` helpers. The client already
-   distinguishes terminal vs transient internally; thread a cause tag into the callback so the widget
-   can label it more specifically than the current single "Credentials expired" copy.
-2. **Send-while-down** — pairs with P0-7; at minimum disable the send button + show "reconnecting…"
-   instead of silently dropping (the terminal case already disables send in the error box render at
-   `widget.ts:127-133`).
+**Remaining polish (still open).**
+1. **Finer cause wording** — `ErrorListener = (err: Error)` carries **no cause tag**
+   (`nats-client.ts:222`), the classifier lumps `authorization violation` + `authentication expired`
+   into one terminal message (`:588-596`), and the widget shows a single hardcoded "Credentials
+   expired" heading (`widget.ts:163`). Thread a cause tag into the callback so the widget can
+   distinguish "auth failed — reload to re-login" vs "network blip — reconnecting" vs "rate-limited"
+   using `error-runtime` helpers. This is the open P1-7 slice.
+2. **Send-while-down** — now covered by P0-7 (client replay ledger re-sends on reconnect); the
+   terminal case already disables send in the error-box render.
 
 **Acceptance (mostly met).** A network blip shows "reconnecting…"; a credential rejection shows a
 distinct terminal message with a recovery action (✅). Finer per-cause wording is the open slice.
 
 ---
 
-## P1-8 — Turn control: `/stop` abort + inbound debounce/coalesce — 🔴 MISSING
+## P1-8 — Turn control: `/stop` abort + inbound debounce/coalesce — ✅ BUILT (both halves)
 
-**Symptom.** While the agent is streaming a long turn there is no way to stop it, and a follow-up
-message can't be merged into the in-flight turn — each becomes its own serialized turn. Typing
-`/stop` does **not** interrupt: it is queued *behind* the very turn it means to abort.
+**Symptom (original).** While the agent streamed a long turn there was no way to stop it, and a
+follow-up message couldn't be merged into the in-flight turn. Typing `/stop` did **not** interrupt —
+it queued *behind* the very turn it meant to abort.
 
-**Classification.** 🔴 Missing. The core abort **primitive exists** and our turns are abortable in
-principle, but nothing on our side delivers the abort out-of-band, and there is no message
-coalescing. This is a **Telegram parity gap** (Telegram has both).
+**Classification.** ✅ Built — the `/stop` control lane (P1-8a, #25) and the two-layer
+debounce/coalesce (P1-8b, #29). Both close a Telegram parity gap.
 
-**Where it stands today — why `/stop` is not "already there".**
-- Every `user_message` is enqueued with **no content inspection**:
-  ```js
-  // packages/plugin/index-nats.ts:510-513
-  channel.setMessageHandler((peerId, message) => {
-    if (message.type !== "user_message") return; // approvals routed below
-    dispatchInbound(peerId, message);        // → per-session FIFO, unconditionally
-  });
-  ```
-- The FIFO chains each turn off the previous (`inbound-queue.ts`
-  `createSerializedInboundDispatcher`): `const settled = previous.then(() => handler(...))`. So a
-  `/stop` sent mid-turn waits for the running turn to **finish** before it is processed → by then
-  `abortReplyRunBySessionId` has nothing to abort → no-op.
-- **The core primitive is present and reachable:** `abortReplyRunBySessionId(sessionId)`
-  (`openclaw/src/auto-reply/reply/reply-run-registry.ts:745`); `/stop` is a core text command
-  (`commands-registry.shared.ts:699`), and our turns register in the reply-run-registry because they
-  run through `channelRuntime.inbound.run` (`inbound.ts:49`). The **only** missing piece is an
-  out-of-band delivery path (a queue bypass) so the abort reaches core while the turn is still live.
-- There is **no control-lane / abort fast-path anywhere in our plugin** (no `isAbortRequestText`, no
-  bypass — verified). Telegram *builds* its own control lane; core does not hand us one for free.
-- **No coalescing:** consecutive `user_message`s always become separate serialized turns; there is no
-  debounce/batch step.
+### P1-8a — `/stop` abort (control lane)
 
-**Telegram reference (the model to adopt, adapted).**
-- **Control lane / abort bypass:** `sequential-key.ts:73-74` — "`/stop@bot` still needs the control
-  lane so it can cancel a busy turn"; abort vocabulary `abort-primitives.ts:72` `isAbortRequestText`
-  (matches `/stop` + natural-language abort triggers).
-- **Reply fence (interrupt semantics):** `telegram-reply-fence.ts:206`
-  `shouldSupersedeTelegramReplyFence`. Note the **direct-chat default** (`:224-233`): a plain
-  follow-up in a DM returns `false` = *non-interrupting = queued* — **the same behavior we already
-  have.** Only authorized commands (`/stop`, explicit `/…`) supersede in DMs; plain messages
-  supersede only in *group* chats (`:234`). So parity here is **not** "auto-interrupt on every
-  message" — it is specifically the `/stop` control path + coalescing.
-- **Debounce/coalesce:** `bot-handlers.debounce-key.ts` (`buildTelegramInboundDebounceKey`,
-  `debounceLane`) — rapid same-sender/same-conversation messages are batched before the turn runs.
+- **Pre-enqueue control lane.** `src/control-lane.ts` `isControlLaneMessage()` is checked in
+  `setMessageHandler` **before** the debouncer/FIFO (`index-nats.ts:724-822`); a matching frame is
+  dispatched fire-and-forget as a control-lane turn `handleInboundMessage(..., {controlLane:true})`
+  (`:788-799`), so core's `tryFastAbortFromMessage` runs while the turn is still live (core runs it
+  before its per-session busy gate, so it never collides with the one-turn-per-session FIFO
+  invariant).
+- **Abort vocabulary.** `isControlLaneMessage` matches `isAbortRequestText`
+  (`openclaw/plugin-sdk/command-primitives-runtime`) = `/stop` **plus** the natural-language abort
+  vocabulary ("stop", "abort", "wait", …). The full vocabulary all aborts, for core/Telegram parity.
+- **Control-lane turns** stamp `access.commands.authorized:true` (`inbound.ts:215-223`), hedged
+  through `commandGate` (`index-nats.ts:814-820` / `src/command-gate.ts` — the allowlist trap: core
+  ignores our stamp when a commands/owner allowlist is configured); they run **draftless** and skip
+  typing (`inbound.ts:136,183`). A started working draft is finalized when the run resolves without a
+  final delivery (`inbound.ts` on-settle path); core's own `/stop` turn delivers "⚙️ Agent was
+  aborted."
+- **Client Stop button.** `widget.ts:182-186` flips the primary button to **Stop** while `isTyping ||
+  any m.working`; clicking it sends the literal `/stop` as a `user_message` (`:381-386`), so the
+  typed command and the button share one path.
 
-**Implementation sketch.**
-1. **`/stop` abort (out-of-band).** In `channel.setMessageHandler` (`index-nats.ts:510-513`),
-   **before** `dispatchInbound`, check `isAbortRequestText(message.text)` (import from
-   `openclaw/plugin-sdk/reply-runtime`, re-exported from `command-primitives-runtime`). If true:
-   resolve the session key (`resolveWebchannelSessionRoute`, as `inbound.ts:145`) and call
-   `abortReplyRunBySessionId(sessionKey)` **without enqueuing**. Optionally finalize the in-flight
-   working draft via the existing on-error finalize path (the `catch` block at `inbound.ts:309-333`,
-   `draft.finalize` `:321`) with a "⏹ stopped" text.
-2. **Client "Stop" affordance.** In `demo/web/src/widget.ts`, while `state.isTyping` or a working
-   draft exists, toggle the Send button to **Stop**; on click call a new
-   `client.stop()` on the wrapper (`nats-client-wrapper.ts`) that sends a stop signal. **Wire
-   choice:** either (a) send the literal `/stop` as a `user_message` (server detects it via step 1 —
-   also makes *typed* `/stop` work) — recommended, no new frame; or (b) a dedicated
-   `{ type:"cancel" }` outbound frame (`types.ts:153` union) handled identically before enqueue.
-   Prefer (a) so typed `/stop` and the button share one path.
-3. **Debounce/coalesce (server-side).** Give the queue a per-session **pending-input buffer**: while
-   a turn runs, accumulate subsequent plain `user_message` texts; on turn completion, flush the
-   buffer as **one** turn input (mirrors Telegram's debounce-before-run). This requires the queue to
-   hold message *content* (today it holds an opaque promise chain) — the same buffer P1-9 Option B
-   needs, so **build them together if going server-side.** A lighter alternative is a **client-side**
-   debounce in the widget (hold rapid sends ~250–400ms, concat, then publish once).
+> **Decision record — /stop wire choice (a), and explicit-`/stop`-only buffer drop.**
+> - **Wire choice (a)** (send the literal `/stop` as a `user_message`, server detects it) was chosen
+>   over (b) a dedicated `{type:"cancel"}` frame — no new frame, and typed `/stop` and the button
+>   share the same path (`control-lane.ts` header).
+> - **Explicit-`/stop`-only buffer drop.** The *destructive* buffer drop (`inboundDebouncer.cancelKey`
+>   + `inboundDispatcher.clearPending`, `index-nats.ts:773-781`) is gated by `isExplicitAbortCommand`
+>   (`text === "/stop"` only, `control-lane.ts:56-61`), **not** the broader `isControlLaneMessage`.
+>   Rationale: the NL vocabulary ("wait", "stop please") must still ABORT the running turn but must
+>   NOT destroy a user's queued follow-up — a false-positive there should cost at most a spurious
+>   abort, never a lost message. The drop is further gated by `shouldDropBufferedInputOnStop` (`:97`)
+>   = `!gate.delegated || gate.isListed(peerId)`, biased toward NOT dropping when the abort may be a
+>   no-op (allowlist trap), so a peer whose turn keeps running never loses buffered input.
 
-**Acceptance.** Mid-stream, clicking **Stop** (or typing `/stop`) aborts the running turn within one
-step and finalizes the draft as stopped — it does **not** wait for the turn to complete. Firing two
-messages in quick succession produces **one** coalesced turn, not two serialized turns.
+### P1-8b — debounce / coalesce (two layers)
 
-**Scope note.** The `/stop` half is **XS–S** (core primitive exists; only the pre-enqueue bypass +
-button are new). The coalesce half is **S–M** (queue needs a content buffer). They are independent —
-ship `/stop` first.
+- **(a) Pre-run debounce** reuses core's `createInboundDebouncer` (`index-nats.ts:659-713`), sitting
+  IN FRONT of the FIFO. Window from **global** core config
+  `messages.inbound.byChannel.webchannel ?? messages.inbound.debounceMs ?? 0` via
+  `resolveInboundDebounceMs` (default `0` = inert). ⚠️ This is a **top-level core key**, NOT under
+  `channels.webchannel` — the demo sets `"messages":{"inbound":{"byChannel":{"webchannel":300}}}`
+  (`run.sh:268`).
+- **(b) Busy-time coalesce** is always-on in `src/inbound-queue.ts`: a message arriving while a
+  session turn RUNS buffers in `pending`, and on settlement the buffer merges into ONE follow-up turn
+  (`startCoalesceTurn`, `coalesceUserMessages` joins texts with `"\n\n"`). Introspection
+  `pendingBuffered` / `clearPending` (the latter used by `/stop`'s buffer drop).
+
+**Telegram reference (the model adopted, adapted).** Control lane `sequential-key.ts:73-74`; abort
+vocabulary `abort-primitives.ts:72` `isAbortRequestText`; reply-fence direct-chat default
+`telegram-reply-fence.ts:224-233` (a plain DM follow-up is non-interrupting = queued — same as us);
+debounce `bot-handlers.debounce-key.ts`.
+
+**Acceptance (met).** Mid-stream, clicking Stop (or typing `/stop`) aborts the running turn within one
+step and finalizes the draft as stopped — it does not wait for the turn to complete. Two messages in
+quick succession produce **one** coalesced turn.
 
 ---
 
@@ -395,12 +381,15 @@ reply-chain cache; it never dequeues a pending turn. Because **we own the browse
 offer genuine retraction — a superset of Telegram. Distinct from P1-8: retraction targets a
 **not-yet-started** queued message; aborting the **in-flight** turn is P1-8.
 
-**Where it stands today.**
-- The widget publishes immediately: `widget.ts:216-221` `submit()` → `client.send(text)` →
-  `nats-client-wrapper.ts:131` → publishes over NATS at once. Nothing is held locally.
-- Queueing happens **server-side** (`inbound-queue.ts` per-session FIFO). Once published, the message
-  is committed to that chain and there is **no dequeue signal** (`types.ts:153` outbound union has
-  only `user_message` / `approval_decision` / `load_history`).
+**Where it stands today (nothing built — sends go straight through).**
+- The widget publishes immediately: `submit()` → `client.send(text)` → the wrapper publishes over
+  NATS at once. Nothing is held locally; there is no pending chip and no retract control.
+- Queueing happens **server-side** (`inbound-queue.ts` per-session FIFO / the P1-8b coalesce buffer).
+  The outbound union has no `retract` frame (`user_message` / `approval_decision` / `load_history` /
+  `load_commands` only), so once published a message is committed to the chain.
+- **Note:** P1-8b already gave the queue a content buffer (`src/inbound-queue.ts` `pending` +
+  `clearPending`) — the same server-side buffer Option B below needs. So Option B's prerequisite now
+  exists; only the `retract` frame + a by-id dequeue would be net-new.
 
 **Telegram reference.** None — this affordance does not exist in Telegram (see Classification). This
 item is scoped from our own transport, not benchmarked.
@@ -432,20 +421,18 @@ costs no E2E/server work, and stays purely in `demo/web/src/widget.ts` + a small
 
 | Order | Gap | Effort | Depends on |
 |---|---|---|---|
-| 1 | P1-8a `/stop` turn abort | XS–S | — (core `abortReplyRunBySessionId` exists; add pre-enqueue bypass + Stop button) |
+| 1 | P1-3 reasoning lane | M | P1-1 ✅ + P0-5 ✅ **now met — unblocked, top lift** |
 | 2 | P1-9 pending-message retraction (unsend) | S | — (Option A: client hold, no server/wire change) |
-| 3 | P1-1 markdown rendering | S–M | — (unblocks P0-3 output, P1-3) |
-| 4 | P1-7 finer error wording | XS | — (mechanics + terminal UX already built) |
+| 3 | P1-7 finer error wording | XS | — (mechanics + terminal UX already built; thread a cause tag) |
+| 4 | P0-3 argument menus | S | — (catalog entries already carry `args.choices`; render dropdowns) |
+| 5 | P1-2 long-response polish | S | P1-1 ✅ |
+| 6 | P1-6 doctor | M | — (factor existing `index-nats` checks into a `ChannelDoctorAdapter`) |
+| 7 | P1-4 media | L (mini-project) | **DECIDED: object storage / blob endpoint** |
 | — | ~~P1-5 interactive buttons~~ | — | **MERGED into P0-4** (delta = generalize renderer + 2 wire frames) |
-| 5 | P1-8b inbound debounce/coalesce | S–M | queue content buffer (shared with P1-9 Option B) |
-| 6 | P1-3 reasoning lane | M | P1-1, P0-5 |
-| 7 | P1-6 doctor | M | — (factor existing `index-nats` checks) |
-| 8 | P1-2 long-response polish | S | P1-1, P0-5 |
-| 9 | P1-4 media | L (mini-project) | **DECIDED: object storage / blob endpoint** |
 
-> ✅ **Already built by the integrated demo:** P1-7 (error/reconnect UX — status pill, terminal
-> "Credentials expired" + re-auth, terminal-vs-transient classification). Remaining P1-7 = finer
-> per-cause wording only.
+> ✅ **Already built:** P1-1 (markdown, #27), P1-7 (error/reconnect UX — status pill, terminal
+> "Credentials expired" + re-auth, terminal-vs-transient classification; finer per-cause wording is
+> the only remaining slice), P1-8a (`/stop` control lane, #25), P1-8b (debounce/coalesce, #29).
 
 **Resolved decisions (2026-07-02):**
 - **P1-4 media → object storage (blob endpoint).** See P1-4 above.

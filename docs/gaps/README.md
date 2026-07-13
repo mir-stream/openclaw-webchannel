@@ -6,16 +6,16 @@ close every gap. Each file lists gaps with *symptom → classification → curre
 `file:line`) → Telegram reference (`file:line`) → reusable `plugin-sdk` runtime → implementation
 sketch → acceptance*.
 
-> **⚠️ Re-anchored 2026-07-03 (post integrated-demo rebase); re-verified 2026-07-10.** This branch
-> was rebased onto the nearly-finished **integrated showcase demo**, which *rewrote the entire demo
-> surface*. Most of what P0 originally described as unrendered "wiring gaps" is now **built** — the
-> demo no longer uses the thin `runDemo` path; it drives the production `WebChannelNATSClient` state
-> reducer and already renders history, typing, approvals, streaming drafts, and terminal-error UX.
-> **Re-verified 2026-07-10 against the post-#14/#15/#16/#19 tree** — since the 07-03 anchoring,
-> develop merged **partial-mode answer-text streaming (#14)**, **approval-snapshot rehydration
-> (#15/#19)**, **ordered history merge (#16)**, and moved the register hop fully onto **NATS
-> request/reply** (the HTTP `registerHttpRoute` is gone). Those four areas are corrected below. See
-> **["What the integrated demo already closed"](#what-the-integrated-demo-already-closed)**.
+> **⚠️ Re-anchored 2026-07-03 (post integrated-demo rebase); re-verified 2026-07-13 (post-#24…#33
+> tree).** This branch was rebased onto the integrated showcase demo, which *rewrote the entire demo
+> surface*, and the P0/P1 parity stack has since **landed** — **P0 is now fully built except one
+> residual** (P0-3 argument menus), and several P1 items shipped too. The demo drives the production
+> `WebChannelNATSClient` state reducer and renders history, typing, approvals, streaming drafts,
+> markdown, slash-command discovery, and terminal-error UX. Since the 07-10 re-verify develop merged:
+> **P0-2 depth cap (#24)**; the P0/P1 parity stack **#25/#26/#28/#29/#30** = `/stop` control lane +
+> NATS typing gate + slash discovery + debounce/coalesce + ingress dedupe; **markdown (#27)**;
+> **client replay+ack (#31)**; and the **protocol-version handshake (#33)**. Those areas are corrected
+> below. See **["What the integrated demo already closed"](#what-the-integrated-demo-already-closed)**.
 >
 > **⚠️ Line numbers drift — trust the symbol, not the number.** The demo is still under active
 > development, so every `file:line` anchor in these docs is approximate and *will* keep moving. The
@@ -24,9 +24,9 @@ sketch → acceptance*.
 
 | File | Covers | Headline |
 |---|---|---|
-| [`P0_CORE_CHAT_GAPS.md`](P0_CORE_CHAT_GAPS.md) | history, slash commands, HITL approvals, streaming, typing, send reliability | **Mostly ✅ built by the integrated demo.** Client render is done via `nats-client-wrapper.ts` + `demo/web/src/widget.ts`. Remaining = **server-side** (P0-2 depth cap, P0-5 streaming flag, P0-6 typing gate) + **net-new** (P0-3 discovery, P0-7 idempotency). |
-| [`P1_RICH_UX_GAPS.md`](P1_RICH_UX_GAPS.md) | markdown rendering, long responses, reasoning lane, media, buttons, doctor, error UX, **turn control (P1-8)**, **pending-message retraction (P1-9)** | **P1-7 error/reconnect UX ✅ mostly built.** Markdown (P1-1) is still plain text; **P1-8 `/stop` abort + debounce** is a Telegram parity gap (`/stop` currently queues behind the running turn); **P1-9 unsend** is a web advantage Telegram lacks; **media (P1-4) is a mini-project**; reasoning/doctor still open. |
-| [`P2_ADVANCED_GAPS.md`](P2_ADVANCED_GAPS.md) | multi-conversation, reactions, edit/quote, ingress durability, throttle, audit, access depth | **Ingress durability (P2-4) matters most for our NATS transport** (loss, not dup). Multi-conversation is the biggest product lift. *(P2 unchanged — still backlog.)* |
+| [`P0_CORE_CHAT_GAPS.md`](P0_CORE_CHAT_GAPS.md) | history, slash commands, HITL approvals, streaming, typing, send reliability | **✅ P0 fully built except one residual.** Client render is done via `nats-client-wrapper.ts` + `demo/web/src/widget.ts`; the server-side halves (P0-2 depth cap #24, P0-5 streaming flag, P0-6 typing gate #26) and the net-new work (P0-3 discovery #30, P0-7 idempotency #30/#31) all landed. **Only P0-3 argument menus remain open.** |
+| [`P1_RICH_UX_GAPS.md`](P1_RICH_UX_GAPS.md) | markdown rendering, long responses, reasoning lane, media, buttons, doctor, error UX, **turn control (P1-8)**, **pending-message retraction (P1-9)** | **✅ P1-1 markdown, P1-7 error UX, and P1-8 `/stop`+debounce built.** Still open: **P1-3 reasoning lane** (now **unblocked** — its P1-1/P0-5 deps are met), **P1-9 unsend** (web advantage), **P1-2 long-response**, **P1-6 doctor**, **P1-7 finer wording**, and **media (P1-4) — a mini-project**. |
+| [`P2_ADVANCED_GAPS.md`](P2_ADVANCED_GAPS.md) | multi-conversation, reactions, edit/quote, ingress durability, throttle, audit, access depth | **Ingress durability (P2-4) matters most for our NATS transport.** P0-7 now covers the client-reconnect side; P2-4 narrows to **agent-down durability** (JetStream vs spool, still deferred). Multi-conversation is the biggest product lift. *(Rest of P2 unchanged — still backlog.)* |
 
 ## The current architecture (read this first — it changed)
 
@@ -34,8 +34,8 @@ There is **one production client path**, and the demo uses it.
 
 | Layer | File | Role |
 |---|---|---|
-| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS + E2E handshake + `onMessage`/`onError`/`onState`; terminal-vs-transient auth classification (`:551-556`, `failTerminally` `:629`). |
-| **State reducer wrapper** | `packages/client/src/nats-client-wrapper.ts` (`WebChannelNATSClient`) | reduces the full protocol into an immutable `WebChannelState { messages, approvals, status, isTyping }`; exposes `subscribe`/`getState`/`send`/`decide`/`loadHistory`. **This is the "Option 2 reducer" the old doc deferred — it now exists for the NATS path.** |
+| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS + E2E handshake + `onMessage`/`onError`/`onState`/`onProtocol`; terminal-vs-transient auth classification (`:588-596`); P0-7b replay ledger (`unackedLedger`/`flushQueue`/`drainAcked`). |
+| **State reducer wrapper** | `packages/client/src/nats-client-wrapper.ts` (`WebChannelNATSClient`) | reduces the full protocol into an immutable `WebChannelState { messages(+wireId/delivered), approvals, status, connected, isTyping?, commands?, agentProtocolVersion, agentPluginVersion, error? }` (`types.ts:123-165`); exposes `subscribe`/`getState`/`send`/`decide`/`loadHistory`/`loadCommands`. |
 | Demo widget | `demo/web/src/widget.ts` | `client.subscribe(render)` → renders bubbles, typing, approval cards, "Load older", terminal-error re-auth. |
 | **Retired** | `packages/client/src/browser-demo-entry.ts` (`runDemo`) | the old thin "drop everything but `agent_message`" path. **No longer the demo** — only a SaaS smoke test + `e2e/local/ci-smoke.html` still reference it. |
 
@@ -46,34 +46,42 @@ which glues together the split modules:
 | Concern | Module (current) |
 |---|---|
 | plugin registration + outbound seam | `src/channel.ts` (`createWebChannelPlugin` `:87`) |
-| NATS outbound frames | `src/nats-channel.ts` (`NatsChannel` — `sendText` `:352`, `sendProgress` `:375`, `finalizeDraft` `:383`, `sendTyping` `:390`, `sendHistory` `:398`, `sendApprovalRequest` `:406`, `sendApprovalResolved` `:432`, `sendApprovalSnapshot` `:473`) |
-| register hop + handler wiring | `packages/plugin/index-nats.ts` (**NATS request/reply — no HTTP**): `setRegisterRequestHandler` (wired `:638`), `setApprovalDecisionHandler` (`:530`), `setLoadHistoryHandler` (`:548`); the register success path sends **both** a history snapshot (`sendHistory`, detached read) **and** an approval snapshot (`sendApprovalSnapshot`, synchronous, `:668-673`) — stateless per register. |
-| inbound turn / streaming / typing | `src/inbound.ts` (streaming-mode resolve `:124-126`, `sendTyping` `:160`, `commandBody` `:200`) |
-| history store | `src/history.ts` (`resolveHistoryConfig` `:37`, `recent` `:182`, `pageBefore` `:213`) |
+| NATS outbound frames | `src/nats-channel.ts` (`NatsChannel` — `sendProgress` `:375`, `finalizeDraft` `:383`, `sendHistory` `:398`, `sendApprovalRequest` `:406`, `sendApprovalResolved` `:432`, `sendApprovalSnapshot` `:473`, `sendTyping` **gated** `:509-513`, `sendCommands` `:527-530`, `sendAck` `:539-543`) |
+| register hop + handler wiring | `packages/plugin/index-nats.ts` (**NATS request/reply — no HTTP**): `setRegisterRequestHandler` (wired `:638`), `setApprovalDecisionHandler` (`:530`), `setLoadHistoryHandler` (`:548`), `setLoadCommandsHandler` (`:917-925`); the register success path sends **both** a history snapshot (`sendHistory`, detached read) **and** an approval snapshot (`sendApprovalSnapshot`, synchronous, `:668-673`) — stateless per register. |
+| `/stop` control lane (P1-8a) | `src/control-lane.ts` (`isControlLaneMessage`, `isExplicitAbortCommand`, `shouldDropBufferedInputOnStop`) + `src/command-gate.ts` (allowlist-trap hedge) |
+| slash-command discovery (P0-3) | `src/commands-catalog.ts` (`buildCommandCatalog`, `createCommandCatalogProvider`) |
+| ingress dedupe + ack (P0-7a) | `src/ingress-dedupe.ts` (`filterFreshInboundItems`, `createIngressOnFlush`, `recordCancelledInboundItems`) |
+| protocol version (#33) | `src/protocol.ts` (`WEBCHANNEL_PROTOCOL_VERSION`, `readPluginVersion`) |
+| inbound turn / streaming / typing | `src/inbound.ts` (streaming-mode resolve `:124-136`, control-lane branch, `sendTyping` `:160`, `commandBody` `:200`) |
+| debounce / coalesce (P1-8b) | `src/inbound-queue.ts` (`coalesceUserMessages`, `startCoalesceTurn`, `clearPending`/`pendingBuffered`) + core `createInboundDebouncer` |
+| history store | `src/history.ts` (`resolveHistoryConfig` `:37`, `recent` `:182`, `planHistoryFetch` `:218-231`, `pageBefore` `:277-318`) |
 | multi-account multiplex | `src/multiplex.ts` (`planAccounts`) |
-| legacy WS transport (retained) | `src/transport.ts` (`typingEnabled`/`historyEnabled` gates `:193-201,:610-634`) |
+| legacy WS transport (retained) | `src/transport.ts` (`typingEnabled`/`historyEnabled` gates) |
 
 ## What the integrated demo already closed
 
-The demo config (`demo/run.sh:232-249`) ships `history.enabled:true` and `execApprovals` with
+The demo config (`demo/run.sh:268-291`) ships `history.enabled:true` and `execApprovals` with
 approvers, so these run **end-to-end** in the demo. The reducer (`nats-client-wrapper.ts`) handles
 every inbound frame; the widget renders each.
 
 | Gap | Status now | Where |
 |---|---|---|
-| **P0-1** history restore | ✅ **built** (client reduce + **ordered merge** + render; server snapshot from the register route, stateless). #16 replaced blanket-prepend with three-tier matching + anchor-cursor insertion; #15/#19 add an approval snapshot on the same register hop. | reducer `case "history"` `nats-client-wrapper.ts:209`; server snapshot in the register route (`index-nats.ts`) |
-| **P0-2** history pagination | 🟡 **UI + client + server handler built**; server **depth cap still open** | "Load older" `widget.ts:49,211`; `loadHistory` `:155`; cap `history.ts:221` |
+| **P0-1** history restore | ✅ **built** (client reduce + **ordered merge** + render; server snapshot from the register route, stateless). #16 three-tier matching + anchor-cursor; #15/#19 approval snapshot on the same hop. | reducer `case "history"` `nats-client-wrapper.ts:209`; server snapshot in the register route |
+| **P0-2** history pagination | ✅ **built** (#24): two-phase `pageBefore` to the 1000-msg ceiling + `planHistoryFetch` call-site fix; >1000-turn residual stays upstream-blocked | `pageBefore` `history.ts:277-318`; `planHistoryFetch` `:218-231` |
+| **P0-3** slash-command discovery | ✅ **built** (#30): server catalog (`load_commands`→`commands`) + client typeahead. **Residual: argument menus** | `commands-catalog.ts`; `sendCommands` `nats-channel.ts:527-530`; widget `cmdMenu` `:78`, `renderMenu` `:238` |
 | **P0-4** approval cards | ✅ **built** (card render + `decide`); **rehydration built** (#15/#19 `approval_snapshot` Legs A/B/C) | `renderApproval` `widget.ts:81`; reducer `:381/:421/:435`; `decide` `:145` |
-| **P0-5** streaming drafts | 🟡 **client render built** (mode-agnostic); **demo sets no `streaming.mode`** so neither `partial` (answer-text streaming) nor `progress` (tool lines) is exercised | reducer `case "progress"` `:557`; working bubble `widget.ts:150`; server gate `inbound.ts:124-126` |
-| **P0-6** typing indicator | ✅ **client built**; server **NATS gate still open** (`typing:"off"` ignored on NATS) | reducer `case "typing"` `:376`; `widget.ts:159`; ungated `nats-channel.ts:390` |
-| **P1-7** error / reconnect UX | ✅ **mostly built** (status pill + terminal "Credentials expired" + re-auth) | `widget.ts:119-133`; terminal classify `nats-client.ts:551-556` |
+| **P0-5** streaming drafts | ✅ **built** — demo sets `streaming.mode:"partial"` (`run.sh:287`), so answer-text streaming is exercised | reducer `case "progress"` `:557`; server gate `inbound.ts:124-136` |
+| **P0-6** typing indicator | ✅ **built** — client render + **NATS gate wired** (#26): `typing:"off"` now honored | reducer `case "typing"` `:376`; gate `nats-channel.ts:509-513` wired `index-nats.ts:590` |
+| **P0-7** send reliability | ✅ **built** (#30/#31): client replay ledger + server ingress dedupe + `ack` frame | `nats-client.ts` `unackedLedger`/`flushQueue`/`drainAcked`; `src/ingress-dedupe.ts`; `sendAck` `nats-channel.ts:539-543` |
+| **P1-1** markdown | ✅ **built** (#27): sanitized markdown DOM for agent bubbles (zero-dep, no `innerHTML`) | `demo/web/src/markdown.ts`; `renderMarkdown` at `widget.ts:201` |
+| **P1-7** error / reconnect UX | ✅ **mostly built** (status pill + terminal "Credentials expired" + re-auth); finer wording open | terminal classify `nats-client.ts:588-596`; heading `widget.ts:163` |
+| **P1-8** turn control | ✅ **built**: `/stop` control lane (#25, `control-lane.ts`) + debounce/coalesce (#29, `inbound-queue.ts`) | control lane `index-nats.ts:724-822`; Stop button `widget.ts:182-186,381-386` |
 
-**Still genuinely open** (net-new work, accurately described in the files): **P0-3** slash-command
-discovery, **P0-7** send idempotency/replay, **P1-1** markdown rendering (`widget.ts:156` `[m.text]`
-is still a plain text node), **P1-8** turn control (`/stop` abort + inbound debounce — Telegram
-parity; `/stop` currently queues behind the running turn at `index-nats.ts:510-513`), **P1-9**
-pending-message retraction / unsend (web advantage — no Telegram equivalent), **P1-2/3/4/6**, and the
-**server-side** halves of P0-2/P0-5/P0-6.
+**Still genuinely open** (accurately described in the files): **P0-3** argument menus (the only P0
+residual), **P1-2** long-response, **P1-3** reasoning lane (now **unblocked** — P1-1 + P0-5 met),
+**P1-4** media (mini-project), **P1-6** doctor, **P1-7** finer error wording, **P1-9** pending-message
+retraction / unsend (web advantage — no Telegram equivalent), and **all of P2** (with P2-4 now
+narrowed to agent-down durability — see below).
 
 ## Classification legend
 
@@ -89,41 +97,38 @@ pending-message retraction / unsend (web advantage — no Telegram equivalent), 
    (`demo/web/src/widget.ts`) subscribes to it. The old "two paths / thin `runDemo` drops 90%"
    framing is **obsolete**.
 
-2. **Server defaults are ON.** `packages/plugin/openclaw.plugin.json` ships `history.enabled:true`
-   (`:174-178`), `capabilities.typing:"on"` (`:167-170`), `execApprovals`/`inlineButtons`
-   (`:137/:163`), and a `streaming.mode` option (`off|partial|block|progress`, enum `:110`) that has
-   **no default** and is **not set by the demo** (P0-5). Post-#14 the two draft modes differ:
-   `"partial"` streams the **answer text** into the working draft (the "typing out" / Telegram-parity
-   effect, superset of progress), while `"progress"` streams **tool/item lines only** and finalizes
-   the answer atomically (`inbound.ts:124-126`). (Nit: the manifest help text at `:285-287` still
-   describes `"progress"` as the draft "that becomes the answer" — post-#14 that describes `partial`;
-   a one-line product-string fix that does not belong on this docs-only branch.)
+2. **Server defaults are ON, and the demo sets `partial`.** `packages/plugin/openclaw.plugin.json`
+   ships `history.enabled:true` (`:174-178`), `capabilities.typing:"on"` (`:167-170`),
+   `execApprovals`/`inlineButtons` (`:137/:163`), and a `streaming.mode` option
+   (`off|partial|block|progress`, enum `:110`) with **no manifest default** — but the demo now **sets
+   `streaming.mode:"partial"`** (`run.sh:287`, P0-5). The two draft modes differ: `"partial"` streams
+   the **answer text** into the working draft (the "typing out" / Telegram-parity effect, superset of
+   progress), while `"progress"` streams **tool/item lines only** and finalizes the answer atomically
+   (`inbound.ts:124-136`). Setup-wizard nit remains: it does not offer `streaming.mode` (enroll-only).
 
-3. **Slash commands already execute.** Traced through openclaw core
-   (`commands-text-routing.ts:40-48`): text commands are on by default and WebChannel is not a
-   native-command surface (`channel.ts:103` declares no `nativeCommands`), so `/help` typed in the
-   browser already runs. **P0-3 is discovery-only.**
+3. **Slash commands both execute AND are discoverable.** Execution always worked — text commands are
+   on by default and WebChannel is not a native-command surface (`channel.ts:115` declares no
+   `nativeCommands`), so `/help` typed in the browser runs (core `commands-text-routing.ts:40-48`).
+   **Discovery is now built too** (#30): a `load_commands`→`commands` catalog (config-filtered, from
+   `native-command-registry`) feeds a widget typeahead. The only P0-3 residual is **argument menus**.
 
-## Server-side items still valid after the refactor
+## Server-side items — now FIXED after the refactor
 
-Re-verified 2026-07-10 against the current tree:
+The three server-side gaps this section previously tracked as open have all landed. Re-verified
+2026-07-13:
 
-1. **P0-2 depth cap** — `pageBefore` (`history.ts:213-235`): the SDK seam
-   (`runtime.subagent.getSessionMessages`) has no `before` cursor, so it always fetches only the
-   newest `limit*2` messages (`fetchLimit` `:221`); pagination silently stops after ~2 pages, and the
-   cursor-miss fallback `window.slice(-limit)` (`:233`) returns the *newest* slice while the comment
-   (`:205/:231`) claims *oldest*. Client dedup hides it as "load-more stops".
-2. **P0-6 typing gate** — the gate lives only on the legacy WS transport
-   (`transport.ts:193/:360/:610` `typingEnabled`). `NatsChannel` (`nats-channel.ts`) has **no gate field**
-   and `NatsChannel.sendTyping` (`:390`) is ungated; `index-nats.ts` never wires one. So
-   `capabilities.typing:"off"` is **silently ignored on the NATS path** (the `inbound.ts:156-157`
-   comment "the transport gates the frame" is only true for the WS transport).
-3. **P0-5 streaming flag** — `demo/run.sh` sets no `streaming` config (the account block at
-   `:273-291` has `history`/`execApprovals`/`auth`/`dmSecurity` but no `streaming.mode`), so
-   `resolveStreamingMode(...)` yields the no-draft fallback (`inbound.ts:124-126`) in the demo. The
-   client render is mode-agnostic and ready, but the demo never emits `progress` frames. To exercise
-   the answer-text "typing out" effect the section's acceptance describes, set
-   `streaming.mode:"partial"` (`"progress"` streams tool-lines only).
+1. **P0-2 depth cap** — ✅ FIXED (#24). `pageBefore` (`history.ts:277-318`) is now a two-phase fetch
+   that widens to the 1000-message upstream ceiling (`MAX_FETCH_WINDOW`) when the small window can't
+   yield a full page, and returns an **empty page** (not the old newest-N `slice`) on a genuine
+   cursor miss. The live-path call-site bug (whole request object passed as `beforeId`) is fixed via
+   `planHistoryFetch` (`:218-231`). Residual: conversations >1000 turns stay upstream-blocked.
+2. **P0-6 typing gate** — ✅ FIXED (#26). `NatsChannel` now has a `typingEnabled` field (`:249`) +
+   `setTypingEnabled()` (`:502-504`); `sendTyping` (`:509-513`) is gated; wired at
+   `index-nats.ts:590` from `resolveTypingEnabled(account)` (`account-config.ts:271-276`). So
+   `capabilities.typing:"off"` is now honored on NATS.
+3. **P0-5 streaming flag** — ✅ FIXED. `demo/run.sh:287` now sets `"streaming": { "mode": "partial" }`
+   in the account block, so `resolveStreamingMode(...)` enables the answer-text draft stream in the
+   demo (`inbound.ts:124-136`). Setup-wizard nit: it still doesn't offer `streaming.mode` (enroll-only).
 
 ## Reuse principle
 
@@ -147,7 +152,8 @@ as peer deps. The full runtime→gap map is at the bottom of `P2_ADVANCED_GAPS.m
 
 **Deferred (open — decide when P2 is scheduled):**
 - **P2-4 durability:** JetStream vs disk spool (touches NATS topology — see memory `nats-cutover-plan`).
-  Working lean: JetStream off + browser is hand-rolled NATS; recommendation is P0-7 client
-  replay+ack as primary, disk-spool optional. Not yet committed.
+  P0-7 client replay+ack **is now built** and covers the client-reconnect side, so P2-4 narrows to
+  agent-down durability (disk-spool / JetStream on the inbound subject). The transport decision is
+  still not committed.
 - **P2-1 threading:** per-thread session keying + wire changes. Recommendation is payload-level
   multiplex (subject wire unchanged). Not yet committed.
