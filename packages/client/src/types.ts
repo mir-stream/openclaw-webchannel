@@ -147,6 +147,21 @@ export type WebChannelState = {
    * typeahead menu renders. Replaced wholesale on each `commands` frame.
    */
   commands?: CommandCatalogEntry[];
+  /**
+   * The AGENT-plugin's wire-protocol version, learned from the register success
+   * reply (NATS path). `null` until a register completes, and STAYS null against
+   * a pre-v1 plugin whose reply omits the field (non-fatal — see the register
+   * policy in nats-client.ts). A value that DISAGREES with the client's
+   * `WEBCHANNEL_PROTOCOL_VERSION` never lands here: it is a TERMINAL error that
+   * moves `status` to `"error"` instead. Exposed for diagnostics (admin screen).
+   */
+  agentProtocolVersion: number | null;
+  /**
+   * The AGENT-plugin's package version string, reported in the register success
+   * reply for diagnosability. `null` until a register completes or against a
+   * pre-reporting plugin. Advisory only — never gates behavior.
+   */
+  agentPluginVersion: string | null;
 };
 
 /** A state-change subscriber. Receives the latest immutable snapshot. */

@@ -36,7 +36,9 @@ import {
   outboundSubject,
   handshakeSubject,
   registerSubject,
+  type ProtocolInfo,
 } from "./nats-client.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import {
   generateX25519KeyPair,
   unwrapConversationKey,
@@ -235,6 +237,11 @@ function registerAgentHandler(
   peerId: string,
   wrapped: () => WrappedConversationKey | null,
   gate?: Promise<void>,
+  // Optional wire-protocol version fields to include in the register reply (the
+  // protocol handshake). Omitted keys model a pre-v1 / pre-reporting plugin.
+  // protocolVersion is typed `number | string` (widened past the real wire type)
+  // so a test can inject a malformed string "2" from a buggy/third-party plugin.
+  versions?: { protocolVersion?: number | string; pluginVersion?: string },
 ): ServerHandler {
   const reg = registerSubject(TENANT, AGENT, peerId);
   return async (subject, payload, server, replyTo) => {
@@ -247,12 +254,12 @@ function registerAgentHandler(
     if (body.op === "register") {
       if (gate) await gate;
       const w = wrapped();
-      server.deliverToClient(
-        replyTo,
-        JSON.stringify(
-          w ? { peerId, registered: true, wrappedConversationKey: w } : { peerId, registered: true },
-        ),
-      );
+      const reply: Record<string, unknown> = w
+        ? { peerId, registered: true, wrappedConversationKey: w }
+        : { peerId, registered: true };
+      if (versions?.protocolVersion !== undefined) reply.protocolVersion = versions.protocolVersion;
+      if (versions?.pluginVersion !== undefined) reply.pluginVersion = versions.pluginVersion;
+      server.deliverToClient(replyTo, JSON.stringify(reply));
     }
   };
 }
@@ -640,5 +647,157 @@ describe("unwrapConversationKey conformance (agent wrap ↔ browser unwrap)", ()
       "peer-A",
     );
     expect(Buffer.from(ok).equals(Buffer.from(K))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wire-protocol version handshake (client policy on the register reply)
+// ---------------------------------------------------------------------------
+
+describe("WebChannelNatsClient — register protocol-version handshake", () => {
+  it("match: reply carries protocolVersion=1 + pluginVersion → onProtocol exposes both, session establishes", async () => {
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const { client, deviceKP } = await makeClient(agentId.publicB64url);
+
+    const infos: ProtocolInfo[] = [];
+    client.onProtocol((i) => infos.push(i));
+    const errors: Error[] = [];
+    client.onError((e) => errors.push(e));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    server.handler = registerAgentHandler(
+      PEER,
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      undefined,
+      { protocolVersion: WEBCHANNEL_PROTOCOL_VERSION, pluginVersion: "9.9.9" },
+    );
+    client.sendUserMessage("hello");
+    await settle();
+
+    expect(errors).toHaveLength(0);
+    expect(infos).toEqual([{ protocolVersion: 1, pluginVersion: "9.9.9" }]);
+    // Session still establishes: the buffered send flushed as ciphertext under K.
+    const sent = server.published.filter((p) => p.subject === inboundSubject(TENANT, AGENT, PEER));
+    expect(sent).toHaveLength(1);
+    expect(openMessage(sent[0].payload, K)).toMatchObject({ type: "user_message", text: "hello" });
+
+    client.disconnect();
+  });
+
+  it("absent (pre-v1 plugin): reply omits version fields → onProtocol exposes nulls, non-fatal", async () => {
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const { client, deviceKP } = await makeClient(agentId.publicB64url);
+
+    const infos: ProtocolInfo[] = [];
+    client.onProtocol((i) => infos.push(i));
+    const errors: Error[] = [];
+    client.onError((e) => errors.push(e));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    // No `versions` arg → reply has neither protocolVersion nor pluginVersion.
+    server.handler = registerAgentHandler(PEER, () =>
+      wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+    );
+    client.sendUserMessage("hello");
+    await settle();
+
+    expect(errors).toHaveLength(0);
+    expect(infos).toEqual([{ protocolVersion: null, pluginVersion: null }]);
+    expect(server.readyState).toBe(FakeNatsWS.OPEN);
+
+    client.disconnect();
+  });
+
+  it("mismatch: reply protocolVersion=2 → TERMINAL onError naming both versions, socket torn down, no key", async () => {
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const { client, deviceKP } = await makeClient(agentId.publicB64url);
+
+    const infos: ProtocolInfo[] = [];
+    client.onProtocol((i) => infos.push(i));
+    const errors: Error[] = [];
+    client.onError((e) => errors.push(e));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    server.handler = registerAgentHandler(
+      PEER,
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      undefined,
+      { protocolVersion: 2, pluginVersion: "2.0.0" },
+    );
+    client.sendUserMessage("never-sent");
+    await settle();
+
+    // Terminal: a two-sided diagnostic and a torn-down socket.
+    expect(infos).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain("client=1");
+    expect(errors[0].message).toContain("agent-plugin=2");
+    expect(server.readyState).toBe(FakeNatsWS.CLOSED);
+    // The mismatch is caught BEFORE key delivery — no session key, nothing sealed.
+    expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
+  });
+
+  it("malformed: reply protocolVersion='2' (string) → TERMINAL onError naming the received value, socket torn down, no key", async () => {
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const { client, deviceKP } = await makeClient(agentId.publicB64url);
+
+    const infos: ProtocolInfo[] = [];
+    client.onProtocol((i) => infos.push(i));
+    const errors: Error[] = [];
+    client.onError((e) => errors.push(e));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    // A buggy/third-party plugin sends the string "2" instead of the number 2.
+    // This must NOT silently degrade to "absent/pre-v1" and proceed.
+    server.handler = registerAgentHandler(
+      PEER,
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      undefined,
+      { protocolVersion: "2", pluginVersion: "2.0.0" },
+    );
+    client.sendUserMessage("never-sent");
+    await settle();
+
+    // Terminal, exactly like a mismatch: one onError naming the received type +
+    // value, no onProtocol emission, torn-down socket, nothing sealed.
+    expect(infos).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain("string");
+    expect(errors[0].message).toContain('"2"');
+    expect(server.readyState).toBe(FakeNatsWS.CLOSED);
+    expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
+  });
+
+  it("malformed: a numeric-string '1' is NOT coerced → also TERMINAL (presence with the wrong type is the offense)", async () => {
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const { client, deviceKP } = await makeClient(agentId.publicB64url);
+
+    const infos: ProtocolInfo[] = [];
+    client.onProtocol((i) => infos.push(i));
+    const errors: Error[] = [];
+    client.onError((e) => errors.push(e));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    // "1" would "match" WEBCHANNEL_PROTOCOL_VERSION if we coerced — we must not:
+    // a well-behaved v1 plugin sends the NUMBER 1, so a string is malformed.
+    server.handler = registerAgentHandler(
+      PEER,
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      undefined,
+      { protocolVersion: "1" },
+    );
+    client.sendUserMessage("never-sent");
+    await settle();
+
+    expect(infos).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain('"1"');
+    expect(server.readyState).toBe(FakeNatsWS.CLOSED);
+    expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
 });

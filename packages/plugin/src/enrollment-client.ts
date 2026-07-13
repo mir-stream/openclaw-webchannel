@@ -21,6 +21,7 @@ import type { KeyPair } from "./e2e-crypto.js";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DEFAULT_ACCOUNT_ID, resolveReadCredentialPath } from "./account-config.js";
+import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Import SaaS types for type safety
@@ -34,6 +35,10 @@ type EnrollmentRequest = {
   agentPublicKey: string;
   accountId?: string;
   tenant: string;
+  /** Plugin package version (diagnostics only; OPTIONAL for pre-reporting plugins). */
+  pluginVersion?: string;
+  /** Plugin wire-protocol version (OPTIONAL for pre-v1 plugins). */
+  protocolVersion?: number;
 };
 
 /**
@@ -347,6 +352,10 @@ export class EnrollmentClient {
       agentPublicKey: this.bufferToBase64Url(identityKey.publicKey),
       accountId: this.options.accountId,
       tenant: this.options.tenant,
+      // Report the plugin's build + wire-protocol version at enrollment so the
+      // SaaS/admin can record which plugin generation a device paired with.
+      pluginVersion: readPluginVersion() ?? undefined,
+      protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
     };
 
     console.log(`[enrollment] Calling ${this.options.saasEnrollUrl}...`);

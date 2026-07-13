@@ -23,6 +23,7 @@ import { PopChallengeStore, popSignedMessage } from "./pop-challenge.js";
 import { TransientVerifyError } from "./auth.js";
 import type { JwtIdentity } from "./jwt.js";
 import type { WrappedConversationKey } from "./late-join-decryptor.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
 const PEER = "user-42";
 const FAKE_WRAPPED: WrappedConversationKey = {
@@ -127,8 +128,18 @@ describe("handleRegisterRequest (register over NATS)", () => {
       peerId: string;
       registered: boolean;
       wrappedConversationKey: WrappedConversationKey;
+      protocolVersion?: number;
+      pluginVersion?: string;
     };
-    expect(reply).toEqual({ peerId: PEER, registered: true, wrappedConversationKey: FAKE_WRAPPED });
+    expect(reply).toMatchObject({
+      peerId: PEER,
+      registered: true,
+      wrappedConversationKey: FAKE_WRAPPED,
+    });
+    // Protocol handshake: the reply echoes the plugin's wire-protocol version
+    // (enforced client-side) and its package version (diagnostics).
+    expect(reply.protocolVersion).toBe(WEBCHANNEL_PROTOCOL_VERSION);
+    expect(typeof reply.pluginVersion).toBe("string");
     // The wrap targeted the request's 32-byte cnf device key.
     expect(h.wrapCalls).toHaveLength(1);
     expect(h.wrapCalls[0].key.length).toBe(32);

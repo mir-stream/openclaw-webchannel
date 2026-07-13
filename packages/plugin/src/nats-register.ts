@@ -45,6 +45,7 @@ import type { PopChallengeStore } from "./pop-challenge.js";
 import type { WrappedConversationKey } from "./late-join-decryptor.js";
 import { resolveRequirePoP, popRequirementUnmet } from "./register-pop-gate.js";
 import { assertValidSubjectToken } from "./subject-token.js";
+import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
 
 /**
  * Generic register-reply payloads. ANY verification failure collapses to
@@ -289,7 +290,28 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     // sent — an empty set is the reconciliation signal that retires stale cards.
     deps.sendApprovalSnapshot(peerId);
 
-    reply(JSON.stringify({ peerId, registered: true, wrappedConversationKey }));
+    // Wire-protocol handshake: echo the plugin's protocol + package versions so
+    // the client can enforce a match (mismatch → terminal client-side) and the
+    // admin screen can report the agent-plugin build. A pre-v1 client ignores
+    // both fields; a pre-reporting plugin simply omits them (client tolerates).
+    //
+    // PLAINTEXT BY DESIGN: these fields ride the unencrypted register reply over
+    // the untrusted relay. A hostile relay can already forge/suppress this reply
+    // (it can forge a mismatch to force the client terminal — a DoS it already
+    // holds via forged 401s / dropped replies — or strip a real one), and it can
+    // READ pluginVersion (an agent build fingerprint). That is acceptable: these
+    // are DIAGNOSTICS, never authenticated. Real security rests entirely on the
+    // pinned-agent-identity-key unwrap of the wrapped conversation key above; the
+    // version fields gate nothing on the trust path.
+    reply(
+      JSON.stringify({
+        peerId,
+        registered: true,
+        wrappedConversationKey,
+        protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
+        pluginVersion: readPluginVersion() ?? undefined,
+      }),
+    );
   } catch (err) {
     logger?.error?.(`webchannel: register failed for ${peerId}: ${String(err)}`);
     reply(REGISTER_FAILED);
