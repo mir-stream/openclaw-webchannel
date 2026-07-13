@@ -13,6 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EnrollmentClient } from "./enrollment-client.js";
 import type { EnrollmentOptions } from "./enrollment-client.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import { mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -125,6 +126,41 @@ describe("EnrollmentClient", () => {
           headers: { "Content-Type": "application/json" },
         }),
       );
+    });
+
+    it("should report plugin + protocol version in the enroll POST body", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: "test_device_code",
+          user_code: "ABCD-1234",
+          verification_uri: "https://saas.com/enroll",
+          verification_uri_complete: "https://saas.com/enroll?user_code=ABCD-1234",
+          expires_in: 600,
+          interval: 5,
+        }),
+      }).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          creds: { userJwt: "j", userSeed: "s" },
+          peerId: "mock-peer-id",
+          jwksUrl: "https://saas.com/.well-known/jwks.json",
+          bootstrapUrl: "https://saas.com/bootstrap",
+        }),
+      });
+
+      await client.enroll();
+
+      // The FIRST fetch is the /enroll POST; its body must carry both version fields.
+      const [, init] = mockFetch.mock.calls[0] as [string, { body: string }];
+      const body = JSON.parse(init.body) as {
+        agentPublicKey: string;
+        pluginVersion?: string;
+        protocolVersion?: number;
+      };
+      expect(typeof body.agentPublicKey).toBe("string");
+      expect(typeof body.pluginVersion).toBe("string");
+      expect(body.protocolVersion).toBe(WEBCHANNEL_PROTOCOL_VERSION);
     });
 
     it("should poll for approval with correct interval", async () => {

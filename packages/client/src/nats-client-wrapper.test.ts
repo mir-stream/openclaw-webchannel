@@ -864,3 +864,52 @@ describe("WebChannelNATSClient — P0-7b delivery acks", () => {
     expect(w.getState()).toBe(before);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Protocol-version handshake: the register outcome surfaces on WebChannelState
+// so a diagnostics/admin view can read the agent-plugin's versions.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — protocol version on state", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+
+  /** Fire the inner client's protocol listeners (what a real register triggers). */
+  function emitProtocol(
+    wrapper: WebChannelNATSClient,
+    info: { protocolVersion: number | null; pluginVersion: string | null },
+  ): void {
+    (wrapper["client"] as unknown as {
+      notifyProtocolListeners: (i: typeof info) => void;
+    }).notifyProtocolListeners(info);
+  }
+
+  it("initial state exposes null protocol + plugin versions (not yet registered)", () => {
+    const state = makeWrapper().getState();
+    expect(state.agentProtocolVersion).toBeNull();
+    expect(state.agentPluginVersion).toBeNull();
+  });
+
+  it("a matched register exposes both versions on state", () => {
+    const wrapper = makeWrapper();
+    emitProtocol(wrapper, { protocolVersion: 1, pluginVersion: "0.1.8" });
+    const state = wrapper.getState();
+    expect(state.agentProtocolVersion).toBe(1);
+    expect(state.agentPluginVersion).toBe("0.1.8");
+  });
+
+  it("a pre-v1 plugin (null versions) keeps state null without error", () => {
+    const wrapper = makeWrapper();
+    emitProtocol(wrapper, { protocolVersion: null, pluginVersion: null });
+    const state = wrapper.getState();
+    expect(state.agentProtocolVersion).toBeNull();
+    expect(state.agentPluginVersion).toBeNull();
+    expect(state.status).not.toBe("error");
+  });
+});

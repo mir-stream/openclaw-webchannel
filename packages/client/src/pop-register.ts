@@ -21,6 +21,7 @@
 
 import { base64urlEncode } from "./e2e-crypto-browser.js";
 import type { WrappedConversationKey } from "./e2e-crypto-browser.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
 /** Device Ed25519 PoP public key in JWK form (matches the plugin's `pop_jwk`). */
 export type DevicePopJwk = {
@@ -153,6 +154,15 @@ export type RegisterWithPopResult = {
    * device private key (`unwrapConversationKey`) instead of handshaking.
    */
   wrappedConversationKey?: WrappedConversationKey;
+  /**
+   * The agent-plugin's wire-protocol version, echoed in the register reply.
+   * OPTIONAL: a pre-v1 plugin omits it (the caller treats absence as non-fatal
+   * and exposes `agentProtocolVersion: null`). A value that disagrees with the
+   * client's `WEBCHANNEL_PROTOCOL_VERSION` is TERMINAL at the call site.
+   */
+  protocolVersion?: number;
+  /** The agent-plugin's package version string (diagnostics only). OPTIONAL. */
+  pluginVersion?: string;
 };
 
 /** Shape of an error reply (generic — no detail, so the reply is no oracle). */
@@ -222,6 +232,10 @@ export async function registerWithPop(
         token: opts.jwt,
         nonce,
         signature,
+        // Advertise the client's wire-protocol version. A pre-v1 plugin ignores
+        // it; a v1 plugin echoes its own version back so the caller can enforce
+        // a match (see the register policy in nats-client.ts).
+        protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
       })) as typeof registerReply;
     } catch (err) {
       lastTimeout = err as Error;
@@ -237,9 +251,19 @@ export async function registerWithPop(
       if (registerReply.code === 401) throw new PopRejectedError();
       throw new PopServerError(registerReply.code);
     }
-    return registerReply.wrappedConversationKey
-      ? { peerId: opts.peerId, registered: true, wrappedConversationKey: registerReply.wrappedConversationKey }
-      : { peerId: opts.peerId, registered: true };
+    // Carry the (optional) version fields through to the caller for its handshake
+    // policy + state exposure; absent fields stay undefined (pre-v1 plugin).
+    const result: RegisterWithPopResult = { peerId: opts.peerId, registered: true };
+    if (registerReply.wrappedConversationKey) {
+      result.wrappedConversationKey = registerReply.wrappedConversationKey;
+    }
+    if (typeof registerReply.protocolVersion === "number") {
+      result.protocolVersion = registerReply.protocolVersion;
+    }
+    if (typeof registerReply.pluginVersion === "string") {
+      result.pluginVersion = registerReply.pluginVersion;
+    }
+    return result;
   }
 
   throw lastTimeout ?? new Error("pop-register: registration failed after retries");

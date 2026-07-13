@@ -32,6 +32,7 @@ import {
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
 import { registerWithPop, isTerminalRegisterError } from "./pop-register.js";
 import type { CommandCatalogEntry } from "./types.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
 // Handshake retry (core NATS has no retention — the one-shot key_exchange can be
 // dropped if the agent's per-peer SUB is not yet server-active when we publish,
@@ -219,6 +220,21 @@ export type StateListener = (connected: boolean) => void;
 
 /** Error listener callback (e.g. PoP registration failure). */
 export type ErrorListener = (err: Error) => void;
+
+/**
+ * The agent-plugin versions learned from a successful register handshake.
+ * Both are `null` until a register completes (or against a pre-reporting
+ * plugin). A protocol version that DISAGREES with the client's
+ * `WEBCHANNEL_PROTOCOL_VERSION` never reaches here — it is surfaced as a
+ * terminal error instead.
+ */
+export type ProtocolInfo = {
+  protocolVersion: number | null;
+  pluginVersion: string | null;
+};
+
+/** Register-handshake protocol/version listener. */
+export type ProtocolListener = (info: ProtocolInfo) => void;
 
 // ---------------------------------------------------------------------------
 // WebSocket-based NATS client (browser-compatible)
@@ -835,6 +851,7 @@ export class WebChannelNatsClient {
   private readonly options: NatsClientOptions;
   private readonly messageListeners = new Set<MessageListener>();
   private readonly errorListeners = new Set<ErrorListener>();
+  private readonly protocolListeners = new Set<ProtocolListener>();
 
   private keyPair: BrowserKeyPair | null = null;
   private sessionKey: Uint8Array | null = null;
@@ -975,6 +992,17 @@ export class WebChannelNatsClient {
   onError(listener: ErrorListener): () => void {
     this.errorListeners.add(listener);
     return () => { this.errorListeners.delete(listener); };
+  }
+
+  /**
+   * Add a register-handshake protocol listener. Fires once per successful
+   * register with the agent-plugin's protocol/plugin version (either may be
+   * null against a pre-v1/pre-reporting plugin). A version MISMATCH does not
+   * fire this — it flows through `onError` as a terminal failure.
+   */
+  onProtocol(listener: ProtocolListener): () => void {
+    this.protocolListeners.add(listener);
+    return () => { this.protocolListeners.delete(listener); };
   }
 
   // ---------------------------------------------------------------------------
@@ -1131,6 +1159,31 @@ export class WebChannelNatsClient {
       // would have spawned a newer onConnected. Bail so this stale flow does not
       // establish a key for a connection generation that is no longer current.
       if (this.connectionEpoch !== epoch) return;
+
+      // Wire-protocol handshake (mirrors the :1080 pin-failure style). The plugin
+      // echoes its protocol + package versions in the register reply:
+      //   - absent protocolVersion  → pre-v1 plugin; NON-FATAL, expose null.
+      //   - present but mismatched   → TERMINAL: the two sides speak incompatible
+      //     wire contracts, so surface a two-sided diagnostic and disconnect
+      //     (only upgrading the older side, or a fresh client, can recover).
+      //   - match                    → proceed; expose both versions on state.
+      const agentProtocolVersion =
+        typeof registerResult.protocolVersion === "number" ? registerResult.protocolVersion : null;
+      const agentPluginVersion =
+        typeof registerResult.pluginVersion === "string" ? registerResult.pluginVersion : null;
+      if (agentProtocolVersion !== null && agentProtocolVersion !== WEBCHANNEL_PROTOCOL_VERSION) {
+        const err = new Error(
+          `webchannel protocol mismatch: client=${WEBCHANNEL_PROTOCOL_VERSION} ` +
+            `agent-plugin=${agentProtocolVersion}; upgrade the older side`,
+        );
+        this.notifyErrorListeners(err);
+        this.client.disconnect();
+        return;
+      }
+      this.notifyProtocolListeners({
+        protocolVersion: agentProtocolVersion,
+        pluginVersion: agentPluginVersion,
+      });
 
       if (registerDeliveredKey) {
         // Register-delivered key: unwrap K with the cnf device private key.
@@ -1344,6 +1397,16 @@ export class WebChannelNatsClient {
         listener(err);
       } catch (e) {
         console.error("[nats-client] Error listener error:", e);
+      }
+    });
+  }
+
+  private notifyProtocolListeners(info: ProtocolInfo): void {
+    this.protocolListeners.forEach((listener) => {
+      try {
+        listener(info);
+      } catch (e) {
+        console.error("[nats-client] Protocol listener error:", e);
       }
     });
   }

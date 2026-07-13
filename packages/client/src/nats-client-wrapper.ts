@@ -46,6 +46,9 @@ export class WebChannelNATSClient {
     approvals: [],
     status: "connecting",
     connected: false,
+    // Learned from the register handshake; null until a register completes.
+    agentProtocolVersion: null,
+    agentPluginVersion: null,
   };
 
   private readonly listeners = new Set<Listener>();
@@ -103,6 +106,16 @@ export class WebChannelNATSClient {
     this.client.onError((err: Error) => {
       console.error("[nats-wrapper] terminal connection error:", err);
       this.setState({ status: "error", connected: false, error: err.message });
+    });
+
+    // Register-handshake outcome: surface the agent-plugin's protocol/plugin
+    // version on state for diagnostics (admin screen). A version MISMATCH never
+    // arrives here — it flows through onError above as a terminal failure.
+    this.client.onProtocol(({ protocolVersion, pluginVersion }) => {
+      this.setState({
+        agentProtocolVersion: protocolVersion,
+        agentPluginVersion: pluginVersion,
+      });
     });
   }
 

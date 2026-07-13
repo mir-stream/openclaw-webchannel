@@ -42,6 +42,10 @@ export class WebChannelClient {
     approvals: [],
     status: "connecting",
     connected: false,
+    // The gateway-WS path has no register handshake, so the agent protocol/plugin
+    // version is never negotiated here — it stays null (only the NATS path learns it).
+    agentProtocolVersion: null,
+    agentPluginVersion: null,
   };
 
   private readonly listeners = new Set<Listener>();

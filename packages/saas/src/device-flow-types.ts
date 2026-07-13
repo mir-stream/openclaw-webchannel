@@ -39,6 +39,18 @@ export type EnrollmentRequest = {
    * Determines which NATS account the plugin will be enrolled into.
    */
   tenant: string;
+
+  /**
+   * Plugin package version (e.g. "0.1.8"), reported for diagnostics/audit.
+   * OPTIONAL: a pre-reporting plugin omits it. Not part of the trust chain.
+   */
+  pluginVersion?: string;
+
+  /**
+   * Plugin wire-protocol version (see WEBCHANNEL_PROTOCOL_VERSION). OPTIONAL:
+   * a pre-v1 plugin omits it. Advisory only — enrollment does not gate on it.
+   */
+  protocolVersion?: number;
 };
 
 /**
