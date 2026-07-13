@@ -158,6 +158,18 @@ export async function createWidget(
       sendBtn.disabled = false;
     }
 
+    // Stop button (P1-8a): while a turn is in flight — the agent is typing, or a
+    // working (unfinalized) progress bubble is live — the primary button becomes
+    // a Stop button. Clicking it sends the literal "/stop" (wire choice (a): the
+    // typed command and the button share one server path). It restores to "Send"
+    // automatically once the terminal frame settles isTyping/working back to
+    // false. In the error state the button is disabled (above), so leave it.
+    if (state.status !== "error") {
+      const inFlight = state.isTyping === true || state.messages.some((m) => m.working);
+      sendBtn.dataset.mode = inFlight ? "stop" : "send";
+      sendBtn.textContent = inFlight ? "Stop" : "Send";
+    }
+
     const bubbles = state.messages.map((m) =>
       el(
         "div",
@@ -330,7 +342,16 @@ export async function createWidget(
     input.value = "";
     renderMenu(); // hide the typeahead once the message is sent
   };
-  sendBtn.onclick = submit;
+  // The primary button is a Send button by default and a Stop button while a
+  // turn is in flight (render() flips `dataset.mode`). Stop sends the literal
+  // "/stop" through the SAME send path a typed "/stop" would take.
+  sendBtn.onclick = () => {
+    if (sendBtn.dataset.mode === "stop") {
+      client?.send("/stop");
+      return;
+    }
+    submit();
+  };
   // Live-filter the typeahead as the user types (fires AFTER the value updates,
   // unlike keydown). A keystroke re-arms a menu the user dismissed with Escape.
   input.oninput = () => {
