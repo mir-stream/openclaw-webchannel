@@ -31,7 +31,7 @@ concurrency:
 jobs:
   gate:
     name: E2E Gate (nats-server v2.14 + Typecheck + Tests)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
 
     # Pin the Node.js version — must match the engines.node range declared
     # in each published package.json.
