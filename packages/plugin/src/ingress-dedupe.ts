@@ -19,6 +19,18 @@
  * This deviation from the sketch is deliberate and settled.
  */
 
+/**
+ * Upper bound on a dedupe-able client `id`. Honest client ids are short random
+ * tokens (see `randomInboxToken` in packages/client/src/nats-client.ts), so 128
+ * is generous. The wire does NOT validate `id` — `InboundWsMessage` types it
+ * `id?: string`, but a hostile peer can send a non-string or a ~1MB string, and
+ * a recorded id is persisted as a dedupe key in per-account SQLite (7-day TTL,
+ * up to stateMaxEntries). So we treat a non-string or over-length id as ID-LESS
+ * (pass through un-deduped, never recorded) rather than persisting it — bounding
+ * the storage-amplification surface to conforming clients.
+ */
+const MAX_INGRESS_DEDUPE_ID_LENGTH = 128;
+
 /** The `checkAndRecord` shape this helper depends on (a subset of `PersistentDedupe`). */
 export type IngressDedupeCheck = (
   key: string,
@@ -58,9 +70,20 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
 ): Promise<T[]> {
   const survivors: T[] = [];
   for (const item of items) {
-    const id = item.message.id;
+    // Normalize the wire `id`: only a non-empty, in-bounds STRING is dedupe-able.
+    // A non-string or over-length id is treated as ID-LESS — passed through
+    // un-deduped and never recorded, so a hostile client cannot amplify SQLite
+    // storage with junk keys. (Such a frame is still ACKed by the P0-7b ack
+    // layer, which accepts any non-empty string; it simply is not deduped —
+    // acceptable, since only a non-conforming client ever hits this path.)
+    const rawId = item.message.id;
+    const id =
+      typeof rawId === "string" && rawId.length > 0 && rawId.length <= MAX_INGRESS_DEDUPE_ID_LENGTH
+        ? rawId
+        : undefined;
     if (!id) {
-      // Back-compat: id-less frames pass through un-deduped.
+      // Back-compat / hardening: id-less (or non-conforming) frames pass through
+      // un-deduped.
       survivors.push(item);
       continue;
     }
