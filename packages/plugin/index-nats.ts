@@ -53,7 +53,6 @@ import { planAccounts } from "./src/multiplex.js";
 import {
   loadPersistedEnrolledCreds,
   resolveTypingEnabled,
-  resolveWebchannelAccountConfig,
 } from "./src/account-config.js";
 import type { KeyPair } from "./src/e2e-crypto.js";
 import { devOpenAgentIdentityKeyPair } from "./src/dev-identity.js";
@@ -551,13 +550,15 @@ export default defineChannelPluginEntry({
 
       // P0-6: honor `capabilities.typing: "off"` on NATS (previously the gate
       // existed only on the legacy WS transport, so the off-toggle was silently
-      // ignored here). Read this account's RESOLVED config (channel-level base
-      // merged under the account override), not the flat channel-level section
-      // the legacy WS path reads — each account's capability applies to its own
-      // channel (가-1 Cycle 2).
-      channel.setTypingEnabled(
-        resolveTypingEnabled(resolveWebchannelAccountConfig(api.config, accountId)),
-      );
+      // ignored here). `account` (destructured from the serving plan above) IS
+      // this account's RESOLVED config — `resolveWebchannelAccountConfig(cfg,
+      // accountId)` (multiplex.ts), the channel-level base merged under the
+      // account override — so each account's capability applies to its own
+      // channel (가-1 Cycle 2). We reuse that binding rather than re-resolving:
+      // it is already the exact `WebchannelAccountConfig` `resolveTypingEnabled`
+      // takes (the history handler below casts it only because
+      // `resolveHistoryConfig` wants a narrower shape).
+      channel.setTypingEnabled(resolveTypingEnabled(account));
 
       // ---- Step 3 (per account): inbound dispatcher (accountId-threaded) ----
       // Each account gets its OWN serialized dispatcher bound to its channel and
