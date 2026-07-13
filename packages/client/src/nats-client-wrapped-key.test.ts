@@ -239,7 +239,9 @@ function registerAgentHandler(
   gate?: Promise<void>,
   // Optional wire-protocol version fields to include in the register reply (the
   // protocol handshake). Omitted keys model a pre-v1 / pre-reporting plugin.
-  versions?: { protocolVersion?: number; pluginVersion?: string },
+  // protocolVersion is typed `number | string` (widened past the real wire type)
+  // so a test can inject a malformed string "2" from a buggy/third-party plugin.
+  versions?: { protocolVersion?: number | string; pluginVersion?: string },
 ): ServerHandler {
   const reg = registerSubject(TENANT, AGENT, peerId);
   return async (subject, payload, server, replyTo) => {
@@ -735,6 +737,67 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     expect(errors[0].message).toContain("agent-plugin=2");
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     // The mismatch is caught BEFORE key delivery — no session key, nothing sealed.
+    expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
+  });
+
+  it("malformed: reply protocolVersion='2' (string) → TERMINAL onError naming the received value, socket torn down, no key", async () => {
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const { client, deviceKP } = await makeClient(agentId.publicB64url);
+
+    const infos: ProtocolInfo[] = [];
+    client.onProtocol((i) => infos.push(i));
+    const errors: Error[] = [];
+    client.onError((e) => errors.push(e));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    // A buggy/third-party plugin sends the string "2" instead of the number 2.
+    // This must NOT silently degrade to "absent/pre-v1" and proceed.
+    server.handler = registerAgentHandler(
+      PEER,
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      undefined,
+      { protocolVersion: "2", pluginVersion: "2.0.0" },
+    );
+    client.sendUserMessage("never-sent");
+    await settle();
+
+    // Terminal, exactly like a mismatch: one onError naming the received type +
+    // value, no onProtocol emission, torn-down socket, nothing sealed.
+    expect(infos).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain("string");
+    expect(errors[0].message).toContain('"2"');
+    expect(server.readyState).toBe(FakeNatsWS.CLOSED);
+    expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
+  });
+
+  it("malformed: a numeric-string '1' is NOT coerced → also TERMINAL (presence with the wrong type is the offense)", async () => {
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const { client, deviceKP } = await makeClient(agentId.publicB64url);
+
+    const infos: ProtocolInfo[] = [];
+    client.onProtocol((i) => infos.push(i));
+    const errors: Error[] = [];
+    client.onError((e) => errors.push(e));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    // "1" would "match" WEBCHANNEL_PROTOCOL_VERSION if we coerced — we must not:
+    // a well-behaved v1 plugin sends the NUMBER 1, so a string is malformed.
+    server.handler = registerAgentHandler(
+      PEER,
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      undefined,
+      { protocolVersion: "1" },
+    );
+    client.sendUserMessage("never-sent");
+    await settle();
+
+    expect(infos).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain('"1"');
+    expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
 });

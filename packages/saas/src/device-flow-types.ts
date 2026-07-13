@@ -169,6 +169,25 @@ export type PendingEnrollment = {
    * Generated upon approval and used as the session routing key.
    */
   peerId?: string;
+
+  /**
+   * Plugin package version the device reported at /enroll (e.g. "0.1.8").
+   * ADVISORY / diagnostics-only: recorded so a store-backed admin listing can
+   * show which plugin generation a device paired with. NEVER part of the trust
+   * chain and NEVER gates approval. Persisted only after sanitization (bounded
+   * length + printable charset) because /enroll is unauthenticated — see
+   * enroll(). Absent when the plugin does not report it (pre-reporting build) or
+   * the reported value failed sanitization.
+   */
+  pluginVersion?: string;
+
+  /**
+   * Plugin wire-protocol version the device reported at /enroll (see
+   * WEBCHANNEL_PROTOCOL_VERSION). ADVISORY / diagnostics-only, same rules as
+   * pluginVersion: never part of the trust chain, never gates approval,
+   * persisted only if it sanitizes to a non-negative safe integer.
+   */
+  protocolVersion?: number;
 };
 
 /**

@@ -110,6 +110,27 @@ function assertValidAgentPublicKey(key: unknown): void {
   }
 }
 
+// Advisory version fields ride the same unauthenticated /enroll ingress as
+// agentPublicKey, but they are diagnostics-only (never gate approval, never part
+// of the trust chain). So unlike agentPublicKey — which is REJECTED — a malformed
+// version is SANITIZED-AWAY: we drop it and let enrollment succeed. The bounds
+// exist purely to cap store/approval-UI bloat and keep a control-character string
+// out of an admin listing; 64 chars comfortably fits any real semver + build tag.
+const PLUGIN_VERSION_MAX_LEN = 64;
+const PLUGIN_VERSION_FORMAT = /^[\w.+-]+$/;
+
+/** A reported `pluginVersion` for storage, or undefined if it fails the bound. */
+function sanitizePluginVersion(v: unknown): string | undefined {
+  return typeof v === "string" && v.length > 0 && v.length <= PLUGIN_VERSION_MAX_LEN && PLUGIN_VERSION_FORMAT.test(v)
+    ? v
+    : undefined;
+}
+
+/** A reported `protocolVersion` for storage, or undefined if not a non-negative safe int. */
+function sanitizeProtocolVersion(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Enrollment store interface
 // ---------------------------------------------------------------------------
@@ -500,6 +521,11 @@ export class DeviceFlowEnrollment {
     // Reject a malformed/oversized agentPublicKey at ingress rather than late at
     // browser-side cnf binding (and cap store/approval-UI bloat from a huge string).
     assertValidAgentPublicKey(request.agentPublicKey);
+    // Sanitize the advisory version fields ONCE before the mint/retry loop.
+    // Undefined (absent or malformed) → the key is omitted entirely below so it
+    // "stays absent" in the store record rather than persisting an empty slot.
+    const pluginVersion = sanitizePluginVersion(request.pluginVersion);
+    const protocolVersion = sanitizeProtocolVersion(request.protocolVersion);
     const now = Date.now();
     const expiresAt = now + this.options.expirationSeconds * 1000;
 
@@ -525,6 +551,8 @@ export class DeviceFlowEnrollment {
         createdAt: now,
         expiresAt,
         status: "pending",
+        ...(pluginVersion !== undefined ? { pluginVersion } : {}),
+        ...(protocolVersion !== undefined ? { protocolVersion } : {}),
       };
       try {
         await this.store.saveEnrollment(enrollment);

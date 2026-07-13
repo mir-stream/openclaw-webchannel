@@ -182,6 +182,74 @@ describe("DeviceFlowEnrollment", () => {
       });
     });
 
+    // The reported pluginVersion/protocolVersion are ADVISORY (diagnostics only,
+    // never gate approval). They ride the same unauthenticated /enroll ingress as
+    // agentPublicKey, so a malformed value is SANITIZED-AWAY (dropped) rather than
+    // rejected — enrollment still succeeds, keeping the version fields off the
+    // trust path while capping store/approval-UI bloat.
+    describe("version reporting (advisory) is sanitized before persistence", () => {
+      const storedFor = async (req: EnrollmentRequest) => {
+        const response = await enrollment.enroll(req);
+        const store = enrollment["store"] as MemoryEnrollmentStore;
+        return (await store.getEnrollment(response.device_code))!;
+      };
+
+      it("persists well-formed pluginVersion + protocolVersion onto the stored enrollment", async () => {
+        const pending = await storedFor({
+          ...validEnrollmentRequest,
+          pluginVersion: "0.1.8",
+          protocolVersion: 1,
+        });
+        expect(pending.pluginVersion).toBe("0.1.8");
+        expect(pending.protocolVersion).toBe(1);
+      });
+
+      it("omits an oversized (>64-char) pluginVersion while the enrollment still succeeds", async () => {
+        const pending = await storedFor({
+          ...validEnrollmentRequest,
+          pluginVersion: "9".repeat(65),
+          protocolVersion: 1,
+        });
+        expect(pending.pluginVersion).toBeUndefined();
+        // Sanitization is per-field: the valid protocolVersion still persists.
+        expect(pending.protocolVersion).toBe(1);
+        expect(pending.status).toBe("pending");
+      });
+
+      it("omits a pluginVersion with control/non-printable characters", async () => {
+        const pending = await storedFor({
+          ...validEnrollmentRequest,
+          pluginVersion: "0.1.8\n<script>",
+        });
+        expect(pending.pluginVersion).toBeUndefined();
+      });
+
+      it("omits a non-string pluginVersion and a non-integer/negative protocolVersion", async () => {
+        const pending = await storedFor({
+          ...validEnrollmentRequest,
+          // Malformed shapes a hostile/buggy caller could send.
+          pluginVersion: 12345 as unknown as string,
+          protocolVersion: 1.5 as unknown as number,
+        });
+        expect(pending.pluginVersion).toBeUndefined();
+        expect(pending.protocolVersion).toBeUndefined();
+
+        const negative = await storedFor({
+          ...validEnrollmentRequest,
+          protocolVersion: -1,
+        });
+        expect(negative.protocolVersion).toBeUndefined();
+      });
+
+      it("keeps absent version fields absent (pre-reporting plugin)", async () => {
+        const pending = await storedFor(validEnrollmentRequest);
+        expect(pending.pluginVersion).toBeUndefined();
+        expect(pending.protocolVersion).toBeUndefined();
+        expect("pluginVersion" in pending).toBe(false);
+        expect("protocolVersion" in pending).toBe(false);
+      });
+    });
+
     // #8: a persistent store with UNIQUE(user_code) surfaces a rare collision as
     // UserCodeCollisionError; enroll() re-mints and retries (bounded), and treats
     // ONLY that error as retryable.

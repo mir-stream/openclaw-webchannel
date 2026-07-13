@@ -294,6 +294,15 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     // the client can enforce a match (mismatch → terminal client-side) and the
     // admin screen can report the agent-plugin build. A pre-v1 client ignores
     // both fields; a pre-reporting plugin simply omits them (client tolerates).
+    //
+    // PLAINTEXT BY DESIGN: these fields ride the unencrypted register reply over
+    // the untrusted relay. A hostile relay can already forge/suppress this reply
+    // (it can forge a mismatch to force the client terminal — a DoS it already
+    // holds via forged 401s / dropped replies — or strip a real one), and it can
+    // READ pluginVersion (an agent build fingerprint). That is acceptable: these
+    // are DIAGNOSTICS, never authenticated. Real security rests entirely on the
+    // pinned-agent-identity-key unwrap of the wrapped conversation key above; the
+    // version fields gate nothing on the trust path.
     reply(
       JSON.stringify({
         peerId,

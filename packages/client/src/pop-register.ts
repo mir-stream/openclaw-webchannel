@@ -128,6 +128,31 @@ export class PopServerError extends Error {
 }
 
 /**
+ * Thrown when a register SUCCESS reply carries a `protocolVersion` that is
+ * PRESENT but not a safe-integer number (e.g. the string "2" from a buggy or
+ * third-party plugin). This is exactly the silent-break class the version
+ * handshake exists to kill: without this guard the malformed value degrades to
+ * `undefined` in the copy-through below, the client policy reads it as "pre-v1,
+ * absent" and proceeds — masking a plugin that is in fact speaking an
+ * unintelligible wire protocol. So it is TERMINAL (same standing as a version
+ * MISMATCH): the message names the received type + value for diagnosis, and the
+ * caller tears the connection down instead of retrying. NB presence with the
+ * wrong TYPE is the offense, not the value — even `"1"` (a numeric string that
+ * would "match" if coerced) is terminal, because a well-behaved v1 plugin sends
+ * the NUMBER 1.
+ */
+export class ProtocolVersionMalformedError extends Error {
+  constructor(received: unknown) {
+    super(
+      `pop-register: register reply carried a non-numeric protocolVersion ` +
+        `(${typeof received} ${JSON.stringify(received)}) — the agent-plugin is speaking ` +
+        `an unintelligible wire protocol`,
+    );
+    this.name = "ProtocolVersionMalformedError";
+  }
+}
+
+/**
  * Classify a `registerWithPop` throw as TERMINAL (true) vs TRANSIENT (false).
  *
  * TERMINAL = a rejected proof/token (`PopRejectedError`) or a non-transient
@@ -140,7 +165,13 @@ export class PopServerError extends Error {
  * unreachable, so the caller should keep reconnecting/re-attempting.
  */
 export function isTerminalRegisterError(err: unknown): boolean {
-  return err instanceof PopRejectedError || err instanceof PopServerError;
+  return (
+    err instanceof PopRejectedError ||
+    err instanceof PopServerError ||
+    // A malformed protocolVersion in a SUCCESS reply is as terminal as a
+    // mismatch: retrying the same plugin re-derives the same broken reply.
+    err instanceof ProtocolVersionMalformedError
+  );
 }
 
 /** Successful register-hop result (parsed register reply). */
@@ -257,9 +288,20 @@ export async function registerWithPop(
     if (registerReply.wrappedConversationKey) {
       result.wrappedConversationKey = registerReply.wrappedConversationKey;
     }
-    if (typeof registerReply.protocolVersion === "number") {
-      result.protocolVersion = registerReply.protocolVersion;
+    // protocolVersion is STRICT: absent → pre-v1 (tolerated). But present-and-
+    // not-a-safe-integer (e.g. the string "2") must NOT silently degrade to
+    // undefined — that would let the mismatch guard read it as "absent" and
+    // proceed, the exact silent break this handshake kills. Read via `unknown`
+    // so the declared `number` type can't narrow the runtime check away.
+    const pv: unknown = registerReply.protocolVersion;
+    if (pv !== undefined) {
+      if (typeof pv !== "number" || !Number.isSafeInteger(pv)) {
+        throw new ProtocolVersionMalformedError(pv);
+      }
+      result.protocolVersion = pv;
     }
+    // pluginVersion stays LENIENT (advisory only): a non-string drops to
+    // undefined without failing the connection.
     if (typeof registerReply.pluginVersion === "string") {
       result.pluginVersion = registerReply.pluginVersion;
     }

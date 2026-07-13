@@ -87,6 +87,15 @@ jobs:
       - name: Install
         run: npm ci
 
+      # Root cross-package lockstep gate: a v* tag cut from a commit that bypassed
+      # the PR gate could ship diverged client/plugin WEBCHANNEL_PROTOCOL_VERSION
+      # constants (per-package `npm test -w` never imports both in one process).
+      # Runs BEFORE any publish step in this job; the two plugin jobs `needs:
+      # publish`, so this one gate also blocks their npm/ClawHub publishes — a
+      # one-sided constant bump must not reach npm.
+      - name: Enforce client↔plugin protocol-version lockstep
+        run: npx vitest run e2e/protocol-version-lockstep.test.ts
+
       - name: Build
         run: npm run build -w packages/client -w packages/saas
 
