@@ -24,6 +24,7 @@
 import { isAbortRequestText } from "openclaw/plugin-sdk/command-primitives-runtime";
 
 import type { InboundWsMessage } from "./transport.js";
+import type { CommandGate } from "./command-gate.js";
 
 /**
  * True when an inbound frame is an out-of-band abort request that must bypass
@@ -57,4 +58,47 @@ export function isExplicitAbortCommand(message: InboundWsMessage): boolean {
     message.type === "user_message" &&
     message.text.trim().toLowerCase() === "/stop"
   );
+}
+
+/**
+ * True ONLY when an explicit `/stop` should ALSO destroy this peer's buffered
+ * input (the pre-run debounce window + the mid-turn coalesce buffer), i.e. when
+ * the abort it accompanies will actually take effect.
+ *
+ * WHY THE GATE
+ * ------------
+ * The buffer drop is ALL-OR-NOTHING with the abort by design: dropping the
+ * queued input only makes sense if the running turn is genuinely being
+ * cancelled. But the abort itself is authorized by CORE, and core IGNORES our
+ * control-lane `access.commands.authorized` stamp whenever a commands/owner
+ * allowlist is configured — for a non-listed peer the `/stop` returns
+ * handled:false, the running turn keeps going, and the abort is a no-op (see
+ * command-gate.ts for the exact trap). If we still dropped the buffers in that
+ * case, a non-listed peer's Stop would be a PARTIAL abort: their turn survives
+ * but their queued follow-ups are destroyed — the worst of both. So we drop only
+ * when the gate says core will honor this peer's abort:
+ * `!gate.delegated` (no allowlist — the stamp path authorizes everyone) OR
+ * `gate.isListed(peerId)` (allowlist configured and this peer is on it).
+ *
+ * ASYMMETRY WE ACCEPT (honestly)
+ * ------------------------------
+ * The gate is a best-effort mirror biased toward NOT dropping. A false "not
+ * listed" (the mirror says refused, core actually honors) merely SKIPS the drop
+ * for a peer whose abort DID succeed: their queued follow-up then runs after the
+ * abort instead of being discarded — a mild surprise. We accept that over the
+ * opposite error (destroying input for a peer whose turn keeps running), because
+ * data loss is worse than a skipped cleanup. Core remains the authority for the
+ * abort itself either way; this predicate only governs the destructive cleanup.
+ *
+ * NL abort vocabulary ("wait", "stop please") is excluded here exactly as in
+ * `isExplicitAbortCommand` — those still abort, but must never destroy buffered
+ * input.
+ */
+export function shouldDropBufferedInputOnStop(
+  message: InboundWsMessage,
+  gate: CommandGate,
+  peerId: string,
+): boolean {
+  if (!isExplicitAbortCommand(message)) return false;
+  return !gate.delegated || gate.isListed(peerId);
 }

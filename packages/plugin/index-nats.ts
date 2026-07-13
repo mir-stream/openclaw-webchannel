@@ -28,7 +28,7 @@ import {
   createSerializedInboundDispatcher,
   coalesceUserMessages,
 } from "./src/inbound-queue.js";
-import { isControlLaneMessage, isExplicitAbortCommand } from "./src/control-lane.js";
+import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./src/control-lane.js";
 import { resolveCommandGate } from "./src/command-gate.js";
 import {
   createInboundDebouncer,
@@ -677,12 +677,25 @@ export default defineChannelPluginEntry({
           // the running turn (`clearPending`). Log at info only when something
           // was actually dropped.
           //
-          // The destructive drop is gated on `isExplicitAbortCommand`, NOT the
-          // broader `isControlLaneMessage`: the abort itself keeps the full NL
-          // vocabulary (a "wait"/"stop please" still aborts the running turn for
-          // core parity), but a false-positive NL match must never silently
-          // destroy a queued follow-up. Only the unambiguous "/stop" opts in.
-          if (isExplicitAbortCommand(message)) {
+          // The destructive drop is gated by `shouldDropBufferedInputOnStop`,
+          // which narrows on TWO axes (both live in the tested predicate):
+          //  1. EXPLICIT "/stop" only, NOT the broader `isControlLaneMessage`
+          //     vocabulary — a "wait"/"stop please" still aborts the running turn
+          //     for core parity, but a false-positive NL match must never
+          //     silently destroy a queued follow-up. Only the unambiguous "/stop"
+          //     opts in.
+          //  2. AUTHZ ASYMMETRY — the drop is all-or-nothing with the abort, and
+          //     the abort is core's call. When a commands/owner allowlist is
+          //     configured, core IGNORES our control-lane stamp (see the hedge
+          //     below + command-gate.ts): a non-listed peer's abort is refused,
+          //     the running turn keeps going. Dropping their buffers then would be
+          //     a PARTIAL /stop — turn survives, queued input destroyed. So we
+          //     drop only when the gate says core will honor this peer's abort
+          //     (`!delegated || isListed`). The mirror is biased toward NOT
+          //     dropping, so its only error is skipping cleanup for a peer whose
+          //     abort actually succeeded (their follow-up runs after the abort) —
+          //     accepted over destroying input for a peer whose turn survives.
+          if (shouldDropBufferedInputOnStop(message, commandGate, peerId)) {
             const debounceCancelled = inboundDebouncer.cancelKey(peerId);
             const pendingDropped = inboundDispatcher.clearPending(peerId);
             if (debounceCancelled || pendingDropped > 0) {
@@ -699,7 +712,7 @@ export default defineChannelPluginEntry({
             accountId,
             { controlLane: true },
           ).catch((err) =>
-            api.logger.error?.(
+            api.logger?.error?.(
               `webchannel: control-lane dispatch failed: ${String(err)}`,
             ),
           );
@@ -734,7 +747,7 @@ export default defineChannelPluginEntry({
         void inboundDebouncer
           .enqueue({ peerId, message })
           .catch((err) =>
-            api.logger.error?.(
+            api.logger?.error?.(
               `webchannel: inbound enqueue failed: ${String(err)}`,
             ),
           );

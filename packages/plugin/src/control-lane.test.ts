@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 
-import { isControlLaneMessage, isExplicitAbortCommand } from "./control-lane.js";
+import {
+  isControlLaneMessage,
+  isExplicitAbortCommand,
+  shouldDropBufferedInputOnStop,
+} from "./control-lane.js";
+import { resolveCommandGate } from "./command-gate.js";
 import { createSerializedInboundDispatcher } from "./inbound-queue.js";
 import type { InboundWsMessage } from "./transport.js";
 
@@ -59,6 +64,48 @@ describe("isExplicitAbortCommand", () => {
     expect(
       isExplicitAbortCommand({ type: "approval_decision", id: "a1", decision: "allow-once" }),
     ).toBe(false);
+  });
+});
+
+describe("shouldDropBufferedInputOnStop", () => {
+  // Real gate outputs (not hand-built stubs) so this stays honest against the
+  // actual command-gate mirror the production wiring uses.
+  const noAllowlist = resolveCommandGate({}, "default");
+  const allowlistWithPeer = resolveCommandGate(
+    { commands: { allowFrom: { webchannel: ["alice"] } } },
+    "default",
+  );
+  const allowlistWithoutPeer = allowlistWithPeer; // same gate, different peer queried
+
+  it("drops on explicit /stop when NO allowlist is configured (stamp authorizes everyone)", () => {
+    expect(noAllowlist.delegated).toBe(false);
+    expect(shouldDropBufferedInputOnStop(userMessage("/stop"), noAllowlist, "alice")).toBe(true);
+  });
+
+  it("drops on explicit /stop when an allowlist is configured AND the peer is listed", () => {
+    expect(allowlistWithPeer.delegated).toBe(true);
+    expect(shouldDropBufferedInputOnStop(userMessage("/stop"), allowlistWithPeer, "alice")).toBe(
+      true,
+    );
+  });
+
+  it("does NOT drop on explicit /stop when an allowlist is configured and the peer is NOT listed", () => {
+    // Core would refuse this peer's abort → the running turn survives, so the
+    // buffered input must be preserved (all-or-nothing).
+    expect(shouldDropBufferedInputOnStop(userMessage("/stop"), allowlistWithoutPeer, "bob")).toBe(
+      false,
+    );
+  });
+
+  it("never drops for NL abort text, regardless of gate", () => {
+    expect(shouldDropBufferedInputOnStop(userMessage("stop please"), noAllowlist, "alice")).toBe(
+      false,
+    );
+    expect(shouldDropBufferedInputOnStop(userMessage("wait"), noAllowlist, "alice")).toBe(false);
+    // Even a listed peer under no allowlist: NL text is not an explicit /stop.
+    expect(shouldDropBufferedInputOnStop(userMessage("stop"), allowlistWithPeer, "alice")).toBe(
+      false,
+    );
   });
 });
 
