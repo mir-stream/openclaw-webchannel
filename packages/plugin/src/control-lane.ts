@@ -38,3 +38,23 @@ import type { InboundWsMessage } from "./transport.js";
 export function isControlLaneMessage(message: InboundWsMessage): boolean {
   return message.type === "user_message" && isAbortRequestText(message.text);
 }
+
+/**
+ * True ONLY for the unambiguous typed `/stop` command (case- and
+ * surrounding-whitespace-insensitive), and nothing else.
+ *
+ * The NL abort vocabulary ("wait", "stop", "abort", …) still ABORTS the running
+ * turn — `isControlLaneMessage` keeps that full vocabulary for core/Telegram
+ * parity, and must NOT be narrowed. But those NL words must not additionally
+ * DESTROY the peer's buffered input: a user mid-conversation who types "wait" or
+ * "stop please" (a false-positive against the running turn) should lose at most
+ * a spurious abort, never a queued follow-up message. Only the explicit typed
+ * "/stop" — and the widget Stop button, which sends the literal "/stop" — opts
+ * into dropping the buffered/debounced input alongside the abort.
+ */
+export function isExplicitAbortCommand(message: InboundWsMessage): boolean {
+  return (
+    message.type === "user_message" &&
+    message.text.trim().toLowerCase() === "/stop"
+  );
+}

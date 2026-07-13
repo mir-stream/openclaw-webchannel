@@ -28,7 +28,7 @@ import {
   createSerializedInboundDispatcher,
   coalesceUserMessages,
 } from "./src/inbound-queue.js";
-import { isControlLaneMessage } from "./src/control-lane.js";
+import { isControlLaneMessage, isExplicitAbortCommand } from "./src/control-lane.js";
 import { resolveCommandGate } from "./src/command-gate.js";
 import {
   createInboundDebouncer,
@@ -668,19 +668,28 @@ export default defineChannelPluginEntry({
         // as busy. No wedge and no double-delivery — the /stop is simply ignored
         // for an unauthorized sender.
         if (isControlLaneMessage(message)) {
-          // P1-8b: a user who says "/stop" wants the text queued behind the
-          // running turn gone too — mirroring core fast-abort clearing its own
-          // followup lanes. Drop this peer's buffered input on BOTH layers before
+          // P1-8b: an EXPLICIT "/stop" (typed, or the widget Stop button which
+          // sends the literal "/stop") wants the text queued behind the running
+          // turn gone too — mirroring core fast-abort clearing its own followup
+          // lanes. Drop this peer's buffered input on BOTH layers before
           // dispatching the abort: (a) any messages waiting in the pre-run
           // debounce window (`cancelKey`), and (b) any messages buffered during
-          // the running turn (`clearPending`). Log at info only when something was
-          // actually dropped.
-          const debounceCancelled = inboundDebouncer.cancelKey(peerId);
-          const pendingDropped = inboundDispatcher.clearPending(peerId);
-          if (debounceCancelled || pendingDropped > 0) {
-            api.logger?.info?.(
-              `webchannel: /stop dropped buffered input for peer ${peerId} (debounced=${debounceCancelled}, pending=${pendingDropped})`,
-            );
+          // the running turn (`clearPending`). Log at info only when something
+          // was actually dropped.
+          //
+          // The destructive drop is gated on `isExplicitAbortCommand`, NOT the
+          // broader `isControlLaneMessage`: the abort itself keeps the full NL
+          // vocabulary (a "wait"/"stop please" still aborts the running turn for
+          // core parity), but a false-positive NL match must never silently
+          // destroy a queued follow-up. Only the unambiguous "/stop" opts in.
+          if (isExplicitAbortCommand(message)) {
+            const debounceCancelled = inboundDebouncer.cancelKey(peerId);
+            const pendingDropped = inboundDispatcher.clearPending(peerId);
+            if (debounceCancelled || pendingDropped > 0) {
+              api.logger?.info?.(
+                `webchannel: /stop dropped buffered input for peer ${peerId} (debounced=${debounceCancelled}, pending=${pendingDropped})`,
+              );
+            }
           }
           void handleInboundMessage(
             api,

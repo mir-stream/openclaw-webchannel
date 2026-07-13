@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { isControlLaneMessage } from "./control-lane.js";
+import { isControlLaneMessage, isExplicitAbortCommand } from "./control-lane.js";
 import { createSerializedInboundDispatcher } from "./inbound-queue.js";
 import type { InboundWsMessage } from "./transport.js";
 
@@ -38,6 +38,27 @@ describe("isControlLaneMessage", () => {
       isControlLaneMessage({ type: "approval_decision", id: "a1", decision: "allow-once" }),
     ).toBe(false);
     expect(isControlLaneMessage({ type: "load_history", limit: 20 })).toBe(false);
+  });
+});
+
+describe("isExplicitAbortCommand", () => {
+  it("is true ONLY for the typed '/stop' (case- and whitespace-insensitive)", () => {
+    expect(isExplicitAbortCommand(userMessage("/stop"))).toBe(true);
+    expect(isExplicitAbortCommand(userMessage("/STOP "))).toBe(true);
+  });
+
+  it("is false for NL abort words that still route on the control lane", () => {
+    // These abort the running turn (isControlLaneMessage true) but must NOT
+    // drop buffered input — so isExplicitAbortCommand is false for them.
+    expect(isExplicitAbortCommand(userMessage("stop"))).toBe(false);
+    expect(isExplicitAbortCommand(userMessage("wait"))).toBe(false);
+    expect(isExplicitAbortCommand(userMessage("/stop now"))).toBe(false);
+  });
+
+  it("is false for non-user_message frames", () => {
+    expect(
+      isExplicitAbortCommand({ type: "approval_decision", id: "a1", decision: "allow-once" }),
+    ).toBe(false);
   });
 });
 
