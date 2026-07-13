@@ -16,6 +16,7 @@ export {
   type DevicePopJwk,
   type RegisterWithPopOptions,
 } from "./pop-register.js";
+export { filterCommandCatalog } from "./command-filter.js";
 export type {
   ChatRole,
   ChatMessage,
@@ -26,4 +27,6 @@ export type {
   WebChannelState,
   WebChannelOptions,
   Listener,
+  CommandCatalogEntry,
+  CommandCatalogArg,
 } from "./types.js";

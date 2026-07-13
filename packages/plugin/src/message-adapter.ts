@@ -180,6 +180,15 @@ export type ProgressDraftController = {
   /** Push the freshest pending draft text to the socket now. */
   flush: () => Promise<void>;
   /**
+   * Read-only snapshot of the draft text the flush loop would currently send —
+   * the streamed answer body (partial mode) or the "Working…" scaffold + tool
+   * lines. Returns "" when nothing has been pushed yet (there is no scaffold
+   * worth preserving). Side-effect-free: used by the aborted-turn defensive
+   * finalize (inbound.ts) to settle the bubble with the streamed content alone
+   * (no marker).
+   */
+  snapshotText: () => string;
+  /**
    * Finalize the draft into the final answer (reuses the draft id). Idempotent:
    * the first call finalizes and stops the loop; later calls are no-ops so the
    * normal path and the error-recovery path can't double-finalize.
@@ -357,6 +366,7 @@ export function createProgressDraftController(params: {
       rollCurrentIntoPrefix();
     },
     flush: () => loop.flush(),
+    snapshotText: () => (hasPendingContent() ? composeText() : ""),
     finalize: async (text) => {
       // Idempotent: the normal delivery path and the error-recovery path may
       // both attempt to finalize; only the first wins so we never send two

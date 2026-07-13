@@ -10,6 +10,7 @@ import {
   resolveWebchannelAccountConfig,
   resolveAcquisitionIdentity,
   resolveAccountNatsConfig,
+  resolveTypingEnabled,
   readAccountsMap,
   readWebchannelSection,
   accountCredentialPath,
@@ -62,6 +63,76 @@ describe("account-config: account id validation (TRUST BOUNDARY)", () => {
   it("canonicalizeAccountId lowercases and preserves valid ids", () => {
     expect(canonicalizeAccountId("AcctA")).toBe("accta");
     expect(canonicalizeAccountId("acct-1")).toBe("acct-1");
+  });
+});
+
+describe("account-config: resolveTypingEnabled (P0-6)", () => {
+  it("defaults ON when capabilities is absent", () => {
+    expect(resolveTypingEnabled({})).toBe(true);
+    expect(resolveTypingEnabled({ capabilities: {} })).toBe(true);
+  });
+
+  it("ON for explicit typing:'on'", () => {
+    expect(resolveTypingEnabled({ capabilities: { typing: "on" } })).toBe(true);
+  });
+
+  it("OFF only for explicit typing:'off'", () => {
+    expect(resolveTypingEnabled({ capabilities: { typing: "off" } })).toBe(false);
+  });
+
+  it("honors an account override 'off' over a channel-level 'on' base (through the merge)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { typing: "on" },
+          accounts: {
+            acctA: { capabilities: { typing: "off" } },
+          },
+        },
+      },
+    };
+    expect(resolveTypingEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
+  });
+
+  it("honors an account override 'on' over a channel-level 'off' base (through the merge)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { typing: "off" },
+          accounts: {
+            acctA: { capabilities: { typing: "on" } },
+          },
+        },
+      },
+    };
+    expect(resolveTypingEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(true);
+  });
+
+  it("inherits the channel-level base when the account omits capabilities (shared-base merge)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { typing: "off" },
+          accounts: { acctA: { tenant: "t" } },
+        },
+      },
+    };
+    expect(resolveTypingEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
+  });
+
+  it("keeps the base typing:'off' when the account sets OTHER capabilities (nested merge, no clobber)", () => {
+    // Locks `capabilities` staying in NESTED_OBJECT_KEYS: the account's
+    // capabilities object must MERGE over the base, not replace it — dropping
+    // that would silently regress typing:"off" back to being ignored.
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { typing: "off" },
+          accounts: { acctA: { capabilities: { someOtherKey: "x" } } },
+        },
+      },
+    };
+    expect(resolveTypingEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
   });
 });
 

@@ -31,6 +31,7 @@ import {
   openEnvelope,
 } from "./e2e-session.js";
 import { isValidSubjectToken } from "./subject-token.js";
+import type { CommandCatalogEntry } from "./commands-catalog.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,9 +50,17 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 export type InboundWsMessage =
-  | { type: "user_message"; text: string }
+  // P0-7a: `id` is a stable, client-minted unique id for this logical send. It is
+  // OPTIONAL for back-compat — an older client omits it and the frame passes
+  // through un-deduped. When present, the server records `${peerId}:${id}` at
+  // ingress (7-day window) and silently drops a duplicate before it runs a turn.
+  | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
-  | { type: "load_history"; before?: string; limit?: number };
+  | { type: "load_history"; before?: string; limit?: number }
+  // P0-3 slash-command DISCOVERY: the browser asks for the command catalog (no
+  // params — the catalog is not paged). The agent answers with a `commands`
+  // frame. Discovery only; command EXECUTION is a normal `user_message`.
+  | { type: "load_commands" };
 
 export type OutboundWsMessage =
   | { type: "agent_message"; text: string; id?: string }
@@ -68,7 +77,10 @@ export type OutboundWsMessage =
       resolved?: Array<{ id: string; decision: ApprovalDecision }>;
     }
   | { type: "typing" }
-  | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> };
+  | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> }
+  // P0-3 slash-command DISCOVERY: the command catalog delivered in reply to a
+  // `load_commands` request (config-filtered, alias-free, name-sorted).
+  | { type: "commands"; commands: CommandCatalogEntry[] };
 
 export type HistoryMessage = {
   id: string;
@@ -221,6 +233,17 @@ export class NatsChannel {
   private readonly maxSeenMessageIdsPerPeer: number;
   private readonly seenMessageIds = new Map<string, Map<string, number>>();
 
+  /**
+   * P0-6: whether `sendTyping(...)` may emit a `typing` frame. Defaults enabled
+   * so the "Bot is typing…" affordance works out of the box; an operator
+   * disables it per-account via `capabilities.typing = "off"`. Toggled once at
+   * channel start (index-nats) from the account's RESOLVED config — unlike the
+   * legacy WS gate (`transport.ts`), which reads the channel-level flat section,
+   * because each `NatsChannel` IS a single account's channel (가-1 Cycle 2).
+   * Previously ungated on NATS, so `typing: "off"` was silently ignored.
+   */
+  private typingEnabled = true;
+
   // ---- Encrypt-by-construction state (only populated in crypto mode) --------
 
   /** When true, the channel is E2E-encrypted and fail-closed (no plaintext). */
@@ -246,6 +269,7 @@ export class NatsChannel {
   private onMessage?: (peerId: string, message: InboundWsMessage) => void;
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
   private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
+  private onLoadCommands?: (peerId: string) => void;
   private onHandshakeComplete?: (peerId: string) => void;
   /**
    * Register-hop admission over NATS (replaces the deleted HTTP register routes).
@@ -466,9 +490,20 @@ export class NatsChannel {
   }
 
   /**
+   * P0-6: toggle the typing-indicator wire frame for this account's channel.
+   * Called once at channel start (index-nats) with the account's resolved
+   * `capabilities.typing` (default "on"). When disabled, `sendTyping` is a
+   * no-op returning `false`, so callers need not gate at the call site.
+   */
+  setTypingEnabled(enabled: boolean): void {
+    this.typingEnabled = enabled;
+  }
+
+  /**
    * Send typing indicator to peer.
    */
   sendTyping(peerId: string): boolean {
+    if (!this.typingEnabled) return false;
     const payload: OutboundWsMessage = { type: "typing" };
     return this.sendToPeer(peerId, payload);
   }
@@ -478,6 +513,15 @@ export class NatsChannel {
    */
   sendHistory(peerId: string, messages: HistoryMessage[]): boolean {
     const payload: OutboundWsMessage = { type: "history", messages };
+    return this.sendToPeer(peerId, payload);
+  }
+
+  /**
+   * Send the slash-command catalog to peer (P0-3 discovery). Rides the same
+   * sealed `.out` path as every other outbound frame.
+   */
+  sendCommands(peerId: string, commands: CommandCatalogEntry[]): boolean {
+    const payload: OutboundWsMessage = { type: "commands", commands };
     return this.sendToPeer(peerId, payload);
   }
 
@@ -587,6 +631,15 @@ export class NatsChannel {
     handler: (peerId: string, request: { before?: string; limit?: number }) => void
   ): void {
     this.onLoadHistory = handler;
+  }
+
+  /**
+   * Set the command-catalog load handler (P0-3 discovery). Fires on a
+   * `load_commands` request; the handler builds the catalog and calls
+   * `sendCommands`.
+   */
+  setLoadCommandsHandler(handler: (peerId: string) => void): void {
+    this.onLoadCommands = handler;
   }
 
   /**
@@ -979,6 +1032,10 @@ export class NatsChannel {
 
       case "load_history":
         this.onLoadHistory?.(peerId, { before: message.before, limit: message.limit });
+        break;
+
+      case "load_commands":
+        this.onLoadCommands?.(peerId);
         break;
 
       default:

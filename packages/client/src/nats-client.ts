@@ -31,6 +31,7 @@ import {
 } from "./e2e-crypto-browser.js";
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
 import { registerWithPop, isTerminalRegisterError } from "./pop-register.js";
+import type { CommandCatalogEntry } from "./types.js";
 
 // Handshake retry (core NATS has no retention — the one-shot key_exchange can be
 // dropped if the agent's per-peer SUB is not yet server-active when we publish,
@@ -156,7 +157,9 @@ export type InboundMessage = {
     // #15: authoritative pending-approval snapshot (carries `approvals`).
     | "approval_snapshot"
     | "typing"
-    | "history";
+    | "history"
+    // P0-3: slash-command discovery catalog (carries `commands`).
+    | "commands";
   id?: string;
   text?: string;
   kind?: "exec" | "plugin";
@@ -185,12 +188,19 @@ export type InboundMessage = {
   resolved?: Array<{ id: string; decision: string }>;
   before?: string;
   limit?: number;
+  /** P0-3: the slash-command catalog on a `commands` frame. */
+  commands?: CommandCatalogEntry[];
 };
 
 export type OutboundMessage =
-  | { type: "user_message"; text: string }
+  // P0-7a: `id` is a stable, unique id stamped per logical send so the agent can
+  // dedupe a re-delivered frame at ingress. Always set on the send path below;
+  // typed optional to mirror the wire union (older clients omit it).
+  | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: string }
-  | { type: "load_history"; before?: string; limit?: number };
+  | { type: "load_history"; before?: string; limit?: number }
+  // P0-3: request the slash-command discovery catalog.
+  | { type: "load_commands" };
 
 /** Message listener callback (decrypted, high-level). */
 export type MessageListener = (msg: InboundMessage) => void;
@@ -891,7 +901,14 @@ export class WebChannelNatsClient {
 
   /** Send user message (buffered until the handshake completes). */
   sendUserMessage(text: string): void {
-    this.enqueue({ type: "user_message", text });
+    // P0-7a: stamp a stable, unique id per logical send. The agent records it at
+    // ingress and drops a duplicate frame (rapid double-submit; a future replay
+    // queue re-send after reconnect) so it never runs the turn twice. Reuse the
+    // package's existing randomness helper (WebCrypto-preferring, Math.random
+    // fallback) rather than `crypto.randomUUID` so we match the client's
+    // established host assumptions; the id only needs to be collision-unguessable,
+    // not a UUID.
+    this.enqueue({ type: "user_message", text, id: randomInboxToken() });
   }
 
   /** Send approval decision (buffered until the handshake completes). */
@@ -902,6 +919,11 @@ export class WebChannelNatsClient {
   /** Request history page (buffered until the handshake completes). */
   loadHistory(before?: string, limit?: number): void {
     this.enqueue({ type: "load_history", before, limit });
+  }
+
+  /** Request the slash-command catalog (buffered until the handshake completes). */
+  loadCommands(): void {
+    this.enqueue({ type: "load_commands" });
   }
 
   /** Add decrypted-message listener. */

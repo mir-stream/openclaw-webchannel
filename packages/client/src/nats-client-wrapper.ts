@@ -156,6 +156,16 @@ export class WebChannelNATSClient {
     this.client.loadHistory(request?.before, request?.limit);
   }
 
+  /**
+   * Request the slash-command discovery catalog (P0-3). The agent answers with
+   * a `commands` frame that lands in `state.commands`. UI calls this the first
+   * time the user types `/` (lazy discovery); repeat calls are cheap and simply
+   * refresh the catalog.
+   */
+  loadCommands(): void {
+    this.client.loadCommands();
+  }
+
   // ---------------------------------------------------------------------------
   // State management
   // ---------------------------------------------------------------------------
@@ -375,6 +385,14 @@ export class WebChannelNATSClient {
 
       case "typing": {
         this.setState({ isTyping: true });
+        return;
+      }
+
+      case "commands": {
+        // P0-3 discovery: replace the catalog wholesale (idempotent — a repeat
+        // request just refreshes it). NOT turn activity, so isTyping is left
+        // untouched.
+        this.setState({ commands: Array.isArray(msg.commands) ? msg.commands : [] });
         return;
       }
 

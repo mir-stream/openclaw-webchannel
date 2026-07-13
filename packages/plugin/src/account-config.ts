@@ -252,6 +252,29 @@ export function resolveAcquisitionIdentity(
   };
 }
 
+/**
+ * Resolve whether the typing indicator is enabled for an account (P0-6).
+ *
+ * Reads the account's merged `capabilities.typing` (channel-level shared base
+ * under the account override — pass a config already resolved via
+ * `resolveWebchannelAccountConfig`). Enabled by ANYTHING but an explicit
+ * `"off"`, so an omitted key defaults ON, mirroring the legacy WS wiring at
+ * `index.ts` (`typing !== "off"`) — we apply the default here rather than
+ * depending on the JSON schema being applied.
+ *
+ * Unlike the legacy WS path, which reads the flat CHANNEL-LEVEL section, this
+ * reads the PER-ACCOUNT resolved config so each account's capability applies to
+ * its own channel (가-1 Cycle 2 — see `inbound.ts`). The NATS channel gate
+ * (`NatsChannel.setTypingEnabled`) was previously never wired, so an operator's
+ * `typing: "off"` was silently ignored on NATS.
+ */
+export function resolveTypingEnabled(accountConfig: WebchannelAccountConfig): boolean {
+  const capabilities = accountConfig?.capabilities as
+    | { typing?: "on" | "off" }
+    | undefined;
+  return (capabilities?.typing ?? "on") !== "off";
+}
+
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,
