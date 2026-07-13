@@ -13,15 +13,12 @@
     "allowImportingTsExtensions": false,
     "verbatimModuleSyntax": true
   },
-  // NOTE: `index-nats.ts` (the NATS entry) is deliberately NOT in `include`. It
-  // SHOULD be — leaving it tsc-blind is what let a `WEBCHANNEL_ID` free-identifier
-  // ReferenceError (P0-7 base commits) and a P0-2 bug ship past typecheck. But it
-  // currently accesses config fields the plugin SDK's `OpenClawConfig` type does
-  // not declare (`api.config.nats`, `api.config.saas`) and calls `historyPageBefore`
-  // with a request object where the type wants a string — 4 PRE-EXISTING errors
-  // unrelated to any current change. Adding it here fails typecheck on those alone.
-  // esbuild still bundles it (free identifiers are legal there), so the entry is
-  // built+shipped untyped. Re-add it once those config-surface types are fixed.
-  "include": ["index.ts", "setup-entry.ts", "src/**/*.ts"],
+  // `index-nats.ts` (the NATS entry) IS in `include` — it was tsc-blind before
+  // (which let a `WEBCHANNEL_ID` ReferenceError and a P0-2 bug ship past
+  // typecheck; issue #32). Plugin-sdk's `OpenClawConfig` doesn't declare channel
+  // config extensions (`nats`/`saas`), so the entry narrows `api.config` once via
+  // its local `WebchannelChannelConfig` — keep new top-level config reads on that
+  // seam, not fresh casts.
+  "include": ["index.ts", "setup-entry.ts", "index-nats.ts", "src/**/*.ts"],
   "exclude": ["node_modules"]
 }

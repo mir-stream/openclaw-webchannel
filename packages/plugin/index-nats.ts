@@ -104,6 +104,19 @@ type AccountRuntime = {
   historyConfig: ReturnType<typeof resolveHistoryConfig>;
 };
 
+/**
+ * Top-level config blocks this entry reads that plugin-sdk's `OpenClawConfig`
+ * does not model. The webchannel `channels add` wizard writes a shared `nats`/
+ * `saas` base at the config root (the default account's identity base); the SDK
+ * type only declares core keys, so `api.config` is narrowed once against this at
+ * the point of use. Both fields (and their members) are optional — the runtime
+ * already falls back to per-account config / acquisition env when absent.
+ */
+type WebchannelChannelConfig = {
+  nats?: { url?: string; devOpen?: boolean };
+  saas?: { baseUrl?: string };
+};
+
 /** accountId → runtime, built once per process (idempotent across re-warms). */
 const accountRuntimes = new Map<string, AccountRuntime>();
 /** Idempotency guard: the async per-account build runs once per process. */
@@ -305,7 +318,11 @@ export default defineChannelPluginEntry({
     }
     accountsBuildStarted = true;
 
-    const legacyNats = api.config.nats as { url?: string; devOpen?: boolean } | undefined;
+    // Narrow ONCE against the channel-plugin config extensions plugin-sdk's
+    // `OpenClawConfig` does not declare (see `WebchannelChannelConfig`). Every
+    // top-level `nats`/`saas` read below goes through this local.
+    const config = api.config as typeof api.config & WebchannelChannelConfig;
+    const legacyNats = config.nats;
 
     // Phase 3 planning (pure): list accounts. The wire identity is the accountId
     // itself (unique by construction), so there are no structural pre-I/O skips.
@@ -338,7 +355,7 @@ export default defineChannelPluginEntry({
         // Match the consume block's precedence (:277): plan-resolved base URL
         // (config `saas.baseUrl` over acquisition env) falls back to the flat
         // top-level `saas.baseUrl`.
-        plan.saasBaseUrl ?? api.config.saas?.baseUrl,
+        plan.saasBaseUrl ?? config.saas?.baseUrl,
         accountId,
         // SaaS-delivered issuer, persisted with the enrolled creds at
         // `channels add` time (EnrollmentResult.issuer). Same loader the
@@ -393,7 +410,7 @@ export default defineChannelPluginEntry({
         const source = resolveNatsCredentialSource({
           natsConfig: accountNatsCfg,
           legacyNats,
-          saasBaseUrl: plan.saasBaseUrl ?? api.config.saas?.baseUrl,
+          saasBaseUrl: plan.saasBaseUrl ?? config.saas?.baseUrl,
           tenant,
           accountId,
         });
