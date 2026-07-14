@@ -298,7 +298,14 @@ silently enable tool progress or answer partials.
   lane streams, then the atomic final answer arrives normally — proving the
   reasoning gate is independent of the answer streaming mode.
 - **Multiple bursts:** `onReasoningEnd` rotates one item; a later update creates the
-  next item.
+  next item. btw stale-burst defense: the btw runner never resets its
+  `reasoningText` accumulator at `thinking_end`, so a second burst's cumulative
+  payload still carries prior bursts' text as a raw prefix; the controller keeps
+  the closed burst's last RAW payload as its `stalePrefix` (assigned, not appended
+  from trimmed display text — trimming loses inter-burst whitespace and breaks the
+  prefix match from burst 3 on) and strips it from later payloads so each rotated
+  lane shows only its own text (ACP is unaffected — it ends reasoning at most once
+  per attempt).
 - **Missing `onReasoningEnd`:** turn settlement stops the active controller; no
   reasoning terminal state is required; `turn_settled` releases turn activity.
 - **Abort/error:** stop the active controller. Already-delivered reasoning remains

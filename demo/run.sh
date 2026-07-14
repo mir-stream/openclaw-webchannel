@@ -259,12 +259,16 @@ boot_agent() {
   # isolates users regardless of this setting. Kept (not removed) because the
   # full browser roundtrip could not be re-verified without it in this env;
   # it is harmless (it only affects non-webchannel channels + the core doctor).
+  #
+  # agents.defaults.reasoningDefault "stream" below opts this demo into the P1-3
+  # reasoning lane (level-gated; default is "off"), so a zai thinking model shows
+  # its reasoning in the widget. The echo stand-in produces no reasoning — harmless.
   cat > "$home/.openclaw/openclaw.json" <<JSON
 {
   "gateway": { "mode": "local", "bind": "loopback" },
   "session": { "dmScope": "per-channel-peer" },
   "models": { "providers": { $PROVIDER_BLOCK } },
-  "agents": { "defaults": { "model": { "primary": "$PRIMARY_MODEL" }, "compaction": { "reserveTokensFloor": 20000 } } },
+  "agents": { "defaults": { "model": { "primary": "$PRIMARY_MODEL" }, "compaction": { "reserveTokensFloor": 20000 }, "reasoningDefault": "stream" } },
   "messages": { "inbound": { "byChannel": { "webchannel": 300 } } },
   "plugins": {
     "load": { "paths": ["$REPO/packages/plugin"] },
