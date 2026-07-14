@@ -13,8 +13,8 @@
 > demo rewrote the demo surface (now `demo/web/src/widget.ts` over the `WebChannelNATSClient` reducer),
 > and the parity stack has since landed several P1 items. **Now built:** **P1-1 markdown (#27)**,
 > **P1-7 error/reconnect UX** (mostly), and **P1-8** (`/stop` control lane #25 + debounce/coalesce
-> #29), and P1-3 reasoning lane — all marked ✅. **Still open:** P1-2 long-response,
-> P1-4 media, P1-6 doctor, P1-7 finer wording, and P1-9 unsend.
+> #29), P1-3 reasoning lane, and **P1-9 unsend** (Option A client-side hold) — all marked ✅.
+> **Still open:** P1-2 long-response, P1-4 media, P1-6 doctor, and P1-7 finer wording.
 > Note (#14): the plugin has a partial-mode answer-text stream (`streaming.mode:"partial"`, exercised
 > in the demo) — P1-3's reasoning lane builds on that existing stream, not a net-new one.
 >
@@ -374,7 +374,7 @@ quick succession produce **one** coalesced turn.
 
 ---
 
-## P1-9 — Pending-message retraction ("unsend" a queued message) — 🟢 WEB ADVANTAGE (no Telegram equiv)
+## P1-9 — Pending-message retraction ("unsend" a queued message) — ✅ BUILT (Option A — client-side hold)
 
 **Symptom.** You send a message while a turn is still running; it sits queued (`inbound-queue.ts`
 FIFO) and is delivered to the agent only after the current turn finishes. There is no way to pull it
@@ -387,15 +387,44 @@ reply-chain cache; it never dequeues a pending turn. Because **we own the browse
 offer genuine retraction — a superset of Telegram. Distinct from P1-8: retraction targets a
 **not-yet-started** queued message; aborting the **in-flight** turn is P1-8.
 
-**Where it stands today (nothing built — sends go straight through).**
-- The widget publishes immediately: `submit()` → `client.send(text)` → the wrapper publishes over
-  NATS at once. Nothing is held locally; there is no pending chip and no retract control.
-- Queueing happens **server-side** (`inbound-queue.ts` per-session FIFO / the P1-8b coalesce buffer).
-  The outbound union has no `retract` frame (`user_message` / `approval_decision` / `load_history` /
-  `load_commands` only), so once published a message is committed to the chain.
-- **Note:** P1-8b already gave the queue a content buffer (`src/inbound-queue.ts` `pending` +
-  `clearPending`) — the same server-side buffer Option B below needs. So Option B's prerequisite now
-  exists; only the `retract` frame + a by-id dequeue would be net-new.
+**What shipped (Option A — client-side hold; zero wire change, zero server-runtime change).** See
+`docs/P1_9_UNSEND_PLAN.md` (v4) for the full design + rationale. The hold lives in the wrapper
+(`packages/client/src/nats-client-wrapper.ts`), not the widget, so any embedder inherits it:
+- `send()` HOLDS when `state.isTyping || a working draft || held.length > 0` (the last is a FIFO latch
+  across disconnects); a held message is a `pending: true` local bubble, published only on release.
+- Release is FIFO-all, gated on `connected && sessionEstablished` (a new `onSession` hook in
+  `nats-client.ts`, fired at BOTH key-establishment sites strictly AFTER `flushQueue()` — drain → flush
+  → notify, so a released hold is ordered behind the P0-7b ledger replay). Released bubbles are moved
+  to the **tail** of the transcript (display position = publish position — load-bearing for the
+  history merge's local-order = transcript-order invariant).
+- Abort text bypasses the hold (`packages/client/src/abort-mirror.ts` mirrors core's `ABORT_TRIGGERS`
+  as a strict SUBSET; a plugin-package contract test enforces the subset against the real SDK
+  predicate). Explicit `/stop` additionally flips held bubbles to `retracted: true` (kept in the
+  transcript, restorable); NL abort words bypass but leave held messages intact.
+- `retract(id)` removes a pending or retracted bubble; a `turn_settled` draft-finalize + a
+  post-reconnect staleness valve (`STALE_DRAFT_GRACE_MS = 30_000`, connection-scoped) prevent a wedged
+  `working` draft from becoming a permanent send lockout. Note: the valve re-arms FRESH on every
+  register, so under a register storm (< 30s apart — the documented duplicate-responder failure mode)
+  its grace keeps resetting and expiry is deferred; non-lossy (chips stay retractable, `/stop`
+  recovers text), just slower to unwedge until the storm itself is fixed.
+- **Maintenance duty:** `abort-mirror.ts` is a VERBATIM pin of the openclaw dist `ABORT_TRIGGERS` +
+  normalization. It accepts a subset of core, so a false positive is impossible, but core GROWING its
+  vocabulary is invisible to the mirror (the new word is held-then-released — a bounded stale-abort
+  residual). **Re-pin the trigger set + normalization on every openclaw upgrade;** the contract test
+  catches a REMOVED word (prune the mirror) but cannot see additions.
+- **Known edge (pre-existing, documented while P1-9 touched the probe):** a bypassed mid-turn immediate
+  send (e.g. an NL abort echo) sitting between the tier-3 anchor and the reply blocks the positional
+  probe when the server does not transcript that text. This is byte-for-byte the SAME path any mid-turn
+  immediate send takes today — not introduced by P1-9, which only made the probe skip local-only
+  pending/retracted chips.
+- **Accepted residual (approval-wait window):** if `approval_request` clears `isTyping` with no working
+  draft live, held messages release into the server coalesce buffer behind the approval-blocked turn
+  (unretractable from that point) — exactly today's behavior for that window; Option A never makes it
+  worse. Fixing it needs Option B.
+
+Option B (server-side dequeue) stays deferred: P1-8b already gave the queue a content buffer
+(`src/inbound-queue.ts` `pending` + `clearPending`), so Option B's prerequisite exists; only a
+`retract` frame + a by-id dequeue + a protocol bump would be net-new. Not now.
 
 **Telegram reference.** None — this affordance does not exist in Telegram (see Classification). This
 item is scoped from our own transport, not benchmarked.
@@ -428,7 +457,7 @@ costs no E2E/server work, and stays purely in `demo/web/src/widget.ts` + a small
 | Order | Gap | Effort | Depends on |
 |---|---|---|---|
 | ✅ | P1-3 reasoning lane | M | built — native callback + turn-correlated lane |
-| 2 | P1-9 pending-message retraction (unsend) | S | — (Option A: client hold, no server/wire change) |
+| ✅ | P1-9 pending-message retraction (unsend) | S | built — Option A client hold, no server/wire change |
 | ✅ | P1-7 finer error wording | XS | built — cause tag threaded to a cause-driven terminal error box |
 | 4 | P0-3 argument menus | S | — (catalog entries already carry `args.choices`; render dropdowns) |
 | 5 | P1-2 long-response polish | S | P1-1 ✅ |

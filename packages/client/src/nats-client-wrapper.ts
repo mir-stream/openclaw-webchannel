@@ -28,6 +28,10 @@ import {
   type NatsClientOptions,
   type InboundMessage,
 } from "./nats-client.js";
+// P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
+// NOT re-exported from the public barrel; imported directly here and by the
+// plugin-side contract test.
+import { isLikelyAbortText, isExplicitStop } from "./abort-mirror.js";
 
 // ---------------------------------------------------------------------------
 // WebChannel NATS Client
@@ -55,6 +59,35 @@ export class WebChannelNATSClient {
   };
 
   private readonly listeners = new Set<Listener>();
+
+  /**
+   * P1-9: user messages HELD locally because a turn was in flight at send time
+   * (the local twin of the server-side coalesce buffer). Insertion-ordered;
+   * released FIFO once the turn settles AND the session key exists. Each entry's
+   * `localId` is the id of its `pending: true` transcript bubble.
+   */
+  private readonly held: Array<{ localId: string; text: string }> = [];
+  /**
+   * P1-9 §3.2: true only between a session KEY establishment (onSession, fired
+   * after flushQueue) and the next disconnect. The release gate depends on THIS,
+   * not the raw `connected` flip — at onState(true) the conversation key does not
+   * exist yet, so releasing there would push held texts into the SDK outbound
+   * queue (committed, ✕ gone) with nothing publishable AND ahead of the P0-7b
+   * ledger replay (FIFO inversion). Cleared on every onState(false).
+   */
+  private sessionEstablished = false;
+  /**
+   * P1-9 §3.6.2: post-reconnect staleness valve. `staleDraftWatch` holds the ids
+   * of `working` drafts recorded when onSession fired; the timer flips any still
+   * in the set to `working: false` in place (never swapping the id) after the
+   * grace. Both are connection-scoped: cleared on every onState(false)/close()
+   * and re-armed FRESH on every onSession, so the grace counts only connected
+   * time. A draft-touching frame (progress/agent_message by id, reasoning by
+   * turnId) disarms its entry — the turn is demonstrably alive.
+   */
+  private readonly staleDraftWatch = new Set<string>();
+  private staleDraftTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly STALE_DRAFT_GRACE_MS = 30_000;
 
   // `url` and `jwt` are supplied through the WebChannelOptions aliases
   // `natsUrl` / `bootstrapJwt`, so they are Omitted from the NatsClientOptions
@@ -93,6 +126,15 @@ export class WebChannelNATSClient {
     // (CL2), a trailing `onState(false)` from the connection teardown must NOT
     // downgrade it back to "reconnecting" — the client is not reconnecting.
     this.client.onState((connected: boolean) => {
+      if (!connected) {
+        // P1-9: the conversation key is gone on ANY disconnect — close the
+        // release gate and clear the connection-scoped staleness valve. Done
+        // BEFORE the terminal-"error" early return below so neither ever
+        // depends on that branch's behavior; the valve re-arms fresh on the
+        // next onSession (grace counts only connected time, §3.6.2).
+        this.sessionEstablished = false;
+        this.clearStaleDraftWatch();
+      }
       if (!connected && this.state.status === "error") return;
       this.setState({
         status: connected ? "connected" : "reconnecting",
@@ -103,6 +145,18 @@ export class WebChannelNATSClient {
         // back up — without this it would keep a stale `error`/`errorCause`.
         ...(connected ? { error: undefined, errorCause: undefined } : { isTyping: false }),
       });
+      // P1-9: a connection flip is a state transition — re-evaluate the release
+      // gate (a no-op unless the key is up and nothing is in flight).
+      this.maybeRelease();
+    });
+
+    // P1-9 §3.2/§3.6.2: session KEY established (both register-unwrap and legacy
+    // handshake paths, strictly AFTER flushQueue). Open the release gate, arm the
+    // staleness valve fresh, and try to release — ordered behind the ledger replay.
+    this.client.onSession(() => {
+      this.sessionEstablished = true;
+      this.armStaleDraftWatch();
+      this.maybeRelease();
     });
 
     // CL2: surface a TERMINAL failure to the embedder. The underlying client
@@ -153,6 +207,8 @@ export class WebChannelNATSClient {
 
   /** Disconnect from NATS */
   close(): void {
+    // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
+    this.clearStaleDraftWatch();
     this.client.disconnect();
   }
 
@@ -161,15 +217,65 @@ export class WebChannelNATSClient {
     const trimmed = text.trim();
     if (!trimmed) return;
 
-    // P0-7b: capture the wire id so a later `ack` frame can mark this local echo
-    // delivered (the SDK correlates by wireId, never the synthetic local id).
-    // Known/accepted: sendUserMessage publishes BEFORE appendMessage records the
-    // echo, so a SAME-TICK synchronous ack would miss the bubble and `delivered`
-    // would never flip. That can only happen on a synchronous fake transport (a
-    // test); over a real WS/NATS socket the ack is always a later event-loop turn,
-    // so it lands after the echo exists. Not restructured.
-    const wireId = this.client.sendUserMessage(trimmed);
+    // P1-9 §3.3: abort-shaped text ALWAYS bypasses the hold. Holding an abort
+    // deadlocks (the hold waits for the settle, the settle needs the abort);
+    // releasing it later aborts the WRONG turn (the user's own just-started
+    // follow-up, or a turn another device started). The server control lane
+    // stays the single authority on what an abort DOES — we only ensure the text
+    // reaches it immediately. An explicit `/stop` additionally retracts the held
+    // messages (§3.4: "stop means stop everything, including what I queued"); NL
+    // abort words leave held entries intact (mirroring the server, where only the
+    // explicit command clears the buffer).
+    if (isLikelyAbortText(trimmed)) {
+      if (isExplicitStop(trimmed)) this.markHeldRetracted();
+      this.publish(trimmed);
+      return;
+    }
 
+    // P1-9 §3.1: hold while a turn is in flight OR anything is already held. The
+    // `held.length > 0` latch preserves FIFO across a disconnect (onState(false)
+    // forces isTyping:false, so without the latch a send during the reconnect
+    // window would publish ahead of an earlier held message).
+    if (this.shouldHold()) {
+      const localId = `u-${this.uid()}`;
+      this.held.push({ localId, text: trimmed });
+      this.appendMessage({ id: localId, role: "user", text: trimmed, pending: true });
+      return;
+    }
+
+    this.publish(trimmed);
+  }
+
+  /**
+   * P1-9 retraction. Accepts a PENDING (still held) or a RETRACTED (/stop-marked)
+   * bubble by id: removes it from `held[]` (pending case) and from the transcript,
+   * returns true. Any other id (a normal sent bubble, an agent bubble, unknown) →
+   * false, no-op. No race with release: both run on the single JS thread and
+   * release flips `pending` off synchronously before any user event observes it.
+   */
+  retract(id: string): boolean {
+    const msg = this.state.messages.find((m) => m.id === id);
+    if (!msg || (msg.pending !== true && msg.retracted !== true)) return false;
+    const hi = this.held.findIndex((h) => h.localId === id);
+    if (hi !== -1) this.held.splice(hi, 1);
+    this.setState({ messages: this.state.messages.filter((m) => m.id !== id) });
+    return true;
+  }
+
+  /**
+   * Publish a user message immediately — today's send path, unchanged. Extracted
+   * so both the no-hold and the abort-bypass branches share it (§3.1/§3.3).
+   *
+   * P0-7b: capture the wire id so a later `ack` frame can mark this local echo
+   * delivered (the SDK correlates by wireId, never the synthetic local id).
+   * Known/accepted: sendUserMessage publishes BEFORE appendMessage records the
+   * echo, so a SAME-TICK synchronous ack would miss the bubble and `delivered`
+   * would never flip. That can only happen on a synchronous fake transport (a
+   * test); over a real WS/NATS socket the ack is always a later event-loop turn,
+   * so it lands after the echo exists. Not restructured.
+   */
+  private publish(trimmed: string): void {
+    const wireId = this.client.sendUserMessage(trimmed);
     this.appendMessage({
       id: `u-${this.uid()}`,
       role: "user",
@@ -177,6 +283,160 @@ export class WebChannelNATSClient {
       wireId,
       turnId: wireId,
     });
+  }
+
+  /** P1-9 §3.1: a turn is in flight when the agent is typing or a draft is working. */
+  private turnInFlight(): boolean {
+    return this.state.isTyping === true || this.state.messages.some((m) => m.working);
+  }
+
+  /** P1-9 §3.1: hold predicate — in flight OR the latch keeps prior holds first. */
+  private shouldHold(): boolean {
+    return this.turnInFlight() || this.held.length > 0;
+  }
+
+  /**
+   * P1-9 §3.2: release ALL held messages FIFO once the turn has settled AND the
+   * session key exists (a released burst hits an idle session — the first starts
+   * a turn, the rest coalesce into one follow-up, exactly as a live burst does).
+   *
+   * Each released bubble is published, patched `{pending:false, wireId, turnId}`,
+   * AND MOVED TO THE TAIL of `state.messages` (display position = publish
+   * position). Moving to the tail is load-bearing, not cosmetic: the history
+   * merge assumes local order mirrors transcript order (the tier-3 probe + the
+   * insertion cursor). An in-place release would order a held chip ABOVE the
+   * reply it delayed while the server transcript orders it after — the next
+   * snapshot would mis-adopt or duplicate. Moving to the tail makes a released
+   * bubble an ordinary send in an ordinary position.
+   *
+   * Re-entrancy: snapshot-and-clear `held[]` BEFORE the per-bubble setState calls
+   * — each setState fires listeners synchronously mid-loop, and a listener
+   * calling retract()/send() re-entrantly must see a consistent `held[]`.
+   */
+  private maybeRelease(): void {
+    if (
+      this.held.length === 0 ||
+      this.turnInFlight() ||
+      !this.state.connected ||
+      !this.sessionEstablished
+    ) {
+      return;
+    }
+    const releasing = this.held.slice();
+    this.held.length = 0;
+
+    for (const { localId, text } of releasing) {
+      const wireId = this.client.sendUserMessage(text);
+      const bubble = this.state.messages.find((m) => m.id === localId);
+      // A re-entrant listener may have already removed the bubble; the text is
+      // still published (correct — release is a commit), so just skip the patch.
+      if (!bubble) continue;
+      const messages = this.state.messages.filter((m) => m.id !== localId);
+      messages.push({ ...bubble, pending: false, wireId, turnId: wireId });
+      this.setState({ messages });
+    }
+  }
+
+  /**
+   * P1-9 §3.4: an explicit /stop moves every held entry out of `held[]` and flips
+   * its bubble to `{pending:false, retracted:true}` — KEPT in the transcript
+   * (text preserved, restorable), never auto-released. Unlike the server's
+   * allowlist-gated buffer drop, client-held text exists nowhere else, so we mark
+   * rather than delete (A6). NL abort words do not call this.
+   */
+  private markHeldRetracted(): void {
+    if (this.held.length === 0) return;
+    const ids = new Set(this.held.map((h) => h.localId));
+    this.held.length = 0;
+    this.setState({
+      messages: this.state.messages.map((m) =>
+        ids.has(m.id) ? { ...m, pending: false, retracted: true } : m,
+      ),
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // P1-9 §3.6: stale working-draft reconciliation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * §3.6.1: finalize any `working` draft whose turnId matches a settled turn
+   * (flip `working: false` in place — id/text untouched). Settled means no more
+   * upserts are coming; if `turnInFlight` drops as a result, the end-of-frame
+   * `maybeRelease()` releases held messages.
+   */
+  private finalizeDraftsForTurn(turnId?: string): void {
+    if (!turnId) return;
+    let changed = false;
+    const messages = this.state.messages.map((m) => {
+      if (m.working && m.turnId === turnId) {
+        changed = true;
+        this.staleDraftWatch.delete(m.id);
+        return { ...m, working: false };
+      }
+      return m;
+    });
+    if (changed) this.setState({ messages });
+  }
+
+  /**
+   * §3.6.2: arm the post-reconnect staleness valve FRESH — record the ids of the
+   * currently-`working` drafts and start a one-shot grace timer. Called only from
+   * onSession (session re-establishment), never during a healthy connection, so
+   * the normal lifecycle can't trip it. Clears any prior watch/timer first.
+   */
+  private armStaleDraftWatch(): void {
+    this.clearStaleDraftWatch();
+    for (const m of this.state.messages) {
+      if (m.working) this.staleDraftWatch.add(m.id);
+    }
+    if (this.staleDraftWatch.size === 0) return;
+    this.staleDraftTimer = setTimeout(
+      () => this.expireStaleDrafts(),
+      WebChannelNATSClient.STALE_DRAFT_GRACE_MS,
+    );
+  }
+
+  /** §3.6.2: clear the watch set AND the grace timer (connection teardown / re-arm). */
+  private clearStaleDraftWatch(): void {
+    this.staleDraftWatch.clear();
+    if (this.staleDraftTimer) {
+      clearTimeout(this.staleDraftTimer);
+      this.staleDraftTimer = null;
+    }
+  }
+
+  /** §3.6.2: reasoning-frame disarm — drop watched drafts belonging to `turnId`. */
+  private disarmStaleDraftsByTurn(turnId: string): void {
+    if (this.staleDraftWatch.size === 0) return;
+    for (const m of this.state.messages) {
+      if (m.turnId === turnId && this.staleDraftWatch.has(m.id)) {
+        this.staleDraftWatch.delete(m.id);
+      }
+    }
+  }
+
+  /**
+   * §3.6.2: grace expired. Any draft still in the watch set (no draft-touching
+   * frame arrived across the grace) is presumed stale — flip `working: false` IN
+   * PLACE (id and text untouched, so a WRONG guess self-heals: a later progress
+   * upsert re-matches the id and re-flips it working, re-engaging the hold). Then
+   * re-evaluate the release gate.
+   */
+  private expireStaleDrafts(): void {
+    this.staleDraftTimer = null;
+    if (this.staleDraftWatch.size === 0) return;
+    let changed = false;
+    const messages = this.state.messages.map((m) => {
+      if (this.staleDraftWatch.has(m.id) && m.working) {
+        changed = true;
+        return { ...m, working: false };
+      }
+      return m;
+    });
+    this.staleDraftWatch.clear();
+    if (changed) this.setState({ messages });
+    this.maybeRelease();
   }
 
   /** Send approval decision */
@@ -262,6 +522,14 @@ export class WebChannelNATSClient {
   // ---------------------------------------------------------------------------
 
   private handleMessage(msg: InboundMessage): void {
+    this.handleFrame(msg);
+    // P1-9 §3.2: every handled frame is a state transition — re-evaluate the
+    // release gate after the reducer settles (a no-op when nothing is held or a
+    // turn is still in flight).
+    this.maybeRelease();
+  }
+
+  private handleFrame(msg: InboundMessage): void {
     switch (msg.type) {
       case "history": {
         const incoming = Array.isArray(msg.messages) ? msg.messages : [];
@@ -314,9 +582,15 @@ export class WebChannelNATSClient {
         // device's server id onto this device's bubble — the ids swap between
         // the two bubbles, but the bubble COUNT stays exactly right and every
         // later snapshot still dedups, so nothing duplicates or disappears.
+        // P1-9 §6.3: a held (pending) or /stop-retracted user bubble is
+        // LOCAL-ONLY (never on the wire, never in the transcript). It must NEVER
+        // be an adoption target — a snapshot row with identical text (the same
+        // text sent from another device) would otherwise steal its server id onto
+        // our UNSENT bubble, and the later release would run/duplicate it. Exclude
+        // both from the tier-2 text-match pool.
         const isLocalLiveId = (m: ChatMessage): boolean =>
           m.role === "user"
-            ? m.id.startsWith("u-")
+            ? m.id.startsWith("u-") && m.pending !== true && m.retracted !== true
             : !m.working && (m.id.startsWith("a-") || m.id.startsWith("webchannel-"));
         const adoptKey = (role: string, text: string): string => `${role} ${text}`;
 
@@ -392,7 +666,23 @@ export class WebChannelNATSClient {
           }
           // Tier 3: positional (agent replies whose live text was reformatted).
           if (m.role === "agent" && anchor !== null) {
-            const cand = anchor + 1;
+            // P1-9 §6.3: a held (pending) or retracted user chip is local-only
+            // and sits BETWEEN the anchor and the agent reply it delayed
+            // (`[u2, h3(pending), A]`). The probe was hard-coded to `anchor + 1`,
+            // which would land on the chip (role user) and miss `A` → the
+            // snapshot row fresh-inserts → duplicate agent bubble. Skip past
+            // pending/retracted bubbles (they can never correspond to a snapshot
+            // row) and probe the first NON-local candidate after the anchor.
+            // CURSOR MECHANICS ARE UNTOUCHED — fresh rows still insert at the
+            // plain `cursor` (before a held chip is chronologically correct;
+            // anything the snapshot carries predates the unpublished chip).
+            let cand = anchor + 1;
+            while (
+              cand < next.length &&
+              (next[cand].pending === true || next[cand].retracted === true)
+            ) {
+              cand++;
+            }
             if (
               cand < next.length &&
               !claimed.has(cand) &&
@@ -647,17 +937,27 @@ export class WebChannelNATSClient {
           { id: id ?? "", role: "agent", text, working: true, turnId: msg.turnId },
         );
         this.setState({ isTyping: false });
+        // P1-9 §3.6.2: a progress upsert on a watched draft proves the turn is
+        // still alive — disarm its staleness entry.
+        this.staleDraftWatch.delete(id ?? "");
         return;
       }
 
       case "reasoning": {
         if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) return;
         this.upsertReasoning({ id: msg.id, turnId: msg.turnId, text: msg.text });
+        // P1-9 §3.6.2: reasoning correlates by turnId — disarm any watched draft
+        // for this turn (the turn is demonstrably still producing frames).
+        this.disarmStaleDraftsByTurn(msg.turnId);
         return;
       }
 
       case "turn_settled": {
         this.setState({ isTyping: false });
+        // P1-9 §3.6.1: settled ⇒ no more upserts — finalize any lingering working
+        // draft whose turnId matches (in the normal flow the final agent_message
+        // already did this, a no-op). Never swaps the id.
+        this.finalizeDraftsForTurn(msg.turnId);
         return;
       }
 
@@ -671,6 +971,8 @@ export class WebChannelNATSClient {
             (prev) => ({ ...prev, text: text ?? "", working: false, turnId: msg.turnId ?? prev.turnId }),
             { id, role: "agent", text: text ?? "", working: false, turnId: msg.turnId },
           );
+          // P1-9 §3.6.2: the final upsert also proves liveness — disarm.
+          this.staleDraftWatch.delete(id);
           return;
         }
 

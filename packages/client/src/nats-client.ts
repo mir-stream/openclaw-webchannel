@@ -251,6 +251,15 @@ export type ProtocolInfo = {
 /** Register-handshake protocol/version listener. */
 export type ProtocolListener = (info: ProtocolInfo) => void;
 
+/**
+ * P1-9: fired once per session KEY-establishment (both the register-delivered-K
+ * path and the legacy handshake path), strictly AFTER `flushQueue()`. Lets the
+ * wrapper release held sends only when the conversation key exists AND the P0-7b
+ * unacked ledger has already been replayed to the front of the wire — see the
+ * `drain → flush → notify` ordering in `onConnected`/`handleRaw`.
+ */
+export type SessionListener = () => void;
+
 // ---------------------------------------------------------------------------
 // WebSocket-based NATS client (browser-compatible)
 // -----------------------------------------------------------------
@@ -881,6 +890,7 @@ export class WebChannelNatsClient {
   private readonly messageListeners = new Set<MessageListener>();
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly protocolListeners = new Set<ProtocolListener>();
+  private readonly sessionListeners = new Set<SessionListener>();
 
   private keyPair: BrowserKeyPair | null = null;
   private sessionKey: Uint8Array | null = null;
@@ -1032,6 +1042,17 @@ export class WebChannelNatsClient {
   onProtocol(listener: ProtocolListener): () => void {
     this.protocolListeners.add(listener);
     return () => { this.protocolListeners.delete(listener); };
+  }
+
+  /**
+   * P1-9: add a session-established listener. Fires once per key establishment
+   * (register-delivered K and legacy handshake), strictly AFTER `flushQueue()`
+   * — so a listener that publishes (releasing held sends) is ordered behind the
+   * P0-7b ledger replay that `flushQueue()` moved to the front of the wire.
+   */
+  onSession(listener: SessionListener): () => void {
+    this.sessionListeners.add(listener);
+    return () => { this.sessionListeners.delete(listener); };
   }
 
   // ---------------------------------------------------------------------------
@@ -1278,6 +1299,9 @@ export class WebChannelNatsClient {
         this.sessionKey = key;
         this.drainPendingInbound();
         this.flushQueue();
+        // P1-9: notify AFTER flushQueue so a released hold is ordered behind the
+        // P0-7b ledger replay (drain → flush → notify; see onSession).
+        this.notifySessionListeners();
         return;
       }
     }
@@ -1332,6 +1356,8 @@ export class WebChannelNatsClient {
       this.clearHandshakeRetry();
       this.drainPendingInbound();
       this.flushQueue();
+      // P1-9: notify AFTER flushQueue (drain → flush → notify; see onSession).
+      this.notifySessionListeners();
       return;
     }
 
@@ -1452,6 +1478,16 @@ export class WebChannelNatsClient {
         listener(info);
       } catch (e) {
         console.error("[nats-client] Protocol listener error:", e);
+      }
+    });
+  }
+
+  private notifySessionListeners(): void {
+    this.sessionListeners.forEach((listener) => {
+      try {
+        listener();
+      } catch (e) {
+        console.error("[nats-client] Session listener error:", e);
       }
     });
   }
