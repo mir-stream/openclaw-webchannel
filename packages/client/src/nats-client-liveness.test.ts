@@ -95,7 +95,8 @@ describe("CL2 — terminal auth failure", () => {
       heartbeatIntervalMs: 0, // isolate CL2 from the heartbeat
     });
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     let lastConnected = false;
     client.onState((c) => { lastConnected = c; });
 
@@ -110,6 +111,8 @@ describe("CL2 — terminal auth failure", () => {
 
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toMatch(/authorization/i);
+    // P1-7: a violation is a credential never/no-longer acceptable → auth-rejected.
+    expect(causes).toEqual(["auth-rejected"]);
     expect(lastConnected).toBe(false);
     expect(ws.closed).toBe(true);
 
@@ -181,7 +184,8 @@ describe("CL2 — terminal auth failure", () => {
       heartbeatIntervalMs: 0,
     });
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
 
     client.connect();
     await flush();
@@ -189,6 +193,9 @@ describe("CL2 — terminal auth failure", () => {
     await flush();
 
     expect(errors).toHaveLength(1); // expired creds → terminal
+    // P1-7: a TTL lapse on a valid credential → auth-expired (distinct from a
+    // violation), so scene ⑤ can say "Credentials expired".
+    expect(causes).toEqual(["auth-expired"]);
   });
 });
 

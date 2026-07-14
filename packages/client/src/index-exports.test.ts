@@ -16,7 +16,14 @@ import {
   WEBCHANNEL_PROTOCOL_VERSION,
   type BootstrapPayload,
   type PinnedKeys,
+  type WebChannelErrorCause,
 } from "./index.js";
+
+// P1-7: compile-time export assertion for the new type. A type-only export has no
+// runtime value, so there is nothing to `expect` at runtime — this TYPE-POSITION
+// use is the whole check: if the barrel stops exporting the name, tsc fails here.
+const _errorCauseExported: WebChannelErrorCause = "protocol-mismatch";
+void _errorCauseExported;
 
 /** Deterministic 32-byte key (no crypto.getRandomValues — reproducible). */
 function makeKey32(seed: number): Uint8Array {

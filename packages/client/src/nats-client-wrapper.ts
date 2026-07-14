@@ -15,6 +15,7 @@
 import type {
   WebChannelOptions,
   WebChannelState,
+  WebChannelErrorCause,
   Listener,
   ApprovalDecision,
   ApprovalOption,
@@ -96,7 +97,11 @@ export class WebChannelNATSClient {
       this.setState({
         status: connected ? "connected" : "reconnecting",
         connected,
-        ...(!connected ? { isTyping: false } : {}),
+        // P1-7: a successful (re)connect clears a stale terminal reason. The
+        // register-failure sites don't set the raw client's `terminal` flag, so a
+        // generic embedder calling connect() again on the SAME instance can come
+        // back up — without this it would keep a stale `error`/`errorCause`.
+        ...(connected ? { error: undefined, errorCause: undefined } : { isTyping: false }),
       });
     });
 
@@ -106,9 +111,17 @@ export class WebChannelNATSClient {
     // creds) — and has stopped reconnecting. We move to the terminal `"error"`
     // status with a reason so the app can prompt for fresh credentials instead
     // of showing an eternal reconnect spinner.
-    this.client.onError((err: Error) => {
+    this.client.onError((err: Error, cause?: WebChannelErrorCause) => {
       console.error("[nats-wrapper] terminal connection error:", err);
-      this.setState({ status: "error", connected: false, error: err.message });
+      // P1-7: carry the machine-readable cause onto state so the embedder picks
+      // truthful wording + the right recovery affordance. A classified emit site
+      // supplies its cause; an unclassified failure falls back to "unknown".
+      this.setState({
+        status: "error",
+        connected: false,
+        error: err.message,
+        errorCause: cause ?? "unknown",
+      });
     });
 
     // Register-handshake outcome: surface the agent-plugin's protocol/plugin

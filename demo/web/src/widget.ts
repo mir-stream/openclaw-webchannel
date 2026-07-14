@@ -12,14 +12,18 @@
  *
  * Scene ⑤ (short-lived trust): the "short-lived" control reconnects the lane with
  * a short-TTL NATS credential. When it lapses the relay refuses it, the client
- * classifies `-ERR Authentication Expired` as TERMINAL (no eternal spinner), and
- * the widget shows a distinct "credentials expired" state with a one-click
- * re-authenticate that mints a fresh, normal credential.
+ * classifies `-ERR Authentication Expired` as TERMINAL (no eternal spinner) with
+ * cause `auth-expired`. The terminal error box (P1-7) is cause-driven: it maps the
+ * `state.errorCause` tag to truthful wording + the right recovery affordance via
+ * `terminalErrorCopy`, so scene ⑤ shows "Credentials expired" + re-authenticate,
+ * while a protocol mismatch or embedder config error shows its own heading and
+ * hides the (useless) re-auth button.
  */
 import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/client/src/index.js";
 import type { WebChannelState, ApprovalRequest } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
 import { renderMarkdown } from "./markdown.js";
+import { terminalErrorCopy } from "./error-copy.js";
 import {
   orderConversationPresentation,
   captureOpenReasoningIds,
@@ -159,16 +163,25 @@ export async function createWidget(
       : state.status === "error" ? "var(--bad)"
       : "var(--warn)";
 
-    // Terminal error → distinct "credentials expired" box with a re-auth button
-    // (scene ⑤ honest terminal-error UX — NOT the reconnect spinner).
+    // Terminal error → cause-driven box (P1-7): the heading/hint and whether a
+    // Re-authenticate button is offered come from `terminalErrorCopy(errorCause)`,
+    // so a protocol mismatch or embedder config error no longer masquerades as the
+    // single hardcoded "Credentials expired" state. The raw `state.error` detail
+    // line renders ONLY when present; the copy.hint always renders exactly once
+    // (no duplicate). NOT the reconnect spinner.
     if (state.status === "error") {
-      const reauth = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
-      reauth.onclick = () => { void connectLane(); };
-      errBox.replaceChildren(
-        el("div", { style: "font-weight:600;margin-bottom:4px" }, ["Credentials expired"]),
-        el("div", {}, [state.error ?? "the relay rejected the credential — re-authenticate to continue"]),
-        reauth,
-      );
+      const copy = terminalErrorCopy(state.errorCause);
+      const children: Node[] = [
+        el("div", { style: "font-weight:600;margin-bottom:4px" }, [copy.heading]),
+      ];
+      if (state.error) children.push(el("div", {}, [state.error]));
+      children.push(el("div", { style: "color:var(--muted);margin-top:4px" }, [copy.hint]));
+      if (copy.showReauth) {
+        const reauth = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
+        reauth.onclick = () => { void connectLane(); };
+        children.push(reauth);
+      }
+      errBox.replaceChildren(...children);
       errBox.classList.remove("hidden");
       input.disabled = true;
       sendBtn.disabled = true;

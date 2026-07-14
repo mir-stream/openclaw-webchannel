@@ -123,6 +123,40 @@ export type ApprovalRequest = {
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "error";
 
 /**
+ * Machine-readable cause of a TERMINAL connection failure (status `"error"`).
+ * Drives per-cause wording + the recovery affordance in the embedder UI, so a
+ * protocol mismatch or an embedder config bug no longer masquerades as the single
+ * hardcoded "Credentials expired" heading. Additive/open string union — a future
+ * producer can add a member and older UIs fall through to `"unknown"`.
+ */
+export type WebChannelErrorCause =
+  // `-ERR …Authentication Expired`: creds were valid, their TTL lapsed. Benign,
+  // expected with short-TTL creds (demo scene ⑤); re-auth mints a fresh one.
+  | "auth-expired"
+  // `-ERR …Authorization Violation` OR a PoP register 401: this credential was
+  // never/no-longer acceptable (possibly revoked). Re-auth. Stays
+  // revocation-NEUTRAL — a benign expiry hitting during a reconnect window is
+  // rejected at CONNECT as a violation, so this cause can cover that user story too.
+  | "auth-rejected"
+  // Version mismatch, malformed `protocolVersion`, or a register reply with no
+  // `wrappedConversationKey`: the two sides speak incompatible wire contracts.
+  // Re-auth CANNOT help — the older side must be upgraded.
+  | "protocol-mismatch"
+  // Missing SaaS-pinned agent key OR a conversation-key unwrap failure: the E2E
+  // session could not be authenticated/established. Re-auth (which refetches the
+  // bootstrap, incl. the pin) can genuinely recover it — or it is tampering.
+  | "secure-channel-failed"
+  // Embedder-side bug: the bootstrap `jwt` is missing. A code fix, not a retry —
+  // re-auth provably cannot help.
+  | "config"
+  // PoP register non-401/non-503 error reply (typically 5xx; the reply is
+  // deliberately a no-oracle, so an odd 4xx lands here too — acceptable). Retry
+  // later / re-auth.
+  | "server"
+  // Fallback — any terminal error without a classified cause.
+  | "unknown";
+
+/**
  * The full client state, recomputed immutably on every change. A new object is
  * produced per change (the arrays too), so a `subscribe` listener can cheaply
  * detect updates by identity — and a React adapter can feed it straight into
@@ -142,6 +176,13 @@ export type WebChannelState = {
    * embedder show a real message instead of an eternal reconnect spinner.
    */
   error?: string;
+  /**
+   * Set alongside `error` when `status === "error"`: the machine-readable cause
+   * of the terminal failure, so the embedder can pick truthful wording + the
+   * right recovery affordance (not the single "Credentials expired" heading).
+   * Cleared together with `error` on a later successful reconnect.
+   */
+  errorCause?: WebChannelErrorCause;
   /**
    * Native "Bot is typing…" affordance. The server pushes a single `typing`
    * frame at the start of a turn, which flips this to `true`. The first

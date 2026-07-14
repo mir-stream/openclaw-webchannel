@@ -25,6 +25,7 @@ export type {
   ApprovalOption,
   ApprovalRequest,
   ConnectionStatus,
+  WebChannelErrorCause,
   WebChannelState,
   WebChannelOptions,
   Listener,
