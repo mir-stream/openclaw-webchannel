@@ -141,3 +141,101 @@ describe("ReasoningDraftController", () => {
     expect(frames[0].id).not.toBe(frames[1].id);
   });
 });
+
+describe("ReasoningDraftController — btw stale-burst defense", () => {
+  function setup() {
+    const frames: Array<{ id: string; turnId: string; text: string }> = [];
+    const transport = {
+      sendReasoning: (_peer: string, id: string, turnId: string, text: string) => {
+        frames.push({ id, turnId, text });
+        return true;
+      },
+    } as unknown as WebChannelTransport;
+    const controller = createReasoningDraftController({
+      transport,
+      sessionKey: "peer-1",
+      turnId: "turn-1",
+    });
+    return { controller, frames };
+  }
+
+  it("strips a prior burst's stale prefix from a later btw burst (under the rotated id)", () => {
+    // btw never resets its `reasoningText` accumulator at thinking_end, so burst 2's
+    // cumulative payload still carries burst 1's full text as a raw prefix.
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAABBB" });
+    controller.push({ text: "AAABBBCCC" });
+    expect(frames.map((f) => f.text)).toEqual(["AAA", "BBB", "BBBCCC"]);
+    // burst 1 has its own id; burst 2's two frames share the rotated id.
+    expect(frames[1].id).not.toBe(frames[0].id);
+    expect(frames[2].id).toBe(frames[1].id);
+  });
+
+  it("ignores a stale re-send of the exact prior-burst text after endBurst", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAA" });
+    expect(frames.map((f) => f.text)).toEqual(["AAA"]);
+  });
+
+  it("trims inter-burst whitespace left in the stripped remainder", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAA\n\nBBB" });
+    expect(frames.map((f) => f.text)).toEqual(["AAA", "BBB"]);
+  });
+
+  it("falls through to a plain replace when a later burst does not carry the stale prefix", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "XYZ" });
+    expect(frames.map((f) => f.text)).toEqual(["AAA", "XYZ"]);
+    expect(frames[1].id).not.toBe(frames[0].id);
+  });
+
+  it("accumulates the stale prefix across three bursts (burst 3 prefix = burst1+burst2)", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAABBB" });
+    controller.endBurst();
+    controller.push({ text: "AAABBBCCC" });
+    expect(frames.map((f) => f.text)).toEqual(["AAA", "BBB", "CCC"]);
+    // Each burst renders under its own rotated id.
+    expect(new Set(frames.map((f) => f.id)).size).toBe(3);
+  });
+
+  it("handles three bursts with whitespace BETWEEN them in btw's raw accumulator", () => {
+    // Thinking models emit "\n" / "\n\n" between blocks, so btw's raw cumulative
+    // payload carries inter-burst whitespace. The stale prefix must be the raw
+    // payload (not our trimmed display text), or burst 3's prefix match fails and
+    // its lane shows the fully duplicated text.
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAA\nBBB" });
+    controller.endBurst();
+    controller.push({ text: "AAA\nBBB\nCCC" });
+    expect(frames.map((f) => f.text)).toEqual(["AAA", "BBB", "CCC"]);
+    expect(new Set(frames.map((f) => f.id)).size).toBe(3);
+  });
+
+  it("preserves the stale prefix through an all-stale burst (endBurst early-return)", () => {
+    // A burst whose every payload strips to nothing sends no frame, so its
+    // endBurst early-returns on empty currentText — the PRIOR burst's stale
+    // prefix must survive so the NEXT real burst still strips correctly.
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAA" }); // stale re-send only — strips to empty
+    controller.endBurst();
+    controller.push({ text: "AAA\nCCC" });
+    expect(frames.map((f) => f.text)).toEqual(["AAA", "CCC"]);
+    expect(new Set(frames.map((f) => f.id)).size).toBe(2);
+  });
+});

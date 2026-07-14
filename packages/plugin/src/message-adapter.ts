@@ -437,6 +437,27 @@ export type ReasoningDraftController = {
  * So normalization is a plain REPLACE: ignore empty/non-string text, no-op an
  * exact duplicate of the current text, otherwise replace and send. No
  * snapshot/startsWith/endsWith/concat heuristic is needed.
+ *
+ * btw STALE-BURST DEFENSE: the btw `reasoningText` accumulator (declared
+ * dist/btw-CDO5476N.js:563) is NEVER reset at `thinking_end` (:626), even though
+ * that same event fires `onReasoningEnd`. So a SECOND thinking burst in one
+ * attempt emits cumulative text that still carries burst 1's full text as a raw
+ * prefix (btw concatenates raw deltas, whitespace and all). Under our per-burst id
+ * rotation that would render burst 1 duplicated inside burst 2's lane. We defend
+ * with a `stalePrefix`: on `endBurst` we set it to the just-closed burst's LAST
+ * RAW payload (that raw cumulative text already contains every prior burst — so
+ * assign, don't append our trimmed display text, which loses inter-burst
+ * whitespace and misfires from burst 3 on), and on `push` we strip that prefix
+ * (plus any leading whitespace) from an incoming cumulative payload before the
+ * replace logic runs. The ACP runner cannot hit this — its
+ * `maybeEndReasoning` (dist/run-attempt-DRhLt3eF.js:4520-4524) fires
+ * `onReasoningEnd` at most once per attempt (a `reasoningEnded` guard). The strip
+ * is conservative: a payload that does NOT start with the accumulated prefix
+ * falls through unchanged, so the worst case is the pre-fix duplicated display,
+ * never lost text — as long as the emitter's accumulator persists for the
+ * controller's lifetime (the pinned single-invocation contract). A fresh runner
+ * re-streaming byte-identical reasoning into a reused controller could jump-strip
+ * mid-stream; no pinned path does that today.
  */
 export function createReasoningDraftController(params: {
   transport: WebChannelTransport;
@@ -445,17 +466,39 @@ export function createReasoningDraftController(params: {
 }): ReasoningDraftController {
   let id = nextMessageId();
   let currentText = "";
+  // Prefix a later burst's payload carries under btw (stale-burst defense). btw's
+  // `reasoningText` is its RAW cumulative accumulator, so the prefix is exactly the
+  // last raw payload of the just-closed burst — NOT our trimmed display text (the
+  // two differ whenever whitespace separates bursts, e.g. "\n\n" from a thinking
+  // model). `endBurst` therefore ASSIGNS `stalePrefix = lastRawText` (the raw
+  // payload already contains every prior burst), not `+=` our stripped text.
+  let stalePrefix = "";
+  // The last raw payload seen this burst (before stripping), captured so endBurst
+  // can hand the raw cumulative text to `stalePrefix`.
+  let lastRawText = "";
   let stopped = false;
 
   const push = (update: ReasoningStreamUpdate): void => {
     if (stopped) return;
     const text = typeof update.text === "string" ? update.text : "";
     if (text.length === 0) return;
+    // Remember the RAW payload before any stripping (see stalePrefix above).
+    lastRawText = text;
+    // btw stale-burst defense (see the contract above): a later burst's cumulative
+    // payload still carries every prior burst's text as a leading prefix. Strip it
+    // (and any whitespace the deltas left between bursts) so this burst's lane
+    // shows only its own text. A payload that does not carry the prefix is left
+    // as-is (conservative — never drop text we can't confidently attribute).
+    let normalized = text;
+    if (stalePrefix.length > 0 && normalized.startsWith(stalePrefix)) {
+      normalized = normalized.slice(stalePrefix.length).replace(/^\s+/, "");
+      if (normalized.length === 0) return;
+    }
     // Cumulative/snapshot REPLACE (see the verified contract above): a payload is
     // always the full text so far, so an exact match is a no-op and anything else
     // replaces the current text wholesale.
-    if (text === currentText) return;
-    currentText = text;
+    if (normalized === currentText) return;
+    currentText = normalized;
     params.transport.sendReasoning(params.sessionKey, id, params.turnId, currentText);
   };
 
@@ -463,6 +506,11 @@ export function createReasoningDraftController(params: {
     push,
     endBurst: () => {
       if (stopped || currentText.length === 0) return;
+      // The NEXT burst's raw payload carries this closed burst's LAST RAW text as
+      // its prefix (btw's accumulator is cumulative and already holds all prior
+      // bursts), so assign — don't append our trimmed display text, which would
+      // drop any inter-burst whitespace and break the prefix match from burst 3 on.
+      stalePrefix = lastRawText;
       id = nextMessageId();
       currentText = "";
     },
