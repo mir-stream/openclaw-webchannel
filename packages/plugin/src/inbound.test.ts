@@ -119,6 +119,8 @@ function makeFakeTransport(): {
     },
     sendText: () => true,
     sendTextToAnyOpen: () => true,
+    sendReasoning: () => true,
+    sendTurnSettled: () => true,
     sendProgress: (_sessionKey: string, id: string, text: string) => {
       progress.push({ id, text });
       return true;

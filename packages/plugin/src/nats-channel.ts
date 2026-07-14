@@ -63,8 +63,10 @@ export type InboundWsMessage =
   | { type: "load_commands" };
 
 export type OutboundWsMessage =
-  | { type: "agent_message"; text: string; id?: string }
-  | { type: "progress"; id: string; text: string }
+  | { type: "agent_message"; text: string; id?: string; turnId?: string }
+  | { type: "progress"; id: string; text: string; turnId?: string }
+  | { type: "reasoning"; id: string; turnId: string; text: string }
+  | { type: "turn_settled"; turnId: string }
   | { type: "approval_request"; id: string; kind: "exec" | "plugin"; title: string; description?: string; prompt: string; options: Array<{ decision: string; label: string; style: string }>; expiresAtMs?: number }
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
   // #15 authoritative pending-approval snapshot (see transport.ts for the full
@@ -458,10 +460,13 @@ export class NatsChannel {
   /**
    * Send text message to peer.
    */
-  sendText(peerId: string, text: string, id?: string): boolean {
-    const payload: OutboundWsMessage = id
-      ? { type: "agent_message", text, id }
-      : { type: "agent_message", text };
+  sendText(peerId: string, text: string, id?: string, turnId?: string): boolean {
+    const payload: OutboundWsMessage = {
+      type: "agent_message",
+      text,
+      ...(id ? { id } : {}),
+      ...(turnId ? { turnId } : {}),
+    };
     return this.sendToPeer(peerId, payload);
   }
 
@@ -481,16 +486,24 @@ export class NatsChannel {
   /**
    * Send progress update to peer.
    */
-  sendProgress(peerId: string, id: string, text: string): boolean {
-    const payload: OutboundWsMessage = { type: "progress", id, text };
+  sendProgress(peerId: string, id: string, text: string, turnId?: string): boolean {
+    const payload: OutboundWsMessage = { type: "progress", id, text, ...(turnId ? { turnId } : {}) };
     return this.sendToPeer(peerId, payload);
   }
 
   /**
    * Finalize progress draft to final answer.
    */
-  finalizeDraft(peerId: string, id: string, text: string): boolean {
-    return this.sendText(peerId, text, id);
+  finalizeDraft(peerId: string, id: string, text: string, turnId?: string): boolean {
+    return this.sendText(peerId, text, id, turnId);
+  }
+
+  sendReasoning(peerId: string, id: string, turnId: string, text: string): boolean {
+    return this.sendToPeer(peerId, { type: "reasoning", id, turnId, text });
+  }
+
+  sendTurnSettled(peerId: string, turnId: string): boolean {
+    return this.sendToPeer(peerId, { type: "turn_settled", turnId });
   }
 
   /**

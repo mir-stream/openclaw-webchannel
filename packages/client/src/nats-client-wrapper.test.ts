@@ -913,3 +913,40 @@ describe("WebChannelNATSClient — protocol version on state", () => {
     expect(state.status).not.toBe("error");
   });
 });
+
+describe("WebChannelNATSClient — reasoning lane", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "jwt",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+
+  function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
+    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+  }
+
+  it("keeps reasoning separate, correlated, replaceable, and bounded", () => {
+    const wrapper = makeWrapper();
+    for (let i = 0; i < 105; i++) {
+      deliver(wrapper, { type: "reasoning", id: `r${i}`, turnId: `t${i}`, text: `text${i}` });
+    }
+    expect(wrapper.getState().reasoning).toHaveLength(100);
+    expect(wrapper.getState().reasoning[0].id).toBe("r5");
+    deliver(wrapper, { type: "reasoning", id: "r104", turnId: "t104", text: "updated" });
+    expect(wrapper.getState().reasoning.at(-1)?.text).toBe("updated");
+    expect(wrapper.getState().messages).toEqual([]);
+  });
+
+  it("does not clear typing on reasoning but turn_settled does", () => {
+    const wrapper = makeWrapper();
+    deliver(wrapper, { type: "typing" });
+    deliver(wrapper, { type: "reasoning", id: "r", turnId: "t", text: "thought" });
+    expect(wrapper.getState().isTyping).toBe(true);
+    deliver(wrapper, { type: "turn_settled", turnId: "t" });
+    expect(wrapper.getState().isTyping).toBe(false);
+  });
+});

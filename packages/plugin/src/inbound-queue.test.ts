@@ -233,6 +233,18 @@ describe("coalesceUserMessages", () => {
     ]);
     expect(merged).toEqual({ type: "user_message", text: "a\n\nb", at: 111 });
   });
+
+  it("carries the LAST message's id (turnId anchors on the latest user bubble)", () => {
+    // The merged id becomes the turn's turnId; the widget anchors reasoning and
+    // typing-text suppression to the LATEST user bubble, so the last id — not the
+    // first — must survive the merge.
+    const merged = coalesceUserMessages([
+      { type: "user_message", text: "a", id: "id-1" },
+      { type: "user_message", text: "b", id: "id-2" },
+      { type: "user_message", text: "c", id: "id-3" },
+    ]);
+    expect(merged).toEqual({ type: "user_message", text: "a\n\nb\n\nc", id: "id-3" });
+  });
 });
 
 describe("createSerializedInboundDispatcher with coalesce (P1-8b layer b)", () => {

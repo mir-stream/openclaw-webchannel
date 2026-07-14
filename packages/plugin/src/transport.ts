@@ -61,7 +61,7 @@ export type ApprovalRequestPayload = {
 };
 
 export type InboundWsMessage =
-  | { type: "user_message"; text: string }
+  | { type: "user_message"; text: string; id?: string }
   | { type: "approval_decision"; id: string; decision: ApprovalDecision }
   /**
    * History pagination request. Emitted by the widget when the user scrolls up
@@ -74,8 +74,10 @@ export type InboundWsMessage =
    */
   | { type: "load_history"; before?: string; limit?: number };
 export type OutboundWsMessage =
-  | { type: "agent_message"; text: string; id?: string }
-  | { type: "progress"; id: string; text: string }
+  | { type: "agent_message"; text: string; id?: string; turnId?: string }
+  | { type: "progress"; id: string; text: string; turnId?: string }
+  | { type: "reasoning"; id: string; turnId: string; text: string }
+  | { type: "turn_settled"; turnId: string }
   | ({ type: "approval_request" } & ApprovalRequestPayload)
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
   /**
@@ -334,6 +336,7 @@ export class WebChannelTransport {
       // drafts) and retries.
       if (
         payload.type !== "progress" &&
+        payload.type !== "reasoning" &&
         payload.type !== "typing" &&
         payload.type !== "history"
       ) {
@@ -579,12 +582,15 @@ export class WebChannelTransport {
    * legacy no-draft path: the widget appends a fresh bubble. Returns true if
    * delivered.
    */
-  sendText(sessionKey: string, text: string, id?: string): boolean {
+  sendText(sessionKey: string, text: string, id?: string, turnId?: string): boolean {
     const ws = this.openSocket(sessionKey);
     if (!ws) return false;
-    const payload: OutboundWsMessage = id
-      ? { type: "agent_message", text, id }
-      : { type: "agent_message", text };
+    const payload: OutboundWsMessage = {
+      type: "agent_message",
+      text,
+      ...(id ? { id } : {}),
+      ...(turnId ? { turnId } : {}),
+    };
     // TODO(reconnect): message replay + idempotency dedupe deferred
     return this.safeSend(ws, payload);
   }
@@ -597,10 +603,10 @@ export class WebChannelTransport {
    * `message-adapter.ts`, which threads the SAME id through every `sendProgress`
    * and the eventual `finalizeDraft`; the transport does not track it.
    */
-  sendProgress(sessionKey: string, id: string, text: string): boolean {
+  sendProgress(sessionKey: string, id: string, text: string, turnId?: string): boolean {
     const ws = this.openSocket(sessionKey);
     if (!ws) return false;
-    const payload: OutboundWsMessage = { type: "progress", id, text };
+    const payload: OutboundWsMessage = { type: "progress", id, text, ...(turnId ? { turnId } : {}) };
     return this.safeSend(ws, payload);
   }
 
@@ -609,8 +615,20 @@ export class WebChannelTransport {
    * reusing the id so the widget transitions the same bubble. Thin wrapper over
    * `sendText(..., id)` for call-site clarity.
    */
-  finalizeDraft(sessionKey: string, id: string, text: string): boolean {
-    return this.sendText(sessionKey, text, id);
+  finalizeDraft(sessionKey: string, id: string, text: string, turnId?: string): boolean {
+    return this.sendText(sessionKey, text, id, turnId);
+  }
+
+  sendReasoning(sessionKey: string, id: string, turnId: string, text: string): boolean {
+    const ws = this.openSocket(sessionKey);
+    if (!ws) return false;
+    return this.safeSend(ws, { type: "reasoning", id, turnId, text });
+  }
+
+  sendTurnSettled(sessionKey: string, turnId: string): boolean {
+    const ws = this.openSocket(sessionKey);
+    if (!ws) return false;
+    return this.safeSend(ws, { type: "turn_settled", turnId });
   }
 
   /**

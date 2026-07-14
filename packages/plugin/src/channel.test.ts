@@ -1,8 +1,25 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
 import { WebChannelTransport } from "./transport.js";
 import { createWebChannelPlugin } from "./channel.js";
 import { handleInboundMessage } from "./inbound.js";
+import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
+
+// Reasoning display policy is resolved from the session store / config default in
+// production (reasoning-level.ts, Telegram parity). These channel tests exercise
+// the callback WIRING per streaming mode + reasoning level, so we mock the
+// resolver to drive the level deterministically. Default is "off" — matching the
+// real default — so the reasoning lane is NOT wired unless a test opts into
+// "stream".
+vi.mock("./reasoning-level.js", () => ({
+  resolveWebchannelReasoningLevel: vi.fn(() => "off"),
+}));
+const mockReasoningLevel = vi.mocked(resolveWebchannelReasoningLevel);
+
+beforeEach(() => {
+  mockReasoningLevel.mockReset();
+  mockReasoningLevel.mockReturnValue("off");
+});
 
 describe("webchannel plugin", () => {
   it("resolves an account from config", () => {
@@ -55,6 +72,11 @@ describe("webchannel inbound round-trip", () => {
       // test can drive a MULTI-message reply (boundary → per-item cumulative
       // restarts from ""). Fired in the same slot as `partialTexts`.
       partialSteps?: Array<{ text: string } | { boundary: true }>;
+      reasoningSteps?: Array<{
+        text: string;
+        isReasoningSnapshot?: boolean;
+        end?: boolean;
+      }>;
       // Captures the replyOptions the turn supplied, so a test can assert which
       // callbacks were (or were NOT) wired for a given streaming mode.
       onReplyOptions?: (replyOptions: any) => void;
@@ -129,6 +151,12 @@ describe("webchannel inbound round-trip", () => {
               } else if (turn.replyOptions?.onPartialReply) {
                 await turn.replyOptions.onPartialReply({ text: step.text });
               }
+            }
+          }
+          if (opts?.reasoningSteps) {
+            for (const step of opts.reasoningSteps) {
+              await turn.replyOptions?.onReasoningStream?.(step);
+              if (step.end) await turn.replyOptions?.onReasoningEnd?.();
             }
           }
           // Simulate the turn blowing up mid-draft (after a progress frame, but
@@ -226,7 +254,7 @@ describe("webchannel inbound round-trip", () => {
     expect(captured.recordedTo).toBe("web-anon");
     // The reply was delivered back through THIS channel to the peer's socket.
     // No-progress config => plain no-id agent_message (legacy append path).
-    expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
   });
 
   it("threads accountId into resolveAgentRoute (binding.account routing — Cycle 2)", async () => {
@@ -380,7 +408,7 @@ describe("webchannel inbound round-trip", () => {
 
     // The final answer finalized the SAME draft id (widget transitions the
     // working bubble into the final text), NOT a fresh no-id agent_message.
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
 
     // Every progress frame shares the one draft id.
     for (const call of progressSpy.mock.calls) {
@@ -420,7 +448,7 @@ describe("webchannel inbound round-trip", () => {
     expect(lastFrameText).toBe("Hello world");
 
     // The final answer finalized the SAME draft id (working bubble → final text).
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("strips reasoning tags from streamed partials in partial mode (mirrors core hygiene)", async () => {
@@ -449,7 +477,7 @@ describe("webchannel inbound round-trip", () => {
     const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
     expect(lastFrameText).toBe("Hello world");
     const progId = progressSpy.mock.calls[0][1];
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("ignores a SHRINKING cumulative partial (no backwards flicker) in partial mode", async () => {
@@ -548,7 +576,7 @@ describe("webchannel inbound round-trip", () => {
     // All frames share one draft id, and the final settles that same id.
     const progId = progressSpy.mock.calls[0][1];
     for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("treats an assistant-message boundary BEFORE the first partial as a no-op (no leading blank prefix)", async () => {
@@ -612,7 +640,7 @@ describe("webchannel inbound round-trip", () => {
     expect((lastFrameText as string).match(/Second msg/g)?.length).toBe(1);
     const progId = progressSpy.mock.calls[0][1];
     for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("handles a LATE assistant-message boundary idempotently (no double-roll)", async () => {
@@ -705,13 +733,114 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
-    // No draft: replyOptions is omitted entirely, and delivery falls through to
-    // the plain no-id agent_message append (sendText), never sendProgress/finalize.
+    // No answer/tool draft AND reasoning level is the default "off": with neither
+    // lane active, replyOptions is omitted entirely (pre-reasoning-lane shape).
     expect(seenReplyOptions).toBeUndefined();
     expect(progressSpy).not.toHaveBeenCalled();
     expect(finalizeSpy).not.toHaveBeenCalled();
-    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
   });
+
+  it("streaming.mode=block with reasoning level 'stream' wires ONLY the reasoning callbacks (no tool/answer draft)", async () => {
+    const transport = new WebChannelTransport();
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    mockReasoningLevel.mockReturnValue("stream");
+
+    let seenReplyOptions: any = "unset";
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "block" } },
+      fireToolProgress: true,
+      partialTexts: ["should not stream"],
+      onReplyOptions: (ro) => {
+        seenReplyOptions = ro;
+      },
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    // Reasoning lane opened, but no answer/tool draft in block mode: replyOptions
+    // carries ONLY the reasoning callbacks — no tool/answer callbacks, no suppression.
+    expect(seenReplyOptions).toEqual({
+      onReasoningStream: expect.any(Function),
+      onReasoningEnd: expect.any(Function),
+    });
+    expect(progressSpy).not.toHaveBeenCalled();
+    expect(finalizeSpy).not.toHaveBeenCalled();
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
+  });
+
+  it.each(["off", "block", "progress", "partial"] as const)(
+    "streams reasoning independently of the answer streaming mode when the level is 'stream' (mode=%s)",
+    async (mode) => {
+      const transport = new WebChannelTransport();
+      const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+      mockReasoningLevel.mockReturnValue("stream");
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode } },
+        reasoningSteps: [{ text: "safe" }],
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningSpy).toHaveBeenCalledTimes(1);
+      expect(reasoningSpy).toHaveBeenCalledWith(
+        "web-anon",
+        expect.any(String),
+        "turn-42",
+        "safe",
+      );
+      // turn_settled is a lifecycle frame emitted for every ordinary turn.
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42");
+    },
+  );
+
+  it.each(["off", "on"] as const)(
+    "does NOT wire the reasoning lane when the resolved level is '%s' (Telegram parity: only 'stream' streams)",
+    async (level) => {
+      // btw emits reasoning upstream at level "on" too (dist/btw-CDO5476N.js:617-627),
+      // but the webchannel display policy — like Telegram — streams reasoning ONLY
+      // at "stream". At "off"/"on" no reasoning callback is wired and no frame is sent.
+      const transport = new WebChannelTransport();
+      const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+      mockReasoningLevel.mockReturnValue(level);
+      let seenReplyOptions: any = "unset";
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        reasoningSteps: [{ text: "safe" }],
+        onReplyOptions: (ro) => {
+          seenReplyOptions = ro;
+        },
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      // No reasoning callback wired (partial mode still wires the answer draft,
+      // just not the reasoning lane) and no reasoning frame emitted.
+      expect(seenReplyOptions?.onReasoningStream).toBeUndefined();
+      expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
+      expect(reasoningSpy).not.toHaveBeenCalled();
+      // turn_settled still fires — it is a lifecycle frame, not a reasoning frame.
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42");
+    },
+  );
 
   it("recovers the working bubble when the turn throws mid-draft in progress mode", async () => {
     vi.useFakeTimers();
@@ -840,7 +969,7 @@ describe("webchannel inbound round-trip", () => {
     expect(typingSpy).toHaveBeenCalledWith("web-anon");
     // The agent's reply (via sendText) was delivered — proves the typing
     // call is BEFORE agent dispatch, not after.
-    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
     // Strict order: typing < sendText.
     const typingOrder = typingSpy.mock.invocationCallOrder[0];
     const sendTextOrder = sendTextSpy.mock.invocationCallOrder[0];

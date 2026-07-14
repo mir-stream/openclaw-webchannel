@@ -352,7 +352,7 @@ describe("WebChannelClient — send", () => {
     expect(msgs).toHaveLength(1);
     expect(msgs[0]).toMatchObject({ role: "user", text: "hi there" });
     expect(sock.sent).toHaveLength(1);
-    expect(JSON.parse(sock.sent[0])).toEqual({ type: "user_message", text: "hi there" });
+    expect(JSON.parse(sock.sent[0])).toEqual({ type: "user_message", text: "hi there", id: "ws-0" });
   });
 
   it("is a no-op when the socket is not OPEN (no state change, no send)", async () => {
@@ -709,5 +709,17 @@ describe("WebChannelClient — history pagination (AC5)", () => {
       const rt = JSON.parse(JSON.stringify(f));
       expect(rt).toEqual(f);
     }
+  });
+
+  it("stores reasoning by turn, replaces updates, and settles activity separately", async () => {
+    const { client, sock } = await openClient();
+    sock.fireMessage({ type: "typing" });
+    sock.fireMessage({ type: "reasoning", id: "r1", turnId: "t1", text: "first" });
+    expect(client.getState().reasoning).toEqual([{ id: "r1", turnId: "t1", text: "first" }]);
+    expect(client.getState().isTyping).toBe(true);
+    sock.fireMessage({ type: "reasoning", id: "r1", turnId: "t1", text: "updated" });
+    expect(client.getState().reasoning[0].text).toBe("updated");
+    sock.fireMessage({ type: "turn_settled", turnId: "t1" });
+    expect(client.getState().isTyping).toBe(false);
   });
 });

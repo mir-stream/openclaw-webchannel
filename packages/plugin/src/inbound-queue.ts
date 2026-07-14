@@ -62,7 +62,7 @@ export interface SerializedInboundDispatcher<Message> {
 }
 
 /** The inbound frame shape the coalesce merge understands. */
-export type UserMessageLike = { type: "user_message"; text: string };
+export type UserMessageLike = { type: "user_message"; text: string; id?: string };
 
 /**
  * Merge several buffered `user_message` frames into ONE turn's message.
@@ -72,12 +72,17 @@ export type UserMessageLike = { type: "user_message"; text: string };
  * one turn each. Texts are joined with a blank line (`"\n\n"`) so the agent sees
  * them as distinct paragraphs of one prompt, in arrival order.
  *
- * Non-text fields of the FIRST frame are preserved (spread), so if the union
- * member ever grows fields beyond `{ type, text }` the earliest message's
- * metadata wins — matching "the turn is anchored on the first message". A single
- * message is returned as-is (identity), so the no-burst path is a pure pass
- * through. Callers only ever pass a non-empty array (a flush batch / a drained
- * buffer); an empty array is a contract violation and returns `undefined`.
+ * Non-text fields of the FIRST frame are preserved (spread) EXCEPT `id`, which is
+ * taken from the LAST frame: since the turn-correlated reasoning lane, the
+ * coalesced message's `id` becomes the turn's `turnId` (inbound.ts), and the
+ * widget anchors reasoning and its typing-text suppression to the LATEST user
+ * bubble. Carrying the first id would anchor the turn to the earlier bubble and
+ * the widget would miss. Ingress dedupe/ack run per-message BEFORE coalescing
+ * (src/ingress-dedupe.ts iterates `items` before this merge), so no dedupe
+ * consumer depends on the merged id. A single message is returned as-is
+ * (identity), so the no-burst path is a pure pass through. Callers only ever pass
+ * a non-empty array (a flush batch / a drained buffer); an empty array is a
+ * contract violation and returns `undefined`.
  */
 export function coalesceUserMessages<M extends UserMessageLike>(
   messages: readonly M[],
@@ -85,7 +90,7 @@ export function coalesceUserMessages<M extends UserMessageLike>(
   const first = messages[0];
   if (messages.length <= 1) return first;
   const text = messages.map((m) => m.text).join("\n\n");
-  return { ...first, text };
+  return { ...first, id: messages[messages.length - 1].id, text };
 }
 
 /**

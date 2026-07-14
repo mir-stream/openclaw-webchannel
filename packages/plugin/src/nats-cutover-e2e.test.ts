@@ -492,6 +492,29 @@ describe("AC 5 E2E: NATS Cutover", () => {
     agentChannel.unregisterPeer(peerId);
   });
 
+  it("should send correlated reasoning and turn settlement frames", async () => {
+    const peerId = "user-1";
+    agentChannel.registerPeer(peerId);
+    const payloads: string[] = [];
+    const outboundSub = agentTransport.subscribe(
+      `webchannel.${tenant}.${accountId}.${peerId}.out`,
+    );
+    agentTransport.on("message", (msg) => {
+      if (msg.subject.endsWith(".out")) payloads.push(msg.payload.toString());
+    });
+
+    agentChannel.sendReasoning(peerId, "reason-1", "turn-1", "Checking files");
+    agentChannel.sendTurnSettled(peerId, "turn-1");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(payloads.map((payload) => JSON.parse(payload))).toEqual([
+      { type: "reasoning", id: "reason-1", turnId: "turn-1", text: "Checking files" },
+      { type: "turn_settled", turnId: "turn-1" },
+    ]);
+    agentTransport.unsubscribe(outboundSub);
+    agentChannel.unregisterPeer(peerId);
+  });
+
   // ---------------------------------------------------------------------------
   // Test 8: Approval request routing
   // ---------------------------------------------------------------------------

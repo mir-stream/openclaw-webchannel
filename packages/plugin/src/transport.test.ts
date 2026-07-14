@@ -157,6 +157,21 @@ describe("webchannel transport backpressure (safeSend)", () => {
     transport.dispose();
   });
 
+  it("sends correlated reasoning and turn settlement frames", () => {
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
+    const ws = makeFakeSocket({ bufferedAmount: 0 });
+    register(transport, ws);
+
+    expect(transport.sendReasoning(ANON_PEER_ID, "r1", "t1", "checking")).toBe(true);
+    expect(transport.sendTurnSettled(ANON_PEER_ID, "t1")).toBe(true);
+    expect(ws.sent.map((frame) => JSON.parse(frame))).toEqual([
+      { type: "reasoning", id: "r1", turnId: "t1", text: "checking" },
+      { type: "turn_settled", turnId: "t1" },
+    ]);
+
+    transport.dispose();
+  });
+
   it("drops when bufferedAmount exceeds the cap", () => {
     const transport = new WebChannelTransport({ heartbeatMs: 1000 });
     // 2 MB buffered, over the 1 MB cap.
@@ -170,6 +185,19 @@ describe("webchannel transport backpressure (safeSend)", () => {
     expect(ws.sent).toHaveLength(0);
 
     transport.dispose();
+  });
+
+  it("drops reasoning but terminates on a lost turn_settled frame", () => {
+    const transport = new WebChannelTransport({ heartbeatMs: 1000 });
+    const reasoningSocket = makeFakeSocket({ bufferedAmount: 2_000_000 });
+    register(transport, reasoningSocket);
+    expect(transport.sendReasoning(ANON_PEER_ID, "r", "t", "text")).toBe(false);
+    expect(reasoningSocket.terminated).toBe(false);
+
+    const settledSocket = makeFakeSocket({ bufferedAmount: 2_000_000 });
+    register(transport, settledSocket);
+    expect(transport.sendTurnSettled(ANON_PEER_ID, "t")).toBe(false);
+    expect(settledSocket.terminated).toBe(true);
   });
 
   it("does not send on a non-OPEN socket", () => {

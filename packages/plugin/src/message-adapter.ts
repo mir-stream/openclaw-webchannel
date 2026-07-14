@@ -204,6 +204,7 @@ export type ProgressDraftController = {
 export function createProgressDraftController(params: {
   transport: WebChannelTransport;
   sessionKey: string;
+  turnId?: string;
   /** Channel config section (for label/maxLines/line formatting). */
   channelConfig: unknown;
   throttleMs?: number;
@@ -266,7 +267,7 @@ export function createProgressDraftController(params: {
 
   const sendOrEditStreamMessage = async (text: string): Promise<boolean> => {
     if (stopped) return false;
-    const sent = transport.sendProgress(sessionKey, id, text);
+    const sent = transport.sendProgress(sessionKey, id, text, params.turnId);
     // Track that a working bubble is now shown to the widget, so the
     // error-recovery path knows it must emit a terminal frame to settle it.
     if (sent) started = true;
@@ -393,7 +394,7 @@ export function createProgressDraftController(params: {
       }
       stopped = true;
       loop.stop();
-      await transport.finalizeDraft(sessionKey, id, text);
+      await transport.finalizeDraft(sessionKey, id, text, params.turnId);
     },
     stop: () => {
       // Halt the throttled loop so no late background flush can race cleanup.
@@ -401,6 +402,72 @@ export function createProgressDraftController(params: {
       // a working bubble should use finalize(text) instead.
       stopped = true;
       loop.stop();
+    },
+  };
+}
+
+/**
+ * One `onReasoningStream` payload, narrowed to the fields we consume. The pinned
+ * OpenClaw callback delivers `{ text?; mediaUrls?; isReasoningSnapshot? }`
+ * (verified: dist/plugin-sdk/types-B70zVumi.d.ts:1737-1741). `mediaUrls` is
+ * intentionally ignored — the webchannel reasoning lane is text-only.
+ */
+export type ReasoningStreamUpdate = {
+  text?: string;
+  isReasoningSnapshot?: boolean;
+};
+
+export type ReasoningDraftController = {
+  push: (update: ReasoningStreamUpdate) => void;
+  endBurst: () => void;
+  stop: () => void;
+};
+
+/**
+ * Normalizes OpenClaw's reasoning updates into cumulative, replace-by-id wire
+ * frames. Each `onReasoningEnd` boundary rotates the id so separate reasoning
+ * bursts remain distinct in the UI.
+ *
+ * VERIFIED CONTRACT (pinned OpenClaw v2026.6.x): every emitter sends either a
+ * snapshot or the cumulative FULL text so far — NEVER a bare delta:
+ *  - the ACP runner emits the full accumulated text with `isReasoningSnapshot:
+ *    true` (dist/run-attempt-DRhLt3eF.js:4114-4117);
+ *  - the btw runner emits cumulative full text (`reasoningText += delta` then
+ *    emits `reasoningText`, no snapshot flag) (dist/btw-CDO5476N.js:617-627).
+ * So normalization is a plain REPLACE: ignore empty/non-string text, no-op an
+ * exact duplicate of the current text, otherwise replace and send. No
+ * snapshot/startsWith/endsWith/concat heuristic is needed.
+ */
+export function createReasoningDraftController(params: {
+  transport: WebChannelTransport;
+  sessionKey: string;
+  turnId: string;
+}): ReasoningDraftController {
+  let id = nextMessageId();
+  let currentText = "";
+  let stopped = false;
+
+  const push = (update: ReasoningStreamUpdate): void => {
+    if (stopped) return;
+    const text = typeof update.text === "string" ? update.text : "";
+    if (text.length === 0) return;
+    // Cumulative/snapshot REPLACE (see the verified contract above): a payload is
+    // always the full text so far, so an exact match is a no-op and anything else
+    // replaces the current text wholesale.
+    if (text === currentText) return;
+    currentText = text;
+    params.transport.sendReasoning(params.sessionKey, id, params.turnId, currentText);
+  };
+
+  return {
+    push,
+    endBurst: () => {
+      if (stopped || currentText.length === 0) return;
+      id = nextMessageId();
+      currentText = "";
+    },
+    stop: () => {
+      stopped = true;
     },
   };
 }

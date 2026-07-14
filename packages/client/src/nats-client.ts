@@ -153,6 +153,8 @@ export type InboundMessage = {
   type:
     | "agent_message"
     | "progress"
+    | "reasoning"
+    | "turn_settled"
     | "approval_request"
     | "approval_resolved"
     // #15: authoritative pending-approval snapshot (carries `approvals`).
@@ -169,6 +171,7 @@ export type InboundMessage = {
   /** P0-7b: the acknowledged `user_message` ids on an `ack` frame. */
   ids?: string[];
   text?: string;
+  turnId?: string;
   kind?: "exec" | "plugin";
   title?: string;
   description?: string;

@@ -11,8 +11,9 @@
  * claim/commit (`createClaimableDedupe`, the model the gap doc sketches):
  *   (a) a processing failure already surfaces to the user via the error-finalize
  *       path, and a human retry is a NEW id — so there is nothing to roll back;
- *   (b) the P1-8b coalesce merge keeps only the FIRST message's fields, so a
- *       per-id rollback after a merged-turn failure would be lossy anyway; and
+ *   (b) the P1-8b coalesce merge collapses the batch to ONE message (first
+ *       frame's fields, LAST frame's `id` as the turn anchor), so a per-id
+ *       rollback after a merged-turn failure would be lossy anyway; and
  *   (c) claim/commit's in-flight waiting guards a concurrent same-key race that
  *       cannot happen here — this runs inside the debouncer's `onFlush`, which is
  *       same-peer serialized by core's keyChains, so checks are already ordered.

@@ -20,6 +20,11 @@ import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/cl
 import type { WebChannelState, ApprovalRequest } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
 import { renderMarkdown } from "./markdown.js";
+import {
+  orderConversationPresentation,
+  captureOpenReasoningIds,
+  buildReasoningDetails,
+} from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
   connecting: "connecting…",
@@ -188,7 +193,20 @@ export async function createWidget(
     // Carry markdown hits over from the previous pass; misses re-parse. Assigned
     // to `mdCache` after the list is built so it tracks only the live transcript.
     const nextMdCache = new Map<string, HTMLElement>();
-    const bubbles = state.messages.map((m) => {
+    const openReasoningIds = captureOpenReasoningIds(list);
+    const bubbles: HTMLElement[] = [];
+    for (const presentation of orderConversationPresentation(state.messages, state.reasoning)) {
+      if (presentation.kind === "reasoning") {
+        const item = presentation.value;
+        const key = `reasoning:${item.id}\n${item.text}`;
+        const rendered = mdCache.get(key) ?? renderMarkdown(item.text);
+        nextMdCache.set(key, rendered);
+        bubbles.push(
+          buildReasoningDetails(item, rendered, openReasoningIds.has(item.id)),
+        );
+        continue;
+      }
+      const m = presentation.value;
       const isUser = m.role === "user";
       // User bubbles stay plain-text (pre-wrap keeps their line breaks). Agent
       // bubbles — including `working` streaming drafts — render markdown to DOM;
@@ -202,7 +220,7 @@ export async function createWidget(
         nextMdCache.set(key, rendered);
         child = rendered;
       }
-      return el(
+      bubbles.push(el(
         "div",
         {
           style:
@@ -215,9 +233,14 @@ export async function createWidget(
             (m.working ? ";opacity:.7;font-style:italic" : ""),
         },
         [child],
-      );
-    });
-    if (state.isTyping) {
+      ));
+    }
+
+    const latestUser = [...state.messages].reverse().find((m) => m.role === "user");
+    const reasoningReplacesTypingText = Boolean(
+      latestUser?.turnId && state.reasoning.some((item) => item.turnId === latestUser.turnId),
+    );
+    if (state.isTyping && !reasoningReplacesTypingText) {
       bubbles.push(
         el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, ["agent is typing…"]),
       );

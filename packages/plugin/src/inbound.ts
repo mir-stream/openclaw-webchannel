@@ -5,14 +5,19 @@ import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
 import { DEFAULT_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
+import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
 
 /** The inbound path only handles user messages; approvals route separately. */
 type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
 import {
   resolveStreamingMode,
   createProgressDraftController,
+  createReasoningDraftController,
 } from "./message-adapter.js";
-import type { ProgressDraftController } from "./message-adapter.js";
+import type {
+  ProgressDraftController,
+  ReasoningDraftController,
+} from "./message-adapter.js";
 
 /**
  * Handle one inbound user message from the browser widget.
@@ -83,6 +88,9 @@ export async function handleInboundMessage(
   // (2) we stamp CommandAuthorized on the turn context (see the buildContext
   // call) so core's fast-abort accepts it.
   const controlLane = options?.controlLane === true;
+  const turnId =
+    message.id ??
+    `webchannel-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // Progress-draft wiring (Phase 1 first slice). Core does NOT auto-drive a
   // plugin's `message.live` adapter; the generic seam for a plugin channel is
@@ -140,9 +148,14 @@ export async function handleInboundMessage(
     draft = createProgressDraftController({
       transport,
       sessionKey: wsKey,
+      turnId,
       channelConfig,
     });
   }
+  // Reasoning lane is created AFTER route resolution (below), once we can resolve
+  // the session's reasoning display level.
+  let reasoning: ReasoningDraftController | undefined;
+  let finalReplyDelivered = false;
 
   // Resolve the channel-scoped agent route, then FORCE the per-account-channel-
   // peer session scope (see `resolveWebchannelSessionRoute`). Binding-based agent
@@ -154,6 +167,29 @@ export async function handleInboundMessage(
   // turn is dispatched under this key, and the history READ sites resolve the
   // SAME key via the SAME helper, so paging/snapshot stay consistent.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey);
+
+  // Reasoning display policy (CHANNEL-OWNED). OpenClaw's plugin dispatch path
+  // forwards `onReasoningStream` with no reasoning-level gate of its own (ACP
+  // always snapshots; btw emits at any level != "off" — dist/run-attempt
+  // -DRhLt3eF.js:4114-4117, dist/btw-CDO5476N.js:617-627), so the CHANNEL decides
+  // whether reasoning reaches the browser. Mirroring the Telegram reference
+  // (streams only at "stream", suppresses at "off" — dist/bot-Dxj27QDQ.js:6441,
+  // :6582), we wire the lane ONLY when the resolved session reasoning level is
+  // "stream". Resolution is session-store-first, fail-closed to "off" on a store
+  // read error, with the `agents.*.reasoningDefault` config default otherwise
+  // (see reasoning-level.ts). Default is "off": no ambient reasoning ever streams
+  // to a widget unless the operator/session explicitly opted into "stream". The
+  // control lane (/stop) never opens a reasoning lane while aborting another turn.
+  if (!controlLane) {
+    const reasoningLevel = resolveWebchannelReasoningLevel({
+      cfg: api.config,
+      agentId: route.agentId,
+      sessionKey: route.sessionKey,
+    });
+    if (reasoningLevel === "stream") {
+      reasoning = createReasoningDraftController({ transport, sessionKey: wsKey, turnId });
+    }
+  }
 
   // Native "Bot is typing…" affordance. We push the frame right after route
   // resolution and right before agent dispatch (1) so the widget sees the
@@ -256,65 +292,67 @@ export async function handleInboundMessage(
             recordInboundSession: channelRuntime.session.recordInboundSession,
             dispatchReplyWithBufferedBlockDispatcher:
               channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
-            // Progress-draft callbacks (only when streaming.mode === "progress").
-            // These fire DURING the agent run and feed the rolling draft. We also
-            // set `suppressDefaultToolProgressMessages` so the agent's own tool
-            // progress text isn't ALSO delivered as separate messages (it lives
-            // inside our draft instead — GetReplyOptions.suppressDefaultToolProgressMessages,
-            // dist/plugin-sdk/types-BYvUZFDr.d.ts:261-265).
-            ...(draft
+            // `replyOptions` exists ONLY when this turn has a live lane to feed:
+            // the reasoning lane (resolved level "stream") and/or the answer/tool
+            // draft (progress/partial mode). When NEITHER is active — block/off
+            // with no "stream" reasoning, and every control-lane turn — the whole
+            // key is omitted, restoring the pre-reasoning-lane block/off shape.
+            ...(reasoning || draft
               ? {
                   replyOptions: {
-                    suppressDefaultToolProgressMessages: true,
-                    onToolStart: (p) => {
-                      draft!.pushEvent({
-                        event: "tool",
-                        itemId: p.itemId,
-                        toolCallId: p.toolCallId,
-                        name: p.name,
-                        phase: p.phase,
-                        args: p.args,
-                      });
-                    },
-                    onItemEvent: (p) => {
-                      draft!.pushEvent({
-                        event: "item",
-                        itemId: p.itemId,
-                        itemKind: p.kind,
-                        title: p.title,
-                        name: p.name,
-                        phase: p.phase,
-                        status: p.status,
-                        summary: p.summary,
-                        progressText: p.progressText,
-                        meta: p.meta,
-                      });
-                    },
-                    // Answer-text streaming — PARTIAL MODE ONLY. Core emits
-                    // `onPartialReply` with the CUMULATIVE assistant text
-                    // (`text`) for final-answer-phase items only (commentary
-                    // goes to item events; shouldStreamAssistantPartial, verified:
-                    // dist/run-attempt-DRhLt3eF.js:4546-4548) — so no filtering
-                    // is needed here. In progress mode this is omitted, so
-                    // answer text never streams (the mode distinction). Guard an
-                    // empty `text` so a trailing empty partial can't clobber the
-                    // draft (PartialReplyPayload.text, dist/plugin-sdk/types-DNy-f8Hr.d.ts:200-203).
-                    ...(answerStreamingEnabled
+                    // Reasoning callbacks are wired iff the lane opened above.
+                    ...(reasoning
                       ? {
-                          onPartialReply: (p) => {
-                            draft!.pushAnswerText(p.text ?? "");
+                          onReasoningStream: (p) => reasoning!.push(p),
+                          onReasoningEnd: () => reasoning!.endBurst(),
+                        }
+                      : {}),
+                    // Progress-draft callbacks (only when a draft exists, i.e.
+                    // streaming.mode "progress"/"partial"). These fire DURING the
+                    // agent run and feed the rolling draft. We also set
+                    // `suppressDefaultToolProgressMessages` so the agent's own tool
+                    // progress text isn't ALSO delivered as separate messages (it
+                    // lives inside our draft instead — GetReplyOptions
+                    // .suppressDefaultToolProgressMessages, dist/plugin-sdk/
+                    // types-BYvUZFDr.d.ts:261-265).
+                    ...(draft
+                      ? {
+                          suppressDefaultToolProgressMessages: true,
+                          onToolStart: (p) => {
+                            draft.pushEvent({
+                              event: "tool",
+                              itemId: p.itemId,
+                              toolCallId: p.toolCallId,
+                              name: p.name,
+                              phase: p.phase,
+                              args: p.args,
+                            });
                           },
-                          // Assistant-message boundary. Core's cumulative
-                          // `text` is per-itemId (restarts from "" on the next
-                          // final_answer message); rolling the prior message's
-                          // text into a prefix here prevents it visibly
-                          // vanishing on a multi-message reply. Fired once per
-                          // message start, incl. before the first (a no-op then)
-                          // — verified: dist/run-attempt-DRhLt3eF.js:4083-4086.
-                          // Partial mode only; NOT wired in progress mode.
-                          onAssistantMessageStart: () => {
-                            draft!.handleAssistantMessageBoundary();
+                          onItemEvent: (p) => {
+                            draft.pushEvent({
+                              event: "item",
+                              itemId: p.itemId,
+                              itemKind: p.kind,
+                              title: p.title,
+                              name: p.name,
+                              phase: p.phase,
+                              status: p.status,
+                              summary: p.summary,
+                              progressText: p.progressText,
+                              meta: p.meta,
+                            });
                           },
+                          // Answer-text streaming remains PARTIAL MODE ONLY.
+                          ...(answerStreamingEnabled
+                            ? {
+                                onPartialReply: (p) => {
+                                  draft.pushAnswerText(p.text ?? "");
+                                },
+                                onAssistantMessageStart: () => {
+                                  draft.handleAssistantMessageBoundary();
+                                },
+                              }
+                            : {}),
                         }
                       : {}),
                   },
@@ -334,9 +372,11 @@ export async function handleInboundMessage(
                 // blocks (rare for this channel) fall through to a plain send.
                 if (draft && info?.kind === "final") {
                   await draft.finalize(text);
+                  finalReplyDelivered = true;
                   return { visibleReplySent: true };
                 }
-                const sent = transport.sendText(wsKey, text);
+                const sent = transport.sendText(wsKey, text, undefined, turnId);
+                if (sent && info?.kind === "final") finalReplyDelivered = true;
                 return { visibleReplySent: sent };
               },
             },
@@ -390,11 +430,20 @@ export async function handleInboundMessage(
           `webchannel: draft error-finalize failed: ${String(finalizeErr)}`,
         );
       }
+    } else if (!controlLane && !finalReplyDelivered) {
+      transport.sendText(
+        wsKey,
+        "Sorry — something went wrong while answering. Please try again.",
+        undefined,
+        turnId,
+      );
     }
   } finally {
     // Always halt the throttled draft loop so a late background flush can't race
     // the error handling (or linger after a normal finalize). Idempotent and a
     // no-op when no draft was created or it was already stopped by finalize().
     draft?.stop();
+    reasoning?.stop();
+    if (!controlLane) transport.sendTurnSettled(wsKey, turnId);
   }
 }
