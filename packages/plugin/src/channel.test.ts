@@ -1,8 +1,25 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
 import { WebChannelTransport } from "./transport.js";
 import { createWebChannelPlugin } from "./channel.js";
 import { handleInboundMessage } from "./inbound.js";
+import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
+
+// Reasoning display policy is resolved from the session store / config default in
+// production (reasoning-level.ts, Telegram parity). These channel tests exercise
+// the callback WIRING per streaming mode + reasoning level, so we mock the
+// resolver to drive the level deterministically. Default is "off" — matching the
+// real default — so the reasoning lane is NOT wired unless a test opts into
+// "stream".
+vi.mock("./reasoning-level.js", () => ({
+  resolveWebchannelReasoningLevel: vi.fn(() => "off"),
+}));
+const mockReasoningLevel = vi.mocked(resolveWebchannelReasoningLevel);
+
+beforeEach(() => {
+  mockReasoningLevel.mockReset();
+  mockReasoningLevel.mockReturnValue("off");
+});
 
 describe("webchannel plugin", () => {
   it("resolves an account from config", () => {
@@ -58,7 +75,6 @@ describe("webchannel inbound round-trip", () => {
       reasoningSteps?: Array<{
         text: string;
         isReasoningSnapshot?: boolean;
-        requiresReasoningProgressOptIn?: boolean;
         end?: boolean;
       }>;
       // Captures the replyOptions the turn supplied, so a test can assert which
@@ -717,8 +733,39 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
-    // No answer/tool draft: only the mode-independent reasoning callbacks exist.
-    // Tool/answer callbacks and suppression must remain absent.
+    // No answer/tool draft AND reasoning level is the default "off": with neither
+    // lane active, replyOptions is omitted entirely (pre-reasoning-lane shape).
+    expect(seenReplyOptions).toBeUndefined();
+    expect(progressSpy).not.toHaveBeenCalled();
+    expect(finalizeSpy).not.toHaveBeenCalled();
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
+  });
+
+  it("streaming.mode=block with reasoning level 'stream' wires ONLY the reasoning callbacks (no tool/answer draft)", async () => {
+    const transport = new WebChannelTransport();
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    mockReasoningLevel.mockReturnValue("stream");
+
+    let seenReplyOptions: any = "unset";
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "block" } },
+      fireToolProgress: true,
+      partialTexts: ["should not stream"],
+      onReplyOptions: (ro) => {
+        seenReplyOptions = ro;
+      },
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    // Reasoning lane opened, but no answer/tool draft in block mode: replyOptions
+    // carries ONLY the reasoning callbacks — no tool/answer callbacks, no suppression.
     expect(seenReplyOptions).toEqual({
       onReasoningStream: expect.any(Function),
       onReasoningEnd: expect.any(Function),
@@ -729,18 +776,16 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it.each(["off", "block", "progress", "partial"] as const)(
-    "streams reasoning independently when streaming.mode=%s and suppresses opt-in-required payloads",
+    "streams reasoning independently of the answer streaming mode when the level is 'stream' (mode=%s)",
     async (mode) => {
       const transport = new WebChannelTransport();
       const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
       const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+      mockReasoningLevel.mockReturnValue("stream");
       const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
       const { api } = makeFakeApi(captured, {
         channelConfig: { streaming: { mode } },
-        reasoningSteps: [
-          { text: "safe" },
-          { text: "hidden", requiresReasoningProgressOptIn: true },
-        ],
+        reasoningSteps: [{ text: "safe" }],
       });
 
       await handleInboundMessage(api, transport, "web-anon", {
@@ -756,6 +801,43 @@ describe("webchannel inbound round-trip", () => {
         "turn-42",
         "safe",
       );
+      // turn_settled is a lifecycle frame emitted for every ordinary turn.
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42");
+    },
+  );
+
+  it.each(["off", "on"] as const)(
+    "does NOT wire the reasoning lane when the resolved level is '%s' (Telegram parity: only 'stream' streams)",
+    async (level) => {
+      // btw emits reasoning upstream at level "on" too (dist/btw-CDO5476N.js:617-627),
+      // but the webchannel display policy — like Telegram — streams reasoning ONLY
+      // at "stream". At "off"/"on" no reasoning callback is wired and no frame is sent.
+      const transport = new WebChannelTransport();
+      const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+      mockReasoningLevel.mockReturnValue(level);
+      let seenReplyOptions: any = "unset";
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        reasoningSteps: [{ text: "safe" }],
+        onReplyOptions: (ro) => {
+          seenReplyOptions = ro;
+        },
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      // No reasoning callback wired (partial mode still wires the answer draft,
+      // just not the reasoning lane) and no reasoning frame emitted.
+      expect(seenReplyOptions?.onReasoningStream).toBeUndefined();
+      expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
+      expect(reasoningSpy).not.toHaveBeenCalled();
+      // turn_settled still fires — it is a lifecycle frame, not a reasoning frame.
       expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42");
     },
   );

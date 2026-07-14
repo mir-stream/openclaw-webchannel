@@ -100,23 +100,34 @@ describe("ReasoningDraftController", () => {
     return { controller, frames };
   }
 
-  it("normalizes cumulative and delta updates to cumulative replace frames", () => {
+  it("replaces cumulative full-text updates by id (verified pinned contract)", () => {
+    // Every pinned emitter sends the cumulative FULL text so far (ACP snapshot /
+    // btw `reasoningText += delta`), never a bare delta — so each frame is a
+    // wholesale replace on one id.
     const { controller, frames } = setup();
     controller.push({ text: "Think" });
     controller.push({ text: "Thinking" });
-    controller.push({ text: " more" });
+    controller.push({ text: "Thinking more" });
     expect(frames.map((frame) => frame.text)).toEqual(["Think", "Thinking", "Thinking more"]);
     expect(new Set(frames.map((frame) => frame.id)).size).toBe(1);
     expect(frames.every((frame) => frame.turnId === "turn-1")).toBe(true);
   });
 
-  it("replaces snapshots, suppresses duplicates, and rejects opt-in-required payloads", () => {
+  it("replaces snapshot updates and suppresses exact duplicates", () => {
     const { controller, frames } = setup();
     controller.push({ text: "one" });
     controller.push({ text: "replacement", isReasoningSnapshot: true });
     controller.push({ text: "replacement", isReasoningSnapshot: true });
-    controller.push({ text: "private", requiresReasoningProgressOptIn: true });
     expect(frames.map((frame) => frame.text)).toEqual(["one", "replacement"]);
+  });
+
+  it("ignores empty / non-string text", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "" });
+    controller.push({});
+    controller.push({ text: undefined });
+    controller.push({ text: "real" });
+    expect(frames.map((frame) => frame.text)).toEqual(["real"]);
   });
 
   it("rotates ids at a reasoning-end boundary and ignores late updates after stop", () => {

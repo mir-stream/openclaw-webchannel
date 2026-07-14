@@ -33,3 +33,49 @@ export function orderConversationPresentation(
   for (const turnId of byTurn.keys()) emitReasoning(turnId);
   return result;
 }
+
+/**
+ * Collect the ids of currently-EXPANDED reasoning lanes in `container`. The
+ * widget rebuilds the whole transcript with `replaceChildren()` each render, so
+ * it must snapshot which `<details>` the user opened BEFORE replacement and
+ * restore `open` on the rebuilt nodes — otherwise a streaming reasoning update
+ * would snap an expanded lane closed. Pairs with `buildReasoningDetails`.
+ */
+export function captureOpenReasoningIds(container: ParentNode): Set<string> {
+  return new Set(
+    Array.from(
+      container.querySelectorAll<HTMLDetailsElement>("details[data-reasoning-id][open]"),
+    ).map((node) => node.dataset.reasoningId ?? ""),
+  );
+}
+
+/**
+ * Build one reasoning lane as a collapsed `<details data-reasoning-id>` with a
+ * neutral `Reasoning` summary and the pre-rendered (sanitize-by-construction)
+ * markdown `body`. `open` restores the user's prior expand/collapse choice (see
+ * `captureOpenReasoningIds`). XSS safety is inherited from the caller's markdown
+ * renderer — this builder only ever appends the given element and text nodes,
+ * never `innerHTML`.
+ */
+export function buildReasoningDetails(
+  item: ReasoningItem,
+  body: HTMLElement,
+  open: boolean,
+): HTMLDetailsElement {
+  const details = document.createElement("details");
+  details.dataset.reasoningId = item.id;
+  details.setAttribute(
+    "style",
+    "align-self:flex-start;max-width:85%;padding:7px 10px;border-radius:8px;" +
+      "font-size:12px;background:#161b22;border:1px solid var(--border);color:var(--muted)",
+  );
+  const summary = document.createElement("summary");
+  summary.setAttribute("style", "cursor:pointer;font-weight:600");
+  summary.textContent = "Reasoning";
+  const bodyWrap = document.createElement("div");
+  bodyWrap.setAttribute("style", "margin-top:7px;color:var(--fg)");
+  bodyWrap.append(body);
+  details.append(summary, bodyWrap);
+  details.open = open;
+  return details;
+}

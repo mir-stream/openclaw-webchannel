@@ -20,7 +20,11 @@ import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/cl
 import type { WebChannelState, ApprovalRequest } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
 import { renderMarkdown } from "./markdown.js";
-import { orderConversationPresentation } from "./presentation.js";
+import {
+  orderConversationPresentation,
+  captureOpenReasoningIds,
+  buildReasoningDetails,
+} from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
   connecting: "connecting…",
@@ -189,10 +193,7 @@ export async function createWidget(
     // Carry markdown hits over from the previous pass; misses re-parse. Assigned
     // to `mdCache` after the list is built so it tracks only the live transcript.
     const nextMdCache = new Map<string, HTMLElement>();
-    const openReasoningIds = new Set(
-      Array.from(list.querySelectorAll<HTMLDetailsElement>("details[data-reasoning-id][open]"))
-        .map((node) => node.dataset.reasoningId ?? ""),
-    );
+    const openReasoningIds = captureOpenReasoningIds(list);
     const bubbles: HTMLElement[] = [];
     for (const presentation of orderConversationPresentation(state.messages, state.reasoning)) {
       if (presentation.kind === "reasoning") {
@@ -200,17 +201,9 @@ export async function createWidget(
         const key = `reasoning:${item.id}\n${item.text}`;
         const rendered = mdCache.get(key) ?? renderMarkdown(item.text);
         nextMdCache.set(key, rendered);
-        const details = el("details", {
-          "data-reasoning-id": item.id,
-          style:
-            "align-self:flex-start;max-width:85%;padding:7px 10px;border-radius:8px;" +
-            "font-size:12px;background:#161b22;border:1px solid var(--border);color:var(--muted)",
-        }, [
-          el("summary", { style: "cursor:pointer;font-weight:600" }, ["Reasoning"]),
-          el("div", { style: "margin-top:7px;color:var(--fg)" }, [rendered]),
-        ]) as HTMLDetailsElement;
-        details.open = openReasoningIds.has(item.id);
-        bubbles.push(details);
+        bubbles.push(
+          buildReasoningDetails(item, rendered, openReasoningIds.has(item.id)),
+        );
         continue;
       }
       const m = presentation.value;

@@ -10,9 +10,16 @@ When OpenClaw exposes reasoning for a turn, WebChannel shows it in a separate,
 collapsed `Reasoning` section while the answer continues through the existing
 answer/progress path unchanged. Turns without reasoning show no empty control.
 
-Reasoning delivery is independent of `channels.webchannel.streaming.mode`.
-`partial`, `progress`, `block`, and `off` still decide how answer/tool progress is
-rendered; they do not decide whether an available reasoning callback is wired.
+Reasoning delivery is independent of `channels.webchannel.streaming.mode` (the
+ANSWER streaming mode). `partial`, `progress`, `block`, and `off` still decide how
+answer/tool progress is rendered; they do not decide whether reasoning is shown.
+
+The reasoning lane is instead gated on the resolved SESSION reasoning level: it
+streams to the browser ONLY when that level is `stream`, mirroring the Telegram
+reference channel. The level is resolved session-store-first, fail-closed to `off`
+on a store-read error, otherwise from the `agents.*.reasoningDefault` config
+default (default `off`). So no ambient reasoning ever reaches a widget unless the
+operator/session explicitly opted into `stream`.
 
 ## 2. Current-state facts
 
@@ -21,11 +28,20 @@ rendered; they do not decide whether an available reasoning callback is wired.
 - Partial answer text enters through `onPartialReply`; tool lifecycle events enter
   through `onToolStart` / `onItemEvent`.
 - OpenClaw has a purpose-built `onReasoningStream(payload)` callback and an
-  `onReasoningEnd()` boundary. The relevant delivered fields are `text`,
-  `isReasoningSnapshot`, and `requiresReasoningProgressOptIn`; do not depend on
-  `isReasoning`, which is not forwarded by every runner path.
-- OpenClaw also exposes `streamReasoningInNonStreamModes`, but that is an
-  independent reasoning-policy opt-in, not the WebChannel answer streaming mode.
+  `onReasoningEnd()` boundary. The pinned payload is exactly
+  `{ text?: string; mediaUrls?: string[]; isReasoningSnapshot?: boolean }`
+  (verified: `dist/plugin-sdk/types-B70zVumi.d.ts:1737-1741`). We consume `text`
+  and `isReasoningSnapshot`; `mediaUrls` is ignored (text-only lane). Do not
+  depend on `isReasoning`, which is not forwarded by every runner path.
+- The plugin dispatch path forwards `onReasoningStream` with NO reasoning-level
+  gate of its own (`dist/dispatch-B2e1grFo.js:1658-1710`): the ACP runner always
+  emits a full-text snapshot (`dist/run-attempt-DRhLt3eF.js:4100-4117`) and the
+  btw runner emits cumulative full text whenever the resolved level is not `off`,
+  i.e. it emits at level `on` too (`dist/btw-CDO5476N.js:617-627`). WHETHER a
+  channel shows reasoning to its client is therefore CHANNEL-OWNED display policy.
+  (The fields `requiresReasoningProgressOptIn` and
+  `streamReasoningInNonStreamModes` do NOT exist anywhere in the pinned dist —
+  an earlier draft of this plan invented them.)
 - Plugin and client wire unions independently declare frame shapes. A new frame
   must be added to every declaration; importing the Node-side plugin contract
   into the zero-dependency browser client is intentionally avoided.
@@ -46,28 +62,38 @@ WebChannel consumes the channel callback it intentionally exposes.
 An empty or non-string `payload.text` is ignored. WebChannel must not fall back to
 answer text when reasoning is absent.
 
-### 3.2 Reasoning is independent of answer streaming mode
+### 3.2 Reasoning is gated on the session reasoning level, not the answer mode
 
-Every ordinary turn supplies:
+When the lane is active, an ordinary turn supplies:
 
 - `onReasoningStream`
 - `onReasoningEnd`
 
-These callbacks are supplied regardless of WebChannel's `partial`, `progress`,
-`block`, or `off` mode, including when no answer draft exists. Do **not** set
-`streamReasoningInNonStreamModes:true`: in the pinned OpenClaw runtime that option
-can surface ambient reasoning even when the session reasoning mode is `off`, with
-`requiresReasoningProgressOptIn:true`. WebChannel has no such explicit user opt-in
-in P1-3. Defense in depth: discard any callback whose
-`requiresReasoningProgressOptIn` is true. A future reasoning preference may enable
-it deliberately, but that is a separate product change.
+These are supplied (or not) INDEPENDENTLY of WebChannel's `partial`, `progress`,
+`block`, or `off` answer mode — including when no answer draft exists. What decides
+whether they are wired is the resolved SESSION reasoning level: the lane is wired
+ONLY when that level is `stream`.
 
-The `/stop` control-lane turn is excluded: it should not create a new reasoning
-lane while aborting another turn.
+Because the plugin dispatch path applies no reasoning-level gate of its own (see
+§2 — the ACP/btw runners emit at any level `!= off`), display policy is
+channel-owned, and WebChannel implements the same gate as the Telegram reference:
+
+- resolve the level via `resolveWebchannelReasoningLevel` (`reasoning-level.ts`),
+  mirroring `resolveTelegramReasoningLevel` (`dist/bot-Dxj27QDQ.js:6029-6044`):
+  the session-store entry's `reasoningLevel` wins when it is `on`/`stream`/`off`;
+  a store-read throw is fail-closed to `off`; otherwise the config default from
+  `agents.list[…].reasoningDefault` → `agents.defaults.reasoningDefault` → `off`;
+- wire the reasoning callbacks only when that resolves to `stream`. At `off` or
+  `on` the callbacks are NOT wired and no reasoning frame is ever sent (Telegram
+  likewise streams its draft only at `stream`, `dist/bot-Dxj27QDQ.js:6441`, and
+  suppresses at `off`, `:6582`).
+
+The `/stop` control-lane turn is excluded: it never opens a reasoning lane while
+aborting another turn.
 
 This decision does not force reasoning generation. Existing OpenClaw/model/session
-reasoning policy remains authoritative; WebChannel only displays callbacks that
-OpenClaw elects to emit.
+reasoning policy remains authoritative; WebChannel only displays reasoning when the
+resolved level opts into `stream`.
 
 ### 3.3 Add a dedicated wire frame
 
@@ -122,19 +148,21 @@ the addition is optional and forward-compatible.
 The transport frame always carries the full reasoning text accumulated so far.
 The browser reducer therefore always replaces by id; it never appends deltas.
 
-The per-turn plugin controller maintains `currentText`:
+VERIFIED CONTRACT (pinned OpenClaw v2026.6.x): every emitter sends either a
+snapshot or the cumulative FULL text so far — NEVER a bare delta. The ACP runner
+emits the full accumulated text with `isReasoningSnapshot: true`
+(`dist/run-attempt-DRhLt3eF.js:4100-4117`); the btw runner accumulates
+`reasoningText += delta` and emits `reasoningText` with no snapshot flag
+(`dist/btw-CDO5476N.js:617-627`). No provider path emits a bare delta.
 
-- `payload.isReasoningSnapshot === true`: replace `currentText` with `text`.
-- otherwise, if `text` extends `currentText`: replace with `text` (cumulative
-  providers).
-- otherwise append `text` (delta providers).
-- exact duplicate updates are no-ops.
+The per-turn plugin controller therefore maintains `currentText` with a plain
+REPLACE — no snapshot/startsWith/endsWith/concat heuristic:
 
-Before implementing this heuristic, tests must be written from the callback
-shapes exercised by the pinned OpenClaw version. If the runtime contract proves
-that non-snapshot payloads are already cumulative, simplify to replacement and
-record that verified contract in code comments. Do not ship an untested concat
-heuristic.
+- empty or non-string `payload.text`: ignore.
+- exact duplicate of `currentText`: no-op.
+- otherwise: replace `currentText` with `text` and send.
+
+The browser reducer likewise always replaces by id; it never appends deltas.
 
 `onReasoningEnd` closes the current burst in the plugin controller only; it does
 not send a terminal frame. A later reasoning update in the same turn starts a new
@@ -260,12 +288,15 @@ silently enable tool progress or answer partials.
 
 ## 5. Lifecycle and edge cases
 
-- **No reasoning:** no frame and no client item.
-- **Reasoning before answer:** lane appears; answer later follows
+- **No reasoning, or reasoning level not `stream`:** no reasoning callback is
+  wired, no frame is sent, and no client item appears. Level `off` and `on` both
+  fall here; only `stream` opens the lane.
+- **Reasoning before answer (level `stream`):** lane appears; answer later follows
   its existing path. The textual typing indicator is hidden while reasoning is
   visible, but the internal turn-control signal stays active.
-- **Reasoning without streamed answer (`off`/`block`):** lane streams, then the
-  atomic final answer arrives normally.
+- **Reasoning (level `stream`) without a streamed answer (answer mode `off`/`block`):**
+  lane streams, then the atomic final answer arrives normally — proving the
+  reasoning gate is independent of the answer streaming mode.
 - **Multiple bursts:** `onReasoningEnd` rotates one item; a later update creates the
   next item.
 - **Missing `onReasoningEnd`:** turn settlement stops the active controller; no
@@ -286,9 +317,9 @@ silently enable tool progress or answer partials.
 ## 6. Non-goals
 
 - Enabling a model's reasoning or changing session `reasoningLevel`.
-- Exposing arbitrary internal chain-of-thought. The UI presents only channel-safe
-  reasoning preview/summary content that OpenClaw's explicit `stream` policy emits;
-  opt-in-required ambient payloads are rejected.
+- Exposing arbitrary internal chain-of-thought. The UI presents reasoning only
+  when the resolved session reasoning level is `stream`; at `off`/`on` no lane is
+  wired and nothing is shown.
 - Persisting reasoning in session history or server storage.
 - Persisted correlation for historical reasoning after a fresh load.
 - Adding user controls for reasoning level.
@@ -307,11 +338,11 @@ silently enable tool progress or answer partials.
    - update transport mocks, frame fixtures, protocol comments, and runtime
      unknown-frame compatibility tests.
 2. **Plugin callback/controller**
-   - implement the per-turn controller;
-   - wire callbacks independently of `streaming.mode`;
+   - implement the per-turn controller (cumulative REPLACE, verified contract);
+   - wire callbacks independently of the answer `streaming.mode`, gated on the
+     resolved session reasoning level === `stream` (`reasoning-level.ts`);
    - rotate on reasoning-end and stop on turn settlement;
-   - reject `requiresReasoningProgressOptIn` payloads;
-   - add partial/progress/block/off and control-lane tests.
+   - add level `off`/`on`/`stream` × partial/progress/block/off and control-lane tests.
 3. **Headless client reducer**
    - expose `ReasoningItem` and initialize `reasoning: []`;
    - upsert by id and prune to the retention bound;
@@ -330,10 +361,12 @@ silently enable tool progress or answer partials.
 
 | Case | Expected result |
 |---|---|
-| Reasoning callback, `partial` mode | Separate reasoning lane; answer draft unchanged |
-| Reasoning callback, `progress` mode | Separate reasoning lane; tool progress unchanged |
-| Reasoning callback, `block` mode | Reasoning lane plus atomic final answer; Stop remains armed |
-| Reasoning callback, `off` mode | Same as block; proves mode independence |
+| Level `stream`, `partial` mode | Separate reasoning lane; answer draft unchanged |
+| Level `stream`, `progress` mode | Separate reasoning lane; tool progress unchanged |
+| Level `stream`, `block` mode | Reasoning lane plus atomic final answer; Stop remains armed |
+| Level `stream`, `off` mode | Same as block; proves answer-mode independence |
+| Level `on` (any mode) | No reasoning lane wired; no reasoning frame (btw emits at `on` upstream, channel suppresses) |
+| Level `off` (any mode) | No reasoning lane wired; no reasoning frame |
 | No reasoning callback | No empty `Reasoning` UI |
 | Snapshot updates | Text replaces without duplication |
 | Cumulative updates | Text replaces without duplication |
@@ -345,7 +378,7 @@ silently enable tool progress or answer partials.
 | Settlement frame lost, then reconnect | Reconnect clears stale activity |
 | Two consecutive turns | Each reasoning group stays with its own answer |
 | History prepend during live turn | Live reasoning keeps its turn placement |
-| Opt-in-required ambient payload | Suppressed |
+| Store-read error during level resolution | Fail-closed to `off`; no reasoning lane |
 | More than 100 bursts | Oldest/orphaned reasoning is bounded and pruned |
 | Expanded lane receives update | Remains expanded |
 | Hostile markdown/HTML | Inert text/safe markdown DOM |
@@ -358,8 +391,9 @@ silently enable tool progress or answer partials.
    can be expanded while it streams.
 2. The answer remains a separate bubble and preserves the existing behavior for
    all four streaming modes.
-3. A reasoning callback is wired in all four modes; the `/stop` control lane is
-   excluded.
+3. When the resolved session reasoning level is `stream`, the reasoning callback
+   is wired in all four answer modes; at level `off`/`on` it is not wired; the
+   `/stop` control lane is always excluded.
 4. Non-reasoning turns render no empty affordance.
 5. Incremental updates neither duplicate text nor close a lane the user expanded.
 6. Two or more consecutive turns keep each reasoning lane attached to the correct
@@ -378,8 +412,10 @@ silently enable tool progress or answer partials.
 
 These are code-contract checks, not product decisions:
 
-1. Verify whether the pinned OpenClaw runtime sends non-snapshot reasoning payloads
-   as deltas or cumulative text; lock the observed semantics in controller tests.
+1. RESOLVED: the pinned OpenClaw runtime never sends bare deltas — ACP emits
+   full-text snapshots (`dist/run-attempt-DRhLt3eF.js:4100-4117`) and btw emits
+   cumulative full text (`dist/btw-CDO5476N.js:617-627`). The controller uses a
+   plain REPLACE, locked by `message-adapter.test.ts`.
 2. Enumerate every independent wire union and transport mock before editing; this
    repository intentionally duplicates browser/server protocol types.
 3. Trace the inbound `user_message.id` through both NATS and legacy WebSocket

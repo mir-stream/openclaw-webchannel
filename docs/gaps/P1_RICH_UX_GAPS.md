@@ -117,15 +117,19 @@ the layout, and streaming growth doesn't yank the viewport.
 **Symptom.** Model "thinking" (when present) is dumped inline with the answer or lost.
 
 **Classification.** ✅ Built. Native OpenClaw reasoning callbacks now travel on a dedicated,
-turn-correlated frame and render as collapsed `Reasoning` details independently of answer streaming
-mode. Opt-in-required ambient reasoning is suppressed.
+turn-correlated frame and render as collapsed `Reasoning` details independently of the answer
+streaming mode. Reasoning streams to the browser ONLY when the resolved session reasoning level is
+`stream` (default `off` via `agents.defaults.reasoningDefault`), matching the Telegram reference and
+fail-closed on a store-read error.
 
-**Where it stands today.** `inbound.ts` wires `onReasoningStream` / `onReasoningEnd` for every
-ordinary turn regardless of `partial` / `progress` / `block` / `off`, while preserving existing
-mode-specific answer/tool callbacks. `ReasoningDraftController` normalizes delta/snapshot updates,
-rotates bursts, and rejects `requiresReasoningProgressOptIn` payloads. Dedicated `reasoning` and
-`turn_settled` frames exist in both transports. Both clients keep bounded ephemeral reasoning state;
-the demo groups it by `turnId` between the matching user message and answer. It is not persisted.
+**Where it stands today.** After route resolution `inbound.ts` resolves the session reasoning level
+(`reasoning-level.ts`, Telegram-parity: session-store level wins, throw → `off`, else config default)
+and wires `onReasoningStream` / `onReasoningEnd` ONLY when it is `stream` — in every answer mode
+(`partial` / `progress` / `block` / `off`), while preserving existing mode-specific answer/tool
+callbacks. `ReasoningDraftController` normalizes cumulative/snapshot updates by REPLACE (verified: no
+pinned emitter sends a bare delta) and rotates bursts. Dedicated `reasoning` and `turn_settled` frames
+exist in both transports. Both clients keep bounded ephemeral reasoning state; the demo groups it by
+`turnId` between the matching user message and answer. It is not persisted.
 
 **Telegram reference.**
 - `reasoning-lane-coordinator.ts:68` `splitTelegramReasoningText()` — splits `{reasoningText,

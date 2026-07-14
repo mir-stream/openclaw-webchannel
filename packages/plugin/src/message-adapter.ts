@@ -406,23 +406,37 @@ export function createProgressDraftController(params: {
   };
 }
 
+/**
+ * One `onReasoningStream` payload, narrowed to the fields we consume. The pinned
+ * OpenClaw callback delivers `{ text?; mediaUrls?; isReasoningSnapshot? }`
+ * (verified: dist/plugin-sdk/types-B70zVumi.d.ts:1737-1741). `mediaUrls` is
+ * intentionally ignored — the webchannel reasoning lane is text-only.
+ */
 export type ReasoningStreamUpdate = {
   text?: string;
   isReasoningSnapshot?: boolean;
-  requiresReasoningProgressOptIn?: boolean;
 };
 
 export type ReasoningDraftController = {
   push: (update: ReasoningStreamUpdate) => void;
   endBurst: () => void;
   stop: () => void;
-  readonly started: boolean;
 };
 
 /**
- * Normalizes OpenClaw's provider-dependent reasoning updates into cumulative,
- * replace-by-id wire frames. Each `onReasoningEnd` boundary rotates the id so
- * separate reasoning bursts remain distinct in the UI.
+ * Normalizes OpenClaw's reasoning updates into cumulative, replace-by-id wire
+ * frames. Each `onReasoningEnd` boundary rotates the id so separate reasoning
+ * bursts remain distinct in the UI.
+ *
+ * VERIFIED CONTRACT (pinned OpenClaw v2026.6.x): every emitter sends either a
+ * snapshot or the cumulative FULL text so far — NEVER a bare delta:
+ *  - the ACP runner emits the full accumulated text with `isReasoningSnapshot:
+ *    true` (dist/run-attempt-DRhLt3eF.js:4114-4117);
+ *  - the btw runner emits cumulative full text (`reasoningText += delta` then
+ *    emits `reasoningText`, no snapshot flag) (dist/btw-CDO5476N.js:617-627).
+ * So normalization is a plain REPLACE: ignore empty/non-string text, no-op an
+ * exact duplicate of the current text, otherwise replace and send. No
+ * snapshot/startsWith/endsWith/concat heuristic is needed.
  */
 export function createReasoningDraftController(params: {
   transport: WebChannelTransport;
@@ -432,26 +446,17 @@ export function createReasoningDraftController(params: {
   let id = nextMessageId();
   let currentText = "";
   let stopped = false;
-  let started = false;
 
   const push = (update: ReasoningStreamUpdate): void => {
-    if (stopped || update.requiresReasoningProgressOptIn === true) return;
+    if (stopped) return;
     const text = typeof update.text === "string" ? update.text : "";
     if (text.length === 0) return;
-
-    let next: string;
-    if (update.isReasoningSnapshot === true || text.startsWith(currentText)) {
-      next = text;
-    } else if (currentText.endsWith(text)) {
-      next = currentText;
-    } else {
-      next = currentText + text;
-    }
-    if (next === currentText) return;
-    currentText = next;
-    if (params.transport.sendReasoning(params.sessionKey, id, params.turnId, currentText)) {
-      started = true;
-    }
+    // Cumulative/snapshot REPLACE (see the verified contract above): a payload is
+    // always the full text so far, so an exact match is a no-op and anything else
+    // replaces the current text wholesale.
+    if (text === currentText) return;
+    currentText = text;
+    params.transport.sendReasoning(params.sessionKey, id, params.turnId, currentText);
   };
 
   return {
@@ -463,9 +468,6 @@ export function createReasoningDraftController(params: {
     },
     stop: () => {
       stopped = true;
-    },
-    get started() {
-      return started;
     },
   };
 }

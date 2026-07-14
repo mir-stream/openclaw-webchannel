@@ -5,6 +5,7 @@ import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
 import { DEFAULT_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
+import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
 
 /** The inbound path only handles user messages; approvals route separately. */
 type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
@@ -151,10 +152,9 @@ export async function handleInboundMessage(
       channelConfig,
     });
   }
+  // Reasoning lane is created AFTER route resolution (below), once we can resolve
+  // the session's reasoning display level.
   let reasoning: ReasoningDraftController | undefined;
-  if (!controlLane) {
-    reasoning = createReasoningDraftController({ transport, sessionKey: wsKey, turnId });
-  }
   let finalReplyDelivered = false;
 
   // Resolve the channel-scoped agent route, then FORCE the per-account-channel-
@@ -167,6 +167,29 @@ export async function handleInboundMessage(
   // turn is dispatched under this key, and the history READ sites resolve the
   // SAME key via the SAME helper, so paging/snapshot stay consistent.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey);
+
+  // Reasoning display policy (CHANNEL-OWNED). OpenClaw's plugin dispatch path
+  // forwards `onReasoningStream` with no reasoning-level gate of its own (ACP
+  // always snapshots; btw emits at any level != "off" — dist/run-attempt
+  // -DRhLt3eF.js:4114-4117, dist/btw-CDO5476N.js:617-627), so the CHANNEL decides
+  // whether reasoning reaches the browser. Mirroring the Telegram reference
+  // (streams only at "stream", suppresses at "off" — dist/bot-Dxj27QDQ.js:6441,
+  // :6582), we wire the lane ONLY when the resolved session reasoning level is
+  // "stream". Resolution is session-store-first, fail-closed to "off" on a store
+  // read error, with the `agents.*.reasoningDefault` config default otherwise
+  // (see reasoning-level.ts). Default is "off": no ambient reasoning ever streams
+  // to a widget unless the operator/session explicitly opted into "stream". The
+  // control lane (/stop) never opens a reasoning lane while aborting another turn.
+  if (!controlLane) {
+    const reasoningLevel = resolveWebchannelReasoningLevel({
+      cfg: api.config,
+      agentId: route.agentId,
+      sessionKey: route.sessionKey,
+    });
+    if (reasoningLevel === "stream") {
+      reasoning = createReasoningDraftController({ transport, sessionKey: wsKey, turnId });
+    }
+  }
 
   // Native "Bot is typing…" affordance. We push the frame right after route
   // resolution and right before agent dispatch (1) so the widget sees the
@@ -269,17 +292,29 @@ export async function handleInboundMessage(
             recordInboundSession: channelRuntime.session.recordInboundSession,
             dispatchReplyWithBufferedBlockDispatcher:
               channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
-            // Progress-draft callbacks (only when streaming.mode === "progress").
-            // These fire DURING the agent run and feed the rolling draft. We also
-            // set `suppressDefaultToolProgressMessages` so the agent's own tool
-            // progress text isn't ALSO delivered as separate messages (it lives
-            // inside our draft instead — GetReplyOptions.suppressDefaultToolProgressMessages,
-            // dist/plugin-sdk/types-BYvUZFDr.d.ts:261-265).
-            ...(!controlLane
+            // `replyOptions` exists ONLY when this turn has a live lane to feed:
+            // the reasoning lane (resolved level "stream") and/or the answer/tool
+            // draft (progress/partial mode). When NEITHER is active — block/off
+            // with no "stream" reasoning, and every control-lane turn — the whole
+            // key is omitted, restoring the pre-reasoning-lane block/off shape.
+            ...(reasoning || draft
               ? {
                   replyOptions: {
-                    onReasoningStream: (p) => reasoning!.push(p),
-                    onReasoningEnd: () => reasoning!.endBurst(),
+                    // Reasoning callbacks are wired iff the lane opened above.
+                    ...(reasoning
+                      ? {
+                          onReasoningStream: (p) => reasoning!.push(p),
+                          onReasoningEnd: () => reasoning!.endBurst(),
+                        }
+                      : {}),
+                    // Progress-draft callbacks (only when a draft exists, i.e.
+                    // streaming.mode "progress"/"partial"). These fire DURING the
+                    // agent run and feed the rolling draft. We also set
+                    // `suppressDefaultToolProgressMessages` so the agent's own tool
+                    // progress text isn't ALSO delivered as separate messages (it
+                    // lives inside our draft instead — GetReplyOptions
+                    // .suppressDefaultToolProgressMessages, dist/plugin-sdk/
+                    // types-BYvUZFDr.d.ts:261-265).
                     ...(draft
                       ? {
                           suppressDefaultToolProgressMessages: true,
