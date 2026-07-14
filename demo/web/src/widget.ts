@@ -178,7 +178,7 @@ export async function createWidget(
       children.push(el("div", { style: "color:var(--muted);margin-top:4px" }, [copy.hint]));
       if (copy.showReauth) {
         const reauth = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
-        reauth.onclick = () => { void connectLane(); };
+        reauth.onclick = () => { connectLaneGuarded(); };
         children.push(reauth);
       }
       errBox.replaceChildren(...children);
@@ -398,12 +398,37 @@ export async function createWidget(
     client.connect();
   }
 
+  /**
+   * Fire-and-forget lane (re)connect. A failed re-auth (the /nats-user or
+   * /bootstrap SaaS fetch) rejects BEFORE any client exists, so no state event
+   * renders it — without this catch the errBox stays hidden and the pill sticks
+   * on "connecting…". Renders the failure into errBox with a retry that repeats
+   * the SAME request (incl. scene ⑤'s short TTL).
+   */
+  function connectLaneGuarded(ttlSeconds?: number): void {
+    connectLane(ttlSeconds).catch((err: unknown) => {
+      statusPill.textContent = "● error";
+      statusPill.style.color = "var(--bad)";
+      const retry = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
+      retry.onclick = () => { connectLaneGuarded(ttlSeconds); };
+      errBox.replaceChildren(
+        el("div", { style: "font-weight:600;margin-bottom:4px" }, ["Re-authentication failed"]),
+        el("div", {}, [err instanceof Error ? err.message : String(err)]),
+        el("div", { style: "color:var(--muted);margin-top:4px" }, ["The auth endpoint could not be reached — try again."]),
+        retry,
+      );
+      errBox.classList.remove("hidden");
+      input.disabled = true;
+      sendBtn.disabled = true;
+    });
+  }
+
   // ── Wiring ────────────────────────────────────────────────────────────────
   historyBtn.onclick = () => {
     const oldest = client?.getState().messages.find((m) => !m.working);
     client?.loadHistory({ before: oldest?.id, limit: 20 });
   };
-  shortBtn.onclick = () => { void connectLane(SHORT_TTL_SECONDS); };
+  shortBtn.onclick = () => { connectLaneGuarded(SHORT_TTL_SECONDS); };
   const submit = () => {
     const text = input.value.trim();
     if (!text) return;

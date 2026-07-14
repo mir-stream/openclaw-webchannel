@@ -194,7 +194,11 @@ describe("CL2 — terminal auth failure", () => {
 
     expect(errors).toHaveLength(1); // expired creds → terminal
     // P1-7: a TTL lapse on a valid credential → auth-expired (distinct from a
-    // violation), so scene ⑤ can say "Credentials expired".
+    // violation), so scene ⑤ can say "Credentials expired". The human message
+    // matches the cause: "credentials expired", NOT the violation path's
+    // "authorization rejected" (which would read discordant under that heading).
+    expect(errors[0].message).toMatch(/credentials expired/i);
+    expect(errors[0].message).not.toMatch(/authorization rejected/i);
     expect(causes).toEqual(["auth-expired"]);
   });
 });

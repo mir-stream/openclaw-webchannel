@@ -614,8 +614,8 @@ export class NatsClient {
         // story — see WebChannelErrorCause.
         if (/authentication expired/i.test(line)) {
           this.failTerminally(
-            `NATS authorization rejected: ${line.slice(5).trim()} ` +
-              `(credentials invalid/expired — reconnecting cannot help)`,
+            `NATS credentials expired: ${line.slice(5).trim()} ` +
+              `(credential TTL lapsed — reconnecting cannot help; re-authenticate)`,
             "auth-expired",
           );
         } else if (/authorization violation/i.test(line)) {
