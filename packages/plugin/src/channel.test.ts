@@ -55,6 +55,12 @@ describe("webchannel inbound round-trip", () => {
       // test can drive a MULTI-message reply (boundary → per-item cumulative
       // restarts from ""). Fired in the same slot as `partialTexts`.
       partialSteps?: Array<{ text: string } | { boundary: true }>;
+      reasoningSteps?: Array<{
+        text: string;
+        isReasoningSnapshot?: boolean;
+        requiresReasoningProgressOptIn?: boolean;
+        end?: boolean;
+      }>;
       // Captures the replyOptions the turn supplied, so a test can assert which
       // callbacks were (or were NOT) wired for a given streaming mode.
       onReplyOptions?: (replyOptions: any) => void;
@@ -129,6 +135,12 @@ describe("webchannel inbound round-trip", () => {
               } else if (turn.replyOptions?.onPartialReply) {
                 await turn.replyOptions.onPartialReply({ text: step.text });
               }
+            }
+          }
+          if (opts?.reasoningSteps) {
+            for (const step of opts.reasoningSteps) {
+              await turn.replyOptions?.onReasoningStream?.(step);
+              if (step.end) await turn.replyOptions?.onReasoningEnd?.();
             }
           }
           // Simulate the turn blowing up mid-draft (after a progress frame, but
@@ -226,7 +238,7 @@ describe("webchannel inbound round-trip", () => {
     expect(captured.recordedTo).toBe("web-anon");
     // The reply was delivered back through THIS channel to the peer's socket.
     // No-progress config => plain no-id agent_message (legacy append path).
-    expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
   });
 
   it("threads accountId into resolveAgentRoute (binding.account routing — Cycle 2)", async () => {
@@ -380,7 +392,7 @@ describe("webchannel inbound round-trip", () => {
 
     // The final answer finalized the SAME draft id (widget transitions the
     // working bubble into the final text), NOT a fresh no-id agent_message.
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
 
     // Every progress frame shares the one draft id.
     for (const call of progressSpy.mock.calls) {
@@ -420,7 +432,7 @@ describe("webchannel inbound round-trip", () => {
     expect(lastFrameText).toBe("Hello world");
 
     // The final answer finalized the SAME draft id (working bubble → final text).
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("strips reasoning tags from streamed partials in partial mode (mirrors core hygiene)", async () => {
@@ -449,7 +461,7 @@ describe("webchannel inbound round-trip", () => {
     const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
     expect(lastFrameText).toBe("Hello world");
     const progId = progressSpy.mock.calls[0][1];
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("ignores a SHRINKING cumulative partial (no backwards flicker) in partial mode", async () => {
@@ -548,7 +560,7 @@ describe("webchannel inbound round-trip", () => {
     // All frames share one draft id, and the final settles that same id.
     const progId = progressSpy.mock.calls[0][1];
     for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("treats an assistant-message boundary BEFORE the first partial as a no-op (no leading blank prefix)", async () => {
@@ -612,7 +624,7 @@ describe("webchannel inbound round-trip", () => {
     expect((lastFrameText as string).match(/Second msg/g)?.length).toBe(1);
     const progId = progressSpy.mock.calls[0][1];
     for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("handles a LATE assistant-message boundary idempotently (no double-roll)", async () => {
@@ -705,13 +717,48 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
-    // No draft: replyOptions is omitted entirely, and delivery falls through to
-    // the plain no-id agent_message append (sendText), never sendProgress/finalize.
-    expect(seenReplyOptions).toBeUndefined();
+    // No answer/tool draft: only the mode-independent reasoning callbacks exist.
+    // Tool/answer callbacks and suppression must remain absent.
+    expect(seenReplyOptions).toEqual({
+      onReasoningStream: expect.any(Function),
+      onReasoningEnd: expect.any(Function),
+    });
     expect(progressSpy).not.toHaveBeenCalled();
     expect(finalizeSpy).not.toHaveBeenCalled();
-    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
   });
+
+  it.each(["off", "block", "progress", "partial"] as const)(
+    "streams reasoning independently when streaming.mode=%s and suppresses opt-in-required payloads",
+    async (mode) => {
+      const transport = new WebChannelTransport();
+      const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode } },
+        reasoningSteps: [
+          { text: "safe" },
+          { text: "hidden", requiresReasoningProgressOptIn: true },
+        ],
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningSpy).toHaveBeenCalledTimes(1);
+      expect(reasoningSpy).toHaveBeenCalledWith(
+        "web-anon",
+        expect.any(String),
+        "turn-42",
+        "safe",
+      );
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42");
+    },
+  );
 
   it("recovers the working bubble when the turn throws mid-draft in progress mode", async () => {
     vi.useFakeTimers();
@@ -840,7 +887,7 @@ describe("webchannel inbound round-trip", () => {
     expect(typingSpy).toHaveBeenCalledWith("web-anon");
     // The agent's reply (via sendText) was delivered — proves the typing
     // call is BEFORE agent dispatch, not after.
-    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
     // Strict order: typing < sendText.
     const typingOrder = typingSpy.mock.invocationCallOrder[0];
     const sendTextOrder = sendTextSpy.mock.invocationCallOrder[0];

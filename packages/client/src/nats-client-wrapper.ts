@@ -19,6 +19,7 @@ import type {
   ApprovalDecision,
   ApprovalOption,
   ChatMessage,
+  ReasoningItem,
   ApprovalRequest,
 } from "./types.js";
 import {
@@ -43,6 +44,7 @@ export class WebChannelNATSClient {
 
   private state: WebChannelState = {
     messages: [],
+    reasoning: [],
     approvals: [],
     status: "connecting",
     connected: false,
@@ -94,6 +96,7 @@ export class WebChannelNATSClient {
       this.setState({
         status: connected ? "connected" : "reconnecting",
         connected,
+        ...(!connected ? { isTyping: false } : {}),
       });
     });
 
@@ -159,6 +162,7 @@ export class WebChannelNATSClient {
       role: "user",
       text: trimmed,
       wireId,
+      turnId: wireId,
     });
   }
 
@@ -198,6 +202,15 @@ export class WebChannelNATSClient {
 
   private appendMessage(message: ChatMessage): void {
     this.setState({ messages: [...this.state.messages, message] });
+  }
+
+  private upsertReasoning(item: ReasoningItem): void {
+    const current = this.state.reasoning;
+    const idx = current.findIndex((entry) => entry.id === item.id);
+    const next = idx === -1
+      ? [...current, item]
+      : current.map((entry, i) => (i === idx ? item : entry));
+    this.setState({ reasoning: next.slice(-100) });
   }
 
   private upsertMessage(
@@ -617,9 +630,20 @@ export class WebChannelNATSClient {
         const text = msg.text ?? "";
         this.upsertMessage(
           id ?? "",
-          (prev) => ({ ...prev, text, working: true }),
-          { id: id ?? "", role: "agent", text, working: true },
+          (prev) => ({ ...prev, text, working: true, turnId: msg.turnId ?? prev.turnId }),
+          { id: id ?? "", role: "agent", text, working: true, turnId: msg.turnId },
         );
+        this.setState({ isTyping: false });
+        return;
+      }
+
+      case "reasoning": {
+        if (!msg.id || !msg.turnId || typeof msg.text !== "string" || msg.text.length === 0) return;
+        this.upsertReasoning({ id: msg.id, turnId: msg.turnId, text: msg.text });
+        return;
+      }
+
+      case "turn_settled": {
         this.setState({ isTyping: false });
         return;
       }
@@ -631,8 +655,8 @@ export class WebChannelNATSClient {
         if (id) {
           this.upsertMessage(
             id,
-            (prev) => ({ ...prev, text: text ?? "", working: false }),
-            { id, role: "agent", text: text ?? "", working: false },
+            (prev) => ({ ...prev, text: text ?? "", working: false, turnId: msg.turnId ?? prev.turnId }),
+            { id, role: "agent", text: text ?? "", working: false, turnId: msg.turnId },
           );
           return;
         }
@@ -641,10 +665,10 @@ export class WebChannelNATSClient {
           id: `a-${this.uid()}`,
           role: "agent",
           text: text ?? "",
+          turnId: msg.turnId,
         });
         return;
       }
     }
   }
 }
-

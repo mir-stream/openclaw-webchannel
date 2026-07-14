@@ -37,6 +37,14 @@ export type ChatMessage = {
    * (state-only — a view can render a ✓). Absent until then.
    */
   delivered?: boolean;
+  /** Ephemeral live-turn correlation. History messages intentionally omit it. */
+  turnId?: string;
+};
+
+export type ReasoningItem = {
+  id: string;
+  turnId: string;
+  text: string;
 };
 
 /** Native HITL approval decision; mirrors the plugin/SDK union. */
@@ -122,6 +130,8 @@ export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "er
  */
 export type WebChannelState = {
   messages: ChatMessage[];
+  /** Ephemeral, non-history reasoning previews, bounded by the clients. */
+  reasoning: ReasoningItem[];
   approvals: ApprovalRequest[];
   status: ConnectionStatus;
   /** Convenience mirror of `status === "connected"`. */
@@ -247,8 +257,10 @@ export type InboundWsMessage =
 
 /** Wire envelope received FROM the gateway. Mirrors `src/transport.ts`. */
 export type OutboundWsMessage =
-  | { type: "agent_message"; text: string; id?: string }
-  | { type: "progress"; id: string; text: string }
+  | { type: "agent_message"; text: string; id?: string; turnId?: string }
+  | { type: "progress"; id: string; text: string; turnId?: string }
+  | { type: "reasoning"; id: string; turnId: string; text: string }
+  | { type: "turn_settled"; turnId: string }
   | {
       type: "approval_request";
       id: string;

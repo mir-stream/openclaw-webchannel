@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 
-import { createProgressDraftController } from "./message-adapter.js";
+import { createProgressDraftController, createReasoningDraftController } from "./message-adapter.js";
 import type { WebChannelTransport } from "./transport.js";
 
 /**
@@ -80,5 +80,53 @@ describe("ProgressDraftController.snapshotText", () => {
     await draft.finalize("hello world final");
     // The snapshot reads never altered the finalized text.
     expect(first).toBe("hello world");
+  });
+});
+
+describe("ReasoningDraftController", () => {
+  function setup() {
+    const frames: Array<{ id: string; turnId: string; text: string }> = [];
+    const transport = {
+      sendReasoning: (_peer: string, id: string, turnId: string, text: string) => {
+        frames.push({ id, turnId, text });
+        return true;
+      },
+    } as unknown as WebChannelTransport;
+    const controller = createReasoningDraftController({
+      transport,
+      sessionKey: "peer-1",
+      turnId: "turn-1",
+    });
+    return { controller, frames };
+  }
+
+  it("normalizes cumulative and delta updates to cumulative replace frames", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "Think" });
+    controller.push({ text: "Thinking" });
+    controller.push({ text: " more" });
+    expect(frames.map((frame) => frame.text)).toEqual(["Think", "Thinking", "Thinking more"]);
+    expect(new Set(frames.map((frame) => frame.id)).size).toBe(1);
+    expect(frames.every((frame) => frame.turnId === "turn-1")).toBe(true);
+  });
+
+  it("replaces snapshots, suppresses duplicates, and rejects opt-in-required payloads", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "one" });
+    controller.push({ text: "replacement", isReasoningSnapshot: true });
+    controller.push({ text: "replacement", isReasoningSnapshot: true });
+    controller.push({ text: "private", requiresReasoningProgressOptIn: true });
+    expect(frames.map((frame) => frame.text)).toEqual(["one", "replacement"]);
+  });
+
+  it("rotates ids at a reasoning-end boundary and ignores late updates after stop", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "first" });
+    controller.endBurst();
+    controller.push({ text: "second" });
+    controller.stop();
+    controller.push({ text: "late" });
+    expect(frames).toHaveLength(2);
+    expect(frames[0].id).not.toBe(frames[1].id);
   });
 });

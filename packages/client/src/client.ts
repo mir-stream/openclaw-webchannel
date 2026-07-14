@@ -2,6 +2,7 @@ import type {
   ApprovalDecision,
   ApprovalRequest,
   ChatMessage,
+  ReasoningItem,
   WebChannelOptions,
   WebChannelState,
   ConnectionStatus,
@@ -39,6 +40,7 @@ export class WebChannelClient {
 
   private state: WebChannelState = {
     messages: [],
+    reasoning: [],
     approvals: [],
     status: "connecting",
     connected: false,
@@ -128,12 +130,16 @@ export class WebChannelClient {
     // TODO(reconnect): message replay + idempotency dedupe deferred.
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
+    const suffix = this.uid();
+    const wireId = `ws-${suffix}`;
     this.appendMessage({
-      id: `u-${this.uid()}`,
+      id: `u-${suffix}`,
       role: "user",
       text: trimmed,
+      wireId,
+      turnId: wireId,
     });
-    const payload: InboundWsMessage = { type: "user_message", text: trimmed };
+    const payload: InboundWsMessage = { type: "user_message", text: trimmed, id: wireId };
     ws.send(JSON.stringify(payload));
   }
 
@@ -193,6 +199,15 @@ export class WebChannelClient {
 
   private appendMessage(message: ChatMessage): void {
     this.setState({ messages: [...this.state.messages, message] });
+  }
+
+  private upsertReasoning(item: ReasoningItem): void {
+    const current = this.state.reasoning;
+    const idx = current.findIndex((entry) => entry.id === item.id);
+    const next = idx === -1
+      ? [...current, item]
+      : current.map((entry, i) => (i === idx ? item : entry));
+    this.setState({ reasoning: next.slice(-100) });
   }
 
   /** Replace the message with `id` via `update`, or append `fallback` if absent. */
@@ -353,6 +368,7 @@ export class WebChannelClient {
             m.working ? { ...m, working: false } : m,
           )
         : this.state.messages,
+      isTyping: false,
     });
   }
 
@@ -415,6 +431,17 @@ export class WebChannelClient {
         return;
       }
 
+      case "reasoning": {
+        if (!parsed.id || !parsed.turnId || typeof parsed.text !== "string" || parsed.text.length === 0) return;
+        this.upsertReasoning({ id: parsed.id, turnId: parsed.turnId, text: parsed.text });
+        return;
+      }
+
+      case "turn_settled": {
+        this.setState({ isTyping: false });
+        return;
+      }
+
       case "approval_request": {
         const req: ApprovalRequest = {
           id: parsed.id,
@@ -474,11 +501,11 @@ export class WebChannelClient {
         // bubble supersedes "Bot is typing…", and a duplicate typing frame
         // arriving afterwards will just re-arm it (no harm — the next real
         // frame clears it again).
-        const { id, text } = parsed;
+        const { id, text, turnId } = parsed;
         this.upsertMessage(
           id,
-          (prev) => ({ ...prev, text, working: true }),
-          { id, role: "agent", text, working: true },
+          (prev) => ({ ...prev, text, working: true, turnId: turnId ?? prev.turnId }),
+          { id, role: "agent", text, working: true, turnId },
         );
         this.setState({ isTyping: false });
         return;
@@ -495,8 +522,8 @@ export class WebChannelClient {
           const id = parsed.id;
           this.upsertMessage(
             id,
-            (prev) => ({ ...prev, text, working: false }),
-            { id, role: "agent", text, working: false },
+            (prev) => ({ ...prev, text, working: false, turnId: parsed.turnId ?? prev.turnId }),
+            { id, role: "agent", text, working: false, turnId: parsed.turnId },
           );
           return;
         }
@@ -504,6 +531,7 @@ export class WebChannelClient {
           id: `a-${this.uid()}`,
           role: "agent",
           text,
+          turnId: parsed.turnId,
         });
         return;
       }

@@ -20,6 +20,7 @@ export { filterCommandCatalog } from "./command-filter.js";
 export type {
   ChatRole,
   ChatMessage,
+  ReasoningItem,
   ApprovalDecision,
   ApprovalOption,
   ApprovalRequest,

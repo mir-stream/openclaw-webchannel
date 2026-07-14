@@ -204,6 +204,7 @@ export type ProgressDraftController = {
 export function createProgressDraftController(params: {
   transport: WebChannelTransport;
   sessionKey: string;
+  turnId?: string;
   /** Channel config section (for label/maxLines/line formatting). */
   channelConfig: unknown;
   throttleMs?: number;
@@ -266,7 +267,7 @@ export function createProgressDraftController(params: {
 
   const sendOrEditStreamMessage = async (text: string): Promise<boolean> => {
     if (stopped) return false;
-    const sent = transport.sendProgress(sessionKey, id, text);
+    const sent = transport.sendProgress(sessionKey, id, text, params.turnId);
     // Track that a working bubble is now shown to the widget, so the
     // error-recovery path knows it must emit a terminal frame to settle it.
     if (sent) started = true;
@@ -393,7 +394,7 @@ export function createProgressDraftController(params: {
       }
       stopped = true;
       loop.stop();
-      await transport.finalizeDraft(sessionKey, id, text);
+      await transport.finalizeDraft(sessionKey, id, text, params.turnId);
     },
     stop: () => {
       // Halt the throttled loop so no late background flush can race cleanup.
@@ -401,6 +402,70 @@ export function createProgressDraftController(params: {
       // a working bubble should use finalize(text) instead.
       stopped = true;
       loop.stop();
+    },
+  };
+}
+
+export type ReasoningStreamUpdate = {
+  text?: string;
+  isReasoningSnapshot?: boolean;
+  requiresReasoningProgressOptIn?: boolean;
+};
+
+export type ReasoningDraftController = {
+  push: (update: ReasoningStreamUpdate) => void;
+  endBurst: () => void;
+  stop: () => void;
+  readonly started: boolean;
+};
+
+/**
+ * Normalizes OpenClaw's provider-dependent reasoning updates into cumulative,
+ * replace-by-id wire frames. Each `onReasoningEnd` boundary rotates the id so
+ * separate reasoning bursts remain distinct in the UI.
+ */
+export function createReasoningDraftController(params: {
+  transport: WebChannelTransport;
+  sessionKey: string;
+  turnId: string;
+}): ReasoningDraftController {
+  let id = nextMessageId();
+  let currentText = "";
+  let stopped = false;
+  let started = false;
+
+  const push = (update: ReasoningStreamUpdate): void => {
+    if (stopped || update.requiresReasoningProgressOptIn === true) return;
+    const text = typeof update.text === "string" ? update.text : "";
+    if (text.length === 0) return;
+
+    let next: string;
+    if (update.isReasoningSnapshot === true || text.startsWith(currentText)) {
+      next = text;
+    } else if (currentText.endsWith(text)) {
+      next = currentText;
+    } else {
+      next = currentText + text;
+    }
+    if (next === currentText) return;
+    currentText = next;
+    if (params.transport.sendReasoning(params.sessionKey, id, params.turnId, currentText)) {
+      started = true;
+    }
+  };
+
+  return {
+    push,
+    endBurst: () => {
+      if (stopped || currentText.length === 0) return;
+      id = nextMessageId();
+      currentText = "";
+    },
+    stop: () => {
+      stopped = true;
+    },
+    get started() {
+      return started;
     },
   };
 }

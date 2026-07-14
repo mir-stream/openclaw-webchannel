@@ -13,8 +13,8 @@
 > demo rewrote the demo surface (now `demo/web/src/widget.ts` over the `WebChannelNATSClient` reducer),
 > and the parity stack has since landed several P1 items. **Now built:** **P1-1 markdown (#27)**,
 > **P1-7 error/reconnect UX** (mostly), and **P1-8** (`/stop` control lane #25 + debounce/coalesce
-> #29) — all marked ✅. **Still open:** P1-2 long-response, P1-3 reasoning lane (now **unblocked** —
-> its deps P1-1 + P0-5 partial are met), P1-4 media, P1-6 doctor, P1-7 finer wording, P1-9 unsend.
+> #29), and P1-3 reasoning lane — all marked ✅. **Still open:** P1-2 long-response,
+> P1-4 media, P1-6 doctor, P1-7 finer wording, and P1-9 unsend.
 > Note (#14): the plugin has a partial-mode answer-text stream (`streaming.mode:"partial"`, exercised
 > in the demo) — P1-3's reasoning lane builds on that existing stream, not a net-new one.
 >
@@ -112,21 +112,20 @@ the layout, and streaming growth doesn't yank the viewport.
 
 ---
 
-## P1-3 — Reasoning / thinking lane separation — 🔴 MISSING
+## P1-3 — Reasoning / thinking lane separation — ✅ BUILT
 
 **Symptom.** Model "thinking" (when present) is dumped inline with the answer or lost.
 
-**Classification.** 🔴 Missing — but **now unblocked.** Its dependencies (P1-1 markdown ✅ and P0-5
-partial ✅, exercised in the demo) are met, so this is the top remaining P1 lift. Needs a server
-decision (emit reasoning separately) + client render (collapsible lane).
+**Classification.** ✅ Built. Native OpenClaw reasoning callbacks now travel on a dedicated,
+turn-correlated frame and render as collapsed `Reasoning` details independently of answer streaming
+mode. Opt-in-required ambient reasoning is suppressed.
 
-**Where it stands today.** The plugin already streams **answer text** in `"partial"` mode
-(`inbound.ts:124-136`, `onPartialReply` → `draft.pushAnswerText`) — exercised in the demo since P0-5
-set `streaming.mode:"partial"` — but there is still **no reasoning/answer split**: reasoning is not
-separated from the answer stream. Both `partial` (answer) and `progress` (tool lines) share the
-single `progress` frame and one working draft (reducer `case "progress"`, `nats-client-wrapper.ts:557`).
-A reasoning lane builds **on top of** that existing partial stream (a separate reasoning frame/field
-feeding a collapsible lane), not a new stream from scratch.
+**Where it stands today.** `inbound.ts` wires `onReasoningStream` / `onReasoningEnd` for every
+ordinary turn regardless of `partial` / `progress` / `block` / `off`, while preserving existing
+mode-specific answer/tool callbacks. `ReasoningDraftController` normalizes delta/snapshot updates,
+rotates bursts, and rejects `requiresReasoningProgressOptIn` payloads. Dedicated `reasoning` and
+`turn_settled` frames exist in both transports. Both clients keep bounded ephemeral reasoning state;
+the demo groups it by `turnId` between the matching user message and answer. It is not persisted.
 
 **Telegram reference.**
 - `reasoning-lane-coordinator.ts:68` `splitTelegramReasoningText()` — splits `{reasoningText,
@@ -137,16 +136,14 @@ feeding a collapsible lane), not a new stream from scratch.
   **`openclaw/plugin-sdk/text-chunking` `stripReasoningTagsFromText()`**,
   **`openclaw/plugin-sdk/channel-outbound` `isPotentialTruncatedFinal()` / `selectLongerFinalText()`**.
 
-**Implementation sketch.**
-1. **Server:** add a `reasoning` boolean/kind to `progress` frames (or a new `reasoning` frame type
-   in `nats-channel.ts`) when the turn produces reasoning; reuse `stripReasoningTagsFromText` +
-   `formatReasoningMessage` so the split matches other channels.
-2. **Client:** add a reducer `case` + a `WebChannelState` field; render reasoning in a collapsible
-   `<details>` above the answer bubble (default collapsed); the answer streams/finalizes as in P0-5.
-3. Handle truncation recovery with `selectLongerFinalText` semantics.
+**Decision record.** Native `onReasoningStream` won over parsing `<think>` tags. A dedicated frame
+won over overloading `progress`, and `turnId` prevents multi-turn ordering errors. Reasoning has no
+fallible live/done UI state; `turn_settled` handles only transient Stop/typing activity. Full plan:
+`docs/P1_REASONING_LANE_PLAN.md`.
 
-**Acceptance.** A reasoning-capable turn shows a collapsed "Thoughts" section that expands, with the
-answer rendered separately and streaming normally. Non-reasoning turns show no empty affordance.
+**Acceptance (met).** A reasoning-capable turn shows a collapsed `Reasoning` section that expands,
+with the answer rendered separately and streaming normally. Non-reasoning turns show no empty
+affordance; consecutive turns retain correct reasoning/answer placement.
 
 **Scope note.** Requires a small wire addition — heavier than the pure-render items. Sequence after
 P1-1.
@@ -421,7 +418,7 @@ costs no E2E/server work, and stays purely in `demo/web/src/widget.ts` + a small
 
 | Order | Gap | Effort | Depends on |
 |---|---|---|---|
-| 1 | P1-3 reasoning lane | M | P1-1 ✅ + P0-5 ✅ **now met — unblocked, top lift** |
+| ✅ | P1-3 reasoning lane | M | built — native callback + turn-correlated lane |
 | 2 | P1-9 pending-message retraction (unsend) | S | — (Option A: client hold, no server/wire change) |
 | 3 | P1-7 finer error wording | XS | — (mechanics + terminal UX already built; thread a cause tag) |
 | 4 | P0-3 argument menus | S | — (catalog entries already carry `args.choices`; render dropdowns) |
