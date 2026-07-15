@@ -39,6 +39,17 @@ export type ChatMessage = {
   delivered?: boolean;
   /** Ephemeral live-turn correlation. History messages intentionally omit it. */
   turnId?: string;
+  /**
+   * P1-9: true while this user message is HELD locally (a turn was in flight
+   * at send time) and not yet published. Local-only — never on the wire,
+   * never in history. Flips off (with wireId/turnId assigned) at release.
+   */
+  pending?: boolean;
+  /**
+   * P1-9: an explicit /stop converted this held message into a not-sent
+   * marker. Local-only. Text preserved; removable via retract(id).
+   */
+  retracted?: boolean;
 };
 
 export type ReasoningItem = {

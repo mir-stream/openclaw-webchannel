@@ -2,6 +2,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 import type { InboundMessage, NatsClientOptions } from "./nats-client.js";
+// P1-9 wire-order harness: the subject helpers + the handshake frame let a test
+// establish a REAL conversation key over the legacy handshake path (FakeWS) and
+// assert publish ordering on the encrypted `.in` subject.
+import { inboundSubject, handshakeSubject } from "./nats-client.js";
+import { generateX25519KeyPair, keyExchangeFrame } from "./e2e-crypto-browser.js";
 
 /**
  * CL1 regression: the public wrapper must FORWARD the NATS-layer NKEY
@@ -94,6 +99,8 @@ class FakeWS {
   onmessage: ((e: { data: string }) => void) | null = null;
   onerror: ((e: unknown) => void) | null = null;
   onclose: (() => void) | null = null;
+  /** P1-9: every raw frame the client wrote, for wire-order assertions. */
+  sent: string[] = [];
   constructor(url: string) {
     this.url = url;
     FakeWS.instances.push(this);
@@ -103,6 +110,7 @@ class FakeWS {
     });
   }
   send(data: string): void {
+    this.sent.push(data);
     if (data.startsWith("PING")) this.onmessage?.({ data: "PONG\r\n" });
   }
   close(): void {
@@ -1025,5 +1033,640 @@ describe("WebChannelNATSClient — reasoning lane", () => {
     expect(wrapper.getState().isTyping).toBe(true);
     deliver(wrapper, { type: "turn_settled", turnId: "t" });
     expect(wrapper.getState().isTyping).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1-9 — pending-message retraction ("unsend"). A send while a turn is in flight
+// is HELD client-side as a pending bubble and published only when the turn
+// settles; the abort vocabulary bypasses the hold; explicit /stop retracts held
+// messages; a post-reconnect staleness valve prevents a wedged send lockout.
+// (docs/P1_9_UNSEND_PLAN.md; §8 test plan.)
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", () => {
+  type Frame = Record<string, unknown> & { type: string };
+  type Wrapper = WebChannelNATSClient;
+
+  const IN = inboundSubject("t", "a", "p");
+  const HS = handshakeSubject("t", "a", "p");
+  const tick = () => new Promise<void>((r) => setTimeout(r, 0));
+
+  function makeWrapper(): Wrapper {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+      heartbeatIntervalMs: 0,
+    });
+  }
+  const inner = (w: Wrapper) => (w as unknown as { client: { sendUserMessage: (t: string) => string; notifySessionListeners: () => void } }).client;
+  const lowLevel = (w: Wrapper) => (w as unknown as { client: { client: { connected: boolean; notifyStateListeners: () => void } } }).client.client;
+  const deliver = (w: Wrapper, frame: Frame) => (w as unknown as { handleMessage: (m: Frame) => void }).handleMessage(frame);
+  const messages = (w: Wrapper) => w.getState().messages;
+  const held = (w: Wrapper) => (w as unknown as { held: Array<{ localId: string; text: string }> }).held;
+  const heldTexts = (w: Wrapper) => held(w).map((h) => h.text);
+  const pendingBubbles = (w: Wrapper) => messages(w).filter((m) => m.pending);
+
+  /**
+   * Open the release gate WITHOUT a socket (direct field set). The REAL
+   * onState/onSession callbacks are exercised in the session-gate and wire-order
+   * tests below; here we only need `connected` + `sessionEstablished` true so the
+   * reducer-level release logic runs.
+   */
+  function goOnline(w: Wrapper): void {
+    (w as unknown as { state: Record<string, unknown> }).state = {
+      ...(w as unknown as { state: Record<string, unknown> }).state,
+      connected: true,
+      status: "connected",
+    };
+    (w as unknown as { sessionEstablished: boolean }).sessionEstablished = true;
+  }
+  /** Fire the wrapper's real onState(false) (forces isTyping:false; clears the gate). */
+  function goOffline(w: Wrapper): void {
+    const ll = lowLevel(w);
+    ll.connected = false;
+    ll.notifyStateListeners();
+  }
+  const fireSession = (w: Wrapper) => inner(w).notifySessionListeners();
+
+  // Real socket + real conversation key over the legacy handshake path.
+  const lastWs = () => FakeWS.instances[FakeWS.instances.length - 1];
+  const keyState = (w: Wrapper) =>
+    inner(w) as unknown as { keyPair: unknown; sessionKey: unknown };
+  async function waitFor(pred: () => boolean, n = 100): Promise<void> {
+    for (let i = 0; i < n; i++) {
+      if (pred()) return;
+      await tick();
+    }
+    throw new Error("waitFor timed out");
+  }
+  function serverMsg(ws: FakeWS, subject: string, payload: string): void {
+    const n = new TextEncoder().encode(payload).length;
+    ws.serverEmit(`MSG ${subject} 1 ${n}\r\n${payload}\r\n`);
+  }
+  async function establishKey(w: Wrapper): Promise<void> {
+    // Wait for onConnected's legacy-handshake keygen (keyPair set, key not yet).
+    await waitFor(() => Boolean(keyState(w).keyPair) && !keyState(w).sessionKey);
+    const agent = await generateX25519KeyPair();
+    serverMsg(lastWs(), HS, keyExchangeFrame(agent.publicKeyB64url));
+    // handleRaw async derive → sessionKey → drain → flush → notify(session).
+    await waitFor(() => Boolean(keyState(w).sessionKey));
+    await tick(); // let the session-listener-driven release settle
+  }
+  const inboundPubs = (ws: FakeWS) => ws.sent.filter((s) => s.startsWith(`PUB ${IN} `));
+
+  let originalWebSocket: unknown;
+  beforeEach(() => {
+    originalWebSocket = (globalThis as { WebSocket?: unknown }).WebSocket;
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeWS;
+    FakeWS.instances = [];
+  });
+  afterEach(() => {
+    (globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket;
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  // 1. idle send publishes immediately (A4 regression pin).
+  it("1: an idle send publishes immediately (no hold when nothing is in flight)", () => {
+    const w = makeWrapper();
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    w.send("hello");
+    expect(spy).toHaveBeenCalledWith("hello");
+    const m = messages(w)[0];
+    expect(m.pending).toBeUndefined();
+    expect(m.wireId).toBeTruthy();
+    expect(m.turnId).toBe(m.wireId);
+  });
+
+  // 2. send during isTyping → not published, bubble pending:true, no wireId.
+  it("2: a send during isTyping is HELD (pending bubble, not published, no wireId)", () => {
+    const w = makeWrapper();
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("queued");
+    expect(spy).not.toHaveBeenCalled();
+    const m = messages(w)[0];
+    expect(m.pending).toBe(true);
+    expect(m.wireId).toBeUndefined();
+    expect(heldTexts(w)).toEqual(["queued"]);
+  });
+
+  // 3. send during a working draft (isTyping already false) → held.
+  it("3: a send during a working draft is HELD even though isTyping is false", () => {
+    const w = makeWrapper();
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    expect(w.getState().isTyping).toBe(false); // progress clears typing
+    w.send("queued");
+    expect(spy).not.toHaveBeenCalled();
+    expect(pendingBubbles(w).map((m) => m.text)).toEqual(["queued"]);
+  });
+
+  // 4. agent_message final → held released FIFO: publish order + patched + moved to tail.
+  it("4: on the agent's final message, held messages release FIFO — patched and MOVED TO THE TAIL", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("held-1");
+    w.send("held-2"); // latched behind held-1
+    expect(spy).not.toHaveBeenCalled();
+
+    deliver(w, { type: "agent_message", id: "webchannel-A", text: "the reply", turnId: "T" });
+
+    // FIFO publish order.
+    expect(spy.mock.calls.map((c) => c[0])).toEqual(["held-1", "held-2"]);
+    // Display order: the reply, THEN the two released chips at the tail.
+    expect(messages(w).map((m) => m.text)).toEqual(["the reply", "held-1", "held-2"]);
+    const [, r1, r2] = messages(w);
+    for (const r of [r1, r2]) {
+      expect(r.pending).toBe(false);
+      expect(r.wireId).toBeTruthy();
+      expect(r.turnId).toBe(r.wireId);
+    }
+    expect(held(w)).toHaveLength(0);
+  });
+
+  // 5. turn_settled (typing-only turn, no draft) → releases.
+  it("5: turn_settled on a typing-only turn releases held messages", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("queued");
+    expect(spy).not.toHaveBeenCalled();
+    deliver(w, { type: "turn_settled", turnId: "T" });
+    expect(spy).toHaveBeenCalledWith("queued");
+    expect(pendingBubbles(w)).toHaveLength(0);
+  });
+
+  // 6. retract a pending id → gone, nothing published after settle; non-pending id → false.
+  it("6: retract removes a pending bubble (nothing published after settle); a non-pending id is a no-op", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("oops");
+    const id = messages(w)[0].id;
+
+    expect(w.retract(id)).toBe(true);
+    expect(messages(w)).toHaveLength(0);
+    expect(held(w)).toHaveLength(0);
+
+    // The turn settles — nothing to release (it was retracted before the wire).
+    deliver(w, { type: "turn_settled", turnId: "T" });
+    expect(spy).not.toHaveBeenCalled();
+
+    // A non-pending / unknown id → false, no-op.
+    w.send("sent"); // idle → normal send (not pending)
+    const sentId = messages(w)[0].id;
+    expect(w.retract(sentId)).toBe(false);
+    expect(w.retract("no-such-id")).toBe(false);
+  });
+
+  // 7. explicit /stop mid-turn → published immediately AND held bubbles flip retracted.
+  it("7: explicit /stop publishes immediately AND flips held bubbles to retracted (kept in transcript)", () => {
+    const w = makeWrapper();
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("later question");
+    const heldId = messages(w)[0].id;
+
+    w.send(" /STOP "); // case/whitespace variant — trimmed before publish
+    expect(spy).toHaveBeenCalledWith("/STOP");
+    const marker = messages(w).find((m) => m.id === heldId)!;
+    expect(marker.retracted).toBe(true);
+    expect(marker.pending).toBe(false);
+    expect(marker.text).toBe("later question"); // text preserved
+    expect(held(w)).toHaveLength(0); // out of the held queue
+
+    // The retracted marker is retractable (dismiss / after restore).
+    expect(w.retract(heldId)).toBe(true);
+  });
+
+  // 8. NL "stop"/"wait"/"Stop." mid-turn → bypass: published immediately, held untouched.
+  it("8: NL abort words bypass the hold (publish immediately) and DO NOT touch held messages", () => {
+    for (const word of ["stop", "wait", "Stop."]) {
+      const w = makeWrapper();
+      const spy = vi.spyOn(inner(w), "sendUserMessage");
+      deliver(w, { type: "typing" });
+      w.send("keep me");
+      spy.mockClear();
+
+      w.send(word);
+      expect(spy).toHaveBeenCalledWith(word); // bypassed → published
+      // The held message is UNTOUCHED (not retracted, still pending).
+      const stillHeld = messages(w).find((m) => m.text === "keep me")!;
+      expect(stillHeld.pending).toBe(true);
+      expect(stillHeld.retracted).toBeUndefined();
+      expect(heldTexts(w)).toEqual(["keep me"]);
+    }
+  });
+
+  // 9. latch: typing-only turn → M1 held → onState(false) → send M2 → M2 held → reconnect → release M1,M2.
+  it("9: the held.length>0 latch preserves FIFO across a disconnect (M2 queues behind M1, released in order)", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("M1"); // held (isTyping)
+
+    goOffline(w); // real onState(false): isTyping → false, gate closed, M1 latched
+    expect(w.getState().isTyping).toBe(false);
+
+    w.send("M2"); // turnInFlight is false now, but held.length>0 latches → held
+    expect(spy).not.toHaveBeenCalled();
+    expect(heldTexts(w)).toEqual(["M1", "M2"]);
+
+    // Reconnect + session established → release in FIFO order.
+    goOnline(w);
+    fireSession(w);
+    expect(spy.mock.calls.map((c) => c[0])).toEqual(["M1", "M2"]);
+  });
+
+  // 10a. session gate: settle-while-disconnected → no release; onState(true) alone → no release;
+  //      onSession → releases (delayed-key over the real socket makes the middle assertion real).
+  it("10a: release gates on session establishment, not the raw connect flip (delayed key)", async () => {
+    const w = makeWrapper();
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("M"); // held
+    deliver(w, { type: "turn_settled", turnId: "T" }); // settle while DISCONNECTED
+    expect(spy).not.toHaveBeenCalled(); // no release (not connected/established)
+
+    // Connect: onState(true) fires, but the key is DELAYED — sessionEstablished false.
+    w.connect();
+    await waitFor(() => w.getState().connected);
+    await waitFor(() => Boolean(keyState(w).keyPair)); // handshake published, no key yet
+    expect(w.getState().connected).toBe(true);
+    expect(spy).not.toHaveBeenCalled(); // connected but keyless → still held
+    expect(heldTexts(w)).toEqual(["M"]);
+
+    // Key arrives → onSession fires (after flushQueue) → release.
+    await establishKey(w);
+    expect(spy).toHaveBeenCalledWith("M");
+    w.close();
+  });
+
+  // 10b. ledger order: an undelivered P0-7b ledger entry M1 replays BEFORE a released hold M2
+  //      (drain→flush→notify — the onSession release is ordered behind the ledger replay).
+  it("10b: on reconnect a ledgered M1 replays on the wire BEFORE a released hold M2", async () => {
+    const w = makeWrapper();
+    w.connect();
+    await establishKey(w); // session 1
+
+    // Spy records how many `.in` publishes exist AT THE MOMENT sendUserMessage runs.
+    const counts: number[] = [];
+    const c = inner(w);
+    const realSUM = c.sendUserMessage.bind(c);
+    vi.spyOn(c, "sendUserMessage").mockImplementation((text: string) => {
+      counts.push(inboundPubs(lastWs()).length);
+      return realSUM(text);
+    });
+
+    w.send("M1"); // sealed publish + recorded in the P0-7b unacked ledger
+    deliver(w, { type: "typing" }); // start a turn so the next send holds
+    w.send("M2"); // held
+    expect(inboundPubs(lastWs())).toHaveLength(1); // only M1 on the wire so far
+
+    // Session drop that KEEPS the unacked ledger (resetSession keeps it), then
+    // reconnect on the same socket → onConnected regenerates the handshake key.
+    const ll = lowLevel(w);
+    ll.connected = false;
+    ll.notifyStateListeners();
+    ll.connected = true;
+    ll.notifyStateListeners();
+    await establishKey(w); // session 2: flushQueue replays M1, THEN onSession releases M2
+
+    // Wire: [M1 (initial), M1 (ledger replay), M2 (released hold)] — three publishes.
+    expect(inboundPubs(lastWs())).toHaveLength(3);
+    // sendUserMessage fired for M1 (0 prior `.in`) then M2 (2 prior `.in` — its own
+    // send + the ledger replay). The "2" proves the replay preceded the release.
+    expect(counts).toEqual([0, 2]);
+    w.close();
+  });
+
+  // 11. snapshot identical text does NOT adopt onto a pending/retracted bubble.
+  it("11: a snapshot with identical text does not adopt onto a pending bubble; both survive distinctly", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    deliver(w, { type: "typing" });
+    w.send("dup"); // held pending
+    const localId = messages(w)[0].id;
+
+    // Another device sent the same text → the snapshot carries a server row "dup".
+    deliver(w, { type: "history", messages: [{ id: "srv-dup", role: "user", text: "dup" }] });
+
+    // The pending bubble is NOT an adoption target → two distinct bubbles.
+    expect(messages(w)).toHaveLength(2);
+    expect(messages(w).find((m) => m.id === localId)?.pending).toBe(true);
+    expect(messages(w).some((m) => m.id === "srv-dup")).toBe(true);
+
+    // After the turn settles the held bubble releases and both still exist.
+    deliver(w, { type: "turn_settled", turnId: "T" });
+    expect(messages(w)).toHaveLength(2);
+    expect(messages(w).find((m) => m.id === localId)?.pending).toBe(false);
+  });
+
+  // 12. tier-3 transparency: a held chip between the anchor and the reply is skipped by the probe.
+  it("12: the tier-3 positional probe skips a held chip and adopts onto the reply (no duplicate agent bubble)", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    w.send("u2"); // normal user send (idle)
+    deliver(w, { type: "typing" });
+    w.send("h3"); // held pending
+    // Multi-frame reply: A1 and A2 both live; A2 stays WORKING so the hold survives.
+    deliver(w, { type: "progress", id: "webchannel-a1", text: "a1…", turnId: "T" });
+    deliver(w, { type: "progress", id: "webchannel-a2", text: "a2…", turnId: "T" });
+    deliver(w, { type: "agent_message", id: "webchannel-a1", text: "A1 FINAL", turnId: "T" });
+    // Layout: [u2, h3(pending), A1(final), A2(working)]; still held (A2 working).
+    expect(messages(w).map((m) => m.text)).toEqual(["u2", "h3", "A1 FINAL", "a2…"]);
+    expect(pendingBubbles(w)).toHaveLength(1);
+
+    // Snapshot [u2row, A1row] with RAW stored text ≠ live A1 text.
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "core-u2", role: "user", text: "u2" },
+        { id: "core-a1", role: "agent", text: "A1 raw stored" },
+      ],
+    });
+
+    // A1row adopts onto A1 THROUGH the held chip — no duplicate agent bubble.
+    expect(messages(w)).toHaveLength(4);
+    expect(messages(w).find((m) => m.id === "core-a1")?.text).toBe("A1 raw stored");
+    expect(messages(w).filter((m) => m.role === "agent")).toHaveLength(2); // A1(adopted)+A2
+    expect(pendingBubbles(w)).toHaveLength(1); // h3 still held
+  });
+
+  // 12b. post-release snapshot: a released chip (moved to tail) is an ordinary in-order send.
+  it("12b: after release (moved to tail), a snapshot adopts cleanly with no duplicates or mis-adoption", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    w.send("u2");
+    deliver(w, { type: "typing" });
+    w.send("h3"); // held
+    deliver(w, { type: "agent_message", id: "webchannel-A", text: "A reply", turnId: "T" });
+    // Reply settled the turn → h3 released and MOVED TO THE TAIL: [u2, A, h3].
+    expect(messages(w).map((m) => m.text)).toEqual(["u2", "A reply", "h3"]);
+    expect(pendingBubbles(w)).toHaveLength(0);
+
+    // Snapshot carries the whole transcript in order, plus a newer reply R.
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "core-u2", role: "user", text: "u2" },
+        { id: "core-A", role: "agent", text: "A raw stored" },
+        { id: "core-h3", role: "user", text: "h3" },
+        { id: "core-R", role: "agent", text: "R reply" },
+      ],
+    });
+    expect(messages(w).map((m) => m.id)).toEqual(["core-u2", "core-A", "core-h3", "core-R"]);
+  });
+
+  // 13. no snapshot finalize: a mid-turn snapshot with intermediate agent rows leaves the draft working.
+  it("13: a mid-turn snapshot with intermediate agent rows never finalizes a working draft (held stays held)", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("held");
+    deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    expect(spy).not.toHaveBeenCalled();
+
+    // A routine mid-run snapshot (core appends assistant rows per message_end).
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "core-u", role: "user", text: "earlier" },
+        { id: "core-mid", role: "agent", text: "intermediate assistant row" },
+      ],
+    });
+
+    // The working draft survived working:true; the held message is still held.
+    expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
+    expect(pendingBubbles(w)).toHaveLength(1);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  // 14. staleness valve (fake timers).
+  describe("14: post-reconnect staleness valve", () => {
+    it("expires a wedged working draft after the grace, in place, and releases held", () => {
+      vi.useFakeTimers();
+      const w = makeWrapper();
+      goOnline(w);
+      deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" }); // working draft
+      w.send("held"); // held (draft working; progress already cleared isTyping)
+      // Session re-establishes with the draft still working → arm the valve.
+      fireSession(w);
+
+      vi.advanceTimersByTime(30_000);
+      const draft = messages(w).find((m) => m.id === "webchannel-d")!;
+      expect(draft.working).toBe(false); // flipped in place
+      expect(draft.id).toBe("webchannel-d"); // id untouched
+      expect(draft.text).toBe("partial…"); // text untouched
+      expect(pendingBubbles(w)).toHaveLength(0); // released
+    });
+
+    it("a draft-touching progress frame inside the grace disarms the valve (held stays held)", () => {
+      vi.useFakeTimers();
+      const w = makeWrapper();
+      goOnline(w);
+      deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+      w.send("held");
+      fireSession(w);
+
+      vi.advanceTimersByTime(10_000);
+      deliver(w, { type: "progress", id: "webchannel-d", text: "more…", turnId: "T" }); // proof of life
+      vi.advanceTimersByTime(30_000);
+      expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
+      expect(pendingBubbles(w)).toHaveLength(1); // still held
+    });
+
+    it("a post-expiry progress re-flips the SAME draft working (self-heals, no duplicate)", () => {
+      vi.useFakeTimers();
+      const w = makeWrapper();
+      goOnline(w);
+      deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+      fireSession(w);
+      vi.advanceTimersByTime(30_000);
+      expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false);
+
+      deliver(w, { type: "progress", id: "webchannel-d", text: "back alive…", turnId: "T" });
+      const drafts = messages(w).filter((m) => m.id === "webchannel-d");
+      expect(drafts).toHaveLength(1); // no duplicate
+      expect(drafts[0].working).toBe(true); // re-engaged
+    });
+
+    it("a mid-grace flap clears the timer and re-arms fresh on the next onSession (disconnected time never counts)", () => {
+      vi.useFakeTimers();
+      const w = makeWrapper();
+      goOnline(w);
+      deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+      fireSession(w);
+
+      vi.advanceTimersByTime(20_000); // 20s into the grace
+      goOffline(w); // flap: timer + watch cleared
+      vi.advanceTimersByTime(30_000); // disconnected time — must NOT expire anything
+      expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
+
+      // Reconnect re-arms a FULL fresh grace.
+      goOnline(w);
+      fireSession(w);
+      vi.advanceTimersByTime(29_000);
+      expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true); // not yet
+      vi.advanceTimersByTime(1_000);
+      expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false); // now
+    });
+  });
+
+  // 15. turn_settled with matching turnId finalizes a lingering draft.
+  it("15: turn_settled finalizes a lingering working draft whose turnId matches", () => {
+    const w = makeWrapper();
+    deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    expect(messages(w)[0].working).toBe(true);
+    deliver(w, { type: "turn_settled", turnId: "T" });
+    expect(messages(w)[0].working).toBe(false); // finalized in place
+    expect(messages(w)[0].id).toBe("webchannel-d");
+  });
+
+  // 16. approval_request with no working draft → releases.
+  it("16: an approval_request with no working draft releases held messages", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("queued");
+    expect(spy).not.toHaveBeenCalled();
+    deliver(w, {
+      type: "approval_request",
+      id: "ap-1",
+      kind: "exec",
+      title: "Run",
+      prompt: "cmd",
+      options: [{ decision: "allow-once", label: "Allow", style: "success" }],
+    });
+    expect(spy).toHaveBeenCalledWith("queued");
+    expect(pendingBubbles(w)).toHaveLength(0);
+  });
+
+  // 17. Fix A: a re-entrant send() from a mid-release listener must NOT jump the
+  //     queue — the live drain keeps FIFO (M1, M2, M3), never M1, M3, M2.
+  it("17: a re-entrant send during the release loop stays FIFO (live drain, no queue-jump)", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("M1");
+    w.send("M2"); // latched behind M1 → held [M1, M2]
+    expect(spy).not.toHaveBeenCalled();
+
+    // Inject a re-entrant send("M3") ONLY once M1 has actually been released
+    // mid-loop (its bubble is present and no longer pending) — that lands the
+    // injected send INSIDE the release loop while M2 is still queued in held[].
+    // Gating on the released M1 (not merely the first setState) is what makes
+    // this guard the fix: snapshot-and-clear has held[] empty at that instant so
+    // M3 would publish immediately → ["M1","M3","M2"]; the live drain keeps M2
+    // queued so M3 holds and the loop drains it last → ["M1","M2","M3"].
+    let injected = false;
+    const unsub = w.subscribe(() => {
+      if (injected) return;
+      if (!messages(w).some((m) => m.text === "M1" && m.pending === false)) return;
+      injected = true;
+      w.send("M3");
+    });
+
+    // Settle the turn → release loop drains [M1, M2] live; the M1 setState fires
+    // the listener which calls send("M3"). Because M2 is still in held[], M3 is
+    // HELD (not published now) and the continuing loop drains it after M2.
+    deliver(w, { type: "agent_message", id: "webchannel-A", text: "the reply", turnId: "T" });
+    unsub();
+
+    // Wire/publish order: FIFO, NOT M1, M3, M2.
+    expect(spy.mock.calls.map((c) => c[0])).toEqual(["M1", "M2", "M3"]);
+    // Display order: the reply, then the three user chips in FIFO at the tail.
+    const userTexts = messages(w).filter((m) => m.role === "user").map((m) => m.text);
+    expect(userTexts).toEqual(["M1", "M2", "M3"]);
+    expect(held(w)).toHaveLength(0);
+    expect(pendingBubbles(w)).toHaveLength(0);
+  });
+
+  // 18. Fix B1: explicit /stop finalizes a live working draft in place, unwedging
+  //     the composer even with no disconnect (socket-alive agent death).
+  it("18: explicit /stop finalizes a live working draft in place and unlocks the composer", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+
+    // A working draft is live (its final frame is about to be lost — no settle).
+    deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
+
+    // Explicit /stop: published immediately AND finalizes the draft in place.
+    w.send("/stop");
+    expect(spy).toHaveBeenCalledWith("/stop");
+    const draft = messages(w).find((m) => m.id === "webchannel-d")!;
+    expect(draft.working).toBe(false); // flipped in place
+    expect(draft.id).toBe("webchannel-d"); // id untouched
+    expect(draft.text).toBe("partial…"); // text untouched
+
+    // The wedge is unlocked: a subsequent send publishes IMMEDIATELY (not held).
+    spy.mockClear();
+    w.send("next");
+    expect(spy).toHaveBeenCalledWith("next");
+    expect(pendingBubbles(w)).toHaveLength(0);
+    expect(held(w)).toHaveLength(0);
+  });
+
+  // 18b. Fix B1 self-heal: a post-/stop progress on the same draft id re-flips it
+  //      working (the turn was actually alive), with no duplicate bubble.
+  it("18b: a post-/stop progress re-flips the same draft working (self-heal, no duplicate)", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    w.send("/stop");
+    expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false);
+
+    deliver(w, { type: "progress", id: "webchannel-d", text: "back alive…", turnId: "T" });
+    const drafts = messages(w).filter((m) => m.id === "webchannel-d");
+    expect(drafts).toHaveLength(1); // no duplicate bubble
+    expect(drafts[0].working).toBe(true); // re-engaged
+  });
+
+  // 18c. Fix B1 scope: an NL abort word ("wait") must NOT finalize a working draft.
+  it("18c: an NL abort word does not finalize a live working draft (only explicit /stop does)", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+
+    w.send("wait"); // NL abort → bypasses the hold, published, but NO finalize
+    expect(spy).toHaveBeenCalledWith("wait");
+    expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
+  });
+
+  // 18d. Fix B1: explicit /stop rescues an isTyping-ONLY wedge (pre-first-token
+  //      hang: typing frame, turn dies before any progress, socket alive).
+  it("18d: explicit /stop clears an isTyping-only wedge (no working draft) and unlocks the composer", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+
+    deliver(w, { type: "typing" }); // isTyping:true, zero working drafts
+    expect(w.getState().isTyping).toBe(true);
+
+    w.send("/stop");
+    expect(spy).toHaveBeenCalledWith("/stop");
+    expect(w.getState().isTyping).toBe(false); // typing indicator cleared
+
+    // Composer unlocked: a subsequent send publishes immediately (not held).
+    spy.mockClear();
+    w.send("next");
+    expect(spy).toHaveBeenCalledWith("next");
+    expect(pendingBubbles(w)).toHaveLength(0);
+    expect(held(w)).toHaveLength(0);
   });
 });
