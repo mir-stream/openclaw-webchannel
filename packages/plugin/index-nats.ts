@@ -48,7 +48,8 @@ import {
 } from "./src/approvals.js";
 import { assertJwtAuthConfig, verifyJwtAndExtractIdentity, preflightResolveJwks } from "./src/auth.js";
 import type { AuthConfig, JwtAuthConfig } from "./src/auth.js";
-import { formatAccountReadiness, deriveJwksUrl, deriveIssuer, type JwksReadiness } from "./src/preflight.js";
+import { formatAccountReadiness, deriveIssuer, type JwksReadiness } from "./src/preflight.js";
+import { resolveEffectiveAccountAuth } from "./src/account-auth.js";
 import { PopChallengeStore } from "./src/pop-challenge.js";
 import { handleRegisterRequest } from "./src/nats-register.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig, planHistoryFetch } from "./src/history.js";
@@ -147,67 +148,6 @@ let accountsBuildStarted = false;
 const historyReadScope = new AsyncResource("webchannel:history-read");
 const runDetachedHistoryRead = <T>(fn: () => Promise<T>): Promise<T> =>
   historyReadScope.runInAsyncScope(fn);
-
-/**
- * Trust-anchor derivation (design §4 change 1): fill the ABSENT JWT-verify params
- * from `{saas.baseUrl, accountId}` — CONFIG-PRESENT-WINS. These are trust FACTS,
- * not settings, and cannot legitimately mismatch:
- *   - issuer  = SaaS-DELIVERED (EnrollmentResult.issuer, persisted with the
- *               enrolled creds) when present, else saas.baseUrl (back-compat
- *               derivation for pre-issuer enrollments / non-enrolled accounts)
- *   - audience = accountId    (bootstrap JWTs are minted with `aud == accountId`)
- *   - jwksUrl  = saas.baseUrl + /.well-known/jwks.json
- * An explicitly-configured value is an operator PIN (proxy / custom-domain /
- * logical-issuer) and ALWAYS wins — we only fill fields that are absent.
- * Issuer precedence: pin > delivered > derived. The delivered value is used
- * VERBATIM (verifyJwt compares slash-insensitively) — the SaaS declared the
- * exact `iss` it mints at enroll time; re-deriving it here from the base URL is
- * exactly the configuration-by-coincidence this field exists to kill.
- *
- * Returns a NEW object (never mutates the caller's config). Non-jwt (or absent)
- * auth is returned unchanged.
- *
- * Fail-closed: when `saasBaseUrl` is undefined AND the params are absent we fill
- * NOTHING — `assertJwtAuthConfig` then throws and the jwt account is skipped with a
- * loud log (Step 6). Missing verify params NEVER downgrade an account to `auto`
- * (`admission` is a separate PINNED config default, not derived here). jwksUrl is
- * derived ONLY when no key source (jwksUrl/jwks/jwksFile) is configured, because
- * `assertJwtAuthConfig` requires EXACTLY ONE — we must not introduce a second.
- */
-function deriveAccountAuth(
-  raw: AuthConfig | undefined,
-  saasBaseUrl: string | undefined,
-  accountId: string,
-  deliveredIssuer?: string,
-): AuthConfig | undefined {
-  if (!raw || raw.strategy !== "jwt" || !saasBaseUrl) return raw;
-  // Runtime view: a pointer-style account legitimately OMITS these fields (the
-  // `as AuthConfig` cast at the read site types them as required, but config may
-  // leave them absent — that is exactly what we are filling in here).
-  const jwt = (raw.jwt ?? {}) as {
-    jwksUrl?: string;
-    jwks?: unknown;
-    jwksFile?: string;
-    issuer?: string;
-    audience?: string;
-  };
-  const hasKeySource =
-    typeof jwt.jwksUrl === "string" || jwt.jwks !== undefined || typeof jwt.jwksFile === "string";
-  return {
-    ...raw,
-    jwt: {
-      ...jwt,
-      // pin > delivered > derived. The derivation goes via the shared canonical
-      // helper (trailing-slash stripped), matching the jwksUrl derivation —
-      // otherwise an operator's trailing-slash --base-url would pin a
-      // non-canonical issuer that mismatches the SaaS's minted `iss` and
-      // rejects every bootstrap JWT (silent issuer-mismatch).
-      issuer: jwt.issuer ?? deliveredIssuer ?? deriveIssuer(saasBaseUrl),
-      audience: jwt.audience ?? accountId,
-      ...(hasKeySource ? {} : { jwksUrl: deriveJwksUrl(saasBaseUrl) }),
-    },
-  } as AuthConfig;
-}
 
 /**
  * Lazy transport facade.
@@ -348,20 +288,14 @@ export default defineChannelPluginEntry({
       // effective (derived) issuer/jwksUrl/audience, per the design's "diagnostics
       // must read the effective values" constraint. See `deriveAccountAuth` above
       // for the config-present-wins + fail-closed rationale.
-      const accountAuth = deriveAccountAuth(
-        account.auth as AuthConfig | undefined,
-        // Match the consume block's precedence (:277): plan-resolved base URL
-        // (config `saas.baseUrl` over acquisition env) falls back to the flat
-        // top-level `saas.baseUrl`.
-        plan.saasBaseUrl ?? config.saas?.baseUrl,
+      const accountAuth = resolveEffectiveAccountAuth({
+        accountAuthRaw: account.auth as AuthConfig | undefined,
         accountId,
-        // SaaS-delivered issuer, persisted with the enrolled creds at
-        // `channels add` time (EnrollmentResult.issuer). Same loader the
-        // consume step uses later — ONE reader, so the two paths can't drift.
-        // Returns undefined for non-enrolled accounts / pre-issuer creds →
-        // the derivation fallback applies.
-        loadPersistedEnrolledCreds(accountId)?.issuer,
-      );
+        ...(plan.saasBaseUrl !== undefined ? { planSaasBaseUrl: plan.saasBaseUrl } : {}),
+        ...(config.saas?.baseUrl !== undefined
+          ? { topLevelSaasBaseUrl: config.saas.baseUrl }
+          : {}),
+      });
       const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
       const accountDmSecurity = account.dmSecurity as string | undefined;

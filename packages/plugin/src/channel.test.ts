@@ -64,6 +64,20 @@ describe("webchannel plugin", () => {
     // D1 caveat: this adapter does not opt into core's error-swallowing path.
     expect(plugin.outbound.bestEffort).not.toBe(true);
   });
+
+  it("exposes doctor preview warnings and status probing from the common factory", async () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    expect(plugin.doctor?.collectPreviewWarnings).toBeTypeOf("function");
+    expect(plugin.status?.probeAccount).toBeTypeOf("function");
+    const warnings = await plugin.doctor!.collectPreviewWarnings!({
+      cfg: { channels: { webchannel: { encryption: { mode: "disabled" }, dmSecurity: "allowlist" } } } as never,
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {},
+    });
+    expect(warnings).toEqual(
+      expect.arrayContaining([expect.stringMatching(/channels\.webchannel\.default.*encryption-disabled/)]),
+    );
+  });
 });
 
 describe("webchannel transport", () => {

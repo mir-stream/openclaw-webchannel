@@ -26,10 +26,15 @@ import {
   type WebchannelAcquisitionIdentity,
 } from "./account-config.js";
 
-const ACQUISITION_IDENTITY_ENV_KEYS = [
+export const ACQUISITION_IDENTITY_ENV_KEYS = [
   "WEBCHANNEL_TENANT",
   "WEBCHANNEL_SAAS_BASE_URL",
 ] as const;
+
+export function hasWebchannelConfig(cfg: unknown): boolean {
+  const section = readWebchannelSection(cfg);
+  return section !== undefined && Object.keys(section).length > 0;
+}
 
 /** Module-scoped guard so the deprecation warning fires at most once per process. */
 let deprecationWarned = false;
@@ -68,8 +73,7 @@ export function resolveAcquisitionEnvPrecedence(
   const env = opts.env ?? process.env;
   const warn = opts.warn ?? ((msg: string) => console.warn(msg));
 
-  const section = readWebchannelSection(cfg);
-  const hasConfig = section !== undefined && Object.keys(section).length > 0;
+  const hasConfig = hasWebchannelConfig(cfg);
 
   const envSet = ACQUISITION_IDENTITY_ENV_KEYS.filter((k) => env[k] !== undefined);
 

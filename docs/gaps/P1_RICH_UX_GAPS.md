@@ -14,7 +14,8 @@
 > and the parity stack has since landed several P1 items. **Now built:** **P1-1 markdown (#27)**,
 > **P1-7 error/reconnect UX** (incl. finer cause-driven wording), and **P1-8** (`/stop` control lane
 > #25 + debounce/coalesce #29), P1-3 reasoning lane, and **P1-9 unsend** (Option A client-side hold)
-> — all marked ✅. **Still open:** P1-2 long-response, P1-4 media, and P1-6 doctor.
+> — all marked ✅. **Still open:** P1-2 long-response and P1-4 media.
+> P1-6 doctor is built on `feat/p1-6-doctor` and awaiting merge (#39) — see its section.
 > Note (#14): the plugin has a partial-mode answer-text stream (`streaming.mode:"partial"`, exercised
 > in the demo) — P1-3's reasoning lane builds on that existing stream, not a net-new one.
 >
@@ -219,13 +220,45 @@ single biggest P1 lift. Consider splitting into its own tracking doc.
 
 ---
 
-## P1-6 — Doctor / self-diagnosis — 🔴 MISSING
+## P1-6 — Doctor / self-diagnosis — ✅ BUILT
 
-**Symptom.** When misconfigured, failures are opaque (silent skips in logs); no user-facing "what's
-wrong + how to fix".
+**Symptom (original).** When misconfigured, failures were opaque (silent skips in logs); no
+user-facing "what's wrong + how to fix".
 
-**Classification.** 🔴 Missing (we have a setup *wizard* — `docs/SETUP_WIZARD_PLAN.md` — but no
-*doctor* that validates an existing config / live connection).
+**Classification.** ✅ Built (branch `feat/p1-6-doctor`; plan + dist-verified SDK contract in
+`docs/P1_DOCTOR_PLAN.md`). `openclaw doctor` now reports actionable per-account findings with fix
+hints via `ChannelDoctorAdapter.collectPreviewWarnings` (Path A — works with the gateway DOWN), and
+the status surfaces carry a live probe (`status.probeAccount`: effective-JWKS-source check +
+relay dial, never triggers enrollment) plus runtime-only `collectStatusIssues`.
+
+**What was built.**
+- `src/doctor.ts` — finding engine C1–C11 factored from the exact serving-loop skip conditions
+  (`index-nats.ts`): encryption-disabled, creds-missing, register-hop-static-unsupported,
+  identity-key-missing, verifier-unbuildable, shared-audience, open-admission, obsolete-cors,
+  auth-strategy-invalid (contextual a/b/c), credential-source-invalid, orphaned-default,
+  deprecated-acquisition-env. Mirror-fidelity rule: never a false positive on a served config,
+  never silent on a skipped one.
+- `src/account-auth.ts` — `deriveAccountAuth` moved verbatim out of the entry +
+  `resolveEffectiveAccountAuth` (single effective-auth resolution shared by serving loop, doctor,
+  and probe; behavior-preserving).
+- `src/auth.ts` — side-effect-free `validateJwtVerifierConfig`/`validateVerifierConfig` (doctor
+  validates without allocating the module-level JWKS cache; `makeJwtVerifier` calls the same
+  validator — one source of truth).
+- `src/consume-credentials.ts` — `resolveDialMaterial` (probe-safe: enrolled mode reads persisted
+  creds only, `persisted.natsUrl ?? source.url`, device flow unreachable).
+- Adapters attached in `createWebChannelPlugin` (`src/channel.ts`) so the doctor CLI's read-only /
+  setup-entry load path gets them; types from `openclaw/plugin-sdk/channel-contract`.
+
+**Gotchas (durable).** The real `ChannelDoctorAdapter` is config-repair hooks, NOT the scanner
+registry this doc originally sketched — status issues/probe live on the separate
+`ChannelStatusAdapter`. `openclaw doctor`'s status-issue leg (Path B) is gateway-RPC-gated and
+silently absent when the gateway is down, so config findings MUST live in Path A. The plain
+`openclaw status` scan builds snapshots via `config.describeAccount`, never
+`status.buildAccountSnapshot` — don't smuggle config findings through snapshots.
+
+**Acceptance (met).** `openclaw doctor` reports actionable issues for a mis-set account (missing
+creds, bad auth strategy, encryption off) with a fix hint, instead of a silent log skip (✅ — plus
+live probe + runtime status issues beyond the original ask).
 
 **Where it stands today.** `packages/plugin/index-nats.ts` already *detects* many failure modes and
 logs them (encryption misconfig skip, missing creds skip, connection failure skip, admission=auto +
@@ -461,7 +494,7 @@ costs no E2E/server work, and stays purely in `demo/web/src/widget.ts` + a small
 | ✅ | P1-7 finer error wording | XS | built — cause tag threaded to a cause-driven terminal error box |
 | 4 | P0-3 argument menus | S | — (catalog entries already carry `args.choices`; render dropdowns) |
 | 5 | P1-2 long-response polish | S | P1-1 ✅ |
-| 6 | P1-6 doctor | M | — (factor existing `index-nats` checks into a `ChannelDoctorAdapter`) |
+| ✅ | P1-6 doctor | M | built — C1–C11 finding engine mirrors the serving-loop skips; doctor + status adapters, probe never enrolls |
 | 7 | P1-4 media | L (mini-project) | **DECIDED: object storage / blob endpoint** |
 | — | ~~P1-5 interactive buttons~~ | — | **MERGED into P0-4** (delta = generalize renderer + 2 wire frames) |
 

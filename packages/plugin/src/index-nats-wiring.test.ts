@@ -50,6 +50,14 @@ describe("index-nats.ts wiring contract — typing gate (P0-6)", () => {
   });
 });
 
+describe("index-nats.ts wiring contract — effective auth (P1-6)", () => {
+  it("uses the shared resolver and no longer defines a local derivation helper", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(/import \{ resolveEffectiveAccountAuth \} from "\.\/src\/account-auth\.js"/);
+    expect(INDEX_NATS_SOURCE).toMatch(/const accountAuth = resolveEffectiveAccountAuth\(/);
+    expect(INDEX_NATS_SOURCE).not.toMatch(/function deriveAccountAuth\(/);
+  });
+});
+
 describe("index-nats.ts wiring contract — command catalog (P0-3)", () => {
   it("serves load_commands from the MEMOIZED provider, not a per-request build", () => {
     // The handler must call the memoized provider (`catalogProvider()`), never

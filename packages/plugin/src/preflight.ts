@@ -424,7 +424,7 @@ export async function runAddPreflight(
   // 2. Relay dial (scoped no-op sub within the account's own subtree, then close).
   const dialSubject = `webchannel.${opts.tenant}.${opts.accountId}._preflight`;
   const relay = opts.enrollment.natsUrl
-    ? await (opts.dial ?? defaultRelayDial)({
+    ? await (opts.dial ?? dialRelayForPreflight)({
         url: opts.enrollment.natsUrl,
         userJwt: opts.enrollment.userJwt,
         userSeed: opts.enrollment.userSeed,
@@ -460,7 +460,8 @@ export async function runAddPreflight(
  * same primitive the runtime uses to dial enrolled creds — so nothing about the
  * auth flow is reinvented here.
  */
-async function defaultRelayDial(input: {
+export async function dialRelayForPreflight(input: {
+  kind?: "static";
   url: string;
   userJwt: string;
   userSeed: string;
@@ -472,12 +473,7 @@ async function defaultRelayDial(input: {
   try {
     const connected = await withTimeout(
       connectNatsCredentialSource(
-        {
-          mode: 'static',
-          url: input.url,
-          userJwt: input.userJwt,
-          userSeed: input.userSeed,
-        },
+        { mode: "static", url: input.url, userJwt: input.userJwt, userSeed: input.userSeed },
         input.connectDeps ?? {},
       ),
       input.timeoutMs,

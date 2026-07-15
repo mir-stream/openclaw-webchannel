@@ -93,16 +93,19 @@ export function planAccounts(
  * Intentionally narrow: tuning / tenant / saas-only shared bases are legitimate
  * shapes and stay quiet (that boot noise was the original complaint).
  */
-function warnOnOrphanedDefault(cfg: unknown, warn?: (msg: string) => void): void {
-  if (!warn) return;
+export function detectOrphanedDefault(cfg: unknown): boolean {
   const section = readWebchannelSection(cfg);
-  if (!section) return;
+  if (!section) return false;
   const accounts = readAccountsMap(section);
   const hasNamedAccounts = Object.keys(accounts).length > 0;
-  if (!hasNamedAccounts) return;
-  if (DEFAULT_WEBCHANNEL_ACCOUNT_ID in accounts) return;
+  if (!hasNamedAccounts) return false;
+  if (DEFAULT_WEBCHANNEL_ACCOUNT_ID in accounts) return false;
   const hasIdentityBase = "auth" in section || "nats" in section;
-  if (!hasIdentityBase) return;
+  return hasIdentityBase;
+}
+
+export function warnOnOrphanedDefault(cfg: unknown, warn?: (msg: string) => void): void {
+  if (!warn || !detectOrphanedDefault(cfg)) return;
   warn(
     `webchannel: channel-level auth/nats present but no accounts.default — the ` +
       `"default" account is NOT served (channel-level fields are shared base only). ` +
