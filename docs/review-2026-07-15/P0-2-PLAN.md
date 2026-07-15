@@ -2,7 +2,9 @@
 
 > Work item: [`P0.md`](P0.md) §"P0-2" (lines 90–173).
 > Branch: `feat/p0-2-auto-admission-removal`, stacked on `feat/p0-1-gateway-ws-removal` (PR #41).
-> Status: DRAFT v2 (explorer-verified inventory folded in; pre codex adversarial review).
+> Status: DRAFT v3 (codex R1: 2 BLOCKER + 2 MAJOR folded in — registration now
+> mandatory end-to-end, browser-demo-entry in scope, protocol-version decision made,
+> two-layer migration semantics).
 
 ## 1. Goal and invariants
 
@@ -72,6 +74,7 @@ OUT (explicitly deferred):
 | `packages/client/src/e2e-browser-client.ts` | Playwright dial seam, not in barrel (verified); same 2 tests |
 | `e2e/dev-nats-roundtrip.test.ts`, `e2e/enrolled-jwt-roundtrip.test.ts` | drive the two seams above via handshake |
 | `packages/client/src/e2e-crypto-browser.test.ts` | tests `parseKeyExchange` only |
+| `e2e/local/drive-roundtrip.ts`, `e2e/local/browser-entry.ts` | registration-less handshake drivers (drive-roundtrip mints the old HS256 web-anon ticket); die with their harnesses — Stage 1 confirms which `.sh` consume them |
 
 ### 3.2 REWRITE map (file:line, current role → change)
 
@@ -124,9 +127,32 @@ field (:79-80) → register-hop-only.
 `publishHandshakeWithRetry` (:1302-1315), `clearHandshakeRetry` (:1317-1322), handshake
 arm of `handleRaw` (:1327-1336), `handshakeRetryTimer` (:933), `handshakeSub` (:923),
 `keyPair` field (:885), `HANDSHAKE_MAX_RETRIES`/`HANDSHAKE_RETRY_MS`,
-`handshakeSubject()` (:846-848): DELETE. `registration.deviceX25519PrivateKey`
-(:117-126) optional → **required** (missing = terminal config error at construction,
-not a silent legacy-path pre-selection). Register-delivered branch (:1226-1282) KEEP.
+`handshakeSubject()` (:846-848): DELETE. **`registration` itself (:114, today
+optional — "when absent, registration is skipped") and `deviceX25519PrivateKey`
+(:117-126) both become required** (codex R1 BLOCKER 1): the constructor throws a
+synchronous terminal config error when either is missing — never a silent
+legacy-path pre-selection, never a connected-but-keyless client (`connect()` runs
+registration only inside `if (registration)` at :1126 today).
+Register-delivered branch (:1226-1282) KEEP.
+
+**`packages/client/src/nats-client-wrapper.ts`** — forwards `registration` unchanged
+(:70) and `WebChannelNATSClientOptions` inherits its optionality: type + runtime
+follow the mandatory-registration change; wrapper-level missing-registration test
+added.
+
+**`packages/client/src/browser-demo-entry.ts`** — codex R1 BLOCKER 2: a RUNTIME
+handshake selector, not stale prose — `opts.gwUrl ? { registration: {...} } : {}`
+(:177-189) constructs the production client registration-less when `gwUrl` is unset
+(comment :167-170 spells out the auto/handshake intent; `agentPublicKey` required
+only when `gwUrl` set, :160-162). REWRITE: registration unconditional; `gwUrl` stops
+being a registration toggle; `agentPublicKey` always required from bootstrap.
+
+**`examples/minimal-consumer/src/widget.ts`** — constructs `WebChannelNATSClient`
+with NO registration (type-surface smoke, :16-23). REWRITE to include a registration
+stub once the type requires it (WebCrypto-generated keys or documented fixture);
+`examples/webchannel-app` + `demo/web/src/widget.ts` already register unconditionally
+(verified) — README snippets re-checked in Stage 6. `browser-jwt-entry.ts` registers
+(4 sites) — verify both construction sites in Stage 4.
 
 **`packages/client/src/e2e-crypto-browser.ts`** — DELETE `generateX25519KeyPair`
 (:56-67), `deriveConversationKey` (:115-121), `keyExchangeFrame` (:216-218),
@@ -206,27 +232,51 @@ the only remaining route (register-hop) is fail-closed without an enrolled/attes
 identity key (`index-nats.ts:544-556` — the F2 guard, which stays as the serve-time
 backstop).
 
-Decision: **surface this at load, not as a silent no-serve.** A static-creds account
-(any static signal per the resolver) gets a targeted migration error at startup:
-"static NATS credentials no longer imply auto admission; BYO-NATS requires
-authenticated registration (attested agent identity) — enroll with `openclaw channels
-add --channel webchannel`, or track P0-3 (BYO-NATS authenticated registration)".
+Decision: **surface this loudly, with two-layer semantics** (codex R1 MAJOR 2 — a
+static source can be selected by config OR by process-wide env/`.creds` signals that
+never pass through account-config, and the two layers have different blast radii):
+
+- **Layer 1 — raw removed config shapes** (`nats.devOpen`, `nats.admission:"auto"`,
+  `nats.credentials.mode:"open"`, `auth.strategy:"anonymous"`): thrown by
+  `assertNoRemovedConfig` inside `resolveWebchannelAccountConfig`. Propagation is the
+  **P0-1 precedent, verified**: `planAccounts` (`multiplex.ts:71`) calls it per
+  account with NO try/catch, so the throw escapes the plugin's serve loop —
+  **plugin-load-fatal**, exactly like `auth.ticketParam` today. A removed shape in
+  committed config should be unmissable; this is deliberate.
+- **Layer 2 — effective source after full precedence resolution** (static selected by
+  `credentials.mode:"static"`, `credsFile`, inline secrets, `WEBCHANNEL_NATS_USER_JWT`
+  + `_SEED`, `WEBCHANNEL_NATS_CREDS`; open selected by `WEBCHANNEL_NATS_DEV_OPEN=1`):
+  detected at/after `resolveNatsCredentialSource` in the serving loop, where the
+  existing per-account catch (`index-nats.ts:399,455`) converts a throw into
+  **skip-this-account with an error-level migration log** — one bad account disables
+  that account only, other accounts/channels unaffected (matches the established
+  degradation model for credential problems). The message states the env-var scope
+  explicitly (a process-wide env selects static/open for EVERY account, so every
+  account logs it): "static NATS credentials no longer imply auto admission; BYO-NATS
+  requires authenticated registration (attested agent identity) — enroll with
+  `openclaw channels add --channel webchannel`, or track P0-3", and for DEV_OPEN:
+  "WEBCHANNEL_NATS_DEV_OPEN was removed; there is no unauthenticated NATS mode".
+
 Deliberate consequence, stated in CHANGELOG and the PR body: **static-creds accounts
 are un-servable until P0-3** (Q3 — product call, flagged to the user).
+
+Tests cover every static signal individually (mode/credsFile/inline/env-JWT+seed/
+env-creds-file) plus env DEV_OPEN — per-account skip asserted, not process crash;
+and one Layer-1 shape per key — process-fatal asserted.
 
 The dev-identity fallback (`index-nats.ts:534-543`) and `dev-identity.ts` are deleted;
 register-hop with no attested key is ALWAYS fail-closed.
 
 ### D5 — Migration errors ride the P0-1 seam
 
-All config-shape detection lives in `assertNoRemovedConfig` (`account-config.ts:184`),
+Layer 1 (D4) detection lives in `assertNoRemovedConfig` (`account-config.ts:184`),
 which runs inside `resolveWebchannelAccountConfig` — the real load path for every
-account resolution. New checks: `nats.devOpen` (presence), `nats.admission === "auto"`,
-`nats.credentials.mode === "open"`, plus the D4 static-shape error (which needs the
-resolver's static-signal logic — implementation may put it in
-`resolveNatsCredentialSource` instead; codex to weigh in on the seam split). Schema
-keeps removed keys deprecated-accepted with descriptions saying "REMOVED — startup
-error; see migration".
+account resolution, plugin-load-fatal via `planAccounts` (verified — R1 resolved).
+New Layer-1 checks: `nats.devOpen` (presence), `nats.admission === "auto"`,
+`nats.credentials.mode === "open"`, `auth.strategy === "anonymous"` (D9). Layer 2
+(effective source, env-selected shapes) lives in the resolver/serving loop per D4.
+Schema keeps removed keys deprecated-accepted with descriptions saying "REMOVED —
+startup error; see migration".
 
 ### D6 — e2e harness migration (the true blast radius)
 
@@ -260,14 +310,39 @@ CI steps + the ≥1420 test baseline move in lockstep (a code-only delete lands 
 Stage 1 inventories A1–A5 by test-grep (not plan-doc claims — P0-1 lesson: round-1
 once shipped a gate on a fabricated field).
 
-### D8 — Wire/protocol + release
+### D8 — Wire/protocol + release: protocol version STAYS 1 (decision, not deferral)
 
 `key_exchange` leaves the wire; the `.handshake` subject disappears entirely. The 11/4
-frame count on `.in`/`.out` proper is unchanged. CHANGELOG 0.3.0 BREAKING gains:
-auto-admission removed, devOpen removed, live handshake removed, static-creds serving
-deferred to P0-3, `deviceX25519PrivateKey` required in client registration. Verify in
-Stage 1 that no protocol-version bump is needed beyond 0.3.0 (register-reply
-`protocol-version` lockstep test).
+frame count on `.in`/`.out` proper is unchanged.
+
+**Decision (codex R1 MAJOR 1): keep `WEBCHANNEL_PROTOCOL_VERSION = 1`.** Rationale:
+
+- The version gates the **negotiated** wire contract, and negotiation happens only in
+  the register reply (`nats-client.ts:1200-1221`, exact-match, mismatch = TERMINAL
+  disconnect). The negotiated contract — register request/reply, wrapped-K delivery,
+  envelope frames — is **byte-identical** before and after P0-2. A v1 client that
+  registers works perfectly against the new plugin.
+- Bumping to 2 under the exact-match rule would therefore terminally break every
+  fully-compatible registering v1 client for zero wire difference — strictly worse
+  than the status quo.
+- The handshake path never reached version negotiation in ANY version (auto clients
+  never register), so it was never under the version's protection; deleting it cannot
+  be expressed by that mechanism.
+
+Acknowledged residual: an old auto-mode client against a new plugin publishes
+`key_exchange` into a subject nobody subscribes and times out without a version
+diagnostic. Accepted because (a) that client shape only ever worked against
+`admission:"auto"` agents, whose config now hard-errors at agent startup — the
+operator hears about it on the agent side; (b) client+plugin ship 0.3.0 in enforced
+3-way lockstep. Stated in CHANGELOG.
+
+Compat tests locked in: reply-without-protocolVersion → non-fatal (exists — verify),
+matching v1 → proceeds, mismatched → terminal (exists — verify), and the
+protocol-version-lockstep suite stays green unmodified.
+
+CHANGELOG 0.3.0 BREAKING gains: auto-admission removed, devOpen removed, live
+handshake removed, static-creds serving deferred to P0-3, **`registration` (incl.
+`deviceX25519PrivateKey`) required in client options**.
 
 ### D9 — `auth.strategy:"anonymous"` leaves the schema
 
@@ -289,7 +364,10 @@ seam (value-match), not a schema rejection.
 3. **Plugin channel** — delete handshake surface (`nats-channel.ts`,
    `e2e-session.ts`); keyStore-only crypto invariant; delete `e2e-roundtrip-agent.ts`.
 4. **Client** — delete legacy handshake branch + handshake-only crypto exports +
-   `e2e-browser-client.ts`; `deviceX25519PrivateKey` required.
+   `e2e-browser-client.ts`; `registration` + `deviceX25519PrivateKey` required
+   (constructor-synchronous terminal error, direct + wrapper); rewrite
+   `browser-demo-entry.ts` (unconditional registration) + `examples/minimal-consumer`
+   stub; audit every remaining construction site (§3.2 last block).
 5. **Tests** — delete/rewrite per §6.1; add migration-error tests + A1–A5.
 6. **e2e + CI + guards + docs** — D6 harness moves; banned-symbol guard extension;
    CI BASELINE re-measure; docs sweep (§3.3 stale fixes; F-list below); CHANGELOG.
@@ -319,9 +397,16 @@ register-pop-gate, nats-channel-ack, nats-subject-permissions, nats-transport*,
 client -register/-recovery/-wrapped-key/-replay/-crypto/-liveness/-wrapper,
 protocol-version-lockstep, `auth-admission.test.ts` as the D9 guard).
 
-ADD: migration-error tests (one per removed shape: devOpen key, admission:"auto",
-credentials.mode:"open", static-creds shape, strategy:"anonymous", env DEV_OPEN);
-A1–A5; "registerPeer is sole peerSessionKeys writer + stays bounded" unit.
+ADD: migration-error tests per D4's two layers (Layer 1: one per removed shape,
+process-fatal asserted; Layer 2: one per static signal — mode/credsFile/inline/
+env-JWT+seed/env-creds-file — plus env DEV_OPEN, per-account skip asserted);
+missing-`registration` construction errors (direct `WebChannelNatsClient` AND wrapper
+`WebChannelNATSClient`); `browser-demo-entry` unconditional-registration test;
+A1–A5; "registerPeer is sole peerSessionKeys writer + stays bounded" unit incl.
+exception paths (a subscribe/eviction throw after the :299 key insertion must not
+leak an entry — codex R1 MINOR); D8 protocol compat tests (verify existing, extend
+if absent); R2 reconnect-resubscribe regression test (`.register` survives transport
+replay — `nats-transport.ts:580`).
 
 ### 6.2 Guards
 
@@ -336,21 +421,22 @@ symbol; git grep only — rg is absent on real PATH).
 Re-measure after Stage 5 and set `BASELINE` in `e2e-gate.yml` (P0-2 deletes more
 tests than it adds — measure, don't guess). Update/remove CI steps 8/8b/8d/8f per D6.
 
-## 7. Risks / open questions
+## 7. Risks / open questions (R1 verdicts folded in)
 
-- **Q1 (D2)**: `devOpen:false` also migration-errors (presence check) — codex to
-  challenge.
-- **Q2 (D6)**: subsumption of the 3 candidate-delete harnesses is asserted, not yet
-  proven — Stage 1 audits assertion-by-assertion. Fallback for any un-subsumed
-  harness: migrate it to the enrolled trust chain (never keep open mode).
-- **Q3 (D4)**: static-creds un-servability window until P0-3 — product-level call;
-  review text supports it; flag in PR body.
-- **R1**: `registerHopAvailable`/static-signal logic needed by the D4 load-time error
-  — seam split between account-config and nats-credential-source to be settled
-  (codex input welcome).
-- **R2**: deleting `subscribeWildcard` — verify `.register` resubscription on
-  reconnect is unaffected (transport replays subscriptions; register sub is
-  per-account, as wildcard was).
+- **Q1 (D2)**: `devOpen:false` presence check — **ACCEPTED by codex R1** (stricter
+  migration behavior, intentional; tested + documented).
+- **Q2 (D6)**: subsumption of the 3 candidate-delete harnesses — **still open by
+  design**: codex R1 concurs deletion must wait for Stage 1 assertion-by-assertion
+  evidence. Fallback for any un-subsumed harness: migrate it to the enrolled trust
+  chain (never keep open mode).
+- **Q3 (D4)**: static-creds un-servability window until P0-3 — codex R1: technically
+  coherent, **requires explicit product approval** → flagged to the user in the PR
+  body and in the TechLead status report; treated as approved-by-review-text unless
+  the user objects.
+- **R1 (seam split)**: RESOLVED in D4/D5 (two-layer semantics: Layer 1
+  plugin-load-fatal via planAccounts, Layer 2 per-account skip in the serving loop).
+- **R2 (reconnect resubscribe)**: **ACCEPTED by codex R1** (transport replays stored
+  subjects — `nats-transport.ts:580`); regression test added to §6.1.
 - **R3**: docs sweep breadth (explorer F): plugin README, e2e/local README (incl.
   phantom `wildcard-gate.ts`), docs/{AUTH,README,ONBOARDING_GUIDE,
   TRUST_AND_ONBOARDING,STATUS,DEMO_PLAN,SETUP_WIZARD_PLAN,SPLIT_DEMO,
