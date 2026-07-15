@@ -253,7 +253,13 @@ export function resolveNatsCredentialSource(
     );
   }
 
-  // ── 1. STATIC (bring-your-own-NATS) ───────────────────────────────────────
+  // ── 1. STATIC (bring-your-own-NATS) — UNREACHABLE until P0-3 ──────────────
+  // The static-signal guard above throws for EVERY condition that could set a
+  // static signal, so this resolution block cannot currently run. It is retained
+  // as the P0-3 (BYO-NATS authenticated registration) landing site: P0-3 removes
+  // the throw and re-enables this path once static creds carry an attested
+  // identity. The `{ mode: "static" }` union member + connector case survive for
+  // direct unit construction of the resolved source.
   const credsFilePath = env["WEBCHANNEL_NATS_CREDS"] ?? creds?.credsFile;
   const envJwt = env["WEBCHANNEL_NATS_USER_JWT"];
   const envSeed = env["WEBCHANNEL_NATS_USER_SEED"];

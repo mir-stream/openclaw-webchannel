@@ -7,9 +7,9 @@
  * BigInt) so it runs identically in a real browser and in Node ≥18 (which also
  * exposes `globalThis.crypto.subtle` with X25519). It speaks the exact same wire
  * protocol the agent (`packages/plugin/src/e2e-session.ts` + `nats-channel.ts`)
- * and the live-gate browser seam (`e2e-browser-client.ts`) use:
- *   - handshake frame: {type:"legacy exchange frame", pubKey:<b64url X25519>}
- *   - session key:     hkdfSha256(ecdh, null, "webchannel-conversation-v1", 32)
+ * uses:
+ *   - conversation key K: register-delivered, unwrapped via the key-wrap ECDH
+ *                         (KEY_WRAP_INFO = "webchannel-key-wrap-v1")
  *   - wire envelope:   MessageEnvelope v1 JSON, content = ChaCha20-Poly1305
  *   - AAD:             canonical(routing) = {tenant,accountId,sub,messageId,envelopeType,ts}
  */

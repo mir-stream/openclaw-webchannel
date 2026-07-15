@@ -23,7 +23,7 @@
  *   - "browser": scoped to the peer's OWN subtree across all of the tenant's
  *     accounts (`webchannel.{tenant}.*.{peerId}.>`, the `*` matching the accountId
  *     segment). A browser therefore cannot publish to (or subscribe) another
- *     peerId's `.register`/`.reginbox`/`.in`/`.out`/`.handshake` — this structurally
+ *     peerId's `.register`/`.reginbox`/`.in`/`.out` — this structurally
  *     closes the register-reply forgery / K-poisoning vector (a same-tenant peer
  *     could otherwise publish a forged `registered:true` reply to a victim's
  *     reginbox) and the unregister-DoS. The peerId MUST be the authenticated

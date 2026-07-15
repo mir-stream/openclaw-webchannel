@@ -162,7 +162,7 @@ jobs:
 
       # ──────────────────────────────────────────────────────────────────────
       # 6. Run all test suites with JSON output for baseline verification
-      #    - Baseline: ≥1420 tests across all packages
+      #    - Baseline: ≥1398 tests across all packages
       #    - Real-server suites (skipIf removed in CI) now run against the
       #      real nats-server binary installed in step 3.
       #    - Sub-AC 1: e2e/dev-nats-roundtrip.test.ts — open-NATS E2E gate

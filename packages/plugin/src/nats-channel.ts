@@ -49,11 +49,11 @@ export type NatsChannelCryptoOptions = {
   /**
    * Agent-owned per-peerId conversation-key store.
    *
-   * When supplied, the channel runs the REGISTER-admission key model:
-   * `registerPeer` loads/creates the peer's stable key K from this store (so a
-   * second device of the same user never overwrites the first one's key), and
-   * the per-device X25519 `.handshake` negotiation is DISABLED — devices
-   * receive K wrapped to their JWT-cnf pubkey via the register response.
+   * The channel runs the REGISTER-admission key model: `registerPeer`
+   * loads/creates the peer's stable key K from this store (so a second device of
+   * the same user never overwrites the first one's key), and devices receive K
+   * wrapped to their JWT-cnf pubkey via the register response — there is no
+   * per-device handshake (the unauthenticated X25519 negotiation was removed).
    */
   keyStore?: ConversationKeyStore;
   /**
@@ -182,8 +182,9 @@ export class NatsChannel implements WebChannelPeerChannel {
   /** When true, the channel is E2E-encrypted and fail-closed (no plaintext). */
   private readonly encryptionRequired: boolean;
   /**
-   * Phase 6: agent-owned conversation-key store (register-admission accounts
-   * only; null = legacy handshake key model). See NatsChannelCryptoOptions.
+   * Phase 6: agent-owned conversation-key store. Non-null on every encrypted
+   * channel (the constructor requires it when `encryptionRequired`); null only
+   * in the non-encrypted test construction. See NatsChannelCryptoOptions.
    */
   private readonly keyStore: ConversationKeyStore | null;
   /**
@@ -685,7 +686,7 @@ export class NatsChannel implements WebChannelPeerChannel {
    * in-namespace precisely so browser creds need no `_INBOX.>` grant — the
    * agent's own creds may not even cover `_INBOX.*`). Everything else is
    * dropped with a warn: another peer's subtree, the requester's own
-   * `.in`/`.handshake`/`.register` (a self-bounce through the agent's handlers),
+   * `.in`/`.register` (a self-bounce through the agent's handlers),
    * `_INBOX.*`, foreign namespaces. `peerId` here is the subject-routing
    * segment, NOT the JWT identity (that is verified later, in
    * `handleRegisterRequest`); the confinement is nonetheless sound because a

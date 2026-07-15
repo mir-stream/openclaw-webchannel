@@ -7,9 +7,8 @@
  *    bound by the canonical AAD.
  *
  * It deliberately reuses the proven primitives (`e2e-crypto.ts`,
- * `e2e-envelope.ts`) and the same handshake frame shape + KDF info string the
- * live E2E gate exercises (`e2e-roundtrip-agent.ts` ↔ `e2e-browser-client.ts`),
- * so the production channel speaks the identical wire protocol.
+ * `e2e-envelope.ts`) so the production channel and the browser client speak the
+ * identical envelope wire protocol.
  */
 
 import { randomBytes } from "node:crypto";

@@ -34,9 +34,10 @@ import { createHash, webcrypto } from "node:crypto";
 import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
 import { setupTrustChain } from "../src/setup-trust-chain.js";
 import type { JwksDocument } from "../src/types.js";
-// F2: this dev bootstrap server front-ends a DEV-OPEN register-hop agent, which
-// wraps K under the WELL-KNOWN dev identity key (packages/plugin/src/dev-identity.ts).
-// Deliver its PUBLIC half so the browser pins the same key the agent wraps under.
+// F2: this dev bootstrap server front-ends a register-hop agent, which wraps K
+// under its attested agent identity key. Deliver that key's PUBLIC half (supplied
+// via WEBCHANNEL_AGENT_PUBLIC_KEY) so the browser pins the same key the agent
+// wraps under; omitted → the browser fail-closes on the register path.
 
 // ---------------------------------------------------------------------------
 // Configuration
