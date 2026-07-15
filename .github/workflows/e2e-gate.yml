@@ -2,10 +2,10 @@
 # e2e-gate.yml — Single blocking CI gate for openclaw-webchannel Phase B.
 #
 # Enforces:
-#  - All pre-existing test suites stay green (≥1420 test baseline across 3 pkgs)
+#  - All pre-existing test suites stay green (≥1398 test baseline across 3 pkgs)
 #  - 3-package typecheck passes clean
 #  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
-#  - Both dev/open-NATS mode AND enrolled-JWT mode covered
+#  - The register-hop (enrolled-JWT) admission path is covered end-to-end
 #
 # The gate runs on every push and PR to the integration branches AND to the
 # working branches where development actually happens (develop, feature/**) —
@@ -177,16 +177,16 @@ jobs:
           CI: "true"
 
       # ──────────────────────────────────────────────────────────────────────
-      # 7. Verify test count meets baseline (≥1365 tests passed)
+      # 7. Verify test count meets baseline (≥1398 tests passed)
       #    Fails the gate if the count regresses below the seed-time baseline.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Verify test baseline (≥1365 tests)
+      - name: Verify test baseline (≥1398 tests)
         if: always()
         run: |
           set -euo pipefail
           node - << 'EOF'
           const fs = require('fs');
-          const BASELINE = 1365;
+          const BASELINE = 1398;
           let data;
           try {
             data = JSON.parse(fs.readFileSync('/tmp/vitest-results.json', 'utf8'));
@@ -207,7 +207,7 @@ jobs:
 
       # ──────────────────────────────────────────────────────────────────────
       # 8c. Live e2e: enrolled-NATS-transport (device-flow)
-      #    dev unauthenticated mode OFF: the plugin obtains tenant-scoped NATS creds via the REAL
+      #    The plugin obtains tenant-scoped NATS creds via the REAL
       #    device-flow enrollment-server and NKEY-connects to a JWT-auth
       #    nats-server from ONE shared trust chain. Node driver, no Chromium.
       #    Isolated under /tmp/oc-enrolled-e2e (port 18999) — hermetic, no

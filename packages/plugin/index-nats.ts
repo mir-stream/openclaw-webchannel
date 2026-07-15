@@ -90,9 +90,9 @@ type AccountRuntime = {
   transport: NatsTransport;
   enrolled?: EnrolledNatsConnection;
   /**
-   * The `channels.webchannel.auth` verifier — built ONLY for a `register-hop`
-   * account. An `auto` account admits peers via the NATS wildcard + X25519
-   * handshake and has no verifier, so this is optional. (Register verifies via
+   * The `channels.webchannel.auth` `JWT auth configuration`. Every account is
+   * register-hop, so this is always required; it is `undefined` only transiently
+   * before the verifier is built. (Register verifies via
    * `verifyJwtAndExtractIdentity` against `auth`, not this field; it is retained
    * to fail loudly on a register-hop account's verifier misconfig.)
    */
@@ -830,14 +830,12 @@ export default defineChannelPluginEntry({
       // failure boundary (a build fault must never surface as an unhandled throw
       // on the dispatch path). See src/commands-catalog.ts for the design.
       //
-      // EXPOSURE DECISION (deliberate): unlike the history/approval snapshots —
-      // which are register-hop-gated because they carry the user's own data —
-      // the `commands` frame is served to ANY handshaken peer, including
-      // wildcard / `admission:"auto"` peers. Auto-mode peers never call
-      // registerPeer, so gating discovery on registration would kill the
-      // typeahead in auto mode entirely. The catalog is low-sensitivity command
-      // metadata (names / descriptions / args), already config-filtered by
-      // buildCommandCatalog — so serving it to any handshaken peer is accepted.
+      // The `commands` frame carries only low-sensitivity command metadata
+      // (names / descriptions / args), already config-filtered by
+      // buildCommandCatalog — so unlike the history/approval snapshots (which
+      // carry the user's own data) it does not need to be withheld pending any
+      // additional gate. Every peer is register-hop-authenticated before this
+      // handler can fire, so serving the catalog to a registered peer is accepted.
       const catalogProvider = createCommandCatalogProvider(api.config);
       channel.setLoadCommandsHandler((peerId) => {
         try {
@@ -899,9 +897,9 @@ export default defineChannelPluginEntry({
       });
 
       // ---- Axis B consequence: register-hop admission over NATS -------------
-      // A register-hop account wires the register-request handler and subscribes
-      // its own `.register` wildcard (the NATS analogue of the old HTTP route).
-      // An `auto` account does neither — it admits via the wildcard + handshake.
+      // Every account wires the register-request handler and subscribes its own
+      // `.register` wildcard (the NATS analogue of the old HTTP route) — the sole
+      // admission path now that auto-admission and the X25519 handshake are gone.
       {
         // PER-ACCOUNT PoP nonce store (NOT process-wide). Scoping the store to
         // this account means its per-peer cap evicts only THIS account's own
@@ -921,6 +919,7 @@ export default defineChannelPluginEntry({
           // unguarded path must never surface as an unhandledRejection.
           void handleRegisterRequest({
             auth: accountAuth,
+            tenant,
             subjectPeerId,
             payload,
             reply,

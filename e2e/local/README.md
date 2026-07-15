@@ -42,9 +42,7 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 | File | Role |
 |---|---|
 | `echo-openai-server.mjs` | ~50-line fake OpenAI `/v1/chat/completions` that returns `echo: <last user msg>`. Pointed at by an openclaw `openai-completions` provider. |
-| `gen-jwt-fixtures.mjs` | Mints an RS256 keypair (`jwks.json` + private JWK) used to sign bootstrap JWTs in the harnesses that self-issue. |
 | `all-real.mjs` | Playwright runner for `run-all-real.sh` and `run-derived-trust.sh`: serves the browser bundle, launches headless Chromium running the production `WebChannelNatsClient`, NKEY-authenticates to the JWT-auth nats-server, drives the JWT + PoP register hop, and asserts the reply echoes the sent text. **This is the "from a real browser" proof.** |
-| `browser-roundtrip.mjs` | Standalone Playwright round-trip driver (headless Chromium over the register hop). Not currently wired into the four harnesses above — kept as a lower-level driver. |
 | `enrolled-transport-roundtrip.ts` | Node driver for `run-enrolled-transport.sh`: an NKEY-authenticated peer that round-trips one message against the device-flow-enrolled plugin. |
 | `two-account-isolation-roundtrip.ts` | Node driver for `run-two-account-isolation.sh`: drives a message into each of two accounts and asserts routing isolation. |
 | `ci-smoke.html` | The unified demo/chat page served by the SaaS issuer. |

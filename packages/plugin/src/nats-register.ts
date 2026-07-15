@@ -67,6 +67,8 @@ export const REGISTER_UNAVAILABLE = JSON.stringify({ error: "unavailable", code:
 export type RegisterHandlerDeps = {
   /** This account's auth config (the verifier enforces its own issuer + aud). */
   auth: AuthConfig | undefined;
+  /** Agent-owned tenant namespace; primary confinement remains structural in NATS. */
+  tenant: string;
   /** peerId segment of the `.register` subject — routing ONLY, never trusted. */
   subjectPeerId: string;
   /** Raw request payload (plaintext JSON; the browser has no session key yet). */
@@ -186,6 +188,14 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     return;
   }
   const peerId = identity.peerId;
+
+  // Defense-in-depth: primary tenant binding is structural (the configured NATS
+  // namespace and scoped credentials). A signed claim, when present, must agree.
+  if (identity.tenant !== undefined && identity.tenant !== deps.tenant) {
+    logger?.error?.("webchannel: register JWT tenant does not match configured tenant — rejecting");
+    reply(REGISTER_UNAUTHORIZED);
+    return;
+  }
 
   // SECURITY (subject spoofing): identity is the verified JWT `sub`, never the
   // subject peerId. Reject a mismatch.
