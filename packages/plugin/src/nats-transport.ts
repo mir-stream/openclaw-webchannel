@@ -33,7 +33,8 @@ export type NatsConnectOptions = {
   /**
    * NATS user JWT (from SaaS-issued credentials for this agent). Passed in the
    * CONNECT command's `jwt` field. Required when the NATS account enforces JWT
-   * authentication (production). May be omitted for open dev servers.
+   * authentication in production. May be omitted only by isolated tests and
+   * low-level transport consumers; plugin serving always resolves credentials.
    */
   jwtCredential?: string;
   /**

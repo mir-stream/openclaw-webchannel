@@ -74,7 +74,7 @@ OUT (explicitly deferred):
 | `packages/client/src/e2e-browser-client.ts` | Playwright dial seam, not in barrel (verified); same 2 tests |
 | `e2e/dev-nats-roundtrip.test.ts`, `e2e/enrolled-jwt-roundtrip.test.ts` | drive the two seams above via handshake |
 | `packages/client/src/e2e-crypto-browser.test.ts` | tests `parseKeyExchange` only |
-| `e2e/local/drive-roundtrip.ts`, `e2e/local/browser-entry.ts` | registration-less handshake drivers (drive-roundtrip mints the old HS256 web-anon ticket); die with their harnesses — Stage 1 confirms which `.sh` consume them |
+| `e2e/local/drive-roundtrip.ts`, `e2e/local/browser-entry.ts` | registration-less handshake drivers (drive-roundtrip mints the old HS256 web-anon ticket). Stage 1 fact: no `e2e/local/*.sh` references either file (repository grep); they are orphaned from shell harnesses. |
 
 ### 3.2 REWRITE map (file:line, current role → change)
 
@@ -333,9 +333,9 @@ admission. So the migration is transport+identity substitution, not semantics lo
 
 | CI step | Harness | Unique assertions | Disposition |
 |---|---|---|---|
-| 8 | `run-jwt-register.sh` | first-principles JWT+PoP register mechanics | likely SUBSUMED by all-real → delete iff Stage 1 diff confirms |
-| 8b | `run-saas-issuer-register.sh` | real SaaS issuer + JWKS-over-HTTP | likely SUBSUMED (all-real uses the real issuer) → same |
-| 8d | `run-browser-jwt-register.sh` | real Chromium browser register | likely SUBSUMED (all-real drives a real browser) → same |
+| 8 | `run-jwt-register.sh` | static-file RS256 fixture/JWKS; production PoP challenge+register; register-delivered K; encrypted echo text; nonzero on register/error/timeout | **SUBSUMED → DELETE in Stage 6.** `run-all-real.sh` proves the same production PoP/register/K/encrypted-echo assertions with a stronger real issuer/JWKS HTTP trust chain and authenticated NATS. The only difference, `jwksFile` fixture wiring, is configuration-unit coverage rather than a unique protocol assertion. |
+| 8b | `run-saas-issuer-register.sh` | reference bootstrap RS256 issuance; live JWKS-over-HTTP verification; bootstrap peer/JWT-sub and agent-pin presence; production PoP register; encrypted echo | **SUBSUMED → DELETE in Stage 6.** all-real uses the reference enrollment issuer's real RS256/JWKS HTTP endpoints, obtains browser bootstrap from that same trust chain, drives PoP register, and proves encrypted echo. Its enrolled agent/browser credentials and explicit attested pin are stronger than dev-open/dev-key scaffolding. |
+| 8d | `run-browser-jwt-register.sh` | in-page X25519 + non-extractable Ed25519 generation; cross-origin bootstrap; production browser PoP register; encrypted echo text in real Chromium | **SUBSUMED → DELETE in Stage 6.** `all-real.mjs` bundles the same production browser entry pattern into headless Chromium and asserts the echoed text, while `run-all-real.sh` also supplies authenticated NATS and enrolled identity. No candidate-only browser assertion remains. |
 | 8f | `run-two-account-isolation.sh` | 2-account routing isolation | NOT subsumed → **MIGRATE** to the `setupTrustChain` enrolled pattern (per-account enrolled creds + attested identity; driver pins the enrolled key) |
 | 8c/8e/8g | enrolled-transport / all-real / derived-trust | — | KEEP (already devOpen-OFF, register-hop, real creds) |
 
@@ -360,11 +360,11 @@ inside the register token → expect `REGISTER_UNAUTHORIZED`.
 
 | # | Attack | Expected | Existing coverage? |
 |---|--------|----------|--------------------|
-| A1 | Relay tampers device X25519 key (`cnf.jwk`) in the register token | JWT verify fails → registration rejected | partial (JWT verify tests) — inventory in Stage 1, add the cnf-mutation case |
-| A2 | Relay tampers the plaintext register reply's wrapped-K material | browser fails closed and disconnects (`nats-client.ts:1261`); pin itself is NOT wire-mutable (SaaS-delivered) | partial (pin/unwrap tests) — inventory, extend |
-| A3 | Unregistered valid NATS user publishes `.in` | no agent turn starts | NEW — transport-level (see boundary note below) |
-| A4 | Bootstrap JWT peer/account/tenant/device binding substitution | verify fails | partial (register-pop-gate) — inventory, extend |
-| A5 | Register response missing wrapped K | terminal failure, no fallback code path exists | NEW — client-side test |
+| A1 | Relay tampers device X25519 key (`cnf.jwk`) in the register token | JWT verify fails → registration rejected | Partial: signed-token payload/signature tamper crosses the real verifier at `packages/plugin/src/jwt-middleware.test.ts:252`; structural cnf cases at `jwt-cnf.test.ts:105-174`. No signed cnf-specific mutation existed; add it. |
+| A2 | Relay tampers the plaintext register reply's wrapped-K material | browser fails closed and disconnects (`nats-client.ts:1261`); pin itself is NOT wire-mutable (SaaS-delivered) | Partial: ciphertext mutation/disconnect at `packages/client/src/nats-client-wrapped-key.test.ts:507`; wrap ciphertext/tag and wrong peer binding at `packages/plugin/src/late-join-decryptor.test.ts:176-213`. Ephemeral key, nonce, tag/ciphertext and wrong-local-pin matrix is incomplete. |
+| A3 | Unregistered valid NATS user publishes `.in` | no agent turn starts | No pre-existing subscription-boundary test. Added in Checkpoint A at `packages/plugin/src/nats-channel-admission-boundary.test.ts:36`. |
+| A4 | Bootstrap JWT peer/account/tenant/device binding substitution | verify fails | Partial: subject-vs-claim peer rejection at `packages/plugin/src/nats-register.test.ts:172`; PoP mismatch cases at `register-pop-gate.test.ts:47-120`; issuer/audience tamper at `jwt-middleware.test.ts:273-318`. Named account, tenant, and device binding mutations were not all present. |
+| A5 | Register response missing wrapped K | terminal failure, no fallback code path exists | Existing: `packages/client/src/nats-client-wrapped-key.test.ts:485` asserts terminal error and no handshake fallback. |
 
 Test-boundary requirements (codex R3):
 
@@ -428,6 +428,10 @@ loud; (b) client+plugin ship 0.3.0 in enforced 3-way lockstep. Stated in CHANGEL
 Compat tests locked in: reply-without-protocolVersion → non-fatal (exists — verify),
 matching v1 → proceeds, mismatched → terminal (exists — verify), and the
 protocol-version-lockstep suite stays green unmodified.
+
+Stage 1 verification: reply without `protocolVersion` is non-fatal at
+`packages/client/src/nats-client-wrapped-key.test.ts:704`; a matching v1 reply proceeds
+at `:669`; a mismatch is terminal at `:724` (malformed string mismatch at `:757`).
 
 CHANGELOG 0.3.0 BREAKING gains: auto-admission removed, devOpen removed, live
 handshake removed, static-creds serving deferred to P0-3, **`registration` (incl.

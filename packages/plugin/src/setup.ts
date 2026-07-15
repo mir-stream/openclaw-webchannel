@@ -81,7 +81,7 @@ type WebchannelSetupInput = {
   issuer?: string;
   audience?: string;
   // Connection / credential-mode passthrough.
-  credentialsMode?: "enrolled" | "static" | "open";
+  credentialsMode?: "enrolled" | "static";
 } & Record<string, unknown>;
 
 /** Minimal runtime log sink (the host passes `RuntimeEnv`). */
@@ -186,14 +186,9 @@ function mergePatch(
  * the `auth.jwt` sub-object is OMITTED ENTIRELY so nothing is guessed — only
  * `auth.strategy: "jwt"` is written (runtime derivation supplies the rest).
  *
- * `admission` is pinned to `register-hop` because this builder ALWAYS emits a
- * SaaS-enrolled jwt account (`auth.strategy: "jwt"`, `credentials.mode: "enrolled"`)
- * — exactly the case `resolveAdmissionMode` would infer register-hop for (jwt +
- * a viable register hop). Pinning it makes the register-over-NATS chat path work
- * out of the box; the legacy `auto` (X25519-handshake, no `.register` subject)
- * would silently break the browser's register request. Static/BYO-NATS accounts
- * do NOT reach this builder (they take the partial `buildAccountPatch` path), so
- * their `auto` default is unaffected.
+ * `admission` is pinned to `register-hop` because this builder always emits a
+ * SaaS-enrolled JWT account and authenticated registration is the only serving
+ * path.
  *
  * `nats.url` is intentionally OMITTED — the SaaS delivers the relay URL together
  * with the enrolled credentials at device-flow time (it is the rendezvous

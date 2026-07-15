@@ -48,7 +48,7 @@ function makeChannel(): { channel: NatsChannel; transport: FakeTransport } {
     transport as unknown as ConstructorParameters<typeof NatsChannel>[0],
     ACCOUNT,
     TENANT,
-    {}, // crypto mode
+    undefined,
   );
   return { channel, transport };
 }

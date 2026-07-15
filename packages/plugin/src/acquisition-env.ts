@@ -15,7 +15,7 @@
  *     synthesize a legacy `"default"` account's identity.
  *
  * This does NOT touch the connection/static-creds env
- * (WEBCHANNEL_NATS_URL/_USER_JWT/_USER_SEED/_CREDS/_DEV_OPEN) — those keep their
+ * (WEBCHANNEL_NATS_URL/_USER_JWT/_USER_SEED/_CREDS) — those keep their
  * runtime-connection override meaning (handled by the credential-source resolver).
  */
 

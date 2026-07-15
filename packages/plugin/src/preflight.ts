@@ -24,15 +24,13 @@
  *     add-time; documented there).
  *
  * Constraints honored (design §5): read EFFECTIVE/derived values everywhere;
- * fail-closed (a FAIL never downgrades to `auto` / never silently serves); the
+ * fail-closed (a FAIL never silently serves); the
  * readiness line reports the ENFORCED dmScope (per-account-channel-peer) that
  * webchannel imposes itself (`session-route.ts`) — the old dmScope="main" WARN
  * is gone because that leak is now structurally impossible; reuse the JWKS cache;
- * an `auto` account (no verifier / no JWKS) degrades to a graceful line.
  */
 
 import { JWKSCache, JwksUnavailableError } from "./jwks.js";
-import type { AdmissionMode } from "./nats-admission.js";
 import {
   connectNatsCredentialSource,
   type ConnectNatsDeps,
@@ -76,11 +74,11 @@ export type JwksReadiness = { keyCount: number } | { error: string };
 
 export type AccountReadinessInput = {
   accountId: string;
-  /** The RESOLVED admission mode (from `resolveAdmissionMode`). */
-  admission: AdmissionMode;
+  /** Authenticated registration is the only admission mode. */
+  admission: "register-hop";
   /**
    * EFFECTIVE (derived) issuer — read from the DERIVED `accountAuth`, never raw
-   * `account.auth` (design §5). Absent for an `auto`/non-jwt account, or when the
+   * `account.auth` (design §5). Absent when the
    * verifier could not be built.
    */
   issuer?: string;
@@ -143,16 +141,6 @@ export function formatAccountReadiness(
         `[webchannel] account "${id}" FAIL · verifier build failed: ${input.buildError}` +
         ` · issuer=${input.issuer ?? '(unresolved)'} · aud=${input.audience ?? '(unresolved)'}` +
         ` · admission=${input.admission}`,
-    };
-  }
-
-  // ── `auto` account: no `channels.webchannel.auth` verifier and no JWKS at all
-  //    (invariant 1). Degrade gracefully — this is NOT a failure, it is a
-  //    bring-your-own-NATS / handshake-admission account.
-  if (input.admission === 'auto') {
-    return {
-      verdict: 'READY',
-      line: `[webchannel] account "${id}" READY · admission=auto · (no JWT verifier)${tail}`,
     };
   }
 

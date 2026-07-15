@@ -270,6 +270,28 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         await verifier(`${h}.${tamperedPayload}.${sig}`),
       ).toBeNull();
     });
+
+    it("rejects a relay-mutated cnf.jwk through the real signature verifier", async () => {
+      await ensureKeys();
+      const verifier = makeVerifier(mockJwksServer(publishedJwks));
+      const now = nowSec();
+      const originalDeviceKey = Buffer.alloc(32, 1).toString("base64url");
+      const token = await mintToken(
+        {
+          iss: ISSUER,
+          aud: AUDIENCE,
+          sub: "user-abc",
+          iat: now,
+          exp: now + 60,
+          cnf: { jwk: { kty: "OKP", crv: "X25519", x: originalDeviceKey } },
+        },
+        primaryPrivateKey,
+      );
+      const [header, payload, signature] = token.split(".");
+      const claims = JSON.parse(Buffer.from(payload!, "base64url").toString("utf8"));
+      claims.cnf.jwk.x = Buffer.alloc(32, 2).toString("base64url");
+      expect(await verifier(`${header}.${b64url(claims)}.${signature}`)).toBeNull();
+    });
   });
 
   // ── Scenario 3: expired token rejection ────────────────────────────────────

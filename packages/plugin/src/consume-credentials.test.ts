@@ -139,16 +139,6 @@ describe("consumeCredentialSource", () => {
     expect(createEnrolled).not.toHaveBeenCalled();
   });
 
-  it("open source → delegates to connectNatsCredentialSource unchanged", async () => {
-    const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}) }) as never);
-    const source: NatsCredentialSource = { mode: "open", url: "ws://open" };
-    const result = await consumeCredentialSource(source, "default", { transportFactory });
-    expect(result.status).toBe("connected");
-    expect(transportFactory).toHaveBeenCalledWith(
-      expect.objectContaining({ url: "ws://open" }),
-    );
-  });
-
   it("static source → delegates to connectNatsCredentialSource unchanged", async () => {
     const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}) }) as never);
     const makeSigner = vi.fn(() => async () => "sig");

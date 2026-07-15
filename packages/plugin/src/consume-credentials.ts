@@ -14,7 +14,7 @@
  *                 "creds missing" result so the caller applies account-scoped
  *                 graceful degradation (skip the account, actionable log) — NO
  *                 runtime enroll, NO polling, NO hang.
- *   - open / static → unchanged: delegate to `connectNatsCredentialSource`
+ *   - static → delegate to `connectNatsCredentialSource`
  *                 (these already carry their auth material; no SaaS issuer).
  *
  * This keeps the connection/static-creds env overrides
@@ -42,7 +42,7 @@ export type ConsumeResult =
       connection: ConnectedNats;
       /**
        * The URL actually dialed. For `enrolled` this is the SaaS-delivered
-       * `natsUrl` when present (else the resolver fallback); for `open`/`static`
+       * `natsUrl` when present (else the resolver fallback); for `static`
        * it is `source.url`. Surfaced so callers can log the EFFECTIVE relay,
        * which — for enrolled — may differ from the resolver's `source.url`.
        */
@@ -51,7 +51,7 @@ export type ConsumeResult =
        * F2 — the agent's SaaS-attested static X25519 identity key pair, present
        * ONLY on the `enrolled` path when the persisted `credentials.json` carries
        * a valid `identityKey`. The register-hop channel wraps K under this so the
-       * browser can authenticate it. Absent for open/static sources (no enrolled
+       * browser can authenticate it. Absent for static sources (no enrolled
        * identity) and for pre-F2 / malformed enrolled creds — a register-hop
        * account then fail-closed skips serving.
        */
@@ -80,7 +80,7 @@ export async function consumeCredentialSource(
   deps: ConsumeCredentialSourceDeps = {},
 ): Promise<ConsumeResult> {
   if (source.mode !== "enrolled") {
-    // open / static: connect directly (auth material is already present).
+    // Static: connect directly (auth material is already present).
     const connection = await connectNatsCredentialSource(source, deps);
     return { status: "connected", connection, dialedUrl: source.url };
   }

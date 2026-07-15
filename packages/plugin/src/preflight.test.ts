@@ -98,20 +98,6 @@ describe("formatAccountReadiness (Gate B)", () => {
     expect(r.line).not.toContain("leaks transcripts across users");
   });
 
-  it("auto account → graceful degraded READY line (no verifier / no JWKS)", () => {
-    const r = formatAccountReadiness({
-      accountId: "byo",
-      admission: "auto",
-      dmSecurity: "open",
-    });
-    expect(r.verdict).toBe("READY");
-    expect(r.line).toContain("admission=auto");
-    expect(r.line).toContain("(no JWT verifier)");
-    // No issuer/JWKS fields on an auto account.
-    expect(r.line).not.toContain("JWKS");
-    // Even the auto degrade line reports the enforced scope truthfully.
-    expect(r.line).toContain("dmScope=per-account-channel-peer (webchannel-enforced)");
-  });
 });
 
 describe("evaluateAddPreflight (Gate A, pure)", () => {
