@@ -2,7 +2,7 @@
 
 > **ARCHIVED 2026-07-15.** This comparison predates the NATS-only surface.
 
-> 📌 **Single source of truth for current working state: [`STATUS.md`](STATUS.md).** This is a research artifact (2026-06-19); its adopt-candidates are recommendations, not committed scope.
+> 📌 **Single source of truth for current working state: [`STATUS.md`](../STATUS.md).** This is a research artifact (2026-06-19); its adopt-candidates are recommendations, not committed scope.
 
 > Status: draft (2026-06-19). Single-pass research + documentation. No code changes.
 > Generated as the "gap-analysis" research seed deliverable

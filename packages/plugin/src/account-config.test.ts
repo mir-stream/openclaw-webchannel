@@ -18,18 +18,23 @@ import {
   resolveReadCredentialPath,
   loadPersistedEnrolledCreds,
 } from "./account-config.js";
+import { planAccounts } from "./multiplex.js";
 
 const HOME = "/home/test";
 
 describe("removed auth.ticketParam migration", () => {
-  it("rejects the deprecated flat config through account resolution", () => {
+  it("rejects the deprecated flat config through the NATS account planning seam", () => {
     const cfg = { channels: { webchannel: { auth: { strategy: "jwt", ticketParam: "ticket" } } } };
-    expect(() => resolveWebchannelAccountConfig(cfg)).toThrow(/removed config auth\.ticketParam.*channels add/s);
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /removed config auth\.ticketParam.*openclaw channels add/s,
+    );
   });
 
-  it("rejects the deprecated named-account leaf through account resolution", () => {
+  it("rejects the deprecated named-account leaf through the NATS account planning seam", () => {
     const cfg = { channels: { webchannel: { accounts: { work: { auth: { ticketParam: "jwt" } } } } } };
-    expect(() => resolveWebchannelAccountConfig(cfg, "work")).toThrow(/removed config auth\.ticketParam.*channels add/s);
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /removed config auth\.ticketParam.*openclaw channels add/s,
+    );
   });
 });
 

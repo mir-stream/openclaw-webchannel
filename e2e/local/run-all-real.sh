@@ -330,15 +330,26 @@ done
 # P0-1 T3b: a real gateway boot must expose no browser-facing socket endpoint.
 # A missing route may answer 404/400 or close the request; it must never complete
 # a WebSocket switching-protocols response.
-PROBE_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+set +e
+PROBE_STATUS=$(curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-  "http://127.0.0.1:$GW_PORT/webchannel/ws" || true)
+  "http://127.0.0.1:$GW_PORT/webchannel/ws")
+PROBE_RC=$?
+set -e
+if [ "$PROBE_RC" -eq 28 ]; then
+  echo "[run-all-real] FAIL — browser-facing socket probe timed out (connect=2s, total=5s)" >&2
+  exit 2
+fi
 if [ "$PROBE_STATUS" = "101" ]; then
   echo "[run-all-real] FAIL — browser-facing socket endpoint accepted an upgrade" >&2
   exit 2
 fi
-echo "[run-all-real] ✓ browser-facing socket probe refused (HTTP ${PROBE_STATUS:-connection-closed})"
+if [ "$PROBE_RC" -ne 0 ]; then
+  echo "[run-all-real] ✓ browser-facing socket probe refused (connection closed; curl rc=$PROBE_RC)"
+else
+  echo "[run-all-real] ✓ browser-facing socket probe refused (explicit HTTP $PROBE_STATUS)"
+fi
 
 # ---------------------------------------------------------------------------
 # 7. Run the REAL-BROWSER Playwright driver (NKEY-auth + PoP register).

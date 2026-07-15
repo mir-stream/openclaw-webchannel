@@ -11,7 +11,7 @@ seed(`.ouroboros/*`)·평가 점수에 "AC 100% / complete"가 보여도, 그것
 | [`archive/REVIEW_2026-07-02.md`](archive/REVIEW_2026-07-02.md) | 통합 데모 직후 전체 코드 리뷰 | 보관된 리뷰 스냅샷 |
 | [`REVIEW_2026-07-15.md`](REVIEW_2026-07-15.md) | 저장소 전체 리뷰와 우선순위 실행안. auto-admission·Gateway-WS 완전 삭제, 전달 보장, multi-agent/HA 및 reference hardening | **현재 실행 우선순위** |
 | [`archive/PLAN.md`](archive/PLAN.md) | 초기 범위·아키텍처·단계 | 보관된 설계 기록 |
-| [`AUTH.md`](AUTH.md) | 인증·신원 모델 (ConnectionVerifier seam, 빌트인 전략) | 설계 (라이브 검증됨) |
+| [`AUTH.md`](AUTH.md) | 인증·신원 모델 (`assertJwtAuthConfig` + NATS register-hop 검증) | 설계 (라이브 검증됨) |
 | [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) | E2E NATS relay 신뢰 결합 + 디바이스-플로우 온보딩 | ✅ 라이브 검증됨 (live-proven) |
 | [`PACKAGING.md`](PACKAGING.md) | 패키지 구조·배포/ClawHub 체크리스트 | 일부 미완 |
 | [`archive/RESEARCH.md`](archive/RESEARCH.md) | OpenClaw 내부 API·경로 조사 노트 | 보관된 레퍼런스 |

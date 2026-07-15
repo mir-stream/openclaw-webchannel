@@ -84,7 +84,7 @@ long-lived branches:
 | JWKS rotation + eviction (admin-driven, 500→401 fix) | `jwks.ts`; `demo/verify-rotate.mjs`, `verify-evict.mjs` |
 | Trust chain, NATS user-cred minting, external (Synadia/NGS) account signing | `packages/saas`; `external-nats-account.test.ts`, `nats-permissions-realserver.test.ts`; demo `DEMO_RELAY=synadia` live |
 | Public API boundary (barrel = contract; internals unreachable) | `examples/minimal-consumer/test/boundary.test.mjs`, `examples/webchannel-app/test/no-internal-imports.test.mjs` (CI) |
-| Stability hardening from the 2026-07-02 full review | **13 findings fixed + pushed** (C1 crash guard, S1 reconnect, A1 OOM sweeper, S2 map ceilings, S3, A2/A3, CL1–3 incl. terminal-auth state + keepalive liveness, O1/O3/O-min8) — [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md) |
+| Stability hardening from the 2026-07-02 full review | **13 findings fixed + pushed** (C1 crash guard, S1 reconnect, A1 OOM sweeper, S2 map ceilings, S3, A2/A3, CL1–3 incl. terminal-auth state + keepalive liveness, O1/O3/O-min8) — [`REVIEW_2026-07-02.md`](archive/REVIEW_2026-07-02.md) |
 
 ## What does NOT work yet / open items
 

@@ -16,13 +16,8 @@ vi.mock("openclaw/plugin-sdk/approval-handler-runtime", async (importOriginal) =
 
 import { NullPeerChannel } from "./channel-contract.js";
 class FakePeerChannel extends NullPeerChannel {
-  private approvalHandler?: (peerId: string, id: string, decision: any) => void;
-  private historyHandler?: (peerId: string, request: any) => void;
-  setApprovalDecisionHandler(handler: any) { this.approvalHandler = handler; }
   setFirstLivenessHandler(_handler: any) {}
-  setLoadHistoryHandler(handler: any) { this.historyHandler = handler; }
   setHistoryEnabled(_enabled: boolean) {}
-  registerConnection(ws: any, peerId = "web-anon") { ws.on("message", (raw: any) => { try { const frame = JSON.parse(String(raw)); if (frame.type === "approval_decision" && ["allow-once", "allow-always", "deny"].includes(frame.decision)) this.approvalHandler?.(peerId, frame.id, frame.decision); if (frame.type === "load_history") this.historyHandler?.(peerId, { ...(frame.before ? { before: frame.before } : {}), ...(frame.limit ? { limit: frame.limit } : {}) }); } catch {} }); }
 }
 import type { ApprovalRequestPayload } from "./channel-contract.js";
 import {
@@ -518,34 +513,6 @@ describe("webchannel approval decision -> gateway", () => {
     );
   });
 
-  it("routes an inbound approval_decision frame through the transport handler", () => {
-    const transport = new FakePeerChannel();
-    const handler = vi.fn();
-    transport.setApprovalDecisionHandler(handler);
-
-    // Reach the private parse path the same way a real ws 'message' would, by
-    // invoking the registered listener with a JSON approval_decision frame.
-    const fakeWs: any = {
-      readyState: 1,
-      listeners: {} as Record<string, (data: any) => void>,
-      on(event: string, cb: (data: any) => void) {
-        this.listeners[event] = cb;
-      },
-      send: vi.fn(),
-    };
-    (transport as any).registerConnection(fakeWs);
-    fakeWs.listeners.message(
-      JSON.stringify({ type: "approval_decision", id: "exec-9", decision: "allow-always" }),
-    );
-    expect(handler).toHaveBeenCalledWith("web-anon", "exec-9", "allow-always");
-
-    // A malformed decision is ignored (defensive guard).
-    handler.mockClear();
-    fakeWs.listeners.message(
-      JSON.stringify({ type: "approval_decision", id: "exec-9", decision: "bogus" }),
-    );
-    expect(handler).not.toHaveBeenCalled();
-  });
 });
 
 describe("webchannel approver resolution", () => {
