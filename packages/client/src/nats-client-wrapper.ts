@@ -227,7 +227,17 @@ export class WebChannelNATSClient {
     // abort words leave held entries intact (mirroring the server, where only the
     // explicit command clears the buffer).
     if (isLikelyAbortText(trimmed)) {
-      if (isExplicitStop(trimmed)) this.markHeldRetracted();
+      if (isExplicitStop(trimmed)) {
+        this.markHeldRetracted();
+        // §3.4: /stop means "stop everything". Also locally finalize the live
+        // turn-in-flight state (working drafts AND the typing indicator) so the
+        // composer unwedges even when a turn dies WITHOUT a disconnect (agent
+        // dies with the socket alive) — the staleness valve only arms on
+        // reconnect, so without this /stop cannot rescue a socket-alive wedge.
+        // Covers both a working-draft hang and a pre-first-token typing-only
+        // hang. NL abort words do NOT call this.
+        this.finalizeLocalTurnState();
+      }
       this.publish(trimmed);
       return;
     }
@@ -309,9 +319,19 @@ export class WebChannelNATSClient {
    * snapshot would mis-adopt or duplicate. Moving to the tail makes a released
    * bubble an ordinary send in an ordinary position.
    *
-   * Re-entrancy: snapshot-and-clear `held[]` BEFORE the per-bubble setState calls
-   * — each setState fires listeners synchronously mid-loop, and a listener
-   * calling retract()/send() re-entrantly must see a consistent `held[]`.
+   * Re-entrancy: drain `held[]` LIVE — `shift()` one entry per iteration rather
+   * than snapshot-and-clear before the loop. Each per-bubble `setState()` fires
+   * listeners synchronously mid-loop; a listener calling `send()` re-entrantly
+   * must NOT jump the queue. With a live drain the still-unreleased entries are
+   * genuinely present in `held[]`, so `shouldHold()` (`held.length > 0`) still
+   * holds that new message and the continuing `while` loop picks it up in FIFO
+   * order — a snapshot-and-clear would leave `held[]` empty mid-loop and let the
+   * re-entrant send publish AHEAD of the not-yet-released entries (M1, M3, M2).
+   * Two behaviors this preserves: (a) a re-entrant `retract()` of a not-yet-
+   * released held item splices it out of the live array, so `shift()` never
+   * reaches it — its publish is cancelled; (b) the last entry's listener calling
+   * `send()` runs only AFTER that entry's `sendUserMessage` already fired, so
+   * order stays correct.
    */
   private maybeRelease(): void {
     if (
@@ -322,10 +342,8 @@ export class WebChannelNATSClient {
     ) {
       return;
     }
-    const releasing = this.held.slice();
-    this.held.length = 0;
-
-    for (const { localId, text } of releasing) {
+    while (this.held.length > 0) {
+      const { localId, text } = this.held.shift()!;
       const wireId = this.client.sendUserMessage(text);
       const bubble = this.state.messages.find((m) => m.id === localId);
       // A re-entrant listener may have already removed the bubble; the text is
@@ -377,6 +395,36 @@ export class WebChannelNATSClient {
       return m;
     });
     if (changed) this.setState({ messages });
+  }
+
+  /**
+   * §3.4: finalize the local turn-in-flight state — flip EVERY live `working`
+   * draft to `working: false` in place (id/text untouched, staleness-watch entry
+   * dropped) AND clear the `isTyping` indicator. Both feed `turnInFlight()`, so
+   * clearing them is what actually unwedges the composer. Called only from the
+   * explicit-`/stop` branch of send(): "stop everything" must unwedge
+   * immediately, not wait for a `turn_settled`/final frame that may never arrive
+   * (agent died with the socket alive). Covers BOTH a working-draft hang and a
+   * pre-first-token typing-only hang (isTyping true, zero drafts). Same
+   * self-healing invariant as the staleness valve: if the turn is actually still
+   * alive, a later `typing`/`progress` frame re-sets the state it cleared.
+   */
+  private finalizeLocalTurnState(): void {
+    let changed = false;
+    const messages = this.state.messages.map((m) => {
+      if (m.working) {
+        changed = true;
+        this.staleDraftWatch.delete(m.id);
+        return { ...m, working: false };
+      }
+      return m;
+    });
+    const clearTyping = this.state.isTyping === true;
+    if (!changed && !clearTyping) return;
+    this.setState({
+      ...(changed ? { messages } : {}),
+      ...(clearTyping ? { isTyping: false } : {}),
+    });
   }
 
   /**

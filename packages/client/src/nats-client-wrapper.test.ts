@@ -1552,4 +1552,121 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(spy).toHaveBeenCalledWith("queued");
     expect(pendingBubbles(w)).toHaveLength(0);
   });
+
+  // 17. Fix A: a re-entrant send() from a mid-release listener must NOT jump the
+  //     queue — the live drain keeps FIFO (M1, M2, M3), never M1, M3, M2.
+  it("17: a re-entrant send during the release loop stays FIFO (live drain, no queue-jump)", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+    w.send("M1");
+    w.send("M2"); // latched behind M1 → held [M1, M2]
+    expect(spy).not.toHaveBeenCalled();
+
+    // Inject a re-entrant send("M3") ONLY once M1 has actually been released
+    // mid-loop (its bubble is present and no longer pending) — that lands the
+    // injected send INSIDE the release loop while M2 is still queued in held[].
+    // Gating on the released M1 (not merely the first setState) is what makes
+    // this guard the fix: snapshot-and-clear has held[] empty at that instant so
+    // M3 would publish immediately → ["M1","M3","M2"]; the live drain keeps M2
+    // queued so M3 holds and the loop drains it last → ["M1","M2","M3"].
+    let injected = false;
+    const unsub = w.subscribe(() => {
+      if (injected) return;
+      if (!messages(w).some((m) => m.text === "M1" && m.pending === false)) return;
+      injected = true;
+      w.send("M3");
+    });
+
+    // Settle the turn → release loop drains [M1, M2] live; the M1 setState fires
+    // the listener which calls send("M3"). Because M2 is still in held[], M3 is
+    // HELD (not published now) and the continuing loop drains it after M2.
+    deliver(w, { type: "agent_message", id: "webchannel-A", text: "the reply", turnId: "T" });
+    unsub();
+
+    // Wire/publish order: FIFO, NOT M1, M3, M2.
+    expect(spy.mock.calls.map((c) => c[0])).toEqual(["M1", "M2", "M3"]);
+    // Display order: the reply, then the three user chips in FIFO at the tail.
+    const userTexts = messages(w).filter((m) => m.role === "user").map((m) => m.text);
+    expect(userTexts).toEqual(["M1", "M2", "M3"]);
+    expect(held(w)).toHaveLength(0);
+    expect(pendingBubbles(w)).toHaveLength(0);
+  });
+
+  // 18. Fix B1: explicit /stop finalizes a live working draft in place, unwedging
+  //     the composer even with no disconnect (socket-alive agent death).
+  it("18: explicit /stop finalizes a live working draft in place and unlocks the composer", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+
+    // A working draft is live (its final frame is about to be lost — no settle).
+    deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
+
+    // Explicit /stop: published immediately AND finalizes the draft in place.
+    w.send("/stop");
+    expect(spy).toHaveBeenCalledWith("/stop");
+    const draft = messages(w).find((m) => m.id === "webchannel-d")!;
+    expect(draft.working).toBe(false); // flipped in place
+    expect(draft.id).toBe("webchannel-d"); // id untouched
+    expect(draft.text).toBe("partial…"); // text untouched
+
+    // The wedge is unlocked: a subsequent send publishes IMMEDIATELY (not held).
+    spy.mockClear();
+    w.send("next");
+    expect(spy).toHaveBeenCalledWith("next");
+    expect(pendingBubbles(w)).toHaveLength(0);
+    expect(held(w)).toHaveLength(0);
+  });
+
+  // 18b. Fix B1 self-heal: a post-/stop progress on the same draft id re-flips it
+  //      working (the turn was actually alive), with no duplicate bubble.
+  it("18b: a post-/stop progress re-flips the same draft working (self-heal, no duplicate)", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    w.send("/stop");
+    expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false);
+
+    deliver(w, { type: "progress", id: "webchannel-d", text: "back alive…", turnId: "T" });
+    const drafts = messages(w).filter((m) => m.id === "webchannel-d");
+    expect(drafts).toHaveLength(1); // no duplicate bubble
+    expect(drafts[0].working).toBe(true); // re-engaged
+  });
+
+  // 18c. Fix B1 scope: an NL abort word ("wait") must NOT finalize a working draft.
+  it("18c: an NL abort word does not finalize a live working draft (only explicit /stop does)", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+
+    w.send("wait"); // NL abort → bypasses the hold, published, but NO finalize
+    expect(spy).toHaveBeenCalledWith("wait");
+    expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
+  });
+
+  // 18d. Fix B1: explicit /stop rescues an isTyping-ONLY wedge (pre-first-token
+  //      hang: typing frame, turn dies before any progress, socket alive).
+  it("18d: explicit /stop clears an isTyping-only wedge (no working draft) and unlocks the composer", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+
+    deliver(w, { type: "typing" }); // isTyping:true, zero working drafts
+    expect(w.getState().isTyping).toBe(true);
+
+    w.send("/stop");
+    expect(spy).toHaveBeenCalledWith("/stop");
+    expect(w.getState().isTyping).toBe(false); // typing indicator cleared
+
+    // Composer unlocked: a subsequent send publishes immediately (not held).
+    spy.mockClear();
+    w.send("next");
+    expect(spy).toHaveBeenCalledWith("next");
+    expect(pendingBubbles(w)).toHaveLength(0);
+    expect(held(w)).toHaveLength(0);
+  });
 });
