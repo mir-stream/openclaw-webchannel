@@ -2,8 +2,9 @@
 
 > Work item: [`P0.md`](P0.md) §"P0-2" (lines 90–173).
 > Branch: `feat/p0-2-auto-admission-removal`, stacked on `feat/p0-1-gateway-ws-removal` (PR #41).
-> Status: DRAFT v8 (codex R1–R6 folded in; R6: guard schema-exclusion, ledger-first stage wording, A3
-> transport-level boundary, baseline ledger arithmetic, saas comment sweep).
+> Status: **CONVERGED v9** — codex gpt-5.6-sol adversarial review, 7 rounds
+> (findings: 2B+2M → 1B+3M(B refuted) → 0B+2M → 0B+3M → 0B+1M → 0B+1M → **0B+0M**).
+> R7's three MINORs folded below. This document is the implementation spec.
 
 ## 1. Goal and invariants
 
@@ -134,6 +135,12 @@ by its existing cap loop (:315-322).
 
 **`packages/plugin/src/preflight.ts`** — auto readiness branch (:149-156) + admission
 field (:79-80) → register-hop-only.
+
+**`packages/plugin/src/nats-transport.ts`** — comments only (codex R7): option
+docs (:30,:36) and the internal branch note (:236) still frame credential-less
+construction as supported "open dev" behavior. Reframe as test/low-level transport
+capability (the generic transport stays permissive by design — its production
+callers all come through the credential source, which no longer has an open mode).
 
 **`packages/plugin/src/setup.ts`** — already writes `admission:"register-hop"` +
 `credentials.mode:"enrolled"` (:238) — KEEP that; but (codex R4) the TYPE surface is
@@ -369,6 +376,11 @@ Test-boundary requirements (codex R3):
 - **A2 enumerates the actually-mutable wire fields individually**: wrapped ephemeral
   public key, nonce, ciphertext/tag — each mutation → unwrap failure + disconnect —
   plus one wrong-local-pin case. (The pin never rides the relay.)
+- **A4 enumerates each required binding individually** (codex R7, per P0.md:162):
+  four mutation cases — `peerId` (subject-vs-claim mismatch), `accountId`
+  (cross-account token), `tenant`, and device (`cnf.jwk`, shared with A1) — each →
+  registration rejected. Not "inventory, extend" hand-waving: each binding gets a
+  named test.
 - **A3 must prove the SUBSCRIPTION boundary, not dispatch behavior** (codex R4):
   injecting into the dispatch function bypasses exactly the property under test.
   The test asserts, at the transport level (recording/real transport), that (i) at
@@ -524,9 +536,9 @@ regressions live):
 - **Documented narrow exclusions** (each with an inline comment naming why): the
   migration-detector seams that legitimately CONTAIN the removed literals —
   `account-config.ts` + its test, `nats-credential-source.ts` + its test (env
-  detection + messages), **`openclaw.plugin.json`** (the R5 schema rule KEEPS the
-  deprecated literals there — without this exclusion the guard fails
-  deterministically; codex R6) — plus `CHANGELOG.md`, `docs/archive`,
+  detection + messages), **`openclaw.plugin.json`** (needed specifically for the
+  `devOpen`/`DEV_OPEN` patterns — the kept literals `auto`/`open`/`anonymous` are
+  not in PATTERN; codex R6/R7) — plus `CHANGELOG.md`, `docs/archive`,
   `docs/review-2026-07-15`, and the guard scripts themselves.
 
 Canary-test every addition (planted symbol per new pattern AND per new path root;
