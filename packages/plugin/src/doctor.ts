@@ -10,7 +10,11 @@ import type {
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { collectStatusIssuesFromLastError } from "openclaw/plugin-sdk/status-helpers";
 
-import { ACQUISITION_IDENTITY_ENV_KEYS, hasWebchannelConfig } from "./acquisition-env.js";
+import {
+  EFFECTIVE_DEPRECATED_ACQUISITION_ENV_KEYS,
+  hasWebchannelConfig,
+  IGNORED_ACQUISITION_IDENTITY_ENV_KEYS,
+} from "./acquisition-env.js";
 import {
   loadPersistedEnrolledCreds,
   type PersistedEnrolledCreds,
@@ -202,17 +206,30 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
       fix: "Move the intended default account fields under accounts.default.",
     });
   }
-  const deprecated = hasWebchannelConfig(cfg)
-    ? ACQUISITION_IDENTITY_ENV_KEYS.filter((key) => env[key] !== undefined)
+  const ignoredDeprecated = hasWebchannelConfig(cfg)
+    ? IGNORED_ACQUISITION_IDENTITY_ENV_KEYS.filter((key) => env[key] !== undefined)
     : [];
-  if (deprecated.length > 0) {
+  if (ignoredDeprecated.length > 0) {
     findings.push({
       accountId: "default",
       checkId: "deprecated-acquisition-env",
       kind: "config",
       severity: "warn",
-      message: `Deprecated acquisition env is ignored because channels.webchannel config is authoritative: ${deprecated.join(", ")}.`,
-      fix: `Unset ${deprecated.join(", ")} and use openclaw channels add for account configuration.`,
+      message: `Deprecated acquisition env is ignored because channels.webchannel config is authoritative: ${ignoredDeprecated.join(", ")}.`,
+      fix: `Unset ${ignoredDeprecated.join(", ")} and use openclaw channels add for account configuration.`,
+    });
+  }
+  const effectiveDeprecated = hasWebchannelConfig(cfg)
+    ? EFFECTIVE_DEPRECATED_ACQUISITION_ENV_KEYS.filter((key) => env[key] !== undefined)
+    : [];
+  if (effectiveDeprecated.length > 0) {
+    findings.push({
+      accountId: "default",
+      checkId: "deprecated-acquisition-env",
+      kind: "config",
+      severity: "warn",
+      message: `Deprecated acquisition env is still effective and overrides configured SaaS settings: ${effectiveDeprecated.join(", ")}. Support will be removed after 2026-08-15.`,
+      fix: `Move ${effectiveDeprecated.join(", ")} to channels.webchannel configuration, then unset it.`,
     });
   }
   return findings;

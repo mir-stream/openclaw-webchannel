@@ -89,6 +89,23 @@ describe("evaluateWebchannelDoctor findings", () => {
     }
   });
 
+  it("C11 distinguishes ignored tenant env from the still-effective SaaS override", () => {
+    const config = cfg({ dmSecurity: "allowlist" });
+    const findings = evaluateWebchannelDoctor(config, {
+      env: {
+        WEBCHANNEL_TENANT: "old-tenant",
+        WEBCHANNEL_SAAS_BASE_URL: "https://legacy-saas.example",
+      },
+    }).filter((finding) => finding.checkId === "deprecated-acquisition-env");
+
+    expect(findings).toHaveLength(2);
+    expect(findings.find((finding) => finding.message.includes("WEBCHANNEL_TENANT"))?.message)
+      .toContain("is ignored");
+    const saas = findings.find((finding) => finding.message.includes("WEBCHANNEL_SAAS_BASE_URL"));
+    expect(saas?.message).toContain("still effective");
+    expect(saas?.message).toContain("2026-08-15");
+  });
+
   it("keeps healthy compatibility fixtures at zero findings", () => {
     const fixtures = [
       cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
