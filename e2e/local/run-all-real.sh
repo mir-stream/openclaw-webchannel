@@ -327,28 +327,48 @@ for i in $(seq 1 240); do
   fi
 done
 
-# P0-1 T3b: a real gateway boot must expose no browser-facing socket endpoint.
-# A missing route may answer 404/400 or close the request; it must never complete
-# a WebSocket switching-protocols response.
+# P0-1 T3b: a real gateway boot must expose no browser-facing WEBCHANNEL socket
+# endpoint. Reality check (probed live): the OpenClaw CORE gateway accepts a WS
+# upgrade on ANY path of its port and immediately issues its authenticated
+# control-protocol `connect.challenge` — that surface is core OpenClaw, not
+# ours, and cannot be removed by this plugin. The correct invariant is
+# therefore INDISTINGUISHABILITY: /webchannel/ws must behave exactly like an
+# unregistered path (same status; if 101, the first frame is the core
+# connect.challenge and carries no webchannel-protocol markers).
+t3b_probe() {
+  # $1=path $2=outfile; prints http_code; rc propagated (28 = held open, OK)
+  curl -sS --connect-timeout 2 --max-time 5 -o "$2" -w '%{http_code}' \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "http://127.0.0.1:$GW_PORT$1"
+}
 set +e
-PROBE_STATUS=$(curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' \
-  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
-  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-  "http://127.0.0.1:$GW_PORT/webchannel/ws")
-PROBE_RC=$?
+WC_STATUS=$(t3b_probe /webchannel/ws "$OCH/t3b-webchannel.out"); WC_RC=$?
+CN_STATUS=$(t3b_probe /p0-1-unregistered-canary "$OCH/t3b-canary.out"); CN_RC=$?
 set -e
-if [ "$PROBE_RC" -eq 28 ]; then
-  echo "[run-all-real] FAIL — browser-facing socket probe timed out (connect=2s, total=5s)" >&2
+if [ "$WC_RC" -ne 0 ] && [ "$WC_RC" -ne 28 ]; then
+  echo "[run-all-real] FAIL — T3b probe errored (curl rc=$WC_RC)" >&2
   exit 2
 fi
-if [ "$PROBE_STATUS" = "101" ]; then
-  echo "[run-all-real] FAIL — browser-facing socket endpoint accepted an upgrade" >&2
+if [ "$WC_STATUS" != "$CN_STATUS" ]; then
+  echo "[run-all-real] FAIL — /webchannel/ws ($WC_STATUS) differs from unregistered path ($CN_STATUS): a webchannel-specific route exists" >&2
   exit 2
 fi
-if [ "$PROBE_RC" -ne 0 ]; then
-  echo "[run-all-real] ✓ browser-facing socket probe refused (connection closed; curl rc=$PROBE_RC)"
+if [ "$WC_STATUS" = "101" ]; then
+  # LC_ALL=C + -a: the capture starts with a raw WS frame byte (0x81). BSD grep
+  # in a UTF-8 locale silently fails to match lines carrying invalid multibyte
+  # sequences, and binary heuristics vary across grep implementations.
+  if ! LC_ALL=C grep -aq 'connect.challenge' "$OCH/t3b-webchannel.out"; then
+    echo "[run-all-real] FAIL — 101 on /webchannel/ws without the core connect.challenge (unknown upgrade handler)" >&2
+    exit 2
+  fi
+  if LC_ALL=C grep -aqE '"type"[[:space:]]*:[[:space:]]*"(agent_message|history|approval_request|approval_snapshot|typing|commands|ack)"' "$OCH/t3b-webchannel.out"; then
+    echo "[run-all-real] FAIL — /webchannel/ws answered with webchannel-protocol frames" >&2
+    exit 2
+  fi
+  echo "[run-all-real] ✓ T3b: /webchannel/ws is indistinguishable from an unregistered path (core gateway challenge only)"
 else
-  echo "[run-all-real] ✓ browser-facing socket probe refused (explicit HTTP $PROBE_STATUS)"
+  echo "[run-all-real] ✓ T3b: no upgrade accepted on /webchannel/ws (HTTP $WC_STATUS, matches unregistered path)"
 fi
 
 # ---------------------------------------------------------------------------
