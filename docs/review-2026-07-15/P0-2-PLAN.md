@@ -2,7 +2,7 @@
 
 > Work item: [`P0.md`](P0.md) §"P0-2" (lines 90–173).
 > Branch: `feat/p0-2-auto-admission-removal`, stacked on `feat/p0-1-gateway-ws-removal` (PR #41).
-> Status: DRAFT v7 (codex R1–R5 folded in; R5: one consistent schema-deprecation rule, A3
+> Status: DRAFT v8 (codex R1–R6 folded in; R6: guard schema-exclusion, ledger-first stage wording, A3
 > transport-level boundary, baseline ledger arithmetic, saas comment sweep).
 
 ## 1. Goal and invariants
@@ -469,7 +469,8 @@ PR #37 and is load-bearing; P0-2 does not reverse it. Codex R3 may attack this s
    stub; audit every remaining construction site (§3.2 last block).
 5. **Tests** — delete/rewrite per §6.1; add migration-error tests + A1–A5.
 6. **e2e + CI + guards + docs** — D6 harness moves; banned-symbol guard extension;
-   CI BASELINE re-measure; docs sweep (§3.3 stale fixes; F-list below); CHANGELOG.
+   CI BASELINE via the §6.3 ledger (reconcile, then update — never bare
+   re-measurement); docs sweep (§3.3 stale fixes; F-list below); CHANGELOG.
 
 Each stage ends with a TechLead commit checkpoint (codex cannot write worktree git
 metadata).
@@ -523,7 +524,9 @@ regressions live):
 - **Documented narrow exclusions** (each with an inline comment naming why): the
   migration-detector seams that legitimately CONTAIN the removed literals —
   `account-config.ts` + its test, `nats-credential-source.ts` + its test (env
-  detection + messages) — plus `CHANGELOG.md`, `docs/archive`,
+  detection + messages), **`openclaw.plugin.json`** (the R5 schema rule KEEPS the
+  deprecated literals there — without this exclusion the guard fails
+  deterministically; codex R6) — plus `CHANGELOG.md`, `docs/archive`,
   `docs/review-2026-07-15`, and the guard scripts themselves.
 
 Canary-test every addition (planted symbol per new pattern AND per new path root;
