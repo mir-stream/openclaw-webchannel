@@ -2,7 +2,7 @@
 
 > Work item: [`P0.md`](P0.md) §"P0-2" (lines 90–173).
 > Branch: `feat/p0-2-auto-admission-removal`, stacked on `feat/p0-1-gateway-ws-removal` (PR #41).
-> Status: DRAFT v6 (codex R1–R4 folded in; R4: setup/auth type surfaces, A3
+> Status: DRAFT v7 (codex R1–R5 folded in; R5: one consistent schema-deprecation rule, A3
 > transport-level boundary, baseline ledger arithmetic, saas comment sweep).
 
 ## 1. Goal and invariants
@@ -92,15 +92,25 @@ delegate branch are rewritten to static-only; its test's `{ mode: "open" }` case
 (`consume-credentials.test.ts:142`) is deleted/rewritten as unrepresentable.
 `acquisition-env.ts:18` stale `_DEV_OPEN` comment pruned.
 
-**`packages/plugin/openclaw.plugin.json`** — `nats.devOpen` (:195-198) DELETE;
-`nats.admission` enum (:199-203) → `["register-hop"]` (desc: deprecated-accepted,
-"auto" is a startup error); `credentials.mode` enum (:209-212) → `["static","enrolled"]`;
-`auth.strategy` enum (:47-50) drops `"anonymous"` (D9); help text at :255 rewritten
-(currently instructs "set NO auth at all for auto admission").
+**`packages/plugin/openclaw.plugin.json`** — ONE consistent rule for every removed
+shape (codex R5 — an earlier draft contradicted itself here): **removed literals stay
+schema-valid-but-deprecated; rejection happens ONLY at the `assertNoRemovedConfig`
+seam.** Removing an enum literal (or a key, per P0-1 D4) makes the generic schema
+validator reject the config BEFORE the migration seam runs — which violates P0.md
+:154-157's targeted-error requirement. Concretely: `nats.devOpen` (:195-198) KEY
+KEPT, description → "REMOVED — startup migration error"; `nats.admission` enum
+(:199-203) keeps `"auto"`, description marks it removed; `credentials.mode` enum
+(:209-212) keeps `"open"`, same treatment; `auth.strategy` enum (:47-50) keeps
+`"anonymous"`, same treatment (D9). Help text at :255 rewritten (currently instructs
+"set NO auth at all for auto admission"). A migration-error test per literal proves
+the seam is reached (not schema-rejected).
 
 **`packages/plugin/index-nats.ts`** — dev-identity import (:70) + register-hop
 dev-identity fallback (:534-557) DELETE (fail-closed branch :544-556 becomes the only
-behavior); admission resolution (:469-479) → unconditional register-hop (D1);
+behavior); legacy config projection type `nats?: { url?: string; devOpen?: boolean }`
+(:115) loses the `devOpen` member (`url` stays — legacy `nats.url` remains honored by
+the resolver) (codex R5); admission resolution (:469-479) → unconditional
+register-hop (D1);
 wildcard-subscribe block + auto/dmSecurity warn (:834-843) DELETE; channel-construction
 ternary (:562-572) → always keyStore+identityKeyPair; verifier/register gates
 (:944-963, :980+) unconditional. `isDmPostureOpen` import (:51) DELETE →
@@ -415,10 +425,12 @@ handshake removed, static-creds serving deferred to P0-3, **`registration` (incl
 
 Anonymous strategy only ever routed to auto admission and is already REJECTED at
 verify-time for register-hop (`auth-admission.test.ts` asserts the rejection — that
-test KEEPS as the guard). Remove `"anonymous"` from the schema enum (:47-50) and the
-":255" help text that instructs configuring "NO auth at all for auto admission".
-Old configs carrying `strategy:"anonymous"` get a migration error via the same D5
-seam (value-match), not a schema rejection.
+test KEEPS as the guard). The RUNTIME type union drops `AnonymousAuthConfig`
+(`auth.ts:62,:106`); the schema enum KEEPS the `"anonymous"` literal as
+deprecated-accepted (see the §3.2 schema rule — removing it would schema-reject
+before the migration seam) and the ":255" help text is rewritten. Old configs
+carrying `strategy:"anonymous"` get a migration error via the same D5 seam
+(value-match), never a generic schema rejection.
 
 ### D10 — Constructor validation boundary: local material synchronous, SaaS-delivered material runtime (codex R2)
 
