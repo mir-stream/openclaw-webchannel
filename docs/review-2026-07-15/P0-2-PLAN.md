@@ -2,9 +2,10 @@
 
 > Work item: [`P0.md`](P0.md) §"P0-2" (lines 90–173).
 > Branch: `feat/p0-2-auto-admission-removal`, stacked on `feat/p0-1-gateway-ws-removal` (PR #41).
-> Status: DRAFT v3 (codex R1: 2 BLOCKER + 2 MAJOR folded in — registration now
-> mandatory end-to-end, browser-demo-entry in scope, protocol-version decision made,
-> two-layer migration semantics).
+> Status: DRAFT v4 (codex R2 folded in: A1 mechanism corrected to JWT-signature
+> binding with the relay threat model made explicit; D8 rationale repaired against
+> the registering-without-x25519 shape; D10 constructor-validation boundary; ac6
+> DEV_OPEN coupling migrated).
 
 ## 1. Goal and invariants
 
@@ -163,9 +164,16 @@ delete), `hkdfSha256`, envelope codec, base64url helpers.
 **`packages/client/src/index.ts`** — no change (verified: no handshake surface is
 exported).
 
-**`packages/saas/reference/bootstrap-server.ts`** — :252 `DEV_OPEN ?
+**`packages/saas/reference/bootstrap-server.ts`** — :245-252 `DEV_OPEN ?
 {agentPublicKey: devOpenAgentIdentityPublicB64url()}` reference-harness pin: REWRITE
-(drop DEV_OPEN arm) or delete the flag entirely.
+to an explicit pin source — new `WEBCHANNEL_AGENT_PUBLIC_KEY` env (base64url), no
+implicit dev key, no DEV_OPEN flag.
+
+**`packages/saas/src/ac6-device-flow-e2e.test.ts`** — :141 starts the reference
+bootstrap-server with `WEBCHANNEL_NATS_DEV_OPEN=1` to obtain the dev pin (codex R2 —
+outside the four D6 harnesses, and it would trip the new banned-symbol guard).
+REWRITE: the test generates/derives an agent X25519 key pair itself and passes the
+public half via the new env; the client-side pin assertion pins that key.
 
 ### 3.3 Stale-docs fixes discovered (fold into Stage 6)
 
@@ -299,10 +307,24 @@ CI steps + the ≥1420 test baseline move in lockstep (a code-only delete lands 
 
 ### D7 — Attack tests (P0.md's five)
 
+**Threat model (explicit, per P0.md "Relay가 … 치환"):** the attacker is the NATS
+relay (or any NATS-level principal). The first-party HTTPS bootstrap leg
+(SaaS ↔ browser) is NOT the attacker — key substitution *at issuance* is a
+compromised-issuer scenario, out of scope for these five.
+
+**A1 binding mechanism (corrected, codex R2):** the browser X25519 device key rides
+INSIDE the SaaS-signed bootstrap JWT (`cnf.jwk`); the register handler extracts it
+only from the *verified* token (`nats-register.ts:250-258` — rejects when absent or
+non-32-byte). PoP does NOT bind it — PoP proves possession of the separate Ed25519
+`pop_jwk` over `peerId+nonce` only (RFC 7800 split, `pop-challenge.ts:9-21,63`). So a
+relay substituting the device key must alter the JWT payload → signature verification
+fails → registration rejected. That is the manufacturable A1 test: mutate `cnf.jwk`
+inside the register token → expect `REGISTER_UNAUTHORIZED`.
+
 | # | Attack | Expected | Existing coverage? |
 |---|--------|----------|--------------------|
-| A1 | Relay substitutes browser device key at register | plugin registration fails (PoP verifies against JWT-`cnf`-bound key) | partial (F2/register-pop-gate tests) — inventory in Stage 1, extend |
-| A2 | Relay substitutes agent key / wrapped K | browser fails closed (pin > delivered > derived) | partial (pin tests) — inventory, extend |
+| A1 | Relay tampers device X25519 key (`cnf.jwk`) in the register token | JWT verify fails → registration rejected | partial (JWT verify tests) — inventory in Stage 1, add the cnf-mutation case |
+| A2 | Relay substitutes agent key / wrapped K | browser fails closed (pin is SaaS-delivered; never derive from wire — `nats-client.ts:1248-1260`) | partial (pin/unwrap tests) — inventory, extend |
 | A3 | Unregistered valid NATS user publishes `.in` | no agent turn starts | NEW — integration test at channel dispatch level |
 | A4 | Bootstrap JWT peer/account/tenant/device binding substitution | verify fails | partial (register-pop-gate) — inventory, extend |
 | A5 | Register response missing wrapped K | terminal failure, no fallback code path exists | NEW — client-side test |
@@ -319,22 +341,29 @@ frame count on `.in`/`.out` proper is unchanged.
 
 - The version gates the **negotiated** wire contract, and negotiation happens only in
   the register reply (`nats-client.ts:1200-1221`, exact-match, mismatch = TERMINAL
-  disconnect). The negotiated contract — register request/reply, wrapped-K delivery,
-  envelope frames — is **byte-identical** before and after P0-2. A v1 client that
-  registers works perfectly against the new plugin.
-- Bumping to 2 under the exact-match rule would therefore terminally break every
-  fully-compatible registering v1 client for zero wire difference — strictly worse
-  than the status quo.
+  disconnect). The negotiated contract for the **delivered-key model** — register
+  request/reply, wrapped-K delivery, envelope frames — is **byte-identical** before
+  and after P0-2. A v1 client that registers with `deviceX25519PrivateKey` works
+  perfectly against the new plugin.
+- Bumping to 2 under the exact-match rule would terminally break exactly those
+  fully-compatible clients for zero wire difference — strictly worse.
 - The handshake path never reached version negotiation in ANY version (auto clients
   never register), so it was never under the version's protection; deleting it cannot
   be expressed by that mechanism.
+- **The registering-WITHOUT-x25519 shape (codex R2):** a v1 client with
+  `registration` but no `deviceX25519PrivateKey` passes v1 negotiation, then runs the
+  legacy handshake (`nats-client.ts:1099,1285`). Against a register-hop account this
+  shape **already wedges today** — a keyStore-mode channel never subscribes
+  `.handshake` (F5, `nats-channel.ts:352-357`). It only ever functioned against
+  `admission:"auto"` agents. Post-P0-2 those agents hard-error at startup, and 0.3.0
+  clients make the shape unrepresentable (D10). So keeping v1 does not regress it:
+  it moves from "wedges against production accounts" to "wedges against a config
+  that refuses to boot". Compat policy stated in CHANGELOG.
 
-Acknowledged residual: an old auto-mode client against a new plugin publishes
-`key_exchange` into a subject nobody subscribes and times out without a version
-diagnostic. Accepted because (a) that client shape only ever worked against
-`admission:"auto"` agents, whose config now hard-errors at agent startup — the
-operator hears about it on the agent side; (b) client+plugin ship 0.3.0 in enforced
-3-way lockstep. Stated in CHANGELOG.
+Acknowledged residual: old auto-mode or registering-without-x25519 clients against a
+new plugin time out without a version diagnostic — exactly their behavior against any
+register-hop account today. Accepted because (a) the agent-side migration errors are
+loud; (b) client+plugin ship 0.3.0 in enforced 3-way lockstep. Stated in CHANGELOG.
 
 Compat tests locked in: reply-without-protocolVersion → non-fatal (exists — verify),
 matching v1 → proceeds, mismatched → terminal (exists — verify), and the
@@ -352,6 +381,26 @@ test KEEPS as the guard). Remove `"anonymous"` from the schema enum (:47-50) and
 ":255" help text that instructs configuring "NO auth at all for auto admission".
 Old configs carrying `strategy:"anonymous"` get a migration error via the same D5
 seam (value-match), not a schema rejection.
+
+### D10 — Constructor validation boundary: local material synchronous, SaaS-delivered material runtime (codex R2)
+
+Constructor-synchronous terminal errors (both `WebChannelNatsClient` and the
+`WebChannelNATSClient` wrapper) cover everything the app possesses locally at
+construction time:
+
+- `registration` present, with BOTH `devicePrivateKey` (Ed25519 PoP) and
+  `deviceX25519PrivateKey` — client-generated keys; absence is unrecoverable
+  misconfiguration.
+- non-empty bootstrap `jwt` — the wrapper's silent `bootstrapJwt ?? ""` default
+  (`nats-client-wrapper.ts:71`) is deleted; constructing before bootstrap completes
+  is a programming error.
+
+`pinnedAgentPublicKey` deliberately stays type-optional + runtime-terminal
+(`nats-client.ts:1248-1260`): the P1-7 cause design classifies a missing pin as
+`secure-channel-failed`, NOT `config`, because the pin rides the SaaS bootstrap
+response and re-auth (which refetches bootstrap) can genuinely deliver it — a
+constructor throw would strand that recoverable state. That classification shipped in
+PR #37 and is load-bearing; P0-2 does not reverse it. Codex R3 may attack this split.
 
 ## 5. Stages
 
@@ -400,8 +449,10 @@ protocol-version-lockstep, `auth-admission.test.ts` as the D9 guard).
 ADD: migration-error tests per D4's two layers (Layer 1: one per removed shape,
 process-fatal asserted; Layer 2: one per static signal — mode/credsFile/inline/
 env-JWT+seed/env-creds-file — plus env DEV_OPEN, per-account skip asserted);
-missing-`registration` construction errors (direct `WebChannelNatsClient` AND wrapper
-`WebChannelNATSClient`); `browser-demo-entry` unconditional-registration test;
+missing-`registration` / missing-either-private-key / empty-`jwt` construction errors
+(direct `WebChannelNatsClient` AND wrapper `WebChannelNATSClient` — D10); pin stays
+runtime-terminal (existing P1-7 cause tests keep covering it);
+`browser-demo-entry` unconditional-registration test; ac6 explicit-pin migration;
 A1–A5; "registerPeer is sole peerSessionKeys writer + stays bounded" unit incl.
 exception paths (a subscribe/eviction throw after the :299 key insertion must not
 leak an entry — codex R1 MINOR); D8 protocol compat tests (verify existing, extend
