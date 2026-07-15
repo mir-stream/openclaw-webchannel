@@ -147,10 +147,87 @@ describe("WebChannelNATSClient — CL2 terminal error status", () => {
     expect(state.status).toBe("error");
     expect(state.connected).toBe(false);
     expect(state.error).toMatch(/authorization/i);
+    // P1-7: the cause tag lands on state alongside the reason.
+    expect(state.errorCause).toBe("auth-rejected");
 
     // Sticky: a trailing teardown state event must not downgrade it.
     await new Promise((r) => setTimeout(r, 20));
     expect(wrapper.getState().status).toBe("error");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1-7: the machine-readable error cause threads onto state.errorCause, falls
+// back to "unknown" when absent, and is cleared (with error) on reconnect.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P1-7 error cause on state", () => {
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+    });
+  }
+  /** Drive the inner client's error listeners (what a real terminal failure does). */
+  function emitError(wrapper: WebChannelNATSClient, err: Error, cause?: string): void {
+    (wrapper["client"] as unknown as {
+      notifyErrorListeners: (e: Error, c?: string) => void;
+    }).notifyErrorListeners(err, cause);
+  }
+  /**
+   * Drive a state event through to the wrapper's onState handler. The wrapper
+   * subscribes via `WebChannelNatsClient.onState`, which registers straight on the
+   * LOW-LEVEL `NatsClient` (`wrapper.client.client`), whose `notifyStateListeners`
+   * forwards its `connected` flag — so set the flag and fire it there.
+   */
+  function emitState(wrapper: WebChannelNATSClient, connected: boolean): void {
+    const lowLevel = wrapper["client"]["client"] as unknown as {
+      connected: boolean;
+      notifyStateListeners: () => void;
+    };
+    lowLevel.connected = connected;
+    lowLevel.notifyStateListeners();
+  }
+
+  it("a classified cause lands on state.errorCause", () => {
+    const w = makeWrapper();
+    emitError(w, new Error("upgrade the older side"), "protocol-mismatch");
+    const s = w.getState();
+    expect(s.status).toBe("error");
+    expect(s.errorCause).toBe("protocol-mismatch");
+    expect(s.error).toBe("upgrade the older side");
+  });
+
+  it("an unclassified failure (no cause) falls back to \"unknown\"", () => {
+    const w = makeWrapper();
+    emitError(w, new Error("mystery"));
+    expect(w.getState().errorCause).toBe("unknown");
+  });
+
+  it("a later successful reconnect clears error + errorCause", () => {
+    const w = makeWrapper();
+    emitError(w, new Error("boom"), "secure-channel-failed");
+    expect(w.getState().errorCause).toBe("secure-channel-failed");
+    // The register-failure sites don't set the raw client's terminal flag, so an
+    // embedder can reconnect the SAME instance; a connected event clears the stale
+    // reason. (The sticky guard only blocks a connected:false event from the error
+    // status; a connected:true is a genuine recovery.)
+    emitState(w, true);
+    const s = w.getState();
+    expect(s.status).toBe("connected");
+    expect(s.error).toBeUndefined();
+    expect(s.errorCause).toBeUndefined();
+  });
+
+  it("sticky guard: a trailing onState(false) after an error does NOT clear the cause", () => {
+    const w = makeWrapper();
+    emitError(w, new Error("boom"), "auth-expired");
+    emitState(w, false); // teardown event
+    const s = w.getState();
+    expect(s.status).toBe("error"); // not downgraded to reconnecting
+    expect(s.errorCause).toBe("auth-expired"); // preserved
   });
 });
 

@@ -256,13 +256,14 @@ skip.
 
 ---
 
-## P1-7 — Error handling / reconnect UX — ✅ MOSTLY BUILT
+## P1-7 — Error handling / reconnect UX — ✅ BUILT
 
 **Symptom (original).** On failures the demo showed minimal state; terminal errors (PoP/NKEY
 rejection) were hard to distinguish from transient ones.
 
-**Classification.** ✅ Mostly built by the integrated demo. Reconnect mechanics + connection-state UX
-+ terminal-vs-transient classification are done; finer error-cause wording is the remaining polish.
+**Classification.** ✅ Built. Reconnect mechanics + connection-state UX + terminal-vs-transient
+classification, and now the finer per-cause wording slice (a machine-readable cause tag threaded from
+the connection layer to a cause-driven terminal error box).
 
 **Where it stands today.**
 - Reconnect backoff with jitter: `nats-client.ts` `scheduleReconnect` (capped exponential + full
@@ -287,18 +288,22 @@ rejection) were hard to distinguish from transient ones.
 - Reusable: **`openclaw/plugin-sdk/error-runtime`** (`formatErrorMessage`, `extractErrorCode`) —
   classifier building blocks; **`openclaw/plugin-sdk/runtime-env`** (`computeBackoff`).
 
-**Remaining polish (still open).**
-1. **Finer cause wording** — `ErrorListener = (err: Error)` carries **no cause tag**
-   (`nats-client.ts:222`), the classifier lumps `authorization violation` + `authentication expired`
-   into one terminal message (`:588-596`), and the widget shows a single hardcoded "Credentials
-   expired" heading (`widget.ts:163`). Thread a cause tag into the callback so the widget can
-   distinguish "auth failed — reload to re-login" vs "network blip — reconnecting" vs "rate-limited"
-   using `error-runtime` helpers. This is the open P1-7 slice.
+**Polish.**
+1. **Finer cause wording** — ✅ **built.** `ErrorListener` now carries an optional
+   `WebChannelErrorCause` second arg; the `-ERR` classifier splits `authentication expired`
+   (`auth-expired`) from `authorization violation` (`auth-rejected`), and the six register/handshake
+   emit sites each tag their cause (`config`, `auth-rejected`, `server`, `protocol-mismatch`,
+   `secure-channel-failed`). The wrapper lands it in `state.errorCause` (`?? "unknown"`), and the
+   widget renders heading/hint/recovery from `demo/web/src/error-copy.ts` — so a protocol mismatch
+   shows "Upgrade required" with no re-auth button instead of the false "Credentials expired". A
+   `rate-limited` cause was scoped out: there is no rate-limit signal on the browser↔NATS↔plugin path,
+   so inventing one would be dead code (the union stays open for a future producer).
 2. **Send-while-down** — now covered by P0-7 (client replay ledger re-sends on reconnect); the
    terminal case already disables send in the error-box render.
 
-**Acceptance (mostly met).** A network blip shows "reconnecting…"; a credential rejection shows a
-distinct terminal message with a recovery action (✅). Finer per-cause wording is the open slice.
+**Acceptance (met).** A network blip shows "reconnecting…"; a credential rejection shows a distinct
+terminal message with a recovery action (✅); each terminal cause now gets truthful per-cause wording
+and the right recovery affordance (✅).
 
 ---
 
@@ -424,7 +429,7 @@ costs no E2E/server work, and stays purely in `demo/web/src/widget.ts` + a small
 |---|---|---|---|
 | ✅ | P1-3 reasoning lane | M | built — native callback + turn-correlated lane |
 | 2 | P1-9 pending-message retraction (unsend) | S | — (Option A: client hold, no server/wire change) |
-| 3 | P1-7 finer error wording | XS | — (mechanics + terminal UX already built; thread a cause tag) |
+| ✅ | P1-7 finer error wording | XS | built — cause tag threaded to a cause-driven terminal error box |
 | 4 | P0-3 argument menus | S | — (catalog entries already carry `args.choices`; render dropdowns) |
 | 5 | P1-2 long-response polish | S | P1-1 ✅ |
 | 6 | P1-6 doctor | M | — (factor existing `index-nats` checks into a `ChannelDoctorAdapter`) |
@@ -432,8 +437,9 @@ costs no E2E/server work, and stays purely in `demo/web/src/widget.ts` + a small
 | — | ~~P1-5 interactive buttons~~ | — | **MERGED into P0-4** (delta = generalize renderer + 2 wire frames) |
 
 > ✅ **Already built:** P1-1 (markdown, #27), P1-7 (error/reconnect UX — status pill, terminal
-> "Credentials expired" + re-auth, terminal-vs-transient classification; finer per-cause wording is
-> the only remaining slice), P1-8a (`/stop` control lane, #25), P1-8b (debounce/coalesce, #29).
+> error box + re-auth, terminal-vs-transient classification, and finer per-cause wording via a
+> threaded `WebChannelErrorCause` tag), P1-8a (`/stop` control lane, #25), P1-8b (debounce/coalesce,
+> #29).
 
 **Resolved decisions (2026-07-02):**
 - **P1-4 media → object storage (blob endpoint).** See P1-4 above.

@@ -75,12 +75,12 @@ every inbound frame; the widget renders each.
 | **P0-7** send reliability | ✅ **built** (#30/#31): client replay ledger + server ingress dedupe + `ack` frame | `nats-client.ts` `unackedLedger`/`flushQueue`/`drainAcked`; `src/ingress-dedupe.ts`; `sendAck` `nats-channel.ts:539-543` |
 | **P1-1** markdown | ✅ **built** (#27): sanitized markdown DOM for agent bubbles (zero-dep, no `innerHTML`) | `demo/web/src/markdown.ts`; `renderMarkdown` at `widget.ts:201` |
 | **P1-3** reasoning lane | ✅ **built**: native callback → dedicated turn-correlated wire/state → collapsed sanitized UI; streams only when resolved session reasoning level is `stream` (default `off`, Telegram parity, fail-closed) | `ReasoningDraftController`; `reasoning-level.ts`; `reasoning`/`turn_settled`; `presentation.ts` |
-| **P1-7** error / reconnect UX | ✅ **mostly built** (status pill + terminal "Credentials expired" + re-auth); finer wording open | terminal classify `nats-client.ts:588-596`; heading `widget.ts:163` |
+| **P1-7** error / reconnect UX | ✅ **built** (status pill + cause-driven terminal error box + re-auth); a `WebChannelErrorCause` tag threads from the `-ERR`/register emit sites through `state.errorCause` to per-cause wording | terminal classify `nats-client.ts` `-ERR` split; `error-copy.ts`; error box `widget.ts` |
 | **P1-8** turn control | ✅ **built**: `/stop` control lane (#25, `control-lane.ts`) + debounce/coalesce (#29, `inbound-queue.ts`) | control lane `index-nats.ts:724-822`; Stop button `widget.ts:182-186,381-386` |
 
 **Still genuinely open** (accurately described in the files): **P0-3** argument menus (the only P0
 residual), **P1-2** long-response,
-**P1-4** media (mini-project), **P1-6** doctor, **P1-7** finer error wording, **P1-9** pending-message
+**P1-4** media (mini-project), **P1-6** doctor, **P1-9** pending-message
 retraction / unsend (web advantage — no Telegram equivalent), and **all of P2** (with P2-4 now
 narrowed to agent-down durability — see below).
 

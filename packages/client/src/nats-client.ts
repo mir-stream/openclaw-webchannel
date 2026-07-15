@@ -30,8 +30,14 @@ import {
   type BrowserKeyPair,
 } from "./e2e-crypto-browser.js";
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
-import { registerWithPop, isTerminalRegisterError } from "./pop-register.js";
-import type { CommandCatalogEntry } from "./types.js";
+import {
+  registerWithPop,
+  isTerminalRegisterError,
+  PopRejectedError,
+  PopServerError,
+  ProtocolVersionMalformedError,
+} from "./pop-register.js";
+import type { CommandCatalogEntry, WebChannelErrorCause } from "./types.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
 // Handshake retry (core NATS has no retention — the one-shot key_exchange can be
@@ -221,8 +227,14 @@ export type RawMessageListener = (subject: string, payload: string) => void;
 /** Connection state listener callback */
 export type StateListener = (connected: boolean) => void;
 
-/** Error listener callback (e.g. PoP registration failure). */
-export type ErrorListener = (err: Error) => void;
+/**
+ * Error listener callback (e.g. PoP registration failure). The optional second
+ * arg is a machine-readable cause tag (P1-7): a foreign error (a `PopRejectedError`
+ * thrown by `registerWithPop`, a WebCrypto unwrap throw) keeps its own class
+ * identity and carries the cause alongside — an additive trailing param, so every
+ * existing 1-arg listener still typechecks and behaves identically.
+ */
+export type ErrorListener = (err: Error, cause?: WebChannelErrorCause) => void;
 
 /**
  * The agent-plugin versions learned from a successful register handshake.
@@ -593,10 +605,24 @@ export class NatsClient {
         // deliberately excluded: "Authentication Timeout"/"Cancelled" (a slow or
         // sleeping client that just missed the auth window — retrying works) and
         // "Permissions Violation" (per-subject, connection stays up).
-        if (/authorization violation|authentication expired/i.test(line)) {
+        // P1-7: split the two terminal literals into distinct cause tags. The
+        // match stays a case-insensitive SUBSTRING test — real nats-server lines
+        // are quoted (e.g. `-ERR 'User/Account Authentication Expired'`), so an
+        // anchored/exact test would miss them. "expired" = a valid credential
+        // whose TTL lapsed (benign); "violation" = a credential never/no-longer
+        // acceptable (possibly revoked). Same terminal recovery, different trust
+        // story — see WebChannelErrorCause.
+        if (/authentication expired/i.test(line)) {
+          this.failTerminally(
+            `NATS credentials expired: ${line.slice(5).trim()} ` +
+              `(credential TTL lapsed — reconnecting cannot help; re-authenticate)`,
+            "auth-expired",
+          );
+        } else if (/authorization violation/i.test(line)) {
           this.failTerminally(
             `NATS authorization rejected: ${line.slice(5).trim()} ` +
               `(credentials invalid/expired — reconnecting cannot help)`,
+            "auth-rejected",
           );
         }
         continue;
@@ -685,7 +711,7 @@ export class NatsClient {
    * socket down, and notifies error listeners. No further redial happens until a
    * brand-new client is constructed.
    */
-  private failTerminally(message: string): void {
+  private failTerminally(message: string, cause?: WebChannelErrorCause): void {
     if (this.terminal) return; // fire once
     this.terminal = true;
     this.clearReconnectTimer();
@@ -703,7 +729,7 @@ export class NatsClient {
     // "error" status before the state event lands — otherwise the state event
     // (connected=false) would momentarily flash "reconnecting" (the wrapper's
     // sticky-error guard keys off the already-set "error" status).
-    this.notifyErrorListeners(new Error(message));
+    this.notifyErrorListeners(new Error(message), cause);
     this.notifyStateListeners();
   }
 
@@ -762,10 +788,10 @@ export class NatsClient {
     this.scheduleReconnect();
   }
 
-  private notifyErrorListeners(err: Error): void {
+  private notifyErrorListeners(err: Error, cause?: WebChannelErrorCause): void {
     this.errorListeners.forEach((listener) => {
       try {
-        listener(err);
+        listener(err, cause);
       } catch (e) {
         console.error("[nats-client] Error listener threw:", e);
       }
@@ -926,7 +952,7 @@ export class WebChannelNatsClient {
     // CL2: forward the low-level client's terminal auth failures to our own
     // error listeners, so an embedder learns credentials died (not just PoP
     // registration failures, which already flow through notifyErrorListeners).
-    this.client.onError((err) => this.notifyErrorListeners(err));
+    this.client.onError((err, cause) => this.notifyErrorListeners(err, cause));
   }
 
   /** Connect to NATS (the handshake begins automatically once connected). */
@@ -1104,7 +1130,8 @@ export class WebChannelNatsClient {
         const err = new Error(
           "[nats-client] registration requires a bootstrap `jwt` (none provided)",
         );
-        this.notifyErrorListeners(err);
+        // P1-7: an embedder-code bug — a retry re-runs the same missing-jwt path.
+        this.notifyErrorListeners(err, "config");
         this.client.disconnect();
         return;
       }
@@ -1139,7 +1166,14 @@ export class WebChannelNatsClient {
           // (original) error and tear the socket fully down. disconnect() clears
           // the reconnect timer and nulls onclose, so nothing redials; only a
           // fresh client (new bootstrap JWT) can recover.
-          this.notifyErrorListeners(err as Error);
+          // P1-7: classify the foreign throw into a cause tag (it keeps its own
+          // class identity — the cause rides alongside).
+          const cause: WebChannelErrorCause =
+            err instanceof PopRejectedError ? "auth-rejected"
+            : err instanceof ProtocolVersionMalformedError ? "protocol-mismatch"
+            : err instanceof PopServerError ? "server"
+            : "unknown";
+          this.notifyErrorListeners(err as Error, cause);
           this.client.disconnect();
           return;
         }
@@ -1179,7 +1213,8 @@ export class WebChannelNatsClient {
           `webchannel protocol mismatch: client=${WEBCHANNEL_PROTOCOL_VERSION} ` +
             `agent-plugin=${agentProtocolVersion}; upgrade the older side`,
         );
-        this.notifyErrorListeners(err);
+        // P1-7: re-auth cannot reconcile incompatible wire versions.
+        this.notifyErrorListeners(err, "protocol-mismatch");
         this.client.disconnect();
         return;
       }
@@ -1199,7 +1234,9 @@ export class WebChannelNatsClient {
             "[nats-client] register response carried no wrappedConversationKey " +
               "(plugin does not support the register-delivered key model)",
           );
-          this.notifyErrorListeners(err);
+          // P1-7: the plugin speaks an incompatible register contract — a
+          // capability mismatch, upgrade the older side (re-auth cannot help).
+          this.notifyErrorListeners(err, "protocol-mismatch");
           this.client.disconnect();
           return;
         }
@@ -1214,7 +1251,10 @@ export class WebChannelNatsClient {
               "(bootstrap response carried no agentPublicKey) — refusing to unwrap K " +
               "against an unauthenticated wire key",
           );
-          this.notifyErrorListeners(err);
+          // P1-7: NOT "config" — the pin rides the SaaS bootstrap response, so
+          // re-auth (which refetches bootstrap) can genuinely deliver it. Hiding
+          // the re-auth affordance here would strand a recoverable state.
+          this.notifyErrorListeners(err, "secure-channel-failed");
           this.client.disconnect();
           return;
         }
@@ -1228,7 +1268,9 @@ export class WebChannelNatsClient {
           );
         } catch (err) {
           console.error("[nats-client] conversation-key unwrap failed:", err);
-          this.notifyErrorListeners(err as Error);
+          // P1-7: the E2E session could not be established (bad/tampered key or a
+          // stale pin) — re-auth to retry with fresh keys.
+          this.notifyErrorListeners(err as Error, "secure-channel-failed");
           this.client.disconnect();
           return;
         }
@@ -1394,10 +1436,10 @@ export class WebChannelNatsClient {
     });
   }
 
-  private notifyErrorListeners(err: Error): void {
+  private notifyErrorListeners(err: Error, cause?: WebChannelErrorCause): void {
     this.errorListeners.forEach((listener) => {
       try {
-        listener(err);
+        listener(err, cause);
       } catch (e) {
         console.error("[nats-client] Error listener error:", e);
       }

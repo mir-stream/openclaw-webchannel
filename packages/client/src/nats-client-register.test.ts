@@ -322,6 +322,88 @@ describe("WebChannelNatsClient PoP registration wiring (NATS)", () => {
     client.disconnect();
   });
 
+  // -------------------------------------------------------------------------
+  // P1-7: the terminal register failures each carry a machine-readable cause.
+  // -------------------------------------------------------------------------
+  it("a rejected proof (401) surfaces cause \"auth-rejected\"", async () => {
+    const device = await generateDevicePopKeyPair();
+    const causes: Array<string | undefined> = [];
+    const client = new WebChannelNatsClient({
+      url: "ws://127.0.0.1:4222",
+      jwt: JWT,
+      accountId: AGENT,
+      tenant: TENANT,
+      peerId: PEER,
+      registration: { devicePrivateKey: device.privateKey },
+    });
+    client.onError((_err, cause) => causes.push(cause));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    server.handler = makeRegisterAndHandshakeAgent(TENANT, AGENT, PEER, {
+      rejectRegister: true,
+    }).handler;
+
+    await settle();
+
+    // A 401 → PopRejectedError → the credential is not acceptable.
+    expect(causes).toEqual(["auth-rejected"]);
+
+    client.disconnect();
+  });
+
+  it("a non-401/non-503 error reply (500) surfaces cause \"server\"", async () => {
+    const device = await generateDevicePopKeyPair();
+    const reg = registerSubject(TENANT, AGENT, PEER);
+    const causes: Array<string | undefined> = [];
+    const client = new WebChannelNatsClient({
+      url: "ws://127.0.0.1:4222",
+      jwt: JWT,
+      accountId: AGENT,
+      tenant: TENANT,
+      peerId: PEER,
+      registration: { devicePrivateKey: device.privateKey },
+    });
+    client.onError((_err, cause) => causes.push(cause));
+    client.connect();
+    const server = FakeNatsWS.instances.at(-1)!;
+    // Inline agent: challenge → nonce, register → a 500 server-error reply
+    // (PopServerError → terminal, but a DIFFERENT recovery story than a bad proof).
+    server.handler = (subject, payload, srv, replyTo) => {
+      if (subject !== reg || !replyTo) return;
+      const body = JSON.parse(payload) as { op?: string };
+      if (body.op === "challenge") srv.deliverToClient(replyTo, JSON.stringify({ nonce: "n" }));
+      else if (body.op === "register") srv.deliverToClient(replyTo, JSON.stringify({ error: "boom", code: 500 }));
+    };
+
+    await settle();
+
+    expect(causes).toEqual(["server"]);
+
+    client.disconnect();
+  });
+
+  it("missing bootstrap jwt on the register path surfaces cause \"config\"", async () => {
+    const device = await generateDevicePopKeyPair();
+    const causes: Array<string | undefined> = [];
+    // registration present but NO `jwt` — an embedder-code bug the register hop
+    // fails closed on (a retry re-runs the same missing-jwt path).
+    const client = new WebChannelNatsClient({
+      url: "ws://127.0.0.1:4222",
+      accountId: AGENT,
+      tenant: TENANT,
+      peerId: PEER,
+      registration: { devicePrivateKey: device.privateKey },
+    });
+    client.onError((_err, cause) => causes.push(cause));
+    client.connect();
+
+    await settle();
+
+    expect(causes).toEqual(["config"]);
+
+    client.disconnect();
+  });
+
   it("no registration config → handshake published immediately, no register round-trip", async () => {
     const hs = handshakeSubject(TENANT, AGENT, PEER);
     const reg = registerSubject(TENANT, AGENT, PEER);

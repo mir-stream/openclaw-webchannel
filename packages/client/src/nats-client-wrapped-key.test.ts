@@ -485,7 +485,8 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
   it("fail-closed terminal: register reply without wrappedConversationKey → onError, no handshake fallback", async () => {
     const { client } = await makeClient(makeAgentIdentity().publicB64url);
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     server.handler = registerAgentHandler(PEER, () => null);
@@ -494,6 +495,9 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
 
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toMatch(/wrappedConversationKey/);
+    // P1-7: a plugin that can't deliver the wrapped key is a capability/protocol
+    // mismatch — re-auth cannot help.
+    expect(causes).toEqual(["protocol-mismatch"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     // NO downgrade: no handshake frame, no plaintext, nothing on .in.
     expect(server.published.some((p) => p.subject === handshakeSubject(TENANT, AGENT, PEER))).toBe(false);
@@ -506,7 +510,8 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     const { client, deviceKP } = await makeClient(agentId.publicB64url);
 
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     server.handler = registerAgentHandler(PEER, () => {
@@ -520,6 +525,8 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     await settle();
 
     expect(errors).toHaveLength(1);
+    // P1-7: an unwrap throw → the E2E session could not be established.
+    expect(causes).toEqual(["secure-channel-failed"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
@@ -573,7 +580,8 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
       },
     });
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     const K = new Uint8Array(randomBytes(32));
@@ -585,6 +593,9 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
 
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toMatch(/pinned agent public key/i);
+    // P1-7: NOT "config" — the pin rides the SaaS bootstrap, so re-auth can deliver
+    // it; the cause keeps the re-auth affordance available.
+    expect(causes).toEqual(["secure-channel-failed"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
@@ -718,7 +729,8 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     const infos: ProtocolInfo[] = [];
     client.onProtocol((i) => infos.push(i));
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     server.handler = registerAgentHandler(
@@ -735,6 +747,8 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toContain("client=1");
     expect(errors[0].message).toContain("agent-plugin=2");
+    // P1-7: incompatible wire versions → protocol-mismatch (no re-auth affordance).
+    expect(causes).toEqual(["protocol-mismatch"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     // The mismatch is caught BEFORE key delivery — no session key, nothing sealed.
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
@@ -748,7 +762,8 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     const infos: ProtocolInfo[] = [];
     client.onProtocol((i) => infos.push(i));
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     // A buggy/third-party plugin sends the string "2" instead of the number 2.
@@ -768,6 +783,8 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toContain("string");
     expect(errors[0].message).toContain('"2"');
+    // P1-7: a ProtocolVersionMalformedError classifies as protocol-mismatch.
+    expect(causes).toEqual(["protocol-mismatch"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
