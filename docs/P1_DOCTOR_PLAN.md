@@ -1,7 +1,8 @@
 # P1-6 — Doctor / Self-diagnosis Plan
 
-> Status: DRAFT rev3 (rev1: 17 findings; rev2: 7 findings — both codex/gpt-5.6-sol
-> adversarial rounds folded in; see §9 for dispositions)
+> Status: APPROVED-FOR-IMPLEMENTATION rev4 (codex/gpt-5.6-sol adversarial rounds:
+> 17 → 7 → 2 editorial findings, all folded in; see §9/§9b for dispositions.
+> rev4 = rev3 + malformed-persisted-creds→creds-missing rationale + C1–C11 scope fix)
 > Branch: `feat/p1-6-doctor`
 > Gap ref: `docs/gaps/P1_RICH_UX_GAPS.md` §P1-6 (🔴 MISSING)
 
@@ -260,9 +261,13 @@ type WebchannelProbe = BaseProbeResult & {
      wins, exactly like the runtime (`consume-credentials.ts:99`).
 
   Tests: delivered-URL-wins over configured URL; configured fallback when the
-  persisted block lacks `natsUrl`; malformed persisted creds → `invalid`, not a
-  throw; enrolled-missing → `creds-missing` and the device-flow seam is never
-  invoked. The dial itself then reuses Gate A's relay dial exactly as today
+  persisted block lacks `natsUrl`; malformed persisted creds → `creds-missing`
+  (rev3 finding 1: `loadPersistedEnrolledCreds` deliberately folds absent/
+  unreadable/malformed/incomplete to `undefined`, `account-config.ts:384-390` —
+  the runtime consume path sees the same `undefined` and reports creds-missing,
+  and the re-enroll fix is correct for malformed creds too; `invalid` is
+  reserved for resolver throws); enrolled-missing → `creds-missing` and the
+  device-flow seam is never invoked. The dial itself then reuses Gate A's relay dial exactly as today
   (`preflight.ts:475` wraps material as static/open).
 - **Relay leg** — export Gate A's relay dial from `preflight.ts` (currently
   module-private) and reuse: connect, scoped no-op subscribe under
@@ -343,7 +348,7 @@ together through the shared resolver.
 
 | File | Change |
 |------|--------|
-| `src/doctor.ts` (NEW) | Finding engine, C1–C10, formatter, doctor adapter factory; Phase 2: probe + status adapter factory + `resolveDialMaterial` |
+| `src/doctor.ts` (NEW) | Finding engine, C1–C11, formatter, doctor adapter factory; Phase 2: probe + status adapter factory + `resolveDialMaterial` |
 | `src/doctor.test.ts` (NEW) | Per-check fire/pass; formatter carries fix hints; contextual C8 cases (a/b/c); probe fail-soft + never-enrolls (injected seams) |
 | `src/account-auth.ts` (NEW) | `deriveAccountAuth` (moved verbatim) + `resolveEffectiveAccountAuth` (input resolution, §3.2) |
 | `src/account-auth.test.ts` (NEW) | Precedence matrix (§3.2) |
@@ -358,7 +363,7 @@ together through the shared resolver.
 
 ## 6. Scope decisions
 
-- **IN (Phase 1)**: `doctor.collectPreviewWarnings`, C1–C10,
+- **IN (Phase 1)**: `doctor.collectPreviewWarnings`, C1–C11,
   `resolveEffectiveAccountAuth` extraction.
 - **IN (Phase 2)**: `status.probeAccount` (effective-source JWKS + relay dial),
   runtime-only `collectStatusIssues`, optional thin `describeAccount`.
