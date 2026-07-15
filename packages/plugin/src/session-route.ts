@@ -52,7 +52,7 @@ import {
   type ResolvedAgentRoute,
 } from "openclaw/plugin-sdk/routing";
 
-import { WEBCHANNEL_ID } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
 
 /**
  * The DM scope webchannel FORCES for its own inbound session-key derivation,

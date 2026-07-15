@@ -21,6 +21,18 @@ import {
 
 const HOME = "/home/test";
 
+describe("removed auth.ticketParam migration", () => {
+  it("rejects the deprecated flat config through account resolution", () => {
+    const cfg = { channels: { webchannel: { auth: { strategy: "jwt", ticketParam: "ticket" } } } };
+    expect(() => resolveWebchannelAccountConfig(cfg)).toThrow(/removed config auth\.ticketParam.*channels add/s);
+  });
+
+  it("rejects the deprecated named-account leaf through account resolution", () => {
+    const cfg = { channels: { webchannel: { accounts: { work: { auth: { ticketParam: "jwt" } } } } } };
+    expect(() => resolveWebchannelAccountConfig(cfg, "work")).toThrow(/removed config auth\.ticketParam.*channels add/s);
+  });
+});
+
 describe("account-config: account id validation (TRUST BOUNDARY)", () => {
   it("accepts safe ids", () => {
     for (const id of ["default", "acctA", "acct-1", "a_b-C9", "x".repeat(64)]) {

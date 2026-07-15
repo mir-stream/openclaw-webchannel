@@ -1,7 +1,7 @@
 /**
  * Sub-AC 3a: JWT verification middleware — mock JWKS server integration tests.
  *
- * Exercises the full `resolveVerifier({ strategy: "jwt", jwt: { jwksUrl } })`
+ * Exercises the full `assertJwtAuthConfig({ strategy: "jwt", jwt: { jwksUrl } })`
  * middleware path using a mock fetch function that simulates a SaaS JWKS HTTP
  * endpoint.  The mock is injected via `jwt._fetchImpl` (a test-only field on
  * `JwtAuthConfig`) so the JWKSCache makes a "real" fetch call but against our
@@ -33,7 +33,7 @@ import { describe, it, expect, vi } from "vitest";
 import type { IncomingMessage } from "node:http";
 import { webcrypto } from "node:crypto";
 
-import { resolveVerifier } from "./auth.js";
+import { verifyJwtAndExtractIdentity } from "./auth.js";
 import type { JsonWebKeySet } from "./jwks.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -144,14 +144,14 @@ function nowSec(): number {
 }
 
 /**
- * Create a fresh `ConnectionVerifier` backed by the mock JWKS server.
+ * Create a fresh `JWT auth configuration` backed by the mock JWKS server.
  *
  * Each call returns a NEW verifier with its own `JWKSCache` instance —
  * no shared cache state between tests.  The `_fetchImpl` field routes
  * the cache's HTTP fetch through the provided stub.
  */
 function makeVerifier(fetchImpl: typeof fetch = mockJwksServer(publishedJwks)) {
-  return resolveVerifier({
+  const config = {
     strategy: "jwt",
     jwt: {
       jwksUrl: JWKS_URL,
@@ -159,7 +159,11 @@ function makeVerifier(fetchImpl: typeof fetch = mockJwksServer(publishedJwks)) {
       audience: AUDIENCE,
       _fetchImpl: fetchImpl,
     },
-  });
+  } as const;
+  return async (req: { url?: string }) => {
+    const token = new URL(req.url ?? "/", "http://localhost").searchParams.get("ticket");
+    return token ? verifyJwtAndExtractIdentity(token, config) : null;
+  };
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -426,7 +430,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
       // not silently return null (which could be misread as "auth passed").
       await expect(
         verifier(fakeReq(`/ws?ticket=${token}`)),
-      ).rejects.toThrow(/JWKS fetch failed.*500/);
+      ).rejects.toThrow(/JWKS source unavailable/);
     });
   });
 });

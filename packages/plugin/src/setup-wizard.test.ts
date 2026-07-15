@@ -11,7 +11,7 @@ vi.mock("node:fs", async (importOriginal) => {
 import { buildFullAccountPatch } from "./setup.js";
 import { resolveAdmissionMode } from "./nats-admission.js";
 import { webchannelSetupWizard, validateHttpUrl } from "./setup-wizard.js";
-import { WebChannelTransport } from "./transport.js";
+import { NullPeerChannel } from "./channel-contract.js";
 import { createWebChannelPlugin } from "./channel.js";
 
 type Cfg = { channels: { webchannel?: Record<string, unknown> } };
@@ -149,7 +149,7 @@ describe("setup-wizard: declarative detection", () => {
 
 describe("setup-wizard: constructed plugin exposes setupWizard", () => {
   it("forwards setupWizard through createChannelPluginBase", () => {
-    const plugin = createWebChannelPlugin(new WebChannelTransport());
+    const plugin = createWebChannelPlugin(new NullPeerChannel());
     expect(plugin.setupWizard).toBeDefined();
     expect((plugin.setupWizard as { channel?: string }).channel).toBe("webchannel");
     expect(plugin.setupWizard).toBe(webchannelSetupWizard);

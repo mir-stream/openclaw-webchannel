@@ -70,13 +70,13 @@ import type {
   ChannelOutboundPayloadHint,
 } from "openclaw/plugin-sdk/channel-runtime";
 
-import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
+import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type {
-  WebChannelTransport,
+  WebChannelPeerChannel,
   ApprovalDecision,
   ApprovalOption,
   ApprovalRequestPayload,
-} from "./transport.js";
+} from "./channel-contract.js";
 import {
   DEFAULT_ACCOUNT_ID,
   listWebchannelAccountIds,
@@ -93,7 +93,7 @@ import {
  */
 export type ResolveAccountTransport = (
   accountId: string | null | undefined,
-) => WebChannelTransport | undefined;
+) => WebChannelPeerChannel | undefined;
 
 /**
  * approvalId → account it was DELIVERED on (S1 adversarial-round F1). The
@@ -690,7 +690,7 @@ export function buildApprovalRequestPayload(
  * triggered it.
  */
 export function createClawApprovalNativeRuntimeSpec(
-  transport: WebChannelTransport,
+  transport: WebChannelPeerChannel,
   resolveAccountTransport?: ResolveAccountTransport,
 ): ChannelApprovalNativeRuntimeSpec<
   ApprovalRequestPayload, // TPendingPayload
@@ -714,7 +714,7 @@ export function createClawApprovalNativeRuntimeSpec(
   const hasResolver = typeof resolveAccountTransport === "function";
   const transportFor = (
     accountId: string | null | undefined,
-  ): WebChannelTransport | undefined =>
+  ): WebChannelPeerChannel | undefined =>
     hasResolver ? resolveAccountTransport!(accountId) : transport;
   return {
     // We can render BOTH exec and plugin approvals natively in the widget.
@@ -879,7 +879,7 @@ export function createClawApprovalNativeRuntimeSpec(
  * createDiscordApprovalCapability (discord/src/approval-native.ts).
  */
 export function createClawApprovalCapability(
-  transport: WebChannelTransport,
+  transport: WebChannelPeerChannel,
   resolveAccountTransport?: ResolveAccountTransport,
 ) {
   const nativeRuntime = createLazyChannelApprovalNativeRuntimeAdapter({

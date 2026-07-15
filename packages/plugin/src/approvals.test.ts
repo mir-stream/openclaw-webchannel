@@ -14,8 +14,17 @@ vi.mock("openclaw/plugin-sdk/approval-handler-runtime", async (importOriginal) =
   return { ...actual, resolveApprovalOverGateway };
 });
 
-import { WebChannelTransport } from "./transport.js";
-import type { ApprovalRequestPayload } from "./transport.js";
+import { NullPeerChannel } from "./channel-contract.js";
+class FakePeerChannel extends NullPeerChannel {
+  private approvalHandler?: (peerId: string, id: string, decision: any) => void;
+  private historyHandler?: (peerId: string, request: any) => void;
+  setApprovalDecisionHandler(handler: any) { this.approvalHandler = handler; }
+  setFirstLivenessHandler(_handler: any) {}
+  setLoadHistoryHandler(handler: any) { this.historyHandler = handler; }
+  setHistoryEnabled(_enabled: boolean) {}
+  registerConnection(ws: any, peerId = "web-anon") { ws.on("message", (raw: any) => { try { const frame = JSON.parse(String(raw)); if (frame.type === "approval_decision" && ["allow-once", "allow-always", "deny"].includes(frame.decision)) this.approvalHandler?.(peerId, frame.id, frame.decision); if (frame.type === "load_history") this.historyHandler?.(peerId, { ...(frame.before ? { before: frame.before } : {}), ...(frame.limit ? { limit: frame.limit } : {}) }); } catch {} }); }
+}
+import type { ApprovalRequestPayload } from "./channel-contract.js";
 import {
   createClawApprovalNativeRuntimeSpec,
   createClawApprovalCapability,
@@ -84,7 +93,7 @@ describe("webchannel approval payload projection", () => {
 
 describe("webchannel native approval runtime", () => {
   it("emits an approval_request frame with the offered options on delivery", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const requestSpy = vi
       .spyOn(transport, "sendApprovalRequest")
       .mockReturnValue(true);
@@ -150,7 +159,7 @@ describe("webchannel native approval runtime", () => {
   });
 
   it("emits an approval_resolved frame when the gateway resolves the approval", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
     const resolvedSpy = vi
       .spyOn(transport, "sendApprovalResolved")
@@ -208,7 +217,7 @@ describe("webchannel native approval origin routing (multi-user)", () => {
   // built by createApproverRestrictedNativeApprovalCapability exposes the
   // resolver we passed in as `native.resolveOriginTarget`, so exercise it there
   // (the old standalone createClawApprovalNativeAdapter was removed).
-  const transport = new WebChannelTransport();
+  const transport = new FakePeerChannel();
   const capability = createClawApprovalCapability(transport) as any;
   const resolveOriginTarget = capability.native.resolveOriginTarget;
 
@@ -250,7 +259,7 @@ describe("webchannel native approval origin routing (multi-user)", () => {
   });
 
   it("prepareTarget keys the prompt to the planned per-peer target", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const spec = createClawApprovalNativeRuntimeSpec(transport);
     const prepared = await spec.transport.prepareTarget({
       cfg: cfgEnabled,
@@ -273,7 +282,7 @@ describe("webchannel native approval origin routing (multi-user)", () => {
   });
 
   it("delivers the approval_request to the originating peer's socket key", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const requestSpy = vi
       .spyOn(transport, "sendApprovalRequest")
       .mockReturnValue(true);
@@ -360,7 +369,7 @@ describe("webchannel native approval surface state (Gate 2)", () => {
   // approval client). These hooks live at the CAPABILITY level and are read by
   // core's exec-approval-surface resolver.
   it("exposes surface-state hooks returning enabled when execApprovals on + approvers configured", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const capability = createClawApprovalCapability(transport) as any;
 
     expect(typeof capability.getExecInitiatingSurfaceState).toBe("function");
@@ -379,7 +388,7 @@ describe("webchannel native approval surface state (Gate 2)", () => {
   });
 
   it("reports disabled surface state when execApprovals are off", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const capability = createClawApprovalCapability(transport) as any;
     const cfgOff: any = {
       channels: { webchannel: { execApprovals: { enabled: false, approvers: ["web-anon"] } } },
@@ -391,7 +400,7 @@ describe("webchannel native approval surface state (Gate 2)", () => {
   });
 
   it("reports disabled surface state when enabled but NO approvers configured", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const capability = createClawApprovalCapability(transport) as any;
     const cfgNoApprovers: any = {
       channels: { webchannel: { execApprovals: { enabled: true } } },
@@ -510,7 +519,7 @@ describe("webchannel approval decision -> gateway", () => {
   });
 
   it("routes an inbound approval_decision frame through the transport handler", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const handler = vi.fn();
     transport.setApprovalDecisionHandler(handler);
 
@@ -633,7 +642,7 @@ describe("webchannel capability authorizeActorAction", () => {
   };
 
   it("authorizes a configured approver", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const capability = createClawApprovalCapability(transport) as any;
     const result = capability.authorizeActorAction({
       cfg: cfgWithApprovers,
@@ -646,7 +655,7 @@ describe("webchannel capability authorizeActorAction", () => {
   });
 
   it("capability.authorizeActorAction rejects a non-approver", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const capability = createClawApprovalCapability(transport) as any;
     const result = capability.authorizeActorAction({
       cfg: cfgWithApprovers,
@@ -662,7 +671,7 @@ describe("webchannel capability authorizeActorAction", () => {
   });
 
   it("rejects when no approvers configured", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const capability = createClawApprovalCapability(transport) as any;
     const cfgEmpty = {
       channels: { webchannel: { execApprovals: { enabled: true } } },
@@ -703,15 +712,15 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
   };
 
   function makeAccountTransports() {
-    const transportA = new WebChannelTransport();
-    const transportB = new WebChannelTransport();
+    const transportA = new FakePeerChannel();
+    const transportB = new FakePeerChannel();
     const sentA = vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
     const sentB = vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue(true);
     const resolvedA = vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
     const resolvedB = vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
-    const fallback = new WebChannelTransport();
+    const fallback = new FakePeerChannel();
     const sentFallback = vi.spyOn(fallback, "sendApprovalRequest").mockReturnValue(true);
-    const byAccount: Record<string, WebChannelTransport> = { a: transportA, b: transportB };
+    const byAccount: Record<string, FakePeerChannel> = { a: transportA, b: transportB };
     const spec = createClawApprovalNativeRuntimeSpec(
       fallback,
       (accountId) => byAccount[accountId ?? "default"],
@@ -865,7 +874,7 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
   it("legacy WS (no resolver) still delivers on the single closure transport", async () => {
     // The legacy single-account WS entry passes NO resolver → every account uses
     // the closure transport (there is exactly one account, no misroute possible).
-    const only = new WebChannelTransport();
+    const only = new FakePeerChannel();
     const onlySent = vi.spyOn(only, "sendApprovalRequest").mockReturnValue(true);
     const spec = createClawApprovalNativeRuntimeSpec(only); // no resolver
     const view = fakePendingExecView("exec-legacy");
@@ -954,9 +963,9 @@ describe("webchannel S1 accountId-aware approvals (multi-account)", () => {
     // Resolver knows accounts a+b, but 'b' is 'skipped' (returns undefined) as
     // if registerFull skipped it (creds-missing). The closure/fallback transport
     // is the PRIMARY (a). A prompt for b must NOT land on the fallback.
-    const primary = new WebChannelTransport();
+    const primary = new FakePeerChannel();
     const primarySent = vi.spyOn(primary, "sendApprovalRequest").mockReturnValue(true);
-    const transportA = new WebChannelTransport();
+    const transportA = new FakePeerChannel();
     const aSent = vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
     const spec = createClawApprovalNativeRuntimeSpec(
       primary,
@@ -1043,7 +1052,7 @@ describe("webchannel pending-approval store (#15)", () => {
     // Resolver present but returns undefined for this account → F2 fail-closed
     // drop (no misroute). The pending record must still be written so the prompt
     // is recoverable on the peer's next register.
-    const fallback = new WebChannelTransport();
+    const fallback = new FakePeerChannel();
     const spec = createClawApprovalNativeRuntimeSpec(fallback, () => undefined);
     const p = payload("exec-nc");
     await deliver(spec, "acct", "alice", p);
@@ -1051,7 +1060,7 @@ describe("webchannel pending-approval store (#15)", () => {
   });
 
   it("deliverPending records the entry even when the socket send returns false", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(false);
     const spec = createClawApprovalNativeRuntimeSpec(transport);
     const p = payload("exec-nf");
@@ -1061,7 +1070,7 @@ describe("webchannel pending-approval store (#15)", () => {
   });
 
   it("updateEntry erases the entry for BOTH resolved and expired finalize", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
     vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
     const spec = createClawApprovalNativeRuntimeSpec(transport);
@@ -1080,15 +1089,15 @@ describe("webchannel pending-approval store (#15)", () => {
   });
 
   it("updateEntry erases ONLY its own account's entry (same id on A and B is independent)", async () => {
-    const transportA = new WebChannelTransport();
-    const transportB = new WebChannelTransport();
+    const transportA = new FakePeerChannel();
+    const transportB = new FakePeerChannel();
     vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
     vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue(true);
     vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
     vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
-    const byAccount: Record<string, WebChannelTransport> = { a: transportA, b: transportB };
+    const byAccount: Record<string, FakePeerChannel> = { a: transportA, b: transportB };
     const spec = createClawApprovalNativeRuntimeSpec(
-      new WebChannelTransport(),
+      new FakePeerChannel(),
       (accountId) => byAccount[accountId ?? "default"],
     );
 
@@ -1218,7 +1227,7 @@ describe("webchannel recently-resolved store (#19)", () => {
   }
 
   it("updateEntry records the REAL decision at finalize (captured for the snapshot)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
     vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
     const spec = createClawApprovalNativeRuntimeSpec(transport);
@@ -1235,7 +1244,7 @@ describe("webchannel recently-resolved store (#19)", () => {
   });
 
   it("an EXPIRY records the decision the builder produces ('deny'), driven through buildExpiredResult", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendApprovalRequest").mockReturnValue(true);
     vi.spyOn(transport, "sendApprovalResolved").mockReturnValue(true);
     const spec = createClawApprovalNativeRuntimeSpec(transport);
@@ -1266,15 +1275,15 @@ describe("webchannel recently-resolved store (#19)", () => {
   });
 
   it("records under the SAME account's composite key: A's finalize doesn't mask B", async () => {
-    const transportA = new WebChannelTransport();
-    const transportB = new WebChannelTransport();
+    const transportA = new FakePeerChannel();
+    const transportB = new FakePeerChannel();
     vi.spyOn(transportA, "sendApprovalRequest").mockReturnValue(true);
     vi.spyOn(transportB, "sendApprovalRequest").mockReturnValue(true);
     vi.spyOn(transportA, "sendApprovalResolved").mockReturnValue(true);
     vi.spyOn(transportB, "sendApprovalResolved").mockReturnValue(true);
-    const byAccount: Record<string, WebChannelTransport> = { a: transportA, b: transportB };
+    const byAccount: Record<string, FakePeerChannel> = { a: transportA, b: transportB };
     const spec = createClawApprovalNativeRuntimeSpec(
-      new WebChannelTransport(),
+      new FakePeerChannel(),
       (accountId) => byAccount[accountId ?? "default"],
     );
 

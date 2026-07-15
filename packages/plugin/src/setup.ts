@@ -51,7 +51,7 @@
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
-import { WEBCHANNEL_ID } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
   DEFAULT_ACCOUNT_ID,
   canonicalizeAccountId,

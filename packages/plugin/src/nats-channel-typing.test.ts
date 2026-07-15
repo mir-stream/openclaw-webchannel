@@ -9,7 +9,7 @@
  */
 
 import { EventEmitter } from "node:events";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
@@ -70,5 +70,19 @@ describe("P0-6 — NatsChannel typing gate", () => {
     channel.setTypingEnabled(true);
     expect(channel.sendTyping("peer-0")).toBe(true);
     expect(typingFrames(transport)).toHaveLength(1);
+  });
+});
+
+describe("approval decision reverse path", () => {
+  it("dispatches a decoded decision with peer/id/decision and rejects malformed input", () => {
+    const transport = new RecordingTransport();
+    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
+    const handler = vi.fn();
+    channel.setApprovalDecisionHandler(handler);
+    transport.emit("message", { subject: "webchannel.tenant.acct.peer-0.in", payload: Buffer.from(JSON.stringify({ type: "approval_decision", id: "exec-1", decision: "deny" })) });
+    expect(handler).toHaveBeenCalledWith("peer-0", "exec-1", "deny");
+    handler.mockClear();
+    transport.emit("message", { subject: "webchannel.tenant.acct.peer-0.in", payload: Buffer.from(JSON.stringify({ type: "approval_decision", id: "exec-1", decision: "bogus" })) });
+    expect(handler).not.toHaveBeenCalled();
   });
 });

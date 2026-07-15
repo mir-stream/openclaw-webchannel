@@ -19,8 +19,8 @@ import {
   stripInlineDirectiveTagsForDelivery,
 } from "openclaw/plugin-sdk/text-chunking";
 
-import { WEBCHANNEL_ID } from "./transport.js";
-import type { WebChannelTransport } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
+import type { WebChannelPeerChannel } from "./channel-contract.js";
 
 /**
  * Stable per-message id we generate for each outbound logical send. This becomes
@@ -88,7 +88,7 @@ export function buildClawReceipt(id: string): MessageReceipt {
  * primary id is our generated per-message id; this is also the fallback send
  * used if core ever drives the adapter directly.
  */
-export function createClawMessageAdapter(transport: WebChannelTransport) {
+export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
   return defineChannelMessageAdapter({
     id: WEBCHANNEL_ID,
     // Final delivery is plain text only.
@@ -105,12 +105,12 @@ export function createClawMessageAdapter(transport: WebChannelTransport) {
         const id = nextMessageId();
         // `ctx.to` is the recorded reply target — the REAL per-peer `wsKey`
         // (inbound.ts records `reply.to = wsKey`). Target it directly; if it's
-        // absent or has no mapped socket, fall back to `sendTextToAnyOpen`,
+        // absent or has no mapped socket, fall back to `untargeted fallback`,
         // which delivers only when exactly ONE connection exists and otherwise
         // refuses to guess — so we never default to the literal `web-anon` key
         // when real peers are connected.
         if (!ctx.to || !transport.sendText(ctx.to, ctx.text, id)) {
-          transport.sendTextToAnyOpen(ctx.text);
+          console.error("[webchannel] outbound send has no resolvable target peer — dropped");
         }
         return { receipt: buildClawReceipt(id), messageId: id };
       },
@@ -202,7 +202,7 @@ export type ProgressDraftController = {
 };
 
 export function createProgressDraftController(params: {
-  transport: WebChannelTransport;
+  transport: WebChannelPeerChannel;
   sessionKey: string;
   turnId?: string;
   /** Channel config section (for label/maxLines/line formatting). */
@@ -460,7 +460,7 @@ export type ReasoningDraftController = {
  * mid-stream; no pinned path does that today.
  */
 export function createReasoningDraftController(params: {
-  transport: WebChannelTransport;
+  transport: WebChannelPeerChannel;
   sessionKey: string;
   turnId: string;
 }): ReasoningDraftController {

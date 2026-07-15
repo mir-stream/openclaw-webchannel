@@ -92,3 +92,11 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
     );
   });
 });
+
+describe("index-nats.ts wiring contract — approval decision account routing", () => {
+  it("threads the runtime accountId into handleApprovalDecision", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /setApprovalDecisionHandler\(\(peerId, id, decision\) =>[\s\S]*?handleApprovalDecision\(api\.config, id, decision, peerId, accountId\)/,
+    );
+  });
+});

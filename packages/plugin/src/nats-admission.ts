@@ -95,7 +95,7 @@ export type AdmissionServingPlan = {
   /** `auto` subscribes the tenant/accountId wildcard; `register-hop` does not. */
   subscribeWildcard: boolean;
   /**
-   * Build (and require) the `channels.webchannel.auth` `ConnectionVerifier`.
+   * Build (and require) the `channels.webchannel.auth` `JWT auth configuration`.
    * True ONLY for `register-hop`, so a pure-`auto` account is served with no
    * `auth` config at all, and a misconfigured jwt account still fails loudly on
    * the register-hop path (its verifier throw skips it) rather than being

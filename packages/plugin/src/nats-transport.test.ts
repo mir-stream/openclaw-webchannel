@@ -273,7 +273,7 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
 
   it("NatsTransport has no WebSocketServer or net.Server property", () => {
     // A transport that created a server socket would expose a `wss` or
-    // `server` property (the pattern in legacy WebChannelTransport was
+    // `server` property (the pattern in legacy NATS peer channel was
     // `this.wss = new WebSocketServer({ noServer: true })`). The NATS
     // transport is a pure client — no such property should exist.
     const t = new NatsTransport({ url: "ws://localhost:4222" });

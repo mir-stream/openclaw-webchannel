@@ -4,8 +4,8 @@ import {
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
-import { WEBCHANNEL_ID } from "./transport.js";
-import type { WebChannelTransport } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
+import type { WebChannelPeerChannel } from "./channel-contract.js";
 import { createClawMessageAdapter } from "./message-adapter.js";
 import {
   createClawApprovalCapability,
@@ -85,7 +85,7 @@ function resolveAccount(
  * and dist/plugin-sdk/outbound.types-BEZiz165.d.ts:105-127 (ChannelOutboundContext).
  */
 export function createWebChannelPlugin(
-  transport: WebChannelTransport,
+  transport: WebChannelPeerChannel,
   opts?: {
     /**
      * S1 (accountId-aware approvals): resolve a specific account's transport
@@ -194,12 +194,12 @@ export function createWebChannelPlugin(
           // `ctx.to` is the recorded reply target — now the REAL per-peer
           // `wsKey` (inbound.ts records `reply.to = wsKey`), so target it
           // directly. If it's absent or has no mapped socket, fall back to
-          // `sendTextToAnyOpen`, which only delivers when EXACTLY ONE connection
+          // `untargeted fallback`, which only delivers when EXACTLY ONE connection
           // exists (the anonymous single-peer case) and otherwise refuses to
           // guess — so we never default an untargeted send to the literal
           // `web-anon` key when real peers are connected.
           if (!ctx.to || !transport.sendText(ctx.to, ctx.text)) {
-            transport.sendTextToAnyOpen(ctx.text);
+            console.error("[webchannel] outbound send has no resolvable target peer — dropped");
           }
           return { messageId: `webchannel-${Date.now()}` };
         },

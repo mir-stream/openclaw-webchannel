@@ -7,7 +7,7 @@ import {
   type UserMessageLike,
 } from "./inbound-queue.js";
 import { isControlLaneMessage } from "./control-lane.js";
-import type { InboundWsMessage } from "./transport.js";
+import type { InboundWsMessage } from "./channel-contract.js";
 
 /**
  * P1-8b — the two inbound-smoothing seams as wired in index-nats.ts.

@@ -23,7 +23,7 @@
  */
 import { isAbortRequestText } from "openclaw/plugin-sdk/command-primitives-runtime";
 
-import type { InboundWsMessage } from "./transport.js";
+import type { InboundWsMessage } from "./channel-contract.js";
 import type { CommandGate } from "./command-gate.js";
 
 /**
