@@ -9,6 +9,7 @@ seed(`.ouroboros/*`)·평가 점수에 "AC 100% / complete"가 보여도, 그것
 | [`SPLIT_DEMO.md`](SPLIT_DEMO.md) | 분할 호스트(Mac)/컨테이너 라이브 데모 재현 가이드 | 재현 가이드 |
 | [`BACKLOG.md`](BACKLOG.md) | 후속 작업 (legacy Gateway-WS 전송 제거 등; `hmac-ticket` 전략 제거 완료; **C2 인증 핸드셰이크**) | 백로그 |
 | [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md) | 통합 데모 직후 전체 코드 리뷰 (안정성·보안·하네스). 발견 ID별 검증상태·위치·시나리오·수정방향 + 권고 순서 | 리뷰 스냅샷 (2026-07-02) |
+| [`REVIEW_2026-07-15.md`](REVIEW_2026-07-15.md) | 저장소 전체 리뷰와 우선순위 실행안. auto-admission·Gateway-WS 완전 삭제, 전달 보장, multi-agent/HA 및 reference hardening | **현재 실행 우선순위** |
 | [`PLAN.md`](PLAN.md) | 전체 범위·아키텍처·단계(Phase 0–3)·리스크 | 설계/계획 기준 |
 | [`AUTH.md`](AUTH.md) | 인증·신원 모델 (ConnectionVerifier seam, 빌트인 전략) | 설계 (라이브 검증됨) |
 | [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) | E2E NATS relay 신뢰 결합 + 디바이스-플로우 온보딩 | ✅ 라이브 검증됨 (live-proven) |
