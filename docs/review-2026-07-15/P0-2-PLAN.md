@@ -88,6 +88,12 @@ Static + enrolled + `.creds` parsing KEEP.
 **`packages/plugin/src/account-config.ts`** — extend `assertNoRemovedConfig` (:184-191)
 per D5. Everything else KEEP.
 
+**`packages/plugin/src/consume-credentials.ts`** (codex R3) — the union change lands
+here too: "open / static" contract comments (:17,:21,:83) and the non-enrolled
+delegate branch are rewritten to static-only; its test's `{ mode: "open" }` case
+(`consume-credentials.test.ts:142`) is deleted/rewritten as unrepresentable.
+`acquisition-env.ts:18` stale `_DEV_OPEN` comment pruned.
+
 **`packages/plugin/openclaw.plugin.json`** — `nats.devOpen` (:195-198) DELETE;
 `nats.admission` enum (:199-203) → `["register-hop"]` (desc: deprecated-accepted,
 "auto" is a startup error); `credentials.mode` enum (:209-212) → `["static","enrolled"]`;
@@ -173,7 +179,8 @@ implicit dev key, no DEV_OPEN flag.
 bootstrap-server with `WEBCHANNEL_NATS_DEV_OPEN=1` to obtain the dev pin (codex R2 —
 outside the four D6 harnesses, and it would trip the new banned-symbol guard).
 REWRITE: the test generates/derives an agent X25519 key pair itself and passes the
-public half via the new env; the client-side pin assertion pins that key.
+public half via the new env; the pin assertion becomes EQUALITY against that env
+value (the current :452,:474 defined-only assertion is too weak — codex R3).
 
 ### 3.3 Stale-docs fixes discovered (fold into Stage 6)
 
@@ -324,10 +331,21 @@ inside the register token → expect `REGISTER_UNAUTHORIZED`.
 | # | Attack | Expected | Existing coverage? |
 |---|--------|----------|--------------------|
 | A1 | Relay tampers device X25519 key (`cnf.jwk`) in the register token | JWT verify fails → registration rejected | partial (JWT verify tests) — inventory in Stage 1, add the cnf-mutation case |
-| A2 | Relay substitutes agent key / wrapped K | browser fails closed (pin is SaaS-delivered; never derive from wire — `nats-client.ts:1248-1260`) | partial (pin/unwrap tests) — inventory, extend |
+| A2 | Relay tampers the plaintext register reply's wrapped-K material | browser fails closed and disconnects (`nats-client.ts:1261`); pin itself is NOT wire-mutable (SaaS-delivered) | partial (pin/unwrap tests) — inventory, extend |
 | A3 | Unregistered valid NATS user publishes `.in` | no agent turn starts | NEW — integration test at channel dispatch level |
 | A4 | Bootstrap JWT peer/account/tenant/device binding substitution | verify fails | partial (register-pop-gate) — inventory, extend |
 | A5 | Register response missing wrapped K | terminal failure, no fallback code path exists | NEW — client-side test |
+
+Test-boundary requirements (codex R3):
+
+- **A1 must cross the real verifier**: mutate the payload segment of a genuinely
+  signed token while keeping the original signature, and drive the production
+  `verifyJwtAndExtractIdentity` path (`jwt.ts:243,252` — signature verify precedes
+  payload extraction). A `handleRegisterRequest` test with a mocked `verifyIdentity`
+  proves nothing about the binding.
+- **A2 enumerates the actually-mutable wire fields individually**: wrapped ephemeral
+  public key, nonce, ciphertext/tag — each mutation → unwrap failure + disconnect —
+  plus one wrong-local-pin case. (The pin never rides the relay.)
 
 Stage 1 inventories A1–A5 by test-grep (not plan-doc claims — P0-1 lesson: round-1
 once shipped a gate on a fabricated field).
@@ -461,11 +479,24 @@ replay — `nats-transport.ts:580`).
 
 ### 6.2 Guards
 
-Extend `scripts/check-banned-symbols.sh` PATTERN with removed symbols
-(`key_exchange`, `devOpen`, `DEV_OPEN`, `subscribeWildcard`, `handleHandshake`,
-`resolveAdmissionMode`, `dev-identity`), scoped to exclude docs/archive +
-docs/review-2026-07-15 + the guard scripts; canary-test every addition (planted
-symbol; git grep only — rg is absent on real PATH).
+Extend `scripts/check-banned-symbols.sh` on BOTH axes (codex R3 — the current guard
+scans only `packages README.md docs .github scripts`, missing exactly where the
+regressions live):
+
+- **PATTERN** += `key_exchange`, `devOpen`, `DEV_OPEN`, `subscribeWildcard`,
+  `handleHandshake`, `resolveAdmissionMode`, `devOpenAgentIdentity`.
+- **Paths** += `examples demo e2e .ouroboros` (currently unscanned; they hold live
+  hits like `browser-demo-entry.ts:167`, `run-two-account-isolation.sh:196`,
+  `demo/run.sh:327` that must all be gone or excluded by the time the guard lands).
+- **Documented narrow exclusions** (each with an inline comment naming why): the
+  migration-detector seams that legitimately CONTAIN the removed literals —
+  `account-config.ts` + its test, `nats-credential-source.ts` + its test (env
+  detection + messages) — plus `CHANGELOG.md`, `docs/archive`,
+  `docs/review-2026-07-15`, and the guard scripts themselves.
+
+Canary-test every addition (planted symbol per new pattern AND per new path root;
+git grep only — rg is absent on real PATH). `pack-load-smoke.sh` allowlist unchanged
+unless dist file set changes.
 
 ### 6.3 CI baseline
 
