@@ -68,7 +68,7 @@ status/terminal-error surfacing.
   config from those, as in `e2e/local/run-all-real.sh:89-127`.) Required for
   scene ③ (we must own the relay to kill/tamper it) and consistent with the C2
   accepted-risk posture (self-operated relay only until the authenticated
-  handshake lands).
+  registration lands).
 - **Optional `DEMO_RELAY=synadia`**: external managed-account mode via the proven
   `mintNatsUserCreds({ issuerAccountId, accountSeed: <signing seed> })` path
   (`packages/saas/src/nats-user-creds.ts:46-54,109-117`,
@@ -99,8 +99,8 @@ login story spans gateways.
 
 Admission for every demo account stays `register-hop` (the default for
 `auth.strategy="jwt"`): only the register hop populates the aud map + verifier
-(`index-nats.ts:690-729`), and an `admission:"auto"` account would 401 the
-bootstrap JWT. run.sh must not set `admission:"auto"`.
+(`index-nats.ts:690-729`), and an `admission:register-hop` account would 401 the
+bootstrap JWT. run.sh must not set `admission:register-hop`.
 
 ## Layout
 
@@ -154,7 +154,7 @@ Everything here is demo-side; **zero product-code changes.**
    e2e echo fallback) → `openclaw channels add` for `agent-dev` (device-flow
    enroll, auto-approved on first boot only) → `gateway run` (consume-only).
    Gateway config: `auth.strategy="jwt"` (⇒ `register-hop` admission — do NOT set
-   `admission:"auto"`), `execApprovals.enabled` + `execApprovals.approvers` = the
+   `admission:register-hop`), `execApprovals.enabled` + `execApprovals.approvers` = the
    demo peer ids, history on.
 3. `demo/web/` — widget on `WebChannelNatsClientWrapper` (full protocol already
    reduced to state, `nats-client-wrapper.ts:207-311`): message list with
@@ -278,10 +278,10 @@ narrative:
   `wss://connect.ngs.global`. The wiretap over a real third-party relay is the star
   — ciphertext only. Secrets live in `synadia.env` (outside the repo, never
   committed). Verified live: reply/wiretap/history all OK. **Surfaced + fixed a
-  latent product race:** the one-shot X25519 handshake could be dropped on a real
+  latent product race:** the one-shot authenticated registration could be dropped on a real
   (higher-latency) relay because core NATS has no retention and the agent's per-peer
   SUB may not be server-active when the browser publishes; the client now
-  republishes the handshake (500ms × 5) until answered. Local sub-ms latency always
+  republishes the registration (500ms × 5) until answered. Local sub-ms latency always
   hid it. `openclaw.plugin.json:216-249` BYO-NATS (fully SaaS-issuer-less static
   creds) is the further end of this spectrum, not yet built.
 - **Agent-initiated outbound** (`index-nats.ts:732-744`, primary account) —
@@ -324,7 +324,7 @@ gap (below).
   core change.** Two independent causes were stacked; fixing the first exposed the
   second. (This trace predates the register-over-NATS migration — the register hop
   named below was an HTTP plugin route at the time; it is now a NATS request/reply,
-  but the detached-async-context read and handshake-complete snapshot carried
+  but the detached-async-context read and register-complete snapshot carried
   forward unchanged, and Phase 6 later added the register-delivered snapshot on top.)
 
   **Cause 1 — scope (`missing scope: operator.read`).** `historyRecent` runs inside
@@ -346,10 +346,10 @@ gap (below).
 
   **Cause 2 — timing (fail-closed `no session key yet`).** With the read fixed, the
   snapshot was still dropped: it was sent from the register hop, which completes
-  BEFORE the E2E X25519 handshake, so `sendHistory` had no per-peer session key and
+  BEFORE the E2E authenticated registration, so `sendHistory` had no per-peer session key and
   fail-closed (correctly — never plaintext). **Fix:** send the initial snapshot from
   a new `NatsChannel.setHandshakeCompleteHandler` (fires at the end of
-  `handleHandshake`, once `peerSessionKeys` is set) instead of the register hop. That
+  `legacy exchange handler`, once `peerSessionKeys` is set) instead of the register hop. That
   handler also runs outside the HTTP request scope, so it composes cleanly with the
   detached read.
 
@@ -396,11 +396,11 @@ this scope).
 ## Honest-demo notes
 
 - **Active-MITM is NOT claimed (C2).** The E2E session key is derived from
-  whatever pubkey arrives on `.handshake`; the client does not yet pin it against
+  whatever pubkey arrives on `registration subject`; the client does not yet pin it against
   the SaaS-attested `agentPublicKey` that `saas-bootstrap.ts:222` already extracts
   (`nats-client.ts:828-834`). So scene ③ proves confidentiality vs a **passive**
   wiretap + integrity vs **blind** tamper (AAD drop) + authentication (PoP) +
-  availability — but an **active** relay substituting its own handshake key could
+  availability — but an **active** relay substituting its own registration key could
   decrypt. That is the deferred C2 hardening; the demo must not claim active-MITM
   resistance. `DEMO_RELAY=synadia` inherits this caveat (call it out in README).
 - **Revoke is enforced at the rendezvous** (bootstrap/register), not by killing an

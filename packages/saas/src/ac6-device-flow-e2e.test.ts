@@ -57,6 +57,7 @@ const TEST_ACCOUNT_ID = "test-agent";
 let enrollmentServer: ReturnType<typeof spawn> | null = null;
 let bootstrapServer: ReturnType<typeof spawn> | null = null;
 let natsServer: ReturnType<typeof spawn> | null = null;
+let bootstrapAgentPublicKey = "";
 
 // Resolve the tsx binary from node_modules (a bare `npx tsx` is flaky under a
 // spawned shell — it may miss the cache and report "command not found").
@@ -132,16 +133,14 @@ async function startBootstrapServer(): Promise<void> {
     "../reference/bootstrap-server.ts",
   );
 
+  bootstrapAgentPublicKey = await generateDeviceKey();
   bootstrapServer = spawn(TSX_BIN, [serverPath], {
     cwd: dirname(fileURLToPath(import.meta.url)),
     env: {
       ...process.env,
       PORT: String(BOOTSTRAP_SERVER_PORT),
       SAAS_BASE_URL: BOOTSTRAP_BASE_URL,
-      // F2: this reference bootstrap-server only serves the well-known DEV agent
-      // pin in dev-open mode (it has no enrollment/registry). This is a dev/e2e
-      // harness, so opt in — the /bootstrap response then carries agentPublicKey.
-      WEBCHANNEL_NATS_DEV_OPEN: "1",
+      WEBCHANNEL_AGENT_PUBLIC_KEY: bootstrapAgentPublicKey,
     },
     stdio: "pipe",
   });
@@ -471,7 +470,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
 
     expect(bootstrapResponse.jwt).toBeDefined();
     expect(bootstrapResponse.peerId).toBeDefined();
-    expect(bootstrapResponse.agentPublicKey).toBeDefined();
+    expect(bootstrapResponse.agentPublicKey).toBe(bootstrapAgentPublicKey);
     expect(bootstrapResponse.jwksUrl).toContain("/.well-known/jwks.json");
     expect(bootstrapResponse.natsUrl).toContain("nats");
 

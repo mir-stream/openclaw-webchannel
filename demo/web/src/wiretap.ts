@@ -91,7 +91,7 @@ export async function createWiretap(
   client.onRawMessage((subject: string, payload: string) => {
     const leaf = subject.split(".").slice(-2).join(".");
     // The admission exchange (register request + reginbox reply) rides the relay
-    // now — tag it so a viewer notices the JWT/PoP handshake is visible yet safe.
+    // now — tag it so a viewer notices the JWT/PoP registration is visible yet safe.
     // Match BOTH the request (`…{peerId}.register`) and the reply, whose subject
     // is `…{peerId}.reginbox.{token}` (ends in the token, not `.reginbox`), via a
     // segment check rather than an end-anchored test.

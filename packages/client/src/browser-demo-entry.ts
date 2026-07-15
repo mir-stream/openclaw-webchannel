@@ -154,20 +154,14 @@ export async function runDemo(
     agentPublicKey?: string;
   };
   if (!jwt || !peerId) throw new Error("bootstrap-jwt response missing jwt/peerId");
-  // F2: register-hop needs the pinned agent key to authenticate the delivered K.
-  // Only required when the register hop is on (gwUrl set); the auto/handshake
-  // path (no gwUrl) never delivers a wrapped K.
-  if (opts.gwUrl && !agentPublicKey) {
+  // F2: the pinned agent key authenticates the register-delivered K.
+  if (!agentPublicKey) {
     throw new Error("bootstrap response missing agentPublicKey (register-hop requires it)");
   }
 
-  // 5. Production client with NATS-layer NKEY auth, and — only when `gwUrl` is
-  //    set (now a register-hop TOGGLE, not a URL: the register hop rides NATS on
-  //    the account's `.register` subject, so no gateway URL is dialed) — the PoP
-  //    register hop. With `admission: "auto"` on the agent there is no register
-  //    hop: leave `gwUrl` empty and the client connects with `natsCredentials`
-  //    only, relying on the X25519 handshake + dmSecurity allowlist for admission.
-  //    Unlike runAllReal, we keep this client alive for the whole chat session.
+  // 5. Production client with NATS-layer NKEY auth and the PoP register hop.
+  //    `gwUrl` is retained as an obsolete caller option but never selects the
+  //    security protocol; registration rides the account's NATS `.register` subject.
   const clientOpts = {
     url: natsUrl,
     jwt,
@@ -175,17 +169,11 @@ export async function runDemo(
     tenant: opts.tenant,
     peerId,
     natsCredentials: { userJwt, userSeedRaw },
-    ...(opts.gwUrl
-      ? {
-          registration: {
-            devicePrivateKey: ed25519.privateKey,
-            // Phase 6: register-delivered conversation key (no handshake).
-            deviceX25519PrivateKey: x25519.privateKey,
-            // F2: pin the SaaS-attested agent key for K authentication.
-            pinnedAgentPublicKey: agentPublicKey,
-          },
-        }
-      : {}),
+    registration: {
+      devicePrivateKey: ed25519.privateKey,
+      deviceX25519PrivateKey: x25519.privateKey,
+      pinnedAgentPublicKey: agentPublicKey,
+    },
   };
   const client = new WebChannelNatsClient(clientOpts);
 
@@ -198,10 +186,10 @@ export async function runDemo(
   // Wire terminal errors (e.g. PoP/NKEY rejection) straight through.
   client.onError((e) => callbacks.onError(e));
 
-  // Surface connection state. The handshake (and PoP register) happen after the
+  // Surface connection state. PoP registration happens after the
   // socket connects; we report "connecting" now and "connected" once the NATS
   // PONG flips the client to connected. The UI treats "connected" as ready —
-  // outbound sends are buffered by the client until the handshake completes, so
+  // outbound sends are buffered by the client until registration completes, so
   // a human typing immediately after "connected" is safe (fail-closed buffering).
   client.onState((connected) => {
     callbacks.onStatus(connected ? "connected" : "connecting");

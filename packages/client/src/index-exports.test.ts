@@ -27,6 +27,10 @@ import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 // use is the whole check: if the barrel stops exporting the name, tsc fails here.
 const _errorCauseExported: WebChannelErrorCause = "protocol-mismatch";
 void _errorCauseExported;
+const registration = {
+  devicePrivateKey: {} as CryptoKey,
+  deviceX25519PrivateKey: {} as CryptoKey,
+};
 
 /** Deterministic 32-byte key (no crypto.getRandomValues — reproducible). */
 function makeKey32(seed: number): Uint8Array {
@@ -70,6 +74,7 @@ describe("public export surface (package entry)", () => {
       reconnectBaseMs: 250,
       reconnectCapMs: 5_000,
       heartbeatIntervalMs: 20_000,
+      registration,
     };
     expect(options.natsUrl).toContain("relay");
   });

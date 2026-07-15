@@ -138,7 +138,7 @@ for acct in "${ACCOUNTS[@]}"; do
   set +e; wait "$add_pid"; rc=$?; set -e
   [ "$rc" -ne 0 ] && { echo "[multiplex] $acct enrollment did not complete (denied/expired):"; tail -8 "$addlog"; exit 2; }
   [ -f "$HOME_DIR/.openclaw-webchannel/$acct/credentials.json" ] || { echo "[multiplex] $acct creds not persisted"; exit 2; }
-  # Re-assert register-hop admission (setup adapter may write admission:auto).
+  # Re-assert register-hop admission (setup adapter may write admission:register-hop).
   node -e '
     const fs = require("fs"); const p = process.argv[1], acct = process.argv[2];
     const cfg = JSON.parse(fs.readFileSync(p, "utf8"));

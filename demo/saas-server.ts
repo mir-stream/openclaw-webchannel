@@ -612,7 +612,7 @@ const server = createServer(async (req, res) => {
             // browser can pin it and authenticate the register-delivered K. Keyed
             // by (tenant, accountId) — the same account the browser bootstraps for.
             // Omitted when the account has no enrolled agent key yet (e.g. an
-            // auto/handshake account); the client only requires it on the
+            // auto/registration account); the client only requires it on the
             // register-hop path.
             const agentPublicKey = await agentKeyRegistry.get(DEMO_TENANT, accountId);
             console.log(

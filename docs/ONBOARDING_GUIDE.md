@@ -5,7 +5,7 @@ over a NATS relay (Synadia/NGS), end-to-end encrypted, with a **SaaS
 issuer** minting credentials.
 
 > ⚠️ **Relay trust caveat:** the E2E channel currently provides confidentiality against a
-> *passive* relay only. Active-relay MITM protection (authenticated handshake) is **not yet
+> *passive* relay only. Active-relay MITM protection (authenticated registration) is **not yet
 > wired** — see **C2** in [`BACKLOG.md`](./BACKLOG.md). Until then, run this against a relay you
 > operate (your own `nats-server` or your own Synadia account), not a genuinely untrusted one. This is the practical sibling of the conceptual
 [`TRUST_AND_ONBOARDING.md`](./TRUST_AND_ONBOARDING.md).
@@ -43,7 +43,7 @@ Three identities, three different sources (this trips everyone up):
 
 > The agent **subscribes** on `{tenant}/{accountId}`; the browser **sends** to the same
 > `{tenant}/{accountId}` it is told. They must match. Security rests on **tenant creds +
-> E2E encryption + handshake/allowlist**, not on `accountId`.
+> E2E encryption + registration/allowlist**, not on `accountId`.
 >
 > The **handling agent is decoupled** from the wire identity (telegram-like): the
 > `accountId` is the on-wire/admission identity, and which OpenClaw agent answers is a
@@ -95,7 +95,7 @@ export TRUST_CHAIN_PATH="$HOME/.openclaw-webchannel-saas/trust-chain-synadia.jso
 > config's `auth.jwt.issuer` is **derived from `--base-url`** (fact: issuer defaults to
 > the SaaS base URL), so with `admission: register-hop` the two must agree — set
 > `SAAS_ISSUER` to your SaaS base URL (as `e2e/local/run-demo-synadia.sh` does). Under
-> `admission: auto` (the happy-path default) `iss` is not verified, so a divergent value
+> `admission:register-hop (the happy-path default) `iss` is not verified, so a divergent value
 > like the one above is harmless. `e2e/local/run-demo-synadia.sh` is the canonical,
 > already-updated example of the full demo env block.
 
@@ -224,7 +224,7 @@ in one shot.
 config at all, `WEBCHANNEL_TENANT` / `WEBCHANNEL_SAAS_BASE_URL` synthesize the `"default"`
 account's identity. Once any webchannel config exists, these are **ignored** (config wins)
 with a one-time deprecation warning. (Connection/static env —
-`WEBCHANNEL_NATS_URL`/`_USER_JWT`/`_USER_SEED`/`_CREDS`/`_DEV_OPEN` — keep their runtime meaning.)
+`WEBCHANNEL_NATS_URL`/`_USER_JWT`/`_USER_SEED`/`_CREDS`/`_LEGACY_UNAUTHENTICATED` — keep their runtime meaning.)
 
 Approve the device code exactly as in §5; on success creds are persisted and `channels add`
 exits 0. `gateway run` then consumes them with no re-approval.
@@ -271,7 +271,7 @@ openclaw config get channels.webchannel    # verify
 | `credentials.mode=enrolled` | NATS creds come from the SaaS device flow |
 | `credentials.saasBaseUrl` | where `/api/enroll` + `/api/poll` live |
 | `auth.jwt.*` | verifies browser bootstrap JWTs (issuer JWKS) |
-| `admission` | `register-hop` (SaaS bootstrap+PoP) or `auto` (handshake+allowlist) — see §6 |
+| `admission` | `register-hop` (SaaS bootstrap+PoP) or `auto` (registration+allowlist) — see §6 |
 
 > **Container caveat:** from inside a container the SaaS is **not** `127.0.0.1` — use
 > `host.docker.internal:3951` for `saasBaseUrl` **and** `jwksUrl`. The `issuer` value
@@ -400,7 +400,7 @@ JWT-mint time (`canAccess` → `403`). Use the **same `tenant`+`accountId`** as 
   > and on openclaw 2026.6.10 `api.registerHttpRoute` could resolve to a no-op → 404, which
   > is why older guidance told you to fall back to `auto`. That is obsolete: register moved
   > to NATS request/reply and the 404 class is gone.
-- **`auto`**: the agent serves any peer that completes the X25519 handshake **and** passes
+- **`auto`**: the agent serves any peer that completes the authenticated registration **and** passes
   the `dmSecurity` allowlist — **no register hop, no SaaS bootstrap/PoP**. Simpler, but it
   drops the PoP + short-TTL admission guarantee. Switch with:
   ```bash
@@ -456,14 +456,14 @@ The `#token=` fragment auto-authenticates; a missing/wrong token → `AUTH_RATE_
 
 **Env overrides** (take precedence over config; keep secrets out of committed config):
 `WEBCHANNEL_NATS_URL`, `WEBCHANNEL_NATS_USER_JWT`, `WEBCHANNEL_NATS_USER_SEED`,
-`WEBCHANNEL_NATS_CREDS`, `WEBCHANNEL_NATS_DEV_OPEN=1`, `WEBCHANNEL_SAAS_BASE_URL`,
+`WEBCHANNEL_NATS_CREDS`, `removed unauthenticated NATS flag`, `WEBCHANNEL_SAAS_BASE_URL`,
 `WEBCHANNEL_TENANT`. (Acquisition no longer reads `WEBCHANNEL_AGENT_ID` — the wire identity
 is the `accountId`, set via `channels add --account <id>`. The **login-flow demo** server is
 configured with `DEMO_ACCOUNT_ID`/`DEMO_TENANT`; `WEBCHANNEL_ACCOUNT_ID` is a **headless
 harness** var read by the `e2e/local/*` drivers.)
 
-**Subjects:** `webchannel.{tenant}.{accountId}.{peerId}.{in,out,handshake}`
-(agent subscribes `…*.in`/`…*.handshake`, publishes `…*.out`; browser is the mirror).
+**Subjects:** `webchannel.{tenant}.{accountId}.{peerId}.{in,out,registration}`
+(agent subscribes `…*.in`/`…*registration subject`, publishes `…*.out`; browser is the mirror).
 
 **Credential modes** (`nats.credentials.mode`): `enrolled` (SaaS device flow, default) ·
 `static` (BYO url + user JWT + NKEY seed / `.creds` file, no issuer) · `open` (dev, no auth).

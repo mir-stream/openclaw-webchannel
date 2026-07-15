@@ -18,7 +18,7 @@
  *                 (these already carry their auth material; no SaaS issuer).
  *
  * This keeps the connection/static-creds env overrides
- * (WEBCHANNEL_NATS_URL/_USER_JWT/_USER_SEED/_CREDS/_DEV_OPEN) meaningful: the
+ * (WEBCHANNEL_NATS_URL/_USER_JWT/_USER_SEED/_CREDS/_LEGACY_UNAUTHENTICATED) meaningful: the
  * resolver still classifies the source from them; only the `enrolled` branch is
  * redirected from "enroll now" to "load persisted".
  */

@@ -30,7 +30,7 @@ auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See 
   (`:18789`): enrolled via the SaaS device flow against a persistent local trust chain
   (`nats-server` + reference issuer), credentials cached at `~/.openclaw-webchannel/credentials.json`
   so restarts reconnect with no re-approval. Also has an env-gated **dev/open-NATS** path
-  (`WEBCHANNEL_NATS_DEV_OPEN=1`) that connects to a plain local `nats-server` with no enrollment —
+  (`removed unauthenticated NATS flag`) that connects to a plain local `nats-server` with no enrollment —
   see [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
@@ -100,7 +100,7 @@ Phase 6 (multi-device) split key establishment by admission mode:
   request/reply on the account's `…{peerId}.register` subject) wraps K (`src/late-join-decryptor.ts`
   — X25519 ECDH + HKDF-SHA256 `webchannel-key-wrap-v1` + ChaCha20-Poly1305) to the device key
   attested in **that request's** verified JWT `cnf` claim and returns it in the register reply.
-  There is **no `.handshake` on this path** — the keyStore-mode channel neither subscribes nor
+  There is **no `registration subject` on this path** — the keyStore-mode channel neither subscribes nor
   answers it — so an active relay cannot substitute keys: K only ever travels **wrapped to a
   JWT-attested device key**, and the wrap target comes from the SaaS-signed JWT `cnf`, not from
   anything the transport controls. So even though register now rides NATS (visible to the relay),
@@ -116,15 +116,15 @@ Phase 6 (multi-device) split key establishment by admission mode:
     surfaces as `JwtIdentity.devicePublicKey`; the register handler REQUIRES it (401 without) and
     wraps per-request. There is deliberately **no cross-request pinned-key store** — the old
     peerId-keyed pin store collided two devices of one user and was removed (with the never-wired
-    `handshake-verifier.ts`) in Phase 6 W7.
+    `registration-verifier.ts`) in Phase 6 W7.
   - **Session scoping caveat:** a register account serves many users, so openclaw's
     `session.dmScope` MUST be `"per-channel-peer"` (or the per-account variant). The default
     `"main"` collapses every peer into ONE agent session, and the register history snapshot then
     delivers the shared transcript to every user (re-sealed to each requester's own K —
     encryption cannot prevent a scoping leak). The plugin warns loudly at startup when it detects
     this (`crossUserHistoryWarning`).
-- **Auto admission (`admission:"auto"`, bring-your-own-NATS) — legacy per-device X25519
-  handshake, unchanged.** The handshake is unauthenticated (any tenant-creds holder can complete
+- **Authenticated admission (`admission:register-hop`, bring-your-own-NATS) — legacy per-device X25519
+  registration, unchanged.** The registration is unauthenticated (any tenant-creds holder can complete
   it), so auto mode gives confidentiality against a *passive* relay only; an *active* relay MITM
   can substitute keys. Acceptable **only while the relay is operated by a trusted party** (your
   own `nats-server` or your own Synadia account). Migrating auto deployments to register
@@ -135,7 +135,7 @@ Phase 6 (multi-device) split key establishment by admission mode:
 **Threat model (register path):** relay substitutes a key → impossible, K is wrapped to the
 JWT-attested `cnf` key and never negotiated on the wire; attacker skips bootstrap → no admission
 (register requires a verified JWT + PoP); forged `cnf` → JWT signature verification fails;
-tampered wrapped key → Poly1305 reject, client fails closed (terminal error, no handshake
+tampered wrapped key → Poly1305 reject, client fails closed (terminal error, no registration
 downgrade). **Auto path:** active relay MITM remains possible (see above). **Out of scope:** SaaS
 key compromise / revocation (deferred to re-enrollment); K rotation (deferred — fixed key first);
 real-time allowlist authz is a core-delegated stub.
@@ -153,7 +153,7 @@ credentials — **no SaaS issuer required**.
   them (no import from `packages/saas`).
 - **Axis B — peer admission** (`src/nats-admission.ts`): which browser peers the agent
   serves. `register-hop` (SaaS bootstrap JWT + PoP) or `auto` (subscribe the
-  tenant/agent wildcard; serve any peer that completes the X25519 handshake **and**
+  tenant/agent wildcard; serve any peer that completes the authenticated registration **and**
   passes the `dmSecurity` allowlist). Static creds default to `auto`. Security here
   rests on **NATS subject permissions + the allowlist + E2E encryption** — not on an
   issuer. E2E encryption stays fail-closed regardless of source.
@@ -166,7 +166,7 @@ credentials — **no SaaS issuer required**.
   // NO `auth` block needed: static creds resolve admission to "auto", and JWT
   // verification (`assertJwtAuthConfig` + the register-path `verifyIdentity`)
   // only runs for the "register-hop" admission mode.
-  // Browser admission here = NATS subject permissions + X25519 handshake
+  // Browser admission here = NATS subject permissions + authenticated registration
   // (+ an optional `dmSecurity` allowlist). The `jwt` register-hop strategy is
   // the only alternative; it is INERT on this static/auto NATS path.
   "nats": {
@@ -193,7 +193,7 @@ Env overrides (take precedence over config) — secrets need not live in committ
 | `WEBCHANNEL_NATS_USER_JWT` | static user JWT |
 | `WEBCHANNEL_NATS_USER_SEED` | static user NKEY seed (`SU…`) |
 | `WEBCHANNEL_NATS_CREDS` | path to a NATS `.creds` file (JWT + seed) |
-| `WEBCHANNEL_NATS_DEV_OPEN=1` | dev open-NATS (no auth) |
+| `removed unauthenticated NATS flag` | dev open-NATS (no auth) |
 | `WEBCHANNEL_SAAS_BASE_URL` | enrolled-mode SaaS base URL |
 
 ### Browser (natsCredentials, no registration)
@@ -213,7 +213,7 @@ new WebChannelNatsClient({
 
 > **Synadia permissions:** the static user must have **pub + sub** permission on the
 > `webchannel.<tenant>.<accountId>.*` subjects (the agent subscribes to `…*.in` /
-> `…*.handshake` and publishes `…*.out`; the browser is the mirror). Without the
+> `…*registration subject` and publishes `…*.out`; the browser is the mirror). Without the
 > wildcard sub permission the agent's `auto` admission cannot receive peers.
 
 ## NATS subject namespace

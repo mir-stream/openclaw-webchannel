@@ -24,7 +24,7 @@ import type {
 } from "./types.js";
 import {
   WebChannelNatsClient,
-  type NatsClientOptions,
+  type WebChannelNatsClientOptions as DirectClientOptions,
   type InboundMessage,
 } from "./nats-client.js";
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
@@ -51,11 +51,13 @@ import { isLikelyAbortText, isExplicitStop } from "./abort-mirror.js";
  * Everything else (accountId, tenant, peerId, registration, natsCredentials,
  * reconnect tuning) is forwarded as-is.
  */
-export type WebChannelNATSClientOptions = WebChannelOptions &
-  Omit<NatsClientOptions, "url" | "jwt">;
+export type WebChannelNATSClientOptions = Omit<WebChannelOptions, "bootstrapJwt"> &
+  Omit<DirectClientOptions, "url" | "jwt"> & {
+    bootstrapJwt: string;
+  };
 
 export class WebChannelNATSClient {
-  private readonly natsOptions: NatsClientOptions;
+  private readonly natsOptions: DirectClientOptions;
   private readonly client: WebChannelNatsClient;
 
   private state: WebChannelState = {
@@ -103,7 +105,7 @@ export class WebChannelNATSClient {
   constructor(options: WebChannelNATSClientOptions) {
     this.natsOptions = {
       url: options.natsUrl ?? "wss://nats.example.com",
-      jwt: options.bootstrapJwt ?? "",
+      jwt: options.bootstrapJwt,
       accountId: options.accountId ?? "default-account",
       tenant: options.tenant ?? "default-tenant",
       peerId: options.peerId ?? "anonymous-peer",

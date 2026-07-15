@@ -3,7 +3,7 @@
 # browser running the PRODUCTION WebChannelNatsClient:
 #   (a) NATS-layer NKEY-authenticates to a REAL JWT-auth nats-server, AND
 #   (b) drives the JWT + Proof-of-Possession HTTP register hop,
-# against a REAL enrolled plugin (gateway, devOpen OFF) whose NATS creds were
+# against a REAL enrolled plugin (gateway, dev unauthenticated mode OFF) whose NATS creds were
 # acquired AT CONFIG TIME via `openclaw channels add` (가-1: the device-flow
 # EnrollmentClient runs in the setup hook, not at gateway boot) and which the
 # CONSUME-ONLY gateway then loads to connect to the SAME nats-server — all from
@@ -11,7 +11,7 @@
 # left is the echo LLM.
 #
 # This FUSES the #18 server topology (run-enrolled-transport.sh: unified issuer +
-# JWT-auth nats-server from ONE setupTrustChain + enrolled plugin, devOpen OFF)
+# JWT-auth nats-server from ONE setupTrustChain + enrolled plugin, dev unauthenticated mode OFF)
 # with the #19 browser driver (browser-jwt-register.mjs → here: all-real.mjs).
 #
 # Trust unification: ONE setupTrustChain() in the reference enrollment-server
@@ -284,7 +284,7 @@ CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
 echo "[run-all-real] ✓ credentials persisted at $CRED_FILE"
 
 # 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
-#      setup adapter writes the demo-proven block (`admission: "auto"`,
+#      setup adapter writes the demo-proven block (`admission: "register-hop"`,
 #      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
 #      override that disables the HTTP register hop (no aud→account dispatch
 #      entry ⇒ challenge 401 "No account for token audience"), and this harness

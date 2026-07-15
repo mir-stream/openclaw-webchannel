@@ -8,6 +8,11 @@ import type { InboundMessage, NatsClientOptions } from "./nats-client.js";
 import { inboundSubject, handshakeSubject } from "./nats-client.js";
 import { generateX25519KeyPair, keyExchangeFrame } from "./e2e-crypto-browser.js";
 
+const registration = {
+  devicePrivateKey: {} as CryptoKey,
+  deviceX25519PrivateKey: {} as CryptoKey,
+};
+
 /**
  * CL1 regression: the public wrapper must FORWARD the NATS-layer NKEY
  * credentials (and reconnect tuning) to the underlying client. Before the fix
@@ -30,6 +35,7 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
       accountId: "acct-1",
       tenant: "tenant-1",
       peerId: "peer-1",
+      registration,
       natsCredentials,
     });
 
@@ -49,6 +55,7 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
       accountId: "acct-1",
       tenant: "tenant-1",
       peerId: "peer-1",
+      registration,
       reconnectBaseMs: 250,
       reconnectCapMs: 8_000,
     });
@@ -65,6 +72,7 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
       accountId: "acct-1",
       tenant: "tenant-1",
       peerId: "peer-1",
+      registration,
       heartbeatIntervalMs: 0, // e.g. an embedder disabling the heartbeat
     });
     const built = wrapper["natsOptions"] as NatsClientOptions;
@@ -78,6 +86,7 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
       accountId: "acct-1",
       tenant: "tenant-1",
       peerId: "peer-1",
+      registration,
     });
 
     const built = wrapper["natsOptions"] as NatsClientOptions;
@@ -142,6 +151,7 @@ describe("WebChannelNATSClient — CL2 terminal error status", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
       heartbeatIntervalMs: 0,
     });
     wrapper.connect();
@@ -176,6 +186,7 @@ describe("WebChannelNATSClient — P1-7 error cause on state", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   /** Drive the inner client's error listeners (what a real terminal failure does). */
@@ -257,6 +268,7 @@ describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
 
@@ -338,6 +350,7 @@ describe("WebChannelNATSClient — W6 agent-bubble id adoption", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   type AnyFrame = { type: string; [k: string]: unknown };
@@ -463,6 +476,7 @@ describe("WebChannelNATSClient — #16 ordered history insertion", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: AnyFrame): void {
@@ -613,6 +627,7 @@ describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () =
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
@@ -853,6 +868,7 @@ describe("WebChannelNATSClient — P0-3 command discovery", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
@@ -906,6 +922,7 @@ describe("WebChannelNATSClient — P0-7b delivery acks", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
@@ -962,6 +979,7 @@ describe("WebChannelNATSClient — protocol version on state", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
 
@@ -1007,6 +1025,7 @@ describe("WebChannelNATSClient — reasoning lane", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
 

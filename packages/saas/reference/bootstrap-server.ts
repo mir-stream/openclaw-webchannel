@@ -37,7 +37,6 @@ import type { JwksDocument } from "../src/types.js";
 // F2: this dev bootstrap server front-ends a DEV-OPEN register-hop agent, which
 // wraps K under the WELL-KNOWN dev identity key (packages/plugin/src/dev-identity.ts).
 // Deliver its PUBLIC half so the browser pins the same key the agent wraps under.
-import { devOpenAgentIdentityPublicB64url } from "../../plugin/src/dev-identity.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -50,14 +49,9 @@ const SAAS_ISSUER = process.env.SAAS_ISSUER || SAAS_BASE_URL;
 
 const JWKS_URL = `${SAAS_BASE_URL}/.well-known/jwks.json`;
 const NATS_URL = process.env.NATS_URL || "wss://nats.example.com";
-// F2 — DEV-OPEN gate. This reference server has NO enrollment/registry, so it can
-// only deliver an `agentPublicKey` pin for the DEV-OPEN register-hop agent (which
-// wraps K under the PUBLIC well-known dev identity key). That is safe ONLY when
-// the whole stack is dev-open; a production copy would leak the public dev key as
-// a "trusted" pin and re-open the MITM. So the pin is served ONLY behind the
-// explicit dev knob (WEBCHANNEL_NATS_DEV_OPEN=1, matching the gateway's dev flag).
-// Otherwise NO pin is returned and the browser fail-closes on the register path.
-const DEV_OPEN = process.env.WEBCHANNEL_NATS_DEV_OPEN === "1";
+// The pin is supplied by the enrollment/registry owner. This standalone reference
+// server deliberately has no implicit identity fallback.
+const AGENT_PUBLIC_KEY = process.env.WEBCHANNEL_AGENT_PUBLIC_KEY;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,8 +69,8 @@ type BootstrapRequest = {
 type BootstrapResponse = {
   jwt: string; // RS256-signed bootstrap JWT
   peerId: string; // = JWT `sub`; returned so the driver stays consistent
-  // F2: the DEV-OPEN agent's well-known dev identity public key, delivered ONLY
-  // when DEV_OPEN is set (see above). Omitted otherwise → the browser fail-closes.
+  // SaaS-delivered pin for the enrolled agent identity. Omitted when the caller
+  // has not configured one, causing the browser to fail closed at registration.
   agentPublicKey?: string;
   jwksUrl: string; // JWKS endpoint URL
   natsUrl: string; // NATS WebSocket URL
@@ -249,7 +243,7 @@ async function handleBootstrap(req: any, res: any, trustChain: RealTrustChain): 
       // — ONLY in dev-open mode (this reference server has no registry/enrollment,
       // and the dev key is public, so serving it outside dev-open would re-open
       // the MITM). Omitted otherwise → the browser fail-closes on the register path.
-      ...(DEV_OPEN ? { agentPublicKey: devOpenAgentIdentityPublicB64url() } : {}),
+      ...(AGENT_PUBLIC_KEY ? { agentPublicKey: AGENT_PUBLIC_KEY } : {}),
       jwksUrl: JWKS_URL,
       natsUrl: NATS_URL,
     };

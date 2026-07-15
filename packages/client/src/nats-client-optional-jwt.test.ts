@@ -153,39 +153,22 @@ describe("NatsClient — optional bootstrap jwt", () => {
 });
 
 describe("WebChannelNatsClient — registration without a bootstrap jwt", () => {
-  it("fires the error callback and does NOT proceed to the PoP register hop", async () => {
-    FakeNatsWS.sendInfo = false; // plain path: CONNECT on ws-open, PONG → connected.
-    // The guard rejects before devicePrivateKey is ever used, but the type wants a
-    // real CryptoKey, so mint a throwaway Ed25519 key.
+  it("rejects construction before any register hop", async () => {
     const kp = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
       "sign",
       "verify",
     ])) as CryptoKeyPair;
 
-    const client = new WebChannelNatsClient({
-      url: "ws://127.0.0.1:4222",
-      accountId: "a",
-      tenant: "t",
-      peerId: "p",
-      // NO bootstrap `jwt`, but `registration` is present → guard must trip.
-      registration: {
-        devicePrivateKey: kp.privateKey,
-      },
-    });
-
-    let captured: Error | null = null;
-    client.onError((e) => { captured = e; });
-    let lastState = true;
-    client.onState((c) => { lastState = c; });
-
-    client.connect();
-    await settle();
-
-    expect(captured).toBeInstanceOf(Error);
-    expect((captured as unknown as Error).message).toMatch(/registration requires a bootstrap/i);
-    // …and tore the connection down (fail-closed), without proceeding to register.
-    expect(lastState).toBe(false);
-
-    client.disconnect();
+    expect(() => new WebChannelNatsClient({
+        url: "ws://127.0.0.1:4222",
+        jwt: "",
+        accountId: "a",
+        tenant: "t",
+        peerId: "p",
+        registration: {
+          devicePrivateKey: kp.privateKey,
+          deviceX25519PrivateKey: kp.privateKey,
+        },
+      })).toThrow(/non-empty bootstrap jwt/i);
   });
 });

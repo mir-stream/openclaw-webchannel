@@ -15,26 +15,13 @@
 // acctA's channel — the aud IS the accountId), and binding.account routing
 // (resolveAgentRoute(accountId) → the agent bound via webchannel:<account>). No unit mocks.
 import { webcrypto } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { WebChannelNatsClient } from "../../packages/client/src/nats-client.js";
-import { buildBootstrapClaims } from "../../packages/saas/src/bootstrap-claims.js";
-// F2: dev-open register-hop agent wraps K under the well-known dev identity key.
-// CAVEAT: both accounts here pin the SAME dev key (the dev fallback is process-wide),
-// so this e2e does NOT exercise the per-account identity-key property — that a wrap
-// from account A cannot be authenticated as account B. That property is covered by
-// the plugin unit negative controls (nats-channel-keystore.test.ts: relay/non-pinned
-// key rejected) and the client conformance tests; here we only assert subject-scope
-// isolation on the same pinned key.
-import { devOpenAgentIdentityPublicB64url } from "../../packages/plugin/src/dev-identity.js";
 
 const NATS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18222";
-const PRIV_PATH = process.env.WEBCHANNEL_RS256_PRIVATE ?? "/tmp/oc-two-acct-e2e/rs256-private.jwk.json";
-
-const ISS = process.env.WEBCHANNEL_ISSUER ?? "https://e2e-issuer.test";
+const ISSUER = process.env.WEBCHANNEL_ISSUER_URL ?? "http://127.0.0.1:3971";
 const PEER_ID = process.env.WEBCHANNEL_PEER_ID ?? "web-acctA-peer";
 const ACCOUNT_ID = process.env.WEBCHANNEL_ACCOUNT_ID ?? "accta";
 const TENANT = process.env.WEBCHANNEL_TENANT ?? "default-tenant";
-const KID = "webchannel-e2e-rs256";
 
 const EXPECT_PREFIX = process.env.EXPECT_PREFIX ?? "";
 const FORBID_PREFIX = process.env.FORBID_PREFIX ?? "";
@@ -47,17 +34,6 @@ if (!EXPECT_PREFIX || !FORBID_PREFIX) {
 
 const b64url = (b: ArrayBuffer | Uint8Array) =>
   Buffer.from(b instanceof Uint8Array ? b : new Uint8Array(b)).toString("base64url");
-const b64urlStr = (s: string) => Buffer.from(s).toString("base64url");
-
-// 1. RS256 private key (shared issuer key; only `aud` distinguishes accounts).
-const privJwk = JSON.parse(readFileSync(PRIV_PATH, "utf8"));
-const rsaKey = await webcrypto.subtle.importKey(
-  "jwk",
-  privJwk,
-  { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-  false,
-  ["sign"],
-);
 
 // 2. Device X25519 key → cnf.jwk.
 const x25519 = (await webcrypto.subtle.generateKey({ name: "X25519" }, true, [
@@ -73,28 +49,35 @@ const ed25519 = (await webcrypto.subtle.generateKey({ name: "Ed25519" }, false, 
 const edPubJwk = (await webcrypto.subtle.exportKey("jwk", ed25519.publicKey)) as { x?: string };
 if (!edPubJwk.x) throw new Error("Ed25519 public JWK missing 'x'");
 
-// 4. Bootstrap JWT with aud=ACCOUNT_ID (this account's accountId → register dispatch).
-const claims = buildBootstrapClaims({
-  iss: ISS,
-  peerId: PEER_ID,
-  accountId: ACCOUNT_ID,
+const post = async <T>(path: string, body: unknown): Promise<T> => {
+  const response = await fetch(`${ISSUER}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(`${path} failed: ${response.status} ${await response.text()}`);
+  return response.json() as Promise<T>;
+};
+
+// The same enrolled trust chain mints browser NATS credentials and the signed
+// bootstrap token, including the per-account attested agent identity pin.
+const natsCredentials = await post<{ userJwt: string; userSeedRaw: string }>("/test/nats-user", {
   tenant: TENANT,
+  role: "browser",
+  peerId: PEER_ID,
+});
+const bootstrap = await post<{ jwt: string; agentPublicKey: string }>("/test/bootstrap-jwt", {
+  tenant: TENANT,
+  accountId: ACCOUNT_ID,
+  peerId: PEER_ID,
   deviceX25519PublicKey,
   devicePopPublicKey: edPubJwk.x,
 });
-const header = { alg: "RS256", typ: "JWT", kid: KID };
-const signingInput = `${b64urlStr(JSON.stringify(header))}.${b64urlStr(JSON.stringify(claims))}`;
-const sig = await webcrypto.subtle.sign(
-  { name: "RSASSA-PKCS1-v1_5" },
-  rsaKey,
-  new TextEncoder().encode(signingInput),
-);
-const jwt = `${signingInput}.${b64url(sig)}`;
 
 // 5. Production client through the PoP register path.
 const client = new WebChannelNatsClient({
   url: NATS,
-  jwt,
+  jwt: bootstrap.jwt,
   accountId: ACCOUNT_ID,
   tenant: TENANT,
   peerId: PEER_ID,
@@ -104,9 +87,9 @@ const client = new WebChannelNatsClient({
     devicePrivateKey: ed25519.privateKey,
     // Phase 6: register-delivered conversation key (no handshake).
     deviceX25519PrivateKey: x25519.privateKey,
-    // F2: authenticate the delivered K against the dev-open agent's identity key.
-    pinnedAgentPublicKey: devOpenAgentIdentityPublicB64url(),
+    pinnedAgentPublicKey: bootstrap.agentPublicKey,
   },
+  natsCredentials,
 });
 
 client.onError((e) => {

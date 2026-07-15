@@ -7,7 +7,7 @@ agent's reply back — encrypted end-to-end.
 
 ```
 headless Chromium (WebChannelNatsClient)
-      │  X25519 handshake + ChaCha20-Poly1305
+      │  authenticated registration + ChaCha20-Poly1305
       ▼
   nats-server (ws://…:18222)         ← relay sees ciphertext only
       ▼
@@ -81,7 +81,7 @@ node e2e/local/echo-openai-server.mjs 18900 &
 
 # 4. boot the isolated gateway in dev/open-NATS mode (env-driven — see the contract below)
 OPENCLAW_HOME="$OCH" WEBCHANNEL_TICKET_SECRET=e2e-ticket-secret OPENCLAW_DISABLE_BONJOUR=1 \
-  WEBCHANNEL_NATS_DEV_OPEN=1 WEBCHANNEL_NATS_URL=ws://127.0.0.1:18222 \
+  removed unauthenticated NATS flag WEBCHANNEL_NATS_URL=ws://127.0.0.1:18222 \
   WEBCHANNEL_TENANT=default-tenant WEBCHANNEL_ACCOUNT_ID=default-agent \
   node_modules/.bin/openclaw gateway --port 18799 --force &
 # wait for: "[webchannel] ✓ NATS mode plugin registered"
@@ -103,7 +103,7 @@ Both drivers print `[REPLY] echo: …<your message>`, proving the round-trip.
 peer-admission path** — no wildcard shortcut. It is a sibling of the open-NATS round-trip above,
 but boots the gateway with `channels.webchannel.auth.strategy = "jwt"`. The wildcard is gated
 off on the jwt path (`index-nats.ts` / `src/wildcard-gate.ts` `shouldSubscribeWildcard`):
-under `auth.strategy="jwt"` the agent does **not** call `subscribeWildcard()`, so it is
+under `auth.strategy="jwt"` the agent does **not** call `wildcard subscription`, so it is
 subscribed to NO peer subjects until something calls `channel.registerPeer(peerId)` — and the
 only thing that does is the live HTTP register route.
 
@@ -117,8 +117,8 @@ What it does, hermetically (isolated `OPENCLAW_HOME=/tmp/oc-e2e`, self-cleaning 
    + `rs256-private.jwk.json` (the driver re-imports it to sign), **before** the gateway boots.
 2. Boots nats-server + the echo provider + an isolated gateway whose `channels.webchannel.auth`
    is `{ strategy:"jwt", jwt:{ jwksFile, issuer:"https://e2e-issuer.test", audience:"default-agent" } }`,
-   with `dmSecurity:"allowlist"`, `allowFrom:["web-jwt-peer"]`. (`devOpen` stays env-driven —
-   `WEBCHANNEL_NATS_DEV_OPEN=1` — since the schema rejects unknown `channels.webchannel` keys.)
+   with `dmSecurity:"allowlist"`, `allowFrom:["web-jwt-peer"]`. (`dev unauthenticated mode` stays env-driven —
+   `removed unauthenticated NATS flag` — since the schema rejects unknown `channels.webchannel` keys.)
 3. `jwt-register-roundtrip.ts` runs the **production** `WebChannelNatsClient` with a `registration`
    config: it generates device X25519 (→ `cnf.jwk`) + Ed25519 PoP (→ `pop_jwk`) keys, builds the
    bootstrap claims via `packages/saas/bootstrap-claims`, RS256-signs the JWT (`kid` matches the
@@ -128,8 +128,8 @@ What it does, hermetically (isolated `OPENCLAW_HOME=/tmp/oc-e2e`, self-cleaning 
 Because the wildcard is OFF, the reply (`echo: …`) can only mean the agent registered the peer
 through the HTTP hop. The driver prints `[PROOF] agent registered peer via HTTP hop (wildcard OFF)`.
 
-This does **not** change production behavior: enrolled production runs `devOpenNats=false`, so the
-wildcard is already off there. The gate only tightens the devOpen+jwt test so the proof is real.
+This does **not** change production behavior: enrolled production runs `legacy unauthenticated NATS=false`, so the
+wildcard is already off there. The gate only tightens the dev unauthenticated mode+jwt test so the proof is real.
 
 ### Real-SaaS-issuer scenario (real bootstrap-server, real JWKS over HTTP)
 
@@ -167,7 +167,7 @@ The unit-level twin of this proof lives in `packages/saas/src/ac6-device-flow-e2
 the plugin's `verifyJwt` + `JWKSCache` and asserts the real-issuer JWT verifies against the
 served JWKS without a gateway.
 
-JWT issuance is **independent of NATS transport**: this harness keeps devOpen NATS (no
+JWT issuance is **independent of NATS transport**: this harness keeps dev unauthenticated mode NATS (no
 enrollment). The full **enrolled-NATS-transport (device-flow)** variant — a JWT-auth
 nats-server fed by the device-flow `/enroll`+`/poll` credentials — remains a follow-up.
 
@@ -180,7 +180,7 @@ against the plugin schema and rejects unknown keys (so you cannot put `nats`/`en
 
 | Env var | Meaning |
 |---|---|
-| `WEBCHANNEL_NATS_DEV_OPEN=1` | enable the dev/open-NATS path (no enrollment, no JWT) |
+| `removed unauthenticated NATS flag` | enable the dev/open-NATS path (no enrollment, no JWT) |
 | `WEBCHANNEL_NATS_URL` | nats-server ws URL (default `ws://127.0.0.1:4222`) |
 | `WEBCHANNEL_TENANT` / `WEBCHANNEL_ACCOUNT_ID` | subject-namespace fields (`accountId` = the wire identity; must match the browser client) |
 
@@ -191,7 +191,7 @@ Encryption stays **on** (encrypt-by-construction default); the relay only ever s
 - **Echo model, not a live LLM** — by design (hermetic). The agent path is real; only the brain is dumb.
 - **Wildcard auto-register (open-NATS harness only) vs. the HTTP register hop (now exercised)** — the
   open-NATS dev harness connects on the wildcard path and does not call the HTTP register route,
-  so that path uses `NatsChannel.subscribeWildcard()` (the allowlist gate still runs). The HTTP
+  so that path uses `NatsChannel.wildcard subscription` (the allowlist gate still runs). The HTTP
   register hop is now **exercised end-to-end** by the JWT-register scenario above
   (`run-jwt-register.sh`): under `auth.strategy="jwt"` the wildcard is gated OFF
   (`src/wildcard-gate.ts`), so the round-trip there proves `registerPeer` happens **only** via the
