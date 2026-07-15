@@ -18,6 +18,8 @@ import {
   type PinnedKeys,
   type WebChannelErrorCause,
 } from "./index.js";
+import * as publicApi from "./index.js";
+import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 
 // P1-7: compile-time export assertion for the new type. A type-only export has no
 // runtime value, so there is nothing to `expect` at runtime — this TYPE-POSITION
@@ -47,6 +49,27 @@ function validPayload(): BootstrapPayload {
 }
 
 describe("public export surface (package entry)", () => {
+  it("does not export the removed gateway client", () => {
+    const removedExport = "WebChannel" + "Client";
+    expect(removedExport in publicApi).toBe(false);
+  });
+
+  it("constructs the NATS wrapper type without legacy WS options", () => {
+    const compileOnly = (options: ConstructorParameters<typeof WebChannelNATSClient>[0]) =>
+      new WebChannelNATSClient(options);
+    expect(compileOnly).toBeTypeOf("function");
+    const options: ConstructorParameters<typeof WebChannelNATSClient>[0] = {
+      natsUrl: "wss://relay.example.test",
+      bootstrapJwt: "jwt",
+      accountId: "account",
+      tenant: "tenant",
+      peerId: "peer",
+      reconnectBaseMs: 250,
+      reconnectCapMs: 5_000,
+      heartbeatIntervalMs: 20_000,
+    };
+    expect(options.natsUrl).toContain("relay");
+  });
   it("re-exports parseBootstrapResponse and it validates a well-formed payload", () => {
     const keys: PinnedKeys = parseBootstrapResponse(validPayload());
     expect(keys.agentPublicKey).toEqual(makeKey32(2));

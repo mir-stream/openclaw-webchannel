@@ -6,7 +6,7 @@
  *
  * Key changes from original index.ts:
  * - NATS peer channel → NatsChannel
- * - WebSocket upgrade route → Peer registration via JWT verification
+ * - Direct browser route → peer registration via NATS JWT verification
  * - Direct NATS pub/sub instead of WebSocket frame relay
  * - Multi-peer sessions preserved via peerId routing
  * - Approvals use NATS first-write-wins exactly-once
@@ -167,11 +167,11 @@ const runDetachedHistoryRead = <T>(fn: () => Promise<T>): Promise<T> =>
  * auth is returned unchanged.
  *
  * Fail-closed: when `saasBaseUrl` is undefined AND the params are absent we fill
- * NOTHING — `makeJwtVerifier` then throws and the jwt account is skipped with a
+ * NOTHING — `assertJwtAuthConfig` then throws and the jwt account is skipped with a
  * loud log (Step 6). Missing verify params NEVER downgrade an account to `auto`
  * (`admission` is a separate PINNED config default, not derived here). jwksUrl is
  * derived ONLY when no key source (jwksUrl/jwks/jwksFile) is configured, because
- * `makeJwtVerifier` requires EXACTLY ONE — we must not introduce a second.
+ * `assertJwtAuthConfig` requires EXACTLY ONE — we must not introduce a second.
  */
 function deriveAccountAuth(
   raw: AuthConfig | undefined,

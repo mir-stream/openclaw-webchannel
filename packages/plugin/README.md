@@ -7,16 +7,11 @@ OpenClaw agent (Claude) from the browser.
 > completion reports and seed files elsewhere describe component-level work, not end-to-end
 > functionality. Where they conflict with STATUS.md, STATUS.md is correct.
 
-## Two transports
+## Transport
 
-This package ships two plugin entries. **`index-nats.ts` is the production default**
-(`package.json` → `openclaw.extensions = ["./index-nats.ts"]`); `index.ts` is a **dev-only**
-zero-infra fallback.
-
-| Entry | Mode | Role |
-|---|---|---|
-| `index-nats.ts` | **NATS E2E** — both sides dial OUT to a shared NATS bus (no inbound port); relay sees ciphertext only | ✅ **Production default.** Cut over live on the real gateway (`:18789`): real browser ↔ NATS ↔ this plugin ↔ `inbound.run` ↔ back, E2E-encrypted, device-flow enrolled. Satisfies the no-inbound-port premise. |
-| `index.ts` | **Gateway-WS** — browser connects via a WebSocket upgrade on the gateway's own port | 🔧 **Dev-only.** Requires a reachable inbound gateway port (same-host/LAN only) — does **not** satisfy the no-inbound-port premise, so it is NOT a production transport. Keep for zero-infra local round-trips. |
+This package ships the NATS E2E plugin entry. Both browser and agent dial out to
+a shared NATS relay; the agent exposes no browser-facing inbound port and the
+relay sees encrypted envelopes only.
 
 As of `e384198`, a real headless-Chromium message HAS travelled browser → NATS → this plugin →
 `inbound.run` → (echo model) → back. Earlier the NATS entry assumed APIs that don't exist
@@ -37,10 +32,6 @@ auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See 
   so restarts reconnect with no re-approval. Also has an env-gated **dev/open-NATS** path
   (`WEBCHANNEL_NATS_DEV_OPEN=1`) that connects to a plain local `nats-server` with no enrollment —
   see [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
-- Gateway-WS channel (`index.ts`) — **dev-only** zero-infra fallback (run it via an OpenClaw gateway
-  with this plugin loaded in WS mode). Needs a reachable inbound port, so it is NOT used in
-  production. Exercise it via the `smoke/*.mjs` WS round-trip scripts; the single interactive
-  chat demo is the NATS path (`e2e/local/run-demo.sh`).
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
 ## Enrollment & credentials (NATS mode)
@@ -254,9 +245,8 @@ npm test              # vitest run
 `package.json`); the plugin is loaded as TypeScript via OpenClaw's plugin loader. Packaging /
 publish to ClawHub is a known open question — see `../../docs/PACKAGING.md` and STATUS.md.
 
-The plugin serves no static UI and, in the **production** entry (`index-nats.ts`), no inbound
+The plugin serves no static UI and no inbound
 HTTP routes at all: register admission (`register-hop` mode) rides NATS request/reply on the
 account's `webchannel.{tenant}.{accountId}.{peerId}.register` subject, so the agent makes only
-outbound connections. The **legacy dev-only** entry (`index.ts`) still exposes the `/webchannel/ws`
-WebSocket upgrade route instead. Either way a consumer wires the headless `packages/client`
-library into their own page (see that package's README).
+outbound connections. A consumer wires the headless `packages/client` library
+into their own page (see that package's README).

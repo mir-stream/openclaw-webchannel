@@ -49,12 +49,46 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 echo "==> Packing plugin into $WORK …"
-TARBALL=$(cd "$PLUGIN_DIR" && npm pack --pack-destination "$WORK" | tail -1)
+TARBALL=$(cd "$PLUGIN_DIR" && npm_config_cache="$WORK/npm-cache" npm pack --pack-destination "$WORK" | tail -1)
 echo "    tarball: $TARBALL"
 
 echo "==> Extracting tarball …"
 tar xzf "$WORK/$TARBALL" -C "$WORK"
 PKG="$WORK/package"
+
+# The packed manifest must expose only the two built NATS-safe entries.
+node --input-type=module - "$PKG/package.json" <<'NODE'
+import fs from "node:fs";
+const pkg = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const expectedExtensions = ["./dist/index-nats.js"];
+if (JSON.stringify(pkg.openclaw?.extensions) !== JSON.stringify(expectedExtensions)) {
+  throw new Error(`unexpected openclaw.extensions: ${JSON.stringify(pkg.openclaw?.extensions)}`);
+}
+if (pkg.openclaw?.setupEntry !== "./dist/setup-entry.js") {
+  throw new Error(`unexpected openclaw.setupEntry: ${JSON.stringify(pkg.openclaw?.setupEntry)}`);
+}
+NODE
+
+# Pin the complete tarball surface. npm prefixes entries with `package/`.
+EXPECTED_FILES=$(cat <<'EOF'
+README.md
+dist/index-nats.js
+dist/setup-entry.js
+index-nats.ts
+openclaw.plugin.json
+package.json
+setup-entry.ts
+EOF
+)
+# LC_ALL=C on BOTH sides: the heredoc above is ordered by C-locale sort, and an
+# unpinned `sort` (e.g. ko_KR.UTF-8) orders README.md differently → false diff.
+EXPECTED_FILES=$(printf '%s\n' "$EXPECTED_FILES" | LC_ALL=C sort)
+ACTUAL_FILES=$(tar tzf "$WORK/$TARBALL" | sed -e 's#^package/##' -e '/\/$/d' | LC_ALL=C sort)
+if [ "$ACTUAL_FILES" != "$EXPECTED_FILES" ]; then
+  echo "ERROR: packed tarball file list differs from the allowlist." >&2
+  diff -u <(printf '%s\n' "$EXPECTED_FILES") <(printf '%s\n' "$ACTUAL_FILES") >&2 || true
+  exit 1
+fi
 
 # ── Assertions on the extracted package ─────────────────────────────────────
 if [ -d "$PKG/src" ]; then
@@ -69,6 +103,13 @@ for f in dist/index-nats.js dist/setup-entry.js; do
   fi
 done
 
+# Plain grep, NOT rg: rg is absent on the self-hosted runner, and an exit-127
+# inside `if` reads as "no matches" — the scan would be silently disarmed.
+if grep -rnE 'handleUpgrade|[?]ticket=|WebChannelTransport' "$PKG/dist"; then
+  echo "ERROR: packed dist contains a removed gateway transport symbol." >&2
+  exit 1
+fi
+
 for f in dist/index-nats.js dist/setup-entry.js; do
   if [ "$(grep -cF '/src/' "$PKG/$f" || true)" -ne 0 ]; then
     echo "ERROR: $f contains a residual './src/' reference — bundle is not self-contained." >&2
@@ -80,7 +121,7 @@ done
 # The whole point: a runtime import misplaced into devDependencies won't be
 # installed here, so the load step below catches it.
 echo "==> Installing production deps only (--omit=dev) …"
-(cd "$PKG" && npm install --omit=dev --no-audit --no-fund)
+(cd "$PKG" && npm_config_cache="$WORK/npm-cache" npm install --omit=dev --no-audit --no-fund)
 
 # Make host openclaw (peer, provides openclaw/plugin-sdk/*) resolvable.
 mkdir -p "$PKG/node_modules"

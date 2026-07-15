@@ -1,9 +1,8 @@
 /**
- * WebChannel NATS Client Wrapper — Adapter for existing client.ts.
+ * WebChannel NATS Client Wrapper — public browser-facing state adapter.
  *
- * This module wraps the WebChannelNatsClient to provide the same API
- * as the original WebSocket-based WebChannelClient, enabling a drop-in
- * replacement for AC 5's NATS cutover.
+ * This module wraps `WebChannelNatsClient` with transcript, approval, progress,
+ * and subscription state suitable for UI integrations.
  *
  * Changes from gateway-WS:
  * - No WebSocket connection to /webchannel/ws
@@ -40,8 +39,7 @@ import { isLikelyAbortText, isExplicitStop } from "./abort-mirror.js";
 /**
  * NATS-based WebChannel client.
  *
- * Drop-in replacement for WebSocket-based WebChannelClient.
- * Uses NATS subjects for per-peer messaging instead of gateway-WS relay.
+ * Uses per-peer NATS subjects for browser messaging.
  */
 export class WebChannelNATSClient {
   private readonly natsOptions: NatsClientOptions;

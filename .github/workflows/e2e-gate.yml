@@ -2,7 +2,7 @@
 # e2e-gate.yml — Single blocking CI gate for openclaw-webchannel Phase B.
 #
 # Enforces:
-#  - All pre-existing test suites stay green (≥712 test baseline across 3 pkgs)
+#  - All pre-existing test suites stay green (≥1420 test baseline across 3 pkgs)
 #  - 3-package typecheck passes clean
 #  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
 #  - Both dev/open-NATS mode AND enrolled-JWT mode covered
@@ -152,6 +152,9 @@ jobs:
       - name: Plugin pack-and-load smoke (F3 remote-install guard)
         run: bash scripts/pack-load-smoke.sh
 
+      - name: Removed gateway transport symbol guard
+        run: bash scripts/check-banned-symbols.sh
+
       - name: Examples consumer tests (public-API boundary)
         run: |
           npm test --workspace=examples/minimal-consumer
@@ -159,7 +162,7 @@ jobs:
 
       # ──────────────────────────────────────────────────────────────────────
       # 6. Run all test suites with JSON output for baseline verification
-      #    - Baseline: ≥712 tests across all 3 packages
+      #    - Baseline: ≥1420 tests across all packages
       #    - Real-server suites (skipIf removed in CI) now run against the
       #      real nats-server binary installed in step 3.
       #    - Sub-AC 1: e2e/dev-nats-roundtrip.test.ts — open-NATS E2E gate
@@ -174,16 +177,16 @@ jobs:
           CI: "true"
 
       # ──────────────────────────────────────────────────────────────────────
-      # 7. Verify test count meets baseline (≥712 tests passed)
+      # 7. Verify test count meets baseline (≥1420 tests passed)
       #    Fails the gate if the count regresses below the seed-time baseline.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Verify test baseline (≥712 tests)
+      - name: Verify test baseline (≥1420 tests)
         if: always()
         run: |
           set -euo pipefail
           node - << 'EOF'
           const fs = require('fs');
-          const BASELINE = 712;
+          const BASELINE = 1420;
           let data;
           try {
             data = JSON.parse(fs.readFileSync('/tmp/vitest-results.json', 'utf8'));

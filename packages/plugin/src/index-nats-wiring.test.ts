@@ -100,3 +100,10 @@ describe("index-nats.ts wiring contract — approval decision account routing", 
     );
   });
 });
+
+describe("index-nats.ts browser-route absence", () => {
+  it("contains no gateway HTTP route registration or socket-upgrade wiring", () => {
+    expect(INDEX_NATS_SOURCE).not.toContain("registerHttpRoute");
+    expect(INDEX_NATS_SOURCE.toLowerCase()).not.toContain("upgrade route");
+  });
+});

@@ -1,5 +1,7 @@
 # WebChannel — 조사 노트 (RESEARCH)
 
+> **ARCHIVED 2026-07-15.** API observations here are historical.
+
 > 📌 **현재 동작 상태의 단일 진실원: [`STATUS.md`](STATUS.md).** 이 문서는 레퍼런스/조사 노트이며 명시된 설치본 시점 기준이다.
 >
 > ⚠️ **superseded — `hmac-ticket` 전략은 이후 완전히 제거됨.** 아래 `hmac-ticket`·`src/ticket.ts` 관련 서술은 조사 시점의 역사 기록이며, 현행 인증은 `jwt`뿐이다 ([`AUTH.md`](AUTH.md) §4, [`BACKLOG.md`](BACKLOG.md)).

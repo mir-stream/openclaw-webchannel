@@ -30,7 +30,6 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import type { IncomingMessage } from "node:http";
 import { webcrypto } from "node:crypto";
 
 import { verifyJwtAndExtractIdentity } from "./auth.js";
@@ -111,11 +110,6 @@ function mockJwksServerError(status: number): typeof fetch {
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
-/** Minimal IncomingMessage stub carrying only the URL. */
-function fakeReq(url: string): IncomingMessage {
-  return { url } as IncomingMessage;
-}
-
 /** Base64url-encode an arbitrary value via JSON.stringify. */
 function b64url(obj: unknown): string {
   return Buffer.from(JSON.stringify(obj), "utf8").toString("base64url");
@@ -160,10 +154,7 @@ function makeVerifier(fetchImpl: typeof fetch = mockJwksServer(publishedJwks)) {
       _fetchImpl: fetchImpl,
     },
   } as const;
-  return async (req: { url?: string }) => {
-    const token = new URL(req.url ?? "/", "http://localhost").searchParams.get("ticket");
-    return token ? verifyJwtAndExtractIdentity(token, config) : null;
-  };
+  return async (token: string | null) => token ? verifyJwtAndExtractIdentity(token, config) : null;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -184,7 +175,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         { iss: ISSUER, aud: AUDIENCE, sub: "user-abc", iat: now, exp: now + 60 },
         primaryPrivateKey,
       );
-      const identity = await verifier(fakeReq(`/ws?ticket=${token}`));
+      const identity = await verifier(token);
       expect(identity).toEqual({ peerId: "user-abc" });
     });
 
@@ -203,7 +194,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         },
         primaryPrivateKey,
       );
-      const identity = await verifier(fakeReq(`/ws?ticket=${token}`));
+      const identity = await verifier(token);
       expect(identity).toEqual({ peerId: "user-abc", displayName: "Alice" });
     });
 
@@ -221,7 +212,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         },
         primaryPrivateKey,
       );
-      const identity = await verifier(fakeReq(`/ws?ticket=${token}`));
+      const identity = await verifier(token);
       expect(identity).toEqual({ peerId: "user-abc" });
     });
 
@@ -234,7 +225,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         { iss: ISSUER, aud: AUDIENCE, sub: "user-abc", iat: now, exp: now + 60 },
         primaryPrivateKey,
       );
-      await verifier(fakeReq(`/ws?ticket=${token}`));
+      await verifier(token);
       // The JWKSCache must have fetched from the mock server at least once.
       // jwks.ts calls `fetchImpl(url)` with just the URL (no init object).
       expect(fetchImpl).toHaveBeenCalledOnce();
@@ -255,7 +246,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         otherPrivateKey,
         KID, // kid points to our published key, but signature won't match
       );
-      expect(await verifier(fakeReq(`/ws?ticket=${token}`))).toBeNull();
+      expect(await verifier(token)).toBeNull();
     });
 
     it("returns null when the payload is tampered after signing (sig/payload mismatch)", async () => {
@@ -276,7 +267,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         exp: now + 60,
       });
       expect(
-        await verifier(fakeReq(`/ws?ticket=${h}.${tamperedPayload}.${sig}`)),
+        await verifier(`${h}.${tamperedPayload}.${sig}`),
       ).toBeNull();
     });
   });
@@ -297,7 +288,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         },
         primaryPrivateKey,
       );
-      expect(await verifier(fakeReq(`/ws?ticket=${token}`))).toBeNull();
+      expect(await verifier(token)).toBeNull();
     });
 
     it("returns null when the exp claim is missing entirely", async () => {
@@ -308,7 +299,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         { iss: ISSUER, aud: AUDIENCE, sub: "user-abc", iat: now /* no exp */ },
         primaryPrivateKey,
       );
-      expect(await verifier(fakeReq(`/ws?ticket=${token}`))).toBeNull();
+      expect(await verifier(token)).toBeNull();
     });
 
     it("returns null when exp is a non-numeric value (e.g. string 'never')", async () => {
@@ -325,7 +316,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         },
         primaryPrivateKey,
       );
-      expect(await verifier(fakeReq(`/ws?ticket=${token}`))).toBeNull();
+      expect(await verifier(token)).toBeNull();
     });
   });
 
@@ -334,19 +325,19 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
     it("returns null when no ticket query parameter is present", async () => {
       await ensureKeys();
       const verifier = makeVerifier(mockJwksServer(publishedJwks));
-      expect(await verifier(fakeReq("/ws"))).toBeNull();
+      expect(await verifier(null)).toBeNull();
     });
 
     it("returns null when the token has too few segments (not a 3-part JWT)", async () => {
       await ensureKeys();
       const verifier = makeVerifier(mockJwksServer(publishedJwks));
-      expect(await verifier(fakeReq("/ws?ticket=only.two"))).toBeNull();
+      expect(await verifier("only.two")).toBeNull();
     });
 
     it("returns null when the token is completely non-JWT garbage", async () => {
       await ensureKeys();
       const verifier = makeVerifier(mockJwksServer(publishedJwks));
-      expect(await verifier(fakeReq("/ws?ticket=not-a-jwt-at-all"))).toBeNull();
+      expect(await verifier("not-a-jwt-at-all")).toBeNull();
     });
 
     it("returns null when alg=none is declared (algorithm-confusion attack)", async () => {
@@ -363,7 +354,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         exp: now + 60,
       });
       expect(
-        await verifier(fakeReq(`/ws?ticket=${header}.${payload}.`)),
+        await verifier(`${header}.${payload}.`),
       ).toBeNull();
     });
 
@@ -380,7 +371,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         exp: now + 60,
       });
       expect(
-        await verifier(fakeReq(`/ws?ticket=${header}.${payload}.${"A".repeat(43)}`)),
+        await verifier(`${header}.${payload}.${"A".repeat(43)}`),
       ).toBeNull();
     });
 
@@ -398,7 +389,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         },
         primaryPrivateKey,
       );
-      expect(await verifier(fakeReq(`/ws?ticket=${token}`))).toBeNull();
+      expect(await verifier(token)).toBeNull();
     });
 
     it("returns null when the aud claim does not match the configured audience", async () => {
@@ -415,7 +406,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         },
         primaryPrivateKey,
       );
-      expect(await verifier(fakeReq(`/ws?ticket=${token}`))).toBeNull();
+      expect(await verifier(token)).toBeNull();
     });
 
     it("throws (fail-closed) when the mock JWKS server returns a 5xx error", async () => {
@@ -429,7 +420,7 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
       // A JWKS fetch failure must propagate as a rejection (fail-closed),
       // not silently return null (which could be misread as "auth passed").
       await expect(
-        verifier(fakeReq(`/ws?ticket=${token}`)),
+        verifier(token),
       ).rejects.toThrow(/JWKS source unavailable/);
     });
   });

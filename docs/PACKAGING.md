@@ -86,24 +86,24 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 
 ### B. 플러그인 패키지 → publishable  ⬜ (대부분 미완)
 - ⬜ `"private"`/semver — 플러그인 `package.json`은 아직 `private:true`, `0.0.0`.
-- ⬜ 빌드: `openclaw.extensions`가 아직 TS 소스. 게이트웨이가 소스 직접 로드 중이라 동작하지만, 출시엔 `dist/` 빌드 + `files`. **(superseded — entry는 이제 `./index-nats.ts`가 기본값이고 `./index.ts`(Gateway-WS)는 legacy dev-only; `STATUS.md` 참조.)**
+- ⬜ 빌드: `openclaw.extensions`가 아직 TS 소스. 게이트웨이가 소스 직접 로드 중이라 동작하지만, 출시엔 `dist/` 빌드 + `files`. **(superseded — entry는 이제 `./index-nats.ts`가 기본값이고 direct gateway entry removed; `STATUS.md` 참조.)**
 - ⬜ **`openclaw` peerDependency 선언**(여전히 미선언) + 테스트 버전(`v2026.6.6`).
 - ⬜ ESM `exports`/`.d.ts`.
 - ○ SDK 접점 adapter 격리.
 
 ### C. Auth  ✅  → 상세 `AUTH.md`
-- ✅ `ConnectionVerifier` + `handleUpgrade` 배선(하드코딩 `ANON_PEER_ID` 제거).
+- ✅ `JWT register verifier` + `register-hop verification` 배선(하드코딩 `ANON_PEER_ID` 제거).
 - ✅ 빌트인 `anonymous` + `hmac-ticket` + `jwt` + config 스키마.
 - ✅ 안전 기본값(strategy 미설정 거부, anonymous loud opt-in).
-- ✅ ticket 발급/검증 zero-dep(`src/ticket.ts` for hmac, `src/jwt.ts`+`src/jwks.ts` for RS256+JWKS). node smoke 스크립트(`smoke/jwt.mjs` 등)가 발급측을 수행해 E2E 검증.
+- ✅ ticket 발급/검증 zero-dep(`src/ticket.ts` for hmac, `src/jwt.ts`+`src/jwks.ts` for RS256+JWKS). node smoke 스크립트(`NATS live harness` 등)가 발급측을 수행해 E2E 검증.
 - ⬜ `trusted-header` 빌트인, `createWebChannel({auth})` 커스텀 함수 주입.
 
 ### D. 헤드리스 클라이언트 `openclaw-webchannel-client`  ✅ (2026-06-15)
 - ✅ `packages/client` 신규 구현 — **framework-agnostic, zero runtime dep**. ESM, `tsc` 빌드(라이브러리 → `dist/` JS + `.d.ts`).
-- ✅ `WebChannelClient`: `connect()`/`close()`/`send()`/`decide()` + `subscribe(listener)`(불변 상태 스냅샷 push) + `getState()`. (재연결 백오프+지터, 동시-connect sentinel, 매 재연결 `getTicket`, progress 드래프트, 승인 카드, 고아 드래프트 정리, **typing indicator: `WebChannelState.isTyping` + `typing` 케이스 자동 settle**, **history pagination: connect 시 `history` 프레임으로 `state.messages` hydrate + `loadHistory({before?, limit?})` 페이지네이션 메서드, id 중복 가드**.)
+- ✅ `WebChannelNATSClient`: `connect()`/`close()`/`send()`/`decide()` + `subscribe(listener)`(불변 상태 스냅샷 push) + `getState()`. (재연결 백오프+지터, 동시-connect sentinel, 매 재연결 `getTicket`, progress 드래프트, 승인 카드, 고아 드래프트 정리, **typing indicator: `WebChannelState.isTyping` + `typing` 케이스 자동 settle**, **history pagination: connect 시 `history` 프레임으로 `state.messages` hydrate + `loadHistory({before?, limit?})` 페이지네이션 메서드, id 중복 가드**.)
 - ✅ **상태 소유권이 클라이언트** — 메시지/승인 리듀서가 여기 단일 출처. 순수 JS/Vue/React 뷰는 얇은 뷰. `state.messages`는 초기 비어있다가 connect 성공 시 서버 `history` 프레임으로 hydrate (스크롤 복원 / 페이지 reload 시 "어제 무슨 얘기했지?" UX 해결).
 - ✅ **크로스오리진 `url` 옵션** + same-origin `path` 옵션.
-- ✅ `vitest` 유닛 29케이스 + 라이브 게이트웨이 hmac-ticket + jwt E2E(node smoke 스크립트 `smoke-client.mjs`, `smoke/jwt.mjs`) 통과. (브라우저 UI는 소비자가 client 라이브러리 위에 직접 구성 — 이 repo는 데모 페이지를 배포하지 않는다.)
+- ✅ `vitest` 유닛 29케이스 + 라이브 게이트웨이 hmac-ticket + jwt E2E(node smoke 스크립트 `smoke-client.mjs`, `NATS live harness`) 통과. (브라우저 UI는 소비자가 client 라이브러리 위에 직접 구성 — 이 repo는 데모 페이지를 배포하지 않는다.)
 - ✅ **삭제된 React `openclaw-webchannel-widget` 대체.** 위젯(`webchannel/widget`: `useWebChannel` 훅 + `Chat.tsx` + example)은 2026-06-15 삭제. 위젯이 들고 있던 연결 로직은 client에 프레임워크 없이 재구현됐다.
 - ⬜ `"private"` 해제(출시 시) / `<script>` 임베드 UMD / README.
 

@@ -327,6 +327,19 @@ for i in $(seq 1 240); do
   fi
 done
 
+# P0-1 T3b: a real gateway boot must expose no browser-facing socket endpoint.
+# A missing route may answer 404/400 or close the request; it must never complete
+# a WebSocket switching-protocols response.
+PROBE_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+  -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+  "http://127.0.0.1:$GW_PORT/webchannel/ws" || true)
+if [ "$PROBE_STATUS" = "101" ]; then
+  echo "[run-all-real] FAIL — browser-facing socket endpoint accepted an upgrade" >&2
+  exit 2
+fi
+echo "[run-all-real] ✓ browser-facing socket probe refused (HTTP ${PROBE_STATUS:-connection-closed})"
+
 # ---------------------------------------------------------------------------
 # 7. Run the REAL-BROWSER Playwright driver (NKEY-auth + PoP register).
 # ---------------------------------------------------------------------------

@@ -149,7 +149,7 @@ function recordApprovalAccount(approvalId: string, accountId: string | null | un
 
 /**
  * PENDING-APPROVAL STORE — the authority behind the register-time
- * `approval_snapshot` frame (docs/APPROVAL_REHYDRATION_PLAN.md).
+ * `approval_snapshot` frame (docs/archive/APPROVAL_REHYDRATION_PLAN.md).
  *
  * The plugin observes every approval's full lifecycle (`deliverPending` →
  * `updateEntry`) with the complete wire payload in hand, so it can keep an
