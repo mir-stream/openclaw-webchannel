@@ -24,6 +24,7 @@ if git grep -nE --untracked "$PATTERN" -- \
   ':(exclude)CHANGELOG.md' \
   ':(exclude)docs/archive' \
   ':(exclude)docs/review-2026-07-15' \
+  ':(exclude)docs/REVIEW_2026-07-15.md' \
   ':(exclude)scripts/check-banned-symbols.sh' \
   ':(exclude)scripts/pack-load-smoke.sh'; then
   echo "ERROR: removed transport/admission symbol found in a current source, package, doc, or workflow." >&2

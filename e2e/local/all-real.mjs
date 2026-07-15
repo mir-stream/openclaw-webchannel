@@ -3,7 +3,7 @@
  * #21 ALL-REAL driver — a REAL headless-Chromium browser running the PRODUCTION
  * WebChannelNatsClient (a) NATS-layer NKEY-authenticates to a REAL JWT-auth
  * nats-server AND (b) drives the JWT + Proof-of-Possession HTTP register hop,
- * against a REAL enrolled plugin (dev unauthenticated mode OFF) — all from ONE shared trust chain
+ * against a REAL enrolled plugin (real device-flow creds, no unauthenticated NATS mode) — all from ONE shared trust chain
  * — completing an encrypted echo round-trip. The only stand-in is the echo LLM.
  *
  * Fuses the #18 server topology (run-enrolled-transport.sh) with the #19 browser

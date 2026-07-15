@@ -19,18 +19,21 @@ headless Chromium (WebChannelNatsClient)
 What is **real**: the browser client, the NATS wire + crypto, the `index-nats` plugin, the
 openclaw gateway, and the `inbound.run` agent loop (the reply even carries openclaw's real
 prompt construction). What is a **stand-in**: only the model — a deterministic `echo:` server
-replaces a live LLM (by design; keeps it hermetic). What is a **dev shortcut**: peer
-registration uses a wildcard subscription instead of the HTTP register hop (see "Known gaps").
+replaces a live LLM (by design; keeps it hermetic). Peer admission is **always** the NATS
+register hop (`…{peerId}.register`, JWT + Proof-of-Possession) — the sole admission path; there
+is no wildcard shortcut and no unauthenticated key-exchange path.
 
 Your real `~/.openclaw` and gateway are **never touched** — everything runs under an isolated
 `OPENCLAW_HOME`.
 
-> **Want to actually chat with the agent?** `./run-demo.sh` is the **single interactive demo** —
-> it boots this same enrolled-NATS topology against your real model/provider config and the SaaS
-> issuer serves ONE unified web page (`ENABLE_DEMO_UI=1`): a left panel where you approve the
-> agent's enrollment and a right panel where you then chat with it — one origin, no separate chat
-> server (Ctrl+C tears it down). The unified page lives at `ci-smoke.html`; the SaaS bundles the
-> browser client (`packages/client/src/browser-demo-entry.ts`) into `/widget.js`. For the split
+> **Want to actually chat with the agent?** The interactive demo lives in the top-level
+> [`demo/`](../../demo) directory (`demo/run.sh`; a real NGS relay is a mode of the same script):
+> it boots this same enrolled-NATS topology against your real model/provider
+> config and the SaaS issuer serves ONE unified web page (`ENABLE_DEMO_UI=1`) — a left panel
+> where you approve the agent's enrollment and a right panel where you then chat with it, one
+> origin, no separate chat server (Ctrl+C tears it down). The unified page lives at
+> `ci-smoke.html`; the SaaS bundles the browser client
+> (`packages/client/src/browser-demo-entry.ts`) into `/widget.js`. For the split
 > host(Mac)/container variant see [`../../docs/SPLIT_DEMO.md`](../../docs/SPLIT_DEMO.md). The
 > harnesses below are headless one-shot proofs, not the interactive demo.
 
@@ -39,9 +42,12 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 | File | Role |
 |---|---|
 | `echo-openai-server.mjs` | ~50-line fake OpenAI `/v1/chat/completions` that returns `echo: <last user msg>`. Pointed at by an openclaw `openai-completions` provider. |
-| `drive-roundtrip.ts` | Node driver: runs the production `WebChannelNatsClient` (Node 22+ has the browser globals it needs) and round-trips one message. Fast inner-loop check. |
-| `browser-entry.ts` | Browser bundle entry — exposes `window.runWeb(opts)` driving `WebChannelNatsClient`. Bundled to IIFE via esbuild. |
-| `browser-roundtrip.mjs` | Playwright runner: serves the bundle, launches headless Chromium, calls `runWeb`, asserts the reply echoes the sent text. **This is the "from a real browser" proof.** |
+| `gen-jwt-fixtures.mjs` | Mints an RS256 keypair (`jwks.json` + private JWK) used to sign bootstrap JWTs in the harnesses that self-issue. |
+| `all-real.mjs` | Playwright runner for `run-all-real.sh` and `run-derived-trust.sh`: serves the browser bundle, launches headless Chromium running the production `WebChannelNatsClient`, NKEY-authenticates to the JWT-auth nats-server, drives the JWT + PoP register hop, and asserts the reply echoes the sent text. **This is the "from a real browser" proof.** |
+| `browser-roundtrip.mjs` | Standalone Playwright round-trip driver (headless Chromium over the register hop). Not currently wired into the four harnesses above — kept as a lower-level driver. |
+| `enrolled-transport-roundtrip.ts` | Node driver for `run-enrolled-transport.sh`: an NKEY-authenticated peer that round-trips one message against the device-flow-enrolled plugin. |
+| `two-account-isolation-roundtrip.ts` | Node driver for `run-two-account-isolation.sh`: drives a message into each of two accounts and asserts routing isolation. |
+| `ci-smoke.html` | The unified demo/chat page served by the SaaS issuer. |
 
 ## Prerequisites
 
@@ -49,161 +55,72 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 - The `openclaw` npm dep installed (it ships `playwright-core` + `esbuild` transitively).
 - Chromium for playwright-core: `node node_modules/openclaw/node_modules/playwright-core/cli.js install chromium chromium-headless-shell`.
 
-## Reproduce
+## The harnesses
 
-All paths below are from the repo root. Use a scratch `OPENCLAW_HOME` so your real config is untouched.
-
-```bash
-OCH=/tmp/oc-e2e; mkdir -p "$OCH/.openclaw"
-
-# 1. nats-server with a websocket listener
-cat > "$OCH/nats.conf" <<'CONF'
-port: 14222
-websocket { port: 18222, no_tls: true }
-CONF
-nats-server -c "$OCH/nats.conf" &
-
-# 2. echo model server
-node e2e/local/echo-openai-server.mjs 18900 &
-
-# 3. isolated openclaw config: webchannel (NATS) + echo provider + a single agent.
-#    See the keys the gateway requires below; a minimal config is:
-#    - models.providers.echo-local = { baseUrl: "http://127.0.0.1:18900/v1", api: "openai-completions",
-#        models: [{ id: "echo", contextWindow: 200000, maxTokens: 8192 }] }
-#    - agents.defaults.model.primary = "echo-local/echo"
-#    - agents.defaults.compaction.reserveTokensFloor = 20000   # else tiny-context compaction errors
-#    - channels.webchannel = { dmSecurity: "allowlist", allowFrom: ["web-anon"] }
-#        # NOTE: no `auth` block on the open-NATS `auto` path (no verifier is built);
-#        # no `nats`/`encryption` keys either — the schema rejects them here.
-#    - plugins.load.paths = ["<repo>/packages/plugin"]
-#    The plugin entry is ALREADY index-nats.ts by default
-#    (packages/plugin/package.json openclaw.extensions = ["./index-nats.ts"]) — nothing to swap.
-
-# 4. boot the isolated gateway in dev/open-NATS mode (env-driven — see the contract below)
-OPENCLAW_HOME="$OCH" WEBCHANNEL_TICKET_SECRET=e2e-ticket-secret OPENCLAW_DISABLE_BONJOUR=1 \
-  removed unauthenticated NATS flag WEBCHANNEL_NATS_URL=ws://127.0.0.1:18222 \
-  WEBCHANNEL_TENANT=default-tenant WEBCHANNEL_ACCOUNT_ID=default-agent \
-  node_modules/.bin/openclaw gateway --port 18799 --force &
-# wait for: "[webchannel] ✓ NATS mode plugin registered"
-
-# 5a. fast Node round-trip
-node --import tsx e2e/local/drive-roundtrip.ts
-
-# 5b. real headless-browser round-trip
-ESB=$(find node_modules -path '*/esbuild/bin/esbuild' | head -1)
-"$ESB" e2e/local/browser-entry.ts --bundle --format=iife --global-name=WC --outfile=/tmp/oc-e2e/browser-bundle.js
-node e2e/local/browser-roundtrip.mjs    # exits 0 iff the reply echoes the sent text
-```
-
-Both drivers print `[REPLY] echo: …<your message>`, proving the round-trip.
-
-## JWT-register scenario (NATS register hop as sole admission)
-
-`run-jwt-register.sh` proves the **NATS register hop (`…{peerId}.register`) is the SOLE
-peer-admission path** — no wildcard shortcut. It is a sibling of the open-NATS round-trip above,
-but boots the gateway with `channels.webchannel.auth.strategy = "jwt"`. The wildcard is gated
-off on the jwt path (`index-nats.ts` / `src/wildcard-gate.ts` `shouldSubscribeWildcard`):
-under `auth.strategy="jwt"` the agent does **not** call `wildcard subscription`, so it is
-subscribed to NO peer subjects until something calls `channel.registerPeer(peerId)` — and the
-only thing that does is the live HTTP register route.
+All four boot a real gateway + `nats-server` + echo provider under an isolated
+`OPENCLAW_HOME`, run one encrypted round-trip through the register hop, and self-clean on exit.
 
 ```bash
-./e2e/local/run-jwt-register.sh     # exits 0 iff the JWT+PoP register hop admits the peer
+./e2e/local/run-all-real.sh              # production browser + device-flow-enrolled plugin,
+                                         #   one shared trust chain, JWT + PoP register hop
+./e2e/local/run-enrolled-transport.sh    # agent-side device-flow enrollment → enrolled NATS transport
+./e2e/local/run-two-account-isolation.sh # one gateway, two accounts, routing-isolation (AC6 gate)
+./e2e/local/run-derived-trust.sh         # `channels add` with ZERO hand-written JWT trust facts
 ```
 
-What it does, hermetically (isolated `OPENCLAW_HOME=/tmp/oc-e2e`, self-cleaning trap):
+Each prints `[REPLY] echo: …<your message>` (and a `[PROOF] …` line) on success, and exits
+non-zero if the register hop fails to admit the peer.
 
-1. `gen-jwt-fixtures.mjs` mints an RS256 keypair → `jwks.json` (gateway's `auth.jwt.jwksFile`)
-   + `rs256-private.jwk.json` (the driver re-imports it to sign), **before** the gateway boots.
-2. Boots nats-server + the echo provider + an isolated gateway whose `channels.webchannel.auth`
-   is `{ strategy:"jwt", jwt:{ jwksFile, issuer:"https://e2e-issuer.test", audience:"default-agent" } }`,
-   with `dmSecurity:"allowlist"`, `allowFrom:["web-jwt-peer"]`. (`dev unauthenticated mode` stays env-driven —
-   `removed unauthenticated NATS flag` — since the schema rejects unknown `channels.webchannel` keys.)
-3. `jwt-register-roundtrip.ts` runs the **production** `WebChannelNatsClient` with a `registration`
-   config: it generates device X25519 (→ `cnf.jwk`) + Ed25519 PoP (→ `pop_jwk`) keys, builds the
-   bootstrap claims via `packages/saas/bootstrap-claims`, RS256-signs the JWT (`kid` matches the
-   JWKS), and on connect drives challenge → PoP-signed register over the live HTTP route, then
-   round-trips one encrypted message. A register failure fires `onError` → non-zero exit (loud).
+### `run-all-real.sh` — the fusion proof
 
-Because the wildcard is OFF, the reply (`echo: …`) can only mean the agent registered the peer
-through the HTTP hop. The driver prints `[PROOF] agent registered peer via HTTP hop (wildcard OFF)`.
+A REAL headless-Chromium browser running the production `WebChannelNatsClient`
+(a) NKEY-authenticates to a REAL JWT-auth `nats-server` and (b) drives the JWT + PoP register
+hop, against a REAL enrolled plugin whose NATS creds were acquired **at config time** via
+`openclaw channels add` (the device-flow `EnrollmentClient` runs in the setup hook, not at
+gateway boot). One `setupTrustChain()` feeds the agent's device-flow creds, the nats-server
+operator/account, the register-hop JWKS, and the browser's NATS creds + bootstrap JWT. The
+only stand-in is the echo LLM.
 
-This does **not** change production behavior: enrolled production runs `legacy unauthenticated NATS=false`, so the
-wildcard is already off there. The gate only tightens the dev unauthenticated mode+jwt test so the proof is real.
+### `run-enrolled-transport.sh` — enrolled transport (agent side)
 
-### Real-SaaS-issuer scenario (real bootstrap-server, real JWKS over HTTP)
+Proves the plugin obtains tenant-scoped NATS user credentials via the REAL device-flow
+enrollment-server (enroll → auto-approve → poll) through the production
+`createEnrolledNatsConnection` path, connects (NKEY-authenticated) to a JWT-auth nats-server
+from the SAME `setupTrustChain()`, and completes an encrypted round-trip.
 
-`run-saas-issuer-register.sh` is the **stronger sibling** of `run-jwt-register.sh`. Same
-live register hop, same wildcard-OFF jwt path, same encrypted round-trip — but the bootstrap
-JWT is **not self-minted from a static fixture**. It is minted + RS256-signed by the **real**
-reference bootstrap-server (`packages/saas/reference/bootstrap-server.ts`), which derives a
-real RSA keypair via `setupTrustChain()` and serves the matching public JWKS at
-`/.well-known/jwks.json`. The gateway is configured with
-`channels.webchannel.auth.jwt.jwksUrl` pointing **at that live JWKS endpoint** (not a
-`jwksFile`), so the plugin's `verifyJwt` fetches the signing key by header `kid` **over HTTP
-from the real issuer**.
+### `run-two-account-isolation.sh` — routing isolation (AC6 gate)
 
-```bash
-./e2e/local/run-saas-issuer-register.sh   # exits 0 iff the real-issuer JWT is admitted
-```
+One gateway (index-nats plugin) serves TWO webchannel accounts simultaneously, each with its
+own `auth.jwt` audience (= the account id) and a distinct bound agent. The production
+`WebChannelNatsClient` drives a message into each account and asserts routing isolation:
+acctA's reply carries agentA's prefix and not agentB's, and vice-versa. Both accounts admit
+peers via the register hop on the enrolled trust chain — the same real per-account creds and
+registry-pinned agent keys as the other harnesses.
 
-What it proves end-to-end: **real bootstrap-server RS256 issuance → real JWKS-over-HTTP
-verification → live HTTP register hop → encrypted echo** — the real issuer↔verifier↔register
-loop, not a fixture. The driver prints
-`[PROOF] real-SaaS-issued JWT (RS256, real JWKS) admitted via live register hop`.
+### `run-derived-trust.sh` — zero hand-written trust facts
 
-How it differs from `run-jwt-register.sh`:
+Proves a fresh `openclaw channels add` reaches a working encrypted register round-trip with
+ZERO hand-written JWT trust facts in `openclaw.json`. It writes NO `channels.webchannel`
+config beyond what `buildFullAccountPatch` (`packages/plugin/src/setup.ts`) emits at
+`channels add` (which omits issuer/jwksUrl/audience), so it is the only harness that exercises
+`deriveAccountAuth` (`packages/plugin/index-nats.ts`) end-to-end. The Gate-B readiness line
+reports the derived issuer/JWKS/aud and `admission=register-hop`.
 
-| | `run-jwt-register.sh` | `run-saas-issuer-register.sh` |
-|---|---|---|
-| JWT source | self-minted in the driver from `gen-jwt-fixtures.mjs` | **real bootstrap-server** (`/bootstrap`) |
-| JWKS source | static `auth.jwt.jwksFile` | **live** `auth.jwt.jwksUrl` (HTTP fetch) |
-| Issuer | `https://e2e-issuer.test` (fixed) | `SAAS_ISSUER` (env, default `https://saas.local/issuer`) |
-| peerId | hardcoded `web-jwt-peer` | driver sends a fixed `peerId`; server threads it into JWT `sub`; allowlisted |
-| Ports | gw 18799 / nats 18222 / echo 18900 | gw 18899 / nats 18322 / echo 18901 / bootstrap 3911 |
-
-The unit-level twin of this proof lives in `packages/saas/src/ac6-device-flow-e2e.test.ts`
-("issued JWT verifies against served JWKS via the plugin's verifyJwt"), which cross-imports
-the plugin's `verifyJwt` + `JWKSCache` and asserts the real-issuer JWT verifies against the
-served JWKS without a gateway.
-
-JWT issuance is **independent of NATS transport**: this harness keeps dev unauthenticated mode NATS (no
-enrollment). The full **enrolled-NATS-transport (device-flow)** variant — a JWT-auth
-nats-server fed by the device-flow `/enroll`+`/poll` credentials — remains a follow-up.
-
-## dev/open-NATS contract (how `index-nats` skips enrollment)
-
-Production `index-nats` connects via `createEnrolledNatsConnection` (SaaS device-flow + JWT).
-For local testing it has a **dev/open-NATS** path that connects to a plain `nats-server` with no
-enrollment. It is **env-driven** because openclaw validates the `channels.webchannel` config
-against the plugin schema and rejects unknown keys (so you cannot put `nats`/`encryption` there):
-
-| Env var | Meaning |
-|---|---|
-| `removed unauthenticated NATS flag` | enable the dev/open-NATS path (no enrollment, no JWT) |
-| `WEBCHANNEL_NATS_URL` | nats-server ws URL (default `ws://127.0.0.1:4222`) |
-| `WEBCHANNEL_TENANT` / `WEBCHANNEL_ACCOUNT_ID` | subject-namespace fields (`accountId` = the wire identity; must match the browser client) |
-
-Encryption stays **on** (encrypt-by-construction default); the relay only ever sees ciphertext.
+The unit-level twin of the real-issuer proof lives in
+`packages/saas/src/ac6-device-flow-e2e.test.ts` ("issued JWT verifies against served JWKS via
+the plugin's verifyJwt"), which cross-imports the plugin's `verifyJwt` + `JWKSCache` and
+asserts a real-issuer JWT verifies against the served JWKS without a gateway.
 
 ## Known gaps (why this is "live" but not yet "full production")
 
 - **Echo model, not a live LLM** — by design (hermetic). The agent path is real; only the brain is dumb.
-- **Wildcard auto-register (open-NATS harness only) vs. the HTTP register hop (now exercised)** — the
-  open-NATS dev harness connects on the wildcard path and does not call the HTTP register route,
-  so that path uses `NatsChannel.wildcard subscription` (the allowlist gate still runs). The HTTP
-  register hop is now **exercised end-to-end** by the JWT-register scenario above
-  (`run-jwt-register.sh`): under `auth.strategy="jwt"` the wildcard is gated OFF
-  (`src/wildcard-gate.ts`), so the round-trip there proves `registerPeer` happens **only** via the
-  register hop. (Background: register admission rides NATS request/reply on
-  `…{peerId}.register` — the HTTP routes were retired; the client is wired to call `registerWithPop`
-  over that seam — #11 done.) The remaining gap (#13) shrinks
-  to: a real **browser/Playwright** JWT variant against a **real SaaS issuer** — deferred because
-  Playwright cannot pass an Ed25519 `CryptoKey` across the page boundary (the Node driver can).
-- **In CI (JWT-register harness)** — `run-jwt-register.sh` is now run by the CI gate
-  (`.github/workflows/e2e-gate.yml`, step "Real-gateway live e2e (JWT register hop)"), so the
-  real-gateway + `inbound.run` path is regression-guarded on every push/PR (follow-up #9, done for
-  this harness). Still manual (smaller remaining follow-up): the open-NATS `drive-roundtrip.ts` /
-  browser `browser-roundtrip.mjs` real-gateway variants, and the real **browser/Playwright** JWT
-  variant against a real SaaS issuer (#13 — Playwright cannot pass an Ed25519 `CryptoKey` across the
-  page boundary).
+- **Real-SaaS browser/Playwright JWT variant against a hosted issuer** — the register-hop
+  proof runs against the reference bootstrap/enrollment server, not a hosted SaaS. A real
+  browser variant against a hosted issuer is deferred because Playwright cannot pass an
+  Ed25519 `CryptoKey` across the page boundary (the Node drivers can).
+
+## In CI
+
+`run-all-real.sh` and the other three harnesses run in the CI gate
+(`.github/workflows/e2e-gate.yml`), so the real-gateway + `inbound.run` path is
+regression-guarded on every push/PR.

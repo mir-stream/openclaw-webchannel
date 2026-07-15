@@ -5,7 +5,7 @@
 # jwksUrl / audience code path exercised end-to-end for the first time.
 #
 # WHY this harness exists (the gap it closes): EVERY other real-SaaS harness
-# (run-all-real.sh, run-saas-issuer-register.sh, run-enrolled-transport.sh, …)
+# (run-all-real.sh, run-enrolled-transport.sh, run-two-account-isolation.sh)
 # and demo/run.sh writes an EXPLICIT `auth.jwt` block (issuer/jwksUrl/audience)
 # into openclaw.json. Because of config-present-wins, NONE of them actually
 # exercise `deriveAccountAuth` (packages/plugin/index-nats.ts). This one does:

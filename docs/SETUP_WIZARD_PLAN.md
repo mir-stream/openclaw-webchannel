@@ -8,8 +8,8 @@ Backlog ref: [[webchannel-setup-wizard-backlog]] (user-flagged PRIORITY 2026-07-
 
 Onboarding a webchannel account today requires **hand-writing** the full
 `channels.webchannel.accounts.<id>` block via `openclaw config patch` *before*
-`openclaw channels add` (which only runs the device-flow enroll). Ground truth of
-the hand-written block — `e2e/local/run-demo-synadia.sh:169-196`:
+`openclaw channels add` (which only runs the device-flow enroll). The pre-wizard
+hand-written block looked like:
 
 ```json
 { "channels": { "webchannel": { "accounts": { "<id>": {
@@ -20,7 +20,7 @@ the hand-written block — `e2e/local/run-demo-synadia.sh:169-196`:
       "issuer": "http://127.0.0.1:3951",
       "audience": "default-agent" } },
   "dmSecurity": "open",
-  "nats": { "url": "wss://connect.ngs.global:443", "admission": "auto",
+  "nats": { "url": "wss://connect.ngs.global:443", "admission": "register-hop",
             "credentials": { "mode": "enrolled" } }
 } } } } }
 ```

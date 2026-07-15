@@ -97,10 +97,9 @@ change — out of scope. A single gateway multiplexing several accounts
 be shown as an aside with *different users* per account, but the fleet-from-one-
 login story spans gateways.
 
-Admission for every demo account stays `register-hop` (the default for
-`auth.strategy="jwt"`): only the register hop populates the aud map + verifier
-(`index-nats.ts:690-729`), and an `admission:register-hop` account would 401 the
-bootstrap JWT. run.sh must not set `admission:register-hop`.
+Admission for every demo account is `register-hop` — the sole admission path and the
+default for `auth.strategy="jwt"`: only the register hop populates the aud map + verifier
+(`index-nats.ts:690-729`). run.sh does not need to set `admission` explicitly.
 
 ## Layout
 

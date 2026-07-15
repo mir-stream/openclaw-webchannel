@@ -1,7 +1,7 @@
 // Driver for the enrolled-NATS-transport E2E (#18 — agent-side).
 //
 // WHAT THE AGENT PROVED ALREADY (by the time this driver runs): the PLUGIN, with
-// dev unauthenticated mode OFF, obtained tenant-scoped NATS user creds via the REAL device-flow
+// real device-flow enrollment (no unauthenticated NATS mode); tenant-scoped NATS user creds via the REAL device-flow
 // enrollment-server (enroll → auto-approve → poll) through the PRODUCTION
 // createEnrolledNatsConnection path, and connected (NKEY-authenticated) to a
 // JWT-auth nats-server whose operator/account come from the SAME setupTrustChain

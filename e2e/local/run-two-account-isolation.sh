@@ -21,11 +21,13 @@
 #     channel.registerPeer (Cycle 2 C2 invariant), aud=acctB hits acctB's
 #   - binding.account ROUTING → resolveAgentRoute(accountId) picks the bound agent
 #
-# Credential source is dev/open-NATS (removed unauthenticated NATS flag), as in the
-# other register-focused harnesses (run-jwt-register / run-saas-issuer-register /
-# run-browser-jwt-register): it isolates the multiplex+dispatch+routing layer
-# without per-account NATS-cred plumbing. The CONFIG-TIME channels-add enrollment
-# path is covered separately by run-enrolled-transport.sh and run-all-real.sh.
+# Credentials ride the enrolled trust chain: ONE setupTrustChain() in the
+# reference enrollment-server issues real per-account device-flow NATS creds and
+# registry-pinned agent keys (no dev identity), so each account admits its peer
+# via the register hop just like production. This isolates the
+# multiplex+dispatch+routing layer on the same trust chain the other harnesses
+# use. The single-account CONFIG-TIME channels-add enrollment path is covered by
+# run-enrolled-transport.sh and run-all-real.sh.
 #
 # Everything runs under an isolated OPENCLAW_HOME=/tmp/oc-two-acct-e2e; your real
 # ~/.openclaw is never touched. Distinct ports avoid colliding with the other

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hermetic enrolled-NATS-transport E2E (#18 — agent-side). Proves, in ONE running
-# real gateway with dev unauthenticated mode OFF, that the PLUGIN obtains tenant-scoped NATS user
+# real gateway, that the PLUGIN obtains tenant-scoped NATS user
 # credentials via the REAL device-flow enrollment-server (enroll → auto-approve →
 # poll) through the PRODUCTION createEnrolledNatsConnection path, connects
 # (NKEY-authenticated) to a JWT-auth nats-server whose operator/account come from

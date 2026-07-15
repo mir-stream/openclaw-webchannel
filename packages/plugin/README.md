@@ -20,18 +20,17 @@ As of `e384198`, a real headless-Chromium message HAS travelled browser → NATS
 `webchannel.{tenant}.{accountId}.*.register` subject and the browser drives challenge/register/
 unregister via NATS request/reply on `…{peerId}.register` (the old inbound HTTP register routes
 are deleted — the agent makes ONLY outbound connections). The browser client is wired to register
-over this hop (`registerWithPop`). Two caveats remain: the deterministic echo
-model stands in for a live LLM (by design), and the local dev harness still drives the wildcard
-auto-register path (a live e2e with a real bootstrap JWT is follow-up #13). See STATUS.md.
+over this hop (`registerWithPop`), and the live harnesses exercise it end-to-end. One caveat
+remains: the deterministic echo model stands in for a live LLM (by design); a real
+browser/Playwright variant against a hosted SaaS issuer is follow-up #13. See STATUS.md.
 
 ## Status
 
 - NATS entry (`index-nats.ts`) — **production default, cut over live** on the real gateway
   (`:18789`): enrolled via the SaaS device flow against a persistent local trust chain
   (`nats-server` + reference issuer), credentials cached at `~/.openclaw-webchannel/credentials.json`
-  so restarts reconnect with no re-approval. Also has an env-gated **dev/open-NATS** path
-  (`removed unauthenticated NATS flag`) that connects to a plain local `nats-server` with no enrollment —
-  see [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
+  so restarts reconnect with no re-approval. See
+  [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
 
 ## Enrollment & credentials (NATS mode)
@@ -193,7 +192,6 @@ Env overrides (take precedence over config) — secrets need not live in committ
 | `WEBCHANNEL_NATS_USER_JWT` | static user JWT |
 | `WEBCHANNEL_NATS_USER_SEED` | static user NKEY seed (`SU…`) |
 | `WEBCHANNEL_NATS_CREDS` | path to a NATS `.creds` file (JWT + seed) |
-| `removed unauthenticated NATS flag` | dev open-NATS (no auth) |
 | `WEBCHANNEL_SAAS_BASE_URL` | enrolled-mode SaaS base URL |
 
 ### Browser (natsCredentials, no registration)

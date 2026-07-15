@@ -33,8 +33,9 @@ this file, **this file is correct.**
   peer (`conversation-key-store.ts`, 0600 on disk) and **wrap-delivers it in the register
   response to the JWT-attested device key** — the register path has NO unauthenticated
   registration anymore (the old `registration-verifier` is deleted). Two devices on one user each
-  decrypt live traffic + snapshots; W6 id/text/positional dedup handles echo adoption. The
-  legacy authenticated registration survives only on the dev/open (`admission:register-hop`) path.
+  decrypt live traffic + snapshots; W6 id/text/positional dedup handles echo adoption.
+  Register-hop (bootstrap JWT + PoP) is now the SOLE admission path — P0-2 deleted the
+  unauthenticated X25519 handshake and the dev/open-NATS mode entirely.
 - **Multi-account multiplex** — one gateway serves `channels.webchannel.accounts.<id>` with
   per-account NATS connections, subject namespaces, verifiers, and admission
   (`multiplex.ts`; 가-1/가-2). Exec/plugin approvals are **accountId-aware** (per-account
@@ -59,7 +60,7 @@ this file, **this file is correct.**
 `.github/workflows/e2e-gate.yml` (push to `main`/`develop`/`feature/**`), GREEN on both
 long-lived branches:
 
-- 3-package typecheck; full vitest suite (**1064 tests**, hard floor ≥712) on a real
+- 3-package typecheck; full vitest suite (**1371 tests**, hard floor ≥1365) on a real
   `nats-server` v2.14 (absence hard-fails; real-server suites cannot silently skip).
 - **4 live harnesses** against a real openclaw gateway + headless Chromium:
   `run-enrolled-transport`, `run-all-real` (production browser + device-flow-enrolled
@@ -93,7 +94,7 @@ long-lived branches:
 | Gap | Detail |
 |---|---|
 | **S1 outbound facade** (proactive/approval outbound is primary-account-only) | Cross-account disclosure risk on the agent-initiated leg; the approvals half is done, the outbound facade is the open half. [`BACKLOG.md`](BACKLOG.md) §S1. |
-| **C2 (unauthenticated registration) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `registration-verifier` deleted). The legacy authenticated registration remains on the dev/open `admission:register-hop` path — still the accepted-risk/untrusted-relay caveat there. [`BACKLOG.md`](BACKLOG.md) §C2. |
+| **C2 (unauthenticated registration) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `registration-verifier` deleted). Register-hop is now the sole admission path; the residual is the accepted-risk/untrusted-relay caveat there (the relay carries the admission frames but cannot forge admission). [`BACKLOG.md`](BACKLOG.md) §C2. |
 | Direct gateway transport removal | ✅ complete; browser traffic uses the NATS relay only. |
 | Demo/reference server hardening (review SEC1/2/5) | The reference/demo SaaS servers are deliberately demo-grade (in-memory stores, printed admin token); production-hardening rewrite is a pending decision. |
 | Pre-issuer enrollments | Agents enrolled before 0.1.3 never receive the delivered issuer — they must delete `credentials.json` and re-enroll (documented in `GETTING_STARTED.md` troubleshooting). |
@@ -117,7 +118,8 @@ things to know when reading it:
 
 1. **The HTTP register hop it describes was later replaced wholesale by register-over-NATS**
    (2026-07-03): the HTTP routes, their CORS layer (`register-cors.ts`), and `registerBaseUrl`
-   are deleted. The harness names survive (`run-jwt-register.sh` etc.) but drive the NATS hop.
+   are deleted. The JWT-register harnesses that old file names (`run-jwt-register.sh` etc.) were
+   later removed in P0-2 — the register hop is now proven by `run-all-real` / `run-derived-trust`.
 2. The "unwired parallel layer" contradiction it reconciles is long closed — the NATS path has
    been the production default since `e384198`, and everything above is downstream of it.
 

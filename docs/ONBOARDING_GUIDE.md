@@ -93,11 +93,9 @@ export TRUST_CHAIN_PATH="$HOME/.openclaw-webchannel-saas/trust-chain-synadia.jso
 
 > `SAAS_ISSUER` is the `iss` the SaaS stamps. On the `channels add` happy path the
 > config's `auth.jwt.issuer` is **derived from `--base-url`** (fact: issuer defaults to
-> the SaaS base URL), so with `admission: register-hop` the two must agree — set
-> `SAAS_ISSUER` to your SaaS base URL (as `e2e/local/run-demo-synadia.sh` does). Under
-> `admission:register-hop (the happy-path default) `iss` is not verified, so a divergent value
-> like the one above is harmless. `e2e/local/run-demo-synadia.sh` is the canonical,
-> already-updated example of the full demo env block.
+> the SaaS base URL), so with `admission: register-hop` (the sole admission path) the two must
+> agree — set `SAAS_ISSUER` to your SaaS base URL. The demo env block in `demo/run.sh` is the
+> canonical, already-updated example.
 
 Run it (stays in the foreground; restart wipes the in-memory enrollment store):
 
@@ -181,7 +179,7 @@ enroll-ready block and **derives** every field you would otherwise hand-write:
 | `auth.jwt.issuer` | `<base-url>` (default) |
 | `auth.jwt.audience` | `<accountId>` (default) |
 | `dmSecurity` | `open` |
-| `nats.admission` | `auto` |
+| `nats.admission` | `register-hop` |
 | `nats.credentials.mode` | `enrolled` |
 | `nats.url` | **omitted** — the SaaS delivers the relay URL with the creds at enroll |
 
@@ -271,7 +269,7 @@ openclaw config get channels.webchannel    # verify
 | `credentials.mode=enrolled` | NATS creds come from the SaaS device flow |
 | `credentials.saasBaseUrl` | where `/api/enroll` + `/api/poll` live |
 | `auth.jwt.*` | verifies browser bootstrap JWTs (issuer JWKS) |
-| `admission` | `register-hop` (SaaS bootstrap+PoP) or `auto` (registration+allowlist) — see §6 |
+| `admission` | `register-hop` (SaaS bootstrap+PoP) — the sole admission path, see §6 |
 
 > **Container caveat:** from inside a container the SaaS is **not** `127.0.0.1` — use
 > `host.docker.internal:3951` for `saasBaseUrl` **and** `jwksUrl`. The `issuer` value
@@ -375,9 +373,9 @@ node --import tsx packages/saas/reference/enrollment-server.ts
 > it unset; the reference SaaS still accepts it only as a headless-harness hint.
 
 > For a **turnkey local run** that boots the whole stack (issuer+web, NATS, gateway, enrolled
-> plugin) against your real model config, just use `./e2e/local/run-demo.sh` — it sets all of the
-> above for you. The Synadia sibling is `./e2e/local/run-demo-synadia.sh` (its env block is the
-> canonical demo example).
+> plugin) against your real model config, just use `demo/run.sh` — it sets all of the
+> above for you. `DEMO_RELAY=synadia demo/run.sh` runs the same demo over real NGS; its env
+> block is the canonical demo example.
 
 The page: approve the agent in the left panel → in the right panel **log in** as `alice` or
 `bob` (password `demo`). The browser then generates keys → mints NATS creds from `issuer/nats-user`
@@ -386,29 +384,21 @@ chat. The **peerId is derived server-side** from the logged-in user (its `uuid`)
 client-declared peerId is ignored — and the SaaS enforces the user↔`accountId` authz at
 JWT-mint time (`canAccess` → `403`). Use the **same `tenant`+`accountId`** as the agent.
 
-### Two admission models
+### Admission: the register hop (the only path)
 
-- **`register-hop`** (config default when `auth.strategy=jwt`): the browser completes a
-  register hop as a **NATS request/reply** on the account's `.register` subject — there is
-  **no HTTP route and no gateway URL**. The browser derives the register subject from
-  `tenant/accountId/peerId`, proves possession of its device key (PoP — a signature over a
-  single-use server nonce), the agent validates the bootstrap JWT `aud`, and returns the
-  conversation key **wrapped to the device key**. This rides the same outbound NATS
+- **`register-hop`** (the sole admission path; the default when `auth.strategy=jwt`): the
+  browser completes a register hop as a **NATS request/reply** on the account's `.register`
+  subject — there is **no HTTP route and no gateway URL**. The browser derives the register
+  subject from `tenant/accountId/peerId`, proves possession of its device key (PoP — a
+  signature over a single-use server nonce), the agent validates the bootstrap JWT `aud`, and
+  returns the conversation key **wrapped to the device key**. This rides the same outbound NATS
   connection as chat, so the agent keeps **zero inbound listeners**. This is what the demo
-  (`demo/run.sh`) and the Synadia runners use — register-hop is fully working.
+  (`demo/run.sh`) uses — register-hop is fully working.
   > **History note:** register was originally an HTTP plugin route (`/webchannel/nats/register*`),
   > and on openclaw 2026.6.10 `api.registerHttpRoute` could resolve to a no-op → 404, which
-  > is why older guidance told you to fall back to `auto`. That is obsolete: register moved
-  > to NATS request/reply and the 404 class is gone.
-- **`auto`**: the agent serves any peer that completes the authenticated registration **and** passes
-  the `dmSecurity` allowlist — **no register hop, no SaaS bootstrap/PoP**. Simpler, but it
-  drops the PoP + short-TTL admission guarantee. Switch with:
-  ```bash
-  openclaw config patch --stdin <<'JSON'
-  { "channels": { "webchannel": { "dmSecurity": "open", "nats": { "admission": "auto" } } } }
-  JSON
-  # restart the gateway to apply
-  ```
+  > is why older guidance told you to fall back to an unauthenticated auto-subscribe mode. Both
+  > are obsolete: register moved to NATS request/reply (the 404 class is gone) and the
+  > unauthenticated auto-admission mode was removed entirely — register-hop is the only path.
 
 Type a message → the **real configured model** replies (verify the agent's model is a live
 provider, e.g. `openclaw config get` / the `agent model:` startup log — not an echo stand-in).
@@ -456,7 +446,7 @@ The `#token=` fragment auto-authenticates; a missing/wrong token → `AUTH_RATE_
 
 **Env overrides** (take precedence over config; keep secrets out of committed config):
 `WEBCHANNEL_NATS_URL`, `WEBCHANNEL_NATS_USER_JWT`, `WEBCHANNEL_NATS_USER_SEED`,
-`WEBCHANNEL_NATS_CREDS`, `removed unauthenticated NATS flag`, `WEBCHANNEL_SAAS_BASE_URL`,
+`WEBCHANNEL_NATS_CREDS`, `WEBCHANNEL_SAAS_BASE_URL`,
 `WEBCHANNEL_TENANT`. (Acquisition no longer reads `WEBCHANNEL_AGENT_ID` — the wire identity
 is the `accountId`, set via `channels add --account <id>`. The **login-flow demo** server is
 configured with `DEMO_ACCOUNT_ID`/`DEMO_TENANT`; `WEBCHANNEL_ACCOUNT_ID` is a **headless
@@ -466,7 +456,7 @@ harness** var read by the `e2e/local/*` drivers.)
 (agent subscribes `…*.in`/`…*registration subject`, publishes `…*.out`; browser is the mirror).
 
 **Credential modes** (`nats.credentials.mode`): `enrolled` (SaaS device flow, default) ·
-`static` (BYO url + user JWT + NKEY seed / `.creds` file, no issuer) · `open` (dev, no auth).
+`static` (BYO url + user JWT + NKEY seed / `.creds` file, no issuer).
 
 **Issuer endpoints:** `/api/enroll`, `/api/poll`, `/approve`, `/.well-known/jwks.json`.
 Under `ENABLE_DEMO_UI` the browser login flow adds `/login`, `/nats-user`, `/bootstrap`

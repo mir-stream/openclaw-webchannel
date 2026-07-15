@@ -7,7 +7,7 @@ encrypted, device-flow enrolled. This is the run that proved the NATS E2E path l
 hardware (a real LLM reply came back).
 
 For the single-host interactive demo (everything on one machine), use
-[`e2e/local/run-demo.sh`](../e2e/local/README.md) instead. This doc is the harder,
+[`demo/run.sh`](../demo/README.md) instead. This doc is the harder,
 more-realistic split topology.
 
 ```
