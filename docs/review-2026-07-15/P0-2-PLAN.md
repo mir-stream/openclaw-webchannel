@@ -1,0 +1,359 @@
+# P0-2 Implementation Plan — Auto-admission과 unauthenticated handshake 완전 삭제
+
+> Work item: [`P0.md`](P0.md) §"P0-2" (lines 90–173).
+> Branch: `feat/p0-2-auto-admission-removal`, stacked on `feat/p0-1-gateway-ws-removal` (PR #41).
+> Status: DRAFT v2 (explorer-verified inventory folded in; pre codex adversarial review).
+
+## 1. Goal and invariants
+
+Delete every path by which a peer is served **without authenticated registration**, and
+every path by which the agent connects to NATS **without credentials**:
+
+- **Axis B (`nats-admission.ts`)**: `admission: "auto"` — wildcard `.in`/`.handshake`
+  subscription serving ANY peer that completes an unauthenticated X25519 `key_exchange`.
+  The per-connection key exchange verifies nothing about the counterparty: an active
+  relay can run two separate exchanges and read/re-encrypt plaintext in the middle
+  (the exact MITM the register-delivered wrapped-K design closed for register-hop).
+- **Axis A (`nats-credential-source.ts`)**: `mode: "open"` — `WEBCHANNEL_NATS_DEV_OPEN`,
+  `nats.devOpen`, `credentials.mode:"open"` — connecting to NATS with no credentials.
+- **Wire**: the `key_exchange` frame and the `.handshake` subject, both directions,
+  both packages.
+- **Dev identity**: the WELL-KNOWN dev agent identity key (`dev-identity.ts`) that
+  register-hop-on-open-NATS used to wrap K without attestation.
+
+End-state invariants (P0.md 완료 조건):
+
+1. `admission:"auto"`, `DEV_OPEN`, unauthenticated `key_exchange`: **0 runtime callers**.
+2. Every peer gets an active subscription **only after** authenticated registration
+   (bootstrap JWT + PoP over the `.register` subject).
+3. BYO-NATS and managed NATS use the same protocol/invariants (see D4 for the
+   deliberate P0-3 hand-off on static-creds serving).
+4. Old config (`admission:"auto"`, `devOpen`, `credentials.mode:"open"`, and the
+   static-creds-implies-auto default shape) fails loudly with a targeted migration
+   error, never silently ignored (reuses the P0-1 `assertNoRemovedConfig` seam).
+5. Bidirectional key-substitution attack tests pass (relay substituting either side's
+   key is detected and the flow fails closed).
+
+KEPT (남겨야 할 암호 기능): SaaS-attested browser device key; SaaS-attested agent
+identity key; register-response wrapped conversation key (`KEY_WRAP_INFO =
+"webchannel-key-wrap-v1"` static-static ECDH — domain-separated from the deleted
+handshake KDF `webchannel-conversation-v1`, verified); ChaCha20-Poly1305
+`MessageEnvelope` v1 with canonical AAD; replay/idempotency protection; PoP register
+(`registerWithPop`).
+
+## 2. Scope
+
+IN: plugin admission/credential axes, plugin channel handshake surface, client legacy
+handshake branch, config schema + migration errors, wire frame removal, tests
+(delete/rewrite/add attack tests), e2e harness migration, CI baseline, docs, CHANGELOG.
+
+OUT (explicitly deferred):
+- P0-3: BYO-NATS(static creds) authenticated registration — P0-2 makes static-creds
+  accounts fail loudly (D4); P0-3 restores them with attested keys.
+- P0-4: send-result contract (unchanged from P0-1 deferral).
+- Encryption-policy surface (`encryption.mode:"disabled"` boot rejection) — already
+  fail-closed; untouched.
+- `ANON_PEER_ID` (`auth.ts:33`, "web-anon") — NOT part of auto admission; it feeds
+  approvals fan-out (`approvals.ts`) + inbound fallback. Untouched.
+- Broader `dmSecurity` allowlist enforcement — only the orphaned `isDmPostureOpen`
+  helper dies (its sole runtime caller is the auto-mode warn; verified).
+- `demo/web/src/wiretap.ts` `webchannel.{tenant}.>` subscription — OBSERVER wildcard
+  (chaos/wiretap tooling), unrelated to admission. Untouched.
+
+## 3. Dependency map (explorer-verified; spot-checks re-run by TechLead)
+
+### 3.1 DELETE whole files
+
+| File | Why safe |
+|---|---|
+| `packages/plugin/src/nats-admission.ts` (+ `nats-admission.test.ts`) | collapses to constants (D1) |
+| `packages/plugin/src/dev-identity.ts` (+ `dev-identity.test.ts`) | D4 |
+| `packages/plugin/src/e2e-roundtrip-agent.ts` | test seam, not shipped; importers = 2 vitest live-gate tests only (verified: other hits are comments) |
+| `packages/client/src/e2e-browser-client.ts` | Playwright dial seam, not in barrel (verified); same 2 tests |
+| `e2e/dev-nats-roundtrip.test.ts`, `e2e/enrolled-jwt-roundtrip.test.ts` | drive the two seams above via handshake |
+| `packages/client/src/e2e-crypto-browser.test.ts` | tests `parseKeyExchange` only |
+
+### 3.2 REWRITE map (file:line, current role → change)
+
+**`packages/plugin/src/nats-credential-source.ts`** — `mode:"open"` union member (:98),
+`devOpen` config field (:73), `legacyNats.devOpen` (:116), OPEN resolver branch
+(:243-251), connector `case "open"` (:380-389), `admission` field type (:75-76):
+delete open/devOpen everywhere; `admission` type becomes `"register-hop"`.
+Static + enrolled + `.creds` parsing KEEP.
+
+**`packages/plugin/src/account-config.ts`** — extend `assertNoRemovedConfig` (:184-191)
+per D5. Everything else KEEP.
+
+**`packages/plugin/openclaw.plugin.json`** — `nats.devOpen` (:195-198) DELETE;
+`nats.admission` enum (:199-203) → `["register-hop"]` (desc: deprecated-accepted,
+"auto" is a startup error); `credentials.mode` enum (:209-212) → `["static","enrolled"]`;
+`auth.strategy` enum (:47-50) drops `"anonymous"` (D9); help text at :255 rewritten
+(currently instructs "set NO auth at all for auto admission").
+
+**`packages/plugin/index-nats.ts`** — dev-identity import (:70) + register-hop
+dev-identity fallback (:534-557) DELETE (fail-closed branch :544-556 becomes the only
+behavior); admission resolution (:469-479) → unconditional register-hop (D1);
+wildcard-subscribe block + auto/dmSecurity warn (:834-843) DELETE; channel-construction
+ternary (:562-572) → always keyStore+identityKeyPair; verifier/register gates
+(:944-963, :980+) unconditional. `isDmPostureOpen` import (:51) DELETE →
+`dm-allowlist.ts:55` function deleted (module stays).
+
+**`packages/plugin/src/nats-channel.ts`** — `subscribeWildcard()` (:349-359),
+`handleHandshake()` (:815-901) incl. S2 auto-cap (:858-876) + auto history suppression
+(:886-900), `handshakeSubscriptions` (:228), `handshakeSubject()` (:673-675),
+legacy-mode handshake sub in `registerPeer` (:333-337) + teardown (:402-406),
+handshake dispatch arm (:734-737), ephemeral `agentKeyPair` (:214,260),
+`setHandshakeCompleteHandler`/`onHandshakeComplete`/`isNewSession` machinery
+(:235-247, :610-622, :899 — verified consumers are tests + the deleted path only):
+DELETE. Constructor invariant becomes `encryptionRequired ⇒ keyStore ⇒ identityKeyPair`
+(today `keyStore` optional and null-keyStore IS the auto path — :219,:261).
+`peerSessionKeys` (:226) KEEP; sole writer becomes `registerPeer` (:299-301), bounded
+by its existing cap loop (:315-322).
+
+**`packages/plugin/src/e2e-session.ts`** — DELETE `keyExchangeFrame` (:61-66),
+`parseKeyExchange` (:72-93), `deriveConversationKey` (:49-55), `CONVERSATION_KDF_INFO`
+(:35). KEEP `sealEnvelope`/`openEnvelope`/`SessionRouting`.
+
+**`packages/plugin/src/preflight.ts`** — auto readiness branch (:149-156) + admission
+field (:79-80) → register-hop-only.
+
+**`packages/plugin/src/setup.ts`** — already writes `admission:"register-hop"` +
+`credentials.mode:"enrolled"` (:238) — KEEP; prune stale "legacy auto" prose (:193-196).
+
+**`packages/client/src/nats-client.ts`** — legacy handshake fallback (:1285-1294),
+`publishHandshakeWithRetry` (:1302-1315), `clearHandshakeRetry` (:1317-1322), handshake
+arm of `handleRaw` (:1327-1336), `handshakeRetryTimer` (:933), `handshakeSub` (:923),
+`keyPair` field (:885), `HANDSHAKE_MAX_RETRIES`/`HANDSHAKE_RETRY_MS`,
+`handshakeSubject()` (:846-848): DELETE. `registration.deviceX25519PrivateKey`
+(:117-126) optional → **required** (missing = terminal config error at construction,
+not a silent legacy-path pre-selection). Register-delivered branch (:1226-1282) KEEP.
+
+**`packages/client/src/e2e-crypto-browser.ts`** — DELETE `generateX25519KeyPair`
+(:56-67), `deriveConversationKey` (:115-121), `keyExchangeFrame` (:216-218),
+`parseKeyExchange` (:221-237), `BrowserKeyPair` (:50-54). KEEP `unwrapConversationKey`,
+`KEY_WRAP_INFO`, `deriveX25519SharedSecret` (:69-86 — unwrap dependency, DO NOT
+delete), `hkdfSha256`, envelope codec, base64url helpers.
+
+**`packages/client/src/index.ts`** — no change (verified: no handshake surface is
+exported).
+
+**`packages/saas/reference/bootstrap-server.ts`** — :252 `DEV_OPEN ?
+{agentPublicKey: devOpenAgentIdentityPublicB64url()}` reference-harness pin: REWRITE
+(drop DEV_OPEN arm) or delete the flag entirely.
+
+### 3.3 Stale-docs fixes discovered (fold into Stage 6)
+
+- `e2e/local/README.md:105,197` reference `src/wildcard-gate.ts` /
+  `shouldSubscribeWildcard` — **file does not exist** (the gate is
+  `admissionServingPlan`). Rewrite.
+- `run-all-real.sh:286-302` / `run-enrolled-transport.sh:278-284` comments claim the
+  setup adapter writes `admission:"auto"` — stale (setup.ts:238 writes register-hop).
+
+## 4. Design decisions
+
+### D1 — Axis B collapses; `nats-admission.ts` deleted
+
+With `"auto"` gone there is exactly one admission mode. `resolveAdmissionMode`,
+`AdmissionMode`, `AdmissionServingPlan`, `admissionServingPlan` die; the serving loop
+unconditionally builds the verifier, subscribes `.register`, never subscribes a
+wildcard. Config key `nats.admission` stays **schema-accepted (deprecated)** — P0-1 D4
+lesson: `additionalProperties:false` rejects old configs BEFORE the migration detector
+runs. `assertNoRemovedConfig` throws on `admission:"auto"`; explicit
+`admission:"register-hop"` is accepted and ignored (it names the only remaining
+behavior — erroring on it would punish the safe config).
+
+### D2 — Axis A: `open` credential mode deleted; env override becomes a hard error
+
+Detection points and their error surfaces:
+
+- Config-sourced (`nats.devOpen`, legacy top-level `nats.devOpen`,
+  `credentials.mode:"open"`): migration error via `assertNoRemovedConfig` — same seam
+  and message style as P0-1's `auth.ticketParam`. Key-presence check for `devOpen`
+  (any value, incl. `false` — carried-but-false is dead config; the error is cheaper
+  than the ambiguity — Q1 for codex), value-match for `credentials.mode === "open"`.
+- Env-sourced (`WEBCHANNEL_NATS_DEV_OPEN=1`): `resolveNatsCredentialSource` throws the
+  same migration error (env never passes through account-config; the resolver already
+  throws on incomplete static creds, and index-nats maps a resolver throw to
+  skip-account-with-log).
+
+Migration error text names the removed setting, the required authenticated enrollment,
+and the reconfigure command (`openclaw channels add --channel webchannel`).
+
+### D3 — Handshake deleted end-to-end; wrap path untouched
+
+Per §3.2 (`nats-channel.ts`, `e2e-session.ts`, `nats-client.ts`,
+`e2e-crypto-browser.ts`). Load-bearing invariants:
+
+- Register wrap path uses `KEY_WRAP_INFO` (domain-separated) — handshake KDF deletable
+  with zero wrap-path impact (verified).
+- `NatsChannel` crypto model becomes keyStore-only: `encryptionRequired ⇒ keyStore ⇒
+  identityKeyPair`. Without this, a half-deleted channel neither handshakes nor has a
+  keyStore and serves nothing (explorer G2).
+- `peerSessionKeys` stays; register becomes its sole writer; boundedness now rides
+  `registerPeer`'s existing cap (explorer G3 — verify no unbounded re-register growth
+  in Stage 3 tests).
+- History/approval snapshots: auto-path suppression machinery
+  (`setHandshakeCompleteHandler` et al.) is fully dead — every peer is
+  PoP-authenticated and snapshots fire from the register route (already the case).
+
+### D4 — Static creds: forced register-hop, load-time migration error until P0-3
+
+Today `resolveAdmissionMode` defaults **everything except jwt+hop-available to auto**
+— including static creds (`registerHopAvailable = credentialMode !== "static"`,
+schema text: "static credentials always default to auto"). Deleting auto is therefore
+NOT transparent for static-creds BYO-NATS: their default serving path disappears, and
+the only remaining route (register-hop) is fail-closed without an enrolled/attested
+identity key (`index-nats.ts:544-556` — the F2 guard, which stays as the serve-time
+backstop).
+
+Decision: **surface this at load, not as a silent no-serve.** A static-creds account
+(any static signal per the resolver) gets a targeted migration error at startup:
+"static NATS credentials no longer imply auto admission; BYO-NATS requires
+authenticated registration (attested agent identity) — enroll with `openclaw channels
+add --channel webchannel`, or track P0-3 (BYO-NATS authenticated registration)".
+Deliberate consequence, stated in CHANGELOG and the PR body: **static-creds accounts
+are un-servable until P0-3** (Q3 — product call, flagged to the user).
+
+The dev-identity fallback (`index-nats.ts:534-543`) and `dev-identity.ts` are deleted;
+register-hop with no attested key is ALWAYS fail-closed.
+
+### D5 — Migration errors ride the P0-1 seam
+
+All config-shape detection lives in `assertNoRemovedConfig` (`account-config.ts:184`),
+which runs inside `resolveWebchannelAccountConfig` — the real load path for every
+account resolution. New checks: `nats.devOpen` (presence), `nats.admission === "auto"`,
+`nats.credentials.mode === "open"`, plus the D4 static-shape error (which needs the
+resolver's static-signal logic — implementation may put it in
+`resolveNatsCredentialSource` instead; codex to weigh in on the seam split). Schema
+keeps removed keys deprecated-accepted with descriptions saying "REMOVED — startup
+error; see migration".
+
+### D6 — e2e harness migration (the true blast radius)
+
+Corrected understanding (explorer E, verified): the four devOpen CI harnesses are
+**register-hop tests already** — devOpen is their NATS *transport* scaffold and
+`dev-identity` is their *attestation* scaffold (agent falls back to the well-known dev
+key; drivers pin `devOpenAgentIdentityPublicB64url()`). None of them exercises auto
+admission. So the migration is transport+identity substitution, not semantics loss:
+
+| CI step | Harness | Unique assertions | Disposition |
+|---|---|---|---|
+| 8 | `run-jwt-register.sh` | first-principles JWT+PoP register mechanics | likely SUBSUMED by all-real → delete iff Stage 1 diff confirms |
+| 8b | `run-saas-issuer-register.sh` | real SaaS issuer + JWKS-over-HTTP | likely SUBSUMED (all-real uses the real issuer) → same |
+| 8d | `run-browser-jwt-register.sh` | real Chromium browser register | likely SUBSUMED (all-real drives a real browser) → same |
+| 8f | `run-two-account-isolation.sh` | 2-account routing isolation | NOT subsumed → **MIGRATE** to the `setupTrustChain` enrolled pattern (per-account enrolled creds + attested identity; driver pins the enrolled key) |
+| 8c/8e/8g | enrolled-transport / all-real / derived-trust | — | KEEP (already devOpen-OFF, register-hop, real creds) |
+
+Any un-subsumed assertion from the deleted three is folded into `run-all-real.sh`.
+CI steps + the ≥1420 test baseline move in lockstep (a code-only delete lands red).
+
+### D7 — Attack tests (P0.md's five)
+
+| # | Attack | Expected | Existing coverage? |
+|---|--------|----------|--------------------|
+| A1 | Relay substitutes browser device key at register | plugin registration fails (PoP verifies against JWT-`cnf`-bound key) | partial (F2/register-pop-gate tests) — inventory in Stage 1, extend |
+| A2 | Relay substitutes agent key / wrapped K | browser fails closed (pin > delivered > derived) | partial (pin tests) — inventory, extend |
+| A3 | Unregistered valid NATS user publishes `.in` | no agent turn starts | NEW — integration test at channel dispatch level |
+| A4 | Bootstrap JWT peer/account/tenant/device binding substitution | verify fails | partial (register-pop-gate) — inventory, extend |
+| A5 | Register response missing wrapped K | terminal failure, no fallback code path exists | NEW — client-side test |
+
+Stage 1 inventories A1–A5 by test-grep (not plan-doc claims — P0-1 lesson: round-1
+once shipped a gate on a fabricated field).
+
+### D8 — Wire/protocol + release
+
+`key_exchange` leaves the wire; the `.handshake` subject disappears entirely. The 11/4
+frame count on `.in`/`.out` proper is unchanged. CHANGELOG 0.3.0 BREAKING gains:
+auto-admission removed, devOpen removed, live handshake removed, static-creds serving
+deferred to P0-3, `deviceX25519PrivateKey` required in client registration. Verify in
+Stage 1 that no protocol-version bump is needed beyond 0.3.0 (register-reply
+`protocol-version` lockstep test).
+
+### D9 — `auth.strategy:"anonymous"` leaves the schema
+
+Anonymous strategy only ever routed to auto admission and is already REJECTED at
+verify-time for register-hop (`auth-admission.test.ts` asserts the rejection — that
+test KEEPS as the guard). Remove `"anonymous"` from the schema enum (:47-50) and the
+":255" help text that instructs configuring "NO auth at all for auto admission".
+Old configs carrying `strategy:"anonymous"` get a migration error via the same D5
+seam (value-match), not a schema rejection.
+
+## 5. Stages
+
+1. **Inventory + harness-subsumption audit** — diff the 3 candidate-delete harnesses'
+   assertions against `run-all-real.sh`; inventory existing A1–A5 coverage; confirm
+   protocol-version stance. Output: plan updated to CONVERGED-fact status.
+2. **Plugin axes** — delete `nats-admission.ts` + open mode + dev-identity; rewrite
+   the serving loop (unconditional register-hop); D2/D4/D5/D9 migration errors;
+   schema; preflight/setup prose.
+3. **Plugin channel** — delete handshake surface (`nats-channel.ts`,
+   `e2e-session.ts`); keyStore-only crypto invariant; delete `e2e-roundtrip-agent.ts`.
+4. **Client** — delete legacy handshake branch + handshake-only crypto exports +
+   `e2e-browser-client.ts`; `deviceX25519PrivateKey` required.
+5. **Tests** — delete/rewrite per §6.1; add migration-error tests + A1–A5.
+6. **e2e + CI + guards + docs** — D6 harness moves; banned-symbol guard extension;
+   CI BASELINE re-measure; docs sweep (§3.3 stale fixes; F-list below); CHANGELOG.
+
+Each stage ends with a TechLead commit checkpoint (codex cannot write worktree git
+metadata).
+
+## 6. Test and guard plan
+
+### 6.1 Test classification (explorer D, TechLead-spot-checked)
+
+DELETE: `nats-admission.test.ts`, `dev-identity.test.ts`,
+`e2e/dev-nats-roundtrip.test.ts`, `e2e/enrolled-jwt-roundtrip.test.ts`,
+`client/e2e-crypto-browser.test.ts`.
+
+REWRITE: `nats-channel-crypto.test.ts` (drop wildcard-mode harness + key_exchange
+helper; keep register-mode crypto), `nats-channel-s2.test.ts` (:61-87 wildcard cap
+case out; register cap cases stay), `nats-channel-keystore.test.ts` (:299-337
+handshake-interplay cases out), `account-config.test.ts` (devOpen fixture → rejection
+case), `nats-credential-source.test.ts` (open rows → migration-error rows),
+`setup-wizard.test.ts` (:84), `preflight.test.ts` (auto readiness rows),
+client register tests that simulate the agent via `deriveConversationKey` (move
+simulation to wrap/unwrap helpers).
+
+KEEP: register/PoP/envelope suites (nats-channel-register, nats-register,
+register-pop-gate, nats-channel-ack, nats-subject-permissions, nats-transport*,
+client -register/-recovery/-wrapped-key/-replay/-crypto/-liveness/-wrapper,
+protocol-version-lockstep, `auth-admission.test.ts` as the D9 guard).
+
+ADD: migration-error tests (one per removed shape: devOpen key, admission:"auto",
+credentials.mode:"open", static-creds shape, strategy:"anonymous", env DEV_OPEN);
+A1–A5; "registerPeer is sole peerSessionKeys writer + stays bounded" unit.
+
+### 6.2 Guards
+
+Extend `scripts/check-banned-symbols.sh` PATTERN with removed symbols
+(`key_exchange`, `devOpen`, `DEV_OPEN`, `subscribeWildcard`, `handleHandshake`,
+`resolveAdmissionMode`, `dev-identity`), scoped to exclude docs/archive +
+docs/review-2026-07-15 + the guard scripts; canary-test every addition (planted
+symbol; git grep only — rg is absent on real PATH).
+
+### 6.3 CI baseline
+
+Re-measure after Stage 5 and set `BASELINE` in `e2e-gate.yml` (P0-2 deletes more
+tests than it adds — measure, don't guess). Update/remove CI steps 8/8b/8d/8f per D6.
+
+## 7. Risks / open questions
+
+- **Q1 (D2)**: `devOpen:false` also migration-errors (presence check) — codex to
+  challenge.
+- **Q2 (D6)**: subsumption of the 3 candidate-delete harnesses is asserted, not yet
+  proven — Stage 1 audits assertion-by-assertion. Fallback for any un-subsumed
+  harness: migrate it to the enrolled trust chain (never keep open mode).
+- **Q3 (D4)**: static-creds un-servability window until P0-3 — product-level call;
+  review text supports it; flag in PR body.
+- **R1**: `registerHopAvailable`/static-signal logic needed by the D4 load-time error
+  — seam split between account-config and nats-credential-source to be settled
+  (codex input welcome).
+- **R2**: deleting `subscribeWildcard` — verify `.register` resubscription on
+  reconnect is unaffected (transport replays subscriptions; register sub is
+  per-account, as wildcard was).
+- **R3**: docs sweep breadth (explorer F): plugin README, e2e/local README (incl.
+  phantom `wildcard-gate.ts`), docs/{AUTH,README,ONBOARDING_GUIDE,
+  TRUST_AND_ONBOARDING,STATUS,DEMO_PLAN,SETUP_WIZARD_PLAN,SPLIT_DEMO,
+  PHASE6_MULTIDEVICE_PLAN,BACKLOG}.md, docs/gaps/{P0_CORE_CHAT_GAPS,
+  P2_ADVANCED_GAPS}.md, `packages/saas/reference/bootstrap-server.ts`,
+  demo/ scripts seeding admission. STATUS.md/BACKLOG.md close the C2 residual.
