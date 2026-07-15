@@ -2,10 +2,8 @@
 
 > Work item: [`P0.md`](P0.md) §"P0-2" (lines 90–173).
 > Branch: `feat/p0-2-auto-admission-removal`, stacked on `feat/p0-1-gateway-ws-removal` (PR #41).
-> Status: DRAFT v4 (codex R2 folded in: A1 mechanism corrected to JWT-signature
-> binding with the relay threat model made explicit; D8 rationale repaired against
-> the registering-without-x25519 shape; D10 constructor-validation boundary; ac6
-> DEV_OPEN coupling migrated).
+> Status: DRAFT v6 (codex R1–R4 folded in; R4: setup/auth type surfaces, A3
+> transport-level boundary, baseline ledger arithmetic, saas comment sweep).
 
 ## 1. Goal and invariants
 
@@ -128,7 +126,17 @@ by its existing cap loop (:315-322).
 field (:79-80) → register-hop-only.
 
 **`packages/plugin/src/setup.ts`** — already writes `admission:"register-hop"` +
-`credentials.mode:"enrolled"` (:238) — KEEP; prune stale "legacy auto" prose (:193-196).
+`credentials.mode:"enrolled"` (:238) — KEEP that; but (codex R4) the TYPE surface is
+live deletion scope: `WebchannelSetupInput.credentialsMode` admits `"open"` (:84) and
+`buildAccountPatch` writes it verbatim into persisted config (:128) — drop `"open"`
+from the type so setup can never re-mint a removed shape; prune stale "legacy auto"
+prose (:193-196); setup tests updated.
+
+**`packages/plugin/src/auth.ts`** — (codex R4, pairs with D9) `AnonymousAuthConfig`
+(:62) and its arm in the `AuthConfig` union (:106) are deleted — the runtime type,
+not just the schema enum. Affected construction sites/tests inventoried in Stage 1
+(`auth-admission.test.ts` keeps asserting the REJECTION of a raw
+`{strategy:"anonymous"}` object, now type-cast in the test).
 
 **`packages/client/src/nats-client.ts`** — legacy handshake fallback (:1285-1294),
 `publishHandshakeWithRetry` (:1302-1315), `clearHandshakeRetry` (:1317-1322), handshake
@@ -189,6 +197,11 @@ value (the current :452,:474 defined-only assertion is too weak — codex R3).
   `admissionServingPlan`). Rewrite.
 - `run-all-real.sh:286-302` / `run-enrolled-transport.sh:278-284` comments claim the
   setup adapter writes `admission:"auto"` — stale (setup.ts:238 writes register-hop).
+- (codex R4) saas protocol comments still describe `.handshake` as a live subject:
+  `subject-token.ts:4`, `nats-user-creds.ts:26`, `device-flow-enrollment.ts:885` —
+  rewrite (subject set becomes `register|reginbox|in|out`); permission tests stop
+  asserting handshake-specific semantics (the broad `>` grants themselves stay —
+  they cover the surviving subjects).
 
 ## 4. Design decisions
 
@@ -332,7 +345,7 @@ inside the register token → expect `REGISTER_UNAUTHORIZED`.
 |---|--------|----------|--------------------|
 | A1 | Relay tampers device X25519 key (`cnf.jwk`) in the register token | JWT verify fails → registration rejected | partial (JWT verify tests) — inventory in Stage 1, add the cnf-mutation case |
 | A2 | Relay tampers the plaintext register reply's wrapped-K material | browser fails closed and disconnects (`nats-client.ts:1261`); pin itself is NOT wire-mutable (SaaS-delivered) | partial (pin/unwrap tests) — inventory, extend |
-| A3 | Unregistered valid NATS user publishes `.in` | no agent turn starts | NEW — integration test at channel dispatch level |
+| A3 | Unregistered valid NATS user publishes `.in` | no agent turn starts | NEW — transport-level (see boundary note below) |
 | A4 | Bootstrap JWT peer/account/tenant/device binding substitution | verify fails | partial (register-pop-gate) — inventory, extend |
 | A5 | Register response missing wrapped K | terminal failure, no fallback code path exists | NEW — client-side test |
 
@@ -346,6 +359,13 @@ Test-boundary requirements (codex R3):
 - **A2 enumerates the actually-mutable wire fields individually**: wrapped ephemeral
   public key, nonce, ciphertext/tag — each mutation → unwrap failure + disconnect —
   plus one wrong-local-pin case. (The pin never rides the relay.)
+- **A3 must prove the SUBSCRIPTION boundary, not dispatch behavior** (codex R4):
+  injecting into the dispatch function bypasses exactly the property under test.
+  The test asserts, at the transport level (recording/real transport), that (i) at
+  startup only `.register` is subscribed (`nats-channel.ts:371`) — no `.in`, no
+  wildcard; (ii) a pre-registration `.in` publish produces no delivery and no turn;
+  (iii) after successful registration (`registerPeer` — :292,:324) the same publish
+  is delivered.
 
 Stage 1 inventories A1–A5 by test-grep (not plan-doc claims — P0-1 lesson: round-1
 once shipped a gate on a fabricated field).
@@ -498,10 +518,20 @@ Canary-test every addition (planted symbol per new pattern AND per new path root
 git grep only — rg is absent on real PATH). `pack-load-smoke.sh` allowlist unchanged
 unless dist file set changes.
 
-### 6.3 CI baseline
+### 6.3 CI baseline — ledger, not re-measurement (codex R4)
 
-Re-measure after Stage 5 and set `BASELINE` in `e2e-gate.yml` (P0-2 deletes more
-tests than it adds — measure, don't guess). Update/remove CI steps 8/8b/8d/8f per D6.
+A bare "re-measure and set BASELINE" is circular (it would bless accidental test
+loss). Stage 5 produces an explicit **balance sheet**, mirroring the P0-1 practice:
+
+    old measured total (1428 @ P0-1 tip)
+    − enumerated deletions   (each deleted file/describe with its test count)
+    + enumerated additions   (migration errors, A1–A5, D10 ctor tests, …)
+    = expected total  →  must equal the measured total; any unexplained delta
+      FAILS the review round (investigate before setting BASELINE)
+
+`BASELINE` in `e2e-gate.yml:189` is then set just under the reconciled total.
+Update/remove CI steps 8/8b/8d/8f per D6. The ledger goes in the Stage 5 commit
+message.
 
 ## 7. Risks / open questions (R1 verdicts folded in)
 
