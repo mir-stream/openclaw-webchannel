@@ -61,11 +61,13 @@ long-lived branches:
 
 - 3-package typecheck; full vitest suite (**1064 tests**, hard floor ≥712) on a real
   `nats-server` v2.14 (absence hard-fails; real-server suites cannot silently skip).
-- **7 live harnesses** against a real openclaw gateway + headless Chromium:
-  `run-jwt-register`, `run-saas-issuer-register`, `run-enrolled-transport`,
-  `run-browser-jwt-register`, `run-all-real` (production browser + device-flow-enrolled plugin
-  on one JWT-auth nats-server — the only stand-in is the echo LLM, by design),
-  `run-two-account-isolation`, `run-derived-trust`.
+- **4 live harnesses** against a real openclaw gateway + headless Chromium:
+  `run-enrolled-transport`, `run-all-real` (production browser + device-flow-enrolled
+  plugin on one JWT-auth nats-server — the only stand-in is the echo LLM, by design),
+  `run-two-account-isolation`, `run-derived-trust`. (P0-2 removed the three
+  dev-open-NATS register harnesses — `run-jwt-register`, `run-saas-issuer-register`,
+  `run-browser-jwt-register` — whose assertions `run-all-real` subsumes; two-account
+  isolation was migrated onto the enrolled trust chain.)
 - Examples consumer tests run with their own runner against freshly built `dist/`
   (`7603b85` — they import the package entry like a real downstream).
 
