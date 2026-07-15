@@ -682,12 +682,11 @@ export function buildApprovalRequestPayload(
 
 /**
  * Build the strongly typed native runtime spec. `transport` is captured in the
- * closure so delivery/finalize go straight to our WebSocket session map — we do
+ * closure so delivery/finalize go straight to our NATS peer channel — we do
  * not need the gateway-supplied `context` (which other channels use to reach a
- * platform client). The delivery target resolves to the ORIGINATING peer's web
- * session (see `prepareTarget` / the capability's `resolveOriginTarget`), so
- * with multiple concurrent users each approval prompt reaches the user who
- * triggered it.
+ * platform client). The delivery target resolves to the ORIGINATING peer (see
+ * the capability's `resolveOriginTarget`), so with multiple concurrent users
+ * each approval prompt reaches the user who triggered it.
  */
 export function createClawApprovalNativeRuntimeSpec(
   transport: WebChannelPeerChannel,
@@ -708,9 +707,9 @@ export function createClawApprovalNativeRuntimeSpec(
   // frame — it must NEVER fall back to the closure `transport` (the primary
   // channel), or an account that `registerFull` skipped (creds-missing /
   // connect-fail) would have its prompt delivered on the PRIMARY account's
-  // channel — re-opening the exact cross-account misroute S1 closes. Only the
-  // legacy single-transport WS entry (no resolver) uses the closure transport,
-  // where there is exactly one account and no misroute is possible.
+  // channel — re-opening the exact cross-account misroute S1 closes. Only a
+  // resolver-less single-channel wiring uses the closure transport, where
+  // there is exactly one account and no misroute is possible.
   const hasResolver = typeof resolveAccountTransport === "function";
   const transportFor = (
     accountId: string | null | undefined,
@@ -796,11 +795,11 @@ export function createClawApprovalNativeRuntimeSpec(
           );
           return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
         }
-        // Fail-closed: with 2+ connections and an absent `turnSourceTo` the
-        // target falls back to `web-anon`, `soleOpenSocket` returns undefined,
-        // and the prompt is correctly DROPPED rather than misrouted. That drop
-        // is otherwise invisible, so log it (no logger in scope here; match the
-        // transport's `[webchannel]` console style — src/transport.ts safeSend).
+        // Fail-closed: with 2+ registered peers and an absent `turnSourceTo`
+        // the target falls back to `web-anon`, `sendApprovalRequest` returns
+        // false (no such registered peer), and the prompt is correctly DROPPED
+        // rather than misrouted. That drop is otherwise invisible, so log it
+        // (no logger in scope here; match the `[webchannel]` console style).
         const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload);
         if (!delivered) {
           console.warn(

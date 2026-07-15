@@ -41,6 +41,19 @@ import { isLikelyAbortText, isExplicitStop } from "./abort-mirror.js";
  *
  * Uses per-peer NATS subjects for browser messaging.
  */
+
+/**
+ * Canonical constructor options for `WebChannelNATSClient` — the public type a
+ * consumer should annotate its config with. `url` and `jwt` are supplied
+ * through the `WebChannelOptions` aliases `natsUrl` / `bootstrapJwt`, so they
+ * are Omitted from the `NatsClientOptions` half — otherwise the intersection
+ * would require the caller to ALSO pass a raw `url` the wrapper ignores.
+ * Everything else (accountId, tenant, peerId, registration, natsCredentials,
+ * reconnect tuning) is forwarded as-is.
+ */
+export type WebChannelNATSClientOptions = WebChannelOptions &
+  Omit<NatsClientOptions, "url" | "jwt">;
+
 export class WebChannelNATSClient {
   private readonly natsOptions: NatsClientOptions;
   private readonly client: WebChannelNatsClient;
@@ -87,12 +100,7 @@ export class WebChannelNATSClient {
   private staleDraftTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly STALE_DRAFT_GRACE_MS = 30_000;
 
-  // `url` and `jwt` are supplied through the WebChannelOptions aliases
-  // `natsUrl` / `bootstrapJwt`, so they are Omitted from the NatsClientOptions
-  // half — otherwise the intersection would require the caller to ALSO pass a
-  // raw `url` the wrapper ignores. Everything else (accountId, tenant, peerId,
-  // registration, natsCredentials, reconnect tuning) is forwarded as-is.
-  constructor(options: WebChannelOptions & Omit<NatsClientOptions, "url" | "jwt">) {
+  constructor(options: WebChannelNATSClientOptions) {
     this.natsOptions = {
       url: options.natsUrl ?? "wss://nats.example.com",
       jwt: options.bootstrapJwt ?? "",

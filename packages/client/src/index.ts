@@ -4,7 +4,10 @@
  * reconnect, wire protocol, progress drafts, approvals, transcript state)
  * WITHOUT React. Wrap it in any UI (vanilla DOM, Vue, or a thin React hook).
  */
-export { WebChannelNATSClient } from "./nats-client-wrapper.js";
+export {
+  WebChannelNATSClient,
+  type WebChannelNATSClientOptions,
+} from "./nats-client-wrapper.js";
 export {
   generateDevicePopKeyPair,
   popSignedMessage,
