@@ -427,13 +427,6 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
-   * Send text to the single registered peer, when exactly one is connected.
-   *
-   * Mirrors NATS peer channel.untargeted fallback: the outbound seam falls back
-   * here for core-initiated (untargeted) sends. With one peer (the common single
-   * web user) we deliver; with zero or many we refuse to guess and return false.
-   */
-  /**
    * Send progress update to peer.
    */
   sendProgress(peerId: string, id: string, text: string, turnId?: string): boolean {

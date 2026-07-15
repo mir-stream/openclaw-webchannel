@@ -216,8 +216,8 @@ function deriveAccountAuth(
  * `registerFull`). This Proxy forwards every transport method call to the live
  * `NatsChannel` once it is bound; before binding, method calls are no-ops
  * returning `false`. `NatsChannel` implements the outbound surface the plugin's
- * message/outbound adapters use (sendText, untargeted fallback, sendProgress,
- * finalizeDraft, sendTyping, sendApprovalRequest/Resolved).
+ * message/outbound adapters use (sendText, sendProgress, finalizeDraft,
+ * sendTyping, sendApprovalRequest/Resolved — see `WebChannelPeerChannel`).
  */
 let boundChannel: NatsChannel | null = null;
 const lazyTransport: WebChannelPeerChannel = new Proxy({} as WebChannelPeerChannel, {
@@ -1081,10 +1081,11 @@ export default defineChannelPluginEntry({
     // unknown-account fallback there. Prefer "default", else the first built
     // account.
     //
-    // Remaining follow-up (S1 outbound leg): core-initiated UNTARGETED sends
-    // (`untargeted fallback` etc.) are still primary-only — a peerId registered on
-    // BOTH the primary AND a non-primary account could receive the primary
-    // account's proactive outbound. Decide semantics when agent-initiated
+    // Remaining follow-up (S1 outbound leg): core-initiated sends without an
+    // account route are still primary-only — a peerId registered on BOTH the
+    // primary AND a non-primary account could receive the primary account's
+    // proactive outbound. (Untargeted sends now DROP explicitly per P0-1; the
+    // send-result contract is P0-4.) Decide semantics when agent-initiated
     // outbound is built (docs/BACKLOG.md S1).
     const primary = accountRuntimes.get("default") ?? [...accountRuntimes.values()][0];
     boundChannel = primary ? primary.channel : null;

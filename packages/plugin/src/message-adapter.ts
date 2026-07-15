@@ -105,10 +105,9 @@ export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
         const id = nextMessageId();
         // `ctx.to` is the recorded reply target — the REAL per-peer `wsKey`
         // (inbound.ts records `reply.to = wsKey`). Target it directly; if it's
-        // absent or has no mapped socket, fall back to `untargeted fallback`,
-        // which delivers only when exactly ONE connection exists and otherwise
-        // refuses to guess — so we never default to the literal `web-anon` key
-        // when real peers are connected.
+        // absent or the targeted send fails, the message is DROPPED with an
+        // explicit error log (P0-1 removed recipient guessing; the send-result
+        // contract itself is P0-4).
         if (!ctx.to || !transport.sendText(ctx.to, ctx.text, id)) {
           console.error("[webchannel] outbound send has no resolvable target peer — dropped");
         }
