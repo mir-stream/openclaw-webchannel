@@ -20,7 +20,7 @@ import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { DEFAULT_ACCOUNT_ID, resolveReadCredentialPath } from "./account-config.js";
+import { accountCredentialPath } from "./account-config.js";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@ import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
  */
 type EnrollmentRequest = {
   agentPublicKey: string;
-  accountId?: string;
+  accountId: string;
   tenant: string;
   /** Plugin package version (diagnostics only; OPTIONAL for pre-reporting plugins). */
   pluginVersion?: string;
@@ -153,7 +153,7 @@ export type PluginCredentials = {
   /**
    * Account (deployment) id — the wire identity (optional, for debugging).
    */
-  accountId?: string;
+  accountId: string;
 
   /**
    * Tenant ID.
@@ -203,15 +203,13 @@ export type EnrollmentOptions = {
    * `credentialPath` is omitted the path is derived from this. Defaults to
    * `"default"`.
    */
-  accountId?: string;
+  accountId: string;
 
   /**
    * Local credential storage path.
    * Defaults to the account-scoped path
-   * `~/.openclaw-webchannel/<account>/credentials.json`, with a backward-compat
-   * fallback to the legacy `~/.openclaw-webchannel/credentials.json` for the
-   * `"default"` account when the per-account file is absent but the legacy one
-   * exists.
+   * `~/.openclaw-webchannel/<account>/credentials.json`. Obsolete single-file
+   * credentials are intentionally ignored.
    */
   credentialPath?: string;
 
@@ -227,6 +225,9 @@ export type EnrollmentOptions = {
    * waiting real seconds. Never set this in production.
    */
   _minPollIntervalMs?: number;
+
+  /** @internal Test-only home-directory seam for default path resolution. */
+  _home?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -244,11 +245,12 @@ export type EnrollmentOptions = {
  */
 export class EnrollmentClient {
   private readonly options: Required<
-    Omit<EnrollmentOptions, "displayInstructions" | "accountId" | "_minPollIntervalMs">
+    Omit<EnrollmentOptions, "displayInstructions" | "accountId" | "_minPollIntervalMs" | "_home">
   > & {
     displayInstructions: boolean;
-    accountId?: string;
+    accountId: string;
     _minPollIntervalMs?: number;
+    _home?: string;
   };
   private credentials?: PluginCredentials;
 
@@ -261,7 +263,7 @@ export class EnrollmentClient {
     this.options = {
       ...options,
       credentialPath:
-        options.credentialPath ?? this.defaultCredentialPath(options.accountId),
+        options.credentialPath ?? this.defaultCredentialPath(options.accountId, options._home),
       displayInstructions: options.displayInstructions ?? true,
     };
   }
@@ -475,14 +477,11 @@ export class EnrollmentClient {
   /**
    * Get the default credential path for an account (가-1).
    *
-   * Account-scoped: `~/.openclaw-webchannel/<account>/credentials.json`. For the
-   * `"default"` account, falls back to the legacy single-file
-   * `~/.openclaw-webchannel/credentials.json` when the per-account file is absent
-   * but the legacy one exists (so an already-enrolled deployment keeps working
-   * without re-enrolling). Delegated to `resolveReadCredentialPath`.
+   * Account-scoped: `~/.openclaw-webchannel/<account>/credentials.json`.
+   * Obsolete single-file credentials are never read.
    */
-  private defaultCredentialPath(accountId?: string): string {
-    return resolveReadCredentialPath(accountId ?? DEFAULT_ACCOUNT_ID);
+  private defaultCredentialPath(accountId: string, home?: string): string {
+    return accountCredentialPath(accountId, home);
   }
 
   // ---------------------------------------------------------------------------

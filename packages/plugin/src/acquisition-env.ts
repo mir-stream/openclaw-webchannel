@@ -20,7 +20,7 @@
  */
 
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   readWebchannelSection,
   resolveAcquisitionIdentity,
   type WebchannelAcquisitionIdentity,
@@ -59,7 +59,7 @@ export type AcquisitionEnvResult = {
  */
 export function resolveAcquisitionEnvPrecedence(
   cfg: unknown,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   opts: {
     env?: Record<string, string | undefined>;
     warn?: (msg: string) => void;

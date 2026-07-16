@@ -68,6 +68,7 @@ describe("acquireCredentials", () => {
   it("honors an explicit credentialPath override", async () => {
     let capturedOpts: ConstructorParameters<typeof EnrollmentClient>[0] | undefined;
     await acquireCredentials({
+      accountId: "default",
       saasBaseUrl: "http://s",
       tenant: "t",
       credentialPath: "/custom/path/creds.json",
@@ -83,6 +84,7 @@ describe("acquireCredentials", () => {
   it("propagates an enrollment failure (rejects)", async () => {
     await expect(
       acquireCredentials({
+      accountId: "default",
         saasBaseUrl: "http://s",
         tenant: "t",
         log: () => {},
@@ -95,6 +97,7 @@ describe("acquireCredentials", () => {
   it("defaults accountId to 'default' for the path", async () => {
     let capturedOpts: ConstructorParameters<typeof EnrollmentClient>[0] | undefined;
     await acquireCredentials({
+      accountId: "default",
       saasBaseUrl: "http://s",
       tenant: "t",
       home: HOME,

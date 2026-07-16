@@ -41,9 +41,9 @@ import type {
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountCredentialPath,
   canonicalizeAccountId,
-  resolveReadCredentialPath,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { webchannelSetup } from "./setup.js";
@@ -95,16 +95,16 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     configuredLabel: "configured",
     unconfiguredLabel: "not configured",
     resolveConfigured: ({ cfg, accountId }) => {
-      const id = canonicalizeAccountId(accountId ?? DEFAULT_ACCOUNT_ID);
+      const id = canonicalizeAccountId(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
       const account = resolveWebchannelAccountConfig(cfg, id);
       const hasJwt = Boolean((account.auth as { jwt?: unknown } | undefined)?.jwt);
       if (hasJwt) return true;
       // Enrolled creds on disk also count as configured (the account is usable
       // under admission=register-hop even before jwt auth is fully wired).
-      return existsSync(resolveReadCredentialPath(id));
+      return existsSync(accountCredentialPath(id));
     },
     resolveStatusLines: ({ cfg, accountId, configured }) => {
-      const id = canonicalizeAccountId(accountId ?? DEFAULT_ACCOUNT_ID);
+      const id = canonicalizeAccountId(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
       const account = resolveWebchannelAccountConfig(cfg, id);
       const tenant = accountString(account, "tenant") ?? "unset";
       const saas =

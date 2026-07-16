@@ -28,7 +28,7 @@ browser/Playwright variant against a hosted SaaS issuer is follow-up #13. See ST
 
 - NATS entry (`index-nats.ts`) — **production default, cut over live** on the real gateway
   (`:18789`): enrolled via the SaaS device flow against a persistent local trust chain
-  (`nats-server` + reference issuer), credentials cached at `~/.openclaw-webchannel/credentials.json`
+  (`nats-server` + reference issuer), credentials cached at `~/.openclaw-webchannel/<account>/credentials.json`
   so restarts reconnect with no re-approval. See
   [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
@@ -82,7 +82,7 @@ approves, then receives and persists NATS user credentials. On restart it loads 
 credentials and skips enrollment.
 
 **Credential storage:**
-- **Location:** `~/.openclaw-webchannel/credentials.json` (override via `credentialPath`)
+- **Location:** `~/.openclaw-webchannel/<account>/credentials.json` (override via `credentialPath`)
 - **Permissions:** written with mode `0o600` (owner read/write only)
 - **Shape** (`PluginCredentials`): `identityKey { publicKey, privateKey }` (base64url X25519),
   optional `enrollment { creds, peerId, jwksUrl, bootstrapUrl }`, plus `tenant`, `saasEnrollUrl`,

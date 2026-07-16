@@ -14,7 +14,7 @@ import {
 } from "./approvals.js";
 import type { ResolveAccountTransport } from "./approvals.js";
 import {
-  DEFAULT_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   listWebchannelAccountIds,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
@@ -34,7 +34,7 @@ import { webchannelSetupWizard } from "./setup-wizard.js";
 // approvals.ts reading this back adds no new module cycle (and it's only
 // dereferenced at runtime inside createClawApprovalCapability, so ESM live
 // bindings resolve it well after module evaluation).
-export const DEFAULT_ACCOUNT_ID = ACCOUNT_CONFIG_DEFAULT_ACCOUNT_ID;
+export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID;
 
 type ResolvedAccount = {
   accountId: string | null;
@@ -62,7 +62,7 @@ function resolveAccount(
   // detection so a single-account deployment is a regression-free pass-through.
   const account = resolveWebchannelAccountConfig(
     cfg,
-    accountId ?? DEFAULT_ACCOUNT_ID,
+    accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   );
   return {
     accountId: accountId ?? null,

@@ -93,7 +93,7 @@ plugin receives NATS credentials it persists locally for re-connection.
 ```
 plugin                              SaaS                         operator
   │ POST /enroll (agentPublicKey,    │                              │
-  │   tenant, accountId?)            │                              │
+  │   tenant, accountId)             │                              │
   │ ───────────────────────────────►│  create PendingEnrollment    │
   │ ◄─────────────────────────────── │  status=pending              │
   │   device_code, user_code,        │                              │
@@ -124,7 +124,7 @@ restart the plugin reloads stored creds and reconnects with no re-pairing.
 Exported from `device-flow-types.ts` for type-safety across the SaaS ↔ plugin
 boundary:
 
-- `EnrollmentRequest` — `{ agentPublicKey, tenant, accountId? }`
+- `EnrollmentRequest` — `{ agentPublicKey, tenant, accountId }`
 - `EnrollmentResponse` — `device_code`, `user_code`, `verification_uri`,
   `verification_uri_complete`, `expires_in`, `interval`
 - `PollRequest` — `{ device_code }`
@@ -175,8 +175,9 @@ auth) and `src/nats-user-jwt.test.ts` (unit-level JWT/permission shape).
 ## Reference harnesses
 
 These live under `reference/` and are **for demonstration only — NOT production**.
-They use plain Node `http` with no TLS, no auth, and an in-memory store; a real
-SaaS must add TLS, authentication, a persistent store, and production error
+They use plain Node `http` with no TLS and an in-memory store. Operator actions
+require `Authorization: Bearer $ENROLLMENT_ADMIN_TOKEN` and fail closed when the
+variable is unset; a real SaaS must add TLS, authentication, a persistent store, and production error
 handling.
 
 - `reference/setup-trust-chain.ts` — CLI that runs `setupTrustChain` and
@@ -186,8 +187,18 @@ handling.
   - `POST /api/enroll` — start enrollment
   - `POST /api/poll` — poll for approval
   - `GET  /enroll` — operator approval UI (`reference/enrollment-ui.html`)
-  - `POST /approve` / `POST /deny` — operator decision
+  - `POST /approve` / `POST /deny` / `POST /revoke` — operator action; requires `ENROLLMENT_ADMIN_TOKEN`
   - serves `bootstrapUrl` as `/bootstrap`, JWKS as `/.well-known/jwks.json`
+
+Run the reference operator endpoints with an explicit token:
+
+```bash
+ENROLLMENT_ADMIN_TOKEN=dev-only-token node --import tsx packages/saas/reference/enrollment-server.ts
+curl -X POST http://127.0.0.1:3000/approve \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer dev-only-token' \
+  -d '{"user_code":"ABCD-EFGH"}'
+```
 - `reference/bootstrap-server.ts` — reference bootstrap-JWT issuance endpoint.
 
 ## Installation notes

@@ -40,6 +40,7 @@ NATS_WS=18622
 NATS_TCP=14622
 ECHO_PORT=18904
 ISSUER_PORT=3941
+ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
 PAGE_PORT=19393
 
 TENANT=default-tenant
@@ -88,6 +89,7 @@ SAAS_ISSUER="$SAAS_ISSUER" \
 NATS_URL="ws://127.0.0.1:$NATS_WS" \
 NATS_CONFIG_OUT="$OCH" \
 ENABLE_TEST_ROUTES=1 \
+ENROLLMENT_ADMIN_TOKEN="$ENROLLMENT_ADMIN_TOKEN" \
 POLL_INTERVAL_SECONDS=1 \
   node --import tsx "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
 ISSUER_PID=$!
@@ -270,6 +272,7 @@ done
 [ -z "$USER_CODE" ] && { echo "[run-all-real] TIMEOUT waiting for user_code — channels-add log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-all-real] enrollment user_code=$USER_CODE — approving…"
 APPROVE="$(curl -fsS -X POST "http://127.0.0.1:$ISSUER_PORT/approve" \
+  -H "Authorization: Bearer $ENROLLMENT_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d "{\"user_code\":\"$USER_CODE\"}" || true)"
 echo "[run-all-real] approve response: $APPROVE"
 

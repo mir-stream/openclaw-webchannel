@@ -53,11 +53,11 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountCredentialPath,
   canonicalizeAccountId,
   readAccountsMap,
   readWebchannelSection,
-  resolveReadCredentialPath,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
@@ -264,7 +264,7 @@ function writeAccountConfig(
   const existingAccounts = readAccountsMap(section);
   const hasNamedAccounts = Object.keys(existingAccounts).length > 0;
 
-  if (accountId === DEFAULT_ACCOUNT_ID && !hasNamedAccounts) {
+  if (accountId === DEFAULT_WEBCHANNEL_ACCOUNT_ID && !hasNamedAccounts) {
     // Merge at channel level (excluding the structural `accounts` map). Safe only
     // while no named accounts exist — a flat default is still servable then.
     const { accounts, ...flat } = section as { accounts?: unknown } & Record<string, unknown>;
@@ -395,8 +395,9 @@ export const webchannelSetup = {
       return;
     }
 
-    // Skip if per-account (or legacy-default) creds already exist.
-    const existingPath = resolveReadCredentialPath(id);
+    // Skip only if account-scoped creds already exist. The legacy single-file
+    // path is migration/runbook-only and is never read at runtime.
+    const existingPath = accountCredentialPath(id);
     const { existsSync } = await import("node:fs");
     if (existsSync(existingPath)) {
       runtime.log(

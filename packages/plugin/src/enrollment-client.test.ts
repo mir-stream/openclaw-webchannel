@@ -14,9 +14,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { EnrollmentClient } from "./enrollment-client.js";
 import type { EnrollmentOptions } from "./enrollment-client.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
-import { mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { accountCredentialPath, legacyCredentialPath } from "./account-config.js";
+import { MemoryAgentKeyRegistry } from "../../saas/src/agent-key-registry.js";
 
 // ---------------------------------------------------------------------------
 // Test utilities
@@ -293,6 +295,97 @@ describe("EnrollmentClient", () => {
 
       // Should NOT have called SaaS endpoints
       expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("P1-1 offline re-key", () => {
+    const queueSuccessfulEnrollment = (peerId: string) => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: `device-${peerId}`,
+          user_code: "ABCD-1234",
+          verification_uri: "https://saas.com/enroll",
+          verification_uri_complete: "https://saas.com/enroll?user_code=ABCD-1234",
+          expires_in: 600,
+          interval: 5,
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          creds: { userJwt: `jwt-${peerId}`, userSeed: `seed-${peerId}` },
+          peerId,
+          jwksUrl: "https://saas.com/.well-known/jwks.json",
+          bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
+        }),
+      });
+    };
+
+    it("24: deleting an explicit credentialPath causes a fresh identity and enrollment", async () => {
+      queueSuccessfulEnrollment("first");
+      await client.enroll();
+      const firstKey = Buffer.from(client.getIdentityKey().publicKey).toString("hex");
+      rmSync(credentialPath, { force: true });
+
+      const replacement = new EnrollmentClient(createTestOptions({ credentialPath }));
+      queueSuccessfulEnrollment("second");
+      await replacement.enroll();
+      const secondKey = Buffer.from(replacement.getIdentityKey().publicKey).toString("hex");
+
+      expect(secondKey).not.toBe(firstKey);
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+
+    it("24: runbook reset covers default layout, override, and default-account legacy leftover without key reuse", async () => {
+      const fixtureHome = join(tmpdir(), `openclaw-reset-${Date.now()}`);
+      const cases = [
+        { name: "default-layout", path: accountCredentialPath("acct", fixtureHome), legacy: false },
+        { name: "explicit-override", path: join(fixtureHome, "override.json"), legacy: false },
+        { name: "default", path: accountCredentialPath("default", fixtureHome), legacy: true },
+      ];
+      try {
+        for (const scenario of cases) {
+          mockFetch.mockReset();
+          const pathOptions = scenario.legacy
+            ? { credentialPath: undefined, _home: fixtureHome }
+            : { credentialPath: scenario.path };
+          const firstClient = new EnrollmentClient(createTestOptions({ accountId: scenario.name, ...pathOptions }));
+          queueSuccessfulEnrollment(`${scenario.name}-old`);
+          await firstClient.enroll();
+          const oldKey = Buffer.from(firstClient.getIdentityKey().publicKey).toString("base64url");
+          const registry = new MemoryAgentKeyRegistry();
+          expect((await registry.register("test-tenant", scenario.name, oldKey, null)).ok).toBe(true);
+          expect(await registry.revokeActive("test-tenant", scenario.name)).toBe(true);
+
+          if (scenario.legacy) {
+            const legacy = legacyCredentialPath(fixtureHome);
+            mkdirSync(join(fixtureHome, ".openclaw-webchannel"), { recursive: true });
+            writeFileSync(legacy, JSON.stringify({
+              identityKey: { publicKey: oldKey, privateKey: oldKey },
+              enrollment: { creds: { userJwt: "legacy", userSeed: "legacy" } },
+            }));
+          }
+          rmSync(scenario.path, { force: true });
+
+          let incomingKey = "";
+          mockFetch.mockImplementationOnce(async (_url, init) => {
+            incomingKey = (JSON.parse(String(init?.body)) as { agentPublicKey: string }).agentPublicKey;
+            const registration = await registry.register("test-tenant", scenario.name, incomingKey, null);
+            expect(registration.ok, scenario.name).toBe(true);
+            return { ok: true, json: async () => ({ device_code: `device-${scenario.name}`, user_code: "RESET-1234", verification_uri: "https://saas.com/enroll", verification_uri_complete: "https://saas.com/enroll?user_code=RESET-1234", expires_in: 600, interval: 0 }) };
+          });
+          mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ creds: { userJwt: "new-jwt", userSeed: "new-seed" }, peerId: `new-${scenario.name}`, jwksUrl: "https://saas.com/jwks", bootstrapUrl: "https://saas.com/bootstrap", natsUrl: "wss://nats.saas.com" }) });
+          const replacement = new EnrollmentClient(createTestOptions({ accountId: scenario.name, ...pathOptions }));
+          await replacement.enroll();
+          expect(incomingKey).not.toBe(oldKey);
+          expect((await registry.getActive("test-tenant", scenario.name))?.publicKey).toBe(incomingKey);
+          expect(mockFetch).toHaveBeenCalledTimes(4);
+        }
+      } finally {
+        rmSync(fixtureHome, { recursive: true, force: true });
+      }
     });
   });
 

@@ -32,7 +32,7 @@ export type EnrollmentRequest = {
    * Account (deployment) identifier — the wire identity (optional but recommended).
    * Useful for debugging and logging; not part of the trust chain.
    */
-  accountId?: string;
+  accountId: string;
 
   /**
    * Tenant identifier (required for multi-tenant SaaS).
@@ -137,7 +137,7 @@ export type PendingEnrollment = {
   /**
    * Account (deployment) identifier — the wire identity (optional).
    */
-  accountId?: string;
+  accountId: string;
 
   /**
    * Tenant identifier.

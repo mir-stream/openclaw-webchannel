@@ -9,7 +9,8 @@
  * CONSUME the persisted per-account creds instead of enrolling:
  *
  *   - enrolled  → load `~/.openclaw-webchannel/<account>/credentials.json`
- *                 (legacy single-file fallback for `"default"`) and connect with
+ *                 (account-scoped only; the legacy single-file path is retained
+ *                 solely for migration/runbook cleanup) and connect with
  *                 those user JWT + NKEY seed. Missing/empty ⇒ a structured
  *                 "creds missing" result so the caller applies account-scoped
  *                 graceful degradation (skip the account, actionable log) — NO
@@ -32,7 +33,7 @@ import {
   type NatsCredentialSource,
 } from "./nats-credential-source.js";
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   loadPersistedEnrolledCreds,
 } from "./account-config.js";
 import type { KeyPair } from "./e2e-crypto.js";
@@ -78,7 +79,7 @@ export type ConsumeCredentialSourceDeps = ConnectNatsDeps & {
  */
 export async function consumeCredentialSource(
   source: NatsCredentialSource,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   deps: ConsumeCredentialSourceDeps = {},
 ): Promise<ConsumeResult> {
   if (source.mode !== "enrolled") {

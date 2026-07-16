@@ -25,7 +25,7 @@
 
 import { EnrollmentClient } from "./enrollment-client.js";
 import type { EnrollmentResultLike } from "./enrollment-client.js";
-import { accountCredentialPath, DEFAULT_ACCOUNT_ID } from "./account-config.js";
+import { accountCredentialPath } from "./account-config.js";
 
 /** A minimal log sink (the setup hook's `runtime.log`, or `console.log`). */
 export type AcquireLog = (...args: unknown[]) => void;
@@ -36,7 +36,7 @@ export type AcquireCredentialsOptions = {
    * (JWT aud / NATS subject key) sent to the SaaS enrollment. The credential
    * path is account-scoped on the same value.
    */
-  accountId?: string;
+  accountId: string;
   /** SaaS issuer base URL; `/api/enroll` + `/api/poll` are derived from it. */
   saasBaseUrl: string;
   /** Deployment tenant identifier. */
@@ -74,7 +74,7 @@ export type AcquireCredentialsOptions = {
 export async function acquireCredentials(
   options: AcquireCredentialsOptions,
 ): Promise<EnrollmentResultLike> {
-  const accountId = options.accountId ?? DEFAULT_ACCOUNT_ID;
+  const accountId = options.accountId;
   const log: AcquireLog = options.log ?? ((...args) => console.log(...args));
   const credentialPath =
     options.credentialPath ?? accountCredentialPath(accountId, options.home);

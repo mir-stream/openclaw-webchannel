@@ -1,91 +1,134 @@
-/**
- * F2 — durable agent identity-key registry.
- *
- * ── Why this exists ─────────────────────────────────────────────────────────
- * On the register/keyStore (production multi-device) path the browser must accept
- * the conversation key K ONLY if it was wrapped by the genuine agent — i.e. by the
- * holder of the agent identity private key that the SaaS attests to the browser.
- * For the browser to authenticate K it needs the agent's X25519 identity PUBLIC
- * key, delivered alongside the (first-party HTTPS) bootstrap response and derived
- * from SOLELY there — never from any NATS frame (see `parseBootstrapResponse` in
- * packages/client/src/saas-bootstrap.ts).
- *
- * That key is sent to the SaaS at enrollment (`agentPublicKey`) but historically
- * lived ONLY in the in-memory pending-enrollment store, which is retention-evicted
- * minutes after the agent polls its creds. So a browser bootstrapping HOURS later
- * had no attested agent key to pin. This registry is the durable home for it:
- * populated at enrollment APPROVAL and read at bootstrap.
- *
- * ── Keying ──────────────────────────────────────────────────────────────────
- * Keyed by (tenant, accountId), matching how the rest of the codebase resolves an
- * account. `accountId` is OPTIONAL in the enrollment request (it "is not part of
- * the trust chain"), so an accountId-less enrollment falls back to
- * {@link DEFAULT_REGISTRY_ACCOUNT_ID}. This is a pure MAP key — it does NOT
- * conjure a plugin-side "default" account (issue #17 is about the plugin's
- * account-config resolution, a different layer). At bootstrap the browser always
- * carries a concrete accountId, so the lookup selects the same key the matching
- * per-account enrollment persisted.
- *
- * ── Durability ──────────────────────────────────────────────────────────────
- * The interface is the durable seam: a production SaaS backs it with a DB / KV so
- * the mapping outlives process restarts and the pending-store sweep. The bundled
- * {@link MemoryAgentKeyRegistry} keeps it in a Map — sufficient for the demo /
- * reference servers (it survives the pending-store eviction because nothing sweeps
- * it) but NOT across a process restart, which a real deployment must not rely on.
- */
+import { createHash, randomBytes } from "node:crypto";
+
+/** Stable full base64url SHA-256 identifier of an X25519 public key. */
+export type AgentKeyId = string;
+/** Opaque, per-activation CAS token. It is deliberately not derived from the key. */
+export type ActivationId = string;
+
+export interface AgentKeyRecord {
+  readonly tenant: string;
+  readonly accountId: string;
+  readonly publicKey: string;
+  readonly keyId: AgentKeyId;
+  readonly activationId: ActivationId;
+  readonly status: "active" | "superseded" | "revoked";
+  readonly enrolledAt: number;
+  readonly endedAt?: number;
+  readonly supersededBy?: ActivationId;
+}
+
+export type RegisterAgentKeyResult =
+  | { ok: true; record: AgentKeyRecord; idempotent: boolean }
+  | { ok: false; reason: "conflict"; current: AgentKeyRecord | null }
+  | { ok: false; reason: "revoked" };
 
 /**
- * Fallback registry account segment for an enrollment that carried no explicit
- * `accountId`. See the module docstring — this is a map-key fallback only.
- */
-export const DEFAULT_REGISTRY_ACCOUNT_ID = "default";
-
-/**
- * Durable store mapping (tenant, accountId) → the agent's attested X25519
- * identity public key (base64url, 43 chars). Implementations may be in-memory
- * (demo/reference) or persistent (DB/KV) for production.
+ * Durable agent-key registry SPI v2.
+ *
+ * Implementations MUST serialize register/revokeActive per slot and return a
+ * coherent before-or-after snapshot from readers. History and tombstones are
+ * non-lossy for the lifetime of a slot: TTL or lossy compaction is not conformant.
+ * The enrollment store and this registry must share one durability domain.
  */
 export interface AgentKeyRegistry {
-  /**
-   * Upsert the attested agent public key for (tenant, accountId). Called at
-   * enrollment APPROVAL. A re-enrollment mints a FRESH agent identity key, so a
-   * later approval MUST overwrite the previous value (upsert, last-writer-wins).
-   */
-  put(tenant: string, accountId: string | undefined, agentPublicKey: string): Promise<void>;
+  getActive(tenant: string, accountId: string): Promise<AgentKeyRecord | null>;
+  register(
+    tenant: string,
+    accountId: string,
+    publicKey: string,
+    expect: ActivationId | null,
+  ): Promise<RegisterAgentKeyResult>;
+  revokeActive(tenant: string, accountId: string): Promise<boolean>;
+  listHistory(tenant: string, accountId: string): Promise<AgentKeyRecord[]>;
+}
 
-  /**
-   * Look up the attested agent public key for (tenant, accountId), or `null` when
-   * none is registered (no enrollment yet, or a pre-F2 approval). A `null` at
-   * bootstrap means the browser cannot authenticate K — the caller decides
-   * whether to fail the bootstrap or omit the field (a lockstep-old client
-   * ignores it).
-   */
-  get(tenant: string, accountId: string | undefined): Promise<string | null>;
+/** Length-prefixing prevents tenant/account boundary collisions. */
+export function agentKeyRegistryKey(tenant: string, accountId: string): string {
+  return `${tenant.length}:${tenant}/${accountId.length}:${accountId}`;
+}
+
+function keyId(publicKey: string): AgentKeyId {
+  return createHash("sha256").update(Buffer.from(publicKey, "base64url")).digest("base64url");
+}
+
+function clone(record: AgentKeyRecord): AgentKeyRecord {
+  return { ...record };
 }
 
 /**
- * Canonical registry key. `accountId` undefined/empty collapses to
- * {@link DEFAULT_REGISTRY_ACCOUNT_ID}. The two segments are length-prefixed so no
- * `tenant`/`accountId` pair can collide with another via the join character.
- */
-export function agentKeyRegistryKey(tenant: string, accountId: string | undefined): string {
-  const acct = accountId && accountId.length > 0 ? accountId : DEFAULT_REGISTRY_ACCOUNT_ID;
-  return `${tenant.length}:${tenant}/${acct.length}:${acct}`;
-}
-
-/**
- * In-memory {@link AgentKeyRegistry}. Survives the pending-enrollment store's
- * eviction (nothing sweeps this map) but NOT a process restart — production
- * deployments provide a persistent implementation of the same interface.
+ * Single-process reference implementation. Map transitions contain no await,
+ * hence each slot's read/modify/write is one JS run-to-completion operation.
  */
 export class MemoryAgentKeyRegistry implements AgentKeyRegistry {
-  private readonly keys = new Map<string, string>();
+  private readonly histories = new Map<string, AgentKeyRecord[]>();
 
-  async put(tenant: string, accountId: string | undefined, agentPublicKey: string): Promise<void> {
-    this.keys.set(agentKeyRegistryKey(tenant, accountId), agentPublicKey);
+  async getActive(tenant: string, accountId: string): Promise<AgentKeyRecord | null> {
+    const active = this.histories
+      .get(agentKeyRegistryKey(tenant, accountId))
+      ?.find((record) => record.status === "active");
+    return active ? clone(active) : null;
   }
 
-  async get(tenant: string, accountId: string | undefined): Promise<string | null> {
-    return this.keys.get(agentKeyRegistryKey(tenant, accountId)) ?? null;
+  async register(
+    tenant: string,
+    accountId: string,
+    publicKey: string,
+    expect: ActivationId | null,
+  ): Promise<RegisterAgentKeyResult> {
+    const slot = agentKeyRegistryKey(tenant, accountId);
+    const history = this.histories.get(slot) ?? [];
+    const incomingKeyId = keyId(publicKey);
+
+    // Contractual precedence: permanent tombstone, idempotency, then CAS.
+    if (history.some((record) => record.status === "revoked" && record.keyId === incomingKeyId)) {
+      return { ok: false, reason: "revoked" };
+    }
+    const activeIndex = history.findIndex((record) => record.status === "active");
+    const active = activeIndex >= 0 ? history[activeIndex] : undefined;
+    if (active?.publicKey === publicKey) {
+      return { ok: true, record: clone(active), idempotent: true };
+    }
+    if ((expect === null && active) || (expect !== null && active?.activationId !== expect)) {
+      return { ok: false, reason: "conflict", current: active ? clone(active) : null };
+    }
+
+    const now = Date.now();
+    const activationId = randomBytes(16).toString("base64url");
+    const record: AgentKeyRecord = {
+      tenant,
+      accountId,
+      publicKey,
+      keyId: incomingKeyId,
+      activationId,
+      status: "active",
+      enrolledAt: now,
+    };
+    const next = history.map((old, index) =>
+      index === activeIndex
+        ? { ...old, status: "superseded" as const, endedAt: now, supersededBy: activationId }
+        : old,
+    );
+    next.unshift(record);
+    this.histories.set(slot, next);
+    return { ok: true, record: clone(record), idempotent: false };
+  }
+
+  async revokeActive(tenant: string, accountId: string): Promise<boolean> {
+    const slot = agentKeyRegistryKey(tenant, accountId);
+    const history = this.histories.get(slot);
+    const activeIndex = history?.findIndex((record) => record.status === "active") ?? -1;
+    if (!history || activeIndex < 0) return false;
+    const now = Date.now();
+    this.histories.set(
+      slot,
+      history.map((record, index) =>
+        index === activeIndex ? { ...record, status: "revoked" as const, endedAt: now } : record,
+      ),
+    );
+    return true;
+  }
+
+  async listHistory(tenant: string, accountId: string): Promise<AgentKeyRecord[]> {
+    return (this.histories.get(agentKeyRegistryKey(tenant, accountId)) ?? []).map(clone);
   }
 }
