@@ -56,6 +56,8 @@ ACCT_B=acctb
 PEER_A=web-accta-peer
 PEER_B=web-acctb-peer
 ISS="http://127.0.0.1:$ISSUER_PORT"
+# P1-1: operator actions (approve/deny/revoke) are bearer-guarded, fail-closed 503.
+ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
 ECHO_A_PREFIX="AGENT-A-ECHO: "
 ECHO_B_PREFIX="AGENT-B-ECHO: "
 
@@ -109,6 +111,7 @@ echo "[run-two-acct] set plugin extensions → ./index-nats.ts"
 # 1. One trust chain supplies the operator, enrollment credentials, JWKS, and pins.
 PORT="$ISSUER_PORT" SAAS_BASE_URL="$ISS" SAAS_ISSUER="$ISS" \
 NATS_URL="ws://127.0.0.1:$NATS_WS" NATS_CONFIG_OUT="$OCH" ENABLE_TEST_ROUTES=1 \
+ENROLLMENT_ADMIN_TOKEN="$ENROLLMENT_ADMIN_TOKEN" \
 POLL_INTERVAL_SECONDS=1 node --import tsx \
   "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
 ISSUER_PID=$!
@@ -219,6 +222,7 @@ enroll_account() {
   done
   [ -n "$code" ] || { cat "$log"; exit 2; }
   curl -fsS -X POST "$ISS/approve" -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer $ENROLLMENT_ADMIN_TOKEN" \
     -d "{\"user_code\":\"$code\"}" >/dev/null
   wait "$ADD_PID" || { cat "$log"; exit 2; }
   ADD_PID=""
