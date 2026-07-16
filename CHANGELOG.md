@@ -1,5 +1,9 @@
 # Changelog
 
+- Hardened both NATS WebSocket transports with stable subscription replay,
+  byte-accurate bounded framing, per-phase handshake deadlines, and stale
+  async-connection generation guards.
+
 ## 0.3.0
 
 ### BREAKING

@@ -23,6 +23,10 @@
 import WebSocket from "ws";
 import { EventEmitter } from "node:events";
 
+export const MAX_CONTROL_LINE = 64 * 1024;
+export const MAX_PAYLOAD = 8 * 1024 * 1024;
+export const MAX_BUFFERED_BYTES = MAX_CONTROL_LINE + MAX_PAYLOAD + 4;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -83,6 +87,8 @@ export type NatsConnectOptions = {
    * terminal `error`). Default `Infinity` — keep retrying with capped backoff.
    */
   maxReconnectAttempts?: number;
+  /** Per-handshake-phase deadline in ms. Default 10,000; 0 disables it. */
+  handshakeTimeoutMs?: number;
   /**
    * Seam for dependency injection in tests. When provided, this factory is
    * called instead of `new WebSocket(url)`. Allows tests to drive the
@@ -133,20 +139,15 @@ export class NatsTransport extends EventEmitter {
   // Active subscriptions: sid → subject. Used for cleanup on disconnect.
   private readonly subs: Map<number, string> = new Map();
 
-  // Partial-line buffer for NATS protocol parsing (text frames may split).
-  private buffer = "";
-
   // Whether the NATS handshake (INFO→CONNECT→PONG) has completed.
   private _connected = false;
-
-  // Prevents sending CONNECT twice in JWT mode (INFO may arrive in fragments).
-  private _connectSent = false;
 
   private readonly url: string;
   private readonly jwtCredential?: string;
   private readonly nkeySigningCallback?: (nonce: string) => Promise<string>;
   private readonly clientName: string;
   private readonly wsFactory: (url: string) => WebSocket;
+  private readonly handshakeTimeoutMs: number;
 
   // ── Reconnect state (S1) ───────────────────────────────────────────────────
   private readonly reconnectEnabled: boolean;
@@ -170,6 +171,7 @@ export class NatsTransport extends EventEmitter {
     this.reconnectBaseMs = options.reconnectBaseMs ?? 500;
     this.reconnectCapMs = options.reconnectCapMs ?? 15_000;
     this.maxReconnectAttempts = options.maxReconnectAttempts ?? Infinity;
+    this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
     // Default factory: real outbound WebSocket CLIENT connection.
     this.wsFactory = options._wsFactory ?? ((url) => new WebSocket(url));
   }
@@ -199,7 +201,6 @@ export class NatsTransport extends EventEmitter {
     // connect() would silently lose S1 auto-reconnect forever (`closed` was
     // only ever set, never cleared).
     this.closed = false;
-    this._connectSent = false;
     return new Promise<void>((resolve, reject) => {
       // ── Outbound WebSocket CLIENT connection ────────────────────────────
       // `wsFactory(url)` dials the remote NATS server. The default factory
@@ -207,7 +208,11 @@ export class NatsTransport extends EventEmitter {
       // No local port is opened for listening; there is NO inbound socket.
       const ws = this.wsFactory(this.url);
       this.ws = ws;
-      this.buffer = "";
+      let buffer = Buffer.alloc(0);
+      let connectSent = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let phase = "WebSocket open";
+      let established = false;
 
       // `handshakeDone` gates whether we emit errors to EventEmitter listeners.
       // Before the handshake completes, errors reject the connect() promise;
@@ -217,6 +222,7 @@ export class NatsTransport extends EventEmitter {
       const settle = (err?: Error): void => {
         if (settled) return;
         settled = true;
+        if (timer) clearTimeout(timer);
         if (err) {
           reject(err);
         } else {
@@ -224,9 +230,29 @@ export class NatsTransport extends EventEmitter {
           resolve();
         }
       };
+      const armDeadline = (nextPhase: string): void => {
+        phase = nextPhase;
+        if (timer) clearTimeout(timer);
+        if (this.handshakeTimeoutMs === 0 || settled) return;
+        timer = setTimeout(() => {
+          const err = new Error(`NatsTransport: handshake timeout in phase ${phase}`);
+          settle(err);
+          try { ws.close(); } catch { /* own socket already closed */ }
+        }, this.handshakeTimeoutMs);
+        if (typeof timer.unref === "function") timer.unref();
+      };
+      const protocolViolation = (reason: string): void => {
+        const err = new Error(`NatsTransport: protocol violation: ${reason}`);
+        this.emitError(err);
+        settle(err);
+        try { ws.close(); } catch { /* already closed */ }
+      };
+      armDeadline("WebSocket open");
 
       ws.on("open", () => {
+        if (this.ws !== ws) return;
         if (this.nkeySigningCallback) {
+          armDeadline("INFO");
           // ── JWT auth mode: wait for INFO with nonce before sending CONNECT ──
           // In enrolled-JWT mode the real nats-server sends INFO (containing a
           // challenge nonce) as the first message. We MUST sign that nonce and
@@ -253,14 +279,41 @@ export class NatsTransport extends EventEmitter {
           ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
           // Initiate the round-trip that proves the connection is ready.
           ws.send("PING\r\n");
+          armDeadline("first PONG");
         }
       });
 
       ws.on("message", (data: Buffer | string) => {
-        const chunk =
-          Buffer.isBuffer(data) ? data.toString("utf8") : (data as string);
-        this.buffer += chunk;
-        this.drainBuffer(settle);
+        if (this.ws !== ws) return;
+        const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        if (buffer.length + chunk.length > MAX_BUFFERED_BYTES) {
+          protocolViolation(`buffer exceeds ${MAX_BUFFERED_BYTES} bytes`);
+          return;
+        }
+        buffer = Buffer.concat([buffer, chunk]);
+        const result = this.drainBuffer(ws, buffer, (err?: Error) => {
+          if (err) {
+            settle(err);
+            try { ws.close(); } catch { /* already closed */ }
+            return;
+          }
+          if (!established) {
+            established = true;
+            settle();
+            if (this.ws === ws) {
+              this._connected = true;
+              this.safeEmit("connect");
+            }
+          } else if (this.ws === ws) {
+            this.safeEmit("pong");
+          }
+        }, () => established, protocolViolation, () => {
+          if (connectSent) return false;
+          connectSent = true;
+          armDeadline("CONNECT signing");
+          return true;
+        }, () => armDeadline("first PONG"));
+        buffer = result;
       });
 
       ws.on("error", (err: Error) => {
@@ -312,13 +365,27 @@ export class NatsTransport extends EventEmitter {
    * Promise. It is called exactly once — on the first PONG (success) or on any
    * -ERR before that (failure).
    */
-  private drainBuffer(onFirstPong?: (err?: Error) => void): void {
+  private drainBuffer(
+    ws: WebSocket,
+    initialBuffer: Buffer,
+    onFirstPong: (err?: Error) => void,
+    isEstablished: () => boolean,
+    protocolViolation: (reason: string) => void,
+    beginJwtConnect: () => boolean,
+    connectSent: () => void,
+  ): Buffer {
     // NATS lines are terminated by \r\n. MSG payloads follow immediately after
     // the MSG header line (also terminated by \r\n).
+    let buffer = initialBuffer;
     let crlfPos: number;
-    while ((crlfPos = this.buffer.indexOf("\r\n")) !== -1) {
-      const line = this.buffer.slice(0, crlfPos);
-      this.buffer = this.buffer.slice(crlfPos + 2);
+    while ((crlfPos = buffer.indexOf("\r\n")) !== -1) {
+      if (crlfPos > MAX_CONTROL_LINE) {
+        protocolViolation(`control line exceeds ${MAX_CONTROL_LINE} bytes`);
+        return Buffer.alloc(0);
+      }
+      const lineBytes = buffer.subarray(0, crlfPos);
+      const line = lineBytes.toString("utf8");
+      buffer = buffer.subarray(crlfPos + 2);
 
       if (!line) continue;
 
@@ -327,29 +394,23 @@ export class NatsTransport extends EventEmitter {
         // In JWT auth mode, the INFO contains a challenge nonce that we must
         // sign before sending CONNECT. sendConnectWithJwt() is idempotent
         // (guarded by _connectSent) so repeated INFO lines are safe.
-        if (this.nkeySigningCallback && !this._connectSent) {
-          this._connectSent = true;
-          void this.sendConnectWithJwt(line, onFirstPong);
+        if (this.nkeySigningCallback && beginJwtConnect()) {
+          void this.sendConnectWithJwt(ws, line, onFirstPong, connectSent);
         }
         continue;
       }
 
       if (line === "PONG") {
         // PONG is the server's reply to our PING, confirming the connection.
-        if (!this._connected) {
-          this._connected = true;
-          this.safeEmit("connect");
-          onFirstPong?.();
-        } else {
-          // Subsequent PONGs are heartbeat replies.
-          this.safeEmit("pong");
-        }
+        // Establishment belongs to this dial, not to the transport-wide state:
+        // overlapping connect() calls must each settle on their own first PONG.
+        onFirstPong();
         continue;
       }
 
       if (line === "PING") {
         // Server-side keepalive ping — reply immediately.
-        this.ws?.send("PONG\r\n");
+          ws.send("PONG\r\n");
         continue;
       }
 
@@ -363,22 +424,37 @@ export class NatsTransport extends EventEmitter {
         // parts[0]="MSG" parts[1]=subject parts[2]=sid
         // With reply-to: parts[3]=reply-to parts[4]=byteCount
         // Without:       parts[3]=byteCount
+        if ((parts.length !== 4 && parts.length !== 5) || parts.some((part) => part === "")) {
+          protocolViolation("malformed MSG header");
+          return Buffer.alloc(0);
+        }
         const hasReplyTo = parts.length === 5;
-        const subject = parts[1] ?? "";
+        const subject = parts[1];
         const replyTo = hasReplyTo ? parts[3] : undefined;
-        const byteCount = parseInt(parts[hasReplyTo ? 4 : 3] ?? "0", 10);
-
-        if (isNaN(byteCount) || byteCount < 0) continue; // malformed, skip
+        const lengthToken = parts[hasReplyTo ? 4 : 3];
+        if (!/^\d+$/.test(lengthToken)) {
+          protocolViolation("malformed MSG byte count");
+          return Buffer.alloc(0);
+        }
+        const byteCount = Number(lengthToken);
+        if (!Number.isSafeInteger(byteCount) || byteCount > MAX_PAYLOAD) {
+          protocolViolation(`MSG payload exceeds ${MAX_PAYLOAD} bytes`);
+          return Buffer.alloc(0);
+        }
 
         // The payload plus the trailing \r\n must be in the buffer.
-        if (this.buffer.length < byteCount + 2) {
+        if (buffer.length < byteCount + 2) {
           // Incomplete payload — put the header line back and wait.
-          this.buffer = `${line}\r\n${this.buffer}`;
+          buffer = Buffer.concat([lineBytes, Buffer.from("\r\n"), buffer]);
           break;
         }
 
-        const payload = Buffer.from(this.buffer.slice(0, byteCount));
-        this.buffer = this.buffer.slice(byteCount + 2); // consume payload + \r\n
+        if (buffer[byteCount] !== 13 || buffer[byteCount + 1] !== 10) {
+          protocolViolation("MSG payload missing trailing CRLF");
+          return Buffer.alloc(0);
+        }
+        const payload = Buffer.from(buffer.subarray(0, byteCount));
+        buffer = buffer.subarray(byteCount + 2);
 
         const msg: NatsMessage = { subject, replyTo, payload };
         this.safeEmit("message", msg);
@@ -387,11 +463,12 @@ export class NatsTransport extends EventEmitter {
 
       if (line.startsWith("-ERR ")) {
         const err = new Error(`NATS server error: ${line}`);
-        if (!this._connected && onFirstPong) {
+        if (!isEstablished()) {
           // Still in handshake — reject the connect() promise directly.
           // Do NOT also emit 'error' here: the promise rejection IS the error
           // signal, and emitting 'error' with no listener would throw.
           onFirstPong(err);
+          return Buffer.alloc(0);
         } else {
           // Post-handshake NATS error (e.g. Permissions Violation for Publish/
           // Subscription) — emit to registered listeners so callers can react.
@@ -407,6 +484,11 @@ export class NatsTransport extends EventEmitter {
 
       // Unknown line — ignore to stay forward-compatible.
     }
+    if (buffer.indexOf("\r\n") === -1 && buffer.length > MAX_CONTROL_LINE) {
+      protocolViolation(`control line exceeds ${MAX_CONTROL_LINE} bytes`);
+      return Buffer.alloc(0);
+    }
+    return buffer;
   }
 
   // ---------------------------------------------------------------------------
@@ -495,7 +577,6 @@ export class NatsTransport extends EventEmitter {
     }
     this._connected = false;
     this.subs.clear();
-    this.buffer = "";
     if (this.ws) {
       try {
         this.ws.close();
@@ -550,11 +631,6 @@ export class NatsTransport extends EventEmitter {
    */
   private async reconnectOnce(): Promise<void> {
     if (this.closed) return;
-    // Capture the subjects we WANT subscribed. We do NOT clear `this.subs` yet:
-    // if this attempt fails, the entries must survive so the NEXT attempt can
-    // still recover them (clearing early would lose all subscriptions after a
-    // single failed re-dial). Dedupe — a subject may map to several sids.
-    const desiredSubjects = [...new Set(this.subs.values())];
     try {
       await this.connect();
     } catch (err) {
@@ -578,11 +654,11 @@ export class NatsTransport extends EventEmitter {
       this.disconnect();
       return;
     }
-    // Success — replace the stale sid→subject entries with fresh subscriptions
-    // on the new socket, then reset the backoff counter.
-    this.subs.clear();
-    for (const subject of desiredSubjects) {
-      this.subscribe(subject);
+    // A sid is a stable logical subscription id for this transport instance.
+    // Replay every entry verbatim: duplicate subjects intentionally retain
+    // their independent subscriptions and callers' unsubscribe handles.
+    for (const [sid, subject] of this.subs) {
+      this.ws!.send(`SUB ${subject} ${sid}\r\n`);
     }
     this.reconnectAttempts = 0;
     this.emit("reconnect");
@@ -602,8 +678,10 @@ export class NatsTransport extends EventEmitter {
    * resolves or rejects the outer connect() Promise via the `settle` callback.
    */
   private async sendConnectWithJwt(
+    ws: WebSocket,
     infoLine: string,
     settle?: (err?: Error) => void,
+    onSent?: () => void,
   ): Promise<void> {
     try {
       // Extract nonce from INFO JSON: INFO {"nonce":"abc123",...}
@@ -639,8 +717,10 @@ export class NatsTransport extends EventEmitter {
         connectPayload["sig"] = sig;
       }
 
-      this.ws!.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
-      this.ws!.send("PING\r\n");
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
+      ws.send("PING\r\n");
+      onSent?.();
     } catch (err) {
       settle?.(err instanceof Error ? err : new Error(String(err)));
     }
