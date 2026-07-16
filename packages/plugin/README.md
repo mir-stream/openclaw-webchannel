@@ -146,11 +146,11 @@ Support for static/BYO creds is planned to return in **P0-3**.
 Until then, any removed config **fails closed with a targeted migration error** instead of silently
 degrading:
 
-- `nats.credentials.mode:"static"` / `"open"`, the removed dev-open NATS flag,
-  `nats.admission:"auto"`, and `auth.strategy:"anonymous"` are rejected at account resolution
-  (`assertNoRemovedConfig` in `src/account-config.ts`), with a message pointing at
-  `openclaw channels add --channel webchannel`.
-- the matching environment overrides are rejected the same way in `src/nats-credential-source.ts`.
+- `nats.credentials.mode:"open"`, the removed dev-open NATS flag, `nats.admission:"auto"`, and
+  `auth.strategy:"anonymous"` are rejected at account resolution (`assertNoRemovedConfig` in
+  `src/account-config.ts`), with a message pointing at `openclaw channels add --channel webchannel`.
+- `nats.credentials.mode:"static"` and the matching environment overrides are rejected one phase
+  later, at credential-source resolution (`src/nats-credential-source.ts`).
 
 Enrolled (SaaS device-flow) creds remain the supported path; the connection env overrides
 (`WEBCHANNEL_NATS_URL` / `_USER_JWT` / `_USER_SEED` / `_CREDS`) still classify the source. Do **not**
