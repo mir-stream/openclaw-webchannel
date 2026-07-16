@@ -3,46 +3,26 @@
 Follow-up work that is deferred, not a functional gap. The single source of truth for current
 state is [`STATUS.md`](STATUS.md).
 
-## C2 — Authenticated registration (mutual key attestation) — **SECURITY, hard blocker for untrusted relay**
+## C2 — Authenticated registration (mutual key attestation) — **CLOSED on the register path (P0-2)**
 
-**Status: accepted-risk (option A) for now.** The E2E channel currently provides confidentiality
-against a *passive* relay only. The live authenticated registration is **unauthenticated in both
-directions**, so an *active* relay can MITM every conversation and approval. This is acceptable
-**only while the relay is operated by a trusted party** (own `nats-server` / own Synadia account).
-**This item MUST be closed before any deployment on a third-party-operated relay** (e.g. Synadia
-NGS external mode where Synadia operates the relay). Until then, docs claiming "untrusted relay"
-E2E have been softened (README.md, docs/ONBOARDING_GUIDE.md, packages/plugin/README.md,
-packages/client/README.md).
+**Status: closed on the sole admission path (as of P0-2).** The authenticated register hop
+(PoP + JWT `cnf`-attested device key → register-reply-delivered wrapped conversation key K) is now
+the ONLY admission path — auto-admission, the unauthenticated `.handshake` key-exchange, dev-open,
+and static-creds serving are all deleted. K is never negotiated on the wire; it travels only inside
+the authenticated register reply, wrapped to the SaaS-attested device `cnf` key — so an active relay
+can carry the admission frames but cannot substitute keys or MITM a conversation/approval (tampering
+fails Poly1305, and the client fails closed with a terminal error). This matches
+[`STATUS.md`](STATUS.md) and the "E2E security model" section of
+[`packages/plugin/README.md`](../packages/plugin/README.md).
 
-**Root cause (verified 2026-07-02).** The verification machinery is ~70% built but not wired:
-- `parseAndVerifyHandshake` / `verifyDeviceKey` (plugin) and `verifyAgentKey` /
-  `parseAndStorePinnedKeys` / `getPinnedKeys` (client) have **zero non-test callers**.
-- The live agent registration (`packages/plugin/src/nats-channel.ts` `legacy exchange handler`) feeds the wire
-  key straight into `deriveConversationKey` with no verification.
-- The live wire frame is `{type:"legacy exchange frame", pubKey}` (`e2e-session.ts`) — no `peerId`, no
-  envelope — while the verifier expects a `registration_hello` message with `devicePublicKey` +
-  `peerId`. **Wire format must be reconciled**, not just "call the function".
-- `jwt.ts` still admits bootstrap JWTs with **no `cnf` at all** (backward-compat) → often no pin to
-  check.
-- **Net-new work:** the SaaS receives the agent's X25519 key at enrollment
-  (`device-flow-enrollment.ts:264`) but **never attests it back to the browser** — the browser has
-  no trusted source for the agent key, so `verifyAgentKey` has nothing to check against.
+**Residual (accepted).** You must still trust the relay operator for **availability and metadata**
+(subject/timing observability) — NOT for confidentiality or integrity. Running on a third-party
+relay (e.g. Synadia NGS) is therefore safe for message *content*; a hostile relay can still drop or
+delay traffic and observe who-talks-to-whom.
 
-**Scope of the fix (mutual attestation — option C):**
-- [ ] browser→agent: make `cnf.jwk` mandatory in `jwt.ts` (drop the no-cnf backward-compat path, or
-  gate it behind an explicit insecure flag); reconcile the `legacy exchange frame` frame with the
-  `registration_hello` shape (add `peerId` or switch the live frame); call `parseAndVerifyHandshake`
-  in `legacy exchange handler` **before** `deriveConversationKey`.
-- [ ] agent→browser: SaaS signs/attests the enrollment-captured `agentPublicKey` to the browser
-  (embed in the bootstrap JWT the browser already verifies, or a signed sidecar); browser calls
-  `parseAndStorePinnedKeys` then `verifyAgentKey` before deriving the key.
-- [ ] wire eviction for the pinned-key stores on disconnect (ties into the plugin unbounded-map
-  cleanup).
-- [ ] add an integration test that a substituted key on either leg aborts with `HandshakeMitmError`.
-
-**Do NOT ship the browser→agent leg alone as an end state** — asymmetric authentication leaves the
-agent-impersonation direction open while implying MITM is handled (false sense of security). It is
-acceptable only as an intermediate commit toward the full mutual fix.
+**Deferred (not blockers):** conversation-key rotation (a fixed K is used today); SaaS key
+compromise / revocation (handled via re-enrollment); real-time allowlist authz (a core-delegated
+stub).
 
 ## S1 — accountId-aware outbound facade (proactive/approval outbound is primary-account-only) — **cross-account disclosure risk**
 
@@ -143,7 +123,7 @@ appeared only in two unit tests — so the guard became a pure ALLOWLIST of that
 reginbox, non-empty token) instead of the planned "confine in-namespace, pass through the rest".
 
 - [x] `handleRegister` allowlist guard (own reginbox + non-empty token; everything else dropped
-  with a warn — other peers' subtrees, own `.in`/`registration subject`/`.register` self-bounce, `_INBOX.*`,
+  with a warn — other peers' subtrees, own `.in`/`.handshake`/`.register` self-bounce, `_INBOX.*`,
   foreign namespaces)
 - [x] tests rewritten to the allowlist semantics (+5 cases: self-bounce, `_INBOX` drop, empty
   token, foreign-peer/prefix-peerId reginbox)

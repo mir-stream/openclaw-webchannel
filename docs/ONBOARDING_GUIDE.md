@@ -222,7 +222,9 @@ in one shot.
 config at all, `WEBCHANNEL_TENANT` / `WEBCHANNEL_SAAS_BASE_URL` synthesize the `"default"`
 account's identity. Once any webchannel config exists, these are **ignored** (config wins)
 with a one-time deprecation warning. (Connection/static env —
-`WEBCHANNEL_NATS_URL`/`_USER_JWT`/`_USER_SEED`/`_CREDS`/`_LEGACY_UNAUTHENTICATED` — keep their runtime meaning.)
+`WEBCHANNEL_NATS_URL`/`_USER_JWT`/`_USER_SEED`/`_CREDS` — keep their runtime meaning; the removed
+unauthenticated dev-open env flag now throws a targeted migration error instead of enabling an open
+connection — see `resolveNatsCredentialSource`.)
 
 Approve the device code exactly as in §5; on success creds are persisted and `channels add`
 exits 0. `gateway run` then consumes them with no re-approval.
@@ -361,7 +363,7 @@ NATS_URL='wss://connect.ngs.global:443' \
 ENABLE_DEMO_UI=1 \
 DEMO_APP_HTML="$PWD/e2e/local/ci-smoke.html" \
 DEMO_CLIENT_ENTRY="$PWD/packages/client/src/browser-demo-entry.ts" \
-DEMO_GW_URL='' \                                            # register-hop TOGGLE, not a dialed URL: '' = admission auto; any non-empty value = register-hop (which rides NATS on the `.register` subject — no gateway is dialed)
+DEMO_GW_URL='' \                                            # vestigial: register-hop is the SOLE admission path (it rides NATS on the `.register` subject — no gateway is ever dialed). This var no longer selects an "auto" mode.
 DEMO_TENANT='default-tenant' \
 DEMO_ACCOUNT_ID='default-agent' \
 node --import tsx packages/saas/reference/enrollment-server.ts
@@ -452,8 +454,9 @@ is the `accountId`, set via `channels add --account <id>`. The **login-flow demo
 configured with `DEMO_ACCOUNT_ID`/`DEMO_TENANT`; `WEBCHANNEL_ACCOUNT_ID` is a **headless
 harness** var read by the `e2e/local/*` drivers.)
 
-**Subjects:** `webchannel.{tenant}.{accountId}.{peerId}.{in,out,registration}`
-(agent subscribes `…*.in`/`…*registration subject`, publishes `…*.out`; browser is the mirror).
+**Subjects:** messaging on `webchannel.{tenant}.{accountId}.{peerId}.{in,out}`; admission is the
+separate request/reply subject `webchannel.{tenant}.{accountId}.{peerId}.register`. (Agent
+subscribes `…*.in` and the `…*.register` admission subject, publishes `…*.out`; browser is the mirror.)
 
 **Credential modes** (`nats.credentials.mode`): `enrolled` (SaaS device flow, default) ·
 `static` (BYO url + user JWT + NKEY seed / `.creds` file, no issuer).

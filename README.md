@@ -17,9 +17,10 @@ The NATS E2E path is the production default (`packages/plugin/package.json` →
 `openclaw.extensions = ["./index-nats.ts"]`) and is **live-proven on real hardware**: a real
 browser on a Mac talked to a real OpenClaw gateway + this plugin (running in a container) over a
 real JWT-auth `nats-server` and got a real LLM reply — ingress-free, end-to-end encrypted, and
-device-flow enrolled. (E2E today = confidentiality against a *passive* relay; active-relay MITM
-protection requires the authenticated handshake tracked as **C2** in
-[`docs/BACKLOG.md`](docs/BACKLOG.md), a prerequisite before running on a third-party relay.)
+device-flow enrolled. (E2E is confidential AND integrity-protected against the relay: the
+authenticated register hop is the sole admission path and the conversation key is delivered wrapped
+to the JWT-attested device key, so review finding **C2** — active-relay MITM — is CLOSED (see
+[`docs/BACKLOG.md`](docs/BACKLOG.md)); the residual is relay trust for availability/metadata only.)
 
 ## Status at a glance
 
@@ -28,7 +29,7 @@ protection requires the authenticated handshake tracked as **C2** in
 | **NATS E2E path end-to-end** (browser ↔ NATS ↔ plugin ↔ `inbound.run` ↔ back) | ✅ **production default, live-proven on real hardware** |
 | E2E crypto (X25519 + HKDF + ChaCha20-Poly1305), envelope, NATS transport | ✅ done, component-tested |
 | Trust chain (`packages/saas`): `setupTrustChain`, device-flow enrollment, NATS user creds | ✅ done, tested on a real nats-server |
-| Browser dialing NATS in the production client (`WebChannelNatsClient`) | ✅ live (NKEY-auth + X25519 handshake, ciphertext-only) |
+| Browser dialing NATS in the production client (`WebChannelNatsClient`) | ✅ live (NKEY-auth + register-delivered conversation key, ciphertext-only) |
 | Packaging / publishing | ✅ **shipped** — plugin `openclaw-webchannel@0.1.0` on ClawHub (`clawhub:mir-stream/openclaw-webchannel`); `@mir-stream/webchannel-{saas,client}@0.1.3` on GitHub Packages via tag-triggered CI (`docs/PUBLISHING.md`) |
 
 Full detail, and reconciliation of the conflicting "AC 100% / complete" signals, is in

@@ -116,7 +116,7 @@ change the map's key.**
 |---|---|---|
 | Map key | `peerId` | **`peerId` (unchanged)** — preserves binding |
 | Map value | derived per-device registration, **overwritten each time** | **agent-owned key, generated ONCE per peerId, stable** |
-| How a device learns the key | negotiates it via `registration subject` X25519 | **receives it wrapped to its own pubkey** |
+| How a device learns the key | negotiates it via `handshakeSubject` X25519 | **receives it wrapped to its own pubkey** |
 | 2nd device | overwrites → kills device 1 | value untouched → just gets its own wrapped copy |
 
 The `if (!peerSessionKeys.has(peerId))` guard already present at `nats-channel.ts:519`
@@ -160,16 +160,16 @@ is exactly the "generate once, never re-derive" hook.
 device's X25519 pubkey into the bootstrap JWT as `cnf.jwk`
 (`bootstrap-claims.ts:127` — `cnf: { jwk: { kty:"OKP", crv:"X25519", x } }`), and the
 register-hop verifies that JWT. So at register time the agent **already has** the
-device pubkey to wrap K to — **no `registration subject` round-trip needed**.
+device pubkey to wrap K to — **no `handshakeSubject` round-trip needed**.
 
 ---
 
 ## 5. Consequence — the registration dies, and with it a whole class of races
 
-Because the device pubkey arrives via bootstrap `cnf` (not via `registration subject`), the
+Because the device pubkey arrives via bootstrap `cnf` (not via `handshakeSubject`), the
 per-device authenticated registration is **no longer a key-negotiation step**. Dropping it
 **removes the ROOT CAUSE** of the registration race we fixed in `1c81f0d`
-(client republish 500ms×5): there is no one-shot legacy exchange frame publish that can be
+(client republish 500ms×5): there is no one-shot key-exchange frame publish that can be
 lost on a real relay, because the key is delivered by the agent, not negotiated by
 the client.
 
@@ -186,11 +186,11 @@ Client today: `keyPair` + `sessionKey` set from the registration
 |---|---|---|
 | W1 | agent `nats-channel.ts` | Generate + **persist** K once per peerId (random 32B); seal live replies **and** stored history with K. Delete per-registration key derivation (the `set()` at :536 becomes "generate-if-absent"). |
 | W2 | agent register route | On device register (peerId + `cnf.jwk` in hand): `wrapConversationKey(K, identity.devicePublicKey)` **in the register handler**, return the `WrappedConversationKey` **in the register HTTP response** (§7 — decided). Never via later pin-store lookup (§7.5 F2). |
-| W3 | client `nats-client.ts` | Take the wrapped key from the register response → `unwrapConversationKey(..., devicePriv)` → use K to seal `.in` and open `.out` + backlog. Remove the `registration subject` negotiation + retry machinery (subject to F5's auto-mode decision). |
+| W3 | client `nats-client.ts` | Take the wrapped key from the register response → `unwrapConversationKey(..., devicePriv)` → use K to seal `.in` and open `.out` + backlog. Remove the `handshakeSubject` negotiation + retry machinery (subject to F5's auto-mode decision). |
 | W4 | agent | Persist K so a gateway restart keeps history decryptable (K must survive process death — history at-rest is sealed with it). |
 | W5 | client entry → crypto client | Plumb the **cnf device private key** from `browser-jwt-entry.ts` into `NatsCryptoClient` (constructor option) — today's per-epoch throwaway keypair (`nats-client.ts:833`) is NOT the cnf key (§7.5 F4). |
 | W6 | client hydration | Make history hydration **idempotent by message id** — under shared K, another device's register-triggered snapshot on the shared `.out` is decryptable by all devices (§7.5 F7). |
-| W7 | plugin `auth.ts` / verifier | Retire or repurpose `registration-verifier.ts` + the peerId-keyed pin store — both belong to the negotiation model B replaces; the verifier was never wired anyway (§7.5 F3 / C2). |
+| W7 | plugin `auth.ts` / verifier | Retire or repurpose `handshake-verifier.ts` + the peerId-keyed pin store — both belong to the negotiation model B replaces; the verifier was never wired anyway (§7.5 F3 / C2). |
 
 Already done and reusable: wrap/unwrap/decryptBacklog (`late-join-decryptor.ts`),
 broadcast fan-out model (`multidevice-broadcast.test.ts` — exactly-once per device,
@@ -228,7 +228,7 @@ to eliminate. No offsetting benefit once ①'s scope fear is disproven.
   collision exists at the pin layer. Consequence: wrap must happen **per register
   request from the JWT in hand**, never by later store lookup. The pin store
   itself needs rework-or-retirement in W-items (see F3).
-- **F3 (major)** — `registration-verifier.ts` (pin check during registration = MITM
+- **F3 (major)** — `handshake-verifier.ts` (pin check during registration = MITM
   prevention) is **UNWIRED** — zero references from `nats-channel.ts` /
   `index-nats.ts`. Today's registration is unauthenticated even on the registered
   path. **This is review finding C2 (relay MITM, accepted-risk).** Phase 6 B
@@ -336,7 +336,7 @@ Suggested order (each step keeps the suite green; W-items from §6):
 5. **W6 — idempotent hydration** (client): dedup rendered messages by `id`
    (history frames already carry `id: string`, `nats-channel.ts:59`); ensure live
    message frames carry/align the same id so live-vs-snapshot overlap dedups.
-6. **W7 — retire on register path**: `registration-verifier.ts` (was never wired) and
+6. **W7 — retire on register path**: `handshake-verifier.ts` (was never wired) and
    the peerId-keyed pin store become auto-mode-only or deleted; keep whatever auto
    still needs.
 7. **Tests/acceptance** — §12. Then fresh-agent review (established workflow).

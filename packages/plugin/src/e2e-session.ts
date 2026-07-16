@@ -23,11 +23,6 @@ import {
 } from "./e2e-envelope.js";
 import type { EnvelopeRouting, EnvelopeType } from "./e2e-envelope.js";
 
-/**
- * HKDF `info` string for the conversation key. MUST match the browser
- * (`e2e-browser-client.ts`) and the live gate agent (`e2e-roundtrip-agent.ts`)
- * — both derive `hkdfSha256(sharedSecret, null, "webchannel-conversation-v1", 32)`.
- */
 /** Stable routing identity shared by every envelope a peer session emits. */
 export type SessionRouting = {
   readonly accountId: string;
@@ -36,10 +31,6 @@ export type SessionRouting = {
   readonly sub: string;
 };
 
-/**
- * Derive the 32-byte ChaCha20-Poly1305 conversation key from an X25519 ECDH
- * exchange + HKDF-SHA256. Symmetric: agent and browser compute the same key.
- */
 /**
  * Encrypt a structured message into a serialized `MessageEnvelope` v1 frame.
  *

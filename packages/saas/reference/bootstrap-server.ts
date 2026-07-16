@@ -240,10 +240,11 @@ async function handleBootstrap(req: any, res: any, trustChain: RealTrustChain): 
     const response: BootstrapResponse = {
       jwt,
       peerId,
-      // F2: deliver the well-known dev identity public key so the browser pins it
-      // — ONLY in dev-open mode (this reference server has no registry/enrollment,
-      // and the dev key is public, so serving it outside dev-open would re-open
-      // the MITM). Omitted otherwise → the browser fail-closes on the register path.
+      // F2: deliver the SaaS-attested agent identity public key so the browser
+      // pins it — gated on the `WEBCHANNEL_AGENT_PUBLIC_KEY` env being set (this
+      // reference server has no registry/enrollment, so the operator supplies the
+      // key explicitly). Omitted when the env is unset → the browser fail-closes
+      // on the register path.
       ...(AGENT_PUBLIC_KEY ? { agentPublicKey: AGENT_PUBLIC_KEY } : {}),
       jwksUrl: JWKS_URL,
       natsUrl: NATS_URL,

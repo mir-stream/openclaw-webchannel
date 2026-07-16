@@ -283,12 +283,11 @@ CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
 [ -f "$CRED_FILE" ] || { echo "[run-all-real] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-all-real] ✓ credentials persisted at $CRED_FILE"
 
-# 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
-#      setup adapter writes the demo-proven block (`admission: "register-hop"`,
-#      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
-#      override that disables the HTTP register hop (no aud→account dispatch
-#      entry ⇒ challenge 401 "No account for token audience"), and this harness
-#      drives the register hop. Restore the pre-add intent.
+# 6b². Tighten dmSecurity AFTER `channels add`. The setup adapter writes the
+#      demo-proven block (`admission: "register-hop"` — the sole admission path —
+#      with `dmSecurity: "open"`) into the account; this step narrows it to
+#      `dmSecurity: "allowlist"` plus an explicit `allowFrom` pin so the harness
+#      exercises the allowlist path. (admission stays register-hop throughout.)
 node -e '
   const fs = require("fs");
   const p = process.argv[1], acct = process.argv[2], peer = process.argv[3];

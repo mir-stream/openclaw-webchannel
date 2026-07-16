@@ -18,9 +18,11 @@
  *                 (these already carry their auth material; no SaaS issuer).
  *
  * This keeps the connection/static-creds env overrides
- * (WEBCHANNEL_NATS_URL/_USER_JWT/_USER_SEED/_CREDS/_LEGACY_UNAUTHENTICATED) meaningful: the
- * resolver still classifies the source from them; only the `enrolled` branch is
- * redirected from "enroll now" to "load persisted".
+ * (WEBCHANNEL_NATS_URL/_USER_JWT/_USER_SEED/_CREDS) meaningful: the resolver
+ * still classifies the source from them; only the `enrolled` branch is
+ * redirected from "enroll now" to "load persisted". (The removed unauthenticated
+ * dev-open env flag is no longer an override — supplying it now throws a targeted
+ * migration error in the resolver.)
  */
 
 import {

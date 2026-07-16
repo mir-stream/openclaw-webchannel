@@ -347,8 +347,8 @@ gap (below).
   snapshot was still dropped: it was sent from the register hop, which completes
   BEFORE the E2E authenticated registration, so `sendHistory` had no per-peer session key and
   fail-closed (correctly — never plaintext). **Fix:** send the initial snapshot from
-  a new `NatsChannel.setHandshakeCompleteHandler` (fires at the end of
-  `legacy exchange handler`, once `peerSessionKeys` is set) instead of the register hop. That
+  a new `NatsChannel.setHandshakeCompleteHandler` (fires at the end of the
+  handshake handler, once `peerSessionKeys` is set) instead of the register hop. That
   handler also runs outside the HTTP request scope, so it composes cleanly with the
   detached read.
 
@@ -395,7 +395,7 @@ this scope).
 ## Honest-demo notes
 
 - **Active-MITM is NOT claimed (C2).** The E2E session key is derived from
-  whatever pubkey arrives on `registration subject`; the client does not yet pin it against
+  whatever pubkey arrives on the `.handshake` subject; the client does not yet pin it against
   the SaaS-attested `agentPublicKey` that `saas-bootstrap.ts:222` already extracts
   (`nats-client.ts:828-834`). So scene ③ proves confidentiality vs a **passive**
   wiretap + integrity vs **blind** tamper (AAD drop) + authentication (PoP) +

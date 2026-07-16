@@ -91,16 +91,19 @@ credentials and skips enrollment.
 
 ## E2E security model (admission + key establishment)
 
-Phase 6 (multi-device) split key establishment by admission mode:
+P0-2 made the authenticated register hop the **sole** admission path; key establishment happens
+there:
 
-- **Register admission (production / SaaS path) — register-delivered conversation key.**
+- **Register admission (the only path) — register-delivered conversation key.**
   The agent OWNS a stable per-peerId key K (`src/conversation-key-store.ts`, persisted at
   `~/.openclaw-webchannel/<account>/conversation-keys.json`, 0600). The register handler (a NATS
   request/reply on the account's `…{peerId}.register` subject) wraps K (`src/late-join-decryptor.ts`
   — X25519 ECDH + HKDF-SHA256 `webchannel-key-wrap-v1` + ChaCha20-Poly1305) to the device key
   attested in **that request's** verified JWT `cnf` claim and returns it in the register reply.
-  There is **no `registration subject` on this path** — the keyStore-mode channel neither subscribes nor
-  answers it — so an active relay cannot substitute keys: K only ever travels **wrapped to a
+  There is **no unauthenticated key-exchange subject on this path** — the register handler DOES
+  subscribe and answer `.register` (that IS the admission path), but K is never negotiated on the
+  wire; it travels only inside the authenticated register reply — so an active relay cannot
+  substitute keys: K only ever travels **wrapped to a
   JWT-attested device key**, and the wrap target comes from the SaaS-signed JWT `cnf`, not from
   anything the transport controls. So even though register now rides NATS (visible to the relay),
   the relay/observer sees only ciphertext + a wrapped key it cannot open, and cannot coax K to be
@@ -115,19 +118,13 @@ Phase 6 (multi-device) split key establishment by admission mode:
     surfaces as `JwtIdentity.devicePublicKey`; the register handler REQUIRES it (401 without) and
     wraps per-request. There is deliberately **no cross-request pinned-key store** — the old
     peerId-keyed pin store collided two devices of one user and was removed (with the never-wired
-    `registration-verifier.ts`) in Phase 6 W7.
+    `handshake-verifier.ts`) in Phase 6 W7.
   - **Session scoping caveat:** a register account serves many users, so openclaw's
     `session.dmScope` MUST be `"per-channel-peer"` (or the per-account variant). The default
     `"main"` collapses every peer into ONE agent session, and the register history snapshot then
     delivers the shared transcript to every user (re-sealed to each requester's own K —
     encryption cannot prevent a scoping leak). The plugin warns loudly at startup when it detects
     this (`crossUserHistoryWarning`).
-- **Authenticated admission (`admission:register-hop`, bring-your-own-NATS) — legacy per-device X25519
-  registration, unchanged.** The registration is unauthenticated (any tenant-creds holder can complete
-  it), so auto mode gives confidentiality against a *passive* relay only; an *active* relay MITM
-  can substitute keys. Acceptable **only while the relay is operated by a trusted party** (your
-  own `nats-server` or your own Synadia account). Migrating auto deployments to register
-  admission is the follow-up that closes this.
 - **No anonymous admission:** the `anonymous` auth strategy throws at plugin load
   (`makeAnonymousVerifier` never returns a verifier) — connections must use `jwt`.
 
@@ -135,84 +132,30 @@ Phase 6 (multi-device) split key establishment by admission mode:
 JWT-attested `cnf` key and never negotiated on the wire; attacker skips bootstrap → no admission
 (register requires a verified JWT + PoP); forged `cnf` → JWT signature verification fails;
 tampered wrapped key → Poly1305 reject, client fails closed (terminal error, no registration
-downgrade). **Auto path:** active relay MITM remains possible (see above). **Out of scope:** SaaS
+downgrade). Review finding **C2** (active-relay MITM) is CLOSED on this path — the residual is only
+relay TRUST for availability/metadata, not confidentiality/integrity. **Out of scope:** SaaS
 key compromise / revocation (deferred to re-enrollment); K rotation (deferred — fixed key first);
 real-time allowlist authz is a core-delegated stub.
 
-## Bring-your-own NATS (e.g. Synadia Cloud / NGS)
+## Bring-your-own NATS (static creds) — REMOVED in P0-2, returns in P0-3
 
-The agent's NATS connection is decoupled from the SaaS issuer along **two orthogonal
-axes**, so you can point the plugin at **any** NATS with just a URL + static user
-credentials — **no SaaS issuer required**.
+Static / bring-your-own-NATS **serving** (and the old dev-open mode) was removed in P0-2: the
+authenticated register hop is now the **sole** admission path (see the E2E security model above).
+Support for static/BYO creds is planned to return in **P0-3**.
 
-- **Axis A — credential source** (`src/nats-credential-source.ts`): how the *agent*
-  authenticates to NATS. One of `open` (dev, no auth), `static` (BYO-NATS — url +
-  user JWT + NKEY seed, or a `.creds` file, given directly), or `enrolled` (the SaaS
-  device-flow, still the default). The plugin is *given* static creds; it never mints
-  them (no import from `packages/saas`).
-- **Axis B — peer admission** (`src/nats-admission.ts`): which browser peers the agent
-  serves. `register-hop` (SaaS bootstrap JWT + PoP) or `auto` (subscribe the
-  tenant/agent wildcard; serve any peer that completes the authenticated registration **and**
-  passes the `dmSecurity` allowlist). Static creds default to `auto`. Security here
-  rests on **NATS subject permissions + the allowlist + E2E encryption** — not on an
-  issuer. E2E encryption stays fail-closed regardless of source.
+Until then, any removed config **fails closed with a targeted migration error** instead of silently
+degrading:
 
-### Agent (static creds, no issuer)
+- `nats.credentials.mode:"static"` / `"open"`, the removed dev-open NATS flag,
+  `nats.admission:"auto"`, and `auth.strategy:"anonymous"` are rejected at account resolution
+  (`assertNoRemovedConfig` in `src/account-config.ts`), with a message pointing at
+  `openclaw channels add --channel webchannel`.
+- the matching environment overrides are rejected the same way in `src/nats-credential-source.ts`.
 
-```jsonc
-// channels.webchannel
-{
-  // NO `auth` block needed: static creds resolve admission to "auto", and JWT
-  // verification (`assertJwtAuthConfig` + the register-path `verifyIdentity`)
-  // only runs for the "register-hop" admission mode.
-  // Browser admission here = NATS subject permissions + authenticated registration
-  // (+ an optional `dmSecurity` allowlist). The `jwt` register-hop strategy is
-  // the only alternative; it is INERT on this static/auto NATS path.
-  "nats": {
-    "url": "wss://connect.ngs.global",
-    "credentials": {
-      "mode": "static",
-      // Prefer env/file over inlining secrets:
-      "userJwt":  { "env": "WEBCHANNEL_NATS_USER_JWT" },
-      "userSeed": { "env": "WEBCHANNEL_NATS_USER_SEED" }
-      // …or point at a standard NATS .creds file instead:
-      // "credsFile": "/etc/openclaw/synadia.creds"
-    }
-    // admission defaults to "auto" for static creds; override with
-    // "admission": "register-hop" if you run the SaaS JWT bootstrap.
-  }
-}
-```
-
-Env overrides (take precedence over config) — secrets need not live in committed config:
-
-| Env var | Meaning |
-|---------|---------|
-| `WEBCHANNEL_NATS_URL` | NATS WebSocket URL |
-| `WEBCHANNEL_NATS_USER_JWT` | static user JWT |
-| `WEBCHANNEL_NATS_USER_SEED` | static user NKEY seed (`SU…`) |
-| `WEBCHANNEL_NATS_CREDS` | path to a NATS `.creds` file (JWT + seed) |
-| `WEBCHANNEL_SAAS_BASE_URL` | enrolled-mode SaaS base URL |
-
-### Browser (natsCredentials, no registration)
-
-```ts
-new WebChannelNatsClient({
-  url: "wss://connect.ngs.global",
-  accountId, tenant, peerId,
-  // No bootstrap `jwt` and no `registration` — the bootstrap JWT is now optional
-  // and only needed for the SaaS register-hop path.
-  natsCredentials: {
-    userJwt,       // browser-scoped NATS user JWT
-    userSeedRaw,   // base64url of the raw 32-byte Ed25519 seed
-  },
-});
-```
-
-> **Synadia permissions:** the static user must have **pub + sub** permission on the
-> `webchannel.<tenant>.<accountId>.*` subjects (the agent subscribes to `…*.in` /
-> `…*registration subject` and publishes `…*.out`; the browser is the mirror). Without the
-> wildcard sub permission the agent's `auto` admission cannot receive peers.
+Enrolled (SaaS device-flow) creds remain the supported path; the connection env overrides
+(`WEBCHANNEL_NATS_URL` / `_USER_JWT` / `_USER_SEED` / `_CREDS`) still classify the source. Do **not**
+copy an old `credentials.mode:"static"` block (or a `natsCredentials`-only browser client) as a
+working recipe — it now throws at startup / requires `registration`.
 
 ## NATS subject namespace
 

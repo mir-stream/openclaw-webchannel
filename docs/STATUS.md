@@ -32,7 +32,7 @@ this file, **this file is correct.**
 - **Multi-device is production behavior (Phase 6).** The agent owns one conversation key per
   peer (`conversation-key-store.ts`, 0600 on disk) and **wrap-delivers it in the register
   response to the JWT-attested device key** — the register path has NO unauthenticated
-  registration anymore (the old `registration-verifier` is deleted). Two devices on one user each
+  registration anymore (the old `handshake-verifier` is deleted). Two devices on one user each
   decrypt live traffic + snapshots; W6 id/text/positional dedup handles echo adoption.
   Register-hop (bootstrap JWT + PoP) is now the SOLE admission path — P0-2 deleted the
   unauthenticated X25519 handshake and the dev/open-NATS mode entirely.
@@ -94,7 +94,7 @@ long-lived branches:
 | Gap | Detail |
 |---|---|
 | **S1 outbound facade** (proactive/approval outbound is primary-account-only) | Cross-account disclosure risk on the agent-initiated leg; the approvals half is done, the outbound facade is the open half. [`BACKLOG.md`](BACKLOG.md) §S1. |
-| **C2 (unauthenticated registration) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `registration-verifier` deleted). Register-hop is now the sole admission path; the residual is the accepted-risk/untrusted-relay caveat there (the relay carries the admission frames but cannot forge admission). [`BACKLOG.md`](BACKLOG.md) §C2. |
+| **C2 (unauthenticated registration) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `handshake-verifier` deleted). Register-hop is now the sole admission path; the residual is the accepted-risk/untrusted-relay caveat there (the relay carries the admission frames but cannot forge admission). [`BACKLOG.md`](BACKLOG.md) §C2. |
 | Direct gateway transport removal | ✅ complete; browser traffic uses the NATS relay only. |
 | Demo/reference server hardening (review SEC1/2/5) | The reference/demo SaaS servers are deliberately demo-grade (in-memory stores, printed admin token); production-hardening rewrite is a pending decision. |
 | Pre-issuer enrollments | Agents enrolled before 0.1.3 never receive the delivered issuer — they must delete `credentials.json` and re-enroll (documented in `GETTING_STARTED.md` troubleshooting). |
