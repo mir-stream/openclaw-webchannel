@@ -111,7 +111,7 @@ live in the open widget. Everything else below is a sharpening of this one story
 
 - **No active-MITM claim (C2):** scene ③ proves confidentiality vs a *passive*
   wiretap + integrity + authentication + availability, not an active relay that
-  substitutes its own handshake key.
+  substitutes its own registration key.
 - **The admission exchange is visible on the relay — on purpose.** Now that register
   rides NATS, the wiretap sees the `.register` / `.reginbox` frames (tagged ✦admission
   in the pane). Two honest facts: (1) **message bodies are still ciphertext** — that
@@ -125,7 +125,7 @@ live in the open widget. Everything else below is a sharpening of this one story
 - **Echo LLM** lets the demo boot creds-free; the UI shows an "Echo mode" badge.
   Approvals + slash commands need a real model.
 - **Reload history hydration** works: reload a chat and the prior turns come back.
-  The snapshot is sent from the E2E handshake-complete handler (the earliest point
+  The snapshot is sent from the E2E register-complete handler (the earliest point
   the per-peer session key exists) and the core session read runs in a detached
   async-context so `sessions.get` authorizes against a synthetic operator client
   instead of the request-scoped plugin client. No openclaw core change. See

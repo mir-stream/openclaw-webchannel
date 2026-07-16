@@ -59,8 +59,6 @@ export type AuthLogger = {
  */
 export type SecretRef = string | { env: string };
 
-export type AnonymousAuthConfig = { strategy: "anonymous" };
-
 /**
  * JWT (RS256 / JWKS) auth config. The gateway validates compact JWTs against
  * an asymmetric public key resolved from a JWKS source. See AUTH.md §10 for
@@ -103,7 +101,7 @@ export type JwtAuthConfig = {
   requirePoP?: boolean;
 };
 
-export type AuthConfig = AnonymousAuthConfig | JwtAuthConfig;
+export type AuthConfig = JwtAuthConfig;
 
 /**
  * Build a `JWT auth configuration` for the `jwt` (RS256 / JWKS) strategy.

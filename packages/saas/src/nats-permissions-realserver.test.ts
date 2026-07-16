@@ -326,6 +326,35 @@ describe.skipIf(!NATS_SERVER_BIN)(
       expect(trustChain!.natsConfig.accountJwt).toBeTruthy();
     });
 
+    it("a connection WITHOUT NATS credentials is refused by the JWT-auth server", async () => {
+      // authN invariant (previously covered by the deleted e2e/enrolled-jwt-roundtrip.test.ts):
+      // the operator + MEMORY-resolver server grants NO anonymous access, so a CONNECT carrying
+      // no JWT and no signature must be rejected — never flipped to connected.
+      const ws = new WebSocket(WS_URL);
+      const outcome = await new Promise<"refused" | "connected">((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("no server response")), 4000);
+        const settle = (v: "refused" | "connected") => {
+          clearTimeout(timeout);
+          resolve(v);
+        };
+        ws.on("message", (data: Buffer) => {
+          const text = data.toString();
+          if (text.startsWith("INFO ")) {
+            // Reply with an empty CONNECT — no jwt, no sig (an unauthenticated client).
+            ws.send(`CONNECT ${JSON.stringify({ verbose: false, pedantic: false })}\r\nPING\r\n`);
+            return;
+          }
+          if (text.includes("-ERR")) settle("refused");
+          else if (text.includes("PONG")) settle("connected");
+        });
+        // A hard socket close before any PONG is also a refusal (server drops bad auth).
+        ws.on("close", () => settle("refused"));
+        ws.on("error", () => settle("refused"));
+      });
+      ws.close();
+      expect(outcome).toBe("refused");
+    });
+
     it("tenant A client can subscribe to its own subjects", async () => {
       const creds = await generateTestCredentials(TENANT_A);
       const { ws, ready } = await connectWithJwt(creds.userJwt, creds.userSeed, "tenant-a-client");

@@ -883,9 +883,9 @@ export class DeviceFlowEnrollment {
     //     Synadia's nats-server.
     //
     // Tenant scope `webchannel.{tenant}.>` covers the live per-peer channel
-    // subjects `webchannel.{tenant}.{accountId}.{peerId}.{in,out,handshake}` (see
-    // packages/plugin/src/nats-channel.ts) while preserving cross-tenant
-    // isolation. Matches e2e/enrolled-jwt-roundtrip.test.ts.
+    // subjects `webchannel.{tenant}.{accountId}.{peerId}.{in,out}` plus the
+    // `.register`/`.reginbox` admission subjects (see
+    // packages/plugin/src/nats-channel.ts) while preserving cross-tenant isolation.
     const minted = await mintNatsUserCreds({
       accountSeed: this.options.saasTrustChain.natsAccountSeed,
       tenant: enrollment.tenant,

@@ -1,12 +1,30 @@
+import {
+  createCipheriv,
+  createPrivateKey,
+  createPublicKey,
+  diffieHellman,
+  generateKeyPairSync,
+  hkdfSync,
+  randomBytes,
+} from "node:crypto";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 import type { InboundMessage, NatsClientOptions } from "./nats-client.js";
-// P1-9 wire-order harness: the subject helpers + the handshake frame let a test
-// establish a REAL conversation key over the legacy handshake path (FakeWS) and
-// assert publish ordering on the encrypted `.in` subject.
-import { inboundSubject, handshakeSubject } from "./nats-client.js";
-import { generateX25519KeyPair, keyExchangeFrame } from "./e2e-crypto-browser.js";
+// P1-9 wire-order harness: P0-2 deleted the unauthenticated `.handshake` path, so
+// the session-gate / wire-order tests below establish the conversation key the
+// way production does — a PoP register round-trip whose reply carries K wrapped
+// to the device X25519 key — and assert publish ordering on the encrypted `.in`
+// subject. The register-fake + agent-style wrap mirror
+// nats-client-wrapped-key.test.ts (node:crypto, independent of the browser impl).
+import { inboundSubject, registerSubject } from "./nats-client.js";
+import { generateDevicePopKeyPair } from "./pop-register.js";
+import type { WrappedConversationKey } from "./e2e-crypto-browser.js";
+
+const registration = {
+  devicePrivateKey: {} as CryptoKey,
+  deviceX25519PrivateKey: {} as CryptoKey,
+};
 
 /**
  * CL1 regression: the public wrapper must FORWARD the NATS-layer NKEY
@@ -30,6 +48,7 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
       accountId: "acct-1",
       tenant: "tenant-1",
       peerId: "peer-1",
+      registration,
       natsCredentials,
     });
 
@@ -49,6 +68,7 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
       accountId: "acct-1",
       tenant: "tenant-1",
       peerId: "peer-1",
+      registration,
       reconnectBaseMs: 250,
       reconnectCapMs: 8_000,
     });
@@ -65,6 +85,7 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
       accountId: "acct-1",
       tenant: "tenant-1",
       peerId: "peer-1",
+      registration,
       heartbeatIntervalMs: 0, // e.g. an embedder disabling the heartbeat
     });
     const built = wrapper["natsOptions"] as NatsClientOptions;
@@ -78,6 +99,7 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
       accountId: "acct-1",
       tenant: "tenant-1",
       peerId: "peer-1",
+      registration,
     });
 
     const built = wrapper["natsOptions"] as NatsClientOptions;
@@ -142,6 +164,7 @@ describe("WebChannelNATSClient — CL2 terminal error status", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
       heartbeatIntervalMs: 0,
     });
     wrapper.connect();
@@ -176,6 +199,7 @@ describe("WebChannelNATSClient — P1-7 error cause on state", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   /** Drive the inner client's error listeners (what a real terminal failure does). */
@@ -257,6 +281,7 @@ describe("WebChannelNATSClient — W6 idempotent history hydration", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
 
@@ -338,6 +363,7 @@ describe("WebChannelNATSClient — W6 agent-bubble id adoption", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   type AnyFrame = { type: string; [k: string]: unknown };
@@ -463,6 +489,7 @@ describe("WebChannelNATSClient — #16 ordered history insertion", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: AnyFrame): void {
@@ -613,6 +640,7 @@ describe("WebChannelNATSClient — approval_snapshot reconciliation (#15)", () =
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
@@ -853,6 +881,7 @@ describe("WebChannelNATSClient — P0-3 command discovery", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
@@ -906,6 +935,7 @@ describe("WebChannelNATSClient — P0-7b delivery acks", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
   function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
@@ -962,6 +992,7 @@ describe("WebChannelNATSClient — protocol version on state", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
 
@@ -1007,6 +1038,7 @@ describe("WebChannelNATSClient — reasoning lane", () => {
       accountId: "a",
       tenant: "t",
       peerId: "p",
+      registration,
     });
   }
 
@@ -1037,6 +1069,191 @@ describe("WebChannelNATSClient — reasoning lane", () => {
 });
 
 // ---------------------------------------------------------------------------
+// P1-9 wire-order harness — register-delivered conversation key over a fake NATS
+// socket. P0-2 removed the legacy `.handshake` negotiation, so the two
+// session-gate / wire-order tests establish the session key exactly as
+// production does: a PoP register round-trip whose reply carries K wrapped to the
+// device X25519 key. The wrap is produced the AGENT's way (node:crypto, mirroring
+// packages/plugin/src/late-join-decryptor.ts and nats-client-wrapped-key.test.ts)
+// so the browser unwrap is exercised for real, not stubbed.
+// ---------------------------------------------------------------------------
+
+async function makeDeviceX25519(): Promise<{ privateKey: CryptoKey; publicKeyBytes: Uint8Array }> {
+  const pair = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
+    "deriveBits",
+  ])) as CryptoKeyPair;
+  return {
+    privateKey: pair.privateKey,
+    publicKeyBytes: new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey)),
+  };
+}
+
+/** DER SPKI from a raw 32-byte X25519 public key (RFC 8410 prefix). */
+function x25519RawToSpki(raw: Uint8Array): Buffer {
+  return Buffer.concat([Buffer.from("302a300506032b656e032100", "hex"), Buffer.from(raw)]);
+}
+
+/** A node:crypto X25519 identity key pair standing in for the SaaS-attested agent key. */
+function makeAgentIdentity(): { privatePem: string; publicRaw: Uint8Array; publicB64url: string } {
+  const kp = generateKeyPairSync("x25519");
+  const publicRaw = new Uint8Array(
+    (kp.publicKey.export({ type: "spki", format: "der" }) as Buffer).subarray(-32),
+  );
+  return {
+    privatePem: kp.privateKey.export({ type: "pkcs8", format: "pem" }) as string,
+    publicRaw,
+    publicB64url: Buffer.from(publicRaw).toString("base64url"),
+  };
+}
+
+/**
+ * Wrap K the AGENT's way (F2 static-static): ECDH(agentIdentity.private,
+ * device.public) → HKDF "webchannel-key-wrap-v1" → chacha20-poly1305 sealing K
+ * with AAD = UTF-8(peerId). Mirrors packages/plugin/src/late-join-decryptor.ts,
+ * independent of the browser unwrap under test.
+ */
+function wrapLikeAgent(
+  conversationKey: Uint8Array,
+  devicePublicKeyRaw: Uint8Array,
+  agentIdentity: { privatePem: string; publicRaw: Uint8Array },
+  peerId: string,
+): WrappedConversationKey {
+  const devicePub = createPublicKey({
+    key: x25519RawToSpki(devicePublicKeyRaw),
+    type: "spki",
+    format: "der",
+  });
+  const shared = diffieHellman({
+    privateKey: createPrivateKey(agentIdentity.privatePem),
+    publicKey: devicePub,
+  });
+  const wrapKey = Buffer.from(
+    hkdfSync("sha256", shared, Buffer.alloc(32), "webchannel-key-wrap-v1", 32),
+  );
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv("chacha20-poly1305", wrapKey, nonce, { authTagLength: 16 });
+  cipher.setAAD(Buffer.from(peerId, "utf8"), { plaintextLength: conversationKey.length });
+  const ciphertext = Buffer.concat([cipher.update(Buffer.from(conversationKey)), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  const b64 = (b: Buffer | Uint8Array) => Buffer.from(b).toString("base64url");
+  return {
+    ephemeralPublicKey: b64(agentIdentity.publicRaw),
+    nonce: b64(nonce),
+    ciphertext: b64(ciphertext),
+    tag: b64(tag),
+  };
+}
+
+type RegHandler = (
+  subject: string,
+  payload: string,
+  server: FakeRegisterWS,
+  replyTo?: string,
+) => void | Promise<void>;
+
+/**
+ * A fake NATS socket that answers the PoP register round-trip (challenge →
+ * register) over request/reply, and records every raw frame the client wrote in
+ * `sent` for wire-order assertions. Mirrors the `FakeNatsWS` in
+ * nats-client-wrapped-key.test.ts (PONG on PING flips the client to connected).
+ */
+class FakeRegisterWS {
+  static instances: FakeRegisterWS[] = [];
+  static readonly OPEN = 1;
+  static readonly CLOSED = 3;
+  url: string;
+  binaryType = "blob";
+  readyState = 0;
+  onopen: (() => void) | null = null;
+  onmessage: ((e: { data: string }) => void) | null = null;
+  onerror: ((e: unknown) => void) | null = null;
+  onclose: (() => void) | null = null;
+  /** P1-9: every raw frame the client wrote, for wire-order assertions. */
+  sent: string[] = [];
+  private readonly subs = new Map<string, number>();
+  handler: RegHandler = () => {};
+  constructor(url: string) {
+    this.url = url;
+    FakeRegisterWS.instances.push(this);
+    queueMicrotask(() => {
+      this.readyState = FakeRegisterWS.OPEN;
+      this.onopen?.();
+    });
+  }
+  send(data: string): void {
+    this.sent.push(data);
+    if (data.startsWith("CONNECT") || data.startsWith("PONG")) return;
+    if (data.startsWith("PING")) {
+      this.serverEmit("PONG\r\n");
+      return;
+    }
+    if (data.startsWith("SUB ")) {
+      const [, subject, sid] = data.trim().split(" ");
+      this.subs.set(subject, Number(sid));
+      return;
+    }
+    if (data.startsWith("UNSUB ")) {
+      const sid = Number(data.trim().split(" ")[1]);
+      for (const [subject, id] of this.subs) if (id === sid) this.subs.delete(subject);
+      return;
+    }
+    if (data.startsWith("PUB ")) {
+      const idx = data.indexOf("\r\n");
+      const header = data.slice(0, idx).split(" "); // PUB <subject> [reply-to] <len>
+      const subject = header[1];
+      const replyTo = header.length === 4 ? header[2] : undefined;
+      const payload = data.slice(idx + 2).replace(/\r\n$/, "");
+      void this.handler(subject, payload, this, replyTo);
+      return;
+    }
+  }
+  deliverToClient(subject: string, payload: string): void {
+    const sid = this.subs.get(subject);
+    if (sid === undefined) return;
+    const len = new TextEncoder().encode(payload).length;
+    this.serverEmit(`MSG ${subject} ${sid} ${len}\r\n${payload}\r\n`);
+  }
+  close(): void {
+    this.readyState = FakeRegisterWS.CLOSED;
+    this.onclose?.();
+  }
+  serverEmit(frame: string): void {
+    this.onmessage?.({ data: frame });
+  }
+}
+
+/**
+ * Register-agent handler over the reply-to inbox: challenge → nonce, register →
+ * `{peerId, registered, wrappedConversationKey}`. `gate`, when supplied, holds
+ * the register REPLY (the wrapped key) so a test can observe the
+ * connected-but-keyless window before the key lands.
+ */
+function makeRegisterHandler(
+  tenant: string,
+  accountId: string,
+  peerId: string,
+  wrapped: () => WrappedConversationKey,
+  gate?: Promise<void>,
+): RegHandler {
+  const reg = registerSubject(tenant, accountId, peerId);
+  return async (subject, payload, server, replyTo) => {
+    if (subject !== reg || !replyTo) return;
+    const body = JSON.parse(payload) as { op?: string };
+    if (body.op === "challenge") {
+      server.deliverToClient(replyTo, JSON.stringify({ nonce: "nonce-abc" }));
+      return;
+    }
+    if (body.op === "register") {
+      if (gate) await gate;
+      server.deliverToClient(
+        replyTo,
+        JSON.stringify({ peerId, registered: true, wrappedConversationKey: wrapped() }),
+      );
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
 // P1-9 — pending-message retraction ("unsend"). A send while a turn is in flight
 // is HELD client-side as a pending bubble and published only when the turn
 // settles; the abort vocabulary bypasses the hold; explicit /stop retracts held
@@ -1048,10 +1265,41 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   type Wrapper = WebChannelNATSClient;
 
   const IN = inboundSubject("t", "a", "p");
-  const HS = handshakeSubject("t", "a", "p");
   const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 
-  function makeWrapper(): Wrapper {
+  // Reducer-level tests never open a socket, so a truthy-keyed registration is
+  // all the constructor needs (P0-2 makes registration mandatory). The two
+  // wire-order tests below pass a REAL one built by `realRegistration()`.
+  const fakeRegistration = {
+    devicePrivateKey: {} as CryptoKey,
+    deviceX25519PrivateKey: {} as CryptoKey,
+  };
+
+  /** A real device PoP + X25519 key set, a pinned agent identity, and a K to wrap. */
+  async function realRegistration(): Promise<{
+    registration: NonNullable<NatsClientOptions["registration"]>;
+    deviceKP: Awaited<ReturnType<typeof makeDeviceX25519>>;
+    agentId: ReturnType<typeof makeAgentIdentity>;
+    K: Uint8Array;
+  }> {
+    const pop = await generateDevicePopKeyPair();
+    const deviceKP = await makeDeviceX25519();
+    const agentId = makeAgentIdentity();
+    return {
+      registration: {
+        devicePrivateKey: pop.privateKey,
+        deviceX25519PrivateKey: deviceKP.privateKey,
+        pinnedAgentPublicKey: agentId.publicB64url,
+      },
+      deviceKP,
+      agentId,
+      K: new Uint8Array(randomBytes(32)),
+    };
+  }
+
+  function makeWrapper(
+    registration: NonNullable<NatsClientOptions["registration"]> = fakeRegistration,
+  ): Wrapper {
     return new WebChannelNATSClient({
       natsUrl: "ws://127.0.0.1:4222",
       bootstrapJwt: "eyJ-bootstrap",
@@ -1059,6 +1307,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       tenant: "t",
       peerId: "p",
       heartbeatIntervalMs: 0,
+      registration,
     });
   }
   const inner = (w: Wrapper) => (w as unknown as { client: { sendUserMessage: (t: string) => string; notifySessionListeners: () => void } }).client;
@@ -1091,10 +1340,9 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   }
   const fireSession = (w: Wrapper) => inner(w).notifySessionListeners();
 
-  // Real socket + real conversation key over the legacy handshake path.
-  const lastWs = () => FakeWS.instances[FakeWS.instances.length - 1];
-  const keyState = (w: Wrapper) =>
-    inner(w) as unknown as { keyPair: unknown; sessionKey: unknown };
+  // Real socket + real conversation key over the register-delivered-K path.
+  const lastWs = () => FakeRegisterWS.instances[FakeRegisterWS.instances.length - 1];
+  const keyState = (w: Wrapper) => inner(w) as unknown as { sessionKey: unknown };
   async function waitFor(pred: () => boolean, n = 100): Promise<void> {
     for (let i = 0; i < n; i++) {
       if (pred()) return;
@@ -1102,26 +1350,22 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     }
     throw new Error("waitFor timed out");
   }
-  function serverMsg(ws: FakeWS, subject: string, payload: string): void {
-    const n = new TextEncoder().encode(payload).length;
-    ws.serverEmit(`MSG ${subject} 1 ${n}\r\n${payload}\r\n`);
-  }
+  /**
+   * Wait for the (already-wired) register round-trip to deliver + unwrap K, then
+   * let the onSession-driven release settle. The caller sets `lastWs().handler`
+   * after connect (and, for the delayed-key test, gates the register reply).
+   */
   async function establishKey(w: Wrapper): Promise<void> {
-    // Wait for onConnected's legacy-handshake keygen (keyPair set, key not yet).
-    await waitFor(() => Boolean(keyState(w).keyPair) && !keyState(w).sessionKey);
-    const agent = await generateX25519KeyPair();
-    serverMsg(lastWs(), HS, keyExchangeFrame(agent.publicKeyB64url));
-    // handleRaw async derive → sessionKey → drain → flush → notify(session).
     await waitFor(() => Boolean(keyState(w).sessionKey));
-    await tick(); // let the session-listener-driven release settle
+    await tick(); // drain → flush → notify(session) → release
   }
-  const inboundPubs = (ws: FakeWS) => ws.sent.filter((s) => s.startsWith(`PUB ${IN} `));
+  const inboundPubs = (ws: FakeRegisterWS) => ws.sent.filter((s) => s.startsWith(`PUB ${IN} `));
 
   let originalWebSocket: unknown;
   beforeEach(() => {
     originalWebSocket = (globalThis as { WebSocket?: unknown }).WebSocket;
-    (globalThis as { WebSocket: unknown }).WebSocket = FakeWS;
-    FakeWS.instances = [];
+    (globalThis as { WebSocket: unknown }).WebSocket = FakeRegisterWS;
+    FakeRegisterWS.instances = [];
   });
   afterEach(() => {
     (globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket;
@@ -1290,22 +1534,33 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   // 10a. session gate: settle-while-disconnected → no release; onState(true) alone → no release;
   //      onSession → releases (delayed-key over the real socket makes the middle assertion real).
   it("10a: release gates on session establishment, not the raw connect flip (delayed key)", async () => {
-    const w = makeWrapper();
+    const { registration, deviceKP, agentId, K } = await realRegistration();
+    const w = makeWrapper(registration);
     const spy = vi.spyOn(inner(w), "sendUserMessage");
     deliver(w, { type: "typing" });
     w.send("M"); // held
     deliver(w, { type: "turn_settled", turnId: "T" }); // settle while DISCONNECTED
     expect(spy).not.toHaveBeenCalled(); // no release (not connected/established)
 
-    // Connect: onState(true) fires, but the key is DELAYED — sessionEstablished false.
+    // Connect, but GATE the register REPLY so the conversation key is DELAYED:
+    // onState(true) fires (connected) while sessionEstablished stays false.
+    let releaseRegister = () => {};
+    const gate = new Promise<void>((r) => { releaseRegister = r; });
     w.connect();
+    lastWs().handler = makeRegisterHandler(
+      "t", "a", "p",
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "p"),
+      gate,
+    );
     await waitFor(() => w.getState().connected);
-    await waitFor(() => Boolean(keyState(w).keyPair)); // handshake published, no key yet
+    await tick(); // let the (gated) register round-trip reach its held reply
     expect(w.getState().connected).toBe(true);
-    expect(spy).not.toHaveBeenCalled(); // connected but keyless → still held
+    expect(keyState(w).sessionKey).toBeFalsy(); // connected but keyless → still held
+    expect(spy).not.toHaveBeenCalled();
     expect(heldTexts(w)).toEqual(["M"]);
 
     // Key arrives → onSession fires (after flushQueue) → release.
+    releaseRegister();
     await establishKey(w);
     expect(spy).toHaveBeenCalledWith("M");
     w.close();
@@ -1314,8 +1569,13 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   // 10b. ledger order: an undelivered P0-7b ledger entry M1 replays BEFORE a released hold M2
   //      (drain→flush→notify — the onSession release is ordered behind the ledger replay).
   it("10b: on reconnect a ledgered M1 replays on the wire BEFORE a released hold M2", async () => {
-    const w = makeWrapper();
+    const { registration, deviceKP, agentId, K } = await realRegistration();
+    const w = makeWrapper(registration);
     w.connect();
+    lastWs().handler = makeRegisterHandler(
+      "t", "a", "p",
+      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "p"),
+    );
     await establishKey(w); // session 1
 
     // Spy records how many `.in` publishes exist AT THE MOMENT sendUserMessage runs.
@@ -1333,7 +1593,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(inboundPubs(lastWs())).toHaveLength(1); // only M1 on the wire so far
 
     // Session drop that KEEPS the unacked ledger (resetSession keeps it), then
-    // reconnect on the same socket → onConnected regenerates the handshake key.
+    // reconnect on the same socket → onConnected re-runs register + key delivery.
     const ll = lowLevel(w);
     ll.connected = false;
     ll.notifyStateListeners();

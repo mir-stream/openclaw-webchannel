@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hermetic enrolled-NATS-transport E2E (#18 — agent-side). Proves, in ONE running
-# real gateway with devOpen OFF, that the PLUGIN obtains tenant-scoped NATS user
+# real gateway, that the PLUGIN obtains tenant-scoped NATS user
 # credentials via the REAL device-flow enrollment-server (enroll → auto-approve →
 # poll) through the PRODUCTION createEnrolledNatsConnection path, connects
 # (NKEY-authenticated) to a JWT-auth nats-server whose operator/account come from
@@ -276,7 +276,7 @@ CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
 echo "[run-enrolled] ✓ credentials persisted at $CRED_FILE"
 
 # 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
-#      setup adapter writes the demo-proven block (`admission: "auto"`,
+#      setup adapter writes the demo-proven block (`admission: "register-hop"`,
 #      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
 #      override that disables the HTTP register hop (no aud→account dispatch
 #      entry ⇒ challenge 401 "No account for token audience"), and this harness

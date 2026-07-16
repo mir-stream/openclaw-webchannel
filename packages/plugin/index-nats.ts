@@ -47,8 +47,6 @@ import type { AuthConfig, JwtAuthConfig } from "./src/auth.js";
 import { formatAccountReadiness, deriveJwksUrl, deriveIssuer, type JwksReadiness } from "./src/preflight.js";
 import { PopChallengeStore } from "./src/pop-challenge.js";
 import { handleRegisterRequest } from "./src/nats-register.js";
-import { resolveAdmissionMode, admissionServingPlan } from "./src/nats-admission.js";
-import { isDmPostureOpen } from "./src/dm-allowlist.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig, planHistoryFetch } from "./src/history.js";
 import { createCommandCatalogProvider } from "./src/commands-catalog.js";
 import { resolveWebchannelSessionRoute } from "./src/session-route.js";
@@ -67,7 +65,6 @@ import {
   resolveTypingEnabled,
 } from "./src/account-config.js";
 import type { KeyPair } from "./src/e2e-crypto.js";
-import { devOpenAgentIdentityKeyPair } from "./src/dev-identity.js";
 
 // ---------------------------------------------------------------------------
 // Global state — multi-account multiplex (가-1 Cycle 2)
@@ -93,9 +90,9 @@ type AccountRuntime = {
   transport: NatsTransport;
   enrolled?: EnrolledNatsConnection;
   /**
-   * The `channels.webchannel.auth` verifier — built ONLY for a `register-hop`
-   * account. An `auto` account admits peers via the NATS wildcard + X25519
-   * handshake and has no verifier, so this is optional. (Register verifies via
+   * The `channels.webchannel.auth` `JWT auth configuration`. Every account is
+   * register-hop, so this is always required; it is `undefined` only transiently
+   * before the verifier is built. (Register verifies via
    * `verifyJwtAndExtractIdentity` against `auth`, not this field; it is retained
    * to fail loudly on a register-hop account's verifier misconfig.)
    */
@@ -112,7 +109,7 @@ type AccountRuntime = {
  * already falls back to per-account config / acquisition env when absent.
  */
 type WebchannelChannelConfig = {
-  nats?: { url?: string; devOpen?: boolean };
+  nats?: { url?: string };
   saas?: { baseUrl?: string };
 };
 
@@ -399,7 +396,6 @@ export default defineChannelPluginEntry({
       // ---- Step 1 (per account): resolve credential source + CONSUME -------
       let transport: NatsTransport;
       let enrolled: EnrolledNatsConnection | undefined;
-      let credentialMode: NatsCredentialSource["mode"];
       // F2: the agent's SaaS-attested identity key from the enrolled creds (set
       // only on the enrolled path). The register-hop channel wraps K under it.
       let identityKey: KeyPair | undefined;
@@ -411,7 +407,6 @@ export default defineChannelPluginEntry({
           tenant,
           accountId,
         });
-        credentialMode = source.mode;
         const consumed = await consumeCredentialSource(source, accountId);
         if (consumed.status === "creds-missing") {
           // Account-scoped graceful degradation (creds missing/expired): skip
@@ -460,23 +455,7 @@ export default defineChannelPluginEntry({
         continue;
       }
 
-      // ---- Axis B (per account): peer admission -----------------------------
-      // Resolved BEFORE the channel is built (Phase 6): a `register-hop`
-      // account gets an agent-owned ConversationKeyStore — its peers' stable
-      // key K is wrap-delivered via the register HTTP response and the legacy
-      // `.handshake` is disabled — while an `auto` account gets NO store and
-      // keeps the per-device handshake untouched (F5 decision).
-      const registerHopAvailable = credentialMode !== "static";
-      const admission = resolveAdmissionMode({
-        authStrategy: (accountAuth as { strategy?: string } | undefined)?.strategy,
-        registerHopAvailable,
-        explicitOverride: accountNatsCfg?.admission,
-      });
-      // The serving plan makes the ONE structural consequence of `admission`
-      // explicit and testable: only a `register-hop` account builds a verifier
-      // and an aud→account dispatch entry; an `auto` account subscribes the
-      // wildcard and is served with NO `channels.webchannel.auth` config.
-      const servingPlan = admissionServingPlan(admission);
+      const admission = "register-hop" as const;
       // Phase 6 review finding 1 (RESOLVED, not warned): a multi-user
       // (register-hop) account no longer risks the SHARED-transcript leak on the
       // history snapshot / load_history paths — webchannel FORCES its own
@@ -488,7 +467,7 @@ export default defineChannelPluginEntry({
       // Fix #7: detect two register-hop accounts sharing the same (issuer, aud).
       // Only register-hop + jwt accounts admit by verifying a token, so only they
       // can be cross-verified by a shared audience. Warn loudly naming both.
-      if (admission === "register-hop" && (accountAuth as { strategy?: string } | undefined)?.strategy === "jwt") {
+      if ((accountAuth as { strategy?: string } | undefined)?.strategy === "jwt") {
         const jwtBlock = (accountAuth as { jwt?: { issuer?: string; audience?: string } }).jwt;
         const issuer = jwtBlock?.issuer;
         const audience = jwtBlock?.audience;
@@ -514,46 +493,12 @@ export default defineChannelPluginEntry({
         }
       }
 
-      // ---- F2: resolve the register-hop wrap identity key -------------------
-      // A register-hop account wraps the conversation key K under the agent's
-      // SaaS-attested identity key so the browser can authenticate it. K MUST be
-      // wrapped under an ATTESTED key on every non-dev path:
-      //  - ENROLLED mode (production): the key comes from the persisted creds. If
-      //    it is absent (pre-F2 creds / malformed block) we SKIP serving.
-      //  - STATIC creds + explicit `nats.admission:"register-hop"` (a legitimate
-      //    bring-your-own-NATS production shape — the override is honored verbatim,
-      //    nats-admission.ts): there is a real untrusted relay, so an unattested
-      //    key would re-open the MITM. Also SKIP serving — BYON register-hop still
-      //    requires an enrolled/attested identity key.
-      //  - open mode ONLY (`WEBCHANNEL_NATS_DEV_OPEN` / devOpen / credentials.mode
-      //    "open" — the genuine dev/e2e knob, no untrusted relay in the threat
-      //    model): fall back to the WELL-KNOWN dev identity key so the dev browser
-      //    drivers can pin it. This is the ONLY path that may wrap under the public
-      //    dev key.
-      // Auto accounts never wrap K, so they never reach this block.
-      let registerHopIdentityKey = identityKey;
-      if (admission === "register-hop" && !registerHopIdentityKey) {
-        if (credentialMode === "open") {
-          registerHopIdentityKey = devOpenAgentIdentityKeyPair();
-          (api.logger?.warn ?? console.warn)?.(
-            `[webchannel] account "${accountId}" register-hop on DEV-OPEN NATS with no enrolled ` +
-              `identity key — using the WELL-KNOWN DEV identity key to wrap K (DEV/E2E ONLY, NOT ` +
-              `attested; this key is public, so an untrusted relay could MITM — never use dev-open ` +
-              `in production).`,
-          );
-        } else {
-          // enrolled (production) OR static (BYO-NATS production) with no attested
-          // key → fail closed. Never wrap K under the public dev key on a path that
-          // faces a real relay.
-          (api.logger?.error ?? console.error)?.(
-            `[webchannel] account "${accountId}" is register-hop (${credentialMode}) but has no ` +
-              `agent identity key — refusing to serve (the browser could not authenticate the ` +
-              `conversation key; wrapping under the public dev key would re-open the relay MITM). ` +
-              `Enroll to mint an attested identity key: openclaw channels add --channel webchannel ` +
-              `--account ${accountId}`,
-          );
-          continue;
-        }
+      if (!identityKey) {
+        (api.logger?.error ?? console.error)?.(
+          `[webchannel] account "${accountId}" has no attested agent identity key — refusing to serve. ` +
+            `Enroll with: openclaw channels add --channel webchannel --account ${accountId}`,
+        );
+        continue;
       }
 
       // ---- Step 2 (per account): create the encrypted NATS channel ---------
@@ -561,14 +506,8 @@ export default defineChannelPluginEntry({
       // accountId is the wire identity (one namespace per account).
       const channel = new NatsChannel(transport, accountId, tenant, {
         ...cryptoOptions,
-        ...(admission === "register-hop"
-          ? {
-              keyStore: new ConversationKeyStore({ accountId }),
-              // Guaranteed present: enrolled/static → persisted attested key (else
-              // skipped above); dev-open → the well-known dev key.
-              identityKeyPair: registerHopIdentityKey,
-            }
-          : {}),
+        keyStore: new ConversationKeyStore({ accountId }),
+        identityKeyPair: identityKey,
       });
       console.log(
         `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, accountId=${accountId})`,
@@ -831,17 +770,6 @@ export default defineChannelPluginEntry({
           );
       });
 
-      // ---- Axis B consequence: wildcard subscription (auto accounts) --------
-      if (servingPlan.subscribeWildcard) {
-        channel.subscribeWildcard();
-      }
-      if (admission === "auto" && isDmPostureOpen(accountDmSecurity)) {
-        api.logger.warn?.(
-          `webchannel: account "${accountId}" admission=auto with no dmSecurity allowlist — ` +
-            "any peer with NATS access + a valid handshake is served; rely on NATS subject permissions.",
-        );
-      }
-
       // ---- Step 4 (per account): approval decision handler -----------------
       // S1: pass THIS account's id so the fail-closed approver check reads the
       // account's own `execApprovals.approvers` — a peer who is an approver on
@@ -902,14 +830,12 @@ export default defineChannelPluginEntry({
       // failure boundary (a build fault must never surface as an unhandled throw
       // on the dispatch path). See src/commands-catalog.ts for the design.
       //
-      // EXPOSURE DECISION (deliberate): unlike the history/approval snapshots —
-      // which are register-hop-gated because they carry the user's own data —
-      // the `commands` frame is served to ANY handshaken peer, including
-      // wildcard / `admission:"auto"` peers. Auto-mode peers never call
-      // registerPeer, so gating discovery on registration would kill the
-      // typeahead in auto mode entirely. The catalog is low-sensitivity command
-      // metadata (names / descriptions / args), already config-filtered by
-      // buildCommandCatalog — so serving it to any handshaken peer is accepted.
+      // The `commands` frame carries only low-sensitivity command metadata
+      // (names / descriptions / args), already config-filtered by
+      // buildCommandCatalog — so unlike the history/approval snapshots (which
+      // carry the user's own data) it does not need to be withheld pending any
+      // additional gate. Every peer is register-hop-authenticated before this
+      // handler can fire, so serving the catalog to a registered peer is accepted.
       const catalogProvider = createCommandCatalogProvider(api.config);
       channel.setLoadCommandsHandler((peerId) => {
         try {
@@ -941,8 +867,7 @@ export default defineChannelPluginEntry({
       const effIssuer = effJwt?.issuer;
       const effAudience = effJwt?.audience;
 
-      if (servingPlan.buildVerifier) {
-        try {
+      try {
           assertJwtAuthConfig(accountAuth);
         } catch (err) {
           // Fail-closed: the verifier could not be built (missing/unresolvable
@@ -959,9 +884,7 @@ export default defineChannelPluginEntry({
           });
           (api.logger?.error ?? console.error)?.(buildFail.line);
           continue;
-        }
       }
-
       // ---- Publish this account's runtime -----------------------------------
       accountRuntimes.set(accountId, {
         accountId,
@@ -974,10 +897,10 @@ export default defineChannelPluginEntry({
       });
 
       // ---- Axis B consequence: register-hop admission over NATS -------------
-      // A register-hop account wires the register-request handler and subscribes
-      // its own `.register` wildcard (the NATS analogue of the old HTTP route).
-      // An `auto` account does neither — it admits via the wildcard + handshake.
-      if (servingPlan.subscribeRegister) {
+      // Every account wires the register-request handler and subscribes its own
+      // `.register` wildcard (the NATS analogue of the old HTTP route) — the sole
+      // admission path now that auto-admission and the X25519 handshake are gone.
+      {
         // PER-ACCOUNT PoP nonce store (NOT process-wide). Scoping the store to
         // this account means its per-peer cap evicts only THIS account's own
         // peers' nonces — so an attacker flooding `challenge` in account A can
@@ -996,6 +919,7 @@ export default defineChannelPluginEntry({
           // unguarded path must never surface as an unhandledRejection.
           void handleRegisterRequest({
             auth: accountAuth,
+            tenant,
             subjectPeerId,
             payload,
             reply,
@@ -1050,10 +974,7 @@ export default defineChannelPluginEntry({
       // verify is non-admit), and the cache retries per-register on the 5-min
       // TTL — permanently skipping on a momentary IdP hiccup would be worse.
       let jwks: JwksReadiness | undefined;
-      if (
-        servingPlan.buildVerifier &&
-        (accountAuth as { strategy?: string } | undefined)?.strategy === "jwt"
-      ) {
+      if ((accountAuth as { strategy?: string } | undefined)?.strategy === "jwt") {
         try {
           jwks = await preflightResolveJwks(accountAuth as JwtAuthConfig);
         } catch (err) {

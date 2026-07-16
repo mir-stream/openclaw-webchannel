@@ -22,12 +22,7 @@ import { NatsChannel } from "./nats-channel.js";
 import { ConversationKeyStore } from "./conversation-key-store.js";
 import { generateKeyPair } from "./e2e-crypto.js";
 import { unwrapConversationKey } from "./late-join-decryptor.js";
-import {
-  keyExchangeFrame,
-  parseKeyExchange,
-  sealEnvelope,
-  openEnvelope,
-} from "./e2e-session.js";
+import { sealEnvelope, openEnvelope } from "./e2e-session.js";
 
 // ---------------------------------------------------------------------------
 // In-memory NATS broker (echo:false, exact-subject routing) — same fixture
@@ -97,7 +92,6 @@ const ACCOUNT = "agent-1";
 const PEER = "user-42";
 const outSubj = `webchannel.${TENANT}.${ACCOUNT}.${PEER}.out`;
 const inSubj = `webchannel.${TENANT}.${ACCOUNT}.${PEER}.in`;
-const hsSubj = `webchannel.${TENANT}.${ACCOUNT}.${PEER}.handshake`;
 
 let home: string;
 
@@ -270,7 +264,7 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     ).toThrow(/identityKeyPair/);
   });
 
-  it("wrapConversationKeyForDevice guards: unregistered peer → null; bad key length → throw; legacy channel → null", () => {
+  it("wrapConversationKeyForDevice guards: unregistered peer → null; bad key length → throw", () => {
     const broker = new FakeBroker();
     const { channel } = makeKeyStoreChannel(broker);
     const deviceKP = generateKeyPair();
@@ -279,60 +273,6 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     channel.registerPeer(PEER);
     expect(() => channel.wrapConversationKeyForDevice(PEER, new Uint8Array(31))).toThrow(/32 bytes/);
 
-    const legacy = new NatsChannel(
-      new FakeTransport(broker) as unknown as ConstructorParameters<typeof NatsChannel>[0],
-      ACCOUNT,
-      TENANT,
-      {},
-    );
-    legacy.registerPeer(PEER);
-    expect(legacy.wrapConversationKeyForDevice(PEER, deviceKP.publicKey)).toBeNull();
-  });
-
-  it("divergence (F5): keyStore mode never subscribes nor answers .handshake; legacy mode does", () => {
-    const broker = new FakeBroker();
-    const { channel, agentTransport, store } = makeKeyStoreChannel(broker);
-    channel.registerPeer(PEER);
-    expect(agentTransport.subscribedSubjects()).toEqual([inSubj]);
-
-    // Even a directly-delivered rogue handshake frame is refused: no agent
-    // key_exchange reply, and K is untouched.
-    const kBefore = store.get(PEER)!;
-    const browserKP = generateKeyPair();
-    const replies: Buffer[] = [];
-    const listener = new FakeTransport(broker);
-    listener.subscribe(hsSubj);
-    listener.on("message", (m: { payload: Buffer }) => replies.push(m.payload));
-    agentTransport.deliver(hsSubj, Buffer.from(keyExchangeFrame(browserKP.publicKey)));
-    expect(replies).toHaveLength(0);
-    expect(Buffer.from(store.get(PEER)!).equals(Buffer.from(kBefore))).toBe(true);
-
-    // Legacy (auto-style) channel on its own broker: handshake IS answered.
-    const broker2 = new FakeBroker();
-    const legacyTransport = new FakeTransport(broker2);
-    const legacy = new NatsChannel(
-      legacyTransport as unknown as ConstructorParameters<typeof NatsChannel>[0],
-      ACCOUNT,
-      TENANT,
-      {},
-    );
-    legacy.registerPeer(PEER);
-    const legacyReplies: Buffer[] = [];
-    const browser2 = new FakeTransport(broker2);
-    browser2.subscribe(hsSubj);
-    browser2.on("message", (m: { payload: Buffer }) => legacyReplies.push(m.payload));
-    browser2.publish(hsSubj, keyExchangeFrame(browserKP.publicKey));
-    expect(legacyReplies).toHaveLength(1);
-    expect(parseKeyExchange(legacyReplies[0])).not.toBeNull();
-  });
-
-  it("subscribeWildcard in keyStore mode skips the handshake wildcard", () => {
-    const broker = new FakeBroker();
-    const { channel, agentTransport } = makeKeyStoreChannel(broker);
-    channel.subscribeWildcard();
-    expect(agentTransport.subscribedSubjects()).toEqual([
-      `webchannel.${TENANT}.${ACCOUNT}.*.in`,
-    ]);
   });
 
   it("K survives a gateway restart: a rebuilt channel re-establishes the SAME key (acceptance B, unit level)", () => {

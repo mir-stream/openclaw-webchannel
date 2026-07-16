@@ -38,6 +38,20 @@ describe("removed auth.ticketParam migration", () => {
   });
 });
 
+describe("P0-2 removed config migration", () => {
+  it.each([
+    ["nats.devOpen", { nats: { devOpen: false } }],
+    ['nats.admission="auto"', { nats: { admission: "auto" } }],
+    ['nats.credentials.mode="open"', { nats: { credentials: { mode: "open" } } }],
+    ['auth.strategy="anonymous"', { auth: { strategy: "anonymous" } }],
+  ])("fails account resolution for %s", (setting, account) => {
+    const cfg = { channels: { webchannel: account } };
+    expect(() => resolveWebchannelAccountConfig(cfg, "default")).toThrow(
+      new RegExp(`removed config ${setting.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}`),
+    );
+  });
+});
+
 describe("account-config: account id validation (TRUST BOUNDARY)", () => {
   it("accepts safe ids", () => {
     for (const id of ["default", "acctA", "acct-1", "a_b-C9", "x".repeat(64)]) {
@@ -266,11 +280,11 @@ describe("account-config: readWebchannelSection / readAccountsMap / resolveAccou
     expect(readAccountsMap(readWebchannelSection(cfg))).toEqual({ a: { x: 1 } });
   });
 
-  it("reads per-account merged nats config", () => {
+  it("rejects a merged per-account devOpen fixture", () => {
     const cfg = {
       channels: { webchannel: { nats: { url: "ws://base" }, accounts: { acctA: { nats: { devOpen: true } } } } },
     };
-    expect(resolveAccountNatsConfig(cfg, "acctA")).toEqual({ url: "ws://base", devOpen: true });
+    expect(() => resolveAccountNatsConfig(cfg, "acctA")).toThrow(/removed config nats.devOpen/);
   });
 
   it("reads flat nats config for default", () => {

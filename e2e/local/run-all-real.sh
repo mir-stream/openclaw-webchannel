@@ -3,7 +3,7 @@
 # browser running the PRODUCTION WebChannelNatsClient:
 #   (a) NATS-layer NKEY-authenticates to a REAL JWT-auth nats-server, AND
 #   (b) drives the JWT + Proof-of-Possession HTTP register hop,
-# against a REAL enrolled plugin (gateway, devOpen OFF) whose NATS creds were
+# against a REAL enrolled plugin (gateway) whose NATS creds were
 # acquired AT CONFIG TIME via `openclaw channels add` (가-1: the device-flow
 # EnrollmentClient runs in the setup hook, not at gateway boot) and which the
 # CONSUME-ONLY gateway then loads to connect to the SAME nats-server — all from
@@ -11,8 +11,8 @@
 # left is the echo LLM.
 #
 # This FUSES the #18 server topology (run-enrolled-transport.sh: unified issuer +
-# JWT-auth nats-server from ONE setupTrustChain + enrolled plugin, devOpen OFF)
-# with the #19 browser driver (browser-jwt-register.mjs → here: all-real.mjs).
+# JWT-auth nats-server from ONE setupTrustChain + enrolled plugin)
+# with the #19 browser driver (all-real.mjs).
 #
 # Trust unification: ONE setupTrustChain() in the reference enrollment-server
 # feeds (a) the device-flow NATS user creds the agent enrolls for, (b) the
@@ -283,12 +283,11 @@ CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
 [ -f "$CRED_FILE" ] || { echo "[run-all-real] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-all-real] ✓ credentials persisted at $CRED_FILE"
 
-# 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
-#      setup adapter writes the demo-proven block (`admission: "auto"`,
-#      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
-#      override that disables the HTTP register hop (no aud→account dispatch
-#      entry ⇒ challenge 401 "No account for token audience"), and this harness
-#      drives the register hop. Restore the pre-add intent.
+# 6b². Tighten dmSecurity AFTER `channels add`. The setup adapter writes the
+#      demo-proven block (`admission: "register-hop"` — the sole admission path —
+#      with `dmSecurity: "open"`) into the account; this step narrows it to
+#      `dmSecurity: "allowlist"` plus an explicit `allowFrom` pin so the harness
+#      exercises the allowlist path. (admission stays register-hop throughout.)
 node -e '
   const fs = require("fs");
   const p = process.argv[1], acct = process.argv[2], peer = process.argv[3];

@@ -34,13 +34,11 @@ import {
   WebChannelNatsClient,
   inboundSubject,
   outboundSubject,
-  handshakeSubject,
   registerSubject,
   type ProtocolInfo,
 } from "./nats-client.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import {
-  generateX25519KeyPair,
   unwrapConversationKey,
   sealMessage,
   openMessage,
@@ -48,6 +46,22 @@ import {
   type WrappedConversationKey,
 } from "./e2e-crypto-browser.js";
 import { generateDevicePopKeyPair } from "./pop-register.js";
+
+async function generateX25519KeyPair(): Promise<{
+  privateKey: CryptoKey;
+  publicKeyBytes: Uint8Array;
+}> {
+  const pair = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
+    "deriveBits",
+  ])) as CryptoKeyPair;
+  return {
+    privateKey: pair.privateKey,
+    publicKeyBytes: new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey)),
+  };
+}
+
+const removedHandshakeSubject = (tenant: string, accountId: string, peerId: string) =>
+  `webchannel.${tenant}.${accountId}.${peerId}.handshake`;
 
 // ---------------------------------------------------------------------------
 // Agent-side wrap, implemented EXACTLY like the plugin's late-join-decryptor
@@ -96,7 +110,7 @@ function wrapLikeAgent(
 ): WrappedConversationKey {
   // ECDH: wrap private × device public. The public half emitted in the wire field
   // is always the agent identity public (compat alias), even when a relay wraps
-  // under a different private key — the browser IGNORES the field anyway.
+  // under a different private key while keeping the public identity field stable.
   const devicePub = createPublicKey({
     key: x25519RawToSpki(devicePublicKeyRaw),
     type: "spki",
@@ -320,7 +334,7 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     await settle();
 
     // Divergence, client half: handshake subject neither subscribed nor published.
-    const hs = handshakeSubject(TENANT, AGENT, PEER);
+    const hs = removedHandshakeSubject(TENANT, AGENT, PEER);
     expect(server.subscribedSubjects()).not.toContain(hs);
     expect(server.published.some((p) => p.subject === hs)).toBe(false);
 
@@ -500,7 +514,7 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     expect(causes).toEqual(["protocol-mismatch"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     // NO downgrade: no handshake frame, no plaintext, nothing on .in.
-    expect(server.published.some((p) => p.subject === handshakeSubject(TENANT, AGENT, PEER))).toBe(false);
+    expect(server.published.some((p) => p.subject === removedHandshakeSubject(TENANT, AGENT, PEER))).toBe(false);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
 
@@ -547,8 +561,8 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     // The relay even copies the genuine agent's public key into the wire field
-    // (compat alias) to look legitimate — irrelevant, the browser ignores it and
-    // derives from the pin. The actual wrap ECDH uses the relay's PRIVATE key.
+    // (compat alias) to pass the pin equality check. The actual wrap ECDH uses
+    // the relay's PRIVATE key and therefore still fails authentication.
     server.handler = registerAgentHandler(PEER, () =>
       wrapLikeAgent(Kprime, deviceKP.publicKeyBytes, agentId, PEER, relay.privatePem),
     );
@@ -614,6 +628,37 @@ describe("unwrapConversationKey conformance (agent wrap ↔ browser unwrap)", ()
       PEER,
     );
     expect(Buffer.from(recovered).equals(Buffer.from(K))).toBe(true);
+  });
+
+  it.each(["ephemeralPublicKey", "nonce", "tag"] as const)(
+    "A2: rejects a relay mutation of wrapped %s",
+    async (field) => {
+      const K = new Uint8Array(randomBytes(32));
+      const agentId = makeAgentIdentity();
+      const deviceKP = await generateX25519KeyPair();
+      const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER);
+      const bytes = base64urlDecode(wrapped[field]);
+      bytes[0] ^= 0xff;
+      await expect(
+        unwrapConversationKey(
+          { ...wrapped, [field]: Buffer.from(bytes).toString("base64url") },
+          deviceKP.privateKey,
+          agentId.publicB64url,
+          PEER,
+        ),
+      ).rejects.toThrow();
+    },
+  );
+
+  it("A2: rejects a wrong local SaaS pin", async () => {
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const wrongAgent = makeAgentIdentity();
+    const deviceKP = await generateX25519KeyPair();
+    const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER);
+    await expect(
+      unwrapConversationKey(wrapped, deviceKP.privateKey, wrongAgent.publicB64url, PEER),
+    ).rejects.toThrow(/pinned key/);
   });
 
   it("a different device's private key cannot unwrap (Poly1305 reject)", async () => {

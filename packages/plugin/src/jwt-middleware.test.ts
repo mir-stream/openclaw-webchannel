@@ -34,6 +34,8 @@ import { webcrypto } from "node:crypto";
 
 import { verifyJwtAndExtractIdentity } from "./auth.js";
 import type { JsonWebKeySet } from "./jwks.js";
+import { handleRegisterRequest, REGISTER_UNAUTHORIZED } from "./nats-register.js";
+import { PopChallengeStore } from "./pop-challenge.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -216,6 +218,38 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
       expect(identity).toEqual({ peerId: "user-abc" });
     });
 
+    it("A4: a valid signed token for another tenant is rejected by register admission", async () => {
+      await ensureKeys();
+      const now = nowSec();
+      const token = await mintToken(
+        { iss: ISSUER, aud: AUDIENCE, sub: "user-abc", tenant: "mutated-tenant", iat: now, exp: now + 60 },
+        primaryPrivateKey,
+      );
+      const config = {
+        strategy: "jwt",
+        jwt: { jwksUrl: JWKS_URL, issuer: ISSUER, audience: AUDIENCE, _fetchImpl: mockJwksServer(publishedJwks) },
+      } as const;
+      const identity = await verifyJwtAndExtractIdentity(token, config);
+      expect(identity?.tenant).toBe("mutated-tenant");
+
+      const replies: string[] = [];
+      await handleRegisterRequest({
+        auth: config,
+        tenant: "agent-tenant",
+        subjectPeerId: "user-abc",
+        payload: JSON.stringify({ op: "challenge", token }),
+        reply: (value) => replies.push(value),
+        verifyIdentity: (jwt, auth) => verifyJwtAndExtractIdentity(jwt, auth),
+        popChallenges: new PopChallengeStore(),
+        registerPeer: () => {},
+        wrapConversationKeyForDevice: () => null,
+        unregisterPeer: () => {},
+        sendHistorySnapshot: () => {},
+        sendApprovalSnapshot: () => {},
+      });
+      expect(replies).toEqual([REGISTER_UNAUTHORIZED]);
+    });
+
     it("the mock JWKS server fetch is actually called (verifies fetch path is exercised)", async () => {
       await ensureKeys();
       const fetchImpl = mockJwksServer(publishedJwks);
@@ -269,6 +303,28 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
       expect(
         await verifier(`${h}.${tamperedPayload}.${sig}`),
       ).toBeNull();
+    });
+
+    it("rejects a relay-mutated cnf.jwk through the real signature verifier", async () => {
+      await ensureKeys();
+      const verifier = makeVerifier(mockJwksServer(publishedJwks));
+      const now = nowSec();
+      const originalDeviceKey = Buffer.alloc(32, 1).toString("base64url");
+      const token = await mintToken(
+        {
+          iss: ISSUER,
+          aud: AUDIENCE,
+          sub: "user-abc",
+          iat: now,
+          exp: now + 60,
+          cnf: { jwk: { kty: "OKP", crv: "X25519", x: originalDeviceKey } },
+        },
+        primaryPrivateKey,
+      );
+      const [header, payload, signature] = token.split(".");
+      const claims = JSON.parse(Buffer.from(payload!, "base64url").toString("utf8"));
+      claims.cnf.jwk.x = Buffer.alloc(32, 2).toString("base64url");
+      expect(await verifier(`${header}.${b64url(claims)}.${signature}`)).toBeNull();
     });
   });
 

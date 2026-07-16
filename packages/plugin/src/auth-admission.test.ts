@@ -16,7 +16,7 @@ import { assertJwtAuthConfig, type AuthConfig } from "./auth.js";
 
 describe("Anonymous strategy rejection (AC 4)", () => {
   it("should throw error when anonymous strategy is resolved", () => {
-    const anonConfig: AuthConfig = { strategy: "anonymous" };
+    const anonConfig = { strategy: "anonymous" } as unknown as AuthConfig;
 
     expect(() => assertJwtAuthConfig(anonConfig)).toThrow(
       /not valid for register-hop JWT verification/,
@@ -24,7 +24,7 @@ describe("Anonymous strategy rejection (AC 4)", () => {
   });
 
   it("should throw error with detailed message mentioning AC 4", () => {
-    const anonConfig: AuthConfig = { strategy: "anonymous" };
+    const anonConfig = { strategy: "anonymous" } as unknown as AuthConfig;
 
     expect(() => assertJwtAuthConfig(anonConfig)).toThrow(
       /not valid for register-hop JWT verification/,
@@ -32,7 +32,7 @@ describe("Anonymous strategy rejection (AC 4)", () => {
   });
 
   it("should throw error suggesting the jwt strategy", () => {
-    const anonConfig: AuthConfig = { strategy: "anonymous" };
+    const anonConfig = { strategy: "anonymous" } as unknown as AuthConfig;
 
     expect(() => assertJwtAuthConfig(anonConfig)).toThrow(
       /register-hop JWT verification/,
@@ -63,7 +63,7 @@ describe("Anonymous strategy rejection (AC 4)", () => {
   });
 
   it("should throw error for unknown strategy", () => {
-    const unknownConfig: AuthConfig = { strategy: "unknown" as any };
+    const unknownConfig = { strategy: "unknown" } as unknown as AuthConfig;
 
     expect(() => assertJwtAuthConfig(unknownConfig)).toThrow(
       /auth strategy "unknown" is not valid/,

@@ -32,9 +32,10 @@ this file, **this file is correct.**
 - **Multi-device is production behavior (Phase 6).** The agent owns one conversation key per
   peer (`conversation-key-store.ts`, 0600 on disk) and **wrap-delivers it in the register
   response to the JWT-attested device key** — the register path has NO unauthenticated
-  handshake anymore (the old `handshake-verifier` is deleted). Two devices on one user each
-  decrypt live traffic + snapshots; W6 id/text/positional dedup handles echo adoption. The
-  legacy X25519 handshake survives only on the dev/open (`admission: "auto"`) path.
+  registration anymore (the old `handshake-verifier` is deleted). Two devices on one user each
+  decrypt live traffic + snapshots; W6 id/text/positional dedup handles echo adoption.
+  Register-hop (bootstrap JWT + PoP) is now the SOLE admission path — P0-2 deleted the
+  unauthenticated X25519 handshake and the dev/open-NATS mode entirely.
 - **Multi-account multiplex** — one gateway serves `channels.webchannel.accounts.<id>` with
   per-account NATS connections, subject namespaces, verifiers, and admission
   (`multiplex.ts`; 가-1/가-2). Exec/plugin approvals are **accountId-aware** (per-account
@@ -59,13 +60,15 @@ this file, **this file is correct.**
 `.github/workflows/e2e-gate.yml` (push to `main`/`develop`/`feature/**`), GREEN on both
 long-lived branches:
 
-- 3-package typecheck; full vitest suite (**1064 tests**, hard floor ≥712) on a real
+- 3-package typecheck; full vitest suite (**1371 tests**, hard floor ≥1365) on a real
   `nats-server` v2.14 (absence hard-fails; real-server suites cannot silently skip).
-- **7 live harnesses** against a real openclaw gateway + headless Chromium:
-  `run-jwt-register`, `run-saas-issuer-register`, `run-enrolled-transport`,
-  `run-browser-jwt-register`, `run-all-real` (production browser + device-flow-enrolled plugin
-  on one JWT-auth nats-server — the only stand-in is the echo LLM, by design),
-  `run-two-account-isolation`, `run-derived-trust`.
+- **4 live harnesses** against a real openclaw gateway + headless Chromium:
+  `run-enrolled-transport`, `run-all-real` (production browser + device-flow-enrolled
+  plugin on one JWT-auth nats-server — the only stand-in is the echo LLM, by design),
+  `run-two-account-isolation`, `run-derived-trust`. (P0-2 removed the three
+  dev-open-NATS register harnesses — `run-jwt-register`, `run-saas-issuer-register`,
+  `run-browser-jwt-register` — whose assertions `run-all-real` subsumes; two-account
+  isolation was migrated onto the enrolled trust chain.)
 - Examples consumer tests run with their own runner against freshly built `dist/`
   (`7603b85` — they import the package entry like a real downstream).
 
@@ -79,7 +82,7 @@ long-lived branches:
 | Register-over-NATS admission (PoP challenge→sign→verify, opaque reject, reply-to reginbox guard) | `nats-register.ts` + `nats-register.test.ts`; PR #6 review PASS; N2 guard `949b3a9` |
 | SaaS-delivered trust facts (natsUrl + issuer), pin>delivered>derived | `device-flow-types.ts` / `account-config.ts` / `index-nats.ts:deriveAccountAuth`; `issuer-single-source.test.ts`; demo fake-issuer boots pin-less |
 | Device-flow enrollment + `channels add` wizard (config-only interactive; `--flag` form enrolls) | `setup-wizard.ts` + Gate A preflight; AC6 device-flow E2E on real nats-server |
-| Multi-device conversation keys (wrap-delivered at register; no handshake on register path) | `conversation-key-store.ts`, `nats-client-wrapped-key.test.ts` (fail-closed terminals), `demo/verify-multidevice.mjs` 6/6 |
+| Multi-device conversation keys (wrap-delivered at register; no registration on register path) | `conversation-key-store.ts`, `nats-client-wrapped-key.test.ts` (fail-closed terminals), `demo/verify-multidevice.mjs` 6/6 |
 | Multi-account multiplex + accountId-aware approvals | `multiplex.ts`, `approvals.ts` (+3-lens adversarial review F1/F2 fixed); `demo/verify-multiplex.mjs`, `demo/multiplex.sh` |
 | JWKS rotation + eviction (admin-driven, 500→401 fix) | `jwks.ts`; `demo/verify-rotate.mjs`, `verify-evict.mjs` |
 | Trust chain, NATS user-cred minting, external (Synadia/NGS) account signing | `packages/saas`; `external-nats-account.test.ts`, `nats-permissions-realserver.test.ts`; demo `DEMO_RELAY=synadia` live |
@@ -91,7 +94,7 @@ long-lived branches:
 | Gap | Detail |
 |---|---|
 | **S1 outbound facade** (proactive/approval outbound is primary-account-only) | Cross-account disclosure risk on the agent-initiated leg; the approvals half is done, the outbound facade is the open half. [`BACKLOG.md`](BACKLOG.md) §S1. |
-| **C2 (unauthenticated handshake) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `handshake-verifier` deleted). The legacy X25519 handshake remains on the dev/open `admission:"auto"` path — still the accepted-risk/untrusted-relay caveat there. [`BACKLOG.md`](BACKLOG.md) §C2. |
+| **C2 (unauthenticated registration) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `handshake-verifier` deleted). Register-hop is now the sole admission path; the residual is the accepted-risk/untrusted-relay caveat there (the relay carries the admission frames but cannot forge admission). [`BACKLOG.md`](BACKLOG.md) §C2. |
 | Direct gateway transport removal | ✅ complete; browser traffic uses the NATS relay only. |
 | Demo/reference server hardening (review SEC1/2/5) | The reference/demo SaaS servers are deliberately demo-grade (in-memory stores, printed admin token); production-hardening rewrite is a pending decision. |
 | Pre-issuer enrollments | Agents enrolled before 0.1.3 never receive the delivered issuer — they must delete `credentials.json` and re-enroll (documented in `GETTING_STARTED.md` troubleshooting). |
@@ -115,7 +118,8 @@ things to know when reading it:
 
 1. **The HTTP register hop it describes was later replaced wholesale by register-over-NATS**
    (2026-07-03): the HTTP routes, their CORS layer (`register-cors.ts`), and `registerBaseUrl`
-   are deleted. The harness names survive (`run-jwt-register.sh` etc.) but drive the NATS hop.
+   are deleted. The JWT-register harnesses that old file names (`run-jwt-register.sh` etc.) were
+   later removed in P0-2 — the register hop is now proven by `run-all-real` / `run-derived-trust`.
 2. The "unwired parallel layer" contradiction it reconciles is long closed — the NATS path has
    been the production default since `e384198`, and everything above is downstream of it.
 

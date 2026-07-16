@@ -54,31 +54,17 @@ describe("parseNatsCredsFile", () => {
   });
 });
 
-describe("resolveNatsCredentialSource — open", () => {
-  it("resolves open via WEBCHANNEL_NATS_DEV_OPEN=1 (env overrides config)", () => {
-    const s = resolveNatsCredentialSource({
+describe("resolveNatsCredentialSource — removed open mode", () => {
+  it("rejects WEBCHANNEL_NATS_DEV_OPEN=1 with a migration error", () => {
+    expect(() => resolveNatsCredentialSource({
       ...BASE,
       natsConfig: { credentials: { mode: "static", userJwt: "j", userSeed: "s" } },
       env: { WEBCHANNEL_NATS_DEV_OPEN: "1" },
-    });
-    expect(s.mode).toBe("open");
-  });
-
-  it("resolves open via legacy devOpen and via credentials.mode=open", () => {
-    expect(
-      resolveNatsCredentialSource({ ...BASE, legacyNats: { devOpen: true }, env: {} }).mode,
-    ).toBe("open");
-    expect(
-      resolveNatsCredentialSource({
-        ...BASE,
-        natsConfig: { credentials: { mode: "open" } },
-        env: {},
-      }).mode,
-    ).toBe("open");
+    })).toThrow(/WEBCHANNEL_NATS_DEV_OPEN was removed/);
   });
 });
 
-describe("resolveNatsCredentialSource — static (BYO-NATS)", () => {
+describe.skip("legacy static resolution details (serving removed until P0-3)", () => {
   it("resolves static from env JWT + seed and applies the URL precedence", () => {
     const s = resolveNatsCredentialSource({
       ...BASE,
@@ -168,6 +154,19 @@ describe("resolveNatsCredentialSource — static (BYO-NATS)", () => {
   });
 });
 
+describe("resolveNatsCredentialSource — static migration signals", () => {
+  const migration = /static NATS credentials no longer imply auto admission/;
+  it.each([
+    ["mode", { natsConfig: { credentials: { mode: "static" } }, env: {} }],
+    ["credsFile", { natsConfig: { credentials: { credsFile: "/x" } }, env: {} }],
+    ["inline", { natsConfig: { credentials: { userJwt: "j", userSeed: "s" } }, env: {} }],
+    ["env JWT+seed", { env: { WEBCHANNEL_NATS_USER_JWT: "j", WEBCHANNEL_NATS_USER_SEED: "s" } }],
+    ["env creds file", { env: { WEBCHANNEL_NATS_CREDS: "/x" } }],
+  ])("rejects %s", (_name, extra) => {
+    expect(() => resolveNatsCredentialSource({ ...BASE, ...extra } as never)).toThrow(migration);
+  });
+});
+
 describe("resolveNatsCredentialSource — enrolled (default)", () => {
   it("defaults to enrolled and carries the SaaS base URL + tenant/agent", () => {
     const s = resolveNatsCredentialSource({
@@ -239,23 +238,6 @@ describe("connectNatsCredentialSource — static branch", () => {
     expect(fakeTransport.connect).toHaveBeenCalled();
     expect(result.transport).toBe(fakeTransport);
     expect(result.enrolled).toBeUndefined();
-  });
-
-  it("open branch builds a no-auth transport", async () => {
-    let captured: Record<string, unknown> | undefined;
-    const fakeTransport = { connect: vi.fn().mockResolvedValue(undefined) };
-    await connectNatsCredentialSource(
-      { mode: "open", url: "ws://x" },
-      {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        transportFactory: (opts) => {
-          captured = opts as Record<string, unknown>;
-          return fakeTransport as any;
-        },
-      },
-    );
-    expect(captured?.["jwtCredential"]).toBeUndefined();
-    expect(captured?.["nkeySigningCallback"]).toBeUndefined();
   });
 
   it("enrolled branch delegates to createEnrolled and returns the connection", async () => {

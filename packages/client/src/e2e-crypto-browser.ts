@@ -7,9 +7,9 @@
  * BigInt) so it runs identically in a real browser and in Node ≥18 (which also
  * exposes `globalThis.crypto.subtle` with X25519). It speaks the exact same wire
  * protocol the agent (`packages/plugin/src/e2e-session.ts` + `nats-channel.ts`)
- * and the live-gate browser seam (`e2e-browser-client.ts`) use:
- *   - handshake frame: {type:"key_exchange", pubKey:<b64url X25519>}
- *   - session key:     hkdfSha256(ecdh, null, "webchannel-conversation-v1", 32)
+ * uses:
+ *   - conversation key K: register-delivered, unwrapped via the key-wrap ECDH
+ *                         (KEY_WRAP_INFO = "webchannel-key-wrap-v1")
  *   - wire envelope:   MessageEnvelope v1 JSON, content = ChaCha20-Poly1305
  *   - AAD:             canonical(routing) = {tenant,accountId,sub,messageId,envelopeType,ts}
  */
@@ -19,8 +19,6 @@ import { chacha20poly1305Encrypt, chacha20poly1305Decrypt } from "./chacha20poly
 /**
  * HKDF `info` for the conversation key. MUST match the agent and the live gate.
  */
-export const CONVERSATION_KDF_INFO = "webchannel-conversation-v1";
-
 // ---------------------------------------------------------------------------
 // base64url + random
 // ---------------------------------------------------------------------------
@@ -47,26 +45,7 @@ export function randomBytes(n: number): Uint8Array {
 // X25519 key exchange (Web Crypto)
 // ---------------------------------------------------------------------------
 
-export type BrowserKeyPair = {
-  privateKey: CryptoKey;
-  publicKeyBytes: Uint8Array;
-  publicKeyB64url: string;
-};
-
-export async function generateX25519KeyPair(): Promise<BrowserKeyPair> {
-  const kp = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
-    "deriveBits",
-  ])) as CryptoKeyPair;
-  const jwk = await crypto.subtle.exportKey("jwk", kp.publicKey);
-  const x = (jwk as { x: string }).x;
-  return {
-    privateKey: kp.privateKey,
-    publicKeyBytes: base64urlDecode(x),
-    publicKeyB64url: x,
-  };
-}
-
-async function deriveX25519SharedSecret(
+export async function deriveX25519SharedSecret(
   myPrivateKey: CryptoKey,
   theirPubKeyB64url: string,
 ): Promise<Uint8Array> {
@@ -112,14 +91,6 @@ export async function hkdfSha256(
  * Derive the 32-byte conversation key from our X25519 private key and the peer's
  * base64url public key (ECDH → HKDF-SHA256), using the shared KDF info.
  */
-export async function deriveConversationKey(
-  myPrivateKey: CryptoKey,
-  theirPubKeyB64url: string,
-): Promise<Uint8Array> {
-  const rawSecret = await deriveX25519SharedSecret(myPrivateKey, theirPubKeyB64url);
-  return hkdfSha256(rawSecret, null, CONVERSATION_KDF_INFO, 32);
-}
-
 // ---------------------------------------------------------------------------
 // Conversation-key unwrap (Phase 6 multi-device — register-delivered key)
 // ---------------------------------------------------------------------------
@@ -150,13 +121,8 @@ export function wrapAad(peerId: string): Uint8Array {
  */
 export type WrappedConversationKey = {
   /**
-   * b64url 32-byte X25519 public key used for the wrap ECDH. IGNORED here (F2):
-   * the browser derives the unwrap key from the SaaS-PINNED agent public key,
-   * never from this wire field (which an untrusted relay could substitute). Kept
-   * in the type only because an OLD (pre-F2) browser read it — but there is NO
-   * interop with an old browser: the new agent always binds the peerId AAD, which
-   * an old no-AAD unwrap can't satisfy, so old-client + new-agent is a HARD break
-   * (strict 3-way lockstep). The field name is retained; its value is vestigial.
+   * b64url 32-byte agent X25519 public key. It must equal the independently
+   * SaaS-pinned key before that pin is used for wrap ECDH.
    */
   ephemeralPublicKey: string;
   /** b64url 12-byte ChaCha20-Poly1305 nonce. */
@@ -194,6 +160,14 @@ export async function unwrapConversationKey(
   agentPublicKeyB64url: string,
   peerId: string,
 ): Promise<Uint8Array> {
+  const wireAgentKey = base64urlDecode(wrapped.ephemeralPublicKey);
+  const pinnedAgentKey = base64urlDecode(agentPublicKeyB64url);
+  if (
+    wireAgentKey.length !== pinnedAgentKey.length ||
+    wireAgentKey.some((value, index) => value !== pinnedAgentKey[index])
+  ) {
+    throw new Error("wrapped conversation key agent identity does not match the pinned key");
+  }
   const rawSecret = await deriveX25519SharedSecret(
     devicePrivateKey,
     agentPublicKeyB64url,
@@ -206,34 +180,6 @@ export async function unwrapConversationKey(
     base64urlDecode(wrapped.tag),
     wrapAad(peerId),
   );
-}
-
-// ---------------------------------------------------------------------------
-// Handshake frame codec
-// ---------------------------------------------------------------------------
-
-/** Build the `{type:"key_exchange", pubKey}` handshake frame as a JSON string. */
-export function keyExchangeFrame(publicKeyB64url: string): string {
-  return JSON.stringify({ type: "key_exchange", pubKey: publicKeyB64url });
-}
-
-/** Parse a handshake frame; returns the peer public key (b64url) or null. */
-export function parseKeyExchange(payload: string): string | null {
-  try {
-    const frame = JSON.parse(payload) as { type?: unknown; pubKey?: unknown };
-    if (frame.type !== "key_exchange" || typeof frame.pubKey !== "string" || !frame.pubKey) {
-      return null;
-    }
-    // An X25519 public key is exactly 32 bytes; a non-32-byte key would throw in
-    // importKey downstream. Reject it here so a malformed frame is ignorable,
-    // mirroring the agent's `parseKeyExchange` (e2e-session.ts).
-    if (base64urlDecode(frame.pubKey).length !== 32) {
-      return null;
-    }
-    return frame.pubKey;
-  } catch {
-    return null;
-  }
 }
 
 // ---------------------------------------------------------------------------

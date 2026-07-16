@@ -127,6 +127,7 @@ export type CnfClaim = {
  */
 export type JwtIdentity = {
   peerId: string;
+  tenant?: string;
   displayName?: string;
   /** Device X25519 public key from cnf.jwk (base64url, 32 bytes when decoded). */
   devicePublicKey?: string;
@@ -351,6 +352,7 @@ export async function verifyJwt(
   // displayName — best-effort, prefers `name` then `preferred_username`
   // (OIDC convention). Anything else is ignored silently.
   const identity: JwtIdentity = { peerId: payload.sub };
+  if (typeof payload.tenant === "string" && payload.tenant.length > 0) identity.tenant = payload.tenant;
   const dn = payload.name ?? payload.preferred_username;
   if (typeof dn === "string" && dn.length > 0) identity.displayName = dn;
   if (devicePublicKeyB64) identity.devicePublicKey = devicePublicKeyB64;

@@ -4,7 +4,7 @@
  * login → typing → streaming progress draft → real-LLM answer, HITL approval
  * cards, history hydration, and honest status/terminal-error surfacing.
  *
- * The full connect handshake is production: generate device keys in-page, mint
+ * The full connect registration is production: generate device keys in-page, mint
  * browser NATS creds + a PoP bootstrap JWT from the SaaS, then drive the wrapper
  * with BOTH natsCredentials (NATS-layer NKEY auth) and registration (PoP register
  * hop over NATS request/reply). The Ed25519 PoP private key is non-extractable
@@ -455,7 +455,7 @@ export async function createWidget(
         // The register subject is derived from tenant/accountId/peerId; the
         // client drives challenge→register over NATS request/reply (no gateway URL).
         devicePrivateKey: ed25519.privateKey,
-        // Phase 6: register-delivered conversation key (no handshake).
+        // Phase 6: register-delivered conversation key (no registration).
         deviceX25519PrivateKey: x25519.privateKey,
         // F2: pin the SaaS-attested agent key for K authentication.
         pinnedAgentPublicKey: boot.data.agentPublicKey,

@@ -188,6 +188,23 @@ function assertNoRemovedConfig(account: WebchannelAccountConfig): void {
       "webchannel: removed config auth.ticketParam is no longer supported because Gateway direct WebSocket authentication was deleted; reconfigure with `openclaw channels add --channel webchannel`.",
     );
   }
+  const migrationError = (setting: string): never => {
+    throw new Error(
+      `webchannel: removed config ${setting} is no longer supported; authenticated enrollment is required. Reconfigure with \`openclaw channels add --channel webchannel\`.`,
+    );
+  };
+  if (auth && typeof auth === "object" && (auth as { strategy?: unknown }).strategy === "anonymous") {
+    migrationError('auth.strategy="anonymous"');
+  }
+  const nats = account.nats;
+  if (nats && typeof nats === "object") {
+    if (Object.prototype.hasOwnProperty.call(nats, "devOpen")) migrationError("nats.devOpen");
+    if ((nats as { admission?: unknown }).admission === "auto") migrationError('nats.admission="auto"');
+    const credentials = (nats as { credentials?: unknown }).credentials;
+    if (credentials && typeof credentials === "object" && (credentials as { mode?: unknown }).mode === "open") {
+      migrationError('nats.credentials.mode="open"');
+    }
+  }
 }
 
 /**

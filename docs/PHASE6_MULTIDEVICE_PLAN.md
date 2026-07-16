@@ -44,7 +44,7 @@ admission (MUST include `session.dmScope: "per-channel-peer"`), K rotation.
    for state-level (id-accurate) assertions in verify drivers.
 
 **Decision summary (details in §8/§11):** option B register-only; auto-admission keeps
-legacy handshake untouched (F5=a); wrapped-K delivered in the register HTTP response
+legacy registration untouched (F5=a); wrapped-K delivered in the register HTTP response
 (§7=①); stateless register (unconditional re-wrap + bounded snapshot, client
 message-id idempotency); K persisted plaintext+perms at
 `~/.openclaw-webchannel/<account>/`; K rotation + live-gateway admission migration
@@ -64,11 +64,11 @@ Ground truth of why:
 |---|---|
 | `saas-server.ts` (mint) | `peerId = user.uuid` — **per-USER**, server-derived, body peerId ignored. |
 | `nats-channel.ts:150` | `peerSessionKeys = Map<peerId, Uint8Array>` — one key slot per peerId. |
-| `nats-channel.ts:536` | `peerSessionKeys.set(peerId, sessionKey)` runs on **every handshake**. |
-| `nats-channel.ts:417/421/425` | subjects are `webchannel.{tenant}.{accountId}.{peerId}.{in\|out\|handshake}` — shared across a user's devices. |
+| `nats-channel.ts:536` | `peerSessionKeys.set(peerId, sessionKey)` runs on **every registration**. |
+| `nats-channel.ts:417/421/425` | subjects are `webchannel.{tenant}.{accountId}.{peerId}.{in\|out\|registration}` — shared across a user's devices. |
 
-So two devices of one user carry the **same peerId**, handshake into the **same key
-slot**, and the second handshake **overwrites** the first device's session key.
+So two devices of one user carry the **same peerId**, registration into the **same key
+slot**, and the second registration **overwrites** the first device's session key.
 Result — not "unsynced", but **one device dies**:
 
 - inbound → the loser can't decrypt (fail-closed) → messages silently dropped;
@@ -115,8 +115,8 @@ change the map's key.**
 | | Today (broken) | Phase 6 |
 |---|---|---|
 | Map key | `peerId` | **`peerId` (unchanged)** — preserves binding |
-| Map value | derived per-device handshake, **overwritten each time** | **agent-owned key, generated ONCE per peerId, stable** |
-| How a device learns the key | negotiates it via `.handshake` X25519 | **receives it wrapped to its own pubkey** |
+| Map value | derived per-device registration, **overwritten each time** | **agent-owned key, generated ONCE per peerId, stable** |
+| How a device learns the key | negotiates it via `handshakeSubject` X25519 | **receives it wrapped to its own pubkey** |
 | 2nd device | overwrites → kills device 1 | value untouched → just gets its own wrapped copy |
 
 The `if (!peerSessionKeys.has(peerId))` guard already present at `nats-channel.ts:519`
@@ -156,27 +156,27 @@ is exactly the "generate once, never re-derive" hook.
 - `decryptBacklog(...)` — a late-joining device decrypts paginated stored history with K
   (`late-join-decryptor.ts:291`).
 
-**The device public key is already on hand without a handshake.** SaaS mints the
+**The device public key is already on hand without a registration.** SaaS mints the
 device's X25519 pubkey into the bootstrap JWT as `cnf.jwk`
 (`bootstrap-claims.ts:127` — `cnf: { jwk: { kty:"OKP", crv:"X25519", x } }`), and the
 register-hop verifies that JWT. So at register time the agent **already has** the
-device pubkey to wrap K to — **no `.handshake` round-trip needed**.
+device pubkey to wrap K to — **no `handshakeSubject` round-trip needed**.
 
 ---
 
-## 5. Consequence — the handshake dies, and with it a whole class of races
+## 5. Consequence — the registration dies, and with it a whole class of races
 
-Because the device pubkey arrives via bootstrap `cnf` (not via `.handshake`), the
-per-device X25519 handshake is **no longer a key-negotiation step**. Dropping it
-**removes the ROOT CAUSE** of the handshake race we fixed in `1c81f0d`
-(client republish 500ms×5): there is no one-shot key_exchange publish that can be
+Because the device pubkey arrives via bootstrap `cnf` (not via `handshakeSubject`), the
+per-device authenticated registration is **no longer a key-negotiation step**. Dropping it
+**removes the ROOT CAUSE** of the registration race we fixed in `1c81f0d`
+(client republish 500ms×5): there is no one-shot key-exchange frame publish that can be
 lost on a real relay, because the key is delivered by the agent, not negotiated by
 the client.
 
-Client today: `keyPair` + `sessionKey` set from the handshake
+Client today: `keyPair` + `sessionKey` set from the registration
 (`nats-client.ts:679-680`), fail-closed buffering until `sessionKey` exists. Phase 6:
-`sessionKey` = unwrapped K; the handshake path (`handshakeSubject`, retry timer,
-`handshakeSub`) is removed.
+`sessionKey` = unwrapped K; the registration path (`registrationSubject`, retry timer,
+`registrationSub`) is removed.
 
 ---
 
@@ -184,9 +184,9 @@ Client today: `keyPair` + `sessionKey` set from the handshake
 
 | # | Where | Change |
 |---|---|---|
-| W1 | agent `nats-channel.ts` | Generate + **persist** K once per peerId (random 32B); seal live replies **and** stored history with K. Delete per-handshake key derivation (the `set()` at :536 becomes "generate-if-absent"). |
+| W1 | agent `nats-channel.ts` | Generate + **persist** K once per peerId (random 32B); seal live replies **and** stored history with K. Delete per-registration key derivation (the `set()` at :536 becomes "generate-if-absent"). |
 | W2 | agent register route | On device register (peerId + `cnf.jwk` in hand): `wrapConversationKey(K, identity.devicePublicKey)` **in the register handler**, return the `WrappedConversationKey` **in the register HTTP response** (§7 — decided). Never via later pin-store lookup (§7.5 F2). |
-| W3 | client `nats-client.ts` | Take the wrapped key from the register response → `unwrapConversationKey(..., devicePriv)` → use K to seal `.in` and open `.out` + backlog. Remove the `.handshake` negotiation + retry machinery (subject to F5's auto-mode decision). |
+| W3 | client `nats-client.ts` | Take the wrapped key from the register response → `unwrapConversationKey(..., devicePriv)` → use K to seal `.in` and open `.out` + backlog. Remove the `handshakeSubject` negotiation + retry machinery (subject to F5's auto-mode decision). |
 | W4 | agent | Persist K so a gateway restart keeps history decryptable (K must survive process death — history at-rest is sealed with it). |
 | W5 | client entry → crypto client | Plumb the **cnf device private key** from `browser-jwt-entry.ts` into `NatsCryptoClient` (constructor option) — today's per-epoch throwaway keypair (`nats-client.ts:833`) is NOT the cnf key (§7.5 F4). |
 | W6 | client hydration | Make history hydration **idempotent by message id** — under shared K, another device's register-triggered snapshot on the shared `.out` is decryptable by all devices (§7.5 F7). |
@@ -228,21 +228,21 @@ to eliminate. No offsetting benefit once ①'s scope fear is disproven.
   collision exists at the pin layer. Consequence: wrap must happen **per register
   request from the JWT in hand**, never by later store lookup. The pin store
   itself needs rework-or-retirement in W-items (see F3).
-- **F3 (major)** — `handshake-verifier.ts` (pin check during handshake = MITM
+- **F3 (major)** — `handshake-verifier.ts` (pin check during registration = MITM
   prevention) is **UNWIRED** — zero references from `nats-channel.ts` /
-  `index-nats.ts`. Today's handshake is unauthenticated even on the registered
+  `index-nats.ts`. Today's registration is unauthenticated even on the registered
   path. **This is review finding C2 (relay MITM, accepted-risk).** Phase 6 B
   resolves C2 structurally: K is wrapped to the JWT-attested cnf key, so the
   relay can never inject its own key. C2 closure is part of Phase 6's value.
-- **F4 (new wiring item)** — the client's handshake keypair is **NOT the cnf
+- **F4 (new wiring item)** — the client's registration keypair is **NOT the cnf
   keypair**: `browser-jwt-entry.ts:54` makes the device key for bootstrap, while
   `nats-client.ts:833` makes a **separate fresh keypair per connection epoch**.
   B requires plumbing the cnf device **private** key from the entry into
   `NatsCryptoClient` (constructor option) for unwrap. → new W5.
-- **F5 (open — interview question)** — `admission:"auto"` (wildcard) accounts
+- **F5 (open — interview question)** — `admission:register-hop` (wildcard) accounts
   have **no register hop** → no JWT, no cnf → wrap impossible. Removing the
-  handshake globally leaves auto mode with NO key path — and **the live gateway
-  runs auto mode today**. Options: (a) keep the handshake ONLY for auto accounts
+  registration globally leaves auto mode with NO key path — and **the live gateway
+  runs auto mode today**. Options: (a) keep the registration ONLY for auto accounts
   (its posture is already "any tenant-creds holder"), (b) drop E2E on auto,
   (c) migrate the live gateway to register admission. → §8, must be decided.
 - **F6 (non-blocker)** — the channel has no envelope replay/nonce guard (only
@@ -260,13 +260,13 @@ to eliminate. No offsetting benefit once ①'s scope fear is disproven.
 ## 8. Other decisions — ALL CLOSED (interview `interview_20260703_043054`)
 
 - **F5 — auto-admission fate** → **DECIDED (owner): (a) auto keeps the legacy
-  per-device handshake, untouched.** Option B applies ONLY to register-admission
+  per-device registration, untouched.** Option B applies ONLY to register-admission
   accounts. Rationale: the product/SaaS path is entirely register admission; auto's
-  E2E is already opportunistic-only (unauthenticated handshake, F3/C2) so nothing
+  E2E is already opportunistic-only (unauthenticated registration, F3/C2) so nothing
   new is lost; plaintext fallback rejected as a security regression. **Live-gateway
   migration to register admission = separate follow-up, NOT Phase 6.** Consequence:
-  the handshake code path is NOT deleted — it becomes auto-mode-only; the register
-  path must never emit/answer handshake frames (guarded by the §12 divergence test).
+  the registration code path is NOT deleted — it becomes auto-mode-only; the register
+  path must never emit/answer registration frames (guarded by the §12 divergence test).
 - **W4 — K persistence** → **DECIDED (engineering, precedent-based):** K lives at
   `~/.openclaw-webchannel/<account>/` (per-account secret dir), per-peerId, plaintext
   JSON + owner-only file perms — the SAME posture as `credentials.json` (which holds
@@ -312,7 +312,7 @@ Suggested order (each step keeps the suite green; W-items from §6):
 1. **W1+W4 — agent K store** (`nats-channel.ts` + new `conversation-key-store.ts`):
    generate-once-per-peerId, persist to `~/.openclaw-webchannel/<account>/`
    (see §8 W4). On the REGISTER path, `peerSessionKeys[peerId]` is loaded/created
-   from this store; the handshake `set()` at `nats-channel.ts:536` remains ONLY for
+   from this store; the registration `set()` at `nats-channel.ts:536` remains ONLY for
    auto-admission accounts. Unit-testable without any client change.
 2. **W2 — wrap in register route** (`index-nats.ts:387-454` region + `auth.ts`):
    after successful verify, `wrapConversationKey(K, identity.devicePublicKey)`
@@ -320,7 +320,7 @@ Suggested order (each step keeps the suite green; W-items from §6):
    `{ ok: true, wrappedConversationKey: WrappedConversationKey }` (type from
    `late-join-decryptor.ts:102`: `{ephemeralPublicKey, nonce, ciphertext, tag}`,
    all b64url). Trigger the history snapshot from register (registered path no
-   longer has a handshake-complete moment) — reuse the `81d61c4` detached-scope
+   longer has a register-complete moment) — reuse the `81d61c4` detached-scope
    read; drop the `onHandshakeComplete` snapshot trigger on the register path.
 3. **W5 — client keypair plumbing** (`browser-jwt-entry.ts` → `nats-client.ts`):
    pass the cnf device X25519 PRIVATE key into `NatsCryptoClient` (new constructor
@@ -328,7 +328,7 @@ Suggested order (each step keeps the suite green; W-items from §6):
    the register path.
 4. **W3 — client unwrap** (`nats-client.ts` + browser unwrap impl): take
    `wrappedConversationKey` from the register response → unwrap with device privkey
-   → `this.sessionKey = K`. Remove handshake publish/retry/subscription machinery
+   → `this.sessionKey = K`. Remove registration publish/retry/subscription machinery
    on the register path (keep for auto/legacy config). NOTE: client crypto is
    browser-side — port `unwrapConversationKey` (ECDH + HKDF-SHA256
    `"webchannel-key-wrap-v1"` + ChaCha20-Poly1305 open) into the client package's
@@ -345,18 +345,18 @@ Suggested order (each step keeps the suite green; W-items from §6):
 
 | Q | Decision | Decided by |
 |---|---|---|
-| F5 auto-mode | (a) keep legacy handshake on auto; B register-only; live migration = follow-up | Owner |
+| F5 auto-mode | (a) keep legacy registration on auto; B register-only; live migration = follow-up | Owner |
 | W4 K persistence | `~/.openclaw-webchannel/<account>/`, per-peerId, plaintext+perms (= credentials.json posture); at-rest wrap deferred | Engineering (precedent) |
 | Reconnect | Stateless register: always re-wrap + full bounded snapshot; no client "have-K" signal; self-heal via re-register | Engineering |
 | 4a acceptance | Full set + negative controls, ONE Playwright scene (§12) | Recommended, confirmed at Restate |
 | 4b divergence test | In scope, unit/integration level (§12) | Recommended, confirmed at Restate |
 
-One-line goal (Restate-approved): *register-admission accounts drop handshake key
+One-line goal (Restate-approved): *register-admission accounts drop registration key
 negotiation; the agent generates+persists a per-peerId key K and wrap-delivers it to
 each device's JWT-cnf X25519 key in the register HTTP response (stateless
 re-wrap+snapshot, client message-id-idempotent hydration) so one user's multiple
 devices decrypt one conversation concurrently; auto-admission keeps the legacy
-handshake; K rotation & live-gateway migration out of scope.*
+registration; K rotation & live-gateway migration out of scope.*
 
 ## 12. Acceptance criteria (final)
 
@@ -378,7 +378,7 @@ Negative controls:
 re-registers, OLD history still decrypts (same K re-wrapped).
 
 **C. Unit divergence test (F5 guard):** register account → wrapped-K in register
-response AND no handshake frame emitted; auto account → handshake fires AND no wrap
+response AND no registration frame emitted; auto account → registration fires AND no wrap
 attempted.
 
 **D. Existing suites stay green** (168 client / 748 plugin / 115 saas at time of

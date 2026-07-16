@@ -9,7 +9,7 @@ constraints:
 - 단일 register 라우트가 JWT aud(=agentId=account 키)로 어느 account 채널에 registerPeer 할지 내부 디스패치(account별 path 신설 금지)
 - creds는 account별 ~/.openclaw-webchannel/<account>/credentials.json 에 영속
 - acquisition-identity env(WEBCHANNEL_TENANT/_AGENT_ID/_SAAS_BASE_URL)는 deprecated; account config 부재 시에만 'default' account 합성에 사용, config 존재 시 무시(+1회성 deprecation 경고, 크래시 금지)
-- connection/static-creds env(WEBCHANNEL_NATS_URL/_NATS_USER_JWT/_USER_SEED/_CREDS/_DEV_OPEN)는 런타임 연결 override 의미 유지
+- connection/static-creds env(WEBCHANNEL_NATS_URL/_NATS_USER_JWT/_USER_SEED/_CREDS/_LEGACY_UNAUTHENTICATED)는 런타임 연결 override 의미 유지
 - 'default'는 예약어 아닌 일반 account id(명시 --account default 허용)
 - legacy ~/.openclaw-webchannel/credentials.json 존재 시 'default' account creds로 읽는 하위호환 fallback
 - channels add는 전부-플래그 비대화형 모드 필수(TTY 의존 금지); afterAccountConfigWritten에서 폴링

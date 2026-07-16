@@ -14,7 +14,7 @@
 > `WebChannelNATSClient` state reducer, so all P0 client render is done (marked ✅). Since the 07-10
 > re-verify develop merged: **P0-2 depth cap (#24)**, the **/stop control lane + typing gate + slash
 > discovery + debounce/coalesce + ingress dedupe (#25/#26/#28/#29/#30)**, **markdown (#27, P1)**,
-> **client replay+ack (#31)**, and the **protocol-version handshake (#33)**. Corrected below for:
+> **client replay+ack (#31)**, and the **protocol-version registration (#33)**. Corrected below for:
 > partial-mode answer-text streaming (#14, P0-5 — now enabled in the demo), the `approval_snapshot`
 > rehydration frame (#15/#19, P0-4/§0 wire), the ordered history merge (#16, P0-1/§0), the NATS
 > register hop replacing `registerHttpRoute` (P0-3), and the two new inbound frames (`commands`,
@@ -41,7 +41,7 @@ retired.
 
 | Layer | File | Handles |
 |---|---|---|
-| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS, E2E handshake, `onMessage`/`onError`/`onState`, `loadHistory` `:768`, `sendApprovalDecision`, terminal-auth classify `:551-556` |
+| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS, E2E registration, `onMessage`/`onError`/`onState`, `loadHistory` `:768`, `sendApprovalDecision`, terminal-auth classify `:551-556` |
 | **State reducer wrapper** | `packages/client/src/nats-client-wrapper.ts` (`WebChannelNATSClient`) | reduces full protocol → `WebChannelState`; `getState` `:110`, `subscribe` `:115`, `send` `:131`, `decide` `:145`, `loadHistory` `:155` |
 | Demo widget | `demo/web/src/widget.ts` | `subscribe(render)` → bubbles, typing, approval cards, "Load older", terminal re-auth |
 | **Retired** | `packages/client/src/browser-demo-entry.ts` (`runDemo`) | old drop-all path; only a SaaS smoke test + `e2e/local/ci-smoke.html` still reference it |
@@ -146,7 +146,7 @@ it; the widget renders it.
 
 **Where it stands today.**
 - Server sends the snapshot **from the register success path** (Phase 6 stateless-register change — it
-  used to fire on first liveness / handshake-complete, that wiring is now gone; the register hop is
+  used to fire on first liveness / register-complete, that wiring is now gone; the register hop is
   now NATS request/reply via `setRegisterRequestHandler`, no HTTP). Every register (first join,
   reload, reconnect) gets the bounded snapshot: `historyRecent(api, route.sessionKey,
   historyConfig.limit, …)` → `channel.sendHistory(peerId, messages)`, run as a **detached** read
@@ -180,9 +180,9 @@ order; no duplicate bubbles on a mid-session reconnect.
 
 **Watch out.** Both snapshots (history + approval) now fire **inside the register path**, so they
 require the register hop. `demo/run.sh` uses register-hop admission — but **not in the config
-heredoc**: the `channels add` setup adapter may write `admission:auto`, so `run.sh:321-326` re-asserts
+heredoc**: the `channels add` setup adapter may write `admission:register-hop, so `run.sh:321-326` re-asserts
 `accounts.<acct>.nats.admission="register-hop"` programmatically after enrollment, and the trigger
-fires because of that re-assertion. If you switch to `admission:"auto"` (no register hop), neither
+fires because of that re-assertion. If you switch to `admission:register-hop` (no register hop), neither
 snapshot sends — re-wire them onto whatever path replaces register. The client must have its `.out`
 subscription active *before* it calls register (`WebChannelNatsClient.onConnected` ordering) or the
 snapshot is lost.
@@ -298,11 +298,11 @@ handler and returns output as an `agent_message`; webchannel declares no `capabi
   (`openclaw/plugin-sdk/native-command-registry`) — **config-filtered, alias-free, name-sorted, NOT
   hard-coded**, so a command gated off for the deployment is absent and new core commands appear
   without touching this plugin. The provider is **memoized per account**
-  (`createCommandCatalogProvider`) — the handler runs inline for any handshaken peer, so per-request
+  (`createCommandCatalogProvider`) — the handler runs inline for any registered peer, so per-request
   rebuilds were an event-loop DoS surface; memoizing removes it without a rate limiter. Entry shape:
   `{name (no leading slash), description, args?:[{name,description?,required?,choices?}]}`.
-  > **Exposure decision.** The catalog is served to **any handshaken peer**, including wildcard /
-  > `admission:"auto"` peers — deliberately, unlike the history/approval snapshots (which ride the
+  > **Exposure decision.** The catalog is served to **any registered peer**, including wildcard /
+  > `admission:register-hop` peers — deliberately, unlike the history/approval snapshots (which ride the
   > register-hop admission path). The command set is low-sensitivity (it is the same list core would
   > run for a typed command), so leaking it to an auto peer carries none of the approval-power risk
   > that gates the snapshots.

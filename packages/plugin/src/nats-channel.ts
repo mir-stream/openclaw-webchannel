@@ -18,36 +18,17 @@
 
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
 import type { ApprovalDecision, ApprovalRequestPayload, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
-import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
 import { wrapConversationKey } from "./late-join-decryptor.js";
 import type { WrappedConversationKey } from "./late-join-decryptor.js";
-import {
-  deriveConversationKey,
-  keyExchangeFrame,
-  parseKeyExchange,
-  sealEnvelope,
-  openEnvelope,
-} from "./e2e-session.js";
+import { sealEnvelope, openEnvelope } from "./e2e-session.js";
 import { isValidSubjectToken } from "./subject-token.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-/**
- * Plain byte-equality for two locally-derived session keys. NOT constant-time —
- * this only decides whether a handshake produced a NEW session (fire the initial
- * snapshot) or a duplicate (skip it); both operands are values the agent computed
- * itself, so there is no secret to leak by timing.
- */
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
 
 export type { HistoryMessage, InboundWsMessage, OutboundWsMessage } from "./channel-contract.js";
 
@@ -59,27 +40,20 @@ export type { HistoryMessage, InboundWsMessage, OutboundWsMessage } from "./chan
  * Encrypt-by-construction options for `NatsChannel`.
  *
  * When supplied, the channel runs in E2E-encrypted mode (the production NATS
- * entry's required mode): every peer must complete an X25519 handshake before
- * any message flows, all outbound is ChaCha20-Poly1305-sealed, all inbound is
+ * entry's required mode): every peer must complete authenticated registration
+ * before any message flows, all outbound is ChaCha20-Poly1305-sealed, all inbound is
  * decrypted, and the channel is FAIL-CLOSED — it never publishes or processes
  * plaintext on the relay. Omit to keep the legacy plaintext-JSON behaviour.
  */
 export type NatsChannelCryptoOptions = {
   /**
-   * Optional pre-generated agent X25519 key pair. One is generated per channel
-   * instance when omitted (the common case).
-   */
-  keyPair?: KeyPair;
-  /**
-   * Phase 6 (multi-device): agent-owned per-peerId conversation-key store.
+   * Agent-owned per-peerId conversation-key store.
    *
-   * When supplied, the channel runs the REGISTER-admission key model:
-   * `registerPeer` loads/creates the peer's stable key K from this store (so a
-   * second device of the same user never overwrites the first one's key), and
-   * the per-device X25519 `.handshake` negotiation is DISABLED — devices
-   * receive K wrapped to their JWT-cnf pubkey via the register HTTP response
-   * (`wrapConversationKeyForDevice`) instead. Omit for auto-admission accounts,
-   * which keep the legacy handshake (F5 decision — see PHASE6_MULTIDEVICE_PLAN §8).
+   * The channel runs the REGISTER-admission key model: `registerPeer`
+   * loads/creates the peer's stable key K from this store (so a second device of
+   * the same user never overwrites the first one's key), and devices receive K
+   * wrapped to their JWT-cnf pubkey via the register response — there is no
+   * per-device handshake (the unauthenticated X25519 negotiation was removed).
    */
   keyStore?: ConversationKeyStore;
   /**
@@ -89,10 +63,7 @@ export type NatsChannelCryptoOptions = {
    * ONLY by `wrapConversationKeyForDevice` to wrap K static-static so the browser
    * can authenticate that K came from the genuine agent (closes the register-hop
    * MITM). REQUIRED whenever `keyStore` is set — the channel refuses to construct
-   * a keyStore channel without it (fail-closed). Distinct from the boot-ephemeral
-   * `keyPair` used on the auto/handshake path, which stays untouched (wiring a
-   * static key there buys no auth — the browser doesn't pin it — while trading
-   * away per-boot freshness).
+   * a keyStore channel without it (fail-closed).
    */
   identityKeyPair?: KeyPair;
 };
@@ -210,11 +181,10 @@ export class NatsChannel implements WebChannelPeerChannel {
 
   /** When true, the channel is E2E-encrypted and fail-closed (no plaintext). */
   private readonly encryptionRequired: boolean;
-  /** Agent X25519 key pair used to answer per-peer handshakes (null = plaintext mode). */
-  private readonly agentKeyPair: KeyPair | null;
   /**
-   * Phase 6: agent-owned conversation-key store (register-admission accounts
-   * only; null = legacy handshake key model). See NatsChannelCryptoOptions.
+   * Phase 6: agent-owned conversation-key store. Non-null on every encrypted
+   * channel (the constructor requires it when `encryptionRequired`); null only
+   * in the non-encrypted test construction. See NatsChannelCryptoOptions.
    */
   private readonly keyStore: ConversationKeyStore | null;
   /**
@@ -224,15 +194,12 @@ export class NatsChannel implements WebChannelPeerChannel {
   private readonly identityKeyPair: KeyPair | null;
   /** Per-peer established conversation keys (peerId -> 32-byte session key). */
   private readonly peerSessionKeys = new Map<string, Uint8Array>();
-  /** Per-peer handshake subscriptions (peerId -> sid). */
-  private readonly handshakeSubscriptions = new Map<string, number>();
 
   // Message handlers
   private onMessage?: (peerId: string, message: InboundWsMessage) => void;
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
   private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
   private onLoadCommands?: (peerId: string) => void;
-  private onHandshakeComplete?: (peerId: string) => void;
   /**
    * Register-hop admission over NATS (replaces the deleted HTTP register routes).
    * Fired for a plaintext JSON request on `…{peerId}.register`; the handler runs
@@ -257,7 +224,6 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.accountId = accountId;
     this.tenant = tenant;
     this.encryptionRequired = crypto != null;
-    this.agentKeyPair = crypto ? (crypto.keyPair ?? generateKeyPair()) : null;
     this.keyStore = crypto?.keyStore ?? null;
     // F2 fail-closed: a keyStore (register-hop) channel MUST have the attested
     // identity key to wrap K authentically. The entry (index-nats) already skips
@@ -265,9 +231,9 @@ export class NatsChannel implements WebChannelPeerChannel {
     // last-line assertion so the channel can never be constructed to wrap K under
     // an unattested key.
     this.identityKeyPair = crypto?.identityKeyPair ?? null;
-    if (this.keyStore && !this.identityKeyPair) {
+    if (this.encryptionRequired && (!this.keyStore || !this.identityKeyPair)) {
       throw new Error(
-        "webchannel: keyStore (register-hop) channel requires crypto.identityKeyPair " +
+        "webchannel: encrypted channel requires crypto.keyStore and crypto.identityKeyPair " +
           "(the SaaS-attested agent identity key) to wrap the conversation key — refusing " +
           "to serve without it (fail-closed; the browser could not authenticate K otherwise).",
       );
@@ -296,10 +262,10 @@ export class NatsChannel implements WebChannelPeerChannel {
     // expected) self-heals on re-register. Crucially this SETS but never
     // re-derives: a second device registering the same peerId leaves K
     // untouched, which is the whole multi-device fix.
-    if (this.encryptionRequired && this.keyStore) {
-      this.peerSessionKeys.set(peerId, this.keyStore.getOrCreate(peerId));
-    }
     if (this.peerSubscriptions.has(peerId)) {
+      if (this.encryptionRequired && this.keyStore) {
+        this.peerSessionKeys.set(peerId, this.keyStore.getOrCreate(peerId));
+      }
       console.warn(`[nats-channel] Peer ${peerId} already registered`);
       return;
     }
@@ -324,38 +290,17 @@ export class NatsChannel implements WebChannelPeerChannel {
     const inboundSubject = this.inboundSubject(peerId);
     const sid = this.transport.subscribe(inboundSubject);
     this.peerSubscriptions.set(peerId, sid);
-
-    // Legacy crypto mode (no keyStore) also subscribes the peer's handshake
-    // subject so the X25519 key exchange can complete before any message is
-    // sealed/opened. In keyStore mode there is NO handshake: K was established
-    // from the store above and is wrap-delivered in the register HTTP response,
-    // so the register path must never answer handshake frames (F5 divergence).
-    if (this.encryptionRequired && !this.keyStore) {
-      const hsSubject = this.handshakeSubject(peerId);
-      const hsSid = this.transport.subscribe(hsSubject);
-      this.handshakeSubscriptions.set(peerId, hsSid);
+    if (this.encryptionRequired && this.keyStore) {
+      try {
+        this.peerSessionKeys.set(peerId, this.keyStore.getOrCreate(peerId));
+      } catch (err) {
+        this.transport.unsubscribe(sid);
+        this.peerSubscriptions.delete(peerId);
+        throw err;
+      }
     }
+
     console.log(`[nats-channel] Registered peer ${peerId}, subscribed to ${inboundSubject}`);
-  }
-
-  /**
-   * Subscribe to the tenant/agent WILDCARD subjects so any peer is handled
-   * without an explicit `registerPeer` (peers auto-register on their handshake).
-   *
-   * Used by the dev/open-NATS path where there is no HTTP registration step.
-   * Per-peer routing still works because `handleNatsMessage` derives the peerId
-   * from the subject, and the inbound allowlist gate still runs downstream.
-   */
-  subscribeWildcard(): void {
-    const inWild = `webchannel.${this.tenant}.${this.accountId}.*.in`;
-    this.transport.subscribe(inWild);
-    // keyStore mode never listens for handshakes (F5: handshake is the AUTO
-    // path's key model; a keyStore channel delivers K via the register hop).
-    if (this.encryptionRequired && !this.keyStore) {
-      const hsWild = `webchannel.${this.tenant}.${this.accountId}.*.handshake`;
-      this.transport.subscribe(hsWild);
-    }
-    console.log(`[nats-channel] Subscribed to wildcard ${inWild}`);
   }
 
   /**
@@ -399,13 +344,8 @@ export class NatsChannel implements WebChannelPeerChannel {
       this.peerSubscriptions.delete(peerId);
       console.log(`[nats-channel] Unregistered peer ${peerId}`);
     }
-    const hsSid = this.handshakeSubscriptions.get(peerId);
-    if (hsSid) {
-      this.transport.unsubscribe(hsSid);
-      this.handshakeSubscriptions.delete(peerId);
-    }
-    // Drop the in-memory session key: a reconnecting peer must re-handshake
-    // (legacy mode) or re-register, which reloads the STABLE key K from the
+    // Drop the in-memory session key: a reconnecting peer must re-register,
+    // which reloads the stable key K from the
     // keyStore (Phase 6 mode — the persisted K itself is never dropped here).
     this.peerSessionKeys.delete(peerId);
     // F4: drop the peer's replay window with it (bounded memory; a genuine
@@ -608,20 +548,6 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
-   * Set the handshake-complete handler.
-   *
-   * Fires once the per-peer E2E session key is established (see
-   * `handleHandshake`) — the earliest point at which `sendHistory` can actually
-   * encrypt a frame to this peer. The initial history snapshot MUST be sent from
-   * here, not from the register hop: registration completes before the crypto
-   * handshake, so a snapshot sent at register time is fail-closed dropped ("no
-   * session key yet").
-   */
-  setHandshakeCompleteHandler(handler: (peerId: string) => void): void {
-    this.onHandshakeComplete = handler;
-  }
-
-  /**
    * Phase 6 (keyStore mode): wrap the peer's conversation key K to a specific
    * device's X25519 public key for delivery in the register HTTP response.
    *
@@ -670,10 +596,6 @@ export class NatsChannel implements WebChannelPeerChannel {
     return `webchannel.${this.tenant}.${this.accountId}.${peerId}.out`;
   }
 
-  private handshakeSubject(peerId: string): string {
-    return `webchannel.${this.tenant}.${this.accountId}.${peerId}.handshake`;
-  }
-
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
     if (!this.transport.connected) {
       console.warn("[nats-channel] Transport not connected, cannot send");
@@ -684,7 +606,7 @@ export class NatsChannel implements WebChannelPeerChannel {
 
     try {
       if (this.encryptionRequired) {
-        // Fail-closed: refuse to publish until the peer's handshake established a
+        // Fail-closed: refuse to publish until registration established a
         // session key. We NEVER fall back to plaintext on the relay.
         const key = this.peerSessionKeys.get(peerId);
         if (!key) {
@@ -711,7 +633,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   private handleNatsMessage(msg: NatsMessage): void {
-    // Subject format: webchannel.{tenant}.{accountId}.{peerId}.{in|handshake}
+    // Subject format: webchannel.{tenant}.{accountId}.{peerId}.{in|register}
     const parts = msg.subject.split(".");
     if (parts.length < 5) {
       console.warn(`[nats-channel] Invalid subject format: ${msg.subject}`);
@@ -731,10 +653,6 @@ export class NatsChannel implements WebChannelPeerChannel {
     }
 
     if (this.encryptionRequired) {
-      if (suffix === "handshake") {
-        this.handleHandshake(msg, peerId);
-        return;
-      }
       this.handleEncryptedInbound(msg, peerId);
       return;
     }
@@ -768,7 +686,7 @@ export class NatsChannel implements WebChannelPeerChannel {
    * in-namespace precisely so browser creds need no `_INBOX.>` grant — the
    * agent's own creds may not even cover `_INBOX.*`). Everything else is
    * dropped with a warn: another peer's subtree, the requester's own
-   * `.in`/`.handshake`/`.register` (a self-bounce through the agent's handlers),
+   * `.in`/`.register` (a self-bounce through the agent's handlers),
    * `_INBOX.*`, foreign namespaces. `peerId` here is the subject-routing
    * segment, NOT the JWT identity (that is verified later, in
    * `handleRegisterRequest`); the confinement is nonetheless sound because a
@@ -807,103 +725,9 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   /**
-   * Crypto mode: answer a peer's X25519 handshake.
-   *
-   * Derives the conversation key from the browser's public key, stores it, and
-   * publishes the agent's public key back on the same handshake subject.
-   */
-  private handleHandshake(msg: NatsMessage, peerId: string): void {
-    if (!this.agentKeyPair) return;
-    // Phase 6 defense-in-depth: a keyStore-mode channel never subscribes a
-    // handshake subject, so no frame should arrive here — but if one does
-    // (misuse/misconfig), REFUSE it. Answering would let a relay-level writer
-    // overwrite the agent-owned stable key K with an attacker-derived one.
-    if (this.keyStore) {
-      console.warn(
-        `[nats-channel] Dropping handshake from ${peerId}: channel uses the ` +
-          `register-delivered conversation key (keyStore mode, no handshake)`,
-      );
-      return;
-    }
-    const browserPubKey = parseKeyExchange(msg.payload);
-    if (!browserPubKey) {
-      console.warn(`[nats-channel] Ignoring malformed handshake from ${peerId}`);
-      return;
-    }
-    // Defense-in-depth: `parseKeyExchange` already rejects non-32-byte keys, but
-    // any future crypto path here (a bad key that still decodes to 32 bytes, a
-    // low-order point, etc.) must never escape this handler as an uncaught throw
-    // — that would kill the read pump and the whole gateway process. Contain it.
-    let sessionKey: Uint8Array;
-    try {
-      sessionKey = deriveConversationKey(this.agentKeyPair.privateKey, browserPubKey);
-    } catch (err) {
-      console.warn(
-        `[nats-channel] Dropping handshake from ${peerId}: key derivation failed: ${String(err)}`,
-      );
-      return;
-    }
-    // Capture the prior key BEFORE we overwrite it, to decide whether this is a
-    // NEW session (fresh key) or a duplicate handshake (client republished the
-    // same key_exchange — e.g. the browser's bounded handshake retry when the
-    // first frame was dropped, or a relay RTT > the retry interval). Only a new
-    // session should trigger the initial history snapshot below.
-    const prevKey = this.peerSessionKeys.get(peerId);
-    // S2: this is the ONLY writer of peerSessionKeys and — on the wildcard /
-    // `admission:"auto"` path (the live gateway's mode), where peers never call
-    // registerPeer — the only per-peer growth vector at all. So the session-key
-    // ceiling must be enforced HERE, not just in registerPeer (which the
-    // wildcard path bypasses). Evict the oldest peer when a NEW peerId would
-    // exceed the cap; a returning peer simply re-handshakes.
-    if (!this.peerSessionKeys.has(peerId)) {
-      while (this.peerSessionKeys.size >= this.maxPeers) {
-        const oldest = this.peerSessionKeys.keys().next().value as string | undefined;
-        if (oldest === undefined) break;
-        console.warn(
-          `[nats-channel] session-key cap ${this.maxPeers} reached; evicting oldest peer ${oldest}`,
-        );
-        // Registered-mode peer → full teardown (also unsubscribes); wildcard-mode
-        // peer has no subscription, so just drop its key.
-        if (this.peerSubscriptions.has(oldest)) {
-          this.unregisterPeer(oldest);
-        } else {
-          this.peerSessionKeys.delete(oldest);
-          // F4: drop the evicted peer's replay window too (unregisterPeer
-          // already does this for the registered-mode branch).
-          this.seenMessageIds.delete(oldest);
-        }
-      }
-    }
-    this.peerSessionKeys.set(peerId, sessionKey);
-    this.transport.publish(
-      this.handshakeSubject(peerId),
-      keyExchangeFrame(this.agentKeyPair.publicKey),
-    );
-    console.log(`[nats-channel] Completed handshake with peer ${peerId}`);
-    // Session key is now established → the initial history snapshot can finally
-    // be encrypted to this peer. (Sent from here, not the register hop, which
-    // runs before the handshake — see setHandshakeCompleteHandler.) TWO guards:
-    //  1. REGISTERED peers only (`peerSubscriptions` — the register-hop / PoP-
-    //     authenticated path). The wildcard / `admission:"auto"` path never calls
-    //     registerPeer, so a peer there is unauthenticated (any tenant-creds holder
-    //     can handshake for any peerId); it must NOT receive stored history. For
-    //     the SAME reason approval snapshots (#15/#19) are register-hop-only and
-    //     never fired from here — a handshake-time snapshot would leak pending
-    //     approval ids (and approve capability) to a peerId hijacker. See
-    //     APPROVAL_REHYDRATION_PLAN §3.7.
-    //  2. NEW session key only — a duplicate handshake (client retry / RTT race)
-    //     derives the SAME key, so we skip re-sending the whole backlog. A genuine
-    //     reconnect brings a fresh browser key → new session → re-hydrates.
-    const isNewSession = !prevKey || !bytesEqual(prevKey, sessionKey);
-    if (this.peerSubscriptions.has(peerId) && isNewSession) {
-      this.onHandshakeComplete?.(peerId);
-    }
-  }
-
-  /**
    * Crypto mode: decrypt an inbound envelope and dispatch it.
    *
-   * Fail-closed: a message that arrives before the handshake completes (no
+   * Fail-closed: a message that arrives before registration completes (no
    * session key) or that fails to decrypt/parse is dropped — never processed as
    * plaintext.
    */
@@ -911,7 +735,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     const key = this.peerSessionKeys.get(peerId);
     if (!key) {
       console.warn(
-        `[nats-channel] Dropping inbound from ${peerId}: no session key (handshake not completed)`,
+        `[nats-channel] Dropping inbound from ${peerId}: no registered session key`,
       );
       return;
     }

@@ -21,11 +21,13 @@
 #     channel.registerPeer (Cycle 2 C2 invariant), aud=acctB hits acctB's
 #   - binding.account ROUTING → resolveAgentRoute(accountId) picks the bound agent
 #
-# Credential source is dev/open-NATS (WEBCHANNEL_NATS_DEV_OPEN=1), as in the
-# other register-focused harnesses (run-jwt-register / run-saas-issuer-register /
-# run-browser-jwt-register): it isolates the multiplex+dispatch+routing layer
-# without per-account NATS-cred plumbing. The CONFIG-TIME channels-add enrollment
-# path is covered separately by run-enrolled-transport.sh and run-all-real.sh.
+# Credentials ride the enrolled trust chain: ONE setupTrustChain() in the
+# reference enrollment-server issues real per-account device-flow NATS creds and
+# registry-pinned agent keys (no dev identity), so each account admits its peer
+# via the register hop just like production. This isolates the
+# multiplex+dispatch+routing layer on the same trust chain the other harnesses
+# use. The single-account CONFIG-TIME channels-add enrollment path is covered by
+# run-enrolled-transport.sh and run-all-real.sh.
 #
 # Everything runs under an isolated OPENCLAW_HOME=/tmp/oc-two-acct-e2e; your real
 # ~/.openclaw is never touched. Distinct ports avoid colliding with the other
@@ -42,6 +44,7 @@ PKG_BAK=/tmp/oc-two-acct-e2e.pkgbak.json
 GW_PORT=19299
 NATS_WS=18722
 NATS_TCP=14722
+ISSUER_PORT=3971
 ECHO_A_PORT=18906
 ECHO_B_PORT=18907
 
@@ -52,11 +55,11 @@ ACCT_A=accta            # canonical (lowercased) account ids — see account-con
 ACCT_B=acctb
 PEER_A=web-accta-peer
 PEER_B=web-acctb-peer
-ISS="https://e2e-issuer.test"
+ISS="http://127.0.0.1:$ISSUER_PORT"
 ECHO_A_PREFIX="AGENT-A-ECHO: "
 ECHO_B_PREFIX="AGENT-B-ECHO: "
 
-NATS_PID=""; ECHO_A_PID=""; ECHO_B_PID=""; GW_PID=""
+NATS_PID=""; ISSUER_PID=""; ECHO_A_PID=""; ECHO_B_PID=""; GW_PID=""; ADD_PID=""
 
 cleanup() {
   echo "[run-two-acct] cleanup…"
@@ -64,6 +67,8 @@ cleanup() {
   [ -n "$ECHO_A_PID" ] && kill "$ECHO_A_PID" 2>/dev/null || true
   [ -n "$ECHO_B_PID" ] && kill "$ECHO_B_PID" 2>/dev/null || true
   [ -n "$NATS_PID" ]   && kill "$NATS_PID"   2>/dev/null || true
+  [ -n "$ISSUER_PID" ] && kill "$ISSUER_PID" 2>/dev/null || true
+  [ -n "$ADD_PID" ]    && kill "$ADD_PID"    2>/dev/null || true
   pkill -f "nats-server -c $OCH/nats.conf" 2>/dev/null || true
   pkill -f "echo-openai-server.mjs $ECHO_A_PORT" 2>/dev/null || true
   pkill -f "echo-openai-server.mjs $ECHO_B_PORT" 2>/dev/null || true
@@ -101,11 +106,23 @@ node -e '
 ' "$PKG_JSON"
 echo "[run-two-acct] set plugin extensions → ./index-nats.ts"
 
-# 1. nats-server with a websocket listener (open/dev mode).
-cat > "$OCH/nats.conf" <<CONF
-port: $NATS_TCP
-websocket { port: $NATS_WS, no_tls: true }
-CONF
+# 1. One trust chain supplies the operator, enrollment credentials, JWKS, and pins.
+PORT="$ISSUER_PORT" SAAS_BASE_URL="$ISS" SAAS_ISSUER="$ISS" \
+NATS_URL="ws://127.0.0.1:$NATS_WS" NATS_CONFIG_OUT="$OCH" ENABLE_TEST_ROUTES=1 \
+POLL_INTERVAL_SECONDS=1 node --import tsx \
+  "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
+ISSUER_PID=$!
+for i in $(seq 1 120); do
+  curl -fsS "$ISS/.well-known/jwks.json" >/dev/null 2>&1 && [ -f "$OCH/resolver.json" ] && break
+  kill -0 "$ISSUER_PID" 2>/dev/null || { cat "$OCH/issuer.log"; exit 2; }
+  sleep 0.25
+done
+OCH="$OCH" NATS_TCP="$NATS_TCP" NATS_WS="$NATS_WS" node -e '
+  const fs=require("fs"), d=process.env.OCH;
+  const r=JSON.parse(fs.readFileSync(d+"/resolver.json","utf8"));
+  const preload=Object.entries(r).map(([k,v])=>`  ${k}: "${v}"`).join("\n");
+  fs.writeFileSync(d+"/nats.conf", `port: ${process.env.NATS_TCP}\nwebsocket { port: ${process.env.NATS_WS}, no_tls: true }\noperator: "${d}/operator.jwt"\nresolver: MEMORY\nresolver_preload: {\n${preload}\n}\n`);
+'
 nats-server -c "$OCH/nats.conf" >"$OCH/nats.log" 2>&1 &
 NATS_PID=$!
 echo "[run-two-acct] nats-server pid=$NATS_PID (ws://127.0.0.1:$NATS_WS)"
@@ -114,9 +131,6 @@ for i in $(seq 1 120); do
   kill -0 "$NATS_PID" 2>/dev/null || { echo "nats died"; cat "$OCH/nats.log"; exit 2; }
   sleep 0.25
 done
-
-# 2. RS256 signing key + JWKS — shared issuer (only `aud` distinguishes accounts).
-node "$REPO/e2e/local/gen-jwt-fixtures.mjs" "$OCH"
 
 # 3. TWO echo model servers — distinct prefixes make the agents distinguishable.
 ECHO_PREFIX="$ECHO_A_PREFIX" node "$REPO/e2e/local/echo-openai-server.mjs" "$ECHO_A_PORT" >"$OCH/echoA.log" 2>&1 &
@@ -173,14 +187,14 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
         "$ACCT_A": {
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
-            "jwksFile": "$OCH/jwks.json", "issuer": "$ISS", "audience": "$ACCT_A" } },
+            "jwksUrl": "$ISS/.well-known/jwks.json", "issuer": "$ISS", "audience": "$ACCT_A" } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$PEER_A"]
         },
         "$ACCT_B": {
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
-            "jwksFile": "$OCH/jwks.json", "issuer": "$ISS", "audience": "$ACCT_B" } },
+            "jwksUrl": "$ISS/.well-known/jwks.json", "issuer": "$ISS", "audience": "$ACCT_B" } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$PEER_B"]
         }
@@ -191,9 +205,31 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
 JSON
 echo "[run-two-acct] wrote $OCH/.openclaw/openclaw.json (2 accounts, 2 agents, 2 bindings)"
 
-# 5. Boot ONE gateway serving BOTH accounts (dev/open-NATS).
+enroll_account() {
+  local acct="$1" log="$OCH/channels-add-$1.log" code=""
+  HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
+    "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account "$acct" \
+      --base-url "$ISS" --url "$TENANT" >"$log" 2>&1 &
+  ADD_PID=$!
+  for i in $(seq 1 240); do
+    code="$(grep -oE 'User code: [A-Z]{4}-[A-Z]{4}' "$log" 2>/dev/null | head -1 | awk '{print $3}' || true)"
+    [ -n "$code" ] && break
+    kill -0 "$ADD_PID" 2>/dev/null || { cat "$log"; exit 2; }
+    sleep 0.25
+  done
+  [ -n "$code" ] || { cat "$log"; exit 2; }
+  curl -fsS -X POST "$ISS/approve" -H 'Content-Type: application/json' \
+    -d "{\"user_code\":\"$code\"}" >/dev/null
+  wait "$ADD_PID" || { cat "$log"; exit 2; }
+  ADD_PID=""
+  [ -f "$OCH/.openclaw-webchannel/$acct/credentials.json" ] || exit 2
+}
+enroll_account "$ACCT_A"
+enroll_account "$ACCT_B"
+
+# 5. Boot ONE gateway serving BOTH enrolled accounts.
 OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  WEBCHANNEL_NATS_DEV_OPEN=1 WEBCHANNEL_NATS_URL=ws://127.0.0.1:$NATS_WS \
+  HOME="$OCH" WEBCHANNEL_NATS_URL=ws://127.0.0.1:$NATS_WS \
   WEBCHANNEL_GW_URL=http://127.0.0.1:$GW_PORT \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &
@@ -229,8 +265,7 @@ run_account() {
   set +e
   WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
   WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
-  WEBCHANNEL_RS256_PRIVATE="$OCH/rs256-private.jwk.json" \
-  WEBCHANNEL_ISSUER="$ISS" WEBCHANNEL_TENANT="$TENANT" \
+  WEBCHANNEL_ISSUER_URL="$ISS" WEBCHANNEL_TENANT="$TENANT" \
   WEBCHANNEL_PEER_ID="$peer" WEBCHANNEL_ACCOUNT_ID="$acct" \
   EXPECT_PREFIX="$expect" FORBID_PREFIX="$forbid" \
   SEND_MESSAGE="hello from $label" \

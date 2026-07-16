@@ -324,7 +324,7 @@ JSON
   [ "$rc" -ne 0 ] && { echo "[demo] $acct channels add failed (rc=$rc):"; cat "$addlog"; exit 2; }
   [ -f "$home/.openclaw-webchannel/$acct/credentials.json" ] || { echo "[demo] $acct creds not persisted"; cat "$addlog"; exit 2; }
 
-  # Re-assert register-hop admission (setup adapter may write admission:auto).
+  # Re-assert register-hop admission (setup adapter may write admission:register-hop).
   node -e '
     const fs = require("fs"); const p = process.argv[1], acct = process.argv[2];
     const cfg = JSON.parse(fs.readFileSync(p, "utf8"));

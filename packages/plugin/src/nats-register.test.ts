@@ -26,6 +26,7 @@ import type { WrappedConversationKey } from "./late-join-decryptor.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
 const PEER = "user-42";
+const TENANT = "tenant-1";
 const FAKE_WRAPPED: WrappedConversationKey = {
   ephemeralPublicKey: "ephemeral",
   nonce: "nonce",
@@ -75,6 +76,7 @@ function makeHarness(opts?: {
 
   const deps: RegisterHandlerDeps = {
     auth: (opts?.auth ?? { strategy: "jwt" }) as RegisterHandlerDeps["auth"],
+    tenant: TENANT,
     subjectPeerId: opts?.subjectPeerId ?? PEER,
     payload: "",
     reply: (r) => replies.push(r),
