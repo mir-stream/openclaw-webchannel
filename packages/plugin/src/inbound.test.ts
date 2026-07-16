@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import { handleInboundMessage } from "./inbound.js";
-import type { WebChannelTransport } from "./transport.js";
+import type { WebChannelPeerChannel } from "./channel-contract.js";
 
 /**
  * P1-8a — `handleInboundMessage` control-lane behaviour.
@@ -104,7 +104,7 @@ function makeFakeApi(params: {
 
 /** A transport that records finalize frames and accepts progress/typing/text. */
 function makeFakeTransport(): {
-  transport: WebChannelTransport;
+  transport: WebChannelPeerChannel;
   finalizes: Array<{ id: string; text: string }>;
   progress: Array<{ id: string; text: string }>;
   typing: string[];
@@ -118,17 +118,21 @@ function makeFakeTransport(): {
       return true;
     },
     sendText: () => true,
-    sendTextToAnyOpen: () => true,
     sendReasoning: () => true,
     sendTurnSettled: () => true,
     sendProgress: (_sessionKey: string, id: string, text: string) => {
       progress.push({ id, text });
       return true;
     },
-    finalizeDraft: async (_sessionKey: string, id: string, text: string) => {
+    finalizeDraft: (_sessionKey: string, id: string, text: string) => {
       finalizes.push({ id, text });
+      return true;
     },
-  } as unknown as WebChannelTransport;
+    sendHistory: () => true,
+    sendApprovalRequest: () => true,
+    sendApprovalResolved: () => true,
+    sendApprovalSnapshot: () => true,
+  } as WebChannelPeerChannel;
   return { transport, finalizes, progress, typing };
 }
 

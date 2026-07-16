@@ -1,7 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
-import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
-import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
+import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
+import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
 import { DEFAULT_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
@@ -68,7 +68,7 @@ import type {
  */
 export async function handleInboundMessage(
   api: OpenClawPluginApi,
-  transport: WebChannelTransport,
+  transport: WebChannelPeerChannel,
   peerId: string,
   message: InboundUserMessage,
   accountId: string = DEFAULT_ACCOUNT_ID,

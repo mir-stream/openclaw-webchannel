@@ -1,9 +1,8 @@
 /**
- * WebChannel NATS Client Wrapper — Adapter for existing client.ts.
+ * WebChannel NATS Client Wrapper — public browser-facing state adapter.
  *
- * This module wraps the WebChannelNatsClient to provide the same API
- * as the original WebSocket-based WebChannelClient, enabling a drop-in
- * replacement for AC 5's NATS cutover.
+ * This module wraps `WebChannelNatsClient` with transcript, approval, progress,
+ * and subscription state suitable for UI integrations.
  *
  * Changes from gateway-WS:
  * - No WebSocket connection to /webchannel/ws
@@ -40,9 +39,21 @@ import { isLikelyAbortText, isExplicitStop } from "./abort-mirror.js";
 /**
  * NATS-based WebChannel client.
  *
- * Drop-in replacement for WebSocket-based WebChannelClient.
- * Uses NATS subjects for per-peer messaging instead of gateway-WS relay.
+ * Uses per-peer NATS subjects for browser messaging.
  */
+
+/**
+ * Canonical constructor options for `WebChannelNATSClient` — the public type a
+ * consumer should annotate its config with. `url` and `jwt` are supplied
+ * through the `WebChannelOptions` aliases `natsUrl` / `bootstrapJwt`, so they
+ * are Omitted from the `NatsClientOptions` half — otherwise the intersection
+ * would require the caller to ALSO pass a raw `url` the wrapper ignores.
+ * Everything else (accountId, tenant, peerId, registration, natsCredentials,
+ * reconnect tuning) is forwarded as-is.
+ */
+export type WebChannelNATSClientOptions = WebChannelOptions &
+  Omit<NatsClientOptions, "url" | "jwt">;
+
 export class WebChannelNATSClient {
   private readonly natsOptions: NatsClientOptions;
   private readonly client: WebChannelNatsClient;
@@ -89,12 +100,7 @@ export class WebChannelNATSClient {
   private staleDraftTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly STALE_DRAFT_GRACE_MS = 30_000;
 
-  // `url` and `jwt` are supplied through the WebChannelOptions aliases
-  // `natsUrl` / `bootstrapJwt`, so they are Omitted from the NatsClientOptions
-  // half — otherwise the intersection would require the caller to ALSO pass a
-  // raw `url` the wrapper ignores. Everything else (accountId, tenant, peerId,
-  // registration, natsCredentials, reconnect tuning) is forwarded as-is.
-  constructor(options: WebChannelOptions & Omit<NatsClientOptions, "url" | "jwt">) {
+  constructor(options: WebChannelNATSClientOptions) {
     this.natsOptions = {
       url: options.natsUrl ?? "wss://nats.example.com",
       jwt: options.bootstrapJwt ?? "",

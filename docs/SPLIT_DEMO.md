@@ -92,7 +92,7 @@ openclaw gateway run
 ```
 
 **No `channels.webchannel.auth` block is needed** — static/enrolled creds resolve admission to
-`auto`, and the ConnectionVerifier is only built for the `register-hop` mode. Browser admission =
+`auto`, and JWT auth config plus live verification are enforced for the `register-hop` mode. Browser admission =
 NATS subject permissions + X25519 handshake + the `dmSecurity` allowlist (`allowFrom` must
 include the browser's `peerId`).
 

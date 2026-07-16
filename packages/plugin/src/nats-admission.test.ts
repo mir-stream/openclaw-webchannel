@@ -109,7 +109,7 @@ describe("admissionServingPlan", () => {
 
   it("INVARIANT 3 — a jwt account with a viable hop stays register-hop (verifier IS required)", () => {
     // A misconfigured jwt account still resolves to register-hop, so buildVerifier
-    // is true → resolveVerifier runs (and throws → the account is skipped, loud).
+    // is true → assertJwtAuthConfig runs (and throws → the account is skipped, loud).
     // The verifier is skipped only for a GENUINE `auto` decision, never as a
     // catch-all for verifier errors.
     const admission = resolveAdmissionMode({

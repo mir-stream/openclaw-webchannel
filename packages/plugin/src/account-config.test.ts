@@ -18,8 +18,25 @@ import {
   resolveReadCredentialPath,
   loadPersistedEnrolledCreds,
 } from "./account-config.js";
+import { planAccounts } from "./multiplex.js";
 
 const HOME = "/home/test";
+
+describe("removed auth.ticketParam migration", () => {
+  it("rejects the deprecated flat config through the NATS account planning seam", () => {
+    const cfg = { channels: { webchannel: { auth: { strategy: "jwt", ticketParam: "ticket" } } } };
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /removed config auth\.ticketParam.*openclaw channels add/s,
+    );
+  });
+
+  it("rejects the deprecated named-account leaf through the NATS account planning seam", () => {
+    const cfg = { channels: { webchannel: { accounts: { work: { auth: { ticketParam: "jwt" } } } } } };
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /removed config auth\.ticketParam.*openclaw channels add/s,
+    );
+  });
+});
 
 describe("account-config: account id validation (TRUST BOUNDARY)", () => {
   it("accepts safe ids", () => {

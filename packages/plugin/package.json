@@ -23,7 +23,7 @@
     "channel": {
       "id": "webchannel",
       "label": "WebChannel",
-      "blurb": "Self-hosted web chat channel served on the gateway port."
+      "blurb": "End-to-end encrypted web chat over an outbound NATS relay."
     },
     "compat": {
       "pluginApi": ">=2026.6.10",

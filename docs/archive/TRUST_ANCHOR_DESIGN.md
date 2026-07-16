@@ -1,5 +1,7 @@
 # Trust Anchor Design — `channels add` derives trust, config holds only settings
 
+> **ARCHIVED 2026-07-15.** Historical design; see `../TRUST_AND_ONBOARDING.md`.
+
 > **Essence:** the plugin's ONLY trust input is the **SaaS URL**. Everything
 > trust-related is *derived* from `{SaaS URL, accountId}` or *delivered by the
 > SaaS at enrollment* — never guessed, never hand-written. Everything else is a

@@ -95,7 +95,7 @@ export type AccountReadinessInput = {
   jwks?: JwksReadiness;
   /**
    * The account's JWT verifier could not be BUILT (missing/unresolvable
-   * issuer/audience/jwks source — `makeJwtVerifier`/`resolveVerifier` threw).
+   * issuer/audience/jwks source — `assertJwtAuthConfig` threw).
    * This is a hard CONFIG fault that skips the account (fail-closed, never a
    * downgrade to `auto`); naming it here lets the FAIL line still report the
    * issuer/aud state alongside the reason.

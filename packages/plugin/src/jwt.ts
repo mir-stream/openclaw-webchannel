@@ -2,9 +2,9 @@
  * Zero-dependency RS256 JWT verifier for the `jwt` auth strategy.
  *
  * AUTH.md §10: SaaS operators / IdPs issue RS256 JWTs carrying `kid`, `iss`,
- * `aud`, `exp`, `sub` (and optional display name claims). The browser delivers
- * the compact JWT via `?ticket=` and the gateway validates it against a JWKS
- * public key resolved by `kid`.
+ * `aud`, `exp`, `sub` (and optional display name claims). The browser presents
+ * the compact JWT during the NATS register hop; the plugin validates it against
+ * a JWKS public key resolved by `kid`.
  *
  * CONSTRAINTS:
  *  - Use only `globalThis.crypto.subtle` (Cloudflare Workers + Node 18+ both

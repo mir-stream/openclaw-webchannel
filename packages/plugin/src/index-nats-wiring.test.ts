@@ -92,3 +92,18 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
     );
   });
 });
+
+describe("index-nats.ts wiring contract — approval decision account routing", () => {
+  it("threads the runtime accountId into handleApprovalDecision", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /setApprovalDecisionHandler\(\(peerId, id, decision\) =>[\s\S]*?handleApprovalDecision\(api\.config, id, decision, peerId, accountId\)/,
+    );
+  });
+});
+
+describe("index-nats.ts browser-route absence", () => {
+  it("contains no gateway HTTP route registration or socket-upgrade wiring", () => {
+    expect(INDEX_NATS_SOURCE).not.toContain("registerHttpRoute");
+    expect(INDEX_NATS_SOURCE.toLowerCase()).not.toContain("upgrade route");
+  });
+});

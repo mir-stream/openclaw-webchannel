@@ -12,30 +12,30 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { resolveVerifier, type AuthConfig } from "./auth.js";
+import { assertJwtAuthConfig, type AuthConfig } from "./auth.js";
 
 describe("Anonymous strategy rejection (AC 4)", () => {
   it("should throw error when anonymous strategy is resolved", () => {
     const anonConfig: AuthConfig = { strategy: "anonymous" };
 
-    expect(() => resolveVerifier(anonConfig)).toThrow(
-      /auth strategy 'anonymous' is disabled/,
+    expect(() => assertJwtAuthConfig(anonConfig)).toThrow(
+      /not valid for register-hop JWT verification/,
     );
   });
 
   it("should throw error with detailed message mentioning AC 4", () => {
     const anonConfig: AuthConfig = { strategy: "anonymous" };
 
-    expect(() => resolveVerifier(anonConfig)).toThrow(
-      /AC 4 requires SaaS-attested device keys/,
+    expect(() => assertJwtAuthConfig(anonConfig)).toThrow(
+      /not valid for register-hop JWT verification/,
     );
   });
 
   it("should throw error suggesting the jwt strategy", () => {
     const anonConfig: AuthConfig = { strategy: "anonymous" };
 
-    expect(() => resolveVerifier(anonConfig)).toThrow(
-      /Use the 'jwt' strategy with JWKS verification/,
+    expect(() => assertJwtAuthConfig(anonConfig)).toThrow(
+      /register-hop JWT verification/,
     );
   });
 
@@ -54,7 +54,7 @@ describe("Anonymous strategy rejection (AC 4)", () => {
         },
       };
 
-      const verifier = resolveVerifier(jwtConfig);
+      const verifier = assertJwtAuthConfig(jwtConfig);
       expect(verifier).toBeDefined(); // Should not throw at strategy selection
     } catch (e: unknown) {
       // If it throws, it should be due to missing config, not strategy rejection
@@ -65,14 +65,14 @@ describe("Anonymous strategy rejection (AC 4)", () => {
   it("should throw error for unknown strategy", () => {
     const unknownConfig: AuthConfig = { strategy: "unknown" as any };
 
-    expect(() => resolveVerifier(unknownConfig)).toThrow(
-      /unknown auth strategy "unknown"/,
+    expect(() => assertJwtAuthConfig(unknownConfig)).toThrow(
+      /auth strategy "unknown" is not valid/,
     );
   });
 
   it("should throw error for missing strategy", () => {
-    expect(() => resolveVerifier(null)).toThrow(/auth.strategy is required/);
-    expect(() => resolveVerifier(undefined)).toThrow(/auth.strategy is required/);
-    expect(() => resolveVerifier({} as any)).toThrow(/auth.strategy is required/);
+    expect(() => assertJwtAuthConfig(null)).toThrow(/auth.strategy is required/);
+    expect(() => assertJwtAuthConfig(undefined)).toThrow(/auth.strategy is required/);
+    expect(() => assertJwtAuthConfig({} as any)).toThrow(/auth.strategy is required/);
   });
 });

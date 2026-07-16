@@ -46,7 +46,8 @@ export class EncryptionDisabledError extends Error {
       "webchannel-nats: refusing to start — encryption is disabled " +
         "(channels.webchannel.encryption.mode='disabled'), but the NATS channel is " +
         "encrypt-by-construction (fail-closed). The relay must only ever see ciphertext. " +
-        "Remove the override to run encrypted, or use the gateway-WS entry for a non-NATS deployment.",
+        "Disabling encryption is unsupported on the NATS-only surface; remove the override " +
+        "to run encrypted.",
     );
     this.name = "EncryptionDisabledError";
   }

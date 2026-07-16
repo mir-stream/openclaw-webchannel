@@ -1,7 +1,7 @@
 /**
  * NATS Channel — Plugin-side NATS message channel.
  *
- * This module replaces the gateway-WS WebChannelTransport with a NATS-based
+ * This module replaces the gateway-WS NATS peer channel with a NATS-based
  * channel that:
  * - Subscribes to per-peer inbound subjects
  * - Publishes to per-peer outbound subjects
@@ -17,7 +17,7 @@
  */
 
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
-import type { ApprovalDecision, ApprovalRequestPayload } from "./transport.js";
+import type { ApprovalDecision, ApprovalRequestPayload, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import type { ConversationKeyStore } from "./conversation-key-store.js";
@@ -49,51 +49,7 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
-export type InboundWsMessage =
-  // P0-7a: `id` is a stable, client-minted unique id for this logical send. It is
-  // OPTIONAL for back-compat — an older client omits it and the frame passes
-  // through un-deduped. When present, the server records `${peerId}:${id}` at
-  // ingress (7-day window) and silently drops a duplicate before it runs a turn.
-  | { type: "user_message"; text: string; id?: string }
-  | { type: "approval_decision"; id: string; decision: ApprovalDecision }
-  | { type: "load_history"; before?: string; limit?: number }
-  // P0-3 slash-command DISCOVERY: the browser asks for the command catalog (no
-  // params — the catalog is not paged). The agent answers with a `commands`
-  // frame. Discovery only; command EXECUTION is a normal `user_message`.
-  | { type: "load_commands" };
-
-export type OutboundWsMessage =
-  | { type: "agent_message"; text: string; id?: string; turnId?: string }
-  | { type: "progress"; id: string; text: string; turnId?: string }
-  | { type: "reasoning"; id: string; turnId: string; text: string }
-  | { type: "turn_settled"; turnId: string }
-  | { type: "approval_request"; id: string; kind: "exec" | "plugin"; title: string; description?: string; prompt: string; options: Array<{ decision: string; label: string; style: string }>; expiresAtMs?: number }
-  | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
-  // #15 authoritative pending-approval snapshot (see transport.ts for the full
-  // rationale). This union is nats-channel's OWN — it is NOT imported from
-  // transport.ts, so the frame type must be added here independently. `resolved`
-  // (#19, optional) carries recently-resolved outcomes for the client's Leg B.
-  | {
-      type: "approval_snapshot";
-      approvals: ApprovalRequestPayload[];
-      resolved?: Array<{ id: string; decision: ApprovalDecision }>;
-    }
-  | { type: "typing" }
-  | { type: "history"; messages: Array<{ id: string; role: string; text: string; ts?: number }> }
-  // P0-3 slash-command DISCOVERY: the command catalog delivered in reply to a
-  // `load_commands` request (config-filtered, alias-free, name-sorted).
-  | { type: "commands"; commands: CommandCatalogEntry[] }
-  // P0-7b: ingress acknowledgement — the ids of `user_message` frames the agent
-  // admitted at ingress (fresh AND deduped duplicates), so the client can drain
-  // its unacked replay ledger. Delivered on the same sealed `.out` path.
-  | { type: "ack"; ids: string[] };
-
-export type HistoryMessage = {
-  id: string;
-  role: "user" | "agent";
-  text: string;
-  ts?: number;
-};
+export type { HistoryMessage, InboundWsMessage, OutboundWsMessage } from "./channel-contract.js";
 
 // ---------------------------------------------------------------------------
 // NATS Channel
@@ -195,7 +151,7 @@ const DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER = 2_000;
  * Replaces gateway-WS WebSocketServer with NATS pub/sub.
  * Each peer (browser session) gets their own subject pair.
  */
-export class NatsChannel {
+export class NatsChannel implements WebChannelPeerChannel {
   private readonly transport: NatsTransport;
   private readonly accountId: string;
   private readonly tenant: string;
@@ -471,19 +427,6 @@ export class NatsChannel {
   }
 
   /**
-   * Send text to the single registered peer, when exactly one is connected.
-   *
-   * Mirrors WebChannelTransport.sendTextToAnyOpen: the outbound seam falls back
-   * here for core-initiated (untargeted) sends. With one peer (the common single
-   * web user) we deliver; with zero or many we refuse to guess and return false.
-   */
-  sendTextToAnyOpen(text: string): boolean {
-    if (this.peerSubscriptions.size !== 1) return false;
-    const [peerId] = this.peerSubscriptions.keys();
-    return this.sendText(peerId, text);
-  }
-
-  /**
    * Send progress update to peer.
    */
   sendProgress(peerId: string, id: string, text: string, turnId?: string): boolean {
@@ -560,15 +503,7 @@ export class NatsChannel {
    */
   sendApprovalRequest(
     peerId: string,
-    request: {
-      id: string;
-      kind: "exec" | "plugin";
-      title: string;
-      description?: string;
-      prompt: string;
-      options: Array<{ decision: string; label: string; style: string }>;
-      expiresAtMs?: number;
-    }
+    request: ApprovalRequestPayload,
   ): boolean {
     const payload: OutboundWsMessage = {
       type: "approval_request",
@@ -1057,6 +992,13 @@ export class NatsChannel {
         break;
 
       case "approval_decision":
+        if (
+          typeof message.id !== "string" ||
+          !(["allow-once", "allow-always", "deny"] as const).includes(message.decision)
+        ) {
+          console.warn(`[nats-channel] Invalid approval_decision from ${peerId}`);
+          break;
+        }
         this.onApprovalDecision?.(peerId, message.id, message.decision);
         break;
 

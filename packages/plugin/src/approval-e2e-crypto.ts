@@ -54,7 +54,7 @@ import {
   deserializeEnvelope,
 } from "./e2e-envelope.js";
 import type { EnvelopeRouting, MessageEnvelope } from "./e2e-envelope.js";
-import type { ApprovalRequestPayload, ApprovalDecision } from "./transport.js";
+import type { ApprovalRequestPayload, ApprovalDecision } from "./channel-contract.js";
 
 // ---------------------------------------------------------------------------
 // HKDF info string for approval key derivation (domain-separated from chat)

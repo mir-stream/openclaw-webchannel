@@ -23,7 +23,7 @@ this file, **this file is correct.**
   `EnrollmentResult` delivers `natsUrl` (rendezvous authority) **and, since 0.1.3, the
   bootstrap-JWT `issuer`** — runtime precedence `operator pin > delivered > derived-from-baseUrl`.
   The `channels add` wizard writes the full config block (no hand-edited `openclaw.json`) and
-  deliberately has **no issuer prompt**. Root-cause history: `docs/TRUST_ANCHOR_DESIGN.md`;
+  deliberately has **no issuer prompt**. Root-cause history: `docs/archive/TRUST_ANCHOR_DESIGN.md`;
   Gate A/B preflight (`packages/plugin/src/preflight.ts`) reports the effective values at add
   time and gateway start.
 - **E2E encryption is encrypt-by-construction and fail-closed on both ends** (X25519 + HKDF +
@@ -50,10 +50,9 @@ this file, **this file is correct.**
   cross-tenant, tamper, replay), per-peer isolation, short-TTL re-auth, JWKS rotation,
   multi-device. `DEMO_RELAY=synadia` runs it over real NGS. It deliberately keeps a **fake
   issuer with no agent-side pins**, so every boot live-tests the delivered-issuer path.
-  (The old `e2e/local/run-demo.sh` and the Gateway-WS live-chat trio are deleted.)
-- **The Gateway-WS path (`index.ts`) is legacy / dev-only**; `index-nats.ts` is the production
-  entry. The `hmac-ticket` strategy is removed; transport removal is tracked in
-  [`BACKLOG.md`](BACKLOG.md).
+  (The old `e2e/local/run-demo.sh` live-chat harness is deleted.)
+- **The NATS entry is the sole production transport**; the gateway registers no browser-facing route.
+  The earlier HMAC strategy and direct-browser transport have been removed.
 
 ## CI — the source of truth
 
@@ -85,7 +84,7 @@ long-lived branches:
 | JWKS rotation + eviction (admin-driven, 500→401 fix) | `jwks.ts`; `demo/verify-rotate.mjs`, `verify-evict.mjs` |
 | Trust chain, NATS user-cred minting, external (Synadia/NGS) account signing | `packages/saas`; `external-nats-account.test.ts`, `nats-permissions-realserver.test.ts`; demo `DEMO_RELAY=synadia` live |
 | Public API boundary (barrel = contract; internals unreachable) | `examples/minimal-consumer/test/boundary.test.mjs`, `examples/webchannel-app/test/no-internal-imports.test.mjs` (CI) |
-| Stability hardening from the 2026-07-02 full review | **13 findings fixed + pushed** (C1 crash guard, S1 reconnect, A1 OOM sweeper, S2 map ceilings, S3, A2/A3, CL1–3 incl. terminal-auth state + keepalive liveness, O1/O3/O-min8) — [`REVIEW_2026-07-02.md`](REVIEW_2026-07-02.md) |
+| Stability hardening from the 2026-07-02 full review | **13 findings fixed + pushed** (C1 crash guard, S1 reconnect, A1 OOM sweeper, S2 map ceilings, S3, A2/A3, CL1–3 incl. terminal-auth state + keepalive liveness, O1/O3/O-min8) — [`REVIEW_2026-07-02.md`](archive/REVIEW_2026-07-02.md) |
 
 ## What does NOT work yet / open items
 
@@ -93,7 +92,7 @@ long-lived branches:
 |---|---|
 | **S1 outbound facade** (proactive/approval outbound is primary-account-only) | Cross-account disclosure risk on the agent-initiated leg; the approvals half is done, the outbound facade is the open half. [`BACKLOG.md`](BACKLOG.md) §S1. |
 | **C2 (unauthenticated handshake) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `handshake-verifier` deleted). The legacy X25519 handshake remains on the dev/open `admission:"auto"` path — still the accepted-risk/untrusted-relay caveat there. [`BACKLOG.md`](BACKLOG.md) §C2. |
-| Legacy Gateway-WS transport removal | Strategy (`hmac-ticket`) removed; the transport itself is deferred structural cleanup. [`BACKLOG.md`](BACKLOG.md). |
+| Direct gateway transport removal | ✅ complete; browser traffic uses the NATS relay only. |
 | Demo/reference server hardening (review SEC1/2/5) | The reference/demo SaaS servers are deliberately demo-grade (in-memory stores, printed admin token); production-hardening rewrite is a pending decision. |
 | Pre-issuer enrollments | Agents enrolled before 0.1.3 never receive the delivered issuer — they must delete `credentials.json` and re-enroll (documented in `GETTING_STARTED.md` troubleshooting). |
 | Registry is private | `@mir-stream/*` consumers need a classic `read:packages` PAT until the packages go public; the example app is not yet a standalone `npm create` scaffold. |
@@ -109,7 +108,7 @@ long-lived branches:
 ## Historical record (Phase B closure — condensed, 2026-06 → 07-01)
 
 The full Phase B narrative (live NATS round-trip gates, encrypt-by-construction, PoP producer
-side, the `registerHttpRoute` sync-window discovery, the enrolled-transport and all-real
+side, plugin registration sync-window discovery, the enrolled-transport and all-real
 fusions #13–#17, and the "how did the AC signals get contradictory" reconciliation) lived in
 the 07-01 version of this file — see git history (`git show 114b03c:docs/STATUS.md`). Two
 things to know when reading it:

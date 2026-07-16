@@ -13,7 +13,7 @@ import {
   createIngressOnFlush,
   recordCancelledInboundItems,
 } from "./ingress-dedupe.js";
-import type { InboundWsMessage } from "./transport.js";
+import type { InboundWsMessage } from "./channel-contract.js";
 
 /**
  * P1-8a — the out-of-band control lane. Two seams are covered here:

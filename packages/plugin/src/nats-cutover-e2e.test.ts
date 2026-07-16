@@ -577,7 +577,7 @@ describe("AC 5 E2E: NATS Cutover", () => {
   // ---------------------------------------------------------------------------
 
   it("should not use gateway-WS relay paths", () => {
-    // Verify that NatsChannel is used instead of WebChannelTransport
+    // Verify that NatsChannel is used instead of NATS peer channel
     expect(agentChannel).toBeInstanceOf(NatsChannel);
 
     // Verify that the channel uses NATS subjects

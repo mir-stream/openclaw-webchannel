@@ -1,7 +1,59 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
-import { createProgressDraftController, createReasoningDraftController } from "./message-adapter.js";
-import type { WebChannelTransport } from "./transport.js";
+import { createClawMessageAdapter, createProgressDraftController, createReasoningDraftController } from "./message-adapter.js";
+import { NullPeerChannel } from "./channel-contract.js";
+import type { WebChannelPeerChannel } from "./channel-contract.js";
+
+describe("targeted outbound delivery", () => {
+  class RecordingChannel extends NullPeerChannel {
+    readonly sent: string[] = [];
+    constructor(private readonly live: Set<string>) { super(); }
+    override sendText(peerId: string): boolean {
+      if (!this.live.has(peerId)) return false;
+      this.sent.push(peerId);
+      return true;
+    }
+  }
+
+  const send = async (channel: RecordingChannel, to?: string) => {
+    const adapter = createClawMessageAdapter(channel) as any;
+    return adapter.send.text({ to, text: "hello" });
+  };
+
+  it("delivers to a valid explicit target", async () => {
+    const channel = new RecordingChannel(new Set(["peer-a"]));
+    await send(channel, "peer-a");
+    expect(channel.sent).toEqual(["peer-a"]);
+  });
+
+  it("drops and logs when the target is absent", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const channel = new RecordingChannel(new Set(["peer-a"]));
+    await send(channel);
+    expect(channel.sent).toEqual([]);
+    expect(error).toHaveBeenCalledWith("[webchannel] outbound send has no resolvable target peer — dropped");
+    error.mockRestore();
+  });
+
+  it("drops a stale target", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const channel = new RecordingChannel(new Set());
+    await send(channel, "peer-gone");
+    expect(channel.sent).toEqual([]);
+    expect(error).toHaveBeenCalledOnce();
+    error.mockRestore();
+  });
+
+  it("does not leak an unresolved target to another account channel", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const accountA = new RecordingChannel(new Set(["peer-a"]));
+    const accountB = new RecordingChannel(new Set(["peer-b"]));
+    await send(accountA, "peer-b");
+    expect(accountA.sent).toEqual([]);
+    expect(accountB.sent).toEqual([]);
+    error.mockRestore();
+  });
+});
 
 /**
  * P1-8a — `ProgressDraftController.snapshotText()`.
@@ -15,7 +67,7 @@ import type { WebChannelTransport } from "./transport.js";
  */
 
 function makeFakeTransport(): {
-  transport: WebChannelTransport;
+  transport: WebChannelPeerChannel;
   progress: Array<{ id: string; text: string }>;
 } {
   const progress: Array<{ id: string; text: string }> = [];
@@ -25,7 +77,7 @@ function makeFakeTransport(): {
       return true;
     },
     finalizeDraft: async () => {},
-  } as unknown as WebChannelTransport;
+  } as unknown as WebChannelPeerChannel;
   return { transport, progress };
 }
 
@@ -91,7 +143,7 @@ describe("ReasoningDraftController", () => {
         frames.push({ id, turnId, text });
         return true;
       },
-    } as unknown as WebChannelTransport;
+    } as unknown as WebChannelPeerChannel;
     const controller = createReasoningDraftController({
       transport,
       sessionKey: "peer-1",
@@ -150,7 +202,7 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
         frames.push({ id, turnId, text });
         return true;
       },
-    } as unknown as WebChannelTransport;
+    } as unknown as WebChannelPeerChannel;
     const controller = createReasoningDraftController({
       transport,
       sessionKey: "peer-1",

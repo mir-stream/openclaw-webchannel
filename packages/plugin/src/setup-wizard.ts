@@ -39,7 +39,7 @@ import type {
   ChannelSetupWizardTextInput,
 } from "openclaw/plugin-sdk/setup";
 
-import { WEBCHANNEL_ID } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
   DEFAULT_ACCOUNT_ID,
   canonicalizeAccountId,

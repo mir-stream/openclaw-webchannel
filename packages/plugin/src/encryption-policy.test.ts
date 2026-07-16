@@ -33,6 +33,8 @@ describe("resolveEncryptionPolicy (fail-closed NATS boot guard)", () => {
       expect(err).toBeInstanceOf(EncryptionDisabledError);
       expect((err as Error).message).toContain("encrypt-by-construction");
       expect((err as Error).message).toContain("ciphertext");
+      expect((err as Error).message).toContain("NATS-only surface");
+      expect((err as Error).message).toContain("remove the override");
     }
   });
 });

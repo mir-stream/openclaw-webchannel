@@ -1,10 +1,8 @@
 /**
  * Public types for the headless WebChannel client.
  *
- * The wire envelopes (`InboundWsMessage` / `OutboundWsMessage`) mirror the
- * plugin side declared in `src/transport.ts`. They are re-declared here (not
- * imported) so this package stays framework- and Node-free; the plugin's
- * contract test guards against drift (PACKAGING.md §3).
+ * Shared state and option types for the NATS-backed browser client. Wire-frame
+ * types remain private to the NATS implementation.
  */
 
 export type ChatRole = "user" | "agent";
@@ -230,133 +228,31 @@ export type WebChannelState = {
 export type Listener = (state: WebChannelState) => void;
 
 /**
- * Client options — all optional. A zero-arg construction connects to
- * `/webchannel/ws` on the current origin with no ticket (the anonymous dev
- * path).
+ * Public aliases used by `WebChannelNATSClient`. All fields are optional so an
+ * embedder can adopt configuration incrementally; production deployments
+ * normally provide the identity and relay fields together.
  */
 export type WebChannelOptions = {
   /**
-   * Full WebSocket URL (`ws://` or `wss://`), e.g. for a CROSS-ORIGIN gateway.
-   * Takes precedence over `path`. Use this when the page and the gateway live on
-   * different origins (the same-origin `path` form can't express that).
-   */
-  url?: string;
-  /**
-   * WS path on the CURRENT origin (ignored when `url` is set). Defaults to
-   * `/webchannel/ws`.
-   */
-  path?: string;
-  /**
-   * Supplies a short-lived token for the `jwt` server strategy (delivered on the
-   * WS upgrade URL as `?ticket=<jwt>`). Called on EVERY (re)connect so a
-   * reconnect always gets a FRESH token (the host session is long-lived, the
-   * token is short-lived — AUTH.md §5). Returning null/empty connects with no
-   * token (cookie / trusted-header auth).
-   */
-  getTicket?: () => Promise<string | null>;
-  // -----------------------------------------------------------------------
-  // NATS mode options (AC 5: NATS cutover)
-  // -----------------------------------------------------------------------
-  /**
-   * NATS WebSocket URL. When provided, client connects directly to NATS
-   * instead of gateway-WS. Requires bootstrapJwt, accountId, tenant, and peerId.
+   * NATS relay WebSocket URL. Defaults to the wrapper's hosted-relay placeholder
+   * when omitted; production callers should supply the enrolled relay URL.
    */
   natsUrl?: string;
   /**
-   * Bootstrap JWT (RS256-signed) from SaaS. Required for NATS mode.
-   * Contains cnf.jwk claim with device public key.
+   * SaaS-issued bootstrap JWT used by register-hop admission. It carries the
+   * peer identity and device confirmation key.
    */
   bootstrapJwt?: string;
   /**
-   * Account (deployment) id — the wire identity (from JWT claims). Required for
-   * NATS mode.
+   * Account/deployment identifier used in the per-account NATS subject prefix.
    */
   accountId?: string;
   /**
-   * Tenant ID (from JWT claims). Required for NATS mode.
+   * Tenant identifier used in the NATS subject namespace.
    */
   tenant?: string;
   /**
-   * Peer ID (JWT sub claim). Required for NATS mode.
+   * Peer identifier, normally the bootstrap JWT `sub`, used for per-peer routing.
    */
   peerId?: string;
 };
-
-/** Wire envelope sent TO the gateway. Mirrors `src/transport.ts`. */
-export type InboundWsMessage =
-  // P0-7a: `id` is a stable, client-minted unique id per logical send, used for
-  // server-side ingress idempotency (a rapid double-submit or a future replay is
-  // deduped). OPTIONAL for back-compat: an older client omits it and the frame
-  // is not deduped.
-  | { type: "user_message"; text: string; id?: string }
-  | { type: "approval_decision"; id: string; decision: ApprovalDecision }
-  /**
-   * History pagination request. The widget emits this when the user scrolls
-   * up past the hydrated bubble list and asks for more. `before` is the
-   * oldest message id currently visible in the widget; `limit` is the page
-   * size (the server falls back to its configured `pageSize` when omitted).
-   * The SDK does NOT auto-fire this on the client's behalf — UI code calls
-   * `client.loadHistory(...)` on user action (e.g. scroll-to-top button).
-   */
-  | { type: "load_history"; before?: string; limit?: number }
-  /**
-   * Slash-command discovery request (P0-3). The widget emits this the first
-   * time the user types `/`; the agent answers with a `commands` frame. No
-   * params — the catalog is not paged. Fired by UI code via
-   * `client.loadCommands()`, never automatically by the SDK.
-   */
-  | { type: "load_commands" };
-
-/** Wire envelope received FROM the gateway. Mirrors `src/transport.ts`. */
-export type OutboundWsMessage =
-  | { type: "agent_message"; text: string; id?: string; turnId?: string }
-  | { type: "progress"; id: string; text: string; turnId?: string }
-  | { type: "reasoning"; id: string; turnId: string; text: string }
-  | { type: "turn_settled"; turnId: string }
-  | {
-      type: "approval_request";
-      id: string;
-      kind: "exec" | "plugin";
-      title: string;
-      description?: string;
-      prompt: string;
-      options: ApprovalOption[];
-      expiresAtMs?: number;
-    }
-  | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
-  /**
-   * Authoritative pending-approval snapshot (#15). Emitted on every successful
-   * register (NATS path) carrying the peer's COMPLETE still-pending set for the
-   * account. The client reconciles its approval state against it: rehydrate lost
-   * cards, retire cards resolved elsewhere, and re-send a lost decision. An
-   * empty `approvals` array is meaningful (nothing pending → retire stale cards).
-   *
-   * `resolved` (#19, OPTIONAL) carries recently-RESOLVED outcomes so the client's
-   * Leg B can render the actual decision instead of a neutral "resolved
-   * (elsewhere)". Optional for back-compat with an older plugin that never sends
-   * it (the client falls back to "unknown").
-   */
-  | { type: "approval_snapshot"; approvals: Array<{
-      id: string;
-      kind: "exec" | "plugin";
-      title: string;
-      description?: string;
-      prompt: string;
-      options: ApprovalOption[];
-      expiresAtMs?: number;
-    }>; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
-  /** Native typing affordance; see `WebChannelState.isTyping`. */
-  | { type: "typing" }
-  /**
-   * History snapshot / pagination response. Emitted exactly ONCE per
-   * connection after the first heartbeat (initial snapshot) AND in response
-   * to `load_history` requests (older pages). The widget prepends `messages`
-   * to its transcript, deduplicating by id.
-   */
-  | { type: "history"; messages: ChatMessage[] }
-  /**
-   * Slash-command discovery catalog (P0-3), sent in reply to `load_commands`.
-   * Config-filtered, alias-free, name-sorted. The client replaces
-   * `WebChannelState.commands` wholesale with it.
-   */
-  | { type: "commands"; commands: CommandCatalogEntry[] };

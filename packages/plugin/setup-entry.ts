@@ -1,6 +1,6 @@
 import { defineSetupPluginEntry } from "openclaw/plugin-sdk/channel-core";
 
-import { WebChannelTransport } from "./src/transport.js";
+import { NullPeerChannel } from "./src/channel-contract.js";
 import { createWebChannelPlugin } from "./src/channel.js";
 
 /**
@@ -10,6 +10,6 @@ import { createWebChannelPlugin } from "./src/channel.js";
  * (that only happens in index.ts `registerFull`); it exists only to satisfy the
  * channel plugin's outbound adapter shape during setup-safe inspection.
  */
-const transport = new WebChannelTransport();
+const transport = new NullPeerChannel();
 
 export default defineSetupPluginEntry(createWebChannelPlugin(transport));

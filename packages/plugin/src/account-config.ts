@@ -181,6 +181,15 @@ function mergeAccountConfig(
   return merged;
 }
 
+function assertNoRemovedConfig(account: WebchannelAccountConfig): void {
+  const auth = account.auth;
+  if (auth && typeof auth === "object" && Object.prototype.hasOwnProperty.call(auth, "ticketParam")) {
+    throw new Error(
+      "webchannel: removed config auth.ticketParam is no longer supported because Gateway direct WebSocket authentication was deleted; reconfigure with `openclaw channels add --channel webchannel`.",
+    );
+  }
+}
+
 /**
  * List the configured account ids (canonical `accounts.<id>` model).
  *
@@ -219,7 +228,9 @@ export function resolveWebchannelAccountConfig(
   if (!section) return {};
   const base = channelLevelBase(section);
   const override = readAccountsMap(section)[accountId] ?? {};
-  return mergeAccountConfig(base, override);
+  const resolved = mergeAccountConfig(base, override);
+  assertNoRemovedConfig(resolved);
+  return resolved;
 }
 
 /**

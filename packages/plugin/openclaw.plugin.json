@@ -48,7 +48,10 @@
                 "type": "string",
                 "enum": ["anonymous", "jwt"]
               },
-              "ticketParam": { "type": "string" },
+              "ticketParam": {
+                "type": "string",
+                "description": "REMOVED — load-time migration error. Gateway direct WebSocket ticket authentication no longer exists; reset this channel with `openclaw channels add --channel webchannel`."
+              },
               "requirePoP": {
                 "type": "boolean",
                 "default": true,
@@ -250,10 +253,6 @@
         "auth.strategy": {
           "label": "Auth strategy",
           "help": "How browser connections are verified. Production runs the NATS path (index-nats): use \"jwt\" for the register-hop admission, or set NO auth at all for `auto` admission (browser is gated by NATS subject-permissioned creds + the X25519 handshake). \"anonymous\" is REJECTED at load (the plugin refuses to start)."
-        },
-        "auth.ticketParam": {
-          "label": "Ticket query param",
-          "help": "Query-string parameter the JWT arrives in on the WS upgrade URL. Defaults to \"ticket\"."
         },
         "auth.jwt.jwksUrl": {
           "label": "JWKS URL",
