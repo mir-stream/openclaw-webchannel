@@ -178,11 +178,19 @@ scans.
 
 ### 3.2 Shared effective-auth resolution (review finding 13)
 
-rev1 proposed moving `deriveAccountAuth` (`index-nats.ts:177-210`) verbatim.
-Insufficient: the caller ALSO owns base-URL precedence
-(`plan.saasBaseUrl ?? config.saas?.baseUrl`, `:358`) and persisted-issuer
-loading (`loadPersistedEnrolledCreds(accountId)?.issuer`, `:365`) — extracting
-only the fill function lets doctor and runtime resolve DIFFERENT inputs.
+> **Line refs in this subsection are PRE-EXTRACTION** — they cite
+> `index-nats.ts` as of `develop`, BEFORE this PR moved the code out. The
+> constructs no longer exist at those lines (or at all) in the current file, and
+> the numbers must NOT be "corrected" to current ones: at HEAD, `353-363` is now
+> C2's creds-missing skip, i.e. real but unrelated code. §4's catalog cites the
+> CURRENT file; this subsection documents the refactor's starting point.
+
+rev1 proposed moving `deriveAccountAuth` (pre-extraction `index-nats.ts:177-210`)
+verbatim. Insufficient: the caller ALSO owns base-URL precedence
+(`plan.saasBaseUrl ?? config.saas?.baseUrl`, pre-extraction `:353-358`) and
+persisted-issuer loading (`loadPersistedEnrolledCreds(accountId)?.issuer`,
+pre-extraction `:365`) — extracting only the fill function lets doctor and
+runtime resolve DIFFERENT inputs.
 
 Extract instead into **`src/account-auth.ts`** — a **strictly
 behavior-preserving** refactor (rev2 finding 1: this PR is a diagnosis feature;
@@ -198,13 +206,14 @@ resolveEffectiveAccountAuth({
   loadCreds,               // injected loadPersistedEnrolledCreds (fs seam)
 })
 // = deriveAccountAuth(accountAuthRaw,
-//     planSaasBaseUrl ?? topLevelSaasBaseUrl,   // EXACTLY index-nats.ts:353-358
+//     planSaasBaseUrl ?? topLevelSaasBaseUrl,   // EXACTLY pre-extraction :353-358
 //     accountId,
-//     loadCreds(accountId)?.issuer)             // EXACTLY index-nats.ts:365
+//     loadCreds(accountId)?.issuer)             // EXACTLY pre-extraction :365
 ```
 
 **Known divergence, documented not "fixed":** the AUTH derivation input is
-`plan.saasBaseUrl ?? config.saas?.baseUrl` (`index-nats.ts:353-358`), while the
+`plan.saasBaseUrl ?? config.saas?.baseUrl` (pre-extraction `index-nats.ts:353-358`;
+now the `resolveEffectiveAccountAuth` call at `index-nats.ts:293-300`), while the
 CREDENTIAL-SOURCE resolver separately honors
 `WEBCHANNEL_SAAS_BASE_URL > nats.credentials.saasBaseUrl > input > default`
 (`nats-credential-source.ts:309`). `nats.credentials.saasBaseUrl` does NOT feed
@@ -326,16 +335,16 @@ cross-account/config-layout.
 
 | # | checkId | Condition (source) | kind / severity | Fix hint |
 |---|---------|--------------------|-----------------|----------|
-| C1 | `encryption-disabled` | `resolveEncryptionPolicy` throws (`encryption.mode:"disabled"`) — `index-nats.ts:391-400` | config / error | Remove the `encryption.mode` override — the NATS channel is encrypt-by-construction |
-| C2 | `creds-missing` | credential source resolves to `enrolled` AND `loadPersistedEnrolledCreds(accountId)` is undefined — mirrors `consumeCredentialSource` `creds-missing` (`index-nats.ts:419-429`) | auth / error | `openclaw channels add --channel webchannel --account <id>` |
-| C3a | `register-hop-static-unsupported` | admission=register-hop AND credentialMode=`static` — the runtime ALWAYS fail-closes here (static consume never yields an identity key: `nats-credential-source.ts:390`, guard `index-nats.ts:537-560`) | config / error | Remediation must actually clear the finding (rev2 finding 4 — ANY static signal keeps resolving `static` before `enrolled`, `nats-credential-source.ts:253`): EITHER remove ALL static credential signals (`nats.credentials.{mode,credsFile,userJwt,userSeed}` + `WEBCHANNEL_NATS_{CREDS,USER_JWT,USER_SEED}` env) and enroll, OR set `nats.admission:"auto"` deliberately. Test: applying the suggested fix yields zero findings |
-| C3b | `identity-key-missing` | admission=register-hop AND credentialMode=`enrolled` AND persisted creds lack the identity key (pre-F2 creds) — `index-nats.ts:548-559` | auth / error | Re-enroll to mint an attested identity key (same command as C2) |
+| C1 | `encryption-disabled` | `resolveEncryptionPolicy` throws (`encryption.mode:"disabled"`) — `index-nats.ts:325-334` | config / error | Remove the `encryption.mode` override — the NATS channel is encrypt-by-construction |
+| C2 | `creds-missing` | credential source resolves to `enrolled` AND `loadPersistedEnrolledCreds(accountId)` is undefined — mirrors `consumeCredentialSource` `creds-missing` (`index-nats.ts:353-363`) | auth / error | `openclaw channels add --channel webchannel --account <id>` |
+| C3a | `register-hop-static-unsupported` | admission=register-hop AND credentialMode=`static` — the runtime ALWAYS fail-closes here (static consume never yields an identity key: `nats-credential-source.ts:390`, guard `index-nats.ts:471-494`) | config / error | Remediation must actually clear the finding (rev2 finding 4 — ANY static signal keeps resolving `static` before `enrolled`, `nats-credential-source.ts:253`): EITHER remove ALL static credential signals (`nats.credentials.{mode,credsFile,userJwt,userSeed}` + `WEBCHANNEL_NATS_{CREDS,USER_JWT,USER_SEED}` env) and enroll, OR set `nats.admission:"auto"` deliberately. Test: applying the suggested fix yields zero findings |
+| C3b | `identity-key-missing` | admission=register-hop AND credentialMode=`enrolled` AND persisted creds lack the identity key (pre-F2 creds) — `index-nats.ts:482-493` | auth / error | Re-enroll to mint an attested identity key (same command as C2) |
 | C4 | `verifier-unbuildable` | admission=register-hop AND the verifier config fails the REAL validation rules. Mechanism (rev2 finding 5 — calling `resolveVerifier` directly would mutate the module-level JWKS-cache `WeakMap`, `auth.ts:193`, from an offline scan): extract/export a side-effect-free **`validateJwtVerifierConfig(auth)`** in `auth.ts` that owns the exact non-empty issuer/audience + exactly-one-key-source rules (`auth.ts:243,260`); `makeJwtVerifier` calls it first (single validation source — semantics cannot drift) and the doctor calls it alone (no cache construction). Surface the thrown/returned error verbatim | config / error | From the validation error + effective issuer/aud state; live URL reachability stays in the probe |
-| C5 | `shared-audience` | two register-hop jwt accounts share slash-normalized (issuer, audience) — `index-nats.ts:491-518` | config / error | Give each register-hop account a distinct audience (= its accountId); names BOTH accounts |
-| C6 | `open-admission` | admission=auto AND `isDmPostureOpen(dmSecurity)` (`dm-allowlist.ts:55`) — `index-nats.ts:841-846` | intent / warn | Set `dmSecurity:"allowlist"` and populate `allowFrom`, or rely on NATS subject permissions deliberately |
-| C7 | `obsolete-cors` | `auth.cors` present — `index-nats.ts:375-383` | config / warn | Delete the `auth.cors` block (register hop moved to NATS; origin allowlisting is inert) |
+| C5 | `shared-audience` | two register-hop jwt accounts share slash-normalized (issuer, audience) — `index-nats.ts:425-452` | config / **error** (deliberate escalation — see below) | Give each register-hop account a distinct audience (= its accountId); names BOTH accounts |
+| C6 | `open-admission` | admission=auto AND `isDmPostureOpen(dmSecurity)` (`dm-allowlist.ts:55`) — `index-nats.ts:775-780` | intent / warn | Set `dmSecurity:"allowlist"` and populate `allowFrom`, or rely on NATS subject permissions deliberately |
+| C7 | `obsolete-cors` | `auth.cors` present — `index-nats.ts:309-317` | config / warn | Delete the `auth.cors` block (register hop moved to NATS; origin allowlisting is inert) |
 | C8 | `auth-strategy-invalid` | non-jwt `auth.strategy`, classified CONTEXTUALLY (review finding 9): (a) explicit `nats.admission:"register-hop"` override + non-jwt → **error** (verifier construction will fail; account skipped); (b) `strategy:"anonymous"`/unknown with NO explicit admission → **warn**: "auth is ignored; admission silently became `auto`" (`resolveAdmissionMode` defaults non-jwt→auto, `nats-admission.ts:68`; `resolveVerifier` would throw, `auth.ts:309`, but is never called for auto); (c) intentional auto/static BYO-NATS with no auth block at all → **no finding** | config / error-or-warn | (a) use `strategy:"jwt"`; (b) remove the inert auth block or switch to jwt; (c) — |
-| C9 | `credential-source-invalid` | `resolveNatsCredentialSource` throws (unreadable creds file `nats-credential-source.ts:280`; incomplete static jwt/seed `:293`) — the serving loop catch-skips the whole block (`index-nats.ts:458-464`) (review finding 8) | config / error | From the thrown message (file path / missing field named) |
+| C9 | `credential-source-invalid` | `resolveNatsCredentialSource` throws (unreadable creds file `nats-credential-source.ts:280`; incomplete static jwt/seed `:293`) — the serving loop catch-skips the whole block (`index-nats.ts:392-398`) (review finding 8) | config / error | From the thrown message (file path / missing field named) |
 | C10 | `orphaned-default` | the orphaned-default shape ONLY (rev2 finding 6 — do not string-route arbitrary sink warnings): refactor `warnOnOrphanedDefault` (`multiplex.ts:96-111`) into an exported pure predicate `detectOrphanedDefault(cfg): boolean` + a warn wrapper, so serving loop and doctor share ONE detector. Condition: channel-level auth/nats beside named accounts, no `accounts.default` | config / warn | Move the intended default's fields under `accounts.default` |
 | C11 | `deprecated-acquisition-env` | deprecated acquisition env vars set while `channels.webchannel` config exists — they are IGNORED (`acquisition-env.ts:74-84`; detect via the same `ACQUISITION_IDENTITY_ENV_KEYS` + has-config predicate, not the once-only warn sink whose `deprecationWarned` latch would suppress repeat scans) | config / warn | Unset the deprecated env vars (named in the message); config is authoritative — use `openclaw channels add` |
 
@@ -343,6 +352,17 @@ Semantics rule: the doctor **mirrors** the serving loop; it never introduces new
 semantics. C3a documents (not changes) the current static-register-hop
 fail-close — if that behavior is ever revisited, serving loop and doctor change
 together through the shared resolver.
+
+**C5 is a deliberate, documented divergence from strict mirroring.** The runtime
+(`index-nats.ts:425-452`) only WARNS on a shared audience and serves both —
+it is not a skip — yet the doctor reports `error`. This is an intentional
+stricter-than-runtime escalation, not a bug and not drift: doctor's job includes
+catching what the runtime tolerates. A shared audience means a bootstrap JWT
+minted for account A also verifies for account B, so a browser admitted to A
+reaches B's conversation keys and history — a cross-account boundary failure,
+which is an `error` regardless of the runtime's willingness to keep serving. The
+severity is deliberately NOT downgraded to match the runtime warn. Any future
+change to either side should keep this asymmetry conscious.
 
 ## 5. Files touched
 
@@ -366,7 +386,10 @@ together through the shared resolver.
 - **IN (Phase 1)**: `doctor.collectPreviewWarnings`, C1–C11,
   `resolveEffectiveAccountAuth` extraction.
 - **IN (Phase 2)**: `status.probeAccount` (effective-source JWKS + relay dial),
-  runtime-only `collectStatusIssues`, optional thin `describeAccount`.
+  runtime-only `collectStatusIssues`.
+- **DEFERRED (to the `lastError` follow-up PR below) — thin `describeAccount`.**
+  Previously listed IN (Phase 2). This PR deliberately keeps `openclaw doctor` as
+  the diagnosis surface and does not touch the status snapshot path.
 - **OUT — demo admin panel surface.** SaaS-side surface; doctor output is
   agent-side; bridging needs a new reporting path. Acceptance met via
   `openclaw doctor`.
@@ -377,6 +400,23 @@ together through the shared resolver.
 - **OUT — live register round-trip probe.** Same honest-scope reasoning as
   Gate A (`preflight.ts:205-233`): no browser bootstrap JWT exists at probe
   time.
+- **OUT — removing `audience` configurability entirely. BACKLOG note.**
+  Everything up to the plugin is already accountId-based (binding/routing beyond
+  that is core's job), so whether `audience` needs to be settable AT ALL is
+  questionable. Rather than have doctor police shared audiences forever (C5),
+  review the necessity first: if nothing legitimately needs a pinned audience,
+  block the setting so every audience is accountId-derived — and the
+  shared-audience failure class stops existing instead of being diagnosed.
+- **OUT (follow-up PR) — record `lastError` at the serving-loop skips. BACKLOG
+  note.** All 5 skips only log and `continue`; they record no machine-readable
+  state. `collectStatusIssuesFromLastError` (SDK `status-helpers`) reads
+  `account.lastError`, so for webchannel it always finds nothing. Consequence:
+  with the gateway RUNNING and an account actively NOT being served, `openclaw
+  status` still shows that account green — the skip is silent on the status
+  surface. Fix: set `lastError` on the channel runtime state at each skip; the
+  SDK's existing wiring (`lastError` → `collectStatusIssuesFromLastError` →
+  status warn) then surfaces it for free. Pairs with the deferred
+  `describeAccount` above.
 
 ## 7. Testing
 
@@ -390,7 +430,7 @@ together through the shared resolver.
    (`account-config.ts:184` fallback); (ii) static BYO-NATS with implicit
    `auto` and NO auth block (locks C8(c), `nats-admission.ts:68`); (iii)
    dev-open register-hop (well-known dev identity fallback — no C3 finding,
-   `index-nats.ts:539-546`); (iv) healthy enrolled register-hop (persisted
+   `index-nats.ts:473-480`); (iv) healthy enrolled register-hop (persisted
    creds + identity key + valid jwt block).
    **Remediation test** (rev2 finding 4): applying C3a's suggested fix to the
    fixture clears the finding.
