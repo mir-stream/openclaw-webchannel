@@ -17,7 +17,7 @@
  */
 
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   listWebchannelAccountIds,
   readAccountsMap,
   readWebchannelSection,
@@ -100,7 +100,7 @@ function warnOnOrphanedDefault(cfg: unknown, warn?: (msg: string) => void): void
   const accounts = readAccountsMap(section);
   const hasNamedAccounts = Object.keys(accounts).length > 0;
   if (!hasNamedAccounts) return;
-  if (DEFAULT_ACCOUNT_ID in accounts) return;
+  if (DEFAULT_WEBCHANNEL_ACCOUNT_ID in accounts) return;
   const hasIdentityBase = "auth" in section || "nats" in section;
   if (!hasIdentityBase) return;
   warn(

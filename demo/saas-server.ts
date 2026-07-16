@@ -42,7 +42,11 @@
  *   DEMO_CLIENT_ENTRY    path to web/src/app.ts (esbuild → /app.js IIFE)
  */
 
-import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../packages/saas/src/device-flow-enrollment.js";
+import {
+  DeviceFlowEnrollment,
+  EnrollmentValidationError,
+  MemoryEnrollmentStore,
+} from "../packages/saas/src/device-flow-enrollment.js";
 import { MemoryAgentKeyRegistry } from "../packages/saas/src/agent-key-registry.js";
 import { loadOrCreateTrustChain } from "../packages/saas/src/persistent-trust-chain.js";
 import { generateRsaKeypair } from "../packages/saas/src/setup-trust-chain.js";
@@ -58,6 +62,8 @@ import { mintNatsUserCreds, issueBrowserCredentials, type NatsUserRole } from ".
 import { assertValidSubjectToken } from "../packages/saas/src/subject-token.js";
 import type { EnrollmentRequest, PollRequest } from "../packages/saas/src/device-flow-types.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createDemoEnrollmentHttpHandler } from "../packages/saas/src/enrollment-http-handler.js";
+import { serializeBootstrapResponse, serializeEnrollmentResponse } from "../packages/saas/src/p1-1-wire-adapter.js";
 import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -284,6 +290,23 @@ const enrollment = new DeviceFlowEnrollment({
   store: enrollmentStore,
   agentKeyRegistry,
 });
+export const createDemoEnrollmentHandler = createDemoEnrollmentHttpHandler;
+const demoEnrollmentAdminHandler = createDemoEnrollmentHandler({
+  authorize(req) {
+    const user = sessionUser(req);
+    return user && isAdmin(user)
+      ? { ok: true }
+      : { ok: false, status: 403, error: "admin session required" };
+  },
+  enrollment, defaultTenant: DEMO_TENANT,
+  registry: agentKeyRegistry, bootstrap: () => ({ error: "bootstrap is handled by the session route" }),
+  onApproved(userCode) {
+    markEnroll(userCode, "approved");
+    const tracked = demoEnrollments.get(userCode);
+    if (tracked?.accountId && !DEMO_ACCOUNTS[tracked.accountId]) DEMO_ACCOUNTS[tracked.accountId] = { source: "enrolled" };
+  },
+  onDenied(userCode) { markEnroll(userCode, "denied"); },
+});
 
 // Live view of enrollment requests for the admin panel (the store has no
 // "list pending" API). Keyed by user_code, insertion-ordered for stable render.
@@ -468,7 +491,12 @@ function nowMs(): number {
 // HTTP server
 // ---------------------------------------------------------------------------
 
-const server = createServer(async (req, res) => {
+export const demoSaasRequestHandler = async (req: IncomingMessage, res: ServerResponse) => {
+  const delegatedPath = new URL(req.url ?? "/", "http://demo.invalid").pathname;
+  if (/^\/admin\/enrollments\/[^/]+\/(?:approve|deny)$/.test(delegatedPath) || /^\/admin\/accounts\/[^/]+\/revoke$/.test(delegatedPath)) {
+    await demoEnrollmentAdminHandler(req, res);
+    return;
+  }
   setCors(res);
   if (req.method === "OPTIONS") {
     res.writeHead(200);
@@ -614,19 +642,18 @@ const server = createServer(async (req, res) => {
             // Omitted when the account has no enrolled agent key yet (e.g. an
             // auto/registration account); the client only requires it on the
             // register-hop path.
-            const agentPublicKey = await agentKeyRegistry.get(DEMO_TENANT, accountId);
+            const agentPublicKey = (await agentKeyRegistry.getActive(DEMO_TENANT, accountId))?.publicKey ?? null;
             console.log(
               `[bootstrap] issued JWT for ${user.username} peerId=${user.uuid} account=${accountId}` +
                 (agentPublicKey ? " (+agentPublicKey pin)" : ""),
             );
             // The client derives the register subject from tenant/accountId/peerId
             // and dials the shared relay — no gateway URL travels in the response.
-            sendJson(res, {
+            sendJson(res, serializeBootstrapResponse({
               jwt,
               peerId: user.uuid,
               natsUrl: NATS_URL,
-              ...(agentPublicKey ? { agentPublicKey } : {}),
-            });
+            }, agentPublicKey));
           })
           .catch((err) => {
             console.error("[bootstrap] Error:", err);
@@ -641,12 +668,12 @@ const server = createServer(async (req, res) => {
       parseJsonBody(req, (body) => {
         if (!body) return sendJson(res, { error: "Invalid JSON body" }, 400);
         const enrollRequest = body as EnrollmentRequest;
-        if (!enrollRequest.agentPublicKey || !enrollRequest.tenant) {
-          return sendJson(res, { error: "Missing required fields: agentPublicKey, tenant" }, 400);
+        if (!enrollRequest.agentPublicKey || !enrollRequest.tenant || !enrollRequest.accountId) {
+          return sendJson(res, { error: "Missing required fields: agentPublicKey, tenant, accountId" }, 400);
         }
         try {
           assertValidSubjectToken(enrollRequest.tenant, "tenant");
-          if (enrollRequest.accountId !== undefined) assertValidSubjectToken(enrollRequest.accountId, "accountId");
+          assertValidSubjectToken(enrollRequest.accountId, "accountId");
         } catch (err) {
           return sendJson(res, { error: (err as Error).message }, 400);
         }
@@ -655,9 +682,12 @@ const server = createServer(async (req, res) => {
           .then((resp) => {
             console.log(`[enroll] created ${resp.user_code} (account=${enrollRequest.accountId})`);
             trackEnroll(resp.user_code, enrollRequest.tenant, enrollRequest.accountId);
-            sendJson(res, resp);
+            sendJson(res, serializeEnrollmentResponse(resp));
           })
           .catch((err) => {
+            if (err instanceof EnrollmentValidationError) {
+              return sendJson(res, { error: err.message }, 400);
+            }
             console.error("[enroll] Error:", err);
             sendJson(res, { error: "Internal server error" }, 500);
           });
@@ -694,55 +724,6 @@ const server = createServer(async (req, res) => {
       if (req.method === "GET" && path === "/admin/enrollments") {
         return sendJson(res, enrollmentSnapshot());
       }
-      // POST /admin/enrollments/:code/approve | /deny
-      const enrollMatch = path.match(/^\/admin\/enrollments\/([^/]+)\/(approve|deny)$/);
-      if (req.method === "POST" && enrollMatch) {
-        const userCode = decodeURIComponent(enrollMatch[1]);
-        const action = enrollMatch[2];
-        if (action === "approve") {
-          enrollment
-            .approve(userCode)
-            .then((result) => {
-              if (result) {
-                markEnroll(userCode, "approved");
-                // An approved enrollment IS the account entering the directory —
-                // no separate registration or URL step. Register admission is over
-                // NATS, so the moment it is in the directory it is dialable + grantable.
-                const tracked = demoEnrollments.get(userCode);
-                if (tracked?.accountId && !DEMO_ACCOUNTS[tracked.accountId]) {
-                  DEMO_ACCOUNTS[tracked.accountId] = { source: "enrolled" };
-                  console.log(`[admin] account "${tracked.accountId}" entered the directory (enrolled → grantable)`);
-                }
-                console.log(`[admin] approved ${userCode} → peer ${result.peerId}`);
-                sendJson(res, { ok: true, peerId: result.peerId });
-              } else {
-                sendJson(res, { error: "Enrollment not found or expired" }, 404);
-              }
-            })
-            .catch((err) => {
-              console.error("[admin/approve] Error:", err);
-              sendJson(res, { error: "Internal server error" }, 500);
-            });
-        } else {
-          enrollment
-            .deny(userCode)
-            .then((ok) => {
-              if (ok) {
-                markEnroll(userCode, "denied");
-                console.log(`[admin] denied ${userCode}`);
-                sendJson(res, { ok: true });
-              } else {
-                sendJson(res, { error: "Enrollment not found" }, 404);
-              }
-            })
-            .catch((err) => {
-              console.error("[admin/deny] Error:", err);
-              sendJson(res, { error: "Internal server error" }, 500);
-            });
-        }
-        return;
-      }
-
       // GET /admin/signing-key — current active kid + the kids published in JWKS.
       if (req.method === "GET" && path === "/admin/signing-key") {
         return sendJson(res, { activeKid, jwksKids: jwksKeys.map((k) => k.kid) });
@@ -901,9 +882,10 @@ const server = createServer(async (req, res) => {
     console.error("[demo-saas] Error:", err);
     sendJson(res, { error: "Internal server error" }, 500);
   }
-});
+};
+const server = createServer(demoSaasRequestHandler);
 
-server.listen(PORT, () => {
+export function startDemoSaasServer(): void { server.listen(PORT, () => {
   console.log("");
   console.log("==============================================");
   console.log("  WebChannel Showcase Demo — SaaS");
@@ -919,9 +901,11 @@ server.listen(PORT, () => {
   console.log("  Logins (password \"demo\"):  alice, bob (chat) · admin (approve/grant)");
   console.log("==============================================");
   console.log("");
-});
+}); }
 
-process.on("SIGINT", () => {
+if (process.argv[1] === fileURLToPath(import.meta.url)) startDemoSaasServer();
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) process.on("SIGINT", () => {
   console.log("\n[demo-saas] shutting down…");
   enrollmentStore.close();
   server.close(() => process.exit(0));

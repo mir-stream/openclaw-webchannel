@@ -19,9 +19,9 @@ name: E2E Gate
 
 on:
   push:
-    branches: [main, master, develop, "feature/**"]
+    branches: [main, master, develop, review, "feature/**"]
   pull_request:
-    branches: [main, master, develop]
+    branches: [main, master, develop, review]
 
 # Only one gate run per branch/PR at a time; cancel stale in-progress runs.
 concurrency:

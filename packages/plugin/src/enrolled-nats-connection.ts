@@ -57,7 +57,7 @@ export type EnrolledNatsConnectionOptions = {
    * enrollment AND threaded into credential-path resolution so the connection
    * reads the account-scoped creds. Defaults to `"default"`.
    */
-  accountId?: string;
+  accountId: string;
 
   /**
    * Local credential storage path. Overrides the account-scoped default.
@@ -192,6 +192,7 @@ export async function createEnrolledNatsConnection(
  */
 export function createDefaultNatsConnection(
   tenant: string,
+  accountId: string,
   natsUrl: string,
   saasBaseUrl: string,
 ): Promise<EnrolledNatsConnection> {
@@ -200,5 +201,6 @@ export function createDefaultNatsConnection(
     saasPollUrl: `${saasBaseUrl}/api/poll`,
     natsUrl,
     tenant,
+    accountId,
   });
 }

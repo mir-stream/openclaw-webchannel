@@ -78,7 +78,7 @@ import type {
   ApprovalRequestPayload,
 } from "./channel-contract.js";
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   listWebchannelAccountIds,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
@@ -117,7 +117,7 @@ const deliveredApprovalAccounts = new Map<string, string>();
 
 /** Normalize an account id for binding comparison (null/unscoped ⇒ "default"). */
 function bindingAccountKey(accountId: string | null | undefined): string {
-  return accountId ?? DEFAULT_ACCOUNT_ID;
+  return accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
 }
 
 /**
@@ -524,7 +524,7 @@ function readExecApprovals(
   agentFilter?: string[];
   sessionFilter?: string[];
 } | undefined {
-  const account = resolveWebchannelAccountConfig(cfg, accountId ?? DEFAULT_ACCOUNT_ID);
+  const account = resolveWebchannelAccountConfig(cfg, accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
   return account.execApprovals as ReturnType<typeof readExecApprovals>;
 }
 
@@ -766,7 +766,7 @@ export function createClawApprovalNativeRuntimeSpec(
           // Scope the dedupe key by account: the SAME peerId registered on two
           // accounts is two distinct delivery targets (each account's channel),
           // never one deduped entry.
-          dedupeKey: `${WEBCHANNEL_ID}:${accountId ?? DEFAULT_ACCOUNT_ID}:${sessionKey}`,
+          dedupeKey: `${WEBCHANNEL_ID}:${accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}:${sessionKey}`,
           target: { sessionKey },
         };
       },
@@ -791,7 +791,7 @@ export function createClawApprovalNativeRuntimeSpec(
           // Refuse to misroute onto the primary channel; drop with a warn.
           console.warn(
             `[webchannel] approval ${pendingPayload.id} not delivered: no live channel for ` +
-              `account "${accountId ?? DEFAULT_ACCOUNT_ID}" (skipped or unknown) — refusing to misroute`,
+              `account "${accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}" (skipped or unknown) — refusing to misroute`,
           );
           return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
         }
@@ -804,7 +804,7 @@ export function createClawApprovalNativeRuntimeSpec(
         if (!delivered) {
           console.warn(
             `[webchannel] approval ${pendingPayload.id} not delivered: no matching open ` +
-              `socket for "${sessionKey}" (account "${accountId ?? DEFAULT_ACCOUNT_ID}")`,
+              `socket for "${sessionKey}" (account "${accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}")`,
           );
         }
         return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
@@ -841,7 +841,7 @@ export function createClawApprovalNativeRuntimeSpec(
         if (!channel) {
           console.warn(
             `[webchannel] approval ${entry.approvalId} resolve frame dropped: no live channel ` +
-              `for account "${accountId ?? entry.accountId ?? DEFAULT_ACCOUNT_ID}"`,
+              `for account "${accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}"`,
           );
           return;
         }

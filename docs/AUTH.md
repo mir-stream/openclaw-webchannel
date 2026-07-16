@@ -31,3 +31,23 @@ produce a targeted migration error. Remove it and rerun
 `openclaw channels add --channel webchannel`.
 
 See [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) for the complete trust model.
+
+## Agent identity-key lifecycle
+
+An account is the isolation axis and represents one logical agent. Agent HA replicas must share the same identity key; independently keyed replicas are unsupported and surface as replacement conflicts. Enrollment wire formats do not contain an `agentId`.
+
+The approval guarantees assume one issuer process and require the enrollment store and agent-key registry to use the same durability domain (both memory for development, or both durable in the same database). Mixed durability is unsupported. Multi-issuer enrollment-transition serialization and atomic store/registry commits are deferred work; registry CAS nevertheless ensures a losing different-key approval never receives credentials.
+
+Revocation permanently tombstones the active identity key and only stops that slot's key from being served to future bootstrap requests. It does not disconnect browsers that already pinned the key and does not revoke the agent's existing NATS credentials.
+
+### Offline re-key after revocation
+
+This is intentionally an offline operation; deleting a file cannot replace credentials held by a running transport.
+
+1. Stop the OpenClaw gateway.
+2. Delete the account credential file: `rm -- "$HOME/.openclaw-webchannel/<account>/credentials.json"`. If `credentialPath` is configured, delete that exact override instead.
+3. Also remove the obsolete single-file credential, if present: `rm -f -- "$HOME/.openclaw-webchannel/credentials.json"`. Readers no longer use it.
+4. Run `openclaw channels add --channel webchannel` for the account and approve the new enrollment.
+5. Restart the gateway only after enrollment completes.
+
+Until the restart, an already-running transport continues using its old in-memory credentials; online hot-swap is not supported.

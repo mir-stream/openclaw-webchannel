@@ -38,6 +38,7 @@ import type { JwksDocument } from "../src/types.js";
 // under its attested agent identity key. Deliver that key's PUBLIC half (supplied
 // via WEBCHANNEL_AGENT_PUBLIC_KEY) so the browser pins the same key the agent
 // wraps under; omitted → the browser fail-closes on the register path.
+import { serializeBootstrapResponse } from "../src/p1-1-wire-adapter.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -237,18 +238,17 @@ async function handleBootstrap(req: any, res: any, trustChain: RealTrustChain): 
     // REAL RS256 signature with the trust-chain private key; header.kid = trust kid.
     const jwt = await signBootstrapJwt(jwtPayload, trustChain);
 
-    const response: BootstrapResponse = {
+    const response = serializeBootstrapResponse({
       jwt,
       peerId,
+      jwksUrl: JWKS_URL,
+      natsUrl: NATS_URL,
       // F2: deliver the SaaS-attested agent identity public key so the browser
       // pins it — gated on the `WEBCHANNEL_AGENT_PUBLIC_KEY` env being set (this
       // reference server has no registry/enrollment, so the operator supplies the
       // key explicitly). Omitted when the env is unset → the browser fail-closes
       // on the register path.
-      ...(AGENT_PUBLIC_KEY ? { agentPublicKey: AGENT_PUBLIC_KEY } : {}),
-      jwksUrl: JWKS_URL,
-      natsUrl: NATS_URL,
-    };
+    }, AGENT_PUBLIC_KEY ?? null) as BootstrapResponse;
 
     sendJson(res, response);
     console.log(`[bootstrap] Issued RS256 bootstrap JWT (kid=${trustChain.kid}) for peerId=${peerId}, tenant=${request.tenant}`);

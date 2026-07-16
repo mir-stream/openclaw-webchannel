@@ -3,7 +3,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
-import { DEFAULT_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
+import { DEFAULT_WEBCHANNEL_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
 import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
 
@@ -71,7 +71,7 @@ export async function handleInboundMessage(
   transport: WebChannelPeerChannel,
   peerId: string,
   message: InboundUserMessage,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   options?: { controlLane?: boolean },
 ): Promise<void> {
   // `wsKey` is the verified per-peer id the transport uses as its socket-map

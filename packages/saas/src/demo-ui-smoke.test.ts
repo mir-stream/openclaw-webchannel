@@ -106,6 +106,7 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
         DEMO_ACCOUNT_ID: ACCOUNT_ID,
         DEMO_TENANT: TENANT,
         DEMO_PEER_ID: "smoke-peer",
+        ENROLLMENT_ADMIN_TOKEN: "test-admin-token",
       },
       stdio: "pipe",
     });
@@ -156,7 +157,7 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
 
     const approve = await fetch(`${BASE}/approve`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-admin-token" },
       body: JSON.stringify({ user_code: code }),
     });
     expect(approve.ok).toBe(true);
@@ -168,7 +169,7 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
     const code = await enroll("smoke-agent-2");
     const deny = await fetch(`${BASE}/deny`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-admin-token" },
       body: JSON.stringify({ user_code: code }),
     });
     expect(deny.ok).toBe(true);

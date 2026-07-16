@@ -302,6 +302,7 @@ Pairing runs during **`channels add`** (§4), which prints the pairing prompt:
 - **curl (most reliable):**
   ```bash
   curl -X POST http://127.0.0.1:3951/approve \
+    -H "authorization: Bearer $ENROLLMENT_ADMIN_TOKEN" \
     -H 'content-type: application/json' -d '{"user_code":"ABCD-EFGH"}'
   # → {"success":true,…}
   ```
@@ -316,9 +317,8 @@ later at `gateway run`):
 [webchannel] ✓ Credentials acquired for account "default" → ~/.openclaw-webchannel/default/credentials.json (peerId=…)
 ```
 
-Creds are cached at `~/.openclaw-webchannel/<account>/credentials.json` (mode 0600;
-`"default"` also falls back to the legacy `~/.openclaw-webchannel/credentials.json` if
-present). Then start the gateway — it **consumes** the persisted creds, never re-enrolls:
+Creds are cached at `~/.openclaw-webchannel/<account>/credentials.json` (mode 0600).
+Then start the gateway — it **consumes** the persisted creds, never re-enrolls:
 
 ```bash
 openclaw gateway run        # connection config lives in config (§4); creds were acquired in §4

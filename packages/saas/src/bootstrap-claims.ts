@@ -18,6 +18,8 @@
  * This module builds the claim object only; signing (RS256) is the issuer's job.
  */
 
+import { assertValidSubjectToken } from "./subject-token.js";
+
 /** Device X25519 public key (cnf.jwk) — base64url 32-byte `x`. */
 export type DeviceCnfJwk = {
   readonly kty: "OKP";
@@ -114,6 +116,7 @@ export function buildBootstrapClaims(input: BootstrapClaimsInput): BootstrapClai
   if (isMulti && audience.length === 0) {
     throw new Error("bootstrap-claims: accountId array must be non-empty");
   }
+  for (const value of isMulti ? audience : [audience]) assertValidSubjectToken(value, "accountId");
   const primaryAccountId = isMulti ? "" : audience;
 
   const claims: BootstrapClaims = {

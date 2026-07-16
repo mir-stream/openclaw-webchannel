@@ -36,6 +36,7 @@ import { encodeUser } from "@nats-io/jwt";
 import { setupTrustChain } from "./setup-trust-chain.js";
 import type { SetupTrustChainResult, NatsSelfContainedAccountConfig } from "./types.js";
 import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
+import { MemoryAgentKeyRegistry } from "./agent-key-registry.js";
 import type { NatsUserCredentials } from "./device-flow-types.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
 
@@ -182,6 +183,7 @@ beforeAll(async () => {
 
   // Configure enrollment service
   enrollment = new DeviceFlowEnrollment({
+    agentKeyRegistry: new MemoryAgentKeyRegistry(),
     saasTrustChain: trustChain.private,
     natsAccountConfig: trustChain.natsConfig,
     saasBaseUrl: "https://saas.test.com",

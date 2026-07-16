@@ -29,7 +29,8 @@ import type {
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
-import type { AgentKeyRegistry } from "./agent-key-registry.js";
+import { createHash } from "node:crypto";
+import type { ActivationId, AgentKeyRecord, AgentKeyRegistry } from "./agent-key-registry.js";
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -95,6 +96,18 @@ const DEFAULT_RETENTION_MS = 300_000;
 const AGENT_PUBLIC_KEY_FORMAT = /^[A-Za-z0-9_-]{43}$/;
 
 /**
+ * A request-validation failure that is safe for an unauthenticated enrollment
+ * endpoint to return to its caller. Backend/store/runtime errors intentionally
+ * use their original types and must be handled by a sanitized 500 boundary.
+ */
+export class EnrollmentValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EnrollmentValidationError";
+  }
+}
+
+/**
  * Throw unless `key` is the exact `agentPublicKey` wire format.
  *
  * `/enroll` is unauthenticated and `agentPublicKey` is the one field whose
@@ -104,7 +117,7 @@ const AGENT_PUBLIC_KEY_FORMAT = /^[A-Za-z0-9_-]{43}$/;
  */
 function assertValidAgentPublicKey(key: unknown): void {
   if (typeof key !== "string" || !AGENT_PUBLIC_KEY_FORMAT.test(key)) {
-    throw new Error(
+    throw new EnrollmentValidationError(
       "webchannel: agentPublicKey must be base64url of a 32-byte X25519 public key",
     );
   }
@@ -433,14 +446,18 @@ export type DeviceFlowOptions = {
   store?: EnrollmentStore;
 
   /**
-   * F2 — durable agent identity-key registry. When supplied, enrollment APPROVAL
-   * upserts `(tenant, accountId) → agentPublicKey` here so the bootstrap path can
-   * deliver the attested agent key to the browser LONG after the pending-store
-   * eviction. Omit only in tests that don't exercise the bootstrap-pin path.
-   * Production MUST provide a PERSISTENT implementation (survives restarts).
+   * Durable agent identity-key registry. Required for every approval path.
+   * Production MUST provide a persistent implementation in the same durability
+   * domain as the enrollment store; mixed memory/durable configurations are unsupported.
    */
-  agentKeyRegistry?: AgentKeyRegistry;
+  agentKeyRegistry: AgentKeyRegistry;
 };
+
+export type ApproveOutcome =
+  | { kind: "approved"; result: EnrollmentResult }
+  | { kind: "conflict"; existing: { activationId: ActivationId; keyIdFingerprint: string; enrolledAt: number } | null; incoming: { keyIdFingerprint: string } }
+  | { kind: "revoked_key" }
+  | { kind: "rejected" };
 
 /**
  * The delivered-issuer default: trailing-slash-stripped base URL. MUST mirror
@@ -483,9 +500,10 @@ export class DeviceFlowEnrollment {
    */
   private readonly userCodeLocks = new Map<string, Promise<unknown>>();
   /** F2: durable agent identity-key registry (undefined = pin delivery disabled). */
-  private readonly agentKeyRegistry?: AgentKeyRegistry;
+  private readonly agentKeyRegistry: AgentKeyRegistry;
 
   constructor(options: DeviceFlowOptions) {
+    if (!options.agentKeyRegistry) throw new Error("agentKeyRegistry is required");
     this.options = {
       expirationSeconds: DEFAULT_EXPIRATION_SECONDS,
       pollIntervalSeconds: MIN_POLL_INTERVAL_SECONDS,
@@ -514,9 +532,13 @@ export class DeviceFlowEnrollment {
   async enroll(request: EnrollmentRequest): Promise<EnrollmentResponse> {
     // Reject tenant/accountId tokens that would break the NATS subject hierarchy
     // or cross tenant boundaries before they are persisted or used in a grant.
-    assertValidSubjectToken(request.tenant, "tenant");
-    if (request.accountId !== undefined) {
+    try {
+      assertValidSubjectToken(request.tenant, "tenant");
       assertValidSubjectToken(request.accountId, "accountId");
+    } catch (error) {
+      throw new EnrollmentValidationError(
+        error instanceof Error ? error.message : "webchannel: invalid enrollment subject",
+      );
     }
     // Reject a malformed/oversized agentPublicKey at ingress rather than late at
     // browser-side cnf binding (and cap store/approval-UI bloat from a huge string).
@@ -653,8 +675,8 @@ export class DeviceFlowEnrollment {
    * `expired` are terminal → null; the operator (or the clock) already
    * rejected the record and must not have credentials minted after the fact.
    */
-  async approve(userCode: string): Promise<EnrollmentResult | null> {
-    return this.withUserCodeLock(userCode, () => this.approveInner(userCode));
+  async approve(userCode: string, opts?: { replaceActivationId?: ActivationId }): Promise<ApproveOutcome> {
+    return this.withUserCodeLock(userCode, () => this.approveInner(userCode, opts));
   }
 
   /**
@@ -690,27 +712,43 @@ export class DeviceFlowEnrollment {
     return result;
   }
 
-  private async approveInner(userCode: string): Promise<EnrollmentResult | null> {
+  private result(natsCreds: NatsUserCredentials, peerId: string): EnrollmentResult {
+    return { creds: natsCreds, peerId, jwksUrl: this.options.jwksUrl, bootstrapUrl: this.options.bootstrapUrl, natsUrl: this.options.natsUrl, issuer: this.options.issuer };
+  }
+
+  private conflict(active: AgentKeyRecord | null, incomingKeyId: string): ApproveOutcome {
+    return {
+      kind: "conflict",
+      existing: active ? { activationId: active.activationId, keyIdFingerprint: active.keyId.slice(0, 12), enrolledAt: active.enrolledAt } : null,
+      incoming: { keyIdFingerprint: incomingKeyId.slice(0, 12) },
+    };
+  }
+
+  private async approveInner(userCode: string, opts?: { replaceActivationId?: ActivationId }): Promise<ApproveOutcome> {
     const enrollment = await this.store.getEnrollmentByUserCode(userCode);
-    if (!enrollment) return null;
+    if (!enrollment) return { kind: "rejected" };
 
     // Check expiration
     if (Date.now() > enrollment.expiresAt) {
       await this.store.updateEnrollment(enrollment.device_code, { status: "expired" });
-      return null;
+      return { kind: "rejected" };
     }
 
     // A2: already approved → return the credentials minted the first time
     // instead of overwriting them with a fresh identity.
     if (enrollment.status === "approved" && enrollment.natsCreds && enrollment.peerId) {
-      return {
-        creds: enrollment.natsCreds,
-        peerId: enrollment.peerId,
-        jwksUrl: this.options.jwksUrl,
-        bootstrapUrl: this.options.bootstrapUrl,
-        natsUrl: this.options.natsUrl,
-        issuer: this.options.issuer,
-      };
+      const active = await this.agentKeyRegistry.getActive(enrollment.tenant, enrollment.accountId);
+      if (!active) {
+        const history = await this.agentKeyRegistry.listHistory(enrollment.tenant, enrollment.accountId);
+        if (history.length === 0) {
+          const recovered = await this.agentKeyRegistry.register(enrollment.tenant, enrollment.accountId, enrollment.agentPublicKey, null);
+          if (!recovered.ok) console.warn("approved enrollment registry reconciliation failed", recovered.reason);
+        } else console.warn("approved enrollment has no active key; registry unchanged");
+      } else if (active.publicKey !== enrollment.agentPublicKey) {
+        console.warn("approved enrollment differs from active key; registry unchanged");
+      }
+      const result = this.result(enrollment.natsCreds, enrollment.peerId);
+      return { kind: "approved", result };
     }
 
     // #11: only a pending enrollment may be (newly) approved. `denied` and
@@ -718,7 +756,17 @@ export class DeviceFlowEnrollment {
     // record the operator (or the clock) already rejected. This also refuses to
     // re-mint on a corrupt approved-without-creds record (which fell through the
     // A2 guard above) rather than hand out a second, divergent identity.
-    if (enrollment.status !== "pending") return null;
+    if (enrollment.status !== "pending") return { kind: "rejected" };
+
+    const incomingKeyId = createHash("sha256").update(Buffer.from(enrollment.agentPublicKey, "base64url")).digest("base64url");
+    const history = await this.agentKeyRegistry.listHistory(enrollment.tenant, enrollment.accountId);
+    if (history.some((record) => record.status === "revoked" && record.keyId === incomingKeyId)) return { kind: "revoked_key" };
+    const active = await this.agentKeyRegistry.getActive(enrollment.tenant, enrollment.accountId);
+    let expect: ActivationId | null;
+    if (!active && opts?.replaceActivationId === undefined) expect = null;
+    else if (active?.publicKey === enrollment.agentPublicKey) expect = active.activationId;
+    else if (active && opts?.replaceActivationId === active.activationId) expect = active.activationId;
+    else return this.conflict(active, incomingKeyId);
 
     // Generate NATS user credentials
     const natsCreds = await this.generateNatsUserCredentials(enrollment);
@@ -726,34 +774,28 @@ export class DeviceFlowEnrollment {
     // Generate peer ID (bootstrap JWT subject)
     const peerId = this.generatePeerId();
 
+    const afterMint = await this.store.getEnrollment(enrollment.device_code);
+    if (!afterMint || afterMint.status !== "pending" || Date.now() > afterMint.expiresAt) return { kind: "rejected" };
+
+    const registered = await this.agentKeyRegistry.register(enrollment.tenant, enrollment.accountId, enrollment.agentPublicKey, expect);
+    if (!registered.ok) {
+      if (registered.reason === "revoked") return { kind: "revoked_key" };
+      return this.conflict(registered.current, incomingKeyId);
+    }
+
     await this.store.updateEnrollment(enrollment.device_code, {
       status: "approved",
       natsCreds,
       peerId,
     });
 
-    // F2: persist the attested agent identity public key DURABLY so a browser can
-    // pin it at bootstrap long after this pending record is swept. Upsert — a
-    // re-enroll mints a fresh identity key, and this newly-approved record carries
-    // it, so last-writer-wins is exactly right. Done only on the fresh-mint path
-    // (an idempotent re-approve above already returned without re-minting; the key
-    // is unchanged and already registered).
-    if (this.agentKeyRegistry) {
-      await this.agentKeyRegistry.put(
-        enrollment.tenant,
-        enrollment.accountId,
-        enrollment.agentPublicKey,
-      );
+    const stored = await this.store.getEnrollment(enrollment.device_code);
+    if (stored?.status !== "approved" || !stored.natsCreds || !stored.peerId) {
+      console.warn("approved enrollment was not observable after store update");
+      return { kind: "rejected" };
     }
-
-    return {
-      creds: natsCreds,
-      peerId,
-      jwksUrl: this.options.jwksUrl,
-      bootstrapUrl: this.options.bootstrapUrl,
-      natsUrl: this.options.natsUrl,
-      issuer: this.options.issuer,
-    };
+    const result = this.result(natsCreds, peerId);
+    return { kind: "approved", result };
   }
 
   /**
