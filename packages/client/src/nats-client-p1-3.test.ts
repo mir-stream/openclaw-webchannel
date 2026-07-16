@@ -10,7 +10,15 @@ class FakeWS {
   send(data: string): void { this.sent.push(data); }
   close(): void { this.closed = true; this.readyState = 3; this.onclose?.(); }
   open(): void { this.readyState = 1; this.onopen?.(); }
-  frame(data: string | Uint8Array): void { this.onmessage?.({ data: typeof data === "string" ? data : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) }); }
+  frame(data: string | Uint8Array): void {
+    if (typeof data === "string") { this.onmessage?.({ data }); return; }
+    // Copy into a freshly-constructed ArrayBuffer: `data.buffer` is typed
+    // ArrayBufferLike (may be SharedArrayBuffer) under the TS ≥5.7 typed-array
+    // generics that packages/client resolves on fresh installs.
+    const buf = new ArrayBuffer(data.byteLength);
+    new Uint8Array(buf).set(data);
+    this.onmessage?.({ data: buf });
+  }
 }
 let original: unknown;
 beforeEach(() => { original = globalThis.WebSocket; (globalThis as any).WebSocket = FakeWS; FakeWS.instances = []; });
