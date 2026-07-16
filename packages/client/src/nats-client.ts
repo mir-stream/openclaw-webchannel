@@ -446,7 +446,17 @@ export class NatsClient {
     // and breaks the parser — request ArrayBuffer and decode to UTF-8.
     ws.binaryType = "arraybuffer";
     this.ws = ws;
-    const dial = { buffer: new Uint8Array(0), connectSent: false, timer: null as ReturnType<typeof setTimeout> | null, phase: "WebSocket open" };
+    // NOTE: `buffer` is annotated as bare `Uint8Array` (generic default) — under
+    // TS ≥5.7 typed-array generics, letting it infer `Uint8Array<ArrayBuffer>`
+    // from `new Uint8Array(0)` rejects later assignments of encoder/slice results
+    // typed `Uint8Array<ArrayBufferLike>` (packages/client resolves a newer local
+    // TypeScript than the workspace root, so this must compile under both).
+    const dial: {
+      buffer: Uint8Array;
+      connectSent: boolean;
+      timer: ReturnType<typeof setTimeout> | null;
+      phase: string;
+    } = { buffer: new Uint8Array(0), connectSent: false, timer: null, phase: "WebSocket open" };
     const armDeadline = (phase: string): void => {
       dial.phase = phase;
       if (dial.timer) clearTimeout(dial.timer);
