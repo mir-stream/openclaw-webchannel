@@ -362,7 +362,7 @@ if [ "$WC_STATUS" = "101" ]; then
     echo "[run-all-real] FAIL — 101 on /webchannel/ws without the core connect.challenge (unknown upgrade handler)" >&2
     exit 2
   fi
-  if LC_ALL=C grep -aqE '"type"[[:space:]]*:[[:space:]]*"(agent_message|history|approval_request|approval_snapshot|typing|commands|ack)"' "$OCH/t3b-webchannel.out"; then
+  if LC_ALL=C grep -aqE '"type"[[:space:]]*:[[:space:]]*"(agent_message|history|approval_request|approval_snapshot|approval_resolved|typing|commands|ack|progress|reasoning|turn_settled)"' "$OCH/t3b-webchannel.out"; then
     echo "[run-all-real] FAIL — /webchannel/ws answered with webchannel-protocol frames" >&2
     exit 2
   fi

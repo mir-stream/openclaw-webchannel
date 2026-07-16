@@ -100,9 +100,9 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 
 ### D. 헤드리스 클라이언트 `openclaw-webchannel-client`  ✅ (2026-06-15)
 - ✅ `packages/client` 신규 구현 — **framework-agnostic, zero runtime dep**. ESM, `tsc` 빌드(라이브러리 → `dist/` JS + `.d.ts`).
-- ✅ `WebChannelNATSClient`: `connect()`/`close()`/`send()`/`decide()` + `subscribe(listener)`(불변 상태 스냅샷 push) + `getState()`. (재연결 백오프+지터, 동시-connect sentinel, 매 재연결 `getTicket`, progress 드래프트, 승인 카드, 고아 드래프트 정리, **typing indicator: `WebChannelState.isTyping` + `typing` 케이스 자동 settle**, **history pagination: connect 시 `history` 프레임으로 `state.messages` hydrate + `loadHistory({before?, limit?})` 페이지네이션 메서드, id 중복 가드**.)
+- ✅ `WebChannelNATSClient`: `connect()`/`close()`/`send()`/`decide()` + `subscribe(listener)`(불변 상태 스냅샷 push) + `getState()`. (재연결 백오프+지터, 동시-connect sentinel, progress 드래프트, 승인 카드, 고아 드래프트 정리, **typing indicator: `WebChannelState.isTyping` + `typing` 케이스 자동 settle**, **history pagination: connect 시 `history` 프레임으로 `state.messages` hydrate + `loadHistory({before?, limit?})` 페이지네이션 메서드, id 중복 가드**.)
 - ✅ **상태 소유권이 클라이언트** — 메시지/승인 리듀서가 여기 단일 출처. 순수 JS/Vue/React 뷰는 얇은 뷰. `state.messages`는 초기 비어있다가 connect 성공 시 서버 `history` 프레임으로 hydrate (스크롤 복원 / 페이지 reload 시 "어제 무슨 얘기했지?" UX 해결).
-- ✅ **크로스오리진 `url` 옵션** + same-origin `path` 옵션.
+- ✅ **크로스오리진 연결은 `natsUrl`(SaaS-delivered NATS WebSocket)** — WS-era `url`/`path` 옵션은 P0-1에서 제거됨.
 - ✅ `vitest` 유닛 29케이스 + 라이브 게이트웨이 hmac-ticket + jwt E2E(node smoke 스크립트 `smoke-client.mjs`, `NATS live harness`) 통과. (브라우저 UI는 소비자가 client 라이브러리 위에 직접 구성 — 이 repo는 데모 페이지를 배포하지 않는다.)
 - ✅ **삭제된 React `openclaw-webchannel-widget` 대체.** 위젯(`webchannel/widget`: `useWebChannel` 훅 + `Chat.tsx` + example)은 2026-06-15 삭제. 위젯이 들고 있던 연결 로직은 client에 프레임워크 없이 재구현됐다.
 - ⬜ `"private"` 해제(출시 시) / `<script>` 임베드 UMD / README.
@@ -121,7 +121,7 @@ openclaw plugins install ./my-plugin        # 로컬 개발
 
 지금까지: C(auth)·A 분리·D 헤드리스 클라이언트(+ 위젯 삭제)·E2E **완료**. 다음은 목표별:
 
-- **SaaS 임베드 목표** → ① 크로스오리진은 client `url` 옵션으로 **완료**, ② SaaS 백엔드 ticket 발급 연동(`issueWebChannelTicket` 호출 → `getTicket`), 필요 시 ③ `openclaw-webchannel-ticket` zero-dep 패키지 분리.
+- **SaaS 임베드 목표** → ① 크로스오리진 연결은 NATS WebSocket(`natsUrl`)으로 **완료**, ② 인증은 SaaS 백엔드 JWT 부트스트랩 발급으로 **완료** (ticket 전략·`getTicket`은 이후 완전히 제거됨 — [`AUTH.md`](AUTH.md) §4).
 - **출시 목표** → B(플러그인 publishable: private 해제·dist 빌드·`openclaw` peerDep·exports) + D(client `private` 해제·README) + F(라이선스·ClawHub·CI).
 
 ---

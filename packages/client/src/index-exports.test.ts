@@ -17,6 +17,7 @@ import {
   type BootstrapPayload,
   type PinnedKeys,
   type WebChannelErrorCause,
+  type WebChannelNATSClientOptions,
 } from "./index.js";
 import * as publicApi from "./index.js";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
@@ -55,10 +56,12 @@ describe("public export surface (package entry)", () => {
   });
 
   it("constructs the NATS wrapper type without legacy WS options", () => {
-    const compileOnly = (options: ConstructorParameters<typeof WebChannelNATSClient>[0]) =>
+    // Uses the barrel-exported options type (not ConstructorParameters) so tsc
+    // fails here if `WebChannelNATSClientOptions` drops off the public surface.
+    const compileOnly = (options: WebChannelNATSClientOptions) =>
       new WebChannelNATSClient(options);
     expect(compileOnly).toBeTypeOf("function");
-    const options: ConstructorParameters<typeof WebChannelNATSClient>[0] = {
+    const options: WebChannelNATSClientOptions = {
       natsUrl: "wss://relay.example.test",
       bootstrapJwt: "jwt",
       accountId: "account",

@@ -163,8 +163,9 @@ credentials — **no SaaS issuer required**.
 ```jsonc
 // channels.webchannel
 {
-  // NO `auth` block needed: static creds resolve admission to "auto", and the
-  // ConnectionVerifier is only built for the "register-hop" admission mode.
+  // NO `auth` block needed: static creds resolve admission to "auto", and JWT
+  // verification (`assertJwtAuthConfig` + the register-path `verifyIdentity`)
+  // only runs for the "register-hop" admission mode.
   // Browser admission here = NATS subject permissions + X25519 handshake
   // (+ an optional `dmSecurity` allowlist). The `jwt` register-hop strategy is
   // the only alternative; it is INERT on this static/auto NATS path.
