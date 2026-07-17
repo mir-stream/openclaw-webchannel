@@ -57,7 +57,16 @@ export {
   type ReconcileOutcome,
 } from "./enrollment-repository.js";
 export { runAgentKeyRegistryConformance } from "./agent-key-registry-conformance.js";
-export { runEnrollmentRepositoryConformance, interpose, type InterposeHooks } from "./enrollment-repository-conformance.js";
+export {
+  runEnrollmentRepositoryConformance,
+  enrollmentRepositoryConformanceCases,
+  interpose,
+  barrier,
+  type InterposeHooks,
+  type EnrollmentRepositoryFaultControl,
+  type EnrollmentRepositoryConformanceOptions,
+  type EnrollmentRepositoryConformanceCase,
+} from "./enrollment-repository-conformance.js";
 export { buildBootstrapClaims } from "./bootstrap-claims.js";
 export type {
   BootstrapClaims,

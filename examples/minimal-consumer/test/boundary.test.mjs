@@ -39,10 +39,12 @@ await ok("saas barrel exposes operator symbols", async () => {
     "CommitPayloadMismatchError",
     "runEnrollmentRepositoryConformance",
     "interpose",
+    "barrier",
     "buildBootstrapClaims",
   ]) {
     assert.equal(typeof saas[sym], "function", `expected ${sym} to be exported`);
   }
+  assert.equal(Array.isArray(saas.enrollmentRepositoryConformanceCases), true);
 });
 
 await ok("saas barrel does NOT leak raw mint / subject-token guards", async () => {

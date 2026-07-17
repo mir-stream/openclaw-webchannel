@@ -94,21 +94,31 @@ plugin receives NATS credentials it persists locally for re-connection.
 plugin                              SaaS                         operator
   │ POST /enroll (agentPublicKey,    │                              │
   │   tenant, accountId)             │                              │
-  │ ───────────────────────────────►│  create PendingEnrollment    │
+  │ ───────────────────────────────►│  create EnrollmentRecord     │
   │ ◄─────────────────────────────── │  status=pending              │
   │   device_code, user_code,        │                              │
   │   verification_uri[_complete],   │   ── shows user_code ──►      │
   │   expires_in, interval           │                              │ visits
   │                                  │                              │ verification_uri
   │ POST /poll (device_code)         │                              │ Approve / Deny
-  │ ──── every `interval`s ─────────►│  pending → approved | denied │ ◄────
-  │ ◄── 400 authorization_pending ── │     | expired                │
+  │ ──── every `interval`s ─────────►│  pending → approving       │ ◄────
+  │ ◄── 400 authorization_pending ── │    → approved | denied      │
   │ ◄── 200 EnrollmentResult ─────── │  on approve: mint NATS creds │
   │     (creds, peerId, jwksUrl,     │  + peerId                    │
   │      bootstrapUrl)               │                              │
 ```
 
-State: `pending → approved | expired | denied`. Codes are short-lived
+State: `pending → approving → approved`, with `pending|approving → denied`
+and eligible non-terminal records → `expired`. Approval claims carry leases;
+the repository clock is authoritative for leases, expiry, and retention. The
+process-local approval lock is advisory only: adapters must atomically fence
+claims and commit the enrollment, active key, and history together. Denying an
+`approving` record invalidates its claim, so a late commit cannot reverse the
+operator decision. Approved records are not expired by polling and remain
+available through `approvedAt + retentionMs` (equality retained) for boundary
+poll grace and idempotent commit recovery.
+
+Codes are short-lived
 (`expirationSeconds`, default 600s), the poll interval is enforced at a minimum
 of 5s per RFC 8628 (`pollIntervalSeconds`, default 5). Device codes are 256-bit
 (32-byte) crypto-random, base64url; user codes are `XXXX-XXXX` drawn from an

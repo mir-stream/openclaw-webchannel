@@ -15,7 +15,6 @@ import {
   loadOrCreateTrustChain,
   DeviceFlowEnrollment,
   MemoryEnrollmentRepository,
-  MemoryEnrollmentRepository,
   EnrollmentValidationError,
   buildBootstrapClaims,
   generateRsaKeypair,

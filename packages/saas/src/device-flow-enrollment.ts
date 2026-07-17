@@ -29,7 +29,7 @@ import type {
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { ActivationId, AgentKeyRecord } from "./agent-key-registry.js";
 import { DeviceCodeCollisionError, UserCodeCollisionError, type EnrollmentRepository } from "./enrollment-repository.js";
 
@@ -438,28 +438,19 @@ export class DeviceFlowEnrollment {
    * Called by the SaaS approval UI when the operator clicks "Approve".
    * Generates NATS user credentials and updates enrollment status.
    *
-   * A2: idempotent + race-safe WITHIN the enrollment's validity window.
+   * Approval is serialized by the repository's atomic claim/commit operations.
    * `/approve` is an unauthenticated, repeatable action (double-click, retry,
    * replay). Re-minting creds/peerId on a repeat would hand the already-connected
    * plugin a DIFFERENT identity on its next poll and break the live session, so:
    *  - a repeat AFTER the first approval returns the SAME credentials (status
    *    guard on the persisted enrollment), and
-   *  - two CONCURRENT approvals of the same enrollment are SERIALIZED by the
-   *    per-userCode lock (#22), so the second runs only after the first's whole
-   *    read-mint-write span settles and then re-reads → hits the A2 guard and
-   *    re-returns the first-minted identity (never a distinct second one).
-   * The same lock also serializes approve against a concurrent deny (#22): the
-   * two can no longer interleave so that one silently overwrites the other's
-   * terminal write — the loser re-reads and observes the winner via the #11
-   * status guards (deny-after-approve → false, approve-after-deny → null).
-   * Past `expiresAt` this returns null (the expiry check precedes the guard) —
-   * consistent with `poll()`, which also fails an expired record; the whole
-   * enroll→approve→poll cycle must complete inside the device-flow window.
+   * The process-local per-userCode lock only avoids duplicate work; correctness
+   * comes from repository-clock lease fencing and the atomic commit. Approved
+   * results remain recoverable after expiresAt for the configured retention
+   * horizon. An operator may deny an approving record, invalidating its claim.
    *
-   * Transition rules: approve is honored only from `pending` (mint) and
-   * `approved` (idempotent re-return of the first-minted creds). `denied` and
-   * `expired` are terminal → null; the operator (or the clock) already
-   * rejected the record and must not have credentials minted after the fact.
+   * Transition rules: pending→approving→approved, with approved idempotently
+   * returning the persisted result; denied and expired remain terminal.
    */
   async approve(userCode: string, opts?: { replaceActivationId?: ActivationId }): Promise<ApproveOutcome> {
     return this.withUserCodeLock(userCode, () => this.approveInner(userCode, opts));
@@ -511,7 +502,9 @@ export class DeviceFlowEnrollment {
   }
 
   private async approveInner(userCode: string, opts?: { replaceActivationId?: ActivationId }): Promise<ApproveOutcome> {
-    const opId = crypto.randomUUID();
+    // Operation identity is exactly 128 random bits encoded without padding;
+    // UUID formatting would expose only 122 random bits and violate the SPI.
+    const opId = randomBytes(16).toString("base64url");
     const claim = await this.repository.claimApproval(userCode, opId, this.options.approvalLeaseMs);
     if (claim.kind === "in_progress") return { kind: "in_progress" };
     if (claim.kind === "already_approved") {
@@ -560,16 +553,15 @@ export class DeviceFlowEnrollment {
    *
    * Called by the SaaS approval UI when the operator clicks "Deny".
    *
-   * Transition rules: deny is a `pending`→`denied` transition only. An already
+   * Transition rules: deny is a `pending|approving`→`denied` transition. An already
    * `approved` enrollment has live minted credentials, so flipping it to
    * `denied` would make the record lie about an identity that still works →
    * false, no state change. An expired record is marked `expired` (matching
-   * `poll()`), and any other non-pending status (including already `denied`)
+   * `poll()`), and any other terminal status (including already `denied`)
    * returns false without change.
    */
   async deny(userCode: string): Promise<boolean> {
-    // #22: share approve's per-userCode gate so a deny can't interleave with a
-    // concurrent approve's read→mint→write span (and vice versa).
+    // Advisory only: cross-replica safety is supplied by repository fencing.
     return this.withUserCodeLock(userCode, () => this.denyInner(userCode));
   }
 

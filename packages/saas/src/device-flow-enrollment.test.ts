@@ -16,7 +16,7 @@ import {
   DeviceFlowEnrollment,
   type ApproveOutcome,
 } from "./device-flow-enrollment.js";
-import { interpose } from "./enrollment-repository-conformance.js";
+import { barrier, interpose } from "./enrollment-repository-conformance.js";
 import { MemoryEnrollmentRepository, UserCodeCollisionError, type EnrollmentRepository } from "./enrollment-repository.js";
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import type { EnrollmentRequest, PollRequest, PendingEnrollment } from "./device-flow-types.js";
@@ -939,10 +939,31 @@ describe("DeviceFlowEnrollment", () => {
 });
 
 describe("P1-2 shared-repository integration", () => {
+  it("2.3: emits a unique 128-bit base64url opId for every approval call", async () => {
+    const raw = new MemoryEnrollmentRepository({ autoSweep: false });
+    const opIds: string[] = [];
+    const repository = new Proxy(raw, { get(target, property, receiver) {
+      if (property === "claimApproval") return async (...args: Parameters<EnrollmentRepository["claimApproval"]>) => {
+        opIds.push(args[1]); return target.claimApproval(...args);
+      };
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    } }) as EnrollmentRepository;
+    const service = createEnrollment(repository); const request = await service.enroll(validEnrollmentRequest);
+    approved(await service.approve(request.user_code)); approved(await service.approve(request.user_code));
+    expect(opIds).toHaveLength(2); expect(new Set(opIds).size).toBe(2);
+    for (const opId of opIds) {
+      expect(opId).toMatch(/^[A-Za-z0-9_-]{22}$/);
+      expect(Buffer.from(opId, "base64url")).toHaveLength(16);
+    }
+  });
+
   it("11/21: two replicas and lock-bypassed approvals mint and commit one identity", async () => {
     const repository = new MemoryEnrollmentRepository({ autoSweep: false });
     const first = createEnrollment(repository);
     const second = createEnrollment(repository);
+    const firstMint = vi.spyOn(first as never, "generateNatsUserCredentials" as never);
+    const secondMint = vi.spyOn(second as never, "generateNatsUserCredentials" as never);
     const request = await first.enroll(validEnrollmentRequest);
 
     // Calling the inner method is intentional: correctness must come from the
@@ -958,6 +979,7 @@ describe("P1-2 shared-repository integration", () => {
     const winner = approved(outcomes.find((outcome) => outcome.kind === "approved")!);
     expect(retry).toEqual(winner);
     expect(await first.poll({ device_code: request.device_code })).toEqual(winner);
+    expect(firstMint.mock.calls.length + secondMint.mock.calls.length).toBe(1);
     expect(await repository.listHistory(validEnrollmentRequest.tenant, validEnrollmentRequest.accountId)).toHaveLength(1);
   });
 
@@ -981,6 +1003,30 @@ describe("P1-2 shared-repository integration", () => {
     expect(await denier.deny(second.user_code)).toBe(true);
     expect(await approver.approve(second.user_code)).toEqual({ kind: "rejected" });
     expect((await repository.getEnrollment(second.device_code))?.status).toBe("denied");
+
+    // Pin the more dangerous ordering separately: mint has completed, but the
+    // atomic commit is paused while deny invalidates the live claim. A test
+    // that pauses inside mint cannot prove this post-mint fence.
+    const postMintRaw = new MemoryEnrollmentRepository({ autoSweep: false });
+    const commitGate = barrier(); let mintCompleted = false; let commitEntered!: () => void;
+    const atCommit = new Promise<void>((resolve) => { commitEntered = resolve; });
+    const postMintRepo = interpose(postMintRaw, { commitApproval: { before: async () => { commitEntered(); await commitGate.wait(); } } });
+    const postMintApprover = createEnrollment(postMintRepo); const postMintDenier = createEnrollment(postMintRepo);
+    const postMintRequest = await postMintApprover.enroll({ ...validEnrollmentRequest, accountId: "post-mint-deny" });
+    const postMintOriginal = (postMintApprover as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials.bind(postMintApprover);
+    (postMintApprover as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials = async (e) => { const value = await postMintOriginal(e); mintCompleted = true; return value; };
+    const lateCommit = postMintApprover.approve(postMintRequest.user_code); await atCommit;
+    expect(mintCompleted).toBe(true); expect(await postMintDenier.deny(postMintRequest.user_code)).toBe(true);
+    commitGate.resume(); expect(await lateCommit).toEqual({ kind: "rejected" });
+    expect((await postMintRaw.getEnrollment(postMintRequest.device_code))?.status).toBe("denied");
+    expect(await postMintRaw.listHistory(validEnrollmentRequest.tenant, "post-mint-deny")).toEqual([]);
+
+    // Reverse serialization: once commit is durable, deny is a terminal no-op
+    // and the exact committed credentials remain observable by poll.
+    const committedRequest = await approver.enroll({ ...validEnrollmentRequest, accountId: "commit-before-deny" });
+    const committedResult = approved(await approver.approve(committedRequest.user_code));
+    expect(await denier.deny(committedRequest.user_code)).toBe(false);
+    expect(await approver.poll({ device_code: committedRequest.device_code })).toEqual(committedResult);
   });
 
   it("13 and ported rejected-approve: mint failure releases claim and does not wedge deny", async () => {

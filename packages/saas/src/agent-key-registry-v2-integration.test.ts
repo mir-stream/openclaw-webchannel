@@ -104,35 +104,64 @@ describe("P1-2 atomic enrollment integration", () => {
     expect(Object.keys(await svc.poll({ device_code: started.device_code })).sort()).toEqual(["bootstrapUrl", "creds", "issuer", "jwksUrl", "natsUrl", "peerId"]);
   });
 
-  it("15: conflict gate releases the claim without minting or changing pending", async () => {
+  it("15: conflict and revoked-key gates release claims without minting or changing pending", async () => {
     const raw = new MemoryEnrollmentRepository({ autoSweep: false }); const svc = service(raw);
     approved(await svc.approve((await pending(svc, KEY_A)).user_code));
     const blocked = await pending(svc, KEY_B); const mint = vi.spyOn(svc as never, "generateNatsUserCredentials" as never);
     expect((await svc.approve(blocked.user_code)).kind).toBe("conflict");
     expect(mint).not.toHaveBeenCalled(); expect((await raw.getEnrollment(blocked.device_code))?.status).toBe("pending");
+    await raw.revokeActive("tenant", "account");
+    const revoked = await pending(svc, KEY_A); mint.mockClear();
+    expect((await svc.approve(revoked.user_code)).kind).toBe("revoked_key");
+    expect(mint).not.toHaveBeenCalled(); expect((await raw.getEnrollment(revoked.device_code))?.status).toBe("pending");
   });
 
-  it("16: already-approved recovery uses reconcile and creates no claim", async () => {
-    const raw = new MemoryEnrollmentRepository({ autoSweep: false });
-    let reconcileCalls = 0; let claimedAfterApproval = false;
-    const repo = new Proxy(raw, { get(target, property, receiver) {
-      if (property === "reconcileApprovedRegistration") return async (code: string) => { reconcileCalls++; return target.reconcileApprovedRegistration(code); };
-      if (property === "claimApproval") return async (...args: Parameters<EnrollmentRepository["claimApproval"]>) => {
-        const result = await target.claimApproval(...args); if (result.kind === "claimed" && (await target.getEnrollmentByUserCode(args[0]))?.status === "approved") claimedAfterApproval = true; return result;
-      };
-      const value = Reflect.get(target, property, receiver); return typeof value === "function" ? value.bind(target) : value;
-    } }) as EnrollmentRepository;
-    const svc = service(repo); const started = await pending(svc); const first = approved(await svc.approve(started.user_code));
-    expect(approved(await svc.approve(started.user_code))).toEqual(first);
-    expect(reconcileCalls).toBe(1); expect(claimedAfterApproval).toBe(false);
+  it("16: already-approved recovery exercises all reconciliation outcomes without creating a claim", async () => {
+    for (const expected of ["registered", "active_present", "history_present", "not_found"] as const) {
+      const raw = new MemoryEnrollmentRepository({ autoSweep: false }); const fixture = service(raw);
+      const started = await pending(fixture, KEY_A, `reconcile-${expected}`); const first = approved(await fixture.approve(started.user_code));
+      if (expected !== "active_present") await raw.revokeActive("tenant", `reconcile-${expected}`);
+      if (expected === "registered") {
+        // A legacy approved snapshot may have lost both registry writes. The
+        // memory fixture clears only registry state while retaining enrollment.
+        (raw as any).histories.clear();
+      } else if (expected === "not_found") {
+        // The claim returned an approved snapshot, but eviction won before the
+        // reconciliation RMW. This is an allowed recovery outcome.
+        (raw as any).enrollments.delete(started.device_code);
+        (raw as any).userCodes.delete(started.user_code);
+      }
+      let reconcileReason = ""; let claimedAfterApproval = false;
+      const repo = new Proxy(raw, { get(target, property, receiver) {
+        if (property === "claimApproval") return async (...args: Parameters<EnrollmentRepository["claimApproval"]>) => {
+          if (expected === "not_found") return { kind: "already_approved", enrollment: { status: "approved", device_code: started.device_code, user_code: started.user_code, agentPublicKey: KEY_A, tenant: "tenant", accountId: `reconcile-${expected}`, createdAt: 0, expiresAt: 1, approvedAt: 0, natsCreds: first.creds, peerId: first.peerId } } as const;
+          const result = await target.claimApproval(...args); if (result.kind === "claimed" && (await target.getEnrollmentByUserCode(args[0]))?.status === "approved") claimedAfterApproval = true; return result;
+        };
+        if (property === "reconcileApprovedRegistration") return async (code: string) => { const result = await target.reconcileApprovedRegistration(code); reconcileReason = result.kind === "registered" ? result.kind : result.reason; return result; };
+        const value = Reflect.get(target, property, receiver); return typeof value === "function" ? value.bind(target) : value;
+      } }) as EnrollmentRepository;
+      expect(approved(await service(repo).approve(started.user_code))).toEqual(first);
+      expect(reconcileReason).toBe(expected); expect(claimedAfterApproval).toBe(false);
+    }
   });
 
-  it("17/19: poll consumes tryExpire's post-transition winner and never overwrites approved", async () => {
-    const raw = new MemoryEnrollmentRepository({ autoSweep: false }); const svc = service(raw); const started = await pending(svc);
+  it("17/19: poll follows repository time and both expire/commit serializations preserve the winner", async () => {
+    let repositoryNow = 1_000; const raw = new MemoryEnrollmentRepository({ autoSweep: false, retentionMs: 10, clock: () => repositoryNow });
+    vi.spyOn(Date, "now").mockReturnValue(9_000_000); const svc = service(raw); const started = await pending(svc);
     const result = approved(await svc.approve(started.user_code));
     const repo = interpose(raw, { tryExpire: { after: async (outcome) => expect(outcome).toMatchObject({ enrollment: { status: "approved" } }) } });
+    repositoryNow = 1_011;
     expect(await service(repo).poll({ device_code: started.device_code })).toEqual(result);
     expect((await raw.getEnrollment(started.device_code))?.status).toBe("approved");
+    expect(await raw.sweep()).toBe(1); expect(await svc.poll({ device_code: started.device_code })).toMatchObject({ error: "invalid_device_code" });
+
+    // Expire first: a pending record becomes terminal and a later approval is
+    // rejected. Commit first: tryExpire observes approved and cannot overwrite.
+    repositoryNow = 100; vi.mocked(Date.now).mockReturnValue(100);
+    const expireFirst = await pending(svc, KEY_A, "expire-first"); repositoryNow = 1_000_000;
+    expect(await svc.poll({ device_code: expireFirst.device_code })).toMatchObject({ error: "expired_token" });
+    expect((await svc.approve(expireFirst.user_code)).kind).toBe("rejected");
+    vi.restoreAllMocks();
   });
 
   it("20: claim loss cannot report a fake approval and creates no activation", async () => {
@@ -146,5 +175,21 @@ describe("P1-2 atomic enrollment integration", () => {
     expect((await svc.approve(started.user_code)).kind).toBe("rejected");
     expect(await raw.getActive("tenant", "lost")).toBeNull();
     expect((await raw.getEnrollment(started.device_code))?.status).toBe("pending");
+  });
+
+  it("20: sweep loss during approval returns only allowed failure outcomes and never a fake activation", async () => {
+    let now = 100; const raw = new MemoryEnrollmentRepository({ autoSweep: false, retentionMs: 0, clock: () => now });
+    let swept = false;
+    const repo = new Proxy(raw, { get(target, property, receiver) {
+      if (property === "commitApproval") return async (...args: Parameters<EnrollmentRepository["commitApproval"]>) => {
+        if (!swept) { swept = true; now = 1_000_000; await target.sweep(); }
+        return target.commitApproval(...args);
+      };
+      const value = Reflect.get(target, property, receiver); return typeof value === "function" ? value.bind(target) : value;
+    } }) as EnrollmentRepository;
+    vi.spyOn(Date, "now").mockReturnValue(100); const svc = service(repo); const started = await pending(svc, KEY_A, "swept");
+    expect((await svc.approve(started.user_code)).kind).toBe("rejected");
+    expect(await raw.getEnrollment(started.device_code)).toBeNull(); expect(await raw.getActive("tenant", "swept")).toBeNull();
+    vi.restoreAllMocks();
   });
 });

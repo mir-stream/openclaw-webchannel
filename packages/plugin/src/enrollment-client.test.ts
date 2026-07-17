@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { accountCredentialPath, legacyCredentialPath } from "./account-config.js";
 import { MemoryEnrollmentRepository } from "../../saas/src/enrollment-repository.js";
+import { DeviceFlowEnrollment } from "../../saas/src/device-flow-enrollment.js";
 
 // ---------------------------------------------------------------------------
 // Test utilities
@@ -74,6 +75,19 @@ describe("EnrollmentClient", () => {
 
   describe("enroll() - first boot", () => {
     it("25: accepts a final poll that reaches the server just after expiresAt", async () => {
+      let repositoryNow = 1_001;
+      const repository = new MemoryEnrollmentRepository({ autoSweep: false, retentionMs: 50, clock: () => repositoryNow });
+      const boundaryResult = { creds: { userJwt: "boundary-jwt", userSeed: "boundary-seed", userPubkey: "boundary-pub" }, peerId: "boundary-peer" };
+      await repository.createEnrollment({
+        device_code: "boundary-device", user_code: "BOUND-ARY1", agentPublicKey: "A".repeat(43), tenant: "test-tenant", accountId: "test-agent",
+        createdAt: 0, expiresAt: 1_000, status: "approved", approvedAt: 999, natsCreds: boundaryResult.creds, peerId: boundaryResult.peerId,
+      });
+      const saas = new DeviceFlowEnrollment({
+        repository,
+        saasTrustChain: { rsaPrivateKeyPem: "unused", natsAccountSeed: "unused" },
+        natsAccountConfig: { operatorJwt: "unused", accountJwt: "unused", resolverConfig: {}, accountPublicKey: "unused" },
+        saasBaseUrl: "https://saas.com", jwksUrl: "https://saas.com/jwks", bootstrapUrl: "https://saas.com/bootstrap", natsUrl: "wss://nats.saas.com",
+      });
       mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({
         device_code: "boundary-device", user_code: "BOUND-ARY1",
         verification_uri: "https://saas.com/enroll", verification_uri_complete: "https://saas.com/enroll?user_code=BOUND-ARY1",
@@ -81,11 +95,13 @@ describe("EnrollmentClient", () => {
       }) });
       const now = vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValueOnce(999).mockReturnValue(1_001);
       mockFetch.mockImplementationOnce(async () => {
-        // The client launched the poll before its local deadline. The server-side
-        // retention grace, modeled by this successful response, lets the request
-        // complete even though network transit crossed the advertised deadline.
+        // This is a fixture transport, but the response itself comes from the
+        // shipped DeviceFlowEnrollment + repository transition, not a canned
+        // success. Repository time is already beyond expiresAt.
         expect(Date.now()).toBeGreaterThan(1_000);
-        return { ok: true, json: async () => ({ creds: { userJwt: "boundary-jwt", userSeed: "boundary-seed" }, peerId: "boundary-peer", jwksUrl: "https://saas.com/jwks", bootstrapUrl: "https://saas.com/bootstrap", natsUrl: "wss://nats.saas.com" }) };
+        repositoryNow = 1_001;
+        const response = await saas.poll({ device_code: "boundary-device" });
+        return { ok: !("error" in response), json: async () => response };
       });
       await expect(client.enroll()).resolves.toMatchObject({ peerId: "boundary-peer" });
       expect(mockFetch).toHaveBeenCalledTimes(2); now.mockRestore();
