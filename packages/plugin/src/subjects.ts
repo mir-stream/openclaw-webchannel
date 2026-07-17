@@ -55,6 +55,13 @@ export function registerWildcard(tenant: string, accountId: string): string {
  * The register-reply allowlist checks `replyTo.startsWith(prefix)` and validates
  * the single token after it, so the trailing dot is load-bearing — a reply-to
  * must be `…reginbox.{token}`, never the bare `…reginbox`.
+ *
+ * ⚠ TWIN, OPPOSITE CONVENTION — DO NOT UNIFY: a same-named `reginboxPrefix`
+ * exists in the client (`packages/client/src/nats-client.ts`) that returns the
+ * prefix WITHOUT the trailing dot, because the low-level client appends
+ * `.{token}` itself. THIS copy keeps the trailing dot on purpose (the allowlist
+ * `startsWith`). Merging the two would silently break the reginbox allowlist.
+ * The two packages cannot share code (client is zero-dependency).
  */
 export function reginboxPrefix(tenant: string, accountId: string, peerId: string): string {
   return `${accountRoot(tenant, accountId)}.${peerId}.reginbox.`;
