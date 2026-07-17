@@ -250,7 +250,8 @@ see [`../../docs/STATUS.md`](../../docs/STATUS.md).
 
 Production deployments implement the exported `EnrollmentRepository` and run
 `runEnrollmentRepositoryConformance` against independent clients connected to
-the real shared backend. `commitApproval` must place the enrollment row, active
+the real shared backend. The core and fault suites are mandatory for every
+adapter; the controlled-clock suite is recommended. `commitApproval` must place the enrollment row, active
 key slot, and append-only history in one transaction; claim, deny, expiry,
 reconciliation, register, and revoke are atomic read/modify/write operations.
 
@@ -264,13 +265,21 @@ share a slot. Configure retention explicitly and retain records while
 largest expected clock skew. The bundled memory implementation demonstrates
 single-process semantics only and is not evidence of multi-process durability.
 
+The factory's `clock` capability is optional. When it is absent, the convenience
+runner executes core and fault cases and emits an explicit `SKIP` message for
+every clock case; its returned report also lists every skipped case. Calling an
+exported clock case directly without that capability fails with a named
+`requires the optional controlled clock capability` error. Provide the clock to
+certify lease, expiry, retention-boundary, and time-dependent race behavior.
+
 ```ts
-await runEnrollmentRepositoryConformance({
+const report = await runEnrollmentRepositoryConformance({
   create: async ({ retentionMs, autoSweep }) => ({
     repo: await openRepository({ retentionMs, autoSweep }),
     close: async () => closeRepository(),
   }),
 });
+// report.skipped is non-empty when controlled-clock cases were not certified.
 ```
 
 This Phase-B build uses a simplified (non-production) NKEY signature path while

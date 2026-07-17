@@ -66,6 +66,7 @@ export {
   type EnrollmentRepositoryFaultControl,
   type EnrollmentRepositoryConformanceOptions,
   type EnrollmentRepositoryConformanceCase,
+  type EnrollmentRepositoryConformanceReport,
 } from "./enrollment-repository-conformance.js";
 export { buildBootstrapClaims } from "./bootstrap-claims.js";
 export type {
