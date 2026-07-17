@@ -227,18 +227,9 @@ export type DeviceFlowOptions = {
    */
   issuer?: string;
 
-  /**
-   * Enrollment store (defaults to in-memory).
-   * Use a persistent store (Redis, DB) for production deployments.
-   */
   /** Atomic enrollment/key repository. There is deliberately no memory default. */
   repository: EnrollmentRepository;
 
-  /**
-   * Durable agent identity-key registry. Required for every approval path.
-   * Production MUST provide a persistent implementation in the same durability
-   * domain as the enrollment store; mixed memory/durable configurations are unsupported.
-   */
   /** Maximum mint duration before the repository fence rejects the commit. */
   approvalLeaseMs?: number;
 };
@@ -533,7 +524,14 @@ export class DeviceFlowEnrollment {
     // Generate NATS user credentials
     let natsCreds: NatsUserCredentials;
     try { natsCreds = await this.generateNatsUserCredentials(enrollment); }
-    catch (error) { await this.repository.releaseClaim(opId); throw error; }
+    catch (error) {
+      // Best-effort release: the MINT failure is the root cause the caller must
+      // see. If releaseClaim itself rejects, log it and still rethrow the mint
+      // error — the lease expiry recovers the claim either way (plan §2.2).
+      try { await this.repository.releaseClaim(opId); }
+      catch (releaseError) { console.warn("mint-failure claim release failed; lease expiry will recover", releaseError); }
+      throw error;
+    }
 
     // Generate peer ID (bootstrap JWT subject)
     const peerId = this.generatePeerId();

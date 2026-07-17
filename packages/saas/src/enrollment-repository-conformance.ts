@@ -136,6 +136,14 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
       gate.resume(); const [delayed, firstResult] = await Promise.all([paused, winner]);
       if (commitFirst) {
         invariant(firstResult.kind === "committed" && delayed.kind === "already_approved", "commit-first serialization did not preserve its exact winner");
+        // The RETURNED outcome must itself carry the recovery payload the plan
+        // guarantees ("creds/peerId/approvedAt/committedBy 보유 보장") — the A2
+        // re-return path consumes exactly this object, so an adapter that only
+        // sets the stored record but returns a bare already_approved would pass
+        // a state re-read yet break every loser-retry recovery.
+        invariant(delayed.kind === "already_approved" && same(delayed.enrollment.natsCreds, commit.creds) && delayed.enrollment.peerId === commit.peerId
+          && typeof delayed.enrollment.approvedAt === "number" && typeof delayed.enrollment.committedBy === "string",
+          "already_approved outcome lacks the guaranteed recovery payload");
         const saved = await repo.getEnrollment(item.device_code);
         invariant(saved?.status === "approved" && same(saved.natsCreds, commit.creds) && saved.peerId === commit.peerId, "commit-first credentials changed");
       } else {

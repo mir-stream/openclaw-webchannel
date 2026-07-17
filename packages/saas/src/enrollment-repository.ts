@@ -61,10 +61,14 @@ export type MemoryEnrollmentRepositoryOptions = {
 const DEFAULT_RETENTION_MS = 300_000;
 const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
 const cloneRecord = (record: AgentKeyRecord): AgentKeyRecord => ({ ...record });
+const cloneCreds = (creds: NonNullable<EnrollmentRecord["natsCreds"]>): NonNullable<EnrollmentRecord["natsCreds"]> => ({
+  ...creds,
+  ...(creds.permissions ? { permissions: { ...creds.permissions, pub: creds.permissions.pub?.slice(), sub: creds.permissions.sub?.slice() } } : {}),
+});
 const cloneEnrollment = (record: EnrollmentRecord): EnrollmentRecord => ({
   ...record,
   ...(record.claim ? { claim: { ...record.claim } } : {}),
-  ...(record.natsCreds ? { natsCreds: { ...record.natsCreds, ...(record.natsCreds.permissions ? { permissions: { ...record.natsCreds.permissions, pub: record.natsCreds.permissions.pub?.slice(), sub: record.natsCreds.permissions.sub?.slice() } } : {}) } } : {}),
+  ...(record.natsCreds ? { natsCreds: cloneCreds(record.natsCreds) } : {}),
   ...(record.committedRecord ? { committedRecord: cloneRecord(record.committedRecord) } : {}),
 });
 const keyId = (publicKey: string): string => createHash("sha256").update(Buffer.from(publicKey, "base64url")).digest("base64url");
@@ -184,7 +188,12 @@ export class MemoryEnrollmentRepository implements EnrollmentRepository {
       record.status = "pending"; delete record.claim;
       return registered.reason === "revoked" ? { kind: "revoked" } : { kind: "conflict", current: registered.current };
     }
-    record.status = "approved"; record.natsCreds = { ...commit.creds }; record.peerId = commit.peerId;
+    // Deep-clone on the way IN, not just on the way out: a shallow spread left
+    // the nested permissions arrays aliased to the caller-retained payload, so
+    // a caller mutating minted creds after commit would silently corrupt the
+    // durable record while commitDigest still matched the original bytes —
+    // making the record fail its own idempotent-recovery digest later.
+    record.status = "approved"; record.natsCreds = cloneCreds(commit.creds); record.peerId = commit.peerId;
     record.approvedAt = now; record.committedBy = opId; record.commitDigest = commitDigest;
     record.committedRecord = cloneRecord(registered.record); delete record.claim;
     return { kind: "committed", record: cloneRecord(registered.record), idempotent: false };
