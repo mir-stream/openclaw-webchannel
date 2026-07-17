@@ -60,8 +60,9 @@ import {
 } from "./src/nats-credential-source.js";
 import { consumeCredentialSource } from "./src/consume-credentials.js";
 import { planAccounts } from "./src/multiplex.js";
+import { detectSharedAudienceCollisions } from "./src/shared-audience.js";
 import {
-  loadPersistedEnrolledCreds,
+  loadPersistedAgentIdentity,
   resolveTypingEnabled,
 } from "./src/account-config.js";
 import type { KeyPair } from "./src/e2e-crypto.js";
@@ -325,39 +326,66 @@ export default defineChannelPluginEntry({
       warn: (msg) => (api.logger?.warn ?? console.warn)?.(msg),
     });
 
-    // Fix #7: shared-audience cross-account guard. Register admission is chosen
-    // purely by the `.register` subject (accountId segment), NOT by the token's
-    // aud. So if two register-hop accounts on this gateway share the same (issuer,
-    // audience), a token minted for one VERIFIES against the other's subject →
-    // that peer would get the WRONG account's conversation key + history. The
-    // deleted register-dispatch map used to catch this via an aud→account
-    // collision warning; re-add that detection here. Keyed by (issuer, audience);
-    // value = the first register-hop accountId that claimed it.
-    const registerHopAudClaims = new Map<string, string>();
+    // P0-3 D6-1: shared-audience PRE-PASS. Register admission is chosen purely by
+    // the `.register` subject (accountId segment), NOT by the token's aud. So if
+    // two register-hop accounts on this gateway share the same (issuer, audience),
+    // a token minted for one VERIFIES against the other's subject → that peer would
+    // get the WRONG account's conversation key + history. Because the shared-aud
+    // token verifies against EVERY member's subject, we skip the ENTIRE collision
+    // set (not just the second claimant), and we decide it HERE — before the
+    // serving loop opens any transport — so a colliding account never leaks an
+    // authenticated live connection.
+    //
+    // Derive each account's EFFECTIVE auth ONCE in this pre-pass and reuse it in
+    // the serving loop below (every downstream consumer — the collision detector,
+    // the connection verifier via `assertJwtAuthConfig`, the register-path
+    // `verifyIdentity`, and the published `AccountRuntime.auth` — reads this single
+    // per-account value, so they all see the effective (derived)
+    // issuer/jwksUrl/audience, per the design's "diagnostics must read the
+    // effective values" constraint). See `deriveAccountAuth` above for the
+    // config-present-wins + fail-closed rationale.
+    const accountAuthByPlan = new Map<string, AuthConfig | undefined>();
+    for (const plan of plans) {
+      accountAuthByPlan.set(
+        plan.accountId,
+        deriveAccountAuth(
+          plan.account.auth as AuthConfig | undefined,
+          // Match the consume block's precedence: plan-resolved base URL (config
+          // `saas.baseUrl` over acquisition env) falls back to the flat top-level.
+          plan.saasBaseUrl ?? config.saas?.baseUrl,
+          plan.accountId,
+          // SaaS-attested issuer, persisted at `channels add` time
+          // (EnrollmentResult.issuer). The IDENTITY accessor (not the enrolled
+          // transport loader) surfaces it, so issuer survives even when enrolled
+          // transport material is absent/corrupt or the source is static.
+          loadPersistedAgentIdentity(plan.accountId)?.issuer,
+        ),
+      );
+    }
+    const sharedAudienceCollisions = detectSharedAudienceCollisions(
+      [...accountAuthByPlan].map(([accountId, auth]) => ({ accountId, auth })),
+    );
 
     for (const plan of plans) {
       const { accountId, tenant, account } = plan;
-      // Derive the EFFECTIVE account auth ONCE, here — every downstream consumer
-      // below (the shared-audience guard, the connection verifier via
-      // `assertJwtAuthConfig`, the register-path `verifyIdentity`, and the published
-      // `AccountRuntime.auth`) reads this single local, so they all see the
-      // effective (derived) issuer/jwksUrl/audience, per the design's "diagnostics
-      // must read the effective values" constraint. See `deriveAccountAuth` above
-      // for the config-present-wins + fail-closed rationale.
-      const accountAuth = deriveAccountAuth(
-        account.auth as AuthConfig | undefined,
-        // Match the consume block's precedence (:277): plan-resolved base URL
-        // (config `saas.baseUrl` over acquisition env) falls back to the flat
-        // top-level `saas.baseUrl`.
-        plan.saasBaseUrl ?? config.saas?.baseUrl,
-        accountId,
-        // SaaS-delivered issuer, persisted with the enrolled creds at
-        // `channels add` time (EnrollmentResult.issuer). Same loader the
-        // consume step uses later — ONE reader, so the two paths can't drift.
-        // Returns undefined for non-enrolled accounts / pre-issuer creds →
-        // the derivation fallback applies.
-        loadPersistedEnrolledCreds(accountId)?.issuer,
-      );
+      // The effective account auth, derived once in the pre-pass above.
+      const accountAuth = accountAuthByPlan.get(accountId);
+
+      // P0-3 D6-1: fail-closed skip for a shared-audience collision. Decided in
+      // the pre-pass BEFORE any transport opens, so no authenticated connection is
+      // ever leaked. EVERY member of the collision set is skipped.
+      const collision = sharedAudienceCollisions.get(accountId);
+      if (collision) {
+        (api.logger?.error ?? console.error)?.(
+          `[webchannel] account "${accountId}" SHARED-AUDIENCE MISCONFIG — refusing to serve. It shares ` +
+            `the same jwt (issuer="${collision.issuer}", audience="${collision.audience}") with ` +
+            `${collision.peers.map((p) => `"${p}"`).join(", ")}. A bootstrap JWT minted for any one of ` +
+            `them VERIFIES against the others' .register subject → a peer could receive the WRONG account's ` +
+            `conversation key + history. ALL colliding accounts are skipped. Give each register-hop account ` +
+            `a DISTINCT audience (= its accountId).`,
+        );
+        continue;
+      }
       const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
       const accountDmSecurity = account.dmSecurity as string | undefined;
@@ -396,9 +424,13 @@ export default defineChannelPluginEntry({
       // ---- Step 1 (per account): resolve credential source + CONSUME -------
       let transport: NatsTransport;
       let enrolled: EnrolledNatsConnection | undefined;
-      // F2: the agent's SaaS-attested identity key from the enrolled creds (set
-      // only on the enrolled path). The register-hop channel wraps K under it.
+      // F2: the agent's SaaS-attested identity key (set on BOTH the enrolled path
+      // and the static/BYO path — the register-hop channel wraps K under it).
       let identityKey: KeyPair | undefined;
+      // P0-3 D1-5: the credential source mode + effective dialed relay, surfaced
+      // in the Gate B readiness line below.
+      let credentialSourceMode: NatsCredentialSource["mode"] | undefined;
+      let dialedUrl: string | undefined;
       try {
         const source = resolveNatsCredentialSource({
           natsConfig: accountNatsCfg,
@@ -419,6 +451,23 @@ export default defineChannelPluginEntry({
           );
           continue;
         }
+        if (consumed.status === "identity-missing") {
+          // P0-3: a static (BYO-NATS) source resolved but the account has NO
+          // SaaS-attested agent identity. Static creds replace the TRANSPORT only;
+          // a register-hop account still needs an attested identity to wrap K. We
+          // never connected (the transport factory was not called), so this is a
+          // clean account-scoped skip — the process and other accounts survive.
+          // The F2 no-identityKey guard below stays as a backstop.
+          (api.logger?.error ?? console.error)?.(
+            `[webchannel] account "${consumed.accountId}" uses static (BYO-NATS) credentials but has NO ` +
+              `attested agent identity — refusing to serve. Static credentials replace the NATS TRANSPORT ` +
+              `only; the agent still needs a SaaS-attested identity from enrollment. Run: openclaw ` +
+              `channels add --channel webchannel --account ${consumed.accountId}`,
+          );
+          continue;
+        }
+        credentialSourceMode = source.mode;
+        dialedUrl = consumed.dialedUrl;
         // Log the EFFECTIVE relay (consumed.dialedUrl), not the resolver's
         // `source.url`: for enrolled mode the SaaS-delivered `natsUrl` wins, so
         // these can differ — printing the dialed URL keeps the log truthful.
@@ -464,34 +513,9 @@ export default defineChannelPluginEntry({
       // dmScope="main" warning is therefore gone; the readiness line below
       // reports the ENFORCED scope instead.
 
-      // Fix #7: detect two register-hop accounts sharing the same (issuer, aud).
-      // Only register-hop + jwt accounts admit by verifying a token, so only they
-      // can be cross-verified by a shared audience. Warn loudly naming both.
-      if ((accountAuth as { strategy?: string } | undefined)?.strategy === "jwt") {
-        const jwtBlock = (accountAuth as { jwt?: { issuer?: string; audience?: string } }).jwt;
-        const issuer = jwtBlock?.issuer;
-        const audience = jwtBlock?.audience;
-        if (issuer && audience) {
-          // Normalize the issuer the SAME way verifyJwt compares it (trailing
-          // slash collapsed) — otherwise a config-pinned "https://x/" and a
-          // derived "https://x" would key as DISTINCT here yet CROSS-VERIFY at
-          // runtime, so this guard would miss exactly the collision it exists to
-          // name (a bootstrap JWT for one account admitting on the other's subject).
-          const key = `${deriveIssuer(issuer)} ${audience}`;
-          const firstAccount = registerHopAudClaims.get(key);
-          if (firstAccount && firstAccount !== accountId) {
-            (api.logger?.warn ?? console.warn)?.(
-              `[webchannel] SHARED-AUDIENCE MISCONFIG: register-hop accounts "${firstAccount}" and ` +
-                `"${accountId}" share the same jwt (issuer="${issuer}", audience="${audience}"). ` +
-                `A bootstrap JWT minted for one will VERIFY against the other's .register subject → ` +
-                `the peer would receive the WRONG account's conversation key + history. Give each ` +
-                `register-hop account a DISTINCT audience (= its accountId).`,
-            );
-          } else if (!firstAccount) {
-            registerHopAudClaims.set(key, accountId);
-          }
-        }
-      }
+      // Shared-audience collisions are detected fail-closed in the pre-pass above
+      // (P0-3 D6-1) — every colliding account was already skipped before reaching
+      // here, so there is no post-connect collision check on the serving path.
 
       if (!identityKey) {
         (api.logger?.error ?? console.error)?.(
@@ -881,6 +905,8 @@ export default defineChannelPluginEntry({
             ...(effAudience !== undefined ? { audience: effAudience } : {}),
             buildError: (err as Error).message,
             ...(accountDmSecurity !== undefined ? { dmSecurity: accountDmSecurity } : {}),
+            ...(credentialSourceMode !== undefined ? { credentialSource: credentialSourceMode } : {}),
+            ...(dialedUrl !== undefined ? { dialedUrl } : {}),
           });
           (api.logger?.error ?? console.error)?.(buildFail.line);
           continue;
@@ -988,6 +1014,8 @@ export default defineChannelPluginEntry({
         ...(effAudience !== undefined ? { audience: effAudience } : {}),
         ...(jwks !== undefined ? { jwks } : {}),
         ...(accountDmSecurity !== undefined ? { dmSecurity: accountDmSecurity } : {}),
+        ...(credentialSourceMode !== undefined ? { credentialSource: credentialSourceMode } : {}),
+        ...(dialedUrl !== undefined ? { dialedUrl } : {}),
       });
       if (readiness.verdict === "FAIL") (api.logger?.error ?? console.error)?.(readiness.line);
       else if (readiness.verdict === "WARN") (api.logger?.warn ?? console.warn)?.(readiness.line);

@@ -728,3 +728,56 @@ describe.skipIf(!NATS_SERVER_BIN)("Per-peer browser + observer scoping", () => {
     ).rejects.toThrow(/peerId/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Template-derived preflight probe matrix (P0-3 S3, agent role).
+//
+// These are the EXACT subjects + verdicts the plugin's add-time permission probe
+// (`preflight-probe.ts`) relies on: an enrolled agent (tenant-wide grant) must be
+// ALLOWED to sub + pub its own `…_preflight` subject (P1/P2) and DENIED on a
+// subject OUTSIDE the webchannel namespace (P3, the over-broad negative) and
+// outside its tenant. The plugin cannot mint JWT creds (no @nats-io there), so the
+// REAL-server enforcement of the template's agent grant is proven HERE, where the
+// mint + trust chain live; the plugin unit-tests only the probe's -ERR correlation
+// + PING-barrier verdict logic against a controllable fake transport.
+//
+// "Template-derived": the agent grant is `webchannel.{tenant}.>`, locked to the
+// shared fixture by nats-permissions-template-parity.test.ts — so this matrix
+// confirms a real nats-server enforces exactly that template grant on the probe
+// subjects.
+// ---------------------------------------------------------------------------
+describe.skipIf(!NATS_SERVER_BIN)("Template-derived preflight probe matrix (agent grant)", () => {
+  const PT = "tenant-probe";
+  const PACCT = "acct-probe";
+  async function agentCreds() {
+    return mintNatsUserCreds({
+      accountSeed: trustChain!.private.natsAccountSeed,
+      tenant: PT,
+      role: "agent",
+    });
+  }
+  const preflightSubject = `webchannel.${PT}.${PACCT}._preflight`;
+
+  it("P1: agent may SUBSCRIBE its own _preflight subject (allowed)", async () => {
+    const { denied } = await probe(await agentCreds(), `SUB ${preflightSubject} 1\r\n`);
+    expect(denied).toBe(false);
+  });
+
+  it("P2: agent may PUBLISH its own _preflight subject (allowed)", async () => {
+    const { denied } = await probe(await agentCreds(), `PUB ${preflightSubject} 2\r\nhi\r\n`);
+    expect(denied).toBe(false);
+  });
+
+  it("P3: agent is DENIED subscribing OUTSIDE the webchannel namespace (over-broad negative)", async () => {
+    const { denied } = await probe(
+      await agentCreds(),
+      `SUB _webchannel_preflight_foreign.deadbeef 1\r\n`,
+    );
+    expect(denied).toBe(true);
+  });
+
+  it("agent is DENIED on a DIFFERENT tenant's subtree (tenant-outside negative)", async () => {
+    const { denied } = await probe(await agentCreds(), `PUB webchannel.other-tenant.x.p.out 2\r\nhi\r\n`);
+    expect(denied).toBe(true);
+  });
+});

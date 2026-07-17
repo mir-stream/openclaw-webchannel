@@ -40,6 +40,31 @@ describe("formatAccountReadiness (Gate B)", () => {
     expect(r.line).toContain("dmSecurity=open");
   });
 
+  it("surfaces the credential source mode + effective dialed relay (P0-3 D1-5)", () => {
+    const r = formatAccountReadiness({
+      accountId: "acme",
+      admission: "register-hop",
+      issuer: "https://saas.example",
+      audience: "acme",
+      jwks: { keyCount: 1 },
+      credentialSource: "static",
+      dialedUrl: "wss://byo-relay:4222",
+    });
+    expect(r.line).toContain("source=static");
+    expect(r.line).toContain("relay=wss://byo-relay:4222");
+  });
+
+  it("shows (unknown) source/relay when a build failure preempts the consume facts", () => {
+    const r = formatAccountReadiness({
+      accountId: "acme",
+      admission: "register-hop",
+      buildError: "missing jwks source",
+    });
+    expect(r.verdict).toBe("FAIL");
+    expect(r.line).toContain("source=(unknown)");
+    expect(r.line).toContain("relay=(unknown)");
+  });
+
   it("empty JWKS → FAIL line (cannot verify any bootstrap JWT)", () => {
     const r = formatAccountReadiness({
       accountId: "acme",
@@ -181,9 +206,27 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
     async () => new Response(jwksDoc, { status: 200, headers: { "content-type": "application/json" } }),
   ) as unknown as typeof fetch;
 
-  it("derives the jwks url from the base and passes when JWKS + dial are healthy", async () => {
+  // D4b: the dial now goes through the runtime resolve → consume path. A healthy
+  // dial = persisted enrolled creds (loadPersisted) + a transport that connects
+  // (transportFactory). `probePass` stubs the permission probe; the probe's own
+  // logic is covered by preflight-probe.test.ts.
+  type Captured = { url?: string };
+  const healthyConsumeDeps = (
+    captured: Captured = {},
+    persisted: { userJwt: string; userSeed: string; natsUrl?: string } = { userJwt: "J", userSeed: "S" },
+  ) => ({
+    loadPersisted: () => persisted as never,
+    makeSigner: () => async () => "sig",
+    transportFactory: (o: { url: string }) => {
+      captured.url = o.url;
+      return { connect: async () => {}, disconnect: () => {} } as never;
+    },
+  });
+  const probePass = vi.fn(async () => ({ results: [], verdict: "PASS" as const, line: "probe pass" }));
+
+  it("dials the runtime resolve→consume path and passes when JWKS + dial + probe are healthy", async () => {
     const log = vi.fn();
-    const dial = vi.fn(async (_input: { url: string; subject: string }) => ({ ok: true }) as const);
+    const captured: Captured = {};
     const report = await runAddPreflight({
       accountId: "acme",
       tenant: "t",
@@ -196,16 +239,15 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
       },
       log,
       fetchImpl: okFetch,
-      dial,
+      consumeDeps: healthyConsumeDeps(captured, { userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example" }),
+      runProbes: probePass,
     });
     expect(report.ok).toBe(true);
-    expect(dial).toHaveBeenCalledOnce();
-    // Scoped no-op subject rides the account's own subtree.
-    expect(dial.mock.calls[0][0]).toMatchObject({
-      url: "wss://relay.example",
-      subject: "webchannel.t.acme._preflight",
-    });
+    // Enrolled consume dials the SaaS-delivered natsUrl (runtime-identical).
+    expect(captured.url).toBe("wss://relay.example");
+    expect(probePass).toHaveBeenCalled();
     expect(log.mock.calls.some((c) => String(c[0]).includes("issuer/aud ✓"))).toBe(true);
+    expect(log.mock.calls.some((c) => String(c[0]).includes("permissions PASS"))).toBe(true);
   });
 
   it("reports FAIL (does not throw) when the relay dial fails", async () => {
@@ -217,14 +259,22 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
       enrollment: { userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example" },
       log,
       fetchImpl: okFetch,
-      dial: async () => ({ error: "refused" }),
+      consumeDeps: {
+        loadPersisted: () => ({ userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example" }) as never,
+        makeSigner: () => async () => "sig",
+        transportFactory: () => ({ connect: async () => { throw new Error("refused"); }, disconnect: () => {} }) as never,
+      },
+      runProbes: probePass,
     });
     expect(report.ok).toBe(false);
     expect(log.mock.calls.some((c) => String(c[0]).includes("relay dial failed: refused"))).toBe(true);
   });
 
-  it("FAILs when no relay URL was delivered (cannot prove the dial)", async () => {
+  it("FAILs when no enrolled creds are persisted (creds-missing → dial cannot run)", async () => {
+    // Replaces the old "no relay URL" case: under D4b the dial goes through
+    // consume, which fail-closes to creds-missing when nothing is persisted.
     const log = vi.fn();
+    const localProbe = vi.fn(async () => ({ results: [], verdict: "PASS" as const, line: "probe pass" }));
     const report = await runAddPreflight({
       accountId: "acme",
       tenant: "t",
@@ -232,15 +282,48 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
       enrollment: { userJwt: "J", userSeed: "S" },
       log,
       fetchImpl: okFetch,
+      consumeDeps: { loadPersisted: () => undefined },
+      runProbes: localProbe,
     });
     expect(report.ok).toBe(false);
-    expect(log.mock.calls.some((c) => String(c[0]).includes("no SaaS-delivered relay URL"))).toBe(true);
+    expect(log.mock.calls.some((c) => String(c[0]).includes("no enrolled credentials persisted"))).toBe(true);
+    // The probe never runs when the dial never connected.
+    expect(localProbe).not.toHaveBeenCalled();
+  });
+
+  it("a probe FAIL flips the verdict and surfaces the permission template", async () => {
+    const log = vi.fn();
+    const report = await runAddPreflight({
+      accountId: "acme",
+      tenant: "t",
+      saasBaseUrl: "https://saas.example",
+      enrollment: { userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example", jwksUrl: deriveJwksUrl("https://saas.example") },
+      log,
+      fetchImpl: okFetch,
+      consumeDeps: healthyConsumeDeps({}, { userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example" }),
+      runProbes: async () => ({ results: [], verdict: "FAIL" as const, line: "NATS permission probe FAIL — template…" }),
+    });
+    expect(report.ok).toBe(false);
+    expect(log.mock.calls.some((c) => String(c[0]).includes("permissions FAIL"))).toBe(true);
+  });
+
+  it("a probe WARN (over-broad) is surfaced but does NOT fail the add", async () => {
+    const log = vi.fn();
+    const report = await runAddPreflight({
+      accountId: "acme",
+      tenant: "t",
+      saasBaseUrl: "https://saas.example",
+      enrollment: { userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example", jwksUrl: deriveJwksUrl("https://saas.example") },
+      log,
+      fetchImpl: okFetch,
+      consumeDeps: healthyConsumeDeps({}, { userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example" }),
+      runProbes: async () => ({ results: [], verdict: "WARN" as const, line: "NATS permission probe WARN — over-broad" }),
+    });
+    expect(report.ok).toBe(true);
+    expect(log.mock.calls.some((c) => String(c[0]).includes("permissions WARN"))).toBe(true);
   });
 
   it("uses the SaaS-DELIVERED issuer over the derivation (pin > delivered > derived)", async () => {
-    // Matches the runtime's deriveAccountAuth precedence: a delivered issuer
-    // (EnrollmentResult.issuer) beats issuer=saasBaseUrl derivation, so Gate A
-    // reports the issuer the runtime will actually verify against.
     const log = vi.fn();
     const report = await runAddPreflight({
       accountId: "acme",
@@ -255,13 +338,11 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
       },
       log,
       fetchImpl: okFetch,
-      dial: async () => ({ ok: true }) as const,
+      consumeDeps: healthyConsumeDeps({}, { userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example" }),
+      runProbes: probePass,
     });
     expect(report.ok).toBe(true);
-    expect(log.mock.calls.some((c) => String(c[0]).includes("issuer=https://saas.local/logical-issuer"))).toBe(
-      true,
-    );
-    // No pin present ⇒ no pin-vs-delivered contradiction warning.
+    expect(log.mock.calls.some((c) => String(c[0]).includes("issuer=https://saas.local/logical-issuer"))).toBe(true);
     expect(log.mock.calls.some((c) => String(c[0]).includes("WARN: auth.jwt.issuer"))).toBe(false);
   });
 
@@ -281,17 +362,15 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
       pinnedIssuer: "https://stale-pin.example",
       log,
       fetchImpl: okFetch,
-      dial: async () => ({ ok: true }) as const,
+      consumeDeps: healthyConsumeDeps({}, { userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example" }),
+      runProbes: probePass,
     });
     expect(log.mock.calls.some((c) => String(c[0]).includes('WARN: auth.jwt.issuer is pinned to'))).toBe(true);
-    // Pin wins in the report line (operator escape hatch).
     expect(log.mock.calls.some((c) => String(c[0]).includes("issuer=https://stale-pin.example"))).toBe(true);
     expect(report).toBeDefined();
   });
 
   it("does NOT warn when pin and delivered issuer differ only by trailing slash", async () => {
-    // verifyJwt compares iss slash-insensitively, so a slash variant is not a
-    // contradiction — warning on it would train operators to ignore the warning.
     const log = vi.fn();
     await runAddPreflight({
       accountId: "acme",
@@ -306,7 +385,8 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
       pinnedIssuer: "https://saas.example",
       log,
       fetchImpl: okFetch,
-      dial: async () => ({ ok: true }) as const,
+      consumeDeps: healthyConsumeDeps({}, { userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example" }),
+      runProbes: probePass,
     });
     expect(log.mock.calls.some((c) => String(c[0]).includes("WARN: auth.jwt.issuer"))).toBe(false);
   });

@@ -45,15 +45,36 @@ PAGE_PORT=19393
 
 TENANT=default-tenant
 ACCOUNT_ID=default-agent
+# P0-3 S4: a SECOND enrolled account (distinct aud=accountId) so the shared
+# adversarial suite's N2 (account-A token → account-B .register → 401) can run in
+# Mode A too — the self-hosted ENROLLED baseline runs the SAME echo + N1-N3 suite
+# as Mode B/C (plan §8: A/B/C share the registration suite).
+ACCOUNT_B=default-agent-b
 PEER_ID=web-allreal-peer
 SAAS_ISSUER="https://saas.local/allreal-issuer"
+ISS="http://127.0.0.1:$ISSUER_PORT"
+# Aliases the shared lib-negative-legs.sh expects.
+ACCT_A="$ACCOUNT_ID"
+ACCT_B="$ACCOUNT_B"
 
 NATS_PID=""; ECHO_PID=""; ISSUER_PID=""; GW_PID=""; ADD_PID=""
+GW_STOPPED=0
+
+# Shared adversarial suite N1-N3 + the N3 SIGSTOP fail-safe helpers.
+# shellcheck source=lib-negative-legs.sh
+source "$REPO/e2e/local/lib-negative-legs.sh"
 
 cleanup() {
   echo "[run-all-real] cleanup…"
   [ -n "$ADD_PID" ]    && kill "$ADD_PID"    2>/dev/null || true
-  [ -n "$GW_PID" ]     && kill "$GW_PID"     2>/dev/null || true
+  # N3 fail-safe: a SIGSTOPped gateway ignores TERM/pkill. Resume it
+  # UNCONDITIONALLY before any TERM (never gated on GW_STOPPED — closes the
+  # STOP-before-flag race), then TERM, then a SIGKILL fallback.
+  if [ -n "$GW_PID" ]; then
+    kill -CONT "$GW_PID" 2>/dev/null || true
+    kill "$GW_PID" 2>/dev/null || true
+    kill -9 "$GW_PID" 2>/dev/null || true
+  fi
   [ -n "$ISSUER_PID" ] && kill "$ISSUER_PID" 2>/dev/null || true
   [ -n "$ECHO_PID" ]   && kill "$ECHO_PID"   2>/dev/null || true
   [ -n "$NATS_PID" ]   && kill "$NATS_PID"   2>/dev/null || true
@@ -77,6 +98,16 @@ pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
 pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
+
+# Build the plugin dist from CURRENT src. The gateway loads the plugin via the
+# package.json `openclaw.extensions` (./dist/index-nats.js); a stale dist would
+# run pre-P0-3 code (the stale-dist footgun bit this harness's first runs). CI
+# builds it in e2e-gate step 5c, but a LOCAL run (incl. the S6 authoritative run)
+# must not rely on that. dist is gitignored.
+echo "[run-all-real] building plugin dist from current src…"
+( cd "$REPO/packages/plugin" && npm run build ) >"$OCH/plugin-build.log" 2>&1 \
+  || { echo "[run-all-real] plugin build FAILED"; cat "$OCH/plugin-build.log"; exit 2; }
+echo "[run-all-real] ✓ plugin dist built"
 
 # ---------------------------------------------------------------------------
 # 1. REAL device-flow enrollment-server (single trust chain). Writes the public
@@ -231,6 +262,18 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
           },
           "dmSecurity": "allowlist",
           "allowFrom": ["$PEER_ID"]
+        },
+        "$ACCOUNT_B": {
+          "tenant": "$TENANT",
+          "auth": {
+            "strategy": "jwt",
+            "jwt": {
+              "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
+              "issuer": "$SAAS_ISSUER",
+              "audience": "$ACCOUNT_B"
+            }
+          },
+          "dmSecurity": "open"
         }
       }
     }
@@ -303,6 +346,40 @@ node -e '
 ' "$OCH/.openclaw/openclaw.json" "$ACCOUNT_ID" "$PEER_ID"
 echo "[run-all-real] ✓ re-asserted admission=register-hop + dmSecurity=allowlist for account $ACCOUNT_ID"
 
+# 6d. Enroll the SECOND account (P0-3 S4 — identity only). It is the N2 target:
+#     an account-A token presented on account-B's `.register` must be rejected 401.
+#     Kept dmSecurity:"open" (no allowlist) — N2 tests the aud binding, not dmSecurity.
+echo "[run-all-real] channels add for second account ${ACCOUNT_B} ..."
+HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
+  "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account "$ACCOUNT_B" \
+    --base-url "http://127.0.0.1:$ISSUER_PORT" --url "$TENANT" \
+  >"$OCH/channels-add-b.log" 2>&1 &
+ADD_PID=$!
+USER_CODE_B=""
+for i in $(seq 1 240); do
+  USER_CODE_B="$(grep -oE 'User code: [A-Z]{4}-[A-Z]{4}' "$OCH/channels-add-b.log" 2>/dev/null | head -1 | awk '{print $3}' || true)"
+  [ -n "$USER_CODE_B" ] && break
+  kill -0 "$ADD_PID" 2>/dev/null || { echo "[run-all-real] channels add ($ACCOUNT_B) exited early — log:"; cat "$OCH/channels-add-b.log"; exit 2; }
+  sleep 0.25
+done
+[ -z "$USER_CODE_B" ] && { echo "[run-all-real] TIMEOUT user_code ($ACCOUNT_B) — log:"; cat "$OCH/channels-add-b.log"; exit 2; }
+curl -fsS -X POST "http://127.0.0.1:$ISSUER_PORT/approve" \
+  -H "Authorization: Bearer $ENROLLMENT_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' -d "{\"user_code\":\"$USER_CODE_B\"}" >/dev/null
+set +e; wait "$ADD_PID"; ADD_RC=$?; set -e
+ADD_PID=""
+[ "$ADD_RC" -ne 0 ] && { echo "[run-all-real] channels add ($ACCOUNT_B) failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add-b.log"; exit 2; }
+[ -f "$OCH/.openclaw-webchannel/$ACCOUNT_B/credentials.json" ] || { echo "[run-all-real] creds NOT persisted for $ACCOUNT_B"; cat "$OCH/channels-add-b.log"; exit 2; }
+node -e '
+  const fs=require("fs"); const p=process.argv[1], acct=process.argv[2];
+  const cfg=JSON.parse(fs.readFileSync(p,"utf8"));
+  const a=cfg.channels.webchannel.accounts[acct];
+  a.nats={...(a.nats??{}), admission:"register-hop"};
+  a.dmSecurity="open";
+  fs.writeFileSync(p, JSON.stringify(cfg,null,2));
+' "$OCH/.openclaw/openclaw.json" "$ACCOUNT_B"
+echo "[run-all-real] ✓ enrolled second account $ACCOUNT_B (identity)"
+
 # ---------------------------------------------------------------------------
 # 6c. Boot the isolated gateway — CONSUME-ONLY. No acquisition env: identity
 #     lives in the config `channels add` wrote; only the connection override
@@ -328,6 +405,13 @@ for i in $(seq 1 240); do
     echo "[run-all-real] TIMEOUT waiting for gateway registration — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
+
+# P0-3 S4: BOTH accounts must serve (N2 targets account-B's live `.register`).
+if ! grep -q "account \"$ACCOUNT_ID\" ✓ encrypted NATS channel" "$OCH/gateway.log" 2>/dev/null \
+   || ! grep -q "account \"$ACCOUNT_B\" ✓ encrypted NATS channel" "$OCH/gateway.log" 2>/dev/null; then
+  echo "[run-all-real] FAIL — both accounts did not build channels (need 2-of-2 for N2). gateway log:"; tail -40 "$OCH/gateway.log"; exit 2
+fi
+echo "[run-all-real] ✓ both accounts serving ($ACCOUNT_ID + $ACCOUNT_B)"
 
 # P0-1 T3b: a real gateway boot must expose no browser-facing WEBCHANNEL socket
 # endpoint. Reality check (probed live): the OpenClaw CORE gateway accepts a WS
@@ -391,5 +475,17 @@ echo "[run-all-real] driver exit code = $RC"
 if [ "$RC" -ne 0 ]; then
   echo "[run-all-real] gateway log tail (debug):"; tail -40 "$OCH/gateway.log" 2>/dev/null || true
   echo "[run-all-real] nats log tail (debug):";    tail -20 "$OCH/nats.log" 2>/dev/null || true
+  exit "$RC"
 fi
-exit "$RC"
+echo "[run-all-real] ✓ echo round-trip OK (Mode A enrolled)"
+
+# ---------------------------------------------------------------------------
+# 8. Shared adversarial suite N1-N3 (P0-3 S4) — the SAME suite Mode B/C run, so
+#    the self-hosted ENROLLED baseline shares the registration suite (plan §8).
+#    N2 uses the account-A token → account-B `.register` → 401 path (both accounts
+#    served above). The N3 SIGSTOP fail-safe is wired into cleanup() at the top.
+# ---------------------------------------------------------------------------
+run_all_negative_legs || { echo "[run-all-real] negative legs FAILED"; exit 3; }
+
+echo "[run-all-real] ✓✓ Mode A (self-hosted enrolled) PROVEN: echo + N1-N3 (shared suite)"
+exit 0

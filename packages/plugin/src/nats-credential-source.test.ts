@@ -64,7 +64,7 @@ describe("resolveNatsCredentialSource — removed open mode", () => {
   });
 });
 
-describe.skip("legacy static resolution details (serving removed until P0-3)", () => {
+describe("static resolution details (re-enabled in P0-3)", () => {
   it("resolves static from env JWT + seed and applies the URL precedence", () => {
     const s = resolveNatsCredentialSource({
       ...BASE,
@@ -154,16 +154,74 @@ describe.skip("legacy static resolution details (serving removed until P0-3)", (
   });
 });
 
-describe("resolveNatsCredentialSource — static migration signals", () => {
+describe("resolveNatsCredentialSource — static signals resolve (P0-3, no longer a migration throw)", () => {
+  // P0-3 removed the "static creds no longer imply auto admission" migration
+  // throw. Each static signal now RESOLVES to a `{ mode: "static" }` source
+  // (identity is supplied separately at consume time) — or, when a signal is
+  // present but the transport creds are incomplete, fails with the TARGETED
+  // "incomplete static credentials" error (never the deleted migration throw).
   const migration = /static NATS credentials no longer imply auto admission/;
-  it.each([
-    ["mode", { natsConfig: { credentials: { mode: "static" } }, env: {} }],
-    ["credsFile", { natsConfig: { credentials: { credsFile: "/x" } }, env: {} }],
-    ["inline", { natsConfig: { credentials: { userJwt: "j", userSeed: "s" } }, env: {} }],
-    ["env JWT+seed", { env: { WEBCHANNEL_NATS_USER_JWT: "j", WEBCHANNEL_NATS_USER_SEED: "s" } }],
-    ["env creds file", { env: { WEBCHANNEL_NATS_CREDS: "/x" } }],
-  ])("rejects %s", (_name, extra) => {
-    expect(() => resolveNatsCredentialSource({ ...BASE, ...extra } as never)).toThrow(migration);
+
+  it("inline userJwt + userSeed → resolves static", () => {
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      natsConfig: { credentials: { userJwt: "j", userSeed: "s" } },
+      env: {},
+    }) as Extract<NatsCredentialSource, { mode: "static" }>;
+    expect(s.mode).toBe("static");
+    expect(s.userJwt).toBe("j");
+    expect(s.userSeed).toBe("s");
+  });
+
+  it("env JWT + seed → resolves static", () => {
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      env: { WEBCHANNEL_NATS_USER_JWT: "j", WEBCHANNEL_NATS_USER_SEED: "s" },
+    }) as Extract<NatsCredentialSource, { mode: "static" }>;
+    expect(s.mode).toBe("static");
+    expect(s.userJwt).toBe("j");
+    expect(s.userSeed).toBe("s");
+  });
+
+  it("credentials.credsFile → resolves static (from the parsed file)", () => {
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      natsConfig: { credentials: { credsFile: "/x" } },
+      env: {},
+      readFile: () => CREDS_FILE,
+    }) as Extract<NatsCredentialSource, { mode: "static" }>;
+    expect(s.mode).toBe("static");
+    expect(s.userJwt).toContain("eyJhbGci");
+    expect(s.userSeed).toMatch(/^SUAGM/);
+  });
+
+  it("env creds file → resolves static (from the parsed file)", () => {
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      env: { WEBCHANNEL_NATS_CREDS: "/x" },
+      readFile: () => CREDS_FILE,
+    }) as Extract<NatsCredentialSource, { mode: "static" }>;
+    expect(s.mode).toBe("static");
+  });
+
+  it("mode:\"static\" alone (no secrets) → targeted incomplete error, NOT the migration throw or a silent enrolled downgrade", () => {
+    // An explicit `mode:"static"` is itself a static signal (documented precedence
+    // #1); with no transport creds it must fail LOUD with the incompleteness error
+    // rather than silently downgrading to the enrolled device-flow.
+    expect(() =>
+      resolveNatsCredentialSource({
+        ...BASE,
+        natsConfig: { credentials: { mode: "static" } },
+        env: {},
+      }),
+    ).toThrow(/incomplete .*userJwt \+ userSeed/);
+    expect(() =>
+      resolveNatsCredentialSource({
+        ...BASE,
+        natsConfig: { credentials: { mode: "static" } },
+        env: {},
+      }),
+    ).not.toThrow(migration);
   });
 });
 

@@ -71,6 +71,13 @@ const SAAS_ISSUER = process.env.SAAS_ISSUER || SAAS_BASE_URL;
 // When set, TEST-ONLY routes (/test/nats-user, /test/bootstrap-jwt) are served.
 // Leave unset in any real deployment.
 const ENABLE_TEST_ROUTES = process.env.ENABLE_TEST_ROUTES === "1";
+// P0-3 (D6-5 R5-2): the SERVER-FORCED lifetime for every credential minted by the
+// unauthenticated /test/nats-user route. A hard constant (never a request-body
+// field) so the route can only ever emit short-lived creds — this is the
+// mechanism Mode B uses to get its static agent creds from outside the enrollment
+// bundle without exporting the account seed, and it bounds the blast radius if the
+// ENABLE_TEST_ROUTES gate is ever misconfigured on in a real deployment.
+const TEST_NATS_USER_TTL_SECONDS = 900;
 // When set, the SaaS server ALSO serves the unified single-origin DEMO surface:
 //   GET /                 → the two-panel demo app (operator approves + visitor chats)
 //   GET /widget.js        → the browser client bundle (esbuild IIFE, global WebDemo)
@@ -977,6 +984,12 @@ export const referenceEnrollmentRequestHandler = async (req: import("node:http")
           role: resolvedRole,
           ...(resolvedRole === "browser" ? { peerId } : {}),
           issuerAccountId: natsIssuerAccountId,
+          // P0-3 (D6-5 R5-2): SERVER-FORCED expiry on this unauthenticated test
+          // mint. It is a hard constant, NOT read from the request body — so even
+          // if the ENABLE_TEST_ROUTES gate is misconfigured on, this route can only
+          // ever emit SHORT-LIVED creds (all roles, incl. the tenant-wide agent
+          // role Mode B uses), never a non-expiring tenant-wide credential.
+          ttlSeconds: TEST_NATS_USER_TTL_SECONDS,
         })
           .then((creds) => {
             console.log(`[test/nats-user] minted ${resolvedRole} creds for tenant=${tenant}${peerId ? ` peerId=${peerId}` : ""}`);

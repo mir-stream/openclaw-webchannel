@@ -137,25 +137,27 @@ relay TRUST for availability/metadata, not confidentiality/integrity. **Out of s
 key compromise / revocation (deferred to re-enrollment); K rotation (deferred — fixed key first);
 real-time allowlist authz is a core-delegated stub.
 
-## Bring-your-own NATS (static creds) — REMOVED in P0-2, returns in P0-3
+## Bring-your-own NATS (static creds)
 
-Static / bring-your-own-NATS **serving** (and the old dev-open mode) was removed in P0-2: the
-authenticated register hop is now the **sole** admission path (see the E2E security model above).
-Support for static/BYO creds is planned to return in **P0-3**.
+A static / bring-your-own-NATS relay is a supported **transport** choice (P0-3): point the agent
+at your own NATS (self-hosted, Synadia/NGS, …) with a URL + user JWT/seed via
+`nats.credentials.mode:"static"` or the connection env overrides (`WEBCHANNEL_NATS_URL` /
+`_USER_JWT` / `_USER_SEED` / `_CREDS`, which also classify the source). It is **not** an auth
+bypass: the authenticated register hop remains the **sole** admission path (see the E2E security
+model above), and every account still needs a SaaS-attested agent identity from enrollment
+(`channels add`). A static account with no enrolled identity is skipped (`identity-missing`), never
+served. Configure your broker's subject grants per the BYO-NATS permission template (see
+[`docs/AUTH.md`](../../docs/AUTH.md)); enrolled (SaaS device-flow) creds remain the default, and a
+static transport reuses the exact same connect + register path with operator-supplied material.
 
-Until then, any removed config **fails closed with a targeted migration error** instead of silently
-degrading:
+Removed config still **fails closed with a targeted migration error** instead of silently degrading
+(`assertNoRemovedConfig` in `src/account-config.ts`, with a message pointing at
+`openclaw channels add --channel webchannel`):
 
 - `nats.credentials.mode:"open"`, the removed dev-open NATS flag, `nats.admission:"auto"`, and
-  `auth.strategy:"anonymous"` are rejected at account resolution (`assertNoRemovedConfig` in
-  `src/account-config.ts`), with a message pointing at `openclaw channels add --channel webchannel`.
-- `nats.credentials.mode:"static"` and the matching environment overrides are rejected one phase
-  later, at credential-source resolution (`src/nats-credential-source.ts`).
-
-Enrolled (SaaS device-flow) creds remain the supported path; the connection env overrides
-(`WEBCHANNEL_NATS_URL` / `_USER_JWT` / `_USER_SEED` / `_CREDS`) still classify the source. Do **not**
-copy an old `credentials.mode:"static"` block (or a `natsCredentials`-only browser client) as a
-working recipe — it now throws at startup / requires `registration`.
+  `auth.strategy:"anonymous"` are rejected at account resolution.
+- `auth.requirePoP` (any value) is rejected at the same seam — Proof-of-Possession is now
+  unconditional, so the opt-out was removed.
 
 ## NATS subject namespace
 

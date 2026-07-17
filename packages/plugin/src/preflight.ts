@@ -32,9 +32,17 @@
 
 import { JWKSCache, JwksUnavailableError } from "./jwks.js";
 import {
-  connectNatsCredentialSource,
-  type ConnectNatsDeps,
+  resolveNatsCredentialSource,
+  type WebchannelNatsConfig,
 } from "./nats-credential-source.js";
+import {
+  consumeCredentialSource,
+  type ConsumeCredentialSourceDeps,
+} from "./consume-credentials.js";
+import {
+  runPermissionProbes,
+  type PermissionProbeReport,
+} from "./preflight-probe.js";
 
 // ===========================================================================
 // Shared helpers
@@ -101,6 +109,15 @@ export type AccountReadinessInput = {
   buildError?: string;
   /** `account.dmSecurity`. */
   dmSecurity?: string;
+  /**
+   * P0-3 D1-5 — the credential SOURCE mode that served this account
+   * (`static` = BYO-NATS transport, `enrolled` = SaaS device-flow). Surfaced in
+   * the readiness line so the operator sees which transport path is live and can
+   * reconcile it against add-time preflight (which reports the add-time env).
+   */
+  credentialSource?: "static" | "enrolled";
+  /** P0-3 D1-5 — the EFFECTIVE dialed relay URL (consume-time), shown alongside the source mode. */
+  dialedUrl?: string;
 };
 
 export type AccountReadinessReport = { verdict: ReadinessVerdict; line: string };
@@ -128,8 +145,13 @@ export function formatAccountReadiness(
   input: AccountReadinessInput,
 ): AccountReadinessReport {
   const id = input.accountId;
+  // P0-3 D1-5: surface the credential source mode + effective dialed relay so the
+  // Gate B readiness line reports the RUN-time transport facts (add-time preflight
+  // reports add-time env, which can differ).
+  const sourceTail =
+    ` · source=${input.credentialSource ?? '(unknown)'} · relay=${input.dialedUrl ?? '(unknown)'}`;
   const tail =
-    ` · dmScope=${WEBCHANNEL_ENFORCED_DM_SCOPE_LABEL} · dmSecurity=${input.dmSecurity ?? '(unset)'}`;
+    ` · dmScope=${WEBCHANNEL_ENFORCED_DM_SCOPE_LABEL} · dmSecurity=${input.dmSecurity ?? '(unset)'}${sourceTail}`;
 
   // ── Hard CONFIG fault: the verifier could not be built. Fail-closed — the
   //    account is skipped by the loop; here we just name the trust state so the
@@ -140,7 +162,7 @@ export function formatAccountReadiness(
       line:
         `[webchannel] account "${id}" FAIL · verifier build failed: ${input.buildError}` +
         ` · issuer=${input.issuer ?? '(unresolved)'} · aud=${input.audience ?? '(unresolved)'}` +
-        ` · admission=${input.admission}`,
+        ` · admission=${input.admission}${sourceTail}`,
     };
   }
 
@@ -334,8 +356,22 @@ export type AddPreflightEnrollment = {
 export type RunAddPreflightOptions = {
   accountId: string;
   tenant: string;
+  /**
+   * SaaS base URL, RAW — the resolver owns the full precedence (env >
+   * nats.credentials.saasBaseUrl > this > default), matching the runtime.
+   */
   saasBaseUrl: string;
+  /** Enrollment bundle — used for the JWKS check (jwksUrl) + issuer precedence. */
   enrollment: AddPreflightEnrollment;
+  /**
+   * D4b — resolver inputs, so the relay dial goes through the EXACT runtime path
+   * (`resolveNatsCredentialSource` + `consumeCredentialSource`): enrolled dials the
+   * persisted creds (as runtime does), static dials the real static material.
+   */
+  natsConfig?: WebchannelNatsConfig;
+  legacyNats?: { url?: string };
+  /** Env bag (defaults to `process.env`). Injectable for tests. */
+  env?: Record<string, string | undefined>;
   /** Config-pinned operator escape hatches (config-present-wins). */
   pinnedIssuer?: string;
   pinnedAudience?: string;
@@ -343,18 +379,18 @@ export type RunAddPreflightOptions = {
   log: (...args: unknown[]) => void;
   /** @internal Test seam: JWKS fetch impl (forwarded to JWKSCache). */
   fetchImpl?: typeof fetch;
-  /** @internal Test seam: override the relay-dial probe. */
-  dial?: (input: {
-    url: string;
-    userJwt: string;
-    userSeed: string;
-    subject: string;
-    timeoutMs: number;
-  }) => Promise<{ ok: true } | { error: string }>;
-  /** @internal Test seam: connect deps forwarded to the default relay dial. */
-  connectDeps?: ConnectNatsDeps;
+  /**
+   * @internal Test seam: consume deps (transportFactory / makeSigner /
+   * loadPersisted / loadIdentity) forwarded to `consumeCredentialSource` — the
+   * runtime-identical dial injection point (replaces the old manual `dial` seam).
+   */
+  consumeDeps?: ConsumeCredentialSourceDeps;
+  /** @internal Test seam: override the permission probe (default `runPermissionProbes`). */
+  runProbes?: typeof runPermissionProbes;
   /** Relay-dial timeout (ms). Default 5000 — keeps `channels add` responsive. */
   timeoutMs?: number;
+  /** Per-probe PING/PONG barrier timeout (ms). Default 2000. */
+  probeTimeoutMs?: number;
 };
 
 /**
@@ -421,18 +457,51 @@ export async function runAddPreflight(
     };
   }
 
-  // 2. Relay dial (scoped no-op sub within the account's own subtree, then close).
-  const dialSubject = `webchannel.${opts.tenant}.${opts.accountId}._preflight`;
-  const relay = opts.enrollment.natsUrl
-    ? await (opts.dial ?? defaultRelayDial)({
-        url: opts.enrollment.natsUrl,
-        userJwt: opts.enrollment.userJwt,
-        userSeed: opts.enrollment.userSeed,
-        subject: dialSubject,
-        timeoutMs,
-        ...(opts.connectDeps ? { connectDeps: opts.connectDeps } : {}),
-      })
-    : ({ error: 'no SaaS-delivered relay URL in the enrollment result' } as const);
+  // 2. Relay dial + permission probe — runtime-identical resolve → consume (D4b).
+  //    `resolveNatsCredentialSource` + `consumeCredentialSource` are the SAME calls
+  //    the serving loop makes: enrolled loads the just-persisted creds and dials the
+  //    SaaS-delivered relay (as runtime), static dials the operator's own material.
+  //    Then the sequential PING-barrier permission probe runs on the live transport
+  //    (D4a) before we close it.
+  let relay: { ok: true } | { error: string };
+  let probeReport: PermissionProbeReport | undefined;
+  try {
+    const source = resolveNatsCredentialSource({
+      ...(opts.natsConfig !== undefined ? { natsConfig: opts.natsConfig } : {}),
+      ...(opts.legacyNats !== undefined ? { legacyNats: opts.legacyNats } : {}),
+      saasBaseUrl: opts.saasBaseUrl,
+      tenant: opts.tenant,
+      accountId: opts.accountId,
+      ...(opts.env !== undefined ? { env: opts.env } : {}),
+    });
+    const consumed = await withTimeout(
+      consumeCredentialSource(source, opts.accountId, opts.consumeDeps ?? {}),
+      timeoutMs,
+      `relay dial timed out after ${timeoutMs}ms`,
+    );
+    if (consumed.status === "creds-missing") {
+      relay = { error: "no enrolled credentials persisted for this account (run channels add)" };
+    } else if (consumed.status === "identity-missing") {
+      relay = { error: "static (BYO-NATS) credentials have no attested agent identity — enroll first" };
+    } else {
+      relay = { ok: true };
+      try {
+        probeReport = await (opts.runProbes ?? runPermissionProbes)(
+          consumed.connection.transport,
+          { tenant: opts.tenant, accountId: opts.accountId },
+          { ...(opts.probeTimeoutMs !== undefined ? { timeoutMs: opts.probeTimeoutMs } : {}) },
+        );
+      } finally {
+        try {
+          consumed.connection.transport.disconnect();
+        } catch {
+          /* ignore teardown errors — the probe result is already decided */
+        }
+      }
+    }
+  } catch (err) {
+    relay = { error: err instanceof Error ? err.message : String(err) };
+  }
 
   const report = evaluateAddPreflight({
     accountId: opts.accountId,
@@ -447,59 +516,19 @@ export async function runAddPreflight(
     relay,
   });
 
-  opts.log(`[webchannel] ${report.line}`);
-  return report;
-}
-
-/**
- * Default relay-dial probe: connect the enrolled creds to the relay (the NKEY
- * challenge-response handshake itself proves the creds are valid + accepted),
- * open a scoped no-op subscription within the account's own subtree, then
- * disconnect. Bounded by `timeoutMs` so `channels add` can never hang on an
- * unreachable relay. Reuses `connectNatsCredentialSource` (static mode) — the
- * same primitive the runtime uses to dial enrolled creds — so nothing about the
- * auth flow is reinvented here.
- */
-async function defaultRelayDial(input: {
-  url: string;
-  userJwt: string;
-  userSeed: string;
-  subject: string;
-  timeoutMs: number;
-  connectDeps?: ConnectNatsDeps;
-}): Promise<{ ok: true } | { error: string }> {
-  let connection: Awaited<ReturnType<typeof connectNatsCredentialSource>> | undefined;
-  try {
-    const connected = await withTimeout(
-      connectNatsCredentialSource(
-        {
-          mode: 'static',
-          url: input.url,
-          userJwt: input.userJwt,
-          userSeed: input.userSeed,
-        },
-        input.connectDeps ?? {},
-      ),
-      input.timeoutMs,
-      `relay dial timed out after ${input.timeoutMs}ms`,
-    );
-    connection = connected;
-    // Scoped no-op subscription within the agent's own `webchannel.{tenant}.>`
-    // grant — proves the subject scoping the browser register will ride is
-    // permitted for these creds. Best-effort; a permission fault surfaces via
-    // the transport error event, but the connect handshake is the load-bearing
-    // proof, so we do not block on a settle window (keeps `channels add` fast).
-    connected.transport.subscribe(input.subject);
-    return { ok: true };
-  } catch (err) {
-    return { error: err instanceof Error ? err.message : String(err) };
-  } finally {
-    try {
-      connection?.transport.disconnect();
-    } catch {
-      /* ignore teardown errors — the probe result is already decided */
-    }
+  // Compose the probe outcome (D4a) into the final verdict + line. A probe FAIL
+  // (agent creds denied on the account's own subtree) flips the overall verdict; a
+  // WARN (over-broad grant) is surfaced but does not fail the add.
+  let ok = report.ok;
+  let line = report.line;
+  if (probeReport) {
+    line += ` · permissions ${probeReport.verdict}`;
+    if (probeReport.verdict !== "PASS") line += `\n${probeReport.line}`;
+    if (probeReport.verdict === "FAIL") ok = false;
   }
+
+  opts.log(`[webchannel] ${line}`);
+  return { ok, line };
 }
 
 /** Reject with `message` if `p` does not settle within `ms`. */

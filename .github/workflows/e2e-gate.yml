@@ -2,7 +2,7 @@
 # e2e-gate.yml — Single blocking CI gate for openclaw-webchannel Phase B.
 #
 # Enforces:
-#  - All pre-existing test suites stay green (≥1398 test baseline across 3 pkgs)
+#  - All pre-existing test suites stay green (≥1500 test baseline across all pkgs; P0-3 ratchet, was 1398)
 #  - 3-package typecheck passes clean
 #  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
 #  - The register-hop (enrolled-JWT) admission path is covered end-to-end
@@ -162,7 +162,7 @@ jobs:
 
       # ──────────────────────────────────────────────────────────────────────
       # 6. Run all test suites with JSON output for baseline verification
-      #    - Baseline: ≥1398 tests across all packages
+      #    - Baseline: ≥1500 tests across all packages (P0-3 bump from 1398)
       #    - Real-server suites (skipIf removed in CI) now run against the
       #      real nats-server binary installed in step 3.
       #    - Sub-AC 1: e2e/dev-nats-roundtrip.test.ts — open-NATS E2E gate
@@ -177,16 +177,16 @@ jobs:
           CI: "true"
 
       # ──────────────────────────────────────────────────────────────────────
-      # 7. Verify test count meets baseline (≥1398 tests passed)
+      # 7. Verify test count meets baseline (≥1500 tests passed)
       #    Fails the gate if the count regresses below the seed-time baseline.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Verify test baseline (≥1398 tests)
+      - name: Verify test baseline (≥1500 tests)
         if: always()
         run: |
           set -euo pipefail
           node - << 'EOF'
           const fs = require('fs');
-          const BASELINE = 1398;
+          const BASELINE = 1500;
           let data;
           try {
             data = JSON.parse(fs.readFileSync('/tmp/vitest-results.json', 'utf8'));
@@ -254,3 +254,31 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
       - name: "Live e2e: DERIVED trust anchor (zero hand-written trust facts)"
         run: bash e2e/local/run-derived-trust.sh
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 8h. Live e2e: Mode B — STATIC (BYO-NATS) serving + adversarial N1-N3 (P0-3)
+      #    Two accounts ENROLL for identity but the gateway's NATS transport comes
+      #    from STATIC creds (WEBCHANNEL_NATS_USER_JWT/_SEED + credentials.mode:
+      #    "static"), obtained out-of-band from the TTL-bounded /test/nats-user
+      #    agent route. A real browser round-trips; the shared N1 (pre-register
+      #    no-turn) / N2 (wrong-binding 401) / N3 (SIGSTOP-MITM key-swap →
+      #    secure-channel-failed + recovery) legs run; a fail-closed leg proves a
+      #    static-but-unenrolled account is identity-missing skipped. Isolated under
+      #    /tmp/oc-byo-static-e2e (port 19499). Sequential (self-hosted single
+      #    runner). Any non-zero exit FAILS the gate.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Live e2e: Mode B — static BYO-NATS + N1-N3"
+        run: bash e2e/local/run-byo-static.sh
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 8i. Live e2e: Mode C — EXTERNAL (managed) account + adversarial N1-N3 (P0-3)
+      #    An operator + account (with a delegated signing key) are synthesized;
+      #    nats-server runs resolver-backed; the reference SaaS mints in EXTERNAL
+      #    mode (signing-key-signed, issuer_account-stamped). The gateway consumes
+      #    those external creds and CONNECTS (the register success is the live
+      #    resolver-CONNECT proof the shape-only unit tests can't give); a browser
+      #    round-trips; N1-N3 run. No downgrade path — a resolver refusal FAILS.
+      #    Isolated under /tmp/oc-external-acct-e2e (port 19599). Sequential.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Live e2e: Mode C — external account + N1-N3"
+        run: bash e2e/local/run-external-account.sh

@@ -7,8 +7,11 @@ state is [`STATUS.md`](STATUS.md).
 
 **Status: closed on the sole admission path (as of P0-2).** The authenticated register hop
 (PoP + JWT `cnf`-attested device key → register-reply-delivered wrapped conversation key K) is now
-the ONLY admission path — auto-admission, the unauthenticated `.handshake` key-exchange, dev-open,
-and static-creds serving are all deleted. K is never negotiated on the wire; it travels only inside
+the ONLY admission path — auto-admission, the unauthenticated `.handshake` key-exchange, and dev-open
+are all deleted. (Static/BYO-NATS creds serving, which P0-2 had made un-servable, was restored in
+P0-3 as a **transport** choice only: a static relay rides this exact same authenticated register hop,
+never an admission bypass, and enrollment still supplies the attested agent identity.) K is never
+negotiated on the wire; it travels only inside
 the authenticated register reply, wrapped to the SaaS-attested device `cnf` key — so an active relay
 can carry the admission frames but cannot substitute keys or MITM a conversation/approval (tampering
 fails Poly1305, and the client fails closed with a terminal error). This matches

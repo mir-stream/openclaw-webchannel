@@ -101,6 +101,49 @@ describe("index-nats.ts wiring contract — approval decision account routing", 
   });
 });
 
+describe("index-nats.ts wiring contract — shared-audience fail-closed pre-pass (P0-3 D6-1)", () => {
+  it("detects collisions in a PRE-PASS via the extracted detector, before the serving loop", () => {
+    // Collision detection must run through the tested pure module, keyed by the
+    // per-plan derived auth built in the pre-pass — not an inline heuristic.
+    expect(INDEX_NATS_SOURCE).toMatch(/const\s+sharedAudienceCollisions\s*=\s*detectSharedAudienceCollisions\(/);
+    expect(INDEX_NATS_SOURCE).toMatch(/const\s+accountAuthByPlan\s*=\s*new Map/);
+  });
+
+  it("skips EVERY colliding account with a `continue` before any transport opens", () => {
+    // The skip reads the pre-pass result and continues out of the loop iteration
+    // (fail-closed), so a colliding account never reaches the Step 1 consume/connect.
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /const\s+collision\s*=\s*sharedAudienceCollisions\.get\(accountId\);[\s\S]*?if\s*\(collision\)\s*\{[\s\S]*?continue;/,
+    );
+  });
+
+  it("no longer carries the old post-connect `registerHopAudClaims` warn-only map", () => {
+    // The P0-2-era "warn on the second claimant" map is replaced by the fail-closed
+    // pre-pass; its presence would mean a colliding account could still serve.
+    expect(INDEX_NATS_SOURCE).not.toContain("registerHopAudClaims");
+  });
+
+  it("derives the register-hop issuer from the IDENTITY accessor (survives absent transport creds)", () => {
+    // Issuer must come from loadPersistedAgentIdentity (decoupled from transport
+    // material), not the enrolled-transport loader.
+    expect(INDEX_NATS_SOURCE).toMatch(/loadPersistedAgentIdentity\(plan\.accountId\)\?\.issuer/);
+    expect(INDEX_NATS_SOURCE).not.toContain("loadPersistedEnrolledCreds");
+  });
+});
+
+describe("index-nats.ts wiring contract — static identity-missing skip + readiness source (P0-3 D1/S2)", () => {
+  it("skips a static account with no attested identity (identity-missing) account-scoped", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(/if\s*\(consumed\.status === "identity-missing"\)\s*\{[\s\S]*?continue;/);
+  });
+
+  it("surfaces the credential source mode + effective dialed URL in the readiness line", () => {
+    // Both the build-fail and healthy readiness calls thread the run-time source
+    // facts through formatAccountReadiness (Gate B).
+    expect(INDEX_NATS_SOURCE).toMatch(/credentialSource:\s*credentialSourceMode/);
+    expect(INDEX_NATS_SOURCE).toMatch(/dialedUrl\s*=\s*consumed\.dialedUrl/);
+  });
+});
+
 describe("index-nats.ts browser-route absence", () => {
   it("contains no gateway HTTP route registration or socket-upgrade wiring", () => {
     expect(INDEX_NATS_SOURCE).not.toContain("registerHttpRoute");

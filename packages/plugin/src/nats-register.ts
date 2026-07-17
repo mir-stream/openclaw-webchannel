@@ -43,7 +43,7 @@ import { TransientVerifyError } from "./auth.js";
 import type { JwtIdentity } from "./jwt.js";
 import type { PopChallengeStore } from "./pop-challenge.js";
 import type { WrappedConversationKey } from "./late-join-decryptor.js";
-import { resolveRequirePoP, popRequirementUnmet } from "./register-pop-gate.js";
+import { popRequirementUnmet } from "./register-pop-gate.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
 
@@ -225,9 +225,11 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   }
 
   // op === "register"
-  // PoP gate (secure-by-default): PoP is REQUIRED unless auth.requirePoP=false.
-  const requirePoP = resolveRequirePoP(auth as { requirePoP?: boolean } | undefined);
-  if (popRequirementUnmet(requirePoP, Boolean(identity.popPublicJwk))) {
+  // PoP gate (P0-3 D6-5): PoP is UNCONDITIONALLY required. A verified bootstrap
+  // JWT that carries no pop_jwk is rejected before any peer is registered — the
+  // opt-out (auth.requirePoP:false) was removed (it unlocked the only admission
+  // door; a present value now reaches a fatal migration error at config load).
+  if (popRequirementUnmet(Boolean(identity.popPublicJwk))) {
     logger?.error?.(
       `webchannel: register rejected for ${peerId} — proof-of-possession required (JWT has no pop_jwk)`,
     );

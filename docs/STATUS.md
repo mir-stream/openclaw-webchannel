@@ -36,6 +36,14 @@ this file, **this file is correct.**
   decrypt live traffic + snapshots; W6 id/text/positional dedup handles echo adoption.
   Register-hop (bootstrap JWT + PoP) is now the SOLE admission path — P0-2 deleted the
   unauthenticated X25519 handshake and the dev/open-NATS mode entirely.
+  **P0-3** then re-enabled static (BYO-NATS) relays as an authenticated **transport** choice
+  (the operator owns the relay, but enrollment still supplies the attested agent identity — a
+  static account with no enrolled identity is skipped, `identity-missing`, never served),
+  ending the P0-2 static-creds un-servable window. P0-3 also removed the `auth.requirePoP`
+  opt-out (PoP is now unconditional; a present value is a startup migration error), hardened
+  shared-audience `(issuer, audience)` collisions to a fail-closed pre-pass skip of the whole
+  collision set, and added the BYO-NATS permission template (`nats-permission-template.ts`) plus
+  an add-time register-hop permission probe (`preflight-probe.ts`).
 - **Multi-account multiplex** — one gateway serves `channels.webchannel.accounts.<id>` with
   per-account NATS connections, subject namespaces, verifiers, and admission
   (`multiplex.ts`; 가-1/가-2). Exec/plugin approvals are **accountId-aware** (per-account

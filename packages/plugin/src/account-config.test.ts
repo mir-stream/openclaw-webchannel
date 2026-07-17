@@ -17,6 +17,7 @@ import {
   legacyCredentialPath,
   resolveReadCredentialPath,
   loadPersistedEnrolledCreds,
+  loadPersistedAgentIdentity,
 } from "./account-config.js";
 import { planAccounts } from "./multiplex.js";
 
@@ -579,6 +580,80 @@ describe("account-config: loadPersistedEnrolledCreds", () => {
 
   it("rejects a traversal account id", () => {
     expect(() => loadPersistedEnrolledCreds("../../evil", { home: HOME })).toThrow(
+      /invalid account id/,
+    );
+  });
+});
+
+describe("account-config: loadPersistedAgentIdentity (P0-3 D1)", () => {
+  // base64url of a 32-byte X25519 key is 43 chars.
+  const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+
+  it("returns identity even when transport material (userJwt/userSeed) is absent", () => {
+    // The key decoupling: identity does NOT require the enrolled transport creds.
+    // A file with only the identityKey block (no enrollment.creds) still yields
+    // the attested identity — this is what lets a static (BYO-NATS) account serve.
+    const file = JSON.stringify({ identityKey: { publicKey: KEY43, privateKey: KEY43 } });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const identity = loadPersistedAgentIdentity("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => file,
+    });
+    expect(identity).toBeDefined();
+    expect(identity!.identityKey.publicKey).toBeInstanceOf(Uint8Array);
+    expect(identity!.identityKey.publicKey.length).toBe(32);
+    expect(identity!.identityKey.privateKey.length).toBe(32);
+    expect(identity!.issuer).toBeUndefined();
+  });
+
+  it("surfaces enrollment.issuer alongside the identity (verbatim)", () => {
+    const file = JSON.stringify({
+      identityKey: { publicKey: KEY43, privateKey: KEY43 },
+      enrollment: { issuer: "https://saas.local/demo-issuer/" },
+    });
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const identity = loadPersistedAgentIdentity("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => file,
+    });
+    expect(identity?.issuer).toBe("https://saas.local/demo-issuer/");
+  });
+
+  it("returns undefined when the identityKey is corrupt / not a 32-byte pair (fail-closed)", () => {
+    const perAccount = accountCredentialPath("acctA", HOME);
+    const load = (identityKey: unknown) =>
+      loadPersistedAgentIdentity("acctA", {
+        home: HOME,
+        exists: (p) => p === perAccount,
+        read: () => JSON.stringify({ identityKey, enrollment: { issuer: "https://x" } }),
+      });
+    // Wrong length (not an X25519 key).
+    expect(load({ publicKey: "AAAA", privateKey: "AAAA" })).toBeUndefined();
+    // Only one half present.
+    expect(load({ publicKey: KEY43 })).toBeUndefined();
+    // Absent entirely — no identity, even though an issuer is present (issuer alone
+    // is useless without the attested key).
+    expect(load(undefined)).toBeUndefined();
+  });
+
+  it("returns undefined when the file is absent or malformed", () => {
+    expect(
+      loadPersistedAgentIdentity("default", { home: HOME, exists: () => false }),
+    ).toBeUndefined();
+    const perAccount = accountCredentialPath("default", HOME);
+    expect(
+      loadPersistedAgentIdentity("default", {
+        home: HOME,
+        exists: (p) => p === perAccount,
+        read: () => "not json{",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("rejects a traversal account id", () => {
+    expect(() => loadPersistedAgentIdentity("../../evil", { home: HOME })).toThrow(
       /invalid account id/,
     );
   });

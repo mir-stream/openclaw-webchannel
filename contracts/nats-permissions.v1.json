@@ -1,0 +1,21 @@
+{
+  "_meta": {
+    "source": "plugin requiredNatsPermissions (packages/plugin/src/nats-permission-template.ts) == saas mintNatsUserCreds (packages/saas/src/nats-user-creds.ts)",
+    "version": "v1",
+    "bumpRule": "Any change to the subject GRANT semantics (subjects, allow/deny) is a breaking change: bump to nats-permissions.v2.json and update BOTH the plugin parity test and the saas JWT-claim parity test in the same commit. Parity comparisons strip _meta first.",
+    "sample": { "tenant": "t1", "peerId": "p1", "accountId": "a1" },
+    "notes": "accountId is NOT present in any grant — the browser grant wildcards the accountId segment (webchannel.{tenant}.*.{peerId}.>) so one peerId spans every account. It is recorded here only as sample context."
+  },
+  "agent": {
+    "pub": { "allow": ["webchannel.t1.>"], "deny": [] },
+    "sub": { "allow": ["webchannel.t1.>"], "deny": [] }
+  },
+  "browser": {
+    "pub": { "allow": ["webchannel.t1.*.p1.>"], "deny": [] },
+    "sub": { "allow": ["webchannel.t1.*.p1.>"], "deny": [] }
+  },
+  "observer": {
+    "pub": { "allow": [], "deny": [">"] },
+    "sub": { "allow": ["webchannel.t1.>"], "deny": [] }
+  }
+}

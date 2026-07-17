@@ -34,6 +34,7 @@ import {
 } from "./nats-credential-source.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  loadPersistedAgentIdentity,
   loadPersistedEnrolledCreds,
 } from "./account-config.js";
 import type { KeyPair } from "./e2e-crypto.js";
@@ -60,11 +61,23 @@ export type ConsumeResult =
        */
       identityKey?: KeyPair;
     }
-  | { status: "creds-missing"; accountId: string };
+  | { status: "creds-missing"; accountId: string }
+  /**
+   * P0-3 — a `static` (BYO-NATS) source resolved, but the account has NO
+   * SaaS-attested agent identity persisted (no valid `identityKey`). Static
+   * creds replace the TRANSPORT only; a register-hop account still needs an
+   * attested identity, so we DO NOT connect (the transport factory is never
+   * called) and the caller fail-closed skips serving. Distinct from
+   * `creds-missing` (enrolled path) because the remediation differs: the
+   * operator must ENROLL for identity even though they supplied transport creds.
+   */
+  | { status: "identity-missing"; accountId: string };
 
 export type ConsumeCredentialSourceDeps = ConnectNatsDeps & {
-  /** Injectable persisted-creds loader (tests). */
+  /** Injectable persisted enrolled-creds loader (enrolled transport path; tests). */
   loadPersisted?: typeof loadPersistedEnrolledCreds;
+  /** Injectable persisted agent-identity loader (static path; tests). */
+  loadIdentity?: typeof loadPersistedAgentIdentity;
   /** Override home dir for path resolution (tests). */
   home?: string;
 };
@@ -82,10 +95,27 @@ export async function consumeCredentialSource(
   accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   deps: ConsumeCredentialSourceDeps = {},
 ): Promise<ConsumeResult> {
-  if (source.mode !== "enrolled") {
-    // Static: connect directly (auth material is already present).
+  if (source.mode === "static") {
+    // Static (BYO-NATS): the transport material is already present in `source`,
+    // but the register-hop wrap still needs the SaaS-attested agent identity.
+    // Load it separately (decoupled from transport material — D1). No identity ⇒
+    // return `identity-missing` WITHOUT connecting (assert: the transport factory
+    // is never called on this path). Static dials `source.url` — the operator
+    // owns the transport fully, so we never consult the persisted `natsUrl`.
+    const loadIdentity = deps.loadIdentity ?? loadPersistedAgentIdentity;
+    const identity = loadIdentity(accountId, {
+      ...(deps.home !== undefined ? { home: deps.home } : {}),
+    });
+    if (!identity) {
+      return { status: "identity-missing", accountId };
+    }
     const connection = await connectNatsCredentialSource(source, deps);
-    return { status: "connected", connection, dialedUrl: source.url };
+    return {
+      status: "connected",
+      connection,
+      dialedUrl: source.url,
+      identityKey: identity.identityKey,
+    };
   }
 
   const loadPersisted = deps.loadPersisted ?? loadPersistedEnrolledCreds;

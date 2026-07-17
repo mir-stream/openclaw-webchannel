@@ -25,6 +25,12 @@ import type { WrappedConversationKey } from "./late-join-decryptor.js";
 import { sealEnvelope, openEnvelope } from "./e2e-session.js";
 import { isValidSubjectToken } from "./subject-token.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
+import {
+  registerWildcard,
+  reginboxPrefix,
+  inboundSubject as buildInboundSubject,
+  outboundSubject as buildOutboundSubject,
+} from "./subjects.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -314,7 +320,7 @@ export class NatsChannel implements WebChannelPeerChannel {
    * pinned to THIS account — identity still comes only from the verified JWT.
    */
   subscribeRegister(): void {
-    const regWild = `webchannel.${this.tenant}.${this.accountId}.*.register`;
+    const regWild = registerWildcard(this.tenant, this.accountId);
     this.transport.subscribe(regWild);
     console.log(`[nats-channel] Subscribed to register wildcard ${regWild}`);
   }
@@ -589,11 +595,11 @@ export class NatsChannel implements WebChannelPeerChannel {
   // ---------------------------------------------------------------------------
 
   private inboundSubject(peerId: string): string {
-    return `webchannel.${this.tenant}.${this.accountId}.${peerId}.in`;
+    return buildInboundSubject(this.tenant, this.accountId, peerId);
   }
 
   private outboundSubject(peerId: string): string {
-    return `webchannel.${this.tenant}.${this.accountId}.${peerId}.out`;
+    return buildOutboundSubject(this.tenant, this.accountId, peerId);
   }
 
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
@@ -704,7 +710,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   private handleRegister(msg: NatsMessage, peerId: string): void {
     if (!this.onRegisterRequest) return;
     const replyTo = msg.replyTo;
-    const ownReginboxPrefix = `webchannel.${this.tenant}.${this.accountId}.${peerId}.reginbox.`;
+    const ownReginboxPrefix = reginboxPrefix(this.tenant, this.accountId, peerId);
     const reply = (response: string): void => {
       if (!replyTo) return; // fire-and-forget (e.g. unregister)
       // Allowlist: own reginbox prefix + a single valid subject token (the token

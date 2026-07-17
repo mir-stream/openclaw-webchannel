@@ -239,27 +239,14 @@ export function resolveNatsCredentialSource(
     input.legacyNats?.url ??
     DEFAULT_NATS_URL;
 
-  if (
-    creds?.mode === "static" ||
-    creds?.credsFile !== undefined ||
-    creds?.userJwt !== undefined ||
-    creds?.userSeed !== undefined ||
-    env["WEBCHANNEL_NATS_CREDS"] !== undefined ||
-    env["WEBCHANNEL_NATS_USER_JWT"] !== undefined ||
-    env["WEBCHANNEL_NATS_USER_SEED"] !== undefined
-  ) {
-    throw new Error(
-      "webchannel: static NATS credentials no longer imply auto admission; BYO-NATS requires authenticated registration (attested agent identity) — enroll with `openclaw channels add --channel webchannel`, or track P0-3.",
-    );
-  }
-
-  // ── 1. STATIC (bring-your-own-NATS) — UNREACHABLE until P0-3 ──────────────
-  // The static-signal guard above throws for EVERY condition that could set a
-  // static signal, so this resolution block cannot currently run. It is retained
-  // as the P0-3 (BYO-NATS authenticated registration) landing site: P0-3 removes
-  // the throw and re-enables this path once static creds carry an attested
-  // identity. The `{ mode: "static" }` union member + connector case survive for
-  // direct unit construction of the resolved source.
+  // ── 1. STATIC (bring-your-own-NATS) ───────────────────────────────────────
+  // Re-enabled in P0-3: static credentials pick the TRANSPORT (a BYO relay +
+  // user JWT/seed) but are NOT an auth bypass. The resolver only produces the
+  // resolved `{ mode: "static", … }` source; the attested agent identity is
+  // supplied separately at consume time (`consume-credentials.ts` loads it via
+  // `loadPersistedAgentIdentity` and fail-closed skips serving when it is
+  // absent). Before P0-3 a static signal here threw a fail-loud migration error
+  // (P0-2 landing site); that throw is now removed and this block is live.
   const credsFilePath = env["WEBCHANNEL_NATS_CREDS"] ?? creds?.credsFile;
   const envJwt = env["WEBCHANNEL_NATS_USER_JWT"];
   const envSeed = env["WEBCHANNEL_NATS_USER_SEED"];
@@ -274,7 +261,14 @@ export function resolveNatsCredentialSource(
     env,
   );
 
+  // An explicit `credentials.mode: "static"` is itself a static signal (documented
+  // precedence #1 above): honoring it means an operator who declared static but
+  // supplied no secrets gets the loud "incomplete static credentials" error below
+  // rather than a silent, surprising downgrade to the enrolled device-flow. This
+  // matches the fail-loud guard P0-2 fenced this block with (which also keyed on
+  // `mode === "static"`), now that P0-3 has removed that guard.
   const staticSignalled =
+    creds?.mode === "static" ||
     credsFilePath !== undefined ||
     envJwt !== undefined ||
     envSeed !== undefined ||

@@ -237,6 +237,14 @@ describe.skipIf(!NATS_SERVER_BIN)(
       }
     });
 
+    it("flush() round-trips a PING/PONG barrier against the real server (P0-3 probe seam)", async () => {
+      const t = await makeTransport("flush-probe");
+      // A real nats-server answers our PING with PONG, so flush() resolves.
+      await expect(t.flush(2000)).resolves.toBeUndefined();
+      // And it works repeatedly (sequential barriers, as the probe uses it).
+      await expect(t.flush(2000)).resolves.toBeUndefined();
+    });
+
     it("replays a backlog of N messages in order with zero gaps over the real bus", async () => {
       const agentKeys = generateKeyPair();
       const browserKeys = generateKeyPair();

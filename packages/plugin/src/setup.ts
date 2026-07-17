@@ -62,6 +62,7 @@ import {
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
 import { runAddPreflight } from "./preflight.js";
+import { formatPermissionTemplate } from "./nats-permission-template.js";
 
 /**
  * The slice of `ChannelSetupInput` this adapter reads. The host type is a closed
@@ -392,6 +393,21 @@ export const webchannelSetup = {
         `[webchannel] account "${id}" credential mode is "${mode}"; ` +
           `skipping device-flow acquisition (no creds to acquire).`,
       );
+      // P0-3 D3 output #1: for static (BYO-NATS) mode, surface the subject-grant
+      // template the operator must configure on their own broker — and remind them
+      // that enrollment is still REQUIRED for the attested agent identity (a BYO
+      // relay is a transport choice, not an auth bypass).
+      if (mode === "static") {
+        const staticTenant =
+          resolveSetupIdentity(input).tenant ??
+          (account.tenant as string | undefined) ??
+          "default-tenant";
+        runtime.log(
+          `[webchannel] account "${id}" static (BYO-NATS): enrollment is still REQUIRED for the ` +
+            `attested agent identity, and your NATS broker must grant these subjects:\n` +
+            formatPermissionTemplate(staticTenant),
+        );
+      }
       return;
     }
 
@@ -458,6 +474,14 @@ export const webchannelSetup = {
       // loud, actionable log line.
       const existingJwt = (account.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
         ?.jwt;
+      // D4b: the relay dial now goes through the runtime resolve → consume path,
+      // so hand it the same resolver inputs the serving loop reads — the account's
+      // `nats` block + the legacy top-level `nats.url` — and let it dial the
+      // just-persisted creds exactly as `gateway run` will.
+      const accountNats = account.nats as
+        | import("./nats-credential-source.js").WebchannelNatsConfig
+        | undefined;
+      const legacyNats = (cfg as { nats?: { url?: string } }).nats;
       await runAddPreflight({
         accountId: id,
         tenant,
@@ -469,6 +493,8 @@ export const webchannelSetup = {
           ...(enrollment.jwksUrl !== undefined ? { jwksUrl: enrollment.jwksUrl } : {}),
           ...(enrollment.issuer !== undefined ? { issuer: enrollment.issuer } : {}),
         },
+        ...(accountNats !== undefined ? { natsConfig: accountNats } : {}),
+        ...(legacyNats !== undefined ? { legacyNats } : {}),
         // Config-present-wins: an operator PIN overrides the derivation.
         ...(existingJwt?.issuer !== undefined ? { pinnedIssuer: existingJwt.issuer } : {}),
         ...(existingJwt?.audience !== undefined ? { pinnedAudience: existingJwt.audience } : {}),

@@ -55,8 +55,7 @@
               },
               "requirePoP": {
                 "type": "boolean",
-                "default": true,
-                "description": "Require Proof-of-Possession at the NATS register hop. Default true (secure-by-default): a verified bootstrap JWT with no pop_jwk is rejected before any peer is registered. Set false to restore legacy optional-PoP behavior (dev only)."
+                "description": "REMOVED — startup migration error. Proof-of-Possession is now ALWAYS required at the NATS register hop (the opt-out unlocked the only admission door). The property is still ACCEPTED by the schema so a present value reaches the targeted migration error rather than a generic schema reject; remove it."
               },
               "jwt": {
                 "type": "object",
@@ -187,7 +186,7 @@
           "nats": {
             "type": "object",
             "additionalProperties": false,
-            "description": "Agent↔NATS connection. Authenticated enrollment and register-hop peer admission are required; static BYO-NATS serving returns in P0-3.",
+            "description": "Agent↔NATS connection. A static (BYO-NATS) relay is a supported TRANSPORT choice, but not an auth bypass: register-hop peer admission is always required, and every account still needs a SaaS-attested agent identity from enrollment (`channels add`) — a static account with no enrolled identity is skipped (identity-missing), never served.",
             "properties": {
               "url": {
                 "type": "string",
@@ -210,7 +209,7 @@
                   "mode": {
                     "type": "string",
                     "enum": ["static", "enrolled", "open"],
-                    "description": "enrolled is the supported mode. static is rejected until P0-3; open is REMOVED and reaches a startup migration error."
+                    "description": "enrolled (SaaS device-flow) is the default. static = bring-your-own-NATS TRANSPORT (url + user JWT/seed): the operator owns the relay, but enrollment still supplies the attested agent identity — a static account with no enrolled identity is skipped (identity-missing), never served. open is REMOVED and reaches a startup migration error."
                   },
                   "userJwt": {
                     "anyOf": [

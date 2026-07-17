@@ -215,15 +215,29 @@ describe("handleRegisterRequest (register over NATS)", () => {
     expect(h.registered).toEqual([]);
   });
 
-  it("register with no cnf device key → generic unauthorized", async () => {
-    // requirePoP defaults true; with no pop_jwk the PoP gate rejects first, so
-    // set requirePoP:false to reach the cnf check with a no-cnf identity.
+  it("register with NO pop_jwk is rejected — PoP is unconditionally required (P0-3 D6-5)", async () => {
+    // The former auth.requirePoP:false opt-out is removed, so a verified JWT that
+    // carries no pop_jwk is rejected at the PoP gate before any peer is registered.
     const h = makeHarness({
-      auth: { strategy: "jwt", requirePoP: false },
-      identity: { peerId: PEER } as JwtIdentity, // no devicePublicKey, no pop_jwk
+      identity: { peerId: PEER, devicePublicKey: randomBytes(32).toString("base64url") } as JwtIdentity, // no popPublicJwk
     });
     await h.run({ op: "register", token: "jwt" });
     expect(h.replies[0]).toBe(REGISTER_UNAUTHORIZED);
+    expect(h.registered).toEqual([]);
+  });
+
+  it("register with pop_jwk + valid PoP but NO cnf device key → generic unauthorized", async () => {
+    // PoP is unconditionally required now, so to reach the cnf check we present a
+    // pop_jwk identity, satisfy the PoP challenge, and simply omit devicePublicKey.
+    const device = makeDevice();
+    const h = makeHarness({
+      identity: { peerId: PEER, popPublicJwk: device.popPublicJwk } as JwtIdentity, // pop_jwk, NO devicePublicKey
+    });
+    await h.run({ op: "challenge", token: "jwt" });
+    const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
+    const signature = device.sign(popSignedMessage(PEER, nonce));
+    await h.run({ op: "register", token: "jwt", nonce, signature });
+    expect(h.replies[1]).toBe(REGISTER_UNAUTHORIZED);
     expect(h.registered).toEqual([]);
   });
 
