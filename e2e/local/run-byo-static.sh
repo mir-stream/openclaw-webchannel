@@ -63,12 +63,22 @@ cleanup() {
   pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
   pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 }
+# Signal traps (INT/TERM) convert to a normal exit so the EXIT trap runs the N3
+# SIGSTOP kill -CONT fail-safe exactly once: a CI cancel (e2e-gate concurrency
+# cancel-in-progress) landing in the N3 STOP window must still resume the gateway.
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Pre-clean.
 pkill -f "nats-server -c $OCH/nats.conf" 2>/dev/null || true
 pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
+# A STOPPED gateway (a previous run killed mid-N3) ignores TERM; CONT then KILL is
+# the only self-heal — otherwise the orphan keeps holding $GW_PORT and the next
+# run EADDRINUSEs on every subsequent run until a manual kill -9.
+pkill -CONT -f "gateway --port $GW_PORT" 2>/dev/null || true
 pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
+pkill -9 -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
 
@@ -234,6 +244,13 @@ done
 for a in "$ACCT_A" "$ACCT_B"; do
   if ! grep -qE "account \"$a\" credential source: static" "$OCH/gateway.log" 2>/dev/null; then
     echo "[run-byo] FAIL — $a did not serve via the static source. gateway log:"; grep -i "credential source\|static\|$a" "$OCH/gateway.log" | tail -20; exit 3
+  fi
+  # `credential source: static` is logged BEFORE the identityKey guard in
+  # packages/plugin/index-nats.ts, so 6a alone would pass even if the account was
+  # skipped before the channel was built. Also gate on the per-account channel line
+  # (mirrors the same gate in run-external-account.sh / run-all-real.sh) for 2-of-2 parity.
+  if ! grep -q "account \"$a\" ✓ encrypted NATS channel" "$OCH/gateway.log" 2>/dev/null; then
+    echo "[run-byo] FAIL — $a logged static source but built NO encrypted NATS channel. gateway log:"; tail -40 "$OCH/gateway.log"; exit 3
   fi
 done
 echo "[run-byo] ✓ both enrolled accounts serving via STATIC (BYO-NATS) transport"

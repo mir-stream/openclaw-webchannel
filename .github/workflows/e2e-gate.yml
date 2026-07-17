@@ -33,6 +33,14 @@ jobs:
     name: E2E Gate (nats-server v2.14 + Typecheck + Tests)
     runs-on: [self-hosted, linux, x64]
 
+    # Bound the whole gate (build + typecheck + ~1500 vitest + 6 sequential live
+    # e2e modes on the single serial self-hosted runner) so a hang — e.g. a
+    # SIGSTOPped N3 gateway wedging a live leg — can't sit on the 360-min default
+    # and block the queue. A SIGKILL at this timeout bypasses the EXIT/signal
+    # traps, which is exactly why each runner's pre-clean self-heals a stopped
+    # gateway (CONT+KILL). Comfortably above observed full-gate runtime.
+    timeout-minutes: 60
+
     # Pin the Node.js version — must match the engines.node range declared
     # in each published package.json.
     env:
