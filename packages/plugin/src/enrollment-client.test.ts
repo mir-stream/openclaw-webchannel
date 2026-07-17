@@ -18,7 +18,7 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { accountCredentialPath, legacyCredentialPath } from "./account-config.js";
-import { MemoryAgentKeyRegistry } from "../../saas/src/agent-key-registry.js";
+import { MemoryEnrollmentRepository } from "../../saas/src/enrollment-repository.js";
 
 // ---------------------------------------------------------------------------
 // Test utilities
@@ -73,6 +73,24 @@ describe("EnrollmentClient", () => {
   });
 
   describe("enroll() - first boot", () => {
+    it("25: accepts a final poll that reaches the server just after expiresAt", async () => {
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({
+        device_code: "boundary-device", user_code: "BOUND-ARY1",
+        verification_uri: "https://saas.com/enroll", verification_uri_complete: "https://saas.com/enroll?user_code=BOUND-ARY1",
+        expires_in: 1, interval: 0,
+      }) });
+      const now = vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValueOnce(999).mockReturnValue(1_001);
+      mockFetch.mockImplementationOnce(async () => {
+        // The client launched the poll before its local deadline. The server-side
+        // retention grace, modeled by this successful response, lets the request
+        // complete even though network transit crossed the advertised deadline.
+        expect(Date.now()).toBeGreaterThan(1_000);
+        return { ok: true, json: async () => ({ creds: { userJwt: "boundary-jwt", userSeed: "boundary-seed" }, peerId: "boundary-peer", jwksUrl: "https://saas.com/jwks", bootstrapUrl: "https://saas.com/bootstrap", natsUrl: "wss://nats.saas.com" }) };
+      });
+      await expect(client.enroll()).resolves.toMatchObject({ peerId: "boundary-peer" });
+      expect(mockFetch).toHaveBeenCalledTimes(2); now.mockRestore();
+    });
+
     it("should generate identity key and initiate enrollment", async () => {
       // Mock enrollment response
       mockFetch.mockResolvedValueOnce({
@@ -355,7 +373,7 @@ describe("EnrollmentClient", () => {
           queueSuccessfulEnrollment(`${scenario.name}-old`);
           await firstClient.enroll();
           const oldKey = Buffer.from(firstClient.getIdentityKey().publicKey).toString("base64url");
-          const registry = new MemoryAgentKeyRegistry();
+          const registry = new MemoryEnrollmentRepository();
           expect((await registry.register("test-tenant", scenario.name, oldKey, null)).ok).toBe(true);
           expect(await registry.revokeActive("test-tenant", scenario.name)).toBe(true);
 

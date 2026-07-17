@@ -22,7 +22,7 @@ import { mintNatsUserCreds } from "./nats-user-creds.js";
 import { setupTrustChain } from "./setup-trust-chain.js";
 import { loadOrCreateTrustChain } from "./persistent-trust-chain.js";
 import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
-import { MemoryAgentKeyRegistry } from "./agent-key-registry.js";
+import { MemoryEnrollmentRepository } from "./enrollment-repository.js";
 
 /** Synthesize a managed account: a distinct identity key + signing key. */
 function makeExternalAccount() {
@@ -162,7 +162,7 @@ describe("DeviceFlowEnrollment — agent path mints against the external account
     const chain = await setupTrustChain({ externalNatsAccount: { signingSeed, accountId } });
 
     const enrollment = new DeviceFlowEnrollment({
-    agentKeyRegistry: new MemoryAgentKeyRegistry(),
+    repository: new MemoryEnrollmentRepository(),
       saasTrustChain: chain.private,
       natsAccountConfig: chain.natsConfig,
       natsIssuerAccountId: chain.natsConfig.mode === "external" ? chain.natsConfig.accountPublicKey : undefined,

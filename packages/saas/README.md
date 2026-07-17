@@ -135,9 +135,10 @@ boundary:
 - `DeviceFlowError` — `authorization_pending` | `authorization_declined` |
   `expired_token` | `invalid_device_code` | `access_denied`
 
-Enrollment state is stored via the `EnrollmentStore` interface;
-`MemoryEnrollmentStore` is the default. Production should back it with a
-persistent store (Redis, DB).
+Enrollment state and agent-key history share the required `EnrollmentRepository`
+atomic boundary. `MemoryEnrollmentRepository` must be selected explicitly and is
+only a single-process reference; production should provide a conforming durable
+repository (for example PostgreSQL or a suitably co-located Redis deployment).
 
 ## Tenant-scoped NATS permissions
 
@@ -234,6 +235,33 @@ see [`../../docs/STATUS.md`](../../docs/STATUS.md).
    agents.
 
 ## Implementation note
+
+### Durable enrollment repositories
+
+Production deployments implement the exported `EnrollmentRepository` and run
+`runEnrollmentRepositoryConformance` against independent clients connected to
+the real shared backend. `commitApproval` must place the enrollment row, active
+key slot, and append-only history in one transaction; claim, deny, expiry,
+reconciliation, register, and revoke are atomic read/modify/write operations.
+
+In PostgreSQL, use unique device/user-code constraints, lock the enrollment row
+with `SELECT … FOR UPDATE`, lock the account slot (row or advisory lock), and
+retry serialization failures. In Redis, perform each transition in Lua. Redis
+Cluster is unsuitable unless enrollment and registry keys are deliberately
+co-located in one hash slot; their natural device-code and account keys do not
+share a slot. Configure retention explicitly and retain records while
+`now <= base + retentionMs`; a practical floor is two poll intervals plus the
+largest expected clock skew. The bundled memory implementation demonstrates
+single-process semantics only and is not evidence of multi-process durability.
+
+```ts
+await runEnrollmentRepositoryConformance({
+  create: async ({ retentionMs, autoSweep }) => ({
+    repo: await openRepository({ retentionMs, autoSweep }),
+    close: async () => closeRepository(),
+  }),
+});
+```
 
 This Phase-B build uses a simplified (non-production) NKEY signature path while
 keeping the correct claim/permission structure for NATS compatibility;

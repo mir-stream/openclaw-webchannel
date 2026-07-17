@@ -30,7 +30,8 @@ import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
 import { createHash } from "node:crypto";
-import type { ActivationId, AgentKeyRecord, AgentKeyRegistry } from "./agent-key-registry.js";
+import type { ActivationId, AgentKeyRecord } from "./agent-key-registry.js";
+import { DeviceCodeCollisionError, UserCodeCollisionError, type EnrollmentRepository } from "./enrollment-repository.js";
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -73,19 +74,6 @@ const DEVICE_CODE_BYTES = 32;
  * the work under a hostile/degenerate store.
  */
 const MAX_ENROLL_ATTEMPTS = 5;
-
-/**
- * How often the in-memory store's background sweeper runs (default 60s).
- */
-const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
-
-/**
- * How long past `expiresAt` an enrollment is retained before eviction
- * (default 5 min). A grace window so a plugin polling shortly after expiry
- * still observes the correct `expired_token` error rather than the confusing
- * `invalid_device_code` ("not found"). After the window the record is reclaimed.
- */
-const DEFAULT_RETENTION_MS = 300_000;
 
 /**
  * Exact wire format of `agentPublicKey`: base64url (no padding) of a 32-byte
@@ -144,30 +132,6 @@ function sanitizeProtocolVersion(v: unknown): number | undefined {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Enrollment store interface
-// ---------------------------------------------------------------------------
-
-/**
- * Thrown by an {@link EnrollmentStore} when a `saveEnrollment` fails because the
- * `user_code` uniqueness constraint was violated (a rare collision on the
- * approval-UI lookup key). This is the ONE store failure `enroll()` treats as
- * retryable: it re-mints a fresh user_code and retries, bounded. Any other
- * `saveEnrollment` failure is a real store fault and propagates unchanged.
- *
- * Persistent stores SHOULD map their backend's unique-violation (e.g. a
- * Postgres `UNIQUE(user_code)` error) onto this type instead of leaking the
- * backend error format. A store that holds a DIFFERENT copy of this class
- * across package duplication can equivalently set `error.name` to
- * `"UserCodeCollisionError"` — `enroll()` retries on the name too.
- */
-export class UserCodeCollisionError extends Error {
-  constructor(userCode: string) {
-    super(`webchannel: user_code collision: ${userCode}`);
-    this.name = "UserCodeCollisionError";
-  }
-}
-
 /**
  * Is `err` a user_code collision `enroll()` should retry on? Matches both an
  * `instanceof` of our class AND any error whose `name` is
@@ -179,182 +143,6 @@ function isUserCodeCollisionError(err: unknown): boolean {
     err instanceof UserCodeCollisionError ||
     (typeof err === "object" && err !== null && (err as { name?: unknown }).name === "UserCodeCollisionError")
   );
-}
-
-/**
- * Enrollment store interface.
- *
- * Implementations can be in-memory (for testing) or persistent (Redis, DB, etc.)
- */
-export interface EnrollmentStore {
-  /**
-   * Store a pending enrollment.
-   *
-   * SHOULD throw {@link UserCodeCollisionError} (or any error with
-   * `name === "UserCodeCollisionError"`) when the save fails specifically
-   * because `user_code` is already taken by a DIFFERENT live enrollment.
-   * `enroll()` catches exactly that, re-mints a fresh user_code, and retries
-   * (bounded); every other error propagates untouched. Re-saving the SAME
-   * device_code (idempotent) must NOT be treated as a collision.
-   */
-  saveEnrollment(enrollment: PendingEnrollment): Promise<void>;
-
-  /**
-   * Retrieve enrollment by device code.
-   */
-  getEnrollment(deviceCode: string): Promise<PendingEnrollment | null>;
-
-  /**
-   * Retrieve enrollment by user code (for approval UI).
-   */
-  getEnrollmentByUserCode(userCode: string): Promise<PendingEnrollment | null>;
-
-  /**
-   * Update enrollment (status, credentials, etc.).
-   */
-  updateEnrollment(deviceCode: string, updates: Partial<PendingEnrollment>): Promise<void>;
-
-  /**
-   * Clean up expired enrollments.
-   */
-  deleteEnrollment(deviceCode: string): Promise<void>;
-}
-
-/**
- * Options for {@link MemoryEnrollmentStore}.
- */
-export type MemoryEnrollmentStoreOptions = {
-  /** Background sweep cadence in ms. Default 60_000. */
-  sweepIntervalMs?: number;
-  /**
-   * Retention past `expiresAt` before an enrollment is evicted, in ms.
-   * Default 300_000 (5 min grace window). See {@link DEFAULT_RETENTION_MS}.
-   */
-  retentionMs?: number;
-  /**
-   * Start the background interval sweeper automatically (default `true`).
-   * Set `false` in tests that want to drive {@link MemoryEnrollmentStore.sweep}
-   * deterministically without a live timer.
-   */
-  autoSweep?: boolean;
-};
-
-/**
- * In-memory enrollment store implementation.
- *
- * Suitable for single-process deployments. For multi-process, use a persistent
- * store (Redis, database, etc.) that implements the EnrollmentStore interface.
- *
- * Review 2026-07-02 (A1): a background TTL sweeper bounds memory. Without it the
- * `enrollments`/`userCodeIndex` maps grew forever — expired, denied, and consumed
- * records were never removed and `deleteEnrollment` had no caller — so an
- * UNAUTHENTICATED `/enroll` endpoint was an OOM vector (each request added an
- * entry that never left). The sweeper evicts every record once its `expiresAt`
- * plus a grace window has elapsed, regardless of status, so a long-lived issuer's
- * footprint stays bounded even under sustained (or hostile) enrollment traffic.
- */
-export class MemoryEnrollmentStore implements EnrollmentStore {
-  private readonly enrollments = new Map<string, PendingEnrollment>();
-  private readonly userCodeIndex = new Map<string, string>(); // user_code -> device_code
-  private readonly retentionMs: number;
-  private readonly sweepIntervalMs: number;
-  private sweepTimer: ReturnType<typeof setInterval> | undefined;
-
-  constructor(options: MemoryEnrollmentStoreOptions = {}) {
-    this.retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
-    this.sweepIntervalMs = options.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
-    if (options.autoSweep ?? true) this.startSweeper();
-  }
-
-  /**
-   * Evict every enrollment whose retention window (`expiresAt + retentionMs`)
-   * has fully elapsed, in BOTH maps. Pure and deterministic — pass `now` in
-   * tests. Returns the number of records evicted. Deleting from a Map during
-   * its own iteration is well-defined in JS.
-   */
-  sweep(now: number = Date.now()): number {
-    let evicted = 0;
-    for (const [deviceCode, enrollment] of this.enrollments) {
-      if (now > enrollment.expiresAt + this.retentionMs) {
-        // Only drop the user-code index entry if it still points at THIS
-        // record. saveEnrollment now REFUSES a colliding user_code (throws
-        // UserCodeCollisionError) so two live records can no longer share one,
-        // and deleteEnrollment clears the index alongside the record — so this
-        // guard is defensive: it keeps sweep correct even if some path ever
-        // leaves the index pointing at a different (still-live) enrollment.
-        if (this.userCodeIndex.get(enrollment.user_code) === deviceCode) {
-          this.userCodeIndex.delete(enrollment.user_code);
-        }
-        this.enrollments.delete(deviceCode);
-        evicted++;
-      }
-    }
-    return evicted;
-  }
-
-  /**
-   * Start the background sweeper. The timer is `unref`'d so it NEVER keeps the
-   * process alive on its own (a long-lived issuer exits cleanly on SIGINT).
-   * Idempotent.
-   */
-  startSweeper(): void {
-    if (this.sweepTimer) return;
-    const timer = setInterval(() => {
-      this.sweep();
-    }, this.sweepIntervalMs);
-    if (typeof timer.unref === "function") timer.unref();
-    this.sweepTimer = timer;
-  }
-
-  /**
-   * Stop the background sweeper. Call on shutdown (or in tests that started it).
-   * Idempotent.
-   */
-  close(): void {
-    if (this.sweepTimer) {
-      clearInterval(this.sweepTimer);
-      this.sweepTimer = undefined;
-    }
-  }
-
-  async saveEnrollment(enrollment: PendingEnrollment): Promise<void> {
-    // Honor the EnrollmentStore contract: reject a user_code already held by a
-    // DIFFERENT live enrollment instead of silently overwriting the index
-    // (the old last-writer-wins gave two records the same approval-UI key and
-    // orphaned the loser). Re-saving the same device_code is idempotent, and a
-    // stale index entry (its record already deleted/swept) is free to reuse.
-    const owner = this.userCodeIndex.get(enrollment.user_code);
-    if (owner !== undefined && owner !== enrollment.device_code && this.enrollments.has(owner)) {
-      throw new UserCodeCollisionError(enrollment.user_code);
-    }
-    this.enrollments.set(enrollment.device_code, enrollment);
-    this.userCodeIndex.set(enrollment.user_code, enrollment.device_code);
-  }
-
-  async getEnrollment(deviceCode: string): Promise<PendingEnrollment | null> {
-    return this.enrollments.get(deviceCode) ?? null;
-  }
-
-  async getEnrollmentByUserCode(userCode: string): Promise<PendingEnrollment | null> {
-    const deviceCode = this.userCodeIndex.get(userCode);
-    if (!deviceCode) return null;
-    return this.enrollments.get(deviceCode) ?? null;
-  }
-
-  async updateEnrollment(deviceCode: string, updates: Partial<PendingEnrollment>): Promise<void> {
-    const existing = this.enrollments.get(deviceCode);
-    if (!existing) return;
-    const updated = { ...existing, ...updates };
-    this.enrollments.set(deviceCode, updated);
-  }
-
-  async deleteEnrollment(deviceCode: string): Promise<void> {
-    const enrollment = this.enrollments.get(deviceCode);
-    if (enrollment) {
-      this.userCodeIndex.delete(enrollment.user_code);
-    }
-    this.enrollments.delete(deviceCode);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,18 +231,21 @@ export type DeviceFlowOptions = {
    * Enrollment store (defaults to in-memory).
    * Use a persistent store (Redis, DB) for production deployments.
    */
-  store?: EnrollmentStore;
+  /** Atomic enrollment/key repository. There is deliberately no memory default. */
+  repository: EnrollmentRepository;
 
   /**
    * Durable agent identity-key registry. Required for every approval path.
    * Production MUST provide a persistent implementation in the same durability
    * domain as the enrollment store; mixed memory/durable configurations are unsupported.
    */
-  agentKeyRegistry: AgentKeyRegistry;
+  /** Maximum mint duration before the repository fence rejects the commit. */
+  approvalLeaseMs?: number;
 };
 
 export type ApproveOutcome =
   | { kind: "approved"; result: EnrollmentResult }
+  | { kind: "in_progress" }
   | { kind: "conflict"; existing: { activationId: ActivationId; keyIdFingerprint: string; enrolledAt: number } | null; incoming: { keyIdFingerprint: string } }
   | { kind: "revoked_key" }
   | { kind: "rejected" };
@@ -482,10 +273,10 @@ export class DeviceFlowEnrollment {
   // `natsIssuerAccountId` stays optional (external mode only); everything else
   // is defaulted, hence Required.
   private readonly options: Required<
-    Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId" | "agentKeyRegistry">
+    Omit<DeviceFlowOptions, "repository" | "natsIssuerAccountId">
   > &
     Pick<DeviceFlowOptions, "natsIssuerAccountId">;
-  private readonly store: EnrollmentStore;
+  private readonly repository: EnrollmentRepository;
   /**
    * #22: per-userCode serialization gate shared by approve() AND deny(). Maps a
    * userCode to the tail of its running critical-section chain so the next
@@ -499,14 +290,12 @@ export class DeviceFlowEnrollment {
    * approved-with-creds re-return path, which yields the same creds.
    */
   private readonly userCodeLocks = new Map<string, Promise<unknown>>();
-  /** F2: durable agent identity-key registry (undefined = pin delivery disabled). */
-  private readonly agentKeyRegistry: AgentKeyRegistry;
-
   constructor(options: DeviceFlowOptions) {
-    if (!options.agentKeyRegistry) throw new Error("agentKeyRegistry is required");
+    if (!options.repository) throw new Error("repository is required");
     this.options = {
       expirationSeconds: DEFAULT_EXPIRATION_SECONDS,
       pollIntervalSeconds: MIN_POLL_INTERVAL_SECONDS,
+      approvalLeaseMs: 30_000,
       ...options,
       // After the spread so an absent (or explicitly-undefined) `issuer` gets
       // the derivation, keeping the `Required<>` cast honest. An explicit
@@ -514,8 +303,7 @@ export class DeviceFlowEnrollment {
       // exact string it mints).
       issuer: options.issuer ?? defaultIssuer(options.saasBaseUrl),
     };
-    this.store = options.store ?? new MemoryEnrollmentStore();
-    this.agentKeyRegistry = options.agentKeyRegistry;
+    this.repository = options.repository;
   }
 
   /**
@@ -553,7 +341,7 @@ export class DeviceFlowEnrollment {
 
     // Bounded collision-retry: a persistent store with UNIQUE(user_code) can
     // reject a save on a rare code collision (surfaced as UserCodeCollisionError,
-    // per the EnrollmentStore contract). Re-mint BOTH codes and retry — a
+    // per the EnrollmentRepository contract). Re-mint BOTH codes and retry — a
     // device_code collision is negligible, but re-minting both keeps the loop
     // trivially correct. ONLY a collision is retried; any other store error is a
     // real fault and propagates immediately (no retry).
@@ -577,11 +365,12 @@ export class DeviceFlowEnrollment {
         ...(protocolVersion !== undefined ? { protocolVersion } : {}),
       };
       try {
-        await this.store.saveEnrollment(enrollment);
+        await this.repository.createEnrollment(enrollment);
         persisted = true;
         break;
       } catch (err) {
-        if (!isUserCodeCollisionError(err)) throw err;
+        if (!isUserCodeCollisionError(err) && !(err instanceof DeviceCodeCollisionError) &&
+          !(typeof err === "object" && err !== null && (err as { name?: unknown }).name === "DeviceCodeCollisionError")) throw err;
         lastCollision = err;
       }
     }
@@ -609,24 +398,21 @@ export class DeviceFlowEnrollment {
    *  - HTTP 400 + error details if denied/expired/invalid
    */
   async poll(request: PollRequest): Promise<EnrollmentResult | DeviceFlowError> {
-    const enrollment = await this.store.getEnrollment(request.device_code);
+    const { enrollment } = await this.repository.tryExpire(request.device_code);
     if (!enrollment) {
       return { error: "invalid_device_code", error_description: "Device code not found" };
-    }
-
-    // Check expiration
-    if (Date.now() > enrollment.expiresAt) {
-      await this.store.updateEnrollment(request.device_code, { status: "expired" });
-      return { error: "expired_token", error_description: "Device code has expired" };
     }
 
     // Check if denied
     if (enrollment.status === "denied") {
       return { error: "access_denied", error_description: "Enrollment was denied by operator" };
     }
+    if (enrollment.status === "expired") {
+      return { error: "expired_token", error_description: "Device code has expired" };
+    }
 
     // Still pending
-    if (enrollment.status === "pending") {
+    if (enrollment.status === "pending" || enrollment.status === "approving") {
       return { error: "authorization_pending", error_description: "Enrollment is pending operator approval" };
     }
 
@@ -725,77 +511,48 @@ export class DeviceFlowEnrollment {
   }
 
   private async approveInner(userCode: string, opts?: { replaceActivationId?: ActivationId }): Promise<ApproveOutcome> {
-    const enrollment = await this.store.getEnrollmentByUserCode(userCode);
-    if (!enrollment) return { kind: "rejected" };
-
-    // Check expiration
-    if (Date.now() > enrollment.expiresAt) {
-      await this.store.updateEnrollment(enrollment.device_code, { status: "expired" });
-      return { kind: "rejected" };
+    const opId = crypto.randomUUID();
+    const claim = await this.repository.claimApproval(userCode, opId, this.options.approvalLeaseMs);
+    if (claim.kind === "in_progress") return { kind: "in_progress" };
+    if (claim.kind === "already_approved") {
+      const enrollment = claim.enrollment;
+      const reconciled = await this.repository.reconcileApprovedRegistration(enrollment.device_code);
+      if (reconciled.kind === "noop" && reconciled.reason !== "active_present")
+        console.warn("approved enrollment registry reconciliation unchanged", reconciled.reason);
+      if (!enrollment.natsCreds || !enrollment.peerId) return { kind: "rejected" };
+      return { kind: "approved", result: this.result(enrollment.natsCreds, enrollment.peerId) };
     }
-
-    // A2: already approved → return the credentials minted the first time
-    // instead of overwriting them with a fresh identity.
-    if (enrollment.status === "approved" && enrollment.natsCreds && enrollment.peerId) {
-      const active = await this.agentKeyRegistry.getActive(enrollment.tenant, enrollment.accountId);
-      if (!active) {
-        const history = await this.agentKeyRegistry.listHistory(enrollment.tenant, enrollment.accountId);
-        if (history.length === 0) {
-          const recovered = await this.agentKeyRegistry.register(enrollment.tenant, enrollment.accountId, enrollment.agentPublicKey, null);
-          if (!recovered.ok) console.warn("approved enrollment registry reconciliation failed", recovered.reason);
-        } else console.warn("approved enrollment has no active key; registry unchanged");
-      } else if (active.publicKey !== enrollment.agentPublicKey) {
-        console.warn("approved enrollment differs from active key; registry unchanged");
-      }
-      const result = this.result(enrollment.natsCreds, enrollment.peerId);
-      return { kind: "approved", result };
-    }
-
-    // #11: only a pending enrollment may be (newly) approved. `denied` and
-    // `expired` are terminal — approving them would mint live credentials for a
-    // record the operator (or the clock) already rejected. This also refuses to
-    // re-mint on a corrupt approved-without-creds record (which fell through the
-    // A2 guard above) rather than hand out a second, divergent identity.
-    if (enrollment.status !== "pending") return { kind: "rejected" };
+    if (claim.kind !== "claimed") return { kind: "rejected" };
+    const enrollment = claim.enrollment;
 
     const incomingKeyId = createHash("sha256").update(Buffer.from(enrollment.agentPublicKey, "base64url")).digest("base64url");
-    const history = await this.agentKeyRegistry.listHistory(enrollment.tenant, enrollment.accountId);
-    if (history.some((record) => record.status === "revoked" && record.keyId === incomingKeyId)) return { kind: "revoked_key" };
-    const active = await this.agentKeyRegistry.getActive(enrollment.tenant, enrollment.accountId);
+    const history = await this.repository.listHistory(enrollment.tenant, enrollment.accountId);
+    if (history.some((record) => record.status === "revoked" && record.keyId === incomingKeyId)) {
+      await this.repository.releaseClaim(opId); return { kind: "revoked_key" };
+    }
+    const active = await this.repository.getActive(enrollment.tenant, enrollment.accountId);
     let expect: ActivationId | null;
     if (!active && opts?.replaceActivationId === undefined) expect = null;
     else if (active?.publicKey === enrollment.agentPublicKey) expect = active.activationId;
     else if (active && opts?.replaceActivationId === active.activationId) expect = active.activationId;
-    else return this.conflict(active, incomingKeyId);
+    else { await this.repository.releaseClaim(opId); return this.conflict(active, incomingKeyId); }
 
     // Generate NATS user credentials
-    const natsCreds = await this.generateNatsUserCredentials(enrollment);
+    let natsCreds: NatsUserCredentials;
+    try { natsCreds = await this.generateNatsUserCredentials(enrollment); }
+    catch (error) { await this.repository.releaseClaim(opId); throw error; }
 
     // Generate peer ID (bootstrap JWT subject)
     const peerId = this.generatePeerId();
 
-    const afterMint = await this.store.getEnrollment(enrollment.device_code);
-    if (!afterMint || afterMint.status !== "pending" || Date.now() > afterMint.expiresAt) return { kind: "rejected" };
-
-    const registered = await this.agentKeyRegistry.register(enrollment.tenant, enrollment.accountId, enrollment.agentPublicKey, expect);
-    if (!registered.ok) {
-      if (registered.reason === "revoked") return { kind: "revoked_key" };
-      return this.conflict(registered.current, incomingKeyId);
-    }
-
-    await this.store.updateEnrollment(enrollment.device_code, {
-      status: "approved",
-      natsCreds,
-      peerId,
-    });
-
-    const stored = await this.store.getEnrollment(enrollment.device_code);
-    if (stored?.status !== "approved" || !stored.natsCreds || !stored.peerId) {
-      console.warn("approved enrollment was not observable after store update");
-      return { kind: "rejected" };
-    }
-    const result = this.result(natsCreds, peerId);
-    return { kind: "approved", result };
+    const payload = { creds: natsCreds, peerId, agentPublicKey: enrollment.agentPublicKey, expect };
+    let committed;
+    try { committed = await this.repository.commitApproval(opId, payload); }
+    catch { committed = await this.repository.commitApproval(opId, payload); }
+    if (committed.kind === "committed") return { kind: "approved", result: this.result(natsCreds, peerId) };
+    if (committed.kind === "revoked") return { kind: "revoked_key" };
+    if (committed.kind === "conflict") return this.conflict(committed.current, incomingKeyId);
+    return { kind: "rejected" };
   }
 
   /**
@@ -817,21 +574,7 @@ export class DeviceFlowEnrollment {
   }
 
   private async denyInner(userCode: string): Promise<boolean> {
-    const enrollment = await this.store.getEnrollmentByUserCode(userCode);
-    if (!enrollment) return false;
-
-    // Check expiration
-    if (Date.now() > enrollment.expiresAt) {
-      await this.store.updateEnrollment(enrollment.device_code, { status: "expired" });
-      return false;
-    }
-
-    // #11: deny is only a pending→denied transition. An approved enrollment has
-    // live credentials — flipping it to denied would make the record lie.
-    if (enrollment.status !== "pending") return false;
-
-    await this.store.updateEnrollment(enrollment.device_code, { status: "denied" });
-    return true;
+    return this.repository.tryDeny(userCode);
   }
 
   // ---------------------------------------------------------------------------

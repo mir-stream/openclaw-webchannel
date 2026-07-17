@@ -34,7 +34,7 @@ import {
   buildBootstrapClaims,
   DeviceFlowEnrollment,
   EnrollmentValidationError,
-  MemoryAgentKeyRegistry,
+  MemoryEnrollmentRepository,
   type AgentKeyRegistry,
   type EnrollmentRequest,
   type PollRequest,
@@ -153,7 +153,8 @@ const issuer = await createBootstrapIssuer({
 
 // F2: durable agent identity-key registry — approval records the attested agent
 // key so /bootstrap can pin it for the browser's register-delivered-K auth.
-const agentKeyRegistry = new MemoryAgentKeyRegistry();
+const enrollmentRepository = new MemoryEnrollmentRepository();
+const agentKeyRegistry = enrollmentRepository;
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: privateChain,
   natsAccountConfig: trustChain.natsConfig,
@@ -169,7 +170,7 @@ const enrollment = new DeviceFlowEnrollment({
   // enrollment must equal the `iss` minted into bootstrap JWTs below — both
   // read the single SAAS_ISSUER variable, so they cannot disagree.
   issuer: SAAS_ISSUER,
-  agentKeyRegistry,
+  repository: agentKeyRegistry,
 });
 type ExampleEnrollmentHandlerOptions = {
   enrollment: Pick<DeviceFlowEnrollment, "approve" | "deny">;
@@ -208,10 +209,14 @@ export function createExampleEnrollmentHandler(options: ExampleEnrollmentHandler
         }
         const replaceActivationId = typeof body.replaceActivationId === "string" ? body.replaceActivationId : undefined;
         const outcome = await options.enrollment.approve(userCode, replaceActivationId ? { replaceActivationId } : {});
-        if (outcome.kind === "conflict") return sendJson(res, { error: "conflict", activationId: outcome.existing?.activationId ?? null, fingerprint: outcome.existing?.keyIdFingerprint ?? null, enrolledAt: outcome.existing?.enrolledAt ?? null }, 409);
-        if (outcome.kind === "revoked_key") return sendJson(res, { error: "revoked_key" }, 410);
-        if (outcome.kind === "rejected") return sendJson(res, { error: "rejected" }, 404);
-        return sendJson(res, { approved: true, peerId: outcome.result.peerId });
+        switch (outcome.kind) {
+          case "conflict": return sendJson(res, { error: "conflict", activationId: outcome.existing?.activationId ?? null, fingerprint: outcome.existing?.keyIdFingerprint ?? null, enrolledAt: outcome.existing?.enrolledAt ?? null }, 409);
+          case "in_progress": return sendJson(res, { error: "approval_in_progress", error_description: "Approval in progress, retry shortly" }, 409);
+          case "revoked_key": return sendJson(res, { error: "revoked_key" }, 410);
+          case "rejected": return sendJson(res, { error: "rejected" }, 404);
+          case "approved": return sendJson(res, { approved: true, peerId: outcome.result.peerId });
+          default: { const exhaustive: never = outcome; return exhaustive; }
+        }
       }
       const revoked = await options.registry.revokeActive(String(body.tenant ?? ""), String(body.accountId ?? ""));
       return sendJson(res, { revoked }, revoked ? 200 : 404);

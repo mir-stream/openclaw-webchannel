@@ -14,8 +14,8 @@ import {
   setupTrustChain,
   loadOrCreateTrustChain,
   DeviceFlowEnrollment,
-  MemoryEnrollmentStore,
-  MemoryAgentKeyRegistry,
+  MemoryEnrollmentRepository,
+  MemoryEnrollmentRepository,
   EnrollmentValidationError,
   buildBootstrapClaims,
   generateRsaKeypair,
@@ -84,10 +84,14 @@ export function createMinimalConsumerEnrollmentHandler(options: MinimalEnrollmen
       if (path === "/approve") {
         const replaceActivationId = typeof payload.replaceActivationId === "string" ? payload.replaceActivationId : undefined;
         const outcome = await options.enrollment.approve(String(payload.user_code ?? ""), replaceActivationId ? { replaceActivationId } : {});
-        if (outcome.kind === "conflict") return json(res, 409, { error: "conflict", activationId: outcome.existing?.activationId ?? null, fingerprint: outcome.existing?.keyIdFingerprint ?? null, enrolledAt: outcome.existing?.enrolledAt ?? null });
-        if (outcome.kind === "revoked_key") return json(res, 410, { error: "revoked_key" });
-        if (outcome.kind === "rejected") return json(res, 404, { error: "rejected" });
-        return json(res, 200, { approved: true, peerId: outcome.result.peerId });
+        switch (outcome.kind) {
+          case "conflict": return json(res, 409, { error: "conflict", activationId: outcome.existing?.activationId ?? null, fingerprint: outcome.existing?.keyIdFingerprint ?? null, enrolledAt: outcome.existing?.enrolledAt ?? null });
+          case "in_progress": return json(res, 409, { error: "approval_in_progress", error_description: "Approval in progress, retry shortly" });
+          case "revoked_key": return json(res, 410, { error: "revoked_key" });
+          case "rejected": return json(res, 404, { error: "rejected" });
+          case "approved": return json(res, 200, { approved: true, peerId: outcome.result.peerId });
+          default: { const exhaustive: never = outcome; return exhaustive; }
+        }
       }
       if (path === "/deny") {
         const denied = await options.enrollment.deny(String(payload.user_code ?? ""));
@@ -140,8 +144,7 @@ export async function runOperatorEnrollment(): Promise<EnrollmentResult> {
     jwksUrl: "https://saas.example.com/.well-known/jwks.json",
     bootstrapUrl: "https://saas.example.com/bootstrap",
     natsUrl: "wss://nats.example.com",
-    store: new MemoryEnrollmentStore({ autoSweep: false }),
-    agentKeyRegistry: new MemoryAgentKeyRegistry(),
+    repository: new MemoryEnrollmentRepository({ autoSweep: false }),
   });
 
   const started = await enrollment.enroll({
@@ -153,15 +156,13 @@ export async function runOperatorEnrollment(): Promise<EnrollmentResult> {
   });
 
   const approved = await enrollment.approve(started.user_code);
-  if (approved.kind !== "approved") {
-    if (approved.kind === "conflict") {
-      const response = { status: 409, activationId: approved.existing?.activationId ?? null, fingerprint: approved.existing?.keyIdFingerprint ?? null, enrolledAt: approved.existing?.enrolledAt ?? null };
-      throw new Error(`operator approval conflict: ${JSON.stringify(response)}`);
-    }
-    if (approved.kind === "revoked_key") {
-      throw new Error(`operator approval failed: ${JSON.stringify({ status: 410, error: "revoked_key" })}`);
-    }
-    throw new Error(`operator approval failed: ${JSON.stringify({ status: 404, error: "rejected" })}`);
+  switch (approved.kind) {
+    case "approved": break;
+    case "conflict": throw new Error(`operator approval conflict: ${JSON.stringify({ status: 409, activationId: approved.existing?.activationId ?? null, fingerprint: approved.existing?.keyIdFingerprint ?? null, enrolledAt: approved.existing?.enrolledAt ?? null })}`);
+    case "in_progress": throw new Error(`operator approval failed: ${JSON.stringify({ status: 409, error: "approval_in_progress" })}`);
+    case "revoked_key": throw new Error(`operator approval failed: ${JSON.stringify({ status: 410, error: "revoked_key" })}`);
+    case "rejected": throw new Error(`operator approval failed: ${JSON.stringify({ status: 404, error: "rejected" })}`);
+    default: { const exhaustive: never = approved; throw new Error(String(exhaustive)); }
   }
 
   const result = await enrollment.poll({ device_code: started.device_code });

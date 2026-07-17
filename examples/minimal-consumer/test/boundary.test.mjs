@@ -33,8 +33,12 @@ await ok("saas barrel exposes operator symbols", async () => {
     "loadOrCreateTrustChain",
     "generateRsaKeypair",
     "DeviceFlowEnrollment",
-    "MemoryEnrollmentStore",
+    "MemoryEnrollmentRepository",
     "UserCodeCollisionError",
+    "DeviceCodeCollisionError",
+    "CommitPayloadMismatchError",
+    "runEnrollmentRepositoryConformance",
+    "interpose",
     "buildBootstrapClaims",
   ]) {
     assert.equal(typeof saas[sym], "function", `expected ${sym} to be exported`);
@@ -43,7 +47,7 @@ await ok("saas barrel exposes operator symbols", async () => {
 
 await ok("saas barrel does NOT leak raw mint / subject-token guards", async () => {
   const saas = await import("@mir-stream/webchannel-saas");
-  for (const sym of ["mintNatsUserCreds", "assertValidSubjectToken"]) {
+  for (const sym of ["mintNatsUserCreds", "assertValidSubjectToken", "MemoryEnrollmentStore", "MemoryAgentKeyRegistry"]) {
     assert.equal(saas[sym], undefined, `${sym} must NOT be re-exported by the barrel`);
   }
 });

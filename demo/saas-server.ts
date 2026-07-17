@@ -45,9 +45,8 @@
 import {
   DeviceFlowEnrollment,
   EnrollmentValidationError,
-  MemoryEnrollmentStore,
 } from "../packages/saas/src/device-flow-enrollment.js";
-import { MemoryAgentKeyRegistry } from "../packages/saas/src/agent-key-registry.js";
+import { MemoryEnrollmentRepository } from "../packages/saas/src/enrollment-repository.js";
 import { loadOrCreateTrustChain } from "../packages/saas/src/persistent-trust-chain.js";
 import { generateRsaKeypair } from "../packages/saas/src/setup-trust-chain.js";
 import type { JwkRsaPublicKey } from "../packages/saas/src/types.js";
@@ -269,11 +268,11 @@ async function rotateSigningKey(evictPrevious: boolean): Promise<{ kid: string; 
 // Enrollment service (device-flow: agent gateways enroll through this)
 // ---------------------------------------------------------------------------
 
-const enrollmentStore = new MemoryEnrollmentStore();
+const enrollmentRepository = new MemoryEnrollmentRepository();
 // F2: durable agent identity-key registry. Approval upserts (tenant, accountId) →
 // agentPublicKey here; /bootstrap reads it back to pin the attested agent key into
 // the browser response so the register-delivered K can be authenticated.
-const agentKeyRegistry = new MemoryAgentKeyRegistry();
+const agentKeyRegistry = enrollmentRepository;
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: privateChain,
   natsAccountConfig: natsConfig,
@@ -287,8 +286,7 @@ const enrollment = new DeviceFlowEnrollment({
   issuer: SAAS_ISSUER,
   expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 2),
-  store: enrollmentStore,
-  agentKeyRegistry,
+  repository: agentKeyRegistry,
 });
 export const createDemoEnrollmentHandler = createDemoEnrollmentHttpHandler;
 const demoEnrollmentAdminHandler = createDemoEnrollmentHandler({
@@ -907,6 +905,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) startDemoSaasServer();
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) process.on("SIGINT", () => {
   console.log("\n[demo-saas] shutting down…");
-  enrollmentStore.close();
+  enrollmentRepository.close();
   server.close(() => process.exit(0));
 });

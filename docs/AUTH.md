@@ -36,7 +36,9 @@ See [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) for the complete trust 
 
 An account is the isolation axis and represents one logical agent. Agent HA replicas must share the same identity key; independently keyed replicas are unsupported and surface as replacement conflicts. Enrollment wire formats do not contain an `agentId`.
 
-The approval guarantees assume one issuer process and require the enrollment store and agent-key registry to use the same durability domain (both memory for development, or both durable in the same database). Mixed durability is unsupported. Multi-issuer enrollment-transition serialization and atomic store/registry commits are deferred work; registry CAS nevertheless ensures a losing different-key approval never receives credentials.
+Approval correctness is independent of issuer replica count when every replica uses one conforming `EnrollmentRepository`. The repository owns the clock and atomically serializes enrollment transitions, key activation, and history. Issuers stamp `createdAt`/`expiresAt`, but never use their clock to decide expiry or lease validity. Approval claims use a 30-second default lease as a fence; a crash is recovered by lease expiry and re-claim, while a late old commit is rejected.
+
+An ambiguous commit is retried once with the same operation id and byte-for-byte payload. A committed result is recoverable through its immutable snapshot while `now <= approvedAt + retentionMs`; after eviction recovery requires re-enrollment. Retention should be at least twice the poll interval plus expected clock skew. Denying an approving record immediately invalidates its claim. Credentials minted before that denial are unreachable orphans, not cryptographically revoked. `expires_in` remains the client approval-and-pickup deadline; retention supplies boundary grace, not a longer advertised polling window.
 
 Revocation permanently tombstones the active identity key and only stops that slot's key from being served to future bootstrap requests. It does not disconnect browsers that already pinned the key and does not revoke the agent's existing NATS credentials.
 

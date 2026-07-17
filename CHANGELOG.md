@@ -25,3 +25,12 @@
 - Register-delivered protocol version remains v1: the surviving register, wrapped-key, and envelope wire formats are unchanged. Replies without a version remain compatible; mismatches are terminal.
 
 The plugin, client, and SaaS packages must be released together at version `0.3.0`.
+# Unreleased
+
+- **Breaking:** replace `EnrollmentStore`, `MemoryEnrollmentStore`, and
+  `MemoryAgentKeyRegistry` with the required atomic `EnrollmentRepository` and
+  `MemoryEnrollmentRepository`.
+- **Breaking:** `ApproveOutcome` adds `in_progress`; operator HTTP adapters map
+  it to `409 approval_in_progress`. Deny may now terminate an approving lease.
+- Polling an approved record after `expiresAt` returns its credentials during
+  retention instead of overwriting approval with expiry.
