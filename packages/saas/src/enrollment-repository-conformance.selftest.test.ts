@@ -21,10 +21,17 @@ function breakRepository(inner: MemoryEnrollmentRepository, defect: Broken): Enr
       if (typeof value !== "function") return value;
       if (defect === "non_atomic_conflict" && property === "commitApproval") return async (opId: string, payload: Parameters<EnrollmentRepository["commitApproval"]>[1]) => {
         if (opId !== "conflict") return target.commitApproval(opId, payload);
-        // Model the exact forbidden split transaction: registry CAS is durable,
-        // but the adapter reports conflict without rolling that activation back.
+        // Model the exact forbidden split transaction: the ENROLLMENT side is
+        // handled correctly (claim released, record back to pending — the state
+        // case 4 expects after a conflict) while the registry CAS stays durable
+        // behind the conflict outcome. Releasing the claim first is what makes
+        // this mutant survive case 4's enrollment-projection assertion, so the
+        // registry/history assertion is provably the one that kills it (r3
+        // MINOR: without this, the mutant died earlier for an unrelated reason
+        // and never exercised the assertion it was built to validate).
         const enrollment = await target.getEnrollment("device-atomic-conflict"); const active = enrollment && await target.getActive(enrollment.tenant, enrollment.accountId);
         if (!enrollment || !active) throw new Error("non-atomic fixture missing");
+        await target.releaseClaim(opId);
         await target.register(enrollment.tenant, enrollment.accountId, enrollment.agentPublicKey, active.activationId);
         return { kind: "conflict" as const, current: active };
       };
@@ -63,9 +70,18 @@ describe("EnrollmentRepository conformance harness self-tests", () => {
     expect(report.skipped).toEqual([]); expect(report.passed).toHaveLength(enrollmentRepositoryConformanceCases.length);
   });
 
-  for (const [prefix, defect] of [["4:", "non_atomic_conflict"], ["4:", "stale_commit"], ["9:", "retention"], ["10:", "reconcile_overwrite"]] as const) {
-    it(`rejects the deliberately broken ${defect} adapter`, async () => {
-      await expect(findCase(prefix).run(controlled(defect))).rejects.toThrow(/EnrollmentRepository conformance/);
+  // Each mutant must die on the EXACT assertion built to catch its defect —
+  // a generic "some conformance error" match would let fixture drift (the
+  // mutant failing earlier for an unrelated reason) masquerade as mutation
+  // coverage (r3 MINOR).
+  for (const [prefix, defect, killedBy] of [
+    ["4:", "non_atomic_conflict", "conflict mutated registry/history"],
+    ["4:", "stale_commit", "fenced owner did not lose claim"],
+    ["9:", "retention", "configured retention ignored after equality"],
+    ["10:", "reconcile_overwrite", "combined active/history precedence wrong"],
+  ] as const) {
+    it(`rejects the deliberately broken ${defect} adapter on its targeted assertion`, async () => {
+      await expect(findCase(prefix).run(controlled(defect))).rejects.toThrow(`EnrollmentRepository conformance: ${killedBy}`);
     });
   }
 
