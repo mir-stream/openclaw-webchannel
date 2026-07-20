@@ -8,6 +8,70 @@
 export type ChatRole = "user" | "agent";
 
 /**
+ * P0-4: the send lifecycle of a user message, as tracked authoritatively by the
+ * low-level client's monotonic tracker (`WebChannelNatsClient`).
+ *
+ *   queued -> sent -> accepted           (+ failed, terminal, from any state)
+ *
+ * - `queued`   — held locally; not yet written to the socket (pre-key buffer,
+ *                P1-9 hold, or awaiting a publish retry).
+ * - `sent`     — the encrypted `user_message` frame was written to the socket.
+ *                NOT a plugin acceptance.
+ * - `accepted` — the plugin acked the frame at ingress (P0-7b `ack`).
+ * - `failed`   — terminal; carries a `SendFailure` (reason + retryable +
+ *                lastAttemptAt, and a `WebChannelErrorCause` for `terminal`).
+ *
+ * `completed` is NOT a tracker state — it is a wrapper-level promotion driven by
+ * an explicit `turn_settled{outcome:"ok"}` on the anchor message (see
+ * `ChatMessage.sendState`), so the low-level tracker (which knows nothing about
+ * turns) stays the sole authority for queued/sent/accepted/failed.
+ */
+export type SendState = "queued" | "sent" | "accepted" | "failed";
+
+/**
+ * P0-4: the terminal-failure payload accompanying a `failed` send.
+ *
+ * `reason` distinguishes the cause of the failure; `retryable` answers "will
+ * THIS client instance automatically retry?" (NOT whether recovery is possible
+ * at all — that judgement is the embedder's, driven by `cause`):
+ * - `closed`      — an explicit `disconnect()`/`close()` retired the instance.
+ * - `evicted`     — the P0-7b unacked ledger exceeded its cap; the oldest entry
+ *                   was dropped (a fresh send can still succeed → retryable).
+ * - `terminal`    — a non-retryable connection failure (auth/protocol/register);
+ *                   `cause` carries the original `WebChannelErrorCause`.
+ * - `turn-failed` — the turn was admitted but settled with `outcome:"error"`;
+ *                   the message reached the agent, so re-sending is safe.
+ * - `cancelled`   — the user intentionally cancelled the send (a `/stop`
+ *                   hold-retraction or `retract()`); never retryable.
+ */
+export type SendFailure = {
+  reason: "closed" | "evicted" | "terminal" | "turn-failed" | "cancelled";
+  /** For `reason === "terminal"`: the original connection-failure classification. */
+  cause?: WebChannelErrorCause;
+  retryable: boolean;
+  /** Wall-clock ms of the most recent publish attempt (absent if never attempted). */
+  lastAttemptAt?: number;
+};
+
+/**
+ * P0-4: an observable handle for one `send()`. Its `id` is the message's
+ * immutable receipt key — stable across history adoption (which rewrites the
+ * render bubble's public `id`) and across `retract()` (which removes the render
+ * bubble entirely) — so a caller can always correlate a send to its outcome.
+ *
+ * The handle is a thin view over the wrapper's receipt record: `snapshot()`
+ * reads the current state, `subscribe()` fires on every state transition and
+ * returns an unsubscribe. Both survive `retract()`: a retracted send reports
+ * `failed{reason:"cancelled"}`, never a stuck `queued`.
+ */
+export type SendReceipt = {
+  /** Immutable receipt key — valid across history adoption/release/retract. */
+  readonly id: string;
+  snapshot(): { state: ChatMessage["sendState"]; failure?: SendFailure };
+  subscribe(cb: (s: ReturnType<SendReceipt["snapshot"]>) => void): () => void;
+};
+
+/**
  * One transcript bubble. `working: true` marks a live progress draft (the
  * rolling "Working…" bubble); it flips to false when the same id is finalized
  * into the agent's answer.
@@ -25,16 +89,33 @@ export type ChatMessage = {
   working?: boolean;
   /**
    * P0-7b: the stable wire `id` the client stamped on the outbound
-   * `user_message` this bubble echoes (user role only). Set at send time so an
-   * `ack` frame can mark the bubble delivered. Absent on server-hydrated bubbles
-   * and on agent messages; not used by the history three-tier adoption.
+   * `user_message` this bubble echoes (user role only). Set at send/release time
+   * so an `ack` frame's `accepted` transition can find the bubble. Absent on
+   * server-hydrated bubbles, on agent messages, and on a still-`queued` P1-9
+   * hold (assigned only at release); not used by the history three-tier adoption.
    */
   wireId?: string;
   /**
-   * P0-7b: flips true once the agent acks this message's `wireId` at ingress
-   * (state-only — a view can render a ✓). Absent until then.
+   * P0-4: the render mirror of this send's authoritative tracker state (user
+   * role only). Replaces the old boolean `delivered` — `accepted`/`completed`
+   * are the two "the agent got it" states a ✓ renders; `failed` renders a ⚠
+   * with `sendFailure.reason`. Absent on server-hydrated and agent bubbles.
+   *
+   * `completed` is a wrapper-level promotion over the tracker's `accepted`,
+   * applied only on an explicit `turn_settled{outcome:"ok"}` for the anchor
+   * message (turnId === wireId); a coalesced non-anchor send stays `accepted`,
+   * and a legacy plugin (no `outcome`) leaves every message at `accepted`.
    */
-  delivered?: boolean;
+  sendState?: "queued" | "sent" | "accepted" | "completed" | "failed";
+  /** P0-4: present only when `sendState === "failed"` — the failure detail. */
+  sendFailure?: SendFailure;
+  /**
+   * P0-4 (internal): immutable receipt key linking this bubble to its
+   * `SendReceipt` record. History adoption rewrites `id` in place but keeps this
+   * key (it spreads the prior bubble), so the receipt survives id churn. Not a
+   * render field. @internal
+   */
+  receiptKey?: string;
   /** Ephemeral live-turn correlation. History messages intentionally omit it. */
   turnId?: string;
   /**
@@ -189,7 +270,9 @@ export type WebChannelState = {
    * Set alongside `error` when `status === "error"`: the machine-readable cause
    * of the terminal failure, so the embedder can pick truthful wording + the
    * right recovery affordance (not the single "Credentials expired" heading).
-   * Cleared together with `error` on a later successful reconnect.
+   * P0-4: NEVER cleared on this instance — a CL2 terminal permanently retires
+   * the client (status stays "error" even if a manual `connect()` redials);
+   * recovery is a fresh client with fresh credentials.
    */
   errorCause?: WebChannelErrorCause;
   /**

@@ -495,6 +495,18 @@ T-st/T-co는 양측 필요 → Stage 5.
 |---|---|---|
 | 1 임의 id 공개 수용 → ledger 덮어쓰기·dedupe 우회·replay 오분류 | M | D4 재설계: `reserveWireId()` one-shot 예약 seam(패키지 내부, barrel 비노출 검증), 미예약/재사용/기존재 id는 throw + T-id 적대 테스트 (수용) |
 
+### 구현 라운드 노트 (impl-review R1 결정 2건)
+
+- **T-mv(b) 대체 수용**: "신 plugin + 구 client" 시나리오는 in-repo에 구 클라이언트
+  아티팩트가 없어 문자 그대로는 구성 불가. additive 필드 + zero-dep 재선언 구조가
+  "구 클라이언트는 outcome을 무시"를 구조적으로 보증하고(T-sl이 봉인 통과를 핀),
+  구현은 unknown-turn no-op 관용 테스트로 대체 — **미검증 호환 가정임을 여기
+  명시**하고 T-mv(b) 충족을 주장하지 않는다.
+- **finalize-false + turn_settled{ok} → completed 유지**: 최종 frame 전달이
+  실패해도 턴이 오류 없이 settle했으면 anchor는 `completed`가 맞다 — receipt는
+  사용자 메시지의 처리 운명을 추적하고, 답변 텍스트 유실의 복구는 §5 L3/L6
+  (register-시 history 재수화) 레인 소관. deliver seam 주석 + client 문서에 명시.
+
 ### R6 folding log
 
 | R6 | 심각도 | 처리 |

@@ -231,7 +231,10 @@ describe("control-lane /stop cancels debounce-buffered messages without leaving 
   function buildSeam(accountId: string, checkAndRecord: ReturnType<typeof fakeChecker>) {
     const dispatched: string[] = [];
     const acks: Array<{ peerId: string; ids: string[] }> = [];
-    const sendAck = (peerId: string, ids: string[]) => acks.push({ peerId, ids });
+    const sendAck = (peerId: string, ids: string[]) => {
+      acks.push({ peerId, ids });
+      return true;
+    };
     const debouncer = createInboundDebouncer<Item>({
       debounceMs: 50,
       serializeImmediate: true,

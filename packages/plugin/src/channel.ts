@@ -193,10 +193,15 @@ export function createWebChannelPlugin(
           // outbound seam only fires for core-initiated (untargeted) sends.
           // `ctx.to` is the recorded reply target — now the REAL per-peer
           // `wsKey` (inbound.ts records `reply.to = wsKey`), so target it
-          // directly. If it is absent or stale, delivery is explicitly logged
-          // and dropped; recipient guessing is intentionally unsupported.
-          if (!ctx.to || !transport.sendText(ctx.to, ctx.text)) {
-            console.error("[webchannel] outbound send has no resolvable target peer — dropped");
+          // directly. If it is absent or stale, throw so core observes a failed
+          // outbound delivery; recipient guessing is intentionally unsupported.
+          if (!ctx.to) {
+            throw new Error("[webchannel] outbound send failed: ctx.to is absent");
+          }
+          if (!transport.sendText(ctx.to, ctx.text)) {
+            throw new Error(
+              `[webchannel] outbound send failed: targeted send returned false for peer ${ctx.to}`,
+            );
           }
           return { messageId: `webchannel-${Date.now()}` };
         },

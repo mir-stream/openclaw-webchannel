@@ -27,7 +27,7 @@ export type OutboundWsMessage =
   | { type: "agent_message"; text: string; id?: string; turnId?: string }
   | { type: "progress"; id: string; text: string; turnId?: string }
   | { type: "reasoning"; id: string; turnId: string; text: string }
-  | { type: "turn_settled"; turnId: string }
+  | { type: "turn_settled"; turnId: string; outcome: "ok" | "error" }
   | ({ type: "approval_request" } & ApprovalRequestPayload)
   | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
   | { type: "approval_snapshot"; approvals: ApprovalRequestPayload[]; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
@@ -41,7 +41,7 @@ export interface WebChannelPeerChannel {
   sendProgress(peerId: string, id: string, text: string, turnId?: string): boolean;
   finalizeDraft(peerId: string, id: string, text: string, turnId?: string): boolean;
   sendReasoning(peerId: string, id: string, turnId: string, text: string): boolean;
-  sendTurnSettled(peerId: string, turnId: string): boolean;
+  sendTurnSettled(peerId: string, turnId: string, outcome: "ok" | "error"): boolean;
   sendTyping(peerId: string): boolean;
   sendHistory(peerId: string, messages: HistoryMessage[]): boolean;
   sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
@@ -54,7 +54,7 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendProgress(_peerId: string, _id: string, _text: string, _turnId?: string): boolean { return false; }
   finalizeDraft(_peerId: string, _id: string, _text: string, _turnId?: string): boolean { return false; }
   sendReasoning(_peerId: string, _id: string, _turnId: string, _text: string): boolean { return false; }
-  sendTurnSettled(_peerId: string, _turnId: string): boolean { return false; }
+  sendTurnSettled(_peerId: string, _turnId: string, _outcome: "ok" | "error"): boolean { return false; }
   sendTyping(_peerId: string): boolean { return false; }
   sendHistory(_peerId: string, _messages: HistoryMessage[]): boolean { return false; }
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }

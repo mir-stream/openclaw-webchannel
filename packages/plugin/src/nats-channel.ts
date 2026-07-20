@@ -385,8 +385,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     return this.sendToPeer(peerId, { type: "reasoning", id, turnId, text });
   }
 
-  sendTurnSettled(peerId: string, turnId: string): boolean {
-    return this.sendToPeer(peerId, { type: "turn_settled", turnId });
+  sendTurnSettled(peerId: string, turnId: string, outcome: "ok" | "error"): boolean {
+    return this.sendToPeer(peerId, { type: "turn_settled", turnId, outcome });
   }
 
   /**

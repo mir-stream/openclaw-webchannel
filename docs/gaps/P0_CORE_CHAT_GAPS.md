@@ -58,7 +58,7 @@ The **wrapper reduces every inbound frame** (`nats-client-wrapper.ts`):
 | `progress` | `:557` | upsert working bubble keyed by draft `id` |
 | `agent_message` | `:569` | finalize draft / append |
 | `commands` | `:412` | **P0-3**: replace `state.commands` with the delivered discovery catalog (`CommandCatalogEntry[]`) |
-| `ack` | `:420` | **P0-7b**: flip `delivered:true` on local echo bubbles whose `wireId` the agent acked at ingress |
+| `ack` | `:420` | **P0-7b/P0-4**: advance the matching `wireId` to `sendState:"accepted"` via the authoritative send tracker (`onSendState`) — the reducer case is now a no-op (acceptance is tracked low-level, no `delivered` boolean) |
 
 Terminal auth failure → `onError` (`:103`) sets `status:"error"` (no eternal spinner). A separate
 `onProtocol` listener (not a reducer case) records the register reply's `protocolVersion` /
@@ -99,9 +99,11 @@ and `resolutionConfirmed?:boolean`. Other wire deltas: `user_message` gained an 
 `CommandCatalogEntry[]` (`:83`); `ack` carries `{ ids: string[] }` (`:87`). **Register reply** (not a
 `.out` frame — the register req/reply) now carries `protocolVersion` + `pluginVersion`
 (`nats-register.ts:306-314`) alongside `{ peerId, registered:true, wrappedConversationKey }`; the
-client enforces the protocol match and goes terminal on mismatch (#33). `WebChannelState` now holds
-`messages` (+`wireId`/`delivered`), `approvals`, `status`, `connected`, `error?`, `isTyping?`,
-`commands?`, `agentProtocolVersion`, `agentPluginVersion` (`types.ts:123-165`).
+client enforces the protocol match and goes terminal on mismatch (#33). `turn_settled` additionally
+carries an optional `outcome?: "ok" | "error"` (**P0-4** — additive; older peers ignore it).
+`WebChannelState` now holds `messages` (+`wireId`/`sendState`/`sendFailure` — **P0-4** replaced the
+boolean `delivered`), `approvals`, `status`, `connected`, `error?`, `isTyping?`, `commands?`,
+`agentProtocolVersion`, `agentPluginVersion` (`types.ts:123-165`).
 
 ### ⭐ Server defaults are ON; the demo enables the important ones
 
@@ -487,15 +489,18 @@ an ack frame closing the loop. This was the heaviest P0 item and the only one ne
 
 **Where it stands today — client (P0-7b).**
 - Each `user_message` is stamped with a stable id (`randomInboxToken()`) in `sendUserMessage()`
-  (`nats-client.ts:960`). `ChatMessage` gained `wireId?` / `delivered?` (`types.ts:34,39`); the
-  wrapper stamps the local echo with its `wireId` (`nats-client-wrapper.ts:155-161`).
+  (`nats-client.ts:960`). `ChatMessage` gained `wireId?`; **P0-4** replaced the boolean `delivered?`
+  with `sendState?` (queued/sent/accepted/completed/failed) + `sendFailure?` (`types.ts`); the
+  wrapper stamps the local echo with its `wireId` at send/release time.
 - Replay ledger: `outboundQueue` (`:858`) + `unackedLedger: Map<string,OutboundMessage>` (`:873`,
   cap `MAX_UNACKED = 100`, oldest-eviction with a one-shot warn `:1365-1378`, user_message only). On
   session re-establishment `flushQueue()` (`:1327-1342`) prepends the unacked ledger and re-seals
   each with the **same id**, so a mid-session drop is re-sent.
-- Inbound `ack {ids:string[]}` (`nats-client.ts:1048`) → `drainAcked` (`:1053-1055`) removes acked
-  ids from the ledger; the wrapper's `case "ack"` (`nats-client-wrapper.ts:420-431`) flips
-  `delivered:true` on matching-`wireId` bubbles (state-only, so the demo can render a ✓).
+- Inbound `ack {ids:string[]}` → `drainAcked` removes acked ids from the ledger **and** advances
+  each to `sendState:"accepted"` via the authoritative low-level tracker (`onSendState` → the
+  wrapper patches the bubble). **P0-4** removed the old `delivered:true` reducer flip; the wrapper's
+  `case "ack"` is now a no-op (acceptance is tracked low-level, and a duplicate/late/post-terminal
+  ack is a guarded no-op).
 
 **Where it stands today — server (P0-7a).**
 - Ingress dedupe via `createPersistentDedupe` (`openclaw/plugin-sdk/persistent-dedupe`,

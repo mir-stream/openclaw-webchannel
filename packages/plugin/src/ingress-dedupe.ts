@@ -46,6 +46,41 @@
  * the storage-amplification surface to conforming clients.
  */
 const MAX_INGRESS_DEDUPE_ID_LENGTH = 128;
+export const MAX_CANCELLED_INBOUND_FALLBACK_TOMBSTONES = 256;
+
+/** Apply the same bounded/non-empty id rule to persistent and fallback keys. */
+export function ingressDedupeKey(item: IngressDedupeItem): string | undefined {
+  const id = item.message.id;
+  return typeof id === "string" && id.length > 0 && id.length <= MAX_INGRESS_DEDUPE_ID_LENGTH
+    ? `${item.peerId}:${id}`
+    : undefined;
+}
+
+/** Per-account, insertion-ordered safety net for cancelled-item record failures. */
+export class CancelledInboundFallbackTombstones {
+  private readonly keys = new Set<string>();
+
+  constructor(
+    private readonly warn?: (message: string) => void,
+    private readonly cap = MAX_CANCELLED_INBOUND_FALLBACK_TOMBSTONES,
+  ) {}
+
+  get size(): number { return this.keys.size; }
+  has(key: string): boolean { return this.keys.has(key); }
+  delete(key: string): boolean { return this.keys.delete(key); }
+
+  add(key: string): void {
+    if (this.keys.has(key)) return;
+    if (this.keys.size >= this.cap) {
+      const oldest = this.keys.values().next().value as string | undefined;
+      if (oldest !== undefined) {
+        this.keys.delete(oldest);
+        this.warn?.(`webchannel: cancelled-inbound fallback tombstone cap reached; evicted oldest key=${oldest}`);
+      }
+    }
+    this.keys.add(key);
+  }
+}
 
 /** The `checkAndRecord` shape this helper depends on (a subset of `PersistentDedupe`). */
 export type IngressDedupeCheck = (
@@ -104,18 +139,14 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
     // storage with junk keys. (Such a frame is still ACKed by the P0-7b ack
     // layer, which accepts any non-empty string; it simply is not deduped —
     // acceptable, since only a non-conforming client ever hits this path.)
-    const rawId = item.message.id;
-    const id =
-      typeof rawId === "string" && rawId.length > 0 && rawId.length <= MAX_INGRESS_DEDUPE_ID_LENGTH
-        ? rawId
-        : undefined;
-    if (!id) {
+    const key = ingressDedupeKey(item);
+    if (!key) {
       // Back-compat / hardening: id-less (or non-conforming) frames pass through
       // un-deduped.
       survivors.push(item);
       continue;
     }
-    const key = `${item.peerId}:${id}`;
+    const id = item.message.id as string;
     let fresh: boolean;
     try {
       fresh = await checkAndRecord(key, { namespace: accountId });
@@ -154,7 +185,9 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
    * When present, called once per flush with the unique ids across ALL items
    * (see the ack rationale in the factory doc).
    */
-  sendAck?: (peerId: string, ids: string[]) => void;
+  sendAck?: (peerId: string, ids: string[]) => boolean;
+  /** Cancel-record failures that must be suppressed before ordinary admission. */
+  cancelledFallback?: CancelledInboundFallbackTombstones;
   /** Routine duplicate-drop sink (info). */
   logInfo?: (message: string) => void;
   /** Fail-open fault sink (warn). */
@@ -206,24 +239,48 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
 export function createIngressOnFlush<T extends IngressDedupeItem>(
   deps: IngressOnFlushDeps<T>,
 ): (items: readonly T[]) => Promise<void> {
-  const { accountId, checkAndRecord, dispatch, coalesce, sendAck, logInfo, logWarn } = deps;
+  const { accountId, checkAndRecord, dispatch, coalesce, sendAck, cancelledFallback, logInfo, logWarn } = deps;
   const sinks: IngressDedupeLogSinks = { info: logInfo, warn: logWarn };
   return async (items) => {
     // P0-7b ack first — see the doc. Ack is receipt of ADMISSION and covers all
     // id-carrying items regardless of the dedupe outcome, so it runs before the
     // fresh-filter. Guard `items[0]` (an empty flush never fires, but stay total).
-    const anchor = items[0];
+    // Cancel fallback lookup is deliberately first. A hit represents text that
+    // /stop already killed, so it must never reach ordinary ack/dedupe/dispatch.
+    const ordinary: T[] = [];
+    for (const item of items) {
+      const key = ingressDedupeKey(item);
+      if (!key || !cancelledFallback?.has(key)) {
+        ordinary.push(item);
+        continue;
+      }
+      let recorded = false;
+      try {
+        await checkAndRecord(key, { namespace: accountId });
+        recorded = true;
+      } catch (err) {
+        logWarn?.(`webchannel: cancelled-inbound fallback record retry failed for key=${key}: ${String(err)}`);
+      }
+      const id = item.message.id as string;
+      const acked = sendAck?.(item.peerId, [id]) ?? false;
+      if (!acked) logWarn?.(`webchannel: cancelled-inbound fallback ack failed for key=${key}`);
+      if (recorded && acked) cancelledFallback.delete(key);
+    }
+
+    const anchor = ordinary[0];
     if (anchor && sendAck) {
       const ackIds = [
         ...new Set(
-          items
+          ordinary
             .map((i) => i.message.id)
             .filter((id): id is string => typeof id === "string" && id.length > 0),
         ),
       ];
-      if (ackIds.length > 0) sendAck(anchor.peerId, ackIds);
+      if (ackIds.length > 0 && !sendAck(anchor.peerId, ackIds)) {
+        logWarn?.(`webchannel: ingress admission ack failed for peer=${anchor.peerId} ids=${ackIds.join(",")}`);
+      }
     }
-    const fresh = await filterFreshInboundItems(items, accountId, checkAndRecord, sinks);
+    const fresh = await filterFreshInboundItems(ordinary, accountId, checkAndRecord, sinks);
     const first = fresh[0];
     if (!first) return;
     dispatch(first.peerId, coalesce(fresh.map((i) => i.message)));
@@ -264,20 +321,23 @@ export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
   items: readonly T[],
   accountId: string,
   checkAndRecord: IngressDedupeCheck,
-  sendAck: (peerId: string, ids: string[]) => void,
+  sendAck: (peerId: string, ids: string[]) => boolean,
   logWarn?: (message: string) => void,
+  cancelledFallback?: CancelledInboundFallbackTombstones,
 ): Promise<void> {
   const idsByPeer = new Map<string, string[]>();
   for (const item of items) {
-    const id = item.message.id;
-    if (!id) continue; // id-less: not replayable by the client — nothing to do.
+    const key = ingressDedupeKey(item);
+    if (!key) continue; // id-less/non-conforming: never persist or retain it.
+    const id = item.message.id as string;
     try {
-      await checkAndRecord(`${item.peerId}:${id}`, { namespace: accountId });
+      await checkAndRecord(key, { namespace: accountId });
     } catch (err) {
       logWarn?.(
         `webchannel: cancelled-inbound dedupe record failed for peer=${item.peerId} id=${id} ` +
           `(best-effort — the ack still drains the ledger): ${String(err)}`,
       );
+      cancelledFallback?.add(key);
     }
     // Ack regardless of the record outcome: the ack drains the client ledger, and
     // the record is the fallback for when the ack cannot reach a disconnected client.
@@ -285,5 +345,9 @@ export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
     ids.push(id);
     idsByPeer.set(item.peerId, ids);
   }
-  for (const [peerId, ids] of idsByPeer) sendAck(peerId, ids);
+  for (const [peerId, ids] of idsByPeer) {
+    if (!sendAck(peerId, ids)) {
+      logWarn?.(`webchannel: cancelled-inbound ack failed for peer=${peerId} ids=${ids.join(",")}`);
+    }
+  }
 }

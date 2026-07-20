@@ -201,6 +201,21 @@ describe("handleInboundMessage — typing indicator gating", () => {
 });
 
 describe("handleInboundMessage — aborted-turn defensive finalize", () => {
+  it("reports visibleReplySent=false when draft finalization returns false", async () => {
+    let visible: boolean | undefined;
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        visible = (await turn.delivery.deliver({ text: "answer" }, { kind: "final" })).visibleReplySent;
+      },
+    });
+    const { transport } = makeFakeTransport();
+    transport.finalizeDraft = () => false;
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "answer me", id: "turn-dv",
+    });
+    expect(visible).toBe(false);
+  });
   it("settles a hung draft with the streamed snapshot (no marker) when the run resolves without delivering a final", async () => {
     const { api } = makeFakeApi({
       streamingMode: "partial",

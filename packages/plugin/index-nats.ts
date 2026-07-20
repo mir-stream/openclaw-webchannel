@@ -35,7 +35,11 @@ import {
   resolveInboundDebounceMs,
 } from "openclaw/plugin-sdk/reply-runtime";
 import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
-import { createIngressOnFlush, recordCancelledInboundItems } from "./src/ingress-dedupe.js";
+import {
+  CancelledInboundFallbackTombstones,
+  createIngressOnFlush,
+  recordCancelledInboundItems,
+} from "./src/ingress-dedupe.js";
 import {
   handleApprovalDecision,
   listPendingApprovalsForPeer,
@@ -573,6 +577,11 @@ export default defineChannelPluginEntry({
               `(degrading to memory-only): ${String(err)}`,
           ),
       });
+      // Same per-account lifetime as the persistent dedupe. This closes the
+      // live-process window where both a cancelled-item record and its ACK fail.
+      const cancelledInboundFallback = new CancelledInboundFallbackTombstones(
+        (m) => api.logger?.warn?.(m),
+      );
 
       // P1-8b layer (a): idle pre-run debounce (Telegram parity), REUSING core's
       // `createInboundDebouncer`. Sits IN FRONT of the per-session FIFO: rapid
@@ -617,6 +626,7 @@ export default defineChannelPluginEntry({
           dispatch: dispatchInbound,
           coalesce: coalesceUserMessages,
           sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
+          cancelledFallback: cancelledInboundFallback,
           logInfo: (m) => api.logger?.info?.(m),
           logWarn: (m) => api.logger?.warn?.(m),
         }),
@@ -640,6 +650,7 @@ export default defineChannelPluginEntry({
             (key, opts) => inboundDedupe.checkAndRecord(key, opts),
             (peerId, ids) => channel.sendAck(peerId, ids),
             (m) => api.logger?.warn?.(m),
+            cancelledInboundFallback,
           ).catch((err) =>
             api.logger?.warn?.(
               `webchannel: cancelled-inbound handling failed: ${String(err)}`,
@@ -720,7 +731,11 @@ export default defineChannelPluginEntry({
           // client-side ledger entry would never drain and every reconnect would
           // replay the /stop. A replayed /stop that lands before this ack is a
           // harmless no-op abort (accepted).
-          if (message.id) channel.sendAck(peerId, [message.id]);
+          if (message.id && !channel.sendAck(peerId, [message.id])) {
+            api.logger?.warn?.(
+              `webchannel: control-lane ack failed for peer=${peerId} id=${message.id}`,
+            );
+          }
           void handleInboundMessage(
             api,
             channel,

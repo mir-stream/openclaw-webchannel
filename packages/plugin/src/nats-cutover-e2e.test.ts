@@ -504,12 +504,12 @@ describe("AC 5 E2E: NATS Cutover", () => {
     });
 
     agentChannel.sendReasoning(peerId, "reason-1", "turn-1", "Checking files");
-    agentChannel.sendTurnSettled(peerId, "turn-1");
+    agentChannel.sendTurnSettled(peerId, "turn-1", "ok");
     await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(payloads.map((payload) => JSON.parse(payload))).toEqual([
       { type: "reasoning", id: "reason-1", turnId: "turn-1", text: "Checking files" },
-      { type: "turn_settled", turnId: "turn-1" },
+      { type: "turn_settled", turnId: "turn-1", outcome: "ok" },
     ]);
     agentTransport.unsubscribe(outboundSub);
     agentChannel.unregisterPeer(peerId);
