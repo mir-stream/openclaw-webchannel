@@ -16,7 +16,8 @@ vi.mock("./e2e-crypto-browser.js", async (importOriginal) => {
   };
 });
 
-import { inboundSubject, registerSubject } from "./nats-client.js";
+import { inboundSubject, outboundSubject, registerSubject } from "./nats-client.js";
+import { sealMessage } from "./e2e-crypto-browser.js";
 import {
   AGENT, FakeNatsWS, PEER, TENANT, installFakeWebSocket, makeClient,
   registerAgent, settle, type ServerHandler,
@@ -72,6 +73,45 @@ describe("P1-3 connection epoch guards", () => {
     h.client.connect(); await settle(12);
     expect(reentered).toBe(true); expect(errors).toEqual([]);
     expect(FakeNatsWS.instances.at(-1)!.readyState).toBe(FakeNatsWS.OPEN); h.client.disconnect();
+  });
+
+  it("sync disconnect+connect inside a drained inbound listener cannot leak the old epoch", async () => {
+    const h = await makeClient();
+    const K = new Uint8Array(32).fill(7);
+    const outS = outboundSubject(TENANT, AGENT, PEER);
+    let releaseReply!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseReply = resolve; });
+    FakeNatsWS.sharedHandler = registerAgent(K, h.devicePublicRaw, h.identity, {
+      beforeReply: async () => {
+        // A sealed .out frame lands BEFORE the register reply delivers K, so it is
+        // buffered in pendingInbound and only decrypted by drainPendingInbound().
+        FakeNatsWS.instances[0]!.deliverToClient(
+          outS,
+          sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, K, { type: "agent_message", id: "m1", text: "hi" }),
+        );
+        await gate;
+      },
+    });
+    let sessions = 0; const errors: Error[] = []; let torn = false;
+    h.client.onSession(() => { sessions++; });
+    h.client.onError((e) => errors.push(e));
+    // The drained inbound listener synchronously tears down + redials — advancing
+    // the epoch under the still-running register continuation.
+    h.client.onMessage(() => { if (!torn) { torn = true; h.client.disconnect(); h.client.connect(); } });
+    h.client.connect();
+    h.client.sendUserMessage("queued-must-not-flush-on-old-epoch");
+    await settle(6);
+    releaseReply();
+    await settle(16);
+    expect(torn).toBe(true);
+    // The old epoch's socket saw no flushed publish (flushQueue was epoch-guarded).
+    expect(FakeNatsWS.instances[0]!.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
+    // Exactly one session notification — from the replacement connection, never the stale flow.
+    expect(sessions).toBe(1);
+    expect(errors).toEqual([]);
+    const replacement = FakeNatsWS.instances.at(-1)!;
+    expect(replacement.readyState).toBe(FakeNatsWS.OPEN);
+    h.client.disconnect();
   });
 
   it("error-listener disconnect+connect prevents the old terminal branch closing the new socket", async () => {

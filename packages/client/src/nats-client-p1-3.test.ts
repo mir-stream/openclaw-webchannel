@@ -147,4 +147,37 @@ describe("P1-3 browser transport invariants", () => {
     expect(packed.length).toBeLessThanOrEqual(MAX_BUFFERED_BYTES); ws.frame(packed);
     expect(got.map(([s]) => s)).toEqual(["split", "split", "split", "split", "zero", "packed0", "packed1", "packed2"]); c.disconnect();
   });
+
+  it("ignores an unsolicited PONG before the signed CONNECT is on the wire", async () => {
+    vi.useFakeTimers();
+    const sign = vi.spyOn(crypto.subtle, "sign").mockImplementationOnce(() => new Promise<ArrayBuffer>(() => {}));
+    const c = make({ connectTimeoutMs: 10, natsCredentials: credentials, reconnectBaseMs: 100 });
+    let becameConnected = false; c.onState((v) => { if (v) becameConnected = true; });
+    c.connect(); const ws = FakeWS.instances[0]!; ws.open(); ws.frame('INFO {"nonce":"n"}\r\n');
+    // Signing is pending → CONNECT is NOT on the wire. An unsolicited PONG must be ignored.
+    ws.frame("PONG\r\n");
+    expect(becameConnected).toBe(false); expect(ws.closed).toBe(false);
+    // The armed "CONNECT signing" deadline still fires — the PONG did not clear it.
+    await vi.advanceTimersByTimeAsync(10); expect(ws.closed).toBe(true);
+    sign.mockRestore(); c.disconnect();
+  });
+
+  it("disconnect clears the active dial deadline timer", () => {
+    vi.useFakeTimers();
+    const c = make({ connectTimeoutMs: 10_000 }); c.connect();
+    expect(vi.getTimerCount()).toBe(1); // the WebSocket-open deadline
+    c.disconnect(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("forceReconnect clears the old dial deadline, leaving only the reconnect timer", () => {
+    vi.useFakeTimers();
+    const c = make({ connectTimeoutMs: 10_000, reconnectBaseMs: 100 });
+    c.connect(); const ws = FakeWS.instances[0]!; ws.open();
+    expect(vi.getTimerCount()).toBe(1); // the "first PONG" dial deadline
+    // A parser violation before any PONG forces a reconnect. The old dial's
+    // deadline must be cancelled — exactly one timer remains (the reconnect), not two.
+    ws.frame("MSG s 1 1\r\nX!!");
+    expect(ws.closed).toBe(true); expect(vi.getTimerCount()).toBe(1);
+    c.disconnect();
+  });
 });

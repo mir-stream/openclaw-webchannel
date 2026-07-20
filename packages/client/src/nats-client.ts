@@ -288,6 +288,13 @@ export class NatsClient {
   /** CL3: keepalive timer + outstanding-PING flag. */
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pongPending = false;
+  /**
+   * The CURRENT dial's deadline-timer cleanup. disconnect()/forceReconnect() null
+   * ws.onclose before close(), so the dial's onclose→clearDeadline never runs;
+   * invoking this cancels the armed deadline directly. Only ever points at the
+   * current dial's cleanup — a stale dial self-cleans via its own onclose/timeout.
+   */
+  private activeDialCleanup: (() => void) | null = null;
 
   constructor(options: NatsClientOptions) {
     this.options = options;
@@ -312,6 +319,9 @@ export class NatsClient {
   disconnect(): void {
     this.clearReconnectTimer();
     this.stopHeartbeat();
+    // Cancel the active dial's armed deadline before we null its onclose below
+    // (which would otherwise strand the timer until it fires as a guarded no-op).
+    if (this.activeDialCleanup) { this.activeDialCleanup(); this.activeDialCleanup = null; }
     if (this.ws) {
       this.ws.onopen = null;
       this.ws.onmessage = null;
@@ -454,9 +464,10 @@ export class NatsClient {
     const dial: {
       buffer: Uint8Array;
       connectSent: boolean;
+      connectOnWire: boolean;
       timer: ReturnType<typeof setTimeout> | null;
       phase: string;
-    } = { buffer: new Uint8Array(0), connectSent: false, timer: null, phase: "WebSocket open" };
+    } = { buffer: new Uint8Array(0), connectSent: false, connectOnWire: false, timer: null, phase: "WebSocket open" };
     const armDeadline = (phase: string): void => {
       dial.phase = phase;
       if (dial.timer) clearTimeout(dial.timer);
@@ -471,6 +482,12 @@ export class NatsClient {
       if (dial.timer) clearTimeout(dial.timer);
       dial.timer = null;
     };
+    // Expose THIS dial's timer cleanup on the instance. disconnect()/forceReconnect()
+    // null ws.onclose BEFORE close(), so the dial's own onclose→clearDeadline never
+    // runs and the armed deadline would otherwise survive up to connectTimeoutMs and
+    // fire as a guarded no-op. Each new dial reassigns this slot; a stale dial still
+    // self-cleans via its own onclose/timeout.
+    this.activeDialCleanup = clearDeadline;
     armDeadline("WebSocket open");
 
     ws.onopen = () => {
@@ -480,6 +497,10 @@ export class NatsClient {
       // With NKEY auth we MUST wait for the server's INFO nonce before signing,
       // so CONNECT is deferred to the INFO handler in drainBuffer().
       if (!this.options.natsCredentials) {
+        // CONNECT goes out synchronously here — mark it on-wire BEFORE the send so
+        // a server that answers our PING with a PONG in the same tick (the test
+        // fake does) is not mistaken for an unsolicited PONG and dropped.
+        dial.connectOnWire = true;
         this.sendConnect(ws);
         armDeadline("first PONG");
       } else {
@@ -502,12 +523,12 @@ export class NatsClient {
       dial.buffer = joined;
       dial.buffer = this.drainBuffer(ws, dial.buffer, () => {
         clearDeadline();
-      }, () => armDeadline("first PONG"), () => {
+      }, () => { dial.connectOnWire = true; armDeadline("first PONG"); }, () => {
         if (dial.connectSent) return false;
         dial.connectSent = true;
         armDeadline("CONNECT signing");
         return true;
-      });
+      }, () => dial.connectOnWire);
     };
 
     ws.onerror = (err) => {
@@ -551,9 +572,10 @@ export class NatsClient {
    */
   private async sendSignedConnect(ws: WebSocket, infoLine: string, onSent: () => void): Promise<void> {
     const creds = this.options.natsCredentials;
-    // Capture the socket BEFORE the crypto await: a (theoretical) reconnect
-    // during the await could swap `this.ws`, and we must send CONNECT on the
-    // same socket that produced this INFO nonce — never a replacement.
+    // `ws` is threaded in lexically by the caller: CONNECT must be sent on the
+    // exact socket that produced this INFO nonce, never a replacement that a
+    // reconnect during the crypto await below may have swapped into `this.ws`
+    // (re-checked against `this.ws` right before the send).
     if (!creds) return;
 
     let nonce = "";
@@ -581,9 +603,12 @@ export class NatsClient {
     if (sig) connectPayload["sig"] = sig;
 
     if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+    // Mark CONNECT on-wire and arm the "first PONG" deadline BEFORE the synchronous
+    // sends: a server (or test fake) that answers our PING with a PONG in the same
+    // tick must not have that legitimate PONG dropped as unsolicited.
+    onSent();
     ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
     ws.send("PING\r\n");
-    onSent();
   }
 
   private drainBuffer(
@@ -592,6 +617,7 @@ export class NatsClient {
     onPong: () => void,
     onConnectSent: () => void,
     beginSignedConnect: () => boolean,
+    isConnectOnWire: () => boolean,
   ): Uint8Array {
     let buffer = initialBuffer;
     const decoder = new TextDecoder();
@@ -617,6 +643,11 @@ export class NatsClient {
       }
 
       if (line === "PONG") {
+        // A PONG is only legitimate once our CONNECT+PING is actually on the wire.
+        // An unsolicited PONG (NKEY mode: INFO arrived, signing still pending) must
+        // not clear the deadline, flip us connected, or touch pongPending — ignore
+        // it entirely and keep the armed phase deadline running.
+        if (!isConnectOnWire()) continue;
         onPong();
         // CL3: any PONG proves the link is alive — clear the outstanding-ping
         // flag so the next heartbeat tick does not declare a dead link.
@@ -783,6 +814,8 @@ export class NatsClient {
     this.terminal = true;
     this.clearReconnectTimer();
     this.stopHeartbeat();
+    // Cancel the active dial's armed deadline before we null its onclose below.
+    if (this.activeDialCleanup) { this.activeDialCleanup(); this.activeDialCleanup = null; }
     this.connected = false;
     if (this.ws) {
       this.ws.onopen = null;
@@ -842,6 +875,8 @@ export class NatsClient {
    */
   private forceReconnect(): void {
     this.stopHeartbeat();
+    // Cancel the active dial's armed deadline before we null its onclose below.
+    if (this.activeDialCleanup) { this.activeDialCleanup(); this.activeDialCleanup = null; }
     this.connected = false;
     if (this.ws) {
       this.ws.onopen = null;
@@ -1130,6 +1165,10 @@ export class WebChannelNatsClient {
     const pending = this.pendingInbound;
     this.pendingInbound = [];
     for (const payload of pending) {
+      // A delivered frame's listener can synchronously tear the session down
+      // (disconnect() → resetSession nulls sessionKey). Bail mid-loop rather than
+      // decrypting the rest against a key that no longer belongs to this session.
+      if (!this.sessionKey) return;
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
       if (msg) this.deliverInbound(msg);
     }
@@ -1318,8 +1357,15 @@ export class WebChannelNatsClient {
         }
         if (this.connectionEpoch !== epoch) return;
         this.sessionKey = key;
+        // drainPendingInbound() synchronously invokes message listeners; one that
+        // calls disconnect()+connect() advances the epoch under us. Re-check before
+        // flushing/notifying so a stale flow never publishes on — or fires a false
+        // "session established" for — a connection generation that is no longer
+        // current (session listeners gate P1-9 unsend-hold release).
         this.drainPendingInbound();
+        if (this.connectionEpoch !== epoch) return;
         this.flushQueue();
+        if (this.connectionEpoch !== epoch) return;
         // P1-9: notify AFTER flushQueue so a released hold is ordered behind the
         // P0-7b ledger replay (drain → flush → notify; see onSession).
         this.notifySessionListeners();

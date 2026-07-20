@@ -210,6 +210,10 @@ export class NatsTransport extends EventEmitter {
       this.ws = ws;
       let buffer = Buffer.alloc(0);
       let connectSent = false;
+      // Set only once CONNECT is actually on the wire (no-creds open-handler, or
+      // sendConnectWithJwt's onSent). A PONG before this is unsolicited and must
+      // not settle the dial — the phase deadline stays armed.
+      let connectOnWire = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let phase = "WebSocket open";
       let established = false;
@@ -243,7 +247,11 @@ export class NatsTransport extends EventEmitter {
       };
       const protocolViolation = (reason: string): void => {
         const err = new Error(`NatsTransport: protocol violation: ${reason}`);
-        this.emitError(err);
+        // During the handshake the rejection IS the signal (mirrors the -ERR
+        // branch): reject the connect() promise WITHOUT also emitting 'error',
+        // which — with no listener attached yet — Node would rethrow as an
+        // uncaught exception. Post-handshake, emit so live callers can react.
+        if (established) this.emitError(err);
         settle(err);
         try { ws.close(); } catch { /* already closed */ }
       };
@@ -277,6 +285,7 @@ export class NatsTransport extends EventEmitter {
             connectPayload["jwt"] = this.jwtCredential;
           }
           ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
+          connectOnWire = true;
           // Initiate the round-trip that proves the connection is ready.
           ws.send("PING\r\n");
           armDeadline("first PONG");
@@ -312,7 +321,7 @@ export class NatsTransport extends EventEmitter {
           connectSent = true;
           armDeadline("CONNECT signing");
           return true;
-        }, () => armDeadline("first PONG"));
+        }, () => { connectOnWire = true; armDeadline("first PONG"); }, () => connectOnWire);
         buffer = result;
       });
 
@@ -373,6 +382,7 @@ export class NatsTransport extends EventEmitter {
     protocolViolation: (reason: string) => void,
     beginJwtConnect: () => boolean,
     connectSent: () => void,
+    isConnectOnWire: () => boolean,
   ): Buffer {
     // NATS lines are terminated by \r\n. MSG payloads follow immediately after
     // the MSG header line (also terminated by \r\n).
@@ -401,6 +411,10 @@ export class NatsTransport extends EventEmitter {
       }
 
       if (line === "PONG") {
+        // A PONG is only legitimate once our CONNECT+PING is actually on the wire.
+        // An unsolicited PONG (JWT mode: INFO arrived, signing still pending) is
+        // ignored — the phase deadline stays armed and connect() does not settle.
+        if (!isConnectOnWire()) continue;
         // PONG is the server's reply to our PING, confirming the connection.
         // Establishment belongs to this dial, not to the transport-wide state:
         // overlapping connect() calls must each settle on their own first PONG.
@@ -410,7 +424,7 @@ export class NatsTransport extends EventEmitter {
 
       if (line === "PING") {
         // Server-side keepalive ping — reply immediately.
-          ws.send("PONG\r\n");
+        ws.send("PONG\r\n");
         continue;
       }
 
@@ -718,9 +732,12 @@ export class NatsTransport extends EventEmitter {
       }
 
       if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      // Mark CONNECT on-wire and arm the "first PONG" deadline BEFORE the sync
+      // sends: a server that answers our PING with a PONG in the same tick must
+      // not have that legitimate PONG dropped as unsolicited.
+      onSent?.();
       ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
       ws.send("PING\r\n");
-      onSent?.();
     } catch (err) {
       settle?.(err instanceof Error ? err : new Error(String(err)));
     }

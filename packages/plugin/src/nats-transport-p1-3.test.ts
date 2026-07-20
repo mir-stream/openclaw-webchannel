@@ -240,4 +240,26 @@ describe("P1-3 plugin transport invariants", () => {
     expect(got.map((m) => m.subject)).toEqual(["split", "split", "split", "split", "zero", "packed0", "packed1", "packed2", "after"]);
     expect(sockets[0]!.closed).toBe(false); t.disconnect();
   });
+
+  it("ignores an unsolicited PONG before the signed CONNECT is on the wire", async () => {
+    vi.useFakeTimers();
+    const { transport: t, sockets } = setup({ handshakeTimeoutMs: 10, jwtCredential: "j", nkeySigningCallback: () => new Promise<string>(() => {}) });
+    const dial = t.connect(); const rejected = expect(dial).rejects.toThrow(/CONNECT signing/);
+    sockets[0]!.open(); sockets[0]!.frame('INFO {"nonce":"n"}\r\n'); await Promise.resolve();
+    // Signing is pending → CONNECT is NOT on the wire. An unsolicited PONG must not
+    // resolve connect(); the "CONNECT signing" phase deadline stays armed.
+    sockets[0]!.frame("PONG\r\n"); expect(t.connected).toBe(false);
+    await vi.advanceTimersByTimeAsync(10); await rejected; expect(sockets[0]!.closed).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("rejects a handshake-phase protocol violation without emitting error", async () => {
+    const { transport: t, sockets } = setup();
+    const errs: Error[] = []; t.on("error", (e) => errs.push(e));
+    const dial = t.connect(); sockets[0]!.open();
+    // Oversized control line before any PONG — a violation during the handshake.
+    sockets[0]!.frame(`${"X".repeat(MAX_CONTROL_LINE + 1)}\r\n`);
+    await expect(dial).rejects.toThrow(/protocol violation/);
+    expect(errs).toEqual([]); expect(sockets[0]!.closed).toBe(true);
+  });
 });
