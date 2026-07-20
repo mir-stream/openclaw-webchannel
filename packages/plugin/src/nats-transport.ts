@@ -251,7 +251,7 @@ export class NatsTransport extends EventEmitter {
         // branch): reject the connect() promise WITHOUT also emitting 'error',
         // which — with no listener attached yet — Node would rethrow as an
         // uncaught exception. Post-handshake, emit so live callers can react.
-        if (established) this.emitError(err);
+        if (established) this.emitError(err, ws);
         settle(err);
         try { ws.close(); } catch { /* already closed */ }
       };

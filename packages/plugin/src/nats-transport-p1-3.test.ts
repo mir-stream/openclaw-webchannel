@@ -113,6 +113,15 @@ describe("P1-3 plugin transport invariants", () => {
     expect(seen).toEqual(["L1"]);
   });
 
+  it("stops the error fan-out on a post-handshake protocol violation", async () => {
+    const { transport: t, sockets } = setup(); const connected = t.connect(); await handshake(sockets[0]!, connected);
+    const seen: string[] = [];
+    t.on("error", () => { seen.push("L1"); t.disconnect(); });
+    t.on("error", () => { seen.push("L2"); });
+    sockets[0]!.frame("MSG s 1 x 1 extra\r\n");
+    expect(seen).toEqual(["L1"]);
+  });
+
   it.each(["MSG s 1 -1", "MSG s 1 NaN", "MSG s 1 1junk", "MSG s 1", "MSG s 1 x 1 extra", "MSG  1 1"])(
     "closes on malformed header %s", async (line) => {
       const { transport: t, sockets } = setup(); t.on("error", () => {}); const promise = t.connect(); await handshake(sockets[0]!, promise);

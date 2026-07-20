@@ -669,10 +669,15 @@ export class NatsClient {
           this.connected = true;
           this.reconnectAttempts = 0;
           console.log("[nats-client] Connected to NATS");
-          this.resubscribeAll();
-          this.startHeartbeat();
+          // Order is deliberately UNCHANGED (notify -> resubscribe -> heartbeat):
+          // nats-client-wrapper's P1-9 ledger/hold release observes this sequence.
+          // The leak this fixes is a state listener that synchronously disconnects:
+          // it ran stopHeartbeat(), and the unguarded startHeartbeat() below then
+          // armed a fresh interval on a dead client. Bail instead of reordering.
           this.notifyStateListeners(() => this.ws === ws);
           if (this.ws !== ws) return new Uint8Array(0);
+          this.resubscribeAll();
+          this.startHeartbeat();
         }
         continue;
       }
