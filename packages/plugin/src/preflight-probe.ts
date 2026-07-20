@@ -23,9 +23,10 @@
  * The three probes (every source mode benefits — enrolled too):
  *   - P1 self-subtree SUB   `webchannel.{tenant}.{accountId}._preflight` — DENIED ⇒ FAIL.
  *   - P2 self-subtree PUB   same subject                                 — DENIED ⇒ FAIL.
- *   - P3 foreign SUB `_webchannel_preflight_foreign.{rand}` (OUTSIDE the webchannel
- *     namespace) — ALLOWED ⇒ over-broad WARN (functional but the isolation
- *     guarantee is weakened); DENIED is the expected/healthy result.
+ *   - P3 foreign-tenant SUB `webchannel.{randomTenant}._preflight` — ALLOWED ⇒
+ *     cross-tenant grant, WARN.
+ *   - P4 foreign-namespace SUB `_webchannel_preflight_foreign.{rand}` — ALLOWED ⇒
+ *     globally over-broad grant, WARN.
  */
 
 import { randomBytes } from "node:crypto";
@@ -46,7 +47,7 @@ export type ProbeTransport = {
 export type ProbeOperation = "Publish" | "Subscription";
 
 export type PermissionProbeResult = {
-  probe: "P1-agent-sub" | "P2-agent-pub" | "P3-foreign-sub";
+  probe: "P1-agent-sub" | "P2-agent-pub" | "P3-foreign-tenant-sub" | "P4-foreign-namespace-sub";
   operation: ProbeOperation;
   subject: string;
   /** true = the broker permitted the operation (no correlated -ERR before PONG). */
@@ -112,8 +113,10 @@ async function runProbe(
 export type RunPermissionProbesOptions = {
   /** Per-probe PING/PONG barrier timeout (ms). Default 2000. */
   timeoutMs?: number;
-  /** Override the foreign-namespace probe subject (tests). */
+  /** Override the foreign-tenant probe subject (tests). */
   foreignSubject?: string;
+  /** Override the outside-webchannel namespace probe subject (tests). */
+  foreignNamespaceSubject?: string;
   /** Tenant used in the FAIL template hint (defaults to the probe tenant). */
   tenant?: string;
 };
@@ -131,7 +134,9 @@ export async function runPermissionProbes(
   const timeoutMs = opts.timeoutMs ?? 2000;
   const selfSubject = preflightSubject(ids.tenant, ids.accountId);
   const foreignSubject =
-    opts.foreignSubject ?? `_webchannel_preflight_foreign.${randomBytes(8).toString("hex")}`;
+    opts.foreignSubject ?? `webchannel._preflight_${randomBytes(8).toString("hex")}._probe`;
+  const foreignNamespaceSubject =
+    opts.foreignNamespaceSubject ?? `_webchannel_preflight_foreign.${randomBytes(8).toString("hex")}`;
 
   // STRICTLY SEQUENTIAL — one shared error channel.
   const p1Allowed = await runProbe(
@@ -149,11 +154,17 @@ export async function runPermissionProbes(
     { operation: "Subscription", subject: foreignSubject, kind: "sub" },
     timeoutMs,
   );
+  const p4Allowed = await runProbe(
+    transport,
+    { operation: "Subscription", subject: foreignNamespaceSubject, kind: "sub" },
+    timeoutMs,
+  );
 
   const results: PermissionProbeResult[] = [
     { probe: "P1-agent-sub", operation: "Subscription", subject: selfSubject, allowed: p1Allowed },
     { probe: "P2-agent-pub", operation: "Publish", subject: selfSubject, allowed: p2Allowed },
-    { probe: "P3-foreign-sub", operation: "Subscription", subject: foreignSubject, allowed: p3Allowed },
+    { probe: "P3-foreign-tenant-sub", operation: "Subscription", subject: foreignSubject, allowed: p3Allowed },
+    { probe: "P4-foreign-namespace-sub", operation: "Subscription", subject: foreignNamespaceSubject, allowed: p4Allowed },
   ];
 
   if (!p1Allowed || !p2Allowed) {
@@ -167,13 +178,18 @@ export async function runPermissionProbes(
         formatPermissionTemplate(opts.tenant ?? ids.tenant),
     };
   }
-  if (p3Allowed) {
+  if (p3Allowed || p4Allowed) {
+    const scope = p3Allowed && p4Allowed
+      ? `another tenant (${foreignSubject}) and outside the webchannel namespace (${foreignNamespaceSubject})`
+      : p3Allowed
+        ? `another tenant (${foreignSubject})`
+        : `outside the webchannel namespace (${foreignNamespaceSubject})`;
     return {
       results,
       verdict: "WARN",
       line:
-        `NATS permission probe WARN — the agent creds are OVER-BROAD: they permit subscribing OUTSIDE the ` +
-        `webchannel namespace (${foreignSubject}). Serving works, but the isolation guarantee is weakened — ` +
+        `NATS permission probe WARN — the agent creds are OVER-BROAD: they permit subscribing to ${scope}. ` +
+        `Serving works, but the isolation guarantee is weakened — ` +
         `scope the creds to webchannel.${ids.tenant}.> per the template.`,
     };
   }

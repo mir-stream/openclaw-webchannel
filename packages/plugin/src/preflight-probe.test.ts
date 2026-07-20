@@ -6,7 +6,7 @@
  * proven in packages/saas/src/nats-permissions-realserver.test.ts — the plugin
  * bans @nats-io so it cannot mint scoped creds here. This suite drives a
  * CONTROLLABLE fake transport to pin the parts that ARE plugin logic: `-ERR`
- * correlation on BOTH operation kind AND subject, the sequential 3-probe verdict,
+ * correlation on BOTH operation kind AND subject, the sequential 4-probe verdict,
  * and per-probe cleanup (UNSUB).
  */
 import { EventEmitter } from "node:events";
@@ -61,7 +61,8 @@ class FakeProbeTransport extends EventEmitter implements ProbeTransport {
 
 const IDS = { tenant: "t1", accountId: "a1" };
 const SELF = preflightSubject("t1", "a1");
-const FOREIGN = "_webchannel_preflight_foreign.fixed";
+const FOREIGN = "webchannel.other-tenant._probe";
+const FOREIGN_NAMESPACE = "_webchannel_preflight_foreign.fixed";
 
 describe("parsePermissionViolation", () => {
   it("extracts operation + subject from a real -ERR line", () => {
@@ -77,15 +78,17 @@ describe("parsePermissionViolation", () => {
 
 describe("runPermissionProbes — sequential PING-barrier verdicts", () => {
   it("PASS: self sub+pub allowed, foreign sub denied", async () => {
-    const t = new FakeProbeTransport((_op, subject) => subject === FOREIGN);
-    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN });
+    const t = new FakeProbeTransport(
+      (_op, subject) => subject === FOREIGN || subject === FOREIGN_NAMESPACE,
+    );
+    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN, foreignNamespaceSubject: FOREIGN_NAMESPACE });
     expect(report.verdict).toBe("PASS");
-    expect(report.results.map((r) => r.allowed)).toEqual([true, true, false]);
+    expect(report.results.map((r) => r.allowed)).toEqual([true, true, false, false]);
   });
 
   it("FAIL + template when the agent is denied SUB on its own subtree (P1)", async () => {
     const t = new FakeProbeTransport((op, subject) => op === "Subscription" && subject === SELF);
-    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN });
+    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN, foreignNamespaceSubject: FOREIGN_NAMESPACE });
     expect(report.verdict).toBe("FAIL");
     expect(report.results[0].allowed).toBe(false);
     // The FAIL line carries the permission template so the operator can fix it.
@@ -94,7 +97,7 @@ describe("runPermissionProbes — sequential PING-barrier verdicts", () => {
 
   it("FAIL when the agent is denied PUB on its own subtree (P2) — same subject, different op", async () => {
     const t = new FakeProbeTransport((op, subject) => op === "Publish" && subject === SELF);
-    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN });
+    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN, foreignNamespaceSubject: FOREIGN_NAMESPACE });
     expect(report.verdict).toBe("FAIL");
     // P1 (sub, same subject) is NOT tripped — correlation is by op AND subject.
     expect(report.results[0].allowed).toBe(true);
@@ -103,10 +106,26 @@ describe("runPermissionProbes — sequential PING-barrier verdicts", () => {
 
   it("WARN (over-broad) when the foreign-namespace subscription is ALLOWED", async () => {
     const t = new FakeProbeTransport(() => false); // nothing denied
-    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN });
+    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN, foreignNamespaceSubject: FOREIGN_NAMESPACE });
     expect(report.verdict).toBe("WARN");
     expect(report.results[2].allowed).toBe(true);
     expect(report.line).toContain("OVER-BROAD");
+  });
+
+  it("WARN when access is limited to webchannel but crosses tenant boundaries", async () => {
+    // Models allow `webchannel.>`: the old outside-namespace-only probe called
+    // this PASS even though these creds can read every tenant.
+    const t = new FakeProbeTransport(
+      (_op, subject) => !subject.startsWith("webchannel."),
+    );
+    const report = await runPermissionProbes(t, IDS, {
+      foreignSubject: FOREIGN,
+      foreignNamespaceSubject: FOREIGN_NAMESPACE,
+    });
+    expect(report.verdict).toBe("WARN");
+    expect(report.results[2].allowed).toBe(true);
+    expect(report.results[3].allowed).toBe(false);
+    expect(report.line).toContain("another tenant");
   });
 
   it("correlation: an UNCORRELATED -ERR (wrong operation) does not trip a probe", async () => {
@@ -121,21 +140,21 @@ describe("runPermissionProbes — sequential PING-barrier verdicts", () => {
         return [violationErr("Publish", SELF)];
       },
     );
-    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN });
+    const report = await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN, foreignNamespaceSubject: FOREIGN_NAMESPACE });
     expect(report.results[0].allowed).toBe(true); // P1 not tripped by the Publish -ERR
   });
 
   it("cleans up each sub probe with an UNSUB after its barrier", async () => {
     const t = new FakeProbeTransport(() => false);
-    await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN });
-    // P1 sub → unsub, P2 pub (no unsub), P3 foreign sub → unsub.
+    await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN, foreignNamespaceSubject: FOREIGN_NAMESPACE });
+    // P1 sub → unsub, P2 pub, P3 foreign tenant sub, P4 foreign namespace sub.
     const ops = t.calls.map((c) => c.op);
-    expect(ops).toEqual(["sub", "unsub", "pub", "sub", "unsub"]);
+    expect(ops).toEqual(["sub", "unsub", "pub", "sub", "unsub", "sub", "unsub"]);
   });
 
   it("does not leave `error` listeners attached after the probes (no leak)", async () => {
     const t = new FakeProbeTransport(() => false);
-    await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN });
+    await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN, foreignNamespaceSubject: FOREIGN_NAMESPACE });
     expect(t.listenerCount("error")).toBe(0);
   });
 });

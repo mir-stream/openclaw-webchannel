@@ -220,6 +220,13 @@ export type EnrollmentOptions = {
   displayInstructions?: boolean;
 
   /**
+   * Force a fresh device-flow enrollment even when an older enrollment block is
+   * present. Used by static/BYO onboarding to repair legacy credential files
+   * that predate the mandatory attested identity key.
+   */
+  forceEnrollment?: boolean;
+
+  /**
    * @internal Test-only: floor (ms) for the poll interval. Production keeps the
    * RFC 8628 minimum of 5000ms; tests inject a small value to poll without
    * waiting real seconds. Never set this in production.
@@ -265,6 +272,7 @@ export class EnrollmentClient {
       credentialPath:
         options.credentialPath ?? this.defaultCredentialPath(options.accountId, options._home),
       displayInstructions: options.displayInstructions ?? true,
+      forceEnrollment: options.forceEnrollment ?? false,
     };
   }
 
@@ -276,7 +284,7 @@ export class EnrollmentClient {
    */
   async enroll(): Promise<EnrollmentResult> {
     // Try to load existing credentials
-    if (this.loadCredentials()) {
+    if (!this.options.forceEnrollment && this.loadCredentials()) {
       if (this.credentials?.enrollment) {
         console.log("[enrollment] Found existing credentials, skipping enrollment");
         return this.credentials.enrollment;

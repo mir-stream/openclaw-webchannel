@@ -81,17 +81,16 @@ application layer is the primary boundary), but it is a **tolerated, documented
 configuration only** under the permission template above — webchannel provides no
 issuer or tooling for self-minted browser creds.
 
-### Add-time preflight does not probe a static operator's broker
+### Add-time static transport preflight
 
-`channels add` runs a permission probe, but it validates the **enrolled/SaaS**
-transport creds — it dials and probes with the creds the SaaS just delivered. A
-static account returns from acquisition before that probe (there are no creds to
-acquire), so a static operator's **own** broker grants are **not** checked at
-add-time. Validate them instead against the printed permission template and by
-live serving (a mis-scoped agent grant surfaces as the account failing to
-subscribe/serve; a mis-scoped browser grant surfaces as register/echo failing for
-that peer). The static-mode `channels add` output prints the template for exactly
-this reason.
+`channels add` always ensures device-flow enrollment because both transport
+modes require the SaaS-attested agent identity; a valid persisted identity is
+reused, while a legacy credential file without one is freshly enrolled. In
+static mode the enrollment-
+delivered NATS credentials are not selected for runtime transport; the subsequent
+permission probe resolves and consumes the configured static credentials, so it
+dials the operator's own broker. It verifies self-subtree publish/subscribe and
+warns when either cross-tenant or outside-webchannel subscriptions are allowed.
 
 ## Agent identity-key lifecycle
 

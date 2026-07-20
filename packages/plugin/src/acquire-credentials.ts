@@ -50,6 +50,8 @@ export type AcquireCredentialsOptions = {
   log?: AcquireLog;
   /** Override the home dir for path resolution (tests). */
   home?: string;
+  /** Repair a legacy file by running device flow even if enrollment creds exist. */
+  forceEnrollment?: boolean;
   /**
    * @internal Test-only seam: inject an EnrollmentClient factory so tests run
    * the flow without a real SaaS. Defaults to `new EnrollmentClient(...)`.
@@ -97,6 +99,9 @@ export async function acquireCredentials(
     // Non-interactive: the EnrollmentClient already prints the user_code +
     // verification URI to the console. Keep that on so CI/operators see it.
     displayInstructions: true,
+    ...(options.forceEnrollment !== undefined
+      ? { forceEnrollment: options.forceEnrollment }
+      : {}),
     ...(options._minPollIntervalMs !== undefined
       ? { _minPollIntervalMs: options._minPollIntervalMs }
       : {}),

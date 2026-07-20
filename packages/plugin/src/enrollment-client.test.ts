@@ -296,6 +296,49 @@ describe("EnrollmentClient", () => {
       // Should NOT have called SaaS endpoints
       expect(mockFetch).not.toHaveBeenCalled();
     });
+
+    it("forceEnrollment bypasses a legacy enrollment and repairs the identity", async () => {
+      writeFileSync(credentialPath, JSON.stringify({
+        enrollment: {
+          creds: { userJwt: "legacy_jwt", userSeed: "legacy_seed" },
+          peerId: "legacy-peer",
+        },
+      }));
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            device_code: "repair-code",
+            user_code: "REPAIR-1",
+            verification_uri: "https://saas.com/enroll",
+            expires_in: 600,
+            interval: 0,
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            creds: { userJwt: "fresh_jwt", userSeed: "fresh_seed" },
+            peerId: "fresh-peer",
+            jwksUrl: "https://saas.com/.well-known/jwks.json",
+            bootstrapUrl: "https://saas.com/bootstrap",
+          }),
+        });
+
+      const repairingClient = new EnrollmentClient(createTestOptions({
+        credentialPath,
+        forceEnrollment: true,
+      }));
+      const result = await repairingClient.enroll();
+
+      expect(result.peerId).toBe("fresh-peer");
+      expect(mockFetch).toHaveBeenCalledWith(
+        "https://saas.com/api/enroll",
+        expect.objectContaining({ method: "POST" }),
+      );
+      const repaired = JSON.parse(require("node:fs").readFileSync(credentialPath, "utf8"));
+      expect(repaired.identityKey).toBeDefined();
+    });
   });
 
   describe("P1-1 offline re-key", () => {

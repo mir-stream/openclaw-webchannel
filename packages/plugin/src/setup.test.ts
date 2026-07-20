@@ -377,10 +377,15 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(runtime.log).toHaveBeenCalled();
   });
 
-  it("skips acquisition (and logs) when credential mode is not enrolled", async () => {
+  it("forces identity repair for legacy creds and still preflights static transport", async () => {
+    existsMock.mockReturnValue(true);
     const runtime = makeRuntime();
     const cfg = {
-      channels: { webchannel: { accounts: { accta: { nats: { credentials: { mode: "static" } } } } } },
+      channels: { webchannel: { accounts: { accta: {
+        tenant: "t",
+        saas: { baseUrl: "http://s" },
+        nats: { url: "wss://byo", credentials: { mode: "static", userJwt: "J", userSeed: "S" } },
+      } } } },
     } as never;
     await webchannelSetup.afterAccountConfigWritten({
       previousCfg: cfg,
@@ -389,7 +394,33 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
       input: {},
       runtime,
     });
-    expect(acquireMock).not.toHaveBeenCalled();
+    expect(acquireMock).toHaveBeenCalledOnce();
+    expect(preflightMock).toHaveBeenCalledOnce();
+    expect(acquireMock.mock.calls[0][0]).toMatchObject({ forceEnrollment: true });
+  });
+
+  it("acquires the required identity and preflights the BYO relay in static mode", async () => {
+    const runtime = makeRuntime();
+    const cfg = {
+      channels: { webchannel: { accounts: { accta: {
+        tenant: "t",
+        saas: { baseUrl: "http://s" },
+        nats: { url: "wss://byo", credentials: { mode: "static", userJwt: "J", userSeed: "S" } },
+      } } } },
+    } as never;
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "accta",
+      input: { tenant: "t", saasBaseUrl: "http://s" },
+      runtime,
+    });
+    expect(acquireMock).toHaveBeenCalledOnce();
+    expect(acquireMock.mock.calls[0][0]).not.toHaveProperty("forceEnrollment");
+    expect(preflightMock).toHaveBeenCalledOnce();
+    expect(preflightMock.mock.calls[0][0]).toMatchObject({
+      natsConfig: { url: "wss://byo", credentials: { mode: "static", userJwt: "J", userSeed: "S" } },
+    });
     expect(runtime.log.mock.calls.some((c) => String(c[0]).includes("static"))).toBe(true);
   });
 

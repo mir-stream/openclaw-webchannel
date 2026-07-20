@@ -56,6 +56,7 @@ import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   accountCredentialPath,
   canonicalizeAccountId,
+  loadPersistedAgentIdentity,
   readAccountsMap,
   readWebchannelSection,
   resolveWebchannelAccountConfig,
@@ -388,39 +389,55 @@ export const webchannelSetup = {
       input.credentialsMode ??
       "enrolled";
 
-    if (mode !== "enrolled") {
+    if (mode !== "enrolled" && mode !== "static") {
       runtime.log(
         `[webchannel] account "${id}" credential mode is "${mode}"; ` +
           `skipping device-flow acquisition (no creds to acquire).`,
       );
-      // P0-3 D3 output #1: for static (BYO-NATS) mode, surface the subject-grant
-      // template the operator must configure on their own broker — and remind them
-      // that enrollment is still REQUIRED for the attested agent identity (a BYO
-      // relay is a transport choice, not an auth bypass).
-      if (mode === "static") {
-        const staticTenant =
-          resolveSetupIdentity(input).tenant ??
-          (account.tenant as string | undefined) ??
-          "default-tenant";
-        runtime.log(
-          `[webchannel] account "${id}" static (BYO-NATS): enrollment is still REQUIRED for the ` +
-            `attested agent identity, and your NATS broker must grant these subjects:\n` +
-            formatPermissionTemplate(staticTenant),
-        );
-      }
       return;
+    }
+
+    // Static/BYO replaces only the NATS transport. It still needs the same
+    // SaaS-attested identity as enrolled mode, so a first-time `channels add`
+    // MUST run device flow instead of returning before an identity exists. The
+    // enrollment-delivered NATS creds are persisted as recovery material but the
+    // runtime resolver continues to select the operator's static credentials.
+    if (mode === "static") {
+      const staticTenant =
+        resolveSetupIdentity(input).tenant ??
+        (account.tenant as string | undefined) ??
+        "default-tenant";
+      runtime.log(
+        `[webchannel] account "${id}" static (BYO-NATS): acquiring the required ` +
+          `SaaS-attested agent identity; runtime transport remains your static credentials. ` +
+          `Your NATS broker must grant these subjects:\n` +
+          formatPermissionTemplate(staticTenant),
+      );
     }
 
     // Skip only if account-scoped creds already exist. The legacy single-file
     // path is migration/runbook-only and is never read at runtime.
     const existingPath = accountCredentialPath(id);
     const { existsSync } = await import("node:fs");
-    if (existsSync(existingPath)) {
+    if (existsSync(existingPath) && mode === "enrolled") {
       runtime.log(
         `[webchannel] account "${id}" already has credentials at ${existingPath}; ` +
           `skipping acquisition.`,
       );
       return;
+    }
+    const existingIdentity =
+      mode === "static" && existsSync(existingPath)
+        ? loadPersistedAgentIdentity(id)
+        : undefined;
+    if (existsSync(existingPath)) {
+      runtime.log(
+        existingIdentity
+          ? `[webchannel] account "${id}" reusing the attested identity at ${existingPath}; ` +
+              `continuing to preflight the configured static transport.`
+          : `[webchannel] account "${id}" has legacy credentials without a valid attested identity; ` +
+              `running device-flow enrollment to repair them before static transport preflight.`,
+      );
     }
 
     const identity = resolveSetupIdentity(input);
@@ -459,6 +476,9 @@ export const webchannelSetup = {
         saasBaseUrl,
         tenant,
         log: (...args) => runtime.log(...args),
+        ...(mode === "static" && existsSync(existingPath) && !existingIdentity
+          ? { forceEnrollment: true }
+          : {}),
       });
 
       // Gate A (design §4 change 4): the achievable add-time preflight, run

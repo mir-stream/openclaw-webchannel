@@ -345,22 +345,34 @@ export default defineChannelPluginEntry({
     // effective values" constraint). See `deriveAccountAuth` above for the
     // config-present-wins + fail-closed rationale.
     const accountAuthByPlan = new Map<string, AuthConfig | undefined>();
+    const accountPrepassErrors = new Map<string, string>();
     for (const plan of plans) {
-      accountAuthByPlan.set(
-        plan.accountId,
-        deriveAccountAuth(
-          plan.account.auth as AuthConfig | undefined,
-          // Match the consume block's precedence: plan-resolved base URL (config
-          // `saas.baseUrl` over acquisition env) falls back to the flat top-level.
-          plan.saasBaseUrl ?? config.saas?.baseUrl,
+      try {
+        accountAuthByPlan.set(
           plan.accountId,
-          // SaaS-attested issuer, persisted at `channels add` time
-          // (EnrollmentResult.issuer). The IDENTITY accessor (not the enrolled
-          // transport loader) surfaces it, so issuer survives even when enrolled
-          // transport material is absent/corrupt or the source is static.
-          loadPersistedAgentIdentity(plan.accountId)?.issuer,
-        ),
-      );
+          deriveAccountAuth(
+            plan.account.auth as AuthConfig | undefined,
+            // Match the consume block's precedence: plan-resolved base URL (config
+            // `saas.baseUrl` over acquisition env) falls back to the flat top-level.
+            plan.saasBaseUrl ?? config.saas?.baseUrl,
+            plan.accountId,
+            // SaaS-attested issuer, persisted at `channels add` time
+            // (EnrollmentResult.issuer). The IDENTITY accessor (not the enrolled
+            // transport loader) surfaces it, so issuer survives even when enrolled
+            // transport material is absent/corrupt or the source is static.
+            loadPersistedAgentIdentity(plan.accountId)?.issuer,
+          ),
+        );
+      } catch (err) {
+        // Preserve multi-account fault isolation: filesystem trust-boundary
+        // validation may reject a hand-edited account key. Record the fault and
+        // skip only that account below; never let one bad key abort every healthy
+        // account before the serving loop starts.
+        accountPrepassErrors.set(
+          plan.accountId,
+          err instanceof Error ? err.message : String(err),
+        );
+      }
     }
     const sharedAudienceCollisions = detectSharedAudienceCollisions(
       [...accountAuthByPlan].map(([accountId, auth]) => ({ accountId, auth })),
@@ -370,6 +382,14 @@ export default defineChannelPluginEntry({
       const { accountId, tenant, account } = plan;
       // The effective account auth, derived once in the pre-pass above.
       const accountAuth = accountAuthByPlan.get(accountId);
+
+      const prepassError = accountPrepassErrors.get(accountId);
+      if (prepassError) {
+        (api.logger?.error ?? console.error)?.(
+          `[webchannel] account "${accountId}" preflight failed — skipping this account (${prepassError})`,
+        );
+        continue;
+      }
 
       // P0-3 D6-1: fail-closed skip for a shared-audience collision. Decided in
       // the pre-pass BEFORE any transport opens, so no authenticated connection is
