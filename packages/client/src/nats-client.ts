@@ -671,7 +671,7 @@ export class NatsClient {
           console.log("[nats-client] Connected to NATS");
           this.resubscribeAll();
           this.startHeartbeat();
-          this.notifyStateListeners();
+          this.notifyStateListeners(() => this.ws === ws);
           if (this.ws !== ws) return new Uint8Array(0);
         }
         continue;
@@ -688,7 +688,7 @@ export class NatsClient {
         // would re-extract the same header from the same buffer forever — a
         // synchronous infinite loop that freezes the tab. Break and wait for the
         // next ws.onmessage to append the rest.
-        const result = this.handleMessage(line, lineBytes, buffer);
+        const result = this.handleMessage(ws, line, lineBytes, buffer);
         if (!result) return new Uint8Array(0);
         if (this.ws !== ws) return new Uint8Array(0);
         buffer = result.buffer;
@@ -743,7 +743,7 @@ export class NatsClient {
    * fully arrived yet (the header is re-buffered; caller must STOP draining and
    * wait for more socket data — see the break in drainBuffer).
    */
-  private handleMessage(line: string, lineBytes: Uint8Array, buffer: Uint8Array): { buffer: Uint8Array; complete: boolean } | null {
+  private handleMessage(ws: WebSocket, line: string, lineBytes: Uint8Array, buffer: Uint8Array): { buffer: Uint8Array; complete: boolean } | null {
     const parts = line.split(" ");
     if ((parts.length !== 4 && parts.length !== 5) || parts.some((part) => part === "")) {
       this.forceReconnect(); return null;
@@ -767,7 +767,7 @@ export class NatsClient {
 
     // Deliver the raw payload; decryption/parsing happens in WebChannelNatsClient
     // (the envelope must be decrypted before it is meaningful).
-    this.notifyRawListeners(subject, payload);
+    this.notifyRawListeners(subject, payload, () => this.ws === ws);
     return { buffer, complete: true };
   }
 
@@ -915,24 +915,35 @@ export class NatsClient {
     });
   }
 
-  private notifyRawListeners(subject: string, payload: string): void {
-    this.rawListeners.forEach((listener) => {
+  /**
+   * `isCurrent` (drain-loop callers only) is re-checked BEFORE each listener, not
+   * just after the batch: a listener that synchronously retires the dial
+   * (disconnect()/reconnect()) must not have the remaining listeners delivered to
+   * afterwards. Partial fan-out is already the norm here — each listener is
+   * independently try/caught — and an explicit teardown outranks the rest of a
+   * fan-out for a socket that no longer exists.
+   */
+  private notifyRawListeners(subject: string, payload: string, isCurrent?: () => boolean): void {
+    for (const listener of [...this.rawListeners]) {
+      if (isCurrent && !isCurrent()) return;
       try {
         listener(subject, payload);
       } catch (err) {
         console.error("[nats-client] Listener error:", err);
       }
-    });
+    }
   }
 
-  private notifyStateListeners(): void {
-    this.stateListeners.forEach((listener) => {
+  /** See notifyRawListeners for why `isCurrent` is checked before EACH listener. */
+  private notifyStateListeners(isCurrent?: () => boolean): void {
+    for (const listener of [...this.stateListeners]) {
+      if (isCurrent && !isCurrent()) return;
       try {
         listener(this.connected);
       } catch (err) {
         console.error("[nats-client] State listener error:", err);
       }
-    });
+    }
   }
 }
 

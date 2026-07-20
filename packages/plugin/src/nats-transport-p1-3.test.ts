@@ -95,6 +95,24 @@ describe("P1-3 plugin transport invariants", () => {
     expect(errorCase.sockets[0]!.sent).not.toContain("PONG\r\n");
   });
 
+  it("stops the message fan-out when an earlier listener retires the dial", async () => {
+    const { transport: t, sockets } = setup(); const connected = t.connect(); await handshake(sockets[0]!, connected);
+    const seen: string[] = [];
+    t.on("message", (m: NatsMessage) => { seen.push(`L1:${m.payload.toString()}`); t.disconnect(); });
+    t.on("message", (m: NatsMessage) => { seen.push(`L2:${m.payload.toString()}`); });
+    sockets[0]!.frame("MSG s 1 1\r\nA\r\n");
+    expect(seen).toEqual(["L1:A"]);
+  });
+
+  it("stops the error fan-out when an earlier listener retires the dial", async () => {
+    const { transport: t, sockets } = setup(); const connected = t.connect(); await handshake(sockets[0]!, connected);
+    const seen: string[] = [];
+    t.on("error", () => { seen.push("L1"); t.disconnect(); });
+    t.on("error", () => { seen.push("L2"); });
+    sockets[0]!.frame("-ERR 'permissions'\r\n");
+    expect(seen).toEqual(["L1"]);
+  });
+
   it.each(["MSG s 1 -1", "MSG s 1 NaN", "MSG s 1 1junk", "MSG s 1", "MSG s 1 x 1 extra", "MSG  1 1"])(
     "closes on malformed header %s", async (line) => {
       const { transport: t, sockets } = setup(); t.on("error", () => {}); const promise = t.connect(); await handshake(sockets[0]!, promise);

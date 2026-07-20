@@ -56,6 +56,27 @@ describe("P1-3 browser transport invariants", () => {
     expect(ws.sent).not.toContain("PONG\r\n"); expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("stops the raw-listener fan-out when an earlier listener retires the dial", () => {
+    const c = make(); const seen: string[] = [];
+    c.onRawMessage((_s, p) => { seen.push(`L1:${p}`); c.disconnect(); });
+    c.onRawMessage((_s, p) => { seen.push(`L2:${p}`); });
+    c.connect(); const ws = FakeWS.instances[0]!; establish(ws);
+    ws.frame("MSG s 1 1\r\nA\r\n");
+    expect(seen).toEqual(["L1:A"]);
+  });
+
+  // disconnect() re-notifies state listeners itself, so a later listener is always
+  // reached with `false`; without the per-listener currency check the ABORTED outer
+  // fan-out reaches it a SECOND time. Assert the exact call log, not a filtered view
+  // (filtering on `v` hides the duplicate and makes this test vacuous).
+  it("does not double-notify a later state listener when an earlier one retires the dial", () => {
+    vi.useFakeTimers(); const c = make({ heartbeatIntervalMs: 10 }); const l2: boolean[] = [];
+    c.onState((v) => { if (v) c.disconnect(); });
+    c.onState((v) => { l2.push(v); });
+    c.connect(); const ws = FakeWS.instances[0]!; ws.open(); ws.frame("PONG\r\n");
+    expect(l2).toEqual([false]); expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each(["MSG s 1 -1", "MSG s 1 NaN", "MSG s 1 1junk", "MSG s 1", "MSG s 1 x 1 extra", "MSG  1 1"])("force-reconnects malformed %s", (line) => {
     vi.useFakeTimers(); const c = make({ reconnectBaseMs: 100 }); c.connect(); const ws = FakeWS.instances[0]!; establish(ws); ws.frame(`${line}\r\nX\r\n`); expect(ws.closed).toBe(true); c.disconnect();
   });

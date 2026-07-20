@@ -311,10 +311,10 @@ export class NatsTransport extends EventEmitter {
             settle();
             if (this.ws === ws) {
               this._connected = true;
-              this.safeEmit("connect");
+              this.safeEmitFor(ws, "connect");
             }
           } else if (this.ws === ws) {
-            this.safeEmit("pong");
+            this.safeEmitFor(ws, "pong");
           }
         }, () => established, protocolViolation, () => {
           if (connectSent) return false;
@@ -472,7 +472,7 @@ export class NatsTransport extends EventEmitter {
         buffer = buffer.subarray(byteCount + 2);
 
         const msg: NatsMessage = { subject, replyTo, payload };
-        this.safeEmit("message", msg);
+        this.safeEmitFor(ws, "message", msg);
         if (this.ws !== ws) return Buffer.alloc(0);
         continue;
       }
@@ -488,7 +488,7 @@ export class NatsTransport extends EventEmitter {
         } else {
           // Post-handshake NATS error (e.g. Permissions Violation for Publish/
           // Subscription) — emit to registered listeners so callers can react.
-          this.emitError(err);
+          this.emitError(err, ws);
           if (this.ws !== ws) return Buffer.alloc(0);
         }
         continue;
@@ -767,9 +767,12 @@ export class NatsTransport extends EventEmitter {
    * Consumers SHOULD still attach an `"error"` listener (for structured logging
    * and reconnect); this guard only protects against a consumer that forgot to.
    */
-  private emitError(err: Error): void {
+  private emitError(err: Error, ws?: WebSocket): void {
     if (this.listenerCount("error") > 0) {
-      this.emit("error", err);
+      // Dial-aware when called from the drain loop: an error listener that tears
+      // the dial down must not have the remaining error listeners fired for a
+      // socket that is already gone (see safeEmitFor).
+      this.safeEmitFor(ws, "error", err);
     } else {
       // Last-resort backstop — a consumer forgot to attach an "error" listener.
       // Log instead of letting Node rethrow as an uncaught exception.
@@ -791,12 +794,30 @@ export class NatsTransport extends EventEmitter {
    * every listener throw here (log + continue); a bad frame degrades to a warn.
    */
   private safeEmit(event: string, ...args: unknown[]): void {
-    try {
-      this.emit(event, ...args);
-    } catch (err) {
-      console.error(
-        `[NatsTransport] listener for "${event}" threw (frame dropped, read pump continues): ${String(err)}`,
-      );
+    this.safeEmitFor(undefined, event, ...args);
+  }
+
+  /**
+   * As `safeEmit`, but when `ws` is given the dial is re-checked BEFORE each
+   * listener rather than only after the whole fan-out.
+   *
+   * `EventEmitter.emit()` runs every listener before returning, so a listener that
+   * synchronously retires the dial (disconnect()/a replacement connect()) would
+   * still have the REMAINING listeners invoked for a socket that no longer exists
+   * — the drain loop's post-dispatch guard cannot see inside `emit`. Iterating
+   * `rawListeners()` keeps `once` semantics intact (Node's once-wrapper is bound
+   * and removes itself when invoked) while making the fan-out abortable.
+   */
+  private safeEmitFor(ws: WebSocket | undefined, event: string, ...args: unknown[]): void {
+    for (const listener of this.rawListeners(event)) {
+      if (ws !== undefined && this.ws !== ws) return;
+      try {
+        (listener as (...a: unknown[]) => void)(...args);
+      } catch (err) {
+        console.error(
+          `[NatsTransport] listener for "${event}" threw (frame dropped, read pump continues): ${String(err)}`,
+        );
+      }
     }
   }
 }
