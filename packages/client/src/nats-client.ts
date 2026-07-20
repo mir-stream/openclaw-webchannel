@@ -484,7 +484,10 @@ export class NatsClient {
       const timeout = this.options.connectTimeoutMs ?? 10_000;
       if (timeout === 0) return;
       dial.timer = setTimeout(() => {
-        if (this.ws === ws) this.forceReconnect();
+        if (this.ws === ws) {
+          console.warn(`[nats-client] Handshake timeout in phase ${dial.phase}`);
+          this.forceReconnect();
+        }
         else try { ws.close(); } catch { /* stale dial owns its socket */ }
       }, timeout);
     };
@@ -666,9 +669,10 @@ export class NatsClient {
           this.connected = true;
           this.reconnectAttempts = 0;
           console.log("[nats-client] Connected to NATS");
-          this.notifyStateListeners();
           this.resubscribeAll();
           this.startHeartbeat();
+          this.notifyStateListeners();
+          if (this.ws !== ws) return new Uint8Array(0);
         }
         continue;
       }
@@ -686,6 +690,7 @@ export class NatsClient {
         // next ws.onmessage to append the rest.
         const result = this.handleMessage(line, lineBytes, buffer);
         if (!result) return new Uint8Array(0);
+        if (this.ws !== ws) return new Uint8Array(0);
         buffer = result.buffer;
         if (!result.complete) break;
         continue;

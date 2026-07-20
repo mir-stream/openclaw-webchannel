@@ -41,6 +41,21 @@ describe("P1-3 browser transport invariants", () => {
     expect(got).toEqual(["한😀", "A", "B"]); c.disconnect();
   });
 
+  it("abandons a packed frame when a raw listener disconnects the owning dial", () => {
+    const c = make(); const got: string[] = [];
+    c.onRawMessage((_s, payload) => { got.push(payload); if (payload === "A") c.disconnect(); });
+    c.connect(); const ws = FakeWS.instances[0]!; establish(ws);
+    ws.frame("MSG s 1 1\r\nA\r\nMSG s 1 1\r\nB\r\nPING\r\n");
+    expect(got).toEqual(["A"]); expect(ws.sent).not.toContain("PONG\r\n");
+  });
+
+  it("abandons a packed frame when the connected listener disconnects the owning dial", () => {
+    vi.useFakeTimers(); const c = make({ heartbeatIntervalMs: 10 });
+    c.onState((connected) => { if (connected) c.disconnect(); });
+    c.connect(); const ws = FakeWS.instances[0]!; ws.open(); ws.frame("PONG\r\nPING\r\n");
+    expect(ws.sent).not.toContain("PONG\r\n"); expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each(["MSG s 1 -1", "MSG s 1 NaN", "MSG s 1 1junk", "MSG s 1", "MSG s 1 x 1 extra", "MSG  1 1"])("force-reconnects malformed %s", (line) => {
     vi.useFakeTimers(); const c = make({ reconnectBaseMs: 100 }); c.connect(); const ws = FakeWS.instances[0]!; establish(ws); ws.frame(`${line}\r\nX\r\n`); expect(ws.closed).toBe(true); c.disconnect();
   });
@@ -50,6 +65,18 @@ describe("P1-3 browser transport invariants", () => {
     for (const frame of [`MSG s 1 ${MAX_PAYLOAD + 1}\r\n`, "X".repeat(MAX_CONTROL_LINE + 1), new Uint8Array(MAX_BUFFERED_BYTES + 1)]) {
       const c = make({ reconnectBaseMs: 100 }); c.connect(); const ws = FakeWS.instances.at(-1)!; establish(ws); ws.frame(frame); expect(ws.closed).toBe(true); c.disconnect();
     }
+  });
+
+  it("rejects a maximal valid frame plus one byte before parsing it", () => {
+    vi.useFakeTimers(); const c = make({ reconnectBaseMs: 100 }); const got: string[] = [];
+    c.onRawMessage((_s, payload) => got.push(payload)); c.connect(); const ws = FakeWS.instances[0]!; establish(ws);
+    const payload = new Uint8Array(MAX_PAYLOAD).fill(65);
+    const suffix = ` 2 ${MAX_PAYLOAD}`, subject = "s".repeat(MAX_CONTROL_LINE - 4 - suffix.length);
+    const header = new TextEncoder().encode(`MSG ${subject}${suffix}\r\n`);
+    const oversized = new Uint8Array(header.length + payload.length + 3);
+    oversized.set(header); oversized.set(payload, header.length); oversized.set([13, 10, 88], header.length + payload.length);
+    expect(oversized.length).toBe(MAX_BUFFERED_BYTES + 1); ws.frame(oversized);
+    expect(got).toHaveLength(0); expect(ws.closed).toBe(true); c.disconnect();
   });
 
   it("accepts exact control, payload, and maximal-frame boundaries through reinsertion", () => {
@@ -99,6 +126,13 @@ describe("P1-3 browser transport invariants", () => {
   it("times out WS-open silence", async () => {
     vi.useFakeTimers(); const c = make({ connectTimeoutMs: 10, reconnectBaseMs: 100 }); c.connect(); const ws = FakeWS.instances[0]!;
     await vi.advanceTimersByTimeAsync(10); expect(ws.closed).toBe(true); c.disconnect();
+  });
+
+  it("reports the active phase when a connect deadline expires", async () => {
+    vi.useFakeTimers(); const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const c = make({ connectTimeoutMs: 10, reconnectBaseMs: 100 }); c.connect(); const ws = FakeWS.instances[0]!; ws.open();
+    await vi.advanceTimersByTimeAsync(10); expect(warn).toHaveBeenCalledWith(expect.stringContaining("first PONG"));
+    warn.mockRestore(); c.disconnect();
   });
 
   it("times out NKEY INFO silence", async () => {

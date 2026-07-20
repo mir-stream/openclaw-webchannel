@@ -77,6 +77,24 @@ describe("P1-3 plugin transport invariants", () => {
     expect(got).toHaveLength(1); expect(got[0]!.payload).toEqual(payload); t.disconnect();
   });
 
+  it("abandons a packed frame when a message listener disconnects the owning dial", async () => {
+    const { transport: t, sockets } = setup(); const connected = t.connect(); await handshake(sockets[0]!, connected);
+    const got: string[] = []; t.on("message", (m: NatsMessage) => { got.push(m.payload.toString()); if (m.payload.toString() === "A") t.disconnect(); });
+    sockets[0]!.frame("MSG s 1 1\r\nA\r\nMSG s 1 1\r\nB\r\nPING\r\n");
+    expect(got).toEqual(["A"]); expect(sockets[0]!.sent).not.toContain("PONG\r\n");
+  });
+
+  it("abandons a packed frame when connect or error listeners retire the owning dial", async () => {
+    const connectCase = setup(); connectCase.transport.on("connect", () => connectCase.transport.disconnect());
+    const connecting = connectCase.transport.connect(); connectCase.sockets[0]!.open(); connectCase.sockets[0]!.frame("PONG\r\nPING\r\n"); await connecting;
+    expect(connectCase.sockets[0]!.sent).not.toContain("PONG\r\n");
+
+    const errorCase = setup(); const established = errorCase.transport.connect(); await handshake(errorCase.sockets[0]!, established);
+    errorCase.transport.on("error", () => errorCase.transport.disconnect());
+    errorCase.sockets[0]!.frame("-ERR 'permissions'\r\nPING\r\n");
+    expect(errorCase.sockets[0]!.sent).not.toContain("PONG\r\n");
+  });
+
   it.each(["MSG s 1 -1", "MSG s 1 NaN", "MSG s 1 1junk", "MSG s 1", "MSG s 1 x 1 extra", "MSG  1 1"])(
     "closes on malformed header %s", async (line) => {
       const { transport: t, sockets } = setup(); t.on("error", () => {}); const promise = t.connect(); await handshake(sockets[0]!, promise);
@@ -93,6 +111,16 @@ describe("P1-3 plugin transport invariants", () => {
       const { transport: t, sockets } = setup(); t.on("error", () => {}); const promise = t.connect(); await handshake(sockets[0]!, promise);
       sockets[0]!.frame(frame); expect(sockets[0]!.closed).toBe(true);
     }
+  });
+
+  it("rejects a maximal valid frame plus one byte before parsing it", async () => {
+    const { transport: t, sockets } = setup(); const connected = t.connect(); await handshake(sockets[0]!, connected);
+    const got: NatsMessage[] = []; const errors: Error[] = []; t.on("message", (m) => got.push(m)); t.on("error", (e) => errors.push(e));
+    const payload = Buffer.alloc(MAX_PAYLOAD, 65); const suffix = ` 2 ${MAX_PAYLOAD}`;
+    const subject = "s".repeat(MAX_CONTROL_LINE - Buffer.byteLength("MSG ") - Buffer.byteLength(suffix));
+    const oversized = Buffer.concat([Buffer.from(`MSG ${subject}${suffix}\r\n`), payload, Buffer.from("\r\nX")]);
+    expect(oversized.length).toBe(MAX_BUFFERED_BYTES + 1); sockets[0]!.frame(oversized);
+    expect(got).toEqual([]); expect(errors[0]!.message).toMatch(/buffer exceeds/); expect(sockets[0]!.closed).toBe(true);
   });
 
   it("accepts exact control, payload, and maximal-frame boundaries through reinsertion", async () => {

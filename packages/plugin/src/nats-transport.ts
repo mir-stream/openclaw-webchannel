@@ -419,6 +419,7 @@ export class NatsTransport extends EventEmitter {
         // Establishment belongs to this dial, not to the transport-wide state:
         // overlapping connect() calls must each settle on their own first PONG.
         onFirstPong();
+        if (this.ws !== ws) return Buffer.alloc(0);
         continue;
       }
 
@@ -472,6 +473,7 @@ export class NatsTransport extends EventEmitter {
 
         const msg: NatsMessage = { subject, replyTo, payload };
         this.safeEmit("message", msg);
+        if (this.ws !== ws) return Buffer.alloc(0);
         continue;
       }
 
@@ -487,6 +489,7 @@ export class NatsTransport extends EventEmitter {
           // Post-handshake NATS error (e.g. Permissions Violation for Publish/
           // Subscription) — emit to registered listeners so callers can react.
           this.emitError(err);
+          if (this.ws !== ws) return Buffer.alloc(0);
         }
         continue;
       }
