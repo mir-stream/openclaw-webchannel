@@ -345,33 +345,43 @@ export default defineChannelPluginEntry({
     // effective values" constraint). See `deriveAccountAuth` above for the
     // config-present-wins + fail-closed rationale.
     const accountAuthByPlan = new Map<string, AuthConfig | undefined>();
-    const accountPrepassErrors = new Map<string, string>();
+    const accountPrepassErrors = new Map<
+      string,
+      { message: string; auth?: AuthConfig }
+    >();
     for (const plan of plans) {
+      let accountAuth: AuthConfig | undefined;
       try {
-        accountAuthByPlan.set(
+        accountAuth = deriveAccountAuth(
+          plan.account.auth as AuthConfig | undefined,
+          // Match the consume block's precedence: plan-resolved base URL (config
+          // `saas.baseUrl` over acquisition env) falls back to the flat top-level.
+          plan.saasBaseUrl ?? config.saas?.baseUrl,
           plan.accountId,
-          deriveAccountAuth(
-            plan.account.auth as AuthConfig | undefined,
-            // Match the consume block's precedence: plan-resolved base URL (config
-            // `saas.baseUrl` over acquisition env) falls back to the flat top-level.
-            plan.saasBaseUrl ?? config.saas?.baseUrl,
-            plan.accountId,
-            // SaaS-attested issuer, persisted at `channels add` time
-            // (EnrollmentResult.issuer). The IDENTITY accessor (not the enrolled
-            // transport loader) surfaces it, so issuer survives even when enrolled
-            // transport material is absent/corrupt or the source is static.
-            loadPersistedAgentIdentity(plan.accountId)?.issuer,
-          ),
+          // SaaS-attested issuer, persisted at `channels add` time
+          // (EnrollmentResult.issuer). The IDENTITY accessor (not the enrolled
+          // transport loader) surfaces it, so issuer survives even when enrolled
+          // transport material is absent/corrupt or the source is static.
+          loadPersistedAgentIdentity(plan.accountId)?.issuer,
         );
+
+        // Validate the complete register-hop trust configuration BEFORE the
+        // serving loop can consume credentials and open an authenticated NATS
+        // transport. A rejected account must never leave behind a tenant-wide
+        // socket or its auto-reconnect loop merely because its JWT verifier could
+        // not be built. This also initializes the per-auth-object JWKS cache that
+        // startup readiness and live verification share; it performs no fetch.
+        assertJwtAuthConfig(accountAuth);
+        accountAuthByPlan.set(plan.accountId, accountAuth);
       } catch (err) {
         // Preserve multi-account fault isolation: filesystem trust-boundary
         // validation may reject a hand-edited account key. Record the fault and
         // skip only that account below; never let one bad key abort every healthy
         // account before the serving loop starts.
-        accountPrepassErrors.set(
-          plan.accountId,
-          err instanceof Error ? err.message : String(err),
-        );
+        accountPrepassErrors.set(plan.accountId, {
+          message: err instanceof Error ? err.message : String(err),
+          ...(accountAuth !== undefined ? { auth: accountAuth } : {}),
+        });
       }
     }
     const sharedAudienceCollisions = detectSharedAudienceCollisions(
@@ -385,9 +395,22 @@ export default defineChannelPluginEntry({
 
       const prepassError = accountPrepassErrors.get(accountId);
       if (prepassError) {
-        (api.logger?.error ?? console.error)?.(
-          `[webchannel] account "${accountId}" preflight failed — skipping this account (${prepassError})`,
-        );
+        const failedJwt = (
+          prepassError.auth as
+            | { jwt?: { issuer?: string; audience?: string } }
+            | undefined
+        )?.jwt;
+        const buildFail = formatAccountReadiness({
+          accountId,
+          admission: "register-hop",
+          ...(failedJwt?.issuer !== undefined ? { issuer: failedJwt.issuer } : {}),
+          ...(failedJwt?.audience !== undefined ? { audience: failedJwt.audience } : {}),
+          buildError: prepassError.message,
+          ...((plan.account.dmSecurity as string | undefined) !== undefined
+            ? { dmSecurity: plan.account.dmSecurity as string }
+            : {}),
+        });
+        (api.logger?.error ?? console.error)?.(buildFail.line);
         continue;
       }
 
@@ -916,26 +939,8 @@ export default defineChannelPluginEntry({
       const effIssuer = effJwt?.issuer;
       const effAudience = effJwt?.audience;
 
-      try {
-          assertJwtAuthConfig(accountAuth);
-        } catch (err) {
-          // Fail-closed: the verifier could not be built (missing/unresolvable
-          // trust params). Emit a per-gate FAIL readiness line naming the
-          // issuer/aud state — not just the raw thrown message — then skip the
-          // account (never downgrade a broken jwt account to `auto`).
-          const buildFail = formatAccountReadiness({
-            accountId,
-            admission,
-            ...(effIssuer !== undefined ? { issuer: effIssuer } : {}),
-            ...(effAudience !== undefined ? { audience: effAudience } : {}),
-            buildError: (err as Error).message,
-            ...(accountDmSecurity !== undefined ? { dmSecurity: accountDmSecurity } : {}),
-            ...(credentialSourceMode !== undefined ? { credentialSource: credentialSourceMode } : {}),
-            ...(dialedUrl !== undefined ? { dialedUrl } : {}),
-          });
-          (api.logger?.error ?? console.error)?.(buildFail.line);
-          continue;
-      }
+      // The verifier was validated and its shared cache initialized in the
+      // pre-pass, before this account opened its transport.
       // ---- Publish this account's runtime -----------------------------------
       accountRuntimes.set(accountId, {
         accountId,

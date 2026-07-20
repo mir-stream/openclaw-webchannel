@@ -129,6 +129,27 @@ describe("index-nats.ts wiring contract — shared-audience fail-closed pre-pass
     expect(INDEX_NATS_SOURCE).toMatch(/loadPersistedAgentIdentity\(plan\.accountId\)\?\.issuer/);
     expect(INDEX_NATS_SOURCE).not.toContain("loadPersistedEnrolledCreds");
   });
+
+  it("validates JWT auth before the serving loop can open a NATS transport", () => {
+    const validationAt = INDEX_NATS_SOURCE.indexOf("assertJwtAuthConfig(accountAuth);");
+    const servingLoopAt = INDEX_NATS_SOURCE.indexOf("for (const plan of plans) {", validationAt);
+    const consumeAt = INDEX_NATS_SOURCE.indexOf("consumeCredentialSource(source, accountId)");
+
+    expect(validationAt).toBeGreaterThan(-1);
+    expect(servingLoopAt).toBeGreaterThan(validationAt);
+    expect(consumeAt).toBeGreaterThan(servingLoopAt);
+    // Keep a single validation site: reintroducing a post-connect assertion can
+    // recreate the rejected-transport leak this ordering contract prevents.
+    expect(INDEX_NATS_SOURCE.match(/assertJwtAuthConfig\(accountAuth\);/g)).toHaveLength(1);
+  });
+
+  it("preserves structured Gate B diagnostics for pre-pass auth failures", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /const\s+prepassError\s*=\s*accountPrepassErrors\.get\(accountId\);[\s\S]*?formatAccountReadiness\(\{[\s\S]*?buildError:\s*prepassError\.message/,
+    );
+    expect(INDEX_NATS_SOURCE).toMatch(/issuer:\s*failedJwt\.issuer/);
+    expect(INDEX_NATS_SOURCE).toMatch(/audience:\s*failedJwt\.audience/);
+  });
 });
 
 describe("index-nats.ts wiring contract — static identity-missing skip + readiness source (P0-3 D1/S2)", () => {
