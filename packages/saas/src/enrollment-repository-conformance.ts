@@ -1,4 +1,4 @@
-import { CommitPayloadMismatchError, type EnrollmentRepository } from "./enrollment-repository.js";
+import type { EnrollmentRepository } from "./enrollment-repository.js";
 
 type Method = keyof EnrollmentRepository;
 export type InterposeHooks = Partial<Record<Method, { before?: () => void | Promise<void>; after?: (result: unknown) => void | Promise<void> }>>;
@@ -62,6 +62,10 @@ function requireClock(instance: Instance, caseName: string): Clock {
   return instance.clock;
 }
 const baseAt = (now: number, suffix: string) => ({ device_code: `device-${suffix}`, user_code: `CODE-${suffix}`, agentPublicKey: "A".repeat(43), accountId: `account-${suffix}`, tenant: "tenant", createdAt: now, expiresAt: now + 10_000, status: "pending" as const });
+// Real-clock cases must tolerate adapter/network latency. Nothing waits for
+// these deadlines, so generous margins make the fixtures portable at no cost.
+const CORE_TTL_MS = 60_000;
+const CORE_LEASE_MS = 60_000;
 const commit = { agentPublicKey: "A".repeat(43), peerId: "peer", expect: null, creds: { userJwt: "jwt", userSeed: "seed", userPubkey: "pub" } };
 const same = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
 const status = async (repo: EnrollmentRepository, deviceCode: string, expected: string): Promise<void> =>
@@ -79,8 +83,13 @@ function transitionedEnrollment(before: Awaited<ReturnType<typeof projection>>["
 }
 async function expectMismatch(action: () => Promise<unknown>, message: string): Promise<void> {
   try { await action(); throw new Error(message); }
-  catch (error) { invariant(error instanceof CommitPayloadMismatchError, message); }
+  catch (error) { invariant(error instanceof Error && error.name === "CommitPayloadMismatchError", message); }
 }
+const fixtureNow = async (instance: Instance): Promise<number> => instance.clock?.now() ?? instance.repo.now();
+const coreBaseAt = async (instance: Instance, suffix: string) => {
+  const now = await fixtureNow(instance);
+  return { ...baseAt(now, suffix), expiresAt: now + CORE_TTL_MS };
+};
 
 /**
  * Individually named cases are public so an adapter can expose them through its
@@ -89,16 +98,31 @@ async function expectMismatch(action: () => Promise<unknown>, message: string): 
  */
 export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepositoryConformanceCase[] = [
   { name: "1: concurrent claims are exclusive", suite: "core", async run(instance) {
-    const now = 10_000;
-    const base = { device_code: "device-a", user_code: "ABCD-WXYZ", agentPublicKey: "A".repeat(43), accountId: "account", tenant: "tenant", createdAt: now, expiresAt: now + 10_000, status: "pending" as const };
+    const now = await fixtureNow(instance);
+    const base = { device_code: "device-a", user_code: "ABCD-WXYZ", agentPublicKey: "A".repeat(43), accountId: "account", tenant: "tenant", createdAt: now, expiresAt: now + CORE_TTL_MS, status: "pending" as const };
     await instance.repo.createEnrollment(base);
-    const [a, b] = await Promise.all([instance.repo.claimApproval(base.user_code, "op-a", 1_000), instance.repo.claimApproval(base.user_code, "op-b", 1_000)]);
+    const [a, b] = await Promise.all([instance.repo.claimApproval(base.user_code, "op-a", CORE_LEASE_MS), instance.repo.claimApproval(base.user_code, "op-b", CORE_LEASE_MS)]);
     invariant([a, b].filter((x) => x.kind === "claimed").length === 1 && [a, b].filter((x) => x.kind === "in_progress").length === 1, "claim exclusivity violated");
     const opId = a.kind === "claimed" ? "op-a" : "op-b";
     const committed = await instance.repo.commitApproval(opId, commit);
     invariant(committed.kind === "committed" && !committed.idempotent, "initial commit failed");
     const history = await instance.repo.listHistory(base.tenant, base.accountId);
     invariant(history.some((entry) => entry.activationId === committed.record.activationId), "approved commit absent from append-only history");
+    invariant(same(await instance.repo.getEnrollmentByUserCode(base.user_code), await instance.repo.getEnrollment(base.device_code)), "user_code lookup disagrees with device_code lookup");
+    invariant(await instance.repo.getEnrollmentByUserCode("UNKNOWN-CODE") === null, "unknown user_code lookup did not return null");
+    invariant(same(await instance.repo.claimApproval("UNKNOWN-CODE", "unknown-op", CORE_LEASE_MS), { kind: "not_found" }), "unknown user_code claim did not return not_found");
+
+    const releasable = await coreBaseAt(instance, "release"); await instance.repo.createEnrollment(releasable);
+    invariant((await instance.repo.claimApproval(releasable.user_code, "release-owner", CORE_LEASE_MS)).kind === "claimed", "release fixture was not claimed");
+    invariant(await instance.repo.releaseClaim("release-owner"), "live claim was not released");
+    const released = await instance.repo.getEnrollment(releasable.device_code);
+    invariant(released?.status === "pending" && released.claim === undefined, "released claim did not return to pending without a claim");
+    invariant((await instance.repo.claimApproval(releasable.user_code, "release-reclaimer", CORE_LEASE_MS)).kind === "claimed", "released enrollment was not immediately reclaimable");
+    const beforeStaleRelease = await instance.repo.getEnrollment(releasable.device_code);
+    invariant(!(await instance.repo.releaseClaim("release-owner")) && same(await instance.repo.getEnrollment(releasable.device_code), beforeStaleRelease), "stale release mutated the replacement claim");
+
+    const denied = await coreBaseAt(instance, "claim-denied"); await instance.repo.createEnrollment(denied); await instance.repo.tryDeny(denied.user_code);
+    invariant(same(await instance.repo.claimApproval(denied.user_code, "denied-op", CORE_LEASE_MS), { kind: "denied" }), "denied user_code claim did not return denied");
   } },
   { name: "2: lease fencing, boundaries, decision table, and both race orders", suite: "clock", async run(instance) {
     const repo = instance.repo; const clock = requireClock(instance, "case 2"); const now = clock.now();
@@ -119,8 +143,10 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
     await repo.claimApproval(reclaimable.user_code, "r1", 5); await clock.advance(6);
     invariant((await repo.claimApproval(reclaimable.user_code, "r2", 5)).kind === "claimed", "valid elapsed lease did not reclaim");
 
-    // The barrier pins which atomic call reaches the repository first. In both
-    // serializations exactly one writer wins and a stale call is mutation-free.
+    // Coverage limitation: the controlled clock cannot make reclaim and commit
+    // simultaneously legal (commit owns equality; reclaim owns strictly after).
+    // Pin both serializations deterministically instead of claiming overlap or
+    // accepting the mutation-free in_progress outcome excluded by this case.
     for (const commitFirst of [true, false]) {
       const item = { ...baseAt(clock.now(), `race-${commitFirst}`), accountId: `race-${commitFirst}` }; await repo.createEnrollment(item);
       await repo.claimApproval(item.user_code, `owner-${commitFirst}`, 5); await clock.advance(commitFirst ? 5 : 6);
@@ -133,7 +159,7 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
       const winner = commitFirst
         ? repo.commitApproval(`owner-${commitFirst}`, commit)
         : repo.claimApproval(item.user_code, `reclaimer-${commitFirst}`, 10);
-      gate.resume(); const [delayed, firstResult] = await Promise.all([paused, winner]);
+      const firstResult = await winner; gate.resume(); const delayed = await paused;
       if (commitFirst) {
         invariant(firstResult.kind === "committed" && delayed.kind === "already_approved", "commit-first serialization did not preserve its exact winner");
         // The RETURNED outcome must itself carry the recovery payload the plan
@@ -154,13 +180,13 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
     }
   } },
   { name: "3: immutable idempotency, supersede/revoke recovery, payload and opId binding", suite: "core", async run(instance) {
-    const now = 10_000; const base = baseAt(now, "idempotent");
-    await instance.repo.createEnrollment(base); await instance.repo.claimApproval(base.user_code, "op", 1_000);
+    const base = await coreBaseAt(instance, "idempotent");
+    await instance.repo.createEnrollment(base); await instance.repo.claimApproval(base.user_code, "op", CORE_LEASE_MS);
     const committed = await instance.repo.commitApproval("op", commit); invariant(committed.kind === "committed", "initial commit failed");
     const retry = await instance.repo.commitApproval("op", commit);
     invariant(retry.kind === "committed" && retry.idempotent && same(retry.record, committed.record), "exact idempotent recovery violated");
-    const replacement = { ...baseAt(now, "replacement"), accountId: base.accountId, agentPublicKey: "B".repeat(43) };
-    await instance.repo.createEnrollment(replacement); await instance.repo.claimApproval(replacement.user_code, "replacement", 1_000);
+    const replacement = { ...await coreBaseAt(instance, "replacement"), accountId: base.accountId, agentPublicKey: "B".repeat(43) };
+    await instance.repo.createEnrollment(replacement); await instance.repo.claimApproval(replacement.user_code, "replacement", CORE_LEASE_MS);
     const replaced = await instance.repo.commitApproval("replacement", { ...commit, agentPublicKey: replacement.agentPublicKey, expect: committed.kind === "committed" ? committed.record.activationId : null, creds: { userJwt: "jwt-2", userSeed: "seed-2", userPubkey: "pub-2" }, peerId: "peer-2" });
     invariant(replaced.kind === "committed", "supersede fixture failed");
     const afterSupersede = await instance.repo.commitApproval("op", commit);
@@ -171,12 +197,12 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
     for (const changed of [{ ...commit, agentPublicKey: "B".repeat(43) }, { ...commit, peerId: "changed" }, { ...commit, creds: { ...commit.creds, userJwt: "changed" } }, { ...commit, expect: "changed" }]) try {
       await instance.repo.commitApproval("op", changed); throw new Error("payload mutation accepted");
     }
-    catch (error) { if (!(error instanceof CommitPayloadMismatchError)) throw error; }
+    catch (error) { if (!(error instanceof Error && error.name === "CommitPayloadMismatchError")) throw error; }
     const observed = await instance.repo.tryExpire(base.device_code);
     invariant(observed.enrollment?.status === "approved", "approved enrollment was expired");
     invariant(observed.enrollment?.peerId === commit.peerId && same(observed.enrollment?.natsCreds, commit.creds), "persisted exact credentials/peerId differ");
     invariant((await instance.repo.commitApproval("other-op", commit)).kind === "claim_lost", "other opId recovered commit");
-    const other = { ...baseAt(now, "op-reuse"), accountId: "op-reuse" }; await instance.repo.createEnrollment(other);
+    const other = { ...await coreBaseAt(instance, "op-reuse"), accountId: "op-reuse" }; await instance.repo.createEnrollment(other);
     await expectMismatch(() => instance.repo.claimApproval(other.user_code, "op", 10), "opId reuse was silently accepted");
   } },
   { name: "4: commit success and every failure are atomic", suite: "clock", async run(instance) {
@@ -205,11 +231,12 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
     const fencedBefore = await projection(repo, fenced); invariant((await repo.commitApproval("old-fenced", commit)).kind === "claim_lost", "fenced owner did not lose claim");
     invariant(same(await projection(repo, fenced), fencedBefore), "claim_lost mutated a real claimed record or registry/history");
   } },
-  { name: "5: commit registry precedence is tombstone then same-key then CAS", suite: "core", async run({ repo }) {
+  { name: "5: commit registry precedence is tombstone then same-key then CAS", suite: "core", async run(instance) {
+    const { repo } = instance;
     const active = await repo.register("tenant", "same", "A".repeat(43), null); invariant(active.ok, "active seed failed");
-    const item = { ...baseAt(10_000, "same"), accountId: "same" }; await repo.createEnrollment(item); await repo.claimApproval(item.user_code, "same", 20);
+    const item = { ...await coreBaseAt(instance, "same"), accountId: "same" }; await repo.createEnrollment(item); await repo.claimApproval(item.user_code, "same", CORE_LEASE_MS);
     const result = await repo.commitApproval("same", { ...commit, expect: "stale" }); invariant(result.kind === "committed" && active.ok && result.record.activationId === active.record.activationId, "same-key idempotency lost to CAS");
-    await repo.revokeActive("tenant", "same"); const tomb = { ...baseAt(10_000, "tomb"), accountId: "same" }; await repo.createEnrollment(tomb); await repo.claimApproval(tomb.user_code, "tomb", 20);
+    await repo.revokeActive("tenant", "same"); const tomb = { ...await coreBaseAt(instance, "tomb"), accountId: "same" }; await repo.createEnrollment(tomb); await repo.claimApproval(tomb.user_code, "tomb", CORE_LEASE_MS);
     invariant((await repo.commitApproval("tomb", commit)).kind === "revoked", "tombstone did not take priority");
   } },
   { name: "6: deny matrix and deny/commit both orders", suite: "clock", async run(instance) {
@@ -246,9 +273,9 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
     const approved = { ...baseAt(clock.now(), "expire-approved"), accountId: "expire-approved" }; await repo.createEnrollment(approved); await repo.claimApproval(approved.user_code, "approved", 10); await repo.commitApproval("approved", commit); await clock.advance(100_000);
     const observed = await repo.tryExpire(approved.device_code); invariant(!observed.transitioned && observed.enrollment?.status === "approved" && same(observed.enrollment.natsCreds, commit.creds), "approved was expired or credentials lost");
   } },
-  { name: "8: create is insert-only with portable named collision errors", suite: "core", async run({ repo }) {
-    const first = baseAt(10_000, "collision"); await repo.createEnrollment(first);
-    for (const [candidate, errorName] of [[{ ...baseAt(10_000, "other"), user_code: first.user_code }, "UserCodeCollisionError"], [{ ...first, user_code: "OTHER-CODE" }, "DeviceCodeCollisionError"]] as const) {
+  { name: "8: create is insert-only with portable named collision errors", suite: "core", async run(instance) {
+    const { repo } = instance; const first = await coreBaseAt(instance, "collision"); await repo.createEnrollment(first);
+    for (const [candidate, errorName] of [[{ ...await coreBaseAt(instance, "other"), user_code: first.user_code }, "UserCodeCollisionError"], [{ ...first, user_code: "OTHER-CODE" }, "DeviceCodeCollisionError"]] as const) {
       try { await repo.createEnrollment(candidate); throw new Error(`${errorName} missing`); } catch (error) { invariant(error instanceof Error && error.name === errorName, `${errorName} not portable by name`); }
     }
     invariant((await repo.getEnrollment(first.device_code))?.user_code === first.user_code, "collision overwrote original");
@@ -266,6 +293,9 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
       if (state === "denied") await repo.tryDeny(item.user_code); if (state === "expired") { await clock.advance(6); await repo.tryExpire(item.device_code); }
       const target = item.expiresAt + 50; await clock.advance(target - clock.now()); invariant(await repo.sweep() === 0, `${state} evicted at equality`); await clock.advance(1); invariant(await repo.sweep() >= 1, `${state} retained too long`);
     }
+    const legacyApproved = { ...baseAt(clock.now(), "retain-legacy-approved"), expiresAt: clock.now() + 5, status: "approved" as const, natsCreds: commit.creds, peerId: commit.peerId };
+    await repo.createEnrollment(legacyApproved); await clock.advance(56);
+    invariant(await repo.sweep() >= 1 && await repo.getEnrollment(legacyApproved.device_code) === null, "approved row without approvedAt was retained forever");
     const live = { ...baseAt(clock.now(), "sweep-live"), expiresAt: clock.now() + 1 }; await repo.createEnrollment(live); await repo.claimApproval(live.user_code, "sweep-live", 100); await clock.advance(52); invariant(await repo.sweep() === 0, "sweep removed live lease");
     // The retention boundary is expiresAt+retentionMs. A lease live through
     // that boundary protects the approving row, so either serialization must
@@ -289,15 +319,18 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
       }
     }
   } },
-  { name: "10: reconciliation precedence and register races never resurrect", suite: "core", async run({ repo }) {
+  { name: "10: reconciliation precedence and register races never resurrect", suite: "core", async run(instance) {
+    const { repo } = instance; const now = await fixtureNow(instance);
     invariant(same(await repo.reconcileApprovedRegistration("missing"), { kind: "noop", reason: "not_found" }), "not_found precedence wrong");
-    const pending = baseAt(10_000, "reconcile-pending"); await repo.createEnrollment(pending); invariant((await repo.reconcileApprovedRegistration(pending.device_code)).kind === "noop", "non-approved reconciled");
-    const legacy = { ...baseAt(10_000, "reconcile-legacy"), status: "approved" as const, natsCreds: commit.creds, peerId: commit.peerId, approvedAt: 10_000 }; await repo.createEnrollment(legacy);
+    const pending = await coreBaseAt(instance, "reconcile-pending"); await repo.createEnrollment(pending); invariant((await repo.reconcileApprovedRegistration(pending.device_code)).kind === "noop", "non-approved reconciled");
+    const torn = { ...await coreBaseAt(instance, "reconcile-torn"), status: "approved" as const, natsCreds: commit.creds, peerId: commit.peerId, approvedAt: now, committedBy: "torn-op", committedRecord: { tenant: "tenant", accountId: "account-reconcile-torn", publicKey: "A".repeat(43), keyId: "torn-key", activationId: "torn-activation", status: "active" as const, enrolledAt: now } }; await repo.createEnrollment(torn);
+    invariant(same(await repo.reconcileApprovedRegistration(torn.device_code), { kind: "noop", reason: "commit_snapshot_present" }) && await repo.getActive(torn.tenant, torn.accountId) === null, "commit snapshot was re-registered as legacy");
+    const legacy = { ...await coreBaseAt(instance, "reconcile-legacy"), status: "approved" as const, natsCreds: commit.creds, peerId: commit.peerId, approvedAt: now }; await repo.createEnrollment(legacy);
     invariant((await repo.reconcileApprovedRegistration(legacy.device_code)).kind === "registered", "empty legacy slot not reconciled");
     invariant(same(await repo.reconcileApprovedRegistration(legacy.device_code), { kind: "noop", reason: "active_present" }), "combined active/history precedence wrong");
     await repo.revokeActive(legacy.tenant, legacy.accountId); invariant(same(await repo.reconcileApprovedRegistration(legacy.device_code), { kind: "noop", reason: "history_present" }), "tombstone resurrected");
     for (const reconcileFirst of [true, false]) {
-      const accountId = `reconcile-race-${reconcileFirst}`; const item = { ...baseAt(10_000, accountId), accountId, status: "approved" as const, natsCreds: commit.creds, peerId: commit.peerId, approvedAt: 10_000 }; await repo.createEnrollment(item);
+      const accountId = `reconcile-race-${reconcileFirst}`; const item = { ...await coreBaseAt(instance, accountId), accountId, status: "approved" as const, natsCreds: commit.creds, peerId: commit.peerId, approvedAt: now }; await repo.createEnrollment(item);
       const gate = barrier(); const delayedRepo = interpose(repo, reconcileFirst ? { register: { before: gate.wait } } : { reconcileApprovedRegistration: { before: gate.wait } });
       const delayed = reconcileFirst ? delayedRepo.register(item.tenant, accountId, "B".repeat(43), null) : delayedRepo.reconcileApprovedRegistration(item.device_code); await Promise.resolve();
       const first = reconcileFirst ? await repo.reconcileApprovedRegistration(item.device_code) : await repo.register(item.tenant, accountId, "B".repeat(43), null); gate.resume(); const loser = await delayed;
@@ -316,8 +349,8 @@ export const enrollmentRepositoryConformanceCases: readonly EnrollmentRepository
     }
   } },
   { name: "3/fault: committed response loss is recovered exactly", suite: "fault", async run(instance) {
-    const now = 10_000; const base = baseAt(now, "fault"); const repo = interpose(instance.repo);
-    await repo.createEnrollment(base); await repo.claimApproval(base.user_code, "op", 1_000); repo.throwAfterCommit({ times: 1 });
+    const base = await coreBaseAt(instance, "fault"); const repo = interpose(instance.repo);
+    await repo.createEnrollment(base); await repo.claimApproval(base.user_code, "op", CORE_LEASE_MS); repo.throwAfterCommit({ times: 1 });
     try { await repo.commitApproval("op", commit); throw new Error("failpoint did not fire"); } catch (error) { invariant(error instanceof Error && error.message.includes("committed response lost"), "wrong failpoint error"); }
     const recovered = await repo.commitApproval("op", commit); invariant(recovered.kind === "committed" && recovered.idempotent, "ambiguous commit was not recovered");
   } },

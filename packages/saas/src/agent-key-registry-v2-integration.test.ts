@@ -117,14 +117,19 @@ describe("P1-2 atomic enrollment integration", () => {
   });
 
   it("16: already-approved recovery exercises all reconciliation outcomes without creating a claim", async () => {
-    for (const expected of ["registered", "active_present", "history_present", "not_found"] as const) {
+    for (const expected of ["commit_snapshot_present", "active_present", "history_present", "not_found"] as const) {
       const raw = new MemoryEnrollmentRepository({ autoSweep: false }); const fixture = service(raw);
       const started = await pending(fixture, KEY_A, `reconcile-${expected}`); const first = approved(await fixture.approve(started.user_code));
       if (expected !== "active_present") await raw.revokeActive("tenant", `reconcile-${expected}`);
-      if (expected === "registered") {
-        // A legacy approved snapshot may have lost both registry writes. The
-        // memory fixture clears only registry state while retaining enrollment.
+      if (expected === "commit_snapshot_present") {
+        // A modern approved snapshot may have lost history externally, but its
+        // authoritative committedRecord must not be replaced by reconciliation.
         (raw as any).histories.clear();
+      } else if (expected === "history_present") {
+        // Model a pre-snapshot legacy row so its revoked history remains the
+        // applicable resurrection guard.
+        const stored = (raw as any).enrollments.get(started.device_code);
+        delete stored.committedBy; delete stored.committedRecord; delete stored.commitDigest;
       } else if (expected === "not_found") {
         // The claim returned an approved snapshot, but eviction won before the
         // reconciliation RMW. This is an allowed recovery outcome.

@@ -14,6 +14,11 @@ no browser-facing connection or token route.
 The subject namespace fixes tenant, account, and peer routing. Authentication
 failure never downgrades to open admission.
 
+The enrollment repository conformance factory's controlled `clock` capability
+is optional, but an adapter that omits it certifies strictly less: assert that
+the conformance report's `skipped` list is empty to prove full clock-dependent
+lease, expiry, retention, and race coverage.
+
 ## Configuration
 
 Register-hop admission uses `channels.webchannel.auth.strategy: "jwt"` and:
@@ -36,11 +41,11 @@ See [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) for the complete trust 
 
 An account is the isolation axis and represents one logical agent. Agent HA replicas must share the same identity key; independently keyed replicas are unsupported and surface as replacement conflicts. Enrollment wire formats do not contain an `agentId`.
 
-Approval correctness is independent of issuer replica count when every replica uses one conforming `EnrollmentRepository`. The repository owns the clock and atomically serializes enrollment transitions, key activation, and history. Issuers stamp `createdAt`/`expiresAt`, but never use their clock to decide expiry or lease validity. Approval claims use a 30-second default lease as a fence; a crash is recovered by lease expiry and re-claim, while a late old commit is rejected.
+Approval correctness is independent of issuer replica count when every replica uses one conforming `EnrollmentRepository`. The repository owns the clock and atomically serializes enrollment transitions, key activation, and history. Issuers obtain `createdAt`/`expiresAt` from the repository clock and never use their own clock for expiry or lease validity. Approval claims use a 30-second default lease as a fence; a crash is recovered by lease expiry and re-claim, while a late old commit is rejected.
 
-Durable adapters must pass the exported core and fault conformance suites against the real shared backend; controlled-clock conformance is recommended. The conformance factory's clock capability is optional: the convenience runner visibly reports each clock-case skip and returns those names, while direct execution of a clock case without the capability fails loudly. A skipped clock suite is not certification of lease, expiry, retention-boundary, or time-dependent race behavior.
+Durable adapters must pass the exported core and fault conformance suites against the real shared backend; controlled-clock conformance is recommended. The fault suite certifies idempotent recovery after a fully successful commit whose response is lost; it does not inject partial writes or prove transactional atomicity. The conformance factory's clock capability is optional: the convenience runner visibly reports each clock-case skip and returns those names, while direct execution of a clock case without the capability fails loudly. A skipped clock suite is not certification of lease, expiry, retention-boundary, or time-dependent race behavior.
 
-An ambiguous commit is retried once with the same operation id and byte-for-byte payload. A committed result is recoverable through its immutable snapshot while `now <= approvedAt + retentionMs`; after eviction recovery requires re-enrollment. Retention should be at least twice the poll interval plus expected clock skew. Denying an approving record immediately invalidates its claim. Credentials minted before that denial are unreachable orphans, not cryptographically revoked. `expires_in` remains the client approval-and-pickup deadline; retention supplies boundary grace, not a longer advertised polling window.
+An ambiguous commit is retried once with the same operation id and byte-for-byte payload. A committed result is recoverable through its immutable snapshot while `now <= approvedAt + retentionMs`; after eviction recovery requires re-enrollment. Retention should be at least twice the poll interval plus expected clock skew. In multi-replica or cross-instance operation, denying an approving record immediately invalidates its claim. Within one `DeviceFlowEnrollment` instance, deny queues behind the in-flight approve and may therefore observe the terminal approval. Credentials minted before a cross-instance denial are unreachable orphans, not cryptographically revoked. `expires_in` remains the client approval-and-pickup deadline; retention supplies boundary grace, not a longer advertised polling window.
 
 Revocation permanently tombstones the active identity key and only stops that slot's key from being served to future bootstrap requests. It does not disconnect browsers that already pinned the key and does not revoke the agent's existing NATS credentials.
 

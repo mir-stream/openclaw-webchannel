@@ -110,11 +110,13 @@ plugin                              SaaS                         operator
 
 State: `pending → approving → approved`, with `pending|approving → denied`
 and eligible non-terminal records → `expired`. Approval claims carry leases;
-the repository clock is authoritative for leases, expiry, and retention. The
+the repository clock is authoritative for issuance timestamps, leases, expiry, and retention. The
 process-local approval lock is advisory only: adapters must atomically fence
-claims and commit the enrollment, active key, and history together. Denying an
-`approving` record invalidates its claim, so a late commit cannot reverse the
-operator decision. Approved records are not expired by polling and remain
+claims and commit the enrollment, active key, and history together. In
+multi-replica or cross-instance operation, denying an `approving` record
+invalidates its claim, so a late commit cannot reverse the operator decision.
+Within one `DeviceFlowEnrollment` instance, the process-local lock queues deny
+behind an in-flight approve. Approved records are not expired by polling and remain
 available through `approvedAt + retentionMs` (equality retained) for boundary
 poll grace and idempotent commit recovery.
 
@@ -251,7 +253,9 @@ see [`../../docs/STATUS.md`](../../docs/STATUS.md).
 Production deployments implement the exported `EnrollmentRepository` and run
 `runEnrollmentRepositoryConformance` against independent clients connected to
 the real shared backend. The core and fault suites are mandatory for every
-adapter; the controlled-clock suite is recommended. `commitApproval` must place the enrollment row, active
+adapter; the controlled-clock suite is recommended. The fault suite certifies
+idempotent recovery after a successful commit response is lost; it does not
+inject partial writes or prove transactional atomicity. `commitApproval` must place the enrollment row, active
 key slot, and append-only history in one transaction; claim, deny, expiry,
 reconciliation, register, and revoke are atomic read/modify/write operations.
 
@@ -265,7 +269,8 @@ share a slot. Configure retention explicitly and retain records while
 largest expected clock skew. The bundled memory implementation demonstrates
 single-process semantics only and is not evidence of multi-process durability.
 
-The factory's `clock` capability is optional. When it is absent, the convenience
+The factory's `clock` capability is optional, but omitting it certifies strictly
+less behavior. When it is absent, the convenience
 runner executes core and fault cases and emits an explicit `SKIP` message for
 every clock case; its returned report also lists every skipped case. Calling an
 exported clock case directly without that capability fails with a named
@@ -273,13 +278,16 @@ exported clock case directly without that capability fails with a named
 certify lease, expiry, retention-boundary, and time-dependent race behavior.
 
 ```ts
+let now = Date.now();
 const report = await runEnrollmentRepositoryConformance({
   create: async ({ retentionMs, autoSweep }) => ({
-    repo: await openRepository({ retentionMs, autoSweep }),
+    repo: await openRepository({ retentionMs, autoSweep, clock: () => now }),
     close: async () => closeRepository(),
+    clock: { now: () => now, advance: async (ms) => { now += ms; } },
   }),
 });
-// report.skipped is non-empty when controlled-clock cases were not certified.
+// Assert this to prove the adapter received full controlled-clock coverage.
+expect(report.skipped).toEqual([]);
 ```
 
 This Phase-B build uses a simplified (non-production) NKEY signature path while

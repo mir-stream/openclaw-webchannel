@@ -162,7 +162,7 @@ export type EnrollmentRecord = {
   /** The lease is itself the fencing token; present only while approving. */
   claim?: { opId: string; leaseUntil: number };
 
-  /** Repository-clock timestamp and idempotency metadata for an approved commit. */
+  /** Repository-clock timestamp and idempotency metadata for an approved commit. Legacy approved rows may omit approvedAt and age from expiresAt. */
   approvedAt?: number;
   committedBy?: string;
   commitDigest?: string;

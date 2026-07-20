@@ -327,7 +327,7 @@ export class DeviceFlowEnrollment {
     // "stays absent" in the store record rather than persisting an empty slot.
     const pluginVersion = sanitizePluginVersion(request.pluginVersion);
     const protocolVersion = sanitizeProtocolVersion(request.protocolVersion);
-    const now = Date.now();
+    const now = await this.repository.now();
     const expiresAt = now + this.options.expirationSeconds * 1000;
 
     // Bounded collision-retry: a persistent store with UNIQUE(user_code) can
@@ -438,7 +438,8 @@ export class DeviceFlowEnrollment {
    * The process-local per-userCode lock only avoids duplicate work; correctness
    * comes from repository-clock lease fencing and the atomic commit. Approved
    * results remain recoverable after expiresAt for the configured retention
-   * horizon. An operator may deny an approving record, invalidating its claim.
+   * horizon. A different issuer instance may deny an approving record and
+   * invalidate its claim; this instance's process-local lock queues deny calls.
    *
    * Transition rules: pending→approving→approved, with approved idempotently
    * returning the persisted result; denied and expired remain terminal.
@@ -501,7 +502,10 @@ export class DeviceFlowEnrollment {
     if (claim.kind === "already_approved") {
       const enrollment = claim.enrollment;
       const reconciled = await this.repository.reconcileApprovedRegistration(enrollment.device_code);
-      if (reconciled.kind === "noop" && reconciled.reason !== "active_present")
+      const active = await this.repository.getActive(enrollment.tenant, enrollment.accountId);
+      if (reconciled.kind === "noop" && reconciled.reason === "active_present" && active?.publicKey !== enrollment.agentPublicKey)
+        console.warn("approved enrollment registry active key differs from enrollment", active?.activationId);
+      else if (reconciled.kind === "noop" && reconciled.reason !== "active_present")
         console.warn("approved enrollment registry reconciliation unchanged", reconciled.reason);
       if (!enrollment.natsCreds || !enrollment.peerId) return { kind: "rejected" };
       return { kind: "approved", result: this.result(enrollment.natsCreds, enrollment.peerId) };
@@ -512,14 +516,20 @@ export class DeviceFlowEnrollment {
     const incomingKeyId = createHash("sha256").update(Buffer.from(enrollment.agentPublicKey, "base64url")).digest("base64url");
     const history = await this.repository.listHistory(enrollment.tenant, enrollment.accountId);
     if (history.some((record) => record.status === "revoked" && record.keyId === incomingKeyId)) {
-      await this.repository.releaseClaim(opId); return { kind: "revoked_key" };
+      try { await this.repository.releaseClaim(opId); }
+      catch (releaseError) { console.warn("revoked-key claim release failed; lease expiry will recover", releaseError); }
+      return { kind: "revoked_key" };
     }
     const active = await this.repository.getActive(enrollment.tenant, enrollment.accountId);
     let expect: ActivationId | null;
     if (!active && opts?.replaceActivationId === undefined) expect = null;
     else if (active?.publicKey === enrollment.agentPublicKey) expect = active.activationId;
     else if (active && opts?.replaceActivationId === active.activationId) expect = active.activationId;
-    else { await this.repository.releaseClaim(opId); return this.conflict(active, incomingKeyId); }
+    else {
+      try { await this.repository.releaseClaim(opId); }
+      catch (releaseError) { console.warn("conflict claim release failed; lease expiry will recover", releaseError); }
+      return this.conflict(active, incomingKeyId);
+    }
 
     // Generate NATS user credentials
     let natsCreds: NatsUserCredentials;
@@ -539,7 +549,11 @@ export class DeviceFlowEnrollment {
     const payload = { creds: natsCreds, peerId, agentPublicKey: enrollment.agentPublicKey, expect };
     let committed;
     try { committed = await this.repository.commitApproval(opId, payload); }
-    catch { committed = await this.repository.commitApproval(opId, payload); }
+    catch (error) {
+      console.warn("approval commit failed; evaluating idempotent retry", error);
+      if (error instanceof Error && error.name === "CommitPayloadMismatchError") throw error;
+      committed = await this.repository.commitApproval(opId, payload);
+    }
     if (committed.kind === "committed") return { kind: "approved", result: this.result(natsCreds, peerId) };
     if (committed.kind === "revoked") return { kind: "revoked_key" };
     if (committed.kind === "conflict") return this.conflict(committed.current, incomingKeyId);

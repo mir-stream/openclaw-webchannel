@@ -14,12 +14,12 @@ export class UserCodeCollisionError extends Error {
 export class DeviceCodeCollisionError extends Error {
   constructor(deviceCode: string) { super(`webchannel: device_code collision: ${deviceCode}`); this.name = "DeviceCodeCollisionError"; }
 }
+/** `name` is the portable cross-package contract; consumers must not rely on `instanceof`. */
 export class CommitPayloadMismatchError extends Error {
   constructor(message = "webchannel: commit payload does not match the claimed enrollment or committed operation") {
     super(message); this.name = "CommitPayloadMismatchError";
   }
 }
-
 export type ClaimApprovalOutcome =
   | { kind: "claimed"; enrollment: EnrollmentRecord }
   | { kind: "already_approved"; enrollment: EnrollmentRecord }
@@ -33,13 +33,14 @@ export type CommitApprovalOutcome =
 export type TryExpireOutcome = { transitioned: boolean; enrollment: EnrollmentRecord | null };
 export type ReconcileOutcome =
   | { kind: "registered"; record: AgentKeyRecord }
-  | { kind: "noop"; reason: "not_found" | "not_approved" | "active_present" | "history_present" };
+  | { kind: "noop"; reason: "not_found" | "not_approved" | "active_present" | "history_present" | "commit_snapshot_present" };
 
 /**
  * One durability and serialization boundary for enrollment and key activation.
  * Implementations own the authoritative monotonic clock used for all decisions.
  */
 export interface EnrollmentRepository extends AgentKeyRegistry {
+  now(): Promise<number>;
   createEnrollment(enrollment: EnrollmentRecord): Promise<void>;
   getEnrollment(deviceCode: string): Promise<EnrollmentRecord | null>;
   getEnrollmentByUserCode(userCode: string): Promise<EnrollmentRecord | null>;
@@ -108,6 +109,8 @@ export class MemoryEnrollmentRepository implements EnrollmentRepository {
     this.sweepTimer.unref?.();
   }
   close(): void { if (this.sweepTimer) clearInterval(this.sweepTimer); this.sweepTimer = undefined; }
+
+  async now(): Promise<number> { return this.clock(); }
 
   async createEnrollment(enrollment: EnrollmentRecord): Promise<void> {
     if (this.enrollments.has(enrollment.device_code)) throw new DeviceCodeCollisionError(enrollment.device_code);
@@ -222,6 +225,9 @@ export class MemoryEnrollmentRepository implements EnrollmentRepository {
     const history = this.histories.get(agentKeyRegistryKey(enrollment.tenant, enrollment.accountId)) ?? [];
     if (history.some((r) => r.status === "active")) return { kind: "noop", reason: "active_present" };
     if (history.length) return { kind: "noop", reason: "history_present" };
+    // A commit snapshot identifies a modern transactional row. Re-registering
+    // it would create an activation different from the authoritative snapshot.
+    if (enrollment.committedBy || enrollment.committedRecord) return { kind: "noop", reason: "commit_snapshot_present" };
     const result = this.registerSync(enrollment.tenant, enrollment.accountId, enrollment.agentPublicKey, null);
     if (!result.ok) throw new Error("webchannel: impossible reconciliation registry result");
     return { kind: "registered", record: result.record };
@@ -234,8 +240,10 @@ export class MemoryEnrollmentRepository implements EnrollmentRepository {
       // edge still receives the full ambiguity-recovery horizon. All other
       // states age from expiresAt. The strict `>` is intentional—at equality the
       // record, credentials, and idempotent result are still contractually live.
-      const base = record.status === "approved" ? record.approvedAt : record.expiresAt;
-      if (base !== undefined && now > base + this.retentionMs) { this.enrollments.delete(code); this.userCodes.delete(record.user_code); removed++; }
+      // Legacy approved rows may predate approvedAt; expiresAt is a conservative
+      // finite fallback that prevents credentials from becoming immortal.
+      const base = record.status === "approved" ? (record.approvedAt ?? record.expiresAt) : record.expiresAt;
+      if (now > base + this.retentionMs) { this.enrollments.delete(code); this.userCodes.delete(record.user_code); removed++; }
     }
     return removed;
   }
