@@ -188,6 +188,17 @@ function assertNoRemovedConfig(account: WebchannelAccountConfig): void {
       "webchannel: removed config auth.ticketParam is no longer supported because Gateway direct WebSocket authentication was deleted; reconfigure with `openclaw channels add --channel webchannel`.",
     );
   }
+  // P0-3 D6-5: the `auth.requirePoP` opt-out is REMOVED. Proof-of-Possession is
+  // now UNCONDITIONALLY required at the NATS register hop — after P0-2 the
+  // register hop is the only admission door, so `requirePoP:false` unlocked it.
+  // A present value (even `true`) is a fatal migration error: `false` is a removed
+  // security relaxation, and `true` is rejected too so a stale config can't read
+  // as if the toggle still means anything.
+  if (auth && typeof auth === "object" && Object.prototype.hasOwnProperty.call(auth, "requirePoP")) {
+    throw new Error(
+      "webchannel: removed config auth.requirePoP is no longer supported — Proof-of-Possession is now ALWAYS required at the NATS register hop (the opt-out unlocked the only admission door). Remove auth.requirePoP and reconfigure with `openclaw channels add --channel webchannel`.",
+    );
+  }
   const migrationError = (setting: string): never => {
     throw new Error(
       `webchannel: removed config ${setting} is no longer supported; authenticated enrollment is required. Reconfigure with \`openclaw channels add --channel webchannel\`.`,
@@ -400,6 +411,67 @@ export type PersistedEnrolledCreds = {
 };
 
 /**
+ * The agent's SaaS-attested application identity — the material EVERY credential
+ * source (enrolled OR static/BYO-NATS) needs to serve a register-hop account.
+ * Read from the SAME `credentials.json` enrollment persists, but DECOUPLED from
+ * the transport material (userJwt/userSeed): a static account brings its own
+ * transport yet still relies on this attested identity for the register-hop wrap.
+ */
+export type PersistedAgentIdentity = {
+  /** F2 — the agent's SaaS-attested static X25519 identity key pair. */
+  identityKey: KeyPair;
+  /**
+   * Bootstrap-JWT issuer the SaaS delivered at enroll time (verbatim). Optional:
+   * absent for pre-issuer enrollments (the runtime then derives issuer). Same
+   * value `loadPersistedEnrolledCreds` surfaces — both read it through the shared
+   * reader so the two accessors cannot drift.
+   */
+  issuer?: string;
+};
+
+/** Injectable fs seams shared by the persisted-credential accessors (tests). */
+type PersistedCredsReadOpts = {
+  home?: string;
+  exists?: (p: string) => boolean;
+  read?: (p: string) => string;
+};
+
+/**
+ * Read + JSON-parse an account's persisted `credentials.json`. Returns the raw
+ * parsed object, or `undefined` when the file is absent, unreadable, or malformed.
+ * Shared by BOTH persisted accessors so the fs seam + traversal guard + the
+ * identity-parsing path live in exactly one place (no drift). Validates
+ * `accountId` first.
+ */
+function readPersistedCredentials(
+  accountId: string,
+  opts: PersistedCredsReadOpts,
+): RawPersistedCredentials | undefined {
+  assertValidAccountId(accountId);
+  const exists = opts.exists ?? existsSync;
+  const read = opts.read ?? ((p: string) => readFileSync(p, "utf-8"));
+  const path = resolveReadCredentialPath(accountId, {
+    ...(opts.home !== undefined ? { home: opts.home } : {}),
+    exists,
+  });
+  if (!exists(path)) return undefined;
+  try {
+    return JSON.parse(read(path)) as RawPersistedCredentials;
+  } catch {
+    return undefined;
+  }
+}
+
+type RawPersistedCredentials = {
+  identityKey?: { publicKey?: unknown; privateKey?: unknown };
+  enrollment?: {
+    creds?: { userJwt?: unknown; userSeed?: unknown };
+    natsUrl?: unknown;
+    issuer?: unknown;
+  };
+};
+
+/**
  * Load the persisted enrolled creds for an account (CONSUME-only path — 가-1).
  *
  * Reads the account-scoped credential file and returns its `enrollment.creds`.
@@ -412,59 +484,105 @@ export type PersistedEnrolledCreds = {
  */
 export function loadPersistedEnrolledCreds(
   accountId: string,
-  opts: {
-    home?: string;
-    exists?: (p: string) => boolean;
-    read?: (p: string) => string;
-  } = {},
+  opts: PersistedCredsReadOpts = {},
 ): PersistedEnrolledCreds | undefined {
-  assertValidAccountId(accountId);
-  const exists = opts.exists ?? existsSync;
-  const read = opts.read ?? ((p: string) => readFileSync(p, "utf-8"));
-  const path = resolveReadCredentialPath(accountId, {
-    ...(opts.home !== undefined ? { home: opts.home } : {}),
-    exists,
-  });
-  if (!exists(path)) return undefined;
-  try {
-    const parsed = JSON.parse(read(path)) as {
-      identityKey?: { publicKey?: unknown; privateKey?: unknown };
-      enrollment?: {
-        creds?: { userJwt?: unknown; userSeed?: unknown };
-        natsUrl?: unknown;
-        issuer?: unknown;
-      };
+  const parsed = readPersistedCredentials(accountId, opts);
+  if (!parsed) return undefined;
+  const creds = parsed.enrollment?.creds;
+  if (
+    creds &&
+    typeof creds.userJwt === "string" &&
+    typeof creds.userSeed === "string" &&
+    creds.userJwt.length > 0 &&
+    creds.userSeed.length > 0
+  ) {
+    // Thread the SaaS-delivered relay URL + issuer through when present. Kept
+    // optional so already-persisted (pre-natsUrl / pre-issuer) creds still
+    // load and fall back gracefully.
+    const natsUrl = parsed.enrollment?.natsUrl;
+    const issuer = parsed.enrollment?.issuer;
+    // F2: decode the agent identity key pair (top-level, base64url). Only
+    // surfaced when BOTH halves decode to exactly 32 bytes — a partial or
+    // malformed block is treated as absent so the register-hop account
+    // fail-closed skips serving rather than wrapping under a bad key.
+    const identityKey = parseIdentityKey(parsed.identityKey);
+    return {
+      userJwt: creds.userJwt,
+      userSeed: creds.userSeed,
+      ...(typeof natsUrl === "string" && natsUrl.length > 0 ? { natsUrl } : {}),
+      ...(typeof issuer === "string" && issuer.length > 0 ? { issuer } : {}),
+      ...(identityKey ? { identityKey } : {}),
     };
-    const creds = parsed.enrollment?.creds;
-    if (
-      creds &&
-      typeof creds.userJwt === "string" &&
-      typeof creds.userSeed === "string" &&
-      creds.userJwt.length > 0 &&
-      creds.userSeed.length > 0
-    ) {
-      // Thread the SaaS-delivered relay URL + issuer through when present. Kept
-      // optional so already-persisted (pre-natsUrl / pre-issuer) creds still
-      // load and fall back gracefully.
-      const natsUrl = parsed.enrollment?.natsUrl;
-      const issuer = parsed.enrollment?.issuer;
-      // F2: decode the agent identity key pair (top-level, base64url). Only
-      // surfaced when BOTH halves decode to exactly 32 bytes — a partial or
-      // malformed block is treated as absent so the register-hop account
-      // fail-closed skips serving rather than wrapping under a bad key.
-      const identityKey = parseIdentityKey(parsed.identityKey);
-      return {
-        userJwt: creds.userJwt,
-        userSeed: creds.userSeed,
-        ...(typeof natsUrl === "string" && natsUrl.length > 0 ? { natsUrl } : {}),
-        ...(typeof issuer === "string" && issuer.length > 0 ? { issuer } : {}),
-        ...(identityKey ? { identityKey } : {}),
-      };
-    }
-    return undefined;
-  } catch {
-    return undefined;
   }
+  return undefined;
+}
+
+/**
+ * Load the persisted agent IDENTITY for an account (P0-3 D1).
+ *
+ * Unlike `loadPersistedEnrolledCreds`, this reads ONLY the identity material —
+ * the top-level `identityKey` and `enrollment.issuer` — and is NOT gated on the
+ * presence of transport material (userJwt/userSeed). That decoupling is the
+ * point: a static (BYO-NATS) account supplies its own transport but still needs
+ * the SaaS-attested identity to serve the register hop, and enrolled transport
+ * material may be absent/corrupt without invalidating the identity/issuer chain.
+ *
+ * Returns `undefined` when the file is absent/malformed OR the `identityKey`
+ * block does not decode to a valid 32-byte X25519 pair (fail-closed: no attested
+ * identity ⇒ the account cannot serve). Shares the fs reader + `parseIdentityKey`
+ * helper with `loadPersistedEnrolledCreds`, so the identity parsing can't drift.
+ */
+export function loadPersistedAgentIdentity(
+  accountId: string,
+  opts: PersistedCredsReadOpts = {},
+): PersistedAgentIdentity | undefined {
+  const parsed = readPersistedCredentials(accountId, opts);
+  if (!parsed) return undefined;
+  const identityKey = parseIdentityKey(parsed.identityKey);
+  if (!identityKey) return undefined;
+  const issuer = parsed.enrollment?.issuer;
+  return {
+    identityKey,
+    ...(typeof issuer === "string" && issuer.length > 0 ? { issuer } : {}),
+  };
+}
+
+/**
+ * Load ONLY the SaaS-delivered bootstrap-JWT issuer (`enrollment.issuer`) for an
+ * account, with NO gate on the `identityKey` block.
+ *
+ * Why this exists as its own accessor rather than reusing either loader above:
+ *
+ *   - `loadPersistedAgentIdentity` returns `undefined` outright when
+ *     `parseIdentityKey` fails, which would drop a perfectly good delivered issuer
+ *     along with the unusable key. That coupling is correct for its OWN purpose
+ *     (no attested identity ⇒ the account must not serve) but WRONG for the issuer,
+ *     because the issuer feeds the shared-audience collision PRE-PASS, which runs
+ *     for its own reasons and must see every account's real issuer.
+ *   - `loadPersistedEnrolledCreds` gates on transport material (userJwt/userSeed),
+ *     which a static/BYO-NATS account legitimately does not persist.
+ *
+ * The security consequence of getting this wrong is concrete: two accounts sharing
+ * an explicit `auth.jwt.audience` are only PAIRED by
+ * `detectSharedAudienceCollisions` when they agree on the issuer. If a corrupt
+ * `identityKey` silently demoted one account to the DERIVED issuer while its twin
+ * kept the DELIVERED one, the pair would no longer collide, the collision pre-pass
+ * would let the twin serve, and a bootstrap JWT minted for the corrupt account
+ * (iss=delivered, aud=shared) would still verify on the twin's `.register` subject
+ * — precisely the confused-deputy the pre-pass exists to prevent. A broken key must
+ * never be able to HIDE a collision.
+ *
+ * Returns `undefined` when the file is absent/malformed or `enrollment.issuer` is
+ * not a non-empty string. Shares `readPersistedCredentials` with both loaders above
+ * so the on-disk shape can't drift between them.
+ */
+export function loadPersistedIssuer(
+  accountId: string,
+  opts: PersistedCredsReadOpts = {},
+): string | undefined {
+  const parsed = readPersistedCredentials(accountId, opts);
+  const issuer = parsed?.enrollment?.issuer;
+  return typeof issuer === "string" && issuer.length > 0 ? issuer : undefined;
 }
 
 /**

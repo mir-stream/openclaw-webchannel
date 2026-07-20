@@ -56,12 +56,14 @@ import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   accountCredentialPath,
   canonicalizeAccountId,
+  loadPersistedAgentIdentity,
   readAccountsMap,
   readWebchannelSection,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
 import { runAddPreflight } from "./preflight.js";
+import { formatPermissionTemplate } from "./nats-permission-template.js";
 
 /**
  * The slice of `ChannelSetupInput` this adapter reads. The host type is a closed
@@ -387,7 +389,7 @@ export const webchannelSetup = {
       input.credentialsMode ??
       "enrolled";
 
-    if (mode !== "enrolled") {
+    if (mode !== "enrolled" && mode !== "static") {
       runtime.log(
         `[webchannel] account "${id}" credential mode is "${mode}"; ` +
           `skipping device-flow acquisition (no creds to acquire).`,
@@ -395,16 +397,47 @@ export const webchannelSetup = {
       return;
     }
 
+    // Static/BYO replaces only the NATS transport. It still needs the same
+    // SaaS-attested identity as enrolled mode, so a first-time `channels add`
+    // MUST run device flow instead of returning before an identity exists. The
+    // enrollment-delivered NATS creds are persisted as recovery material but the
+    // runtime resolver continues to select the operator's static credentials.
+    if (mode === "static") {
+      const staticTenant =
+        resolveSetupIdentity(input).tenant ??
+        (account.tenant as string | undefined) ??
+        "default-tenant";
+      runtime.log(
+        `[webchannel] account "${id}" static (BYO-NATS): acquiring the required ` +
+          `SaaS-attested agent identity; runtime transport remains your static credentials. ` +
+          `Your NATS broker must grant these subjects:\n` +
+          formatPermissionTemplate(staticTenant),
+      );
+    }
+
     // Skip only if account-scoped creds already exist. The legacy single-file
     // path is migration/runbook-only and is never read at runtime.
     const existingPath = accountCredentialPath(id);
     const { existsSync } = await import("node:fs");
-    if (existsSync(existingPath)) {
+    if (existsSync(existingPath) && mode === "enrolled") {
       runtime.log(
         `[webchannel] account "${id}" already has credentials at ${existingPath}; ` +
           `skipping acquisition.`,
       );
       return;
+    }
+    const existingIdentity =
+      mode === "static" && existsSync(existingPath)
+        ? loadPersistedAgentIdentity(id)
+        : undefined;
+    if (existsSync(existingPath)) {
+      runtime.log(
+        existingIdentity
+          ? `[webchannel] account "${id}" reusing the attested identity at ${existingPath}; ` +
+              `continuing to preflight the configured static transport.`
+          : `[webchannel] account "${id}" has legacy credentials without a valid attested identity; ` +
+              `running device-flow enrollment to repair them before static transport preflight.`,
+      );
     }
 
     const identity = resolveSetupIdentity(input);
@@ -443,6 +476,9 @@ export const webchannelSetup = {
         saasBaseUrl,
         tenant,
         log: (...args) => runtime.log(...args),
+        ...(mode === "static" && existsSync(existingPath) && !existingIdentity
+          ? { forceEnrollment: true }
+          : {}),
       });
 
       // Gate A (design §4 change 4): the achievable add-time preflight, run
@@ -458,6 +494,14 @@ export const webchannelSetup = {
       // loud, actionable log line.
       const existingJwt = (account.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
         ?.jwt;
+      // D4b: the relay dial now goes through the runtime resolve → consume path,
+      // so hand it the same resolver inputs the serving loop reads — the account's
+      // `nats` block + the legacy top-level `nats.url` — and let it dial the
+      // just-persisted creds exactly as `gateway run` will.
+      const accountNats = account.nats as
+        | import("./nats-credential-source.js").WebchannelNatsConfig
+        | undefined;
+      const legacyNats = (cfg as { nats?: { url?: string } }).nats;
       await runAddPreflight({
         accountId: id,
         tenant,
@@ -469,6 +513,8 @@ export const webchannelSetup = {
           ...(enrollment.jwksUrl !== undefined ? { jwksUrl: enrollment.jwksUrl } : {}),
           ...(enrollment.issuer !== undefined ? { issuer: enrollment.issuer } : {}),
         },
+        ...(accountNats !== undefined ? { natsConfig: accountNats } : {}),
+        ...(legacyNats !== undefined ? { legacyNats } : {}),
         // Config-present-wins: an operator PIN overrides the derivation.
         ...(existingJwt?.issuer !== undefined ? { pinnedIssuer: existingJwt.issuer } : {}),
         ...(existingJwt?.audience !== undefined ? { pinnedAudience: existingJwt.audience } : {}),

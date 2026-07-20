@@ -1,19 +1,20 @@
 import { describe, it, expect } from "vitest";
 import { generateKeyPairSync, sign as edSign, type JsonWebKey } from "node:crypto";
-import { resolveRequirePoP, popRequirementUnmet } from "./register-pop-gate.js";
+import { popRequirementUnmet } from "./register-pop-gate.js";
+import { resolveWebchannelAccountConfig } from "./account-config.js";
 import { PopChallengeStore, popSignedMessage, type PopPublicJwk } from "./pop-challenge.js";
 
 /**
  * These tests model the register route's admission decision (index-nats.ts):
  *
- *   const requirePoP = resolveRequirePoP(live.auth);
- *   if (popRequirementUnmet(requirePoP, Boolean(identity.popPublicJwk))) -> 401
+ *   if (popRequirementUnmet(Boolean(identity.popPublicJwk))) -> 401
  *   else if (identity.popPublicJwk) { verify signed nonce or 401 }
  *   // otherwise register the peer
  *
- * They prove the three Item-1d scenarios: default rejects a no-pop_jwk JWT,
- * a pop_jwk JWT with a valid PoP is accepted, and requirePoP:false restores the
- * legacy "no-pop is accepted" behavior.
+ * P0-3 D6-5: PoP is now UNCONDITIONALLY required — the `auth.requirePoP` opt-out
+ * was removed (a present value reaches a fatal migration error at config load).
+ * So the gate reduces to "reject any verified JWT that carries no pop_jwk", and
+ * the former opt-out scenarios are migration-error tests below.
  */
 
 function makeDevice(): { popPublicJwk: PopPublicJwk; sign: (msg: string) => string } {
@@ -25,33 +26,16 @@ function makeDevice(): { popPublicJwk: PopPublicJwk; sign: (msg: string) => stri
   };
 }
 
-describe("resolveRequirePoP — secure-by-default", () => {
-  it("defaults to TRUE when auth is undefined", () => {
-    expect(resolveRequirePoP(undefined)).toBe(true);
-  });
-  it("defaults to TRUE when requirePoP is unset", () => {
-    expect(resolveRequirePoP({})).toBe(true);
-  });
-  it("honors an explicit false", () => {
-    expect(resolveRequirePoP({ requirePoP: false })).toBe(false);
-  });
-  it("honors an explicit true", () => {
-    expect(resolveRequirePoP({ requirePoP: true })).toBe(true);
-  });
-});
-
-describe("register PoP gate (Item 1)", () => {
-  it("requirePoP default → a verified JWT with NO pop_jwk is REJECTED (401)", () => {
-    const requirePoP = resolveRequirePoP(undefined); // default true
-    // identity.popPublicJwk is undefined → hasPopJwk=false
-    expect(popRequirementUnmet(requirePoP, false)).toBe(true); // → route responds 401
+describe("popRequirementUnmet — PoP is unconditionally required (P0-3 D6-5)", () => {
+  it("a verified JWT with NO pop_jwk is REJECTED (401)", () => {
+    // identity.popPublicJwk absent → hasPopJwk=false → route responds 401.
+    expect(popRequirementUnmet(false)).toBe(true);
   });
 
-  it("requirePoP default → a JWT WITH pop_jwk + valid PoP is accepted", () => {
-    const requirePoP = resolveRequirePoP(undefined); // default true
+  it("a JWT WITH pop_jwk + valid PoP is accepted", () => {
     const dev = makeDevice();
     // The gate does not reject (pop_jwk present) …
-    expect(popRequirementUnmet(requirePoP, true)).toBe(false);
+    expect(popRequirementUnmet(true)).toBe(false);
     // … and the existing signed-nonce verification then succeeds → peer registered.
     const store = new PopChallengeStore();
     const nonce = store.issue("alice");
@@ -60,9 +44,23 @@ describe("register PoP gate (Item 1)", () => {
       store.verify({ peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }),
     ).toEqual({ ok: true, reason: "verified" });
   });
+});
 
-  it("requirePoP:false → a JWT with NO pop_jwk is accepted (legacy back-compat)", () => {
-    const requirePoP = resolveRequirePoP({ requirePoP: false }); // explicit opt-out
-    expect(popRequirementUnmet(requirePoP, false)).toBe(false); // → not rejected, peer registered
+describe("auth.requirePoP opt-out is REMOVED → fatal migration error (P0-3 D6-5)", () => {
+  const migration = /removed config auth\.requirePoP.*Proof-of-Possession is now ALWAYS required/s;
+
+  it("a present requirePoP:false (the legacy opt-out) is a fatal migration error", () => {
+    const cfg = { channels: { webchannel: { auth: { strategy: "jwt", requirePoP: false } } } };
+    expect(() => resolveWebchannelAccountConfig(cfg)).toThrow(migration);
+  });
+
+  it("a present requirePoP:true is ALSO rejected (no stale toggle may linger)", () => {
+    const cfg = { channels: { webchannel: { auth: { strategy: "jwt", requirePoP: true } } } };
+    expect(() => resolveWebchannelAccountConfig(cfg)).toThrow(migration);
+  });
+
+  it("an account with NO requirePoP resolves cleanly", () => {
+    const cfg = { channels: { webchannel: { auth: { strategy: "jwt" } } } };
+    expect(() => resolveWebchannelAccountConfig(cfg)).not.toThrow();
   });
 });

@@ -82,10 +82,10 @@ const deviceKp = {
   ).toString("base64url"),
 };
 
-// 1b. Device Ed25519 PoP key → pop_jwk. The gateway now requires PoP by default
-//     (auth.requirePoP defaults true), so the bootstrap JWT MUST carry pop_jwk and
-//     the register hop MUST present a signed-nonce proof. Mirrors how
-//     jwt-register-roundtrip.ts / runAllReal drive the production PoP path.
+// 1b. Device Ed25519 PoP key → pop_jwk. PoP is ALWAYS required at the register
+//     hop (P0-3 removed the auth.requirePoP opt-out), so the bootstrap JWT MUST
+//     carry pop_jwk and the register hop MUST present a signed-nonce proof. Mirrors
+//     how jwt-register-roundtrip.ts / runAllReal drive the production PoP path.
 const popKeyPair = await generateDevicePopKeyPair();
 
 // 2. Mint a bootstrap JWT from THIS issuer's trust chain, INCLUDING pop_jwk.

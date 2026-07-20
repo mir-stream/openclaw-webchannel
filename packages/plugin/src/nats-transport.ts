@@ -476,6 +476,43 @@ export class NatsTransport extends EventEmitter {
     this.ws!.send("\r\n");
   }
 
+  /**
+   * Round-trip a PING and resolve when the matching PONG returns — a protocol
+   * BARRIER (P0-3: the minimal seam for the add-time permission probe; no other
+   * transport change).
+   *
+   * nats-server processes everything sent BEFORE our PING — and, for a rejected
+   * SUB/PUB, emits the async `-ERR 'Permissions Violation …'` — before it replies
+   * PONG. So a caller that sends SUB/PUB then `await flush()` is guaranteed any
+   * resulting permission `-ERR` has ALREADY been delivered on the `error` event by
+   * the time this resolves. Rejects on timeout (default 2s).
+   *
+   * Callers MUST serialize flushes (one PING/PONG in flight at a time). The
+   * permission probe runs strictly sequentially, so this holds.
+   */
+  flush(timeoutMs = 2000): Promise<void> {
+    this.assertOpen();
+    return new Promise<void>((resolve, reject) => {
+      const onPong = (): void => {
+        cleanup();
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`NatsTransport: flush (PING/PONG) timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        this.off("pong", onPong);
+      };
+      // A post-handshake PONG (reply to OUR ping) fires the `pong` event
+      // (drainBuffer). Server-initiated PINGs are answered separately and do NOT
+      // fire `pong`, so with serialized flushes this resolves on our own PONG.
+      this.once("pong", onPong);
+      this.ws!.send("PING\r\n");
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Teardown
   // ---------------------------------------------------------------------------

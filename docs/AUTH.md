@@ -20,17 +20,77 @@ Register-hop admission uses `channels.webchannel.auth.strategy: "jwt"` and:
 
 - required `issuer` and `audience`;
 - exactly one of `jwksUrl`, `jwksFile`, or inline `jwks`;
-- optional `clockSkew` and `requirePoP` controls.
+- an optional `clockSkew` control.
 
 `assertJwtAuthConfig` validates the structure during account startup and creates
 the shared JWKS cache. Startup preflight and live verification reuse that cache.
 JWKS outages fail closed but are retryable; invalid tokens are terminal rejects.
 
-The deprecated `auth.ticketParam` schema key remains accepted only so loading can
-produce a targeted migration error. Remove it and rerun
-`openclaw channels add --channel webchannel`.
+Proof-of-Possession is **always required** at the register hop — a verified
+bootstrap JWT that carries no `pop_jwk` is rejected before any peer is registered.
+The former `auth.requirePoP` opt-out is **removed**: after register-hop became the
+sole admission path, a config toggle that unlocked it was a security relaxation,
+not a setting. The schema still accepts the key only so a present value produces a
+targeted startup migration error — remove `auth.requirePoP` and rerun
+`openclaw channels add --channel webchannel`. The deprecated `auth.ticketParam`
+key is accepted for the same reason (targeted migration error, then remove).
 
 See [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) for the complete trust model.
+
+## BYO-NATS operator contract
+
+A static (bring-your-own-NATS) relay is a **transport** choice — self-hosted,
+Synadia/NGS, or any managed NATS. It is not an auth bypass: register-hop admission
+and the SaaS-attested agent identity are unchanged (a static account with no
+enrolled identity is skipped, `identity-missing`). What the operator owns is the
+broker, so the operator must configure the subject grants webchannel needs.
+
+### Required subject permissions
+
+For a tenant `{tenant}` (rendered for your tenant by `formatPermissionTemplate`
+and enforced by `mintNatsUserCreds`), configure three roles:
+
+| Role | pub allow | pub deny | sub allow |
+|------|-----------|----------|-----------|
+| agent (the enrolled gateway) | `webchannel.{tenant}.>` | — | `webchannel.{tenant}.>` |
+| browser (per session; `{peerId}` = the authenticated session subject) | `webchannel.{tenant}.*.{peerId}.>` | — | `webchannel.{tenant}.*.{peerId}.>` |
+| observer (read-only wiretap) | — | `>` | `webchannel.{tenant}.>` |
+
+The observer's deny-all publish MUST be the explicit `pub.deny: [">"]`. An empty
+`pub.allow` is **not** deny-all in nats-server (an absent/empty allow-list means
+unrestricted), so only the explicit deny actually refuses every publish. The
+per-peer browser grant (`*` matching the accountId segment) is what structurally
+closes register-reply forgery and unregister-DoS: a browser can only touch its own
+peer subtree, so it cannot publish a forged register reply to (or subscribe) another
+peer's reginbox.
+
+### Browser credentials stay SaaS-minted
+
+The plugin never mints browser credentials. Per-peer browser creds require a
+peerId-scoped grant, and the peerId is the value the SaaS login authenticates — so
+the SaaS is the only supported issuer, in one of two shapes:
+
+- **self-hosted relay preloading SaaS account trust** (the default), or
+- **external/managed account** — the operator delegates their own NATS account's
+  signing key to the SaaS via `issuerAccountId`, and the SaaS mints per-peer creds
+  on that account's behalf (`nats.issuer_account`-stamped, signing-key-signed —
+  the Synadia/NGS shape).
+
+An operator distributing browser creds outside the SaaS is not blocked (the
+application layer is the primary boundary), but it is a **tolerated, documented
+configuration only** under the permission template above — webchannel provides no
+issuer or tooling for self-minted browser creds.
+
+### Add-time static transport preflight
+
+`channels add` always ensures device-flow enrollment because both transport
+modes require the SaaS-attested agent identity; a valid persisted identity is
+reused, while a legacy credential file without one is freshly enrolled. In
+static mode the enrollment-
+delivered NATS credentials are not selected for runtime transport; the subsequent
+permission probe resolves and consumes the configured static credentials, so it
+dials the operator's own broker. It verifies self-subtree publish/subscribe and
+warns when either cross-tenant or outside-webchannel subscriptions are allowed.
 
 ## Agent identity-key lifecycle
 

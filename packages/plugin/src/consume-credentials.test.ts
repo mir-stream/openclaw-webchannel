@@ -139,9 +139,16 @@ describe("consumeCredentialSource", () => {
     expect(createEnrolled).not.toHaveBeenCalled();
   });
 
-  it("static source → delegates to connectNatsCredentialSource unchanged", async () => {
+  it("static + persisted identity → connects with the static material and surfaces identityKey", async () => {
+    // P0-3: a static (BYO-NATS) source picks the transport, but serving still
+    // requires the SaaS-attested agent identity. When present, connect with the
+    // static creds AND return the identityKey (same shape as the enrolled path).
     const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}) }) as never);
     const makeSigner = vi.fn(() => async () => "sig");
+    const identityKey = {
+      publicKey: new Uint8Array(32).fill(1),
+      privateKey: new Uint8Array(32).fill(2),
+    };
     const source: NatsCredentialSource = {
       mode: "static",
       url: "ws://static",
@@ -151,10 +158,60 @@ describe("consumeCredentialSource", () => {
     const result = await consumeCredentialSource(source, "default", {
       transportFactory,
       makeSigner,
+      loadIdentity: () => ({ identityKey }),
     });
     expect(result.status).toBe("connected");
     expect(transportFactory).toHaveBeenCalledWith(
       expect.objectContaining({ url: "ws://static", jwtCredential: "J" }),
     );
+    if (result.status === "connected") {
+      expect(result.identityKey).toBe(identityKey);
+      expect(result.dialedUrl).toBe("ws://static");
+    }
+  });
+
+  it("static WITHOUT a persisted identity → identity-missing (NO connect, transport factory untouched)", async () => {
+    const transportFactory = vi.fn();
+    const makeSigner = vi.fn();
+    const source: NatsCredentialSource = {
+      mode: "static",
+      url: "ws://static",
+      userJwt: "J",
+      userSeed: "S",
+    };
+    const result = await consumeCredentialSource(source, "acctBYO", {
+      transportFactory,
+      makeSigner,
+      loadIdentity: () => undefined,
+    });
+    expect(result).toEqual({ status: "identity-missing", accountId: "acctBYO" });
+    expect(transportFactory).not.toHaveBeenCalled();
+  });
+
+  it("static IGNORES any persisted natsUrl — dials source.url (operator owns the transport)", async () => {
+    // Unlike enrolled (which prefers the SaaS-delivered natsUrl), static = the
+    // operator owns transport fully, so the consume path dials source.url and the
+    // identity loader's transport fields (if any) are never consulted for the URL.
+    const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}) }) as never);
+    const identityKey = {
+      publicKey: new Uint8Array(32).fill(1),
+      privateKey: new Uint8Array(32).fill(2),
+    };
+    const source: NatsCredentialSource = {
+      mode: "static",
+      url: "ws://operator-relay",
+      userJwt: "J",
+      userSeed: "S",
+    };
+    const result = await consumeCredentialSource(source, "default", {
+      transportFactory,
+      makeSigner: () => async () => "sig",
+      loadIdentity: () => ({ identityKey, issuer: "https://irrelevant-for-transport" }),
+    });
+    expect(result.status).toBe("connected");
+    expect(transportFactory).toHaveBeenCalledWith(
+      expect.objectContaining({ url: "ws://operator-relay" }),
+    );
+    if (result.status === "connected") expect(result.dialedUrl).toBe("ws://operator-relay");
   });
 });

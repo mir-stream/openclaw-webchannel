@@ -849,6 +849,29 @@ export function registerSubject(tenant: string, accountId: string, peerId: strin
   return `webchannel.${tenant}.${accountId}.${peerId}.register`;
 }
 
+/**
+ * Derive the register-reply inbox PREFIX for a peer (register-hop mode).
+ * Format: webchannel.{tenant}.{accountId}.{peerId}.reginbox
+ *
+ * The browser passes this as the request `replyPrefix`; the low-level client
+ * appends a random token, so the actual reply subject is
+ * `…{peerId}.reginbox.{token}`. It stays WITHIN the browser's own
+ * `webchannel.{tenant}.*.{peerId}.>` grant (no separate `_INBOX.>` grant needed),
+ * and the agent's reply-allowlist only publishes to a requester's OWN reginbox —
+ * so this is the most security-sensitive reply channel and is covered by the
+ * client subject-coverage test against the shared permissions fixture.
+ *
+ * ⚠ TWIN, OPPOSITE CONVENTION — DO NOT UNIFY: a same-named `reginboxPrefix`
+ * exists in the plugin (`packages/plugin/src/subjects.ts`) that returns the
+ * prefix WITH a trailing dot (`…reginbox.`), because the agent's allowlist does
+ * `replyTo.startsWith(prefix)`. THIS copy is dot-LESS on purpose: the low-level
+ * client appends `.{token}`. Merging the two would silently break the reginbox
+ * allowlist. Each package keeps its own copy (client is zero-dependency).
+ */
+export function reginboxPrefix(tenant: string, accountId: string, peerId: string): string {
+  return `webchannel.${tenant}.${accountId}.${peerId}.reginbox`;
+}
+
 // ---------------------------------------------------------------------------
 // WebChannel NATS client (high-level API)
 // ---------------------------------------------------------------------------
@@ -1117,7 +1140,7 @@ export class WebChannelNatsClient {
         // In-namespace reply inbox: the browser's tenant-wide creds already cover
         // pub+sub on `webchannel.{tenant}.>`, so no separate `_INBOX.>` grant is
         // needed (and none is broadened across tenants).
-        const replyPrefix = `webchannel.${tenant}.${accountId}.${peerId}.reginbox`;
+        const replyPrefix = reginboxPrefix(tenant, accountId, peerId);
         registerResult = await registerWithPop({
           request: async (body) => {
             const raw = await this.client.request(registerSubj, JSON.stringify(body), {

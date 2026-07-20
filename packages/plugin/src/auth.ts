@@ -92,13 +92,6 @@ export type JwtAuthConfig = {
      */
     _fetchImpl?: typeof fetch;
   };
-  /**
-   * Require Proof-of-Possession at the NATS register hop. Secure-by-default:
-   * when unset the plugin behaves as `true`, so a verified bootstrap JWT that
-   * carries no `pop_jwk` is REJECTED before any peer is registered. Set to
-   * `false` to restore the legacy optional-PoP behavior (dev only).
-   */
-  requirePoP?: boolean;
 };
 
 export type AuthConfig = JwtAuthConfig;

@@ -101,6 +101,85 @@ describe("index-nats.ts wiring contract — approval decision account routing", 
   });
 });
 
+describe("index-nats.ts wiring contract — shared-audience fail-closed pre-pass (P0-3 D6-1)", () => {
+  it("detects collisions in a PRE-PASS via the extracted detector, before the serving loop", () => {
+    // Collision detection must run through the tested pure module, keyed by the
+    // per-plan derived auth built in the pre-pass — not an inline heuristic.
+    expect(INDEX_NATS_SOURCE).toMatch(/const\s+sharedAudienceCollisions\s*=\s*detectSharedAudienceCollisions\(/);
+    expect(INDEX_NATS_SOURCE).toMatch(/const\s+accountAuthByPlan\s*=\s*new Map/);
+  });
+
+  it("skips EVERY colliding account with a `continue` before any transport opens", () => {
+    // The skip reads the pre-pass result and continues out of the loop iteration
+    // (fail-closed), so a colliding account never reaches the Step 1 consume/connect.
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /const\s+collision\s*=\s*sharedAudienceCollisions\.get\(accountId\);[\s\S]*?if\s*\(collision\)\s*\{[\s\S]*?continue;/,
+    );
+  });
+
+  it("no longer carries the old post-connect `registerHopAudClaims` warn-only map", () => {
+    // The P0-2-era "warn on the second claimant" map is replaced by the fail-closed
+    // pre-pass; its presence would mean a colliding account could still serve.
+    expect(INDEX_NATS_SOURCE).not.toContain("registerHopAudClaims");
+  });
+
+  it("derives the register-hop issuer from the ISSUER-ONLY accessor (gated on neither transport creds nor identityKey)", () => {
+    // The issuer feeds the shared-audience collision pre-pass, so it must be read
+    // through an accessor that NEITHER of the other two loaders' gates can suppress:
+    //   - `loadPersistedEnrolledCreds` gates on userJwt+userSeed → a static/BYO
+    //     account (which persists none) would lose its issuer.
+    //   - `loadPersistedAgentIdentity` gates on a parseable identityKey → a CORRUPT
+    //     key would demote the account to the DERIVED issuer, un-pairing it from a
+    //     twin that shares its explicit aud and letting that twin serve. A broken
+    //     key must fail its OWN account closed (the F2 backstop), never hide a
+    //     collision from another account.
+    expect(INDEX_NATS_SOURCE).toMatch(/loadPersistedIssuer\(plan\.accountId\)/);
+    expect(INDEX_NATS_SOURCE).not.toContain("loadPersistedEnrolledCreds");
+    // The identity accessor must not be what feeds the issuer argument.
+    expect(INDEX_NATS_SOURCE).not.toMatch(/loadPersistedAgentIdentity\(plan\.accountId\)\?\.issuer/);
+  });
+
+  it("validates JWT auth before the serving loop can open a NATS transport", () => {
+    const validationAt = INDEX_NATS_SOURCE.indexOf("assertJwtAuthConfig(accountAuth);");
+    const servingLoopAt = INDEX_NATS_SOURCE.indexOf("for (const plan of plans) {", validationAt);
+    const consumeAt = INDEX_NATS_SOURCE.indexOf("consumeCredentialSource(source, accountId)");
+
+    expect(validationAt).toBeGreaterThan(-1);
+    expect(servingLoopAt).toBeGreaterThan(validationAt);
+    expect(consumeAt).toBeGreaterThan(servingLoopAt);
+    // Keep a single validation site: reintroducing a post-connect assertion can
+    // recreate the rejected-transport leak this ordering contract prevents.
+    expect(INDEX_NATS_SOURCE.match(/assertJwtAuthConfig\(accountAuth\);/g)).toHaveLength(1);
+  });
+
+  it("preserves structured Gate B diagnostics for pre-pass auth failures", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /const\s+prepassError\s*=\s*accountPrepassErrors\.get\(accountId\);[\s\S]*?formatAccountReadiness\(\{[\s\S]*?buildError:\s*prepassError\.message/,
+    );
+    expect(INDEX_NATS_SOURCE).toMatch(/issuer:\s*failedJwt\.issuer/);
+    expect(INDEX_NATS_SOURCE).toMatch(/audience:\s*failedJwt\.audience/);
+  });
+});
+
+describe("index-nats.ts wiring contract — static identity-missing skip + readiness source (P0-3 D1/S2)", () => {
+  it("skips a static account with no attested identity (identity-missing) account-scoped", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(/if\s*\(consumed\.status === "identity-missing"\)\s*\{[\s\S]*?continue;/);
+  });
+
+  it("surfaces the credential source mode + effective dialed URL in the readiness line", () => {
+    // Both the build-fail and healthy readiness calls thread the run-time source
+    // facts through formatAccountReadiness (Gate B).
+    expect(INDEX_NATS_SOURCE).toMatch(/credentialSource:\s*credentialSourceMode/);
+    expect(INDEX_NATS_SOURCE).toMatch(/dialedUrl\s*=\s*consumed\.dialedUrl/);
+  });
+
+  it("disconnects an enrolled transport rejected by the identity-key backstop", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /if\s*\(!identityKey\)\s*\{[\s\S]*?transport\.disconnect\(\);[\s\S]*?continue;/,
+    );
+  });
+});
+
 describe("index-nats.ts browser-route absence", () => {
   it("contains no gateway HTTP route registration or socket-upgrade wiring", () => {
     expect(INDEX_NATS_SOURCE).not.toContain("registerHttpRoute");
