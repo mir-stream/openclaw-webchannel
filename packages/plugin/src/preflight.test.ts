@@ -270,6 +270,43 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
     expect(log.mock.calls.some((c) => String(c[0]).includes("relay dial failed: refused"))).toBe(true);
   });
 
+  it("disconnects a transport whose dial resolves after the preflight timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const disconnect = vi.fn();
+      const localProbe = vi.fn(async () => ({ results: [], verdict: "PASS" as const, line: "probe pass" }));
+      let finishConnect!: () => void;
+      const connect = new Promise<void>((resolve) => { finishConnect = resolve; });
+      const reportPromise = runAddPreflight({
+        accountId: "acme",
+        tenant: "t",
+        saasBaseUrl: "https://saas.example",
+        enrollment: { userJwt: "J", userSeed: "S" },
+        log: vi.fn(),
+        fetchImpl: okFetch,
+        timeoutMs: 10,
+        consumeDeps: {
+          loadPersisted: () => ({ userJwt: "J", userSeed: "S" }) as never,
+          makeSigner: () => async () => "sig",
+          transportFactory: () => ({ connect: () => connect, disconnect }) as never,
+        },
+        runProbes: localProbe,
+      });
+
+      await vi.advanceTimersByTimeAsync(10);
+      const report = await reportPromise;
+      expect(report.ok).toBe(false);
+      expect(disconnect).not.toHaveBeenCalled();
+
+      finishConnect();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(disconnect).toHaveBeenCalledOnce();
+      expect(localProbe).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("FAILs when no enrolled creds are persisted (creds-missing → dial cannot run)", async () => {
     // Replaces the old "no relay URL" case: under D4b the dial goes through
     // consume, which fail-closes to creds-missing when nothing is persisted.

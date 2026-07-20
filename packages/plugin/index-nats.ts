@@ -542,6 +542,11 @@ export default defineChannelPluginEntry({
           `[webchannel] account "${accountId}" has no attested agent identity key — refusing to serve. ` +
             `Enroll with: openclaw channels add --channel webchannel --account ${accountId}`,
         );
+        // `consumeCredentialSource` has already authenticated and opened the
+        // enrolled transport at this point.  This is a fail-closed backstop for
+        // legacy/malformed persisted bundles, so do not leave an unserved
+        // account's socket (and its reconnect loop) alive.
+        transport.disconnect();
         continue;
       }
 

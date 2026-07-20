@@ -142,6 +142,12 @@ describe("index-nats.ts wiring contract — static identity-missing skip + readi
     expect(INDEX_NATS_SOURCE).toMatch(/credentialSource:\s*credentialSourceMode/);
     expect(INDEX_NATS_SOURCE).toMatch(/dialedUrl\s*=\s*consumed\.dialedUrl/);
   });
+
+  it("disconnects an enrolled transport rejected by the identity-key backstop", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /if\s*\(!identityKey\)\s*\{[\s\S]*?transport\.disconnect\(\);[\s\S]*?continue;/,
+    );
+  });
 });
 
 describe("index-nats.ts browser-route absence", () => {

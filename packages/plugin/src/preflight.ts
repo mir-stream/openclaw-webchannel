@@ -478,6 +478,10 @@ export async function runAddPreflight(
       consumeCredentialSource(source, opts.accountId, opts.consumeDeps ?? {}),
       timeoutMs,
       `relay dial timed out after ${timeoutMs}ms`,
+      // A timeout cannot cancel the underlying websocket dial. If it succeeds
+      // after Gate A has already returned FAIL, close the resulting transport so
+      // its socket and auto-reconnect loop cannot outlive the preflight.
+      (late) => late.status === "connected" && late.connection.transport.disconnect(),
     );
     if (consumed.status === "creds-missing") {
       relay = { error: "no enrolled credentials persisted for this account (run channels add)" };
@@ -532,11 +536,28 @@ export async function runAddPreflight(
 }
 
 /** Reject with `message` if `p` does not settle within `ms`. */
-function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+function withTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  message: string,
+  disposeLateResolution?: (value: T) => void,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(message));
+    }, ms);
     p.then(
       (v) => {
+        if (timedOut) {
+          try {
+            disposeLateResolution?.(v);
+          } catch {
+            /* best-effort cleanup after the caller has already observed timeout */
+          }
+          return;
+        }
         clearTimeout(timer);
         resolve(v);
       },
