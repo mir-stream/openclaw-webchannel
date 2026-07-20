@@ -127,4 +127,29 @@ describe("P1-3 connection epoch guards", () => {
     expect(FakeNatsWS.instances[1]!.published.some((p) => p.subject === registerSubject(TENANT, AGENT, PEER))).toBe(true);
     h.client.disconnect();
   });
+
+  it("error-listener connect keeps a replacement dial alive after the failed socket closed", async () => {
+    const h = await makeClient(); let releaseReply!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseReply = resolve; });
+    FakeNatsWS.sharedHandler = handlerBySocket(
+      registerAgent(new Uint8Array(32), h.devicePublicRaw, h.identity, { omitWrappedKey: true, beforeReply: () => gate }),
+      registerAgent(new Uint8Array(32).fill(8), h.devicePublicRaw, h.identity),
+    );
+    let errors = 0;
+    h.client.onError(() => { errors++; h.client.connect(); });
+    h.client.connect(); await settle(5);
+
+    // The first socket dies while its register continuation is still pending.
+    // Before the scheduled reconnect fires, release a terminal reply. Its error
+    // listener synchronously dials a replacement while the old continuation is
+    // still on the stack.
+    FakeNatsWS.instances[0]!.close();
+    releaseReply(); await settle(8);
+
+    expect(errors).toBe(1); expect(FakeNatsWS.instances).toHaveLength(2);
+    expect(FakeNatsWS.instances[0]!.readyState).toBe(FakeNatsWS.CLOSED);
+    expect(FakeNatsWS.instances[1]!.readyState).toBe(FakeNatsWS.OPEN);
+    expect(FakeNatsWS.instances[1]!.published.some((p) => p.subject === registerSubject(TENANT, AGENT, PEER))).toBe(true);
+    h.client.disconnect();
+  });
 });

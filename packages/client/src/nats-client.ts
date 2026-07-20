@@ -273,6 +273,7 @@ export type WebChannelNatsClientOptions = Omit<NatsClientOptions, "jwt" | "regis
 export class NatsClient {
   private readonly options: NatsClientOptions;
   private ws: WebSocket | null = null;
+  private connectionGeneration = 0;
   private connected = false;
   private rawListeners = new Set<RawMessageListener>();
   private stateListeners = new Set<StateListener>();
@@ -313,6 +314,14 @@ export class NatsClient {
   /** Connect to NATS server */
   connect(): void {
     this.connectInternal();
+  }
+
+  /** @internal Bind higher-level terminal cleanup to the dial that failed. */
+  currentConnectionGeneration(): number { return this.connectionGeneration; }
+
+  /** @internal Never let stale higher-level cleanup tear down a replacement dial. */
+  disconnectConnectionGeneration(generation: number): void {
+    if (this.connectionGeneration === generation) this.disconnect();
   }
 
   /** Disconnect and cleanup */
@@ -451,6 +460,7 @@ export class NatsClient {
     }
 
     const ws = new WebSocket(this.options.url);
+    this.connectionGeneration++;
     // nats-server speaks the NATS protocol over BINARY WebSocket frames. The
     // default binaryType ("blob") coerces to "[object Blob]" in the text buffer
     // and breaks the parser — request ArrayBuffer and decode to UTF-8.
@@ -1196,6 +1206,7 @@ export class WebChannelNatsClient {
     // re-checks `this.connectionEpoch === epoch` so a continuation resumed after
     // a drop+reconnect bails instead of clobbering the fresh flow's state.
     const epoch = ++this.connectionEpoch;
+    const connectionGeneration = this.client.currentConnectionGeneration();
     const { registration } = this.options;
 
     // (Re)subscribe idempotently: unsubscribe stale sids so a reconnect never
@@ -1257,7 +1268,7 @@ export class WebChannelNatsClient {
             : err instanceof ProtocolVersionMalformedError ? "protocol-mismatch"
             : err instanceof PopServerError ? "server"
             : "unknown";
-          this.failConnectionEpoch(epoch, err as Error, cause);
+          this.failConnectionEpoch(epoch, connectionGeneration, err as Error, cause);
           return;
         }
         // TRANSIENT (B4): request timeout, 503, or agent-offline retry-
@@ -1297,7 +1308,7 @@ export class WebChannelNatsClient {
             `agent-plugin=${agentProtocolVersion}; upgrade the older side`,
         );
         // P1-7: re-auth cannot reconcile incompatible wire versions.
-        this.failConnectionEpoch(epoch, err, "protocol-mismatch");
+        this.failConnectionEpoch(epoch, connectionGeneration, err, "protocol-mismatch");
         return;
       }
       this.notifyProtocolListeners({
@@ -1319,7 +1330,7 @@ export class WebChannelNatsClient {
           );
           // P1-7: the plugin speaks an incompatible register contract — a
           // capability mismatch, upgrade the older side (re-auth cannot help).
-          this.failConnectionEpoch(epoch, err, "protocol-mismatch");
+          this.failConnectionEpoch(epoch, connectionGeneration, err, "protocol-mismatch");
           return;
         }
         // F2 fail-closed: the register-delivered K is authenticated by deriving
@@ -1336,7 +1347,7 @@ export class WebChannelNatsClient {
           // P1-7: NOT "config" — the pin rides the SaaS bootstrap response, so
           // re-auth (which refetches bootstrap) can genuinely deliver it. Hiding
           // the re-auth affordance here would strand a recoverable state.
-          this.failConnectionEpoch(epoch, err, "secure-channel-failed");
+          this.failConnectionEpoch(epoch, connectionGeneration, err, "secure-channel-failed");
           return;
         }
         let key: Uint8Array;
@@ -1352,7 +1363,7 @@ export class WebChannelNatsClient {
           console.error("[nats-client] conversation-key unwrap failed:", err);
           // P1-7: the E2E session could not be established (bad/tampered key or a
           // stale pin) — re-auth to retry with fresh keys.
-          this.failConnectionEpoch(epoch, err as Error, "secure-channel-failed");
+          this.failConnectionEpoch(epoch, connectionGeneration, err as Error, "secure-channel-failed");
           return;
         }
         if (this.connectionEpoch !== epoch) return;
@@ -1375,11 +1386,20 @@ export class WebChannelNatsClient {
   }
 
   /** Guard terminal handling across both stale async flows and sync listener re-entry. */
-  private failConnectionEpoch(epoch: number, err: Error, cause: WebChannelErrorCause): void {
+  private failConnectionEpoch(
+    epoch: number, connectionGeneration: number, err: Error, cause: WebChannelErrorCause,
+  ): void {
     if (this.connectionEpoch !== epoch) return;
+    // Retire the failed generation BEFORE invoking embedder code. An error
+    // listener may synchronously call connect() after the failed socket has
+    // already closed; that creates a replacement dial whose onConnected() has
+    // not run yet, so it cannot advance the epoch for itself. Keeping `epoch`
+    // current through notification would let this old terminal continuation's
+    // post-listener guard pass and disconnect that replacement socket.
+    const retiredEpoch = ++this.connectionEpoch;
     this.notifyErrorListeners(err, cause);
-    if (this.connectionEpoch !== epoch) return;
-    this.client.disconnect();
+    if (this.connectionEpoch !== retiredEpoch) return;
+    this.client.disconnectConnectionGeneration(connectionGeneration);
   }
 
   private async handleRaw(subject: string, payload: string): Promise<void> {
