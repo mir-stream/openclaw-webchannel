@@ -733,10 +733,18 @@ describe.skipIf(!NATS_SERVER_BIN)("Per-peer browser + observer scoping", () => {
 // Template-derived preflight probe matrix (P0-3 S3, agent role).
 //
 // These are the EXACT subjects + verdicts the plugin's add-time permission probe
-// (`preflight-probe.ts`) relies on: an enrolled agent (tenant-wide grant) must be
-// ALLOWED to sub + pub its own `…_preflight` subject (P1/P2) and DENIED on a
-// subject OUTSIDE the webchannel namespace (P3, the over-broad negative) and
-// outside its tenant. The plugin cannot mint JWT creds (no @nats-io there), so the
+// (`preflight-probe.ts`) relies on, one case per probe, using that module's real
+// subject SHAPES (preflight-probe.ts:135-139). An enrolled agent (tenant-wide
+// grant) must be:
+//   P1/P2 — ALLOWED to sub + pub its own `webchannel.{tenant}.{acct}._preflight`.
+//   P3    — DENIED on `webchannel._preflight_{hex}._probe`. This one lives INSIDE
+//           the `webchannel.` root, which is exactly why it is the case that
+//           catches an over-broad `webchannel.>` grant: a template grant scoped to
+//           `webchannel.{tenant}.>` denies it, a sloppy `webchannel.>` would not,
+//           and no subject outside the root can tell those two apart.
+//   P4    — DENIED on `_webchannel_preflight_foreign.{hex}`, outside the webchannel
+//           namespace entirely (the globally-over-broad negative).
+// The plugin cannot mint JWT creds (no @nats-io there), so the
 // REAL-server enforcement of the template's agent grant is proven HERE, where the
 // mint + trust chain live; the plugin unit-tests only the probe's -ERR correlation
 // + PING-barrier verdict logic against a controllable fake transport.
@@ -768,7 +776,21 @@ describe.skipIf(!NATS_SERVER_BIN)("Template-derived preflight probe matrix (agen
     expect(denied).toBe(false);
   });
 
-  it("P3: agent is DENIED subscribing OUTSIDE the webchannel namespace (over-broad negative)", async () => {
+  it("P3: agent is DENIED subscribing another tenant's probe subject INSIDE the webchannel root (over-broad `webchannel.>` negative)", async () => {
+    // The real P3 shape (preflight-probe.ts:137). Deliberately inside the
+    // `webchannel.` root: this is the ONLY case here that distinguishes the
+    // template's `webchannel.{tenant}.>` grant from an over-broad `webchannel.>`.
+    const { denied } = await probe(
+      await agentCreds(),
+      `SUB webchannel._preflight_deadbeefcafe1234._probe 1\r\n`,
+    );
+    expect(denied).toBe(true);
+  });
+
+  it("P4: agent is DENIED subscribing OUTSIDE the webchannel namespace (globally over-broad negative)", async () => {
+    // The real P4 shape (preflight-probe.ts:139) — `_webchannel_preflight_foreign.*`
+    // is NOT under the `webchannel.` root, so this catches a grant broad enough to
+    // escape the namespace altogether (e.g. `>`), which P3 alone would not.
     const { denied } = await probe(
       await agentCreds(),
       `SUB _webchannel_preflight_foreign.deadbeef 1\r\n`,

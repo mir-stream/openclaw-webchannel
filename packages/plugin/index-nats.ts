@@ -62,7 +62,7 @@ import { consumeCredentialSource } from "./src/consume-credentials.js";
 import { planAccounts } from "./src/multiplex.js";
 import { detectSharedAudienceCollisions } from "./src/shared-audience.js";
 import {
-  loadPersistedAgentIdentity,
+  loadPersistedIssuer,
   resolveTypingEnabled,
 } from "./src/account-config.js";
 import type { KeyPair } from "./src/e2e-crypto.js";
@@ -359,10 +359,19 @@ export default defineChannelPluginEntry({
           plan.saasBaseUrl ?? config.saas?.baseUrl,
           plan.accountId,
           // SaaS-attested issuer, persisted at `channels add` time
-          // (EnrollmentResult.issuer). The IDENTITY accessor (not the enrolled
-          // transport loader) surfaces it, so issuer survives even when enrolled
-          // transport material is absent/corrupt or the source is static.
-          loadPersistedAgentIdentity(plan.accountId)?.issuer,
+          // (EnrollmentResult.issuer). Read through a DEDICATED accessor that is
+          // gated on NEITHER transport material (a static/BYO account persists
+          // none) NOR the identityKey block. That second exemption is load-bearing
+          // for the collision pre-pass below: `loadPersistedAgentIdentity` returns
+          // undefined whenever `parseIdentityKey` fails, which would demote a
+          // corrupt-key account to the DERIVED issuer while a twin sharing its
+          // explicit `auth.jwt.audience` kept the DELIVERED one — the two would
+          // then no longer PAIR in `detectSharedAudienceCollisions`, the twin
+          // would be served, and a bootstrap JWT minted for the corrupt account
+          // (iss=delivered, aud=shared) would still verify on the twin's
+          // `.register` subject. A broken identity key must fail its own account
+          // closed (the F2 backstop does that), never HIDE a collision from another.
+          loadPersistedIssuer(plan.accountId),
         );
 
         // Validate the complete register-hop trust configuration BEFORE the
@@ -481,6 +490,11 @@ export default defineChannelPluginEntry({
           saasBaseUrl: plan.saasBaseUrl ?? config.saas?.baseUrl,
           tenant,
           accountId,
+          // The resolver is pure and has no logger; it emits at most one notice
+          // (an account declaring mode:"enrolled" while process-wide static NATS
+          // env creds are set — those are IGNORED for it). Silence would hide a
+          // real cross-account relay-credential mix-up, so thread the real logger.
+          warn: (msg) => (api.logger?.warn ?? console.warn)(msg),
         });
         const consumed = await consumeCredentialSource(source, accountId);
         if (consumed.status === "creds-missing") {
@@ -965,9 +979,13 @@ export default defineChannelPluginEntry({
         // peerId would re-open that cross-account eviction across a sub collision.)
         const accountPopChallenges = new PopChallengeStore();
         // Narrow, typed view of the channel methods the register deps feed. The
-        // `RegisterChannelSurface` contract (Pick over NatsChannel, declared in
-        // a type-checked file) is what makes dropping any of these methods from
-        // NatsChannel a compile error — this file is outside `tsc`'s include set.
+        // `RegisterChannelSurface` contract (a Pick over NatsChannel) is what
+        // makes dropping any of these methods from NatsChannel a COMPILE error
+        // rather than a runtime `undefined is not a function` deep inside the
+        // admission path: this annotation is the only place the register wiring
+        // states which methods it structurally requires. This file IS in
+        // `tsc`'s include set (packages/plugin/tsconfig.json, since issue #32),
+        // so that check really runs — do not re-weaken this to an inline object.
         const registerChannel: RegisterChannelSurface = channel;
         channel.setRegisterRequestHandler((subjectPeerId, payload, reply) => {
           // The handler is internally guarded (it replies REGISTER_FAILED on any

@@ -360,6 +360,48 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
     expect(log.mock.calls.some((c) => String(c[0]).includes("permissions WARN"))).toBe(true);
   });
 
+  it("a probe that REJECTS is reported as a probe failure, NOT a relay dial failure", async () => {
+    // The misattribution this pins: the probe runs strictly AFTER the dial has
+    // succeeded, so letting its rejection escape to the outer catch overwrote the
+    // relay verdict and printed "relay dial failed: … flush (PING/PONG) timed out",
+    // sending the operator to check credentials and reachability for what is really
+    // a slow/wedged broker.
+    const log = vi.fn();
+    const disconnect = vi.fn();
+    const report = await runAddPreflight({
+      accountId: "acme",
+      tenant: "t",
+      saasBaseUrl: "https://saas.example",
+      enrollment: {
+        userJwt: "J",
+        userSeed: "S",
+        natsUrl: "wss://relay.example",
+        jwksUrl: deriveJwksUrl("https://saas.example"),
+      },
+      log,
+      fetchImpl: okFetch,
+      consumeDeps: {
+        loadPersisted: () => ({ userJwt: "J", userSeed: "S", natsUrl: "wss://relay.example" }) as never,
+        makeSigner: () => async () => "sig",
+        transportFactory: () => ({ connect: async () => {}, disconnect }) as never,
+      },
+      runProbes: async () => {
+        throw new Error("NatsTransport: flush (PING/PONG) timed out after 2000ms");
+      },
+    });
+    const lines = log.mock.calls.map((c) => String(c[0])).join("\n");
+    // The dial leg keeps its OK verdict — it demonstrably succeeded.
+    expect(lines).toContain("relay dial ✓");
+    expect(lines).not.toContain("relay dial failed");
+    // …and the failure is attributed to the probe, quoting the real error.
+    expect(lines).toContain("permissions FAIL");
+    expect(lines).toContain("flush (PING/PONG) timed out after 2000ms");
+    // FAIL-CLOSED: an unverified permission set must never report a clean PASS.
+    expect(report.ok).toBe(false);
+    // The transport is still torn down — the `finally` must survive the local catch.
+    expect(disconnect).toHaveBeenCalledOnce();
+  });
+
   it("uses the SaaS-DELIVERED issuer over the derivation (pin > delivered > derived)", async () => {
     const log = vi.fn();
     const report = await runAddPreflight({

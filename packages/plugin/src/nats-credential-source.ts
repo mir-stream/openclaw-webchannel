@@ -125,6 +125,16 @@ export type ResolveNatsCredentialSourceInput = {
   env?: Record<string, string | undefined>;
   /** File reader for `.creds` files (defaults to `fs.readFileSync`). Injectable. */
   readFile?: (path: string) => string;
+  /**
+   * Optional warning sink. The resolver is otherwise PURE (its only I/O is the
+   * injectable `readFile`), and it has no logger of its own, so a diagnostic it
+   * must emit — currently only the "process-wide static env creds were ignored
+   * for this `mode:"enrolled"` account" notice — is pushed through here instead
+   * of `console`. Defaults to a NO-OP (not `console.warn`) so unit tests stay
+   * silent and can assert on the call rather than on stderr. Call sites that
+   * have a logger (`index-nats.ts`) thread a real one.
+   */
+  warn?: (message: string) => void;
 };
 
 const DEFAULT_NATS_URL = "ws://127.0.0.1:4222";
@@ -211,11 +221,15 @@ function extractCredsBlock(content: string, label: string): string | undefined {
 /**
  * Resolve a discriminated `NatsCredentialSource` from config + env.
  *
- * Precedence (env OVERRIDES config), evaluated top-to-bottom:
- *   1. STATIC — any static secret is present: `WEBCHANNEL_NATS_CREDS`,
+ * Precedence, evaluated top-to-bottom:
+ *   0. EXPLICIT `credentials.mode` — an operator-declared mode is AUTHORITATIVE
+ *      in BOTH directions. `"enrolled"` pins the account to the device-flow no
+ *      matter what static material is lying around (see the block below for why
+ *      that asymmetry against env matters); `"static"` is itself a static signal.
+ *   1. STATIC — an inferred static signal (no explicit mode): `WEBCHANNEL_NATS_CREDS`,
  *               `WEBCHANNEL_NATS_USER_JWT` + `WEBCHANNEL_NATS_USER_SEED`,
- *               `credentials.mode === "static"`, `credentials.credsFile`, or
- *               inline `credentials.userJwt` + `userSeed`.
+ *               `credentials.credsFile`, or inline `credentials.userJwt` + `userSeed`.
+ *               Within static, env OVERRIDES config for the secret VALUES.
  *   2. ENROLLED — the default (unchanged production path).
  *
  * Pure given its inputs (the only I/O is the injectable `readFile` for `.creds`),
@@ -230,6 +244,7 @@ export function resolveNatsCredentialSource(
       "webchannel: WEBCHANNEL_NATS_DEV_OPEN was removed; there is no unauthenticated NATS mode. Enroll with `openclaw channels add --channel webchannel`.",
     );
   }
+  const warn = input.warn ?? (() => {});
   const nats = input.natsConfig;
   const creds = nats?.credentials;
 
@@ -239,6 +254,79 @@ export function resolveNatsCredentialSource(
     input.legacyNats?.url ??
     DEFAULT_NATS_URL;
 
+  // The three PROCESS-WIDE static env signals. Read here (not just in the static
+  // block) because block 0 has to reason about whether a static signal came from
+  // this ACCOUNT's config or from the ambient process environment.
+  const envCredsFilePath = env["WEBCHANNEL_NATS_CREDS"];
+  const envJwt = env["WEBCHANNEL_NATS_USER_JWT"];
+  const envSeed = env["WEBCHANNEL_NATS_USER_SEED"];
+
+  // ── 0. EXPLICIT `mode: "enrolled"` is AUTHORITATIVE ───────────────────────
+  // Before this block, `mode` only had force in the static direction: any static
+  // signal won, and `mode:"enrolled"` (which `setup.ts` writes into EVERY
+  // wizard-created account) was inert. That made the documented "explicit source
+  // selector" one-way, and opened a real cross-account isolation hole:
+  //
+  //   `WEBCHANNEL_NATS_USER_JWT` / `_SEED` / `WEBCHANNEL_NATS_CREDS` are
+  //   PROCESS-WIDE. On a gateway that serves one BYO-NATS account plus several
+  //   enrolled ones, exporting those env vars for the BYO account also flipped
+  //   every enrolled account to static. Each flipped account then dialed the ENV
+  //   url (the static branch in `consume-credentials.ts` deliberately never
+  //   consults the persisted `enrollment.natsUrl`) carrying ANOTHER account's
+  //   NATS user credential — silently collapsing per-account relay isolation,
+  //   with no warning. An explicit `mode:"enrolled"` now forecloses that.
+  //
+  // The two static-material sources are treated DIFFERENTLY on purpose, because
+  // they carry different operator intent:
+  //
+  //   - ACCOUNT CONFIG (`credentials.credsFile` / `.userJwt` / `.userSeed`) is
+  //     scoped to this one account and was hand-written next to the `mode` field.
+  //     "enrolled" + account-level static secrets is a contradiction the operator
+  //     typed deliberately, and no silent winner is defensible (picking static
+  //     ignores the declared mode; picking enrolled ignores real secrets). House
+  //     rule is fail-closed ⇒ refuse to start and name both sides.
+  //   - PROCESS ENV is GLOBAL and is NOT an account-level statement of intent —
+  //     it is ambient. Hard-erroring on it would break the legitimate mixed
+  //     BYO + enrolled gateway that motivated this fix in the first place, so
+  //     enrolled simply WINS and we warn that the ambient creds were ignored here.
+  if (creds?.mode === "enrolled") {
+    const path = "channels.webchannel.nats.credentials";
+    const contradictions = [
+      creds.credsFile !== undefined && `${path}.credsFile`,
+      creds.userJwt !== undefined && `${path}.userJwt`,
+      creds.userSeed !== undefined && `${path}.userSeed`,
+    ].filter((v): v is string => typeof v === "string");
+    if (contradictions.length > 0) {
+      throw new Error(
+        `webchannel: account "${input.accountId}" declares ${path}.mode:"enrolled" but the SAME ` +
+          `account config also carries static (bring-your-own-NATS) material: ` +
+          `${contradictions.join(", ")}. ` +
+          `Those select different credential sources and the config does not say which wins. ` +
+          `Pick one: remove mode:"enrolled" to dial your own NATS with those secrets, or delete ` +
+          `the credentials.credsFile/userJwt/userSeed fields to stay on the SaaS device-flow. ` +
+          `Refusing to start.`,
+      );
+    }
+    const ignoredEnv = [
+      envCredsFilePath !== undefined && "WEBCHANNEL_NATS_CREDS",
+      envJwt !== undefined && "WEBCHANNEL_NATS_USER_JWT",
+      envSeed !== undefined && "WEBCHANNEL_NATS_USER_SEED",
+    ].filter((v): v is string => typeof v === "string");
+    if (ignoredEnv.length > 0) {
+      warn(
+        `webchannel: account "${input.accountId}" declares ` +
+          `channels.webchannel.nats.credentials.mode:"enrolled", so the process-wide static NATS ` +
+          `credentials in ${ignoredEnv.join(" + ")} were IGNORED for this account (it stays on the ` +
+          `SaaS device-flow and its own SaaS-delivered relay). Those env vars are global, so they ` +
+          `apply only to accounts that do NOT declare mode:"enrolled" — this is how a gateway ` +
+          `serves BYO-NATS and enrolled accounts side by side without cross-wiring their relay ` +
+          `credentials. If this account was MEANT to be bring-your-own-NATS, remove its ` +
+          `mode:"enrolled" (or set mode:"static").`,
+      );
+    }
+    return resolveEnrolled(input, env, creds, url);
+  }
+
   // ── 1. STATIC (bring-your-own-NATS) ───────────────────────────────────────
   // Re-enabled in P0-3: static credentials pick the TRANSPORT (a BYO relay +
   // user JWT/seed) but are NOT an auth bypass. The resolver only produces the
@@ -247,9 +335,7 @@ export function resolveNatsCredentialSource(
   // `loadPersistedAgentIdentity` and fail-closed skips serving when it is
   // absent). Before P0-3 a static signal here threw a fail-loud migration error
   // (P0-2 landing site); that throw is now removed and this block is live.
-  const credsFilePath = env["WEBCHANNEL_NATS_CREDS"] ?? creds?.credsFile;
-  const envJwt = env["WEBCHANNEL_NATS_USER_JWT"];
-  const envSeed = env["WEBCHANNEL_NATS_USER_SEED"];
+  const credsFilePath = envCredsFilePath ?? creds?.credsFile;
   const configJwt = resolveSecretRef(
     creds?.userJwt,
     "channels.webchannel.nats.credentials.userJwt",
@@ -262,7 +348,7 @@ export function resolveNatsCredentialSource(
   );
 
   // An explicit `credentials.mode: "static"` is itself a static signal (documented
-  // precedence #1 above): honoring it means an operator who declared static but
+  // precedence #0/#1 above): honoring it means an operator who declared static but
   // supplied no secrets gets the loud "incomplete static credentials" error below
   // rather than a silent, surprising downgrade to the enrolled device-flow. This
   // matches the fail-loud guard P0-2 fenced this block with (which also keyed on
@@ -309,10 +395,26 @@ export function resolveNatsCredentialSource(
   }
 
   // ── 2. ENROLLED (SaaS device-flow — the default) ──────────────────────────
-  // The resolver owns saasBaseUrl precedence so a `nats.credentials.saasBaseUrl`
-  // set by an operator is actually honored (previously it was silently ignored):
-  //   env WEBCHANNEL_SAAS_BASE_URL > nats.credentials.saasBaseUrl
-  //     > top-level api.config.saas?.baseUrl (input.saasBaseUrl) > default.
+  return resolveEnrolled(input, env, creds, url);
+}
+
+/**
+ * Build the `enrolled` source. Extracted so the DEFAULT fall-through (block 2)
+ * and the explicit `mode:"enrolled"` short-circuit (block 0) return the byte-
+ * identical source — an explicit declaration must never resolve differently from
+ * the inferred default, or the two paths could drift on saasBaseUrl precedence.
+ *
+ * The resolver owns saasBaseUrl precedence so a `nats.credentials.saasBaseUrl`
+ * set by an operator is actually honored (previously it was silently ignored):
+ *   env WEBCHANNEL_SAAS_BASE_URL > nats.credentials.saasBaseUrl
+ *     > top-level api.config.saas?.baseUrl (input.saasBaseUrl) > default.
+ */
+function resolveEnrolled(
+  input: ResolveNatsCredentialSourceInput,
+  env: Record<string, string | undefined>,
+  creds: WebchannelNatsCredentialsConfig | undefined,
+  url: string,
+): Extract<NatsCredentialSource, { mode: "enrolled" }> {
   const saasBaseUrl =
     env["WEBCHANNEL_SAAS_BASE_URL"] ??
     creds?.saasBaseUrl ??

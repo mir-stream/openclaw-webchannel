@@ -548,6 +548,44 @@ export function loadPersistedAgentIdentity(
 }
 
 /**
+ * Load ONLY the SaaS-delivered bootstrap-JWT issuer (`enrollment.issuer`) for an
+ * account, with NO gate on the `identityKey` block.
+ *
+ * Why this exists as its own accessor rather than reusing either loader above:
+ *
+ *   - `loadPersistedAgentIdentity` returns `undefined` outright when
+ *     `parseIdentityKey` fails, which would drop a perfectly good delivered issuer
+ *     along with the unusable key. That coupling is correct for its OWN purpose
+ *     (no attested identity ⇒ the account must not serve) but WRONG for the issuer,
+ *     because the issuer feeds the shared-audience collision PRE-PASS, which runs
+ *     for its own reasons and must see every account's real issuer.
+ *   - `loadPersistedEnrolledCreds` gates on transport material (userJwt/userSeed),
+ *     which a static/BYO-NATS account legitimately does not persist.
+ *
+ * The security consequence of getting this wrong is concrete: two accounts sharing
+ * an explicit `auth.jwt.audience` are only PAIRED by
+ * `detectSharedAudienceCollisions` when they agree on the issuer. If a corrupt
+ * `identityKey` silently demoted one account to the DERIVED issuer while its twin
+ * kept the DELIVERED one, the pair would no longer collide, the collision pre-pass
+ * would let the twin serve, and a bootstrap JWT minted for the corrupt account
+ * (iss=delivered, aud=shared) would still verify on the twin's `.register` subject
+ * — precisely the confused-deputy the pre-pass exists to prevent. A broken key must
+ * never be able to HIDE a collision.
+ *
+ * Returns `undefined` when the file is absent/malformed or `enrollment.issuer` is
+ * not a non-empty string. Shares `readPersistedCredentials` with both loaders above
+ * so the on-disk shape can't drift between them.
+ */
+export function loadPersistedIssuer(
+  accountId: string,
+  opts: PersistedCredsReadOpts = {},
+): string | undefined {
+  const parsed = readPersistedCredentials(accountId, opts);
+  const issuer = parsed?.enrollment?.issuer;
+  return typeof issuer === "string" && issuer.length > 0 ? issuer : undefined;
+}
+
+/**
  * F2 — decode a persisted `identityKey.{publicKey,privateKey}` (base64url) into a
  * raw-bytes `KeyPair`. Returns `undefined` unless BOTH halves are present and
  * decode to exactly 32 bytes (an X25519 key), so a malformed/partial block is

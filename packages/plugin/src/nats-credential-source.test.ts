@@ -225,6 +225,157 @@ describe("resolveNatsCredentialSource — static signals resolve (P0-3, no longe
   });
 });
 
+describe("resolveNatsCredentialSource — explicit mode:\"enrolled\" is authoritative", () => {
+  // The hole this closes: WEBCHANNEL_NATS_USER_JWT/_SEED/_CREDS are PROCESS-WIDE.
+  // Before this, ANY static signal won, so exporting them for one BYO account also
+  // flipped every enrolled account to static — each then dialing the ENV relay with
+  // ANOTHER account's user credential, collapsing per-account relay isolation.
+  // `setup.ts` writes mode:"enrolled" into every wizard-created account, so that
+  // declaration is exactly the thing that must now hold the line.
+
+  it("env-only static creds do NOT flip a mode:\"enrolled\" account (and it warns once)", () => {
+    const warn = vi.fn();
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      saasBaseUrl: "https://saas.example",
+      natsConfig: { credentials: { mode: "enrolled" } },
+      env: {
+        WEBCHANNEL_NATS_USER_JWT: "other-accounts-jwt",
+        WEBCHANNEL_NATS_USER_SEED: "other-accounts-seed",
+      },
+      warn,
+    });
+    expect(s.mode).toBe("enrolled");
+    expect(warn).toHaveBeenCalledTimes(1);
+    const msg = warn.mock.calls[0]![0] as string;
+    // Must name the account and the exact env vars it ignored — a bare "ignored
+    // env creds" line is unactionable on a multi-account gateway.
+    expect(msg).toContain('"a1"');
+    expect(msg).toContain("WEBCHANNEL_NATS_USER_JWT");
+    expect(msg).toContain("WEBCHANNEL_NATS_USER_SEED");
+    expect(msg).toMatch(/IGNORED/);
+  });
+
+  it("WEBCHANNEL_NATS_CREDS alone also loses to mode:\"enrolled\" (and is named in the warning)", () => {
+    const warn = vi.fn();
+    // readFile must never be reached: an enrolled account must not even parse a
+    // process-wide .creds file it was never meant to use.
+    const readFile = vi.fn().mockReturnValue(CREDS_FILE);
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      natsConfig: { credentials: { mode: "enrolled" } },
+      env: { WEBCHANNEL_NATS_CREDS: "/other-account.creds" },
+      readFile,
+      warn,
+    });
+    expect(s.mode).toBe("enrolled");
+    expect(readFile).not.toHaveBeenCalled();
+    expect(warn.mock.calls[0]![0]).toContain("WEBCHANNEL_NATS_CREDS");
+  });
+
+  it("resolves the SAME enrolled source the default fall-through would (no drift)", () => {
+    const explicit = resolveNatsCredentialSource({
+      ...BASE,
+      saasBaseUrl: "https://top-level.example",
+      natsConfig: {
+        url: "wss://cfg:4222",
+        credentials: { mode: "enrolled", saasBaseUrl: "https://creds.example" },
+      },
+      env: { WEBCHANNEL_NATS_USER_JWT: "j", WEBCHANNEL_NATS_USER_SEED: "s" },
+    });
+    const inferred = resolveNatsCredentialSource({
+      ...BASE,
+      saasBaseUrl: "https://top-level.example",
+      natsConfig: { url: "wss://cfg:4222", credentials: { saasBaseUrl: "https://creds.example" } },
+      env: {},
+    });
+    expect(explicit).toEqual(inferred);
+  });
+
+  it("mode:\"enrolled\" + ACCOUNT-CONFIG static secrets is a contradiction ⇒ throws", () => {
+    // Account-level config is scoped intent typed next to `mode`, unlike ambient
+    // env. No silent winner is defensible, so fail closed and name both sides.
+    for (const credentials of [
+      { mode: "enrolled" as const, userJwt: "j", userSeed: "s" },
+      { mode: "enrolled" as const, credsFile: "/byo.creds" },
+      { mode: "enrolled" as const, userSeed: "s" },
+    ]) {
+      expect(() =>
+        resolveNatsCredentialSource({ ...BASE, natsConfig: { credentials }, env: {} }),
+      ).toThrow(/mode:"enrolled" but the SAME account config also carries static/);
+    }
+  });
+
+  it("the contradiction error names the account and the offending config paths", () => {
+    let caught: Error | undefined;
+    try {
+      resolveNatsCredentialSource({
+        ...BASE,
+        natsConfig: { credentials: { mode: "enrolled", credsFile: "/x", userSeed: "s" } },
+        env: {},
+      });
+    } catch (err) {
+      caught = err as Error;
+    }
+    expect(caught).toBeDefined();
+    expect(caught!.message).toContain('"a1"');
+    expect(caught!.message).toContain("channels.webchannel.nats.credentials.credsFile");
+    expect(caught!.message).toContain("channels.webchannel.nats.credentials.userSeed");
+    // Not reported as an offender — it was never set.
+    expect(caught!.message).not.toContain("channels.webchannel.nats.credentials.userJwt,");
+    expect(caught!.message).toMatch(/Refusing to start/);
+  });
+
+  it("mode:\"enrolled\" with no static material anywhere ⇒ enrolled, and NO warning", () => {
+    const warn = vi.fn();
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      saasBaseUrl: "https://saas.example",
+      natsConfig: { credentials: { mode: "enrolled" } },
+      env: {},
+      warn,
+    });
+    expect(s.mode).toBe("enrolled");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op without an injected warn (the resolver never touches console)", () => {
+    expect(() =>
+      resolveNatsCredentialSource({
+        ...BASE,
+        natsConfig: { credentials: { mode: "enrolled" } },
+        env: { WEBCHANNEL_NATS_USER_JWT: "j" },
+      }),
+    ).not.toThrow();
+  });
+
+  it("REGRESSION: mode ABSENT (legacy config) + env secrets still resolves STATIC", () => {
+    // The enrolled-wins rule keys on an EXPLICIT declaration only. Legacy configs
+    // written before `mode` existed must keep inferring static from any signal —
+    // silently downgrading them to the device-flow would break working gateways.
+    const warn = vi.fn();
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      natsConfig: { url: "wss://byo:4222" },
+      env: { WEBCHANNEL_NATS_USER_JWT: "j", WEBCHANNEL_NATS_USER_SEED: "s" },
+      warn,
+    }) as Extract<NatsCredentialSource, { mode: "static" }>;
+    expect(s.mode).toBe("static");
+    expect(s.userJwt).toBe("j");
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("REGRESSION: mode:\"static\" is unchanged — env secrets resolve static", () => {
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      natsConfig: { credentials: { mode: "static" } },
+      env: { WEBCHANNEL_NATS_USER_JWT: "j", WEBCHANNEL_NATS_USER_SEED: "s" },
+    }) as Extract<NatsCredentialSource, { mode: "static" }>;
+    expect(s.mode).toBe("static");
+    expect(s.userSeed).toBe("s");
+  });
+});
+
 describe("resolveNatsCredentialSource — enrolled (default)", () => {
   it("defaults to enrolled and carries the SaaS base URL + tenant/agent", () => {
     const s = resolveNatsCredentialSource({

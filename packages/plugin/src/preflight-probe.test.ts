@@ -157,4 +157,22 @@ describe("runPermissionProbes — sequential PING-barrier verdicts", () => {
     await runPermissionProbes(t, IDS, { foreignSubject: FOREIGN, foreignNamespaceSubject: FOREIGN_NAMESPACE });
     expect(t.listenerCount("error")).toBe(0);
   });
+
+  it("a rejecting flush() PROPAGATES (and still unhooks its listener) — the contract preflight relies on", async () => {
+    // FakeProbeTransport's flush resolves unconditionally, so nothing here ever
+    // exercised the barrier-timeout path (nats-transport.ts:500 rejects). That gap
+    // is why the rejection's misattribution as a "relay dial failed" survived:
+    // runPermissionProbes has no internal catch and MUST surface the rejection so
+    // its caller can attribute it to the probe leg (see preflight.test.ts). Pinning
+    // both halves of that contract — it rejects, and it does not leak a listener.
+    const t = new FakeProbeTransport(() => false);
+    const boom = new Error("NatsTransport: flush (PING/PONG) timed out after 2000ms");
+    t.flush = async () => {
+      throw boom;
+    };
+    await expect(
+      runPermissionProbes(t, IDS, { foreignSubject: FOREIGN, foreignNamespaceSubject: FOREIGN_NAMESPACE }),
+    ).rejects.toThrow("flush (PING/PONG) timed out");
+    expect(t.listenerCount("error")).toBe(0);
+  });
 });

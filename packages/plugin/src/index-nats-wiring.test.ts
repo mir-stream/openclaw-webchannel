@@ -123,11 +123,20 @@ describe("index-nats.ts wiring contract — shared-audience fail-closed pre-pass
     expect(INDEX_NATS_SOURCE).not.toContain("registerHopAudClaims");
   });
 
-  it("derives the register-hop issuer from the IDENTITY accessor (survives absent transport creds)", () => {
-    // Issuer must come from loadPersistedAgentIdentity (decoupled from transport
-    // material), not the enrolled-transport loader.
-    expect(INDEX_NATS_SOURCE).toMatch(/loadPersistedAgentIdentity\(plan\.accountId\)\?\.issuer/);
+  it("derives the register-hop issuer from the ISSUER-ONLY accessor (gated on neither transport creds nor identityKey)", () => {
+    // The issuer feeds the shared-audience collision pre-pass, so it must be read
+    // through an accessor that NEITHER of the other two loaders' gates can suppress:
+    //   - `loadPersistedEnrolledCreds` gates on userJwt+userSeed → a static/BYO
+    //     account (which persists none) would lose its issuer.
+    //   - `loadPersistedAgentIdentity` gates on a parseable identityKey → a CORRUPT
+    //     key would demote the account to the DERIVED issuer, un-pairing it from a
+    //     twin that shares its explicit aud and letting that twin serve. A broken
+    //     key must fail its OWN account closed (the F2 backstop), never hide a
+    //     collision from another account.
+    expect(INDEX_NATS_SOURCE).toMatch(/loadPersistedIssuer\(plan\.accountId\)/);
     expect(INDEX_NATS_SOURCE).not.toContain("loadPersistedEnrolledCreds");
+    // The identity accessor must not be what feeds the issuer argument.
+    expect(INDEX_NATS_SOURCE).not.toMatch(/loadPersistedAgentIdentity\(plan\.accountId\)\?\.issuer/);
   });
 
   it("validates JWT auth before the serving loop can open a NATS transport", () => {

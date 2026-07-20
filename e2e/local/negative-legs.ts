@@ -1,12 +1,14 @@
 // P0-3 S4 — shared adversarial negative legs N1 + N2 (run in every mode A/B/C).
 //
-// N1 pre-register no-turn: a valid-creds publish to account A's `…{peerId}.in`
-// WITHOUT registering must create NO turn. (Mechanism note: the gateway subscribes
-// a peer's `.in` ONLY at registration — nats-channel.ts:297 — and unregister drops
-// the sub + key together, so pre-register the subject has NO subscriber and the
-// message never reaches dispatch. That is STRONGER than the drop-line the plan
-// assumed; the runner greps the gateway log for the `no registered session key`
-// drop as a best-effort signal, but the PASS gate here is the no-turn assertion.)
+// N1 pre-register no-turn: a valid-creds publish to account B's `…{peerId}.in`
+// WITHOUT registering must create NO turn — followed by a POSITIVE CONTROL that
+// registers the SAME peerId and proves the SAME `.in` subject then DOES produce an
+// outbound frame. (Mechanism note: the gateway subscribes a peer's `.in` ONLY at
+// registration — nats-channel.ts:297 — and unregister drops the sub + key together,
+// so pre-register the subject has NO subscriber and the message never reaches
+// dispatch. That is STRONGER than the drop-line the plan assumed; the runner greps
+// the gateway log for the `no registered session key` drop as a best-effort signal,
+// but the PASS gate here is the no-turn assertion + its control.)
 //
 // N2 wrong-binding 401: account A's bootstrap JWT presented on account B's
 // `.register` subject must be rejected 401 (aud mismatch) — the live twin of the
@@ -14,7 +16,7 @@
 //
 // Exit: 0 all legs passed · 4 a leg failed · 2 setup error.
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, webcrypto } from "node:crypto";
 
 import {
   mintNatsUser,
@@ -24,6 +26,7 @@ import {
   subscribe,
 } from "./raw-probe.js";
 import type { NatsMessage } from "../../packages/plugin/src/nats-transport.js";
+import { WebChannelNatsClient } from "../../packages/client/src/nats-client.js";
 
 const ISSUER = reqEnv("WEBCHANNEL_ISSUER_URL");
 const NATS_WS = reqEnv("WEBCHANNEL_NATS_URL");
@@ -50,7 +53,24 @@ function fail(leg: string, msg: string): never {
   process.exit(4);
 }
 
-// ── N1 — pre-register publish creates no turn ────────────────────────────────
+// ── N1 — pre-register publish creates no turn (+ positive control) ───────────
+//
+// ACCOUNT CHOICE IS LOAD-BEARING: this leg runs against ACCOUNT_B, which every
+// mode configures as dmSecurity:"open" (run-byo-static.sh / run-external-account.sh
+// / run-all-real.sh). It must NOT be moved to ACCOUNT_A, which all three configure
+// as dmSecurity:"allowlist" with allowFrom:["$PEER_A"]. inbound.ts:131 denies a
+// non-allowlisted peer BEFORE dispatch and emits no reply, so on ACCOUNT_A this
+// leg's random `n1-noturn-<hex>` peer would produce 0 outbound frames whether or
+// not the guarded regression exists — a second sufficient cause that makes the
+// assertion VACUOUS and unable to ever fail. lib-negative-legs.sh:55-59 records the
+// same reasoning for N3.
+//
+// The POSITIVE CONTROL closes the other half of the vacuity gap: proving "0
+// outbound" only means something if the same stimulus CAN produce an outbound
+// frame. After the no-turn window, the same peerId registers for real (production
+// WebChannelNatsClient, as in n3-key-swap.ts's recovery phase) and the SAME `.out`
+// subscription must then observe traffic — so a broken relay, a dead gateway, or a
+// typo'd subject can no longer masquerade as a passing security assertion.
 async function n1PreRegisterNoTurn(): Promise<void> {
   const peerId = `n1-noturn-${randomBytes(4).toString("hex")}`;
   const creds = await mintNatsUser(ISSUER, { tenant: TENANT, role: "browser", peerId });
@@ -61,8 +81,8 @@ async function n1PreRegisterNoTurn(): Promise<void> {
     clientName: "n1-probe",
   });
   try {
-    const inSubj = `webchannel.${TENANT}.${ACCOUNT_A}.${peerId}.in`;
-    const outSubj = `webchannel.${TENANT}.${ACCOUNT_A}.${peerId}.out`;
+    const inSubj = `webchannel.${TENANT}.${ACCOUNT_B}.${peerId}.in`;
+    const outSubj = `webchannel.${TENANT}.${ACCOUNT_B}.${peerId}.out`;
     let outbound = 0;
     subscribe(transport, outSubj, (_m: NatsMessage) => {
       outbound++;
@@ -90,9 +110,102 @@ async function n1PreRegisterNoTurn(): Promise<void> {
       fail("N1", `expected NO outbound frame for an unregistered peer, saw ${outbound}`);
     }
     pass("N1", `pre-register publish to ${inSubj} created no turn (0 outbound in ${NO_TURN_WINDOW_MS}ms)`);
+
+    // ── POSITIVE CONTROL — same peerId, same subjects, now REGISTERED ────────
+    await n1PositiveControl(peerId);
+    // The raw `.out` subscription above was never torn down, so this counter is
+    // the SAME observer that reported 0 a moment ago. Going 0 → >0 with only
+    // registration changed is what makes the negative assertion falsifiable.
+    if (outbound === 0) {
+      fail(
+        "N1",
+        `positive control saw NO outbound frame on ${outSubj} AFTER registering the same peer — ` +
+          `the no-turn assertion above is therefore vacuous (dead gateway, wrong subject, or ` +
+          `an account that denies this peer before dispatch)`,
+      );
+    }
+    pass("N1", `positive control: same peer registered → ${outbound} outbound frame(s) on ${outSubj}`);
   } finally {
     transport.disconnect();
   }
+}
+
+/**
+ * Register `peerId` for real against ACCOUNT_B and drive one turn, using the
+ * PRODUCTION client (identical construction to n3-key-swap.ts's recovery phase:
+ * device X25519 + Ed25519 PoP keys, a bootstrap JWT carrying them, and the F2
+ * SaaS-pinned agent key). Nothing is faked — a stubbed register would prove
+ * nothing about whether the `.in` subject is genuinely live.
+ *
+ * Deliberately does NOT assert on the echo text: this control's only job is to
+ * show the stimulus reaches the gateway and comes back out on `.out`. The full
+ * content round-trip is already asserted by the mode runners' own happy-path legs
+ * and by N3's recovery phase.
+ */
+async function n1PositiveControl(peerId: string): Promise<void> {
+  // Device X25519 (cnf) — extractable so the raw public key can be exported.
+  const x = (await webcrypto.subtle.generateKey({ name: "X25519" }, true, [
+    "deriveBits",
+  ])) as CryptoKeyPair;
+  const deviceX25519PublicKey = Buffer.from(
+    new Uint8Array(await webcrypto.subtle.exportKey("raw", x.publicKey)),
+  ).toString("base64url");
+  // Device Ed25519 (PoP) — non-extractable signer.
+  const ed = (await webcrypto.subtle.generateKey({ name: "Ed25519" }, false, [
+    "sign",
+    "verify",
+  ])) as CryptoKeyPair;
+  const edJwk = (await webcrypto.subtle.exportKey("jwk", ed.publicKey)) as { x?: string };
+  if (!edJwk.x) throw new Error("Ed25519 jwk missing x");
+
+  const creds = await mintNatsUser(ISSUER, { tenant: TENANT, role: "browser", peerId });
+  const boot = await mintBootstrapJwt(ISSUER, {
+    tenant: TENANT,
+    accountId: ACCOUNT_B,
+    peerId,
+    deviceX25519PublicKey,
+    devicePopPublicKey: edJwk.x,
+  });
+  if (!boot.agentPublicKey) throw new Error("bootstrap-jwt carried no agentPublicKey (F2 pin)");
+
+  const client = new WebChannelNatsClient({
+    url: creds.natsUrl ?? NATS_WS,
+    jwt: boot.jwt,
+    accountId: ACCOUNT_B,
+    tenant: TENANT,
+    peerId,
+    natsCredentials: { userJwt: creds.userJwt, userSeedRaw: creds.userSeedRaw },
+    registration: {
+      devicePrivateKey: ed.privateKey,
+      deviceX25519PrivateKey: x.privateKey,
+      pinnedAgentPublicKey: boot.agentPublicKey,
+    },
+  });
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => resolve(), 25000);
+    client.onError((e, c) => {
+      clearTimeout(timer);
+      console.error(`[neg] N1 positive-control onError: ${e.message} (cause=${c})`);
+      resolve();
+    });
+    client.onMessage((m) => {
+      if (m.type === "agent_message") {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    client.connect();
+    client.sendUserMessage("n1 positive control");
+  });
+  try {
+    client.disconnect();
+  } catch {
+    /* terminal already */
+  }
+  // Let the raw `.out` subscriber drain anything still in flight before the
+  // caller reads its counter (the client's own socket closing says nothing about
+  // what the separate probe connection has already been delivered).
+  await sleep(500);
 }
 
 // ── N2 — account A token on account B's .register is 401 ─────────────────────

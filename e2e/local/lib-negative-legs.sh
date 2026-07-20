@@ -56,7 +56,15 @@ run_negative_legs_n1_n2() {
 # recovery leg registers a FRESH RANDOM peerId and must complete a real echo
 # round-trip — an allowlist account (e.g. run-all-real's ACCT_A, pinned to its own
 # echo peer) would deny that random peer's message ("inbound denied … not-
-# allowlisted") and the recovery would spuriously fail. N1/N2 stay on ACCT_A.
+# allowlisted") and the recovery would spuriously fail.
+#
+# N1 runs on ACCT_B for the SAME reason plus a sharper one: on an allowlist account
+# its random peer is denied at inbound.ts:131 BEFORE dispatch, so "0 outbound" would
+# hold regardless of the regression it guards — the assertion could never fail. N1
+# additionally runs a positive control that registers that peer and requires traffic
+# on the same subject, which likewise needs an open account. Only N2 stays on ACCT_A
+# (it asserts a 401 on ACCT_B's `.register` using an ACCT_A-bound token, so it needs
+# both account ids and never depends on either account's dmSecurity).
 run_negative_leg_n3() {
   local n3_peer="n3-victim-${RANDOM}"
   local n3_account="$ACCT_B"

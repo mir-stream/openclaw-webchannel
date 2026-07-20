@@ -473,6 +473,11 @@ export async function runAddPreflight(
       tenant: opts.tenant,
       accountId: opts.accountId,
       ...(opts.env !== undefined ? { env: opts.env } : {}),
+      // Surface the resolver's one notice (mode:"enrolled" account + process-wide
+      // static NATS env creds ⇒ env ignored here) while the operator is still
+      // watching the add — that is exactly when a mixed BYO/enrolled gateway's
+      // env-vs-config intent mismatch is cheapest to fix.
+      warn: (msg) => opts.log(`[webchannel] ${msg}`),
     });
     const consumed = await withTimeout(
       consumeCredentialSource(source, opts.accountId, opts.consumeDeps ?? {}),
@@ -490,11 +495,38 @@ export async function runAddPreflight(
     } else {
       relay = { ok: true };
       try {
-        probeReport = await (opts.runProbes ?? runPermissionProbes)(
-          consumed.connection.transport,
-          { tenant: opts.tenant, accountId: opts.accountId },
-          { ...(opts.probeTimeoutMs !== undefined ? { timeoutMs: opts.probeTimeoutMs } : {}) },
-        );
+        try {
+          probeReport = await (opts.runProbes ?? runPermissionProbes)(
+            consumed.connection.transport,
+            { tenant: opts.tenant, accountId: opts.accountId },
+            { ...(opts.probeTimeoutMs !== undefined ? { timeoutMs: opts.probeTimeoutMs } : {}) },
+          );
+        } catch (probeErr) {
+          // ATTRIBUTION, not tolerance. The probe runs AFTER the dial has already
+          // demonstrably succeeded, so letting its rejection escape to the outer
+          // catch would overwrite `relay` with `{ error }` and print "relay dial
+          // failed: NatsTransport: flush (PING/PONG) timed out after 2000ms" —
+          // sending the operator to check credentials and reachability for what is
+          // actually a slow or wedged BROKER. The dial verdict stays OK and the
+          // failure is reported against the leg that really failed.
+          //
+          // Still FAIL-CLOSED: a probe that could not complete proves NOTHING about
+          // the account's grants, and `channels add` must not report a clean PASS on
+          // an unverified permission set. Synthesizing verdict:"FAIL" (results: []
+          // — no probe produced a result) makes `ok = false` below, exactly as a
+          // DENIED self-subtree would.
+          probeReport = {
+            results: [],
+            verdict: "FAIL",
+            line:
+              `NATS permission probe FAIL — the probe itself could not complete: ` +
+              `${probeErr instanceof Error ? probeErr.message : String(probeErr)}. ` +
+              `The relay dial SUCCEEDED, so this is not a credential or reachability ` +
+              `problem — the broker did not answer the probe's PING/PONG barrier in time ` +
+              `(slow, overloaded, or wedged). The account's grants are UNVERIFIED; re-run ` +
+              `channels add once the relay is healthy.`,
+          };
+        }
       } finally {
         try {
           consumed.connection.transport.disconnect();

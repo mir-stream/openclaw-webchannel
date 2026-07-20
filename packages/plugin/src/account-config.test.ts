@@ -18,6 +18,7 @@ import {
   resolveReadCredentialPath,
   loadPersistedEnrolledCreds,
   loadPersistedAgentIdentity,
+  loadPersistedIssuer,
 } from "./account-config.js";
 import { planAccounts } from "./multiplex.js";
 
@@ -656,5 +657,68 @@ describe("account-config: loadPersistedAgentIdentity (P0-3 D1)", () => {
     expect(() => loadPersistedAgentIdentity("../../evil", { home: HOME })).toThrow(
       /invalid account id/,
     );
+  });
+});
+
+describe("account-config: loadPersistedIssuer (issuer NOT gated on identityKey)", () => {
+  const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+  const ISSUER = "https://saas.local/demo-issuer/";
+  const perAccount = accountCredentialPath("acctA", HOME);
+  const load = (file: unknown, fn = loadPersistedIssuer): ReturnType<typeof loadPersistedIssuer> =>
+    fn("acctA", {
+      home: HOME,
+      exists: (p) => p === perAccount,
+      read: () => (typeof file === "string" ? file : JSON.stringify(file)),
+    }) as ReturnType<typeof loadPersistedIssuer>;
+
+  it("THE POINT: a corrupt identityKey must not hide the delivered issuer", () => {
+    // `loadPersistedAgentIdentity` is fail-closed on a bad key — correct for its own
+    // purpose (that account cannot serve) but fatal if the ISSUER rode along, because
+    // the issuer feeds the shared-audience collision pre-pass. If a broken key silently
+    // demoted this account to the DERIVED issuer while a twin sharing its explicit
+    // auth.jwt.audience kept the DELIVERED one, the two would stop PAIRING in
+    // detectSharedAudienceCollisions, the twin would be served, and a bootstrap JWT
+    // minted for THIS account (iss=delivered, aud=shared) would still verify on the
+    // twin's `.register` subject. Same fixture, both accessors, opposite answers:
+    const corrupt = {
+      identityKey: { publicKey: "AAAA", privateKey: "AAAA" }, // not a 32-byte pair
+      enrollment: { issuer: ISSUER },
+    };
+    expect(
+      loadPersistedAgentIdentity("acctA", {
+        home: HOME,
+        exists: (p) => p === perAccount,
+        read: () => JSON.stringify(corrupt),
+      }),
+    ).toBeUndefined();
+    expect(load(corrupt)).toBe(ISSUER);
+  });
+
+  it("returns the issuer when the identityKey block is ABSENT entirely", () => {
+    expect(load({ enrollment: { issuer: ISSUER } })).toBe(ISSUER);
+  });
+
+  it("returns the issuer when transport material (userJwt/userSeed) is absent (static/BYO account)", () => {
+    // `loadPersistedEnrolledCreds` gates on userJwt+userSeed, which a BYO-NATS
+    // account legitimately never persists — hence a third accessor rather than reuse.
+    expect(load({ identityKey: { publicKey: KEY43, privateKey: KEY43 }, enrollment: { issuer: ISSUER } })).toBe(
+      ISSUER,
+    );
+  });
+
+  it("returns undefined when the issuer is missing, empty, or not a string", () => {
+    expect(load({ enrollment: {} })).toBeUndefined();
+    expect(load({ enrollment: { issuer: "" } })).toBeUndefined();
+    expect(load({ enrollment: { issuer: 42 } })).toBeUndefined();
+    expect(load({})).toBeUndefined();
+  });
+
+  it("returns undefined when the file is absent or malformed", () => {
+    expect(loadPersistedIssuer("default", { home: HOME, exists: () => false })).toBeUndefined();
+    expect(load("not json{")).toBeUndefined();
+  });
+
+  it("rejects a traversal account id (same validation as the other loaders)", () => {
+    expect(() => loadPersistedIssuer("../../evil", { home: HOME })).toThrow(/invalid account id/);
   });
 });
