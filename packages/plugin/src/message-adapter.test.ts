@@ -4,6 +4,21 @@ import { createClawMessageAdapter, createProgressDraftController, createReasonin
 import { NullPeerChannel } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
 
+describe("durable-delivery capability contract", () => {
+  // P0-4 (review R5): the outbound seams THROW on failure, and that is only safe
+  // because core refuses to blind-replay an entry stamped `send_attempt_started`
+  // unless the adapter declares `reconcileUnknownSend`. Declaring it would silently
+  // re-open core's replay path for a send that may already have been delivered —
+  // duplicate delivery to the user, with nothing else in the tree to catch it (the
+  // peer range `openclaw >= 2026.6.10` is open-ended). This is the gate.
+  it("does not declare reconcileUnknownSend (would re-open core's blind-replay path)", () => {
+    const adapter = createClawMessageAdapter(new NullPeerChannel()) as unknown as {
+      durableFinal?: { capabilities?: Record<string, unknown> };
+    };
+    expect(adapter.durableFinal?.capabilities?.reconcileUnknownSend).not.toBe(true);
+  });
+});
+
 describe("targeted outbound delivery", () => {
   class RecordingChannel extends NullPeerChannel {
     readonly sent: string[] = [];
@@ -26,32 +41,78 @@ describe("targeted outbound delivery", () => {
     expect(channel.sent).toEqual(["peer-a"]);
   });
 
-  it("drops and logs when the target is absent", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  it("throws a cause-specific error when the target is absent", async () => {
     const channel = new RecordingChannel(new Set(["peer-a"]));
-    await send(channel);
+    await expect(send(channel)).rejects.toThrow("ctx.to is absent");
     expect(channel.sent).toEqual([]);
-    expect(error).toHaveBeenCalledWith("[webchannel] outbound send has no resolvable target peer — dropped");
-    error.mockRestore();
   });
 
-  it("drops a stale target", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  it("throws a distinct error when a targeted send returns false", async () => {
     const channel = new RecordingChannel(new Set());
-    await send(channel, "peer-gone");
+    await expect(send(channel, "peer-gone")).rejects.toThrow(
+      "targeted send returned false for peer peer-gone",
+    );
     expect(channel.sent).toEqual([]);
-    expect(error).toHaveBeenCalledOnce();
-    error.mockRestore();
   });
 
   it("does not leak an unresolved target to another account channel", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const accountA = new RecordingChannel(new Set(["peer-a"]));
     const accountB = new RecordingChannel(new Set(["peer-b"]));
-    await send(accountA, "peer-b");
+    await expect(send(accountA, "peer-b")).rejects.toThrow("targeted send returned false");
     expect(accountA.sent).toEqual([]);
     expect(accountB.sent).toEqual([]);
-    error.mockRestore();
+  });
+});
+
+describe("ProgressDraftController.finalize result contract", () => {
+  it("caches the first true result across simultaneous and later calls", async () => {
+    const finalizeDraft = vi.fn((_peer: string, _id: string, _text: string) => true);
+    const transport = { finalizeDraft } as unknown as WebChannelPeerChannel;
+    const draft = createProgressDraftController({ transport, sessionKey: "p", channelConfig: {} });
+    await expect(Promise.all([draft.finalize("one"), draft.finalize("two")])).resolves.toEqual([true, true]);
+    await expect(draft.finalize("three")).resolves.toBe(true);
+    expect(finalizeDraft).toHaveBeenCalledTimes(1);
+    expect(finalizeDraft.mock.calls[0]?.[2]).toBe("one");
+  });
+
+  it("caches false without retrying", async () => {
+    const finalizeDraft = vi.fn((_peer: string, _id: string, _text: string) => false);
+    const transport = { finalizeDraft } as unknown as WebChannelPeerChannel;
+    const draft = createProgressDraftController({ transport, sessionKey: "p", channelConfig: {} });
+    await expect(draft.finalize("one")).resolves.toBe(false);
+    await expect(draft.finalize("two")).resolves.toBe(false);
+    expect(finalizeDraft).toHaveBeenCalledTimes(1);
+  });
+
+  // P0-4 (review R2): with no pending draft content the finalize body runs to
+  // `finalizeDraft` with no preceding await, so the idempotency latch must be
+  // armed BEFORE it — a re-entrant call from inside finalizeDraft must not
+  // trigger a second terminal frame.
+  it("latches synchronously: a re-entrant finalize from inside finalizeDraft does not double-send", async () => {
+    let draft!: ReturnType<typeof createProgressDraftController>;
+    let reentrant: Promise<boolean> | undefined;
+    const finalizeDraft = vi.fn((_peer: string, _id: string, _text: string) => {
+      reentrant ??= draft.finalize("re-entrant");
+      return true;
+    });
+    const transport = { finalizeDraft } as unknown as WebChannelPeerChannel;
+    draft = createProgressDraftController({ transport, sessionKey: "p", channelConfig: {} });
+    await expect(draft.finalize("one")).resolves.toBe(true);
+    await expect(reentrant).resolves.toBe(true); // same cached outcome
+    expect(finalizeDraft).toHaveBeenCalledTimes(1);
+    expect(finalizeDraft.mock.calls[0]?.[2]).toBe("one");
+  });
+
+  it("continues to finalize when a pending preview flush throws", async () => {
+    const finalizeDraft = vi.fn((_peer: string, _id: string, _text: string) => true);
+    const transport = {
+      sendProgress: () => { throw new Error("closing socket"); },
+      finalizeDraft,
+    } as unknown as WebChannelPeerChannel;
+    const draft = createProgressDraftController({ transport, sessionKey: "p", channelConfig: {}, throttleMs: 60_000 });
+    draft.pushAnswerText("partial");
+    await expect(draft.finalize("final")).resolves.toBe(true);
+    expect(finalizeDraft).toHaveBeenCalledTimes(1);
   });
 });
 

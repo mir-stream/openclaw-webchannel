@@ -193,10 +193,25 @@ export function createWebChannelPlugin(
           // outbound seam only fires for core-initiated (untargeted) sends.
           // `ctx.to` is the recorded reply target — now the REAL per-peer
           // `wsKey` (inbound.ts records `reply.to = wsKey`), so target it
-          // directly. If it is absent or stale, delivery is explicitly logged
-          // and dropped; recipient guessing is intentionally unsupported.
-          if (!ctx.to || !transport.sendText(ctx.to, ctx.text)) {
-            console.error("[webchannel] outbound send has no resolvable target peer — dropped");
+          // directly. If it is absent or stale, throw so core observes a failed
+          // outbound delivery; recipient guessing is intentionally unsupported.
+          //
+          // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
+          // thrown outbound — traced in openclaw 2026.6.10 (the installed version
+          // and the floor of the `>=2026.6.10` peer range): core stamps
+          // `send_attempt_started` immediately before calling us, and its durable
+          // delivery drain refuses to blindly replay an entry in that state unless
+          // the adapter supplies `reconcileUnknownSend` (we deliberately do not),
+          // so the entry moves to failed instead. See the fuller trace in
+          // `message-adapter.ts`. A core bump — or adding `reconcileUnknownSend` —
+          // re-opens the blind-replay path → SILENT DUPLICATE DELIVERY.
+          if (!ctx.to) {
+            throw new Error("[webchannel] outbound send failed: ctx.to is absent");
+          }
+          if (!transport.sendText(ctx.to, ctx.text)) {
+            throw new Error(
+              `[webchannel] outbound send failed: targeted send returned false for peer ${ctx.to}`,
+            );
           }
           return { messageId: `webchannel-${Date.now()}` };
         },

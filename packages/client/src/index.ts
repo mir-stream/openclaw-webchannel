@@ -33,6 +33,10 @@ export type {
   Listener,
   CommandCatalogEntry,
   CommandCatalogArg,
+  // P0-4: the observable send-result contract.
+  SendState,
+  SendFailure,
+  SendReceipt,
 } from "./types.js";
 // SaaS bootstrap key-pin validator — exported so a downstream host (rota-crew)
 // can run a contract test against the client's ACTUAL bootstrap parsing logic

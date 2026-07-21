@@ -144,6 +144,7 @@ export async function handleInboundMessage(
     (streamingMode === "progress" || streamingMode === "partial") && !controlLane;
   const answerStreamingEnabled = streamingMode === "partial";
   let draft: ProgressDraftController | undefined;
+  let turnOutcome: "ok" | "error" = "ok";
   if (draftEnabled) {
     draft = createProgressDraftController({
       transport,
@@ -368,12 +369,19 @@ export async function handleInboundMessage(
               deliver: async (payload, info) => {
                 const text = payload.text;
                 if (!text) return { visibleReplySent: false };
+                // P0-4 DECISION: `visibleReplySent:false` (a final-frame send that
+                // failed) does NOT suppress the later `turn_settled{outcome:"ok"}`
+                // — the turn genuinely settled without error, so the client's
+                // send-receipt correctly reaches `completed` (it tracks the USER
+                // message's fate, not answer delivery). The dropped answer text is
+                // recovered by the register-time history snapshot (recovery lanes
+                // §5 L3/L6), never by faking the turn outcome.
                 // Only the final reply replaces the draft. Non-final visible
                 // blocks (rare for this channel) fall through to a plain send.
                 if (draft && info?.kind === "final") {
-                  await draft.finalize(text);
-                  finalReplyDelivered = true;
-                  return { visibleReplySent: true };
+                  const sent = await draft.finalize(text);
+                  if (sent) finalReplyDelivered = true;
+                  return { visibleReplySent: sent };
                 }
                 const sent = transport.sendText(wsKey, text, undefined, turnId);
                 if (sent && info?.kind === "final") finalReplyDelivered = true;
@@ -410,6 +418,7 @@ export async function handleInboundMessage(
       await draft.finalize(snapshot || "⏹ Stopped.");
     }
   } catch (err) {
+    turnOutcome = "error";
     api.logger.error?.(`webchannel: inbound dispatch failed: ${String(err)}`);
     // BLOCKING recovery: if the turn threw AFTER a progress frame was emitted,
     // the widget is showing a working bubble that will otherwise hang forever
@@ -431,12 +440,17 @@ export async function handleInboundMessage(
         );
       }
     } else if (!controlLane && !finalReplyDelivered) {
-      transport.sendText(
+      const sent = transport.sendText(
         wsKey,
         "Sorry — something went wrong while answering. Please try again.",
         undefined,
         turnId,
       );
+      if (!sent) {
+        api.logger?.warn?.(
+          `webchannel: error fallback reply was not delivered for peer=${wsKey} turn=${turnId}`,
+        );
+      }
     }
   } finally {
     // Always halt the throttled draft loop so a late background flush can't race
@@ -444,6 +458,10 @@ export async function handleInboundMessage(
     // no-op when no draft was created or it was already stopped by finalize().
     draft?.stop();
     reasoning?.stop();
-    if (!controlLane) transport.sendTurnSettled(wsKey, turnId);
+    if (!controlLane && !transport.sendTurnSettled(wsKey, turnId, turnOutcome)) {
+      api.logger?.warn?.(
+        `webchannel: turn_settled was not delivered for peer=${wsKey} turn=${turnId} outcome=${turnOutcome}`,
+      );
+    }
   }
 }

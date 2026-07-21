@@ -238,19 +238,21 @@ describe("WebChannelNATSClient — P1-7 error cause on state", () => {
     expect(w.getState().errorCause).toBe("unknown");
   });
 
-  it("a later successful reconnect clears error + errorCause", () => {
+  it("a terminal instance stays in error even after a later connected event (P0-4 permanent retirement)", () => {
     const w = makeWrapper();
     emitError(w, new Error("boom"), "secure-channel-failed");
     expect(w.getState().errorCause).toBe("secure-channel-failed");
-    // The register-failure sites don't set the raw client's terminal flag, so an
-    // embedder can reconnect the SAME instance; a connected event clears the stale
-    // reason. (The sticky guard only blocks a connected:false event from the error
-    // status; a connected:true is a genuine recovery.)
+    // P0-4 (R3): a CL2 terminal instance is PERMANENTLY retired. A
+    // registration-path terminal sets only the WCNC-level latch (the raw
+    // transport is not terminal), so a later connected event CAN arrive — but the
+    // onState handler must not revive the sticky "error": every send still
+    // immediate-fails (terminalReached), so a green status would be a lie.
+    // Recovery is a fresh client, never same-instance revival.
     emitState(w, true);
     const s = w.getState();
-    expect(s.status).toBe("connected");
-    expect(s.error).toBeUndefined();
-    expect(s.errorCause).toBeUndefined();
+    expect(s.status).toBe("error");
+    expect(s.error).toBe("boom");
+    expect(s.errorCause).toBe("secure-channel-failed");
   });
 
   it("sticky guard: a trailing onState(false) after an error does NOT clear the cause", () => {
@@ -924,10 +926,13 @@ describe("WebChannelNATSClient — P0-3 command discovery", () => {
 });
 
 // ---------------------------------------------------------------------------
-// P0-7b delivery acks — send() stamps the local echo with the wire id, and an
-// `ack` frame marks the matching bubble delivered (state-only).
+// P0-4 send-state acks (T-wd) — send() stamps the local echo with the wire id,
+// and an `ack` frame advances the matching bubble to `sendState:"accepted"`
+// (replaces the removed boolean `delivered`). Acceptance is now driven by the
+// low-level tracker's `onSendState`, so the ack is delivered through the inner
+// client's real inbound path (`deliverInbound`), not the reducer alone.
 // ---------------------------------------------------------------------------
-describe("WebChannelNATSClient — P0-7b delivery acks", () => {
+describe("WebChannelNATSClient — P0-4 send-state acks", () => {
   function makeWrapper(): WebChannelNATSClient {
     return new WebChannelNATSClient({
       natsUrl: "ws://127.0.0.1:4222",
@@ -938,36 +943,39 @@ describe("WebChannelNATSClient — P0-7b delivery acks", () => {
       registration,
     });
   }
-  function deliver(wrapper: WebChannelNATSClient, frame: InboundMessage): void {
-    (wrapper as unknown as { handleMessage: (m: InboundMessage) => void }).handleMessage(frame);
+  /** Deliver an ack the way the socket would: through the inner client's inbound
+   * path, which drains the ledger AND advances the tracker (→ onSendState). */
+  function ack(wrapper: WebChannelNATSClient, ids: string[]): void {
+    (wrapper as unknown as { client: { deliverInbound: (m: InboundMessage) => void } })
+      .client.deliverInbound({ type: "ack", ids });
   }
 
-  it("send() stores the wire id on the local echo", () => {
+  it("send() stores the wire id and starts the bubble at sendState 'queued'", () => {
     const w = makeWrapper();
     w.send("hello");
     const m = w.getState().messages[0];
     expect(typeof m.wireId).toBe("string");
     expect(m.wireId).toBeTruthy();
-    expect(m.delivered).toBeUndefined(); // not yet acked
+    expect(m.sendState).toBe("queued"); // not yet accepted (never connected)
   });
 
-  it("an ack frame marks the matching bubble delivered and leaves others untouched", () => {
+  it("an ack advances the matching bubble to sendState 'accepted' and leaves others untouched", () => {
     const w = makeWrapper();
     w.send("first");
     w.send("second");
     const [m1, m2] = w.getState().messages;
 
-    deliver(w, { type: "ack", ids: [m1.wireId!] });
+    ack(w, [m1.wireId!]);
     const after = w.getState().messages;
-    expect(after.find((m) => m.id === m1.id)?.delivered).toBe(true);
-    expect(after.find((m) => m.id === m2.id)?.delivered).toBeUndefined(); // unrelated
+    expect(after.find((m) => m.id === m1.id)?.sendState).toBe("accepted");
+    expect(after.find((m) => m.id === m2.id)?.sendState).toBe("queued"); // unrelated
   });
 
   it("an ack with no matching wireId is a state no-op", () => {
     const w = makeWrapper();
     w.send("only");
     const before = w.getState();
-    deliver(w, { type: "ack", ids: ["not-a-wire-id"] });
+    ack(w, ["not-a-wire-id"]);
     expect(w.getState()).toBe(before); // no setState fired
   });
 
@@ -975,7 +983,7 @@ describe("WebChannelNATSClient — P0-7b delivery acks", () => {
     const w = makeWrapper();
     w.send("only");
     const before = w.getState();
-    deliver(w, { type: "ack", ids: [] });
+    ack(w, []);
     expect(w.getState()).toBe(before);
   });
 });
@@ -1378,7 +1386,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     const w = makeWrapper();
     const spy = vi.spyOn(inner(w), "sendUserMessage");
     w.send("hello");
-    expect(spy).toHaveBeenCalledWith("hello");
+    expect(spy).toHaveBeenCalledWith("hello", expect.any(String));
     const m = messages(w)[0];
     expect(m.pending).toBeUndefined();
     expect(m.wireId).toBeTruthy();
@@ -1443,7 +1451,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     w.send("queued");
     expect(spy).not.toHaveBeenCalled();
     deliver(w, { type: "turn_settled", turnId: "T" });
-    expect(spy).toHaveBeenCalledWith("queued");
+    expect(spy).toHaveBeenCalledWith("queued", expect.any(String));
     expect(pendingBubbles(w)).toHaveLength(0);
   });
 
@@ -1480,7 +1488,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     const heldId = messages(w)[0].id;
 
     w.send(" /STOP "); // case/whitespace variant — trimmed before publish
-    expect(spy).toHaveBeenCalledWith("/STOP");
+    expect(spy).toHaveBeenCalledWith("/STOP", expect.any(String));
     const marker = messages(w).find((m) => m.id === heldId)!;
     expect(marker.retracted).toBe(true);
     expect(marker.pending).toBe(false);
@@ -1501,7 +1509,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       spy.mockClear();
 
       w.send(word);
-      expect(spy).toHaveBeenCalledWith(word); // bypassed → published
+      expect(spy).toHaveBeenCalledWith(word, expect.any(String)); // bypassed → published
       // The held message is UNTOUCHED (not retracted, still pending).
       const stillHeld = messages(w).find((m) => m.text === "keep me")!;
       expect(stillHeld.pending).toBe(true);
@@ -1562,7 +1570,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     // Key arrives → onSession fires (after flushQueue) → release.
     releaseRegister();
     await establishKey(w);
-    expect(spy).toHaveBeenCalledWith("M");
+    expect(spy).toHaveBeenCalledWith("M", expect.any(String));
     w.close();
   });
 
@@ -1809,7 +1817,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       prompt: "cmd",
       options: [{ decision: "allow-once", label: "Allow", style: "success" }],
     });
-    expect(spy).toHaveBeenCalledWith("queued");
+    expect(spy).toHaveBeenCalledWith("queued", expect.any(String));
     expect(pendingBubbles(w)).toHaveLength(0);
   });
 
@@ -1867,7 +1875,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
 
     // Explicit /stop: published immediately AND finalizes the draft in place.
     w.send("/stop");
-    expect(spy).toHaveBeenCalledWith("/stop");
+    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String));
     const draft = messages(w).find((m) => m.id === "webchannel-d")!;
     expect(draft.working).toBe(false); // flipped in place
     expect(draft.id).toBe("webchannel-d"); // id untouched
@@ -1876,7 +1884,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     // The wedge is unlocked: a subsequent send publishes IMMEDIATELY (not held).
     spy.mockClear();
     w.send("next");
-    expect(spy).toHaveBeenCalledWith("next");
+    expect(spy).toHaveBeenCalledWith("next", expect.any(String));
     expect(pendingBubbles(w)).toHaveLength(0);
     expect(held(w)).toHaveLength(0);
   });
@@ -1904,7 +1912,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
 
     w.send("wait"); // NL abort → bypasses the hold, published, but NO finalize
-    expect(spy).toHaveBeenCalledWith("wait");
+    expect(spy).toHaveBeenCalledWith("wait", expect.any(String));
     expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
   });
 
@@ -1919,13 +1927,13 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(w.getState().isTyping).toBe(true);
 
     w.send("/stop");
-    expect(spy).toHaveBeenCalledWith("/stop");
+    expect(spy).toHaveBeenCalledWith("/stop", expect.any(String));
     expect(w.getState().isTyping).toBe(false); // typing indicator cleared
 
     // Composer unlocked: a subsequent send publishes immediately (not held).
     spy.mockClear();
     w.send("next");
-    expect(spy).toHaveBeenCalledWith("next");
+    expect(spy).toHaveBeenCalledWith("next", expect.any(String));
     expect(pendingBubbles(w)).toHaveLength(0);
     expect(held(w)).toHaveLength(0);
   });

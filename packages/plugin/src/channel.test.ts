@@ -52,6 +52,18 @@ describe("webchannel plugin", () => {
     };
     expect(result.configured).toBe(true);
   });
+
+  it("throws distinct outbound errors and never marks this send path best-effort", async () => {
+    const transport = new FakePeerChannel();
+    const plugin = createWebChannelPlugin(transport) as any;
+    const sendText = plugin.outbound.sendText;
+    await expect(sendText({ text: "hello" })).rejects.toThrow("ctx.to is absent");
+    await expect(sendText({ to: "missing", text: "hello" })).rejects.toThrow(
+      "targeted send returned false for peer missing",
+    );
+    // D1 caveat: this adapter does not opt into core's error-swallowing path.
+    expect(plugin.outbound.bestEffort).not.toBe(true);
+  });
 });
 
 describe("webchannel transport", () => {
@@ -189,6 +201,21 @@ describe("webchannel inbound round-trip", () => {
       recordInboundSession,
     };
   }
+
+  it("warns once when turn_settled cannot be sent, without reporting false success", async () => {
+    const transport = new FakePeerChannel();
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(false);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured);
+    const warn = vi.fn();
+    api.logger.warn = warn;
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message", id: "turn-ts", text: "hello",
+    });
+    expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-ts", "ok");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("turn_settled was not delivered");
+  });
 
   it("default-deny allowlist (gap ③): a non-allowlisted peer is denied — inbound.run never runs, no reply", async () => {
     const transport = new FakePeerChannel();
@@ -812,7 +839,7 @@ describe("webchannel inbound round-trip", () => {
         "safe",
       );
       // turn_settled is a lifecycle frame emitted for every ordinary turn.
-      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42");
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42", "ok");
     },
   );
 
@@ -848,7 +875,7 @@ describe("webchannel inbound round-trip", () => {
       expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
       expect(reasoningSpy).not.toHaveBeenCalled();
       // turn_settled still fires — it is a lifecycle frame, not a reasoning frame.
-      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42");
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42", "ok");
     },
   );
 
@@ -864,6 +891,7 @@ describe("webchannel inbound round-trip", () => {
       const finalizeSpy = vi
         .spyOn(transport, "finalizeDraft")
         .mockReturnValue(true);
+      const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
 
       const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
       const { api } = makeFakeApi(captured, {
@@ -893,6 +921,7 @@ describe("webchannel inbound round-trip", () => {
       expect(finId).toBe(progId);
       expect(typeof finText).toBe("string");
       expect((finText as string).length).toBeGreaterThan(0);
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", expect.any(String), "error");
 
       // The draft loop was stopped: no late background throttled flush fires
       // after the error handling, so no further progress frames are emitted.
