@@ -42,7 +42,10 @@ type ReceiptRecord = {
   id: string;
   state: NonNullable<ChatMessage["sendState"]>;
   failure?: SendFailure;
-  subscribers: Set<(s: { state: ChatMessage["sendState"]; failure?: SendFailure }) => void>;
+  // P0-4 (review R5): mirrors `SendReceipt.snapshot()` — a concrete, non-optional
+  // state (a record always has one), so consumers never narrow an impossible
+  // `undefined`.
+  subscribers: Set<(s: { state: NonNullable<ChatMessage["sendState"]>; failure?: SendFailure }) => void>;
 };
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the

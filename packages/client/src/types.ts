@@ -67,7 +67,14 @@ export type SendFailure = {
 export type SendReceipt = {
   /** Immutable receipt key — valid across history adoption/release/retract. */
   readonly id: string;
-  snapshot(): { state: ChatMessage["sendState"]; failure?: SendFailure };
+  /**
+   * P0-4 (review R5): `NonNullable`, not the optional `ChatMessage["sendState"]`
+   * — a receipt record always carries a concrete state (the record's own field is
+   * non-optional, and the never-taken missing-record fallback returns `"failed"`),
+   * so admitting `undefined` here would force every consumer of this BREAKING API
+   * to narrow a value that cannot occur.
+   */
+  snapshot(): { state: NonNullable<ChatMessage["sendState"]>; failure?: SendFailure };
   subscribe(cb: (s: ReturnType<SendReceipt["snapshot"]>) => void): () => void;
 };
 

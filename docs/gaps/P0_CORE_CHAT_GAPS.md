@@ -58,7 +58,7 @@ The **wrapper reduces every inbound frame** (`nats-client-wrapper.ts`):
 | `progress` | `:557` | upsert working bubble keyed by draft `id` |
 | `agent_message` | `:569` | finalize draft / append |
 | `commands` | `:412` | **P0-3**: replace `state.commands` with the delivered discovery catalog (`CommandCatalogEntry[]`) |
-| `ack` | `:420` | **P0-7b/P0-4**: advance the matching `wireId` to `sendState:"accepted"` via the authoritative send tracker (`onSendState`) — the reducer case is now a no-op (acceptance is tracked low-level, no `delivered` boolean) |
+| `ack` | `:1081` | **P0-7b/P0-4**: advance the matching `wireId` to `sendState:"accepted"` via the authoritative send tracker (`onSendState`) — the reducer case is now a no-op (acceptance is tracked low-level, no `delivered` boolean) |
 
 Terminal auth failure → `onError` (`:103`) sets `status:"error"` (no eternal spinner). A separate
 `onProtocol` listener (not a reducer case) records the register reply's `protocolVersion` /
@@ -103,7 +103,7 @@ client enforces the protocol match and goes terminal on mismatch (#33). `turn_se
 carries an optional `outcome?: "ok" | "error"` (**P0-4** — additive; older peers ignore it).
 `WebChannelState` now holds `messages` (+`wireId`/`sendState`/`sendFailure` — **P0-4** replaced the
 boolean `delivered`), `approvals`, `status`, `connected`, `error?`, `isTyping?`, `commands?`,
-`agentProtocolVersion`, `agentPluginVersion` (`types.ts:123-165`).
+`agentProtocolVersion`, `agentPluginVersion` (`types.ts:262`).
 
 ### ⭐ Server defaults are ON; the demo enables the important ones
 
@@ -489,7 +489,7 @@ an ack frame closing the loop. This was the heaviest P0 item and the only one ne
 
 **Where it stands today — client (P0-7b).**
 - Each `user_message` is stamped with a stable id (`randomInboxToken()`) in `sendUserMessage()`
-  (`nats-client.ts:960`). `ChatMessage` gained `wireId?`; **P0-4** replaced the boolean `delivered?`
+  (`nats-client.ts:1277`). `ChatMessage` gained `wireId?`; **P0-4** replaced the boolean `delivered?`
   with `sendState?` (queued/sent/accepted/completed/failed) + `sendFailure?` (`types.ts`); the
   wrapper stamps the local echo with its `wireId` at send/release time.
 - Replay ledger: `outboundQueue` (`:858`) + `unackedLedger: Map<string,OutboundMessage>` (`:873`,
@@ -560,5 +560,5 @@ remains **P2-4**. P0-7 covers the client→agent replay + idempotency side; P2-4
 
 All render extensions now go through one place — the reducer (`nats-client-wrapper.ts`) and the
 widget's `render(state)`. New frame types (e.g. P1-5 `presentation`, P1-3 `reasoning`) add: a `case`
-in the reducer, a field on `WebChannelState` (`types.ts:123-165`), and a branch in `render` — exactly
+in the reducer, a field on `WebChannelState` (`types.ts:262`), and a branch in `render` — exactly
 as #30's `commands` and #31's `ack` did. There is no thin path to re-wire.

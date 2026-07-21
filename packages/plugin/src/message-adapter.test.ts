@@ -4,6 +4,21 @@ import { createClawMessageAdapter, createProgressDraftController, createReasonin
 import { NullPeerChannel } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
 
+describe("durable-delivery capability contract", () => {
+  // P0-4 (review R5): the outbound seams THROW on failure, and that is only safe
+  // because core refuses to blind-replay an entry stamped `send_attempt_started`
+  // unless the adapter declares `reconcileUnknownSend`. Declaring it would silently
+  // re-open core's replay path for a send that may already have been delivered —
+  // duplicate delivery to the user, with nothing else in the tree to catch it (the
+  // peer range `openclaw >= 2026.6.10` is open-ended). This is the gate.
+  it("does not declare reconcileUnknownSend (would re-open core's blind-replay path)", () => {
+    const adapter = createClawMessageAdapter(new NullPeerChannel()) as unknown as {
+      durableFinal?: { capabilities?: Record<string, unknown> };
+    };
+    expect(adapter.durableFinal?.capabilities?.reconcileUnknownSend).not.toBe(true);
+  });
+});
+
 describe("targeted outbound delivery", () => {
   class RecordingChannel extends NullPeerChannel {
     readonly sent: string[] = [];
