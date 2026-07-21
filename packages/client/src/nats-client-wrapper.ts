@@ -134,6 +134,21 @@ export class WebChannelNATSClient {
    */
   private terminal = false;
   /**
+   * P0-4 (review): true between an explicit `close()` and the next `connect()`.
+   * CONNECTION-SCOPED — the exact opposite of the permanent `terminal` latch: a
+   * closed instance is reusable, so `connect()` clears this. It is the wrapper
+   * mirror of the low-level `disconnected` gate (`nats-client.ts`), which fails a
+   * send onto a closed instance as `failed{closed}`. The mirror is required
+   * because that gate only fires for sends that actually REACH
+   * `sendUserMessage()`: a send arriving while a turn is still in flight is
+   * pushed into `held[]` instead, and `held[]` drains only on `onSession` — which
+   * a closed instance never fires again. `close()` does not settle live `working`
+   * drafts (only the terminal path does) and it clears the staleness valve, so
+   * `turnInFlight()` can stay true forever after a close. Without this flag such
+   * a send is stranded at `queued` — the exact failure P0-4 exists to eliminate.
+   */
+  private closed = false;
+  /**
    * P1-9 §3.6.2: post-reconnect staleness valve. `staleDraftWatch` holds the ids
    * of `working` drafts recorded when onSession fired; the timer flips any still
    * in the set to `working: false` in place (never swapping the id) after the
@@ -297,11 +312,22 @@ export class WebChannelNATSClient {
 
   /** Connect to NATS */
   connect(): void {
+    // P0-4 (review): a reconnect reopens the send path — clear the closed gate so
+    // holding resumes. Mirrors `WebChannelNatsClient.connect()`, which clears its
+    // own `disconnected` flag; the ordering mirrors it too — that method REFUSES
+    // outright on a terminally-retired instance, so a retired wrapper must stay
+    // closed rather than silently re-enable holding onto a dead instance.
+    if (!this.terminal) this.closed = false;
     this.client.connect();
   }
 
   /** Disconnect from NATS */
   close(): void {
+    // P0-4 (review): gate holding FIRST — a send arriving after this close (or
+    // re-entrantly, from a listener the sweep below fires) must publish and
+    // resolve to failed{closed} via the low-level `disconnected` gate, never land
+    // in `held[]` whose only drain (onSession) this instance will never fire.
+    this.closed = true;
     // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
     this.clearStaleDraftWatch();
     // P0-4 (D5): fail the wrapper-owned held[] (no wireId → invisible to the
@@ -427,6 +453,10 @@ export class WebChannelNATSClient {
     // P0-4: never hold after a terminal failure (a held send would escape the
     // held[] sweep and orphan). Publish instead → immediate failed{terminal}.
     if (this.terminal) return false;
+    // P0-4 (review): never hold after an explicit close() either — held[] drains
+    // only on onSession, which a closed instance never fires, so a hold here is a
+    // permanent `queued`. Publish instead → immediate failed{closed}.
+    if (this.closed) return false;
     return this.turnInFlight() || this.held.length > 0;
   }
 

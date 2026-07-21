@@ -25,3 +25,8 @@
   final-frame send failure does **not** suppress `turn_settled{outcome:"ok"}`: the
   turn genuinely settled, so the client's send-receipt reaches `completed`; the
   dropped answer text is recovered by the register-time history snapshot.
+- The outbound **throw-on-failure** behavior above depends on core absorbing the
+  throw into `OutboundDeliveryError` → `{status:"failed"}` **without retrying**
+  (verified against `openclaw` 2026.6.10, the floor of the `>=2026.6.10` peer
+  range). A core that retried a thrown outbound would cause silent duplicate
+  delivery — re-verify on any core version bump.

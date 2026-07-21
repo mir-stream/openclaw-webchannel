@@ -978,15 +978,20 @@ export class NatsClient {
       try { this.ws.close(); } catch { /* already closing */ }
       this.ws = null;
     }
-    // R2b-2: capture the generation BEFORE notifying — a listener that responds
-    // to this teardown by calling disconnect() bumps it (and clears the timer).
+    // R2b-2: notify EXACTLY ONCE, here — before the generation/terminal check.
+    // The observable state (`connected: false`) is already final at this point,
+    // and `scheduleReconnect()` below changes nothing a listener can observe, so
+    // a second notify after it would be a duplicate identical `onState(false)`
+    // (P0-4 review: embedders re-render twice, and the wrapper runs its release
+    // gate twice). Placement is load-bearing: the generation must be captured
+    // BEFORE the notification, because a listener that responds to this teardown
+    // by calling disconnect() bumps it (and clears the timer).
     const gen = this.lifecycleGeneration;
     this.notifyStateListeners();
     // If disconnect() ran during the notification (generation changed) or a
     // terminal failure intervened, honor it: do NOT schedule a reconnect.
     if (this.lifecycleGeneration !== gen || this.terminal) return;
     this.scheduleReconnect();
-    this.notifyStateListeners();
   }
 
   private notifyErrorListeners(err: Error, cause?: WebChannelErrorCause): void {

@@ -107,6 +107,14 @@ export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
         // (inbound.ts records `reply.to = wsKey`). Target it directly; if it's
         // absent or the targeted send fails, throw before fabricating any
         // receipt (P0-1 removed recipient guessing; P0-4 makes failure honest).
+        //
+        // P0-4 (review): throwing is safe ONLY because core absorbs the throw
+        // into `OutboundDeliveryError` → `{status:"failed"}` and does NOT retry
+        // the send (verified against openclaw 2026.6.10, the installed version
+        // and the floor of the `>=2026.6.10` peer range). If a future core ever
+        // retried a thrown send, a partially-delivered message would be re-sent —
+        // SILENT DUPLICATE DELIVERY to the peer, invisible here because the
+        // receipt is only built on the success path. Re-verify on any core bump.
         if (!ctx.to) {
           throw new Error("[webchannel] message.send.text failed: ctx.to is absent");
         }

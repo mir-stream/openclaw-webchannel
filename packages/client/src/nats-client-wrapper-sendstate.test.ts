@@ -510,6 +510,55 @@ describe("WebChannelNATSClient — P0-4 send onto a closed instance (T-cx)", () 
     expect(bubble.sendState).toBe("failed");
     expect(bubble.sendFailure).toMatchObject({ reason: "closed", retryable: false });
   });
+
+  // T-cx(d): the hold path. close() does NOT settle a live `working` draft (only
+  // the terminal path does) and it clears the staleness valve, so turnInFlight()
+  // stays true forever afterwards. Without the wrapper's `closed` gate the send
+  // is pushed into held[], whose only drain is onSession — never fired again on a
+  // closed instance — and the receipt is stranded at `queued`.
+  it("T-cx(d): send() after close() with a live working draft fails failed{closed}, never held", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    await settle();
+    expect(h.wrapper.getState().messages.some((m) => m.working)).toBe(true); // turn in flight
+
+    h.wrapper.close();
+    const receipt = h.wrapper.send("after-close-midturn")!;
+    await settle();
+    expect(receipt.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed", retryable: false } });
+    const bubble = userBubble(h.wrapper, "after-close-midturn")!;
+    expect(bubble.sendState).toBe("failed");
+    expect(bubble.pending).not.toBe(true);
+  });
+
+  // T-cx(e): the `closed` gate is scoped to the closed window only — an ordinary
+  // in-flight turn on an OPEN instance still holds (queued) as P1-9 §3.1 requires.
+  it("T-cx(e): with no close(), a send during a live turn still holds at queued", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, { type: "typing" });
+    await settle();
+    const receipt = h.wrapper.send("still-held")!;
+    await settle();
+    expect(receipt.snapshot().state).toBe("queued");
+    expect(userBubble(h.wrapper, "still-held")!.pending).toBe(true);
+    h.wrapper.close();
+  });
+
+  // T-cx(f): `closed` is connection-scoped, not permanent — after close() →
+  // connect() the hold behaviour is restored.
+  it("T-cx(f): close() then connect() restores holding", async () => {
+    const h = await connectWrapper();
+    h.wrapper.close();
+    h.wrapper.connect();
+    await settle();
+    deliverOut(h.K, { type: "typing" });
+    await settle();
+    const receipt = h.wrapper.send("re-held")!;
+    await settle();
+    expect(receipt.snapshot().state).toBe("queued");
+    expect(userBubble(h.wrapper, "re-held")!.pending).toBe(true);
+    h.wrapper.close();
+  });
 });
 
 // ---------------------------------------------------------------------------
