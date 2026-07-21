@@ -12,8 +12,8 @@ import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { createAccount } from "@nats-io/nkeys";
-import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "./device-flow-enrollment.js";
-import { MemoryAgentKeyRegistry } from "./agent-key-registry.js";
+import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
+import { MemoryEnrollmentRepository } from "./enrollment-repository.js";
 import { createDemoEnrollmentHttpHandler, createReferenceEnrollmentHttpHandler } from "./enrollment-http-handler.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -34,12 +34,12 @@ describe("P1-1 HTTP callers and reference approval UI", () => {
   const KEY_B = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
   const makeService = () => {
     const account = createAccount();
-    const registry = new MemoryAgentKeyRegistry();
+    const registry = new MemoryEnrollmentRepository();
     const enrollment = new DeviceFlowEnrollment({
       saasTrustChain: { rsaPrivateKeyPem: "TEST", natsAccountSeed: new TextDecoder().decode(account.getSeed()) },
       natsAccountConfig: { operatorJwt: "op", accountJwt: "acct", resolverConfig: {}, accountPublicKey: "pub" },
       saasBaseUrl: "https://saas", jwksUrl: "https://saas/jwks", bootstrapUrl: "https://saas/bootstrap", natsUrl: "wss://nats",
-      store: new MemoryEnrollmentStore({ autoSweep: false }), agentKeyRegistry: registry,
+      repository: registry,
     });
     return { enrollment, registry };
   };

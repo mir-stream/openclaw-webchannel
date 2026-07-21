@@ -34,8 +34,8 @@
  *   - CORS is enabled for all origins. Restrict in production.
  */
 
-import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../src/device-flow-enrollment.js";
-import { MemoryAgentKeyRegistry } from "../src/agent-key-registry.js";
+import { DeviceFlowEnrollment } from "../src/device-flow-enrollment.js";
+import { MemoryEnrollmentRepository } from "../src/enrollment-repository.js";
 import { createReferenceEnrollmentHttpHandler } from "../src/enrollment-http-handler.js";
 import { serializeBootstrapResponse, serializeEnrollmentResponse } from "../src/p1-1-wire-adapter.js";
 import { escapeHtmlAttribute, renderApprovalTemplate } from "./approval-page-renderer.js";
@@ -207,9 +207,9 @@ async function signBootstrapJwt(payload: Record<string, unknown>): Promise<strin
 // Enrollment service
 // ---------------------------------------------------------------------------
 
-const enrollmentStore = new MemoryEnrollmentStore();
+const enrollmentRepository = new MemoryEnrollmentRepository();
 // F2: durable agent identity-key registry (see the demo server for rationale).
-const agentKeyRegistry = new MemoryAgentKeyRegistry();
+const agentKeyRegistry = enrollmentRepository;
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: mockTrustChain,
   natsAccountConfig: mockNatsConfig,
@@ -220,8 +220,7 @@ const enrollment = new DeviceFlowEnrollment({
   natsUrl: NATS_URL,
   expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 5),
-  store: enrollmentStore,
-  agentKeyRegistry,
+  repository: agentKeyRegistry,
 });
 const enrollmentAdminToken = process.env.ENROLLMENT_ADMIN_TOKEN;
 export const createReferenceEnrollmentHandler = createReferenceEnrollmentHttpHandler;
@@ -230,7 +229,7 @@ const referenceAdminHandler = createReferenceEnrollmentHandler({
   registry: agentKeyRegistry, bootstrap: () => ({ error: "bootstrap is handled by the session route" }),
   async onApproved(userCode) {
     markDemoEnroll(userCode, "approved");
-    const record = await enrollmentStore.getEnrollmentByUserCode(userCode);
+    const record = await enrollmentRepository.getEnrollmentByUserCode(userCode);
     return { tenant: record?.tenant, accountId: record?.accountId };
   },
   onDenied(userCode) { markDemoEnroll(userCode, "denied"); },
@@ -459,7 +458,7 @@ function fallbackApprovalTemplate(userCode?: string): string {
 //
 // Production-shaped mirror: the SaaS hosts BOTH the operator approval flow and the
 // embeddable chat widget. We keep a lightweight in-server view of enrollment
-// requests (the MemoryEnrollmentStore has no "list pending" API) so the admin panel
+// requests (the MemoryEnrollmentRepository has no "list pending" API) so the admin panel
 // can render live cards + Approve/Deny — a stand-in for a real SaaS dashboard.
 
 type DemoEnrollStatus = "pending" | "approved" | "denied";
@@ -1128,7 +1127,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) startReferenceEnrollment
 // Graceful shutdown
 if (process.argv[1] === fileURLToPath(import.meta.url)) process.on("SIGINT", () => {
   console.log("\n\nShutting down server...");
-  enrollmentStore.close(); // stop the A1 background sweeper
+  enrollmentRepository.close(); // stop the A1 background sweeper
   server.close(() => {
     console.log("Server stopped");
     process.exit(0);

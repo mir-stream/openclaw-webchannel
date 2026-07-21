@@ -94,21 +94,31 @@ plugin receives NATS credentials it persists locally for re-connection.
 plugin                              SaaS                         operator
   │ POST /enroll (agentPublicKey,    │                              │
   │   tenant, accountId)             │                              │
-  │ ───────────────────────────────►│  create PendingEnrollment    │
+  │ ───────────────────────────────►│  create EnrollmentRecord     │
   │ ◄─────────────────────────────── │  status=pending              │
   │   device_code, user_code,        │                              │
   │   verification_uri[_complete],   │   ── shows user_code ──►      │
   │   expires_in, interval           │                              │ visits
   │                                  │                              │ verification_uri
   │ POST /poll (device_code)         │                              │ Approve / Deny
-  │ ──── every `interval`s ─────────►│  pending → approved | denied │ ◄────
-  │ ◄── 400 authorization_pending ── │     | expired                │
+  │ ──── every `interval`s ─────────►│  pending → approving       │ ◄────
+  │ ◄── 400 authorization_pending ── │    → approved | denied      │
   │ ◄── 200 EnrollmentResult ─────── │  on approve: mint NATS creds │
   │     (creds, peerId, jwksUrl,     │  + peerId                    │
   │      bootstrapUrl)               │                              │
 ```
 
-State: `pending → approved | expired | denied`. Codes are short-lived
+State: `pending → approving → approved`, with `pending|approving → denied`
+and eligible non-terminal records → `expired`. Approval claims carry leases;
+the repository clock is authoritative for issuance timestamps, leases, expiry, and retention. The
+process-local approval lock is advisory only: adapters must atomically fence
+claims and commit the enrollment, active key, and history together. Denying an
+`approving` record invalidates its claim, so a late commit cannot reverse the
+operator decision. Approved records are not expired by polling and remain
+available through `approvedAt + retentionMs` (equality retained) for boundary
+poll grace and idempotent commit recovery.
+
+Codes are short-lived
 (`expirationSeconds`, default 600s), the poll interval is enforced at a minimum
 of 5s per RFC 8628 (`pollIntervalSeconds`, default 5). Device codes are 256-bit
 (32-byte) crypto-random, base64url; user codes are `XXXX-XXXX` drawn from an
@@ -135,9 +145,10 @@ boundary:
 - `DeviceFlowError` — `authorization_pending` | `authorization_declined` |
   `expired_token` | `invalid_device_code` | `access_denied`
 
-Enrollment state is stored via the `EnrollmentStore` interface;
-`MemoryEnrollmentStore` is the default. Production should back it with a
-persistent store (Redis, DB).
+Enrollment state and agent-key history share the required `EnrollmentRepository`
+atomic boundary. `MemoryEnrollmentRepository` must be selected explicitly and is
+only a single-process reference; production should provide a conforming durable
+repository (for example PostgreSQL or a suitably co-located Redis deployment).
 
 ## Tenant-scoped NATS permissions
 
@@ -234,6 +245,48 @@ see [`../../docs/STATUS.md`](../../docs/STATUS.md).
    agents.
 
 ## Implementation note
+
+### Durable enrollment repositories
+
+Production deployments implement the exported `EnrollmentRepository` and run
+`runEnrollmentRepositoryConformance` against independent clients connected to
+the real shared backend. The core and fault suites are mandatory for every
+adapter; the controlled-clock suite is recommended. The fault suite certifies
+idempotent recovery after a successful commit response is lost; it does not
+inject partial writes or prove transactional atomicity. `commitApproval` must place the enrollment row, active
+key slot, and append-only history in one transaction; claim, deny, expiry,
+reconciliation, register, and revoke are atomic read/modify/write operations.
+
+In PostgreSQL, use unique device/user-code constraints, lock the enrollment row
+with `SELECT … FOR UPDATE`, lock the account slot (row or advisory lock), and
+retry serialization failures. In Redis, perform each transition in Lua. Redis
+Cluster is unsuitable unless enrollment and registry keys are deliberately
+co-located in one hash slot; their natural device-code and account keys do not
+share a slot. Configure retention explicitly and retain records while
+`now <= base + retentionMs`; a practical floor is two poll intervals plus the
+largest expected clock skew. The bundled memory implementation demonstrates
+single-process semantics only and is not evidence of multi-process durability.
+
+The factory's `clock` capability is optional, but omitting it certifies strictly
+less behavior. When it is absent, the convenience
+runner executes core and fault cases and emits an explicit `SKIP` message for
+every clock case; its returned report also lists every skipped case. Calling an
+exported clock case directly without that capability fails with a named
+`requires the optional controlled clock capability` error. Provide the clock to
+certify lease, expiry, retention-boundary, and time-dependent race behavior.
+
+```ts
+let now = Date.now();
+const report = await runEnrollmentRepositoryConformance({
+  create: async ({ retentionMs, autoSweep }) => ({
+    repo: await openRepository({ retentionMs, autoSweep, clock: () => now }),
+    close: async () => closeRepository(),
+    clock: { now: () => now, advance: async (ms) => { now += ms; } },
+  }),
+});
+// Assert this to prove the adapter received full controlled-clock coverage.
+expect(report.skipped).toEqual([]);
+```
 
 This Phase-B build uses a simplified (non-production) NKEY signature path while
 keeping the correct claim/permission structure for NATS compatibility;

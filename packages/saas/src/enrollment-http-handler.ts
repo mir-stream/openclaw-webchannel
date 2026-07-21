@@ -97,14 +97,20 @@ export function createEnrollmentHttpHandler(options: {
       if (action === "approve") {
         const replacement = typeof payload.replaceActivationId === "string" ? payload.replaceActivationId : undefined;
         const outcome = await options.enrollment.approve(userCode, { ...(replacement ? { replaceActivationId: replacement } : {}) });
-        if (outcome.kind === "conflict") return json(res, 409, { error: "conflict", activationId: outcome.existing?.activationId ?? null, fingerprint: outcome.existing?.keyIdFingerprint ?? null, enrolledAt: outcome.existing?.enrolledAt ?? null });
-        if (outcome.kind === "revoked_key") return json(res, 410, { error: "revoked_key" });
-        if (outcome.kind === "rejected") return json(res, 404, { ...(options.profile === "reference" ? { success: false } : {}), error: "rejected" });
-        options.log?.(`[${options.profile}] approved ${userCode}`);
-        const extra = await options.onApproved?.(userCode);
-        return json(res, 200, options.profile === "reference"
-          ? { success: true, peerId: outcome.result.peerId, ...(extra ?? {}) }
-          : { approved: true, peerId: outcome.result.peerId, ...(extra ?? {}) });
+        switch (outcome.kind) {
+          case "conflict": return json(res, 409, { error: "conflict", activationId: outcome.existing?.activationId ?? null, fingerprint: outcome.existing?.keyIdFingerprint ?? null, enrolledAt: outcome.existing?.enrolledAt ?? null });
+          case "in_progress": return json(res, 409, { error: "approval_in_progress", error_description: "Approval in progress, retry shortly" });
+          case "revoked_key": return json(res, 410, { error: "revoked_key" });
+          case "rejected": return json(res, 404, { ...(options.profile === "reference" ? { success: false } : {}), error: "rejected" });
+          case "approved": {
+            options.log?.(`[${options.profile}] approved ${userCode}`);
+            const extra = await options.onApproved?.(userCode);
+            return json(res, 200, options.profile === "reference"
+              ? { success: true, peerId: outcome.result.peerId, ...(extra ?? {}) }
+              : { approved: true, peerId: outcome.result.peerId, ...(extra ?? {}) });
+          }
+          default: { const exhaustive: never = outcome; return exhaustive; }
+        }
       }
       if (action === "deny") {
         const denied = await options.enrollment.deny(userCode);

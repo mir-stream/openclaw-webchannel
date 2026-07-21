@@ -8,7 +8,7 @@
 import { describe, expect, it } from "vitest";
 import { setupTrustChain } from "./setup-trust-chain.js";
 import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
-import { MemoryAgentKeyRegistry } from "./agent-key-registry.js";
+import { MemoryEnrollmentRepository } from "./enrollment-repository.js";
 
 describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () => {
   it("should generate NATS user credentials with proper structure", async () => {
@@ -20,7 +20,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
 
     // Create enrollment service
     const enrollment = new DeviceFlowEnrollment({
-    agentKeyRegistry: new MemoryAgentKeyRegistry(),
+    repository: new MemoryEnrollmentRepository(),
       saasTrustChain: trustChain.private,
       natsAccountConfig: trustChain.natsConfig,
       saasBaseUrl: "https://saas.test.com",
@@ -64,7 +64,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     const trustChain = await setupTrustChain();
 
     const enrollment = new DeviceFlowEnrollment({
-    agentKeyRegistry: new MemoryAgentKeyRegistry(),
+    repository: new MemoryEnrollmentRepository(),
       saasTrustChain: trustChain.private,
       natsAccountConfig: trustChain.natsConfig,
       saasBaseUrl: "https://saas.test.com",
@@ -115,7 +115,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     const trustChain = await setupTrustChain();
 
     const enrollment = new DeviceFlowEnrollment({
-    agentKeyRegistry: new MemoryAgentKeyRegistry(),
+    repository: new MemoryEnrollmentRepository(),
       saasTrustChain: trustChain.private,
       natsAccountConfig: trustChain.natsConfig,
       saasBaseUrl: "https://saas.test.com",
@@ -164,7 +164,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     const trustChain = await setupTrustChain();
 
     const enrollment = new DeviceFlowEnrollment({
-    agentKeyRegistry: new MemoryAgentKeyRegistry(),
+    repository: new MemoryEnrollmentRepository(),
       saasTrustChain: trustChain.private,
       natsAccountConfig: trustChain.natsConfig,
       saasBaseUrl: "https://saas.test.com",
@@ -236,7 +236,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     const trustChain = await setupTrustChain();
 
     const enrollment = new DeviceFlowEnrollment({
-    agentKeyRegistry: new MemoryAgentKeyRegistry(),
+    repository: new MemoryEnrollmentRepository(),
       saasTrustChain: trustChain.private,
       natsAccountConfig: trustChain.natsConfig,
       saasBaseUrl: "https://saas.test.com",
@@ -272,7 +272,7 @@ describe("NATS user JWT generation with tenant-scoped permissions (AC 3)", () =>
     const trustChain = await setupTrustChain();
 
     const enrollment = new DeviceFlowEnrollment({
-    agentKeyRegistry: new MemoryAgentKeyRegistry(),
+    repository: new MemoryEnrollmentRepository(),
       saasTrustChain: trustChain.private,
       natsAccountConfig: trustChain.natsConfig,
       saasBaseUrl: "https://saas.test.com",

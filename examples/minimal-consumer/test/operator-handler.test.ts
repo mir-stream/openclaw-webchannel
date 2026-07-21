@@ -58,5 +58,12 @@ assert.deepEqual(confirmed.body, { approved: true, peerId: "peer" });
 assert.deepEqual(approveCalls.at(-1), ["CODE", { replaceActivationId: "activation-1" }]);
 console.log("ok - conflict response confirms replacement through replaceActivationId");
 
+const busyEnrollment = { ...enrollment, approve: async () => ({ kind: "in_progress" as const }) };
+const busyHandler = createMinimalConsumerEnrollmentHandler({ adminToken: "secret-token", enrollment: busyEnrollment as never, registry, bootstrap: () => ({}) });
+assert.deepEqual(await invoke(busyHandler, "/approve", { user_code: "CODE" }, "Bearer secret-token"), {
+  status: 409, body: { error: "approval_in_progress", error_description: "Approval in progress, retry shortly" },
+});
+console.log("ok - in-progress approval is a distinct 409 and never falls through as success");
+
 assert.deepEqual(await invoke(handler, "/enroll", {}), { status: 400, body: { error: "invalid enrollment" } });
 console.log("ok - EnrollmentValidationError maps to 400");

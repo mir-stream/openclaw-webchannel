@@ -18,7 +18,8 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { accountCredentialPath, legacyCredentialPath } from "./account-config.js";
-import { MemoryAgentKeyRegistry } from "../../saas/src/agent-key-registry.js";
+import { MemoryEnrollmentRepository } from "../../saas/src/enrollment-repository.js";
+import { DeviceFlowEnrollment } from "../../saas/src/device-flow-enrollment.js";
 
 // ---------------------------------------------------------------------------
 // Test utilities
@@ -73,6 +74,39 @@ describe("EnrollmentClient", () => {
   });
 
   describe("enroll() - first boot", () => {
+    it("25: accepts a final poll that reaches the server just after expiresAt", async () => {
+      let repositoryNow = 1_001;
+      const repository = new MemoryEnrollmentRepository({ autoSweep: false, retentionMs: 50, clock: () => repositoryNow });
+      const boundaryResult = { creds: { userJwt: "boundary-jwt", userSeed: "boundary-seed", userPubkey: "boundary-pub" }, peerId: "boundary-peer" };
+      await repository.createEnrollment({
+        device_code: "boundary-device", user_code: "BOUND-ARY1", agentPublicKey: "A".repeat(43), tenant: "test-tenant", accountId: "test-agent",
+        createdAt: 0, expiresAt: 1_000, status: "approved", approvedAt: 999, natsCreds: boundaryResult.creds, peerId: boundaryResult.peerId,
+      });
+      const saas = new DeviceFlowEnrollment({
+        repository,
+        saasTrustChain: { rsaPrivateKeyPem: "unused", natsAccountSeed: "unused" },
+        natsAccountConfig: { operatorJwt: "unused", accountJwt: "unused", resolverConfig: {}, accountPublicKey: "unused" },
+        saasBaseUrl: "https://saas.com", jwksUrl: "https://saas.com/jwks", bootstrapUrl: "https://saas.com/bootstrap", natsUrl: "wss://nats.saas.com",
+      });
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({
+        device_code: "boundary-device", user_code: "BOUND-ARY1",
+        verification_uri: "https://saas.com/enroll", verification_uri_complete: "https://saas.com/enroll?user_code=BOUND-ARY1",
+        expires_in: 1, interval: 0,
+      }) });
+      const now = vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValueOnce(999).mockReturnValue(1_001);
+      mockFetch.mockImplementationOnce(async () => {
+        // This is a fixture transport, but the response itself comes from the
+        // shipped DeviceFlowEnrollment + repository transition, not a canned
+        // success. Repository time is already beyond expiresAt.
+        expect(Date.now()).toBeGreaterThan(1_000);
+        repositoryNow = 1_001;
+        const response = await saas.poll({ device_code: "boundary-device" });
+        return { ok: !("error" in response), json: async () => response };
+      });
+      await expect(client.enroll()).resolves.toMatchObject({ peerId: "boundary-peer" });
+      expect(mockFetch).toHaveBeenCalledTimes(2); now.mockRestore();
+    });
+
     it("should generate identity key and initiate enrollment", async () => {
       // Mock enrollment response
       mockFetch.mockResolvedValueOnce({
@@ -355,7 +389,7 @@ describe("EnrollmentClient", () => {
           queueSuccessfulEnrollment(`${scenario.name}-old`);
           await firstClient.enroll();
           const oldKey = Buffer.from(firstClient.getIdentityKey().publicKey).toString("base64url");
-          const registry = new MemoryAgentKeyRegistry();
+          const registry = new MemoryEnrollmentRepository();
           expect((await registry.register("test-tenant", scenario.name, oldKey, null)).ok).toBe(true);
           expect(await registry.revokeActive("test-tenant", scenario.name)).toBe(true);
 
