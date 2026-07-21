@@ -330,11 +330,25 @@ export class WebChannelNATSClient {
     this.closed = true;
     // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
     this.clearStaleDraftWatch();
-    // P0-4 (D5): fail the wrapper-owned held[] (no wireId → invisible to the
-    // low-level fail-all). Do this BEFORE disconnect() so the held terminal
-    // transitions land before the queue/ledger sweep fires its own failures.
-    this.failHeld({ reason: "closed", retryable: false });
     this.client.disconnect();
+    // P0-4 (D5): fail the wrapper-owned held[] (no wireId → invisible to the
+    // low-level fail-all).
+    //
+    // P0-4 (review R3): this runs LAST, after the teardown, because it NOTIFIES
+    // (receiptTransition → setState → embedder state subscribers) and the
+    // mutate-before-notify discipline requires the teardown to be COMPLETE before
+    // anything observes it. It used to run first, so an embedder reacting to a
+    // failed send by calling `connect()` — an ordinary auto-reconnect reflex —
+    // dialed from inside this sweep and the trailing `client.disconnect()` then
+    // killed that dial: `closed` was back to false with no socket and no reconnect
+    // armed, `close()` deliberately leaves `working` drafts live so turnInFlight()
+    // stayed true forever, and the next send() was held with no possible drain
+    // (onSession never fires again) — permanently `queued`. The old comment
+    // justified the old order as "held transitions land before the queue/ledger
+    // sweep"; that notification order between two independent receipt groups is
+    // cosmetic (nothing in the tests or the D5 contract depends on it), and a
+    // consistent post-teardown state is worth more than it.
+    this.failHeld({ reason: "closed", retryable: false });
   }
 
   /**

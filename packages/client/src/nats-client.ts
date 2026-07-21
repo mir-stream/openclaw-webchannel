@@ -1240,13 +1240,26 @@ export class WebChannelNatsClient {
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
     this.outSub = -1;
     this.resetSession();
+    this.client.disconnect();
     // P0-4 (B2): an explicit disconnect retires this instance — every pending
     // user_message (queued in `outboundQueue` AND published-but-unacked in the
     // ledger) fails observably with `failed{closed}`, then BOTH structures clear
     // (the old code cleared only the ledger, stranding queued sends in a dead
     // instance with no terminal transition).
+    //
+    // P0-4 (review R3): this sweep runs LAST — after the socket teardown — because
+    // it NOTIFIES (trackerFail → the wrapper's receipt/bubble setState → embedder
+    // state subscribers), and the PR's mutate-before-notify discipline means the
+    // teardown must be COMPLETE before anyone can observe it. An embedder that
+    // reacts to a failed send by calling `connect()` (an ordinary auto-reconnect
+    // reflex) used to run between the sweep and `client.disconnect()`: it dialed,
+    // and the trailing disconnect then killed that fresh dial, leaving the flags
+    // saying "open" with no socket and no reconnect armed. With the sweep last, a
+    // re-entrant connect() dials AFTER everything is torn down and nothing
+    // undoes it — the embedder's explicit reconnect is honored. `failAllPending`
+    // already clears the queue/ledger before it notifies, so moving the call does
+    // not change WHAT is swept, only when the notifications land.
     this.failAllPending({ reason: "closed", retryable: false });
-    this.client.disconnect();
   }
 
   /**

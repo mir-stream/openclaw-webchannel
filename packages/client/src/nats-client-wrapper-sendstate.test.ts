@@ -773,6 +773,135 @@ describe("WebChannelNATSClient — P0-4 eviction callout vs. the seal (F-A)", ()
 });
 
 // ---------------------------------------------------------------------------
+// P0-4 (review R3) — R3-1: the teardown paths must COMPLETE before they notify.
+// Both `close()` and the low-level `disconnect()` used to fire their failure
+// sweeps and only then tear the socket down, so an embedder reacting to a failed
+// send by calling `connect()` (an ordinary auto-reconnect reflex) dialed from
+// inside the sweep and the trailing teardown killed that dial — leaving the gates
+// saying "open" with no socket, where a later send held forever (`close()` leaves
+// `working` drafts live, and `onSession` never fires again to drain held[]).
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
+  /** The three flags that must agree: wrapper gate, low-level gate, live socket. */
+  function coherence(w: WebChannelNATSClient) {
+    const wrapperClosed = (w as unknown as { closed: boolean }).closed;
+    const mid = (w as unknown as { client: { disconnected: boolean; client: { ws: unknown } } }).client;
+    return { wrapperClosed, lowLevelDisconnected: mid.disconnected, hasSocket: mid.client.ws !== null };
+  }
+
+  // R3-1(a): connect() re-entered from close()'s held sweep. The embedder's
+  // reconnect is honored, the instance ends coherently OPEN, and a later send
+  // actually reaches the wire instead of sitting in held[] forever.
+  it("R3-1(a): connect() from close()'s notification leaves a coherent live instance; a later send is not stuck", async () => {
+    const h = await connectWrapper({ ack: false });
+    // A live `working` draft: close() does NOT settle it, so turnInFlight() stays
+    // true — this is what made the stranded send permanent.
+    deliverOut(h.K, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    await settle();
+    h.wrapper.send("held-one"); // → held[]
+    expect(h.wrapper.getState().messages.some((m) => m.pending)).toBe(true);
+
+    let reconnected = false;
+    h.wrapper.subscribe((s) => {
+      if (reconnected) return;
+      if (s.messages.some((m) => m.sendState === "failed")) {
+        reconnected = true;
+        h.wrapper.connect(); // the embedder's auto-reconnect reflex
+      }
+    });
+
+    h.wrapper.close();
+    await settle();
+    expect(reconnected).toBe(true);
+
+    // Coherent: the re-entrant connect() won, and nothing tore it back down.
+    expect(coherence(h.wrapper)).toEqual({
+      wrapperClosed: false, lowLevelDisconnected: false, hasSocket: true,
+    });
+
+    // A send now still HOLDS — the pre-close `working` draft is untouched, so a
+    // turn is legitimately in flight (P1-9 §3.1). The point is that the hold is
+    // DRAINABLE on this live instance: settling the turn releases it to the wire.
+    // Under the old ordering the instance had no socket, so nothing could ever
+    // release it and this receipt stayed `queued` forever.
+    const before = h.received.length;
+    const late = h.wrapper.send("after-reconnect")!;
+    await settle();
+    expect(late.snapshot().state).toBe("queued");
+    deliverOut(h.K, { type: "turn_settled", turnId: "T" });
+    await settle();
+    expect(late.snapshot().state).not.toBe("queued");
+    expect(h.received.length).toBe(before + 1); // it really went to the wire
+    h.wrapper.close();
+  });
+
+  // R3-1(b): the low-level twin — connect() re-entered from the `failAllPending`
+  // sweep inside disconnect(). Driven by an unacked (ledgered) send so the sweep
+  // has something to notify about, with no held[] involved.
+  it("R3-1(b): connect() from the low-level disconnect sweep leaves a coherent live instance", async () => {
+    const h = await connectWrapper({ ack: false });
+    const unacked = h.wrapper.send("unacked")!;
+    await settle();
+    expect(unacked.snapshot().state).toBe("sent"); // in the ledger, not held[]
+
+    let reconnected = false;
+    h.wrapper.subscribe((s) => {
+      if (reconnected) return;
+      if (s.messages.some((m) => m.sendFailure?.reason === "closed")) {
+        reconnected = true;
+        h.wrapper.connect();
+      }
+    });
+
+    h.wrapper.close();
+    await settle();
+    expect(reconnected).toBe(true);
+    expect(unacked.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed" } });
+    expect(coherence(h.wrapper)).toEqual({
+      wrapperClosed: false, lowLevelDisconnected: false, hasSocket: true,
+    });
+
+    const before = h.received.length;
+    const late = h.wrapper.send("late")!;
+    await settle();
+    expect(late.snapshot().state).not.toBe("queued");
+    expect(h.received.length).toBe(before + 1);
+    h.wrapper.close();
+  });
+
+  // R3-1(c): controls — the reorder must not change the non-re-entrant paths.
+  it("R3-1(c): a plain close() and a sequential close()→connect() behave as before", async () => {
+    const h = await connectWrapper({ ack: false });
+    deliverOut(h.K, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
+    await settle();
+    const held = h.wrapper.send("held-plain")!;
+    h.wrapper.send("unacked-plain");
+    await settle();
+
+    h.wrapper.close();
+    await settle();
+    // Both receipt groups still fail{closed}; the instance ends fully closed.
+    expect(held.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed" } });
+    expect(userBubble(h.wrapper, "unacked-plain")!.sendFailure).toMatchObject({ reason: "closed" });
+    expect((h.wrapper as unknown as { held: unknown[] }).held).toHaveLength(0);
+    expect(coherence(h.wrapper)).toEqual({
+      wrapperClosed: true, lowLevelDisconnected: true, hasSocket: false,
+    });
+
+    // Sequential reopen: gates clear, socket returns, holding is restored.
+    h.wrapper.connect();
+    await settle();
+    expect(coherence(h.wrapper)).toEqual({
+      wrapperClosed: false, lowLevelDisconnected: false, hasSocket: true,
+    });
+    deliverOut(h.K, { type: "typing" });
+    await settle();
+    expect(h.wrapper.send("re-held")!.snapshot().state).toBe("queued"); // holds again
+    h.wrapper.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // P0-4 (R3): a CL2 terminal instance is PERMANENTLY retired — a registration-path
 // terminal (only the WCNC latch set; the raw transport is NOT terminal) must not
 // let a later public connect() flip the sticky "error" to "connected" while every
