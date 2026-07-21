@@ -114,23 +114,44 @@ describe("P1-3 connection epoch guards", () => {
     h.client.disconnect();
   });
 
-  it("error-listener disconnect+connect prevents the old terminal branch closing the new socket", async () => {
+  // P0-4 send-result-contract terminal model (updated): a register-path terminal
+  // (here `omitWrappedKey` → the missing-wrappedConversationKey terminal) now
+  // PERMANENTLY retires the instance. An error-listener that tries to reconnect
+  // the SAME instance is REFUSED at connect() (the R5 guard in nats-client.ts:
+  // "terminally retired"), so no replacement socket is ever dialed — the pre-P0-4
+  // "old terminal branch closes the NEW socket" hazard is unreachable because no
+  // NEW socket exists. What the epoch guard actually protects — a stale terminal
+  // continuation cannot act — still holds: onError fires exactly once and the
+  // instance never re-registers on a second socket. The stale-continuation guard
+  // itself (retire-before-notify + generation-targeted disconnect) is unchanged
+  // and remains proven by the other epoch tests above. Companion suite asserting
+  // the same retirement contract at the wrapper layer:
+  // nats-client-wrapper-sendstate.test.ts › "P0-4 permanent terminal retirement".
+  it("a register-path terminal retires the instance; an error-listener disconnect+connect is refused and the stale continuation stays inert", async () => {
     const h = await makeClient(); let errors = 0;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     FakeNatsWS.sharedHandler = handlerBySocket(
       registerAgent(new Uint8Array(32), h.devicePublicRaw, h.identity, { omitWrappedKey: true }),
       registerAgent(new Uint8Array(32).fill(5), h.devicePublicRaw, h.identity),
     );
     h.client.onError(() => { errors++; if (errors === 1) { h.client.disconnect(); h.client.connect(); } });
     h.client.connect(); await settle(12);
-    expect(errors).toBe(1); expect(FakeNatsWS.instances).toHaveLength(2);
-    expect(FakeNatsWS.instances[1]!.readyState).toBe(FakeNatsWS.OPEN);
-    expect(FakeNatsWS.instances[1]!.published.some((p) => p.subject === registerSubject(TENANT, AGENT, PEER))).toBe(true);
+    expect(errors).toBe(1);
+    // connect() was refused → no replacement dial; the retired socket is the only one.
+    expect(FakeNatsWS.instances).toHaveLength(1);
+    expect(FakeNatsWS.instances[0]!.readyState).toBe(FakeNatsWS.CLOSED);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("terminally retired"))).toBe(true);
+    // The stale continuation never re-registered: exactly one socket ever published a register.
+    const registered = FakeNatsWS.instances.filter((ws) => ws.published.some((p) => p.subject === registerSubject(TENANT, AGENT, PEER)));
+    expect(registered).toHaveLength(1);
+    warn.mockRestore();
     h.client.disconnect();
   });
 
-  it("error-listener connect keeps a replacement dial alive after the failed socket closed", async () => {
+  it("a register-path terminal retires the instance; an error-listener connect() after the failed socket closed is refused (no replacement dial)", async () => {
     const h = await makeClient(); let releaseReply!: () => void;
     const gate = new Promise<void>((resolve) => { releaseReply = resolve; });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     FakeNatsWS.sharedHandler = handlerBySocket(
       registerAgent(new Uint8Array(32), h.devicePublicRaw, h.identity, { omitWrappedKey: true, beforeReply: () => gate }),
       registerAgent(new Uint8Array(32).fill(8), h.devicePublicRaw, h.identity),
@@ -140,16 +161,20 @@ describe("P1-3 connection epoch guards", () => {
     h.client.connect(); await settle(5);
 
     // The first socket dies while its register continuation is still pending.
-    // Before the scheduled reconnect fires, release a terminal reply. Its error
-    // listener synchronously dials a replacement while the old continuation is
-    // still on the stack.
+    // Releasing the (terminal) reply fires the error listener, whose connect() is
+    // now REFUSED because the instance is terminally retired — under the old model
+    // this dialed a live replacement; under P0-4 no replacement is created.
     FakeNatsWS.instances[0]!.close();
     releaseReply(); await settle(8);
 
-    expect(errors).toBe(1); expect(FakeNatsWS.instances).toHaveLength(2);
+    expect(errors).toBe(1);
+    expect(FakeNatsWS.instances).toHaveLength(1);
     expect(FakeNatsWS.instances[0]!.readyState).toBe(FakeNatsWS.CLOSED);
-    expect(FakeNatsWS.instances[1]!.readyState).toBe(FakeNatsWS.OPEN);
-    expect(FakeNatsWS.instances[1]!.published.some((p) => p.subject === registerSubject(TENANT, AGENT, PEER))).toBe(true);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("terminally retired"))).toBe(true);
+    // No replacement ever registered.
+    const registered = FakeNatsWS.instances.filter((ws) => ws.published.some((p) => p.subject === registerSubject(TENANT, AGENT, PEER)));
+    expect(registered).toHaveLength(1);
+    warn.mockRestore();
     h.client.disconnect();
   });
 });

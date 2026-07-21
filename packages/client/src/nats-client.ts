@@ -1658,12 +1658,15 @@ export class WebChannelNatsClient {
     // caught by `terminalReached` and immediate-fails, never re-queued into a
     // dead instance. Idempotent, so re-entry through the guard is harmless.
     this.markTerminalAndSweep(cause);
-    // Retire the failed generation BEFORE invoking embedder code. An error
-    // listener may synchronously call connect() after the failed socket has
-    // already closed; that creates a replacement dial whose onConnected() has
-    // not run yet, so it cannot advance the epoch for itself. Keeping `epoch`
-    // current through notification would let this old terminal continuation's
-    // post-listener guard pass and disconnect that replacement socket.
+    // Retire the failed epoch BEFORE invoking embedder code, so a stale
+    // continuation of THIS flow (e.g. a late unwrap resolve/reject still on the
+    // stack) that resumes after notification sees a bumped epoch and stays inert.
+    // Note: under the P0-4 retirement contract `markTerminalAndSweep` above has
+    // already set `terminalReached`, so an error listener's synchronous
+    // `connect()` is refused (no replacement dial is ever created — recovery is a
+    // fresh instance); the retire-before-notify here is no longer guarding a
+    // replacement socket, but it remains load-bearing for the same-flow late
+    // continuations covered by the epoch-guard tests.
     const retiredEpoch = ++this.connectionEpoch;
     this.notifyErrorListeners(err, cause);
     if (this.connectionEpoch !== retiredEpoch) return;
