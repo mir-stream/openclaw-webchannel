@@ -152,6 +152,9 @@ jobs:
       - name: Plugin pack-and-load smoke (F3 remote-install guard)
         run: bash scripts/pack-load-smoke.sh
 
+      - name: Client clean-pack surface smoke (stale dist guard)
+        run: bash scripts/client-pack-smoke.sh
+
       - name: Removed gateway transport symbol guard
         run: bash scripts/check-banned-symbols.sh
 

@@ -9,7 +9,7 @@ seed(`.ouroboros/*`)·평가 점수에 "AC 100% / complete"가 보여도, 그것
 | [`SPLIT_DEMO.md`](SPLIT_DEMO.md) | 분할 호스트(Mac)/컨테이너 라이브 데모 재현 가이드 | 재현 가이드 |
 | [`BACKLOG.md`](BACKLOG.md) | 후속 작업과 완료된 마이그레이션 기록 | 백로그 |
 | [`archive/REVIEW_2026-07-02.md`](archive/REVIEW_2026-07-02.md) | 통합 데모 직후 전체 코드 리뷰 | 보관된 리뷰 스냅샷 |
-| [`REVIEW_2026-07-15.md`](REVIEW_2026-07-15.md) | 저장소 전체 리뷰와 우선순위 실행안. auto-admission·Gateway-WS 완전 삭제, 전달 보장, multi-agent/HA 및 reference hardening | **현재 실행 우선순위** |
+| [`REVIEW_2026-07-15.md`](REVIEW_2026-07-15.md) | 저장소 전체 리뷰와 우선순위 실행안. auto-admission·Gateway-WS 완전 삭제, 전달 보장, account-scoped agent identity/key lifecycle·agent replica key 불변식·issuer HA 및 reference hardening | 실행 인덱스 (후속 PLAN 결정 우선) |
 | [`archive/PLAN.md`](archive/PLAN.md) | 초기 범위·아키텍처·단계 | 보관된 설계 기록 |
 | [`AUTH.md`](AUTH.md) | 인증·신원 모델 (`assertJwtAuthConfig` + NATS register-hop 검증) | 설계 (라이브 검증됨) |
 | [`TRUST_AND_ONBOARDING.md`](TRUST_AND_ONBOARDING.md) | E2E NATS relay 신뢰 결합 + 디바이스-플로우 온보딩 | ✅ 라이브 검증됨 (live-proven) |
@@ -17,6 +17,10 @@ seed(`.ouroboros/*`)·평가 점수에 "AC 100% / complete"가 보여도, 그것
 | [`archive/RESEARCH.md`](archive/RESEARCH.md) | OpenClaw 내부 API·경로 조사 노트 | 보관된 레퍼런스 |
 | [`archive/GAP_ANALYSIS.md`](archive/GAP_ANALYSIS.md) | 외부 채널 대비 기능 갭 분석 | 보관된 리서치 |
 | [`archive/`](archive/) | 옛 PRD 등 역사 스냅샷 | 보관 (참조 금지, STATUS/PLAN 사용) |
+
+P1-1의 현재 제품 계약은 원 리뷰의 multi-agent 제안이 아니라
+[`P1-1-PLAN.md` §0](review-2026-07-15/P1-1-PLAN.md#0-범위-결정과-보장-범위-확정)과
+[`AUTH.md`의 Agent identity-key lifecycle](AUTH.md#agent-identity-key-lifecycle)을 따른다.
 
 패키지별 문서는 각 패키지 README 참조: `packages/plugin/README.md`,
 `packages/client/README.md`, `packages/saas/README.md`.

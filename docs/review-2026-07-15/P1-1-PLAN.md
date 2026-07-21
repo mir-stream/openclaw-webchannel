@@ -1,9 +1,10 @@
 # P1-1 구현 계획 — Agent key registry: 명시적 교체 의미론
 
-Status: **CONVERGED r8** — codex(gpt-5.6-sol) 적대리뷰 7라운드 수렴
-(r7 판정 CONVERGED: BLOCKER 0 / MAJOR 0; 잔여 MINOR 3건 본문 반영 완료).
-구현 착수 조건: P0-1 merge 후 rebase.
-원 리뷰: [P1.md — P1-1](./P1.md#p1-1-multi-agent-identity-key-routing)
+Status: **IMPLEMENTED** — 현재 제품 계약은 [`docs/AUTH.md`의
+Agent identity-key lifecycle](../AUTH.md#agent-identity-key-lifecycle)을 따른다.
+아래는 CONVERGED r8 구현 계획과 검토 기록이다(codex(gpt-5.6-sol) 적대리뷰
+7라운드, r7 판정 BLOCKER 0 / MAJOR 0; 잔여 MINOR 3건 본문 반영 완료).
+원 리뷰: [P1.md — P1-1](./P1.md#p1-1-multi-agent-identity-key-registry-routing)
 
 ## 0. 범위 결정과 보장 범위 (확정)
 
@@ -594,7 +595,7 @@ Wire 호환:
 
 ## 4. 비범위 (명시)
 
-- `agentId`·wire 변경·복수 logical agent 라우팅 — (b) 보류.
+- `agentId`·wire 변경·복수 logical agent 라우팅 — 현재 미지원이며 향후 제품 결정으로 보류.
 - Key rotation overlap window — (b)/후속.
 - 복수 issuer replica의 enrollment 전이 직렬화(lease/CAS, 중복 mint 차단),
   enrollment 상태 전이의 조건부화(poll expiry write 포함), approval+registry
