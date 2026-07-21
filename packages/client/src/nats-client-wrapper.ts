@@ -185,6 +185,10 @@ export class WebChannelNATSClient {
       // the CL1 natsCredentials bug — the wrapper rebuilds the options object, so
       // any NatsClientOptions field it doesn't name is silently lost).
       heartbeatIntervalMs: options.heartbeatIntervalMs,
+      // P1-3: forward the connect-stage deadline (same drop-on-the-floor class);
+      // without this the public type advertises `connectTimeoutMs` but the low
+      // level always runs its 10s default — 0 (disable) must survive too.
+      connectTimeoutMs: options.connectTimeoutMs,
     };
 
     this.client = new WebChannelNatsClient(this.natsOptions);

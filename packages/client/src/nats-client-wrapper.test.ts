@@ -92,6 +92,33 @@ describe("WebChannelNATSClient — CL1 option forwarding", () => {
     expect(built.heartbeatIntervalMs).toBe(0);
   });
 
+  it("forwards connectTimeoutMs (P1-3 connect-stage deadline)", () => {
+    const wrapper = new WebChannelNATSClient({
+      natsUrl: "wss://nats.prod.example.com",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "acct-1",
+      tenant: "tenant-1",
+      peerId: "peer-1",
+      registration,
+      connectTimeoutMs: 2_500,
+    });
+    const built = wrapper["natsOptions"] as NatsClientOptions;
+    expect(built.connectTimeoutMs).toBe(2_500);
+
+    // 0 is meaningful (disables the deadline) and must survive the rebuild —
+    // a `||`-style fallback would silently re-enable the 10s default.
+    const disabled = new WebChannelNATSClient({
+      natsUrl: "wss://nats.prod.example.com",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "acct-1",
+      tenant: "tenant-1",
+      peerId: "peer-1",
+      registration,
+      connectTimeoutMs: 0,
+    });
+    expect((disabled["natsOptions"] as NatsClientOptions).connectTimeoutMs).toBe(0);
+  });
+
   it("leaves natsCredentials undefined for open/dev NATS (unchanged behavior)", () => {
     const wrapper = new WebChannelNATSClient({
       natsUrl: "wss://nats.dev.example.com",
