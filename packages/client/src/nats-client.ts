@@ -603,8 +603,26 @@ export class NatsClient {
 
     let sig = "";
     if (nonce) {
-      const privateKey = await importEd25519SeedKey(base64urlDecode(creds.userSeedRaw));
-      sig = await signNonce(privateKey, nonce);
+      try {
+        const privateKey = await importEd25519SeedKey(base64urlDecode(creds.userSeedRaw));
+        sig = await signNonce(privateKey, nonce);
+      } catch (err) {
+        // A malformed user seed (or any WebCrypto failure) can never produce a
+        // valid signature — the SAME credentials fail on every re-dial. Left
+        // unguarded, `void sendSignedConnect(...)` turns this into an unhandled
+        // rejection, CONNECT is never sent, and the armed "CONNECT signing"
+        // deadline silently force-reconnects into an endless ~10s loop. Retire
+        // terminally instead (mirrors the plugin's settle(err)), but only for the
+        // CURRENT dial — a reconnect during the await may have moved on, and that
+        // replacement runs its own signing.
+        if (this.ws !== ws) return;
+        this.failTerminally(
+          `NATS NKEY signing failed: ${err instanceof Error ? err.message : String(err)} ` +
+            `(invalid user seed — reconnecting cannot help; re-authenticate)`,
+          "auth-rejected",
+        );
+        return;
+      }
     }
 
     const connectPayload: Record<string, unknown> = {

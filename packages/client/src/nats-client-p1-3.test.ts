@@ -120,6 +120,24 @@ describe("P1-3 browser transport invariants", () => {
     ws.frame("MSG s 1 1\r\nX!!"); expect(ws.closed).toBe(true); c.disconnect();
   });
 
+  // A persistent signing failure (malformed seed / any WebCrypto throw) must retire
+  // terminally, not loop the "CONNECT signing" deadline forever. Before the fix the
+  // throw was an unhandled rejection and the deadline force-reconnected every ~10s.
+  it("fails terminally when NKEY signing throws instead of looping the signing deadline", async () => {
+    vi.useFakeTimers();
+    const sign = vi.spyOn(crypto.subtle, "sign").mockImplementation(() => { throw new Error("boom"); });
+    const causes: Array<string | undefined> = [];
+    const c = make({ connectTimeoutMs: 10, natsCredentials: credentials, reconnectBaseMs: 5, reconnectCapMs: 5 });
+    c.onError((_e, cause) => causes.push(cause));
+    c.connect(); const ws = FakeWS.instances[0]!; ws.open(); ws.frame('INFO {"nonce":"n"}\r\n');
+    await vi.advanceTimersByTimeAsync(0); // let the rejected signing settle
+    expect(causes).toContain("auth-rejected"); expect(ws.closed).toBe(true);
+    // No reconnect loop: advance well past the signing deadline + backoff — no new dial.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(FakeWS.instances).toHaveLength(1);
+    sign.mockRestore(); c.disconnect();
+  });
+
   it("does not send a delayed NKEY signature to a replacement socket", async () => {
     vi.useFakeTimers(); let release!: (value: ArrayBuffer) => void;
     const sign = vi.spyOn(crypto.subtle, "sign").mockImplementationOnce(() => new Promise<ArrayBuffer>((resolve) => { release = resolve; }));
