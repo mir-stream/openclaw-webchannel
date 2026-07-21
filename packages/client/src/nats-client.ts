@@ -1763,9 +1763,32 @@ export class WebChannelNatsClient {
       this.unackedLedger.clear();
       this.outboundQueue = [...replay, ...this.outboundQueue];
     }
-    const queued = this.outboundQueue;
-    this.outboundQueue = [];
-    for (const message of queued) this.seal(message);
+    // P0-4 (review R1): drain the queue LIVE — shift one entry per iteration —
+    // rather than snapshotting it into a local array and clearing the field up
+    // front. `seal()` publishes synchronously, which runs `trackerAdvance(…,
+    // "sent")` → the wrapper's receipt/bubble `setState` → the embedder's state
+    // subscribers, MID-LOOP. A perfectly ordinary subscriber (route change,
+    // unmount, logout) may call `close()` there. With a snapshot the remaining
+    // entries live in NEITHER `outboundQueue` NOR `unackedLedger` for the length
+    // of the loop, so the `failAllPending()` sweep inside that `disconnect()`
+    // cannot see them; the loop then resumes and `seal()` re-pushes them onto a
+    // closed instance whose sweep will never run again — permanently `queued`,
+    // the exact invariant P0-4 exists to eliminate. (Same hole on the terminal
+    // path: `markTerminalAndSweep` would likewise miss the in-flight array.) A
+    // live drain keeps the remainder genuinely present in `outboundQueue`, so
+    // every sweep sees it. This mirrors the deliberate live-`shift()` discipline
+    // in the wrapper's `maybeRelease()`, which is why the release path is immune.
+    //
+    // The `this.sessionKey` condition is LOAD-BEARING, not a re-check for tidiness:
+    // `seal()` fail-closes by re-pushing to the TAIL when the key is gone, so an
+    // unconditional `while (length > 0)` would shift-and-re-push the same frame
+    // forever. With the guard, a mid-loop session teardown just leaves the
+    // remainder queued in order — swept to failed{closed}/failed{terminal} if the
+    // instance was closed/retired, or replayed at the next flushQueue() on a plain
+    // reconnect (pre-existing behavior), with no reordering either way.
+    while (this.sessionKey && this.outboundQueue.length > 0) {
+      this.seal(this.outboundQueue.shift()!);
+    }
   }
 
   private seal(message: OutboundMessage): void {

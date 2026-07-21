@@ -47,8 +47,16 @@ type Setup = {
   control: { ack: boolean };
 };
 
-/** A registered wrapper over the fake socket; auto-acks user_messages by default. */
-async function connectWrapper(control: { ack: boolean } = { ack: true }): Promise<Setup> {
+/**
+ * A registered wrapper over the fake socket; auto-acks user_messages by default.
+ * `opts.connect === false` returns the wrapper UNCONNECTED (no dial, no session
+ * key) so a caller can queue pre-connect sends and drive `connect()` itself —
+ * the only way to exercise a multi-entry `flushQueue()` drain.
+ */
+async function connectWrapper(
+  control: { ack: boolean } = { ack: true },
+  opts: { connect?: boolean } = {},
+): Promise<Setup> {
   const pop = await generateDevicePopKeyPair();
   const x = await generateDeviceX25519();
   const identity = makeAgentIdentity();
@@ -79,8 +87,10 @@ async function connectWrapper(control: { ack: boolean } = { ack: true }): Promis
       pinnedAgentPublicKey: identity.publicB64url,
     },
   });
-  wrapper.connect();
-  await settle();
+  if (opts.connect !== false) {
+    wrapper.connect();
+    await settle();
+  }
   return { wrapper, K, identity, devicePublicRaw: x.publicRaw, received, control };
 }
 
@@ -557,6 +567,92 @@ describe("WebChannelNATSClient — P0-4 send onto a closed instance (T-cx)", () 
     await settle();
     expect(receipt.snapshot().state).toBe("queued");
     expect(userBubble(h.wrapper, "re-held")!.pending).toBe(true);
+    h.wrapper.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0-4 (review R1) — F1: a teardown from a state subscriber DURING the
+// `flushQueue()` drain. Each `seal()` publishes synchronously and notifies the
+// embedder mid-loop; with the old snapshot-and-clear drain the not-yet-sealed
+// remainder was invisible to `failAllPending()`/`markTerminalAndSweep`, so it
+// was re-queued onto a dead instance and stranded at `queued` forever. Driven
+// entirely through the public API (pre-connect sends + a plain `subscribe()`).
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P0-4 mid-flush teardown (F1)", () => {
+  /** Queue `texts` pre-connect and return their receipts (all at `queued`). */
+  async function queuedBatch(h: Setup, texts: string[]) {
+    const receipts = texts.map((t) => h.wrapper.send(t)!);
+    expect(receipts.map((r) => r.snapshot().state)).toEqual(texts.map(() => "queued"));
+    return receipts;
+  }
+  const states = (rs: Array<{ snapshot: () => { state?: string } }>) => rs.map((r) => r.snapshot().state);
+
+  // F1(a): close() from a subscriber mid-drain — every receipt must end terminal.
+  it("F1(a): close() during the flush drain leaves NO send stuck at queued", async () => {
+    const h = await connectWrapper({ ack: false }, { connect: false });
+    const receipts = await queuedBatch(h, ["m1", "m2", "m3"]);
+
+    let closedOnce = false;
+    h.wrapper.subscribe((s) => {
+      // Fires as soon as the first drained frame leaves `queued` (→ "sent"),
+      // i.e. synchronously inside the drain loop, before m2/m3 are sealed.
+      if (closedOnce) return;
+      const m1 = s.messages.find((m) => m.text === "m1");
+      if (m1?.sendState && m1.sendState !== "queued") {
+        closedOnce = true;
+        h.wrapper.close();
+      }
+    });
+
+    h.wrapper.connect();
+    await settle();
+    expect(closedOnce).toBe(true);
+    expect(states(receipts)).toEqual(["failed", "failed", "failed"]);
+    for (const r of receipts) {
+      expect(r.snapshot()).toMatchObject({ failure: { reason: "closed", retryable: false } });
+    }
+  });
+
+  // F1(b): the terminal twin — a genuine -ERR emitted from the subscriber mid-drain
+  // (synchronously reachable: the literal goes straight onto the socket's protocol
+  // stream). The remainder must be swept to failed{terminal}, not stranded.
+  it("F1(b): a terminal failure during the flush drain leaves NO send stuck at queued", async () => {
+    const h = await connectWrapper({ ack: false }, { connect: false });
+    const receipts = await queuedBatch(h, ["t1", "t2", "t3"]);
+
+    let firedOnce = false;
+    h.wrapper.subscribe((s) => {
+      if (firedOnce) return;
+      const t1 = s.messages.find((m) => m.text === "t1");
+      if (t1?.sendState && t1.sendState !== "queued") {
+        firedOnce = true;
+        FakeNatsWS.instances.at(-1)!.onmessage?.({ data: "-ERR 'Authorization Violation'\r\n" });
+      }
+    });
+
+    h.wrapper.connect();
+    await settle();
+    expect(firedOnce).toBe(true);
+    expect(states(receipts)).toEqual(["failed", "failed", "failed"]);
+    for (const r of receipts) {
+      expect(r.snapshot()).toMatchObject({ failure: { reason: "terminal", retryable: false } });
+    }
+    expect(h.wrapper.getState().status).toBe("error");
+  });
+
+  // F1(c): control — with no teardown, the live drain still publishes the whole
+  // batch in FIFO order and every receipt advances past `queued`.
+  it("F1(c): an undisturbed flush publishes every frame in FIFO order", async () => {
+    const h = await connectWrapper({ ack: true }, { connect: false });
+    const receipts = await queuedBatch(h, ["f1", "f2", "f3"]);
+
+    h.wrapper.connect();
+    await settle();
+    expect(states(receipts)).toEqual(["accepted", "accepted", "accepted"]);
+    // `received` records the server-side arrival order of the sealed user_messages.
+    const wireIds = ["f1", "f2", "f3"].map((t) => userBubble(h.wrapper, t)!.wireId!);
+    expect(h.received).toEqual(wireIds);
     h.wrapper.close();
   });
 });
