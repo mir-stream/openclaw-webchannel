@@ -1804,8 +1804,21 @@ export class WebChannelNatsClient {
     // and leave a drained id re-inserted. Only user_messages (see `unackedLedger`);
     // an id-less frame from a caller that bypassed sendUserMessage is not
     // replayable and is skipped.
+    //
+    // P0-4 (review R2): `recordUnacked` RETURNS the ids it evicted rather than
+    // failing them inline, and we notify them at the end of this method. Nothing
+    // between the `sessionKey` fail-closed check above and `sealMessage()` below
+    // may call into embedder code: a subscriber reached from here can `close()`,
+    // which nulls `sessionKey` mid-seal (TS narrowing from the top-of-function
+    // check hides it), and `null` then flows into the AEAD as a raw TypeError
+    // thrown straight out of `send()`. Audited: eviction was the ONLY such callout
+    // in this window; the remaining statements are Map/object reads and a
+    // `console.warn`. Keeping it that way makes the seal atomic — hence no
+    // defensive re-check before `sealMessage()`, which would be dead code (and a
+    // re-queue there would strand the frame on an already-swept closed instance).
+    let evicted: string[] = [];
     if (message.type === "user_message" && message.id) {
-      this.recordUnacked(message.id, message);
+      evicted = this.recordUnacked(message.id, message);
     }
     const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, message);
     // P0-4 (D3): stamp the attempt time on every publish attempt (R1-F10), then
@@ -1822,6 +1835,18 @@ export class WebChannelNatsClient {
       if (ok) this.trackerAdvance(message.id, "sent");
     } else if (!ok) {
       console.warn(`[nats-client] publish failed for non-replicated frame '${message.type}' — recovery via reconnect/register snapshot`);
+    }
+    // P0-4 (review R2): the deferred eviction notifications — the seal is complete,
+    // so an embedder that tears the instance down from here can no longer corrupt
+    // it. Ordered AFTER this message's own `sent` advance on purpose: a `close()`
+    // from an eviction subscriber sweeps the ledger, and THIS message is already
+    // recorded in it, so it lands at failed{closed} rather than being stranded.
+    for (const id of evicted) {
+      this.trackerFail(id, {
+        reason: "evicted",
+        retryable: true,
+        lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
+      });
     }
   }
 
@@ -1917,8 +1942,24 @@ export class WebChannelNatsClient {
     });
   }
 
-  /** P0-7b: record an unacked user_message, evicting the oldest past the cap. */
-  private recordUnacked(id: string, message: OutboundMessage): void {
+  /**
+   * P0-7b: record an unacked user_message, evicting the oldest past the cap.
+   *
+   * RETURNS the evicted ids instead of failing them here (P0-4 review R2).
+   * `trackerFail` is a synchronous callout into embedder code (emitSendState →
+   * the wrapper's receiptTransition → setState → app state subscribers), and the
+   * only caller is `seal()`, which runs this BETWEEN its `sessionKey` fail-closed
+   * check and the `sealMessage()` that reads `this.sessionKey`. A subscriber
+   * calling `close()` from that window nulls the key mid-seal, so `sealMessage`
+   * received `null` and threw a raw crypto TypeError out of `send()` — breaking
+   * the P0-4 contract that a send RETURNS an observable receipt and never throws
+   * (and, on the flush path, escaping `onConnected` as an unhandled rejection
+   * that abandoned the rest of the drain). Returning the ids keeps `seal()`'s
+   * critical section free of embedder code; the caller notifies once the seal is
+   * done. B3's observable-eviction behavior itself is unchanged.
+   */
+  private recordUnacked(id: string, message: OutboundMessage): string[] {
+    const evicted: string[] = [];
     this.unackedLedger.set(id, message);
     while (this.unackedLedger.size > WebChannelNatsClient.MAX_UNACKED) {
       const oldest = this.unackedLedger.keys().next().value as string | undefined;
@@ -1926,12 +1967,8 @@ export class WebChannelNatsClient {
       this.unackedLedger.delete(oldest);
       // P0-4 (B3): an evicted message will never be replayed → fail it observably
       // (retryable — a fresh send can still succeed) instead of the old
-      // console-only drop.
-      this.trackerFail(oldest, {
-        reason: "evicted",
-        retryable: true,
-        lastAttemptAt: this.sendTracker.get(oldest)?.lastAttemptAt,
-      });
+      // console-only drop. Deferred to the caller (see the note above).
+      evicted.push(oldest);
       if (!this.warnedUnackedEvict) {
         // Warn ONCE per session (re-armed in resetSession) — a full ledger means
         // an unusually long delivery stall; a per-send warn would spam a burst.
@@ -1942,6 +1979,7 @@ export class WebChannelNatsClient {
         );
       }
     }
+    return evicted;
   }
 
   private notifyMessageListeners(msg: InboundMessage): void {

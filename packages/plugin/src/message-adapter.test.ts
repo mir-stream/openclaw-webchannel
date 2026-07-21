@@ -69,6 +69,25 @@ describe("ProgressDraftController.finalize result contract", () => {
     expect(finalizeDraft).toHaveBeenCalledTimes(1);
   });
 
+  // P0-4 (review R2): with no pending draft content the finalize body runs to
+  // `finalizeDraft` with no preceding await, so the idempotency latch must be
+  // armed BEFORE it — a re-entrant call from inside finalizeDraft must not
+  // trigger a second terminal frame.
+  it("latches synchronously: a re-entrant finalize from inside finalizeDraft does not double-send", async () => {
+    let draft!: ReturnType<typeof createProgressDraftController>;
+    let reentrant: Promise<boolean> | undefined;
+    const finalizeDraft = vi.fn((_peer: string, _id: string, _text: string) => {
+      reentrant ??= draft.finalize("re-entrant");
+      return true;
+    });
+    const transport = { finalizeDraft } as unknown as WebChannelPeerChannel;
+    draft = createProgressDraftController({ transport, sessionKey: "p", channelConfig: {} });
+    await expect(draft.finalize("one")).resolves.toBe(true);
+    await expect(reentrant).resolves.toBe(true); // same cached outcome
+    expect(finalizeDraft).toHaveBeenCalledTimes(1);
+    expect(finalizeDraft.mock.calls[0]?.[2]).toBe("one");
+  });
+
   it("continues to finalize when a pending preview flush throws", async () => {
     const finalizeDraft = vi.fn((_peer: string, _id: string, _text: string) => true);
     const transport = {

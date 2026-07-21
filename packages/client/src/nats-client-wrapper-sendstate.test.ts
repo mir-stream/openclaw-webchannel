@@ -658,6 +658,121 @@ describe("WebChannelNATSClient — P0-4 mid-flush teardown (F1)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// P0-4 (review R2) — F-A: unacked-ledger EVICTION notifies the embedder, and B3
+// moved that notification from a console.warn into a real `trackerFail`. Firing
+// it from inside `seal()`'s critical section let a subscriber's `close()` null
+// `sessionKey` between the fail-closed check and `sealMessage()`, so `null` flowed
+// into the AEAD and `send()` threw a raw crypto TypeError — no receipt returned
+// at all. The notification is now deferred to the end of `seal()`.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P0-4 eviction callout vs. the seal (F-A)", () => {
+  // The ledger cap is a private constant; 101 unacked sends is the first size
+  // that evicts. Keep in sync with `MAX_UNACKED` in nats-client.ts.
+  const CAP = 100;
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => { errSpy.mockRestore(); warnSpy.mockRestore(); });
+
+  /** Send `n` messages, capturing any synchronous throw instead of failing fast. */
+  function sendBurst(w: WebChannelNATSClient, n: number, prefix: string) {
+    const receipts: Array<ReturnType<WebChannelNATSClient["send"]>> = [];
+    const throws: Array<{ i: number; err: unknown }> = [];
+    for (let i = 0; i < n; i++) {
+      try {
+        receipts.push(w.send(`${prefix}${i}`));
+      } catch (err) {
+        throws.push({ i, err });
+        receipts.push(undefined);
+      }
+    }
+    return { receipts, throws };
+  }
+  const stateOf = (r: ReturnType<WebChannelNATSClient["send"]>) => r?.snapshot().state;
+
+  // F-A(a): live session. A subscriber closes on the first failed{evicted} — which
+  // fires from inside the 101st seal. send() must not throw and nothing may strand.
+  it("F-A(a): close() from an eviction subscriber never throws out of send(); no receipt stays queued", async () => {
+    const h = await connectWrapper({ ack: false }); // never acked → the ledger fills
+    let closedOnce = false;
+    h.wrapper.subscribe((s) => {
+      if (closedOnce) return;
+      if (s.messages.some((m) => m.sendFailure?.reason === "evicted")) {
+        closedOnce = true;
+        h.wrapper.close();
+      }
+    });
+
+    const { receipts, throws } = sendBurst(h.wrapper, CAP + 2, "ev-");
+    await settle();
+
+    expect(throws).toEqual([]); // no raw crypto TypeError escaping send()
+    expect(receipts.every((r) => r !== undefined)).toBe(true);
+    expect(closedOnce).toBe(true);
+    const stuck = receipts.filter((r) => stateOf(r) !== "failed").length;
+    expect(stuck).toBe(0);
+    expect(stateOf(receipts[0])).toBe("failed");
+    expect(receipts[0]!.snapshot().failure).toMatchObject({ reason: "evicted", retryable: true });
+    // The message whose own seal triggered the eviction was recorded in the ledger
+    // BEFORE the sweep, so close() reaches it — failed{closed}, never stranded.
+    expect(receipts[CAP]!.snapshot().failure).toMatchObject({ reason: "closed" });
+  });
+
+  // F-A(b): the same teardown during the pre-connect `flushQueue()` drain, where
+  // the throw used to escape `onConnected` as an unhandled rejection, abandon the
+  // rest of the drain, and skip notifySessionListeners.
+  it("F-A(b): close() from an eviction subscriber mid-flush leaves no unhandled rejection and no stuck send", async () => {
+    const h = await connectWrapper({ ack: false }, { connect: false });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown) => unhandled.push(err);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const { receipts, throws } = sendBurst(h.wrapper, CAP + 5, "fq-");
+      expect(throws).toEqual([]); // queued pre-connect: nothing seals yet
+
+      let closedOnce = false;
+      h.wrapper.subscribe((s) => {
+        if (closedOnce) return;
+        if (s.messages.some((m) => m.sendFailure?.reason === "evicted")) {
+          closedOnce = true;
+          h.wrapper.close();
+        }
+      });
+
+      h.wrapper.connect();
+      await settle();
+
+      expect(closedOnce).toBe(true);
+      expect(unhandled).toEqual([]);
+      expect(receipts.filter((r) => stateOf(r) !== "failed").length).toBe(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  // F-A(c): control — an ordinary eviction with no teardown still reports
+  // failed{evicted, retryable:true} and leaves the triggering send at `sent`.
+  it("F-A(c): an undisturbed eviction fails the oldest as evicted and does not disturb the live send", async () => {
+    const h = await connectWrapper({ ack: false });
+    const { receipts, throws } = sendBurst(h.wrapper, CAP + 1, "ok-");
+    await settle();
+
+    expect(throws).toEqual([]);
+    expect(receipts[0]!.snapshot()).toMatchObject({
+      state: "failed", failure: { reason: "evicted", retryable: true },
+    });
+    // The send whose seal evicted it published normally.
+    expect(stateOf(receipts[CAP])).toBe("sent");
+    // Everything between the evicted head and the tail is still in the ledger.
+    expect(stateOf(receipts[1])).toBe("sent");
+    h.wrapper.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // P0-4 (R3): a CL2 terminal instance is PERMANENTLY retired — a registration-path
 // terminal (only the WCNC latch set; the raw transport is NOT terminal) must not
 // let a later public connect() flip the sticky "error" to "connected" while every

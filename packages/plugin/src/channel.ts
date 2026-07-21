@@ -196,13 +196,15 @@ export function createWebChannelPlugin(
           // directly. If it is absent or stale, throw so core observes a failed
           // outbound delivery; recipient guessing is intentionally unsupported.
           //
-          // P0-4 (review): throwing is safe ONLY because core absorbs the throw
-          // into `OutboundDeliveryError` → `{status:"failed"}` and does NOT retry
-          // the send (verified against openclaw 2026.6.10, the installed version
-          // and the floor of the `>=2026.6.10` peer range). If a future core ever
-          // retried a thrown outbound, a partially-delivered send would be
-          // re-sent — SILENT DUPLICATE DELIVERY to the peer, invisible here
-          // because we return no idempotency key. Re-verify on any core bump.
+          // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
+          // thrown outbound — traced in openclaw 2026.6.10 (the installed version
+          // and the floor of the `>=2026.6.10` peer range): core stamps
+          // `send_attempt_started` immediately before calling us, and its durable
+          // delivery drain refuses to blindly replay an entry in that state unless
+          // the adapter supplies `reconcileUnknownSend` (we deliberately do not),
+          // so the entry moves to failed instead. See the fuller trace in
+          // `message-adapter.ts`. A core bump — or adding `reconcileUnknownSend` —
+          // re-opens the blind-replay path → SILENT DUPLICATE DELIVERY.
           if (!ctx.to) {
             throw new Error("[webchannel] outbound send failed: ctx.to is absent");
           }

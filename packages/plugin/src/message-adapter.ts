@@ -108,13 +108,18 @@ export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
         // absent or the targeted send fails, throw before fabricating any
         // receipt (P0-1 removed recipient guessing; P0-4 makes failure honest).
         //
-        // P0-4 (review): throwing is safe ONLY because core absorbs the throw
-        // into `OutboundDeliveryError` → `{status:"failed"}` and does NOT retry
-        // the send (verified against openclaw 2026.6.10, the installed version
-        // and the floor of the `>=2026.6.10` peer range). If a future core ever
-        // retried a thrown send, a partially-delivered message would be re-sent —
-        // SILENT DUPLICATE DELIVERY to the peer, invisible here because the
-        // receipt is only built on the success path. Re-verify on any core bump.
+        // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
+        // thrown outbound. Traced in openclaw 2026.6.10 (the installed version and
+        // the floor of the `>=2026.6.10` peer range): `durableFinal.capabilities.
+        // text` below makes this channel eligible for core's durable delivery
+        // queue, whose `failDelivery` does NOT drop the entry (it bumps retryCount
+        // and leaves it pending for `recoverPendingDeliveries`) — but core stamps
+        // `send_attempt_started` immediately BEFORE calling us, and its drain
+        // refuses to blindly replay an entry in that state unless the adapter
+        // supplies `reconcileUnknownSend`, which we deliberately do not. So a
+        // thrown send moves to failed, never re-sent. Adding a
+        // `reconcileUnknownSend` here, or a core bump, re-opens the blind-replay
+        // path → SILENT DUPLICATE DELIVERY. Re-verify then.
         if (!ctx.to) {
           throw new Error("[webchannel] message.send.text failed: ctx.to is absent");
         }
@@ -384,7 +389,18 @@ export function createProgressDraftController(params: {
       // both attempt to finalize; only the first wins so we never send two
       // terminal frames (or finalize onto an already-settled bubble).
       if (finalizeResult) return finalizeResult;
-      finalizeResult = (async () => {
+      // P0-4 (review R2): arm the latch SYNCHRONOUSLY. `finalizeResult = (async
+      // () => {...})()` only assigns once the body first SUSPENDS, and the body
+      // reaches `transport.finalizeDraft(...)` with no preceding `await` whenever
+      // there is no pending draft content — so the whole terminal-frame send used
+      // to run before the latch existed, leaving it unarmed across exactly the
+      // stretch it exists to protect (the pre-P0-4 code set its `finalized` flag
+      // synchronously). Resolving an already-assigned promise WITH the body's
+      // promise keeps the cached-result contract: every caller, re-entrant or
+      // not, awaits the same single `finalizeDraft` outcome (or rejection).
+      let settleFinalize!: (v: boolean | PromiseLike<boolean>) => void;
+      finalizeResult = new Promise<boolean>((resolve) => { settleFinalize = resolve; });
+      settleFinalize((async () => {
         // Flush any pending draft text first so the widget has shown the working
         // bubble at least once (the throttle may not have fired yet for a fast
         // turn). This must run BEFORE we stop the loop, since flush() bails when
@@ -406,7 +422,7 @@ export function createProgressDraftController(params: {
         stopped = true;
         loop.stop();
         return transport.finalizeDraft(sessionKey, id, text, params.turnId);
-      })();
+      })());
       return finalizeResult;
     },
     stop: () => {
