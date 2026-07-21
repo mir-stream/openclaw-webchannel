@@ -259,6 +259,30 @@ describe("P1-3 plugin transport invariants", () => {
     await vi.advanceTimersByTimeAsync(10); await rejected; expect(sockets[0]!.closed).toBe(true);
   });
 
+  // A rejected NKEY signing must close its own dial's socket, NOT leak it open.
+  // The close is indirect — sendConnectWithJwt's catch calls settle(err), which is
+  // the ws.on("message") onFirstPong callback whose error branch does ws.close().
+  // Pinned here because it is non-obvious (two reviewers misread it as a leak):
+  // on the reconnect path a leak would accumulate an OPEN socket per failed retry.
+  it("closes each dial's socket when signing rejects, on both initial and reconnect paths", async () => {
+    vi.useFakeTimers();
+    let calls = 0;
+    const signer = async () => { calls++; if (calls === 1) return "sig"; throw new Error("boom"); };
+    const { transport: t, sockets } = setup({ reconnect: true, reconnectBaseMs: 1, reconnectCapMs: 1, jwtCredential: "j", nkeySigningCallback: signer });
+    const initial = t.connect();
+    sockets[0]!.open(); sockets[0]!.frame('INFO {"nonce":"n"}\r\n'); await Promise.resolve(); sockets[0]!.frame("PONG\r\n"); await initial;
+    expect(t.connected).toBe(true);
+    // Drop → auto-reconnect opens socket[1]; its signing REJECTS.
+    sockets[0]!.close(); await vi.advanceTimersByTimeAsync(1);
+    sockets[1]!.open(); sockets[1]!.frame('INFO {"nonce":"n"}\r\n'); await Promise.resolve(); await Promise.resolve();
+    expect(sockets[1]!.closed).toBe(true);
+    // One more retry — no OPEN socket accumulates.
+    await vi.advanceTimersByTimeAsync(1);
+    sockets[2]!.open(); sockets[2]!.frame('INFO {"nonce":"n"}\r\n'); await Promise.resolve(); await Promise.resolve();
+    expect(sockets.filter((s) => !s.closed).length).toBe(0);
+    t.disconnect(); vi.useRealTimers();
+  });
+
   it("times out first-PONG silence after signed CONNECT", async () => {
     vi.useFakeTimers(); const { transport: t, sockets } = setup({ handshakeTimeoutMs: 10, jwtCredential: "j", nkeySigningCallback: async () => "s" });
     const dial = t.connect(); const rejected = expect(dial).rejects.toThrow(/first PONG/); sockets[0]!.open(); sockets[0]!.frame('INFO {"nonce":"n"}\r\n'); await Promise.resolve();
