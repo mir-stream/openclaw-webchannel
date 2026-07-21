@@ -137,6 +137,41 @@ describe("WebChannelNATSClient — P0-4 receipt + sendState (wrapper)", () => {
     h.wrapper.close();
   });
 
+  for (const scenario of [
+    { outcome: "ok" as const, state: "completed" as const, reason: undefined },
+    { outcome: "error" as const, state: "failed" as const, reason: "turn-failed" as const },
+  ]) {
+    it(`commits missing-ACK turn_settled{${scenario.outcome}} before typing settlement can close`, async () => {
+      const h = await connectWrapper({ ack: false });
+      const receipt = h.wrapper.send(`settle-${scenario.outcome}`)!;
+      await settle();
+      expect(receipt.snapshot().state).toBe("sent");
+      const wireId = userBubble(h.wrapper, `settle-${scenario.outcome}`)!.wireId!;
+
+      deliverOut(h.K, { type: "typing" });
+      await settle();
+      let closed = false;
+      const unsubscribe = h.wrapper.subscribe((state) => {
+        if (!closed && state.isTyping === false) {
+          closed = true;
+          h.wrapper.close();
+        }
+      });
+
+      deliverOut(h.K, { type: "turn_settled", turnId: wireId, outcome: scenario.outcome });
+      await settle();
+      expect(closed).toBe(true);
+      expect(receipt.snapshot().state).toBe(scenario.state);
+      if (scenario.reason) {
+        expect(receipt.snapshot().failure).toMatchObject({ reason: scenario.reason, retryable: true });
+      } else {
+        expect(receipt.snapshot().failure).toBeUndefined();
+      }
+      expect(receipt.snapshot().failure?.reason).not.toBe("closed");
+      unsubscribe();
+    });
+  }
+
   // T-st: an acked send with NO turn_settled ends at accepted — completed forbidden
   // (a /stop-killed message is acked as admitted but never runs a turn).
   it("T-st: an acked-but-never-settled send stays accepted, never completed", async () => {
@@ -280,6 +315,63 @@ describe("WebChannelNATSClient — P0-4 receipt handle (T-rc)", () => {
     receipt.subscribe((s) => { seen.push(receipt.snapshot().state); expect(receipt.snapshot().state).toBe(s.state); });
     await settle();
     expect(seen).toContain("accepted");
+    h.wrapper.close();
+  });
+
+  it("serializes teardown re-entry so two receipt listeners see sent→failed with matching snapshots", async () => {
+    const h = await connectWrapper({ ack: false }, { connect: false });
+    const receipt = h.wrapper.send("receipt-reentrant-close")!;
+    const first: Array<{ event: ChatMessage["sendState"]; snapshot: ChatMessage["sendState"] }> = [];
+    const second: Array<{ event: ChatMessage["sendState"]; snapshot: ChatMessage["sendState"] }> = [];
+    receipt.subscribe((event) => first.push({ event: event.state, snapshot: receipt.snapshot().state }));
+    receipt.subscribe((event) => second.push({ event: event.state, snapshot: receipt.snapshot().state }));
+
+    let closed = false;
+    h.wrapper.subscribe((state) => {
+      const bubble = state.messages.find((m) => m.text === "receipt-reentrant-close");
+      if (!closed && bubble?.sendState === "sent") {
+        closed = true;
+        h.wrapper.close();
+      }
+    });
+
+    h.wrapper.connect();
+    await settle();
+    expect(closed).toBe(true);
+    for (const events of [first, second]) {
+      expect(events.map((event) => event.event)).toEqual(["sent", "failed"]);
+      expect(events.every((event) => event.event === event.snapshot)).toBe(true);
+    }
+    expect(receipt.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed" } });
+  });
+
+  it("queues a nested turn outcome until the current receipt fanout is complete", async () => {
+    const h = await connectWrapper({ ack: false }, { connect: false });
+    const receipt = h.wrapper.send("nested-wrapper-outcome")!;
+    const wireId = userBubble(h.wrapper, "nested-wrapper-outcome")!.wireId!;
+    const observed: Array<{ event: ChatMessage["sendState"]; snapshot: ChatMessage["sendState"] }> = [];
+    receipt.subscribe((event) => observed.push({ event: event.state, snapshot: receipt.snapshot().state }));
+
+    let settled = false;
+    h.wrapper.subscribe((state) => {
+      const bubble = state.messages.find((m) => m.text === "nested-wrapper-outcome");
+      if (!settled && bubble?.sendState === "sent") {
+        settled = true;
+        // Synchronous fake-socket delivery re-enters the wrapper reducer while
+        // the `sent` bubble notification is still on the stack.
+        deliverOut(h.K, { type: "turn_settled", turnId: wireId, outcome: "error" });
+      }
+    });
+
+    h.wrapper.connect();
+    await settle();
+    expect(settled).toBe(true);
+    expect(observed.map((event) => event.event)).toEqual(["sent", "failed"]);
+    expect(observed.every((event) => event.event === event.snapshot)).toBe(true);
+    expect(receipt.snapshot()).toMatchObject({
+      state: "failed",
+      failure: { reason: "turn-failed", retryable: true },
+    });
     h.wrapper.close();
   });
 });
@@ -866,6 +958,71 @@ describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
     await settle();
     expect(late.snapshot().state).not.toBe("queued");
     expect(h.received.length).toBe(before + 1);
+    h.wrapper.close();
+  });
+
+  it("preserves a fresh no-draft send created by a synchronous reconnecting listener", async () => {
+    const h = await connectWrapper({ ack: false });
+    const old = h.wrapper.send("old-unacked")!;
+    await settle();
+    expect(old.snapshot().state).toBe("sent");
+
+    let replacement: ReturnType<WebChannelNATSClient["send"]>;
+    let reopened = false;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (reopened || state.status !== "reconnecting") return;
+      reopened = true;
+      h.wrapper.connect();
+      replacement = h.wrapper.send("fresh-after-close");
+    });
+
+    h.wrapper.close();
+    expect(reopened).toBe(true);
+    expect(old.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed" } });
+    expect(replacement!.snapshot().state).toBe("queued");
+    await settle();
+    expect(replacement!.snapshot().state).toBe("sent");
+    expect(userBubble(h.wrapper, "fresh-after-close")?.wireId).toBeDefined();
+    expect(h.received).toContain(userBubble(h.wrapper, "fresh-after-close")!.wireId!);
+    expect(replacement!.snapshot().failure).toBeUndefined();
+
+    unsubscribe();
+    h.wrapper.close();
+  });
+
+  it("preserves a fresh held entry created while close notifies reconnecting state", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, { type: "progress", id: "webchannel-d", text: "working", turnId: "T" });
+    await settle();
+    const oldHeld = h.wrapper.send("old-held")!;
+    expect(oldHeld.snapshot().state).toBe("queued");
+
+    let freshHeld: ReturnType<WebChannelNATSClient["send"]>;
+    let reopened = false;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (reopened || state.status !== "reconnecting") return;
+      reopened = true;
+      h.wrapper.connect();
+      freshHeld = h.wrapper.send("fresh-held-after-close");
+    });
+
+    h.wrapper.close();
+    await settle();
+    expect(reopened).toBe(true);
+    expect(oldHeld.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed" } });
+    expect(freshHeld!.snapshot().state).toBe("queued");
+    expect(userBubble(h.wrapper, "fresh-held-after-close")?.pending).toBe(true);
+    expect((h.wrapper as unknown as { held: Array<{ text: string }> }).held.map((entry) => entry.text))
+      .toEqual(["fresh-held-after-close"]);
+
+    // The replacement connection has a session, but the working draft correctly
+    // keeps the fresh hold queued until its turn settles.
+    deliverOut(h.K, { type: "turn_settled", turnId: "T" });
+    await settle();
+    expect(freshHeld!.snapshot().state).toBe("accepted");
+    expect(userBubble(h.wrapper, "fresh-held-after-close")?.pending).not.toBe(true);
+
+    unsubscribe();
     h.wrapper.close();
   });
 

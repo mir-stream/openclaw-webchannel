@@ -226,8 +226,11 @@ onSendState(listener: (id: string, state: SendState, failure?: SendFailure) => v
 - CL2 terminal (`onError` 경유) → 전원 `failed{terminal, cause, retryable: false}`
   — cause는 기존 `WebChannelErrorCause` 그대로 전달 (`auth-expired`/`auth-rejected`/
   `protocol-mismatch`/`secure-channel-failed`/`config`/`server`/`unknown`).
-  receipt `retryable`은 "이 클라이언트 인스턴스가 자동 재시도하는가"로 정의(JSDoc
-  명시); 회복 경로 판단은 cause로 embedder 몫.
+  receipt `retryable`은 "이 terminal outcome 뒤 caller/embedder가 새 send 시도를
+  시작해도 되는가"로 정의(JSDoc 명시). failed receipt 자체는 다시 진행되지 않고
+  자동 재시도되지 않는다. `evicted`/`turn-failed`만 true이고 `closed`/`terminal`/
+  `cancelled`는 false다. 실제 재시도 전 현재 인스턴스 readiness를 별도로 확인해야
+  하며 terminal 회복은 fresh credential의 새 client instance가 필요하다.
 
 **Terminal 시퀀스 계약 (R2b-1 BLOCKER fold)**: 에러 리스너는 동기이고 리스너 체인
 안에서 `send()`가 다시 불릴 수 있다 (wrapper 자신의 fail-all 리스너 뒤에 다른

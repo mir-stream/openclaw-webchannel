@@ -46,6 +46,13 @@ type ReceiptRecord = {
   // state (a record always has one), so consumers never narrow an impossible
   // `undefined`.
   subscribers: Set<(s: { state: NonNullable<ChatMessage["sendState"]>; failure?: SendFailure }) => void>;
+  /** Nested transitions wait until the current bubble/subscriber fanout ends. */
+  pendingTransitions: Array<{
+    state: NonNullable<ChatMessage["sendState"]>;
+    failure?: SendFailure;
+    extraBubblePatch?: Partial<ChatMessage>;
+  }>;
+  drainingTransitions: boolean;
 };
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the
@@ -335,27 +342,19 @@ export class WebChannelNATSClient {
     // resolve to failed{closed} via the low-level `disconnected` gate, never land
     // in `held[]` whose only drain (onSession) this instance will never fire.
     this.closed = true;
+    // Detach only this lifecycle's held ownership before the low-level close can
+    // notify state listeners. A listener may synchronously connect() and send a
+    // fresh held message; the old close must not sweep that replacement entry.
+    const heldEntries = this.takeHeld();
     // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
     this.clearStaleDraftWatch();
     this.client.disconnect();
     // P0-4 (D5): fail the wrapper-owned held[] (no wireId → invisible to the
     // low-level fail-all).
     //
-    // P0-4 (review R3): this runs LAST, after the teardown, because it NOTIFIES
-    // (receiptTransition → setState → embedder state subscribers) and the
-    // mutate-before-notify discipline requires the teardown to be COMPLETE before
-    // anything observes it. It used to run first, so an embedder reacting to a
-    // failed send by calling `connect()` — an ordinary auto-reconnect reflex —
-    // dialed from inside this sweep and the trailing `client.disconnect()` then
-    // killed that dial: `closed` was back to false with no socket and no reconnect
-    // armed, `close()` deliberately leaves `working` drafts live so turnInFlight()
-    // stayed true forever, and the next send() was held with no possible drain
-    // (onSession never fires again) — permanently `queued`. The old comment
-    // justified the old order as "held transitions land before the queue/ledger
-    // sweep"; that notification order between two independent receipt groups is
-    // cosmetic (nothing in the tests or the D5 contract depends on it), and a
-    // consistent post-teardown state is worth more than it.
-    this.failHeld({ reason: "closed", retryable: false });
+    // Notifications still run after teardown, but target only the detached old
+    // entries. Replacement held work remains owned by the reopened lifecycle.
+    this.failHeldEntries(heldEntries, { reason: "closed", retryable: false });
   }
 
   /**
@@ -403,7 +402,13 @@ export class WebChannelNATSClient {
       this.held.push({ localId, text: trimmed, receiptKey });
       // P0-4: a held send has a receipt (queued) but NO wireId yet — the wireId
       // is minted at release (2-phase). The receiptKey is the stable handle.
-      this.receipts.set(receiptKey, { id: receiptKey, state: "queued", subscribers: new Set() });
+      this.receipts.set(receiptKey, {
+        id: receiptKey,
+        state: "queued",
+        subscribers: new Set(),
+        pendingTransitions: [],
+        drainingTransitions: false,
+      });
       this.appendMessage({
         id: localId, role: "user", text: trimmed, pending: true, receiptKey, sendState: "queued",
       });
@@ -450,7 +455,13 @@ export class WebChannelNATSClient {
     const receiptKey = this.newReceiptKey();
     const wireId = this.client.reserveWireId();
     this.wireIdToReceiptKey.set(wireId, receiptKey);
-    this.receipts.set(receiptKey, { id: receiptKey, state: "queued", subscribers: new Set() });
+    this.receipts.set(receiptKey, {
+      id: receiptKey,
+      state: "queued",
+      subscribers: new Set(),
+      pendingTransitions: [],
+      drainingTransitions: false,
+    });
     this.appendMessage({
       id: `u-${this.uid()}`,
       role: "user",
@@ -568,8 +579,18 @@ export class WebChannelNATSClient {
    * untouched because they carry no held entry. Used by close() and terminal error.
    */
   private failHeld(failure: SendFailure): void {
-    if (this.held.length === 0) return;
-    const entries = this.held.splice(0);
+    this.failHeldEntries(this.takeHeld(), failure);
+  }
+
+  private takeHeld(): Array<{ localId: string; text: string; receiptKey: string }> {
+    return this.held.splice(0);
+  }
+
+  /** Fail a detached ownership snapshot without consuming replacement holds. */
+  private failHeldEntries(
+    entries: readonly { localId: string; text: string; receiptKey: string }[],
+    failure: SendFailure,
+  ): void {
     for (const e of entries) {
       this.receiptTransition(e.receiptKey, "failed", failure, { pending: false });
     }
@@ -824,9 +845,11 @@ export class WebChannelNATSClient {
   /**
    * P0-4: apply a send-state transition to a receipt record (authoritative) and
    * mirror it onto the render bubble, enforcing the wrapper-level monotonic guard
-   * (which alone knows `completed`). Order is mutate-before-notify: update the
-   * record, patch the bubble (fires state listeners), THEN notify receipt
-   * subscribers. A rejected transition (guard) touches nothing.
+   * (which alone knows `completed`). A bubble/state or receipt subscriber can
+   * synchronously cause another transition for this same receipt, so the whole
+   * guard→mutation→bubble fanout→receipt fanout transaction is drained FIFO per
+   * receipt. The current event remains the authoritative snapshot until every
+   * subscriber has seen it; a rejected transition touches nothing.
    */
   private receiptTransition(
     receiptKey: string,
@@ -835,16 +858,32 @@ export class WebChannelNATSClient {
     extraBubblePatch?: Partial<ChatMessage>,
   ): void {
     const rec = this.receipts.get(receiptKey);
-    if (!rec || !this.receiptAdvances(rec.state, state)) return;
-    rec.state = state;
-    rec.failure = failure;
-    this.patchBubbleByReceiptKey(receiptKey, { sendState: state, sendFailure: failure, ...(extraBubblePatch ?? {}) });
-    for (const cb of [...rec.subscribers]) {
-      try {
-        cb({ state, failure });
-      } catch (e) {
-        console.error("[nats-wrapper] receipt subscriber threw:", e);
+    if (!rec) return;
+    rec.pendingTransitions.push({ state, failure, extraBubblePatch });
+    if (rec.drainingTransitions) return;
+
+    rec.drainingTransitions = true;
+    try {
+      while (rec.pendingTransitions.length > 0) {
+        const next = rec.pendingTransitions.shift()!;
+        if (!this.receiptAdvances(rec.state, next.state)) continue;
+        rec.state = next.state;
+        rec.failure = next.failure;
+        this.patchBubbleByReceiptKey(receiptKey, {
+          sendState: next.state,
+          sendFailure: next.failure,
+          ...(next.extraBubblePatch ?? {}),
+        });
+        for (const cb of [...rec.subscribers]) {
+          try {
+            cb({ state: next.state, failure: next.failure });
+          } catch (e) {
+            console.error("[nats-wrapper] receipt subscriber threw:", e);
+          }
+        }
       }
+    } finally {
+      rec.drainingTransitions = false;
     }
   }
 
@@ -1296,16 +1335,11 @@ export class WebChannelNATSClient {
       }
 
       case "turn_settled": {
-        this.setState({ isTyping: false });
-        // P1-9 §3.6.1: settled ⇒ no more upserts — finalize any lingering working
-        // draft whose turnId matches (in the normal flow the final agent_message
-        // already did this, a no-op). Never swaps the id.
-        this.finalizeDraftsForTurn(msg.turnId);
         // P0-4 (§1): promote the send only on an EXPLICIT outcome. `"ok"` →
         // `accepted → completed` on the anchor (turnId === wireId); `"error"` →
         // `failed{turn-failed, retryable:true}`. ABSENT `outcome` = legacy plugin
         // (fires turn_settled from a finally regardless of success): the UI still
-        // settles above, but the send honestly stays `accepted` — never a
+        // settles below, but the send honestly stays `accepted` — never a
         // fabricated `completed`. A turn_settled that beats the ack promotes
         // straight past `sent` (the receipt guard allows the monotonic upgrade).
         if (msg.turnId && msg.outcome === "ok") {
@@ -1313,6 +1347,14 @@ export class WebChannelNATSClient {
         } else if (msg.turnId && msg.outcome === "error") {
           this.promoteAnchor(msg.turnId, "failed", { reason: "turn-failed", retryable: true });
         }
+        // Outcome is authoritative and must be committed before either UI
+        // settlement callout. A listener reacting to typing/draft completion may
+        // close the client; that teardown cannot overwrite completed/turn-failed.
+        this.setState({ isTyping: false });
+        // P1-9 §3.6.1: settled ⇒ no more upserts — finalize any lingering working
+        // draft whose turnId matches (in the normal flow the final agent_message
+        // already did this, a no-op). Never swaps the id.
+        this.finalizeDraftsForTurn(msg.turnId);
         return;
       }
 

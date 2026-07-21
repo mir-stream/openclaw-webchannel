@@ -381,16 +381,27 @@ export class NatsClient {
    *
    * - Not connected → `false` (keep the warn). The caller keeps the frame queued
    *   / ledgered so a reconnect+flush replays it (no false success).
-   * - `ws.send` throws → `false` AND force a reconnect. A synchronous send-throw
-   *   does NOT guarantee an `onclose` (a half-open socket), so without the forced
-   *   teardown a live process would sit `connected===true` forever while every
-   *   publish vanished. `forceReconnect` tears the socket down, redials, and the
-   *   fresh `onConnected` re-registers + replays the queue (mirrors the heartbeat
-   *   PING-throw recovery in `startHeartbeat`).
+   * - Socket not OPEN, or `ws.send` throws → `false` AND force a reconnect. A
+   *   CLOSING/CLOSED browser socket may silently discard sends, and a synchronous
+   *   send-throw does not guarantee an `onclose` (a half-open socket). Without the
+   *   forced teardown a live process could sit `connected===true` while publishes
+   *   vanished. `forceReconnect` tears the socket down, redials, and the fresh
+   *   `onConnected` re-registers + replays the queue (mirrors heartbeat recovery).
    */
   publish(subject: string, payload: string): boolean {
     if (!this.connected || !this.ws) {
       console.warn("[nats-client] Not connected, cannot publish");
+      return false;
+    }
+
+    // `connected` is updated by socket callbacks and can briefly lag the native
+    // WebSocket state. Browsers are allowed to silently discard `send()` calls
+    // once a socket is CLOSING/CLOSED, so only OPEN is a successful write. Drive
+    // the same reconnect path as a synchronous send throw; higher layers already
+    // ledgered the user message and will replay it with the same id.
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      console.warn("[nats-client] Socket is not open, forcing reconnect before publish");
+      this.forceReconnect();
       return false;
     }
 
@@ -1092,6 +1103,19 @@ export class WebChannelNatsClient {
   private readonly protocolListeners = new Set<ProtocolListener>();
   private readonly sessionListeners = new Set<SessionListener>();
   private readonly sendStateListeners = new Set<SendStateListener>();
+  /**
+   * Send-state callbacks are public synchronous callouts. A listener may tear the
+   * client down while an earlier transition is still fanning out, which can
+   * synchronously produce a later transition for the same id. Drain events FIFO
+   * so every listener observes the same monotonic order. Tracker mutation remains
+   * synchronous at the transition site; only callback delivery is serialized.
+   */
+  private readonly pendingSendStateEvents: Array<{
+    id: string;
+    state: SendState;
+    failure?: SendFailure;
+  }> = [];
+  private drainingSendStateEvents = false;
 
   /**
    * P0-4 (D4): the authoritative send-state tracker, keyed by wire `id`. The
@@ -1235,8 +1259,13 @@ export class WebChannelNatsClient {
     // AFTER this returns (a state subscriber calling close() mid-render, then
     // control resuming into publish()'s `sendUserMessage`; or a plain send() after
     // close()) fails observably with `failed{closed}` rather than queuing onto the
-    // dead instance the `failAllPending` sweep below has already swept.
+    // dead instance after its old ownership snapshot has been detached below.
     this.disconnected = true;
+    // Detach ownership of THIS lifecycle's pending work before the raw transport
+    // notifies state listeners. Such a listener may synchronously connect() and
+    // send on the replacement lifecycle; that fresh queue/ledger must not be
+    // consumed by this disconnect's trailing failure notifications.
+    const pendingIds = this.takePendingSendIds();
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
     this.outSub = -1;
     this.resetSession();
@@ -1247,19 +1276,9 @@ export class WebChannelNatsClient {
     // (the old code cleared only the ledger, stranding queued sends in a dead
     // instance with no terminal transition).
     //
-    // P0-4 (review R3): this sweep runs LAST — after the socket teardown — because
-    // it NOTIFIES (trackerFail → the wrapper's receipt/bubble setState → embedder
-    // state subscribers), and the PR's mutate-before-notify discipline means the
-    // teardown must be COMPLETE before anyone can observe it. An embedder that
-    // reacts to a failed send by calling `connect()` (an ordinary auto-reconnect
-    // reflex) used to run between the sweep and `client.disconnect()`: it dialed,
-    // and the trailing disconnect then killed that fresh dial, leaving the flags
-    // saying "open" with no socket and no reconnect armed. With the sweep last, a
-    // re-entrant connect() dials AFTER everything is torn down and nothing
-    // undoes it — the embedder's explicit reconnect is honored. `failAllPending`
-    // already clears the queue/ledger before it notifies, so moving the call does
-    // not change WHAT is swept, only when the notifications land.
-    this.failAllPending({ reason: "closed", retryable: false });
+    // Notify only the detached lifecycle after teardown. Re-entrant replacement
+    // work created by the state notification above remains live and drainable.
+    this.failPendingIds(pendingIds, { reason: "closed", retryable: false });
   }
 
   /**
@@ -1902,21 +1921,33 @@ export class WebChannelNatsClient {
   }
 
   /**
-   * P0-4: fail EVERY pending user_message (queued in the outbound queue AND
-   * published-but-unacked in the ledger) with the same failure, then clear both
-   * structures. Clears first, then notifies per id (mutate-before-notify, safe
-   * against a listener that re-enters). Messages already `accepted` are neither
-   * queued nor ledgered, so they are untouched (monotonic — no accepted→failed).
+   * Detach the current lifecycle's entire outbound queue/ledger before any public
+   * failure callout, returning only the user-message ids that need a receipt
+   * transition. Non-user frames are dropped with the retired lifecycle. Messages
+   * already `accepted` are in neither collection and remain untouched.
    */
-  private failAllPending(failure: SendFailure): void {
+  private takePendingSendIds(): string[] {
     const ids = new Set<string>();
     for (const m of this.outboundQueue) if (m.type === "user_message" && m.id) ids.add(m.id);
     for (const id of this.unackedLedger.keys()) ids.add(id);
     this.outboundQueue = [];
     this.unackedLedger.clear();
+    return [...ids];
+  }
+
+  /** Fail a previously detached ownership snapshot without touching live queues. */
+  private failPendingIds(ids: readonly string[], failure: SendFailure): void {
     for (const id of ids) {
       this.trackerFail(id, { ...failure, lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt });
     }
+  }
+
+  /**
+   * Terminal paths retire the current lifecycle wholesale. Detach first, then
+   * fail each captured id so listener re-entry cannot be consumed by the sweep.
+   */
+  private failAllPending(failure: SendFailure): void {
+    this.failPendingIds(this.takePendingSendIds(), failure);
   }
 
   /**
@@ -1946,13 +1977,27 @@ export class WebChannelNatsClient {
   }
 
   private emitSendState(id: string, state: SendState, failure?: SendFailure): void {
-    this.sendStateListeners.forEach((listener) => {
-      try {
-        listener(id, state, failure);
-      } catch (e) {
-        console.error("[nats-client] Send-state listener error:", e);
+    this.pendingSendStateEvents.push({ id, state, failure });
+    if (this.drainingSendStateEvents) return;
+
+    this.drainingSendStateEvents = true;
+    try {
+      while (this.pendingSendStateEvents.length > 0) {
+        const event = this.pendingSendStateEvents.shift()!;
+        // Keep Set.forEach's existing live membership semantics (unsubscribe of a
+        // not-yet-visited listener suppresses it; an added listener may join this
+        // event). FIFO serialization changes only nested-event ordering.
+        this.sendStateListeners.forEach((listener) => {
+          try {
+            listener(event.id, event.state, event.failure);
+          } catch (e) {
+            console.error("[nats-client] Send-state listener error:", e);
+          }
+        });
       }
-    });
+    } finally {
+      this.drainingSendStateEvents = false;
+    }
   }
 
   /**

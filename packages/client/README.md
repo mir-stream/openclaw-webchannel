@@ -68,8 +68,12 @@ queued -> sent -> accepted -> completed        (+ failed, terminal, from any pre
   at `accepted` (an honest degradation — `completed` never appears, never faked).
 - `failed` — terminal; `sendFailure.reason` is one of `closed` | `evicted` |
   `terminal` (+ `cause`) | `turn-failed` | `cancelled`, with `retryable` and
-  `lastAttemptAt`. `retryable` means "does THIS client auto-retry"; recovery
-  judgement for a `terminal` failure is the embedder's, keyed off `cause`.
+  `lastAttemptAt`. `retryable` means the caller/embedder may initiate a **fresh**
+  retry after this terminal outcome; the failed receipt itself never resumes and
+  is never automatically retried. It is `true` for `evicted`/`turn-failed` and
+  `false` for `closed`/`terminal`/`cancelled`. Readiness is separate: retry only
+  on a ready instance; terminal recovery requires a new instance as described
+  below.
 
 Once a CL2 terminal failure fires (auth/register/secure-channel — `status:"error"`),
 the client instance is **permanently retired**: it never reconnects, and every

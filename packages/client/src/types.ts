@@ -31,18 +31,23 @@ export type SendState = "queued" | "sent" | "accepted" | "failed";
 /**
  * P0-4: the terminal-failure payload accompanying a `failed` send.
  *
- * `reason` distinguishes the cause of the failure; `retryable` answers "will
- * THIS client instance automatically retry?" (NOT whether recovery is possible
- * at all — that judgement is the embedder's, driven by `cause`):
+ * `reason` distinguishes the cause of the failure; `retryable` means the caller
+ * may initiate a fresh send attempt after this terminal outcome. A failed receipt
+ * never resumes and the client never automatically retries that receipt:
  * - `closed`      — an explicit `disconnect()`/`close()` retired the instance.
  * - `evicted`     — the P0-7b unacked ledger exceeded its cap; the oldest entry
- *                   was dropped (a fresh send can still succeed → retryable).
+ *                   was dropped (a fresh send on the ready instance can succeed).
  * - `terminal`    — a non-retryable connection failure (auth/protocol/register);
  *                   `cause` carries the original `WebChannelErrorCause`.
  * - `turn-failed` — the turn was admitted but settled with `outcome:"error"`;
- *                   the message reached the agent, so re-sending is safe.
+ *                   caller-directed re-sending is allowed when ready.
  * - `cancelled`   — the user intentionally cancelled the send (a `/stop`
  *                   hold-retraction or `retract()`); never retryable.
+ *
+ * Runtime policy is `true` for `evicted`/`turn-failed`, and `false` for
+ * `closed`/`terminal`/`cancelled`. Readiness is separate: a caller still must not
+ * retry until the current instance is ready (and terminal recovery needs a new
+ * instance), even where the surrounding application offers a recovery action.
  */
 export type SendFailure = {
   reason: "closed" | "evicted" | "terminal" | "turn-failed" | "cancelled";

@@ -78,7 +78,6 @@ export async function handleInboundMessage(
   // key (the anonymous strategy is the single-peer special case, where this
   // falls back to ANON_PEER_ID).
   const wsKey = peerId || ANON_PEER_ID;
-  const channelRuntime = api.runtime.channel;
 
   // Control lane (P1-8a): an out-of-band abort turn ("/stop"). It reaches here
   // directly (NOT via the per-session FIFO) so core's fast-abort can cancel the
@@ -91,6 +90,17 @@ export async function handleInboundMessage(
   const turnId =
     message.id ??
     `webchannel-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let draft: ProgressDraftController | undefined;
+  let reasoning: ReasoningDraftController | undefined;
+  let finalReplyDelivered = false;
+  let turnOutcome: "ok" | "error" = "ok";
+  // Ordinary messages have already been ACKed by ingress and therefore need one
+  // settled outcome even when setup fails. Control-lane turns never settle; an
+  // explicit DM denial opts out below because no agent turn was admitted.
+  let settlementEligible = !controlLane;
+
+  try {
+    const channelRuntime = api.runtime.channel;
 
   // Progress-draft wiring (Phase 1 first slice). Core does NOT auto-drive a
   // plugin's `message.live` adapter; the generic seam for a plugin channel is
@@ -130,6 +140,7 @@ export async function handleInboundMessage(
     dmSecurity: cc?.dmSecurity,
   });
   if (!admission.allowed) {
+    settlementEligible = false;
     api.logger?.info?.(
       `webchannel: inbound denied for peer ${wsKey} (${admission.reason}); turn not dispatched`,
     );
@@ -143,8 +154,6 @@ export async function handleInboundMessage(
   const draftEnabled =
     (streamingMode === "progress" || streamingMode === "partial") && !controlLane;
   const answerStreamingEnabled = streamingMode === "partial";
-  let draft: ProgressDraftController | undefined;
-  let turnOutcome: "ok" | "error" = "ok";
   if (draftEnabled) {
     draft = createProgressDraftController({
       transport,
@@ -155,8 +164,6 @@ export async function handleInboundMessage(
   }
   // Reasoning lane is created AFTER route resolution (below), once we can resolve
   // the session's reasoning display level.
-  let reasoning: ReasoningDraftController | undefined;
-  let finalReplyDelivered = false;
 
   // Resolve the channel-scoped agent route, then FORCE the per-account-channel-
   // peer session scope (see `resolveWebchannelSessionRoute`). Binding-based agent
@@ -221,7 +228,6 @@ export async function handleInboundMessage(
     transport.sendTyping(wsKey);
   }
 
-  try {
     await channelRuntime.inbound.run({
       channel: WEBCHANNEL_ID,
       accountId,
@@ -320,7 +326,7 @@ export async function handleInboundMessage(
                       ? {
                           suppressDefaultToolProgressMessages: true,
                           onToolStart: (p) => {
-                            draft.pushEvent({
+                            draft!.pushEvent({
                               event: "tool",
                               itemId: p.itemId,
                               toolCallId: p.toolCallId,
@@ -330,7 +336,7 @@ export async function handleInboundMessage(
                             });
                           },
                           onItemEvent: (p) => {
-                            draft.pushEvent({
+                            draft!.pushEvent({
                               event: "item",
                               itemId: p.itemId,
                               itemKind: p.kind,
@@ -347,10 +353,10 @@ export async function handleInboundMessage(
                           ...(answerStreamingEnabled
                             ? {
                                 onPartialReply: (p) => {
-                                  draft.pushAnswerText(p.text ?? "");
+                                  draft!.pushAnswerText(p.text ?? "");
                                 },
                                 onAssistantMessageStart: () => {
-                                  draft.handleAssistantMessageBoundary();
+                                  draft!.handleAssistantMessageBoundary();
                                 },
                               }
                             : {}),
@@ -458,7 +464,7 @@ export async function handleInboundMessage(
     // no-op when no draft was created or it was already stopped by finalize().
     draft?.stop();
     reasoning?.stop();
-    if (!controlLane && !transport.sendTurnSettled(wsKey, turnId, turnOutcome)) {
+    if (settlementEligible && !transport.sendTurnSettled(wsKey, turnId, turnOutcome)) {
       api.logger?.warn?.(
         `webchannel: turn_settled was not delivered for peer=${wsKey} turn=${turnId} outcome=${turnOutcome}`,
       );

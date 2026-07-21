@@ -220,6 +220,7 @@ describe("webchannel inbound round-trip", () => {
   it("default-deny allowlist (gap ③): a non-allowlisted peer is denied — inbound.run never runs, no reply", async () => {
     const transport = new FakePeerChannel();
     const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     const { api, resolveAgentRoute } = makeFakeApi(captured, {
@@ -237,6 +238,7 @@ describe("webchannel inbound round-trip", () => {
     expect(inboundRun).not.toHaveBeenCalled();
     expect(resolveAgentRoute).not.toHaveBeenCalled();
     expect(sendSpy).not.toHaveBeenCalled();
+    expect(settledSpy).not.toHaveBeenCalled();
   });
 
   it("default-deny allowlist (gap ③): an allowlisted peer is admitted — inbound.run runs and reply is delivered", async () => {
@@ -257,6 +259,38 @@ describe("webchannel inbound round-trip", () => {
 
     expect(inboundRun).toHaveBeenCalledOnce();
     expect(sendSpy).toHaveBeenCalled();
+  });
+
+  it("settles an ACKed ordinary turn as error when route setup throws before inbound.run", async () => {
+    const transport = new FakePeerChannel();
+    const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api, resolveAgentRoute } = makeFakeApi(captured);
+    resolveAgentRoute.mockImplementation(() => {
+      throw new Error("route store unavailable");
+    });
+    const error = vi.fn();
+    api.logger.error = error;
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    await handleInboundMessage(api, transport, "alice", {
+      type: "user_message",
+      id: "acked-route-fault",
+      text: "hello",
+    });
+
+    expect(inboundRun).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(sendSpy).toHaveBeenCalledWith(
+      "alice",
+      "Sorry — something went wrong while answering. Please try again.",
+      undefined,
+      "acked-route-fault",
+    );
+    expect(settledSpy).toHaveBeenCalledTimes(1);
+    expect(settledSpy).toHaveBeenCalledWith("alice", "acked-route-fault", "error");
   });
 
   it("resolves a channel-scoped route and delivers the reply to the peer socket", async () => {

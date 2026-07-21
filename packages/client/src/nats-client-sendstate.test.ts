@@ -74,6 +74,29 @@ describe("WebChannelNatsClient — P0-4 send-state tracker", () => {
     h.client.disconnect();
   });
 
+  it("serializes re-entrant teardown events so every listener sees queued→sent→failed", async () => {
+    const h = await setup({ deliver: true, ack: false });
+    const first: Ev[] = [];
+    const second: Ev[] = [];
+    let closed = false;
+    h.client.onSendState((id, state, failure) => {
+      first.push({ id, state, failure });
+      if (state === "sent" && !closed) {
+        closed = true;
+        h.client.disconnect();
+      }
+    });
+    h.client.onSendState((id, state, failure) => second.push({ id, state, failure }));
+
+    const id = h.client.sendUserMessage("close-during-sent");
+
+    expect(closed).toBe(true);
+    expect(states(first, id)).toEqual(["queued", "sent", "failed"]);
+    expect(states(second, id)).toEqual(["queued", "sent", "failed"]);
+    expect(first.at(-1)?.failure).toMatchObject({ reason: "closed" });
+    expect(second.at(-1)?.failure).toMatchObject({ reason: "closed" });
+  });
+
   // T-d1: a pre-connect send stays `queued`, then flushes to sent+accepted once
   // the register-delivered key lands.
   it("T-d1: a pre-connect send is queued, then sent+accepted after registration", async () => {
@@ -118,6 +141,25 @@ describe("WebChannelNatsClient — P0-4 send-state tracker", () => {
     // Reconnect happened and the replay drove sent+accepted (a single `sent`).
     expect(FakeNatsWS.instances.length).toBeGreaterThan(1);
     expect(states(h.events, id)).toEqual(["queued", "sent", "accepted"]);
+    h.client.disconnect();
+  });
+
+  it("treats a silently-discarding CLOSING socket as unsent and replays after reconnect", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const h = await setup();
+    const stale = FakeNatsWS.instances.at(-1)!;
+    const publishedBefore = stale.published.length;
+    stale.readyState = 2; // WebSocket.CLOSING; FakeNatsWS.send would otherwise accept silently.
+
+    const id = h.client.sendUserMessage("closing-window");
+
+    expect(states(h.events, id)).toEqual(["queued"]);
+    expect(stale.published).toHaveLength(publishedBefore);
+    await settle(30);
+    expect(FakeNatsWS.instances.length).toBeGreaterThan(1);
+    expect(states(h.events, id)).toEqual(["queued", "sent", "accepted"]);
+    expect(h.received).toContain(id);
+    warn.mockRestore();
     h.client.disconnect();
   });
 
@@ -200,6 +242,35 @@ describe("WebChannelNatsClient — P0-4 send-state tracker", () => {
     const queue = (h.client as unknown as { outboundQueue: unknown[] }).outboundQueue;
     expect(ledger.size).toBe(0);
     expect(queue).toHaveLength(0);
+  });
+
+  it("disconnect preserves a fresh send created by a synchronous reconnecting state listener", async () => {
+    const h = await setup({ deliver: true, ack: false });
+    const oldId = h.client.sendUserMessage("old-lifecycle");
+    await settle();
+    expect(states(h.events, oldId)).toEqual(["queued", "sent"]);
+
+    let freshId: string | undefined;
+    let reopened = false;
+    const unsubscribe = h.client.onState((connected) => {
+      if (connected || reopened) return;
+      reopened = true;
+      h.client.connect();
+      freshId = h.client.sendUserMessage("replacement-lifecycle");
+    });
+
+    h.client.disconnect();
+    expect(reopened).toBe(true);
+    expect(freshId).toBeDefined();
+    expect(states(h.events, oldId).at(-1)).toBe("failed");
+    expect(states(h.events, freshId!)).toEqual(["queued"]);
+    await settle(30);
+    expect(states(h.events, freshId!)).toEqual(["queued", "sent"]);
+    expect(h.received).toContain(freshId!);
+    expect(h.events.some((e) => e.id === freshId && e.state === "failed")).toBe(false);
+
+    unsubscribe();
+    h.client.disconnect();
   });
 
   // T-tm (register-path entry points): each REGISTER/handshake terminal failure
