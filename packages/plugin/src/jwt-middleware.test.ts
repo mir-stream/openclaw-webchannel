@@ -250,6 +250,52 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
       expect(replies).toEqual([REGISTER_UNAUTHORIZED]);
     });
 
+    it("A4: a valid signed token for another tenant cannot unregister a matching peer", async () => {
+      await ensureKeys();
+      const now = nowSec();
+      const token = await mintToken(
+        {
+          iss: ISSUER,
+          aud: AUDIENCE,
+          sub: "user-abc",
+          tenant: "mutated-tenant",
+          iat: now,
+          exp: now + 60,
+        },
+        primaryPrivateKey,
+      );
+      const config = {
+        strategy: "jwt",
+        jwt: {
+          jwksUrl: JWKS_URL,
+          issuer: ISSUER,
+          audience: AUDIENCE,
+          _fetchImpl: mockJwksServer(publishedJwks),
+        },
+      } as const;
+      const identity = await verifyJwtAndExtractIdentity(token, config);
+      expect(identity).toMatchObject({ peerId: "user-abc", tenant: "mutated-tenant" });
+
+      const replies: string[] = [];
+      const unregistered: string[] = [];
+      await handleRegisterRequest({
+        auth: config,
+        tenant: "agent-tenant",
+        subjectPeerId: "user-abc",
+        payload: JSON.stringify({ op: "unregister", token }),
+        reply: (value) => replies.push(value),
+        verifyIdentity: (jwt, auth) => verifyJwtAndExtractIdentity(jwt, auth),
+        popChallenges: new PopChallengeStore(),
+        registerPeer: () => {},
+        wrapConversationKeyForDevice: () => null,
+        unregisterPeer: (peerId) => unregistered.push(peerId),
+        sendHistorySnapshot: () => {},
+        sendApprovalSnapshot: () => {},
+      });
+      expect(unregistered).toEqual([]);
+      expect(replies).toEqual([]);
+    });
+
     it("the mock JWKS server fetch is actually called (verifies fetch path is exercised)", async () => {
       await ensureKeys();
       const fetchImpl = mockJwksServer(publishedJwks);

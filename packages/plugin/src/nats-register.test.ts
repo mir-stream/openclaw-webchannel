@@ -255,11 +255,27 @@ describe("handleRegisterRequest (register over NATS)", () => {
     expect(h.snapshots).toEqual([]);
   });
 
-  it("unregister with a VALID token tears down the verified peer, no reply", async () => {
-    const h = makeHarness(); // default verifyIdentity returns identity{peerId:PEER}
+  it("unregister with a VALID token and no tenant claim tears down the verified peer, no reply", async () => {
+    const h = makeHarness(); // legacy identity{peerId:PEER} has no tenant claim
     await h.run({ op: "unregister", token: "jwt" });
     expect(h.unregistered).toEqual([PEER]);
     expect(h.replies).toEqual([]); // fire-and-forget
+  });
+
+  it("unregister with a matching signed tenant tears down the verified peer, no reply", async () => {
+    const h = makeHarness({ identity: { peerId: PEER, tenant: TENANT } as JwtIdentity });
+    await h.run({ op: "unregister", token: "jwt" });
+    expect(h.unregistered).toEqual([PEER]);
+    expect(h.replies).toEqual([]);
+  });
+
+  it("unregister with a matching peerId but mismatched signed tenant is a silent no-op", async () => {
+    const h = makeHarness({
+      identity: { peerId: PEER, tenant: "other-tenant" } as JwtIdentity,
+    });
+    await h.run({ op: "unregister", token: "jwt" });
+    expect(h.unregistered).toEqual([]);
+    expect(h.replies).toEqual([]);
   });
 
   it("unregister WITHOUT a token is a silent no-op (does not tear down)", async () => {
