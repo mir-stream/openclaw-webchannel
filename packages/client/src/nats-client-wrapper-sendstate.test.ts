@@ -237,6 +237,60 @@ describe("WebChannelNATSClient — P0-4 receipt + sendState (wrapper)", () => {
   });
 });
 
+describe("WebChannelNATSClient — synchronous callback outbound FIFO", () => {
+  it("commits immediate A before its state subscriber can send B", async () => {
+    const h = await connectWrapper({ ack: false });
+    let injected = false;
+    let secondReceipt: ReturnType<WebChannelNATSClient["send"]>;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      if (injected || !state.messages.some((m) => m.role === "user" && m.text === "immediate-A")) return;
+      injected = true;
+      secondReceipt = h.wrapper.send("immediate-B");
+    });
+
+    const firstReceipt = h.wrapper.send("immediate-A")!;
+    await settle();
+    const userMessages = h.wrapper.getState().messages.filter((m) => m.role === "user");
+    expect(userMessages.map((m) => m.text)).toEqual(["immediate-A", "immediate-B"]);
+    expect(h.received.slice(-2)).toEqual(userMessages.map((m) => m.wireId));
+    expect(firstReceipt.snapshot().state).toBe("sent");
+    expect(secondReceipt!.snapshot().state).toBe("sent");
+
+    unsubscribe();
+    h.wrapper.close();
+  });
+
+  it("commits the final held A before its release subscriber can send B", async () => {
+    const h = await connectWrapper({ ack: false });
+    deliverOut(h.K, { type: "typing" });
+    await settle();
+    const heldReceipt = h.wrapper.send("held-final-A")!;
+    expect((h.wrapper as unknown as { held: unknown[] }).held).toHaveLength(1);
+
+    let injected = false;
+    let secondReceipt: ReturnType<WebChannelNATSClient["send"]>;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      const released = state.messages.find((m) => m.text === "held-final-A");
+      if (injected || released?.pending === true || !released?.wireId) return;
+      injected = true;
+      // This is the final held entry: held[] is empty, so B takes the immediate
+      // path and would jump A unless A already owns its low-level queue position.
+      secondReceipt = h.wrapper.send("after-final-B");
+    });
+
+    deliverOut(h.K, { type: "turn_settled", turnId: "prior-turn" });
+    await settle();
+    const userMessages = h.wrapper.getState().messages.filter((m) => m.role === "user");
+    expect(userMessages.map((m) => m.text)).toEqual(["held-final-A", "after-final-B"]);
+    expect(h.received.slice(-2)).toEqual(userMessages.map((m) => m.wireId));
+    expect(heldReceipt.snapshot().state).toBe("sent");
+    expect(secondReceipt!.snapshot().state).toBe("sent");
+
+    unsubscribe();
+    h.wrapper.close();
+  });
+});
+
 describe("WebChannelNATSClient — P0-4 receipt handle (T-rc)", () => {
   type Snap = { state: ChatMessage["sendState"]; failure?: SendFailure };
 

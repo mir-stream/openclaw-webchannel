@@ -1163,6 +1163,8 @@ export class WebChannelNatsClient {
 
   private sessionKey: Uint8Array | null = null;
   private outboundQueue: OutboundMessage[] = [];
+  /** Non-reentrant drain: callbacks may enqueue more work, which stays at the tail. */
+  private drainingOutboundQueue = false;
   /**
    * P0-7b: published-but-unacked `user_message` ledger (insertion-ordered).
    *
@@ -1296,15 +1298,16 @@ export class WebChannelNatsClient {
   sendUserMessage(text: string, reservedId?: string): string {
     const id = reservedId === undefined ? this.reserveWireId() : reservedId;
     this.consumeReservedId(id);
-    // Seed the tracker at `queued` (mutate-before-notify) so every downstream
-    // transition has a live entry to advance. A single logical send has exactly
-    // one id, so the agent's ingress dedupe drops a re-delivered frame (rapid
-    // double-submit, or a P0-7b replay after reconnect) and never re-runs the turn.
+    // Seed without notifying. For a live send, its queue position must be owned
+    // BEFORE the public queued callback: a listener can synchronously send B, and
+    // B must never commit/publish ahead of A. Terminal/closed sends intentionally
+    // never enter a live queue, but still expose queued→failed below.
     this.trackerInsert(id);
     if (this.terminalReached) {
       // D4 terminal sequence ①: a send arriving after a terminal failure is NOT
       // queued into a dead instance — it resolves immediately to an observable
       // failed receipt (reject-throw would break the observable-failed contract).
+      this.emitSendState(id, "queued");
       this.trackerFail(id, {
         reason: "terminal",
         cause: this.terminalCause,
@@ -1320,6 +1323,7 @@ export class WebChannelNatsClient {
       // maybeRelease), so the wrapper's `onSendState` handler patches the receipt
       // AND the render bubble. Fixes both the re-entrant close()-mid-render race
       // and a plain send() after close(), at the low-level layer.
+      this.emitSendState(id, "queued");
       this.trackerFail(id, {
         reason: "closed",
         retryable: false,
@@ -1327,7 +1331,12 @@ export class WebChannelNatsClient {
       });
       return id;
     }
-    this.enqueue({ type: "user_message", text, id });
+    // Authoritative outbound ownership precedes every public callback. A nested
+    // send appends behind this entry; whichever stack frame starts the drain will
+    // therefore publish in logical call order.
+    this.outboundQueue.push({ type: "user_message", text, id });
+    this.emitSendState(id, "queued");
+    this.drainOutboundQueue();
     return id;
   }
 
@@ -1775,11 +1784,8 @@ export class WebChannelNatsClient {
   }
 
   private enqueue(message: OutboundMessage): void {
-    if (!this.sessionKey) {
-      this.outboundQueue.push(message);
-      return;
-    }
-    this.seal(message);
+    this.outboundQueue.push(message);
+    this.drainOutboundQueue();
   }
 
   private flushQueue(): void {
@@ -1795,31 +1801,47 @@ export class WebChannelNatsClient {
       this.unackedLedger.clear();
       this.outboundQueue = [...replay, ...this.outboundQueue];
     }
-    // P0-4 (review R1): drain the queue LIVE — shift one entry per iteration —
-    // rather than snapshotting it into a local array and clearing the field up
-    // front. `seal()` publishes synchronously, which runs `trackerAdvance(…,
-    // "sent")` → the wrapper's receipt/bubble `setState` → the embedder's state
-    // subscribers, MID-LOOP. A perfectly ordinary subscriber (route change,
-    // unmount, logout) may call `close()` there. With a snapshot the remaining
-    // entries live in NEITHER `outboundQueue` NOR `unackedLedger` for the length
-    // of the loop, so the `failAllPending()` sweep inside that `disconnect()`
-    // cannot see them; the loop then resumes and `seal()` re-pushes them onto a
-    // closed instance whose sweep will never run again — permanently `queued`,
-    // the exact invariant P0-4 exists to eliminate. (Same hole on the terminal
-    // path: `markTerminalAndSweep` would likewise miss the in-flight array.) A
-    // live drain keeps the remainder genuinely present in `outboundQueue`, so
-    // every sweep sees it. This mirrors the deliberate live-`shift()` discipline
-    // in the wrapper's `maybeRelease()`, which is why the release path is immune.
-    //
-    // The `this.sessionKey` condition is LOAD-BEARING, not a re-check for tidiness:
-    // `seal()` fail-closes by re-pushing to the TAIL when the key is gone, so an
-    // unconditional `while (length > 0)` would shift-and-re-push the same frame
-    // forever. With the guard, a mid-loop session teardown just leaves the
-    // remainder queued in order — swept to failed{closed}/failed{terminal} if the
-    // instance was closed/retired, or replayed at the next flushQueue() on a plain
-    // reconnect (pre-existing behavior), with no reordering either way.
-    while (this.sessionKey && this.outboundQueue.length > 0) {
-      this.seal(this.outboundQueue.shift()!);
+    this.drainOutboundQueue();
+  }
+
+  /**
+   * Drain only the ordinary outbound queue. Reconnect-only ledger replay is
+   * prepended by `flushQueue()` once per established session; live sends must not
+   * replay the entire unacked ledger. Nested sends append to this same live queue
+   * and the outer drain consumes them FIFO without recursive sealing.
+   */
+  private drainOutboundQueue(): void {
+    if (this.drainingOutboundQueue) return;
+    this.drainingOutboundQueue = true;
+    try {
+      // P0-4 (review R1): drain the queue LIVE — shift one entry per iteration —
+      // rather than snapshotting it into a local array and clearing the field up
+      // front. `seal()` publishes synchronously, which runs `trackerAdvance(…,
+      // "sent")` → the wrapper's receipt/bubble `setState` → the embedder's state
+      // subscribers, MID-LOOP. A perfectly ordinary subscriber (route change,
+      // unmount, logout) may call `close()` there. With a snapshot the remaining
+      // entries live in NEITHER `outboundQueue` NOR `unackedLedger` for the length
+      // of the loop, so the `failAllPending()` sweep inside that `disconnect()`
+      // cannot see them; the loop then resumes and `seal()` re-pushes them onto a
+      // closed instance whose sweep will never run again — permanently `queued`,
+      // the exact invariant P0-4 exists to eliminate. (Same hole on the terminal
+      // path: `markTerminalAndSweep` would likewise miss the in-flight array.) A
+      // live drain keeps the remainder genuinely present in `outboundQueue`, so
+      // every sweep sees it. This mirrors the deliberate live-`shift()` discipline
+      // in the wrapper's `maybeRelease()`, which is why the release path is immune.
+      //
+      // The `this.sessionKey` condition is LOAD-BEARING, not a re-check for tidiness:
+      // `seal()` fail-closes by re-pushing to the TAIL when the key is gone, so an
+      // unconditional `while (length > 0)` would shift-and-re-push the same frame
+      // forever. With the guard, a mid-loop session teardown just leaves the
+      // remainder queued in order — swept to failed{closed}/failed{terminal} if the
+      // instance was closed/retired, or replayed at the next flushQueue() on a plain
+      // reconnect (pre-existing behavior), with no reordering either way.
+      while (this.sessionKey && this.outboundQueue.length > 0) {
+        this.seal(this.outboundQueue.shift()!);
+      }
+    } finally {
+      this.drainingOutboundQueue = false;
     }
   }
 
@@ -1886,11 +1908,10 @@ export class WebChannelNatsClient {
   // P0-4 — authoritative send-state tracker (D4)
   // ---------------------------------------------------------------------------
 
-  /** Insert a fresh `queued` entry and notify (mutate-before-notify). No-op if already tracked. */
+  /** Seed a fresh `queued` entry without a public callout. No-op if already tracked. */
   private trackerInsert(id: string): void {
     if (this.sendTracker.has(id)) return;
     this.sendTracker.set(id, { state: "queued" });
-    this.emitSendState(id, "queued");
   }
 
   /**

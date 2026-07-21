@@ -97,6 +97,27 @@ describe("WebChannelNatsClient — P0-4 send-state tracker", () => {
     expect(second.at(-1)?.failure).toMatchObject({ reason: "closed" });
   });
 
+  it("commits A before a queued listener can synchronously send B", async () => {
+    const h = await setup({ deliver: true, ack: false });
+    let firstQueuedId: string | undefined;
+    let nestedId: string | undefined;
+    h.client.onSendState((id, state) => {
+      if (state !== "queued" || firstQueuedId !== undefined) return;
+      firstQueuedId = id;
+      nestedId = h.client.sendUserMessage("B-from-queued-listener");
+    });
+
+    const firstId = h.client.sendUserMessage("A-outer");
+    await settle();
+
+    expect(firstQueuedId).toBe(firstId);
+    expect(nestedId).toBeDefined();
+    expect(h.received.slice(-2)).toEqual([firstId, nestedId]);
+    expect(states(h.events, firstId)).toEqual(["queued", "sent"]);
+    expect(states(h.events, nestedId!)).toEqual(["queued", "sent"]);
+    h.client.disconnect();
+  });
+
   // T-d1: a pre-connect send stays `queued`, then flushes to sent+accepted once
   // the register-delivered key lands.
   it("T-d1: a pre-connect send is queued, then sent+accepted after registration", async () => {

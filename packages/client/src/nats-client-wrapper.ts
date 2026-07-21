@@ -99,6 +99,10 @@ export class WebChannelNATSClient {
   };
 
   private readonly listeners = new Set<Listener>();
+  /** Counts public state fanouts so a staged bubble is exposed exactly once. */
+  private stateNotificationSeq = 0;
+  /** Receipt bubbles installed silently while their low-level send commits. */
+  private readonly stagedReceiptExposures = new Set<string>();
 
   /**
    * P1-9: user messages HELD locally because a turn was in flight at send time
@@ -253,7 +257,14 @@ export class WebChannelNATSClient {
     // bubble. A wireId with no local receipt (a direct/internal send) is ignored.
     this.client.onSendState((wireId: string, state: SendState, failure?: SendFailure) => {
       const receiptKey = this.wireIdToReceiptKey.get(wireId);
-      if (receiptKey) this.receiptTransition(receiptKey, state, failure);
+      if (!receiptKey) return;
+      // The record already starts at queued, so this is not a receipt transition.
+      // It is nevertheless the first safe point to expose a silently staged
+      // bubble: the low level owns A's outbound queue position before emitting it.
+      if (state === "queued" && this.stagedReceiptExposures.delete(receiptKey)) {
+        this.notifyStateListeners();
+      }
+      this.receiptTransition(receiptKey, state, failure);
     });
 
     // CL2: surface a TERMINAL failure to the embedder. The underlying client
@@ -446,10 +457,10 @@ export class WebChannelNATSClient {
    * no-hold and the abort-bypass branches share it (§3.1/§3.3).
    *
    * P0-4 commit order (D4): reserve the wire id, register the receipt record +
-   * alias + render bubble, THEN call `sendUserMessage(text, wireId)`. The old code
-   * called sendUserMessage FIRST, so its synchronous `queued`/`sent`/immediate-
-   * `failed` transitions fired before the bubble existed and were lost. Reserving
-   * up front guarantees every transition lands on the already-registered receipt.
+   * alias + render bubble SILENTLY, then let `sendUserMessage` own A's outbound
+   * queue position before any state callback can synchronously send B. The queued
+   * low-level event exposes the staged bubble; if that event is itself delayed by
+   * a nested event drain, the commit helper exposes it once before returning.
    */
   private publish(trimmed: string): SendReceipt {
     const receiptKey = this.newReceiptKey();
@@ -462,7 +473,7 @@ export class WebChannelNATSClient {
       pendingTransitions: [],
       drainingTransitions: false,
     });
-    this.appendMessage({
+    const bubble: ChatMessage = {
       id: `u-${this.uid()}`,
       role: "user",
       text: trimmed,
@@ -470,8 +481,12 @@ export class WebChannelNATSClient {
       turnId: wireId,
       receiptKey,
       sendState: "queued",
-    });
-    this.client.sendUserMessage(trimmed, wireId);
+    };
+    this.stageReceiptStateThenCommit(
+      receiptKey,
+      { messages: [...this.state.messages, bubble] },
+      () => { this.client.sendUserMessage(trimmed, wireId); },
+    );
     return this.makeReceipt(receiptKey);
   }
 
@@ -507,13 +522,14 @@ export class WebChannelNATSClient {
    * bubble an ordinary send in an ordinary position.
    *
    * Re-entrancy: drain `held[]` LIVE — `shift()` one entry per iteration rather
-   * than snapshot-and-clear before the loop. Each per-bubble `setState()` fires
-   * listeners synchronously mid-loop; a listener calling `send()` re-entrantly
-   * must NOT jump the queue. With a live drain the still-unreleased entries are
-   * genuinely present in `held[]`, so `shouldHold()` (`held.length > 0`) still
-   * holds that new message and the continuing `while` loop picks it up in FIFO
-   * order — a snapshot-and-clear would leave `held[]` empty mid-loop and let the
-   * re-entrant send publish AHEAD of the not-yet-released entries (M1, M3, M2).
+   * than snapshot-and-clear before the loop. Each staged bubble is exposed to
+   * listeners synchronously after its low-level queue commit; a listener calling
+   * `send()` re-entrantly must NOT jump the queue. With a live drain the still-
+   * unreleased entries are genuinely present in `held[]`, so `shouldHold()`'s
+   * `held.length > 0` latch holds that new message and the continuing loop takes
+   * it in FIFO order. A snapshot-and-clear would leave `held[]` empty mid-loop
+   * and let the re-entrant send publish AHEAD of the not-yet-released entries
+   * (M1, M3, M2).
    * Two behaviors this preserves: (a) a re-entrant `retract()` of a not-yet-
    * released held item splices it out of the live array, so `shift()` never
    * reaches it — its publish is cancelled; (b) the last entry's listener calling
@@ -531,9 +547,8 @@ export class WebChannelNATSClient {
     }
     while (this.held.length > 0) {
       const { localId, text, receiptKey } = this.held.shift()!;
-      // P0-4 commit order: reserve the wireId, register the alias, MOVE the bubble
-      // to the tail (with wireId), THEN publish — so the synchronous `sent`
-      // transition patches an already-present, correctly-keyed bubble.
+      // P0-4 commit order: reserve the wireId, register the alias, stage the bubble
+      // at the tail, THEN let the low level own/publish A before exposing that move.
       const wireId = this.client.reserveWireId();
       this.wireIdToReceiptKey.set(wireId, receiptKey);
       const bubble = this.state.messages.find((m) => m.id === localId);
@@ -542,9 +557,14 @@ export class WebChannelNATSClient {
       if (bubble) {
         const messages = this.state.messages.filter((m) => m.id !== localId);
         messages.push({ ...bubble, pending: false, wireId, turnId: wireId });
-        this.setState({ messages });
+        this.stageReceiptStateThenCommit(
+          receiptKey,
+          { messages },
+          () => { this.client.sendUserMessage(text, wireId); },
+        );
+      } else {
+        this.client.sendUserMessage(text, wireId);
       }
-      this.client.sendUserMessage(text, wireId);
     }
   }
 
@@ -740,23 +760,44 @@ export class WebChannelNATSClient {
   // ---------------------------------------------------------------------------
 
   /**
-   * P0-4: the try/catch is load-bearing, not defensive politeness. Under the D4
-   * commit order the actual `sendUserMessage` runs AFTER the bubble is rendered
-   * (`publish()`, and per-entry inside the `maybeRelease()` drain loop), so an
-   * embedder listener that throws here would abort the caller BEFORE the frame
-   * is ever published — leaving the receipt stuck at `queued` forever (the exact
-   * invariant P0-4 exists to forbid), leaking the reserved wireId + its alias,
-   * and in the release case stranding every remaining `held[]` entry behind the
-   * aborted `while` loop. An embedder's render bug must never cost a send.
+   * Public state listeners are isolated so an embedder render bug cannot abort a
+   * send, a staged-bubble exposure, or a held drain midway through its FIFO commit.
    */
   private setState(patch: Partial<WebChannelState>): void {
     this.state = { ...this.state, ...patch };
+    this.notifyStateListeners();
+  }
+
+  private notifyStateListeners(): void {
+    this.stateNotificationSeq++;
     for (const listener of this.listeners) {
       try {
         listener(this.state);
       } catch (e) {
         console.error("[nats-wrapper] state listener threw:", e);
       }
+    }
+  }
+
+  /**
+   * Install a receipt bubble/update before committing its low-level send, without
+   * exposing it early. The low-level queued callback normally performs the public
+   * fanout after queue ownership is established. If that callback is delayed by a
+   * surrounding send-state drain, expose the staged state once after commit.
+   */
+  private stageReceiptStateThenCommit(
+    receiptKey: string,
+    patch: Partial<WebChannelState>,
+    commit: () => void,
+  ): void {
+    const notificationSeq = this.stateNotificationSeq;
+    this.state = { ...this.state, ...patch };
+    this.stagedReceiptExposures.add(receiptKey);
+    try {
+      commit();
+    } finally {
+      this.stagedReceiptExposures.delete(receiptKey);
+      if (this.stateNotificationSeq === notificationSeq) this.notifyStateListeners();
     }
   }
 
