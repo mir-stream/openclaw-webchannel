@@ -1,0 +1,13 @@
+# 러너 신축 컷오버 — deploy 레인 라벨 라우팅 프로브 (설계 §6-4 a-0)
+# workflow_dispatch 전용·echo만 하는 무해 워크플로. publish는 dispatch=실출판이라 검증에 못 쓰므로
+# 이 프로브가 wc-publish 러너 착지 증거를 댄다. 컷오버 완주 후 제거 가능.
+name: label-probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: deploy
+    steps:
+      - name: 러너 증거 출력
+        run: echo "label-probe landed on runner=${RUNNER_NAME} host=$(hostname)"
