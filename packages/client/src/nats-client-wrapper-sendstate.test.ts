@@ -440,6 +440,79 @@ describe("WebChannelNATSClient — P0-4 state-listener fault isolation (T-lg)", 
 });
 
 // ---------------------------------------------------------------------------
+// T-cx: the register-before-send window's OTHER vector — a send registered onto
+// an explicitly-CLOSED instance must not strand at `queued`. `close()` returns
+// normally (never throws), so the setState try/catch guard (T-lg) does NOT cover
+// it; a connection-scoped `disconnected` gate in the low level fails the send
+// `failed{closed}` so the receipt AND bubble reach a terminal state. Covers the
+// re-entrant close()-mid-render race (publish + held-release) and a plain send()
+// after close(). Companion invariant test to T-lg.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P0-4 send onto a closed instance (T-cx)", () => {
+  // T-cx(a): a state subscriber that close()s during publish()'s render — before
+  // sendUserMessage runs — must still land the send at failed{closed}, not queued.
+  it("T-cx(a): close() from a state subscriber mid-publish fails that send failed{closed}", async () => {
+    const h = await connectWrapper();
+    let closedOnce = false;
+    h.wrapper.subscribe((s) => {
+      if (!closedOnce && s.messages.some((m) => m.role === "user" && m.text === "boom")) {
+        closedOnce = true;
+        h.wrapper.close(); // → disconnect() before this send's sendUserMessage runs
+      }
+    });
+    const receipt = h.wrapper.send("boom")!;
+    await settle();
+    expect(closedOnce).toBe(true);
+    expect(receipt.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed", retryable: false } });
+    const bubble = userBubble(h.wrapper, "boom")!;
+    expect(bubble.sendState).toBe("failed");
+    expect(bubble.sendFailure).toMatchObject({ reason: "closed", retryable: false });
+  });
+
+  // T-cx(b): the held-release path — a subscriber that close()s while a held
+  // message is being released (the entry already shifted off held[], the bubble
+  // moved to the tail) must fail that released send failed{closed}, not queued.
+  it("T-cx(b): close() from a subscriber mid-release fails the released send failed{closed}", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, { type: "typing" }); // turn in flight → the next send holds
+    await settle();
+    const receipt = h.wrapper.send("held-boom")!;
+    expect(receipt.snapshot().state).toBe("queued");
+
+    let closedOnce = false;
+    h.wrapper.subscribe((s) => {
+      // Fires when release moves the held bubble to the tail (pending flipped off),
+      // synchronously BEFORE its sendUserMessage — close() here wins the race.
+      if (!closedOnce && s.messages.some((m) => m.text === "held-boom" && m.pending !== true)) {
+        closedOnce = true;
+        h.wrapper.close();
+      }
+    });
+
+    deliverOut(h.K, { type: "turn_settled", turnId: "T" }); // settle → release drain
+    await settle();
+    expect(closedOnce).toBe(true);
+    expect(receipt.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed", retryable: false } });
+    const bubble = userBubble(h.wrapper, "held-boom")!;
+    expect(bubble.sendState).toBe("failed");
+    expect(bubble.sendFailure).toMatchObject({ reason: "closed", retryable: false });
+  });
+
+  // T-cx(c): a plain send() AFTER close() — no re-entrancy — must fail failed{closed}
+  // immediately, never stuck at queued on the dead instance.
+  it("T-cx(c): a plain send() after close() fails failed{closed}, never stuck queued", async () => {
+    const h = await connectWrapper();
+    h.wrapper.close();
+    const receipt = h.wrapper.send("after-close")!;
+    expect(receipt.snapshot().state).not.toBe("queued");
+    expect(receipt.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed", retryable: false } });
+    const bubble = userBubble(h.wrapper, "after-close")!;
+    expect(bubble.sendState).toBe("failed");
+    expect(bubble.sendFailure).toMatchObject({ reason: "closed", retryable: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // P0-4 (R3): a CL2 terminal instance is PERMANENTLY retired — a registration-path
 // terminal (only the WCNC latch set; the raw transport is NOT terminal) must not
 // let a later public connect() flip the sticky "error" to "connected" while every

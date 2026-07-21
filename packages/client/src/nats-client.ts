@@ -1119,6 +1119,18 @@ export class WebChannelNatsClient {
    */
   private terminalReached = false;
   private terminalCause: WebChannelErrorCause = "unknown";
+  /**
+   * P0-4: connection-scoped closed gate (unlike the PERMANENT `terminalReached`).
+   * Set by `disconnect()` (the only production caller is the wrapper's `close()`)
+   * and cleared by a successful non-terminal `connect()`. Gates `sendUserMessage`
+   * so a send registered onto an explicitly-closed instance fails observably with
+   * `failed{closed}` instead of stranding at `queued` on a dead instance — closing
+   * the register-before-send window where a state subscriber calls `close()` mid-
+   * render (its sweep runs before this send's `sendUserMessage`), or a plain
+   * `send()` lands after `close()`. Initially false: a never-connected instance is
+   * NOT "disconnected", so a pre-connect send still queues and flushes on connect.
+   */
+  private disconnected = false;
 
   private sessionKey: Uint8Array | null = null;
   private outboundQueue: OutboundMessage[] = [];
@@ -1205,12 +1217,21 @@ export class WebChannelNatsClient {
       console.warn("[nats-client] connect() ignored — this instance is terminally retired; construct a fresh client with fresh credentials");
       return;
     }
+    // P0-4: a non-terminal reconnect reopens the send path — clear the closed gate
+    // (AFTER the terminal guard above, so a retired instance stays retired).
+    this.disconnected = false;
     this.client.connect();
   }
 
   /** Disconnect from NATS and drop the session. */
   disconnect(): void {
     this.connectionEpoch++;
+    // P0-4: gate `sendUserMessage` BEFORE anything else so a send that arrives
+    // AFTER this returns (a state subscriber calling close() mid-render, then
+    // control resuming into publish()'s `sendUserMessage`; or a plain send() after
+    // close()) fails observably with `failed{closed}` rather than queuing onto the
+    // dead instance the `failAllPending` sweep below has already swept.
+    this.disconnected = true;
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
     this.outSub = -1;
     this.resetSession();
@@ -1250,6 +1271,20 @@ export class WebChannelNatsClient {
       this.trackerFail(id, {
         reason: "terminal",
         cause: this.terminalCause,
+        retryable: false,
+        lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
+      });
+      return id;
+    }
+    if (this.disconnected) {
+      // P0-4: an explicitly-closed instance never queues a send — it resolves
+      // immediately to `failed{closed}` (observable, never stuck at `queued`).
+      // The wireId→receiptKey alias is set BEFORE sendUserMessage (publish/
+      // maybeRelease), so the wrapper's `onSendState` handler patches the receipt
+      // AND the render bubble. Fixes both the re-entrant close()-mid-render race
+      // and a plain send() after close(), at the low-level layer.
+      this.trackerFail(id, {
+        reason: "closed",
         retryable: false,
         lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
       });
