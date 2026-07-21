@@ -35,6 +35,10 @@ import {
 import type { CommandCatalogEntry, WebChannelErrorCause } from "./types.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
+export const MAX_CONTROL_LINE = 64 * 1024;
+export const MAX_PAYLOAD = 8 * 1024 * 1024;
+export const MAX_BUFFERED_BYTES = MAX_CONTROL_LINE + MAX_PAYLOAD + 4;
+
 /**
  * A random, subject-safe token for a request/reply inbox segment (hex only, so
  * it never contains a `.`/`*`/`>` that would break the subject hierarchy).
@@ -88,6 +92,8 @@ export type NatsClientOptions = {
    * to 0 to disable.
    */
   heartbeatIntervalMs?: number;
+  /** Per-handshake-phase deadline in ms. Default 10,000; 0 disables it. */
+  connectTimeoutMs?: number;
   /**
    * Required PoP registration. The client performs the JWT +
    * Proof-of-Possession registration over NATS request/reply on the account's
@@ -267,6 +273,7 @@ export type WebChannelNatsClientOptions = Omit<NatsClientOptions, "jwt" | "regis
 export class NatsClient {
   private readonly options: NatsClientOptions;
   private ws: WebSocket | null = null;
+  private connectionGeneration = 0;
   private connected = false;
   private rawListeners = new Set<RawMessageListener>();
   private stateListeners = new Set<StateListener>();
@@ -274,13 +281,6 @@ export class NatsClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private subscriptions = new Map<number, string>(); // sid -> subject
   private sidCounter = 0;
-  private buffer = "";
-  /**
-   * NKEY-auth only: guards the signed CONNECT so it is sent exactly once per
-   * socket even if the server emits multiple INFO lines. Reset on each
-   * (re)connect. Unused on the no-natsCredentials path.
-   */
-  private connectSent = false;
 
   /** CL2: terminal auth failure — stop reconnecting; only a fresh client helps. */
   private terminal = false;
@@ -289,6 +289,13 @@ export class NatsClient {
   /** CL3: keepalive timer + outstanding-PING flag. */
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pongPending = false;
+  /**
+   * The CURRENT dial's deadline-timer cleanup. disconnect()/forceReconnect() null
+   * ws.onclose before close(), so the dial's onclose→clearDeadline never runs;
+   * invoking this cancels the armed deadline directly. Only ever points at the
+   * current dial's cleanup — a stale dial self-cleans via its own onclose/timeout.
+   */
+  private activeDialCleanup: (() => void) | null = null;
 
   constructor(options: NatsClientOptions) {
     this.options = options;
@@ -309,10 +316,21 @@ export class NatsClient {
     this.connectInternal();
   }
 
+  /** @internal Bind higher-level terminal cleanup to the dial that failed. */
+  currentConnectionGeneration(): number { return this.connectionGeneration; }
+
+  /** @internal Never let stale higher-level cleanup tear down a replacement dial. */
+  disconnectConnectionGeneration(generation: number): void {
+    if (this.connectionGeneration === generation) this.disconnect();
+  }
+
   /** Disconnect and cleanup */
   disconnect(): void {
     this.clearReconnectTimer();
     this.stopHeartbeat();
+    // Cancel the active dial's armed deadline before we null its onclose below
+    // (which would otherwise strand the timer until it fires as a guarded no-op).
+    if (this.activeDialCleanup) { this.activeDialCleanup(); this.activeDialCleanup = null; }
     if (this.ws) {
       this.ws.onopen = null;
       this.ws.onmessage = null;
@@ -442,35 +460,91 @@ export class NatsClient {
     }
 
     const ws = new WebSocket(this.options.url);
+    this.connectionGeneration++;
     // nats-server speaks the NATS protocol over BINARY WebSocket frames. The
     // default binaryType ("blob") coerces to "[object Blob]" in the text buffer
     // and breaks the parser — request ArrayBuffer and decode to UTF-8.
     ws.binaryType = "arraybuffer";
     this.ws = ws;
-    this.connectSent = false;
-    // A fresh socket starts a fresh NATS protocol stream. Any bytes left in the
-    // buffer from a socket torn down mid-frame (the half-open case CL3's
-    // heartbeat forces a reconnect on) would otherwise corrupt the new stream's
-    // INFO/PONG parse — on the NKEY path a mangled INFO means the signed CONNECT
-    // is never sent → server auth timeout. Start clean.
-    this.buffer = "";
+    // NOTE: `buffer` is annotated as bare `Uint8Array` (generic default) — under
+    // TS ≥5.7 typed-array generics, letting it infer `Uint8Array<ArrayBuffer>`
+    // from `new Uint8Array(0)` rejects later assignments of encoder/slice results
+    // typed `Uint8Array<ArrayBufferLike>` (packages/client resolves a newer local
+    // TypeScript than the workspace root, so this must compile under both).
+    const dial: {
+      buffer: Uint8Array;
+      connectSent: boolean;
+      connectOnWire: boolean;
+      timer: ReturnType<typeof setTimeout> | null;
+      phase: string;
+    } = { buffer: new Uint8Array(0), connectSent: false, connectOnWire: false, timer: null, phase: "WebSocket open" };
+    const armDeadline = (phase: string): void => {
+      dial.phase = phase;
+      if (dial.timer) clearTimeout(dial.timer);
+      const timeout = this.options.connectTimeoutMs ?? 10_000;
+      if (timeout === 0) return;
+      dial.timer = setTimeout(() => {
+        if (this.ws === ws) {
+          console.warn(`[nats-client] Handshake timeout in phase ${dial.phase}`);
+          this.forceReconnect();
+        }
+        else try { ws.close(); } catch { /* stale dial owns its socket */ }
+      }, timeout);
+    };
+    const clearDeadline = (): void => {
+      if (dial.timer) clearTimeout(dial.timer);
+      dial.timer = null;
+    };
+    // Expose THIS dial's timer cleanup on the instance. disconnect()/forceReconnect()
+    // null ws.onclose BEFORE close(), so the dial's own onclose→clearDeadline never
+    // runs and the armed deadline would otherwise survive up to connectTimeoutMs and
+    // fire as a guarded no-op. Each new dial reassigns this slot; a stale dial still
+    // self-cleans via its own onclose/timeout.
+    this.activeDialCleanup = clearDeadline;
+    armDeadline("WebSocket open");
 
     ws.onopen = () => {
+      if (this.ws !== ws) return;
       console.log("[nats-client] WebSocket connected");
       // No NKEY auth: send CONNECT immediately (original path, byte-for-byte).
       // With NKEY auth we MUST wait for the server's INFO nonce before signing,
       // so CONNECT is deferred to the INFO handler in drainBuffer().
       if (!this.options.natsCredentials) {
-        this.sendConnect();
+        // Mark CONNECT on-wire and arm the "first PONG" deadline BEFORE the send
+        // (matching the signed-connect path): a server — or the test fake — that
+        // answers our PING with a PONG in the SAME synchronous tick would settle
+        // the connection and clear the deadline inside sendConnect(); arming after
+        // that would strand a fresh timer that fires ~10s later and force-reconnects
+        // a healthy link. Arm-then-send lets the sync PONG clear it and stay clear.
+        dial.connectOnWire = true;
+        armDeadline("first PONG");
+        this.sendConnect(ws);
+      } else {
+        armDeadline("INFO");
       }
     };
 
     ws.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
-      this.buffer +=
-        typeof event.data === "string"
-          ? event.data
-          : new TextDecoder().decode(new Uint8Array(event.data));
-      this.drainBuffer();
+      if (this.ws !== ws) return;
+      const chunk = typeof event.data === "string"
+        ? new TextEncoder().encode(event.data)
+        : new Uint8Array(event.data);
+      if (dial.buffer.length + chunk.length > MAX_BUFFERED_BYTES) {
+        this.forceReconnect();
+        return;
+      }
+      const joined = new Uint8Array(dial.buffer.length + chunk.length);
+      joined.set(dial.buffer);
+      joined.set(chunk, dial.buffer.length);
+      dial.buffer = joined;
+      dial.buffer = this.drainBuffer(ws, dial.buffer, () => {
+        clearDeadline();
+      }, () => { dial.connectOnWire = true; armDeadline("first PONG"); }, () => {
+        if (dial.connectSent) return false;
+        dial.connectSent = true;
+        armDeadline("CONNECT signing");
+        return true;
+      }, () => dial.connectOnWire);
     };
 
     ws.onerror = (err) => {
@@ -478,15 +552,16 @@ export class NatsClient {
     };
 
     ws.onclose = () => {
+      clearDeadline();
+      if (this.ws !== ws) return;
       this.connected = false;
       this.stopHeartbeat();
-      this.notifyStateListeners();
       this.scheduleReconnect();
+      this.notifyStateListeners();
     };
   }
 
-  private sendConnect(): void {
-    if (!this.ws) return;
+  private sendConnect(ws: WebSocket): void {
 
     const connectPayload: Record<string, unknown> = {
       verbose: false,
@@ -501,8 +576,8 @@ export class NatsClient {
     // takes the deferred-CONNECT path instead) the field is simply omitted.
     if (this.options.jwt) connectPayload["jwt"] = this.options.jwt;
 
-    this.ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
-    this.ws.send("PING\r\n");
+    ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
+    ws.send("PING\r\n");
   }
 
   /**
@@ -511,13 +586,13 @@ export class NatsClient {
    * signature (NATS challenge-response), then PING to provoke the PONG that
    * flips us to `connected`. Only invoked when `natsCredentials` is set.
    */
-  private async sendSignedConnect(infoLine: string): Promise<void> {
+  private async sendSignedConnect(ws: WebSocket, infoLine: string, onSent: () => void): Promise<void> {
     const creds = this.options.natsCredentials;
-    // Capture the socket BEFORE the crypto await: a (theoretical) reconnect
-    // during the await could swap `this.ws`, and we must send CONNECT on the
-    // same socket that produced this INFO nonce — never a replacement.
-    const ws = this.ws;
-    if (!ws || !creds) return;
+    // `ws` is threaded in lexically by the caller: CONNECT must be sent on the
+    // exact socket that produced this INFO nonce, never a replacement that a
+    // reconnect during the crypto await below may have swapped into `this.ws`
+    // (re-checked against `this.ws` right before the send).
+    if (!creds) return;
 
     let nonce = "";
     try {
@@ -528,8 +603,26 @@ export class NatsClient {
 
     let sig = "";
     if (nonce) {
-      const privateKey = await importEd25519SeedKey(base64urlDecode(creds.userSeedRaw));
-      sig = await signNonce(privateKey, nonce);
+      try {
+        const privateKey = await importEd25519SeedKey(base64urlDecode(creds.userSeedRaw));
+        sig = await signNonce(privateKey, nonce);
+      } catch (err) {
+        // A malformed user seed (or any WebCrypto failure) can never produce a
+        // valid signature — the SAME credentials fail on every re-dial. Left
+        // unguarded, `void sendSignedConnect(...)` turns this into an unhandled
+        // rejection, CONNECT is never sent, and the armed "CONNECT signing"
+        // deadline silently force-reconnects into an endless ~10s loop. Retire
+        // terminally instead (mirrors the plugin's settle(err)), but only for the
+        // CURRENT dial — a reconnect during the await may have moved on, and that
+        // replacement runs its own signing.
+        if (this.ws !== ws) return;
+        this.failTerminally(
+          `NATS NKEY signing failed: ${err instanceof Error ? err.message : String(err)} ` +
+            `(invalid user seed — reconnecting cannot help; re-authenticate)`,
+          "auth-rejected",
+        );
+        return;
+      }
     }
 
     const connectPayload: Record<string, unknown> = {
@@ -543,29 +636,53 @@ export class NatsClient {
     };
     if (sig) connectPayload["sig"] = sig;
 
-    // Send on the captured socket (the one that produced this INFO nonce).
+    if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+    // Mark CONNECT on-wire and arm the "first PONG" deadline BEFORE the synchronous
+    // sends: a server (or test fake) that answers our PING with a PONG in the same
+    // tick must not have that legitimate PONG dropped as unsolicited.
+    onSent();
     ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
     ws.send("PING\r\n");
   }
 
-  private drainBuffer(): void {
+  private drainBuffer(
+    ws: WebSocket,
+    initialBuffer: Uint8Array,
+    onPong: () => void,
+    onConnectSent: () => void,
+    beginSignedConnect: () => boolean,
+    isConnectOnWire: () => boolean,
+  ): Uint8Array {
+    let buffer = initialBuffer;
+    const decoder = new TextDecoder();
+    const crlfIndex = (bytes: Uint8Array): number => {
+      for (let i = 0; i + 1 < bytes.length; i++) if (bytes[i] === 13 && bytes[i + 1] === 10) return i;
+      return -1;
+    };
     let crlfPos: number;
-    while ((crlfPos = this.buffer.indexOf("\r\n")) !== -1) {
-      const line = this.buffer.slice(0, crlfPos);
-      this.buffer = this.buffer.slice(crlfPos + 2);
+    while ((crlfPos = crlfIndex(buffer)) !== -1) {
+      if (crlfPos > MAX_CONTROL_LINE) { this.forceReconnect(); return new Uint8Array(0); }
+      const lineBytes = buffer.slice(0, crlfPos);
+      const line = decoder.decode(lineBytes);
+      buffer = buffer.slice(crlfPos + 2);
 
       if (!line) continue;
 
       if (line.startsWith("INFO ")) {
         // NKEY auth: the INFO nonce is our cue to send the signed CONNECT (once).
-        if (this.options.natsCredentials && !this.connectSent) {
-          this.connectSent = true;
-          void this.sendSignedConnect(line);
+        if (this.options.natsCredentials && beginSignedConnect()) {
+          void this.sendSignedConnect(ws, line, onConnectSent);
         }
         continue;
       }
 
       if (line === "PONG") {
+        // A PONG is only legitimate once our CONNECT+PING is actually on the wire.
+        // An unsolicited PONG (NKEY mode: INFO arrived, signing still pending) must
+        // not clear the deadline, flip us connected, or touch pongPending — ignore
+        // it entirely and keep the armed phase deadline running.
+        if (!isConnectOnWire()) continue;
+        onPong();
         // CL3: any PONG proves the link is alive — clear the outstanding-ping
         // flag so the next heartbeat tick does not declare a dead link.
         this.pongPending = false;
@@ -573,7 +690,13 @@ export class NatsClient {
           this.connected = true;
           this.reconnectAttempts = 0;
           console.log("[nats-client] Connected to NATS");
-          this.notifyStateListeners();
+          // Order is deliberately UNCHANGED (notify -> resubscribe -> heartbeat):
+          // nats-client-wrapper's P1-9 ledger/hold release observes this sequence.
+          // The leak this fixes is a state listener that synchronously disconnects:
+          // it ran stopHeartbeat(), and the unguarded startHeartbeat() below then
+          // armed a fresh interval on a dead client. Bail instead of reordering.
+          this.notifyStateListeners(() => this.ws === ws);
+          if (this.ws !== ws) return new Uint8Array(0);
           this.resubscribeAll();
           this.startHeartbeat();
         }
@@ -581,7 +704,7 @@ export class NatsClient {
       }
 
       if (line === "PING") {
-        this.ws?.send("PONG\r\n");
+        ws.send("PONG\r\n");
         continue;
       }
 
@@ -591,7 +714,11 @@ export class NatsClient {
         // would re-extract the same header from the same buffer forever — a
         // synchronous infinite loop that freezes the tab. Break and wait for the
         // next ws.onmessage to append the rest.
-        if (!this.handleMessage(line)) break;
+        const result = this.handleMessage(ws, line, lineBytes, buffer);
+        if (!result) return new Uint8Array(0);
+        if (this.ws !== ws) return new Uint8Array(0);
+        buffer = result.buffer;
+        if (!result.complete) break;
         continue;
       }
 
@@ -617,16 +744,23 @@ export class NatsClient {
               `(credential TTL lapsed — reconnecting cannot help; re-authenticate)`,
             "auth-expired",
           );
+          return new Uint8Array(0);
         } else if (/authorization violation/i.test(line)) {
           this.failTerminally(
             `NATS authorization rejected: ${line.slice(5).trim()} ` +
               `(credentials invalid/expired — reconnecting cannot help)`,
             "auth-rejected",
           );
+          return new Uint8Array(0);
         }
         continue;
       }
     }
+    if (crlfIndex(buffer) === -1 && buffer.length > MAX_CONTROL_LINE) {
+      this.forceReconnect();
+      return new Uint8Array(0);
+    }
+    return buffer;
   }
 
   /**
@@ -635,26 +769,32 @@ export class NatsClient {
    * fully arrived yet (the header is re-buffered; caller must STOP draining and
    * wait for more socket data — see the break in drainBuffer).
    */
-  private handleMessage(line: string): boolean {
+  private handleMessage(ws: WebSocket, line: string, lineBytes: Uint8Array, buffer: Uint8Array): { buffer: Uint8Array; complete: boolean } | null {
     const parts = line.split(" ");
+    if ((parts.length !== 4 && parts.length !== 5) || parts.some((part) => part === "")) {
+      this.forceReconnect(); return null;
+    }
     const hasReplyTo = parts.length === 5;
-    const subject = parts[1] ?? "";
-    const byteCount = parseInt(parts[hasReplyTo ? 4 : 3] ?? "0", 10);
+    const subject = parts[1]!;
+    const lengthToken = parts[hasReplyTo ? 4 : 3]!;
+    if (!/^\d+$/.test(lengthToken)) { this.forceReconnect(); return null; }
+    const byteCount = Number(lengthToken);
+    if (!Number.isSafeInteger(byteCount) || byteCount > MAX_PAYLOAD) { this.forceReconnect(); return null; }
 
-    if (isNaN(byteCount) || byteCount < 0) return true; // malformed header: drop, keep draining
-
-    if (this.buffer.length < byteCount + 2) {
-      this.buffer = `${line}\r\n${this.buffer}`;
-      return false; // need more bytes
+    if (buffer.length < byteCount + 2) {
+      const restored = new Uint8Array(lineBytes.length + 2 + buffer.length);
+      restored.set(lineBytes); restored.set([13, 10], lineBytes.length); restored.set(buffer, lineBytes.length + 2);
+      return { buffer: restored, complete: false };
     }
 
-    const payload = this.buffer.slice(0, byteCount);
-    this.buffer = this.buffer.slice(byteCount + 2);
+    if (buffer[byteCount] !== 13 || buffer[byteCount + 1] !== 10) { this.forceReconnect(); return null; }
+    const payload = new TextDecoder().decode(buffer.slice(0, byteCount));
+    buffer = buffer.slice(byteCount + 2);
 
     // Deliver the raw payload; decryption/parsing happens in WebChannelNatsClient
     // (the envelope must be decrypted before it is meaningful).
-    this.notifyRawListeners(subject, payload);
-    return true;
+    this.notifyRawListeners(subject, payload, () => this.ws === ws);
+    return { buffer, complete: true };
   }
 
   private resubscribeAll(): void {
@@ -715,6 +855,8 @@ export class NatsClient {
     this.terminal = true;
     this.clearReconnectTimer();
     this.stopHeartbeat();
+    // Cancel the active dial's armed deadline before we null its onclose below.
+    if (this.activeDialCleanup) { this.activeDialCleanup(); this.activeDialCleanup = null; }
     this.connected = false;
     if (this.ws) {
       this.ws.onopen = null;
@@ -774,6 +916,8 @@ export class NatsClient {
    */
   private forceReconnect(): void {
     this.stopHeartbeat();
+    // Cancel the active dial's armed deadline before we null its onclose below.
+    if (this.activeDialCleanup) { this.activeDialCleanup(); this.activeDialCleanup = null; }
     this.connected = false;
     if (this.ws) {
       this.ws.onopen = null;
@@ -783,8 +927,8 @@ export class NatsClient {
       try { this.ws.close(); } catch { /* already closing */ }
       this.ws = null;
     }
-    this.notifyStateListeners();
     this.scheduleReconnect();
+    this.notifyStateListeners();
   }
 
   private notifyErrorListeners(err: Error, cause?: WebChannelErrorCause): void {
@@ -797,24 +941,35 @@ export class NatsClient {
     });
   }
 
-  private notifyRawListeners(subject: string, payload: string): void {
-    this.rawListeners.forEach((listener) => {
+  /**
+   * `isCurrent` (drain-loop callers only) is re-checked BEFORE each listener, not
+   * just after the batch: a listener that synchronously retires the dial
+   * (disconnect()/reconnect()) must not have the remaining listeners delivered to
+   * afterwards. Partial fan-out is already the norm here — each listener is
+   * independently try/caught — and an explicit teardown outranks the rest of a
+   * fan-out for a socket that no longer exists.
+   */
+  private notifyRawListeners(subject: string, payload: string, isCurrent?: () => boolean): void {
+    for (const listener of [...this.rawListeners]) {
+      if (isCurrent && !isCurrent()) return;
       try {
         listener(subject, payload);
       } catch (err) {
         console.error("[nats-client] Listener error:", err);
       }
-    });
+    }
   }
 
-  private notifyStateListeners(): void {
-    this.stateListeners.forEach((listener) => {
+  /** See notifyRawListeners for why `isCurrent` is checked before EACH listener. */
+  private notifyStateListeners(isCurrent?: () => boolean): void {
+    for (const listener of [...this.stateListeners]) {
+      if (isCurrent && !isCurrent()) return;
       try {
         listener(this.connected);
       } catch (err) {
         console.error("[nats-client] State listener error:", err);
       }
-    });
+    }
   }
 }
 
@@ -953,6 +1108,7 @@ export class WebChannelNatsClient {
 
   /** Disconnect from NATS and drop the session. */
   disconnect(): void {
+    this.connectionEpoch++;
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
     this.outSub = -1;
     this.resetSession();
@@ -1061,6 +1217,10 @@ export class WebChannelNatsClient {
     const pending = this.pendingInbound;
     this.pendingInbound = [];
     for (const payload of pending) {
+      // A delivered frame's listener can synchronously tear the session down
+      // (disconnect() → resetSession nulls sessionKey). Bail mid-loop rather than
+      // decrypting the rest against a key that no longer belongs to this session.
+      if (!this.sessionKey) return;
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
       if (msg) this.deliverInbound(msg);
     }
@@ -1088,6 +1248,7 @@ export class WebChannelNatsClient {
     // re-checks `this.connectionEpoch === epoch` so a continuation resumed after
     // a drop+reconnect bails instead of clobbering the fresh flow's state.
     const epoch = ++this.connectionEpoch;
+    const connectionGeneration = this.client.currentConnectionGeneration();
     const { registration } = this.options;
 
     // (Re)subscribe idempotently: unsubscribe stale sids so a reconnect never
@@ -1131,11 +1292,11 @@ export class WebChannelNatsClient {
           devicePrivateKey: registration.devicePrivateKey,
         });
       } catch (err) {
-        console.error("[nats-client] PoP registration failed:", err);
         // Epoch guard (mirrors the success path below): a reconnect during the
         // register round-trip may have already spawned a newer onConnected, so a
         // stale flow must not tear down or redial the live connection.
         if (this.connectionEpoch !== epoch) return;
+        console.error("[nats-client] PoP registration failed:", err);
         if (isTerminalRegisterError(err)) {
           // Rejected proof/token or a non-transient server failure — the SAME
           // bootstrap credentials will never be accepted. Terminal: surface the
@@ -1149,8 +1310,7 @@ export class WebChannelNatsClient {
             : err instanceof ProtocolVersionMalformedError ? "protocol-mismatch"
             : err instanceof PopServerError ? "server"
             : "unknown";
-          this.notifyErrorListeners(err as Error, cause);
-          this.client.disconnect();
+          this.failConnectionEpoch(epoch, connectionGeneration, err as Error, cause);
           return;
         }
         // TRANSIENT (B4): request timeout, 503, or agent-offline retry-
@@ -1190,14 +1350,14 @@ export class WebChannelNatsClient {
             `agent-plugin=${agentProtocolVersion}; upgrade the older side`,
         );
         // P1-7: re-auth cannot reconcile incompatible wire versions.
-        this.notifyErrorListeners(err, "protocol-mismatch");
-        this.client.disconnect();
+        this.failConnectionEpoch(epoch, connectionGeneration, err, "protocol-mismatch");
         return;
       }
       this.notifyProtocolListeners({
         protocolVersion: agentProtocolVersion,
         pluginVersion: agentPluginVersion,
       });
+      if (this.connectionEpoch !== epoch) return;
 
       {
         // Register-delivered key: unwrap K with the cnf device private key.
@@ -1212,8 +1372,7 @@ export class WebChannelNatsClient {
           );
           // P1-7: the plugin speaks an incompatible register contract — a
           // capability mismatch, upgrade the older side (re-auth cannot help).
-          this.notifyErrorListeners(err, "protocol-mismatch");
-          this.client.disconnect();
+          this.failConnectionEpoch(epoch, connectionGeneration, err, "protocol-mismatch");
           return;
         }
         // F2 fail-closed: the register-delivered K is authenticated by deriving
@@ -1230,8 +1389,7 @@ export class WebChannelNatsClient {
           // P1-7: NOT "config" — the pin rides the SaaS bootstrap response, so
           // re-auth (which refetches bootstrap) can genuinely deliver it. Hiding
           // the re-auth affordance here would strand a recoverable state.
-          this.notifyErrorListeners(err, "secure-channel-failed");
-          this.client.disconnect();
+          this.failConnectionEpoch(epoch, connectionGeneration, err, "secure-channel-failed");
           return;
         }
         let key: Uint8Array;
@@ -1243,23 +1401,47 @@ export class WebChannelNatsClient {
             peerId,
           );
         } catch (err) {
+          if (this.connectionEpoch !== epoch) return;
           console.error("[nats-client] conversation-key unwrap failed:", err);
           // P1-7: the E2E session could not be established (bad/tampered key or a
           // stale pin) — re-auth to retry with fresh keys.
-          this.notifyErrorListeners(err as Error, "secure-channel-failed");
-          this.client.disconnect();
+          this.failConnectionEpoch(epoch, connectionGeneration, err as Error, "secure-channel-failed");
           return;
         }
         if (this.connectionEpoch !== epoch) return;
         this.sessionKey = key;
+        // drainPendingInbound() synchronously invokes message listeners; one that
+        // calls disconnect()+connect() advances the epoch under us. Re-check before
+        // flushing/notifying so a stale flow never publishes on — or fires a false
+        // "session established" for — a connection generation that is no longer
+        // current (session listeners gate P1-9 unsend-hold release).
         this.drainPendingInbound();
+        if (this.connectionEpoch !== epoch) return;
         this.flushQueue();
+        if (this.connectionEpoch !== epoch) return;
         // P1-9: notify AFTER flushQueue so a released hold is ordered behind the
         // P0-7b ledger replay (drain → flush → notify; see onSession).
         this.notifySessionListeners();
         return;
       }
     }
+  }
+
+  /** Guard terminal handling across both stale async flows and sync listener re-entry. */
+  private failConnectionEpoch(
+    epoch: number, connectionGeneration: number, err: Error, cause: WebChannelErrorCause,
+  ): void {
+    if (this.connectionEpoch !== epoch) return;
+    // Retire the failed generation BEFORE invoking embedder code. An error
+    // listener may synchronously call connect() after the failed socket has
+    // already closed; that creates a replacement dial whose onConnected() has
+    // not run yet, so it cannot advance the epoch for itself. Keeping `epoch`
+    // current through notification would let this old terminal continuation's
+    // post-listener guard pass and disconnect that replacement socket.
+    const retiredEpoch = ++this.connectionEpoch;
+    this.notifyErrorListeners(err, cause);
+    if (this.connectionEpoch !== retiredEpoch) return;
+    this.client.disconnectConnectionGeneration(connectionGeneration);
   }
 
   private async handleRaw(subject: string, payload: string): Promise<void> {

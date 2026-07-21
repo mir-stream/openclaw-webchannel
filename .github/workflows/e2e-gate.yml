@@ -2,7 +2,7 @@
 # e2e-gate.yml — Single blocking CI gate for openclaw-webchannel Phase B.
 #
 # Enforces:
-#  - All pre-existing test suites stay green (≥1398 test baseline across 3 pkgs)
+#  - All pre-existing test suites stay green (≥1465 test baseline across 3 pkgs)
 #  - 3-package typecheck passes clean
 #  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
 #  - The register-hop (enrolled-JWT) admission path is covered end-to-end
@@ -162,7 +162,7 @@ jobs:
 
       # ──────────────────────────────────────────────────────────────────────
       # 6. Run all test suites with JSON output for baseline verification
-      #    - Baseline: ≥1398 tests across all packages
+      #    - Baseline: ≥1465 tests across all packages
       #    - Real-server suites (skipIf removed in CI) now run against the
       #      real nats-server binary installed in step 3.
       #    - Sub-AC 1: e2e/dev-nats-roundtrip.test.ts — open-NATS E2E gate
@@ -177,16 +177,16 @@ jobs:
           CI: "true"
 
       # ──────────────────────────────────────────────────────────────────────
-      # 7. Verify test count meets baseline (≥1398 tests passed)
+      # 7. Verify test count meets baseline (≥1465 tests passed)
       #    Fails the gate if the count regresses below the seed-time baseline.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Verify test baseline (≥1398 tests)
+      - name: Verify test baseline (≥1465 tests)
         if: always()
         run: |
           set -euo pipefail
           node - << 'EOF'
           const fs = require('fs');
-          const BASELINE = 1398;
+          const BASELINE = 1465;
           let data;
           try {
             data = JSON.parse(fs.readFileSync('/tmp/vitest-results.json', 'utf8'));
