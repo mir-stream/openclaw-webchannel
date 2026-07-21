@@ -667,9 +667,25 @@ export class WebChannelNATSClient {
   // State management
   // ---------------------------------------------------------------------------
 
+  /**
+   * P0-4: the try/catch is load-bearing, not defensive politeness. Under the D4
+   * commit order the actual `sendUserMessage` runs AFTER the bubble is rendered
+   * (`publish()`, and per-entry inside the `maybeRelease()` drain loop), so an
+   * embedder listener that throws here would abort the caller BEFORE the frame
+   * is ever published — leaving the receipt stuck at `queued` forever (the exact
+   * invariant P0-4 exists to forbid), leaking the reserved wireId + its alias,
+   * and in the release case stranding every remaining `held[]` entry behind the
+   * aborted `while` loop. An embedder's render bug must never cost a send.
+   */
   private setState(patch: Partial<WebChannelState>): void {
     this.state = { ...this.state, ...patch };
-    for (const listener of this.listeners) listener(this.state);
+    for (const listener of this.listeners) {
+      try {
+        listener(this.state);
+      } catch (e) {
+        console.error("[nats-wrapper] state listener threw:", e);
+      }
+    }
   }
 
   private appendMessage(message: ChatMessage): void {

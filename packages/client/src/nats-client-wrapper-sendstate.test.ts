@@ -379,6 +379,67 @@ describe("WebChannelNATSClient — P0-4 held/terminal ownership (T-cl, T-re)", (
 });
 
 // ---------------------------------------------------------------------------
+// T-lg: a throwing embedder state listener must never cost a send. Under the D4
+// commit order sendUserMessage runs AFTER the bubble is rendered, so an unguarded
+// setState notify loop would abort publish() / the maybeRelease() drain and strand
+// the receipt at `queued` forever.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — P0-4 state-listener fault isolation (T-lg)", () => {
+  let errSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => { errSpy = vi.spyOn(console, "error").mockImplementation(() => {}); });
+  afterEach(() => errSpy.mockRestore());
+
+  // T-lg(a): publish() path — the throw is swallowed, the frame still goes out,
+  // and the receipt leaves `queued`.
+  it("T-lg(a): a throwing state listener does not abort publish; the send still reaches a terminal-bound state", async () => {
+    const h = await connectWrapper();
+    h.wrapper.subscribe(() => { throw new Error("embedder render bug"); });
+
+    let receipt: ReturnType<WebChannelNATSClient["send"]>;
+    expect(() => { receipt = h.wrapper.send("guarded"); }).not.toThrow();
+    await settle();
+
+    const wireId = userBubble(h.wrapper, "guarded")?.wireId;
+    expect(wireId).toBeDefined();
+    expect(h.received).toContain(wireId); // the frame really was published
+    expect(receipt!.snapshot().state).not.toBe("queued");
+    expect(receipt!.snapshot().state).toBe("accepted"); // auto-acked by the fake
+    expect(errSpy).toHaveBeenCalled();
+    h.wrapper.close();
+  });
+
+  // T-lg(b): maybeRelease() path — the drain loop must survive a mid-loop throw,
+  // so the SECOND held entry behind the first is released too (an unguarded loop
+  // aborts after the first shift(), stranding the rest of held[] forever).
+  it("T-lg(b): a throwing state listener does not abort the held drain; every held entry releases", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, { type: "typing" }); // turn in flight → both sends hold
+    await settle();
+    const r1 = h.wrapper.send("held-1")!;
+    const r2 = h.wrapper.send("held-2")!;
+    expect(r1.snapshot().state).toBe("queued");
+    expect(r2.snapshot().state).toBe("queued");
+
+    h.wrapper.subscribe(() => { throw new Error("embedder render bug"); });
+
+    const before = h.received.length;
+    deliverOut(h.K, { type: "turn_settled", turnId: "T" }); // → release drain
+    await settle();
+
+    expect(h.received.length).toBe(before + 2); // BOTH published, loop not aborted
+    for (const text of ["held-1", "held-2"]) {
+      const m = userBubble(h.wrapper, text)!;
+      expect(m.wireId).toBeDefined();
+      expect(h.received).toContain(m.wireId);
+    }
+    expect(r1.snapshot().state).not.toBe("queued");
+    expect(r2.snapshot().state).not.toBe("queued");
+    expect((h.wrapper as unknown as { held: unknown[] }).held).toHaveLength(0);
+    h.wrapper.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // P0-4 (R3): a CL2 terminal instance is PERMANENTLY retired — a registration-path
 // terminal (only the WCNC latch set; the raw transport is NOT terminal) must not
 // let a later public connect() flip the sticky "error" to "connected" while every
