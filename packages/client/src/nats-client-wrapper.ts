@@ -113,6 +113,12 @@ export class WebChannelNATSClient {
    * `localId` is the id of its `pending: true` transcript bubble.
    */
   private readonly held: Array<{ localId: string; text: string; receiptKey: string }> = [];
+  /**
+   * Explicit `/stop` is a small commit transaction. Ordinary sends created by
+   * cancellation/finalization callbacks stay held until the outermost stop has
+   * owned its low-level queue position; nested stops share the same transaction.
+   */
+  private stopCommitDepth = 0;
 
   /**
    * P0-4: receipt records keyed by the immutable `receiptKey`, and the
@@ -391,15 +397,28 @@ export class WebChannelNATSClient {
     // explicit command clears the buffer).
     if (isLikelyAbortText(trimmed)) {
       if (isExplicitStop(trimmed)) {
-        this.markHeldRetracted();
-        // §3.4: /stop means "stop everything". Also locally finalize the live
-        // turn-in-flight state (working drafts AND the typing indicator) so the
-        // composer unwedges even when a turn dies WITHOUT a disconnect (agent
-        // dies with the socket alive) — the staleness valve only arms on
-        // reconnect, so without this /stop cannot rescue a socket-alive wedge.
-        // Covers both a working-draft hang and a pre-first-token typing-only
-        // hang. NL abort words do NOT call this.
-        this.finalizeLocalTurnState();
+        this.stopCommitDepth++;
+        let stopCommitted = false;
+        try {
+          this.markHeldRetracted();
+          // §3.4: /stop means "stop everything". Also locally finalize the live
+          // turn-in-flight state (working drafts AND the typing indicator) so the
+          // composer unwedges even when a turn dies WITHOUT a disconnect (agent
+          // dies with the socket alive) — the staleness valve only arms on
+          // reconnect, so without this /stop cannot rescue a socket-alive wedge.
+          // Covers both a working-draft hang and a pre-first-token typing-only
+          // hang. NL abort words do NOT call this.
+          this.finalizeLocalTurnState();
+          const receipt = this.publish(trimmed);
+          stopCommitted = true;
+          return receipt;
+        } finally {
+          this.stopCommitDepth--;
+          // A failed outer publish must not release replacements ahead of a stop
+          // that never committed. A nested stop never drains while its outer
+          // transaction is still active.
+          if (this.stopCommitDepth === 0 && stopCommitted) this.maybeRelease();
+        }
       }
       // Control-lane text is a real published user message → a normal receipt.
       return this.publish(trimmed);
@@ -507,6 +526,9 @@ export class WebChannelNATSClient {
     // only on onSession, which a closed instance never fires, so a hold here is a
     // permanent `queued`. Publish instead → immediate failed{closed}.
     if (this.closed) return false;
+    // Ordinary callback-created sends cannot publish during an explicit-stop
+    // transaction. They release only after the outer stop owns its queue slot.
+    if (this.stopCommitDepth > 0) return true;
     return this.turnInFlight() || this.held.length > 0;
   }
 
@@ -541,6 +563,7 @@ export class WebChannelNATSClient {
    */
   private maybeRelease(): void {
     if (
+      this.stopCommitDepth > 0 ||
       this.held.length === 0 ||
       this.turnInFlight() ||
       !this.state.connected ||

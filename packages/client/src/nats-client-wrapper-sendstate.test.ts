@@ -377,6 +377,106 @@ describe("WebChannelNATSClient — synchronous callback outbound FIFO", () => {
   });
 });
 
+describe("WebChannelNATSClient — explicit /stop reentrant replacement ordering", () => {
+  it("commits /stop before releasing B from a held-receipt cancellation callback", async () => {
+    const h = await connectWrapper({ ack: false });
+    deliverOut(h.K, { type: "typing" });
+    await settle();
+
+    const heldReceipt = h.wrapper.send("stop-held-H")!;
+    let cancellationCallbacks = 0;
+    let replacementReceipt: SendReceipt | undefined;
+    let replacementSnapshotInside: ChatMessage["sendState"];
+    heldReceipt.subscribe((event) => {
+      if (event.failure?.reason !== "cancelled") return;
+      cancellationCallbacks++;
+      replacementReceipt = h.wrapper.send("stop-callback-B")!;
+      replacementSnapshotInside = replacementReceipt.snapshot().state;
+    });
+
+    const stopReceipt = h.wrapper.send("/stop")!;
+    await settle();
+
+    const stopBubble = userBubble(h.wrapper, "/stop")!;
+    const replacementBubble = userBubble(h.wrapper, "stop-callback-B")!;
+    const oldBubble = userBubble(h.wrapper, "stop-held-H")!;
+    expect(cancellationCallbacks).toBe(1);
+    expect(replacementSnapshotInside).toBe("queued");
+    expect(h.received).toEqual([stopBubble.wireId, replacementBubble.wireId]);
+    expect(h.wrapper.getState().messages.filter((m) => m.role === "user").map((m) => m.text)).toEqual([
+      "stop-held-H",
+      "/stop",
+      "stop-callback-B",
+    ]);
+    expect(stopReceipt.snapshot().state).toBe("sent");
+    expect(replacementReceipt!.snapshot().state).toBe("sent");
+    expect(replacementBubble).toMatchObject({ pending: false, sendState: "sent" });
+    expect(replacementBubble.wireId).toBeDefined();
+    expect((h.wrapper as unknown as { held: unknown[] }).held).toHaveLength(0);
+    expect(heldReceipt.snapshot()).toMatchObject({
+      state: "failed",
+      failure: { reason: "cancelled", retryable: false },
+    });
+    expect(oldBubble).toMatchObject({
+      pending: false,
+      retracted: true,
+      sendState: "failed",
+      sendFailure: { reason: "cancelled", retryable: false },
+    });
+    h.wrapper.close();
+  });
+
+  it("commits /stop before releasing C from its local-finalization state callback", async () => {
+    const h = await connectWrapper({ ack: false });
+    deliverOut(h.K, { type: "typing" });
+    await settle();
+
+    const heldReceipt = h.wrapper.send("finalize-held-H")!;
+    let injected = false;
+    let replacementReceipt: SendReceipt | undefined;
+    let replacementSnapshotInside: ChatMessage["sendState"];
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      const oldBubble = state.messages.find((m) => m.text === "finalize-held-H");
+      if (injected || state.isTyping !== false || oldBubble?.retracted !== true) return;
+      injected = true;
+      replacementReceipt = h.wrapper.send("finalize-state-C")!;
+      replacementSnapshotInside = replacementReceipt.snapshot().state;
+    });
+
+    const stopReceipt = h.wrapper.send("/stop")!;
+    await settle();
+
+    const stopBubble = userBubble(h.wrapper, "/stop")!;
+    const replacementBubble = userBubble(h.wrapper, "finalize-state-C")!;
+    const oldBubble = userBubble(h.wrapper, "finalize-held-H")!;
+    expect(injected).toBe(true);
+    expect(replacementSnapshotInside).toBe("queued");
+    expect(h.received).toEqual([stopBubble.wireId, replacementBubble.wireId]);
+    expect(h.wrapper.getState().messages.filter((m) => m.role === "user").map((m) => m.text)).toEqual([
+      "finalize-held-H",
+      "/stop",
+      "finalize-state-C",
+    ]);
+    expect(stopReceipt.snapshot().state).toBe("sent");
+    expect(replacementReceipt!.snapshot().state).toBe("sent");
+    expect(replacementBubble).toMatchObject({ pending: false, sendState: "sent" });
+    expect(replacementBubble.wireId).toBeDefined();
+    expect((h.wrapper as unknown as { held: unknown[] }).held).toHaveLength(0);
+    expect(heldReceipt.snapshot()).toMatchObject({
+      state: "failed",
+      failure: { reason: "cancelled", retryable: false },
+    });
+    expect(oldBubble).toMatchObject({
+      pending: false,
+      retracted: true,
+      sendState: "failed",
+      sendFailure: { reason: "cancelled", retryable: false },
+    });
+    unsubscribe();
+    h.wrapper.close();
+  });
+});
+
 describe("WebChannelNATSClient — P0-4 receipt handle (T-rc)", () => {
   type Snap = { state: ChatMessage["sendState"]; failure?: SendFailure };
 
