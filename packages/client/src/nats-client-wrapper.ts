@@ -40,6 +40,8 @@ import {
  */
 type ReceiptRecord = {
   id: string;
+  /** Assigned at immediate publish or held release; absent while still held. */
+  wireId?: string;
   state: NonNullable<ChatMessage["sendState"]>;
   failure?: SendFailure;
   // P0-4 (review R5): mirrors `SendReceipt.snapshot()` — a concrete, non-optional
@@ -468,6 +470,7 @@ export class WebChannelNATSClient {
     this.wireIdToReceiptKey.set(wireId, receiptKey);
     this.receipts.set(receiptKey, {
       id: receiptKey,
+      wireId,
       state: "queued",
       subscribers: new Set(),
       pendingTransitions: [],
@@ -551,6 +554,8 @@ export class WebChannelNATSClient {
       // at the tail, THEN let the low level own/publish A before exposing that move.
       const wireId = this.client.reserveWireId();
       this.wireIdToReceiptKey.set(wireId, receiptKey);
+      const receipt = this.receipts.get(receiptKey);
+      if (receipt) receipt.wireId = wireId;
       const bubble = this.state.messages.find((m) => m.id === localId);
       // A re-entrant listener may have already removed the bubble; the text is
       // still published (correct — release is a commit), so just skip the patch.
@@ -859,13 +864,7 @@ export class WebChannelNATSClient {
   private makeReceipt(receiptKey: string): SendReceipt {
     return {
       id: receiptKey,
-      snapshot: () => {
-        const rec = this.receipts.get(receiptKey);
-        // A record always exists for a receipt we handed out; the fallback keeps
-        // the type total. `failed` would only surface if a record were ever
-        // dropped, which never happens (records are never deleted).
-        return rec ? { state: rec.state, failure: rec.failure } : { state: "failed" as const };
-      },
+      snapshot: () => this.receiptSnapshot(receiptKey),
       subscribe: (cb) => {
         const rec = this.receipts.get(receiptKey);
         if (!rec) return () => {};
@@ -873,6 +872,46 @@ export class WebChannelNATSClient {
         return () => { rec.subscribers.delete(cb); };
       },
     };
+  }
+
+  /**
+   * Read the wrapper projection unless the low tracker has already reached a
+   * later state whose callback is merely waiting in the global FIFO drain. This
+   * is a read-only overlay: bubbles and receipt subscribers still transition
+   * through `receiptTransition` in serialized event order.
+   *
+   * While this receipt's own transition is fanning out, its record remains the
+   * snapshot authority so every subscriber sees the event it was passed. The
+   * wrapper-only terminal outcomes (`completed` and `failed`, including
+   * `turn-failed`) likewise outrank the low tracker's accepted/sent projection.
+   * A held receipt has no wire id and therefore remains queued.
+   */
+  private receiptSnapshot(receiptKey: string): ReturnType<SendReceipt["snapshot"]> {
+    const rec = this.receipts.get(receiptKey);
+    // A record always exists for a receipt we handed out; the fallback keeps the
+    // type total. Records are intentionally retained across adoption/retraction.
+    if (!rec) return { state: "failed" };
+
+    const wrapperState = rec.state;
+    const wrapperSnapshot = { state: wrapperState, failure: rec.failure };
+    if (
+      rec.drainingTransitions ||
+      wrapperState === "failed" ||
+      wrapperState === "completed" ||
+      !rec.wireId
+    ) {
+      return wrapperSnapshot;
+    }
+
+    const tracked = this.client.getSendStateSnapshot(rec.wireId);
+    if (!tracked) return wrapperSnapshot;
+    if (
+      tracked.state === "failed" ||
+      WebChannelNATSClient.RECEIPT_RANK[tracked.state] > WebChannelNATSClient.RECEIPT_RANK[wrapperState]
+    ) {
+      return tracked;
+    }
+    return wrapperSnapshot;
   }
 
   /** Monotonic receipt guard (wrapper-level, incl. `completed`): queued<sent<accepted<completed; failed/completed terminal. */

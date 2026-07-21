@@ -21,7 +21,7 @@ import {
   type AgentIdentity,
   type ServerHandler,
 } from "./nats-client-wrapped.test-harness.js";
-import type { ChatMessage, SendFailure } from "./types.js";
+import type { ChatMessage, SendFailure, SendReceipt } from "./types.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
@@ -242,10 +242,12 @@ describe("WebChannelNATSClient — synchronous callback outbound FIFO", () => {
     const h = await connectWrapper({ ack: false });
     let injected = false;
     let secondReceipt: ReturnType<WebChannelNATSClient["send"]>;
+    let secondSnapshotInside: ChatMessage["sendState"];
     const unsubscribe = h.wrapper.subscribe((state) => {
       if (injected || !state.messages.some((m) => m.role === "user" && m.text === "immediate-A")) return;
       injected = true;
       secondReceipt = h.wrapper.send("immediate-B");
+      secondSnapshotInside = secondReceipt!.snapshot().state;
     });
 
     const firstReceipt = h.wrapper.send("immediate-A")!;
@@ -254,6 +256,9 @@ describe("WebChannelNATSClient — synchronous callback outbound FIFO", () => {
     expect(userMessages.map((m) => m.text)).toEqual(["immediate-A", "immediate-B"]);
     expect(h.received.slice(-2)).toEqual(userMessages.map((m) => m.wireId));
     expect(firstReceipt.snapshot().state).toBe("sent");
+    // B's low tracker reached sent inside A's queued callback; B's serialized
+    // sent event has not fanned out yet, but its synchronous snapshot is current.
+    expect(secondSnapshotInside).toBe("sent");
     expect(secondReceipt!.snapshot().state).toBe("sent");
 
     unsubscribe();
@@ -288,6 +293,87 @@ describe("WebChannelNATSClient — synchronous callback outbound FIFO", () => {
 
     unsubscribe();
     h.wrapper.close();
+  });
+
+  it("reports nested post-close B as failed before its serialized callbacks drain", async () => {
+    const h = await connectWrapper({ ack: false });
+    const bubbleStates = trackBubble(h.wrapper, "post-close-B");
+    const receiptEvents: Array<{ event: ChatMessage["sendState"]; snapshot: ChatMessage["sendState"] }> = [];
+    let injected = false;
+    let nestedReceipt: SendReceipt | undefined;
+    let snapshotInside: ReturnType<SendReceipt["snapshot"]> | undefined;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      const trigger = state.messages.find((m) => m.text === "close-trigger-A");
+      if (injected || trigger?.sendState !== "queued") return;
+      injected = true;
+      h.wrapper.close();
+      nestedReceipt = h.wrapper.send("post-close-B")!;
+      nestedReceipt.subscribe((event) => {
+        receiptEvents.push({ event: event.state, snapshot: nestedReceipt!.snapshot().state });
+      });
+      // B's queued/failed callbacks are FIFO-deferred behind A's current queued
+      // fanout, but the low tracker has already synchronously reached failed.
+      snapshotInside = nestedReceipt.snapshot();
+    });
+
+    const triggerReceipt = h.wrapper.send("close-trigger-A")!;
+    await settle();
+
+    expect(injected).toBe(true);
+    expect(snapshotInside).toMatchObject({
+      state: "failed",
+      failure: { reason: "closed", retryable: false },
+    });
+    expect(triggerReceipt.snapshot()).toMatchObject({ state: "failed", failure: { reason: "closed" } });
+    expect(nestedReceipt!.snapshot()).toEqual(snapshotInside);
+    expect(bubbleStates).toEqual(["queued", "failed"]);
+    expect(receiptEvents).toEqual([{ event: "failed", snapshot: "failed" }]);
+    expect(userBubble(h.wrapper, "post-close-B")).toMatchObject({
+      sendState: "failed",
+      sendFailure: { reason: "closed", retryable: false },
+    });
+    unsubscribe();
+  });
+
+  it("reports nested post-terminal B as failed before its serialized callbacks drain", async () => {
+    const h = await connectWrapper({ ack: false });
+    const bubbleStates = trackBubble(h.wrapper, "post-terminal-B");
+    const receiptEvents: Array<{ event: ChatMessage["sendState"]; snapshot: ChatMessage["sendState"] }> = [];
+    let injected = false;
+    let nestedReceipt: SendReceipt | undefined;
+    let snapshotInside: ReturnType<SendReceipt["snapshot"]> | undefined;
+    const unsubscribe = h.wrapper.subscribe((state) => {
+      const trigger = state.messages.find((m) => m.text === "terminal-trigger-A");
+      if (injected || trigger?.sendState !== "sent") return;
+      injected = true;
+      FakeNatsWS.instances.at(-1)!.onmessage?.({ data: "-ERR 'Authorization Violation'\r\n" });
+      nestedReceipt = h.wrapper.send("post-terminal-B")!;
+      nestedReceipt.subscribe((event) => {
+        receiptEvents.push({ event: event.state, snapshot: nestedReceipt!.snapshot().state });
+      });
+      // The terminal latch and low tracker have advanced even though B's public
+      // queued/failed events must wait for A's current fanout to finish.
+      snapshotInside = nestedReceipt.snapshot();
+    });
+
+    const triggerReceipt = h.wrapper.send("terminal-trigger-A")!;
+    await settle();
+
+    expect(injected).toBe(true);
+    expect(snapshotInside).toMatchObject({
+      state: "failed",
+      failure: { reason: "terminal", cause: "auth-rejected", retryable: false },
+    });
+    expect(triggerReceipt.snapshot()).toMatchObject({ state: "failed", failure: { reason: "terminal" } });
+    expect(nestedReceipt!.snapshot()).toEqual(snapshotInside);
+    expect(bubbleStates).toEqual(["queued", "failed"]);
+    expect(receiptEvents).toEqual([{ event: "failed", snapshot: "failed" }]);
+    expect(userBubble(h.wrapper, "post-terminal-B")).toMatchObject({
+      sendState: "failed",
+      sendFailure: { reason: "terminal", cause: "auth-rejected", retryable: false },
+    });
+    expect(h.wrapper.getState().status).toBe("error");
+    unsubscribe();
   });
 });
 

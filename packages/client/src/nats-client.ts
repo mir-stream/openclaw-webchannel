@@ -1425,6 +1425,22 @@ export class WebChannelNatsClient {
   }
 
   /**
+   * Read the already-mutated authoritative tracker without affecting serialized
+   * callback delivery. A higher-level receipt can therefore report a transition
+   * that has synchronously happened even when its `onSendState` event is queued
+   * behind an older event's fanout. Return copies so callers cannot mutate the
+   * tracker through this package-internal seam. @internal
+   */
+  getSendStateSnapshot(id: string): { state: SendState; failure?: SendFailure } | undefined {
+    const entry = this.sendTracker.get(id);
+    if (!entry) return undefined;
+    return {
+      state: entry.state,
+      failure: entry.failure ? { ...entry.failure } : undefined,
+    };
+  }
+
+  /**
    * P0-4 (R5-1/R6-1): mint a unique wire id and RESERVE it, one-shot. The wrapper
    * calls this BEFORE creating the bubble/receipt so a `sendUserMessage(text, id)`
    * lands its synchronous `queued`/immediate-`failed` transition on an
