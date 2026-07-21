@@ -32,7 +32,7 @@ The plugin, client, and SaaS packages must be released together at version `0.3.
   `MemoryEnrollmentRepository`; adapters must implement the repository-authoritative
   asynchronous `now()` clock accessor.
 - **Breaking:** `ApproveOutcome` adds `in_progress`; operator HTTP adapters map
-  it to `409 approval_in_progress`. A cross-instance deny may now terminate an
-  approving lease; same-instance deny remains queued by the process-local lock.
+  it to `409 approval_in_progress`. Deny may now terminate an approving lease,
+  preempting an approve still in flight on the same instance.
 - Polling an approved record after `expiresAt` returns its credentials during
   retention instead of overwriting approval with expiry.

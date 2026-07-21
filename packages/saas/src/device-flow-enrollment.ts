@@ -438,8 +438,8 @@ export class DeviceFlowEnrollment {
    * The process-local per-userCode lock only avoids duplicate work; correctness
    * comes from repository-clock lease fencing and the atomic commit. Approved
    * results remain recoverable after expiresAt for the configured retention
-   * horizon. A different issuer instance may deny an approving record and
-   * invalidate its claim; this instance's process-local lock queues deny calls.
+   * horizon. An operator may deny an approving record, invalidating its claim so
+   * a late commit is fenced (deny does not join this lock — see `deny()`).
    *
    * Transition rules: pending→approving→approved, with approved idempotently
    * returning the persisted result; denied and expired remain terminal.
@@ -449,11 +449,19 @@ export class DeviceFlowEnrollment {
   }
 
   /**
-   * #22: run `fn` as the sole holder of `userCode`'s critical section, serialized
-   * against every other approve/deny on the same userCode. The work is chained
-   * onto the userCode's running tail so it starts only after the prior holder
-   * fully settles (success OR failure), and the whole read→write span — including
-   * approve's async NATS mint — is protected.
+   * Approve-only double-submit guard: run `fn` as the sole holder of
+   * `userCode`'s critical section, serialized against every OTHER approve on the
+   * same userCode. Only `approve()` uses this lock; `deny()` deliberately does
+   * not (it must be able to preempt an in-flight approve — see `deny()`). Its
+   * sole remaining job is de-duplicating concurrent approves so a double-click or
+   * retry does not race a second NATS mint. It is a UX/latency optimization, NOT
+   * a correctness mechanism: correctness — including deny preempting an approving
+   * record — comes entirely from the repository's atomic claim/commit/tryDeny
+   * fencing, not from this queue.
+   *
+   * The work is chained onto the userCode's running tail so it starts only after
+   * the prior holder fully settles (success OR failure), and the whole read→write
+   * span — including approve's async NATS mint — is protected.
    *
    * The stored tail node swallows `fn`'s outcome, so a thrown mint/store error
    * propagates to THIS caller (via the returned promise) yet never wedges the
@@ -571,13 +579,17 @@ export class DeviceFlowEnrollment {
    * false, no state change. An expired record is marked `expired` (matching
    * `poll()`), and any other terminal status (including already `denied`)
    * returns false without change.
+   *
+   * Deny deliberately BYPASSES approve's per-userCode lock (`withUserCodeLock`).
+   * It must be able to preempt an approve that is still in flight on this same
+   * instance — an operator who clicks Approve then Deny needs the Deny to land
+   * while the async NATS mint is running, not queue behind it. `tryDeny` is an
+   * atomic repository transition to `denied` that deletes the claim, so a late
+   * `commitApproval` from the in-flight approve is fenced (`claim_lost` →
+   * rejected) with no minted identity ever activated. No orchestrator-side
+   * serialization is needed; the repository supplies all the fencing.
    */
   async deny(userCode: string): Promise<boolean> {
-    // Advisory only: cross-replica safety is supplied by repository fencing.
-    return this.withUserCodeLock(userCode, () => this.denyInner(userCode));
-  }
-
-  private async denyInner(userCode: string): Promise<boolean> {
     return this.repository.tryDeny(userCode);
   }
 

@@ -706,11 +706,15 @@ describe("DeviceFlowEnrollment", () => {
     });
   });
 
-  // #22: approve() and deny() are check-then-act with a real async gap (approve
-  // awaits the NATS mint between its read and write). They must be serialized
-  // JOINTLY per userCode so a concurrent approve+deny cannot interleave and have
-  // one silently overwrite the other's terminal write. The #11 status guards
-  // alone can't close this — both sides read `pending` before either writes.
+  // approve() and deny() are check-then-act with a real async gap (approve awaits
+  // the NATS mint between its read and write). They are NOT jointly serialized:
+  // approve holds a per-userCode lock only to de-dup concurrent approves, and
+  // deny intentionally BYPASSES that lock so it can preempt an approve still in
+  // flight on the same instance. Correctness comes from repository fencing — the
+  // atomic claim/commit/tryDeny transitions — not from any orchestrator queue: a
+  // deny flips the record to `denied` and deletes the claim, so the in-flight
+  // approve's late commit is fenced (`claim_lost` → rejected) with no identity
+  // ever activated.
   describe("MemoryEnrollmentRepository", () => {
     const makePending = (overrides: Partial<PendingEnrollment> = {}): PendingEnrollment => ({
       device_code: "test-device-code",
@@ -983,6 +987,38 @@ describe("P1-2 shared-repository integration", () => {
     expect(await repository.listHistory(validEnrollmentRequest.tenant, validEnrollmentRequest.accountId)).toHaveLength(1);
   });
 
+  it("same-instance deny preempts an approve still in flight (no joint lock)", async () => {
+    // The regression guard for the deny-lock fix: on a SINGLE instance, a deny
+    // issued while approve is mid-mint must land immediately (not queue behind
+    // the lock) and preempt the approve. If deny is routed back through
+    // withUserCodeLock it would queue behind the in-flight approve, see a
+    // terminal `approved` record, and return false — the operator's Deny would
+    // be silently lost. This must fail against that (pre-fix) code.
+    const repository = new MemoryEnrollmentRepository({ autoSweep: false });
+    const service = createEnrollment(repository);
+    const request = await service.enroll(validEnrollmentRequest);
+
+    let releaseMint!: () => void;
+    const mintPaused = new Promise<void>((resolve) => { releaseMint = resolve; });
+    const originalMint = (service as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials.bind(service);
+    (service as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials = async (e) => { await mintPaused; return originalMint(e); };
+
+    // Approve is in flight, paused inside the NATS mint with the claim held.
+    const approving = service.approve(request.user_code);
+    await vi.waitFor(async () => expect((await repository.getEnrollment(request.device_code))?.status).toBe("approving"));
+
+    // Deny on the SAME instance must land while approve is still awaiting the
+    // mint — it does not queue behind approve's lock.
+    expect(await service.deny(request.user_code)).toBe(true);
+    expect((await repository.getEnrollment(request.device_code))?.status).toBe("denied");
+
+    // Release the mint: the late commit is fenced by the deleted claim.
+    releaseMint();
+    expect(await approving).toEqual({ kind: "rejected" });
+    expect((await repository.getEnrollment(request.device_code))?.status).toBe("denied");
+    expect(await repository.listHistory(validEnrollmentRequest.tenant, validEnrollmentRequest.accountId)).toEqual([]);
+  });
+
   it("12/18: approve-then-deny fences the late commit; deny-then-approve stays denied", async () => {
     const repository = new MemoryEnrollmentRepository({ autoSweep: false });
     const approver = createEnrollment(repository);
@@ -1063,7 +1099,7 @@ describe("P1-2 shared-repository integration", () => {
     }
   });
 
-  it("ported concurrent approve+approve: the public joint lock coalesces onto one identity", async () => {
+  it("ported concurrent approve+approve: the public approve lock coalesces onto one identity", async () => {
     const repository = new MemoryEnrollmentRepository({ autoSweep: false });
     const service = createEnrollment(repository);
     const request = await service.enroll(validEnrollmentRequest);

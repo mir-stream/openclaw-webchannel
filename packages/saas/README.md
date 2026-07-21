@@ -112,11 +112,9 @@ State: `pending → approving → approved`, with `pending|approving → denied`
 and eligible non-terminal records → `expired`. Approval claims carry leases;
 the repository clock is authoritative for issuance timestamps, leases, expiry, and retention. The
 process-local approval lock is advisory only: adapters must atomically fence
-claims and commit the enrollment, active key, and history together. In
-multi-replica or cross-instance operation, denying an `approving` record
-invalidates its claim, so a late commit cannot reverse the operator decision.
-Within one `DeviceFlowEnrollment` instance, the process-local lock queues deny
-behind an in-flight approve. Approved records are not expired by polling and remain
+claims and commit the enrollment, active key, and history together. Denying an
+`approving` record invalidates its claim, so a late commit cannot reverse the
+operator decision. Approved records are not expired by polling and remain
 available through `approvedAt + retentionMs` (equality retained) for boundary
 poll grace and idempotent commit recovery.
 
