@@ -235,4 +235,36 @@ describe("P1-3 browser transport invariants", () => {
     expect(ws.closed).toBe(true); expect(vi.getTimerCount()).toBe(1);
     c.disconnect();
   });
+
+  // Regression: the no-creds path must arm the "first PONG" deadline BEFORE
+  // sendConnect(). A WebSocket whose send() answers our PING with a PONG in the
+  // SAME synchronous tick establishes the connection and clears the deadline
+  // inside sendConnect; if the deadline were armed AFTER (the pre-fix order) a
+  // fresh timer would be stranded and force-reconnect the healthy link ~10s later.
+  it("does not strand a first-PONG deadline when the server answers PONG in-tick", () => {
+    vi.useFakeTimers();
+    class SyncPongWS extends FakeWS {
+      send(data: string): void {
+        super.send(data);
+        // Answer PING synchronously, before ws.open()'s onopen handler returns.
+        if (data === "PING\r\n") this.frame("PONG\r\n");
+      }
+    }
+    (globalThis as any).WebSocket = SyncPongWS;
+    const states: boolean[] = [];
+    const c = make({ connectTimeoutMs: 10_000, reconnectBaseMs: 100 });
+    c.onState((v) => states.push(v));
+    c.connect(); const ws = FakeWS.instances[0]!; ws.open();
+    // Established in-tick, and the arm-then-send order let the sync PONG clear
+    // the deadline: no timer survives.
+    expect(states).toEqual([true]);
+    expect(vi.getTimerCount()).toBe(0);
+    // Prove it behaviorally: a stranded deadline would fire here and tear down
+    // the healthy socket, spawning a reconnect dial.
+    vi.advanceTimersByTime(30_000);
+    expect(ws.closed).toBe(false);
+    expect(FakeWS.instances).toHaveLength(1);
+    expect(states).toEqual([true]);
+    c.disconnect();
+  });
 });

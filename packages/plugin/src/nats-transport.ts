@@ -172,8 +172,13 @@ export class NatsTransport extends EventEmitter {
     this.reconnectCapMs = options.reconnectCapMs ?? 15_000;
     this.maxReconnectAttempts = options.maxReconnectAttempts ?? Infinity;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? 10_000;
-    // Default factory: real outbound WebSocket CLIENT connection.
-    this.wsFactory = options._wsFactory ?? ((url) => new WebSocket(url));
+    // Default factory: real outbound WebSocket CLIENT connection. Cap the ws
+    // frame size at our own buffer bound so a hostile relay cannot make Node
+    // allocate a ~100 MiB frame (ws's default maxPayload) before our per-message
+    // MAX_BUFFERED_BYTES guard — which only sees data AFTER ws reassembles the
+    // frame — gets a chance to reject it.
+    this.wsFactory =
+      options._wsFactory ?? ((url) => new WebSocket(url, { maxPayload: MAX_BUFFERED_BYTES }));
   }
 
   /** `true` once the NATS CONNECT/PONG handshake has completed. */

@@ -510,12 +510,15 @@ export class NatsClient {
       // With NKEY auth we MUST wait for the server's INFO nonce before signing,
       // so CONNECT is deferred to the INFO handler in drainBuffer().
       if (!this.options.natsCredentials) {
-        // CONNECT goes out synchronously here — mark it on-wire BEFORE the send so
-        // a server that answers our PING with a PONG in the same tick (the test
-        // fake does) is not mistaken for an unsolicited PONG and dropped.
+        // Mark CONNECT on-wire and arm the "first PONG" deadline BEFORE the send
+        // (matching the signed-connect path): a server — or the test fake — that
+        // answers our PING with a PONG in the SAME synchronous tick would settle
+        // the connection and clear the deadline inside sendConnect(); arming after
+        // that would strand a fresh timer that fires ~10s later and force-reconnects
+        // a healthy link. Arm-then-send lets the sync PONG clear it and stay clear.
         dial.connectOnWire = true;
-        this.sendConnect(ws);
         armDeadline("first PONG");
+        this.sendConnect(ws);
       } else {
         armDeadline("INFO");
       }
