@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { PersistedEnrolledCreds } from "./account-config.js";
 import {
+  createWebchannelDoctorAdapter,
   createWebchannelStatusAdapter,
   evaluateWebchannelDoctor,
   formatDoctorWarning,
@@ -13,7 +14,7 @@ import {
 const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel } } as never);
 const identityKey = { publicKey: new Uint8Array(32), privateKey: new Uint8Array(32) };
 const persisted = { userJwt: "J", userSeed: "S", identityKey };
-const validAuth = (audience = "a") => ({ strategy: "jwt", jwt: { issuer: "https://issuer", audience, jwks: { keys: [] } } });
+const validAuth = (audience = "a") => ({ strategy: "jwt", jwt: { issuer: "https://issuer", audience, jwks: { keys: [{ kty: "RSA", kid: "test" }] } } });
 const ids = (config: OpenClawConfig, env: Record<string, string | undefined> = {}, load: () => PersistedEnrolledCreds | undefined = () => persisted) =>
   evaluateWebchannelDoctor(config, { env, loadPersistedEnrolledCreds: load }).map((finding) => finding.checkId);
 
@@ -120,13 +121,59 @@ describe("evaluateWebchannelDoctor findings", () => {
     const warning = formatDoctorWarning({ accountId: "a", checkId: "creds-missing", kind: "auth", severity: "error", message: "missing", fix: "enroll" });
     expect(warning).toBe("- channels.webchannel.a: ERROR [creds-missing] missing Fix: enroll");
   });
+
+  it.each([
+    ['auth.strategy="anonymous"', cfg({ auth: { strategy: "anonymous" } })],
+    ['nats.admission="auto"', cfg({ nats: { admission: "auto" } })],
+    ["nats.devOpen", cfg({ nats: { devOpen: false } })],
+    ['nats.credentials.mode="open"', cfg({ nats: { credentials: { mode: "open" } } })],
+  ])("keeps the preview actionable for removed %s", async (setting, config) => {
+    const adapter = createWebchannelDoctorAdapter({
+      env: {},
+      loadPersistedEnrolledCreds: () => persisted,
+    });
+    const warnings = await adapter.collectPreviewWarnings!({
+      cfg: config,
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {},
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("[configuration-invalid]");
+    expect(warnings[0]).toContain(setting);
+    expect(warnings[0]).toContain("openclaw channels add --channel webchannel");
+  });
+
+  it("keeps the preview actionable for a malformed raw account key", async () => {
+    const adapter = createWebchannelDoctorAdapter({ env: {} });
+    const warnings = await adapter.collectPreviewWarnings!({
+      cfg: cfg({ accounts: { "../bad": { auth: validAuth("../bad") } } }),
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {},
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/configuration-invalid.*invalid account id.*\.\.\/bad/i);
+  });
+
+  it("keeps the preview actionable when persisted credential inspection throws", async () => {
+    const adapter = createWebchannelDoctorAdapter({
+      env: {},
+      loadPersistedEnrolledCreds: () => { throw new Error("credential store unavailable"); },
+    });
+    const warnings = await adapter.collectPreviewWarnings!({
+      cfg: cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {},
+    });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/configuration-invalid.*credential store unavailable/i);
+  });
 });
 
 describe("status probe", () => {
   it("probes inline effective JWKS plus relay and returns success", async () => {
     const dial = vi.fn(async () => ({ ok: true as const }));
     const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial });
-    expect(result).toMatchObject({ ok: true, admission: "register-hop", jwks: { source: "inline", keyCount: 0 }, relay: { ok: true } });
+    expect(result).toMatchObject({ ok: true, admission: "register-hop", jwks: { source: "inline", keyCount: 1 }, relay: { ok: true } });
     expect(dial).toHaveBeenCalledWith(expect.objectContaining({ subject: "webchannel.default-tenant.default._doctor" }));
   });
 
@@ -135,10 +182,44 @@ describe("status probe", () => {
     const file = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksFile: "/keys.json" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, readFile: () => JSON.stringify({ keys: [{ kty: "RSA" }] }) });
     expect(file.jwks).toEqual({ source: "file", keyCount: 1 });
 
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ keys: [] }), { status: 200, headers: { "content-type": "application/json" } }));
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ keys: [{ kty: "RSA" }] }), { status: 200, headers: { "content-type": "application/json" } }));
     const url = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksUrl: "https://idp/keys" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, fetchImpl });
-    expect(url.jwks).toEqual({ source: "url", keyCount: 0 });
+    expect(url.jwks).toEqual({ source: "url", keyCount: 1 });
     expect(fetchImpl).toHaveBeenCalled();
+  });
+
+  it("fails clearly while preserving relay and structured JWKS facts for every empty source", async () => {
+    const dial = vi.fn(async () => ({ ok: true as const }));
+    const cases = [
+      {
+        source: "inline",
+        auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwks: { keys: [] } } },
+        deps: {},
+      },
+      {
+        source: "file",
+        auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksFile: "/keys.json" } },
+        deps: { readFile: () => JSON.stringify({ keys: [] }) },
+      },
+      {
+        source: "url",
+        auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksUrl: "https://idp/keys" } },
+        deps: { fetchImpl: async () => new Response(JSON.stringify({ keys: [] }), { status: 200, headers: { "content-type": "application/json" } }) },
+      },
+    ] as const;
+
+    for (const fixture of cases) {
+      const result = await probeWebchannelAccount(
+        { account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: fixture.auth, dmSecurity: "allowlist" }) },
+        { env: {}, loadCreds: () => persisted, dial, ...fixture.deps },
+      );
+      expect(result).toMatchObject({
+        ok: false,
+        error: `jwks: ${fixture.source} source contains 0 keys`,
+        jwks: { source: fixture.source, keyCount: 0 },
+        relay: { ok: true },
+      });
+    }
   });
 
   it("is fail-soft on dial failure and timeout-shaped errors", async () => {
@@ -164,5 +245,24 @@ describe("status probe", () => {
     ]) ?? [];
     expect(issues.some((issue) => issue.accountId === "a")).toBe(true);
     expect(issues.some((issue) => issue.accountId === "b" && issue.kind === "auth")).toBe(true);
+  });
+
+  it("keeps a distinct pre-existing lastError beside a failed probe for the same account", () => {
+    const issues = createWebchannelStatusAdapter().collectStatusIssues?.([
+      { accountId: "a", lastError: "relay disconnected", probe: { ok: false, error: "jwks unreachable" } } as never,
+    ]) ?? [];
+    expect(issues.map((issue) => issue.message)).toEqual([
+      "Webchannel probe failed: jwks unreachable",
+      "Channel error: relay disconnected",
+    ]);
+  });
+
+  it("deduplicates only the exact trimmed probe-derived lastError", () => {
+    const issues = createWebchannelStatusAdapter().collectStatusIssues?.([
+      { accountId: "a", lastError: "  jwks unreachable ", probe: { ok: false, error: " jwks unreachable  " } } as never,
+    ]) ?? [];
+    expect(issues.map((issue) => issue.message)).toEqual([
+      "Webchannel probe failed:  jwks unreachable  ",
+    ]);
   });
 });

@@ -241,11 +241,18 @@ export function formatDoctorWarning(finding: DoctorFinding): string {
 
 export function createWebchannelDoctorAdapter(deps: DoctorDeps = {}): ChannelDoctorAdapter {
   return {
-    collectPreviewWarnings: ({ cfg, env }) =>
-      evaluateWebchannelDoctor(cfg, {
-        ...deps,
-        ...(env !== undefined ? { env } : {}),
-      }).map(formatDoctorWarning),
+    collectPreviewWarnings: ({ cfg, env }) => {
+      try {
+        return evaluateWebchannelDoctor(cfg, {
+          ...deps,
+          ...(env !== undefined ? { env } : {}),
+        }).map(formatDoctorWarning);
+      } catch (err) {
+        return [
+          `- channels.webchannel: ERROR [configuration-invalid] Could not inspect WebChannel configuration: ${errorMessage(err)} Fix: Correct the reported account/configuration or reconfigure it with openclaw channels add --channel webchannel.`,
+        ];
+      }
+    },
   };
 }
 
@@ -310,7 +317,13 @@ export async function probeWebchannelAccount(params: {
         jwks = { error: errorMessage(err) };
       }
     }
-    const errors = ["error" in relay ? `relay: ${relay.error}` : undefined, jwks && "error" in jwks ? `jwks: ${jwks.error}` : undefined].filter(Boolean);
+    const errors = [
+      "error" in relay ? `relay: ${relay.error}` : undefined,
+      jwks && "error" in jwks ? `jwks: ${jwks.error}` : undefined,
+      jwks && "keyCount" in jwks && jwks.keyCount === 0
+        ? `jwks: ${jwks.source} source contains 0 keys`
+        : undefined,
+    ].filter((error): error is string => error !== undefined);
     return {
       ok: errors.length === 0,
       ...(errors.length > 0 ? { error: errors.join("; ") } : {}),
@@ -332,12 +345,10 @@ export function createWebchannelStatusAdapter(deps: ProbeDeps = {}): ChannelStat
 }
 
 function collectRuntimeStatusIssues(accounts: ChannelAccountSnapshot[]): ChannelStatusIssue[] {
-  const failedProbeAccounts = new Set<string>();
   const issues: ChannelStatusIssue[] = [];
   for (const snapshot of accounts) {
     const probe = (snapshot as unknown as { probe?: unknown }).probe;
     if (!isFailedProbe(probe)) continue;
-    failedProbeAccounts.add(snapshot.accountId);
     issues.push({
       channel: "webchannel",
       accountId: snapshot.accountId,
@@ -348,7 +359,13 @@ function collectRuntimeStatusIssues(accounts: ChannelAccountSnapshot[]): Channel
   }
   issues.push(...collectStatusIssuesFromLastError(
     "webchannel",
-    accounts.filter((snapshot) => !failedProbeAccounts.has(snapshot.accountId)),
+    accounts.filter((snapshot) => {
+      const probe = (snapshot as unknown as { probe?: unknown }).probe;
+      const lastError = typeof snapshot.lastError === "string"
+        ? snapshot.lastError.trim()
+        : "";
+      return !(isFailedProbe(probe) && lastError === probe.error.trim());
+    }),
   ));
   return issues;
 }

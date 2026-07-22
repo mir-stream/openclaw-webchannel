@@ -43,14 +43,62 @@ describe("webchannel plugin", () => {
     expect(account.dmPolicy).toBe("allowlist");
   });
 
-  it("reports configured in Phase 0 (no auth required)", () => {
+  it("reports an actual flat default configuration as configured", () => {
     const transport = new FakePeerChannel();
     const plugin = createWebChannelPlugin(transport);
-    const cfg = { channels: { webchannel: {} } } as any;
+    const cfg = { channels: { webchannel: { dmSecurity: "allowlist" } } } as any;
+    const account = plugin.config.resolveAccount(cfg, undefined);
     const result = plugin.config.inspectAccount!(cfg, undefined) as {
       configured: boolean;
     };
     expect(result.configured).toBe(true);
+    expect(plugin.config.isConfigured!(account, cfg)).toBe(true);
+
+    const ghost = plugin.config.resolveAccount(cfg, "ghost");
+    expect(plugin.config.isConfigured!(ghost, cfg)).toBe(false);
+    expect(plugin.config.inspectAccount!(cfg, "ghost")).toMatchObject({
+      configured: false,
+      tokenStatus: "missing",
+    });
+  });
+
+  it("reports absent and empty channel sections as unconfigured", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const fixtures = [
+      {},
+      { channels: {} },
+      { channels: { webchannel: {} } },
+      { channels: { webchannel: { accounts: {} } } },
+      { channels: { webchannel: { enabled: true } } },
+      { channels: { webchannel: { defaultAccount: "default" } } },
+      { channels: { webchannel: { accounts: {}, enabled: true } } },
+    ] as any[];
+
+    for (const cfg of fixtures) {
+      const account = plugin.config.resolveAccount(cfg, undefined);
+      expect(plugin.config.isConfigured!(account, cfg)).toBe(false);
+      expect(plugin.config.inspectAccount!(cfg, undefined)).toMatchObject({
+        configured: false,
+        tokenStatus: "missing",
+      });
+    }
+  });
+
+  it("reports an explicitly configured named account as configured", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: { work: { dmSecurity: "allowlist" } },
+        },
+      },
+    } as any;
+    const account = plugin.config.resolveAccount(cfg, "work");
+    expect(plugin.config.isConfigured!(account, cfg)).toBe(true);
+    expect(plugin.config.inspectAccount!(cfg, "work")).toMatchObject({
+      configured: true,
+      tokenStatus: "available",
+    });
   });
 
   it("throws distinct outbound errors and never marks this send path best-effort", async () => {

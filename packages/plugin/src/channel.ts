@@ -17,6 +17,8 @@ import type { ResolveAccountTransport } from "./approvals.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   listWebchannelAccountIds,
+  readAccountsMap,
+  readWebchannelSection,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { webchannelSetup } from "./setup.js";
@@ -92,6 +94,28 @@ function resolveAccount(
   };
 }
 
+function isWebchannelAccountConfigured(
+  cfg: OpenClawConfig,
+  accountId?: string | null,
+): boolean {
+  const section = readWebchannelSection(cfg);
+  if (!section || Object.keys(section).length === 0) return false;
+
+  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const accounts = readAccountsMap(section);
+  if (Object.keys(accounts).length > 0) {
+    return listWebchannelAccountIds(cfg).includes(id);
+  }
+
+  // Flat configuration represents only the implicit default account. Structural
+  // keys alone do not configure that account, and must not configure arbitrary
+  // account ids synthesized by a caller.
+  if (id !== DEFAULT_WEBCHANNEL_ACCOUNT_ID) return false;
+  return Object.keys(section).some(
+    (key) => !["accounts", "defaultAccount", "enabled"].includes(key),
+  );
+}
+
 /**
  * Build the WebChannel ChannelPlugin.
  *
@@ -148,11 +172,16 @@ export function createWebChannelPlugin(
         // always synthesizes `"default"` when nothing else is configured.
         listAccountIds: (cfg: OpenClawConfig) => listWebchannelAccountIds(cfg),
         resolveAccount,
-        inspectAccount: (_cfg: OpenClawConfig, _accountId?: string | null) => {
-          // Phase 0: no token/auth required (loopback dev). Always "configured".
-          // TODO(auth): Phase 1 per-user token — reflect real config state here.
-          return { enabled: true, configured: true, tokenStatus: "available" };
+        inspectAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
+          const configured = isWebchannelAccountConfigured(cfg, accountId);
+          return {
+            enabled: true,
+            configured,
+            tokenStatus: configured ? "available" : "missing",
+          };
         },
+        isConfigured: (account, cfg) =>
+          isWebchannelAccountConfigured(cfg, account.accountId),
       },
       // `setup` (ChannelSetupAdapter) is required by CreateChannelPluginBaseOptions
       // and owns config writes for `openclaw channels add`. 가-1: this is where
