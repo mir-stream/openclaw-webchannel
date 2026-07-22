@@ -231,7 +231,7 @@ export class ConversationKeyStore {
   }
 
   private persist(keys: ReadonlyMap<string, Uint8Array>): void {
-    const out: StoreFile = { version: 1, keys: {} };
+    const out: StoreFile = { version: 1, keys: Object.create(null) as Record<string, string> };
     for (const [peerId, key] of keys) {
       out.keys[peerId] = Buffer.from(key).toString("base64url");
     }

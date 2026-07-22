@@ -74,6 +74,18 @@ describe("ConversationKeyStore", () => {
     expect(reborn.get("never-seen")).toBeNull();
   });
 
+  it("persists a __proto__ peerId as an own key across instances", () => {
+    const first = new ConversationKeyStore({ accountId: ACCOUNT, home });
+    const key = first.getOrCreate("__proto__");
+
+    const persisted = storedKeys();
+    expect(Object.prototype.hasOwnProperty.call(persisted, "__proto__")).toBe(true);
+    expect(persisted["__proto__"]).toBe(Buffer.from(key).toString("base64url"));
+
+    const reborn = new ConversationKeyStore({ accountId: ACCOUNT, home });
+    expect(sameBytes(reborn.getOrCreate("__proto__"), key)).toBe(true);
+  });
+
   it("writes with owner-only permissions", () => {
     const store = new ConversationKeyStore({ accountId: ACCOUNT, home });
     store.getOrCreate("user-42");
