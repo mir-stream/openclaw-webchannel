@@ -28,9 +28,11 @@
 
 import {
   connectNatsCredentialSource,
+  resolveNatsCredentialSource,
   type ConnectedNats,
   type ConnectNatsDeps,
   type NatsCredentialSource,
+  type ResolveNatsCredentialSourceInput,
 } from "./nats-credential-source.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
@@ -68,6 +70,53 @@ export type ConsumeCredentialSourceDeps = ConnectNatsDeps & {
   /** Override home dir for path resolution (tests). */
   home?: string;
 };
+
+export type DialMaterial =
+  | {
+      status: "ok";
+      mode: NatsCredentialSource["mode"];
+      dial: { kind: "static"; url: string; userJwt: string; userSeed: string };
+    }
+  | { status: "creds-missing"; accountId: string }
+  | { status: "invalid"; error: string };
+
+export type ResolveDialMaterialInput = ResolveNatsCredentialSourceInput & {
+  loadCreds?: (accountId: string) => ReturnType<typeof loadPersistedEnrolledCreds>;
+};
+
+/** Resolve probe dial material without ever entering the enrollment connector. */
+export function resolveDialMaterial(input: ResolveDialMaterialInput): DialMaterial {
+  let source: NatsCredentialSource;
+  try {
+    source = resolveNatsCredentialSource(input);
+  } catch (err) {
+    return { status: "invalid", error: err instanceof Error ? err.message : String(err) };
+  }
+  if (source.mode === "static") {
+    return {
+      status: "ok",
+      mode: source.mode,
+      dial: {
+        kind: "static",
+        url: source.url,
+        userJwt: source.userJwt,
+        userSeed: source.userSeed,
+      },
+    };
+  }
+  const persisted = (input.loadCreds ?? loadPersistedEnrolledCreds)(input.accountId);
+  if (!persisted) return { status: "creds-missing", accountId: input.accountId };
+  return {
+    status: "ok",
+    mode: source.mode,
+    dial: {
+      kind: "static",
+      url: persisted.natsUrl ?? source.url,
+      userJwt: persisted.userJwt,
+      userSeed: persisted.userSeed,
+    },
+  };
+}
 
 /**
  * Consume a resolved credential source at runtime.

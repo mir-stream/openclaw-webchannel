@@ -7,10 +7,11 @@
  * per-account config (가-1) that is a wrong-tenant footgun: a stale env var
  * would silently mis-route an explicitly-configured account.
  *
- * New rule (deterministic, config wins):
+ * New identity rule (deterministic, config wins):
  *   - If ANY `channels.webchannel` account config exists (flat OR per-account),
- *     these three env vars are IGNORED for identity, and a ONE-TIME deprecation
- *     warning is emitted. Config is authoritative.
+ *     `WEBCHANNEL_TENANT` is IGNORED for identity. `WEBCHANNEL_SAAS_BASE_URL`
+ *     remains an effective enrolled-credential override during its deprecation
+ *     window. A ONE-TIME warning accurately describes either case.
  *   - ONLY when there is NO webchannel account config at all are they used, to
  *     synthesize a legacy `"default"` account's identity.
  *
@@ -21,15 +22,22 @@
 
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  readWebchannelSection,
+  hasWebchannelConfig,
   resolveAcquisitionIdentity,
   type WebchannelAcquisitionIdentity,
 } from "./account-config.js";
 
-const ACQUISITION_IDENTITY_ENV_KEYS = [
-  "WEBCHANNEL_TENANT",
+export const IGNORED_ACQUISITION_IDENTITY_ENV_KEYS = ["WEBCHANNEL_TENANT"] as const;
+export const EFFECTIVE_DEPRECATED_ACQUISITION_ENV_KEYS = [
   "WEBCHANNEL_SAAS_BASE_URL",
 ] as const;
+export const ACQUISITION_IDENTITY_ENV_KEYS = [
+  ...IGNORED_ACQUISITION_IDENTITY_ENV_KEYS,
+  ...EFFECTIVE_DEPRECATED_ACQUISITION_ENV_KEYS,
+] as const;
+
+// Retain the existing module export while sharing the account-model predicate.
+export { hasWebchannelConfig };
 
 /** Module-scoped guard so the deprecation warning fires at most once per process. */
 let deprecationWarned = false;
@@ -50,8 +58,8 @@ export type AcquisitionEnvResult = {
  * Resolve the acquisition identity for an account, applying the env-precedence
  * rule.
  *
- *   - Config present  → config wins; the three identity env vars are ignored
- *     and a one-time deprecation warning is emitted (if any are set).
+ *   - Config present  → config wins for tenant; the SaaS env override remains
+ *     effective temporarily. A one-time deprecation warning is emitted.
  *   - Config absent   → synthesize from env (legacy `"default"` path), falling
  *     back to the historical defaults.
  *
@@ -68,18 +76,27 @@ export function resolveAcquisitionEnvPrecedence(
   const env = opts.env ?? process.env;
   const warn = opts.warn ?? ((msg: string) => console.warn(msg));
 
-  const section = readWebchannelSection(cfg);
-  const hasConfig = section !== undefined && Object.keys(section).length > 0;
+  const hasConfig = hasWebchannelConfig(cfg);
 
-  const envSet = ACQUISITION_IDENTITY_ENV_KEYS.filter((k) => env[k] !== undefined);
+  const ignoredEnv = IGNORED_ACQUISITION_IDENTITY_ENV_KEYS.filter(
+    (key) => env[key] !== undefined,
+  );
+  const effectiveDeprecatedEnv = EFFECTIVE_DEPRECATED_ACQUISITION_ENV_KEYS.filter(
+    (key) => env[key] !== undefined,
+  );
 
   if (hasConfig) {
-    if (envSet.length > 0 && !deprecationWarned) {
+    if ((ignoredEnv.length > 0 || effectiveDeprecatedEnv.length > 0) && !deprecationWarned) {
       deprecationWarned = true;
-      warn(
-        `[webchannel] ignoring deprecated acquisition env (${envSet.join(", ")}) — ` +
+      if (ignoredEnv.length > 0) warn(
+        `[webchannel] ignoring deprecated acquisition env (${ignoredEnv.join(", ")}) — ` +
           `channels.webchannel config is authoritative. Configure identity via ` +
           `'openclaw channels add --channel webchannel' instead.`,
+      );
+      if (effectiveDeprecatedEnv.length > 0) warn(
+        `[webchannel] deprecated acquisition env (${effectiveDeprecatedEnv.join(", ")}) is still effective ` +
+          `and overrides configured SaaS settings. Move it to channels.webchannel configuration; ` +
+          `environment-variable support will be removed after 2026-08-15.`,
       );
     }
     return { identity: resolveAcquisitionIdentity(cfg, accountId), usedLegacyEnv: false };

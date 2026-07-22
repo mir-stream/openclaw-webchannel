@@ -199,18 +199,8 @@ export async function preflightResolveJwks(
   return { keyCount: doc.keys.length };
 }
 
-/**
- * Validate a register-hop JWT configuration and initialize its shared JWKS
- * cache. The caller must retain this exact auth object in AccountRuntime so
- * preflight and live verification reuse the same WeakMap-keyed cache.
- */
-export function assertJwtAuthConfig(config: AuthConfig | undefined | null): asserts config is JwtAuthConfig {
-  if (!config || typeof config !== "object" || !("strategy" in config)) {
-    throw new Error("webchannel: channels.webchannel.auth.strategy is required (jwt). Refusing to start.");
-  }
-  if (config.strategy !== "jwt") {
-    throw new Error(`webchannel: auth strategy "${config.strategy}" is not valid for register-hop JWT verification. Refusing to start.`);
-  }
+/** Validate every construction-time JWT invariant without allocating a cache. */
+export function validateJwtVerifierConfig(config: JwtAuthConfig): void {
   const jwtCfg = config.jwt;
   if (!jwtCfg || typeof jwtCfg !== "object") {
     throw new Error(
@@ -227,9 +217,37 @@ export function assertJwtAuthConfig(config: AuthConfig | undefined | null): asse
       "webchannel: channels.webchannel.auth.jwt.audience is required (strategy=\"jwt\"). Refusing to start.",
     );
   }
+  const sourceCount = [jwtCfg.jwksUrl, jwtCfg.jwksFile, jwtCfg.jwks].filter(
+    (value) => value !== undefined,
+  ).length;
+  if (sourceCount !== 1) {
+    throw new Error(
+      `webchannel: jwt strategy requires exactly one of jwksUrl, jwksFile, or jwks (got ${sourceCount}). Refusing to start.`,
+    );
+  }
+}
+
+/** Validate the full register-hop auth config domain without allocating a cache. */
+export function validateVerifierConfig(config: AuthConfig | undefined | null): asserts config is JwtAuthConfig {
+  if (!config || typeof config !== "object" || !("strategy" in config)) {
+    throw new Error("webchannel: channels.webchannel.auth.strategy is required (jwt). Refusing to start.");
+  }
+  if (config.strategy !== "jwt") {
+    throw new Error(`webchannel: auth strategy "${config.strategy}" is not valid for register-hop JWT verification. Refusing to start.`);
+  }
+  validateJwtVerifierConfig(config);
+}
+
+/**
+ * Validate a register-hop JWT configuration and initialize its shared JWKS
+ * cache. The caller must retain this exact auth object in AccountRuntime so
+ * preflight and live verification reuse the same WeakMap-keyed cache.
+ */
+export function assertJwtAuthConfig(config: AuthConfig | undefined | null): asserts config is JwtAuthConfig {
+  validateVerifierConfig(config);
   // Exactly one JWKS source must be supplied. `jwksCacheFor` calls
-  // `JWKSCache.create` (which enforces this) once per account and memoizes the
-  // result, so a misconfig fails at plugin load instead of every upgrade, and
+  // `JWKSCache.create` (which also enforces this) once per account and memoizes
+  // the result, so a misconfig fails at plugin load instead of every upgrade, and
   // the 5-minute TTL is honored across upgrades rather than reset each time.
   jwksCacheFor(config);
 }

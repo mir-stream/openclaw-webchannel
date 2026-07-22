@@ -17,6 +17,9 @@
         "additionalProperties": false,
         "description": "WebChannel config (OpenClaw multi-account model). The channel-level (flat) fields are the shared base AND the implicit \"default\" account; named accounts live under `accounts.<accountId>` and inherit the channel-level base. Acquisition identity (tenant/accountId/saas.baseUrl) and credentials are set via 'openclaw channels add --channel webchannel'.",
         "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
           "accounts": {
             "type": "object",
             "description": "Per-account overrides keyed by accountId (channels.webchannel.accounts.<id>). Each account inherits the channel-level (flat) fields as a shared base; account fields override. By design the per-account leaf schema is NOT enumerated here (additionalProperties:true / unvalidated) — it mirrors the channel-level fields; validating it twice would couple the two trees. Named accounts are created by 'openclaw channels add --channel webchannel --account <id>'.",

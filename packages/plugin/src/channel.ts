@@ -3,6 +3,7 @@ import {
   createChannelPluginBase,
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
+import type { ChannelDoctorAdapter, ChannelStatusAdapter } from "openclaw/plugin-sdk/channel-contract";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
@@ -15,11 +16,20 @@ import {
 import type { ResolveAccountTransport } from "./approvals.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  hasWebchannelConfig,
+  isWebchannelAccountEnabled,
   listWebchannelAccountIds,
+  readAccountsMap,
+  readWebchannelSection,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { webchannelSetup } from "./setup.js";
 import { webchannelSetupWizard } from "./setup-wizard.js";
+import {
+  createWebchannelDoctorAdapter,
+  createWebchannelStatusAdapter,
+  type WebchannelProbe,
+} from "./doctor.js";
 
 // Single default account id for Phase 1. `listAccountIds` MUST return ≥1 entry
 // and the plugin MUST expose `gateway.startAccount`, otherwise core's channel
@@ -38,6 +48,7 @@ export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_A
 
 type ResolvedAccount = {
   accountId: string | null;
+  enabled: boolean;
   allowFrom: string[];
   dmPolicy: string | undefined;
 };
@@ -45,12 +56,27 @@ type ResolvedAccount = {
 // `createChatChannelPlugin`'s `base` param requires a non-optional `capabilities`,
 // but `createChannelPluginBase`'s return type weakens it to optional
 // (CreatedChannelPluginBase makes capabilities Partial). We pass capabilities in,
-// so at runtime it is present; this alias documents the SDK type mismatch we cast
-// around. Verified: dist/plugin-sdk/core-HhTaqQ72.d.ts:142 (CreatedChannelPluginBase
+// so at runtime it is present; the helper below documents the SDK type mismatch.
+// Verified: dist/plugin-sdk/core-HhTaqQ72.d.ts:142 (CreatedChannelPluginBase
 // optional capabilities) vs :169/:228 (ChatChannelPluginBase requires capabilities).
-type ChatChannelBaseParam = Parameters<
-  typeof createChatChannelPlugin<ResolvedAccount>
+type WebchannelAdapters = {
+  doctor: ChannelDoctorAdapter;
+  status: ChannelStatusAdapter<ResolvedAccount, WebchannelProbe>;
+};
+
+type WebchannelChatBase = Parameters<
+  typeof createChatChannelPlugin<ResolvedAccount, WebchannelProbe>
 >[0]["base"];
+
+function withRequiredCapabilities<T extends { capabilities?: unknown }>(
+  value: T,
+): T & { capabilities: Exclude<T["capabilities"], undefined> } {
+  return value as T & { capabilities: Exclude<T["capabilities"], undefined> };
+}
+
+function asWebchannelChatBase<T>(value: T): T & WebchannelChatBase {
+  return value as T & WebchannelChatBase;
+}
 
 function resolveAccount(
   cfg: OpenClawConfig,
@@ -66,9 +92,29 @@ function resolveAccount(
   );
   return {
     accountId: accountId ?? null,
+    enabled: isWebchannelAccountEnabled(cfg, accountId),
     allowFrom: (account.allowFrom as string[] | undefined) ?? [],
     dmPolicy: account.dmSecurity as string | undefined,
   };
+}
+
+function isWebchannelAccountConfigured(
+  cfg: OpenClawConfig,
+  accountId?: string | null,
+): boolean {
+  const section = readWebchannelSection(cfg);
+  if (!section || !hasWebchannelConfig(cfg)) return false;
+
+  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const accounts = readAccountsMap(section);
+  if (Object.keys(accounts).length > 0) {
+    return listWebchannelAccountIds(cfg).includes(id);
+  }
+
+  // Flat configuration represents only the implicit default account. Structural
+  // keys alone do not configure that account, and must not configure arbitrary
+  // account ids synthesized by a caller.
+  return id === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
 }
 
 /**
@@ -96,7 +142,7 @@ export function createWebChannelPlugin(
     resolveApprovalTransport?: ResolveAccountTransport;
   },
 ) {
-  return createChatChannelPlugin<ResolvedAccount>({
+  return createChatChannelPlugin<ResolvedAccount, WebchannelProbe>({
     // `message` (ChannelMessageAdapter) declares our outbound text send plus the
     // `live` progress-draft capabilities. It is attached on the base object here
     // (rather than passed into `createChannelPluginBase`, whose typed options
@@ -108,7 +154,7 @@ export function createWebChannelPlugin(
     // `outbound`). See src/message-adapter.ts for why core does not auto-drive
     // `message.live` for plugin channels and how drafts fire via the inbound
     // turn's reply callbacks instead.
-    base: Object.assign(createChannelPluginBase<ResolvedAccount>({
+    base: asWebchannelChatBase(Object.assign(withRequiredCapabilities(createChannelPluginBase<ResolvedAccount>({
       id: WEBCHANNEL_ID,
       // `capabilities` is required on ChannelPlugin (verified:
       // dist/types.plugin-BIHyhl5u.d.ts:22). One web chat surface => direct chats.
@@ -127,11 +173,17 @@ export function createWebChannelPlugin(
         // always synthesizes `"default"` when nothing else is configured.
         listAccountIds: (cfg: OpenClawConfig) => listWebchannelAccountIds(cfg),
         resolveAccount,
-        inspectAccount: (_cfg: OpenClawConfig, _accountId?: string | null) => {
-          // Phase 0: no token/auth required (loopback dev). Always "configured".
-          // TODO(auth): Phase 1 per-user token — reflect real config state here.
-          return { enabled: true, configured: true, tokenStatus: "available" };
+        inspectAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
+          const configured = isWebchannelAccountConfigured(cfg, accountId);
+          return {
+            enabled: isWebchannelAccountEnabled(cfg, accountId),
+            configured,
+            tokenStatus: configured ? "available" : "missing",
+          };
         },
+        isEnabled: (account) => account.enabled,
+        isConfigured: (account, cfg) =>
+          isWebchannelAccountConfigured(cfg, account.accountId),
       },
       // `setup` (ChannelSetupAdapter) is required by CreateChannelPluginBaseOptions
       // and owns config writes for `openclaw channels add`. 가-1: this is where
@@ -145,8 +197,10 @@ export function createWebChannelPlugin(
       // the plugin via createChannelPluginBase (openclaw core.ts:502/841/817).
       // See src/setup-wizard.ts.
       setupWizard: webchannelSetupWizard,
-    }), {
+    })), {
       message: createClawMessageAdapter(transport),
+      doctor: createWebchannelDoctorAdapter(),
+      status: createWebchannelStatusAdapter(),
       // `approvalCapability` is a top-level ChannelPlugin field (sibling of
       // outbound/security/message). `createChatChannelPlugin` spreads `base`
       // into the returned plugin (dist/core-DSxVv-v1.js:255-266) and
@@ -169,7 +223,7 @@ export function createWebChannelPlugin(
       gateway: {
         startAccount: (ctx: any) => startClawApprovalMonitor(ctx),
       },
-    }) as ChatChannelBaseParam,
+    } satisfies WebchannelAdapters & Record<string, unknown>)),
 
     // DM security: who may message the bot. Phase 0 uses config allowlist only.
     security: {

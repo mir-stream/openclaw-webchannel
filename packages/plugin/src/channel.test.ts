@@ -39,18 +39,152 @@ describe("webchannel plugin", () => {
       channels: { webchannel: { allowFrom: ["user1"], dmSecurity: "allowlist" } },
     } as any;
     const account = plugin.config.resolveAccount(cfg, undefined);
+    expect(account.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(account, cfg)).toBe(true);
     expect(account.allowFrom).toEqual(["user1"]);
     expect(account.dmPolicy).toBe("allowlist");
   });
 
-  it("reports configured in Phase 0 (no auth required)", () => {
+  it("reports an actual flat default configuration as configured", () => {
     const transport = new FakePeerChannel();
     const plugin = createWebChannelPlugin(transport);
-    const cfg = { channels: { webchannel: {} } } as any;
+    const cfg = { channels: { webchannel: { dmSecurity: "allowlist" } } } as any;
+    const account = plugin.config.resolveAccount(cfg, undefined);
     const result = plugin.config.inspectAccount!(cfg, undefined) as {
       configured: boolean;
     };
     expect(result.configured).toBe(true);
+    expect(plugin.config.isConfigured!(account, cfg)).toBe(true);
+
+    const ghost = plugin.config.resolveAccount(cfg, "ghost");
+    expect(ghost.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(true);
+    expect(plugin.config.isConfigured!(ghost, cfg)).toBe(false);
+    expect(plugin.config.inspectAccount!(cfg, "ghost")).toMatchObject({
+      enabled: true,
+      configured: false,
+      tokenStatus: "missing",
+    });
+  });
+
+  it("reports absent and empty channel sections as unconfigured", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const fixtures = [
+      {},
+      { channels: {} },
+      { channels: { webchannel: {} } },
+      { channels: { webchannel: { accounts: {} } } },
+      { channels: { webchannel: { enabled: true } } },
+      { channels: { webchannel: { enabled: false } } },
+      { channels: { webchannel: { defaultAccount: "default" } } },
+      { channels: { webchannel: { accounts: {}, enabled: true } } },
+    ] as any[];
+
+    for (const cfg of fixtures) {
+      const account = plugin.config.resolveAccount(cfg, undefined);
+      expect(plugin.config.isConfigured!(account, cfg)).toBe(false);
+      expect(plugin.config.inspectAccount!(cfg, undefined)).toMatchObject({
+        configured: false,
+        tokenStatus: "missing",
+      });
+    }
+  });
+
+  it("reports an explicitly configured named account as configured", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: { work: { dmSecurity: "allowlist" } },
+        },
+      },
+    } as any;
+    const account = plugin.config.resolveAccount(cfg, "work");
+    expect(plugin.config.isConfigured!(account, cfg)).toBe(true);
+    expect(plugin.config.inspectAccount!(cfg, "work")).toMatchObject({
+      configured: true,
+      tokenStatus: "available",
+    });
+  });
+
+  it("reports flat channel-level disable while keeping configuration truth separate", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const disabledCfg = {
+      channels: { webchannel: { enabled: false, dmSecurity: "allowlist" } },
+    } as any;
+    const disabled = plugin.config.resolveAccount(disabledCfg, undefined);
+    expect(disabled.enabled).toBe(false);
+    expect(plugin.config.isEnabled!(disabled, disabledCfg)).toBe(false);
+    expect(plugin.config.isConfigured!(disabled, disabledCfg)).toBe(true);
+    expect(plugin.config.inspectAccount!(disabledCfg, undefined)).toMatchObject({
+      enabled: false,
+      configured: true,
+    });
+
+    const enabledCfg = {
+      channels: { webchannel: { enabled: true, dmSecurity: "allowlist" } },
+    } as any;
+    const enabled = plugin.config.resolveAccount(enabledCfg, undefined);
+    expect(enabled.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(enabled, enabledCfg)).toBe(true);
+    expect(plugin.config.inspectAccount!(enabledCfg, undefined)).toMatchObject({
+      enabled: true,
+      configured: true,
+    });
+  });
+
+  it("honors named disable, enabled controls, and global-disable dominance", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            disabled: { enabled: false, dmSecurity: "allowlist" },
+            enabled: { enabled: true, dmSecurity: "allowlist" },
+            inherited: { dmSecurity: "allowlist" },
+          },
+        },
+      },
+    } as any;
+
+    for (const [accountId, expected] of [
+      ["disabled", false],
+      ["enabled", true],
+      ["inherited", true],
+    ] as const) {
+      const account = plugin.config.resolveAccount(cfg, accountId);
+      expect(account.enabled).toBe(expected);
+      expect(plugin.config.isEnabled!(account, cfg)).toBe(expected);
+      expect(plugin.config.inspectAccount!(cfg, accountId)).toMatchObject({
+        enabled: expected,
+        configured: true,
+      });
+    }
+
+    const ghost = plugin.config.resolveAccount(cfg, "ghost");
+    expect(ghost.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(true);
+    expect(plugin.config.isConfigured!(ghost, cfg)).toBe(false);
+    expect(plugin.config.inspectAccount!(cfg, "ghost")).toMatchObject({
+      enabled: true,
+      configured: false,
+    });
+
+    const globallyDisabledCfg = {
+      channels: {
+        webchannel: {
+          enabled: false,
+          accounts: { enabled: { enabled: true, dmSecurity: "allowlist" } },
+        },
+      },
+    } as any;
+    const globallyDisabled = plugin.config.resolveAccount(globallyDisabledCfg, "enabled");
+    expect(globallyDisabled.enabled).toBe(false);
+    expect(plugin.config.isEnabled!(globallyDisabled, globallyDisabledCfg)).toBe(false);
+    expect(plugin.config.inspectAccount!(globallyDisabledCfg, "enabled")).toMatchObject({
+      enabled: false,
+      configured: true,
+    });
   });
 
   it("throws distinct outbound errors and never marks this send path best-effort", async () => {
@@ -63,6 +197,20 @@ describe("webchannel plugin", () => {
     );
     // D1 caveat: this adapter does not opt into core's error-swallowing path.
     expect(plugin.outbound.bestEffort).not.toBe(true);
+  });
+
+  it("exposes doctor preview warnings and status probing from the common factory", async () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    expect(plugin.doctor?.collectPreviewWarnings).toBeTypeOf("function");
+    expect(plugin.status?.probeAccount).toBeTypeOf("function");
+    const warnings = await plugin.doctor!.collectPreviewWarnings!({
+      cfg: { channels: { webchannel: { encryption: { mode: "disabled" }, dmSecurity: "allowlist" } } } as never,
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {},
+    });
+    expect(warnings).toEqual(
+      expect.arrayContaining([expect.stringMatching(/channels\.webchannel\.default.*encryption-disabled/)]),
+    );
   });
 });
 

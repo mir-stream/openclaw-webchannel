@@ -424,7 +424,7 @@ export async function runAddPreflight(
   // 2. Relay dial (scoped no-op sub within the account's own subtree, then close).
   const dialSubject = `webchannel.${opts.tenant}.${opts.accountId}._preflight`;
   const relay = opts.enrollment.natsUrl
-    ? await (opts.dial ?? defaultRelayDial)({
+    ? await (opts.dial ?? dialRelayForPreflight)({
         url: opts.enrollment.natsUrl,
         userJwt: opts.enrollment.userJwt,
         userSeed: opts.enrollment.userSeed,
@@ -460,7 +460,8 @@ export async function runAddPreflight(
  * same primitive the runtime uses to dial enrolled creds — so nothing about the
  * auth flow is reinvented here.
  */
-async function defaultRelayDial(input: {
+export async function dialRelayForPreflight(input: {
+  kind?: "static";
   url: string;
   userJwt: string;
   userSeed: string;
@@ -472,16 +473,33 @@ async function defaultRelayDial(input: {
   try {
     const connected = await withTimeout(
       connectNatsCredentialSource(
-        {
-          mode: 'static',
-          url: input.url,
-          userJwt: input.userJwt,
-          userSeed: input.userSeed,
-        },
+        { mode: "static", url: input.url, userJwt: input.userJwt, userSeed: input.userSeed },
         input.connectDeps ?? {},
       ),
       input.timeoutMs,
       `relay dial timed out after ${input.timeoutMs}ms`,
+      // A timeout does NOT cancel the connect — the promise stays pending and can
+      // still resolve with a live authenticated transport that no one holds. The
+      // `finally` below cannot reach it (`connection` is still undefined), so a
+      // slow relay would leak a connection + its subscription per probe. Doctor/
+      // status probe this path repeatedly, so a late arrival is torn down here.
+      //
+      // RESIDUAL (not covered): this only fires if the connect eventually SETTLES.
+      // `NatsTransport.connect()` has no handshake timeout and no cancellation —
+      // its promise resolves on the first pong, and the only timer in
+      // `nats-transport.ts` is reconnect backoff. So if the relay accepts the
+      // socket and then goes silent, `connect()` never settles, `onLate` never
+      // runs, and that socket stays orphaned — arguably the likeliest reason the
+      // dial timeout fires at all. Closing that needs the dialer to own the
+      // transport (construct it here so it can be disconnected without waiting on
+      // the connect promise), which is a larger change than this fix.
+      (late) => {
+        try {
+          late.transport.disconnect();
+        } catch {
+          /* ignore teardown errors — the probe result is already decided */
+        }
+      },
     );
     connection = connected;
     // Scoped no-op subscription within the agent's own `webchannel.{tenant}.>`
@@ -502,13 +520,33 @@ async function defaultRelayDial(input: {
   }
 }
 
-/** Reject with `message` if `p` does not settle within `ms`. */
-function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+/**
+ * Reject with `message` if `p` does not settle within `ms`.
+ *
+ * `onLate` receives a value `p` resolves with AFTER the timeout already rejected.
+ * The returned promise is settled by then, so that value is otherwise dropped on
+ * the floor — which orphans anything holding a resource. Callers whose `T` needs
+ * teardown (a live connection) pass a disposer here.
+ */
+function withTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  message: string,
+  onLate?: (value: T) => void,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(message));
+    }, ms);
     p.then(
       (v) => {
         clearTimeout(timer);
+        if (timedOut) {
+          onLate?.(v);
+          return;
+        }
         resolve(v);
       },
       (err) => {

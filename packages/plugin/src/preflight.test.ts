@@ -15,6 +15,7 @@ import {
   formatAccountReadiness,
   evaluateAddPreflight,
   runAddPreflight,
+  dialRelayForPreflight,
   deriveJwksUrl,
 } from "./preflight.js";
 
@@ -309,5 +310,73 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
       dial: async () => ({ ok: true }) as const,
     });
     expect(log.mock.calls.some((c) => String(c[0]).includes("WARN: auth.jwt.issuer"))).toBe(false);
+  });
+});
+
+describe("dialRelayForPreflight (relay-dial probe)", () => {
+  /** A fake NatsTransport whose `connect` settles only when the test releases it. */
+  function slowTransport(): {
+    factory: () => never;
+    release: () => void;
+    disconnect: ReturnType<typeof vi.fn>;
+  } {
+    let release: () => void = () => {};
+    const connected = new Promise<void>((r) => {
+      release = r;
+    });
+    const disconnect = vi.fn();
+    return {
+      factory: () =>
+        ({
+          connect: vi.fn(() => connected),
+          subscribe: vi.fn(),
+          disconnect,
+          connected: true,
+        }) as never,
+      release: () => release(),
+      disconnect,
+    };
+  }
+
+  it("disconnects a connection that lands AFTER the dial timed out", async () => {
+    // The timeout does not cancel the connect. Without a late-settle disposer the
+    // relay's answer arrives to nobody: a live authenticated transport (plus its
+    // subscription) that no code holds and nothing ever closes. Doctor/status
+    // probe this path repeatedly, so each slow probe would leak one.
+    const t = slowTransport();
+
+    const result = await dialRelayForPreflight({
+      url: "wss://relay.example",
+      userJwt: "J",
+      userSeed: "S",
+      subject: "webchannel.t.acme._preflight",
+      timeoutMs: 5,
+      connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
+    });
+
+    // The caller's contract is unchanged: it still gets the timeout verdict, and
+    // nothing was torn down while the connect was merely slow.
+    expect(result).toEqual({ error: "relay dial timed out after 5ms" });
+    expect(t.disconnect).not.toHaveBeenCalled();
+
+    t.release();
+    await vi.waitFor(() => expect(t.disconnect).toHaveBeenCalledTimes(1));
+  });
+
+  it("disconnects on the normal path too (probe succeeds, then tears down)", async () => {
+    const t = slowTransport();
+    t.release(); // connect resolves immediately — no timeout involved
+
+    const result = await dialRelayForPreflight({
+      url: "wss://relay.example",
+      userJwt: "J",
+      userSeed: "S",
+      subject: "webchannel.t.acme._preflight",
+      timeoutMs: 5000,
+      connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(t.disconnect).toHaveBeenCalledTimes(1);
   });
 });

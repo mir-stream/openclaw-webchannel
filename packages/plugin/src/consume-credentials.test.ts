@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 
-import { consumeCredentialSource } from "./consume-credentials.js";
+import { consumeCredentialSource, resolveDialMaterial } from "./consume-credentials.js";
 import type { NatsCredentialSource } from "./nats-credential-source.js";
 
 describe("consumeCredentialSource", () => {
@@ -156,5 +156,26 @@ describe("consumeCredentialSource", () => {
     expect(transportFactory).toHaveBeenCalledWith(
       expect.objectContaining({ url: "ws://static", jwtCredential: "J" }),
     );
+  });
+});
+
+describe("resolveDialMaterial (probe-safe)", () => {
+  const base = { tenant: "t", accountId: "a", env: {} };
+
+  it("surfaces the resolver's refusal of static creds as invalid material", () => {
+    // BYO-NATS static credentials are refused until P0-3 lands, so the resolver
+    // throws and the probe reports invalid material rather than a dial-able source.
+    expect(resolveDialMaterial({ ...base, natsConfig: { url: "ws://static", credentials: { mode: "static", userJwt: "J", userSeed: "S" } } }).status).toBe("invalid");
+  });
+
+  it("prefers delivered relay URL and uses configured fallback", () => {
+    const enrolled = (natsUrl?: string) => resolveDialMaterial({ ...base, natsConfig: { url: "ws://configured" }, loadCreds: () => ({ userJwt: "J", userSeed: "S", ...(natsUrl ? { natsUrl } : {}) }) });
+    expect(enrolled("wss://delivered")).toMatchObject({ status: "ok", dial: { url: "wss://delivered" } });
+    expect(enrolled()).toMatchObject({ status: "ok", dial: { url: "ws://configured" } });
+  });
+
+  it("maps absent or malformed persisted creds to creds-missing and resolver throws to invalid", () => {
+    expect(resolveDialMaterial({ ...base, loadCreds: () => undefined })).toEqual({ status: "creds-missing", accountId: "a" });
+    expect(resolveDialMaterial({ ...base, natsConfig: { credentials: { mode: "static", userJwt: "J" } } })).toMatchObject({ status: "invalid" });
   });
 });
