@@ -212,6 +212,7 @@ describe("status probe", () => {
     const dial = vi.fn(async () => ({ ok: true as const }));
     const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial });
     expect(result).toMatchObject({ ok: true, admission: "register-hop", jwks: { source: "inline", keyCount: 1 }, relay: { ok: true } });
+    expect(result.relay).toEqual({ ok: true });
     expect(dial).toHaveBeenCalledWith(expect.objectContaining({ subject: "webchannel.default-tenant.default._doctor" }));
   });
 
@@ -224,6 +225,53 @@ describe("status probe", () => {
     const url = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksUrl: "https://idp/keys" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, fetchImpl });
     expect(url.jwks).toEqual({ source: "url", keyCount: 1 });
     expect(fetchImpl).toHaveBeenCalled();
+  });
+
+  it("never returns relay URL credentials or URL-JWKS secrets in probe failures", async () => {
+    const relayUrl = "wss://user:pass@relay.example/ws?access_token=topsecret#frag";
+    const jwksUrl = "https://jwks-user:jwks-pass@idp.example/keys?api_key=jwks-topsecret#jwks-frag";
+    const result = await probeWebchannelAccount(
+      {
+        account: { accountId: "default" },
+        timeoutMs: 50,
+        cfg: cfg({
+          auth: {
+            strategy: "jwt",
+            jwt: { issuer: "i", audience: "default", jwksUrl },
+          },
+          dmSecurity: "allowlist",
+        }),
+      },
+      {
+        env: {},
+        loadCreds: () => ({ ...persisted, natsUrl: relayUrl }),
+        dial: async (input) => ({ error: `relay dial failed for ${input.url}` }),
+        fetchImpl: async () => { throw new Error(`JWKS endpoint failed at ${jwksUrl}`); },
+      },
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      relay: { error: expect.stringContaining("wss://relay.example") },
+      jwks: { error: expect.stringContaining("https://idp.example") },
+    });
+    const serialized = JSON.stringify(result);
+    for (const secret of [
+      "user",
+      "pass",
+      "access_token",
+      "topsecret",
+      "frag",
+      "jwks-user",
+      "jwks-pass",
+      "api_key",
+      "jwks-topsecret",
+      "jwks-frag",
+      "/ws",
+      "/keys",
+    ]) {
+      expect(serialized).not.toContain(secret);
+    }
   });
 
   it("fails clearly while preserving relay and structured JWKS facts for every empty source", async () => {

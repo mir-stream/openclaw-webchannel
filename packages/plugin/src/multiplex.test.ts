@@ -101,6 +101,64 @@ describe("planAccounts: multi-account (Phase 3)", () => {
   });
 });
 
+describe("planAccounts: enabled-state serving boundary", () => {
+  it("returns no plans when the channel is globally disabled", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          enabled: false,
+          tenant: "disabled-tenant",
+          auth: { strategy: "jwt" },
+        },
+      },
+    };
+    expect(planAccounts(cfg, { env: {} })).toEqual([]);
+  });
+
+  it("omits a disabled named account while preserving enabled siblings", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            off: { enabled: false, tenant: "off-tenant" },
+            on: { enabled: true, tenant: "on-tenant" },
+            inherited: { tenant: "inherited-tenant" },
+          },
+        },
+      },
+    };
+    expect(planAccounts(cfg, { env: {} }).map((plan) => plan.accountId)).toEqual([
+      "inherited",
+      "on",
+    ]);
+  });
+
+  it("skips disabled accounts before identity or account-config resolution", () => {
+    let envReads = 0;
+    const env = new Proxy<Record<string, string | undefined>>({}, {
+      get: () => {
+        envReads += 1;
+        throw new Error("disabled account attempted identity resolution");
+      },
+    });
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            off: {
+              enabled: false,
+              auth: { strategy: "anonymous" },
+            },
+          },
+        },
+      },
+    };
+
+    expect(planAccounts(cfg, { env })).toEqual([]);
+    expect(envReads).toBe(0);
+  });
+});
+
 describe("planAccounts: 가-2 decoupled handling agent", () => {
   it("serves a named account that declares NO agentId (agent is a bind concern)", () => {
     // 가-2: the wire identity is the accountId itself, so a named account needs no

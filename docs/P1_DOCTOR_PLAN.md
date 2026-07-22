@@ -237,7 +237,7 @@ type WebchannelProbe = BaseProbeResult & {
   accountId: string;
   admission: AdmissionMode;
   jwks?: { source: "url" | "file" | "inline"; keyCount: number } | { error: string };
-  relay?: { ok: true; url: string } | { error: string };
+  relay?: { ok: true } | { error: string };
 };
 ```
 
@@ -284,6 +284,9 @@ type WebchannelProbe = BaseProbeResult & {
   Honest claim (review finding 12): this proves **relay authentication +
   connectivity only** — `subscribe` returns before any async permission fault
   can surface. The probe result label says exactly that.
+  Successful status exposes only `{ok:true}` (never the credential-bearing dial
+  URL); relay/JWKS URL errors remove userinfo, path, query, and fragment content
+  while retaining only a safe scheme/host/port and the useful failure reason.
 - **JWKS leg — probe the EFFECTIVE key source** (review finding 11), not the
   Gate A derived URL: run `resolveEffectiveAccountAuth` first, then probe
   whichever single source the runtime would use — `jwksUrl` → bounded fetch via

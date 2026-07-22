@@ -262,9 +262,9 @@ export default defineChannelPluginEntry({
     const config = api.config as typeof api.config & WebchannelChannelConfig;
     const legacyNats = config.nats;
 
-    // Phase 3 planning (pure): list accounts. The wire identity is the accountId
-    // itself (unique by construction), so there are no structural pre-I/O skips.
-    // Order is deterministic (sorted accountIds).
+    // Phase 3 planning (pure): list enabled accounts. Disabled accounts are
+    // omitted before acquisition/credential/network work; the wire identity is
+    // the accountId itself (unique by construction). Order is deterministic.
     const plans = planAccounts(api.config, {
       warn: (msg) => (api.logger?.warn ?? console.warn)?.(msg),
     });

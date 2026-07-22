@@ -141,6 +141,23 @@ export function readAccountsMap(
     : {};
 }
 
+/**
+ * Resolve whether an account is enabled for both status and runtime planning.
+ * A channel-level false disables every account; otherwise an explicit named
+ * account false disables only that account. Missing flags default to enabled.
+ */
+export function isWebchannelAccountEnabled(
+  cfg: unknown,
+  accountId?: string | null,
+): boolean {
+  const section = readWebchannelSection(cfg);
+  if (section?.enabled === false) return false;
+
+  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const account = readAccountsMap(section)[id];
+  return !(account && typeof account === "object" && account.enabled === false);
+}
+
 /** The channel-level shared base (flat fields, excluding structural keys). */
 function channelLevelBase(
   section: Record<string, unknown> | undefined,

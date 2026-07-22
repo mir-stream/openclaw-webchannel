@@ -276,7 +276,7 @@ export type WebchannelProbe = BaseProbeResult & {
   accountId: string;
   admission: "register-hop";
   jwks?: { source: "url" | "file" | "inline"; keyCount: number } | { error: string };
-  relay?: { ok: true; url: string } | { error: string };
+  relay?: { ok: true } | { error: string };
 };
 
 export type ProbeDeps = {
@@ -312,7 +312,16 @@ export async function probeWebchannelAccount(params: {
     // Register-hop is the only admission path; the probe reports it verbatim.
     const admission = "register-hop" as const;
     if (dialMaterial.status !== "ok") {
-      return { ok: false, error: dialMaterial.status === "invalid" ? dialMaterial.error : `no enrolled credentials for ${accountId}`, accountId, admission };
+      return {
+        ok: false,
+        error: redactUrlSecrets(
+          dialMaterial.status === "invalid"
+            ? dialMaterial.error
+            : `no enrolled credentials for ${accountId}`,
+        ),
+        accountId,
+        admission,
+      };
     }
 
     const relay = await probeRelay(dialMaterial, plan.tenant, accountId, params.timeoutMs, deps);
@@ -330,7 +339,7 @@ export async function probeWebchannelAccount(params: {
         validateJwtVerifierConfig(effective);
         jwks = await probeJwks(effective, params.timeoutMs, deps);
       } catch (err) {
-        jwks = { error: errorMessage(err) };
+        jwks = { error: redactUrlSecrets(errorMessage(err)) };
       }
     }
     const errors = [
@@ -349,7 +358,12 @@ export async function probeWebchannelAccount(params: {
       relay,
     };
   } catch (err) {
-    return { ok: false, error: errorMessage(err), accountId, admission: "register-hop" };
+    return {
+      ok: false,
+      error: redactUrlSecrets(errorMessage(err)),
+      accountId,
+      admission: "register-hop",
+    };
   }
 }
 
@@ -386,13 +400,15 @@ function collectRuntimeStatusIssues(accounts: ChannelAccountSnapshot[]): Channel
   return issues;
 }
 
-async function probeRelay(material: Extract<DialMaterial, { status: "ok" }>, tenant: string, accountId: string, timeoutMs: number, deps: ProbeDeps): Promise<{ ok: true; url: string } | { error: string }> {
+async function probeRelay(material: Extract<DialMaterial, { status: "ok" }>, tenant: string, accountId: string, timeoutMs: number, deps: ProbeDeps): Promise<{ ok: true } | { error: string }> {
   const result = await (deps.dial ?? dialRelayForPreflight)({
     ...material.dial,
     subject: `webchannel.${tenant}.${accountId}._doctor`,
     timeoutMs,
   });
-  return "error" in result ? result : { ok: true, url: material.dial.url };
+  return "error" in result
+    ? { error: redactUrlSecrets(result.error) }
+    : { ok: true };
 }
 
 async function probeJwks(auth: JwtAuthConfig, timeoutMs: number, deps: ProbeDeps): Promise<Exclude<WebchannelProbe["jwks"], undefined>> {
@@ -416,6 +432,22 @@ function isFailedProbe(value: unknown): value is { ok: false; error: string } {
 }
 
 function normalizeSlash(value: string): string { return value.replace(/\/+$/, ""); }
+const URL_IN_ERROR_RE = /\b(?:https?|wss?):\/\/[^\s<>"'`]+/gi;
+function redactUrlSecrets(value: string): string {
+  return value.replace(URL_IN_ERROR_RE, (rawUrl) => {
+    try {
+      const url = new URL(rawUrl);
+      url.username = "";
+      url.password = "";
+      url.pathname = "";
+      url.search = "";
+      url.hash = "";
+      return `${url.protocol}//${url.host}`;
+    } catch {
+      return "[redacted-url]";
+    }
+  });
+}
 function configurationInvalidFinding(accountId: string, err: unknown): DoctorFinding {
   return {
     accountId,

@@ -16,6 +16,7 @@ import {
 import type { ResolveAccountTransport } from "./approvals.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  isWebchannelAccountEnabled,
   listWebchannelAccountIds,
   readAccountsMap,
   readWebchannelSection,
@@ -94,19 +95,6 @@ function resolveAccount(
     allowFrom: (account.allowFrom as string[] | undefined) ?? [],
     dmPolicy: account.dmSecurity as string | undefined,
   };
-}
-
-function isWebchannelAccountEnabled(
-  cfg: OpenClawConfig,
-  accountId?: string | null,
-): boolean {
-  const section = readWebchannelSection(cfg);
-  // Channel-level disable dominates every flat or named account.
-  if (section?.enabled === false) return false;
-
-  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
-  const account = readAccountsMap(section)[id];
-  return !(account && typeof account === "object" && account.enabled === false);
 }
 
 function isWebchannelAccountConfigured(

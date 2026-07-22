@@ -18,6 +18,7 @@
 
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  isWebchannelAccountEnabled,
   listWebchannelAccountIds,
   readAccountsMap,
   readWebchannelSection,
@@ -47,8 +48,9 @@ export type PlanAccountsOptions = {
  * Plan which webchannel accounts to serve from a config. Pure (no I/O).
  *
  * Order follows `listWebchannelAccountIds` (sorted) for deterministic serving.
- * Every listed account is served — the accountId is the unique wire identity, so
- * there are no structural (pre-I/O) skips to apply.
+ * Every enabled listed account is served; disabled accounts are omitted before
+ * acquisition identity or later runtime I/O. The accountId is the unique wire
+ * identity, so there are no other structural (pre-I/O) skips to apply.
  */
 export function planAccounts(
   cfg: unknown,
@@ -61,6 +63,10 @@ export function planAccounts(
   const entries: AccountPlanEntry[] = [];
 
   for (const accountId of accountIds) {
+    // Share the exact status predicate and skip before acquisition identity,
+    // credential resolution, or any future per-account runtime I/O.
+    if (!isWebchannelAccountEnabled(cfg, accountId)) continue;
+
     // Identity with config-over-env precedence. For a named account this is
     // config-only; for the synthesized default with no config it is env-derived.
     const { identity } = resolveAcquisitionEnvPrecedence(cfg, accountId, {
