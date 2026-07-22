@@ -297,6 +297,39 @@ describe("status probe", () => {
     expect(fetchImpl).toHaveBeenCalled();
   });
 
+  it("rejects string-valued inline JWKS for a named account after relay success", async () => {
+    const dial = vi.fn(async () => ({ ok: true as const }));
+    const result = await probeWebchannelAccount(
+      {
+        account: { accountId: "named" },
+        timeoutMs: 50,
+        cfg: cfg({
+          accounts: {
+            named: {
+              auth: {
+                strategy: "jwt",
+                jwt: {
+                  issuer: "https://issuer",
+                  audience: "named",
+                  jwks: JSON.stringify({ keys: [{ kty: "RSA", kid: "test" }] }),
+                },
+              },
+            },
+          },
+        }),
+      },
+      { env: {}, loadCreds: () => persisted, dial },
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: "jwks: JWKS must be an object with a keys array",
+      relay: { ok: true },
+      jwks: { error: "JWKS must be an object with a keys array" },
+    });
+    expect(dial).toHaveBeenCalled();
+  });
+
   it("never returns relay URL credentials or URL-JWKS secrets in probe failures", async () => {
     const relayUrl = "wss://user:pass@relay.example/ws?access_token=topsecret#frag";
     const jwksUrl = "https://jwks-user:jwks-pass@idp.example/keys?api_key=jwks-topsecret#jwks-frag";

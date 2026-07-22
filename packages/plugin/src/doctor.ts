@@ -443,14 +443,19 @@ async function probeJwks(auth: JwtAuthConfig, timeoutMs: number, deps: ProbeDeps
     const cache = JWKSCache.create({ jwksUrl: jwt.jwksUrl }, { fetchTimeoutMs: timeoutMs, ...(deps.fetchImpl !== undefined ? { fetchImpl: deps.fetchImpl } : {}) });
     return { source: "url", keyCount: (await cache.warm()).keys.length };
   }
-  if (jwt.jwksFile !== undefined) return { source: "file", keyCount: parseJwks((deps.readFile ?? ((path) => readFileSync(path, "utf8")))(jwt.jwksFile)).keys.length };
-  return { source: "inline", keyCount: parseJwks(jwt.jwks).keys.length };
+  if (jwt.jwksFile !== undefined) {
+    const contents = (deps.readFile ?? ((path) => readFileSync(path, "utf8")))(jwt.jwksFile);
+    return {
+      source: "file",
+      keyCount: parseJwksDocument(JSON.parse(contents) as unknown).keys.length,
+    };
+  }
+  return { source: "inline", keyCount: parseJwksDocument(jwt.jwks).keys.length };
 }
 
-function parseJwks(value: unknown): JsonWebKeySet {
-  const parsed = typeof value === "string" ? JSON.parse(value) as unknown : value;
-  if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as { keys?: unknown }).keys)) throw new Error("JWKS must be an object with a keys array");
-  return parsed as JsonWebKeySet;
+function parseJwksDocument(value: unknown): JsonWebKeySet {
+  if (!value || typeof value !== "object" || !Array.isArray((value as { keys?: unknown }).keys)) throw new Error("JWKS must be an object with a keys array");
+  return value as JsonWebKeySet;
 }
 
 function isFailedProbe(value: unknown): value is { ok: false; error: string } {
