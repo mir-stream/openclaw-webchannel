@@ -142,6 +142,19 @@ export function readAccountsMap(
 }
 
 /**
+ * Whether `channels.webchannel` contains actual account configuration data.
+ * Lifecycle/selection metadata alone does not configure an account: an empty
+ * `accounts` map, `defaultAccount`, and `enabled` are structural. Any real flat
+ * field or at least one entry in `accounts` does count as configuration.
+ */
+export function hasWebchannelConfig(cfg: unknown): boolean {
+  const section = readWebchannelSection(cfg);
+  if (!section) return false;
+  if (Object.keys(readAccountsMap(section)).length > 0) return true;
+  return Object.keys(section).some((key) => !STRUCTURAL_KEYS.has(key));
+}
+
+/**
  * Resolve whether an account is enabled for both status and runtime planning.
  * A channel-level false disables every account; otherwise an explicit named
  * account false disables only that account. Missing flags default to enabled.

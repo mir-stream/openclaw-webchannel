@@ -16,6 +16,7 @@ import {
 import type { ResolveAccountTransport } from "./approvals.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  hasWebchannelConfig,
   isWebchannelAccountEnabled,
   listWebchannelAccountIds,
   readAccountsMap,
@@ -102,7 +103,7 @@ function isWebchannelAccountConfigured(
   accountId?: string | null,
 ): boolean {
   const section = readWebchannelSection(cfg);
-  if (!section || Object.keys(section).length === 0) return false;
+  if (!section || !hasWebchannelConfig(cfg)) return false;
 
   const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   const accounts = readAccountsMap(section);
@@ -113,10 +114,7 @@ function isWebchannelAccountConfigured(
   // Flat configuration represents only the implicit default account. Structural
   // keys alone do not configure that account, and must not configure arbitrary
   // account ids synthesized by a caller.
-  if (id !== DEFAULT_WEBCHANNEL_ACCOUNT_ID) return false;
-  return Object.keys(section).some(
-    (key) => !["accounts", "defaultAccount", "enabled"].includes(key),
-  );
+  return id === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
 }
 
 /**

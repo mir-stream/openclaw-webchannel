@@ -109,6 +109,20 @@ describe("evaluateWebchannelDoctor findings", () => {
     expect(saas?.message).toContain("2026-08-15");
   });
 
+  it("does not diagnose acquisition env that is honored beside lifecycle metadata only", () => {
+    const findings = evaluateWebchannelDoctor(cfg({ enabled: true }), {
+      env: {
+        WEBCHANNEL_TENANT: "legacy-tenant",
+        WEBCHANNEL_SAAS_BASE_URL: "https://legacy-saas.example",
+      },
+      loadPersistedEnrolledCreds: () => persisted,
+    });
+
+    expect(
+      findings.filter((finding) => finding.checkId === "deprecated-acquisition-env"),
+    ).toEqual([]);
+  });
+
   it("keeps healthy compatibility fixtures at zero findings", () => {
     const fixtures = [
       cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
@@ -243,6 +257,35 @@ describe("status probe", () => {
     expect(dial).toHaveBeenCalledWith(expect.objectContaining({ subject: "webchannel.default-tenant.default._doctor" }));
   });
 
+  it("probes a healthy target without planning an invalid sibling", async () => {
+    const dial = vi.fn(async () => ({ ok: true as const }));
+    const loadCreds = vi.fn((_accountId: string) => persisted);
+    const result = await probeWebchannelAccount(
+      {
+        account: { accountId: "good" },
+        timeoutMs: 50,
+        cfg: cfg({
+          accounts: {
+            bad: { auth: { strategy: "anonymous" } },
+            good: { auth: validAuth("good"), dmSecurity: "allowlist" },
+          },
+        }),
+      },
+      { env: {}, loadCreds, dial },
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      accountId: "good",
+      jwks: { source: "inline", keyCount: 1 },
+      relay: { ok: true },
+    });
+    expect(dial).toHaveBeenCalledWith(
+      expect.objectContaining({ subject: "webchannel.default-tenant.good._doctor" }),
+    );
+    expect(loadCreds.mock.calls.every(([accountId]) => accountId === "good")).toBe(true);
+  });
+
   it("probes the effective file and URL JWKS sources through injected seams", async () => {
     const dial = vi.fn(async () => ({ ok: true as const }));
     const file = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksFile: "/keys.json" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, readFile: () => JSON.stringify({ keys: [{ kty: "RSA" }] }) });
@@ -358,6 +401,39 @@ describe("status probe", () => {
     ]) ?? [];
     expect(issues.some((issue) => issue.accountId === "a")).toBe(true);
     expect(issues.some((issue) => issue.accountId === "b" && issue.kind === "auth")).toBe(true);
+  });
+
+  it("ignores disabled and unconfigured lifecycle rows but reports active failures", () => {
+    const status = createWebchannelStatusAdapter();
+    const inactiveIssues = status.collectStatusIssues?.([
+      {
+        accountId: "disabled",
+        enabled: false,
+        configured: true,
+        lastError: "disabled",
+        probe: { ok: false, error: "disabled" },
+      } as never,
+      {
+        accountId: "unconfigured",
+        enabled: true,
+        configured: false,
+        lastError: "not configured",
+        probe: { ok: false, error: "not configured" },
+      } as never,
+    ]) ?? [];
+    expect(inactiveIssues).toEqual([]);
+
+    const activeIssues = status.collectStatusIssues?.([
+      {
+        accountId: "active",
+        enabled: true,
+        configured: true,
+        lastError: "relay disconnected",
+      },
+    ]) ?? [];
+    expect(activeIssues.map((issue) => issue.message)).toEqual([
+      "Channel error: relay disconnected",
+    ]);
   });
 
   it("keeps a distinct pre-existing lastError beside a failed probe for the same account", () => {

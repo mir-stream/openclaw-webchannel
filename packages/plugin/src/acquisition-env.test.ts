@@ -40,6 +40,26 @@ describe("resolveAcquisitionEnvPrecedence", () => {
     expect(usedLegacyEnv).toBe(true);
   });
 
+  it("treats an enabled-only channel section as structural and honors legacy env", () => {
+    const warn = vi.fn();
+    const cfg = { channels: { webchannel: { enabled: true } } };
+    const { identity, usedLegacyEnv } = resolveAcquisitionEnvPrecedence(cfg, "default", {
+      env: {
+        WEBCHANNEL_TENANT: "envTenant",
+        WEBCHANNEL_SAAS_BASE_URL: "https://env-saas.example",
+      },
+      warn,
+    });
+
+    expect(identity).toEqual({
+      accountId: "default",
+      tenant: "envTenant",
+      saasBaseUrl: "https://env-saas.example",
+    });
+    expect(usedLegacyEnv).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
   it("IGNORES env and uses config when a webchannel config exists", () => {
     const warn = vi.fn();
     const cfg = {

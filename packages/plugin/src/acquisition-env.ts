@@ -22,7 +22,7 @@
 
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  readWebchannelSection,
+  hasWebchannelConfig,
   resolveAcquisitionIdentity,
   type WebchannelAcquisitionIdentity,
 } from "./account-config.js";
@@ -36,10 +36,8 @@ export const ACQUISITION_IDENTITY_ENV_KEYS = [
   ...EFFECTIVE_DEPRECATED_ACQUISITION_ENV_KEYS,
 ] as const;
 
-export function hasWebchannelConfig(cfg: unknown): boolean {
-  const section = readWebchannelSection(cfg);
-  return section !== undefined && Object.keys(section).length > 0;
-}
+// Retain the existing module export while sharing the account-model predicate.
+export { hasWebchannelConfig };
 
 /** Module-scoped guard so the deprecation warning fires at most once per process. */
 let deprecationWarned = false;

@@ -12,10 +12,10 @@ import { collectStatusIssuesFromLastError } from "openclaw/plugin-sdk/status-hel
 
 import {
   EFFECTIVE_DEPRECATED_ACQUISITION_ENV_KEYS,
-  hasWebchannelConfig,
   IGNORED_ACQUISITION_IDENTITY_ENV_KEYS,
 } from "./acquisition-env.js";
 import {
+  hasWebchannelConfig,
   isWebchannelAccountEnabled,
   listWebchannelAccountIds,
   loadPersistedEnrolledCreds,
@@ -30,7 +30,6 @@ import { JWKSCache, type JsonWebKeySet } from "./jwks.js";
 import {
   type AccountPlanEntry,
   detectOrphanedDefault,
-  planAccounts,
   planWebchannelAccount,
 } from "./multiplex.js";
 import type { WebchannelNatsConfig } from "./nats-credential-source.js";
@@ -313,7 +312,13 @@ export async function probeWebchannelAccount(params: {
 }, deps: ProbeDeps = {}): Promise<WebchannelProbe> {
   const accountId = params.account.accountId ?? "default";
   try {
-    const plan = planAccounts(params.cfg, { env: deps.env, warn: () => {} }).find((entry) => entry.accountId === accountId);
+    if (!listWebchannelAccountIds(params.cfg).includes(accountId)) {
+      throw new Error(`account ${accountId} is not configured`);
+    }
+    const plan = planWebchannelAccount(params.cfg, accountId, {
+      env: deps.env,
+      warn: () => {},
+    });
     if (!plan) throw new Error(`account ${accountId} is not configured`);
     const top = params.cfg as unknown as { nats?: { url?: string }; saas?: { baseUrl?: string } };
     const nats = plan.account.nats as WebchannelNatsConfig | undefined;
@@ -394,7 +399,10 @@ export function createWebchannelStatusAdapter(deps: ProbeDeps = {}): ChannelStat
 
 function collectRuntimeStatusIssues(accounts: ChannelAccountSnapshot[]): ChannelStatusIssue[] {
   const issues: ChannelStatusIssue[] = [];
-  for (const snapshot of accounts) {
+  const activeAccounts = accounts.filter(
+    (snapshot) => snapshot.enabled !== false && snapshot.configured !== false,
+  );
+  for (const snapshot of activeAccounts) {
     const probe = (snapshot as unknown as { probe?: unknown }).probe;
     if (!isFailedProbe(probe)) continue;
     issues.push({
@@ -407,7 +415,7 @@ function collectRuntimeStatusIssues(accounts: ChannelAccountSnapshot[]): Channel
   }
   issues.push(...collectStatusIssuesFromLastError(
     "webchannel",
-    accounts.filter((snapshot) => {
+    activeAccounts.filter((snapshot) => {
       const probe = (snapshot as unknown as { probe?: unknown }).probe;
       const lastError = typeof snapshot.lastError === "string"
         ? snapshot.lastError.trim()
