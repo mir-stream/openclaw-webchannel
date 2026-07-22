@@ -142,6 +142,20 @@ export class ProtocolMismatchError extends Error {
 }
 
 /**
+ * Thrown when an account has reached the agent-side conversation-key capacity.
+ * This is terminal for the current account and credentials: retrying or
+ * re-authenticating cannot create room. Operators must admit new users through
+ * another OpenClaw WebChannel account.
+ */
+export class PopCapacityError extends Error {
+  readonly code = 507;
+  constructor() {
+    super("pop-register: agent account conversation-key capacity reached (code 507)");
+    this.name = "PopCapacityError";
+  }
+}
+
+/**
  * Thrown when a register reply carries a required `protocolVersion` that is
  * missing or not a safe-integer number (e.g. the string "2" from a buggy or
  * third-party plugin). This is exactly the silent-break class the version
@@ -166,8 +180,9 @@ export class ProtocolVersionMalformedError extends ProtocolMismatchError {
  * Classify a `registerWithPop` throw as TERMINAL (true) vs TRANSIENT (false).
  *
  * TERMINAL = a rejected proof/token (`PopRejectedError`), mandatory-v2 mismatch
- * (`ProtocolMismatchError`), or non-transient server failure (`PopServerError`):
- * redialing the same peer cannot change the reply.
+ * (`ProtocolMismatchError`), account capacity rejection (`PopCapacityError`),
+ * or non-transient server failure (`PopServerError`): redialing the same peer
+ * cannot change the reply.
  *
  * TRANSIENT = everything else `registerWithPop` throws: a request timeout, a
  * `503` (JWKS unreachable), or retry-exhaustion because the AGENT is offline
@@ -177,6 +192,7 @@ export class ProtocolVersionMalformedError extends ProtocolMismatchError {
 export function isTerminalRegisterError(err: unknown): boolean {
   return (
     err instanceof PopRejectedError ||
+    err instanceof PopCapacityError ||
     err instanceof PopServerError ||
     err instanceof ProtocolMismatchError
   );
@@ -281,7 +297,9 @@ export async function registerWithPop(
     }
     if (registerReply?.error) {
       // 503 = transient (JWKS unreachable): retry like a lost reply. 401 = genuine
-      // reject: terminal. Anything else (e.g. 500): terminal server failure.
+      // reject: terminal. The exact capacity reply is terminal and separately
+      // classified; any other reply (e.g. 500, or an unknown 507) is a terminal
+      // server failure.
       if (registerReply.code === 503) {
         lastTimeout = new Error("pop-register: register unavailable (503) — retrying");
         continue;
@@ -297,6 +315,9 @@ export async function registerWithPop(
             `and requires v${advertised}`,
           advertised,
         );
+      }
+      if (registerReply.code === 507 && registerReply.error === "capacity_exceeded") {
+        throw new PopCapacityError();
       }
       throw new PopServerError(registerReply.code);
     }

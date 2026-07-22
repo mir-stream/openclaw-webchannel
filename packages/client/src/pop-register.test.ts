@@ -17,6 +17,8 @@ import {
   popSignedMessage,
   signPop,
   registerWithPop,
+  isTerminalRegisterError,
+  PopCapacityError,
   PopRejectedError,
   ProtocolMismatchError,
   type DevicePopJwk,
@@ -234,6 +236,33 @@ describe("registerWithPop (producer ↔ consumer interop)", () => {
         retries: 1,
       }),
     ).rejects.not.toBeInstanceOf(PopRejectedError);
+  });
+
+  it("classifies the exact 507 capacity reply as terminal without retrying", async () => {
+    const device = await generateDevicePopKeyPair();
+    const agent = makeFakeAgent({ peerId: PEER, serverPopJwk: device.publicJwk });
+    let registerAttempts = 0;
+    const request: RegisterRequestFn = async (payload) => {
+      const body = payload as { op?: string };
+      if (body.op === "register") {
+        registerAttempts++;
+        return { error: "capacity_exceeded", code: 507 };
+      }
+      return agent.request(payload);
+    };
+
+    const error = await registerWithPop({
+      request,
+      jwt: "jwt",
+      peerId: PEER,
+      devicePrivateKey: device.privateKey,
+      retries: 5,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PopCapacityError);
+    expect(isTerminalRegisterError(error)).toBe(true);
+    expect(agent.calls.challenge).toBe(1);
+    expect(registerAttempts).toBe(1);
   });
 
   it("throws after exhausting retries when every round-trip times out", async () => {

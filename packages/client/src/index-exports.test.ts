@@ -27,6 +27,8 @@ import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 // use is the whole check: if the barrel stops exporting the name, tsc fails here.
 const _errorCauseExported: WebChannelErrorCause = "protocol-mismatch";
 void _errorCauseExported;
+const _capacityCauseExported: WebChannelErrorCause = "capacity";
+void _capacityCauseExported;
 const registration = {
   devicePrivateKey: {} as CryptoKey,
   deviceX25519PrivateKey: {} as CryptoKey,
@@ -57,6 +59,10 @@ describe("public export surface (package entry)", () => {
   it("does not export the removed gateway client", () => {
     const removedExport = "WebChannel" + "Client";
     expect(removedExport in publicApi).toBe(false);
+  });
+
+  it("keeps the low-level PopCapacityError off the package root", () => {
+    expect("PopCapacityError" in publicApi).toBe(false);
   });
 
   it("constructs the NATS wrapper type without legacy WS options", () => {

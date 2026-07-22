@@ -127,7 +127,15 @@ export function registerAgent(
               code: 426,
               protocolVersion: options.versions?.protocolVersion ?? WEBCHANNEL_PROTOCOL_VERSION,
             }
-          : {error:options.rejectCode===503?"unavailable":"unauthorized",code:options.rejectCode},
+          : {
+              error:
+                options.rejectCode === 503
+                  ? "unavailable"
+                  : options.rejectCode === 507
+                    ? "capacity_exceeded"
+                    : "unauthorized",
+              code: options.rejectCode,
+            },
       )); return;
     }
     await options.beforeReply?.();

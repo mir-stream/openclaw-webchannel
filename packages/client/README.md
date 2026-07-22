@@ -39,6 +39,16 @@ Public state types include `ChatMessage`, `ApprovalRequest`, `ReasoningItem`,
 `WebChannelState`, `WebChannelErrorCause`, `WebChannelOptions`, and the P0-4
 send-result types `SendState`, `SendFailure`, and `SendReceipt`.
 
+### Terminal connection causes
+
+`WebChannelState.errorCause` distinguishes failures that need re-authentication
+from failures that need an operator or code change. In particular, `"capacity"`
+means the selected OpenClaw WebChannel account has reached its fixed
+conversation-key limit. It is terminal for that client instance and
+re-authentication will not help; the UI should direct the user to the operator.
+The lower-level `PopCapacityError` remains an internal direct-module detail and
+is not exported from the package root.
+
 ## Send-result contract (P0-4)
 
 Every `send()` returns a `SendReceipt` (or `undefined` for trimmed-empty input —
@@ -75,7 +85,7 @@ queued -> sent -> accepted -> completed        (+ failed, terminal, from any pre
   on a ready instance; terminal recovery requires a new instance as described
   below.
 
-Once a CL2 terminal failure fires (auth/register/secure-channel — `status:"error"`),
+Once a CL2 terminal failure fires (auth/register/capacity/secure-channel — `status:"error"`),
 the client instance is **permanently retired**: it never reconnects, and every
 subsequent `send()` resolves immediately to `failed{terminal}`. Recovery means
 constructing a NEW client with fresh credentials — reviving the same instance is

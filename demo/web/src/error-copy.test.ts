@@ -1,7 +1,7 @@
 /**
  * P1-7 terminal-error copy tests: every cause resolves to non-empty copy, an
- * absent cause falls back to the `unknown` entry, and the two unrecoverable
- * causes (`protocol-mismatch`, `config`) hide the Re-authenticate affordance.
+ * absent cause falls back to the `unknown` entry, and unrecoverable causes hide
+ * the Re-authenticate affordance.
  */
 import { describe, expect, it } from "vitest";
 
@@ -14,6 +14,7 @@ const ALL_CAUSES: WebChannelErrorCause[] = [
   "protocol-mismatch",
   "secure-channel-failed",
   "config",
+  "capacity",
   "server",
   "unknown",
 ];
@@ -42,6 +43,7 @@ describe("terminalErrorCopy", () => {
   it("hides Re-authenticate for the unrecoverable causes", () => {
     expect(terminalErrorCopy("protocol-mismatch").showReauth).toBe(false);
     expect(terminalErrorCopy("config").showReauth).toBe(false);
+    expect(terminalErrorCopy("capacity").showReauth).toBe(false);
   });
 
   it("offers Re-authenticate for the recoverable causes (incl. the unknown fallback)", () => {
@@ -52,5 +54,11 @@ describe("terminalErrorCopy", () => {
 
   it("scene ⑤: an expired credential still reads \"Credentials expired\"", () => {
     expect(terminalErrorCopy("auth-expired").heading).toBe("Credentials expired");
+  });
+
+  it("tells a capacity-rejected user to contact the operator", () => {
+    const copy = terminalErrorCopy("capacity");
+    expect(copy.heading).toMatch(/full/i);
+    expect(copy.hint).toMatch(/operator/i);
   });
 });

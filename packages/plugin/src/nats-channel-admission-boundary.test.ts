@@ -1,6 +1,13 @@
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
+import {
+  ConversationKeyCapacityError,
+  ConversationKeyStore,
+} from "./conversation-key-store.js";
 import { generateKeyPair } from "./e2e-crypto.js";
 import { NatsChannel } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
@@ -76,8 +83,46 @@ describe("authenticated subscription boundary", () => {
       { keyStore: keyStore as never, identityKeyPair: generateKeyPair() },
     );
     expect(() => sut.registerPeer("peer")).toThrow(/disk failure/);
-    expect(sut["peerSubscriptions"]).toHaveLength(0);
-    expect(sut["peerSessionKeys"]).toHaveLength(0);
+    expect(sut["peerSubscriptions"].size).toBe(0);
+    expect(sut["peerSessionKeys"].size).toBe(0);
     expect(transport.subjects.size).toBe(0);
+  });
+
+  it("rejects real key-store capacity before evicting any live peer", () => {
+    const home = mkdtempSync(join(tmpdir(), "webchannel-admission-capacity-"));
+    try {
+      const transport = new RecordingTransport();
+      const store = new ConversationKeyStore({
+        accountId: "acct",
+        home,
+        maxKeys: 2,
+        onCapacityWarning: () => {},
+      });
+      const sut = new NatsChannel(
+        transport as unknown as NatsTransport,
+        "acct",
+        "tenant",
+        { keyStore: store, identityKeyPair: generateKeyPair() },
+        { maxPeers: 2 },
+      );
+
+      sut.registerPeer("p1");
+      sut.registerPeer("p2");
+      const p1 = store.get("p1")!;
+      const p2 = store.get("p2")!;
+
+      expect(() => sut.registerPeer("p3")).toThrow(ConversationKeyCapacityError);
+      expect([...sut["peerSubscriptions"].keys()]).toEqual(["p1", "p2"]);
+      expect([...sut["peerSessionKeys"].keys()]).toEqual(["p1", "p2"]);
+      expect([...transport.subjects.values()]).toEqual([
+        "webchannel.tenant.acct.p1.in",
+        "webchannel.tenant.acct.p2.in",
+      ]);
+      expect(store.get("p3")).toBeNull();
+      expect(Buffer.from(store.get("p1")!).equals(Buffer.from(p1))).toBe(true);
+      expect(Buffer.from(store.get("p2")!).equals(Buffer.from(p2))).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

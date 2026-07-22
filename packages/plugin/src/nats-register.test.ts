@@ -10,12 +10,13 @@
  */
 
 import { generateKeyPairSync, sign as edSign, randomBytes, webcrypto } from "node:crypto";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import {
   handleRegisterRequest,
   REGISTER_UNAUTHORIZED,
   REGISTER_FAILED,
+  REGISTER_CAPACITY_EXCEEDED,
   REGISTER_UNAVAILABLE,
   type RegisterHandlerDeps,
 } from "./nats-register.js";
@@ -34,6 +35,8 @@ import {
 import { generateKeyPair as generateX25519KeyPair } from "./e2e-crypto.js";
 import type { JsonWebKeySet } from "./jwks.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
+import { ConversationKeyCapacityError } from "./conversation-key-store.js";
+import { formatCapacityReject } from "./capacity-status.js";
 
 const PEER = "user-42";
 const TENANT = "tenant-1";
@@ -126,6 +129,8 @@ function makeHarness(opts?: {
   requirePoP?: boolean;
   verifyIdentity?: RegisterHandlerDeps["verifyIdentity"];
   registerPeer?: (peerId: string) => void;
+  onCapacityReject?: RegisterHandlerDeps["onCapacityReject"];
+  logger?: RegisterHandlerDeps["logger"];
 }): Harness {
   const replies: string[] = [];
   const registered: string[] = [];
@@ -157,7 +162,8 @@ function makeHarness(opts?: {
     unregisterPeer: (pid) => unregistered.push(pid),
     sendHistorySnapshot: (pid) => snapshots.push(pid),
     sendApprovalSnapshot: (pid) => approvalSnapshots.push(pid),
-    logger: { error: () => {} },
+    ...(opts?.onCapacityReject ? { onCapacityReject: opts.onCapacityReject } : {}),
+    logger: opts?.logger ?? { error: () => {} },
   };
 
   const run = async (payload: unknown): Promise<void> => {
@@ -171,6 +177,17 @@ function makeHarness(opts?: {
   };
 
   return { deps, replies, registered, unregistered, snapshots, approvalSnapshots, wrapCalls, run };
+}
+
+async function runProvenRegister(h: Harness, device: ReturnType<typeof makeDevice>): Promise<void> {
+  await h.run({ op: "challenge", token: "jwt" });
+  const { nonce } = JSON.parse(h.replies.at(-1)!) as { nonce: string };
+  await h.run({
+    op: "register",
+    token: "jwt",
+    nonce,
+    signature: device.sign(popSignedMessage(PEER, nonce)),
+  });
 }
 
 describe("handleRegisterRequest (register over NATS)", () => {
@@ -415,6 +432,195 @@ describe("handleRegisterRequest (register over NATS)", () => {
     // Must reply REGISTER_FAILED (not throw / unhandledRejection).
     await expect(h.run({ op: "register", token: "jwt", nonce, signature })).resolves.toBeUndefined();
     expect(h.replies[1]).toBe(REGISTER_FAILED);
+  });
+
+  it("capacity failure replies 507 once before wrap/history/approval and reports safe status", async () => {
+    const device = makeDevice();
+    const onCapacityReject = vi.fn();
+    const logger = { error: vi.fn() };
+    const h = makeHarness({
+      identity: {
+        peerId: PEER,
+        popPublicJwk: device.popPublicJwk,
+        devicePublicKey: randomBytes(32).toString("base64url"),
+      } as JwtIdentity,
+      registerPeer: () => {
+        throw new ConversationKeyCapacityError({
+          accountId: "acct-a",
+          currentKeys: 10_000,
+          maxKeys: 10_000,
+        });
+      },
+      onCapacityReject,
+      logger,
+    });
+
+    await runProvenRegister(h, device);
+    expect(h.replies.at(-1)).toBe(REGISTER_CAPACITY_EXCEEDED);
+    expect(h.replies.filter((reply) => reply === REGISTER_CAPACITY_EXCEEDED)).toHaveLength(1);
+    expect(onCapacityReject).toHaveBeenCalledWith({
+      accountId: "acct-a",
+      currentKeys: 10_000,
+      maxKeys: 10_000,
+    });
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(h.wrapCalls).toHaveLength(0);
+    expect(h.snapshots).toHaveLength(0);
+    expect(h.approvalSnapshots).toHaveLength(0);
+  });
+
+  it("classifies a structurally valid foreign capacity error without instanceof", async () => {
+    const device = makeDevice();
+    const foreign = Object.assign(new Error("foreign module"), {
+      name: "ConversationKeyCapacityError",
+      accountId: "acct-a",
+      currentKeys: 10_001,
+      maxKeys: 10_000,
+    });
+    const h = makeHarness({
+      identity: {
+        peerId: PEER,
+        popPublicJwk: device.popPublicJwk,
+        devicePublicKey: randomBytes(32).toString("base64url"),
+      } as JwtIdentity,
+      registerPeer: () => {
+        throw foreign;
+      },
+      onCapacityReject: vi.fn(),
+    });
+    await runProvenRegister(h, device);
+    expect(h.replies.at(-1)).toBe(REGISTER_CAPACITY_EXCEEDED);
+  });
+
+  it.each([
+    { accountId: undefined, currentKeys: 10, maxKeys: 10 },
+    { accountId: "acct-a", currentKeys: 10, maxKeys: 0 },
+    { accountId: "acct-a", currentKeys: 1.5, maxKeys: 10 },
+  ])("keeps malformed same-name capacity errors on privacy-safe 500", async (fields) => {
+    const device = makeDevice();
+    const logger = { error: vi.fn() };
+    const h = makeHarness({
+      identity: {
+        peerId: PEER,
+        popPublicJwk: device.popPublicJwk,
+        devicePublicKey: randomBytes(32).toString("base64url"),
+      } as JwtIdentity,
+      registerPeer: () => {
+        throw Object.assign(new Error("dynamic-secret"), {
+          name: "ConversationKeyCapacityError",
+          ...fields,
+        });
+      },
+      logger,
+    });
+    await runProvenRegister(h, device);
+    expect(h.replies.at(-1)).toBe(REGISTER_FAILED);
+    expect(logger.error).toHaveBeenCalledWith(
+      "webchannel: malformed conversation-key capacity error; registration failed",
+    );
+    expect(logger.error.mock.calls.flat().join(" ")).not.toContain(PEER);
+    expect(logger.error.mock.calls.flat().join(" ")).not.toContain("dynamic-secret");
+  });
+
+  it("uses the shared formatter for the no-callback fallback", async () => {
+    const device = makeDevice();
+    const logger = { error: vi.fn() };
+    const status = { accountId: "acct-a", currentKeys: 10, maxKeys: 10 };
+    const h = makeHarness({
+      identity: {
+        peerId: PEER,
+        popPublicJwk: device.popPublicJwk,
+        devicePublicKey: randomBytes(32).toString("base64url"),
+      } as JwtIdentity,
+      registerPeer: () => {
+        throw new ConversationKeyCapacityError(status);
+      },
+      logger,
+    });
+    await runProvenRegister(h, device);
+    expect(logger.error).toHaveBeenCalledWith(formatCapacityReject(status));
+  });
+
+  it("keeps 507 reply-first when capacity diagnostics throw", async () => {
+    const device = makeDevice();
+    const events: string[] = [];
+    const consoleFallback = vi.spyOn(console, "error").mockImplementation(() => {
+      events.push("console");
+    });
+    const logger = {
+      error: vi.fn(() => {
+        events.push("logger");
+        throw new Error("must not be called");
+      }),
+    };
+    const h = makeHarness({
+      identity: {
+        peerId: PEER,
+        popPublicJwk: device.popPublicJwk,
+        devicePublicKey: randomBytes(32).toString("base64url"),
+      } as JwtIdentity,
+      registerPeer: () => {
+        throw new ConversationKeyCapacityError({
+          accountId: "acct-a",
+          currentKeys: 10,
+          maxKeys: 10,
+        });
+      },
+      onCapacityReject: () => {
+        events.push(h.replies.at(-1) === REGISTER_CAPACITY_EXCEEDED ? "reply-first" : "reply-missing");
+        throw new Error("capacity logger unavailable");
+      },
+      logger,
+    });
+
+    await expect(runProvenRegister(h, device)).resolves.toBeUndefined();
+    expect(events).toEqual(["reply-first", "console"]);
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(consoleFallback).toHaveBeenCalledOnce();
+    expect(h.replies.filter((reply) => reply === REGISTER_CAPACITY_EXCEEDED)).toHaveLength(1);
+  });
+
+  it("keeps 507 when the absent-callback logger and console fallback both throw", async () => {
+    const device = makeDevice();
+    vi.spyOn(console, "error").mockImplementation(() => {
+      throw new Error("console unavailable");
+    });
+    const h = makeHarness({
+      identity: {
+        peerId: PEER,
+        popPublicJwk: device.popPublicJwk,
+        devicePublicKey: randomBytes(32).toString("base64url"),
+      } as JwtIdentity,
+      registerPeer: () => {
+        throw new ConversationKeyCapacityError({
+          accountId: "acct-a",
+          currentKeys: 10,
+          maxKeys: 10,
+        });
+      },
+      logger: {
+        error: () => {
+          throw new Error("logger unavailable");
+        },
+      },
+    });
+    await expect(runProvenRegister(h, device)).resolves.toBeUndefined();
+    expect(h.replies.filter((reply) => reply === REGISTER_CAPACITY_EXCEEDED)).toHaveLength(1);
+  });
+
+  it("does not route tenant/subject security diagnostics through the capacity limiter", async () => {
+    const logger = { error: vi.fn() };
+    const onCapacityReject = vi.fn();
+    const h = makeHarness({
+      subjectPeerId: "spoofed-peer",
+      logger,
+      onCapacityReject,
+    });
+    for (let i = 0; i < 3; i += 1) {
+      await h.run({ op: "register", token: "jwt" });
+    }
+    expect(logger.error).toHaveBeenCalledTimes(3);
+    expect(onCapacityReject).not.toHaveBeenCalled();
   });
 
   it("transient verify failure (JWKS unreachable) → retryable 503, distinct from 401", async () => {

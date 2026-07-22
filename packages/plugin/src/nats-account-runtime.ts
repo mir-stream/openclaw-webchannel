@@ -17,6 +17,7 @@ import { NatsChannel } from "./nats-channel.js";
 import type { RegisterChannelSurface } from "./nats-channel.js";
 import type { InboundWsMessage, NatsChannelCryptoOptions } from "./nats-channel.js";
 import { ConversationKeyStore } from "./conversation-key-store.js";
+import { createCapacityDiagnostics } from "./capacity-diagnostics.js";
 import { resolveEncryptionPolicy } from "./encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./encryption-policy.js";
 import { createWebChannelPlugin } from "./channel.js";
@@ -580,6 +581,9 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       }
 
       const preflightIdentityKey = identityKey;
+      // Keep one limiter per account lifecycle so transport restart attempts do
+      // not reset capacity-rejection suppression and create a fresh log burst.
+      const capacityDiagnostics = createCapacityDiagnostics({ logger: api.logger });
       return await runAccountStartupLoop({
         signal: ctx.abortSignal,
         onRetryScheduled: ({ failure, failedAttempts, delayMs }) => {
@@ -732,7 +736,10 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       try {
         channel = new NatsChannel(transport, accountId, tenant, {
           ...cryptoOptions,
-          keyStore: new ConversationKeyStore({ accountId }),
+          keyStore: new ConversationKeyStore({
+            accountId,
+            onCapacityWarning: capacityDiagnostics.onCapacityWarning,
+          }),
           identityKeyPair: attemptIdentityKey,
         });
       } catch (err) {
@@ -1198,6 +1205,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
                 listPendingApprovalsForPeer(accountId, pid),
                 listResolvedApprovalsForPeer(accountId, pid),
               ),
+            onCapacityReject: capacityDiagnostics.onCapacityReject,
             logger: api.logger,
           }).catch((err) => {
             api.logger?.error?.(

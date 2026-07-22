@@ -82,6 +82,21 @@ describe("index-nats.ts wiring contract — account-bound auth and startup", () 
   });
 });
 
+describe("nats-account-runtime.ts wiring contract — capacity diagnostics", () => {
+  it("creates one diagnostics composition site and passes both callbacks by reference", () => {
+    expect(RUNTIME_SOURCE.match(/const capacityDiagnostics = createCapacityDiagnostics\(\{/g)).toHaveLength(1);
+    expect(RUNTIME_SOURCE).toMatch(
+      /onCapacityWarning:\s*capacityDiagnostics\.onCapacityWarning/,
+    );
+    expect(RUNTIME_SOURCE).toMatch(
+      /onCapacityReject:\s*capacityDiagnostics\.onCapacityReject/,
+    );
+    expect(RUNTIME_SOURCE).not.toMatch(
+      /onCapacity(?:Warning|Reject):\s*capacityDiagnostics\.onCapacity(?:Warning|Reject)\(/,
+    );
+  });
+});
+
 describe("index-nats.ts wiring contract — command catalog (P0-3)", () => {
   it("serves load_commands from the MEMOIZED provider, not a per-request build", () => {
     // The handler must call the memoized provider (`catalogProvider()`), never
