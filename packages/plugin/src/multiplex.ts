@@ -44,6 +44,33 @@ export type PlanAccountsOptions = {
   warn?: (msg: string) => void;
 };
 
+/** Plan one raw account id without applying cross-account warnings. */
+export function planWebchannelAccount(
+  cfg: unknown,
+  accountId: string,
+  opts: PlanAccountsOptions = {},
+): AccountPlanEntry | undefined {
+  // Share the exact status predicate and skip before acquisition identity,
+  // credential resolution, or any future per-account runtime I/O.
+  if (!isWebchannelAccountEnabled(cfg, accountId)) return undefined;
+
+  // Identity with config-over-env precedence. For a named account this is
+  // config-only; for the synthesized default with no config it is env-derived.
+  const { identity } = resolveAcquisitionEnvPrecedence(cfg, accountId, {
+    ...(opts.env !== undefined ? { env: opts.env } : {}),
+    ...(opts.warn !== undefined ? { warn: opts.warn } : {}),
+  });
+
+  const account = resolveWebchannelAccountConfig(cfg, accountId);
+  return {
+    status: "serve",
+    accountId,
+    tenant: identity.tenant,
+    ...(identity.saasBaseUrl !== undefined ? { saasBaseUrl: identity.saasBaseUrl } : {}),
+    account,
+  };
+}
+
 /**
  * Plan which webchannel accounts to serve from a config. Pure (no I/O).
  *
@@ -63,25 +90,8 @@ export function planAccounts(
   const entries: AccountPlanEntry[] = [];
 
   for (const accountId of accountIds) {
-    // Share the exact status predicate and skip before acquisition identity,
-    // credential resolution, or any future per-account runtime I/O.
-    if (!isWebchannelAccountEnabled(cfg, accountId)) continue;
-
-    // Identity with config-over-env precedence. For a named account this is
-    // config-only; for the synthesized default with no config it is env-derived.
-    const { identity } = resolveAcquisitionEnvPrecedence(cfg, accountId, {
-      ...(opts.env !== undefined ? { env: opts.env } : {}),
-      ...(opts.warn !== undefined ? { warn: opts.warn } : {}),
-    });
-
-    const account = resolveWebchannelAccountConfig(cfg, accountId);
-    entries.push({
-      status: "serve",
-      accountId,
-      tenant: identity.tenant,
-      ...(identity.saasBaseUrl !== undefined ? { saasBaseUrl: identity.saasBaseUrl } : {}),
-      account,
-    });
+    const plan = planWebchannelAccount(cfg, accountId, opts);
+    if (plan) entries.push(plan);
   }
 
   return entries;

@@ -156,6 +156,33 @@ describe("evaluateWebchannelDoctor findings", () => {
     expect(warnings[0]).toMatch(/configuration-invalid.*invalid account id.*\.\.\/bad/i);
   });
 
+  it("isolates removed config planning failures and still diagnoses a sibling", async () => {
+    const adapter = createWebchannelDoctorAdapter({
+      env: {},
+      loadPersistedEnrolledCreds: () => persisted,
+    });
+    const warnings = await adapter.collectPreviewWarnings!({
+      cfg: cfg({
+        accounts: {
+          bad: { auth: { strategy: "anonymous" } },
+          good: {
+            auth: validAuth("good"),
+            encryption: { mode: "disabled" },
+          },
+        },
+      }),
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {},
+    });
+
+    expect(warnings).toHaveLength(2);
+    expect(warnings).toEqual(expect.arrayContaining([
+      expect.stringMatching(/channels\.webchannel\.bad.*\[configuration-invalid\].*auth\.strategy="anonymous"/),
+      expect.stringMatching(/channels\.webchannel\.good.*\[encryption-disabled\]/),
+    ]));
+    expect(warnings.every((warning) => warning.startsWith("- channels.webchannel."))).toBe(true);
+  });
+
   it("keeps a throwing credential loader account-scoped", () => {
     const findings = evaluateWebchannelDoctor(
       cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),

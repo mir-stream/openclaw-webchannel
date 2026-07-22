@@ -16,6 +16,8 @@ import {
   IGNORED_ACQUISITION_IDENTITY_ENV_KEYS,
 } from "./acquisition-env.js";
 import {
+  isWebchannelAccountEnabled,
+  listWebchannelAccountIds,
   loadPersistedEnrolledCreds,
   type PersistedEnrolledCreds,
 } from "./account-config.js";
@@ -25,7 +27,12 @@ import { validateJwtVerifierConfig, validateVerifierConfig } from "./auth.js";
 import { resolveDialMaterial, type DialMaterial } from "./consume-credentials.js";
 import { resolveEncryptionPolicy, type WebchannelEncryptionConfig } from "./encryption-policy.js";
 import { JWKSCache, type JsonWebKeySet } from "./jwks.js";
-import { detectOrphanedDefault, planAccounts } from "./multiplex.js";
+import {
+  type AccountPlanEntry,
+  detectOrphanedDefault,
+  planAccounts,
+  planWebchannelAccount,
+} from "./multiplex.js";
 import type { WebchannelNatsConfig } from "./nats-credential-source.js";
 import { resolveNatsCredentialSource } from "./nats-credential-source.js";
 import { dialRelayForPreflight } from "./preflight.js";
@@ -67,7 +74,18 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
   const claims = new Map<string, string>();
   const top = cfg as { nats?: { url?: string }; saas?: { baseUrl?: string } };
 
-  for (const plan of planAccounts(cfg, { env, warn: () => {} })) {
+  const plans: AccountPlanEntry[] = [];
+  for (const accountId of listWebchannelAccountIds(cfg)) {
+    if (!isWebchannelAccountEnabled(cfg, accountId)) continue;
+    try {
+      const plan = planWebchannelAccount(cfg, accountId, { env, warn: () => {} });
+      if (plan) plans.push(plan);
+    } catch (err) {
+      findings.push(configurationInvalidFinding(accountId, err));
+    }
+  }
+
+  for (const plan of plans) {
     const { accountId, account, tenant } = plan;
     const nats = account.nats as WebchannelNatsConfig | undefined;
     try {
