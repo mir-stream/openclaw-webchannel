@@ -126,6 +126,9 @@ export class NatsChannel implements WebChannelPeerChannel {
   private readonly transport: NatsTransport;
   private readonly accountId: string;
   private readonly tenant: string;
+  private disposed = false;
+  private registerSid: number | undefined;
+  private readonly transportMessageListener: (msg: NatsMessage) => void;
 
   // Per-peer subscriptions (peerId -> sid)
   private readonly peerSubscriptions = new Map<string, number>();
@@ -245,8 +248,11 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.maxSeenMessageIdsPerPeer =
       limits?.maxSeenMessageIdsPerPeer ?? DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER;
 
-    // Wire up NATS message handler
-    this.transport.on("message", (msg: NatsMessage) => this.handleNatsMessage(msg));
+    // Retain the exact listener identity so account teardown can detach it.
+    this.transportMessageListener = (msg: NatsMessage) => {
+      if (!this.disposed) this.handleNatsMessage(msg);
+    };
+    this.transport.on("message", this.transportMessageListener);
   }
 
   /**
@@ -256,6 +262,7 @@ export class NatsChannel implements WebChannelPeerChannel {
    * connects with its bootstrap JWT (peerId from JWT sub claim).
    */
   registerPeer(peerId: string): void {
+    if (this.disposed) throw new Error("NatsChannel is disposed");
     // Phase 6 (keyStore mode): establish the peer's STABLE conversation key K
     // from the agent-owned store — load if known, generate-once if new. Runs
     // even for an already-registered peer so a lost in-memory key (never
@@ -314,8 +321,10 @@ export class NatsChannel implements WebChannelPeerChannel {
    * pinned to THIS account — identity still comes only from the verified JWT.
    */
   subscribeRegister(): void {
+    if (this.disposed) throw new Error("NatsChannel is disposed");
+    if (this.registerSid !== undefined) return;
     const regWild = `webchannel.${this.tenant}.${this.accountId}.*.register`;
-    this.transport.subscribe(regWild);
+    this.registerSid = this.transport.subscribe(regWild);
     console.log(`[nats-channel] Subscribed to register wildcard ${regWild}`);
   }
 
@@ -351,6 +360,27 @@ export class NatsChannel implements WebChannelPeerChannel {
     // F4: drop the peer's replay window with it (bounded memory; a genuine
     // reconnect re-establishes a fresh window).
     this.seenMessageIds.delete(peerId);
+  }
+
+  /** Idempotently detach all NATS ownership and fail closed for later sends. */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.transport.off("message", this.transportMessageListener);
+    if (this.registerSid !== undefined) {
+      this.transport.unsubscribe(this.registerSid);
+      this.registerSid = undefined;
+    }
+    for (const sid of this.peerSubscriptions.values()) this.transport.unsubscribe(sid);
+    this.peerSubscriptions.clear();
+    this.peerSessionKeys.clear();
+    this.seenMessageIds.clear();
+    this.approvalResolutions.clear();
+    this.onMessage = undefined;
+    this.onApprovalDecision = undefined;
+    this.onLoadHistory = undefined;
+    this.onLoadCommands = undefined;
+    this.onRegisterRequest = undefined;
   }
 
   /**
@@ -597,7 +627,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   }
 
   private sendToPeer(peerId: string, payload: OutboundWsMessage): boolean {
-    if (!this.transport.connected) {
+    if (this.disposed || !this.transport.connected) {
       console.warn("[nats-channel] Transport not connected, cannot send");
       return false;
     }

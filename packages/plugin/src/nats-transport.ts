@@ -23,6 +23,83 @@
 import WebSocket from "ws";
 import { EventEmitter } from "node:events";
 
+export class NatsLifecycleAbortError extends Error {
+  constructor() { super("NATS startup aborted"); this.name = "NatsLifecycleAbortError"; }
+}
+
+export class NatsHandshakeTimeoutError extends Error {
+  constructor(public readonly phase: string) {
+    super(`NatsTransport: handshake timeout in phase ${phase}`);
+    this.name = "NatsHandshakeTimeoutError";
+  }
+}
+
+export class NatsConnectionClosedError extends Error {
+  constructor(
+    public readonly closeCode: number,
+    public readonly reasonPresent: boolean,
+  ) {
+    super(`NatsTransport: connection closed before NATS handshake (code=${closeCode || 1005}, reasonPresent=${reasonPresent})`);
+    this.name = "NatsConnectionClosedError";
+  }
+}
+
+export class NatsUnexpectedResponseError extends Error {
+  constructor(public readonly statusCode: number) {
+    super(`NatsTransport: WebSocket upgrade rejected (HTTP ${statusCode})`);
+    this.name = "NatsUnexpectedResponseError";
+  }
+}
+
+export type NatsServerErrorCode =
+  | "authorization-violation"
+  | "credentials-expired"
+  | "authentication-timeout"
+  | "protocol-error"
+  | "unknown";
+
+export class NatsServerError extends Error {
+  constructor(public readonly code: NatsServerErrorCode, detail?: string) {
+    const label = code === "authorization-violation" ? "Permissions Violation"
+      : code === "authentication-timeout" ? "Authentication Timeout"
+      : code === "credentials-expired" ? "Credentials Expired"
+      : code === "protocol-error" ? "Protocol Error" : "Unknown";
+    super(`NATS server error: ${detail ?? label}`);
+    this.name = "NatsServerError";
+  }
+}
+
+export type TransportCloseReport = {
+  reconnectSuppressed: boolean;
+  socketClosed: boolean;
+  forcedTerminationAttempted: boolean;
+  gracefulTimedOut: boolean;
+  closeHandle?: { probe: () => Promise<TransportCloseReport> };
+};
+
+function parseNatsServerError(line: string): NatsServerError {
+  const normalized = line.toLowerCase();
+  const detail = line.replace(/^-ERR\s+'?/, "").replace(/'$/, "").replace(/[\u0000-\u001f\u007f]/g, "?").slice(0, 1024);
+  if (normalized.includes("authorization violation") || normalized.includes("permissions violation")) return new NatsServerError("authorization-violation", detail);
+  if (normalized.includes("authentication timeout")) return new NatsServerError("authentication-timeout", detail);
+  const credentialExpired = /\bcredentials?\s+expired\b/.test(normalized);
+  const authenticationExpired = /\b(?:user|account)\s+authentication\s+expired\b/.test(normalized);
+  if (credentialExpired || authenticationExpired) return new NatsServerError("credentials-expired", detail);
+  if (normalized.includes("protocol")) return new NatsServerError("protocol-error", detail);
+  return new NatsServerError("unknown", detail);
+}
+
+function reconnectFailureLabel(error: unknown): string {
+  if (error instanceof NatsServerError) return `NATS ${error.code}`;
+  if (error instanceof NatsUnexpectedResponseError) return `WebSocket upgrade HTTP ${error.statusCode}`;
+  if (error instanceof NatsConnectionClosedError) return `WebSocket close code ${error.closeCode || 1005}`;
+  if (error instanceof NatsHandshakeTimeoutError) return `handshake timeout (${error.phase})`;
+  const code = typeof error === "object" && error !== null && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : undefined;
+  return code ? `transport ${code.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64)}` : "unclassified transport failure";
+}
+
 export const MAX_CONTROL_LINE = 64 * 1024;
 export const MAX_PAYLOAD = 8 * 1024 * 1024;
 export const MAX_BUFFERED_BYTES = MAX_CONTROL_LINE + MAX_PAYLOAD + 4;
@@ -160,6 +237,9 @@ export class NatsTransport extends EventEmitter {
   private reconnectAttempts = 0;
   // Pending backoff timer, if a reconnect is scheduled.
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private shutdownPromise: Promise<TransportCloseReport> | undefined;
+  private retainedSocket: WebSocket | null = null;
+  private readonly socketCleanup = new WeakMap<WebSocket, () => void>();
 
   constructor(options: NatsConnectOptions) {
     super();
@@ -200,7 +280,10 @@ export class NatsTransport extends EventEmitter {
    * Port-scan invariant: after this call (success or failure) the current
    * process has ZERO new TCP sockets in LISTEN state.
    */
-  connect(): Promise<void> {
+  connect(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(new NatsLifecycleAbortError());
+    if (this.retainedSocket) return Promise.reject(new Error("NatsTransport: previous socket closure is unconfirmed"));
+    this.shutdownPromise = undefined;
     // Re-arm auto-reconnect: an explicit connect() undoes a prior explicit
     // disconnect(). Without this, a transport reused via disconnect() →
     // connect() would silently lose S1 auto-reconnect forever (`closed` was
@@ -228,10 +311,31 @@ export class NatsTransport extends EventEmitter {
       // after it completes, errors are emitted so callers can react.
       let handshakeDone = false;
       let settled = false;
+      const removeSocketListener = (event: string, listener: (...args: any[]) => void): void => {
+        const detachable = ws as WebSocket & {
+          off?: (name: string, fn: (...args: any[]) => void) => unknown;
+          removeListener?: (name: string, fn: (...args: any[]) => void) => unknown;
+        };
+        if (typeof detachable.off === "function") detachable.off(event, listener);
+        else detachable.removeListener?.(event, listener);
+      };
+      const cleanupHandshakeListeners = (): void => {
+        removeSocketListener("open", onOpen);
+        removeSocketListener("unexpected-response", onUnexpectedResponse);
+      };
+      const cleanupSocketListeners = (): void => {
+        cleanupHandshakeListeners();
+        removeSocketListener("message", onMessage);
+        removeSocketListener("error", onError);
+        removeSocketListener("close", onClose);
+        this.socketCleanup.delete(ws);
+      };
       const settle = (err?: Error): void => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        cleanupHandshakeListeners();
         if (err) {
           reject(err);
         } else {
@@ -239,19 +343,24 @@ export class NatsTransport extends EventEmitter {
           resolve();
         }
       };
+      const onAbort = (): void => {
+        settle(new NatsLifecycleAbortError());
+        this.disconnect();
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
       const armDeadline = (nextPhase: string): void => {
         phase = nextPhase;
         if (timer) clearTimeout(timer);
         if (this.handshakeTimeoutMs === 0 || settled) return;
         timer = setTimeout(() => {
-          const err = new Error(`NatsTransport: handshake timeout in phase ${phase}`);
+          const err = new NatsHandshakeTimeoutError(phase);
           settle(err);
           try { ws.close(); } catch { /* own socket already closed */ }
         }, this.handshakeTimeoutMs);
         if (typeof timer.unref === "function") timer.unref();
       };
       const protocolViolation = (reason: string): void => {
-        const err = new Error(`NatsTransport: protocol violation: ${reason}`);
+        const err = new NatsServerError("protocol-error", `protocol violation: ${reason}`);
         // During the handshake the rejection IS the signal (mirrors the -ERR
         // branch): reject the connect() promise WITHOUT also emitting 'error',
         // which — with no listener attached yet — Node would rethrow as an
@@ -262,7 +371,7 @@ export class NatsTransport extends EventEmitter {
       };
       armDeadline("WebSocket open");
 
-      ws.on("open", () => {
+      const onOpen = () => {
         if (this.ws !== ws) return;
         if (this.nkeySigningCallback) {
           armDeadline("INFO");
@@ -295,9 +404,9 @@ export class NatsTransport extends EventEmitter {
           ws.send("PING\r\n");
           armDeadline("first PONG");
         }
-      });
+      };
 
-      ws.on("message", (data: Buffer | string) => {
+      const onMessage = (data: Buffer | string) => {
         if (this.ws !== ws) return;
         const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
         if (buffer.length + chunk.length > MAX_BUFFERED_BYTES) {
@@ -328,9 +437,9 @@ export class NatsTransport extends EventEmitter {
           return true;
         }, () => { connectOnWire = true; armDeadline("first PONG"); }, () => connectOnWire);
         buffer = result;
-      });
+      };
 
-      ws.on("error", (err: Error) => {
+      const onError = (err: Error) => {
         // Network-level error (refused, DNS fail, TLS fail, etc.).
         // If the handshake hasn't finished yet, reject the connect() promise
         // (the caller handles it via await/catch — no need to also throw via
@@ -338,6 +447,7 @@ export class NatsTransport extends EventEmitter {
         // caller hasn't added a listener yet).
         if (!handshakeDone) {
           settle(err);
+          try { ws.close(); } catch { try { ws.terminate(); } catch { /* disposer confirms */ } }
         } else if (this.ws === ws) {
           // Post-handshake error — emit to registered listeners. Identity
           // guard: after disconnect() (ws → null) or a newer connect(), this
@@ -345,21 +455,34 @@ export class NatsTransport extends EventEmitter {
           this._connected = false;
           this.emitError(err);
         }
-      });
+      };
 
-      ws.on("close", () => {
+      const onUnexpectedResponse = (_request: unknown, response: { statusCode?: number; resume?: () => void; destroy?: () => void; socket?: { destroy?: () => void } }) => {
+        const statusCode = response.statusCode ?? 0;
+        try { response.resume?.(); } catch { /* best effort */ }
+        try { response.destroy?.(); } catch { /* best effort */ }
+        try { response.socket?.destroy?.(); } catch { /* best effort */ }
+        settle(new NatsUnexpectedResponseError(statusCode));
+        try { ws.terminate(); } catch { /* shutdown owns confirmation */ }
+      };
+
+      const onClose = (code: number = 1005, reason?: Buffer) => {
+        const closeCause = new NatsConnectionClosedError(code, (reason?.length ?? 0) > 0);
         // If the socket closed before the handshake completed, the promise
         // is still pending — reject it. Always settle OUR OWN dial's promise,
         // even if the transport has since moved on to a newer socket.
-        settle(new Error("NatsTransport: connection closed before NATS handshake"));
+        settle(closeCause);
         // Stale-socket guard: ws close events fire ASYNC, so after an explicit
         // disconnect() (ws → null) or a newer connect() replaced this.ws, this
         // close belongs to a PREVIOUS socket — it must not flip the live
         // connection's state, emit a spurious "disconnect", or schedule a
         // reconnect alongside the live socket.
-        if (this.ws !== ws) return;
+        if (this.ws !== ws) {
+          cleanupSocketListeners();
+          return;
+        }
         this._connected = false;
-        this.emit("disconnect");
+        this.emit("disconnect", closeCause);
         // S1: auto-reconnect ONLY for an ESTABLISHED connection that dropped.
         // `handshakeDone` is per-socket, so a close during the INITIAL connect
         // (or a failed reconnect attempt's own handshake) does NOT schedule here
@@ -368,7 +491,16 @@ export class NatsTransport extends EventEmitter {
         if (this.reconnectEnabled && !this.closed && handshakeDone) {
           this.scheduleReconnect();
         }
-      });
+        if (this.ws === ws) this.ws = null;
+        cleanupSocketListeners();
+      };
+
+      this.socketCleanup.set(ws, cleanupSocketListeners);
+      ws.on("open", onOpen);
+      ws.on("message", onMessage);
+      ws.on("error", onError);
+      ws.on("unexpected-response", onUnexpectedResponse);
+      ws.on("close", onClose);
     });
   }
 
@@ -483,7 +615,7 @@ export class NatsTransport extends EventEmitter {
       }
 
       if (line.startsWith("-ERR ")) {
-        const err = new Error(`NATS server error: ${line}`);
+        const err = parseNatsServerError(line);
         if (!isEstablished()) {
           // Still in handshake — reject the connect() promise directly.
           // Do NOT also emit 'error' here: the promise rejection IS the error
@@ -592,6 +724,12 @@ export class NatsTransport extends EventEmitter {
    * undone by the auto-reconnect loop.
    */
   disconnect(): void {
+    void this.closeGracefully().catch(() => {});
+  }
+
+  /** Await the bounded physical-close protocol. Concurrent callers share it. */
+  closeGracefully(graceMs = 250, forceMs = 250): Promise<TransportCloseReport> {
+    if (this.shutdownPromise) return this.shutdownPromise;
     this.closed = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -599,14 +737,100 @@ export class NatsTransport extends EventEmitter {
     }
     this._connected = false;
     this.subs.clear();
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {
-        // Already closed or in a bad state — nothing to do.
-      }
-      this.ws = null;
+    const socket = this.ws ?? this.retainedSocket;
+    this.retainedSocket = socket;
+    this.ws = null;
+    this.shutdownPromise = this.confirmSocketClosed(socket, graceMs, forceMs).catch(() => ({
+      reconnectSuppressed: true,
+      socketClosed: false,
+      forcedTerminationAttempted: false,
+      gracefulTimedOut: false,
+      closeHandle: { probe: () => this.probePhysicalClose(graceMs, forceMs) },
+    }));
+    return this.shutdownPromise;
+  }
+
+  private async confirmSocketClosed(
+    socket: WebSocket | null,
+    graceMs: number,
+    forceMs: number,
+  ): Promise<TransportCloseReport> {
+    if (!socket || socket.readyState === WebSocket.CLOSED) {
+      this.retainedSocket = null;
+      return { reconnectSuppressed: true, socketClosed: true, forcedTerminationAttempted: false, gracefulTimedOut: false };
     }
+    let closed = false;
+    const onClose = () => { closed = true; };
+    socket.on("close", onClose);
+    const removeCloseListener = (listener: (...args: unknown[]) => void): void => {
+      const detachable = socket as WebSocket & {
+        off?: (event: string, fn: (...args: unknown[]) => void) => unknown;
+        removeListener?: (event: string, fn: (...args: unknown[]) => void) => unknown;
+      };
+      if (typeof detachable.off === "function") detachable.off("close", listener);
+      else detachable.removeListener?.("close", listener);
+    };
+    const wait = (ms: number) => {
+      if (closed || socket.readyState === WebSocket.CLOSED) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          if (timer) clearTimeout(timer);
+          removeCloseListener(onObservedClose);
+          resolve();
+        };
+        const onObservedClose = () => { closed = true; finish(); };
+        socket.on("close", onObservedClose);
+        timer = setTimeout(finish, ms);
+        if (typeof timer.unref === "function") timer.unref();
+        if (closed || socket.readyState === WebSocket.CLOSED) finish();
+      });
+    };
+    let forcedTerminationAttempted = false;
+    let gracefulTimedOut = false;
+    const state = (): number => socket.readyState as number;
+    try {
+      let forceNow = state() === WebSocket.CONNECTING;
+      if (state() === WebSocket.OPEN) {
+        try { socket.close(); } catch { forceNow = true; }
+      }
+      if (!forceNow && !closed && state() !== WebSocket.CLOSED) {
+        await wait(graceMs);
+        if (!closed && state() !== WebSocket.CLOSED) {
+          gracefulTimedOut = true;
+          forceNow = true;
+        }
+      }
+      if (forceNow && !closed && state() !== WebSocket.CLOSED) {
+        forcedTerminationAttempted = true;
+        try { socket.terminate(); } catch { /* report unconfirmed */ }
+        if (!closed && state() !== WebSocket.CLOSED) await wait(forceMs);
+      }
+      const socketClosed = closed || state() === WebSocket.CLOSED;
+      if (socketClosed) {
+        this.socketCleanup.get(socket)?.();
+        if (this.retainedSocket === socket) this.retainedSocket = null;
+      }
+      return {
+        reconnectSuppressed: true,
+        socketClosed,
+        forcedTerminationAttempted,
+        gracefulTimedOut,
+        ...(!socketClosed ? { closeHandle: { probe: () => this.probePhysicalClose(graceMs, forceMs) } } : {}),
+      };
+    } finally {
+      removeCloseListener(onClose);
+    }
+  }
+
+  /** Retry physical cleanup only; never reconnects or creates a socket. */
+  async probePhysicalClose(graceMs = 250, forceMs = 250): Promise<TransportCloseReport> {
+    const socket = this.retainedSocket;
+    this.shutdownPromise = undefined;
+    return this.closeGracefully(graceMs, forceMs);
   }
 
   // ---------------------------------------------------------------------------
@@ -665,7 +889,7 @@ export class NatsTransport extends EventEmitter {
       if (this.reconnectAttempts === 1 || this.reconnectAttempts % 10 === 0) {
         console.error(
           `[NatsTransport] reconnect attempt ${this.reconnectAttempts} failed: ` +
-            `${err instanceof Error ? err.message : String(err)} — retrying with backoff`,
+            `${reconnectFailureLabel(err)} — retrying with backoff`,
         );
       }
       this.scheduleReconnect();
@@ -748,6 +972,7 @@ export class NatsTransport extends EventEmitter {
       ws.send("PING\r\n");
     } catch (err) {
       settle?.(err instanceof Error ? err : new Error(String(err)));
+      try { ws.close(); } catch { try { ws.terminate(); } catch { /* disposer confirms */ } }
     }
   }
 
@@ -782,7 +1007,7 @@ export class NatsTransport extends EventEmitter {
       // Last-resort backstop — a consumer forgot to attach an "error" listener.
       // Log instead of letting Node rethrow as an uncaught exception.
       console.error(
-        `[NatsTransport] unhandled connection error (no "error" listener attached): ${err.message}`,
+        `[NatsTransport] unhandled connection error (no "error" listener attached): ${reconnectFailureLabel(err)}`,
       );
     }
   }

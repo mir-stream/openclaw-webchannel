@@ -7,6 +7,7 @@ import {
   isValidAccountId,
   assertValidAccountId,
   listWebchannelAccountIds,
+  inspectWebchannelAccountIds,
   resolveWebchannelAccountConfig,
   resolveAcquisitionIdentity,
   resolveAccountNatsConfig,
@@ -168,6 +169,18 @@ describe("account-config: resolveTypingEnabled (P0-6)", () => {
 });
 
 describe("account-config: listWebchannelAccountIds", () => {
+  it("isolates invalid raw keys and does not synthesize default for an explicit all-invalid map", () => {
+    const mixed = { channels: { webchannel: { accounts: { good: {}, "bad.id": {}, constructor: {}, Zed: {} } } } };
+    expect(inspectWebchannelAccountIds(mixed)).toEqual({
+      validIds: ["good", "Zed"].sort((a, b) => a.localeCompare(b)),
+      invalid: [
+        { id: "bad.id", reason: "the id must match /^[A-Za-z0-9_-]{1,64}$/" },
+        { id: "constructor", reason: "the id is a blocked prototype key" },
+      ].sort((a, b) => a.id.localeCompare(b.id)),
+      usesImplicitDefault: false,
+    });
+    expect(listWebchannelAccountIds({ channels: { webchannel: { accounts: { "../bad": {} } } } })).toEqual([]);
+  });
   it("synthesizes default when there is no webchannel section", () => {
     expect(listWebchannelAccountIds({ channels: {} })).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);
     expect(listWebchannelAccountIds({})).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);

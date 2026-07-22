@@ -29,11 +29,12 @@ class FakeTransport extends EventEmitter {
   connected = true;
   readonly subs: string[] = [];
   readonly published: Array<{ subject: string; payload: string }> = [];
+  readonly unsubscribed: number[] = [];
   subscribe(subject: string): number {
     this.subs.push(subject);
     return this.subs.length;
   }
-  unsubscribe(): void {}
+  unsubscribe(sid: number): void { this.unsubscribed.push(sid); }
   publish(subject: string, payload: string | Buffer): void {
     this.published.push({ subject, payload: payload.toString() });
   }
@@ -65,6 +66,18 @@ function deliverChallenge(replyTo?: string): FakeTransport {
 }
 
 describe("NatsChannel register-hop wiring", () => {
+  it("disposes the retained transport listener and every owned subscription idempotently", () => {
+    const { channel, transport } = makeChannel();
+    channel.subscribeRegister();
+    channel.registerPeer(PEER);
+    expect(transport.listenerCount("message")).toBe(1);
+    channel.dispose();
+    channel.dispose();
+    expect(transport.listenerCount("message")).toBe(0);
+    expect(transport.unsubscribed).toEqual([1, 2]);
+    expect(channel.sendText(PEER, "late")).toBe(false);
+  });
+
   it("subscribeRegister subscribes the `.register` wildcard", () => {
     const { channel, transport } = makeChannel();
     channel.subscribeRegister();

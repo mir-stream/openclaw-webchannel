@@ -191,11 +191,12 @@ function jwksCacheFor(config: JwtAuthConfig): JWKSCache {
  */
 export async function preflightResolveJwks(
   config: JwtAuthConfig,
+  signal?: AbortSignal,
 ): Promise<{ keyCount: number }> {
   const cache = jwksCacheFor(config);
   // Startup warm gets the generous budget (no browser is waiting); the same
   // cache's live-verify path keeps the tight 4s default set at construction.
-  const doc = await cache.warm(STARTUP_WARM_JWKS_TIMEOUT_MS);
+  const doc = await cache.warm(STARTUP_WARM_JWKS_TIMEOUT_MS, signal);
   return { keyCount: doc.keys.length };
 }
 

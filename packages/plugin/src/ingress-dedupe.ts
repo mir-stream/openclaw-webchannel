@@ -130,9 +130,11 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
   accountId: string,
   checkAndRecord: IngressDedupeCheck,
   sinks?: IngressDedupeLogSinks,
+  isActive: () => boolean = () => true,
 ): Promise<T[]> {
   const survivors: T[] = [];
   for (const item of items) {
+    if (!isActive()) return [];
     // Normalize the wire `id`: only a non-empty, in-bounds STRING is dedupe-able.
     // A non-string or over-length id is treated as ID-LESS — passed through
     // un-deduped and never recorded, so a hostile client cannot amplify SQLite
@@ -150,7 +152,9 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
     let fresh: boolean;
     try {
       fresh = await checkAndRecord(key, { namespace: accountId });
+      if (!isActive()) return [];
     } catch (err) {
+      if (!isActive()) return [];
       sinks?.warn?.(
         `webchannel: ingress dedupe check failed for peer=${item.peerId} id=${id} — ` +
           `keeping message (fail-open): ${String(err)}`,
@@ -192,13 +196,14 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
   logInfo?: (message: string) => void;
   /** Fail-open fault sink (warn). */
   logWarn?: (message: string) => void;
+  /** Runtime lifecycle fence. Inactive work is intentionally dropped. */
+  isActive?: () => boolean;
 };
 
 /**
- * Build the debouncer's `onFlush` handler — the REAL one index-nats.ts wires,
- * extracted to `src/` so it is tsc-checked and tested directly (index-nats.ts is
- * outside tsconfig, and an inlined closure there could silently drift, e.g.
- * dispatch `items` instead of `fresh`, or drop the accountId namespace).
+ * Build the debouncer's `onFlush` handler wired by the NATS account runtime.
+ * Keeping this logic extracted makes the duplicate filtering and account
+ * namespace behavior directly testable.
  *
  * WHY IT LIVES IN onFlush (not setMessageHandler). The dedupe check is async
  * (`checkAndRecord` may await SQLite). `onFlush` is SAME-PEER SERIALIZED by core's
@@ -240,8 +245,10 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
   deps: IngressOnFlushDeps<T>,
 ): (items: readonly T[]) => Promise<void> {
   const { accountId, checkAndRecord, dispatch, coalesce, sendAck, cancelledFallback, logInfo, logWarn } = deps;
+  const isActive = deps.isActive ?? (() => true);
   const sinks: IngressDedupeLogSinks = { info: logInfo, warn: logWarn };
   return async (items) => {
+    if (!isActive()) return;
     // P0-7b ack first — see the doc. Ack is receipt of ADMISSION and covers all
     // id-carrying items regardless of the dedupe outcome, so it runs before the
     // fresh-filter. Guard `items[0]` (an empty flush never fires, but stay total).
@@ -257,17 +264,20 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
       let recorded = false;
       try {
         await checkAndRecord(key, { namespace: accountId });
+        if (!isActive()) return;
         recorded = true;
       } catch (err) {
         logWarn?.(`webchannel: cancelled-inbound fallback record retry failed for key=${key}: ${String(err)}`);
       }
       const id = item.message.id as string;
+      if (!isActive()) return;
       const acked = sendAck?.(item.peerId, [id]) ?? false;
       if (!acked) logWarn?.(`webchannel: cancelled-inbound fallback ack failed for key=${key}`);
       if (recorded && acked) cancelledFallback.delete(key);
     }
 
     const anchor = ordinary[0];
+    if (!isActive()) return;
     if (anchor && sendAck) {
       const ackIds = [
         ...new Set(
@@ -280,9 +290,11 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         logWarn?.(`webchannel: ingress admission ack failed for peer=${anchor.peerId} ids=${ackIds.join(",")}`);
       }
     }
-    const fresh = await filterFreshInboundItems(ordinary, accountId, checkAndRecord, sinks);
+    const fresh = await filterFreshInboundItems(ordinary, accountId, checkAndRecord, sinks, isActive);
+    if (!isActive()) return;
     const first = fresh[0];
     if (!first) return;
+    if (!isActive()) return;
     dispatch(first.peerId, coalesce(fresh.map((i) => i.message)));
   };
 }
@@ -324,14 +336,17 @@ export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
   sendAck: (peerId: string, ids: string[]) => boolean,
   logWarn?: (message: string) => void,
   cancelledFallback?: CancelledInboundFallbackTombstones,
+  isActive: () => boolean = () => true,
 ): Promise<void> {
   const idsByPeer = new Map<string, string[]>();
   for (const item of items) {
+    if (!isActive()) return;
     const key = ingressDedupeKey(item);
     if (!key) continue; // id-less/non-conforming: never persist or retain it.
     const id = item.message.id as string;
     try {
       await checkAndRecord(key, { namespace: accountId });
+      if (!isActive()) return;
     } catch (err) {
       logWarn?.(
         `webchannel: cancelled-inbound dedupe record failed for peer=${item.peerId} id=${id} ` +
@@ -346,6 +361,7 @@ export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
     idsByPeer.set(item.peerId, ids);
   }
   for (const [peerId, ids] of idsByPeer) {
+    if (!isActive()) return;
     if (!sendAck(peerId, ids)) {
       logWarn?.(`webchannel: cancelled-inbound ack failed for peer=${peerId} ids=${ids.join(",")}`);
     }
