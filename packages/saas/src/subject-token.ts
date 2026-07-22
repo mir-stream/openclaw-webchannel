@@ -1,7 +1,7 @@
 /**
  * NATS-subject token validator (defense against subject-hierarchy injection).
  *
- * Live channel subjects are `webchannel.{tenant}.{accountId}.{peerId}.{in|out|handshake}`.
+ * Live channel subjects are `webchannel.{tenant}.{accountId}.{peerId}.{in|out|register|reginbox}`.
  * A token containing a `.` (subject separator), `*`/`>` (NATS wildcards), or
  * whitespace/control chars would break the subject hierarchy and could cross
  * tenant boundaries (e.g. a `tenant` of `a.*` would widen a `webchannel.{tenant}.>`

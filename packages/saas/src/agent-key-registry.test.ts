@@ -1,176 +1,61 @@
-/**
- * F2 — agent identity-key registry tests + the DeviceFlowEnrollment approval
- * integration that populates it.
- *
- * Covers the SaaS completion criteria:
- *  - the registry persists (tenant, accountId) → agentPublicKey across the
- *    pending-enrollment store's eviction (the whole reason it exists);
- *  - enrollment APPROVAL upserts the attested key (re-enroll mints a fresh key →
- *    the registry reflects the latest);
- *  - keying is per-account: distinct accounts get distinct keys, and an
- *    accountId-less enrollment falls back to the default segment WITHOUT
- *    colliding with a named account.
- */
+import { describe, expect, it } from "vitest";
+import { agentKeyRegistryKey } from "./agent-key-registry.js";
+import { MemoryEnrollmentRepository } from "./enrollment-repository.js";
+import { runAgentKeyRegistryConformance } from "./agent-key-registry-conformance.js";
 
-import { describe, it, expect } from "vitest";
-import { createAccount } from "@nats-io/nkeys";
-import {
-  DeviceFlowEnrollment,
-  MemoryEnrollmentStore,
-} from "./device-flow-enrollment.js";
-import {
-  MemoryAgentKeyRegistry,
-  agentKeyRegistryKey,
-  DEFAULT_REGISTRY_ACCOUNT_ID,
-} from "./agent-key-registry.js";
-import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
-import type { EnrollmentRequest } from "./device-flow-types.js";
+const A = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const B = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 
-const mockAccountKp = createAccount();
-const mockTrustChain: SaasTrustChainPrivate = {
-  rsaPrivateKeyPem: "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----",
-  natsAccountSeed: new TextDecoder().decode(mockAccountKp.getSeed()),
-};
-const mockNatsConfig: NatsAccountConfig = {
-  operatorJwt: "MOCK_OPERATOR_JWT",
-  accountJwt: "MOCK_ACCOUNT_JWT",
-  resolverConfig: {},
-  accountPublicKey: "MOCK_ACCOUNT_PUBLIC_KEY",
-};
-
-// Two distinct 43-char base64url X25519 public keys (the wire format enroll()
-// enforces). Used to prove re-enroll upserts to the NEW key.
-const AGENT_KEY_A = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
-const AGENT_KEY_B = "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKK";
-
-function makeEnrollment(
-  store: MemoryEnrollmentStore,
-  registry: MemoryAgentKeyRegistry,
-): DeviceFlowEnrollment {
-  return new DeviceFlowEnrollment({
-    saasTrustChain: mockTrustChain,
-    natsAccountConfig: mockNatsConfig,
-    saasBaseUrl: "https://saas.com",
-    jwksUrl: "https://saas.com/.well-known/jwks.json",
-    bootstrapUrl: "https://saas.com/bootstrap",
-    natsUrl: "wss://nats.saas.com",
-    expirationSeconds: 600,
-    pollIntervalSeconds: 5,
-    store,
-    agentKeyRegistry: registry,
-  });
-}
-
-/** Drive one enroll → approve cycle; returns the user_code. */
-async function enrollAndApprove(
-  enrollment: DeviceFlowEnrollment,
-  req: EnrollmentRequest,
-): Promise<void> {
-  const resp = await enrollment.enroll(req);
-  const result = await enrollment.approve(resp.user_code);
-  expect(result).not.toBeNull();
-}
-
-describe("MemoryAgentKeyRegistry", () => {
-  it("put/get round-trips per (tenant, accountId)", async () => {
-    const reg = new MemoryAgentKeyRegistry();
-    await reg.put("t1", "a1", AGENT_KEY_A);
-    expect(await reg.get("t1", "a1")).toBe(AGENT_KEY_A);
-    expect(await reg.get("t1", "a2")).toBeNull();
-    expect(await reg.get("t2", "a1")).toBeNull();
+describe("MemoryEnrollmentRepository v2", () => {
+  it("runs the exported conformance suite", async () => {
+    await runAgentKeyRegistryConformance(() => new MemoryEnrollmentRepository());
   });
 
-  it("an accountId-less enrollment keys to the default segment (no collision with a named account)", async () => {
-    const reg = new MemoryAgentKeyRegistry();
-    await reg.put("t1", undefined, AGENT_KEY_A);
-    await reg.put("t1", "named", AGENT_KEY_B);
-    expect(await reg.get("t1", undefined)).toBe(AGENT_KEY_A);
-    expect(await reg.get("t1", DEFAULT_REGISTRY_ACCOUNT_ID)).toBe(AGENT_KEY_A);
-    expect(await reg.get("t1", "named")).toBe(AGENT_KEY_B);
+  it("registers, conflicts, replaces, and records append-only history", async () => {
+    const r = new MemoryEnrollmentRepository();
+    const a = await r.register("t", "a", A, null);
+    expect(a.ok).toBe(true);
+    if (!a.ok) return;
+    expect(a.record.activationId).not.toBe(a.record.keyId);
+    const conflict = await r.register("t", "a", B, null);
+    expect(conflict).toMatchObject({ ok: false, reason: "conflict" });
+    const b = await r.register("t", "a", B, a.record.activationId);
+    expect(b.ok).toBe(true);
+    const history = await r.listHistory("t", "a");
+    expect(history).toHaveLength(2);
+    expect(history[1]).toMatchObject({ status: "superseded", supersededBy: history[0].activationId });
   });
 
-  it("put upserts (last write wins)", async () => {
-    const reg = new MemoryAgentKeyRegistry();
-    await reg.put("t1", "a1", AGENT_KEY_A);
-    await reg.put("t1", "a1", AGENT_KEY_B);
-    expect(await reg.get("t1", "a1")).toBe(AGENT_KEY_B);
+  it("uses activation events for CAS and rejects A-B-A replay", async () => {
+    const r = new MemoryEnrollmentRepository();
+    const a1 = await r.register("t", "a", A, null); expect(a1.ok).toBe(true); if (!a1.ok) return;
+    const b = await r.register("t", "a", B, a1.record.activationId); expect(b.ok).toBe(true); if (!b.ok) return;
+    const a2 = await r.register("t", "a", A, b.record.activationId); expect(a2.ok).toBe(true); if (!a2.ok) return;
+    expect(a2.record.activationId).not.toBe(a1.record.activationId);
+    expect(await r.register("t", "a", B, a1.record.activationId)).toMatchObject({ ok: false, reason: "conflict" });
   });
 
-  it("agentKeyRegistryKey cannot collide across tenant/account via the join character", () => {
-    // A naive `${tenant}/${accountId}` join would let ("a/b", "c") collide with
-    // ("a", "b/c"). The length-prefixed key keeps them distinct.
+  it("gives tombstone precedence over idempotency and permits another key", async () => {
+    const r = new MemoryEnrollmentRepository();
+    await r.register("t", "a", A, null);
+    expect(await r.revokeActive("t", "a")).toBe(true);
+    expect(await r.revokeActive("t", "a")).toBe(false);
+    expect(await r.register("t", "a", A, null)).toEqual({ ok: false, reason: "revoked" });
+    expect((await r.register("t", "a", B, null)).ok).toBe(true);
+  });
+
+  it("returns defensive snapshots", async () => {
+    const r = new MemoryEnrollmentRepository();
+    await r.register("t", "a", A, null);
+    const active = await r.getActive("t", "a");
+    (active as { publicKey: string }).publicKey = B;
+    const history = await r.listHistory("t", "a");
+    (history[0] as { status: string }).status = "revoked";
+    expect((await r.getActive("t", "a"))?.publicKey).toBe(A);
+  });
+
+  it("length-prefixes both slot segments", () => {
     expect(agentKeyRegistryKey("a/b", "c")).not.toBe(agentKeyRegistryKey("a", "b/c"));
-    expect(agentKeyRegistryKey("t", undefined)).toBe(agentKeyRegistryKey("t", DEFAULT_REGISTRY_ACCOUNT_ID));
-  });
-});
-
-describe("DeviceFlowEnrollment → agent-key registry (F2a)", () => {
-  it("approval persists the attested agent key, and it SURVIVES the pending-store eviction", async () => {
-    const store = new MemoryEnrollmentStore({ autoSweep: false, retentionMs: 0 });
-    const registry = new MemoryAgentKeyRegistry();
-    const enrollment = makeEnrollment(store, registry);
-
-    await enrollAndApprove(enrollment, {
-      agentPublicKey: AGENT_KEY_A,
-      tenant: "acme",
-      accountId: "agent-1",
-    });
-    expect(await registry.get("acme", "agent-1")).toBe(AGENT_KEY_A);
-
-    // Evict EVERYTHING from the pending store (retentionMs:0 → sweep drops all
-    // records past expiry; force it well past). The durable registry must retain.
-    store.sweep(Date.now() + 10 * 60 * 1000);
-    expect(await registry.get("acme", "agent-1")).toBe(AGENT_KEY_A);
-  });
-
-  it("re-enrollment mints a fresh key → approval UPSERTS the registry to the new key", async () => {
-    const store = new MemoryEnrollmentStore({ autoSweep: false });
-    const registry = new MemoryAgentKeyRegistry();
-    const enrollment = makeEnrollment(store, registry);
-
-    await enrollAndApprove(enrollment, { agentPublicKey: AGENT_KEY_A, tenant: "acme", accountId: "agent-1" });
-    expect(await registry.get("acme", "agent-1")).toBe(AGENT_KEY_A);
-
-    // Same account re-enrolls with a NEW identity key (fresh device flow).
-    await enrollAndApprove(enrollment, { agentPublicKey: AGENT_KEY_B, tenant: "acme", accountId: "agent-1" });
-    expect(await registry.get("acme", "agent-1")).toBe(AGENT_KEY_B);
-  });
-
-  it("keys per account: two accounts on one tenant get distinct agent keys", async () => {
-    const store = new MemoryEnrollmentStore({ autoSweep: false });
-    const registry = new MemoryAgentKeyRegistry();
-    const enrollment = makeEnrollment(store, registry);
-
-    await enrollAndApprove(enrollment, { agentPublicKey: AGENT_KEY_A, tenant: "acme", accountId: "agent-1" });
-    await enrollAndApprove(enrollment, { agentPublicKey: AGENT_KEY_B, tenant: "acme", accountId: "agent-2" });
-
-    expect(await registry.get("acme", "agent-1")).toBe(AGENT_KEY_A);
-    expect(await registry.get("acme", "agent-2")).toBe(AGENT_KEY_B);
-  });
-
-  it("a DENIED enrollment never populates the registry", async () => {
-    const store = new MemoryEnrollmentStore({ autoSweep: false });
-    const registry = new MemoryAgentKeyRegistry();
-    const enrollment = makeEnrollment(store, registry);
-
-    const resp = await enrollment.enroll({ agentPublicKey: AGENT_KEY_A, tenant: "acme", accountId: "agent-1" });
-    expect(await enrollment.deny(resp.user_code)).toBe(true);
-    expect(await enrollment.approve(resp.user_code)).toBeNull();
-    expect(await registry.get("acme", "agent-1")).toBeNull();
-  });
-
-  it("no registry configured → approval still succeeds (pin delivery simply disabled)", async () => {
-    const store = new MemoryEnrollmentStore({ autoSweep: false });
-    const enrollment = new DeviceFlowEnrollment({
-      saasTrustChain: mockTrustChain,
-      natsAccountConfig: mockNatsConfig,
-      saasBaseUrl: "https://saas.com",
-      jwksUrl: "https://saas.com/.well-known/jwks.json",
-      bootstrapUrl: "https://saas.com/bootstrap",
-      natsUrl: "wss://nats.saas.com",
-      store,
-    });
-    const resp = await enrollment.enroll({ agentPublicKey: AGENT_KEY_A, tenant: "acme", accountId: "agent-1" });
-    expect(await enrollment.approve(resp.user_code)).not.toBeNull();
+    expect(agentKeyRegistryKey("t", "default")).not.toBe(agentKeyRegistryKey("td", "efault"));
   });
 });

@@ -1,9 +1,9 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
-import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
-import type { WebChannelTransport, InboundWsMessage } from "./transport.js";
+import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
+import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
-import { DEFAULT_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
+import { DEFAULT_WEBCHANNEL_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
 import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
 
@@ -68,17 +68,16 @@ import type {
  */
 export async function handleInboundMessage(
   api: OpenClawPluginApi,
-  transport: WebChannelTransport,
+  transport: WebChannelPeerChannel,
   peerId: string,
   message: InboundUserMessage,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   options?: { controlLane?: boolean },
 ): Promise<void> {
   // `wsKey` is the verified per-peer id the transport uses as its socket-map
   // key (the anonymous strategy is the single-peer special case, where this
   // falls back to ANON_PEER_ID).
   const wsKey = peerId || ANON_PEER_ID;
-  const channelRuntime = api.runtime.channel;
 
   // Control lane (P1-8a): an out-of-band abort turn ("/stop"). It reaches here
   // directly (NOT via the per-session FIFO) so core's fast-abort can cancel the
@@ -91,6 +90,17 @@ export async function handleInboundMessage(
   const turnId =
     message.id ??
     `webchannel-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  let draft: ProgressDraftController | undefined;
+  let reasoning: ReasoningDraftController | undefined;
+  let finalReplyDelivered = false;
+  let turnOutcome: "ok" | "error" = "ok";
+  // Ordinary messages have already been ACKed by ingress and therefore need one
+  // settled outcome even when setup fails. Control-lane turns never settle; an
+  // explicit DM denial opts out below because no agent turn was admitted.
+  let settlementEligible = !controlLane;
+
+  try {
+    const channelRuntime = api.runtime.channel;
 
   // Progress-draft wiring (Phase 1 first slice). Core does NOT auto-drive a
   // plugin's `message.live` adapter; the generic seam for a plugin channel is
@@ -130,6 +140,7 @@ export async function handleInboundMessage(
     dmSecurity: cc?.dmSecurity,
   });
   if (!admission.allowed) {
+    settlementEligible = false;
     api.logger?.info?.(
       `webchannel: inbound denied for peer ${wsKey} (${admission.reason}); turn not dispatched`,
     );
@@ -143,7 +154,6 @@ export async function handleInboundMessage(
   const draftEnabled =
     (streamingMode === "progress" || streamingMode === "partial") && !controlLane;
   const answerStreamingEnabled = streamingMode === "partial";
-  let draft: ProgressDraftController | undefined;
   if (draftEnabled) {
     draft = createProgressDraftController({
       transport,
@@ -154,8 +164,6 @@ export async function handleInboundMessage(
   }
   // Reasoning lane is created AFTER route resolution (below), once we can resolve
   // the session's reasoning display level.
-  let reasoning: ReasoningDraftController | undefined;
-  let finalReplyDelivered = false;
 
   // Resolve the channel-scoped agent route, then FORCE the per-account-channel-
   // peer session scope (see `resolveWebchannelSessionRoute`). Binding-based agent
@@ -220,7 +228,6 @@ export async function handleInboundMessage(
     transport.sendTyping(wsKey);
   }
 
-  try {
     await channelRuntime.inbound.run({
       channel: WEBCHANNEL_ID,
       accountId,
@@ -319,7 +326,7 @@ export async function handleInboundMessage(
                       ? {
                           suppressDefaultToolProgressMessages: true,
                           onToolStart: (p) => {
-                            draft.pushEvent({
+                            draft!.pushEvent({
                               event: "tool",
                               itemId: p.itemId,
                               toolCallId: p.toolCallId,
@@ -329,7 +336,7 @@ export async function handleInboundMessage(
                             });
                           },
                           onItemEvent: (p) => {
-                            draft.pushEvent({
+                            draft!.pushEvent({
                               event: "item",
                               itemId: p.itemId,
                               itemKind: p.kind,
@@ -346,10 +353,10 @@ export async function handleInboundMessage(
                           ...(answerStreamingEnabled
                             ? {
                                 onPartialReply: (p) => {
-                                  draft.pushAnswerText(p.text ?? "");
+                                  draft!.pushAnswerText(p.text ?? "");
                                 },
                                 onAssistantMessageStart: () => {
-                                  draft.handleAssistantMessageBoundary();
+                                  draft!.handleAssistantMessageBoundary();
                                 },
                               }
                             : {}),
@@ -368,12 +375,19 @@ export async function handleInboundMessage(
               deliver: async (payload, info) => {
                 const text = payload.text;
                 if (!text) return { visibleReplySent: false };
+                // P0-4 DECISION: `visibleReplySent:false` (a final-frame send that
+                // failed) does NOT suppress the later `turn_settled{outcome:"ok"}`
+                // — the turn genuinely settled without error, so the client's
+                // send-receipt correctly reaches `completed` (it tracks the USER
+                // message's fate, not answer delivery). The dropped answer text is
+                // recovered by the register-time history snapshot (recovery lanes
+                // §5 L3/L6), never by faking the turn outcome.
                 // Only the final reply replaces the draft. Non-final visible
                 // blocks (rare for this channel) fall through to a plain send.
                 if (draft && info?.kind === "final") {
-                  await draft.finalize(text);
-                  finalReplyDelivered = true;
-                  return { visibleReplySent: true };
+                  const sent = await draft.finalize(text);
+                  if (sent) finalReplyDelivered = true;
+                  return { visibleReplySent: sent };
                 }
                 const sent = transport.sendText(wsKey, text, undefined, turnId);
                 if (sent && info?.kind === "final") finalReplyDelivered = true;
@@ -410,6 +424,7 @@ export async function handleInboundMessage(
       await draft.finalize(snapshot || "⏹ Stopped.");
     }
   } catch (err) {
+    turnOutcome = "error";
     api.logger.error?.(`webchannel: inbound dispatch failed: ${String(err)}`);
     // BLOCKING recovery: if the turn threw AFTER a progress frame was emitted,
     // the widget is showing a working bubble that will otherwise hang forever
@@ -431,12 +446,17 @@ export async function handleInboundMessage(
         );
       }
     } else if (!controlLane && !finalReplyDelivered) {
-      transport.sendText(
+      const sent = transport.sendText(
         wsKey,
         "Sorry — something went wrong while answering. Please try again.",
         undefined,
         turnId,
       );
+      if (!sent) {
+        api.logger?.warn?.(
+          `webchannel: error fallback reply was not delivered for peer=${wsKey} turn=${turnId}`,
+        );
+      }
     }
   } finally {
     // Always halt the throttled draft loop so a late background flush can't race
@@ -444,6 +464,10 @@ export async function handleInboundMessage(
     // no-op when no draft was created or it was already stopped by finalize().
     draft?.stop();
     reasoning?.stop();
-    if (!controlLane) transport.sendTurnSettled(wsKey, turnId);
+    if (settlementEligible && !transport.sendTurnSettled(wsKey, turnId, turnOutcome)) {
+      api.logger?.warn?.(
+        `webchannel: turn_settled was not delivered for peer=${wsKey} turn=${turnId} outcome=${turnOutcome}`,
+      );
+    }
   }
 }

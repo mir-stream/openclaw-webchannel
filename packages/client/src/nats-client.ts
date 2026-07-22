@@ -6,28 +6,23 @@
  * - Subscribes to inbound message subjects
  * - Publishes to outbound message subjects
  * - Handles reconnection with exponential backoff
- * - Integrates with Phase A crypto (handshake + E2E encryption)
+ * - Integrates with register-delivered E2E encryption
  *
  * Architecture:
  * - Outbound-only connection (browser dials NATS)
  * - JWT-based authentication (bootstrap JWT from SaaS)
  * - Per-peer NATS subjects (tenant-keyed routing)
- * - E2E encryption: per-peer X25519 handshake + MessageEnvelope v1 sealing,
+ * - E2E encryption: authenticated register-delivered key + MessageEnvelope v1 sealing,
  *   matching the agent (`packages/plugin/src/nats-channel.ts` crypto mode). The
- *   client is FAIL-CLOSED — it buffers sends until the handshake completes and
+ *   client is FAIL-CLOSED — it buffers sends until registration completes and
  *   never publishes or accepts plaintext on the relay.
  */
 
 import {
-  generateX25519KeyPair,
-  deriveConversationKey,
-  keyExchangeFrame,
-  parseKeyExchange,
   sealMessage,
   openMessage,
   base64urlDecode,
   unwrapConversationKey,
-  type BrowserKeyPair,
 } from "./e2e-crypto-browser.js";
 import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
 import {
@@ -37,16 +32,12 @@ import {
   PopServerError,
   ProtocolVersionMalformedError,
 } from "./pop-register.js";
-import type { CommandCatalogEntry, WebChannelErrorCause } from "./types.js";
+import type { CommandCatalogEntry, WebChannelErrorCause, SendState, SendFailure } from "./types.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
-// Handshake retry (core NATS has no retention — the one-shot key_exchange can be
-// dropped if the agent's per-peer SUB is not yet server-active when we publish,
-// which a real, higher-latency relay makes possible). Republish a few times until
-// the agent answers. ~2.6s total worst case (500ms × 5) — well under any human
-// perception of "did it connect?", and it stops instantly once the key arrives.
-const HANDSHAKE_RETRY_MS = 500;
-const HANDSHAKE_MAX_RETRIES = 5;
+export const MAX_CONTROL_LINE = 64 * 1024;
+export const MAX_PAYLOAD = 8 * 1024 * 1024;
+export const MAX_BUFFERED_BYTES = MAX_CONTROL_LINE + MAX_PAYLOAD + 4;
 
 /**
  * A random, subject-safe token for a request/reply inbox segment (hex only, so
@@ -101,12 +92,13 @@ export type NatsClientOptions = {
    * to 0 to disable.
    */
   heartbeatIntervalMs?: number;
+  /** Per-handshake-phase deadline in ms. Default 10,000; 0 disables it. */
+  connectTimeoutMs?: number;
   /**
-   * Optional PoP registration. When present, the client performs the JWT +
+   * Required PoP registration. The client performs the JWT +
    * Proof-of-Possession registration over NATS request/reply on the account's
    * `…{peerId}.register` subject after connecting (and before any key flows), so
-   * the agent subscribes to this peer's subjects. When absent, registration is
-   * skipped (dev/open-NATS uses the agent's wildcard auto-register instead).
+   * the agent subscribes to this peer's subjects.
    * `jwt`, `tenant`, `accountId` and `peerId` come from the existing
    * NatsClientOptions fields — the register subject is derived from them, so
    * there is no gateway URL to configure (the agent is reached over NATS only).
@@ -116,14 +108,13 @@ export type NatsClientOptions = {
     devicePrivateKey: CryptoKey;
     /**
      * Phase 6 (multi-device): the device X25519 PRIVATE key whose PUBLIC half
-     * was minted into the bootstrap JWT `cnf.jwk`. When present, the session
+     * was minted into the bootstrap JWT `cnf.jwk`. The session
      * key is the agent-owned conversation key K delivered WRAPPED to this key
      * in the register reply (`unwrapConversationKey`) — no `.handshake`
      * negotiation happens at all, so one user's multiple devices share one
-     * stable K. When absent, the legacy per-connection X25519 handshake runs
-     * (old-plugin compat; the auto-admission path never registers anyway).
+     * stable K.
      */
-    deviceX25519PrivateKey?: CryptoKey;
+    deviceX25519PrivateKey: CryptoKey;
     /**
      * F2 — the SaaS-PINNED agent X25519 identity public key (base64url, 32 bytes),
      * taken from the first-party HTTPS bootstrap response. REQUIRED whenever
@@ -178,6 +169,16 @@ export type InboundMessage = {
   ids?: string[];
   text?: string;
   turnId?: string;
+  /**
+   * P0-4 (additive; older plugins omit it): on a `turn_settled` frame, whether
+   * the turn settled cleanly. `"ok"` promotes the anchor message `accepted →
+   * completed`; `"error"` fails it `turn-failed`; ABSENT means a legacy plugin
+   * that fires `turn_settled` from a `finally` regardless of outcome — the client
+   * then leaves the message at `accepted` (an honest degradation) and never
+   * fabricates `completed`. Client re-declares this wire type (zero-dep package),
+   * so a new field here needs no plugin import.
+   */
+  outcome?: "ok" | "error";
   kind?: "exec" | "plugin";
   title?: string;
   description?: string;
@@ -252,13 +253,27 @@ export type ProtocolInfo = {
 export type ProtocolListener = (info: ProtocolInfo) => void;
 
 /**
- * P1-9: fired once per session KEY-establishment (both the register-delivered-K
- * path and the legacy handshake path), strictly AFTER `flushQueue()`. Lets the
- * wrapper release held sends only when the conversation key exists AND the P0-7b
- * unacked ledger has already been replayed to the front of the wire — see the
- * `drain → flush → notify` ordering in `onConnected`/`handleRaw`.
+ * P1-9: fired once per session KEY-establishment (the register-delivered-K
+ * path — P0-2 removed the legacy handshake path), strictly AFTER `flushQueue()`.
+ * Lets the wrapper release held sends only when the conversation key exists AND
+ * the P0-7b unacked ledger has already been replayed to the front of the wire —
+ * see the `drain → flush → notify` ordering in `onConnected`.
  */
 export type SessionListener = () => void;
+
+/**
+ * P0-4: authoritative send-state listener. Fires on every VALID monotonic
+ * transition of a tracked `user_message`, keyed by its wire `id`. Invalid inputs
+ * (duplicate ack, ack after eviction, any event after `failed`) are silent
+ * no-ops — the tracker is the guard, so a consumer never has to re-derive
+ * validity. `failure` is present only for `state === "failed"`.
+ */
+export type SendStateListener = (id: string, state: SendState, failure?: SendFailure) => void;
+
+export type WebChannelNatsClientOptions = Omit<NatsClientOptions, "jwt" | "registration"> & {
+  jwt: string;
+  registration: NonNullable<NatsClientOptions["registration"]>;
+};
 
 // ---------------------------------------------------------------------------
 // WebSocket-based NATS client (browser-compatible)
@@ -277,6 +292,7 @@ export type SessionListener = () => void;
 export class NatsClient {
   private readonly options: NatsClientOptions;
   private ws: WebSocket | null = null;
+  private connectionGeneration = 0;
   private connected = false;
   private rawListeners = new Set<RawMessageListener>();
   private stateListeners = new Set<StateListener>();
@@ -284,13 +300,6 @@ export class NatsClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private subscriptions = new Map<number, string>(); // sid -> subject
   private sidCounter = 0;
-  private buffer = "";
-  /**
-   * NKEY-auth only: guards the signed CONNECT so it is sent exactly once per
-   * socket even if the server emits multiple INFO lines. Reset on each
-   * (re)connect. Unused on the no-natsCredentials path.
-   */
-  private connectSent = false;
 
   /** CL2: terminal auth failure — stop reconnecting; only a fresh client helps. */
   private terminal = false;
@@ -299,6 +308,23 @@ export class NatsClient {
   /** CL3: keepalive timer + outstanding-PING flag. */
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pongPending = false;
+  /**
+   * The CURRENT dial's deadline-timer cleanup. disconnect()/forceReconnect() null
+   * ws.onclose before close(), so the dial's onclose→clearDeadline never runs;
+   * invoking this cancels the armed deadline directly. Only ever points at the
+   * current dial's cleanup — a stale dial self-cleans via its own onclose/timeout.
+   */
+  private activeDialCleanup: (() => void) | null = null;
+  /**
+   * P0-4 (R2b-2): lifecycle generation, bumped by `disconnect()`. `forceReconnect`
+   * captures it BEFORE notifying state listeners and re-checks it AFTER: if a
+   * listener synchronously called `disconnect()` (advancing the generation and
+   * clearing the reconnect timer), forceReconnect must NOT re-arm the timer and
+   * resurrect a connection the embedder explicitly closed. This surface became
+   * reachable once `publish()` (D3) can drive `forceReconnect` from a send-throw
+   * whose state event a listener may respond to with `disconnect()`.
+   */
+  private lifecycleGeneration = 0;
 
   constructor(options: NatsClientOptions) {
     this.options = options;
@@ -319,10 +345,24 @@ export class NatsClient {
     this.connectInternal();
   }
 
+  /** @internal Bind higher-level terminal cleanup to the dial that failed. */
+  currentConnectionGeneration(): number { return this.connectionGeneration; }
+
+  /** @internal Never let stale higher-level cleanup tear down a replacement dial. */
+  disconnectConnectionGeneration(generation: number): void {
+    if (this.connectionGeneration === generation) this.disconnect();
+  }
+
   /** Disconnect and cleanup */
   disconnect(): void {
+    // P0-4 (R2b-2): advance the lifecycle generation so an in-flight
+    // forceReconnect (mid state-listener notification) does not re-arm the timer.
+    this.lifecycleGeneration++;
     this.clearReconnectTimer();
     this.stopHeartbeat();
+    // Cancel the active dial's armed deadline before we null its onclose below
+    // (which would otherwise strand the timer until it fires as a guarded no-op).
+    if (this.activeDialCleanup) { this.activeDialCleanup(); this.activeDialCleanup = null; }
     if (this.ws) {
       this.ws.onopen = null;
       this.ws.onmessage = null;
@@ -335,17 +375,47 @@ export class NatsClient {
     this.notifyStateListeners();
   }
 
-  /** Publish message to NATS subject */
-  publish(subject: string, payload: string): void {
+  /**
+   * Publish message to NATS subject. Returns whether the frame was written to
+   * the socket (P0-4 B1 — the old void signature silently dropped sends).
+   *
+   * - Not connected → `false` (keep the warn). The caller keeps the frame queued
+   *   / ledgered so a reconnect+flush replays it (no false success).
+   * - Socket not OPEN, or `ws.send` throws → `false` AND force a reconnect. A
+   *   CLOSING/CLOSED browser socket may silently discard sends, and a synchronous
+   *   send-throw does not guarantee an `onclose` (a half-open socket). Without the
+   *   forced teardown a live process could sit `connected===true` while publishes
+   *   vanished. `forceReconnect` tears the socket down, redials, and the fresh
+   *   `onConnected` re-registers + replays the queue (mirrors heartbeat recovery).
+   */
+  publish(subject: string, payload: string): boolean {
     if (!this.connected || !this.ws) {
       console.warn("[nats-client] Not connected, cannot publish");
-      return;
+      return false;
+    }
+
+    // `connected` is updated by socket callbacks and can briefly lag the native
+    // WebSocket state. Browsers are allowed to silently discard `send()` calls
+    // once a socket is CLOSING/CLOSED, so only OPEN is a successful write. Drive
+    // the same reconnect path as a synchronous send throw; higher layers already
+    // ledgered the user message and will replay it with the same id.
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      console.warn("[nats-client] Socket is not open, forcing reconnect before publish");
+      this.forceReconnect();
+      return false;
     }
 
     // Use TextEncoder for byte-length (browser-compatible; Node.js ≥18 also
     // has globalThis.TextEncoder). NATS PUB requires the UTF-8 byte count.
     const byteLen = new TextEncoder().encode(payload).length;
-    this.ws.send(`PUB ${subject} ${byteLen}\r\n${payload}\r\n`);
+    try {
+      this.ws.send(`PUB ${subject} ${byteLen}\r\n${payload}\r\n`);
+      return true;
+    } catch (err) {
+      console.warn("[nats-client] publish send threw — forcing reconnect", err);
+      this.forceReconnect();
+      return false;
+    }
   }
 
   /**
@@ -452,35 +522,91 @@ export class NatsClient {
     }
 
     const ws = new WebSocket(this.options.url);
+    this.connectionGeneration++;
     // nats-server speaks the NATS protocol over BINARY WebSocket frames. The
     // default binaryType ("blob") coerces to "[object Blob]" in the text buffer
     // and breaks the parser — request ArrayBuffer and decode to UTF-8.
     ws.binaryType = "arraybuffer";
     this.ws = ws;
-    this.connectSent = false;
-    // A fresh socket starts a fresh NATS protocol stream. Any bytes left in the
-    // buffer from a socket torn down mid-frame (the half-open case CL3's
-    // heartbeat forces a reconnect on) would otherwise corrupt the new stream's
-    // INFO/PONG parse — on the NKEY path a mangled INFO means the signed CONNECT
-    // is never sent → server auth timeout. Start clean.
-    this.buffer = "";
+    // NOTE: `buffer` is annotated as bare `Uint8Array` (generic default) — under
+    // TS ≥5.7 typed-array generics, letting it infer `Uint8Array<ArrayBuffer>`
+    // from `new Uint8Array(0)` rejects later assignments of encoder/slice results
+    // typed `Uint8Array<ArrayBufferLike>` (packages/client resolves a newer local
+    // TypeScript than the workspace root, so this must compile under both).
+    const dial: {
+      buffer: Uint8Array;
+      connectSent: boolean;
+      connectOnWire: boolean;
+      timer: ReturnType<typeof setTimeout> | null;
+      phase: string;
+    } = { buffer: new Uint8Array(0), connectSent: false, connectOnWire: false, timer: null, phase: "WebSocket open" };
+    const armDeadline = (phase: string): void => {
+      dial.phase = phase;
+      if (dial.timer) clearTimeout(dial.timer);
+      const timeout = this.options.connectTimeoutMs ?? 10_000;
+      if (timeout === 0) return;
+      dial.timer = setTimeout(() => {
+        if (this.ws === ws) {
+          console.warn(`[nats-client] Handshake timeout in phase ${dial.phase}`);
+          this.forceReconnect();
+        }
+        else try { ws.close(); } catch { /* stale dial owns its socket */ }
+      }, timeout);
+    };
+    const clearDeadline = (): void => {
+      if (dial.timer) clearTimeout(dial.timer);
+      dial.timer = null;
+    };
+    // Expose THIS dial's timer cleanup on the instance. disconnect()/forceReconnect()
+    // null ws.onclose BEFORE close(), so the dial's own onclose→clearDeadline never
+    // runs and the armed deadline would otherwise survive up to connectTimeoutMs and
+    // fire as a guarded no-op. Each new dial reassigns this slot; a stale dial still
+    // self-cleans via its own onclose/timeout.
+    this.activeDialCleanup = clearDeadline;
+    armDeadline("WebSocket open");
 
     ws.onopen = () => {
+      if (this.ws !== ws) return;
       console.log("[nats-client] WebSocket connected");
       // No NKEY auth: send CONNECT immediately (original path, byte-for-byte).
       // With NKEY auth we MUST wait for the server's INFO nonce before signing,
       // so CONNECT is deferred to the INFO handler in drainBuffer().
       if (!this.options.natsCredentials) {
-        this.sendConnect();
+        // Mark CONNECT on-wire and arm the "first PONG" deadline BEFORE the send
+        // (matching the signed-connect path): a server — or the test fake — that
+        // answers our PING with a PONG in the SAME synchronous tick would settle
+        // the connection and clear the deadline inside sendConnect(); arming after
+        // that would strand a fresh timer that fires ~10s later and force-reconnects
+        // a healthy link. Arm-then-send lets the sync PONG clear it and stay clear.
+        dial.connectOnWire = true;
+        armDeadline("first PONG");
+        this.sendConnect(ws);
+      } else {
+        armDeadline("INFO");
       }
     };
 
     ws.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
-      this.buffer +=
-        typeof event.data === "string"
-          ? event.data
-          : new TextDecoder().decode(new Uint8Array(event.data));
-      this.drainBuffer();
+      if (this.ws !== ws) return;
+      const chunk = typeof event.data === "string"
+        ? new TextEncoder().encode(event.data)
+        : new Uint8Array(event.data);
+      if (dial.buffer.length + chunk.length > MAX_BUFFERED_BYTES) {
+        this.forceReconnect();
+        return;
+      }
+      const joined = new Uint8Array(dial.buffer.length + chunk.length);
+      joined.set(dial.buffer);
+      joined.set(chunk, dial.buffer.length);
+      dial.buffer = joined;
+      dial.buffer = this.drainBuffer(ws, dial.buffer, () => {
+        clearDeadline();
+      }, () => { dial.connectOnWire = true; armDeadline("first PONG"); }, () => {
+        if (dial.connectSent) return false;
+        dial.connectSent = true;
+        armDeadline("CONNECT signing");
+        return true;
+      }, () => dial.connectOnWire);
     };
 
     ws.onerror = (err) => {
@@ -488,15 +614,16 @@ export class NatsClient {
     };
 
     ws.onclose = () => {
+      clearDeadline();
+      if (this.ws !== ws) return;
       this.connected = false;
       this.stopHeartbeat();
-      this.notifyStateListeners();
       this.scheduleReconnect();
+      this.notifyStateListeners();
     };
   }
 
-  private sendConnect(): void {
-    if (!this.ws) return;
+  private sendConnect(ws: WebSocket): void {
 
     const connectPayload: Record<string, unknown> = {
       verbose: false,
@@ -511,8 +638,8 @@ export class NatsClient {
     // takes the deferred-CONNECT path instead) the field is simply omitted.
     if (this.options.jwt) connectPayload["jwt"] = this.options.jwt;
 
-    this.ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
-    this.ws.send("PING\r\n");
+    ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
+    ws.send("PING\r\n");
   }
 
   /**
@@ -521,13 +648,13 @@ export class NatsClient {
    * signature (NATS challenge-response), then PING to provoke the PONG that
    * flips us to `connected`. Only invoked when `natsCredentials` is set.
    */
-  private async sendSignedConnect(infoLine: string): Promise<void> {
+  private async sendSignedConnect(ws: WebSocket, infoLine: string, onSent: () => void): Promise<void> {
     const creds = this.options.natsCredentials;
-    // Capture the socket BEFORE the crypto await: a (theoretical) reconnect
-    // during the await could swap `this.ws`, and we must send CONNECT on the
-    // same socket that produced this INFO nonce — never a replacement.
-    const ws = this.ws;
-    if (!ws || !creds) return;
+    // `ws` is threaded in lexically by the caller: CONNECT must be sent on the
+    // exact socket that produced this INFO nonce, never a replacement that a
+    // reconnect during the crypto await below may have swapped into `this.ws`
+    // (re-checked against `this.ws` right before the send).
+    if (!creds) return;
 
     let nonce = "";
     try {
@@ -538,8 +665,26 @@ export class NatsClient {
 
     let sig = "";
     if (nonce) {
-      const privateKey = await importEd25519SeedKey(base64urlDecode(creds.userSeedRaw));
-      sig = await signNonce(privateKey, nonce);
+      try {
+        const privateKey = await importEd25519SeedKey(base64urlDecode(creds.userSeedRaw));
+        sig = await signNonce(privateKey, nonce);
+      } catch (err) {
+        // A malformed user seed (or any WebCrypto failure) can never produce a
+        // valid signature — the SAME credentials fail on every re-dial. Left
+        // unguarded, `void sendSignedConnect(...)` turns this into an unhandled
+        // rejection, CONNECT is never sent, and the armed "CONNECT signing"
+        // deadline silently force-reconnects into an endless ~10s loop. Retire
+        // terminally instead (mirrors the plugin's settle(err)), but only for the
+        // CURRENT dial — a reconnect during the await may have moved on, and that
+        // replacement runs its own signing.
+        if (this.ws !== ws) return;
+        this.failTerminally(
+          `NATS NKEY signing failed: ${err instanceof Error ? err.message : String(err)} ` +
+            `(invalid user seed — reconnecting cannot help; re-authenticate)`,
+          "auth-rejected",
+        );
+        return;
+      }
     }
 
     const connectPayload: Record<string, unknown> = {
@@ -553,29 +698,53 @@ export class NatsClient {
     };
     if (sig) connectPayload["sig"] = sig;
 
-    // Send on the captured socket (the one that produced this INFO nonce).
+    if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+    // Mark CONNECT on-wire and arm the "first PONG" deadline BEFORE the synchronous
+    // sends: a server (or test fake) that answers our PING with a PONG in the same
+    // tick must not have that legitimate PONG dropped as unsolicited.
+    onSent();
     ws.send(`CONNECT ${JSON.stringify(connectPayload)}\r\n`);
     ws.send("PING\r\n");
   }
 
-  private drainBuffer(): void {
+  private drainBuffer(
+    ws: WebSocket,
+    initialBuffer: Uint8Array,
+    onPong: () => void,
+    onConnectSent: () => void,
+    beginSignedConnect: () => boolean,
+    isConnectOnWire: () => boolean,
+  ): Uint8Array {
+    let buffer = initialBuffer;
+    const decoder = new TextDecoder();
+    const crlfIndex = (bytes: Uint8Array): number => {
+      for (let i = 0; i + 1 < bytes.length; i++) if (bytes[i] === 13 && bytes[i + 1] === 10) return i;
+      return -1;
+    };
     let crlfPos: number;
-    while ((crlfPos = this.buffer.indexOf("\r\n")) !== -1) {
-      const line = this.buffer.slice(0, crlfPos);
-      this.buffer = this.buffer.slice(crlfPos + 2);
+    while ((crlfPos = crlfIndex(buffer)) !== -1) {
+      if (crlfPos > MAX_CONTROL_LINE) { this.forceReconnect(); return new Uint8Array(0); }
+      const lineBytes = buffer.slice(0, crlfPos);
+      const line = decoder.decode(lineBytes);
+      buffer = buffer.slice(crlfPos + 2);
 
       if (!line) continue;
 
       if (line.startsWith("INFO ")) {
         // NKEY auth: the INFO nonce is our cue to send the signed CONNECT (once).
-        if (this.options.natsCredentials && !this.connectSent) {
-          this.connectSent = true;
-          void this.sendSignedConnect(line);
+        if (this.options.natsCredentials && beginSignedConnect()) {
+          void this.sendSignedConnect(ws, line, onConnectSent);
         }
         continue;
       }
 
       if (line === "PONG") {
+        // A PONG is only legitimate once our CONNECT+PING is actually on the wire.
+        // An unsolicited PONG (NKEY mode: INFO arrived, signing still pending) must
+        // not clear the deadline, flip us connected, or touch pongPending — ignore
+        // it entirely and keep the armed phase deadline running.
+        if (!isConnectOnWire()) continue;
+        onPong();
         // CL3: any PONG proves the link is alive — clear the outstanding-ping
         // flag so the next heartbeat tick does not declare a dead link.
         this.pongPending = false;
@@ -583,7 +752,13 @@ export class NatsClient {
           this.connected = true;
           this.reconnectAttempts = 0;
           console.log("[nats-client] Connected to NATS");
-          this.notifyStateListeners();
+          // Order is deliberately UNCHANGED (notify -> resubscribe -> heartbeat):
+          // nats-client-wrapper's P1-9 ledger/hold release observes this sequence.
+          // The leak this fixes is a state listener that synchronously disconnects:
+          // it ran stopHeartbeat(), and the unguarded startHeartbeat() below then
+          // armed a fresh interval on a dead client. Bail instead of reordering.
+          this.notifyStateListeners(() => this.ws === ws);
+          if (this.ws !== ws) return new Uint8Array(0);
           this.resubscribeAll();
           this.startHeartbeat();
         }
@@ -591,7 +766,7 @@ export class NatsClient {
       }
 
       if (line === "PING") {
-        this.ws?.send("PONG\r\n");
+        ws.send("PONG\r\n");
         continue;
       }
 
@@ -601,7 +776,11 @@ export class NatsClient {
         // would re-extract the same header from the same buffer forever — a
         // synchronous infinite loop that freezes the tab. Break and wait for the
         // next ws.onmessage to append the rest.
-        if (!this.handleMessage(line)) break;
+        const result = this.handleMessage(ws, line, lineBytes, buffer);
+        if (!result) return new Uint8Array(0);
+        if (this.ws !== ws) return new Uint8Array(0);
+        buffer = result.buffer;
+        if (!result.complete) break;
         continue;
       }
 
@@ -627,16 +806,23 @@ export class NatsClient {
               `(credential TTL lapsed — reconnecting cannot help; re-authenticate)`,
             "auth-expired",
           );
+          return new Uint8Array(0);
         } else if (/authorization violation/i.test(line)) {
           this.failTerminally(
             `NATS authorization rejected: ${line.slice(5).trim()} ` +
               `(credentials invalid/expired — reconnecting cannot help)`,
             "auth-rejected",
           );
+          return new Uint8Array(0);
         }
         continue;
       }
     }
+    if (crlfIndex(buffer) === -1 && buffer.length > MAX_CONTROL_LINE) {
+      this.forceReconnect();
+      return new Uint8Array(0);
+    }
+    return buffer;
   }
 
   /**
@@ -645,26 +831,32 @@ export class NatsClient {
    * fully arrived yet (the header is re-buffered; caller must STOP draining and
    * wait for more socket data — see the break in drainBuffer).
    */
-  private handleMessage(line: string): boolean {
+  private handleMessage(ws: WebSocket, line: string, lineBytes: Uint8Array, buffer: Uint8Array): { buffer: Uint8Array; complete: boolean } | null {
     const parts = line.split(" ");
+    if ((parts.length !== 4 && parts.length !== 5) || parts.some((part) => part === "")) {
+      this.forceReconnect(); return null;
+    }
     const hasReplyTo = parts.length === 5;
-    const subject = parts[1] ?? "";
-    const byteCount = parseInt(parts[hasReplyTo ? 4 : 3] ?? "0", 10);
+    const subject = parts[1]!;
+    const lengthToken = parts[hasReplyTo ? 4 : 3]!;
+    if (!/^\d+$/.test(lengthToken)) { this.forceReconnect(); return null; }
+    const byteCount = Number(lengthToken);
+    if (!Number.isSafeInteger(byteCount) || byteCount > MAX_PAYLOAD) { this.forceReconnect(); return null; }
 
-    if (isNaN(byteCount) || byteCount < 0) return true; // malformed header: drop, keep draining
-
-    if (this.buffer.length < byteCount + 2) {
-      this.buffer = `${line}\r\n${this.buffer}`;
-      return false; // need more bytes
+    if (buffer.length < byteCount + 2) {
+      const restored = new Uint8Array(lineBytes.length + 2 + buffer.length);
+      restored.set(lineBytes); restored.set([13, 10], lineBytes.length); restored.set(buffer, lineBytes.length + 2);
+      return { buffer: restored, complete: false };
     }
 
-    const payload = this.buffer.slice(0, byteCount);
-    this.buffer = this.buffer.slice(byteCount + 2);
+    if (buffer[byteCount] !== 13 || buffer[byteCount + 1] !== 10) { this.forceReconnect(); return null; }
+    const payload = new TextDecoder().decode(buffer.slice(0, byteCount));
+    buffer = buffer.slice(byteCount + 2);
 
     // Deliver the raw payload; decryption/parsing happens in WebChannelNatsClient
     // (the envelope must be decrypted before it is meaningful).
-    this.notifyRawListeners(subject, payload);
-    return true;
+    this.notifyRawListeners(subject, payload, () => this.ws === ws);
+    return { buffer, complete: true };
   }
 
   private resubscribeAll(): void {
@@ -725,6 +917,8 @@ export class NatsClient {
     this.terminal = true;
     this.clearReconnectTimer();
     this.stopHeartbeat();
+    // Cancel the active dial's armed deadline before we null its onclose below.
+    if (this.activeDialCleanup) { this.activeDialCleanup(); this.activeDialCleanup = null; }
     this.connected = false;
     if (this.ws) {
       this.ws.onopen = null;
@@ -784,6 +978,8 @@ export class NatsClient {
    */
   private forceReconnect(): void {
     this.stopHeartbeat();
+    // Cancel the active dial's armed deadline before we null its onclose below.
+    if (this.activeDialCleanup) { this.activeDialCleanup(); this.activeDialCleanup = null; }
     this.connected = false;
     if (this.ws) {
       this.ws.onopen = null;
@@ -793,7 +989,19 @@ export class NatsClient {
       try { this.ws.close(); } catch { /* already closing */ }
       this.ws = null;
     }
+    // R2b-2: notify EXACTLY ONCE, here — before the generation/terminal check.
+    // The observable state (`connected: false`) is already final at this point,
+    // and `scheduleReconnect()` below changes nothing a listener can observe, so
+    // a second notify after it would be a duplicate identical `onState(false)`
+    // (P0-4 review: embedders re-render twice, and the wrapper runs its release
+    // gate twice). Placement is load-bearing: the generation must be captured
+    // BEFORE the notification, because a listener that responds to this teardown
+    // by calling disconnect() bumps it (and clears the timer).
+    const gen = this.lifecycleGeneration;
     this.notifyStateListeners();
+    // If disconnect() ran during the notification (generation changed) or a
+    // terminal failure intervened, honor it: do NOT schedule a reconnect.
+    if (this.lifecycleGeneration !== gen || this.terminal) return;
     this.scheduleReconnect();
   }
 
@@ -807,24 +1015,35 @@ export class NatsClient {
     });
   }
 
-  private notifyRawListeners(subject: string, payload: string): void {
-    this.rawListeners.forEach((listener) => {
+  /**
+   * `isCurrent` (drain-loop callers only) is re-checked BEFORE each listener, not
+   * just after the batch: a listener that synchronously retires the dial
+   * (disconnect()/reconnect()) must not have the remaining listeners delivered to
+   * afterwards. Partial fan-out is already the norm here — each listener is
+   * independently try/caught — and an explicit teardown outranks the rest of a
+   * fan-out for a socket that no longer exists.
+   */
+  private notifyRawListeners(subject: string, payload: string, isCurrent?: () => boolean): void {
+    for (const listener of [...this.rawListeners]) {
+      if (isCurrent && !isCurrent()) return;
       try {
         listener(subject, payload);
       } catch (err) {
         console.error("[nats-client] Listener error:", err);
       }
-    });
+    }
   }
 
-  private notifyStateListeners(): void {
-    this.stateListeners.forEach((listener) => {
+  /** See notifyRawListeners for why `isCurrent` is checked before EACH listener. */
+  private notifyStateListeners(isCurrent?: () => boolean): void {
+    for (const listener of [...this.stateListeners]) {
+      if (isCurrent && !isCurrent()) return;
       try {
         listener(this.connected);
       } catch (err) {
         console.error("[nats-client] State listener error:", err);
       }
-    });
+    }
   }
 }
 
@@ -849,14 +1068,6 @@ export function outboundSubject(tenant: string, accountId: string, peerId: strin
 }
 
 /**
- * Derive handshake NATS subject for a peer.
- * Format: webchannel.{tenant}.{accountId}.{peerId}.handshake
- */
-export function handshakeSubject(tenant: string, accountId: string, peerId: string): string {
-  return `webchannel.${tenant}.${accountId}.${peerId}.handshake`;
-}
-
-/**
  * Derive the register-admission NATS subject for a peer (register-hop mode).
  * Format: webchannel.{tenant}.{accountId}.{peerId}.register
  *
@@ -874,27 +1085,86 @@ export function registerSubject(tenant: string, accountId: string, peerId: strin
 /**
  * High-level, E2E-encrypted WebChannel NATS client.
  *
- * Wraps `NatsClient` and adds the per-peer X25519 handshake + MessageEnvelope v1
+ * Wraps `NatsClient` and adds authenticated registration + MessageEnvelope v1
  * sealing the agent expects. It is FAIL-CLOSED:
- *   - outbound sends are buffered until the handshake establishes a session key,
+ *   - outbound sends are buffered until registration establishes a session key,
  *     and are only ever published as ciphertext (never plaintext);
  *   - inbound frames are dropped until the session key exists and are decrypted
  *     before delivery.
  *
  * Subject direction (matching the agent): the browser PUBLISHES to `.in`,
- * SUBSCRIBES to `.out`, and exchanges keys on `.handshake`.
+ * SUBSCRIBES to `.out`, and receives its wrapped key from `.register`.
  */
 export class WebChannelNatsClient {
   private readonly client: NatsClient;
-  private readonly options: NatsClientOptions;
+  private readonly options: WebChannelNatsClientOptions;
   private readonly messageListeners = new Set<MessageListener>();
   private readonly errorListeners = new Set<ErrorListener>();
   private readonly protocolListeners = new Set<ProtocolListener>();
   private readonly sessionListeners = new Set<SessionListener>();
+  private readonly sendStateListeners = new Set<SendStateListener>();
+  /**
+   * Send-state callbacks are public synchronous callouts. A listener may tear the
+   * client down while an earlier transition is still fanning out, which can
+   * synchronously produce a later transition for the same id. Drain events FIFO
+   * so every listener observes the same monotonic order. Tracker mutation remains
+   * synchronous at the transition site; only callback delivery is serialized.
+   */
+  private readonly pendingSendStateEvents: Array<{
+    id: string;
+    state: SendState;
+    failure?: SendFailure;
+  }> = [];
+  private drainingSendStateEvents = false;
 
-  private keyPair: BrowserKeyPair | null = null;
+  /**
+   * P0-4 (D4): the authoritative send-state tracker, keyed by wire `id`. The
+   * SOLE authority for the monotonic guard (queued < sent < accepted; `failed`
+   * terminal) — every transition point routes through `trackerAdvance`/
+   * `trackerFail`, which mutate the entry BEFORE notifying and reject any invalid
+   * input. Entries are retained after reaching `accepted`/`failed` so a late
+   * duplicate ack (or an ack after eviction) is correctly rejected; the set is
+   * conversation-bounded (the same order of magnitude as `state.messages`).
+   */
+  private readonly sendTracker = new Map<string, { state: SendState; failure?: SendFailure; lastAttemptAt?: number }>();
+  /** Forward rank for the monotonic guard; `failed` is handled separately (terminal). */
+  private static readonly SEND_RANK: Record<"queued" | "sent" | "accepted", number> = {
+    queued: 0,
+    sent: 1,
+    accepted: 2,
+  };
+  /**
+   * P0-4 (R5-1/R6-1): wire ids minted by `reserveWireId()` but not yet consumed
+   * by `sendUserMessage`. A reserved id is guaranteed unique across this set, the
+   * tracker, the outbound queue, and the unacked ledger — so no arbitrary string
+   * can enter the ledger `Map` and overwrite/mis-dedupe an existing send.
+   */
+  private readonly reservedWireIds = new Set<string>();
+  /**
+   * P0-4 (D4 terminal sequence): set once a terminal (non-retryable) failure is
+   * observed. After this, a new `sendUserMessage` is NOT queued — it resolves
+   * immediately to an observable `failed{terminal}` receipt (so a send that
+   * arrives while error listeners run cannot escape the terminal sweep).
+   */
+  private terminalReached = false;
+  private terminalCause: WebChannelErrorCause = "unknown";
+  /**
+   * P0-4: connection-scoped closed gate (unlike the PERMANENT `terminalReached`).
+   * Set by `disconnect()` (the only production caller is the wrapper's `close()`)
+   * and cleared by a successful non-terminal `connect()`. Gates `sendUserMessage`
+   * so a send registered onto an explicitly-closed instance fails observably with
+   * `failed{closed}` instead of stranding at `queued` on a dead instance — closing
+   * the register-before-send window where a state subscriber calls `close()` mid-
+   * render (its sweep runs before this send's `sendUserMessage`), or a plain
+   * `send()` lands after `close()`. Initially false: a never-connected instance is
+   * NOT "disconnected", so a pre-connect send still queues and flushes on connect.
+   */
+  private disconnected = false;
+
   private sessionKey: Uint8Array | null = null;
   private outboundQueue: OutboundMessage[] = [];
+  /** Non-reentrant drain: callbacks may enqueue more work, which stays at the tail. */
+  private drainingOutboundQueue = false;
   /**
    * P0-7b: published-but-unacked `user_message` ledger (insertion-ordered).
    *
@@ -930,26 +1200,26 @@ export class WebChannelNatsClient {
   /** One-time guard so a full pre-key buffer warns once, not per dropped frame. */
   private warnedPreKeyDrop = false;
   private outSub = -1;
-  private handshakeSub = -1;
-  /**
-   * Handshake retry timer. The initial `key_exchange` is a one-shot publish, but
-   * core NATS has NO retention: if the agent's per-peer subscription is not yet
-   * active on the server when we publish (a real, higher-latency relay makes the
-   * SUB→handshake ordering non-deterministic even though we register first), the
-   * frame is dropped and — with no retry — the session would wedge forever. So we
-   * republish on a bounded schedule until the agent answers (sessionKey is set) or
-   * the attempt cap is hit. Cleared on session establishment, reconnect, or close.
-   */
-  private handshakeRetryTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * Bumped on every `onConnected()` so a stale async continuation (resumed after
    * the socket dropped and a reconnect spawned a fresh flow) can detect it is no
-   * longer current and bail instead of overwriting `keyPair` / publishing a
-   * stale handshake.
+   * longer current and bail instead of installing stale registration state.
    */
   private connectionEpoch = 0;
 
-  constructor(options: NatsClientOptions) {
+  constructor(options: WebChannelNatsClientOptions) {
+    if (!options.registration) {
+      throw new Error("[nats-client] registration is required");
+    }
+    if (!options.registration.devicePrivateKey) {
+      throw new Error("[nats-client] registration.devicePrivateKey is required");
+    }
+    if (!options.registration.deviceX25519PrivateKey) {
+      throw new Error("[nats-client] registration.deviceX25519PrivateKey is required");
+    }
+    if (typeof options.jwt !== "string" || options.jwt.trim().length === 0) {
+      throw new Error("[nats-client] non-empty bootstrap jwt is required");
+    }
     this.options = options;
     this.client = new NatsClient(options);
     this.client.onRawMessage((subject, payload) => {
@@ -959,46 +1229,135 @@ export class WebChannelNatsClient {
       if (connected) void this.onConnected();
       else this.resetSession();
     });
-    // CL2: forward the low-level client's terminal auth failures to our own
-    // error listeners, so an embedder learns credentials died (not just PoP
-    // registration failures, which already flow through notifyErrorListeners).
-    this.client.onError((err, cause) => this.notifyErrorListeners(err, cause));
+    // CL2 + P0-4: forward the low-level client's terminal auth failures. The
+    // terminal SEQUENCE (D4) is mandatory: ① mark terminal so a re-entrant send
+    // resolves to an immediate failed receipt, ② sweep pending (queue + ledger)
+    // to failed{terminal}, THEN ③ notify error listeners (the wrapper's onError
+    // fails its own held[] here) — a send arriving during ③ is immediately failed
+    // by step ①, never left orphaned in a dead instance.
+    this.client.onError((err, cause) => this.handleTerminal(err, cause));
   }
 
-  /** Connect to NATS (the handshake begins automatically once connected). */
+  /** Connect to NATS (registration begins automatically once connected). */
   connect(): void {
+    // P0-4 (R5): a terminally-retired instance must not dial at all. Without this
+    // a post-terminal connect() opens a raw socket whose eventual close makes the
+    // low-level client (whose own `terminal` flag stays false on registration-path
+    // terminals) schedule reconnects forever. Recovery is a fresh client.
+    if (this.terminalReached) {
+      console.warn("[nats-client] connect() ignored — this instance is terminally retired; construct a fresh client with fresh credentials");
+      return;
+    }
+    // P0-4: a non-terminal reconnect reopens the send path — clear the closed gate
+    // (AFTER the terminal guard above, so a retired instance stays retired).
+    this.disconnected = false;
     this.client.connect();
   }
 
   /** Disconnect from NATS and drop the session. */
   disconnect(): void {
+    this.connectionEpoch++;
+    // P0-4: gate `sendUserMessage` BEFORE anything else so a send that arrives
+    // AFTER this returns (a state subscriber calling close() mid-render, then
+    // control resuming into publish()'s `sendUserMessage`; or a plain send() after
+    // close()) fails observably with `failed{closed}` rather than queuing onto the
+    // dead instance after its old ownership snapshot has been detached below.
+    this.disconnected = true;
+    // Detach ownership of THIS lifecycle's pending work before the raw transport
+    // notifies state listeners. Such a listener may synchronously connect() and
+    // send on the replacement lifecycle; that fresh queue/ledger must not be
+    // consumed by this disconnect's trailing failure notifications.
+    const pendingIds = this.takePendingSendIds();
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
-    if (this.handshakeSub >= 0) this.client.unsubscribe(this.handshakeSub);
     this.outSub = -1;
-    this.handshakeSub = -1;
     this.resetSession();
-    // P0-7b: an explicit disconnect retires this instance — drop the unacked
-    // ledger (unlike resetSession, which keeps it across a mid-session drop).
-    this.unackedLedger.clear();
     this.client.disconnect();
+    // P0-4 (B2): an explicit disconnect retires this instance — every pending
+    // user_message (queued in `outboundQueue` AND published-but-unacked in the
+    // ledger) fails observably with `failed{closed}`, then BOTH structures clear
+    // (the old code cleared only the ledger, stranding queued sends in a dead
+    // instance with no terminal transition).
+    //
+    // Notify only the detached lifecycle after teardown. Re-entrant replacement
+    // work created by the state notification above remains live and drainable.
+    this.failPendingIds(pendingIds, { reason: "closed", retryable: false });
   }
 
   /**
    * Send user message (buffered until the handshake completes). Returns the
    * stable wire `id` stamped on the frame so the caller can correlate a later
-   * `ack` (P0-7b) back to its local echo.
+   * `ack` (P0-7b) or a send-state transition (P0-4) back to its local echo.
+   *
+   * `reservedId` (P0-4/R5-1): a wire id previously minted by `reserveWireId()`.
+   * Passing it lets the wrapper register the bubble/receipt BEFORE the id's
+   * synchronous state transitions fire (commit order, D4). It is consumed exactly
+   * once and MUST be currently reserved and absent from the tracker/queue/ledger
+   * — a violation THROWS (a programmer error, never a fabricated receipt). Omit
+   * it (direct callers, tests) to self-reserve a fresh id.
    */
-  sendUserMessage(text: string): string {
-    // P0-7a: stamp a stable, unique id per logical send. The agent records it at
-    // ingress and drops a duplicate frame (rapid double-submit; the P0-7b replay
-    // queue re-send after reconnect) so it never runs the turn twice. Reuse the
-    // package's existing randomness helper (WebCrypto-preferring, Math.random
-    // fallback) rather than `crypto.randomUUID` so we match the client's
-    // established host assumptions; the id only needs to be collision-unguessable,
-    // not a UUID.
-    const id = randomInboxToken();
-    this.enqueue({ type: "user_message", text, id });
+  sendUserMessage(text: string, reservedId?: string): string {
+    const id = reservedId === undefined ? this.reserveWireId() : reservedId;
+    this.consumeReservedId(id);
+    // Seed without notifying. For a live send, its queue position must be owned
+    // BEFORE the public queued callback: a listener can synchronously send B, and
+    // B must never commit/publish ahead of A. Terminal/closed sends intentionally
+    // never enter a live queue, but still expose queued→failed below.
+    this.trackerInsert(id);
+    if (this.terminalReached) {
+      // D4 terminal sequence ①: a send arriving after a terminal failure is NOT
+      // queued into a dead instance — it resolves immediately to an observable
+      // failed receipt (reject-throw would break the observable-failed contract).
+      this.emitSendState(id, "queued");
+      this.trackerFail(id, {
+        reason: "terminal",
+        cause: this.terminalCause,
+        retryable: false,
+        lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
+      });
+      return id;
+    }
+    if (this.disconnected) {
+      // P0-4: an explicitly-closed instance never queues a send — it resolves
+      // immediately to `failed{closed}` (observable, never stuck at `queued`).
+      // The wireId→receiptKey alias is set BEFORE sendUserMessage (publish/
+      // maybeRelease), so the wrapper's `onSendState` handler patches the receipt
+      // AND the render bubble. Fixes both the re-entrant close()-mid-render race
+      // and a plain send() after close(), at the low-level layer.
+      this.emitSendState(id, "queued");
+      this.trackerFail(id, {
+        reason: "closed",
+        retryable: false,
+        lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
+      });
+      return id;
+    }
+    // Authoritative outbound ownership precedes every public callback. A nested
+    // send appends behind this entry; whichever stack frame starts the drain will
+    // therefore publish in logical call order.
+    this.outboundQueue.push({ type: "user_message", text, id });
+    this.emitSendState(id, "queued");
+    this.drainOutboundQueue();
     return id;
+  }
+
+  /**
+   * P0-4: validate + consume a wire id. It must be currently reserved and not yet
+   * present in the tracker/queue/ledger; on success it leaves `reservedWireIds`.
+   * Any violation throws (programmer error — an unreserved/reused/in-flight id
+   * must never reach the ledger `Map`).
+   */
+  private consumeReservedId(id: string): void {
+    if (!this.reservedWireIds.has(id)) {
+      throw new Error("[nats-client] sendUserMessage: wire id was not reserved via reserveWireId()");
+    }
+    if (
+      this.sendTracker.has(id) ||
+      this.unackedLedger.has(id) ||
+      this.outboundQueue.some((m) => m.type === "user_message" && m.id === id)
+    ) {
+      throw new Error("[nats-client] sendUserMessage: reserved wire id is already in use");
+    }
+    this.reservedWireIds.delete(id);
   }
 
   /** Send approval decision (buffered until the handshake completes). */
@@ -1055,16 +1414,68 @@ export class WebChannelNatsClient {
     return () => { this.sessionListeners.delete(listener); };
   }
 
+  /**
+   * P0-4: subscribe to authoritative send-state transitions (queued/sent/
+   * accepted/failed) keyed by wire `id`. Fires only on VALID monotonic
+   * transitions; returns an unsubscribe.
+   */
+  onSendState(listener: SendStateListener): () => void {
+    this.sendStateListeners.add(listener);
+    return () => { this.sendStateListeners.delete(listener); };
+  }
+
+  /**
+   * Read the already-mutated authoritative tracker without affecting serialized
+   * callback delivery. A higher-level receipt can therefore report a transition
+   * that has synchronously happened even when its `onSendState` event is queued
+   * behind an older event's fanout. Return copies so callers cannot mutate the
+   * tracker through this package-internal seam. @internal
+   */
+  getSendStateSnapshot(id: string): { state: SendState; failure?: SendFailure } | undefined {
+    const entry = this.sendTracker.get(id);
+    if (!entry) return undefined;
+    return {
+      state: entry.state,
+      failure: entry.failure ? { ...entry.failure } : undefined,
+    };
+  }
+
+  /**
+   * P0-4 (R5-1/R6-1): mint a unique wire id and RESERVE it, one-shot. The wrapper
+   * calls this BEFORE creating the bubble/receipt so a `sendUserMessage(text, id)`
+   * lands its synchronous `queued`/immediate-`failed` transition on an
+   * already-registered receipt. The candidate is regenerated until it collides
+   * with nothing in `reservedWireIds`, the tracker, the outbound queue, or the
+   * unacked ledger; a bounded 8-attempt exhaustion throws BEFORE the wrapper
+   * records anything (a broken RNG stub can never mint an orphaned receipt).
+   *
+   * Package-internal — `WebChannelNatsClient` is not exported from the barrel, so
+   * this is not public API. @internal
+   */
+  reserveWireId(): string {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const candidate = randomInboxToken();
+      if (
+        !this.reservedWireIds.has(candidate) &&
+        !this.sendTracker.has(candidate) &&
+        !this.unackedLedger.has(candidate) &&
+        !this.outboundQueue.some((m) => m.type === "user_message" && m.id === candidate)
+      ) {
+        this.reservedWireIds.add(candidate);
+        return candidate;
+      }
+    }
+    throw new Error("[nats-client] reserveWireId: could not mint a unique id after 8 attempts");
+  }
+
   // ---------------------------------------------------------------------------
   // Internal — handshake + crypto
   // ---------------------------------------------------------------------------
 
   private resetSession(): void {
-    this.clearHandshakeRetry();
     this.sessionKey = null;
-    this.keyPair = null;
     // Frames buffered for a dead session are ciphertext under a key we no
-    // longer (or never will) hold — drop them; the fresh register/handshake
+    // longer (or never will) hold — drop them; fresh registration
     // re-hydrates.
     this.pendingInbound = [];
     // Re-arm the one-time pre-key-drop warning for the next session.
@@ -1077,13 +1488,17 @@ export class WebChannelNatsClient {
   /**
    * Decrypt + deliver the `.out` frames that arrived before the session key
    * was established (see `pendingInbound`). Called immediately after the key
-   * is set on either path (register-delivered K or legacy handshake).
+   * is set from the register-delivered K.
    */
   private drainPendingInbound(): void {
     if (!this.sessionKey || this.pendingInbound.length === 0) return;
     const pending = this.pendingInbound;
     this.pendingInbound = [];
     for (const payload of pending) {
+      // A delivered frame's listener can synchronously tear the session down
+      // (disconnect() → resetSession nulls sessionKey). Bail mid-loop rather than
+      // decrypting the rest against a key that no longer belongs to this session.
+      if (!this.sessionKey) return;
       const msg = openMessage(payload, this.sessionKey) as InboundMessage | null;
       if (msg) this.deliverInbound(msg);
     }
@@ -1099,37 +1514,49 @@ export class WebChannelNatsClient {
     this.notifyMessageListeners(msg);
   }
 
-  /** P0-7b: remove acked ids from the unacked ledger; unknown ids are a no-op. */
+  /**
+   * P0-7b: remove acked ids from the unacked ledger; unknown ids are a no-op.
+   * P0-4: also advance each acked id to `accepted` (the tracker's guard makes a
+   * duplicate/late/post-terminal ack a no-op).
+   */
   private drainAcked(ids?: string[]): void {
     if (!ids) return;
-    for (const id of ids) this.unackedLedger.delete(id);
+    for (const id of ids) {
+      this.unackedLedger.delete(id);
+      this.trackerAdvance(id, "accepted");
+    }
   }
 
   private async onConnected(): Promise<void> {
+    // P0-4 (R4): a terminally-retired instance must NOT re-register. A
+    // registration-path terminal sets `terminalReached` but leaves the raw
+    // transport non-terminal, so an explicit `connect()` can still redial and fire
+    // this handler; without this guard a now-valid register reply would establish
+    // a session and fire `onSession` on a dead instance (reviving sessionEstablished
+    // / the staleness valve while every send immediate-fails). Recovery is a fresh
+    // client, never this one.
+    // R5: defensively tear the socket down here too — closing the race where a
+    // socket dialed BEFORE the latch was set opens after it (a scheduled reconnect
+    // firing, or a connect() that slipped in). disconnect() clears the reconnect
+    // timer + nulls onclose, so the low-level client stops redialing for good.
+    if (this.terminalReached) {
+      this.client.disconnect();
+      return;
+    }
     const { tenant, accountId, peerId } = this.options;
     // Mark this flow as the current connection generation. Any `await` below
     // re-checks `this.connectionEpoch === epoch` so a continuation resumed after
     // a drop+reconnect bails instead of clobbering the fresh flow's state.
     const epoch = ++this.connectionEpoch;
+    const connectionGeneration = this.client.currentConnectionGeneration();
     const { registration } = this.options;
-    // Phase 6 (multi-device): when the JWT-cnf X25519 private key is supplied,
-    // the session key is the agent-owned conversation key K, delivered WRAPPED
-    // in the register response — the `.handshake` subject is never subscribed
-    // nor published on this path (the plugin's register-admission channel does
-    // not answer handshakes anymore).
-    const registerDeliveredKey = Boolean(registration?.deviceX25519PrivateKey);
 
     // (Re)subscribe idempotently: unsubscribe stale sids so a reconnect never
     // leaves duplicate subscriptions delivering the same MSG twice. `.out` MUST
     // be active BEFORE the register hop: the agent sends the initial history
     // snapshot from the register route, and core NATS has no retention.
     if (this.outSub >= 0) this.client.unsubscribe(this.outSub);
-    if (this.handshakeSub >= 0) this.client.unsubscribe(this.handshakeSub);
-    this.handshakeSub = -1;
     this.outSub = this.client.subscribe(outboundSubject(tenant, accountId, peerId));
-    if (!registerDeliveredKey) {
-      this.handshakeSub = this.client.subscribe(handshakeSubject(tenant, accountId, peerId));
-    }
 
     // Fresh connection → fresh key establishment.
     this.resetSession();
@@ -1144,18 +1571,7 @@ export class WebChannelNatsClient {
     // raw NatsClient.disconnect() (clears the reconnect timer + closes the
     // socket, leaving connected === false). The application must react to onError
     // and re-initialize with fresh credentials (a new bootstrap JWT).
-    if (registration) {
-      // The register hop presents the bootstrap JWT; it is REQUIRED here even
-      // though the type makes `jwt` optional (it is unused on the BYO-NATS path).
-      if (!this.options.jwt) {
-        const err = new Error(
-          "[nats-client] registration requires a bootstrap `jwt` (none provided)",
-        );
-        // P1-7: an embedder-code bug — a retry re-runs the same missing-jwt path.
-        this.notifyErrorListeners(err, "config");
-        this.client.disconnect();
-        return;
-      }
+    {
       let registerResult: Awaited<ReturnType<typeof registerWithPop>>;
       try {
         const registerSubj = registerSubject(tenant, accountId, peerId);
@@ -1176,11 +1592,11 @@ export class WebChannelNatsClient {
           devicePrivateKey: registration.devicePrivateKey,
         });
       } catch (err) {
-        console.error("[nats-client] PoP registration failed:", err);
         // Epoch guard (mirrors the success path below): a reconnect during the
         // register round-trip may have already spawned a newer onConnected, so a
         // stale flow must not tear down or redial the live connection.
         if (this.connectionEpoch !== epoch) return;
+        console.error("[nats-client] PoP registration failed:", err);
         if (isTerminalRegisterError(err)) {
           // Rejected proof/token or a non-transient server failure — the SAME
           // bootstrap credentials will never be accepted. Terminal: surface the
@@ -1194,8 +1610,12 @@ export class WebChannelNatsClient {
             : err instanceof ProtocolVersionMalformedError ? "protocol-mismatch"
             : err instanceof PopServerError ? "server"
             : "unknown";
-          this.notifyErrorListeners(err as Error, cause);
-          this.client.disconnect();
+          // P0-4: failConnectionEpoch now folds the D4 terminal sweep in BEFORE
+          // notifying (mark terminal → fail queued/ledgered sends observably →
+          // notify → generation-precise disconnect), so a later send resolves to
+          // failed{terminal} instead of re-queuing into a dead instance while the
+          // P1-3 epoch/generation retirement stays intact.
+          this.failConnectionEpoch(epoch, connectionGeneration, err as Error, cause);
           return;
         }
         // TRANSIENT (B4): request timeout, 503, or agent-offline retry-
@@ -1235,16 +1655,18 @@ export class WebChannelNatsClient {
             `agent-plugin=${agentProtocolVersion}; upgrade the older side`,
         );
         // P1-7: re-auth cannot reconcile incompatible wire versions.
-        this.notifyErrorListeners(err, "protocol-mismatch");
-        this.client.disconnect();
+        // P0-4: failConnectionEpoch folds the terminal sweep in (sweep pending →
+        // notify), not a bare notify — and keeps the P1-3 generation retirement.
+        this.failConnectionEpoch(epoch, connectionGeneration, err, "protocol-mismatch");
         return;
       }
       this.notifyProtocolListeners({
         protocolVersion: agentProtocolVersion,
         pluginVersion: agentPluginVersion,
       });
+      if (this.connectionEpoch !== epoch) return;
 
-      if (registerDeliveredKey) {
+      {
         // Register-delivered key: unwrap K with the cnf device private key.
         // Fail-closed and TERMINAL on any miss — we never fall back to the
         // handshake here (the plugin does not answer it on this path, and a
@@ -1257,8 +1679,9 @@ export class WebChannelNatsClient {
           );
           // P1-7: the plugin speaks an incompatible register contract — a
           // capability mismatch, upgrade the older side (re-auth cannot help).
-          this.notifyErrorListeners(err, "protocol-mismatch");
-          this.client.disconnect();
+          // P0-4: failConnectionEpoch folds the terminal sweep in (sweep pending
+          // → notify), preserving the P1-3 generation retirement.
+          this.failConnectionEpoch(epoch, connectionGeneration, err, "protocol-mismatch");
           return;
         }
         // F2 fail-closed: the register-delivered K is authenticated by deriving
@@ -1275,91 +1698,80 @@ export class WebChannelNatsClient {
           // P1-7: NOT "config" — the pin rides the SaaS bootstrap response, so
           // re-auth (which refetches bootstrap) can genuinely deliver it. Hiding
           // the re-auth affordance here would strand a recoverable state.
-          this.notifyErrorListeners(err, "secure-channel-failed");
-          this.client.disconnect();
+          // P0-4: failConnectionEpoch folds the terminal sweep in (sweep pending
+          // → notify), preserving the P1-3 generation retirement.
+          this.failConnectionEpoch(epoch, connectionGeneration, err, "secure-channel-failed");
           return;
         }
         let key: Uint8Array;
         try {
           key = await unwrapConversationKey(
             wrapped,
-            registration.deviceX25519PrivateKey!,
+            registration.deviceX25519PrivateKey,
             registration.pinnedAgentPublicKey,
             peerId,
           );
         } catch (err) {
+          if (this.connectionEpoch !== epoch) return;
           console.error("[nats-client] conversation-key unwrap failed:", err);
           // P1-7: the E2E session could not be established (bad/tampered key or a
           // stale pin) — re-auth to retry with fresh keys.
-          this.notifyErrorListeners(err as Error, "secure-channel-failed");
-          this.client.disconnect();
+          // P0-4: failConnectionEpoch folds the terminal sweep in (sweep pending
+          // → notify), preserving the P1-3 generation retirement.
+          this.failConnectionEpoch(epoch, connectionGeneration, err as Error, "secure-channel-failed");
           return;
         }
         if (this.connectionEpoch !== epoch) return;
         this.sessionKey = key;
+        // drainPendingInbound() synchronously invokes message listeners; one that
+        // calls disconnect()+connect() advances the epoch under us. Re-check before
+        // flushing/notifying so a stale flow never publishes on — or fires a false
+        // "session established" for — a connection generation that is no longer
+        // current (session listeners gate P1-9 unsend-hold release).
         this.drainPendingInbound();
+        if (this.connectionEpoch !== epoch) return;
         this.flushQueue();
+        if (this.connectionEpoch !== epoch) return;
         // P1-9: notify AFTER flushQueue so a released hold is ordered behind the
         // P0-7b ledger replay (drain → flush → notify; see onSession).
         this.notifySessionListeners();
         return;
       }
     }
-
-    // Legacy per-connection X25519 handshake (no registration at all — the
-    // wildcard/auto-admission path — or an embedder that has not supplied the
-    // cnf device key yet).
-    const keyPair = await generateX25519KeyPair();
-    // Same guard after the keygen await: do not clobber a fresher flow's keyPair
-    // or publish a stale handshake.
-    if (this.connectionEpoch !== epoch) return;
-    this.keyPair = keyPair;
-    this.publishHandshakeWithRetry(epoch, 0);
   }
 
   /**
-   * Publish the `key_exchange` handshake frame and, if the agent has not answered
-   * (no session key) within a short window, republish — up to `HANDSHAKE_MAX_RETRIES`
-   * times. Guarded by the connection epoch so a stale flow never republishes onto a
-   * newer connection. Stops as soon as `handleRaw` establishes the session key.
+   * Guard terminal handling across both stale async flows and sync listener
+   * re-entry (P1-3), AND fold in the P0-4 D4 terminal sweep. Register/handshake
+   * terminal sites route here (epoch + generation in scope); the raw transport
+   * path routes through `handleTerminal` instead (no epoch).
    */
-  private publishHandshakeWithRetry(epoch: number, attempt: number): void {
-    if (this.connectionEpoch !== epoch || this.sessionKey || !this.keyPair) return;
-    const { tenant, accountId, peerId } = this.options;
-    this.client.publish(
-      handshakeSubject(tenant, accountId, peerId),
-      keyExchangeFrame(this.keyPair.publicKeyB64url),
-    );
-    if (attempt >= HANDSHAKE_MAX_RETRIES) return;
-    if (this.handshakeRetryTimer) clearTimeout(this.handshakeRetryTimer);
-    this.handshakeRetryTimer = setTimeout(() => {
-      this.handshakeRetryTimer = null;
-      this.publishHandshakeWithRetry(epoch, attempt + 1);
-    }, HANDSHAKE_RETRY_MS);
-  }
-
-  private clearHandshakeRetry(): void {
-    if (this.handshakeRetryTimer) {
-      clearTimeout(this.handshakeRetryTimer);
-      this.handshakeRetryTimer = null;
-    }
+  private failConnectionEpoch(
+    epoch: number, connectionGeneration: number, err: Error, cause: WebChannelErrorCause,
+  ): void {
+    if (this.connectionEpoch !== epoch) return;
+    // P0-4 D4 ①②: mark terminal + sweep queued/ledgered sends to failed{terminal}
+    // BEFORE embedder code runs — a send arriving during the notify below is
+    // caught by `terminalReached` and immediate-fails, never re-queued into a
+    // dead instance. Idempotent, so re-entry through the guard is harmless.
+    this.markTerminalAndSweep(cause);
+    // Retire the failed epoch BEFORE invoking embedder code, so a stale
+    // continuation of THIS flow (e.g. a late unwrap resolve/reject still on the
+    // stack) that resumes after notification sees a bumped epoch and stays inert.
+    // Note: under the P0-4 retirement contract `markTerminalAndSweep` above has
+    // already set `terminalReached`, so an error listener's synchronous
+    // `connect()` is refused (no replacement dial is ever created — recovery is a
+    // fresh instance); the retire-before-notify here is no longer guarding a
+    // replacement socket, but it remains load-bearing for the same-flow late
+    // continuations covered by the epoch-guard tests.
+    const retiredEpoch = ++this.connectionEpoch;
+    this.notifyErrorListeners(err, cause);
+    if (this.connectionEpoch !== retiredEpoch) return;
+    this.client.disconnectConnectionGeneration(connectionGeneration);
   }
 
   private async handleRaw(subject: string, payload: string): Promise<void> {
     const { tenant, accountId, peerId } = this.options;
-
-    if (subject === handshakeSubject(tenant, accountId, peerId)) {
-      if (this.sessionKey || !this.keyPair) return; // already established / not ready
-      const agentPubKey = parseKeyExchange(payload);
-      if (!agentPubKey) return;
-      this.sessionKey = await deriveConversationKey(this.keyPair.privateKey, agentPubKey);
-      this.clearHandshakeRetry();
-      this.drainPendingInbound();
-      this.flushQueue();
-      // P1-9: notify AFTER flushQueue (drain → flush → notify; see onSession).
-      this.notifySessionListeners();
-      return;
-    }
 
     if (subject === outboundSubject(tenant, accountId, peerId)) {
       if (!this.sessionKey) {
@@ -1388,11 +1800,8 @@ export class WebChannelNatsClient {
   }
 
   private enqueue(message: OutboundMessage): void {
-    if (!this.sessionKey) {
-      this.outboundQueue.push(message);
-      return;
-    }
-    this.seal(message);
+    this.outboundQueue.push(message);
+    this.drainOutboundQueue();
   }
 
   private flushQueue(): void {
@@ -1408,9 +1817,48 @@ export class WebChannelNatsClient {
       this.unackedLedger.clear();
       this.outboundQueue = [...replay, ...this.outboundQueue];
     }
-    const queued = this.outboundQueue;
-    this.outboundQueue = [];
-    for (const message of queued) this.seal(message);
+    this.drainOutboundQueue();
+  }
+
+  /**
+   * Drain only the ordinary outbound queue. Reconnect-only ledger replay is
+   * prepended by `flushQueue()` once per established session; live sends must not
+   * replay the entire unacked ledger. Nested sends append to this same live queue
+   * and the outer drain consumes them FIFO without recursive sealing.
+   */
+  private drainOutboundQueue(): void {
+    if (this.drainingOutboundQueue) return;
+    this.drainingOutboundQueue = true;
+    try {
+      // P0-4 (review R1): drain the queue LIVE — shift one entry per iteration —
+      // rather than snapshotting it into a local array and clearing the field up
+      // front. `seal()` publishes synchronously, which runs `trackerAdvance(…,
+      // "sent")` → the wrapper's receipt/bubble `setState` → the embedder's state
+      // subscribers, MID-LOOP. A perfectly ordinary subscriber (route change,
+      // unmount, logout) may call `close()` there. With a snapshot the remaining
+      // entries live in NEITHER `outboundQueue` NOR `unackedLedger` for the length
+      // of the loop, so the `failAllPending()` sweep inside that `disconnect()`
+      // cannot see them; the loop then resumes and `seal()` re-pushes them onto a
+      // closed instance whose sweep will never run again — permanently `queued`,
+      // the exact invariant P0-4 exists to eliminate. (Same hole on the terminal
+      // path: `markTerminalAndSweep` would likewise miss the in-flight array.) A
+      // live drain keeps the remainder genuinely present in `outboundQueue`, so
+      // every sweep sees it. This mirrors the deliberate live-`shift()` discipline
+      // in the wrapper's `maybeRelease()`, which is why the release path is immune.
+      //
+      // The `this.sessionKey` condition is LOAD-BEARING, not a re-check for tidiness:
+      // `seal()` fail-closes by re-pushing to the TAIL when the key is gone, so an
+      // unconditional `while (length > 0)` would shift-and-re-push the same frame
+      // forever. With the guard, a mid-loop session teardown just leaves the
+      // remainder queued in order — swept to failed{closed}/failed{terminal} if the
+      // instance was closed/retired, or replayed at the next flushQueue() on a plain
+      // reconnect (pre-existing behavior), with no reordering either way.
+      while (this.sessionKey && this.outboundQueue.length > 0) {
+        this.seal(this.outboundQueue.shift()!);
+      }
+    } finally {
+      this.drainingOutboundQueue = false;
+    }
   }
 
   private seal(message: OutboundMessage): void {
@@ -1426,20 +1874,196 @@ export class WebChannelNatsClient {
     // and leave a drained id re-inserted. Only user_messages (see `unackedLedger`);
     // an id-less frame from a caller that bypassed sendUserMessage is not
     // replayable and is skipped.
+    //
+    // P0-4 (review R2): `recordUnacked` RETURNS the ids it evicted rather than
+    // failing them inline, and we notify them at the end of this method. Nothing
+    // between the `sessionKey` fail-closed check above and `sealMessage()` below
+    // may call into embedder code: a subscriber reached from here can `close()`,
+    // which nulls `sessionKey` mid-seal (TS narrowing from the top-of-function
+    // check hides it), and `null` then flows into the AEAD as a raw TypeError
+    // thrown straight out of `send()`. Audited: eviction was the ONLY such callout
+    // in this window; the remaining statements are Map/object reads and a
+    // `console.warn`. Keeping it that way makes the seal atomic — hence no
+    // defensive re-check before `sealMessage()`, which would be dead code (and a
+    // re-queue there would strand the frame on an already-swept closed instance).
+    let evicted: string[] = [];
     if (message.type === "user_message" && message.id) {
-      this.recordUnacked(message.id, message);
+      evicted = this.recordUnacked(message.id, message);
     }
     const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, message);
-    this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
+    // P0-4 (D3): stamp the attempt time on every publish attempt (R1-F10), then
+    // consume the publish result. On success a user_message advances to `sent`;
+    // on failure it stays `queued` (no emit) — it remains in the ledger and the
+    // publish-driven forceReconnect replays it, so a live process never reports
+    // false success. Non-replicated frames only warn on failure (§5 recovery lanes).
+    if (message.type === "user_message" && message.id) {
+      const entry = this.sendTracker.get(message.id);
+      if (entry) entry.lastAttemptAt = Date.now();
+    }
+    const ok = this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
+    if (message.type === "user_message" && message.id) {
+      if (ok) this.trackerAdvance(message.id, "sent");
+    } else if (!ok) {
+      console.warn(`[nats-client] publish failed for non-replicated frame '${message.type}' — recovery via reconnect/register snapshot`);
+    }
+    // P0-4 (review R2): the deferred eviction notifications — the seal is complete,
+    // so an embedder that tears the instance down from here can no longer corrupt
+    // it. Ordered AFTER this message's own `sent` advance on purpose: a `close()`
+    // from an eviction subscriber sweeps the ledger, and THIS message is already
+    // recorded in it, so it lands at failed{closed} rather than being stranded.
+    for (const id of evicted) {
+      this.trackerFail(id, {
+        reason: "evicted",
+        retryable: true,
+        lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
+      });
+    }
   }
 
-  /** P0-7b: record an unacked user_message, evicting the oldest past the cap. */
-  private recordUnacked(id: string, message: OutboundMessage): void {
+  // ---------------------------------------------------------------------------
+  // P0-4 — authoritative send-state tracker (D4)
+  // ---------------------------------------------------------------------------
+
+  /** Seed a fresh `queued` entry without a public callout. No-op if already tracked. */
+  private trackerInsert(id: string): void {
+    if (this.sendTracker.has(id)) return;
+    this.sendTracker.set(id, { state: "queued" });
+  }
+
+  /**
+   * Advance a tracked send FORWARD to `queued`/`sent`/`accepted`, enforcing the
+   * monotonic guard: the id must be tracked, not terminal (`failed`), and the
+   * target must strictly outrank the current state. Invalid inputs are silent
+   * no-ops (R1-F5) — duplicate ack, ack after eviction, forward event after a
+   * failure. Mutates then notifies.
+   */
+  private trackerAdvance(id: string, to: "queued" | "sent" | "accepted"): void {
+    const entry = this.sendTracker.get(id);
+    if (!entry || entry.state === "failed") return;
+    if (WebChannelNatsClient.SEND_RANK[entry.state] >= WebChannelNatsClient.SEND_RANK[to]) return;
+    entry.state = to;
+    this.emitSendState(id, to, entry.failure);
+  }
+
+  /**
+   * Fail a tracked send terminally. No-op if unknown or already `failed`
+   * (`failed`/`accepted`/`sent`→`failed` are all valid; only re-failing is not).
+   */
+  private trackerFail(id: string, failure: SendFailure): void {
+    const entry = this.sendTracker.get(id);
+    if (!entry || entry.state === "failed") return;
+    entry.state = "failed";
+    entry.failure = failure;
+    this.emitSendState(id, "failed", failure);
+  }
+
+  /**
+   * Detach the current lifecycle's entire outbound queue/ledger before any public
+   * failure callout, returning only the user-message ids that need a receipt
+   * transition. Non-user frames are dropped with the retired lifecycle. Messages
+   * already `accepted` are in neither collection and remain untouched.
+   */
+  private takePendingSendIds(): string[] {
+    const ids = new Set<string>();
+    for (const m of this.outboundQueue) if (m.type === "user_message" && m.id) ids.add(m.id);
+    for (const id of this.unackedLedger.keys()) ids.add(id);
+    this.outboundQueue = [];
+    this.unackedLedger.clear();
+    return [...ids];
+  }
+
+  /** Fail a previously detached ownership snapshot without touching live queues. */
+  private failPendingIds(ids: readonly string[], failure: SendFailure): void {
+    for (const id of ids) {
+      this.trackerFail(id, { ...failure, lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt });
+    }
+  }
+
+  /**
+   * Terminal paths retire the current lifecycle wholesale. Detach first, then
+   * fail each captured id so listener re-entry cannot be consumed by the sweep.
+   */
+  private failAllPending(failure: SendFailure): void {
+    this.failPendingIds(this.takePendingSendIds(), failure);
+  }
+
+  /**
+   * P0-4 terminal sequence (D4) steps ①②: mark terminal (so a re-entrant send
+   * resolves immediately to failed) then sweep pending → failed{terminal,cause}.
+   * Shared by BOTH terminal entry points so neither loses the sweep: the raw
+   * transport-death path (`handleTerminal`, no epoch in scope) and the register/
+   * handshake path (`failConnectionEpoch`, epoch+generation-guarded). Runs BEFORE
+   * any embedder notify — a send arriving while error listeners run is caught by
+   * the `terminalReached` mark and never escapes into a dead instance.
+   */
+  private markTerminalAndSweep(cause?: WebChannelErrorCause): void {
+    this.terminalReached = true;
+    this.terminalCause = cause ?? "unknown";
+    this.failAllPending({ reason: "terminal", cause: this.terminalCause, retryable: false });
+  }
+
+  /**
+   * P0-4 terminal sequence (D4): transport-death entry point (`client.onError` —
+   * no connection epoch in scope, so no generation-targeted disconnect here, same
+   * as review's pre-P0-4 routing). ① mark + ② sweep, THEN ③ notify error
+   * listeners (the wrapper fails its own held[] there).
+   */
+  private handleTerminal(err: Error, cause?: WebChannelErrorCause): void {
+    this.markTerminalAndSweep(cause);
+    this.notifyErrorListeners(err, cause);
+  }
+
+  private emitSendState(id: string, state: SendState, failure?: SendFailure): void {
+    this.pendingSendStateEvents.push({ id, state, failure });
+    if (this.drainingSendStateEvents) return;
+
+    this.drainingSendStateEvents = true;
+    try {
+      while (this.pendingSendStateEvents.length > 0) {
+        const event = this.pendingSendStateEvents.shift()!;
+        // Keep Set.forEach's existing live membership semantics (unsubscribe of a
+        // not-yet-visited listener suppresses it; an added listener may join this
+        // event). FIFO serialization changes only nested-event ordering.
+        this.sendStateListeners.forEach((listener) => {
+          try {
+            listener(event.id, event.state, event.failure);
+          } catch (e) {
+            console.error("[nats-client] Send-state listener error:", e);
+          }
+        });
+      }
+    } finally {
+      this.drainingSendStateEvents = false;
+    }
+  }
+
+  /**
+   * P0-7b: record an unacked user_message, evicting the oldest past the cap.
+   *
+   * RETURNS the evicted ids instead of failing them here (P0-4 review R2).
+   * `trackerFail` is a synchronous callout into embedder code (emitSendState →
+   * the wrapper's receiptTransition → setState → app state subscribers), and the
+   * only caller is `seal()`, which runs this BETWEEN its `sessionKey` fail-closed
+   * check and the `sealMessage()` that reads `this.sessionKey`. A subscriber
+   * calling `close()` from that window nulls the key mid-seal, so `sealMessage`
+   * received `null` and threw a raw crypto TypeError out of `send()` — breaking
+   * the P0-4 contract that a send RETURNS an observable receipt and never throws
+   * (and, on the flush path, escaping `onConnected` as an unhandled rejection
+   * that abandoned the rest of the drain). Returning the ids keeps `seal()`'s
+   * critical section free of embedder code; the caller notifies once the seal is
+   * done. B3's observable-eviction behavior itself is unchanged.
+   */
+  private recordUnacked(id: string, message: OutboundMessage): string[] {
+    const evicted: string[] = [];
     this.unackedLedger.set(id, message);
     while (this.unackedLedger.size > WebChannelNatsClient.MAX_UNACKED) {
       const oldest = this.unackedLedger.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       this.unackedLedger.delete(oldest);
+      // P0-4 (B3): an evicted message will never be replayed → fail it observably
+      // (retryable — a fresh send can still succeed) instead of the old
+      // console-only drop. Deferred to the caller (see the note above).
+      evicted.push(oldest);
       if (!this.warnedUnackedEvict) {
         // Warn ONCE per session (re-armed in resetSession) — a full ledger means
         // an unusually long delivery stall; a per-send warn would spam a burst.
@@ -1450,6 +2074,7 @@ export class WebChannelNatsClient {
         );
       }
     }
+    return evicted;
   }
 
   private notifyMessageListeners(msg: InboundMessage): void {

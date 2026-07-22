@@ -1,432 +1,84 @@
-/**
- * Production browser NATS client — PoP registration wiring tests (NATS transport).
- *
- * Proves that `WebChannelNatsClient.onConnected()` runs the PoP registration
- * over NATS request/reply in the right ORDER relative to the X25519 handshake:
- *   - it subscribes to .out/.handshake, THEN completes the challenge+register
- *     request/reply round-trips, and only AFTER that publishes its key-exchange
- *     frame (NATS has no retention, so a handshake published before the agent
- *     registers/subscribes would be lost);
- *   - it is FAIL-CLOSED — a rejected proof (generic `unauthorized` reply →
- *     PopRejectedError) publishes no handshake and no .in frame, and surfaces via
- *     onError;
- *   - with no `registration` config the current behaviour is unchanged (handshake
- *     published immediately, no register round-trip).
- *
- * The fake nats-server (over a fake WebSocket) mirrors the crypto test harness
- * and additionally answers the register subject: a browser PUB with a reply-to
- * inbox is answered by delivering a MSG to that inbox. The device key is a real
- * Ed25519 key from generateDevicePopKeyPair(), so signPop runs for real.
- */
-
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-
+import { inboundSubject, registerSubject } from "./nats-client.js";
+import { openMessage } from "./e2e-crypto-browser.js";
 import {
-  WebChannelNatsClient,
-  inboundSubject,
-  handshakeSubject,
-  registerSubject,
-} from "./nats-client.js";
-import {
-  generateX25519KeyPair,
-  deriveConversationKey,
-  keyExchangeFrame,
-  parseKeyExchange,
-} from "./e2e-crypto-browser.js";
-import { generateDevicePopKeyPair } from "./pop-register.js";
+  AGENT, FakeNatsWS, JWT, PEER, TENANT, installFakeWebSocket, makeClient,
+  registerAgent, settle,
+} from "./nats-client-wrapped.test-harness.js";
 
-// ---------------------------------------------------------------------------
-// Fake nats-server over a fake WebSocket (mirrors nats-client-crypto.test.ts)
-// ---------------------------------------------------------------------------
+let restore:()=>void;
+beforeEach(()=>{restore=installFakeWebSocket();});
+afterEach(()=>restore());
 
-type ServerHandler = (
-  subject: string,
-  payload: string,
-  server: FakeNatsWS,
-  replyTo?: string,
-) => void | Promise<void>;
-
-class FakeNatsWS {
-  static instances: FakeNatsWS[] = [];
-  static readonly CONNECTING = 0;
-  static readonly OPEN = 1;
-  static readonly CLOSING = 2;
-  static readonly CLOSED = 3;
-
-  url: string;
-  binaryType = "blob";
-  readyState: number = FakeNatsWS.CONNECTING;
-  onopen: (() => void) | null = null;
-  onmessage: ((e: { data: string }) => void) | null = null;
-  onerror: ((e: unknown) => void) | null = null;
-  onclose: (() => void) | null = null;
-
-  /** subject -> sid the client subscribed with. */
-  private readonly subs = new Map<string, number>();
-  /** Every PUB the client sent, in order (for wiretap assertions). */
-  readonly published: Array<{ subject: string; payload: string; replyTo?: string }> = [];
-  /** Agent-side behaviour injected by the test. */
-  handler: ServerHandler = () => {};
-
-  constructor(url: string) {
-    this.url = url;
-    FakeNatsWS.instances.push(this);
-    queueMicrotask(() => {
-      this.readyState = FakeNatsWS.OPEN;
-      this.onopen?.();
-    });
-  }
-
-  send(data: string): void {
-    if (data.startsWith("CONNECT")) return;
-    if (data.startsWith("PING")) {
-      this.emit("PONG\r\n");
-      return;
-    }
-    if (data.startsWith("PONG")) return;
-    if (data.startsWith("SUB ")) {
-      const [, subject, sid] = data.trim().split(" ");
-      this.subs.set(subject, Number(sid));
-      return;
-    }
-    if (data.startsWith("UNSUB ")) {
-      const sid = Number(data.trim().split(" ")[1]);
-      for (const [subject, id] of this.subs) if (id === sid) this.subs.delete(subject);
-      return;
-    }
-    if (data.startsWith("PUB ")) {
-      const idx = data.indexOf("\r\n");
-      const header = data.slice(0, idx).split(" "); // PUB <subject> [reply-to] <len>
-      const subject = header[1];
-      const replyTo = header.length === 4 ? header[2] : undefined;
-      const payload = data.slice(idx + 2).replace(/\r\n$/, "");
-      this.published.push({ subject, payload, replyTo });
-      void this.handler(subject, payload, this, replyTo);
-      return;
-    }
-  }
-
-  /** Deliver a MSG to the client iff it is subscribed to `subject`. */
-  deliverToClient(subject: string, payload: string): void {
-    const sid = this.subs.get(subject);
-    if (sid === undefined) return;
-    const len = new TextEncoder().encode(payload).length;
-    this.emit(`MSG ${subject} ${sid} ${len}\r\n${payload}\r\n`);
-  }
-
-  close(): void {
-    this.readyState = FakeNatsWS.CLOSED;
-    this.onclose?.();
-  }
-
-  private emit(frame: string): void {
-    this.onmessage?.({ data: frame });
-  }
-}
-
-/**
- * An "agent" that mirrors the plugin: answers the register subject over the
- * reply-to inbox (challenge → nonce, register → registered), then answers the
- * X25519 handshake. `state.registered` flips true once the register op is
- * handled — the ordering wiretap keys off it.
- */
-function makeRegisterAndHandshakeAgent(
-  tenant: string,
-  accountId: string,
-  peerId: string,
-  opts?: { rejectRegister?: boolean },
-): { handler: ServerHandler; state: { registered: boolean } } {
-  const reg = registerSubject(tenant, accountId, peerId);
-  const hs = handshakeSubject(tenant, accountId, peerId);
-  const state = { registered: false };
-  const handler: ServerHandler = async (subject, payload, server, replyTo) => {
-    if (subject === reg && replyTo) {
-      const body = JSON.parse(payload) as { op?: string };
-      if (body.op === "challenge") {
-        server.deliverToClient(replyTo, JSON.stringify({ nonce: "nonce-abc" }));
-        return;
-      }
-      if (body.op === "register") {
-        if (opts?.rejectRegister) {
-          server.deliverToClient(replyTo, JSON.stringify({ error: "unauthorized", code: 401 }));
-          return;
-        }
-        state.registered = true;
-        server.deliverToClient(replyTo, JSON.stringify({ peerId, registered: true }));
-        return;
-      }
-      return;
-    }
-    if (subject === hs) {
-      const browserPub = parseKeyExchange(payload);
-      if (!browserPub) return;
-      const agentKP = await generateX25519KeyPair();
-      await deriveConversationKey(agentKP.privateKey, browserPub);
-      server.deliverToClient(hs, keyExchangeFrame(agentKP.publicKeyB64url));
-    }
-  };
-  return { handler, state };
-}
-
-const TENANT = "acme";
-const AGENT = "agent-1";
-const PEER = "user-42";
-const JWT = "bootstrap.jwt.token";
-
-async function settle(rounds = 8): Promise<void> {
-  for (let i = 0; i < rounds; i++) await new Promise((r) => setTimeout(r, 5));
-}
-
-let originalWebSocket: unknown;
-
-beforeEach(() => {
-  originalWebSocket = (globalThis as { WebSocket?: unknown }).WebSocket;
-  (globalThis as { WebSocket: unknown }).WebSocket = FakeNatsWS;
-  FakeNatsWS.instances = [];
-});
-
-afterEach(() => {
-  (globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket;
-});
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-describe("WebChannelNatsClient PoP registration wiring (NATS)", () => {
-  it("registers (challenge → register) BEFORE publishing the handshake frame", async () => {
-    const device = await generateDevicePopKeyPair();
-    const reg = registerSubject(TENANT, AGENT, PEER);
-    const hs = handshakeSubject(TENANT, AGENT, PEER);
-
-    const client = new WebChannelNatsClient({
-      url: "ws://127.0.0.1:4222",
-      jwt: JWT,
-      accountId: AGENT,
-      tenant: TENANT,
-      peerId: PEER,
-      registration: { devicePrivateKey: device.privateKey },
-    });
-    client.connect();
-    const server = FakeNatsWS.instances.at(-1)!;
-    const agent = makeRegisterAndHandshakeAgent(TENANT, AGENT, PEER);
-
-    // Wiretap: capture whether the register op had completed at the moment the
-    // handshake frame was published.
-    let handshakePublishedBeforeRegister = false;
-    server.handler = (subject, payload, srv, replyTo) => {
-      if (subject === hs && !agent.state.registered) handshakePublishedBeforeRegister = true;
-      return agent.handler(subject, payload, srv, replyTo);
-    };
-
+describe("WebChannelNatsClient PoP registration wiring (NATS)",()=>{
+  it("registers challenge → PoP → admit, then unwraps K and flushes ciphertext",async()=>{
+    const K=new Uint8Array(32).fill(11);
+    const h=await makeClient();
+    FakeNatsWS.sharedHandler=registerAgent(K,h.devicePublicRaw,h.identity);
+    h.client.connect();
+    h.client.sendUserMessage("hello");
     await settle();
-
-    // Both register round-trips happened, in order, on the register subject with
-    // a reply-to inbox, carrying the JWT/op/nonce/signature.
-    const regPubs = server.published.filter((p) => p.subject === reg);
-    expect(regPubs).toHaveLength(2);
-    const challenge = JSON.parse(regPubs[0].payload) as { op?: string; token?: string };
-    const register = JSON.parse(regPubs[1].payload) as {
-      op?: string;
-      token?: string;
-      nonce?: string;
-      signature?: string;
-    };
-    expect(challenge.op).toBe("challenge");
-    expect(challenge.token).toBe(JWT);
-    expect(regPubs[0].replyTo).toMatch(/reginbox/);
-    expect(register.op).toBe("register");
-    expect(register.token).toBe(JWT);
-    expect(register.nonce).toBe("nonce-abc");
-    expect(typeof register.signature).toBe("string");
-
-    // The handshake was published only AFTER the register round-trip resolved.
-    expect(handshakePublishedBeforeRegister).toBe(false);
-    expect(server.published.some((p) => p.subject === hs)).toBe(true);
-
-    client.disconnect();
+    const server=FakeNatsWS.instances[0];
+    const pubs=server.published.filter(p=>p.subject===registerSubject(TENANT,AGENT,PEER));
+    expect(pubs).toHaveLength(2);
+    expect(JSON.parse(pubs[0].payload)).toEqual({op:"challenge",token:JWT});
+    const proof=JSON.parse(pubs[1].payload) as {op:string;token:string;nonce:string;signature:string};
+    expect(proof).toMatchObject({op:"register",token:JWT,nonce:"nonce-abc"});
+    expect(typeof proof.signature).toBe("string");
+    const sent=server.published.find(p=>p.subject===inboundSubject(TENANT,AGENT,PEER))!;
+    expect(sent.payload).not.toContain("hello");
+    expect(openMessage(sent.payload,K)).toMatchObject({type:"user_message",text:"hello"});
+    h.client.disconnect();
   });
 
-  it("fail-closed: a rejected proof (unauthorized → PopRejectedError) publishes no handshake / no .in, and fires onError", async () => {
-    const device = await generateDevicePopKeyPair();
-    const errors: Error[] = [];
-    const client = new WebChannelNatsClient({
-      url: "ws://127.0.0.1:4222",
-      jwt: JWT,
-      accountId: AGENT,
-      tenant: TENANT,
-      peerId: PEER,
-      registration: { devicePrivateKey: device.privateKey },
-    });
-    client.onError((err) => errors.push(err));
-    client.connect();
-    const server = FakeNatsWS.instances.at(-1)!;
-    server.handler = makeRegisterAndHandshakeAgent(TENANT, AGENT, PEER, {
-      rejectRegister: true,
-    }).handler;
-
-    await settle();
-
-    // No handshake and no .in frame ever hit the wire (session never establishes).
-    const hs = handshakeSubject(TENANT, AGENT, PEER);
-    const inS = inboundSubject(TENANT, AGENT, PEER);
-    expect(server.published.some((p) => p.subject === hs)).toBe(false);
-    expect(server.published.some((p) => p.subject === inS)).toBe(false);
-
-    // onError received the PoP rejection.
-    expect(errors.length).toBe(1);
-    expect(errors[0].name).toBe("PopRejectedError");
-
-    // The session never establishes: a send stays buffered, nothing on .in.
-    client.sendUserMessage("after-reject");
-    await settle();
-    expect(server.published.some((p) => p.subject === inS)).toBe(false);
-
-    client.disconnect();
+  it("fail-closed terminal when register omits wrapped K",async()=>{
+    const h=await makeClient(); const errors:Error[]=[];
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32),h.devicePublicRaw,h.identity,{omitWrappedKey:true});
+    h.client.onError(e=>errors.push(e));h.client.connect();h.client.sendUserMessage("blocked");await settle();
+    expect(errors[0]?.message).toMatch(/wrappedConversationKey/);
+    expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.CLOSED);
+    expect(FakeNatsWS.instances[0].published.some(p=>p.subject===inboundSubject(TENANT,AGENT,PEER))).toBe(false);
   });
 
-  it("registration failure is terminal: tears the socket down (connected === false), no handshake, no reconnect", async () => {
-    const device = await generateDevicePopKeyPair();
-    const states: boolean[] = [];
-    const client = new WebChannelNatsClient({
-      url: "ws://127.0.0.1:4222",
-      jwt: JWT,
-      accountId: AGENT,
-      tenant: TENANT,
-      peerId: PEER,
-      registration: { devicePrivateKey: device.privateKey },
-    });
-    client.onState((connected) => states.push(connected));
-    client.connect();
-    const server = FakeNatsWS.instances.at(-1)!;
-    server.handler = makeRegisterAndHandshakeAgent(TENANT, AGENT, PEER, {
-      rejectRegister: true,
-    }).handler;
-
-    await settle();
-
-    // The socket connected, then registration failed and tore it back down:
-    // the last state observed is `false` (not reconnecting in some wedged state).
-    expect(states.at(-1)).toBe(false);
-    // The underlying fake WebSocket was actually closed.
-    expect(server.readyState).toBe(FakeNatsWS.CLOSED);
-    // No handshake was published (fail-closed).
-    const hs = handshakeSubject(TENANT, AGENT, PEER);
-    expect(server.published.some((p) => p.subject === hs)).toBe(false);
-
-    // Terminal: no reconnect loop spawns a second socket after the teardown.
-    const instanceCountAfterTeardown = FakeNatsWS.instances.length;
-    await settle();
-    expect(FakeNatsWS.instances.length).toBe(instanceCountAfterTeardown);
-
-    client.disconnect();
+  it("fail-closed terminal when the SaaS pin is absent",async()=>{
+    const h=await makeClient({pinned:null});const errors:Error[]=[];
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(2),h.devicePublicRaw,h.identity);
+    h.client.onError(e=>errors.push(e));h.client.connect();await settle();
+    expect(errors[0]?.message).toMatch(/pinned agent public key/i);
+    expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.CLOSED);
   });
 
-  // -------------------------------------------------------------------------
-  // P1-7: the terminal register failures each carry a machine-readable cause.
-  // -------------------------------------------------------------------------
-  it("a rejected proof (401) surfaces cause \"auth-rejected\"", async () => {
-    const device = await generateDevicePopKeyPair();
-    const causes: Array<string | undefined> = [];
-    const client = new WebChannelNatsClient({
-      url: "ws://127.0.0.1:4222",
-      jwt: JWT,
-      accountId: AGENT,
-      tenant: TENANT,
-      peerId: PEER,
-      registration: { devicePrivateKey: device.privateKey },
-    });
-    client.onError((_err, cause) => causes.push(cause));
-    client.connect();
-    const server = FakeNatsWS.instances.at(-1)!;
-    server.handler = makeRegisterAndHandshakeAgent(TENANT, AGENT, PEER, {
-      rejectRegister: true,
-    }).handler;
-
-    await settle();
-
-    // A 401 → PopRejectedError → the credential is not acceptable.
-    expect(causes).toEqual(["auth-rejected"]);
-
-    client.disconnect();
+  it("protocol version absent is non-fatal for compatibility",async()=>{
+    const h=await makeClient();const seen:unknown[]=[];
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(3),h.devicePublicRaw,h.identity);
+    h.client.onProtocol(v=>seen.push(v));h.client.connect();await settle();
+    expect(seen).toEqual([{protocolVersion:null,pluginVersion:null}]);
+    expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.OPEN);h.client.disconnect();
   });
 
-  it("a non-401/non-503 error reply (500) surfaces cause \"server\"", async () => {
-    const device = await generateDevicePopKeyPair();
-    const reg = registerSubject(TENANT, AGENT, PEER);
-    const causes: Array<string | undefined> = [];
-    const client = new WebChannelNatsClient({
-      url: "ws://127.0.0.1:4222",
-      jwt: JWT,
-      accountId: AGENT,
-      tenant: TENANT,
-      peerId: PEER,
-      registration: { devicePrivateKey: device.privateKey },
-    });
-    client.onError((_err, cause) => causes.push(cause));
-    client.connect();
-    const server = FakeNatsWS.instances.at(-1)!;
-    // Inline agent: challenge → nonce, register → a 500 server-error reply
-    // (PopServerError → terminal, but a DIFFERENT recovery story than a bad proof).
-    server.handler = (subject, payload, srv, replyTo) => {
-      if (subject !== reg || !replyTo) return;
-      const body = JSON.parse(payload) as { op?: string };
-      if (body.op === "challenge") srv.deliverToClient(replyTo, JSON.stringify({ nonce: "n" }));
-      else if (body.op === "register") srv.deliverToClient(replyTo, JSON.stringify({ error: "boom", code: 500 }));
-    };
-
-    await settle();
-
-    expect(causes).toEqual(["server"]);
-
-    client.disconnect();
+  it("matching protocol version proceeds and reports plugin version",async()=>{
+    const h=await makeClient();const seen:unknown[]=[];
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(4),h.devicePublicRaw,h.identity,{versions:{protocolVersion:1,pluginVersion:"9.9.9"}});
+    h.client.onProtocol(v=>seen.push(v));h.client.connect();await settle();
+    expect(seen).toEqual([{protocolVersion:1,pluginVersion:"9.9.9"}]);
+    expect((h.client as unknown as {sessionKey:Uint8Array}).sessionKey).toBeTruthy();h.client.disconnect();
   });
 
-  it("missing bootstrap jwt on the register path surfaces cause \"config\"", async () => {
-    const device = await generateDevicePopKeyPair();
-    const causes: Array<string | undefined> = [];
-    // registration present but NO `jwt` — an embedder-code bug the register hop
-    // fails closed on (a retry re-runs the same missing-jwt path).
-    const client = new WebChannelNatsClient({
-      url: "ws://127.0.0.1:4222",
-      accountId: AGENT,
-      tenant: TENANT,
-      peerId: PEER,
-      registration: { devicePrivateKey: device.privateKey },
-    });
-    client.onError((_err, cause) => causes.push(cause));
-    client.connect();
-
-    await settle();
-
-    expect(causes).toEqual(["config"]);
-
-    client.disconnect();
+  it("protocol mismatch is terminal and never publishes inbound",async()=>{
+    const h=await makeClient();const errors:Error[]=[];
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(5),h.devicePublicRaw,h.identity,{versions:{protocolVersion:2}});
+    h.client.onError(e=>errors.push(e));h.client.connect();h.client.sendUserMessage("blocked");await settle();
+    expect(errors[0]?.message).toMatch(/protocol/i);
+    expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.CLOSED);
+    expect(FakeNatsWS.instances[0].published.some(p=>p.subject===inboundSubject(TENANT,AGENT,PEER))).toBe(false);
   });
 
-  it("no registration config → handshake published immediately, no register round-trip", async () => {
-    const hs = handshakeSubject(TENANT, AGENT, PEER);
-    const reg = registerSubject(TENANT, AGENT, PEER);
-
-    const client = new WebChannelNatsClient({
-      url: "ws://127.0.0.1:4222",
-      jwt: JWT,
-      accountId: AGENT,
-      tenant: TENANT,
-      peerId: PEER,
-      // Note: NO `registration` field.
-    });
-    client.connect();
-    const server = FakeNatsWS.instances.at(-1)!;
-    server.handler = makeRegisterAndHandshakeAgent(TENANT, AGENT, PEER).handler;
-
-    await settle();
-
-    // Handshake published (current behaviour preserved) and the register subject
-    // was never touched (no challenge/register round-trip).
-    expect(server.published.some((p) => p.subject === hs)).toBe(true);
-    expect(server.published.some((p) => p.subject === reg)).toBe(false);
-
-    client.disconnect();
+  it("authentication rejection is terminal with no reconnect",async()=>{
+    const h=await makeClient({reconnect:true});const errors:Error[]=[];
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32),h.devicePublicRaw,h.identity,{rejectCode:401});
+    h.client.onError(e=>errors.push(e));h.client.connect();await settle(20);
+    expect(errors[0]?.name).toBe("PopRejectedError");
+    const count=FakeNatsWS.instances.length;await settle(10);expect(FakeNatsWS.instances).toHaveLength(count);
+    h.client.disconnect();
   });
 });

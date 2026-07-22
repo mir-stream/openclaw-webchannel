@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hermetic enrolled-NATS-transport E2E (#18 — agent-side). Proves, in ONE running
-# real gateway with devOpen OFF, that the PLUGIN obtains tenant-scoped NATS user
+# real gateway, that the PLUGIN obtains tenant-scoped NATS user
 # credentials via the REAL device-flow enrollment-server (enroll → auto-approve →
 # poll) through the PRODUCTION createEnrolledNatsConnection path, connects
 # (NKEY-authenticated) to a JWT-auth nats-server whose operator/account come from
@@ -32,6 +32,7 @@ NATS_WS=18422
 NATS_TCP=14422
 ECHO_PORT=18902
 ISSUER_PORT=3921
+ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
 
 TENANT=default-tenant
 ACCOUNT_ID=default-agent
@@ -80,6 +81,7 @@ SAAS_ISSUER="$SAAS_ISSUER" \
 NATS_URL="ws://127.0.0.1:$NATS_WS" \
 NATS_CONFIG_OUT="$OCH" \
 ENABLE_TEST_ROUTES=1 \
+ENROLLMENT_ADMIN_TOKEN="$ENROLLMENT_ADMIN_TOKEN" \
 POLL_INTERVAL_SECONDS=1 \
   node --import tsx "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
 ISSUER_PID=$!
@@ -261,6 +263,7 @@ done
 [ -z "$USER_CODE" ] && { echo "[run-enrolled] TIMEOUT waiting for user_code — channels-add log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-enrolled] enrollment user_code=$USER_CODE — approving…"
 APPROVE="$(curl -fsS -X POST "http://127.0.0.1:$ISSUER_PORT/approve" \
+  -H "Authorization: Bearer $ENROLLMENT_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d "{\"user_code\":\"$USER_CODE\"}" || true)"
 echo "[run-enrolled] approve response: $APPROVE"
 
@@ -276,7 +279,7 @@ CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
 echo "[run-enrolled] ✓ credentials persisted at $CRED_FILE"
 
 # 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
-#      setup adapter writes the demo-proven block (`admission: "auto"`,
+#      setup adapter writes the demo-proven block (`admission: "register-hop"`,
 #      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
 #      override that disables the HTTP register hop (no aud→account dispatch
 #      entry ⇒ challenge 401 "No account for token audience"), and this harness

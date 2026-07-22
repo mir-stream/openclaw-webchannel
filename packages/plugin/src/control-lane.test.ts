@@ -13,7 +13,7 @@ import {
   createIngressOnFlush,
   recordCancelledInboundItems,
 } from "./ingress-dedupe.js";
-import type { InboundWsMessage } from "./transport.js";
+import type { InboundWsMessage } from "./channel-contract.js";
 
 /**
  * P1-8a — the out-of-band control lane. Two seams are covered here:
@@ -231,7 +231,10 @@ describe("control-lane /stop cancels debounce-buffered messages without leaving 
   function buildSeam(accountId: string, checkAndRecord: ReturnType<typeof fakeChecker>) {
     const dispatched: string[] = [];
     const acks: Array<{ peerId: string; ids: string[] }> = [];
-    const sendAck = (peerId: string, ids: string[]) => acks.push({ peerId, ids });
+    const sendAck = (peerId: string, ids: string[]) => {
+      acks.push({ peerId, ids });
+      return true;
+    };
     const debouncer = createInboundDebouncer<Item>({
       debounceMs: 50,
       serializeImmediate: true,

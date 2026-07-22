@@ -15,12 +15,12 @@
  *     synthesize a legacy `"default"` account's identity.
  *
  * This does NOT touch the connection/static-creds env
- * (WEBCHANNEL_NATS_URL/_USER_JWT/_USER_SEED/_CREDS/_DEV_OPEN) — those keep their
+ * (WEBCHANNEL_NATS_URL/_USER_JWT/_USER_SEED/_CREDS) — those keep their
  * runtime-connection override meaning (handled by the credential-source resolver).
  */
 
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   readWebchannelSection,
   resolveAcquisitionIdentity,
   type WebchannelAcquisitionIdentity,
@@ -59,7 +59,7 @@ export type AcquisitionEnvResult = {
  */
 export function resolveAcquisitionEnvPrecedence(
   cfg: unknown,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   opts: {
     env?: Record<string, string | undefined>;
     warn?: (msg: string) => void;

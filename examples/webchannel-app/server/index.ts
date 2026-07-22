@@ -33,7 +33,9 @@ import {
   issueBrowserCredentials,
   buildBootstrapClaims,
   DeviceFlowEnrollment,
-  MemoryAgentKeyRegistry,
+  EnrollmentValidationError,
+  MemoryEnrollmentRepository,
+  type AgentKeyRegistry,
   type EnrollmentRequest,
   type PollRequest,
   type SetupTrustChainResult,
@@ -69,11 +71,9 @@ const SAAS_ISSUER = process.env.SAAS_ISSUER || SAAS_BASE_URL;
 const TRUST_CHAIN_PATH =
   process.env.TRUST_CHAIN_PATH || join(tmpdir(), `webchannel-app-trust-${process.pid}.json`);
 const CONFIG_DIR = process.env.NATS_CONFIG_OUT || join(tmpdir(), `webchannel-app-nats-${process.pid}`);
-// Admin token gating /admin/enrollments/:code/approve (the ONLY route that hands
-// back tenant-wide agent creds). If unset we auto-generate one and print it at
-// boot so the openclaw walkthrough still works zero-config.
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || randomBytes(24).toString("hex");
-const ADMIN_TOKEN_GENERATED = !process.env.ADMIN_TOKEN;
+// Admin token gating for approve/deny/revoke. It deliberately fails closed when
+// unset because approval hands back tenant-wide agent credentials.
+const ENROLLMENT_ADMIN_TOKEN = process.env.ENROLLMENT_ADMIN_TOKEN;
 
 // ---------------------------------------------------------------------------
 // 1. Trust chain (persistent) + NATS relay + bootstrap issuer + enrollment.
@@ -153,7 +153,8 @@ const issuer = await createBootstrapIssuer({
 
 // F2: durable agent identity-key registry — approval records the attested agent
 // key so /bootstrap can pin it for the browser's register-delivered-K auth.
-const agentKeyRegistry = new MemoryAgentKeyRegistry();
+const enrollmentRepository = new MemoryEnrollmentRepository();
+const agentKeyRegistry = enrollmentRepository;
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: privateChain,
   natsAccountConfig: trustChain.natsConfig,
@@ -169,7 +170,66 @@ const enrollment = new DeviceFlowEnrollment({
   // enrollment must equal the `iss` minted into bootstrap JWTs below — both
   // read the single SAAS_ISSUER variable, so they cannot disagree.
   issuer: SAAS_ISSUER,
-  agentKeyRegistry,
+  repository: agentKeyRegistry,
+});
+type ExampleEnrollmentHandlerOptions = {
+  enrollment: Pick<DeviceFlowEnrollment, "approve" | "deny">;
+  registry: Pick<AgentKeyRegistry, "revokeActive">;
+  adminToken?: string;
+};
+
+/** Consumer-owned operator routes, implemented exclusively with the public SaaS API. */
+export function createExampleEnrollmentHandler(options: ExampleEnrollmentHandlerOptions) {
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    try {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
+      const path = new URL(req.url ?? "/", "http://example.invalid").pathname;
+      const actionMatch = path.match(/^\/admin\/enrollments\/([^/]+)\/(approve|deny)$/);
+      const isRevoke = path === "/revoke";
+      if (req.method !== "POST" || (!actionMatch && !isRevoke)) return sendJson(res, { error: "not found" }, 404);
+      if (!options.adminToken) return sendJson(res, { error: "enrollment admin token is not configured" }, 503);
+      if (req.headers.authorization !== `Bearer ${options.adminToken}`) return sendJson(res, { error: "unauthorized" }, 401);
+
+      const payload = await readBody(req);
+      if (payload === null || (payload !== undefined && (typeof payload !== "object" || Array.isArray(payload)))) {
+        return sendJson(res, { error: "invalid JSON body" }, 400);
+      }
+      const body = (payload ?? {}) as Record<string, unknown>;
+      if (actionMatch) {
+        let userCode: string;
+        try { userCode = decodeURIComponent(actionMatch[1]); }
+        catch { return sendJson(res, { error: "malformed URL encoding" }, 400); }
+        if (actionMatch[2] === "deny") {
+          const denied = await options.enrollment.deny(userCode);
+          return sendJson(res, { denied }, denied ? 200 : 404);
+        }
+        const replaceActivationId = typeof body.replaceActivationId === "string" ? body.replaceActivationId : undefined;
+        const outcome = await options.enrollment.approve(userCode, replaceActivationId ? { replaceActivationId } : {});
+        switch (outcome.kind) {
+          case "conflict": return sendJson(res, { error: "conflict", activationId: outcome.existing?.activationId ?? null, fingerprint: outcome.existing?.keyIdFingerprint ?? null, enrolledAt: outcome.existing?.enrolledAt ?? null }, 409);
+          case "in_progress": return sendJson(res, { error: "approval_in_progress", error_description: "Approval in progress, retry shortly" }, 409);
+          case "revoked_key": return sendJson(res, { error: "revoked_key" }, 410);
+          case "rejected": return sendJson(res, { error: "rejected" }, 404);
+          case "approved": return sendJson(res, { approved: true, peerId: outcome.result.peerId });
+          default: { const exhaustive: never = outcome; return exhaustive; }
+        }
+      }
+      const revoked = await options.registry.revokeActive(String(body.tenant ?? ""), String(body.accountId ?? ""));
+      return sendJson(res, { revoked }, revoked ? 200 : 404);
+    } catch (error) {
+      console.error("[app] enrollment operator route error:", error);
+      if (!res.headersSent) return sendJson(res, { error: "internal server error" }, 500);
+      if (!res.writableEnded) res.end();
+    }
+  };
+}
+
+const exampleEnrollmentAdminHandler = createExampleEnrollmentHandler({
+  adminToken: ENROLLMENT_ADMIN_TOKEN, enrollment, registry: agentKeyRegistry,
 });
 
 // Bundle the browser client (web/app.ts → IIFE) once at boot from dist exports.
@@ -196,21 +256,6 @@ function sessionUser(req: IncomingMessage): AppUser | null {
   if (!auth || Array.isArray(auth)) return null;
   const token = auth.replace(/^Bearer\s+/i, "");
   return sessions.get(token) ?? null;
-}
-
-// Admin gate for the creds-returning approve route. Accepts either an
-// `x-admin-token: <token>` header or `Authorization: Bearer <token>`.
-function isAdmin(req: IncomingMessage): boolean {
-  const header = req.headers["x-admin-token"];
-  const supplied =
-    typeof header === "string" && header.length > 0
-      ? header
-      : (() => {
-          const auth = req.headers["authorization"];
-          if (!auth || Array.isArray(auth)) return "";
-          return auth.replace(/^Bearer\s+/i, "");
-        })();
-  return supplied.length > 0 && supplied === ADMIN_TOKEN;
 }
 
 // ---------------------------------------------------------------------------
@@ -240,12 +285,18 @@ function readBody(req: IncomingMessage): Promise<unknown> {
 // ---------------------------------------------------------------------------
 // Router.
 // ---------------------------------------------------------------------------
-const server = createServer((req, res) => {
+export const exampleAppRequestHandler = (req: IncomingMessage, res: ServerResponse) => {
+  const delegatedPath = new URL(req.url ?? "/", "http://example.invalid").pathname;
+  if (/^\/admin\/enrollments\/[^/]+\/(?:approve|deny)$/.test(delegatedPath) || delegatedPath === "/revoke") {
+    void exampleEnrollmentAdminHandler(req, res);
+    return;
+  }
   void handle(req, res).catch((err) => {
     console.error("[app] unhandled route error:", err);
     if (!res.headersSent) sendJson(res, { error: "Internal server error" }, 500);
   });
-});
+};
+const server = createServer(exampleAppRequestHandler);
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url || "/", SAAS_BASE_URL);
@@ -338,7 +389,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const jwt = await issuer.sign(claims);
     // F2: pin the SaaS-attested agent key so the browser can authenticate the
     // register-delivered K. Present once the account's agent has enrolled.
-    const agentPublicKey = await agentKeyRegistry.get(TENANT, accountId);
+    const agentPublicKey = (await agentKeyRegistry.getActive(TENANT, accountId))?.publicKey ?? null;
     return sendJson(res, {
       jwt,
       peerId: user.uuid,
@@ -354,12 +405,27 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const body = await readBody(req);
     if (!body) return sendJson(res, { error: "Invalid JSON body" }, 400);
     const enrollRequest = body as EnrollmentRequest;
-    if (!enrollRequest.agentPublicKey || !enrollRequest.tenant) {
-      return sendJson(res, { error: "Missing required fields: agentPublicKey, tenant" }, 400);
+    if (!enrollRequest.agentPublicKey || !enrollRequest.tenant || !enrollRequest.accountId) {
+      return sendJson(res, { error: "Missing required fields: agentPublicKey, tenant, accountId" }, 400);
     }
-    const resp = await enrollment.enroll(enrollRequest);
+    let resp;
+    try {
+      resp = await enrollment.enroll(enrollRequest);
+    } catch (err) {
+      if (err instanceof EnrollmentValidationError) {
+        return sendJson(res, { error: err.message }, 400);
+      }
+      throw err;
+    }
     console.log(`[enroll] created ${resp.user_code} (account=${enrollRequest.accountId})`);
-    return sendJson(res, resp);
+    return sendJson(res, {
+      device_code: resp.device_code,
+      user_code: resp.user_code,
+      verification_uri: resp.verification_uri,
+      verification_uri_complete: resp.verification_uri_complete,
+      expires_in: resp.expires_in,
+      interval: resp.interval,
+    });
   }
   if (method === "POST" && path === "/api/poll") {
     const body = await readBody(req);
@@ -369,28 +435,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const result = await enrollment.poll(pollRequest);
     return sendJson(res, result, "error" in result ? 400 : 200);
   }
-  // Admin-approve an enrollment. This route returns TENANT-WIDE agent
-  // credentials. It MUST be admin-gated — without a gate ANY anonymous caller
-  // obtains creds to impersonate the agent for every peer in the tenant. Here it
-  // requires ADMIN_TOKEN (x-admin-token header or Authorization: Bearer).
-  const approveMatch = path.match(/^\/admin\/enrollments\/([^/]+)\/approve$/);
-  if (method === "POST" && approveMatch) {
-    if (!isAdmin(req)) return sendJson(res, { error: "admin token required" }, 401);
-    const userCode = decodeURIComponent(approveMatch[1]);
-    const approved = await enrollment.approve(userCode);
-    return sendJson(res, { approved }, approved ? 200 : 404);
-  }
-
   sendJson(res, { error: "not found" }, 404);
 }
 
-server.listen(PORT, () => {
+export function startExampleAppServer(): void { server.listen(PORT, () => {
   console.log(`[app] SaaS backend on ${SAAS_BASE_URL}`);
   console.log(`[app] tenant=${TENANT} account=${ACCOUNT_ID}`);
-  if (ADMIN_TOKEN_GENERATED) {
-    console.log(`[app] admin token (for approving enrollments): ${ADMIN_TOKEN}`);
-  }
-});
+}); }
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) startExampleAppServer();
 
 // Best-effort teardown of the child nats-server. Only registered in
 // self-contained mode — in synadia mode no child is spawned (the relay is the

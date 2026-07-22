@@ -14,10 +14,10 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createAccount } from "@nats-io/nkeys";
 import {
   DeviceFlowEnrollment,
-  MemoryEnrollmentStore,
-  UserCodeCollisionError,
-  type EnrollmentStore,
+  type ApproveOutcome,
 } from "./device-flow-enrollment.js";
+import { barrier, interpose } from "./enrollment-repository-conformance.js";
+import { MemoryEnrollmentRepository, UserCodeCollisionError, type EnrollmentRepository } from "./enrollment-repository.js";
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import type { EnrollmentRequest, PollRequest, PendingEnrollment } from "./device-flow-types.js";
 
@@ -40,8 +40,9 @@ const mockNatsConfig: NatsAccountConfig = {
   accountPublicKey: "MOCK_ACCOUNT_PUBLIC_KEY",
 };
 
-const createEnrollment = (store?: EnrollmentStore) => {
+const createEnrollment = (store?: EnrollmentRepository) => {
   return new DeviceFlowEnrollment({
+    repository: new MemoryEnrollmentRepository(),
     saasTrustChain: mockTrustChain,
     natsAccountConfig: mockNatsConfig,
     saasBaseUrl: "https://saas.com",
@@ -50,9 +51,15 @@ const createEnrollment = (store?: EnrollmentStore) => {
     natsUrl: "wss://nats.saas.com",
     expirationSeconds: 600,
     pollIntervalSeconds: 5,
-    ...(store ? { store } : {}),
+    ...(store ? { repository: store } : {}),
   });
 };
+
+function approved(outcome: ApproveOutcome) {
+  expect(outcome.kind).toBe("approved");
+  if (outcome.kind !== "approved") throw new Error(`expected approved, got ${outcome.kind}`);
+  return outcome.result;
+}
 
 // A real 43-char base64url string (base64url of a 32-byte X25519 public key) —
 // the exact wire format enroll() now enforces at ingress (#13).
@@ -98,7 +105,7 @@ describe("DeviceFlowEnrollment", () => {
     it("should store pending enrollment with correct metadata", async () => {
       const response = await enrollment.enroll(validEnrollmentRequest);
 
-      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const store = enrollment["repository"] as MemoryEnrollmentRepository;
       const pending = await store.getEnrollment(response.device_code);
 
       expect(pending).toMatchObject({
@@ -122,6 +129,7 @@ describe("DeviceFlowEnrollment", () => {
 
     it("should use custom expiration and interval when provided", async () => {
       const customEnrollment = new DeviceFlowEnrollment({
+    repository: new MemoryEnrollmentRepository(),
         saasTrustChain: mockTrustChain,
         natsAccountConfig: mockNatsConfig,
         saasBaseUrl: "https://saas.com",
@@ -150,7 +158,7 @@ describe("DeviceFlowEnrollment", () => {
           /agentPublicKey must be base64url of a 32-byte X25519 public key/,
         );
         // Nothing was persisted — the guard runs before saveEnrollment.
-        const store = enrollment["store"] as MemoryEnrollmentStore;
+        const store = enrollment["repository"] as MemoryEnrollmentRepository;
         expect((store["enrollments"] as Map<string, unknown>).size).toBe(0);
       };
 
@@ -190,7 +198,7 @@ describe("DeviceFlowEnrollment", () => {
     describe("version reporting (advisory) is sanitized before persistence", () => {
       const storedFor = async (req: EnrollmentRequest) => {
         const response = await enrollment.enroll(req);
-        const store = enrollment["store"] as MemoryEnrollmentStore;
+        const store = enrollment["repository"] as MemoryEnrollmentRepository;
         return (await store.getEnrollment(response.device_code))!;
       };
 
@@ -254,22 +262,20 @@ describe("DeviceFlowEnrollment", () => {
     // UserCodeCollisionError; enroll() re-mints and retries (bounded), and treats
     // ONLY that error as retryable.
     describe("user_code collision retry", () => {
-      // A store that delegates to a real MemoryEnrollmentStore but runs a hook on
+      // A store that delegates to a real MemoryEnrollmentRepository but runs a hook on
       // each save (which may throw), and records every attempted enrollment.
       const trackingStore = (saveHook: (e: PendingEnrollment, attempt: number) => void) => {
-        const inner = new MemoryEnrollmentStore({ autoSweep: false });
+        const inner = new MemoryEnrollmentRepository({ autoSweep: false });
         const saveCalls: PendingEnrollment[] = [];
-        const store: EnrollmentStore = {
-          async saveEnrollment(e) {
-            saveCalls.push(e);
-            saveHook(e, saveCalls.length); // may throw
-            return inner.saveEnrollment(e);
+        const store = new Proxy(inner, {
+          get(target, property, receiver) {
+            if (property === "createEnrollment") return async (e: PendingEnrollment) => {
+              saveCalls.push(e); saveHook(e, saveCalls.length); return target.createEnrollment(e);
+            };
+            const value = Reflect.get(target, property, receiver);
+            return typeof value === "function" ? value.bind(target) : value;
           },
-          getEnrollment: (d) => inner.getEnrollment(d),
-          getEnrollmentByUserCode: (u) => inner.getEnrollmentByUserCode(u),
-          updateEnrollment: (d, u) => inner.updateEnrollment(d, u),
-          deleteEnrollment: (d) => inner.deleteEnrollment(d),
-        };
+        }) as EnrollmentRepository;
         return { store, saveCalls };
       };
 
@@ -365,6 +371,7 @@ describe("DeviceFlowEnrollment", () => {
 
     it("delivers an explicit issuer VERBATIM (proxy / logical-issuer deployments)", async () => {
       const customIssuerEnrollment = new DeviceFlowEnrollment({
+    repository: new MemoryEnrollmentRepository(),
         saasTrustChain: mockTrustChain,
         natsAccountConfig: mockNatsConfig,
         saasBaseUrl: "https://saas.com",
@@ -389,6 +396,7 @@ describe("DeviceFlowEnrollment", () => {
 
     it("derives the default issuer with trailing slashes stripped (matches the plugin's deriveIssuer)", async () => {
       const slashEnrollment = new DeviceFlowEnrollment({
+    repository: new MemoryEnrollmentRepository(),
         saasTrustChain: mockTrustChain,
         natsAccountConfig: mockNatsConfig,
         saasBaseUrl: "https://saas.com///",
@@ -422,6 +430,7 @@ describe("DeviceFlowEnrollment", () => {
     it("should return expired_token for expired enrollment", async () => {
       // Create enrollment with very short expiration
       const shortLivedEnrollment = new DeviceFlowEnrollment({
+    repository: new MemoryEnrollmentRepository(),
         saasTrustChain: mockTrustChain,
         natsAccountConfig: mockNatsConfig,
         saasBaseUrl: "https://saas.com",
@@ -475,7 +484,7 @@ describe("DeviceFlowEnrollment", () => {
 
       const approvalResult = await enrollment.approve(enrollResponse.user_code);
 
-      expect(approvalResult).toMatchObject({
+      expect(approved(approvalResult)).toMatchObject({
         creds: {
           userJwt: expect.any(String),
           userSeed: expect.any(String),
@@ -492,7 +501,7 @@ describe("DeviceFlowEnrollment", () => {
 
       await enrollment.approve(enrollResponse.user_code);
 
-      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const store = enrollment["repository"] as MemoryEnrollmentRepository;
       const pending = await store.getEnrollment(enrollResponse.device_code);
 
       expect(pending?.status).toBe("approved");
@@ -502,11 +511,12 @@ describe("DeviceFlowEnrollment", () => {
 
     it("should return null for non-existent user code", async () => {
       const result = await enrollment.approve("NON_EXISTENT");
-      expect(result).toBeNull();
+      expect(result).toEqual({ kind: "rejected" });
     });
 
     it("should return null for expired enrollment", async () => {
       const shortLivedEnrollment = new DeviceFlowEnrollment({
+    repository: new MemoryEnrollmentRepository(),
         saasTrustChain: mockTrustChain,
         natsAccountConfig: mockNatsConfig,
         saasBaseUrl: "https://saas.com",
@@ -523,7 +533,7 @@ describe("DeviceFlowEnrollment", () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
 
       const result = await shortLivedEnrollment.approve(enrollResponse.user_code);
-      expect(result).toBeNull();
+      expect(result).toEqual({ kind: "rejected" });
     });
 
     // A2: approve must be idempotent — a repeat click/retry/replay must NOT
@@ -531,8 +541,8 @@ describe("DeviceFlowEnrollment", () => {
     it("is idempotent: a second approve returns the SAME creds/peerId", async () => {
       const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
 
-      const first = await enrollment.approve(enrollResponse.user_code);
-      const second = await enrollment.approve(enrollResponse.user_code);
+      const first = approved(await enrollment.approve(enrollResponse.user_code));
+      const second = approved(await enrollment.approve(enrollResponse.user_code));
 
       expect(first).not.toBeNull();
       expect(second).not.toBeNull();
@@ -540,7 +550,7 @@ describe("DeviceFlowEnrollment", () => {
       expect(second!.creds).toEqual(first!.creds);
 
       // And the persisted record was not overwritten with a fresh identity.
-      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const store = enrollment["repository"] as MemoryEnrollmentRepository;
       const persisted = await store.getEnrollment(enrollResponse.device_code);
       expect(persisted?.peerId).toBe(first!.peerId);
       expect(persisted?.natsCreds).toEqual(first!.creds);
@@ -551,10 +561,11 @@ describe("DeviceFlowEnrollment", () => {
     it("coalesces concurrent approvals onto a single identity", async () => {
       const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
 
-      const [a, b] = await Promise.all([
+      const outcomes = await Promise.all([
         enrollment.approve(enrollResponse.user_code),
         enrollment.approve(enrollResponse.user_code),
       ]);
+      const [a, b] = outcomes.map(approved);
 
       expect(a).not.toBeNull();
       expect(b).not.toBeNull();
@@ -562,7 +573,7 @@ describe("DeviceFlowEnrollment", () => {
       expect(a!.creds).toEqual(b!.creds);
 
       // The persisted identity matches what both callers received.
-      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const store = enrollment["repository"] as MemoryEnrollmentRepository;
       const persisted = await store.getEnrollment(enrollResponse.device_code);
       expect(persisted?.peerId).toBe(a!.peerId);
     });
@@ -572,12 +583,12 @@ describe("DeviceFlowEnrollment", () => {
     it("poll after a repeat approve returns the first-minted identity", async () => {
       const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
 
-      const approved = await enrollment.approve(enrollResponse.user_code);
+      const approvedResult = approved(await enrollment.approve(enrollResponse.user_code));
       await enrollment.approve(enrollResponse.user_code); // repeat
       const polled = await enrollment.poll({ device_code: enrollResponse.device_code });
 
-      expect("peerId" in polled! && polled.peerId).toBe(approved!.peerId);
-      expect("creds" in polled! && polled.creds).toEqual(approved!.creds);
+      expect("peerId" in polled! && polled.peerId).toBe(approvedResult.peerId);
+      expect("creds" in polled! && polled.creds).toEqual(approvedResult.creds);
     });
 
     // #11: a denied enrollment is terminal — approve must NOT mint creds and
@@ -587,9 +598,9 @@ describe("DeviceFlowEnrollment", () => {
       await enrollment.deny(enrollResponse.user_code);
 
       const result = await enrollment.approve(enrollResponse.user_code);
-      expect(result).toBeNull();
+      expect(result).toEqual({ kind: "rejected" });
 
-      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const store = enrollment["repository"] as MemoryEnrollmentRepository;
       const persisted = await store.getEnrollment(enrollResponse.device_code);
       expect(persisted?.status).toBe("denied");
       expect(persisted?.natsCreds).toBeUndefined();
@@ -600,20 +611,13 @@ describe("DeviceFlowEnrollment", () => {
       expect("error" in polled && polled.error).toBe("access_denied");
     });
 
-    // #11: the new status guard (not the clock) catches a record already marked
-    // `expired` even while its expiresAt still lies in the future.
-    it("returns null when approving a record whose status is already expired", async () => {
-      const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
-
-      const store = enrollment["store"] as MemoryEnrollmentStore;
-      await store.updateEnrollment(enrollResponse.device_code, { status: "expired" });
-
-      const result = await enrollment.approve(enrollResponse.user_code);
-      expect(result).toBeNull();
-
-      const persisted = await store.getEnrollment(enrollResponse.device_code);
-      expect(persisted?.status).toBe("expired");
-      expect(persisted?.natsCreds).toBeUndefined();
+    it("rejects a repository-expired record", async () => {
+      let repositoryNow = Date.now();
+      const repo = new MemoryEnrollmentRepository({ autoSweep: false, clock: () => repositoryNow });
+      const svc = createEnrollment(repo); const enrollResponse = await svc.enroll(validEnrollmentRequest);
+      repositoryNow += 700_000;
+      expect(await svc.approve(enrollResponse.user_code)).toEqual({ kind: "rejected" });
+      expect((await repo.getEnrollment(enrollResponse.device_code))?.status).toBe("expired");
     });
   });
 
@@ -631,7 +635,7 @@ describe("DeviceFlowEnrollment", () => {
 
       await enrollment.deny(enrollResponse.user_code);
 
-      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const store = enrollment["repository"] as MemoryEnrollmentRepository;
       const pending = await store.getEnrollment(enrollResponse.device_code);
 
       expect(pending?.status).toBe("denied");
@@ -646,19 +650,19 @@ describe("DeviceFlowEnrollment", () => {
     // flip it to denied and make the record lie about a working identity.
     it("returns false and leaves an approved enrollment untouched", async () => {
       const enrollResponse = await enrollment.enroll(validEnrollmentRequest);
-      const approved = await enrollment.approve(enrollResponse.user_code);
+      const approvedResult = approved(await enrollment.approve(enrollResponse.user_code));
 
       const result = await enrollment.deny(enrollResponse.user_code);
       expect(result).toBe(false);
 
-      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const store = enrollment["repository"] as MemoryEnrollmentRepository;
       const persisted = await store.getEnrollment(enrollResponse.device_code);
       expect(persisted?.status).toBe("approved");
 
       // The originally minted credentials still poll through.
       const polled = await enrollment.poll({ device_code: enrollResponse.device_code });
-      expect("peerId" in polled! && polled.peerId).toBe(approved!.peerId);
-      expect("creds" in polled! && polled.creds).toEqual(approved!.creds);
+      expect("peerId" in polled! && polled.peerId).toBe(approvedResult.peerId);
+      expect("creds" in polled! && polled.creds).toEqual(approvedResult.creds);
     });
 
     // #11: deny of an already-denied record is a terminal no-op → false.
@@ -669,7 +673,7 @@ describe("DeviceFlowEnrollment", () => {
       const result = await enrollment.deny(enrollResponse.user_code);
       expect(result).toBe(false);
 
-      const store = enrollment["store"] as MemoryEnrollmentStore;
+      const store = enrollment["repository"] as MemoryEnrollmentRepository;
       const persisted = await store.getEnrollment(enrollResponse.device_code);
       expect(persisted?.status).toBe("denied");
     });
@@ -677,6 +681,7 @@ describe("DeviceFlowEnrollment", () => {
     // #11: deny of an expired record marks it expired (matching poll()) → false.
     it("returns false and marks an expired enrollment expired", async () => {
       const shortLivedEnrollment = new DeviceFlowEnrollment({
+    repository: new MemoryEnrollmentRepository(),
         saasTrustChain: mockTrustChain,
         natsAccountConfig: mockNatsConfig,
         saasBaseUrl: "https://saas.com",
@@ -695,150 +700,27 @@ describe("DeviceFlowEnrollment", () => {
       const result = await shortLivedEnrollment.deny(enrollResponse.user_code);
       expect(result).toBe(false);
 
-      const store = shortLivedEnrollment["store"] as MemoryEnrollmentStore;
+      const store = shortLivedEnrollment["repository"] as MemoryEnrollmentRepository;
       const persisted = await store.getEnrollment(enrollResponse.device_code);
       expect(persisted?.status).toBe("expired");
     });
   });
 
-  // #22: approve() and deny() are check-then-act with a real async gap (approve
-  // awaits the NATS mint between its read and write). They must be serialized
-  // JOINTLY per userCode so a concurrent approve+deny cannot interleave and have
-  // one silently overwrite the other's terminal write. The #11 status guards
-  // alone can't close this — both sides read `pending` before either writes.
-  describe("concurrent approve/deny serialization (#22)", () => {
-    // Store whose updateEnrollment can be delayed, forcing the historic
-    // interleave window: the current holder yields to the event loop mid-write,
-    // and without the joint lock the other operation would slip in.
-    class SlowUpdateStore extends MemoryEnrollmentStore {
-      updateDelayMs = 0;
-      override async updateEnrollment(
-        deviceCode: string,
-        updates: Partial<PendingEnrollment>,
-      ): Promise<void> {
-        if (this.updateDelayMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, this.updateDelayMs));
-        }
-        return super.updateEnrollment(deviceCode, updates);
-      }
-    }
-
-    // Store whose FIRST updateEnrollment throws a non-collision error, to prove a
-    // rejected approve releases the userCode's queue (try/finally semantics).
-    class ThrowOnceUpdateStore extends MemoryEnrollmentStore {
-      throwOnce = false;
-      override async updateEnrollment(
-        deviceCode: string,
-        updates: Partial<PendingEnrollment>,
-      ): Promise<void> {
-        if (this.throwOnce) {
-          this.throwOnce = false;
-          throw new Error("store boom");
-        }
-        return super.updateEnrollment(deviceCode, updates);
-      }
-    }
-
-    it("approve+deny fired together: approve (queued first) wins, deny observes approved", async () => {
-      const store = new SlowUpdateStore({ autoSweep: false });
-      const svc = createEnrollment(store);
-      const enrollResponse = await svc.enroll(validEnrollmentRequest);
-
-      // approve holds the lock across a slow write; a broken lock would let deny
-      // read `pending` and flip the record to denied under the approval.
-      store.updateDelayMs = 50;
-      const approveP = svc.approve(enrollResponse.user_code); // acquires first
-      const denyP = svc.deny(enrollResponse.user_code); // queues behind
-      const [approved, denied] = await Promise.all([approveP, denyP]);
-
-      expect(approved).not.toBeNull();
-      expect(denied).toBe(false); // deny re-read the approved record → #11 guard
-
-      const persisted = await store.getEnrollment(enrollResponse.device_code);
-      expect(persisted?.status).toBe("approved");
-      expect(persisted?.natsCreds).toEqual(approved!.creds);
-      expect(persisted?.peerId).toBe(approved!.peerId);
-
-      // The live plugin still polls through the approved identity.
-      const polled = await svc.poll({ device_code: enrollResponse.device_code });
-      expect("peerId" in polled! && polled.peerId).toBe(approved!.peerId);
-      store.close();
-    });
-
-    it("deny+approve fired together: deny (queued first) wins, approve observes denied", async () => {
-      const store = new SlowUpdateStore({ autoSweep: false });
-      const svc = createEnrollment(store);
-      const enrollResponse = await svc.enroll(validEnrollmentRequest);
-
-      // deny holds the lock across a slow write; a broken lock would let approve
-      // read `pending`, mint, and overwrite the deny with an approved identity.
-      store.updateDelayMs = 50;
-      const denyP = svc.deny(enrollResponse.user_code); // acquires first
-      const approveP = svc.approve(enrollResponse.user_code); // queues behind
-      const [denied, approved] = await Promise.all([denyP, approveP]);
-
-      expect(denied).toBe(true);
-      expect(approved).toBeNull(); // approve re-read the denied record → #11 guard
-
-      const persisted = await store.getEnrollment(enrollResponse.device_code);
-      expect(persisted?.status).toBe("denied");
-      expect(persisted?.natsCreds).toBeUndefined();
-      expect(persisted?.peerId).toBeUndefined();
-
-      // The plugin sees access_denied — no creds were minted after the deny.
-      const polled = await svc.poll({ device_code: enrollResponse.device_code });
-      expect("error" in polled! && polled.error).toBe("access_denied");
-      store.close();
-    });
-
-    it("a rejected approve (store write throws) propagates and does not wedge a later deny", async () => {
-      const store = new ThrowOnceUpdateStore({ autoSweep: false });
-      const svc = createEnrollment(store);
-      const enrollResponse = await svc.enroll(validEnrollmentRequest);
-
-      // approve mints, then its persist throws a non-collision store error: it
-      // must propagate (not be swallowed) AND release the userCode's queue.
-      store.throwOnce = true;
-      await expect(svc.approve(enrollResponse.user_code)).rejects.toThrow("store boom");
-
-      // The record stayed pending (approve never wrote) — the queue is free, so a
-      // subsequent deny on the same userCode still runs to completion.
-      const denied = await svc.deny(enrollResponse.user_code);
-      expect(denied).toBe(true);
-
-      const persisted = await store.getEnrollment(enrollResponse.device_code);
-      expect(persisted?.status).toBe("denied");
-      store.close();
-    });
-
-    it("concurrent approve+approve stays coalesced onto one identity under the joint lock", async () => {
-      const store = new SlowUpdateStore({ autoSweep: false });
-      const svc = createEnrollment(store);
-      const enrollResponse = await svc.enroll(validEnrollmentRequest);
-
-      store.updateDelayMs = 30;
-      const [a, b] = await Promise.all([
-        svc.approve(enrollResponse.user_code),
-        svc.approve(enrollResponse.user_code),
-      ]);
-
-      expect(a).not.toBeNull();
-      expect(b).not.toBeNull();
-      // Second approve re-read and hit the A2 approved-with-creds re-return path.
-      expect(b!.peerId).toBe(a!.peerId);
-      expect(b!.creds).toEqual(a!.creds);
-
-      const persisted = await store.getEnrollment(enrollResponse.device_code);
-      expect(persisted?.peerId).toBe(a!.peerId);
-      store.close();
-    });
-  });
-
-  describe("MemoryEnrollmentStore", () => {
+  // approve() and deny() are check-then-act with a real async gap (approve awaits
+  // the NATS mint between its read and write). They are NOT jointly serialized:
+  // approve holds a per-userCode lock only to de-dup concurrent approves, and
+  // deny intentionally BYPASSES that lock so it can preempt an approve still in
+  // flight on the same instance. Correctness comes from repository fencing — the
+  // atomic claim/commit/tryDeny transitions — not from any orchestrator queue: a
+  // deny flips the record to `denied` and deletes the claim, so the in-flight
+  // approve's late commit is fenced (`claim_lost` → rejected) with no identity
+  // ever activated.
+  describe("MemoryEnrollmentRepository", () => {
     const makePending = (overrides: Partial<PendingEnrollment> = {}): PendingEnrollment => ({
       device_code: "test-device-code",
       user_code: "TEST-CODE",
       agentPublicKey: validEnrollmentRequest.agentPublicKey,
+      accountId: validEnrollmentRequest.accountId,
       tenant: validEnrollmentRequest.tenant,
       createdAt: 1_000,
       expiresAt: 601_000,
@@ -847,9 +729,9 @@ describe("DeviceFlowEnrollment", () => {
     });
 
     it("should store and retrieve enrollments", async () => {
-      const store = new MemoryEnrollmentStore();
+      const store = new MemoryEnrollmentRepository();
       const pending = makePending();
-      await store.saveEnrollment(pending);
+      await store.createEnrollment(pending);
 
       const retrieved = await store.getEnrollment(pending.device_code);
 
@@ -861,44 +743,32 @@ describe("DeviceFlowEnrollment", () => {
     });
 
     it("should retrieve enrollment by user code", async () => {
-      const store = new MemoryEnrollmentStore();
+      const store = new MemoryEnrollmentRepository();
       const pending = makePending();
-      await store.saveEnrollment(pending);
+      await store.createEnrollment(pending);
 
       const retrieved = await store.getEnrollmentByUserCode(pending.user_code);
 
       expect(retrieved?.device_code).toBe(pending.device_code);
     });
 
-    it("should update enrollment", async () => {
-      const store = new MemoryEnrollmentStore();
+    it("should conditionally transition enrollment", async () => {
+      const store = new MemoryEnrollmentRepository({ autoSweep: false, clock: () => 1_000 });
       const pending = makePending();
-      await store.saveEnrollment(pending);
-
-      await store.updateEnrollment(pending.device_code, {
-        status: "approved",
-        natsCreds: {
-          userJwt: "MOCK_JWT",
-          userSeed: "MOCK_SEED",
-          userPubkey: "MOCK_PUBKEY",
-        },
-      });
-
-      const updated = await store.getEnrollment(pending.device_code);
-
-      expect(updated?.status).toBe("approved");
-      expect(updated?.natsCreds).toBeDefined();
+      await store.createEnrollment(pending);
+      expect((await store.claimApproval(pending.user_code, "op", 1_000)).kind).toBe("claimed");
+      expect((await store.getEnrollment(pending.device_code))?.status).toBe("approving");
+      expect(await store.releaseClaim("op")).toBe(true);
+      expect((await store.getEnrollment(pending.device_code))?.status).toBe("pending");
     });
 
-    it("should delete enrollment", async () => {
-      const store = new MemoryEnrollmentStore();
-      const pending = makePending();
-      await store.saveEnrollment(pending);
-
-      await store.deleteEnrollment(pending.device_code);
-
-      const deleted = await store.getEnrollment(pending.device_code);
-      expect(deleted).toBeNull();
+    it("evicts enrollment and its user-code index through sweep", async () => {
+      let now = 1_000; const store = new MemoryEnrollmentRepository({ autoSweep: false, retentionMs: 10, clock: () => now });
+      const pending = makePending({ expiresAt: 1_000 });
+      await store.createEnrollment(pending);
+      now = 1_011; expect(await store.sweep()).toBe(1);
+      expect(await store.getEnrollment(pending.device_code)).toBeNull();
+      expect(await store.getEnrollmentByUserCode(pending.user_code)).toBeNull();
     });
 
     // ── A1: TTL sweeper bounds memory (review 2026-07-02) ──────────────────
@@ -906,34 +776,34 @@ describe("DeviceFlowEnrollment", () => {
     // record is eligible for eviction once now > 901_000.
 
     it("sweep() evicts records past expiresAt + retention from BOTH maps", async () => {
-      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      let now = 601_001; const store = new MemoryEnrollmentRepository({ autoSweep: false, clock: () => now });
       const pending = makePending();
-      await store.saveEnrollment(pending);
+      await store.createEnrollment(pending);
 
       // Just past expiry but INSIDE the grace window — retained so a late poll
       // still sees `expired_token`.
-      expect(store.sweep(601_001)).toBe(0);
+      expect(await store.sweep()).toBe(0);
       expect(await store.getEnrollment(pending.device_code)).not.toBeNull();
 
       // Past the retention window — evicted from both the device-code map and
       // the user-code index.
-      expect(store.sweep(901_001)).toBe(1);
+      now = 901_001; expect(await store.sweep()).toBe(1);
       expect(await store.getEnrollment(pending.device_code)).toBeNull();
       expect(await store.getEnrollmentByUserCode(pending.user_code)).toBeNull();
     });
 
     it("sweep() leaves not-yet-stale records untouched", async () => {
-      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      let now = 601_000; const store = new MemoryEnrollmentRepository({ autoSweep: false, clock: () => now });
       const fresh = makePending({ device_code: "fresh", user_code: "FRESH" });
       const stale = makePending({
         device_code: "stale",
         user_code: "STALE",
         expiresAt: 100, // long past; 100 + 300_000 < now below
       });
-      await store.saveEnrollment(fresh);
-      await store.saveEnrollment(stale);
+      await store.createEnrollment(fresh);
+      await store.createEnrollment(stale);
 
-      const evicted = store.sweep(601_000); // stale eligible, fresh not
+      const evicted = await store.sweep(); // stale eligible, fresh not
       expect(evicted).toBe(1);
       expect(await store.getEnrollment("stale")).toBeNull();
       expect(await store.getEnrollment("fresh")).not.toBeNull();
@@ -942,51 +812,52 @@ describe("DeviceFlowEnrollment", () => {
     // #8: saveEnrollment now REFUSES a user_code already held by a different live
     // record (replaces the old silent last-writer-wins that orphaned the loser).
     it("saveEnrollment throws UserCodeCollisionError on a live user_code collision", async () => {
-      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      const store = new MemoryEnrollmentRepository({ autoSweep: false });
       const a = makePending({ device_code: "dev-a", user_code: "SAME-CODE" });
-      await store.saveEnrollment(a);
+      await store.createEnrollment(a);
 
       const b = makePending({ device_code: "dev-b", user_code: "SAME-CODE" });
-      await expect(store.saveEnrollment(b)).rejects.toBeInstanceOf(UserCodeCollisionError);
+      await expect(store.createEnrollment(b)).rejects.toBeInstanceOf(UserCodeCollisionError);
 
       // The holder and its index entry are untouched; the loser was not stored.
       expect((await store.getEnrollmentByUserCode("SAME-CODE"))?.device_code).toBe("dev-a");
       expect(await store.getEnrollment("dev-b")).toBeNull();
 
-      // Re-saving the SAME device_code is idempotent (not a collision).
-      await expect(store.saveEnrollment(a)).resolves.toBeUndefined();
+      // The new insertion-only contract also rejects a duplicate device code.
+      await expect(store.createEnrollment(a)).rejects.toHaveProperty("name", "DeviceCodeCollisionError");
 
-      // Once the holder is deleted, the code is free to reuse.
-      await store.deleteEnrollment("dev-a");
-      await expect(store.saveEnrollment(b)).resolves.toBeUndefined();
-      expect((await store.getEnrollmentByUserCode("SAME-CODE"))?.device_code).toBe("dev-b");
+      // Once the holder is swept, the code is free to reuse.
+      const expiring = new MemoryEnrollmentRepository({ autoSweep: false, retentionMs: 0, clock: () => 2 });
+      await expiring.createEnrollment({ ...a, expiresAt: 1 }); await expiring.sweep();
+      await expect(expiring.createEnrollment(b)).resolves.toBeUndefined();
+      expect((await expiring.getEnrollmentByUserCode("SAME-CODE"))?.device_code).toBe("dev-b");
     });
 
     // The sweep-does-not-orphan invariant, under the new no-collision semantics:
     // a swept user_code is free to reuse, and a later sweep must not drop the
     // reusing record's index entry.
     it("a swept user_code is reusable and the reuse survives a later sweep", async () => {
-      const store = new MemoryEnrollmentStore({ autoSweep: false });
+      let now = 901_001; const store = new MemoryEnrollmentRepository({ autoSweep: false, clock: () => now });
       const old = makePending({
         device_code: "old",
         user_code: "SAME-CODE",
         expiresAt: 100, // stale — evicted below (100 + 300_000 retention)
       });
-      await store.saveEnrollment(old);
-      expect(store.sweep(901_001)).toBe(1); // evicts "old" and clears its index
+      await store.createEnrollment(old);
+      expect(await store.sweep()).toBe(1); // evicts "old" and clears its index
 
       // The code is free now, so a fresh enrollment may take it (no collision).
       const fresh = makePending({ device_code: "fresh", user_code: "SAME-CODE" });
-      await store.saveEnrollment(fresh);
+      await store.createEnrollment(fresh);
 
       // A later sweep while "fresh" is still within its window must NOT orphan
       // fresh's index entry (its expiresAt 601_000 + retention → eligible >901_000).
-      expect(store.sweep(602_000)).toBe(0);
+      now = 602_000; expect(await store.sweep()).toBe(0);
       expect((await store.getEnrollmentByUserCode("SAME-CODE"))?.device_code).toBe("fresh");
     });
 
     it("close() is idempotent and stops the sweeper", () => {
-      const store = new MemoryEnrollmentStore(); // autoSweep on by default
+      const store = new MemoryEnrollmentRepository(); // autoSweep on by default
       expect(() => {
         store.close();
         store.close();
@@ -1068,5 +939,172 @@ describe("DeviceFlowEnrollment", () => {
       expect(response.device_code).toMatch(/^[A-Za-z0-9_-]+$/);
       expect(response.device_code).not.toContain("=");
     });
+  });
+});
+
+describe("P1-2 shared-repository integration", () => {
+  it("2.3: emits a unique 128-bit base64url opId for every approval call", async () => {
+    const raw = new MemoryEnrollmentRepository({ autoSweep: false });
+    const opIds: string[] = [];
+    const repository = new Proxy(raw, { get(target, property, receiver) {
+      if (property === "claimApproval") return async (...args: Parameters<EnrollmentRepository["claimApproval"]>) => {
+        opIds.push(args[1]); return target.claimApproval(...args);
+      };
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    } }) as EnrollmentRepository;
+    const service = createEnrollment(repository); const request = await service.enroll(validEnrollmentRequest);
+    approved(await service.approve(request.user_code)); approved(await service.approve(request.user_code));
+    expect(opIds).toHaveLength(2); expect(new Set(opIds).size).toBe(2);
+    for (const opId of opIds) {
+      expect(opId).toMatch(/^[A-Za-z0-9_-]{22}$/);
+      expect(Buffer.from(opId, "base64url")).toHaveLength(16);
+    }
+  });
+
+  it("11/21: two replicas and lock-bypassed approvals mint and commit one identity", async () => {
+    const repository = new MemoryEnrollmentRepository({ autoSweep: false });
+    const first = createEnrollment(repository);
+    const second = createEnrollment(repository);
+    const firstMint = vi.spyOn(first as never, "generateNatsUserCredentials" as never);
+    const secondMint = vi.spyOn(second as never, "generateNatsUserCredentials" as never);
+    const request = await first.enroll(validEnrollmentRequest);
+
+    // Calling the inner method is intentional: correctness must come from the
+    // repository claim, while the per-instance lock remains only a latency and
+    // duplicate-work optimization.
+    const outcomes = await Promise.all([
+      (first as unknown as { approveInner(code: string): Promise<ApproveOutcome> }).approveInner(request.user_code),
+      (second as unknown as { approveInner(code: string): Promise<ApproveOutcome> }).approveInner(request.user_code),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.kind === "approved")).toHaveLength(1);
+    expect(outcomes.filter((outcome) => outcome.kind === "in_progress")).toHaveLength(1);
+    const retry = approved(await second.approve(request.user_code));
+    const winner = approved(outcomes.find((outcome) => outcome.kind === "approved")!);
+    expect(retry).toEqual(winner);
+    expect(await first.poll({ device_code: request.device_code })).toEqual(winner);
+    expect(firstMint.mock.calls.length + secondMint.mock.calls.length).toBe(1);
+    expect(await repository.listHistory(validEnrollmentRequest.tenant, validEnrollmentRequest.accountId)).toHaveLength(1);
+  });
+
+  it("same-instance deny preempts an approve still in flight (no joint lock)", async () => {
+    // The regression guard for the deny-lock fix: on a SINGLE instance, a deny
+    // issued while approve is mid-mint must land immediately (not queue behind
+    // the lock) and preempt the approve. If deny is routed back through
+    // withUserCodeLock it would queue behind the in-flight approve, see a
+    // terminal `approved` record, and return false — the operator's Deny would
+    // be silently lost. This must fail against that (pre-fix) code.
+    const repository = new MemoryEnrollmentRepository({ autoSweep: false });
+    const service = createEnrollment(repository);
+    const request = await service.enroll(validEnrollmentRequest);
+
+    let releaseMint!: () => void;
+    const mintPaused = new Promise<void>((resolve) => { releaseMint = resolve; });
+    const originalMint = (service as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials.bind(service);
+    (service as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials = async (e) => { await mintPaused; return originalMint(e); };
+
+    // Approve is in flight, paused inside the NATS mint with the claim held.
+    const approving = service.approve(request.user_code);
+    await vi.waitFor(async () => expect((await repository.getEnrollment(request.device_code))?.status).toBe("approving"));
+
+    // Deny on the SAME instance must land while approve is still awaiting the
+    // mint — it does not queue behind approve's lock.
+    expect(await service.deny(request.user_code)).toBe(true);
+    expect((await repository.getEnrollment(request.device_code))?.status).toBe("denied");
+
+    // Release the mint: the late commit is fenced by the deleted claim.
+    releaseMint();
+    expect(await approving).toEqual({ kind: "rejected" });
+    expect((await repository.getEnrollment(request.device_code))?.status).toBe("denied");
+    expect(await repository.listHistory(validEnrollmentRequest.tenant, validEnrollmentRequest.accountId)).toEqual([]);
+  });
+
+  it("12/18: approve-then-deny fences the late commit; deny-then-approve stays denied", async () => {
+    const repository = new MemoryEnrollmentRepository({ autoSweep: false });
+    const approver = createEnrollment(repository);
+    const denier = createEnrollment(repository);
+    const request = await approver.enroll(validEnrollmentRequest);
+    let releaseMint!: () => void;
+    const mintPaused = new Promise<void>((resolve) => { releaseMint = resolve; });
+    const originalMint = (approver as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials.bind(approver);
+    (approver as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials = async (e) => { await mintPaused; return originalMint(e); };
+    const approving = approver.approve(request.user_code);
+    await vi.waitFor(async () => expect((await repository.getEnrollment(request.device_code))?.status).toBe("approving"));
+    expect(await denier.deny(request.user_code)).toBe(true);
+    releaseMint();
+    expect(await approving).toEqual({ kind: "rejected" });
+    expect((await repository.getEnrollment(request.device_code))?.status).toBe("denied");
+
+    const second = await approver.enroll({ ...validEnrollmentRequest, accountId: "deny-first" });
+    expect(await denier.deny(second.user_code)).toBe(true);
+    expect(await approver.approve(second.user_code)).toEqual({ kind: "rejected" });
+    expect((await repository.getEnrollment(second.device_code))?.status).toBe("denied");
+
+    // Pin the more dangerous ordering separately: mint has completed, but the
+    // atomic commit is paused while deny invalidates the live claim. A test
+    // that pauses inside mint cannot prove this post-mint fence.
+    const postMintRaw = new MemoryEnrollmentRepository({ autoSweep: false });
+    const commitGate = barrier(); let mintCompleted = false; let commitEntered!: () => void;
+    const atCommit = new Promise<void>((resolve) => { commitEntered = resolve; });
+    const postMintRepo = interpose(postMintRaw, { commitApproval: { before: async () => { commitEntered(); await commitGate.wait(); } } });
+    const postMintApprover = createEnrollment(postMintRepo); const postMintDenier = createEnrollment(postMintRepo);
+    const postMintRequest = await postMintApprover.enroll({ ...validEnrollmentRequest, accountId: "post-mint-deny" });
+    const postMintOriginal = (postMintApprover as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials.bind(postMintApprover);
+    (postMintApprover as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials = async (e) => { const value = await postMintOriginal(e); mintCompleted = true; return value; };
+    const lateCommit = postMintApprover.approve(postMintRequest.user_code); await atCommit;
+    expect(mintCompleted).toBe(true); expect(await postMintDenier.deny(postMintRequest.user_code)).toBe(true);
+    commitGate.resume(); expect(await lateCommit).toEqual({ kind: "rejected" });
+    expect((await postMintRaw.getEnrollment(postMintRequest.device_code))?.status).toBe("denied");
+    expect(await postMintRaw.listHistory(validEnrollmentRequest.tenant, "post-mint-deny")).toEqual([]);
+
+    // Reverse serialization: once commit is durable, deny is a terminal no-op
+    // and the exact committed credentials remain observable by poll.
+    const committedRequest = await approver.enroll({ ...validEnrollmentRequest, accountId: "commit-before-deny" });
+    const committedResult = approved(await approver.approve(committedRequest.user_code));
+    expect(await denier.deny(committedRequest.user_code)).toBe(false);
+    expect(await approver.poll({ device_code: committedRequest.device_code })).toEqual(committedResult);
+  });
+
+  it("13 and ported rejected-approve: mint failure releases claim and does not wedge deny", async () => {
+    const repository = new MemoryEnrollmentRepository({ autoSweep: false });
+    const service = createEnrollment(repository);
+    const request = await service.enroll(validEnrollmentRequest);
+    const originalMint = (service as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials.bind(service);
+    let fail = true;
+    (service as unknown as { generateNatsUserCredentials(e: PendingEnrollment): Promise<unknown> }).generateNatsUserCredentials = async (e) => {
+      if (fail) { fail = false; throw new Error("mint boom"); }
+      return originalMint(e);
+    };
+    await expect(service.approve(request.user_code)).rejects.toThrow("mint boom");
+    expect((await repository.getEnrollment(request.device_code))?.status).toBe("pending");
+    expect(await service.deny(request.user_code)).toBe(true);
+  });
+
+  it("14: one ambiguous commit response recovers; two propagate then already-approved recovers", async () => {
+    for (const times of [1, 2]) {
+      const raw = new MemoryEnrollmentRepository({ autoSweep: false });
+      const repository = interpose(raw);
+      repository.throwAfterCommit({ times });
+      const service = createEnrollment(repository);
+      const request = await service.enroll({ ...validEnrollmentRequest, accountId: `ambiguous-${times}` });
+      if (times === 1) {
+        const result = approved(await service.approve(request.user_code));
+        expect(await service.poll({ device_code: request.device_code })).toEqual(result);
+      } else {
+        await expect(service.approve(request.user_code)).rejects.toThrow("committed response lost");
+        const recovered = approved(await service.approve(request.user_code));
+        expect(await service.poll({ device_code: request.device_code })).toEqual(recovered);
+      }
+      expect(await raw.listHistory(validEnrollmentRequest.tenant, `ambiguous-${times}`)).toHaveLength(1);
+    }
+  });
+
+  it("ported concurrent approve+approve: the public approve lock coalesces onto one identity", async () => {
+    const repository = new MemoryEnrollmentRepository({ autoSweep: false });
+    const service = createEnrollment(repository);
+    const request = await service.enroll(validEnrollmentRequest);
+    const [left, right] = await Promise.all([service.approve(request.user_code), service.approve(request.user_code)]);
+    expect(approved(left)).toEqual(approved(right));
+    expect(await repository.listHistory(validEnrollmentRequest.tenant, validEnrollmentRequest.accountId)).toHaveLength(1);
   });
 });

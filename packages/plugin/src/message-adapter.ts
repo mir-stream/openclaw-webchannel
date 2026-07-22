@@ -19,8 +19,8 @@ import {
   stripInlineDirectiveTagsForDelivery,
 } from "openclaw/plugin-sdk/text-chunking";
 
-import { WEBCHANNEL_ID } from "./transport.js";
-import type { WebChannelTransport } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
+import type { WebChannelPeerChannel } from "./channel-contract.js";
 
 /**
  * Stable per-message id we generate for each outbound logical send. This becomes
@@ -88,7 +88,7 @@ export function buildClawReceipt(id: string): MessageReceipt {
  * primary id is our generated per-message id; this is also the fallback send
  * used if core ever drives the adapter directly.
  */
-export function createClawMessageAdapter(transport: WebChannelTransport) {
+export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
   return defineChannelMessageAdapter({
     id: WEBCHANNEL_ID,
     // Final delivery is plain text only.
@@ -105,12 +105,28 @@ export function createClawMessageAdapter(transport: WebChannelTransport) {
         const id = nextMessageId();
         // `ctx.to` is the recorded reply target — the REAL per-peer `wsKey`
         // (inbound.ts records `reply.to = wsKey`). Target it directly; if it's
-        // absent or has no mapped socket, fall back to `sendTextToAnyOpen`,
-        // which delivers only when exactly ONE connection exists and otherwise
-        // refuses to guess — so we never default to the literal `web-anon` key
-        // when real peers are connected.
-        if (!ctx.to || !transport.sendText(ctx.to, ctx.text, id)) {
-          transport.sendTextToAnyOpen(ctx.text);
+        // absent or the targeted send fails, throw before fabricating any
+        // receipt (P0-1 removed recipient guessing; P0-4 makes failure honest).
+        //
+        // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
+        // thrown outbound. Traced in openclaw 2026.6.10 (the installed version and
+        // the floor of the `>=2026.6.10` peer range): `durableFinal.capabilities.
+        // text` below makes this channel eligible for core's durable delivery
+        // queue, whose `failDelivery` does NOT drop the entry (it bumps retryCount
+        // and leaves it pending for `recoverPendingDeliveries`) — but core stamps
+        // `send_attempt_started` immediately BEFORE calling us, and its drain
+        // refuses to blindly replay an entry in that state unless the adapter
+        // supplies `reconcileUnknownSend`, which we deliberately do not. So a
+        // thrown send moves to failed, never re-sent. Adding a
+        // `reconcileUnknownSend` here, or a core bump, re-opens the blind-replay
+        // path → SILENT DUPLICATE DELIVERY. Re-verify then.
+        if (!ctx.to) {
+          throw new Error("[webchannel] message.send.text failed: ctx.to is absent");
+        }
+        if (!transport.sendText(ctx.to, ctx.text, id)) {
+          throw new Error(
+            `[webchannel] message.send.text failed: targeted send returned false for peer ${ctx.to}`,
+          );
         }
         return { receipt: buildClawReceipt(id), messageId: id };
       },
@@ -190,10 +206,10 @@ export type ProgressDraftController = {
   snapshotText: () => string;
   /**
    * Finalize the draft into the final answer (reuses the draft id). Idempotent:
-   * the first call finalizes and stops the loop; later calls are no-ops so the
-   * normal path and the error-recovery path can't double-finalize.
+   * the first call finalizes and stops the loop; later calls return that first
+   * attempt's cached boolean so callers never retry or observe `undefined`.
    */
-  finalize: (text: string) => Promise<void>;
+  finalize: (text: string) => Promise<boolean>;
   /**
    * Stop the draft loop without sending a final frame. Used on cleanup paths so
    * a late background throttled flush can't race error handling. Idempotent.
@@ -202,7 +218,7 @@ export type ProgressDraftController = {
 };
 
 export function createProgressDraftController(params: {
-  transport: WebChannelTransport;
+  transport: WebChannelPeerChannel;
   sessionKey: string;
   turnId?: string;
   /** Channel config section (for label/maxLines/line formatting). */
@@ -235,7 +251,7 @@ export function createProgressDraftController(params: {
   let absorbedMissedBoundaries = 0;
   let stopped = false;
   let started = false;
-  let finalized = false;
+  let finalizeResult: Promise<boolean> | undefined;
 
   // The full streamed answer body so far = completed messages + current one.
   const answerBody = (): string => answerPrefix + answerText;
@@ -368,33 +384,46 @@ export function createProgressDraftController(params: {
     },
     flush: () => loop.flush(),
     snapshotText: () => (hasPendingContent() ? composeText() : ""),
-    finalize: async (text) => {
+    finalize: (text) => {
       // Idempotent: the normal delivery path and the error-recovery path may
       // both attempt to finalize; only the first wins so we never send two
       // terminal frames (or finalize onto an already-settled bubble).
-      if (finalized) return;
-      finalized = true;
-      // Flush any pending draft text first so the widget has shown the working
-      // bubble at least once (the throttle may not have fired yet for a fast
-      // turn). This must run BEFORE we stop the loop, since flush() bails when
-      // `isStopped()` is true. Then finalize in place onto the same draft id.
-      //
-      // TOCTOU hardening: a pending progress `ws.send` can throw if the socket
-      // slipped to CLOSING between the OPEN check and the send. We must NOT let
-      // that abort finalization — the final answer (and, on the error path, the
-      // settling frame) still has to be delivered. So swallow a flush failure
-      // and proceed to finalizeDraft regardless.
-      if (hasPendingContent()) {
-        loop.update(composeText());
-        try {
-          await loop.flush();
-        } catch {
-          // Pending preview send failed; deliver the final frame anyway below.
+      if (finalizeResult) return finalizeResult;
+      // P0-4 (review R2): arm the latch SYNCHRONOUSLY. `finalizeResult = (async
+      // () => {...})()` only assigns once the body first SUSPENDS, and the body
+      // reaches `transport.finalizeDraft(...)` with no preceding `await` whenever
+      // there is no pending draft content — so the whole terminal-frame send used
+      // to run before the latch existed, leaving it unarmed across exactly the
+      // stretch it exists to protect (the pre-P0-4 code set its `finalized` flag
+      // synchronously). Resolving an already-assigned promise WITH the body's
+      // promise keeps the cached-result contract: every caller, re-entrant or
+      // not, awaits the same single `finalizeDraft` outcome (or rejection).
+      let settleFinalize!: (v: boolean | PromiseLike<boolean>) => void;
+      finalizeResult = new Promise<boolean>((resolve) => { settleFinalize = resolve; });
+      settleFinalize((async () => {
+        // Flush any pending draft text first so the widget has shown the working
+        // bubble at least once (the throttle may not have fired yet for a fast
+        // turn). This must run BEFORE we stop the loop, since flush() bails when
+        // `isStopped()` is true. Then finalize in place onto the same draft id.
+        //
+        // TOCTOU hardening: a pending progress `ws.send` can throw if the socket
+        // slipped to CLOSING between the OPEN check and the send. We must NOT let
+        // that abort finalization — the final answer (and, on the error path, the
+        // settling frame) still has to be delivered. So swallow a flush failure
+        // and proceed to finalizeDraft regardless.
+        if (hasPendingContent()) {
+          loop.update(composeText());
+          try {
+            await loop.flush();
+          } catch {
+            // Pending preview send failed; deliver the final frame anyway below.
+          }
         }
-      }
-      stopped = true;
-      loop.stop();
-      await transport.finalizeDraft(sessionKey, id, text, params.turnId);
+        stopped = true;
+        loop.stop();
+        return transport.finalizeDraft(sessionKey, id, text, params.turnId);
+      })());
+      return finalizeResult;
     },
     stop: () => {
       // Halt the throttled loop so no late background flush can race cleanup.
@@ -460,7 +489,7 @@ export type ReasoningDraftController = {
  * mid-stream; no pinned path does that today.
  */
 export function createReasoningDraftController(params: {
-  transport: WebChannelTransport;
+  transport: WebChannelPeerChannel;
   sessionKey: string;
   turnId: string;
 }): ReasoningDraftController {

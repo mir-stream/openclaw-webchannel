@@ -8,8 +8,8 @@ Backlog ref: [[webchannel-setup-wizard-backlog]] (user-flagged PRIORITY 2026-07-
 
 Onboarding a webchannel account today requires **hand-writing** the full
 `channels.webchannel.accounts.<id>` block via `openclaw config patch` *before*
-`openclaw channels add` (which only runs the device-flow enroll). Ground truth of
-the hand-written block — `e2e/local/run-demo-synadia.sh:169-196`:
+`openclaw channels add` (which only runs the device-flow enroll). The pre-wizard
+hand-written block looked like:
 
 ```json
 { "channels": { "webchannel": { "accounts": { "<id>": {
@@ -20,7 +20,7 @@ the hand-written block — `e2e/local/run-demo-synadia.sh:169-196`:
       "issuer": "http://127.0.0.1:3951",
       "audience": "default-agent" } },
   "dmSecurity": "open",
-  "nats": { "url": "wss://connect.ngs.global:443", "admission": "auto",
+  "nats": { "url": "wss://connect.ngs.global:443", "admission": "register-hop",
             "credentials": { "mode": "enrolled" } }
 } } } } }
 ```
@@ -85,7 +85,7 @@ the hand-written block — `e2e/local/run-demo-synadia.sh:169-196`:
 | `nats.credentials.{userJwt,userSeed}` | SaaS-delivered at enroll (device flow) — never prompted |
 
 The wizard writes the **full block above verbatim = the proven demo config.** Note
-(Q4): under `admission=auto` the register-route verifier is not built, so the
+(Q4): under `admission:register-hop the register-route verifier is not built, so the
 `auth.jwt.*` block is *inert on the auto happy path*; it is written anyway because
 (a) it reproduces the proven-working demo block and (b) it is load-bearing if the
 account is later switched to `admission=register-hop`. Documented, not accidental.
@@ -95,7 +95,7 @@ account is later switched to `admission=register-hop`. Documented, not accidenta
 1. **`packages/plugin/src/setup.ts` — add a pure `buildFullAccountPatch({tenant,
    saasBaseUrl, accountId, issuer?, audience?})`** returning the complete block
    (tenant, saas.baseUrl, auth.strategy=jwt, auth.jwt.{jwksUrl derived, issuer,
-   audience}, nats.{admission=auto, credentials.mode=enrolled}, dmSecurity=open).
+   audience}, nats.{admission:register-hop, credentials.mode=enrolled}, dmSecurity=open).
    **Keep `buildAccountPatch` (partial) unchanged** — it preserves the existing
    merge/partial-write semantics that `setup.test.ts:63-71,102-126` assert.
 2. **Non-interactive seam — `applyAccountConfig`:** when `saasBaseUrl` is present in

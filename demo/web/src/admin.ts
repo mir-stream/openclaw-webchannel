@@ -117,7 +117,18 @@ export function createAdminPanel(bodyEl: HTMLElement, _config: DemoConfig): () =
           const deny = el("button", { style: "font-size:11px;padding:3px 10px;margin-top:6px;margin-left:6px;border-color:var(--bad)" }, ["Deny"]) as HTMLButtonElement;
           approve.onclick = async () => {
             approve.disabled = deny.disabled = true;
-            await api(`/admin/enrollments/${encodeURIComponent(e.userCode)}/approve`, { method: "POST" });
+            const url = `/admin/enrollments/${encodeURIComponent(e.userCode)}/approve`;
+            const first = await api<{ activationId?: string; fingerprint?: string; enrolledAt?: number }>(url, { method: "POST" });
+            if (first.status === 409 && first.data.activationId) {
+              const enrolledAt = first.data.enrolledAt
+                ? new Date(first.data.enrolledAt).toLocaleString()
+                : "unknown";
+              if (window.confirm(
+                `Replace the currently enrolled agent key?\nFingerprint: ${first.data.fingerprint ?? "unknown"}\nEnrolled: ${enrolledAt}`,
+              )) {
+                await api(url, { method: "POST", body: { replaceActivationId: first.data.activationId } });
+              }
+            }
             refreshEnrollments();
           };
           deny.onclick = async () => {

@@ -5,7 +5,7 @@
 # jwksUrl / audience code path exercised end-to-end for the first time.
 #
 # WHY this harness exists (the gap it closes): EVERY other real-SaaS harness
-# (run-all-real.sh, run-saas-issuer-register.sh, run-enrolled-transport.sh, …)
+# (run-all-real.sh, run-enrolled-transport.sh, run-two-account-isolation.sh)
 # and demo/run.sh writes an EXPLICIT `auth.jwt` block (issuer/jwksUrl/audience)
 # into openclaw.json. Because of config-present-wins, NONE of them actually
 # exercise `deriveAccountAuth` (packages/plugin/index-nats.ts). This one does:
@@ -52,6 +52,7 @@ NATS_WS=18922
 NATS_TCP=14922
 ECHO_PORT=18907
 ISSUER_PORT=3981
+ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
 PAGE_PORT=19494
 
 TENANT=derived-tenant
@@ -101,6 +102,7 @@ SAAS_BASE_URL="$SAAS_BASE_URL" \
 NATS_URL="ws://127.0.0.1:$NATS_WS" \
 NATS_CONFIG_OUT="$OCH" \
 ENABLE_TEST_ROUTES=1 \
+ENROLLMENT_ADMIN_TOKEN="$ENROLLMENT_ADMIN_TOKEN" \
 POLL_INTERVAL_SECONDS=1 \
   node --import tsx "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
 ISSUER_PID=$!
@@ -261,6 +263,7 @@ done
 [ -z "$USER_CODE" ] && { echo "[run-derived-trust] TIMEOUT waiting for user_code — channels-add log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-derived-trust] enrollment user_code=$USER_CODE — approving…"
 APPROVE="$(curl -fsS -X POST "$SAAS_BASE_URL/approve" \
+  -H "Authorization: Bearer $ENROLLMENT_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d "{\"user_code\":\"$USER_CODE\"}" || true)"
 echo "[run-derived-trust] approve response: $APPROVE"
 

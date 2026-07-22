@@ -1,6 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-import { WebChannelTransport } from "./transport.js";
+import { NullPeerChannel } from "./channel-contract.js";
+class FakePeerChannel extends NullPeerChannel {
+  constructor(_options?: unknown) { super(); }
+  private approvalHandler?: (peerId: string, id: string, decision: any) => void;
+  private historyHandler?: (peerId: string, request: any) => void;
+  setApprovalDecisionHandler(handler: any) { this.approvalHandler = handler; }
+  setFirstLivenessHandler(_handler: any) {}
+  setLoadHistoryHandler(handler: any) { this.historyHandler = handler; }
+  setHistoryEnabled(_enabled: boolean) {}
+  registerConnection(ws: any, peerId = "web-anon") { ws.on("message", (raw: any) => { try { const frame = JSON.parse(String(raw)); if (frame.type === "approval_decision" && ["allow-once", "allow-always", "deny"].includes(frame.decision)) this.approvalHandler?.(peerId, frame.id, frame.decision); if (frame.type === "load_history") this.historyHandler?.(peerId, { ...(frame.before ? { before: frame.before } : {}), ...(frame.limit ? { limit: frame.limit } : {}) }); } catch {} }); }
+}
 import { createWebChannelPlugin } from "./channel.js";
 import { handleInboundMessage } from "./inbound.js";
 import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
@@ -23,7 +33,7 @@ beforeEach(() => {
 
 describe("webchannel plugin", () => {
   it("resolves an account from config", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const plugin = createWebChannelPlugin(transport);
     const cfg = {
       channels: { webchannel: { allowFrom: ["user1"], dmSecurity: "allowlist" } },
@@ -34,7 +44,7 @@ describe("webchannel plugin", () => {
   });
 
   it("reports configured in Phase 0 (no auth required)", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const plugin = createWebChannelPlugin(transport);
     const cfg = { channels: { webchannel: {} } } as any;
     const result = plugin.config.inspectAccount!(cfg, undefined) as {
@@ -42,11 +52,23 @@ describe("webchannel plugin", () => {
     };
     expect(result.configured).toBe(true);
   });
+
+  it("throws distinct outbound errors and never marks this send path best-effort", async () => {
+    const transport = new FakePeerChannel();
+    const plugin = createWebChannelPlugin(transport) as any;
+    const sendText = plugin.outbound.sendText;
+    await expect(sendText({ text: "hello" })).rejects.toThrow("ctx.to is absent");
+    await expect(sendText({ to: "missing", text: "hello" })).rejects.toThrow(
+      "targeted send returned false for peer missing",
+    );
+    // D1 caveat: this adapter does not opt into core's error-swallowing path.
+    expect(plugin.outbound.bestEffort).not.toBe(true);
+  });
 });
 
 describe("webchannel transport", () => {
   it("returns false when no socket is mapped for a session", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     expect(transport.sendText("missing", "hello")).toBe(false);
   });
 });
@@ -180,9 +202,25 @@ describe("webchannel inbound round-trip", () => {
     };
   }
 
+  it("warns once when turn_settled cannot be sent, without reporting false success", async () => {
+    const transport = new FakePeerChannel();
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(false);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured);
+    const warn = vi.fn();
+    api.logger.warn = warn;
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message", id: "turn-ts", text: "hello",
+    });
+    expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-ts", "ok");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("turn_settled was not delivered");
+  });
+
   it("default-deny allowlist (gap ③): a non-allowlisted peer is denied — inbound.run never runs, no reply", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     const { api, resolveAgentRoute } = makeFakeApi(captured, {
@@ -200,10 +238,11 @@ describe("webchannel inbound round-trip", () => {
     expect(inboundRun).not.toHaveBeenCalled();
     expect(resolveAgentRoute).not.toHaveBeenCalled();
     expect(sendSpy).not.toHaveBeenCalled();
+    expect(settledSpy).not.toHaveBeenCalled();
   });
 
   it("default-deny allowlist (gap ③): an allowlisted peer is admitted — inbound.run runs and reply is delivered", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -222,8 +261,40 @@ describe("webchannel inbound round-trip", () => {
     expect(sendSpy).toHaveBeenCalled();
   });
 
+  it("settles an ACKed ordinary turn as error when route setup throws before inbound.run", async () => {
+    const transport = new FakePeerChannel();
+    const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api, resolveAgentRoute } = makeFakeApi(captured);
+    resolveAgentRoute.mockImplementation(() => {
+      throw new Error("route store unavailable");
+    });
+    const error = vi.fn();
+    api.logger.error = error;
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    await handleInboundMessage(api, transport, "alice", {
+      type: "user_message",
+      id: "acked-route-fault",
+      text: "hello",
+    });
+
+    expect(inboundRun).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(sendSpy).toHaveBeenCalledWith(
+      "alice",
+      "Sorry — something went wrong while answering. Please try again.",
+      undefined,
+      "acked-route-fault",
+    );
+    expect(settledSpy).toHaveBeenCalledTimes(1);
+    expect(settledSpy).toHaveBeenCalledWith("alice", "acked-route-fault", "error");
+  });
+
   it("resolves a channel-scoped route and delivers the reply to the peer socket", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const sendSpy = vi
       .spyOn(transport, "sendText")
       .mockReturnValue(true);
@@ -258,7 +329,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("threads accountId into resolveAgentRoute (binding.account routing — Cycle 2)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -287,7 +358,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("stamps accountId on the turn context AND the run params (S1: turnSourceAccountId)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -317,7 +388,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("applies PER-ACCOUNT dmSecurity allowlist (account isolation — Cycle 2)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -351,7 +422,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("default account keeps reading the flat (channel-level) config (regression)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -371,7 +442,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("streams a progress draft then finalizes the SAME id when streaming.mode=progress", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     // Simulate an open socket so the draft loop's sends "succeed" (returning
     // false would make createDraftStreamLoop retain pending text and not emit).
     const progressSpy = vi
@@ -417,7 +488,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("streams ANSWER TEXT as progress frames (one draft id) then finalizes the SAME id when streaming.mode=partial (no-tool turn)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -452,7 +523,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("strips reasoning tags from streamed partials in partial mode (mirrors core hygiene)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -481,7 +552,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("ignores a SHRINKING cumulative partial (no backwards flicker) in partial mode", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -507,7 +578,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("shows label+tool line first, then the answer text replaces the scaffold when streaming.mode=partial (mixed turn)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -539,7 +610,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("preserves earlier message text across an assistant-message boundary in partial mode (no vanish)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -580,7 +651,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("treats an assistant-message boundary BEFORE the first partial as a no-op (no leading blank prefix)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -611,7 +682,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("degrades a MISSING assistant-message boundary to correct accumulation (no clobber, no dup)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -644,7 +715,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("handles a LATE assistant-message boundary idempotently (no double-roll)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -677,7 +748,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("does NOT stream answer text in progress mode (onPartialReply is not wired — regression)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -712,7 +783,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("streaming.mode=block takes the plain no-id agent_message path (no draft — regression)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
@@ -742,7 +813,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("streaming.mode=block with reasoning level 'stream' wires ONLY the reasoning callbacks (no tool/answer draft)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
@@ -778,7 +849,7 @@ describe("webchannel inbound round-trip", () => {
   it.each(["off", "block", "progress", "partial"] as const)(
     "streams reasoning independently of the answer streaming mode when the level is 'stream' (mode=%s)",
     async (mode) => {
-      const transport = new WebChannelTransport();
+      const transport = new FakePeerChannel();
       const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
       const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
       mockReasoningLevel.mockReturnValue("stream");
@@ -802,7 +873,7 @@ describe("webchannel inbound round-trip", () => {
         "safe",
       );
       // turn_settled is a lifecycle frame emitted for every ordinary turn.
-      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42");
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42", "ok");
     },
   );
 
@@ -812,7 +883,7 @@ describe("webchannel inbound round-trip", () => {
       // btw emits reasoning upstream at level "on" too (dist/btw-CDO5476N.js:617-627),
       // but the webchannel display policy — like Telegram — streams reasoning ONLY
       // at "stream". At "off"/"on" no reasoning callback is wired and no frame is sent.
-      const transport = new WebChannelTransport();
+      const transport = new FakePeerChannel();
       const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
       const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
       mockReasoningLevel.mockReturnValue(level);
@@ -838,14 +909,14 @@ describe("webchannel inbound round-trip", () => {
       expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
       expect(reasoningSpy).not.toHaveBeenCalled();
       // turn_settled still fires — it is a lifecycle frame, not a reasoning frame.
-      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42");
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42", "ok");
     },
   );
 
   it("recovers the working bubble when the turn throws mid-draft in progress mode", async () => {
     vi.useFakeTimers();
     try {
-      const transport = new WebChannelTransport();
+      const transport = new FakePeerChannel();
       // Open socket simulated: progress/finalize sends "succeed" so the draft
       // actually starts (started=true) and the widget shows a working bubble.
       const progressSpy = vi
@@ -854,6 +925,7 @@ describe("webchannel inbound round-trip", () => {
       const finalizeSpy = vi
         .spyOn(transport, "finalizeDraft")
         .mockReturnValue(true);
+      const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
 
       const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
       const { api } = makeFakeApi(captured, {
@@ -883,6 +955,7 @@ describe("webchannel inbound round-trip", () => {
       expect(finId).toBe(progId);
       expect(typeof finText).toBe("string");
       expect((finText as string).length).toBeGreaterThan(0);
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", expect.any(String), "error");
 
       // The draft loop was stopped: no late background throttled flush fires
       // after the error handling, so no further progress frames are emitted.
@@ -897,7 +970,7 @@ describe("webchannel inbound round-trip", () => {
   it("recovers the working bubble when the turn throws mid-draft in partial mode (answer-text-only, no tool events)", async () => {
     vi.useFakeTimers();
     try {
-      const transport = new WebChannelTransport();
+      const transport = new FakePeerChannel();
       const progressSpy = vi
         .spyOn(transport, "sendProgress")
         .mockReturnValue(true);
@@ -943,7 +1016,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("sends exactly one typing frame after route resolution, before agent dispatch (AC2)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const typingSpy = vi
       .spyOn(transport, "sendTyping")
       .mockReturnValue(true);
@@ -977,7 +1050,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("still sends the typing frame when the turn throws mid-dispatch (AC2)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const typingSpy = vi
       .spyOn(transport, "sendTyping")
       .mockReturnValue(true);
@@ -1012,7 +1085,7 @@ describe("webchannel inbound round-trip", () => {
     // handleInboundMessage. This test is a structural guard: we verify the
     // transport exposes BOTH the first-liveness hook AND the load-history
     // hook, so index.ts can wire them up without further transport changes.
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     expect(typeof transport.setFirstLivenessHandler).toBe("function");
     expect(typeof transport.setLoadHistoryHandler).toBe("function");
     expect(typeof transport.sendHistory).toBe("function");
@@ -1031,7 +1104,7 @@ describe("webchannel inbound round-trip", () => {
     // validated { before, limit } shape. This is the wire-side companion to
     // the unit test in transport.test.ts and locks the parse contract from
     // the transport's POV.
-    const transport = new WebChannelTransport({ heartbeatMs: 60_000 });
+    const transport = new FakePeerChannel({ heartbeatMs: 60_000 });
     const handler = vi.fn();
     transport.setLoadHistoryHandler(handler);
 

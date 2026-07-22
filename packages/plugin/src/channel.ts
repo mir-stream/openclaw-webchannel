@@ -4,8 +4,8 @@ import {
 } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
-import { WEBCHANNEL_ID } from "./transport.js";
-import type { WebChannelTransport } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
+import type { WebChannelPeerChannel } from "./channel-contract.js";
 import { createClawMessageAdapter } from "./message-adapter.js";
 import {
   createClawApprovalCapability,
@@ -14,7 +14,7 @@ import {
 } from "./approvals.js";
 import type { ResolveAccountTransport } from "./approvals.js";
 import {
-  DEFAULT_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   listWebchannelAccountIds,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
@@ -34,7 +34,7 @@ import { webchannelSetupWizard } from "./setup-wizard.js";
 // approvals.ts reading this back adds no new module cycle (and it's only
 // dereferenced at runtime inside createClawApprovalCapability, so ESM live
 // bindings resolve it well after module evaluation).
-export const DEFAULT_ACCOUNT_ID = ACCOUNT_CONFIG_DEFAULT_ACCOUNT_ID;
+export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID;
 
 type ResolvedAccount = {
   accountId: string | null;
@@ -62,7 +62,7 @@ function resolveAccount(
   // detection so a single-account deployment is a regression-free pass-through.
   const account = resolveWebchannelAccountConfig(
     cfg,
-    accountId ?? DEFAULT_ACCOUNT_ID,
+    accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   );
   return {
     accountId: accountId ?? null,
@@ -85,7 +85,7 @@ function resolveAccount(
  * and dist/plugin-sdk/outbound.types-BEZiz165.d.ts:105-127 (ChannelOutboundContext).
  */
 export function createWebChannelPlugin(
-  transport: WebChannelTransport,
+  transport: WebChannelPeerChannel,
   opts?: {
     /**
      * S1 (accountId-aware approvals): resolve a specific account's transport
@@ -193,13 +193,25 @@ export function createWebChannelPlugin(
           // outbound seam only fires for core-initiated (untargeted) sends.
           // `ctx.to` is the recorded reply target — now the REAL per-peer
           // `wsKey` (inbound.ts records `reply.to = wsKey`), so target it
-          // directly. If it's absent or has no mapped socket, fall back to
-          // `sendTextToAnyOpen`, which only delivers when EXACTLY ONE connection
-          // exists (the anonymous single-peer case) and otherwise refuses to
-          // guess — so we never default an untargeted send to the literal
-          // `web-anon` key when real peers are connected.
-          if (!ctx.to || !transport.sendText(ctx.to, ctx.text)) {
-            transport.sendTextToAnyOpen(ctx.text);
+          // directly. If it is absent or stale, throw so core observes a failed
+          // outbound delivery; recipient guessing is intentionally unsupported.
+          //
+          // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
+          // thrown outbound — traced in openclaw 2026.6.10 (the installed version
+          // and the floor of the `>=2026.6.10` peer range): core stamps
+          // `send_attempt_started` immediately before calling us, and its durable
+          // delivery drain refuses to blindly replay an entry in that state unless
+          // the adapter supplies `reconcileUnknownSend` (we deliberately do not),
+          // so the entry moves to failed instead. See the fuller trace in
+          // `message-adapter.ts`. A core bump — or adding `reconcileUnknownSend` —
+          // re-opens the blind-replay path → SILENT DUPLICATE DELIVERY.
+          if (!ctx.to) {
+            throw new Error("[webchannel] outbound send failed: ctx.to is absent");
+          }
+          if (!transport.sendText(ctx.to, ctx.text)) {
+            throw new Error(
+              `[webchannel] outbound send failed: targeted send returned false for peer ${ctx.to}`,
+            );
           }
           return { messageId: `webchannel-${Date.now()}` };
         },

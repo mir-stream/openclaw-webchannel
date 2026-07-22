@@ -14,7 +14,7 @@
 > `WebChannelNATSClient` state reducer, so all P0 client render is done (marked ✅). Since the 07-10
 > re-verify develop merged: **P0-2 depth cap (#24)**, the **/stop control lane + typing gate + slash
 > discovery + debounce/coalesce + ingress dedupe (#25/#26/#28/#29/#30)**, **markdown (#27, P1)**,
-> **client replay+ack (#31)**, and the **protocol-version handshake (#33)**. Corrected below for:
+> **client replay+ack (#31)**, and the **protocol-version registration (#33)**. Corrected below for:
 > partial-mode answer-text streaming (#14, P0-5 — now enabled in the demo), the `approval_snapshot`
 > rehydration frame (#15/#19, P0-4/§0 wire), the ordered history merge (#16, P0-1/§0), the NATS
 > register hop replacing `registerHttpRoute` (P0-3), and the two new inbound frames (`commands`,
@@ -41,7 +41,7 @@ retired.
 
 | Layer | File | Handles |
 |---|---|---|
-| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS, E2E handshake, `onMessage`/`onError`/`onState`, `loadHistory` `:768`, `sendApprovalDecision`, terminal-auth classify `:551-556` |
+| Low-level NATS client | `packages/client/src/nats-client.ts` (`WebChannelNatsClient`) | raw NATS WS, E2E registration, `onMessage`/`onError`/`onState`, `loadHistory` `:768`, `sendApprovalDecision`, terminal-auth classify `:551-556` |
 | **State reducer wrapper** | `packages/client/src/nats-client-wrapper.ts` (`WebChannelNATSClient`) | reduces full protocol → `WebChannelState`; `getState` `:110`, `subscribe` `:115`, `send` `:131`, `decide` `:145`, `loadHistory` `:155` |
 | Demo widget | `demo/web/src/widget.ts` | `subscribe(render)` → bubbles, typing, approval cards, "Load older", terminal re-auth |
 | **Retired** | `packages/client/src/browser-demo-entry.ts` (`runDemo`) | old drop-all path; only a SaaS smoke test + `e2e/local/ci-smoke.html` still reference it |
@@ -58,7 +58,7 @@ The **wrapper reduces every inbound frame** (`nats-client-wrapper.ts`):
 | `progress` | `:557` | upsert working bubble keyed by draft `id` |
 | `agent_message` | `:569` | finalize draft / append |
 | `commands` | `:412` | **P0-3**: replace `state.commands` with the delivered discovery catalog (`CommandCatalogEntry[]`) |
-| `ack` | `:420` | **P0-7b**: flip `delivered:true` on local echo bubbles whose `wireId` the agent acked at ingress |
+| `ack` | `:1081` | **P0-7b/P0-4**: advance the matching `wireId` to `sendState:"accepted"` via the authoritative send tracker (`onSendState`) — the reducer case is now a no-op (acceptance is tracked low-level, no `delivered` boolean) |
 
 Terminal auth failure → `onError` (`:103`) sets `status:"error"` (no eternal spinner). A separate
 `onProtocol` listener (not a reducer case) records the register reply's `protocolVersion` /
@@ -99,9 +99,11 @@ and `resolutionConfirmed?:boolean`. Other wire deltas: `user_message` gained an 
 `CommandCatalogEntry[]` (`:83`); `ack` carries `{ ids: string[] }` (`:87`). **Register reply** (not a
 `.out` frame — the register req/reply) now carries `protocolVersion` + `pluginVersion`
 (`nats-register.ts:306-314`) alongside `{ peerId, registered:true, wrappedConversationKey }`; the
-client enforces the protocol match and goes terminal on mismatch (#33). `WebChannelState` now holds
-`messages` (+`wireId`/`delivered`), `approvals`, `status`, `connected`, `error?`, `isTyping?`,
-`commands?`, `agentProtocolVersion`, `agentPluginVersion` (`types.ts:123-165`).
+client enforces the protocol match and goes terminal on mismatch (#33). `turn_settled` additionally
+carries an optional `outcome?: "ok" | "error"` (**P0-4** — additive; older peers ignore it).
+`WebChannelState` now holds `messages` (+`wireId`/`sendState`/`sendFailure` — **P0-4** replaced the
+boolean `delivered`), `approvals`, `status`, `connected`, `error?`, `isTyping?`, `commands?`,
+`agentProtocolVersion`, `agentPluginVersion` (`types.ts:262`).
 
 ### ⭐ Server defaults are ON; the demo enables the important ones
 
@@ -146,7 +148,7 @@ it; the widget renders it.
 
 **Where it stands today.**
 - Server sends the snapshot **from the register success path** (Phase 6 stateless-register change — it
-  used to fire on first liveness / handshake-complete, that wiring is now gone; the register hop is
+  used to fire on first liveness / register-complete, that wiring is now gone; the register hop is
   now NATS request/reply via `setRegisterRequestHandler`, no HTTP). Every register (first join,
   reload, reconnect) gets the bounded snapshot: `historyRecent(api, route.sessionKey,
   historyConfig.limit, …)` → `channel.sendHistory(peerId, messages)`, run as a **detached** read
@@ -180,9 +182,9 @@ order; no duplicate bubbles on a mid-session reconnect.
 
 **Watch out.** Both snapshots (history + approval) now fire **inside the register path**, so they
 require the register hop. `demo/run.sh` uses register-hop admission — but **not in the config
-heredoc**: the `channels add` setup adapter may write `admission:auto`, so `run.sh:321-326` re-asserts
+heredoc**: the `channels add` setup adapter may write `admission:register-hop, so `run.sh:321-326` re-asserts
 `accounts.<acct>.nats.admission="register-hop"` programmatically after enrollment, and the trigger
-fires because of that re-assertion. If you switch to `admission:"auto"` (no register hop), neither
+fires because of that re-assertion. If you switch to `admission:register-hop` (no register hop), neither
 snapshot sends — re-wire them onto whatever path replaces register. The client must have its `.out`
 subscription active *before* it calls register (`WebChannelNatsClient.onConnected` ordering) or the
 snapshot is lost.
@@ -298,11 +300,11 @@ handler and returns output as an `agent_message`; webchannel declares no `capabi
   (`openclaw/plugin-sdk/native-command-registry`) — **config-filtered, alias-free, name-sorted, NOT
   hard-coded**, so a command gated off for the deployment is absent and new core commands appear
   without touching this plugin. The provider is **memoized per account**
-  (`createCommandCatalogProvider`) — the handler runs inline for any handshaken peer, so per-request
+  (`createCommandCatalogProvider`) — the handler runs inline for any registered peer, so per-request
   rebuilds were an event-loop DoS surface; memoizing removes it without a rate limiter. Entry shape:
   `{name (no leading slash), description, args?:[{name,description?,required?,choices?}]}`.
-  > **Exposure decision.** The catalog is served to **any handshaken peer**, including wildcard /
-  > `admission:"auto"` peers — deliberately, unlike the history/approval snapshots (which ride the
+  > **Exposure decision.** The catalog is served to **any registered peer**, including wildcard /
+  > `admission:register-hop` peers — deliberately, unlike the history/approval snapshots (which ride the
   > register-hop admission path). The command set is low-sensitivity (it is the same list core would
   > run for a typed command), so leaking it to an auto peer carries none of the approval-power risk
   > that gates the snapshots.
@@ -487,15 +489,18 @@ an ack frame closing the loop. This was the heaviest P0 item and the only one ne
 
 **Where it stands today — client (P0-7b).**
 - Each `user_message` is stamped with a stable id (`randomInboxToken()`) in `sendUserMessage()`
-  (`nats-client.ts:960`). `ChatMessage` gained `wireId?` / `delivered?` (`types.ts:34,39`); the
-  wrapper stamps the local echo with its `wireId` (`nats-client-wrapper.ts:155-161`).
+  (`nats-client.ts:1277`). `ChatMessage` gained `wireId?`; **P0-4** replaced the boolean `delivered?`
+  with `sendState?` (queued/sent/accepted/completed/failed) + `sendFailure?` (`types.ts`); the
+  wrapper stamps the local echo with its `wireId` at send/release time.
 - Replay ledger: `outboundQueue` (`:858`) + `unackedLedger: Map<string,OutboundMessage>` (`:873`,
   cap `MAX_UNACKED = 100`, oldest-eviction with a one-shot warn `:1365-1378`, user_message only). On
   session re-establishment `flushQueue()` (`:1327-1342`) prepends the unacked ledger and re-seals
   each with the **same id**, so a mid-session drop is re-sent.
-- Inbound `ack {ids:string[]}` (`nats-client.ts:1048`) → `drainAcked` (`:1053-1055`) removes acked
-  ids from the ledger; the wrapper's `case "ack"` (`nats-client-wrapper.ts:420-431`) flips
-  `delivered:true` on matching-`wireId` bubbles (state-only, so the demo can render a ✓).
+- Inbound `ack {ids:string[]}` → `drainAcked` removes acked ids from the ledger **and** advances
+  each to `sendState:"accepted"` via the authoritative low-level tracker (`onSendState` → the
+  wrapper patches the bubble). **P0-4** removed the old `delivered:true` reducer flip; the wrapper's
+  `case "ack"` is now a no-op (acceptance is tracked low-level, and a duplicate/late/post-terminal
+  ack is a guarded no-op).
 
 **Where it stands today — server (P0-7a).**
 - Ingress dedupe via `createPersistentDedupe` (`openclaw/plugin-sdk/persistent-dedupe`,
@@ -555,5 +560,5 @@ remains **P2-4**. P0-7 covers the client→agent replay + idempotency side; P2-4
 
 All render extensions now go through one place — the reducer (`nats-client-wrapper.ts`) and the
 widget's `render(state)`. New frame types (e.g. P1-5 `presentation`, P1-3 `reasoning`) add: a `case`
-in the reducer, a field on `WebChannelState` (`types.ts:123-165`), and a branch in `render` — exactly
+in the reducer, a field on `WebChannelState` (`types.ts:262`), and a branch in `render` — exactly
 as #30's `commands` and #31's `ack` did. There is no thin path to re-wire.

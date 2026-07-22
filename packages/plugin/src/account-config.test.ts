@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { join } from "node:path";
 
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   canonicalizeAccountId,
   isValidAccountId,
   assertValidAccountId,
@@ -18,8 +18,39 @@ import {
   resolveReadCredentialPath,
   loadPersistedEnrolledCreds,
 } from "./account-config.js";
+import { planAccounts } from "./multiplex.js";
 
 const HOME = "/home/test";
+
+describe("removed auth.ticketParam migration", () => {
+  it("rejects the deprecated flat config through the NATS account planning seam", () => {
+    const cfg = { channels: { webchannel: { auth: { strategy: "jwt", ticketParam: "ticket" } } } };
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /removed config auth\.ticketParam.*openclaw channels add/s,
+    );
+  });
+
+  it("rejects the deprecated named-account leaf through the NATS account planning seam", () => {
+    const cfg = { channels: { webchannel: { accounts: { work: { auth: { ticketParam: "jwt" } } } } } };
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /removed config auth\.ticketParam.*openclaw channels add/s,
+    );
+  });
+});
+
+describe("P0-2 removed config migration", () => {
+  it.each([
+    ["nats.devOpen", { nats: { devOpen: false } }],
+    ['nats.admission="auto"', { nats: { admission: "auto" } }],
+    ['nats.credentials.mode="open"', { nats: { credentials: { mode: "open" } } }],
+    ['auth.strategy="anonymous"', { auth: { strategy: "anonymous" } }],
+  ])("fails account resolution for %s", (setting, account) => {
+    const cfg = { channels: { webchannel: account } };
+    expect(() => resolveWebchannelAccountConfig(cfg, "default")).toThrow(
+      new RegExp(`removed config ${setting.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}`),
+    );
+  });
+});
 
 describe("account-config: account id validation (TRUST BOUNDARY)", () => {
   it("accepts safe ids", () => {
@@ -138,18 +169,18 @@ describe("account-config: resolveTypingEnabled (P0-6)", () => {
 
 describe("account-config: listWebchannelAccountIds", () => {
   it("synthesizes default when there is no webchannel section", () => {
-    expect(listWebchannelAccountIds({ channels: {} })).toEqual([DEFAULT_ACCOUNT_ID]);
-    expect(listWebchannelAccountIds({})).toEqual([DEFAULT_ACCOUNT_ID]);
+    expect(listWebchannelAccountIds({ channels: {} })).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);
+    expect(listWebchannelAccountIds({})).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);
   });
 
   it("returns default for a flat single-account config", () => {
     const cfg = { channels: { webchannel: { auth: { strategy: "jwt" }, allowFrom: ["a"] } } };
-    expect(listWebchannelAccountIds(cfg)).toEqual([DEFAULT_ACCOUNT_ID]);
+    expect(listWebchannelAccountIds(cfg)).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);
   });
 
   it("returns default for an empty webchannel object", () => {
     expect(listWebchannelAccountIds({ channels: { webchannel: {} } })).toEqual([
-      DEFAULT_ACCOUNT_ID,
+      DEFAULT_WEBCHANNEL_ACCOUNT_ID,
     ]);
   });
 
@@ -157,7 +188,7 @@ describe("account-config: listWebchannelAccountIds", () => {
     const cfg = {
       channels: { webchannel: { auth: { strategy: "jwt" }, accounts: {} } },
     };
-    expect(listWebchannelAccountIds(cfg)).toEqual([DEFAULT_ACCOUNT_ID]);
+    expect(listWebchannelAccountIds(cfg)).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);
   });
 
   it("lists accounts-map children", () => {
@@ -249,11 +280,11 @@ describe("account-config: readWebchannelSection / readAccountsMap / resolveAccou
     expect(readAccountsMap(readWebchannelSection(cfg))).toEqual({ a: { x: 1 } });
   });
 
-  it("reads per-account merged nats config", () => {
+  it("rejects a merged per-account devOpen fixture", () => {
     const cfg = {
       channels: { webchannel: { nats: { url: "ws://base" }, accounts: { acctA: { nats: { devOpen: true } } } } },
     };
-    expect(resolveAccountNatsConfig(cfg, "acctA")).toEqual({ url: "ws://base", devOpen: true });
+    expect(() => resolveAccountNatsConfig(cfg, "acctA")).toThrow(/removed config nats.devOpen/);
   });
 
   it("reads flat nats config for default", () => {
@@ -313,6 +344,9 @@ describe("account-config: resolveAcquisitionIdentity", () => {
 });
 
 describe("account-config: credential paths", () => {
+  it("rejects account-less path reads at the API boundary", () => {
+    expect(() => (accountCredentialPath as unknown as () => string)()).toThrow(/account id/i);
+  });
   it("builds the per-account path", () => {
     expect(accountCredentialPath("acctA", HOME)).toBe(
       join(HOME, ".openclaw-webchannel", "acctA", "credentials.json"),
@@ -338,13 +372,14 @@ describe("account-config: credential paths", () => {
     expect(path).toBe(perAccount);
   });
 
-  it("resolveReadCredentialPath falls back to legacy for default when per-account is absent", () => {
+  it("resolveReadCredentialPath ignores the legacy file for default", () => {
     const legacy = legacyCredentialPath(HOME);
+    const perAccount = accountCredentialPath("default", HOME);
     const path = resolveReadCredentialPath("default", {
       home: HOME,
       exists: (p) => p === legacy,
     });
-    expect(path).toBe(legacy);
+    expect(path).toBe(perAccount);
   });
 
   it("resolveReadCredentialPath does NOT use legacy for a non-default account", () => {
@@ -372,6 +407,10 @@ describe("account-config: credential paths", () => {
 describe("account-config: loadPersistedEnrolledCreds", () => {
   const validFile = JSON.stringify({
     enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } },
+  });
+
+  it("rejects account-less credential reads at the API boundary", () => {
+    expect(() => (loadPersistedEnrolledCreds as unknown as () => unknown)()).toThrow(/account id/i);
   });
 
   it("loads creds from the per-account file", () => {
@@ -489,14 +528,14 @@ describe("account-config: loadPersistedEnrolledCreds", () => {
     expect(load(undefined)).toMatchObject({ userJwt: "JWT", userSeed: "SEED" });
   });
 
-  it("loads from the legacy file for the default account (backward-compat)", () => {
+  it("ignores the legacy file for the default account", () => {
     const legacy = legacyCredentialPath(HOME);
     const creds = loadPersistedEnrolledCreds("default", {
       home: HOME,
       exists: (p) => p === legacy,
       read: () => validFile,
     });
-    expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
+    expect(creds).toBeUndefined();
   });
 
   it("returns undefined when no file exists", () => {

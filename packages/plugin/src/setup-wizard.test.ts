@@ -9,9 +9,8 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 import { buildFullAccountPatch } from "./setup.js";
-import { resolveAdmissionMode } from "./nats-admission.js";
 import { webchannelSetupWizard, validateHttpUrl } from "./setup-wizard.js";
-import { WebChannelTransport } from "./transport.js";
+import { NullPeerChannel } from "./channel-contract.js";
 import { createWebChannelPlugin } from "./channel.js";
 
 type Cfg = { channels: { webchannel?: Record<string, unknown> } };
@@ -92,34 +91,6 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
     expect((patch.nats as { admission: string }).admission).toBe("register-hop");
   });
 
-  it("the builder's output round-trips through resolveAdmissionMode to register-hop", () => {
-    // End-to-end: the emitted block (jwt auth + enrolled creds + the explicit
-    // override) is exactly what the per-account serving loop feeds resolveAdmissionMode,
-    // and it must resolve to register-hop — the override and the inference agree.
-    const patch = buildFullAccountPatch({
-      tenant: "t",
-      saasBaseUrl: "http://s",
-      accountId: "acct",
-    });
-    const auth = patch.auth as { strategy: string };
-    const nats = patch.nats as {
-      admission: "auto" | "register-hop";
-      credentials: { mode: string };
-    };
-    // enrolled creds ⇒ a register hop is viable (registerHopAvailable = mode !== "static").
-    const registerHopAvailable = nats.credentials.mode !== "static";
-    const resolved = resolveAdmissionMode({
-      authStrategy: auth.strategy,
-      registerHopAvailable,
-      explicitOverride: nats.admission,
-    });
-    expect(resolved).toBe("register-hop");
-    // …and even WITHOUT the explicit override the inference alone would pick it,
-    // proving the pin matches (not overrides) the intended default.
-    expect(
-      resolveAdmissionMode({ authStrategy: auth.strategy, registerHopAvailable }),
-    ).toBe("register-hop");
-  });
 });
 
 describe("setup-wizard: declarative detection", () => {
@@ -149,7 +120,7 @@ describe("setup-wizard: declarative detection", () => {
 
 describe("setup-wizard: constructed plugin exposes setupWizard", () => {
   it("forwards setupWizard through createChannelPluginBase", () => {
-    const plugin = createWebChannelPlugin(new WebChannelTransport());
+    const plugin = createWebChannelPlugin(new NullPeerChannel());
     expect(plugin.setupWizard).toBeDefined();
     expect((plugin.setupWizard as { channel?: string }).channel).toBe("webchannel");
     expect(plugin.setupWizard).toBe(webchannelSetupWizard);

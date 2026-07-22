@@ -7,7 +7,7 @@ encrypted, device-flow enrolled. This is the run that proved the NATS E2E path l
 hardware (a real LLM reply came back).
 
 For the single-host interactive demo (everything on one machine), use
-[`e2e/local/run-demo.sh`](../e2e/local/README.md) instead. This doc is the harder,
+[`demo/run.sh`](../demo/README.md) instead. This doc is the harder,
 more-realistic split topology.
 
 ```
@@ -92,8 +92,8 @@ openclaw gateway run
 ```
 
 **No `channels.webchannel.auth` block is needed** — static/enrolled creds resolve admission to
-`auto`, and the ConnectionVerifier is only built for the `register-hop` mode. Browser admission =
-NATS subject permissions + X25519 handshake + the `dmSecurity` allowlist (`allowFrom` must
+`auto`, and JWT auth config plus live verification are enforced for the `register-hop` mode. Browser admission =
+NATS subject permissions + authenticated registration + the `dmSecurity` allowlist (`allowFrom` must
 include the browser's `peerId`).
 
 ## The one gotcha that breaks everything

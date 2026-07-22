@@ -1,0 +1,10 @@
+{
+  "enrollmentRequest": ["accountId", "agentPublicKey", "pluginVersion", "protocolVersion", "tenant"],
+  "enrollmentResponse": ["device_code", "expires_in", "interval", "user_code", "verification_uri", "verification_uri_complete"],
+  "bootstrapSessionPinAbsent": ["jwt", "peerId"],
+  "bootstrapSessionPinPresent": ["agentPublicKey", "jwt", "peerId"],
+  "bootstrapRendezvousPinAbsent": ["jwt", "natsUrl", "peerId"],
+  "bootstrapRendezvousPinPresent": ["agentPublicKey", "jwt", "natsUrl", "peerId"],
+  "bootstrapStandalonePinAbsent": ["jwksUrl", "jwt", "natsUrl", "peerId"],
+  "bootstrapStandalonePinPresent": ["agentPublicKey", "jwksUrl", "jwt", "natsUrl", "peerId"]
+}

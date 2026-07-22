@@ -67,6 +67,8 @@ export const REGISTER_UNAVAILABLE = JSON.stringify({ error: "unavailable", code:
 export type RegisterHandlerDeps = {
   /** This account's auth config (the verifier enforces its own issuer + aud). */
   auth: AuthConfig | undefined;
+  /** Agent-owned tenant namespace; primary confinement remains structural in NATS. */
+  tenant: string;
   /** peerId segment of the `.register` subject — routing ONLY, never trusted. */
   subjectPeerId: string;
   /** Raw request payload (plaintext JSON; the browser has no session key yet). */
@@ -107,6 +109,11 @@ export type RegisterHandlerDeps = {
   logger?: { error?: (msg: string) => void };
 };
 
+/** A missing legacy tenant claim is accepted; a signed claim must match. */
+function identityMatchesTenantScope(identity: JwtIdentity, tenant: string): boolean {
+  return identity.tenant === undefined || identity.tenant === tenant;
+}
+
 /**
  * Run the register-hop admission for one NATS request. Replies via `deps.reply`.
  * See the module docstring for the security model. Idempotent for `register`
@@ -133,9 +140,10 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   const token = typeof parsed.token === "string" ? parsed.token : "";
 
   // Unregister: authenticated, fire-and-forget teardown (NO reply). It flows
-  // through the SAME verify + subject/JWT-peerId match as register, so an
-  // unverified / mismatched / transient-verify token is a silent no-op — no one
-  // can tear down a peer they don't own. The victim (if any) simply re-registers.
+  // through the SAME verify + tenant/subject/JWT-peerId checks as register, so
+  // an unverified / mismatched / transient-verify token is a silent no-op — no
+  // one can tear down a peer they don't own. The victim (if any) simply
+  // re-registers.
   if (op === "unregister") {
     if (!token) return;
     let unregIdentity: JwtIdentity | null;
@@ -147,6 +155,12 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
       return;
     }
     if (!unregIdentity) return;
+    if (!identityMatchesTenantScope(unregIdentity, deps.tenant)) {
+      logger?.error?.(
+        "webchannel: unregister JWT tenant does not match configured tenant — ignoring",
+      );
+      return;
+    }
     if (subjectPeerId !== unregIdentity.peerId) {
       logger?.error?.(
         `webchannel: unregister subject peerId "${subjectPeerId}" != JWT peerId "${unregIdentity.peerId}" — ignoring`,
@@ -186,6 +200,14 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     return;
   }
   const peerId = identity.peerId;
+
+  // Defense-in-depth: primary tenant binding is structural (the configured NATS
+  // namespace and scoped credentials). A signed claim, when present, must agree.
+  if (!identityMatchesTenantScope(identity, deps.tenant)) {
+    logger?.error?.("webchannel: register JWT tenant does not match configured tenant — rejecting");
+    reply(REGISTER_UNAUTHORIZED);
+    return;
+  }
 
   // SECURITY (subject spoofing): identity is the verified JWT `sub`, never the
   // subject peerId. Reject a mismatch.

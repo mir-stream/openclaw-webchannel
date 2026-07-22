@@ -62,13 +62,10 @@ describe("P0-7b — NatsChannel.sendAck", () => {
     expect(transport.published).toHaveLength(0);
   });
 
-  it("is fail-closed before the session key exists (crypto mode) — returns false, no plaintext", () => {
+  it("rejects encrypted construction without keyStore and identityKeyPair", () => {
     const transport = new RecordingTransport();
-    // Crypto mode (any crypto options → encryptionRequired). No handshake has run,
-    // so the peer has no session key: sendToPeer must refuse rather than leak.
-    const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant", {});
-
-    expect(channel.sendAck("peer-0", ["id-a"])).toBe(false);
+    expect(() => new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant", {}))
+      .toThrow(/keyStore and crypto.identityKeyPair/);
     expect(transport.published).toHaveLength(0);
   });
 });

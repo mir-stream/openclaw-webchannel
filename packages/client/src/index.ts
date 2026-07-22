@@ -1,11 +1,13 @@
 /**
  * Public API for `@mir-stream/webchannel-client` — a framework-agnostic, zero-dependency
- * browser client carrying WebChannel's *functionality* (WS connection,
+ * browser client carrying WebChannel's *functionality* (NATS connection,
  * reconnect, wire protocol, progress drafts, approvals, transcript state)
  * WITHOUT React. Wrap it in any UI (vanilla DOM, Vue, or a thin React hook).
  */
-export { WebChannelClient } from "./client.js";
-export { WebChannelNATSClient } from "./nats-client-wrapper.js";
+export {
+  WebChannelNATSClient,
+  type WebChannelNATSClientOptions,
+} from "./nats-client-wrapper.js";
 export {
   generateDevicePopKeyPair,
   popSignedMessage,
@@ -31,6 +33,10 @@ export type {
   Listener,
   CommandCatalogEntry,
   CommandCatalogArg,
+  // P0-4: the observable send-result contract.
+  SendState,
+  SendFailure,
+  SendReceipt,
 } from "./types.js";
 // SaaS bootstrap key-pin validator — exported so a downstream host (rota-crew)
 // can run a contract test against the client's ACTUAL bootstrap parsing logic

@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import { handleInboundMessage } from "./inbound.js";
-import type { WebChannelTransport } from "./transport.js";
+import type { WebChannelPeerChannel } from "./channel-contract.js";
 
 /**
  * P1-8a — `handleInboundMessage` control-lane behaviour.
@@ -104,7 +104,7 @@ function makeFakeApi(params: {
 
 /** A transport that records finalize frames and accepts progress/typing/text. */
 function makeFakeTransport(): {
-  transport: WebChannelTransport;
+  transport: WebChannelPeerChannel;
   finalizes: Array<{ id: string; text: string }>;
   progress: Array<{ id: string; text: string }>;
   typing: string[];
@@ -118,17 +118,21 @@ function makeFakeTransport(): {
       return true;
     },
     sendText: () => true,
-    sendTextToAnyOpen: () => true,
     sendReasoning: () => true,
     sendTurnSettled: () => true,
     sendProgress: (_sessionKey: string, id: string, text: string) => {
       progress.push({ id, text });
       return true;
     },
-    finalizeDraft: async (_sessionKey: string, id: string, text: string) => {
+    finalizeDraft: (_sessionKey: string, id: string, text: string) => {
       finalizes.push({ id, text });
+      return true;
     },
-  } as unknown as WebChannelTransport;
+    sendHistory: () => true,
+    sendApprovalRequest: () => true,
+    sendApprovalResolved: () => true,
+    sendApprovalSnapshot: () => true,
+  } as WebChannelPeerChannel;
   return { transport, finalizes, progress, typing };
 }
 
@@ -197,6 +201,21 @@ describe("handleInboundMessage — typing indicator gating", () => {
 });
 
 describe("handleInboundMessage — aborted-turn defensive finalize", () => {
+  it("reports visibleReplySent=false when draft finalization returns false", async () => {
+    let visible: boolean | undefined;
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        visible = (await turn.delivery.deliver({ text: "answer" }, { kind: "final" })).visibleReplySent;
+      },
+    });
+    const { transport } = makeFakeTransport();
+    transport.finalizeDraft = () => false;
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message", text: "answer me", id: "turn-dv",
+    });
+    expect(visible).toBe(false);
+  });
   it("settles a hung draft with the streamed snapshot (no marker) when the run resolves without delivering a final", async () => {
     const { api } = makeFakeApi({
       streamingMode: "partial",

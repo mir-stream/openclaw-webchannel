@@ -12,9 +12,9 @@
 > **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-13 (post-#24…#33 tree).** The integrated showcase
 > demo rewrote the demo surface (now `demo/web/src/widget.ts` over the `WebChannelNATSClient` reducer),
 > and the parity stack has since landed several P1 items. **Now built:** **P1-1 markdown (#27)**,
-> **P1-7 error/reconnect UX** (mostly), and **P1-8** (`/stop` control lane #25 + debounce/coalesce
-> #29), P1-3 reasoning lane, and **P1-9 unsend** (Option A client-side hold) — all marked ✅.
-> **Still open:** P1-2 long-response, P1-4 media, P1-6 doctor, and P1-7 finer wording.
+> **P1-7 error/reconnect UX** (incl. finer cause-driven wording), and **P1-8** (`/stop` control lane
+> #25 + debounce/coalesce #29), P1-3 reasoning lane, and **P1-9 unsend** (Option A client-side hold)
+> — all marked ✅. **Still open:** P1-2 long-response, P1-4 media, and P1-6 doctor.
 > Note (#14): the plugin has a partial-mode answer-text stream (`streaming.mode:"partial"`, exercised
 > in the demo) — P1-3's reasoning lane builds on that existing stream, not a net-new one.
 >

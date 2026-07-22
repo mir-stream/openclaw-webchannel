@@ -32,7 +32,7 @@ export type EnrollmentRequest = {
    * Account (deployment) identifier — the wire identity (optional but recommended).
    * Useful for debugging and logging; not part of the trust chain.
    */
-  accountId?: string;
+  accountId: string;
 
   /**
    * Tenant identifier (required for multi-tenant SaaS).
@@ -118,7 +118,7 @@ export type PollRequest = {
  * Internal type (not exposed in API responses). SaaS stores this for each
  * pending enrollment until approval or expiration.
  */
-export type PendingEnrollment = {
+export type EnrollmentRecord = {
   /**
    * Device code (opaque token).
    */
@@ -137,7 +137,7 @@ export type PendingEnrollment = {
   /**
    * Account (deployment) identifier — the wire identity (optional).
    */
-  accountId?: string;
+  accountId: string;
 
   /**
    * Tenant identifier.
@@ -157,7 +157,18 @@ export type PendingEnrollment = {
   /**
    * Approval state.
    */
-  status: "pending" | "approved" | "expired" | "denied";
+  status: "pending" | "approving" | "approved" | "expired" | "denied";
+
+  /** The lease is itself the fencing token; present only while approving. */
+  claim?: { opId: string; leaseUntil: number };
+
+  /** Repository-clock timestamp and idempotency metadata for an approved commit. Legacy approved rows may omit approvedAt and age from expiresAt. */
+  approvedAt?: number;
+  committedBy?: string;
+  commitDigest?: string;
+
+  /** Immutable activation snapshot returned by ambiguous-commit retries. */
+  committedRecord?: import("./agent-key-registry.js").AgentKeyRecord;
 
   /**
    * Issued NATS user credentials (populated upon approval).
@@ -189,6 +200,9 @@ export type PendingEnrollment = {
    */
   protocolVersion?: number;
 };
+
+/** @deprecated Use EnrollmentRecord. Kept as a type alias for source migration only. */
+export type PendingEnrollment = EnrollmentRecord;
 
 /**
  * NATS user credentials issued to the plugin.

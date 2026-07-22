@@ -40,7 +40,7 @@ import type { WebchannelNatsConfig } from "./nats-credential-source.js";
 import type { KeyPair } from "./e2e-crypto.js";
 
 /** The single default account id (mirrors core's `"default"`). */
-export const DEFAULT_ACCOUNT_ID = "default";
+export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = "default";
 
 /**
  * Strict account-id shape accepted at the filesystem trust boundary. Matches the
@@ -62,19 +62,19 @@ const BLOCKED_ACCOUNT_IDS = new Set(["__proto__", "prototype", "constructor"]);
  */
 export function canonicalizeAccountId(value: string | undefined | null): string {
   const trimmed = (value ?? "").trim().toLowerCase();
-  if (!trimmed) return DEFAULT_ACCOUNT_ID;
+  if (!trimmed) return DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   const canonical = trimmed
     .replace(/[^a-z0-9_-]+/g, "-")
     .replace(/^-+/, "")
     .replace(/-+$/, "")
     .slice(0, 64);
-  if (!canonical || BLOCKED_ACCOUNT_IDS.has(canonical)) return DEFAULT_ACCOUNT_ID;
+  if (!canonical || BLOCKED_ACCOUNT_IDS.has(canonical)) return DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   return canonical;
 }
 
 /** True when `id` is a safe account id for use as a filesystem path component. */
 export function isValidAccountId(id: string): boolean {
-  return STRICT_ACCOUNT_ID_RE.test(id) && !BLOCKED_ACCOUNT_IDS.has(id.toLowerCase());
+  return typeof id === "string" && STRICT_ACCOUNT_ID_RE.test(id) && !BLOCKED_ACCOUNT_IDS.has(id.toLowerCase());
 }
 
 /**
@@ -181,6 +181,32 @@ function mergeAccountConfig(
   return merged;
 }
 
+function assertNoRemovedConfig(account: WebchannelAccountConfig): void {
+  const auth = account.auth;
+  if (auth && typeof auth === "object" && Object.prototype.hasOwnProperty.call(auth, "ticketParam")) {
+    throw new Error(
+      "webchannel: removed config auth.ticketParam is no longer supported because Gateway direct WebSocket authentication was deleted; reconfigure with `openclaw channels add --channel webchannel`.",
+    );
+  }
+  const migrationError = (setting: string): never => {
+    throw new Error(
+      `webchannel: removed config ${setting} is no longer supported; authenticated enrollment is required. Reconfigure with \`openclaw channels add --channel webchannel\`.`,
+    );
+  };
+  if (auth && typeof auth === "object" && (auth as { strategy?: unknown }).strategy === "anonymous") {
+    migrationError('auth.strategy="anonymous"');
+  }
+  const nats = account.nats;
+  if (nats && typeof nats === "object") {
+    if (Object.prototype.hasOwnProperty.call(nats, "devOpen")) migrationError("nats.devOpen");
+    if ((nats as { admission?: unknown }).admission === "auto") migrationError('nats.admission="auto"');
+    const credentials = (nats as { credentials?: unknown }).credentials;
+    if (credentials && typeof credentials === "object" && (credentials as { mode?: unknown }).mode === "open") {
+      migrationError('nats.credentials.mode="open"');
+    }
+  }
+}
+
 /**
  * List the configured account ids (canonical `accounts.<id>` model).
  *
@@ -199,7 +225,7 @@ function mergeAccountConfig(
 export function listWebchannelAccountIds(cfg: unknown): string[] {
   const section = readWebchannelSection(cfg);
   const ids = new Set<string>(Object.keys(readAccountsMap(section)).filter(Boolean));
-  if (ids.size === 0) return [DEFAULT_ACCOUNT_ID];
+  if (ids.size === 0) return [DEFAULT_WEBCHANNEL_ACCOUNT_ID];
   return [...ids].sort((a, b) => a.localeCompare(b));
 }
 
@@ -213,13 +239,15 @@ export function listWebchannelAccountIds(cfg: unknown): string[] {
  */
 export function resolveWebchannelAccountConfig(
   cfg: unknown,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
 ): WebchannelAccountConfig {
   const section = readWebchannelSection(cfg);
   if (!section) return {};
   const base = channelLevelBase(section);
   const override = readAccountsMap(section)[accountId] ?? {};
-  return mergeAccountConfig(base, override);
+  const resolved = mergeAccountConfig(base, override);
+  assertNoRemovedConfig(resolved);
+  return resolved;
 }
 
 /**
@@ -233,7 +261,7 @@ export function resolveWebchannelAccountConfig(
  */
 export function resolveAcquisitionIdentity(
   cfg: unknown,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
 ): WebchannelAcquisitionIdentity {
   const account = resolveWebchannelAccountConfig(cfg, accountId);
   const top = cfg as
@@ -241,7 +269,7 @@ export function resolveAcquisitionIdentity(
     | undefined;
   const accountSaas = (account.saas as { baseUrl?: string } | undefined)?.baseUrl;
 
-  const isDefault = accountId === DEFAULT_ACCOUNT_ID;
+  const isDefault = accountId === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   return {
     accountId,
     tenant:
@@ -278,7 +306,7 @@ export function resolveTypingEnabled(accountConfig: WebchannelAccountConfig): bo
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
 ): WebchannelNatsConfig | undefined {
   const account = resolveWebchannelAccountConfig(cfg, accountId);
   return account.nats as WebchannelNatsConfig | undefined;
@@ -298,7 +326,7 @@ export function credentialsRootDir(home: string = homedir()): string {
  * Validates `accountId` (rejects traversal) BEFORE the join.
  */
 export function accountCredentialPath(
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string,
   home: string = homedir(),
 ): string {
   assertValidAccountId(accountId);
@@ -306,10 +334,11 @@ export function accountCredentialPath(
 }
 
 /**
- * Legacy single-file path: `~/.openclaw-webchannel/credentials.json`.
+ * Migration-only legacy single-file location. Runtime readers must never
+ * consult this path; it is exposed solely for explicit cleanup tooling.
  *
- * Kept for the backward-compat fallback: when the per-account file is absent for
- * the `"default"` account AND this legacy file exists, the runtime reads it.
+ * Readers never consult this location. Operators may use it only for an
+ * explicit one-time migration or for the offline reset cleanup procedure.
  */
 export function legacyCredentialPath(home: string = homedir()): string {
   return join(credentialsRootDir(home), "credentials.json");
@@ -318,27 +347,17 @@ export function legacyCredentialPath(home: string = homedir()): string {
 /**
  * Resolve the credential path to READ for an account.
  *
- * Precedence:
- *   1. The per-account path if it exists.
- *   2. Backward-compat: for `"default"` only, the legacy single-file path.
- *   3. Otherwise the per-account path (callers treat a non-existent path as
- *      "creds missing").
+ * This always returns the account-scoped path. The legacy single-file location
+ * is migration/cleanup-only and is deliberately never a read fallback.
  *
  * `assertValidAccountId` runs first (via `accountCredentialPath`).
  */
 export function resolveReadCredentialPath(
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string,
   opts: { home?: string; exists?: (p: string) => boolean } = {},
 ): string {
   const home = opts.home ?? homedir();
-  const exists = opts.exists ?? existsSync;
-  const perAccount = accountCredentialPath(accountId, home);
-  if (exists(perAccount)) return perAccount;
-  if (accountId === DEFAULT_ACCOUNT_ID) {
-    const legacy = legacyCredentialPath(home);
-    if (exists(legacy)) return legacy;
-  }
-  return perAccount;
+  return accountCredentialPath(accountId, home);
 }
 
 /**
@@ -383,8 +402,8 @@ export type PersistedEnrolledCreds = {
 /**
  * Load the persisted enrolled creds for an account (CONSUME-only path — 가-1).
  *
- * Reads the resolved credential file (per-account, with the legacy fallback for
- * `"default"`) and returns its `enrollment.creds`. Returns `undefined` when the
+ * Reads the account-scoped credential file and returns its `enrollment.creds`.
+ * The legacy single-file path is never consulted. Returns `undefined` when the
  * file is absent, unreadable, malformed, or has no enrollment block — the
  * runtime treats that as "creds missing" and applies account-scoped graceful
  * degradation (it never enrolls at runtime). Validates `accountId` first.
@@ -392,7 +411,7 @@ export type PersistedEnrolledCreds = {
  * The fs seams are injectable for tests.
  */
 export function loadPersistedEnrolledCreds(
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string,
   opts: {
     home?: string;
     exists?: (p: string) => boolean;

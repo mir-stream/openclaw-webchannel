@@ -1,5 +1,3 @@
-import type { IncomingMessage } from "node:http";
-
 import { verifyJwt } from "./jwt.js";
 import type { JwtIdentity } from "./jwt.js";
 import { JWKSCache, JwksUnavailableError } from "./jwks.js";
@@ -21,7 +19,7 @@ export class TransientVerifyError extends Error {
 
 /**
  * The auth seam. AUTH.md §3: every built-in or custom strategy converges to ONE
- * contract — a `ConnectionVerifier` run in `transport.handleUpgrade`. Its result
+ * contract — a `JWT auth configuration` run in `NATS register admission`. Its result
  * (`peerId`) becomes the session key, so closing the auth hole also gives us
  * per-user session separation. This file is SDK-free and `ws`-free; it needs
  * only `node:http` types + `./jwt.js`.
@@ -43,11 +41,6 @@ export const ANON_PEER_ID = "web-anon";
 // request's verified JWT `cnf` claim (`identity.devicePublicKey`), so there is
 // no cross-request key store to poison or collide.
 
-export type ConnectionIdentity = { peerId: string; displayName?: string };
-export type ConnectionVerifier = (
-  req: IncomingMessage,
-) => Promise<ConnectionIdentity | null>;
-
 /**
  * Minimal logger shape we accept (matches OpenClaw's optional-method logger).
  * Kept structural so we don't import the SDK.
@@ -66,8 +59,6 @@ export type AuthLogger = {
  */
 export type SecretRef = string | { env: string };
 
-export type AnonymousAuthConfig = { strategy: "anonymous" };
-
 /**
  * JWT (RS256 / JWKS) auth config. The gateway validates compact JWTs against
  * an asymmetric public key resolved from a JWKS source. See AUTH.md §10 for
@@ -76,8 +67,8 @@ export type AnonymousAuthConfig = { strategy: "anonymous" };
  * `issuer` / `audience` are required claims: a missing mismatch rejects every
  * token (intentional fail-closed default — no silent "trust any iss/aud"
  * fallback). `jwksUrl` / `jwksFile` / `jwks` is the key source (exactly one;
- * `resolveVerifier` throws if zero or more than one is supplied). `clockSkew`
- * defaults to 60s, `ticketParam` to "ticket".
+ * `assertJwtAuthConfig` throws if zero or more than one is supplied). `clockSkew`
+ * defaults to 60s.
  */
 export type JwtAuthConfig = {
   strategy: "jwt";
@@ -101,8 +92,6 @@ export type JwtAuthConfig = {
      */
     _fetchImpl?: typeof fetch;
   };
-  /** Query param the JWT arrives in. Default `"ticket"`. */
-  ticketParam?: string;
   /**
    * Require Proof-of-Possession at the NATS register hop. Secure-by-default:
    * when unset the plugin behaves as `true`, so a verified bootstrap JWT that
@@ -112,40 +101,10 @@ export type JwtAuthConfig = {
   requirePoP?: boolean;
 };
 
-export type AuthConfig = AnonymousAuthConfig | JwtAuthConfig;
-
-/** Read a single query param value from a raw request URL (path+query). */
-function readQueryParam(reqUrl: string | undefined, param: string): string | null {
-  if (!reqUrl) return null;
-  // `req.url` is a path+query like "/webchannel/ws?ticket=...". Resolve against
-  // a dummy origin so the URL parser accepts a relative target.
-  let url: URL;
-  try {
-    url = new URL(reqUrl, "http://localhost");
-  } catch {
-    return null;
-  }
-  return url.searchParams.get(param);
-}
-
-function makeAnonymousVerifier(logger?: AuthLogger): ConnectionVerifier {
-  // AC 4: Anonymous strategy is now REJECTED to prevent open-admission security hole.
-  // All connections MUST be authenticated with SaaS-attested keys (cnf claim).
-  // Operators must use the 'jwt' strategy with proper verification.
-  const errorMsg =
-    "webchannel: auth strategy 'anonymous' is disabled — " +
-    "AC 4 requires SaaS-attested device keys (cnf claim). " +
-    "Use the 'jwt' strategy with JWKS verification. " +
-    "Refusing to start.";
-  logger?.error?.(errorMsg);
-  throw new Error(errorMsg);
-
-  // NOTE: The function never returns a verifier — anonymous admission is a
-  // security violation in Phase B. Callers must use authenticated strategies.
-}
+export type AuthConfig = JwtAuthConfig;
 
 /**
- * Build a `ConnectionVerifier` for the `jwt` (RS256 / JWKS) strategy.
+ * Build a `JWT auth configuration` for the `jwt` (RS256 / JWKS) strategy.
  *
  * Fail-closed (AC1): throws at construction if any of the three required
  * `auth.jwt.{issuer, audience, (jwksUrl|jwks|jwksFile)}` fields is missing.
@@ -240,7 +199,18 @@ export async function preflightResolveJwks(
   return { keyCount: doc.keys.length };
 }
 
-function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
+/**
+ * Validate a register-hop JWT configuration and initialize its shared JWKS
+ * cache. The caller must retain this exact auth object in AccountRuntime so
+ * preflight and live verification reuse the same WeakMap-keyed cache.
+ */
+export function assertJwtAuthConfig(config: AuthConfig | undefined | null): asserts config is JwtAuthConfig {
+  if (!config || typeof config !== "object" || !("strategy" in config)) {
+    throw new Error("webchannel: channels.webchannel.auth.strategy is required (jwt). Refusing to start.");
+  }
+  if (config.strategy !== "jwt") {
+    throw new Error(`webchannel: auth strategy "${config.strategy}" is not valid for register-hop JWT verification. Refusing to start.`);
+  }
   const jwtCfg = config.jwt;
   if (!jwtCfg || typeof jwtCfg !== "object") {
     throw new Error(
@@ -261,61 +231,7 @@ function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
   // `JWKSCache.create` (which enforces this) once per account and memoizes the
   // result, so a misconfig fails at plugin load instead of every upgrade, and
   // the 5-minute TTL is honored across upgrades rather than reset each time.
-  const jwksCache = jwksCacheFor(config);
-  const ticketParam = config.ticketParam ?? "ticket";
-  const issuer = jwtCfg.issuer;
-  const audience = jwtCfg.audience;
-  const clockSkew = jwtCfg.clockSkew;
-  return async (req: IncomingMessage) => {
-    const token = readQueryParam(req.url, ticketParam);
-    if (!token) return null;
-    const identity = await verifyJwt(token, {
-      jwks: jwksCache,
-      issuer,
-      audience,
-      clockSkewSec: clockSkew,
-    });
-    if (!identity) return null;
-
-    return identity.displayName !== undefined
-      ? { peerId: identity.peerId, displayName: identity.displayName }
-      : { peerId: identity.peerId };
-  };
-}
-
-/**
- * Build the `ConnectionVerifier` for the configured auth block.
- *
- * SAFE DEFAULT (AUTH.md §7): an unconfigured / unknown strategy THROWS rather
- * than silently falling back to anonymous. `auth:"plugin"` with zero
- * verification would expose every connection to the world — refusing to start is
- * the safe behavior, and the caller (index.ts) lets this propagate so plugin
- * load fails loudly.
- *
- * AC 4: 'anonymous' strategy is disabled — only the authenticated 'jwt'
- * strategy (with cnf claim) is allowed.
- */
-export function resolveVerifier(
-  authConfig: AuthConfig | undefined | null,
-  logger?: AuthLogger,
-): ConnectionVerifier {
-  if (!authConfig || typeof authConfig !== "object" || !("strategy" in authConfig)) {
-    throw new Error(
-      "webchannel: channels.webchannel.auth.strategy is required (jwt). Refusing to start.",
-    );
-  }
-
-  switch (authConfig.strategy) {
-    case "anonymous":
-      // AC 4: Anonymous is now disabled — throw to prevent open-admission hole
-      return makeAnonymousVerifier(logger);
-    case "jwt":
-      return makeJwtVerifier(authConfig);
-    default:
-      throw new Error(
-        `webchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected jwt). Refusing to start.`,
-      );
-  }
+  jwksCacheFor(config);
 }
 
 /**

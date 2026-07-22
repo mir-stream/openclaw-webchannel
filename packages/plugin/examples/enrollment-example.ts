@@ -182,7 +182,7 @@ async function main() {
     console.log("  ✓ Reconnection without re-pairing");
     console.log("");
     console.log("Credential storage:");
-    console.log("  Location: ~/.openclaw-webchannel/credentials.json");
+    console.log("  Location: ~/.openclaw-webchannel/<account>/credentials.json");
     console.log("  Permissions: 0o600 (owner read/write only)");
     console.log("  Contains: Identity key + NATS creds + metadata");
     console.log("");

@@ -46,9 +46,13 @@
             "properties": {
               "strategy": {
                 "type": "string",
-                "enum": ["anonymous", "jwt"]
+                "enum": ["anonymous", "jwt"],
+                "description": "jwt is required. anonymous is REMOVED and reaches a startup migration error."
               },
-              "ticketParam": { "type": "string" },
+              "ticketParam": {
+                "type": "string",
+                "description": "REMOVED — load-time migration error. Gateway direct WebSocket ticket authentication no longer exists; reset this channel with `openclaw channels add --channel webchannel`."
+              },
               "requirePoP": {
                 "type": "boolean",
                 "default": true,
@@ -183,20 +187,20 @@
           "nats": {
             "type": "object",
             "additionalProperties": false,
-            "description": "Agent↔NATS connection. Two orthogonal axes: `credentials` (how the agent authenticates to NATS) and `admission` (which browser peers the agent serves). A bring-your-own-NATS (Synadia/NGS) deployment sets credentials.mode=\"static\" and needs NO SaaS issuer.",
+            "description": "Agent↔NATS connection. Authenticated enrollment and register-hop peer admission are required; static BYO-NATS serving returns in P0-3.",
             "properties": {
               "url": {
                 "type": "string",
-                "description": "NATS WebSocket URL (ws://… / wss://…) for static/open modes. For ENROLLED mode the SaaS is the rendezvous authority and DELIVERS the relay URL with the minted creds (EnrollmentResult.natsUrl); that wins, and this / WEBCHANNEL_NATS_URL is only a dev override / back-compat fallback. Default ws://127.0.0.1:4222."
+                "description": "NATS WebSocket URL (ws://… / wss://…). For enrolled mode the SaaS-delivered relay URL wins; this and WEBCHANNEL_NATS_URL are overrides."
               },
               "devOpen": {
                 "type": "boolean",
-                "description": "Dev only: connect to an open local nats-server with NO auth. Equivalent to credentials.mode=\"open\". Env override: WEBCHANNEL_NATS_DEV_OPEN=1."
+                "description": "REMOVED — startup migration error. Unauthenticated NATS mode no longer exists."
               },
               "admission": {
                 "type": "string",
                 "enum": ["auto", "register-hop"],
-                "description": "Peer-admission override. \"register-hop\": peers must complete the SaaS bootstrap JWT + Proof-of-Possession register hop over NATS request/reply on the webchannel.{tenant}.{accountId}.{peerId}.register subject before being served. \"auto\": the agent subscribes to the tenant/agent wildcard and serves any peer that completes the X25519 handshake and passes the dmSecurity allowlist. Default: register-hop when auth.strategy=\"jwt\"; auto otherwise; static credentials always default to auto."
+                "description": "register-hop is required. auto is REMOVED and reaches a startup migration error."
               },
               "credentials": {
                 "type": "object",
@@ -206,7 +210,7 @@
                   "mode": {
                     "type": "string",
                     "enum": ["static", "enrolled", "open"],
-                    "description": "static: bring-your-own-NATS (url + user JWT + NKEY seed, given directly — no SaaS issuer). enrolled: SaaS device-flow (default). open: no auth (dev only)."
+                    "description": "enrolled is the supported mode. static is rejected until P0-3; open is REMOVED and reaches a startup migration error."
                   },
                   "userJwt": {
                     "anyOf": [
@@ -249,11 +253,7 @@
       "uiHints": {
         "auth.strategy": {
           "label": "Auth strategy",
-          "help": "How browser connections are verified. Production runs the NATS path (index-nats): use \"jwt\" for the register-hop admission, or set NO auth at all for `auto` admission (browser is gated by NATS subject-permissioned creds + the X25519 handshake). \"anonymous\" is REJECTED at load (the plugin refuses to start)."
-        },
-        "auth.ticketParam": {
-          "label": "Ticket query param",
-          "help": "Query-string parameter the JWT arrives in on the WS upgrade URL. Defaults to \"ticket\"."
+          "help": "Browser connections require JWT verification plus Proof-of-Possession over the authenticated NATS register hop. anonymous is removed and causes a targeted startup migration error."
         },
         "auth.jwt.jwksUrl": {
           "label": "JWKS URL",

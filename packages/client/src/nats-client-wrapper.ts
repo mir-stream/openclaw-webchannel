@@ -1,9 +1,8 @@
 /**
- * WebChannel NATS Client Wrapper — Adapter for existing client.ts.
+ * WebChannel NATS Client Wrapper — public browser-facing state adapter.
  *
- * This module wraps the WebChannelNatsClient to provide the same API
- * as the original WebSocket-based WebChannelClient, enabling a drop-in
- * replacement for AC 5's NATS cutover.
+ * This module wraps `WebChannelNatsClient` with transcript, approval, progress,
+ * and subscription state suitable for UI integrations.
  *
  * Changes from gateway-WS:
  * - No WebSocket connection to /webchannel/ws
@@ -22,12 +21,41 @@ import type {
   ChatMessage,
   ReasoningItem,
   ApprovalRequest,
+  SendReceipt,
+  SendFailure,
+  SendState,
 } from "./types.js";
 import {
   WebChannelNatsClient,
-  type NatsClientOptions,
+  type WebChannelNatsClientOptions as DirectClientOptions,
   type InboundMessage,
 } from "./nats-client.js";
+
+/**
+ * P0-4: the state a `SendReceipt` observes. A separate `receiptKey`-keyed record
+ * (not the render bubble) is authoritative: it survives `retract()` removing the
+ * bubble and history adoption rewriting the bubble's `id`, so `snapshot()` never
+ * loses its backing or reports a stuck `queued`. The render bubble's
+ * `sendState`/`sendFailure` mirror this record for the UI.
+ */
+type ReceiptRecord = {
+  id: string;
+  /** Assigned at immediate publish or held release; absent while still held. */
+  wireId?: string;
+  state: NonNullable<ChatMessage["sendState"]>;
+  failure?: SendFailure;
+  // P0-4 (review R5): mirrors `SendReceipt.snapshot()` — a concrete, non-optional
+  // state (a record always has one), so consumers never narrow an impossible
+  // `undefined`.
+  subscribers: Set<(s: { state: NonNullable<ChatMessage["sendState"]>; failure?: SendFailure }) => void>;
+  /** Nested transitions wait until the current bubble/subscriber fanout ends. */
+  pendingTransitions: Array<{
+    state: NonNullable<ChatMessage["sendState"]>;
+    failure?: SendFailure;
+    extraBubblePatch?: Partial<ChatMessage>;
+  }>;
+  drainingTransitions: boolean;
+};
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the
 // plugin-side contract test.
@@ -40,11 +68,25 @@ import { isLikelyAbortText, isExplicitStop } from "./abort-mirror.js";
 /**
  * NATS-based WebChannel client.
  *
- * Drop-in replacement for WebSocket-based WebChannelClient.
- * Uses NATS subjects for per-peer messaging instead of gateway-WS relay.
+ * Uses per-peer NATS subjects for browser messaging.
  */
+
+/**
+ * Canonical constructor options for `WebChannelNATSClient` — the public type a
+ * consumer should annotate its config with. `url` and `jwt` are supplied
+ * through the `WebChannelOptions` aliases `natsUrl` / `bootstrapJwt`, so they
+ * are Omitted from the `NatsClientOptions` half — otherwise the intersection
+ * would require the caller to ALSO pass a raw `url` the wrapper ignores.
+ * Everything else (accountId, tenant, peerId, registration, natsCredentials,
+ * reconnect tuning) is forwarded as-is.
+ */
+export type WebChannelNATSClientOptions = Omit<WebChannelOptions, "bootstrapJwt"> &
+  Omit<DirectClientOptions, "url" | "jwt"> & {
+    bootstrapJwt: string;
+  };
+
 export class WebChannelNATSClient {
-  private readonly natsOptions: NatsClientOptions;
+  private readonly natsOptions: DirectClientOptions;
   private readonly client: WebChannelNatsClient;
 
   private state: WebChannelState = {
@@ -59,6 +101,10 @@ export class WebChannelNATSClient {
   };
 
   private readonly listeners = new Set<Listener>();
+  /** Counts public state fanouts so a staged bubble is exposed exactly once. */
+  private stateNotificationSeq = 0;
+  /** Receipt bubbles installed silently while their low-level send commits. */
+  private readonly stagedReceiptExposures = new Set<string>();
 
   /**
    * P1-9: user messages HELD locally because a turn was in flight at send time
@@ -66,7 +112,29 @@ export class WebChannelNATSClient {
    * released FIFO once the turn settles AND the session key exists. Each entry's
    * `localId` is the id of its `pending: true` transcript bubble.
    */
-  private readonly held: Array<{ localId: string; text: string }> = [];
+  private readonly held: Array<{ localId: string; text: string; receiptKey: string }> = [];
+  /**
+   * Explicit `/stop` is a small commit transaction. Ordinary sends created by
+   * cancellation/finalization callbacks stay held until the outermost stop has
+   * owned its low-level queue position; nested stops share the same transaction.
+   */
+  private stopCommitDepth = 0;
+
+  /**
+   * P0-4: receipt records keyed by the immutable `receiptKey`, and the
+   * wireId → receiptKey routing for the low-level tracker's `onSendState`
+   * transitions (a wireId is assigned at publish/release; a held send has a
+   * receipt but no wireId yet).
+   */
+  private readonly receipts = new Map<string, ReceiptRecord>();
+  private readonly wireIdToReceiptKey = new Map<string, string>();
+  /** P0-4: forward rank for the receipt-level monotonic guard (incl. `completed`). */
+  private static readonly RECEIPT_RANK: Record<"queued" | "sent" | "accepted" | "completed", number> = {
+    queued: 0,
+    sent: 1,
+    accepted: 2,
+    completed: 3,
+  };
   /**
    * P1-9 §3.2: true only between a session KEY establishment (onSession, fired
    * after flushQueue) and the next disconnect. The release gate depends on THIS,
@@ -76,6 +144,32 @@ export class WebChannelNATSClient {
    * ledger replay (FIFO inversion). Cleared on every onState(false).
    */
   private sessionEstablished = false;
+  /**
+   * P0-4: true once a terminal failure has been observed (wrapper mirror of the
+   * low-level `terminalReached`). PERMANENT — a terminal instance is retired
+   * (CL2 contract: every terminal cause is `retryable:false`; recovery means
+   * re-initializing with fresh credentials, not reviving this instance). While
+   * set, `send()` must NEVER hold — a held send arriving after the terminal
+   * held[] sweep would be orphaned — so holding is disabled and the send
+   * publishes, resolving immediately to failed{terminal}. Symmetric with the
+   * low-level `terminalReached`, which also never resets.
+   */
+  private terminal = false;
+  /**
+   * P0-4 (review): true between an explicit `close()` and the next `connect()`.
+   * CONNECTION-SCOPED — the exact opposite of the permanent `terminal` latch: a
+   * closed instance is reusable, so `connect()` clears this. It is the wrapper
+   * mirror of the low-level `disconnected` gate (`nats-client.ts`), which fails a
+   * send onto a closed instance as `failed{closed}`. The mirror is required
+   * because that gate only fires for sends that actually REACH
+   * `sendUserMessage()`: a send arriving while a turn is still in flight is
+   * pushed into `held[]` instead, and `held[]` drains only on `onSession` — which
+   * a closed instance never fires again. `close()` does not settle live `working`
+   * drafts (only the terminal path does) and it clears the staleness valve, so
+   * `turnInFlight()` can stay true forever after a close. Without this flag such
+   * a send is stranded at `queued` — the exact failure P0-4 exists to eliminate.
+   */
+  private closed = false;
   /**
    * P1-9 §3.6.2: post-reconnect staleness valve. `staleDraftWatch` holds the ids
    * of `working` drafts recorded when onSession fired; the timer flips any still
@@ -89,15 +183,10 @@ export class WebChannelNATSClient {
   private staleDraftTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly STALE_DRAFT_GRACE_MS = 30_000;
 
-  // `url` and `jwt` are supplied through the WebChannelOptions aliases
-  // `natsUrl` / `bootstrapJwt`, so they are Omitted from the NatsClientOptions
-  // half — otherwise the intersection would require the caller to ALSO pass a
-  // raw `url` the wrapper ignores. Everything else (accountId, tenant, peerId,
-  // registration, natsCredentials, reconnect tuning) is forwarded as-is.
-  constructor(options: WebChannelOptions & Omit<NatsClientOptions, "url" | "jwt">) {
+  constructor(options: WebChannelNATSClientOptions) {
     this.natsOptions = {
       url: options.natsUrl ?? "wss://nats.example.com",
-      jwt: options.bootstrapJwt ?? "",
+      jwt: options.bootstrapJwt,
       accountId: options.accountId ?? "default-account",
       tenant: options.tenant ?? "default-tenant",
       peerId: options.peerId ?? "anonymous-peer",
@@ -115,6 +204,10 @@ export class WebChannelNATSClient {
       // the CL1 natsCredentials bug — the wrapper rebuilds the options object, so
       // any NatsClientOptions field it doesn't name is silently lost).
       heartbeatIntervalMs: options.heartbeatIntervalMs,
+      // P1-3: forward the connect-stage deadline (same drop-on-the-floor class);
+      // without this the public type advertises `connectTimeoutMs` but the low
+      // level always runs its 10s default — 0 (disable) must survive too.
+      connectTimeoutMs: options.connectTimeoutMs,
     };
 
     this.client = new WebChannelNatsClient(this.natsOptions);
@@ -122,27 +215,30 @@ export class WebChannelNATSClient {
     // Wire up message listener
     this.client.onMessage((msg: InboundMessage) => this.handleMessage(msg));
 
-    // Wire up state listener. Once we are in the terminal `"error"` status
-    // (CL2), a trailing `onState(false)` from the connection teardown must NOT
-    // downgrade it back to "reconnecting" — the client is not reconnecting.
+    // Wire up state listener.
     this.client.onState((connected: boolean) => {
       if (!connected) {
         // P1-9: the conversation key is gone on ANY disconnect — close the
         // release gate and clear the connection-scoped staleness valve. Done
-        // BEFORE the terminal-"error" early return below so neither ever
-        // depends on that branch's behavior; the valve re-arms fresh on the
-        // next onSession (grace counts only connected time, §3.6.2).
+        // BEFORE the terminal early-return below so neither depends on that
+        // branch; the valve re-arms fresh on the next onSession (§3.6.2).
         this.sessionEstablished = false;
         this.clearStaleDraftWatch();
       }
-      if (!connected && this.state.status === "error") return;
+      // P0-4: a CL2 terminal instance is PERMANENTLY retired — the onState handler
+      // must not mutate status/error at all, on EITHER edge. This matters because
+      // a registration-path terminal sets only the WCNC-level `terminalReached`
+      // (the raw transport is NOT terminal), so a later explicit `connect()`
+      // re-dials and emits `connected:true`; without this guard that would flip
+      // the sticky "error" to "connected" and clear the cause while every send
+      // still immediate-fails (a green status on a wedged instance). It also
+      // supersedes the old one-sided (!connected && status==="error") sticky
+      // guard, since `terminal` is always set whenever status is "error".
+      // Recovery is a fresh client with fresh credentials, never this instance.
+      if (this.terminal) return;
       this.setState({
         status: connected ? "connected" : "reconnecting",
         connected,
-        // P1-7: a successful (re)connect clears a stale terminal reason. The
-        // register-failure sites don't set the raw client's `terminal` flag, so a
-        // generic embedder calling connect() again on the SAME instance can come
-        // back up — without this it would keep a stale `error`/`errorCause`.
         ...(connected ? { error: undefined, errorCause: undefined } : { isTyping: false }),
       });
       // P1-9: a connection flip is a state transition — re-evaluate the release
@@ -154,9 +250,29 @@ export class WebChannelNATSClient {
     // handshake paths, strictly AFTER flushQueue). Open the release gate, arm the
     // staleness valve fresh, and try to release — ordered behind the ledger replay.
     this.client.onSession(() => {
+      // P0-4 (R4): defense in depth — a retired instance must never open the
+      // release gate, arm the staleness valve, or release, even if a stray
+      // onSession somehow fired. The mid-level `onConnected` terminal guard is the
+      // root fix; this makes the wrapper safe regardless.
+      if (this.terminal) return;
       this.sessionEstablished = true;
       this.armStaleDraftWatch();
       this.maybeRelease();
+    });
+
+    // P0-4: the authoritative tracker drives every send-state transition. Route
+    // it through the wireId → receiptKey alias to the receipt record + render
+    // bubble. A wireId with no local receipt (a direct/internal send) is ignored.
+    this.client.onSendState((wireId: string, state: SendState, failure?: SendFailure) => {
+      const receiptKey = this.wireIdToReceiptKey.get(wireId);
+      if (!receiptKey) return;
+      // The record already starts at queued, so this is not a receipt transition.
+      // It is nevertheless the first safe point to expose a silently staged
+      // bubble: the low level owns A's outbound queue position before emitting it.
+      if (state === "queued" && this.stagedReceiptExposures.delete(receiptKey)) {
+        this.notifyStateListeners();
+      }
+      this.receiptTransition(receiptKey, state, failure);
     });
 
     // CL2: surface a TERMINAL failure to the embedder. The underlying client
@@ -167,6 +283,31 @@ export class WebChannelNATSClient {
     // of showing an eternal reconnect spinner.
     this.client.onError((err: Error, cause?: WebChannelErrorCause) => {
       console.error("[nats-wrapper] terminal connection error:", err);
+      // P0-4: mark terminal BEFORE failing held[] so a re-entrant send from a
+      // receipt subscriber during the sweep does NOT hold (shouldHold is gated on
+      // this) — it publishes and resolves immediately to failed{terminal}.
+      this.terminal = true;
+      // P0-4 (D5 held/terminal): the queued/ledgered sends were already swept to
+      // failed{terminal} by the low-level terminal sequence BEFORE this listener
+      // ran; fail the wrapper-owned held[] here (they have no wireId, so the sweep
+      // could not reach them). Retracted bubbles are preserved by failHeld.
+      this.failHeld({ reason: "terminal", cause: cause ?? "unknown", retryable: false });
+      // P0-4 (R4): settle the live-turn UI in the SAME terminal update. A terminal
+      // mid-turn otherwise leaves an eternal "typing…" (or a spinning `working`
+      // draft): the gated onState(false) skips the normal cleanup, and the
+      // staleness valve only arms on a reconnect this retired instance never does.
+      // Flip isTyping off and every `working` draft to `working:false` in place
+      // (id/text untouched — the /stop idiom), atomically with the error status so
+      // there is no intermediate flicker. Does NOT touch status/error semantics.
+      let draftsSettled = false;
+      const settledMessages = this.state.messages.map((m) => {
+        if (m.working) {
+          draftsSettled = true;
+          this.staleDraftWatch.delete(m.id);
+          return { ...m, working: false };
+        }
+        return m;
+      });
       // P1-7: carry the machine-readable cause onto state so the embedder picks
       // truthful wording + the right recovery affordance. A classified emit site
       // supplies its cause; an unclassified failure falls back to "unknown".
@@ -175,6 +316,8 @@ export class WebChannelNATSClient {
         connected: false,
         error: err.message,
         errorCause: cause ?? "unknown",
+        isTyping: false,
+        ...(draftsSettled ? { messages: settledMessages } : {}),
       });
     });
 
@@ -202,20 +345,46 @@ export class WebChannelNATSClient {
 
   /** Connect to NATS */
   connect(): void {
+    // P0-4 (review): a reconnect reopens the send path — clear the closed gate so
+    // holding resumes. Mirrors `WebChannelNatsClient.connect()`, which clears its
+    // own `disconnected` flag; the ordering mirrors it too — that method REFUSES
+    // outright on a terminally-retired instance, so a retired wrapper must stay
+    // closed rather than silently re-enable holding onto a dead instance.
+    if (!this.terminal) this.closed = false;
     this.client.connect();
   }
 
   /** Disconnect from NATS */
   close(): void {
+    // P0-4 (review): gate holding FIRST — a send arriving after this close (or
+    // re-entrantly, from a listener the sweep below fires) must publish and
+    // resolve to failed{closed} via the low-level `disconnected` gate, never land
+    // in `held[]` whose only drain (onSession) this instance will never fire.
+    this.closed = true;
+    // Detach only this lifecycle's held ownership before the low-level close can
+    // notify state listeners. A listener may synchronously connect() and send a
+    // fresh held message; the old close must not sweep that replacement entry.
+    const heldEntries = this.takeHeld();
     // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
     this.clearStaleDraftWatch();
     this.client.disconnect();
+    // P0-4 (D5): fail the wrapper-owned held[] (no wireId → invisible to the
+    // low-level fail-all).
+    //
+    // Notifications still run after teardown, but target only the detached old
+    // entries. Replacement held work remains owned by the reopened lifecycle.
+    this.failHeldEntries(heldEntries, { reason: "closed", retryable: false });
   }
 
-  /** Send user message */
-  send(text: string): void {
+  /**
+   * Send user message. Returns a `SendReceipt` (P0-4) for observing the send's
+   * terminal outcome — source-compatible with the old `void` return (callers may
+   * ignore it). `undefined` ONLY for trimmed-empty input (R2b-3): no bubble, no
+   * tracker mutation, no fabricated receipt.
+   */
+  send(text: string): SendReceipt | undefined {
     const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!trimmed) return undefined;
 
     // P1-9 §3.3: abort-shaped text ALWAYS bypasses the hold. Holding an abort
     // deadlocks (the hold waits for the settle, the settle needs the abort);
@@ -228,18 +397,31 @@ export class WebChannelNATSClient {
     // explicit command clears the buffer).
     if (isLikelyAbortText(trimmed)) {
       if (isExplicitStop(trimmed)) {
-        this.markHeldRetracted();
-        // §3.4: /stop means "stop everything". Also locally finalize the live
-        // turn-in-flight state (working drafts AND the typing indicator) so the
-        // composer unwedges even when a turn dies WITHOUT a disconnect (agent
-        // dies with the socket alive) — the staleness valve only arms on
-        // reconnect, so without this /stop cannot rescue a socket-alive wedge.
-        // Covers both a working-draft hang and a pre-first-token typing-only
-        // hang. NL abort words do NOT call this.
-        this.finalizeLocalTurnState();
+        this.stopCommitDepth++;
+        let stopCommitted = false;
+        try {
+          this.markHeldRetracted();
+          // §3.4: /stop means "stop everything". Also locally finalize the live
+          // turn-in-flight state (working drafts AND the typing indicator) so the
+          // composer unwedges even when a turn dies WITHOUT a disconnect (agent
+          // dies with the socket alive) — the staleness valve only arms on
+          // reconnect, so without this /stop cannot rescue a socket-alive wedge.
+          // Covers both a working-draft hang and a pre-first-token typing-only
+          // hang. NL abort words do NOT call this.
+          this.finalizeLocalTurnState();
+          const receipt = this.publish(trimmed);
+          stopCommitted = true;
+          return receipt;
+        } finally {
+          this.stopCommitDepth--;
+          // A failed outer publish must not release replacements ahead of a stop
+          // that never committed. A nested stop never drains while its outer
+          // transaction is still active.
+          if (this.stopCommitDepth === 0 && stopCommitted) this.maybeRelease();
+        }
       }
-      this.publish(trimmed);
-      return;
+      // Control-lane text is a real published user message → a normal receipt.
+      return this.publish(trimmed);
     }
 
     // P1-9 §3.1: hold while a turn is in flight OR anything is already held. The
@@ -247,13 +429,25 @@ export class WebChannelNATSClient {
     // forces isTyping:false, so without the latch a send during the reconnect
     // window would publish ahead of an earlier held message).
     if (this.shouldHold()) {
+      const receiptKey = this.newReceiptKey();
       const localId = `u-${this.uid()}`;
-      this.held.push({ localId, text: trimmed });
-      this.appendMessage({ id: localId, role: "user", text: trimmed, pending: true });
-      return;
+      this.held.push({ localId, text: trimmed, receiptKey });
+      // P0-4: a held send has a receipt (queued) but NO wireId yet — the wireId
+      // is minted at release (2-phase). The receiptKey is the stable handle.
+      this.receipts.set(receiptKey, {
+        id: receiptKey,
+        state: "queued",
+        subscribers: new Set(),
+        pendingTransitions: [],
+        drainingTransitions: false,
+      });
+      this.appendMessage({
+        id: localId, role: "user", text: trimmed, pending: true, receiptKey, sendState: "queued",
+      });
+      return this.makeReceipt(receiptKey);
     }
 
-    this.publish(trimmed);
+    return this.publish(trimmed);
   }
 
   /**
@@ -269,30 +463,53 @@ export class WebChannelNATSClient {
     const hi = this.held.findIndex((h) => h.localId === id);
     if (hi !== -1) this.held.splice(hi, 1);
     this.setState({ messages: this.state.messages.filter((m) => m.id !== id) });
+    // P0-4 (R3-4): a cancel is still a terminal RECEIPT outcome even though the
+    // render bubble is gone. The receipt record outlives the bubble, so
+    // snapshot()/subscribe() report failed{cancelled} rather than a stuck queued.
+    // A second retract of an already-cancelled bubble is a receipt no-op (guard).
+    if (msg.receiptKey) {
+      this.receiptTransition(msg.receiptKey, "failed", { reason: "cancelled", retryable: false });
+    }
     return true;
   }
 
   /**
-   * Publish a user message immediately — today's send path, unchanged. Extracted
-   * so both the no-hold and the abort-bypass branches share it (§3.1/§3.3).
+   * Publish a user message immediately — today's send path. Extracted so both the
+   * no-hold and the abort-bypass branches share it (§3.1/§3.3).
    *
-   * P0-7b: capture the wire id so a later `ack` frame can mark this local echo
-   * delivered (the SDK correlates by wireId, never the synthetic local id).
-   * Known/accepted: sendUserMessage publishes BEFORE appendMessage records the
-   * echo, so a SAME-TICK synchronous ack would miss the bubble and `delivered`
-   * would never flip. That can only happen on a synchronous fake transport (a
-   * test); over a real WS/NATS socket the ack is always a later event-loop turn,
-   * so it lands after the echo exists. Not restructured.
+   * P0-4 commit order (D4): reserve the wire id, register the receipt record +
+   * alias + render bubble SILENTLY, then let `sendUserMessage` own A's outbound
+   * queue position before any state callback can synchronously send B. The queued
+   * low-level event exposes the staged bubble; if that event is itself delayed by
+   * a nested event drain, the commit helper exposes it once before returning.
    */
-  private publish(trimmed: string): void {
-    const wireId = this.client.sendUserMessage(trimmed);
-    this.appendMessage({
+  private publish(trimmed: string): SendReceipt {
+    const receiptKey = this.newReceiptKey();
+    const wireId = this.client.reserveWireId();
+    this.wireIdToReceiptKey.set(wireId, receiptKey);
+    this.receipts.set(receiptKey, {
+      id: receiptKey,
+      wireId,
+      state: "queued",
+      subscribers: new Set(),
+      pendingTransitions: [],
+      drainingTransitions: false,
+    });
+    const bubble: ChatMessage = {
       id: `u-${this.uid()}`,
       role: "user",
       text: trimmed,
       wireId,
       turnId: wireId,
-    });
+      receiptKey,
+      sendState: "queued",
+    };
+    this.stageReceiptStateThenCommit(
+      receiptKey,
+      { messages: [...this.state.messages, bubble] },
+      () => { this.client.sendUserMessage(trimmed, wireId); },
+    );
+    return this.makeReceipt(receiptKey);
   }
 
   /** P1-9 §3.1: a turn is in flight when the agent is typing or a draft is working. */
@@ -302,6 +519,16 @@ export class WebChannelNATSClient {
 
   /** P1-9 §3.1: hold predicate — in flight OR the latch keeps prior holds first. */
   private shouldHold(): boolean {
+    // P0-4: never hold after a terminal failure (a held send would escape the
+    // held[] sweep and orphan). Publish instead → immediate failed{terminal}.
+    if (this.terminal) return false;
+    // P0-4 (review): never hold after an explicit close() either — held[] drains
+    // only on onSession, which a closed instance never fires, so a hold here is a
+    // permanent `queued`. Publish instead → immediate failed{closed}.
+    if (this.closed) return false;
+    // Ordinary callback-created sends cannot publish during an explicit-stop
+    // transaction. They release only after the outer stop owns its queue slot.
+    if (this.stopCommitDepth > 0) return true;
     return this.turnInFlight() || this.held.length > 0;
   }
 
@@ -320,13 +547,14 @@ export class WebChannelNATSClient {
    * bubble an ordinary send in an ordinary position.
    *
    * Re-entrancy: drain `held[]` LIVE — `shift()` one entry per iteration rather
-   * than snapshot-and-clear before the loop. Each per-bubble `setState()` fires
-   * listeners synchronously mid-loop; a listener calling `send()` re-entrantly
-   * must NOT jump the queue. With a live drain the still-unreleased entries are
-   * genuinely present in `held[]`, so `shouldHold()` (`held.length > 0`) still
-   * holds that new message and the continuing `while` loop picks it up in FIFO
-   * order — a snapshot-and-clear would leave `held[]` empty mid-loop and let the
-   * re-entrant send publish AHEAD of the not-yet-released entries (M1, M3, M2).
+   * than snapshot-and-clear before the loop. Each staged bubble is exposed to
+   * listeners synchronously after its low-level queue commit; a listener calling
+   * `send()` re-entrantly must NOT jump the queue. With a live drain the still-
+   * unreleased entries are genuinely present in `held[]`, so `shouldHold()`'s
+   * `held.length > 0` latch holds that new message and the continuing loop takes
+   * it in FIFO order. A snapshot-and-clear would leave `held[]` empty mid-loop
+   * and let the re-entrant send publish AHEAD of the not-yet-released entries
+   * (M1, M3, M2).
    * Two behaviors this preserves: (a) a re-entrant `retract()` of a not-yet-
    * released held item splices it out of the live array, so `shift()` never
    * reaches it — its publish is cancelled; (b) the last entry's listener calling
@@ -335,6 +563,7 @@ export class WebChannelNATSClient {
    */
   private maybeRelease(): void {
     if (
+      this.stopCommitDepth > 0 ||
       this.held.length === 0 ||
       this.turnInFlight() ||
       !this.state.connected ||
@@ -343,15 +572,27 @@ export class WebChannelNATSClient {
       return;
     }
     while (this.held.length > 0) {
-      const { localId, text } = this.held.shift()!;
-      const wireId = this.client.sendUserMessage(text);
+      const { localId, text, receiptKey } = this.held.shift()!;
+      // P0-4 commit order: reserve the wireId, register the alias, stage the bubble
+      // at the tail, THEN let the low level own/publish A before exposing that move.
+      const wireId = this.client.reserveWireId();
+      this.wireIdToReceiptKey.set(wireId, receiptKey);
+      const receipt = this.receipts.get(receiptKey);
+      if (receipt) receipt.wireId = wireId;
       const bubble = this.state.messages.find((m) => m.id === localId);
       // A re-entrant listener may have already removed the bubble; the text is
       // still published (correct — release is a commit), so just skip the patch.
-      if (!bubble) continue;
-      const messages = this.state.messages.filter((m) => m.id !== localId);
-      messages.push({ ...bubble, pending: false, wireId, turnId: wireId });
-      this.setState({ messages });
+      if (bubble) {
+        const messages = this.state.messages.filter((m) => m.id !== localId);
+        messages.push({ ...bubble, pending: false, wireId, turnId: wireId });
+        this.stageReceiptStateThenCommit(
+          receiptKey,
+          { messages },
+          () => { this.client.sendUserMessage(text, wireId); },
+        );
+      } else {
+        this.client.sendUserMessage(text, wireId);
+      }
     }
   }
 
@@ -364,13 +605,43 @@ export class WebChannelNATSClient {
    */
   private markHeldRetracted(): void {
     if (this.held.length === 0) return;
-    const ids = new Set(this.held.map((h) => h.localId));
-    this.held.length = 0;
-    this.setState({
-      messages: this.state.messages.map((m) =>
-        ids.has(m.id) ? { ...m, pending: false, retracted: true } : m,
-      ),
-    });
+    const entries = this.held.splice(0);
+    // P0-4: /stop is a user-intentional cancel — each held receipt ends at
+    // failed{cancelled,retryable:false}, and its bubble flips to the retracted
+    // marker (text preserved, restorable). receiptTransition patches the bubble
+    // (sendState/sendFailure) alongside the pending→retracted flip.
+    for (const e of entries) {
+      this.receiptTransition(
+        e.receiptKey,
+        "failed",
+        { reason: "cancelled", retryable: false },
+        { pending: false, retracted: true },
+      );
+    }
+  }
+
+  /**
+   * P0-4 (D5): fail every wrapper-owned held[] entry with `failure` and clear the
+   * hold (they can no longer release). Their bubbles flip pending→false with the
+   * failed sendState/sendFailure; `retracted` bubbles (already terminal) are left
+   * untouched because they carry no held entry. Used by close() and terminal error.
+   */
+  private failHeld(failure: SendFailure): void {
+    this.failHeldEntries(this.takeHeld(), failure);
+  }
+
+  private takeHeld(): Array<{ localId: string; text: string; receiptKey: string }> {
+    return this.held.splice(0);
+  }
+
+  /** Fail a detached ownership snapshot without consuming replacement holds. */
+  private failHeldEntries(
+    entries: readonly { localId: string; text: string; receiptKey: string }[],
+    failure: SendFailure,
+  ): void {
+    for (const e of entries) {
+      this.receiptTransition(e.receiptKey, "failed", failure, { pending: false });
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -516,9 +787,46 @@ export class WebChannelNATSClient {
   // State management
   // ---------------------------------------------------------------------------
 
+  /**
+   * Public state listeners are isolated so an embedder render bug cannot abort a
+   * send, a staged-bubble exposure, or a held drain midway through its FIFO commit.
+   */
   private setState(patch: Partial<WebChannelState>): void {
     this.state = { ...this.state, ...patch };
-    for (const listener of this.listeners) listener(this.state);
+    this.notifyStateListeners();
+  }
+
+  private notifyStateListeners(): void {
+    this.stateNotificationSeq++;
+    for (const listener of this.listeners) {
+      try {
+        listener(this.state);
+      } catch (e) {
+        console.error("[nats-wrapper] state listener threw:", e);
+      }
+    }
+  }
+
+  /**
+   * Install a receipt bubble/update before committing its low-level send, without
+   * exposing it early. The low-level queued callback normally performs the public
+   * fanout after queue ownership is established. If that callback is delayed by a
+   * surrounding send-state drain, expose the staged state once after commit.
+   */
+  private stageReceiptStateThenCommit(
+    receiptKey: string,
+    patch: Partial<WebChannelState>,
+    commit: () => void,
+  ): void {
+    const notificationSeq = this.stateNotificationSeq;
+    this.state = { ...this.state, ...patch };
+    this.stagedReceiptExposures.add(receiptKey);
+    try {
+      commit();
+    } finally {
+      this.stagedReceiptExposures.delete(receiptKey);
+      if (this.stateNotificationSeq === notificationSeq) this.notifyStateListeners();
+    }
   }
 
   private appendMessage(message: ChatMessage): void {
@@ -564,6 +872,144 @@ export class WebChannelNATSClient {
   }
 
   private seq = 0;
+
+  // ---------------------------------------------------------------------------
+  // P0-4 — receipt records + send-state projection (D5)
+  // ---------------------------------------------------------------------------
+
+  /** Dedicated counter so receiptKeys never perturb the `u-`/`a-` bubble id sequence. */
+  private receiptSeq = 0;
+  private newReceiptKey(): string {
+    return `r-${this.receiptSeq++}`;
+  }
+
+  /** A thin observable view over the receiptKey-keyed record (no state duplication). */
+  private makeReceipt(receiptKey: string): SendReceipt {
+    return {
+      id: receiptKey,
+      snapshot: () => this.receiptSnapshot(receiptKey),
+      subscribe: (cb) => {
+        const rec = this.receipts.get(receiptKey);
+        if (!rec) return () => {};
+        rec.subscribers.add(cb);
+        return () => { rec.subscribers.delete(cb); };
+      },
+    };
+  }
+
+  /**
+   * Read the wrapper projection unless the low tracker has already reached a
+   * later state whose callback is merely waiting in the global FIFO drain. This
+   * is a read-only overlay: bubbles and receipt subscribers still transition
+   * through `receiptTransition` in serialized event order.
+   *
+   * While this receipt's own transition is fanning out, its record remains the
+   * snapshot authority so every subscriber sees the event it was passed. The
+   * wrapper-only terminal outcomes (`completed` and `failed`, including
+   * `turn-failed`) likewise outrank the low tracker's accepted/sent projection.
+   * A held receipt has no wire id and therefore remains queued.
+   */
+  private receiptSnapshot(receiptKey: string): ReturnType<SendReceipt["snapshot"]> {
+    const rec = this.receipts.get(receiptKey);
+    // A record always exists for a receipt we handed out; the fallback keeps the
+    // type total. Records are intentionally retained across adoption/retraction.
+    if (!rec) return { state: "failed" };
+
+    const wrapperState = rec.state;
+    const wrapperSnapshot = { state: wrapperState, failure: rec.failure };
+    if (
+      rec.drainingTransitions ||
+      wrapperState === "failed" ||
+      wrapperState === "completed" ||
+      !rec.wireId
+    ) {
+      return wrapperSnapshot;
+    }
+
+    const tracked = this.client.getSendStateSnapshot(rec.wireId);
+    if (!tracked) return wrapperSnapshot;
+    if (
+      tracked.state === "failed" ||
+      WebChannelNATSClient.RECEIPT_RANK[tracked.state] > WebChannelNATSClient.RECEIPT_RANK[wrapperState]
+    ) {
+      return tracked;
+    }
+    return wrapperSnapshot;
+  }
+
+  /** Monotonic receipt guard (wrapper-level, incl. `completed`): queued<sent<accepted<completed; failed/completed terminal. */
+  private receiptAdvances(from: ReceiptRecord["state"], to: NonNullable<ChatMessage["sendState"]>): boolean {
+    if (from === to) return false;
+    if (from === "failed" || from === "completed") return false; // terminal
+    if (to === "failed") return true; // failable from any non-terminal state
+    return WebChannelNATSClient.RECEIPT_RANK[to] > WebChannelNATSClient.RECEIPT_RANK[from];
+  }
+
+  /**
+   * P0-4: apply a send-state transition to a receipt record (authoritative) and
+   * mirror it onto the render bubble, enforcing the wrapper-level monotonic guard
+   * (which alone knows `completed`). A bubble/state or receipt subscriber can
+   * synchronously cause another transition for this same receipt, so the whole
+   * guard→mutation→bubble fanout→receipt fanout transaction is drained FIFO per
+   * receipt. The current event remains the authoritative snapshot until every
+   * subscriber has seen it; a rejected transition touches nothing.
+   */
+  private receiptTransition(
+    receiptKey: string,
+    state: NonNullable<ChatMessage["sendState"]>,
+    failure?: SendFailure,
+    extraBubblePatch?: Partial<ChatMessage>,
+  ): void {
+    const rec = this.receipts.get(receiptKey);
+    if (!rec) return;
+    rec.pendingTransitions.push({ state, failure, extraBubblePatch });
+    if (rec.drainingTransitions) return;
+
+    rec.drainingTransitions = true;
+    try {
+      while (rec.pendingTransitions.length > 0) {
+        const next = rec.pendingTransitions.shift()!;
+        if (!this.receiptAdvances(rec.state, next.state)) continue;
+        rec.state = next.state;
+        rec.failure = next.failure;
+        this.patchBubbleByReceiptKey(receiptKey, {
+          sendState: next.state,
+          sendFailure: next.failure,
+          ...(next.extraBubblePatch ?? {}),
+        });
+        for (const cb of [...rec.subscribers]) {
+          try {
+            cb({ state: next.state, failure: next.failure });
+          } catch (e) {
+            console.error("[nats-wrapper] receipt subscriber threw:", e);
+          }
+        }
+      }
+    } finally {
+      rec.drainingTransitions = false;
+    }
+  }
+
+  /** Patch the render bubble carrying `receiptKey` (a no-op if it was retracted). */
+  private patchBubbleByReceiptKey(receiptKey: string, patch: Partial<ChatMessage>): void {
+    const idx = this.state.messages.findIndex((m) => m.receiptKey === receiptKey);
+    if (idx === -1) return;
+    const messages = this.state.messages.slice();
+    messages[idx] = { ...messages[idx], ...patch };
+    this.setState({ messages });
+  }
+
+  /**
+   * P0-4 (§1 coalesce anchor): promote the ANCHOR user bubble of `turnId` — the
+   * one whose wireId === turnId — to `completed` (outcome ok) or fail it
+   * `turn-failed` (outcome error). A coalesced non-anchor send (wireId ≠ turnId)
+   * is intentionally left at `accepted`: admission is guaranteed, turn outcome is
+   * observed per turn.
+   */
+  private promoteAnchor(turnId: string, state: "completed" | "failed", failure?: SendFailure): void {
+    const anchor = this.state.messages.find((m) => m.role === "user" && m.wireId === turnId);
+    if (anchor?.receiptKey) this.receiptTransition(anchor.receiptKey, state, failure);
+  }
 
   // ---------------------------------------------------------------------------
   // Message handling
@@ -782,21 +1228,12 @@ export class WebChannelNATSClient {
       }
 
       case "ack": {
-        // P0-7b: mark the local echoes whose wireId the agent acknowledged at
-        // ingress as delivered (state-only — the demo can render a ✓). Ids we
-        // don't hold locally are a silent no-op.
-        const ids = Array.isArray(msg.ids) ? msg.ids : [];
-        if (ids.length === 0) return;
-        const acked = new Set(ids);
-        let changed = false;
-        const messages = this.state.messages.map((m) => {
-          if (m.wireId !== undefined && acked.has(m.wireId) && !m.delivered) {
-            changed = true;
-            return { ...m, delivered: true };
-          }
-          return m;
-        });
-        if (changed) this.setState({ messages });
+        // P0-4: acceptance is now driven authoritatively by the low-level
+        // tracker — the same `ack` frame already advanced each matching wireId to
+        // `accepted` via `onSendState` (which patched the bubble's sendState).
+        // Nothing to do at the reducer level; `handleMessage` runs the release
+        // gate (`maybeRelease`) AFTER this reducer returns, so the ack still
+        // participates in re-evaluating held-message release.
         return;
       }
 
@@ -1001,6 +1438,21 @@ export class WebChannelNATSClient {
       }
 
       case "turn_settled": {
+        // P0-4 (§1): promote the send only on an EXPLICIT outcome. `"ok"` →
+        // `accepted → completed` on the anchor (turnId === wireId); `"error"` →
+        // `failed{turn-failed, retryable:true}`. ABSENT `outcome` = legacy plugin
+        // (fires turn_settled from a finally regardless of success): the UI still
+        // settles below, but the send honestly stays `accepted` — never a
+        // fabricated `completed`. A turn_settled that beats the ack promotes
+        // straight past `sent` (the receipt guard allows the monotonic upgrade).
+        if (msg.turnId && msg.outcome === "ok") {
+          this.promoteAnchor(msg.turnId, "completed");
+        } else if (msg.turnId && msg.outcome === "error") {
+          this.promoteAnchor(msg.turnId, "failed", { reason: "turn-failed", retryable: true });
+        }
+        // Outcome is authoritative and must be committed before either UI
+        // settlement callout. A listener reacting to typing/draft completion may
+        // close the client; that teardown cannot overwrite completed/turn-failed.
         this.setState({ isTyping: false });
         // P1-9 §3.6.1: settled ⇒ no more upserts — finalize any lingering working
         // draft whose turnId matches (in the normal flow the final agent_message

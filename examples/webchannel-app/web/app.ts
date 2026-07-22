@@ -186,6 +186,21 @@ async function mountBrowserUi(): Promise<void> {
         const div = document.createElement("div");
         div.className = `msg ${m.role}`;
         div.textContent = m.text;
+        // P0-4: minimal send-status affordance on the user's own bubbles. The
+        // agent got the message once it reaches `accepted` (or `completed`); a
+        // `failed` bubble shows a ⚠ whose title carries the reason so the send
+        // never silently vanishes.
+        if (m.role === "user" && m.sendState) {
+          const badge = document.createElement("span");
+          badge.className = `send-status ${m.sendState}`;
+          if (m.sendState === "accepted" || m.sendState === "completed") {
+            badge.textContent = " ✓";
+          } else if (m.sendState === "failed") {
+            badge.textContent = " ⚠";
+            badge.title = `send failed: ${m.sendFailure?.reason ?? "unknown"}`;
+          }
+          if (badge.textContent) div.append(badge);
+        }
         return div;
       }),
     );

@@ -51,13 +51,13 @@
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
-import { WEBCHANNEL_ID } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountCredentialPath,
   canonicalizeAccountId,
   readAccountsMap,
   readWebchannelSection,
-  resolveReadCredentialPath,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
@@ -81,7 +81,7 @@ type WebchannelSetupInput = {
   issuer?: string;
   audience?: string;
   // Connection / credential-mode passthrough.
-  credentialsMode?: "enrolled" | "static" | "open";
+  credentialsMode?: "enrolled" | "static";
 } & Record<string, unknown>;
 
 /** Minimal runtime log sink (the host passes `RuntimeEnv`). */
@@ -186,14 +186,9 @@ function mergePatch(
  * the `auth.jwt` sub-object is OMITTED ENTIRELY so nothing is guessed — only
  * `auth.strategy: "jwt"` is written (runtime derivation supplies the rest).
  *
- * `admission` is pinned to `register-hop` because this builder ALWAYS emits a
- * SaaS-enrolled jwt account (`auth.strategy: "jwt"`, `credentials.mode: "enrolled"`)
- * — exactly the case `resolveAdmissionMode` would infer register-hop for (jwt +
- * a viable register hop). Pinning it makes the register-over-NATS chat path work
- * out of the box; the legacy `auto` (X25519-handshake, no `.register` subject)
- * would silently break the browser's register request. Static/BYO-NATS accounts
- * do NOT reach this builder (they take the partial `buildAccountPatch` path), so
- * their `auto` default is unaffected.
+ * `admission` is pinned to `register-hop` because this builder always emits a
+ * SaaS-enrolled JWT account and authenticated registration is the only serving
+ * path.
  *
  * `nats.url` is intentionally OMITTED — the SaaS delivers the relay URL together
  * with the enrolled credentials at device-flow time (it is the rendezvous
@@ -269,7 +264,7 @@ function writeAccountConfig(
   const existingAccounts = readAccountsMap(section);
   const hasNamedAccounts = Object.keys(existingAccounts).length > 0;
 
-  if (accountId === DEFAULT_ACCOUNT_ID && !hasNamedAccounts) {
+  if (accountId === DEFAULT_WEBCHANNEL_ACCOUNT_ID && !hasNamedAccounts) {
     // Merge at channel level (excluding the structural `accounts` map). Safe only
     // while no named accounts exist — a flat default is still servable then.
     const { accounts, ...flat } = section as { accounts?: unknown } & Record<string, unknown>;
@@ -400,8 +395,9 @@ export const webchannelSetup = {
       return;
     }
 
-    // Skip if per-account (or legacy-default) creds already exist.
-    const existingPath = resolveReadCredentialPath(id);
+    // Skip only if account-scoped creds already exist. The legacy single-file
+    // path is migration/runbook-only and is never read at runtime.
+    const existingPath = accountCredentialPath(id);
     const { existsSync } = await import("node:fs");
     if (existsSync(existingPath)) {
       runtime.log(

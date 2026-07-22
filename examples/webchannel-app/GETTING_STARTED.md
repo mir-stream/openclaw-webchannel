@@ -167,11 +167,10 @@ You should see:
 [app] relay mode: synadia (account A1b2c3…) → wss://connect.ngs.global
 [app] SaaS backend on http://127.0.0.1:4000
 [app] tenant=app-tenant account=agent-dev
-[app] admin token (for approving enrollments): 3f9a…      ← copy this
 ```
 
-Note the **admin token** — you need it to approve the agent in Step 6. (Set `ADMIN_TOKEN`
-yourself in the env to make it stable across restarts.)
+Configure `ENROLLMENT_ADMIN_TOKEN` before boot — you need it to approve the agent
+in Step 6. The operator routes fail closed with 503 when it is absent.
 
 ## Step 5 — Open the browser widget
 
@@ -221,7 +220,7 @@ openclaw channels add
 credentials, so it is **admin-gated** with the token from Step 4:
 
 ```bash
-curl -X POST -H "x-admin-token: <ADMIN_TOKEN>" \
+curl -X POST -H "Authorization: Bearer <ENROLLMENT_ADMIN_TOKEN>" \
   http://127.0.0.1:4000/admin/enrollments/WXYZ-1234/approve
 ```
 
@@ -247,7 +246,7 @@ replies over the E2E-encrypted NGS relay.
   account=agent-dev` and that the wizard used the same tenant and an audience of
   `agent-dev`.
 - **`401` when approving** → wrong/missing `x-admin-token`; use the token the server
-  printed at boot (or set `ADMIN_TOKEN`).
+  supplied through `ENROLLMENT_ADMIN_TOKEN`.
 - **`npm install` 401/403** → the PAT lacks `read:packages`, or `.npmrc` is missing the
   `@mir-stream:registry` line.
 - **Agent connects but never replies** → openclaw has no model provider configured. The

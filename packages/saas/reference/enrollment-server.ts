@@ -34,8 +34,11 @@
  *   - CORS is enabled for all origins. Restrict in production.
  */
 
-import { DeviceFlowEnrollment, MemoryEnrollmentStore } from "../src/device-flow-enrollment.js";
-import { MemoryAgentKeyRegistry } from "../src/agent-key-registry.js";
+import { DeviceFlowEnrollment } from "../src/device-flow-enrollment.js";
+import { MemoryEnrollmentRepository } from "../src/enrollment-repository.js";
+import { createReferenceEnrollmentHttpHandler } from "../src/enrollment-http-handler.js";
+import { serializeBootstrapResponse, serializeEnrollmentResponse } from "../src/p1-1-wire-adapter.js";
+import { escapeHtmlAttribute, renderApprovalTemplate } from "./approval-page-renderer.js";
 import { setupTrustChain } from "../src/setup-trust-chain.js";
 import { loadOrCreateTrustChain } from "../src/persistent-trust-chain.js";
 import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
@@ -204,9 +207,9 @@ async function signBootstrapJwt(payload: Record<string, unknown>): Promise<strin
 // Enrollment service
 // ---------------------------------------------------------------------------
 
-const enrollmentStore = new MemoryEnrollmentStore();
+const enrollmentRepository = new MemoryEnrollmentRepository();
 // F2: durable agent identity-key registry (see the demo server for rationale).
-const agentKeyRegistry = new MemoryAgentKeyRegistry();
+const agentKeyRegistry = enrollmentRepository;
 const enrollment = new DeviceFlowEnrollment({
   saasTrustChain: mockTrustChain,
   natsAccountConfig: mockNatsConfig,
@@ -217,8 +220,19 @@ const enrollment = new DeviceFlowEnrollment({
   natsUrl: NATS_URL,
   expirationSeconds: Number(process.env.EXPIRATION_SECONDS ?? 600),
   pollIntervalSeconds: Number(process.env.POLL_INTERVAL_SECONDS ?? 5),
-  store: enrollmentStore,
-  agentKeyRegistry,
+  repository: agentKeyRegistry,
+});
+const enrollmentAdminToken = process.env.ENROLLMENT_ADMIN_TOKEN;
+export const createReferenceEnrollmentHandler = createReferenceEnrollmentHttpHandler;
+const referenceAdminHandler = createReferenceEnrollmentHandler({
+  adminToken: enrollmentAdminToken, enrollment,
+  registry: agentKeyRegistry, bootstrap: () => ({ error: "bootstrap is handled by the session route" }),
+  async onApproved(userCode) {
+    markDemoEnroll(userCode, "approved");
+    const record = await enrollmentRepository.getEnrollmentByUserCode(userCode);
+    return { tenant: record?.tenant, accountId: record?.accountId };
+  },
+  onDenied(userCode) { markDemoEnroll(userCode, "denied"); },
 });
 
 // ---------------------------------------------------------------------------
@@ -228,7 +242,7 @@ const enrollment = new DeviceFlowEnrollment({
 function setCorsHeaders(res: any): void {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
 function sendJson(res: any, data: unknown, status = 200): void {
@@ -264,20 +278,16 @@ function parseJsonBody(req: any, callback: (body: unknown) => void): void {
 
 async function renderApprovalPage(userCode?: string): Promise<string> {
   const templatePath = join(__dirname, "enrollment-ui.html");
-  try {
-    const template = await readFile(templatePath, "utf-8");
-    if (userCode) {
-      return template.replaceAll("{{USER_CODE}}", userCode);
-    }
-    return template;
-  } catch (err) {
-    // Fallback inline template if file not found
-    return fallbackApprovalTemplate(userCode);
-  }
+  return renderApprovalTemplate({
+    templatePath,
+    userCode,
+    readTemplate: readFile,
+    fallback: fallbackApprovalTemplate,
+  });
 }
 
 function fallbackApprovalTemplate(userCode?: string): string {
-  const displayCode = userCode || "{{USER_CODE}}";
+  const displayCode = escapeHtmlAttribute(userCode || "{{USER_CODE}}");
   return `
 <!DOCTYPE html>
 <html lang="en">
@@ -345,7 +355,7 @@ function fallbackApprovalTemplate(userCode?: string): string {
     }
   </style>
 </head>
-<body>
+<body data-user-code="${displayCode}">
   <h1>🔐 WebChannel Plugin Enrollment</h1>
 
   <div class="info">
@@ -354,6 +364,7 @@ function fallbackApprovalTemplate(userCode?: string): string {
   </div>
 
   <div class="user-code">${displayCode}</div>
+  <label>Admin token <input id="admin-token" type="password" autocomplete="off"></label>
 
   <div class="button-group">
     <button class="approve" onclick="approveEnrollment()">✓ Approve</button>
@@ -363,28 +374,33 @@ function fallbackApprovalTemplate(userCode?: string): string {
   <div id="status"></div>
 
   <script>
-    const userCode = "${displayCode}";
+    const userCode = document.body.dataset.userCode || "";
+    let adminToken = "";
     const statusEl = document.getElementById("status");
 
-    async function approveEnrollment() {
+    async function approveEnrollment(replaceActivationId) {
       statusEl.className = "pending";
       statusEl.textContent = "Processing approval...";
 
       try {
         const res = await fetch("/approve", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_code: userCode })
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + (adminToken ||= document.getElementById("admin-token").value) },
+          body: JSON.stringify({ user_code: userCode, ...(replaceActivationId ? { replaceActivationId } : {}) })
         });
 
         const result = await res.json();
 
         if (result.success) {
           statusEl.className = "approved";
-          statusEl.innerHTML = "✓ Enrollment Approved!<br><br>" +
-            "Plugin: " + result.accountId + "<br>" +
-            "Tenant: " + result.tenant + "<br>" +
-            "Peer ID: " + result.peerId;
+          statusEl.textContent = "✓ Enrollment Approved!\nPlugin: " + (result.accountId || "N/A") + "\nTenant: " + (result.tenant || "N/A") + "\nPeer ID: " + (result.peerId || "N/A");
+          statusEl.style.whiteSpace = "pre-line";
+        } else if (res.status === 409 && result.error === "conflict") {
+          const when = result.enrolledAt ? new Date(result.enrolledAt).toISOString() : "unknown";
+          const warning = "This approval replaces existing agent key " + (result.fingerprint || "unknown") + " (enrolled " + when + "). Continue?";
+          statusEl.className = "denied";
+          statusEl.textContent = warning;
+          if (result.activationId && confirm(warning)) await approveEnrollment(result.activationId);
         } else {
           statusEl.className = "denied";
           statusEl.textContent = "✗ Approval failed: " + (result.error || "Unknown error");
@@ -402,7 +418,7 @@ function fallbackApprovalTemplate(userCode?: string): string {
       try {
         const res = await fetch("/deny", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + (adminToken ||= document.getElementById("admin-token").value) },
           body: JSON.stringify({ user_code: userCode })
         });
 
@@ -442,7 +458,7 @@ function fallbackApprovalTemplate(userCode?: string): string {
 //
 // Production-shaped mirror: the SaaS hosts BOTH the operator approval flow and the
 // embeddable chat widget. We keep a lightweight in-server view of enrollment
-// requests (the MemoryEnrollmentStore has no "list pending" API) so the admin panel
+// requests (the MemoryEnrollmentRepository has no "list pending" API) so the admin panel
 // can render live cards + Approve/Deny — a stand-in for a real SaaS dashboard.
 
 type DemoEnrollStatus = "pending" | "approved" | "denied";
@@ -564,7 +580,12 @@ function sessionUser(req: any): DemoUser | null {
 // HTTP server
 // ---------------------------------------------------------------------------
 
-const server = createServer(async (req, res) => {
+export const referenceEnrollmentRequestHandler = async (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => {
+  const delegatedPath = new URL(req.url ?? "/", "http://reference.invalid").pathname;
+  if (["/approve", "/deny", "/revoke"].includes(delegatedPath) || (req.method === "OPTIONS" && ["/approve", "/deny", "/revoke"].includes(delegatedPath))) {
+    await referenceAdminHandler(req, res);
+    return;
+  }
   // Enable CORS
   setCorsHeaders(res);
 
@@ -803,16 +824,15 @@ const server = createServer(async (req, res) => {
             // authenticate the register-delivered K. Omitted when the account has
             // no enrolled agent key yet (the client only requires it on the
             // register-hop path).
-            const agentPublicKey = await agentKeyRegistry.get(tenant, accountId);
+            const agentPublicKey = (await agentKeyRegistry.getActive(tenant, accountId))?.publicKey ?? null;
             console.log(
               `[bootstrap] issued JWT (kid=${bootstrapKid}) for ${user.username} peerId=${user.uuid}, account=${accountId}` +
                 (agentPublicKey ? " (+agentPublicKey pin)" : ""),
             );
-            sendJson(res, {
+            sendJson(res, serializeBootstrapResponse({
               jwt,
               peerId: user.uuid,
-              ...(agentPublicKey ? { agentPublicKey } : {}),
-            });
+            }, agentPublicKey));
           })
           .catch((err) => {
             console.error("[bootstrap] Error:", err);
@@ -835,8 +855,8 @@ const server = createServer(async (req, res) => {
         const enrollRequest = body as EnrollmentRequest;
 
         // Validate request
-        if (!enrollRequest.agentPublicKey || !enrollRequest.tenant) {
-          sendJson(res, { error: "Missing required fields: agentPublicKey, tenant" }, 400);
+        if (!enrollRequest.agentPublicKey || !enrollRequest.tenant || !enrollRequest.accountId) {
+          sendJson(res, { error: "Missing required fields: agentPublicKey, tenant, accountId" }, 400);
           return;
         }
 
@@ -844,9 +864,7 @@ const server = createServer(async (req, res) => {
         // cross tenant boundaries (subject-injection guard) — 400, not 500.
         try {
           assertValidSubjectToken(enrollRequest.tenant, "tenant");
-          if (enrollRequest.accountId !== undefined) {
-            assertValidSubjectToken(enrollRequest.accountId, "accountId");
-          }
+          assertValidSubjectToken(enrollRequest.accountId, "accountId");
         } catch (err) {
           sendJson(res, { error: (err as Error).message }, 400);
           return;
@@ -858,7 +876,7 @@ const server = createServer(async (req, res) => {
           .then((enrollResponse) => {
             console.log(`[enroll] Created enrollment: ${enrollResponse.user_code}`);
             trackDemoEnroll(enrollResponse.user_code, enrollRequest.tenant, enrollRequest.accountId);
-            sendJson(res, enrollResponse);
+            sendJson(res, serializeEnrollmentResponse(enrollResponse));
           })
           .catch((err) => {
             console.error("[enroll] Error:", err);
@@ -912,91 +930,6 @@ const server = createServer(async (req, res) => {
       const userCode = url.searchParams.get("user_code") || undefined;
       const html = await renderApprovalPage(userCode);
       sendHtml(res, html);
-      return;
-    }
-
-    // ---------------------------------------------------------------------
-    // POST /approve - Approve enrollment (operator → SaaS)
-    // ---------------------------------------------------------------------
-    if (path === "/approve" && req.method === "POST") {
-      parseJsonBody(req, (body) => {
-        if (!body || typeof body !== "object") {
-          sendJson(res, { success: false, error: "Invalid JSON body" }, 400);
-          return;
-        }
-
-        const { user_code } = body as { user_code?: string };
-
-        if (!user_code) {
-          sendJson(res, { success: false, error: "Missing user_code" }, 400);
-          return;
-        }
-
-        // Approve enrollment
-        enrollment
-          .approve(user_code)
-          .then((result) => {
-            if (result) {
-              console.log(`[approve] Approved enrollment: ${user_code}`);
-              markDemoEnroll(user_code, "approved");
-
-              // Get enrollment details for response
-              enrollmentStore.getEnrollmentByUserCode(user_code).then((enrollment) => {
-                sendJson(res, {
-                  success: true,
-                  peerId: result.peerId,
-                  tenant: enrollment?.tenant,
-                  accountId: enrollment?.accountId,
-                });
-              });
-            } else {
-              console.log(`[approve] Enrollment not found or expired: ${user_code}`);
-              sendJson(res, { success: false, error: "Enrollment not found or expired" }, 404);
-            }
-          })
-          .catch((err) => {
-            console.error("[approve] Error:", err);
-            sendJson(res, { success: false, error: "Internal server error" }, 500);
-          });
-      });
-      return;
-    }
-
-    // ---------------------------------------------------------------------
-    // POST /deny - Deny enrollment (operator → SaaS)
-    // ---------------------------------------------------------------------
-    if (path === "/deny" && req.method === "POST") {
-      parseJsonBody(req, (body) => {
-        if (!body || typeof body !== "object") {
-          sendJson(res, { success: false, error: "Invalid JSON body" }, 400);
-          return;
-        }
-
-        const { user_code } = body as { user_code?: string };
-
-        if (!user_code) {
-          sendJson(res, { success: false, error: "Missing user_code" }, 400);
-          return;
-        }
-
-        // Deny enrollment
-        enrollment
-          .deny(user_code)
-          .then((success) => {
-            if (success) {
-              console.log(`[deny] Denied enrollment: ${user_code}`);
-              markDemoEnroll(user_code, "denied");
-              sendJson(res, { success: true });
-            } else {
-              console.log(`[deny] Enrollment not found: ${user_code}`);
-              sendJson(res, { success: false, error: "Enrollment not found" }, 404);
-            }
-          })
-          .catch((err) => {
-            console.error("[deny] Error:", err);
-            sendJson(res, { success: false, error: "Internal server error" }, 500);
-          });
-      });
       return;
     }
 
@@ -1075,13 +1008,12 @@ const server = createServer(async (req, res) => {
           sendJson(res, { error: "Invalid JSON body" }, 400);
           return;
         }
-        const { tenant, accountId, peerId, deviceX25519PublicKey, devicePopPublicKey, agentPublicKey } = body as {
+        const { tenant, accountId, peerId, deviceX25519PublicKey, devicePopPublicKey } = body as {
           tenant?: string;
           accountId?: string;
           peerId?: string;
           deviceX25519PublicKey?: string;
           devicePopPublicKey?: string;
-          agentPublicKey?: string;
         };
         if (!tenant || !accountId || !peerId || !deviceX25519PublicKey) {
           sendJson(
@@ -1107,11 +1039,9 @@ const server = createServer(async (req, res) => {
         }
         signBootstrapJwt(claims as unknown as Record<string, unknown>)
           .then(async (jwt) => {
-            // F2: this test route bypasses enrollment, so the harness may supply the
-            // agent identity public key directly (the plugin's persisted
-            // `identityKey.publicKey`); otherwise fall back to the registry (if the
-            // harness DID enroll). Echoed so the browser can pin it for K auth.
-            const pin = agentPublicKey ?? (await agentKeyRegistry.get(tenant, accountId)) ?? undefined;
+            // The pin is registry-only. Caller-supplied key overrides are intentionally
+            // unsupported so this test route cannot produce a false-green trust path.
+            const pin = (await agentKeyRegistry.getActive(tenant, accountId))?.publicKey;
             console.log(`[test/bootstrap-jwt] issued JWT (kid=${bootstrapKid}) for peerId=${peerId}, tenant=${tenant}`);
             sendJson(res, { jwt, peerId, kid: bootstrapKid, ...(pin ? { agentPublicKey: pin } : {}) });
           })
@@ -1131,13 +1061,14 @@ const server = createServer(async (req, res) => {
     console.error("[server] Error:", err);
     sendJson(res, { error: "Internal server error" }, 500);
   }
-});
+};
+const server = createServer(referenceEnrollmentRequestHandler);
 
 // ---------------------------------------------------------------------------
 // Start server
 // ---------------------------------------------------------------------------
 
-server.listen(PORT, () => {
+export function startReferenceEnrollmentServer(): void { server.listen(PORT, () => {
   console.log("");
   console.log("==============================================");
   console.log("  WebChannel SaaS Enrollment Server");
@@ -1166,7 +1097,7 @@ server.listen(PORT, () => {
   console.log("  - This is a reference implementation using HTTP");
   console.log("  - Use TLS in production");
   console.log("  - Enrollment store is in-memory (use Redis/DB in production)");
-  console.log("  - No operator authentication (add in production)");
+  console.log("  - Operator actions require ENROLLMENT_ADMIN_TOKEN; when unset they are unavailable (503)");
   console.log("  - CORS enabled for all origins (restrict in production)");
   console.log("");
   console.log("Press Ctrl+C to stop");
@@ -1189,12 +1120,14 @@ server.listen(PORT, () => {
     console.warn("################################################################");
     console.warn("");
   }
-});
+}); }
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) startReferenceEnrollmentServer();
 
 // Graceful shutdown
-process.on("SIGINT", () => {
+if (process.argv[1] === fileURLToPath(import.meta.url)) process.on("SIGINT", () => {
   console.log("\n\nShutting down server...");
-  enrollmentStore.close(); // stop the A1 background sweeper
+  enrollmentRepository.close(); // stop the A1 background sweeper
   server.close(() => {
     console.log("Server stopped");
     process.exit(0);

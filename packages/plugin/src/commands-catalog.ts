@@ -110,13 +110,12 @@ export function buildCommandCatalog(cfg: unknown): CommandCatalogEntry[] {
  * ---------------
  * The catalog is a PURE function of `cfg`, and a gateway process's config is
  * fixed for its lifetime. The `load_commands` handler, by contrast, runs inline
- * on the inbound dispatch path for ANY handshaken peer — including wildcard /
- * `admission:"auto"` peers who never register (the deliberate exposure decision
- * at the wiring site). Building the catalog per request therefore spun the
- * native-command registry list + sort on the event loop for every frame, so a
- * peer could flood `load_commands` and turn discovery into an event-loop DoS
- * surface. Memoizing removes that surface without a rate limiter: the first
- * request pays the build, every later request is a cached read.
+ * on the inbound dispatch path for every registered peer. Building the catalog
+ * per request therefore spun the native-command registry list + sort on the
+ * event loop for every frame, so a peer could flood `load_commands` and turn
+ * discovery into an event-loop DoS surface. Memoizing removes that surface
+ * without a rate limiter: the first request pays the build, every later request
+ * is a cached read.
  *
  * DESIGN CHOICES
  * --------------

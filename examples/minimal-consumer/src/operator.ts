@@ -8,11 +8,14 @@
  * the enrollment object mints the correctly-scoped NATS creds internally.
  */
 
+import type { IncomingMessage, ServerResponse } from "node:http";
+
 import {
   setupTrustChain,
   loadOrCreateTrustChain,
   DeviceFlowEnrollment,
-  MemoryEnrollmentStore,
+  MemoryEnrollmentRepository,
+  EnrollmentValidationError,
   buildBootstrapClaims,
   generateRsaKeypair,
   type SetupTrustChainResult,
@@ -21,7 +24,90 @@ import {
   type DeviceFlowError,
   type BootstrapClaims,
   type JwkRsaPublicKey,
+  type AgentKeyRegistry,
 } from "@mir-stream/webchannel-saas";
+
+async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  let raw = "";
+  for await (const chunk of req) raw += chunk;
+  if (!raw) return {};
+  const value: unknown = JSON.parse(raw);
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new SyntaxError("invalid JSON body");
+  return value as Record<string, unknown>;
+}
+
+function json(res: ServerResponse, status: number, value: unknown): void {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(value));
+}
+
+type MinimalEnrollmentHandlerOptions = {
+  enrollment: Pick<DeviceFlowEnrollment, "enroll" | "poll" | "approve" | "deny">;
+  registry: Pick<AgentKeyRegistry, "revokeActive">;
+  bootstrap: () => Promise<Record<string, unknown>> | Record<string, unknown>;
+  adminToken?: string;
+};
+
+/** A real downstream HTTP handler composed only from public barrel symbols. */
+export function createMinimalConsumerEnrollmentHandler(options: MinimalEnrollmentHandlerOptions) {
+  const adminToken = options.adminToken ?? process.env.ENROLLMENT_ADMIN_TOKEN;
+  return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    try {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      if (req.method === "OPTIONS") { res.statusCode = 204; res.end(); return; }
+      const path = new URL(req.url ?? "/", "http://minimal.invalid").pathname;
+      const admin = req.method === "POST" && ["/approve", "/deny", "/revoke"].includes(path);
+      if (admin) {
+        if (!adminToken) return json(res, 503, { error: "enrollment admin token is not configured" });
+        if (req.headers.authorization !== `Bearer ${adminToken}`) return json(res, 401, { error: "unauthorized" });
+      }
+      const payload = req.method === "POST" ? await readJson(req) : {};
+      if (req.method !== "POST") return json(res, 404, { error: "not found" });
+      if (path === "/enroll") {
+        try {
+          const response = await options.enrollment.enroll(payload as never);
+          return json(res, 200, { device_code: response.device_code, user_code: response.user_code, verification_uri: response.verification_uri, verification_uri_complete: response.verification_uri_complete, expires_in: response.expires_in, interval: response.interval });
+        } catch (error) {
+          if (error instanceof EnrollmentValidationError) return json(res, 400, { error: error.message });
+          throw error;
+        }
+      }
+      if (path === "/poll") {
+        const result = await options.enrollment.poll(payload as never);
+        return json(res, "error" in result ? 400 : 200, result);
+      }
+      if (path === "/bootstrap") return json(res, 200, await options.bootstrap());
+      if (path === "/approve") {
+        const replaceActivationId = typeof payload.replaceActivationId === "string" ? payload.replaceActivationId : undefined;
+        const outcome = await options.enrollment.approve(String(payload.user_code ?? ""), replaceActivationId ? { replaceActivationId } : {});
+        switch (outcome.kind) {
+          case "conflict": return json(res, 409, { error: "conflict", activationId: outcome.existing?.activationId ?? null, fingerprint: outcome.existing?.keyIdFingerprint ?? null, enrolledAt: outcome.existing?.enrolledAt ?? null });
+          case "in_progress": return json(res, 409, { error: "approval_in_progress", error_description: "Approval in progress, retry shortly" });
+          case "revoked_key": return json(res, 410, { error: "revoked_key" });
+          case "rejected": return json(res, 404, { error: "rejected" });
+          case "approved": return json(res, 200, { approved: true, peerId: outcome.result.peerId });
+          default: { const exhaustive: never = outcome; return exhaustive; }
+        }
+      }
+      if (path === "/deny") {
+        const denied = await options.enrollment.deny(String(payload.user_code ?? ""));
+        return json(res, denied ? 200 : 404, { denied });
+      }
+      if (path === "/revoke") {
+        const revoked = await options.registry.revokeActive(String(payload.tenant ?? ""), String(payload.accountId ?? ""));
+        return json(res, revoked ? 200 : 404, { revoked });
+      }
+      return json(res, 404, { error: "not found" });
+    } catch (error) {
+      if (error instanceof SyntaxError) return json(res, 400, { error: "invalid JSON body" });
+      if (!res.headersSent) return json(res, 500, { error: "internal server error" });
+      if (!res.writableEnded) res.end();
+    }
+  };
+}
 
 /** Rotate the JWKS signing key without rebuilding the whole trust chain. */
 export async function rotateSigningKey(): Promise<JwkRsaPublicKey> {
@@ -57,7 +143,7 @@ export async function runOperatorEnrollment(): Promise<EnrollmentResult> {
     jwksUrl: "https://saas.example.com/.well-known/jwks.json",
     bootstrapUrl: "https://saas.example.com/bootstrap",
     natsUrl: "wss://nats.example.com",
-    store: new MemoryEnrollmentStore({ autoSweep: false }),
+    repository: new MemoryEnrollmentRepository({ autoSweep: false }),
   });
 
   const started = await enrollment.enroll({
@@ -69,8 +155,13 @@ export async function runOperatorEnrollment(): Promise<EnrollmentResult> {
   });
 
   const approved = await enrollment.approve(started.user_code);
-  if (!approved) {
-    throw new Error("operator approval failed");
+  switch (approved.kind) {
+    case "approved": break;
+    case "conflict": throw new Error(`operator approval conflict: ${JSON.stringify({ status: 409, activationId: approved.existing?.activationId ?? null, fingerprint: approved.existing?.keyIdFingerprint ?? null, enrolledAt: approved.existing?.enrolledAt ?? null })}`);
+    case "in_progress": throw new Error(`operator approval failed: ${JSON.stringify({ status: 409, error: "approval_in_progress" })}`);
+    case "revoked_key": throw new Error(`operator approval failed: ${JSON.stringify({ status: 410, error: "revoked_key" })}`);
+    case "rejected": throw new Error(`operator approval failed: ${JSON.stringify({ status: 404, error: "rejected" })}`);
+    default: { const exhaustive: never = approved; throw new Error(String(exhaustive)); }
   }
 
   const result = await enrollment.poll({ device_code: started.device_code });

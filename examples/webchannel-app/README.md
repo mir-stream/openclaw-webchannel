@@ -99,13 +99,12 @@ approve via `POST /admin/enrollments/<code>/approve`, then `openclaw gateway`.
 Once the agent subscribes, the PoP register completes and the lane goes live.
 
 The approve route returns **tenant-wide agent credentials**, so it is
-**admin-gated**: it requires an `x-admin-token` header (or
-`Authorization: Bearer`) equal to `ADMIN_TOKEN`. Set `ADMIN_TOKEN` in the env, or
-let the server auto-generate one and print it at boot
-(`[app] admin token (for approving enrollments): …`). Approve with:
+**admin-gated**: it requires `Authorization: Bearer <token>` equal to
+`ENROLLMENT_ADMIN_TOKEN`. The routes fail closed with 503 when the variable is
+unset. Approve with:
 
 ```bash
-curl -X POST -H "x-admin-token: <ADMIN_TOKEN>" \
+curl -X POST -H "Authorization: Bearer <ENROLLMENT_ADMIN_TOKEN>" \
   http://127.0.0.1:4000/admin/enrollments/<USER_CODE>/approve
 ```
 

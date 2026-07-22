@@ -160,7 +160,7 @@ side is now covered (see below), so what remains is specifically **agent-down me
   down / not subscribed** is still lost — the client replay only helps if the client is the one that
   reconnects; nothing spools the inbound subject on the agent side. The register handler sends a
   history snapshot on (re)connect, papering over *some* browser-side loss, and `nats-channel.ts`
-  drops inbound before handshake. There is **no JetStream stream and no disk spool** — no NATS-native
+  drops inbound before registration. There is **no JetStream stream and no disk spool** — no NATS-native
   retention, no processed-offset, no claim/lease.
 
 **Telegram reference (the durability model to adopt).**
@@ -184,7 +184,7 @@ side is now covered (see below), so what remains is specifically **agent-down me
 **Implementation sketch.**
 1. **Evaluate JetStream** for the inbound subject (durable, replay on reconnect) — this may be the
    highest-leverage single change; check whether the deployed nats-server has JetStream enabled.
-2. If not JetStream: on receipt (post-handshake), `ChannelIngressQueue.write` before dispatch;
+2. If not JetStream: on receipt (post-registration), `ChannelIngressQueue.write` before dispatch;
    `claim` → run turn → `release`/`fail`; recover claims from dead processes on startup.
 3. ✅ **P0-7 (client replay + ingress dedupe + ack) is already built** — the two ends already give
    end-to-end at-least-once + idempotent for the *client-reconnect* case. P2-4 adds only the
@@ -263,7 +263,7 @@ no redaction helper, no `ChannelStatusIssue`/status-patch telemetry.
 1. **Redaction discipline:** a `stringifyWebchannelForLog` that guarantees no plaintext message
    content / creds hit logs (critical given E2E — the relay never sees plaintext, so neither should
    logs). Model on `raw-update-log.ts:75`.
-2. **Security-audit collector:** flag risky config (admission=auto + open dmSecurity — already
+2. **Security-audit collector:** flag risky config (admission:register-hop + open dmSecurity — already
    warned at `index-nats.ts:625`; formalize into findings), unset approvers with execApprovals on,
    etc.
 3. **Status telemetry:** publish channel status via `gateway-runtime` status-patch (connected,

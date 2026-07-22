@@ -88,7 +88,23 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
     // The control-lane branch bypasses the debouncer/onFlush, so it acks its own
     // id-carrying frame directly (else its ledger entry never drains).
     expect(INDEX_NATS_SOURCE).toMatch(
-      /if\s*\(message\.id\)\s*channel\.sendAck\(peerId,\s*\[message\.id\]\)/,
+      /if\s*\(message\.id\s*&&\s*!channel\.sendAck\(peerId,\s*\[message\.id\]\)\)/,
     );
+    expect(INDEX_NATS_SOURCE.match(/control-lane ack failed/g)).toHaveLength(1);
+  });
+});
+
+describe("index-nats.ts wiring contract — approval decision account routing", () => {
+  it("threads the runtime accountId into handleApprovalDecision", () => {
+    expect(INDEX_NATS_SOURCE).toMatch(
+      /setApprovalDecisionHandler\(\(peerId, id, decision\) =>[\s\S]*?handleApprovalDecision\(api\.config, id, decision, peerId, accountId\)/,
+    );
+  });
+});
+
+describe("index-nats.ts browser-route absence", () => {
+  it("contains no gateway HTTP route registration or socket-upgrade wiring", () => {
+    expect(INDEX_NATS_SOURCE).not.toContain("registerHttpRoute");
+    expect(INDEX_NATS_SOURCE.toLowerCase()).not.toContain("upgrade route");
   });
 });

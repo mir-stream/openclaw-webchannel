@@ -6,6 +6,7 @@ import { createInboundDebouncer } from "openclaw/plugin-sdk/reply-runtime";
 import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
 
 import {
+  CancelledInboundFallbackTombstones,
   filterFreshInboundItems,
   createIngressOnFlush,
   recordCancelledInboundItems,
@@ -64,6 +65,74 @@ function fakeChecker() {
   );
   return { checkAndRecord, calls };
 }
+
+describe("cancelled inbound fallback tombstones", () => {
+  it("does not register when only the ack fails, and warns once", async () => {
+    const fallback = new CancelledInboundFallbackTombstones();
+    const warn = vi.fn();
+    await recordCancelledInboundItems(
+      [item("p", "killed", "id")], "acct", async () => true, () => false, warn, fallback,
+    );
+    expect(fallback.size).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("record-only failure registers, suppresses replay, and removes only after record+ack succeed", async () => {
+    const fallback = new CancelledInboundFallbackTombstones();
+    await recordCancelledInboundItems(
+      [item("p", "killed", "id")], "acct",
+      async () => { throw new Error("disk"); }, () => true, undefined, fallback,
+    );
+    expect(fallback.size).toBe(1);
+    const dispatch = vi.fn();
+    const onFlush = createIngressOnFlush<Item>({
+      accountId: "acct", checkAndRecord: async () => true, dispatch,
+      coalesce: coalesceUserMessages, sendAck: () => true, cancelledFallback: fallback,
+    });
+    await onFlush([item("p", "replay", "id")]);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(fallback.size).toBe(0);
+  });
+
+  it("simultaneous failure remains until a later replay has both successes", async () => {
+    const fallback = new CancelledInboundFallbackTombstones();
+    await recordCancelledInboundItems(
+      [item("p", "killed", "id")], "acct",
+      async () => { throw new Error("disk"); }, () => false, undefined, fallback,
+    );
+    const dispatch = vi.fn();
+    const failedReplay = createIngressOnFlush<Item>({
+      accountId: "acct", checkAndRecord: async () => true, dispatch,
+      coalesce: coalesceUserMessages, sendAck: () => false, cancelledFallback: fallback,
+    });
+    await failedReplay([item("p", "replay", "id")]);
+    expect(fallback.size).toBe(1);
+    const recoveredReplay = createIngressOnFlush<Item>({
+      accountId: "acct", checkAndRecord: async () => true, dispatch,
+      coalesce: coalesceUserMessages, sendAck: () => true, cancelledFallback: fallback,
+    });
+    await recoveredReplay([item("p", "replay", "id")]);
+    expect(fallback.size).toBe(0);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("isolates accounts, rejects oversized ids, and evicts the oldest at cap with one warn", async () => {
+    const warn = vi.fn();
+    const accountA = new CancelledInboundFallbackTombstones(warn, 2);
+    const accountB = new CancelledInboundFallbackTombstones(undefined, 2);
+    const fail = async () => { throw new Error("disk"); };
+    await recordCancelledInboundItems([item("p", "x", "same")], "a", fail, () => true, undefined, accountA);
+    expect(accountA.size).toBe(1);
+    expect(accountB.size).toBe(0);
+    await recordCancelledInboundItems([item("p", "x", "x".repeat(129))], "a", fail, () => true, undefined, accountA);
+    expect(accountA.size).toBe(1);
+    await recordCancelledInboundItems([item("p", "x", "second")], "a", fail, () => true, undefined, accountA);
+    await recordCancelledInboundItems([item("p", "x", "third")], "a", fail, () => true, undefined, accountA);
+    expect(accountA.size).toBe(2);
+    expect(accountA.has("p:same")).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("filterFreshInboundItems", () => {
   it("keeps every item, in order, when all are fresh", async () => {
@@ -341,7 +410,7 @@ describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messag
       [item("p1", "killed-a", "idA"), item("p1", "killed-b", "idB")],
       "acctZ",
       checkAndRecord,
-      (peerId, ids) => acks.push({ peerId, ids }),
+      (peerId, ids) => { acks.push({ peerId, ids }); return true; },
     );
     expect(calls).toEqual([
       { key: "p1:idA", namespace: "acctZ" },
@@ -360,7 +429,7 @@ describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messag
       [item("p1", "killed", "idA")],
       "acct",
       checkAndRecord,
-      (_peerId, ids) => order.push(`ack:${ids.join(",")}`),
+      (_peerId, ids) => { order.push(`ack:${ids.join(",")}`); return true; },
     );
     expect(order).toEqual(["record:p1:idA", "ack:idA"]);
   });
@@ -372,7 +441,7 @@ describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messag
       [item("p1", "no-id")],
       "acct",
       checkAndRecord,
-      (peerId, ids) => acks.push({ peerId, ids }),
+      (peerId, ids) => { acks.push({ peerId, ids }); return true; },
     );
     expect(checkAndRecord).not.toHaveBeenCalled();
     expect(acks).toEqual([]);
@@ -388,7 +457,7 @@ describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messag
       [item("p1", "killed", "idA")],
       "acct",
       checkAndRecord,
-      (peerId, ids) => acks.push({ peerId, ids }),
+      (peerId, ids) => { acks.push({ peerId, ids }); return true; },
       log,
     );
     // Record threw, but the ack still fires (drains the ledger) and a warn is logged.
@@ -403,7 +472,7 @@ describe("recordCancelledInboundItems — P0-7b (/stop-cancelled buffered messag
       [item("p1", "a", "id1"), item("p2", "b", "id2"), item("p1", "c", "id3")],
       "acct",
       checkAndRecord,
-      (peerId, ids) => acks.push({ peerId, ids }),
+      (peerId, ids) => { acks.push({ peerId, ids }); return true; },
     );
     expect(acks).toEqual([
       { peerId: "p1", ids: ["id1", "id3"] },
@@ -443,6 +512,7 @@ describe("createIngressOnFlush — P0-7b ingress ACK (fresh + duplicate ids acke
         sendAck: (peerId, ids) => {
           acks.push({ peerId, ids });
           order.push("ack");
+          return true;
         },
       }),
     });

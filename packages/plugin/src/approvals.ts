@@ -70,15 +70,15 @@ import type {
   ChannelOutboundPayloadHint,
 } from "openclaw/plugin-sdk/channel-runtime";
 
-import { WEBCHANNEL_ID, ANON_PEER_ID } from "./transport.js";
+import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type {
-  WebChannelTransport,
+  WebChannelPeerChannel,
   ApprovalDecision,
   ApprovalOption,
   ApprovalRequestPayload,
-} from "./transport.js";
+} from "./channel-contract.js";
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   listWebchannelAccountIds,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
@@ -93,7 +93,7 @@ import {
  */
 export type ResolveAccountTransport = (
   accountId: string | null | undefined,
-) => WebChannelTransport | undefined;
+) => WebChannelPeerChannel | undefined;
 
 /**
  * approvalId → account it was DELIVERED on (S1 adversarial-round F1). The
@@ -117,7 +117,7 @@ const deliveredApprovalAccounts = new Map<string, string>();
 
 /** Normalize an account id for binding comparison (null/unscoped ⇒ "default"). */
 function bindingAccountKey(accountId: string | null | undefined): string {
-  return accountId ?? DEFAULT_ACCOUNT_ID;
+  return accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
 }
 
 /**
@@ -149,7 +149,7 @@ function recordApprovalAccount(approvalId: string, accountId: string | null | un
 
 /**
  * PENDING-APPROVAL STORE — the authority behind the register-time
- * `approval_snapshot` frame (docs/APPROVAL_REHYDRATION_PLAN.md).
+ * `approval_snapshot` frame (docs/archive/APPROVAL_REHYDRATION_PLAN.md).
  *
  * The plugin observes every approval's full lifecycle (`deliverPending` →
  * `updateEntry`) with the complete wire payload in hand, so it can keep an
@@ -524,7 +524,7 @@ function readExecApprovals(
   agentFilter?: string[];
   sessionFilter?: string[];
 } | undefined {
-  const account = resolveWebchannelAccountConfig(cfg, accountId ?? DEFAULT_ACCOUNT_ID);
+  const account = resolveWebchannelAccountConfig(cfg, accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
   return account.execApprovals as ReturnType<typeof readExecApprovals>;
 }
 
@@ -682,15 +682,14 @@ export function buildApprovalRequestPayload(
 
 /**
  * Build the strongly typed native runtime spec. `transport` is captured in the
- * closure so delivery/finalize go straight to our WebSocket session map — we do
+ * closure so delivery/finalize go straight to our NATS peer channel — we do
  * not need the gateway-supplied `context` (which other channels use to reach a
- * platform client). The delivery target resolves to the ORIGINATING peer's web
- * session (see `prepareTarget` / the capability's `resolveOriginTarget`), so
- * with multiple concurrent users each approval prompt reaches the user who
- * triggered it.
+ * platform client). The delivery target resolves to the ORIGINATING peer (see
+ * the capability's `resolveOriginTarget`), so with multiple concurrent users
+ * each approval prompt reaches the user who triggered it.
  */
 export function createClawApprovalNativeRuntimeSpec(
-  transport: WebChannelTransport,
+  transport: WebChannelPeerChannel,
   resolveAccountTransport?: ResolveAccountTransport,
 ): ChannelApprovalNativeRuntimeSpec<
   ApprovalRequestPayload, // TPendingPayload
@@ -708,13 +707,13 @@ export function createClawApprovalNativeRuntimeSpec(
   // frame — it must NEVER fall back to the closure `transport` (the primary
   // channel), or an account that `registerFull` skipped (creds-missing /
   // connect-fail) would have its prompt delivered on the PRIMARY account's
-  // channel — re-opening the exact cross-account misroute S1 closes. Only the
-  // legacy single-transport WS entry (no resolver) uses the closure transport,
-  // where there is exactly one account and no misroute is possible.
+  // channel — re-opening the exact cross-account misroute S1 closes. Only a
+  // resolver-less single-channel wiring uses the closure transport, where
+  // there is exactly one account and no misroute is possible.
   const hasResolver = typeof resolveAccountTransport === "function";
   const transportFor = (
     accountId: string | null | undefined,
-  ): WebChannelTransport | undefined =>
+  ): WebChannelPeerChannel | undefined =>
     hasResolver ? resolveAccountTransport!(accountId) : transport;
   return {
     // We can render BOTH exec and plugin approvals natively in the widget.
@@ -767,7 +766,7 @@ export function createClawApprovalNativeRuntimeSpec(
           // Scope the dedupe key by account: the SAME peerId registered on two
           // accounts is two distinct delivery targets (each account's channel),
           // never one deduped entry.
-          dedupeKey: `${WEBCHANNEL_ID}:${accountId ?? DEFAULT_ACCOUNT_ID}:${sessionKey}`,
+          dedupeKey: `${WEBCHANNEL_ID}:${accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}:${sessionKey}`,
           target: { sessionKey },
         };
       },
@@ -792,20 +791,20 @@ export function createClawApprovalNativeRuntimeSpec(
           // Refuse to misroute onto the primary channel; drop with a warn.
           console.warn(
             `[webchannel] approval ${pendingPayload.id} not delivered: no live channel for ` +
-              `account "${accountId ?? DEFAULT_ACCOUNT_ID}" (skipped or unknown) — refusing to misroute`,
+              `account "${accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}" (skipped or unknown) — refusing to misroute`,
           );
           return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
         }
-        // Fail-closed: with 2+ connections and an absent `turnSourceTo` the
-        // target falls back to `web-anon`, `soleOpenSocket` returns undefined,
-        // and the prompt is correctly DROPPED rather than misrouted. That drop
-        // is otherwise invisible, so log it (no logger in scope here; match the
-        // transport's `[webchannel]` console style — src/transport.ts safeSend).
+        // Fail-closed: with 2+ registered peers and an absent `turnSourceTo`
+        // the target falls back to `web-anon`, `sendApprovalRequest` returns
+        // false (no such registered peer), and the prompt is correctly DROPPED
+        // rather than misrouted. That drop is otherwise invisible, so log it
+        // (no logger in scope here; match the `[webchannel]` console style).
         const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload);
         if (!delivered) {
           console.warn(
             `[webchannel] approval ${pendingPayload.id} not delivered: no matching open ` +
-              `socket for "${sessionKey}" (account "${accountId ?? DEFAULT_ACCOUNT_ID}")`,
+              `socket for "${sessionKey}" (account "${accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}")`,
           );
         }
         return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
@@ -842,7 +841,7 @@ export function createClawApprovalNativeRuntimeSpec(
         if (!channel) {
           console.warn(
             `[webchannel] approval ${entry.approvalId} resolve frame dropped: no live channel ` +
-              `for account "${accountId ?? entry.accountId ?? DEFAULT_ACCOUNT_ID}"`,
+              `for account "${accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}"`,
           );
           return;
         }
@@ -879,7 +878,7 @@ export function createClawApprovalNativeRuntimeSpec(
  * createDiscordApprovalCapability (discord/src/approval-native.ts).
  */
 export function createClawApprovalCapability(
-  transport: WebChannelTransport,
+  transport: WebChannelPeerChannel,
   resolveAccountTransport?: ResolveAccountTransport,
 ) {
   const nativeRuntime = createLazyChannelApprovalNativeRuntimeAdapter({
