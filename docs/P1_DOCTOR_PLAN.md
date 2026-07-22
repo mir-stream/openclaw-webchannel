@@ -333,6 +333,22 @@ Every check names the EFFECTIVE (post-`resolveEffectiveAccountAuth`) values and
 carries a fix hint. Per-account checks run over `planAccounts(cfg)`; C5/C10 are
 cross-account/config-layout.
 
+> **Catalog rows are PRE-REBASE spec.** This catalog was converged against
+> pre-merge-train `develop`. The rebase onto post-PR-#40 `develop` (P0-1/P0-2
+> merged; P0-3 still pending) removed three rows from the implementation, and
+> the rows below are kept as the spec's historical record, not "corrected":
+> **C3a** `register-hop-static-unsupported` — any static credential signal now
+> THROWS in `resolveNatsCredentialSource` (fail-closed until P0-3), so the
+> condition is unreachable and a static config surfaces as C9
+> `credential-source-invalid`; **C6** `open-admission` — the admission axis
+> (`nats.admission`, its mode resolver, `auto`) was removed outright, and
+> register-hop is the only path; **C8** `auth-strategy-invalid` — its premise
+> (non-jwt silently downgrades to `auto`) no longer exists: the serving loop
+> verifies EVERY account via `assertJwtAuthConfig`, so a non-jwt/missing auth
+> block hard-skips and surfaces as C4 `verifier-unbuildable` (now
+> unconditional per account). The mirror-fidelity rule and the remaining rows
+> stand; the drift guard in `index-nats-wiring.test.ts` pins today's 5 skips.
+
 | # | checkId | Condition (source) | kind / severity | Fix hint |
 |---|---------|--------------------|-----------------|----------|
 | C1 | `encryption-disabled` | `resolveEncryptionPolicy` throws (`encryption.mode:"disabled"`) — `index-nats.ts:325-334` | config / error | Remove the `encryption.mode` override — the NATS channel is encrypt-by-construction |
@@ -343,7 +359,7 @@ cross-account/config-layout.
 | C5 | `shared-audience` | two register-hop jwt accounts share slash-normalized (issuer, audience) — `index-nats.ts:425-452` | config / **error** (deliberate escalation — see below) | Give each register-hop account a distinct audience (= its accountId); names BOTH accounts |
 | C6 | `open-admission` | admission=auto AND `isDmPostureOpen(dmSecurity)` (`dm-allowlist.ts:55`) — `index-nats.ts:775-780` | intent / warn | Set `dmSecurity:"allowlist"` and populate `allowFrom`, or rely on NATS subject permissions deliberately |
 | C7 | `obsolete-cors` | `auth.cors` present — `index-nats.ts:309-317` | config / warn | Delete the `auth.cors` block (register hop moved to NATS; origin allowlisting is inert) |
-| C8 | `auth-strategy-invalid` | non-jwt `auth.strategy`, classified CONTEXTUALLY (review finding 9): (a) explicit `nats.admission:"register-hop"` override + non-jwt → **error** (verifier construction will fail; account skipped); (b) `strategy:"anonymous"`/unknown with NO explicit admission → **warn**: "auth is ignored; admission silently became `auto`" (`resolveAdmissionMode` defaults non-jwt→auto, `nats-admission.ts:68`; `resolveVerifier` would throw, `auth.ts:309`, but is never called for auto); (c) intentional auto/static BYO-NATS with no auth block at all → **no finding** | config / error-or-warn | (a) use `strategy:"jwt"`; (b) remove the inert auth block or switch to jwt; (c) — |
+| C8 | `auth-strategy-invalid` | non-jwt `auth.strategy`, classified CONTEXTUALLY (review finding 9): (a) explicit `nats.admission:"register-hop"` override + non-jwt → **error** (verifier construction will fail; account skipped); (b) `strategy:"anonymous"`/unknown with NO explicit admission → **warn**: "auth is ignored; admission silently became `auto`" (the admission-mode resolver defaults non-jwt→auto, `nats-admission.ts:68`; `resolveVerifier` would throw, `auth.ts:309`, but is never called for auto); (c) intentional auto/static BYO-NATS with no auth block at all → **no finding** | config / error-or-warn | (a) use `strategy:"jwt"`; (b) remove the inert auth block or switch to jwt; (c) — |
 | C9 | `credential-source-invalid` | `resolveNatsCredentialSource` throws (unreadable creds file `nats-credential-source.ts:280`; incomplete static jwt/seed `:293`) — the serving loop catch-skips the whole block (`index-nats.ts:392-398`) (review finding 8) | config / error | From the thrown message (file path / missing field named) |
 | C10 | `orphaned-default` | the orphaned-default shape ONLY (rev2 finding 6 — do not string-route arbitrary sink warnings): refactor `warnOnOrphanedDefault` (`multiplex.ts:96-111`) into an exported pure predicate `detectOrphanedDefault(cfg): boolean` + a warn wrapper, so serving loop and doctor share ONE detector. Condition: channel-level auth/nats beside named accounts, no `accounts.default` | config / warn | Move the intended default's fields under `accounts.default` |
 | C11 | `deprecated-acquisition-env` | deprecated acquisition env vars set while `channels.webchannel` config exists — they are IGNORED (`acquisition-env.ts:74-84`; detect via the same `ACQUISITION_IDENTITY_ENV_KEYS` + has-config predicate, not the once-only warn sink whose `deprecationWarned` latch would suppress repeat scans) | config / warn | Unset the deprecated env vars (named in the message); config is authoritative — use `openclaw channels add` |
