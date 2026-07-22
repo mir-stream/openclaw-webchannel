@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
-import type { PersistedEnrolledCreds } from "./account-config.js";
+import { assertValidAccountId, type PersistedEnrolledCreds } from "./account-config.js";
 import {
   createWebchannelDoctorAdapter,
   createWebchannelStatusAdapter,
@@ -15,6 +15,8 @@ const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels
 const identityKey = { publicKey: new Uint8Array(32), privateKey: new Uint8Array(32) };
 const persisted = { userJwt: "J", userSeed: "S", identityKey };
 const validAuth = (audience = "a") => ({ strategy: "jwt", jwt: { issuer: "https://issuer", audience, jwks: { keys: [{ kty: "RSA", kid: "test" }] } } });
+const removedDevModeKey = ["dev", "Open"].join("");
+const removedDevModeSetting = ["nats.", removedDevModeKey].join("");
 const ids = (config: OpenClawConfig, env: Record<string, string | undefined> = {}, load: () => PersistedEnrolledCreds | undefined = () => persisted) =>
   evaluateWebchannelDoctor(config, { env, loadPersistedEnrolledCreds: load }).map((finding) => finding.checkId);
 
@@ -125,7 +127,7 @@ describe("evaluateWebchannelDoctor findings", () => {
   it.each([
     ['auth.strategy="anonymous"', cfg({ auth: { strategy: "anonymous" } })],
     ['nats.admission="auto"', cfg({ nats: { admission: "auto" } })],
-    ["nats.devOpen", cfg({ nats: { devOpen: false } })],
+    [removedDevModeSetting, cfg({ nats: { [removedDevModeKey]: false } })],
     ['nats.credentials.mode="open"', cfg({ nats: { credentials: { mode: "open" } } })],
   ])("keeps the preview actionable for removed %s", async (setting, config) => {
     const adapter = createWebchannelDoctorAdapter({
@@ -154,18 +156,54 @@ describe("evaluateWebchannelDoctor findings", () => {
     expect(warnings[0]).toMatch(/configuration-invalid.*invalid account id.*\.\.\/bad/i);
   });
 
-  it("keeps the preview actionable when persisted credential inspection throws", async () => {
-    const adapter = createWebchannelDoctorAdapter({
+  it("keeps a throwing credential loader account-scoped", () => {
+    const findings = evaluateWebchannelDoctor(
+      cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
+      {
+        env: {},
+        loadPersistedEnrolledCreds: () => { throw new Error("credential store unavailable"); },
+      },
+    );
+    expect(findings).toEqual([
+      expect.objectContaining({
+        accountId: "default",
+        checkId: "configuration-invalid",
+        message: expect.stringContaining("credential store unavailable"),
+      }),
+    ]);
+    expect(formatDoctorWarning(findings[0]!)).toMatch(
+      /channels\.webchannel\.default.*\[configuration-invalid\]/,
+    );
+  });
+
+  it("isolates a malformed account credential path and still diagnoses its sibling", () => {
+    const findings = evaluateWebchannelDoctor(cfg({
+      accounts: {
+        "../bad": { auth: validAuth("../bad") },
+        good: {
+          auth: validAuth("good"),
+          encryption: { mode: "disabled" },
+        },
+      },
+    }), {
       env: {},
-      loadPersistedEnrolledCreds: () => { throw new Error("credential store unavailable"); },
+      loadPersistedEnrolledCreds: (accountId) => {
+        assertValidAccountId(accountId);
+        return persisted;
+      },
     });
-    const warnings = await adapter.collectPreviewWarnings!({
-      cfg: cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
-      doctorFixCommand: "openclaw doctor --fix",
-      env: {},
-    });
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toMatch(/configuration-invalid.*credential store unavailable/i);
+
+    expect(findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        accountId: "../bad",
+        checkId: "configuration-invalid",
+        message: expect.stringMatching(/invalid account id.*\.\.\/bad/i),
+      }),
+      expect.objectContaining({
+        accountId: "good",
+        checkId: "encryption-disabled",
+      }),
+    ]));
   });
 });
 

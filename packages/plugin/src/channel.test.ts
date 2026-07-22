@@ -39,6 +39,8 @@ describe("webchannel plugin", () => {
       channels: { webchannel: { allowFrom: ["user1"], dmSecurity: "allowlist" } },
     } as any;
     const account = plugin.config.resolveAccount(cfg, undefined);
+    expect(account.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(account, cfg)).toBe(true);
     expect(account.allowFrom).toEqual(["user1"]);
     expect(account.dmPolicy).toBe("allowlist");
   });
@@ -55,8 +57,11 @@ describe("webchannel plugin", () => {
     expect(plugin.config.isConfigured!(account, cfg)).toBe(true);
 
     const ghost = plugin.config.resolveAccount(cfg, "ghost");
+    expect(ghost.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(true);
     expect(plugin.config.isConfigured!(ghost, cfg)).toBe(false);
     expect(plugin.config.inspectAccount!(cfg, "ghost")).toMatchObject({
+      enabled: true,
       configured: false,
       tokenStatus: "missing",
     });
@@ -70,6 +75,7 @@ describe("webchannel plugin", () => {
       { channels: { webchannel: {} } },
       { channels: { webchannel: { accounts: {} } } },
       { channels: { webchannel: { enabled: true } } },
+      { channels: { webchannel: { enabled: false } } },
       { channels: { webchannel: { defaultAccount: "default" } } },
       { channels: { webchannel: { accounts: {}, enabled: true } } },
     ] as any[];
@@ -98,6 +104,86 @@ describe("webchannel plugin", () => {
     expect(plugin.config.inspectAccount!(cfg, "work")).toMatchObject({
       configured: true,
       tokenStatus: "available",
+    });
+  });
+
+  it("reports flat channel-level disable while keeping configuration truth separate", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const disabledCfg = {
+      channels: { webchannel: { enabled: false, dmSecurity: "allowlist" } },
+    } as any;
+    const disabled = plugin.config.resolveAccount(disabledCfg, undefined);
+    expect(disabled.enabled).toBe(false);
+    expect(plugin.config.isEnabled!(disabled, disabledCfg)).toBe(false);
+    expect(plugin.config.isConfigured!(disabled, disabledCfg)).toBe(true);
+    expect(plugin.config.inspectAccount!(disabledCfg, undefined)).toMatchObject({
+      enabled: false,
+      configured: true,
+    });
+
+    const enabledCfg = {
+      channels: { webchannel: { enabled: true, dmSecurity: "allowlist" } },
+    } as any;
+    const enabled = plugin.config.resolveAccount(enabledCfg, undefined);
+    expect(enabled.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(enabled, enabledCfg)).toBe(true);
+    expect(plugin.config.inspectAccount!(enabledCfg, undefined)).toMatchObject({
+      enabled: true,
+      configured: true,
+    });
+  });
+
+  it("honors named disable, enabled controls, and global-disable dominance", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            disabled: { enabled: false, dmSecurity: "allowlist" },
+            enabled: { enabled: true, dmSecurity: "allowlist" },
+            inherited: { dmSecurity: "allowlist" },
+          },
+        },
+      },
+    } as any;
+
+    for (const [accountId, expected] of [
+      ["disabled", false],
+      ["enabled", true],
+      ["inherited", true],
+    ] as const) {
+      const account = plugin.config.resolveAccount(cfg, accountId);
+      expect(account.enabled).toBe(expected);
+      expect(plugin.config.isEnabled!(account, cfg)).toBe(expected);
+      expect(plugin.config.inspectAccount!(cfg, accountId)).toMatchObject({
+        enabled: expected,
+        configured: true,
+      });
+    }
+
+    const ghost = plugin.config.resolveAccount(cfg, "ghost");
+    expect(ghost.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(true);
+    expect(plugin.config.isConfigured!(ghost, cfg)).toBe(false);
+    expect(plugin.config.inspectAccount!(cfg, "ghost")).toMatchObject({
+      enabled: true,
+      configured: false,
+    });
+
+    const globallyDisabledCfg = {
+      channels: {
+        webchannel: {
+          enabled: false,
+          accounts: { enabled: { enabled: true, dmSecurity: "allowlist" } },
+        },
+      },
+    } as any;
+    const globallyDisabled = plugin.config.resolveAccount(globallyDisabledCfg, "enabled");
+    expect(globallyDisabled.enabled).toBe(false);
+    expect(plugin.config.isEnabled!(globallyDisabled, globallyDisabledCfg)).toBe(false);
+    expect(plugin.config.inspectAccount!(globallyDisabledCfg, "enabled")).toMatchObject({
+      enabled: false,
+      configured: true,
     });
   });
 

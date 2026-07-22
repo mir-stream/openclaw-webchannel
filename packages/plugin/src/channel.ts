@@ -46,6 +46,7 @@ export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_A
 
 type ResolvedAccount = {
   accountId: string | null;
+  enabled: boolean;
   allowFrom: string[];
   dmPolicy: string | undefined;
 };
@@ -89,9 +90,23 @@ function resolveAccount(
   );
   return {
     accountId: accountId ?? null,
+    enabled: isWebchannelAccountEnabled(cfg, accountId),
     allowFrom: (account.allowFrom as string[] | undefined) ?? [],
     dmPolicy: account.dmSecurity as string | undefined,
   };
+}
+
+function isWebchannelAccountEnabled(
+  cfg: OpenClawConfig,
+  accountId?: string | null,
+): boolean {
+  const section = readWebchannelSection(cfg);
+  // Channel-level disable dominates every flat or named account.
+  if (section?.enabled === false) return false;
+
+  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const account = readAccountsMap(section)[id];
+  return !(account && typeof account === "object" && account.enabled === false);
 }
 
 function isWebchannelAccountConfigured(
@@ -175,11 +190,12 @@ export function createWebChannelPlugin(
         inspectAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
           const configured = isWebchannelAccountConfigured(cfg, accountId);
           return {
-            enabled: true,
+            enabled: isWebchannelAccountEnabled(cfg, accountId),
             configured,
             tokenStatus: configured ? "available" : "missing",
           };
         },
+        isEnabled: (account) => account.enabled,
         isConfigured: (account, cfg) =>
           isWebchannelAccountConfigured(cfg, account.accountId),
       },

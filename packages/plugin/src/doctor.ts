@@ -31,6 +31,7 @@ import { resolveNatsCredentialSource } from "./nats-credential-source.js";
 import { dialRelayForPreflight } from "./preflight.js";
 
 export type DoctorCheckId =
+  | "configuration-invalid"
   | "encryption-disabled"
   | "creds-missing"
   | "identity-key-missing"
@@ -121,31 +122,40 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
     let persistedLoaded = false;
     const getPersisted = () => {
       if (!persistedLoaded) {
-        persisted = loadCreds(accountId);
         persistedLoaded = true;
+        persisted = loadCreds(accountId);
       }
       return persisted;
     };
 
-    if (source.mode === "enrolled" && !getPersisted()) {
-      findings.push({
-        accountId,
-        checkId: "creds-missing",
-        kind: "auth",
-        severity: "error",
-        message: `Effective credential mode=enrolled has no usable persisted credentials.`,
-        fix: reEnrollFix(accountId),
-      });
-    }
-    if (source.mode === "enrolled" && getPersisted() && !getPersisted()?.identityKey) {
-      findings.push({
-        accountId,
-        checkId: "identity-key-missing",
-        kind: "auth",
-        severity: "error",
-        message: "The enrolled credentials carry no attested agent identity key; the account is skipped.",
-        fix: `${reEnrollFix(accountId)} to mint an attested identity key.`,
-      });
+    if (source.mode === "enrolled") {
+      let enrolled: PersistedEnrolledCreds | undefined;
+      try {
+        enrolled = getPersisted();
+      } catch (err) {
+        findings.push(configurationInvalidFinding(accountId, err));
+        continue;
+      }
+      if (!enrolled) {
+        findings.push({
+          accountId,
+          checkId: "creds-missing",
+          kind: "auth",
+          severity: "error",
+          message: `Effective credential mode=enrolled has no usable persisted credentials.`,
+          fix: reEnrollFix(accountId),
+        });
+      }
+      if (enrolled && !enrolled.identityKey) {
+        findings.push({
+          accountId,
+          checkId: "identity-key-missing",
+          kind: "auth",
+          severity: "error",
+          message: "The enrolled credentials carry no attested agent identity key; the account is skipped.",
+          fix: `${reEnrollFix(accountId)} to mint an attested identity key.`,
+        });
+      }
     }
 
     // Register-hop is the ONLY admission path (auto-admission was removed), so
@@ -153,13 +163,19 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
     // serving loop calls `assertJwtAuthConfig(accountAuth)` unconditionally and
     // skips the account when it throws. Mirror that with the cache-free validator.
     {
-      const effective = resolveEffectiveAccountAuth({
-        accountAuthRaw: rawAuth,
-        accountId,
-        ...(plan.saasBaseUrl !== undefined ? { planSaasBaseUrl: plan.saasBaseUrl } : {}),
-        ...(top.saas?.baseUrl !== undefined ? { topLevelSaasBaseUrl: top.saas.baseUrl } : {}),
-        loadCreds: () => getPersisted(),
-      });
+      let effective: ReturnType<typeof resolveEffectiveAccountAuth>;
+      try {
+        effective = resolveEffectiveAccountAuth({
+          accountAuthRaw: rawAuth,
+          accountId,
+          ...(plan.saasBaseUrl !== undefined ? { planSaasBaseUrl: plan.saasBaseUrl } : {}),
+          ...(top.saas?.baseUrl !== undefined ? { topLevelSaasBaseUrl: top.saas.baseUrl } : {}),
+          loadCreds: () => getPersisted(),
+        });
+      } catch (err) {
+        findings.push(configurationInvalidFinding(accountId, err));
+        continue;
+      }
       if (effective?.strategy === "jwt") {
         const issuer = effective.jwt.issuer;
         const audience = effective.jwt.audience;
@@ -400,4 +416,14 @@ function isFailedProbe(value: unknown): value is { ok: false; error: string } {
 }
 
 function normalizeSlash(value: string): string { return value.replace(/\/+$/, ""); }
+function configurationInvalidFinding(accountId: string, err: unknown): DoctorFinding {
+  return {
+    accountId,
+    checkId: "configuration-invalid",
+    kind: "config",
+    severity: "error",
+    message: `Could not inspect configuration or persisted credentials for account ${JSON.stringify(accountId)}: ${errorMessage(err)}`,
+    fix: "Correct the account id/configuration or credential-store readability, then rerun openclaw doctor or reconfigure WebChannel with a valid account value.",
+  };
+}
 function errorMessage(err: unknown): string { return err instanceof Error ? err.message : String(err); }
