@@ -17,6 +17,7 @@ import type { ResolveAccountTransport } from "./approvals.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID as ACCOUNT_CONFIG_DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   hasWebchannelConfig,
+  inspectWebchannelAccountIds,
   isWebchannelAccountEnabled,
   listWebchannelAccountIds,
   readAccountsMap,
@@ -140,6 +141,8 @@ export function createWebChannelPlugin(
      * it and every account falls back to `transport` (unchanged behavior).
      */
     resolveApprovalTransport?: ResolveAccountTransport;
+    startNatsAccount?: (ctx: any) => Promise<void>;
+    onInvalidAccountId?: (cfg: OpenClawConfig, invalid: { id: string; reason: string }) => void;
   },
 ) {
   return createChatChannelPlugin<ResolvedAccount, WebchannelProbe>({
@@ -168,10 +171,16 @@ export function createWebChannelPlugin(
       config: {
         // 가-1: list the configured accounts. A flat (legacy) config yields the
         // single `"default"` account; a per-account config lists its children.
-        // MUST be non-empty so core's channel monitor runs the start-account
-        // task (and thus the native approval bootstrap) — `listWebchannelAccountIds`
-        // always synthesizes `"default"` when nothing else is configured.
-        listAccountIds: (cfg: OpenClawConfig) => listWebchannelAccountIds(cfg),
+        // An implicit/flat configuration retains the synthesized `"default"`
+        // account. An explicit accounts map whose keys are all invalid returns
+        // `[]` fail-closed, so core starts no account task for those keys.
+        listAccountIds: (cfg: OpenClawConfig) => {
+          const inspection = inspectWebchannelAccountIds(cfg);
+          for (const invalid of inspection.invalid) {
+            try { opts?.onInvalidAccountId?.(cfg, invalid); } catch { /* enumeration is fail-safe */ }
+          }
+          return inspection.validIds;
+        },
         resolveAccount,
         inspectAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
           const configured = isWebchannelAccountConfigured(cfg, accountId);
@@ -221,7 +230,9 @@ export function createWebChannelPlugin(
       // ChannelGatewayAdapter.startAccount signature verified:
       // dist/plugin-sdk/types.adapters-BRNttHis.d.ts:330-331.
       gateway: {
-        startAccount: (ctx: any) => startClawApprovalMonitor(ctx),
+        startAccount: (ctx: any) => opts?.startNatsAccount
+          ? composeAccountLifecycles(ctx, opts.startNatsAccount)
+          : startClawApprovalMonitor(ctx),
       },
     } satisfies WebchannelAdapters & Record<string, unknown>)),
 
@@ -292,4 +303,40 @@ export function createWebChannelPlugin(
       },
     },
   });
+}
+
+/** Run approval and NATS account ownership as one host lifecycle. */
+export async function composeAccountLifecycles(
+  ctx: any,
+  startNatsAccount: (ctx: any) => Promise<void>,
+): Promise<void> {
+  const child = new AbortController();
+  let resolveHostAbort: (() => void) | undefined;
+  const onHostAbort = () => {
+    child.abort(ctx.abortSignal.reason);
+    resolveHostAbort?.();
+  };
+  ctx.abortSignal.addEventListener("abort", onHostAbort, { once: true });
+  if (ctx.abortSignal.aborted) onHostAbort();
+  const childCtx = { ...ctx, abortSignal: child.signal };
+  const approval = Promise.resolve().then(() => startClawApprovalMonitor(childCtx));
+  const nats = Promise.resolve().then(() => startNatsAccount(childCtx));
+  const tagged = <T>(name: string, promise: Promise<T>) => promise.then(
+    () => ({ name, status: "fulfilled" as const }),
+    (reason) => ({ name, status: "rejected" as const, reason }),
+  );
+  const hostAbort = new Promise<{ name: "host-abort"; status: "fulfilled" }>((resolve) => {
+    resolveHostAbort = () => resolve({ name: "host-abort", status: "fulfilled" });
+    if (ctx.abortSignal.aborted) resolveHostAbort();
+  });
+  try {
+    const first = await Promise.race([tagged("approval", approval), tagged("nats", nats), hostAbort]);
+    child.abort();
+    await Promise.allSettled([approval, nats]);
+    if (first.name === "host-abort") return;
+    if (first.status === "rejected") throw first.reason;
+    throw new Error(`webchannel: ${first.name} account lifecycle exited before host abort`);
+  } finally {
+    ctx.abortSignal.removeEventListener("abort", onHostAbort);
+  }
 }

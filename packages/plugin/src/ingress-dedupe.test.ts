@@ -377,6 +377,49 @@ describe("createIngressOnFlush — the REAL onFlush index-nats.ts wires", () => 
   });
 });
 
+describe("ingress lifecycle fences", () => {
+  it("drops a flush that becomes inactive inside an awaited dedupe operation", async () => {
+    let active = true;
+    let resolveCheck!: (fresh: boolean) => void;
+    const dispatch = vi.fn();
+    const sendAck = vi.fn(() => true);
+    const onFlush = createIngressOnFlush<Item>({
+      accountId: "a",
+      checkAndRecord: () => new Promise<boolean>((resolve) => { resolveCheck = resolve; }),
+      dispatch,
+      coalesce: (messages) => messages[0]!,
+      sendAck,
+      isActive: () => active,
+    });
+    const pending = onFlush([item("p", "hello", "id")]);
+    expect(sendAck).toHaveBeenCalledOnce();
+    active = false;
+    resolveCheck(true);
+    await pending;
+    expect(sendAck).toHaveBeenCalledOnce();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("does not ACK a cancelled item after its dedupe await crosses disposal", async () => {
+    let active = true;
+    let resolveCheck!: (fresh: boolean) => void;
+    const sendAck = vi.fn(() => true);
+    const pending = recordCancelledInboundItems(
+      [item("p", "hello", "id")],
+      "a",
+      () => new Promise<boolean>((resolve) => { resolveCheck = resolve; }),
+      sendAck,
+      undefined,
+      undefined,
+      () => active,
+    );
+    active = false;
+    resolveCheck(true);
+    await pending;
+    expect(sendAck).not.toHaveBeenCalled();
+  });
+});
+
 describe("createIngressOnFlush — integration through a REAL createInboundDebouncer", () => {
   it("plugs into the debouncer: same id across two windows dispatches once", async () => {
     const { checkAndRecord } = fakeChecker();

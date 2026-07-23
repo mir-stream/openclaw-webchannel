@@ -11,7 +11,7 @@ class FakePeerChannel extends NullPeerChannel {
   setHistoryEnabled(_enabled: boolean) {}
   registerConnection(ws: any, peerId = "web-anon") { ws.on("message", (raw: any) => { try { const frame = JSON.parse(String(raw)); if (frame.type === "approval_decision" && ["allow-once", "allow-always", "deny"].includes(frame.decision)) this.approvalHandler?.(peerId, frame.id, frame.decision); if (frame.type === "load_history") this.historyHandler?.(peerId, { ...(frame.before ? { before: frame.before } : {}), ...(frame.limit ? { limit: frame.limit } : {}) }); } catch {} }); }
 }
-import { createWebChannelPlugin } from "./channel.js";
+import { composeAccountLifecycles, createWebChannelPlugin } from "./channel.js";
 import { handleInboundMessage } from "./inbound.js";
 import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
 
@@ -31,7 +31,48 @@ beforeEach(() => {
   mockReasoningLevel.mockReturnValue("off");
 });
 
+describe("account lifecycle composition", () => {
+  const context = (abortSignal: AbortSignal) => ({
+    accountId: "default",
+    abortSignal,
+    channelRuntime: { runtimeContexts: { register: () => ({ dispose: vi.fn() }) } },
+  });
+
+  it("host abort waits for both approval and NATS cleanup", async () => {
+    const host = new AbortController();
+    let release!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => { release = resolve; });
+    const task = composeAccountLifecycles(context(host.signal), async (ctx) => {
+      if (!ctx.abortSignal.aborted) await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", resolve, { once: true }));
+      await cleanupGate;
+    });
+    host.abort();
+    let settled = false;
+    void task.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    await expect(task).resolves.toBeUndefined();
+  });
+
+  it("an unexpected sibling resolution aborts and awaits approval cleanup before rejecting", async () => {
+    const host = new AbortController();
+    const task = composeAccountLifecycles(context(host.signal), async () => {});
+    await expect(task).rejects.toThrow(/nats account lifecycle exited before host abort/);
+  });
+});
+
 describe("webchannel plugin", () => {
+  it("reports invalid raw ids best-effort without changing valid enumeration", () => {
+    const reporter = vi.fn(() => { throw new Error("logger failed"); });
+    const plugin = createWebChannelPlugin(new FakePeerChannel(), { onInvalidAccountId: reporter });
+    const mixed = { channels: { webchannel: { accounts: { good: {}, "bad.id": {} } } } } as any;
+    expect(plugin.config.listAccountIds(mixed)).toEqual(["good"]);
+    expect(reporter).toHaveBeenCalledWith(mixed, expect.objectContaining({ id: "bad.id" }));
+    const allInvalid = { channels: { webchannel: { accounts: { "../bad": {} } } } } as any;
+    expect(plugin.config.listAccountIds(allInvalid)).toEqual([]);
+  });
+
   it("resolves an account from config", () => {
     const transport = new FakePeerChannel();
     const plugin = createWebChannelPlugin(transport);

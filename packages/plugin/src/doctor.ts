@@ -16,6 +16,7 @@ import {
 } from "./acquisition-env.js";
 import {
   hasWebchannelConfig,
+  inspectWebchannelAccountIds,
   isWebchannelAccountEnabled,
   listWebchannelAccountIds,
   loadPersistedEnrolledCreds,
@@ -37,6 +38,7 @@ import { resolveNatsCredentialSource } from "./nats-credential-source.js";
 import { dialRelayForPreflight } from "./preflight.js";
 
 export type DoctorCheckId =
+  | "invalid-account-id"
   | "configuration-invalid"
   | "encryption-disabled"
   | "creds-missing"
@@ -72,6 +74,20 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
   const findings: DoctorFinding[] = [];
   const claims = new Map<string, string>();
   const top = cfg as { nats?: { url?: string }; saas?: { baseUrl?: string } };
+
+  const inspection = inspectWebchannelAccountIds(cfg);
+  for (const invalid of inspection.invalid) {
+    findings.push({
+      accountId: invalid.id,
+      checkId: "invalid-account-id",
+      kind: "config",
+      severity: "error",
+      message:
+        `Account key ${JSON.stringify(invalid.id)} is invalid (${invalid.reason}) and was not started.`,
+      fix:
+        "Rename the config key to match /^[A-Za-z0-9_-]{1,64}$/ (excluding __proto__, prototype, and constructor), then rerun account setup/enrollment so credentials and JWT audience stay aligned.",
+    });
+  }
 
   const plans: AccountPlanEntry[] = [];
   for (const accountId of listWebchannelAccountIds(cfg)) {
@@ -269,7 +285,10 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
 }
 
 export function formatDoctorWarning(finding: DoctorFinding): string {
-  return `- channels.webchannel.${finding.accountId}: ${finding.severity.toUpperCase()} [${finding.checkId}] ${finding.message} Fix: ${finding.fix}`;
+  const prefix = finding.checkId === "invalid-account-id"
+    ? `channels.webchannel.accounts[${JSON.stringify(finding.accountId)}]`
+    : `channels.webchannel.${finding.accountId}`;
+  return `- ${prefix}: ${finding.severity.toUpperCase()} [${finding.checkId}] ${finding.message} Fix: ${finding.fix}`;
 }
 
 export function createWebchannelDoctorAdapter(deps: DoctorDeps = {}): ChannelDoctorAdapter {

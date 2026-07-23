@@ -373,3 +373,31 @@ describe("createSerializedInboundDispatcher with coalesce (P1-8b layer b)", () =
     expect(calls).toEqual(["m1", "boom", "after"]);
   });
 });
+
+describe("SerializedInboundDispatcher close gate", () => {
+  it("skips a turn queued in the same tick and clears recursive coalesce follow-up", async () => {
+    const handled: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const dispatcher = createSerializedInboundDispatcher<{ text: string }>(async (_key, message) => {
+      handled.push(message.text);
+      await gate;
+    }, { coalesce: (messages) => ({ text: messages.map((m) => m.text).join("+") }) });
+    dispatcher.dispatch("a", { text: "first" });
+    await Promise.resolve();
+    dispatcher.dispatch("a", { text: "second" });
+    dispatcher.close();
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(handled).toEqual(["first"]);
+    expect(dispatcher.pendingSessions()).toBe(0);
+    expect(dispatcher.pendingBuffered("a")).toBe(0);
+
+    const sameTick = createSerializedInboundDispatcher<{ text: string }>(async (_key, message) => { handled.push(message.text); });
+    sameTick.dispatch("b", { text: "never" });
+    sameTick.close();
+    await Promise.resolve();
+    expect(handled).not.toContain("never");
+  });
+});

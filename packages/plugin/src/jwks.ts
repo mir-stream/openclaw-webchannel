@@ -39,6 +39,10 @@ export class JwksUnavailableError extends Error {
   }
 }
 
+export class JwksLifecycleAbortError extends Error {
+  constructor() { super("webchannel: JWKS warm aborted by account lifecycle"); this.name = "JwksLifecycleAbortError"; }
+}
+
 /**
  * A single JWK with the subset of fields we care about. Mirrors RFC 7517 / 7518
  * §6.3.1 (RSA public key). `kid` is optional in the spec but required here for
@@ -93,7 +97,7 @@ export type JWKSCacheOptions = {
    * open for runtime adapters that don't have `node:fs` (e.g. some sandboxed
    * Workers environments).
    */
-  readFileImpl?: (path: string) => Promise<Uint8Array>;
+  readFileImpl?: (path: string, signal?: AbortSignal) => Promise<Uint8Array>;
   /**
    * Per-request JWKS-fetch timeout in ms (default 10s). Bounds a slow/hanging
    * IdP so it cannot stall the caller — critical now that the warm path runs on
@@ -136,9 +140,12 @@ async function fetchJwks(
   url: string,
   fetchImpl: typeof fetch,
   timeoutMs: number,
+  lifecycleSignal?: AbortSignal,
 ): Promise<JsonWebKeySet> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const onLifecycleAbort = () => controller.abort();
+  lifecycleSignal?.addEventListener("abort", onLifecycleAbort, { once: true });
   // The signal stays armed across BOTH the connect/headers phase AND the body
   // read: a black-hole IdP can return 200 headers then trickle the body forever,
   // so clearing the timer after `fetch()` resolves (headers) would leave the
@@ -147,12 +154,15 @@ async function fetchJwks(
   try {
     let res: Awaited<ReturnType<typeof fetchImpl>>;
     try {
-      res = await fetchImpl(url, { signal: controller.signal });
+      res = await raceAbort(fetchImpl(url, { signal: controller.signal }), controller.signal);
     } catch (err) {
+      if (lifecycleSignal?.aborted) throw new JwksLifecycleAbortError();
       // Network-level failure (DNS, connection refused) OR the abort timeout.
       throw new JwksUnavailableError(
         controller.signal.aborted
-          ? `webchannel: JWKS fetch timed out for ${url} after ${timeoutMs}ms`
+          ? lifecycleSignal?.aborted
+            ? "webchannel: JWKS fetch aborted"
+            : `webchannel: JWKS fetch timed out for ${url} after ${timeoutMs}ms`
           : `webchannel: JWKS fetch failed for ${url}: ${(err as Error).message}`,
         { cause: err },
       );
@@ -160,7 +170,7 @@ async function fetchJwks(
     if (!res.ok) {
       // Consume + discard so the body isn't leaked, then throw.
       try {
-        await res.text();
+        await raceAbort(res.text(), controller.signal);
       } catch {
         /* ignore — we're already failing */
       }
@@ -171,8 +181,9 @@ async function fetchJwks(
     }
     let doc: unknown;
     try {
-      doc = await res.json();
+      doc = await raceAbort(res.json(), controller.signal);
     } catch (err) {
+      if (lifecycleSignal?.aborted) throw new JwksLifecycleAbortError();
       // A hung body read trips the same abort timer → surface it as a timeout.
       throw new JwksUnavailableError(
         controller.signal.aborted
@@ -184,20 +195,37 @@ async function fetchJwks(
     return parseJwks(doc);
   } finally {
     clearTimeout(timer);
+    lifecycleSignal?.removeEventListener("abort", onLifecycleAbort);
   }
 }
 
 /** Read + parse a JWKS file from disk. Throws on missing file or bad JSON. */
-async function loadJwksFile(path: string, readFileImpl: (p: string) => Promise<Uint8Array>): Promise<JsonWebKeySet> {
+async function loadJwksFile(
+  path: string,
+  readFileImpl: (p: string, signal?: AbortSignal) => Promise<Uint8Array>,
+  timeoutMs: number,
+  lifecycleSignal?: AbortSignal,
+): Promise<JsonWebKeySet> {
+  const controller = new AbortController();
+  let deadlineExpired = false;
+  const timer = setTimeout(() => { deadlineExpired = true; controller.abort(); }, timeoutMs);
+  const onLifecycleAbort = () => controller.abort();
+  lifecycleSignal?.addEventListener("abort", onLifecycleAbort, { once: true });
   let bytes: Uint8Array;
   try {
-    bytes = await readFileImpl(path);
+    bytes = await raceAbort(readFileImpl(path, controller.signal), controller.signal);
   } catch (err) {
+    if (lifecycleSignal?.aborted) throw new JwksLifecycleAbortError();
     // A missing/unreadable file is an infra fault (deploy/mount), not a verdict.
     throw new JwksUnavailableError(
-      `webchannel: JWKS file read failed for ${path}: ${(err as Error).message}`,
+      deadlineExpired
+        ? `webchannel: JWKS file read timed out after ${timeoutMs}ms`
+        : `webchannel: JWKS file read failed for ${path}: ${(err as Error).message}`,
       { cause: err },
     );
+  } finally {
+    clearTimeout(timer);
+    lifecycleSignal?.removeEventListener("abort", onLifecycleAbort);
   }
   let text: string;
   try {
@@ -219,6 +247,19 @@ async function loadJwksFile(path: string, readFileImpl: (p: string) => Promise<U
   return parseJwks(parsed);
 }
 
+function raceAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new JwksLifecycleAbortError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new JwksLifecycleAbortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+  });
+}
+
 /** Structural validation for a parsed JWKS document. */
 function parseJwks(doc: unknown): JsonWebKeySet {
   if (!doc || typeof doc !== "object") {
@@ -235,7 +276,7 @@ export class JWKSCache implements KeyResolver {
   private readonly source: JWKSCacheOptionsFull["source"];
   private readonly ttlMs: number;
   private readonly fetchImpl: typeof fetch;
-  private readonly readFileImpl: (path: string) => Promise<Uint8Array>;
+  private readonly readFileImpl: (path: string, signal?: AbortSignal) => Promise<Uint8Array>;
   private readonly fetchTimeoutMs: number;
 
   /**
@@ -254,7 +295,11 @@ export class JWKSCache implements KeyResolver {
    * this to deduplicate concurrent misses so 100 simultaneous connections
    * arriving with an unknown kid produce ONE refetch, not 100.
    */
-  private inflightRefetch: Promise<JsonWebKeySet> | null = null;
+  private inflightRefetch: {
+    controller: AbortController;
+    promise: Promise<JsonWebKeySet>;
+    subscribers: number;
+  } | null = null;
 
   private constructor(opts: JWKSCacheOptionsFull) {
     this.source = opts.source;
@@ -263,8 +308,8 @@ export class JWKSCache implements KeyResolver {
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.readFileImpl =
       opts.readFileImpl ??
-      (async (p) => {
-        const buf = await readFile(p);
+      (async (p, signal) => {
+        const buf = await readFile(p, signal ? { signal } : undefined);
         return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
       });
   }
@@ -358,11 +403,11 @@ export class JWKSCache implements KeyResolver {
    * ("cannot verify any bootstrap JWT"), which this method does NOT itself treat
    * as an error (an empty-but-served JWKS is not an I/O fault).
    */
-  async warm(fetchTimeoutMsOverride?: number): Promise<JsonWebKeySet> {
-    return (
-      (await this.maybeLoadFromCache()) ??
-      (await this.loadFresh(fetchTimeoutMsOverride))
-    );
+  async warm(fetchTimeoutMsOverride?: number, signal?: AbortSignal): Promise<JsonWebKeySet> {
+    if (signal?.aborted) throw new JwksLifecycleAbortError();
+    const cached = await this.maybeLoadFromCache();
+    if (signal?.aborted) throw new JwksLifecycleAbortError();
+    return cached ?? (await this.loadFresh(fetchTimeoutMsOverride, signal));
   }
 
   /**
@@ -400,10 +445,12 @@ export class JWKSCache implements KeyResolver {
    * (cache hit) or failed (next fetch uses the tight instance default). Racing a
    * second, shorter fetch instead would defeat the dedup this exists for.
    */
-  private async loadFresh(fetchTimeoutMsOverride?: number): Promise<JsonWebKeySet> {
-    if (this.inflightRefetch) return this.inflightRefetch;
-
-    const promise = (async (): Promise<JsonWebKeySet> => {
+  private async loadFresh(fetchTimeoutMsOverride?: number, signal?: AbortSignal): Promise<JsonWebKeySet> {
+    let operation = this.inflightRefetch;
+    if (!operation) {
+      const controller = new AbortController();
+      const created = { controller, promise: Promise.resolve(null as unknown as JsonWebKeySet), subscribers: 0 };
+      const promise = (async (): Promise<JsonWebKeySet> => {
       try {
         let doc: JsonWebKeySet;
         if (this.source.kind === "url") {
@@ -411,9 +458,15 @@ export class JWKSCache implements KeyResolver {
             this.source.url,
             this.fetchImpl,
             fetchTimeoutMsOverride ?? this.fetchTimeoutMs,
+            controller.signal,
           );
         } else if (this.source.kind === "file") {
-          doc = await loadJwksFile(this.source.path, this.readFileImpl);
+          doc = await loadJwksFile(
+            this.source.path,
+            this.readFileImpl,
+            fetchTimeoutMsOverride ?? this.fetchTimeoutMs,
+            controller.signal,
+          );
         } else {
           // Inline already handled in maybeLoadFromCache; this branch is
           // defensive only.
@@ -421,7 +474,7 @@ export class JWKSCache implements KeyResolver {
         }
         // Only cache when the source can actually change (URL, file). Inline
         // docs are immutable for the life of the cache instance.
-        if (this.source.kind !== "inline") {
+        if (this.source.kind !== "inline" && !controller.signal.aborted && this.inflightRefetch === created) {
           this.cache = { doc, fetchedAtMs: Date.now() };
         }
         return doc;
@@ -429,16 +482,26 @@ export class JWKSCache implements KeyResolver {
         // Fail-closed: clear the cache so the next call re-attempts instead of
         // serving the previous (now-stale) document. Re-throw so the caller
         // surfaces the failure.
-        this.cache = null;
+        if (this.inflightRefetch === created) this.cache = null;
         throw err;
       }
-    })();
-
-    this.inflightRefetch = promise;
+      })();
+      created.promise = promise;
+      operation = created;
+      this.inflightRefetch = operation;
+      void promise.finally(() => {
+        if (this.inflightRefetch === created && created.subscribers === 0) this.inflightRefetch = null;
+      }).catch(() => {});
+    }
+    operation.subscribers++;
     try {
-      return await promise;
+      return await raceAbort(operation.promise, signal);
     } finally {
-      this.inflightRefetch = null;
+      operation.subscribers--;
+      if (operation.subscribers === 0) {
+        if (this.inflightRefetch === operation) this.inflightRefetch = null;
+        if (!operation.controller.signal.aborted) operation.controller.abort();
+      }
     }
   }
 

@@ -3,7 +3,7 @@
  *
  * ── Separation of concerns ─────────────────────────────────────────────────
  * Connecting the agent to NATS has TWO orthogonal axes that used to be fused
- * inside `index-nats.ts`:
+ * inside the old monolithic plugin entry:
  *
  *   Axis A — CREDENTIAL SOURCE (this module): *how* the agent authenticates to
  *            the NATS server. This is purely about acquiring a connected
@@ -34,7 +34,7 @@
 import { readFileSync } from "node:fs";
 
 import type { SecretRef } from "./auth.js";
-import { NatsTransport } from "./nats-transport.js";
+import { NatsLifecycleAbortError, NatsTransport } from "./nats-transport.js";
 import { makeNkeySigningCallback } from "./nkey-sign.js";
 import {
   createEnrolledNatsConnection,
@@ -361,6 +361,10 @@ export type ConnectNatsDeps = {
   createEnrolled?: typeof createEnrolledNatsConnection;
   /** NKEY signing-callback factory (defaults to `makeNkeySigningCallback`). */
   makeSigner?: typeof makeNkeySigningCallback;
+  /** Initial-dial lifecycle cancellation. */
+  signal?: AbortSignal;
+  /** Transfers attempt ownership before the first await. */
+  onTransport?: (transport: NatsTransport) => void;
 };
 
 /**
@@ -385,15 +389,29 @@ export async function connectNatsCredentialSource(
 
   switch (source.mode) {
     case "static": {
+      let signer: (nonce: string) => Promise<string>;
+      try {
+        signer = makeSigner(source.userSeed);
+      } catch (cause) {
+        throw Object.assign(
+          new Error("webchannel: NATS credential material is invalid", { cause }),
+          { code: "NATS_CREDENTIAL_INVALID" },
+        );
+      }
       const transport = transportFactory({
         url: source.url,
         jwtCredential: source.userJwt,
-        nkeySigningCallback: makeSigner(source.userSeed),
+        nkeySigningCallback: signer,
         clientName: "openclaw-webchannel-agent",
         // S1: auto-reconnect a dropped connection (replays subscriptions).
         reconnect: true,
       });
-      await transport.connect();
+      deps.onTransport?.(transport);
+      await transport.connect(deps.signal);
+      if (deps.signal?.aborted) {
+        transport.disconnect();
+        throw new NatsLifecycleAbortError();
+      }
       return { transport };
     }
     case "enrolled": {

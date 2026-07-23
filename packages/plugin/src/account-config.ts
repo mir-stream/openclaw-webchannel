@@ -53,6 +53,48 @@ const STRICT_ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 /** Object keys that must never be used as account ids (prototype pollution). */
 const BLOCKED_ACCOUNT_IDS = new Set(["__proto__", "prototype", "constructor"]);
 
+export type InvalidAccountId = { id: string; reason: string };
+
+export type AccountIdInspection = {
+  validIds: string[];
+  invalid: InvalidAccountId[];
+  usesImplicitDefault: boolean;
+};
+
+/** JSON rendering is deliberately shared by every surface that prints an id. */
+export function formatAccountIdForLog(id: string): string {
+  return JSON.stringify(id);
+}
+
+export function inspectWebchannelAccountIds(cfg: unknown): AccountIdInspection {
+  const section = readWebchannelSection(cfg);
+  const rawIds = Object.keys(readAccountsMap(section));
+  if (rawIds.length === 0) {
+    return {
+      validIds: [DEFAULT_WEBCHANNEL_ACCOUNT_ID],
+      invalid: [],
+      usesImplicitDefault: true,
+    };
+  }
+
+  const validIds: string[] = [];
+  const invalid: InvalidAccountId[] = [];
+  for (const id of rawIds) {
+    if (isValidAccountId(id)) validIds.push(id);
+    else {
+      invalid.push({
+        id,
+        reason: BLOCKED_ACCOUNT_IDS.has(id.toLowerCase())
+          ? "the id is a blocked prototype key"
+          : "the id must match /^[A-Za-z0-9_-]{1,64}$/",
+      });
+    }
+  }
+  validIds.sort((a, b) => a.localeCompare(b));
+  invalid.sort((a, b) => a.id.localeCompare(b.id));
+  return { validIds, invalid, usesImplicitDefault: false };
+}
+
 /**
  * Core-compatible canonicalization (mirrors openclaw's `normalizeAccountId`):
  * lowercase, replace runs of invalid chars with `-`, strip leading/trailing
@@ -253,10 +295,7 @@ function assertNoRemovedConfig(account: WebchannelAccountConfig): void {
  * Sorted for stable ordering (mirrors core).
  */
 export function listWebchannelAccountIds(cfg: unknown): string[] {
-  const section = readWebchannelSection(cfg);
-  const ids = new Set<string>(Object.keys(readAccountsMap(section)).filter(Boolean));
-  if (ids.size === 0) return [DEFAULT_WEBCHANNEL_ACCOUNT_ID];
-  return [...ids].sort((a, b) => a.localeCompare(b));
+  return inspectWebchannelAccountIds(cfg).validIds;
 }
 
 /**

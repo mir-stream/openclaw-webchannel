@@ -167,7 +167,7 @@ describe("evaluateWebchannelDoctor findings", () => {
       env: {},
     });
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toMatch(/configuration-invalid.*invalid account id.*\.\.\/bad/i);
+    expect(warnings[0]).toMatch(/invalid-account-id.*account key.*\.\.\/bad.*was not started/i);
   });
 
   it("isolates removed config planning failures and still diagnoses a sibling", async () => {
@@ -237,8 +237,8 @@ describe("evaluateWebchannelDoctor findings", () => {
     expect(findings).toEqual(expect.arrayContaining([
       expect.objectContaining({
         accountId: "../bad",
-        checkId: "configuration-invalid",
-        message: expect.stringMatching(/invalid account id.*\.\.\/bad/i),
+        checkId: "invalid-account-id",
+        message: expect.stringMatching(/account key.*\.\.\/bad.*was not started/i),
       }),
       expect.objectContaining({
         accountId: "good",

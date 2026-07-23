@@ -43,6 +43,8 @@
  */
 export interface SerializedInboundDispatcher<Message> {
   dispatch: (sessionKey: string, message: Message) => void;
+  /** Permanently reject new work and discard every queued follow-up. */
+  close: () => void;
   /** Test/diagnostics only: number of sessions with a live (undrained) chain. */
   pendingSessions: () => number;
   /**
@@ -119,6 +121,7 @@ export function createSerializedInboundDispatcher<Message>(
   },
 ): SerializedInboundDispatcher<Message> {
   const coalesce = options?.coalesce;
+  let closed = false;
 
   // sessionKey -> tail of that session's promise chain. The value is the
   // promise for the LAST-enqueued turn; the next message chains off it. Entries
@@ -152,12 +155,18 @@ export function createSerializedInboundDispatcher<Message>(
   // stored promise non-rejecting so the drain/cleanup ALWAYS runs (a failed turn
   // must not wedge the session or strand its buffer).
   const startCoalesceTurn = (sessionKey: string, message: Message) => {
+    if (closed) return;
     const settled = Promise.resolve()
-      .then(() => handler(sessionKey, message))
+      .then(() => closed ? undefined : handler(sessionKey, message))
       .catch(() => {});
     running.set(sessionKey, settled);
 
     void settled.then(() => {
+      if (closed) {
+        if (running.get(sessionKey) === settled) running.delete(sessionKey);
+        pending.delete(sessionKey);
+        return;
+      }
       // Identity guard, matching the legacy cleanup: only this turn's own
       // settlement may advance the session. (Nothing else overwrites `running`
       // for a live session — dispatch only appends to `pending` while busy — but
@@ -176,6 +185,7 @@ export function createSerializedInboundDispatcher<Message>(
   };
 
   const dispatchCoalesced = (sessionKey: string, message: Message) => {
+    if (closed) return;
     if (running.has(sessionKey)) {
       // Busy: buffer instead of chaining a second turn. `startCoalesceTurn` sets
       // `running` synchronously, so a same-tick burst reliably lands here.
@@ -188,6 +198,7 @@ export function createSerializedInboundDispatcher<Message>(
   };
 
   const dispatchLegacy = (sessionKey: string, message: Message) => {
+    if (closed) return;
     // Chain off whatever is currently queued for this session (or a resolved
     // promise if the session is idle). We attach via `.then` with NO rejection
     // handler on `previous` itself — instead the previous link is made
@@ -213,8 +224,8 @@ export function createSerializedInboundDispatcher<Message>(
     // for its own user-facing error recovery (inbound.ts finalizes the working
     // bubble on failure).
     const settled = previous.then(() =>
-      Promise.resolve()
-        .then(() => handler(sessionKey, message))
+      closed ? undefined : Promise.resolve()
+        .then(() => closed ? undefined : handler(sessionKey, message))
         .catch(() => {}),
     );
 
@@ -237,6 +248,13 @@ export function createSerializedInboundDispatcher<Message>(
 
   return {
     dispatch,
+    close: () => {
+      if (closed) return;
+      closed = true;
+      chains.clear();
+      pending.clear();
+      running.clear();
+    },
     // Only one of the two structures is ever populated for a given dispatcher
     // (coalesce is fixed at construction), so summing is correct for both paths:
     // legacy counts live chains; coalesce counts running turns.
