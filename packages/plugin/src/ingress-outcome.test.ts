@@ -4,6 +4,7 @@ import {
   MAX_INGRESS_OUTCOME_HOT_BYTES,
   MAX_INGRESS_OUTCOME_HOT_ENTRIES,
   createIngressOutcomeStore,
+  createRateLimitedOutcomeFailureWarning,
   createRateLimitedOutcomeInvariantWarning,
   type IngressOutcomeStore,
   type OutcomeRecordResult,
@@ -40,6 +41,40 @@ async function commit(
 }
 
 describe("IngressOutcomeStore", () => {
+  it("warns for cold lookup and accepted/overloaded record storage failures without error data", async () => {
+    const accepted = fake(); const overloaded = fake();
+    const warned: string[] = [];
+    const warnFailure = createRateLimitedOutcomeFailureWarning((message) => warned.push(message));
+    (overloaded.store.hasRecent as any).mockImplementationOnce(async (_key: string, options: any) => {
+      options.onDiskError(new Error("secret lookup peer:id"));
+      return false;
+    });
+    const store = createIngressOutcomeStore({
+      accepted: accepted.store,
+      overloaded: overloaded.store,
+      warnFailure,
+    });
+    expect((await store.lookup("acct", "secret-key")).status).toBe("unknown");
+
+    for (const [outcome, target] of [
+      ["accepted", accepted],
+      ["overloaded", overloaded],
+    ] as const) {
+      (target.store.checkAndRecord as any).mockImplementationOnce(async (_key: string, options: any) => {
+        options.onDiskError(new Error(`secret ${outcome} content`));
+        return true;
+      });
+      expect((await store.record("acct", `secret-${outcome}`, outcome)).status).toBe(
+        outcome === "accepted" ? "recorded" : "unknown",
+      );
+    }
+
+    expect(warned.join(" ")).toContain("category=lookup-overloaded");
+    expect(warned.join(" ")).toContain("category=record-accepted");
+    expect(warned.join(" ")).toContain("category=record-overloaded");
+    expect(warned.join(" ")).not.toMatch(/secret|peer:id|content/);
+  });
+
   it("namespaces accounts and gives overloaded precedence over impossible dual markers", async () => {
     const accepted = fake(); const overloaded = fake();
     const warn = vi.fn();
@@ -66,7 +101,12 @@ describe("IngressOutcomeStore", () => {
 
   it("fails closed when replacing the opposite marker reports a disk error", async () => {
     const accepted = fake(); const overloaded = fake();
-    const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store });
+    const warnFailure = vi.fn();
+    const store = createIngressOutcomeStore({
+      accepted: accepted.store,
+      overloaded: overloaded.store,
+      warnFailure,
+    });
     await commit(store, "a", "k", "overloaded");
     expect(store.peek("a", "k")).toBe("overloaded");
     const disk = new Error("forget failed");
@@ -77,6 +117,7 @@ describe("IngressOutcomeStore", () => {
 
     const result = await store.record("a", "k", "accepted", { replaceOpposite: true });
     expect(result).toEqual({ status: "unknown", error: disk });
+    expect(warnFailure).toHaveBeenCalledWith("a", "replace-with-accepted");
     expect(accepted.store.checkAndRecord).not.toHaveBeenCalled();
     expect(overloaded.values.has("a:k")).toBe(true);
     expect(store.peek("a", "k")).toBe("overloaded");
@@ -203,12 +244,18 @@ describe("IngressOutcomeStore", () => {
         }
         return target.values.delete(`${options.namespace}:${key}`);
       });
-      const store = createIngressOutcomeStore({ accepted: accepted.store, overloaded: overloaded.store });
+      const warnFailure = vi.fn();
+      const store = createIngressOutcomeStore({
+        accepted: accepted.store,
+        overloaded: overloaded.store,
+        warnFailure,
+      });
 
       const pending = await store.record("a", "p:i", outcome);
       if (pending.status !== "recorded") throw new Error("write unexpectedly unknown");
       expect(pending.write.created).toBe(true);
       expect(await pending.write.rollback()).toBe(false);
+      expect(warnFailure).toHaveBeenCalledWith("a", `rollback-${outcome}`);
 
       // The durable marker still exists but neither the synchronous hot path nor
       // a same-process cold lookup may classify it as a completed result.
@@ -217,6 +264,7 @@ describe("IngressOutcomeStore", () => {
       expect(store.hotSize()).toEqual({ entries: 0, bytes: 0 });
       expect(store.rollbackRecoverySize()).toMatchObject({ entries: 1, poisoned: false });
       await expect(store.lookup("a", "p:i")).resolves.toEqual({ status: "unknown", error: disk });
+      expect(warnFailure).toHaveBeenCalledWith("a", `rollback-recovery-${outcome}`);
       expect(target.store.hasRecent).not.toHaveBeenCalled();
 
       // A later retry first removes that exact generation, then performs a fresh
@@ -236,6 +284,7 @@ describe("IngressOutcomeStore", () => {
 
   it("fails the process store closed without growing recovery metadata past its cap", async () => {
     const accepted = fake(); const overloaded = fake();
+    const warnFailure = vi.fn();
     (accepted.store.forget as any).mockImplementation(async (_key: string, options: any) => {
       options.onDiskError?.(new Error("disk unavailable"));
       return false;
@@ -245,6 +294,7 @@ describe("IngressOutcomeStore", () => {
       overloaded: overloaded.store,
       maxRollbackRecoveryEntries: 1,
       maxRollbackRecoveryBytes: 1_024,
+      warnFailure,
     });
 
     for (const key of ["one", "two"]) {
@@ -254,6 +304,7 @@ describe("IngressOutcomeStore", () => {
     }
 
     expect(store.rollbackRecoverySize()).toMatchObject({ entries: 1, poisoned: true });
+    expect(warnFailure).toHaveBeenCalledWith("a", "rollback-recovery-poisoned");
     expect(store.peek("a", "one")).toBeUndefined();
     expect(store.peek("a", "two")).toBeUndefined();
     expect((await store.lookup("a", "unrelated")).status).toBe("unknown");
@@ -303,5 +354,21 @@ describe("IngressOutcomeStore", () => {
     expect(warn).toHaveBeenCalledTimes(2);
     expect(warn.mock.calls[1]?.[0]).toContain("suppressed=1");
     expect(warn.mock.calls.flat().join(" ")).not.toMatch(/secret|peer|id-one|id-two/);
+  });
+
+  it("rate-limits fixed failure categories and redacts unsafe account labels", () => {
+    let now = 0;
+    const warn = vi.fn();
+    const limited = createRateLimitedOutcomeFailureWarning(warn, () => now, 100);
+    limited("acct-safe", "lookup-accepted");
+    limited("acct-safe", "lookup-accepted");
+    limited("acct-safe", "record-accepted");
+    expect(warn).toHaveBeenCalledTimes(2);
+    now = 100;
+    limited("secret peer/id\nciphertext", "lookup-accepted");
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn.mock.calls[2]?.[0]).toContain("account=<redacted>");
+    expect(warn.mock.calls[2]?.[0]).toContain("suppressed=1");
+    expect(warn.mock.calls.flat().join(" ")).not.toMatch(/secret peer|ciphertext/);
   });
 });

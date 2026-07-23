@@ -5,6 +5,25 @@ import {
 } from "openclaw/plugin-sdk/persistent-dedupe";
 
 export type IngressOutcome = "accepted" | "overloaded";
+export type IngressOutcomeFailureCategory =
+  | "lookup-overloaded"
+  | "lookup-accepted"
+  | "record-accepted"
+  | "record-overloaded"
+  | "replace-with-accepted"
+  | "replace-with-overloaded"
+  | "rollback-accepted"
+  | "rollback-overloaded"
+  | "rollback-recovery-accepted"
+  | "rollback-recovery-overloaded"
+  | "rollback-recovery-poisoned"
+  | "adapter-lookup"
+  | "adapter-record-accepted"
+  | "adapter-record-overloaded";
+export type IngressOutcomeFailureWarning = (
+  accountId: string,
+  category: IngressOutcomeFailureCategory,
+) => void;
 export type OutcomeLookup =
   | { status: "found"; outcome: IngressOutcome }
   | { status: "not-found" }
@@ -55,6 +74,7 @@ type OutcomeStoreOptions = {
   maxRollbackRecoveryEntries?: number;
   maxRollbackRecoveryBytes?: number;
   warnInvariant?: (message: string) => void;
+  warnFailure?: IngressOutcomeFailureWarning;
 };
 
 type HotEntry = {
@@ -155,10 +175,12 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       // this process. A process restart retains the plan's documented crash
       // tradeoff, but this live process can no longer silently ACK lost work.
       rollbackRecoveryPoisoned = true;
+      options.warnFailure?.(accountId, "rollback-recovery-poisoned");
       return;
     }
     rollbackRecovery.set(mapKey, { accountId, key, outcome, durability, bytes });
     totalRollbackRecoveryBytes += bytes;
+    options.warnFailure?.(accountId, `rollback-${outcome}`);
   };
 
   const hasRecent = async (
@@ -198,7 +220,13 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
   };
 
   const lookupUnlocked = async (accountId: string, key: string): Promise<OutcomeLookup> => {
-    const rejected = await hasRecent(options.overloaded, accountId, key);
+    let rejected: { found: boolean; diskError?: unknown };
+    try {
+      rejected = await hasRecent(options.overloaded, accountId, key);
+    } catch (error) {
+      options.warnFailure?.(accountId, "lookup-overloaded");
+      return { status: "unknown", error };
+    }
     if (rejected.found) {
       let accepted: { found: boolean; diskError?: unknown } | undefined;
       try { accepted = await hasRecent(options.accepted, accountId, key); } catch { /* overload remains authoritative */ }
@@ -209,9 +237,18 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       putHot(accountId, key, "overloaded", "durable");
       return { status: "found", outcome: "overloaded" };
     }
-    if (rejected.diskError !== undefined) return { status: "unknown", error: rejected.diskError };
+    if (rejected.diskError !== undefined) {
+      options.warnFailure?.(accountId, "lookup-overloaded");
+      return { status: "unknown", error: rejected.diskError };
+    }
 
-    const accepted = await hasRecent(options.accepted, accountId, key);
+    let accepted: { found: boolean; diskError?: unknown };
+    try {
+      accepted = await hasRecent(options.accepted, accountId, key);
+    } catch (error) {
+      options.warnFailure?.(accountId, "lookup-accepted");
+      return { status: "unknown", error };
+    }
     if (accepted.found) {
       const existing = hot.get(hotKey(accountId, key));
       putHot(
@@ -222,7 +259,10 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
       );
       return { status: "found", outcome: "accepted" };
     }
-    if (accepted.diskError !== undefined) return { status: "unknown", error: accepted.diskError };
+    if (accepted.diskError !== undefined) {
+      options.warnFailure?.(accountId, "lookup-accepted");
+      return { status: "unknown", error: accepted.diskError };
+    }
     return { status: "not-found" };
   };
 
@@ -231,6 +271,7 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
     key: string,
   ): Promise<{ status: "ok" } | { status: "unknown"; error: unknown }> => {
     if (rollbackRecoveryPoisoned) {
+      options.warnFailure?.(accountId, "rollback-recovery-poisoned");
       return { status: "unknown", error: rollbackRecoveryPoisonedError };
     }
     const mapKey = hotKey(accountId, key);
@@ -244,9 +285,13 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         onDiskError: (error) => { diskError = error; },
       });
     } catch (error) {
+      options.warnFailure?.(accountId, `rollback-recovery-${recovery.outcome}`);
       return { status: "unknown", error };
     }
-    if (diskError !== undefined) return { status: "unknown", error: diskError };
+    if (diskError !== undefined) {
+      options.warnFailure?.(accountId, `rollback-recovery-${recovery.outcome}`);
+      return { status: "unknown", error: diskError };
+    }
     // `false` is also a successful cleanup: it means the exact marker is already
     // absent. The key gate prevents a replacement generation from being created
     // between this delete and releasing the quarantine.
@@ -291,14 +336,21 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
         }
         if (recordOptions?.replaceOpposite) {
           let forgetDiskError: unknown;
-          await oppositeStore.forget(key, {
-            namespace: accountId,
-            onDiskError: (error) => { forgetDiskError = error; },
-          });
+          try {
+            await oppositeStore.forget(key, {
+              namespace: accountId,
+              onDiskError: (error) => { forgetDiskError = error; },
+            });
+          } catch (error) {
+            options.warnFailure?.(accountId, `replace-with-${outcome}`);
+            releaseOperation();
+            return { status: "unknown", error };
+          }
           // The SDK forget API reports storage failures only through this hook.
           // Fail closed: recording/ACKing the replacement while a durable
           // opposite marker may remain would create a dual terminal outcome.
           if (forgetDiskError !== undefined) {
+            options.warnFailure?.(accountId, `replace-with-${outcome}`);
             releaseOperation();
             return { status: "unknown", error: forgetDiskError };
           }
@@ -309,10 +361,12 @@ export function createIngressOutcomeStore(options: OutcomeStoreOptions): Ingress
           onDiskError: (error) => { diskError = error; },
         });
       } catch (error) {
+        options.warnFailure?.(accountId, `record-${outcome}`);
         releaseOperation();
         return { status: "unknown", error };
       }
       if (diskError !== undefined) {
+        options.warnFailure?.(accountId, `record-${outcome}`);
         if (outcome === "overloaded") {
           // SDK has already inserted a memory marker. It must not authorize a
           // terminal rejection, so remove memory first and best-effort disk state.
@@ -426,6 +480,54 @@ export function createRateLimitedOutcomeInvariantWarning(
   };
 }
 
+const OUTCOME_FAILURE_CATEGORIES: readonly IngressOutcomeFailureCategory[] = [
+  "lookup-overloaded",
+  "lookup-accepted",
+  "record-accepted",
+  "record-overloaded",
+  "replace-with-accepted",
+  "replace-with-overloaded",
+  "rollback-accepted",
+  "rollback-overloaded",
+  "rollback-recovery-accepted",
+  "rollback-recovery-overloaded",
+  "rollback-recovery-poisoned",
+  "adapter-lookup",
+  "adapter-record-accepted",
+  "adapter-record-overloaded",
+];
+
+/** Fixed-category limiter: keys, message data, and arbitrary errors never enter warning state. */
+export function createRateLimitedOutcomeFailureWarning(
+  warn: (message: string) => void,
+  now: () => number = Date.now,
+  intervalMs = 60_000,
+): IngressOutcomeFailureWarning {
+  const state = new Map<IngressOutcomeFailureCategory, { lastAt: number; suppressed: number }>(
+    OUTCOME_FAILURE_CATEGORIES.map((category) => [
+      category,
+      { lastAt: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    ]),
+  );
+  return (accountId, category) => {
+    const entry = state.get(category);
+    if (!entry) return;
+    const at = now();
+    if (at - entry.lastAt < intervalMs) {
+      entry.suppressed = Math.min(entry.suppressed + 1, Number.MAX_SAFE_INTEGER);
+      return;
+    }
+    const safeAccount = /^[A-Za-z0-9._-]{1,64}$/.test(accountId) ? accountId : "<redacted>";
+    const suppressed = entry.suppressed;
+    entry.lastAt = at;
+    entry.suppressed = 0;
+    warn(
+      `webchannel: ingress outcome storage unavailable account=${safeAccount} ` +
+        `category=${category} action=retry-fail-closed suppressed=${suppressed}`,
+    );
+  };
+}
+
 const DEDUPE_OPTIONS = {
   ttlMs: 7 * 24 * 60 * 60 * 1_000,
   memoryMaxSize: 2_048,
@@ -437,6 +539,9 @@ let processStore: IngressOutcomeStore | undefined;
 const processInvariantWarning = createRateLimitedOutcomeInvariantWarning((message) =>
   console.warn(message),
 );
+const processFailureWarning = createRateLimitedOutcomeFailureWarning((message) =>
+  console.warn(message),
+);
 
 /** One accepted/overloaded store pair and one hot cache for the whole process. */
 export function getProcessIngressOutcomeStore(): IngressOutcomeStore {
@@ -445,6 +550,7 @@ export function getProcessIngressOutcomeStore(): IngressOutcomeStore {
       accepted: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "persistent-dedupe" }),
       overloaded: createPersistentDedupe({ ...DEDUPE_OPTIONS, namespacePrefix: "webchannel-inbound-overloaded" }),
       warnInvariant: processInvariantWarning,
+      warnFailure: processFailureWarning,
     });
   }
   return processStore;

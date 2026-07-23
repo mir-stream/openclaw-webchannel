@@ -708,6 +708,49 @@ describe("real createPersistentDedupe (hermetic, isolated state dir)", () => {
 });
 
 describe("protocol-v2 outcome/lease ingress ordering", () => {
+  it.each([
+    ["lookup", "adapter-lookup", "accepted"],
+    ["record-accepted", "adapter-record-accepted", "accepted"],
+    ["record-overloaded", "adapter-record-overloaded", "rejected"],
+  ] as const)(
+    "rate-limits content-free warnings when the outcome %s adapter throws",
+    async (failure, category, offerStatus) => {
+      const store = {
+        peek: vi.fn(),
+        lookup: vi.fn(async () => {
+          if (failure === "lookup") throw new Error("secret lookup peer:id");
+          return { status: "not-found" as const };
+        }),
+        record: vi.fn(async () => {
+          throw new Error("secret record ciphertext");
+        }),
+        forget: vi.fn(), hotSize: vi.fn(), rollbackRecoverySize: vi.fn(),
+      } as unknown as IngressOutcomeStore;
+      const warn = vi.fn();
+      const onFlush = createIngressOnFlush<Item>({
+        accountId: "acct",
+        outcomeStore: store,
+        beginBatch: () => ({
+          offer: () => offerStatus === "accepted"
+            ? { status: "accepted" as const, commit: vi.fn(), rollback: vi.fn() }
+            : { status: "rejected" as const, reason: "session-byte-count" as const },
+          finish: vi.fn(),
+        }),
+        logWarn: warn,
+      });
+
+      await onFlush([item("secret-peer", "secret content", "secret-id-one")]);
+      await onFlush([item("other-secret-peer", "other content", "secret-id-two")]);
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[0]).toContain(`category=${category}`);
+      expect(warn.mock.calls[0]?.[0]).toContain("account=acct");
+      expect(warn.mock.calls.flat().join(" ")).not.toMatch(
+        /secret-peer|secret content|secret-id|ciphertext|peer:id/,
+      );
+    },
+  );
+
   it("releases every held outcome gate before awaiting multi-item /stop cancellation", async () => {
     const budget = new InboundRetentionBudget({
       maxMessagesPerSession: 8,

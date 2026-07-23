@@ -283,6 +283,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
   const { accountId, checkAndRecord, dispatch, coalesce, sendAck, cancelledFallback, logInfo, logWarn } = deps;
   const isActive = deps.isActive ?? (() => true);
   const sinks: IngressDedupeLogSinks = { info: logInfo, warn: logWarn };
+  const warnOutcomeFailure = createRateLimitedOutcomeFailureWarning((message) => logWarn?.(message));
   return async (items) => {
     if (!isActive()) return;
     if (deps.outcomeStore && deps.beginBatch) {
@@ -408,6 +409,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           try {
             existing = await deps.outcomeStore.lookup(accountId, key);
           } catch (error) {
+            warnOutcomeFailure(accountId, "adapter-lookup");
             existing = { status: "unknown", error };
           }
           if (!isActive() || !retainedItem.isActive()) {
@@ -437,6 +439,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
             try {
               result = await deps.outcomeStore.record(accountId, key, "overloaded");
             } catch {
+              warnOutcomeFailure(accountId, "adapter-record-overloaded");
               // The same FIFO barrier below handles thrown adapters and explicit
               // tri-state unknown identically.
             }
@@ -469,6 +472,7 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
           try {
             recorded = await deps.outcomeStore.record(accountId, key, "accepted");
           } catch {
+            warnOutcomeFailure(accountId, "adapter-record-accepted");
             // A thrown storage adapter is the same unresolved classification as
             // `{status:"unknown"}` and blocks this suffix.
           }
@@ -662,5 +666,6 @@ import type {
   OutcomeRecordResult,
   OutcomeWriteReceipt,
 } from "./ingress-outcome.js";
+import { createRateLimitedOutcomeFailureWarning } from "./ingress-outcome.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
 import type { IngressResultFrame } from "./ingress-result-chunks.js";
