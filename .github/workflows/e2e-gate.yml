@@ -232,14 +232,15 @@ jobs:
         run: bash e2e/local/run-all-real.sh
 
       # ──────────────────────────────────────────────────────────────────────
-      # 8f. Live e2e: 2-account routing isolation (가-1 Cycle 3 — AC6 gate)
-      #    ONE gateway serves TWO webchannel accounts (acctA→agentA, acctB→agentB),
-      #    each bound to a DISTINCT agent (distinct echo prefix) via binding.account.
-      #    A Node driver messages each account and asserts ROUTING ISOLATION: acctA's
-      #    reply carries agentA's prefix and NOT agentB's (and symmetrically). Proves
-      #    the REAL registerFull multiplex + single-route JWT-aud→account dispatch +
-      #    binding.account routing (no mocks). Node-only (no Chromium). Isolated under
-      #    /tmp/oc-two-acct-e2e (port 19299) — hermetic, no secret. Non-zero exit FAILS.
+      # 8f. Live e2e: one-process/two-account isolation (issue #54 gate)
+      #    ONE gateway serves two account runtimes sharing tenant/relay/issuer/JWKS.
+      #    Its latest structured aggregate record must report complete 2/2.
+      #    Production clients prove A→A and B→B, then an A-authorized token sent
+      #    to B's live register subject must receive exact opaque 401 with no B
+      #    peer/key/history/approval effect, followed by another healthy B→B.
+      #    The host starts both accounts through the coordinator and production
+      #    account-bound NatsChannels plus binding.account routing (no mocks).
+      #    Node-only, hermetic under /tmp/oc-two-acct-e2e; non-zero exit fails.
       # ──────────────────────────────────────────────────────────────────────
       - name: "Live e2e: 2-account routing isolation"
         run: bash e2e/local/run-two-account-isolation.sh

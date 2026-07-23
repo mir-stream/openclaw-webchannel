@@ -1144,7 +1144,9 @@ by tests:
   arrival cutoff once, and cannot manufacture another probe or core restart;
 - primary and account-targeted routing remain correct as accounts recover/stop;
 - invalid IDs appear in doctor without being canonicalized or used as paths;
-- shared-audience warning/doctor semantics remain unchanged;
+- account-bound audience semantics remain unchanged: any legacy
+  `auth.jwt.audience` key is a targeted migration finding and the runtime account
+  id is the verifier's immutable expected `aud`;
 - established disconnect/reconnect keeps supported account status truthful;
 - logs escape invalid IDs and redact every non-origin component of relay URLs;
 - observability uses structured logs and supported OpenClaw account status only;

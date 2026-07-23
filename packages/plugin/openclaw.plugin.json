@@ -83,8 +83,7 @@
                     "description": "Expected `iss` claim. Tokens with a different iss are rejected (constant-time compare)."
                   },
                   "audience": {
-                    "type": "string",
-                    "description": "Expected `aud` claim (string OR array containing it)."
+                    "description": "REMOVED — delete this key. JWT aud is always the runtime accountId; every JSON value reaches a targeted migration error."
                   },
                   "clockSkew": {
                     "type": "integer",
@@ -93,7 +92,7 @@
                     "description": "Allowed clock-skew leeway in seconds when checking exp. Default 60."
                   }
                 },
-                "required": ["issuer", "audience"]
+                "required": []
               }
             }
           },
@@ -275,8 +274,8 @@
           "help": "Expected `iss` claim. Tokens whose iss does not match (constant-time compare) are rejected. DERIVED at runtime from the SaaS base URL (`issuer == saas.baseUrl`) when omitted; set this only to pin a different issuer (proxy / custom-domain)."
         },
         "auth.jwt.audience": {
-          "label": "Audience (aud)",
-          "help": "Expected `aud` claim. Tokens whose aud is neither this string nor an array containing it are rejected. DERIVED at runtime from the account id (`audience == accountId`) when omitted; set this only to pin a different audience."
+          "label": "Audience (removed)",
+          "help": "REMOVED — delete auth.jwt.audience. The plugin always expects JWT aud to contain its runtime accountId. This value is never used as verifier configuration."
         },
         "auth.jwt.clockSkew": {
           "label": "Clock skew (sec)",

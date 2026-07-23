@@ -155,6 +155,53 @@ const STRUCTURAL_KEYS = new Set(["accounts", "defaultAccount", "enabled"]);
 /** A single resolved account's raw config object. */
 export type WebchannelAccountConfig = Record<string, unknown>;
 
+export class RemovedAudienceConfigError extends Error {
+  readonly accountId: string;
+  readonly paths: readonly string[];
+
+  constructor(accountId: string, paths: readonly string[]) {
+    super(
+      `webchannel: removed config ${paths.join(", ")} is no longer supported for account ` +
+        `${JSON.stringify(accountId)}; delete auth.jwt.audience. JWT aud is always the runtime ` +
+        `accountId. Refusing to serve this account.`,
+    );
+    this.name = "RemovedAudienceConfigError";
+    this.accountId = accountId;
+    this.paths = [...paths];
+  }
+}
+
+function hasRawAudience(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const jwt = (value as { jwt?: unknown }).jwt;
+  return Boolean(
+    jwt &&
+      typeof jwt === "object" &&
+      !Array.isArray(jwt) &&
+      Object.prototype.hasOwnProperty.call(jwt, "audience"),
+  );
+}
+
+/** Return the raw removed-key locations that scope to one account before merge. */
+export function findRemovedAudiencePaths(cfg: unknown, accountId: string): string[] {
+  const section = readWebchannelSection(cfg);
+  if (!section) return [];
+  const paths: string[] = [];
+  if (hasRawAudience(section.auth)) {
+    paths.push("channels.webchannel.auth.jwt.audience");
+  }
+  const account = readAccountsMap(section)[accountId];
+  if (account && hasRawAudience(account.auth)) {
+    paths.push(`channels.webchannel.accounts.${accountId}.auth.jwt.audience`);
+  }
+  return paths;
+}
+
+export function assertNoRemovedAudienceConfig(cfg: unknown, accountId: string): void {
+  const paths = findRemovedAudiencePaths(cfg, accountId);
+  if (paths.length > 0) throw new RemovedAudienceConfigError(accountId, paths);
+}
+
 /**
  * Acquisition identity for an account — the inputs the device-flow enroll needs.
  * `saasBaseUrl` is optional; the credential-source resolver owns its full

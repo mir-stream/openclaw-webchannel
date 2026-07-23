@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 
-import { formatAccountIdForLog } from "./account-config.js";
+import {
+  formatAccountIdForLog,
+  RemovedAudienceConfigError,
+} from "./account-config.js";
 import {
   NatsConnectionClosedError,
   NatsHandshakeTimeoutError,
@@ -131,6 +134,15 @@ function startupCloseLabel(code: number): string {
 
 export function classifyAccountStartupFailure(cause: unknown, phase: AccountStartupPhase = "websocket"): AccountStartupFailure {
   if (cause instanceof AccountStartupError) return cause.failure;
+  if (cause instanceof RemovedAudienceConfigError) {
+    return {
+      kind: "permanent",
+      code: "audience-override-removed",
+      phase: "preflight",
+      cause,
+      operatorMessage: cause.message,
+    };
+  }
   if (cause instanceof NatsLifecycleAbortError || cause instanceof JwksLifecycleAbortError ||
       (cause instanceof DOMException && cause.name === "AbortError")) {
     return { kind: "aborted", code: "lifecycle-aborted", phase, cause, operatorMessage: "account startup aborted" };

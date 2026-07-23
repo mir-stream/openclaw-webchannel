@@ -216,8 +216,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
             "strategy": "jwt",
             "jwt": {
               "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
-              "issuer": "$SAAS_ISSUER",
-              "audience": "$ACCOUNT_ID"
+              "issuer": "$SAAS_ISSUER"
             }
           },
           "dmSecurity": "allowlist",
@@ -281,8 +280,8 @@ echo "[run-enrolled] ✓ credentials persisted at $CRED_FILE"
 # 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
 #      setup adapter writes the demo-proven block (`admission: "register-hop"`,
 #      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
-#      override that disables the HTTP register hop (no aud→account dispatch
-#      entry ⇒ challenge 401 "No account for token audience"), and this harness
+#      override that disables the account-bound NATS register hop (the live
+#      account subject has no prepared verifier/handler), and this harness
 #      exists precisely to drive the register hop. Restore the pre-add intent:
 #      register-hop admission + allowlist DM security.
 node -e '

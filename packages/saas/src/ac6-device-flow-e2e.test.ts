@@ -143,6 +143,9 @@ async function startBootstrapServer(): Promise<void> {
       PORT: String(BOOTSTRAP_SERVER_PORT),
       SAAS_BASE_URL: BOOTSTRAP_BASE_URL,
       WEBCHANNEL_AGENT_PUBLIC_KEY: bootstrapAgentPublicKey,
+      ENABLE_TEST_ROUTES: "1",
+      REFERENCE_TENANT: TEST_TENANT,
+      REFERENCE_ACCOUNT_ID: TEST_ACCOUNT_ID,
     },
     stdio: "pipe",
   });
@@ -396,6 +399,21 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     expect(bootstrap.agentPublicKey).not.toBe(attackerKey.publicKey);
   });
 
+  it("test bootstrap rejects a peerId that can alter the NATS subject hierarchy", async () => {
+    const response = await fetch(`${SAAS_BASE_URL}/test/bootstrap-jwt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tenant: TEST_TENANT,
+        accountId: TEST_ACCOUNT_ID,
+        peerId: "peer.*",
+        deviceX25519PublicKey: await generateDeviceKey(),
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: expect.stringMatching(/peerId/) });
+  });
+
   // -------------------------------------------------------------------------
   // Test 4: Complete enrollment flow with approval
   // -------------------------------------------------------------------------
@@ -517,6 +535,8 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       agentPublicKey: string;
       jwksUrl: string;
       natsUrl: string;
+      accountId: string;
+      tenant: string;
     };
 
     expect(bootstrapResponse.jwt).toBeDefined();
@@ -524,6 +544,8 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     expect(bootstrapResponse.agentPublicKey).toBe(bootstrapAgentPublicKey);
     expect(bootstrapResponse.jwksUrl).toContain("/.well-known/jwks.json");
     expect(bootstrapResponse.natsUrl).toContain("nats");
+    expect(bootstrapResponse.accountId).toBe(TEST_ACCOUNT_ID);
+    expect(bootstrapResponse.tenant).toBe(TEST_TENANT);
 
     // Verify JWT structure (header.payload.signature)
     const jwtParts = bootstrapResponse.jwt.split(".");
@@ -546,7 +568,6 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       iss: expect.any(String),
       sub: bootstrapResponse.peerId, // peerId is threaded into sub
       aud: TEST_ACCOUNT_ID,
-      accountId: TEST_ACCOUNT_ID,
       tenant: TEST_TENANT,
       cnf: {
         jwk: {
@@ -603,6 +624,23 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     expect(identity?.devicePublicKey).toBe(devicePublicKey);
 
     console.log(`[AC6 E2E] verifyJwt admitted real-issuer JWT for peerId: ${identity?.peerId}`);
+  });
+
+  it("standalone test issuer rejects a caller that tries to choose another tuple", async () => {
+    const devicePublicKey = await generateDeviceKey();
+    const response = await fetch(`${BOOTSTRAP_BASE_URL}/bootstrap`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        devicePublicKey,
+        tenant: TEST_TENANT,
+        accountId: "caller-chosen-account",
+      }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: expect.stringMatching(/server-owned test tuple/),
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -855,7 +893,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       `${BOOTSTRAP_BASE_URL}/bootstrap`,
       {
         devicePublicKey: deviceKey,
-        accountId,
+        accountId: TEST_ACCOUNT_ID,
         tenant: TEST_TENANT,
       },
     ) as {

@@ -28,4 +28,17 @@ describe("shipped WebChannel manifest schema", () => {
   it("retains strict unknown-key rejection", () => {
     expect(runtime.safeParse({ unknownLifecycleKey: true }).success).toBe(false);
   });
+
+  it("lets every JSON value reach the removed-audience runtime tombstone", () => {
+    for (const audience of [null, "", "legacy", 0, false, [], {}, ["a"]]) {
+      expect(runtime.safeParse({
+        auth: { strategy: "jwt", jwt: { audience } },
+      }).success).toBe(true);
+      expect(runtime.safeParse({
+        accounts: {
+          named: { auth: { strategy: "jwt", jwt: { audience } } },
+        },
+      }).success).toBe(true);
+    }
+  });
 });

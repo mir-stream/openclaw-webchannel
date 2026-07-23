@@ -163,6 +163,42 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
     expect(approve.ok).toBe(true);
     const approved = (await enrollments()).find((e) => e.userCode === code);
     expect(approved!.status).toBe("approved");
+
+    const cookie = await loginCookie("alice", "demo");
+    const bootstrap = async (body: Record<string, unknown>) => {
+      const response = await fetch(`${BASE}/bootstrap`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", cookie },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    };
+    const deviceKey = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+    const valid = await bootstrap({
+      tenant: TENANT,
+      accountId: ACCOUNT_ID,
+      deviceX25519PublicKey: deviceKey,
+    });
+    expect(valid.status).toBe(200);
+    expect(valid.body.agentPublicKey).toBe(deviceKey);
+    const claims = JSON.parse(
+      Buffer.from(String(valid.body.jwt).split(".")[1], "base64url").toString("utf8"),
+    ) as Record<string, unknown>;
+    expect(claims.aud).toBe(ACCOUNT_ID);
+    expect(claims.tenant).toBe(TENANT);
+    expect(claims.sub).toBe(ALICE_UUID);
+    expect(claims).not.toHaveProperty("accountId");
+
+    expect((await bootstrap({
+      tenant: "foreign-tenant",
+      accountId: ACCOUNT_ID,
+      deviceX25519PublicKey: deviceKey,
+    })).status).toBe(403);
+    expect((await bootstrap({
+      tenant: TENANT,
+      accountId: "foreign-account",
+      deviceX25519PublicKey: deviceKey,
+    })).status).toBe(403);
   });
 
   it("tracks a denied enrollment as denied", async () => {

@@ -49,28 +49,36 @@ describe("buildBootstrapClaims", () => {
 
   it("requires a peerId", () => {
     expect(() => buildBootstrapClaims({ ...base, peerId: "" })).toThrow(/peerId/);
+    expect(() => buildBootstrapClaims({ ...base, peerId: "peer.*" })).toThrow(/peerId/);
+    expect(() => buildBootstrapClaims({ ...base, peerId: "peer.with.dot" })).toThrow(/peerId/);
   });
 
-  it("scalar accountId keeps the byte-for-byte behaviour: aud === accountId === id", () => {
+  it("uses scalar accountId solely as the signed aud", () => {
     const claims = buildBootstrapClaims(base);
     expect(claims.aud).toBe("agent-1");
-    expect(claims.accountId).toBe("agent-1");
+    expect(claims).not.toHaveProperty("accountId");
   });
 
-  it("array accountId mints a multi-audience token with a dead (empty) top-level accountId", () => {
+  it("array accountId mints a multi-audience token without a duplicate accountId claim", () => {
     const claims = buildBootstrapClaims({ ...base, accountId: ["agent-dev", "agent-ops"] });
     expect(claims.aud).toEqual(["agent-dev", "agent-ops"]);
-    // The top-level accountId is a dead claim; multi-aud has no single primary → "".
-    expect(claims.accountId).toBe("");
+    expect(claims).not.toHaveProperty("accountId");
   });
 
   it("a single-element array still yields an array aud (multi form), not a scalar", () => {
     const claims = buildBootstrapClaims({ ...base, accountId: ["agent-dev"] });
     expect(claims.aud).toEqual(["agent-dev"]);
-    expect(claims.accountId).toBe("");
+    expect(claims).not.toHaveProperty("accountId");
   });
 
   it("rejects an empty accountId array", () => {
     expect(() => buildBootstrapClaims({ ...base, accountId: [] })).toThrow(/non-empty/);
+  });
+
+  it("rejects tenant/account subject wildcards and empty tokens", () => {
+    expect(() => buildBootstrapClaims({ ...base, tenant: "" })).toThrow(/tenant/);
+    expect(() => buildBootstrapClaims({ ...base, tenant: "acme.*" })).toThrow(/tenant/);
+    expect(() => buildBootstrapClaims({ ...base, accountId: "bad.>" })).toThrow(/accountId/);
+    expect(() => buildBootstrapClaims({ ...base, accountId: ["agent-ok", "bad.*"] })).toThrow(/accountId/);
   });
 });

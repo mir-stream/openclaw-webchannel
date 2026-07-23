@@ -63,7 +63,7 @@ else
   PRIMARY_MODEL="echo-local/echo"
 fi
 
-# Config with BOTH accounts under ONE gateway (each its own jwt.audience = its id).
+# Config with BOTH accounts under ONE gateway. Each account key is its JWT audience.
 ACCT_BLOCKS=""
 for acct in "${ACCOUNTS[@]}"; do
   [ -n "$ACCT_BLOCKS" ] && ACCT_BLOCKS="$ACCT_BLOCKS,"
@@ -72,8 +72,7 @@ for acct in "${ACCOUNTS[@]}"; do
           \"tenant\": \"$TENANT\",
           \"auth\": { \"strategy\": \"jwt\", \"jwt\": {
             \"jwksUrl\": \"$SAAS_URL/.well-known/jwks.json\",
-            \"issuer\": \"$ISSUER\",
-            \"audience\": \"$acct\"
+            \"issuer\": \"$ISSUER\"
           } },
           \"dmSecurity\": \"allowlist\",
           \"allowFrom\": [\"$UUID_ALICE\", \"$UUID_BOB\", \"$UUID_ADMIN\"]
@@ -158,7 +157,9 @@ HOME="$HOME_DIR" OPENCLAW_HOME="$HOME_DIR" OPENCLAW_DISABLE_BONJOUR=1 \
 GW_PID=$!
 echo "[multiplex] gateway pid=$GW_PID serving ${#ACCOUNTS[@]} accounts — waiting…"
 for i in $(seq 1 240); do
-  if grep -qE "NATS mode plugin registered \(${#ACCOUNTS[@]} of" "$HOME_DIR/gateway.log" 2>/dev/null; then
+  latest_aggregate="$(grep "event=webchannel\.account_aggregate" "$HOME_DIR/gateway.log" 2>/dev/null | tail -n 1 || true)"
+  if printf '%s\n' "$latest_aggregate" | grep -Eq \
+    "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=${#ACCOUNTS[@]} totalCount=${#ACCOUNTS[@]}"; then
     echo "[multiplex] ✓ one gateway (pid=$GW_PID) serving: ${ACCOUNTS[*]} on :$PORT"; break
   fi
   kill -0 "$GW_PID" 2>/dev/null || { echo "[multiplex] gateway died:"; tail -20 "$HOME_DIR/gateway.log"; exit 2; }

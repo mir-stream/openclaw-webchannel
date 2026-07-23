@@ -23,7 +23,7 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
   it("(a) with NO issuer/audience: OMITS all JWT-verify params (they derive at runtime)", () => {
     // Trust-anchor change 2: the builder no longer GUESSES issuer/jwksUrl/audience.
     // It emits `auth.strategy:"jwt"` but NO `auth.jwt` sub-object — the runtime
-    // deriver (`deriveAccountAuth`) fills issuer=saas.baseUrl, audience=accountId,
+    // deriver fills issuer=saas.baseUrl; the verifier binds aud to accountId,
     // jwksUrl=saas.baseUrl+/.well-known/jwks.json from the anchor. What stays: the
     // anchor (saas.baseUrl), strategy, admission=register-hop, enrolled creds,
     // dmSecurity=open. Mirrors e2e/local/run-demo-synadia.sh MINUS nats.url
@@ -53,16 +53,15 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
     expect((patch.auth as { jwt?: unknown }).jwt).toBeUndefined();
   });
 
-  it("(b) with explicit issuer + audience OPERATOR PINS: writes them (pin honored), but never jwksUrl", () => {
+  it("(b) with an explicit issuer pin writes it but never audience/jwksUrl", () => {
     const patch = buildFullAccountPatch({
       tenant: "default-tenant",
       saasBaseUrl: "http://host.docker.internal:3951",
       accountId: "default-agent",
       issuer: "http://127.0.0.1:3951",
-      audience: "default-agent",
     });
     expect((patch.auth as { jwt: { issuer: string } }).jwt.issuer).toBe("http://127.0.0.1:3951");
-    expect((patch.auth as { jwt: { audience: string } }).jwt.audience).toBe("default-agent");
+    expect((patch.auth as { jwt: Record<string, unknown> }).jwt).not.toHaveProperty("audience");
     // jwksUrl is NEVER written by the builder anymore — it derives at runtime.
     expect((patch.auth as { jwt: { jwksUrl?: unknown } }).jwt.jwksUrl).toBeUndefined();
   });
@@ -167,18 +166,18 @@ describe("setup-wizard: per-field funnel safety", () => {
     });
   });
 
-  it("finalize derives a CANONICAL audience/account key for a mixed-case account id", () => {
+  it("finalize uses the CANONICAL account key without persisting a separate audience", () => {
     const cfg = { channels: { webchannel: { accounts: {} } } } as never;
     const finalized = webchannelSetupWizard.finalize?.({
       cfg,
       accountId: "AcctA",
-      // audience is the default the wizard surfaces = canonical(accountId).
-      credentialValues: { tenant: "t", saasBaseUrl: "http://s", audience: "accta" },
+      credentialValues: { tenant: "t", saasBaseUrl: "http://s" },
     } as never) as { cfg: unknown };
-    // Written under the canonical key, and aud matches that key.
+    // The account key is the JWT audience; there is no independently writable
+    // audience field that can drift from it.
     const written = account(finalized.cfg, "accta");
     expect(written).toBeDefined();
-    expect((written.auth as { jwt: { audience: string } }).jwt.audience).toBe("accta");
+    expect((written.auth as { jwt?: Record<string, unknown> }).jwt?.audience).toBeUndefined();
   });
 
   it("finalize NEVER writes an issuer pin — even if a stray issuer value is collected", () => {

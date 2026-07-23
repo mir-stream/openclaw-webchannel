@@ -93,7 +93,7 @@ export type AccountReadinessInput = {
   jwks?: JwksReadiness;
   /**
    * The account's JWT verifier could not be BUILT (missing/unresolvable
-   * issuer/audience/jwks source — `assertJwtAuthConfig` threw).
+   * issuer/JWKS source — cache-free verifier preparation threw).
    * This is a hard CONFIG fault that skips the account (fail-closed, never a
    * downgrade to `auto`); naming it here lets the FAIL line still report the
    * issuer/aud state alongside the reason.
@@ -205,9 +205,7 @@ export function formatAccountReadiness(
 // browser. We do NOT fake one. Instead we run the strongest checks that ARE
 // achievable at add-time and that directly catch the traps this design targets:
 //
-//   1. issuer/aud INTERNAL consistency — the derived audience must equal the
-//      accountId (what the SaaS mints, `bootstrap-claims.ts`); a config-PINNED
-//      audience that disagrees would reject every browser → hard FAIL naming it.
+//   1. issuer/aud INTERNAL consistency — audience is structurally accountId.
 //   2. JWKS reachable + NON-EMPTY at the DERIVED url, AND the SaaS-advertised
 //      `enrollment.jwksUrl` must match the derived url. A mismatch is the exact
 //      issuer-mismatch trap surfaced early: the --base-url used to enroll differs
@@ -224,14 +222,12 @@ export type AddPreflightFacts = {
   accountId: string;
   /** Effective (derived) issuer = saasBaseUrl, unless pinned. */
   effectiveIssuer: string;
-  /** Effective (derived) audience = accountId, unless pinned. */
+  /** Effective audience = accountId by construction. */
   effectiveAudience: string;
   /** The jwksUrl the agent DERIVES at runtime (saasBaseUrl + well-known). */
   derivedJwksUrl: string;
   /** The jwksUrl the SaaS ADVERTISED in the enrollment result (if any). */
   deliveredJwksUrl?: string;
-  /** A config-pinned `auth.jwt.audience` (operator escape hatch), if present. */
-  pinnedAudience?: string;
   /** JWKS resolution outcome against `derivedJwksUrl`. */
   jwks: JwksReadiness;
   /** Relay-dial outcome. */
@@ -248,18 +244,7 @@ export type AddPreflightReport = { ok: boolean; line: string };
 export function evaluateAddPreflight(facts: AddPreflightFacts): AddPreflightReport {
   const prefix = 'channels add preflight';
 
-  // 1. issuer/aud internal consistency (the issuer-mismatch trap, add-time).
-  if (facts.pinnedAudience !== undefined && facts.pinnedAudience !== facts.accountId) {
-    return {
-      ok: false,
-      line:
-        `${prefix}: FAIL — config pins auth.jwt.audience="${facts.pinnedAudience}" but the SaaS ` +
-        `mints aud="${facts.accountId}" (= accountId). The register JWT verify will reject every ` +
-        `browser. Set audience to the accountId or remove the pin.`,
-    };
-  }
-
-  // 2. JWKS reachable + non-empty + derivation matches the SaaS's own base URL.
+  // JWKS reachable + non-empty + derivation matches the SaaS's own base URL.
   if ('error' in facts.jwks) {
     return {
       ok: false,
@@ -338,7 +323,6 @@ export type RunAddPreflightOptions = {
   enrollment: AddPreflightEnrollment;
   /** Config-pinned operator escape hatches (config-present-wins). */
   pinnedIssuer?: string;
-  pinnedAudience?: string;
   /** Progress sink (the setup hook's `runtime.log`, or console). */
   log: (...args: unknown[]) => void;
   /** @internal Test seam: JWKS fetch impl (forwarded to JWKSCache). */
@@ -378,7 +362,7 @@ export async function runAddPreflight(
   // pin > SaaS-delivered (enrollment.issuer) > derived from --base-url.
   const effectiveIssuer =
     opts.pinnedIssuer ?? opts.enrollment.issuer ?? deriveIssuer(opts.saasBaseUrl);
-  const effectiveAudience = opts.pinnedAudience ?? opts.accountId;
+  const effectiveAudience = opts.accountId;
   const derivedJwksUrl = deriveJwksUrl(opts.saasBaseUrl);
 
   // An operator pin that CONTRADICTS what the SaaS just declared it mints is
@@ -442,7 +426,6 @@ export async function runAddPreflight(
     ...(opts.enrollment.jwksUrl !== undefined
       ? { deliveredJwksUrl: opts.enrollment.jwksUrl }
       : {}),
-    ...(opts.pinnedAudience !== undefined ? { pinnedAudience: opts.pinnedAudience } : {}),
     jwks,
     relay,
   });

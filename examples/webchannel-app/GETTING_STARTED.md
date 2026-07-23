@@ -186,8 +186,9 @@ The widget will:
 ## Step 6 — Attach your openclaw agent
 
 > ⚠️ **Three strings must match on both sides:** the **tenant** (`app-tenant`), the
-> **SaaS URL** (`http://127.0.0.1:4000`), and the **account / JWT audience**
-> (`agent-dev`). If openclaw uses a different account/audience, the agent will reject the
+> **SaaS URL** (`http://127.0.0.1:4000`), and the **account id**
+> (`agent-dev`). The account id is also the JWT audience; there is no separate audience
+> setting. If openclaw uses a different account, the agent will reject the
 > browser’s bootstrap JWT. Align them: keep the SaaS defaults, or set `APP_TENANT` /
 > `APP_ACCOUNT` on the server to match the account you add in openclaw.
 
@@ -205,7 +206,6 @@ openclaw channels add
 #   → select: WebChannel
 #   → WebChannel tenant id:        app-tenant
 #   → WebChannel SaaS base URL:    http://127.0.0.1:4000
-#   → JWT audience (advanced):     agent-dev     ← match the SaaS account
 #
 #   Enrollment created. user code: WXYZ-1234   (waiting for approval…)
 ```
@@ -243,8 +243,7 @@ replies over the E2E-encrypted NGS relay.
 
 - **Browser stuck on “waiting for agent” after `gateway` is up** → tenant/account
   mismatch (see the callout in Step 6). Confirm the SaaS logs `tenant=app-tenant
-  account=agent-dev` and that the wizard used the same tenant and an audience of
-  `agent-dev`.
+  account=agent-dev` and that the wizard used the same tenant and account id.
 - **`401` when approving** → wrong/missing `x-admin-token`; use the token the server
   supplied through `ENROLLMENT_ADMIN_TOKEN`.
 - **`npm install` 401/403** → the PAT lacks `read:packages`, or `.npmrc` is missing the

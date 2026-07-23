@@ -297,7 +297,7 @@ const demoEnrollmentAdminHandler = createDemoEnrollmentHandler({
       : { ok: false, status: 403, error: "admin session required" };
   },
   enrollment, defaultTenant: DEMO_TENANT,
-  registry: agentKeyRegistry, bootstrap: () => ({ error: "bootstrap is handled by the session route" }),
+  registry: agentKeyRegistry,
   onApproved(userCode) {
     markEnroll(userCode, "approved");
     const tracked = demoEnrollments.get(userCode);
@@ -607,13 +607,17 @@ export const demoSaasRequestHandler = async (req: IncomingMessage, res: ServerRe
       if (!user) return sendJson(res, { error: "not authenticated" }, 401);
       parseJsonBody(req, (body) => {
         if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
-        const { accountId, deviceX25519PublicKey, devicePopPublicKey } = body as {
+        const { tenant, accountId, deviceX25519PublicKey, devicePopPublicKey } = body as {
+          tenant?: string;
           accountId?: string;
           deviceX25519PublicKey?: string;
           devicePopPublicKey?: string;
         };
         if (!accountId || !deviceX25519PublicKey) {
           return sendJson(res, { error: "Missing required fields: accountId, deviceX25519PublicKey" }, 400);
+        }
+        if (tenant !== undefined && tenant !== DEMO_TENANT) {
+          return sendJson(res, { error: `user not authorized for tenant "${tenant}"` }, 403);
         }
         if (!userDir.canAccess(user, accountId)) {
           console.warn(`[bootstrap] ${user.username} DENIED for account "${accountId}"`);

@@ -77,7 +77,7 @@ export type EnvelopeType =
  * This is what the NATS relay operator can observe; it contains ZERO content.
  */
 export type EnvelopeRouting = {
-  /** SaaS-issued account (deployment) identity (accountId claim). Plaintext — used for NATS subject routing. */
+  /** Runtime account target/wire identity authorized by signed JWT `aud`. Plaintext — used for NATS subject routing. */
   readonly accountId: string;
   /** Tenant scope (tenant claim). Plaintext — used for NATS account isolation. */
   readonly tenant: string;

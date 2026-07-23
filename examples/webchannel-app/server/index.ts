@@ -358,7 +358,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (!user) return sendJson(res, { error: "not authenticated" }, 401);
     const body = await readBody(req);
     if (!body || typeof body !== "object") return sendJson(res, { error: "Invalid JSON body" }, 400);
-    const { accountId, deviceX25519PublicKey, devicePopPublicKey } = body as {
+    const { tenant, accountId, deviceX25519PublicKey, devicePopPublicKey } = body as {
+      tenant?: string;
       accountId?: string;
       deviceX25519PublicKey?: string;
       devicePopPublicKey?: string;
@@ -366,9 +367,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (!accountId || !deviceX25519PublicKey) {
       return sendJson(res, { error: "Missing required fields: accountId, deviceX25519PublicKey" }, 400);
     }
-    // accountId is authorized server-side; peerId is the session uuid (body
-    // peerId, if any, is IGNORED). This closes the signing-oracle vector.
-    if (!canAccess(user, accountId)) {
+    if (tenant !== undefined && tenant !== TENANT) {
+      return sendJson(res, { error: `user not authorized for tenant "${tenant}"` }, 403);
+    }
+    // This canonical example serves one fixed scalar target. The caller may
+    // echo the session-provided value, but cannot choose another signing tuple;
+    // peerId is likewise the session uuid (body peerId, if any, is ignored).
+    if (accountId !== ACCOUNT_ID || !canAccess(user, ACCOUNT_ID)) {
       console.warn(`[bootstrap] ${user.username} DENIED for account "${accountId}"`);
       return sendJson(res, { error: `user not authorized for account "${accountId}"` }, 403);
     }
@@ -377,7 +382,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       claims = buildBootstrapClaims({
         iss: SAAS_ISSUER,
         peerId: user.uuid, // server-pinned, NOT from body
-        accountId,
+        accountId: ACCOUNT_ID,
         tenant: TENANT,
         deviceX25519PublicKey,
         devicePopPublicKey,
@@ -389,7 +394,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const jwt = await issuer.sign(claims);
     // F2: pin the SaaS-attested agent key so the browser can authenticate the
     // register-delivered K. Present once the account's agent has enrolled.
-    const agentPublicKey = (await agentKeyRegistry.getActive(TENANT, accountId))?.publicKey ?? null;
+    const agentPublicKey = (await agentKeyRegistry.getActive(TENANT, ACCOUNT_ID))?.publicKey ?? null;
     return sendJson(res, {
       jwt,
       peerId: user.uuid,

@@ -79,6 +79,7 @@ const ENABLE_TEST_ROUTES = process.env.ENABLE_TEST_ROUTES === "1";
 // dashboard and the embeddable chat widget. Demo-only (conflates two personas onto
 // one page) so it stays behind a flag; the real approval/enroll routes are unchanged.
 const ENABLE_DEMO_UI = process.env.ENABLE_DEMO_UI === "1";
+const TEST_ROUTES_ENABLED = ENABLE_TEST_ROUTES && !ENABLE_DEMO_UI;
 // Path to the unified demo HTML (served at GET /). Required when ENABLE_DEMO_UI=1.
 const DEMO_APP_HTML = process.env.DEMO_APP_HTML || "";
 // Path to the browser client entry esbuild bundles into /widget.js.
@@ -226,7 +227,7 @@ const enrollmentAdminToken = process.env.ENROLLMENT_ADMIN_TOKEN;
 export const createReferenceEnrollmentHandler = createReferenceEnrollmentHttpHandler;
 const referenceAdminHandler = createReferenceEnrollmentHandler({
   adminToken: enrollmentAdminToken, enrollment,
-  registry: agentKeyRegistry, bootstrap: () => ({ error: "bootstrap is handled by the session route" }),
+  registry: agentKeyRegistry,
   async onApproved(userCode) {
     markDemoEnroll(userCode, "approved");
     const record = await enrollmentRepository.getEnrollmentByUserCode(userCode);
@@ -798,6 +799,10 @@ export const referenceEnrollmentRequestHandler = async (req: import("node:http")
           );
           return;
         }
+        if (tenant !== DEMO_TENANT) {
+          sendJson(res, { error: `not authorized for tenant "${tenant}"` }, 403);
+          return;
+        }
         // The user↔aud (account) ownership gate — the authorization boundary.
         if (!userDir!.canAccess(user, accountId)) {
           console.warn(`[bootstrap] ${user.username} DENIED for account "${accountId}" (not authorized)`);
@@ -948,7 +953,7 @@ export const referenceEnrollmentRequestHandler = async (req: import("node:http")
       // Disabled under ENABLE_DEMO_UI: the demo replaces this unauthenticated
       // mint oracle with the session-gated POST /nats-user below. Serving both
       // would leave the login gate bypassable.
-      if (!ENABLE_TEST_ROUTES || ENABLE_DEMO_UI) {
+      if (!TEST_ROUTES_ENABLED) {
         sendJson(res, { error: "Not found" }, 404);
         return;
       }
@@ -999,7 +1004,7 @@ export const referenceEnrollmentRequestHandler = async (req: import("node:http")
       // Disabled under ENABLE_DEMO_UI: this route trusts a client-supplied peerId
       // (unauthenticated forgery of any identity). The demo replaces it with the
       // session-gated POST /bootstrap below, which derives peerId server-side.
-      if (!ENABLE_TEST_ROUTES || ENABLE_DEMO_UI) {
+      if (!TEST_ROUTES_ENABLED) {
         sendJson(res, { error: "Not found" }, 404);
         return;
       }
@@ -1104,7 +1109,7 @@ export function startReferenceEnrollmentServer(): void { server.listen(PORT, () 
   console.log("==============================================");
   console.log("");
 
-  if (ENABLE_TEST_ROUTES) {
+  if (TEST_ROUTES_ENABLED) {
     console.warn("");
     console.warn("################################################################");
     console.warn("# ⚠️  ENABLE_TEST_ROUTES=1 — UNAUTHENTICATED TEST ROUTES ENABLED");
@@ -1117,6 +1122,8 @@ export function startReferenceEnrollmentServer(): void { server.listen(PORT, () 
     console.warn("#   oracle. They exist ONLY for hermetic E2E harnesses.");
     console.warn("#");
     console.warn("#   NEVER set ENABLE_TEST_ROUTES=1 in a real deployment.");
+  } else if (ENABLE_TEST_ROUTES && ENABLE_DEMO_UI) {
+    console.warn("[test-routes] ENABLE_TEST_ROUTES was requested but is suppressed because ENABLE_DEMO_UI=1");
     console.warn("################################################################");
     console.warn("");
   }

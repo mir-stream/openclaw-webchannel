@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * SaaS Bootstrap JWT issuance endpoint — REAL RS256 issuer + REAL JWKS.
+ * TEST-ONLY Bootstrap JWT issuance endpoint — REAL RS256 issuer + REAL JWKS.
  *
  * This server validates device PoP (proof of possession) inputs and issues
  * RS256-signed bootstrap JWTs containing cnf.jwk (X25519) + pop_jwk (Ed25519)
@@ -18,6 +18,8 @@
  *   GET  /.well-known/jwks.json     - Real RSA public key (RFC 7517) for verifiers
  *
  * ENVIRONMENT VARIABLES:
+ *   ENABLE_TEST_ROUTES=1 - mandatory explicit unsafe-test gate
+ *   REFERENCE_TENANT / REFERENCE_ACCOUNT_ID - mandatory server-owned tuple
  *   PORT          - Server port (default: 3001)
  *   SAAS_ISSUER   - Token issuer (`iss` claim). Default http://localhost:<PORT>.
  *   SAAS_BASE_URL - Base URL for response convenience fields (default http://localhost:<PORT>).
@@ -39,6 +41,7 @@ import type { JwksDocument } from "../src/types.js";
 // via WEBCHANNEL_AGENT_PUBLIC_KEY) so the browser pins the same key the agent
 // wraps under; omitted → the browser fail-closes on the register path.
 import { serializeBootstrapResponse } from "../src/p1-1-wire-adapter.js";
+import { assertValidSubjectToken } from "../src/subject-token.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -54,6 +57,13 @@ const NATS_URL = process.env.NATS_URL || "wss://nats.example.com";
 // The pin is supplied by the enrollment/registry owner. This standalone reference
 // server deliberately has no implicit identity fallback.
 const AGENT_PUBLIC_KEY = process.env.WEBCHANNEL_AGENT_PUBLIC_KEY;
+if (process.env.ENABLE_TEST_ROUTES !== "1") {
+  throw new Error("bootstrap-server is test-only; set ENABLE_TEST_ROUTES=1 explicitly");
+}
+const REFERENCE_TENANT = process.env.REFERENCE_TENANT ?? "";
+const REFERENCE_ACCOUNT_ID = process.env.REFERENCE_ACCOUNT_ID ?? "";
+assertValidSubjectToken(REFERENCE_TENANT, "REFERENCE_TENANT");
+assertValidSubjectToken(REFERENCE_ACCOUNT_ID, "REFERENCE_ACCOUNT_ID");
 
 // ---------------------------------------------------------------------------
 // Types
@@ -62,8 +72,9 @@ const AGENT_PUBLIC_KEY = process.env.WEBCHANNEL_AGENT_PUBLIC_KEY;
 type BootstrapRequest = {
   devicePublicKey: string; // base64url-encoded X25519 public key (→ cnf.jwk)
   devicePopPublicKey?: string; // base64url-encoded Ed25519 PoP public key (→ pop_jwk)
-  accountId: string;
-  tenant: string;
+  /** Legacy mismatch assertions only; callers cannot choose the signed tuple. */
+  accountId?: string;
+  tenant?: string;
   peerId?: string; // optional caller-supplied peerId; else derived from device key
   pop?: string; // Proof of possession (signature) - optional for this demo
 };
@@ -76,6 +87,8 @@ type BootstrapResponse = {
   agentPublicKey?: string;
   jwksUrl: string; // JWKS endpoint URL
   natsUrl: string; // NATS WebSocket URL
+  accountId: string;
+  tenant: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -197,13 +210,12 @@ async function handleBootstrap(req: any, res: any, trustChain: RealTrustChain): 
       return;
     }
 
-    if (!request.accountId || typeof request.accountId !== "string") {
-      sendJson(res, { error: "invalid accountId" }, 400);
+    if (request.accountId !== undefined && request.accountId !== REFERENCE_ACCOUNT_ID) {
+      sendJson(res, { error: "accountId does not match server-owned test tuple" }, 400);
       return;
     }
-
-    if (!request.tenant || typeof request.tenant !== "string") {
-      sendJson(res, { error: "invalid tenant" }, 400);
+    if (request.tenant !== undefined && request.tenant !== REFERENCE_TENANT) {
+      sendJson(res, { error: "tenant does not match server-owned test tuple" }, 400);
       return;
     }
 
@@ -229,8 +241,8 @@ async function handleBootstrap(req: any, res: any, trustChain: RealTrustChain): 
     const jwtPayload = buildBootstrapClaims({
       iss: SAAS_ISSUER,
       peerId,
-      accountId: request.accountId,
-      tenant: request.tenant,
+      accountId: REFERENCE_ACCOUNT_ID,
+      tenant: REFERENCE_TENANT,
       deviceX25519PublicKey: request.devicePublicKey,
       devicePopPublicKey: request.devicePopPublicKey,
     });
@@ -249,9 +261,11 @@ async function handleBootstrap(req: any, res: any, trustChain: RealTrustChain): 
       // key explicitly). Omitted when the env is unset → the browser fail-closes
       // on the register path.
     }, AGENT_PUBLIC_KEY ?? null) as BootstrapResponse;
+    response.accountId = REFERENCE_ACCOUNT_ID;
+    response.tenant = REFERENCE_TENANT;
 
     sendJson(res, response);
-    console.log(`[bootstrap] Issued RS256 bootstrap JWT (kid=${trustChain.kid}) for peerId=${peerId}, tenant=${request.tenant}`);
+    console.log(`[bootstrap] Issued RS256 bootstrap JWT (kid=${trustChain.kid}) for peerId=${peerId}, tenant=${REFERENCE_TENANT}, accountId=${REFERENCE_ACCOUNT_ID}`);
   } catch (err) {
     console.error("[bootstrap] Error:", err);
     sendJson(res, { error: "Internal server error" }, 500);
@@ -287,9 +301,11 @@ const server = createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
+  console.warn("[bootstrap] UNSAFE TEST-ONLY unauthenticated issuer; never expose as SaaS");
   console.log(`[bootstrap] SaaS Bootstrap server listening on http://localhost:${PORT}`);
   console.log(`[bootstrap] Issuer (iss): ${SAAS_ISSUER}`);
   console.log(`[bootstrap] Signing kid: ${trustChain.kid}`);
+  console.log(`[bootstrap] Fixed tuple: tenant=${REFERENCE_TENANT} accountId=${REFERENCE_ACCOUNT_ID}`);
   console.log(`[bootstrap] Bootstrap endpoint: http://localhost:${PORT}/bootstrap`);
   console.log(`[bootstrap] JWKS endpoint: http://localhost:${PORT}/.well-known/jwks.json`);
 });

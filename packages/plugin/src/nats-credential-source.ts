@@ -406,11 +406,22 @@ export async function connectNatsCredentialSource(
         // S1: auto-reconnect a dropped connection (replays subscriptions).
         reconnect: true,
       });
-      deps.onTransport?.(transport);
-      await transport.connect(deps.signal);
-      if (deps.signal?.aborted) {
-        transport.disconnect();
-        throw new NatsLifecycleAbortError();
+      let ownershipTransferred = false;
+      try {
+        if (deps.onTransport) {
+          deps.onTransport(transport);
+          ownershipTransferred = true;
+        }
+        await transport.connect(deps.signal);
+        if (deps.signal?.aborted) throw new NatsLifecycleAbortError();
+      } catch (err) {
+        // The connector owns a transport until it returns it. A failed signer,
+        // protocol handshake, timeout, or socket dial must not leave that
+        // locally-created transport reconnecting in the background.
+        if (!ownershipTransferred || deps.signal?.aborted) {
+          try { transport.disconnect(); } catch { /* preserve the connect error */ }
+        }
+        throw err;
       }
       return { transport };
     }

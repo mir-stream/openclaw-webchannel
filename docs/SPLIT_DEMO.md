@@ -49,8 +49,8 @@ This boots (all under `/tmp/oc-mac-demo`, self-cleaning on Ctrl+C):
    booted with `NATS_URL=ws://<LAN_IP>:<NATS_WS>` so the URL it *delivers* is LAN-resolvable.
    With `ENABLE_DEMO_UI=1` this SAME issuer origin ALSO serves the unified web page (`GET /`),
    the chat-widget bundle (`GET /widget.js`), and the live enrollment list (`GET /demo/enrollments`)
-   — one origin, no separate web server. `DEMO_GW_URL=""` → no HTTP register hop (`auto`
-   admission + `dmSecurity` allowlist do the gating);
+   — one origin, no separate web server. `DEMO_GW_URL` is obsolete/unused;
+   authenticated registration rides the account-scoped NATS request/reply subject;
 2. a **JWT-auth `nats-server`** built from that trust chain's operator + resolver, websocket
    listener bound `0.0.0.0:<NATS_WS>`.
 

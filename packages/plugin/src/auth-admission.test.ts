@@ -40,26 +40,17 @@ describe("Anonymous strategy rejection (AC 4)", () => {
   });
 
   it("should accept jwt strategy", () => {
-    // This test verifies that jwt strategy is still accepted
-    // (it will fail during verifier construction due to missing required fields,
-    // but the strategy selection should work)
-
-    try {
-      const jwtConfig: AuthConfig = {
-        strategy: "jwt",
-        jwt: {
-          jwksUrl: "https://example.com/jwks.json",
-          issuer: "test-issuer",
-          audience: "test-audience",
-        },
-      };
-
-      const verifier = assertJwtAuthConfig(jwtConfig);
-      expect(verifier).toBeDefined(); // Should not throw at strategy selection
-    } catch (e: unknown) {
-      // If it throws, it should be due to missing config, not strategy rejection
-      expect((e as Error).message).not.toContain(/unknown auth strategy/);
-    }
+    const jwtConfig: AuthConfig = {
+      strategy: "jwt",
+      jwt: {
+        jwksUrl: "https://example.com/jwks.json",
+        issuer: "test-issuer",
+      },
+    };
+    const resolved = assertJwtAuthConfig(jwtConfig);
+    expect(resolved.jwt.clockSkew).toBe(60);
+    expect(Object.isFrozen(resolved)).toBe(true);
+    expect(Object.isFrozen(resolved.jwt)).toBe(true);
   });
 
   it("should throw error for unknown strategy", () => {

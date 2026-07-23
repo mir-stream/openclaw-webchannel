@@ -55,6 +55,7 @@ import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   accountCredentialPath,
+  assertNoRemovedAudienceConfig,
   canonicalizeAccountId,
   readAccountsMap,
   readWebchannelSection,
@@ -75,11 +76,9 @@ type WebchannelSetupInput = {
   // Generic CLI flags (fallback mapping).
   baseUrl?: string;
   url?: string;
-  // JWT auth overrides (advanced). Absent on the happy path — derived defaults
-  // (issuer = saasBaseUrl, audience = accountId) are used instead. Preserved
-  // across a re-run so a hand-tuned issuer/audience is never clobbered.
+  // JWT issuer pin (advanced). Audience is structurally the account id and is
+  // intentionally not an input.
   issuer?: string;
-  audience?: string;
   // Connection / credential-mode passthrough.
   credentialsMode?: "enrolled" | "static";
 } & Record<string, unknown>;
@@ -93,7 +92,7 @@ const NESTED_PATCH_KEYS = ["nats", "saas", "auth"] as const;
 /**
  * Sub-keys merged ONE MORE level deep under a nested patch key, so writing e.g.
  * `nats.credentials.mode` does not drop a sibling `nats.credentials.saasBaseUrl`,
- * and writing `auth.jwt.audience` does not drop a hand-tuned `auth.jwt.issuer`.
+ * and writing `auth.jwt.issuer` does not drop other supported JWT fields.
  */
 const DEEP_PATCH_SUBKEYS: Record<string, readonly string[]> = {
   nats: ["credentials"],
@@ -140,8 +139,8 @@ function isMergeableObject(value: unknown): value is Record<string, unknown> {
  * Shallow-merge a patch onto an account object, one level deep for nats/saas/auth
  * and one further level for the known compound children (`nats.credentials`,
  * `auth.jwt`) so a full-block write MERGES onto existing config rather than
- * clobbering sibling fields (e.g. a re-run preserves a hand-tuned
- * `auth.jwt.issuer` when only `auth.jwt.audience` is being written).
+ * clobbering sibling fields (for example, a re-run preserves an explicit
+ * `auth.jwt.issuer` pin).
  */
 function mergePatch(
   prev: Record<string, unknown>,
@@ -173,16 +172,12 @@ function mergePatch(
  * "register-hop"`.
  *
  * TRUST-ANCHOR (design §4 change 2): the builder NO LONGER writes the JWT-verify
- * params (`issuer` / `jwksUrl` / `audience`). Those are trust FACTS derived at
- * RUNTIME from the anchor `{saas.baseUrl, accountId}` — `deriveAccountAuth` in
- * `index-nats.ts` fills them in when absent (issuer = saas.baseUrl, audience =
- * accountId, jwksUrl = saas.baseUrl + /.well-known/jwks.json). Writing guesses
- * here was the source of the silent issuer-mismatch trap, so we stop guessing.
+ * params (`issuer` / `jwksUrl`). Those are trust facts derived at runtime from
+ * the SaaS anchor. Audience is not a verifier-config field at all: the prepared
+ * verifier is immutably bound to the canonical runtime account id.
  *
- * `issuer` / `audience` are now OPTIONAL OPERATOR PINS, not defaults: they are
- * written ONLY when the caller explicitly supplies them (the escape hatch for a
- * proxy / custom-domain / logical-issuer deployment, threaded through
- * `applyAccountConfig` and preserved across re-runs). When neither is supplied
+ * `issuer` is an OPTIONAL OPERATOR PIN, not a default. It is written only when
+ * explicitly supplied. When it is absent
  * the `auth.jwt` sub-object is OMITTED ENTIRELY so nothing is guessed — only
  * `auth.strategy: "jwt"` is written (runtime derivation supplies the rest).
  *
@@ -207,22 +202,16 @@ export function buildFullAccountPatch(params: {
    * a specific issuer; when absent, issuer DERIVES at runtime from saas.baseUrl.
    */
   issuer?: string;
-  /**
-   * OPERATOR PIN (optional). When present, written as `auth.jwt.audience`; when
-   * absent, audience DERIVES at runtime from the accountId.
-   */
-  audience?: string;
 }): Record<string, unknown> {
   // `accountId` remains a required param (callers pass it, and it documents that
-  // audience derives from it at runtime) but is no longer read here — the runtime
-  // deriver owns `audience = accountId`.
-  const { tenant, saasBaseUrl, issuer, audience } = params;
-  // Emit auth.jwt ONLY for the explicit operator pins (issuer/audience). jwksUrl
+  // expected JWT aud derives from it at runtime) but is no longer read here —
+  // the account-bound verifier closes over `accountId` directly.
+  const { tenant, saasBaseUrl, issuer } = params;
+  // Emit auth.jwt ONLY for the explicit issuer pin. jwksUrl
   // is never written here — it derives at runtime. If neither pin is supplied,
   // omit auth.jwt entirely so nothing is guessed (strategy alone is written).
   const jwtPins: Record<string, unknown> = {};
   if (issuer !== undefined) jwtPins.issuer = issuer;
-  if (audience !== undefined) jwtPins.audience = audience;
   const auth: Record<string, unknown> = { strategy: "jwt" };
   if (Object.keys(jwtPins).length > 0) auth.jwt = jwtPins;
   return {
@@ -310,8 +299,8 @@ export const webchannelSetup = {
    * `saasBaseUrl` is present in the input:
    *   - `saasBaseUrl` PRESENT (`channels add --base-url <saas> …`) ⇒ write the
    *     COMPLETE enroll-ready block (`buildFullAccountPatch`), MERGED onto any
-   *     existing account so a re-run preserves a hand-tuned `auth.jwt.issuer/
-   *     audience` (only fields we actually supply win).
+   *     existing account so a re-run preserves a hand-tuned `auth.jwt.issuer`
+   *     pin (only fields we actually supply win).
    *   - `saasBaseUrl` ABSENT (a genuine partial `--flag` run — e.g. setting only
    *     `--url <tenant>` or the credential mode) ⇒ fall back to the partial
    *     `buildAccountPatch` write. This guard is REQUIRED so a partial run never
@@ -329,20 +318,25 @@ export const webchannelSetup = {
     // Defensive: even though core/our resolveAccountId canonicalizes, re-derive
     // here so a direct/programmatic caller can never inject a raw id.
     const id = canonicalizeAccountId(accountId);
+    assertNoRemovedAudienceConfig(cfg, id);
+    if (Object.prototype.hasOwnProperty.call(input, "audience")) {
+      throw new Error(
+        "webchannel: removed setup input audience is no longer supported; delete it. JWT aud is always the accountId.",
+      );
+    }
     const identity = resolveSetupIdentity(input);
 
     if (identity.saasBaseUrl !== undefined) {
       // Full-block seam. Read the existing account so a re-run preserves the
-      // operator's manual issuer/audience unless the flags explicitly override.
+      // operator's manual issuer pin unless the flag explicitly overrides.
       const existing = resolveWebchannelAccountConfig(cfg, id);
-      const existingJwt = (existing.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
+      const existingJwt = (existing.auth as { jwt?: { issuer?: string } } | undefined)
         ?.jwt;
       const patch = buildFullAccountPatch({
         tenant: identity.tenant ?? (existing.tenant as string | undefined) ?? "default-tenant",
         saasBaseUrl: identity.saasBaseUrl,
         accountId: id,
         issuer: input.issuer ?? existingJwt?.issuer,
-        audience: input.audience ?? existingJwt?.audience,
       });
       return writeAccountConfig(cfg, id, patch);
     }
@@ -456,7 +450,7 @@ export const webchannelSetup = {
       // bootstrap JWT yet) — see `preflight.ts` runAddPreflight for the honest
       // scope. Never throws (matches this hook's non-fatal contract); a FAIL is a
       // loud, actionable log line.
-      const existingJwt = (account.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
+      const existingJwt = (account.auth as { jwt?: { issuer?: string } } | undefined)
         ?.jwt;
       await runAddPreflight({
         accountId: id,
@@ -471,7 +465,6 @@ export const webchannelSetup = {
         },
         // Config-present-wins: an operator PIN overrides the derivation.
         ...(existingJwt?.issuer !== undefined ? { pinnedIssuer: existingJwt.issuer } : {}),
-        ...(existingJwt?.audience !== undefined ? { pinnedAudience: existingJwt.audience } : {}),
         log: (...args) => runtime.log(...args),
       });
     } catch (err) {

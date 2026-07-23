@@ -147,7 +147,7 @@ describe("planAccounts: enabled-state serving boundary", () => {
           accounts: {
             off: {
               enabled: false,
-              auth: { strategy: "anonymous" },
+              auth: { strategy: "anonymous", jwt: { audience: "removed-but-disabled" } },
             },
           },
         },
@@ -156,6 +156,45 @@ describe("planAccounts: enabled-state serving boundary", () => {
 
     expect(planAccounts(cfg, { env })).toEqual([]);
     expect(envReads).toBe(0);
+  });
+});
+
+describe("planAccounts: removed audience tombstone", () => {
+  it.each([null, false, 0, "", {}, []])(
+    "rejects a present named-account audience regardless of its JSON value (%j)",
+    (audience) => {
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              acct: {
+                tenant: "t",
+                auth: { strategy: "jwt", jwt: { audience } },
+              },
+            },
+          },
+        },
+      };
+      expect(() => planAccounts(cfg, { env: {} })).toThrow(
+        /channels\.webchannel\.accounts\.acct\.auth\.jwt\.audience/,
+      );
+    },
+  );
+
+  it("rejects a channel-base tombstone even when a named account shadows auth.jwt", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          auth: { strategy: "jwt", jwt: { audience: "shared" } },
+          accounts: {
+            acct: { tenant: "t", auth: { strategy: "jwt", jwt: { issuer: "i" } } },
+          },
+        },
+      },
+    };
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /channels\.webchannel\.auth\.jwt\.audience/,
+    );
   });
 });
 

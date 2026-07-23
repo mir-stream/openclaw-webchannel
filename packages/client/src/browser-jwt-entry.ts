@@ -7,7 +7,8 @@
  * It is the in-browser port of `e2e/local/saas-issuer-roundtrip.ts` (the Node
  * driver): generate the device keys, bootstrap directly from the reference SaaS
  * issuer (CORS `*`), then drive the PRODUCTION `WebChannelNatsClient` through the
- * PoP HTTP register hop against the live gateway and await the encrypted reply.
+ * PoP NATS request/reply register hop on the live account subject and await the
+ * encrypted reply.
  *
  * BROWSER-SAFE ONLY: uses crypto.subtle, fetch, btoa, TextEncoder — no `node:`
  * imports — so it survives the browser bundle. `WebChannelNatsClient` is itself
@@ -21,15 +22,29 @@ export type RunJwtRegisterOptions = {
   natsUrl: string;
   /** Reference SaaS issuer base URL serving POST /bootstrap (CORS `*`). */
   issuerUrl: string;
-  /** Gateway base URL serving the PoP register routes. */
+  /** @deprecated Unused harness compatibility field; registration rides NATS. */
   gwUrl: string;
-  accountId: string;
-  tenant: string;
+  /** Optional harness assertions for the server-owned fixed test tuple. */
+  accountId?: string;
+  tenant?: string;
   peerId: string;
   /** Message text to send; the echo model returns it for the assertion. */
   text: string;
   /** Overall round-trip timeout (ms). */
   timeoutMs?: number;
+};
+
+type JwtRegisterClient = Pick<
+  WebChannelNatsClient,
+  "connect" | "disconnect" | "onError" | "onMessage" | "sendUserMessage"
+>;
+
+/** @internal Narrow construction/fetch seams for behavioral boundary tests. */
+export type RunJwtRegisterDeps = {
+  fetchImpl?: typeof fetch;
+  clientFactory?: (
+    options: ConstructorParameters<typeof WebChannelNatsClient>[0],
+  ) => JwtRegisterClient;
 };
 
 /** base64url-encode raw bytes (browser-safe; no Buffer). */
@@ -40,6 +55,37 @@ function b64url(input: ArrayBuffer | Uint8Array): string {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+export function buildReferenceBootstrapRequest(input: {
+  devicePublicKey: string;
+  devicePopPublicKey: string;
+  peerId: string;
+}): Record<string, string> {
+  return {
+    devicePublicKey: input.devicePublicKey,
+    devicePopPublicKey: input.devicePopPublicKey,
+    peerId: input.peerId,
+  };
+}
+
+export function resolveReferenceBootstrapTuple(
+  response: { accountId?: unknown; tenant?: unknown },
+  expected: { accountId?: string; tenant?: string } = {},
+): { accountId: string; tenant: string } {
+  const accountId = response.accountId;
+  const tenant = response.tenant;
+  if (typeof accountId !== "string" || accountId.length === 0 ||
+      typeof tenant !== "string" || tenant.length === 0) {
+    throw new Error("bootstrap response missing fixed tenant/accountId");
+  }
+  if (expected.accountId !== undefined && expected.accountId !== accountId) {
+    throw new Error(`bootstrap accountId mismatch: expected ${expected.accountId}, got ${accountId}`);
+  }
+  if (expected.tenant !== undefined && expected.tenant !== tenant) {
+    throw new Error(`bootstrap tenant mismatch: expected ${expected.tenant}, got ${tenant}`);
+  }
+  return { accountId, tenant };
+}
+
 /**
  * Run the full in-page JWT + PoP register round-trip.
  *
@@ -48,8 +94,10 @@ function b64url(input: ArrayBuffer | Uint8Array): string {
  */
 export async function runJwtRegister(
   opts: RunJwtRegisterOptions,
+  deps: RunJwtRegisterDeps = {},
 ): Promise<{ replyText: string }> {
   const timeoutMs = opts.timeoutMs ?? 25000;
+  const fetchImpl = deps.fetchImpl ?? fetch;
 
   // 1. Device X25519 key → devicePublicKey (b64url raw 32B). Extractable so we
   //    can export the raw public key; the server stamps it as cnf.jwk.
@@ -71,16 +119,14 @@ export async function runJwtRegister(
 
   // 3. Ask the REAL reference issuer to mint + RS256-sign the bootstrap JWT.
   //    The issuer serves CORS `*`, so the browser fetches it directly in-page.
-  const bootstrapRes = await fetch(`${opts.issuerUrl}/bootstrap`, {
+  const bootstrapRes = await fetchImpl(`${opts.issuerUrl}/bootstrap`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+    body: JSON.stringify(buildReferenceBootstrapRequest({
       devicePublicKey,
       devicePopPublicKey,
-      accountId: opts.accountId,
-      tenant: opts.tenant,
       peerId: opts.peerId,
-    }),
+    })),
   });
   if (!bootstrapRes.ok) {
     throw new Error(
@@ -92,13 +138,26 @@ export async function runJwtRegister(
     peerId,
     natsUrl: deliveredNatsUrl,
     agentPublicKey,
+    accountId,
+    tenant,
   } = (await bootstrapRes.json()) as {
     jwt?: string;
     peerId?: string;
     natsUrl?: string;
     agentPublicKey?: string;
+    accountId?: string;
+    tenant?: string;
   };
   if (!jwt || !peerId) throw new Error("bootstrap response missing jwt/peerId");
+  // Expected values are assertions only. Resolve before client construction or
+  // network dialing so the caller can never override the server-owned tuple.
+  const routing = resolveReferenceBootstrapTuple(
+    { accountId, tenant },
+    {
+      ...(opts.accountId !== undefined ? { accountId: opts.accountId } : {}),
+      ...(opts.tenant !== undefined ? { tenant: opts.tenant } : {}),
+    },
+  );
   // F2: the register-delivered K is authenticated against THIS pinned agent key.
   if (!agentPublicKey) throw new Error("bootstrap response missing agentPublicKey");
 
@@ -107,14 +166,14 @@ export async function runJwtRegister(
   // the issuer didn't send one (back-compat).
   const natsUrl = deliveredNatsUrl ?? opts.natsUrl;
 
-  // 4. Production client with the `registration` (PoP HTTP register) path. The
+  // 4. Production client with the `registration` (PoP over NATS request/reply) path. The
   //    in-page Ed25519 private key is handed straight to the client — no
   //    serialization, no boundary crossing.
-  const client = new WebChannelNatsClient({
+  const client = (deps.clientFactory ?? ((options) => new WebChannelNatsClient(options)))({
     url: natsUrl,
     jwt,
-    accountId: opts.accountId,
-    tenant: opts.tenant,
+    accountId: routing.accountId,
+    tenant: routing.tenant,
     peerId,
     registration: {
       devicePrivateKey: ed25519.privateKey,
@@ -149,8 +208,8 @@ export async function runJwtRegister(
       }
     });
 
-    // The client buffers the send through NATS connect + HTTP PoP register +
-    // handshake, so no fixed sleep is needed (matches saas-issuer-roundtrip.ts).
+    // The client buffers the send through NATS connect + PoP register + wrapped
+    // key delivery, so no fixed sleep is needed (matches saas-issuer-roundtrip.ts).
     client.connect();
     client.sendUserMessage(opts.text);
   });
@@ -166,7 +225,7 @@ export type RunAllRealOptions = {
   natsUrl: string;
   /** Unified reference issuer (serves /test/nats-user + /test/bootstrap-jwt, CORS `*`). */
   issuerUrl: string;
-  /** Gateway base URL serving the PoP register routes. */
+  /** @deprecated Unused harness compatibility field; registration rides NATS. */
   gwUrl: string;
   accountId: string;
   tenant: string;
@@ -182,8 +241,9 @@ export type RunAllRealOptions = {
  *   - mint tenant-scoped NATS user creds (raw seed) from the issuer,
  *   - mint a PoP bootstrap JWT (X25519 cnf.jwk + Ed25519 pop_jwk) from the issuer,
  *   - drive the PRODUCTION WebChannelNatsClient with BOTH `natsCredentials`
- *     (NATS-layer NKEY auth) AND `registration` (HTTP PoP register hop),
- *   - complete the X25519 handshake + encrypted echo round-trip.
+ *     (NATS-layer NKEY auth) AND `registration` (PoP over NATS request/reply),
+ *   - unwrap the register-delivered conversation key and complete an encrypted
+ *     echo round-trip.
  *
  * @returns `{ replyText }` — the decrypted `agent_message` text.
  * @throws on any fetch failure, NKEY/PoP rejection (onError), or timeout.

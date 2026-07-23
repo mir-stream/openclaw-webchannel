@@ -2,7 +2,8 @@
 /**
  * #21 ALL-REAL driver — a REAL headless-Chromium browser running the PRODUCTION
  * WebChannelNatsClient (a) NATS-layer NKEY-authenticates to a REAL JWT-auth
- * nats-server AND (b) drives the JWT + Proof-of-Possession HTTP register hop,
+ * nats-server AND (b) drives the JWT + Proof-of-Possession NATS request/reply
+ * register hop,
  * against a REAL enrolled plugin (real device-flow creds, no unauthenticated NATS mode) — all from ONE shared trust chain
  * — completing an encrypted echo round-trip. The only stand-in is the echo LLM.
  *
@@ -25,6 +26,8 @@ const require = createRequire(import.meta.url);
 
 const NATS_URL   = process.env.WEBCHANNEL_NATS_URL   ?? "ws://127.0.0.1:18622";
 const ISSUER_URL = process.env.WEBCHANNEL_ISSUER_URL ?? "http://127.0.0.1:3941";
+// Deprecated/unused compatibility input retained for the browser harness shape;
+// the production register hop is account-subject NATS request/reply.
 const GW_URL     = process.env.WEBCHANNEL_GW_URL     ?? "http://127.0.0.1:19199";
 const ACCOUNT_ID   = process.env.WEBCHANNEL_ACCOUNT_ID   ?? "default-agent";
 const TENANT     = process.env.WEBCHANNEL_TENANT     ?? "default-tenant";

@@ -2,10 +2,9 @@ import { describe, it, expect, vi, afterEach, beforeAll } from "vitest";
 import { webcrypto } from "node:crypto";
 
 import {
-  assertJwtAuthConfig,
-  preflightResolveJwks,
-  verifyJwtAndExtractIdentity,
-  type AuthConfig,
+  createAccountJwtVerifier,
+  resolveRequirePoPPolicy,
+  resolveVerifierConfig,
 } from "./auth.js";
 import type { JsonWebKeySet } from "./jwks.js";
 
@@ -65,12 +64,12 @@ describe("fail-closed when the signing kid is unknown/evicted", () => {
     const now = Math.floor(Date.now() / 1000);
     const token = await signRs256({ iss: ISSUER, aud: AUDIENCE, sub: "user-evicted", iat: now, exp: now + 60 });
     const rotatedAwayJwks: JsonWebKeySet = { keys: [{ ...rsaJwks.keys[0]!, kid: "some-other-kid" }] };
-    const authConfig: AuthConfig = {
+    const authConfig = resolveVerifierConfig({
       strategy: "jwt",
-      jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rotatedAwayJwks },
-    };
+      jwt: { issuer: ISSUER, jwks: rotatedAwayJwks },
+    });
 
-    await expect(verifyJwtAndExtractIdentity(token, authConfig)).resolves.toBeNull();
+    await expect(createAccountJwtVerifier({ auth: authConfig, accountId: AUDIENCE }).verifyIdentity(token)).resolves.toBeNull();
   });
 });
 
@@ -105,21 +104,22 @@ describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", ()
     const { impl, count } = countingFetch();
     // One stable config object == one account. The live NATS path calls
     // verifyJwtAndExtractIdentity per pairing with THIS same object.
-    const authConfig: AuthConfig = {
+    const authConfig = resolveVerifierConfig({
       strategy: "jwt",
       jwt: {
         issuer: ISSUER,
-        audience: AUDIENCE,
         jwksUrl: "https://idp.test/jwks.json",
-        _fetchImpl: impl,
       },
-    };
+    });
 
-    assertJwtAuthConfig(authConfig);
-    await preflightResolveJwks(authConfig);
-    const first = await verifyJwtAndExtractIdentity(token, authConfig);
-    const second = await verifyJwtAndExtractIdentity(token, authConfig);
-    const third = await verifyJwtAndExtractIdentity(token, authConfig);
+    const verifier = createAccountJwtVerifier(
+      { auth: authConfig, accountId: AUDIENCE },
+      { fetchImpl: impl },
+    );
+    await verifier.warmJwks();
+    const first = await verifier.verifyIdentity(token);
+    const second = await verifier.verifyIdentity(token);
+    const third = await verifier.verifyIdentity(token);
 
     expect(first?.peerId).toBe("user-cache");
     expect(second?.peerId).toBe("user-cache");
@@ -140,21 +140,101 @@ describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", ()
     });
     const a = countingFetch();
     const b = countingFetch();
-    const configA: AuthConfig = {
+    const configA = resolveVerifierConfig({
       strategy: "jwt",
-      jwt: { issuer: ISSUER, audience: AUDIENCE, jwksUrl: "https://idp.test/jwks.json", _fetchImpl: a.impl },
-    };
-    const configB: AuthConfig = {
+      jwt: { issuer: ISSUER, jwksUrl: "https://idp.test/jwks.json" },
+    });
+    const configB = resolveVerifierConfig({
       strategy: "jwt",
-      jwt: { issuer: ISSUER, audience: AUDIENCE, jwksUrl: "https://idp.test/jwks.json", _fetchImpl: b.impl },
-    };
+      jwt: { issuer: ISSUER, jwksUrl: "https://idp.test/jwks.json" },
+    });
 
-    await verifyJwtAndExtractIdentity(token, configA);
-    await verifyJwtAndExtractIdentity(token, configB);
+    await createAccountJwtVerifier({ auth: configA, accountId: AUDIENCE }, { fetchImpl: a.impl }).verifyIdentity(token);
+    await createAccountJwtVerifier({ auth: configB, accountId: AUDIENCE }, { fetchImpl: b.impl }).verifyIdentity(token);
 
     // Each account's config keys its own cache — one fetch apiece, no bleed.
     expect(a.count()).toBe(1);
     expect(b.count()).toBe(1);
+  });
+});
+
+describe("account-bound audience", () => {
+  it("accepts a token only in the verifier whose runtime accountId is in aud", async () => {
+    await ensureRsaKeys();
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signRs256({
+      iss: ISSUER,
+      aud: ["account-a", "another-service"],
+      sub: "user-a",
+      iat: now,
+      exp: now + 60,
+    });
+    const auth = resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwks: rsaJwks },
+    });
+
+    await expect(createAccountJwtVerifier({ auth, accountId: "account-a" }).verifyIdentity(token))
+      .resolves.toMatchObject({ peerId: "user-a" });
+    await expect(createAccountJwtVerifier({ auth, accountId: "account-b" }).verifyIdentity(token))
+      .resolves.toBeNull();
+  });
+});
+
+describe("cache-free verifier preparation", () => {
+  it.each([null, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "60", [], {}])(
+    "rejects invalid clockSkew %j",
+    (clockSkew) => {
+      expect(() => resolveVerifierConfig({
+        strategy: "jwt",
+        jwt: { issuer: ISSUER, jwks: { keys: [] }, clockSkew },
+      })).toThrow(/clockSkew/);
+    },
+  );
+
+  it("requires exactly one structurally valid JWKS source", () => {
+    expect(() => resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER },
+    })).toThrow(/exactly one/);
+    expect(() => resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwksUrl: "https://keys", jwks: { keys: [] } },
+    })).toThrow(/exactly one/);
+    expect(() => resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwks: { keys: "not-an-array" } },
+    })).toThrow(/keys array/);
+  });
+
+  it("rejects a cast-reintroduced audience and returns an immutable detached config", () => {
+    expect(() => resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwks: { keys: [] }, audience: "legacy" },
+    })).toThrow(/audience was removed/);
+
+    const rawJwks = { keys: [{ kid: "one" }] };
+    const resolved = resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwks: rawJwks },
+    });
+    rawJwks.keys.push({ kid: "two" });
+    expect(resolved.jwt.jwks?.keys).toEqual([{ kid: "one" }]);
+    expect(Object.isFrozen(resolved)).toBe(true);
+    expect(Object.isFrozen(resolved.jwt)).toBe(true);
+    expect(Object.isFrozen(resolved.jwt.jwks)).toBe(true);
+    expect(Object.isFrozen(resolved.jwt.jwks?.keys)).toBe(true);
+  });
+
+  it.each([null, 0, 1, "false", [], {}])(
+    "rejects invalid requirePoP %j instead of applying truthiness",
+    (requirePoP) => {
+      expect(() => resolveRequirePoPPolicy({ requirePoP })).toThrow(/must be a boolean/);
+    },
+  );
+  it("defaults requirePoP to true and accepts explicit false", () => {
+    expect(resolveRequirePoPPolicy({})).toBe(true);
+    expect(resolveRequirePoPPolicy({ requirePoP: false })).toBe(false);
   });
 });
 

@@ -4,6 +4,10 @@
 
 ### BREAKING
 
+- Reference JWT bootstrap consumers no longer submit a tenant/account choice.
+  They require the server-returned fixed tuple and treat optional caller values
+  only as pre-construction test assertions. This ships lockstep with plugin/SaaS
+  `0.3.0` (incident context #72; durable storage follow-up #71).
 - **P0-4 send-result contract.** `ChatMessage.delivered?: boolean` is **removed**,
   replaced by `sendState?: "queued" | "sent" | "accepted" | "completed" | "failed"`
   and `sendFailure?: SendFailure`. Migration: `delivered === true` ↔

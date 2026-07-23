@@ -38,12 +38,11 @@
 
 import { Buffer } from "node:buffer";
 
-import type { AuthConfig } from "./auth.js";
 import { TransientVerifyError } from "./auth.js";
 import type { JwtIdentity } from "./jwt.js";
 import type { PopChallengeStore } from "./pop-challenge.js";
 import type { WrappedConversationKey } from "./late-join-decryptor.js";
-import { resolveRequirePoP, popRequirementUnmet } from "./register-pop-gate.js";
+import { popRequirementUnmet } from "./register-pop-gate.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
 
@@ -65,8 +64,6 @@ export const REGISTER_FAILED = JSON.stringify({ error: "registration_failed", co
 export const REGISTER_UNAVAILABLE = JSON.stringify({ error: "unavailable", code: 503 });
 
 export type RegisterHandlerDeps = {
-  /** This account's auth config (the verifier enforces its own issuer + aud). */
-  auth: AuthConfig | undefined;
   /** Agent-owned tenant namespace; primary confinement remains structural in NATS. */
   tenant: string;
   /** peerId segment of the `.register` subject — routing ONLY, never trusted. */
@@ -75,8 +72,10 @@ export type RegisterHandlerDeps = {
   payload: string;
   /** Publish the response to the request's NATS reply-to inbox. */
   reply: (response: string) => void;
-  /** Verify the bootstrap JWT against `auth`; null ⇒ unauthenticated. */
-  verifyIdentity: (jwt: string, auth: AuthConfig | undefined) => Promise<JwtIdentity | null>;
+  /** Token-only verifier already bound to this runtime account id. */
+  verifyIdentity: (jwt: string) => Promise<JwtIdentity | null>;
+  /** Strictly resolved during account preparation; never inferred by truthiness here. */
+  requirePoP: boolean;
   /** Single-use PoP nonce store (issue on challenge, verify on register). */
   popChallenges: PopChallengeStore;
   /** Register the peer in this account's channel (loads/creates its stable K). */
@@ -109,9 +108,8 @@ export type RegisterHandlerDeps = {
   logger?: { error?: (msg: string) => void };
 };
 
-/** A missing legacy tenant claim is accepted; a signed claim must match. */
 function identityMatchesTenantScope(identity: JwtIdentity, tenant: string): boolean {
-  return identity.tenant === undefined || identity.tenant === tenant;
+  return typeof identity.tenant === "string" && identity.tenant.length > 0 && identity.tenant === tenant;
 }
 
 /**
@@ -121,7 +119,7 @@ function identityMatchesTenantScope(identity: JwtIdentity, tenant: string): bool
  * reply recovers cleanly.
  */
 export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<void> {
-  const { auth, subjectPeerId, payload, reply, popChallenges, logger } = deps;
+  const { subjectPeerId, payload, reply, popChallenges, logger } = deps;
 
   let parsed: { op?: unknown; token?: unknown; nonce?: unknown; signature?: unknown };
   try {
@@ -148,7 +146,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     if (!token) return;
     let unregIdentity: JwtIdentity | null;
     try {
-      unregIdentity = await deps.verifyIdentity(token, auth);
+      unregIdentity = await deps.verifyIdentity(token);
     } catch (err) {
       // Transient or verify error → do NOT act on an unverified peerId.
       logger?.error?.(`webchannel: unregister verify error (ignored): ${String(err)}`);
@@ -184,7 +182,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   // doesn't permanently kill the session; a genuine verify failure stays 401.
   let identity: JwtIdentity | null;
   try {
-    identity = await deps.verifyIdentity(token, auth);
+    identity = await deps.verifyIdentity(token);
   } catch (err) {
     if (err instanceof TransientVerifyError) {
       logger?.error?.(`webchannel: register verify unavailable (transient): ${String(err)}`);
@@ -202,7 +200,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   const peerId = identity.peerId;
 
   // Defense-in-depth: primary tenant binding is structural (the configured NATS
-  // namespace and scoped credentials). A signed claim, when present, must agree.
+  // namespace and scoped credentials). The mandatory signed claim must agree.
   if (!identityMatchesTenantScope(identity, deps.tenant)) {
     logger?.error?.("webchannel: register JWT tenant does not match configured tenant — rejecting");
     reply(REGISTER_UNAUTHORIZED);
@@ -238,8 +236,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
 
   // op === "register"
   // PoP gate (secure-by-default): PoP is REQUIRED unless auth.requirePoP=false.
-  const requirePoP = resolveRequirePoP(auth as { requirePoP?: boolean } | undefined);
-  if (popRequirementUnmet(requirePoP, Boolean(identity.popPublicJwk))) {
+  if (popRequirementUnmet(deps.requirePoP, Boolean(identity.popPublicJwk))) {
     logger?.error?.(
       `webchannel: register rejected for ${peerId} — proof-of-possession required (JWT has no pop_jwk)`,
     );

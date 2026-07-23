@@ -11,8 +11,18 @@ no browser-facing connection or token route.
 4. The plugin verifies signature, issuer, audience, and proof of possession before registering peer subjects.
 5. The agent returns the conversation key wrapped to the SaaS-attested device key.
 
-The subject namespace fixes tenant, account, and peer routing. Authentication
-failure never downgrades to open admission.
+The live identity contract is exact: `iss` identifies the trusted SaaS issuer
+and may be shared; signed `tenant` must be non-empty and exactly match the
+runtime tenant; `aud` is one account id or an array of authorized account ids in
+that tenant; signed `sub` must exactly match the peer segment of the register
+subject. The subject namespace fixes routing but never substitutes for these
+signed checks. Authentication failure never downgrades to open admission.
+
+Challenge, register, and unregister all pass through that common
+issuer/tenant/audience/subject gate. Challenge needs no PoP or `cnf`; register
+then applies the configured PoP policy and always requires a valid X25519 `cnf`
+key for key delivery. Unregister remains token-only and sends no reply, including
+on rejection.
 
 The enrollment repository conformance factory's controlled `clock` capability
 is optional, but an adapter that omits it certifies strictly less: assert that
@@ -23,12 +33,18 @@ lease, expiry, retention, and race coverage.
 
 Register-hop admission uses `channels.webchannel.auth.strategy: "jwt"` and:
 
-- required `issuer` and `audience`;
+- a required `issuer` (which may be derived from the SaaS enrollment anchor);
 - exactly one of `jwksUrl`, `jwksFile`, or inline `jwks`;
 - optional `clockSkew` and `requirePoP` controls.
 
-`assertJwtAuthConfig` validates the structure during account startup and creates
-the shared JWKS cache. Startup preflight and live verification reuse that cache.
+JWT audience is not configurable: the runtime account id is the expected `aud`.
+Any raw `auth.jwt.audience` key, including `null` or an empty value, is a removed
+configuration tombstone and prevents that enabled account from serving. Delete
+the key instead of trying to align two independent values.
+
+Account startup validates every enabled account structurally before any relay
+connection, then creates one account-bound verifier and shared JWKS cache.
+Startup preflight and live verification reuse that verifier/cache.
 JWKS outages fail closed but are retryable; invalid tokens are terminal rejects.
 
 The deprecated `auth.ticketParam` schema key remains accepted only so loading can

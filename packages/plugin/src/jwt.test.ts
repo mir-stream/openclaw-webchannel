@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { webcrypto } from "node:crypto";
 
-import { verifyJwt, peekUnverifiedJwtAudiences, type JwtIdentity } from "./jwt.js";
+import { verifyJwt, type JwtIdentity } from "./jwt.js";
 import { JWKSCache, type JsonWebKeySet } from "./jwks.js";
 
 /**
@@ -430,6 +430,23 @@ describe("verifyJwt claim validation (AC3)", () => {
     ).toBeNull();
   });
 
+  it("rejects an aud array containing any non-string member", async () => {
+    await ensureKeypair();
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signJwt({
+      iss: ISSUER,
+      aud: [AUDIENCE, 42],
+      sub: "user-42",
+      iat: now,
+      exp: now + 60,
+    });
+    expect(await verifyJwt(token, {
+      jwks: resolver(),
+      issuer: ISSUER,
+      audience: AUDIENCE,
+    })).toBeNull();
+  });
+
   it("rejects an exp expired beyond 60s", async () => {
     await ensureKeypair();
     const now = Math.floor(Date.now() / 1000);
@@ -694,38 +711,5 @@ describe("verifyJwt resolver error propagation (AC5)", () => {
         audience: AUDIENCE,
       }),
     ).rejects.toThrow(/JWKS endpoint is down/);
-  });
-});
-describe("peekUnverifiedJwtAudiences (가-2 aud → account routing)", () => {
-  const b64u = (obj: unknown) =>
-    Buffer.from(JSON.stringify(obj))
-      .toString("base64")
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, "");
-  const token = (payload: unknown) =>
-    `${b64u({ alg: "RS256", typ: "JWT", kid: "k1" })}.${b64u(payload)}.sig`;
-
-  it("returns a single string aud as a one-element array", () => {
-    expect(peekUnverifiedJwtAudiences(token({ sub: "p", aud: "agentA" }))).toEqual(["agentA"]);
-  });
-
-  it("returns an array aud filtered to non-empty strings", () => {
-    expect(
-      peekUnverifiedJwtAudiences(token({ sub: "p", aud: ["agentA", "", "agentB", 5] })),
-    ).toEqual(["agentA", "agentB"]);
-  });
-
-  it("returns [] for a missing/empty/malformed aud", () => {
-    expect(peekUnverifiedJwtAudiences(token({ sub: "p" }))).toEqual([]);
-    expect(peekUnverifiedJwtAudiences(token({ sub: "p", aud: "" }))).toEqual([]);
-    expect(peekUnverifiedJwtAudiences(token({ sub: "p", aud: 42 }))).toEqual([]);
-  });
-
-  it("returns [] for non-token input (no throw)", () => {
-    expect(peekUnverifiedJwtAudiences(undefined)).toEqual([]);
-    expect(peekUnverifiedJwtAudiences("")).toEqual([]);
-    expect(peekUnverifiedJwtAudiences("a.b")).toEqual([]);
-    expect(peekUnverifiedJwtAudiences("a.@@@.c")).toEqual([]);
   });
 });

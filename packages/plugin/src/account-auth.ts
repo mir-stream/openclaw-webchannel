@@ -1,58 +1,98 @@
-import type { AuthConfig } from "./auth.js";
-import { loadPersistedEnrolledCreds, type PersistedEnrolledCreds } from "./account-config.js";
+import {
+  createAccountJwtVerifier,
+  resolveRequirePoPPolicy,
+  resolveVerifierConfig,
+  type AccountJwtVerifier,
+  type AuthConfig,
+  type RawJwtAuthConfig,
+  type ResolvedJwtVerifierConfig,
+  type VerifierFactoryDeps,
+  type VerifyAccountToken,
+} from "./auth.js";
+import {
+  loadPersistedEnrolledCreds,
+  type PersistedEnrolledCreds,
+} from "./account-config.js";
+import type { AccountServePlan } from "./multiplex.js";
 import { deriveIssuer, deriveJwksUrl } from "./preflight.js";
 
+export type MemoizedPersistedAccessor = () => PersistedEnrolledCreds | undefined;
+
+export function createMemoizedPersistedAccessor(
+  accountId: string,
+  load: (accountId: string) => PersistedEnrolledCreds | undefined = loadPersistedEnrolledCreds,
+): MemoizedPersistedAccessor {
+  let loaded = false;
+  let value: PersistedEnrolledCreds | undefined;
+  return () => {
+    if (!loaded) {
+      loaded = true;
+      value = load(accountId);
+    }
+    return value;
+  };
+}
+
+function rawJwt(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const jwt = (raw as { jwt?: unknown }).jwt;
+  return jwt && typeof jwt === "object" && !Array.isArray(jwt)
+    ? (jwt as Record<string, unknown>)
+    : {};
+}
+
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function isRawJwtAuth(raw: unknown): raw is AuthConfig {
+  return Boolean(
+    raw &&
+    typeof raw === "object" &&
+    !Array.isArray(raw) &&
+    (raw as { strategy?: unknown }).strategy === "jwt",
+  );
+}
+
+function canDeriveJwtFields(raw: unknown): raw is AuthConfig {
+  if (!isRawJwtAuth(raw)) return false;
+  const record = raw as Record<string, unknown>;
+  return !hasOwn(record, "jwt") || Boolean(
+    record.jwt && typeof record.jwt === "object" && !Array.isArray(record.jwt),
+  );
+}
+
 /**
- * Trust-anchor derivation (design §4 change 1): fill the ABSENT JWT-verify params
- * from `{saas.baseUrl, accountId}` — CONFIG-PRESENT-WINS. These are trust FACTS,
- * not settings, and cannot legitimately mismatch:
- *   - issuer  = SaaS-DELIVERED (EnrollmentResult.issuer, persisted with the
- *               enrolled creds) when present, else saas.baseUrl (back-compat
- *               derivation for pre-issuer enrollments / non-enrolled accounts)
- *   - audience = accountId    (bootstrap JWTs are minted with `aud == accountId`)
- *   - jwksUrl  = saas.baseUrl + /.well-known/jwks.json
- * An explicitly-configured value is an operator PIN (proxy / custom-domain /
- * logical-issuer) and ALWAYS wins — we only fill fields that are absent.
- * Issuer precedence: pin > delivered > derived. The delivered value is used
- * VERBATIM (verifyJwt compares slash-insensitively) — the SaaS declared the
- * exact `iss` it mints at enroll time; re-deriving it here from the base URL is
- * exactly the configuration-by-coincidence this field exists to kill.
- *
- * Returns a NEW object (never mutates the caller's config). Non-jwt (or absent)
- * auth is returned unchanged.
- *
- * Fail-closed: when `saasBaseUrl` is undefined AND the params are absent we fill
- * NOTHING — `assertJwtAuthConfig` then throws and the jwt account is skipped with a
- * loud log. Missing verify params NEVER downgrade an account to `auto`
- * (`admission` is a separate PINNED config default, not derived here). jwksUrl is
- * derived ONLY when no key source (jwksUrl/jwks/jwksFile) is configured, because
- * `assertJwtAuthConfig` requires EXACTLY ONE — we must not introduce a second.
+ * Derive only issuer/JWKS trust facts. The expected audience is never part of
+ * this value; account binding is supplied separately to the verifier factory.
  */
 export function deriveAccountAuth(
   raw: AuthConfig | undefined,
   saasBaseUrl: string | undefined,
-  accountId: string,
+  _accountId: string,
   deliveredIssuer?: string,
-): AuthConfig | undefined {
-  if (!raw || raw.strategy !== "jwt" || !saasBaseUrl) return raw;
-  const jwt = (raw.jwt ?? {}) as {
-    jwksUrl?: string;
-    jwks?: unknown;
-    jwksFile?: string;
-    issuer?: string;
-    audience?: string;
-  };
-  const hasKeySource =
-    typeof jwt.jwksUrl === "string" || jwt.jwks !== undefined || typeof jwt.jwksFile === "string";
+): RawJwtAuthConfig | undefined {
+  if (!raw || raw.strategy !== "jwt") return raw;
+  // An absent jwt object is the setup-produced derivation pointer. An explicitly
+  // present malformed value is operator input and must survive unchanged so the
+  // strict parser rejects it; never synthesize trust pins over null/string/array.
+  if (!canDeriveJwtFields(raw)) return raw;
+  const jwt = rawJwt(raw);
+  // Presence wins even when the supplied value is malformed. The strict parser
+  // must reject an explicit null/empty/undefined pin; derivation must never hide
+  // it by replacing it with a delivered/default value.
+  const issuer = hasOwn(jwt, "issuer")
+    ? jwt.issuer
+    : deliveredIssuer ?? (saasBaseUrl ? deriveIssuer(saasBaseUrl) : undefined);
+  const hasSource = ["jwksUrl", "jwksFile", "jwks"].some((key) => hasOwn(jwt, key));
   return {
     ...raw,
     jwt: {
       ...jwt,
-      issuer: jwt.issuer ?? deliveredIssuer ?? deriveIssuer(saasBaseUrl),
-      audience: jwt.audience ?? accountId,
-      ...(hasKeySource ? {} : { jwksUrl: deriveJwksUrl(saasBaseUrl) }),
+      ...(issuer !== undefined ? { issuer } : {}),
+      ...(!hasSource && saasBaseUrl ? { jwksUrl: deriveJwksUrl(saasBaseUrl) } : {}),
     },
-  } as AuthConfig;
+  };
 }
 
 export type ResolveEffectiveAccountAuthInput = {
@@ -63,15 +103,71 @@ export type ResolveEffectiveAccountAuthInput = {
   loadCreds?: (accountId: string) => PersistedEnrolledCreds | undefined;
 };
 
-/** Mirror the serving loop's complete auth-input precedence in one place. */
+/** Legacy derivation seam; preparation below is the production boundary. */
 export function resolveEffectiveAccountAuth(
   input: ResolveEffectiveAccountAuthInput,
-): AuthConfig | undefined {
-  const loadCreds = input.loadCreds ?? loadPersistedEnrolledCreds;
+): RawJwtAuthConfig | undefined {
+  // Persisted enrollment metadata is relevant only to an otherwise-valid JWT
+  // trust plan. Invalid/missing strategies must fail from their raw config
+  // without touching disk, and an explicit issuer never needs the delivered
+  // issuer fallback.
+  if (!canDeriveJwtFields(input.accountAuthRaw)) {
+    return deriveAccountAuth(
+      input.accountAuthRaw,
+      input.planSaasBaseUrl ?? input.topLevelSaasBaseUrl,
+      input.accountId,
+    );
+  }
+  const jwt = rawJwt(input.accountAuthRaw);
+  const explicitIssuer = hasOwn(jwt, "issuer");
+  const delivered = explicitIssuer
+    ? undefined
+    : (input.loadCreds ?? loadPersistedEnrolledCreds)(input.accountId)?.issuer;
   return deriveAccountAuth(
     input.accountAuthRaw,
     input.planSaasBaseUrl ?? input.topLevelSaasBaseUrl,
     input.accountId,
-    loadCreds(input.accountId)?.issuer,
+    delivered,
   );
+}
+
+export type PreparedAccountAuth = {
+  readonly auth: ResolvedJwtVerifierConfig;
+  readonly verifyIdentity: VerifyAccountToken;
+  readonly warmJwks: AccountJwtVerifier["warmJwks"];
+  readonly requirePoP: boolean;
+};
+
+export function prepareAccountAuth(input: {
+  plan: AccountServePlan;
+  getPersisted: MemoizedPersistedAccessor;
+  topLevelSaasBaseUrl?: string;
+  logger?: Parameters<typeof createAccountJwtVerifier>[0]["logger"];
+  verifierDeps?: VerifierFactoryDeps;
+}): PreparedAccountAuth {
+  const raw = input.plan.account.auth as AuthConfig | undefined;
+  const jwt = rawJwt(raw);
+  const shouldLoadDeliveredIssuer = canDeriveJwtFields(raw) && !hasOwn(jwt, "issuer");
+  const effective = deriveAccountAuth(
+    raw,
+    input.plan.saasBaseUrl ?? input.topLevelSaasBaseUrl,
+    input.plan.accountId,
+    shouldLoadDeliveredIssuer ? input.getPersisted()?.issuer : undefined,
+  );
+  const auth = resolveVerifierConfig(effective);
+  const requirePoP = resolveRequirePoPPolicy(effective);
+  const verifier = createAccountJwtVerifier(
+    {
+      auth,
+      accountId: input.plan.accountId,
+      ...(input.logger !== undefined ? { logger: input.logger } : {}),
+    },
+    input.verifierDeps,
+  );
+  return Object.freeze({
+    auth,
+    verifyIdentity: verifier.verifyIdentity,
+    warmJwks: verifier.warmJwks,
+    requirePoP,
+  });
 }
