@@ -408,10 +408,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
 
     {
       const { accountId, tenant, account } = plan;
-      // Cache-free structural preparation is the per-account Gate A. It binds
-      // the verifier's expected audience to this immutable runtime accountId
-      // before credential consumption or any socket/JWKS I/O. The memoized
-      // persisted accessor also gives auth derivation and enrolled transport one
+      // Pure planning plus immutable auth preparation is the per-account Gate
+      // A. It binds the verifier's expected audience to this runtime accountId
+      // before this account consumes credentials or performs socket/JWKS I/O.
+      // When issuer derivation genuinely needs delivered enrollment metadata,
+      // the memoized accessor gives auth derivation and enrolled transport one
       // consistent credential snapshot.
       const getPersisted = createMemoizedPersistedAccessor(accountId);
       let accountAuth: ReturnType<typeof prepareAccountAuth>;

@@ -34,9 +34,14 @@ keep the accounts disabled and escalate through incident response.
 
 ### Fixed
 
-- Added complete account preparation barriers, token-only prepared verifiers,
-  Gate-B-before-subscribe activation, exact-identity rollback, once-only primary
-  binding, and cleanup of transports whose connect handshake rejects.
+- Added per-account pure planning and immutable account-bound auth preparation
+  before that account consumes transport credentials or performs network I/O,
+  token-only prepared verifiers, Gate-B-before-subscribe activation,
+  exact-identity rollback, once-only primary binding, and cleanup of transports
+  whose connect handshake rejects. Issuer derivation may read the account's
+  memoized enrollment metadata when required. Signed tenant and account-id
+  audience claims make token populations distinguishable, so accounts retain
+  independent startup and failure isolation.
 - Incident context: #72. Durable credential/storage follow-up: #71.
 
 ### Added

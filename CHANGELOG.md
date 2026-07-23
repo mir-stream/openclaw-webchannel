@@ -30,9 +30,14 @@ control is not available for a deployment, do not improvise by deleting files or
 running an unverified migration: keep the accounts disabled and escalate through
 the service's incident-response process.
 
-- Account startup now completes cache-free planning for every enabled account
-  before credential/network I/O, then transactionally publishes each serving
-  runtime only after JWKS readiness and register-subscription installation.
+- Each enabled account now completes pure account planning and immutable,
+  account-bound auth preparation before that account consumes transport
+  credentials or performs network I/O, then transactionally publishes its
+  serving runtime only after JWKS readiness and register-subscription
+  installation. Issuer derivation may read the account's memoized enrollment
+  metadata when required. Accounts start independently: no generation-wide
+  collision preflight is required because signed tenant and account-id audience
+  claims distinguish their token populations.
 - The shared enrollment HTTP handler no longer exposes `/bootstrap`. Normal
   browser flows consume a server-authorized tenant/account tuple; standalone
   unauthenticated minting is test-only and requires an explicit fixed tuple.

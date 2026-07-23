@@ -42,10 +42,17 @@ Any raw `auth.jwt.audience` key, including `null` or an empty value, is a remove
 configuration tombstone and prevents that enabled account from serving. Delete
 the key instead of trying to align two independent values.
 
-Account startup validates every enabled account structurally before any relay
-connection, then creates one account-bound verifier and shared JWKS cache.
-Startup preflight and live verification reuse that verifier/cache.
-JWKS outages fail closed but are retryable; invalid tokens are terminal rejects.
+Each enabled account independently completes pure account planning and creates
+one immutable account-bound verifier before that account consumes transport
+credentials or opens a relay connection. Issuer derivation may first read the
+account's memoized enrollment metadata when that delivered issuer is required.
+Startup preflight and live verification reuse the prepared verifier and its JWKS
+cache. A removed audience key or malformed auth therefore fails the affected
+account before its own transport credential/network I/O without blocking
+structurally valid accounts. A generation-wide collision preflight is
+unnecessary: the signed tenant claim and account-id `aud` binding distinguish
+token populations even when accounts share an issuer. JWKS outages fail closed
+but are retryable; invalid tokens are terminal rejects.
 
 The deprecated `auth.ticketParam` schema key remains accepted only so loading can
 produce a targeted migration error. Remove it and rerun
