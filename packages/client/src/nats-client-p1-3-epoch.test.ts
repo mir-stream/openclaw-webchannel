@@ -18,6 +18,7 @@ vi.mock("./e2e-crypto-browser.js", async (importOriginal) => {
 
 import { inboundSubject, outboundSubject, registerSubject } from "./nats-client.js";
 import { sealMessage } from "./e2e-crypto-browser.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import {
   AGENT, FakeNatsWS, PEER, TENANT, installFakeWebSocket, makeClient,
   registerAgent, settle, type ServerHandler,
@@ -65,8 +66,8 @@ describe("P1-3 connection epoch guards", () => {
   it("protocol-listener disconnect+connect makes the missing-key branch stale", async () => {
     const h = await makeClient(); const errors: Error[] = []; let reentered = false;
     FakeNatsWS.sharedHandler = handlerBySocket(
-      registerAgent(new Uint8Array(32), h.devicePublicRaw, h.identity, { omitWrappedKey: true, versions: { protocolVersion: 1 } }),
-      registerAgent(new Uint8Array(32).fill(4), h.devicePublicRaw, h.identity, { versions: { protocolVersion: 1 } }),
+      registerAgent(new Uint8Array(32), h.devicePublicRaw, h.identity, { omitWrappedKey: true, versions: { protocolVersion: WEBCHANNEL_PROTOCOL_VERSION } }),
+      registerAgent(new Uint8Array(32).fill(4), h.devicePublicRaw, h.identity, { versions: { protocolVersion: WEBCHANNEL_PROTOCOL_VERSION } }),
     );
     h.client.onError((e) => errors.push(e));
     h.client.onProtocol(() => { if (!reentered) { reentered = true; h.client.disconnect(); h.client.connect(); } });

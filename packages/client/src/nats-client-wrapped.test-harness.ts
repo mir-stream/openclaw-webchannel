@@ -5,6 +5,7 @@ import {
 import { WebChannelNatsClient, registerSubject } from "./nats-client.js";
 import type { ProtocolInfo } from "./nats-client.js";
 import type { WrappedConversationKey } from "./e2e-crypto-browser.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import { generateDevicePopKeyPair } from "./pop-register.js";
 
 export const TENANT = "acme";
@@ -105,6 +106,7 @@ export type RegisterAgentOptions = {
   rejectCode?: number;
   omitWrappedKey?: boolean;
   versions?: { protocolVersion?: number | string; pluginVersion?: string };
+  omitProtocolVersion?: boolean;
   beforeReply?: () => Promise<void>;
 };
 export function registerAgent(
@@ -118,12 +120,22 @@ export function registerAgent(
     if (body.op === "challenge") { server.deliverToClient(replyTo,JSON.stringify({nonce:"nonce-abc"})); return; }
     if (body.op !== "register") return;
     if (options.rejectCode) {
-      server.deliverToClient(replyTo,JSON.stringify({error:options.rejectCode===503?"unavailable":"unauthorized",code:options.rejectCode})); return;
+      server.deliverToClient(replyTo,JSON.stringify(
+        options.rejectCode === 426
+          ? {
+              error: "protocol_mismatch",
+              code: 426,
+              protocolVersion: options.versions?.protocolVersion ?? WEBCHANNEL_PROTOCOL_VERSION,
+            }
+          : {error:options.rejectCode===503?"unavailable":"unauthorized",code:options.rejectCode},
+      )); return;
     }
     await options.beforeReply?.();
     const reply:Record<string,unknown>={peerId:PEER,registered:true};
     if (!options.omitWrappedKey) reply.wrappedConversationKey=wrapLikeAgent(K,devicePublicRaw,identity);
-    if (options.versions?.protocolVersion !== undefined) reply.protocolVersion=options.versions.protocolVersion;
+    if (!options.omitProtocolVersion) {
+      reply.protocolVersion=options.versions?.protocolVersion ?? WEBCHANNEL_PROTOCOL_VERSION;
+    }
     if (options.versions?.pluginVersion !== undefined) reply.pluginVersion=options.versions.pluginVersion;
     server.deliverToClient(replyTo,JSON.stringify(reply));
   };
@@ -131,6 +143,10 @@ export function registerAgent(
 
 export async function makeClient(options?: {
   identity?: AgentIdentity; pinned?: string | null; reconnect?: boolean;
+  retryRandom?: () => number;
+  retryNow?: () => number;
+  retrySetTimeout?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  retryClearTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
 }): Promise<{client:WebChannelNatsClient; devicePublicRaw:Uint8Array; identity:AgentIdentity}> {
   const identity=options?.identity ?? makeAgentIdentity();
   const pop=await generateDevicePopKeyPair();
@@ -142,6 +158,10 @@ export async function makeClient(options?: {
       ...(options?.pinned === null ? {} : {pinnedAgentPublicKey:options?.pinned ?? identity.publicB64url}),
     },
     ...(options?.reconnect ? {reconnectBaseMs:1,reconnectCapMs:2,heartbeatIntervalMs:0} : {}),
+    ...(options?.retryRandom ? {_retryRandom: options.retryRandom} : {}),
+    ...(options?.retryNow ? {_retryNow: options.retryNow} : {}),
+    ...(options?.retrySetTimeout ? {_retrySetTimeout: options.retrySetTimeout} : {}),
+    ...(options?.retryClearTimeout ? {_retryClearTimeout: options.retryClearTimeout} : {}),
   });
   return {client,devicePublicRaw:x.publicRaw,identity};
 }

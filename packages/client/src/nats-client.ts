@@ -30,7 +30,7 @@ import {
   isTerminalRegisterError,
   PopRejectedError,
   PopServerError,
-  ProtocolVersionMalformedError,
+  ProtocolMismatchError,
 } from "./pop-register.js";
 import type { CommandCatalogEntry, WebChannelErrorCause, SendState, SendFailure } from "./types.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
@@ -163,10 +163,12 @@ export type InboundMessage = {
     // P0-7b: ingress acknowledgement (carries `ids`). The agent acks every
     // id-carrying `user_message` at ingress so the client can drain its unacked
     // replay ledger; unknown ids are a silent no-op.
-    | "ack";
+    | "ack"
+    | "inbound_rejected";
   id?: string;
   /** P0-7b: the acknowledged `user_message` ids on an `ack` frame. */
   ids?: string[];
+  reason?: "overloaded";
   text?: string;
   turnId?: string;
   /**
@@ -273,6 +275,11 @@ export type SendStateListener = (id: string, state: SendState, failure?: SendFai
 export type WebChannelNatsClientOptions = Omit<NatsClientOptions, "jwt" | "registration"> & {
   jwt: string;
   registration: NonNullable<NatsClientOptions["registration"]>;
+  /** Deterministic live ingress-outcome retry seams (tests/embedded runtimes). */
+  _retryNow?: () => number;
+  _retryRandom?: () => number;
+  _retrySetTimeout?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  _retryClearTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
 };
 
 // ---------------------------------------------------------------------------
@@ -1179,11 +1186,21 @@ export class WebChannelNatsClient {
    * mid-session drop is exactly when the entries are needed); `disconnect()`
    * clears it (dead instance).
    */
-  private readonly unackedLedger = new Map<string, OutboundMessage>();
+  private readonly unackedLedger = new Map<string, {
+    message: Extract<OutboundMessage, { type: "user_message" }>;
+    retryCount: number;
+    nextRetryAt: number | null;
+  }>();
   /** P0-7b: cap on the unacked ledger; the oldest entry is evicted (with a warn) past this. */
   private static readonly MAX_UNACKED = 100;
   /** P0-7b: one-shot guard so a full ledger warns once per session, not per evicted send. */
   private warnedUnackedEvict = false;
+  private liveRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private liveRetryTimerGeneration = 0;
+  private readonly retryNow: () => number;
+  private readonly retryRandom: () => number;
+  private readonly retrySetTimeout: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  private readonly retryClearTimeout: (timer: ReturnType<typeof setTimeout>) => void;
   /**
    * Ciphertext `.out` frames that arrived BEFORE the session key existed.
    *
@@ -1221,6 +1238,10 @@ export class WebChannelNatsClient {
       throw new Error("[nats-client] non-empty bootstrap jwt is required");
     }
     this.options = options;
+    this.retryNow = options._retryNow ?? (() => Date.now());
+    this.retryRandom = options._retryRandom ?? Math.random;
+    this.retrySetTimeout = options._retrySetTimeout ?? ((fn, ms) => setTimeout(fn, ms));
+    this.retryClearTimeout = options._retryClearTimeout ?? ((timer) => clearTimeout(timer));
     this.client = new NatsClient(options);
     this.client.onRawMessage((subject, payload) => {
       void this.handleRaw(subject, payload);
@@ -1394,9 +1415,9 @@ export class WebChannelNatsClient {
 
   /**
    * Add a register-handshake protocol listener. Fires once per successful
-   * register with the agent-plugin's protocol/plugin version (either may be
-   * null against a pre-v1/pre-reporting plugin). A version MISMATCH does not
-   * fire this — it flows through `onError` as a terminal failure.
+   * protocol-v2 register with the agent-plugin's required protocol version and
+   * optional package version. Missing, malformed, or mismatched protocol values
+   * do not fire this — they flow through `onError` as terminal failures.
    */
   onProtocol(listener: ProtocolListener): () => void {
     this.protocolListeners.add(listener);
@@ -1473,6 +1494,7 @@ export class WebChannelNatsClient {
   // ---------------------------------------------------------------------------
 
   private resetSession(): void {
+    this.cancelLiveRetryTimer();
     this.sessionKey = null;
     // Frames buffered for a dead session are ciphertext under a key we no
     // longer (or never will) hold — drop them; fresh registration
@@ -1511,6 +1533,9 @@ export class WebChannelNatsClient {
    */
   private deliverInbound(msg: InboundMessage): void {
     if (msg.type === "ack") this.drainAcked(msg.ids);
+    if (msg.type === "inbound_rejected" && msg.reason === "overloaded") {
+      this.drainRejected(msg.ids);
+    }
     this.notifyMessageListeners(msg);
   }
 
@@ -1521,10 +1546,34 @@ export class WebChannelNatsClient {
    */
   private drainAcked(ids?: string[]): void {
     if (!ids) return;
-    for (const id of ids) {
-      this.unackedLedger.delete(id);
-      this.trackerAdvance(id, "accepted");
+    // Relinquish retry ownership for the WHOLE authoritative result frame before
+    // the first public tracker callback. `trackerAdvance` can synchronously run
+    // embedder code, including disconnect()/connect(); if later frame ids were
+    // still ledgered, disconnect's fail-all sweep would incorrectly turn them
+    // into failed{closed} before their accepted transition was applied.
+    const frameIds = [...new Set(ids)];
+    for (const id of frameIds) this.unackedLedger.delete(id);
+    this.cancelLiveRetryTimer();
+    for (const id of frameIds) this.trackerAdvance(id, "accepted");
+    this.armLiveRetryTimer();
+  }
+
+  private drainRejected(ids?: string[]): void {
+    if (!ids) return;
+    // Same detach-before-callout rule as ACKs: every id in one rejection frame
+    // owns one authoritative overloaded result even when the first callback
+    // tears down or replaces the active connection lifecycle.
+    const frameIds = [...new Set(ids)];
+    for (const id of frameIds) this.unackedLedger.delete(id);
+    this.cancelLiveRetryTimer();
+    for (const id of frameIds) {
+      this.trackerFail(id, {
+        reason: "overloaded",
+        retryable: true,
+        lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
+      });
     }
+    this.armLiveRetryTimer();
   }
 
   private async onConnected(): Promise<void> {
@@ -1607,7 +1656,7 @@ export class WebChannelNatsClient {
           // class identity — the cause rides alongside).
           const cause: WebChannelErrorCause =
             err instanceof PopRejectedError ? "auth-rejected"
-            : err instanceof ProtocolVersionMalformedError ? "protocol-mismatch"
+            : err instanceof ProtocolMismatchError ? "protocol-mismatch"
             : err instanceof PopServerError ? "server"
             : "unknown";
           // P0-4: failConnectionEpoch now folds the D4 terminal sweep in BEFORE
@@ -1640,16 +1689,15 @@ export class WebChannelNatsClient {
 
       // Wire-protocol handshake (mirrors the :1080 pin-failure style). The plugin
       // echoes its protocol + package versions in the register reply:
-      //   - absent protocolVersion  → pre-v1 plugin; NON-FATAL, expose null.
+      //   - absent/malformed         → already rejected terminally by registerWithPop.
       //   - present but mismatched   → TERMINAL: the two sides speak incompatible
       //     wire contracts, so surface a two-sided diagnostic and disconnect
       //     (only upgrading the older side, or a fresh client, can recover).
       //   - match                    → proceed; expose both versions on state.
-      const agentProtocolVersion =
-        typeof registerResult.protocolVersion === "number" ? registerResult.protocolVersion : null;
+      const agentProtocolVersion = registerResult.protocolVersion;
       const agentPluginVersion =
         typeof registerResult.pluginVersion === "string" ? registerResult.pluginVersion : null;
-      if (agentProtocolVersion !== null && agentProtocolVersion !== WEBCHANNEL_PROTOCOL_VERSION) {
+      if (agentProtocolVersion !== WEBCHANNEL_PROTOCOL_VERSION) {
         const err = new Error(
           `webchannel protocol mismatch: client=${WEBCHANNEL_PROTOCOL_VERSION} ` +
             `agent-plugin=${agentProtocolVersion}; upgrade the older side`,
@@ -1813,7 +1861,7 @@ export class WebChannelNatsClient {
     // ledger; each re-enters it as `seal()` re-publishes. Same id on every replay,
     // so 4a's ingress dedupe makes a re-delivery exactly-once.
     if (this.unackedLedger.size > 0) {
-      const replay = [...this.unackedLedger.values()];
+      const replay = [...this.unackedLedger.values()].map((entry) => entry.message);
       this.unackedLedger.clear();
       this.outboundQueue = [...replay, ...this.outboundQueue];
     }
@@ -1875,34 +1923,73 @@ export class WebChannelNatsClient {
     // an id-less frame from a caller that bypassed sendUserMessage is not
     // replayable and is skipped.
     //
-    // P0-4 (review R2): `recordUnacked` RETURNS the ids it evicted rather than
-    // failing them inline, and we notify them at the end of this method. Nothing
+    // P0-4 (review R2/R3): `recordUnacked` returns inert eviction metadata rather
+    // than notifying or consulting injected retry hooks inline. Nothing
     // between the `sessionKey` fail-closed check above and `sealMessage()` below
     // may call into embedder code: a subscriber reached from here can `close()`,
     // which nulls `sessionKey` mid-seal (TS narrowing from the top-of-function
     // check hides it), and `null` then flows into the AEAD as a raw TypeError
-    // thrown straight out of `send()`. Audited: eviction was the ONLY such callout
-    // in this window; the remaining statements are Map/object reads and a
-    // `console.warn`. Keeping it that way makes the seal atomic — hence no
+    // thrown straight out of `send()`. Audited: this interval contains only
+    // Map/object reads and writes; clock/random/timer/warning work begins after
+    // sealing. Keeping it that way makes the seal atomic — hence no
     // defensive re-check before `sealMessage()`, which would be dead code (and a
     // re-queue there would strand the frame on an already-swept closed instance).
     let evicted: string[] = [];
+    let warnEviction = false;
     if (message.type === "user_message" && message.id) {
-      evicted = this.recordUnacked(message.id, message);
+      ({ evicted, warnEviction } = this.recordUnacked(message.id, message));
     }
     const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, message);
+    const finishPostSeal = () => {
+      if (warnEviction) {
+        console.warn(
+          `[nats-client] unacked ledger exceeded ${WebChannelNatsClient.MAX_UNACKED}; ` +
+            `evicting the oldest unacked message(s) — they will not be replayed on reconnect`,
+        );
+      }
+      for (const id of evicted) {
+        this.trackerFail(id, {
+          reason: "evicted",
+          retryable: true,
+          lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
+        });
+      }
+    };
     // P0-4 (D3): stamp the attempt time on every publish attempt (R1-F10), then
     // consume the publish result. On success a user_message advances to `sent`;
     // on failure it stays `queued` (no emit) — it remains in the ledger and the
     // publish-driven forceReconnect replays it, so a live process never reports
     // false success. Non-replicated frames only warn on failure (§5 recovery lanes).
     if (message.type === "user_message" && message.id) {
+      const ledgerEntry = this.unackedLedger.get(message.id);
+      const attemptAt = this.retryNow();
+      if (
+        !ledgerEntry || this.unackedLedger.get(message.id) !== ledgerEntry
+        || !this.sessionKey || this.disconnected || this.terminalReached
+      ) {
+        finishPostSeal();
+        return;
+      }
+      if (ledgerEntry.nextRetryAt === null) {
+        const delay = this.retryDelay(ledgerEntry.retryCount);
+        if (
+          this.unackedLedger.get(message.id) !== ledgerEntry
+          || !this.sessionKey || this.disconnected || this.terminalReached
+        ) {
+          finishPostSeal();
+          return;
+        }
+        ledgerEntry.nextRetryAt = attemptAt + delay;
+      }
       const entry = this.sendTracker.get(message.id);
-      if (entry) entry.lastAttemptAt = Date.now();
+      if (entry) entry.lastAttemptAt = attemptAt;
     }
     const ok = this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
     if (message.type === "user_message" && message.id) {
-      if (ok) this.trackerAdvance(message.id, "sent");
+      if (ok) {
+        this.trackerAdvance(message.id, "sent");
+        this.armLiveRetryTimer();
+      }
     } else if (!ok) {
       console.warn(`[nats-client] publish failed for non-replicated frame '${message.type}' — recovery via reconnect/register snapshot`);
     }
@@ -1911,13 +1998,7 @@ export class WebChannelNatsClient {
     // it. Ordered AFTER this message's own `sent` advance on purpose: a `close()`
     // from an eviction subscriber sweeps the ledger, and THIS message is already
     // recorded in it, so it lands at failed{closed} rather than being stranded.
-    for (const id of evicted) {
-      this.trackerFail(id, {
-        reason: "evicted",
-        retryable: true,
-        lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
-      });
-    }
+    finishPostSeal();
   }
 
   // ---------------------------------------------------------------------------
@@ -1969,6 +2050,7 @@ export class WebChannelNatsClient {
     for (const id of this.unackedLedger.keys()) ids.add(id);
     this.outboundQueue = [];
     this.unackedLedger.clear();
+    this.cancelLiveRetryTimer();
     return [...ids];
   }
 
@@ -2040,7 +2122,7 @@ export class WebChannelNatsClient {
   /**
    * P0-7b: record an unacked user_message, evicting the oldest past the cap.
    *
-   * RETURNS the evicted ids instead of failing them here (P0-4 review R2).
+   * Returns inert eviction metadata instead of failing/warning here (P0-4 R2/R3).
    * `trackerFail` is a synchronous callout into embedder code (emitSendState →
    * the wrapper's receiptTransition → setState → app state subscribers), and the
    * only caller is `seal()`, which runs this BETWEEN its `sessionKey` fail-closed
@@ -2049,13 +2131,25 @@ export class WebChannelNatsClient {
    * received `null` and threw a raw crypto TypeError out of `send()` — breaking
    * the P0-4 contract that a send RETURNS an observable receipt and never throws
    * (and, on the flush path, escaping `onConnected` as an unhandled rejection
-   * that abandoned the rest of the drain). Returning the ids keeps `seal()`'s
-   * critical section free of embedder code; the caller notifies once the seal is
-   * done. B3's observable-eviction behavior itself is unchanged.
+   * that abandoned the rest of the drain). Deferring eviction notifications,
+   * warnings, and retry clock/random initialization keeps `seal()`'s critical
+   * section free of embedder/injected code. B3's observable behavior is unchanged.
    */
-  private recordUnacked(id: string, message: OutboundMessage): string[] {
+  private recordUnacked(
+    id: string,
+    message: Extract<OutboundMessage, { type: "user_message" }>,
+  ): { evicted: string[]; warnEviction: boolean } {
     const evicted: string[] = [];
-    this.unackedLedger.set(id, message);
+    let warnEviction = false;
+    if (!this.unackedLedger.has(id)) {
+      this.unackedLedger.set(id, {
+        message,
+        retryCount: 0,
+        // Injected clock/random callbacks run only after sealMessage has
+        // completed; null is inert pre-publish ownership metadata.
+        nextRetryAt: null,
+      });
+    }
     while (this.unackedLedger.size > WebChannelNatsClient.MAX_UNACKED) {
       const oldest = this.unackedLedger.keys().next().value as string | undefined;
       if (oldest === undefined) break;
@@ -2068,13 +2162,72 @@ export class WebChannelNatsClient {
         // Warn ONCE per session (re-armed in resetSession) — a full ledger means
         // an unusually long delivery stall; a per-send warn would spam a burst.
         this.warnedUnackedEvict = true;
-        console.warn(
-          `[nats-client] unacked ledger exceeded ${WebChannelNatsClient.MAX_UNACKED}; ` +
-            `evicting the oldest unacked message(s) — they will not be replayed on reconnect`,
-        );
+        warnEviction = true;
       }
     }
-    return evicted;
+    return { evicted, warnEviction };
+  }
+
+  private retryDelay(retryCount: number): number {
+    const base = Math.min(30_000, 1_000 * 2 ** Math.min(retryCount, 30));
+    const random = Math.max(0, Math.min(1, this.retryRandom()));
+    return Math.min(30_000, Math.round(base * (0.9 + random * 0.2)));
+  }
+
+  private cancelLiveRetryTimer(): void {
+    this.liveRetryTimerGeneration++;
+    if (!this.liveRetryTimer) return;
+    this.retryClearTimeout(this.liveRetryTimer);
+    this.liveRetryTimer = null;
+  }
+
+  private armLiveRetryTimer(): void {
+    this.cancelLiveRetryTimer();
+    if (!this.sessionKey || this.unackedLedger.size === 0 || this.disconnected || this.terminalReached) return;
+    let earliest = Number.POSITIVE_INFINITY;
+    for (const entry of this.unackedLedger.values()) {
+      if (entry.nextRetryAt !== null) earliest = Math.min(earliest, entry.nextRetryAt);
+    }
+    if (!Number.isFinite(earliest)) return;
+    const delay = Math.max(0, earliest - this.retryNow());
+    const generation = ++this.liveRetryTimerGeneration;
+    const timer = this.retrySetTimeout(() => {
+      if (generation !== this.liveRetryTimerGeneration) return;
+      this.liveRetryTimer = null;
+      this.liveRetryTimerGeneration++;
+      this.retryDueUnacked();
+    }, delay);
+    // The injected scheduler is an embedder callout. It may synchronously close
+    // or reset this client before returning; do not install a stale timer handle
+    // into the retired session in that case.
+    if (
+      generation !== this.liveRetryTimerGeneration
+      || !this.sessionKey || this.unackedLedger.size === 0
+      || this.disconnected || this.terminalReached
+    ) {
+      this.retryClearTimeout(timer);
+      return;
+    }
+    this.liveRetryTimer = timer;
+    const unrefTimer = timer as ReturnType<typeof setTimeout> & { unref?: () => void };
+    unrefTimer.unref?.();
+  }
+
+  private retryDueUnacked(): void {
+    if (!this.sessionKey || this.disconnected || this.terminalReached) return;
+    const now = this.retryNow();
+    const { tenant, accountId, peerId } = this.options;
+    for (const [id, entry] of this.unackedLedger) {
+      if (entry.nextRetryAt === null || entry.nextRetryAt > now || !this.sessionKey) continue;
+      const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, entry.message);
+      const tracker = this.sendTracker.get(id);
+      if (tracker) tracker.lastAttemptAt = now;
+      const ok = this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
+      if (!ok) break; // publish forced reconnect/reset; reconnect replay owns recovery.
+      entry.retryCount++;
+      entry.nextRetryAt = now + this.retryDelay(entry.retryCount);
+    }
+    this.armLiveRetryTimer();
   }
 
   private notifyMessageListeners(msg: InboundMessage): void {

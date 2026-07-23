@@ -25,6 +25,8 @@ import type { WrappedConversationKey } from "./late-join-decryptor.js";
 import { sealEnvelope, openEnvelope } from "./e2e-session.js";
 import { isValidSubjectToken } from "./subject-token.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
+import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
+import type { IngressResultFrame } from "./ingress-result-chunks.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -115,6 +117,7 @@ const DEFAULT_MAX_APPROVAL_RESOLUTIONS = 10_000;
  */
 const DEFAULT_REPLAY_WINDOW_MS = 10 * 60 * 1_000;
 const DEFAULT_MAX_SEEN_MESSAGE_IDS_PER_PEER = 2_000;
+const RESULT_LIMIT_WARNING_INTERVAL_MS = 60_000;
 
 /**
  * NATS-based message channel for WebChannel.
@@ -203,6 +206,10 @@ export class NatsChannel implements WebChannelPeerChannel {
   private onApprovalDecision?: (peerId: string, id: string, decision: ApprovalDecision) => void;
   private onLoadHistory?: (peerId: string, request: { before?: string; limit?: number }) => void;
   private onLoadCommands?: (peerId: string) => void;
+  private onPeerUnregister?: (peerId: string) => void;
+  /** Bounded, content-free configuration-warning state for result max_payload. */
+  private lastResultLimitWarningAt = Number.NEGATIVE_INFINITY;
+  private suppressedResultLimitWarnings = 0;
   /**
    * Register-hop admission over NATS (replaces the deleted HTTP register routes).
    * Fired for a plaintext JSON request on `…{peerId}.register`; the handler runs
@@ -363,6 +370,9 @@ export class NatsChannel implements WebChannelPeerChannel {
    * Unregister a peer (browser session disconnected).
    */
   unregisterPeer(peerId: string): void {
+    // Release this peer's retained ingress work before retiring its key/window.
+    // Called for explicit unregister and peer-cap eviction alike.
+    this.onPeerUnregister?.(peerId);
     const sid = this.peerSubscriptions.get(peerId);
     if (sid) {
       this.transport.unsubscribe(sid);
@@ -396,12 +406,17 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.onApprovalDecision = undefined;
     this.onLoadHistory = undefined;
     this.onLoadCommands = undefined;
+    this.onPeerUnregister = undefined;
     this.onRegisterRequest = undefined;
   }
 
   /** Backward-compatible lifecycle name; shares the same idempotent teardown. */
   close(): void {
     this.dispose();
+  }
+
+  setPeerUnregisterHandler(handler: (peerId: string) => void): void {
+    this.onPeerUnregister = handler;
   }
 
   /**
@@ -484,10 +499,26 @@ export class NatsChannel implements WebChannelPeerChannel {
    * returns true without publishing (nothing to ack — e.g. an all-id-less batch).
    */
   sendAck(peerId: string, ids: string[]): boolean {
-    if (ids.length === 0) return true;
-    const payload: OutboundWsMessage = { type: "ack", ids };
-    return this.sendToPeer(peerId, payload);
+    return this.sendIngressResult(peerId, "ack", ids);
   }
+
+  sendInboundRejected(peerId: string, ids: string[]): boolean {
+    return this.sendIngressResult(peerId, "inbound_rejected", ids);
+  }
+
+  /** Actual serialized/sealed length for result-frame admission chunking. */
+  outboundWireSize(peerId: string, payload: OutboundWsMessage): number | undefined {
+    if (!this.encryptionRequired) return Buffer.byteLength(JSON.stringify(payload), "utf8");
+    const key = this.peerSessionKeys.get(peerId);
+    if (!key) return undefined;
+    return sealEnvelope(
+      { accountId: this.accountId, tenant: this.tenant, sub: peerId },
+      key,
+      payload,
+    ).length;
+  }
+
+  effectiveOutboundLimit(): number { return this.transport.effectiveOutboundLimit; }
 
   /**
    * Send approval request to peer.
@@ -681,6 +712,55 @@ export class NatsChannel implements WebChannelPeerChannel {
       console.error(`[nats-channel] Failed to send to peer ${peerId}:`, err);
       return false;
     }
+  }
+
+  /**
+   * One boundary for every ingress ACK/rejection producer: validate ids, split
+   * at 64 ids and 64 KiB, and honor the server's effective max_payload using the
+   * actual sealed size. A failed chunk never prevents later chunks from being
+   * attempted. Invalid ids are silently omitted and are never reflected.
+   */
+  private sendIngressResult(
+    peerId: string,
+    type: IngressResultFrame["type"],
+    candidates: readonly unknown[],
+  ): boolean {
+    if (candidates.length === 0) return true;
+    const advertisedLimit = this.transport.effectiveOutboundLimit;
+    const effectiveOutboundLimit = Number.isSafeInteger(advertisedLimit) && advertisedLimit >= 0
+      ? advertisedLimit
+      : undefined;
+    try {
+      const writer = createIngressResultChunkWriter({
+        type,
+        publish: (frame) => this.sendToPeer(peerId, frame),
+        measureWireBytes: (frame) =>
+          this.outboundWireSize(peerId, frame)
+            ?? Buffer.byteLength(JSON.stringify(frame), "utf8"),
+        ...(effectiveOutboundLimit !== undefined ? { effectiveOutboundLimit } : {}),
+        onTooSmall: () => this.warnResultLimitTooSmall(),
+      });
+      for (const candidate of candidates) writer.add(candidate);
+      return writer.finish();
+    } catch (err) {
+      console.error("[nats-channel] Failed to prepare bounded ingress result frame:", err);
+      return false;
+    }
+  }
+
+  private warnResultLimitTooSmall(): void {
+    const now = Date.now();
+    if (now - this.lastResultLimitWarningAt < RESULT_LIMIT_WARNING_INTERVAL_MS) {
+      this.suppressedResultLimitWarnings++;
+      return;
+    }
+    const suppressed = this.suppressedResultLimitWarnings;
+    this.lastResultLimitWarningAt = now;
+    this.suppressedResultLimitWarnings = 0;
+    console.warn(
+      "[nats-channel] ingress result frame cannot fit effective NATS max_payload; " +
+        `increase the server limit (suppressed=${suppressed})`,
+    );
   }
 
   private handleNatsMessage(msg: NatsMessage): void {

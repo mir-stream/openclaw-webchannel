@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { inboundSubject, registerSubject } from "./nats-client.js";
 import { openMessage } from "./e2e-crypto-browser.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import {
   AGENT, FakeNatsWS, JWT, PEER, TENANT, installFakeWebSocket, makeClient,
   registerAgent, settle,
@@ -48,25 +49,25 @@ describe("WebChannelNatsClient PoP registration wiring (NATS)",()=>{
     expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.CLOSED);
   });
 
-  it("protocol version absent is non-fatal for compatibility",async()=>{
-    const h=await makeClient();const seen:unknown[]=[];
-    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(3),h.devicePublicRaw,h.identity);
-    h.client.onProtocol(v=>seen.push(v));h.client.connect();await settle();
-    expect(seen).toEqual([{protocolVersion:null,pluginVersion:null}]);
-    expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.OPEN);h.client.disconnect();
+  it("protocol version absent is terminal under v2",async()=>{
+    const h=await makeClient();const errors:Error[]=[];
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(3),h.devicePublicRaw,h.identity,{omitProtocolVersion:true});
+    h.client.onError(e=>errors.push(e));h.client.connect();await settle();
+    expect(errors[0]?.message).toMatch(/protocolVersion/);
+    expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.CLOSED);
   });
 
   it("matching protocol version proceeds and reports plugin version",async()=>{
     const h=await makeClient();const seen:unknown[]=[];
-    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(4),h.devicePublicRaw,h.identity,{versions:{protocolVersion:1,pluginVersion:"9.9.9"}});
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(4),h.devicePublicRaw,h.identity,{versions:{protocolVersion:WEBCHANNEL_PROTOCOL_VERSION,pluginVersion:"9.9.9"}});
     h.client.onProtocol(v=>seen.push(v));h.client.connect();await settle();
-    expect(seen).toEqual([{protocolVersion:1,pluginVersion:"9.9.9"}]);
+    expect(seen).toEqual([{protocolVersion:WEBCHANNEL_PROTOCOL_VERSION,pluginVersion:"9.9.9"}]);
     expect((h.client as unknown as {sessionKey:Uint8Array}).sessionKey).toBeTruthy();h.client.disconnect();
   });
 
   it("protocol mismatch is terminal and never publishes inbound",async()=>{
     const h=await makeClient();const errors:Error[]=[];
-    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(5),h.devicePublicRaw,h.identity,{versions:{protocolVersion:2}});
+    FakeNatsWS.sharedHandler=registerAgent(new Uint8Array(32).fill(5),h.devicePublicRaw,h.identity,{versions:{protocolVersion:WEBCHANNEL_PROTOCOL_VERSION + 1}});
     h.client.onError(e=>errors.push(e));h.client.connect();h.client.sendUserMessage("blocked");await settle();
     expect(errors[0]?.message).toMatch(/protocol/i);
     expect(FakeNatsWS.instances[0].readyState).toBe(FakeNatsWS.CLOSED);

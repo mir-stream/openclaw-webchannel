@@ -20,6 +20,7 @@ import type { InboundMessage, NatsClientOptions } from "./nats-client.js";
 import { inboundSubject, registerSubject } from "./nats-client.js";
 import { generateDevicePopKeyPair } from "./pop-register.js";
 import type { WrappedConversationKey } from "./e2e-crypto-browser.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
 const registration = {
   devicePrivateKey: {} as CryptoKey,
@@ -1049,13 +1050,13 @@ describe("WebChannelNATSClient — protocol version on state", () => {
 
   it("a matched register exposes both versions on state", () => {
     const wrapper = makeWrapper();
-    emitProtocol(wrapper, { protocolVersion: 1, pluginVersion: "0.1.8" });
+    emitProtocol(wrapper, { protocolVersion: WEBCHANNEL_PROTOCOL_VERSION, pluginVersion: "0.1.8" });
     const state = wrapper.getState();
-    expect(state.agentProtocolVersion).toBe(1);
+    expect(state.agentProtocolVersion).toBe(WEBCHANNEL_PROTOCOL_VERSION);
     expect(state.agentPluginVersion).toBe("0.1.8");
   });
 
-  it("a pre-v1 plugin (null versions) keeps state null without error", () => {
+  it("a test-only null protocol diagnostic keeps the pre-connection state null", () => {
     const wrapper = makeWrapper();
     emitProtocol(wrapper, { protocolVersion: null, pluginVersion: null });
     const state = wrapper.getState();
@@ -1282,7 +1283,12 @@ function makeRegisterHandler(
       if (gate) await gate;
       server.deliverToClient(
         replyTo,
-        JSON.stringify({ peerId, registered: true, wrappedConversationKey: wrapped() }),
+        JSON.stringify({
+          peerId,
+          registered: true,
+          wrappedConversationKey: wrapped(),
+          protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
+        }),
       );
     }
   };

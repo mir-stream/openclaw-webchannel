@@ -47,8 +47,9 @@ export type EnrollmentRequest = {
   pluginVersion?: string;
 
   /**
-   * Plugin wire-protocol version (see WEBCHANNEL_PROTOCOL_VERSION). OPTIONAL:
-   * a pre-v1 plugin omits it. Advisory only — enrollment does not gate on it.
+   * Plugin wire-protocol version (see WEBCHANNEL_PROTOCOL_VERSION). The shipped
+   * v2 plugin always reports it. This generic enrollment API keeps the field
+   * optional only for non-plugin callers; enrollment does not gate on it.
    */
   protocolVersion?: number;
 };

@@ -1,6 +1,6 @@
 # Issue #57 — Busy-turn buffer hard bounds — Implementation Plan (v4)
 
-> Status: APPROVED FOR IMPLEMENTATION — ADVERSARIAL REVIEW CONVERGED AT R4
+> Status: IMPLEMENTED — VERIFICATION COMPLETE AFTER R4 PLAN CONVERGENCE
 > Issue: `#57 Bound per-session busy-turn buffers to prevent authenticated gateway OOM`
 > Branch: `fix/issue-57-bound-busy-turn-buffers`
 >
@@ -87,12 +87,15 @@ debounce waiting/in-flight + dispatcher pending
 ```
 
 A reservation is acquired synchronously before a message or key-chain closure is
-created and remains charged while `onFlush` awaits outcome storage. Fresh
+created and remains charged while a started `onFlush`/`onCancel` callback can
+retain or copy that message, including after peer/account retirement. Fresh
 admitted work transfers that same reservation into dispatcher pending without a
 release/re-reserve gap; an idle turn releases it immediately before becoming the
 uncharged running turn. Duplicate, rejected, cancelled, failed, and torn-down
-items release it exactly once. Thus a stalled dedupe store and a never-settling
-handler cannot move attacker-controlled retention to an earlier unbounded layer.
+items release it exactly once after their last physical callback owner settles.
+Queued callbacks that never began are severed and released synchronously. Thus a
+stalled dedupe store and a never-settling handler cannot move attacker-controlled
+retention to an earlier unbounded layer.
 
 ## 2. Fixed semantics
 
@@ -310,6 +313,15 @@ retained creates neither a second reservation nor an overflow outcome task. The
 first copy remains authoritative and eventually supplies the shared client
 ledger id's ACK/rejection. Whole-flush outcome maps are unnecessary.
 
+The first unresolved persistent classification is also a same-flush FIFO
+barrier. This includes an explicit `unknown`, a thrown lookup/record operation,
+an unresolved overload record, or a cancellation-fallback retry without a
+publishable outcome. The already-classified prefix commits in order, while the
+unresolved current item and every unclassified suffix item release their
+reservations without another lookup, record, offer, result, or dispatch. Their
+client-ledger retries resume classification later; a storage fault can delay a
+suffix but cannot let it overtake the unresolved item.
+
 Record results also expose durability:
 
 ```ts
@@ -328,12 +340,32 @@ emits no terminal result, and lets the client retry. A durable overload marker
 survives a crash after record but before publish; a delivered rejection already
 gave the client its terminal state. Thus every restart ordering has at least one
 recovery owner and a memory-only rejection is never mistaken for durable state.
+Cancellation-fallback recovery uses `record(accepted, { replaceOpposite: true })`.
+The opposite-store delete observes its own `onDiskError`; if a durable overload
+may remain, replacement returns `unknown`, releases the per-key gate, keeps the
+fallback, and emits no ACK. This prevents a dual marker whose later lookup would
+otherwise choose overload.
 
-An unexpected adapter exception is `unknown`: the reservation is released/not
-committed and gets no result until retry. No ad-hoc storage-failure fallback is
-added; each process-wide SDK store has one configured 2,048-entry memory tier,
-and the synchronous hot index has process-wide 2,048-entry/2-MiB caps, so adding
-accounts or storage failures cannot create an unbounded cache family.
+An accepted/overloaded write receipt retains its per-key operation gate until
+`commit()` or `rollback()`. Rollback observes the SDK `forget(...).onDiskError`
+hook. If exact deletion fails, the marker is placed in a separate process-wide
+rollback-recovery quarantine capped at **2,048 entries / 2 MiB** of measured
+account/key metadata and removed from synchronous hot classification. Later
+`lookup`, `record`, or `forget` for that key first retries deletion of the exact
+marker generation under the same key gate. Until cleanup succeeds it returns
+`unknown`, so a same-process cold lookup cannot rediscover the stale marker and
+ACK/reject work whose dispatcher offer was rolled back. Once deletion succeeds,
+classification resumes from `not-found` and the retry may be freshly admitted.
+
+Quarantine entries are never evicted to make room, because eviction would forget
+known-unsafe state. If its count/byte bound cannot accept another failed marker,
+one bounded process poison latch makes every later outcome operation `unknown`
+for the life of that process. This deliberately harsh fail-closed behavior keeps
+storage failures from creating an unbounded map/task/Promise family or silently
+authorizing lost work. This recovery metadata is live-process state, not crash
+recovery: a process restart still has the record-before-result tradeoff documented
+above and §1.2's disk-backed/crash-recovery non-goal remains unchanged. Unexpected
+adapter exceptions likewise return `unknown` and emit no result.
 
 ### 3.4 Protocol v2 is enforced in both directions
 
@@ -438,13 +470,18 @@ share the same bound.
 `cancelKey(key, { notify })` detaches synchronously. `/stop` uses `notify:true`:
 its existing record-cancelled/ACK callback may be async, so reservations remain
 charged until that callback settles. Peer unregister/account disposal use
-`notify:false`, invalidate the generation, and release immediately because the
-transport/session is being retired. This prevents teardown from spawning a new
-fan-out of detached async item closures.
+`notify:false` and invalidate the generation. Waiting and detached callbacks that
+never began are severed and released immediately. A callback that already began
+may have copied its entries before its first await, so its reservation remains
+charged until the callback settles even though all later delivery/dispatch is
+revoked. This makes repeated cross-key teardown churn consume the same hard
+process count/byte budget instead of creating an uncharged async fan-out.
 
 A raw overflow cannot synchronously distinguish an accepted replay from a fresh
-id when the persistent cache is cold. It is handled by a process-wide
-`BoundedOverflowResolver`:
+id when the persistent cache is cold. The exception is the synchronous bounded
+cancelled-item fallback: it is authoritative before the hot outcome cache and
+marks the existing no-wait task as accepted-recovery. Raw overflow is handled by
+a process-wide `BoundedOverflowResolver`:
 
 - at most one active resolver per session, 64 per process, and 1 MiB of measured
   process-wide resolver metadata; there is no waiting queue, so a failed
@@ -454,6 +491,9 @@ id when the persistent cache is cold. It is handled by a process-wide
   the separate 1 MiB resolver-metadata ceiling;
 - it performs full outcome lookup: accepted -> ACK, overloaded -> rejection,
   not-found -> record overloaded durably -> rejection;
+- in accepted-recovery mode it skips ordinary lookup, records accepted with
+  opposite replacement, sends only ACK, and deletes the fallback only after
+  record+ACK succeed while the task remains active;
 - unknown/read/write failure emits no result. A memory-only overload write is
   forgotten as specified in §3.3 and the same-id client retry tries again;
 - session/account teardown invalidates the task generation so a late completion
@@ -507,13 +547,24 @@ overloaded work never enters the dispatcher. ACK may precede `finish` because a
 committed lease reservation is ingress admission; a process crash before handler
 start remains the pre-existing documented record-to-start at-most-once window.
 
+If `/stop` or teardown invalidates a batch while outcome work is stalled, ingress
+does not await any per-item cancellation callback from inside the classification
+loop. Its invalidated footer first rolls back every held outcome receipt, thereby
+releasing all per-key storage gates; only then does it await requested
+cancellation persistence, roll back provisional offers, and release deferred
+reservations. The still-running debounce callback remains physically charged
+until that sequence settles. This prevents a cancellation replacement write from
+waiting behind a gate held by the same flush while preserving the hard retention
+bound and suppressing every late normal ACK/dispatch.
+
 ### 4.4 Accounting ownership
 
 Every retained entry has exactly one owner transition:
 
 ```text
 unowned -> debounce-waiting reserved -> debounce-inflight
-debounce-inflight -> duplicate/rejected/error/cancel/dispose -> released
+debounce-inflight queued -> duplicate/rejected/error/cancel/dispose -> released
+debounce-inflight running callback -> invalidated but charged -> callback settled -> released
 debounce-inflight -> provisional dispatcher offer
 provisional -> rollback/clear/dispose -> released
 provisional -> committed pending (ownership transfer, usage unchanged)
@@ -535,15 +586,16 @@ overflow wire frame in this patch because `inbound_rejected.reason` is
 deliberately overload-only.
 
 Dispatcher `dispose()` releases every pending/provisional entry and closes active
-leases. Bounded-debouncer `dispose()` releases waiting entries without `onCancel`
-fanout and marks in-flight flushes so their `finally` releases rather than
-dispatches; both return summaries for tests/logging. They are idempotent and
-terminal: later
+leases. Bounded-debouncer `dispose()` releases waiting/queued entries without
+`onCancel` fanout and marks started callbacks inert; those callbacks and any
+entries they copied remain reported and charged until their `finally` settles.
+Both return summaries for tests/logging. They are idempotent and terminal: later
 push/beginBatch/dispatch calls return `disposed` without retaining or starting a
 handler. The pinned OpenClaw gateway adapter exposes both `stopAccount(ctx)` and
-`ctx.abortSignal`; §5.3 wires both to one idempotent account disposer. Transient
-NATS disconnect/reconnect must **not** dispose or clear retained work because
-that would destroy already-admitted work during a network flap.
+`ctx.abortSignal`; §5.3 makes start acquire an exact runtime-generation lease and
+wires stop/abort to identity-safe disposal. Transient NATS disconnect/reconnect
+must **not** dispose or clear retained work because that would destroy
+already-admitted work during a network flap.
 
 ### 4.5 Drain ordering and the no-id case
 
@@ -576,6 +628,9 @@ count and byte budget like any other message while pending.
 - mirror the pinned SDK debounce/timer/same-key serialization behavior;
 - reserve before retaining any item/closure and hold the token across async
   `onFlush` settlement;
+- accept a typed measurement seam and make production pass
+  `estimateRetainedMessageBytes(item.message)`, excluding the repo-owned
+  `{peerId, message}` routing wrapper from the fixed wire-message charge;
 - maintain bounded hot-outcome and in-flight-id checks, cancel/release per key,
   terminal idempotent `dispose`, and generation guards for late continuations;
 - expose deterministic clock/timer hooks for exact boundary and stalled-flush
@@ -618,18 +673,30 @@ count and byte budget like any other message while pending.
 - turn `onDiskError` epochs into conservative `unknown` lookup results;
 - report record durability and forget a memory-only overload before returning
   `unknown`, so callers cannot publish a non-durable terminal rejection;
+- retain failed receipt rollbacks in one bounded process-wide 2,048-entry/2-MiB
+  exact-marker quarantine; retry cleanup before hot/cold classification and
+  poison the process store fail-closed if recovery metadata cannot fit;
 - expose no raw boolean whose `false` could mean either absence or storage
-  failure; unexpected exceptions return `unknown` without another cache.
+  failure; unexpected exceptions and pending rollback cleanup return `unknown`.
 
 `packages/plugin/src/ingress-dedupe.ts`
 
 - replace pre-dispatch ordinary recording with sequential outcome lookup,
   reservation adoption, accepted-outcome record, and offer commit/rollback;
+- treat the first unknown/thrown lookup or record, unresolved overload record,
+  or cancellation-fallback retry without a publishable outcome as a FIFO
+  barrier: finalize the classified prefix, then release the current item and
+  untouched suffix for ledger retry without further classification or results;
+- on mid-flush invalidation, roll back all held outcome receipts/key gates before
+  awaiting cancellation callbacks, then roll back offers/releases so physical
+  accounting stays charged until cancellation settles without a self-deadlock;
 - stream ACK/rejection ids through a shared count+sealed-wire-byte chunker;
 - ACK only accepted outcomes and reject only overloaded outcomes, including
   repeated ids in the same flush;
 - preserve cancelled-item semantics while moving its fallback tombstones to one
-  account-namespaced process-wide 256-entry/256-KiB insertion-ordered store.
+  account-namespaced process-wide 256-entry/256-KiB insertion-ordered store;
+- give that fallback precedence over hot outcomes/admission and carry one mode
+  bit through the existing bounded overflow resolver rather than adding a queue.
 
 `packages/plugin/src/ingress-outcome.test.ts`,
 `packages/plugin/src/ingress-dedupe.test.ts`
@@ -637,6 +704,13 @@ count and byte budget like any other message while pending.
 - assert exact offer -> outcome-record -> offer-commit -> result order;
 - add same-id, replay, unknown-storage, and mixed
   duplicate/fresh/partial-admission cases;
+- prove lookup-unknown, accepted-record-unknown, and overload-record-unknown each
+  commit the classified prefix while leaving the suffix wholly untouched;
+- prove multi-item `/stop` releases every held outcome gate before awaiting
+  cancellation persistence, converges accounting, and emits no late normal
+  ACK/dispatch;
+- cover accepted and overloaded rollback-delete failure, same-process cold replay
+  suppression, later exact cleanup/fresh classification, and recovery-cap poison;
 - use real hermetic persistent dedupe instances for accepted and overloaded
   namespaces to prove namespace separation and precedence.
 
@@ -648,10 +722,10 @@ count and byte budget like any other message while pending.
 
 ### 5.3 NATS wiring
 
-`packages/plugin/index-nats.ts`
+`packages/plugin/src/nats-account-runtime.ts`
 
 - create one process retention budget and one overflow-resolver gate at module
-  scope, outside/before the per-account loop;
+  scope, outside every host-selected per-account lifecycle;
 - inject the same budget into every account bounded debouncer and dispatcher;
 - create one process-wide `IngressOutcomeStore`; pass accountId only as the
   logical persistent/cache namespace, never as a resource partition;
@@ -660,6 +734,13 @@ count and byte budget like any other message while pending.
 - keep `/stop` clear wiring, now consuming dropped messages and releasing usage;
 - retain the bounded debouncer, dispatcher, overflow-resolver generation, and
   transport teardown handles in `AccountRuntime`;
+- preserve the existing `NatsAccountRuntimeCoordinator`: `registerFull` remains
+  synchronous/network-free and the host starts only its selected account;
+- fold bounded-ingress cleanup into the coordinator-owned, exact-generation
+  disposer before channel/listener/graceful-transport teardown;
+- guard the final no-await register-subscription/map-publication boundary with
+  the coordinator owner/abort generation so a stopped stale build closes locally
+  and never becomes observable;
 - aggregate pressure logs without message contents.
 
 `packages/plugin/src/channel-contract.ts`, `packages/plugin/src/nats-channel.ts`
@@ -674,14 +755,13 @@ count and byte budget like any other message while pending.
 
 `packages/plugin/src/channel.ts`
 
-- extend `createWebChannelPlugin` options with an idempotent account-runtime
-  disposer;
-- wire both `gateway.stopAccount(ctx)` and `startAccount(ctx)`'s
-  `abortSignal`/`finally` path to that disposer while preserving the approval
-  monitor;
+- keep `gateway.startAccount(ctx)` composed from the approval monitor and the
+  coordinator-backed NATS account lifecycle under one child abort signal;
+- await both lifecycle cleanups on host abort and abort the sibling if either
+  exits unexpectedly;
 - account disposal terminally disposes the bounded debouncer and dispatcher,
-  invalidates overflow tasks, disconnects transport, removes the runtime from
-  the map, and reselects/clears the lazy primary channel;
+  invalidates overflow tasks, gracefully closes transport, removes only the exact
+  owned runtime, and reselects/clears the lazy primary channel;
 - peer/account teardown never disposes the process-wide budget itself; it only
   releases entries owned by that peer/account. Transient reconnect does neither.
 
@@ -692,10 +772,12 @@ count and byte budget like any other message while pending.
 - enforce that limit in `publish`/`publishWithReply` before sending the PUB
   header so an oversized frame cannot corrupt the stream.
 
-Because `index-nats.ts` is outside the plugin `tsconfig` include, all nontrivial
-logic stays in typed `src/` helpers. Update `index-nats-wiring.test.ts`/source
-guards so a future wiring edit cannot silently restore pre-dispatch ACK or create
-one process budget per account.
+`index-nats.ts` remains a thin re-export with no lifecycle ownership.
+`nats-account-runtime.ts` and the nontrivial state machines are included in the
+plugin typecheck and covered by runtime/helper tests. Update
+`index-nats-wiring.test.ts` source guards so a future wiring edit cannot silently
+restore pre-dispatch ACK, create one process budget per account, or publish a
+stale account generation.
 
 ### 5.4 Client result state
 
@@ -707,7 +789,9 @@ one process budget per account.
 `packages/client/src/nats-client.ts`
 
 - add `inbound_rejected` to `InboundMessage`;
-- drain rejected ids from `unackedLedger` and fail trackers before listener fanout;
+- for ACK and rejection frames, detach every unique id and cancel retry ownership
+  before the first public tracker callback, then apply accepted/overloaded states
+  in frame order so callback-driven disconnect/reconnect cannot fail later ids;
 - preserve `lastAttemptAt`;
 - unknown/post-terminal rejection is a no-op;
 - replace ledger values with bounded retry metadata and drive same-id live
@@ -772,14 +856,18 @@ configured account count x four internal reasons.
 1. **Count exact boundary:** a stalled zero-ms `onFlush` plus 32 retained frames
    fills the session; the 33rd retains no object/closure and usage stays 32.
 2. **Byte exact boundary:** injected charges across debounce-inflight + pending
-   exactly fill 1 MiB; +1 byte retains nothing and rejects.
+   exactly fill 1 MiB; +1 byte retains nothing and rejects. A production-shaped
+   `{peerId,message}` debouncer item whose message formula is exactly 1 MiB is
+   admitted, proving routing-wrapper bytes are not charged.
 3. **Single oversize:** one message above the session byte limit is rejected
    before any timer/array/Promise-chain allocation or usage mutation.
 4. **Non-zero debounce:** a stopped fake clock cannot grow `items[]` beyond the
    same count/byte caps; flush order/coalescing matches the pinned SDK behavior.
-5. **Zero-ms key chain:** a never-settling first flush plus an arbitrary push loop
-   proves retained entries/continuations stay bounded and accepted ones preserve
-   same-key order.
+5. **Zero-ms callback bounds:** a never-settling first flush plus an arbitrary
+   same-key push loop proves queued entries/continuations stay bounded. A second
+   adversarial loop starts callbacks for distinct keys, copies entries before the
+   first await, retires every key, and proves exact process count/byte caps, +1
+   retains/starts nothing, and settlement releases without late dispatch.
 6. **In-flight duplicate:** a repeated valid id owns no second reservation and
    cannot enter overflow resolution; the earlier entry remains authoritative.
 7. **Reservation transfer:** debounce-inflight -> pending changes ownership with
@@ -799,17 +887,23 @@ configured account count x four internal reasons.
     and does not wedge the next wave/key chain.
 15. **Clear:** `/stop` cancel+clear returns exact messages, holds reservations
     through async cancel-record/ACK, then releases both layers; unregister/
-    teardown skips that fanout and later timer/settlement starts no cleared work.
-16. **Dispose:** multiple waiting/in-flight/pending sessions converge to global
-    zero; second dispose is a no-op and late continuations/post-dispose pushes
-    cannot reserve, publish, or start work.
+    teardown skips that fanout, severs callbacks that never began, and keeps any
+    started callback charged until settlement without starting cleared work.
+16. **Dispose:** multiple waiting/in-flight/pending sessions release severable
+    work immediately; started callbacks remain reported/charged and converge to
+    global zero on settlement. Repeated dispose is mutation-idempotent, and late
+    continuations/post-dispose pushes cannot reserve, publish, or start work.
 17. **Lease settlement race:** the running turn settles while outcome recording
     is awaited; drain waits for `finish`, then releases and starts exactly once.
 18. **Offer rollback:** outcome-record failure rolls back its reservation once
     without disturbing earlier committed offers.
-19. **Reentrant burst:** logging/result callbacks entering another session cannot
+19. **Cancellation gate ordering:** multi-item `/stop` rolls back every held
+    outcome receipt before awaiting cancellation persistence, cannot deadlock on
+    its own per-key gates, keeps usage charged until settlement, and emits no
+    late normal ACK/dispatch.
+20. **Reentrant burst:** logging/result callbacks entering another session cannot
     observe or create usage above any limit.
-20. **Legacy path:** no-coalesce FIFO behavior remains unchanged for callers that
+21. **Legacy path:** no-coalesce FIFO behavior remains unchanged for callers that
     bypass the bounded debouncer.
 
 ### 7.2 Ingress/dedupe/result tests
@@ -847,7 +941,24 @@ configured account count x four internal reasons.
     chunks still attempt delivery and no id crosses outcome classes.
 17. Cancelled fallback tombstones across many accounts stay within shared
     256-entry/256-KiB caps and evict oldest without cross-account key collision.
-18. Non-string/oversized ids are never persisted or echoed in a result payload.
+18. Failed cancel record + lost ACK + full raw budget recovers through one
+    bounded resolver task as accepted/ACK only, overrides a conflicting hot
+    overload, never dispatches/rejects, and deletes fallback only on success.
+19. Opposite-marker delete disk failure returns unknown, keeps fallback/overload,
+    releases the operation gate, and emits no ACK.
+20. Accepted and overloaded receipt rollback-delete failure quarantine the exact
+    marker; same-process hot/cold replay emits no result/dispatch while cleanup
+    fails, later cleanup permits fresh classification, and the 2,048-entry/2-MiB
+    recovery cap poisons fail-closed without eviction or metadata growth.
+21. Non-string/oversized ids are never persisted or echoed in a result payload.
+22. Mixed batches with a classified prefix followed by lookup-unknown,
+    accepted-record-unknown, or overload-record-unknown commit/publish the prefix,
+    treat the unresolved current entry as a FIFO barrier, and perform no lookup,
+    record, offer, result, or dispatch for its suffix; all released ledger ids can
+    retry later without accounting leaks.
+23. A multi-item batch invalidated by `/stop` releases all held outcome gates
+    before awaiting cancellation handlers, so replacement writes cannot
+    self-deadlock and no normal result/dispatch escapes after invalidation.
 
 ### 7.3 Client tests
 
@@ -867,6 +978,10 @@ configured account count x four internal reasons.
    browser eventually receives the replayed terminal result.
 10. Close, terminal failure, ledger eviction, and session reset cancel/re-arm the
     single timer without leaks; 100 entries remain the hard memory bound.
+11. A two-or-more-id ACK or rejection frame detaches the whole frame before the
+    first state callback; callback-driven disconnect/reconnect preserves every
+    later id's authoritative accepted/failed(overloaded) state and leaves no
+    ledger/timer residue.
 
 ### 7.4 Protocol and integration tests
 
@@ -881,13 +996,19 @@ configured account count x four internal reasons.
 6. two accounts share the process cap without mixing routes/messages.
 7. authenticated unregister and oldest-peer cap eviction invalidate overflow
    work and release only that peer's debounce+pending accounting.
-8. account `stopAccount` and abort-finally dispose both retention layers once,
-   disconnect/remove the runtime, and release reservations owned by that account;
-   a transient NATS reconnect preserves admitted work.
+8. coordinator abort/finally disposes both retention layers once, gracefully
+   closes/removes only the exact runtime, and releases reservations owned by that
+   account; start -> stop -> start builds a fresh transport and register
+   subscription, leaves the old generation inert, and a transient NATS reconnect
+   preserves admitted work.
 9. advertised `INFO.max_payload` below/above the local limit is honored; boundary
    result publishes, and oversized direct payload throws before a `PUB` header/
    write while the connection remains usable.
 10. pressure logger rate limit/aggregation has no message text or ids.
+11. Concurrent starts for one account remain coordinator-single-owner; abort and
+    retry serialize behind exact-generation cleanup, late old cleanup cannot touch
+    a fresh replacement, and a stale generation never subscribes or enters the
+    runtime map.
 
 ### 7.5 Verification commands
 
@@ -906,6 +1027,9 @@ npx vitest run \
   packages/plugin/src/nats-channel-ack.test.ts \
   packages/plugin/src/nats-transport.test.ts \
   packages/plugin/src/nats-register.test.ts \
+  packages/plugin/src/channel.test.ts \
+  packages/plugin/src/nats-account-runtime.test.ts \
+  packages/plugin/src/index-nats-wiring.test.ts \
   packages/client/src/nats-client-sendstate.test.ts \
   packages/client/src/nats-client-wrapper-sendstate.test.ts \
   packages/client/src/nats-client-register.test.ts \

@@ -137,6 +137,28 @@ describe("WebChannelNATSClient — P0-4 receipt + sendState (wrapper)", () => {
     h.wrapper.close();
   });
 
+  it("surfaces inbound_rejected as failed(overloaded) on the receipt and bubble", async () => {
+    const h = await connectWrapper({ ack: false });
+    const receipt = h.wrapper.send("over capacity")!;
+    await settle();
+    const wireId = userBubble(h.wrapper, "over capacity")!.wireId!;
+    deliverOut(h.K, {
+      type: "inbound_rejected",
+      ids: [wireId],
+      reason: "overloaded",
+    });
+    await settle();
+    expect(receipt.snapshot()).toMatchObject({
+      state: "failed",
+      failure: { reason: "overloaded", retryable: true },
+    });
+    expect(userBubble(h.wrapper, "over capacity")).toMatchObject({
+      sendState: "failed",
+      sendFailure: { reason: "overloaded", retryable: true },
+    });
+    h.wrapper.close();
+  });
+
   for (const scenario of [
     { outcome: "ok" as const, state: "completed" as const, reason: undefined },
     { outcome: "error" as const, state: "failed" as const, reason: "turn-failed" as const },

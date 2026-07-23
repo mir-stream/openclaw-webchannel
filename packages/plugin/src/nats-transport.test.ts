@@ -173,6 +173,20 @@ function makeTestTransport(opts?: {
 describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", () => {
   const teardown: NatsTransport[] = [];
 
+  it("honors INFO.max_payload and rejects before writing any PUB header", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+    const connected = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame('INFO {"max_payload":5}\r\nPONG\r\n');
+    await connected;
+    expect(t.effectiveOutboundLimit).toBe(5);
+    const before = fakeWs.sent.length;
+    expect(() => t.publish("x", "123456")).toThrow(/max_payload/);
+    expect(fakeWs.sent).toHaveLength(before);
+    expect(() => t.publish("x", "12345")).not.toThrow();
+  });
+
   afterEach(() => {
     for (const t of teardown) {
       try {

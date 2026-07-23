@@ -13,6 +13,15 @@ This package ships the NATS E2E plugin entry. Both browser and agent dial out to
 a shared NATS relay; the agent exposes no browser-facing inbound port and the
 relay sees encrypted envelopes only.
 
+Protocol v2 places simultaneous hard bounds on all not-yet-running user work:
+32 messages / 1 MiB charged bytes per opaque account+peer session and 1,024
+messages / 32 MiB process-wide across accounts. Existing admitted work is
+preserved; only the newest overflow is rejected with a durable id-correlated
+`inbound_rejected{reason:"overloaded"}` result. Client and plugin v2 must be
+upgraded together. `/stop` holds killed pre-run entries through suppression +
+ACK delivery, and every ACK/rejection path is split at 64 ids, 64 KiB sealed
+wire size, and the NATS server's effective `max_payload`.
+
 As of `e384198`, a real headless-Chromium message HAS travelled browser → NATS → this plugin →
 `inbound.run` → (echo model) → back. Earlier the NATS entry assumed APIs that don't exist
 (`api.http.post`, a `webchannel-nats` id, `keepAlive`) — fixed there. Register admission is now

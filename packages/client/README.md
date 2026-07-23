@@ -67,10 +67,10 @@ queued -> sent -> accepted -> completed        (+ failed, terminal, from any pre
   on the anchor message. A legacy plugin that omits `outcome` leaves the message
   at `accepted` (an honest degradation — `completed` never appears, never faked).
 - `failed` — terminal; `sendFailure.reason` is one of `closed` | `evicted` |
-  `terminal` (+ `cause`) | `turn-failed` | `cancelled`, with `retryable` and
+  `terminal` (+ `cause`) | `overloaded` | `turn-failed` | `cancelled`, with `retryable` and
   `lastAttemptAt`. `retryable` means the caller/embedder may initiate a **fresh**
   retry after this terminal outcome; the failed receipt itself never resumes and
-  is never automatically retried. It is `true` for `evicted`/`turn-failed` and
+  is never automatically retried. It is `true` for `evicted`/`overloaded`/`turn-failed` and
   `false` for `closed`/`terminal`/`cancelled`. Readiness is separate: retry only
   on a ready instance; terminal recovery requires a new instance as described
   below.
@@ -108,14 +108,20 @@ is open. `accepted`/`completed`/`failed` are the durable resolutions.
 | `load_history`/`load_commands` loss | re-request + register re-hydration | loss is harmless |
 | inbound frame loss | register snapshot re-hydration | unchanged |
 
+Protocol v2 adds explicit retained-work overload rejection. A rejected send
+becomes `failed { reason: "overloaded", retryable: true }`; retry is a deliberate
+caller/user action and creates a new id. Before either ACK or rejection arrives,
+the client reliability layer replays the same id live with capped exponential
+backoff, as well as immediately on reconnect. Client and plugin v2 must be
+upgraded together.
+
 ### BREAKING: `ChatMessage.delivered` removed
 
 The boolean `delivered` is gone. Migration: `delivered === true` ↔
 `sendState === "accepted" || sendState === "completed"`; render a failure from
 `sendState === "failed"` + `sendFailure`. `@mir-stream/webchannel-client` and
 `@mir-stream/webchannel-plugin` ship in lockstep — upgrade both together (the
-additive `turn_settled.outcome` field is the only wire change; an older peer on
-either side simply ignores it).
+protocol v2 registration is mandatory in both directions).
 
 See [`../../docs/STATUS.md`](../../docs/STATUS.md) for current deployment status
 and [`../../docs/TRUST_AND_ONBOARDING.md`](../../docs/TRUST_AND_ONBOARDING.md) for

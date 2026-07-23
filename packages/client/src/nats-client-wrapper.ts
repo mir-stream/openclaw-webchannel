@@ -1237,6 +1237,12 @@ export class WebChannelNATSClient {
         return;
       }
 
+      case "inbound_rejected": {
+        // The low-level client has already removed ledger entries and emitted
+        // failed{overloaded}; receipt/bubble state arrives through onSendState.
+        return;
+      }
+
       case "approval_request": {
         const req: ApprovalRequest = {
           id: msg.id ?? "",

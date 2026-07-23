@@ -37,8 +37,8 @@ type EnrollmentRequest = {
   tenant: string;
   /** Plugin package version (diagnostics only; OPTIONAL for pre-reporting plugins). */
   pluginVersion?: string;
-  /** Plugin wire-protocol version (OPTIONAL for pre-v1 plugins). */
-  protocolVersion?: number;
+  /** Mandatory wire-protocol version reported by the shipped v2 plugin. */
+  protocolVersion: number;
 };
 
 /**

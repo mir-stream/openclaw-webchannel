@@ -25,13 +25,22 @@ import {
   createSerializedInboundDispatcher,
   coalesceUserMessages,
 } from "./inbound-queue.js";
+import type { SerializedInboundDispatcher } from "./inbound-queue.js";
+import {
+  estimateRetainedMessageBytes,
+  InboundRetentionBudget,
+} from "./inbound-retention.js";
+import type { RetentionSessionToken } from "./inbound-retention.js";
+import {
+  createBoundedInboundDebouncer,
+  type BoundedInboundDebouncer,
+} from "./bounded-inbound-debouncer.js";
+import { getProcessIngressOutcomeStore } from "./ingress-outcome.js";
+import { BoundedOverflowResolver } from "./inbound-overflow-resolver.js";
+import { InboundPressureLogger } from "./inbound-pressure-log.js";
 import { isControlLaneMessage, shouldDropBufferedInputOnStop } from "./control-lane.js";
 import { resolveCommandGate } from "./command-gate.js";
-import {
-  createInboundDebouncer,
-  resolveInboundDebounceMs,
-} from "openclaw/plugin-sdk/reply-runtime";
-import { createPersistentDedupe } from "openclaw/plugin-sdk/persistent-dedupe";
+import { resolveInboundDebounceMs } from "openclaw/plugin-sdk/reply-runtime";
 import {
   CancelledInboundFallbackTombstones,
   createIngressOnFlush,
@@ -162,6 +171,9 @@ type AccountRuntime = {
   /** Immutable trust configuration used by this account-bound verifier. */
   auth: ResolvedJwtVerifierConfig;
   historyConfig: ReturnType<typeof resolveHistoryConfig>;
+  sessionTokens: Map<string, RetentionSessionToken>;
+  inboundDebouncer: BoundedInboundDebouncer<any>;
+  inboundDispatcher: SerializedInboundDispatcher<any>;
   owner: object;
   dispose: () => Promise<import("./nats-account-coordinator.js").DisposeReport>;
 };
@@ -181,6 +193,22 @@ type WebchannelChannelConfig = {
 
 /** accountId → runtime, built once per process (idempotent across re-warms). */
 const accountRuntimes = new Map<string, AccountRuntime>();
+/** One heap/failure-domain budget and outcome cache across every account. */
+const processInboundRetention = new InboundRetentionBudget();
+const processIngressOutcomes = getProcessIngressOutcomeStore();
+const processCancelledInboundFallback = new CancelledInboundFallbackTombstones(
+  (message) => console.warn(message),
+);
+const processOverflowResolver = new BoundedOverflowResolver({
+  outcomeStore: processIngressOutcomes,
+  sendAck: ({ accountId, peerId, id }) =>
+    accountRuntimes.get(accountId)?.channel.sendAck(peerId, [id]) ?? false,
+  sendRejected: ({ accountId, peerId, id }) =>
+    accountRuntimes.get(accountId)?.channel.sendInboundRejected(peerId, [id]) ?? false,
+  onCancelledRecovered: ({ accountId, key }) => {
+    processCancelledInboundFallback.delete(key, accountId);
+  },
+});
 const accountCoordinator = new NatsAccountRuntimeCoordinator();
 const aggregateTracker = new AccountServingAggregateTracker();
 const permanentFailureReporter = new AccountPermanentFailureReporter();
@@ -721,12 +749,24 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         InboundWsMessage,
         { type: "user_message" }
       >;
-      let inboundDispatcher: ReturnType<typeof createSerializedInboundDispatcher<WebchannelUserMessage>> | undefined;
-      let inboundDebouncer: ReturnType<typeof createInboundDebouncer<{
+      type DebounceItem = {
         peerId: string;
         message: WebchannelUserMessage;
-      }>> | undefined;
-      const observedPeers = new Set<string>();
+      };
+      const sessionTokens = new Map<string, RetentionSessionToken>();
+      const sessionToken = (peerId: string): RetentionSessionToken => {
+        let token = sessionTokens.get(peerId);
+        if (!token) {
+          token = processInboundRetention.createSessionToken();
+          sessionTokens.set(peerId, token);
+        }
+        return token;
+      };
+      const pressureLogger = new InboundPressureLogger(
+        (message) => (api.logger?.warn ?? console.warn)?.(message),
+      );
+      let inboundDispatcher: SerializedInboundDispatcher<WebchannelUserMessage> | undefined;
+      let inboundDebouncer: BoundedInboundDebouncer<DebounceItem> | undefined;
       let disposePromise: Promise<import("./nats-account-coordinator.js").DisposeReport> | undefined;
       const dispose = () => {
         if (disposePromise) return disposePromise;
@@ -734,10 +774,10 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           const errors: Array<{ phase: string; error: unknown }> = [];
           runtimeActive = false;
           try { attemptAbort.dispose(); } catch (error) { errors.push({ phase: "attempt-abort-listener", error }); }
-          for (const peerId of observedPeers) {
-            try { inboundDebouncer?.cancelKey(peerId); } catch (error) { errors.push({ phase: "debouncer", error }); }
-          }
-          try { inboundDispatcher?.close(); } catch (error) { errors.push({ phase: "dispatcher", error }); }
+          try { inboundDebouncer?.dispose(); } catch (error) { errors.push({ phase: "debouncer", error }); }
+          try { inboundDispatcher?.dispose(); } catch (error) { errors.push({ phase: "dispatcher", error }); }
+          try { processOverflowResolver.invalidateAccount(accountId); } catch (error) { errors.push({ phase: "overflow-resolver", error }); }
+          sessionTokens.clear();
           try { detachTransportListeners?.(); } catch (error) { errors.push({ phase: "transport-listeners", error }); }
           try { channel.dispose(); } catch (error) { errors.push({ phase: "channel", error }); }
           const transportReport = await transport.closeGracefully();
@@ -780,38 +820,15 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             // ONE follow-up turn on completion (Telegram parity), instead of
             // chaining a separate turn each.
             coalesce: coalesceUserMessages,
+            budget: processInboundRetention,
+            sessionToken,
           },
         );
-      const dispatchInbound = inboundDispatcher.dispatch;
+      const cancelledInboundFallback = processCancelledInboundFallback;
 
-      // P0-7a: per-account ingress idempotency. Each `user_message` carries a
-      // stable client `id`; we record `${peerId}:${id}` at admission with a 7-day
-      // window (Telegram parity) and drop a duplicate frame before it runs a
-      // second turn. ONE instance PER ACCOUNT — namespace = accountId, so ids are
-      // isolated per account and a peer cannot poison another peer's ids. We use
-      // `createPersistentDedupe` (record-at-ingress), NOT `createClaimableDedupe`
-      // (claim/commit); the rationale for at-most-once admission over
-      // claim/forget rollback lives in ingress-dedupe.ts. A disk fault degrades
-      // to memory-only (onDiskError → warn) and never blocks inbound.
-      const inboundDedupe = createPersistentDedupe({
-        pluginId: WEBCHANNEL_ID,
-        ttlMs: 7 * 24 * 60 * 60 * 1000,
-        memoryMaxSize: 2048,
-        stateMaxEntries: 5000,
-        onDiskError: (err) =>
-          api.logger?.warn?.(
-            `webchannel: account "${accountId}" ingress dedupe disk error ` +
-              `(degrading to memory-only): ${String(err)}`,
-          ),
-      });
-      // Same per-account lifetime as the persistent dedupe. This closes the
-      // live-process window where both a cancelled-item record and its ACK fail.
-      const cancelledInboundFallback = new CancelledInboundFallbackTombstones(
-        (m) => api.logger?.warn?.(m),
-      );
-
-      // P1-8b layer (a): idle pre-run debounce (Telegram parity), REUSING core's
-      // `createInboundDebouncer`. Sits IN FRONT of the per-session FIFO: rapid
+      // P1-8b layer (a): repo-owned bounded idle pre-run debounce (Telegram
+      // parity). It replaces core's unbounded primitive and sits IN FRONT of the
+      // per-session FIFO: rapid
       // same-peer messages within the debounce window flush together as ONE
       // merged turn. `resolveInboundDebounceMs` reads the GLOBAL config
       // (`messages.inbound.byChannel.webchannel ?? messages.inbound.debounceMs ??
@@ -819,74 +836,102 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // this layer inert (each message flushes immediately) unless an operator
       // opts in; layer (b) still coalesces busy-time regardless. We keep that
       // default (do NOT invent a nonzero one). Items carry `peerId` so `buildKey`
-      // and `onFlush` can route; `serializeImmediate` guarantees same-peer flushes
-      // never reorder even on the 0ms immediate path (core serializes same-key
-      // flushes through its `keyChains`). `onFlush` calls `dispatchInbound`
-      // SYNCHRONOUSLY, so a message arriving during a previous flush's merged turn
-      // lands in layer (b)'s buffer rather than spawning a parallel turn.
+      // and `onFlush` can route; one explicit bounded worker owns each same-key
+      // sequence. Forced retirement severs queued batch captures, while a callback
+      // that already began keeps its copied entries charged until settlement.
       const inboundDebounceMs = resolveInboundDebounceMs({
         cfg: api.config,
         channel: WEBCHANNEL_ID,
       });
-      inboundDebouncer = createInboundDebouncer<{
-        peerId: string;
-        message: WebchannelUserMessage;
-      }>({
+      const onIngressFlush = createIngressOnFlush<DebounceItem>({
+        accountId,
+        outcomeStore: processIngressOutcomes,
+        beginBatch: (peerId) => inboundDispatcher!.beginBatch(peerId),
+        sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
+        sendInboundRejected: (peerId, ids) => channel.sendInboundRejected(peerId, ids),
+        cancelledFallback: cancelledInboundFallback,
+        logInfo: (message) => api.logger?.info?.(message),
+        logWarn: (message) => api.logger?.warn?.(message),
+        isActive: () => runtimeActive,
+      });
+      inboundDebouncer = createBoundedInboundDebouncer<DebounceItem>({
         debounceMs: inboundDebounceMs,
-        serializeImmediate: true,
         buildKey: (item) => item.peerId,
-        // P0-7a ingress dedupe + P0-7b ingress ack. The REAL handler is
-        // `createIngressOnFlush` (src/ingress-dedupe.ts) — extracted there so it
-        // is tsc-checked and tested directly. Its doc owns the load-bearing
-        // rationale (why the async dedupe belongs on this same-peer-serialized
-        // flush path, the control-lane bypass, per-id record-before-coalesce, and
-        // why the ack covers fresh + duplicates alike and precedes dispatch).
-        // Split log sinks: routine duplicate drops at info, fail-open faults at
-        // warn. `sendAck` (P0-7b) drains the client's replay ledger on ingress
-        // ADMISSION (not turn success); P0-7a wired no ack (first half).
-        onFlush: createIngressOnFlush<{
-          peerId: string;
-          message: WebchannelUserMessage;
-        }>({
-          accountId,
-          checkAndRecord: (key, opts) => inboundDedupe.checkAndRecord(key, opts),
-          dispatch: dispatchInbound,
-          coalesce: coalesceUserMessages,
-          sendAck: (peerId, ids) => channel.sendAck(peerId, ids),
-          cancelledFallback: cancelledInboundFallback,
-          logInfo: (m) => api.logger?.info?.(m),
-          logWarn: (m) => api.logger?.warn?.(m),
-          isActive: () => runtimeActive,
-        }),
-        onError: (err) =>
-          api.logger.error?.(
-            `webchannel: inbound debounce flush failed: ${String(err)}`,
-          ),
-        onCancel: (items) => {
+        sessionToken: (peerId) => sessionToken(peerId),
+        budget: processInboundRetention,
+        // Charge the authenticated wire message only. `peerId` is routing
+        // metadata on the repo-owned wrapper.
+        measure: (item) => estimateRetainedMessageBytes(item.message),
+        getId: (item) => item.message.id,
+        isOverflowClaimed: (peerId, id) =>
+          processOverflowResolver.hasActiveClaim(accountId, `${peerId}:${id}`),
+        isCancelledFallback: (peerId, id) =>
+          cancelledInboundFallback.has(`${peerId}:${id}`, accountId),
+        peekOutcome: (peerId, id) =>
+          processIngressOutcomes.peek(accountId, `${peerId}:${id}`),
+        onKnownOutcome: (peerId, id, outcome) => {
+          if (outcome === "accepted") channel.sendAck(peerId, [id]);
+          else channel.sendInboundRejected(peerId, [id]);
+        },
+        onOverflow: ({ key: peerId, id, reason, chargedBytes, recoverCancelled }) => {
+          pressureLogger.record({
+            accountId,
+            internalReason: reason,
+            rejectedMessages: 1,
+            rejectedChargedBytes: chargedBytes ?? 0,
+            snapshot: processInboundRetention.snapshot(sessionToken(peerId)),
+          });
+          if (typeof id !== "string" || id.length === 0 || id.length > 128) return;
+          processOverflowResolver.tryStart({
+            accountId,
+            peerId,
+            id,
+            key: `${peerId}:${id}`,
+            sessionToken: sessionToken(peerId),
+            recoverCancelled,
+          });
+        },
+        onFlush: onIngressFlush,
+        onCancel: async (entries) => {
           // P0-7b: a `/stop` cancels debounce-buffered messages that never reached
           // onFlush, so they were never dedupe-recorded and never acked — yet the
           // client's replay ledger still holds them. Record their ids (so an
-          // in-flight replay is dropped as a duplicate) and ack them (drain the
-          // ledger). onCancel is sync-shaped and checkAndRecord is async, so this
-          // is best-effort fire-and-forget with a warn — a lost record only
-          // re-opens the pre-existing pre-4b replay window (see the helper). Layer
-          // (b) `clearPending` items are NOT handled here: they were already
-          // acked+recorded at their own onFlush.
-          void recordCancelledInboundItems(
-            items,
+          // in-flight replay is dropped as accepted) and ACK them. The bounded
+          // debouncer keeps reservations charged until this callback settles.
+          await recordCancelledInboundItems(
+            entries.map((entry) => entry.item),
             accountId,
-            (key, opts) => inboundDedupe.checkAndRecord(key, opts),
+            async (key) => {
+              const result = await processIngressOutcomes.record(
+                accountId,
+                key,
+                "accepted",
+                { replaceOpposite: true },
+              );
+              if (result.status !== "recorded") throw result.error;
+              result.write.commit();
+              return true;
+            },
             (peerId, ids) => channel.sendAck(peerId, ids),
-            (m) => api.logger?.warn?.(m),
+            (message) => api.logger?.warn?.(message),
             cancelledInboundFallback,
-            () => runtimeActive,
-          ).catch((err) =>
+            () => entries.every((entry) => !entry.isRetired()),
+          ).catch((err) => {
             api.logger?.warn?.(
               `webchannel: cancelled-inbound handling failed: ${String(err)}`,
-            ),
-          );
+            );
+          });
         },
       });
+
+      const retirePeerIngress = (peerId: string): void => {
+        inboundDebouncer!.cancelKey(peerId, { notify: false });
+        inboundDispatcher!.clearPending(peerId);
+        const token = sessionTokens.get(peerId);
+        if (token) processOverflowResolver.invalidateSession(token);
+        sessionTokens.delete(peerId);
+      };
+      channel.setPeerUnregisterHandler(retirePeerIngress);
 
       // Command-gate mirror (P1-8a follow-up), resolved ONCE per account. It
       // depends only on `api.config` + `accountId`, never on the message, so we
@@ -898,7 +943,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // core paths (all testable logic lives in the imported typed helpers).
       const commandGate = resolveCommandGate(api.config, accountId);
       channel.setMessageHandler((peerId, message) => {
-        observedPeers.add(peerId);
         if (!runtimeActive) return;
         if (message.type !== "user_message") return; // approvals routed below
         // Control lane (P1-8a): an abort ("/stop"/"stop"/…) must reach core's
@@ -949,11 +993,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           //     abort actually succeeded (their follow-up runs after the abort) —
           //     accepted over destroying input for a peer whose turn survives.
           if (shouldDropBufferedInputOnStop(message, commandGate, peerId)) {
-            const debounceCancelled = inboundDebouncer!.cancelKey(peerId);
+            const debounceCancelled = inboundDebouncer!.cancelKey(peerId, { notify: true });
             const pendingDropped = inboundDispatcher!.clearPending(peerId);
-            if (debounceCancelled || pendingDropped > 0) {
+            if (debounceCancelled || pendingDropped.length > 0) {
               api.logger?.info?.(
-                `webchannel: /stop dropped buffered input for peer ${peerId} (debounced=${debounceCancelled}, pending=${pendingDropped})`,
+                `webchannel: /stop dropped buffered input (debounced=${debounceCancelled}, pending=${pendingDropped.length})`,
               );
             }
           }
@@ -1243,6 +1287,9 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               ...(enrolled ? { enrolled } : {}),
               auth: accountAuth.auth,
               historyConfig,
+              sessionTokens,
+              inboundDebouncer: inboundDebouncer!,
+              inboundDispatcher: inboundDispatcher!,
               owner: ownerIdentity,
               dispose,
             };

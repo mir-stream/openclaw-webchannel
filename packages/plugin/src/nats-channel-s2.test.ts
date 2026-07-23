@@ -62,6 +62,23 @@ describe("S2 — NatsChannel memory bounds", () => {
     expect(transport.subs.size).toBe(3);
   });
 
+  it("runs peer-retirement cleanup for cap eviction and explicit unregister", () => {
+    const transport = new FakeTransport();
+    const channel = new NatsChannel(
+      transport as unknown as NatsTransport,
+      "acct",
+      "tenant",
+      cryptoConfig(),
+      { maxPeers: 1 },
+    );
+    const retired: string[] = [];
+    channel.setPeerUnregisterHandler((peerId) => retired.push(peerId));
+    channel.registerPeer("peer-0");
+    channel.registerPeer("peer-1");
+    channel.unregisterPeer("peer-1");
+    expect(retired).toEqual(["peer-0", "peer-1"]);
+  });
+
   it("never evicts under normal (sub-cap) load", () => {
     const transport = new FakeTransport();
     const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant", cryptoConfig(), {

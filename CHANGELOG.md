@@ -67,7 +67,7 @@ the service's incident-response process.
 - Removed automatic admission, unauthenticated NATS mode, and the live legacy key-exchange subject. Existing removed config shapes fail with migration guidance.
 - Static NATS credential accounts cannot serve until authenticated registration for BYO-NATS lands in P0-3.
 - Client construction now requires a non-empty bootstrap JWT plus registration material containing both Ed25519 and X25519 private keys.
-- Register-delivered protocol version remains v1: the surviving register, wrapped-key, and envelope wire formats are unchanged. Replies without a version remain compatible; mismatches are terminal.
+- Wire protocol v2 is a breaking lockstep client/plugin upgrade: register versions are mandatory in both directions and bounded ingress overload has an explicit terminal `inbound_rejected` result.
 
 The plugin, client, and SaaS packages must be released together at version `0.3.0`.
 # Unreleased
