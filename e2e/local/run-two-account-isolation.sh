@@ -238,12 +238,12 @@ OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &
 GW_PID=$!
-echo "[run-two-acct] gateway pid=$GW_PID — waiting for multiplex registration (2 accounts)…"
+echo "[run-two-acct] gateway pid=$GW_PID — waiting for structured multiplex readiness (2 accounts)…"
 for i in $(seq 1 120); do
-  # Cycle 2 readiness line: "✓ NATS mode plugin registered (N of M ... serving)".
-  if grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$OCH/gateway.log" 2>/dev/null; then
+  # Aggregate readiness requires both configured accounts to be serving.
+  if grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=2 totalCount=2" "$OCH/gateway.log" 2>/dev/null; then
     echo "[run-two-acct] gateway ready:"
-    grep -E "account \"(${ACCT_A}|${ACCT_B})\" ✓ encrypted NATS channel|NATS mode plugin registered" "$OCH/gateway.log" | sed 's/^/  /' || true
+    grep -E "account \"(${ACCT_A}|${ACCT_B})\" ✓ encrypted NATS channel|event=webchannel\.account_aggregate" "$OCH/gateway.log" | sed 's/^/  /' || true
     break
   fi
   if ! kill -0 "$GW_PID" 2>/dev/null; then
@@ -251,7 +251,7 @@ for i in $(seq 1 120); do
   fi
   sleep 0.5
   if [ "$i" -eq 120 ]; then
-    echo "[run-two-acct] TIMEOUT waiting for gateway — log:"; cat "$OCH/gateway.log"; exit 2
+    echo "[run-two-acct] TIMEOUT waiting for structured multiplex readiness — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
 

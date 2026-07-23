@@ -314,9 +314,9 @@ HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &
 GW_PID=$!
-echo "[run-derived-trust] gateway pid=$GW_PID — waiting for plugin registration (consume persisted creds)…"
+echo "[run-derived-trust] gateway pid=$GW_PID — waiting for structured account readiness (consume persisted creds)…"
 for i in $(seq 1 240); do
-  if grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$OCH/gateway.log" 2>/dev/null; then
+  if grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=1 totalCount=1" "$OCH/gateway.log" 2>/dev/null; then
     echo "[run-derived-trust] gateway ready (consumed creds + connected)"
     break
   fi
@@ -325,7 +325,7 @@ for i in $(seq 1 240); do
   fi
   sleep 0.5
   if [ "$i" -eq 240 ]; then
-    echo "[run-derived-trust] TIMEOUT waiting for gateway registration — log:"; cat "$OCH/gateway.log"; exit 2
+    echo "[run-derived-trust] TIMEOUT waiting for structured account readiness — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
 
