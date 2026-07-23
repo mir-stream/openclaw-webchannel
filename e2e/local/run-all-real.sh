@@ -316,7 +316,8 @@ HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
 GW_PID=$!
 echo "[run-all-real] gateway pid=$GW_PID — waiting for structured account readiness (consume persisted creds)…"
 for i in $(seq 1 240); do
-  if grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=1 totalCount=1" "$OCH/gateway.log" 2>/dev/null; then
+  LATEST_AGGREGATE="$(grep "event=webchannel\.account_aggregate" "$OCH/gateway.log" 2>/dev/null | tail -n 1 || true)"
+  if printf '%s\n' "$LATEST_AGGREGATE" | grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=1 totalCount=1"; then
     echo "[run-all-real] gateway ready (consumed creds + connected)"
     break
   fi

@@ -16,10 +16,12 @@ import {
   AccountPermanentFailureReporter,
   AccountServingAggregateTracker,
   NatsAccountRuntimeCoordinator,
+  accountNeverServedStatusPatch,
   accountTransportStatusPatch,
   attachAccountTransportListeners,
   classifyAccountStartupFailure,
   commitAccountPublication,
+  connectedPublishedAccountIds,
   createAccountExecutionApi,
   createAttemptAbortScope,
   formatRelayOrigin,
@@ -596,6 +598,30 @@ describe("live account transport status", () => {
       lastDisconnect: { at: 7, error: "relay disconnected" },
     });
   });
+
+  it("keeps a dormant never-served permanent failure healthy under the pinned host policy", () => {
+    const status = {
+      running: true,
+      lastStartAt: 0,
+      ...accountNeverServedStatusPatch({
+        restartPending: false,
+        reconnectAttempts: 3,
+        lastError: "permanent configuration failure",
+      }),
+    };
+    const now = 120_001;
+    const channelConnectGraceMs = 120_000;
+    const pinnedHostHealthy = status.running === true
+      && (now - status.lastStartAt < channelConnectGraceMs || status.connected !== false);
+
+    expect(status).toMatchObject({
+      connected: undefined,
+      restartPending: false,
+      reconnectAttempts: 3,
+      lastError: "permanent configuration failure",
+    });
+    expect(pinnedHostHealthy).toBe(true);
+  });
 });
 
 describe("permanent account failure reporting", () => {
@@ -631,6 +657,33 @@ describe("permanent account failure reporting", () => {
 });
 
 describe("account serving aggregate", () => {
+  it("counts only connected published runtimes and emits disconnect/reconnect transitions", () => {
+    const lines: string[] = [];
+    const tracker = new AccountServingAggregateTracker();
+    const a = { transport: { connected: true } };
+    const b = { transport: { connected: true } };
+    const runtimes = new Map([["a", a], ["b", b]]);
+    const refresh = () => tracker.update({
+      generation: 1,
+      expectedAccountIds: ["a", "b"],
+      servingAccountIds: connectedPublishedAccountIds(runtimes),
+      logger: { info: (line) => lines.push(line) },
+    });
+
+    expect(refresh()?.category).toBe("complete");
+    a.transport.connected = false;
+    expect(refresh()?.category).toBe("partial");
+    b.transport.connected = false;
+    expect(refresh()?.category).toBe("zero");
+    a.transport.connected = true;
+    expect(refresh()?.category).toBe("partial");
+    b.transport.connected = true;
+    expect(refresh()?.category).toBe("complete");
+    expect(lines.map((line) => line.match(/state=(\w+)/)?.[1])).toEqual([
+      "complete", "partial", "zero", "partial", "complete",
+    ]);
+  });
+
   it("emits generation-aware zero, partial, and complete transitions only when category changes", () => {
     const lines: string[] = [];
     const tracker = new AccountServingAggregateTracker();

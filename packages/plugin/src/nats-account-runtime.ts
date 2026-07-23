@@ -193,13 +193,29 @@ const reportedInvalidAccountIds = new Set<string>();
 const reportedAudiencePairs = new Set<string>();
 const preparedAudienceGenerations = new Set<number>();
 
+export function accountNeverServedStatusPatch(input: {
+  restartPending: boolean;
+  reconnectAttempts: number;
+  lastError: string | null;
+}): typeof input & { connected: undefined } {
+  return { ...input, connected: undefined };
+}
+
+export function connectedPublishedAccountIds<T extends { transport: { connected: boolean } }>(
+  runtimes: ReadonlyMap<string, T>,
+): string[] {
+  return [...runtimes.entries()]
+    .filter(([accountId, runtime]) => runtimes.get(accountId) === runtime && runtime.transport.connected)
+    .map(([accountId]) => accountId);
+}
+
 function reportServingAggregate(api: any): void {
   const expectedAccountIds = listWebchannelAccountIds(api.config)
     .filter((accountId) => isWebchannelAccountEnabled(api.config, accountId));
   aggregateTracker.update({
     generation: Number(api.generation ?? 0),
     expectedAccountIds,
-    servingAccountIds: accountRuntimes.keys(),
+    servingAccountIds: connectedPublishedAccountIds(accountRuntimes),
     logger: api.logger,
   });
 }
@@ -351,7 +367,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       attempt,
       logger: api.logger,
     });
-    setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: null });
+    setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: null }));
     // -----------------------------------------------------------------------
     // Register-hop admission over NATS (replaces the deleted HTTP routes).
     // -----------------------------------------------------------------------
@@ -420,13 +436,13 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       });
     } catch (err) {
       const failure = classifyAccountStartupFailure(err, "preflight");
-      setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: failure.operatorMessage });
+      setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: failure.operatorMessage }));
       reportPermanent(ctx.accountId, failure.code, failure.operatorMessage);
       await waitForAbort(ctx.abortSignal);
       return undefined;
     }
     if (!plan) {
-      setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: "account is disabled or not configured" });
+      setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: "account is disabled or not configured" }));
       await waitForAbort(ctx.abortSignal);
       return undefined;
     }
@@ -452,7 +468,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         });
       } catch (err) {
         const failure = classifyAccountStartupFailure(err, "preflight");
-        setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: failure.operatorMessage });
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: failure.operatorMessage }));
         reportPermanent(accountId, failure.code, failure.operatorMessage);
         await waitForAbort(ctx.abortSignal);
         return undefined;
@@ -494,7 +510,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           "encryption-policy-invalid",
           `E2E encryption configuration is invalid; refusing to serve without encryption. ${(err as Error).message}`,
         );
-        setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: "E2E encryption configuration is invalid" });
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: "E2E encryption configuration is invalid" }));
         await waitForAbort(ctx.abortSignal);
         return undefined;
       }
@@ -514,7 +530,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         });
       } catch (err) {
         const failure = classifyAccountStartupFailure(err, "preflight");
-        setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: failure.operatorMessage });
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: failure.operatorMessage }));
         reportPermanent(accountId, failure.code, failure.operatorMessage);
         await waitForAbort(ctx.abortSignal);
         return undefined;
@@ -541,7 +557,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           "jwt-auth-config-invalid",
           `${buildDetail}; fix the account JWT issuer, audience, and JWKS configuration`,
         );
-        setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: buildDetail });
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: buildDetail }));
         await waitForAbort(ctx.abortSignal);
         return undefined;
       }
@@ -556,7 +572,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         } catch {
           const detail = "enrolled credentials are invalid; remove them and re-enroll the account";
           reportPermanent(accountId, "credentials-invalid", detail);
-          setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: detail });
+          setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: detail }));
           await waitForAbort(ctx.abortSignal);
           return undefined;
         }
@@ -566,7 +582,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             "creds-missing",
             `enrolled credentials are missing; run: openclaw channels add --channel webchannel --account ${accountId}`,
           );
-          setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: "enrolled credentials are missing" });
+          setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: "enrolled credentials are missing" }));
           await waitForAbort(ctx.abortSignal);
           return undefined;
         }
@@ -578,7 +594,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           "identity-key-missing",
           `attested agent identity key is missing; run: openclaw channels add --channel webchannel --account ${accountId}`,
         );
-        setStatus({ connected: false, restartPending: false, reconnectAttempts: 0, lastError: "attested agent identity key is missing" });
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: "attested agent identity key is missing" }));
         await waitForAbort(ctx.abortSignal);
         return undefined;
       }
@@ -587,12 +603,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       return await runAccountStartupLoop({
         signal: ctx.abortSignal,
         onRetryScheduled: ({ failure, failedAttempts, delayMs }) => {
-          setStatus({
-            connected: false,
+          setStatus(accountNeverServedStatusPatch({
             restartPending: true,
             reconnectAttempts: failedAttempts,
             lastError: failure.operatorMessage,
-          });
+          }));
           if (shouldLogRetryAttempt(failedAttempts)) {
             log("warn",
               `event=webchannel.account_startup accountId=${formatAccountIdForLog(accountId)} ` +
@@ -610,12 +625,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           const lastError = quarantined
             ? "transport closure could not be confirmed; account quarantined"
             : failure.operatorMessage;
-          setStatus({
-            connected: false,
+          const status = {
             restartPending: false,
             reconnectAttempts: failedAttempts,
             lastError,
-          });
+          };
+          setStatus(quarantined ? { ...status, connected: false } : accountNeverServedStatusPatch(status));
           reportPermanent(accountId, failure.code, failure.operatorMessage, failedAttempts);
         },
         attempt: async ({ attempt, failedAttempts, markCommitted }) => {
@@ -651,11 +666,13 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         }
         if (runtimeActive && accountRuntimes.get(accountId) === runtimeRef) {
           setStatus(accountTransportStatusPatch("disconnect"));
+          reportServingAggregate(api);
         }
       };
       const onReconnect = () => {
         if (runtimeActive && published && accountRuntimes.get(accountId) === runtimeRef) {
           setStatus(accountTransportStatusPatch("reconnect"));
+          reportServingAggregate(api);
           log("info", `event=webchannel.account_transport accountId=${formatAccountIdForLog(accountId)} state=recovered`);
         }
       };
@@ -1257,7 +1274,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         try { reportServingAggregate(api); } catch { /* rollback continues */ }
         if (boundChannel === channel) boundChannel = null;
         try { rebindPrimary(); } catch { boundChannel = null; }
-        setStatus({ connected: false, restartPending: false, reconnectAttempts: failedAttempts, lastError: "account publication rolled back" });
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: failedAttempts, lastError: "account publication rolled back" }));
       };
       let publicationFailureState: {
         poisoned: boolean;

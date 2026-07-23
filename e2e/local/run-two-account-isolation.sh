@@ -241,9 +241,11 @@ GW_PID=$!
 echo "[run-two-acct] gateway pid=$GW_PID — waiting for structured multiplex readiness (2 accounts)…"
 for i in $(seq 1 120); do
   # Aggregate readiness requires both configured accounts to be serving.
-  if grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=2 totalCount=2" "$OCH/gateway.log" 2>/dev/null; then
+  LATEST_AGGREGATE="$(grep "event=webchannel\.account_aggregate" "$OCH/gateway.log" 2>/dev/null | tail -n 1 || true)"
+  if printf '%s\n' "$LATEST_AGGREGATE" | grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=2 totalCount=2"; then
     echo "[run-two-acct] gateway ready:"
-    grep -E "account \"(${ACCT_A}|${ACCT_B})\" ✓ encrypted NATS channel|event=webchannel\.account_aggregate" "$OCH/gateway.log" | sed 's/^/  /' || true
+    grep -E "account \"(${ACCT_A}|${ACCT_B})\" ✓ encrypted NATS channel" "$OCH/gateway.log" | sed 's/^/  /' || true
+    printf '  %s\n' "$LATEST_AGGREGATE"
     break
   fi
   if ! kill -0 "$GW_PID" 2>/dev/null; then
