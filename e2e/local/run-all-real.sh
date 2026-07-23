@@ -2,7 +2,7 @@
 # #21 — ALL-REAL fusion E2E. ONE live harness where a REAL headless-Chromium
 # browser running the PRODUCTION WebChannelNatsClient:
 #   (a) NATS-layer NKEY-authenticates to a REAL JWT-auth nats-server, AND
-#   (b) drives the JWT + Proof-of-Possession HTTP register hop,
+#   (b) drives the JWT + Proof-of-Possession NATS request/reply register hop,
 # against a REAL enrolled plugin (gateway) whose NATS creds were
 # acquired AT CONFIG TIME via `openclaw channels add` (가-1: the device-flow
 # EnrollmentClient runs in the setup hook, not at gateway boot) and which the
@@ -225,8 +225,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
             "strategy": "jwt",
             "jwt": {
               "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
-              "issuer": "$SAAS_ISSUER",
-              "audience": "$ACCOUNT_ID"
+              "issuer": "$SAAS_ISSUER"
             }
           },
           "dmSecurity": "allowlist",

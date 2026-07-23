@@ -137,9 +137,7 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
     });
   });
 
-  it("does NOT clobber a hand-tuned auth.jwt.issuer/audience on a full-block re-run", () => {
-    // Operator previously wrote a custom issuer/audience; a re-run that only
-    // updates identity (no explicit issuer/audience override) must preserve them.
+  it("fails closed before writing when existing config contains removed auth.jwt.audience", () => {
     const cfg = {
       channels: {
         webchannel: {
@@ -158,27 +156,16 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
         },
       },
     } as never;
-    const next = webchannelSetup.applyAccountConfig({
+    expect(() => webchannelSetup.applyAccountConfig({
       cfg,
       accountId: "accta",
       input: { saasBaseUrl: "http://s", tenant: "t2" },
-    });
-    const accta = (section(next).accounts as Record<string, unknown>).accta as Record<
-      string,
-      unknown
-    >;
-    expect(accta.auth).toEqual({
-      strategy: "jwt",
-      jwt: {
-        jwksUrl: "http://s/.well-known/jwks.json",
-        issuer: "http://custom-issuer",
-        audience: "custom-aud",
-      },
-    });
-    expect(accta.tenant).toBe("t2");
+    })).toThrow(/delete auth\.jwt\.audience/i);
+    expect(((section(cfg).accounts as Record<string, unknown>).accta as { tenant?: string }).tenant)
+      .toBeUndefined();
   });
 
-  it("lets an explicit issuer/audience override win on a full-block write", () => {
+  it("allows an issuer-only input but rejects the removed audience input", () => {
     const cfg = { channels: {} } as never;
     const next = webchannelSetup.applyAccountConfig({
       cfg,
@@ -187,22 +174,25 @@ describe("setup: applyAccountConfig (writes to accounts.<id>)", () => {
         saasBaseUrl: "http://host.docker.internal:3951",
         tenant: "t",
         issuer: "http://127.0.0.1:3951",
-        audience: "custom-aud",
       },
     });
     const accta = (section(next).accounts as Record<string, unknown>).accta as Record<
       string,
       unknown
     >;
-    // Explicit issuer/audience are operator PINS and ARE written; jwksUrl is
-    // never written by the builder anymore (it derives at runtime).
+    // Issuer remains an advanced pin. Audience is structurally the account id
+    // and is never persisted independently.
     expect(accta.auth).toEqual({
       strategy: "jwt",
       jwt: {
         issuer: "http://127.0.0.1:3951",
-        audience: "custom-aud",
       },
     });
+    expect(() => webchannelSetup.applyAccountConfig({
+      cfg: { channels: {} } as never,
+      accountId: "accta",
+      input: { tenant: "t", audience: "custom-aud" },
+    })).toThrow(/removed setup input audience/i);
   });
 
   it("writes the DEFAULT account at channel level (flat — regression-safe) when no named accounts exist", () => {

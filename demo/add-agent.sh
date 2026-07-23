@@ -80,8 +80,7 @@ cat > "$HOME_DIR/.openclaw/openclaw.json" <<JSON
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
             "jwksUrl": "$SAAS_URL/.well-known/jwks.json",
-            "issuer": "https://saas.local/demo-issuer",
-            "audience": "$ACCOUNT"
+            "issuer": "https://saas.local/demo-issuer"
           } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"]
@@ -153,10 +152,15 @@ HOME="$HOME_DIR" OPENCLAW_HOME="$HOME_DIR" OPENCLAW_DISABLE_BONJOUR=1 \
   WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$PORT" --force >"$HOME_DIR/gateway.log" 2>&1 &
 GW_PID=$!
-echo "[add-agent] $ACCOUNT gateway pid=$GW_PID — waiting for registration…"
+echo "[add-agent] $ACCOUNT gateway pid=$GW_PID — waiting for structured readiness…"
 for i in $(seq 1 240); do
-  grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$HOME_DIR/gateway.log" 2>/dev/null \
-    && { echo "[add-agent] ✓ $ACCOUNT is live on :$PORT"; break; }
+  latest_aggregate="$(grep "event=webchannel\.account_aggregate" "$HOME_DIR/gateway.log" 2>/dev/null | tail -n 1 || true)"
+  if grep -q "account \"$ACCOUNT\" ✓ encrypted NATS channel" "$HOME_DIR/gateway.log" 2>/dev/null \
+     && printf '%s\n' "$latest_aggregate" | grep -Eq \
+       "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=1 totalCount=1"; then
+    echo "[add-agent] ✓ $ACCOUNT is live on :$PORT"
+    break
+  fi
   kill -0 "$GW_PID" 2>/dev/null || { echo "[add-agent] gateway died:"; tail -20 "$HOME_DIR/gateway.log"; exit 2; }
   sleep 0.5
   [ "$i" -eq 240 ] && { echo "[add-agent] gateway TIMEOUT:"; tail -20 "$HOME_DIR/gateway.log"; exit 2; }

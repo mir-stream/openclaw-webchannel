@@ -169,15 +169,15 @@ openclaw channels add --channel webchannel \
 # (2) runs the RFC 8628 device flow headlessly (prints the user_code), persists creds, exits 0.
 ```
 
-When `--base-url` (the SaaS base URL) is present, the setup adapter writes the COMPLETE,
-enroll-ready block and **derives** every field you would otherwise hand-write:
+When `--base-url` (the SaaS base URL) is present, the setup adapter writes the complete,
+enroll-ready block. Runtime preparation derives the trust facts that should not be duplicated:
 
 | Field | Derived value |
 |---|---|
 | `auth.strategy` | `jwt` |
-| `auth.jwt.jwksUrl` | `<base-url>/.well-known/jwks.json` |
-| `auth.jwt.issuer` | `<base-url>` (default) |
-| `auth.jwt.audience` | `<accountId>` (default) |
+| verifier JWKS URL | `<base-url>/.well-known/jwks.json` unless explicitly pinned |
+| verifier issuer | SaaS-delivered issuer, then `<base-url>` fallback |
+| verifier audience | always `<accountId>`; no config key exists |
 | `dmSecurity` | `open` |
 | `nats.admission` | `register-hop` |
 | `nats.credentials.mode` | `enrolled` |
@@ -210,13 +210,12 @@ non-bundled `cliAddOptions`.
 
 **Interactive wizard — guided alternative for authoring config.** Running **bare**
 `openclaw channels add` (no flags) launches the interactive setup wizard: pick **webchannel**,
-then answer prompts for the account id, tenant, and SaaS base URL — plus **advanced** JWT
-`issuer`/`audience` overrides (the two fields the flag form cannot express; see the advanced
-subsection). The wizard writes the **same** full block through the shared builder, but the
+then answer prompts for the account id, tenant, and SaaS base URL. The wizard writes the
+**same** full block through the shared builder, but the
 device-flow enroll fires on the `--flag` path — so after authoring config with the wizard,
-complete enrollment by running the flag form above (or re-running acquisition). Use the
-wizard when you need a custom `issuer`/`audience`; use the flag form for config **and** enroll
-in one shot.
+complete enrollment by running the flag form above (or re-running acquisition). Use the flag
+form for config **and** enrollment in one shot. A custom issuer pin is a manual/programmatic
+configuration override; the interactive wizard deliberately has no issuer prompt.
 
 **Unambiguous alternative — acquisition env (legacy):** when there is **no** `channels.webchannel`
 config at all, `WEBCHANNEL_TENANT` / `WEBCHANNEL_SAAS_BASE_URL` synthesize the `"default"`
@@ -232,10 +231,9 @@ exits 0. `gateway run` then consumes them with no re-approval.
 ### Advanced / manual override (register-hop, custom issuer, allowlist)
 
 The flag form maps only the generic `--account`/`--base-url`/`--url` flags — there is **no**
-`--issuer`/`--audience`/`--admission` flag. So for the cases the derived defaults can't
+`--issuer`/`--admission` flag. So for the cases the derived defaults can't
 express — `admission: register-hop`, an `issuer` that is **not** the SaaS base URL, or
-`dmSecurity: allowlist` — either use the interactive wizard's advanced `issuer`/`audience`
-prompts, or hand-write the account block with `openclaw config patch` (objects deep-merge,
+`dmSecurity: allowlist` — hand-write the account block with `openclaw config patch` (objects deep-merge,
 arrays/scalars replace, `null` deletes):
 
 ```bash
@@ -247,8 +245,7 @@ openclaw config patch --stdin <<'JSON'
         "strategy": "jwt",
         "jwt": {
           "jwksUrl": "http://127.0.0.1:3951/.well-known/jwks.json",
-          "issuer":  "https://saas.local/webchannel-issuer",
-          "audience": "default-agent"
+          "issuer":  "https://saas.local/webchannel-issuer"
         }
       },
       "dmSecurity": "allowlist",
@@ -328,7 +325,7 @@ openclaw gateway run        # connection config lives in config (§4); creds wer
 [webchannel] NATS credential source: enrolled → wss://connect.ngs.global:443
 [webchannel] ✓ Connected to NATS
 [webchannel] ✓ Encrypted NATS channel created
-[webchannel] ✓ NATS mode plugin registered
+event=webchannel.account_aggregate generation=… state=complete servingCount=1 totalCount=1
 ```
 
 > **No more runtime enroll / "Polling…" noise.** Because acquisition moved to `channels add`

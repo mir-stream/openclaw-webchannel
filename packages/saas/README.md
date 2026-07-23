@@ -199,7 +199,8 @@ handling.
   - `POST /api/poll` — poll for approval
   - `GET  /enroll` — operator approval UI (`reference/enrollment-ui.html`)
   - `POST /approve` / `POST /deny` / `POST /revoke` — operator action; requires `ENROLLMENT_ADMIN_TOKEN`
-  - serves `bootstrapUrl` as `/bootstrap`, JWKS as `/.well-known/jwks.json`
+  - serves JWKS as `/.well-known/jwks.json`; `/bootstrap` exists only in the
+    login-gated demo session flow, not in the shared enrollment HTTP handler
 
 Run the reference operator endpoints with an explicit token:
 
@@ -210,7 +211,17 @@ curl -X POST http://127.0.0.1:3000/approve \
   -H 'Authorization: Bearer dev-only-token' \
   -d '{"user_code":"ABCD-EFGH"}'
 ```
-- `reference/bootstrap-server.ts` — reference bootstrap-JWT issuance endpoint.
+- `reference/bootstrap-server.ts` — unsafe test-only bootstrap-JWT issuer. It
+  refuses to start unless `ENABLE_TEST_ROUTES=1` and valid server-owned
+  `REFERENCE_TENANT` / `REFERENCE_ACCOUNT_ID` values are supplied; callers
+  cannot choose another signed tuple.
+
+Bootstrap authorization is tuple-scoped. A deployable issuer authenticates the
+principal, authorizes one scalar `(tenant, accountId)` target, mints that target
+as JWT `tenant` + `aud`, and returns only the matching registry pin. In a
+multi-tenant service, `canAccess` must evaluate all three values
+`(user, tenant, accountId)`; a grant list is not permission to accept a
+caller-selected tenant or return a cross-account pin map.
 
 ## Installation notes
 

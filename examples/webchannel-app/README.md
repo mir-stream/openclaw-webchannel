@@ -27,9 +27,12 @@ Server side (`server/index.ts`, all `@mir-stream/webchannel-saas`):
 
 `POST /bootstrap` and `POST /nats-user` are **session-gated**. The `peerId` is
 **always** the authenticated session uuid — a body `peerId` is ignored — and the
-`accountId` is authorized server-side (`canAccess`). Without this gate the server
-would be an unauthenticated oracle minting SaaS-signed bootstrap JWTs for any
-attacker-chosen account / victim peer.
+single target is the server's `ACCOUNT_ID`, authorized server-side (`canAccess`).
+The JWT `aud`, NATS subject account, and returned agent pin all refer to that same
+`(TENANT, ACCOUNT_ID)` tuple. A multi-tenant integrator must authorize the full
+`(user, tenant, accountId)` tuple. Without this gate the server would be an
+unauthenticated oracle minting SaaS-signed bootstrap JWTs for an attacker-chosen
+account or victim peer.
 
 ## Run
 
@@ -81,15 +84,10 @@ This app deliberately does **not** boot openclaw — attaching an agent is *your
 domain. With no agent attached, the browser:
 
 - reaches `status: "connected"` (the NKEY NATS auth succeeds), then
-- ~15s later the PoP `register` request times out (no responder) → the wrapper
-  reports a **terminal** `status: "error"` with message
-  `"[nats-client] request timeout"`.
-
-The app classifies that specific error as a graceful **"⏳ waiting for agent"**
-state (not a red error box) with a **Retry** button. **Retry is a full re-auth**
-(fresh device keys + `/bootstrap` + `/nats-user` + new client) because the
-bootstrap JWT is short-lived (~300s) — re-creating the client alone could present
-an expired JWT.
+- ~15s later, after the bounded PoP `register` attempts time out with no
+  responder, treats the agent-offline condition as transient and enters
+  `status: "reconnecting"` instead of a terminal error. The client keeps
+  retrying until an agent appears.
 
 ## Attach an openclaw agent
 

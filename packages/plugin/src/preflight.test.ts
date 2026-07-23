@@ -124,16 +124,14 @@ describe("evaluateAddPreflight (Gate A, pure)", () => {
     );
   });
 
-  it("pinned audience != accountId → FAIL naming the mismatch", () => {
+  it("reports account-derived audience with no configurable pin branch", () => {
     const r = evaluateAddPreflight({
       ...base,
-      pinnedAudience: "wrong-aud",
       jwks: { keyCount: 3 },
       relay: { ok: true },
     });
-    expect(r.ok).toBe(false);
-    expect(r.line).toContain('auth.jwt.audience="wrong-aud"');
-    expect(r.line).toContain('aud="acme"');
+    expect(r.ok).toBe(true);
+    expect(base.effectiveAudience).toBe(base.accountId);
   });
 
   it("JWKS fetch failure → FAIL naming the derived url", () => {

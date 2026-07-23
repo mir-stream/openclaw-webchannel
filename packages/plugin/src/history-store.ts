@@ -61,7 +61,7 @@ import type { MessageEnvelope } from "./e2e-envelope.js";
  * Identifies a conversation stored in the HistoryStore.
  *
  * The triple (accountId, tenant, sub) uniquely scopes a conversation:
- *   - accountId: SaaS-issued account (deployment) identity (from JWT accountId claim).
+ *   - accountId: runtime target/wire identity authorized by the signed JWT `aud`.
  *   - tenant:  Tenant scope (from JWT tenant claim; NATS account boundary).
  *   - sub:     Stable per-user JWT sub claim (multi-device invariant).
  */

@@ -17,14 +17,15 @@ import {
 import {
   hasWebchannelConfig,
   inspectWebchannelAccountIds,
+  findRemovedAudiencePaths,
   isWebchannelAccountEnabled,
   listWebchannelAccountIds,
   loadPersistedEnrolledCreds,
   type PersistedEnrolledCreds,
+  RemovedAudienceConfigError,
 } from "./account-config.js";
-import { resolveEffectiveAccountAuth } from "./account-auth.js";
-import type { AuthConfig, JwtAuthConfig } from "./auth.js";
-import { validateJwtVerifierConfig, validateVerifierConfig } from "./auth.js";
+import { createMemoizedPersistedAccessor, prepareAccountAuth } from "./account-auth.js";
+import type { AuthConfig, ResolvedJwtVerifierConfig } from "./auth.js";
 import { resolveDialMaterial, type DialMaterial } from "./consume-credentials.js";
 import { resolveEncryptionPolicy, type WebchannelEncryptionConfig } from "./encryption-policy.js";
 import { JWKSCache, type JsonWebKeySet } from "./jwks.js";
@@ -44,7 +45,7 @@ export type DoctorCheckId =
   | "creds-missing"
   | "identity-key-missing"
   | "verifier-unbuildable"
-  | "shared-audience"
+  | "audience-override-removed"
   | "obsolete-cors"
   | "credential-source-invalid"
   | "orphaned-default"
@@ -72,7 +73,6 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
   const env = deps.env ?? process.env;
   const loadCreds = deps.loadPersistedEnrolledCreds ?? loadPersistedEnrolledCreds;
   const findings: DoctorFinding[] = [];
-  const claims = new Map<string, string>();
   const top = cfg as { nats?: { url?: string }; saas?: { baseUrl?: string } };
 
   const inspection = inspectWebchannelAccountIds(cfg);
@@ -91,12 +91,27 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
 
   const plans: AccountPlanEntry[] = [];
   for (const accountId of listWebchannelAccountIds(cfg)) {
-    if (!isWebchannelAccountEnabled(cfg, accountId)) continue;
+    if (!isWebchannelAccountEnabled(cfg, accountId)) {
+      const paths = findRemovedAudiencePaths(cfg, accountId);
+      if (paths.length > 0) {
+        findings.push({
+          accountId,
+          checkId: "audience-override-removed",
+          kind: "config",
+          severity: "warn",
+          message: `Account is disabled and not serving, but removed config ${paths.join(", ")} must be deleted before re-enable.`,
+          fix: "Delete auth.jwt.audience; JWT aud is always the runtime accountId.",
+        });
+      }
+      continue;
+    }
     try {
       const plan = planWebchannelAccount(cfg, accountId, { env, warn: () => {} });
       if (plan) plans.push(plan);
     } catch (err) {
-      findings.push(configurationInvalidFinding(accountId, err));
+      findings.push(err instanceof RemovedAudienceConfigError
+        ? removedAudienceFinding(accountId, err, "error")
+        : configurationInvalidFinding(accountId, err));
     }
   }
 
@@ -191,57 +206,21 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
       }
     }
 
-    // Register-hop is the ONLY admission path (auto-admission was removed), so
-    // every served account is verified against `channels.webchannel.auth` — the
-    // serving loop calls `assertJwtAuthConfig(accountAuth)` unconditionally and
-    // skips the account when it throws. Mirror that with the cache-free validator.
-    {
-      let effective: ReturnType<typeof resolveEffectiveAccountAuth>;
-      try {
-        effective = resolveEffectiveAccountAuth({
-          accountAuthRaw: rawAuth,
-          accountId,
-          ...(plan.saasBaseUrl !== undefined ? { planSaasBaseUrl: plan.saasBaseUrl } : {}),
-          ...(top.saas?.baseUrl !== undefined ? { topLevelSaasBaseUrl: top.saas.baseUrl } : {}),
-          loadCreds: () => getPersisted(),
-        });
-      } catch (err) {
-        findings.push(configurationInvalidFinding(accountId, err));
-        continue;
-      }
-      if (effective?.strategy === "jwt") {
-        const issuer = effective.jwt.issuer;
-        const audience = effective.jwt.audience;
-        if (typeof issuer === "string" && issuer.length > 0 && typeof audience === "string" && audience.length > 0) {
-          const key = `${normalizeSlash(issuer)}\u0000${audience}`;
-          const other = claims.get(key);
-          if (other !== undefined) {
-            const message = `Register-hop accounts ${other} and ${accountId} share effective issuer=${issuer} and audience=${audience}.`;
-            findings.push({
-              accountId,
-              checkId: "shared-audience",
-              kind: "config",
-              severity: "error",
-              message,
-              fix: `Give each register-hop account a distinct audience (normally its accountId); update ${other} and ${accountId}.`,
-            });
-          } else {
-            claims.set(key, accountId);
-          }
-        }
-      }
-      try {
-        validateVerifierConfig(effective);
-      } catch (err) {
-        findings.push({
-          accountId,
-          checkId: "verifier-unbuildable",
-          kind: "config",
-          severity: "error",
-          message: errorMessage(err),
-          fix: "Correct the effective auth strategy and jwt issuer, audience, and exactly-one JWKS source named above.",
-        });
-      }
+    try {
+      prepareAccountAuth({
+        plan,
+        getPersisted,
+        ...(top.saas?.baseUrl !== undefined ? { topLevelSaasBaseUrl: top.saas.baseUrl } : {}),
+      });
+    } catch (err) {
+      findings.push({
+        accountId,
+        checkId: "verifier-unbuildable",
+        kind: "config",
+        severity: "error",
+        message: errorMessage(err),
+        fix: "Correct the effective JWT issuer and exactly-one JWKS source named above.",
+      });
     }
   }
 
@@ -341,6 +320,25 @@ export async function probeWebchannelAccount(params: {
     if (!plan) throw new Error(`account ${accountId} is not configured`);
     const top = params.cfg as unknown as { nats?: { url?: string }; saas?: { baseUrl?: string } };
     const nats = plan.account.nats as WebchannelNatsConfig | undefined;
+    const getPersisted = createMemoizedPersistedAccessor(
+      accountId,
+      deps.loadCreds ?? loadPersistedEnrolledCreds,
+    );
+    let preparedAuth;
+    try {
+      preparedAuth = prepareAccountAuth({
+        plan,
+        getPersisted,
+        ...(top.saas?.baseUrl !== undefined ? { topLevelSaasBaseUrl: top.saas.baseUrl } : {}),
+      });
+    } catch (err) {
+      return {
+        ok: false,
+        error: redactUrlSecrets(errorMessage(err)),
+        accountId,
+        admission: "register-hop",
+      };
+    }
     const dialMaterial = (deps.resolveDialMaterial ?? resolveDialMaterial)({
       natsConfig: nats,
       legacyNats: top.nats,
@@ -349,7 +347,7 @@ export async function probeWebchannelAccount(params: {
       accountId,
       ...(deps.env !== undefined ? { env: deps.env } : {}),
       ...(deps.readFile !== undefined ? { readFile: deps.readFile } : {}),
-      ...(deps.loadCreds !== undefined ? { loadCreds: deps.loadCreds } : {}),
+      loadCreds: () => getPersisted(),
     });
     // Register-hop is the only admission path; the probe reports it verbatim.
     const admission = "register-hop" as const;
@@ -370,16 +368,7 @@ export async function probeWebchannelAccount(params: {
     let jwks: WebchannelProbe["jwks"];
     {
       try {
-        const effective = resolveEffectiveAccountAuth({
-          accountAuthRaw: plan.account.auth as AuthConfig | undefined,
-          accountId,
-          ...(plan.saasBaseUrl !== undefined ? { planSaasBaseUrl: plan.saasBaseUrl } : {}),
-          ...(top.saas?.baseUrl !== undefined ? { topLevelSaasBaseUrl: top.saas.baseUrl } : {}),
-          ...(deps.loadCreds !== undefined ? { loadCreds: deps.loadCreds } : {}),
-        });
-        if (!effective || effective.strategy !== "jwt") throw new Error("effective JWT verifier config is missing");
-        validateJwtVerifierConfig(effective);
-        jwks = await probeJwks(effective, params.timeoutMs, deps);
+        jwks = await probeJwks(preparedAuth.auth, params.timeoutMs, deps);
       } catch (err) {
         jwks = { error: redactUrlSecrets(errorMessage(err)) };
       }
@@ -456,7 +445,7 @@ async function probeRelay(material: Extract<DialMaterial, { status: "ok" }>, ten
     : { ok: true };
 }
 
-async function probeJwks(auth: JwtAuthConfig, timeoutMs: number, deps: ProbeDeps): Promise<Exclude<WebchannelProbe["jwks"], undefined>> {
+async function probeJwks(auth: ResolvedJwtVerifierConfig, timeoutMs: number, deps: ProbeDeps): Promise<Exclude<WebchannelProbe["jwks"], undefined>> {
   const jwt = auth.jwt;
   if (jwt.jwksUrl !== undefined) {
     const cache = JWKSCache.create({ jwksUrl: jwt.jwksUrl }, { fetchTimeoutMs: timeoutMs, ...(deps.fetchImpl !== undefined ? { fetchImpl: deps.fetchImpl } : {}) });
@@ -481,7 +470,6 @@ function isFailedProbe(value: unknown): value is { ok: false; error: string } {
   return !!value && typeof value === "object" && (value as { ok?: unknown }).ok === false && typeof (value as { error?: unknown }).error === "string";
 }
 
-function normalizeSlash(value: string): string { return value.replace(/\/+$/, ""); }
 const URL_IN_ERROR_RE = /\b(?:https?|wss?):\/\/[^\s<>"'`]+/gi;
 function redactUrlSecrets(value: string): string {
   return value.replace(URL_IN_ERROR_RE, (rawUrl) => {
@@ -506,6 +494,20 @@ function configurationInvalidFinding(accountId: string, err: unknown): DoctorFin
     severity: "error",
     message: `Could not inspect configuration or persisted credentials for account ${JSON.stringify(accountId)}: ${errorMessage(err)}`,
     fix: "Correct the account id/configuration or credential-store readability, then rerun openclaw doctor or reconfigure WebChannel with a valid account value.",
+  };
+}
+function removedAudienceFinding(
+  accountId: string,
+  err: RemovedAudienceConfigError,
+  severity: "error" | "warn",
+): DoctorFinding {
+  return {
+    accountId,
+    checkId: "audience-override-removed",
+    kind: "config",
+    severity,
+    message: err.message,
+    fix: "Delete auth.jwt.audience; JWT aud is always the runtime accountId.",
   };
 }
 function errorMessage(err: unknown): string { return err instanceof Error ? err.message : String(err); }

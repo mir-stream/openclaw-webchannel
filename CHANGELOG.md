@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+- **Breaking (issue #54):** `auth.jwt.audience` has been removed. JWT `aud` is
+  now the canonical runtime account id or an array of authorized account ids in
+  one tenant; generic/shared IdP audiences are no longer accepted. The signed
+  `tenant` claim is mandatory and must match exactly. Remove the old config key
+  before upgrading; any enabled account containing it fails closed with
+  migration guidance. This supersedes #65's partial audience-pin proposal.
+
+### Security upgrade / incident response for issue #54
+
+Deployments that previously served more than one account with the same issuer
+and shared audience must treat that service as potentially exposed. A token for
+one account may have admitted access to another peer, including that peer's
+conversation key K and history. Upgrading prevents new cross-account admission;
+it cannot restore secrecy for keys or ciphertext that may already have been
+exposed.
+
+Before re-enabling an affected account, drain and stop **every** vulnerable
+replica and keep all affected accounts disabled. Revoke the affected issuer and
+relay bootstrap/NATS authorizations and active sessions, then rotate K and
+invalidate the old encrypted peer state through a verified control. Review the
+full exposure window and history as an incident. Deleting the old configuration,
+restarting only some replicas, or waiting for token expiry is **not** revocation.
+
+Integrated, verified K rotation/state invalidation is tracked by #72. If that
+control is not available for a deployment, do not improvise by deleting files or
+running an unverified migration: keep the accounts disabled and escalate through
+the service's incident-response process.
+
+- Each enabled account now completes pure account planning and immutable,
+  account-bound auth preparation before that account consumes transport
+  credentials or performs network I/O, then transactionally publishes its
+  serving runtime only after JWKS readiness and register-subscription
+  installation. Issuer derivation may read the account's memoized enrollment
+  metadata when required. Accounts start independently: no generation-wide
+  collision preflight is required because signed tenant and account-id audience
+  claims distinguish their token populations.
+- The shared enrollment HTTP handler no longer exposes `/bootstrap`. Normal
+  browser flows consume a server-authorized tenant/account tuple; standalone
+  unauthenticated minting is test-only and requires an explicit fixed tuple.
+- **Breaking API:** bootstrap claims no longer duplicate `aud` into a top-level
+  `accountId` output claim; consumers must read scalar/array `aud`. The shared
+  handler and minimal-consumer `bootstrap` callback options are removed.
+- Plugin, client, and SaaS release metadata move in lockstep at `0.3.0`.
+- Security incident context remains tracked in #72; durable storage follow-up
+  remains tracked in #71.
 - Hardened both NATS WebSocket transports with stable subscription replay,
   byte-accurate bounded framing, per-phase handshake deadlines, and stale
   async-connection generation guards.

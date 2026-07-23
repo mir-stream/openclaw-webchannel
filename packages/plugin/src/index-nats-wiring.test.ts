@@ -56,11 +56,29 @@ describe("index-nats.ts wiring contract — typing gate (P0-6)", () => {
   });
 });
 
-describe("index-nats.ts wiring contract — effective auth (P1-6)", () => {
-  it("uses the shared resolver and no longer defines a local derivation helper", () => {
-    expect(RUNTIME_SOURCE).toMatch(/import \{ resolveEffectiveAccountAuth \} from "\.\/account-auth\.js"/);
-    expect(RUNTIME_SOURCE).toMatch(/accountAuth = resolveEffectiveAccountAuth\(/);
-    expect(RUNTIME_SOURCE).not.toMatch(/function deriveAccountAuth\(/);
+describe("index-nats.ts wiring contract — account-bound auth and startup", () => {
+  it("prepares one immutable account-bound verifier before credential I/O", () => {
+    expect(RUNTIME_SOURCE).toContain("createMemoizedPersistedAccessor(accountId)");
+    expect(RUNTIME_SOURCE).toContain("accountAuth = prepareAccountAuth(");
+    expect(RUNTIME_SOURCE).not.toContain("resolveEffectiveAccountAuth");
+    expect(RUNTIME_SOURCE).not.toContain("reportSharedAudiences");
+    expect(RUNTIME_SOURCE).not.toContain("registerHopAudClaims");
+    expect(RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth(")).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, accountId"),
+    );
+    expect(RUNTIME_SOURCE).toMatch(/loadPersisted:\s*\(\)\s*=>\s*getPersisted\(\)/);
+  });
+
+  it("wires the prepared token-only verifier and strict PoP policy", () => {
+    expect(RUNTIME_SOURCE).toMatch(/verifyIdentity:\s*accountAuth\.verifyIdentity/);
+    expect(RUNTIME_SOURCE).toMatch(/requirePoP:\s*accountAuth\.requirePoP/);
+  });
+
+  it("completes JWKS readiness before installing the register subscription", () => {
+    const gateB = RUNTIME_SOURCE.indexOf("accountAuth.warmJwks(signal)");
+    const subscribe = RUNTIME_SOURCE.lastIndexOf("channel.subscribeRegister()");
+    expect(gateB).toBeGreaterThan(-1);
+    expect(subscribe).toBeGreaterThan(gateB);
   });
 });
 
@@ -133,13 +151,10 @@ describe("index-nats.ts account lifecycle ownership", () => {
   it("builds only the host-selected account and commits register subscription last", () => {
     expect(RUNTIME_SOURCE).toContain("planWebchannelAccount(api.config, ctx.accountId");
     expect(RUNTIME_SOURCE).not.toMatch(/for\s*\(const plan of plans\)/);
-    expect(RUNTIME_SOURCE.indexOf("assertJwtAuthConfig(accountAuth)")).toBeLessThan(
+    expect(RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth(")).toBeLessThan(
       RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, accountId"),
     );
-    expect(RUNTIME_SOURCE.indexOf("loadPersistedEnrolledCreds(accountId)")).toBeLessThan(
-      RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, accountId"),
-    );
-    expect(RUNTIME_SOURCE.indexOf("preflightResolveJwks")).toBeLessThan(
+    expect(RUNTIME_SOURCE.indexOf("accountAuth.warmJwks(signal)")).toBeLessThan(
       RUNTIME_SOURCE.lastIndexOf("channel.subscribeRegister()"),
     );
   });

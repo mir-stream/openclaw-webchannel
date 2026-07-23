@@ -43,7 +43,6 @@ export function createEnrollmentHttpHandler(options: {
   authorize?: (req: IncomingMessage) => EnrollmentHttpAuthorization | Promise<EnrollmentHttpAuthorization>;
   enrollment: Pick<DeviceFlowEnrollment, "enroll" | "poll" | "approve" | "deny">;
   registry: AgentKeyRegistry;
-  bootstrap: () => Promise<Record<string, unknown>> | Record<string, unknown>;
   defaultTenant?: string;
   onApproved?: (userCode: string) => void | Record<string, unknown> | Promise<void | Record<string, unknown>>;
   onDenied?: (userCode: string) => void | Promise<void>;
@@ -90,7 +89,6 @@ export function createEnrollmentHttpHandler(options: {
         const result = await options.enrollment.poll(payload as never);
         return json(res, "error" in result ? 400 : 200, result);
       }
-      if (openPath === "/bootstrap" && req.method === "POST") return json(res, 200, await options.bootstrap());
       if (!isAdminAction) return json(res, 404, { error: "not found" });
 
       const userCode = demo ? decoded(demo[1]) : String(payload.user_code ?? "");

@@ -283,8 +283,7 @@ boot_agent() {
         "$acct": {
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
-            "jwksUrl": "$SAAS_URL/.well-known/jwks.json",
-            "audience": "$acct"
+            "jwksUrl": "$SAAS_URL/.well-known/jwks.json"
           } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"],
@@ -341,10 +340,16 @@ JSON
     "$REPO/node_modules/.bin/openclaw" gateway --port "$port" --force >"$home/gateway.log" 2>&1 &
   local gw_pid=$!
   GW_PIDS+=("$gw_pid")
-  echo "[demo] $acct gateway pid=$gw_pid — waiting for registration…"
+  echo "[demo] $acct gateway pid=$gw_pid — waiting for structured readiness…"
   for i in $(seq 1 240); do
-    grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$home/gateway.log" 2>/dev/null \
-      && { echo "[demo] $acct gateway ready"; return 0; }
+    local latest_aggregate
+    latest_aggregate="$(grep "event=webchannel\.account_aggregate" "$home/gateway.log" 2>/dev/null | tail -n 1 || true)"
+    if grep -q "account \"$acct\" ✓ encrypted NATS channel" "$home/gateway.log" 2>/dev/null \
+       && printf '%s\n' "$latest_aggregate" | grep -Eq \
+         "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=1 totalCount=1"; then
+      echo "[demo] $acct gateway ready"
+      return 0
+    fi
     kill -0 "$gw_pid" 2>/dev/null || { echo "[demo] $acct gateway died:"; tail -30 "$home/gateway.log"; exit 2; }
     sleep 0.5
     [ "$i" -eq 240 ] && { echo "[demo] $acct gateway TIMEOUT:"; tail -30 "$home/gateway.log"; exit 2; }

@@ -234,7 +234,7 @@ relay dial, never triggers enrollment) plus runtime-only `collectStatusIssues`.
 **What was built.**
 - `src/doctor.ts` — finding engine C1–C11 factored from the exact serving-loop skip conditions
   (`index-nats.ts`): encryption-disabled, creds-missing, register-hop-static-unsupported,
-  identity-key-missing, verifier-unbuildable, shared-audience, open-admission, obsolete-cors,
+  identity-key-missing, verifier-unbuildable, audience-override-removed, open-admission, obsolete-cors,
   auth-strategy-invalid (contextual a/b/c), credential-source-invalid, orphaned-default,
   deprecated-acquisition-env. Mirror-fidelity rule: never a false positive on a served config,
   never silent on a skipped one.
@@ -506,3 +506,8 @@ costs no E2E/server work, and stays purely in `demo/web/src/widget.ts` + a small
 **Resolved decisions (2026-07-02):**
 - **P1-4 media → object storage (blob endpoint).** See P1-4 above.
 - **P1-5 buttons → merged into P0-4** with the `presentation` + `button_action` delta; see P0-4.
+# Issue #54 audience update
+
+Audience drift/shared-audience diagnosis is closed structurally: an enabled
+account rejects any raw `auth.jwt.audience`, and its expected JWT `aud` is always
+its runtime account id. Doctor exposes the removed-key migration finding.

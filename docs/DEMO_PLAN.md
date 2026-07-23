@@ -8,6 +8,13 @@
 > composes **production primitives only** (`packages/{saas,plugin,client}`).
 > CI harnesses (`e2e/local/*`) are untouched.
 
+> **Issue #54 supersession:** Audience is no longer an operator-supplied or
+> independently stored coordinate. The runtime account id is the expected JWT
+> `aud`, and any `auth.jwt.audience` configuration is rejected. Older
+> multi-audience routing/configuration proposals below are retained only as
+> historical design context. A signed `aud` array remains an authorization set:
+> each concrete connection selects one authorized account and its matching pin.
+
 ## Goal
 
 One page that weaves the three packages into a story a viewer cannot mistake for a
@@ -24,7 +31,7 @@ status/terminal-error surfacing.
 
 | # | Scene | Freedom proven |
 |---|---|---|
-| ① | One identity, an agent fleet — admin grants/revokes agents per user live; widget grows/loses lanes | SaaS as sole access authority (`aud` as list) |
+| ① | One identity, an agent fleet — admin grants/revokes agents per user live; widget grows/loses lanes | SaaS session grants choose the lane; each lane receives a scalar account bootstrap and that target's matching pin |
 | ② | Agents appear from anywhere — a NEW agent enrolls live from "another machine", approved (or denied) in the admin panel, instantly reachable | Zero inbound listeners: admission rides the agent's outbound NATS connection (register is NATS request/reply) — the SaaS-delivered rendezvous is only the shared relay `natsUrl`, no gateway URL |
 | ③ | The relay may be hostile — ciphertext-only wiretap; injected tamper silently dropped (AAD); **stolen-JWT replay defeated by PoP**; relay restart mid-chat self-heals **with the user's in-flight message queued and delivered**; cross-tenant subscribe → live `-ERR Permissions Violation`; encryption-off config refuses to boot | Confidentiality (vs passive relay) + integrity + authentication + availability |
 | ④ | Many users, one agent — user A's exec approval card appears only in A's widget; non-approver's decision is rejected fail-closed; different users' turns run in parallel, each user's turns in order | Per-peer routing + HITL approver authz on a shared agent |
@@ -46,9 +53,9 @@ status/terminal-error surfacing.
   that attach the plugin to a gateway. **BYO-gateway** (a `--byo-gateway` flag
   where run.sh boots only the SaaS and the operator attaches their *own* openclaw)
   is deferred to **backlog** — documented, not built this pass.
-- **`aud` scalar (phase 2):** when `aud` becomes an array, the top-level
-  `accountId` claim stays as `aud[0]` ("primary"). It is read only by
-  `device-flow-enrollment.ts:354` (subject-token validation), never by routing.
+- **Account-bound `aud`:** each bootstrap request selects one server-authorized
+  account and mints that account as JWT `aud`. There is no duplicate signed
+  `accountId` claim and no independently configurable audience.
 - **LLM echo fallback is a config/orchestration concern, zero product change.**
   The agent talks to whatever OpenAI-completions endpoint `openclaw.json` names.
   `run.sh` points that provider at the real z.ai endpoint when `ZAI_API_KEY` is
@@ -78,28 +85,23 @@ status/terminal-error surfacing.
   persuasive on a real third-party relay). Call out C2 explicitly in the demo
   README when this mode is used.
 
-## Topology constraint (load-bearing)
+## Topology choice
 
-**One gateway per agent for the fleet scenes.** The register handler dispatches by
-aud peek, FIRST match wins (`resolveAccountIdForJwt`,
-`packages/plugin/src/register-dispatch.ts:21-31`) and ignores any client-supplied
-accountId — so a single multi-aud JWT registers into only ONE account per
-gateway. The fleet therefore runs each agent on its own gateway process
-(19299/19399/…). Register is a **NATS request/reply** on the account's
-`.register` subject (not an HTTP route), so the SaaS `/me`/`/bootstrap` response
-delivers only the shared relay `natsUrl` per account — there is **no `registerBaseUrl`
-and no gateway URL**; the widget lane derives its register subject from
-`tenant/accountId/peerId`. (This also IS the scene-② story: agents are independent
-processes on independent machines, reachable with zero inbound listeners.)
-True single-gateway multi-agent-from-one-login would need a register-route
-change — out of scope. A single gateway multiplexing several accounts
-(`planAccounts`, `packages/plugin/src/multiplex.ts:50-77`) remains real and may
-be shown as an aside with *different users* per account, but the fleet-from-one-
-login story spans gateways.
+The fleet scenes use **one gateway per agent** (19299/19399/…) to tell the
+"another machine" story, but this is orchestration, not a register-routing
+constraint. One gateway can also multiplex several configured accounts.
 
-Admission for every demo account is `register-hop` — the sole admission path and the
-default for `auth.strategy="jwt"`: only the register hop populates the aud map + verifier
-(`index-nats.ts:690-729`). run.sh does not need to set `admission` explicitly.
+Each runtime owns a **NATS request/reply** subscription on its account's
+`.register` subject and an account-bound verifier. The subject selects the
+runtime; the verifier then requires that runtime account id in JWT `aud`. There
+is no unverified audience peek, first-wins dispatcher, shared audience map,
+`registerBaseUrl`, or gateway URL. The widget lane derives its subject from
+`tenant/accountId/peerId`, and the SaaS returns the target account's relay
+`natsUrl` and attested identity pin.
+
+Admission for every demo account is the register hop, the default for
+`auth.strategy="jwt"`. Runtime startup constructs the verifier before subscribing
+or publishing readiness; the register request never creates an audience map.
 
 ## Layout
 
@@ -173,17 +175,14 @@ reload restores history; wiretap shows ciphertext only.
 
 The only product-code change before phase 6:
 
-1. `packages/saas/src/bootstrap-claims.ts` — `aud: string` (`:62`, set at `:96`)
-   → mint `aud` as an array; keep a single-string overload for back-compat. The
-   plugin verifier is already array-aware (`jwt.ts:259-274`) and the multi-aud
-   router exists (`peekUnverifiedJwtAudiences` `jwt.ts:368` →
-   `resolveAccountIdForJwt` `register-dispatch.ts:21`). Decide whether the
-   dangling top-level `accountId` claim (`bootstrap-claims.ts:65,99`, read only by
-   `device-flow-enrollment.ts:354`, NOT by routing) stays as "primary" or drops.
-   Unit tests beside `bootstrap-claims.test.ts`.
-2. Demo server: grants become a list; `/bootstrap` mints the full granted `aud`
-   list + the per-account rendezvous map; `/me` exposes it for the switcher;
-   grant/revoke mutate it.
+1. Historical proposal: mint one fleet-wide `aud` array and route from an
+   unverified audience peek. Issue #54 deliberately did not ship that router.
+   The verifier remains array-aware, but each connection selects one concrete
+   account subject, verifies membership against that account-bound verifier,
+   and receives only that target's pin.
+2. Demo server: grants become a list; `/me` exposes them for the switcher, while
+   each `/bootstrap` request mints a scalar token for one authorized target and
+   returns that target's rendezvous + pin; grant/revoke mutate the authorized set.
 3. Widget: agent switcher — one lazily-connected wrapper client per granted
    account, each pointed at its account's gateway via the rendezvous map. Revoke →
    that lane goes terminal on its next register/bootstrap (proven revoke→403);
@@ -220,8 +219,8 @@ Demo-side scripting only; all primitives ship today.
 - `chaos.sh tamper` — publish a bit-flipped copy of a captured ciphertext frame to
   the peer's `.out` using observer creds; wiretap highlights the injected frame;
   chat pane stays clean (AEAD-open returns null → dropped, `nats-client.ts:837-842`).
-- `chaos.sh replay-jwt` — **authentication leg**: replay a captured
-  `/webchannel/nats/register` POST (or the same signed nonce twice). Server
+- `chaos.sh replay-jwt` — **authentication leg**: replay a captured NATS
+  `.register` request (or the same signed nonce twice). The account runtime
   returns 401 — the nonce is single-use and burned even on a bad signature
   (`pop-challenge.ts:106-154`) — while the real browser registered fine. A stolen
   bootstrap JWT off the wiretap can't register a peer without the device key.
@@ -262,9 +261,9 @@ narrative:
   `demo/verify-evict.mjs` (evicted-kid rejected). Both verified live.
 - **One gateway, many accounts — BUILT (`demo/multiplex.sh`).** ONE gateway
   (:19599) enrolls team-sales + team-support under a single OPENCLAW_HOME;
-  `planAccounts` builds one NatsChannel per account and the single register
-  handler (on each account's `.register` NATS subject) dispatches each browser by
-  JWT `aud`. alice → team-sales, bob → team-support, both served by the SAME
+  the host starts one coordinator-owned NatsChannel per account, each with its
+  own `.register` subscription and account-bound verifier. alice → team-sales,
+  bob → team-support, both served by the SAME
   process. There is no gateway URL to compare anymore (rendezvous is only
   `natsUrl`), so the driver proves the single-process claim by driving both live
   chats. Process-level tenancy, distinct from scene ②'s per-machine story. No
@@ -343,14 +342,12 @@ gap (below).
   trace; the "openclaw doesn't expose the ALS seam" caveat was wrong — `AsyncResource`
   IS the seam. See `runDetachedHistoryRead` in `index-nats.ts`.
 
-  **Cause 2 — timing (fail-closed `no session key yet`).** With the read fixed, the
-  snapshot was still dropped: it was sent from the register hop, which completes
-  BEFORE the E2E authenticated registration, so `sendHistory` had no per-peer session key and
-  fail-closed (correctly — never plaintext). **Fix:** send the initial snapshot from
-  a new `NatsChannel.setHandshakeCompleteHandler` (fires at the end of the
-  handshake handler, once `peerSessionKeys` is set) instead of the register hop. That
-  handler also runs outside the HTTP request scope, so it composes cleanly with the
-  detached read.
+  **Cause 2 — historical timing.** The former unauthenticated handshake path did
+  not have a peer key when register attempted the snapshot. That path is gone.
+  Registration now creates/loads the conversation key, wraps it to the
+  JWT-attested device key, and emits the stateless history/approval snapshots on
+  the already-subscribed `.out` subject. The client unwraps the key from the
+  register reply and hydrates those encrypted frames idempotently.
 
   Verified end-to-end (`demo/verify-e2e.mjs`, now a HARD criterion): reload restores
   the prior turn. Not the plugin-side `HistoryStore` (that serves late-join/multi-device,
@@ -394,14 +391,12 @@ this scope).
 
 ## Honest-demo notes
 
-- **Active-MITM is NOT claimed (C2).** The E2E session key is derived from
-  whatever pubkey arrives on the `.handshake` subject; the client does not yet pin it against
-  the SaaS-attested `agentPublicKey` that `saas-bootstrap.ts:222` already extracts
-  (`nats-client.ts:828-834`). So scene ③ proves confidentiality vs a **passive**
-  wiretap + integrity vs **blind** tamper (AAD drop) + authentication (PoP) +
-  availability — but an **active** relay substituting its own registration key could
-  decrypt. That is the deferred C2 hardening; the demo must not claim active-MITM
-  resistance. `DEMO_RELAY=synadia` inherits this caveat (call it out in README).
+- **The relay remains an availability dependency, not a trust anchor.** The
+  conversation key is delivered in the PoP-gated register reply, wrapped to the
+  JWT-attested device key, and authenticated against the SaaS-attested agent
+  identity pin. A relay can drop, delay, replay, or forge traffic to cause
+  bounded failure, but cannot substitute a usable key or decrypt/forge accepted
+  conversation frames.
 - **Revoke is enforced at the rendezvous** (bootstrap/register), not by killing an
   established E2E session mid-flight — browser NATS creds are tenant-wide today.
   Per-account NATS creds + live session kill is a known follow-up; the demo

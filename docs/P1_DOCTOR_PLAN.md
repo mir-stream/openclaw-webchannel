@@ -1,5 +1,10 @@
 # P1-6 — Doctor / Self-diagnosis Plan
 
+> **Issue #54 update:** the former shared-audience diagnosis is obsolete.
+> Doctor now reports `audience-override-removed` for any raw
+> `auth.jwt.audience` key, while effective `aud` is always the account id.
+> Older C4/C5 discussion below is retained as historical rationale.
+
 > Status: APPROVED-FOR-IMPLEMENTATION rev4 (codex/gpt-5.6-sol adversarial rounds:
 > 17 → 7 → 2 editorial findings, all folded in; see §9/§9b for dispositions.
 > rev4 = rev3 + malformed-persisted-creds→creds-missing rationale + C1–C11 scope fix)
@@ -332,9 +337,10 @@ status table is more informative. It is NOT a findings carrier.
 
 ## 4. Check catalog (v1)
 
-Every check names the EFFECTIVE (post-`resolveEffectiveAccountAuth`) values and
-carries a fix hint. Per-account checks run over `planAccounts(cfg)`; C5/C10 are
-cross-account/config-layout.
+Every current check names the prepared effective trust facts and carries a fix
+hint. Per-account checks run from `planWebchannelAccount`; raw layout checks
+inspect shared and account-local config before merge so removed keys cannot be
+shadowed.
 
 > **Catalog rows are PRE-REBASE spec.** This catalog was converged against
 > pre-merge-train `develop`. The rebase onto post-PR-#40 `develop` (P0-1/P0-2
@@ -349,8 +355,10 @@ cross-account/config-layout.
 > (non-jwt silently downgrades to `auto`) no longer exists: the serving loop
 > verifies EVERY account via `assertJwtAuthConfig`, so a non-jwt/missing auth
 > block hard-skips and surfaces as C4 `verifier-unbuildable` (now
-> unconditional per account). The mirror-fidelity rule and the remaining rows
-> stand; the drift guard in `index-nats-wiring.test.ts` pins today's 5 skips.
+> unconditional per account). Issue #54 subsequently superseded **C5**:
+> configurable/shared audiences no longer exist. Any raw `auth.jwt.audience`
+> is now `audience-override-removed`, and each verifier is bound to its runtime
+> account id. The older source names and line references below are historical.
 
 | # | checkId | Condition (source) | kind / severity | Fix hint |
 |---|---------|--------------------|-----------------|----------|
@@ -359,7 +367,7 @@ cross-account/config-layout.
 | C3a | `register-hop-static-unsupported` | admission=register-hop AND credentialMode=`static` — the runtime ALWAYS fail-closes here (static consume never yields an identity key: `nats-credential-source.ts:390`, guard `index-nats.ts:471-494`) | config / error | Remediation must actually clear the finding (rev2 finding 4 — ANY static signal keeps resolving `static` before `enrolled`, `nats-credential-source.ts:253`): EITHER remove ALL static credential signals (`nats.credentials.{mode,credsFile,userJwt,userSeed}` + `WEBCHANNEL_NATS_{CREDS,USER_JWT,USER_SEED}` env) and enroll, OR set `nats.admission:"auto"` deliberately. Test: applying the suggested fix yields zero findings |
 | C3b | `identity-key-missing` | admission=register-hop AND credentialMode=`enrolled` AND persisted creds lack the identity key (pre-F2 creds) — `index-nats.ts:482-493` | auth / error | Re-enroll to mint an attested identity key (same command as C2) |
 | C4 | `verifier-unbuildable` | admission=register-hop AND the verifier config fails the REAL validation rules. Mechanism (rev2 finding 5 — calling `resolveVerifier` directly would mutate the module-level JWKS-cache `WeakMap`, `auth.ts:193`, from an offline scan): extract/export a side-effect-free **`validateJwtVerifierConfig(auth)`** in `auth.ts` that owns the exact non-empty issuer/audience + exactly-one-key-source rules (`auth.ts:243,260`); `makeJwtVerifier` calls it first (single validation source — semantics cannot drift) and the doctor calls it alone (no cache construction). Surface the thrown/returned error verbatim | config / error | From the validation error + effective issuer/aud state; live URL reachability stays in the probe |
-| C5 | `shared-audience` | two register-hop jwt accounts share slash-normalized (issuer, audience) — `index-nats.ts:425-452` | config / **error** (deliberate escalation — see below) | Give each register-hop account a distinct audience (= its accountId); names BOTH accounts |
+| C5 | `audience-override-removed` | any raw shared-base or account-local `auth.jwt.audience` key is present; disabled accounts report warning-only | config / error (enabled) or warn (disabled) | Delete `auth.jwt.audience`; expected `aud` is always the runtime account id |
 | C6 | `open-admission` | admission=auto AND `isDmPostureOpen(dmSecurity)` (`dm-allowlist.ts:55`) — `index-nats.ts:775-780` | intent / warn | Set `dmSecurity:"allowlist"` and populate `allowFrom`, or rely on NATS subject permissions deliberately |
 | C7 | `obsolete-cors` | `auth.cors` present — `index-nats.ts:309-317` | config / warn | Delete the `auth.cors` block (register hop moved to NATS; origin allowlisting is inert) |
 | C8 | `auth-strategy-invalid` | non-jwt `auth.strategy`, classified CONTEXTUALLY (review finding 9): (a) explicit `nats.admission:"register-hop"` override + non-jwt → **error** (verifier construction will fail; account skipped); (b) `strategy:"anonymous"`/unknown with NO explicit admission → **warn**: "auth is ignored; admission silently became `auto`" (the admission-mode resolver defaults non-jwt→auto, `nats-admission.ts:68`; `resolveVerifier` would throw, `auth.ts:309`, but is never called for auto); (c) intentional auto/static BYO-NATS with no auth block at all → **no finding** | config / error-or-warn | (a) use `strategy:"jwt"`; (b) remove the inert auth block or switch to jwt; (c) — |
@@ -372,16 +380,11 @@ semantics. C3a documents (not changes) the current static-register-hop
 fail-close — if that behavior is ever revisited, serving loop and doctor change
 together through the shared resolver.
 
-**C5 is a deliberate, documented divergence from strict mirroring.** The runtime
-(`index-nats.ts:425-452`) only WARNS on a shared audience and serves both —
-it is not a skip — yet the doctor reports `error`. This is an intentional
-stricter-than-runtime escalation, not a bug and not drift: doctor's job includes
-catching what the runtime tolerates. A shared audience means a bootstrap JWT
-minted for account A also verifies for account B, so a browser admitted to A
-reaches B's conversation keys and history — a cross-account boundary failure,
-which is an `error` regardless of the runtime's willingness to keep serving. The
-severity is deliberately NOT downgraded to match the runtime warn. Any future
-change to either side should keep this asymmetry conscious.
+**C5 now mirrors the issue #54 runtime boundary.** An enabled account with the
+removed key is not served; a disabled account gets a warning so it can be fixed
+before re-enable. Accounts may safely share an issuer and JWKS because each
+prepared verifier supplies its own immutable runtime account id as expected
+`aud`; there is no shared-audience router or first-wins collision policy.
 
 ## 5. Files touched
 
@@ -419,13 +422,9 @@ change to either side should keep this asymmetry conscious.
 - **OUT — live register round-trip probe.** Same honest-scope reasoning as
   Gate A (`preflight.ts:205-233`): no browser bootstrap JWT exists at probe
   time.
-- **OUT — removing `audience` configurability entirely. BACKLOG note.**
-  Everything up to the plugin is already accountId-based (binding/routing beyond
-  that is core's job), so whether `audience` needs to be settable AT ALL is
-  questionable. Rather than have doctor police shared audiences forever (C5),
-  review the necessity first: if nothing legitimately needs a pinned audience,
-  block the setting so every audience is accountId-derived — and the
-  shared-audience failure class stops existing instead of being diagnosed.
+- **DONE by issue #54 — removed `audience` configurability.** Every verifier is
+  account-id-bound, and the manifest retains only a tombstone property so legacy
+  JSON reaches the targeted migration error.
 - **OUT (follow-up PR) — record `lastError` at the serving-loop skips. BACKLOG
   note.** All 5 skips only log and `continue`; they record no machine-readable
   state. `collectStatusIssuesFromLastError` (SDK `status-helpers`) reads

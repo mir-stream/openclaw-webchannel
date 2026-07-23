@@ -6,7 +6,7 @@ import { createEnrollmentHttpHandler } from "./enrollment-http-handler.js";
 async function invoke(outcome: unknown) {
   const handler = createEnrollmentHttpHandler({ profile: "demo", authorize: () => ({ ok: true }),
     enrollment: { enroll: async () => ({}), poll: async () => ({ error: "authorization_pending" }), approve: async () => outcome, deny: async () => false } as never,
-    registry: { getActive: async () => null, register: async () => ({ ok: false, reason: "conflict", current: null }), revokeActive: async () => false, listHistory: async () => [] }, bootstrap: () => ({}) });
+    registry: { getActive: async () => null, register: async () => ({ ok: false, reason: "conflict", current: null }), revokeActive: async () => false, listHistory: async () => [] } });
   const req = Readable.from([JSON.stringify({})]) as IncomingMessage; Object.assign(req, { method: "POST", url: "/admin/enrollments/CODE/approve", headers: {} });
   let text = ""; const state = { sent: false, ended: false }; const res = { statusCode: 0,
     get headersSent() { return state.sent; }, get writableEnded() { return state.ended; }, setHeader() {},

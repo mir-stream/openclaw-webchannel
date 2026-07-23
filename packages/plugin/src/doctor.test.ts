@@ -14,7 +14,7 @@ import {
 const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel } } as never);
 const identityKey = { publicKey: new Uint8Array(32), privateKey: new Uint8Array(32) };
 const persisted = { userJwt: "J", userSeed: "S", identityKey };
-const validAuth = (audience = "a") => ({ strategy: "jwt", jwt: { issuer: "https://issuer", audience, jwks: { keys: [{ kty: "RSA", kid: "test" }] } } });
+const validAuth = (_accountId = "a") => ({ strategy: "jwt", jwt: { issuer: "https://issuer", jwks: { keys: [{ kty: "RSA", kid: "test" }] } } });
 const removedDevModeKey = ["dev", "Open"].join("");
 const removedDevModeSetting = ["nats.", removedDevModeKey].join("");
 const ids = (config: OpenClawConfig, env: Record<string, string | undefined> = {}, load: () => PersistedEnrolledCreds | undefined = () => persisted) =>
@@ -25,8 +25,8 @@ describe("evaluateWebchannelDoctor findings", () => {
     ["encryption-disabled", cfg({ encryption: { mode: "disabled" }, auth: validAuth("default"), dmSecurity: "allowlist" }), {}, () => persisted],
     ["creds-missing", cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }), {}, () => undefined],
     ["identity-key-missing", cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }), {}, () => ({ userJwt: "J", userSeed: "S" })],
-    ["verifier-unbuildable", cfg({ auth: { strategy: "jwt", jwt: { issuer: "", audience: "default", jwks: { keys: [] } } }, dmSecurity: "allowlist" }), {}, () => persisted],
-    ["shared-audience", cfg({ dmSecurity: "allowlist", accounts: { a: { auth: validAuth("shared") }, b: { auth: validAuth("shared") } } }), {}, () => persisted],
+    ["verifier-unbuildable", cfg({ auth: { strategy: "jwt", jwt: { issuer: "", jwks: { keys: [] } } }, dmSecurity: "allowlist" }), {}, () => persisted],
+    ["audience-override-removed", cfg({ auth: { strategy: "jwt", jwt: { issuer: "https://issuer", jwks: { keys: [] }, audience: "legacy" } }, dmSecurity: "allowlist" }), {}, () => persisted],
     ["obsolete-cors", cfg({ auth: { ...validAuth("default"), cors: {} }, dmSecurity: "allowlist" }), {}, () => persisted],
     ["credential-source-invalid", cfg({ auth: validAuth("default"), nats: { credentials: { mode: "static", userJwt: "J" } }, dmSecurity: "allowlist" }), {}, () => persisted],
     ["orphaned-default", cfg({ auth: validAuth("shared"), dmSecurity: "allowlist", accounts: { named: {} } }), {}, () => persisted],
@@ -45,31 +45,31 @@ describe("evaluateWebchannelDoctor findings", () => {
     }
   });
 
-  it("normalizes issuer slashes but requires byte-identical audiences for shared-audience", () => {
+  it("allows healthy accounts to share one issuer/JWKS", () => {
     const findings = evaluateWebchannelDoctor(cfg({
       dmSecurity: "allowlist",
       accounts: {
         a: { auth: validAuth("shared") },
-        b: { auth: { strategy: "jwt", jwt: { issuer: "https://issuer/", audience: "shared", jwks: { keys: [] } } } },
-        c: { auth: { strategy: "jwt", jwt: { issuer: "https://issuer/", audience: "shared/", jwks: { keys: [] } } } },
+        b: { auth: { strategy: "jwt", jwt: { issuer: "https://issuer/", jwks: { keys: [] } } } },
+        c: { auth: { strategy: "jwt", jwt: { issuer: "https://issuer/", jwks: { keys: [] } } } },
       },
     }), { env: {}, loadPersistedEnrolledCreds: () => persisted });
-    const shared = findings.filter((finding) => finding.checkId === "shared-audience");
-    expect(shared).toHaveLength(1);
-    expect(shared[0]?.accountId).toBe("b");
-    expect(shared[0]?.message).toMatch(/a and b/);
+    expect(findings).not.toContainEqual(expect.objectContaining({ checkId: "audience-override-removed" }));
   });
 
-  it("collects a shared-audience claim before rejecting an invalid verifier", () => {
+  it("reports a disabled tombstone as non-serving warning only", () => {
     const findings = evaluateWebchannelDoctor(cfg({
       dmSecurity: "allowlist",
       accounts: {
-        invalid: { auth: { strategy: "jwt", jwt: { issuer: "https://issuer", audience: "shared", jwks: { keys: [] }, jwksUrl: "https://issuer/keys" } } },
-        valid: { auth: validAuth("shared") },
+        disabled: { enabled: false, auth: { strategy: "jwt", jwt: { audience: null } } },
+        valid: { auth: validAuth("valid") },
       },
     }), { env: {}, loadPersistedEnrolledCreds: () => persisted });
-    expect(findings.find((finding) => finding.checkId === "verifier-unbuildable")?.accountId).toBe("invalid");
-    expect(findings.find((finding) => finding.checkId === "shared-audience")?.message).toMatch(/invalid and valid/);
+    expect(findings).toContainEqual(expect.objectContaining({
+      accountId: "disabled",
+      checkId: "audience-override-removed",
+      severity: "warn",
+    }));
   });
 
   it("reports a static creds config as credential-source-invalid (BYO-NATS pending P0-3)", () => {
@@ -128,7 +128,7 @@ describe("evaluateWebchannelDoctor findings", () => {
       cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }),
       cfg({ auth: validAuth("default"), nats: { admission: "register-hop" }, dmSecurity: "allowlist" }),
       cfg({ auth: validAuth("default"), nats: { url: "ws://relay" }, dmSecurity: "allowlist" }),
-      cfg({ auth: { strategy: "jwt", jwt: { issuer: "https://issuer", audience: "default", jwksUrl: "https://issuer/keys" } }, dmSecurity: "allowlist" }),
+      cfg({ auth: { strategy: "jwt", jwt: { issuer: "https://issuer", jwksUrl: "https://issuer/keys" } }, dmSecurity: "allowlist" }),
     ];
     for (const fixture of fixtures) expect(evaluateWebchannelDoctor(fixture, { env: {}, loadPersistedEnrolledCreds: () => persisted })).toEqual([]);
   });
@@ -288,16 +288,16 @@ describe("status probe", () => {
 
   it("probes the effective file and URL JWKS sources through injected seams", async () => {
     const dial = vi.fn(async () => ({ ok: true as const }));
-    const file = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksFile: "/keys.json" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, readFile: () => JSON.stringify({ keys: [{ kty: "RSA" }] }) });
+    const file = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", jwksFile: "/keys.json" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, readFile: () => JSON.stringify({ keys: [{ kty: "RSA" }] }) });
     expect(file.jwks).toEqual({ source: "file", keyCount: 1 });
 
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ keys: [{ kty: "RSA" }] }), { status: 200, headers: { "content-type": "application/json" } }));
-    const url = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksUrl: "https://idp/keys" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, fetchImpl });
+    const url = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: { strategy: "jwt", jwt: { issuer: "i", jwksUrl: "https://idp/keys" } }, dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial, fetchImpl });
     expect(url.jwks).toEqual({ source: "url", keyCount: 1 });
     expect(fetchImpl).toHaveBeenCalled();
   });
 
-  it("rejects string-valued inline JWKS for a named account after relay success", async () => {
+  it("rejects string-valued inline JWKS during structural preparation before relay I/O", async () => {
     const dial = vi.fn(async () => ({ ok: true as const }));
     const result = await probeWebchannelAccount(
       {
@@ -310,7 +310,6 @@ describe("status probe", () => {
                 strategy: "jwt",
                 jwt: {
                   issuer: "https://issuer",
-                  audience: "named",
                   jwks: JSON.stringify({ keys: [{ kty: "RSA", kid: "test" }] }),
                 },
               },
@@ -323,11 +322,9 @@ describe("status probe", () => {
 
     expect(result).toMatchObject({
       ok: false,
-      error: "jwks: JWKS must be an object with a keys array",
-      relay: { ok: true },
-      jwks: { error: "JWKS must be an object with a keys array" },
+      error: expect.stringMatching(/jwks must be an object with a keys array/i),
     });
-    expect(dial).toHaveBeenCalled();
+    expect(dial).not.toHaveBeenCalled();
   });
 
   it("never returns relay URL credentials or URL-JWKS secrets in probe failures", async () => {
@@ -340,7 +337,7 @@ describe("status probe", () => {
         cfg: cfg({
           auth: {
             strategy: "jwt",
-            jwt: { issuer: "i", audience: "default", jwksUrl },
+            jwt: { issuer: "i", jwksUrl },
           },
           dmSecurity: "allowlist",
         }),
@@ -382,17 +379,17 @@ describe("status probe", () => {
     const cases = [
       {
         source: "inline",
-        auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwks: { keys: [] } } },
+        auth: { strategy: "jwt", jwt: { issuer: "i", jwks: { keys: [] } } },
         deps: {},
       },
       {
         source: "file",
-        auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksFile: "/keys.json" } },
+        auth: { strategy: "jwt", jwt: { issuer: "i", jwksFile: "/keys.json" } },
         deps: { readFile: () => JSON.stringify({ keys: [] }) },
       },
       {
         source: "url",
-        auth: { strategy: "jwt", jwt: { issuer: "i", audience: "default", jwksUrl: "https://idp/keys" } },
+        auth: { strategy: "jwt", jwt: { issuer: "i", jwksUrl: "https://idp/keys" } },
         deps: { fetchImpl: async () => new Response(JSON.stringify({ keys: [] }), { status: 200, headers: { "content-type": "application/json" } }) },
       },
     ] as const;

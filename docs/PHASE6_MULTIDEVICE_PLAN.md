@@ -1,5 +1,12 @@
 # Phase 6 — Multi-Device E2E — Design Plan
 
+> **Issue #54 update:** Each runtime verifier is fixed to its account id and
+> `auth.jwt.audience` is removed. A signed multi-value `aud` remains supported as
+> an authorization set: each concrete connection selects one authorized target
+> and receives that target's matching pin. What is historical below is
+> audience-based runtime routing/config override and any one-response fleet
+> pin-map proposal, not multi-account authorization in a signed `aud` array.
+
 Status: **DONE (2026-07-03, branch `feature/showcase-demo`, 7 commits
 `9603f2f..56d5a84`) — all W1–W7 landed, §12 acceptance PASSED, fresh-agent
 review PASSED (0 critical; all 5 findings fixed in `56d5a84`).**

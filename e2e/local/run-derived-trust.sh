@@ -2,19 +2,19 @@
 # TRUST-ANCHOR derivation E2E (docs/TRUST_ANCHOR_DESIGN.md). Proves a fresh
 # `openclaw channels add` reaches a working encrypted register round-trip with
 # ZERO hand-written JWT trust facts in openclaw.json — the derived issuer /
-# jwksUrl / audience code path exercised end-to-end for the first time.
+# issuer/JWKS derivation and account-bound audience path exercised end-to-end.
 #
 # WHY this harness exists (the gap it closes): EVERY other real-SaaS harness
 # (run-all-real.sh, run-enrolled-transport.sh, run-two-account-isolation.sh)
-# and demo/run.sh writes an EXPLICIT `auth.jwt` block (issuer/jwksUrl/audience)
+# and demo/run.sh writes an EXPLICIT `auth.jwt` block (issuer/jwksUrl)
 # into openclaw.json. Because of config-present-wins, NONE of them actually
 # exercise `deriveAccountAuth` (packages/plugin/index-nats.ts). This one does:
 # it writes NO channels.webchannel config at all — the ONLY account config is
 # what `buildFullAccountPatch` (packages/plugin/src/setup.ts) emits at
-# `channels add`, which by design OMITS issuer/jwksUrl/audience.
+# `channels add`, which by design OMITS issuer/jwksUrl and the removed audience key.
 #
 # It asserts three things the design promises:
-#   1. openclaw.json holds NO issuer/jwksUrl/audience (only auth.strategy=jwt,
+#   1. openclaw.json holds NO issuer/jwksUrl or removed audience key (only auth.strategy=jwt,
 #      nats.admission=register-hop, nats.credentials.mode=enrolled) — the
 #      "zero hand-written trust facts" proof.
 #   2. The Gate-B gateway-start readiness line (formatAccountReadiness,

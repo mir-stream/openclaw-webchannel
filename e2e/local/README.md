@@ -44,7 +44,7 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 | `echo-openai-server.mjs` | ~50-line fake OpenAI `/v1/chat/completions` that returns `echo: <last user msg>`. Pointed at by an openclaw `openai-completions` provider. |
 | `all-real.mjs` | Playwright runner for `run-all-real.sh` and `run-derived-trust.sh`: serves the browser bundle, launches headless Chromium running the production `WebChannelNatsClient`, NKEY-authenticates to the JWT-auth nats-server, drives the JWT + PoP register hop, and asserts the reply echoes the sent text. **This is the "from a real browser" proof.** |
 | `enrolled-transport-roundtrip.ts` | Node driver for `run-enrolled-transport.sh`: an NKEY-authenticated peer that round-trips one message against the device-flow-enrolled plugin. |
-| `two-account-isolation-roundtrip.ts` | Node driver for `run-two-account-isolation.sh`: drives a message into each of two accounts and asserts routing isolation. |
+| `two-account-isolation-roundtrip.ts` | Node driver for `run-two-account-isolation.sh`: drives positive round-trips plus an A-authorized token against B's live register subject. |
 | `ci-smoke.html` | The unified demo/chat page served by the SaaS issuer. |
 
 ## Prerequisites
@@ -62,7 +62,7 @@ All four boot a real gateway + `nats-server` + echo provider under an isolated
 ./e2e/local/run-all-real.sh              # production browser + device-flow-enrolled plugin,
                                          #   one shared trust chain, JWT + PoP register hop
 ./e2e/local/run-enrolled-transport.sh    # agent-side device-flow enrollment → enrolled NATS transport
-./e2e/local/run-two-account-isolation.sh # one gateway, two accounts, routing-isolation (AC6 gate)
+./e2e/local/run-two-account-isolation.sh # one gateway/two accounts, live cross-account rejection
 ./e2e/local/run-derived-trust.sh         # `channels add` with ZERO hand-written JWT trust facts
 ```
 
@@ -88,20 +88,24 @@ from the SAME `setupTrustChain()`, and completes an encrypted round-trip.
 
 ### `run-two-account-isolation.sh` — routing isolation (AC6 gate)
 
-One gateway (index-nats plugin) serves TWO webchannel accounts simultaneously, each with its
-own `auth.jwt` audience (= the account id) and a distinct bound agent. The production
-`WebChannelNatsClient` drives a message into each account and asserts routing isolation:
-acctA's reply carries agentA's prefix and not agentB's, and vice-versa. Both accounts admit
-peers via the register hop on the enrolled trust chain — the same real per-account creds and
-registry-pinned agent keys as the other harnesses.
+One gateway process serves two account-bound runtimes sharing the same coordinator,
+tenant, relay, issuer, and JWKS. Aggregate readiness must reach 2/2, and the production
+`WebChannelNatsClient` proves A→A and B→B.
+Then an A-authorized JWT and syntactically valid PoP request are sent to B's actual live
+register subject: challenge and register must both return the exact opaque 401, B's peer/key
+state and history/approval output must remain unchanged, and the same B-issued nonce must
+still succeed with B's token (proving the audience rejection did not consume it). B→B must
+still pass afterward.
+Both entries run through `registerFull` → host account start →
+`NatsAccountRuntimeCoordinator`/`NatsChannel`; there is no direct handler/verifier harness here.
 
 ### `run-derived-trust.sh` — zero hand-written trust facts
 
 Proves a fresh `openclaw channels add` reaches a working encrypted register round-trip with
 ZERO hand-written JWT trust facts in `openclaw.json`. It writes NO `channels.webchannel`
 config beyond what `buildFullAccountPatch` (`packages/plugin/src/setup.ts`) emits at
-`channels add` (which omits issuer/jwksUrl/audience), so it is the only harness that exercises
-`deriveAccountAuth` (`packages/plugin/index-nats.ts`) end-to-end. The Gate-B readiness line
+`channels add` (which omits issuer/JWKS trust pins and never writes an audience), so it is the
+only harness that exercises account auth preparation end-to-end. The Gate-B readiness line
 reports the derived issuer/JWKS/aud and `admission=register-hop`.
 
 The unit-level twin of the real-issuer proof lives in

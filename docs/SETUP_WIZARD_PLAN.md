@@ -1,5 +1,10 @@
 # WebChannel Setup Wizard — Design Plan
 
+> **Superseded by issue #54 for audience handling.** The wizard no longer asks
+> for or writes `auth.jwt.audience`; the canonical account id is always the JWT
+> audience. Existing audience keys must be deleted. Historical sections below
+> describing an audience override are not current behavior.
+
 Status: **REVISED after sub-agent review (NEEDS_CHANGES → addressed).** Ready to implement pending user go-ahead.
 Branch: `feature/webchannel-setup-wizard`
 Backlog ref: [[webchannel-setup-wizard-backlog]] (user-flagged PRIORITY 2026-07-01)
@@ -17,8 +22,7 @@ hand-written block looked like:
   "saas": { "baseUrl": "http://host.docker.internal:3951" },
   "auth": { "strategy": "jwt", "jwt": {
       "jwksUrl": "http://host.docker.internal:3951/.well-known/jwks.json",
-      "issuer": "http://127.0.0.1:3951",
-      "audience": "default-agent" } },
+      "issuer": "http://127.0.0.1:3951" } },
   "dmSecurity": "open",
   "nats": { "url": "wss://connect.ngs.global:443", "admission": "register-hop",
             "credentials": { "mode": "enrolled" } }
@@ -60,7 +64,7 @@ hand-written block looked like:
 - **`ChannelSetupWizardTextInput`** — `setup-wizard-types.ts:126-170`. Fields:
   `inputKey`, **`message`** (NOT `prompt`), `initialValue`, `currentValue`,
   `shouldPrompt`, `required`, `validate`, `normalizeValue`, `applySet`. So advanced
-  inputs with derived defaults (issuer/audience) ARE supported.
+  inputs with derived defaults (such as issuer) ARE supported.
 - **Discovery is automatic** and needs **no core change**: `setupWizard` survives
   registration via spread — `normalizeRegisteredChannelPlugin` returns `{
   ...params.plugin, id, meta }` (`openclaw src/plugins/channel-validation.ts:112-120`);
@@ -74,7 +78,7 @@ hand-written block looked like:
 |---|---|
 | `tenant` | **Prompt** (required; default `default-tenant`) |
 | `saas.baseUrl` | **Prompt** (required; URL-validated) |
-| `auth.jwt.audience` | **Derive** = resolved `accountId` (Q2). Advanced override. |
+| `auth.jwt.audience` | **Omit.** The key is removed; runtime expected `aud` is always the resolved `accountId`. |
 | `auth.jwt.issuer` | **Derive** default = `saas.baseUrl` (Q1). Advanced override. |
 | `auth.jwt.jwksUrl` | **Derive** = `${saas.baseUrl}/.well-known/jwks.json` |
 | `auth.strategy` | **Constant** `"jwt"` |
@@ -93,15 +97,15 @@ account is later switched to `admission=register-hop`. Documented, not accidenta
 ## 5. Design (two seams, one pure writer)
 
 1. **`packages/plugin/src/setup.ts` — add a pure `buildFullAccountPatch({tenant,
-   saasBaseUrl, accountId, issuer?, audience?})`** returning the complete block
-   (tenant, saas.baseUrl, auth.strategy=jwt, auth.jwt.{jwksUrl derived, issuer,
-   audience}, nats.{admission:register-hop, credentials.mode=enrolled}, dmSecurity=open).
+   saasBaseUrl, accountId, issuer?})`** returning the complete block
+   (tenant, saas.baseUrl, auth.strategy=jwt, auth.jwt.{jwksUrl derived, issuer},
+   nats.{admission:register-hop, credentials.mode=enrolled}, dmSecurity=open).
    **Keep `buildAccountPatch` (partial) unchanged** — it preserves the existing
    merge/partial-write semantics that `setup.test.ts:63-71,102-126` assert.
 2. **Non-interactive seam — `applyAccountConfig`:** when `saasBaseUrl` is present in
    the input (the one-shot `--flag` call), write via `buildFullAccountPatch`,
    **merging** the `auth`/`nats` subtrees so a re-run never clobbers an operator's
-   manual `auth.jwt.issuer/audience`. When `saasBaseUrl` is absent (e.g. the
+   manual `auth.jwt.issuer`/JWKS pins. When `saasBaseUrl` is absent (e.g. the
    wizard's per-field `applySetupInput` calls, or a partial re-run), fall back to
    the existing partial `buildAccountPatch`. This guard is REQUIRED because in the
    wizard path each textInput without its own `applySet` funnels through
@@ -114,13 +118,12 @@ account is later switched to `admission=register-hop`. Documented, not accidenta
    - `status`: `resolveConfigured` = account has `auth.jwt` (or creds present);
      `resolveStatusLines` summarizing tenant/saas/account.
    - `textInputs`: `tenant`, `saasBaseUrl` (required + validated); advanced
-     `issuer` (`initialValue` = collected saasBaseUrl) and `audience`
-     (`initialValue` = resolved accountId). Give each a no-op/partial `applySet`
+     `issuer` (`initialValue` = collected saasBaseUrl). Give it a no-op/partial `applySet`
      so the per-field funnel does not write a broken block.
    - `finalize`: read the collected values + resolved `accountId`, then write the
      full block via `buildFullAccountPatch` (atomic — this is the real write for
-     the interactive path). `audience`/`issuer` derived here from the resolved
-     accountId / saasBaseUrl when not overridden.
+     the interactive path). `issuer` is derived from saasBaseUrl when not overridden;
+     expected JWT `aud` is supplied by the runtime account id and is never written.
    - `completionNote`: next steps (`agents bind` + `gateway run`).
 4. **Attach `setupWizard` in `channel.ts` base options** — inside
    `createChannelPluginBase({...})` next to `setup:` (line ~128). Verified path:
@@ -141,7 +144,7 @@ account is later switched to `admission=register-hop`. Documented, not accidenta
 - `packages/plugin/src/setup-wizard.ts` — NEW: `webchannelSetupWizard`.
 - `packages/plugin/src/channel.ts` — attach `setupWizard` in base options.
 - `packages/plugin/src/setup-wizard.test.ts` — NEW: full-block output ==
-  ground-truth demo block; derivations (jwksUrl/issuer/audience); wizard is
+  ground-truth demo block; derivations (jwksUrl/issuer); wizard is
   declarative-detectable (`status`+`credentials`); plugin exposes `setupWizard`;
   per-field funnel does not emit a broken partial.
 - `packages/plugin/src/setup.test.ts` — extend for the guarded `applyAccountConfig`
@@ -156,9 +159,9 @@ account is later switched to `admission=register-hop`. Documented, not accidenta
 - **Q1 issuer** → prompt as advanced input, default `saas.baseUrl`. Docker demo
   needs the override (`iss` = SaaS's own URL `127.0.0.1`, ≠ container-dialed
   `host.docker.internal`). RESOLVED: advanced input, default saasBaseUrl.
-- **Q2 audience** → derive = resolved `accountId` (`aud==accountId`,
-  `bootstrap-claims.ts:96`); advanced override. In wizard mode there is no
-  `--account` flag → take it from the wizard's resolved accountId in `finalize`.
+- **Q2 audience** → resolved `accountId` (`aud==accountId`,
+  `bootstrap-claims.ts:96`) is captured directly by the runtime verifier.
+  The wizard neither prompts for nor writes an override.
 - **Q3 nats.url** → OMIT. Precedence `persisted.natsUrl ?? source.url`
   (`consume-credentials.ts:95`); enroll uses `saasBaseUrl`, never `nats.url`. Caveat
   (documented): the resolver default `ws://127.0.0.1:4222`

@@ -45,7 +45,6 @@ function json(res: ServerResponse, status: number, value: unknown): void {
 type MinimalEnrollmentHandlerOptions = {
   enrollment: Pick<DeviceFlowEnrollment, "enroll" | "poll" | "approve" | "deny">;
   registry: Pick<AgentKeyRegistry, "revokeActive">;
-  bootstrap: () => Promise<Record<string, unknown>> | Record<string, unknown>;
   adminToken?: string;
 };
 
@@ -79,7 +78,6 @@ export function createMinimalConsumerEnrollmentHandler(options: MinimalEnrollmen
         const result = await options.enrollment.poll(payload as never);
         return json(res, "error" in result ? 400 : 200, result);
       }
-      if (path === "/bootstrap") return json(res, 200, await options.bootstrap());
       if (path === "/approve") {
         const replaceActivationId = typeof payload.replaceActivationId === "string" ? payload.replaceActivationId : undefined;
         const outcome = await options.enrollment.approve(String(payload.user_code ?? ""), replaceActivationId ? { replaceActivationId } : {});

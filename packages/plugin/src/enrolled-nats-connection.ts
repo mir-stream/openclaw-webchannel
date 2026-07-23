@@ -113,6 +113,12 @@ export type EnrolledNatsConnection = {
   credentials: PluginCredentials;
 };
 
+export type EnrolledNatsConnectionDeps = {
+  enrollmentClientFactory?: (options: EnrollmentOptions) => EnrollmentClient;
+  transportFactory?: (options: ConstructorParameters<typeof NatsTransport>[0]) => NatsTransport;
+  makeSigner?: typeof makeNkeySigningCallback;
+};
+
 // ---------------------------------------------------------------------------
 // Connection factory
 // ---------------------------------------------------------------------------
@@ -127,17 +133,20 @@ export type EnrolledNatsConnection = {
  */
 export async function createEnrolledNatsConnection(
   options: EnrolledNatsConnectionOptions,
+  deps: EnrolledNatsConnectionDeps = {},
 ): Promise<EnrolledNatsConnection> {
   // Step 1: Enroll (or load existing enrollment)
   console.log("[connection] Starting enrollment...");
-  const enrollmentClient = new EnrollmentClient({
+  const enrollmentOptions: EnrollmentOptions = {
     saasEnrollUrl: options.saasEnrollUrl,
     saasPollUrl: options.saasPollUrl,
     tenant: options.tenant,
     accountId: options.accountId,
     credentialPath: options.credentialPath,
     displayInstructions: options.displayInstructions,
-  });
+  };
+  const enrollmentClient = deps.enrollmentClientFactory?.(enrollmentOptions) ??
+    new EnrollmentClient(enrollmentOptions);
 
   const enrollment = await enrollmentClient.enroll();
 
@@ -161,17 +170,22 @@ export async function createEnrolledNatsConnection(
   // authenticates against a real JWT-auth nats-server (not only an open dev one).
   const natsUrl = enrollment.natsUrl ?? options.natsUrl;
   console.log(`[connection] Connecting to NATS at ${natsUrl}...`);
-  const transport = new NatsTransport({
+  const transport = (deps.transportFactory ?? ((transportOptions) => new NatsTransport(transportOptions)))({
     url: natsUrl,
     jwtCredential: enrollment.creds.userJwt,
-    nkeySigningCallback: makeNkeySigningCallback(enrollment.creds.userSeed),
+    nkeySigningCallback: (deps.makeSigner ?? makeNkeySigningCallback)(enrollment.creds.userSeed),
     clientName: options.natsClientName ?? "openclaw-webchannel-agent",
     // S1: survive a NATS blip (server restart / TCP reset) — re-dial with
     // backoff and replay subscriptions instead of wedging until gateway restart.
     reconnect: true,
   });
 
-  await transport.connect();
+  try {
+    await transport.connect();
+  } catch (err) {
+    try { transport.disconnect(); } catch { /* preserve the original rejection */ }
+    throw err;
+  }
   console.log("[connection] ✓ Connected to NATS");
 
   // Step 4: Get stored credentials for reference

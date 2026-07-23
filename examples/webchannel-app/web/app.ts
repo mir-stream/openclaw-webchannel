@@ -8,11 +8,10 @@
  *   POST /bootstrap (RS256 bootstrap JWT) → POST /nats-user (browser NATS creds) →
  *   new WebChannelNATSClient({ natsCredentials, registration }) → connect.
  *
- * NO-AGENT END STATE: with no openclaw agent attached, the NKEY connect SUCCEEDS
- * (status "connected") but the PoP register request has no responder, so ~15s
- * later it times out and the wrapper reports a TERMINAL status "error" with
- * message "[nats-client] request timeout". This app treats that specific error as
- * a graceful "waiting for agent" state (not a red error box) with a Retry button.
+ * NO-AGENT STATE: with no openclaw agent attached, the NKEY connect succeeds but
+ * the PoP register request has no responder. The timeout is transient: the client
+ * redials and keeps retrying until an agent appears, so the UI shows reconnecting
+ * rather than retiring credentials that may still be valid.
  *
  * classify(state) is a PURE, exported function so a headless Node smoke test can
  * assert the state sequence without a browser.

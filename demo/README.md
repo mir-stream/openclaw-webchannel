@@ -59,14 +59,16 @@ plaintext but every message body is ciphertext).
 **Base layer** (all on real client state): log in → typing indicator → streaming
 draft → answer, `/help`, exec-approval cards, status pill incl. terminal error.
 
-**The core flow to foreground:** the admin grants agents to a user (the grant list
-becomes the JWT `aud` at mint time) → that user's widget shows **one tab per granted
-agent** and they pick whom to talk to → grant or revoke, and the tabs grow or shrink
-live in the open widget. Everything else below is a sharpening of this one story.
+**The core flow to foreground:** the admin grants agents to a user → that user's
+widget shows **one tab per granted agent** and they pick whom to talk to → grant
+or revoke, and the tabs grow or shrink live in the open widget. The grant list is
+UI/session metadata only: opening each lane performs its own authorized scalar
+bootstrap for that `(tenant, accountId)` and receives only that account's agent
+pin. Everything else below is a sharpening of this one story.
 
 | # | Scene | How to show it | Freedom proven |
 |---|-------|----------------|----------------|
-| ① | One identity, an agent fleet | Log in as alice (one tab). As admin, grant/revoke `agent-ops` → alice's tabs grow/shrink live. | SaaS is the sole access authority (`aud` as a list). |
+| ① | One identity, an agent fleet | Log in as alice (one tab). As admin, grant/revoke `agent-ops` → alice's tabs grow/shrink live. | SaaS is the sole access authority; each selected lane receives a separate scalar JWT target and matching pin. |
 | ② | Agents appear from anywhere | `./demo/add-agent.sh` in a 2nd terminal ("another machine") → a new enrollment pops in the admin pane. **Approve it, grant it — that alone makes it grantable AND dialable; there is no URL to paste, no port to open.** Its tab appears in the open widget. (`--auto-approve` for unattended.) | Zero inbound listeners: admission itself rides the agent's outbound NATS connection — the SaaS only delivers the shared relay `natsUrl`. |
 | ③ | The relay may be hostile | `./demo/chaos.sh <control>` against a live chat: `restart-relay` (queued-during-outage message survives), `tamper` (bit-flip dropped, chat clean), `replay-jwt` (nonce single-use → 401), `cross-tenant` (`-ERR Permissions Violation`). | Confidentiality vs passive relay + integrity + authentication + availability. |
 | ④ | Many users, one agent | Open alice and bob on the same agent. Each sees only their own turns; a real model's exec-approval card reaches only the originating peer. | Per-peer routing + HITL approver authz. |

@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
 # 가-1 Cycle 3 — 2-ACCOUNT ROUTING-ISOLATION E2E (AC6, the completion gate).
 #
-# Stands up ONE openclaw gateway (index-nats plugin) serving TWO webchannel
-# accounts simultaneously — acctA and acctB — each with its own auth.jwt audience
-# (= the account id itself), bound to a DISTINCT agent via `binding.account`
+# Stands up ONE openclaw gateway running the production index-nats plugin and
+# serving TWO webchannel accounts (acctA and acctB). They share one tenant,
+# relay, issuer, JWKS, coordinator, and process, while each runtime account id is
+# its immutable expected JWT audience. Each account is bound to a distinct agent
+# via `binding.account`
 # (the equivalent of `openclaw agents bind --bind webchannel:acctA --agent agentA`
 # / `--bind webchannel:acctB --agent agentB`). The handling agent is DECOUPLED
 # from the wire identity: the wire identity IS the accountId, and the agent is a
 # pure `agents bind` concern (telegram-like). Each agent uses a DISTINCT echo model
 # (distinct ECHO_PREFIX) so the agent that handled a turn is observable in the reply.
 #
-# Then a Node driver (the PRODUCTION WebChannelNatsClient) drives a message into
-# EACH account and asserts ROUTING ISOLATION:
+# A Node driver first proves A→A and B→B through the production client. It then
+# mints A- and B-audience JWTs for the SAME peer and SAME PoP/cnf keys. It first
+# proves B's production register emits seeded history + approval snapshots, then
+# signs a fresh live B-issued nonce but submits it with the A token. Audience is
+# therefore the only failing register condition. A-token challenge/register must
+# return ordinary opaque 401 (never timeout/503), with no additional snapshots,
+# peer/key mutation, and a final B→B round-trip must still pass.
 #   - acctA's reply carries agentA's prefix and NOT agentB's, and
 #   - acctB's reply carries agentB's prefix and NOT agentA's.
 #
 # This exercises the REAL stack (no unit mocks):
-#   - registerFull MULTIPLEX  → two NatsChannels, one per account
-#   - single register route's JWT-aud→account DISPATCH → aud=acctA hits acctA's
-#     channel.registerPeer (Cycle 2 C2 invariant), aud=acctB hits acctB's
+#   - registerFull → host account start → NatsAccountRuntimeCoordinator
+#     → two account-bound NatsChannels in one process (aggregate readiness 2/2)
+#   - each live register subject invokes only its runtime's account-bound verifier
 #   - binding.account ROUTING → resolveAgentRoute(accountId) picks the bound agent
 #
 # Credentials ride the enrolled trust chain: ONE setupTrustChain() in the
@@ -142,11 +149,9 @@ ECHO_PREFIX="$ECHO_B_PREFIX" node "$REPO/e2e/local/echo-openai-server.mjs" "$ECH
 ECHO_B_PID=$!
 echo "[run-two-acct] echo servers: A pid=$ECHO_A_PID ($ECHO_A_PORT), B pid=$ECHO_B_PID ($ECHO_B_PORT)"
 
-# 4. Isolated config: TWO providers + TWO agents + TWO webchannel accounts + TWO
-#    account-scoped bindings (the persisted form of `agents bind --bind
-#    webchannel:<acct> --agent <agent>`). Per-account auth.jwt audience = the
-#    account id itself (the wire identity); the handling agent is decoupled and
-#    selected ONLY via the bindings below — no per-account config agentId.
+# 4. One isolated config with TWO providers, agents, accounts, and account-scoped
+#    bindings. JWT audience is not configurable: each runtime derives it from its
+#    own account-map key, while agent routing remains a separate binding concern.
 cat > "$OCH/.openclaw/openclaw.json" <<JSON
 {
   "gateway": { "mode": "local", "bind": "loopback" },
@@ -190,14 +195,14 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
         "$ACCT_A": {
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
-            "jwksUrl": "$ISS/.well-known/jwks.json", "issuer": "$ISS", "audience": "$ACCT_A" } },
+            "jwksUrl": "$ISS/.well-known/jwks.json", "issuer": "$ISS" } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$PEER_A"]
         },
         "$ACCT_B": {
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
-            "jwksUrl": "$ISS/.well-known/jwks.json", "issuer": "$ISS", "audience": "$ACCT_B" } },
+            "jwksUrl": "$ISS/.well-known/jwks.json", "issuer": "$ISS" } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$PEER_B"]
         }
@@ -206,7 +211,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
   }
 }
 JSON
-echo "[run-two-acct] wrote $OCH/.openclaw/openclaw.json (2 accounts, 2 agents, 2 bindings)"
+echo "[run-two-acct] wrote one gateway config (2 accounts, 2 agents, 2 bindings)"
 
 enroll_account() {
   local acct="$1" log="$OCH/channels-add-$1.log" code=""
@@ -231,18 +236,20 @@ enroll_account() {
 enroll_account "$ACCT_A"
 enroll_account "$ACCT_B"
 
-# 5. Boot ONE gateway serving BOTH enrolled accounts.
-OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
-  HOME="$OCH" WEBCHANNEL_NATS_URL=ws://127.0.0.1:$NATS_WS \
-  WEBCHANNEL_GW_URL=http://127.0.0.1:$GW_PORT \
+# 5. Boot ONE gateway. Core starts both account tasks and the coordinator must
+#    publish two isolated runtimes before the aggregate reaches complete 2/2.
+OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 HOME="$OCH" \
+  WEBCHANNEL_NATS_URL=ws://127.0.0.1:$NATS_WS \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &
 GW_PID=$!
 echo "[run-two-acct] gateway pid=$GW_PID — waiting for structured multiplex readiness (2 accounts)…"
 for i in $(seq 1 120); do
-  # Aggregate readiness requires both configured accounts to be serving.
+  # Use the latest structured aggregate record: an earlier complete record must
+  # not mask a later disconnect/retry transition.
   LATEST_AGGREGATE="$(grep "event=webchannel\.account_aggregate" "$OCH/gateway.log" 2>/dev/null | tail -n 1 || true)"
-  if printf '%s\n' "$LATEST_AGGREGATE" | grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=2 totalCount=2"; then
+  if printf '%s\n' "$LATEST_AGGREGATE" | grep -Eq \
+       "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=2 totalCount=2"; then
     echo "[run-two-acct] gateway ready:"
     grep -E "account \"(${ACCT_A}|${ACCT_B})\" ✓ encrypted NATS channel" "$OCH/gateway.log" | sed 's/^/  /' || true
     printf '  %s\n' "$LATEST_AGGREGATE"
@@ -257,7 +264,7 @@ for i in $(seq 1 120); do
   fi
 done
 
-# Sanity: BOTH accounts must have built a channel (2-of-2 serving).
+# Sanity: both accounts must have crossed their private commit fences.
 if ! grep -q "account \"$ACCT_A\" ✓ encrypted NATS channel" "$OCH/gateway.log" 2>/dev/null \
    || ! grep -q "account \"$ACCT_B\" ✓ encrypted NATS channel" "$OCH/gateway.log" 2>/dev/null; then
   echo "[run-two-acct] FAIL — both accounts did not build channels. gateway log:"; cat "$OCH/gateway.log"; exit 2
@@ -269,7 +276,6 @@ run_account() {
   local label="$1" peer="$2" acct="$3" expect="$4" forbid="$5"
   echo "[run-two-acct] driving $label (peer=$peer, account=$acct)…"
   set +e
-  WEBCHANNEL_GW_URL="http://127.0.0.1:$GW_PORT" \
   WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
   WEBCHANNEL_ISSUER_URL="$ISS" WEBCHANNEL_TENANT="$TENANT" \
   WEBCHANNEL_PEER_ID="$peer" WEBCHANNEL_ACCOUNT_ID="$acct" \
@@ -290,5 +296,46 @@ run_account "acctB" "$PEER_B" "$ACCT_B" "$ECHO_B_PREFIX" "$ECHO_A_PREFIX" || {
   echo "[run-two-acct] acctB isolation FAILED — gateway log tail:"; tail -40 "$OCH/gateway.log"; exit 3
 }
 
-echo "[run-two-acct] ✓ 2-ACCOUNT ROUTING ISOLATION PROVEN (AC6): acctA→agentA, acctB→agentB, no cross-leak"
+# 8. Snapshot B's persisted peer-key state and register-call count. The foreign
+#    driver reconnects the existing B peer once as a positive snapshot control,
+#    then presents an A-authorized JWT with a real B-issued nonce and otherwise
+#    identical/valid PoP material on B's actual live subject.
+B_KEYS="$OCH/.openclaw-webchannel/$ACCT_B/conversation-keys.json"
+B_KEYS_BEFORE="$OCH/b-keys-before.json"
+[ -f "$B_KEYS" ] || { echo "[run-two-acct] missing B conversation key store after positive B→B"; exit 3; }
+cp "$B_KEYS" "$B_KEYS_BEFORE"
+B_REGISTER_CALLS_BEFORE="$(grep -Ec "\[nats-channel\] (Registered peer|Peer) $PEER_B" "$OCH/gateway.log" || true)"
+WEBCHANNEL_TEST_MODE=foreign-register \
+WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
+WEBCHANNEL_ISSUER_URL="$ISS" WEBCHANNEL_TENANT="$TENANT" \
+WEBCHANNEL_PEER_ID="$PEER_B" WEBCHANNEL_ACCOUNT_ID="$ACCT_B" \
+WEBCHANNEL_TOKEN_ACCOUNT_ID="$ACCT_A" \
+EXPECT_HISTORY_TEXT="hello from acctB" \
+  node --import tsx "$REPO/e2e/local/two-account-isolation-roundtrip.ts" || {
+    echo "[run-two-acct] foreign A→B register attack assertion FAILED"
+    tail -60 "$OCH/gateway.log"
+    exit 4
+  }
+
+# The only registerPeer calls added by the driver must be its valid B snapshot
+# control and the valid B reuse of the nonce rejected with A's token. The
+# audience-rejected A register adds none; it also emits zero `.out` frames before
+# the nonce-reuse control. Exact key-store bytes stay stable.
+cmp -s "$B_KEYS_BEFORE" "$B_KEYS" || {
+  echo "[run-two-acct] FAIL — B conversation-key store mutated after rejected A token"
+  exit 4
+}
+B_REGISTER_CALLS_AFTER="$(grep -Ec "\[nats-channel\] (Registered peer|Peer) $PEER_B" "$OCH/gateway.log" || true)"
+if [ "$B_REGISTER_CALLS_AFTER" -ne "$((B_REGISTER_CALLS_BEFORE + 2))" ]; then
+  echo "[run-two-acct] FAIL — expected exactly two valid-control B register calls; before=$B_REGISTER_CALLS_BEFORE after=$B_REGISTER_CALLS_AFTER"
+  exit 4
+fi
+echo "[run-two-acct] ✓ foreign A→B added no peer/key/history/approval mutation; B controls prove the rejected nonce stayed reusable"
+
+# 9. B remains healthy after the rejected cross-account request.
+run_account "acctB-after-attack" "$PEER_B" "$ACCT_B" "$ECHO_B_PREFIX" "$ECHO_A_PREFIX" || {
+  echo "[run-two-acct] post-attack acctB round-trip FAILED"; tail -60 "$OCH/gateway.log"; exit 3
+}
+
+echo "[run-two-acct] ✓ ONE-PROCESS 2-ACCOUNT ISOLATION PROVEN: aggregate 2/2, A→A, B→B, A-token→B exact 401/no mutation, B→B recovered"
 exit 0

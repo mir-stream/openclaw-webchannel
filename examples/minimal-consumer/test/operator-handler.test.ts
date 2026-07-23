@@ -40,15 +40,21 @@ const enrollment = {
 const registry = { revokeActive: async () => true };
 
 for (const [path, body] of [["/approve", { user_code: "CODE" }], ["/deny", { user_code: "CODE" }], ["/revoke", { tenant: "tenant", accountId: "account" }]] as const) {
-  const missing = createMinimalConsumerEnrollmentHandler({ enrollment: enrollment as never, registry, bootstrap: () => ({}) });
+  const missing = createMinimalConsumerEnrollmentHandler({ enrollment: enrollment as never, registry });
   assert.equal((await invoke(missing, path, body)).status, 503);
-  const configured = createMinimalConsumerEnrollmentHandler({ adminToken: "secret-token", enrollment: enrollment as never, registry, bootstrap: () => ({}) });
+  const configured = createMinimalConsumerEnrollmentHandler({ adminToken: "secret-token", enrollment: enrollment as never, registry });
   assert.equal((await invoke(configured, path, body)).status, 401);
   assert.equal((await invoke(configured, path, body, "Bearer wrong")).status, 401);
 }
 console.log("ok - approve, deny, and revoke fail closed and reject bad bearer tokens");
 
-const handler = createMinimalConsumerEnrollmentHandler({ adminToken: "secret-token", enrollment: enrollment as never, registry, bootstrap: () => ({}) });
+const handler = createMinimalConsumerEnrollmentHandler({ adminToken: "secret-token", enrollment: enrollment as never, registry });
+assert.deepEqual(await invoke(handler, "/bootstrap", {}), {
+  status: 404,
+  body: { error: "not found" },
+});
+console.log("ok - context-free bootstrap issuance is not exposed");
+
 const first = await invoke(handler, "/approve", { user_code: "CODE" }, "Bearer secret-token");
 assert.equal(first.status, 409);
 assert.deepEqual(first.body, { error: "conflict", activationId: "activation-1", fingerprint: "fingerprint", enrolledAt: 123 });
@@ -59,7 +65,7 @@ assert.deepEqual(approveCalls.at(-1), ["CODE", { replaceActivationId: "activatio
 console.log("ok - conflict response confirms replacement through replaceActivationId");
 
 const busyEnrollment = { ...enrollment, approve: async () => ({ kind: "in_progress" as const }) };
-const busyHandler = createMinimalConsumerEnrollmentHandler({ adminToken: "secret-token", enrollment: busyEnrollment as never, registry, bootstrap: () => ({}) });
+const busyHandler = createMinimalConsumerEnrollmentHandler({ adminToken: "secret-token", enrollment: busyEnrollment as never, registry });
 assert.deepEqual(await invoke(busyHandler, "/approve", { user_code: "CODE" }, "Bearer secret-token"), {
   status: 409, body: { error: "approval_in_progress", error_description: "Approval in progress, retry shortly" },
 });

@@ -43,10 +43,12 @@ import {
   listResolvedApprovalsForPeer,
   ApprovalBindingMissingError,
 } from "./approvals.js";
-import { assertJwtAuthConfig, verifyJwtAndExtractIdentity, preflightResolveJwks } from "./auth.js";
-import type { AuthConfig, JwtAuthConfig } from "./auth.js";
-import { formatAccountReadiness, deriveIssuer, type JwksReadiness } from "./preflight.js";
-import { resolveEffectiveAccountAuth } from "./account-auth.js";
+import type { ResolvedJwtVerifierConfig } from "./auth.js";
+import { formatAccountReadiness, type JwksReadiness } from "./preflight.js";
+import {
+  createMemoizedPersistedAccessor,
+  prepareAccountAuth,
+} from "./account-auth.js";
 import { PopChallengeStore } from "./pop-challenge.js";
 import { handleRegisterRequest } from "./nats-register.js";
 import { recent as historyRecent, pageBefore as historyPageBefore, resolveHistoryConfig, planHistoryFetch } from "./history.js";
@@ -66,7 +68,6 @@ import {
 import { consumeCredentialSource } from "./consume-credentials.js";
 import { planWebchannelAccount } from "./multiplex.js";
 import {
-  loadPersistedEnrolledCreds,
   resolveTypingEnabled,
 } from "./account-config.js";
 import type { KeyPair } from "./e2e-crypto.js";
@@ -158,14 +159,8 @@ type AccountRuntime = {
   channel: NatsChannel;
   transport: NatsTransport;
   enrolled?: EnrolledNatsConnection;
-  /**
-   * The `channels.webchannel.auth` `JWT auth configuration`. Every account is
-   * register-hop, so this is always required; it is `undefined` only transiently
-   * before the verifier is built. (Register verifies via
-   * `verifyJwtAndExtractIdentity` against `auth`, not this field; it is retained
-   * to fail loudly on a register-hop account's verifier misconfig.)
-   */
-  auth: AuthConfig | undefined;
+  /** Immutable trust configuration used by this account-bound verifier. */
+  auth: ResolvedJwtVerifierConfig;
   historyConfig: ReturnType<typeof resolveHistoryConfig>;
   owner: object;
   dispose: () => Promise<import("./nats-account-coordinator.js").DisposeReport>;
@@ -190,8 +185,6 @@ const accountCoordinator = new NatsAccountRuntimeCoordinator();
 const aggregateTracker = new AccountServingAggregateTracker();
 const permanentFailureReporter = new AccountPermanentFailureReporter();
 const reportedInvalidAccountIds = new Set<string>();
-const reportedAudiencePairs = new Set<string>();
-const preparedAudienceGenerations = new Set<number>();
 
 export function accountNeverServedStatusPatch(input: {
   restartPending: boolean;
@@ -263,39 +256,6 @@ function rebindPrimary(): void {
   boundChannel = primary?.channel ?? null;
 }
 
-function reportSharedAudiences(api: any): void {
-  const generation = Number(api.generation ?? 0);
-  if (preparedAudienceGenerations.has(generation)) return;
-  preparedAudienceGenerations.add(generation);
-  const claims = new Map<string, string>();
-  const top = api.config as { saas?: { baseUrl?: string } };
-  for (const id of listWebchannelAccountIds(api.config)) {
-    try {
-      const candidate = planWebchannelAccount(api.config, id, { warn: () => {} });
-      if (!candidate) continue;
-      const auth = resolveEffectiveAccountAuth({
-        accountAuthRaw: candidate.account.auth as AuthConfig | undefined,
-        accountId: id,
-        ...(candidate.saasBaseUrl !== undefined ? { planSaasBaseUrl: candidate.saasBaseUrl } : {}),
-        ...(top.saas?.baseUrl !== undefined ? { topLevelSaasBaseUrl: top.saas.baseUrl } : {}),
-      });
-      if (auth?.strategy !== "jwt") continue;
-      const issuer = auth.jwt?.issuer;
-      const audience = auth.jwt?.audience;
-      if (!issuer || !audience) continue;
-      const key = `${deriveIssuer(issuer)}\u0000${audience}`;
-      const first = claims.get(key);
-      if (!first) { claims.set(key, id); continue; }
-      const pairKey = `${generation}\u0000${key}\u0000${first}\u0000${id}`;
-      if (reportedAudiencePairs.has(pairKey)) continue;
-      reportedAudiencePairs.add(pairKey);
-      (api.logger?.warn ?? console.warn)?.(
-        `event=webchannel.shared_audience state=warning accountId=${formatAccountIdForLog(id)} ` +
-        `otherAccountId=${formatAccountIdForLog(first)} issuer=${JSON.stringify(deriveIssuer(issuer))} audience=${JSON.stringify(audience)}`,
-      );
-    } catch { /* one malformed account never blocks the diagnostic or serving */ }
-  }
-}
 const lazyTransport: WebChannelPeerChannel = new Proxy({} as WebChannelPeerChannel, {
   get(_t, prop) {
     const target = boundChannel as unknown as Record<string, unknown> | null;
@@ -340,7 +300,6 @@ const webChannelPlugin = createWebChannelPlugin(lazyTransport, {
 });
 
 async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Promise<import("./nats-transport.js").TransportCloseReport | undefined> {
-    reportSharedAudiences(api);
     // Seed the generation aggregate before any dormant preflight return. Thus
     // an all-permanent/missing-credential generation still emits `zero` once.
     reportServingAggregate(api);
@@ -449,27 +408,47 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
 
     {
       const { accountId, tenant, account } = plan;
-      // Derive the EFFECTIVE account auth ONCE, here — every downstream consumer
-      // below (the shared-audience guard, the connection verifier via
-      // `assertJwtAuthConfig`, the register-path `verifyIdentity`, and the published
-      // `AccountRuntime.auth`) reads this single local, so they all see the
-      // effective (derived) issuer/jwksUrl/audience, per the design's "diagnostics
-      // must read the effective values" constraint. See `deriveAccountAuth` above
-      // for the config-present-wins + fail-closed rationale.
-      let accountAuth: ReturnType<typeof resolveEffectiveAccountAuth>;
+      // Pure planning plus immutable auth preparation is the per-account Gate
+      // A. It binds the verifier's expected audience to this runtime accountId
+      // before this account consumes credentials or performs socket/JWKS I/O.
+      // When issuer derivation genuinely needs delivered enrollment metadata,
+      // the memoized accessor gives auth derivation and enrolled transport one
+      // consistent credential snapshot.
+      const getPersisted = createMemoizedPersistedAccessor(accountId);
+      let accountAuth: ReturnType<typeof prepareAccountAuth>;
       try {
-        accountAuth = resolveEffectiveAccountAuth({
-          accountAuthRaw: account.auth as AuthConfig | undefined,
-          accountId,
-          ...(plan.saasBaseUrl !== undefined ? { planSaasBaseUrl: plan.saasBaseUrl } : {}),
+        accountAuth = prepareAccountAuth({
+          plan,
+          getPersisted,
           ...(config.saas?.baseUrl !== undefined
             ? { topLevelSaasBaseUrl: config.saas.baseUrl }
             : {}),
+          logger: api.logger,
         });
       } catch (err) {
-        const failure = classifyAccountStartupFailure(err, "preflight");
-        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: failure.operatorMessage }));
-        reportPermanent(accountId, failure.code, failure.operatorMessage);
+        const buildError = err instanceof Error ? err.message : String(err);
+        let buildDetail = `JWT verifier configuration is invalid: ${buildError}`;
+        try {
+          buildDetail = formatAccountReadiness({
+            accountId,
+            admission: "register-hop",
+            audience: accountId,
+            buildError,
+            ...(account.dmSecurity !== undefined
+              ? { dmSecurity: String(account.dmSecurity) }
+              : {}),
+          }).line;
+        } catch { /* the stable permanent event below remains available */ }
+        reportPermanent(
+          accountId,
+          "jwt-auth-config-invalid",
+          `${buildDetail}; fix the account JWT issuer and exactly-one JWKS source`,
+        );
+        setStatus(accountNeverServedStatusPatch({
+          restartPending: false,
+          reconnectAttempts: 0,
+          lastError: buildDetail,
+        }));
         await waitForAbort(ctx.abortSignal);
         return undefined;
       }
@@ -477,9 +456,8 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
       const accountDmSecurity = account.dmSecurity as string | undefined;
       const admission = "register-hop" as const;
-      const effJwt = (accountAuth as { jwt?: { issuer?: string; audience?: string } } | undefined)?.jwt;
-      const effIssuer = effJwt?.issuer;
-      const effAudience = effJwt?.audience;
+      const effIssuer = accountAuth.auth.jwt.issuer;
+      const effAudience = accountId;
 
       // Obsolete-config tidy: the register hop moved from HTTP to NATS, so the
       // old `auth.cors` browser-origin allowlist no longer applies and is silently
@@ -536,39 +514,13 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         return undefined;
       }
 
-      // Complete permanent preflight before the first socket exists. Verifier
-      // construction initializes only the shared cache; it performs no JWKS I/O.
-      try {
-        assertJwtAuthConfig(accountAuth);
-      } catch (err) {
-        let buildDetail = `JWT verifier configuration is invalid: ${err instanceof Error ? err.message : String(err)}`;
-        try {
-          buildDetail = formatAccountReadiness({
-            accountId,
-            admission,
-            ...(effIssuer !== undefined ? { issuer: effIssuer } : {}),
-            ...(effAudience !== undefined ? { audience: effAudience } : {}),
-            buildError: err instanceof Error ? err.message : String(err),
-            ...(accountDmSecurity !== undefined ? { dmSecurity: accountDmSecurity } : {}),
-          }).line;
-        } catch { /* the stable permanent event below remains available */ }
-        reportPermanent(
-          accountId,
-          "jwt-auth-config-invalid",
-          `${buildDetail}; fix the account JWT issuer, audience, and JWKS configuration`,
-        );
-        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: buildDetail }));
-        await waitForAbort(ctx.abortSignal);
-        return undefined;
-      }
-
       // Register-hop encryption requires the SaaS-attested identity key. Load
       // and validate enrolled material before dialing so missing/malformed local
       // credentials are a dormant permanent preflight failure, not an outage.
       if (source.mode === "enrolled") {
-        let persisted: ReturnType<typeof loadPersistedEnrolledCreds>;
+        let persisted: ReturnType<typeof getPersisted>;
         try {
-          persisted = loadPersistedEnrolledCreds(accountId);
+          persisted = getPersisted();
         } catch {
           const detail = "enrolled credentials are invalid; remove them and re-enroll the account";
           reportPermanent(accountId, "credentials-invalid", detail);
@@ -691,6 +643,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       try {
         const consumed = await consumeCredentialSource(source, accountId, {
           signal: attemptAbort.signal,
+          loadPersisted: () => getPersisted(),
           onTransport: (created) => {
             // The connector calls this before awaiting connect(). Take sticky
             // disconnect/error ownership here so PONG+close cannot outrun the
@@ -1169,12 +1122,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // throw), but attach a `.catch` here too as defense-in-depth: a future
           // unguarded path must never surface as an unhandledRejection.
           void handleRegisterRequest({
-            auth: accountAuth,
             tenant,
             subjectPeerId,
             payload,
             reply,
-            verifyIdentity: (jwt, a) => verifyJwtAndExtractIdentity(jwt, a, api.logger),
+            verifyIdentity: accountAuth.verifyIdentity,
+            requirePoP: accountAuth.requirePoP,
             popChallenges: accountPopChallenges,
             registerPeer: (pid) => registerChannel.registerPeer(pid),
             wrapConversationKeyForDevice: (pid, key) =>
@@ -1211,40 +1164,31 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       }
 
       // ---- Step 7 (per account): startup readiness gate (Gate B) -----------
-      // The account is now fully wired (verifier built, channel created,
-      // register subscribed). Emit ONE structured readiness line reporting the
-      // EFFECTIVE (derived) trust facts, or the precise failure. For a
-      // register-hop jwt account we resolve the JWKS ONCE here (reusing the
-      // account's live cache via `preflightResolveJwks`, which also primes the
-      // very cache the register/challenge routes verify against) so the line can
-      // report the key count — the single most useful diagnostic (an empty or
-      // unreachable JWKS ⇒ no bootstrap JWT can ever verify). A transient JWKS
-      // fetch failure is reported as a loud FAIL line but does NOT skip the
-      // account: it is already fail-closed (no reachable keys ⇒ every register
-      // verify is non-admit), and the cache retries per-register on the 5-min
-      // TTL — permanently skipping on a momentary IdP hiccup would be worse.
+      // The account is fully wired but not yet published or subscribed. Warm
+      // the exact cache owned by its account-bound verifier before the final
+      // subscribe→publish fence, preserving abort-aware private-readiness
+      // cleanup. A transient JWKS failure is reported but does not permanently
+      // skip the account: live verification remains fail-closed and can retry.
       let jwks: JwksReadiness | undefined;
-      if ((accountAuth as { strategy?: string } | undefined)?.strategy === "jwt") {
-        try {
-          const readiness = await resolvePrivateReadiness({
-            signal: attemptAbort.signal,
-            resolve: (signal) => preflightResolveJwks(accountAuth as JwtAuthConfig, signal),
-            dispose,
-          });
-          if (readiness.kind === "aborted") {
-            if (ctx.abortSignal.aborted) {
-              return { kind: "completed" as const, closeReport: readiness.closeReport };
-            }
-            return {
-              kind: "failed" as const,
-              cause: privateFailure ?? new NatsConnectionClosedError(1006, false),
-              closeReport: readiness.closeReport,
-            };
+      try {
+        const readiness = await resolvePrivateReadiness({
+          signal: attemptAbort.signal,
+          resolve: (signal) => accountAuth.warmJwks(signal),
+          dispose,
+        });
+        if (readiness.kind === "aborted") {
+          if (ctx.abortSignal.aborted) {
+            return { kind: "completed" as const, closeReport: readiness.closeReport };
           }
-          jwks = readiness.value;
-        } catch (err) {
-          jwks = { error: err instanceof Error ? err.message : String(err) };
+          return {
+            kind: "failed" as const,
+            cause: privateFailure ?? new NatsConnectionClosedError(1006, false),
+            closeReport: readiness.closeReport,
+          };
         }
+        jwks = readiness.value;
+      } catch (err) {
+        jwks = { error: err instanceof Error ? err.message : String(err) };
       }
       const readiness = formatAccountReadiness({
         accountId,
@@ -1297,7 +1241,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               channel,
               transport,
               ...(enrolled ? { enrolled } : {}),
-              auth: accountAuth,
+              auth: accountAuth.auth,
               historyConfig,
               owner: ownerIdentity,
               dispose,

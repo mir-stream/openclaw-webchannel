@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### BREAKING
+
+- Removed configurable `auth.jwt.audience`. The account-bound verifier always
+  expects the runtime account id, and a raw removed key is rejected before any
+  credential or relay I/O. Delete the key from shared and named account blocks.
+- Generic/shared IdP audiences are no longer accepted. `aud` is the account id
+  or an array of authorized account ids in one tenant; this supersedes #65's
+  partial audience-pin proposal.
+- Register admission now requires a non-empty signed tenant claim matching the
+  configured tenant for challenge, register, and unregister.
+
+### Security upgrade / incident response
+
+A prior deployment that served multiple accounts under the same issuer and
+shared audience must be treated as potentially exposed: a token for one account
+may have admitted another peer and disclosed that peer's conversation key K and
+history. This release prevents new cross-account admission, but cannot make
+previously exposed keys or ciphertext secret again.
+
+Drain and stop every vulnerable plugin replica and keep the affected accounts
+disabled. Revoke affected issuer/relay bootstrap and NATS authorizations plus
+active sessions. Review the complete exposure window and history. Rotate K and
+invalidate old encrypted peer state only through a verified control. Removing
+`auth.jwt.audience`, partially restarting the fleet, or waiting for token expiry
+is not revocation.
+
+The integrated verified rotation/state-invalidation path is tracked by #72. If
+it is unavailable, do not invent file-deletion or ad-hoc migration commands;
+keep the accounts disabled and escalate through incident response.
+
+### Fixed
+
+- Added per-account pure planning and immutable account-bound auth preparation
+  before that account consumes transport credentials or performs network I/O,
+  token-only prepared verifiers, Gate-B-before-subscribe activation,
+  exact-identity rollback, once-only primary binding, and cleanup of transports
+  whose connect handshake rejects. Issuer derivation may read the account's
+  memoized enrollment metadata when required. Signed tenant and account-id
+  audience claims make token populations distinguishable, so accounts retain
+  independent startup and failure isolation.
+- Incident context: #72. Durable credential/storage follow-up: #71.
+
 ### Added
 
 - **P0-4:** `turn_settled` frames now carry an explicit `outcome: "ok" | "error"`

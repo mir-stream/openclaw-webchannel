@@ -18,6 +18,7 @@
 
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  assertNoRemovedAudienceConfig,
   isWebchannelAccountEnabled,
   listWebchannelAccountIds,
   readAccountsMap,
@@ -53,6 +54,11 @@ export function planWebchannelAccount(
   // Share the exact status predicate and skip before acquisition identity,
   // credential resolution, or any future per-account runtime I/O.
   if (!isWebchannelAccountEnabled(cfg, accountId)) return undefined;
+
+  // Removed-key policy is evaluated on raw locations before acquisition or the
+  // shallow effective merge, so a channel-base tombstone cannot be shadowed by
+  // an account-local auth.jwt object.
+  assertNoRemovedAudienceConfig(cfg, accountId);
 
   // Identity with config-over-env precedence. For a named account this is
   // config-only; for the synthesized default with no config it is env-derived.

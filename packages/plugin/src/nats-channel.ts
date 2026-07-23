@@ -320,12 +320,28 @@ export class NatsChannel implements WebChannelPeerChannel {
    * The subject namespace already encodes tenant+accountId, so the request is
    * pinned to THIS account — identity still comes only from the verified JWT.
    */
-  subscribeRegister(): void {
+  subscribeRegister(): () => void {
     if (this.disposed) throw new Error("NatsChannel is disposed");
-    if (this.registerSid !== undefined) return;
+    if (this.registerSid !== undefined) {
+      return this.registerDisposer(this.registerSid);
+    }
     const regWild = `webchannel.${this.tenant}.${this.accountId}.*.register`;
-    this.registerSid = this.transport.subscribe(regWild);
+    const sid = this.transport.subscribe(regWild);
+    this.registerSid = sid;
     console.log(`[nats-channel] Subscribed to register wildcard ${regWild}`);
+    return this.registerDisposer(sid);
+  }
+
+  private registerDisposer(sid: number): () => void {
+    let disposed = false;
+    return () => {
+      if (disposed) return;
+      disposed = true;
+      if (this.registerSid === sid) {
+        this.transport.unsubscribe(sid);
+        this.registerSid = undefined;
+      }
+    };
   }
 
   /**
@@ -381,6 +397,11 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.onLoadHistory = undefined;
     this.onLoadCommands = undefined;
     this.onRegisterRequest = undefined;
+  }
+
+  /** Backward-compatible lifecycle name; shares the same idempotent teardown. */
+  close(): void {
+    this.dispose();
   }
 
   /**
@@ -579,7 +600,7 @@ export class NatsChannel implements WebChannelPeerChannel {
 
   /**
    * Phase 6 (keyStore mode): wrap the peer's conversation key K to a specific
-   * device's X25519 public key for delivery in the register HTTP response.
+   * device's X25519 public key for delivery in the NATS register reply.
    *
    * Must be called AFTER `registerPeer(peerId)` (which establishes K). The
    * wrap targets exactly the key presented in THIS request's verified JWT cnf

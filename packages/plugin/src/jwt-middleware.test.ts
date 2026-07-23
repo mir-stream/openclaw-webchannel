@@ -3,8 +3,8 @@
  *
  * Exercises the full `assertJwtAuthConfig({ strategy: "jwt", jwt: { jwksUrl } })`
  * middleware path using a mock fetch function that simulates a SaaS JWKS HTTP
- * endpoint.  The mock is injected via `jwt._fetchImpl` (a test-only field on
- * `JwtAuthConfig`) so the JWKSCache makes a "real" fetch call but against our
+ * endpoint. The mock is injected through the verifier factory dependency so
+ * the JWKSCache makes a "real" fetch call but against our
  * in-process stub rather than an external server — identical code-path, no
  * sockets required.
  *
@@ -32,7 +32,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { webcrypto } from "node:crypto";
 
-import { verifyJwtAndExtractIdentity } from "./auth.js";
+import { createAccountJwtVerifier, resolveVerifierConfig } from "./auth.js";
 import type { JsonWebKeySet } from "./jwks.js";
 import { handleRegisterRequest, REGISTER_UNAUTHORIZED } from "./nats-register.js";
 import { PopChallengeStore } from "./pop-challenge.js";
@@ -143,8 +143,8 @@ function nowSec(): number {
  * Create a fresh `JWT auth configuration` backed by the mock JWKS server.
  *
  * Each call returns a NEW verifier with its own `JWKSCache` instance —
- * no shared cache state between tests.  The `_fetchImpl` field routes
- * the cache's HTTP fetch through the provided stub.
+ * no shared cache state between tests. The factory dependency routes the
+ * cache's HTTP fetch through the provided stub.
  */
 function makeVerifier(fetchImpl: typeof fetch = mockJwksServer(publishedJwks)) {
   const config = {
@@ -152,11 +152,13 @@ function makeVerifier(fetchImpl: typeof fetch = mockJwksServer(publishedJwks)) {
     jwt: {
       jwksUrl: JWKS_URL,
       issuer: ISSUER,
-      audience: AUDIENCE,
-      _fetchImpl: fetchImpl,
     },
   } as const;
-  return async (token: string | null) => token ? verifyJwtAndExtractIdentity(token, config) : null;
+  const verifier = createAccountJwtVerifier(
+    { auth: resolveVerifierConfig(config), accountId: AUDIENCE },
+    { fetchImpl },
+  ).verifyIdentity;
+  return async (token: string | null) => token ? verifier(token) : null;
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -227,19 +229,23 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
       );
       const config = {
         strategy: "jwt",
-        jwt: { jwksUrl: JWKS_URL, issuer: ISSUER, audience: AUDIENCE, _fetchImpl: mockJwksServer(publishedJwks) },
+        jwt: { jwksUrl: JWKS_URL, issuer: ISSUER },
       } as const;
-      const identity = await verifyJwtAndExtractIdentity(token, config);
+      const verifier = createAccountJwtVerifier(
+        { auth: resolveVerifierConfig(config), accountId: AUDIENCE },
+        { fetchImpl: mockJwksServer(publishedJwks) },
+      ).verifyIdentity;
+      const identity = await verifier(token);
       expect(identity?.tenant).toBe("mutated-tenant");
 
       const replies: string[] = [];
       await handleRegisterRequest({
-        auth: config,
         tenant: "agent-tenant",
         subjectPeerId: "user-abc",
         payload: JSON.stringify({ op: "challenge", token }),
         reply: (value) => replies.push(value),
-        verifyIdentity: (jwt, auth) => verifyJwtAndExtractIdentity(jwt, auth),
+        verifyIdentity: verifier,
+        requirePoP: true,
         popChallenges: new PopChallengeStore(),
         registerPeer: () => {},
         wrapConversationKeyForDevice: () => null,
@@ -269,22 +275,24 @@ describe("JWT middleware — mock JWKS server (Sub-AC 3a)", () => {
         jwt: {
           jwksUrl: JWKS_URL,
           issuer: ISSUER,
-          audience: AUDIENCE,
-          _fetchImpl: mockJwksServer(publishedJwks),
         },
       } as const;
-      const identity = await verifyJwtAndExtractIdentity(token, config);
+      const verifier = createAccountJwtVerifier(
+        { auth: resolveVerifierConfig(config), accountId: AUDIENCE },
+        { fetchImpl: mockJwksServer(publishedJwks) },
+      ).verifyIdentity;
+      const identity = await verifier(token);
       expect(identity).toMatchObject({ peerId: "user-abc", tenant: "mutated-tenant" });
 
       const replies: string[] = [];
       const unregistered: string[] = [];
       await handleRegisterRequest({
-        auth: config,
         tenant: "agent-tenant",
         subjectPeerId: "user-abc",
         payload: JSON.stringify({ op: "unregister", token }),
         reply: (value) => replies.push(value),
-        verifyIdentity: (jwt, auth) => verifyJwtAndExtractIdentity(jwt, auth),
+        verifyIdentity: verifier,
+        requirePoP: true,
         popChallenges: new PopChallengeStore(),
         registerPeer: () => {},
         wrapConversationKeyForDevice: () => null,

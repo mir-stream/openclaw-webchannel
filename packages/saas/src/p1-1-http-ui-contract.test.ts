@@ -92,13 +92,13 @@ describe("P1-1 HTTP callers and reference approval UI", () => {
       const denyBody = profile === "demo" ? {} : { user_code: b.user_code };
       const revokePath = profile === "demo" ? "/admin/accounts/account/revoke" : "/revoke";
 
-      await withServer(ctx, factory({ enrollment, registry, bootstrap: () => ({ jwt: "jwt", peerId: "peer" }), log: (line) => logs.push(line) }), async (base) => {
+      await withServer(ctx, factory({ enrollment, registry, log: (line) => logs.push(line) }), async (base) => {
         for (const [path, payload] of [[approvePath, approveBody], [denyPath, denyBody], [revokePath, { tenant: "tenant", accountId: "account" }]] as const) expect((await post(base, path, payload)).status).toBe(503);
         expect((await post(base, "/enroll", { agentPublicKey: KEY_B, tenant: "tenant", accountId: `${profile}-open` })).status).toBe(200);
         expect((await post(base, "/poll", { device_code: "missing" })).status).toBe(400);
-        expect((await post(base, "/bootstrap", {})).status).toBe(200);
+        expect((await post(base, "/bootstrap", {})).status).toBe(404);
       });
-      await withServer(ctx, factory({ adminToken: "secret-token", enrollment, registry, bootstrap: () => ({ jwt: "jwt", peerId: "peer" }), log: (line) => logs.push(line) }), async (base) => {
+      await withServer(ctx, factory({ adminToken: "secret-token", enrollment, registry, log: (line) => logs.push(line) }), async (base) => {
         expect((await post(base, approvePath, approveBody, "wrong")).status).toBe(401);
         const conflictResponse = await post(base, approvePath, approveBody, "secret-token");
         expect(conflictResponse.status).toBe(409);
@@ -125,14 +125,12 @@ describe("P1-1 HTTP callers and reference approval UI", () => {
       enrollment?: Record<string, ReturnType<typeof vi.fn>>;
       registry?: Record<string, ReturnType<typeof vi.fn>>;
       onApproved?: ReturnType<typeof vi.fn>;
-      bootstrap?: ReturnType<typeof vi.fn>;
     }> = [
       { name: "enroll store failure", path: "/enroll", enrollment: { enroll: vi.fn().mockRejectedValue(new Error("enroll store secret detail")) } },
       { name: "poll store failure", path: "/poll", enrollment: { poll: vi.fn().mockRejectedValue(new Error("poll store secret detail")) } },
       { name: "mint failure", path: "/approve", enrollment: { approve: vi.fn().mockRejectedValue(new Error("mint secret detail")) } },
       { name: "registry rejection", path: "/revoke", registry: { revokeActive: vi.fn().mockRejectedValue(new Error("registry secret detail")) } },
       { name: "onApproved hook throw", path: "/approve", enrollment: { approve: vi.fn().mockResolvedValue(approved) }, onApproved: vi.fn().mockRejectedValue(new Error("hook secret detail")) },
-      { name: "bootstrap throw", path: "/bootstrap", bootstrap: vi.fn().mockRejectedValue(new Error("bootstrap secret detail")) },
     ];
     for (const failure of cases) {
       const logs: string[] = [];
@@ -143,7 +141,7 @@ describe("P1-1 HTTP callers and reference approval UI", () => {
       const registry = { revokeActive: vi.fn().mockResolvedValue(true), ...(failure.registry ?? {}) };
       const handler = createReferenceEnrollmentHttpHandler({
         adminToken: "secret-token", enrollment: enrollment as never, registry: registry as never,
-        bootstrap: failure.bootstrap ?? (() => ({})), onApproved: failure.onApproved,
+        onApproved: failure.onApproved,
         log: (line) => logs.push(line),
       });
       const requestBody = failure.path === "/approve"
@@ -163,7 +161,7 @@ describe("P1-1 HTTP callers and reference approval UI", () => {
     const inertEnrollment = { enroll: vi.fn(), poll: vi.fn(), approve: vi.fn(), deny: vi.fn() };
     const handler = createDemoEnrollmentHttpHandler({
       authorize: () => ({ ok: true }), enrollment: inertEnrollment as never,
-      registry: { revokeActive: vi.fn() } as never, bootstrap: () => ({}), log: (line) => logs.push(line),
+      registry: { revokeActive: vi.fn() } as never, log: (line) => logs.push(line),
     });
     const badEncoding = await invoke(handler, "/admin/enrollments/%E0%A4%A/approve", "{}");
     expect(badEncoding.status).toBe(400);
@@ -243,6 +241,20 @@ describe("P1-1 HTTP callers and reference approval UI", () => {
     const route = server.slice(server.indexOf('if (path === "/test/bootstrap-jwt"'));
     expect(route).not.toMatch(/const \{[^}]*agentPublicKey/);
     expect(route).toContain("agentKeyRegistry.getActive");
+  });
+
+  it("issue #54: test issuance is effectively gated and suppressed in demo mode", async () => {
+    const server = await source("packages/saas/reference/enrollment-server.ts");
+    expect(server).toContain("const TEST_ROUTES_ENABLED = ENABLE_TEST_ROUTES && !ENABLE_DEMO_UI");
+    expect(server.match(/if \(!TEST_ROUTES_ENABLED\)/g)).toHaveLength(2);
+    expect(server).toContain("ENABLE_TEST_ROUTES was requested but is suppressed because ENABLE_DEMO_UI=1");
+  });
+
+  it("issue #54: canonical app pins claims and registry lookup to one server tuple", async () => {
+    const server = await source("examples/webchannel-app/server/index.ts");
+    expect(server).toContain("accountId !== ACCOUNT_ID || !canAccess(user, ACCOUNT_ID)");
+    expect(server).toMatch(/buildBootstrapClaims\(\{[\s\S]*?accountId:\s*ACCOUNT_ID,[\s\S]*?tenant:\s*TENANT/);
+    expect(server).toContain("agentKeyRegistry.getActive(TENANT, ACCOUNT_ID)");
   });
 
   it("21 and 24: all HTTP adapters reject missing accountId and the offline reset runbook names every credential path", async () => {

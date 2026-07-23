@@ -11,6 +11,7 @@ import {
   type TransportCloseReport,
 } from "./nats-transport.js";
 import { connectNatsCredentialSource } from "./nats-credential-source.js";
+import { RemovedAudienceConfigError } from "./account-config.js";
 import {
   AccountRunFailure,
   AccountPermanentFailureReporter,
@@ -102,6 +103,18 @@ describe("account startup failure classification", () => {
     expect(classifyAccountStartupFailure(new NatsLifecycleAbortError()).kind).toBe("aborted");
     expect(classifyAccountStartupFailure(Object.assign(new Error(), { code: "ERR_TLS_CERT_ALTNAME_INVALID" })).kind).toBe("permanent");
     expect(classifyAccountStartupFailure(new Error("opaque")).kind).toBe("unknown");
+  });
+
+  it("keeps removed audience overrides permanent and preserves migration guidance", () => {
+    const cause = new RemovedAudienceConfigError("alpha", [
+      "channels.webchannel.accounts.alpha.auth.jwt.audience",
+    ]);
+    expect(classifyAccountStartupFailure(cause, "preflight")).toMatchObject({
+      kind: "permanent",
+      code: "audience-override-removed",
+      phase: "preflight",
+      operatorMessage: cause.message,
+    });
   });
 
   it("implements the complete pre-PONG close policy without exposing the raw reason", () => {

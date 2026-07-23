@@ -28,8 +28,8 @@ const ownReginbox = (token: string): string =>
 class FakeTransport extends EventEmitter {
   connected = true;
   readonly subs: string[] = [];
-  readonly published: Array<{ subject: string; payload: string }> = [];
   readonly unsubscribed: number[] = [];
+  readonly published: Array<{ subject: string; payload: string }> = [];
   subscribe(subject: string): number {
     this.subs.push(subject);
     return this.subs.length;
@@ -82,6 +82,23 @@ describe("NatsChannel register-hop wiring", () => {
     const { channel, transport } = makeChannel();
     channel.subscribeRegister();
     expect(transport.subs).toContain(regWild);
+  });
+
+  it("returns an idempotent unsubscribe and close retires the transport listener", () => {
+    const { channel, transport } = makeChannel();
+    let calls = 0;
+    channel.setRegisterRequestHandler(() => { calls += 1; });
+    const unsubscribe = channel.subscribeRegister();
+    unsubscribe();
+    unsubscribe();
+    expect(transport.unsubscribed).toEqual([1]);
+
+    channel.subscribeRegister();
+    channel.close();
+    channel.close();
+    expect(transport.unsubscribed).toEqual([1, 2]);
+    transport.deliver(regSubj, JSON.stringify({ op: "challenge", token: "jwt" }));
+    expect(calls).toBe(0);
   });
 
   it("routes a register request to the handler and publishes the reply to the requester's own reginbox", () => {

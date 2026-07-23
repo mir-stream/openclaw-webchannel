@@ -14,6 +14,10 @@ import {
   parseNatsCredsFile,
   type NatsCredentialSource,
 } from "./nats-credential-source.js";
+import {
+  completeJwtHandshake,
+  createConnectorTransportHarness,
+} from "./nats-connect-cleanup-test-helper.js";
 
 // A realistic-shaped NATS .creds file (tokens are fake but well-formed).
 const CREDS_FILE = `-----BEGIN NATS USER JWT-----
@@ -216,7 +220,10 @@ describe("resolveNatsCredentialSource — enrolled (default)", () => {
 describe("connectNatsCredentialSource — static branch", () => {
   it("builds a transport with the user JWT + an NKEY signing callback", async () => {
     let captured: Record<string, unknown> | undefined;
-    const fakeTransport = { connect: vi.fn().mockResolvedValue(undefined) };
+    const fakeTransport = {
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn(),
+    };
     const makeSigner = vi.fn().mockReturnValue(async () => "sig");
 
     const result = await connectNatsCredentialSource(
@@ -238,6 +245,7 @@ describe("connectNatsCredentialSource — static branch", () => {
     expect(fakeTransport.connect).toHaveBeenCalled();
     expect(result.transport).toBe(fakeTransport);
     expect(result.enrolled).toBeUndefined();
+    expect(fakeTransport.disconnect).not.toHaveBeenCalled();
   });
 
   it("enrolled branch delegates to createEnrolled and returns the connection", async () => {
@@ -266,5 +274,103 @@ describe("connectNatsCredentialSource — static branch", () => {
     );
     expect(result.transport).toBe(fakeTransport);
     expect(result.enrolled).toBe(enrolled);
+  });
+
+  it.each(["signer", "protocol", "timeout"] as const)(
+    "retires a real production transport after a %s handshake failure",
+    async (failure) => {
+      vi.useFakeTimers();
+      try {
+        const signerError = new Error("NKEY signer rejected");
+        let signerRejects = failure === "signer";
+        const harness = createConnectorTransportHarness();
+        const connecting = connectNatsCredentialSource(
+          { mode: "static", url: "wss://x", userJwt: "JWT", userSeed: "SEED" },
+          {
+            transportFactory: harness.transportFactory,
+            makeSigner: () => async () => {
+              if (signerRejects) throw signerError;
+              return "signature";
+            },
+          },
+        );
+        const rejection = connecting.then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        const transport = harness.transport();
+        const socket = harness.sockets[0]!;
+        socket.open();
+        transport.subscribe("pre.failure.subscription");
+
+        if (failure === "signer") {
+          socket.server('INFO {"nonce":"n"}\r\n');
+        } else if (failure === "protocol") {
+          socket.server('INFO {"nonce":"n"}\r\n');
+          await Promise.resolve();
+          await Promise.resolve();
+          socket.server("-ERR 'Authorization Violation'\r\n");
+        } else {
+          await vi.advanceTimersByTimeAsync(25);
+        }
+
+        const rejected = await rejection;
+        if (failure === "signer") expect(rejected).toBe(signerError);
+        if (failure === "protocol") {
+          expect(rejected).toBeInstanceOf(Error);
+          expect((rejected as Error).message).toContain("Authorization Violation");
+        }
+        if (failure === "timeout") {
+          expect(rejected).toBeInstanceOf(Error);
+          expect((rejected as Error).message).toContain("handshake timeout in phase INFO");
+        }
+
+        expect(socket.readyState).toBe(3);
+        expect(socket.closeCalls).toBeGreaterThan(0);
+        expect(transport.connected).toBe(false);
+        expect(() => transport.publish("must.not.send", "x")).toThrow(/not connected/);
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(harness.sockets).toHaveLength(1);
+
+        // Explicit reuse is allowed. Its next reconnect must NOT replay the
+        // pre-failure SUB, proving connector cleanup cleared subscription state.
+        signerRejects = false;
+        const reused = transport.connect();
+        await completeJwtHandshake(harness.sockets[1]!);
+        await reused;
+        const reconnected = new Promise<void>((resolve) => transport.once("reconnect", resolve));
+        harness.sockets[1]!.close();
+        await vi.advanceTimersByTimeAsync(5);
+        await completeJwtHandshake(harness.sockets[2]!);
+        await reconnected;
+        expect(harness.sockets[2]!.sent.filter(
+          (frame) => typeof frame === "string" && frame.startsWith("SUB "),
+        )).toEqual([]);
+        transport.disconnect();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("keeps a successfully connected real static transport live", async () => {
+    const harness = createConnectorTransportHarness();
+    const connected = connectNatsCredentialSource(
+      { mode: "static", url: "wss://x", userJwt: "JWT", userSeed: "SEED" },
+      {
+        transportFactory: harness.transportFactory,
+        makeSigner: () => async () => "signature",
+      },
+    );
+    await completeJwtHandshake(harness.sockets[0]!);
+    const result = await connected;
+    expect(result.transport).toBe(harness.transport());
+    expect(result.transport.connected).toBe(true);
+    expect(harness.sockets[0]!.closeCalls).toBe(0);
+    result.transport.subscribe("still.live");
+    expect(harness.sockets[0]!.sent).toContain("SUB still.live 1\r\n");
+    result.transport.disconnect();
   });
 });

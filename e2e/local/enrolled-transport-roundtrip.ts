@@ -19,7 +19,7 @@
 //      the only admission path);
 //   3. unwraps the register-delivered conversation key K (Phase 6 — the
 //      register-hop path has NO X25519 handshake; K arrives wrapped to the
-//      device cnf key in the register HTTP response) and runs the
+//      device cnf key in the NATS register reply) and runs the
 //      ChaCha20-Poly1305 round-trip (same wire as the production browser
 //      client), asserting the decrypted echo.
 //
