@@ -20,8 +20,7 @@ import {
   findRemovedAudiencePaths,
   isWebchannelAccountEnabled,
   listWebchannelAccountIds,
-  loadPersistedEnrolledCreds,
-  type PersistedEnrolledCreds,
+  loadPersistedCredentialDocument,
   RemovedAudienceConfigError,
 } from "./account-config.js";
 import { createMemoizedPersistedAccessor, prepareAccountAuth } from "./account-auth.js";
@@ -37,12 +36,18 @@ import {
 import type { WebchannelNatsConfig } from "./nats-credential-source.js";
 import { resolveNatsCredentialSource } from "./nats-credential-source.js";
 import { dialRelayForPreflight } from "./preflight.js";
+import {
+  formatCredentialInspection,
+  type BoundCredentialLoadResult,
+  type PersistedEnrolledCreds,
+} from "./credential-document.js";
 
 export type DoctorCheckId =
   | "invalid-account-id"
   | "configuration-invalid"
   | "encryption-disabled"
   | "creds-missing"
+  | "credential-binding-failed"
   | "identity-key-missing"
   | "verifier-unbuildable"
   | "audience-override-removed"
@@ -71,7 +76,7 @@ const reEnrollFix = (accountId: string) =>
 
 export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): DoctorFinding[] {
   const env = deps.env ?? process.env;
-  const loadCreds = deps.loadPersistedEnrolledCreds ?? loadPersistedEnrolledCreds;
+  const injectedLoadCreds = deps.loadPersistedEnrolledCreds;
   const findings: DoctorFinding[] = [];
   const top = cfg as { nats?: { url?: string }; saas?: { baseUrl?: string } };
 
@@ -171,7 +176,7 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
     const getPersisted = () => {
       if (!persistedLoaded) {
         persistedLoaded = true;
-        persisted = loadCreds(accountId);
+        persisted = injectedLoadCreds?.(accountId);
       }
       return persisted;
     };
@@ -179,7 +184,36 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
     if (source.mode === "enrolled") {
       let enrolled: PersistedEnrolledCreds | undefined;
       try {
-        enrolled = getPersisted();
+        if (injectedLoadCreds) {
+          enrolled = getPersisted();
+        } else {
+          const loaded = loadPersistedCredentialDocument({
+            tenant,
+            accountId,
+            saasBaseUrl: source.saasBaseUrl,
+          });
+          persistedLoaded = true;
+          if (loaded.status === "match") {
+            persisted = loaded.credentials;
+            enrolled = persisted;
+          } else if (loaded.status === "absent") {
+            enrolled = undefined;
+          } else {
+            findings.push({
+              accountId,
+              checkId: "credential-binding-failed",
+              kind: "auth",
+              severity: "error",
+              message:
+                `Persisted enrollment material is not reusable ` +
+                `(${formatCredentialInspection(loaded)}).`,
+              fix:
+                `Stop the gateway, archive the account credential file, complete any required ` +
+                `SaaS active-key replacement, then ${reEnrollFix(accountId)}.`,
+            });
+            continue;
+          }
+        }
       } catch (err) {
         findings.push(configurationInvalidFinding(accountId, err));
         continue;
@@ -210,6 +244,9 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
       prepareAccountAuth({
         plan,
         getPersisted,
+        ...(source.mode === "enrolled"
+          ? { effectiveSaasBaseUrl: source.saasBaseUrl }
+          : {}),
         ...(top.saas?.baseUrl !== undefined ? { topLevelSaasBaseUrl: top.saas.baseUrl } : {}),
       });
     } catch (err) {
@@ -320,15 +357,57 @@ export async function probeWebchannelAccount(params: {
     if (!plan) throw new Error(`account ${accountId} is not configured`);
     const top = params.cfg as unknown as { nats?: { url?: string }; saas?: { baseUrl?: string } };
     const nats = plan.account.nats as WebchannelNatsConfig | undefined;
-    const getPersisted = createMemoizedPersistedAccessor(
+    const source = resolveNatsCredentialSource({
+      natsConfig: nats,
+      legacyNats: top.nats,
+      saasBaseUrl: plan.saasBaseUrl ?? top.saas?.baseUrl,
+      tenant: plan.tenant,
       accountId,
-      deps.loadCreds ?? loadPersistedEnrolledCreds,
+      ...(deps.env !== undefined ? { env: deps.env } : {}),
+      ...(deps.readFile !== undefined ? { readFile: deps.readFile } : {}),
+    });
+    let credentialLoad: BoundCredentialLoadResult | undefined;
+    if (source.mode === "enrolled") {
+      if (deps.loadCreds) {
+        const injected = deps.loadCreds(accountId);
+        credentialLoad = injected
+          ? {
+              status: "match",
+              document: {} as never,
+              credentials: injected,
+            }
+          : { status: "absent" };
+      } else {
+        credentialLoad = loadPersistedCredentialDocument({
+          tenant: plan.tenant,
+          accountId,
+          saasBaseUrl: source.saasBaseUrl,
+        });
+      }
+      if (credentialLoad.status !== "match") {
+        return {
+          ok: false,
+          error: credentialLoad.status === "absent"
+            ? `no enrolled credentials for ${accountId}`
+            : formatCredentialInspection(credentialLoad),
+          accountId,
+          admission: "register-hop",
+        };
+      }
+    }
+    const getPersisted = createMemoizedPersistedAccessor(
+      () => credentialLoad?.status === "match"
+        ? credentialLoad.credentials
+        : undefined,
     );
     let preparedAuth;
     try {
       preparedAuth = prepareAccountAuth({
         plan,
         getPersisted,
+        ...(source.mode === "enrolled"
+          ? { effectiveSaasBaseUrl: source.saasBaseUrl }
+          : {}),
         ...(top.saas?.baseUrl !== undefined ? { topLevelSaasBaseUrl: top.saas.baseUrl } : {}),
       });
     } catch (err) {
@@ -347,7 +426,7 @@ export async function probeWebchannelAccount(params: {
       accountId,
       ...(deps.env !== undefined ? { env: deps.env } : {}),
       ...(deps.readFile !== undefined ? { readFile: deps.readFile } : {}),
-      loadCreds: () => getPersisted(),
+      ...(credentialLoad ? { loadCreds: () => credentialLoad! } : {}),
     });
     // Register-hop is the only admission path; the probe reports it verbatim.
     const admission = "register-hop" as const;

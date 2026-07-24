@@ -57,16 +57,23 @@ describe("index-nats.ts wiring contract — typing gate (P0-6)", () => {
 });
 
 describe("index-nats.ts wiring contract — account-bound auth and startup", () => {
-  it("prepares one immutable account-bound verifier before credential I/O", () => {
-    expect(RUNTIME_SOURCE).toContain("createMemoizedPersistedAccessor(accountId)");
+  it("validates the full credential document before verifier or connector use", () => {
+    expect(RUNTIME_SOURCE).toContain("createMemoizedPersistedAccessor(");
     expect(RUNTIME_SOURCE).toContain("accountAuth = prepareAccountAuth(");
     expect(RUNTIME_SOURCE).not.toContain("resolveEffectiveAccountAuth");
     expect(RUNTIME_SOURCE).not.toContain("reportSharedAudiences");
     expect(RUNTIME_SOURCE).not.toContain("registerHopAudClaims");
+    expect(
+      RUNTIME_SOURCE.indexOf("credentialLoad = loadPersistedCredentialDocument("),
+    ).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth("),
+    );
     expect(RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth(")).toBeLessThan(
       RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, accountId"),
     );
-    expect(RUNTIME_SOURCE).toMatch(/loadPersisted:\s*\(\)\s*=>\s*getPersisted\(\)/);
+    expect(RUNTIME_SOURCE).toMatch(
+      /loadPersisted:\s*\(\)\s*=>\s*credentialLoad/,
+    );
   });
 
   it("wires the prepared token-only verifier and strict PoP policy", () => {
@@ -74,11 +81,22 @@ describe("index-nats.ts wiring contract — account-bound auth and startup", () 
     expect(RUNTIME_SOURCE).toMatch(/requirePoP:\s*accountAuth\.requirePoP/);
   });
 
-  it("completes JWKS readiness before installing the register subscription", () => {
+  it("confirms the register subscription before readiness or publication", () => {
     const gateB = RUNTIME_SOURCE.indexOf("accountAuth.warmJwks(signal)");
     const subscribe = RUNTIME_SOURCE.lastIndexOf("channel.subscribeRegister()");
+    const flush = RUNTIME_SOURCE.lastIndexOf("transport.flush(attemptAbort.signal)");
+    const readiness = RUNTIME_SOURCE.lastIndexOf(
+      "const readiness = formatAccountReadiness({",
+    );
+    const publication = RUNTIME_SOURCE.lastIndexOf(
+      "commitAccountPublication<AccountRuntime>",
+    );
     expect(gateB).toBeGreaterThan(-1);
     expect(subscribe).toBeGreaterThan(gateB);
+    expect(flush).toBeGreaterThan(subscribe);
+    expect(readiness).toBeGreaterThan(flush);
+    expect(publication).toBeGreaterThan(readiness);
+    expect(RUNTIME_SOURCE).toContain("if (!published) return;");
   });
 });
 
@@ -191,14 +209,27 @@ describe("index-nats.ts account lifecycle ownership", () => {
     expect(RUNTIME_SOURCE).not.toContain("accountsBuildStarted");
   });
 
-  it("builds only the host-selected account and commits register subscription last", () => {
+  it("builds only the host-selected account and publishes after the flushed register subscription", () => {
     expect(RUNTIME_SOURCE).toContain("planWebchannelAccount(api.config, ctx.accountId");
     expect(RUNTIME_SOURCE).not.toMatch(/for\s*\(const plan of plans\)/);
+    expect(
+      RUNTIME_SOURCE.indexOf("credentialLoad = loadPersistedCredentialDocument("),
+    ).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth("),
+    );
     expect(RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth(")).toBeLessThan(
       RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, accountId"),
     );
     expect(RUNTIME_SOURCE.indexOf("accountAuth.warmJwks(signal)")).toBeLessThan(
       RUNTIME_SOURCE.lastIndexOf("channel.subscribeRegister()"),
+    );
+    expect(RUNTIME_SOURCE.lastIndexOf("channel.subscribeRegister()")).toBeLessThan(
+      RUNTIME_SOURCE.lastIndexOf("transport.flush(attemptAbort.signal)"),
+    );
+    expect(
+      RUNTIME_SOURCE.lastIndexOf("transport.flush(attemptAbort.signal)"),
+    ).toBeLessThan(
+      RUNTIME_SOURCE.lastIndexOf("commitAccountPublication<AccountRuntime>"),
     );
   });
 });

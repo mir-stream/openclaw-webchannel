@@ -74,12 +74,21 @@ Revocation permanently tombstones the active identity key and only stops that sl
 
 ### Offline re-key after revocation
 
-This is intentionally an offline operation; deleting a file cannot replace credentials held by a running transport.
+This is intentionally an offline, operator-confirmed operation; moving a file
+cannot replace credentials held by a running transport.
 
 1. Stop the OpenClaw gateway.
-2. Delete the account credential file: `rm -- "$HOME/.openclaw-webchannel/<account>/credentials.json"`. If `credentialPath` is configured, delete that exact override instead.
-3. Also remove the obsolete single-file credential, if present: `rm -f -- "$HOME/.openclaw-webchannel/credentials.json"`. Readers no longer use it.
-4. Run `openclaw channels add --channel webchannel` for the account and approve the new enrollment.
-5. Restart the gateway only after enrollment completes.
+2. Move the exact account credential file
+   (`$HOME/.openclaw-webchannel/<account>/credentials.json`, or the configured
+   `credentialPath`) to a new operator-chosen backup path. Do not delete or
+   overwrite it.
+3. If the obsolete single-file credential exists at
+   `$HOME/.openclaw-webchannel/credentials.json`, archive it separately. Readers
+   do not use it.
+4. Complete the SaaS active-key replacement/revocation step required by the
+   deployment.
+5. Run `openclaw channels add --channel webchannel --account <account>` and
+   approve the new enrollment.
+6. Restart the gateway only after enrollment completes.
 
 Until the restart, an already-running transport continues using its old in-memory credentials; online hot-swap is not supported.

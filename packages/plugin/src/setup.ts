@@ -57,11 +57,15 @@ import {
   accountCredentialPath,
   assertNoRemovedAudienceConfig,
   canonicalizeAccountId,
+  loadPersistedCredentialDocument,
   readAccountsMap,
   readWebchannelSection,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
+import {
+  formatCredentialInspection,
+} from "./credential-document.js";
 import { runAddPreflight } from "./preflight.js";
 
 /**
@@ -389,18 +393,9 @@ export const webchannelSetup = {
       return;
     }
 
-    // Skip only if account-scoped creds already exist. The legacy single-file
-    // path is migration/runbook-only and is never read at runtime.
-    const existingPath = accountCredentialPath(id);
-    const { existsSync } = await import("node:fs");
-    if (existsSync(existingPath)) {
-      runtime.log(
-        `[webchannel] account "${id}" already has credentials at ${existingPath}; ` +
-          `skipping acquisition.`,
-      );
-      return;
-    }
-
+    // Resolve the COMPLETE effective identity before consulting the credential
+    // path. Path ownership alone is never proof that persisted enrollment
+    // material belongs to this configured account.
     const identity = resolveSetupIdentity(input);
     const tenant =
       identity.tenant ?? (account.tenant as string | undefined) ?? "default-tenant";
@@ -417,6 +412,40 @@ export const webchannelSetup = {
           `webchannel --account ${id} --base-url <saas-url> --url <tenant-uuid> ` +
           `(--url carries the tenant id, not a URL — the flag name is a host-CLI ` +
           `limitation; --base-url is the SaaS URL)`,
+      );
+      return;
+    }
+
+    const existingPath = accountCredentialPath(id);
+    let persisted: ReturnType<typeof loadPersistedCredentialDocument>;
+    try {
+      persisted = loadPersistedCredentialDocument({
+        tenant,
+        accountId: id,
+        saasBaseUrl,
+      });
+    } catch {
+      runtime.log(
+        `[webchannel] account "${id}": effective tenant/account/SaaS identity is ` +
+          `invalid; refusing credential reuse or enrollment. Correct the account ` +
+          `configuration, then re-run channels add.`,
+      );
+      return;
+    }
+    if (persisted.status === "match") {
+      runtime.log(
+        `[webchannel] account "${id}" has complete matching v2 credentials at ` +
+          `${existingPath}; skipping acquisition.`,
+      );
+      return;
+    }
+    if (persisted.status !== "absent") {
+      runtime.log(
+        `[webchannel] account "${id}": refusing to reuse or replace persisted ` +
+          `credentials (${formatCredentialInspection(persisted)}). Stop the gateway, ` +
+          `archive ${existingPath} to a new backup path, complete any SaaS active-key ` +
+          `replacement required by your deployment, then re-run: openclaw channels add ` +
+          `--channel webchannel --account ${id}`,
       );
       return;
     }

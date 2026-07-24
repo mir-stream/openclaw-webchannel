@@ -9,7 +9,7 @@
 
 import { createHash } from "node:crypto";
 
-import { assertValidAccountId } from "./account-config.js";
+import { assertValidAccountId } from "./account-id.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 
 export const STORAGE_IDENTITY_VERSION = 2 as const;

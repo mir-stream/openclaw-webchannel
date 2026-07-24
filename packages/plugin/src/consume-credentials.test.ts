@@ -1,7 +1,32 @@
 import { describe, it, expect, vi } from "vitest";
 
 import { consumeCredentialSource, resolveDialMaterial } from "./consume-credentials.js";
+import type {
+  BoundCredentialDocument,
+  BoundCredentialLoadResult,
+  PersistedEnrolledCreds,
+} from "./credential-document.js";
 import type { NatsCredentialSource } from "./nats-credential-source.js";
+
+const identityKey = {
+  publicKey: new Uint8Array(32).fill(1),
+  privateKey: new Uint8Array(32).fill(2),
+};
+
+function matching(
+  overrides: Partial<PersistedEnrolledCreds> = {},
+): BoundCredentialLoadResult {
+  return {
+    status: "match",
+    document: {} as BoundCredentialDocument,
+    credentials: {
+      userJwt: "JWT",
+      userSeed: "SEED",
+      identityKey,
+      ...overrides,
+    },
+  };
+}
 
 describe("consumeCredentialSource", () => {
   it("enrolled + persisted creds → connects via the static path (NO enroll)", async () => {
@@ -25,7 +50,7 @@ describe("consumeCredentialSource", () => {
       transportFactory,
       createEnrolled,
       makeSigner: () => async () => "sig",
-      loadPersisted: () => ({ userJwt: "JWT", userSeed: "SEED" }),
+      loadPersisted: () => matching(),
     });
 
     expect(result.status).toBe("connected");
@@ -57,9 +82,7 @@ describe("consumeCredentialSource", () => {
     const result = await consumeCredentialSource(source, "acctA", {
       transportFactory,
       makeSigner: () => async () => "sig",
-      loadPersisted: () => ({
-        userJwt: "JWT",
-        userSeed: "SEED",
+      loadPersisted: () => matching({
         natsUrl: "wss://saas-delivered-relay", // delivered with the minted creds
       }),
     });
@@ -79,10 +102,6 @@ describe("consumeCredentialSource", () => {
 
   it("F2: enrolled + persisted identityKey → surfaced on the connected result", async () => {
     const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}), connected: true }) as never);
-    const identityKey = {
-      publicKey: new Uint8Array(32).fill(1),
-      privateKey: new Uint8Array(32).fill(2),
-    };
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
@@ -93,14 +112,14 @@ describe("consumeCredentialSource", () => {
     const result = await consumeCredentialSource(source, "acctA", {
       transportFactory,
       makeSigner: () => async () => "sig",
-      loadPersisted: () => ({ userJwt: "JWT", userSeed: "SEED", identityKey }),
+      loadPersisted: () => matching({ identityKey }),
     });
     expect(result.status).toBe("connected");
     if (result.status === "connected") expect(result.identityKey).toBe(identityKey);
   });
 
-  it("F2: enrolled without a persisted identityKey → connected result omits identityKey", async () => {
-    const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}), connected: true }) as never);
+  it("rejects a binding mismatch before constructing a connector", async () => {
+    const transportFactory = vi.fn();
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
@@ -110,11 +129,20 @@ describe("consumeCredentialSource", () => {
     };
     const result = await consumeCredentialSource(source, "acctA", {
       transportFactory,
-      makeSigner: () => async () => "sig",
-      loadPersisted: () => ({ userJwt: "JWT", userSeed: "SEED" }),
+      loadPersisted: () => ({
+        status: "mismatch",
+        fields: ["storage.tenant"],
+      }),
     });
-    expect(result.status).toBe("connected");
-    if (result.status === "connected") expect(result.identityKey).toBeUndefined();
+    expect(result).toEqual({
+      status: "creds-binding-failed",
+      accountId: "acctA",
+      failure: {
+        status: "mismatch",
+        fields: ["storage.tenant"],
+      },
+    });
+    expect(transportFactory).not.toHaveBeenCalled();
   });
 
   it("enrolled + missing creds → creds-missing (no connect, no enroll)", async () => {
@@ -131,7 +159,7 @@ describe("consumeCredentialSource", () => {
     const result = await consumeCredentialSource(source, "acctMissing", {
       transportFactory,
       createEnrolled,
-      loadPersisted: () => undefined,
+      loadPersisted: () => ({ status: "absent" }),
     });
 
     expect(result).toEqual({ status: "creds-missing", accountId: "acctMissing" });
@@ -169,13 +197,34 @@ describe("resolveDialMaterial (probe-safe)", () => {
   });
 
   it("prefers delivered relay URL and uses configured fallback", () => {
-    const enrolled = (natsUrl?: string) => resolveDialMaterial({ ...base, natsConfig: { url: "ws://configured" }, loadCreds: () => ({ userJwt: "J", userSeed: "S", ...(natsUrl ? { natsUrl } : {}) }) });
+    const enrolled = (natsUrl?: string) => resolveDialMaterial({
+      ...base,
+      natsConfig: { url: "ws://configured" },
+      loadCreds: () => matching({
+        userJwt: "J",
+        userSeed: "S",
+        ...(natsUrl ? { natsUrl } : {}),
+      }),
+    });
     expect(enrolled("wss://delivered")).toMatchObject({ status: "ok", dial: { url: "wss://delivered" } });
     expect(enrolled()).toMatchObject({ status: "ok", dial: { url: "ws://configured" } });
   });
 
-  it("maps absent or malformed persisted creds to creds-missing and resolver throws to invalid", () => {
-    expect(resolveDialMaterial({ ...base, loadCreds: () => undefined })).toEqual({ status: "creds-missing", accountId: "a" });
+  it("maps absent persisted creds to creds-missing and resolver throws to invalid", () => {
+    expect(resolveDialMaterial({ ...base, loadCreds: () => ({ status: "absent" }) })).toEqual({ status: "creds-missing", accountId: "a" });
     expect(resolveDialMaterial({ ...base, natsConfig: { credentials: { mode: "static", userJwt: "J" } } })).toMatchObject({ status: "invalid" });
+  });
+
+  it("keeps a binding failure distinct from missing material before probe dial", () => {
+    expect(resolveDialMaterial({
+      ...base,
+      loadCreds: () => ({
+        status: "unbound",
+      }),
+    })).toEqual({
+      status: "creds-binding-failed",
+      accountId: "a",
+      failure: { status: "unbound" },
+    });
   });
 });

@@ -89,6 +89,7 @@ export async function acquireCredentials(
   const factory =
     options._clientFactory ?? ((opts) => new EnrollmentClient(opts));
   const client = factory({
+    saasBaseUrl,
     saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
     saasPollUrl: `${saasBaseUrl}/api/poll`,
     tenant: options.tenant,

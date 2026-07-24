@@ -186,6 +186,11 @@ export type NatsMessage = {
   payload: Buffer;
 };
 
+type FlushWaiter = {
+  socket: WebSocket;
+  settle: (error?: Error) => void;
+};
+
 // ---------------------------------------------------------------------------
 // NatsTransport
 // ---------------------------------------------------------------------------
@@ -242,6 +247,8 @@ export class NatsTransport extends EventEmitter {
   private shutdownPromise: Promise<TransportCloseReport> | undefined;
   private retainedSocket: WebSocket | null = null;
   private readonly socketCleanup = new WeakMap<WebSocket, () => void>();
+  /** In-order PING/PONG barriers used to prove server command admission. */
+  private readonly flushWaiters: FlushWaiter[] = [];
 
   constructor(options: NatsConnectOptions) {
     super();
@@ -368,6 +375,7 @@ export class NatsTransport extends EventEmitter {
       };
       const protocolViolation = (reason: string): void => {
         const err = new NatsServerError("protocol-error", `protocol violation: ${reason}`);
+        this.rejectFlushesForSocket(ws, err);
         // During the handshake the rejection IS the signal (mirrors the -ERR
         // branch): reject the connect() promise WITHOUT also emitting 'error',
         // which — with no listener attached yet — Node would rethrow as an
@@ -460,6 +468,7 @@ export class NatsTransport extends EventEmitter {
           // guard: after disconnect() (ws → null) or a newer connect(), this
           // is a STALE socket's error — it must not touch the live state.
           this._connected = false;
+          this.rejectFlushesForSocket(ws, err);
           this.emitError(err);
         }
       };
@@ -475,6 +484,7 @@ export class NatsTransport extends EventEmitter {
 
       const onClose = (code: number = 1005, reason?: Buffer) => {
         const closeCause = new NatsConnectionClosedError(code, (reason?.length ?? 0) > 0);
+        this.rejectFlushesForSocket(ws, closeCause);
         // If the socket closed before the handshake completed, the promise
         // is still pending — reject it. Always settle OUR OWN dial's promise,
         // even if the transport has since moved on to a newer socket.
@@ -576,6 +586,7 @@ export class NatsTransport extends EventEmitter {
         // overlapping connect() calls must each settle on their own first PONG.
         onFirstPong();
         if (this.ws !== ws) return Buffer.alloc(0);
+        this.resolveNextFlushForSocket(ws);
         continue;
       }
 
@@ -644,6 +655,7 @@ export class NatsTransport extends EventEmitter {
         } else {
           // Post-handshake NATS error (e.g. Permissions Violation for Publish/
           // Subscription) — emit to registered listeners so callers can react.
+          this.rejectFlushesForSocket(ws, err);
           this.emitError(err, ws);
           if (this.ws !== ws) return Buffer.alloc(0);
         }
@@ -682,6 +694,56 @@ export class NatsTransport extends EventEmitter {
     this.subs.set(sid, subject);
     this.ws!.send(`SUB ${subject} ${sid}\r\n`);
     return sid;
+  }
+
+  /**
+   * Wait until the server has processed every command sent before this call.
+   *
+   * NATS processes a connection in order, so SUB + PING followed by PONG proves
+   * the subscription command reached the server. A permissions `-ERR` delivered
+   * before that PONG rejects the barrier, allowing startup to remain private.
+   */
+  flush(signal?: AbortSignal): Promise<void> {
+    this.assertOpen();
+    if (signal?.aborted) return Promise.reject(new NatsLifecycleAbortError());
+    const socket = this.ws!;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const remove = () => {
+        const index = this.flushWaiters.indexOf(waiter);
+        if (index >= 0) this.flushWaiters.splice(index, 1);
+        signal?.removeEventListener("abort", onAbort);
+        if (timer) clearTimeout(timer);
+      };
+      const waiter: FlushWaiter = {
+        socket,
+        settle: (error) => {
+          if (settled) return;
+          settled = true;
+          remove();
+          if (error) reject(error);
+          else resolve();
+        },
+      };
+      const onAbort = () => waiter.settle(new NatsLifecycleAbortError());
+      this.flushWaiters.push(waiter);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (this.handshakeTimeoutMs > 0) {
+        timer = setTimeout(
+          () => waiter.settle(new NatsHandshakeTimeoutError("flush PONG")),
+          this.handshakeTimeoutMs,
+        );
+        if (typeof timer.unref === "function") timer.unref();
+      }
+      try {
+        socket.send("PING\r\n");
+      } catch (error) {
+        waiter.settle(
+          error instanceof Error ? error : new Error("NATS flush send failed"),
+        );
+      }
+    });
   }
 
   /**
@@ -767,6 +829,12 @@ export class NatsTransport extends EventEmitter {
     this._connected = false;
     this.subs.clear();
     const socket = this.ws ?? this.retainedSocket;
+    if (socket) {
+      this.rejectFlushesForSocket(
+        socket,
+        new NatsConnectionClosedError(1005, false),
+      );
+    }
     this.retainedSocket = socket;
     this.ws = null;
     this.shutdownPromise = this.confirmSocketClosed(socket, graceMs, forceMs).catch(() => ({
@@ -1008,6 +1076,19 @@ export class NatsTransport extends EventEmitter {
   private assertOpen(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error("NatsTransport: not connected — call connect() first");
+    }
+  }
+
+  private resolveNextFlushForSocket(socket: WebSocket): void {
+    const waiter = this.flushWaiters.find(
+      (candidate) => candidate.socket === socket,
+    );
+    waiter?.settle();
+  }
+
+  private rejectFlushesForSocket(socket: WebSocket, error: Error): void {
+    for (const waiter of [...this.flushWaiters]) {
+      if (waiter.socket === socket) waiter.settle(error);
     }
   }
 

@@ -44,6 +44,8 @@ import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   accountCredentialPath,
   canonicalizeAccountId,
+  loadPersistedCredentialDocument,
+  resolveAcquisitionIdentity,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { webchannelSetup } from "./setup.js";
@@ -98,9 +100,22 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       const account = resolveWebchannelAccountConfig(cfg, id);
       const hasJwt = Boolean((account.auth as { jwt?: unknown } | undefined)?.jwt);
       if (hasJwt) return true;
-      // Enrolled creds on disk also count as configured (the account is usable
-      // under admission=register-hop even before jwt auth is fully wired).
-      return existsSync(accountCredentialPath(id));
+      // A path by itself is not readiness. Count enrolled material only when
+      // its complete v2 identity matches the effective configured account.
+      if (!existsSync(accountCredentialPath(id))) return false;
+      const identity = resolveAcquisitionIdentity(cfg, id);
+      if (!identity.saasBaseUrl) return false;
+      try {
+        return loadPersistedCredentialDocument({
+          tenant: identity.tenant,
+          accountId: id,
+          saasBaseUrl: identity.saasBaseUrl,
+        }).status === "match";
+      } catch {
+        // Invalid effective identity is unconfigured; status inspection must not
+        // turn malformed config into an uncaught wizard failure.
+        return false;
+      }
     },
     resolveStatusLines: ({ cfg, accountId, configured }) => {
       const id = canonicalizeAccountId(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
