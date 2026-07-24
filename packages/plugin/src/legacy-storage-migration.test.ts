@@ -32,7 +32,10 @@ import {
   legacyTuplePaths,
   tupleStoragePaths,
 } from "./storage-paths.js";
-import { createStorageIdentityV2 } from "./storage-identity.js";
+import {
+  createCredentialBindingIdentityV2,
+  createStorageIdentityV2,
+} from "./storage-identity.js";
 import { StorageDocumentError } from "./storage-document.js";
 
 const SCOPE = { tenant: "tenant-A", accountId: "shared-account" };
@@ -195,6 +198,99 @@ describe("legacy tuple storage migration", () => {
     expect(Buffer.from(restarted.getOrCreate("same-peer"))).toEqual(LEGACY_K);
   });
 
+  it("preserves a matching explicit credential identity instead of rebinding it", () => {
+    const candidate = legacyCredential();
+    const explicitIdentity = createCredentialBindingIdentityV2({
+      storage: SCOPE,
+      binding: {
+        saasBaseUrl: "https://preserved.example",
+        deliveredIssuer: "https://preserved-issuer.example",
+        relayUrl: "wss://preserved-relay.example/socket",
+        agentPublicKey: PUBLIC_KEY,
+      },
+    });
+    candidate.credentialIdentity = explicitIdentity;
+
+    const upgraded = upgradeLegacyCredentialDocument(SCOPE, candidate);
+
+    expect(upgraded.credentialIdentity).toBe(explicitIdentity);
+    expect(upgraded.credentialIdentity.binding.saasBaseUrl).toBe(
+      "https://preserved.example",
+    );
+  });
+
+  it("rejects a foreign explicit credential identity before any migration mutation", () => {
+    const legacy = writeLegacyState();
+    const candidate = legacyCredential(SCOPE, "TOP-SECRET");
+    candidate.credentialIdentity = createCredentialBindingIdentityV2({
+      storage: OTHER_SCOPE,
+      binding: {
+        saasBaseUrl: "https://foreign.example",
+        deliveredIssuer: null,
+        relayUrl: null,
+        agentPublicKey: PUBLIC_KEY,
+      },
+    });
+    const credentialBefore = Buffer.from(JSON.stringify(candidate, null, 2));
+    writeFileSync(legacy.credentialPath, credentialBefore, { mode: 0o600 });
+    const keysBefore = readFileSync(legacy.conversationKeyPath);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+
+    let thrown: unknown;
+    try {
+      migrateLegacyTupleState({ ...SCOPE, home });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({
+      code: "identity-mismatch",
+      fields: expect.arrayContaining(["storage.tenant"]),
+    });
+    expect(String(thrown)).not.toContain("TOP-SECRET");
+    expect(readFileSync(legacy.credentialPath)).toEqual(credentialBefore);
+    expect(readFileSync(legacy.conversationKeyPath)).toEqual(keysBefore);
+    expect(existsSync(legacy.directory)).toBe(true);
+    expect(existsSync(destination.credentialPath)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
+  it("rejects a foreign identity marker in v1 keys before any migration mutation", () => {
+    const legacy = writeLegacyState();
+    const credentialBefore = readFileSync(legacy.credentialPath);
+    const keysBefore = Buffer.from(
+      JSON.stringify(
+        {
+          version: 1,
+          storageIdentity: createStorageIdentityV2(OTHER_SCOPE),
+          keys: { "same-peer": LEGACY_K.toString("base64url") },
+        },
+        null,
+        2,
+      ),
+    );
+    writeFileSync(legacy.conversationKeyPath, keysBefore, { mode: 0o600 });
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+
+    let thrown: unknown;
+    try {
+      migrateLegacyTupleState({ ...SCOPE, home });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({
+      code: "identity-mismatch",
+      fields: expect.arrayContaining(["storage.tenant"]),
+    });
+    expect(String(thrown)).not.toContain(LEGACY_K.toString("base64url"));
+    expect(readFileSync(legacy.credentialPath)).toEqual(credentialBefore);
+    expect(readFileSync(legacy.conversationKeyPath)).toEqual(keysBefore);
+    expect(existsSync(legacy.directory)).toBe(true);
+    expect(existsSync(destination.credentialPath)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
   it("quarantines an ownership-ambiguous v1 key without adopting it", () => {
     const legacy = writeLegacyState(SCOPE, { credential: false });
     chmodSync(legacy.directory, 0o755);
@@ -279,7 +375,7 @@ describe("legacy tuple storage migration", () => {
     expect(migrateLegacyTupleState({ ...SCOPE, home }).status).toBe("migrated");
   });
 
-  it("fails closed on a competing incomplete claim without mutating the source", () => {
+  it("fails closed on an exact-account competing incomplete claim without mutating the source", () => {
     const legacy = writeLegacyState();
     const before = readFileSync(legacy.credentialPath);
     const foreign = tupleStoragePaths({ ...OTHER_SCOPE, home });
@@ -306,6 +402,35 @@ describe("legacy tuple storage migration", () => {
     );
     expect(readFileSync(legacy.credentialPath)).toEqual(before);
     expect(existsSync(legacy.directory)).toBe(true);
+  });
+
+  it("does not alias a longer account id or malformed name during claim discovery", () => {
+    const scope = { tenant: "tenant-A", accountId: "acct" };
+    const longerScope = { tenant: "tenant-B", accountId: "acct--blue" };
+    const legacy = writeLegacyState(scope);
+    const longer = tupleStoragePaths({ ...longerScope, home });
+    const backupRoot = join(legacy.root, ".legacy-v1-backups");
+    const longerClaim = join(
+      backupRoot,
+      `${longerScope.accountId}--${longer.namespaceId}`,
+    );
+    mkdirSync(longerClaim, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(longerClaim, "migration-claim.json"),
+      JSON.stringify({
+        version: 2,
+        storageIdentity: createStorageIdentityV2(longerScope),
+        ownerPid: process.pid,
+      }),
+      { mode: 0o600 },
+    );
+    mkdirSync(join(backupRoot, `${scope.accountId}--v2_short`), {
+      recursive: true,
+      mode: 0o700,
+    });
+
+    expect(migrateLegacyTupleState({ ...scope, home }).status).toBe("migrated");
+    expect(existsSync(longerClaim)).toBe(true);
   });
 
   it("permits only one of two concurrent process claims to migrate", async () => {
@@ -396,13 +521,117 @@ describe("legacy tuple storage migration", () => {
       }),
       { mode: 0o600 },
     );
-    renameSync(legacy.directory, join(claim, "source"));
+    const source = join(claim, "source");
+    renameSync(legacy.directory, source);
+    const sourceCredential = join(source, "credentials.json");
+    const sourceConversation = join(source, "conversation-keys.json");
+    chmodSync(source, 0o755);
+    chmodSync(sourceCredential, 0o644);
+    chmodSync(sourceConversation, 0o646);
 
     expect(migrateLegacyTupleState({ ...SCOPE, home }).status).toBe("resumed");
     expect(existsSync(destination.credentialPath)).toBe(true);
     expect(existsSync(destination.conversationKeyPath)).toBe(true);
     expect(existsSync(join(claim, "migration-complete.json"))).toBe(true);
+    expect(statSync(source).mode & 0o777).toBe(0o700);
+    expect(statSync(sourceCredential).mode & 0o777).toBe(0o600);
+    expect(statSync(sourceConversation).mode & 0o777).toBe(0o600);
   });
+
+  it.each(["credentials", "conversation-keys"] as const)(
+    "rejects a foreign %s marker in a claimed archive before changing source modes",
+    (foreignDocument) => {
+      const legacy = writeLegacyState();
+      const destination = tupleStoragePaths({ ...SCOPE, home });
+      const claim = join(
+        legacy.root,
+        ".legacy-v1-backups",
+        `${SCOPE.accountId}--${destination.namespaceId}`,
+      );
+      mkdirSync(claim, { recursive: true, mode: 0o700 });
+      writeFileSync(
+        join(claim, "migration-claim.json"),
+        JSON.stringify({
+          version: 2,
+          storageIdentity: createStorageIdentityV2(SCOPE),
+          ownerPid: process.pid,
+        }),
+        { mode: 0o600 },
+      );
+
+      if (foreignDocument === "credentials") {
+        const candidate = legacyCredential(SCOPE, "RESUME-SECRET");
+        candidate.credentialIdentity = createCredentialBindingIdentityV2({
+          storage: OTHER_SCOPE,
+          binding: {
+            saasBaseUrl: "https://foreign.example",
+            deliveredIssuer: null,
+            relayUrl: null,
+            agentPublicKey: PUBLIC_KEY,
+          },
+        });
+        writeFileSync(
+          legacy.credentialPath,
+          JSON.stringify(candidate, null, 2),
+        );
+      } else {
+        writeFileSync(
+          legacy.conversationKeyPath,
+          JSON.stringify(
+            {
+              version: 1,
+              storageIdentity: createStorageIdentityV2(OTHER_SCOPE),
+              keys: {
+                "same-peer": LEGACY_K.toString("base64url"),
+              },
+            },
+            null,
+            2,
+          ),
+        );
+      }
+
+      const source = join(claim, "source");
+      renameSync(legacy.directory, source);
+      const sourceCredential = join(source, "credentials.json");
+      const sourceConversation = join(source, "conversation-keys.json");
+      chmodSync(source, 0o755);
+      chmodSync(sourceCredential, 0o644);
+      chmodSync(sourceConversation, 0o646);
+      const credentialBefore = readFileSync(sourceCredential);
+      const conversationBefore = readFileSync(sourceConversation);
+      const modesBefore = {
+        source: statSync(source).mode & 0o777,
+        credential: statSync(sourceCredential).mode & 0o777,
+        conversation: statSync(sourceConversation).mode & 0o777,
+      };
+
+      let thrown: unknown;
+      try {
+        migrateLegacyTupleState({ ...SCOPE, home });
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toMatchObject({
+        code: "identity-mismatch",
+        document: foreignDocument,
+        fields: expect.arrayContaining(["storage.tenant"]),
+      });
+      expect(String(thrown)).not.toContain("RESUME-SECRET");
+      expect(existsSync(source)).toBe(true);
+      expect(readFileSync(sourceCredential)).toEqual(credentialBefore);
+      expect(readFileSync(sourceConversation)).toEqual(conversationBefore);
+      expect({
+        source: statSync(source).mode & 0o777,
+        credential: statSync(sourceCredential).mode & 0o777,
+        conversation: statSync(sourceConversation).mode & 0o777,
+      }).toEqual(modesBefore);
+      expect(existsSync(destination.credentialPath)).toBe(false);
+      expect(existsSync(destination.conversationKeyPath)).toBe(false);
+      expect(existsSync(join(claim, "migration-complete.json"))).toBe(false);
+    },
+  );
 
   it("atomically takes over a dead same-tuple claim while preserving it", () => {
     writeLegacyState();

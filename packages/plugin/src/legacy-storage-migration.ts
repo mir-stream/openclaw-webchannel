@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import {
+  CREDENTIAL_IDENTITY_FIELD,
   assertCredentialDocumentStorage,
   legacyCredentialProvesScope,
   parseCredentialJson,
@@ -46,6 +47,8 @@ const BACKUP_DIRECTORY_NAME = ".legacy-v1-backups";
 const CLAIM_FILE_NAME = "migration-claim.json";
 const SOURCE_DIRECTORY_NAME = "source";
 const COMPLETE_FILE_NAME = "migration-complete.json";
+const STORAGE_NAMESPACE_ID_LENGTH = "v2_".length + 43;
+const STORAGE_NAMESPACE_ID_PATTERN = /^v2_[A-Za-z0-9_-]{43}$/;
 
 type ClaimFile = {
   version: 2;
@@ -142,8 +145,16 @@ export function migrateLegacyTupleState(
     });
   }
 
+  const legacyConversationExists = existsSync(legacy.conversationKeyPath);
+  const legacyKeys = legacyConversationExists
+    ? readLegacyConversationKeys(
+        legacy.conversationKeyPath,
+        destination.scope,
+      )
+    : null;
+
   if (liveCredential.status !== "owned") {
-    if (!existsSync(legacy.conversationKeyPath)) {
+    if (!legacyConversationExists) {
       return Object.freeze({
         status: "not-needed",
         credential: "absent",
@@ -190,26 +201,6 @@ export function migrateLegacyTupleState(
 
   // Validate and transform every candidate before the first mutation.
   const upgradedCredential = liveCredential.upgraded;
-  let legacyKeys: Map<string, Uint8Array> | null = null;
-  if (existsSync(legacy.conversationKeyPath)) {
-    let serialized: string;
-    try {
-      serialized = readFileSync(legacy.conversationKeyPath, "utf8");
-    } catch {
-      throw new StorageDocumentError(
-        "conversation-keys",
-        "legacy-migration-failed",
-      );
-    }
-    try {
-      legacyKeys = parseLegacyConversationKeyDocument(serialized);
-    } catch {
-      // The recoverable directory backup retains the candidate, but malformed
-      // key material is never adopted into a v2 tuple.
-      legacyKeys = null;
-    }
-  }
-
   assertDestinationsCompatible(
     destination.scope,
     credentialDestination,
@@ -253,39 +244,29 @@ function migrateProvenArchive(input: {
     "conversation-keys.json",
   );
 
-  hardenArchivedSource(
-    input.sourceDirectory,
-    sourceCredentialPath,
-    sourceConversationPath,
-  );
-
   let upgradedCredential: ReturnType<typeof upgradeLegacyCredentialDocument>;
   try {
     upgradedCredential = upgradeLegacyCredentialDocument(
       input.scope,
       parseCredentialJson(readFileSync(sourceCredentialPath, "utf8")),
     );
-  } catch {
+  } catch (error) {
+    if (isStorageIdentityError(error)) throw error;
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
   }
 
-  let legacyKeys: Map<string, Uint8Array> | null = null;
-  if (existsSync(sourceConversationPath)) {
-    let serialized: string;
-    try {
-      serialized = readFileSync(sourceConversationPath, "utf8");
-    } catch {
-      throw new StorageDocumentError(
-        "conversation-keys",
-        "legacy-migration-failed",
-      );
-    }
-    try {
-      legacyKeys = parseLegacyConversationKeyDocument(serialized);
-    } catch {
-      legacyKeys = null;
-    }
-  }
+  const legacyKeys = existsSync(sourceConversationPath)
+    ? readLegacyConversationKeys(sourceConversationPath, input.scope)
+    : null;
+
+  // The 0700 claim directory already protects the archived material. Validate
+  // every authoritative identity before changing source metadata, then harden
+  // the archive before either destination can be published.
+  hardenArchivedSource(
+    input.sourceDirectory,
+    sourceCredentialPath,
+    sourceConversationPath,
+  );
 
   try {
     publishCredential(
@@ -374,7 +355,11 @@ function inspectLegacyCredential(
   } catch {
     return { status: "invalid" };
   }
-  if (!legacyCredentialProvesScope(scope, parsed)) {
+  const hasExplicitIdentity = Object.prototype.hasOwnProperty.call(
+    parsed,
+    CREDENTIAL_IDENTITY_FIELD,
+  );
+  if (!hasExplicitIdentity && !legacyCredentialProvesScope(scope, parsed)) {
     const hasScopeLabels =
       typeof parsed.tenant === "string" &&
       typeof parsed.accountId === "string";
@@ -385,9 +370,45 @@ function inspectLegacyCredential(
       status: "owned",
       upgraded: upgradeLegacyCredentialDocument(scope, parsed),
     };
-  } catch {
+  } catch (error) {
+    if (isStorageIdentityError(error)) throw error;
     return { status: "invalid" };
   }
+}
+
+function readLegacyConversationKeys(
+  path: string,
+  scope: StorageIdentityV2["storage"],
+): Map<string, Uint8Array> | null {
+  let serialized: string;
+  try {
+    serialized = readFileSync(path, "utf8");
+  } catch {
+    throw new StorageDocumentError(
+      "conversation-keys",
+      "legacy-migration-failed",
+    );
+  }
+  try {
+    return parseLegacyConversationKeyDocument(scope, serialized);
+  } catch (error) {
+    if (isStorageIdentityError(error)) throw error;
+    // Ordinary malformed key material is retained in the recoverable archive
+    // but never adopted into a v2 tuple.
+    return null;
+  }
+}
+
+function isStorageIdentityError(
+  error: unknown,
+): error is StorageDocumentError {
+  return (
+    error instanceof StorageDocumentError &&
+    (error.code === "identity-unbound" ||
+      error.code === "identity-incomplete" ||
+      error.code === "identity-invalid" ||
+      error.code === "identity-mismatch")
+  );
 }
 
 function claimMigration(
@@ -529,7 +550,6 @@ function assertNoLiveForeignClaim(
   ownClaimDirectory: string,
 ): void {
   if (!existsSync(backupRoot)) return;
-  const prefix = `${accountId}--`;
   let entries: Dirent[];
   try {
     entries = readdirSync(backupRoot, { withFileTypes: true });
@@ -537,12 +557,35 @@ function assertNoLiveForeignClaim(
     throw new StorageDocumentError("credentials", "storage-io-failed");
   }
   for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
+    if (
+      !entry.isDirectory() ||
+      claimDirectoryAccountId(entry.name) !== accountId
+    ) {
+      continue;
+    }
     const candidate = join(backupRoot, entry.name);
     if (candidate === ownClaimDirectory) continue;
     if (existsSync(join(candidate, COMPLETE_FILE_NAME))) continue;
     throw new StorageDocumentError("credentials", "legacy-claim-conflict");
   }
+}
+
+/**
+ * Decode the existing `<accountId>--<v2 namespace>` claim naming without using
+ * a prefix match. The fixed namespace length makes the final separator
+ * unambiguous even when a valid account id itself contains `--`.
+ */
+function claimDirectoryAccountId(name: string): string | undefined {
+  const separatorIndex = name.length - STORAGE_NAMESPACE_ID_LENGTH - 2;
+  if (
+    separatorIndex <= 0 ||
+    name.slice(separatorIndex, separatorIndex + 2) !== "--"
+  ) {
+    return undefined;
+  }
+  const namespaceId = name.slice(separatorIndex + 2);
+  if (!STORAGE_NAMESPACE_ID_PATTERN.test(namespaceId)) return undefined;
+  return name.slice(0, separatorIndex);
 }
 
 function verifyExistingDestinations(

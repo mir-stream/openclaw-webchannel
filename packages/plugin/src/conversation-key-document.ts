@@ -48,9 +48,24 @@ export function parseConversationKeyDocument(
 }
 
 export function parseLegacyConversationKeyDocument(
+  scope: StorageScopeIdentity,
   serialized: string,
 ): Map<string, Uint8Array> {
   const document = parseRecord(serialized);
+  if (
+    Object.prototype.hasOwnProperty.call(
+      document,
+      CONVERSATION_KEY_IDENTITY_FIELD,
+    )
+  ) {
+    // A v1 envelope normally has no marker. If one is explicitly present, it is
+    // authoritative and must be checked before version or key parsing.
+    assertDocumentStorageIdentity(
+      "conversation-keys",
+      scope,
+      document[CONVERSATION_KEY_IDENTITY_FIELD],
+    );
+  }
   if (document.version !== LEGACY_CONVERSATION_KEY_DOCUMENT_VERSION) {
     throw new StorageDocumentError("conversation-keys", "invalid-document");
   }
