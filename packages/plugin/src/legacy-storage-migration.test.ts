@@ -1,6 +1,7 @@
 import {
   chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -117,6 +118,95 @@ function writeLegacyState(
 }
 
 describe("legacy tuple storage migration", () => {
+  it("rejects a symlinked legacy conversation-key file without touching its target", () => {
+    const legacy = writeLegacyState(SCOPE, { keys: false });
+    const external = join(home, "external-keys.json");
+    const externalBytes = Buffer.from("TOP-SECRET external keys");
+    writeFileSync(external, externalBytes, { mode: 0o640 });
+    chmodSync(external, 0o640);
+    symlinkSync(external, legacy.conversationKeyPath);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+
+    expect(() => migrateLegacyTupleState({ ...SCOPE, home })).toThrow(
+      expect.objectContaining({ code: "legacy-migration-failed" }),
+    );
+    expect(readFileSync(external)).toEqual(externalBytes);
+    expect(statSync(external).mode & 0o777).toBe(0o640);
+    expect(lstatSync(legacy.conversationKeyPath).isSymbolicLink()).toBe(true);
+    expect(existsSync(destination.credentialPath)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
+  it("rejects a symlinked legacy credential without touching its target", () => {
+    const legacy = writeLegacyState(SCOPE, { credential: false });
+    const external = join(home, "external-credential.json");
+    const externalBytes = Buffer.from(
+      JSON.stringify(legacyCredential(SCOPE, "TOP-SECRET"), null, 2),
+    );
+    writeFileSync(external, externalBytes, { mode: 0o640 });
+    chmodSync(external, 0o640);
+    symlinkSync(external, legacy.credentialPath);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+
+    expect(() => migrateLegacyTupleState({ ...SCOPE, home })).toThrow(
+      expect.objectContaining({ code: "legacy-migration-failed" }),
+    );
+    expect(readFileSync(external)).toEqual(externalBytes);
+    expect(statSync(external).mode & 0o777).toBe(0o640);
+    expect(lstatSync(legacy.credentialPath).isSymbolicLink()).toBe(true);
+    expect(existsSync(destination.credentialPath)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
+  it("rejects a symlinked legacy source directory without touching its target", () => {
+    const legacy = legacyTuplePaths(SCOPE.accountId, home);
+    const externalDirectory = join(home, "external-account");
+    mkdirSync(legacy.root, { recursive: true, mode: 0o700 });
+    mkdirSync(externalDirectory, { recursive: true, mode: 0o750 });
+    chmodSync(externalDirectory, 0o750);
+    const externalCredential = join(externalDirectory, "credentials.json");
+    const externalBytes = Buffer.from(
+      JSON.stringify(legacyCredential(SCOPE, "TOP-SECRET"), null, 2),
+    );
+    writeFileSync(externalCredential, externalBytes, { mode: 0o640 });
+    chmodSync(externalCredential, 0o640);
+    symlinkSync(externalDirectory, legacy.directory);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+
+    expect(() => migrateLegacyTupleState({ ...SCOPE, home })).toThrow(
+      expect.objectContaining({ code: "legacy-migration-failed" }),
+    );
+    expect(readFileSync(externalCredential)).toEqual(externalBytes);
+    expect(statSync(externalCredential).mode & 0o777).toBe(0o640);
+    expect(statSync(externalDirectory).mode & 0o777).toBe(0o750);
+    expect(lstatSync(legacy.directory).isSymbolicLink()).toBe(true);
+    expect(existsSync(destination.credentialPath)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
+  it.each(["credentials", "conversation-keys"] as const)(
+    "rejects a multiply-linked legacy %s secret",
+    (kind) => {
+      const legacy = writeLegacyState();
+      const source = kind === "credentials"
+        ? legacy.credentialPath
+        : legacy.conversationKeyPath;
+      const externalLink = join(home, `${kind}.external-link`);
+      linkSync(source, externalLink);
+      const before = readFileSync(source);
+      const destination = tupleStoragePaths({ ...SCOPE, home });
+
+      expect(() => migrateLegacyTupleState({ ...SCOPE, home })).toThrow(
+        expect.objectContaining({ code: "legacy-migration-failed" }),
+      );
+      expect(readFileSync(source)).toEqual(before);
+      expect(readFileSync(externalLink)).toEqual(before);
+      expect(statSync(source).nlink).toBe(2);
+      expect(existsSync(destination.credentialPath)).toBe(false);
+      expect(existsSync(destination.conversationKeyPath)).toBe(false);
+    },
+  );
+
   it("migrates a proven owner, verifies both destinations, and retains a recoverable backup", () => {
     const legacy = writeLegacyState();
     chmodSync(legacy.directory, 0o755);
@@ -280,6 +370,65 @@ describe("legacy tuple storage migration", () => {
     );
   });
 
+  it("rejects symlinked collocated keys for an exact credential override", () => {
+    const legacy = writeLegacyState(SCOPE, {
+      credential: false,
+      keys: false,
+    });
+    const credentialPath = join(home, "operator-managed", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const exactBytes = Buffer.from(
+      JSON.stringify(legacyCredential(SCOPE, "EXACT-SECRET"), null, 2),
+    );
+    writeFileSync(credentialPath, exactBytes, { mode: 0o640 });
+    const external = join(home, "external-keys.json");
+    const externalBytes = Buffer.from(JSON.stringify({
+      version: 1,
+      keys: { "same-peer": LEGACY_K.toString("base64url") },
+    }));
+    writeFileSync(external, externalBytes, { mode: 0o640 });
+    chmodSync(external, 0o640);
+    symlinkSync(external, legacy.conversationKeyPath);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+
+    expect(() =>
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toThrow(expect.objectContaining({ code: "legacy-migration-failed" }));
+    expect(readFileSync(credentialPath)).toEqual(exactBytes);
+    expect(readFileSync(external)).toEqual(externalBytes);
+    expect(statSync(external).mode & 0o777).toBe(0o640);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
+  it("rejects a multiply-linked exact legacy credential before claiming", () => {
+    const legacy = writeLegacyState(SCOPE, { credential: false });
+    const credentialPath = join(home, "operator-managed", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const exactBytes = Buffer.from(
+      JSON.stringify(legacyCredential(SCOPE, "EXACT-SECRET"), null, 2),
+    );
+    writeFileSync(credentialPath, exactBytes, { mode: 0o640 });
+    chmodSync(credentialPath, 0o640);
+    const externalLink = join(home, "external-credential.json");
+    linkSync(credentialPath, externalLink);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const claim = join(
+      legacy.root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+    );
+
+    expect(() =>
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toThrow(expect.objectContaining({ code: "legacy-migration-failed" }));
+    expect(readFileSync(credentialPath)).toEqual(exactBytes);
+    expect(readFileSync(externalLink)).toEqual(exactBytes);
+    expect(statSync(externalLink).mode & 0o777).toBe(0o640);
+    expect(statSync(externalLink).nlink).toBe(2);
+    expect(existsSync(claim)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
   it("resumes an exact override after the durable archival boundary", () => {
     const legacy = writeLegacyState(SCOPE, { credential: false });
     const credentialPath = join(home, "outside", "account.json");
@@ -331,6 +480,46 @@ describe("legacy tuple storage migration", () => {
     expect(
       migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
     ).toMatchObject({ status: "resumed", credential: "migrated" });
+  });
+
+  it("rejects a new exact-source hardlink on metadata-only replay", () => {
+    const legacy = legacyTuplePaths(SCOPE.accountId, home);
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const original = Buffer.from(JSON.stringify(legacyCredential(), null, 2));
+    writeFileSync(credentialPath, original, { mode: 0o640 });
+    chmodSync(credentialPath, 0o640);
+    const simulatedCrash = new Error("metadata-only crash");
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath,
+        _afterClaim: () => {
+          throw simulatedCrash;
+        },
+      }),
+    ).toThrow(simulatedCrash);
+
+    const externalLink = join(home, "external-credential.json");
+    linkSync(credentialPath, externalLink);
+    expect(() =>
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toThrow(expect.objectContaining({ code: "legacy-migration-failed" }));
+    expect(readFileSync(credentialPath)).toEqual(original);
+    expect(readFileSync(externalLink)).toEqual(original);
+    expect(statSync(credentialPath).mode & 0o777).toBe(0o640);
+    expect(statSync(externalLink).mode & 0o777).toBe(0o640);
+    expect(statSync(credentialPath).nlink).toBe(2);
+    expect(statSync(externalLink).nlink).toBe(2);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const claim = join(
+      legacy.root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+    );
+    expect(existsSync(join(claim, "exact-credentials.json"))).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
   });
 
   it("rejects an in-place exact rewrite after a metadata-only crash", () => {
