@@ -233,8 +233,8 @@ describe("evaluateWebchannelDoctor findings", () => {
       },
     }), {
       env: {},
-      loadPersistedEnrolledCreds: (accountId) => {
-        assertValidAccountId(accountId);
+      loadPersistedEnrolledCreds: (scope) => {
+        assertValidAccountId(scope.accountId);
         return persisted;
       },
     });
@@ -264,7 +264,9 @@ describe("status probe", () => {
 
   it("probes a healthy target without planning an invalid sibling", async () => {
     const dial = vi.fn(async () => ({ ok: true as const }));
-    const loadCreds = vi.fn((_accountId: string) => persisted);
+    const loadCreds = vi.fn(
+      (_scope: { tenant: string; accountId: string }) => persisted,
+    );
     const result = await probeWebchannelAccount(
       {
         account: { accountId: "good" },
@@ -288,7 +290,9 @@ describe("status probe", () => {
     expect(dial).toHaveBeenCalledWith(
       expect.objectContaining({ subject: "webchannel.default-tenant.good.*.register" }),
     );
-    expect(loadCreds.mock.calls.every(([accountId]) => accountId === "good")).toBe(true);
+    expect(
+      loadCreds.mock.calls.every(([scope]) => scope.accountId === "good"),
+    ).toBe(true);
   });
 
   it("probes the effective file and URL JWKS sources through injected seams", async () => {

@@ -78,6 +78,9 @@ export type EnrolledNatsConnectionOptions = {
    */
   credentialPath?: string;
 
+  /** Common tuple-scoped root for credentials and conversation keys. */
+  storageRoot?: string;
+
   /**
    * Whether to display enrollment instructions to console.
    */
@@ -170,6 +173,7 @@ export async function createEnrolledNatsConnection(
     tenant: options.tenant,
     accountId: options.accountId,
     credentialPath: options.credentialPath,
+    storageRoot: options.storageRoot,
     displayInstructions: options.displayInstructions,
   };
   const enrollmentClient = deps.enrollmentClientFactory?.(enrollmentOptions) ??

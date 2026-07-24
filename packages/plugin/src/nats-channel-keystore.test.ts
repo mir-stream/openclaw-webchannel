@@ -111,6 +111,7 @@ function makeKeyStoreChannel(broker: FakeBroker, maxKeys?: number): {
 } {
   const agentTransport = new FakeTransport(broker);
   const store = new ConversationKeyStore({
+    tenant: TENANT,
     accountId: ACCOUNT,
     home,
     ...(maxKeys === undefined ? {} : { maxKeys, onCapacityWarning: () => {} }),
@@ -273,7 +274,11 @@ describe("NatsChannel keyStore mode (register admission)", () => {
 
   it("F2: constructing a keyStore channel WITHOUT an identity key is fail-closed (throws)", () => {
     const broker = new FakeBroker();
-    const store = new ConversationKeyStore({ accountId: ACCOUNT, home });
+    const store = new ConversationKeyStore({
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      home,
+    });
     expect(
       () =>
         new NatsChannel(
@@ -308,7 +313,11 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     // "Restart": brand-new broker/transport/channel/store over the same home.
     const broker2 = new FakeBroker();
     const transport2 = new FakeTransport(broker2);
-    const store2 = new ConversationKeyStore({ accountId: ACCOUNT, home });
+    const store2 = new ConversationKeyStore({
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      home,
+    });
     const channel2 = new NatsChannel(
       transport2 as unknown as ConstructorParameters<typeof NatsChannel>[0],
       ACCOUNT,

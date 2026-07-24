@@ -196,6 +196,20 @@ describe("resolveNatsCredentialSource — enrolled (default)", () => {
     expect(s.saasBaseUrl).toBe("http://localhost:3001");
   });
 
+  it("carries storageRoot and exact credentialPath through enrolled resolution", () => {
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      storageRoot: "/common/state",
+      credentialPath: "/credential-only/credentials.json",
+      env: {},
+    });
+    expect(s).toMatchObject({
+      mode: "enrolled",
+      storageRoot: "/common/state",
+      credentialPath: "/credential-only/credentials.json",
+    });
+  });
+
   it("honors nats.credentials.saasBaseUrl (over the top-level config value)", () => {
     const s = resolveNatsCredentialSource({
       ...BASE,
@@ -311,6 +325,8 @@ describe("connectNatsCredentialSource — static branch", () => {
         saasBaseUrl: "https://saas.example///",
         tenant: "t1",
         accountId: "a1",
+        storageRoot: "/common/state",
+        credentialPath: "/credential-only/credentials.json",
       },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       { createEnrolled: createEnrolled as any },
@@ -322,6 +338,8 @@ describe("connectNatsCredentialSource — static branch", () => {
         natsUrl: "wss://n",
         tenant: "t1",
         accountId: "a1",
+        storageRoot: "/common/state",
+        credentialPath: "/credential-only/credentials.json",
       }),
     );
     expect(result.transport).toBe(fakeTransport);
