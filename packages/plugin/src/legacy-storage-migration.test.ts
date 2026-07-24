@@ -602,6 +602,54 @@ describe("legacy tuple storage migration", () => {
     expect(existsSync(destination.conversationKeyPath)).toBe(true);
   });
 
+  it("resumes a bare-account exact archive link left by a crash", () => {
+    const legacy = writeLegacyState();
+    const original = readFileSync(legacy.credentialPath);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const claim = join(
+      legacy.root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+    );
+    const archived = join(claim, "exact-credentials.json");
+    const simulatedCrash = new Error("link archive crash");
+
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath: legacy.credentialPath,
+        _linkExactSource: (source, archive) => {
+          linkSync(source, archive);
+          throw simulatedCrash;
+        },
+      }),
+    ).toThrow(expect.objectContaining({ code: "legacy-migration-failed" }));
+    expect(readFileSync(legacy.credentialPath)).toEqual(original);
+    expect(readFileSync(archived)).toEqual(original);
+    expect(statSync(legacy.credentialPath).nlink).toBe(2);
+    expect(statSync(archived).nlink).toBe(2);
+
+    expect(
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath: legacy.credentialPath,
+      }),
+    ).toMatchObject({
+      status: "resumed",
+      credential: "migrated",
+      conversationKeys: "migrated",
+    });
+    expect(readFileSync(archived)).toEqual(original);
+    expect(Buffer.from(
+      parseConversationKeyDocument(
+        SCOPE,
+        readFileSync(destination.conversationKeyPath, "utf8"),
+      ).get("same-peer")!,
+    )).toEqual(LEGACY_K);
+  });
+
   it("never overwrites an exact-path credential published after archival", () => {
     const credentialPath = join(home, "outside", "account.json");
     mkdirSync(dirname(credentialPath), { recursive: true });
