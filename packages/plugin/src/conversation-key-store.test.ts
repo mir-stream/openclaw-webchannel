@@ -237,6 +237,37 @@ describe("ConversationKeyStore", () => {
     ).toBe(false);
   });
 
+  it("does not let a malformed document version hide a foreign embedded identity", () => {
+    const source = createStore({ accountId: ACCOUNT, home });
+    source.getOrCreate("same-peer");
+    const candidate = JSON.parse(
+      readFileSync(storePath(), "utf8"),
+    ) as Record<string, unknown>;
+    candidate.version = 999;
+    const targetBytes = Buffer.from(JSON.stringify(candidate));
+    const targetPath = storePath(ACCOUNT, "tenant-B");
+    mkdirSync(dirname(targetPath), { recursive: true, mode: 0o700 });
+    writeFileSync(targetPath, targetBytes, { mode: 0o600 });
+
+    const target = new ConversationKeyStore({
+      tenant: "tenant-B",
+      accountId: ACCOUNT,
+      home,
+    });
+    expect(() => target.get("same-peer")).toThrow(
+      expect.objectContaining({
+        code: "identity-mismatch",
+        fields: expect.arrayContaining(["storage.tenant"]),
+      }),
+    );
+    expect(readFileSync(targetPath)).toEqual(targetBytes);
+    expect(
+      readdirSync(dirname(targetPath)).some((name) =>
+        name.includes(".corrupt-"),
+      ),
+    ).toBe(false);
+  });
+
   it("treats an initially stored key of the wrong length as corrupt", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     mkdirSync(dirname(storePath()), { recursive: true });

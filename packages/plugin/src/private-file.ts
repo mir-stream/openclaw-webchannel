@@ -78,14 +78,17 @@ export function atomicWritePrivateFile(
  * Move a file aside without ever replacing an existing archive.
  *
  * link+unlink is used because Node's rename primitive may replace an existing
- * file. A crash between the two leaves two recoverable links, never data loss.
+ * file. The archive parent and shared source/archive inode are hardened before
+ * unlinking the source. A crash between the two leaves two recoverable links,
+ * never data loss.
  */
 export function archiveFileNoReplace(
   sourcePath: string,
   archivePath: string,
 ): void {
-  ensurePrivateDirectory(dirname(archivePath));
+  ensurePrivateDirectory(dirname(archivePath), true);
   linkSync(sourcePath, archivePath);
+  chmodSync(archivePath, 0o600);
   fsyncDirectoryBestEffort(dirname(archivePath));
   unlinkSync(sourcePath);
   fsyncDirectoryBestEffort(dirname(sourcePath));

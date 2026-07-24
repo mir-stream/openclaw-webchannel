@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import {
+  chmodSync,
   type Dirent,
   existsSync,
   readFileSync,
@@ -252,6 +253,12 @@ function migrateProvenArchive(input: {
     "conversation-keys.json",
   );
 
+  hardenArchivedSource(
+    input.sourceDirectory,
+    sourceCredentialPath,
+    sourceConversationPath,
+  );
+
   let upgradedCredential: ReturnType<typeof upgradeLegacyCredentialDocument>;
   try {
     upgradedCredential = upgradeLegacyCredentialDocument(
@@ -322,6 +329,27 @@ function migrateProvenArchive(input: {
     credential: "migrated",
     conversationKeys: legacyKeys ? "migrated" : "fresh",
   });
+}
+
+/**
+ * Legacy enrollment created its account directory without an explicit mode and
+ * could retain broader modes on existing secret files. Harden only after the
+ * source has been atomically moved under the owner-only backup boundary. A
+ * crash before this point leaves the 0700 claim directory as the outer access
+ * control; resume retries these chmods before publishing either destination.
+ */
+function hardenArchivedSource(
+  sourceDirectory: string,
+  credentialPath: string,
+  conversationPath: string,
+): void {
+  try {
+    chmodSync(sourceDirectory, 0o700);
+    chmodSync(credentialPath, 0o600);
+    if (existsSync(conversationPath)) chmodSync(conversationPath, 0o600);
+  } catch {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
 }
 
 function inspectLegacyCredential(
