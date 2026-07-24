@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -1282,6 +1283,155 @@ describe("legacy tuple storage migration", () => {
     expect(existsSync(destination.credentialPath)).toBe(true);
     expect(existsSync(destination.conversationKeyPath)).toBe(true);
   }, 15_000);
+
+  it("serializes different-tenant exact claims for one legacy account", async () => {
+    const legacy = writeLegacyState(SCOPE, { credential: false });
+    const firstCredential = join(home, "exact", "tenant-a.json");
+    const secondCredential = join(home, "exact", "tenant-b.json");
+    mkdirSync(dirname(firstCredential), { recursive: true });
+    writeFileSync(
+      firstCredential,
+      JSON.stringify(legacyCredential(SCOPE, "FIRST"), null, 2),
+      { mode: 0o600 },
+    );
+    const secondBytes = Buffer.from(
+      JSON.stringify(legacyCredential(OTHER_SCOPE, "SECOND"), null, 2),
+    );
+    writeFileSync(secondCredential, secondBytes, { mode: 0o600 });
+    const firstDestination = tupleStoragePaths({ ...SCOPE, home });
+    const secondDestination = tupleStoragePaths({ ...OTHER_SCOPE, home });
+    const backupRoot = join(legacy.root, ".legacy-v1-backups");
+    const mutex = join(
+      backupRoot,
+      `.account-migration-mutex-${createHash("sha256")
+        .update(SCOPE.accountId)
+        .digest("base64url")}.json`,
+    );
+    const fixture = fileURLToPath(
+      new URL("./test-fixtures/migrate-legacy-storage.ts", import.meta.url),
+    );
+    const start = (
+      scope: typeof SCOPE,
+      credentialPath: string,
+      mutexDelayMs: number,
+    ) => {
+      const child = spawn(
+        process.execPath,
+        [
+          "--import",
+          "tsx",
+          fixture,
+          home,
+          scope.tenant,
+          scope.accountId,
+          "0",
+          credentialPath,
+          String(mutexDelayMs),
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      return new Promise<{ code: number | null; stdout: string; stderr: string }>(
+        (resolve) => {
+          let stdout = "";
+          let stderr = "";
+          child.stdout.setEncoding("utf8");
+          child.stderr.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            stdout += chunk;
+          });
+          child.stderr.on("data", (chunk: string) => {
+            stderr += chunk;
+          });
+          child.on("close", (code) => resolve({ code, stdout, stderr }));
+        },
+      );
+    };
+
+    const first = start(SCOPE, firstCredential, 1_000);
+    for (let attempts = 0; attempts < 500 && !existsSync(mutex); attempts += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(existsSync(mutex)).toBe(true);
+    const second = start(OTHER_SCOPE, secondCredential, 0);
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult, firstResult.stderr).toMatchObject({ code: 0 });
+    expect(secondResult, secondResult.stderr).toMatchObject({ code: 0 });
+    expect(JSON.parse(firstResult.stdout)).toEqual({
+      ok: true,
+      status: "migrated",
+    });
+    expect(JSON.parse(secondResult.stdout)).toEqual({
+      ok: false,
+      code: "legacy-claim-conflict",
+    });
+    expect(existsSync(mutex)).toBe(false);
+    expect(readFileSync(secondCredential)).toEqual(secondBytes);
+    expect(existsSync(secondDestination.credentialPath)).toBe(false);
+    expect(existsSync(secondDestination.conversationKeyPath)).toBe(false);
+    expect(
+      readdirSync(backupRoot, { withFileTypes: true }).filter(
+        (entry) => entry.isDirectory(),
+      ),
+    ).toHaveLength(1);
+    expect(() =>
+      assertCredentialDocumentStorage(
+        SCOPE,
+        parseCredentialJson(readFileSync(firstCredential, "utf8")),
+      ),
+    ).not.toThrow();
+    expect(Buffer.from(
+      parseConversationKeyDocument(
+        SCOPE,
+        readFileSync(firstDestination.conversationKeyPath, "utf8"),
+      ).get("same-peer")!,
+    )).toEqual(LEGACY_K);
+  }, 15_000);
+
+  it("takes over and preserves a dead account migration mutex", () => {
+    const legacy = writeLegacyState();
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const backupRoot = join(legacy.root, ".legacy-v1-backups");
+    mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+    const deadPid = 2_147_483_647;
+    const mutexName =
+      `.account-migration-mutex-${createHash("sha256")
+        .update(SCOPE.accountId)
+        .digest("base64url")}.json`;
+    const mutex = join(backupRoot, mutexName);
+    writeFileSync(
+      mutex,
+      JSON.stringify({
+        version: 1,
+        ownerPid: deadPid,
+        token: "a".repeat(32),
+      }),
+      { mode: 0o600 },
+    );
+
+    expect(migrateLegacyTupleState({ ...SCOPE, home }).status).toBe("migrated");
+    expect(existsSync(mutex)).toBe(false);
+    expect(
+      readdirSync(backupRoot, { withFileTypes: true }).filter(
+        (entry) =>
+          entry.isFile() &&
+          entry.name.startsWith(`${mutexName}.stale-${deadPid}-`),
+      ),
+    ).toHaveLength(1);
+    expect(() =>
+      assertCredentialDocumentStorage(
+        SCOPE,
+        parseCredentialJson(
+          readFileSync(destination.credentialPath, "utf8"),
+        ),
+      ),
+    ).not.toThrow();
+    expect(Buffer.from(
+      parseConversationKeyDocument(
+        SCOPE,
+        readFileSync(destination.conversationKeyPath, "utf8"),
+      ).get("same-peer")!,
+    )).toEqual(LEGACY_K);
+  });
 
   it("resumes a crash-safe claimed archive for the same tuple", () => {
     const legacy = writeLegacyState();
