@@ -28,6 +28,7 @@ import { importEd25519SeedKey, signNonce } from "./nats-nkey-browser.js";
 import {
   registerWithPop,
   isTerminalRegisterError,
+  PopCapacityError,
   PopRejectedError,
   PopServerError,
   ProtocolMismatchError,
@@ -1657,6 +1658,7 @@ export class WebChannelNatsClient {
           const cause: WebChannelErrorCause =
             err instanceof PopRejectedError ? "auth-rejected"
             : err instanceof ProtocolMismatchError ? "protocol-mismatch"
+            : err instanceof PopCapacityError ? "capacity"
             : err instanceof PopServerError ? "server"
             : "unknown";
           // P0-4: failConnectionEpoch now folds the D4 terminal sweep in BEFORE

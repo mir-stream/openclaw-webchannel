@@ -103,14 +103,18 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-function makeKeyStoreChannel(broker: FakeBroker): {
+function makeKeyStoreChannel(broker: FakeBroker, maxKeys?: number): {
   channel: NatsChannel;
   agentTransport: FakeTransport;
   store: ConversationKeyStore;
   identityKP: ReturnType<typeof generateKeyPair>;
 } {
   const agentTransport = new FakeTransport(broker);
-  const store = new ConversationKeyStore({ accountId: ACCOUNT, home });
+  const store = new ConversationKeyStore({
+    accountId: ACCOUNT,
+    home,
+    ...(maxKeys === undefined ? {} : { maxKeys, onCapacityWarning: () => {} }),
+  });
   // F2: a keyStore channel REQUIRES the agent's attested identity key to wrap K.
   const identityKP = generateKeyPair();
   const channel = new NatsChannel(
@@ -171,6 +175,23 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     channel.sendText(PEER, "after-B-joined");
     expect(deviceA.decrypted).toEqual([{ type: "agent_message", text: "after-B-joined" }]);
     expect(deviceA.failed).toBe(0);
+  });
+
+  it("re-registers and wraps the original key when the durable store is full", () => {
+    const broker = new FakeBroker();
+    const { channel, store, identityKP } = makeKeyStoreChannel(broker, 1);
+    channel.registerPeer(PEER);
+    const original = store.get(PEER)!;
+    const deviceKP = generateKeyPair();
+
+    channel.registerPeer(PEER);
+    const wrapped = channel.wrapConversationKeyForDevice(PEER, deviceKP.publicKey);
+    expect(wrapped).not.toBeNull();
+    const unwrapped = unwrapConversationKey(wrapped!, deviceKP.privateKey, {
+      agentPublicKey: identityKP.publicKey,
+      peerId: PEER,
+    });
+    expect(Buffer.from(unwrapped).equals(Buffer.from(original))).toBe(true);
   });
 
   it("both devices decrypt the SAME single ciphertext fanout", () => {

@@ -46,6 +46,11 @@ const COPY: Record<WebChannelErrorCause, TerminalErrorCopy> = {
     hint: "The embedding page passed incomplete connection config — this needs a code fix, not a retry.",
     showReauth: false,
   },
+  capacity: {
+    heading: "Agent account is full",
+    hint: "This OpenClaw WebChannel account cannot admit new users — contact the operator to use another account.",
+    showReauth: false,
+  },
   server: {
     heading: "Agent-side failure",
     hint: "Registration failed on the agent — re-authenticate to retry, or try again later.",

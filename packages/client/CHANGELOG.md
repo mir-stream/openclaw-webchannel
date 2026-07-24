@@ -18,8 +18,15 @@
   and `sendFailure?: SendFailure`. Migration: `delivered === true` ↔
   `sendState === "accepted" || sendState === "completed"`. Lockstep with
   `@mir-stream/webchannel-plugin` — upgrade both together.
+- `WebChannelErrorCause` adds the `"capacity"` member. This is wire-compatible,
+  but downstream exhaustive switches over the union must add the new terminal,
+  non-reauth case.
 
 ### Added
+
+- Agent account capacity replies (`capacity_exceeded`, code 507) now surface as
+  terminal `WebChannelErrorCause: "capacity"` and do not enter a retry or
+  re-authentication loop.
 
 - `send()` now returns a `SendReceipt` (`{ id, snapshot(), subscribe() }`) — an
   observable, retract-surviving handle for a message's terminal outcome

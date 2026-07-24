@@ -60,4 +60,15 @@ describe("WebChannelNatsClient register-hop recovery (F5)",()=>{
     const count=FakeNatsWS.instances.length;await settle(10);expect(FakeNatsWS.instances).toHaveLength(count);
     h.client.disconnect();
   });
+
+  it("a capacity rejection is terminal and reports the capacity cause",async()=>{
+    const h=await makeClient({reconnect:true});const errors:Array<{error:Error;cause?:string}>=[];
+    const K=new Uint8Array(32).fill(8);
+    FakeNatsWS.sharedHandler=registerAgent(K,h.devicePublicRaw,h.identity,{rejectCode:507});
+    h.client.onError((error,cause)=>errors.push({error,cause}));h.client.connect();await settle(20);
+    expect(errors[0]?.error.name).toBe("PopCapacityError");
+    expect(errors[0]?.cause).toBe("capacity");
+    const count=FakeNatsWS.instances.length;await settle(10);expect(FakeNatsWS.instances).toHaveLength(count);
+    h.client.disconnect();
+  });
 });

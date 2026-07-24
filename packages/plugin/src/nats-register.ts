@@ -24,12 +24,13 @@
  *    acts only on the verified peerId. `unregister` is NOT a special-cased
  *    unauthenticated teardown: an unverified/mismatched token is a silent no-op,
  *    so no one can tear down a peer they don't own.
- *  - Failure replies are a single opaque `unauthorized` (401) so the reply channel
- *    is never an oracle; the diagnostic detail stays in the agent's logs. Replay of
- *    a used single-use nonce collapses to the same generic rejection. A TRANSIENT
- *    infra fault (JWKS source unreachable) replies a distinct retryable
- *    `unavailable` (503) — this is not an oracle (both are non-admit), it only lets
- *    the client retry an infra hiccup instead of treating it as a terminal reject.
+ *  - Verification failures are a single opaque `unauthorized` (401), so the
+ *    reply channel is not an identity oracle; replay of a used single-use nonce
+ *    collapses to the same rejection. A TRANSIENT infra fault (JWKS source
+ *    unreachable) replies retryable `unavailable` (503). Only after JWT,
+ *    tenant/subject, PoP, and cnf validation can the handler reveal the
+ *    account-wide, peer-independent `capacity_exceeded` (507) outcome. It
+ *    carries no account, peer, or count detail.
  *  - Moving the register hop onto NATS exposes the bootstrap JWT to the untrusted
  *    relay (the HTTP path carried it in a TLS Authorization header). The
  *    mitigation is unchanged: PoP (device key) + single-use, short-TTL nonce +
@@ -42,6 +43,10 @@ import { TransientVerifyError } from "./auth.js";
 import type { JwtIdentity } from "./jwt.js";
 import type { PopChallengeStore } from "./pop-challenge.js";
 import type { WrappedConversationKey } from "./late-join-decryptor.js";
+import {
+  formatCapacityReject,
+  type CapacityStatus,
+} from "./capacity-status.js";
 import { popRequirementUnmet } from "./register-pop-gate.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
@@ -54,6 +59,10 @@ import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
  */
 export const REGISTER_UNAUTHORIZED = JSON.stringify({ error: "unauthorized", code: 401 });
 export const REGISTER_FAILED = JSON.stringify({ error: "registration_failed", code: 500 });
+export const REGISTER_CAPACITY_EXCEEDED = JSON.stringify({
+  error: "capacity_exceeded",
+  code: 507,
+});
 /**
  * Transient/infra failure (the JWKS source was unreachable, so verification could
  * not be performed). Distinct, RETRYABLE code — the client retries it with backoff
@@ -110,8 +119,44 @@ export type RegisterHandlerDeps = {
    * index-nats.ts and APPROVAL_REHYDRATION_PLAN §3.2/§3.4).
    */
   sendApprovalSnapshot: (peerId: string) => void;
+  /** Capacity-only diagnostics; never wrap or replace the general security logger. */
+  onCapacityReject?: (status: CapacityStatus) => void;
   logger?: { error?: (msg: string) => void };
 };
+
+type CapacityErrorShape = CapacityStatus & {
+  name: "ConversationKeyCapacityError";
+};
+
+function isConversationKeyCapacityError(err: unknown): err is CapacityErrorShape {
+  if (!err || typeof err !== "object") return false;
+  const value = err as Record<string, unknown>;
+  return (
+    value.name === "ConversationKeyCapacityError" &&
+    typeof value.accountId === "string" &&
+    value.accountId.length > 0 &&
+    Number.isSafeInteger(value.currentKeys) &&
+    (value.currentKeys as number) >= 0 &&
+    Number.isSafeInteger(value.maxKeys) &&
+    (value.maxKeys as number) > 0
+  );
+}
+
+function hasCapacityErrorName(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { name?: unknown }).name === "ConversationKeyCapacityError"
+  );
+}
+
+function consoleCapacityFallback(status: CapacityStatus): void {
+  try {
+    console.error(formatCapacityReject(status));
+  } catch {
+    // Diagnostics are never load-bearing for an already-sent reply.
+  }
+}
 
 function identityMatchesTenantScope(identity: JwtIdentity, tenant: string): boolean {
   return typeof identity.tenant === "string" && identity.tenant.length > 0 && identity.tenant === tenant;
@@ -302,10 +347,12 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   // Register (idempotent) + wrap K + snapshot. These do real I/O — registerPeer
   // loads/creates the peer's stable K (ConversationKeyStore.persist → fs writes
   // that can EACCES/ENOSPC), wrap does crypto, snapshot reads history — so any
-  // throw here MUST reply REGISTER_FAILED, not escape. The call site wires this as
-  // `void handleRegisterRequest(...)`; an unguarded throw would leave the browser
-  // with NO reply (→ client retries then terminal disconnect) AND raise an
-  // unhandledRejection. This mirrors the deleted HTTP route's whole-body try/catch.
+  // throw here MUST produce a guarded reply (REGISTER_CAPACITY_EXCEEDED for the
+  // typed capacity boundary, otherwise REGISTER_FAILED), not escape. The call
+  // site wires this as `void handleRegisterRequest(...)`; an unguarded throw
+  // would leave the browser with NO reply (→ client retries then terminal
+  // disconnect) AND raise an unhandledRejection. This mirrors the deleted HTTP
+  // route's whole-body try/catch.
   try {
     // Register (idempotent) + wrap K to THIS request's attested device key.
     deps.registerPeer(peerId);
@@ -349,6 +396,53 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
       }),
     );
   } catch (err) {
+    if (isConversationKeyCapacityError(err)) {
+      const status: CapacityStatus = {
+        accountId: err.accountId,
+        currentKeys: err.currentKeys,
+        maxKeys: err.maxKeys,
+      };
+
+      // Wire outcome first: no logger/callback failure may turn a permanent 507
+      // into a timeout that the browser treats as transient and reconnects.
+      reply(REGISTER_CAPACITY_EXCEEDED);
+      try {
+        if (deps.onCapacityReject) {
+          try {
+            deps.onCapacityReject(status);
+          } catch {
+            // A configured capacity callback owns this branch; do not duplicate
+            // into the general security logger if it fails.
+            consoleCapacityFallback(status);
+          }
+        } else if (logger?.error) {
+          try {
+            logger.error(formatCapacityReject(status));
+          } catch {
+            consoleCapacityFallback(status);
+          }
+        } else {
+          consoleCapacityFallback(status);
+        }
+      } catch {
+        // Defense-in-depth: diagnostics must never reject the handler after 507.
+      }
+      return;
+    }
+
+    if (hasCapacityErrorName(err)) {
+      // A same-name object with an invalid shape is an internal contract bug,
+      // not a trusted capacity signal. Avoid combining its dynamic fields with
+      // the authenticated peer id in logs.
+      reply(REGISTER_FAILED);
+      try {
+        logger?.error?.("webchannel: malformed conversation-key capacity error; registration failed");
+      } catch {
+        // Reply already sent; diagnostic failure is non-fatal.
+      }
+      return;
+    }
+
     logger?.error?.(`webchannel: register failed for ${peerId}: ${String(err)}`);
     reply(REGISTER_FAILED);
   }

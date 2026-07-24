@@ -562,7 +562,7 @@ describe("WebChannelNatsClient — P0-4 send-state tracker", () => {
   // must route through the D4 terminal sequence — sweep pending → failed{terminal,
   // cause}, empty both structures, and immediate-fail a post-failure send. Driving
   // the real entry points (not the private notifyErrorListeners) is what guards
-  // the round-1 BLOCKER: these five sites used to bypass handleTerminal.
+  // the round-1 BLOCKER: these sites used to bypass handleTerminal.
   const K = new Uint8Array(32).fill(31);
   const ledgerOf = (c: WebChannelNatsClient) => (c as unknown as { unackedLedger: Map<string, unknown> }).unackedLedger;
   const queueOf = (c: WebChannelNatsClient) => (c as unknown as { outboundQueue: unknown[] }).outboundQueue;
@@ -601,6 +601,15 @@ describe("WebChannelNatsClient — P0-4 send-state tracker", () => {
           rejectCode: 426,
           versions: { protocolVersion: WEBCHANNEL_PROTOCOL_VERSION },
         });
+        return h;
+      },
+    },
+    {
+      name: "PoP 507 → capacity",
+      cause: "capacity",
+      build: async () => {
+        const h = await makeClient({ reconnect: true });
+        FakeNatsWS.sharedHandler = registerAgent(K, h.devicePublicRaw, h.identity, { rejectCode: 507 });
         return h;
       },
     },

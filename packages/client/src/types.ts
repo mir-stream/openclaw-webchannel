@@ -254,8 +254,13 @@ export type WebChannelErrorCause =
   // Embedder-side bug: the bootstrap `jwt` is missing. A code fix, not a retry —
   // re-auth provably cannot help.
   | "config"
-  // PoP register non-401/non-426/non-503 error reply (typically 5xx; the reply
-  // is deliberately a no-oracle, so another odd 4xx lands here). Retry later.
+  // This OpenClaw WebChannel account has admitted its fixed maximum number of
+  // distinct peer IDs. Re-auth cannot create room; the operator must route new
+  // users to another account.
+  | "capacity"
+  // PoP register error other than 401, 426, 503, or exact capacity 507
+  // (typically 5xx; the reply is deliberately a no-oracle, so another odd 4xx
+  // lands here). Retry later.
   | "server"
   // Fallback — any terminal error without a classified cause.
   | "unknown";

@@ -276,10 +276,16 @@ export class NatsChannel implements WebChannelPeerChannel {
     // expected) self-heals on re-register. Crucially this SETS but never
     // re-derives: a second device registering the same peerId leaves K
     // untouched, which is the whole multi-device fix.
+    // Acquire (or create+durably commit) K before ANY live-session mutation.
+    // In particular, a full key store must reject before the maxPeers policy can
+    // evict an unrelated live peer.
+    const conversationKey =
+      this.encryptionRequired && this.keyStore
+        ? this.keyStore.getOrCreate(peerId)
+        : null;
+
     if (this.peerSubscriptions.has(peerId)) {
-      if (this.encryptionRequired && this.keyStore) {
-        this.peerSessionKeys.set(peerId, this.keyStore.getOrCreate(peerId));
-      }
+      if (conversationKey) this.peerSessionKeys.set(peerId, conversationKey);
       console.warn(`[nats-channel] Peer ${peerId} already registered`);
       return;
     }
@@ -304,15 +310,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     const inboundSubject = this.inboundSubject(peerId);
     const sid = this.transport.subscribe(inboundSubject);
     this.peerSubscriptions.set(peerId, sid);
-    if (this.encryptionRequired && this.keyStore) {
-      try {
-        this.peerSessionKeys.set(peerId, this.keyStore.getOrCreate(peerId));
-      } catch (err) {
-        this.transport.unsubscribe(sid);
-        this.peerSubscriptions.delete(peerId);
-        throw err;
-      }
-    }
+    if (conversationKey) this.peerSessionKeys.set(peerId, conversationKey);
 
     console.log(`[nats-channel] Registered peer ${peerId}, subscribed to ${inboundSubject}`);
   }

@@ -146,6 +146,54 @@ relay TRUST for availability/metadata, not confidentiality/integrity. **Out of s
 key compromise / revocation (deferred to re-enrollment); K rotation (deferred — fixed key first);
 real-time allowlist authz is a core-delegated stub.
 
+## Conversation-key capacity and recovery
+
+Each OpenClaw Gateway process persists conversation keys per WebChannel account,
+not on the SaaS server. The fixed 10,000-entry guard applies to distinct
+`peerId` values (verified JWT `sub` claims), not browser devices. It is an
+abuse/misrouting safety boundary, not a normal scaling knob or public setting.
+At 90% the plugin emits a one-time warning for that account. At the limit,
+existing peers continue to receive their original key and history, while only
+previously unseen peers receive terminal `capacity_exceeded` code 507.
+
+Do not delete entries or the whole `conversation-keys.json`, and do not raise
+the cap: either action can break encrypted-history continuity. There is no
+automatic deletion or supported key-retention/revocation workflow yet. A
+capacity warning or rejection should first be treated as a routing incident:
+inspect issuer, scalar audience, account mapping, and unexpected `sub` churn.
+
+### Account-sharding runbook
+
+The supported expansion path is a new WebChannel account for users first
+assigned after a deliberate cutover. It requires application/SaaS routing work;
+`channels add` alone is not sufficient.
+
+1. Confirm exactly one Gateway writer uses the affected account and stop any
+   duplicate process. Stop that writer and make a dated, owner-only backup of
+   `conversation-keys.json`; never attach the file or its keys to logs/tickets.
+2. Find and stop abnormal issuer/audience/account routing or `sub` churn. If the
+   store is below the limit, restart it and monitor; do not delete entries.
+3. If real new-user capacity is needed, enroll a new account with
+   `openclaw channels add --channel webchannel --account <new-account>`.
+4. Store an immutable `webchannelAccountId` in the application database. Keep
+   all existing users and every user assigned before cutover on the old
+   account—even if they have never registered. Assign only users first created
+   and assigned after cutover to the new account. Moving an old peer creates a
+   different key/history namespace and is not a supported migration.
+5. Make the old and new JWT audiences distinct scalar strings, each matching
+   its account. Never reuse an audience or mint a multi-`aud` token spanning
+   both accounts. Assert the stored account ID is a string at the bootstrap mint
+   call and mint only that scalar audience.
+6. Before traffic, run `openclaw doctor` and require no `shared-audience` or
+   `verifier-unbuildable` finding. Privately decode one sample bootstrap per
+   cohort—without logging it—and verify `aud` is the assigned scalar account;
+   then open traffic.
+
+Pre-cutover users assigned to a full old account can still receive 507 on their
+first registration. Safely reassigning that cohort requires a future membership
+and migration workflow; this runbook deliberately preserves them on the old
+account rather than risking key/history loss.
+
 ## Bring-your-own NATS (static creds) — REMOVED in P0-2, returns in P0-3
 
 Static / bring-your-own-NATS **serving** (and the old dev-open mode) was removed in P0-2: the
