@@ -1,8 +1,15 @@
 # Project Status — single source of truth
 
-_Last updated: 2026-07-05 (full re-audit; supersedes the 2026-07-01 snapshot, which predated
-register-over-NATS, the showcase demo, multi-device, the setup wizard, publishing, and the
-delivered-issuer fix)._
+Issue #57 / protocol v2 bounds pre-debounce and busy-turn retained work by
+shared per-session/process count and charged-byte limits. Newest overflow is
+tail-rejected with a durable correlated client failure, and peer/account teardown
+releases retained accounting. `/stop` durably suppresses every not-yet-running
+entry it kills before releasing reservations. All ingress result frames share
+the count/wire/server-payload boundary. Client and plugin require lockstep rollout.
+
+_Last updated: 2026-07-23 (issue #57 retained-work bounds; the 2026-07-05 full re-audit
+superseded the 2026-07-01 snapshot, which predated register-over-NATS, the showcase demo,
+multi-device, the setup wizard, publishing, and the delivered-issuer fix)._
 
 This document supersedes any "AC 100% / complete / verified" claim found in commit messages,
 Ouroboros seeds (`.ouroboros/*`), evaluator scores, or older notes. Where those conflict with

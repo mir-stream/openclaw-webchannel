@@ -32,7 +32,10 @@ import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 
 let restore: () => void;
 beforeEach(() => { restore = installFakeWebSocket(); });
-afterEach(() => restore());
+afterEach(() => {
+  vi.useRealTimers();
+  restore();
+});
 
 type Ev = { id: string; state: SendState; failure?: SendFailure };
 const IN = inboundSubject(TENANT, AGENT, PEER);
@@ -41,9 +44,17 @@ const states = (events: Ev[], id: string): SendState[] =>
   events.filter((e) => e.id === id).map((e) => e.state);
 
 /** Register + (optionally) deliver/ack every user_message, reading `control` live. */
-async function setup(control: { deliver: boolean; ack: boolean } = { deliver: true, ack: true }) {
+async function setup(
+  control: { deliver: boolean; ack: boolean } = { deliver: true, ack: true },
+  retryHooks?: {
+    retryNow: () => number;
+    retryRandom?: () => number;
+    retrySetTimeout: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+    retryClearTimeout: (timer: ReturnType<typeof setTimeout>) => void;
+  },
+) {
   const K = new Uint8Array(32).fill(31);
-  const h = await makeClient({ reconnect: true });
+  const h = await makeClient({ reconnect: true, retryRandom: () => 0.5, ...retryHooks });
   const events: Ev[] = [];
   h.client.onSendState((id, state, failure) => events.push({ id, state, failure }));
   const registration = registerAgent(K, h.devicePublicRaw, h.identity);
@@ -65,6 +76,259 @@ async function setup(control: { deliver: boolean; ack: boolean } = { deliver: tr
 }
 
 describe("WebChannelNatsClient — P0-4 send-state tracker", () => {
+  it("turns inbound_rejected into terminal failed(overloaded) before listener fanout", async () => {
+    const K = new Uint8Array(32).fill(13);
+    const h = await makeClient();
+    const events: Ev[] = [];
+    const listenerSnapshots: Array<SendState | undefined> = [];
+    h.client.onSendState((id, state, failure) => events.push({ id, state, failure }));
+    const registration = registerAgent(K, h.devicePublicRaw, h.identity);
+    FakeNatsWS.sharedHandler = async (s, p, server, reply) => {
+      await registration(s, p, server, reply);
+      if (s !== IN) return;
+      const msg = openMessage(p, K) as { id?: string } | null;
+      if (!msg?.id) return;
+      server.deliverToClient(OUT, sealMessage(
+        { accountId: AGENT, tenant: TENANT, sub: PEER }, K,
+        { type: "inbound_rejected", ids: [msg.id], reason: "overloaded" } as unknown as OutboundMessage,
+      ));
+    };
+    h.client.onMessage((msg) => {
+      const rejectedId = msg.type === "inbound_rejected" ? msg.ids?.[0] : undefined;
+      if (rejectedId) {
+        listenerSnapshots.push(h.client.getSendStateSnapshot(rejectedId)?.state);
+      }
+    });
+    h.client.connect(); await settle();
+    const id = h.client.sendUserMessage("too much"); await settle();
+    expect(states(events, id)).toEqual(["queued", "sent", "failed"]);
+    expect(events.at(-1)?.failure).toMatchObject({ reason: "overloaded", retryable: true });
+    expect(listenerSnapshots).toEqual(["failed"]);
+    h.client.disconnect();
+  });
+
+  it("detaches every multi-id ACK before a first-id callback reconnects", async () => {
+    const h = await setup({ deliver: true, ack: false });
+    const ids = [
+      h.client.sendUserMessage("ack-one"),
+      h.client.sendUserMessage("ack-two"),
+    ];
+    await settle();
+    const acceptedOrder: string[] = [];
+    let reentered = false;
+    h.client.onSendState((id, state) => {
+      if (state !== "accepted" || !ids.includes(id)) return;
+      acceptedOrder.push(id);
+      if (!reentered) {
+        reentered = true;
+        h.client.disconnect();
+        h.client.connect();
+      }
+    });
+
+    FakeNatsWS.instances.at(-1)!.deliverToClient(OUT, sealMessage(
+      { accountId: AGENT, tenant: TENANT, sub: PEER }, h.K,
+      { type: "ack", ids } as unknown as OutboundMessage,
+    ));
+    await settle();
+
+    expect(acceptedOrder).toEqual(ids);
+    for (const id of ids) expect(states(h.events, id)).toEqual(["queued", "sent", "accepted"]);
+    expect((h.client as unknown as { unackedLedger: Map<string, unknown> }).unackedLedger.size).toBe(0);
+    expect((h.client as unknown as { liveRetryTimer: unknown }).liveRetryTimer).toBeNull();
+    h.client.disconnect();
+  });
+
+  it("detaches every multi-id rejection before a first-id callback reconnects", async () => {
+    const h = await setup({ deliver: true, ack: false });
+    const ids = [
+      h.client.sendUserMessage("reject-one"),
+      h.client.sendUserMessage("reject-two"),
+    ];
+    await settle();
+    const failedOrder: string[] = [];
+    let reentered = false;
+    h.client.onSendState((id, state, failure) => {
+      if (state !== "failed" || failure?.reason !== "overloaded" || !ids.includes(id)) return;
+      failedOrder.push(id);
+      if (!reentered) {
+        reentered = true;
+        h.client.disconnect();
+        h.client.connect();
+      }
+    });
+
+    FakeNatsWS.instances.at(-1)!.deliverToClient(OUT, sealMessage(
+      { accountId: AGENT, tenant: TENANT, sub: PEER }, h.K,
+      { type: "inbound_rejected", ids, reason: "overloaded" } as unknown as OutboundMessage,
+    ));
+    await settle();
+
+    expect(failedOrder).toEqual(ids);
+    for (const id of ids) {
+      expect(states(h.events, id)).toEqual(["queued", "sent", "failed"]);
+      expect(h.events.find((event) => event.id === id && event.state === "failed")?.failure)
+        .toMatchObject({ reason: "overloaded", retryable: true });
+    }
+    expect((h.client as unknown as { unackedLedger: Map<string, unknown> }).unackedLedger.size).toBe(0);
+    expect((h.client as unknown as { liveRetryTimer: unknown }).liveRetryTimer).toBeNull();
+    h.client.disconnect();
+  });
+
+  it("live-retries an unresolved send with the same id and no second sent transition", async () => {
+    let now = 0;
+    let scheduled: (() => void) | undefined;
+    const h = await setup(
+      { deliver: true, ack: false },
+      {
+        retryNow: () => now,
+        retrySetTimeout: (fn) => {
+          scheduled = fn;
+          return 1 as unknown as ReturnType<typeof setTimeout>;
+        },
+        retryClearTimeout: () => { scheduled = undefined; },
+      },
+    );
+    const id = h.client.sendUserMessage("retry live");
+    await settle();
+    expect(h.received.filter((value) => value === id)).toHaveLength(1);
+    now = 1_100;
+    const retry = scheduled;
+    scheduled = undefined;
+    retry?.();
+    await settle();
+    expect(h.received.filter((value) => value === id).length).toBeGreaterThanOrEqual(2);
+    expect(states(h.events, id)).toEqual(["queued", "sent"]);
+    h.client.disconnect();
+  });
+
+  it("keeps the original seal complete when the retry scheduler synchronously disconnects", async () => {
+    let client: WebChannelNatsClient | undefined;
+    let disconnectOnSchedule = false;
+    const h = await setup(
+      { deliver: true, ack: false },
+      {
+        retryNow: () => 0,
+        retrySetTimeout: () => {
+          if (disconnectOnSchedule) client?.disconnect();
+          return 1 as unknown as ReturnType<typeof setTimeout>;
+        },
+        retryClearTimeout: vi.fn(),
+      },
+    );
+    client = h.client;
+    disconnectOnSchedule = true;
+    let id: string | undefined;
+    expect(() => { id = h.client.sendUserMessage("reentrant scheduler"); }).not.toThrow();
+    expect(id).toBeDefined();
+    expect(states(h.events, id!)).toEqual(["queued", "sent", "failed"]);
+    expect(h.events.at(-1)?.failure).toMatchObject({ reason: "closed", retryable: false });
+    expect((h.client as unknown as { unackedLedger: Map<string, unknown> }).unackedLedger.size).toBe(0);
+    expect((h.client as unknown as { liveRetryTimer: unknown }).liveRetryTimer).toBeNull();
+  });
+
+  it.each(["retryNow", "retryRandom"] as const)(
+    "does not publish or strand a send when injected %s disconnects after sealing",
+    async (hook) => {
+      let client: WebChannelNatsClient | undefined;
+      let disconnectOnCall = false;
+      const retrySetTimeout = vi.fn(() => 1 as unknown as ReturnType<typeof setTimeout>);
+      const retryClearTimeout = vi.fn();
+      const h = await setup(
+        { deliver: true, ack: false },
+        {
+          retryNow: () => {
+            if (hook === "retryNow" && disconnectOnCall) client?.disconnect();
+            return 0;
+          },
+          retryRandom: () => {
+            if (hook === "retryRandom" && disconnectOnCall) client?.disconnect();
+            return 0.5;
+          },
+          retrySetTimeout,
+          retryClearTimeout,
+        },
+      );
+      client = h.client;
+      disconnectOnCall = true;
+      let id: string | undefined;
+      expect(() => { id = h.client.sendUserMessage(`reentrant ${hook}`); }).not.toThrow();
+      expect(id).toBeDefined();
+      expect(states(h.events, id!)).toEqual(["queued", "failed"]);
+      expect(h.events.at(-1)?.failure).toMatchObject({ reason: "closed", retryable: false });
+      await settle();
+      expect(h.received).toEqual([]);
+      expect((h.client as unknown as { unackedLedger: Map<string, unknown> }).unackedLedger.size).toBe(0);
+      expect((h.client as unknown as { liveRetryTimer: unknown }).liveRetryTimer).toBeNull();
+      expect(retrySetTimeout).not.toHaveBeenCalled();
+    },
+  );
+
+  it("uses 1/2/4/8/16/30-second retry backoff and clears timers on every lifecycle boundary", async () => {
+    let now = 0;
+    let nextId = 0;
+    let scheduled: { id: number; fn: () => void; delay: number } | undefined;
+    const delays: number[] = [];
+    const cleared: number[] = [];
+    const retrySetTimeout = (fn: () => void, delay: number) => {
+      const id = ++nextId;
+      scheduled = { id, fn, delay };
+      delays.push(delay);
+      return id as unknown as ReturnType<typeof setTimeout>;
+    };
+    const retryClearTimeout = (timer: ReturnType<typeof setTimeout>) => {
+      const id = timer as unknown as number;
+      cleared.push(id);
+      if (scheduled?.id === id) scheduled = undefined;
+    };
+    const runScheduled = () => {
+      const task = scheduled;
+      if (!task) throw new Error("expected a live retry timer");
+      scheduled = undefined;
+      now += task.delay;
+      task.fn();
+    };
+    const h = await setup(
+      { deliver: true, ack: false },
+      { retryNow: () => now, retrySetTimeout, retryClearTimeout },
+    );
+    const first = h.client.sendUserMessage("backoff");
+    await settle();
+    for (let attempt = 0; attempt < 6; attempt++) runScheduled();
+    expect(delays.slice(0, 7)).toEqual([1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+
+    const server = FakeNatsWS.instances.at(-1)!;
+    server.deliverToClient(OUT, sealMessage(
+      { accountId: AGENT, tenant: TENANT, sub: PEER }, h.K,
+      { type: "ack", ids: [first] } as unknown as OutboundMessage,
+    ));
+    expect(scheduled).toBeUndefined();
+    expect(states(h.events, first).at(-1)).toBe("accepted");
+
+    const rejected = h.client.sendUserMessage("reject");
+    await settle();
+    expect(scheduled).toBeDefined();
+    server.deliverToClient(OUT, sealMessage(
+      { accountId: AGENT, tenant: TENANT, sub: PEER }, h.K,
+      { type: "inbound_rejected", ids: [rejected], reason: "overloaded" } as unknown as OutboundMessage,
+    ));
+    expect(scheduled).toBeUndefined();
+    expect(states(h.events, rejected).at(-1)).toBe("failed");
+
+    h.client.sendUserMessage("reconnect");
+    await settle();
+    expect(scheduled).toBeDefined();
+    server.close();
+    expect(scheduled).toBeUndefined();
+    await settle(30);
+    expect(FakeNatsWS.instances.length).toBeGreaterThan(1);
+    expect(scheduled).toBeDefined();
+
+    h.client.disconnect();
+    expect(scheduled).toBeUndefined();
+    expect(cleared.length).toBeGreaterThanOrEqual(4);
+  });
+
   // T-hp (low-level slice): queued → sent → accepted, each exactly once.
   it("T-hp: a happy-path send transitions queued→sent→accepted, each once", async () => {
     const h = await setup();
@@ -325,6 +589,18 @@ describe("WebChannelNatsClient — P0-4 send-state tracker", () => {
       build: async () => {
         const h = await makeClient({ reconnect: true });
         FakeNatsWS.sharedHandler = registerAgent(K, h.devicePublicRaw, h.identity, { rejectCode: 500 });
+        return h;
+      },
+    },
+    {
+      name: "plugin protocol-mismatch 426 → protocol-mismatch",
+      cause: "protocol-mismatch",
+      build: async () => {
+        const h = await makeClient({ reconnect: true });
+        FakeNatsWS.sharedHandler = registerAgent(K, h.devicePublicRaw, h.identity, {
+          rejectCode: 426,
+          versions: { protocolVersion: WEBCHANNEL_PROTOCOL_VERSION },
+        });
         return h;
       },
     },

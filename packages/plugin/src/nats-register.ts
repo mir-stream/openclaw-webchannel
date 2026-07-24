@@ -62,6 +62,11 @@ export const REGISTER_FAILED = JSON.stringify({ error: "registration_failed", co
  * are both non-admit); only the retry disposition differs.
  */
 export const REGISTER_UNAVAILABLE = JSON.stringify({ error: "unavailable", code: 503 });
+export const REGISTER_PROTOCOL_MISMATCH = JSON.stringify({
+  error: "protocol_mismatch",
+  code: 426,
+  protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
+});
 
 export type RegisterHandlerDeps = {
   /** Agent-owned tenant namespace; primary confinement remains structural in NATS. */
@@ -121,7 +126,7 @@ function identityMatchesTenantScope(identity: JwtIdentity, tenant: string): bool
 export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<void> {
   const { subjectPeerId, payload, reply, popChallenges, logger } = deps;
 
-  let parsed: { op?: unknown; token?: unknown; nonce?: unknown; signature?: unknown };
+  let parsed: { op?: unknown; token?: unknown; nonce?: unknown; signature?: unknown; protocolVersion?: unknown };
   try {
     parsed = JSON.parse(payload) as typeof parsed;
   } catch {
@@ -235,6 +240,19 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   }
 
   // op === "register"
+  // Version validation deliberately follows authenticated tenant/subject checks:
+  // unauthenticated requests must not gain an account/version oracle. It occurs
+  // before PoP/key establishment and peer registration, so a v1 client can never
+  // establish a v2 session that ignores terminal overflow results.
+  if (
+    typeof parsed.protocolVersion !== "number"
+    || !Number.isSafeInteger(parsed.protocolVersion)
+    || parsed.protocolVersion !== WEBCHANNEL_PROTOCOL_VERSION
+  ) {
+    reply(REGISTER_PROTOCOL_MISMATCH);
+    return;
+  }
+
   // PoP gate (secure-by-default): PoP is REQUIRED unless auth.requirePoP=false.
   if (popRequirementUnmet(deps.requirePoP, Boolean(identity.popPublicJwk))) {
     logger?.error?.(
@@ -309,10 +327,9 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     // sent — an empty set is the reconciliation signal that retires stale cards.
     deps.sendApprovalSnapshot(peerId);
 
-    // Wire-protocol handshake: echo the plugin's protocol + package versions so
-    // the client can enforce a match (mismatch → terminal client-side) and the
-    // admin screen can report the agent-plugin build. A pre-v1 client ignores
-    // both fields; a pre-reporting plugin simply omits them (client tolerates).
+    // Wire-protocol handshake: echo the mandatory protocol version plus the
+    // optional package version so the client can enforce lockstep and the admin
+    // screen can report the agent-plugin build.
     //
     // PLAINTEXT BY DESIGN: these fields ride the unencrypted register reply over
     // the untrusted relay. A hostile relay can already forge/suppress this reply

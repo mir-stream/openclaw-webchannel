@@ -225,6 +225,8 @@ export class NatsTransport extends EventEmitter {
   private readonly clientName: string;
   private readonly wsFactory: (url: string) => WebSocket;
   private readonly handshakeTimeoutMs: number;
+  /** Valid server-advertised INFO.max_payload, capped by our local 8 MiB ceiling. */
+  private serverMaxPayload = MAX_PAYLOAD;
 
   // ── Reconnect state (S1) ───────────────────────────────────────────────────
   private readonly reconnectEnabled: boolean;
@@ -266,6 +268,10 @@ export class NatsTransport extends EventEmitter {
     return this._connected;
   }
 
+  get effectiveOutboundLimit(): number {
+    return Math.min(MAX_PAYLOAD, this.serverMaxPayload);
+  }
+
   // ---------------------------------------------------------------------------
   // Connection lifecycle
   // ---------------------------------------------------------------------------
@@ -289,6 +295,7 @@ export class NatsTransport extends EventEmitter {
     // connect() would silently lose S1 auto-reconnect forever (`closed` was
     // only ever set, never cleared).
     this.closed = false;
+    this.serverMaxPayload = MAX_PAYLOAD;
     return new Promise<void>((resolve, reject) => {
       // ── Outbound WebSocket CLIENT connection ────────────────────────────
       // `wsFactory(url)` dials the remote NATS server. The default factory
@@ -541,6 +548,18 @@ export class NatsTransport extends EventEmitter {
         // In JWT auth mode, the INFO contains a challenge nonce that we must
         // sign before sending CONNECT. sendConnectWithJwt() is idempotent
         // (guarded by _connectSent) so repeated INFO lines are safe.
+        try {
+          const info = JSON.parse(line.slice(5).trim()) as { max_payload?: unknown };
+          if (
+            typeof info.max_payload === "number"
+            && Number.isSafeInteger(info.max_payload)
+            && info.max_payload > 0
+          ) {
+            this.serverMaxPayload = Math.min(MAX_PAYLOAD, info.max_payload);
+          }
+        } catch {
+          // Existing protocol handling tolerates nonessential malformed INFO.
+        }
         if (this.nkeySigningCallback && beginJwtConnect()) {
           void this.sendConnectWithJwt(ws, line, onFirstPong, connectSent);
         }
@@ -690,6 +709,11 @@ export class NatsTransport extends EventEmitter {
   publish(subject: string, payload: string | Buffer): void {
     this.assertOpen();
     const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, "utf8");
+    if (buf.length > this.effectiveOutboundLimit) {
+      throw new RangeError(
+        `NatsTransport: outbound payload ${buf.length} exceeds effective max_payload ${this.effectiveOutboundLimit}`,
+      );
+    }
     // NATS PUB wire format:
     //   PUB <subject> <byte-count>\r\n<payload>\r\n
     this.ws!.send(`PUB ${subject} ${buf.length}\r\n`);
@@ -707,6 +731,11 @@ export class NatsTransport extends EventEmitter {
   publishWithReply(subject: string, replyTo: string, payload: string | Buffer): void {
     this.assertOpen();
     const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(payload, "utf8");
+    if (buf.length > this.effectiveOutboundLimit) {
+      throw new RangeError(
+        `NatsTransport: outbound payload ${buf.length} exceeds effective max_payload ${this.effectiveOutboundLimit}`,
+      );
+    }
     this.ws!.send(`PUB ${subject} ${replyTo} ${buf.length}\r\n`);
     this.ws!.send(buf);
     this.ws!.send("\r\n");

@@ -192,7 +192,7 @@ describe("EnrollmentClient", () => {
       const body = JSON.parse(init.body) as {
         agentPublicKey: string;
         pluginVersion?: string;
-        protocolVersion?: number;
+        protocolVersion: number;
       };
       expect(typeof body.agentPublicKey).toBe("string");
       expect(typeof body.pluginVersion).toBe("string");

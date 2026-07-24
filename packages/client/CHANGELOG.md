@@ -8,6 +8,11 @@
   They require the server-returned fixed tuple and treat optional caller values
   only as pre-construction test assertions. This ships lockstep with plugin/SaaS
   `0.3.0` (incident context #72; durable storage follow-up #71).
+- **Protocol v2:** a matching plugin is required; missing, malformed, or
+  mismatched register reply versions and authenticated 426 replies are terminal
+  `protocol-mismatch` failures. `inbound_rejected` maps
+  overload to `failed{reason:"overloaded",retryable:true}`. Published unresolved
+  ids are live-retried with one capped exponential-backoff timer.
 - **P0-4 send-result contract.** `ChatMessage.delivered?: boolean` is **removed**,
   replaced by `sendState?: "queued" | "sent" | "accepted" | "completed" | "failed"`
   and `sendFailure?: SendFailure`. Migration: `delivered === true` ↔

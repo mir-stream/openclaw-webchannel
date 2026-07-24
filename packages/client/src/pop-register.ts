@@ -128,25 +128,35 @@ export class PopServerError extends Error {
 }
 
 /**
- * Thrown when a register SUCCESS reply carries a `protocolVersion` that is
- * PRESENT but not a safe-integer number (e.g. the string "2" from a buggy or
+ * Typed terminal failure for the mandatory protocol-v2 register contract.
+ * Used for an explicit plugin 426 as well as malformed reply versions so the
+ * connection layer never misclassifies an upgrade requirement as `server`.
+ */
+export class ProtocolMismatchError extends Error {
+  readonly advertisedVersion: unknown;
+  constructor(message: string, advertisedVersion?: unknown) {
+    super(message);
+    this.name = "ProtocolMismatchError";
+    this.advertisedVersion = advertisedVersion;
+  }
+}
+
+/**
+ * Thrown when a register reply carries a required `protocolVersion` that is
+ * missing or not a safe-integer number (e.g. the string "2" from a buggy or
  * third-party plugin). This is exactly the silent-break class the version
  * handshake exists to kill: without this guard the malformed value degrades to
- * `undefined` in the copy-through below, the client policy reads it as "pre-v1,
- * absent" and proceeds — masking a plugin that is in fact speaking an
- * unintelligible wire protocol. So it is TERMINAL (same standing as a version
- * MISMATCH): the message names the received type + value for diagnosis, and the
- * caller tears the connection down instead of retrying. NB presence with the
- * wrong TYPE is the offense, not the value — even `"1"` (a numeric string that
- * would "match" if coerced) is terminal, because a well-behaved v1 plugin sends
- * the NUMBER 1.
+ * `undefined` in a permissive copy-through and mask a plugin speaking an
+ * unintelligible contract. Protocol v2 is mandatory: missing and wrong-typed
+ * values are terminal, without coercion.
  */
-export class ProtocolVersionMalformedError extends Error {
+export class ProtocolVersionMalformedError extends ProtocolMismatchError {
   constructor(received: unknown) {
     super(
       `pop-register: register reply carried a non-numeric protocolVersion ` +
         `(${typeof received} ${JSON.stringify(received)}) — the agent-plugin is speaking ` +
         `an unintelligible wire protocol`,
+      received,
     );
     this.name = "ProtocolVersionMalformedError";
   }
@@ -155,9 +165,9 @@ export class ProtocolVersionMalformedError extends Error {
 /**
  * Classify a `registerWithPop` throw as TERMINAL (true) vs TRANSIENT (false).
  *
- * TERMINAL = a rejected proof/token (`PopRejectedError`) or a non-transient
- * server failure (`PopServerError`): the SAME bootstrap credentials will never
- * be accepted, so redialing cannot help — the caller must surface a hard error.
+ * TERMINAL = a rejected proof/token (`PopRejectedError`), mandatory-v2 mismatch
+ * (`ProtocolMismatchError`), or non-transient server failure (`PopServerError`):
+ * redialing the same peer cannot change the reply.
  *
  * TRANSIENT = everything else `registerWithPop` throws: a request timeout, a
  * `503` (JWKS unreachable), or retry-exhaustion because the AGENT is offline
@@ -168,9 +178,7 @@ export function isTerminalRegisterError(err: unknown): boolean {
   return (
     err instanceof PopRejectedError ||
     err instanceof PopServerError ||
-    // A malformed protocolVersion in a SUCCESS reply is as terminal as a
-    // mismatch: retrying the same plugin re-derives the same broken reply.
-    err instanceof ProtocolVersionMalformedError
+    err instanceof ProtocolMismatchError
   );
 }
 
@@ -187,17 +195,17 @@ export type RegisterWithPopResult = {
   wrappedConversationKey?: WrappedConversationKey;
   /**
    * The agent-plugin's wire-protocol version, echoed in the register reply.
-   * OPTIONAL: a pre-v1 plugin omits it (the caller treats absence as non-fatal
-   * and exposes `agentProtocolVersion: null`). A value that disagrees with the
+   * Required by protocol v2. Missing, malformed, or mismatched values are
+   * terminal. A value that disagrees with the
    * client's `WEBCHANNEL_PROTOCOL_VERSION` is TERMINAL at the call site.
    */
-  protocolVersion?: number;
+  protocolVersion: number;
   /** The agent-plugin's package version string (diagnostics only). OPTIONAL. */
   pluginVersion?: string;
 };
 
 /** Shape of an error reply (generic — no detail, so the reply is no oracle). */
-type ErrorReply = { error?: string; code?: number };
+type ErrorReply = { error?: string; code?: number; protocolVersion?: unknown };
 
 /**
  * Run the full PoP registration over NATS request/reply: challenge → sign →
@@ -263,9 +271,8 @@ export async function registerWithPop(
         token: opts.jwt,
         nonce,
         signature,
-        // Advertise the client's wire-protocol version. A pre-v1 plugin ignores
-        // it; a v1 plugin echoes its own version back so the caller can enforce
-        // a match (see the register policy in nats-client.ts).
+        // Protocol v2 makes this request field mandatory; the plugin rejects a
+        // missing, malformed, or mismatched value before PoP/key establishment.
         protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
       })) as typeof registerReply;
     } catch (err) {
@@ -280,25 +287,32 @@ export async function registerWithPop(
         continue;
       }
       if (registerReply.code === 401) throw new PopRejectedError();
+      if (registerReply.code === 426) {
+        const advertised = registerReply.protocolVersion;
+        if (typeof advertised !== "number" || !Number.isSafeInteger(advertised)) {
+          throw new ProtocolVersionMalformedError(advertised);
+        }
+        throw new ProtocolMismatchError(
+          `pop-register: agent-plugin rejected protocol v${WEBCHANNEL_PROTOCOL_VERSION} ` +
+            `and requires v${advertised}`,
+          advertised,
+        );
+      }
       throw new PopServerError(registerReply.code);
     }
-    // Carry the (optional) version fields through to the caller for its handshake
-    // policy + state exposure; absent fields stay undefined (pre-v1 plugin).
-    const result: RegisterWithPopResult = { peerId: opts.peerId, registered: true };
+    // Protocol v2 is breaking and mandatory in both directions. Missing and
+    // malformed values are terminal just like a numeric mismatch.
+    const pv: unknown = registerReply.protocolVersion;
+    if (typeof pv !== "number" || !Number.isSafeInteger(pv)) {
+      throw new ProtocolVersionMalformedError(pv);
+    }
+    const result: RegisterWithPopResult = {
+      peerId: opts.peerId,
+      registered: true,
+      protocolVersion: pv,
+    };
     if (registerReply.wrappedConversationKey) {
       result.wrappedConversationKey = registerReply.wrappedConversationKey;
-    }
-    // protocolVersion is STRICT: absent → pre-v1 (tolerated). But present-and-
-    // not-a-safe-integer (e.g. the string "2") must NOT silently degrade to
-    // undefined — that would let the mismatch guard read it as "absent" and
-    // proceed, the exact silent break this handshake kills. Read via `unknown`
-    // so the declared `number` type can't narrow the runtime check away.
-    const pv: unknown = registerReply.protocolVersion;
-    if (pv !== undefined) {
-      if (typeof pv !== "number" || !Number.isSafeInteger(pv)) {
-        throw new ProtocolVersionMalformedError(pv);
-      }
-      result.protocolVersion = pv;
     }
     // pluginVersion stays LENIENT (advisory only): a non-string drops to
     // undefined without failing the connection.

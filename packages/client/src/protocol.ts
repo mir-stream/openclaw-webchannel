@@ -9,10 +9,10 @@
  *
  * There is no shared package between the client and the plugin, so the plugin
  * declares its OWN equal constant (see packages/plugin/src/protocol.ts). The
- * handshake itself catches any drift between the two: the client enforces the
- * match, the plugin stays permissive (v1 is the only version).
+ * handshake itself catches any drift between the two. Protocol v2 is mandatory
+ * in both directions; neither side accepts an absent or mismatched version.
  *
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
  */
-export const WEBCHANNEL_PROTOCOL_VERSION = 1;
+export const WEBCHANNEL_PROTOCOL_VERSION = 2;

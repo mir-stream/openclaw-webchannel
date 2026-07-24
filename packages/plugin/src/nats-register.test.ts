@@ -161,7 +161,12 @@ function makeHarness(opts?: {
   };
 
   const run = async (payload: unknown): Promise<void> => {
-    deps.payload = JSON.stringify(payload);
+    const body = payload as Record<string, unknown>;
+    deps.payload = JSON.stringify(
+      body.op === "register" && !("protocolVersion" in body)
+        ? { ...body, protocolVersion: WEBCHANNEL_PROTOCOL_VERSION }
+        : body,
+    );
     await handleRegisterRequest(deps);
   };
 
@@ -169,6 +174,19 @@ function makeHarness(opts?: {
 }
 
 describe("handleRegisterRequest (register over NATS)", () => {
+  it.each([
+    ["absent", undefined],
+    ["old", WEBCHANNEL_PROTOCOL_VERSION - 1],
+    ["malformed", "2"],
+  ])("rejects %s authenticated register protocol versions before peer establishment", async (_label, protocolVersion) => {
+    const h = makeHarness();
+    await h.run({ op: "register", token: "jwt", protocolVersion });
+    expect(JSON.parse(h.replies[0])).toEqual({
+      error: "protocol_mismatch", code: 426, protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
+    });
+    expect(h.registered).toEqual([]);
+  });
+
   it("challenge → register happy path delivers the wrapped conversation key", async () => {
     const device = makeDevice();
     const h = makeHarness({

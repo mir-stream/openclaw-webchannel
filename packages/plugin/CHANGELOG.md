@@ -12,6 +12,16 @@
   partial audience-pin proposal.
 - Register admission now requires a non-empty signed tenant claim matching the
   configured tenant for challenge, register, and unregister.
+- **Protocol v2:** authenticated register requests require v2 and bounded
+  retained-work overload uses `inbound_rejected`; client and plugin must upgrade
+  together.
+- Bound debounce waiting/in-flight plus busy dispatcher pending work by shared
+  process and per-session count/charged-byte budgets. Preserve admitted work and
+  reject only the newest overflow with durable outcome dedupe.
+- `/stop` now cancellation-records and ACKs the exact waiting/in-flight union
+  before releasing its reservations; failed suppression writes recover through
+  the bounded replay tombstone path. Every ACK/rejection producer shares the
+  same 64-id, 64-KiB, effective-`max_payload` result boundary.
 
 ### Security upgrade / incident response
 

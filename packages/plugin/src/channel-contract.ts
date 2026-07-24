@@ -34,7 +34,8 @@ export type OutboundWsMessage =
   | { type: "typing" }
   | { type: "history"; messages: HistoryMessage[] }
   | { type: "commands"; commands: CommandCatalogEntry[] }
-  | { type: "ack"; ids: string[] };
+  | { type: "ack"; ids: string[] }
+  | { type: "inbound_rejected"; ids: string[]; reason: "overloaded" };
 
 export interface WebChannelPeerChannel {
   sendText(peerId: string, text: string, id?: string, turnId?: string): boolean;
@@ -47,6 +48,8 @@ export interface WebChannelPeerChannel {
   sendApprovalRequest(peerId: string, request: ApprovalRequestPayload): boolean;
   sendApprovalResolved(peerId: string, id: string, decision: ApprovalDecision): boolean;
   sendApprovalSnapshot(peerId: string, approvals: ApprovalRequestPayload[], resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean;
+  sendAck?(peerId: string, ids: string[]): boolean;
+  sendInboundRejected?(peerId: string, ids: string[]): boolean;
 }
 
 export class NullPeerChannel implements WebChannelPeerChannel {
@@ -60,4 +63,6 @@ export class NullPeerChannel implements WebChannelPeerChannel {
   sendApprovalRequest(_peerId: string, _request: ApprovalRequestPayload): boolean { return false; }
   sendApprovalResolved(_peerId: string, _id: string, _decision: ApprovalDecision): boolean { return false; }
   sendApprovalSnapshot(_peerId: string, _approvals: ApprovalRequestPayload[], _resolved?: Array<{ id: string; decision: ApprovalDecision }>): boolean { return false; }
+  sendAck(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
+  sendInboundRejected(_peerId: string, ids: string[]): boolean { return ids.length === 0; }
 }

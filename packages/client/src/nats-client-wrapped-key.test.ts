@@ -251,11 +251,11 @@ function registerAgentHandler(
   peerId: string,
   wrapped: () => WrappedConversationKey | null,
   gate?: Promise<void>,
-  // Optional wire-protocol version fields to include in the register reply (the
-  // protocol handshake). Omitted keys model a pre-v1 / pre-reporting plugin.
+  // Test-only controls for malformed/absent register reply fields. Protocol v2
+  // requires protocolVersion; omission deliberately models a terminal peer.
   // protocolVersion is typed `number | string` (widened past the real wire type)
   // so a test can inject a malformed string "2" from a buggy/third-party plugin.
-  versions?: { protocolVersion?: number | string; pluginVersion?: string },
+  versions?: { protocolVersion?: number | string | null; pluginVersion?: string },
 ): ServerHandler {
   const reg = registerSubject(TENANT, AGENT, peerId);
   return async (subject, payload, server, replyTo) => {
@@ -271,7 +271,9 @@ function registerAgentHandler(
       const reply: Record<string, unknown> = w
         ? { peerId, registered: true, wrappedConversationKey: w }
         : { peerId, registered: true };
-      if (versions?.protocolVersion !== undefined) reply.protocolVersion = versions.protocolVersion;
+      if (versions?.protocolVersion !== null) {
+        reply.protocolVersion = versions?.protocolVersion ?? WEBCHANNEL_PROTOCOL_VERSION;
+      }
       if (versions?.pluginVersion !== undefined) reply.pluginVersion = versions.pluginVersion;
       server.deliverToClient(replyTo, JSON.stringify(reply));
     }
@@ -711,7 +713,7 @@ describe("unwrapConversationKey conformance (agent wrap ↔ browser unwrap)", ()
 // ---------------------------------------------------------------------------
 
 describe("WebChannelNatsClient — register protocol-version handshake", () => {
-  it("match: reply carries protocolVersion=1 + pluginVersion → onProtocol exposes both, session establishes", async () => {
+  it("match: reply carries protocol v2 + pluginVersion → onProtocol exposes both, session establishes", async () => {
     const K = new Uint8Array(randomBytes(32));
     const agentId = makeAgentIdentity();
     const { client, deviceKP } = await makeClient(agentId.publicB64url);
@@ -732,7 +734,7 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     await settle();
 
     expect(errors).toHaveLength(0);
-    expect(infos).toEqual([{ protocolVersion: 1, pluginVersion: "9.9.9" }]);
+    expect(infos).toEqual([{ protocolVersion: WEBCHANNEL_PROTOCOL_VERSION, pluginVersion: "9.9.9" }]);
     // Session still establishes: the buffered send flushed as ciphertext under K.
     const sent = server.published.filter((p) => p.subject === inboundSubject(TENANT, AGENT, PEER));
     expect(sent).toHaveLength(1);
@@ -741,7 +743,7 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     client.disconnect();
   });
 
-  it("absent (pre-v1 plugin): reply omits version fields → onProtocol exposes nulls, non-fatal", async () => {
+  it("absent protocol version is terminal under v2", async () => {
     const K = new Uint8Array(randomBytes(32));
     const agentId = makeAgentIdentity();
     const { client, deviceKP } = await makeClient(agentId.publicB64url);
@@ -752,21 +754,20 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     client.onError((e) => errors.push(e));
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
-    // No `versions` arg → reply has neither protocolVersion nor pluginVersion.
     server.handler = registerAgentHandler(PEER, () =>
       wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      undefined,
+      { protocolVersion: null },
     );
     client.sendUserMessage("hello");
     await settle();
 
-    expect(errors).toHaveLength(0);
-    expect(infos).toEqual([{ protocolVersion: null, pluginVersion: null }]);
-    expect(server.readyState).toBe(FakeNatsWS.OPEN);
-
-    client.disconnect();
+    expect(errors).toHaveLength(1);
+    expect(infos).toEqual([]);
+    expect(server.readyState).toBe(FakeNatsWS.CLOSED);
   });
 
-  it("mismatch: reply protocolVersion=2 → TERMINAL onError naming both versions, socket torn down, no key", async () => {
+  it("mismatch is terminal and names both versions", async () => {
     const K = new Uint8Array(randomBytes(32));
     const agentId = makeAgentIdentity();
     const { client, deviceKP } = await makeClient(agentId.publicB64url);
@@ -782,7 +783,7 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
       PEER,
       () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
       undefined,
-      { protocolVersion: 2, pluginVersion: "2.0.0" },
+      { protocolVersion: WEBCHANNEL_PROTOCOL_VERSION + 1, pluginVersion: "2.0.0" },
     );
     client.sendUserMessage("never-sent");
     await settle();
@@ -790,8 +791,8 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     // Terminal: a two-sided diagnostic and a torn-down socket.
     expect(infos).toHaveLength(0);
     expect(errors).toHaveLength(1);
-    expect(errors[0].message).toContain("client=1");
-    expect(errors[0].message).toContain("agent-plugin=2");
+    expect(errors[0].message).toContain(`client=${WEBCHANNEL_PROTOCOL_VERSION}`);
+    expect(errors[0].message).toContain(`agent-plugin=${WEBCHANNEL_PROTOCOL_VERSION + 1}`);
     // P1-7: incompatible wire versions → protocol-mismatch (no re-auth affordance).
     expect(causes).toEqual(["protocol-mismatch"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
@@ -812,7 +813,7 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     // A buggy/third-party plugin sends the string "2" instead of the number 2.
-    // This must NOT silently degrade to "absent/pre-v1" and proceed.
+    // This must not be coerced or treated as absent; protocol v2 fails closed.
     server.handler = registerAgentHandler(
       PEER,
       () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
@@ -846,7 +847,7 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     // "1" would "match" WEBCHANNEL_PROTOCOL_VERSION if we coerced — we must not:
-    // a well-behaved v1 plugin sends the NUMBER 1, so a string is malformed.
+    // Protocol versions are numeric; a string is malformed even if coercible.
     server.handler = registerAgentHandler(
       PEER,
       () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),

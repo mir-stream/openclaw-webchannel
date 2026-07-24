@@ -101,8 +101,36 @@ describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () 
   it("wires the debouncer onFlush from the extracted createIngressOnFlush factory", () => {
     // The onFlush must be the tested factory, not an inlined closure (which could
     // silently drift — e.g. dispatch `items` instead of the deduped survivors, or
-    // drop the accountId namespace). Pin `onFlush: createIngressOnFlush(`.
-    expect(RUNTIME_SOURCE).toMatch(/onFlush:\s*createIngressOnFlush</);
+    // drop the accountId namespace). The typed factory is constructed once and
+    // passed directly to the bounded debouncer.
+    expect(RUNTIME_SOURCE).toMatch(/const onIngressFlush = createIngressOnFlush</);
+    expect(RUNTIME_SOURCE).toMatch(/onFlush:\s*onIngressFlush/);
+  });
+
+  it("uses one module-scope process budget/outcome store and the bounded debouncer", () => {
+    expect(RUNTIME_SOURCE.match(/new InboundRetentionBudget\(/g)).toHaveLength(1);
+    expect(RUNTIME_SOURCE).toMatch(/const processInboundRetention/);
+    expect(RUNTIME_SOURCE).toMatch(/const processIngressOutcomes/);
+    expect(RUNTIME_SOURCE).toMatch(/createBoundedInboundDebouncer/);
+    expect(RUNTIME_SOURCE).not.toMatch(/createInboundDebouncer</);
+    expect(RUNTIME_SOURCE).not.toContain("createPersistentDedupe");
+    expect(RUNTIME_SOURCE).toMatch(/isOverflowClaimed:/);
+    expect(RUNTIME_SOURCE).toMatch(/processOverflowResolver\.hasActiveClaim/);
+    expect(RUNTIME_SOURCE).toMatch(/isCancelledFallback:/);
+    expect(RUNTIME_SOURCE).toMatch(/recoverCancelled/);
+    expect(RUNTIME_SOURCE).toMatch(/onCancelledRecovered:/);
+  });
+
+  it("charges only the wire message, excluding the peer routing wrapper", () => {
+    expect(RUNTIME_SOURCE).toMatch(
+      /estimateRetainedMessageBytes,[\s\S]*?from "\.\/inbound-retention\.js"/,
+    );
+    expect(RUNTIME_SOURCE).toMatch(
+      /measure:\s*\(item\)\s*=>\s*estimateRetainedMessageBytes\(item\.message\)/,
+    );
+    expect(RUNTIME_SOURCE).not.toMatch(
+      /measure:\s*\(item\)\s*=>\s*estimateRetainedMessageBytes\(item\)(?!\.message)/,
+    );
   });
 });
 

@@ -39,18 +39,20 @@ export type SendState = "queued" | "sent" | "accepted" | "failed";
  *                   was dropped (a fresh send on the ready instance can succeed).
  * - `terminal`    — a non-retryable connection failure (auth/protocol/register);
  *                   `cause` carries the original `WebChannelErrorCause`.
+ * - `overloaded`  — plugin rejected ingress due to bounded retained-work pressure;
+ *                   caller-directed retry is allowed, but never automatic.
  * - `turn-failed` — the turn was admitted but settled with `outcome:"error"`;
  *                   caller-directed re-sending is allowed when ready.
  * - `cancelled`   — the user intentionally cancelled the send (a `/stop`
  *                   hold-retraction or `retract()`); never retryable.
  *
- * Runtime policy is `true` for `evicted`/`turn-failed`, and `false` for
- * `closed`/`terminal`/`cancelled`. Readiness is separate: a caller still must not
+ * Runtime policy is `true` for `evicted`/`overloaded`/`turn-failed`, and `false`
+ * for `closed`/`terminal`/`cancelled`. Readiness is separate: a caller still must not
  * retry until the current instance is ready (and terminal recovery needs a new
  * instance), even where the surrounding application offers a recovery action.
  */
 export type SendFailure = {
-  reason: "closed" | "evicted" | "terminal" | "turn-failed" | "cancelled";
+  reason: "closed" | "evicted" | "terminal" | "overloaded" | "turn-failed" | "cancelled";
   /** For `reason === "terminal"`: the original connection-failure classification. */
   cause?: WebChannelErrorCause;
   retryable: boolean;
@@ -240,8 +242,9 @@ export type WebChannelErrorCause =
   // revocation-NEUTRAL — a benign expiry hitting during a reconnect window is
   // rejected at CONNECT as a violation, so this cause can cover that user story too.
   | "auth-rejected"
-  // Version mismatch, malformed `protocolVersion`, or a register reply with no
-  // `wrappedConversationKey`: the two sides speak incompatible wire contracts.
+  // Explicit 426, version mismatch, malformed/missing `protocolVersion`, or a
+  // register reply with no `wrappedConversationKey`: the two sides speak
+  // incompatible wire contracts.
   // Re-auth CANNOT help — the older side must be upgraded.
   | "protocol-mismatch"
   // Missing SaaS-pinned agent key OR a conversation-key unwrap failure: the E2E
@@ -251,9 +254,8 @@ export type WebChannelErrorCause =
   // Embedder-side bug: the bootstrap `jwt` is missing. A code fix, not a retry —
   // re-auth provably cannot help.
   | "config"
-  // PoP register non-401/non-503 error reply (typically 5xx; the reply is
-  // deliberately a no-oracle, so an odd 4xx lands here too — acceptable). Retry
-  // later / re-auth.
+  // PoP register non-401/non-426/non-503 error reply (typically 5xx; the reply
+  // is deliberately a no-oracle, so another odd 4xx lands here). Retry later.
   | "server"
   // Fallback — any terminal error without a classified cause.
   | "unknown";
@@ -304,11 +306,9 @@ export type WebChannelState = {
   commands?: CommandCatalogEntry[];
   /**
    * The AGENT-plugin's wire-protocol version, learned from the register success
-   * reply (NATS path). `null` until a register completes, and STAYS null against
-   * a pre-v1 plugin whose reply omits the field (non-fatal — see the register
-   * policy in nats-client.ts). A value that DISAGREES with the client's
-   * `WEBCHANNEL_PROTOCOL_VERSION` never lands here: it is a TERMINAL error that
-   * moves `status` to `"error"` instead. Exposed for diagnostics (admin screen).
+   * reply (NATS path). `null` only until a register completes. Under mandatory
+   * protocol v2, an absent, malformed, or mismatched value never lands here: it
+   * is a TERMINAL error that moves `status` to `"error"`. Exposed for diagnostics.
    */
   agentProtocolVersion: number | null;
   /**

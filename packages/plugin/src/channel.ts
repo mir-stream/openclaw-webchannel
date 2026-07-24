@@ -139,7 +139,7 @@ export function createWebChannelPlugin(
      * for native approval delivery/finalize. The NATS entry passes a resolver
      * over its per-account runtimes; the legacy single-transport WS entry omits
      * it and every account falls back to `transport` (unchanged behavior).
-     */
+    */
     resolveApprovalTransport?: ResolveAccountTransport;
     startNatsAccount?: (ctx: any) => Promise<void>;
     onInvalidAccountId?: (cfg: OpenClawConfig, invalid: { id: string; reason: string }) => void;
