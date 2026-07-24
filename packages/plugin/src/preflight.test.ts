@@ -199,10 +199,10 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
     });
     expect(report.ok).toBe(true);
     expect(dial).toHaveBeenCalledOnce();
-    // Scoped no-op subject rides the account's own subtree.
+    // Probe fences the exact wildcard subscription runtime installs.
     expect(dial.mock.calls[0][0]).toMatchObject({
       url: "wss://relay.example",
-      subject: "webchannel.t.acme._preflight",
+      subject: "webchannel.t.acme.*.register",
     });
     expect(log.mock.calls.some((c) => String(c[0]).includes("issuer/aud ✓"))).toBe(true);
   });
@@ -362,7 +362,7 @@ describe("dialRelayForPreflight (relay-dial probe)", () => {
       url: "wss://relay.example",
       userJwt: "J",
       userSeed: "S",
-      subject: "webchannel.t.acme._preflight",
+      subject: "webchannel.t.acme.*.register",
       timeoutMs: 5,
       connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
     });
@@ -384,7 +384,7 @@ describe("dialRelayForPreflight (relay-dial probe)", () => {
       url: "wss://relay.example",
       userJwt: "J",
       userSeed: "S",
-      subject: "webchannel.t.acme._preflight",
+      subject: "webchannel.t.acme.*.register",
       timeoutMs: 5000,
       connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
     });
@@ -406,7 +406,7 @@ describe("dialRelayForPreflight (relay-dial probe)", () => {
       url: "wss://relay.example",
       userJwt: "SECRET-JWT",
       userSeed: "SECRET-SEED",
-      subject: "webchannel.t.acme._preflight",
+      subject: "webchannel.t.acme.*.register",
       timeoutMs: 5000,
       connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
     });
@@ -428,7 +428,7 @@ describe("dialRelayForPreflight (relay-dial probe)", () => {
       url: "wss://relay.example",
       userJwt: "J",
       userSeed: "S",
-      subject: "webchannel.t.acme._preflight",
+      subject: "webchannel.t.acme.*.register",
       timeoutMs: 5,
       connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
     });

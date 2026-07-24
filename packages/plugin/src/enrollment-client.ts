@@ -18,16 +18,18 @@
 
 import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { accountCredentialPath } from "./account-config.js";
+import {
+  accountCredentialPath,
+  loadCredentialDocumentAtPath,
+} from "./account-config.js";
 import {
   CREDENTIAL_BINDING_IDENTITY_FIELD,
   CredentialDocumentBindingError,
   assertValidCredentialBindingExpectation,
   createCredentialIdentityForEnrollment,
   loadBoundCredentialDocument,
-  loadBoundCredentialDocumentJson,
   type PluginCredentialDocument,
 } from "./credential-document.js";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
@@ -225,6 +227,12 @@ export type EnrollmentOptions = {
 
   /** @internal Test-only home-directory seam for default path resolution. */
   _home?: string;
+
+  /** @internal Test-only direct credential-file reader seam. */
+  _readCredentialFile?: (path: string) => string;
+
+  /** @internal Test-only identity generation seam. */
+  _generateIdentityKey?: () => KeyPair;
 };
 
 // ---------------------------------------------------------------------------
@@ -242,12 +250,22 @@ export type EnrollmentOptions = {
  */
 export class EnrollmentClient {
   private readonly options: Required<
-    Omit<EnrollmentOptions, "displayInstructions" | "accountId" | "_minPollIntervalMs" | "_home">
+    Omit<
+      EnrollmentOptions,
+      | "displayInstructions"
+      | "accountId"
+      | "_minPollIntervalMs"
+      | "_home"
+      | "_readCredentialFile"
+      | "_generateIdentityKey"
+    >
   > & {
     displayInstructions: boolean;
     accountId: string;
     _minPollIntervalMs?: number;
     _home?: string;
+    _readCredentialFile?: (path: string) => string;
+    _generateIdentityKey?: () => KeyPair;
   };
   private credentials?: PluginCredentials;
 
@@ -311,7 +329,7 @@ export class EnrollmentClient {
     }
 
     // Generate new key pair
-    const keyPair = generateKeyPair();
+    const keyPair = (this.options._generateIdentityKey ?? generateKeyPair)();
     return keyPair;
   }
 
@@ -344,7 +362,8 @@ export class EnrollmentClient {
    */
   private async performEnrollment(): Promise<EnrollmentResult> {
     // Generate identity key
-    const identityKey = generateKeyPair();
+    const identityKey =
+      (this.options._generateIdentityKey ?? generateKeyPair)();
 
     // Initialize credentials structure
     this.credentials = {
@@ -474,33 +493,23 @@ export class EnrollmentClient {
    * Returns true if successful, false otherwise.
    */
   private loadCredentials(): boolean {
-    try {
-      if (!existsSync(this.options.credentialPath)) {
-        return false;
-      }
-
-      const data = readFileSync(this.options.credentialPath, "utf-8");
-      const loaded = loadBoundCredentialDocumentJson(
-        {
-          tenant: this.options.tenant,
-          accountId: this.options.accountId,
-          saasBaseUrl: this.options.saasBaseUrl,
-        },
-        data,
-      );
-      if (loaded.status !== "match") {
-        throw new CredentialDocumentBindingError(loaded);
-      }
-      this.credentials = loaded.document;
-      return true;
-    } catch (error) {
-      if (error instanceof CredentialDocumentBindingError) throw error;
-      throw new CredentialDocumentBindingError({
-        status: "invalid",
-        code: "read-failed",
-        fields: Object.freeze([]),
-      });
+    const loaded = loadCredentialDocumentAtPath(
+      {
+        tenant: this.options.tenant,
+        accountId: this.options.accountId,
+        saasBaseUrl: this.options.saasBaseUrl,
+      },
+      this.options.credentialPath,
+      this.options._readCredentialFile,
+    );
+    if (loaded.status === "absent") {
+      return false;
     }
+    if (loaded.status !== "match") {
+      throw new CredentialDocumentBindingError(loaded);
+    }
+    this.credentials = loaded.document;
+    return true;
   }
 
   /**

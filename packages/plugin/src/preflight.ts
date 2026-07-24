@@ -405,8 +405,9 @@ export async function runAddPreflight(
     };
   }
 
-  // 2. Relay dial (scoped no-op sub within the account's own subtree, then close).
-  const dialSubject = `webchannel.${opts.tenant}.${opts.accountId}._preflight`;
+  // 2. Relay dial. Fence the exact wildcard subscription runtime installs.
+  const dialSubject =
+    `webchannel.${opts.tenant}.${opts.accountId}.*.register`;
   const relay = opts.enrollment.natsUrl
     ? await (opts.dial ?? dialRelayForPreflight)({
         url: opts.enrollment.natsUrl,
