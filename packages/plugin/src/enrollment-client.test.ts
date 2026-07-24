@@ -23,9 +23,10 @@ import {
   existsSync,
   readFileSync,
   renameSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { accountCredentialPath, legacyCredentialPath } from "./account-config.js";
 import { MemoryEnrollmentRepository } from "../../saas/src/enrollment-repository.js";
@@ -651,6 +652,24 @@ describe("EnrollmentClient", () => {
   });
 
   describe("Error handling", () => {
+    it("does not enroll through a dangling credential symlink", async () => {
+      symlinkSync(join(dirname(credentialPath), "missing-target"), credentialPath);
+      const generateIdentityKey = vi.fn(() => generateKeyPair());
+      const danglingClient = new EnrollmentClient(
+        createTestOptions({
+          credentialPath,
+          _generateIdentityKey: generateIdentityKey,
+        }),
+      );
+
+      await expect(danglingClient.enroll()).rejects.toMatchObject({
+        code: "credentials-invalid-read-failed",
+        fields: [],
+      });
+      expect(generateIdentityKey).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     it("treats EACCES as read-failed before key generation or enrollment", async () => {
       const read = vi.fn(() => {
         throw Object.assign(new Error("SECRET denied path"), {
