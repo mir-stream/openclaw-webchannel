@@ -24,14 +24,26 @@ export function parseConversationKeyDocument(
   serialized: string,
 ): Map<string, Uint8Array> {
   const document = parseRecord(serialized);
+  const hasIdentity = Object.prototype.hasOwnProperty.call(
+    document,
+    CONVERSATION_KEY_IDENTITY_FIELD,
+  );
+  // An explicit identity marker is authoritative even when the surrounding
+  // document version is malformed or unsupported. Otherwise a foreign-scope
+  // document could be downgraded to "ordinary corruption" and moved aside.
+  if (hasIdentity) {
+    assertDocumentStorageIdentity(
+      "conversation-keys",
+      scope,
+      document[CONVERSATION_KEY_IDENTITY_FIELD],
+    );
+  }
   if (document.version !== CONVERSATION_KEY_DOCUMENT_VERSION) {
     throw new StorageDocumentError("conversation-keys", "invalid-document");
   }
-  assertDocumentStorageIdentity(
-    "conversation-keys",
-    scope,
-    document[CONVERSATION_KEY_IDENTITY_FIELD],
-  );
+  if (!hasIdentity) {
+    assertDocumentStorageIdentity("conversation-keys", scope, undefined);
+  }
   return parseKeys(document.keys);
 }
 

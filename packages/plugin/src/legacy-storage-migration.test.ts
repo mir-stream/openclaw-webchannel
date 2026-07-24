@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -110,6 +111,9 @@ function writeLegacyState(
 describe("legacy tuple storage migration", () => {
   it("migrates a proven owner, verifies both destinations, and retains a recoverable backup", () => {
     const legacy = writeLegacyState();
+    chmodSync(legacy.directory, 0o755);
+    chmodSync(legacy.credentialPath, 0o644);
+    chmodSync(legacy.conversationKeyPath, 0o644);
     const result = migrateLegacyTupleState({ ...SCOPE, home });
     const destination = tupleStoragePaths({ ...SCOPE, home });
 
@@ -136,6 +140,13 @@ describe("legacy tuple storage migration", () => {
     expect(
       existsSync(join(backup, "source", "conversation-keys.json")),
     ).toBe(true);
+    expect(statSync(join(backup, "source")).mode & 0o777).toBe(0o700);
+    expect(
+      statSync(join(backup, "source", "credentials.json")).mode & 0o777,
+    ).toBe(0o600);
+    expect(
+      statSync(join(backup, "source", "conversation-keys.json")).mode & 0o777,
+    ).toBe(0o600);
     expect(existsSync(join(backup, "migration-complete.json"))).toBe(true);
 
     const credential = parseCredentialJson(
@@ -186,6 +197,8 @@ describe("legacy tuple storage migration", () => {
 
   it("quarantines an ownership-ambiguous v1 key without adopting it", () => {
     const legacy = writeLegacyState(SCOPE, { credential: false });
+    chmodSync(legacy.directory, 0o755);
+    chmodSync(legacy.conversationKeyPath, 0o644);
     const result = migrateLegacyTupleState({ ...SCOPE, home });
     const destination = tupleStoragePaths({ ...SCOPE, home });
 
@@ -195,11 +208,12 @@ describe("legacy tuple storage migration", () => {
       conversationKeys: "fresh",
     });
     expect(existsSync(legacy.conversationKeyPath)).toBe(false);
-    expect(
-      readdirSync(legacy.directory).some((name) =>
-        name.startsWith("conversation-keys.json.ambiguous-v2-"),
-      ),
-    ).toBe(true);
+    const archive = readdirSync(legacy.directory).find((name) =>
+      name.startsWith("conversation-keys.json.ambiguous-v2-"),
+    );
+    expect(archive).toBeDefined();
+    expect(statSync(legacy.directory).mode & 0o777).toBe(0o700);
+    expect(statSync(join(legacy.directory, archive!)).mode & 0o777).toBe(0o600);
     expect(
       parseConversationKeyDocument(
         SCOPE,
