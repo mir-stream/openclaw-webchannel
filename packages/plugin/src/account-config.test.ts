@@ -20,6 +20,7 @@ import {
   loadPersistedCredentialDocument,
 } from "./account-config.js";
 import { createCredentialIdentityForEnrollment } from "./credential-document.js";
+import { generateKeyPair } from "./e2e-crypto.js";
 import { planAccounts } from "./multiplex.js";
 
 const HOME = "/home/test";
@@ -419,7 +420,9 @@ describe("account-config: credential paths", () => {
 });
 
 describe("account-config: loadPersistedCredentialDocument", () => {
-  const key = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+  const pair = generateKeyPair();
+  const key = Buffer.from(pair.publicKey).toString("base64url");
+  const privateKey = Buffer.from(pair.privateKey).toString("base64url");
   const expected = {
     tenant: "tenant-a",
     accountId: "acctA",
@@ -432,7 +435,7 @@ describe("account-config: loadPersistedCredentialDocument", () => {
       relayUrl: "wss://relay.example",
       agentPublicKey: key,
     }),
-    identityKey: { publicKey: key, privateKey: key },
+    identityKey: { publicKey: key, privateKey },
     enrollment: {
       creds: { userJwt: "JWT", userSeed: "SEED" },
       issuer: "https://issuer.example/",

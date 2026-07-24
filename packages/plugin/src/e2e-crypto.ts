@@ -147,6 +147,28 @@ export function generateKeyPair(): KeyPair {
   };
 }
 
+/**
+ * Derive the raw X25519 public key corresponding to a raw 32-byte private key.
+ *
+ * This is also useful when validating a persisted key pair: accepting two
+ * independently well-shaped halves is not sufficient because the private half
+ * must actually control the persisted (and identity-bound) public half.
+ */
+export function derivePublicKey(privateKey: Uint8Array): Uint8Array {
+  if (privateKey.length !== 32) {
+    throw new Error("X25519 private key must be exactly 32 bytes");
+  }
+  const privateKeyObj = createPrivateKey({
+    key: Buffer.concat([X25519_PKCS8_HEADER, Buffer.from(privateKey)]),
+    format: "der",
+    type: "pkcs8",
+  });
+  const publicJwk = createPublicKey(privateKeyObj).export({ format: "jwk" }) as {
+    x: string;
+  };
+  return new Uint8Array(Buffer.from(publicJwk.x, "base64url"));
+}
+
 // ---------------------------------------------------------------------------
 // 2. ECDH shared-secret derivation
 // ---------------------------------------------------------------------------

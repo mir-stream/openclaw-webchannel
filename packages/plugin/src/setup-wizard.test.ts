@@ -18,8 +18,11 @@ import { webchannelSetupWizard, validateHttpUrl } from "./setup-wizard.js";
 import { NullPeerChannel } from "./channel-contract.js";
 import { createWebChannelPlugin } from "./channel.js";
 import { createCredentialIdentityForEnrollment } from "./credential-document.js";
+import { generateKeyPair } from "./e2e-crypto.js";
 
-const CREDENTIAL_KEY = Buffer.alloc(32, 5).toString("base64url");
+const CREDENTIAL_PAIR = generateKeyPair();
+const CREDENTIAL_KEY = Buffer.from(CREDENTIAL_PAIR.publicKey).toString("base64url");
+const CREDENTIAL_PRIVATE_KEY = Buffer.from(CREDENTIAL_PAIR.privateKey).toString("base64url");
 
 function boundCredentialJson(
   overrides: Partial<{
@@ -36,14 +39,16 @@ function boundCredentialJson(
   return JSON.stringify({
     credentialIdentity: createCredentialIdentityForEnrollment({
       ...identity,
+      relayUrl: "wss://relay.example",
       agentPublicKey: CREDENTIAL_KEY,
     }),
     identityKey: {
       publicKey: CREDENTIAL_KEY,
-      privateKey: CREDENTIAL_KEY,
+      privateKey: CREDENTIAL_PRIVATE_KEY,
     },
     enrollment: {
       creds: { userJwt: "JWT", userSeed: "SEED" },
+      natsUrl: "wss://relay.example",
     },
   });
 }
@@ -144,12 +149,12 @@ describe("setup-wizard: declarative detection", () => {
     expect(webchannelSetupWizard.channel).toBe("webchannel");
   });
 
-  it("status.resolveConfigured is true once auth.jwt is present", () => {
+  it("status.resolveConfigured does not let auth.jwt bypass enrolled credentials", () => {
     existsMock.mockReturnValue(false);
     const cfg = {
       channels: { webchannel: { accounts: { accta: { auth: { jwt: {} } } } } },
     } as never;
-    expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(true);
+    expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(false);
   });
 
   it("status.resolveConfigured is false when neither auth.jwt nor creds exist", () => {
@@ -167,6 +172,7 @@ describe("setup-wizard: declarative detection", () => {
             accta: {
               tenant: "tenant-a",
               saas: { baseUrl: "https://saas.example" },
+              auth: { jwt: { issuer: "https://issuer.example" } },
             },
           },
         },
@@ -195,6 +201,43 @@ describe("setup-wizard: declarative detection", () => {
         cfg,
         accountId: "accta",
       }),
+    ).toBe(true);
+  });
+
+  it("status validates against the effective nats.credentials SaaS override", () => {
+    existsMock.mockReturnValue(true);
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "tenant-a",
+              saas: { baseUrl: "https://saas-a.example" },
+              nats: {
+                credentials: {
+                  mode: "enrolled",
+                  saasBaseUrl: "https://saas-b.example",
+                },
+              },
+              auth: { jwt: { issuer: "https://issuer.example" } },
+            },
+          },
+        },
+      },
+    } as never;
+
+    readMock.mockReturnValue(
+      boundCredentialJson({ saasBaseUrl: "https://saas-a.example" }),
+    );
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" }),
+    ).toBe(false);
+
+    readMock.mockReturnValue(
+      boundCredentialJson({ saasBaseUrl: "https://saas-b.example" }),
+    );
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" }),
     ).toBe(true);
   });
 });

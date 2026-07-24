@@ -9,10 +9,14 @@ import {
   inspectCredentialDocumentJson,
   loadBoundCredentialDocument,
 } from "./credential-document.js";
+import { generateKeyPair } from "./e2e-crypto.js";
 
-const PUBLIC_KEY = Buffer.alloc(32, 7).toString("base64url");
-const PRIVATE_KEY = Buffer.alloc(32, 8).toString("base64url");
-const OTHER_KEY = Buffer.alloc(32, 9).toString("base64url");
+const PAIR = generateKeyPair();
+const OTHER_PAIR = generateKeyPair();
+const PUBLIC_KEY = Buffer.from(PAIR.publicKey).toString("base64url");
+const PRIVATE_KEY = Buffer.from(PAIR.privateKey).toString("base64url");
+const OTHER_KEY = Buffer.from(OTHER_PAIR.publicKey).toString("base64url");
+const OTHER_PRIVATE_KEY = Buffer.from(OTHER_PAIR.privateKey).toString("base64url");
 const EXPECTED = Object.freeze({
   tenant: "tenant-A",
   accountId: "Account_A",
@@ -125,6 +129,7 @@ describe("credential document semantic binding", () => {
       const candidate = cloneDocument();
       if (payloadField === "identityKey.publicKey") {
         candidate.identityKey.publicKey = replacement;
+        candidate.identityKey.privateKey = OTHER_PRIVATE_KEY;
       } else {
         candidate.enrollment[payloadField.slice("enrollment.".length)] =
           replacement;
@@ -193,21 +198,41 @@ describe("credential document semantic binding", () => {
     });
   });
 
-  it("supports explicit null delivered facts only when the payload omits them", () => {
+  it("supports an explicit null issuer only when the payload omits it", () => {
     const candidate = cloneDocument();
     delete candidate.enrollment.issuer;
-    delete candidate.enrollment.natsUrl;
     candidate.credentialIdentity.binding.deliveredIssuer = null;
-    candidate.credentialIdentity.binding.relayUrl = null;
     expect(inspectCredentialDocument(EXPECTED, candidate)).toEqual({
       status: "match",
     });
+  });
 
-    candidate.credentialIdentity.binding.relayUrl =
-      "wss://invented.example";
+  it.each([
+    ["absent", undefined],
+    ["null", null],
+    ["empty", ""],
+  ])("rejects a reusable v2 document with %s delivered relay provenance", (_label, value) => {
+    const candidate = cloneDocument();
+    if (value === undefined) {
+      delete candidate.enrollment.natsUrl;
+    } else {
+      candidate.enrollment.natsUrl = value;
+    }
+    candidate.credentialIdentity.binding.relayUrl = null;
     expect(inspectCredentialDocument(EXPECTED, candidate)).toEqual({
-      status: "mismatch",
-      fields: ["binding.relayUrl"],
+      status: "invalid",
+      code: "invalid-document",
+      fields: ["enrollment.natsUrl"],
+    });
+  });
+
+  it("rejects well-shaped X25519 halves that do not form one key pair", () => {
+    const candidate = cloneDocument();
+    candidate.identityKey.privateKey = OTHER_PRIVATE_KEY;
+    expect(inspectCredentialDocument(EXPECTED, candidate)).toEqual({
+      status: "invalid",
+      code: "invalid-document",
+      fields: ["identityKey.publicKey", "identityKey.privateKey"],
     });
   });
 

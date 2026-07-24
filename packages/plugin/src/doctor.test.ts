@@ -13,7 +13,12 @@ import {
 
 const cfg = (webchannel: Record<string, unknown>): OpenClawConfig => ({ channels: { webchannel } } as never);
 const identityKey = { publicKey: new Uint8Array(32), privateKey: new Uint8Array(32) };
-const persisted = { userJwt: "J", userSeed: "S", identityKey };
+const persisted = {
+  userJwt: "J",
+  userSeed: "S",
+  natsUrl: "wss://bound-relay.example",
+  identityKey,
+};
 const validAuth = (_accountId = "a") => ({ strategy: "jwt", jwt: { issuer: "https://issuer", jwks: { keys: [{ kty: "RSA", kid: "test" }] } } });
 const removedDevModeKey = ["dev", "Open"].join("");
 const removedDevModeSetting = ["nats.", removedDevModeKey].join("");

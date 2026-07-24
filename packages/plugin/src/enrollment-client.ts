@@ -474,7 +474,13 @@ export class EnrollmentClient {
       }
 
       const data = JSON.stringify(this.credentials, null, 2);
-      writeFileSync(this.options.credentialPath, data, { mode: 0o600 }); // rw-------
+      // Enrollment is intentionally create-only. Another process may finish an
+      // enrollment after our initial absence check while this process polls;
+      // O_EXCL preserves that credential file instead of silently replacing it.
+      writeFileSync(this.options.credentialPath, data, {
+        mode: 0o600,
+        flag: "wx",
+      }); // rw-------
 
       console.log(`[enrollment] Credentials saved to ${this.options.credentialPath}`);
     } catch (error) {
