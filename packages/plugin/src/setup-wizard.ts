@@ -32,8 +32,6 @@
  * until `finalize` performs the single atomic full-block write.
  */
 
-import { existsSync } from "node:fs";
-
 import type {
   ChannelSetupWizard,
   ChannelSetupWizardTextInput,
@@ -42,7 +40,6 @@ import type {
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  accountCredentialPath,
   canonicalizeAccountId,
   formatAccountIdForLog,
   isValidAccountId,
@@ -128,7 +125,6 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       }
       // A path by itself is not readiness. Count enrolled material only when
       // its complete v2 identity matches the effective configured account.
-      if (!existsSync(accountCredentialPath(id))) return false;
       const identity = resolveAcquisitionIdentity(cfg, id);
       const saasBaseUrl = resolveEnrolledSaasBaseUrl({
         natsConfig: account.nats as WebchannelNatsConfig | undefined,

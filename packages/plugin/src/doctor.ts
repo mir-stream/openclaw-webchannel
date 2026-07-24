@@ -516,7 +516,7 @@ function collectRuntimeStatusIssues(accounts: ChannelAccountSnapshot[]): Channel
 async function probeRelay(material: Extract<DialMaterial, { status: "ok" }>, tenant: string, accountId: string, timeoutMs: number, deps: ProbeDeps): Promise<{ ok: true } | { error: string }> {
   const result = await (deps.dial ?? dialRelayForPreflight)({
     ...material.dial,
-    subject: `webchannel.${tenant}.${accountId}._doctor`,
+    subject: `webchannel.${tenant}.${accountId}.*.register`,
     timeoutMs,
   });
   return "error" in result

@@ -454,8 +454,10 @@ describe("account-config: loadPersistedCredentialDocument", () => {
     const perAccount = accountCredentialPath("acctA", HOME);
     const result = loadPersistedCredentialDocument(expected, {
       home: HOME,
-      exists: (path: string) => path === perAccount,
-      read: () => validFile,
+      read: (path) => {
+        expect(path).toBe(perAccount);
+        return validFile;
+      },
     });
     expect(result.status).toBe("match");
     if (result.status === "match") {
@@ -471,22 +473,29 @@ describe("account-config: loadPersistedCredentialDocument", () => {
 
   it("ignores the legacy single-file path and distinguishes absence", () => {
     const legacy = legacyCredentialPath(HOME);
+    const reads: string[] = [];
     expect(loadPersistedCredentialDocument({
       ...expected,
       accountId: "default",
     }, {
       home: HOME,
-      exists: (path: string) => path === legacy,
-      read: () => validFile,
+      read: (path) => {
+        reads.push(path);
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      },
     })).toEqual({ status: "absent" });
+    expect(reads).toEqual([accountCredentialPath("default", HOME)]);
+    expect(reads).not.toContain(legacy);
   });
 
   it("distinguishes malformed JSON without exposing its contents", () => {
     const perAccount = accountCredentialPath("acctA", HOME);
     expect(loadPersistedCredentialDocument(expected, {
       home: HOME,
-      exists: (path: string) => path === perAccount,
-      read: () => "not-json SECRET",
+      read: (path) => {
+        expect(path).toBe(perAccount);
+        return "not-json SECRET";
+      },
     })).toEqual({
       status: "invalid",
       code: "invalid-json",
@@ -498,9 +507,11 @@ describe("account-config: loadPersistedCredentialDocument", () => {
     const perAccount = accountCredentialPath("acctA", HOME);
     expect(loadPersistedCredentialDocument(expected, {
       home: HOME,
-      exists: (path: string) => path === perAccount,
-      read: () => {
-        throw new Error("SECRET filesystem detail");
+      read: (path) => {
+        expect(path).toBe(perAccount);
+        throw Object.assign(new Error("SECRET filesystem detail"), {
+          code: "EACCES",
+        });
       },
     })).toEqual({
       status: "invalid",
@@ -516,9 +527,9 @@ describe("account-config: loadPersistedCredentialDocument", () => {
       tenant: "tenant.with.dot",
     }, {
       home: HOME,
-      exists: () => {
+      read: () => {
         consulted = true;
-        return false;
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
       },
     })).toThrow(/storage identity invalid-field/);
     expect(consulted).toBe(false);

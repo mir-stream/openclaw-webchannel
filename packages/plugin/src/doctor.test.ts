@@ -259,7 +259,7 @@ describe("status probe", () => {
     const result = await probeWebchannelAccount({ account: { accountId: "default" }, timeoutMs: 50, cfg: cfg({ auth: validAuth("default"), dmSecurity: "allowlist" }) }, { env: {}, loadCreds: () => persisted, dial });
     expect(result).toMatchObject({ ok: true, admission: "register-hop", jwks: { source: "inline", keyCount: 1 }, relay: { ok: true } });
     expect(result.relay).toEqual({ ok: true });
-    expect(dial).toHaveBeenCalledWith(expect.objectContaining({ subject: "webchannel.default-tenant.default._doctor" }));
+    expect(dial).toHaveBeenCalledWith(expect.objectContaining({ subject: "webchannel.default-tenant.default.*.register" }));
   });
 
   it("probes a healthy target without planning an invalid sibling", async () => {
@@ -286,7 +286,7 @@ describe("status probe", () => {
       relay: { ok: true },
     });
     expect(dial).toHaveBeenCalledWith(
-      expect.objectContaining({ subject: "webchannel.default-tenant.good._doctor" }),
+      expect.objectContaining({ subject: "webchannel.default-tenant.good.*.register" }),
     );
     expect(loadCreds.mock.calls.every(([accountId]) => accountId === "good")).toBe(true);
   });

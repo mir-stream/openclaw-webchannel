@@ -2,13 +2,11 @@ import { beforeEach, describe, it, expect, vi } from "vitest";
 
 // Mock node:fs so status's "creds already exist" probe is controllable and never
 // touches the real home dir.
-const existsMock = vi.fn((_p: string) => false);
 const readMock = vi.fn((_p: string) => "");
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
-    existsSync: (p: string) => existsMock(p),
     readFileSync: (p: string) => readMock(p),
   };
 });
@@ -61,10 +59,10 @@ function boundCredentialJson(
 }
 
 beforeEach(() => {
-  existsMock.mockReset();
-  existsMock.mockReturnValue(false);
   readMock.mockReset();
-  readMock.mockReturnValue("");
+  readMock.mockImplementation(() => {
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  });
 });
 
 type Cfg = { channels: { webchannel?: Record<string, unknown> } };
@@ -157,7 +155,6 @@ describe("setup-wizard: declarative detection", () => {
   });
 
   it("status.resolveConfigured does not let auth.jwt bypass enrolled credentials", () => {
-    existsMock.mockReturnValue(false);
     const cfg = {
       channels: { webchannel: { accounts: { accta: { auth: { jwt: {} } } } } },
     } as never;
@@ -165,13 +162,37 @@ describe("setup-wizard: declarative detection", () => {
   });
 
   it("status.resolveConfigured is false when neither auth.jwt nor creds exist", () => {
-    existsMock.mockReturnValue(false);
     const cfg = { channels: { webchannel: { accounts: { accta: {} } } } } as never;
     expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(false);
   });
 
+  it("status is not configured when the credential store is unreadable", () => {
+    readMock.mockImplementation(() => {
+      throw Object.assign(new Error("SECRET permission detail"), {
+        code: "EACCES",
+      });
+    });
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "tenant-a",
+              saas: { baseUrl: "https://saas.example" },
+            },
+          },
+        },
+      },
+    } as never;
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(false);
+  });
+
   it("status.resolveConfigured requires a complete matching credential document, not path existence", () => {
-    existsMock.mockReturnValue(true);
     const cfg = {
       channels: {
         webchannel: {
@@ -212,7 +233,6 @@ describe("setup-wizard: declarative detection", () => {
   });
 
   it("status validates against the effective nats.credentials SaaS override", () => {
-    existsMock.mockReturnValue(true);
     const cfg = {
       channels: {
         webchannel: {
@@ -249,7 +269,6 @@ describe("setup-wizard: declarative detection", () => {
   });
 
   it("status preserves a valid case-sensitive existing account id and path", async () => {
-    existsMock.mockReturnValue(true);
     const cfg = {
       channels: {
         webchannel: {
@@ -270,7 +289,7 @@ describe("setup-wizard: declarative detection", () => {
         accountId: "Account_A",
       }),
     ).toBe(true);
-    expect(existsMock).toHaveBeenCalledWith(
+    expect(readMock).toHaveBeenCalledWith(
       expect.stringContaining("/Account_A/credentials.json"),
     );
     const lines = await Promise.resolve(
@@ -291,7 +310,7 @@ describe("setup-wizard: declarative detection", () => {
         accountId: "../../unsafe",
       }),
     ).toBe(false);
-    expect(existsMock).not.toHaveBeenCalled();
+    expect(readMock).not.toHaveBeenCalled();
     const lines = await Promise.resolve(
       webchannelSetupWizard.status.resolveStatusLines!({
         cfg,

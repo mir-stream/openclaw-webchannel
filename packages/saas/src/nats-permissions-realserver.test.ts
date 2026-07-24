@@ -350,6 +350,39 @@ async function generateRegisterDeniedCredentials(
   };
 }
 
+/** Credentials that would fool the historical synthetic readiness probes. */
+async function generateSyntheticProbeOnlyCredentials(
+  tenant: string,
+  accountId: string,
+): Promise<NatsUserCredentials> {
+  if (!trustChain) throw new Error("Trust chain not initialized");
+  const accountSigner = fromSeed(
+    new TextEncoder().encode(trustChain.private.natsAccountSeed),
+  );
+  const userKp = createUser();
+  const userSeed = new TextDecoder().decode(userKp.getSeed());
+  const pub = [`webchannel.${tenant}.${accountId}.>`];
+  const sub = [
+    `webchannel.${tenant}.${accountId}._preflight`,
+    `webchannel.${tenant}.${accountId}._doctor`,
+  ];
+  const userJwt = await encodeUser(
+    `synthetic-probe-only-${tenant}-${accountId}`,
+    userKp,
+    accountSigner,
+    {
+      pub: { allow: pub },
+      sub: { allow: sub },
+    },
+  );
+  return {
+    userJwt,
+    userSeed,
+    userPubkey: userKp.getPublicKey(),
+    permissions: { pub, sub },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -475,9 +508,12 @@ describe.skipIf(!NATS_SERVER_BIN)(
       await transport.closeGracefully();
     });
 
-    it("the preflight helper rejects a real server-denied SUB", async () => {
-      const accountId = "preflight-denied";
-      const creds = await generateRegisterDeniedCredentials(TENANT_A, accountId);
+    it("the readiness helper rejects creds that allow only old synthetic probes", async () => {
+      const accountId = "synthetic-only";
+      const creds = await generateSyntheticProbeOnlyCredentials(
+        TENANT_A,
+        accountId,
+      );
 
       await expect(
         dialRelayForPreflight({
@@ -487,7 +523,40 @@ describe.skipIf(!NATS_SERVER_BIN)(
           subject: `webchannel.${TENANT_A}.${accountId}._preflight`,
           timeoutMs: 2000,
         }),
+      ).resolves.toEqual({ ok: true });
+
+      await expect(
+        dialRelayForPreflight({
+          url: WS_URL,
+          userJwt: creds.userJwt,
+          userSeed: creds.userSeed,
+          subject: `webchannel.${TENANT_A}.${accountId}._doctor`,
+          timeoutMs: 2000,
+        }),
+      ).resolves.toEqual({ ok: true });
+
+      await expect(
+        dialRelayForPreflight({
+          url: WS_URL,
+          userJwt: creds.userJwt,
+          userSeed: creds.userSeed,
+          subject: `webchannel.${TENANT_A}.${accountId}.*.register`,
+          timeoutMs: 2000,
+        }),
       ).resolves.toEqual({ error: "relay subscription rejected" });
+    });
+
+    it("production enrollment agent credentials pass the register wildcard probe", async () => {
+      const creds = await generateTestCredentials(TENANT_A);
+      await expect(
+        dialRelayForPreflight({
+          url: WS_URL,
+          userJwt: creds.userJwt,
+          userSeed: creds.userSeed,
+          subject: `webchannel.${TENANT_A}.test-agent.*.register`,
+          timeoutMs: 2000,
+        }),
+      ).resolves.toEqual({ ok: true });
     });
 
     it("tenant A client can publish to its own subjects", async () => {

@@ -651,6 +651,29 @@ describe("EnrollmentClient", () => {
   });
 
   describe("Error handling", () => {
+    it("treats EACCES as read-failed before key generation or enrollment", async () => {
+      const read = vi.fn(() => {
+        throw Object.assign(new Error("SECRET denied path"), {
+          code: "EACCES",
+        });
+      });
+      const generateIdentityKey = vi.fn(() => generateKeyPair());
+      const inaccessible = new EnrollmentClient(
+        createTestOptions({
+          _readCredentialFile: read,
+          _generateIdentityKey: generateIdentityKey,
+        }),
+      );
+
+      await expect(inaccessible.enroll()).rejects.toMatchObject({
+        code: "credentials-invalid-read-failed",
+        fields: [],
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(generateIdentityKey).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     it.each([
       ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
       ["account", { accountId: "../../unsafe" }, "storage.accountId"],

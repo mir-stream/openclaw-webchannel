@@ -25,14 +25,12 @@ vi.mock("./preflight.js", () => ({
   runAddPreflight: (opts: never) => preflightMock(opts),
 }));
 
-// Mock node:fs so the "creds already exist" probe is controllable.
-const existsMock = vi.fn((_p: string) => false);
+// Mock node:fs so direct credential reads are controllable.
 const readMock = vi.fn((_p: string) => "");
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
-    existsSync: (p: string) => existsMock(p),
     readFileSync: (p: string) => readMock(p),
   };
 });
@@ -84,10 +82,10 @@ function section(next: unknown): Record<string, unknown> {
 beforeEach(() => {
   acquireMock.mockClear();
   preflightMock.mockClear();
-  existsMock.mockReset();
-  existsMock.mockReturnValue(false);
   readMock.mockReset();
-  readMock.mockReturnValue(credentialJson());
+  readMock.mockImplementation(() => {
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  });
 });
 
 describe("setup: resolveSetupIdentity", () => {
@@ -346,7 +344,6 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   }
 
   it("runs acquireCredentials for an enrolled account with no existing creds", async () => {
-    existsMock.mockReturnValue(false);
     const runtime = makeRuntime();
     const cfg = {
       channels: { webchannel: { accounts: { accta: { tenant: "tA", saas: { baseUrl: "http://s" } } } } },
@@ -375,7 +372,6 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   });
 
   it("refuses acquisition when the effective binding identity is invalid", async () => {
-    existsMock.mockReturnValue(false);
     const runtime = makeRuntime();
     const cfg = {
       channels: {
@@ -405,7 +401,6 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   });
 
   it("echoes the RESOLVED identity (non-secret) so the generic-flag mapping is not silent", async () => {
-    existsMock.mockReturnValue(false);
     const runtime = makeRuntime();
     const cfg = { channels: { webchannel: { accounts: { accta: {} } } } } as never;
     await webchannelSetup.afterAccountConfigWritten({
@@ -427,7 +422,6 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   });
 
   it("acquires against nats.credentials.saasBaseUrl instead of the lower account SaaS base", async () => {
-    existsMock.mockReturnValue(false);
     const runtime = makeRuntime();
     const cfg = {
       channels: {
@@ -469,7 +463,6 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   });
 
   it("uses the runtime-supported top-level identity fallback for the legacy default account", async () => {
-    existsMock.mockReturnValue(false);
     const runtime = makeRuntime();
     const cfg = {
       tenant: "legacy-tenant",
@@ -527,7 +520,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   );
 
   it("skips acquisition when per-account creds already exist", async () => {
-    existsMock.mockReturnValue(true);
+    readMock.mockReturnValue(credentialJson());
     const runtime = makeRuntime();
     const cfg = { channels: { webchannel: { accounts: { accta: { saas: { baseUrl: "http://s" } } } } } } as never;
     await webchannelSetup.afterAccountConfigWritten({
@@ -541,8 +534,38 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(runtime.log).toHaveBeenCalled();
   });
 
+  it("refuses acquisition when the credential path is unreadable", async () => {
+    readMock.mockImplementation(() => {
+      throw Object.assign(new Error("SECRET permission detail"), {
+        code: "EACCES",
+      });
+    });
+    const runtime = makeRuntime();
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: { tenant: "t", saas: { baseUrl: "http://s" } },
+          },
+        },
+      },
+    } as never;
+
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "accta",
+      input: {},
+      runtime,
+    });
+
+    expect(acquireMock).not.toHaveBeenCalled();
+    const output = runtime.log.mock.calls.flat().join("\n");
+    expect(output).toContain("credentials-invalid-read-failed");
+    expect(output).not.toContain("SECRET permission detail");
+  });
+
   it("refuses mismatched existing credentials without enrolling or exposing values", async () => {
-    existsMock.mockReturnValue(true);
     const secretRelay = "wss://user:pass@old.example/private?token=secret";
     const candidate = JSON.parse(credentialJson()) as Record<string, any>;
     candidate.credentialIdentity.storage.tenant = "old-tenant";
@@ -592,7 +615,6 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   });
 
   it("logs actionable remediation when no saas-base-url is available", async () => {
-    existsMock.mockReturnValue(false);
     const runtime = makeRuntime();
     const cfg = { channels: { webchannel: { accounts: { accta: { tenant: "t" } } } } } as never;
     await webchannelSetup.afterAccountConfigWritten({
@@ -609,7 +631,6 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
   });
 
   it("does NOT throw when acquisition fails (channels add still exits cleanly)", async () => {
-    existsMock.mockReturnValue(false);
     acquireMock.mockRejectedValueOnce(new Error("enroll boom"));
     const runtime = makeRuntime();
     const cfg = { channels: { webchannel: { accounts: { accta: { saas: { baseUrl: "http://s" } } } } } } as never;

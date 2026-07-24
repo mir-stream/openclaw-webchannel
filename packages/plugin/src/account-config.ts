@@ -33,7 +33,7 @@
  */
 
 import { homedir } from "node:os";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -472,23 +472,37 @@ export function loadPersistedCredentialDocument(
   expected: CredentialBindingExpectation,
   opts: {
     home?: string;
+    /** @deprecated Retained for source compatibility; direct reads ignore it. */
     exists?: (p: string) => boolean;
     read?: (p: string) => string;
   } = {},
 ): BoundCredentialLoadResult {
   assertValidAccountId(expected.accountId);
-  assertValidCredentialBindingExpectation(expected);
-  const exists = opts.exists ?? existsSync;
-  const read = opts.read ?? ((p: string) => readFileSync(p, "utf-8"));
   const path = resolveReadCredentialPath(expected.accountId, {
     ...(opts.home !== undefined ? { home: opts.home } : {}),
-    exists,
   });
-  if (!exists(path)) return Object.freeze({ status: "absent" });
+  return loadCredentialDocumentAtPath(expected, path, opts.read);
+}
+
+/**
+ * Read and classify one exact credential path without an existence precheck.
+ *
+ * A direct read avoids check/read races and, critically, distinguishes a
+ * genuinely absent file from an existing store hidden by filesystem denial.
+ */
+export function loadCredentialDocumentAtPath(
+  expected: CredentialBindingExpectation,
+  path: string,
+  read: (p: string) => string = (p) => readFileSync(p, "utf-8"),
+): BoundCredentialLoadResult {
+  assertValidCredentialBindingExpectation(expected);
   let serialized: string;
   try {
     serialized = read(path);
-  } catch {
+  } catch (error) {
+    if (isFilesystemErrorCode(error, "ENOENT")) {
+      return Object.freeze({ status: "absent" });
+    }
     return Object.freeze({
       status: "invalid",
       code: "read-failed",
@@ -496,4 +510,13 @@ export function loadPersistedCredentialDocument(
     });
   }
   return loadBoundCredentialDocumentJson(expected, serialized);
+}
+
+function isFilesystemErrorCode(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === code
+  );
 }
