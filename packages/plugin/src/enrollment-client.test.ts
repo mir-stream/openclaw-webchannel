@@ -973,6 +973,109 @@ describe("EnrollmentClient", () => {
       require("node:fs").rmSync(dir, { recursive: true, force: true });
     });
 
+    it("never overwrites credentials published by a concurrent enrollment winner", async () => {
+      const clientA = new EnrollmentClient(
+        createTestOptions({
+          tenant: "tenant-A",
+          accountId: "race-a",
+          credentialPath,
+          _home: join(dirname(credentialPath), "home-race-a"),
+        }),
+      );
+      const clientB = new EnrollmentClient(
+        createTestOptions({
+          tenant: "tenant-B",
+          accountId: "race-b",
+          credentialPath,
+          _home: join(dirname(credentialPath), "home-race-b"),
+        }),
+      );
+      let releaseAPoll = (): void => {};
+      const holdAPoll = new Promise<void>((resolve) => {
+        releaseAPoll = resolve;
+      });
+      let markAPollStarted = (): void => {};
+      const aPollStarted = new Promise<void>((resolve) => {
+        markAPollStarted = resolve;
+      });
+
+      mockFetch.mockImplementation(async (url, init) => {
+        const body = JSON.parse(String(init?.body)) as {
+          accountId?: string;
+          device_code?: string;
+        };
+        if (String(url).endsWith("/api/enroll")) {
+          return {
+            ok: true,
+            json: async () => ({
+              device_code: `device-${body.accountId}`,
+              user_code: `CODE-${body.accountId}`,
+              verification_uri: "https://saas.com/enroll",
+              verification_uri_complete: "https://saas.com/enroll?user_code=RACE",
+              expires_in: 600,
+              interval: 0,
+            }),
+          };
+        }
+
+        const accountId =
+          body.device_code === "device-race-a" ? "race-a" : "race-b";
+        if (accountId === "race-a") {
+          markAPollStarted();
+          await holdAPoll;
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            creds: {
+              userJwt: `JWT-${accountId}`,
+              userSeed: `SEED-${accountId}`,
+            },
+            peerId: `peer-${accountId}`,
+            jwksUrl: "https://saas.com/.well-known/jwks.json",
+            bootstrapUrl: "https://saas.com/bootstrap",
+            natsUrl: "wss://nats.saas.com",
+          }),
+        };
+      });
+
+      const loserPromise = clientA.enroll();
+      await aPollStarted;
+      await expect(clientB.enroll()).resolves.toMatchObject({
+        peerId: "peer-race-b",
+      });
+      const winnerBytes = readFileSync(credentialPath);
+      const winner = JSON.parse(winnerBytes.toString("utf8")) as {
+        credentialIdentity: {
+          storage: { tenant: string; accountId: string };
+        };
+        enrollment: { creds: { userJwt: string; userSeed: string } };
+      };
+      expect(winner.credentialIdentity.storage).toEqual({
+        tenant: "tenant-B",
+        accountId: "race-b",
+      });
+
+      releaseAPoll();
+      let loserError: unknown;
+      try {
+        await loserPromise;
+      } catch (error) {
+        loserError = error;
+      }
+
+      expect(loserError).toMatchObject({
+        code: "storage-io-failed",
+        document: "credentials",
+      });
+      expect(String(loserError)).not.toContain("SEED-race-a");
+      expect(readFileSync(credentialPath)).toEqual(winnerBytes);
+      expect(winner.enrollment.creds).toEqual({
+        userJwt: "JWT-race-b",
+        userSeed: "SEED-race-b",
+      });
+    });
+
     it("should set restrictive permissions on credential file", async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
