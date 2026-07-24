@@ -69,7 +69,7 @@ describe("index-nats.ts wiring contract — account-bound auth and startup", () 
       RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth("),
     );
     expect(RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth(")).toBeLessThan(
-      RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, accountId"),
+      RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, {"),
     );
     expect(RUNTIME_SOURCE).toMatch(
       /loadPersisted:\s*\(\)\s*=>\s*credentialLoad/,
@@ -218,7 +218,7 @@ describe("index-nats.ts account lifecycle ownership", () => {
       RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth("),
     );
     expect(RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth(")).toBeLessThan(
-      RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, accountId"),
+      RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, {"),
     );
     expect(RUNTIME_SOURCE.indexOf("accountAuth.warmJwks(signal)")).toBeLessThan(
       RUNTIME_SOURCE.lastIndexOf("channel.subscribeRegister()"),

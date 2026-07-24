@@ -68,10 +68,7 @@ describe("consumeCredentialSource", () => {
     const transportFactory = vi.fn(
       () => ({ connect: vi.fn(async () => {}), connected: true }) as never,
     );
-    const loadPersisted = vi.fn(() => ({
-      userJwt: "JWT",
-      userSeed: "SEED",
-    }));
+    const loadPersisted = vi.fn(() => matching());
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
@@ -89,7 +86,11 @@ describe("consumeCredentialSource", () => {
     });
 
     expect(loadPersisted).toHaveBeenCalledWith(
-      { tenant: "tenant-A", accountId: "account-A" },
+      {
+        tenant: "tenant-A",
+        accountId: "account-A",
+        saasBaseUrl: "http://s",
+      },
       {
         storageRoot: "/common/state",
         credentialPath: "/credential-only/credentials.json",
@@ -143,13 +144,13 @@ describe("consumeCredentialSource", () => {
       tenant: "t",
       accountId: "a",
     };
-    const result = await consumeCredentialSource(source, "acctA", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       loadPersisted: () => matching({ natsUrl: undefined }),
     });
     expect(result).toEqual({
       status: "creds-binding-failed",
-      accountId: "acctA",
+      accountId: "a",
       failure: {
         status: "invalid",
         code: "invalid-document",
@@ -195,7 +196,7 @@ describe("consumeCredentialSource", () => {
     });
     expect(result).toEqual({
       status: "creds-binding-failed",
-      accountId: "acctA",
+      accountId: "a",
       failure: {
         status: "mismatch",
         fields: ["storage.tenant"],

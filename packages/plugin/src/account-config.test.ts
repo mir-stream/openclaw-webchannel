@@ -367,16 +367,30 @@ describe("account-config: resolveAcquisitionIdentity", () => {
 
 describe("account-config: credential paths", () => {
   it("rejects account-less path reads at the API boundary", () => {
-    expect(() => (accountCredentialPath as unknown as () => string)()).toThrow(/account id/i);
+    expect(() => (accountCredentialPath as unknown as () => string)()).toThrow(
+      /storage identity/,
+    );
   });
-  it("builds the per-account path", () => {
-    expect(accountCredentialPath("acctA", HOME)).toBe(
-      join(HOME, ".openclaw-webchannel", "acctA", "credentials.json"),
+  it("builds the opaque tuple-scoped path", () => {
+    expect(
+      accountCredentialPath(
+        { tenant: "tenant-a", accountId: "acctA" },
+        { home: HOME },
+      ),
+    ).toMatch(
+      new RegExp(
+        `^${HOME}/\\.openclaw-webchannel-v2/v2_[A-Za-z0-9_-]{43}/credentials\\.json$`,
+      ),
     );
   });
 
   it("REJECTS a traversal account id before building a path (security)", () => {
-    expect(() => accountCredentialPath("../../tmp/evil", HOME)).toThrow(/invalid account id/);
+    expect(() =>
+      accountCredentialPath(
+        { tenant: "tenant-a", accountId: "../../tmp/evil" },
+        { home: HOME },
+      ),
+    ).toThrow(/storage\.accountId/);
   });
 
   it("builds the legacy path", () => {
@@ -386,8 +400,9 @@ describe("account-config: credential paths", () => {
   });
 
   it("resolveReadCredentialPath prefers the per-account file when it exists", () => {
-    const perAccount = accountCredentialPath("default", HOME);
-    const path = resolveReadCredentialPath("default", {
+    const scope = { tenant: "tenant-a", accountId: "default" };
+    const perAccount = accountCredentialPath(scope, { home: HOME });
+    const path = resolveReadCredentialPath(scope, {
       home: HOME,
       exists: (p) => p === perAccount,
     });
@@ -396,8 +411,9 @@ describe("account-config: credential paths", () => {
 
   it("resolveReadCredentialPath ignores the legacy file for default", () => {
     const legacy = legacyCredentialPath(HOME);
-    const perAccount = accountCredentialPath("default", HOME);
-    const path = resolveReadCredentialPath("default", {
+    const scope = { tenant: "tenant-a", accountId: "default" };
+    const perAccount = accountCredentialPath(scope, { home: HOME });
+    const path = resolveReadCredentialPath(scope, {
       home: HOME,
       exists: (p) => p === legacy,
     });
@@ -406,8 +422,9 @@ describe("account-config: credential paths", () => {
 
   it("resolveReadCredentialPath does NOT use legacy for a non-default account", () => {
     const legacy = legacyCredentialPath(HOME);
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const path = resolveReadCredentialPath("acctA", {
+    const scope = { tenant: "tenant-a", accountId: "acctA" };
+    const perAccount = accountCredentialPath(scope, { home: HOME });
+    const path = resolveReadCredentialPath(scope, {
       home: HOME,
       exists: (p) => p === legacy, // only legacy exists
     });
@@ -415,14 +432,18 @@ describe("account-config: credential paths", () => {
   });
 
   it("resolveReadCredentialPath returns the per-account path when nothing exists", () => {
-    const path = resolveReadCredentialPath("default", { home: HOME, exists: () => false });
-    expect(path).toBe(accountCredentialPath("default", HOME));
+    const scope = { tenant: "tenant-a", accountId: "default" };
+    const path = resolveReadCredentialPath(scope, { home: HOME, exists: () => false });
+    expect(path).toBe(accountCredentialPath(scope, { home: HOME }));
   });
 
   it("resolveReadCredentialPath rejects a traversal id", () => {
     expect(() =>
-      resolveReadCredentialPath("../../evil", { home: HOME, exists: () => false }),
-    ).toThrow(/invalid account id/);
+      resolveReadCredentialPath(
+        { tenant: "tenant-a", accountId: "../../evil" },
+        { home: HOME, exists: () => false },
+      ),
+    ).toThrow(/storage\.accountId/);
   });
 });
 
@@ -458,7 +479,7 @@ describe("account-config: loadPersistedCredentialDocument", () => {
   });
 
   it("loads only a complete matching per-account document", () => {
-    const perAccount = accountCredentialPath("acctA", HOME);
+    const perAccount = accountCredentialPath(expected, { home: HOME });
     const result = loadPersistedCredentialDocument(expected, {
       home: HOME,
       read: (path) => {
@@ -491,12 +512,17 @@ describe("account-config: loadPersistedCredentialDocument", () => {
         throw Object.assign(new Error("missing"), { code: "ENOENT" });
       },
     })).toEqual({ status: "absent" });
-    expect(reads).toEqual([accountCredentialPath("default", HOME)]);
+    expect(reads).toEqual([
+      accountCredentialPath(
+        { tenant: expected.tenant, accountId: "default" },
+        { home: HOME },
+      ),
+    ]);
     expect(reads).not.toContain(legacy);
   });
 
   it("distinguishes malformed JSON without exposing its contents", () => {
-    const perAccount = accountCredentialPath("acctA", HOME);
+    const perAccount = accountCredentialPath(expected, { home: HOME });
     expect(loadPersistedCredentialDocument(expected, {
       home: HOME,
       read: (path) => {
@@ -511,7 +537,7 @@ describe("account-config: loadPersistedCredentialDocument", () => {
   });
 
   it("distinguishes an unreadable existing file without exposing the I/O error", () => {
-    const perAccount = accountCredentialPath("acctA", HOME);
+    const perAccount = accountCredentialPath(expected, { home: HOME });
     expect(loadPersistedCredentialDocument(expected, {
       home: HOME,
       read: (path) => {
@@ -530,7 +556,7 @@ describe("account-config: loadPersistedCredentialDocument", () => {
   it("classifies a dangling credential symlink as read-failed", () => {
     const home = mkdtempSync(join(tmpdir(), "webchannel-dangling-credential-"));
     try {
-      const path = accountCredentialPath(expected.accountId, home);
+      const path = accountCredentialPath(expected, { home });
       mkdirSync(dirname(path), { recursive: true });
       symlinkSync(join(home, "missing-target"), path);
       expect(loadPersistedCredentialDocument(expected, { home })).toEqual({
@@ -546,7 +572,7 @@ describe("account-config: loadPersistedCredentialDocument", () => {
   it("classifies a dangling parent-component symlink as read-failed", () => {
     const home = mkdtempSync(join(tmpdir(), "webchannel-dangling-parent-"));
     try {
-      const path = accountCredentialPath(expected.accountId, home);
+      const path = accountCredentialPath(expected, { home });
       mkdirSync(dirname(dirname(path)), { recursive: true });
       symlinkSync(join(home, "missing-account-dir"), dirname(path));
       expect(loadPersistedCredentialDocument(expected, { home })).toEqual({
@@ -589,6 +615,6 @@ describe("account-config: loadPersistedCredentialDocument", () => {
     expect(() => loadPersistedCredentialDocument({
       ...expected,
       accountId: "../../evil",
-    }, { home: HOME })).toThrow(/invalid account id/);
+    }, { home: HOME })).toThrow(/storage\.accountId/);
   });
 });

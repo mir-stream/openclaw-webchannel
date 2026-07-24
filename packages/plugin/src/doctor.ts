@@ -41,6 +41,10 @@ import {
   type BoundCredentialLoadResult,
   type PersistedEnrolledCreds,
 } from "./credential-document.js";
+import {
+  credentialStorageFailureDiagnostic,
+  StorageDocumentError,
+} from "./storage-document.js";
 
 export type DoctorCheckId =
   | "invalid-account-id"
@@ -48,6 +52,7 @@ export type DoctorCheckId =
   | "encryption-disabled"
   | "creds-missing"
   | "credential-binding-failed"
+  | "credential-storage-failed"
   | "identity-key-missing"
   | "verifier-unbuildable"
   | "audience-override-removed"
@@ -67,7 +72,9 @@ export type DoctorFinding = {
 
 export type DoctorDeps = {
   env?: Record<string, string | undefined>;
-  loadPersistedEnrolledCreds?: (accountId: string) => PersistedEnrolledCreds | undefined;
+  loadPersistedEnrolledCreds?: (
+    scope: { tenant: string; accountId: string },
+  ) => PersistedEnrolledCreds | undefined;
   readFile?: (path: string) => string;
 };
 
@@ -156,6 +163,9 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
         saasBaseUrl: plan.saasBaseUrl ?? top.saas?.baseUrl,
         tenant,
         accountId,
+        ...(plan.storageRoot !== undefined
+          ? { storageRoot: plan.storageRoot }
+          : {}),
         env,
         ...(deps.readFile !== undefined ? { readFile: deps.readFile } : {}),
       });
@@ -176,7 +186,7 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
     const getPersisted = () => {
       if (!persistedLoaded) {
         persistedLoaded = true;
-        persisted = injectedLoadCreds?.(accountId);
+        persisted = injectedLoadCreds?.({ tenant, accountId });
       }
       return persisted;
     };
@@ -191,6 +201,13 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
             tenant,
             accountId,
             saasBaseUrl: source.saasBaseUrl,
+          }, {
+            ...(source.storageRoot !== undefined
+              ? { storageRoot: source.storageRoot }
+              : {}),
+            ...(source.credentialPath !== undefined
+              ? { credentialPath: source.credentialPath }
+              : {}),
           });
           persistedLoaded = true;
           if (loaded.status === "match") {
@@ -215,6 +232,20 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
           }
         }
       } catch (err) {
+        if (err instanceof StorageDocumentError) {
+          const diagnostic = credentialStorageFailureDiagnostic(err);
+          findings.push({
+            accountId,
+            checkId: "credential-storage-failed",
+            kind: "auth",
+            severity: "error",
+            message: `${diagnostic.detail}.`,
+            fix:
+              "Stop all old WebChannel plugin processes for this account, inspect the " +
+              "recoverable legacy backup if present, then retry.",
+          });
+          continue;
+        }
         findings.push(configurationInvalidFinding(accountId, err));
         continue;
       }
@@ -333,7 +364,9 @@ export type WebchannelProbe = BaseProbeResult & {
 
 export type ProbeDeps = {
   env?: Record<string, string | undefined>;
-  loadCreds?: (accountId: string) => PersistedEnrolledCreds | undefined;
+  loadCreds?: (
+    scope: { tenant: string; accountId: string },
+  ) => PersistedEnrolledCreds | undefined;
   readFile?: (path: string) => string;
   fetchImpl?: typeof fetch;
   resolveDialMaterial?: typeof resolveDialMaterial;
@@ -363,13 +396,19 @@ export async function probeWebchannelAccount(params: {
       saasBaseUrl: plan.saasBaseUrl ?? top.saas?.baseUrl,
       tenant: plan.tenant,
       accountId,
+      ...(plan.storageRoot !== undefined
+        ? { storageRoot: plan.storageRoot }
+        : {}),
       ...(deps.env !== undefined ? { env: deps.env } : {}),
       ...(deps.readFile !== undefined ? { readFile: deps.readFile } : {}),
     });
     let credentialLoad: BoundCredentialLoadResult | undefined;
     if (source.mode === "enrolled") {
       if (deps.loadCreds) {
-        const injected = deps.loadCreds(accountId);
+        const injected = deps.loadCreds({
+          tenant: plan.tenant,
+          accountId,
+        });
         credentialLoad = injected
           ? {
               status: "match",
@@ -378,11 +417,31 @@ export async function probeWebchannelAccount(params: {
             }
           : { status: "absent" };
       } else {
-        credentialLoad = loadPersistedCredentialDocument({
-          tenant: plan.tenant,
-          accountId,
-          saasBaseUrl: source.saasBaseUrl,
-        });
+        try {
+          credentialLoad = loadPersistedCredentialDocument({
+            tenant: plan.tenant,
+            accountId,
+            saasBaseUrl: source.saasBaseUrl,
+          }, {
+            ...(source.storageRoot !== undefined
+              ? { storageRoot: source.storageRoot }
+              : {}),
+            ...(source.credentialPath !== undefined
+              ? { credentialPath: source.credentialPath }
+              : {}),
+          });
+        } catch (error) {
+          if (error instanceof StorageDocumentError) {
+            const diagnostic = credentialStorageFailureDiagnostic(error);
+            return {
+              ok: false,
+              error: `${diagnostic.code}: ${diagnostic.detail}`,
+              accountId,
+              admission: "register-hop",
+            };
+          }
+          throw error;
+        }
       }
       if (credentialLoad.status !== "match") {
         return {
@@ -424,6 +483,12 @@ export async function probeWebchannelAccount(params: {
       saasBaseUrl: plan.saasBaseUrl ?? top.saas?.baseUrl,
       tenant: plan.tenant,
       accountId,
+      ...(plan.storageRoot !== undefined
+        ? { storageRoot: plan.storageRoot }
+        : {}),
+      ...(source.mode === "enrolled" && source.credentialPath !== undefined
+        ? { credentialPath: source.credentialPath }
+        : {}),
       ...(deps.env !== undefined ? { env: deps.env } : {}),
       ...(deps.readFile !== undefined ? { readFile: deps.readFile } : {}),
       ...(credentialLoad ? { loadCreds: () => credentialLoad! } : {}),

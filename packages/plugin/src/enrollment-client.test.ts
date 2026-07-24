@@ -29,6 +29,7 @@ import {
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { accountCredentialPath, legacyCredentialPath } from "./account-config.js";
+import { legacyTuplePaths } from "./storage-paths.js";
 import { MemoryEnrollmentRepository } from "../../saas/src/enrollment-repository.js";
 import { DeviceFlowEnrollment } from "../../saas/src/device-flow-enrollment.js";
 import {
@@ -45,17 +46,30 @@ const mockFetch = vi.fn();
 
 global.fetch = mockFetch;
 
-const createTestOptions = (override?: Partial<EnrollmentOptions>): EnrollmentOptions => ({
-  saasBaseUrl: "https://saas.com",
-  saasEnrollUrl: "https://saas.com/api/enroll",
-  saasPollUrl: "https://saas.com/api/poll",
-  tenant: "test-tenant",
-  accountId: "test-agent",
-  credentialPath: join(tmpdir(), `openclaw-test-${Date.now()}`, "credentials.json"),
-  displayInstructions: false,
-  _minPollIntervalMs: 0,
-  ...override,
-});
+const createTestOptions = (override?: Partial<EnrollmentOptions>): EnrollmentOptions => {
+  const defaultCredentialPath = join(
+    tmpdir(),
+    `openclaw-test-${Date.now()}-${Math.random()}`,
+    "credentials.json",
+  );
+  const options: EnrollmentOptions = {
+    saasBaseUrl: "https://saas.com",
+    saasEnrollUrl: "https://saas.com/api/enroll",
+    saasPollUrl: "https://saas.com/api/poll",
+    tenant: "test-tenant",
+    accountId: "test-agent",
+    credentialPath: defaultCredentialPath,
+    displayInstructions: false,
+    _minPollIntervalMs: 0,
+    ...override,
+  };
+  return {
+    ...options,
+    _home:
+      override?._home ??
+      join(dirname(options.credentialPath ?? defaultCredentialPath), "isolated-home"),
+  };
+};
 
 // ---------------------------------------------------------------------------
 // Test suite
@@ -378,6 +392,55 @@ describe("EnrollmentClient", () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
+    it("treats an injected credential reader as a complete migration seam", async () => {
+      const isolatedHome = join(dirname(credentialPath), "reader-home");
+      const legacy = legacyTuplePaths("test-agent", isolatedHome);
+      mkdirSync(legacy.directory, { recursive: true });
+      const legacyBytes = Buffer.from("{TOP-SECRET malformed legacy");
+      writeFileSync(legacy.credentialPath, legacyBytes);
+
+      const pair = generateKeyPair();
+      const key = Buffer.from(pair.publicKey).toString("base64url");
+      const serialized = JSON.stringify({
+        [CREDENTIAL_BINDING_IDENTITY_FIELD]:
+          createCredentialIdentityForEnrollment({
+            tenant: "test-tenant",
+            accountId: "test-agent",
+            saasBaseUrl: "https://saas.com",
+            relayUrl: "wss://nats.saas.com",
+            agentPublicKey: key,
+          }),
+        identityKey: {
+          publicKey: key,
+          privateKey: Buffer.from(pair.privateKey).toString("base64url"),
+        },
+        enrollment: {
+          creds: { userJwt: "stored-jwt", userSeed: "stored-seed" },
+          peerId: "stored-peer",
+          jwksUrl: "https://saas.com/jwks",
+          bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
+        },
+        accountId: "test-agent",
+        tenant: "test-tenant",
+        saasEnrollUrl: "https://saas.com/api/enroll",
+        saasPollUrl: "https://saas.com/api/poll",
+      });
+      const read = vi.fn(() => serialized);
+      const injected = new EnrollmentClient(createTestOptions({
+        credentialPath,
+        _home: isolatedHome,
+        _readCredentialFile: read,
+      }));
+
+      await expect(injected.enroll()).resolves.toMatchObject({
+        peerId: "stored-peer",
+      });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(readFileSync(legacy.credentialPath)).toEqual(legacyBytes);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
     it("rejects a legacy unbound file without enrollment or overwrite", async () => {
       const pair = generateKeyPair();
       const key = Buffer.from(pair.publicKey).toString("base64url");
@@ -452,9 +515,23 @@ describe("EnrollmentClient", () => {
     it("24: archive-first replacement covers every path shape without key reuse", async () => {
       const fixtureHome = join(tmpdir(), `openclaw-reset-${Date.now()}`);
       const cases = [
-        { name: "default-layout", path: accountCredentialPath("acct", fixtureHome), legacy: false },
+        {
+          name: "default-layout",
+          path: accountCredentialPath(
+            { tenant: "test-tenant", accountId: "default-layout" },
+            { home: fixtureHome },
+          ),
+          legacy: false,
+        },
         { name: "explicit-override", path: join(fixtureHome, "override.json"), legacy: false },
-        { name: "default", path: accountCredentialPath("default", fixtureHome), legacy: true },
+        {
+          name: "default",
+          path: accountCredentialPath(
+            { tenant: "test-tenant", accountId: "default" },
+            { home: fixtureHome },
+          ),
+          legacy: true,
+        },
       ];
       try {
         for (const scenario of cases) {
@@ -926,7 +1003,9 @@ describe("EnrollmentClient", () => {
         };
       });
 
-      await expect(client.enroll()).rejects.toMatchObject({ code: "EEXIST" });
+      await expect(client.enroll()).rejects.toMatchObject({
+        code: "storage-io-failed",
+      });
       expect(readFileSync(credentialPath, "utf8")).toBe(concurrentDocument);
     });
 

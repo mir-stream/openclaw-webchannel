@@ -386,6 +386,10 @@ function inspectLegacyCredential(
       upgraded: upgradeLegacyCredentialDocument(scope, parsed),
     };
   } catch (error) {
+    if (hasExplicitIdentity) {
+      if (error instanceof StorageDocumentError) throw error;
+      throw new StorageDocumentError("credentials", "legacy-migration-failed");
+    }
     if (isStorageIdentityError(error)) throw error;
     return { status: "invalid" };
   }

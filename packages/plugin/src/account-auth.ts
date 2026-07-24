@@ -93,10 +93,15 @@ export function deriveAccountAuth(
 
 export type ResolveEffectiveAccountAuthInput = {
   accountAuthRaw: AuthConfig | undefined;
+  tenant: string;
   accountId: string;
+  storageRoot?: string;
   planSaasBaseUrl?: string;
   topLevelSaasBaseUrl?: string;
-  loadCreds?: (accountId: string) => PersistedAuthMetadata | undefined;
+  loadCreds?: (
+    scope: { tenant: string; accountId: string },
+    options?: { storageRoot?: string },
+  ) => PersistedAuthMetadata | undefined;
 };
 
 /** Legacy derivation seam; preparation below is the production boundary. */
@@ -118,7 +123,12 @@ export function resolveEffectiveAccountAuth(
   const explicitIssuer = hasOwn(jwt, "issuer");
   const delivered = explicitIssuer
     ? undefined
-    : input.loadCreds?.(input.accountId)?.issuer;
+    : input.loadCreds?.(
+        { tenant: input.tenant, accountId: input.accountId },
+        input.storageRoot !== undefined
+          ? { storageRoot: input.storageRoot }
+          : {},
+      )?.issuer;
   return deriveAccountAuth(
     input.accountAuthRaw,
     input.planSaasBaseUrl ?? input.topLevelSaasBaseUrl,

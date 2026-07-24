@@ -6,10 +6,10 @@
  * Before 가-1, the `enrolled` credential source ran the device flow inside
  * `registerFull` (= at `gateway run` time). 가-1 moves acquisition to
  * config-time (`openclaw channels add`). At runtime the enrolled path must
- * CONSUME the persisted per-account creds instead of enrolling:
+ * CONSUME the persisted tuple-scoped creds instead of enrolling:
  *
- *   - enrolled  → load `~/.openclaw-webchannel/<account>/credentials.json`
- *                 (account-scoped only; the legacy single-file path is retained
+ *   - enrolled  → load the exact `(tenant, accountId)` v2 namespace
+ *                 (the legacy single-file path is retained
  *                 solely for migration/runbook cleanup) and connect with
  *                 those user JWT + NKEY seed. Missing/empty ⇒ a structured
  *                 "creds missing" result so the caller applies account-scoped
@@ -34,10 +34,7 @@ import {
   type NatsCredentialSource,
   type ResolveNatsCredentialSourceInput,
 } from "./nats-credential-source.js";
-import {
-  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  loadPersistedCredentialDocument,
-} from "./account-config.js";
+import { loadPersistedCredentialDocument } from "./account-config.js";
 import type {
   BoundCredentialLoadResult,
   CredentialDocumentFailure,
@@ -78,6 +75,8 @@ export type ConsumeCredentialSourceDeps = ConnectNatsDeps & {
   loadPersisted?: typeof loadPersistedCredentialDocument;
   /** Override home dir for path resolution (tests). */
   home?: string;
+  storageRoot?: string;
+  credentialPath?: string;
 };
 
 export type DialMaterial =
@@ -95,6 +94,8 @@ export type DialMaterial =
   | { status: "invalid"; error: string };
 
 export type ResolveDialMaterialInput = ResolveNatsCredentialSourceInput & {
+  storageRoot?: string;
+  credentialPath?: string;
   loadCreds?: typeof loadPersistedCredentialDocument;
 };
 
@@ -120,11 +121,21 @@ export function resolveDialMaterial(input: ResolveDialMaterialInput): DialMateri
   }
   let persisted: BoundCredentialLoadResult;
   try {
-    persisted = (input.loadCreds ?? loadPersistedCredentialDocument)({
-      tenant: source.tenant,
-      accountId: input.accountId,
-      saasBaseUrl: source.saasBaseUrl,
-    });
+    persisted = (input.loadCreds ?? loadPersistedCredentialDocument)(
+      {
+        tenant: source.tenant,
+        accountId: input.accountId,
+        saasBaseUrl: source.saasBaseUrl,
+      },
+      {
+        ...(input.storageRoot !== undefined
+          ? { storageRoot: input.storageRoot }
+          : {}),
+        ...(input.credentialPath !== undefined
+          ? { credentialPath: input.credentialPath }
+          : {}),
+      },
+    );
   } catch {
     return {
       status: "invalid",
@@ -177,7 +188,6 @@ export function resolveDialMaterial(input: ResolveDialMaterialInput): DialMateri
  */
 export async function consumeCredentialSource(
   source: NatsCredentialSource,
-  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   deps: ConsumeCredentialSourceDeps = {},
 ): Promise<ConsumeResult> {
   if (source.mode !== "enrolled") {
@@ -186,13 +196,18 @@ export async function consumeCredentialSource(
     return { status: "connected", connection, dialedUrl: source.url };
   }
 
+  const accountId = source.accountId;
   const loadPersisted = deps.loadPersisted ?? loadPersistedCredentialDocument;
+  const storageRoot = deps.storageRoot ?? source.storageRoot;
+  const credentialPath = deps.credentialPath ?? source.credentialPath;
   const persisted = loadPersisted({
     tenant: source.tenant,
     accountId,
     saasBaseUrl: source.saasBaseUrl,
   }, {
     ...(deps.home !== undefined ? { home: deps.home } : {}),
+    ...(storageRoot !== undefined ? { storageRoot } : {}),
+    ...(credentialPath !== undefined ? { credentialPath } : {}),
   });
   if (persisted.status === "absent") {
     return { status: "creds-missing", accountId };

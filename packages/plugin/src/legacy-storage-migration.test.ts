@@ -21,12 +21,13 @@ import {
   parseCredentialJson,
   upgradeLegacyCredentialDocument,
 } from "./credential-document.js";
-import { loadPersistedEnrolledCreds } from "./account-config.js";
+import { loadPersistedCredentialDocument } from "./account-config.js";
 import {
   parseConversationKeyDocument,
   serializeConversationKeyDocument,
 } from "./conversation-key-document.js";
 import { ConversationKeyStore } from "./conversation-key-store.js";
+import { derivePublicKey } from "./e2e-crypto.js";
 import { migrateLegacyTupleState } from "./legacy-storage-migration.js";
 import {
   legacyTuplePaths,
@@ -40,8 +41,10 @@ import { StorageDocumentError } from "./storage-document.js";
 
 const SCOPE = { tenant: "tenant-A", accountId: "shared-account" };
 const OTHER_SCOPE = { tenant: "tenant-B", accountId: "shared-account" };
-const PUBLIC_KEY = Buffer.alloc(32, 7).toString("base64url");
 const PRIVATE_KEY = Buffer.alloc(32, 8).toString("base64url");
+const PUBLIC_KEY = Buffer.from(
+  derivePublicKey(Buffer.from(PRIVATE_KEY, "base64url")),
+).toString("base64url");
 const LEGACY_K = Buffer.alloc(32, 9);
 
 let home: string;
@@ -184,8 +187,13 @@ describe("legacy tuple storage migration", () => {
 
   it("auto-migrates before credential/key delivery and survives restart", () => {
     writeLegacyState();
-    const credentials = loadPersistedEnrolledCreds(SCOPE, { home });
-    expect(credentials).toMatchObject({
+    const loaded = loadPersistedCredentialDocument(
+      { ...SCOPE, saasBaseUrl: "https://saas.example" },
+      { home },
+    );
+    expect(loaded.status).toBe("match");
+    if (loaded.status !== "match") throw new Error("expected credentials");
+    expect(loaded.credentials).toMatchObject({
       userJwt: "JWT-old",
       userSeed: "SEED-old",
       natsUrl: "wss://relay.example/socket",
@@ -226,9 +234,9 @@ describe("legacy tuple storage migration", () => {
     const explicitIdentity = createCredentialBindingIdentityV2({
       storage: SCOPE,
       binding: {
-        saasBaseUrl: "https://preserved.example",
-        deliveredIssuer: "https://preserved-issuer.example",
-        relayUrl: "wss://preserved-relay.example/socket",
+        saasBaseUrl: "https://saas.example",
+        deliveredIssuer: "https://issuer.example/",
+        relayUrl: "wss://relay.example/socket",
         agentPublicKey: PUBLIC_KEY,
       },
     });
@@ -238,7 +246,7 @@ describe("legacy tuple storage migration", () => {
 
     expect(upgraded.credentialIdentity).toBe(explicitIdentity);
     expect(upgraded.credentialIdentity.binding.saasBaseUrl).toBe(
-      "https://preserved.example",
+      "https://saas.example",
     );
   });
 
@@ -274,6 +282,47 @@ describe("legacy tuple storage migration", () => {
     expect(readFileSync(legacy.credentialPath)).toEqual(credentialBefore);
     expect(readFileSync(legacy.conversationKeyPath)).toEqual(keysBefore);
     expect(existsSync(legacy.directory)).toBe(true);
+    expect(existsSync(destination.credentialPath)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
+  it("fails closed on an explicit semantic binding mismatch before inspecting keys", () => {
+    const legacy = writeLegacyState();
+    const candidate = legacyCredential(SCOPE, "TOP-SECRET");
+    candidate.credentialIdentity = createCredentialBindingIdentityV2({
+      storage: SCOPE,
+      binding: {
+        saasBaseUrl: "https://different-saas.example",
+        deliveredIssuer: "https://issuer.example/",
+        relayUrl: "wss://relay.example/socket",
+        agentPublicKey: PUBLIC_KEY,
+      },
+    });
+    const credentialBefore = Buffer.from(JSON.stringify(candidate, null, 2));
+    writeFileSync(legacy.credentialPath, credentialBefore, { mode: 0o600 });
+    // If key inspection happens, this malformed file would otherwise be
+    // classified and retained through an ambiguous quarantine path.
+    const keyBefore = Buffer.from("{TOP-SECRET malformed keys");
+    writeFileSync(legacy.conversationKeyPath, keyBefore, { mode: 0o600 });
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+
+    let thrown: unknown;
+    try {
+      migrateLegacyTupleState({ ...SCOPE, home });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(StorageDocumentError);
+    expect(thrown).toMatchObject({
+      document: "credentials",
+      code: "invalid-document",
+    });
+    expect(String(thrown)).not.toContain("TOP-SECRET");
+    expect(String(thrown)).not.toContain(home);
+    expect(existsSync(legacy.directory)).toBe(true);
+    expect(readFileSync(legacy.credentialPath)).toEqual(credentialBefore);
+    expect(readFileSync(legacy.conversationKeyPath)).toEqual(keyBefore);
     expect(existsSync(destination.credentialPath)).toBe(false);
     expect(existsSync(destination.conversationKeyPath)).toBe(false);
   });
@@ -378,6 +427,34 @@ describe("legacy tuple storage migration", () => {
       ).size,
     ).toBe(0);
   });
+
+  it.each(["missing relay", "invalid key pair"] as const)(
+    "does not let matching labels plus %s satisfy complete binding readiness",
+    (failure) => {
+      const legacy = writeLegacyState();
+      const candidate = legacyCredential();
+      if (failure === "missing relay") {
+        delete (candidate.enrollment as Record<string, unknown>).natsUrl;
+      } else {
+        (candidate.identityKey as { publicKey: string }).publicKey =
+          Buffer.alloc(32, 3).toString("base64url");
+      }
+      writeFileSync(
+        legacy.credentialPath,
+        JSON.stringify(candidate, null, 2),
+        { mode: 0o600 },
+      );
+
+      expect(migrateLegacyTupleState({ ...SCOPE, home })).toEqual({
+        status: "ambiguous-quarantined",
+        credential: "absent",
+        conversationKeys: "fresh",
+      });
+      expect(existsSync(legacy.credentialPath)).toBe(true);
+      expect(existsSync(tupleStoragePaths({ ...SCOPE, home }).credentialPath))
+        .toBe(false);
+    },
+  );
 
   it("does not mutate material proven to belong to another tenant", () => {
     const legacy = writeLegacyState(SCOPE);

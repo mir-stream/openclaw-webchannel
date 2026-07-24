@@ -37,7 +37,8 @@ browser/Playwright variant against a hosted SaaS issuer is follow-up #13. See ST
 
 - NATS entry (`index-nats.ts`) — **production default, cut over live** on the real gateway
   (`:18789`): enrolled via the SaaS device flow against a persistent local trust chain
-  (`nats-server` + reference issuer), credentials cached at `~/.openclaw-webchannel/<account>/credentials.json`
+  (`nats-server` + reference issuer), credentials cached in the exact
+  `(tenant, accountId)` namespace under `~/.openclaw-webchannel-v2/`
   so restarts reconnect with no re-approval. See
   [`../../e2e/local/README.md`](../../e2e/local/README.md) to reproduce browser↔agent locally.
 - Defer to [`../../docs/STATUS.md`](../../docs/STATUS.md) for the current authoritative state.
@@ -94,7 +95,15 @@ credentials and skips enrollment only when their complete v2 identity matches th
 tenant, account, SaaS base, delivered issuer/relay, and local public key.
 
 **Credential storage:**
-- **Location:** `~/.openclaw-webchannel/<account>/credentials.json` (override via `credentialPath`)
+- **Default location:** `~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json`,
+  where `<v2_namespace>` is the fixed path-safe id derived from the exact,
+  case-sensitive `(tenant, accountId)`.
+- **Overrides:** account config `storageRoot` changes the common base for both
+  secret stores. The low-level `credentialPath` API remains one exact credential
+  file; when both are supplied, it does not relocate conversation keys.
+- **Root changes:** `storageRoot` is not a live v2-to-v2 migration switch. Stop
+  the gateway before moving the complete opaque tuple directory with its
+  `0700`/`0600` permissions, or re-enroll and let browsers re-register.
 - **Permissions:** written with mode `0o600` (owner read/write only)
 - **Shape** (`PluginCredentials`): `identityKey { publicKey, privateKey }` (base64url X25519),
   optional `enrollment { creds, peerId, jwksUrl, bootstrapUrl, natsUrl, issuer }`, one
@@ -104,6 +113,22 @@ tenant, account, SaaS base, delivered issuer/relay, and local public key.
   gateway, archive the exact file, complete any required SaaS active-key replacement, and then
   re-run account enrollment.
 
+**v1 → v2 cutover:** stop every old plugin process that can access the same
+home before starting this version. On first access, a legacy bare-account
+directory is adopted only when its credential document independently proves the
+exact tenant/account labels and satisfies the complete credential-binding
+readiness checks. The complete legacy directory is atomically moved under
+`~/.openclaw-webchannel/.legacy-v1-backups/`, both v2 destinations are written
+without overwrite and read-verified, and only then is migration marked complete.
+Keep that backup.
+
+A legacy `conversation-keys.json` with no fully proven credential owner is
+renamed to an `.ambiguous-v2-*` archive and never adopted. That tuple starts with
+an empty v2 key store, so browsers must re-register and receive a fresh K. A
+claim conflict, failed archive, destination mismatch, incomplete credential
+binding, or incomplete migration fails closed; do not run old and new binaries
+concurrently to work around it.
+
 ## E2E security model (admission + key establishment)
 
 P0-2 made the authenticated register hop the **sole** admission path; key establishment happens
@@ -111,7 +136,7 @@ there:
 
 - **Register admission (the only path) — register-delivered conversation key.**
   The agent OWNS a stable per-peerId key K (`src/conversation-key-store.ts`, persisted at
-  `~/.openclaw-webchannel/<account>/conversation-keys.json`, 0600). The register handler (a NATS
+  `~/.openclaw-webchannel-v2/<v2_namespace>/conversation-keys.json`, 0600). The register handler (a NATS
   request/reply on the account's `…{peerId}.register` subject) wraps K (`src/late-join-decryptor.ts`
   — X25519 ECDH + HKDF-SHA256 `webchannel-key-wrap-v1` + ChaCha20-Poly1305) to the device key
   attested in **that request's** verified JWT `cnf` claim and returns it in the register reply.
@@ -154,8 +179,8 @@ real-time allowlist authz is a core-delegated stub.
 
 ## Conversation-key capacity and recovery
 
-Each OpenClaw Gateway process persists conversation keys per WebChannel account,
-not on the SaaS server. The fixed 10,000-entry guard applies to distinct
+Each OpenClaw Gateway process persists conversation keys per exact
+tenant/account tuple, not on the SaaS server. The fixed 10,000-entry guard applies to distinct
 `peerId` values (verified JWT `sub` claims), not browser devices. It is an
 abuse/misrouting safety boundary, not a normal scaling knob or public setting.
 At 90% the plugin emits a one-time warning for that account. At the limit,

@@ -44,6 +44,18 @@ export class StorageDocumentError extends Error {
   }
 }
 
+export function credentialStorageFailureDiagnostic(
+  error: StorageDocumentError,
+): { code: string; detail: string } {
+  return {
+    code: `credential-storage-${error.code}`,
+    detail:
+      `credential storage/migration failed (code=${error.code}); stop all old ` +
+      `WebChannel plugin processes for this account, inspect the recoverable ` +
+      `legacy backup if present, then retry`,
+  };
+}
+
 export function assertDocumentStorageIdentity(
   document: SecretDocumentKind,
   expectedScope: StorageScopeIdentity,

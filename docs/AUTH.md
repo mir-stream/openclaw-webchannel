@@ -78,11 +78,13 @@ This is intentionally an offline, operator-confirmed operation; moving a file
 cannot replace credentials held by a running transport.
 
 1. Stop the OpenClaw gateway.
-2. Move the exact account credential file
-   (`$HOME/.openclaw-webchannel/<account>/credentials.json`, or the configured
-   `credentialPath`) to a new operator-chosen backup path. Do not delete or
-   overwrite it.
-3. If the obsolete single-file credential exists at
+2. Resolve and move the exact tuple credential file
+   (`$HOME/.openclaw-webchannel-v2/<v2_namespace>/credentials.json`, under the
+   configured `storageRoot`, or the exact low-level `credentialPath`) to a new
+   operator-chosen backup path. Do not delete or overwrite it.
+3. Keep the recoverable migration archive under
+   `$HOME/.openclaw-webchannel/.legacy-v1-backups/`. If the obsolete single-file
+   credential exists at
    `$HOME/.openclaw-webchannel/credentials.json`, archive it separately. Readers
    do not use it.
 4. Complete the SaaS active-key replacement/revocation step required by the

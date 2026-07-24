@@ -25,6 +25,17 @@ vi.mock("./preflight.js", () => ({
   runAddPreflight: (opts: never) => preflightMock(opts),
 }));
 
+// Migration durability/behavior is covered separately. Keep setup-unit reads
+// hermetic so they never inspect or mutate the developer's real legacy home.
+const migrationMock = vi.hoisted(() => vi.fn(() => ({
+    status: "not-needed",
+    credential: "absent",
+    conversationKeys: "absent",
+  })));
+vi.mock("./legacy-storage-migration.js", () => ({
+  migrateLegacyTupleState: () => migrationMock(),
+}));
+
 // Mock node:fs so direct credential reads are controllable.
 const readMock = vi.fn((_p: string) => "");
 const rootDirectoryStat = {
@@ -50,6 +61,7 @@ import { webchannelSetup, buildAccountPatch, resolveSetupIdentity } from "./setu
 import { listWebchannelAccountIds } from "./account-config.js";
 import { createCredentialIdentityForEnrollment } from "./credential-document.js";
 import { generateKeyPair } from "./e2e-crypto.js";
+import { StorageDocumentError } from "./storage-document.js";
 
 const TEST_PAIR = generateKeyPair();
 const KEY = Buffer.from(TEST_PAIR.publicKey).toString("base64url");
@@ -93,6 +105,12 @@ function section(next: unknown): Record<string, unknown> {
 beforeEach(() => {
   acquireMock.mockClear();
   preflightMock.mockClear();
+  migrationMock.mockReset();
+  migrationMock.mockReturnValue({
+    status: "not-needed",
+    credential: "absent",
+    conversationKeys: "absent",
+  });
   readMock.mockReset();
   readMock.mockImplementation(() => {
     throw Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -414,6 +432,39 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(runtime.log.mock.calls.flat().join("\n")).toContain(
       "effective tenant/account/SaaS identity is invalid",
     );
+  });
+
+  it("reports a sanitized actionable storage migration failure", async () => {
+    migrationMock.mockImplementationOnce(() => {
+      throw new StorageDocumentError("credentials", "legacy-claim-conflict");
+    });
+    const runtime = makeRuntime();
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: { tenant: "tA", saas: { baseUrl: "http://s" } },
+          },
+        },
+      },
+    } as never;
+
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "accta",
+      input: {},
+      runtime,
+    });
+
+    const output = runtime.log.mock.calls.flat().join("\n");
+    expect(output).toContain(
+      "code=credential-storage-legacy-claim-conflict",
+    );
+    expect(output).toContain("stop all old WebChannel plugin processes");
+    expect(output).toContain("recoverable legacy backup");
+    expect(output).not.toContain("/SECRET/operator/path");
+    expect(acquireMock).not.toHaveBeenCalled();
   });
 
   it("echoes the RESOLVED identity (non-secret) so the generic-flag mapping is not silent", async () => {
