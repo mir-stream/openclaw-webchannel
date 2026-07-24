@@ -43,8 +43,8 @@ export type AcquireCredentialsOptions = {
   /** Deployment tenant identifier. */
   tenant: string;
   /**
-   * Override the persisted credential path. Defaults to the opaque
-   * tuple-scoped v2 path.
+   * Override the persisted credential path with an absolute path. Defaults to
+   * the opaque tuple-scoped v2 path.
    */
   credentialPath?: string;
   /** Common tuple-scoped root for credentials and conversation keys. */

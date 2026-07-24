@@ -2,8 +2,10 @@ import { describe, it, expect } from "vitest";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -496,6 +498,29 @@ describe("account-config: loadPersistedCredentialDocument", () => {
         natsUrl: "wss://relay.example",
       });
       expect(result.credentials.identityKey!.publicKey).toHaveLength(32);
+    }
+  });
+
+  it("upgrades a complete owned v1 exact override before returning secrets", () => {
+    const home = mkdtempSync(join(tmpdir(), "webchannel-exact-v1-load-"));
+    try {
+      const credentialPath = join(home, "operator", "account.json");
+      mkdirSync(dirname(credentialPath), { recursive: true });
+      const legacy = JSON.parse(validFile) as Record<string, unknown>;
+      delete legacy.credentialIdentity;
+      writeFileSync(credentialPath, JSON.stringify(legacy), { mode: 0o600 });
+
+      const loaded = loadPersistedCredentialDocument(expected, {
+        home,
+        credentialPath,
+      });
+
+      expect(loaded.status).toBe("match");
+      expect(
+        JSON.parse(readFileSync(credentialPath, "utf8")),
+      ).toHaveProperty("credentialIdentity");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 

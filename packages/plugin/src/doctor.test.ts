@@ -252,6 +252,36 @@ describe("evaluateWebchannelDoctor findings", () => {
       }),
     ]));
   });
+
+  it.each([42, "relative/state"])(
+    "contains invalid storageRoot %j to its account while diagnosing siblings",
+    (storageRoot) => {
+      const findings = evaluateWebchannelDoctor(cfg({
+        accounts: {
+          bad: { storageRoot, auth: validAuth("bad") },
+          good: {
+            auth: validAuth("good"),
+            encryption: { mode: "disabled" },
+          },
+        },
+      }), {
+        env: {},
+        loadPersistedEnrolledCreds: () => persisted,
+      });
+
+      expect(findings).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          accountId: "bad",
+          checkId: "configuration-invalid",
+          message: expect.stringContaining("storageRoot"),
+        }),
+        expect.objectContaining({
+          accountId: "good",
+          checkId: "encryption-disabled",
+        }),
+      ]));
+    },
+  );
 });
 
 describe("status probe", () => {

@@ -423,7 +423,17 @@ export const webchannelSetup = {
     // path. Path ownership alone is never proof that persisted enrollment
     // material belongs to this configured account.
     const configuredIdentity = resolveAcquisitionIdentity(cfg, id);
-    const storageRoot = resolveAccountStorageRoot(account);
+    let storageRoot: string | undefined;
+    try {
+      storageRoot = resolveAccountStorageRoot(account);
+    } catch {
+      runtime.log(
+        `[webchannel] account "${id}": code=storage-root-invalid; storageRoot ` +
+          `must be an absolute filesystem path. Correct this account's ` +
+          `storageRoot and retry.`,
+      );
+      return;
+    }
     const identity = resolveSetupIdentity(input);
     const tenant =
       identity.tenant ?? configuredIdentity.tenant;

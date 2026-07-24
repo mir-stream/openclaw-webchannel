@@ -38,7 +38,7 @@ import {
   statSync,
   type Stats,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 import {
   assertValidAccountId,
@@ -58,6 +58,7 @@ import {
   type CredentialPathOptions,
 } from "./storage-paths.js";
 import type { StorageScopeIdentity } from "./storage-identity.js";
+import { StorageDocumentError } from "./storage-document.js";
 
 export { assertValidAccountId, isValidAccountId } from "./account-id.js";
 export type { PersistedEnrolledCreds } from "./credential-document.js";
@@ -478,7 +479,12 @@ export function resolveAccountStorageRoot(
   if (value === undefined) return undefined;
   if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
     throw new Error(
-      "webchannel: storageRoot must be a non-empty filesystem path",
+      "webchannel: storageRoot must be a non-empty absolute filesystem path",
+    );
+  }
+  if (!isAbsolute(value)) {
+    throw new Error(
+      "webchannel: storageRoot must be an absolute filesystem path",
     );
   }
   return value;
@@ -524,10 +530,27 @@ export function loadPersistedCredentialDocument(
     opts.read === undefined &&
     opts.exists === undefined;
   if (!shouldMigrate) return initial;
-  // Preserve #63's authoritative content/anomalous-path classification before
-  // migration can reinterpret a destination as a legacy source. A matching
-  // document is still withheld until the migration boundary succeeds.
+  // An exact override may itself be a proven v1 source. Only the complete
+  // unbound classification can enter that migration path; malformed,
+  // mismatched, incomplete, and anomalous reads remain authoritative.
   if (initial.status !== "absent" && initial.status !== "match") {
+    if (
+      initial.status === "unbound" &&
+      opts.credentialPath !== undefined
+    ) {
+      try {
+        migrateLegacyTupleState(pathOptions);
+      } catch (error) {
+        if (
+          error instanceof StorageDocumentError &&
+          error.code === "identity-unbound"
+        ) {
+          return initial;
+        }
+        throw error;
+      }
+      return loadCredentialDocumentAtPath(expected, path, opts.read);
+    }
     return initial;
   }
   migrateLegacyTupleState(pathOptions);

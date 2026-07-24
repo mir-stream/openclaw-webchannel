@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import {
   createStorageIdentityV2,
@@ -36,8 +36,8 @@ export type TupleStoragePaths = Readonly<{
 
 export type CredentialPathOptions = TupleStoragePathOptions & {
   /**
-   * Exact credential-file override. It never changes the tuple directory or
-   * the conversation-key path.
+   * Absolute exact credential-file override. It never changes the tuple
+   * directory or the conversation-key path.
    */
   credentialPath?: string;
 };
@@ -65,10 +65,9 @@ export function tupleStoragePaths(
     tenant: options?.tenant as string,
     accountId: options?.accountId as string,
   }).storage;
-  const storageRoot =
-    options.storageRoot === undefined
-      ? defaultStorageRoot(options.home)
-      : validatePathOverride(options.storageRoot, "storageRoot");
+  const storageRoot = options.storageRoot === undefined
+    ? defaultStorageRoot(options.home)
+    : validateStorageRoot(options.storageRoot);
   const namespaceId = deriveStorageNamespaceId(scope);
   const directory = join(storageRoot, namespaceId);
   return Object.freeze({
@@ -89,7 +88,7 @@ export function resolveCredentialPath(options: CredentialPathOptions): string {
   const paths = tupleStoragePaths(options);
   return options.credentialPath === undefined
     ? paths.credentialPath
-    : validatePathOverride(options.credentialPath, "credentialPath");
+    : validateAbsolutePath(options.credentialPath, "credentialPath");
 }
 
 export type LegacyTuplePaths = Readonly<{
@@ -136,4 +135,18 @@ function validatePathOverride(value: string, field: string): string {
     throw new Error(`webchannel: ${field} must be a non-empty filesystem path`);
   }
   return value;
+}
+
+function validateStorageRoot(value: string): string {
+  return validateAbsolutePath(value, "storageRoot");
+}
+
+function validateAbsolutePath(value: string, field: string): string {
+  const validated = validatePathOverride(value, field);
+  if (!isAbsolute(validated)) {
+    throw new Error(
+      `webchannel: ${field} must be an absolute filesystem path`,
+    );
+  }
+  return validated;
 }

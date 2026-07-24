@@ -35,7 +35,7 @@
           "storageRoot": {
             "type": "string",
             "minLength": 1,
-            "description": "Common local base directory for tuple-scoped credentials and conversation keys. Each account uses an opaque namespace derived from the exact (tenant, accountId). This does not change the meaning of an exact credentialPath API override."
+            "description": "Absolute common local base directory for tuple-scoped credentials and conversation keys. Relative paths are rejected rather than resolved against the process working directory. Each account uses an opaque namespace derived from the exact (tenant, accountId). This does not change the meaning of an exact credentialPath API override."
           },
           "saas": {
             "type": "object",

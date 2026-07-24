@@ -1,3 +1,5 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -95,5 +97,35 @@ describe("tuple storage paths", () => {
         storageRoot: "",
       }),
     ).toThrow(/storageRoot/);
+    expect(() =>
+      tupleStoragePaths({
+        tenant: "tenant-A",
+        accountId: "same",
+        storageRoot: "relative/state",
+      }),
+    ).toThrow(/storageRoot must be an absolute filesystem path/);
+  });
+
+  it("rejects a relative credentialPath independently of process cwd", () => {
+    const originalCwd = process.cwd();
+    const first = mkdtempSync(join(tmpdir(), "webchannel-cwd-a-"));
+    const second = mkdtempSync(join(tmpdir(), "webchannel-cwd-b-"));
+    try {
+      for (const cwd of [first, second]) {
+        process.chdir(cwd);
+        expect(() =>
+          resolveCredentialPath({
+            tenant: "tenant-A",
+            accountId: "same",
+            storageRoot: "/state",
+            credentialPath: "relative/credentials.json",
+          }),
+        ).toThrow(/credentialPath must be an absolute filesystem path/);
+      }
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(first, { recursive: true, force: true });
+      rmSync(second, { recursive: true, force: true });
+    }
   });
 });

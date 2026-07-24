@@ -184,6 +184,32 @@ describe("setup-wizard: declarative detection", () => {
     expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(false);
   });
 
+  it.each([42, "relative/state"])(
+    "status.resolveConfigured contains invalid storageRoot %j",
+    (storageRoot) => {
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              accta: {
+                tenant: "tenant-a",
+                storageRoot,
+                saas: { baseUrl: "https://saas.example" },
+              },
+            },
+          },
+        },
+      } as never;
+      expect(
+        webchannelSetupWizard.status.resolveConfigured({
+          cfg,
+          accountId: "accta",
+        }),
+      ).toBe(false);
+      expect(readMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("status is not configured when the credential store is unreadable", () => {
     readMock.mockImplementation(() => {
       throw Object.assign(new Error("SECRET permission detail"), {

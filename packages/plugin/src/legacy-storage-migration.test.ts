@@ -1,6 +1,7 @@
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -8,6 +9,7 @@ import {
   renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { spawn } from "node:child_process";
@@ -227,6 +229,393 @@ describe("legacy tuple storage migration", () => {
         parseCredentialJson(readFileSync(credentialPath, "utf8")),
       ),
     ).not.toThrow();
+  });
+
+  it("archives and upgrades a proven v1 exact override with collocated keys", () => {
+    const legacy = writeLegacyState(SCOPE, { credential: false });
+    const customDirectory = join(home, "operator-managed");
+    const credentialPath = join(customDirectory, "account.json");
+    mkdirSync(customDirectory, { recursive: true, mode: 0o755 });
+    chmodSync(customDirectory, 0o755);
+    const original = Buffer.from(
+      JSON.stringify(legacyCredential(SCOPE, "EXACT-SECRET"), null, 2),
+    );
+    writeFileSync(credentialPath, original, { mode: 0o640 });
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const claim = join(
+      legacy.root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+    );
+
+    expect(
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toMatchObject({
+      status: "migrated",
+      credential: "migrated",
+      conversationKeys: "migrated",
+    });
+    expect(readFileSync(join(claim, "exact-credentials.json"))).toEqual(
+      original,
+    );
+    expect(statSync(join(claim, "exact-credentials.json")).mode & 0o777).toBe(
+      0o600,
+    );
+    expect(statSync(customDirectory).mode & 0o777).toBe(0o755);
+    expect(statSync(credentialPath).mode & 0o777).toBe(0o600);
+    expect(Buffer.from(
+      parseConversationKeyDocument(
+        SCOPE,
+        readFileSync(destination.conversationKeyPath, "utf8"),
+      ).get("same-peer")!,
+    )).toEqual(LEGACY_K);
+
+    const after = readFileSync(credentialPath);
+    expect(
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toMatchObject({ status: "not-needed", credential: "preserved" });
+    expect(readFileSync(credentialPath)).toEqual(after);
+    expect(readFileSync(join(claim, "exact-credentials.json"))).toEqual(
+      original,
+    );
+  });
+
+  it("resumes an exact override after the durable archival boundary", () => {
+    const legacy = writeLegacyState(SCOPE, { credential: false });
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const original = Buffer.from(JSON.stringify(legacyCredential(), null, 2));
+    writeFileSync(credentialPath, original, { mode: 0o600 });
+    const simulatedCrash = new Error("exact archive crash");
+
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath,
+        _afterSourceMove: () => {
+          expect(existsSync(credentialPath)).toBe(false);
+          throw simulatedCrash;
+        },
+      }),
+    ).toThrow(simulatedCrash);
+
+    expect(
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toMatchObject({ status: "resumed", credential: "migrated" });
+    expect(existsSync(credentialPath)).toBe(true);
+    expect(existsSync(legacy.directory)).toBe(false);
+  });
+
+  it("resumes an unchanged exact override from metadata-only state", () => {
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    writeFileSync(
+      credentialPath,
+      JSON.stringify(legacyCredential(), null, 2),
+      { mode: 0o600 },
+    );
+    const simulatedCrash = new Error("metadata-only crash");
+
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath,
+        _afterClaim: () => {
+          throw simulatedCrash;
+        },
+      }),
+    ).toThrow(simulatedCrash);
+
+    expect(
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toMatchObject({ status: "resumed", credential: "migrated" });
+  });
+
+  it("rejects an in-place exact rewrite after a metadata-only crash", () => {
+    const legacy = writeLegacyState(SCOPE, { credential: false });
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    writeFileSync(
+      credentialPath,
+      JSON.stringify(legacyCredential(SCOPE, "ORIGINAL"), null, 2),
+      { mode: 0o600 },
+    );
+    const inodeBefore = statSync(credentialPath).ino;
+    const simulatedCrash = new Error("metadata-only crash");
+
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath,
+        _afterClaim: () => {
+          throw simulatedCrash;
+        },
+      }),
+    ).toThrow(simulatedCrash);
+
+    const replacement = legacyCredential(SCOPE, "REPLACEMENT-SECRET");
+    (replacement.enrollment as { natsUrl: string }).natsUrl =
+      "wss://replacement-relay.example/socket";
+    const replacementBytes = Buffer.from(JSON.stringify(replacement, null, 2));
+    writeFileSync(credentialPath, replacementBytes, { mode: 0o600 });
+    expect(statSync(credentialPath).ino).toBe(inodeBefore);
+
+    let thrown: unknown;
+    try {
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({ code: "legacy-migration-failed" });
+    expect(String(thrown)).not.toContain("REPLACEMENT-SECRET");
+    expect(String(thrown)).not.toContain(home);
+    expect(readFileSync(credentialPath)).toEqual(replacementBytes);
+    expect(existsSync(legacy.directory)).toBe(true);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const claim = join(
+      legacy.root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+    );
+    expect(existsSync(join(claim, "exact-credentials.json"))).toBe(false);
+    expect(existsSync(join(claim, "source"))).toBe(false);
+    expect(existsSync(destination.credentialPath)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
+  it("supports an exact override at the bare-account legacy credential path", () => {
+    const legacy = writeLegacyState();
+    const before = readFileSync(legacy.credentialPath);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const claim = join(
+      legacy.root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+    );
+
+    expect(
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath: legacy.credentialPath,
+      }),
+    ).toMatchObject({
+      status: "migrated",
+      credential: "migrated",
+      conversationKeys: "migrated",
+    });
+    expect(existsSync(legacy.credentialPath)).toBe(true);
+    expect(readFileSync(join(claim, "exact-credentials.json"))).toEqual(before);
+    expect(existsSync(destination.conversationKeyPath)).toBe(true);
+  });
+
+  it("never overwrites an exact-path credential published after archival", () => {
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const original = Buffer.from(JSON.stringify(legacyCredential(), null, 2));
+    writeFileSync(credentialPath, original, { mode: 0o600 });
+    const winner = upgradeLegacyCredentialDocument(
+      SCOPE,
+      legacyCredential(SCOPE, "concurrent-winner"),
+    );
+    const winnerBytes = Buffer.from(JSON.stringify(winner, null, 2));
+
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath,
+        _afterSourceMove: () => {
+          writeFileSync(credentialPath, winnerBytes, { mode: 0o600 });
+        },
+      }),
+    ).toThrow(expect.objectContaining({ code: "legacy-migration-failed" }));
+
+    expect(readFileSync(credentialPath)).toEqual(winnerBytes);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const archived = join(
+      legacyTuplePaths(SCOPE.accountId, home).root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+      "exact-credentials.json",
+    );
+    expect(readFileSync(archived)).toEqual(original);
+  });
+
+  it("does not remove a v2 winner published before exact archival", () => {
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    writeFileSync(
+      credentialPath,
+      JSON.stringify(legacyCredential(), null, 2),
+      { mode: 0o600 },
+    );
+    const winner = upgradeLegacyCredentialDocument(
+      SCOPE,
+      legacyCredential(SCOPE, "pre-archive-winner"),
+    );
+    const winnerBytes = Buffer.from(JSON.stringify(winner, null, 2));
+
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath,
+        _afterClaim: () => {
+          const replacement = `${credentialPath}.winner`;
+          writeFileSync(replacement, winnerBytes, { mode: 0o600 });
+          renameSync(replacement, credentialPath);
+        },
+      }),
+    ).toThrow(expect.objectContaining({ code: "legacy-migration-failed" }));
+
+    expect(existsSync(credentialPath)).toBe(true);
+    expect(readFileSync(credentialPath)).toEqual(winnerBytes);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const claim = join(
+      legacyTuplePaths(SCOPE.accountId, home).root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+    );
+    expect(existsSync(join(claim, "exact-credentials.json"))).toBe(false);
+  });
+
+  it("falls back to a durable exclusive copy when exact archival is cross-device", () => {
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const original = Buffer.from(JSON.stringify(legacyCredential(), null, 2));
+    writeFileSync(credentialPath, original, { mode: 0o600 });
+
+    expect(
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath,
+        _linkExactSource: () => {
+          throw Object.assign(new Error("cross-device link"), {
+            code: "EXDEV",
+          });
+        },
+      }),
+    ).toMatchObject({ status: "migrated", credential: "migrated" });
+
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const archived = join(
+      legacyTuplePaths(SCOPE.accountId, home).root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+      "exact-credentials.json",
+    );
+    expect(readFileSync(archived)).toEqual(original);
+    expect(
+      parseCredentialJson(readFileSync(credentialPath, "utf8")),
+    ).toHaveProperty("credentialIdentity");
+  });
+
+  it("does not let an exact override authorize keys with contradictory legacy ownership", () => {
+    const legacy = writeLegacyState(OTHER_SCOPE);
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const exactBefore = Buffer.from(JSON.stringify(legacyCredential(), null, 2));
+    writeFileSync(credentialPath, exactBefore, { mode: 0o600 });
+    const legacyCredentialBefore = readFileSync(legacy.credentialPath);
+    const keysBefore = readFileSync(legacy.conversationKeyPath);
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+
+    expect(() =>
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toThrow(expect.objectContaining({ code: "legacy-migration-failed" }));
+    expect(readFileSync(credentialPath)).toEqual(exactBefore);
+    expect(readFileSync(legacy.credentialPath)).toEqual(
+      legacyCredentialBefore,
+    );
+    expect(readFileSync(legacy.conversationKeyPath)).toEqual(keysBefore);
+    expect(existsSync(destination.credentialPath)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+  });
+
+  it("keeps an explicit-identity exact override authoritative and untouched", () => {
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const candidate = legacyCredential(SCOPE, "TOP-SECRET");
+    candidate.credentialIdentity = createCredentialBindingIdentityV2({
+      storage: OTHER_SCOPE,
+      binding: {
+        saasBaseUrl: "https://saas.example",
+        deliveredIssuer: "https://issuer.example/",
+        relayUrl: "wss://relay.example/socket",
+        agentPublicKey: PUBLIC_KEY,
+      },
+    });
+    const before = Buffer.from(JSON.stringify(candidate, null, 2));
+    writeFileSync(credentialPath, before, { mode: 0o600 });
+
+    expect(() =>
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toThrow(expect.objectContaining({ code: "identity-mismatch" }));
+    expect(readFileSync(credentialPath)).toEqual(before);
+  });
+
+  it("rejects an exact v1 credential symlink without archiving or rebinding it", () => {
+    const target = join(home, "operator", "target.json");
+    const credentialPath = join(home, "operator", "account.json");
+    mkdirSync(dirname(target), { recursive: true });
+    const before = Buffer.from(JSON.stringify(legacyCredential(), null, 2));
+    writeFileSync(target, before, { mode: 0o600 });
+    symlinkSync(target, credentialPath);
+
+    expect(() =>
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toThrow(expect.objectContaining({ code: "storage-io-failed" }));
+    expect(readFileSync(target)).toEqual(before);
+    expect(lstatSync(credentialPath).isSymbolicLink()).toBe(true);
+    expect(
+      existsSync(join(legacyTuplePaths(SCOPE.accountId, home).root, ".legacy-v1-backups")),
+    ).toBe(false);
+  });
+
+  it("keeps a malformed exact override untouched", () => {
+    const credentialPath = join(home, "operator", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const before = Buffer.from("{TOP-SECRET malformed");
+    writeFileSync(credentialPath, before, { mode: 0o600 });
+
+    expect(() =>
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toThrow(expect.objectContaining({ code: "invalid-document" }));
+    expect(readFileSync(credentialPath)).toEqual(before);
+    expect(
+      existsSync(join(legacyTuplePaths(SCOPE.accountId, home).root, ".legacy-v1-backups")),
+    ).toBe(false);
+  });
+
+  it("never rebinds an unbound document at an aliased canonical v2 path", () => {
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    mkdirSync(destination.directory, { recursive: true, mode: 0o700 });
+    const before = Buffer.from(JSON.stringify(legacyCredential(), null, 2));
+    writeFileSync(destination.credentialPath, before, { mode: 0o600 });
+    const aliasedPath = join(
+      destination.directory,
+      "..",
+      destination.namespaceId,
+      "credentials.json",
+    );
+
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath: aliasedPath,
+      }),
+    ).toThrow(expect.objectContaining({ code: "identity-unbound" }));
+    expect(readFileSync(destination.credentialPath)).toEqual(before);
+    expect(
+      existsSync(join(legacyTuplePaths(SCOPE.accountId, home).root, ".legacy-v1-backups")),
+    ).toBe(false);
   });
 
   it("preserves a matching explicit credential identity instead of rebinding it", () => {
