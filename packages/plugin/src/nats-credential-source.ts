@@ -428,6 +428,7 @@ export async function connectNatsCredentialSource(
     case "enrolled": {
       const createEnrolled = deps.createEnrolled ?? createEnrolledNatsConnection;
       const enrolled = await createEnrolled({
+        saasBaseUrl: source.saasBaseUrl,
         saasEnrollUrl: `${source.saasBaseUrl}/api/enroll`,
         saasPollUrl: `${source.saasBaseUrl}/api/poll`,
         natsUrl: source.url,

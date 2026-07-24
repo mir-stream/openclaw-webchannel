@@ -9,25 +9,21 @@ import {
   type VerifierFactoryDeps,
   type VerifyAccountToken,
 } from "./auth.js";
-import {
-  loadPersistedEnrolledCreds,
-  type PersistedEnrolledCreds,
-} from "./account-config.js";
 import type { AccountServePlan } from "./multiplex.js";
 import { deriveIssuer, deriveJwksUrl } from "./preflight.js";
 
-export type MemoizedPersistedAccessor = () => PersistedEnrolledCreds | undefined;
+export type PersistedAuthMetadata = Readonly<{ issuer?: string }>;
+export type MemoizedPersistedAccessor = () => PersistedAuthMetadata | undefined;
 
 export function createMemoizedPersistedAccessor(
-  accountId: string,
-  load: (accountId: string) => PersistedEnrolledCreds | undefined = loadPersistedEnrolledCreds,
+  load: () => PersistedAuthMetadata | undefined,
 ): MemoizedPersistedAccessor {
   let loaded = false;
-  let value: PersistedEnrolledCreds | undefined;
+  let value: PersistedAuthMetadata | undefined;
   return () => {
     if (!loaded) {
       loaded = true;
-      value = load(accountId);
+      value = load();
     }
     return value;
   };
@@ -100,7 +96,7 @@ export type ResolveEffectiveAccountAuthInput = {
   accountId: string;
   planSaasBaseUrl?: string;
   topLevelSaasBaseUrl?: string;
-  loadCreds?: (accountId: string) => PersistedEnrolledCreds | undefined;
+  loadCreds?: (accountId: string) => PersistedAuthMetadata | undefined;
 };
 
 /** Legacy derivation seam; preparation below is the production boundary. */
@@ -122,7 +118,7 @@ export function resolveEffectiveAccountAuth(
   const explicitIssuer = hasOwn(jwt, "issuer");
   const delivered = explicitIssuer
     ? undefined
-    : (input.loadCreds ?? loadPersistedEnrolledCreds)(input.accountId)?.issuer;
+    : input.loadCreds?.(input.accountId)?.issuer;
   return deriveAccountAuth(
     input.accountAuthRaw,
     input.planSaasBaseUrl ?? input.topLevelSaasBaseUrl,
@@ -141,6 +137,8 @@ export type PreparedAccountAuth = {
 export function prepareAccountAuth(input: {
   plan: AccountServePlan;
   getPersisted: MemoizedPersistedAccessor;
+  /** Fully resolved enrolled SaaS base, including effective override precedence. */
+  effectiveSaasBaseUrl?: string;
   topLevelSaasBaseUrl?: string;
   logger?: Parameters<typeof createAccountJwtVerifier>[0]["logger"];
   verifierDeps?: VerifierFactoryDeps;
@@ -150,7 +148,9 @@ export function prepareAccountAuth(input: {
   const shouldLoadDeliveredIssuer = canDeriveJwtFields(raw) && !hasOwn(jwt, "issuer");
   const effective = deriveAccountAuth(
     raw,
-    input.plan.saasBaseUrl ?? input.topLevelSaasBaseUrl,
+    input.effectiveSaasBaseUrl ??
+      input.plan.saasBaseUrl ??
+      input.topLevelSaasBaseUrl,
     input.plan.accountId,
     shouldLoadDeliveredIssuer ? input.getPersisted()?.issuer : undefined,
   );

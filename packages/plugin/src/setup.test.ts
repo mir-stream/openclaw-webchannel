@@ -26,13 +26,40 @@ vi.mock("./preflight.js", () => ({
 
 // Mock node:fs so the "creds already exist" probe is controllable.
 const existsMock = vi.fn((_p: string) => false);
+const readMock = vi.fn((_p: string) => "");
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, existsSync: (p: string) => existsMock(p) };
+  return {
+    ...actual,
+    existsSync: (p: string) => existsMock(p),
+    readFileSync: (p: string) => readMock(p),
+  };
 });
 
 import { webchannelSetup, buildAccountPatch, resolveSetupIdentity } from "./setup.js";
 import { listWebchannelAccountIds } from "./account-config.js";
+import { createCredentialIdentityForEnrollment } from "./credential-document.js";
+
+const KEY = Buffer.alloc(32, 7).toString("base64url");
+function credentialJson(input: {
+  tenant?: string;
+  accountId?: string;
+  saasBaseUrl?: string;
+} = {}): string {
+  const tenant = input.tenant ?? "t";
+  const accountId = input.accountId ?? "accta";
+  const saasBaseUrl = input.saasBaseUrl ?? "http://s";
+  return JSON.stringify({
+    credentialIdentity: createCredentialIdentityForEnrollment({
+      tenant,
+      accountId,
+      saasBaseUrl,
+      agentPublicKey: KEY,
+    }),
+    identityKey: { publicKey: KEY, privateKey: KEY },
+    enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } },
+  });
+}
 
 type Cfg = { channels: { webchannel?: Record<string, unknown> } };
 function section(next: unknown): Record<string, unknown> {
@@ -44,6 +71,8 @@ beforeEach(() => {
   preflightMock.mockClear();
   existsMock.mockReset();
   existsMock.mockReturnValue(false);
+  readMock.mockReset();
+  readMock.mockReturnValue(credentialJson());
 });
 
 describe("setup: resolveSetupIdentity", () => {
@@ -330,6 +359,36 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     });
   });
 
+  it("refuses acquisition when the effective binding identity is invalid", async () => {
+    existsMock.mockReturnValue(false);
+    const runtime = makeRuntime();
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "invalid.tenant",
+              saas: { baseUrl: "http://s" },
+            },
+          },
+        },
+      },
+    } as never;
+
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "accta",
+      input: {},
+      runtime,
+    });
+
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(runtime.log.mock.calls.flat().join("\n")).toContain(
+      "effective tenant/account/SaaS identity is invalid",
+    );
+  });
+
   it("echoes the RESOLVED identity (non-secret) so the generic-flag mapping is not silent", async () => {
     existsMock.mockReturnValue(false);
     const runtime = makeRuntime();
@@ -365,6 +424,40 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     });
     expect(acquireMock).not.toHaveBeenCalled();
     expect(runtime.log).toHaveBeenCalled();
+  });
+
+  it("refuses mismatched existing credentials without enrolling or exposing values", async () => {
+    existsMock.mockReturnValue(true);
+    const secretRelay = "wss://user:pass@old.example/private?token=secret";
+    const candidate = JSON.parse(credentialJson()) as Record<string, any>;
+    candidate.credentialIdentity.storage.tenant = "old-tenant";
+    candidate.credentialIdentity.binding.relayUrl = secretRelay;
+    candidate.enrollment.natsUrl = secretRelay;
+    readMock.mockReturnValue(JSON.stringify(candidate));
+    const runtime = makeRuntime();
+    const cfg = {
+      channels: { webchannel: { accounts: { accta: { tenant: "t", saas: { baseUrl: "http://s" } } } } },
+    } as never;
+
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "accta",
+      input: {},
+      runtime,
+    });
+
+    expect(acquireMock).not.toHaveBeenCalled();
+    const output = runtime.log.mock.calls.flat().join("\n");
+    expect(output).toContain("storage.tenant");
+    expect(output).toContain("archive");
+    expect(output).toContain("SaaS active-key replacement");
+    expect(output).toContain(
+      "openclaw channels add --channel webchannel --account accta",
+    );
+    expect(output).not.toContain(secretRelay);
+    expect(output).not.toContain("user:pass");
+    expect(output).not.toContain("token=secret");
   });
 
   it("skips acquisition (and logs) when credential mode is not enrolled", async () => {

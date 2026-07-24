@@ -17,8 +17,9 @@ import {
   accountCredentialPath,
   legacyCredentialPath,
   resolveReadCredentialPath,
-  loadPersistedEnrolledCreds,
+  loadPersistedCredentialDocument,
 } from "./account-config.js";
+import { createCredentialIdentityForEnrollment } from "./credential-document.js";
 import { planAccounts } from "./multiplex.js";
 
 const HOME = "/home/test";
@@ -417,182 +418,106 @@ describe("account-config: credential paths", () => {
   });
 });
 
-describe("account-config: loadPersistedEnrolledCreds", () => {
+describe("account-config: loadPersistedCredentialDocument", () => {
+  const key = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+  const expected = {
+    tenant: "tenant-a",
+    accountId: "acctA",
+    saasBaseUrl: "https://saas.example",
+  };
   const validFile = JSON.stringify({
-    enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } },
+    credentialIdentity: createCredentialIdentityForEnrollment({
+      ...expected,
+      deliveredIssuer: "https://issuer.example/",
+      relayUrl: "wss://relay.example",
+      agentPublicKey: key,
+    }),
+    identityKey: { publicKey: key, privateKey: key },
+    enrollment: {
+      creds: { userJwt: "JWT", userSeed: "SEED" },
+      issuer: "https://issuer.example/",
+      natsUrl: "wss://relay.example",
+    },
   });
 
-  it("rejects account-less credential reads at the API boundary", () => {
-    expect(() => (loadPersistedEnrolledCreds as unknown as () => unknown)()).toThrow(/account id/i);
-  });
-
-  it("loads creds from the per-account file", () => {
+  it("loads only a complete matching per-account document", () => {
     const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
+    const result = loadPersistedCredentialDocument(expected, {
       home: HOME,
-      exists: (p) => p === perAccount,
+      exists: (path: string) => path === perAccount,
       read: () => validFile,
     });
-    expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
-  });
-
-  it("threads the SaaS-delivered natsUrl through when persisted", () => {
-    // EnrollmentResult.natsUrl is persisted under `enrollment.natsUrl`; the
-    // consumer dials it in preference to local config, so the loader must surface
-    // it. (Absent → omitted, exercised by the back-compat fixtures above.)
-    const withUrl = JSON.stringify({
-      enrollment: {
-        creds: { userJwt: "JWT", userSeed: "SEED" },
-        natsUrl: "wss://saas-delivered-relay",
-      },
-    });
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
-      home: HOME,
-      exists: (p) => p === perAccount,
-      read: () => withUrl,
-    });
-    expect(creds).toEqual({
-      userJwt: "JWT",
-      userSeed: "SEED",
-      natsUrl: "wss://saas-delivered-relay",
-    });
-  });
-
-  it("threads the SaaS-delivered issuer through when persisted (VERBATIM)", () => {
-    // EnrollmentResult.issuer is persisted under `enrollment.issuer`; the runtime
-    // verifies bootstrap JWTs against it (pin > delivered > derived), so the
-    // loader must surface it — verbatim, trailing slash and all (verify compares
-    // slash-insensitively; the loader must not "helpfully" canonicalize).
-    const withIssuer = JSON.stringify({
-      enrollment: {
-        creds: { userJwt: "JWT", userSeed: "SEED" },
-        natsUrl: "wss://saas-delivered-relay",
-        issuer: "https://saas.local/demo-issuer/",
-      },
-    });
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
-      home: HOME,
-      exists: (p) => p === perAccount,
-      read: () => withIssuer,
-    });
-    expect(creds).toEqual({
-      userJwt: "JWT",
-      userSeed: "SEED",
-      natsUrl: "wss://saas-delivered-relay",
-      issuer: "https://saas.local/demo-issuer/",
-    });
-  });
-
-  it("omits issuer for pre-issuer persisted creds and non-string junk (back-compat)", () => {
-    const junk = JSON.stringify({
-      enrollment: {
-        creds: { userJwt: "JWT", userSeed: "SEED" },
-        issuer: 42,
-      },
-    });
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
-      home: HOME,
-      exists: (p) => p === perAccount,
-      read: () => junk,
-    });
-    expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
-  });
-
-  it("F2: surfaces the agent identity key when both halves decode to 32 bytes", () => {
-    // base64url of a 32-byte X25519 key is 43 chars. Reuse one string for both
-    // halves — the loader only checks decoded length, not that they're a real pair.
-    const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
-    const withIdentity = JSON.stringify({
-      identityKey: { publicKey: KEY43, privateKey: KEY43 },
-      enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } },
-    });
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
-      home: HOME,
-      exists: (p) => p === perAccount,
-      read: () => withIdentity,
-    });
-    expect(creds?.identityKey).toBeDefined();
-    expect(creds!.identityKey!.publicKey).toBeInstanceOf(Uint8Array);
-    expect(creds!.identityKey!.publicKey.length).toBe(32);
-    expect(creds!.identityKey!.privateKey.length).toBe(32);
-  });
-
-  it("F2: omits the identity key when the block is absent, partial, or the wrong length (fail-closed)", () => {
-    const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const load = (identityKey: unknown) =>
-      loadPersistedEnrolledCreds("acctA", {
-        home: HOME,
-        exists: (p) => p === perAccount,
-        read: () =>
-          JSON.stringify({ identityKey, enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } } }),
+    expect(result.status).toBe("match");
+    if (result.status === "match") {
+      expect(result.credentials).toMatchObject({
+        userJwt: "JWT",
+        userSeed: "SEED",
+        issuer: "https://issuer.example/",
+        natsUrl: "wss://relay.example",
       });
-    // Absent entirely.
-    expect(load(undefined)?.identityKey).toBeUndefined();
-    // Only one half present.
-    expect(load({ publicKey: KEY43 })?.identityKey).toBeUndefined();
-    // Wrong length (31 bytes → not an X25519 key).
-    expect(load({ publicKey: "AAAA", privateKey: "AAAA" })?.identityKey).toBeUndefined();
-    // But the rest of the creds still load (identity is optional at this layer).
-    expect(load(undefined)).toMatchObject({ userJwt: "JWT", userSeed: "SEED" });
+      expect(result.credentials.identityKey!.publicKey).toHaveLength(32);
+    }
   });
 
-  it("ignores the legacy file for the default account", () => {
+  it("ignores the legacy single-file path and distinguishes absence", () => {
     const legacy = legacyCredentialPath(HOME);
-    const creds = loadPersistedEnrolledCreds("default", {
+    expect(loadPersistedCredentialDocument({
+      ...expected,
+      accountId: "default",
+    }, {
       home: HOME,
-      exists: (p) => p === legacy,
+      exists: (path: string) => path === legacy,
       read: () => validFile,
+    })).toEqual({ status: "absent" });
+  });
+
+  it("distinguishes malformed JSON without exposing its contents", () => {
+    const perAccount = accountCredentialPath("acctA", HOME);
+    expect(loadPersistedCredentialDocument(expected, {
+      home: HOME,
+      exists: (path: string) => path === perAccount,
+      read: () => "not-json SECRET",
+    })).toEqual({
+      status: "invalid",
+      code: "invalid-json",
+      fields: [],
     });
-    expect(creds).toBeUndefined();
   });
 
-  it("returns undefined when no file exists", () => {
-    expect(
-      loadPersistedEnrolledCreds("default", { home: HOME, exists: () => false }),
-    ).toBeUndefined();
+  it("distinguishes an unreadable existing file without exposing the I/O error", () => {
+    const perAccount = accountCredentialPath("acctA", HOME);
+    expect(loadPersistedCredentialDocument(expected, {
+      home: HOME,
+      exists: (path: string) => path === perAccount,
+      read: () => {
+        throw new Error("SECRET filesystem detail");
+      },
+    })).toEqual({
+      status: "invalid",
+      code: "read-failed",
+      fields: [],
+    });
   });
 
-  it("returns undefined for malformed JSON", () => {
-    const perAccount = accountCredentialPath("default", HOME);
-    expect(
-      loadPersistedEnrolledCreds("default", {
-        home: HOME,
-        exists: (p) => p === perAccount,
-        read: () => "not json{",
-      }),
-    ).toBeUndefined();
-  });
-
-  it("returns undefined when the enrollment block is missing", () => {
-    const perAccount = accountCredentialPath("default", HOME);
-    expect(
-      loadPersistedEnrolledCreds("default", {
-        home: HOME,
-        exists: (p) => p === perAccount,
-        read: () => JSON.stringify({ identityKey: {} }),
-      }),
-    ).toBeUndefined();
-  });
-
-  it("returns undefined when userJwt/userSeed are empty", () => {
-    const perAccount = accountCredentialPath("default", HOME);
-    expect(
-      loadPersistedEnrolledCreds("default", {
-        home: HOME,
-        exists: (p) => p === perAccount,
-        read: () => JSON.stringify({ enrollment: { creds: { userJwt: "", userSeed: "" } } }),
-      }),
-    ).toBeUndefined();
+  it("validates effective tenant/SaaS identity before consulting the filesystem", () => {
+    let consulted = false;
+    expect(() => loadPersistedCredentialDocument({
+      ...expected,
+      tenant: "tenant.with.dot",
+    }, {
+      home: HOME,
+      exists: () => {
+        consulted = true;
+        return false;
+      },
+    })).toThrow(/storage identity invalid-field/);
+    expect(consulted).toBe(false);
   });
 
   it("rejects a traversal account id", () => {
-    expect(() => loadPersistedEnrolledCreds("../../evil", { home: HOME })).toThrow(
-      /invalid account id/,
-    );
+    expect(() => loadPersistedCredentialDocument({
+      ...expected,
+      accountId: "../../evil",
+    }, { home: HOME })).toThrow(/invalid account id/);
   });
 });

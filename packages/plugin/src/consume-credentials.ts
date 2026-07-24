@@ -36,8 +36,12 @@ import {
 } from "./nats-credential-source.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  loadPersistedEnrolledCreds,
+  loadPersistedCredentialDocument,
 } from "./account-config.js";
+import type {
+  BoundCredentialLoadResult,
+  CredentialDocumentFailure,
+} from "./credential-document.js";
 import type { KeyPair } from "./e2e-crypto.js";
 
 /** Outcome of consuming a credential source at runtime. */
@@ -62,11 +66,16 @@ export type ConsumeResult =
        */
       identityKey?: KeyPair;
     }
-  | { status: "creds-missing"; accountId: string };
+  | { status: "creds-missing"; accountId: string }
+  | {
+      status: "creds-binding-failed";
+      accountId: string;
+      failure: Exclude<CredentialDocumentFailure, { status: "absent" }>;
+    };
 
 export type ConsumeCredentialSourceDeps = ConnectNatsDeps & {
   /** Injectable persisted-creds loader (tests). */
-  loadPersisted?: typeof loadPersistedEnrolledCreds;
+  loadPersisted?: typeof loadPersistedCredentialDocument;
   /** Override home dir for path resolution (tests). */
   home?: string;
 };
@@ -78,10 +87,15 @@ export type DialMaterial =
       dial: { kind: "static"; url: string; userJwt: string; userSeed: string };
     }
   | { status: "creds-missing"; accountId: string }
+  | {
+      status: "creds-binding-failed";
+      accountId: string;
+      failure: Exclude<CredentialDocumentFailure, { status: "absent" }>;
+    }
   | { status: "invalid"; error: string };
 
 export type ResolveDialMaterialInput = ResolveNatsCredentialSourceInput & {
-  loadCreds?: (accountId: string) => ReturnType<typeof loadPersistedEnrolledCreds>;
+  loadCreds?: typeof loadPersistedCredentialDocument;
 };
 
 /** Resolve probe dial material without ever entering the enrollment connector. */
@@ -104,16 +118,38 @@ export function resolveDialMaterial(input: ResolveDialMaterialInput): DialMateri
       },
     };
   }
-  const persisted = (input.loadCreds ?? loadPersistedEnrolledCreds)(input.accountId);
-  if (!persisted) return { status: "creds-missing", accountId: input.accountId };
+  let persisted: BoundCredentialLoadResult;
+  try {
+    persisted = (input.loadCreds ?? loadPersistedCredentialDocument)({
+      tenant: source.tenant,
+      accountId: input.accountId,
+      saasBaseUrl: source.saasBaseUrl,
+    });
+  } catch {
+    return {
+      status: "invalid",
+      error: "webchannel: effective credential binding identity is invalid",
+    };
+  }
+  if (persisted.status === "absent") {
+    return { status: "creds-missing", accountId: input.accountId };
+  }
+  if (persisted.status !== "match") {
+    return {
+      status: "creds-binding-failed",
+      accountId: input.accountId,
+      failure: persisted,
+    };
+  }
+  const credentials = persisted.credentials;
   return {
     status: "ok",
     mode: source.mode,
     dial: {
       kind: "static",
-      url: persisted.natsUrl ?? source.url,
-      userJwt: persisted.userJwt,
-      userSeed: persisted.userSeed,
+      url: credentials.natsUrl ?? source.url,
+      userJwt: credentials.userJwt,
+      userSeed: credentials.userSeed,
     },
   };
 }
@@ -137,13 +173,25 @@ export async function consumeCredentialSource(
     return { status: "connected", connection, dialedUrl: source.url };
   }
 
-  const loadPersisted = deps.loadPersisted ?? loadPersistedEnrolledCreds;
-  const persisted = loadPersisted(accountId, {
+  const loadPersisted = deps.loadPersisted ?? loadPersistedCredentialDocument;
+  const persisted = loadPersisted({
+    tenant: source.tenant,
+    accountId,
+    saasBaseUrl: source.saasBaseUrl,
+  }, {
     ...(deps.home !== undefined ? { home: deps.home } : {}),
   });
-  if (!persisted) {
+  if (persisted.status === "absent") {
     return { status: "creds-missing", accountId };
   }
+  if (persisted.status !== "match") {
+    return {
+      status: "creds-binding-failed",
+      accountId,
+      failure: persisted,
+    };
+  }
+  const credentials = persisted.credentials;
 
   // Connect with the persisted enrolled creds via the static branch — identical
   // transport primitive (jwtCredential + NKEY signing callback), no enroll.
@@ -154,13 +202,13 @@ export async function consumeCredentialSource(
   // `WEBCHANNEL_NATS_URL` — now a dev-only override / back-compat fallback for
   // creds enrolled before natsUrl was delivered). This is the load-bearing
   // consume-time half of "the operator does not configure the NATS URL".
-  const dialedUrl = persisted.natsUrl ?? source.url;
+  const dialedUrl = credentials.natsUrl ?? source.url;
   const connection = await connectNatsCredentialSource(
     {
       mode: "static",
       url: dialedUrl,
-      userJwt: persisted.userJwt,
-      userSeed: persisted.userSeed,
+      userJwt: credentials.userJwt,
+      userSeed: credentials.userSeed,
     },
     deps,
   );
@@ -170,6 +218,6 @@ export async function consumeCredentialSource(
     status: "connected",
     connection,
     dialedUrl,
-    ...(persisted.identityKey ? { identityKey: persisted.identityKey } : {}),
+    identityKey: credentials.identityKey,
   };
 }

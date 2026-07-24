@@ -39,6 +39,8 @@ import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
 import { MemoryEnrollmentRepository } from "./enrollment-repository.js";
 import type { NatsUserCredentials } from "./device-flow-types.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
+import { makeNkeySigningCallback } from "../../plugin/src/nkey-sign.js";
+import { NatsTransport } from "../../plugin/src/nats-transport.js";
 
 // ---------------------------------------------------------------------------
 // Locate the nats-server binary
@@ -314,6 +316,39 @@ async function generateAgentCredentials(
   return { userJwt, userSeed, userPubkey: userKp.getPublicKey(), permissions: { pub, sub } };
 }
 
+/**
+ * Agent-like credentials whose ordinary inbound subscription is allowed but
+ * whose mandatory register-admission wildcard is intentionally absent.
+ */
+async function generateRegisterDeniedCredentials(
+  tenant: string,
+  accountId: string,
+): Promise<NatsUserCredentials> {
+  if (!trustChain) throw new Error("Trust chain not initialized");
+  const accountSigner = fromSeed(
+    new TextEncoder().encode(trustChain.private.natsAccountSeed),
+  );
+  const userKp = createUser();
+  const userSeed = new TextDecoder().decode(userKp.getSeed());
+  const pub = [`webchannel.${tenant}.${accountId}.>`];
+  const sub = [`webchannel.${tenant}.${accountId}.*.in`];
+  const userJwt = await encodeUser(
+    `register-denied-${tenant}-${accountId}`,
+    userKp,
+    accountSigner,
+    {
+      pub: { allow: pub },
+      sub: { allow: sub },
+    },
+  );
+  return {
+    userJwt,
+    userSeed,
+    userPubkey: userKp.getPublicKey(),
+    permissions: { pub, sub },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -404,6 +439,39 @@ describe.skipIf(!NATS_SERVER_BIN)(
       // Verify we got a permissions error
       expect(errorMessages.length).toBeGreaterThan(0);
       expect(errorMessages.some((msg) => msg.includes("Permissions Violation"))).toBe(true);
+    });
+
+    it("production SUB/PING barrier rejects a denied register subscription before serving publication", async () => {
+      const accountId = "test-agent";
+      const creds = await generateRegisterDeniedCredentials(TENANT_A, accountId);
+      const transport = new NatsTransport({
+        url: WS_URL,
+        jwtCredential: creds.userJwt,
+        nkeySigningCallback: makeNkeySigningCallback(creds.userSeed),
+        clientName: "register-denied-readiness",
+      });
+      const errors: Error[] = [];
+      transport.on("error", (error) => errors.push(error));
+
+      await transport.connect();
+      let servingPublished = false;
+      transport.subscribe(
+        `webchannel.${TENANT_A}.${accountId}.*.register`,
+      );
+
+      await expect(
+        transport.flush().then(() => {
+          // Mirrors the production publication fence: this callback must remain
+          // unreachable when the real server rejects the required SUB.
+          servingPublished = true;
+        }),
+      ).rejects.toMatchObject({ code: "authorization-violation" });
+
+      expect(servingPublished).toBe(false);
+      expect(errors).toContainEqual(
+        expect.objectContaining({ code: "authorization-violation" }),
+      );
+      await transport.closeGracefully();
     });
 
     it("tenant A client can publish to its own subjects", async () => {

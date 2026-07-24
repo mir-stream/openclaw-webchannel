@@ -104,7 +104,7 @@ long-lived branches:
 | **C2 (unauthenticated registration) — residual scope only** | Closed on the production register path (conversation key is register-delivered to the JWT-attested device key; `handshake-verifier` deleted). Register-hop is now the sole admission path; the residual is the accepted-risk/untrusted-relay caveat there (the relay carries the admission frames but cannot forge admission). [`BACKLOG.md`](BACKLOG.md) §C2. |
 | Direct gateway transport removal | ✅ complete; browser traffic uses the NATS relay only. |
 | Demo/reference server hardening (review SEC1/2/5) | The reference/demo SaaS servers are deliberately demo-grade (in-memory stores, printed admin token); production-hardening rewrite is a pending decision. |
-| Pre-issuer enrollments | Agents enrolled before 0.1.3 never receive the delivered issuer — they must delete `credentials.json` and re-enroll (documented in `GETTING_STARTED.md` troubleshooting). |
+| Pre-v2 credential documents | Legacy files without complete credential-binding identity are not reused. Stop the gateway, archive the exact file, complete any required SaaS active-key replacement, and explicitly re-enroll the account. |
 | Registry is private | `@mir-stream/*` consumers need a classic `read:packages` PAT until the packages go public; the example app is not yet a standalone `npm create` scaffold. |
 | Telegram-parity gaps | Depth cap, discovery, idempotency, markdown, turn control (`/stop`), etc. — analysis lives on branch `feature/webchannel-telegram-parity` (`docs/gaps/`), not merged. |
 | Follow-ups | Live-gateway admission migration (+`dmScope`), conversation-key rotation, agent-initiated-outbound demo scene. |

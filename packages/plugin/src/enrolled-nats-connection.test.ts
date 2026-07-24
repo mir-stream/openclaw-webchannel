@@ -32,6 +32,7 @@ describe("createEnrolledNatsConnection cleanup", () => {
         let signerRejects = failure === "signer";
         const harness = createConnectorTransportHarness();
         const connecting = createEnrolledNatsConnection({
+          saasBaseUrl: "https://saas",
           saasEnrollUrl: "https://saas/api/enroll",
           saasPollUrl: "https://saas/api/poll",
           natsUrl: "wss://fallback",
@@ -126,6 +127,7 @@ describe("createEnrolledNatsConnection cleanup", () => {
     };
 
     const result = await createEnrolledNatsConnection({
+      saasBaseUrl: "https://saas",
       saasEnrollUrl: "https://saas/api/enroll",
       saasPollUrl: "https://saas/api/poll",
       natsUrl: "wss://fallback",
@@ -145,6 +147,7 @@ describe("createEnrolledNatsConnection cleanup", () => {
   it("leaves a successfully connected production transport/socket live", async () => {
     const harness = createConnectorTransportHarness();
     const connecting = createEnrolledNatsConnection({
+      saasBaseUrl: "https://saas",
       saasEnrollUrl: "https://saas/api/enroll",
       saasPollUrl: "https://saas/api/poll",
       natsUrl: "wss://fallback",

@@ -1,17 +1,59 @@
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 
 // Mock node:fs so status's "creds already exist" probe is controllable and never
 // touches the real home dir.
 const existsMock = vi.fn((_p: string) => false);
+const readMock = vi.fn((_p: string) => "");
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, existsSync: (p: string) => existsMock(p) };
+  return {
+    ...actual,
+    existsSync: (p: string) => existsMock(p),
+    readFileSync: (p: string) => readMock(p),
+  };
 });
 
 import { buildFullAccountPatch } from "./setup.js";
 import { webchannelSetupWizard, validateHttpUrl } from "./setup-wizard.js";
 import { NullPeerChannel } from "./channel-contract.js";
 import { createWebChannelPlugin } from "./channel.js";
+import { createCredentialIdentityForEnrollment } from "./credential-document.js";
+
+const CREDENTIAL_KEY = Buffer.alloc(32, 5).toString("base64url");
+
+function boundCredentialJson(
+  overrides: Partial<{
+    tenant: string;
+    accountId: string;
+    saasBaseUrl: string;
+  }> = {},
+): string {
+  const identity = {
+    tenant: overrides.tenant ?? "tenant-a",
+    accountId: overrides.accountId ?? "accta",
+    saasBaseUrl: overrides.saasBaseUrl ?? "https://saas.example",
+  };
+  return JSON.stringify({
+    credentialIdentity: createCredentialIdentityForEnrollment({
+      ...identity,
+      agentPublicKey: CREDENTIAL_KEY,
+    }),
+    identityKey: {
+      publicKey: CREDENTIAL_KEY,
+      privateKey: CREDENTIAL_KEY,
+    },
+    enrollment: {
+      creds: { userJwt: "JWT", userSeed: "SEED" },
+    },
+  });
+}
+
+beforeEach(() => {
+  existsMock.mockReset();
+  existsMock.mockReturnValue(false);
+  readMock.mockReset();
+  readMock.mockReturnValue("");
+});
 
 type Cfg = { channels: { webchannel?: Record<string, unknown> } };
 function account(next: unknown, accountId: string): Record<string, unknown> {
@@ -114,6 +156,46 @@ describe("setup-wizard: declarative detection", () => {
     existsMock.mockReturnValue(false);
     const cfg = { channels: { webchannel: { accounts: { accta: {} } } } } as never;
     expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(false);
+  });
+
+  it("status.resolveConfigured requires a complete matching credential document, not path existence", () => {
+    existsMock.mockReturnValue(true);
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "tenant-a",
+              saas: { baseUrl: "https://saas.example" },
+            },
+          },
+        },
+      },
+    } as never;
+
+    readMock.mockReturnValue("not-json");
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(false);
+
+    readMock.mockReturnValue(boundCredentialJson({ tenant: "other-tenant" }));
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(false);
+
+    readMock.mockReturnValue(boundCredentialJson());
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(true);
   });
 });
 

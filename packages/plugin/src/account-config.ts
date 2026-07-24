@@ -36,22 +36,24 @@ import { homedir } from "node:os";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import {
+  assertValidAccountId,
+  isBlockedAccountId,
+  isValidAccountId,
+} from "./account-id.js";
+import {
+  assertValidCredentialBindingExpectation,
+  loadBoundCredentialDocumentJson,
+  type BoundCredentialLoadResult,
+  type CredentialBindingExpectation,
+} from "./credential-document.js";
 import type { WebchannelNatsConfig } from "./nats-credential-source.js";
-import type { KeyPair } from "./e2e-crypto.js";
+
+export { assertValidAccountId, isValidAccountId } from "./account-id.js";
+export type { PersistedEnrolledCreds } from "./credential-document.js";
 
 /** The single default account id (mirrors core's `"default"`). */
 export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = "default";
-
-/**
- * Strict account-id shape accepted at the filesystem trust boundary. Matches the
- * brief's `^[A-Za-z0-9_-]{1,64}$`; intentionally stricter than core's lenient
- * canonicalizer (no leading-dash / dot / slash) so a path component can never
- * contain `.`/`/`/`\`.
- */
-const STRICT_ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-
-/** Object keys that must never be used as account ids (prototype pollution). */
-const BLOCKED_ACCOUNT_IDS = new Set(["__proto__", "prototype", "constructor"]);
 
 export type InvalidAccountId = { id: string; reason: string };
 
@@ -84,7 +86,7 @@ export function inspectWebchannelAccountIds(cfg: unknown): AccountIdInspection {
     else {
       invalid.push({
         id,
-        reason: BLOCKED_ACCOUNT_IDS.has(id.toLowerCase())
+        reason: isBlockedAccountId(id)
           ? "the id is a blocked prototype key"
           : "the id must match /^[A-Za-z0-9_-]{1,64}$/",
       });
@@ -110,27 +112,8 @@ export function canonicalizeAccountId(value: string | undefined | null): string 
     .replace(/^-+/, "")
     .replace(/-+$/, "")
     .slice(0, 64);
-  if (!canonical || BLOCKED_ACCOUNT_IDS.has(canonical)) return DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  if (!canonical || isBlockedAccountId(canonical)) return DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   return canonical;
-}
-
-/** True when `id` is a safe account id for use as a filesystem path component. */
-export function isValidAccountId(id: string): boolean {
-  return typeof id === "string" && STRICT_ACCOUNT_ID_RE.test(id) && !BLOCKED_ACCOUNT_IDS.has(id.toLowerCase());
-}
-
-/**
- * Assert that an account id is safe to use in a filesystem path. Throws on a
- * traversal sequence / illegal character / blocked key. This is the last-line
- * defense at every path-building / credential-loading entry point.
- */
-export function assertValidAccountId(id: string): void {
-  if (!isValidAccountId(id)) {
-    throw new Error(
-      `webchannel: invalid account id ${JSON.stringify(id)} — must match ` +
-        `/^[A-Za-z0-9_-]{1,64}$/ (refusing to build a credential path).`,
-    );
-  }
 }
 
 /** Per-account config keys whose nested object values are shallow-merged. */
@@ -477,131 +460,40 @@ export function resolveReadCredentialPath(
 }
 
 /**
- * Persisted enrolled NATS credentials (the subset `gateway run` consumes).
- * Mirrors the `enrollment.creds` block of the on-disk `PluginCredentials`.
- */
-export type PersistedEnrolledCreds = {
-  userJwt: string;
-  userSeed: string;
-  /**
-   * NATS relay URL the SaaS delivered alongside the creds (EnrollmentResult.natsUrl,
-   * persisted under `enrollment.natsUrl`). The SaaS is the rendezvous authority, so
-   * the consume path dials THIS in preference to any local `nats.url` /
-   * `WEBCHANNEL_NATS_URL`. Absent for creds enrolled before this field existed —
-   * the consumer then falls back to the resolver URL (back-compat).
-   */
-  natsUrl?: string;
-  /**
-   * Bootstrap-JWT issuer the SaaS delivered alongside the creds
-   * (EnrollmentResult.issuer, persisted under `enrollment.issuer`). Same
-   * rendezvous-authority principle as `natsUrl`: the SaaS declares the exact
-   * `iss` it mints, so the runtime verifies against THIS instead of deriving
-   * issuer = saas.baseUrl and hoping the two agree. Precedence: operator pin
-   * (`auth.jwt.issuer`) > this delivered value > derived. Absent for creds
-   * enrolled before this field existed — the runtime then derives (back-compat).
-   * Used VERBATIM (verify already compares slash-insensitively).
-   */
-  issuer?: string;
-  /**
-   * F2 — the agent's SaaS-attested static X25519 identity key pair, read from the
-   * top-level `identityKey.{publicKey,privateKey}` (base64url) that
-   * `enrollment-client.ts` persists in the SAME `credentials.json`. The register
-   * (keyStore) path wraps the conversation key under THIS so the browser can
-   * authenticate K against the SaaS-pinned agent public key. Absent for creds
-   * enrolled before this field existed or a malformed key block — the register-hop
-   * account then fail-closed skips serving (index-nats), while auto/open/static
-   * accounts (which never wrap K) are unaffected.
-   */
-  identityKey?: KeyPair;
-};
-
-/**
- * Load the persisted enrolled creds for an account (CONSUME-only path — 가-1).
+ * Load one complete credential document only after proving its v2 binding.
  *
- * Reads the account-scoped credential file and returns its `enrollment.creds`.
- * The legacy single-file path is never consulted. Returns `undefined` when the
- * file is absent, unreadable, malformed, or has no enrollment block — the
- * runtime treats that as "creds missing" and applies account-scoped graceful
- * degradation (it never enrolls at runtime). Validates `accountId` first.
+ * The legacy single-file path is never consulted. Unlike the historical loader,
+ * this preserves absent/unbound/mismatch/incomplete/malformed as distinct,
+ * sanitized outcomes and returns secrets only for a complete match.
  *
  * The fs seams are injectable for tests.
  */
-export function loadPersistedEnrolledCreds(
-  accountId: string,
+export function loadPersistedCredentialDocument(
+  expected: CredentialBindingExpectation,
   opts: {
     home?: string;
     exists?: (p: string) => boolean;
     read?: (p: string) => string;
   } = {},
-): PersistedEnrolledCreds | undefined {
-  assertValidAccountId(accountId);
+): BoundCredentialLoadResult {
+  assertValidAccountId(expected.accountId);
+  assertValidCredentialBindingExpectation(expected);
   const exists = opts.exists ?? existsSync;
   const read = opts.read ?? ((p: string) => readFileSync(p, "utf-8"));
-  const path = resolveReadCredentialPath(accountId, {
+  const path = resolveReadCredentialPath(expected.accountId, {
     ...(opts.home !== undefined ? { home: opts.home } : {}),
     exists,
   });
-  if (!exists(path)) return undefined;
+  if (!exists(path)) return Object.freeze({ status: "absent" });
+  let serialized: string;
   try {
-    const parsed = JSON.parse(read(path)) as {
-      identityKey?: { publicKey?: unknown; privateKey?: unknown };
-      enrollment?: {
-        creds?: { userJwt?: unknown; userSeed?: unknown };
-        natsUrl?: unknown;
-        issuer?: unknown;
-      };
-    };
-    const creds = parsed.enrollment?.creds;
-    if (
-      creds &&
-      typeof creds.userJwt === "string" &&
-      typeof creds.userSeed === "string" &&
-      creds.userJwt.length > 0 &&
-      creds.userSeed.length > 0
-    ) {
-      // Thread the SaaS-delivered relay URL + issuer through when present. Kept
-      // optional so already-persisted (pre-natsUrl / pre-issuer) creds still
-      // load and fall back gracefully.
-      const natsUrl = parsed.enrollment?.natsUrl;
-      const issuer = parsed.enrollment?.issuer;
-      // F2: decode the agent identity key pair (top-level, base64url). Only
-      // surfaced when BOTH halves decode to exactly 32 bytes — a partial or
-      // malformed block is treated as absent so the register-hop account
-      // fail-closed skips serving rather than wrapping under a bad key.
-      const identityKey = parseIdentityKey(parsed.identityKey);
-      return {
-        userJwt: creds.userJwt,
-        userSeed: creds.userSeed,
-        ...(typeof natsUrl === "string" && natsUrl.length > 0 ? { natsUrl } : {}),
-        ...(typeof issuer === "string" && issuer.length > 0 ? { issuer } : {}),
-        ...(identityKey ? { identityKey } : {}),
-      };
-    }
-    return undefined;
+    serialized = read(path);
   } catch {
-    return undefined;
+    return Object.freeze({
+      status: "invalid",
+      code: "read-failed",
+      fields: Object.freeze([]),
+    });
   }
-}
-
-/**
- * F2 — decode a persisted `identityKey.{publicKey,privateKey}` (base64url) into a
- * raw-bytes `KeyPair`. Returns `undefined` unless BOTH halves are present and
- * decode to exactly 32 bytes (an X25519 key), so a malformed/partial block is
- * treated as "no identity key" (fail-closed downstream) rather than surfacing a
- * bad key into the wrap path.
- */
-function parseIdentityKey(
-  raw: { publicKey?: unknown; privateKey?: unknown } | undefined,
-): KeyPair | undefined {
-  if (!raw || typeof raw.publicKey !== "string" || typeof raw.privateKey !== "string") {
-    return undefined;
-  }
-  try {
-    const publicKey = new Uint8Array(Buffer.from(raw.publicKey, "base64url"));
-    const privateKey = new Uint8Array(Buffer.from(raw.privateKey, "base64url"));
-    if (publicKey.length !== 32 || privateKey.length !== 32) return undefined;
-    return { publicKey, privateKey };
-  } catch {
-    return undefined;
-  }
+  return loadBoundCredentialDocumentJson(expected, serialized);
 }

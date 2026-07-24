@@ -76,8 +76,14 @@ import {
   type WebchannelNatsConfig,
 } from "./nats-credential-source.js";
 import { consumeCredentialSource } from "./consume-credentials.js";
+import {
+  credentialInspectionCode,
+  formatCredentialInspection,
+  type BoundCredentialLoadResult,
+} from "./credential-document.js";
 import { planWebchannelAccount } from "./multiplex.js";
 import {
+  loadPersistedCredentialDocument,
   resolveTypingEnabled,
 } from "./account-config.js";
 import type { KeyPair } from "./e2e-crypto.js";
@@ -437,18 +443,92 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
 
     {
       const { accountId, tenant, account } = plan;
-      // Pure planning plus immutable auth preparation is the per-account Gate
-      // A. It binds the verifier's expected audience to this runtime accountId
-      // before this account consumes credentials or performs socket/JWKS I/O.
-      // When issuer derivation genuinely needs delivered enrollment metadata,
-      // the memoized accessor gives auth derivation and enrolled transport one
-      // consistent credential snapshot.
-      const getPersisted = createMemoizedPersistedAccessor(accountId);
+      const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
+      const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
+      const accountDmSecurity = account.dmSecurity as string | undefined;
+      const admission = "register-hop" as const;
+
+      // Resolve the effective source before reading enrolled material. In
+      // particular, source.saasBaseUrl includes the resolver's actual override
+      // precedence and is therefore the SaaS identity the document must match.
+      let source: NatsCredentialSource;
+      try {
+        source = resolveNatsCredentialSource({
+          natsConfig: accountNatsCfg,
+          legacyNats,
+          saasBaseUrl: plan.saasBaseUrl ?? config.saas?.baseUrl,
+          tenant,
+          accountId,
+        });
+      } catch (err) {
+        const failure = classifyAccountStartupFailure(err, "preflight");
+        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: failure.operatorMessage }));
+        reportPermanent(accountId, failure.code, failure.operatorMessage);
+        await waitForAbort(ctx.abortSignal);
+        return undefined;
+      }
+
+      // Gate A: load and validate the complete credential document before its
+      // issuer, relay, JWT, seed, or identity key can influence auth or network
+      // work. Keep the exact result so the consume boundary repeats the gate
+      // without a second, potentially different filesystem read.
+      let credentialLoad: BoundCredentialLoadResult | undefined;
+      if (source.mode === "enrolled") {
+        try {
+          credentialLoad = loadPersistedCredentialDocument({
+            tenant,
+            accountId,
+            saasBaseUrl: source.saasBaseUrl,
+          });
+        } catch {
+          const detail =
+            "effective tenant/account/SaaS identity is invalid; correct the account configuration";
+          reportPermanent(
+            accountId,
+            "credential-binding-expectation-invalid",
+            detail,
+          );
+          setStatus(accountNeverServedStatusPatch({
+            restartPending: false,
+            reconnectAttempts: 0,
+            lastError: detail,
+          }));
+          await waitForAbort(ctx.abortSignal);
+          return undefined;
+        }
+        if (credentialLoad.status !== "match") {
+          const code = credentialInspectionCode(credentialLoad);
+          const detail = credentialLoad.status === "absent"
+            ? `enrolled credentials are absent; run: openclaw channels add --channel webchannel --account ${accountId}`
+            : `enrolled credentials are not reusable (${formatCredentialInspection(credentialLoad)}); ` +
+              `stop the gateway, archive the account credential file, complete any required SaaS ` +
+              `active-key replacement, then re-run channels add for account ${accountId}`;
+          reportPermanent(accountId, code, detail);
+          setStatus(accountNeverServedStatusPatch({
+            restartPending: false,
+            reconnectAttempts: 0,
+            lastError: detail,
+          }));
+          await waitForAbort(ctx.abortSignal);
+          return undefined;
+        }
+      }
+
+      // Immutable auth preparation receives only the already-bound projection.
+      // Thus a delivered issuer can never be read from unbound/mismatched bytes.
+      const getPersisted = createMemoizedPersistedAccessor(
+        () => credentialLoad?.status === "match"
+          ? credentialLoad.credentials
+          : undefined,
+      );
       let accountAuth: ReturnType<typeof prepareAccountAuth>;
       try {
         accountAuth = prepareAccountAuth({
           plan,
           getPersisted,
+          ...(source.mode === "enrolled"
+            ? { effectiveSaasBaseUrl: source.saasBaseUrl }
+            : {}),
           ...(config.saas?.baseUrl !== undefined
             ? { topLevelSaasBaseUrl: config.saas.baseUrl }
             : {}),
@@ -481,10 +561,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         await waitForAbort(ctx.abortSignal);
         return undefined;
       }
-      const accountNatsCfg = account.nats as WebchannelNatsConfig | undefined;
-      const accountEncryption = account.encryption as WebchannelEncryptionConfig | undefined;
-      const accountDmSecurity = account.dmSecurity as string | undefined;
-      const admission = "register-hop" as const;
       const effIssuer = accountAuth.auth.jwt.issuer;
       const effAudience = accountId;
 
@@ -522,53 +598,13 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         return undefined;
       }
 
-      // ---- Step 1 (per account): resolve credential source + CONSUME -------
+      // ---- Step 1 (per account): consume already-bound credential source ----
       // F2: the agent's SaaS-attested identity key from the enrolled creds (set
       // only on the enrolled path). The register-hop channel wraps K under it.
-      let identityKey: KeyPair | undefined;
-      let source: NatsCredentialSource;
-      try {
-        source = resolveNatsCredentialSource({
-          natsConfig: accountNatsCfg,
-          legacyNats,
-          saasBaseUrl: plan.saasBaseUrl ?? config.saas?.baseUrl,
-          tenant,
-          accountId,
-        });
-      } catch (err) {
-        const failure = classifyAccountStartupFailure(err, "preflight");
-        setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: failure.operatorMessage }));
-        reportPermanent(accountId, failure.code, failure.operatorMessage);
-        await waitForAbort(ctx.abortSignal);
-        return undefined;
-      }
-
-      // Register-hop encryption requires the SaaS-attested identity key. Load
-      // and validate enrolled material before dialing so missing/malformed local
-      // credentials are a dormant permanent preflight failure, not an outage.
-      if (source.mode === "enrolled") {
-        let persisted: ReturnType<typeof getPersisted>;
-        try {
-          persisted = getPersisted();
-        } catch {
-          const detail = "enrolled credentials are invalid; remove them and re-enroll the account";
-          reportPermanent(accountId, "credentials-invalid", detail);
-          setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: detail }));
-          await waitForAbort(ctx.abortSignal);
-          return undefined;
-        }
-        if (!persisted) {
-          reportPermanent(
-            accountId,
-            "creds-missing",
-            `enrolled credentials are missing; run: openclaw channels add --channel webchannel --account ${accountId}`,
-          );
-          setStatus(accountNeverServedStatusPatch({ restartPending: false, reconnectAttempts: 0, lastError: "enrolled credentials are missing" }));
-          await waitForAbort(ctx.abortSignal);
-          return undefined;
-        }
-        identityKey = persisted.identityKey;
-      }
+      let identityKey: KeyPair | undefined =
+        credentialLoad?.status === "match"
+          ? credentialLoad.credentials.identityKey
+          : undefined;
       if (!identityKey) {
         reportPermanent(
           accountId,
@@ -675,7 +711,9 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       try {
         const consumed = await consumeCredentialSource(source, accountId, {
           signal: attemptAbort.signal,
-          loadPersisted: () => getPersisted(),
+          ...(source.mode === "enrolled" && credentialLoad
+            ? { loadPersisted: () => credentialLoad }
+            : {}),
           onTransport: (created) => {
             // The connector calls this before awaiting connect(). Take sticky
             // disconnect/error ownership here so PONG+close cannot outrun the
@@ -700,6 +738,21 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               phase: "preflight",
               cause: consumed,
               operatorMessage: "enrolled credentials are missing; re-enroll the account",
+            }),
+          };
+        }
+        if (consumed.status === "creds-binding-failed") {
+          attemptAbort.dispose();
+          return {
+            kind: "failed" as const,
+            cause: new AccountStartupError({
+              kind: "permanent",
+              code: credentialInspectionCode(consumed.failure),
+              phase: "preflight",
+              cause: consumed.failure,
+              operatorMessage:
+                `enrolled credentials failed the runtime binding gate ` +
+                `(${formatCredentialInspection(consumed.failure)}); archive them and re-enroll`,
             }),
           };
         }
@@ -1169,6 +1222,10 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         // NatsChannel a compile error inside the normal TypeScript closure.
         const registerChannel: RegisterChannelSurface = channel;
         channel.setRegisterRequestHandler((subjectPeerId, payload, reply) => {
+          // The register SUB is installed privately and flushed before account
+          // publication. A request can arrive in the narrow PONG→commit window;
+          // keep it inert until this runtime is actually serving.
+          if (!published) return;
           // The handler is internally guarded (it replies REGISTER_FAILED on any
           // throw), but attach a `.catch` here too as defense-in-depth: a future
           // unguarded path must never surface as an unhandledRejection.
@@ -1216,11 +1273,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       }
 
       // ---- Step 7 (per account): startup readiness gate (Gate B) -----------
-      // The account is fully wired but not yet published or subscribed. Warm
-      // the exact cache owned by its account-bound verifier before the final
-      // subscribe→publish fence, preserving abort-aware private-readiness
-      // cleanup. A transient JWKS failure is reported but does not permanently
-      // skip the account: live verification remains fail-closed and can retry.
+      // The account is fully wired but still private. Warm the exact cache owned
+      // by its account-bound verifier, then install and flush the required
+      // register subscription before either reporting readiness or publishing
+      // the runtime. A transient JWKS failure is reported but does not
+      // permanently skip the account: live verification remains fail-closed
+      // and can retry.
       let jwks: JwksReadiness | undefined;
       try {
         const readiness = await resolvePrivateReadiness({
@@ -1242,6 +1300,42 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       } catch (err) {
         jwks = { error: err instanceof Error ? err.message : String(err) };
       }
+
+      if (ctx.abortSignal.aborted || preCommitPoisoned || !transport.connected) {
+        const closeReport = (await dispose()).transport;
+        if (ctx.abortSignal.aborted) return { kind: "completed" as const, closeReport };
+        return {
+          kind: "failed" as const,
+          cause: privateFailure ?? new NatsConnectionClosedError(1006, false),
+          closeReport,
+        };
+      }
+
+      // NATS accepts SUB asynchronously. The local sid alone says nothing about
+      // server authorization, so SUB+PING/PONG is the publication barrier.
+      // A permissions -ERR rejects flush and the account stays private.
+      try {
+        channel.subscribeRegister();
+        await transport.flush(attemptAbort.signal);
+      } catch (err) {
+        const cause = privateFailure ?? err;
+        const closeReport = (await dispose()).transport;
+        if (ctx.abortSignal.aborted) {
+          return { kind: "completed" as const, closeReport };
+        }
+        return { kind: "failed" as const, cause, closeReport };
+      }
+
+      if (ctx.abortSignal.aborted || preCommitPoisoned || !transport.connected) {
+        const closeReport = (await dispose()).transport;
+        if (ctx.abortSignal.aborted) return { kind: "completed" as const, closeReport };
+        return {
+          kind: "failed" as const,
+          cause: privateFailure ?? new NatsConnectionClosedError(1006, false),
+          closeReport,
+        };
+      }
+
       const readiness = formatAccountReadiness({
         accountId,
         admission,
@@ -1253,16 +1347,6 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       if (readiness.verdict === "FAIL") log("error", readiness.line);
       else if (readiness.verdict === "WARN") log("warn", readiness.line);
       else log("info", readiness.line);
-
-      if (ctx.abortSignal.aborted || preCommitPoisoned || !transport.connected) {
-        const closeReport = (await dispose()).transport;
-        if (ctx.abortSignal.aborted) return { kind: "completed" as const, closeReport };
-        return {
-          kind: "failed" as const,
-          cause: privateFailure ?? new NatsConnectionClosedError(1006, false),
-          closeReport,
-        };
-      }
 
       const rollbackPublication = () => {
         if (runtimeRef && accountRuntimes.get(accountId) === runtimeRef) accountRuntimes.delete(accountId);
@@ -1278,12 +1362,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         connected: boolean;
       } | undefined;
       try {
-        // Phase D is intentionally synchronous: no register SUB exists before it.
-        // The serving status write is the final throwing operation in this
-        // fence; a failure unpublishes synchronously before disposal is awaited.
+        // Phase D is intentionally synchronous after the server-confirmed
+        // register-subscription barrier. The serving status write is the final
+        // throwing operation in this fence; a failure unpublishes synchronously
+        // before disposal is awaited.
         const committed = commitAccountPublication<AccountRuntime>({
           publish: () => {
-            channel.subscribeRegister();
             if (ctx.abortSignal.aborted || preCommitPoisoned || !transport.connected) {
               throw new Error("account lost ownership or connection during commit");
             }

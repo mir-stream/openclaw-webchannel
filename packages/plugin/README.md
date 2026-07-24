@@ -71,9 +71,11 @@ gateway-run time when no webchannel config exists, and is deprecated once config
 import { EnrollmentClient } from "./src/enrollment-client.js";
 
 const client = new EnrollmentClient({
+  saasBaseUrl:  "https://saas.example",
   saasEnrollUrl: "https://saas.example/api/enroll",
   saasPollUrl:   "https://saas.example/api/poll",
   tenant: "tenant-123",
+  accountId: "account-a",
 });
 
 const enrollment = await client.enroll();   // first boot: device flow; restart: load creds
@@ -88,15 +90,19 @@ const peerId      = client.getPeerId();
 **Flow:** first boot generates an X25519 identity key, POSTs to `/enroll`, surfaces the
 `user_code` + verification URI, polls `/poll` (RFC 8628 minimum 5s interval) until the operator
 approves, then receives and persists NATS user credentials. On restart it loads the stored
-credentials and skips enrollment.
+credentials and skips enrollment only when their complete v2 identity matches the effective
+tenant, account, SaaS base, delivered issuer/relay, and local public key.
 
 **Credential storage:**
 - **Location:** `~/.openclaw-webchannel/<account>/credentials.json` (override via `credentialPath`)
 - **Permissions:** written with mode `0o600` (owner read/write only)
 - **Shape** (`PluginCredentials`): `identityKey { publicKey, privateKey }` (base64url X25519),
-  optional `enrollment { creds, peerId, jwksUrl, bootstrapUrl }`, plus `tenant`, `saasEnrollUrl`,
-  `saasPollUrl`, optional `accountId` (the wire identity). The private key is generated locally
-  and never transmitted.
+  optional `enrollment { creds, peerId, jwksUrl, bootstrapUrl, natsUrl, issuer }`, one
+  `credentialIdentity` (`CredentialBindingIdentityV2`) block, plus `tenant`, `accountId`,
+  `saasEnrollUrl`, and `saasPollUrl`. The private key is generated locally and never transmitted.
+  Legacy/unbound or mismatched files are never reused or overwritten automatically; stop the
+  gateway, archive the exact file, complete any required SaaS active-key replacement, and then
+  re-run account enrollment.
 
 ## E2E security model (admission + key establishment)
 

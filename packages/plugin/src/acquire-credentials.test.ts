@@ -36,6 +36,7 @@ describe("acquireCredentials", () => {
     expect(result.peerId).toBe("peer-1");
     expect(enroll).toHaveBeenCalledOnce();
     // Derives /api/enroll + /api/poll from the base URL.
+    expect(capturedOpts?.saasBaseUrl).toBe("http://saas.example");
     expect(capturedOpts?.saasEnrollUrl).toBe("http://saas.example/api/enroll");
     expect(capturedOpts?.saasPollUrl).toBe("http://saas.example/api/poll");
     expect(capturedOpts?.tenant).toBe("tA");
@@ -62,6 +63,7 @@ describe("acquireCredentials", () => {
         return { enroll: async () => fakeEnrollmentResult() } as unknown as EnrollmentClient;
       },
     });
+    expect(capturedOpts?.saasBaseUrl).toBe("http://saas.example");
     expect(capturedOpts?.saasEnrollUrl).toBe("http://saas.example/api/enroll");
   });
 

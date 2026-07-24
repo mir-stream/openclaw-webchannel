@@ -396,6 +396,48 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
     expect(received[0]!.payload.toString("utf8")).toBe("foo");
   });
 
+  it("flush proves a preceding SUB only after the server PONG", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+    const connected = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n");
+    await connected;
+
+    t.subscribe("webchannel.t.a.*.register");
+    let settled = false;
+    const flushed = t.flush().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(fakeWs.sent).toContain("PING\r\n");
+
+    fakeWs.fireServerFrame("PONG\r\n");
+    await flushed;
+    expect(settled).toBe(true);
+  });
+
+  it("flush rejects a real post-handshake subscription permission error", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+    const connected = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n");
+    await connected;
+    t.on("error", () => { /* expected structured transport event */ });
+
+    t.subscribe("webchannel.forbidden.*.register");
+    const flushed = t.flush();
+    fakeWs.fireServerFrame(
+      "-ERR 'Permissions Violation for Subscription to webchannel.forbidden.*.register'\r\nPONG\r\n",
+    );
+
+    await expect(flushed).rejects.toMatchObject({
+      code: "authorization-violation",
+    });
+  });
+
   it("publish() sends PUB command with correct byte count", async () => {
     const { t, fakeWs } = makeTestTransport();
     teardown.push(t);

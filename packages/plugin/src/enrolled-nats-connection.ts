@@ -9,6 +9,7 @@
  *
  * USAGE:
  *   const connection = await createEnrolledNatsConnection({
+ *     saasBaseUrl: 'https://saas.com',
  *     saasEnrollUrl: 'https://saas.com/api/enroll',
  *     saasPollUrl: 'https://saas.com/api/poll',
  *     natsUrl: 'wss://nats.example.com',
@@ -32,6 +33,9 @@ import type { KeyPair } from "./e2e-crypto.js";
  * Enrolled NATS connection options.
  */
 export type EnrolledNatsConnectionOptions = {
+  /** Effective SaaS base used to bind newly issued credentials. */
+  saasBaseUrl: string;
+
   /**
    * SaaS enrollment endpoint URL.
    */
@@ -99,7 +103,8 @@ export type EnrolledNatsConnection = {
     peerId: string;
     jwksUrl: string;
     bootstrapUrl: string;
-    natsUrl: string;
+    natsUrl?: string;
+    issuer?: string;
   };
 
   /**
@@ -138,6 +143,7 @@ export async function createEnrolledNatsConnection(
   // Step 1: Enroll (or load existing enrollment)
   console.log("[connection] Starting enrollment...");
   const enrollmentOptions: EnrollmentOptions = {
+    saasBaseUrl: options.saasBaseUrl,
     saasEnrollUrl: options.saasEnrollUrl,
     saasPollUrl: options.saasPollUrl,
     tenant: options.tenant,
@@ -211,6 +217,7 @@ export function createDefaultNatsConnection(
   saasBaseUrl: string,
 ): Promise<EnrolledNatsConnection> {
   return createEnrolledNatsConnection({
+    saasBaseUrl,
     saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
     saasPollUrl: `${saasBaseUrl}/api/poll`,
     natsUrl,

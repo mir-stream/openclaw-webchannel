@@ -21,6 +21,14 @@ import type { KeyPair } from "./e2e-crypto.js";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { accountCredentialPath } from "./account-config.js";
+import {
+  CREDENTIAL_BINDING_IDENTITY_FIELD,
+  CredentialDocumentBindingError,
+  createCredentialIdentityForEnrollment,
+  loadBoundCredentialDocument,
+  loadBoundCredentialDocumentJson,
+  type PluginCredentialDocument,
+} from "./credential-document.js";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
 
 // ---------------------------------------------------------------------------
@@ -73,7 +81,7 @@ type EnrollmentResult = {
    * the minted creds (the SaaS is the rendezvous authority); the enrolled plugin
    * dials THIS rather than a local `nats.url` / `WEBCHANNEL_NATS_URL`.
    */
-  natsUrl: string;
+  natsUrl?: string;
   /**
    * The exact `iss` the SaaS puts in the bootstrap JWTs it mints (same
    * rendezvous-authority principle as `natsUrl`). OPTIONAL here (unlike the
@@ -127,49 +135,7 @@ type PollResponse = EnrollmentResult | DeviceFlowError;
  * Stored on disk and used for reconnection. Contains everything needed
  * to reconnect to NATS and identify the plugin.
  */
-export type PluginCredentials = {
-  /**
-   * Plugin's X25519 key pair (identity key).
-   * Generated once on first boot, never rotated.
-   */
-  identityKey: {
-    publicKey: string; // base64url-encoded
-    privateKey: string; // base64url-encoded
-  };
-
-  /**
-   * Enrollment result from SaaS (populated after approval).
-   */
-  enrollment?: {
-    creds: NatsUserCredentials;
-    peerId: string;
-    jwksUrl: string;
-    bootstrapUrl: string;
-    natsUrl: string;
-    /** SaaS-delivered bootstrap-JWT issuer (absent for pre-issuer enrollments). */
-    issuer?: string;
-  };
-
-  /**
-   * Account (deployment) id — the wire identity (optional, for debugging).
-   */
-  accountId: string;
-
-  /**
-   * Tenant ID.
-   */
-  tenant: string;
-
-  /**
-   * SaaS enrollment endpoint URL.
-   */
-  saasEnrollUrl: string;
-
-  /**
-   * SaaS poll endpoint URL.
-   */
-  saasPollUrl: string;
-};
+export type PluginCredentials = PluginCredentialDocument;
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -179,6 +145,9 @@ export type PluginCredentials = {
  * Plugin enrollment options.
  */
 export type EnrollmentOptions = {
+  /** Effective SaaS base used for this acquisition and credential binding. */
+  saasBaseUrl: string;
+
   /**
    * SaaS enrollment endpoint URL.
    * Example: "https://saas.com/api/enroll"
@@ -418,6 +387,31 @@ export class EnrollmentClient {
 
       // Success! Store credentials
       this.credentials.enrollment = pollResult;
+      this.credentials[CREDENTIAL_BINDING_IDENTITY_FIELD] =
+        createCredentialIdentityForEnrollment({
+          tenant: this.options.tenant,
+          accountId: this.options.accountId,
+          saasBaseUrl: this.options.saasBaseUrl,
+          ...(pollResult.issuer !== undefined
+            ? { deliveredIssuer: pollResult.issuer }
+            : {}),
+          ...(pollResult.natsUrl !== undefined
+            ? { relayUrl: pollResult.natsUrl }
+            : {}),
+          agentPublicKey: this.credentials.identityKey.publicKey,
+        });
+      const validated = loadBoundCredentialDocument(
+        {
+          tenant: this.options.tenant,
+          accountId: this.options.accountId,
+          saasBaseUrl: this.options.saasBaseUrl,
+        },
+        this.credentials,
+      );
+      if (validated.status !== "match") {
+        throw new CredentialDocumentBindingError(validated);
+      }
+      this.credentials = validated.document;
       this.saveCredentials();
 
       console.log("[enrollment] ✓ Enrollment complete!");
@@ -446,11 +440,26 @@ export class EnrollmentClient {
       }
 
       const data = readFileSync(this.options.credentialPath, "utf-8");
-      this.credentials = JSON.parse(data) as PluginCredentials;
+      const loaded = loadBoundCredentialDocumentJson(
+        {
+          tenant: this.options.tenant,
+          accountId: this.options.accountId,
+          saasBaseUrl: this.options.saasBaseUrl,
+        },
+        data,
+      );
+      if (loaded.status !== "match") {
+        throw new CredentialDocumentBindingError(loaded);
+      }
+      this.credentials = loaded.document;
       return true;
     } catch (error) {
-      console.warn("[enrollment] Failed to load credentials:", error);
-      return false;
+      if (error instanceof CredentialDocumentBindingError) throw error;
+      throw new CredentialDocumentBindingError({
+        status: "invalid",
+        code: "read-failed",
+        fields: Object.freeze([]),
+      });
     }
   }
 
