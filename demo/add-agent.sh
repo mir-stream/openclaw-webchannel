@@ -133,7 +133,12 @@ if [ "$ADD_RC" -ne 0 ]; then
   tail -8 "$ADDLOG"
   exit 0
 fi
-[ -f "$HOME_DIR/.openclaw-webchannel/$ACCOUNT/credentials.json" ] || { echo "[add-agent] creds not persisted"; exit 2; }
+CRED_FILE="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+  credentials "$TENANT" "$ACCOUNT" "$HOME_DIR")"
+[ -f "$CRED_FILE" ] || {
+  echo "[add-agent] creds not persisted at $CRED_FILE"
+  exit 2
+}
 echo "[add-agent] ✓ $ACCOUNT approved + credentials persisted"
 
 # Re-assert register-hop admission, then boot the gateway.

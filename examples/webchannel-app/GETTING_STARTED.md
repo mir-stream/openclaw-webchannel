@@ -253,7 +253,8 @@ replies over the E2E-encrypted NGS relay.
 - **Browser register rejected with an opaque `unauthorized`** → the agent is verifying
   against a different JWT issuer than the SaaS mints. Two known causes: (1) the agent
   enrolled with an **older** saas/plugin version that predates SaaS-delivered issuer —
-  delete `~/.openclaw-webchannel/<account>/credentials.json` and re-run `channels add`
+  delete `~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json` and re-run
+  `channels add`
   (re-enrollment is what delivers the issuer); (2) a stale `auth.jwt.issuer` **pin** in
   `openclaw.json` — a pin always wins over the delivered value, so remove it unless you
   set it deliberately.

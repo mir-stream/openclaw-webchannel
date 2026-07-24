@@ -273,7 +273,8 @@ ADD_PID=""
 if [ "$ADD_RC" -ne 0 ]; then
   echo "[run-derived-trust] channels add failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add.log"; exit 2
 fi
-CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
+CRED_FILE="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+  credentials "$TENANT" "$ACCOUNT_ID" "$OCH")"
 [ -f "$CRED_FILE" ] || { echo "[run-derived-trust] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-derived-trust] ✓ credentials persisted at $CRED_FILE"
 

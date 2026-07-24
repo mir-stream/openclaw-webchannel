@@ -321,7 +321,10 @@ JSON
 
   set +e; wait "$add_pid"; local rc=$?; set -e
   [ "$rc" -ne 0 ] && { echo "[demo] $acct channels add failed (rc=$rc):"; cat "$addlog"; exit 2; }
-  [ -f "$home/.openclaw-webchannel/$acct/credentials.json" ] || { echo "[demo] $acct creds not persisted"; cat "$addlog"; exit 2; }
+  local cred_file
+  cred_file="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+    credentials "$TENANT" "$acct" "$home")"
+  [ -f "$cred_file" ] || { echo "[demo] $acct creds not persisted at $cred_file"; cat "$addlog"; exit 2; }
 
   # Re-assert register-hop admission (setup adapter may write admission:register-hop).
   node -e '

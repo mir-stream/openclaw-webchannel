@@ -214,7 +214,7 @@ JSON
 echo "[run-two-acct] wrote one gateway config (2 accounts, 2 agents, 2 bindings)"
 
 enroll_account() {
-  local acct="$1" log="$OCH/channels-add-$1.log" code=""
+  local acct="$1" log="$OCH/channels-add-$1.log" code="" cred_file=""
   HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
     "$REPO/node_modules/.bin/openclaw" channels add --channel webchannel --account "$acct" \
       --base-url "$ISS" --url "$TENANT" >"$log" 2>&1 &
@@ -231,7 +231,13 @@ enroll_account() {
     -d "{\"user_code\":\"$code\"}" >/dev/null
   wait "$ADD_PID" || { cat "$log"; exit 2; }
   ADD_PID=""
-  [ -f "$OCH/.openclaw-webchannel/$acct/credentials.json" ] || exit 2
+  cred_file="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+    credentials "$TENANT" "$acct" "$OCH")"
+  [ -f "$cred_file" ] || {
+    echo "[run-two-acct] creds NOT persisted at $cred_file"
+    cat "$log"
+    exit 2
+  }
 }
 enroll_account "$ACCT_A"
 enroll_account "$ACCT_B"
@@ -300,7 +306,8 @@ run_account "acctB" "$PEER_B" "$ACCT_B" "$ECHO_B_PREFIX" "$ECHO_A_PREFIX" || {
 #    driver reconnects the existing B peer once as a positive snapshot control,
 #    then presents an A-authorized JWT with a real B-issued nonce and otherwise
 #    identical/valid PoP material on B's actual live subject.
-B_KEYS="$OCH/.openclaw-webchannel/$ACCT_B/conversation-keys.json"
+B_KEYS="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+  conversation-keys "$TENANT" "$ACCT_B" "$OCH")"
 B_KEYS_BEFORE="$OCH/b-keys-before.json"
 [ -f "$B_KEYS" ] || { echo "[run-two-acct] missing B conversation key store after positive B→B"; exit 3; }
 cp "$B_KEYS" "$B_KEYS_BEFORE"
