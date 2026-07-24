@@ -441,7 +441,7 @@ describe("EnrollmentClient", () => {
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it("rejects a legacy unbound file without enrollment or overwrite", async () => {
+    it("upgrades a complete owned v1 exact override and skips enrollment", async () => {
       const pair = generateKeyPair();
       const key = Buffer.from(pair.publicKey).toString("base64url");
       const privateKey = Buffer.from(pair.privateKey).toString("base64url");
@@ -460,13 +460,13 @@ describe("EnrollmentClient", () => {
         saasPollUrl: "https://saas.com/api/poll",
       };
       writeFileSync(credentialPath, JSON.stringify(legacy));
-      const before = readFileSync(credentialPath, "utf8");
-
-      await expect(client.enroll()).rejects.toMatchObject({
-        code: "credentials-unbound",
+      await expect(client.enroll()).resolves.toMatchObject({
+        peerId: "legacy",
       });
       expect(mockFetch).not.toHaveBeenCalled();
-      expect(readFileSync(credentialPath, "utf8")).toBe(before);
+      expect(
+        JSON.parse(readFileSync(credentialPath, "utf8")),
+      ).toHaveProperty(CREDENTIAL_BINDING_IDENTITY_FIELD);
     });
   });
 

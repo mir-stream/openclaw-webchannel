@@ -1,13 +1,16 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   type Dirent,
   existsSync,
+  linkSync,
+  lstatSync,
   readFileSync,
   readdirSync,
   renameSync,
+  unlinkSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import {
@@ -47,6 +50,8 @@ import {
 const BACKUP_DIRECTORY_NAME = ".legacy-v1-backups";
 const CLAIM_FILE_NAME = "migration-claim.json";
 const SOURCE_DIRECTORY_NAME = "source";
+const EXACT_SOURCE_FILE_NAME = "exact-credentials.json";
+const EXACT_SOURCE_METADATA_FILE_NAME = "exact-source.json";
 const COMPLETE_FILE_NAME = "migration-complete.json";
 const STORAGE_NAMESPACE_ID_LENGTH = "v2_".length + 43;
 const STORAGE_NAMESPACE_ID_PATTERN = /^v2_[A-Za-z0-9_-]{43}$/;
@@ -64,6 +69,21 @@ type CompletionFile = {
   conversationKeys: "fresh" | "migrated";
 };
 
+type ExactSourceFile = {
+  version: 2;
+  storageIdentity: StorageIdentityV2;
+  credentialPathHash: string;
+  sourceDev: number;
+  sourceIno: number;
+  sourceSha256: string;
+};
+
+type ExactCredentialSource = Readonly<{
+  bytes: Buffer;
+  dev: number;
+  ino: number;
+}>;
+
 export type LegacyMigrationResult = Readonly<{
   status:
     | "not-needed"
@@ -80,6 +100,8 @@ export type LegacyMigrationOptions = CredentialPathOptions & {
   _afterClaim?: () => void;
   /** @internal Test-only seam after durable source move and before publication. */
   _afterSourceMove?: () => void;
+  /** @internal Test-only seam for simulating a cross-device hard-link. */
+  _linkExactSource?: (sourcePath: string, archivePath: string) => void;
 };
 
 /**
@@ -97,22 +119,28 @@ export function migrateLegacyTupleState(
   const destination = tupleStoragePaths(options);
   const credentialDestination = resolveCredentialPath(options);
   const legacy = legacyTuplePaths(options.accountId, options.home);
-
-  verifyExistingDestinations(
-    destination.scope,
-    credentialDestination,
-    destination.conversationKeyPath,
-  );
-
   const backupRoot = join(legacy.root, BACKUP_DIRECTORY_NAME);
   const claimDirectory = join(
     backupRoot,
     `${options.accountId}--${destination.namespaceId}`,
   );
   const archivedSource = join(claimDirectory, SOURCE_DIRECTORY_NAME);
+  const archivedExactCredential = join(
+    claimDirectory,
+    EXACT_SOURCE_FILE_NAME,
+  );
+  const exactSourceMetadata = join(
+    claimDirectory,
+    EXACT_SOURCE_METADATA_FILE_NAME,
+  );
   const completed = join(claimDirectory, COMPLETE_FILE_NAME);
 
   if (existsSync(completed)) {
+    verifyExistingDestinations(
+      destination.scope,
+      credentialDestination,
+      destination.conversationKeyPath,
+    );
     const marker = readCompletionFile(completed, destination.scope);
     return Object.freeze({
       status: "not-needed",
@@ -122,6 +150,67 @@ export function migrateLegacyTupleState(
         : "absent",
     });
   }
+
+  const canUseExactLegacySource =
+    options.credentialPath !== undefined &&
+    resolvePath(credentialDestination) !==
+      resolvePath(destination.credentialPath);
+  const hasExactJournal =
+    existsSync(exactSourceMetadata) || existsSync(archivedExactCredential);
+  if (hasExactJournal) {
+    return migrateExactCredentialSource({
+      scope: destination.scope,
+      backupRoot,
+      claimDirectory,
+      archivedExactCredential,
+      exactSourceMetadata,
+      liveCredentialPath: credentialDestination,
+      legacy,
+      conversationKeyDestination: destination.conversationKeyPath,
+      resumed: true,
+      ...(options._afterClaim ? { afterClaim: options._afterClaim } : {}),
+      ...(options._afterSourceMove
+        ? { afterSourceMove: options._afterSourceMove }
+        : {}),
+      ...(options._linkExactSource
+        ? { linkExactSource: options._linkExactSource }
+        : {}),
+    });
+  }
+
+  if (canUseExactLegacySource) {
+    const exactCredential = inspectExactLegacyCredential(
+      credentialDestination,
+      destination.scope,
+    );
+    if (exactCredential.status === "owned") {
+      return migrateExactCredentialSource({
+        scope: destination.scope,
+        backupRoot,
+        claimDirectory,
+        archivedExactCredential,
+        exactSourceMetadata,
+        liveCredentialPath: credentialDestination,
+        legacy,
+        conversationKeyDestination: destination.conversationKeyPath,
+        resumed: false,
+        exactCredential,
+        ...(options._afterClaim ? { afterClaim: options._afterClaim } : {}),
+        ...(options._afterSourceMove
+          ? { afterSourceMove: options._afterSourceMove }
+          : {}),
+        ...(options._linkExactSource
+          ? { linkExactSource: options._linkExactSource }
+          : {}),
+      });
+    }
+  }
+
+  verifyExistingDestinations(
+    destination.scope,
+    credentialDestination,
+    destination.conversationKeyPath,
+  );
 
   if (existsSync(archivedSource)) {
     assertNoLiveForeignClaim(backupRoot, options.accountId, claimDirectory);
@@ -241,6 +330,516 @@ export function migrateLegacyTupleState(
     conversationKeyDestination: destination.conversationKeyPath,
     resumed: false,
   });
+}
+
+function migrateExactCredentialSource(input: {
+  scope: StorageIdentityV2["storage"];
+  backupRoot: string;
+  claimDirectory: string;
+  archivedExactCredential: string;
+  exactSourceMetadata: string;
+  liveCredentialPath: string;
+  legacy: ReturnType<typeof legacyTuplePaths>;
+  conversationKeyDestination: string;
+  resumed: boolean;
+  exactCredential?: {
+    status: "owned";
+    upgraded: ReturnType<typeof upgradeLegacyCredentialDocument>;
+    source: ExactCredentialSource;
+  };
+  afterClaim?: () => void;
+  afterSourceMove?: () => void;
+  linkExactSource?: (sourcePath: string, archivePath: string) => void;
+}): LegacyMigrationResult {
+  const pathHash = credentialPathHash(input.liveCredentialPath);
+  if (
+    existsSync(input.archivedExactCredential) &&
+    !existsSync(input.exactSourceMetadata)
+  ) {
+    // The metadata is durably published before archival. An archive without
+    // that path-bound journal can never be a legitimate resumable state.
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+  const exactJournal = existsSync(input.exactSourceMetadata)
+    ? readExactSourceFile(input.exactSourceMetadata, input.scope, pathHash)
+    : undefined;
+
+  const exactCredential = input.exactCredential ??
+    inspectExactLegacyCredential(
+      existsSync(input.archivedExactCredential)
+        ? input.archivedExactCredential
+        : input.liveCredentialPath,
+      input.scope,
+    );
+  if (exactCredential.status !== "owned") {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+  if (
+    exactJournal &&
+    exactJournal.sourceSha256 !==
+      exactCredentialSourceDigest(exactCredential.source.bytes)
+  ) {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+
+  const archivedLegacyDirectory = join(
+    input.claimDirectory,
+    SOURCE_DIRECTORY_NAME,
+  );
+  const legacyCredentialPath = existsSync(archivedLegacyDirectory)
+    ? join(archivedLegacyDirectory, "credentials.json")
+    : input.legacy.credentialPath;
+  const legacyConversationPath = existsSync(archivedLegacyDirectory)
+    ? join(archivedLegacyDirectory, "conversation-keys.json")
+    : input.legacy.conversationKeyPath;
+
+  // A bare-account credential is independent ownership evidence. If present,
+  // it must agree with the exact override's complete storage/binding identity
+  // before that override may authorize adoption of collocated legacy keys.
+  const legacyCredential = inspectLegacyCredential(
+    legacyCredentialPath,
+    input.scope,
+  );
+  if (
+    legacyCredential.status !== "absent" &&
+    (legacyCredential.status !== "owned" ||
+      !isDeepStrictEqual(
+        legacyCredential.upgraded[CREDENTIAL_IDENTITY_FIELD],
+        exactCredential.upgraded[CREDENTIAL_IDENTITY_FIELD],
+      ))
+  ) {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+
+  const legacyConversationExists = existsSync(legacyConversationPath);
+  const legacyKeys = legacyConversationExists
+    ? readLegacyConversationKeys(
+        legacyConversationPath,
+        input.scope,
+      )
+    : null;
+  if (existsSync(input.conversationKeyDestination)) {
+    const existing = parseConversationKeyDocument(
+      input.scope,
+      readStorageFile(
+        input.conversationKeyDestination,
+        "conversation-keys",
+      ),
+    );
+    if (!conversationKeyMapsEqual(existing, legacyKeys ?? new Map())) {
+      throw new StorageDocumentError(
+        "conversation-keys",
+        "legacy-migration-failed",
+      );
+    }
+  }
+
+  assertNoLiveForeignClaim(
+    input.backupRoot,
+    input.scope.accountId,
+    input.claimDirectory,
+  );
+  claimMigration(input.claimDirectory, input.scope);
+  const authorizedSource: ExactCredentialSource = exactJournal
+    ? Object.freeze({
+        bytes: exactCredential.source.bytes,
+        dev: exactJournal.sourceDev,
+        ino: exactJournal.sourceIno,
+      })
+    : exactCredential.source;
+  const metadataCreated = publishExactSourceFile(
+    input.exactSourceMetadata,
+    input.scope,
+    pathHash,
+    authorizedSource,
+  );
+  input.afterClaim?.();
+
+  try {
+    archiveExactCredential(
+      input.liveCredentialPath,
+      input.archivedExactCredential,
+      exactCredential.upgraded,
+      authorizedSource,
+      input.scope,
+      input.linkExactSource ?? linkSync,
+    );
+  } catch (error) {
+    if (
+      metadataCreated &&
+      !existsSync(input.archivedExactCredential)
+    ) {
+      try {
+        unlinkSync(input.exactSourceMetadata);
+        fsyncDirectoryBestEffort(dirname(input.exactSourceMetadata));
+      } catch {
+        // Preserve the archival failure. The path-bound metadata contains no
+        // secret and a retry will validate it before doing any source work.
+      }
+    }
+    throw error;
+  }
+  const archivedExact = inspectExactLegacyCredential(
+    input.archivedExactCredential,
+    input.scope,
+  );
+  if (
+    archivedExact.status !== "owned" ||
+    !isDeepStrictEqual(
+      archivedExact.upgraded,
+      exactCredential.upgraded,
+    )
+  ) {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+  try {
+    if (
+      existsSync(input.legacy.directory) &&
+      !existsSync(archivedLegacyDirectory)
+    ) {
+      renameSync(input.legacy.directory, archivedLegacyDirectory);
+      fsyncDirectoryBestEffort(input.legacy.root);
+      fsyncDirectoryBestEffort(input.claimDirectory);
+    }
+  } catch {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+  input.afterSourceMove?.();
+
+  try {
+    chmodSync(input.archivedExactCredential, 0o600);
+    if (existsSync(archivedLegacyDirectory)) {
+      const archivedLegacyCredential = join(
+        archivedLegacyDirectory,
+        "credentials.json",
+      );
+      chmodSync(archivedLegacyDirectory, 0o700);
+      if (existsSync(archivedLegacyCredential)) {
+        chmodSync(archivedLegacyCredential, 0o600);
+      }
+      const archivedLegacyConversation = join(
+        archivedLegacyDirectory,
+        "conversation-keys.json",
+      );
+      if (existsSync(archivedLegacyConversation)) {
+        chmodSync(archivedLegacyConversation, 0o600);
+      }
+    }
+    publishCredential(
+      input.scope,
+      input.liveCredentialPath,
+      exactCredential.upgraded,
+      false,
+    );
+    publishConversationKeys(
+      input.scope,
+      input.conversationKeyDestination,
+      legacyKeys ?? new Map(),
+    );
+    verifyMigratedDestinations(
+      input.scope,
+      input.liveCredentialPath,
+      input.conversationKeyDestination,
+      exactCredential.upgraded,
+      legacyKeys ?? new Map(),
+    );
+    atomicWritePrivateFile(
+      join(input.claimDirectory, COMPLETE_FILE_NAME),
+      JSON.stringify(
+        {
+          version: 2,
+          storageIdentity: createStorageIdentityV2(input.scope),
+          credential: "migrated",
+          conversationKeys: legacyKeys ? "migrated" : "fresh",
+        } satisfies CompletionFile,
+        null,
+        2,
+      ),
+      { replace: true, enforceDirectoryMode: true },
+    );
+  } catch (error) {
+    if (error instanceof StorageDocumentError) throw error;
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+
+  return Object.freeze({
+    status: input.resumed ? "resumed" : "migrated",
+    credential: "migrated",
+    conversationKeys: legacyKeys ? "migrated" : "fresh",
+  });
+}
+
+function inspectExactLegacyCredential(
+  credentialPath: string,
+  scope: StorageIdentityV2["storage"],
+):
+  | { status: "absent" | "not-legacy" }
+  | {
+      status: "owned";
+      upgraded: ReturnType<typeof upgradeLegacyCredentialDocument>;
+      source: ExactCredentialSource;
+    } {
+  if (!existsSync(credentialPath)) return { status: "absent" };
+  let before: ReturnType<typeof lstatSync>;
+  let bytes: Buffer;
+  let after: ReturnType<typeof lstatSync>;
+  try {
+    before = lstatSync(credentialPath);
+    if (!before.isFile() || before.isSymbolicLink()) {
+      throw new StorageDocumentError("credentials", "storage-io-failed");
+    }
+    bytes = readFileSync(credentialPath);
+    after = lstatSync(credentialPath);
+    if (!sameInode(before, after)) {
+      throw new StorageDocumentError("credentials", "storage-io-failed");
+    }
+  } catch (error) {
+    if (error instanceof StorageDocumentError) throw error;
+    throw new StorageDocumentError("credentials", "storage-io-failed");
+  }
+  let candidate: Record<string, unknown>;
+  try {
+    candidate = parseCredentialJson(bytes.toString("utf8"));
+  } catch {
+    return { status: "not-legacy" };
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(
+      candidate,
+      CREDENTIAL_IDENTITY_FIELD,
+    ) ||
+    !legacyCredentialProvesScope(scope, candidate)
+  ) {
+    return { status: "not-legacy" };
+  }
+  try {
+    return {
+      status: "owned",
+      upgraded: upgradeLegacyCredentialDocument(scope, candidate),
+      source: Object.freeze({
+        bytes,
+        dev: after.dev,
+        ino: after.ino,
+      }),
+    };
+  } catch {
+    return { status: "not-legacy" };
+  }
+}
+
+function archiveExactCredential(
+  livePath: string,
+  archivePath: string,
+  upgraded: Record<string, unknown>,
+  source: ExactCredentialSource,
+  scope: StorageIdentityV2["storage"],
+  link: (sourcePath: string, archivePath: string) => void,
+): void {
+  let createdArchive = false;
+  if (!existsSync(archivePath)) {
+    try {
+      ensurePrivateDirectory(dirname(archivePath), true);
+      assertLiveExactSource(livePath, source);
+      try {
+        link(livePath, archivePath);
+        createdArchive = true;
+        fsyncDirectoryBestEffort(dirname(archivePath));
+      } catch (error) {
+        if (!isExdev(error)) throw error;
+        atomicWritePrivateFile(archivePath, source.bytes, {
+          replace: false,
+          enforceDirectoryMode: true,
+        });
+        createdArchive = true;
+      }
+    } catch (error) {
+      if (!isEexist(error)) {
+        throw new StorageDocumentError(
+          "credentials",
+          "legacy-migration-failed",
+        );
+      }
+    }
+  }
+
+  try {
+    const archivedBytes = readFileSync(archivePath);
+    if (!archivedBytes.equals(source.bytes)) {
+      throw new StorageDocumentError(
+        "credentials",
+        "legacy-migration-failed",
+      );
+    }
+    const archived = inspectExactLegacyCredential(archivePath, scope);
+    if (
+      archived.status !== "owned" ||
+      !isDeepStrictEqual(archived.upgraded, upgraded)
+    ) {
+      throw new StorageDocumentError(
+        "credentials",
+        "legacy-migration-failed",
+      );
+    }
+    if (!existsSync(livePath)) return;
+
+    const live = parseCredentialJson(readStorageFile(livePath, "credentials"));
+    try {
+      assertCredentialDocumentStorage(scope, live);
+      if (!isDeepStrictEqual(live, upgraded)) {
+        throw new StorageDocumentError(
+          "credentials",
+          "legacy-migration-failed",
+        );
+      }
+      return;
+    } catch (error) {
+      if (
+        error instanceof StorageDocumentError &&
+        error.code !== "identity-unbound"
+      ) {
+        throw error;
+      }
+    }
+
+    // Validate the same originally authorized inode and bytes immediately
+    // before removing its live directory entry. A replacement observed at
+    // either boundary is someone else's file and must remain untouched.
+    assertLiveExactSource(livePath, source);
+    unlinkSync(livePath);
+    fsyncDirectoryBestEffort(dirname(livePath));
+  } catch (error) {
+    if (createdArchive && existsSync(archivePath)) {
+      try {
+        unlinkSync(archivePath);
+        fsyncDirectoryBestEffort(dirname(archivePath));
+      } catch {
+        // Retaining a verified no-replace backup is safer than risking removal
+        // of a path another process may now own.
+      }
+    }
+    if (error instanceof StorageDocumentError) throw error;
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+}
+
+function assertLiveExactSource(
+  path: string,
+  expected: ExactCredentialSource,
+): void {
+  let before: ReturnType<typeof lstatSync>;
+  let bytes: Buffer;
+  let after: ReturnType<typeof lstatSync>;
+  try {
+    before = lstatSync(path);
+    if (
+      !before.isFile() ||
+      before.isSymbolicLink() ||
+      before.dev !== expected.dev ||
+      before.ino !== expected.ino
+    ) {
+      throw new Error("exact source changed");
+    }
+    bytes = readFileSync(path);
+    after = lstatSync(path);
+  } catch {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+  if (
+    !sameInode(before, after) ||
+    after.dev !== expected.dev ||
+    after.ino !== expected.ino ||
+    !bytes.equals(expected.bytes)
+  ) {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+}
+
+function sameInode(
+  left: { dev: number; ino: number },
+  right: { dev: number; ino: number },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function credentialPathHash(path: string): string {
+  return createHash("sha256").update(path).digest("base64url");
+}
+
+function publishExactSourceFile(
+  path: string,
+  scope: StorageIdentityV2["storage"],
+  pathHash: string,
+  source: ExactCredentialSource,
+): boolean {
+  let created = false;
+  if (!existsSync(path)) {
+    try {
+      atomicWritePrivateFile(
+        path,
+        JSON.stringify(
+          {
+            version: 2,
+            storageIdentity: createStorageIdentityV2(scope),
+            credentialPathHash: pathHash,
+            sourceDev: source.dev,
+            sourceIno: source.ino,
+            sourceSha256: exactCredentialSourceDigest(source.bytes),
+          } satisfies ExactSourceFile,
+          null,
+          2,
+        ),
+        { replace: false, enforceDirectoryMode: true },
+      );
+      created = true;
+    } catch (error) {
+      if (!isEexist(error)) throw error;
+    }
+  }
+  const persisted = readExactSourceFile(path, scope, pathHash);
+  if (
+    persisted.sourceDev !== source.dev ||
+    persisted.sourceIno !== source.ino ||
+    persisted.sourceSha256 !== exactCredentialSourceDigest(source.bytes)
+  ) {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+  return created;
+}
+
+function readExactSourceFile(
+  path: string,
+  scope: StorageIdentityV2["storage"],
+  pathHash: string,
+): ExactSourceFile {
+  try {
+    const candidate = JSON.parse(
+      readFileSync(path, "utf8"),
+    ) as Partial<ExactSourceFile>;
+    if (
+      candidate.version !== 2 ||
+      candidate.credentialPathHash !== pathHash ||
+      !Number.isSafeInteger(candidate.sourceDev) ||
+      !Number.isSafeInteger(candidate.sourceIno) ||
+      (candidate.sourceDev ?? -1) < 0 ||
+      (candidate.sourceIno ?? 0) <= 0 ||
+      typeof candidate.sourceSha256 !== "string" ||
+      !/^[A-Za-z0-9_-]{43}$/.test(candidate.sourceSha256)
+    ) {
+      throw new Error("invalid exact source");
+    }
+    assertDocumentStorageIdentity(
+      "credentials",
+      scope,
+      candidate.storageIdentity,
+    );
+    return candidate as ExactSourceFile;
+  } catch {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+}
+
+function exactCredentialSourceDigest(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("base64url");
 }
 
 function migrateProvenArchive(input: {
@@ -802,6 +1401,15 @@ function isEexist(error: unknown): boolean {
     error !== null &&
     "code" in error &&
     (error as { code?: unknown }).code === "EEXIST"
+  );
+}
+
+function isExdev(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === "EXDEV"
   );
 }
 

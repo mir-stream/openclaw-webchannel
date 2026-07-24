@@ -205,7 +205,7 @@ export type EnrollmentOptions = {
   accountId: string;
 
   /**
-   * Local credential storage path.
+   * Absolute local credential storage path.
    * Defaults to the tuple-scoped v2 path. Obsolete single-file credentials are
    * intentionally ignored.
    */
@@ -529,6 +529,42 @@ export class EnrollmentClient {
       this.options._readCredentialFile,
     );
     if (initial.status !== "absent" && initial.status !== "match") {
+      if (
+        initial.status === "unbound" &&
+        this.options.credentialPath !== undefined &&
+        this.options._readCredentialFile === undefined
+      ) {
+        try {
+          migrateLegacyTupleState({
+            tenant: this.options.tenant,
+            accountId: this.options.accountId,
+            ...(this.options.storageRoot !== undefined
+              ? { storageRoot: this.options.storageRoot }
+              : {}),
+            ...(this.options._home !== undefined
+              ? { home: this.options._home }
+              : {}),
+            credentialPath: this.options.credentialPath,
+          });
+        } catch (error) {
+          if (
+            !(
+              error instanceof StorageDocumentError &&
+              error.code === "identity-unbound"
+            )
+          ) {
+            throw error;
+          }
+        }
+        const migrated = loadCredentialDocumentAtPath(
+          expectation,
+          this.options.credentialPath,
+        );
+        if (migrated.status === "match") {
+          this.credentials = migrated.document;
+          return true;
+        }
+      }
       throw new CredentialDocumentBindingError(initial);
     }
     // An injected reader is a complete persistence seam. Running the real

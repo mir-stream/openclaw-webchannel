@@ -134,8 +134,8 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
           : {}),
       });
       if (!saasBaseUrl) return false;
-      const storageRoot = resolveAccountStorageRoot(account);
       try {
+        const storageRoot = resolveAccountStorageRoot(account);
         return loadPersistedCredentialDocument({
           tenant: identity.tenant,
           accountId: id,
@@ -144,8 +144,8 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
           ...(storageRoot !== undefined ? { storageRoot } : {}),
         }).status === "match";
       } catch {
-        // Invalid effective identity is unconfigured; status inspection must not
-        // turn malformed config into an uncaught wizard failure.
+        // Invalid effective identity or storage path is unconfigured; status
+        // inspection must not turn malformed config into an uncaught failure.
         return false;
       }
     },

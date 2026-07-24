@@ -98,9 +98,13 @@ tenant, account, SaaS base, delivered issuer/relay, and local public key.
 - **Default location:** `~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json`,
   where `<v2_namespace>` is the fixed path-safe id derived from the exact,
   case-sensitive `(tenant, accountId)`.
-- **Overrides:** account config `storageRoot` changes the common base for both
-  secret stores. The low-level `credentialPath` API remains one exact credential
-  file; when both are supplied, it does not relocate conversation keys.
+- **Overrides:** account config `storageRoot` must be an absolute filesystem
+  path and changes the common base for both secret stores. Relative roots are
+  rejected rather than resolved against the process working directory. The
+  low-level `credentialPath` API remains one absolute exact credential file;
+  relative overrides are rejected rather than resolved against the process
+  working directory. When both are supplied, it does not relocate conversation
+  keys.
 - **Root changes:** `storageRoot` is not a live v2-to-v2 migration switch. Stop
   the gateway before moving the complete opaque tuple directory with its
   `0700`/`0600` permissions, or re-enroll and let browsers re-register.

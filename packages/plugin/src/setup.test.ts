@@ -377,10 +377,50 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     return { log: vi.fn() };
   }
 
+  it.each([42, "relative/state"])(
+    "contains invalid storageRoot %j as an account-scoped setup diagnostic",
+    async (storageRoot) => {
+      const runtime = makeRuntime();
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              accta: {
+                tenant: "tA",
+                storageRoot,
+                saas: { baseUrl: "http://s" },
+              },
+            },
+          },
+        },
+      } as never;
+
+      await expect(
+        webchannelSetup.afterAccountConfigWritten({
+          previousCfg: cfg,
+          cfg,
+          accountId: "accta",
+          input: {},
+          runtime,
+        }),
+      ).resolves.toBeUndefined();
+
+      const output = runtime.log.mock.calls.flat().join("\n");
+      expect(output).toContain('account "accta"');
+      expect(output).toContain("code=storage-root-invalid");
+      expect(output).toContain("absolute filesystem path");
+      expect(acquireMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("runs acquireCredentials for an enrolled account with no existing creds", async () => {
     const runtime = makeRuntime();
     const cfg = {
-      channels: { webchannel: { accounts: { accta: { tenant: "tA", saas: { baseUrl: "http://s" } } } } },
+      channels: { webchannel: { accounts: { accta: {
+        tenant: "tA",
+        storageRoot: "/operator/state",
+        saas: { baseUrl: "http://s" },
+      } } } },
     } as never;
     await webchannelSetup.afterAccountConfigWritten({
       previousCfg: cfg,
@@ -393,6 +433,7 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(acquireMock.mock.calls[0][0]).toMatchObject({
       accountId: "accta",
       saasBaseUrl: "http://s",
+      storageRoot: "/operator/state",
       tenant: "tA",
     });
     // Gate A preflight runs POST-enroll with the derived anchor + enrolled creds.
