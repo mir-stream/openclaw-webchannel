@@ -435,23 +435,35 @@ function migrateExactCredentialSource(input: {
     try {
       const live = lstatSync(input.liveCredentialPath);
       const archived = lstatSync(input.archivedExactCredential);
+      const validRegularSources =
+        !live.isSymbolicLink() &&
+        !archived.isSymbolicLink() &&
+        live.isFile() &&
+        archived.isFile();
+      const validJournalSource =
+        live.dev === exactJournal.sourceDev &&
+        live.ino === exactJournal.sourceIno;
+      const linkedArchive =
+        sameInode(live, archived) &&
+        live.nlink === 2 &&
+        archived.nlink === 2;
+      const copiedArchive =
+        !sameInode(live, archived) &&
+        live.nlink === 1 &&
+        archived.nlink === 1;
       if (
-        live.isSymbolicLink() ||
-        archived.isSymbolicLink() ||
-        !live.isFile() ||
-        !archived.isFile() ||
-        live.nlink !== 2 ||
-        archived.nlink !== 2 ||
-        !sameInode(live, archived) ||
-        live.dev !== exactJournal.sourceDev ||
-        live.ino !== exactJournal.sourceIno
+        !validRegularSources ||
+        !validJournalSource ||
+        (!linkedArchive && !copiedArchive)
       ) {
         throw new Error("invalid linked exact source");
       }
-      allowedLinkedLegacyCredential = Object.freeze({
-        dev: live.dev,
-        ino: live.ino,
-      });
+      if (linkedArchive) {
+        allowedLinkedLegacyCredential = Object.freeze({
+          dev: live.dev,
+          ino: live.ino,
+        });
+      }
     } catch {
       throw new StorageDocumentError(
         "credentials",
