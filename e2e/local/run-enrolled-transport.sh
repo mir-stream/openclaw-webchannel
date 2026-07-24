@@ -15,7 +15,7 @@
 #
 # Everything runs under an isolated OPENCLAW_HOME=/tmp/oc-enrolled-e2e (and
 # HOME=$OCH so the plugin's enrollment credential store is isolated too); your
-# real ~/.openclaw and ~/.openclaw-webchannel are never touched. Distinct ports
+# real ~/.openclaw and ~/.openclaw-webchannel-v2 are never touched. Distinct ports
 # avoid colliding with the other harnesses. Self-cleaning (trap on EXIT).
 set -euo pipefail
 
@@ -234,7 +234,7 @@ echo "[run-enrolled] wrote $OCH/.openclaw/openclaw.json"
 #    After Cycle 1/2 the gateway is CONSUME-ONLY — it no longer enrolls. The
 #    device flow runs HERE, at config time, exactly as a production operator runs
 #    `openclaw channels add`. HOME=$OCH so creds persist to
-#    $OCH/.openclaw-webchannel/<account>/credentials.json, which the gateway
+#    the tuple-scoped v2 credentials path under $OCH, which the gateway
 #    (also HOME=$OCH) consumes. Identity is passed via the generic CLI flags the
 #    webchannel setup adapter maps: --base-url→saas.baseUrl, --url→tenant. The
 #    wire identity is the --account value itself (no --token→agentId mapping
@@ -273,7 +273,8 @@ ADD_PID=""
 if [ "$ADD_RC" -ne 0 ]; then
   echo "[run-enrolled] channels add failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add.log"; exit 2
 fi
-CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
+CRED_FILE="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+  credentials "$TENANT" "$ACCOUNT_ID" "$OCH")"
 [ -f "$CRED_FILE" ] || { echo "[run-enrolled] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-enrolled] ✓ credentials persisted at $CRED_FILE"
 
