@@ -23,6 +23,70 @@ function enrolledClient() {
 }
 
 describe("createEnrolledNatsConnection cleanup", () => {
+  it("rejects split SaaS endpoints before invoking an injected client factory", async () => {
+    const enrollmentClientFactory = vi.fn();
+    const transportFactory = vi.fn();
+    await expect(
+      createEnrolledNatsConnection(
+        {
+          saasBaseUrl: "https://binding-authority.example",
+          saasEnrollUrl:
+            "https://different-acquisition.example/api/enroll",
+          saasPollUrl:
+            "https://different-acquisition.example/api/poll",
+          natsUrl: "wss://must-not-dial",
+          tenant: "tenant",
+          accountId: "account",
+        },
+        { enrollmentClientFactory, transportFactory },
+      ),
+    ).rejects.toThrow(
+      /enrollment endpoints do not match saasBaseUrl fields=saasEnrollUrl,saasPollUrl/,
+    );
+    expect(enrollmentClientFactory).not.toHaveBeenCalled();
+    expect(transportFactory).not.toHaveBeenCalled();
+  });
+
+  it("rejects missing delivered relay before identity, signer, transport, or dial", async () => {
+    const getIdentityKey = vi.fn();
+    const makeSigner = vi.fn();
+    const transportFactory = vi.fn();
+    const enrollmentClient = {
+      credentials: { marker: true },
+      enroll: vi.fn().mockResolvedValue({
+        creds: { userJwt: "jwt", userSeed: "seed" },
+        peerId: "agent",
+        jwksUrl: "https://saas/.well-known/jwks.json",
+        bootstrapUrl: "https://saas/bootstrap",
+      }),
+      getIdentityKey,
+    };
+
+    await expect(
+      createEnrolledNatsConnection(
+        {
+          saasBaseUrl: "https://saas",
+          saasEnrollUrl: "https://saas/api/enroll",
+          saasPollUrl: "https://saas/api/poll",
+          natsUrl: "wss://must-not-fallback",
+          tenant: "tenant",
+          accountId: "account",
+        },
+        {
+          enrollmentClientFactory: () => enrollmentClient as never,
+          makeSigner,
+          transportFactory,
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "credentials-invalid-invalid-document",
+      fields: ["enrollment.natsUrl"],
+    });
+    expect(getIdentityKey).not.toHaveBeenCalled();
+    expect(makeSigner).not.toHaveBeenCalled();
+    expect(transportFactory).not.toHaveBeenCalled();
+  });
+
   it.each(["signer", "protocol", "timeout"] as const)(
     "retires a real production transport and preserves the %s failure",
     async (failure) => {

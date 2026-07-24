@@ -20,10 +20,17 @@
  *   connection.transport.publish('webchannel.tenant-123.outbound.test', payload);
  */
 
-import { EnrollmentClient, type EnrollmentOptions, type PluginCredentials } from "./enrollment-client.js";
+import {
+  EnrollmentClient,
+  assertEnrollmentEndpointsMatchBase,
+  deriveEnrollmentEndpoints,
+  type EnrollmentOptions,
+  type PluginCredentials,
+} from "./enrollment-client.js";
 import { NatsTransport } from "./nats-transport.js";
 import { makeNkeySigningCallback } from "./nkey-sign.js";
 import type { KeyPair } from "./e2e-crypto.js";
+import { CredentialDocumentBindingError } from "./credential-document.js";
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -103,7 +110,7 @@ export type EnrolledNatsConnection = {
     peerId: string;
     jwksUrl: string;
     bootstrapUrl: string;
-    natsUrl?: string;
+    natsUrl: string;
     issuer?: string;
   };
 
@@ -140,6 +147,10 @@ export async function createEnrolledNatsConnection(
   options: EnrolledNatsConnectionOptions,
   deps: EnrolledNatsConnectionDeps = {},
 ): Promise<EnrolledNatsConnection> {
+  // The exported connector must enforce the same acquisition/binding authority
+  // even when callers inject a custom EnrollmentClient factory.
+  assertEnrollmentEndpointsMatchBase(options);
+
   // Step 1: Enroll (or load existing enrollment)
   console.log("[connection] Starting enrollment...");
   const enrollmentOptions: EnrollmentOptions = {
@@ -156,6 +167,21 @@ export async function createEnrolledNatsConnection(
 
   const enrollment = await enrollmentClient.enroll();
 
+  // An injected/custom enrollment client is outside EnrollmentClient's
+  // persistence gate. Defend the exported connector itself: never create a
+  // signer or transport, and never dial a configured fallback, without the
+  // SaaS-delivered relay provenance.
+  if (
+    typeof (enrollment as { natsUrl?: unknown }).natsUrl !== "string" ||
+    enrollment.natsUrl.length === 0
+  ) {
+    throw new CredentialDocumentBindingError({
+      status: "invalid",
+      code: "invalid-document",
+      fields: ["enrollment.natsUrl"],
+    });
+  }
+
   // Step 2: Get identity key
   console.log("[connection] Getting identity key...");
   const identityKey = enrollmentClient.getIdentityKey();
@@ -164,17 +190,15 @@ export async function createEnrolledNatsConnection(
   //
   // The SaaS is the rendezvous authority: the enrollment response carries the
   // relay URL alongside the minted creds, so the two never drift. We dial that
-  // SaaS-delivered `enrollment.natsUrl` in preference to any locally-configured
-  // `options.natsUrl` (which the resolver derives from `nats.url` /
-  // `WEBCHANNEL_NATS_URL` — now a dev-only override / back-compat fallback for an
-  // older issuer that does not yet return a URL).
+  // SaaS-delivered `enrollment.natsUrl`; local options are never a relay
+  // provenance fallback.
   //
   // A JWT-auth nats-server challenges the client with a nonce in INFO; the client
   // must return an Ed25519 signature over that nonce (signed with the user NKEY
   // seed) in CONNECT, or the server rejects the connection. We derive that signing
   // callback from the enrolled user seed so the production enrolled path
   // authenticates against a real JWT-auth nats-server (not only an open dev one).
-  const natsUrl = enrollment.natsUrl ?? options.natsUrl;
+  const natsUrl = enrollment.natsUrl;
   console.log(`[connection] Connecting to NATS at ${natsUrl}...`);
   const transport = (deps.transportFactory ?? ((transportOptions) => new NatsTransport(transportOptions)))({
     url: natsUrl,
@@ -216,10 +240,11 @@ export function createDefaultNatsConnection(
   natsUrl: string,
   saasBaseUrl: string,
 ): Promise<EnrolledNatsConnection> {
+  const endpoints = deriveEnrollmentEndpoints(saasBaseUrl);
   return createEnrolledNatsConnection({
     saasBaseUrl,
-    saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
-    saasPollUrl: `${saasBaseUrl}/api/poll`,
+    saasEnrollUrl: endpoints.saasEnrollUrl,
+    saasPollUrl: endpoints.saasPollUrl,
     natsUrl,
     tenant,
     accountId,

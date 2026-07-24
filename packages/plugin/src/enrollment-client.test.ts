@@ -11,7 +11,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { EnrollmentClient } from "./enrollment-client.js";
+import {
+  EnrollmentClient,
+  deriveEnrollmentEndpoints,
+} from "./enrollment-client.js";
 import type { EnrollmentOptions } from "./enrollment-client.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import {
@@ -648,6 +651,48 @@ describe("EnrollmentClient", () => {
   });
 
   describe("Error handling", () => {
+    it("rejects split SaaS base/endpoints before any request or persistence", () => {
+      const splitPath = join(
+        tmpdir(),
+        `openclaw-split-authority-${Date.now()}`,
+        "credentials.json",
+      );
+      expect(() =>
+        new EnrollmentClient(
+          createTestOptions({
+            saasBaseUrl: "https://binding-authority.example/",
+            saasEnrollUrl:
+              "https://different-acquisition.example/api/enroll",
+            saasPollUrl:
+              "https://different-acquisition.example/api/poll",
+            credentialPath: splitPath,
+          }),
+        ),
+      ).toThrow(
+        /enrollment endpoints do not match saasBaseUrl fields=saasEnrollUrl,saasPollUrl/,
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(existsSync(splitPath)).toBe(false);
+    });
+
+    it("derives coherent single-slash endpoints from a trailing-slash SaaS base", () => {
+      expect(
+        deriveEnrollmentEndpoints("https://saas.example///"),
+      ).toEqual({
+        saasEnrollUrl: "https://saas.example/api/enroll",
+        saasPollUrl: "https://saas.example/api/poll",
+      });
+      expect(() =>
+        new EnrollmentClient(
+          createTestOptions({
+            saasBaseUrl: "https://saas.example///",
+            saasEnrollUrl: "https://saas.example/api/enroll",
+            saasPollUrl: "https://saas.example/api/poll",
+          }),
+        ),
+      ).not.toThrow();
+    });
+
     it("should throw on HTTP error", async () => {
       mockFetch.mockResolvedValue({
         ok: false,

@@ -461,6 +461,64 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     ).toContain("saasBaseUrl=https://saas-b.example");
   });
 
+  it("uses the runtime-supported top-level identity fallback for the legacy default account", async () => {
+    existsMock.mockReturnValue(false);
+    const runtime = makeRuntime();
+    const cfg = {
+      tenant: "legacy-tenant",
+      saas: { baseUrl: "https://legacy-saas.example" },
+      channels: { webchannel: {} },
+    } as never;
+
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "default",
+      input: {},
+      runtime,
+    });
+
+    expect(acquireMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: "default",
+        tenant: "legacy-tenant",
+        saasBaseUrl: "https://legacy-saas.example",
+      }),
+    );
+  });
+
+  it.each(["bogus", null])(
+    "refuses invalid explicit credential mode %j without acquisition",
+    async (invalidMode) => {
+    const runtime = makeRuntime();
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              auth: { jwt: {} },
+              nats: { credentials: { mode: invalidMode } },
+            },
+          },
+        },
+      },
+    } as never;
+
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "accta",
+      input: {},
+      runtime,
+    });
+
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(runtime.log.mock.calls.flat().join("\n")).toContain(
+      'invalid credential mode; expected "static" or "enrolled"',
+    );
+    },
+  );
+
   it("skips acquisition when per-account creds already exist", async () => {
     existsMock.mockReturnValue(true);
     const runtime = makeRuntime();

@@ -240,6 +240,81 @@ describe("setup-wizard: declarative detection", () => {
       webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" }),
     ).toBe(true);
   });
+
+  it("status preserves a valid case-sensitive existing account id and path", async () => {
+    existsMock.mockReturnValue(true);
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            Account_A: {
+              tenant: "tenant-a",
+              saas: { baseUrl: "https://saas.example" },
+            },
+          },
+        },
+      },
+    } as never;
+    readMock.mockReturnValue(boundCredentialJson({ accountId: "Account_A" }));
+
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "Account_A",
+      }),
+    ).toBe(true);
+    expect(existsMock).toHaveBeenCalledWith(
+      expect.stringContaining("/Account_A/credentials.json"),
+    );
+    const lines = await Promise.resolve(
+      webchannelSetupWizard.status.resolveStatusLines!({
+        cfg,
+        accountId: "Account_A",
+        configured: true,
+      }),
+    );
+    expect(lines[0]).toContain("WebChannel (Account_A): configured");
+  });
+
+  it("status rejects invalid exact account ids without canonicalizing them", async () => {
+    const cfg = { channels: { webchannel: {} } } as never;
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "../../unsafe",
+      }),
+    ).toBe(false);
+    expect(existsMock).not.toHaveBeenCalled();
+    const lines = await Promise.resolve(
+      webchannelSetupWizard.status.resolveStatusLines!({
+        cfg,
+        accountId: "../../unsafe",
+        configured: true,
+      }),
+    );
+    expect(lines[0]).toContain("not configured — invalid account id");
+  });
+
+  it("status rejects an unknown explicit credential mode even with auth.jwt", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              auth: { jwt: {} },
+              nats: { credentials: { mode: "bogus" } },
+            },
+          },
+        },
+      },
+    } as never;
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("setup-wizard: constructed plugin exposes setupWizard", () => {
