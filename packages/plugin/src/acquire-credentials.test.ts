@@ -19,6 +19,9 @@ describe("acquireCredentials", () => {
   it.each([
     ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
     ["account", { accountId: "../../unsafe" }, "storage.accountId"],
+    ["malformed SaaS URL", { saasBaseUrl: "not a url" }, "binding.saasBaseUrl"],
+    ["relative SaaS URL", { saasBaseUrl: "/control" }, "binding.saasBaseUrl"],
+    ["non-HTTP SaaS URL", { saasBaseUrl: "ftp://saas.example" }, "binding.saasBaseUrl"],
   ] as const)(
     "rejects invalid binding %s before path/log/client invocation",
     async (_label, override, expectedField) => {
@@ -74,7 +77,7 @@ describe("acquireCredentials", () => {
     expect(log).toHaveBeenCalled();
   });
 
-  it("strips a trailing slash from the saasBaseUrl", async () => {
+  it("preserves the exact SaaS base while normalizing only endpoint joining", async () => {
     let capturedOpts: ConstructorParameters<typeof EnrollmentClient>[0] | undefined;
     await acquireCredentials({
       accountId: "default",
@@ -87,7 +90,7 @@ describe("acquireCredentials", () => {
         return { enroll: async () => fakeEnrollmentResult() } as unknown as EnrollmentClient;
       },
     });
-    expect(capturedOpts?.saasBaseUrl).toBe("http://saas.example");
+    expect(capturedOpts?.saasBaseUrl).toBe("http://saas.example/");
     expect(capturedOpts?.saasEnrollUrl).toBe("http://saas.example/api/enroll");
   });
 

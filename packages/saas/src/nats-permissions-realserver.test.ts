@@ -41,6 +41,7 @@ import type { NatsUserCredentials } from "./device-flow-types.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
 import { makeNkeySigningCallback } from "../../plugin/src/nkey-sign.js";
 import { NatsTransport } from "../../plugin/src/nats-transport.js";
+import { dialRelayForPreflight } from "../../plugin/src/preflight.js";
 
 // ---------------------------------------------------------------------------
 // Locate the nats-server binary
@@ -472,6 +473,21 @@ describe.skipIf(!NATS_SERVER_BIN)(
         expect.objectContaining({ code: "authorization-violation" }),
       );
       await transport.closeGracefully();
+    });
+
+    it("the preflight helper rejects a real server-denied SUB", async () => {
+      const accountId = "preflight-denied";
+      const creds = await generateRegisterDeniedCredentials(TENANT_A, accountId);
+
+      await expect(
+        dialRelayForPreflight({
+          url: WS_URL,
+          userJwt: creds.userJwt,
+          userSeed: creds.userSeed,
+          subject: `webchannel.${TENANT_A}.${accountId}._preflight`,
+          timeoutMs: 2000,
+        }),
+      ).resolves.toEqual({ error: "relay subscription rejected" });
     });
 
     it("tenant A client can publish to its own subjects", async () => {

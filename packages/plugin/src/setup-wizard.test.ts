@@ -48,8 +48,15 @@ function boundCredentialJson(
     },
     enrollment: {
       creds: { userJwt: "JWT", userSeed: "SEED" },
+      peerId: "peer-a",
+      jwksUrl: "https://keys.example/jwks",
+      bootstrapUrl: "https://bootstrap.example",
       natsUrl: "wss://relay.example",
     },
+    tenant: identity.tenant,
+    accountId: identity.accountId,
+    saasEnrollUrl: `${identity.saasBaseUrl}/api/enroll`,
+    saasPollUrl: `${identity.saasBaseUrl}/api/poll`,
   });
 }
 
@@ -442,5 +449,9 @@ describe("setup-wizard: validateHttpUrl", () => {
   it("rejects unparseable / empty input", () => {
     expect(validateHttpUrl("notaurl")).toBeDefined();
     expect(validateHttpUrl("")).toBeDefined();
+    expect(validateHttpUrl(" https://saas.example")).toBeDefined();
+    expect(validateHttpUrl("https://saas.example?token=secret")).toBeDefined();
+    expect(validateHttpUrl("https://saas.example#fragment")).toBeDefined();
+    expect(validateHttpUrl("https://user:secret@saas.example")).toBeDefined();
   });
 });

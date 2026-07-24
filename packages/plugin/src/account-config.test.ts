@@ -438,9 +438,16 @@ describe("account-config: loadPersistedCredentialDocument", () => {
     identityKey: { publicKey: key, privateKey },
     enrollment: {
       creds: { userJwt: "JWT", userSeed: "SEED" },
+      peerId: "peer-a",
+      jwksUrl: "https://keys.example/jwks",
+      bootstrapUrl: "https://bootstrap.example",
       issuer: "https://issuer.example/",
       natsUrl: "wss://relay.example",
     },
+    tenant: expected.tenant,
+    accountId: expected.accountId,
+    saasEnrollUrl: `${expected.saasBaseUrl}/api/enroll`,
+    saasPollUrl: `${expected.saasBaseUrl}/api/poll`,
   });
 
   it("loads only a complete matching per-account document", () => {

@@ -26,6 +26,9 @@ describe("createEnrolledNatsConnection cleanup", () => {
   it.each([
     ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
     ["account", { accountId: "../../unsafe" }, "storage.accountId"],
+    ["malformed SaaS URL", { saasBaseUrl: "not a url" }, "binding.saasBaseUrl"],
+    ["relative SaaS URL", { saasBaseUrl: "/control" }, "binding.saasBaseUrl"],
+    ["non-HTTP SaaS URL", { saasBaseUrl: "ftp://saas.example" }, "binding.saasBaseUrl"],
   ] as const)(
     "rejects invalid binding %s before invoking any injected dependency",
     async (_label, override, expectedField) => {

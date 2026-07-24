@@ -49,8 +49,8 @@ function completeDocument() {
     },
     accountId: "Account_A",
     tenant: "tenant-A",
-    saasEnrollUrl: "https://control.example/api/enroll",
-    saasPollUrl: "https://control.example/api/poll",
+    saasEnrollUrl: "https://control.example/api/api/enroll",
+    saasPollUrl: "https://control.example/api/api/poll",
   };
 }
 
@@ -283,6 +283,69 @@ describe("credential document semantic binding", () => {
       "credentials",
     );
   });
+
+  it.each([
+    ["tenant", "tenant"],
+    ["accountId", "accountId"],
+    ["saasEnrollUrl", "saasEnrollUrl"],
+    ["saasPollUrl", "saasPollUrl"],
+    ["enrollment.peerId", "peerId"],
+    ["enrollment.jwksUrl", "jwksUrl"],
+    ["enrollment.bootstrapUrl", "bootstrapUrl"],
+  ] as const)("requires nonempty %s", (expectedField, property) => {
+    const candidate = cloneDocument();
+    if (expectedField.startsWith("enrollment.")) {
+      candidate.enrollment[property] = "";
+    } else {
+      candidate[property] = "";
+    }
+    const inspection = inspectCredentialDocument(EXPECTED, candidate);
+    expect(inspection).toEqual({
+      status: "invalid",
+      code: "invalid-document",
+      fields: [expectedField],
+    });
+    expect(loadBoundCredentialDocument(EXPECTED, candidate)).not.toHaveProperty(
+      "credentials",
+    );
+  });
+
+  it.each([
+    ["tenant", "tenant-B"],
+    ["accountId", "Account_B"],
+    ["saasEnrollUrl", "https://other.example/api/enroll"],
+    ["saasPollUrl", "https://other.example/api/poll"],
+  ] as const)("rejects duplicate payload drift in %s", (field, replacement) => {
+    const candidate = cloneDocument();
+    candidate[field] = replacement;
+    expect(inspectCredentialDocument(EXPECTED, candidate)).toEqual({
+      status: "mismatch",
+      fields: [field],
+    });
+  });
+
+  it.each([
+    ["enrollment.creds.permissions", "permissions", "SECRET-PERMISSIONS"],
+    ["enrollment.creds.permissions.pub", "pub", "SECRET-PUB"],
+    ["enrollment.creds.permissions.sub", "sub", "SECRET-SUB"],
+  ] as const)(
+    "validates the truthful optional %s shape without leaking values",
+    (expectedField, property, secret) => {
+      const candidate = cloneDocument();
+      if (property === "permissions") {
+        candidate.enrollment.creds.permissions = secret;
+      } else {
+        candidate.enrollment.creds.permissions = { [property]: [secret, 42] };
+      }
+      const inspection = inspectCredentialDocument(EXPECTED, candidate);
+      expect(inspection).toEqual({
+        status: "invalid",
+        code: "invalid-document",
+        fields: [expectedField],
+      });
+      expect(JSON.stringify(inspection)).not.toContain(secret);
+    },
+  );
 
   it("returns exact content-free diagnostics for errors and logs", () => {
     const secretRelay =

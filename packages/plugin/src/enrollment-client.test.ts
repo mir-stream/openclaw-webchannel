@@ -654,6 +654,9 @@ describe("EnrollmentClient", () => {
     it.each([
       ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
       ["account", { accountId: "../../unsafe" }, "storage.accountId"],
+      ["malformed SaaS URL", { saasBaseUrl: "not a url" }, "binding.saasBaseUrl"],
+      ["relative SaaS URL", { saasBaseUrl: "/control" }, "binding.saasBaseUrl"],
+      ["non-HTTP SaaS URL", { saasBaseUrl: "ftp://saas.example" }, "binding.saasBaseUrl"],
     ] as const)(
       "rejects invalid binding %s before fetch even with an explicit credential path",
       (_label, override, expectedField) => {

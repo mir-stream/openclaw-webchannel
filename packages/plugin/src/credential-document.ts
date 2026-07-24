@@ -8,6 +8,7 @@
  */
 
 import { derivePublicKey, type KeyPair } from "./e2e-crypto.js";
+import { deriveEnrollmentEndpoints } from "./saas-authority.js";
 import {
   createCredentialBindingIdentityV2,
   inspectCredentialBindingIdentityV2,
@@ -110,11 +111,21 @@ export function assertValidCredentialBindingExpectation(
 
 export type CredentialPayloadField =
   | "document"
+  | "tenant"
+  | "accountId"
+  | "saasEnrollUrl"
+  | "saasPollUrl"
   | "identityKey.publicKey"
   | "identityKey.privateKey"
   | "enrollment"
+  | "enrollment.peerId"
+  | "enrollment.jwksUrl"
+  | "enrollment.bootstrapUrl"
   | "enrollment.creds.userJwt"
   | "enrollment.creds.userSeed"
+  | "enrollment.creds.permissions"
+  | "enrollment.creds.permissions.pub"
+  | "enrollment.creds.permissions.sub"
   | "enrollment.issuer"
   | "enrollment.natsUrl";
 
@@ -342,6 +353,28 @@ function evaluateCredentialDocument(
   if (identityInspection.status !== "match") {
     return { inspection: fromIdentityInspection(identityInspection) };
   }
+  const payloadMismatches: CredentialPayloadField[] = [];
+  if (payload.document.tenant !== expected.tenant) {
+    payloadMismatches.push("tenant");
+  }
+  if (payload.document.accountId !== expected.accountId) {
+    payloadMismatches.push("accountId");
+  }
+  const endpoints = deriveEnrollmentEndpoints(expected.saasBaseUrl);
+  if (payload.document.saasEnrollUrl !== endpoints.saasEnrollUrl) {
+    payloadMismatches.push("saasEnrollUrl");
+  }
+  if (payload.document.saasPollUrl !== endpoints.saasPollUrl) {
+    payloadMismatches.push("saasPollUrl");
+  }
+  if (payloadMismatches.length > 0) {
+    return {
+      inspection: Object.freeze({
+        status: "mismatch",
+        fields: Object.freeze(payloadMismatches),
+      }),
+    };
+  }
   return {
     inspection: Object.freeze({ status: "match" }),
     payload,
@@ -354,6 +387,14 @@ function parsePayload(candidate: unknown): ParsedPayload {
     throw new InvalidCredentialPayload(["document"]);
   }
   const fields: CredentialPayloadField[] = [];
+  if (!isNonEmptyString(candidate.tenant)) fields.push("tenant");
+  if (!isNonEmptyString(candidate.accountId)) fields.push("accountId");
+  if (!isNonEmptyString(candidate.saasEnrollUrl)) {
+    fields.push("saasEnrollUrl");
+  }
+  if (!isNonEmptyString(candidate.saasPollUrl)) {
+    fields.push("saasPollUrl");
+  }
   const identityKey = isRecord(candidate.identityKey)
     ? candidate.identityKey
     : undefined;
@@ -366,6 +407,15 @@ function parsePayload(candidate: unknown): ParsedPayload {
     ? candidate.enrollment
     : undefined;
   if (!enrollment) fields.push("enrollment");
+  if (!isNonEmptyString(enrollment?.peerId)) {
+    fields.push("enrollment.peerId");
+  }
+  if (!isNonEmptyString(enrollment?.jwksUrl)) {
+    fields.push("enrollment.jwksUrl");
+  }
+  if (!isNonEmptyString(enrollment?.bootstrapUrl)) {
+    fields.push("enrollment.bootstrapUrl");
+  }
   const creds = enrollment && isRecord(enrollment.creds)
     ? enrollment.creds
     : undefined;
@@ -374,6 +424,30 @@ function parsePayload(candidate: unknown): ParsedPayload {
   }
   if (!isNonEmptyString(creds?.userSeed)) {
     fields.push("enrollment.creds.userSeed");
+  }
+  const permissionsPresent =
+    Boolean(creds) &&
+    Object.prototype.hasOwnProperty.call(creds, "permissions");
+  const permissions =
+    permissionsPresent && isRecord(creds?.permissions)
+      ? creds.permissions
+      : undefined;
+  if (permissionsPresent && !permissions) {
+    fields.push("enrollment.creds.permissions");
+  }
+  if (
+    permissions &&
+    Object.prototype.hasOwnProperty.call(permissions, "pub") &&
+    !isStringArray(permissions.pub)
+  ) {
+    fields.push("enrollment.creds.permissions.pub");
+  }
+  if (
+    permissions &&
+    Object.prototype.hasOwnProperty.call(permissions, "sub") &&
+    !isStringArray(permissions.sub)
+  ) {
+    fields.push("enrollment.creds.permissions.sub");
   }
 
   const issuerPresent =
@@ -494,6 +568,10 @@ function parseJson(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
 function isNonEmptyString(value: unknown): value is string {

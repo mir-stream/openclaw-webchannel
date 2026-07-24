@@ -55,6 +55,7 @@ import {
   resolveEnrolledSaasBaseUrl,
   type WebchannelNatsConfig,
 } from "./nats-credential-source.js";
+import { isAbsoluteHttpUrl } from "./saas-authority.js";
 import { webchannelSetup } from "./setup.js";
 
 /**
@@ -84,6 +85,9 @@ export function validateHttpUrl(value: string): string | undefined {
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     return "URL must use http:// or https://";
+  }
+  if (!isAbsoluteHttpUrl(value)) {
+    return "Enter a valid URL, e.g. https://saas.example.com";
   }
   return undefined;
 }

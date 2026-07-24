@@ -10,6 +10,7 @@
 import { createHash } from "node:crypto";
 
 import { assertValidAccountId } from "./account-id.js";
+import { isAbsoluteHttpUrl } from "./saas-authority.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 
 export const STORAGE_IDENTITY_VERSION = 2 as const;
@@ -429,7 +430,7 @@ function validateBindingFacts(
   binding: CredentialBindingFacts,
 ): CredentialBindingFacts {
   const invalid: CredentialBindingField[] = [];
-  if (!nonEmptyAfterTrailingSlash(binding?.saasBaseUrl)) {
+  if (!isAbsoluteHttpUrl(binding?.saasBaseUrl)) {
     invalid.push("binding.saasBaseUrl");
   }
   if (
