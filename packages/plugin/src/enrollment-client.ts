@@ -24,6 +24,7 @@ import { accountCredentialPath } from "./account-config.js";
 import {
   CREDENTIAL_BINDING_IDENTITY_FIELD,
   CredentialDocumentBindingError,
+  assertValidCredentialBindingExpectation,
   createCredentialIdentityForEnrollment,
   loadBoundCredentialDocument,
   loadBoundCredentialDocumentJson,
@@ -269,6 +270,14 @@ export class EnrollmentClient {
   private credentials?: PluginCredentials;
 
   constructor(options: EnrollmentOptions) {
+    // Validate the complete v2 binding expectation before even resolving a
+    // credential path. An explicit credentialPath must never bypass
+    // tenant/account/SaaS validation and reach filesystem or network work.
+    assertValidCredentialBindingExpectation({
+      tenant: options.tenant,
+      accountId: options.accountId,
+      saasBaseUrl: options.saasBaseUrl,
+    });
     // Reject a split acquisition/binding authority before any request, key
     // generation, or persistence. The public options retain explicit endpoints
     // for compatibility, but they must be mechanically derived from the base.

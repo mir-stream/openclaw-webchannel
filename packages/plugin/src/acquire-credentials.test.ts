@@ -16,6 +16,30 @@ function fakeEnrollmentResult() {
 }
 
 describe("acquireCredentials", () => {
+  it.each([
+    ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
+    ["account", { accountId: "../../unsafe" }, "storage.accountId"],
+  ] as const)(
+    "rejects invalid binding %s before path/log/client invocation",
+    async (_label, override, expectedField) => {
+      const clientFactory = vi.fn();
+      const log = vi.fn();
+      await expect(
+        acquireCredentials({
+          accountId: "account",
+          saasBaseUrl: "https://saas.example",
+          tenant: "tenant",
+          credentialPath: "/explicit/must-not-be-read.json",
+          log,
+          _clientFactory: clientFactory,
+          ...override,
+        }),
+      ).rejects.toThrow(expectedField);
+      expect(clientFactory).not.toHaveBeenCalled();
+      expect(log).not.toHaveBeenCalled();
+    },
+  );
+
   it("runs the device flow non-interactively and persists to the per-account path", async () => {
     let capturedOpts: ConstructorParameters<typeof EnrollmentClient>[0] | undefined;
     const enroll = vi.fn(async () => fakeEnrollmentResult());

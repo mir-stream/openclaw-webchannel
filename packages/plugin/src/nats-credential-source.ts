@@ -41,6 +41,7 @@ import {
   type EnrolledNatsConnection,
 } from "./enrolled-nats-connection.js";
 import { deriveEnrollmentEndpoints } from "./enrollment-client.js";
+import { assertValidCredentialBindingExpectation } from "./credential-document.js";
 
 // ---------------------------------------------------------------------------
 // Config shape (mirrors the `channels.webchannel.nats` schema block)
@@ -479,6 +480,13 @@ export async function connectNatsCredentialSource(
       return { transport };
     }
     case "enrolled": {
+      // Direct callers may inject createEnrolled, so validate before invoking
+      // that trust-boundary seam.
+      assertValidCredentialBindingExpectation({
+        tenant: source.tenant,
+        accountId: source.accountId,
+        saasBaseUrl: source.saasBaseUrl,
+      });
       const createEnrolled = deps.createEnrolled ?? createEnrolledNatsConnection;
       const endpoints = deriveEnrollmentEndpoints(source.saasBaseUrl);
       const enrolled = await createEnrolled({

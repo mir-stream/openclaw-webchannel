@@ -651,6 +651,30 @@ describe("EnrollmentClient", () => {
   });
 
   describe("Error handling", () => {
+    it.each([
+      ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
+      ["account", { accountId: "../../unsafe" }, "storage.accountId"],
+    ] as const)(
+      "rejects invalid binding %s before fetch even with an explicit credential path",
+      (_label, override, expectedField) => {
+        const explicitPath = join(
+          tmpdir(),
+          `openclaw-invalid-binding-${Date.now()}`,
+          "credentials.json",
+        );
+        expect(() =>
+          new EnrollmentClient(
+            createTestOptions({
+              ...override,
+              credentialPath: explicitPath,
+            }),
+          ),
+        ).toThrow(expectedField);
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(existsSync(explicitPath)).toBe(false);
+      },
+    );
+
     it("rejects split SaaS base/endpoints before any request or persistence", () => {
       const splitPath = join(
         tmpdir(),
