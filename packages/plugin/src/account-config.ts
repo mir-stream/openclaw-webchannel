@@ -33,8 +33,13 @@
  */
 
 import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  lstatSync,
+  readFileSync,
+  statSync,
+  type Stats,
+} from "node:fs";
+import { dirname, join } from "node:path";
 
 import {
   assertValidAccountId,
@@ -500,7 +505,10 @@ export function loadCredentialDocumentAtPath(
   try {
     serialized = read(path);
   } catch (error) {
-    if (isFilesystemErrorCode(error, "ENOENT")) {
+    if (
+      isFilesystemErrorCode(error, "ENOENT") &&
+      isGenuinelyAbsentCredentialPath(path)
+    ) {
       return Object.freeze({ status: "absent" });
     }
     return Object.freeze({
@@ -510,6 +518,90 @@ export function loadCredentialDocumentAtPath(
     });
   }
   return loadBoundCredentialDocumentJson(expected, serialized);
+}
+
+/**
+ * Prove ENOENT means no credential directory entry exists.
+ *
+ * `readFileSync` follows symlinks, so a dangling symlink at the credential path
+ * or in a parent component also reports ENOENT. Walk upward with lstat (which
+ * does not follow the entry), follow only existing symlink ancestors to prove
+ * they still resolve to directories, then recheck every observation. Any
+ * unexpected entry, permission failure, non-directory, or detected race fails
+ * closed as read-failed.
+ */
+function isGenuinelyAbsentCredentialPath(path: string): boolean {
+  const missing: string[] = [];
+  let cursor = path;
+  let anchor:
+    | { path: string; lstat: Stats; target?: Stats }
+    | undefined;
+
+  while (true) {
+    try {
+      const entry = lstatSync(cursor);
+      if (cursor === path) return false;
+      let target: Stats | undefined;
+      if (entry.isSymbolicLink()) {
+        try {
+          target = statSync(cursor);
+        } catch {
+          return false;
+        }
+        if (!target.isDirectory()) return false;
+      } else if (!entry.isDirectory()) {
+        return false;
+      }
+      anchor = {
+        path: cursor,
+        lstat: entry,
+        ...(target ? { target } : {}),
+      };
+      break;
+    } catch (error) {
+      if (!isFilesystemErrorCode(error, "ENOENT")) return false;
+      missing.push(cursor);
+      const parent = dirname(cursor);
+      if (parent === cursor) return false;
+      cursor = parent;
+    }
+  }
+
+  // Bias races closed: the supporting directory entry must be unchanged and
+  // every component observed missing must still be missing.
+  try {
+    const currentAnchor = lstatSync(anchor.path);
+    if (
+      currentAnchor.dev !== anchor.lstat.dev ||
+      currentAnchor.ino !== anchor.lstat.ino ||
+      currentAnchor.isDirectory() !== anchor.lstat.isDirectory() ||
+      currentAnchor.isSymbolicLink() !== anchor.lstat.isSymbolicLink()
+    ) {
+      return false;
+    }
+    if (currentAnchor.isSymbolicLink()) {
+      const currentTarget = statSync(anchor.path);
+      if (
+        !currentTarget.isDirectory() ||
+        !anchor.target ||
+        currentTarget.dev !== anchor.target.dev ||
+        currentTarget.ino !== anchor.target.ino
+      ) {
+        return false;
+      }
+    }
+  } catch {
+    return false;
+  }
+  for (const missingPath of missing) {
+    try {
+      lstatSync(missingPath);
+      return false;
+    } catch (error) {
+      if (!isFilesystemErrorCode(error, "ENOENT")) return false;
+    }
+  }
+  return true;
 }
 
 function isFilesystemErrorCode(error: unknown, code: string): boolean {

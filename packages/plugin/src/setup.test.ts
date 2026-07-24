@@ -27,11 +27,22 @@ vi.mock("./preflight.js", () => ({
 
 // Mock node:fs so direct credential reads are controllable.
 const readMock = vi.fn((_p: string) => "");
+const rootDirectoryStat = {
+  dev: 1,
+  ino: 1,
+  isDirectory: () => true,
+  isSymbolicLink: () => false,
+};
+const lstatMock = vi.fn((path: string) => {
+  if (path === "/") return rootDirectoryStat;
+  throw Object.assign(new Error("missing"), { code: "ENOENT" });
+});
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
     readFileSync: (p: string) => readMock(p),
+    lstatSync: (p: string) => lstatMock(p),
   };
 });
 
@@ -84,6 +95,11 @@ beforeEach(() => {
   preflightMock.mockClear();
   readMock.mockReset();
   readMock.mockImplementation(() => {
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  });
+  lstatMock.mockReset();
+  lstatMock.mockImplementation((path: string) => {
+    if (path === "/") return rootDirectoryStat;
     throw Object.assign(new Error("missing"), { code: "ENOENT" });
   });
 });
@@ -563,6 +579,44 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     const output = runtime.log.mock.calls.flat().join("\n");
     expect(output).toContain("credentials-invalid-read-failed");
     expect(output).not.toContain("SECRET permission detail");
+  });
+
+  it("refuses acquisition for a dangling credential symlink", async () => {
+    lstatMock.mockImplementation((path: string) => {
+      if (path.endsWith("/credentials.json")) {
+        return {
+          dev: 2,
+          ino: 2,
+          isDirectory: () => false,
+          isSymbolicLink: () => true,
+        };
+      }
+      if (path === "/") return rootDirectoryStat;
+      throw Object.assign(new Error("missing"), { code: "ENOENT" });
+    });
+    const runtime = makeRuntime();
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: { tenant: "t", saas: { baseUrl: "http://s" } },
+          },
+        },
+      },
+    } as never;
+
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "accta",
+      input: {},
+      runtime,
+    });
+
+    expect(acquireMock).not.toHaveBeenCalled();
+    expect(runtime.log.mock.calls.flat().join("\n")).toContain(
+      "credentials-invalid-read-failed",
+    );
   });
 
   it("refuses mismatched existing credentials without enrolling or exposing values", async () => {

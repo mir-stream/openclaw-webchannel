@@ -3,11 +3,22 @@ import { beforeEach, describe, it, expect, vi } from "vitest";
 // Mock node:fs so status's "creds already exist" probe is controllable and never
 // touches the real home dir.
 const readMock = vi.fn((_p: string) => "");
+const rootDirectoryStat = {
+  dev: 1,
+  ino: 1,
+  isDirectory: () => true,
+  isSymbolicLink: () => false,
+};
+const lstatMock = vi.fn((path: string) => {
+  if (path === "/") return rootDirectoryStat;
+  throw Object.assign(new Error("missing"), { code: "ENOENT" });
+});
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
     readFileSync: (p: string) => readMock(p),
+    lstatSync: (p: string) => lstatMock(p),
   };
 });
 

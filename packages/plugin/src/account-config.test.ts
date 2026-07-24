@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { join } from "node:path";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
@@ -518,6 +525,49 @@ describe("account-config: loadPersistedCredentialDocument", () => {
       code: "read-failed",
       fields: [],
     });
+  });
+
+  it("classifies a dangling credential symlink as read-failed", () => {
+    const home = mkdtempSync(join(tmpdir(), "webchannel-dangling-credential-"));
+    try {
+      const path = accountCredentialPath(expected.accountId, home);
+      mkdirSync(dirname(path), { recursive: true });
+      symlinkSync(join(home, "missing-target"), path);
+      expect(loadPersistedCredentialDocument(expected, { home })).toEqual({
+        status: "invalid",
+        code: "read-failed",
+        fields: [],
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("classifies a dangling parent-component symlink as read-failed", () => {
+    const home = mkdtempSync(join(tmpdir(), "webchannel-dangling-parent-"));
+    try {
+      const path = accountCredentialPath(expected.accountId, home);
+      mkdirSync(dirname(dirname(path)), { recursive: true });
+      symlinkSync(join(home, "missing-account-dir"), dirname(path));
+      expect(loadPersistedCredentialDocument(expected, { home })).toEqual({
+        status: "invalid",
+        code: "read-failed",
+        fields: [],
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps genuinely missing normal directories classified as absent", () => {
+    const home = mkdtempSync(join(tmpdir(), "webchannel-missing-credential-"));
+    try {
+      expect(loadPersistedCredentialDocument(expected, { home })).toEqual({
+        status: "absent",
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("validates effective tenant/SaaS identity before consulting the filesystem", () => {
