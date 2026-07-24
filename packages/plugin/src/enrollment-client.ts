@@ -101,29 +101,11 @@ type EnrollmentResult = {
  */
 export type EnrollmentResultLike = EnrollmentResult;
 
-export type EnrollmentEndpoints = Readonly<{
-  saasEnrollUrl: string;
-  saasPollUrl: string;
-}>;
-
-/**
- * Derive the only enrollment endpoints valid for a SaaS binding authority.
- * Only trailing slashes on the configured base are normalized.
- */
-export function deriveEnrollmentEndpoints(
-  saasBaseUrl: string,
-): EnrollmentEndpoints {
-  const normalizedBase = saasBaseUrl.replace(/\/+$/, "");
-  if (normalizedBase.length === 0) {
-    throw new Error(
-      "webchannel: invalid SaaS enrollment authority fields=saasBaseUrl",
-    );
-  }
-  return Object.freeze({
-    saasEnrollUrl: `${normalizedBase}/api/enroll`,
-    saasPollUrl: `${normalizedBase}/api/poll`,
-  });
-}
+export {
+  deriveEnrollmentEndpoints,
+  type EnrollmentEndpoints,
+} from "./saas-authority.js";
+import { deriveEnrollmentEndpoints } from "./saas-authority.js";
 
 export function assertEnrollmentEndpointsMatchBase(
   options: Pick<

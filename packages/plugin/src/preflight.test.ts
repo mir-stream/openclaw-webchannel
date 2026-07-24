@@ -317,22 +317,37 @@ describe("dialRelayForPreflight (relay-dial probe)", () => {
     factory: () => never;
     release: () => void;
     disconnect: ReturnType<typeof vi.fn>;
+    subscribe: ReturnType<typeof vi.fn>;
+    flush: ReturnType<typeof vi.fn>;
+    on: ReturnType<typeof vi.fn>;
+    off: ReturnType<typeof vi.fn>;
   } {
     let release: () => void = () => {};
     const connected = new Promise<void>((r) => {
       release = r;
     });
     const disconnect = vi.fn();
+    const subscribe = vi.fn();
+    const flush = vi.fn(async () => {});
+    const on = vi.fn();
+    const off = vi.fn();
     return {
       factory: () =>
         ({
           connect: vi.fn(() => connected),
-          subscribe: vi.fn(),
+          subscribe,
+          flush,
+          on,
+          off,
           disconnect,
           connected: true,
         }) as never,
       release: () => release(),
       disconnect,
+      subscribe,
+      flush,
+      on,
+      off,
     };
   }
 
@@ -375,6 +390,53 @@ describe("dialRelayForPreflight (relay-dial probe)", () => {
     });
 
     expect(result).toEqual({ ok: true });
+    expect(t.subscribe.mock.invocationCallOrder[0]).toBeLessThan(
+      t.flush.mock.invocationCallOrder[0]!,
+    );
     expect(t.disconnect).toHaveBeenCalledTimes(1);
+    expect(t.off).toHaveBeenCalledWith("error", expect.any(Function));
+  });
+
+  it("does not report success when the SUB/PING fence rejects", async () => {
+    const t = slowTransport();
+    t.release();
+    t.flush.mockRejectedValueOnce(new Error("secret broker diagnostic"));
+
+    const result = await dialRelayForPreflight({
+      url: "wss://relay.example",
+      userJwt: "SECRET-JWT",
+      userSeed: "SECRET-SEED",
+      subject: "webchannel.t.acme._preflight",
+      timeoutMs: 5000,
+      connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
+    });
+
+    expect(result).toEqual({ error: "relay subscription rejected" });
+    expect(JSON.stringify(result)).not.toContain("secret");
+    expect(t.disconnect).toHaveBeenCalledTimes(1);
+    expect(t.off).toHaveBeenCalledWith("error", expect.any(Function));
+  });
+
+  it("bounds the SUB/PING fence and tears down after timeout", async () => {
+    const t = slowTransport();
+    t.release();
+    // An injected transport may ignore AbortSignal entirely; the public helper
+    // still owns a hard wall-clock bound around the fence.
+    t.flush.mockImplementationOnce(() => new Promise<void>(() => {}));
+
+    const result = await dialRelayForPreflight({
+      url: "wss://relay.example",
+      userJwt: "J",
+      userSeed: "S",
+      subject: "webchannel.t.acme._preflight",
+      timeoutMs: 5,
+      connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
+    });
+
+    expect(result).toEqual({
+      error: "relay subscription timed out after 5ms",
+    });
+    expect(t.disconnect).toHaveBeenCalledTimes(1);
+    expect(t.off).toHaveBeenCalledWith("error", expect.any(Function));
   });
 });

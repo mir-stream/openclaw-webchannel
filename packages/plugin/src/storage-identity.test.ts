@@ -109,6 +109,41 @@ describe("Storage Identity v2 contract", () => {
     });
   });
 
+  it.each([
+    "not a url",
+    "/relative",
+    "ftp://saas.example",
+    "https://saas.example?secret=query",
+    "https://saas.example#fragment",
+    "https://user:secret@saas.example",
+    " https://saas.example",
+  ])("rejects invalid SaaS authority without echoing it: %s", (saasBaseUrl) => {
+    const candidate = cloneIdentity();
+    setField(candidate, "saasBaseUrl", saasBaseUrl);
+    const inspection = inspectCredentialBindingIdentityV2(
+      completeIdentity(),
+      candidate,
+    );
+    expect(inspection).toEqual({
+      status: "invalid",
+      code: "invalid-field",
+      fields: ["binding.saasBaseUrl"],
+    });
+    expect(JSON.stringify(inspection)).not.toContain(saasBaseUrl);
+  });
+
+  it("preserves an accepted SaaS URL byte-for-byte", () => {
+    const exact = "https://SaaS.Example:8443/control/path";
+    const identity = createCredentialBindingIdentityV2({
+      storage: { tenant: "tenant-A", accountId: "Account_A" },
+      binding: {
+        ...completeIdentity().binding,
+        saasBaseUrl: exact,
+      },
+    });
+    expect(identity.binding.saasBaseUrl).toBe(exact);
+  });
+
   it("does not normalize a distinct SaaS path or any relay suffix", () => {
     const expected = completeIdentity();
 

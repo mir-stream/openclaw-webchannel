@@ -453,6 +453,9 @@ export async function dialRelayForPreflight(input: {
   connectDeps?: ConnectNatsDeps;
 }): Promise<{ ok: true } | { error: string }> {
   let connection: Awaited<ReturnType<typeof connectNatsCredentialSource>> | undefined;
+  const consumeProbeError = () => {};
+  const deadline = Date.now() + input.timeoutMs;
+  let phase: "dial" | "subscription" = "dial";
   try {
     const connected = await withTimeout(
       connectNatsCredentialSource(
@@ -485,16 +488,53 @@ export async function dialRelayForPreflight(input: {
       },
     );
     connection = connected;
-    // Scoped no-op subscription within the agent's own `webchannel.{tenant}.>`
-    // grant — proves the subject scoping the browser register will ride is
-    // permitted for these creds. Best-effort; a permission fault surfaces via
-    // the transport error event, but the connect handshake is the load-bearing
-    // proof, so we do not block on a settle window (keeps `channels add` fast).
+    phase = "subscription";
+    // The fence below is the authoritative error consumer. Register a listener
+    // so EventEmitter does not classify the same expected denial as unhandled.
+    connected.transport.on("error", consumeProbeError);
+    // NATS processes a connection in order. SUB followed by the production
+    // transport's PING/PONG flush fence therefore cannot report success before
+    // the server has either accepted the scoped subscription or rejected it.
     connected.transport.subscribe(input.subject);
+    const remainingMs = Math.max(0, deadline - Date.now());
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remainingMs);
+    try {
+      await withTimeout(
+        connected.transport.flush(controller.signal),
+        remainingMs,
+        `relay subscription timed out after ${input.timeoutMs}ms`,
+      );
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(
+          `relay subscription timed out after ${input.timeoutMs}ms`,
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
     return { ok: true };
   } catch (err) {
-    return { error: err instanceof Error ? err.message : String(err) };
+    const message = err instanceof Error ? err.message : "";
+    if (
+      message === `relay dial timed out after ${input.timeoutMs}ms` ||
+      message === `relay subscription timed out after ${input.timeoutMs}ms`
+    ) {
+      return { error: message };
+    }
+    return {
+      error: phase === "subscription"
+        ? "relay subscription rejected"
+        : "relay dial failed",
+    };
   } finally {
+    try {
+      connection?.transport.off("error", consumeProbeError);
+    } catch {
+      /* ignore listener-cleanup errors and still attempt transport teardown */
+    }
     try {
       connection?.transport.disconnect();
     } catch {

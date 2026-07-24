@@ -27,6 +27,7 @@ import { EnrollmentClient } from "./enrollment-client.js";
 import type { EnrollmentResultLike } from "./enrollment-client.js";
 import { accountCredentialPath } from "./account-config.js";
 import { assertValidCredentialBindingExpectation } from "./credential-document.js";
+import { deriveEnrollmentEndpoints } from "./saas-authority.js";
 
 /** A minimal log sink (the setup hook's `runtime.log`, or `console.log`). */
 export type AcquireLog = (...args: unknown[]) => void;
@@ -87,7 +88,8 @@ export async function acquireCredentials(
   const credentialPath =
     options.credentialPath ?? accountCredentialPath(accountId, options.home);
 
-  const saasBaseUrl = options.saasBaseUrl.replace(/\/+$/, "");
+  const saasBaseUrl = options.saasBaseUrl;
+  const endpoints = deriveEnrollmentEndpoints(saasBaseUrl);
 
   log(
     `[webchannel] Acquiring credentials for account "${accountId}" ` +
@@ -98,8 +100,7 @@ export async function acquireCredentials(
     options._clientFactory ?? ((opts) => new EnrollmentClient(opts));
   const client = factory({
     saasBaseUrl,
-    saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
-    saasPollUrl: `${saasBaseUrl}/api/poll`,
+    ...endpoints,
     tenant: options.tenant,
     accountId,
     credentialPath,

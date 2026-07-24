@@ -64,8 +64,15 @@ function credentialJson(input: {
     identityKey: { publicKey: KEY, privateKey: PRIVATE_KEY },
     enrollment: {
       creds: { userJwt: "JWT", userSeed: "SEED" },
+      peerId: "peer-a",
+      jwksUrl: "https://keys.example/jwks",
+      bootstrapUrl: "https://bootstrap.example",
       natsUrl: "wss://relay.example",
     },
+    tenant,
+    accountId,
+    saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
+    saasPollUrl: `${saasBaseUrl}/api/poll`,
   });
 }
 
