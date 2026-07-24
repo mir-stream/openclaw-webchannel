@@ -257,15 +257,17 @@ describe("P1-1 HTTP callers and reference approval UI", () => {
     expect(server).toContain("agentKeyRegistry.getActive(TENANT, ACCOUNT_ID)");
   });
 
-  it("21 and 24: all HTTP adapters reject missing accountId and the offline reset runbook names every credential path", async () => {
+  it("21, 24, and 71: all HTTP adapters reject missing accountId and the offline reset runbook names every credential path", async () => {
     for (const file of ["packages/saas/reference/enrollment-server.ts", "demo/saas-server.ts", "examples/webchannel-app/server/index.ts"]) {
       const text = await source(file);
       expect(text, file).toMatch(/!enrollRequest\.accountId/);
       expect(text, file).toContain("400");
     }
     const auth = await source("docs/AUTH.md");
-    expect(auth).toContain('$HOME/.openclaw-webchannel/<account>/credentials.json');
+    expect(auth).toContain('$HOME/.openclaw-webchannel-v2/<v2_namespace>/credentials.json');
+    expect(auth).toContain("storageRoot");
     expect(auth).toContain("credentialPath");
+    expect(auth).toContain('$HOME/.openclaw-webchannel/.legacy-v1-backups/');
     expect(auth).toContain('$HOME/.openclaw-webchannel/credentials.json');
     expect(auth).toContain("already-running transport continues using its old in-memory credentials");
   });
