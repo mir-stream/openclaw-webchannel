@@ -18,12 +18,7 @@
 
 import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
-import { writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import {
-  accountCredentialPath,
-  loadCredentialDocumentAtPath,
-} from "./account-config.js";
+import { loadCredentialDocumentAtPath } from "./account-config.js";
 import {
   CREDENTIAL_BINDING_IDENTITY_FIELD,
   CredentialDocumentBindingError,
@@ -32,7 +27,14 @@ import {
   loadBoundCredentialDocument,
   type PluginCredentialDocument,
 } from "./credential-document.js";
+import { migrateLegacyTupleState } from "./legacy-storage-migration.js";
+import { atomicWritePrivateFile } from "./private-file.js";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
+import {
+  resolveCredentialPath,
+  tupleStoragePaths,
+} from "./storage-paths.js";
+import { StorageDocumentError } from "./storage-document.js";
 
 // ---------------------------------------------------------------------------
 // Import SaaS types for type safety
@@ -197,20 +199,20 @@ export type EnrollmentOptions = {
 
   /**
    * Account (deployment) id — the wire identity (JWT aud / NATS subject key)
-   * sent to the SaaS enrollment. Also scopes the default credential path:
-   * `~/.openclaw-webchannel/<account>/credentials.json` (가-1). When
-   * `credentialPath` is omitted the path is derived from this. Defaults to
-   * `"default"`.
+   * sent to the SaaS enrollment. Together with tenant it scopes the opaque v2
+   * credential namespace.
    */
   accountId: string;
 
   /**
    * Local credential storage path.
-   * Defaults to the account-scoped path
-   * `~/.openclaw-webchannel/<account>/credentials.json`. Obsolete single-file
-   * credentials are intentionally ignored.
+   * Defaults to the tuple-scoped v2 path. Obsolete single-file credentials are
+   * intentionally ignored.
    */
   credentialPath?: string;
+
+  /** Common tuple-scoped root for credentials and conversation keys. */
+  storageRoot?: string;
 
   /**
    * Whether to display enrollment instructions to console.
@@ -256,6 +258,7 @@ export class EnrollmentClient {
       | "accountId"
       | "_minPollIntervalMs"
       | "_home"
+      | "storageRoot"
       | "_readCredentialFile"
       | "_generateIdentityKey"
     >
@@ -264,9 +267,11 @@ export class EnrollmentClient {
     accountId: string;
     _minPollIntervalMs?: number;
     _home?: string;
+    storageRoot?: string;
     _readCredentialFile?: (path: string) => string;
     _generateIdentityKey?: () => KeyPair;
   };
+  private readonly usesTupleCredentialPath: boolean;
   private credentials?: PluginCredentials;
 
   constructor(options: EnrollmentOptions) {
@@ -287,12 +292,32 @@ export class EnrollmentClient {
     // (the common case from createEnrolledNatsConnection) must NOT clobber the
     // default to `undefined` — that previously crashed saveCredentials with
     // `dirname(undefined)`.
+    const tuplePaths = tupleStoragePaths({
+      tenant: options.tenant,
+      accountId: options.accountId,
+      ...(options.storageRoot !== undefined
+        ? { storageRoot: options.storageRoot }
+        : {}),
+      ...(options._home !== undefined ? { home: options._home } : {}),
+    });
+    const credentialPath = resolveCredentialPath({
+      tenant: options.tenant,
+      accountId: options.accountId,
+      ...(options.storageRoot !== undefined
+        ? { storageRoot: options.storageRoot }
+        : {}),
+      ...(options._home !== undefined ? { home: options._home } : {}),
+      ...(options.credentialPath !== undefined
+        ? { credentialPath: options.credentialPath }
+        : {}),
+    });
     this.options = {
       ...options,
-      credentialPath:
-        options.credentialPath ?? this.defaultCredentialPath(options.accountId, options._home),
+      credentialPath,
       displayInstructions: options.displayInstructions ?? true,
     };
+    this.usesTupleCredentialPath =
+      credentialPath === tuplePaths.credentialPath;
   }
 
   /**
@@ -493,12 +518,35 @@ export class EnrollmentClient {
    * Returns true if successful, false otherwise.
    */
   private loadCredentials(): boolean {
-    const loaded = loadCredentialDocumentAtPath(
-      {
+    const expectation = {
+      tenant: this.options.tenant,
+      accountId: this.options.accountId,
+      saasBaseUrl: this.options.saasBaseUrl,
+    };
+    const initial = loadCredentialDocumentAtPath(
+      expectation,
+      this.options.credentialPath,
+      this.options._readCredentialFile,
+    );
+    if (initial.status !== "absent" && initial.status !== "match") {
+      throw new CredentialDocumentBindingError(initial);
+    }
+    // An injected reader is a complete persistence seam. Running the real
+    // migration beside it would unexpectedly inspect or mutate the host home
+    // while a test/caller believes credential I/O is isolated.
+    if (this.options._readCredentialFile === undefined) {
+      migrateLegacyTupleState({
         tenant: this.options.tenant,
         accountId: this.options.accountId,
-        saasBaseUrl: this.options.saasBaseUrl,
-      },
+        ...(this.options.storageRoot !== undefined
+          ? { storageRoot: this.options.storageRoot }
+          : {}),
+        ...(this.options._home !== undefined ? { home: this.options._home } : {}),
+        credentialPath: this.options.credentialPath,
+      });
+    }
+    const loaded = loadCredentialDocumentAtPath(
+      expectation,
       this.options.credentialPath,
       this.options._readCredentialFile,
     );
@@ -517,35 +565,21 @@ export class EnrollmentClient {
    */
   private saveCredentials(): void {
     try {
-      const dir = dirname(this.options.credentialPath);
-      if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
-      }
-
       const data = JSON.stringify(this.credentials, null, 2);
       // Enrollment is intentionally create-only. Another process may finish an
       // enrollment after our initial absence check while this process polls;
       // O_EXCL preserves that credential file instead of silently replacing it.
-      writeFileSync(this.options.credentialPath, data, {
-        mode: 0o600,
-        flag: "wx",
-      }); // rw-------
+      atomicWritePrivateFile(this.options.credentialPath, data, {
+        replace: false,
+        enforceDirectoryMode: this.usesTupleCredentialPath,
+      });
 
       console.log(`[enrollment] Credentials saved to ${this.options.credentialPath}`);
     } catch (error) {
-      console.error("[enrollment] Failed to save credentials:", error);
-      throw error;
+      console.error("[enrollment] code=credential-write-failed");
+      if (error instanceof StorageDocumentError) throw error;
+      throw new StorageDocumentError("credentials", "storage-io-failed");
     }
-  }
-
-  /**
-   * Get the default credential path for an account (가-1).
-   *
-   * Account-scoped: `~/.openclaw-webchannel/<account>/credentials.json`.
-   * Obsolete single-file credentials are never read.
-   */
-  private defaultCredentialPath(accountId: string, home?: string): string {
-    return accountCredentialPath(accountId, home);
   }
 
   // ---------------------------------------------------------------------------

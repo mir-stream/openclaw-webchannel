@@ -104,6 +104,7 @@ describe("evaluateWebchannelDoctor findings", () => {
         WEBCHANNEL_TENANT: "old-tenant",
         WEBCHANNEL_SAAS_BASE_URL: "https://legacy-saas.example",
       },
+      loadPersistedEnrolledCreds: () => persisted,
     }).filter((finding) => finding.checkId === "deprecated-acquisition-env");
 
     expect(findings).toHaveLength(2);

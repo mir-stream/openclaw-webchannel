@@ -86,6 +86,10 @@ import {
   loadPersistedCredentialDocument,
   resolveTypingEnabled,
 } from "./account-config.js";
+import {
+  credentialStorageFailureDiagnostic,
+  StorageDocumentError,
+} from "./storage-document.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import {
   NatsAccountRuntimeCoordinator,
@@ -459,6 +463,9 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           saasBaseUrl: plan.saasBaseUrl ?? config.saas?.baseUrl,
           tenant,
           accountId,
+          ...(plan.storageRoot !== undefined
+            ? { storageRoot: plan.storageRoot }
+            : {}),
         });
       } catch (err) {
         const failure = classifyAccountStartupFailure(err, "preflight");
@@ -479,8 +486,26 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             tenant,
             accountId,
             saasBaseUrl: source.saasBaseUrl,
+          }, {
+            ...(source.storageRoot !== undefined
+              ? { storageRoot: source.storageRoot }
+              : {}),
+            ...(source.credentialPath !== undefined
+              ? { credentialPath: source.credentialPath }
+              : {}),
           });
-        } catch {
+        } catch (error) {
+          if (error instanceof StorageDocumentError) {
+            const diagnostic = credentialStorageFailureDiagnostic(error);
+            reportPermanent(accountId, diagnostic.code, diagnostic.detail);
+            setStatus(accountNeverServedStatusPatch({
+              restartPending: false,
+              reconnectAttempts: 0,
+              lastError: diagnostic.detail,
+            }));
+            await waitForAbort(ctx.abortSignal);
+            return undefined;
+          }
           const detail =
             "effective tenant/account/SaaS identity is invalid; correct the account configuration";
           reportPermanent(
@@ -709,7 +734,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       };
       let attemptTransport: NatsTransport | undefined;
       try {
-        const consumed = await consumeCredentialSource(source, accountId, {
+        const consumed = await consumeCredentialSource(source, {
           signal: attemptAbort.signal,
           ...(source.mode === "enrolled" && credentialLoad
             ? { loadPersisted: () => credentialLoad }
@@ -790,7 +815,11 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         channel = new NatsChannel(transport, accountId, tenant, {
           ...cryptoOptions,
           keyStore: new ConversationKeyStore({
+            tenant,
             accountId,
+            ...(plan.storageRoot !== undefined
+              ? { storageRoot: plan.storageRoot }
+              : {}),
             onCapacityWarning: capacityDiagnostics.onCapacityWarning,
           }),
           identityKeyPair: attemptIdentityKey,

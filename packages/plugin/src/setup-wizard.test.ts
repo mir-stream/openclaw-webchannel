@@ -21,6 +21,13 @@ vi.mock("node:fs", async (importOriginal) => {
     lstatSync: (p: string) => lstatMock(p),
   };
 });
+vi.mock("./legacy-storage-migration.js", () => ({
+  migrateLegacyTupleState: () => ({
+    status: "not-needed",
+    credential: "absent",
+    conversationKeys: "absent",
+  }),
+}));
 
 import { buildFullAccountPatch } from "./setup.js";
 import { webchannelSetupWizard, validateHttpUrl } from "./setup-wizard.js";
@@ -301,7 +308,9 @@ describe("setup-wizard: declarative detection", () => {
       }),
     ).toBe(true);
     expect(readMock).toHaveBeenCalledWith(
-      expect.stringContaining("/Account_A/credentials.json"),
+      expect.stringMatching(
+        /\/\.openclaw-webchannel-v2\/v2_[A-Za-z0-9_-]{43}\/credentials\.json$/,
+      ),
     );
     const lines = await Promise.resolve(
       webchannelSetupWizard.status.resolveStatusLines!({

@@ -61,12 +61,17 @@ import {
   readAccountsMap,
   readWebchannelSection,
   resolveAcquisitionIdentity,
+  resolveAccountStorageRoot,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
 import {
   formatCredentialInspection,
 } from "./credential-document.js";
+import {
+  credentialStorageFailureDiagnostic,
+  StorageDocumentError,
+} from "./storage-document.js";
 import {
   parseNatsCredentialMode,
   resolveEnrolledSaasBaseUrl,
@@ -418,6 +423,7 @@ export const webchannelSetup = {
     // path. Path ownership alone is never proof that persisted enrollment
     // material belongs to this configured account.
     const configuredIdentity = resolveAcquisitionIdentity(cfg, id);
+    const storageRoot = resolveAccountStorageRoot(account);
     const identity = resolveSetupIdentity(input);
     const tenant =
       identity.tenant ?? configuredIdentity.tenant;
@@ -439,15 +445,29 @@ export const webchannelSetup = {
       return;
     }
 
-    const existingPath = accountCredentialPath(id);
+    const storageOptions = {
+      ...(storageRoot !== undefined ? { storageRoot } : {}),
+    };
+    let existingPath: string;
     let persisted: ReturnType<typeof loadPersistedCredentialDocument>;
     try {
+      existingPath = accountCredentialPath(
+        { tenant, accountId: id },
+        storageOptions,
+      );
       persisted = loadPersistedCredentialDocument({
         tenant,
         accountId: id,
         saasBaseUrl,
-      });
-    } catch {
+      }, storageOptions);
+    } catch (error) {
+      if (error instanceof StorageDocumentError) {
+        const diagnostic = credentialStorageFailureDiagnostic(error);
+        runtime.log(
+          `[webchannel] account "${id}": code=${diagnostic.code}; ${diagnostic.detail}.`,
+        );
+        return;
+      }
       runtime.log(
         `[webchannel] account "${id}": effective tenant/account/SaaS identity is ` +
           `invalid; refusing credential reuse or enrollment. Correct the account ` +
@@ -488,6 +508,7 @@ export const webchannelSetup = {
         accountId: id,
         saasBaseUrl,
         tenant,
+        ...storageOptions,
         log: (...args) => runtime.log(...args),
       });
 

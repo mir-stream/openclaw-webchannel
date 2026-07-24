@@ -16,8 +16,7 @@
  *   2. Prints the user_code to STDOUT/log (no TTY required — the operator
  *      approves at the SaaS `/approve` UI; in CI a harness scrapes the user_code
  *      and POSTs `/approve`).
- *   3. Persists creds to the per-account path
- *      `~/.openclaw-webchannel/<account>/credentials.json`.
+ *   3. Persists creds to the exact tuple-scoped v2 path.
  *
  * The approval MECHANISM is unchanged (operator approves at SaaS `/approve`);
  * this only moves WHERE acquisition is triggered (config-time, not runtime).
@@ -44,10 +43,12 @@ export type AcquireCredentialsOptions = {
   /** Deployment tenant identifier. */
   tenant: string;
   /**
-   * Override the persisted credential path. Defaults to the per-account path
-   * `~/.openclaw-webchannel/<account>/credentials.json`.
+   * Override the persisted credential path. Defaults to the opaque
+   * tuple-scoped v2 path.
    */
   credentialPath?: string;
+  /** Common tuple-scoped root for credentials and conversation keys. */
+  storageRoot?: string;
   /** Progress sink. Defaults to `console.log`. */
   log?: AcquireLog;
   /** Override the home dir for path resolution (tests). */
@@ -86,7 +87,16 @@ export async function acquireCredentials(
   const accountId = options.accountId;
   const log: AcquireLog = options.log ?? ((...args) => console.log(...args));
   const credentialPath =
-    options.credentialPath ?? accountCredentialPath(accountId, options.home);
+    options.credentialPath ??
+    accountCredentialPath(
+      { tenant: options.tenant, accountId },
+      {
+        ...(options.home !== undefined ? { home: options.home } : {}),
+        ...(options.storageRoot !== undefined
+          ? { storageRoot: options.storageRoot }
+          : {}),
+      },
+    );
 
   const saasBaseUrl = options.saasBaseUrl;
   const endpoints = deriveEnrollmentEndpoints(saasBaseUrl);
@@ -104,6 +114,10 @@ export async function acquireCredentials(
     tenant: options.tenant,
     accountId,
     credentialPath,
+    ...(options.storageRoot !== undefined
+      ? { storageRoot: options.storageRoot }
+      : {}),
+    ...(options.home !== undefined ? { _home: options.home } : {}),
     // Non-interactive: the EnrollmentClient already prints the user_code +
     // verification URI to the console. Keep that on so CI/operators see it.
     displayInstructions: true,

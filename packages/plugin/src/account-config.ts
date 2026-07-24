@@ -26,10 +26,9 @@
  * multiplex SERVING is Cycle 2. `"default"` is a NORMAL account id.
  *
  * ── Account id is a TRUST BOUNDARY ──────────────────────────────────────────
- * accountId flows into filesystem paths (`~/.openclaw-webchannel/<account>/…`),
- * so it MUST be validated/canonicalized before any `path.join`. We reuse core's
- * canonicalization rules and additionally HARD-REJECT a non-conforming id at the
- * path boundary so a traversal sequence (`../../evil`) can never escape the root.
+ * accountId participates in the exact storage identity, so it MUST be validated
+ * before deriving an opaque tuple namespace. Raw tenant/account values are
+ * never interpolated into v2 persistence paths.
  */
 
 import { homedir } from "node:os";
@@ -52,7 +51,13 @@ import {
   type BoundCredentialLoadResult,
   type CredentialBindingExpectation,
 } from "./credential-document.js";
+import { migrateLegacyTupleState } from "./legacy-storage-migration.js";
 import type { WebchannelNatsConfig } from "./nats-credential-source.js";
+import {
+  resolveCredentialPath,
+  type CredentialPathOptions,
+} from "./storage-paths.js";
+import type { StorageScopeIdentity } from "./storage-identity.js";
 
 export { assertValidAccountId, isValidAccountId } from "./account-id.js";
 export type { PersistedEnrolledCreds } from "./credential-document.js";
@@ -426,15 +431,13 @@ export function credentialsRootDir(home: string = homedir()): string {
 }
 
 /**
- * Per-account credential path: `~/.openclaw-webchannel/<account>/credentials.json`.
- * Validates `accountId` (rejects traversal) BEFORE the join.
+ * Exact tuple credential path under the opaque v2 namespace.
  */
 export function accountCredentialPath(
-  accountId: string,
-  home: string = homedir(),
+  scope: StorageScopeIdentity,
+  opts: { home?: string; storageRoot?: string; credentialPath?: string } = {},
 ): string {
-  assertValidAccountId(accountId);
-  return join(credentialsRootDir(home), accountId, "credentials.json");
+  return resolveCredentialPath({ ...scope, ...opts });
 }
 
 /**
@@ -449,19 +452,36 @@ export function legacyCredentialPath(home: string = homedir()): string {
 }
 
 /**
- * Resolve the credential path to READ for an account.
+ * Resolve the credential path to READ for one exact tuple.
  *
- * This always returns the account-scoped path. The legacy single-file location
+ * This always returns the tuple-scoped path. The legacy single-file location
  * is migration/cleanup-only and is deliberately never a read fallback.
  *
- * `assertValidAccountId` runs first (via `accountCredentialPath`).
  */
 export function resolveReadCredentialPath(
-  accountId: string,
-  opts: { home?: string; exists?: (p: string) => boolean } = {},
+  scope: StorageScopeIdentity,
+  opts: {
+    home?: string;
+    storageRoot?: string;
+    credentialPath?: string;
+    exists?: (p: string) => boolean;
+  } = {},
 ): string {
-  const home = opts.home ?? homedir();
-  return accountCredentialPath(accountId, home);
+  return accountCredentialPath(scope, opts);
+}
+
+/** Resolve and validate a common tuple storage root from merged config. */
+export function resolveAccountStorageRoot(
+  account: WebchannelAccountConfig,
+): string | undefined {
+  const value = account.storageRoot;
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw new Error(
+      "webchannel: storageRoot must be a non-empty filesystem path",
+    );
+  }
+  return value;
 }
 
 /**
@@ -477,15 +497,40 @@ export function loadPersistedCredentialDocument(
   expected: CredentialBindingExpectation,
   opts: {
     home?: string;
+    storageRoot?: string;
+    credentialPath?: string;
     /** @deprecated Retained for source compatibility; direct reads ignore it. */
     exists?: (p: string) => boolean;
     read?: (p: string) => string;
+    migrateLegacy?: boolean;
   } = {},
 ): BoundCredentialLoadResult {
-  assertValidAccountId(expected.accountId);
-  const path = resolveReadCredentialPath(expected.accountId, {
+  assertValidCredentialBindingExpectation(expected);
+  const pathOptions: CredentialPathOptions = {
+    tenant: expected.tenant,
+    accountId: expected.accountId,
     ...(opts.home !== undefined ? { home: opts.home } : {}),
-  });
+    ...(opts.storageRoot !== undefined
+      ? { storageRoot: opts.storageRoot }
+      : {}),
+    ...(opts.credentialPath !== undefined
+      ? { credentialPath: opts.credentialPath }
+      : {}),
+  };
+  const path = resolveReadCredentialPath(expected, opts);
+  const initial = loadCredentialDocumentAtPath(expected, path, opts.read);
+  const shouldMigrate =
+    opts.migrateLegacy !== false &&
+    opts.read === undefined &&
+    opts.exists === undefined;
+  if (!shouldMigrate) return initial;
+  // Preserve #63's authoritative content/anomalous-path classification before
+  // migration can reinterpret a destination as a legacy source. A matching
+  // document is still withheld until the migration boundary succeeds.
+  if (initial.status !== "absent" && initial.status !== "match") {
+    return initial;
+  }
+  migrateLegacyTupleState(pathOptions);
   return loadCredentialDocumentAtPath(expected, path, opts.read);
 }
 

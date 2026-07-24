@@ -15,11 +15,18 @@ import {
   type CredentialBindingField,
   type CredentialBindingIdentityV2,
   type IdentityInspection,
+  type StorageScopeIdentity,
   type StorageIdentityErrorCode,
 } from "./storage-identity.js";
+import {
+  assertDocumentStorageIdentity,
+  StorageDocumentError,
+} from "./storage-document.js";
 
 /** The sole top-level field carrying credential identity metadata. */
 export const CREDENTIAL_BINDING_IDENTITY_FIELD = "credentialIdentity" as const;
+/** Shared #63/#71 field name; no second storage-only identity block exists. */
+export const CREDENTIAL_IDENTITY_FIELD = CREDENTIAL_BINDING_IDENTITY_FIELD;
 
 export type PersistedNatsUserCredentials = {
   userJwt: string;
@@ -238,6 +245,124 @@ export function createCredentialIdentityForEnrollment(input: {
       agentPublicKey: input.agentPublicKey,
     },
   });
+}
+
+/** Verify only physical tuple ownership; complete binding is checked on load. */
+export function assertCredentialDocumentStorage(
+  scope: StorageScopeIdentity,
+  candidate: unknown,
+): void {
+  if (!isRecord(candidate)) {
+    throw new StorageDocumentError("credentials", "invalid-document");
+  }
+  assertDocumentStorageIdentity(
+    "credentials",
+    scope,
+    candidate[CREDENTIAL_BINDING_IDENTITY_FIELD],
+  );
+}
+
+/** Exact legacy ownership evidence used before adopting collocated v1 state. */
+export function legacyCredentialProvesScope(
+  scope: StorageScopeIdentity,
+  candidate: unknown,
+): boolean {
+  return (
+    isRecord(candidate) &&
+    candidate.tenant === scope.tenant &&
+    candidate.accountId === scope.accountId
+  );
+}
+
+export function parseCredentialJson(serialized: string): Record<string, unknown> {
+  try {
+    const candidate = JSON.parse(serialized) as unknown;
+    if (!isRecord(candidate)) throw new Error("not an object");
+    return candidate;
+  } catch {
+    throw new StorageDocumentError("credentials", "invalid-document");
+  }
+}
+
+/** Base URL encoded by the legacy enrollment endpoint fields. */
+export function enrollmentBaseUrl(saasEnrollUrl: string): string {
+  const withoutTrailing = saasEnrollUrl.replace(/\/+$/, "");
+  const suffix = "/api/enroll";
+  return withoutTrailing.endsWith(suffix)
+    ? withoutTrailing.slice(0, -suffix.length)
+    : withoutTrailing;
+}
+
+/**
+ * Add the shared complete identity to independently proven legacy credentials.
+ * An existing identity is authoritative and may never be rebound.
+ */
+export function upgradeLegacyCredentialDocument(
+  scope: StorageScopeIdentity,
+  candidate: unknown,
+): BoundCredentialDocument {
+  if (!isRecord(candidate)) {
+    throw new StorageDocumentError("credentials", "invalid-document");
+  }
+  if (!legacyCredentialProvesScope(scope, candidate)) {
+    throw new StorageDocumentError("credentials", "identity-mismatch", [
+      "storage.tenant",
+      "storage.accountId",
+    ]);
+  }
+  const saasEnrollUrl = candidate.saasEnrollUrl;
+  if (typeof saasEnrollUrl !== "string" || saasEnrollUrl.length === 0) {
+    throw new StorageDocumentError("credentials", "invalid-document");
+  }
+  const expected: CredentialBindingExpectation = {
+    ...scope,
+    saasBaseUrl: enrollmentBaseUrl(saasEnrollUrl),
+  };
+  let document = candidate;
+  const hadExplicitIdentity =
+    Object.prototype.hasOwnProperty.call(
+      document,
+      CREDENTIAL_BINDING_IDENTITY_FIELD,
+    );
+  if (hadExplicitIdentity) {
+    assertCredentialDocumentStorage(scope, document);
+  } else {
+    const identityKey = isRecord(document.identityKey)
+      ? document.identityKey
+      : undefined;
+    const enrollment = isRecord(document.enrollment)
+      ? document.enrollment
+      : undefined;
+    if (
+      typeof identityKey?.publicKey !== "string" ||
+      typeof enrollment?.natsUrl !== "string"
+    ) {
+      throw new StorageDocumentError("credentials", "invalid-document");
+    }
+    document = {
+      ...document,
+      [CREDENTIAL_BINDING_IDENTITY_FIELD]:
+        createCredentialIdentityForEnrollment({
+          ...scope,
+          saasBaseUrl: expected.saasBaseUrl,
+          ...(typeof enrollment.issuer === "string"
+            ? { deliveredIssuer: enrollment.issuer }
+            : {}),
+          relayUrl: enrollment.natsUrl,
+          agentPublicKey: identityKey.publicKey,
+        }),
+    };
+  }
+  const loaded = loadBoundCredentialDocument(expected, document);
+  if (loaded.status !== "match") {
+    // Storage ownership was already proven above. Any remaining #63 mismatch
+    // is semantic binding/readiness failure, not permission to attribute the
+    // collocated legacy key store to this tuple.
+    throw new StorageDocumentError("credentials", "invalid-document");
+  }
+  return hadExplicitIdentity
+    ? (document as BoundCredentialDocument)
+    : loaded.document;
 }
 
 /** Inspect an already-parsed candidate without ever returning its contents. */

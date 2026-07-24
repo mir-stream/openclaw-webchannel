@@ -45,6 +45,7 @@ import {
   isValidAccountId,
   loadPersistedCredentialDocument,
   resolveAcquisitionIdentity,
+  resolveAccountStorageRoot,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import {
@@ -133,11 +134,14 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
           : {}),
       });
       if (!saasBaseUrl) return false;
+      const storageRoot = resolveAccountStorageRoot(account);
       try {
         return loadPersistedCredentialDocument({
           tenant: identity.tenant,
           accountId: id,
           saasBaseUrl,
+        }, {
+          ...(storageRoot !== undefined ? { storageRoot } : {}),
         }).status === "match";
       } catch {
         // Invalid effective identity is unconfigured; status inspection must not
