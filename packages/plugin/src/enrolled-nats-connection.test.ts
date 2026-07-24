@@ -23,6 +23,39 @@ function enrolledClient() {
 }
 
 describe("createEnrolledNatsConnection cleanup", () => {
+  it.each([
+    ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
+    ["account", { accountId: "../../unsafe" }, "storage.accountId"],
+  ] as const)(
+    "rejects invalid binding %s before invoking any injected dependency",
+    async (_label, override, expectedField) => {
+      const enrollmentClientFactory = vi.fn();
+      const transportFactory = vi.fn();
+      const makeSigner = vi.fn();
+      await expect(
+        createEnrolledNatsConnection(
+          {
+            saasBaseUrl: "https://saas",
+            saasEnrollUrl: "https://saas/api/enroll",
+            saasPollUrl: "https://saas/api/poll",
+            natsUrl: "wss://must-not-dial",
+            tenant: "tenant",
+            accountId: "account",
+            ...override,
+          },
+          {
+            enrollmentClientFactory,
+            transportFactory,
+            makeSigner,
+          },
+        ),
+      ).rejects.toThrow(expectedField);
+      expect(enrollmentClientFactory).not.toHaveBeenCalled();
+      expect(transportFactory).not.toHaveBeenCalled();
+      expect(makeSigner).not.toHaveBeenCalled();
+    },
+  );
+
   it("rejects split SaaS endpoints before invoking an injected client factory", async () => {
     const enrollmentClientFactory = vi.fn();
     const transportFactory = vi.fn();

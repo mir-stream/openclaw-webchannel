@@ -26,6 +26,7 @@
 import { EnrollmentClient } from "./enrollment-client.js";
 import type { EnrollmentResultLike } from "./enrollment-client.js";
 import { accountCredentialPath } from "./account-config.js";
+import { assertValidCredentialBindingExpectation } from "./credential-document.js";
 
 /** A minimal log sink (the setup hook's `runtime.log`, or `console.log`). */
 export type AcquireLog = (...args: unknown[]) => void;
@@ -74,6 +75,13 @@ export type AcquireCredentialsOptions = {
 export async function acquireCredentials(
   options: AcquireCredentialsOptions,
 ): Promise<EnrollmentResultLike> {
+  // Reject invalid v2 identity before path construction, logging, or an
+  // injected client factory can perform filesystem/network work.
+  assertValidCredentialBindingExpectation({
+    tenant: options.tenant,
+    accountId: options.accountId,
+    saasBaseUrl: options.saasBaseUrl,
+  });
   const accountId = options.accountId;
   const log: AcquireLog = options.log ?? ((...args) => console.log(...args));
   const credentialPath =

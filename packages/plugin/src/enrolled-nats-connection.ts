@@ -30,7 +30,10 @@ import {
 import { NatsTransport } from "./nats-transport.js";
 import { makeNkeySigningCallback } from "./nkey-sign.js";
 import type { KeyPair } from "./e2e-crypto.js";
-import { CredentialDocumentBindingError } from "./credential-document.js";
+import {
+  CredentialDocumentBindingError,
+  assertValidCredentialBindingExpectation,
+} from "./credential-document.js";
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -147,6 +150,13 @@ export async function createEnrolledNatsConnection(
   options: EnrolledNatsConnectionOptions,
   deps: EnrolledNatsConnectionDeps = {},
 ): Promise<EnrolledNatsConnection> {
+  // Validate the common v2 binding expectation before an injected factory can
+  // observe the request or perform filesystem/network work.
+  assertValidCredentialBindingExpectation({
+    tenant: options.tenant,
+    accountId: options.accountId,
+    saasBaseUrl: options.saasBaseUrl,
+  });
   // The exported connector must enforce the same acquisition/binding authority
   // even when callers inject a custom EnrollmentClient factory.
   assertEnrollmentEndpointsMatchBase(options);

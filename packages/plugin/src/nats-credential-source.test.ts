@@ -328,6 +328,30 @@ describe("connectNatsCredentialSource — static branch", () => {
     expect(result.enrolled).toBe(enrolled);
   });
 
+  it.each([
+    ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
+    ["account", { accountId: "../../unsafe" }, "storage.accountId"],
+  ] as const)(
+    "enrolled branch rejects invalid binding %s before injected creation",
+    async (_label, override, expectedField) => {
+      const createEnrolled = vi.fn();
+      await expect(
+        connectNatsCredentialSource(
+          {
+            mode: "enrolled",
+            url: "wss://must-not-dial",
+            saasBaseUrl: "https://saas.example",
+            tenant: "tenant",
+            accountId: "account",
+            ...override,
+          },
+          { createEnrolled: createEnrolled as never },
+        ),
+      ).rejects.toThrow(expectedField);
+      expect(createEnrolled).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["signer", "protocol", "timeout"] as const)(
     "retires a real production transport after a %s handshake failure",
     async (failure) => {
