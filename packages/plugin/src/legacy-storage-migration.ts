@@ -27,6 +27,7 @@ import {
   archiveFileNoReplace,
   atomicWritePrivateFile,
   ensurePrivateDirectory,
+  fsyncDirectoryBestEffort,
 } from "./private-file.js";
 import {
   legacyTuplePaths,
@@ -77,6 +78,8 @@ export type LegacyMigrationResult = Readonly<{
 export type LegacyMigrationOptions = CredentialPathOptions & {
   /** @internal Test-only seam after an exclusive claim and before source move. */
   _afterClaim?: () => void;
+  /** @internal Test-only seam after durable source move and before publication. */
+  _afterSourceMove?: () => void;
 };
 
 /**
@@ -128,6 +131,8 @@ export function migrateLegacyTupleState(
       claimDirectory,
       sourceDirectory: archivedSource,
       credentialDestination,
+      enforceCredentialDirectoryMode:
+        credentialDestination === destination.credentialPath,
       conversationKeyDestination: destination.conversationKeyPath,
       resumed: true,
     });
@@ -215,16 +220,24 @@ export function migrateLegacyTupleState(
   try {
     if (!existsSync(archivedSource)) {
       renameSync(legacy.directory, archivedSource);
+      // Make both halves of the cross-directory rename durable before any v2
+      // destination is published. Directory fsync remains best-effort on
+      // platforms that do not support it.
+      fsyncDirectoryBestEffort(legacy.root);
+      fsyncDirectoryBestEffort(claimDirectory);
     }
   } catch {
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
   }
+  options._afterSourceMove?.();
 
   return migrateProvenArchive({
     scope: destination.scope,
     claimDirectory,
     sourceDirectory: archivedSource,
     credentialDestination,
+    enforceCredentialDirectoryMode:
+      credentialDestination === destination.credentialPath,
     conversationKeyDestination: destination.conversationKeyPath,
     resumed: false,
   });
@@ -235,6 +248,7 @@ function migrateProvenArchive(input: {
   claimDirectory: string;
   sourceDirectory: string;
   credentialDestination: string;
+  enforceCredentialDirectoryMode: boolean;
   conversationKeyDestination: string;
   resumed: boolean;
 }): LegacyMigrationResult {
@@ -273,6 +287,7 @@ function migrateProvenArchive(input: {
       input.scope,
       input.credentialDestination,
       upgradedCredential,
+      input.enforceCredentialDirectoryMode,
     );
     publishConversationKeys(
       input.scope,
@@ -417,6 +432,8 @@ function claimMigration(
 ): void {
   const claimPath = join(claimDirectory, CLAIM_FILE_NAME);
   try {
+    // The shared helper durably links every newly created backup/claim path
+    // component before the claim can authorize moving live source material.
     ensurePrivateDirectory(claimDirectory, true);
   } catch {
     throw new StorageDocumentError(
@@ -657,13 +674,14 @@ function publishCredential(
   scope: StorageIdentityV2["storage"],
   destination: string,
   credential: Record<string, unknown>,
+  enforceDirectoryMode: boolean,
 ): void {
   if (!existsSync(destination)) {
     try {
       atomicWritePrivateFile(
         destination,
         JSON.stringify(credential, null, 2),
-        { replace: false, enforceDirectoryMode: true },
+        { replace: false, enforceDirectoryMode },
       );
     } catch (error) {
       if (!isEexist(error)) throw error;
