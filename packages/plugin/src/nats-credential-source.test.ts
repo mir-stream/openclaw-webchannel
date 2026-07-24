@@ -9,6 +9,7 @@
 import { describe, it, expect, vi } from "vitest";
 
 import {
+  resolveEnrolledSaasBaseUrl,
   resolveNatsCredentialSource,
   connectNatsCredentialSource,
   parseNatsCredsFile,
@@ -214,6 +215,44 @@ describe("resolveNatsCredentialSource — enrolled (default)", () => {
       env: { WEBCHANNEL_SAAS_BASE_URL: "https://env.example" },
     }) as Extract<NatsCredentialSource, { mode: "enrolled" }>;
     expect(s.saasBaseUrl).toBe("https://env.example");
+  });
+});
+
+describe("resolveEnrolledSaasBaseUrl — shared binding precedence", () => {
+  it("uses env > credential override > account SaaS > optional fallback", () => {
+    const base = {
+      natsConfig: {
+        credentials: { saasBaseUrl: "https://credentials.example" },
+      },
+      saasBaseUrl: "https://account.example",
+      fallback: "https://fallback.example",
+    };
+    expect(
+      resolveEnrolledSaasBaseUrl({
+        ...base,
+        env: { WEBCHANNEL_SAAS_BASE_URL: "https://env.example" },
+      }),
+    ).toBe("https://env.example");
+    expect(resolveEnrolledSaasBaseUrl({ ...base, env: {} })).toBe(
+      "https://credentials.example",
+    );
+    expect(
+      resolveEnrolledSaasBaseUrl({
+        saasBaseUrl: "https://account.example",
+        fallback: "https://fallback.example",
+        env: {},
+      }),
+    ).toBe("https://account.example");
+    expect(
+      resolveEnrolledSaasBaseUrl({
+        fallback: "https://fallback.example",
+        env: {},
+      }),
+    ).toBe("https://fallback.example");
+  });
+
+  it("preserves setup/status missing-config detection without a fallback", () => {
+    expect(resolveEnrolledSaasBaseUrl({ env: {} })).toBeUndefined();
   });
 });
 

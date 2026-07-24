@@ -66,6 +66,10 @@ import { acquireCredentials } from "./acquire-credentials.js";
 import {
   formatCredentialInspection,
 } from "./credential-document.js";
+import {
+  resolveEnrolledSaasBaseUrl,
+  type WebchannelNatsConfig,
+} from "./nats-credential-source.js";
 import { runAddPreflight } from "./preflight.js";
 
 /**
@@ -399,11 +403,12 @@ export const webchannelSetup = {
     const identity = resolveSetupIdentity(input);
     const tenant =
       identity.tenant ?? (account.tenant as string | undefined) ?? "default-tenant";
-    const saasBaseUrl =
-      identity.saasBaseUrl ??
-      (account.saas as { baseUrl?: string } | undefined)?.baseUrl ??
-      (account.nats as { credentials?: { saasBaseUrl?: string } } | undefined)?.credentials
-        ?.saasBaseUrl;
+    const saasBaseUrl = resolveEnrolledSaasBaseUrl({
+      natsConfig: account.nats as WebchannelNatsConfig | undefined,
+      saasBaseUrl:
+        identity.saasBaseUrl ??
+        (account.saas as { baseUrl?: string } | undefined)?.baseUrl,
+    });
 
     if (!saasBaseUrl) {
       runtime.log(

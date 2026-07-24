@@ -51,7 +51,7 @@ export type ConsumeResult =
       connection: ConnectedNats;
       /**
        * The URL actually dialed. For `enrolled` this is the SaaS-delivered
-       * `natsUrl` when present (else the resolver fallback); for `static`
+       * bound `natsUrl`; for `static`
        * it is `source.url`. Surfaced so callers can log the EFFECTIVE relay,
        * which — for enrolled — may differ from the resolver's `source.url`.
        */
@@ -142,12 +142,25 @@ export function resolveDialMaterial(input: ResolveDialMaterialInput): DialMateri
     };
   }
   const credentials = persisted.credentials;
+  // Defensive for injected loaders: the real document loader already enforces
+  // this, but a test/diagnostic seam must not reintroduce config fallback.
+  if (!credentials.natsUrl) {
+    return {
+      status: "creds-binding-failed",
+      accountId: input.accountId,
+      failure: {
+        status: "invalid",
+        code: "invalid-document",
+        fields: ["enrollment.natsUrl"],
+      },
+    };
+  }
   return {
     status: "ok",
     mode: source.mode,
     dial: {
       kind: "static",
-      url: credentials.natsUrl ?? source.url,
+      url: credentials.natsUrl,
       userJwt: credentials.userJwt,
       userSeed: credentials.userSeed,
     },
@@ -192,17 +205,30 @@ export async function consumeCredentialSource(
     };
   }
   const credentials = persisted.credentials;
+  // Defensive for injected loaders: never dial a current config fallback when
+  // relay provenance is absent.
+  if (!credentials.natsUrl) {
+    return {
+      status: "creds-binding-failed",
+      accountId,
+      failure: {
+        status: "invalid",
+        code: "invalid-document",
+        fields: ["enrollment.natsUrl"],
+      },
+    };
+  }
 
   // Connect with the persisted enrolled creds via the static branch — identical
   // transport primitive (jwtCredential + NKEY signing callback), no enroll.
   //
   // The SaaS is the rendezvous authority: the relay URL was delivered with the
   // minted creds (persisted as `enrollment.natsUrl`), so we dial THAT in
-  // preference to the resolver's `source.url` (derived from `nats.url` /
-  // `WEBCHANNEL_NATS_URL` — now a dev-only override / back-compat fallback for
-  // creds enrolled before natsUrl was delivered). This is the load-bearing
+  // rather than the resolver's `source.url` (derived from `nats.url` /
+  // `WEBCHANNEL_NATS_URL`). Documents from before natsUrl was delivered fail
+  // the binding gate and must be re-enrolled. This is the load-bearing
   // consume-time half of "the operator does not configure the NATS URL".
-  const dialedUrl = credentials.natsUrl ?? source.url;
+  const dialedUrl = credentials.natsUrl;
   const connection = await connectNatsCredentialSource(
     {
       mode: "static",

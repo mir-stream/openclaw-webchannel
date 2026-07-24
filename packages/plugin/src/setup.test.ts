@@ -8,6 +8,7 @@ const acquireMock = vi.fn(
     peerId: "p",
     jwksUrl: "j",
     bootstrapUrl: "b",
+    natsUrl: "wss://relay.example",
   }),
 );
 vi.mock("./acquire-credentials.js", () => ({
@@ -39,8 +40,11 @@ vi.mock("node:fs", async (importOriginal) => {
 import { webchannelSetup, buildAccountPatch, resolveSetupIdentity } from "./setup.js";
 import { listWebchannelAccountIds } from "./account-config.js";
 import { createCredentialIdentityForEnrollment } from "./credential-document.js";
+import { generateKeyPair } from "./e2e-crypto.js";
 
-const KEY = Buffer.alloc(32, 7).toString("base64url");
+const TEST_PAIR = generateKeyPair();
+const KEY = Buffer.from(TEST_PAIR.publicKey).toString("base64url");
+const PRIVATE_KEY = Buffer.from(TEST_PAIR.privateKey).toString("base64url");
 function credentialJson(input: {
   tenant?: string;
   accountId?: string;
@@ -54,10 +58,14 @@ function credentialJson(input: {
       tenant,
       accountId,
       saasBaseUrl,
+      relayUrl: "wss://relay.example",
       agentPublicKey: KEY,
     }),
-    identityKey: { publicKey: KEY, privateKey: KEY },
-    enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } },
+    identityKey: { publicKey: KEY, privateKey: PRIVATE_KEY },
+    enrollment: {
+      creds: { userJwt: "JWT", userSeed: "SEED" },
+      natsUrl: "wss://relay.example",
+    },
   });
 }
 
@@ -409,6 +417,48 @@ describe("setup: afterAccountConfigWritten (headless acquisition)", () => {
     expect(String(echoed![0])).toContain("tenant=tenant-x");
     expect(String(echoed![0])).toContain("accountId=accta");
     expect(String(echoed![0])).toContain("saasBaseUrl=http://s");
+  });
+
+  it("acquires against nats.credentials.saasBaseUrl instead of the lower account SaaS base", async () => {
+    existsMock.mockReturnValue(false);
+    const runtime = makeRuntime();
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "tenant-x",
+              saas: { baseUrl: "https://saas-a.example" },
+              nats: {
+                credentials: {
+                  mode: "enrolled",
+                  saasBaseUrl: "https://saas-b.example",
+                },
+              },
+            },
+          },
+        },
+      },
+    } as never;
+
+    await webchannelSetup.afterAccountConfigWritten({
+      previousCfg: cfg,
+      cfg,
+      accountId: "accta",
+      input: {},
+      runtime,
+    });
+
+    expect(acquireMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: "accta",
+        tenant: "tenant-x",
+        saasBaseUrl: "https://saas-b.example",
+      }),
+    );
+    expect(
+      runtime.log.mock.calls.flat().join("\n"),
+    ).toContain("saasBaseUrl=https://saas-b.example");
   });
 
   it("skips acquisition when per-account creds already exist", async () => {

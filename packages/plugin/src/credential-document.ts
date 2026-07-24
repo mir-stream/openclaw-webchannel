@@ -7,7 +7,7 @@
  * returned only by the load API after the complete v2 binding is proven.
  */
 
-import type { KeyPair } from "./e2e-crypto.js";
+import { derivePublicKey, type KeyPair } from "./e2e-crypto.js";
 import {
   createCredentialBindingIdentityV2,
   inspectCredentialBindingIdentityV2,
@@ -64,6 +64,10 @@ export type BoundCredentialDocument = PluginCredentialDocument & {
 export type PersistedEnrolledCreds = {
   userJwt: string;
   userSeed: string;
+  /**
+   * SaaS-delivered relay. Required by every successful bound-document load;
+   * optional here only for narrow injected diagnostic/test seams.
+   */
   natsUrl?: string;
   issuer?: string;
   /** Present on every successful v2 load; optional only for injected test seams. */
@@ -384,33 +388,51 @@ function parsePayload(candidate: unknown): ParsedPayload {
   const relayPresent =
     Boolean(enrollment) &&
     Object.prototype.hasOwnProperty.call(enrollment, "natsUrl");
-  if (
-    relayPresent &&
-    !isNonEmptyString(enrollment?.natsUrl)
-  ) {
+  // A reusable enrolled v2 document must carry the relay delivered alongside
+  // its credentials. Treat absent/null/empty alike as invalid provenance:
+  // binding relay=null must never authorize dialing a current config fallback.
+  if (!relayPresent || !isNonEmptyString(enrollment?.natsUrl)) {
     fields.push("enrollment.natsUrl");
   }
   if (fields.length > 0) throw new InvalidCredentialPayload(fields);
 
   const encodedPublicKey = publicKey as string;
   const encodedPrivateKey = privateKey as string;
+  const decodedPublicKey = new Uint8Array(
+    Buffer.from(encodedPublicKey, "base64url"),
+  );
+  const decodedPrivateKey = new Uint8Array(
+    Buffer.from(encodedPrivateKey, "base64url"),
+  );
+  let derivedPublicKey: Uint8Array;
+  try {
+    derivedPublicKey = derivePublicKey(decodedPrivateKey);
+  } catch {
+    throw new InvalidCredentialPayload(["identityKey.privateKey"]);
+  }
+  if (!Buffer.from(derivedPublicKey).equals(Buffer.from(decodedPublicKey))) {
+    throw new InvalidCredentialPayload([
+      "identityKey.publicKey",
+      "identityKey.privateKey",
+    ]);
+  }
   const document = candidate as PluginCredentialDocument;
   const persisted = document.enrollment!;
   const identityKeyPair = Object.freeze({
-    publicKey: new Uint8Array(Buffer.from(encodedPublicKey, "base64url")),
-    privateKey: new Uint8Array(Buffer.from(encodedPrivateKey, "base64url")),
+    publicKey: decodedPublicKey,
+    privateKey: decodedPrivateKey,
   });
   const credentials = Object.freeze({
     userJwt: persisted.creds.userJwt,
     userSeed: persisted.creds.userSeed,
-    ...(relayPresent ? { natsUrl: persisted.natsUrl! } : {}),
+    natsUrl: persisted.natsUrl!,
     ...(issuerPresent ? { issuer: persisted.issuer! } : {}),
     identityKey: identityKeyPair,
   });
   return {
     document,
     deliveredIssuer: issuerPresent ? persisted.issuer! : null,
-    relayUrl: relayPresent ? persisted.natsUrl! : null,
+    relayUrl: persisted.natsUrl!,
     agentPublicKey: encodedPublicKey,
     credentials,
   };

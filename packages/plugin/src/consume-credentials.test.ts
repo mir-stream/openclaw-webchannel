@@ -22,6 +22,7 @@ function matching(
     credentials: {
       userJwt: "JWT",
       userSeed: "SEED",
+      natsUrl: "wss://bound-relay",
       identityKey,
       ...overrides,
     },
@@ -55,12 +56,11 @@ describe("consumeCredentialSource", () => {
 
     expect(result.status).toBe("connected");
     expect(createEnrolled).not.toHaveBeenCalled();
-    // Connected via the static branch with the persisted creds. With NO persisted
-    // natsUrl (pre-delivery creds), the resolver's `source.url` is the fallback.
+    // Connected via the static branch with the persisted, identity-bound relay.
     expect(transportFactory).toHaveBeenCalledWith(
-      expect.objectContaining({ url: "ws://relay", jwtCredential: "JWT" }),
+      expect.objectContaining({ url: "wss://bound-relay", jwtCredential: "JWT" }),
     );
-    if (result.status === "connected") expect(result.dialedUrl).toBe("ws://relay");
+    if (result.status === "connected") expect(result.dialedUrl).toBe("wss://bound-relay");
   });
 
   it("enrolled + persisted natsUrl → dials the SaaS-delivered URL, NOT source.url", async () => {
@@ -98,6 +98,31 @@ describe("consumeCredentialSource", () => {
     if (result.status === "connected") {
       expect(result.dialedUrl).toBe("wss://saas-delivered-relay");
     }
+  });
+
+  it("fails closed when an injected matching loader omits relay provenance", async () => {
+    const transportFactory = vi.fn();
+    const source: NatsCredentialSource = {
+      mode: "enrolled",
+      url: "ws://configured-fallback",
+      saasBaseUrl: "http://s",
+      tenant: "t",
+      accountId: "a",
+    };
+    const result = await consumeCredentialSource(source, "acctA", {
+      transportFactory,
+      loadPersisted: () => matching({ natsUrl: undefined }),
+    });
+    expect(result).toEqual({
+      status: "creds-binding-failed",
+      accountId: "acctA",
+      failure: {
+        status: "invalid",
+        code: "invalid-document",
+        fields: ["enrollment.natsUrl"],
+      },
+    });
+    expect(transportFactory).not.toHaveBeenCalled();
   });
 
   it("F2: enrolled + persisted identityKey → surfaced on the connected result", async () => {
@@ -196,18 +221,17 @@ describe("resolveDialMaterial (probe-safe)", () => {
     expect(resolveDialMaterial({ ...base, natsConfig: { url: "ws://static", credentials: { mode: "static", userJwt: "J", userSeed: "S" } } }).status).toBe("invalid");
   });
 
-  it("prefers delivered relay URL and uses configured fallback", () => {
-    const enrolled = (natsUrl?: string) => resolveDialMaterial({
+  it("always uses the delivered bound relay URL", () => {
+    const enrolled = (natsUrl: string) => resolveDialMaterial({
       ...base,
       natsConfig: { url: "ws://configured" },
       loadCreds: () => matching({
         userJwt: "J",
         userSeed: "S",
-        ...(natsUrl ? { natsUrl } : {}),
+        natsUrl,
       }),
     });
     expect(enrolled("wss://delivered")).toMatchObject({ status: "ok", dial: { url: "wss://delivered" } });
-    expect(enrolled()).toMatchObject({ status: "ok", dial: { url: "ws://configured" } });
   });
 
   it("maps absent persisted creds to creds-missing and resolver throws to invalid", () => {

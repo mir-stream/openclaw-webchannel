@@ -130,6 +130,36 @@ export type ResolveNatsCredentialSourceInput = {
 const DEFAULT_NATS_URL = "ws://127.0.0.1:4222";
 const DEFAULT_SAAS_BASE_URL = "http://localhost:3001";
 
+export type ResolveEnrolledSaasBaseUrlInput = {
+  natsConfig?: WebchannelNatsConfig;
+  /** Lowest-precedence config-level SaaS base URL. */
+  saasBaseUrl?: string;
+  /** Env bag (defaults to process.env). */
+  env?: Record<string, string | undefined>;
+  /** Optional final fallback; runtime supplies its built-in default. */
+  fallback?: string;
+};
+
+/**
+ * Resolve the effective enrolled-mode SaaS base URL everywhere credential
+ * binding is checked.
+ *
+ * Precedence is intentionally centralized so setup/status cannot accept or
+ * acquire credentials for one authority while runtime/doctor expects another:
+ * env > nats.credentials override > account/top-level SaaS config > fallback.
+ */
+export function resolveEnrolledSaasBaseUrl(
+  input: ResolveEnrolledSaasBaseUrlInput,
+): string | undefined {
+  const env = input.env ?? process.env;
+  return (
+    env["WEBCHANNEL_SAAS_BASE_URL"] ??
+    input.natsConfig?.credentials?.saasBaseUrl ??
+    input.saasBaseUrl ??
+    input.fallback
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Secret + creds-file helpers
 // ---------------------------------------------------------------------------
@@ -319,11 +349,14 @@ export function resolveNatsCredentialSource(
   // set by an operator is actually honored (previously it was silently ignored):
   //   env WEBCHANNEL_SAAS_BASE_URL > nats.credentials.saasBaseUrl
   //     > top-level api.config.saas?.baseUrl (input.saasBaseUrl) > default.
-  const saasBaseUrl =
-    env["WEBCHANNEL_SAAS_BASE_URL"] ??
-    creds?.saasBaseUrl ??
-    input.saasBaseUrl ??
-    DEFAULT_SAAS_BASE_URL;
+  const saasBaseUrl = resolveEnrolledSaasBaseUrl({
+    ...(nats !== undefined ? { natsConfig: nats } : {}),
+    ...(input.saasBaseUrl !== undefined
+      ? { saasBaseUrl: input.saasBaseUrl }
+      : {}),
+    env,
+    fallback: DEFAULT_SAAS_BASE_URL,
+  })!;
   return {
     mode: "enrolled",
     url,

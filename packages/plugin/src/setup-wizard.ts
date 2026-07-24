@@ -48,6 +48,10 @@ import {
   resolveAcquisitionIdentity,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
+import {
+  resolveEnrolledSaasBaseUrl,
+  type WebchannelNatsConfig,
+} from "./nats-credential-source.js";
 import { webchannelSetup } from "./setup.js";
 
 /**
@@ -98,18 +102,28 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     resolveConfigured: ({ cfg, accountId }) => {
       const id = canonicalizeAccountId(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
       const account = resolveWebchannelAccountConfig(cfg, id);
-      const hasJwt = Boolean((account.auth as { jwt?: unknown } | undefined)?.jwt);
-      if (hasJwt) return true;
+      const mode =
+        (account.nats as WebchannelNatsConfig | undefined)?.credentials?.mode ??
+        "enrolled";
+      if (mode !== "enrolled") {
+        return Boolean((account.auth as { jwt?: unknown } | undefined)?.jwt);
+      }
       // A path by itself is not readiness. Count enrolled material only when
       // its complete v2 identity matches the effective configured account.
       if (!existsSync(accountCredentialPath(id))) return false;
       const identity = resolveAcquisitionIdentity(cfg, id);
-      if (!identity.saasBaseUrl) return false;
+      const saasBaseUrl = resolveEnrolledSaasBaseUrl({
+        natsConfig: account.nats as WebchannelNatsConfig | undefined,
+        ...(identity.saasBaseUrl !== undefined
+          ? { saasBaseUrl: identity.saasBaseUrl }
+          : {}),
+      });
+      if (!saasBaseUrl) return false;
       try {
         return loadPersistedCredentialDocument({
           tenant: identity.tenant,
           accountId: id,
-          saasBaseUrl: identity.saasBaseUrl,
+          saasBaseUrl,
         }).status === "match";
       } catch {
         // Invalid effective identity is unconfigured; status inspection must not

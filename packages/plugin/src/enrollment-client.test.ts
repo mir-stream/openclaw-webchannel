@@ -31,6 +31,7 @@ import {
   CREDENTIAL_BINDING_IDENTITY_FIELD,
   createCredentialIdentityForEnrollment,
 } from "./credential-document.js";
+import { generateKeyPair } from "./e2e-crypto.js";
 
 // ---------------------------------------------------------------------------
 // Test utilities
@@ -153,6 +154,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -194,6 +196,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -252,6 +255,7 @@ describe("EnrollmentClient", () => {
             peerId: "mock-peer-id",
             jwksUrl: "https://saas.com/.well-known/jwks.json",
             bootstrapUrl: "https://saas.com/bootstrap",
+            natsUrl: "wss://nats.saas.com",
           }),
         });
 
@@ -291,6 +295,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -307,6 +312,7 @@ describe("EnrollmentClient", () => {
           tenant: "test-tenant",
           accountId: "test-agent",
           saasBaseUrl: "https://saas.com",
+          relayUrl: "wss://nats.saas.com",
           agentPublicKey: persisted.identityKey.publicKey,
         }),
       );
@@ -315,7 +321,9 @@ describe("EnrollmentClient", () => {
 
   describe("enroll() - reconnection", () => {
     it("should load existing credentials and skip enrollment", async () => {
-      const key = Buffer.alloc(32, 7).toString("base64url");
+      const pair = generateKeyPair();
+      const key = Buffer.from(pair.publicKey).toString("base64url");
+      const privateKey = Buffer.from(pair.privateKey).toString("base64url");
       // Create mock credentials file
       const mockCredentials = {
         [CREDENTIAL_BINDING_IDENTITY_FIELD]:
@@ -323,11 +331,12 @@ describe("EnrollmentClient", () => {
             tenant: "test-tenant",
             accountId: "test-agent",
             saasBaseUrl: "https://saas.com",
+            relayUrl: "wss://nats.saas.com",
             agentPublicKey: key,
           }),
         identityKey: {
           publicKey: key,
-          privateKey: key,
+          privateKey,
         },
         enrollment: {
           creds: {
@@ -337,6 +346,7 @@ describe("EnrollmentClient", () => {
           peerId: "stored-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         },
         accountId: "test-agent",
         tenant: "test-tenant",
@@ -365,14 +375,17 @@ describe("EnrollmentClient", () => {
     });
 
     it("rejects a legacy unbound file without enrollment or overwrite", async () => {
-      const key = Buffer.alloc(32, 7).toString("base64url");
+      const pair = generateKeyPair();
+      const key = Buffer.from(pair.publicKey).toString("base64url");
+      const privateKey = Buffer.from(pair.privateKey).toString("base64url");
       const legacy = {
-        identityKey: { publicKey: key, privateKey: key },
+        identityKey: { publicKey: key, privateKey },
         enrollment: {
           creds: { userJwt: "LEGACY-JWT", userSeed: "LEGACY-SEED" },
           peerId: "legacy",
           jwksUrl: "https://saas.com/jwks",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         },
         accountId: "test-agent",
         tenant: "test-tenant",
@@ -513,6 +526,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -572,6 +586,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -616,6 +631,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -701,6 +717,36 @@ describe("EnrollmentClient", () => {
       expect(existsSync(credentialPath)).toBe(false);
     });
 
+    it("does not persist a successful enrollment response without a delivered relay", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: "test_device_code",
+          user_code: "ABCD-1234",
+          verification_uri: "https://saas.com/enroll",
+          verification_uri_complete:
+            "https://saas.com/enroll?user_code=ABCD-1234",
+          expires_in: 600,
+          interval: 5,
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          creds: { userJwt: "SECRET-JWT", userSeed: "SECRET-SEED" },
+          peerId: "mock-peer-id",
+          jwksUrl: "https://saas.com/.well-known/jwks.json",
+          bootstrapUrl: "https://saas.com/bootstrap",
+        }),
+      });
+
+      await expect(client.enroll()).rejects.toMatchObject({
+        code: "credentials-invalid-invalid-document",
+        fields: ["enrollment.natsUrl"],
+      });
+      expect(existsSync(credentialPath)).toBe(false);
+    });
+
     it("should throw on enrollment expiration", async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
@@ -738,6 +784,38 @@ describe("EnrollmentClient", () => {
   });
 
   describe("Credential persistence", () => {
+    it("never overwrites a credential file created while enrollment is polling", async () => {
+      const concurrentDocument = "concurrently-created-credential-document";
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: "test_device_code",
+          user_code: "ABCD-1234",
+          verification_uri: "https://saas.com/enroll",
+          verification_uri_complete:
+            "https://saas.com/enroll?user_code=ABCD-1234",
+          expires_in: 600,
+          interval: 5,
+        }),
+      });
+      mockFetch.mockImplementationOnce(async () => {
+        writeFileSync(credentialPath, concurrentDocument);
+        return {
+          ok: true,
+          json: async () => ({
+            creds: { userJwt: "new-jwt", userSeed: "new-seed" },
+            peerId: "new-peer",
+            jwksUrl: "https://saas.com/.well-known/jwks.json",
+            bootstrapUrl: "https://saas.com/bootstrap",
+            natsUrl: "wss://nats.saas.com",
+          }),
+        };
+      });
+
+      await expect(client.enroll()).rejects.toMatchObject({ code: "EEXIST" });
+      expect(readFileSync(credentialPath, "utf8")).toBe(concurrentDocument);
+    });
+
     it("should create credential directory if missing", async () => {
       const options = createTestOptions({
         credentialPath: join(tmpdir(), `openclaw-test-${Date.now()}-nested`, "nested", "credentials.json"),
@@ -767,6 +845,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -803,6 +882,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
