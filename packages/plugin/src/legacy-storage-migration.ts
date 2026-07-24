@@ -423,10 +423,49 @@ function migrateExactCredentialSource(input: {
     SOURCE_DIRECTORY_NAME,
   );
   const legacySourceWasArchived = existsSync(archivedLegacyDirectory);
+  let allowedLinkedLegacyCredential: FilesystemIdentity | undefined;
+  if (
+    exactJournal &&
+    exactSourceIsArchived &&
+    !legacySourceWasArchived &&
+    resolvePath(input.liveCredentialPath) ===
+      resolvePath(input.legacy.credentialPath) &&
+    existsSync(input.liveCredentialPath)
+  ) {
+    try {
+      const live = lstatSync(input.liveCredentialPath);
+      const archived = lstatSync(input.archivedExactCredential);
+      if (
+        live.isSymbolicLink() ||
+        archived.isSymbolicLink() ||
+        !live.isFile() ||
+        !archived.isFile() ||
+        live.nlink !== 2 ||
+        archived.nlink !== 2 ||
+        !sameInode(live, archived) ||
+        live.dev !== exactJournal.sourceDev ||
+        live.ino !== exactJournal.sourceIno
+      ) {
+        throw new Error("invalid linked exact source");
+      }
+      allowedLinkedLegacyCredential = Object.freeze({
+        dev: live.dev,
+        ino: live.ino,
+      });
+    } catch {
+      throw new StorageDocumentError(
+        "credentials",
+        "legacy-migration-failed",
+      );
+    }
+  }
   const legacySourceDirectory = legacySourceWasArchived
     ? archivedLegacyDirectory
     : input.legacy.directory;
-  const legacySource = inspectLegacySourceDirectory(legacySourceDirectory);
+  const legacySource = inspectLegacySourceDirectory(
+    legacySourceDirectory,
+    allowedLinkedLegacyCredential,
+  );
   const legacyCredentialPath = legacySourceWasArchived
     ? join(archivedLegacyDirectory, "credentials.json")
     : input.legacy.credentialPath;
@@ -437,7 +476,9 @@ function migrateExactCredentialSource(input: {
   // A bare-account credential is independent ownership evidence. If present,
   // it must agree with the exact override's complete storage/binding identity
   // before that override may authorize adoption of collocated legacy keys.
-  const legacyCredential = legacySource?.credential
+  const legacyCredential = allowedLinkedLegacyCredential
+    ? { status: "owned" as const, upgraded: exactCredential.upgraded }
+    : legacySource?.credential
     ? inspectLegacyCredential(
         legacyCredentialPath,
         input.scope,
@@ -1044,10 +1085,12 @@ function hardenArchivedSource(
 
 function inspectLegacySourceDirectory(
   directory: string,
+  allowedLinkedCredential?: FilesystemIdentity,
 ): LegacySourceIdentity | undefined {
   const inspect = (
     path: string,
     kind: "directory" | "file",
+    allowedLinkedFile?: FilesystemIdentity,
   ): FilesystemIdentity | undefined => {
     let entry: ReturnType<typeof lstatSync>;
     try {
@@ -1059,7 +1102,13 @@ function inspectLegacySourceDirectory(
     if (
       entry.isSymbolicLink() ||
       (kind === "directory" ? !entry.isDirectory() : !entry.isFile()) ||
-      (kind === "file" && entry.nlink !== 1)
+      (kind === "file" &&
+        entry.nlink !== 1 &&
+        !(
+          entry.nlink === 2 &&
+          allowedLinkedFile?.dev === entry.dev &&
+          allowedLinkedFile.ino === entry.ino
+        ))
     ) {
       throw new Error("unsafe legacy source");
     }
@@ -1068,7 +1117,11 @@ function inspectLegacySourceDirectory(
   try {
     const directoryIdentity = inspect(directory, "directory");
     if (!directoryIdentity) return undefined;
-    const credential = inspect(join(directory, "credentials.json"), "file");
+    const credential = inspect(
+      join(directory, "credentials.json"),
+      "file",
+      allowedLinkedCredential,
+    );
     const conversationKeys = inspect(
       join(directory, "conversation-keys.json"),
       "file",
