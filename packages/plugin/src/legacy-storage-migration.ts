@@ -53,6 +53,7 @@ import {
 } from "./storage-document.js";
 
 const BACKUP_DIRECTORY_NAME = ".legacy-v1-backups";
+const ACCOUNT_MUTEX_PREFIX = ".account-migration-mutex-";
 const CLAIM_FILE_NAME = "migration-claim.json";
 const SOURCE_DIRECTORY_NAME = "source";
 const EXACT_SOURCE_FILE_NAME = "exact-credentials.json";
@@ -65,6 +66,12 @@ type ClaimFile = {
   version: 2;
   storageIdentity: StorageIdentityV2;
   ownerPid: number;
+};
+
+type AccountMutexFile = {
+  version: 1;
+  ownerPid: number;
+  token: string;
 };
 
 type CompletionFile = {
@@ -108,6 +115,8 @@ export type LegacyMigrationResult = Readonly<{
 }>;
 
 export type LegacyMigrationOptions = CredentialPathOptions & {
+  /** @internal Test-only seam inside the account claim critical section. */
+  _afterAccountMutex?: () => void;
   /** @internal Test-only seam after an exclusive claim and before source move. */
   _afterClaim?: () => void;
   /** @internal Test-only seam after durable source move and before publication. */
@@ -180,6 +189,9 @@ export function migrateLegacyTupleState(
       legacy,
       conversationKeyDestination: destination.conversationKeyPath,
       resumed: true,
+      ...(options._afterAccountMutex
+        ? { afterAccountMutex: options._afterAccountMutex }
+        : {}),
       ...(options._afterClaim ? { afterClaim: options._afterClaim } : {}),
       ...(options._afterSourceMove
         ? { afterSourceMove: options._afterSourceMove }
@@ -208,6 +220,9 @@ export function migrateLegacyTupleState(
         conversationKeyDestination: destination.conversationKeyPath,
         resumed: false,
         exactCredential,
+        ...(options._afterAccountMutex
+          ? { afterAccountMutex: options._afterAccountMutex }
+          : {}),
         ...(options._afterClaim ? { afterClaim: options._afterClaim } : {}),
         ...(options._afterSourceMove
           ? { afterSourceMove: options._afterSourceMove }
@@ -226,8 +241,13 @@ export function migrateLegacyTupleState(
   );
 
   if (existsSync(archivedSource)) {
-    assertNoLiveForeignClaim(backupRoot, options.accountId, claimDirectory);
-    claimMigration(claimDirectory, destination.scope);
+    claimMigrationForAccount(
+      backupRoot,
+      options.accountId,
+      claimDirectory,
+      destination.scope,
+      options._afterAccountMutex,
+    );
     return migrateProvenArchive({
       scope: destination.scope,
       claimDirectory,
@@ -327,8 +347,13 @@ export function migrateLegacyTupleState(
     upgradedCredential,
     legacyKeys ?? new Map(),
   );
-  assertNoLiveForeignClaim(backupRoot, options.accountId, claimDirectory);
-  claimMigration(claimDirectory, destination.scope);
+  claimMigrationForAccount(
+    backupRoot,
+    options.accountId,
+    claimDirectory,
+    destination.scope,
+    options._afterAccountMutex,
+  );
   options._afterClaim?.();
 
   try {
@@ -381,6 +406,7 @@ function migrateExactCredentialSource(input: {
     upgraded: ReturnType<typeof upgradeLegacyCredentialDocument>;
     source: ExactCredentialSource;
   };
+  afterAccountMutex?: () => void;
   afterClaim?: () => void;
   afterSourceMove?: () => void;
   linkExactSource?: (sourcePath: string, archivePath: string) => void;
@@ -533,12 +559,13 @@ function migrateExactCredentialSource(input: {
     }
   }
 
-  assertNoLiveForeignClaim(
+  claimMigrationForAccount(
     input.backupRoot,
     input.scope.accountId,
     input.claimDirectory,
+    input.scope,
+    input.afterAccountMutex,
   );
-  claimMigration(input.claimDirectory, input.scope);
   const authorizedSource: ExactCredentialSource = exactJournal
     ? Object.freeze({
         bytes: exactCredential.source.bytes,
@@ -1322,6 +1349,119 @@ function isStorageIdentityError(
       error.code === "identity-invalid" ||
       error.code === "identity-mismatch")
   );
+}
+
+function claimMigrationForAccount(
+  backupRoot: string,
+  accountId: string,
+  claimDirectory: string,
+  scope: StorageIdentityV2["storage"],
+  afterAccountMutex?: () => void,
+): void {
+  const mutex = acquireAccountMutex(backupRoot, accountId);
+  try {
+    afterAccountMutex?.();
+    assertNoLiveForeignClaim(backupRoot, accountId, claimDirectory);
+    claimMigration(claimDirectory, scope);
+  } finally {
+    releaseAccountMutex(backupRoot, mutex);
+  }
+}
+
+function acquireAccountMutex(
+  backupRoot: string,
+  accountId: string,
+): Readonly<{ path: string; token: string }> {
+  try {
+    ensurePrivateDirectory(backupRoot, true);
+  } catch {
+    throw new StorageDocumentError("credentials", "legacy-claim-conflict");
+  }
+  const path = join(
+    backupRoot,
+    `${ACCOUNT_MUTEX_PREFIX}` +
+      `${createHash("sha256").update(accountId).digest("base64url")}.json`,
+  );
+  const token = randomBytes(16).toString("hex");
+  const serialized = JSON.stringify({
+    version: 1,
+    ownerPid: process.pid,
+    token,
+  } satisfies AccountMutexFile);
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      atomicWritePrivateFile(path, serialized, {
+        replace: false,
+        enforceDirectoryMode: true,
+      });
+      return Object.freeze({ path, token });
+    } catch (error) {
+      if (!isEexist(error)) {
+        throw new StorageDocumentError(
+          "credentials",
+          "legacy-claim-conflict",
+        );
+      }
+    }
+
+    const owner = readAccountMutex(path);
+    if (processIsAlive(owner.ownerPid)) {
+      throw new StorageDocumentError(
+        "credentials",
+        "legacy-claim-conflict",
+      );
+    }
+    try {
+      archiveFileNoReplace(
+        path,
+        `${path}.stale-${owner.ownerPid}-${randomBytes(8).toString("hex")}`,
+      );
+    } catch (error) {
+      if (isEnoent(error)) continue;
+      throw new StorageDocumentError(
+        "credentials",
+        "legacy-claim-conflict",
+      );
+    }
+  }
+  throw new StorageDocumentError("credentials", "legacy-claim-conflict");
+}
+
+function releaseAccountMutex(
+  backupRoot: string,
+  mutex: Readonly<{ path: string; token: string }>,
+): void {
+  const owner = readAccountMutex(mutex.path);
+  if (owner.ownerPid !== process.pid || owner.token !== mutex.token) {
+    throw new StorageDocumentError("credentials", "legacy-claim-conflict");
+  }
+  try {
+    unlinkSync(mutex.path);
+    fsyncDirectoryBestEffort(backupRoot);
+  } catch {
+    throw new StorageDocumentError("credentials", "legacy-claim-conflict");
+  }
+}
+
+function readAccountMutex(path: string): AccountMutexFile {
+  try {
+    const candidate = JSON.parse(
+      readFileSync(path, "utf8"),
+    ) as Partial<AccountMutexFile>;
+    if (
+      candidate.version !== 1 ||
+      !Number.isSafeInteger(candidate.ownerPid) ||
+      (candidate.ownerPid ?? 0) <= 0 ||
+      typeof candidate.token !== "string" ||
+      !/^[a-f0-9]{32}$/.test(candidate.token)
+    ) {
+      throw new Error("invalid account mutex");
+    }
+    return candidate as AccountMutexFile;
+  } catch {
+    throw new StorageDocumentError("credentials", "legacy-claim-conflict");
+  }
 }
 
 function claimMigration(
