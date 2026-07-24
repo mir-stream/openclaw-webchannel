@@ -1,10 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
+  constants,
   type Dirent,
   existsSync,
+  fchmodSync,
+  fstatSync,
   linkSync,
   lstatSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -82,6 +87,13 @@ type ExactCredentialSource = Readonly<{
   bytes: Buffer;
   dev: number;
   ino: number;
+}>;
+
+type FilesystemIdentity = Readonly<{ dev: number; ino: number }>;
+type LegacySourceIdentity = Readonly<{
+  directory: FilesystemIdentity;
+  credential?: FilesystemIdentity;
+  conversationKeys?: FilesystemIdentity;
 }>;
 
 export type LegacyMigrationResult = Readonly<{
@@ -182,6 +194,7 @@ export function migrateLegacyTupleState(
     const exactCredential = inspectExactLegacyCredential(
       credentialDestination,
       destination.scope,
+      true,
     );
     if (exactCredential.status === "owned") {
       return migrateExactCredentialSource({
@@ -227,10 +240,14 @@ export function migrateLegacyTupleState(
     });
   }
 
-  const liveCredential = inspectLegacyCredential(
-    legacy.credentialPath,
-    destination.scope,
-  );
+  const liveSource = inspectLegacySourceDirectory(legacy.directory);
+  const liveCredential = liveSource?.credential
+    ? inspectLegacyCredential(
+        legacy.credentialPath,
+        destination.scope,
+        liveSource.credential,
+      )
+    : { status: "absent" as const };
   if (liveCredential.status === "other-owner") {
     return Object.freeze({
       status: "owned-by-other",
@@ -239,11 +256,12 @@ export function migrateLegacyTupleState(
     });
   }
 
-  const legacyConversationExists = existsSync(legacy.conversationKeyPath);
+  const legacyConversationExists = liveSource?.conversationKeys !== undefined;
   const legacyKeys = legacyConversationExists
     ? readLegacyConversationKeys(
         legacy.conversationKeyPath,
         destination.scope,
+        liveSource.conversationKeys,
       )
     : null;
 
@@ -275,6 +293,13 @@ export function migrateLegacyTupleState(
       `${legacy.conversationKeyPath}.ambiguous-v2-` +
       `${destination.namespaceId}-${randomBytes(8).toString("hex")}`;
     try {
+      if (!liveSource) {
+        throw new StorageDocumentError(
+          "conversation-keys",
+          "legacy-migration-failed",
+        );
+      }
+      assertLegacySourceAtPath(legacy.directory, liveSource);
       archiveFileNoReplace(legacy.conversationKeyPath, archive);
       publishEmptyConversationStore(
         destination.scope,
@@ -308,12 +333,20 @@ export function migrateLegacyTupleState(
 
   try {
     if (!existsSync(archivedSource)) {
+      if (!liveSource) {
+        throw new StorageDocumentError(
+          "credentials",
+          "legacy-migration-failed",
+        );
+      }
+      assertLegacySourceAtPath(legacy.directory, liveSource);
       renameSync(legacy.directory, archivedSource);
       // Make both halves of the cross-directory rename durable before any v2
       // destination is published. Directory fsync remains best-effort on
       // platforms that do not support it.
       fsyncDirectoryBestEffort(legacy.root);
       fsyncDirectoryBestEffort(claimDirectory);
+      assertLegacySourceAtPath(archivedSource, liveSource);
     }
   } catch {
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
@@ -329,6 +362,7 @@ export function migrateLegacyTupleState(
       credentialDestination === destination.credentialPath,
     conversationKeyDestination: destination.conversationKeyPath,
     resumed: false,
+    sourceIdentity: liveSource,
   });
 }
 
@@ -364,12 +398,14 @@ function migrateExactCredentialSource(input: {
     ? readExactSourceFile(input.exactSourceMetadata, input.scope, pathHash)
     : undefined;
 
+  const exactSourceIsArchived = existsSync(input.archivedExactCredential);
   const exactCredential = input.exactCredential ??
     inspectExactLegacyCredential(
-      existsSync(input.archivedExactCredential)
+      exactSourceIsArchived
         ? input.archivedExactCredential
         : input.liveCredentialPath,
       input.scope,
+      !exactSourceIsArchived,
     );
   if (exactCredential.status !== "owned") {
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
@@ -386,20 +422,28 @@ function migrateExactCredentialSource(input: {
     input.claimDirectory,
     SOURCE_DIRECTORY_NAME,
   );
-  const legacyCredentialPath = existsSync(archivedLegacyDirectory)
+  const legacySourceWasArchived = existsSync(archivedLegacyDirectory);
+  const legacySourceDirectory = legacySourceWasArchived
+    ? archivedLegacyDirectory
+    : input.legacy.directory;
+  const legacySource = inspectLegacySourceDirectory(legacySourceDirectory);
+  const legacyCredentialPath = legacySourceWasArchived
     ? join(archivedLegacyDirectory, "credentials.json")
     : input.legacy.credentialPath;
-  const legacyConversationPath = existsSync(archivedLegacyDirectory)
+  const legacyConversationPath = legacySourceWasArchived
     ? join(archivedLegacyDirectory, "conversation-keys.json")
     : input.legacy.conversationKeyPath;
 
   // A bare-account credential is independent ownership evidence. If present,
   // it must agree with the exact override's complete storage/binding identity
   // before that override may authorize adoption of collocated legacy keys.
-  const legacyCredential = inspectLegacyCredential(
-    legacyCredentialPath,
-    input.scope,
-  );
+  const legacyCredential = legacySource?.credential
+    ? inspectLegacyCredential(
+        legacyCredentialPath,
+        input.scope,
+        legacySource.credential,
+      )
+    : { status: "absent" as const };
   if (
     legacyCredential.status !== "absent" &&
     (legacyCredential.status !== "owned" ||
@@ -411,11 +455,13 @@ function migrateExactCredentialSource(input: {
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
   }
 
-  const legacyConversationExists = existsSync(legacyConversationPath);
+  const legacyConversationExists =
+    legacySource?.conversationKeys !== undefined;
   const legacyKeys = legacyConversationExists
     ? readLegacyConversationKeys(
         legacyConversationPath,
         input.scope,
+        legacySource.conversationKeys,
       )
     : null;
   if (existsSync(input.conversationKeyDestination)) {
@@ -492,14 +538,31 @@ function migrateExactCredentialSource(input: {
   ) {
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
   }
+  const movableLegacySource: LegacySourceIdentity | undefined =
+    legacySource &&
+    !legacySourceWasArchived &&
+    resolvePath(input.liveCredentialPath) ===
+      resolvePath(input.legacy.credentialPath)
+      ? Object.freeze({
+          directory: legacySource.directory,
+          ...(legacySource.conversationKeys
+            ? { conversationKeys: legacySource.conversationKeys }
+            : {}),
+        })
+      : legacySource;
   try {
     if (
-      existsSync(input.legacy.directory) &&
-      !existsSync(archivedLegacyDirectory)
+      movableLegacySource &&
+      !legacySourceWasArchived
     ) {
+      assertLegacySourceAtPath(input.legacy.directory, movableLegacySource);
       renameSync(input.legacy.directory, archivedLegacyDirectory);
       fsyncDirectoryBestEffort(input.legacy.root);
       fsyncDirectoryBestEffort(input.claimDirectory);
+      assertLegacySourceAtPath(
+        archivedLegacyDirectory,
+        movableLegacySource,
+      );
     }
   } catch {
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
@@ -508,22 +571,12 @@ function migrateExactCredentialSource(input: {
 
   try {
     chmodSync(input.archivedExactCredential, 0o600);
-    if (existsSync(archivedLegacyDirectory)) {
-      const archivedLegacyCredential = join(
+    if (movableLegacySource) {
+      hardenArchivedSource(
         archivedLegacyDirectory,
-        "credentials.json",
+        movableLegacySource,
+        false,
       );
-      chmodSync(archivedLegacyDirectory, 0o700);
-      if (existsSync(archivedLegacyCredential)) {
-        chmodSync(archivedLegacyCredential, 0o600);
-      }
-      const archivedLegacyConversation = join(
-        archivedLegacyDirectory,
-        "conversation-keys.json",
-      );
-      if (existsSync(archivedLegacyConversation)) {
-        chmodSync(archivedLegacyConversation, 0o600);
-      }
     }
     publishCredential(
       input.scope,
@@ -572,6 +625,7 @@ function migrateExactCredentialSource(input: {
 function inspectExactLegacyCredential(
   credentialPath: string,
   scope: StorageIdentityV2["storage"],
+  requireSingleLink = false,
 ):
   | { status: "absent" | "not-legacy" }
   | {
@@ -611,6 +665,12 @@ function inspectExactLegacyCredential(
     !legacyCredentialProvesScope(scope, candidate)
   ) {
     return { status: "not-legacy" };
+  }
+  if (requireSingleLink && (before.nlink !== 1 || after.nlink !== 1)) {
+    throw new StorageDocumentError(
+      "credentials",
+      "legacy-migration-failed",
+    );
   }
   try {
     return {
@@ -850,26 +910,44 @@ function migrateProvenArchive(input: {
   enforceCredentialDirectoryMode: boolean;
   conversationKeyDestination: string;
   resumed: boolean;
+  sourceIdentity?: LegacySourceIdentity;
 }): LegacyMigrationResult {
   const sourceCredentialPath = join(input.sourceDirectory, "credentials.json");
   const sourceConversationPath = join(
     input.sourceDirectory,
     "conversation-keys.json",
   );
+  const sourceIdentity =
+    input.sourceIdentity ??
+    inspectLegacySourceDirectory(input.sourceDirectory);
+  if (!sourceIdentity?.credential) {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+  assertLegacySourceAtPath(input.sourceDirectory, sourceIdentity);
 
   let upgradedCredential: ReturnType<typeof upgradeLegacyCredentialDocument>;
   try {
     upgradedCredential = upgradeLegacyCredentialDocument(
       input.scope,
-      parseCredentialJson(readFileSync(sourceCredentialPath, "utf8")),
+      parseCredentialJson(
+        readBoundSecretFile(
+          sourceCredentialPath,
+          sourceIdentity.credential,
+          "credentials",
+        ),
+      ),
     );
   } catch (error) {
     if (isStorageIdentityError(error)) throw error;
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
   }
 
-  const legacyKeys = existsSync(sourceConversationPath)
-    ? readLegacyConversationKeys(sourceConversationPath, input.scope)
+  const legacyKeys = sourceIdentity.conversationKeys
+    ? readLegacyConversationKeys(
+        sourceConversationPath,
+        input.scope,
+        sourceIdentity.conversationKeys,
+      )
     : null;
 
   // The 0700 claim directory already protects the archived material. Validate
@@ -877,8 +955,7 @@ function migrateProvenArchive(input: {
   // the archive before either destination can be published.
   hardenArchivedSource(
     input.sourceDirectory,
-    sourceCredentialPath,
-    sourceConversationPath,
+    sourceIdentity,
   );
 
   try {
@@ -935,21 +1012,169 @@ function migrateProvenArchive(input: {
  */
 function hardenArchivedSource(
   sourceDirectory: string,
-  credentialPath: string,
-  conversationPath: string,
+  identity: LegacySourceIdentity,
+  credentialRequired = true,
 ): void {
   try {
-    chmodSync(sourceDirectory, 0o700);
-    chmodSync(credentialPath, 0o600);
-    if (existsSync(conversationPath)) chmodSync(conversationPath, 0o600);
+    assertLegacySourceAtPath(sourceDirectory, identity);
+    chmodBoundPath(sourceDirectory, identity.directory, 0o700, true);
+    if (!identity.credential && credentialRequired) {
+      throw new Error("missing credential identity");
+    }
+    if (identity.credential) {
+      chmodBoundPath(
+        join(sourceDirectory, "credentials.json"),
+        identity.credential,
+        0o600,
+        false,
+      );
+    }
+    if (identity.conversationKeys) {
+      chmodBoundPath(
+        join(sourceDirectory, "conversation-keys.json"),
+        identity.conversationKeys,
+        0o600,
+        false,
+      );
+    }
   } catch {
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+}
+
+function inspectLegacySourceDirectory(
+  directory: string,
+): LegacySourceIdentity | undefined {
+  const inspect = (
+    path: string,
+    kind: "directory" | "file",
+  ): FilesystemIdentity | undefined => {
+    let entry: ReturnType<typeof lstatSync>;
+    try {
+      entry = lstatSync(path);
+    } catch (error) {
+      if (isEnoent(error)) return undefined;
+      throw error;
+    }
+    if (
+      entry.isSymbolicLink() ||
+      (kind === "directory" ? !entry.isDirectory() : !entry.isFile()) ||
+      (kind === "file" && entry.nlink !== 1)
+    ) {
+      throw new Error("unsafe legacy source");
+    }
+    return Object.freeze({ dev: entry.dev, ino: entry.ino });
+  };
+  try {
+    const directoryIdentity = inspect(directory, "directory");
+    if (!directoryIdentity) return undefined;
+    const credential = inspect(join(directory, "credentials.json"), "file");
+    const conversationKeys = inspect(
+      join(directory, "conversation-keys.json"),
+      "file",
+    );
+    return Object.freeze({
+      directory: directoryIdentity,
+      ...(credential ? { credential } : {}),
+      ...(conversationKeys ? { conversationKeys } : {}),
+    });
+  } catch {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+}
+
+function assertLegacySourceAtPath(
+  directory: string,
+  expected: LegacySourceIdentity,
+): void {
+  const current = inspectLegacySourceDirectory(directory);
+  const same = (
+    left: FilesystemIdentity | undefined,
+    right: FilesystemIdentity | undefined,
+  ): boolean =>
+    left === undefined
+      ? right === undefined
+      : right !== undefined &&
+        left.dev === right.dev &&
+        left.ino === right.ino;
+  if (
+    !current ||
+    !same(current.directory, expected.directory) ||
+    !same(current.credential, expected.credential) ||
+    !same(
+      current.conversationKeys,
+      expected.conversationKeys,
+    )
+  ) {
+    throw new StorageDocumentError("credentials", "legacy-migration-failed");
+  }
+}
+
+function readBoundSecretFile(
+  path: string,
+  expected: FilesystemIdentity,
+  document: "credentials" | "conversation-keys",
+): string {
+  try {
+    return withBoundLegacySource(
+      path,
+      expected,
+      false,
+      (descriptor) => readFileSync(descriptor, "utf8"),
+    );
+  } catch {
+    throw new StorageDocumentError(document, "legacy-migration-failed");
+  }
+}
+
+function chmodBoundPath(
+  path: string,
+  expected: FilesystemIdentity,
+  mode: number,
+  directory: boolean,
+): void {
+  withBoundLegacySource(path, expected, directory, (descriptor) => {
+    fchmodSync(descriptor, mode);
+  });
+}
+
+function withBoundLegacySource<T>(
+  path: string,
+  expected: FilesystemIdentity,
+  directory: boolean,
+  action: (descriptor: number) => T,
+): T {
+  const descriptor = openSync(
+    path,
+    constants.O_RDONLY |
+      constants.O_NOFOLLOW |
+      (directory ? constants.O_DIRECTORY : 0),
+  );
+  const assertBound = (): void => {
+    const entry = fstatSync(descriptor);
+    if (
+      entry.dev !== expected.dev ||
+      entry.ino !== expected.ino ||
+      (directory ? !entry.isDirectory() : !entry.isFile()) ||
+      (!directory && entry.nlink !== 1)
+    ) {
+      throw new Error("legacy source changed");
+    }
+  };
+  try {
+    assertBound();
+    const result = action(descriptor);
+    assertBound();
+    return result;
+  } finally {
+    closeSync(descriptor);
   }
 }
 
 function inspectLegacyCredential(
   credentialPath: string,
   scope: StorageIdentityV2["storage"],
+  identity?: FilesystemIdentity,
 ):
   | { status: "absent" | "invalid" | "other-owner" }
   | {
@@ -959,7 +1184,9 @@ function inspectLegacyCredential(
   if (!existsSync(credentialPath)) return { status: "absent" };
   let serialized: string;
   try {
-    serialized = readFileSync(credentialPath, "utf8");
+    serialized = identity
+      ? readBoundSecretFile(credentialPath, identity, "credentials")
+      : readFileSync(credentialPath, "utf8");
   } catch {
     throw new StorageDocumentError("credentials", "legacy-migration-failed");
   }
@@ -997,10 +1224,13 @@ function inspectLegacyCredential(
 function readLegacyConversationKeys(
   path: string,
   scope: StorageIdentityV2["storage"],
+  identity?: FilesystemIdentity,
 ): Map<string, Uint8Array> | null {
   let serialized: string;
   try {
-    serialized = readFileSync(path, "utf8");
+    serialized = identity
+      ? readBoundSecretFile(path, identity, "conversation-keys")
+      : readFileSync(path, "utf8");
   } catch {
     throw new StorageDocumentError(
       "conversation-keys",
