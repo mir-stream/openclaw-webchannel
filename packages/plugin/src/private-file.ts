@@ -10,15 +10,53 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 
-/** Create a directory tree with an owner-only leaf directory. */
+/**
+ * Create a directory tree with an owner-only leaf directory.
+ *
+ * When recursive mkdir creates a chain, fsync every parent containing a new
+ * entry from the outermost entry inward. That prevents a later durable file or
+ * completion marker from outliving one of its newly created path components.
+ * Existing parent modes are never changed.
+ */
 export function ensurePrivateDirectory(
   directory: string,
   enforceExistingMode = false,
 ): void {
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const firstCreated = mkdirSync(directory, {
+    recursive: true,
+    mode: 0o700,
+  });
+  if (firstCreated !== undefined) {
+    fsyncCreatedDirectoryChain(firstCreated, directory);
+  }
   if (enforceExistingMode) chmodSync(directory, 0o700);
+}
+
+function fsyncCreatedDirectoryChain(
+  firstCreated: string,
+  directory: string,
+): void {
+  const first = resolve(firstCreated);
+  let current = resolve(directory);
+  const parents: string[] = [];
+
+  while (true) {
+    parents.unshift(dirname(current));
+    if (current === first) break;
+    const parent = dirname(current);
+    // mkdirSync's recursive result is contractually the first created path,
+    // hence an ancestor. Keep the durability enhancement best-effort if a
+    // platform ever returns an unexpected value.
+    if (parent === current) {
+      fsyncDirectoryBestEffort(dirname(first));
+      return;
+    }
+    current = parent;
+  }
+
+  for (const parent of parents) fsyncDirectoryBestEffort(parent);
 }
 
 /**
@@ -94,7 +132,13 @@ export function archiveFileNoReplace(
   fsyncDirectoryBestEffort(dirname(sourcePath));
 }
 
-function fsyncDirectoryBestEffort(directory: string): void {
+/**
+ * Best-effort durability barrier for directory-entry changes.
+ *
+ * Some supported platforms/filesystems reject opening or fsyncing a
+ * directory, so callers must not depend on this throwing.
+ */
+export function fsyncDirectoryBestEffort(directory: string): void {
   let descriptor: number | undefined;
   try {
     descriptor = openSync(directory, "r");

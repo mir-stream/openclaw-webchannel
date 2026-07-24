@@ -198,6 +198,29 @@ describe("legacy tuple storage migration", () => {
     expect(Buffer.from(restarted.getOrCreate("same-peer"))).toEqual(LEGACY_K);
   });
 
+  it("preserves an existing exact credential-path parent mode during migration", () => {
+    writeLegacyState();
+    const customDirectory = join(home, "operator-managed");
+    const credentialPath = join(customDirectory, "tenant-a.json");
+    mkdirSync(customDirectory, { recursive: true, mode: 0o755 });
+    chmodSync(customDirectory, 0o755);
+
+    expect(
+      migrateLegacyTupleState({ ...SCOPE, home, credentialPath }),
+    ).toMatchObject({
+      status: "migrated",
+      credential: "migrated",
+    });
+    expect(statSync(customDirectory).mode & 0o777).toBe(0o755);
+    expect(statSync(credentialPath).mode & 0o777).toBe(0o600);
+    expect(() =>
+      assertCredentialDocumentStorage(
+        SCOPE,
+        parseCredentialJson(readFileSync(credentialPath, "utf8")),
+      ),
+    ).not.toThrow();
+  });
+
   it("preserves a matching explicit credential identity instead of rebinding it", () => {
     const candidate = legacyCredential();
     const explicitIdentity = createCredentialBindingIdentityV2({
@@ -536,6 +559,37 @@ describe("legacy tuple storage migration", () => {
     expect(statSync(source).mode & 0o777).toBe(0o700);
     expect(statSync(sourceCredential).mode & 0o777).toBe(0o600);
     expect(statSync(sourceConversation).mode & 0o777).toBe(0o600);
+  });
+
+  it("resumes after a crash boundary immediately following the durable source move", () => {
+    const legacy = writeLegacyState();
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const claim = join(
+      legacy.root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+    );
+    const archivedSource = join(claim, "source");
+    const simulatedCrash = new Error("simulated post-rename crash");
+
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        _afterSourceMove: () => {
+          expect(existsSync(legacy.directory)).toBe(false);
+          expect(existsSync(archivedSource)).toBe(true);
+          expect(existsSync(destination.credentialPath)).toBe(false);
+          expect(existsSync(destination.conversationKeyPath)).toBe(false);
+          throw simulatedCrash;
+        },
+      }),
+    ).toThrow(simulatedCrash);
+
+    expect(migrateLegacyTupleState({ ...SCOPE, home }).status).toBe("resumed");
+    expect(existsSync(destination.credentialPath)).toBe(true);
+    expect(existsSync(destination.conversationKeyPath)).toBe(true);
+    expect(existsSync(join(claim, "migration-complete.json"))).toBe(true);
   });
 
   it.each(["credentials", "conversation-keys"] as const)(
