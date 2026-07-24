@@ -60,6 +60,7 @@ import {
   loadPersistedCredentialDocument,
   readAccountsMap,
   readWebchannelSection,
+  resolveAcquisitionIdentity,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
@@ -67,6 +68,7 @@ import {
   formatCredentialInspection,
 } from "./credential-document.js";
 import {
+  parseNatsCredentialMode,
   resolveEnrolledSaasBaseUrl,
   type WebchannelNatsConfig,
 } from "./nats-credential-source.js";
@@ -383,11 +385,26 @@ export const webchannelSetup = {
     // Resolve the effective account config (channel-level base merged under the
     // account override), then the credential mode (config > input > enrolled).
     const account = resolveWebchannelAccountConfig(cfg, id);
-    const mode =
-      ((account.nats as { credentials?: { mode?: string } } | undefined)?.credentials
-        ?.mode as string | undefined) ??
-      input.credentialsMode ??
-      "enrolled";
+    let mode: "static" | "enrolled";
+    try {
+      const configuredMode = (
+        account.nats as
+          | { credentials?: { mode?: unknown } }
+          | undefined
+      )?.credentials?.mode;
+      mode =
+        parseNatsCredentialMode(
+          configuredMode === undefined
+            ? input.credentialsMode
+            : configuredMode,
+        ) ?? "enrolled";
+    } catch {
+      runtime.log(
+        `[webchannel] account "${id}": invalid credential mode; expected ` +
+          `"static" or "enrolled". Refusing credential acquisition.`,
+      );
+      return;
+    }
 
     if (mode !== "enrolled") {
       runtime.log(
@@ -400,14 +417,15 @@ export const webchannelSetup = {
     // Resolve the COMPLETE effective identity before consulting the credential
     // path. Path ownership alone is never proof that persisted enrollment
     // material belongs to this configured account.
+    const configuredIdentity = resolveAcquisitionIdentity(cfg, id);
     const identity = resolveSetupIdentity(input);
     const tenant =
-      identity.tenant ?? (account.tenant as string | undefined) ?? "default-tenant";
+      identity.tenant ?? configuredIdentity.tenant;
     const saasBaseUrl = resolveEnrolledSaasBaseUrl({
       natsConfig: account.nats as WebchannelNatsConfig | undefined,
       saasBaseUrl:
         identity.saasBaseUrl ??
-        (account.saas as { baseUrl?: string } | undefined)?.baseUrl,
+        configuredIdentity.saasBaseUrl,
     });
 
     if (!saasBaseUrl) {

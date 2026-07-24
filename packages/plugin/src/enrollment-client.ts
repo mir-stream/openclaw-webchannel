@@ -81,7 +81,7 @@ type EnrollmentResult = {
    * the minted creds (the SaaS is the rendezvous authority); the enrolled plugin
    * dials THIS rather than a local `nats.url` / `WEBCHANNEL_NATS_URL`.
    */
-  natsUrl?: string;
+  natsUrl: string;
   /**
    * The exact `iss` the SaaS puts in the bootstrap JWTs it mints (same
    * rendezvous-authority principle as `natsUrl`). OPTIONAL here (unlike the
@@ -99,6 +99,51 @@ type EnrollmentResult = {
  * on the internal `EnrollmentResult` declaration.
  */
 export type EnrollmentResultLike = EnrollmentResult;
+
+export type EnrollmentEndpoints = Readonly<{
+  saasEnrollUrl: string;
+  saasPollUrl: string;
+}>;
+
+/**
+ * Derive the only enrollment endpoints valid for a SaaS binding authority.
+ * Only trailing slashes on the configured base are normalized.
+ */
+export function deriveEnrollmentEndpoints(
+  saasBaseUrl: string,
+): EnrollmentEndpoints {
+  const normalizedBase = saasBaseUrl.replace(/\/+$/, "");
+  if (normalizedBase.length === 0) {
+    throw new Error(
+      "webchannel: invalid SaaS enrollment authority fields=saasBaseUrl",
+    );
+  }
+  return Object.freeze({
+    saasEnrollUrl: `${normalizedBase}/api/enroll`,
+    saasPollUrl: `${normalizedBase}/api/poll`,
+  });
+}
+
+export function assertEnrollmentEndpointsMatchBase(
+  options: Pick<
+    EnrollmentOptions,
+    "saasBaseUrl" | "saasEnrollUrl" | "saasPollUrl"
+  >,
+): void {
+  const expected = deriveEnrollmentEndpoints(options.saasBaseUrl);
+  const fields: string[] = [];
+  if (options.saasEnrollUrl !== expected.saasEnrollUrl) {
+    fields.push("saasEnrollUrl");
+  }
+  if (options.saasPollUrl !== expected.saasPollUrl) {
+    fields.push("saasPollUrl");
+  }
+  if (fields.length > 0) {
+    throw new Error(
+      `webchannel: enrollment endpoints do not match saasBaseUrl fields=${fields.join(",")}`,
+    );
+  }
+}
 
 /**
  * SaaS NATS user credentials (matches server-side type).
@@ -224,6 +269,10 @@ export class EnrollmentClient {
   private credentials?: PluginCredentials;
 
   constructor(options: EnrollmentOptions) {
+    // Reject a split acquisition/binding authority before any request, key
+    // generation, or persistence. The public options retain explicit endpoints
+    // for compatibility, but they must be mechanically derived from the base.
+    assertEnrollmentEndpointsMatchBase(options);
     // Spread FIRST, then apply defaults with nullish-coalescing: an explicit
     // `credentialPath: undefined` / `displayInstructions: undefined` in `options`
     // (the common case from createEnrolledNatsConnection) must NOT clobber the

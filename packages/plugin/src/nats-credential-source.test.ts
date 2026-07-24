@@ -216,6 +216,19 @@ describe("resolveNatsCredentialSource — enrolled (default)", () => {
     }) as Extract<NatsCredentialSource, { mode: "enrolled" }>;
     expect(s.saasBaseUrl).toBe("https://env.example");
   });
+
+  it.each(["bogus", null])(
+    "rejects invalid explicit credential mode %j instead of treating it as enrolled",
+    (invalidMode) => {
+    expect(() =>
+      resolveNatsCredentialSource({
+        ...BASE,
+        natsConfig: { credentials: { mode: invalidMode } } as never,
+        env: {},
+      }),
+    ).toThrow(/credentials\.mode must be "static" or "enrolled"/);
+    },
+  );
 });
 
 describe("resolveEnrolledSaasBaseUrl — shared binding precedence", () => {
@@ -295,7 +308,7 @@ describe("connectNatsCredentialSource — static branch", () => {
       {
         mode: "enrolled",
         url: "wss://n",
-        saasBaseUrl: "https://saas.example",
+        saasBaseUrl: "https://saas.example///",
         tenant: "t1",
         accountId: "a1",
       },

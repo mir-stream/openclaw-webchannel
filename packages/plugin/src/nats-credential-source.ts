@@ -40,6 +40,7 @@ import {
   createEnrolledNatsConnection,
   type EnrolledNatsConnection,
 } from "./enrolled-nats-connection.js";
+import { deriveEnrollmentEndpoints } from "./enrollment-client.js";
 
 // ---------------------------------------------------------------------------
 // Config shape (mirrors the `channels.webchannel.nats` schema block)
@@ -139,6 +140,22 @@ export type ResolveEnrolledSaasBaseUrlInput = {
   /** Optional final fallback; runtime supplies its built-in default. */
   fallback?: string;
 };
+
+export type NatsCredentialMode = "static" | "enrolled";
+
+/**
+ * Parse an explicit credential mode without silently treating unknown config
+ * values as either static or enrolled.
+ */
+export function parseNatsCredentialMode(
+  value: unknown,
+): NatsCredentialMode | undefined {
+  if (value === undefined) return undefined;
+  if (value === "static" || value === "enrolled") return value;
+  throw new Error(
+    'webchannel: channels.webchannel.nats.credentials.mode must be "static" or "enrolled". Refusing to continue.',
+  );
+}
 
 /**
  * Resolve the effective enrolled-mode SaaS base URL everywhere credential
@@ -262,6 +279,9 @@ export function resolveNatsCredentialSource(
   }
   const nats = input.natsConfig;
   const creds = nats?.credentials;
+  const credentialMode = parseNatsCredentialMode(
+    (creds as { mode?: unknown } | undefined)?.mode,
+  );
 
   const url =
     env["WEBCHANNEL_NATS_URL"] ??
@@ -270,7 +290,7 @@ export function resolveNatsCredentialSource(
     DEFAULT_NATS_URL;
 
   if (
-    creds?.mode === "static" ||
+    credentialMode === "static" ||
     creds?.credsFile !== undefined ||
     creds?.userJwt !== undefined ||
     creds?.userSeed !== undefined ||
@@ -460,10 +480,11 @@ export async function connectNatsCredentialSource(
     }
     case "enrolled": {
       const createEnrolled = deps.createEnrolled ?? createEnrolledNatsConnection;
+      const endpoints = deriveEnrollmentEndpoints(source.saasBaseUrl);
       const enrolled = await createEnrolled({
         saasBaseUrl: source.saasBaseUrl,
-        saasEnrollUrl: `${source.saasBaseUrl}/api/enroll`,
-        saasPollUrl: `${source.saasBaseUrl}/api/poll`,
+        saasEnrollUrl: endpoints.saasEnrollUrl,
+        saasPollUrl: endpoints.saasPollUrl,
         natsUrl: source.url,
         tenant: source.tenant,
         accountId: source.accountId,

@@ -44,11 +44,14 @@ import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   accountCredentialPath,
   canonicalizeAccountId,
+  formatAccountIdForLog,
+  isValidAccountId,
   loadPersistedCredentialDocument,
   resolveAcquisitionIdentity,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import {
+  parseNatsCredentialMode,
   resolveEnrolledSaasBaseUrl,
   type WebchannelNatsConfig,
 } from "./nats-credential-source.js";
@@ -100,11 +103,22 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     configuredLabel: "configured",
     unconfiguredLabel: "not configured",
     resolveConfigured: ({ cfg, accountId }) => {
-      const id = canonicalizeAccountId(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
+      const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+      if (!isValidAccountId(id)) return false;
       const account = resolveWebchannelAccountConfig(cfg, id);
-      const mode =
-        (account.nats as WebchannelNatsConfig | undefined)?.credentials?.mode ??
-        "enrolled";
+      let mode: "static" | "enrolled";
+      try {
+        mode =
+          parseNatsCredentialMode(
+            (
+              account.nats as
+                | { credentials?: { mode?: unknown } }
+                | undefined
+            )?.credentials?.mode,
+          ) ?? "enrolled";
+      } catch {
+        return false;
+      }
       if (mode !== "enrolled") {
         return Boolean((account.auth as { jwt?: unknown } | undefined)?.jwt);
       }
@@ -132,7 +146,13 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       }
     },
     resolveStatusLines: ({ cfg, accountId, configured }) => {
-      const id = canonicalizeAccountId(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID);
+      const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+      if (!isValidAccountId(id)) {
+        return [
+          `WebChannel (${formatAccountIdForLog(id)}): not configured — ` +
+            `invalid account id; expected /^[A-Za-z0-9_-]{1,64}$/`,
+        ];
+      }
       const account = resolveWebchannelAccountConfig(cfg, id);
       const tenant = accountString(account, "tenant") ?? "unset";
       const saas =

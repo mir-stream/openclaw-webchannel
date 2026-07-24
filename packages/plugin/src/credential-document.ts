@@ -45,7 +45,7 @@ export type PluginCredentialDocument = {
     peerId: string;
     jwksUrl: string;
     bootstrapUrl: string;
-    natsUrl?: string;
+    natsUrl: string;
     issuer?: string;
   };
   accountId: string;
