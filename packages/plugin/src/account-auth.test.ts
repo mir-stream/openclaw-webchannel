@@ -12,7 +12,7 @@ const pointer = (): AuthConfig => ({ strategy: "jwt", jwt: {} as never });
 describe("resolveEffectiveAccountAuth", () => {
   it("uses plan SaaS URL before top-level and derives absent trust facts", () => {
     const result = resolveEffectiveAccountAuth({
-      accountAuthRaw: pointer(), accountId: "alpha", planSaasBaseUrl: "https://plan.example/",
+      accountAuthRaw: pointer(), tenant: "tenant", accountId: "alpha", planSaasBaseUrl: "https://plan.example/",
       topLevelSaasBaseUrl: "https://top.example", loadCreds: () => undefined,
     });
     expect(result).toMatchObject({ strategy: "jwt", jwt: { issuer: "https://plan.example", jwksUrl: "https://plan.example/.well-known/jwks.json" } });
@@ -20,28 +20,28 @@ describe("resolveEffectiveAccountAuth", () => {
   });
 
   it("falls back to the top-level SaaS URL", () => {
-    const result = resolveEffectiveAccountAuth({ accountAuthRaw: pointer(), accountId: "alpha", topLevelSaasBaseUrl: "https://top.example", loadCreds: () => undefined });
+    const result = resolveEffectiveAccountAuth({ accountAuthRaw: pointer(), tenant: "tenant", accountId: "alpha", topLevelSaasBaseUrl: "https://top.example", loadCreds: () => undefined });
     expect(result?.strategy === "jwt" && (result.jwt as { issuer?: string }).issuer).toBe("https://top.example");
   });
 
   it("uses a delivered issuer even without a base URL and leaves JWKS validation to preparation", () => {
-    const result = resolveEffectiveAccountAuth({ accountAuthRaw: pointer(), accountId: "alpha", loadCreds: () => ({ userJwt: "J", userSeed: "S", issuer: "https://delivered" }) });
+    const result = resolveEffectiveAccountAuth({ accountAuthRaw: pointer(), tenant: "tenant", accountId: "alpha", loadCreds: () => ({ userJwt: "J", userSeed: "S", issuer: "https://delivered" }) });
     expect(result).toEqual({ strategy: "jwt", jwt: { issuer: "https://delivered" } });
   });
 
   it("applies pin > delivered > derived and preserves every key-source form", () => {
     for (const keySource of [{ jwksUrl: "https://pin/keys" }, { jwksFile: "/keys.json" }, { jwks: { keys: [] } }]) {
       const raw = { strategy: "jwt", jwt: { ...keySource, issuer: "https://pin" } } as AuthConfig;
-      expect(resolveEffectiveAccountAuth({ accountAuthRaw: raw, accountId: "alpha", planSaasBaseUrl: "https://derived", loadCreds: () => ({ userJwt: "J", userSeed: "S", issuer: "https://delivered" }) })).toEqual(raw);
+      expect(resolveEffectiveAccountAuth({ accountAuthRaw: raw, tenant: "tenant", accountId: "alpha", planSaasBaseUrl: "https://derived", loadCreds: () => ({ userJwt: "J", userSeed: "S", issuer: "https://delivered" }) })).toEqual(raw);
     }
-    const delivered = resolveEffectiveAccountAuth({ accountAuthRaw: pointer(), accountId: "alpha", planSaasBaseUrl: "https://derived", loadCreds: () => ({ userJwt: "J", userSeed: "S", issuer: "https://delivered" }) });
+    const delivered = resolveEffectiveAccountAuth({ accountAuthRaw: pointer(), tenant: "tenant", accountId: "alpha", planSaasBaseUrl: "https://derived", loadCreds: () => ({ userJwt: "J", userSeed: "S", issuer: "https://delivered" }) });
     expect(delivered?.strategy === "jwt" && (delivered.jwt as { issuer?: string }).issuer).toBe("https://delivered");
   });
 
   it("loads persisted credentials exactly once", () => {
     const loadCreds = vi.fn(() => undefined);
     deriveAccountAuth(pointer(), "https://x", "a");
-    resolveEffectiveAccountAuth({ accountAuthRaw: pointer(), accountId: "a", planSaasBaseUrl: "https://x", loadCreds });
+    resolveEffectiveAccountAuth({ accountAuthRaw: pointer(), tenant: "tenant", accountId: "a", planSaasBaseUrl: "https://x", loadCreds });
     expect(loadCreds).toHaveBeenCalledOnce();
   });
 
@@ -54,6 +54,7 @@ describe("resolveEffectiveAccountAuth", () => {
       }));
       resolveEffectiveAccountAuth({
         accountAuthRaw: accountAuthRaw as never,
+        tenant: "tenant",
         accountId: "alpha",
         loadCreds,
       });

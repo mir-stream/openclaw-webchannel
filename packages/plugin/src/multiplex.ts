@@ -23,6 +23,7 @@ import {
   listWebchannelAccountIds,
   readAccountsMap,
   readWebchannelSection,
+  resolveAccountStorageRoot,
   resolveWebchannelAccountConfig,
   type WebchannelAccountConfig,
 } from "./account-config.js";
@@ -34,6 +35,7 @@ export type AccountServePlan = {
   accountId: string;
   tenant: string;
   saasBaseUrl?: string;
+  storageRoot?: string;
   /** The merged per-account config (channel-level base + account override). */
   account: WebchannelAccountConfig;
 };
@@ -68,11 +70,13 @@ export function planWebchannelAccount(
   });
 
   const account = resolveWebchannelAccountConfig(cfg, accountId);
+  const storageRoot = resolveAccountStorageRoot(account);
   return {
     status: "serve",
     accountId,
     tenant: identity.tenant,
     ...(identity.saasBaseUrl !== undefined ? { saasBaseUrl: identity.saasBaseUrl } : {}),
+    ...(storageRoot !== undefined ? { storageRoot } : {}),
     account,
   };
 }

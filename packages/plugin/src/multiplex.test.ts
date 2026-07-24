@@ -99,6 +99,29 @@ describe("planAccounts: multi-account (Phase 3)", () => {
     expect(plan.account.auth).toEqual({ strategy: "jwt" }); // inherited base
     expect(plan.account.dmSecurity).toBe("allowlist"); // account override
   });
+
+  it("inherits storageRoot from the shared base and lets an account override it", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          storageRoot: "/shared/state",
+          accounts: {
+            acctA: { tenant: "tA" },
+            acctB: { tenant: "tB", storageRoot: "/account-b/state" },
+          },
+        },
+      },
+    };
+    const plans = served(planAccounts(cfg, { env: {} }));
+    expect(plans[0]).toMatchObject({
+      accountId: "acctA",
+      storageRoot: "/shared/state",
+    });
+    expect(plans[1]).toMatchObject({
+      accountId: "acctB",
+      storageRoot: "/account-b/state",
+    });
+  });
 });
 
 describe("planAccounts: enabled-state serving boundary", () => {

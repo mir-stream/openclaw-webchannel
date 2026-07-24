@@ -93,6 +93,7 @@ describe("authenticated subscription boundary", () => {
     try {
       const transport = new RecordingTransport();
       const store = new ConversationKeyStore({
+        tenant: "tenant",
         accountId: "acct",
         home,
         maxKeys: 2,

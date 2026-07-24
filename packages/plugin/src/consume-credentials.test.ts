@@ -7,6 +7,7 @@ import type {
   PersistedEnrolledCreds,
 } from "./credential-document.js";
 import type { NatsCredentialSource } from "./nats-credential-source.js";
+import { StorageDocumentError } from "./storage-document.js";
 
 const identityKey = {
   publicKey: new Uint8Array(32).fill(1),
@@ -47,7 +48,7 @@ describe("consumeCredentialSource", () => {
       accountId: "a",
     };
 
-    const result = await consumeCredentialSource(source, "acctA", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       createEnrolled,
       makeSigner: () => async () => "sig",
@@ -61,6 +62,39 @@ describe("consumeCredentialSource", () => {
       expect.objectContaining({ url: "wss://bound-relay", jwtCredential: "JWT" }),
     );
     if (result.status === "connected") expect(result.dialedUrl).toBe("wss://bound-relay");
+  });
+
+  it("loads enrolled credentials with the exact tuple and override semantics", async () => {
+    const transportFactory = vi.fn(
+      () => ({ connect: vi.fn(async () => {}), connected: true }) as never,
+    );
+    const loadPersisted = vi.fn(() => ({
+      userJwt: "JWT",
+      userSeed: "SEED",
+    }));
+    const source: NatsCredentialSource = {
+      mode: "enrolled",
+      url: "ws://relay",
+      saasBaseUrl: "http://s",
+      tenant: "tenant-A",
+      accountId: "account-A",
+      storageRoot: "/common/state",
+      credentialPath: "/credential-only/credentials.json",
+    };
+
+    await consumeCredentialSource(source, {
+      transportFactory,
+      makeSigner: () => async () => "sig",
+      loadPersisted,
+    });
+
+    expect(loadPersisted).toHaveBeenCalledWith(
+      { tenant: "tenant-A", accountId: "account-A" },
+      {
+        storageRoot: "/common/state",
+        credentialPath: "/credential-only/credentials.json",
+      },
+    );
   });
 
   it("enrolled + persisted natsUrl → dials the SaaS-delivered URL, NOT source.url", async () => {
@@ -79,7 +113,7 @@ describe("consumeCredentialSource", () => {
       accountId: "a",
     };
 
-    const result = await consumeCredentialSource(source, "acctA", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       makeSigner: () => async () => "sig",
       loadPersisted: () => matching({
@@ -134,7 +168,7 @@ describe("consumeCredentialSource", () => {
       tenant: "t",
       accountId: "a",
     };
-    const result = await consumeCredentialSource(source, "acctA", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       makeSigner: () => async () => "sig",
       loadPersisted: () => matching({ identityKey }),
@@ -152,7 +186,7 @@ describe("consumeCredentialSource", () => {
       tenant: "t",
       accountId: "a",
     };
-    const result = await consumeCredentialSource(source, "acctA", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       loadPersisted: () => ({
         status: "mismatch",
@@ -178,10 +212,10 @@ describe("consumeCredentialSource", () => {
       url: "ws://relay",
       saasBaseUrl: "http://s",
       tenant: "t",
-      accountId: "a",
+      accountId: "acctMissing",
     };
 
-    const result = await consumeCredentialSource(source, "acctMissing", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       createEnrolled,
       loadPersisted: () => ({ status: "absent" }),
@@ -190,6 +224,33 @@ describe("consumeCredentialSource", () => {
     expect(result).toEqual({ status: "creds-missing", accountId: "acctMissing" });
     expect(transportFactory).not.toHaveBeenCalled();
     expect(createEnrolled).not.toHaveBeenCalled();
+  });
+
+  it("rejects storage identity mismatch before creating a transport", async () => {
+    const transportFactory = vi.fn();
+    const source: NatsCredentialSource = {
+      mode: "enrolled",
+      url: "ws://relay",
+      saasBaseUrl: "http://s",
+      tenant: "tenant-A",
+      accountId: "account-A",
+    };
+    await expect(
+      consumeCredentialSource(source, {
+        transportFactory,
+        loadPersisted: () => {
+          throw new StorageDocumentError(
+            "credentials",
+            "identity-mismatch",
+            ["storage.tenant"],
+          );
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "identity-mismatch",
+      fields: ["storage.tenant"],
+    });
+    expect(transportFactory).not.toHaveBeenCalled();
   });
 
   it("static source → delegates to connectNatsCredentialSource unchanged", async () => {
@@ -201,7 +262,7 @@ describe("consumeCredentialSource", () => {
       userJwt: "J",
       userSeed: "S",
     };
-    const result = await consumeCredentialSource(source, "default", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       makeSigner,
     });

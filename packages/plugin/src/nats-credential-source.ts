@@ -101,6 +101,8 @@ export type NatsCredentialSource =
       saasBaseUrl: string;
       tenant: string;
       accountId: string;
+      storageRoot?: string;
+      credentialPath?: string;
     };
 
 // ---------------------------------------------------------------------------
@@ -123,6 +125,10 @@ export type ResolveNatsCredentialSourceInput = {
   /** Tenant + account id (enrolled mode; accountId is the wire identity). */
   tenant: string;
   accountId: string;
+  /** Common tuple-scoped persistence root for enrolled material. */
+  storageRoot?: string;
+  /** Exact credential-file override (does not relocate conversation keys). */
+  credentialPath?: string;
   /** Env bag (defaults to `process.env`). Injectable for tests. */
   env?: Record<string, string | undefined>;
   /** File reader for `.creds` files (defaults to `fs.readFileSync`). Injectable. */
@@ -384,6 +390,12 @@ export function resolveNatsCredentialSource(
     saasBaseUrl,
     tenant: input.tenant,
     accountId: input.accountId,
+    ...(input.storageRoot !== undefined
+      ? { storageRoot: input.storageRoot }
+      : {}),
+    ...(input.credentialPath !== undefined
+      ? { credentialPath: input.credentialPath }
+      : {}),
   };
 }
 
@@ -496,6 +508,12 @@ export async function connectNatsCredentialSource(
         natsUrl: source.url,
         tenant: source.tenant,
         accountId: source.accountId,
+        ...(source.storageRoot !== undefined
+          ? { storageRoot: source.storageRoot }
+          : {}),
+        ...(source.credentialPath !== undefined
+          ? { credentialPath: source.credentialPath }
+          : {}),
         displayInstructions: true,
       });
       return { transport: enrolled.transport, enrolled };

@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { join } from "node:path";
-
 import { acquireCredentials } from "./acquire-credentials.js";
+import { accountCredentialPath } from "./account-config.js";
 import { EnrollmentClient } from "./enrollment-client.js";
 
 const HOME = "/home/test";
@@ -71,7 +70,10 @@ describe("acquireCredentials", () => {
     expect(capturedOpts?.accountId).toBe("acctA");
     // Account-scoped persistence path.
     expect(capturedOpts?.credentialPath).toBe(
-      join(HOME, ".openclaw-webchannel", "acctA", "credentials.json"),
+      accountCredentialPath(
+        { tenant: "tA", accountId: "acctA" },
+        { home: HOME },
+      ),
     );
     // The user_code progress is streamed via the injected log (no TTY).
     expect(log).toHaveBeenCalled();
@@ -137,7 +139,10 @@ describe("acquireCredentials", () => {
       },
     });
     expect(capturedOpts?.credentialPath).toBe(
-      join(HOME, ".openclaw-webchannel", "default", "credentials.json"),
+      accountCredentialPath(
+        { tenant: "t", accountId: "default" },
+        { home: HOME },
+      ),
     );
   });
 });

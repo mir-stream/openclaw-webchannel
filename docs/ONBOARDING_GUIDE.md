@@ -157,7 +157,8 @@ hand-written `config patch` is only needed for the advanced cases in the last su
 
 The `--account <id>` value **is** the wire identity (the `accountId`): omit `--account` for
 the `"default"` account, or pass `--account <id>` for a named account (creds persist to
-`~/.openclaw-webchannel/<account>/credentials.json`). There is **no `--token`** — the
+the exact `(tenant, accountId)` namespace under
+`~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json`). There is **no `--token`** — the
 handling agent is bound separately (below).
 
 ```bash
@@ -311,10 +312,14 @@ later at `gateway run`):
 
 ```
 [enrollment] ✓ Enrollment complete!
-[webchannel] ✓ Credentials acquired for account "default" → ~/.openclaw-webchannel/default/credentials.json (peerId=…)
+[webchannel] ✓ Credentials acquired for account "default" → ~/.openclaw-webchannel-v2/v2_<opaque>/credentials.json (peerId=…)
 ```
 
-Creds are cached at `~/.openclaw-webchannel/<account>/credentials.json` (mode 0600).
+Creds are cached at
+`~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json` (mode 0600).
+Set account config `storageRoot` to relocate both tuple-scoped stores. A
+low-level exact `credentialPath` override relocates only credentials and never
+the conversation-key store.
 Then start the gateway — it **consumes** the persisted creds, never re-enrolls:
 
 ```bash
