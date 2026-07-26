@@ -1387,6 +1387,86 @@ describe("legacy tuple storage migration", () => {
     )).toEqual(LEGACY_K);
   }, 15_000);
 
+  it("keeps ambiguous quarantine behind an exact migration mutex", async () => {
+    const legacy = writeLegacyState(SCOPE, { credential: false });
+    const sourceBefore = readFileSync(legacy.conversationKeyPath);
+    const exactCredential = join(home, "exact", "tenant-a.json");
+    mkdirSync(dirname(exactCredential), { recursive: true });
+    writeFileSync(
+      exactCredential,
+      JSON.stringify(legacyCredential(SCOPE), null, 2),
+      { mode: 0o600 },
+    );
+    const firstDestination = tupleStoragePaths({ ...SCOPE, home });
+    const secondDestination = tupleStoragePaths({ ...OTHER_SCOPE, home });
+    const backupRoot = join(legacy.root, ".legacy-v1-backups");
+    const mutex = join(
+      backupRoot,
+      `.account-migration-mutex-${createHash("sha256")
+        .update(SCOPE.accountId)
+        .digest("base64url")}.json`,
+    );
+    const fixture = fileURLToPath(
+      new URL("./test-fixtures/migrate-legacy-storage.ts", import.meta.url),
+    );
+    const child = spawn(
+      process.execPath,
+      [
+        "--import",
+        "tsx",
+        fixture,
+        home,
+        SCOPE.tenant,
+        SCOPE.accountId,
+        "0",
+        exactCredential,
+        "1000",
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const completion = new Promise<{
+      code: number | null;
+      stdout: string;
+      stderr: string;
+    }>((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => {
+        stdout += chunk;
+      });
+      child.stderr.on("data", (chunk: string) => {
+        stderr += chunk;
+      });
+      child.on("close", (code) => resolve({ code, stdout, stderr }));
+    });
+
+    for (let attempts = 0; attempts < 500 && !existsSync(mutex); attempts += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(existsSync(mutex)).toBe(true);
+    expect(() => migrateLegacyTupleState({ ...OTHER_SCOPE, home })).toThrow(
+      expect.objectContaining({ code: "legacy-claim-conflict" }),
+    );
+    expect(readFileSync(legacy.conversationKeyPath)).toEqual(sourceBefore);
+    expect(existsSync(secondDestination.credentialPath)).toBe(false);
+    expect(existsSync(secondDestination.conversationKeyPath)).toBe(false);
+
+    const firstResult = await completion;
+    expect(firstResult, firstResult.stderr).toMatchObject({ code: 0 });
+    expect(JSON.parse(firstResult.stdout)).toEqual({
+      ok: true,
+      status: "migrated",
+    });
+    expect(Buffer.from(
+      parseConversationKeyDocument(
+        SCOPE,
+        readFileSync(firstDestination.conversationKeyPath, "utf8"),
+      ).get("same-peer")!,
+    )).toEqual(LEGACY_K);
+  }, 15_000);
+
   it("takes over and preserves a dead account migration mutex", () => {
     const legacy = writeLegacyState();
     const destination = tupleStoragePaths({ ...SCOPE, home });

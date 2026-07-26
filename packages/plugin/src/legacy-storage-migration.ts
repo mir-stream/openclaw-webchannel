@@ -308,29 +308,40 @@ export function migrateLegacyTupleState(
         );
       }
     }
-    assertNoLiveForeignClaim(backupRoot, options.accountId, claimDirectory);
-    const archive =
-      `${legacy.conversationKeyPath}.ambiguous-v2-` +
-      `${destination.namespaceId}-${randomBytes(8).toString("hex")}`;
-    try {
-      if (!liveSource) {
-        throw new StorageDocumentError(
-          "conversation-keys",
-          "legacy-migration-failed",
+    withAccountMutex(
+      backupRoot,
+      options.accountId,
+      options._afterAccountMutex,
+      () => {
+        assertNoLiveForeignClaim(
+          backupRoot,
+          options.accountId,
+          claimDirectory,
         );
-      }
-      assertLegacySourceAtPath(legacy.directory, liveSource);
-      archiveFileNoReplace(legacy.conversationKeyPath, archive);
-      publishEmptyConversationStore(
-        destination.scope,
-        destination.conversationKeyPath,
-      );
-    } catch {
-      throw new StorageDocumentError(
-        "conversation-keys",
-        "legacy-migration-failed",
-      );
-    }
+        const archive =
+          `${legacy.conversationKeyPath}.ambiguous-v2-` +
+          `${destination.namespaceId}-${randomBytes(8).toString("hex")}`;
+        try {
+          if (!liveSource) {
+            throw new StorageDocumentError(
+              "conversation-keys",
+              "legacy-migration-failed",
+            );
+          }
+          assertLegacySourceAtPath(legacy.directory, liveSource);
+          archiveFileNoReplace(legacy.conversationKeyPath, archive);
+          publishEmptyConversationStore(
+            destination.scope,
+            destination.conversationKeyPath,
+          );
+        } catch {
+          throw new StorageDocumentError(
+            "conversation-keys",
+            "legacy-migration-failed",
+          );
+        }
+      },
+    );
     return Object.freeze({
       status: "ambiguous-quarantined",
       credential: "absent",
@@ -1358,11 +1369,22 @@ function claimMigrationForAccount(
   scope: StorageIdentityV2["storage"],
   afterAccountMutex?: () => void,
 ): void {
+  withAccountMutex(backupRoot, accountId, afterAccountMutex, () => {
+    assertNoLiveForeignClaim(backupRoot, accountId, claimDirectory);
+    claimMigration(claimDirectory, scope);
+  });
+}
+
+function withAccountMutex<T>(
+  backupRoot: string,
+  accountId: string,
+  afterAccountMutex: (() => void) | undefined,
+  action: () => T,
+): T {
   const mutex = acquireAccountMutex(backupRoot, accountId);
   try {
     afterAccountMutex?.();
-    assertNoLiveForeignClaim(backupRoot, accountId, claimDirectory);
-    claimMigration(claimDirectory, scope);
+    return action();
   } finally {
     releaseAccountMutex(backupRoot, mutex);
   }
