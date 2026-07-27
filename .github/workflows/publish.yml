@@ -292,12 +292,39 @@ jobs:
       # override (config.js getGlobalConfigPath). Literal /tmp because the
       # `runner` context is not available in job-level env.
       CLAWHUB_CONFIG_PATH: /tmp/clawhub-config.json
+      # The clawhub CLI shells out to `npm pack --json` and reads the result as
+      # an ARRAY (`JSON.parse(stdout)[0].filename`, dist/cli/commands/packages.js
+      # in 0.23.1 — the latest release). npm 12 changed that payload to an OBJECT
+      # keyed by package name, so `[0]` is undefined and the CLI aborts with
+      # "npm pack did not return a tarball filename". Verified directly:
+      #   npm 11 -> [ { "filename": "openclaw-webchannel-0.4.0.tgz", … } ]
+      #   npm 12 -> { "openclaw-webchannel": { "filename": …, … } }
+      # This is a CLI bug with no fixed release available, so pin the npm the CLI
+      # sees. REMOVE THIS once the CLI handles npm 12's shape.
+      CLAWHUB_NPM_PIN: "npm@11"
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      # Job-scoped only: installs into RUNNER_TEMP and prepends via GITHUB_PATH,
+      # so the shared self-hosted runner's global npm is never mutated.
+      - name: Pin npm for the ClawHub CLI (see CLAWHUB_NPM_PIN)
+        run: |
+          set -euo pipefail
+          npm i --silent --prefix "$RUNNER_TEMP/npm-pin" "$CLAWHUB_NPM_PIN"
+          echo "$RUNNER_TEMP/npm-pin/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Verify the pinned npm is what the CLI will spawn
+        run: |
+          set -euo pipefail
+          echo "npm on PATH: $(which npm) -> $(npm --version)"
+          case "$(npm --version)" in
+            11.*) echo "pin OK" ;;
+            *) echo "::error::expected the pinned npm 11.x, got $(npm --version) — the ClawHub pack step would fail"; exit 1 ;;
+          esac
 
       - name: Install
         run: npm ci
