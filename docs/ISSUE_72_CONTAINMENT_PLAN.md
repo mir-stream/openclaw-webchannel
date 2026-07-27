@@ -326,6 +326,8 @@ signing capability, resolver publish/reload 경로, readback/verification readin
 - authoritative serving-node membership, API/publisher/all-NATS-node stable observed zero,
   unreachable-node quarantine, offline resolver seed와 per-instance publisher credential
   revoke/rotate를 증명할 수 없는 topology는 repository가 CAS를 제공해도 Track A를 fail-closed한다.
+- ordinary rejoin에서도 해당 node process와 cluster route/network의 stop/isolation, stable observed
+  zero, non-serving restart와 delayed-update purge를 증명할 수 있어야 한다.
 
 ## 4. Track A — revoke operation과 동시성
 
@@ -509,13 +511,19 @@ barrier다. 이 barrier 없이 credential revocation만 하고 live takeover하�
 delayed stale update를 reject하는 real-server proof가 있어야 한다. 기본 Dir endpoint는 해당하지
 않는다.
 
-ordinary quarantine node가 돌아올 때도 바로 serving하지 않는다. readiness/service discovery에서
-non-serving quarantine을 유지한 채 latest exact operator/target/system claim을 per-store atomic
-seed/sync하고 claim ID·hash·floors와 current/old signer trust를 non-mutating validation으로
-검증한다. revoked client와 quarantined old publisher credential의 reconnect/publish가 ingress 전에
-거부되고 old-credential update attempt 뒤 store hash가 불변인지 확인한다. membership이 안정된
-뒤에만 authoritative serving membership에 추가한다. partial sync, 검증 실패, membership drift는
-계속 quarantine/fail-closed한다.
+ordinary quarantine node가 돌아올 때도 node-local offline barrier를 거친다.
+
+1. durable quarantine/non-serving 상태에서 해당 NATS process와 cluster route/network를 stop/isolate하고
+   stable observed zero를 증명한다.
+2. process가 stopped인 동안 latest exact operator/target/system claim·config를 그 durable store에
+   per-store atomic replace하고 hash를 검증한다.
+3. restart하되 client ingress, cluster routes, readiness/service discovery를 모두 격리해 non-serving을
+   유지한다.
+4. non-mutating signer trust, exact hash/floors, old publisher/revoked-client credential의
+   reconnect·publish ingress 전 거부, attempt 뒤 store hash 불변, pre-accepted delayed stale update
+   소거를 node-local로 검증한다.
+5. membership이 안정된 뒤에만 routes/client serving을 enable하고 authoritative membership에
+   re-add한다. partial replace/검증, zero 불명, membership drift는 계속 quarantine/fail-closed한다.
 
 ### 4.4 모호한 실패와 reconciliation
 
@@ -820,7 +828,7 @@ forensic backup restore와 protocol v2 rollback은 §2.5에 따라 금지한다.
 | T4 | private mint → actual JWT decode → exact record persist → return 순서; record 실패 시 JWT/seed가 어떤 외부 seam에도 escape하지 않음 |
 | T5 | broader-set stateful confirmation의 cross-route/account/filter/digest 결박, empty/sparse ledger, expiry, replay와 concurrent consume 단일 승자, fixed floor 재사용; exact revoke는 token 없이 durable operation/CAS로 직접 executing. deterministic hook으로 final digest+fence transaction 직전/직후 다른 replica mint를 경주시켜 per-peer/account-wide 선형화를 검증 |
 | T6 | generations-first 뒤 key write 실패 시 key file/material/cache 불변 + audit sidecar 전진 가능; stale-entry compaction 뒤에도 full인 new-peer register는 audit fail-open, missing target entry의 offline rotate는 durable slot/write 없으면 key 변경 전 fail-closed |
-| T7 | 같은 account의 concurrent revoke가 accepted JWT에서 병합되어 lost update 없음; publish lost response/reject와 ledger failure 상태. partition node는 durable quarantine 뒤 나머지 authoritative membership으로 complete하고, stale return은 non-serving exact operator/target/system heal + non-mutating signer trust validation + old credential ingress rejection 뒤에만 rejoin; membership drift는 검증 restart |
+| T7 | 같은 account의 concurrent revoke가 accepted JWT에서 병합되어 lost update 없음; publish lost response/reject와 ledger failure 상태. partition node는 durable quarantine 뒤 나머지 authoritative membership으로 complete한다. stale return은 process/routes stable zero→stopped per-store exact heal→all-ingress 격리 restart→trust/hash/floor/old-credential rejection 검증 뒤에만 rejoin하며, pre-accepted delayed update는 release될 수 없고 store hash가 regress하지 않음; zero 불명·partial·membership drift는 quarantine 유지 |
 | T8 | exact/per-peer 새 userPubkey와 wildcard replacement의 real-server boundary: same-second 거부, 다음 초 `iat > floorSec` 성공 |
 | T9 | wildcard agent recovery: controller suspend/zero 확인, exact tuple credential 이동, re-enrol, decoded agent `iat > floorSec`, relay auth 뒤 restart |
 | T10 | core transcript 유지, post-rotation snapshot이 K_new로 열리고 K_old로 열리지 않음; gateway restart 전후 transcript 유지 |
@@ -934,8 +942,8 @@ v8은 이전 리뷰 기록의 다음 결론을 명시적으로 폐기했다.
   ClaimPublisher takeover가 안전하고, ordinary acceptance를 quorum으로 판정해도 된다는 주장
 - helper signer를 영구 root seed로만 설명하거나 delegated key를 trust에서 교체하면서 current
   account `iss`와 helper signer public key의 exact-match invariant를 유지하지 않아도 된다는 주장
-- ordinary quarantine node가 stale resolver/operator state를 heal·검증하기 전에 serving
-  membership으로 재합류해도 된다는 주장
+- ordinary quarantine node가 node-local stop/route isolation으로 pre-accepted delayed update를
+  소거하고 stale state를 heal·검증하기 전에 serving membership으로 재합류해도 된다는 주장
 
 이 로그는 역사적 오답을 규범으로 남기기 위한 것이 아니라, v8의 현재 계약과 혼동하지 않게 하기
 위한 correction record다.
