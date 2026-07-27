@@ -371,6 +371,48 @@ describe("legacy tuple storage migration", () => {
     );
   });
 
+  it("revalidates live legacy keys after an exact migration claims them", () => {
+    const legacy = writeLegacyState(SCOPE, { credential: false });
+    const credentialPath = join(home, "outside", "account.json");
+    mkdirSync(dirname(credentialPath), { recursive: true });
+    const exactBefore = Buffer.from(
+      JSON.stringify(legacyCredential(SCOPE, "EXACT"), null, 2),
+    );
+    writeFileSync(credentialPath, exactBefore, { mode: 0o600 });
+    const destination = tupleStoragePaths({ ...SCOPE, home });
+    const claim = join(
+      legacy.root,
+      ".legacy-v1-backups",
+      `${SCOPE.accountId}--${destination.namespaceId}`,
+    );
+    let ambiguousResult: ReturnType<typeof migrateLegacyTupleState> | undefined;
+
+    expect(() =>
+      migrateLegacyTupleState({
+        ...SCOPE,
+        home,
+        credentialPath,
+        _beforeExactAccountMutex: () => {
+          ambiguousResult = migrateLegacyTupleState({
+            ...OTHER_SCOPE,
+            home,
+          });
+        },
+      }),
+    ).toThrow(expect.objectContaining({ code: "legacy-migration-failed" }));
+
+    expect(ambiguousResult).toEqual({
+      status: "ambiguous-quarantined",
+      credential: "absent",
+      conversationKeys: "fresh",
+    });
+    expect(readFileSync(credentialPath)).toEqual(exactBefore);
+    expect(existsSync(destination.credentialPath)).toBe(false);
+    expect(existsSync(destination.conversationKeyPath)).toBe(false);
+    expect(existsSync(join(claim, "exact-source.json"))).toBe(false);
+    expect(existsSync(join(claim, "exact-credentials.json"))).toBe(false);
+  });
+
   it("rejects symlinked collocated keys for an exact credential override", () => {
     const legacy = writeLegacyState(SCOPE, {
       credential: false,
