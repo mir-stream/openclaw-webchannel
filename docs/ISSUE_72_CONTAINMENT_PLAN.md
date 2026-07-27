@@ -278,10 +278,25 @@ record-before-mint 방식도 쓰지 않는다.
 `issuedAtSec`/`expiresAtSec`은 원장 clock으로 계산하지 않는다. 반드시 실제 JWT의 `iat`/`exp`를
 decode해 쓴다. repository clock은 audit/operation timing에만 사용하며 이름은 항상 `nowSec()`이다.
 
+모든 계측된 browser issuance는 §4의 operation과 **같은 durable repository**를 사용한다. record
+persist transaction은 `(natsAccountPublicKey, peerId)` fence와 account-wide fence를 원자적으로
+검사한 뒤 active record를 쓴다. active fence가 있으면 mint 전에 대기/거부하는 것이 권고지만,
+이미 메모리에서 mint했더라도 persist/return하지 않고 JWT·seed를 폐기·withhold한다. fence 검사와
+issuance record persist 사이에 다른 replica가 끼어들 수 없어야 한다.
+
+이 transaction이 선형화 지점이다. issuance persist가 broader fence 획득보다 먼저 commit되면
+§5의 transaction 안 final reviewed-set query/digest에 반드시 보인다. fence 획득이 먼저 commit되면
+그 scope의 새 browser credential은 fence가 풀릴 때까지 외부로 escape하지 않는다.
+
 ### 3.3 SPI와 audit-only 가용성
 
 SPI는 durable adapter conformance suite를 제공한다. 발급 record는 credential escape 전
 fail-closed지만, Track B의 generation audit sidecar는 authorization source가 아니다.
+
+repository SPI는 최소한 (a) no-active-fence 검사 + issuance persist, (b) final reviewed-set
+query/digest + confirmation consume + operation transition + issuance fence 획득, (c) fenced
+operation reconciliation/release를 각각 durable transaction으로 제공한다. process-local mutex나
+서로 다른 ledger/operation backend를 조합해 이 계약을 대신하지 않는다.
 
 generation sidecar는 configured key capacity보다 커질 수 없다.
 
@@ -351,6 +366,11 @@ export type RevocationOperation = {
   readonly expiresAtSec: number;
   readonly baseAcceptedClaimId: string; // version/hash/JTI
   readonly candidateClaimId: string | null;
+  /** revoke-one은 null; broader set은 durable issuance fence identity */
+  readonly issuanceFence:
+    | { scope: "peer"; peerId: string; fencingToken: string }
+    | { scope: "account"; fencingToken: string }
+    | null;
   readonly status:
     | "reviewed"
     | "executing"
@@ -362,9 +382,12 @@ export type RevocationOperation = {
 ```
 
 repository의 최소 transaction 계약은 `(account public key, acceptedClaimId, operation.version)`을
-한 CAS 경계에서 fence하고, confirmation consume과 `reviewed → executing`을 원자화하며, resolver
-결과와 ledger mark progress를 idempotent하게 기록하는 것이다. operation에는 JWT/seed를 저장하지
-않고 candidate/accepted claim의 비밀 아닌 hash/JTI만 저장한다.
+한 CAS 경계에서 fence하고, broader-set final digest 검증·confirmation consume·
+`reviewed → executing`·issuance fence 획득을 원자화하며, resolver 결과와 ledger mark progress를
+idempotent하게 기록하는 것이다. per-peer는 `(natsAccountPublicKey, peerId)` fence, wildcard는
+`natsAccountPublicKey` 전체 fence를 잡는다. exact `revoke-one`은 새 issuance가 그 exact
+`userPubkey`를 재사용하지 않으므로 broader issuance fence가 필요 없고 `issuanceFence:null`이다.
+operation에는 JWT/seed를 저장하지 않고 candidate/accepted claim의 비밀 아닌 hash/JTI만 저장한다.
 
 operator는 raw `at`을 입력하지 않는다. 서버는 operation을 만들 때 unix seconds
 `fixedFloorSec`를 **한 번만** 유도하고 positive safe integer·허용 clock bound를 검증한다. 값은
@@ -385,8 +408,15 @@ decoded 새 JWT가 `iat > fixedFloorSec`일 때까지 §2.3처럼 wait/retry한�
   revoke되었지만 ledger row는 아직 `active`일 수 있다. 조회/API는 account+userPubkey에 걸린
   operation overlay와 `reconciliation-required`를 함께 반환해 이를 **effective active**라고
   보고하지 않는다.
-- reconciler는 account public key별 fence를 잡고 resolver accepted JWT를 source of truth로
-  ledger를 수렴시킨다.
+- reconciler는 account public key별 claim fence와 operation의 issuance fencing token을 소유권
+  확인한 뒤 resolver accepted JWT를 source of truth로 ledger를 수렴시킨다.
+
+broader issuance fence는 resolver acceptance와 대상 ledger convergence가 모두 끝난 `complete`
+뒤에만 release한다. `acceptance-unknown`과 `reconciliation-required` 동안은 유지한다. 명시적
+publish rejection처럼 resolver 미적용이 readback으로 확정된 safe abort에서만 release할 수 있다.
+process crash나 lease expiry만으로 무조건 풀지 않는다. recovery worker가 더 높은 repository fencing
+token으로 operation ownership을 인수하고 readback/reconciliation 또는 safe abort를 완료한 뒤
+release한다. stale worker는 이전 token으로 publish, ledger mark, release를 수행할 수 없다.
 
 lost response를 이유로 더 새로운 floor를 만들거나, stale account JWT에서 다시 시작해 동시
 revocation을 덮어쓰면 안 된다. `addRevocation`의 per-key monotonic floor는 방어층이지만 durable
@@ -418,12 +448,12 @@ confirmation record에는 다음 값을 모두 결박한다.
 - expiry
 - 고유 token ID
 
-consume은 `reviewed → executing` 단일 원자 전이다. 동시 consume 중 하나만 실행권을 얻고, 나머지는
-다시 publish하지 않으며 같은 operation status를 반환할 수 있다. token replay는 절대 새 `nowSec()`로
-floor를 재계산하지 않는다.
-
-broader-set 실행 직전 현재 대상 집합의 digest를 다시 계산한다. 다르면 새 dry-run을 요구한다.
-empty/sparse ledger도 digest에 명시적으로 표현해 다른 account/route의 token이 통과하지 못하게 한다.
+broader-set 실행은 같은 durable transaction에서 (1) 현재 대상 집합을 다시 query해 digest 검증,
+(2) confirmation consume, (3) `reviewed → executing`, (4) per-peer/account-wide issuance fence
+획득을 수행한다. 하나라도 실패하면 전부 commit하지 않는다. 동시 consume 중 하나만 실행권을 얻고,
+나머지는 다시 publish하지 않으며 같은 operation status를 반환할 수 있다. token replay는 절대 새
+`nowSec()`로 floor를 재계산하지 않는다. empty/sparse ledger도 digest에 명시적으로 표현해 다른
+account/route의 token이 통과하지 못하게 한다.
 
 wildcard dry-run은 ledger가 아는 active/비만료 browser credential을 tenant·peer별로 집계하고 다음
 unknown을 별도 경고한다.
@@ -431,6 +461,13 @@ unknown을 별도 경고한다.
 - 원장 도입 전에 발급된 browser credential 수와 식별자는 알 수 없음
 - agent/observer 직접 mint는 browser ledger 밖이므로 수를 알 수 없음
 - wildcard는 위 unknown을 포함해 같은 NATS account의 모든 user key에 적용됨
+
+warning만으로 wildcard를 `complete`로 만들 수는 없다. browser repository fence 밖의 agent/observer
+issuer는 controller suspend, operational issuance freeze와 preflight attestation으로 발급을
+차단한다. 이 operational freeze는 final digest/fence transaction 전에 획득해 resolver acceptance와
+ledger convergence까지 유지한다. 모든 issuer replica의 동결을 통제·확인할 수 없으면 wildcard
+실행/완료를 fail-closed한다. 복구용 replacement는 operation `complete`와 안전한 fence/freeze
+release 뒤에만 §2.3의 `iat > fixedFloorSec` 절차로 발급한다.
 
 per-peer dry-run도 비만료 credential과 동일 peer의 복수 credential을 빠뜨리지 않는다. 모든
 dry-run/log/error/operation status는 JWT, seed, K, private key를 포함하지 않는다.
@@ -646,7 +683,7 @@ forensic backup restore와 protocol v2 rollback은 §2.5에 따라 금지한다.
 | T2-b | 선택된 full/Dir resolver: publish response, durable readback, targeted disconnect/reconnect failure |
 | T3 | browser mint caller inventory: 모든 non-test reference/demo/example 경로가 instrumented seam을 지나며 agent/observer 예외가 분류됨 |
 | T4 | private mint → actual JWT decode → exact record persist → return 순서; record 실패 시 JWT/seed가 어떤 외부 seam에도 escape하지 않음 |
-| T5 | broader-set stateful confirmation의 cross-route/account/filter/digest 결박, empty/sparse ledger, expiry, replay와 concurrent consume 단일 승자, fixed floor 재사용; exact revoke는 token 없이 durable operation/CAS로 직접 executing |
+| T5 | broader-set stateful confirmation의 cross-route/account/filter/digest 결박, empty/sparse ledger, expiry, replay와 concurrent consume 단일 승자, fixed floor 재사용; exact revoke는 token 없이 durable operation/CAS로 직접 executing. deterministic hook으로 final digest+fence transaction 직전/직후 다른 replica mint를 경주시켜 per-peer/account-wide 선형화를 검증 |
 | T6 | generations-first 뒤 key write 실패 시 key file/material/cache 불변 + audit sidecar 전진 가능; stale-entry compaction 뒤에도 full인 new-peer register는 audit fail-open, missing target entry의 offline rotate는 durable slot/write 없으면 key 변경 전 fail-closed |
 | T7 | 같은 account의 concurrent revoke가 accepted JWT에서 병합되어 lost update 없음; publish lost response, publish reject, acceptance 뒤 ledger failure, partial cluster propagation의 상태·reconciliation |
 | T8 | exact/per-peer 새 userPubkey와 wildcard replacement의 real-server boundary: same-second 거부, 다음 초 `iat > floorSec` 성공 |
@@ -663,6 +700,7 @@ forensic backup restore와 protocol v2 rollback은 §2.5에 따라 금지한다.
 | T19 | non-expiring credential과 한 peer의 복수 credential을 exact/per-peer/wildcard dry-run·실행에서 빠짐없이 처리하고 pre-ledger/agent unknown 경고를 고정 |
 | T20 | publish→live drain 확인→key persistence→core history retain/reseal→fresh bootstrap 각 경계에 fault를 주어 operation 상태와 재시작/reconciliation 결과를 검증 |
 | T21 | `revocationCapable`이 operator-seed rollout 제약과 resolver readiness를 보고하고, managed provider 실패가 actionable control/escalation을 반환하며 모든 응답·로그에 secret이 없음 |
+| T22 | active issuance fence 중 mint 전 대기/거부 및 mint 후 persist/return 전 폐기, wildcard 외부 issuer freeze fail-closed, crash/lease expiry·acceptance-unknown·reconciliation-required에서 fence 유지/ownership takeover, safe abort/complete release 뒤 issuance 재개 |
 
 T2-a와 T2-b는 서로 대체하지 않는다. real-server harness는 바이너리 부재 시 명시적으로 skip할 수
 있지만 CI lane에는 v2.14.2 MEMORY와 선택된 Dir/full topology를 둘 다 둔다.
@@ -677,7 +715,7 @@ K_new history snapshot 성공과 fresh browser 양방향 relay 성공이다.
 
 | 수용 요구 | 규범 설계 | 증명 |
 |---|---|---|
-| one credential 또는 reviewed broader set revoke | §4 batch/CAS, §5 stateful confirmation | T5, T7, T8, T19 |
+| one credential 또는 reviewed broader set revoke | §3.2 issuance linearization, §4 batch/CAS/fence, §5 stateful confirmation | T5, T7, T8, T19, T22 |
 | self-contained resolver publish/acceptance와 live 차단 | §1.2, §6 | T2-a, T2-b |
 | 발급분 추적과 비밀 미저장 | §3 | T3, T4, T19 |
 | selected peer K rotation과 새 암호 경계 | §2.7, §8.1~§8.4 | T14, T17, T18 |
@@ -685,16 +723,17 @@ K_new history snapshot 성공과 fresh browser 양방향 relay 성공이다.
 | security-authoritative monotonic epoch와 epoch-bound AAD | §0.1의 **selected substitution**; privileged storage rollback은 #85로 deferred | 이 PR에서 literal satisfaction을 주장하지 않음 |
 | history 정책 명시 | §1.4, §8.5 | T10, T20 |
 | 전체 사고 순서가 노출 창 없이 수렴 | §2.7 | T13, T18, T20 |
-| agent/wildcard·managed·degraded 운영 가능 | §2.2~§2.4, §3.4, §5 | T5, T8, T9, T19 |
+| agent/wildcard·managed·degraded 운영 가능 | §2.2~§2.4, §3.4, §5 | T5, T8, T9, T19, T22 |
 | 과거 노출을 치유한다고 주장하지 않음 | §0, §8.4 | old-envelope fixture와 문서 검토 |
 
 ## 10. 롤아웃과 장애 처리
 
 1. Track C 런북과 MEMORY real-server 검증을 먼저 낸다.
 2. Track A에서는 full/Dir resolver migration을 먼저 착륙시키고 여섯 topology smoke test를 통과한다.
-3. durable operation/claim repository와 reconciliation을 배포한다.
-4. issuance wrapper를 private-mint/persist-before-return으로 전환하고 repo-wide caller test를
-   통과한다.
+3. issuance ledger와 durable operation/claim repository를 **같은 transactional backend**에
+   배포하고 fence recovery/reconciliation을 활성화한다.
+4. 모든 issuance wrapper를 private-mint + atomic fence-check/persist-before-return으로 전환하고
+   repo-wide caller/race conformance test를 통과한다.
 5. reference/demo top-level router를 연결한 뒤 admin revoke route를 활성화한다.
 6. publish/readback, reconciliation backlog, acceptance-unknown을 관측한다.
 7. Track B를 배포할 때 protocol v3 client/plugin/SaaS를 lockstep roll forward하고 forced
@@ -703,6 +742,9 @@ K_new history snapshot 성공과 fresh browser 양방향 relay 성공이다.
 publish 실패는 revoke 성공으로 보고하지 않는다. publish 수용 뒤 ledger failure도 active/revoked
 둘 중 하나로 거짓 단순화하지 않고 reconciliation-required로 운영한다. resolver health가 나빠지면
 새 revoke를 중단하고 accepted JWT를 readback해 수렴시킨다.
+
+broader revoke route는 3~4단계가 모든 issuer replica에 배포되고 wildcard 외부 issuer freeze
+preflight가 준비되기 전에는 활성화하지 않는다.
 
 ## 11. 미결 항목
 
@@ -742,6 +784,8 @@ v8은 이전 리뷰 기록의 다음 결론을 명시적으로 폐기했다.
 - backup restore가 `clientNonce`로 탐지될 수 있고 rollback 문제가 wire 호환성뿐이라는 주장
 - audit epoch를 security-authoritative로 보거나 같은 local snapshot의 epoch/AAD만으로 privileged
   rollback까지 막았다고 보아 원래 epoch AC를 literal satisfaction으로 표시하는 주장
+- final digest 확인만으로 concurrent issuance를 닫았다고 보고, issuance persist와 broader revoke를
+  같은 durable fence 아래 선형화하지 않아도 된다는 주장
 
 이 로그는 역사적 오답을 규범으로 남기기 위한 것이 아니라, v8의 현재 계약과 혼동하지 않게 하기
 위한 correction record다.
