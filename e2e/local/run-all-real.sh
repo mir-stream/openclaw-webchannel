@@ -2,8 +2,8 @@
 # #21 — ALL-REAL fusion E2E. ONE live harness where a REAL headless-Chromium
 # browser running the PRODUCTION WebChannelNatsClient:
 #   (a) NATS-layer NKEY-authenticates to a REAL JWT-auth nats-server, AND
-#   (b) drives the JWT + Proof-of-Possession HTTP register hop,
-# against a REAL enrolled plugin (gateway, devOpen OFF) whose NATS creds were
+#   (b) drives the JWT + Proof-of-Possession NATS request/reply register hop,
+# against a REAL enrolled plugin (gateway) whose NATS creds were
 # acquired AT CONFIG TIME via `openclaw channels add` (가-1: the device-flow
 # EnrollmentClient runs in the setup hook, not at gateway boot) and which the
 # CONSUME-ONLY gateway then loads to connect to the SAME nats-server — all from
@@ -11,8 +11,8 @@
 # left is the echo LLM.
 #
 # This FUSES the #18 server topology (run-enrolled-transport.sh: unified issuer +
-# JWT-auth nats-server from ONE setupTrustChain + enrolled plugin, devOpen OFF)
-# with the #19 browser driver (browser-jwt-register.mjs → here: all-real.mjs).
+# JWT-auth nats-server from ONE setupTrustChain + enrolled plugin)
+# with the #19 browser driver (all-real.mjs).
 #
 # Trust unification: ONE setupTrustChain() in the reference enrollment-server
 # feeds (a) the device-flow NATS user creds the agent enrolls for, (b) the
@@ -40,6 +40,7 @@ NATS_WS=18622
 NATS_TCP=14622
 ECHO_PORT=18904
 ISSUER_PORT=3941
+ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
 PAGE_PORT=19393
 
 TENANT=default-tenant
@@ -88,6 +89,7 @@ SAAS_ISSUER="$SAAS_ISSUER" \
 NATS_URL="ws://127.0.0.1:$NATS_WS" \
 NATS_CONFIG_OUT="$OCH" \
 ENABLE_TEST_ROUTES=1 \
+ENROLLMENT_ADMIN_TOKEN="$ENROLLMENT_ADMIN_TOKEN" \
 POLL_INTERVAL_SECONDS=1 \
   node --import tsx "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
 ISSUER_PID=$!
@@ -223,8 +225,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
             "strategy": "jwt",
             "jwt": {
               "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
-              "issuer": "$SAAS_ISSUER",
-              "audience": "$ACCOUNT_ID"
+              "issuer": "$SAAS_ISSUER"
             }
           },
           "dmSecurity": "allowlist",
@@ -242,7 +243,7 @@ echo "[run-all-real] wrote $OCH/.openclaw/openclaw.json"
 #    After Cycle 1/2 the gateway is CONSUME-ONLY — it no longer enrolls. The
 #    device flow runs HERE, at config time (exactly as a production operator runs
 #    `openclaw channels add`). HOME=$OCH so creds persist to
-#    $OCH/.openclaw-webchannel/<account>/credentials.json, which the gateway
+#    the tuple-scoped v2 credentials path under $OCH, which the gateway
 #    (also HOME=$OCH) consumes. Identity via the generic flags the webchannel
 #    setup adapter maps: --base-url→saas.baseUrl, --url→tenant. The wire identity
 #    is the --account value itself (no --token→agentId mapping anymore — the
@@ -270,6 +271,7 @@ done
 [ -z "$USER_CODE" ] && { echo "[run-all-real] TIMEOUT waiting for user_code — channels-add log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-all-real] enrollment user_code=$USER_CODE — approving…"
 APPROVE="$(curl -fsS -X POST "http://127.0.0.1:$ISSUER_PORT/approve" \
+  -H "Authorization: Bearer $ENROLLMENT_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d "{\"user_code\":\"$USER_CODE\"}" || true)"
 echo "[run-all-real] approve response: $APPROVE"
 
@@ -279,16 +281,16 @@ ADD_PID=""
 if [ "$ADD_RC" -ne 0 ]; then
   echo "[run-all-real] channels add failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add.log"; exit 2
 fi
-CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
+CRED_FILE="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+  credentials "$TENANT" "$ACCOUNT_ID" "$OCH")"
 [ -f "$CRED_FILE" ] || { echo "[run-all-real] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-all-real] ✓ credentials persisted at $CRED_FILE"
 
-# 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
-#      setup adapter writes the demo-proven block (`admission: "auto"`,
-#      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
-#      override that disables the HTTP register hop (no aud→account dispatch
-#      entry ⇒ challenge 401 "No account for token audience"), and this harness
-#      drives the register hop. Restore the pre-add intent.
+# 6b². Tighten dmSecurity AFTER `channels add`. The setup adapter writes the
+#      demo-proven block (`admission: "register-hop"` — the sole admission path —
+#      with `dmSecurity: "open"`) into the account; this step narrows it to
+#      `dmSecurity: "allowlist"` plus an explicit `allowFrom` pin so the harness
+#      exercises the allowlist path. (admission stays register-hop throughout.)
 node -e '
   const fs = require("fs");
   const p = process.argv[1], acct = process.argv[2], peer = process.argv[3];
@@ -312,9 +314,10 @@ HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &
 GW_PID=$!
-echo "[run-all-real] gateway pid=$GW_PID — waiting for plugin registration (consume persisted creds)…"
+echo "[run-all-real] gateway pid=$GW_PID — waiting for structured account readiness (consume persisted creds)…"
 for i in $(seq 1 240); do
-  if grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$OCH/gateway.log" 2>/dev/null; then
+  LATEST_AGGREGATE="$(grep "event=webchannel\.account_aggregate" "$OCH/gateway.log" 2>/dev/null | tail -n 1 || true)"
+  if printf '%s\n' "$LATEST_AGGREGATE" | grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=1 totalCount=1"; then
     echo "[run-all-real] gateway ready (consumed creds + connected)"
     break
   fi
@@ -323,9 +326,53 @@ for i in $(seq 1 240); do
   fi
   sleep 0.5
   if [ "$i" -eq 240 ]; then
-    echo "[run-all-real] TIMEOUT waiting for gateway registration — log:"; cat "$OCH/gateway.log"; exit 2
+    echo "[run-all-real] TIMEOUT waiting for structured account readiness — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
+
+# P0-1 T3b: a real gateway boot must expose no browser-facing WEBCHANNEL socket
+# endpoint. Reality check (probed live): the OpenClaw CORE gateway accepts a WS
+# upgrade on ANY path of its port and immediately issues its authenticated
+# control-protocol `connect.challenge` — that surface is core OpenClaw, not
+# ours, and cannot be removed by this plugin. The correct invariant is
+# therefore INDISTINGUISHABILITY: /webchannel/ws must behave exactly like an
+# unregistered path (same status; if 101, the first frame is the core
+# connect.challenge and carries no webchannel-protocol markers).
+t3b_probe() {
+  # $1=path $2=outfile; prints http_code; rc propagated (28 = held open, OK)
+  curl -sS --connect-timeout 2 --max-time 5 -o "$2" -w '%{http_code}' \
+    -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+    -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+    "http://127.0.0.1:$GW_PORT$1"
+}
+set +e
+WC_STATUS=$(t3b_probe /webchannel/ws "$OCH/t3b-webchannel.out"); WC_RC=$?
+CN_STATUS=$(t3b_probe /p0-1-unregistered-canary "$OCH/t3b-canary.out"); CN_RC=$?
+set -e
+if [ "$WC_RC" -ne 0 ] && [ "$WC_RC" -ne 28 ]; then
+  echo "[run-all-real] FAIL — T3b probe errored (curl rc=$WC_RC)" >&2
+  exit 2
+fi
+if [ "$WC_STATUS" != "$CN_STATUS" ]; then
+  echo "[run-all-real] FAIL — /webchannel/ws ($WC_STATUS) differs from unregistered path ($CN_STATUS): a webchannel-specific route exists" >&2
+  exit 2
+fi
+if [ "$WC_STATUS" = "101" ]; then
+  # LC_ALL=C + -a: the capture starts with a raw WS frame byte (0x81). BSD grep
+  # in a UTF-8 locale silently fails to match lines carrying invalid multibyte
+  # sequences, and binary heuristics vary across grep implementations.
+  if ! LC_ALL=C grep -aq 'connect.challenge' "$OCH/t3b-webchannel.out"; then
+    echo "[run-all-real] FAIL — 101 on /webchannel/ws without the core connect.challenge (unknown upgrade handler)" >&2
+    exit 2
+  fi
+  if LC_ALL=C grep -aqE '"type"[[:space:]]*:[[:space:]]*"(agent_message|history|approval_request|approval_snapshot|approval_resolved|typing|commands|ack|progress|reasoning|turn_settled)"' "$OCH/t3b-webchannel.out"; then
+    echo "[run-all-real] FAIL — /webchannel/ws answered with webchannel-protocol frames" >&2
+    exit 2
+  fi
+  echo "[run-all-real] ✓ T3b: /webchannel/ws is indistinguishable from an unregistered path (core gateway challenge only)"
+else
+  echo "[run-all-real] ✓ T3b: no upgrade accepted on /webchannel/ws (HTTP $WC_STATUS, matches unregistered path)"
+fi
 
 # ---------------------------------------------------------------------------
 # 7. Run the REAL-BROWSER Playwright driver (NKEY-auth + PoP register).

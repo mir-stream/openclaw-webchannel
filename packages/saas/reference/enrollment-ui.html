@@ -134,7 +134,7 @@
     }
   </style>
 </head>
-<body>
+<body data-user-code="{{USER_CODE}}">
   <div class="container">
     <h1>🔐 WebChannel Plugin Enrollment</h1>
 
@@ -144,6 +144,7 @@
     </div>
 
     <div class="user-code">{{USER_CODE}}</div>
+    <label>Admin token <input id="admin-token" type="password" autocomplete="off"></label>
 
     <div class="button-group">
       <button class="approve" onclick="approveEnrollment()">✓ Approve</button>
@@ -176,31 +177,33 @@
   </div>
 
   <script>
-    const userCode = "{{USER_CODE}}";
+    const userCode = document.body.dataset.userCode || "";
+    let adminToken = "";
     const statusEl = document.getElementById("status");
 
-    async function approveEnrollment() {
+    async function approveEnrollment(replaceActivationId) {
       statusEl.className = "pending";
       statusEl.innerHTML = '<div class="spinner"></div> Processing approval...';
 
       try {
         const res = await fetch("/approve", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_code: userCode })
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + (adminToken ||= document.getElementById("admin-token").value) },
+          body: JSON.stringify({ user_code: userCode, ...(replaceActivationId ? { replaceActivationId } : {}) })
         });
 
         const result = await res.json();
 
         if (result.success) {
           statusEl.className = "approved";
-          statusEl.innerHTML = "✓ Enrollment Approved!<br><br>" +
-            '<div class="details">' +
-            "<strong>Plugin Details:</strong><br>" +
-            "Account ID: " + (result.accountId || "N/A") + "<br>" +
-            "Tenant: " + (result.tenant || "N/A") + "<br>" +
-            "Peer ID: " + result.peerId + "<br>" +
-            "</div>";
+          statusEl.replaceChildren();
+          const title = document.createElement("strong");
+          title.textContent = "✓ Enrollment Approved!";
+          const details = document.createElement("div");
+          details.className = "details";
+          details.textContent = `Account ID: ${result.accountId || "N/A"}\nTenant: ${result.tenant || "N/A"}\nPeer ID: ${result.peerId || "N/A"}`;
+          details.style.whiteSpace = "pre-line";
+          statusEl.append(title, details);
 
           // Disable buttons
           document.querySelectorAll("button").forEach(btn => {
@@ -208,6 +211,12 @@
             btn.style.opacity = "0.5";
             btn.style.cursor = "not-allowed";
           });
+        } else if (res.status === 409 && result.error === "conflict") {
+          const when = result.enrolledAt ? new Date(result.enrolledAt).toISOString() : "unknown";
+          const warning = `This approval replaces existing agent key ${result.fingerprint || "unknown"} (enrolled ${when}). Continue?`;
+          statusEl.className = "denied";
+          statusEl.textContent = warning;
+          if (result.activationId && confirm(warning)) await approveEnrollment(result.activationId);
         } else {
           statusEl.className = "denied";
           statusEl.textContent = "✗ Approval failed: " + (result.error || "Unknown error");
@@ -225,7 +234,7 @@
       try {
         const res = await fetch("/deny", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "Authorization": "Bearer " + (adminToken ||= document.getElementById("admin-token").value) },
           body: JSON.stringify({ user_code: userCode })
         });
 

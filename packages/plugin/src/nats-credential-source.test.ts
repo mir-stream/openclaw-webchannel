@@ -9,11 +9,16 @@
 import { describe, it, expect, vi } from "vitest";
 
 import {
+  resolveEnrolledSaasBaseUrl,
   resolveNatsCredentialSource,
   connectNatsCredentialSource,
   parseNatsCredsFile,
   type NatsCredentialSource,
 } from "./nats-credential-source.js";
+import {
+  completeJwtHandshake,
+  createConnectorTransportHarness,
+} from "./nats-connect-cleanup-test-helper.js";
 
 // A realistic-shaped NATS .creds file (tokens are fake but well-formed).
 const CREDS_FILE = `-----BEGIN NATS USER JWT-----
@@ -54,31 +59,17 @@ describe("parseNatsCredsFile", () => {
   });
 });
 
-describe("resolveNatsCredentialSource — open", () => {
-  it("resolves open via WEBCHANNEL_NATS_DEV_OPEN=1 (env overrides config)", () => {
-    const s = resolveNatsCredentialSource({
+describe("resolveNatsCredentialSource — removed open mode", () => {
+  it("rejects WEBCHANNEL_NATS_DEV_OPEN=1 with a migration error", () => {
+    expect(() => resolveNatsCredentialSource({
       ...BASE,
       natsConfig: { credentials: { mode: "static", userJwt: "j", userSeed: "s" } },
       env: { WEBCHANNEL_NATS_DEV_OPEN: "1" },
-    });
-    expect(s.mode).toBe("open");
-  });
-
-  it("resolves open via legacy devOpen and via credentials.mode=open", () => {
-    expect(
-      resolveNatsCredentialSource({ ...BASE, legacyNats: { devOpen: true }, env: {} }).mode,
-    ).toBe("open");
-    expect(
-      resolveNatsCredentialSource({
-        ...BASE,
-        natsConfig: { credentials: { mode: "open" } },
-        env: {},
-      }).mode,
-    ).toBe("open");
+    })).toThrow(/WEBCHANNEL_NATS_DEV_OPEN was removed/);
   });
 });
 
-describe("resolveNatsCredentialSource — static (BYO-NATS)", () => {
+describe.skip("legacy static resolution details (serving removed until P0-3)", () => {
   it("resolves static from env JWT + seed and applies the URL precedence", () => {
     const s = resolveNatsCredentialSource({
       ...BASE,
@@ -168,6 +159,19 @@ describe("resolveNatsCredentialSource — static (BYO-NATS)", () => {
   });
 });
 
+describe("resolveNatsCredentialSource — static migration signals", () => {
+  const migration = /static NATS credentials no longer imply auto admission/;
+  it.each([
+    ["mode", { natsConfig: { credentials: { mode: "static" } }, env: {} }],
+    ["credsFile", { natsConfig: { credentials: { credsFile: "/x" } }, env: {} }],
+    ["inline", { natsConfig: { credentials: { userJwt: "j", userSeed: "s" } }, env: {} }],
+    ["env JWT+seed", { env: { WEBCHANNEL_NATS_USER_JWT: "j", WEBCHANNEL_NATS_USER_SEED: "s" } }],
+    ["env creds file", { env: { WEBCHANNEL_NATS_CREDS: "/x" } }],
+  ])("rejects %s", (_name, extra) => {
+    expect(() => resolveNatsCredentialSource({ ...BASE, ...extra } as never)).toThrow(migration);
+  });
+});
+
 describe("resolveNatsCredentialSource — enrolled (default)", () => {
   it("defaults to enrolled and carries the SaaS base URL + tenant/agent", () => {
     const s = resolveNatsCredentialSource({
@@ -192,6 +196,20 @@ describe("resolveNatsCredentialSource — enrolled (default)", () => {
     expect(s.saasBaseUrl).toBe("http://localhost:3001");
   });
 
+  it("carries storageRoot and exact credentialPath through enrolled resolution", () => {
+    const s = resolveNatsCredentialSource({
+      ...BASE,
+      storageRoot: "/common/state",
+      credentialPath: "/credential-only/credentials.json",
+      env: {},
+    });
+    expect(s).toMatchObject({
+      mode: "enrolled",
+      storageRoot: "/common/state",
+      credentialPath: "/credential-only/credentials.json",
+    });
+  });
+
   it("honors nats.credentials.saasBaseUrl (over the top-level config value)", () => {
     const s = resolveNatsCredentialSource({
       ...BASE,
@@ -212,12 +230,66 @@ describe("resolveNatsCredentialSource — enrolled (default)", () => {
     }) as Extract<NatsCredentialSource, { mode: "enrolled" }>;
     expect(s.saasBaseUrl).toBe("https://env.example");
   });
+
+  it.each(["bogus", null])(
+    "rejects invalid explicit credential mode %j instead of treating it as enrolled",
+    (invalidMode) => {
+    expect(() =>
+      resolveNatsCredentialSource({
+        ...BASE,
+        natsConfig: { credentials: { mode: invalidMode } } as never,
+        env: {},
+      }),
+    ).toThrow(/credentials\.mode must be "static" or "enrolled"/);
+    },
+  );
+});
+
+describe("resolveEnrolledSaasBaseUrl — shared binding precedence", () => {
+  it("uses env > credential override > account SaaS > optional fallback", () => {
+    const base = {
+      natsConfig: {
+        credentials: { saasBaseUrl: "https://credentials.example" },
+      },
+      saasBaseUrl: "https://account.example",
+      fallback: "https://fallback.example",
+    };
+    expect(
+      resolveEnrolledSaasBaseUrl({
+        ...base,
+        env: { WEBCHANNEL_SAAS_BASE_URL: "https://env.example" },
+      }),
+    ).toBe("https://env.example");
+    expect(resolveEnrolledSaasBaseUrl({ ...base, env: {} })).toBe(
+      "https://credentials.example",
+    );
+    expect(
+      resolveEnrolledSaasBaseUrl({
+        saasBaseUrl: "https://account.example",
+        fallback: "https://fallback.example",
+        env: {},
+      }),
+    ).toBe("https://account.example");
+    expect(
+      resolveEnrolledSaasBaseUrl({
+        fallback: "https://fallback.example",
+        env: {},
+      }),
+    ).toBe("https://fallback.example");
+  });
+
+  it("preserves setup/status missing-config detection without a fallback", () => {
+    expect(resolveEnrolledSaasBaseUrl({ env: {} })).toBeUndefined();
+  });
 });
 
 describe("connectNatsCredentialSource — static branch", () => {
   it("builds a transport with the user JWT + an NKEY signing callback", async () => {
     let captured: Record<string, unknown> | undefined;
-    const fakeTransport = { connect: vi.fn().mockResolvedValue(undefined) };
+    const fakeTransport = {
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn(),
+    };
     const makeSigner = vi.fn().mockReturnValue(async () => "sig");
 
     const result = await connectNatsCredentialSource(
@@ -239,23 +311,7 @@ describe("connectNatsCredentialSource — static branch", () => {
     expect(fakeTransport.connect).toHaveBeenCalled();
     expect(result.transport).toBe(fakeTransport);
     expect(result.enrolled).toBeUndefined();
-  });
-
-  it("open branch builds a no-auth transport", async () => {
-    let captured: Record<string, unknown> | undefined;
-    const fakeTransport = { connect: vi.fn().mockResolvedValue(undefined) };
-    await connectNatsCredentialSource(
-      { mode: "open", url: "ws://x" },
-      {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        transportFactory: (opts) => {
-          captured = opts as Record<string, unknown>;
-          return fakeTransport as any;
-        },
-      },
-    );
-    expect(captured?.["jwtCredential"]).toBeUndefined();
-    expect(captured?.["nkeySigningCallback"]).toBeUndefined();
+    expect(fakeTransport.disconnect).not.toHaveBeenCalled();
   });
 
   it("enrolled branch delegates to createEnrolled and returns the connection", async () => {
@@ -266,9 +322,11 @@ describe("connectNatsCredentialSource — static branch", () => {
       {
         mode: "enrolled",
         url: "wss://n",
-        saasBaseUrl: "https://saas.example",
+        saasBaseUrl: "https://saas.example///",
         tenant: "t1",
         accountId: "a1",
+        storageRoot: "/common/state",
+        credentialPath: "/credential-only/credentials.json",
       },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       { createEnrolled: createEnrolled as any },
@@ -280,9 +338,136 @@ describe("connectNatsCredentialSource — static branch", () => {
         natsUrl: "wss://n",
         tenant: "t1",
         accountId: "a1",
+        storageRoot: "/common/state",
+        credentialPath: "/credential-only/credentials.json",
       }),
     );
     expect(result.transport).toBe(fakeTransport);
     expect(result.enrolled).toBe(enrolled);
+  });
+
+  it.each([
+    ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
+    ["account", { accountId: "../../unsafe" }, "storage.accountId"],
+    ["malformed SaaS URL", { saasBaseUrl: "not a url" }, "binding.saasBaseUrl"],
+    ["relative SaaS URL", { saasBaseUrl: "/control" }, "binding.saasBaseUrl"],
+    ["non-HTTP SaaS URL", { saasBaseUrl: "ftp://saas.example" }, "binding.saasBaseUrl"],
+  ] as const)(
+    "enrolled branch rejects invalid binding %s before injected creation",
+    async (_label, override, expectedField) => {
+      const createEnrolled = vi.fn();
+      await expect(
+        connectNatsCredentialSource(
+          {
+            mode: "enrolled",
+            url: "wss://must-not-dial",
+            saasBaseUrl: "https://saas.example",
+            tenant: "tenant",
+            accountId: "account",
+            ...override,
+          },
+          { createEnrolled: createEnrolled as never },
+        ),
+      ).rejects.toThrow(expectedField);
+      expect(createEnrolled).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["signer", "protocol", "timeout"] as const)(
+    "retires a real production transport after a %s handshake failure",
+    async (failure) => {
+      vi.useFakeTimers();
+      try {
+        const signerError = new Error("NKEY signer rejected");
+        let signerRejects = failure === "signer";
+        const harness = createConnectorTransportHarness();
+        const connecting = connectNatsCredentialSource(
+          { mode: "static", url: "wss://x", userJwt: "JWT", userSeed: "SEED" },
+          {
+            transportFactory: harness.transportFactory,
+            makeSigner: () => async () => {
+              if (signerRejects) throw signerError;
+              return "signature";
+            },
+          },
+        );
+        const rejection = connecting.then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+        const transport = harness.transport();
+        const socket = harness.sockets[0]!;
+        socket.open();
+        transport.subscribe("pre.failure.subscription");
+
+        if (failure === "signer") {
+          socket.server('INFO {"nonce":"n"}\r\n');
+        } else if (failure === "protocol") {
+          socket.server('INFO {"nonce":"n"}\r\n');
+          await Promise.resolve();
+          await Promise.resolve();
+          socket.server("-ERR 'Authorization Violation'\r\n");
+        } else {
+          await vi.advanceTimersByTimeAsync(25);
+        }
+
+        const rejected = await rejection;
+        if (failure === "signer") expect(rejected).toBe(signerError);
+        if (failure === "protocol") {
+          expect(rejected).toBeInstanceOf(Error);
+          expect((rejected as Error).message).toContain("Authorization Violation");
+        }
+        if (failure === "timeout") {
+          expect(rejected).toBeInstanceOf(Error);
+          expect((rejected as Error).message).toContain("handshake timeout in phase INFO");
+        }
+
+        expect(socket.readyState).toBe(3);
+        expect(socket.closeCalls).toBeGreaterThan(0);
+        expect(transport.connected).toBe(false);
+        expect(() => transport.publish("must.not.send", "x")).toThrow(/not connected/);
+        expect(vi.getTimerCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(harness.sockets).toHaveLength(1);
+
+        // Explicit reuse is allowed. Its next reconnect must NOT replay the
+        // pre-failure SUB, proving connector cleanup cleared subscription state.
+        signerRejects = false;
+        const reused = transport.connect();
+        await completeJwtHandshake(harness.sockets[1]!);
+        await reused;
+        const reconnected = new Promise<void>((resolve) => transport.once("reconnect", resolve));
+        harness.sockets[1]!.close();
+        await vi.advanceTimersByTimeAsync(5);
+        await completeJwtHandshake(harness.sockets[2]!);
+        await reconnected;
+        expect(harness.sockets[2]!.sent.filter(
+          (frame) => typeof frame === "string" && frame.startsWith("SUB "),
+        )).toEqual([]);
+        transport.disconnect();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("keeps a successfully connected real static transport live", async () => {
+    const harness = createConnectorTransportHarness();
+    const connected = connectNatsCredentialSource(
+      { mode: "static", url: "wss://x", userJwt: "JWT", userSeed: "SEED" },
+      {
+        transportFactory: harness.transportFactory,
+        makeSigner: () => async () => "signature",
+      },
+    );
+    await completeJwtHandshake(harness.sockets[0]!);
+    const result = await connected;
+    expect(result.transport).toBe(harness.transport());
+    expect(result.transport.connected).toBe(true);
+    expect(harness.sockets[0]!.closeCalls).toBe(0);
+    result.transport.subscribe("still.live");
+    expect(harness.sockets[0]!.sent).toContain("SUB still.live 1\r\n");
+    result.transport.disconnect();
   });
 });

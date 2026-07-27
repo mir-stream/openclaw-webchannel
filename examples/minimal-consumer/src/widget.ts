@@ -12,13 +12,24 @@ import {
   type ApprovalRequest,
 } from "@mir-stream/webchannel-client";
 
-export function createWidgetClient(): WebChannelNATSClient {
+export async function createWidgetClient(): Promise<WebChannelNATSClient> {
+  const pop = (await crypto.subtle.generateKey(
+    { name: "Ed25519" }, false, ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const x25519 = (await crypto.subtle.generateKey(
+    { name: "X25519" }, false, ["deriveBits"],
+  )) as CryptoKeyPair;
   return new WebChannelNATSClient({
     natsUrl: "wss://nats.example.com",
     bootstrapJwt: "example.bootstrap.jwt",
     accountId: "example-account",
     tenant: "example-tenant",
     peerId: "example-peer",
+    registration: {
+      devicePrivateKey: pop.privateKey,
+      deviceX25519PrivateKey: x25519.privateKey,
+      pinnedAgentPublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    },
   });
 }
 

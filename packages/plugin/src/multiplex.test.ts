@@ -99,6 +99,126 @@ describe("planAccounts: multi-account (Phase 3)", () => {
     expect(plan.account.auth).toEqual({ strategy: "jwt" }); // inherited base
     expect(plan.account.dmSecurity).toBe("allowlist"); // account override
   });
+
+  it("inherits storageRoot from the shared base and lets an account override it", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          storageRoot: "/shared/state",
+          accounts: {
+            acctA: { tenant: "tA" },
+            acctB: { tenant: "tB", storageRoot: "/account-b/state" },
+          },
+        },
+      },
+    };
+    const plans = served(planAccounts(cfg, { env: {} }));
+    expect(plans[0]).toMatchObject({
+      accountId: "acctA",
+      storageRoot: "/shared/state",
+    });
+    expect(plans[1]).toMatchObject({
+      accountId: "acctB",
+      storageRoot: "/account-b/state",
+    });
+  });
+});
+
+describe("planAccounts: enabled-state serving boundary", () => {
+  it("returns no plans when the channel is globally disabled", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          enabled: false,
+          tenant: "disabled-tenant",
+          auth: { strategy: "jwt" },
+        },
+      },
+    };
+    expect(planAccounts(cfg, { env: {} })).toEqual([]);
+  });
+
+  it("omits a disabled named account while preserving enabled siblings", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            off: { enabled: false, tenant: "off-tenant" },
+            on: { enabled: true, tenant: "on-tenant" },
+            inherited: { tenant: "inherited-tenant" },
+          },
+        },
+      },
+    };
+    expect(planAccounts(cfg, { env: {} }).map((plan) => plan.accountId)).toEqual([
+      "inherited",
+      "on",
+    ]);
+  });
+
+  it("skips disabled accounts before identity or account-config resolution", () => {
+    let envReads = 0;
+    const env = new Proxy<Record<string, string | undefined>>({}, {
+      get: () => {
+        envReads += 1;
+        throw new Error("disabled account attempted identity resolution");
+      },
+    });
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            off: {
+              enabled: false,
+              auth: { strategy: "anonymous", jwt: { audience: "removed-but-disabled" } },
+            },
+          },
+        },
+      },
+    };
+
+    expect(planAccounts(cfg, { env })).toEqual([]);
+    expect(envReads).toBe(0);
+  });
+});
+
+describe("planAccounts: removed audience tombstone", () => {
+  it.each([null, false, 0, "", {}, []])(
+    "rejects a present named-account audience regardless of its JSON value (%j)",
+    (audience) => {
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              acct: {
+                tenant: "t",
+                auth: { strategy: "jwt", jwt: { audience } },
+              },
+            },
+          },
+        },
+      };
+      expect(() => planAccounts(cfg, { env: {} })).toThrow(
+        /channels\.webchannel\.accounts\.acct\.auth\.jwt\.audience/,
+      );
+    },
+  );
+
+  it("rejects a channel-base tombstone even when a named account shadows auth.jwt", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          auth: { strategy: "jwt", jwt: { audience: "shared" } },
+          accounts: {
+            acct: { tenant: "t", auth: { strategy: "jwt", jwt: { issuer: "i" } } },
+          },
+        },
+      },
+    };
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /channels\.webchannel\.auth\.jwt\.audience/,
+    );
+  });
 });
 
 describe("planAccounts: 가-2 decoupled handling agent", () => {

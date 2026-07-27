@@ -18,10 +18,23 @@
 
 import { generateKeyPair } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
-import { DEFAULT_ACCOUNT_ID, resolveReadCredentialPath } from "./account-config.js";
+import { loadCredentialDocumentAtPath } from "./account-config.js";
+import {
+  CREDENTIAL_BINDING_IDENTITY_FIELD,
+  CredentialDocumentBindingError,
+  assertValidCredentialBindingExpectation,
+  createCredentialIdentityForEnrollment,
+  loadBoundCredentialDocument,
+  type PluginCredentialDocument,
+} from "./credential-document.js";
+import { migrateLegacyTupleState } from "./legacy-storage-migration.js";
+import { atomicWritePrivateFile } from "./private-file.js";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
+import {
+  resolveCredentialPath,
+  tupleStoragePaths,
+} from "./storage-paths.js";
+import { StorageDocumentError } from "./storage-document.js";
 
 // ---------------------------------------------------------------------------
 // Import SaaS types for type safety
@@ -33,12 +46,12 @@ import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
  */
 type EnrollmentRequest = {
   agentPublicKey: string;
-  accountId?: string;
+  accountId: string;
   tenant: string;
   /** Plugin package version (diagnostics only; OPTIONAL for pre-reporting plugins). */
   pluginVersion?: string;
-  /** Plugin wire-protocol version (OPTIONAL for pre-v1 plugins). */
-  protocolVersion?: number;
+  /** Mandatory wire-protocol version reported by the shipped v2 plugin. */
+  protocolVersion: number;
 };
 
 /**
@@ -92,6 +105,33 @@ type EnrollmentResult = {
  */
 export type EnrollmentResultLike = EnrollmentResult;
 
+export {
+  deriveEnrollmentEndpoints,
+  type EnrollmentEndpoints,
+} from "./saas-authority.js";
+import { deriveEnrollmentEndpoints } from "./saas-authority.js";
+
+export function assertEnrollmentEndpointsMatchBase(
+  options: Pick<
+    EnrollmentOptions,
+    "saasBaseUrl" | "saasEnrollUrl" | "saasPollUrl"
+  >,
+): void {
+  const expected = deriveEnrollmentEndpoints(options.saasBaseUrl);
+  const fields: string[] = [];
+  if (options.saasEnrollUrl !== expected.saasEnrollUrl) {
+    fields.push("saasEnrollUrl");
+  }
+  if (options.saasPollUrl !== expected.saasPollUrl) {
+    fields.push("saasPollUrl");
+  }
+  if (fields.length > 0) {
+    throw new Error(
+      `webchannel: enrollment endpoints do not match saasBaseUrl fields=${fields.join(",")}`,
+    );
+  }
+}
+
 /**
  * SaaS NATS user credentials (matches server-side type).
  */
@@ -127,49 +167,7 @@ type PollResponse = EnrollmentResult | DeviceFlowError;
  * Stored on disk and used for reconnection. Contains everything needed
  * to reconnect to NATS and identify the plugin.
  */
-export type PluginCredentials = {
-  /**
-   * Plugin's X25519 key pair (identity key).
-   * Generated once on first boot, never rotated.
-   */
-  identityKey: {
-    publicKey: string; // base64url-encoded
-    privateKey: string; // base64url-encoded
-  };
-
-  /**
-   * Enrollment result from SaaS (populated after approval).
-   */
-  enrollment?: {
-    creds: NatsUserCredentials;
-    peerId: string;
-    jwksUrl: string;
-    bootstrapUrl: string;
-    natsUrl: string;
-    /** SaaS-delivered bootstrap-JWT issuer (absent for pre-issuer enrollments). */
-    issuer?: string;
-  };
-
-  /**
-   * Account (deployment) id — the wire identity (optional, for debugging).
-   */
-  accountId?: string;
-
-  /**
-   * Tenant ID.
-   */
-  tenant: string;
-
-  /**
-   * SaaS enrollment endpoint URL.
-   */
-  saasEnrollUrl: string;
-
-  /**
-   * SaaS poll endpoint URL.
-   */
-  saasPollUrl: string;
-};
+export type PluginCredentials = PluginCredentialDocument;
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -179,6 +177,9 @@ export type PluginCredentials = {
  * Plugin enrollment options.
  */
 export type EnrollmentOptions = {
+  /** Effective SaaS base used for this acquisition and credential binding. */
+  saasBaseUrl: string;
+
   /**
    * SaaS enrollment endpoint URL.
    * Example: "https://saas.com/api/enroll"
@@ -198,22 +199,20 @@ export type EnrollmentOptions = {
 
   /**
    * Account (deployment) id — the wire identity (JWT aud / NATS subject key)
-   * sent to the SaaS enrollment. Also scopes the default credential path:
-   * `~/.openclaw-webchannel/<account>/credentials.json` (가-1). When
-   * `credentialPath` is omitted the path is derived from this. Defaults to
-   * `"default"`.
+   * sent to the SaaS enrollment. Together with tenant it scopes the opaque v2
+   * credential namespace.
    */
-  accountId?: string;
+  accountId: string;
 
   /**
-   * Local credential storage path.
-   * Defaults to the account-scoped path
-   * `~/.openclaw-webchannel/<account>/credentials.json`, with a backward-compat
-   * fallback to the legacy `~/.openclaw-webchannel/credentials.json` for the
-   * `"default"` account when the per-account file is absent but the legacy one
-   * exists.
+   * Absolute local credential storage path.
+   * Defaults to the tuple-scoped v2 path. Obsolete single-file credentials are
+   * intentionally ignored.
    */
   credentialPath?: string;
+
+  /** Common tuple-scoped root for credentials and conversation keys. */
+  storageRoot?: string;
 
   /**
    * Whether to display enrollment instructions to console.
@@ -227,6 +226,15 @@ export type EnrollmentOptions = {
    * waiting real seconds. Never set this in production.
    */
   _minPollIntervalMs?: number;
+
+  /** @internal Test-only home-directory seam for default path resolution. */
+  _home?: string;
+
+  /** @internal Test-only direct credential-file reader seam. */
+  _readCredentialFile?: (path: string) => string;
+
+  /** @internal Test-only identity generation seam. */
+  _generateIdentityKey?: () => KeyPair;
 };
 
 // ---------------------------------------------------------------------------
@@ -244,26 +252,72 @@ export type EnrollmentOptions = {
  */
 export class EnrollmentClient {
   private readonly options: Required<
-    Omit<EnrollmentOptions, "displayInstructions" | "accountId" | "_minPollIntervalMs">
+    Omit<
+      EnrollmentOptions,
+      | "displayInstructions"
+      | "accountId"
+      | "_minPollIntervalMs"
+      | "_home"
+      | "storageRoot"
+      | "_readCredentialFile"
+      | "_generateIdentityKey"
+    >
   > & {
     displayInstructions: boolean;
-    accountId?: string;
+    accountId: string;
     _minPollIntervalMs?: number;
+    _home?: string;
+    storageRoot?: string;
+    _readCredentialFile?: (path: string) => string;
+    _generateIdentityKey?: () => KeyPair;
   };
+  private readonly usesTupleCredentialPath: boolean;
   private credentials?: PluginCredentials;
 
   constructor(options: EnrollmentOptions) {
+    // Validate the complete v2 binding expectation before even resolving a
+    // credential path. An explicit credentialPath must never bypass
+    // tenant/account/SaaS validation and reach filesystem or network work.
+    assertValidCredentialBindingExpectation({
+      tenant: options.tenant,
+      accountId: options.accountId,
+      saasBaseUrl: options.saasBaseUrl,
+    });
+    // Reject a split acquisition/binding authority before any request, key
+    // generation, or persistence. The public options retain explicit endpoints
+    // for compatibility, but they must be mechanically derived from the base.
+    assertEnrollmentEndpointsMatchBase(options);
     // Spread FIRST, then apply defaults with nullish-coalescing: an explicit
     // `credentialPath: undefined` / `displayInstructions: undefined` in `options`
     // (the common case from createEnrolledNatsConnection) must NOT clobber the
     // default to `undefined` — that previously crashed saveCredentials with
     // `dirname(undefined)`.
+    const tuplePaths = tupleStoragePaths({
+      tenant: options.tenant,
+      accountId: options.accountId,
+      ...(options.storageRoot !== undefined
+        ? { storageRoot: options.storageRoot }
+        : {}),
+      ...(options._home !== undefined ? { home: options._home } : {}),
+    });
+    const credentialPath = resolveCredentialPath({
+      tenant: options.tenant,
+      accountId: options.accountId,
+      ...(options.storageRoot !== undefined
+        ? { storageRoot: options.storageRoot }
+        : {}),
+      ...(options._home !== undefined ? { home: options._home } : {}),
+      ...(options.credentialPath !== undefined
+        ? { credentialPath: options.credentialPath }
+        : {}),
+    });
     this.options = {
       ...options,
-      credentialPath:
-        options.credentialPath ?? this.defaultCredentialPath(options.accountId),
+      credentialPath,
       displayInstructions: options.displayInstructions ?? true,
     };
+    this.usesTupleCredentialPath =
+      credentialPath === tuplePaths.credentialPath;
   }
 
   /**
@@ -300,7 +354,7 @@ export class EnrollmentClient {
     }
 
     // Generate new key pair
-    const keyPair = generateKeyPair();
+    const keyPair = (this.options._generateIdentityKey ?? generateKeyPair)();
     return keyPair;
   }
 
@@ -333,7 +387,8 @@ export class EnrollmentClient {
    */
   private async performEnrollment(): Promise<EnrollmentResult> {
     // Generate identity key
-    const identityKey = generateKeyPair();
+    const identityKey =
+      (this.options._generateIdentityKey ?? generateKeyPair)();
 
     // Initialize credentials structure
     this.credentials = {
@@ -416,6 +471,31 @@ export class EnrollmentClient {
 
       // Success! Store credentials
       this.credentials.enrollment = pollResult;
+      this.credentials[CREDENTIAL_BINDING_IDENTITY_FIELD] =
+        createCredentialIdentityForEnrollment({
+          tenant: this.options.tenant,
+          accountId: this.options.accountId,
+          saasBaseUrl: this.options.saasBaseUrl,
+          ...(pollResult.issuer !== undefined
+            ? { deliveredIssuer: pollResult.issuer }
+            : {}),
+          ...(pollResult.natsUrl !== undefined
+            ? { relayUrl: pollResult.natsUrl }
+            : {}),
+          agentPublicKey: this.credentials.identityKey.publicKey,
+        });
+      const validated = loadBoundCredentialDocument(
+        {
+          tenant: this.options.tenant,
+          accountId: this.options.accountId,
+          saasBaseUrl: this.options.saasBaseUrl,
+        },
+        this.credentials,
+      );
+      if (validated.status !== "match") {
+        throw new CredentialDocumentBindingError(validated);
+      }
+      this.credentials = validated.document;
       this.saveCredentials();
 
       console.log("[enrollment] ✓ Enrollment complete!");
@@ -438,18 +518,82 @@ export class EnrollmentClient {
    * Returns true if successful, false otherwise.
    */
   private loadCredentials(): boolean {
-    try {
-      if (!existsSync(this.options.credentialPath)) {
-        return false;
+    const expectation = {
+      tenant: this.options.tenant,
+      accountId: this.options.accountId,
+      saasBaseUrl: this.options.saasBaseUrl,
+    };
+    const initial = loadCredentialDocumentAtPath(
+      expectation,
+      this.options.credentialPath,
+      this.options._readCredentialFile,
+    );
+    if (initial.status !== "absent" && initial.status !== "match") {
+      if (
+        initial.status === "unbound" &&
+        this.options.credentialPath !== undefined &&
+        this.options._readCredentialFile === undefined
+      ) {
+        try {
+          migrateLegacyTupleState({
+            tenant: this.options.tenant,
+            accountId: this.options.accountId,
+            ...(this.options.storageRoot !== undefined
+              ? { storageRoot: this.options.storageRoot }
+              : {}),
+            ...(this.options._home !== undefined
+              ? { home: this.options._home }
+              : {}),
+            credentialPath: this.options.credentialPath,
+          });
+        } catch (error) {
+          if (
+            !(
+              error instanceof StorageDocumentError &&
+              error.code === "identity-unbound"
+            )
+          ) {
+            throw error;
+          }
+        }
+        const migrated = loadCredentialDocumentAtPath(
+          expectation,
+          this.options.credentialPath,
+        );
+        if (migrated.status === "match") {
+          this.credentials = migrated.document;
+          return true;
+        }
       }
-
-      const data = readFileSync(this.options.credentialPath, "utf-8");
-      this.credentials = JSON.parse(data) as PluginCredentials;
-      return true;
-    } catch (error) {
-      console.warn("[enrollment] Failed to load credentials:", error);
+      throw new CredentialDocumentBindingError(initial);
+    }
+    // An injected reader is a complete persistence seam. Running the real
+    // migration beside it would unexpectedly inspect or mutate the host home
+    // while a test/caller believes credential I/O is isolated.
+    if (this.options._readCredentialFile === undefined) {
+      migrateLegacyTupleState({
+        tenant: this.options.tenant,
+        accountId: this.options.accountId,
+        ...(this.options.storageRoot !== undefined
+          ? { storageRoot: this.options.storageRoot }
+          : {}),
+        ...(this.options._home !== undefined ? { home: this.options._home } : {}),
+        credentialPath: this.options.credentialPath,
+      });
+    }
+    const loaded = loadCredentialDocumentAtPath(
+      expectation,
+      this.options.credentialPath,
+      this.options._readCredentialFile,
+    );
+    if (loaded.status === "absent") {
       return false;
     }
+    if (loaded.status !== "match") {
+      throw new CredentialDocumentBindingError(loaded);
+    }
+    this.credentials = loaded.document;
+    return true;
   }
 
   /**
@@ -457,32 +601,21 @@ export class EnrollmentClient {
    */
   private saveCredentials(): void {
     try {
-      const dir = dirname(this.options.credentialPath);
-      if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
-      }
-
       const data = JSON.stringify(this.credentials, null, 2);
-      writeFileSync(this.options.credentialPath, data, { mode: 0o600 }); // rw-------
+      // Enrollment is intentionally create-only. Another process may finish an
+      // enrollment after our initial absence check while this process polls;
+      // O_EXCL preserves that credential file instead of silently replacing it.
+      atomicWritePrivateFile(this.options.credentialPath, data, {
+        replace: false,
+        enforceDirectoryMode: this.usesTupleCredentialPath,
+      });
 
       console.log(`[enrollment] Credentials saved to ${this.options.credentialPath}`);
     } catch (error) {
-      console.error("[enrollment] Failed to save credentials:", error);
-      throw error;
+      console.error("[enrollment] code=credential-write-failed");
+      if (error instanceof StorageDocumentError) throw error;
+      throw new StorageDocumentError("credentials", "storage-io-failed");
     }
-  }
-
-  /**
-   * Get the default credential path for an account (가-1).
-   *
-   * Account-scoped: `~/.openclaw-webchannel/<account>/credentials.json`. For the
-   * `"default"` account, falls back to the legacy single-file
-   * `~/.openclaw-webchannel/credentials.json` when the per-account file is absent
-   * but the legacy one exists (so an already-enrolled deployment keeps working
-   * without re-enrolling). Delegated to `resolveReadCredentialPath`.
-   */
-  private defaultCredentialPath(accountId?: string): string {
-    return resolveReadCredentialPath(accountId ?? DEFAULT_ACCOUNT_ID);
   }
 
   // ---------------------------------------------------------------------------

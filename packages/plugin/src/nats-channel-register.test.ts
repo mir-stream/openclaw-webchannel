@@ -28,12 +28,13 @@ const ownReginbox = (token: string): string =>
 class FakeTransport extends EventEmitter {
   connected = true;
   readonly subs: string[] = [];
+  readonly unsubscribed: number[] = [];
   readonly published: Array<{ subject: string; payload: string }> = [];
   subscribe(subject: string): number {
     this.subs.push(subject);
     return this.subs.length;
   }
-  unsubscribe(): void {}
+  unsubscribe(sid: number): void { this.unsubscribed.push(sid); }
   publish(subject: string, payload: string | Buffer): void {
     this.published.push({ subject, payload: payload.toString() });
   }
@@ -48,7 +49,7 @@ function makeChannel(): { channel: NatsChannel; transport: FakeTransport } {
     transport as unknown as ConstructorParameters<typeof NatsChannel>[0],
     ACCOUNT,
     TENANT,
-    {}, // crypto mode
+    undefined,
   );
   return { channel, transport };
 }
@@ -65,10 +66,39 @@ function deliverChallenge(replyTo?: string): FakeTransport {
 }
 
 describe("NatsChannel register-hop wiring", () => {
+  it("disposes the retained transport listener and every owned subscription idempotently", () => {
+    const { channel, transport } = makeChannel();
+    channel.subscribeRegister();
+    channel.registerPeer(PEER);
+    expect(transport.listenerCount("message")).toBe(1);
+    channel.dispose();
+    channel.dispose();
+    expect(transport.listenerCount("message")).toBe(0);
+    expect(transport.unsubscribed).toEqual([1, 2]);
+    expect(channel.sendText(PEER, "late")).toBe(false);
+  });
+
   it("subscribeRegister subscribes the `.register` wildcard", () => {
     const { channel, transport } = makeChannel();
     channel.subscribeRegister();
     expect(transport.subs).toContain(regWild);
+  });
+
+  it("returns an idempotent unsubscribe and close retires the transport listener", () => {
+    const { channel, transport } = makeChannel();
+    let calls = 0;
+    channel.setRegisterRequestHandler(() => { calls += 1; });
+    const unsubscribe = channel.subscribeRegister();
+    unsubscribe();
+    unsubscribe();
+    expect(transport.unsubscribed).toEqual([1]);
+
+    channel.subscribeRegister();
+    channel.close();
+    channel.close();
+    expect(transport.unsubscribed).toEqual([1, 2]);
+    transport.deliver(regSubj, JSON.stringify({ op: "challenge", token: "jwt" }));
+    expect(calls).toBe(0);
   });
 
   it("routes a register request to the handler and publishes the reply to the requester's own reginbox", () => {

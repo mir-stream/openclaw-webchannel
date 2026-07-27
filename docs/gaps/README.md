@@ -25,7 +25,7 @@ sketch → acceptance*.
 | File | Covers | Headline |
 |---|---|---|
 | [`P0_CORE_CHAT_GAPS.md`](P0_CORE_CHAT_GAPS.md) | history, slash commands, HITL approvals, streaming, typing, send reliability | **✅ P0 fully built except one residual.** Client render is done via `nats-client-wrapper.ts` + `demo/web/src/widget.ts`; the server-side halves (P0-2 depth cap #24, P0-5 streaming flag, P0-6 typing gate #26) and the net-new work (P0-3 discovery #30, P0-7 idempotency #30/#31) all landed. **Only P0-3 argument menus remain open.** |
-| [`P1_RICH_UX_GAPS.md`](P1_RICH_UX_GAPS.md) | markdown rendering, long responses, reasoning lane, media, buttons, doctor, error UX, **turn control (P1-8)**, **pending-message retraction (P1-9)** | **✅ P1-1 markdown, P1-7 error UX, and P1-8 `/stop`+debounce built.** Still open: **P1-3 reasoning lane** (now **unblocked** — its P1-1/P0-5 deps are met), **P1-9 unsend** (web advantage), **P1-2 long-response**, **P1-6 doctor**, **P1-7 finer wording**, and **media (P1-4) — a mini-project**. |
+| [`P1_RICH_UX_GAPS.md`](P1_RICH_UX_GAPS.md) | markdown rendering, long responses, reasoning lane, media, buttons, doctor, error UX, **turn control (P1-8)**, **pending-message retraction (P1-9)** | **✅ P1-1 markdown, P1-3 reasoning, P1-7 error UX, and P1-8 `/stop`+debounce built.** Still open: **P1-9 unsend** (web advantage), **P1-2 long-response**, **P1-6 doctor**, **P1-7 finer wording**, and **media (P1-4) — a mini-project**. |
 | [`P2_ADVANCED_GAPS.md`](P2_ADVANCED_GAPS.md) | multi-conversation, reactions, edit/quote, ingress durability, throttle, audit, access depth | **Ingress durability (P2-4) matters most for our NATS transport.** P0-7 now covers the client-reconnect side; P2-4 narrows to **agent-down durability** (JetStream vs spool, still deferred). Multi-conversation is the biggest product lift. *(Rest of P2 unchanged — still backlog.)* |
 
 ## The current architecture (read this first — it changed)
@@ -74,12 +74,13 @@ every inbound frame; the widget renders each.
 | **P0-6** typing indicator | ✅ **built** — client render + **NATS gate wired** (#26): `typing:"off"` now honored | reducer `case "typing"` `:376`; gate `nats-channel.ts:509-513` wired `index-nats.ts:590` |
 | **P0-7** send reliability | ✅ **built** (#30/#31): client replay ledger + server ingress dedupe + `ack` frame | `nats-client.ts` `unackedLedger`/`flushQueue`/`drainAcked`; `src/ingress-dedupe.ts`; `sendAck` `nats-channel.ts:539-543` |
 | **P1-1** markdown | ✅ **built** (#27): sanitized markdown DOM for agent bubbles (zero-dep, no `innerHTML`) | `demo/web/src/markdown.ts`; `renderMarkdown` at `widget.ts:201` |
-| **P1-7** error / reconnect UX | ✅ **mostly built** (status pill + terminal "Credentials expired" + re-auth); finer wording open | terminal classify `nats-client.ts:588-596`; heading `widget.ts:163` |
+| **P1-3** reasoning lane | ✅ **built**: native callback → dedicated turn-correlated wire/state → collapsed sanitized UI; streams only when resolved session reasoning level is `stream` (default `off`, Telegram parity, fail-closed) | `ReasoningDraftController`; `reasoning-level.ts`; `reasoning`/`turn_settled`; `presentation.ts` |
+| **P1-7** error / reconnect UX | ✅ **built** (status pill + cause-driven terminal error box + re-auth); a `WebChannelErrorCause` tag threads from the `-ERR`/register emit sites through `state.errorCause` to per-cause wording | terminal classify `nats-client.ts` `-ERR` split; `error-copy.ts`; error box `widget.ts` |
 | **P1-8** turn control | ✅ **built**: `/stop` control lane (#25, `control-lane.ts`) + debounce/coalesce (#29, `inbound-queue.ts`) | control lane `index-nats.ts:724-822`; Stop button `widget.ts:182-186,381-386` |
 
 **Still genuinely open** (accurately described in the files): **P0-3** argument menus (the only P0
-residual), **P1-2** long-response, **P1-3** reasoning lane (now **unblocked** — P1-1 + P0-5 met),
-**P1-4** media (mini-project), **P1-6** doctor, **P1-7** finer error wording, **P1-9** pending-message
+residual), **P1-2** long-response,
+**P1-4** media (mini-project), **P1-6** doctor, **P1-9** pending-message
 retraction / unsend (web advantage — no Telegram equivalent), and **all of P2** (with P2-4 now
 narrowed to agent-down durability — see below).
 

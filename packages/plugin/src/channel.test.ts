@@ -1,35 +1,263 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
-import { WebChannelTransport } from "./transport.js";
-import { createWebChannelPlugin } from "./channel.js";
+import { NullPeerChannel } from "./channel-contract.js";
+class FakePeerChannel extends NullPeerChannel {
+  constructor(_options?: unknown) { super(); }
+  private approvalHandler?: (peerId: string, id: string, decision: any) => void;
+  private historyHandler?: (peerId: string, request: any) => void;
+  setApprovalDecisionHandler(handler: any) { this.approvalHandler = handler; }
+  setFirstLivenessHandler(_handler: any) {}
+  setLoadHistoryHandler(handler: any) { this.historyHandler = handler; }
+  setHistoryEnabled(_enabled: boolean) {}
+  registerConnection(ws: any, peerId = "web-anon") { ws.on("message", (raw: any) => { try { const frame = JSON.parse(String(raw)); if (frame.type === "approval_decision" && ["allow-once", "allow-always", "deny"].includes(frame.decision)) this.approvalHandler?.(peerId, frame.id, frame.decision); if (frame.type === "load_history") this.historyHandler?.(peerId, { ...(frame.before ? { before: frame.before } : {}), ...(frame.limit ? { limit: frame.limit } : {}) }); } catch {} }); }
+}
+import { composeAccountLifecycles, createWebChannelPlugin } from "./channel.js";
 import { handleInboundMessage } from "./inbound.js";
+import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
+
+// Reasoning display policy is resolved from the session store / config default in
+// production (reasoning-level.ts, Telegram parity). These channel tests exercise
+// the callback WIRING per streaming mode + reasoning level, so we mock the
+// resolver to drive the level deterministically. Default is "off" — matching the
+// real default — so the reasoning lane is NOT wired unless a test opts into
+// "stream".
+vi.mock("./reasoning-level.js", () => ({
+  resolveWebchannelReasoningLevel: vi.fn(() => "off"),
+}));
+const mockReasoningLevel = vi.mocked(resolveWebchannelReasoningLevel);
+
+beforeEach(() => {
+  mockReasoningLevel.mockReset();
+  mockReasoningLevel.mockReturnValue("off");
+});
+
+describe("account lifecycle composition", () => {
+  const context = (abortSignal: AbortSignal) => ({
+    accountId: "default",
+    abortSignal,
+    channelRuntime: { runtimeContexts: { register: () => ({ dispose: vi.fn() }) } },
+  });
+
+  it("host abort waits for both approval and NATS cleanup", async () => {
+    const host = new AbortController();
+    let release!: () => void;
+    const cleanupGate = new Promise<void>((resolve) => { release = resolve; });
+    const task = composeAccountLifecycles(context(host.signal), async (ctx) => {
+      if (!ctx.abortSignal.aborted) await new Promise<void>((resolve) => ctx.abortSignal.addEventListener("abort", resolve, { once: true }));
+      await cleanupGate;
+    });
+    host.abort();
+    let settled = false;
+    void task.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    await expect(task).resolves.toBeUndefined();
+  });
+
+  it("an unexpected sibling resolution aborts and awaits approval cleanup before rejecting", async () => {
+    const host = new AbortController();
+    const task = composeAccountLifecycles(context(host.signal), async () => {});
+    await expect(task).rejects.toThrow(/nats account lifecycle exited before host abort/);
+  });
+});
 
 describe("webchannel plugin", () => {
+  it("reports invalid raw ids best-effort without changing valid enumeration", () => {
+    const reporter = vi.fn(() => { throw new Error("logger failed"); });
+    const plugin = createWebChannelPlugin(new FakePeerChannel(), { onInvalidAccountId: reporter });
+    const mixed = { channels: { webchannel: { accounts: { good: {}, "bad.id": {} } } } } as any;
+    expect(plugin.config.listAccountIds(mixed)).toEqual(["good"]);
+    expect(reporter).toHaveBeenCalledWith(mixed, expect.objectContaining({ id: "bad.id" }));
+    const allInvalid = { channels: { webchannel: { accounts: { "../bad": {} } } } } as any;
+    expect(plugin.config.listAccountIds(allInvalid)).toEqual([]);
+  });
+
   it("resolves an account from config", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const plugin = createWebChannelPlugin(transport);
     const cfg = {
       channels: { webchannel: { allowFrom: ["user1"], dmSecurity: "allowlist" } },
     } as any;
     const account = plugin.config.resolveAccount(cfg, undefined);
+    expect(account.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(account, cfg)).toBe(true);
     expect(account.allowFrom).toEqual(["user1"]);
     expect(account.dmPolicy).toBe("allowlist");
   });
 
-  it("reports configured in Phase 0 (no auth required)", () => {
-    const transport = new WebChannelTransport();
+  it("reports an actual flat default configuration as configured", () => {
+    const transport = new FakePeerChannel();
     const plugin = createWebChannelPlugin(transport);
-    const cfg = { channels: { webchannel: {} } } as any;
+    const cfg = { channels: { webchannel: { dmSecurity: "allowlist" } } } as any;
+    const account = plugin.config.resolveAccount(cfg, undefined);
     const result = plugin.config.inspectAccount!(cfg, undefined) as {
       configured: boolean;
     };
     expect(result.configured).toBe(true);
+    expect(plugin.config.isConfigured!(account, cfg)).toBe(true);
+
+    const ghost = plugin.config.resolveAccount(cfg, "ghost");
+    expect(ghost.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(true);
+    expect(plugin.config.isConfigured!(ghost, cfg)).toBe(false);
+    expect(plugin.config.inspectAccount!(cfg, "ghost")).toMatchObject({
+      enabled: true,
+      configured: false,
+      tokenStatus: "missing",
+    });
+  });
+
+  it("reports absent and empty channel sections as unconfigured", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const fixtures = [
+      {},
+      { channels: {} },
+      { channels: { webchannel: {} } },
+      { channels: { webchannel: { accounts: {} } } },
+      { channels: { webchannel: { enabled: true } } },
+      { channels: { webchannel: { enabled: false } } },
+      { channels: { webchannel: { defaultAccount: "default" } } },
+      { channels: { webchannel: { accounts: {}, enabled: true } } },
+    ] as any[];
+
+    for (const cfg of fixtures) {
+      const account = plugin.config.resolveAccount(cfg, undefined);
+      expect(plugin.config.isConfigured!(account, cfg)).toBe(false);
+      expect(plugin.config.inspectAccount!(cfg, undefined)).toMatchObject({
+        configured: false,
+        tokenStatus: "missing",
+      });
+    }
+  });
+
+  it("reports an explicitly configured named account as configured", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: { work: { dmSecurity: "allowlist" } },
+        },
+      },
+    } as any;
+    const account = plugin.config.resolveAccount(cfg, "work");
+    expect(plugin.config.isConfigured!(account, cfg)).toBe(true);
+    expect(plugin.config.inspectAccount!(cfg, "work")).toMatchObject({
+      configured: true,
+      tokenStatus: "available",
+    });
+  });
+
+  it("reports flat channel-level disable while keeping configuration truth separate", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const disabledCfg = {
+      channels: { webchannel: { enabled: false, dmSecurity: "allowlist" } },
+    } as any;
+    const disabled = plugin.config.resolveAccount(disabledCfg, undefined);
+    expect(disabled.enabled).toBe(false);
+    expect(plugin.config.isEnabled!(disabled, disabledCfg)).toBe(false);
+    expect(plugin.config.isConfigured!(disabled, disabledCfg)).toBe(true);
+    expect(plugin.config.inspectAccount!(disabledCfg, undefined)).toMatchObject({
+      enabled: false,
+      configured: true,
+    });
+
+    const enabledCfg = {
+      channels: { webchannel: { enabled: true, dmSecurity: "allowlist" } },
+    } as any;
+    const enabled = plugin.config.resolveAccount(enabledCfg, undefined);
+    expect(enabled.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(enabled, enabledCfg)).toBe(true);
+    expect(plugin.config.inspectAccount!(enabledCfg, undefined)).toMatchObject({
+      enabled: true,
+      configured: true,
+    });
+  });
+
+  it("honors named disable, enabled controls, and global-disable dominance", () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            disabled: { enabled: false, dmSecurity: "allowlist" },
+            enabled: { enabled: true, dmSecurity: "allowlist" },
+            inherited: { dmSecurity: "allowlist" },
+          },
+        },
+      },
+    } as any;
+
+    for (const [accountId, expected] of [
+      ["disabled", false],
+      ["enabled", true],
+      ["inherited", true],
+    ] as const) {
+      const account = plugin.config.resolveAccount(cfg, accountId);
+      expect(account.enabled).toBe(expected);
+      expect(plugin.config.isEnabled!(account, cfg)).toBe(expected);
+      expect(plugin.config.inspectAccount!(cfg, accountId)).toMatchObject({
+        enabled: expected,
+        configured: true,
+      });
+    }
+
+    const ghost = plugin.config.resolveAccount(cfg, "ghost");
+    expect(ghost.enabled).toBe(true);
+    expect(plugin.config.isEnabled!(ghost, cfg)).toBe(true);
+    expect(plugin.config.isConfigured!(ghost, cfg)).toBe(false);
+    expect(plugin.config.inspectAccount!(cfg, "ghost")).toMatchObject({
+      enabled: true,
+      configured: false,
+    });
+
+    const globallyDisabledCfg = {
+      channels: {
+        webchannel: {
+          enabled: false,
+          accounts: { enabled: { enabled: true, dmSecurity: "allowlist" } },
+        },
+      },
+    } as any;
+    const globallyDisabled = plugin.config.resolveAccount(globallyDisabledCfg, "enabled");
+    expect(globallyDisabled.enabled).toBe(false);
+    expect(plugin.config.isEnabled!(globallyDisabled, globallyDisabledCfg)).toBe(false);
+    expect(plugin.config.inspectAccount!(globallyDisabledCfg, "enabled")).toMatchObject({
+      enabled: false,
+      configured: true,
+    });
+  });
+
+  it("throws distinct outbound errors and never marks this send path best-effort", async () => {
+    const transport = new FakePeerChannel();
+    const plugin = createWebChannelPlugin(transport) as any;
+    const sendText = plugin.outbound.sendText;
+    await expect(sendText({ text: "hello" })).rejects.toThrow("ctx.to is absent");
+    await expect(sendText({ to: "missing", text: "hello" })).rejects.toThrow(
+      "targeted send returned false for peer missing",
+    );
+    // D1 caveat: this adapter does not opt into core's error-swallowing path.
+    expect(plugin.outbound.bestEffort).not.toBe(true);
+  });
+
+  it("exposes doctor preview warnings and status probing from the common factory", async () => {
+    const plugin = createWebChannelPlugin(new FakePeerChannel());
+    expect(plugin.doctor?.collectPreviewWarnings).toBeTypeOf("function");
+    expect(plugin.status?.probeAccount).toBeTypeOf("function");
+    const warnings = await plugin.doctor!.collectPreviewWarnings!({
+      cfg: { channels: { webchannel: { encryption: { mode: "disabled" }, dmSecurity: "allowlist" } } } as never,
+      doctorFixCommand: "openclaw doctor --fix",
+      env: {},
+    });
+    expect(warnings).toEqual(
+      expect.arrayContaining([expect.stringMatching(/channels\.webchannel\.default.*encryption-disabled/)]),
+    );
   });
 });
 
 describe("webchannel transport", () => {
   it("returns false when no socket is mapped for a session", () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     expect(transport.sendText("missing", "hello")).toBe(false);
   });
 });
@@ -55,6 +283,11 @@ describe("webchannel inbound round-trip", () => {
       // test can drive a MULTI-message reply (boundary → per-item cumulative
       // restarts from ""). Fired in the same slot as `partialTexts`.
       partialSteps?: Array<{ text: string } | { boundary: true }>;
+      reasoningSteps?: Array<{
+        text: string;
+        isReasoningSnapshot?: boolean;
+        end?: boolean;
+      }>;
       // Captures the replyOptions the turn supplied, so a test can assert which
       // callbacks were (or were NOT) wired for a given streaming mode.
       onReplyOptions?: (replyOptions: any) => void;
@@ -131,6 +364,12 @@ describe("webchannel inbound round-trip", () => {
               }
             }
           }
+          if (opts?.reasoningSteps) {
+            for (const step of opts.reasoningSteps) {
+              await turn.replyOptions?.onReasoningStream?.(step);
+              if (step.end) await turn.replyOptions?.onReasoningEnd?.();
+            }
+          }
           // Simulate the turn blowing up mid-draft (after a progress frame, but
           // before the final reply is delivered).
           if (opts?.throwAfterProgress) {
@@ -152,9 +391,25 @@ describe("webchannel inbound round-trip", () => {
     };
   }
 
+  it("warns once when turn_settled cannot be sent, without reporting false success", async () => {
+    const transport = new FakePeerChannel();
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(false);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured);
+    const warn = vi.fn();
+    api.logger.warn = warn;
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message", id: "turn-ts", text: "hello",
+    });
+    expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-ts", "ok");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("turn_settled was not delivered");
+  });
+
   it("default-deny allowlist (gap ③): a non-allowlisted peer is denied — inbound.run never runs, no reply", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     const { api, resolveAgentRoute } = makeFakeApi(captured, {
@@ -172,10 +427,11 @@ describe("webchannel inbound round-trip", () => {
     expect(inboundRun).not.toHaveBeenCalled();
     expect(resolveAgentRoute).not.toHaveBeenCalled();
     expect(sendSpy).not.toHaveBeenCalled();
+    expect(settledSpy).not.toHaveBeenCalled();
   });
 
   it("default-deny allowlist (gap ③): an allowlisted peer is admitted — inbound.run runs and reply is delivered", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -194,8 +450,40 @@ describe("webchannel inbound round-trip", () => {
     expect(sendSpy).toHaveBeenCalled();
   });
 
+  it("settles an ACKed ordinary turn as error when route setup throws before inbound.run", async () => {
+    const transport = new FakePeerChannel();
+    const sendSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api, resolveAgentRoute } = makeFakeApi(captured);
+    resolveAgentRoute.mockImplementation(() => {
+      throw new Error("route store unavailable");
+    });
+    const error = vi.fn();
+    api.logger.error = error;
+    const inboundRun = (api.runtime as { channel: { inbound: { run: ReturnType<typeof vi.fn> } } })
+      .channel.inbound.run;
+
+    await handleInboundMessage(api, transport, "alice", {
+      type: "user_message",
+      id: "acked-route-fault",
+      text: "hello",
+    });
+
+    expect(inboundRun).not.toHaveBeenCalled();
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(sendSpy).toHaveBeenCalledWith(
+      "alice",
+      "Sorry — something went wrong while answering. Please try again.",
+      undefined,
+      "acked-route-fault",
+    );
+    expect(settledSpy).toHaveBeenCalledTimes(1);
+    expect(settledSpy).toHaveBeenCalledWith("alice", "acked-route-fault", "error");
+  });
+
   it("resolves a channel-scoped route and delivers the reply to the peer socket", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const sendSpy = vi
       .spyOn(transport, "sendText")
       .mockReturnValue(true);
@@ -226,11 +514,11 @@ describe("webchannel inbound round-trip", () => {
     expect(captured.recordedTo).toBe("web-anon");
     // The reply was delivered back through THIS channel to the peer's socket.
     // No-progress config => plain no-id agent_message (legacy append path).
-    expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    expect(sendSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
   });
 
   it("threads accountId into resolveAgentRoute (binding.account routing — Cycle 2)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -259,7 +547,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("stamps accountId on the turn context AND the run params (S1: turnSourceAccountId)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -289,7 +577,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("applies PER-ACCOUNT dmSecurity allowlist (account isolation — Cycle 2)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -323,7 +611,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("default account keeps reading the flat (channel-level) config (regression)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendText").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
@@ -343,7 +631,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("streams a progress draft then finalizes the SAME id when streaming.mode=progress", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     // Simulate an open socket so the draft loop's sends "succeed" (returning
     // false would make createDraftStreamLoop retain pending text and not emit).
     const progressSpy = vi
@@ -380,7 +668,7 @@ describe("webchannel inbound round-trip", () => {
 
     // The final answer finalized the SAME draft id (widget transitions the
     // working bubble into the final text), NOT a fresh no-id agent_message.
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
 
     // Every progress frame shares the one draft id.
     for (const call of progressSpy.mock.calls) {
@@ -389,7 +677,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("streams ANSWER TEXT as progress frames (one draft id) then finalizes the SAME id when streaming.mode=partial (no-tool turn)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -420,11 +708,11 @@ describe("webchannel inbound round-trip", () => {
     expect(lastFrameText).toBe("Hello world");
 
     // The final answer finalized the SAME draft id (working bubble → final text).
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("strips reasoning tags from streamed partials in partial mode (mirrors core hygiene)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -449,11 +737,11 @@ describe("webchannel inbound round-trip", () => {
     const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
     expect(lastFrameText).toBe("Hello world");
     const progId = progressSpy.mock.calls[0][1];
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("ignores a SHRINKING cumulative partial (no backwards flicker) in partial mode", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -479,7 +767,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("shows label+tool line first, then the answer text replaces the scaffold when streaming.mode=partial (mixed turn)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -511,7 +799,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("preserves earlier message text across an assistant-message boundary in partial mode (no vanish)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -548,11 +836,11 @@ describe("webchannel inbound round-trip", () => {
     // All frames share one draft id, and the final settles that same id.
     const progId = progressSpy.mock.calls[0][1];
     for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("treats an assistant-message boundary BEFORE the first partial as a no-op (no leading blank prefix)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -583,7 +871,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("degrades a MISSING assistant-message boundary to correct accumulation (no clobber, no dup)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -612,11 +900,11 @@ describe("webchannel inbound round-trip", () => {
     expect((lastFrameText as string).match(/Second msg/g)?.length).toBe(1);
     const progId = progressSpy.mock.calls[0][1];
     for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back");
+    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
   it("handles a LATE assistant-message boundary idempotently (no double-roll)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -649,7 +937,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("does NOT stream answer text in progress mode (onPartialReply is not wired — regression)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
@@ -684,7 +972,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("streaming.mode=block takes the plain no-id agent_message path (no draft — regression)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
@@ -705,18 +993,119 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
-    // No draft: replyOptions is omitted entirely, and delivery falls through to
-    // the plain no-id agent_message append (sendText), never sendProgress/finalize.
+    // No answer/tool draft AND reasoning level is the default "off": with neither
+    // lane active, replyOptions is omitted entirely (pre-reasoning-lane shape).
     expect(seenReplyOptions).toBeUndefined();
     expect(progressSpy).not.toHaveBeenCalled();
     expect(finalizeSpy).not.toHaveBeenCalled();
-    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
   });
+
+  it("streaming.mode=block with reasoning level 'stream' wires ONLY the reasoning callbacks (no tool/answer draft)", async () => {
+    const transport = new FakePeerChannel();
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    mockReasoningLevel.mockReturnValue("stream");
+
+    let seenReplyOptions: any = "unset";
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "block" } },
+      fireToolProgress: true,
+      partialTexts: ["should not stream"],
+      onReplyOptions: (ro) => {
+        seenReplyOptions = ro;
+      },
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    // Reasoning lane opened, but no answer/tool draft in block mode: replyOptions
+    // carries ONLY the reasoning callbacks — no tool/answer callbacks, no suppression.
+    expect(seenReplyOptions).toEqual({
+      onReasoningStream: expect.any(Function),
+      onReasoningEnd: expect.any(Function),
+    });
+    expect(progressSpy).not.toHaveBeenCalled();
+    expect(finalizeSpy).not.toHaveBeenCalled();
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
+  });
+
+  it.each(["off", "block", "progress", "partial"] as const)(
+    "streams reasoning independently of the answer streaming mode when the level is 'stream' (mode=%s)",
+    async (mode) => {
+      const transport = new FakePeerChannel();
+      const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+      mockReasoningLevel.mockReturnValue("stream");
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode } },
+        reasoningSteps: [{ text: "safe" }],
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningSpy).toHaveBeenCalledTimes(1);
+      expect(reasoningSpy).toHaveBeenCalledWith(
+        "web-anon",
+        expect.any(String),
+        "turn-42",
+        "safe",
+      );
+      // turn_settled is a lifecycle frame emitted for every ordinary turn.
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42", "ok");
+    },
+  );
+
+  it.each(["off", "on"] as const)(
+    "does NOT wire the reasoning lane when the resolved level is '%s' (Telegram parity: only 'stream' streams)",
+    async (level) => {
+      // btw emits reasoning upstream at level "on" too (dist/btw-CDO5476N.js:617-627),
+      // but the webchannel display policy — like Telegram — streams reasoning ONLY
+      // at "stream". At "off"/"on" no reasoning callback is wired and no frame is sent.
+      const transport = new FakePeerChannel();
+      const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+      mockReasoningLevel.mockReturnValue(level);
+      let seenReplyOptions: any = "unset";
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        reasoningSteps: [{ text: "safe" }],
+        onReplyOptions: (ro) => {
+          seenReplyOptions = ro;
+        },
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      // No reasoning callback wired (partial mode still wires the answer draft,
+      // just not the reasoning lane) and no reasoning frame emitted.
+      expect(seenReplyOptions?.onReasoningStream).toBeUndefined();
+      expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
+      expect(reasoningSpy).not.toHaveBeenCalled();
+      // turn_settled still fires — it is a lifecycle frame, not a reasoning frame.
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42", "ok");
+    },
+  );
 
   it("recovers the working bubble when the turn throws mid-draft in progress mode", async () => {
     vi.useFakeTimers();
     try {
-      const transport = new WebChannelTransport();
+      const transport = new FakePeerChannel();
       // Open socket simulated: progress/finalize sends "succeed" so the draft
       // actually starts (started=true) and the widget shows a working bubble.
       const progressSpy = vi
@@ -725,6 +1114,7 @@ describe("webchannel inbound round-trip", () => {
       const finalizeSpy = vi
         .spyOn(transport, "finalizeDraft")
         .mockReturnValue(true);
+      const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
 
       const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
       const { api } = makeFakeApi(captured, {
@@ -754,6 +1144,7 @@ describe("webchannel inbound round-trip", () => {
       expect(finId).toBe(progId);
       expect(typeof finText).toBe("string");
       expect((finText as string).length).toBeGreaterThan(0);
+      expect(settledSpy).toHaveBeenCalledWith("web-anon", expect.any(String), "error");
 
       // The draft loop was stopped: no late background throttled flush fires
       // after the error handling, so no further progress frames are emitted.
@@ -768,7 +1159,7 @@ describe("webchannel inbound round-trip", () => {
   it("recovers the working bubble when the turn throws mid-draft in partial mode (answer-text-only, no tool events)", async () => {
     vi.useFakeTimers();
     try {
-      const transport = new WebChannelTransport();
+      const transport = new FakePeerChannel();
       const progressSpy = vi
         .spyOn(transport, "sendProgress")
         .mockReturnValue(true);
@@ -814,7 +1205,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("sends exactly one typing frame after route resolution, before agent dispatch (AC2)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const typingSpy = vi
       .spyOn(transport, "sendTyping")
       .mockReturnValue(true);
@@ -840,7 +1231,7 @@ describe("webchannel inbound round-trip", () => {
     expect(typingSpy).toHaveBeenCalledWith("web-anon");
     // The agent's reply (via sendText) was delivered — proves the typing
     // call is BEFORE agent dispatch, not after.
-    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back");
+    expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
     // Strict order: typing < sendText.
     const typingOrder = typingSpy.mock.invocationCallOrder[0];
     const sendTextOrder = sendTextSpy.mock.invocationCallOrder[0];
@@ -848,7 +1239,7 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it("still sends the typing frame when the turn throws mid-dispatch (AC2)", async () => {
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     const typingSpy = vi
       .spyOn(transport, "sendTyping")
       .mockReturnValue(true);
@@ -883,7 +1274,7 @@ describe("webchannel inbound round-trip", () => {
     // handleInboundMessage. This test is a structural guard: we verify the
     // transport exposes BOTH the first-liveness hook AND the load-history
     // hook, so index.ts can wire them up without further transport changes.
-    const transport = new WebChannelTransport();
+    const transport = new FakePeerChannel();
     expect(typeof transport.setFirstLivenessHandler).toBe("function");
     expect(typeof transport.setLoadHistoryHandler).toBe("function");
     expect(typeof transport.sendHistory).toBe("function");
@@ -902,7 +1293,7 @@ describe("webchannel inbound round-trip", () => {
     // validated { before, limit } shape. This is the wire-side companion to
     // the unit test in transport.test.ts and locks the parse contract from
     // the transport's POV.
-    const transport = new WebChannelTransport({ heartbeatMs: 60_000 });
+    const transport = new FakePeerChannel({ heartbeatMs: 60_000 });
     const handler = vi.fn();
     transport.setLoadHistoryHandler(handler);
 

@@ -18,8 +18,8 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
     const store = new PopChallengeStore();
     const dev = makeDevice();
     const nonce = store.issue("alice");
-    const sig = dev.sign(popSignedMessage("alice", nonce));
-    expect(store.verify({ peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
+    const sig = dev.sign(popSignedMessage("register", "alice", nonce));
+    expect(store.verify({ op: "register", peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
       .toEqual({ ok: true, reason: "verified" });
   });
 
@@ -28,16 +28,16 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
     const dev = makeDevice();
     const attacker = makeDevice();
     const nonce = store.issue("alice");
-    const sig = attacker.sign(popSignedMessage("alice", nonce)); // signed by the wrong key
-    expect(store.verify({ peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }).ok)
+    const sig = attacker.sign(popSignedMessage("register", "alice", nonce)); // signed by the wrong key
+    expect(store.verify({ op: "register", peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }).ok)
       .toBe(false);
   });
 
   it("rejects a missing nonce (never issued) (401)", () => {
     const store = new PopChallengeStore();
     const dev = makeDevice();
-    const sig = dev.sign(popSignedMessage("alice", "made-up-nonce"));
-    expect(store.verify({ peerId: "alice", nonce: "made-up-nonce", signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
+    const sig = dev.sign(popSignedMessage("register", "alice", "made-up-nonce"));
+    expect(store.verify({ op: "register", peerId: "alice", nonce: "made-up-nonce", signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
       .toEqual({ ok: false, reason: "nonce-missing" });
   });
 
@@ -47,8 +47,8 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
     const dev = makeDevice();
     const nonce = store.issue("alice");
     t += 120_001; // past TTL
-    const sig = dev.sign(popSignedMessage("alice", nonce));
-    expect(store.verify({ peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
+    const sig = dev.sign(popSignedMessage("register", "alice", nonce));
+    expect(store.verify({ op: "register", peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
       .toEqual({ ok: false, reason: "nonce-expired" });
   });
 
@@ -56,8 +56,8 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
     const store = new PopChallengeStore();
     const dev = makeDevice();
     const nonce = store.issue("alice");
-    const sig = dev.sign(popSignedMessage("alice", nonce));
-    const args = { peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk };
+    const sig = dev.sign(popSignedMessage("register", "alice", nonce));
+    const args = { op: "register" as const, peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk };
     expect(store.verify(args).ok).toBe(true);
     expect(store.verify(args)).toEqual({ ok: false, reason: "nonce-missing" }); // replay
   });
@@ -67,8 +67,8 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
     const dev = makeDevice();
     const nonce = store.issue("alice");
     // Device signs the message for "mallory" but presents it as "alice".
-    const sig = dev.sign(popSignedMessage("mallory", nonce));
-    expect(store.verify({ peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
+    const sig = dev.sign(popSignedMessage("register", "mallory", nonce));
+    expect(store.verify({ op: "register", peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
       .toEqual({ ok: false, reason: "signature-mismatch" });
   });
 
@@ -85,12 +85,12 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
     expect(store.size).toBe(2);
 
     // Device A registers with its own nonce — still valid despite B's later issue.
-    const sigA = devA.sign(popSignedMessage("alice", nonceA));
-    expect(store.verify({ peerId: "alice", nonce: nonceA, signatureB64Url: sigA, popPublicJwk: devA.popPublicJwk }))
+    const sigA = devA.sign(popSignedMessage("register", "alice", nonceA));
+    expect(store.verify({ op: "register", peerId: "alice", nonce: nonceA, signatureB64Url: sigA, popPublicJwk: devA.popPublicJwk }))
       .toEqual({ ok: true, reason: "verified" });
     // Device B registers with its own nonce — independent, also valid.
-    const sigB = devB.sign(popSignedMessage("alice", nonceB));
-    expect(store.verify({ peerId: "alice", nonce: nonceB, signatureB64Url: sigB, popPublicJwk: devB.popPublicJwk }))
+    const sigB = devB.sign(popSignedMessage("register", "alice", nonceB));
+    expect(store.verify({ op: "register", peerId: "alice", nonce: nonceB, signatureB64Url: sigB, popPublicJwk: devB.popPublicJwk }))
       .toEqual({ ok: true, reason: "verified" });
   });
 
@@ -98,13 +98,13 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
     const store = new PopChallengeStore();
     const dev = makeDevice();
     const nonce = store.issue("alice"); // bound to alice's bucket only
-    const sig = dev.sign(popSignedMessage("mallory", nonce));
+    const sig = dev.sign(popSignedMessage("register", "mallory", nonce));
     // mallory presents alice's nonce — it isn't in mallory's bucket → missing.
-    expect(store.verify({ peerId: "mallory", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
+    expect(store.verify({ op: "register", peerId: "mallory", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
       .toEqual({ ok: false, reason: "nonce-missing" });
     // Crucially, mallory's probe did NOT consume alice's nonce — alice can still register.
-    const aliceSig = dev.sign(popSignedMessage("alice", nonce));
-    expect(store.verify({ peerId: "alice", nonce, signatureB64Url: aliceSig, popPublicJwk: dev.popPublicJwk }))
+    const aliceSig = dev.sign(popSignedMessage("register", "alice", nonce));
+    expect(store.verify({ op: "register", peerId: "alice", nonce, signatureB64Url: aliceSig, popPublicJwk: dev.popPublicJwk }))
       .toEqual({ ok: true, reason: "verified" });
   });
 
@@ -112,9 +112,9 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
     const store = new PopChallengeStore();
     const dev = makeDevice();
     const nonce = store.issue("alice");
-    const sig = dev.sign(popSignedMessage("alice", nonce));
+    const sig = dev.sign(popSignedMessage("register", "alice", nonce));
     const x25519Jwk: PopPublicJwk = { kty: "OKP", crv: "X25519", x: dev.popPublicJwk.x };
-    expect(store.verify({ peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: x25519Jwk }))
+    expect(store.verify({ op: "register", peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: x25519Jwk }))
       .toEqual({ ok: false, reason: "not-ed25519" });
   });
 
@@ -142,7 +142,7 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
       store.issue("alice");
       store.issue("alice"); // over per-peer cap → evict alice's oldest (n1)
       expect(store.size).toBe(2); // alice bounded to 2, never more
-      expect(store.verify({ peerId: "alice", nonce: n1, signatureB64Url: "x", popPublicJwk: { kty: "OKP", crv: "Ed25519", x: "y" } }))
+      expect(store.verify({ op: "register", peerId: "alice", nonce: n1, signatureB64Url: "x", popPublicJwk: { kty: "OKP", crv: "Ed25519", x: "y" } }))
         .toEqual({ ok: false, reason: "nonce-missing" }); // n1 was evicted
     });
 
@@ -154,8 +154,8 @@ describe("PopChallengeStore (gap ① signed-nonce PoP)", () => {
       // Attacker floods its OWN peerId well past the per-peer cap.
       for (let i = 0; i < 50; i++) store.issue("attacker");
       // Victim's nonce is untouched — the cap only evicted the attacker's own oldest.
-      const sig = dev.sign(popSignedMessage("victim", victimNonce));
-      expect(store.verify({ peerId: "victim", nonce: victimNonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
+      const sig = dev.sign(popSignedMessage("register", "victim", victimNonce));
+      expect(store.verify({ op: "register", peerId: "victim", nonce: victimNonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }))
         .toEqual({ ok: true, reason: "verified" });
       // Attacker is self-bounded to the cap; total = attacker(2) + victim(1) before consume.
       expect(store.size).toBe(2); // victim consumed above → only attacker's 2 remain

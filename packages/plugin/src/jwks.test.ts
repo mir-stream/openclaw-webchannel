@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { JWKSCache, type JsonWebKeySet } from "./jwks.js";
+import { JWKSCache, JwksLifecycleAbortError, type JsonWebKeySet } from "./jwks.js";
 
 /**
  * Tests for the JWKS fetcher + TTL cache + kid lookup + fail-closed semantics.
@@ -350,5 +350,102 @@ describe("JWKSCache HTTP status surfaces", () => {
         new RegExp(`JWKS fetch failed.*HTTP ${status}`),
       );
     }
+  });
+});
+
+describe("JWKSCache lifecycle cancellation", () => {
+  it("lets a startup subscriber abort without cancelling a surviving subscriber", async () => {
+    const jwks = await mintRsaJwks("k1");
+    let resolveFetch!: (response: Response) => void;
+    let sourceSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      sourceSignal = init?.signal as AbortSignal;
+      return new Promise<Response>((resolve) => { resolveFetch = resolve; });
+    }) as unknown as typeof fetch;
+    const cache = JWKSCache.create({ jwksUrl: "https://idp.test/jwks.json" }, { fetchImpl });
+    const firstController = new AbortController();
+    const survivorController = new AbortController();
+    const first = cache.warm(10_000, firstController.signal);
+    const survivor = cache.warm(10_000, survivorController.signal);
+    firstController.abort();
+    await expect(first).rejects.toBeInstanceOf(JwksLifecycleAbortError);
+    expect(sourceSignal?.aborted).toBe(false);
+    resolveFetch(new Response(JSON.stringify(jwks), { status: 200 }));
+    await expect(survivor).resolves.toEqual(jwks);
+  });
+
+  it("aborts/fences the source after the last subscriber leaves and ignores a late result", async () => {
+    const jwks = await mintRsaJwks("late");
+    const pending: Array<(response: Response) => void> = [];
+    const signals: AbortSignal[] = [];
+    const fetchImpl = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      signals.push(init?.signal as AbortSignal);
+      return new Promise<Response>((resolve) => pending.push(resolve));
+    }) as unknown as typeof fetch;
+    const cache = JWKSCache.create({ jwksUrl: "https://idp.test/jwks.json" }, { fetchImpl });
+    const controller = new AbortController();
+    const abandoned = cache.warm(10_000, controller.signal);
+    await Promise.resolve();
+    await Promise.resolve();
+    controller.abort();
+    await expect(abandoned).rejects.toBeInstanceOf(JwksLifecycleAbortError);
+    expect(signals[0]?.aborted).toBe(true);
+    pending[0]!(new Response(JSON.stringify(jwks), { status: 200 }));
+    const next = cache.warm(10_000);
+    await Promise.resolve();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    pending[1]!(new Response(JSON.stringify(jwks), { status: 200 }));
+    await expect(next).resolves.toEqual(jwks);
+  });
+
+  it("aborts during a non-cooperative response body read and fences its late JSON result", async () => {
+    const jwks = await mintRsaJwks("body-late");
+    const bodyResolvers: Array<(doc: JsonWebKeySet) => void> = [];
+    const sourceSignals: AbortSignal[] = [];
+    const fetchImpl = vi.fn((_url: string | URL | Request, init?: RequestInit) => {
+      sourceSignals.push(init?.signal as AbortSignal);
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => new Promise<JsonWebKeySet>((resolve) => bodyResolvers.push(resolve)),
+      } as Response);
+    }) as unknown as typeof fetch;
+    const cache = JWKSCache.create({ jwksUrl: "https://idp.test/jwks.json" }, { fetchImpl });
+    const controller = new AbortController();
+    const first = cache.warm(10_000, controller.signal);
+    await vi.waitFor(() => expect(bodyResolvers).toHaveLength(1));
+    controller.abort();
+    await expect(first).rejects.toBeInstanceOf(JwksLifecycleAbortError);
+    expect(sourceSignals[0]?.aborted).toBe(true);
+    bodyResolvers[0]!(jwks);
+    const second = cache.warm(10_000);
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(bodyResolvers).toHaveLength(2));
+    bodyResolvers[1]!(jwks);
+    await expect(second).resolves.toEqual(jwks);
+  });
+
+  it("passes cancellation to a file read, rejects promptly, and ignores late bytes", async () => {
+    const jwks = await mintRsaJwks("file-late");
+    const readResolvers: Array<(bytes: Uint8Array) => void> = [];
+    const sourceSignals: AbortSignal[] = [];
+    const readFileImpl = vi.fn((_path: string, signal?: AbortSignal) => {
+      if (signal) sourceSignals.push(signal);
+      return new Promise<Uint8Array>((resolve) => readResolvers.push(resolve));
+    });
+    const cache = JWKSCache.create({ jwksFile: "/virtual/jwks.json" }, { readFileImpl });
+    const controller = new AbortController();
+    const first = cache.warm(10_000, controller.signal);
+    await Promise.resolve();
+    expect(readFileImpl).toHaveBeenCalledTimes(1);
+    controller.abort();
+    await expect(first).rejects.toBeInstanceOf(JwksLifecycleAbortError);
+    expect(sourceSignals[0]?.aborted).toBe(true);
+    readResolvers[0]!(new TextEncoder().encode(JSON.stringify(jwks)));
+    const second = cache.warm(10_000);
+    await Promise.resolve();
+    expect(readFileImpl).toHaveBeenCalledTimes(2);
+    readResolvers[1]!(new TextEncoder().encode(JSON.stringify(jwks)));
+    await expect(second).resolves.toEqual(jwks);
   });
 });

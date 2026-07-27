@@ -10,14 +10,6 @@
  */
 
 /**
- * Resolve the effective `requirePoP` setting. CODE default is TRUE
- * (secure-by-default): an unset value means PoP is required.
- */
-export function resolveRequirePoP(auth: { requirePoP?: boolean } | undefined): boolean {
-  return auth?.requirePoP ?? true;
-}
-
-/**
  * Decide whether the register request must be rejected because PoP is required
  * but the verified bootstrap JWT carries no `pop_jwk`.
  *

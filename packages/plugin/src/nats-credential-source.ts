@@ -3,14 +3,14 @@
  *
  * ── Separation of concerns ─────────────────────────────────────────────────
  * Connecting the agent to NATS has TWO orthogonal axes that used to be fused
- * inside `index-nats.ts`:
+ * inside the old monolithic plugin entry:
  *
  *   Axis A — CREDENTIAL SOURCE (this module): *how* the agent authenticates to
  *            the NATS server. This is purely about acquiring a connected
  *            `NatsTransport`. It says nothing about which browser peers are served.
  *
- *   Axis B — PEER ADMISSION (`nats-admission.ts`): *which* browser peers the agent
- *            serves once connected (register-hop vs. wildcard auto-subscribe).
+ *   Axis B — PEER ADMISSION: every browser peer completes authenticated
+ *            registration before the agent subscribes its inbound subject.
  *
  * Before this refactor, the only ways to connect were "dev open-NATS" (no auth)
  * or "enrolled" (SaaS device-flow). There was no way to point the agent at an
@@ -18,7 +18,6 @@
  * credentials. This module adds that as a first-class, co-equal source and demotes
  * the SaaS issuer to ONE optional source among three:
  *
- *   - `open`     — no auth. Dev/local only (the legacy `devOpen`).
  *   - `static`   — url + user JWT + NKEY seed given DIRECTLY (bring-your-own-NATS).
  *                  The plugin is GIVEN these credentials; it never mints them and
  *                  never imports from `packages/saas`. A standard NATS `.creds`
@@ -35,12 +34,14 @@
 import { readFileSync } from "node:fs";
 
 import type { SecretRef } from "./auth.js";
-import { NatsTransport } from "./nats-transport.js";
+import { NatsLifecycleAbortError, NatsTransport } from "./nats-transport.js";
 import { makeNkeySigningCallback } from "./nkey-sign.js";
 import {
   createEnrolledNatsConnection,
   type EnrolledNatsConnection,
 } from "./enrolled-nats-connection.js";
+import { deriveEnrollmentEndpoints } from "./enrollment-client.js";
+import { assertValidCredentialBindingExpectation } from "./credential-document.js";
 
 // ---------------------------------------------------------------------------
 // Config shape (mirrors the `channels.webchannel.nats` schema block)
@@ -55,7 +56,7 @@ import {
  */
 export type WebchannelNatsCredentialsConfig = {
   /** Explicit source selector. When omitted it is inferred (see resolver). */
-  mode?: "static" | "enrolled" | "open";
+  mode?: "static" | "enrolled";
   /** Static mode: NATS user JWT (compact). SecretRef. */
   userJwt?: SecretRef;
   /** Static mode: NATS user NKEY seed ("SU…", base32). SecretRef. */
@@ -70,10 +71,8 @@ export type WebchannelNatsCredentialsConfig = {
 export type WebchannelNatsConfig = {
   /** NATS WebSocket URL. Env override: `WEBCHANNEL_NATS_URL`. */
   url?: string;
-  /** Dev-only open NATS (no auth). Env override: `WEBCHANNEL_NATS_DEV_OPEN=1`. */
-  devOpen?: boolean;
-  /** Explicit peer-admission override (Axis B — consumed by `nats-admission.ts`). */
-  admission?: "auto" | "register-hop";
+  /** The only supported peer-admission mode. */
+  admission?: "register-hop";
   /** Credential source (Axis A). */
   credentials?: WebchannelNatsCredentialsConfig;
 };
@@ -95,7 +94,6 @@ export type StaticNatsCredentials = {
  * (`connectNatsCredentialSource`) turns one of these into a connected transport.
  */
 export type NatsCredentialSource =
-  | { mode: "open"; url: string }
   | ({ mode: "static"; url: string } & StaticNatsCredentials)
   | {
       mode: "enrolled";
@@ -103,6 +101,8 @@ export type NatsCredentialSource =
       saasBaseUrl: string;
       tenant: string;
       accountId: string;
+      storageRoot?: string;
+      credentialPath?: string;
     };
 
 // ---------------------------------------------------------------------------
@@ -112,8 +112,8 @@ export type NatsCredentialSource =
 export type ResolveNatsCredentialSourceInput = {
   /** The `channels.webchannel.nats` config block (schema-validated). */
   natsConfig?: WebchannelNatsConfig;
-  /** Legacy top-level `api.config.nats` (url + devOpen) kept for compatibility. */
-  legacyNats?: { url?: string; devOpen?: boolean };
+  /** Legacy top-level `api.config.nats.url` kept for compatibility. */
+  legacyNats?: { url?: string };
   /**
    * Enrolled-mode SaaS base URL from the top-level `api.config.saas?.baseUrl`,
    * passed RAW (not env-collapsed). The resolver OWNS the full precedence:
@@ -125,6 +125,10 @@ export type ResolveNatsCredentialSourceInput = {
   /** Tenant + account id (enrolled mode; accountId is the wire identity). */
   tenant: string;
   accountId: string;
+  /** Common tuple-scoped persistence root for enrolled material. */
+  storageRoot?: string;
+  /** Exact credential-file override (does not relocate conversation keys). */
+  credentialPath?: string;
   /** Env bag (defaults to `process.env`). Injectable for tests. */
   env?: Record<string, string | undefined>;
   /** File reader for `.creds` files (defaults to `fs.readFileSync`). Injectable. */
@@ -133,6 +137,52 @@ export type ResolveNatsCredentialSourceInput = {
 
 const DEFAULT_NATS_URL = "ws://127.0.0.1:4222";
 const DEFAULT_SAAS_BASE_URL = "http://localhost:3001";
+
+export type ResolveEnrolledSaasBaseUrlInput = {
+  natsConfig?: WebchannelNatsConfig;
+  /** Lowest-precedence config-level SaaS base URL. */
+  saasBaseUrl?: string;
+  /** Env bag (defaults to process.env). */
+  env?: Record<string, string | undefined>;
+  /** Optional final fallback; runtime supplies its built-in default. */
+  fallback?: string;
+};
+
+export type NatsCredentialMode = "static" | "enrolled";
+
+/**
+ * Parse an explicit credential mode without silently treating unknown config
+ * values as either static or enrolled.
+ */
+export function parseNatsCredentialMode(
+  value: unknown,
+): NatsCredentialMode | undefined {
+  if (value === undefined) return undefined;
+  if (value === "static" || value === "enrolled") return value;
+  throw new Error(
+    'webchannel: channels.webchannel.nats.credentials.mode must be "static" or "enrolled". Refusing to continue.',
+  );
+}
+
+/**
+ * Resolve the effective enrolled-mode SaaS base URL everywhere credential
+ * binding is checked.
+ *
+ * Precedence is intentionally centralized so setup/status cannot accept or
+ * acquire credentials for one authority while runtime/doctor expects another:
+ * env > nats.credentials override > account/top-level SaaS config > fallback.
+ */
+export function resolveEnrolledSaasBaseUrl(
+  input: ResolveEnrolledSaasBaseUrlInput,
+): string | undefined {
+  const env = input.env ?? process.env;
+  return (
+    env["WEBCHANNEL_SAAS_BASE_URL"] ??
+    input.natsConfig?.credentials?.saasBaseUrl ??
+    input.saasBaseUrl ??
+    input.fallback
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Secret + creds-file helpers
@@ -216,13 +266,11 @@ function extractCredsBlock(content: string, label: string): string | undefined {
  * Resolve a discriminated `NatsCredentialSource` from config + env.
  *
  * Precedence (env OVERRIDES config), evaluated top-to-bottom:
- *   1. OPEN   — `WEBCHANNEL_NATS_DEV_OPEN=1`, `legacyNats.devOpen`,
- *               `nats.devOpen`, or `credentials.mode === "open"`.
- *   2. STATIC — any static secret is present: `WEBCHANNEL_NATS_CREDS`,
+ *   1. STATIC — any static secret is present: `WEBCHANNEL_NATS_CREDS`,
  *               `WEBCHANNEL_NATS_USER_JWT` + `WEBCHANNEL_NATS_USER_SEED`,
  *               `credentials.mode === "static"`, `credentials.credsFile`, or
  *               inline `credentials.userJwt` + `userSeed`.
- *   3. ENROLLED — the default (unchanged production path).
+ *   2. ENROLLED — the default (unchanged production path).
  *
  * Pure given its inputs (the only I/O is the injectable `readFile` for `.creds`),
  * so the whole decision table is unit-testable without a socket.
@@ -231,8 +279,16 @@ export function resolveNatsCredentialSource(
   input: ResolveNatsCredentialSourceInput,
 ): NatsCredentialSource {
   const env = input.env ?? process.env;
+  if (env["WEBCHANNEL_NATS_DEV_OPEN"] === "1") {
+    throw new Error(
+      "webchannel: WEBCHANNEL_NATS_DEV_OPEN was removed; there is no unauthenticated NATS mode. Enroll with `openclaw channels add --channel webchannel`.",
+    );
+  }
   const nats = input.natsConfig;
   const creds = nats?.credentials;
+  const credentialMode = parseNatsCredentialMode(
+    (creds as { mode?: unknown } | undefined)?.mode,
+  );
 
   const url =
     env["WEBCHANNEL_NATS_URL"] ??
@@ -240,17 +296,27 @@ export function resolveNatsCredentialSource(
     input.legacyNats?.url ??
     DEFAULT_NATS_URL;
 
-  // ── 1. OPEN (dev, no auth) ────────────────────────────────────────────────
-  const openByEnv = env["WEBCHANNEL_NATS_DEV_OPEN"] === "1";
-  const openByConfig =
-    input.legacyNats?.devOpen === true ||
-    nats?.devOpen === true ||
-    creds?.mode === "open";
-  if (openByEnv || openByConfig) {
-    return { mode: "open", url };
+  if (
+    credentialMode === "static" ||
+    creds?.credsFile !== undefined ||
+    creds?.userJwt !== undefined ||
+    creds?.userSeed !== undefined ||
+    env["WEBCHANNEL_NATS_CREDS"] !== undefined ||
+    env["WEBCHANNEL_NATS_USER_JWT"] !== undefined ||
+    env["WEBCHANNEL_NATS_USER_SEED"] !== undefined
+  ) {
+    throw new Error(
+      "webchannel: static NATS credentials no longer imply auto admission; BYO-NATS requires authenticated registration (attested agent identity) — enroll with `openclaw channels add --channel webchannel`, or track P0-3.",
+    );
   }
 
-  // ── 2. STATIC (bring-your-own-NATS) ───────────────────────────────────────
+  // ── 1. STATIC (bring-your-own-NATS) — UNREACHABLE until P0-3 ──────────────
+  // The static-signal guard above throws for EVERY condition that could set a
+  // static signal, so this resolution block cannot currently run. It is retained
+  // as the P0-3 (BYO-NATS authenticated registration) landing site: P0-3 removes
+  // the throw and re-enables this path once static creds carry an attested
+  // identity. The `{ mode: "static" }` union member + connector case survive for
+  // direct unit construction of the resolved source.
   const credsFilePath = env["WEBCHANNEL_NATS_CREDS"] ?? creds?.credsFile;
   const envJwt = env["WEBCHANNEL_NATS_USER_JWT"];
   const envSeed = env["WEBCHANNEL_NATS_USER_SEED"];
@@ -266,7 +332,6 @@ export function resolveNatsCredentialSource(
   );
 
   const staticSignalled =
-    creds?.mode === "static" ||
     credsFilePath !== undefined ||
     envJwt !== undefined ||
     envSeed !== undefined ||
@@ -306,22 +371,31 @@ export function resolveNatsCredentialSource(
     return { mode: "static", url, userJwt, userSeed };
   }
 
-  // ── 3. ENROLLED (SaaS device-flow — the default) ──────────────────────────
+  // ── 2. ENROLLED (SaaS device-flow — the default) ──────────────────────────
   // The resolver owns saasBaseUrl precedence so a `nats.credentials.saasBaseUrl`
   // set by an operator is actually honored (previously it was silently ignored):
   //   env WEBCHANNEL_SAAS_BASE_URL > nats.credentials.saasBaseUrl
   //     > top-level api.config.saas?.baseUrl (input.saasBaseUrl) > default.
-  const saasBaseUrl =
-    env["WEBCHANNEL_SAAS_BASE_URL"] ??
-    creds?.saasBaseUrl ??
-    input.saasBaseUrl ??
-    DEFAULT_SAAS_BASE_URL;
+  const saasBaseUrl = resolveEnrolledSaasBaseUrl({
+    ...(nats !== undefined ? { natsConfig: nats } : {}),
+    ...(input.saasBaseUrl !== undefined
+      ? { saasBaseUrl: input.saasBaseUrl }
+      : {}),
+    env,
+    fallback: DEFAULT_SAAS_BASE_URL,
+  })!;
   return {
     mode: "enrolled",
     url,
     saasBaseUrl,
     tenant: input.tenant,
     accountId: input.accountId,
+    ...(input.storageRoot !== undefined
+      ? { storageRoot: input.storageRoot }
+      : {}),
+    ...(input.credentialPath !== undefined
+      ? { credentialPath: input.credentialPath }
+      : {}),
   };
 }
 
@@ -353,6 +427,10 @@ export type ConnectNatsDeps = {
   createEnrolled?: typeof createEnrolledNatsConnection;
   /** NKEY signing-callback factory (defaults to `makeNkeySigningCallback`). */
   makeSigner?: typeof makeNkeySigningCallback;
+  /** Initial-dial lifecycle cancellation. */
+  signal?: AbortSignal;
+  /** Transfers attempt ownership before the first await. */
+  onTransport?: (transport: NatsTransport) => void;
 };
 
 /**
@@ -360,7 +438,6 @@ export type ConnectNatsDeps = {
  *
  * Every branch produces the SAME `NatsTransport` primitive — only the auth
  * material differs:
- *   - open     → no jwt, no signer.
  *   - static   → user JWT + NKEY-seed signing callback (challenge-response).
  *   - enrolled → delegated to `createEnrolledNatsConnection` (device-flow).
  *
@@ -377,36 +454,66 @@ export async function connectNatsCredentialSource(
   const makeSigner = deps.makeSigner ?? makeNkeySigningCallback;
 
   switch (source.mode) {
-    case "open": {
-      const transport = transportFactory({
-        url: source.url,
-        clientName: "openclaw-webchannel-agent-dev",
-        // S1: auto-reconnect a dropped connection (replays subscriptions).
-        reconnect: true,
-      });
-      await transport.connect();
-      return { transport };
-    }
     case "static": {
+      let signer: (nonce: string) => Promise<string>;
+      try {
+        signer = makeSigner(source.userSeed);
+      } catch (cause) {
+        throw Object.assign(
+          new Error("webchannel: NATS credential material is invalid", { cause }),
+          { code: "NATS_CREDENTIAL_INVALID" },
+        );
+      }
       const transport = transportFactory({
         url: source.url,
         jwtCredential: source.userJwt,
-        nkeySigningCallback: makeSigner(source.userSeed),
+        nkeySigningCallback: signer,
         clientName: "openclaw-webchannel-agent",
         // S1: auto-reconnect a dropped connection (replays subscriptions).
         reconnect: true,
       });
-      await transport.connect();
+      let ownershipTransferred = false;
+      try {
+        if (deps.onTransport) {
+          deps.onTransport(transport);
+          ownershipTransferred = true;
+        }
+        await transport.connect(deps.signal);
+        if (deps.signal?.aborted) throw new NatsLifecycleAbortError();
+      } catch (err) {
+        // The connector owns a transport until it returns it. A failed signer,
+        // protocol handshake, timeout, or socket dial must not leave that
+        // locally-created transport reconnecting in the background.
+        if (!ownershipTransferred || deps.signal?.aborted) {
+          try { transport.disconnect(); } catch { /* preserve the connect error */ }
+        }
+        throw err;
+      }
       return { transport };
     }
     case "enrolled": {
+      // Direct callers may inject createEnrolled, so validate before invoking
+      // that trust-boundary seam.
+      assertValidCredentialBindingExpectation({
+        tenant: source.tenant,
+        accountId: source.accountId,
+        saasBaseUrl: source.saasBaseUrl,
+      });
       const createEnrolled = deps.createEnrolled ?? createEnrolledNatsConnection;
+      const endpoints = deriveEnrollmentEndpoints(source.saasBaseUrl);
       const enrolled = await createEnrolled({
-        saasEnrollUrl: `${source.saasBaseUrl}/api/enroll`,
-        saasPollUrl: `${source.saasBaseUrl}/api/poll`,
+        saasBaseUrl: source.saasBaseUrl,
+        saasEnrollUrl: endpoints.saasEnrollUrl,
+        saasPollUrl: endpoints.saasPollUrl,
         natsUrl: source.url,
         tenant: source.tenant,
         accountId: source.accountId,
+        ...(source.storageRoot !== undefined
+          ? { storageRoot: source.storageRoot }
+          : {}),
+        ...(source.credentialPath !== undefined
+          ? { credentialPath: source.credentialPath }
+          : {}),
         displayInstructions: true,
       });
       return { transport: enrolled.transport, enrolled };

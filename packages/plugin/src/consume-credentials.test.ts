@@ -1,7 +1,34 @@
 import { describe, it, expect, vi } from "vitest";
 
-import { consumeCredentialSource } from "./consume-credentials.js";
+import { consumeCredentialSource, resolveDialMaterial } from "./consume-credentials.js";
+import type {
+  BoundCredentialDocument,
+  BoundCredentialLoadResult,
+  PersistedEnrolledCreds,
+} from "./credential-document.js";
 import type { NatsCredentialSource } from "./nats-credential-source.js";
+import { StorageDocumentError } from "./storage-document.js";
+
+const identityKey = {
+  publicKey: new Uint8Array(32).fill(1),
+  privateKey: new Uint8Array(32).fill(2),
+};
+
+function matching(
+  overrides: Partial<PersistedEnrolledCreds> = {},
+): BoundCredentialLoadResult {
+  return {
+    status: "match",
+    document: {} as BoundCredentialDocument,
+    credentials: {
+      userJwt: "JWT",
+      userSeed: "SEED",
+      natsUrl: "wss://bound-relay",
+      identityKey,
+      ...overrides,
+    },
+  };
+}
 
 describe("consumeCredentialSource", () => {
   it("enrolled + persisted creds → connects via the static path (NO enroll)", async () => {
@@ -21,21 +48,54 @@ describe("consumeCredentialSource", () => {
       accountId: "a",
     };
 
-    const result = await consumeCredentialSource(source, "acctA", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       createEnrolled,
       makeSigner: () => async () => "sig",
-      loadPersisted: () => ({ userJwt: "JWT", userSeed: "SEED" }),
+      loadPersisted: () => matching(),
     });
 
     expect(result.status).toBe("connected");
     expect(createEnrolled).not.toHaveBeenCalled();
-    // Connected via the static branch with the persisted creds. With NO persisted
-    // natsUrl (pre-delivery creds), the resolver's `source.url` is the fallback.
+    // Connected via the static branch with the persisted, identity-bound relay.
     expect(transportFactory).toHaveBeenCalledWith(
-      expect.objectContaining({ url: "ws://relay", jwtCredential: "JWT" }),
+      expect.objectContaining({ url: "wss://bound-relay", jwtCredential: "JWT" }),
     );
-    if (result.status === "connected") expect(result.dialedUrl).toBe("ws://relay");
+    if (result.status === "connected") expect(result.dialedUrl).toBe("wss://bound-relay");
+  });
+
+  it("loads enrolled credentials with the exact tuple and override semantics", async () => {
+    const transportFactory = vi.fn(
+      () => ({ connect: vi.fn(async () => {}), connected: true }) as never,
+    );
+    const loadPersisted = vi.fn(() => matching());
+    const source: NatsCredentialSource = {
+      mode: "enrolled",
+      url: "ws://relay",
+      saasBaseUrl: "http://s",
+      tenant: "tenant-A",
+      accountId: "account-A",
+      storageRoot: "/common/state",
+      credentialPath: "/credential-only/credentials.json",
+    };
+
+    await consumeCredentialSource(source, {
+      transportFactory,
+      makeSigner: () => async () => "sig",
+      loadPersisted,
+    });
+
+    expect(loadPersisted).toHaveBeenCalledWith(
+      {
+        tenant: "tenant-A",
+        accountId: "account-A",
+        saasBaseUrl: "http://s",
+      },
+      {
+        storageRoot: "/common/state",
+        credentialPath: "/credential-only/credentials.json",
+      },
+    );
   });
 
   it("enrolled + persisted natsUrl → dials the SaaS-delivered URL, NOT source.url", async () => {
@@ -54,12 +114,10 @@ describe("consumeCredentialSource", () => {
       accountId: "a",
     };
 
-    const result = await consumeCredentialSource(source, "acctA", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       makeSigner: () => async () => "sig",
-      loadPersisted: () => ({
-        userJwt: "JWT",
-        userSeed: "SEED",
+      loadPersisted: () => matching({
         natsUrl: "wss://saas-delivered-relay", // delivered with the minted creds
       }),
     });
@@ -77,12 +135,33 @@ describe("consumeCredentialSource", () => {
     }
   });
 
+  it("fails closed when an injected matching loader omits relay provenance", async () => {
+    const transportFactory = vi.fn();
+    const source: NatsCredentialSource = {
+      mode: "enrolled",
+      url: "ws://configured-fallback",
+      saasBaseUrl: "http://s",
+      tenant: "t",
+      accountId: "a",
+    };
+    const result = await consumeCredentialSource(source, {
+      transportFactory,
+      loadPersisted: () => matching({ natsUrl: undefined }),
+    });
+    expect(result).toEqual({
+      status: "creds-binding-failed",
+      accountId: "a",
+      failure: {
+        status: "invalid",
+        code: "invalid-document",
+        fields: ["enrollment.natsUrl"],
+      },
+    });
+    expect(transportFactory).not.toHaveBeenCalled();
+  });
+
   it("F2: enrolled + persisted identityKey → surfaced on the connected result", async () => {
     const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}), connected: true }) as never);
-    const identityKey = {
-      publicKey: new Uint8Array(32).fill(1),
-      privateKey: new Uint8Array(32).fill(2),
-    };
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
@@ -90,17 +169,17 @@ describe("consumeCredentialSource", () => {
       tenant: "t",
       accountId: "a",
     };
-    const result = await consumeCredentialSource(source, "acctA", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       makeSigner: () => async () => "sig",
-      loadPersisted: () => ({ userJwt: "JWT", userSeed: "SEED", identityKey }),
+      loadPersisted: () => matching({ identityKey }),
     });
     expect(result.status).toBe("connected");
     if (result.status === "connected") expect(result.identityKey).toBe(identityKey);
   });
 
-  it("F2: enrolled without a persisted identityKey → connected result omits identityKey", async () => {
-    const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}), connected: true }) as never);
+  it("rejects a binding mismatch before constructing a connector", async () => {
+    const transportFactory = vi.fn();
     const source: NatsCredentialSource = {
       mode: "enrolled",
       url: "ws://relay",
@@ -108,13 +187,22 @@ describe("consumeCredentialSource", () => {
       tenant: "t",
       accountId: "a",
     };
-    const result = await consumeCredentialSource(source, "acctA", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
-      makeSigner: () => async () => "sig",
-      loadPersisted: () => ({ userJwt: "JWT", userSeed: "SEED" }),
+      loadPersisted: () => ({
+        status: "mismatch",
+        fields: ["storage.tenant"],
+      }),
     });
-    expect(result.status).toBe("connected");
-    if (result.status === "connected") expect(result.identityKey).toBeUndefined();
+    expect(result).toEqual({
+      status: "creds-binding-failed",
+      accountId: "a",
+      failure: {
+        status: "mismatch",
+        fields: ["storage.tenant"],
+      },
+    });
+    expect(transportFactory).not.toHaveBeenCalled();
   });
 
   it("enrolled + missing creds → creds-missing (no connect, no enroll)", async () => {
@@ -125,13 +213,13 @@ describe("consumeCredentialSource", () => {
       url: "ws://relay",
       saasBaseUrl: "http://s",
       tenant: "t",
-      accountId: "a",
+      accountId: "acctMissing",
     };
 
-    const result = await consumeCredentialSource(source, "acctMissing", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       createEnrolled,
-      loadPersisted: () => undefined,
+      loadPersisted: () => ({ status: "absent" }),
     });
 
     expect(result).toEqual({ status: "creds-missing", accountId: "acctMissing" });
@@ -139,14 +227,31 @@ describe("consumeCredentialSource", () => {
     expect(createEnrolled).not.toHaveBeenCalled();
   });
 
-  it("open source → delegates to connectNatsCredentialSource unchanged", async () => {
-    const transportFactory = vi.fn(() => ({ connect: vi.fn(async () => {}) }) as never);
-    const source: NatsCredentialSource = { mode: "open", url: "ws://open" };
-    const result = await consumeCredentialSource(source, "default", { transportFactory });
-    expect(result.status).toBe("connected");
-    expect(transportFactory).toHaveBeenCalledWith(
-      expect.objectContaining({ url: "ws://open" }),
-    );
+  it("rejects storage identity mismatch before creating a transport", async () => {
+    const transportFactory = vi.fn();
+    const source: NatsCredentialSource = {
+      mode: "enrolled",
+      url: "ws://relay",
+      saasBaseUrl: "http://s",
+      tenant: "tenant-A",
+      accountId: "account-A",
+    };
+    await expect(
+      consumeCredentialSource(source, {
+        transportFactory,
+        loadPersisted: () => {
+          throw new StorageDocumentError(
+            "credentials",
+            "identity-mismatch",
+            ["storage.tenant"],
+          );
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "identity-mismatch",
+      fields: ["storage.tenant"],
+    });
+    expect(transportFactory).not.toHaveBeenCalled();
   });
 
   it("static source → delegates to connectNatsCredentialSource unchanged", async () => {
@@ -158,7 +263,7 @@ describe("consumeCredentialSource", () => {
       userJwt: "J",
       userSeed: "S",
     };
-    const result = await consumeCredentialSource(source, "default", {
+    const result = await consumeCredentialSource(source, {
       transportFactory,
       makeSigner,
     });
@@ -166,5 +271,46 @@ describe("consumeCredentialSource", () => {
     expect(transportFactory).toHaveBeenCalledWith(
       expect.objectContaining({ url: "ws://static", jwtCredential: "J" }),
     );
+  });
+});
+
+describe("resolveDialMaterial (probe-safe)", () => {
+  const base = { tenant: "t", accountId: "a", env: {} };
+
+  it("surfaces the resolver's refusal of static creds as invalid material", () => {
+    // BYO-NATS static credentials are refused until P0-3 lands, so the resolver
+    // throws and the probe reports invalid material rather than a dial-able source.
+    expect(resolveDialMaterial({ ...base, natsConfig: { url: "ws://static", credentials: { mode: "static", userJwt: "J", userSeed: "S" } } }).status).toBe("invalid");
+  });
+
+  it("always uses the delivered bound relay URL", () => {
+    const enrolled = (natsUrl: string) => resolveDialMaterial({
+      ...base,
+      natsConfig: { url: "ws://configured" },
+      loadCreds: () => matching({
+        userJwt: "J",
+        userSeed: "S",
+        natsUrl,
+      }),
+    });
+    expect(enrolled("wss://delivered")).toMatchObject({ status: "ok", dial: { url: "wss://delivered" } });
+  });
+
+  it("maps absent persisted creds to creds-missing and resolver throws to invalid", () => {
+    expect(resolveDialMaterial({ ...base, loadCreds: () => ({ status: "absent" }) })).toEqual({ status: "creds-missing", accountId: "a" });
+    expect(resolveDialMaterial({ ...base, natsConfig: { credentials: { mode: "static", userJwt: "J" } } })).toMatchObject({ status: "invalid" });
+  });
+
+  it("keeps a binding failure distinct from missing material before probe dial", () => {
+    expect(resolveDialMaterial({
+      ...base,
+      loadCreds: () => ({
+        status: "unbound",
+      }),
+    })).toEqual({
+      status: "creds-binding-failed",
+      accountId: "a",
+      failure: { status: "unbound" },
+    });
   });
 });

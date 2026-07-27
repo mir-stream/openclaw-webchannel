@@ -57,6 +57,7 @@ const TEST_ACCOUNT_ID = "test-agent";
 let enrollmentServer: ReturnType<typeof spawn> | null = null;
 let bootstrapServer: ReturnType<typeof spawn> | null = null;
 let natsServer: ReturnType<typeof spawn> | null = null;
+let bootstrapAgentPublicKey = "";
 
 // Resolve the tsx binary from node_modules (a bare `npx tsx` is flaky under a
 // spawned shell — it may miss the cache and report "command not found").
@@ -110,6 +111,8 @@ async function startEnrollmentServer(): Promise<void> {
       // Poll instantly in tests so the flow doesn't wait the RFC 8628 5s interval.
       POLL_INTERVAL_SECONDS: "0",
       EXPIRATION_SECONDS: "600",
+      ENROLLMENT_ADMIN_TOKEN: "test-admin-token",
+      ENABLE_TEST_ROUTES: "1",
     },
     stdio: "pipe",
   });
@@ -132,16 +135,17 @@ async function startBootstrapServer(): Promise<void> {
     "../reference/bootstrap-server.ts",
   );
 
+  bootstrapAgentPublicKey = await generateDeviceKey();
   bootstrapServer = spawn(TSX_BIN, [serverPath], {
     cwd: dirname(fileURLToPath(import.meta.url)),
     env: {
       ...process.env,
       PORT: String(BOOTSTRAP_SERVER_PORT),
       SAAS_BASE_URL: BOOTSTRAP_BASE_URL,
-      // F2: this reference bootstrap-server only serves the well-known DEV agent
-      // pin in dev-open mode (it has no enrollment/registry). This is a dev/e2e
-      // harness, so opt in — the /bootstrap response then carries agentPublicKey.
-      WEBCHANNEL_NATS_DEV_OPEN: "1",
+      WEBCHANNEL_AGENT_PUBLIC_KEY: bootstrapAgentPublicKey,
+      ENABLE_TEST_ROUTES: "1",
+      REFERENCE_TENANT: TEST_TENANT,
+      REFERENCE_ACCOUNT_ID: TEST_ACCOUNT_ID,
     },
     stdio: "pipe",
   });
@@ -203,7 +207,7 @@ function stopAllServers(): void {
 async function postJson(url: string, body: unknown): Promise<unknown> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(url.endsWith("/approve") || url.endsWith("/deny") || url.endsWith("/revoke") ? { Authorization: "Bearer test-admin-token" } : {}) },
     body: JSON.stringify(body),
   });
 
@@ -308,6 +312,28 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     expect(response.ok).toBe(true);
   });
 
+  it("P1-1 admin endpoints require bearer auth while public endpoints and CORS remain available", async () => {
+    for (const path of ["approve", "deny", "revoke"]) {
+      const missing = await fetch(`${SAAS_BASE_URL}/${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_code: "NO-SUCH-CODE", tenant: TEST_TENANT, accountId: TEST_ACCOUNT_ID }),
+      });
+      expect(missing.status, path).toBe(401);
+      const wrong = await fetch(`${SAAS_BASE_URL}/${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer wrong" },
+        body: JSON.stringify({ user_code: "NO-SUCH-CODE", tenant: TEST_TENANT, accountId: TEST_ACCOUNT_ID }),
+      });
+      expect(wrong.status, path).toBe(401);
+    }
+    const preflight = await fetch(`${SAAS_BASE_URL}/approve`, { method: "OPTIONS" });
+    expect(preflight.headers.get("access-control-allow-headers")).toContain("Authorization");
+    const html = await (await fetch(`${SAAS_BASE_URL}/enroll?user_code=SAFE-CODE`)).text();
+    expect(html).not.toContain("test-admin-token");
+    expect(html).not.toContain("Bearer test-admin-token");
+  });
+
   // -------------------------------------------------------------------------
   // Test 2: Bootstrap server health check
   // -------------------------------------------------------------------------
@@ -351,11 +377,53 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     console.log(`[AC6 E2E] Enrollment initiated: ${(enrollResponse as { user_code: string }).user_code}`);
   });
 
+  it("P1-1 test bootstrap ignores a caller-supplied agentPublicKey and serves the registry pin", async () => {
+    const enrolledKey = await generatePluginKeyPair();
+    const attackerKey = await generatePluginKeyPair();
+    const accountId = "registry-pin-test";
+    const started = await postJson(`${SAAS_BASE_URL}/api/enroll`, {
+      agentPublicKey: enrolledKey.publicKey,
+      tenant: TEST_TENANT,
+      accountId,
+    }) as { user_code: string };
+    const approved = await postJson(`${SAAS_BASE_URL}/approve`, { user_code: started.user_code }) as { success: boolean };
+    expect(approved.success).toBe(true);
+    const bootstrap = await postJson(`${SAAS_BASE_URL}/test/bootstrap-jwt`, {
+      tenant: TEST_TENANT,
+      accountId,
+      peerId: "registry-pin-peer",
+      deviceX25519PublicKey: await generateDeviceKey(),
+      agentPublicKey: attackerKey.publicKey,
+    }) as { agentPublicKey?: string };
+    expect(bootstrap.agentPublicKey).toBe(enrolledKey.publicKey);
+    expect(bootstrap.agentPublicKey).not.toBe(attackerKey.publicKey);
+  });
+
+  it("test bootstrap rejects a peerId that can alter the NATS subject hierarchy", async () => {
+    const response = await fetch(`${SAAS_BASE_URL}/test/bootstrap-jwt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tenant: TEST_TENANT,
+        accountId: TEST_ACCOUNT_ID,
+        peerId: "peer.*",
+        deviceX25519PublicKey: await generateDeviceKey(),
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: expect.stringMatching(/peerId/) });
+  });
+
   // -------------------------------------------------------------------------
   // Test 4: Complete enrollment flow with approval
   // -------------------------------------------------------------------------
 
   it("should complete enrollment flow: enroll → approve → poll → credentials", async () => {
+    // Own slot: this test approves+polls, which activates a registry key for
+    // (tenant, accountId). Sharing TEST_ACCOUNT_ID with other approving tests
+    // would make a later plain approve here (or there) hit the "conflict"
+    // outcome (an active key already occupies the slot) instead of "approved".
+    const accountId = `${TEST_ACCOUNT_ID}-full-flow`;
     const pluginKeyPair = await generatePluginKeyPair();
 
     // Step 1: Plugin initiates enrollment
@@ -364,7 +432,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       {
         agentPublicKey: pluginKeyPair.publicKey,
         tenant: TEST_TENANT,
-        accountId: TEST_ACCOUNT_ID,
+        accountId,
       },
     ) as {
       device_code: string;
@@ -390,7 +458,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     expect(approveResponse.success).toBe(true);
     expect(approveResponse.peerId).toBeDefined();
     expect(approveResponse.tenant).toBe(TEST_TENANT);
-    expect(approveResponse.accountId).toBe(TEST_ACCOUNT_ID);
+    expect(approveResponse.accountId).toBe(accountId);
 
     console.log(`[AC6 E2E] Step 2: Enrollment approved, peerId: ${approveResponse.peerId}`);
 
@@ -467,13 +535,17 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       agentPublicKey: string;
       jwksUrl: string;
       natsUrl: string;
+      accountId: string;
+      tenant: string;
     };
 
     expect(bootstrapResponse.jwt).toBeDefined();
     expect(bootstrapResponse.peerId).toBeDefined();
-    expect(bootstrapResponse.agentPublicKey).toBeDefined();
+    expect(bootstrapResponse.agentPublicKey).toBe(bootstrapAgentPublicKey);
     expect(bootstrapResponse.jwksUrl).toContain("/.well-known/jwks.json");
     expect(bootstrapResponse.natsUrl).toContain("nats");
+    expect(bootstrapResponse.accountId).toBe(TEST_ACCOUNT_ID);
+    expect(bootstrapResponse.tenant).toBe(TEST_TENANT);
 
     // Verify JWT structure (header.payload.signature)
     const jwtParts = bootstrapResponse.jwt.split(".");
@@ -496,7 +568,6 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       iss: expect.any(String),
       sub: bootstrapResponse.peerId, // peerId is threaded into sub
       aud: TEST_ACCOUNT_ID,
-      accountId: TEST_ACCOUNT_ID,
       tenant: TEST_TENANT,
       cnf: {
         jwk: {
@@ -553,6 +624,23 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     expect(identity?.devicePublicKey).toBe(devicePublicKey);
 
     console.log(`[AC6 E2E] verifyJwt admitted real-issuer JWT for peerId: ${identity?.peerId}`);
+  });
+
+  it("standalone test issuer rejects a caller that tries to choose another tuple", async () => {
+    const devicePublicKey = await generateDeviceKey();
+    const response = await fetch(`${BOOTSTRAP_BASE_URL}/bootstrap`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        devicePublicKey,
+        tenant: TEST_TENANT,
+        accountId: "caller-chosen-account",
+      }),
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: expect.stringMatching(/server-owned test tuple/),
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -737,7 +825,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     // so call fetch directly (postJson throws on non-2xx).
     const approveRaw = await fetch(`${SAAS_BASE_URL}/approve`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-admin-token" },
       body: JSON.stringify({ user_code: "EXPIRED-CODE" }),
     });
     expect(approveRaw.status).toBe(404);
@@ -761,6 +849,10 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       return;
     }
 
+    // Own slot: a plain approve here must land as "approved", not "conflict"
+    // with whatever key another approving test already activated for
+    // TEST_ACCOUNT_ID. See the "full-flow" test above for the same reasoning.
+    const accountId = `${TEST_ACCOUNT_ID}-full-e2e`;
     const pluginKeyPair = await generatePluginKeyPair();
 
     // Step 1: Enroll plugin
@@ -769,7 +861,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       {
         agentPublicKey: pluginKeyPair.publicKey,
         tenant: TEST_TENANT,
-        accountId: TEST_ACCOUNT_ID,
+        accountId,
       },
     ) as {
       device_code: string;

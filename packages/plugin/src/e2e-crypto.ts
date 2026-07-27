@@ -148,33 +148,25 @@ export function generateKeyPair(): KeyPair {
 }
 
 /**
- * Deterministically build an X25519 key pair from a fixed 32-byte seed used as
- * the raw private scalar. Unlike `generateKeyPair` (CSPRNG), this yields the SAME
- * pair for the same seed — used ONLY to derive the well-known DEV-OPEN identity
- * key both the agent and the dev browser drivers must agree on (see dev-identity.ts).
- * NOT for production key material.
+ * Derive the raw X25519 public key corresponding to a raw 32-byte private key.
  *
- * X25519 stores the scalar verbatim (clamping is applied at use, not at rest), so
- * the returned `privateKey` equals `seed` — it is UNCLAMPED. That is safe here
- * because every consumer feeds it back through `deriveSharedSecret`, which imports
- * it via `diffieHellman` and clamps internally; do NOT treat the raw `privateKey`
- * as a clamped scalar elsewhere.
+ * This is also useful when validating a persisted key pair: accepting two
+ * independently well-shaped halves is not sufficient because the private half
+ * must actually control the persisted (and identity-bound) public half.
  */
-export function keyPairFromSeed(seed: Uint8Array): KeyPair {
-  if (seed.length !== 32) {
-    throw new Error(`keyPairFromSeed: seed must be 32 bytes (got ${seed.length})`);
+export function derivePublicKey(privateKey: Uint8Array): Uint8Array {
+  if (privateKey.length !== 32) {
+    throw new Error("X25519 private key must be exactly 32 bytes");
   }
   const privateKeyObj = createPrivateKey({
-    key: Buffer.concat([X25519_PKCS8_HEADER, Buffer.from(seed)]),
+    key: Buffer.concat([X25519_PKCS8_HEADER, Buffer.from(privateKey)]),
     format: "der",
     type: "pkcs8",
   });
-  const publicKeyObj = createPublicKey(privateKeyObj);
-  const pubJwk = publicKeyObj.export({ format: "jwk" }) as { x: string };
-  return {
-    publicKey: new Uint8Array(Buffer.from(pubJwk.x, "base64url")),
-    privateKey: new Uint8Array(seed),
+  const publicJwk = createPublicKey(privateKeyObj).export({ format: "jwk" }) as {
+    x: string;
   };
+  return new Uint8Array(Buffer.from(publicJwk.x, "base64url"));
 }
 
 // ---------------------------------------------------------------------------

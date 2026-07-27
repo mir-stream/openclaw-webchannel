@@ -34,13 +34,11 @@ import {
   WebChannelNatsClient,
   inboundSubject,
   outboundSubject,
-  handshakeSubject,
   registerSubject,
   type ProtocolInfo,
 } from "./nats-client.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import {
-  generateX25519KeyPair,
   unwrapConversationKey,
   sealMessage,
   openMessage,
@@ -48,6 +46,22 @@ import {
   type WrappedConversationKey,
 } from "./e2e-crypto-browser.js";
 import { generateDevicePopKeyPair } from "./pop-register.js";
+
+async function generateX25519KeyPair(): Promise<{
+  privateKey: CryptoKey;
+  publicKeyBytes: Uint8Array;
+}> {
+  const pair = (await crypto.subtle.generateKey({ name: "X25519" }, true, [
+    "deriveBits",
+  ])) as CryptoKeyPair;
+  return {
+    privateKey: pair.privateKey,
+    publicKeyBytes: new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey)),
+  };
+}
+
+const removedHandshakeSubject = (tenant: string, accountId: string, peerId: string) =>
+  `webchannel.${tenant}.${accountId}.${peerId}.handshake`;
 
 // ---------------------------------------------------------------------------
 // Agent-side wrap, implemented EXACTLY like the plugin's late-join-decryptor
@@ -79,24 +93,42 @@ function makeAgentIdentity(): { privatePem: string; publicRaw: Uint8Array; publi
 }
 
 /**
+ * The v3 wrap AAD, re-implemented here BY HAND (node:Buffer, no import from the
+ * module under test) so this file stays an independent mirror of the agent:
+ *
+ *   UTF-8("webchannel-wrap-v2") ‹0x1F› UTF-8(peerId) ‹0x1F› UTF-8(clientNonce)
+ */
+function wrapAadLikeAgent(peerId: string, clientNonce: string): Buffer {
+  const US = Buffer.from([0x1f]);
+  return Buffer.concat([
+    Buffer.from("webchannel-wrap-v2", "utf8"),
+    US,
+    Buffer.from(peerId, "utf8"),
+    US,
+    Buffer.from(clientNonce, "utf8"),
+  ]);
+}
+
+/**
  * Wrap K the AGENT's way (F2 static-static): ECDH(agentIdentity.private,
  * device.public) → HKDF "webchannel-key-wrap-v1" → chacha20-poly1305 sealing K
- * with AAD = UTF-8(peerId). The `ephemeralPublicKey` field carries the agent
- * identity PUBLIC key (the one-release compat alias). Mirrors
- * packages/plugin/src/late-join-decryptor.ts exactly, independent of the browser
- * impl under test. `wrapPrivatePem` defaults to the agent identity but a test can
- * pass a DIFFERENT key (a relay's key) to prove the browser rejects it.
+ * with AAD = wrapAadLikeAgent(peerId, clientNonce). The `ephemeralPublicKey`
+ * field carries the agent identity PUBLIC key (the one-release compat alias).
+ * Mirrors packages/plugin/src/late-join-decryptor.ts exactly, independent of the
+ * browser impl under test. `wrapPrivatePem` defaults to the agent identity but a
+ * test can pass a DIFFERENT key (a relay's key) to prove the browser rejects it.
  */
 function wrapLikeAgent(
   conversationKey: Uint8Array,
   devicePublicKeyRaw: Uint8Array,
   agentIdentity: { privatePem: string; publicRaw: Uint8Array },
   peerId: string,
+  clientNonce: string,
   wrapPrivatePem: string = agentIdentity.privatePem,
 ): WrappedConversationKey {
   // ECDH: wrap private × device public. The public half emitted in the wire field
   // is always the agent identity public (compat alias), even when a relay wraps
-  // under a different private key — the browser IGNORES the field anyway.
+  // under a different private key while keeping the public identity field stable.
   const devicePub = createPublicKey({
     key: x25519RawToSpki(devicePublicKeyRaw),
     type: "spki",
@@ -112,11 +144,14 @@ function wrapLikeAgent(
     hkdfSync("sha256", shared, Buffer.alloc(32), "webchannel-key-wrap-v1", 32),
   );
 
-  // ChaCha20-Poly1305 seal, binding peerId into the AAD (F2 anti-lift) — matches
-  // the plugin's encrypt(wrapKey, K, wrapAad(peerId)).
+  // ChaCha20-Poly1305 seal, binding peerId (F2 anti-lift) AND the browser-chosen
+  // clientNonce (v3 anti-replay) into the AAD — matches the plugin's
+  // encrypt(wrapKey, K, wrapAad(peerId, clientNonce)).
   const nonce = randomBytes(12);
   const cipher = createCipheriv("chacha20-poly1305", wrapKey, nonce, { authTagLength: 16 });
-  cipher.setAAD(Buffer.from(peerId, "utf8"), { plaintextLength: conversationKey.length });
+  cipher.setAAD(wrapAadLikeAgent(peerId, clientNonce), {
+    plaintextLength: conversationKey.length,
+  });
   const ciphertext = Buffer.concat([cipher.update(Buffer.from(conversationKey)), cipher.final()]);
   const tag = cipher.getAuthTag();
 
@@ -222,6 +257,8 @@ const TENANT = "acme";
 const AGENT = "agent-1";
 const PEER = "user-42";
 const JWT = "bootstrap.jwt.token";
+/** A fixed browser freshness anchor for the direct (non-client-driven) wrap tests. */
+const CN = "Y29uZm9ybWFuY2Utbm9uY2UtZml4LTAx";
 
 async function settle(rounds = 8): Promise<void> {
   for (let i = 0; i < rounds; i++) await new Promise((r) => setTimeout(r, 5));
@@ -229,35 +266,42 @@ async function settle(rounds = 8): Promise<void> {
 
 /**
  * Register-agent handler over the reply-to inbox: challenge → nonce, register →
- * `{peerId, registered, wrappedConversationKey?}` from `wrapped()` (omitted when
- * it returns null). `gate`, when provided, holds the register REPLY so a test can
- * race the NATS `.out` snapshot ahead of the delivered key.
+ * `{peerId, registered, wrappedConversationKey?}` from `wrapped(clientNonce)`
+ * (omitted when it returns null). `gate`, when provided, holds the register REPLY
+ * so a test can race the NATS `.out` snapshot ahead of the delivered key.
+ *
+ * v3: the wrap thunk receives the `clientNonce` the CLIENT put on the register
+ * request, exactly as the real agent does — so a client that failed to send one
+ * (or sent a different one than it unwraps with) fails at Poly1305 here too. The
+ * reply deliberately does NOT echo `clientNonce`, mirroring the real plugin.
  */
 function registerAgentHandler(
   peerId: string,
-  wrapped: () => WrappedConversationKey | null,
+  wrapped: (clientNonce: string) => WrappedConversationKey | null,
   gate?: Promise<void>,
-  // Optional wire-protocol version fields to include in the register reply (the
-  // protocol handshake). Omitted keys model a pre-v1 / pre-reporting plugin.
+  // Test-only controls for malformed/absent register reply fields. Protocol v2
+  // requires protocolVersion; omission deliberately models a terminal peer.
   // protocolVersion is typed `number | string` (widened past the real wire type)
   // so a test can inject a malformed string "2" from a buggy/third-party plugin.
-  versions?: { protocolVersion?: number | string; pluginVersion?: string },
+  versions?: { protocolVersion?: number | string | null; pluginVersion?: string },
 ): ServerHandler {
   const reg = registerSubject(TENANT, AGENT, peerId);
   return async (subject, payload, server, replyTo) => {
     if (subject !== reg || !replyTo) return;
-    const body = JSON.parse(payload) as { op?: string };
+    const body = JSON.parse(payload) as { op?: string; clientNonce?: unknown };
     if (body.op === "challenge") {
       server.deliverToClient(replyTo, JSON.stringify({ nonce: "nonce-abc" }));
       return;
     }
     if (body.op === "register") {
       if (gate) await gate;
-      const w = wrapped();
+      const w = wrapped(typeof body.clientNonce === "string" ? body.clientNonce : "");
       const reply: Record<string, unknown> = w
         ? { peerId, registered: true, wrappedConversationKey: w }
         : { peerId, registered: true };
-      if (versions?.protocolVersion !== undefined) reply.protocolVersion = versions.protocolVersion;
+      if (versions?.protocolVersion !== null) {
+        reply.protocolVersion = versions?.protocolVersion ?? WEBCHANNEL_PROTOCOL_VERSION;
+      }
       if (versions?.pluginVersion !== undefined) reply.pluginVersion = versions.pluginVersion;
       server.deliverToClient(replyTo, JSON.stringify(reply));
     }
@@ -313,14 +357,14 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     client.onMessage((m) => received.push(m));
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
-    server.handler = registerAgentHandler(PEER, () =>
-      wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+    server.handler = registerAgentHandler(PEER, (cn) =>
+      wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
     );
     client.sendUserMessage("hello agent");
     await settle();
 
     // Divergence, client half: handshake subject neither subscribed nor published.
-    const hs = handshakeSubject(TENANT, AGENT, PEER);
+    const hs = removedHandshakeSubject(TENANT, AGENT, PEER);
     expect(server.subscribedSubjects()).not.toContain(hs);
     expect(server.published.some((p) => p.subject === hs)).toBe(false);
 
@@ -366,13 +410,13 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     b.client.onMessage((m) => gotB.push(m));
     a.client.connect();
     const serverA = FakeNatsWS.instances.at(-1)!;
-    serverA.handler = registerAgentHandler(PEER, () =>
-      wrapLikeAgent(K, a.deviceKP.publicKeyBytes, agentId, PEER),
+    serverA.handler = registerAgentHandler(PEER, (cn) =>
+      wrapLikeAgent(K, a.deviceKP.publicKeyBytes, agentId, PEER, cn),
     );
     b.client.connect();
     const serverB = FakeNatsWS.instances.at(-1)!;
-    serverB.handler = registerAgentHandler(PEER, () =>
-      wrapLikeAgent(K, b.deviceKP.publicKeyBytes, agentId, PEER),
+    serverB.handler = registerAgentHandler(PEER, (cn) =>
+      wrapLikeAgent(K, b.deviceKP.publicKeyBytes, agentId, PEER, cn),
     );
     await settle();
 
@@ -411,7 +455,7 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     const server = FakeNatsWS.instances.at(-1)!;
     server.handler = registerAgentHandler(
       PEER,
-      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
       gate,
     );
     await settle(4); // connected, .out subscribed, register in-flight (gated)
@@ -450,7 +494,7 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     const server = FakeNatsWS.instances.at(-1)!;
     server.handler = registerAgentHandler(
       PEER,
-      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
       gate,
     );
     await settle(4); // connected, .out subscribed, register in-flight (gated)
@@ -485,7 +529,8 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
   it("fail-closed terminal: register reply without wrappedConversationKey → onError, no handshake fallback", async () => {
     const { client } = await makeClient(makeAgentIdentity().publicB64url);
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     server.handler = registerAgentHandler(PEER, () => null);
@@ -494,9 +539,12 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
 
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toMatch(/wrappedConversationKey/);
+    // P1-7: a plugin that can't deliver the wrapped key is a capability/protocol
+    // mismatch — re-auth cannot help.
+    expect(causes).toEqual(["protocol-mismatch"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     // NO downgrade: no handshake frame, no plaintext, nothing on .in.
-    expect(server.published.some((p) => p.subject === handshakeSubject(TENANT, AGENT, PEER))).toBe(false);
+    expect(server.published.some((p) => p.subject === removedHandshakeSubject(TENANT, AGENT, PEER))).toBe(false);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
 
@@ -506,11 +554,12 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     const { client, deviceKP } = await makeClient(agentId.publicB64url);
 
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
-    server.handler = registerAgentHandler(PEER, () => {
-      const w = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER);
+    server.handler = registerAgentHandler(PEER, (cn) => {
+      const w = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn);
       // Flip a ciphertext byte → tag verification must fail on unwrap.
       const bad = base64urlDecode(w.ciphertext);
       bad[0] ^= 0xff;
@@ -520,6 +569,8 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     await settle();
 
     expect(errors).toHaveLength(1);
+    // P1-7: an unwrap throw → the E2E session could not be established.
+    expect(causes).toEqual(["secure-channel-failed"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
@@ -540,10 +591,10 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     // The relay even copies the genuine agent's public key into the wire field
-    // (compat alias) to look legitimate — irrelevant, the browser ignores it and
-    // derives from the pin. The actual wrap ECDH uses the relay's PRIVATE key.
-    server.handler = registerAgentHandler(PEER, () =>
-      wrapLikeAgent(Kprime, deviceKP.publicKeyBytes, agentId, PEER, relay.privatePem),
+    // (compat alias) to pass the pin equality check. The actual wrap ECDH uses
+    // the relay's PRIVATE key and therefore still fails authentication.
+    server.handler = registerAgentHandler(PEER, (cn) =>
+      wrapLikeAgent(Kprime, deviceKP.publicKeyBytes, agentId, PEER, cn, relay.privatePem),
     );
     client.sendUserMessage("never-sent");
     await settle();
@@ -573,18 +624,22 @@ describe("WebChannelNatsClient register-delivered conversation key (Phase 6)", (
       },
     });
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     const K = new Uint8Array(randomBytes(32));
-    server.handler = registerAgentHandler(PEER, () =>
-      wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+    server.handler = registerAgentHandler(PEER, (cn) =>
+      wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
     );
     client.sendUserMessage("never-sent");
     await settle();
 
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toMatch(/pinned agent public key/i);
+    // P1-7: NOT "config" — the pin rides the SaaS bootstrap, so re-auth can deliver
+    // it; the cause keeps the re-auth affordance available.
+    expect(causes).toEqual(["secure-channel-failed"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
@@ -595,14 +650,77 @@ describe("unwrapConversationKey conformance (agent wrap ↔ browser unwrap)", ()
     const K = new Uint8Array(randomBytes(32));
     const agentId = makeAgentIdentity();
     const deviceKP = await generateX25519KeyPair();
-    const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER);
+    const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, CN);
     const recovered = await unwrapConversationKey(
       wrapped,
       deviceKP.privateKey,
       agentId.publicB64url,
       PEER,
+      CN,
     );
     expect(Buffer.from(recovered).equals(Buffer.from(K))).toBe(true);
+  });
+
+  it("v3 REPLAY DEFENCE: a wrap minted under nonce N1 fails to unwrap under a fresh N2", async () => {
+    // The attack this exists for: a hostile relay captures a whole register reply
+    // and re-serves it verbatim on the browser's NEXT register. Everything in that
+    // reply is still validly agent-authenticated — only the anchor has moved on.
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const deviceKP = await generateX25519KeyPair();
+    const n1 = "TjEtY2FwdHVyZWQtYW5jaG9yLXZhbHVl";
+    const n2 = "TjItZnJlc2gtYW5jaG9yLXZhbHVlLTAy";
+    expect(n1).not.toBe(n2);
+
+    const capturedWrap = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, n1);
+
+    // Replayed onto the attempt that used N2 → Poly1305 (the AAD differs).
+    await expect(
+      unwrapConversationKey(capturedWrap, deviceKP.privateKey, agentId.publicB64url, PEER, n2),
+    ).rejects.toThrow();
+
+    // Control: nothing else about the wrap is wrong — same device key, same pinned
+    // agent key, same peerId. It opens perfectly under its OWN anchor.
+    const ok = await unwrapConversationKey(
+      capturedWrap,
+      deviceKP.privateKey,
+      agentId.publicB64url,
+      PEER,
+      n1,
+    );
+    expect(Buffer.from(ok).equals(Buffer.from(K))).toBe(true);
+  });
+
+  it.each(["ephemeralPublicKey", "nonce", "tag"] as const)(
+    "A2: rejects a relay mutation of wrapped %s",
+    async (field) => {
+      const K = new Uint8Array(randomBytes(32));
+      const agentId = makeAgentIdentity();
+      const deviceKP = await generateX25519KeyPair();
+      const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, CN);
+      const bytes = base64urlDecode(wrapped[field]);
+      bytes[0] ^= 0xff;
+      await expect(
+        unwrapConversationKey(
+          { ...wrapped, [field]: Buffer.from(bytes).toString("base64url") },
+          deviceKP.privateKey,
+          agentId.publicB64url,
+          PEER,
+          CN,
+        ),
+      ).rejects.toThrow();
+    },
+  );
+
+  it("A2: rejects a wrong local SaaS pin", async () => {
+    const K = new Uint8Array(randomBytes(32));
+    const agentId = makeAgentIdentity();
+    const wrongAgent = makeAgentIdentity();
+    const deviceKP = await generateX25519KeyPair();
+    const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, CN);
+    await expect(
+      unwrapConversationKey(wrapped, deviceKP.privateKey, wrongAgent.publicB64url, PEER, CN),
+    ).rejects.toThrow(/pinned key/);
   });
 
   it("a different device's private key cannot unwrap (Poly1305 reject)", async () => {
@@ -610,9 +728,9 @@ describe("unwrapConversationKey conformance (agent wrap ↔ browser unwrap)", ()
     const agentId = makeAgentIdentity();
     const deviceKP = await generateX25519KeyPair();
     const otherKP = await generateX25519KeyPair();
-    const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER);
+    const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, CN);
     await expect(
-      unwrapConversationKey(wrapped, otherKP.privateKey, agentId.publicB64url, PEER),
+      unwrapConversationKey(wrapped, otherKP.privateKey, agentId.publicB64url, PEER, CN),
     ).rejects.toThrow();
   });
 
@@ -622,10 +740,10 @@ describe("unwrapConversationKey conformance (agent wrap ↔ browser unwrap)", ()
     const relay = makeAgentIdentity(); // the substitute
     const deviceKP = await generateX25519KeyPair();
     // Relay wraps K correctly to the device key, but under the relay's private key.
-    const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, relay.privatePem);
+    const wrapped = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, CN, relay.privatePem);
     // Deriving from the PINNED agent key gives a different secret → Poly1305 fails.
     await expect(
-      unwrapConversationKey(wrapped, deviceKP.privateKey, agentId.publicB64url, PEER),
+      unwrapConversationKey(wrapped, deviceKP.privateKey, agentId.publicB64url, PEER, CN),
     ).rejects.toThrow();
   });
 
@@ -633,11 +751,11 @@ describe("unwrapConversationKey conformance (agent wrap ↔ browser unwrap)", ()
     const K = new Uint8Array(randomBytes(32));
     const agentId = makeAgentIdentity();
     const deviceKP = await generateX25519KeyPair();
-    const wrappedForA = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "peer-A");
+    const wrappedForA = wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "peer-A", CN);
     // Same device key, same pinned agent key, but unwrap claims peer-B → AAD
     // mismatch → Poly1305 fails (a relay cannot lift peerA's wrap onto peerB).
     await expect(
-      unwrapConversationKey(wrappedForA, deviceKP.privateKey, agentId.publicB64url, "peer-B"),
+      unwrapConversationKey(wrappedForA, deviceKP.privateKey, agentId.publicB64url, "peer-B", CN),
     ).rejects.toThrow();
     // Sanity: the SAME wrap unwraps for the correct peer.
     const ok = await unwrapConversationKey(
@@ -645,6 +763,7 @@ describe("unwrapConversationKey conformance (agent wrap ↔ browser unwrap)", ()
       deviceKP.privateKey,
       agentId.publicB64url,
       "peer-A",
+      CN,
     );
     expect(Buffer.from(ok).equals(Buffer.from(K))).toBe(true);
   });
@@ -655,7 +774,7 @@ describe("unwrapConversationKey conformance (agent wrap ↔ browser unwrap)", ()
 // ---------------------------------------------------------------------------
 
 describe("WebChannelNatsClient — register protocol-version handshake", () => {
-  it("match: reply carries protocolVersion=1 + pluginVersion → onProtocol exposes both, session establishes", async () => {
+  it("match: reply carries protocol v2 + pluginVersion → onProtocol exposes both, session establishes", async () => {
     const K = new Uint8Array(randomBytes(32));
     const agentId = makeAgentIdentity();
     const { client, deviceKP } = await makeClient(agentId.publicB64url);
@@ -668,7 +787,7 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     const server = FakeNatsWS.instances.at(-1)!;
     server.handler = registerAgentHandler(
       PEER,
-      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
       undefined,
       { protocolVersion: WEBCHANNEL_PROTOCOL_VERSION, pluginVersion: "9.9.9" },
     );
@@ -676,7 +795,7 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     await settle();
 
     expect(errors).toHaveLength(0);
-    expect(infos).toEqual([{ protocolVersion: 1, pluginVersion: "9.9.9" }]);
+    expect(infos).toEqual([{ protocolVersion: WEBCHANNEL_PROTOCOL_VERSION, pluginVersion: "9.9.9" }]);
     // Session still establishes: the buffered send flushed as ciphertext under K.
     const sent = server.published.filter((p) => p.subject === inboundSubject(TENANT, AGENT, PEER));
     expect(sent).toHaveLength(1);
@@ -685,7 +804,7 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     client.disconnect();
   });
 
-  it("absent (pre-v1 plugin): reply omits version fields → onProtocol exposes nulls, non-fatal", async () => {
+  it("absent protocol version is terminal under v2", async () => {
     const K = new Uint8Array(randomBytes(32));
     const agentId = makeAgentIdentity();
     const { client, deviceKP } = await makeClient(agentId.publicB64url);
@@ -696,21 +815,20 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     client.onError((e) => errors.push(e));
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
-    // No `versions` arg → reply has neither protocolVersion nor pluginVersion.
-    server.handler = registerAgentHandler(PEER, () =>
-      wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+    server.handler = registerAgentHandler(PEER, (cn) =>
+      wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
+      undefined,
+      { protocolVersion: null },
     );
     client.sendUserMessage("hello");
     await settle();
 
-    expect(errors).toHaveLength(0);
-    expect(infos).toEqual([{ protocolVersion: null, pluginVersion: null }]);
-    expect(server.readyState).toBe(FakeNatsWS.OPEN);
-
-    client.disconnect();
+    expect(errors).toHaveLength(1);
+    expect(infos).toEqual([]);
+    expect(server.readyState).toBe(FakeNatsWS.CLOSED);
   });
 
-  it("mismatch: reply protocolVersion=2 → TERMINAL onError naming both versions, socket torn down, no key", async () => {
+  it("mismatch is terminal and names both versions", async () => {
     const K = new Uint8Array(randomBytes(32));
     const agentId = makeAgentIdentity();
     const { client, deviceKP } = await makeClient(agentId.publicB64url);
@@ -718,14 +836,15 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     const infos: ProtocolInfo[] = [];
     client.onProtocol((i) => infos.push(i));
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     server.handler = registerAgentHandler(
       PEER,
-      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
       undefined,
-      { protocolVersion: 2, pluginVersion: "2.0.0" },
+      { protocolVersion: WEBCHANNEL_PROTOCOL_VERSION + 1, pluginVersion: "2.0.0" },
     );
     client.sendUserMessage("never-sent");
     await settle();
@@ -733,8 +852,10 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     // Terminal: a two-sided diagnostic and a torn-down socket.
     expect(infos).toHaveLength(0);
     expect(errors).toHaveLength(1);
-    expect(errors[0].message).toContain("client=1");
-    expect(errors[0].message).toContain("agent-plugin=2");
+    expect(errors[0].message).toContain(`client=${WEBCHANNEL_PROTOCOL_VERSION}`);
+    expect(errors[0].message).toContain(`agent-plugin=${WEBCHANNEL_PROTOCOL_VERSION + 1}`);
+    // P1-7: incompatible wire versions → protocol-mismatch (no re-auth affordance).
+    expect(causes).toEqual(["protocol-mismatch"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     // The mismatch is caught BEFORE key delivery — no session key, nothing sealed.
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
@@ -748,14 +869,15 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     const infos: ProtocolInfo[] = [];
     client.onProtocol((i) => infos.push(i));
     const errors: Error[] = [];
-    client.onError((e) => errors.push(e));
+    const causes: Array<string | undefined> = [];
+    client.onError((e, cause) => { errors.push(e); causes.push(cause); });
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     // A buggy/third-party plugin sends the string "2" instead of the number 2.
-    // This must NOT silently degrade to "absent/pre-v1" and proceed.
+    // This must not be coerced or treated as absent; protocol v2 fails closed.
     server.handler = registerAgentHandler(
       PEER,
-      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
       undefined,
       { protocolVersion: "2", pluginVersion: "2.0.0" },
     );
@@ -768,6 +890,8 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toContain("string");
     expect(errors[0].message).toContain('"2"');
+    // P1-7: a ProtocolVersionMalformedError classifies as protocol-mismatch.
+    expect(causes).toEqual(["protocol-mismatch"]);
     expect(server.readyState).toBe(FakeNatsWS.CLOSED);
     expect(server.published.some((p) => p.subject === inboundSubject(TENANT, AGENT, PEER))).toBe(false);
   });
@@ -784,10 +908,10 @@ describe("WebChannelNatsClient — register protocol-version handshake", () => {
     client.connect();
     const server = FakeNatsWS.instances.at(-1)!;
     // "1" would "match" WEBCHANNEL_PROTOCOL_VERSION if we coerced — we must not:
-    // a well-behaved v1 plugin sends the NUMBER 1, so a string is malformed.
+    // Protocol versions are numeric; a string is malformed even if coercible.
     server.handler = registerAgentHandler(
       PEER,
-      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER),
+      (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, PEER, cn),
       undefined,
       { protocolVersion: "1" },
     );

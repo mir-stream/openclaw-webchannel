@@ -18,8 +18,9 @@ import { spawnSync } from "node:child_process";
 import { platform } from "node:os";
 import WebSocket from "ws";
 
-import { NatsTransport } from "./nats-transport.js";
+import { NatsServerError, NatsTransport } from "./nats-transport.js";
 import type { NatsMessage } from "./nats-transport.js";
+import { classifyAccountStartupFailure } from "./nats-account-coordinator.js";
 
 // ---------------------------------------------------------------------------
 // Port-scan helper
@@ -172,6 +173,20 @@ function makeTestTransport(opts?: {
 describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", () => {
   const teardown: NatsTransport[] = [];
 
+  it("honors INFO.max_payload and rejects before writing any PUB header", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+    const connected = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame('INFO {"max_payload":5}\r\nPONG\r\n');
+    await connected;
+    expect(t.effectiveOutboundLimit).toBe(5);
+    const before = fakeWs.sent.length;
+    expect(() => t.publish("x", "123456")).toThrow(/max_payload/);
+    expect(fakeWs.sent).toHaveLength(before);
+    expect(() => t.publish("x", "12345")).not.toThrow();
+  });
+
   afterEach(() => {
     for (const t of teardown) {
       try {
@@ -273,7 +288,7 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
 
   it("NatsTransport has no WebSocketServer or net.Server property", () => {
     // A transport that created a server socket would expose a `wss` or
-    // `server` property (the pattern in legacy WebChannelTransport was
+    // `server` property (the pattern in legacy NATS peer channel was
     // `this.wss = new WebSocketServer({ noServer: true })`). The NATS
     // transport is a pure client — no such property should exist.
     const t = new NatsTransport({ url: "ws://localhost:4222" });
@@ -381,6 +396,48 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
     expect(received[0]!.payload.toString("utf8")).toBe("foo");
   });
 
+  it("flush proves a preceding SUB only after the server PONG", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+    const connected = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n");
+    await connected;
+
+    t.subscribe("webchannel.t.a.*.register");
+    let settled = false;
+    const flushed = t.flush().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(fakeWs.sent).toContain("PING\r\n");
+
+    fakeWs.fireServerFrame("PONG\r\n");
+    await flushed;
+    expect(settled).toBe(true);
+  });
+
+  it("flush rejects a real post-handshake subscription permission error", async () => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+    const connected = t.connect();
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame("INFO {}\r\nPONG\r\n");
+    await connected;
+    t.on("error", () => { /* expected structured transport event */ });
+
+    t.subscribe("webchannel.forbidden.*.register");
+    const flushed = t.flush();
+    fakeWs.fireServerFrame(
+      "-ERR 'Permissions Violation for Subscription to webchannel.forbidden.*.register'\r\nPONG\r\n",
+    );
+
+    await expect(flushed).rejects.toMatchObject({
+      code: "authorization-violation",
+    });
+  });
+
   it("publish() sends PUB command with correct byte count", async () => {
     const { t, fakeWs } = makeTestTransport();
     teardown.push(t);
@@ -433,6 +490,53 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
 
     await expect(connectPromise).rejects.toThrow("NATS server error");
     expect(t.connected).toBe(false);
+  });
+
+  it.each([
+    "User Authentication Expired",
+    "Account Authentication Expired",
+    "Credential Expired",
+    "Credentials Expired",
+  ])("types initial-handshake -ERR '%s' as permanent credential expiry", async (line) => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+
+    const connectPromise = t.connect();
+    const rejected = connectPromise.then(
+      () => undefined,
+      (cause: unknown) => cause,
+    );
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame(`INFO {}\r\n-ERR '${line}'\r\n`);
+
+    const cause = await rejected;
+    expect(cause).toBeInstanceOf(NatsServerError);
+    expect((cause as NatsServerError).code).toBe("credentials-expired");
+    const failure = classifyAccountStartupFailure(cause);
+    expect(failure).toMatchObject({
+      kind: "permanent",
+      code: "credentials-expired",
+      phase: "nats-auth",
+      operatorMessage: "NATS rejected account credentials (credentials-expired)",
+    });
+    expect(failure.operatorMessage).not.toContain(line);
+  });
+
+  it.each([
+    "Credentials Revoked",
+    "Account Authentication Expiration Warning",
+  ])("does not broaden credential-expiry matching to '%s'", async (line) => {
+    const { t, fakeWs } = makeTestTransport();
+    teardown.push(t);
+    const rejected = t.connect().then(
+      () => undefined,
+      (cause: unknown) => cause,
+    );
+    fakeWs.fireOpen();
+    fakeWs.fireServerFrame(`INFO {}\r\n-ERR '${line}'\r\n`);
+    const cause = await rejected;
+    expect(cause).toBeInstanceOf(NatsServerError);
+    expect((cause as NatsServerError).code).toBe("unknown");
   });
 
   it("JWT credential is included in the CONNECT payload when provided", async () => {
@@ -508,7 +612,7 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
     expect(() => fakeWs.fireError(new Error("simulated TCP reset"))).not.toThrow();
     expect(t.connected).toBe(false);
     expect(errSpy).toHaveBeenCalledWith(
-      expect.stringContaining("simulated TCP reset"),
+      expect.stringContaining("unclassified transport failure"),
     );
     errSpy.mockRestore();
   });
@@ -529,7 +633,7 @@ describe("NatsTransport: ingress-free outbound-only initialization (Sub-AC 1)", 
       fakeWs.fireServerFrame("-ERR 'Permissions Violation for Subscription'\r\n"),
     ).not.toThrow();
     expect(errSpy).toHaveBeenCalledWith(
-      expect.stringContaining("Permissions Violation"),
+      expect.stringContaining("NATS authorization-violation"),
     );
     errSpy.mockRestore();
   });

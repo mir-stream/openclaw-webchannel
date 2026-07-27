@@ -9,6 +9,7 @@
  *
  * USAGE:
  *   const connection = await createEnrolledNatsConnection({
+ *     saasBaseUrl: 'https://saas.com',
  *     saasEnrollUrl: 'https://saas.com/api/enroll',
  *     saasPollUrl: 'https://saas.com/api/poll',
  *     natsUrl: 'wss://nats.example.com',
@@ -19,10 +20,20 @@
  *   connection.transport.publish('webchannel.tenant-123.outbound.test', payload);
  */
 
-import { EnrollmentClient, type EnrollmentOptions, type PluginCredentials } from "./enrollment-client.js";
+import {
+  EnrollmentClient,
+  assertEnrollmentEndpointsMatchBase,
+  deriveEnrollmentEndpoints,
+  type EnrollmentOptions,
+  type PluginCredentials,
+} from "./enrollment-client.js";
 import { NatsTransport } from "./nats-transport.js";
 import { makeNkeySigningCallback } from "./nkey-sign.js";
 import type { KeyPair } from "./e2e-crypto.js";
+import {
+  CredentialDocumentBindingError,
+  assertValidCredentialBindingExpectation,
+} from "./credential-document.js";
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -32,6 +43,9 @@ import type { KeyPair } from "./e2e-crypto.js";
  * Enrolled NATS connection options.
  */
 export type EnrolledNatsConnectionOptions = {
+  /** Effective SaaS base used to bind newly issued credentials. */
+  saasBaseUrl: string;
+
   /**
    * SaaS enrollment endpoint URL.
    */
@@ -57,12 +71,15 @@ export type EnrolledNatsConnectionOptions = {
    * enrollment AND threaded into credential-path resolution so the connection
    * reads the account-scoped creds. Defaults to `"default"`.
    */
-  accountId?: string;
+  accountId: string;
 
   /**
    * Local credential storage path. Overrides the account-scoped default.
    */
   credentialPath?: string;
+
+  /** Common tuple-scoped root for credentials and conversation keys. */
+  storageRoot?: string;
 
   /**
    * Whether to display enrollment instructions to console.
@@ -100,6 +117,7 @@ export type EnrolledNatsConnection = {
     jwksUrl: string;
     bootstrapUrl: string;
     natsUrl: string;
+    issuer?: string;
   };
 
   /**
@@ -111,6 +129,12 @@ export type EnrolledNatsConnection = {
    * Plugin credentials (persisted locally).
    */
   credentials: PluginCredentials;
+};
+
+export type EnrolledNatsConnectionDeps = {
+  enrollmentClientFactory?: (options: EnrollmentOptions) => EnrollmentClient;
+  transportFactory?: (options: ConstructorParameters<typeof NatsTransport>[0]) => NatsTransport;
+  makeSigner?: typeof makeNkeySigningCallback;
 };
 
 // ---------------------------------------------------------------------------
@@ -127,19 +151,50 @@ export type EnrolledNatsConnection = {
  */
 export async function createEnrolledNatsConnection(
   options: EnrolledNatsConnectionOptions,
+  deps: EnrolledNatsConnectionDeps = {},
 ): Promise<EnrolledNatsConnection> {
+  // Validate the common v2 binding expectation before an injected factory can
+  // observe the request or perform filesystem/network work.
+  assertValidCredentialBindingExpectation({
+    tenant: options.tenant,
+    accountId: options.accountId,
+    saasBaseUrl: options.saasBaseUrl,
+  });
+  // The exported connector must enforce the same acquisition/binding authority
+  // even when callers inject a custom EnrollmentClient factory.
+  assertEnrollmentEndpointsMatchBase(options);
+
   // Step 1: Enroll (or load existing enrollment)
   console.log("[connection] Starting enrollment...");
-  const enrollmentClient = new EnrollmentClient({
+  const enrollmentOptions: EnrollmentOptions = {
+    saasBaseUrl: options.saasBaseUrl,
     saasEnrollUrl: options.saasEnrollUrl,
     saasPollUrl: options.saasPollUrl,
     tenant: options.tenant,
     accountId: options.accountId,
     credentialPath: options.credentialPath,
+    storageRoot: options.storageRoot,
     displayInstructions: options.displayInstructions,
-  });
+  };
+  const enrollmentClient = deps.enrollmentClientFactory?.(enrollmentOptions) ??
+    new EnrollmentClient(enrollmentOptions);
 
   const enrollment = await enrollmentClient.enroll();
+
+  // An injected/custom enrollment client is outside EnrollmentClient's
+  // persistence gate. Defend the exported connector itself: never create a
+  // signer or transport, and never dial a configured fallback, without the
+  // SaaS-delivered relay provenance.
+  if (
+    typeof (enrollment as { natsUrl?: unknown }).natsUrl !== "string" ||
+    enrollment.natsUrl.length === 0
+  ) {
+    throw new CredentialDocumentBindingError({
+      status: "invalid",
+      code: "invalid-document",
+      fields: ["enrollment.natsUrl"],
+    });
+  }
 
   // Step 2: Get identity key
   console.log("[connection] Getting identity key...");
@@ -149,29 +204,32 @@ export async function createEnrolledNatsConnection(
   //
   // The SaaS is the rendezvous authority: the enrollment response carries the
   // relay URL alongside the minted creds, so the two never drift. We dial that
-  // SaaS-delivered `enrollment.natsUrl` in preference to any locally-configured
-  // `options.natsUrl` (which the resolver derives from `nats.url` /
-  // `WEBCHANNEL_NATS_URL` — now a dev-only override / back-compat fallback for an
-  // older issuer that does not yet return a URL).
+  // SaaS-delivered `enrollment.natsUrl`; local options are never a relay
+  // provenance fallback.
   //
   // A JWT-auth nats-server challenges the client with a nonce in INFO; the client
   // must return an Ed25519 signature over that nonce (signed with the user NKEY
   // seed) in CONNECT, or the server rejects the connection. We derive that signing
   // callback from the enrolled user seed so the production enrolled path
   // authenticates against a real JWT-auth nats-server (not only an open dev one).
-  const natsUrl = enrollment.natsUrl ?? options.natsUrl;
+  const natsUrl = enrollment.natsUrl;
   console.log(`[connection] Connecting to NATS at ${natsUrl}...`);
-  const transport = new NatsTransport({
+  const transport = (deps.transportFactory ?? ((transportOptions) => new NatsTransport(transportOptions)))({
     url: natsUrl,
     jwtCredential: enrollment.creds.userJwt,
-    nkeySigningCallback: makeNkeySigningCallback(enrollment.creds.userSeed),
+    nkeySigningCallback: (deps.makeSigner ?? makeNkeySigningCallback)(enrollment.creds.userSeed),
     clientName: options.natsClientName ?? "openclaw-webchannel-agent",
     // S1: survive a NATS blip (server restart / TCP reset) — re-dial with
     // backoff and replay subscriptions instead of wedging until gateway restart.
     reconnect: true,
   });
 
-  await transport.connect();
+  try {
+    await transport.connect();
+  } catch (err) {
+    try { transport.disconnect(); } catch { /* preserve the original rejection */ }
+    throw err;
+  }
   console.log("[connection] ✓ Connected to NATS");
 
   // Step 4: Get stored credentials for reference
@@ -192,13 +250,17 @@ export async function createEnrolledNatsConnection(
  */
 export function createDefaultNatsConnection(
   tenant: string,
+  accountId: string,
   natsUrl: string,
   saasBaseUrl: string,
 ): Promise<EnrolledNatsConnection> {
+  const endpoints = deriveEnrollmentEndpoints(saasBaseUrl);
   return createEnrolledNatsConnection({
-    saasEnrollUrl: `${saasBaseUrl}/api/enroll`,
-    saasPollUrl: `${saasBaseUrl}/api/poll`,
+    saasBaseUrl,
+    saasEnrollUrl: endpoints.saasEnrollUrl,
+    saasPollUrl: endpoints.saasPollUrl,
     natsUrl,
     tenant,
+    accountId,
   });
 }

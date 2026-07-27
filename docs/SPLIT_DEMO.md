@@ -7,7 +7,7 @@ encrypted, device-flow enrolled. This is the run that proved the NATS E2E path l
 hardware (a real LLM reply came back).
 
 For the single-host interactive demo (everything on one machine), use
-[`e2e/local/run-demo.sh`](../e2e/local/README.md) instead. This doc is the harder,
+[`demo/run.sh`](../demo/README.md) instead. This doc is the harder,
 more-realistic split topology.
 
 ```
@@ -49,8 +49,8 @@ This boots (all under `/tmp/oc-mac-demo`, self-cleaning on Ctrl+C):
    booted with `NATS_URL=ws://<LAN_IP>:<NATS_WS>` so the URL it *delivers* is LAN-resolvable.
    With `ENABLE_DEMO_UI=1` this SAME issuer origin ALSO serves the unified web page (`GET /`),
    the chat-widget bundle (`GET /widget.js`), and the live enrollment list (`GET /demo/enrollments`)
-   — one origin, no separate web server. `DEMO_GW_URL=""` → no HTTP register hop (`auto`
-   admission + `dmSecurity` allowlist do the gating);
+   — one origin, no separate web server. `DEMO_GW_URL` is obsolete/unused;
+   authenticated registration rides the account-scoped NATS request/reply subject;
 2. a **JWT-auth `nats-server`** built from that trust chain's operator + resolver, websocket
    listener bound `0.0.0.0:<NATS_WS>`.
 
@@ -92,8 +92,8 @@ openclaw gateway run
 ```
 
 **No `channels.webchannel.auth` block is needed** — static/enrolled creds resolve admission to
-`auto`, and the ConnectionVerifier is only built for the `register-hop` mode. Browser admission =
-NATS subject permissions + X25519 handshake + the `dmSecurity` allowlist (`allowFrom` must
+`auto`, and JWT auth config plus live verification are enforced for the `register-hop` mode. Browser admission =
+NATS subject permissions + authenticated registration + the `dmSecurity` allowlist (`allowFrom` must
 include the browser's `peerId`).
 
 ## The one gotcha that breaks everything

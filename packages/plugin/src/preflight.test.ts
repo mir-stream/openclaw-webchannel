@@ -15,6 +15,7 @@ import {
   formatAccountReadiness,
   evaluateAddPreflight,
   runAddPreflight,
+  dialRelayForPreflight,
   deriveJwksUrl,
 } from "./preflight.js";
 
@@ -98,20 +99,6 @@ describe("formatAccountReadiness (Gate B)", () => {
     expect(r.line).not.toContain("leaks transcripts across users");
   });
 
-  it("auto account → graceful degraded READY line (no verifier / no JWKS)", () => {
-    const r = formatAccountReadiness({
-      accountId: "byo",
-      admission: "auto",
-      dmSecurity: "open",
-    });
-    expect(r.verdict).toBe("READY");
-    expect(r.line).toContain("admission=auto");
-    expect(r.line).toContain("(no JWT verifier)");
-    // No issuer/JWKS fields on an auto account.
-    expect(r.line).not.toContain("JWKS");
-    // Even the auto degrade line reports the enforced scope truthfully.
-    expect(r.line).toContain("dmScope=per-account-channel-peer (webchannel-enforced)");
-  });
 });
 
 describe("evaluateAddPreflight (Gate A, pure)", () => {
@@ -137,16 +124,14 @@ describe("evaluateAddPreflight (Gate A, pure)", () => {
     );
   });
 
-  it("pinned audience != accountId → FAIL naming the mismatch", () => {
+  it("reports account-derived audience with no configurable pin branch", () => {
     const r = evaluateAddPreflight({
       ...base,
-      pinnedAudience: "wrong-aud",
       jwks: { keyCount: 3 },
       relay: { ok: true },
     });
-    expect(r.ok).toBe(false);
-    expect(r.line).toContain('auth.jwt.audience="wrong-aud"');
-    expect(r.line).toContain('aud="acme"');
+    expect(r.ok).toBe(true);
+    expect(base.effectiveAudience).toBe(base.accountId);
   });
 
   it("JWKS fetch failure → FAIL naming the derived url", () => {
@@ -214,10 +199,10 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
     });
     expect(report.ok).toBe(true);
     expect(dial).toHaveBeenCalledOnce();
-    // Scoped no-op subject rides the account's own subtree.
+    // Probe fences the exact wildcard subscription runtime installs.
     expect(dial.mock.calls[0][0]).toMatchObject({
       url: "wss://relay.example",
-      subject: "webchannel.t.acme._preflight",
+      subject: "webchannel.t.acme.*.register",
     });
     expect(log.mock.calls.some((c) => String(c[0]).includes("issuer/aud ✓"))).toBe(true);
   });
@@ -323,5 +308,135 @@ describe("runAddPreflight (Gate A, orchestrated with seams)", () => {
       dial: async () => ({ ok: true }) as const,
     });
     expect(log.mock.calls.some((c) => String(c[0]).includes("WARN: auth.jwt.issuer"))).toBe(false);
+  });
+});
+
+describe("dialRelayForPreflight (relay-dial probe)", () => {
+  /** A fake NatsTransport whose `connect` settles only when the test releases it. */
+  function slowTransport(): {
+    factory: () => never;
+    release: () => void;
+    disconnect: ReturnType<typeof vi.fn>;
+    subscribe: ReturnType<typeof vi.fn>;
+    flush: ReturnType<typeof vi.fn>;
+    on: ReturnType<typeof vi.fn>;
+    off: ReturnType<typeof vi.fn>;
+  } {
+    let release: () => void = () => {};
+    const connected = new Promise<void>((r) => {
+      release = r;
+    });
+    const disconnect = vi.fn();
+    const subscribe = vi.fn();
+    const flush = vi.fn(async () => {});
+    const on = vi.fn();
+    const off = vi.fn();
+    return {
+      factory: () =>
+        ({
+          connect: vi.fn(() => connected),
+          subscribe,
+          flush,
+          on,
+          off,
+          disconnect,
+          connected: true,
+        }) as never,
+      release: () => release(),
+      disconnect,
+      subscribe,
+      flush,
+      on,
+      off,
+    };
+  }
+
+  it("disconnects a connection that lands AFTER the dial timed out", async () => {
+    // The timeout does not cancel the connect. Without a late-settle disposer the
+    // relay's answer arrives to nobody: a live authenticated transport (plus its
+    // subscription) that no code holds and nothing ever closes. Doctor/status
+    // probe this path repeatedly, so each slow probe would leak one.
+    const t = slowTransport();
+
+    const result = await dialRelayForPreflight({
+      url: "wss://relay.example",
+      userJwt: "J",
+      userSeed: "S",
+      subject: "webchannel.t.acme.*.register",
+      timeoutMs: 5,
+      connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
+    });
+
+    // The caller's contract is unchanged: it still gets the timeout verdict, and
+    // nothing was torn down while the connect was merely slow.
+    expect(result).toEqual({ error: "relay dial timed out after 5ms" });
+    expect(t.disconnect).not.toHaveBeenCalled();
+
+    t.release();
+    await vi.waitFor(() => expect(t.disconnect).toHaveBeenCalledTimes(1));
+  });
+
+  it("disconnects on the normal path too (probe succeeds, then tears down)", async () => {
+    const t = slowTransport();
+    t.release(); // connect resolves immediately — no timeout involved
+
+    const result = await dialRelayForPreflight({
+      url: "wss://relay.example",
+      userJwt: "J",
+      userSeed: "S",
+      subject: "webchannel.t.acme.*.register",
+      timeoutMs: 5000,
+      connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
+    });
+
+    expect(result).toEqual({ ok: true });
+    expect(t.subscribe.mock.invocationCallOrder[0]).toBeLessThan(
+      t.flush.mock.invocationCallOrder[0]!,
+    );
+    expect(t.disconnect).toHaveBeenCalledTimes(1);
+    expect(t.off).toHaveBeenCalledWith("error", expect.any(Function));
+  });
+
+  it("does not report success when the SUB/PING fence rejects", async () => {
+    const t = slowTransport();
+    t.release();
+    t.flush.mockRejectedValueOnce(new Error("secret broker diagnostic"));
+
+    const result = await dialRelayForPreflight({
+      url: "wss://relay.example",
+      userJwt: "SECRET-JWT",
+      userSeed: "SECRET-SEED",
+      subject: "webchannel.t.acme.*.register",
+      timeoutMs: 5000,
+      connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
+    });
+
+    expect(result).toEqual({ error: "relay subscription rejected" });
+    expect(JSON.stringify(result)).not.toContain("secret");
+    expect(t.disconnect).toHaveBeenCalledTimes(1);
+    expect(t.off).toHaveBeenCalledWith("error", expect.any(Function));
+  });
+
+  it("bounds the SUB/PING fence and tears down after timeout", async () => {
+    const t = slowTransport();
+    t.release();
+    // An injected transport may ignore AbortSignal entirely; the public helper
+    // still owns a hard wall-clock bound around the fence.
+    t.flush.mockImplementationOnce(() => new Promise<void>(() => {}));
+
+    const result = await dialRelayForPreflight({
+      url: "wss://relay.example",
+      userJwt: "J",
+      userSeed: "S",
+      subject: "webchannel.t.acme.*.register",
+      timeoutMs: 5,
+      connectDeps: { transportFactory: t.factory, makeSigner: () => async () => "sig" },
+    });
+
+    expect(result).toEqual({
+      error: "relay subscription timed out after 5ms",
+    });
+    expect(t.disconnect).toHaveBeenCalledTimes(1);
+    expect(t.off).toHaveBeenCalledWith("error", expect.any(Function));
   });
 });

@@ -2,9 +2,9 @@
  * Zero-dependency RS256 JWT verifier for the `jwt` auth strategy.
  *
  * AUTH.md §10: SaaS operators / IdPs issue RS256 JWTs carrying `kid`, `iss`,
- * `aud`, `exp`, `sub` (and optional display name claims). The browser delivers
- * the compact JWT via `?ticket=` and the gateway validates it against a JWKS
- * public key resolved by `kid`.
+ * `aud`, `exp`, `sub` (and optional display name claims). The browser presents
+ * the compact JWT during the NATS register hop; the plugin validates it against
+ * a JWKS public key resolved by `kid`.
  *
  * CONSTRAINTS:
  *  - Use only `globalThis.crypto.subtle` (Cloudflare Workers + Node 18+ both
@@ -127,6 +127,7 @@ export type CnfClaim = {
  */
 export type JwtIdentity = {
   peerId: string;
+  tenant?: string;
   displayName?: string;
   /** Device X25519 public key from cnf.jwk (base64url, 32 bytes when decoded). */
   devicePublicKey?: string;
@@ -279,9 +280,15 @@ export async function verifyJwt(
   if (typeof aud === "string") {
     if (!constantTimeEqual(aud, opts.audience)) return null;
   } else if (Array.isArray(aud)) {
+    // Reject a malformed array as a whole. Filtering non-string members and
+    // accepting a remaining match would let an issuer accidentally mint a
+    // claim with ambiguous/non-RFC audience semantics.
+    if (aud.length === 0 || !aud.every((value) => typeof value === "string")) {
+      return null;
+    }
     let matched = false;
     for (const a of aud) {
-      if (typeof a === "string" && constantTimeEqual(a, opts.audience)) {
+      if (constantTimeEqual(a as string, opts.audience)) {
         matched = true;
         break;
       }
@@ -351,57 +358,31 @@ export async function verifyJwt(
   // displayName — best-effort, prefers `name` then `preferred_username`
   // (OIDC convention). Anything else is ignored silently.
   const identity: JwtIdentity = { peerId: payload.sub };
+  if (typeof payload.tenant === "string" && payload.tenant.length > 0) identity.tenant = payload.tenant;
   const dn = payload.name ?? payload.preferred_username;
   if (typeof dn === "string" && dn.length > 0) identity.displayName = dn;
   if (devicePublicKeyB64) identity.devicePublicKey = devicePublicKeyB64;
 
-  // pop_jwk — Ed25519 PoP public key (RFC 7800-style split key). Best-effort:
-  // a malformed claim is omitted (the register route fails closed when a PoP is
-  // required but the key is absent). An OKP/Ed25519 jwk with a non-empty `x`.
+  // pop_jwk — Ed25519 PoP public key (RFC 7800-style split key). Presence is a
+  // security commitment: a malformed present claim must reject the JWT rather
+  // than degrade to "PoP absent" when requirePoP=false.
   const popJwk = (payload as Record<string, unknown>)["pop_jwk"];
-  if (popJwk && typeof popJwk === "object" && !Array.isArray(popJwk)) {
+  if (popJwk !== undefined) {
+    if (!popJwk || typeof popJwk !== "object" || Array.isArray(popJwk)) return null;
     const p = popJwk as Record<string, unknown>;
-    if (p["kty"] === "OKP" && p["crv"] === "Ed25519" && typeof p["x"] === "string" && p["x"].length > 0) {
-      identity.popPublicJwk = { kty: "OKP", crv: "Ed25519", x: p["x"] };
+    if (
+      p["kty"] !== "OKP" ||
+      p["crv"] !== "Ed25519" ||
+      typeof p["x"] !== "string" ||
+      p["x"].length === 0 ||
+      p["d"] !== undefined
+    ) return null;
+    try {
+      if (base64UrlDecode(p["x"]).length !== 32) return null;
+    } catch {
+      return null;
     }
+    identity.popPublicJwk = { kty: "OKP", crv: "Ed25519", x: p["x"] };
   }
   return identity;
-}
-/**
- * Decode a JWT's `aud` claim WITHOUT verifying the signature (가-2 Cycle 2).
- *
- * Returns the audiences as a normalized string array (`aud` may be a string or
- * an array per RFC 7519). Returns `[]` on any decode failure or a missing/
- * malformed `aud`.
- *
- * ── Why an UNVERIFIED peek is safe ──────────────────────────────────────────
- * A caller that serves multiple accounts can use this to pick WHICH account's
- * verifier to run, where each account's verifier checks a different expected
- * `aud` (= that account's accountId). This helper only ROUTES to a candidate
- * account; the selected account's verifier then performs the full,
- * signature-checked verification (issuer + `aud` + signature + exp), so a
- * forged/altered `aud` can at most select an account whose verifier will then
- * REJECT the token. It never grants trust on its own.
- *
- * NOTE: since register admission moved to a per-account NATS `.register` subject
- * (the subject namespace already pins the account), production no longer routes
- * by aud — each account verifies against its own auth directly. This peek is
- * retained for any future multi-account-single-entry routing and its own tests.
- */
-export function peekUnverifiedJwtAudiences(token: unknown): string[] {
-  if (typeof token !== "string" || token.length === 0) return [];
-  const parts = token.split(".");
-  const payloadSegment = parts[1];
-  if (parts.length !== 3 || !payloadSegment) return [];
-  try {
-    const decoded = base64UrlDecode(payloadSegment);
-    const parsed = JSON.parse(new TextDecoder().decode(decoded)) as unknown;
-    if (!parsed || typeof parsed !== "object") return [];
-    const aud = (parsed as Record<string, unknown>)["aud"];
-    if (typeof aud === "string") return aud.length > 0 ? [aud] : [];
-    if (Array.isArray(aud)) return aud.filter((a): a is string => typeof a === "string" && a.length > 0);
-    return [];
-  } catch {
-    return [];
-  }
 }

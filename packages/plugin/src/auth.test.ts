@@ -1,49 +1,12 @@
 import { describe, it, expect, vi, afterEach, beforeAll } from "vitest";
-import type { IncomingMessage } from "node:http";
 import { webcrypto } from "node:crypto";
 
 import {
-  resolveVerifier,
-  verifyJwtAndExtractIdentity,
-  type AuthConfig,
-  type AuthLogger,
+  createAccountJwtVerifier,
+  resolveRequirePoPPolicy,
+  resolveVerifierConfig,
 } from "./auth.js";
 import type { JsonWebKeySet } from "./jwks.js";
-
-/** Build a minimal IncomingMessage-like object with just a `url`. */
-function fakeReq(url: string): IncomingMessage {
-  return { url } as IncomingMessage;
-}
-
-afterEach(() => {
-  vi.restoreAllMocks();
-});
-
-describe("resolveVerifier safe default", () => {
-  it("throws on missing auth config", () => {
-    expect(() => resolveVerifier(undefined)).toThrow(/strategy is required/);
-    expect(() => resolveVerifier(null)).toThrow(/strategy is required/);
-  });
-
-  it("throws on unknown strategy", () => {
-    expect(() =>
-      resolveVerifier({ strategy: "totally-bogus" } as unknown as AuthConfig),
-    ).toThrow(/unknown auth strategy/);
-  });
-});
-
-describe("anonymous strategy", () => {
-  it("is rejected (AC4): refuses to start and logs an error", () => {
-    const error = vi.fn();
-    const logger: AuthLogger = { error };
-
-    // AC 4: anonymous admission is a security hole — resolving the verifier
-    // must throw rather than hand back an open-admission peer.
-    expect(() => resolveVerifier({ strategy: "anonymous" }, logger)).toThrow(/anonymous/i);
-    expect(error).toHaveBeenCalledTimes(1);
-    expect(error.mock.calls[0][0]).toMatch(/anonymous/i);
-  });
-});
 
 // ── jwt strategy tests (AC1–AC3) ──────────────────────────────────────────────
 
@@ -88,120 +51,6 @@ async function signRs256(payload: Record<string, unknown>): Promise<string> {
   return `${signingInput}.${Buffer.from(sig).toString("base64url")}`;
 }
 
-describe("jwt strategy (AC1 — fail-closed config)", () => {
-  beforeAll(async () => {
-    await ensureRsaKeys();
-  });
-
-  it("throws when issuer is missing", () => {
-    expect(() =>
-      resolveVerifier({
-        strategy: "jwt",
-        jwt: { audience: AUDIENCE, jwks: rsaJwks },
-      } as AuthConfig),
-    ).toThrow(/jwt\.issuer is required/);
-  });
-
-  it("throws when audience is missing", () => {
-    expect(() =>
-      resolveVerifier({
-        strategy: "jwt",
-        jwt: { issuer: ISSUER, jwks: rsaJwks },
-      } as AuthConfig),
-    ).toThrow(/jwt\.audience is required/);
-  });
-
-  it("throws when no JWKS source is provided", () => {
-    expect(() =>
-      resolveVerifier({
-        strategy: "jwt",
-        jwt: { issuer: ISSUER, audience: AUDIENCE },
-      } as AuthConfig),
-    ).toThrow(/exactly one of jwksUrl, jwksFile, or jwks/);
-  });
-
-  it("throws when more than one JWKS source is provided", () => {
-    expect(() =>
-      resolveVerifier({
-        strategy: "jwt",
-        jwt: {
-          issuer: ISSUER,
-          audience: AUDIENCE,
-          jwks: rsaJwks,
-          jwksUrl: "https://idp.test/jwks.json",
-        },
-      } as AuthConfig),
-    ).toThrow(/exactly one of jwksUrl, jwksFile, or jwks/);
-  });
-
-  it("returns a verifier when all required fields are present (inline jwks)", () => {
-    expect(() =>
-      resolveVerifier({
-        strategy: "jwt",
-        jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rsaJwks },
-      }),
-    ).not.toThrow();
-  });
-});
-
-describe("jwt strategy (AC2 — happy path)", () => {
-  beforeAll(async () => {
-    await ensureRsaKeys();
-  });
-
-  it("accepts a valid RS256 token and maps sub -> peerId", async () => {
-    await ensureRsaKeys();
-    const verifier = resolveVerifier({
-      strategy: "jwt",
-      jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rsaJwks },
-    });
-    const now = Math.floor(Date.now() / 1000);
-    const token = await signRs256({
-      iss: ISSUER,
-      aud: AUDIENCE,
-      sub: "user-7",
-      name: "Grace",
-      iat: now,
-      exp: now + 60,
-    });
-    expect(await verifier(fakeReq(`/webchannel/ws?ticket=${token}`))).toEqual({
-      peerId: "user-7",
-      displayName: "Grace",
-    });
-  });
-
-  it("honors a custom ticketParam", async () => {
-    await ensureRsaKeys();
-    const verifier = resolveVerifier({
-      strategy: "jwt",
-      jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rsaJwks },
-      ticketParam: "jwt",
-    });
-    const now = Math.floor(Date.now() / 1000);
-    const token = await signRs256({
-      iss: ISSUER,
-      aud: AUDIENCE,
-      sub: "user-7",
-      iat: now,
-      exp: now + 60,
-    });
-    expect(await verifier(fakeReq(`/webchannel/ws?jwt=${token}`))).toEqual({
-      peerId: "user-7",
-    });
-    // Wrong param name => no ticket => reject.
-    expect(await verifier(fakeReq(`/webchannel/ws?ticket=${token}`))).toBeNull();
-  });
-
-  it("rejects when the ticket query param is missing", async () => {
-    await ensureRsaKeys();
-    const verifier = resolveVerifier({
-      strategy: "jwt",
-      jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rsaJwks },
-    });
-    expect(await verifier(fakeReq("/webchannel/ws"))).toBeNull();
-  });
-});
-
 describe("fail-closed when the signing kid is unknown/evicted", () => {
   beforeAll(async () => {
     await ensureRsaKeys();
@@ -215,12 +64,12 @@ describe("fail-closed when the signing kid is unknown/evicted", () => {
     const now = Math.floor(Date.now() / 1000);
     const token = await signRs256({ iss: ISSUER, aud: AUDIENCE, sub: "user-evicted", iat: now, exp: now + 60 });
     const rotatedAwayJwks: JsonWebKeySet = { keys: [{ ...rsaJwks.keys[0]!, kid: "some-other-kid" }] };
-    const authConfig: AuthConfig = {
+    const authConfig = resolveVerifierConfig({
       strategy: "jwt",
-      jwt: { issuer: ISSUER, audience: AUDIENCE, jwks: rotatedAwayJwks },
-    };
+      jwt: { issuer: ISSUER, jwks: rotatedAwayJwks },
+    });
 
-    await expect(verifyJwtAndExtractIdentity(token, authConfig)).resolves.toBeNull();
+    await expect(createAccountJwtVerifier({ auth: authConfig, accountId: AUDIENCE }).verifyIdentity(token)).resolves.toBeNull();
   });
 });
 
@@ -255,19 +104,22 @@ describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", ()
     const { impl, count } = countingFetch();
     // One stable config object == one account. The live NATS path calls
     // verifyJwtAndExtractIdentity per pairing with THIS same object.
-    const authConfig: AuthConfig = {
+    const authConfig = resolveVerifierConfig({
       strategy: "jwt",
       jwt: {
         issuer: ISSUER,
-        audience: AUDIENCE,
         jwksUrl: "https://idp.test/jwks.json",
-        _fetchImpl: impl,
       },
-    };
+    });
 
-    const first = await verifyJwtAndExtractIdentity(token, authConfig);
-    const second = await verifyJwtAndExtractIdentity(token, authConfig);
-    const third = await verifyJwtAndExtractIdentity(token, authConfig);
+    const verifier = createAccountJwtVerifier(
+      { auth: authConfig, accountId: AUDIENCE },
+      { fetchImpl: impl },
+    );
+    await verifier.warmJwks();
+    const first = await verifier.verifyIdentity(token);
+    const second = await verifier.verifyIdentity(token);
+    const third = await verifier.verifyIdentity(token);
 
     expect(first?.peerId).toBe("user-cache");
     expect(second?.peerId).toBe("user-cache");
@@ -288,21 +140,101 @@ describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", ()
     });
     const a = countingFetch();
     const b = countingFetch();
-    const configA: AuthConfig = {
+    const configA = resolveVerifierConfig({
       strategy: "jwt",
-      jwt: { issuer: ISSUER, audience: AUDIENCE, jwksUrl: "https://idp.test/jwks.json", _fetchImpl: a.impl },
-    };
-    const configB: AuthConfig = {
+      jwt: { issuer: ISSUER, jwksUrl: "https://idp.test/jwks.json" },
+    });
+    const configB = resolveVerifierConfig({
       strategy: "jwt",
-      jwt: { issuer: ISSUER, audience: AUDIENCE, jwksUrl: "https://idp.test/jwks.json", _fetchImpl: b.impl },
-    };
+      jwt: { issuer: ISSUER, jwksUrl: "https://idp.test/jwks.json" },
+    });
 
-    await verifyJwtAndExtractIdentity(token, configA);
-    await verifyJwtAndExtractIdentity(token, configB);
+    await createAccountJwtVerifier({ auth: configA, accountId: AUDIENCE }, { fetchImpl: a.impl }).verifyIdentity(token);
+    await createAccountJwtVerifier({ auth: configB, accountId: AUDIENCE }, { fetchImpl: b.impl }).verifyIdentity(token);
 
     // Each account's config keys its own cache — one fetch apiece, no bleed.
     expect(a.count()).toBe(1);
     expect(b.count()).toBe(1);
+  });
+});
+
+describe("account-bound audience", () => {
+  it("accepts a token only in the verifier whose runtime accountId is in aud", async () => {
+    await ensureRsaKeys();
+    const now = Math.floor(Date.now() / 1000);
+    const token = await signRs256({
+      iss: ISSUER,
+      aud: ["account-a", "another-service"],
+      sub: "user-a",
+      iat: now,
+      exp: now + 60,
+    });
+    const auth = resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwks: rsaJwks },
+    });
+
+    await expect(createAccountJwtVerifier({ auth, accountId: "account-a" }).verifyIdentity(token))
+      .resolves.toMatchObject({ peerId: "user-a" });
+    await expect(createAccountJwtVerifier({ auth, accountId: "account-b" }).verifyIdentity(token))
+      .resolves.toBeNull();
+  });
+});
+
+describe("cache-free verifier preparation", () => {
+  it.each([null, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "60", [], {}])(
+    "rejects invalid clockSkew %j",
+    (clockSkew) => {
+      expect(() => resolveVerifierConfig({
+        strategy: "jwt",
+        jwt: { issuer: ISSUER, jwks: { keys: [] }, clockSkew },
+      })).toThrow(/clockSkew/);
+    },
+  );
+
+  it("requires exactly one structurally valid JWKS source", () => {
+    expect(() => resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER },
+    })).toThrow(/exactly one/);
+    expect(() => resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwksUrl: "https://keys", jwks: { keys: [] } },
+    })).toThrow(/exactly one/);
+    expect(() => resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwks: { keys: "not-an-array" } },
+    })).toThrow(/keys array/);
+  });
+
+  it("rejects a cast-reintroduced audience and returns an immutable detached config", () => {
+    expect(() => resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwks: { keys: [] }, audience: "legacy" },
+    })).toThrow(/audience was removed/);
+
+    const rawJwks = { keys: [{ kid: "one" }] };
+    const resolved = resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwks: rawJwks },
+    });
+    rawJwks.keys.push({ kid: "two" });
+    expect(resolved.jwt.jwks?.keys).toEqual([{ kid: "one" }]);
+    expect(Object.isFrozen(resolved)).toBe(true);
+    expect(Object.isFrozen(resolved.jwt)).toBe(true);
+    expect(Object.isFrozen(resolved.jwt.jwks)).toBe(true);
+    expect(Object.isFrozen(resolved.jwt.jwks?.keys)).toBe(true);
+  });
+
+  it.each([null, 0, 1, "false", [], {}])(
+    "rejects invalid requirePoP %j instead of applying truthiness",
+    (requirePoP) => {
+      expect(() => resolveRequirePoPPolicy({ requirePoP })).toThrow(/must be a boolean/);
+    },
+  );
+  it("defaults requirePoP to true and accepts explicit false", () => {
+    expect(resolveRequirePoPPolicy({})).toBe(true);
+    expect(resolveRequirePoPPolicy({ requirePoP: false })).toBe(false);
   });
 });
 

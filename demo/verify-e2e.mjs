@@ -86,7 +86,7 @@ try {
 
   // Reload → history hydration restores the prior turn. Phase 6: the snapshot
   // is sent from the REGISTER route (stateless register — the conversation key
-  // K is established there; no handshake on this path) and reads the core
+  // K is established there; no registration on this path) and reads the core
   // session store in a detached async-context so `sessions.get` authorizes
   // against a synthetic operator client. Hard criterion: it MUST restore.
   await page.reload({ waitUntil: "domcontentloaded" });

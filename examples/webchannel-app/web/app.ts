@@ -8,11 +8,10 @@
  *   POST /bootstrap (RS256 bootstrap JWT) → POST /nats-user (browser NATS creds) →
  *   new WebChannelNATSClient({ natsCredentials, registration }) → connect.
  *
- * NO-AGENT END STATE: with no openclaw agent attached, the NKEY connect SUCCEEDS
- * (status "connected") but the PoP register request has no responder, so ~15s
- * later it times out and the wrapper reports a TERMINAL status "error" with
- * message "[nats-client] request timeout". This app treats that specific error as
- * a graceful "waiting for agent" state (not a red error box) with a Retry button.
+ * NO-AGENT STATE: with no openclaw agent attached, the NKEY connect succeeds but
+ * the PoP register request has no responder. The timeout is transient: the client
+ * redials and keeps retrying until an agent appears, so the UI shows reconnecting
+ * rather than retiring credentials that may still be valid.
  *
  * classify(state) is a PURE, exported function so a headless Node smoke test can
  * assert the state sequence without a browser.
@@ -186,6 +185,21 @@ async function mountBrowserUi(): Promise<void> {
         const div = document.createElement("div");
         div.className = `msg ${m.role}`;
         div.textContent = m.text;
+        // P0-4: minimal send-status affordance on the user's own bubbles. The
+        // agent got the message once it reaches `accepted` (or `completed`); a
+        // `failed` bubble shows a ⚠ whose title carries the reason so the send
+        // never silently vanishes.
+        if (m.role === "user" && m.sendState) {
+          const badge = document.createElement("span");
+          badge.className = `send-status ${m.sendState}`;
+          if (m.sendState === "accepted" || m.sendState === "completed") {
+            badge.textContent = " ✓";
+          } else if (m.sendState === "failed") {
+            badge.textContent = " ⚠";
+            badge.title = `send failed: ${m.sendFailure?.reason ?? "unknown"}`;
+          }
+          if (badge.textContent) div.append(badge);
+        }
         return div;
       }),
     );

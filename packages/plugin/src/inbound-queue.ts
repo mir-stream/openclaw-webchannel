@@ -1,247 +1,410 @@
-/**
- * Per-session FIFO serialization for inbound user messages.
- *
- * WHY THIS EXISTS
- * ---------------
- * The transport's `onMessage` callback is fire-and-forget: every inbound
- * `user_message` frame immediately kicks off a `handleInboundMessage` →
- * `channelRuntime.inbound.run` turn (see index.ts / inbound.ts). If a user
- * sends two messages back-to-back on the SAME socket, two such turns would run
- * CONCURRENTLY for the same `sessionKey`.
- *
- * OpenClaw core does not tolerate that. Its per-session reply-operation
- * admission gate (`admitReplyTurn`, dispatch-DO0Fpkbp.js) assumes the channel
- * serializes its OWN inbound — that one session never has two turns in flight
- * at once. The bundled Telegram channel satisfies this implicitly: its
- * long-poll offset spool only ever hands the runtime one update at a time, so
- * a turn fully settles before the next is fetched. We have no such natural
- * spool — a WebSocket delivers frames as fast as the client sends them — so two
- * same-session turns collide on that gate and the channel wedges (a "working"
- * progress bubble that never settles).
- *
- * The fix is to give each `sessionKey` its own promise-chain FIFO queue: a new
- * message chains onto the tail of its session's chain and only starts once the
- * previous turn for that session has settled. DIFFERENT sessions keep their own
- * independent chains, so distinct users still run fully in parallel — we only
- * serialize WITHIN a session, matching the one-turn-at-a-time invariant core
- * expects.
- */
+import {
+  InboundRetentionBudget,
+  estimateRetainedMessageBytes,
+  type RetentionLimitReason,
+  type RetentionReservation,
+  type RetentionSessionToken,
+} from "./inbound-retention.js";
 
-/**
- * A per-session serializing dispatcher.
- *
- * `dispatch` has the same fire-and-forget shape the transport's
- * `setMessageHandler` expects, but internally enqueues each call onto a
- * promise chain keyed by `sessionKey`, so same-session calls run strictly in
- * order, one at a time.
- *
- * `pendingSessions` is a minimal introspection accessor for tests and
- * diagnostics ONLY — it reports how many sessions currently have an
- * undrained chain entry. Production code must not depend on it; it exists so
- * the drain/cleanup invariant (the map returns to 0 once a session fully
- * drains) is observable and testable.
- */
+export type UserMessageLike = { type: "user_message"; text: string; id?: string };
+
+export type RetainedEntry<Message> = {
+  message: Message;
+  id?: string;
+  reservation: RetentionReservation;
+};
+
+export type BatchOffer =
+  | { status: "accepted"; commit(): void; rollback(): void }
+  | { status: "rejected"; reason: RetentionLimitReason }
+  | { status: "disposed" };
+
+export interface DispatcherBatchLease<Message> {
+  offer(message: Message, reservation?: RetentionReservation): BatchOffer;
+  finish(): void;
+}
+
 export interface SerializedInboundDispatcher<Message> {
-  dispatch: (sessionKey: string, message: Message) => void;
-  /** Test/diagnostics only: number of sessions with a live (undrained) chain. */
-  pendingSessions: () => number;
-  /**
-   * P1-8b: drop a session's busy-time coalesce buffer, returning how many
-   * pending (not-yet-run) messages were discarded. Used by the `/stop` control
-   * lane — a user who aborts wants the text queued behind the running turn gone
-   * too. Returns 0 when the dispatcher has no `coalesce` (no buffer exists) or
-   * the session has nothing buffered.
-   */
-  clearPending: (sessionKey: string) => number;
-  /**
-   * Test/diagnostics only: number of messages currently sitting in a session's
-   * coalesce buffer (arrived while its turn was running, not yet merged/run).
-   * Always 0 for a dispatcher built without `coalesce`.
-   */
-  pendingBuffered: (sessionKey: string) => number;
+  dispatch(sessionKey: string, message: Message, reservation?: RetentionReservation): BatchOffer["status"];
+  beginBatch(sessionKey: string): DispatcherBatchLease<Message>;
+  pendingSessions(): number;
+  /** Drop/release retained work and return the exact messages that were dropped. */
+  clearPending(sessionKey: string): Message[];
+  pendingBuffered(sessionKey: string): number;
+  dispose(): { pending: number; provisional: number };
+  /** Compatibility alias for lifecycle callers that predate bounded retention. */
+  close(): void;
+  isDisposed(): boolean;
 }
 
-/** The inbound frame shape the coalesce merge understands. */
-export type UserMessageLike = { type: "user_message"; text: string };
-
-/**
- * Merge several buffered `user_message` frames into ONE turn's message.
- *
- * P1-8b coalesce (Telegram parity): when a user fires several messages faster
- * than a turn can run, we run a single turn over their concatenation rather than
- * one turn each. Texts are joined with a blank line (`"\n\n"`) so the agent sees
- * them as distinct paragraphs of one prompt, in arrival order.
- *
- * Non-text fields of the FIRST frame are preserved (spread), so if the union
- * member ever grows fields beyond `{ type, text }` the earliest message's
- * metadata wins — matching "the turn is anchored on the first message". A single
- * message is returned as-is (identity), so the no-burst path is a pure pass
- * through. Callers only ever pass a non-empty array (a flush batch / a drained
- * buffer); an empty array is a contract violation and returns `undefined`.
- */
-export function coalesceUserMessages<M extends UserMessageLike>(
-  messages: readonly M[],
-): M {
+export function coalesceUserMessages<M extends UserMessageLike>(messages: readonly M[]): M {
   const first = messages[0];
-  if (messages.length <= 1) return first;
-  const text = messages.map((m) => m.text).join("\n\n");
-  return { ...first, text };
+  if (!first) return undefined as unknown as M;
+  if (messages.length === 1) return first;
+  return {
+    ...first,
+    id: messages[messages.length - 1].id,
+    text: messages.map((message) => message.text).join("\n\n"),
+  };
+}
+
+type LeaseEntry<Message> = RetainedEntry<Message> & {
+  state: "provisional" | "committed" | "rolled-back" | "attached";
+};
+
+type InternalLease<Message> = {
+  key: string;
+  entries: LeaseEntry<Message>[];
+  finished: boolean;
+  tailRejected: RetentionLimitReason | undefined;
+};
+
+type SessionState<Message> = {
+  running?: Promise<void>;
+  pending: RetainedEntry<Message>[];
+  openLeases: Set<InternalLease<Message>>;
+  readyToDrain: boolean;
+};
+
+export type SerializedInboundDispatcherOptions<Message> = {
+  coalesce?: (messages: Message[]) => Message;
+  budget?: InboundRetentionBudget;
+  sessionToken?: (sessionKey: string) => RetentionSessionToken;
+  measure?: (message: Message) => number;
+};
+
+function checkedCharge<Message>(measure: (message: Message) => number, message: Message): number {
+  const charge = measure(message);
+  if (!Number.isSafeInteger(charge) || charge < 0) {
+    throw new TypeError("retained message charge must be a finite non-negative safe integer");
+  }
+  return charge;
 }
 
 /**
- * Build a per-session serializing dispatcher around `handler`.
- *
- * @param handler Runs one inbound turn. It is expected to settle (resolve or
- *   reject) when the turn is fully done; the NEXT same-session message waits on
- *   that settlement. `handleInboundMessage` already catches its own errors
- *   internally, but we defend against rejection — AND synchronous throws — here
- *   too (a poisoned link must never block the rest of the chain or leak its map
- *   entry; see below).
+ * Per-session serial dispatcher. The coalescing path owns a streaming admission
+ * lease so ingress can persist each outcome before committing retained work.
  */
 export function createSerializedInboundDispatcher<Message>(
   handler: (sessionKey: string, message: Message) => Promise<void>,
-  options?: {
-    /**
-     * P1-8b busy-time coalesce (Telegram parity). When provided, a message that
-     * arrives while its session already has a turn RUNNING is NOT chained as a
-     * second turn — it is buffered. When the running turn settles, the ENTIRE
-     * buffer is drained, merged via this function, and run as ONE follow-up turn
-     * (which itself becomes the new running turn, so messages arriving during IT
-     * buffer again). When omitted, behavior is exactly the legacy per-session
-     * FIFO below (one queued turn per message).
-     */
-    coalesce?: (messages: Message[]) => Message;
-  },
+  options?: SerializedInboundDispatcherOptions<Message>,
 ): SerializedInboundDispatcher<Message> {
   const coalesce = options?.coalesce;
+  const budget = options?.budget ?? new InboundRetentionBudget();
+  const measure = options?.measure ?? estimateRetainedMessageBytes;
+  // Validate injected measurement at construction without retaining an item.
+  if (typeof measure !== "function") throw new TypeError("measure must be a function");
 
-  // sessionKey -> tail of that session's promise chain. The value is the
-  // promise for the LAST-enqueued turn; the next message chains off it. Entries
-  // are removed when a session's chain fully drains (see cleanup below) so this
-  // map does not grow without bound as transient sessions come and go.
-  //
-  // Used ONLY on the legacy (no-`coalesce`) path. The coalesce path uses
-  // `running` + `pending` below instead; the two paths are mutually exclusive
-  // for the life of a dispatcher, so at most one of these structures is ever
-  // populated.
-  const chains = new Map<string, Promise<unknown>>();
+  const tokens = new Map<string, RetentionSessionToken>();
+  const tokenFor = options?.sessionToken ?? ((key: string) => {
+    let token = tokens.get(key);
+    if (!token) {
+      token = budget.createSessionToken();
+      tokens.set(key, token);
+    }
+    return token;
+  });
 
-  // --- Coalesce path state (P1-8b) -----------------------------------------
-  // `running`: sessionKey -> the settled-promise of the turn currently in
-  //   flight for that session. Presence == BUSY. Unlike `chains`, we never queue
-  //   a SECOND turn behind it — at most one turn runs per session at a time; the
-  //   rest wait in `pending`.
-  // `pending`: sessionKey -> messages that arrived while the session was busy,
-  //   in arrival order. Drained (merged into one follow-up turn) when the
-  //   running turn settles. Kept as full Message objects because later phases
-  //   (P0-7 dedupe, P1-9 retraction) will reuse this buffer.
-  const running = new Map<string, Promise<unknown>>();
-  const pending = new Map<string, Message[]>();
+  const chains = new Map<string, Promise<void>>();
+  const sessions = new Map<string, SessionState<Message>>();
+  let disposed = false;
 
-  // Start a fresh turn for `message` as the session's running turn, and wire its
-  // settlement to drain the coalesce buffer (or go idle). Recurses to run the
-  // merged follow-up turn, so messages that arrived during THIS turn are handled
-  // as a single next turn. Mirrors the legacy path's poisoned-link defenses:
-  // the handler is invoked inside `Promise.resolve().then(...)` so a SYNCHRONOUS
-  // throw is funneled into the rejection path, and `.catch(() => {})` makes the
-  // stored promise non-rejecting so the drain/cleanup ALWAYS runs (a failed turn
-  // must not wedge the session or strand its buffer).
-  const startCoalesceTurn = (sessionKey: string, message: Message) => {
-    const settled = Promise.resolve()
-      .then(() => handler(sessionKey, message))
-      .catch(() => {});
-    running.set(sessionKey, settled);
-
-    void settled.then(() => {
-      // Identity guard, matching the legacy cleanup: only this turn's own
-      // settlement may advance the session. (Nothing else overwrites `running`
-      // for a live session — dispatch only appends to `pending` while busy — but
-      // keep the guard defensive.)
-      if (running.get(sessionKey) !== settled) return;
-      const buffered = pending.get(sessionKey);
-      if (buffered && buffered.length > 0) {
-        pending.delete(sessionKey);
-        // Recurse: the merged follow-up becomes the new running turn. Messages
-        // that arrive during it will buffer against THIS same session again.
-        startCoalesceTurn(sessionKey, coalesce!(buffered));
-      } else {
-        running.delete(sessionKey);
-      }
-    });
+  const release = (entry: RetainedEntry<Message>) => {
+    entry.reservation.requestRelease();
   };
 
-  const dispatchCoalesced = (sessionKey: string, message: Message) => {
-    if (running.has(sessionKey)) {
-      // Busy: buffer instead of chaining a second turn. `startCoalesceTurn` sets
-      // `running` synchronously, so a same-tick burst reliably lands here.
-      const buf = pending.get(sessionKey);
-      if (buf) buf.push(message);
-      else pending.set(sessionKey, [message]);
+  const maybeForget = (key: string, state: SessionState<Message>) => {
+    if (!state.running && state.pending.length === 0 && state.openLeases.size === 0) {
+      sessions.delete(key);
+      if (!options?.sessionToken) tokens.delete(key);
+    }
+  };
+
+  const sessionFor = (key: string): SessionState<Message> => {
+    let state = sessions.get(key);
+    if (!state) {
+      state = { pending: [], openLeases: new Set(), readyToDrain: false };
+      sessions.set(key, state);
+    }
+    return state;
+  };
+
+  const startTurn = (key: string, state: SessionState<Message>, entries: RetainedEntry<Message>[]) => {
+    if (disposed || entries.length === 0) {
+      for (const entry of entries) release(entry);
+      maybeForget(key, state);
       return;
     }
-    startCoalesceTurn(sessionKey, message);
-  };
-
-  const dispatchLegacy = (sessionKey: string, message: Message) => {
-    // Chain off whatever is currently queued for this session (or a resolved
-    // promise if the session is idle). We attach via `.then` with NO rejection
-    // handler on `previous` itself — instead the previous link is made
-    // non-rejecting before being stored (see `settled` below), so a failed turn
-    // never blocks the ones queued behind it. Defensive even though
-    // `handleInboundMessage` already swallows its own errors.
-    const previous = chains.get(sessionKey) ?? Promise.resolve();
-
-    // `settled` resolves when THIS turn is fully done, success or failure. We
-    // store this (not the raw handler promise) as the new tail so the next
-    // message waits for completion regardless of outcome, and the chain never
-    // carries a rejection forward.
-    //
-    // We invoke `handler` inside `Promise.resolve().then(...)` so that even a
-    // SYNCHRONOUS throw (a non-async handler that throws before returning a
-    // promise) is funneled into the promise's rejection path rather than
-    // escaping the `previous.then()` callback. Without this, a sync throw would
-    // reject `settled` directly — permanently poisoning the chain tail (wedging
-    // every later same-session turn) AND skipping the success-only cleanup
-    // below (leaking the map entry). The trailing `.catch(() => {})` then
-    // swallows both async rejections and the funneled sync throw: a single
-    // failed turn must not wedge the session's queue. The handler is responsible
-    // for its own user-facing error recovery (inbound.ts finalizes the working
-    // bubble on failure).
-    const settled = previous.then(() =>
-      Promise.resolve()
-        .then(() => handler(sessionKey, message))
-        .catch(() => {}),
-    );
-
-    chains.set(sessionKey, settled);
-
-    // Drain cleanup: once THIS turn settles, drop the map entry IF it is still
-    // the tail — i.e. no newer message has replaced it in the meantime. Without
-    // the identity check we would race-delete an entry a later message already
-    // overwrote, orphaning that message's chain and losing serialization.
-    // Because `settled` is non-rejecting (see above), this cleanup runs for
-    // EVERY turn, including ones whose handler threw synchronously.
+    // Detach/release before allocating the merged string or invoking the handler:
+    // running work is outside the retained-work budget.
+    const messages = entries.map((entry) => entry.message);
+    for (const entry of entries) release(entry);
+    let message: Message;
+    try {
+      message = coalesce ? coalesce(messages) : messages[0];
+    } catch {
+      maybeForget(key, state);
+      return;
+    }
+    const settled = Promise.resolve()
+      .then(() => disposed ? undefined : handler(key, message))
+      .catch(() => {});
+    state.running = settled;
     void settled.then(() => {
-      if (chains.get(sessionKey) === settled) {
-        chains.delete(sessionKey);
+      if (state.running !== settled) return;
+      state.running = undefined;
+      if (disposed) {
+        for (const entry of state.pending.splice(0)) release(entry);
+        maybeForget(key, state);
+        return;
       }
+      if (state.openLeases.size > 0) {
+        state.readyToDrain = true;
+        return;
+      }
+      drain(key, state);
     });
   };
 
-  const dispatch = coalesce ? dispatchCoalesced : dispatchLegacy;
+  const drain = (key: string, state: SessionState<Message>) => {
+    if (state.running || state.openLeases.size > 0) return;
+    state.readyToDrain = false;
+    const entries = state.pending.splice(0);
+    if (entries.length > 0) startTurn(key, state, entries);
+    else maybeForget(key, state);
+  };
+
+  const disposedLease = (): DispatcherBatchLease<Message> => ({
+    offer: () => ({ status: "disposed" }),
+    finish: () => {},
+  });
+
+  const beginBatch = (sessionKey: string): DispatcherBatchLease<Message> => {
+    if (disposed || !coalesce) return disposed ? disposedLease() : createLegacyLease(sessionKey);
+    const state = sessionFor(sessionKey);
+    const internal: InternalLease<Message> = {
+      key: sessionKey,
+      entries: [],
+      finished: false,
+      tailRejected: undefined,
+    };
+    state.openLeases.add(internal);
+
+    const offer = (message: Message, supplied?: RetentionReservation): BatchOffer => {
+      if (disposed || internal.finished) {
+        supplied?.requestRelease();
+        return { status: "disposed" };
+      }
+      if (internal.tailRejected) {
+        // A supplied reservation still protects the caller's retained raw item
+        // while it persists the terminal overload outcome. The caller releases
+        // it after that async resolution; an unsupplied offer owns nothing here.
+        return { status: "rejected", reason: internal.tailRejected };
+      }
+
+      let reservation = supplied;
+      if (reservation) {
+        if (reservation.released || reservation.sessionToken !== tokenFor(sessionKey)) {
+          reservation.requestRelease();
+          internal.tailRejected = "session-message-count";
+          return { status: "rejected", reason: internal.tailRejected };
+        }
+        reservation.transfer("pending");
+      } else {
+        let charge: number;
+        try {
+          charge = checkedCharge(measure, message);
+        } catch {
+          internal.tailRejected = "session-byte-count";
+          return { status: "rejected", reason: internal.tailRejected };
+        }
+        const reserved = budget.tryReserve(tokenFor(sessionKey), charge, "pending");
+        if (reserved.status === "rejected") {
+          internal.tailRejected = reserved.reason;
+          return { status: "rejected", reason: reserved.reason };
+        }
+        reservation = reserved.reservation;
+      }
+
+      const id = (message as { id?: unknown }).id;
+      const entry: LeaseEntry<Message> = {
+        message,
+        ...(typeof id === "string" ? { id } : {}),
+        reservation,
+        state: "provisional",
+      };
+      internal.entries.push(entry);
+      return {
+        status: "accepted",
+        commit: () => {
+          if (entry.state !== "provisional") return;
+          if (disposed || internal.finished) {
+            entry.state = "rolled-back";
+            release(entry);
+            return;
+          }
+          entry.state = "committed";
+        },
+        rollback: () => {
+          if (entry.state !== "provisional" && entry.state !== "committed") return;
+          entry.state = "rolled-back";
+          release(entry);
+        },
+      };
+    };
+
+    const finish = () => {
+      if (internal.finished) return;
+      internal.finished = true;
+      state.openLeases.delete(internal);
+      for (const entry of internal.entries) {
+        if (entry.state === "provisional") {
+          entry.state = "rolled-back";
+          release(entry);
+        } else if (entry.state === "committed") {
+          entry.state = "attached";
+          state.pending.push(entry);
+        }
+      }
+      internal.entries = [];
+      if (!state.running && state.openLeases.size === 0) drain(sessionKey, state);
+      else if (state.readyToDrain && state.openLeases.size === 0) drain(sessionKey, state);
+    };
+
+    return { offer, finish };
+  };
+
+  function createLegacyLease(sessionKey: string): DispatcherBatchLease<Message> {
+    const offered: Message[] = [];
+    let finished = false;
+    return {
+      offer(message, reservation) {
+        if (finished || disposed) {
+          reservation?.requestRelease();
+          return { status: "disposed" };
+        }
+        // Legacy chains do not own retained accounting. A reservation supplied
+        // by the bounded debouncer becomes uncharged immediately before chaining.
+        reservation?.requestRelease();
+        offered.push(message);
+        let active = true;
+        return {
+          status: "accepted",
+          commit: () => { active = false; },
+          rollback: () => {
+            if (!active) return;
+            active = false;
+            const index = offered.indexOf(message);
+            if (index >= 0) offered.splice(index, 1);
+          },
+        };
+      },
+      finish() {
+        if (finished) return;
+        finished = true;
+        for (const message of offered) dispatchLegacy(sessionKey, message);
+      },
+    };
+  }
+
+  const dispatchLegacy = (sessionKey: string, message: Message) => {
+    if (disposed) return;
+    const previous = chains.get(sessionKey) ?? Promise.resolve();
+    const settled = previous.then(() =>
+      disposed ? undefined : Promise.resolve()
+        .then(() => disposed ? undefined : handler(sessionKey, message))
+        .catch(() => {}),
+    );
+    chains.set(sessionKey, settled);
+    void settled.then(() => {
+      if (chains.get(sessionKey) === settled) chains.delete(sessionKey);
+    });
+  };
+
+  const dispatch = (
+    sessionKey: string,
+    message: Message,
+    reservation?: RetentionReservation,
+  ): BatchOffer["status"] => {
+    if (!coalesce) {
+      if (disposed) {
+        reservation?.requestRelease();
+        return "disposed";
+      }
+      reservation?.requestRelease();
+      dispatchLegacy(sessionKey, message);
+      return "accepted";
+    }
+    const lease = beginBatch(sessionKey);
+    const offer = lease.offer(message, reservation);
+    if (offer.status === "accepted") offer.commit();
+    else reservation?.requestRelease();
+    lease.finish();
+    return offer.status;
+  };
+
+  const clearPending = (sessionKey: string): Message[] => {
+    const state = sessions.get(sessionKey);
+    if (!state) return [];
+    const dropped: Message[] = [];
+    for (const entry of state.pending.splice(0)) {
+      dropped.push(entry.message);
+      release(entry);
+    }
+    for (const lease of state.openLeases) {
+      for (const entry of lease.entries) {
+        if (entry.state === "rolled-back") continue;
+        dropped.push(entry.message);
+        entry.state = "rolled-back";
+        release(entry);
+      }
+    }
+    maybeForget(sessionKey, state);
+    return dropped;
+  };
+
+  const dispose = () => {
+    if (disposed) return { pending: 0, provisional: 0 };
+    disposed = true;
+    chains.clear();
+    let pending = 0;
+    let provisional = 0;
+    for (const [key, state] of sessions) {
+      for (const entry of state.pending.splice(0)) {
+        pending++;
+        release(entry);
+      }
+      for (const lease of state.openLeases) {
+        lease.finished = true;
+        for (const entry of lease.entries) {
+          if (entry.state === "rolled-back") continue;
+          provisional++;
+          entry.state = "rolled-back";
+          release(entry);
+        }
+        lease.entries = [];
+      }
+      state.openLeases.clear();
+      state.readyToDrain = false;
+      maybeForget(key, state);
+    }
+    sessions.clear();
+    tokens.clear();
+    // Running handlers are allowed to settle, but queued same-tick handlers and
+    // recursive follow-ups observe `disposed` before they can start.
+    return { pending, provisional };
+  };
 
   return {
     dispatch,
-    // Only one of the two structures is ever populated for a given dispatcher
-    // (coalesce is fixed at construction), so summing is correct for both paths:
-    // legacy counts live chains; coalesce counts running turns.
-    pendingSessions: () => chains.size + running.size,
-    clearPending: (sessionKey: string) => {
-      const buf = pending.get(sessionKey);
-      if (!buf) return 0;
-      pending.delete(sessionKey);
-      return buf.length;
+    beginBatch,
+    pendingSessions: () => chains.size + sessions.size,
+    clearPending,
+    pendingBuffered: (key) => sessions.get(key)?.pending.length ?? 0,
+    dispose,
+    close: () => {
+      void dispose();
     },
-    pendingBuffered: (sessionKey: string) => pending.get(sessionKey)?.length ?? 0,
+    isDisposed: () => disposed,
   };
 }

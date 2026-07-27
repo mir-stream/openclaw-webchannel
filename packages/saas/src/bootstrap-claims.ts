@@ -9,7 +9,7 @@
  *     `saas-bootstrap.ts`).
  *   - `pop_jwk`  — the device's Ed25519 PoP public key. Proof-of-Possession at
  *     peer registration: the plugin issues a nonce and the device must sign
- *     `webchannel-pop:<peerId>:<nonce>` with the matching Ed25519 PRIVATE key
+ *     `webchannel-pop:<op>:<peerId>:<nonce>` with the matching Ed25519 PRIVATE key
  *     (parsed by the plugin's `jwt.ts`, verified by `pop-challenge.ts`).
  *
  * The two keys are deliberately SEPARATE: X25519 is for ECDH and cannot sign, so
@@ -17,6 +17,8 @@
  *
  * This module builds the claim object only; signing (RS256) is the issuer's job.
  */
+
+import { assertValidSubjectToken } from "./subject-token.js";
 
 /** Device X25519 public key (cnf.jwk) — base64url 32-byte `x`. */
 export type DeviceCnfJwk = {
@@ -42,13 +44,13 @@ export type BootstrapClaimsInput = {
    *
    * A single string mints a single-audience token (`aud` is that string), the
    * original behaviour byte-for-byte. An ARRAY mints a multi-audience token
-   * (`aud` is the array), for one login authorized across a fleet of accounts —
-   * the plugin verifier and multi-aud router are already array-aware. A
+   * (`aud` is the array), authorizing separate concrete connections to those
+   * accounts; each target still uses its own account-bound verifier and pin. A
    * single-element array is treated as multi (yields an array `aud`); pass a bare
    * string for the scalar form.
    */
   accountId: string | string[];
-  /** Tenant scope. */
+  /** Signed tenant scope shared by every authorized audience member. */
   tenant: string;
   /** Device X25519 public key (base64url 32 bytes) → `cnf.jwk`. */
   deviceX25519PublicKey: string;
@@ -68,18 +70,10 @@ export type BootstrapClaimsInput = {
 export type BootstrapClaims = {
   iss: string;
   sub: string;
-  /** JWT audience — a single account (string) or a fleet (string array). */
+  /** JWT audience — one account or an explicit account authorization set. */
   aud: string | string[];
   exp: number;
   iat: number;
-  /**
-   * Top-level account id — a DEAD claim nobody in the routing/verify path reads
-   * (verified by grep; the router uses `aud`). Kept only for back-compat of the
-   * scalar case: the single account id for a string `aud`, and `""` for a
-   * multi-aud token (no single "primary" account to name). Do NOT start reading
-   * this — full removal from the type is a tracked backlog item.
-   */
-  accountId: string;
   tenant: string;
   cnf: { jwk: DeviceCnfJwk };
   pop_jwk?: DevicePopJwk;
@@ -100,21 +94,20 @@ function assert32Bytes(label: string, b64url: string): void {
  * `cnf.jwk` and (when supplied) its Ed25519 PoP key as `pop_jwk`.
  */
 export function buildBootstrapClaims(input: BootstrapClaimsInput): BootstrapClaims {
-  if (!input.peerId) throw new Error("bootstrap-claims: peerId is required");
+  assertValidSubjectToken(input.peerId, "peerId");
+  assertValidSubjectToken(input.tenant, "tenant");
   assert32Bytes("deviceX25519PublicKey", input.deviceX25519PublicKey);
   if (input.devicePopPublicKey) assert32Bytes("devicePopPublicKey", input.devicePopPublicKey);
 
   const now = input.nowSeconds ?? Math.floor(Date.now() / 1000);
   const ttl = input.ttlSeconds ?? DEFAULT_TTL_SECONDS;
 
-  // Multi-aud (array) → `aud` is the array, dead top-level `accountId` = "".
-  // Scalar (string) → original behaviour byte-for-byte (`aud` = accountId = id).
   const audience = input.accountId;
   const isMulti = Array.isArray(audience);
   if (isMulti && audience.length === 0) {
     throw new Error("bootstrap-claims: accountId array must be non-empty");
   }
-  const primaryAccountId = isMulti ? "" : audience;
+  for (const value of isMulti ? audience : [audience]) assertValidSubjectToken(value, "accountId");
 
   const claims: BootstrapClaims = {
     iss: input.iss,
@@ -122,7 +115,6 @@ export function buildBootstrapClaims(input: BootstrapClaimsInput): BootstrapClai
     aud: audience,
     exp: now + ttl,
     iat: now,
-    accountId: primaryAccountId,
     tenant: input.tenant,
     cnf: { jwk: { kty: "OKP", crv: "X25519", x: input.deviceX25519PublicKey } },
   };

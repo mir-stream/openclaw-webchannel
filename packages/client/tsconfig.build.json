@@ -7,5 +7,7 @@
     "rootDir": "src"
   },
   "include": ["src"],
-  "exclude": ["node_modules", "dist", "src/**/*.test.ts"]
+  // `*.test-harness.ts` is test scaffolding, NOT public API: it does not match
+  // `*.test.ts`, so it was being compiled into the published dist.
+  "exclude": ["node_modules", "dist", "src/**/*.test.ts", "src/**/*.test-harness.ts"]
 }

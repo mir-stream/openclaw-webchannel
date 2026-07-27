@@ -1,7 +1,7 @@
 // Driver for the enrolled-NATS-transport E2E (#18 — agent-side).
 //
 // WHAT THE AGENT PROVED ALREADY (by the time this driver runs): the PLUGIN, with
-// devOpen OFF, obtained tenant-scoped NATS user creds via the REAL device-flow
+// real device-flow enrollment (no unauthenticated NATS mode); tenant-scoped NATS user creds via the REAL device-flow
 // enrollment-server (enroll → auto-approve → poll) through the PRODUCTION
 // createEnrolledNatsConnection path, and connected (NKEY-authenticated) to a
 // JWT-auth nats-server whose operator/account come from the SAME setupTrustChain
@@ -19,20 +19,19 @@
 //      the only admission path);
 //   3. unwraps the register-delivered conversation key K (Phase 6 — the
 //      register-hop path has NO X25519 handshake; K arrives wrapped to the
-//      device cnf key in the register HTTP response) and runs the
+//      device cnf key in the NATS register reply) and runs the
 //      ChaCha20-Poly1305 round-trip (same wire as the production browser
 //      client), asserting the decrypted echo.
 //
 // Exit codes: 0 ok · 2 setup/HTTP failure · 3 timeout · 5 decrypt/mismatch.
 
-import { randomBytes } from "node:crypto";
+import { randomBytes, webcrypto } from "node:crypto";
 
 import { fromSeed } from "@nats-io/nkeys";
 
 import { NatsTransport } from "../../packages/plugin/src/nats-transport.js";
 import type { NatsMessage } from "../../packages/plugin/src/nats-transport.js";
 import {
-  generateX25519KeyPair,
   unwrapConversationKey,
   sealMessage,
   openMessage,
@@ -70,8 +69,18 @@ async function postJson(url: string, body: unknown, headers: Record<string, stri
 }
 
 // 1. Device X25519 key → cnf.jwk in the bootstrap JWT; the register hop wraps
-//    the conversation key K to this key (Phase 6 — no handshake).
-const deviceKp = await generateX25519KeyPair();
+//    the conversation key K to this key (Phase 6 — no handshake). Generated with
+//    WebCrypto directly (the production browser client's key model), matching the
+//    other enrolled drivers now that the legacy handshake keygen helper is gone.
+const deviceX25519 = (await webcrypto.subtle.generateKey({ name: "X25519" }, true, [
+  "deriveBits",
+])) as CryptoKeyPair;
+const deviceKp = {
+  privateKey: deviceX25519.privateKey,
+  publicKeyB64url: Buffer.from(
+    await webcrypto.subtle.exportKey("raw", deviceX25519.publicKey),
+  ).toString("base64url"),
+};
 
 // 1b. Device Ed25519 PoP key → pop_jwk. The gateway now requires PoP by default
 //     (auth.requirePoP defaults true), so the bootstrap JWT MUST carry pop_jwk and
@@ -165,11 +174,16 @@ try {
 if (!registerResult.wrappedConversationKey) {
   fail(2, "register response carried no wrappedConversationKey (Phase 6 key delivery)");
 }
+// v3: the wrap AAD is bound to the freshness anchor THIS driver generated for the
+// successful register attempt — `registerWithPop` carries it out on its result.
+// Never source it from the register reply (the agent does not echo it, and an
+// echoed anchor would be relay-chosen).
 const sessionKey = await unwrapConversationKey(
   registerResult.wrappedConversationKey,
   deviceKp.privateKey,
   agentPublicKey!,
   PEER_ID,
+  registerResult.clientNonce,
 ).catch((e: Error) => fail(5, `conversation-key unwrap failed: ${e.message}`));
 console.log(`[driver] PoP register hop (NATS) OK → agent subscribed to ${PEER_ID}, K unwrapped`);
 

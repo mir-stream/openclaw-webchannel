@@ -11,8 +11,9 @@
  * claim/commit (`createClaimableDedupe`, the model the gap doc sketches):
  *   (a) a processing failure already surfaces to the user via the error-finalize
  *       path, and a human retry is a NEW id — so there is nothing to roll back;
- *   (b) the P1-8b coalesce merge keeps only the FIRST message's fields, so a
- *       per-id rollback after a merged-turn failure would be lossy anyway; and
+ *   (b) the P1-8b coalesce merge collapses the batch to ONE message (first
+ *       frame's fields, LAST frame's `id` as the turn anchor), so a per-id
+ *       rollback after a merged-turn failure would be lossy anyway; and
  *   (c) claim/commit's in-flight waiting guards a concurrent same-key race that
  *       cannot happen here — this runs inside the debouncer's `onFlush`, which is
  *       same-peer serialized by core's keyChains, so checks are already ordered.
@@ -45,6 +46,65 @@
  * the storage-amplification surface to conforming clients.
  */
 const MAX_INGRESS_DEDUPE_ID_LENGTH = 128;
+export const MAX_CANCELLED_INBOUND_FALLBACK_TOMBSTONES = 256;
+export const MAX_CANCELLED_INBOUND_FALLBACK_BYTES = 256 * 1024;
+
+/** Apply the same bounded/non-empty id rule to persistent and fallback keys. */
+export function ingressDedupeKey(item: IngressDedupeItem): string | undefined {
+  const id = item.message.id;
+  return typeof id === "string" && id.length > 0 && id.length <= MAX_INGRESS_DEDUPE_ID_LENGTH
+    ? `${item.peerId}:${id}`
+    : undefined;
+}
+
+/** Per-account, insertion-ordered safety net for cancelled-item record failures. */
+export class CancelledInboundFallbackTombstones {
+  private readonly keys = new Map<string, number>();
+  private bytes = 0;
+
+  constructor(
+    private readonly warn?: (message: string) => void,
+    private readonly cap = MAX_CANCELLED_INBOUND_FALLBACK_TOMBSTONES,
+    private readonly byteCap = MAX_CANCELLED_INBOUND_FALLBACK_BYTES,
+  ) {}
+
+  get size(): number { return this.keys.size; }
+  get byteSize(): number { return this.bytes; }
+  private scoped(key: string, accountId = "global"): string { return `${accountId.length}:${accountId}${key}`; }
+  has(key: string, accountId?: string): boolean {
+    return this.keys.has(this.scoped(key, accountId))
+      || (accountId !== undefined && this.keys.has(this.scoped(key)));
+  }
+  delete(key: string, accountId?: string): boolean {
+    const scoped = this.scoped(key, accountId);
+    let bytes = this.keys.get(scoped);
+    if (bytes === undefined && accountId !== undefined) {
+      return this.delete(key);
+    }
+    if (bytes === undefined) return false;
+    this.keys.delete(scoped);
+    this.bytes -= bytes;
+    return true;
+  }
+
+  add(key: string, accountId?: string): void {
+    const scoped = this.scoped(key, accountId);
+    if (this.keys.has(scoped)) return;
+    const bytes = Buffer.byteLength(scoped, "utf8") + 48;
+    if (bytes > this.byteCap) return;
+    let evicted = false;
+    while (this.keys.size >= this.cap || this.bytes + bytes > this.byteCap) {
+      const oldest = this.keys.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.bytes -= this.keys.get(oldest)!;
+      this.keys.delete(oldest);
+      evicted = true;
+    }
+    if (evicted) this.warn?.("webchannel: cancelled-inbound fallback tombstone cap reached; evicted oldest metadata entry");
+    this.keys.set(scoped, bytes);
+    this.bytes += bytes;
+  }
+}
 
 /** The `checkAndRecord` shape this helper depends on (a subset of `PersistentDedupe`). */
 export type IngressDedupeCheck = (
@@ -94,31 +154,31 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
   accountId: string,
   checkAndRecord: IngressDedupeCheck,
   sinks?: IngressDedupeLogSinks,
+  isActive: () => boolean = () => true,
 ): Promise<T[]> {
   const survivors: T[] = [];
   for (const item of items) {
+    if (!isActive()) return [];
     // Normalize the wire `id`: only a non-empty, in-bounds STRING is dedupe-able.
     // A non-string or over-length id is treated as ID-LESS — passed through
     // un-deduped and never recorded, so a hostile client cannot amplify SQLite
     // storage with junk keys. (Such a frame is still ACKed by the P0-7b ack
     // layer, which accepts any non-empty string; it simply is not deduped —
     // acceptable, since only a non-conforming client ever hits this path.)
-    const rawId = item.message.id;
-    const id =
-      typeof rawId === "string" && rawId.length > 0 && rawId.length <= MAX_INGRESS_DEDUPE_ID_LENGTH
-        ? rawId
-        : undefined;
-    if (!id) {
+    const key = ingressDedupeKey(item);
+    if (!key) {
       // Back-compat / hardening: id-less (or non-conforming) frames pass through
       // un-deduped.
       survivors.push(item);
       continue;
     }
-    const key = `${item.peerId}:${id}`;
+    const id = item.message.id as string;
     let fresh: boolean;
     try {
       fresh = await checkAndRecord(key, { namespace: accountId });
+      if (!isActive()) return [];
     } catch (err) {
+      if (!isActive()) return [];
       sinks?.warn?.(
         `webchannel: ingress dedupe check failed for peer=${item.peerId} id=${id} — ` +
           `keeping message (fail-open): ${String(err)}`,
@@ -142,22 +202,31 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
   /** Dedupe namespace — the serving account id (isolates ids per account). */
   accountId: string;
   /** The per-account `PersistentDedupe.checkAndRecord` (record-at-ingress). */
-  checkAndRecord: IngressDedupeCheck;
+  checkAndRecord?: IngressDedupeCheck;
   /** Route the surviving, coalesced message onto the per-session FIFO. */
-  dispatch: (peerId: string, message: T["message"]) => void;
+  dispatch?: (peerId: string, message: T["message"]) => void;
   /** Merge the surviving frames into ONE turn's message (P1-8b coalesce). */
-  coalesce: (messages: T["message"][]) => T["message"];
+  coalesce?: (messages: T["message"][]) => T["message"];
   /**
    * P0-7b ingress ACK: drain the client's replay ledger on ingress ADMISSION.
    * OPTIONAL — P0-7a (first half) wires NO ack; P0-7b wires `channel.sendAck`.
    * When present, called once per flush with the unique ids across ALL items
    * (see the ack rationale in the factory doc).
    */
-  sendAck?: (peerId: string, ids: string[]) => void;
+  sendAck?: (peerId: string, ids: string[]) => boolean;
+  sendInboundRejected?: (peerId: string, ids: string[]) => boolean;
+  outcomeStore?: IngressOutcomeStore;
+  beginBatch?: (peerId: string) => DispatcherBatchLease<T["message"]>;
+  measureResultWireBytes?: (peerId: string, frame: IngressResultFrame) => number;
+  effectiveOutboundLimit?: () => number;
+  /** Cancel-record failures that must be suppressed before ordinary admission. */
+  cancelledFallback?: CancelledInboundFallbackTombstones;
   /** Routine duplicate-drop sink (info). */
   logInfo?: (message: string) => void;
   /** Fail-open fault sink (warn). */
   logWarn?: (message: string) => void;
+  /** Account-runtime lifecycle fence, combined with each retained entry fence. */
+  isActive?: () => boolean;
 };
 
 /**
@@ -167,15 +236,22 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
  * dispatch `items` instead of `fresh`, or drop the accountId namespace).
  *
  * WHY IT LIVES IN onFlush (not setMessageHandler). The dedupe check is async
- * (`checkAndRecord` may await SQLite). `onFlush` is SAME-PEER SERIALIZED by core's
- * keyChains (the debouncer's `serializeImmediate` + `buildKey: peerId`), so
+ * (`checkAndRecord` may await SQLite). `onFlush` is SAME-PEER SERIALIZED by the
+ * bounded debouncer's one-worker-per-key design (`buildKey: peerId`), so
  * awaiting the check here cannot reorder a peer's messages. Awaiting the same
  * check in the fire-and-forget `setMessageHandler` COULD: a slower SQLite miss
  * could let a later frame overtake an earlier one. So the dedupe belongs on the
  * serialized flush path, not the raw handler.
  *
- * WHAT IT DOES, per flush batch:
- *  - P0-7b ACK FIRST (before the dedupe/dispatch): ack EVERY id-carrying item —
+ * PRODUCTION outcome/lease branch, per flush batch:
+ *  - lookup the durable accepted/overloaded outcome before admission;
+ *  - offer fresh work against the dispatcher lease and record exactly one chosen
+ *    outcome before committing the lease;
+ *  - emit ACK only for accepted ids and `inbound_rejected` only for overloaded
+ *    ids. These result classes are disjoint and are published after persistence.
+ *
+ * LEGACY boolean-dedupe compatibility branch only:
+ *  - P0-7b ACK FIRST (before the legacy dedupe/dispatch): ack every id-carrying item —
  *    FRESH AND DUPLICATES ALIKE. A deduped duplicate means the ORIGINAL was
  *    admitted, so the client's replay ledger entry must STILL drain; skipping it
  *    would make the client replay that message on every reconnect forever.
@@ -197,34 +273,317 @@ export type IngressOnFlushDeps<T extends IngressDedupeItem> = {
  * deduped — a duplicate abort is a harmless cosmetic double-bubble, and the abort
  * must not wait on SQLite. The control-lane branch acks its own frame separately.
  *
- * Per-id RECORDING happens inside `filterFreshInboundItems` BEFORE the coalesce/
- * dispatch — every id in the batch is recorded as it is checked, so a duplicate
- * already merged into this same turn is still individually recorded and a later
- * replay of it is dropped.
+ * In that legacy branch, per-id recording happens inside
+ * `filterFreshInboundItems` before coalesce/dispatch. Production does not use
+ * this ACK-first flow; it uses the outcome/lease arbitration above.
  */
 export function createIngressOnFlush<T extends IngressDedupeItem>(
   deps: IngressOnFlushDeps<T>,
-): (items: readonly T[]) => Promise<void> {
-  const { accountId, checkAndRecord, dispatch, coalesce, sendAck, logInfo, logWarn } = deps;
+): (items: readonly (T | RetainedDebounceEntry<T>)[]) => Promise<void> {
+  const { accountId, checkAndRecord, dispatch, coalesce, sendAck, cancelledFallback, logInfo, logWarn } = deps;
+  const isActive = deps.isActive ?? (() => true);
   const sinks: IngressDedupeLogSinks = { info: logInfo, warn: logWarn };
+  const warnOutcomeFailure = createRateLimitedOutcomeFailureWarning((message) => logWarn?.(message));
   return async (items) => {
+    if (!isActive()) return;
+    if (deps.outcomeStore && deps.beginBatch) {
+      const retained = items.map((value) => "item" in value
+        ? value as RetainedDebounceEntry<T>
+        : {
+            item: value as T,
+            reservation: undefined,
+            isActive: () => true,
+            isCancellationRequested: () => false,
+            isRetired: () => false,
+            waitForCancellation: async () => {},
+          });
+      const anchor = retained[0]?.item;
+      if (!anchor) return;
+      const peerId = anchor.peerId;
+      const lease = deps.beginBatch(peerId);
+      const measure = (frame: IngressResultFrame) => deps.measureResultWireBytes?.(peerId, frame)
+        ?? Buffer.byteLength(JSON.stringify(frame), "utf8");
+      const ack = createIngressResultChunkWriter({
+        type: "ack",
+        publish: (frame) => deps.sendAck?.(peerId, frame.ids) ?? false,
+        measureWireBytes: measure,
+        effectiveOutboundLimit: deps.effectiveOutboundLimit?.(),
+        onTooSmall: () => logWarn?.("webchannel: result frame cannot fit effective NATS max_payload"),
+      });
+      const rejected = createIngressResultChunkWriter({
+        type: "inbound_rejected",
+        publish: (frame) => deps.sendInboundRejected?.(peerId, frame.ids) ?? false,
+        measureWireBytes: measure,
+        effectiveOutboundLimit: deps.effectiveOutboundLimit?.(),
+        onTooSmall: () => logWarn?.("webchannel: result frame cannot fit effective NATS max_payload"),
+      });
+      const rollbackOffers: Array<() => void> = [];
+      const commitOffers: Array<() => void> = [];
+      const pendingWrites: OutcomeWriteReceipt[] = [];
+      const deferredReleases: Array<() => void> = [];
+      let finalized = false;
+      let fifoBlocked = false;
+
+      const rollbackWrites = async () => {
+        for (const write of pendingWrites) await write.rollback();
+      };
+      const rollbackBatch = async () => {
+        await rollbackWrites();
+        for (const rollback of rollbackOffers) rollback();
+        for (const release of deferredReleases) release();
+      };
+
+      try {
+        for (const retainedItem of retained) {
+          const item = retainedItem.item;
+          const reservation = retainedItem.reservation;
+          const release = () => {
+            reservation?.requestRelease();
+          };
+          // The first unresolved storage classification is a same-flush FIFO
+          // barrier. Suffix entries remain wholly unclassified: no lookup,
+          // offer, record, result, or dispatch. Their ledger ids retry later.
+          if (fifoBlocked) {
+            release();
+            continue;
+          }
+          if (!isActive() || !retainedItem.isActive()) {
+            release();
+            fifoBlocked = true;
+            continue;
+          }
+          const key = ingressDedupeKey(item);
+          if (!key) {
+            const offer = lease.offer(item.message, reservation);
+            if (offer.status === "accepted") offer.commit();
+            else release();
+            continue;
+          }
+          const id = item.message.id as string;
+
+          // A cancellation tombstone is authoritative and must run before an
+          // ordinary outcome lookup or dispatcher admission. It represents text
+          // `/stop` already killed whose first suppression write failed. Retry
+          // persistence first and ACK only after it succeeds; retain the
+          // tombstone until both halves succeed. The replay reservation is
+          // released exactly once.
+          if (cancelledFallback?.has(key, accountId)) {
+            let result: OutcomeRecordResult | undefined;
+            try {
+              result = await deps.outcomeStore.record(
+                accountId,
+                key,
+                "accepted",
+                { replaceOpposite: true },
+              );
+              if (result.status !== "recorded") {
+                logWarn?.("webchannel: cancelled-inbound fallback outcome retry failed");
+              }
+            } catch {
+              logWarn?.("webchannel: cancelled-inbound fallback outcome retry failed");
+            }
+            if (!isActive() || !retainedItem.isActive()) {
+              if (result?.status === "recorded") await result.write.rollback();
+              release();
+              fifoBlocked = true;
+              continue;
+            }
+            if (result?.status !== "recorded") {
+              // The fallback is authoritative accepted suppression, but without
+              // a successful replacement write it has no publishable chosen
+              // outcome. Preserve peer FIFO until that retry succeeds.
+              release();
+              fifoBlocked = true;
+              continue;
+            }
+            let acked = false;
+            result.write.commit();
+            acked = deps.sendAck?.(item.peerId, [id]) ?? false;
+            if (!acked) logWarn?.("webchannel: cancelled-inbound fallback result delivery failed");
+            if (acked) cancelledFallback.delete(key, accountId);
+            release();
+            continue;
+          }
+
+          let existing: OutcomeLookup;
+          try {
+            existing = await deps.outcomeStore.lookup(accountId, key);
+          } catch (error) {
+            warnOutcomeFailure(accountId, "adapter-lookup");
+            existing = { status: "unknown", error };
+          }
+          if (!isActive() || !retainedItem.isActive()) {
+            release();
+            fifoBlocked = true;
+            continue;
+          }
+          if (existing.status === "unknown") {
+            release();
+            fifoBlocked = true;
+            continue;
+          }
+          if (existing.status === "found") {
+            release();
+            if (existing.outcome === "accepted") ack.add(id);
+            else rejected.add(id);
+            continue;
+          }
+
+          const offer = lease.offer(item.message, reservation);
+          if (offer.status === "disposed") {
+            release();
+            continue;
+          }
+          if (offer.status === "rejected") {
+            let result: OutcomeRecordResult | undefined;
+            try {
+              result = await deps.outcomeStore.record(accountId, key, "overloaded");
+            } catch {
+              warnOutcomeFailure(accountId, "adapter-record-overloaded");
+              // The same FIFO barrier below handles thrown adapters and explicit
+              // tri-state unknown identically.
+            }
+            if (!isActive() || !retainedItem.isActive()) {
+              if (result?.status === "recorded") await result.write.rollback();
+              release();
+              fifoBlocked = true;
+              continue;
+            }
+            if (result?.status === "recorded" && result.durability === "durable") {
+              pendingWrites.push(result.write);
+              deferredReleases.push(release);
+              rejected.add(id);
+            } else {
+              if (result?.status === "recorded") await result.write.rollback();
+              release();
+              fifoBlocked = true;
+            }
+            continue;
+          }
+          let rolledBack = false;
+          const rollbackOnce = () => {
+            if (rolledBack) return;
+            rolledBack = true;
+            offer.rollback();
+          };
+          rollbackOffers.push(rollbackOnce);
+
+          let recorded: OutcomeRecordResult | undefined;
+          try {
+            recorded = await deps.outcomeStore.record(accountId, key, "accepted");
+          } catch {
+            warnOutcomeFailure(accountId, "adapter-record-accepted");
+            // A thrown storage adapter is the same unresolved classification as
+            // `{status:"unknown"}` and blocks this suffix.
+          }
+          if (!isActive() || !retainedItem.isActive()) {
+            if (recorded?.status === "recorded") await recorded.write.rollback();
+            // Keep the provisional offer/reservation physically owned until the
+            // invalidated footer has released every earlier outcome gate and the
+            // cancellation callback settles; footer rolls this offer back.
+            fifoBlocked = true;
+          } else if (recorded?.status === "recorded") {
+            pendingWrites.push(recorded.write);
+            commitOffers.push(offer.commit);
+            ack.add(id);
+          } else {
+            rollbackOnce();
+            fifoBlocked = true;
+          }
+        }
+
+        // `/stop` or peer retirement can invalidate an earlier committed offer
+        // while this same batch is stalled on a later lookup/write. Nothing in
+        // an invalidated generation may reach the dispatcher or publish its
+        // normal result. Cancellation keeps accepted markers as tombstones;
+        // teardown removes them so a replacement runtime is not poisoned.
+        const invalidated = !isActive() || retained.some((entry) => !entry.isActive());
+        if (invalidated) {
+          // Release key-operation gates through exact-write rollback before
+          // waiting for cancellation, whose accepted replacement write may be
+          // queued behind one of them.
+          await rollbackWrites();
+          await Promise.all(
+            retained
+              .filter((entry) => entry.isCancellationRequested())
+              .map((entry) => entry.waitForCancellation()),
+          );
+          for (const rollback of rollbackOffers) rollback();
+          for (const release of deferredReleases) release();
+          finalized = true;
+          return;
+        }
+        for (const write of pendingWrites) write.commit();
+        for (const commit of commitOffers) commit();
+        ack.finish();
+        rejected.finish();
+        for (const release of deferredReleases) release();
+        finalized = true;
+      } finally {
+        if (!finalized) await rollbackBatch();
+        lease.finish();
+      }
+      return;
+    }
+
+    if (!checkAndRecord || !dispatch || !coalesce) {
+      throw new Error("createIngressOnFlush requires either outcome/lease or legacy dedupe dependencies");
+    }
+    const rawItems = items.map((value) => "item" in value ? value.item : value);
     // P0-7b ack first — see the doc. Ack is receipt of ADMISSION and covers all
     // id-carrying items regardless of the dedupe outcome, so it runs before the
     // fresh-filter. Guard `items[0]` (an empty flush never fires, but stay total).
-    const anchor = items[0];
+    // Cancel fallback lookup is deliberately first. A hit represents text that
+    // /stop already killed, so it must never reach ordinary ack/dedupe/dispatch.
+    const ordinary: T[] = [];
+    for (const item of rawItems) {
+      if (!isActive()) return;
+      const key = ingressDedupeKey(item);
+      if (!key || !cancelledFallback?.has(key, accountId)) {
+        ordinary.push(item);
+        continue;
+      }
+      let recorded = false;
+      try {
+        await checkAndRecord(key, { namespace: accountId });
+        if (!isActive()) return;
+        recorded = true;
+      } catch {
+        if (!isActive()) return;
+        logWarn?.("webchannel: cancelled-inbound fallback outcome retry failed");
+      }
+      const id = item.message.id as string;
+      if (!isActive()) return;
+      const acked = sendAck?.(item.peerId, [id]) ?? false;
+      if (!acked) logWarn?.("webchannel: cancelled-inbound fallback result delivery failed");
+      if (recorded && acked) cancelledFallback.delete(key, accountId);
+    }
+
+    const anchor = ordinary[0];
+    if (!isActive()) return;
     if (anchor && sendAck) {
       const ackIds = [
         ...new Set(
-          items
+          ordinary
             .map((i) => i.message.id)
             .filter((id): id is string => typeof id === "string" && id.length > 0),
         ),
       ];
-      if (ackIds.length > 0) sendAck(anchor.peerId, ackIds);
+      if (ackIds.length > 0 && !sendAck(anchor.peerId, ackIds)) {
+        logWarn?.(`webchannel: ingress admission ack failed for peer=${anchor.peerId} ids=${ackIds.join(",")}`);
+      }
     }
-    const fresh = await filterFreshInboundItems(items, accountId, checkAndRecord, sinks);
+    const fresh = await filterFreshInboundItems(
+      ordinary,
+      accountId,
+      checkAndRecord,
+      sinks,
+      isActive,
+    );
+    if (!isActive()) return;
     const first = fresh[0];
     if (!first) return;
+    if (!isActive()) return;
     dispatch(first.peerId, coalesce(fresh.map((i) => i.message)));
   };
 }
@@ -249,8 +608,9 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
  * ack-first is safe — here the message was KILLED, so a pre-record replay would
  * wrongly run it.)
  *
- * Best-effort by design (the caller fires this from the sync-shaped `onCancel`
- * hook, fire-and-forget): a record that throws is swallowed with a WARN
+ * The bounded debouncer awaits this handler on behalf of every cancelled entry,
+ * retaining its reservation until persistence and result delivery settle. A
+ * record that throws is swallowed with a WARN
  * (`logWarn`, matching the fail-open severity split in `filterFreshInboundItems`)
  * and does NOT block the ack — a lost record only re-opens the pre-existing
  * pre-P0-7b replay window (a replay could run), which is strictly no worse than
@@ -263,26 +623,49 @@ export async function recordCancelledInboundItems<T extends IngressDedupeItem>(
   items: readonly T[],
   accountId: string,
   checkAndRecord: IngressDedupeCheck,
-  sendAck: (peerId: string, ids: string[]) => void,
+  sendAck: (peerId: string, ids: string[]) => boolean,
   logWarn?: (message: string) => void,
+  cancelledFallback?: CancelledInboundFallbackTombstones,
+  canPublish: () => boolean = () => true,
 ): Promise<void> {
   const idsByPeer = new Map<string, string[]>();
   for (const item of items) {
-    const id = item.message.id;
-    if (!id) continue; // id-less: not replayable by the client — nothing to do.
+    if (!canPublish()) return;
+    const key = ingressDedupeKey(item);
+    if (!key) continue; // id-less/non-conforming: never persist or retain it.
+    const id = item.message.id as string;
+    let suppressionReady = false;
     try {
-      await checkAndRecord(`${item.peerId}:${id}`, { namespace: accountId });
-    } catch (err) {
-      logWarn?.(
-        `webchannel: cancelled-inbound dedupe record failed for peer=${item.peerId} id=${id} ` +
-          `(best-effort — the ack still drains the ledger): ${String(err)}`,
-      );
+      await checkAndRecord(key, { namespace: accountId });
+      if (!canPublish()) return;
+      suppressionReady = true;
+    } catch {
+      if (!canPublish()) return;
+      logWarn?.("webchannel: cancelled-inbound suppression record failed; result delivery remains best-effort");
+      cancelledFallback?.add(key, accountId);
     }
+    if (!suppressionReady) cancelledFallback?.add(key, accountId);
     // Ack regardless of the record outcome: the ack drains the client ledger, and
     // the record is the fallback for when the ack cannot reach a disconnected client.
     const ids = idsByPeer.get(item.peerId) ?? [];
     ids.push(id);
     idsByPeer.set(item.peerId, ids);
   }
-  for (const [peerId, ids] of idsByPeer) sendAck(peerId, ids);
+  for (const [peerId, ids] of idsByPeer) {
+    if (!canPublish()) return;
+    if (!sendAck(peerId, ids)) {
+      logWarn?.("webchannel: cancelled-inbound result delivery failed");
+    }
+  }
 }
+import type { RetainedDebounceEntry } from "./bounded-inbound-debouncer.js";
+import type { DispatcherBatchLease } from "./inbound-queue.js";
+import type {
+  IngressOutcomeStore,
+  OutcomeLookup,
+  OutcomeRecordResult,
+  OutcomeWriteReceipt,
+} from "./ingress-outcome.js";
+import { createRateLimitedOutcomeFailureWarning } from "./ingress-outcome.js";
+import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
+import type { IngressResultFrame } from "./ingress-result-chunks.js";

@@ -53,10 +53,9 @@ function makePayload(
   const verifiedJwtPayload: Record<string, unknown> = {
     iss: "https://saas.example.com/",
     sub: "user-42",
-    aud: "openclaw-webchannel",
+    aud: "agent-abc",
     exp: Math.floor(Date.now() / 1000) + 300,
     iat: Math.floor(Date.now() / 1000),
-    accountId: "agent-abc",
     tenant: "tenant-xyz",
     cnf: {
       jwk: {

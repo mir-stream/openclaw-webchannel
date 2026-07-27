@@ -1,18 +1,87 @@
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 
 // Mock node:fs so status's "creds already exist" probe is controllable and never
 // touches the real home dir.
-const existsMock = vi.fn((_p: string) => false);
+const readMock = vi.fn((_p: string) => "");
+const rootDirectoryStat = {
+  dev: 1,
+  ino: 1,
+  isDirectory: () => true,
+  isSymbolicLink: () => false,
+};
+const lstatMock = vi.fn((path: string) => {
+  if (path === "/") return rootDirectoryStat;
+  throw Object.assign(new Error("missing"), { code: "ENOENT" });
+});
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, existsSync: (p: string) => existsMock(p) };
+  return {
+    ...actual,
+    readFileSync: (p: string) => readMock(p),
+    lstatSync: (p: string) => lstatMock(p),
+  };
 });
+vi.mock("./legacy-storage-migration.js", () => ({
+  migrateLegacyTupleState: () => ({
+    status: "not-needed",
+    credential: "absent",
+    conversationKeys: "absent",
+  }),
+}));
 
 import { buildFullAccountPatch } from "./setup.js";
-import { resolveAdmissionMode } from "./nats-admission.js";
 import { webchannelSetupWizard, validateHttpUrl } from "./setup-wizard.js";
-import { WebChannelTransport } from "./transport.js";
+import { NullPeerChannel } from "./channel-contract.js";
 import { createWebChannelPlugin } from "./channel.js";
+import { createCredentialIdentityForEnrollment } from "./credential-document.js";
+import { generateKeyPair } from "./e2e-crypto.js";
+
+const CREDENTIAL_PAIR = generateKeyPair();
+const CREDENTIAL_KEY = Buffer.from(CREDENTIAL_PAIR.publicKey).toString("base64url");
+const CREDENTIAL_PRIVATE_KEY = Buffer.from(CREDENTIAL_PAIR.privateKey).toString("base64url");
+
+function boundCredentialJson(
+  overrides: Partial<{
+    tenant: string;
+    accountId: string;
+    saasBaseUrl: string;
+  }> = {},
+): string {
+  const identity = {
+    tenant: overrides.tenant ?? "tenant-a",
+    accountId: overrides.accountId ?? "accta",
+    saasBaseUrl: overrides.saasBaseUrl ?? "https://saas.example",
+  };
+  return JSON.stringify({
+    credentialIdentity: createCredentialIdentityForEnrollment({
+      ...identity,
+      relayUrl: "wss://relay.example",
+      agentPublicKey: CREDENTIAL_KEY,
+    }),
+    identityKey: {
+      publicKey: CREDENTIAL_KEY,
+      privateKey: CREDENTIAL_PRIVATE_KEY,
+    },
+    enrollment: {
+      creds: { userJwt: "JWT", userSeed: "SEED" },
+      peerId: "peer-a",
+      jwksUrl: "https://keys.example/jwks",
+      bootstrapUrl: "https://bootstrap.example",
+      natsUrl: "wss://relay.example",
+    },
+    tenant: identity.tenant,
+    accountId: identity.accountId,
+    saasEnrollUrl: `${identity.saasBaseUrl}/api/enroll`,
+    saasPollUrl: `${identity.saasBaseUrl}/api/poll`,
+  });
+}
+
+beforeEach(() => {
+  readMock.mockReset();
+  readMock.mockImplementation(() => {
+    throw Object.assign(new Error("missing"), { code: "ENOENT" });
+  });
+});
 
 type Cfg = { channels: { webchannel?: Record<string, unknown> } };
 function account(next: unknown, accountId: string): Record<string, unknown> {
@@ -24,7 +93,7 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
   it("(a) with NO issuer/audience: OMITS all JWT-verify params (they derive at runtime)", () => {
     // Trust-anchor change 2: the builder no longer GUESSES issuer/jwksUrl/audience.
     // It emits `auth.strategy:"jwt"` but NO `auth.jwt` sub-object — the runtime
-    // deriver (`deriveAccountAuth`) fills issuer=saas.baseUrl, audience=accountId,
+    // deriver fills issuer=saas.baseUrl; the verifier binds aud to accountId,
     // jwksUrl=saas.baseUrl+/.well-known/jwks.json from the anchor. What stays: the
     // anchor (saas.baseUrl), strategy, admission=register-hop, enrolled creds,
     // dmSecurity=open. Mirrors e2e/local/run-demo-synadia.sh MINUS nats.url
@@ -54,16 +123,15 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
     expect((patch.auth as { jwt?: unknown }).jwt).toBeUndefined();
   });
 
-  it("(b) with explicit issuer + audience OPERATOR PINS: writes them (pin honored), but never jwksUrl", () => {
+  it("(b) with an explicit issuer pin writes it but never audience/jwksUrl", () => {
     const patch = buildFullAccountPatch({
       tenant: "default-tenant",
       saasBaseUrl: "http://host.docker.internal:3951",
       accountId: "default-agent",
       issuer: "http://127.0.0.1:3951",
-      audience: "default-agent",
     });
     expect((patch.auth as { jwt: { issuer: string } }).jwt.issuer).toBe("http://127.0.0.1:3951");
-    expect((patch.auth as { jwt: { audience: string } }).jwt.audience).toBe("default-agent");
+    expect((patch.auth as { jwt: Record<string, unknown> }).jwt).not.toHaveProperty("audience");
     // jwksUrl is NEVER written by the builder anymore — it derives at runtime.
     expect((patch.auth as { jwt: { jwksUrl?: unknown } }).jwt.jwksUrl).toBeUndefined();
   });
@@ -92,34 +160,6 @@ describe("setup-wizard: buildFullAccountPatch (ground-truth demo block)", () => 
     expect((patch.nats as { admission: string }).admission).toBe("register-hop");
   });
 
-  it("the builder's output round-trips through resolveAdmissionMode to register-hop", () => {
-    // End-to-end: the emitted block (jwt auth + enrolled creds + the explicit
-    // override) is exactly what the per-account serving loop feeds resolveAdmissionMode,
-    // and it must resolve to register-hop — the override and the inference agree.
-    const patch = buildFullAccountPatch({
-      tenant: "t",
-      saasBaseUrl: "http://s",
-      accountId: "acct",
-    });
-    const auth = patch.auth as { strategy: string };
-    const nats = patch.nats as {
-      admission: "auto" | "register-hop";
-      credentials: { mode: string };
-    };
-    // enrolled creds ⇒ a register hop is viable (registerHopAvailable = mode !== "static").
-    const registerHopAvailable = nats.credentials.mode !== "static";
-    const resolved = resolveAdmissionMode({
-      authStrategy: auth.strategy,
-      registerHopAvailable,
-      explicitOverride: nats.admission,
-    });
-    expect(resolved).toBe("register-hop");
-    // …and even WITHOUT the explicit override the inference alone would pick it,
-    // proving the pin matches (not overrides) the intended default.
-    expect(
-      resolveAdmissionMode({ authStrategy: auth.strategy, registerHopAvailable }),
-    ).toBe("register-hop");
-  });
 });
 
 describe("setup-wizard: declarative detection", () => {
@@ -132,24 +172,226 @@ describe("setup-wizard: declarative detection", () => {
     expect(webchannelSetupWizard.channel).toBe("webchannel");
   });
 
-  it("status.resolveConfigured is true once auth.jwt is present", () => {
-    existsMock.mockReturnValue(false);
+  it("status.resolveConfigured does not let auth.jwt bypass enrolled credentials", () => {
     const cfg = {
       channels: { webchannel: { accounts: { accta: { auth: { jwt: {} } } } } },
     } as never;
-    expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(true);
+    expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(false);
   });
 
   it("status.resolveConfigured is false when neither auth.jwt nor creds exist", () => {
-    existsMock.mockReturnValue(false);
     const cfg = { channels: { webchannel: { accounts: { accta: {} } } } } as never;
     expect(webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" })).toBe(false);
+  });
+
+  it.each([42, "relative/state"])(
+    "status.resolveConfigured contains invalid storageRoot %j",
+    (storageRoot) => {
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              accta: {
+                tenant: "tenant-a",
+                storageRoot,
+                saas: { baseUrl: "https://saas.example" },
+              },
+            },
+          },
+        },
+      } as never;
+      expect(
+        webchannelSetupWizard.status.resolveConfigured({
+          cfg,
+          accountId: "accta",
+        }),
+      ).toBe(false);
+      expect(readMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("status is not configured when the credential store is unreadable", () => {
+    readMock.mockImplementation(() => {
+      throw Object.assign(new Error("SECRET permission detail"), {
+        code: "EACCES",
+      });
+    });
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "tenant-a",
+              saas: { baseUrl: "https://saas.example" },
+            },
+          },
+        },
+      },
+    } as never;
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(false);
+  });
+
+  it("status.resolveConfigured requires a complete matching credential document, not path existence", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "tenant-a",
+              saas: { baseUrl: "https://saas.example" },
+              auth: { jwt: { issuer: "https://issuer.example" } },
+            },
+          },
+        },
+      },
+    } as never;
+
+    readMock.mockReturnValue("not-json");
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(false);
+
+    readMock.mockReturnValue(boundCredentialJson({ tenant: "other-tenant" }));
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(false);
+
+    readMock.mockReturnValue(boundCredentialJson());
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(true);
+  });
+
+  it("status validates against the effective nats.credentials SaaS override", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              tenant: "tenant-a",
+              saas: { baseUrl: "https://saas-a.example" },
+              nats: {
+                credentials: {
+                  mode: "enrolled",
+                  saasBaseUrl: "https://saas-b.example",
+                },
+              },
+              auth: { jwt: { issuer: "https://issuer.example" } },
+            },
+          },
+        },
+      },
+    } as never;
+
+    readMock.mockReturnValue(
+      boundCredentialJson({ saasBaseUrl: "https://saas-a.example" }),
+    );
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" }),
+    ).toBe(false);
+
+    readMock.mockReturnValue(
+      boundCredentialJson({ saasBaseUrl: "https://saas-b.example" }),
+    );
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({ cfg, accountId: "accta" }),
+    ).toBe(true);
+  });
+
+  it("status preserves a valid case-sensitive existing account id and path", async () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            Account_A: {
+              tenant: "tenant-a",
+              saas: { baseUrl: "https://saas.example" },
+            },
+          },
+        },
+      },
+    } as never;
+    readMock.mockReturnValue(boundCredentialJson({ accountId: "Account_A" }));
+
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "Account_A",
+      }),
+    ).toBe(true);
+    expect(readMock).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /\/\.openclaw-webchannel-v2\/v2_[A-Za-z0-9_-]{43}\/credentials\.json$/,
+      ),
+    );
+    const lines = await Promise.resolve(
+      webchannelSetupWizard.status.resolveStatusLines!({
+        cfg,
+        accountId: "Account_A",
+        configured: true,
+      }),
+    );
+    expect(lines[0]).toContain("WebChannel (Account_A): configured");
+  });
+
+  it("status rejects invalid exact account ids without canonicalizing them", async () => {
+    const cfg = { channels: { webchannel: {} } } as never;
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "../../unsafe",
+      }),
+    ).toBe(false);
+    expect(readMock).not.toHaveBeenCalled();
+    const lines = await Promise.resolve(
+      webchannelSetupWizard.status.resolveStatusLines!({
+        cfg,
+        accountId: "../../unsafe",
+        configured: true,
+      }),
+    );
+    expect(lines[0]).toContain("not configured — invalid account id");
+  });
+
+  it("status rejects an unknown explicit credential mode even with auth.jwt", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            accta: {
+              auth: { jwt: {} },
+              nats: { credentials: { mode: "bogus" } },
+            },
+          },
+        },
+      },
+    } as never;
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg,
+        accountId: "accta",
+      }),
+    ).toBe(false);
   });
 });
 
 describe("setup-wizard: constructed plugin exposes setupWizard", () => {
   it("forwards setupWizard through createChannelPluginBase", () => {
-    const plugin = createWebChannelPlugin(new WebChannelTransport());
+    const plugin = createWebChannelPlugin(new NullPeerChannel());
     expect(plugin.setupWizard).toBeDefined();
     expect((plugin.setupWizard as { channel?: string }).channel).toBe("webchannel");
     expect(plugin.setupWizard).toBe(webchannelSetupWizard);
@@ -196,18 +438,18 @@ describe("setup-wizard: per-field funnel safety", () => {
     });
   });
 
-  it("finalize derives a CANONICAL audience/account key for a mixed-case account id", () => {
+  it("finalize uses the CANONICAL account key without persisting a separate audience", () => {
     const cfg = { channels: { webchannel: { accounts: {} } } } as never;
     const finalized = webchannelSetupWizard.finalize?.({
       cfg,
       accountId: "AcctA",
-      // audience is the default the wizard surfaces = canonical(accountId).
-      credentialValues: { tenant: "t", saasBaseUrl: "http://s", audience: "accta" },
+      credentialValues: { tenant: "t", saasBaseUrl: "http://s" },
     } as never) as { cfg: unknown };
-    // Written under the canonical key, and aud matches that key.
+    // The account key is the JWT audience; there is no independently writable
+    // audience field that can drift from it.
     const written = account(finalized.cfg, "accta");
     expect(written).toBeDefined();
-    expect((written.auth as { jwt: { audience: string } }).jwt.audience).toBe("accta");
+    expect((written.auth as { jwt?: Record<string, unknown> }).jwt?.audience).toBeUndefined();
   });
 
   it("finalize NEVER writes an issuer pin — even if a stray issuer value is collected", () => {
@@ -272,5 +514,9 @@ describe("setup-wizard: validateHttpUrl", () => {
   it("rejects unparseable / empty input", () => {
     expect(validateHttpUrl("notaurl")).toBeDefined();
     expect(validateHttpUrl("")).toBeDefined();
+    expect(validateHttpUrl(" https://saas.example")).toBeDefined();
+    expect(validateHttpUrl("https://saas.example?token=secret")).toBeDefined();
+    expect(validateHttpUrl("https://saas.example#fragment")).toBeDefined();
+    expect(validateHttpUrl("https://user:secret@saas.example")).toBeDefined();
   });
 });

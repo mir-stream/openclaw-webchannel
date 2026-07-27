@@ -9,6 +9,7 @@
  *   node dist/examples/enrollment-example.ts
  *
  * ENVIRONMENT VARIABLES:
+ *   SAAS_BASE_URL     - SaaS identity base (default: http://localhost:3000)
  *   SAAS_ENROLL_URL   - SaaS enrollment endpoint (default: http://localhost:3000/api/enroll)
  *   SAAS_POLL_URL     - SaaS poll endpoint (default: http://localhost:3000/api/poll)
  *   NATS_URL          - NATS WebSocket URL (default: wss://nats.example.com)
@@ -32,8 +33,9 @@ import { createEnrolledNatsConnection } from "../src/enrolled-nats-connection.js
 // Configuration
 // ---------------------------------------------------------------------------
 
-const SAAS_ENROLL_URL = process.env.SAAS_ENROLL_URL || "http://localhost:3000/api/enroll";
-const SAAS_POLL_URL = process.env.SAAS_POLL_URL || "http://localhost:3000/api/poll";
+const SAAS_BASE_URL = process.env.SAAS_BASE_URL || "http://localhost:3000";
+const SAAS_ENROLL_URL = process.env.SAAS_ENROLL_URL || `${SAAS_BASE_URL}/api/enroll`;
+const SAAS_POLL_URL = process.env.SAAS_POLL_URL || `${SAAS_BASE_URL}/api/poll`;
 const NATS_URL = process.env.NATS_URL || "wss://nats.example.com";
 const TENANT = process.env.TENANT || "demo-tenant";
 const ACCOUNT_ID = process.env.ACCOUNT_ID || "demo-account";
@@ -49,6 +51,7 @@ async function main() {
   console.log("==============================================");
   console.log("");
   console.log("Configuration:");
+  console.log(`  SaaS Base URL:   ${SAAS_BASE_URL}`);
   console.log(`  SaaS Enroll URL: ${SAAS_ENROLL_URL}`);
   console.log(`  SaaS Poll URL:   ${SAAS_POLL_URL}`);
   console.log(`  NATS URL:        ${NATS_URL}`);
@@ -66,6 +69,7 @@ async function main() {
     console.log("[1] Checking for existing credentials...");
 
     const enrollmentClient = new EnrollmentClient({
+      saasBaseUrl: SAAS_BASE_URL,
       saasEnrollUrl: SAAS_ENROLL_URL,
       saasPollUrl: SAAS_POLL_URL,
       tenant: TENANT,
@@ -182,7 +186,9 @@ async function main() {
     console.log("  ✓ Reconnection without re-pairing");
     console.log("");
     console.log("Credential storage:");
-    console.log("  Location: ~/.openclaw-webchannel/credentials.json");
+    console.log(
+      "  Location: ~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json",
+    );
     console.log("  Permissions: 0o600 (owner read/write only)");
     console.log("  Contains: Identity key + NATS creds + metadata");
     console.log("");

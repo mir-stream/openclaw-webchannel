@@ -4,7 +4,7 @@
  * login → typing → streaming progress draft → real-LLM answer, HITL approval
  * cards, history hydration, and honest status/terminal-error surfacing.
  *
- * The full connect handshake is production: generate device keys in-page, mint
+ * The full connect registration is production: generate device keys in-page, mint
  * browser NATS creds + a PoP bootstrap JWT from the SaaS, then drive the wrapper
  * with BOTH natsCredentials (NATS-layer NKEY auth) and registration (PoP register
  * hop over NATS request/reply). The Ed25519 PoP private key is non-extractable
@@ -12,14 +12,23 @@
  *
  * Scene ⑤ (short-lived trust): the "short-lived" control reconnects the lane with
  * a short-TTL NATS credential. When it lapses the relay refuses it, the client
- * classifies `-ERR Authentication Expired` as TERMINAL (no eternal spinner), and
- * the widget shows a distinct "credentials expired" state with a one-click
- * re-authenticate that mints a fresh, normal credential.
+ * classifies `-ERR Authentication Expired` as TERMINAL (no eternal spinner) with
+ * cause `auth-expired`. The terminal error box (P1-7) is cause-driven: it maps the
+ * `state.errorCause` tag to truthful wording + the right recovery affordance via
+ * `terminalErrorCopy`, so scene ⑤ shows "Credentials expired" + re-authenticate,
+ * while a protocol mismatch or embedder config error shows its own heading and
+ * hides the (useless) re-auth button.
  */
 import { WebChannelNATSClient, filterCommandCatalog } from "../../../packages/client/src/index.js";
-import type { WebChannelState, ApprovalRequest } from "../../../packages/client/src/types.js";
+import type { WebChannelState, ApprovalRequest, ChatMessage } from "../../../packages/client/src/types.js";
 import { api, b64url, el, type DemoConfig } from "./config.js";
 import { renderMarkdown } from "./markdown.js";
+import { terminalErrorCopy } from "./error-copy.js";
+import {
+  orderConversationPresentation,
+  captureOpenReasoningIds,
+  buildReasoningDetails,
+} from "./presentation.js";
 
 const STATUS_LABEL: Record<WebChannelState["status"], string> = {
   connecting: "connecting…",
@@ -147,6 +156,66 @@ export async function createWidget(
     );
   }
 
+  // P1-9: a HELD (pending) user message — a dimmed chip with the "queued" hint
+  // and a ✕ to retract it BEFORE it publishes (the local twin of the server-side
+  // coalesce buffer; retracting means the agent never sees the text).
+  function renderPendingBubble(m: ChatMessage): HTMLElement {
+    const dismiss = el("button", {
+      title: "retract",
+      style: "background:transparent;border:none;color:inherit;cursor:pointer;font-size:12px;padding:0 2px",
+    }, ["✕"]) as HTMLButtonElement;
+    dismiss.onclick = () => client?.retract(m.id);
+    return el("div", {
+      style:
+        "align-self:flex-end;max-width:85%;padding:8px 11px;border-radius:10px;" +
+        "font-size:13px;white-space:pre-wrap;background:var(--accent);color:#fff;opacity:.55",
+    }, [
+      el("div", {}, [m.text]),
+      el("div", {
+        style: "display:flex;align-items:center;gap:6px;margin-top:4px;font-size:11px;opacity:.9",
+      }, [
+        el("span", { style: "flex:1" }, ["⏳ queued — sends when the agent finishes"]),
+        dismiss,
+      ]),
+    ]);
+  }
+
+  // P1-9 §3.4: a RETRACTED user message — an explicit /stop marked it "not sent"
+  // instead of destroying it (client-held text exists nowhere else). Struck and
+  // dimmed, with a one-tap RESTORE (into the composer, appended so it never
+  // clobbers a draft the user is mid-typing) and a ✕ to dismiss it for good.
+  function renderRetractedBubble(m: ChatMessage): HTMLElement {
+    const restore = el("button", {
+      style: "background:transparent;border:none;color:var(--accent);cursor:pointer;font-size:11px;padding:0",
+    }, ["restore"]) as HTMLButtonElement;
+    restore.onclick = () => {
+      input.value = input.value.trim() ? `${input.value} ${m.text}` : m.text;
+      input.focus();
+      client?.retract(m.id);
+      renderMenu();
+    };
+    const dismiss = el("button", {
+      title: "dismiss",
+      style: "background:transparent;border:none;color:inherit;cursor:pointer;font-size:12px;padding:0 2px",
+    }, ["✕"]) as HTMLButtonElement;
+    dismiss.onclick = () => client?.retract(m.id);
+    return el("div", {
+      style:
+        "align-self:flex-end;max-width:85%;padding:8px 11px;border-radius:10px;" +
+        "font-size:13px;white-space:pre-wrap;background:#21262d;border:1px solid var(--border);" +
+        "color:var(--muted);opacity:.7",
+    }, [
+      el("div", { style: "text-decoration:line-through" }, [m.text]),
+      el("div", {
+        style: "display:flex;align-items:center;gap:8px;margin-top:4px;font-size:11px",
+      }, [
+        el("span", { style: "flex:1" }, ["not sent — stopped"]),
+        restore,
+        dismiss,
+      ]),
+    ]);
+  }
+
   function render(state: WebChannelState): void {
     statusPill.textContent = `● ${STATUS_LABEL[state.status]}`;
     statusPill.style.color =
@@ -154,16 +223,25 @@ export async function createWidget(
       : state.status === "error" ? "var(--bad)"
       : "var(--warn)";
 
-    // Terminal error → distinct "credentials expired" box with a re-auth button
-    // (scene ⑤ honest terminal-error UX — NOT the reconnect spinner).
+    // Terminal error → cause-driven box (P1-7): the heading/hint and whether a
+    // Re-authenticate button is offered come from `terminalErrorCopy(errorCause)`,
+    // so a protocol mismatch or embedder config error no longer masquerades as the
+    // single hardcoded "Credentials expired" state. The raw `state.error` detail
+    // line renders ONLY when present; the copy.hint always renders exactly once
+    // (no duplicate). NOT the reconnect spinner.
     if (state.status === "error") {
-      const reauth = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
-      reauth.onclick = () => { void connectLane(); };
-      errBox.replaceChildren(
-        el("div", { style: "font-weight:600;margin-bottom:4px" }, ["Credentials expired"]),
-        el("div", {}, [state.error ?? "the relay rejected the credential — re-authenticate to continue"]),
-        reauth,
-      );
+      const copy = terminalErrorCopy(state.errorCause);
+      const children: Node[] = [
+        el("div", { style: "font-weight:600;margin-bottom:4px" }, [copy.heading]),
+      ];
+      if (state.error) children.push(el("div", {}, [state.error]));
+      children.push(el("div", { style: "color:var(--muted);margin-top:4px" }, [copy.hint]));
+      if (copy.showReauth) {
+        const reauth = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
+        reauth.onclick = () => { connectLaneGuarded(); };
+        children.push(reauth);
+      }
+      errBox.replaceChildren(...children);
       errBox.classList.remove("hidden");
       input.disabled = true;
       sendBtn.disabled = true;
@@ -188,8 +266,27 @@ export async function createWidget(
     // Carry markdown hits over from the previous pass; misses re-parse. Assigned
     // to `mdCache` after the list is built so it tracks only the live transcript.
     const nextMdCache = new Map<string, HTMLElement>();
-    const bubbles = state.messages.map((m) => {
+    const openReasoningIds = captureOpenReasoningIds(list);
+    const bubbles: HTMLElement[] = [];
+    for (const presentation of orderConversationPresentation(state.messages, state.reasoning)) {
+      if (presentation.kind === "reasoning") {
+        const item = presentation.value;
+        const key = `reasoning:${item.id}\n${item.text}`;
+        const rendered = mdCache.get(key) ?? renderMarkdown(item.text);
+        nextMdCache.set(key, rendered);
+        bubbles.push(
+          buildReasoningDetails(item, rendered, openReasoningIds.has(item.id)),
+        );
+        continue;
+      }
+      const m = presentation.value;
       const isUser = m.role === "user";
+      // P1-9: held/retracted user messages get their own affordance-bearing
+      // bubbles (queued chip / not-sent marker), not the plain send bubble.
+      if (isUser && (m.pending || m.retracted)) {
+        bubbles.push(m.pending ? renderPendingBubble(m) : renderRetractedBubble(m));
+        continue;
+      }
       // User bubbles stay plain-text (pre-wrap keeps their line breaks). Agent
       // bubbles — including `working` streaming drafts — render markdown to DOM;
       // the renderer handles line breaks itself, so no pre-wrap (it'd double up).
@@ -202,7 +299,7 @@ export async function createWidget(
         nextMdCache.set(key, rendered);
         child = rendered;
       }
-      return el(
+      bubbles.push(el(
         "div",
         {
           style:
@@ -215,9 +312,19 @@ export async function createWidget(
             (m.working ? ";opacity:.7;font-style:italic" : ""),
         },
         [child],
-      );
-    });
-    if (state.isTyping) {
+      ));
+    }
+
+    // P1-9: skip pending/retracted bubbles — they have no turnId, and letting one
+    // become `latestUser` would resurrect the "agent is typing…" line next to a
+    // live reasoning lane.
+    const latestUser = [...state.messages].reverse().find(
+      (m) => m.role === "user" && !m.pending && !m.retracted,
+    );
+    const reasoningReplacesTypingText = Boolean(
+      latestUser?.turnId && state.reasoning.some((item) => item.turnId === latestUser.turnId),
+    );
+    if (state.isTyping && !reasoningReplacesTypingText) {
       bubbles.push(
         el("div", { style: "align-self:flex-start;font-size:12px;color:var(--muted)" }, ["agent is typing…"]),
       );
@@ -348,7 +455,7 @@ export async function createWidget(
         // The register subject is derived from tenant/accountId/peerId; the
         // client drives challenge→register over NATS request/reply (no gateway URL).
         devicePrivateKey: ed25519.privateKey,
-        // Phase 6: register-delivered conversation key (no handshake).
+        // Phase 6: register-delivered conversation key (no registration).
         deviceX25519PrivateKey: x25519.privateKey,
         // F2: pin the SaaS-attested agent key for K authentication.
         pinnedAgentPublicKey: boot.data.agentPublicKey,
@@ -362,12 +469,41 @@ export async function createWidget(
     client.connect();
   }
 
+  /**
+   * Fire-and-forget lane (re)connect. A failed re-auth (the /nats-user or
+   * /bootstrap SaaS fetch) rejects BEFORE any client exists, so no state event
+   * renders it — without this catch the errBox stays hidden and the pill sticks
+   * on "connecting…". Renders the failure into errBox with a retry that repeats
+   * the SAME request (incl. scene ⑤'s short TTL).
+   */
+  function connectLaneGuarded(ttlSeconds?: number): void {
+    connectLane(ttlSeconds).catch((err: unknown) => {
+      statusPill.textContent = "● error";
+      statusPill.style.color = "var(--bad)";
+      const retry = el("button", { class: "primary", style: "margin-top:8px;font-size:12px" }, ["Re-authenticate"]) as HTMLButtonElement;
+      retry.onclick = () => { connectLaneGuarded(ttlSeconds); };
+      errBox.replaceChildren(
+        el("div", { style: "font-weight:600;margin-bottom:4px" }, ["Re-authentication failed"]),
+        el("div", {}, [err instanceof Error ? err.message : String(err)]),
+        el("div", { style: "color:var(--muted);margin-top:4px" }, ["The auth endpoint could not be reached — try again."]),
+        retry,
+      );
+      errBox.classList.remove("hidden");
+      input.disabled = true;
+      sendBtn.disabled = true;
+    });
+  }
+
   // ── Wiring ────────────────────────────────────────────────────────────────
   historyBtn.onclick = () => {
-    const oldest = client?.getState().messages.find((m) => !m.working);
+    // P1-9: a local-only id (held pending / retracted) must never be sent as a
+    // `before` cursor — exclude them from the oldest-cursor pick.
+    const oldest = client?.getState().messages.find(
+      (m) => !m.working && !m.pending && !m.retracted,
+    );
     client?.loadHistory({ before: oldest?.id, limit: 20 });
   };
-  shortBtn.onclick = () => { void connectLane(SHORT_TTL_SECONDS); };
+  shortBtn.onclick = () => { connectLaneGuarded(SHORT_TTL_SECONDS); };
   const submit = () => {
     const text = input.value.trim();
     if (!text) return;

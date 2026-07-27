@@ -4,15 +4,12 @@ import { fileURLToPath } from "node:url";
 import { describe, it, expect } from "vitest";
 
 /**
- * SOURCE-CONTRACT guard for `index-nats.ts` wiring — a deliberate STOPGAP.
+ * Narrow source-contract guard for stable adapter wiring. Lifecycle behavior is
+ * covered through the executable seams in nats-account-runtime.test.ts.
  *
- * `index-nats.ts` is the gateway plugin entry. It is OUTSIDE tsconfig (tsc-blind)
- * AND cannot be imported by a unit test — evaluating it runs side-effectful
- * gateway setup. So the whole class of bug where a capability GATE exists on the
- * channel but is never wired (or is wired against the wrong config) recurs
- * silently: nothing type-checks it and nothing exercises it. Until the tsconfig
- * closure lands (issue #32), this test reads the entry file AS TEXT and pins the
- * shape of the load-bearing wiring lines with formatting-tolerant regexes.
+ * The root entry is deliberately a thin re-export. The runtime is part of the
+ * TypeScript closure and executable lifecycle tests cover ownership; the few
+ * source checks below retain only older adapter-wiring contracts.
  *
  * IMPORTANT: these assertions pin WIRING SHAPE, not behavior — the behavior of
  * `resolveTypingEnabled` is covered by account-config's own tests. If a wiring
@@ -22,16 +19,25 @@ import { describe, it, expect } from "vitest";
  */
 
 /** Read the entry source exactly once; every contract asserts against this text. */
-const INDEX_NATS_SOURCE = readFileSync(
-  fileURLToPath(new URL("../index-nats.ts", import.meta.url)),
+const RUNTIME_SOURCE = readFileSync(
+  fileURLToPath(new URL("./nats-account-runtime.ts", import.meta.url)),
   "utf8",
 );
+const ENTRY_SOURCE = readFileSync(fileURLToPath(new URL("../index-nats.ts", import.meta.url)), "utf8");
+
+describe("index-nats.ts entry boundary", () => {
+  it("is a thin re-export with no lifecycle ownership", () => {
+    expect(ENTRY_SOURCE.trim()).toBe(
+      '/** Thin NATS entry: all account lifecycle ownership lives in the typed runtime. */\nexport { default } from "./src/nats-account-runtime.js";',
+    );
+  });
+});
 
 describe("index-nats.ts wiring contract — typing gate (P0-6)", () => {
   it("wires the channel typing gate via resolveTypingEnabled", () => {
     // `channel.setTypingEnabled( ... resolveTypingEnabled( ... ) ... )` — the
     // gate must be pushed onto the channel FROM the resolver, not hard-coded.
-    expect(INDEX_NATS_SOURCE).toMatch(
+    expect(RUNTIME_SOURCE).toMatch(
       /channel\.setTypingEnabled\(\s*resolveTypingEnabled\(/,
     );
   });
@@ -40,12 +46,71 @@ describe("index-nats.ts wiring contract — typing gate (P0-6)", () => {
     // The resolver must be fed the already-resolved per-account config binding
     // (`account`, from the serving plan), NOT a fresh
     // resolveWebchannelAccountConfig(api.config, accountId) call at the site.
-    expect(INDEX_NATS_SOURCE).toMatch(
+    expect(RUNTIME_SOURCE).toMatch(
       /channel\.setTypingEnabled\(\s*resolveTypingEnabled\(\s*account\s*\)\s*\)/,
     );
     // Guard the anti-pattern explicitly: no re-resolution inside the typing wire.
-    expect(INDEX_NATS_SOURCE).not.toMatch(
+    expect(RUNTIME_SOURCE).not.toMatch(
       /setTypingEnabled\(\s*resolveTypingEnabled\(\s*resolveWebchannelAccountConfig\(/,
+    );
+  });
+});
+
+describe("index-nats.ts wiring contract — account-bound auth and startup", () => {
+  it("validates the full credential document before verifier or connector use", () => {
+    expect(RUNTIME_SOURCE).toContain("createMemoizedPersistedAccessor(");
+    expect(RUNTIME_SOURCE).toContain("accountAuth = prepareAccountAuth(");
+    expect(RUNTIME_SOURCE).not.toContain("resolveEffectiveAccountAuth");
+    expect(RUNTIME_SOURCE).not.toContain("reportSharedAudiences");
+    expect(RUNTIME_SOURCE).not.toContain("registerHopAudClaims");
+    expect(
+      RUNTIME_SOURCE.indexOf("credentialLoad = loadPersistedCredentialDocument("),
+    ).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth("),
+    );
+    expect(RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth(")).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, {"),
+    );
+    expect(RUNTIME_SOURCE).toMatch(
+      /loadPersisted:\s*\(\)\s*=>\s*credentialLoad/,
+    );
+  });
+
+  it("wires the prepared token-only verifier and strict PoP policy", () => {
+    expect(RUNTIME_SOURCE).toMatch(/verifyIdentity:\s*accountAuth\.verifyIdentity/);
+    expect(RUNTIME_SOURCE).toMatch(/requirePoP:\s*accountAuth\.requirePoP/);
+  });
+
+  it("confirms the register subscription before readiness or publication", () => {
+    const gateB = RUNTIME_SOURCE.indexOf("accountAuth.warmJwks(signal)");
+    const subscribe = RUNTIME_SOURCE.lastIndexOf("channel.subscribeRegister()");
+    const flush = RUNTIME_SOURCE.lastIndexOf("transport.flush(attemptAbort.signal)");
+    const readiness = RUNTIME_SOURCE.lastIndexOf(
+      "const readiness = formatAccountReadiness({",
+    );
+    const publication = RUNTIME_SOURCE.lastIndexOf(
+      "commitAccountPublication<AccountRuntime>",
+    );
+    expect(gateB).toBeGreaterThan(-1);
+    expect(subscribe).toBeGreaterThan(gateB);
+    expect(flush).toBeGreaterThan(subscribe);
+    expect(readiness).toBeGreaterThan(flush);
+    expect(publication).toBeGreaterThan(readiness);
+    expect(RUNTIME_SOURCE).toContain("if (!published) return;");
+  });
+});
+
+describe("nats-account-runtime.ts wiring contract — capacity diagnostics", () => {
+  it("creates one diagnostics composition site and passes both callbacks by reference", () => {
+    expect(RUNTIME_SOURCE.match(/const capacityDiagnostics = createCapacityDiagnostics\(\{/g)).toHaveLength(1);
+    expect(RUNTIME_SOURCE).toMatch(
+      /onCapacityWarning:\s*capacityDiagnostics\.onCapacityWarning/,
+    );
+    expect(RUNTIME_SOURCE).toMatch(
+      /onCapacityReject:\s*capacityDiagnostics\.onCapacityReject/,
+    );
+    expect(RUNTIME_SOURCE).not.toMatch(
+      /onCapacity(?:Warning|Reject):\s*capacityDiagnostics\.onCapacity(?:Warning|Reject)\(/,
     );
   });
 });
@@ -55,11 +120,11 @@ describe("index-nats.ts wiring contract — command catalog (P0-3)", () => {
     // The handler must call the memoized provider (`catalogProvider()`), never
     // rebuild the catalog inline per request. Pin the provider is created and
     // that the handler serves from it.
-    expect(INDEX_NATS_SOURCE).toMatch(/createCommandCatalogProvider\(\s*api\.config\s*\)/);
-    expect(INDEX_NATS_SOURCE).toMatch(/channel\.sendCommands\(\s*peerId\s*,\s*catalogProvider\(\)\s*\)/);
+    expect(RUNTIME_SOURCE).toMatch(/createCommandCatalogProvider\(\s*api\.config\s*\)/);
+    expect(RUNTIME_SOURCE).toMatch(/channel\.sendCommands\(\s*peerId\s*,\s*catalogProvider\(\)\s*\)/);
     // Guard the anti-pattern: no bare per-request `buildCommandCatalog(api.config)`
     // inside the send. (buildCommandCatalog now lives behind the provider only.)
-    expect(INDEX_NATS_SOURCE).not.toMatch(
+    expect(RUNTIME_SOURCE).not.toMatch(
       /sendCommands\(\s*peerId\s*,\s*buildCommandCatalog\(/,
     );
   });
@@ -69,8 +134,36 @@ describe("index-nats.ts wiring contract — ingress dedupe onFlush (P0-7a)", () 
   it("wires the debouncer onFlush from the extracted createIngressOnFlush factory", () => {
     // The onFlush must be the tested factory, not an inlined closure (which could
     // silently drift — e.g. dispatch `items` instead of the deduped survivors, or
-    // drop the accountId namespace). Pin `onFlush: createIngressOnFlush(`.
-    expect(INDEX_NATS_SOURCE).toMatch(/onFlush:\s*createIngressOnFlush</);
+    // drop the accountId namespace). The typed factory is constructed once and
+    // passed directly to the bounded debouncer.
+    expect(RUNTIME_SOURCE).toMatch(/const onIngressFlush = createIngressOnFlush</);
+    expect(RUNTIME_SOURCE).toMatch(/onFlush:\s*onIngressFlush/);
+  });
+
+  it("uses one module-scope process budget/outcome store and the bounded debouncer", () => {
+    expect(RUNTIME_SOURCE.match(/new InboundRetentionBudget\(/g)).toHaveLength(1);
+    expect(RUNTIME_SOURCE).toMatch(/const processInboundRetention/);
+    expect(RUNTIME_SOURCE).toMatch(/const processIngressOutcomes/);
+    expect(RUNTIME_SOURCE).toMatch(/createBoundedInboundDebouncer/);
+    expect(RUNTIME_SOURCE).not.toMatch(/createInboundDebouncer</);
+    expect(RUNTIME_SOURCE).not.toContain("createPersistentDedupe");
+    expect(RUNTIME_SOURCE).toMatch(/isOverflowClaimed:/);
+    expect(RUNTIME_SOURCE).toMatch(/processOverflowResolver\.hasActiveClaim/);
+    expect(RUNTIME_SOURCE).toMatch(/isCancelledFallback:/);
+    expect(RUNTIME_SOURCE).toMatch(/recoverCancelled/);
+    expect(RUNTIME_SOURCE).toMatch(/onCancelledRecovered:/);
+  });
+
+  it("charges only the wire message, excluding the peer routing wrapper", () => {
+    expect(RUNTIME_SOURCE).toMatch(
+      /estimateRetainedMessageBytes,[\s\S]*?from "\.\/inbound-retention\.js"/,
+    );
+    expect(RUNTIME_SOURCE).toMatch(
+      /measure:\s*\(item\)\s*=>\s*estimateRetainedMessageBytes\(item\.message\)/,
+    );
+    expect(RUNTIME_SOURCE).not.toMatch(
+      /measure:\s*\(item\)\s*=>\s*estimateRetainedMessageBytes\(item\)(?!\.message)/,
+    );
   });
 });
 
@@ -78,17 +171,65 @@ describe("index-nats.ts wiring contract — ingress ack (P0-7b)", () => {
   it("wires sendAck into the onFlush factory, the debouncer onCancel, and the control-lane branch", () => {
     // The onFlush factory must be handed a sendAck so admitted (fresh + duplicate)
     // ids drain the client's replay ledger.
-    expect(INDEX_NATS_SOURCE).toMatch(
+    expect(RUNTIME_SOURCE).toMatch(
       /sendAck:\s*\(peerId,\s*ids\)\s*=>\s*channel\.sendAck\(peerId,\s*ids\)/,
     );
     // The debouncer's onCancel must record+ack /stop-cancelled buffered items via
     // the tested helper (else a reconnect replays text the user aborted).
-    expect(INDEX_NATS_SOURCE).toMatch(/onCancel:/);
-    expect(INDEX_NATS_SOURCE).toMatch(/recordCancelledInboundItems\(/);
+    expect(RUNTIME_SOURCE).toMatch(/onCancel:/);
+    expect(RUNTIME_SOURCE).toMatch(/recordCancelledInboundItems\(/);
     // The control-lane branch bypasses the debouncer/onFlush, so it acks its own
     // id-carrying frame directly (else its ledger entry never drains).
-    expect(INDEX_NATS_SOURCE).toMatch(
-      /if\s*\(message\.id\)\s*channel\.sendAck\(peerId,\s*\[message\.id\]\)/,
+    expect(RUNTIME_SOURCE).toMatch(
+      /if\s*\(message\.id\s*&&\s*!channel\.sendAck\(peerId,\s*\[message\.id\]\)\)/,
+    );
+    expect(RUNTIME_SOURCE.match(/control-lane ack failed/g)).toHaveLength(1);
+  });
+});
+
+describe("index-nats.ts wiring contract — approval decision account routing", () => {
+  it("threads the runtime accountId into handleApprovalDecision", () => {
+    expect(RUNTIME_SOURCE).toMatch(
+      /setApprovalDecisionHandler\(\(peerId, id, decision\) =>[\s\S]*?handleApprovalDecision\(api\.config, id, decision, peerId, accountId\)/,
+    );
+  });
+});
+
+describe("index-nats.ts browser-route absence", () => {
+  it("contains no gateway HTTP route registration or socket-upgrade wiring", () => {
+    expect(RUNTIME_SOURCE).not.toContain("registerHttpRoute");
+    expect(RUNTIME_SOURCE.toLowerCase()).not.toContain("upgrade route");
+  });
+});
+
+describe("index-nats.ts account lifecycle ownership", () => {
+  it("keeps registerFull synchronous and network-free", () => {
+    expect(RUNTIME_SOURCE).toMatch(/registerFull\(api\)\s*\{\s*if \(api\.registrationMode !== "full"\) return;\s*accountCoordinator\.installFull\(api\)/);
+    expect(RUNTIME_SOURCE).not.toMatch(/async\s+registerFull/);
+    expect(RUNTIME_SOURCE).not.toContain("accountsBuildStarted");
+  });
+
+  it("builds only the host-selected account and publishes after the flushed register subscription", () => {
+    expect(RUNTIME_SOURCE).toContain("planWebchannelAccount(api.config, ctx.accountId");
+    expect(RUNTIME_SOURCE).not.toMatch(/for\s*\(const plan of plans\)/);
+    expect(
+      RUNTIME_SOURCE.indexOf("credentialLoad = loadPersistedCredentialDocument("),
+    ).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth("),
+    );
+    expect(RUNTIME_SOURCE.indexOf("accountAuth = prepareAccountAuth(")).toBeLessThan(
+      RUNTIME_SOURCE.indexOf("consumeCredentialSource(source, {"),
+    );
+    expect(RUNTIME_SOURCE.indexOf("accountAuth.warmJwks(signal)")).toBeLessThan(
+      RUNTIME_SOURCE.lastIndexOf("channel.subscribeRegister()"),
+    );
+    expect(RUNTIME_SOURCE.lastIndexOf("channel.subscribeRegister()")).toBeLessThan(
+      RUNTIME_SOURCE.lastIndexOf("transport.flush(attemptAbort.signal)"),
+    );
+    expect(
+      RUNTIME_SOURCE.lastIndexOf("transport.flush(attemptAbort.signal)"),
+    ).toBeLessThan(
+      RUNTIME_SOURCE.lastIndexOf("commitAccountPublication<AccountRuntime>"),
     );
   });
 });

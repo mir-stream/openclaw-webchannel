@@ -5,6 +5,7 @@ import {
   coalesceUserMessages,
   type UserMessageLike,
 } from "./inbound-queue.js";
+import { InboundRetentionBudget } from "./inbound-retention.js";
 
 /**
  * A manually-resolvable promise, so a test can hold a turn "in flight" and
@@ -204,7 +205,7 @@ describe("createSerializedInboundDispatcher", () => {
     const { pendingBuffered, clearPending } =
       createSerializedInboundDispatcher<UserMessageLike>(async () => {});
     expect(pendingBuffered("s1")).toBe(0);
-    expect(clearPending("s1")).toBe(0);
+    expect(clearPending("s1")).toEqual([]);
   });
 });
 
@@ -232,6 +233,18 @@ describe("coalesceUserMessages", () => {
       { type: "user_message", text: "b", at: 222 },
     ]);
     expect(merged).toEqual({ type: "user_message", text: "a\n\nb", at: 111 });
+  });
+
+  it("carries the LAST message's id (turnId anchors on the latest user bubble)", () => {
+    // The merged id becomes the turn's turnId; the widget anchors reasoning and
+    // typing-text suppression to the LATEST user bubble, so the last id — not the
+    // first — must survive the merge.
+    const merged = coalesceUserMessages([
+      { type: "user_message", text: "a", id: "id-1" },
+      { type: "user_message", text: "b", id: "id-2" },
+      { type: "user_message", text: "c", id: "id-3" },
+    ]);
+    expect(merged).toEqual({ type: "user_message", text: "a\n\nb\n\nc", id: "id-3" });
   });
 });
 
@@ -307,7 +320,7 @@ describe("createSerializedInboundDispatcher with coalesce (P1-8b layer b)", () =
     expect(pendingBuffered("s1")).toBe(2);
 
     // /stop path: drop the buffer, reporting the count.
-    expect(clearPending("s1")).toBe(2);
+    expect(clearPending("s1")).toEqual([um("m2"), um("m3")]);
     expect(pendingBuffered("s1")).toBe(0);
 
     // M1 settles with nothing buffered → NO merged follow-up turn; session idle.
@@ -317,12 +330,56 @@ describe("createSerializedInboundDispatcher with coalesce (P1-8b layer b)", () =
     expect(pendingSessions()).toBe(0);
   });
 
+  it("clearPending honors cancellation holds on committed and provisional open-lease entries", async () => {
+    const gate = deferred();
+    const budget = new InboundRetentionBudget({
+      maxMessagesPerSession: 8, maxBytesPerSession: 8,
+      maxMessagesPerProcess: 8, maxBytesPerProcess: 8,
+    });
+    const token = budget.createSessionToken();
+    const dispatcher = createSerializedInboundDispatcher<UserMessageLike>(
+      async (_key, message) => { if (message.text === "running") await gate.promise; },
+      { coalesce: coalesceUserMessages, budget, sessionToken: () => token, measure: () => 1 },
+    );
+    dispatcher.dispatch("s1", um("running"));
+    await flush();
+
+    const prior = budget.tryReserve(token, 1, "pending");
+    const committed = budget.tryReserve(token, 1, "debounce-inflight");
+    const provisional = budget.tryReserve(token, 1, "debounce-inflight");
+    if (prior.status !== "accepted" || committed.status !== "accepted" || provisional.status !== "accepted") {
+      throw new Error("unexpected retention rejection");
+    }
+    dispatcher.dispatch("s1", um("prior"), prior.reservation);
+    const lease = dispatcher.beginBatch("s1");
+    const committedOffer = lease.offer(um("committed"), committed.reservation);
+    const provisionalOffer = lease.offer(um("provisional"), provisional.reservation);
+    if (committedOffer.status !== "accepted" || provisionalOffer.status !== "accepted") {
+      throw new Error("unexpected dispatcher rejection");
+    }
+    committedOffer.commit();
+    const releaseCommittedHold = committed.reservation.hold();
+    const releaseProvisionalHold = provisional.reservation.hold();
+
+    expect(dispatcher.clearPending("s1").map((message) => message.text).sort()).toEqual([
+      "committed", "prior", "provisional",
+    ]);
+    expect(budget.usage()).toEqual({ messages: 2, bytes: 2 });
+    releaseCommittedHold();
+    expect(budget.usage()).toEqual({ messages: 1, bytes: 1 });
+    releaseProvisionalHold();
+    expect(budget.usage()).toEqual({ messages: 0, bytes: 0 });
+    lease.finish();
+    gate.resolve();
+    await flush();
+  });
+
   it("clearPending on an idle/unknown session returns 0", () => {
     const { clearPending } = createSerializedInboundDispatcher<UserMessageLike>(
       async () => {},
       { coalesce: coalesceUserMessages },
     );
-    expect(clearPending("never-seen")).toBe(0);
+    expect(clearPending("never-seen")).toEqual([]);
   });
 
   it("a throwing merged follow-up turn does not poison the session (next dispatch runs)", async () => {
@@ -359,5 +416,33 @@ describe("createSerializedInboundDispatcher with coalesce (P1-8b layer b)", () =
     dispatch("s1", um("after"));
     await flush();
     expect(calls).toEqual(["m1", "boom", "after"]);
+  });
+});
+
+describe("SerializedInboundDispatcher close gate", () => {
+  it("skips a turn queued in the same tick and clears recursive coalesce follow-up", async () => {
+    const handled: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const dispatcher = createSerializedInboundDispatcher<{ text: string }>(async (_key, message) => {
+      handled.push(message.text);
+      await gate;
+    }, { coalesce: (messages) => ({ text: messages.map((m) => m.text).join("+") }) });
+    dispatcher.dispatch("a", { text: "first" });
+    await Promise.resolve();
+    dispatcher.dispatch("a", { text: "second" });
+    dispatcher.close();
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(handled).toEqual(["first"]);
+    expect(dispatcher.pendingSessions()).toBe(0);
+    expect(dispatcher.pendingBuffered("a")).toBe(0);
+
+    const sameTick = createSerializedInboundDispatcher<{ text: string }>(async (_key, message) => { handled.push(message.text); });
+    sameTick.dispatch("b", { text: "never" });
+    sameTick.close();
+    await Promise.resolve();
+    expect(handled).not.toContain("never");
   });
 });

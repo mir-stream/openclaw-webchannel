@@ -3,46 +3,26 @@
 Follow-up work that is deferred, not a functional gap. The single source of truth for current
 state is [`STATUS.md`](STATUS.md).
 
-## C2 — Authenticated handshake (mutual key attestation) — **SECURITY, hard blocker for untrusted relay**
+## C2 — Authenticated registration (mutual key attestation) — **CLOSED on the register path (P0-2)**
 
-**Status: accepted-risk (option A) for now.** The E2E channel currently provides confidentiality
-against a *passive* relay only. The live X25519 handshake is **unauthenticated in both
-directions**, so an *active* relay can MITM every conversation and approval. This is acceptable
-**only while the relay is operated by a trusted party** (own `nats-server` / own Synadia account).
-**This item MUST be closed before any deployment on a third-party-operated relay** (e.g. Synadia
-NGS external mode where Synadia operates the relay). Until then, docs claiming "untrusted relay"
-E2E have been softened (README.md, docs/ONBOARDING_GUIDE.md, packages/plugin/README.md,
-packages/client/README.md).
+**Status: closed on the sole admission path (as of P0-2).** The authenticated register hop
+(PoP + JWT `cnf`-attested device key → register-reply-delivered wrapped conversation key K) is now
+the ONLY admission path — auto-admission, the unauthenticated `.handshake` key-exchange, dev-open,
+and static-creds serving are all deleted. K is never negotiated on the wire; it travels only inside
+the authenticated register reply, wrapped to the SaaS-attested device `cnf` key — so an active relay
+can carry the admission frames but cannot substitute keys or MITM a conversation/approval (tampering
+fails Poly1305, and the client fails closed with a terminal error). This matches
+[`STATUS.md`](STATUS.md) and the "E2E security model" section of
+[`packages/plugin/README.md`](../packages/plugin/README.md).
 
-**Root cause (verified 2026-07-02).** The verification machinery is ~70% built but not wired:
-- `parseAndVerifyHandshake` / `verifyDeviceKey` (plugin) and `verifyAgentKey` /
-  `parseAndStorePinnedKeys` / `getPinnedKeys` (client) have **zero non-test callers**.
-- The live agent handshake (`packages/plugin/src/nats-channel.ts` `handleHandshake`) feeds the wire
-  key straight into `deriveConversationKey` with no verification.
-- The live wire frame is `{type:"key_exchange", pubKey}` (`e2e-session.ts`) — no `peerId`, no
-  envelope — while the verifier expects a `handshake_hello` message with `devicePublicKey` +
-  `peerId`. **Wire format must be reconciled**, not just "call the function".
-- `jwt.ts` still admits bootstrap JWTs with **no `cnf` at all** (backward-compat) → often no pin to
-  check.
-- **Net-new work:** the SaaS receives the agent's X25519 key at enrollment
-  (`device-flow-enrollment.ts:264`) but **never attests it back to the browser** — the browser has
-  no trusted source for the agent key, so `verifyAgentKey` has nothing to check against.
+**Residual (accepted).** You must still trust the relay operator for **availability and metadata**
+(subject/timing observability) — NOT for confidentiality or integrity. Running on a third-party
+relay (e.g. Synadia NGS) is therefore safe for message *content*; a hostile relay can still drop or
+delay traffic and observe who-talks-to-whom.
 
-**Scope of the fix (mutual attestation — option C):**
-- [ ] browser→agent: make `cnf.jwk` mandatory in `jwt.ts` (drop the no-cnf backward-compat path, or
-  gate it behind an explicit insecure flag); reconcile the `key_exchange` frame with the
-  `handshake_hello` shape (add `peerId` or switch the live frame); call `parseAndVerifyHandshake`
-  in `handleHandshake` **before** `deriveConversationKey`.
-- [ ] agent→browser: SaaS signs/attests the enrollment-captured `agentPublicKey` to the browser
-  (embed in the bootstrap JWT the browser already verifies, or a signed sidecar); browser calls
-  `parseAndStorePinnedKeys` then `verifyAgentKey` before deriving the key.
-- [ ] wire eviction for the pinned-key stores on disconnect (ties into the plugin unbounded-map
-  cleanup).
-- [ ] add an integration test that a substituted key on either leg aborts with `HandshakeMitmError`.
-
-**Do NOT ship the browser→agent leg alone as an end state** — asymmetric authentication leaves the
-agent-impersonation direction open while implying MITM is handled (false sense of security). It is
-acceptable only as an intermediate commit toward the full mutual fix.
+**Deferred (not blockers):** conversation-key rotation (a fixed K is used today); SaaS key
+compromise / revocation (handled via re-enrollment); real-time allowlist authz (a core-delegated
+stub).
 
 ## S1 — accountId-aware outbound facade (proactive/approval outbound is primary-account-only) — **cross-account disclosure risk**
 
@@ -50,10 +30,10 @@ acceptable only as an intermediate commit toward the full mutual fix.
 untracked (this entry is the first written record outside the session notes).
 
 **Current behavior** (`packages/plugin/index-nats.ts`, "lazy transport facade"): the plugin core
-is created once at module load against a single `lazyTransport` Proxy; after `registerFull` builds
+is created once at module load against a single `lazyTransport` Proxy; after `account startup` builds
 one `NatsChannel` per account, the Proxy is bound to **one PRIMARY channel** (`"default"`, else the
 first built account). Everything the core initiates **without a per-message account context** rides
-that one channel: untargeted/proactive outbound (`sendTextToAnyOpen`), typing/progress fan-out, and
+that one channel: untargeted/proactive outbound (`untargeted recipient guessing`), typing/progress fan-out, and
 the **approval capability** (`sendApprovalRequest`/`Resolved`). Inbound is NOT affected — replies
 route per-account via each channel's own dispatcher.
 
@@ -91,7 +71,7 @@ accounts via `listAccountIds`, reads per-account `execApprovals`, and `deliverPe
 - [x] widget-click authz `handleApprovalDecision` reads THIS account's approver set (index-nats
   passes the channel's accountId).
 - [x] regression tests: two accounts + shared peerId → B-turn approval delivers on B's channel only;
-  per-account isConfigured/approver gates; shared-base inheritance; legacy WS single-transport.
+  per-account isConfigured/approver gates; shared-base inheritance; single-account compatibility.
 
 **Adversarial-round hardening (F1/F2 fixed same day; F3 documented + deferred):**
 - [x] **F1** — id↔account binding: `handleApprovalDecision` now refuses a decision whose approvalId
@@ -100,7 +80,7 @@ accounts via `listAccountIds`, reads per-account `execApprovals`, and `deliverPe
   module-level `deliveredApprovalAccounts` map records the delivering account at `deliverPending`
   and is released at `updateEntry`.
 - [x] **F2** — fail-closed delivery: when the resolver MISSES (an account core started a handler for
-  but `registerFull` skipped — creds-missing/connect-fail), the prompt is DROPPED, never routed to
+  but `account startup` skipped — creds-missing/connect-fail), the prompt is DROPPED, never routed to
   the closure/primary channel (which would re-open the misroute). Legacy WS (no resolver) keeps the
   single closure transport.
 - [ ] **F3 (residual, deferred to the outbound leg)** — an approval with NEITHER `turnSourceAccountId`
@@ -110,7 +90,7 @@ accounts via `listAccountIds`, reads per-account `execApprovals`, and `deliverPe
   account semantics). F2 bounds the blast radius to live channels.
 
 **Proactive/untargeted outbound leg (separate, still open):** core-initiated untargeted sends
-(`sendTextToAnyOpen` etc.) may still be account-blind at a different seam — decide semantics
+(`untargeted recipient guessing` etc.) may still be account-blind at a different seam — decide semantics
 (all accounts? per-account targeting? startup guard on the unsupported combination?) when
 agent-initiated outbound is built. Until the approvals leg lands, the interim posture stands:
 approvals on a multi-account gateway deliver via the primary channel only (misroute/drop for
@@ -120,7 +100,7 @@ non-primary turns).
 ambiguity: (1) its addressing is account-scoped by construction (a chatId belongs to one
 bot/account; the same human on two bots = two chatIds/sessions — no shared cross-account
 identity, unlike webchannel's `webchannel.{tenant}.*.{peerId}.>` where one peerId spans N
-accounts); (2) it has NO broadcast — `sendTextToAnyOpen`/`soleOpenSocket` exist only in the
+accounts); (2) it has NO broadcast — `untargeted recipient guessing`/`single-recipient guessing` exist only in the
 webchannel plugin; telegram always dials a recorded chatId; (3) a proactive/cron (system-event)
 send resolves BOTH `to` AND `accountId` from the session's persisted delivery context
 (`effective-reply-route.ts`: `accountId: ctx.AccountId ?? deliveryContext.accountId ?? entry.lastAccountId`).
@@ -129,7 +109,7 @@ per turn from `ctx.AccountId`, which the S1 inbound stamp now populates for webc
 already forces `per-account-channel-peer` session keys (account encoded in the key). So the leg splits:
 (a) SESSION-BOUND proactive/cron sends (incl. F3's cron approval) → adopt telegram's model, resolve
 accountId from the session's delivery context → send on that ONE account's channel (small scope,
-closes F3); (b) TRULY untargeted `sendTextToAnyOpen` → telegram has no such operation, so the
+closes F3); (b) TRULY untargeted `untargeted recipient guessing` → telegram has no such operation, so the
 defensible default is to retire/constrain blind broadcast in multi-account (require an account /
 startup-guard the ambiguous combo, never primary-only fanout). The "peerId spans N accounts → which
 one?" question is webchannel-unique and stays a product decision.
@@ -165,59 +145,9 @@ requester's own subtree. A BYO-NATS operator who loosens creds to tenant-wide wo
 low-impact cross-peer error-string leak. Optional hardening: hoist the subject==verified-peerId check
 ahead of every reply so the guard is self-sufficient. Bundle with the NATS-cred-scoping follow-up.
 
-## Remove the legacy Gateway-WS transport (`hmac-ticket` strategy: DONE)
+## ✅ Direct gateway transport removal — DONE 2026-07-15
 
-**Rationale.** The NATS E2E path (`index-nats.ts`) is now the production default and is
-live-proven end-to-end (see STATUS.md). The Gateway-WS entry (`index.ts`) and the (now-removed)
-`hmac-ticket` auth strategy have **zero production role**: they only power a zero-infra WS dev
-round-trip, and on the NATS path admission resolves to `auto` (no verifier built) or `register-hop`
-(JWT-only) — `hmac-ticket` never admitted any NATS peer, and `anonymous` throws at load. Removing
-them shrinks the auth surface and deletes a whole parallel transport.
+The browser-facing gateway transport, client, and smoke harness were removed. The NATS relay is now the sole browser path; unresolved outbound targets are explicitly dropped.
 
-### ✅ Done — the `hmac-ticket` auth strategy is fully removed
 
-- [x] `packages/plugin/src/ticket.ts` deleted (HS256 issue/verify)
-- [x] `packages/plugin/src/auth.ts` — `HmacTicketAuthConfig`, `makeHmacTicketVerifier`,
-  `resolveSecret`, and the `hmac-ticket` switch case removed (kept `jwt`; `anonymous` still
-  throws at load)
-- [x] `openclaw.plugin.json` schema — `hmac-ticket` dropped from the strategy enum and the
-  `ticketSecret` property removed
-- [x] hmac smoke scripts deleted (`smoke/e2e.mjs`, `smoke/history.mjs`, `smoke/typing.mjs`,
-  `smoke/burst.mjs`)
-- [x] hmac test files deleted (`ticket.test.ts`, `devticket-webcrypto.test.ts`); the `hmac` cases
-  stripped from `nats-admission.test.ts`, `auth-admission.test.ts`, `register-dispatch.test.ts`
-- [x] docs updated (`docs/AUTH.md`, `docs/STATUS.md`, `docs/README.md`, this file)
-
-### ⏳ Still deferred — remove the Gateway-WS transport itself
-
-**Deferred pending:** confirmation that no consumer depends on the zero-infra WS dev round-trip
-(the remaining `smoke/*.mjs`). Once confirmed, remove in one sweep.
-
-Note: the `jwt` strategy still runs over the Gateway-WS transport (jwt-over-WS via the `?ticket=`
-carrier), so this removal must retire or re-home the jwt WS path as part of the sweep.
-
-Plugin transport / entry:
-- `packages/plugin/index.ts` (the Gateway-WS entry, if present)
-- `packages/plugin/src/transport.ts` (the WS transport + `handleUpgrade` verifier seam)
-
-Client:
-- `WebChannelClient` + `getTicket` / `?ticket=` carrier in `packages/client/src/client.ts` and
-  `packages/client/src/types.ts`
-- `packages/client/README.md` (drop the Gateway-WS usage section)
-
-Smoke / harness:
-- remaining WS smokes `smoke/*.mjs` (the hmac smokes + `packages/client/smoke-client.mjs` are
-  already gone with the `hmac-ticket` strategy)
-
-Config / build:
-- `tsconfig.json` `include` (drop the removed files)
-
-Docs:
-- `docs/PLAN.md`, `docs/PACKAGING.md` (the index.ts/transport historical references — already
-  noted as superseded)
-
-### Verification after removal
-
-- `npm run typecheck` (all workspaces) clean
-- `npm test` green (with the WS/transport tests removed)
-- the NATS live harnesses (`e2e/local/run-*.sh`) still GREEN in CI
+The earlier HMAC strategy and all direct-browser transport artifacts are removed.

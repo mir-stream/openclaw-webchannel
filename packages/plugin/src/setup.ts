@@ -51,16 +51,32 @@
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
-import { WEBCHANNEL_ID } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountCredentialPath,
+  assertNoRemovedAudienceConfig,
   canonicalizeAccountId,
+  loadPersistedCredentialDocument,
   readAccountsMap,
   readWebchannelSection,
-  resolveReadCredentialPath,
+  resolveAcquisitionIdentity,
+  resolveAccountStorageRoot,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
 import { acquireCredentials } from "./acquire-credentials.js";
+import {
+  formatCredentialInspection,
+} from "./credential-document.js";
+import {
+  credentialStorageFailureDiagnostic,
+  StorageDocumentError,
+} from "./storage-document.js";
+import {
+  parseNatsCredentialMode,
+  resolveEnrolledSaasBaseUrl,
+  type WebchannelNatsConfig,
+} from "./nats-credential-source.js";
 import { runAddPreflight } from "./preflight.js";
 
 /**
@@ -75,13 +91,11 @@ type WebchannelSetupInput = {
   // Generic CLI flags (fallback mapping).
   baseUrl?: string;
   url?: string;
-  // JWT auth overrides (advanced). Absent on the happy path — derived defaults
-  // (issuer = saasBaseUrl, audience = accountId) are used instead. Preserved
-  // across a re-run so a hand-tuned issuer/audience is never clobbered.
+  // JWT issuer pin (advanced). Audience is structurally the account id and is
+  // intentionally not an input.
   issuer?: string;
-  audience?: string;
   // Connection / credential-mode passthrough.
-  credentialsMode?: "enrolled" | "static" | "open";
+  credentialsMode?: "enrolled" | "static";
 } & Record<string, unknown>;
 
 /** Minimal runtime log sink (the host passes `RuntimeEnv`). */
@@ -93,7 +107,7 @@ const NESTED_PATCH_KEYS = ["nats", "saas", "auth"] as const;
 /**
  * Sub-keys merged ONE MORE level deep under a nested patch key, so writing e.g.
  * `nats.credentials.mode` does not drop a sibling `nats.credentials.saasBaseUrl`,
- * and writing `auth.jwt.audience` does not drop a hand-tuned `auth.jwt.issuer`.
+ * and writing `auth.jwt.issuer` does not drop other supported JWT fields.
  */
 const DEEP_PATCH_SUBKEYS: Record<string, readonly string[]> = {
   nats: ["credentials"],
@@ -140,8 +154,8 @@ function isMergeableObject(value: unknown): value is Record<string, unknown> {
  * Shallow-merge a patch onto an account object, one level deep for nats/saas/auth
  * and one further level for the known compound children (`nats.credentials`,
  * `auth.jwt`) so a full-block write MERGES onto existing config rather than
- * clobbering sibling fields (e.g. a re-run preserves a hand-tuned
- * `auth.jwt.issuer` when only `auth.jwt.audience` is being written).
+ * clobbering sibling fields (for example, a re-run preserves an explicit
+ * `auth.jwt.issuer` pin).
  */
 function mergePatch(
   prev: Record<string, unknown>,
@@ -173,27 +187,18 @@ function mergePatch(
  * "register-hop"`.
  *
  * TRUST-ANCHOR (design §4 change 2): the builder NO LONGER writes the JWT-verify
- * params (`issuer` / `jwksUrl` / `audience`). Those are trust FACTS derived at
- * RUNTIME from the anchor `{saas.baseUrl, accountId}` — `deriveAccountAuth` in
- * `index-nats.ts` fills them in when absent (issuer = saas.baseUrl, audience =
- * accountId, jwksUrl = saas.baseUrl + /.well-known/jwks.json). Writing guesses
- * here was the source of the silent issuer-mismatch trap, so we stop guessing.
+ * params (`issuer` / `jwksUrl`). Those are trust facts derived at runtime from
+ * the SaaS anchor. Audience is not a verifier-config field at all: the prepared
+ * verifier is immutably bound to the canonical runtime account id.
  *
- * `issuer` / `audience` are now OPTIONAL OPERATOR PINS, not defaults: they are
- * written ONLY when the caller explicitly supplies them (the escape hatch for a
- * proxy / custom-domain / logical-issuer deployment, threaded through
- * `applyAccountConfig` and preserved across re-runs). When neither is supplied
+ * `issuer` is an OPTIONAL OPERATOR PIN, not a default. It is written only when
+ * explicitly supplied. When it is absent
  * the `auth.jwt` sub-object is OMITTED ENTIRELY so nothing is guessed — only
  * `auth.strategy: "jwt"` is written (runtime derivation supplies the rest).
  *
- * `admission` is pinned to `register-hop` because this builder ALWAYS emits a
- * SaaS-enrolled jwt account (`auth.strategy: "jwt"`, `credentials.mode: "enrolled"`)
- * — exactly the case `resolveAdmissionMode` would infer register-hop for (jwt +
- * a viable register hop). Pinning it makes the register-over-NATS chat path work
- * out of the box; the legacy `auto` (X25519-handshake, no `.register` subject)
- * would silently break the browser's register request. Static/BYO-NATS accounts
- * do NOT reach this builder (they take the partial `buildAccountPatch` path), so
- * their `auto` default is unaffected.
+ * `admission` is pinned to `register-hop` because this builder always emits a
+ * SaaS-enrolled JWT account and authenticated registration is the only serving
+ * path.
  *
  * `nats.url` is intentionally OMITTED — the SaaS delivers the relay URL together
  * with the enrolled credentials at device-flow time (it is the rendezvous
@@ -212,22 +217,16 @@ export function buildFullAccountPatch(params: {
    * a specific issuer; when absent, issuer DERIVES at runtime from saas.baseUrl.
    */
   issuer?: string;
-  /**
-   * OPERATOR PIN (optional). When present, written as `auth.jwt.audience`; when
-   * absent, audience DERIVES at runtime from the accountId.
-   */
-  audience?: string;
 }): Record<string, unknown> {
   // `accountId` remains a required param (callers pass it, and it documents that
-  // audience derives from it at runtime) but is no longer read here — the runtime
-  // deriver owns `audience = accountId`.
-  const { tenant, saasBaseUrl, issuer, audience } = params;
-  // Emit auth.jwt ONLY for the explicit operator pins (issuer/audience). jwksUrl
+  // expected JWT aud derives from it at runtime) but is no longer read here —
+  // the account-bound verifier closes over `accountId` directly.
+  const { tenant, saasBaseUrl, issuer } = params;
+  // Emit auth.jwt ONLY for the explicit issuer pin. jwksUrl
   // is never written here — it derives at runtime. If neither pin is supplied,
   // omit auth.jwt entirely so nothing is guessed (strategy alone is written).
   const jwtPins: Record<string, unknown> = {};
   if (issuer !== undefined) jwtPins.issuer = issuer;
-  if (audience !== undefined) jwtPins.audience = audience;
   const auth: Record<string, unknown> = { strategy: "jwt" };
   if (Object.keys(jwtPins).length > 0) auth.jwt = jwtPins;
   return {
@@ -269,7 +268,7 @@ function writeAccountConfig(
   const existingAccounts = readAccountsMap(section);
   const hasNamedAccounts = Object.keys(existingAccounts).length > 0;
 
-  if (accountId === DEFAULT_ACCOUNT_ID && !hasNamedAccounts) {
+  if (accountId === DEFAULT_WEBCHANNEL_ACCOUNT_ID && !hasNamedAccounts) {
     // Merge at channel level (excluding the structural `accounts` map). Safe only
     // while no named accounts exist — a flat default is still servable then.
     const { accounts, ...flat } = section as { accounts?: unknown } & Record<string, unknown>;
@@ -315,8 +314,8 @@ export const webchannelSetup = {
    * `saasBaseUrl` is present in the input:
    *   - `saasBaseUrl` PRESENT (`channels add --base-url <saas> …`) ⇒ write the
    *     COMPLETE enroll-ready block (`buildFullAccountPatch`), MERGED onto any
-   *     existing account so a re-run preserves a hand-tuned `auth.jwt.issuer/
-   *     audience` (only fields we actually supply win).
+   *     existing account so a re-run preserves a hand-tuned `auth.jwt.issuer`
+   *     pin (only fields we actually supply win).
    *   - `saasBaseUrl` ABSENT (a genuine partial `--flag` run — e.g. setting only
    *     `--url <tenant>` or the credential mode) ⇒ fall back to the partial
    *     `buildAccountPatch` write. This guard is REQUIRED so a partial run never
@@ -334,20 +333,25 @@ export const webchannelSetup = {
     // Defensive: even though core/our resolveAccountId canonicalizes, re-derive
     // here so a direct/programmatic caller can never inject a raw id.
     const id = canonicalizeAccountId(accountId);
+    assertNoRemovedAudienceConfig(cfg, id);
+    if (Object.prototype.hasOwnProperty.call(input, "audience")) {
+      throw new Error(
+        "webchannel: removed setup input audience is no longer supported; delete it. JWT aud is always the accountId.",
+      );
+    }
     const identity = resolveSetupIdentity(input);
 
     if (identity.saasBaseUrl !== undefined) {
       // Full-block seam. Read the existing account so a re-run preserves the
-      // operator's manual issuer/audience unless the flags explicitly override.
+      // operator's manual issuer pin unless the flag explicitly overrides.
       const existing = resolveWebchannelAccountConfig(cfg, id);
-      const existingJwt = (existing.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
+      const existingJwt = (existing.auth as { jwt?: { issuer?: string } } | undefined)
         ?.jwt;
       const patch = buildFullAccountPatch({
         tenant: identity.tenant ?? (existing.tenant as string | undefined) ?? "default-tenant",
         saasBaseUrl: identity.saasBaseUrl,
         accountId: id,
         issuer: input.issuer ?? existingJwt?.issuer,
-        audience: input.audience ?? existingJwt?.audience,
       });
       return writeAccountConfig(cfg, id, patch);
     }
@@ -386,11 +390,26 @@ export const webchannelSetup = {
     // Resolve the effective account config (channel-level base merged under the
     // account override), then the credential mode (config > input > enrolled).
     const account = resolveWebchannelAccountConfig(cfg, id);
-    const mode =
-      ((account.nats as { credentials?: { mode?: string } } | undefined)?.credentials
-        ?.mode as string | undefined) ??
-      input.credentialsMode ??
-      "enrolled";
+    let mode: "static" | "enrolled";
+    try {
+      const configuredMode = (
+        account.nats as
+          | { credentials?: { mode?: unknown } }
+          | undefined
+      )?.credentials?.mode;
+      mode =
+        parseNatsCredentialMode(
+          configuredMode === undefined
+            ? input.credentialsMode
+            : configuredMode,
+        ) ?? "enrolled";
+    } catch {
+      runtime.log(
+        `[webchannel] account "${id}": invalid credential mode; expected ` +
+          `"static" or "enrolled". Refusing credential acquisition.`,
+      );
+      return;
+    }
 
     if (mode !== "enrolled") {
       runtime.log(
@@ -400,25 +419,30 @@ export const webchannelSetup = {
       return;
     }
 
-    // Skip if per-account (or legacy-default) creds already exist.
-    const existingPath = resolveReadCredentialPath(id);
-    const { existsSync } = await import("node:fs");
-    if (existsSync(existingPath)) {
+    // Resolve the COMPLETE effective identity before consulting the credential
+    // path. Path ownership alone is never proof that persisted enrollment
+    // material belongs to this configured account.
+    const configuredIdentity = resolveAcquisitionIdentity(cfg, id);
+    let storageRoot: string | undefined;
+    try {
+      storageRoot = resolveAccountStorageRoot(account);
+    } catch {
       runtime.log(
-        `[webchannel] account "${id}" already has credentials at ${existingPath}; ` +
-          `skipping acquisition.`,
+        `[webchannel] account "${id}": code=storage-root-invalid; storageRoot ` +
+          `must be an absolute filesystem path. Correct this account's ` +
+          `storageRoot and retry.`,
       );
       return;
     }
-
     const identity = resolveSetupIdentity(input);
     const tenant =
-      identity.tenant ?? (account.tenant as string | undefined) ?? "default-tenant";
-    const saasBaseUrl =
-      identity.saasBaseUrl ??
-      (account.saas as { baseUrl?: string } | undefined)?.baseUrl ??
-      (account.nats as { credentials?: { saasBaseUrl?: string } } | undefined)?.credentials
-        ?.saasBaseUrl;
+      identity.tenant ?? configuredIdentity.tenant;
+    const saasBaseUrl = resolveEnrolledSaasBaseUrl({
+      natsConfig: account.nats as WebchannelNatsConfig | undefined,
+      saasBaseUrl:
+        identity.saasBaseUrl ??
+        configuredIdentity.saasBaseUrl,
+    });
 
     if (!saasBaseUrl) {
       runtime.log(
@@ -427,6 +451,54 @@ export const webchannelSetup = {
           `webchannel --account ${id} --base-url <saas-url> --url <tenant-uuid> ` +
           `(--url carries the tenant id, not a URL — the flag name is a host-CLI ` +
           `limitation; --base-url is the SaaS URL)`,
+      );
+      return;
+    }
+
+    const storageOptions = {
+      ...(storageRoot !== undefined ? { storageRoot } : {}),
+    };
+    let existingPath: string;
+    let persisted: ReturnType<typeof loadPersistedCredentialDocument>;
+    try {
+      existingPath = accountCredentialPath(
+        { tenant, accountId: id },
+        storageOptions,
+      );
+      persisted = loadPersistedCredentialDocument({
+        tenant,
+        accountId: id,
+        saasBaseUrl,
+      }, storageOptions);
+    } catch (error) {
+      if (error instanceof StorageDocumentError) {
+        const diagnostic = credentialStorageFailureDiagnostic(error);
+        runtime.log(
+          `[webchannel] account "${id}": code=${diagnostic.code}; ${diagnostic.detail}.`,
+        );
+        return;
+      }
+      runtime.log(
+        `[webchannel] account "${id}": effective tenant/account/SaaS identity is ` +
+          `invalid; refusing credential reuse or enrollment. Correct the account ` +
+          `configuration, then re-run channels add.`,
+      );
+      return;
+    }
+    if (persisted.status === "match") {
+      runtime.log(
+        `[webchannel] account "${id}" has complete matching v2 credentials at ` +
+          `${existingPath}; skipping acquisition.`,
+      );
+      return;
+    }
+    if (persisted.status !== "absent") {
+      runtime.log(
+        `[webchannel] account "${id}": refusing to reuse or replace persisted ` +
+          `credentials (${formatCredentialInspection(persisted)}). Stop the gateway, ` +
+          `archive ${existingPath} to a new backup path, complete any SaaS active-key ` +
+          `replacement required by your deployment, then re-run: openclaw channels add ` +
+          `--channel webchannel --account ${id}`,
       );
       return;
     }
@@ -446,6 +518,7 @@ export const webchannelSetup = {
         accountId: id,
         saasBaseUrl,
         tenant,
+        ...storageOptions,
         log: (...args) => runtime.log(...args),
       });
 
@@ -460,7 +533,7 @@ export const webchannelSetup = {
       // bootstrap JWT yet) — see `preflight.ts` runAddPreflight for the honest
       // scope. Never throws (matches this hook's non-fatal contract); a FAIL is a
       // loud, actionable log line.
-      const existingJwt = (account.auth as { jwt?: { issuer?: string; audience?: string } } | undefined)
+      const existingJwt = (account.auth as { jwt?: { issuer?: string } } | undefined)
         ?.jwt;
       await runAddPreflight({
         accountId: id,
@@ -475,7 +548,6 @@ export const webchannelSetup = {
         },
         // Config-present-wins: an operator PIN overrides the derivation.
         ...(existingJwt?.issuer !== undefined ? { pinnedIssuer: existingJwt.issuer } : {}),
-        ...(existingJwt?.audience !== undefined ? { pinnedAudience: existingJwt.audience } : {}),
         log: (...args) => runtime.log(...args),
       });
     } catch (err) {

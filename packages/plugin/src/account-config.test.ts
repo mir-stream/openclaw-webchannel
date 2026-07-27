@@ -1,12 +1,22 @@
 import { describe, it, expect } from "vitest";
-import { join } from "node:path";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   canonicalizeAccountId,
   isValidAccountId,
   assertValidAccountId,
   listWebchannelAccountIds,
+  inspectWebchannelAccountIds,
   resolveWebchannelAccountConfig,
   resolveAcquisitionIdentity,
   resolveAccountNatsConfig,
@@ -16,10 +26,43 @@ import {
   accountCredentialPath,
   legacyCredentialPath,
   resolveReadCredentialPath,
-  loadPersistedEnrolledCreds,
+  loadPersistedCredentialDocument,
 } from "./account-config.js";
+import { createCredentialIdentityForEnrollment } from "./credential-document.js";
+import { generateKeyPair } from "./e2e-crypto.js";
+import { planAccounts } from "./multiplex.js";
 
 const HOME = "/home/test";
+
+describe("removed auth.ticketParam migration", () => {
+  it("rejects the deprecated flat config through the NATS account planning seam", () => {
+    const cfg = { channels: { webchannel: { auth: { strategy: "jwt", ticketParam: "ticket" } } } };
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /removed config auth\.ticketParam.*openclaw channels add/s,
+    );
+  });
+
+  it("rejects the deprecated named-account leaf through the NATS account planning seam", () => {
+    const cfg = { channels: { webchannel: { accounts: { work: { auth: { ticketParam: "jwt" } } } } } };
+    expect(() => planAccounts(cfg, { env: {} })).toThrow(
+      /removed config auth\.ticketParam.*openclaw channels add/s,
+    );
+  });
+});
+
+describe("P0-2 removed config migration", () => {
+  it.each([
+    ["nats.devOpen", { nats: { devOpen: false } }],
+    ['nats.admission="auto"', { nats: { admission: "auto" } }],
+    ['nats.credentials.mode="open"', { nats: { credentials: { mode: "open" } } }],
+    ['auth.strategy="anonymous"', { auth: { strategy: "anonymous" } }],
+  ])("fails account resolution for %s", (setting, account) => {
+    const cfg = { channels: { webchannel: account } };
+    expect(() => resolveWebchannelAccountConfig(cfg, "default")).toThrow(
+      new RegExp(`removed config ${setting.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}`),
+    );
+  });
+});
 
 describe("account-config: account id validation (TRUST BOUNDARY)", () => {
   it("accepts safe ids", () => {
@@ -137,19 +180,31 @@ describe("account-config: resolveTypingEnabled (P0-6)", () => {
 });
 
 describe("account-config: listWebchannelAccountIds", () => {
+  it("isolates invalid raw keys and does not synthesize default for an explicit all-invalid map", () => {
+    const mixed = { channels: { webchannel: { accounts: { good: {}, "bad.id": {}, constructor: {}, Zed: {} } } } };
+    expect(inspectWebchannelAccountIds(mixed)).toEqual({
+      validIds: ["good", "Zed"].sort((a, b) => a.localeCompare(b)),
+      invalid: [
+        { id: "bad.id", reason: "the id must match /^[A-Za-z0-9_-]{1,64}$/" },
+        { id: "constructor", reason: "the id is a blocked prototype key" },
+      ].sort((a, b) => a.id.localeCompare(b.id)),
+      usesImplicitDefault: false,
+    });
+    expect(listWebchannelAccountIds({ channels: { webchannel: { accounts: { "../bad": {} } } } })).toEqual([]);
+  });
   it("synthesizes default when there is no webchannel section", () => {
-    expect(listWebchannelAccountIds({ channels: {} })).toEqual([DEFAULT_ACCOUNT_ID]);
-    expect(listWebchannelAccountIds({})).toEqual([DEFAULT_ACCOUNT_ID]);
+    expect(listWebchannelAccountIds({ channels: {} })).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);
+    expect(listWebchannelAccountIds({})).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);
   });
 
   it("returns default for a flat single-account config", () => {
     const cfg = { channels: { webchannel: { auth: { strategy: "jwt" }, allowFrom: ["a"] } } };
-    expect(listWebchannelAccountIds(cfg)).toEqual([DEFAULT_ACCOUNT_ID]);
+    expect(listWebchannelAccountIds(cfg)).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);
   });
 
   it("returns default for an empty webchannel object", () => {
     expect(listWebchannelAccountIds({ channels: { webchannel: {} } })).toEqual([
-      DEFAULT_ACCOUNT_ID,
+      DEFAULT_WEBCHANNEL_ACCOUNT_ID,
     ]);
   });
 
@@ -157,7 +212,7 @@ describe("account-config: listWebchannelAccountIds", () => {
     const cfg = {
       channels: { webchannel: { auth: { strategy: "jwt" }, accounts: {} } },
     };
-    expect(listWebchannelAccountIds(cfg)).toEqual([DEFAULT_ACCOUNT_ID]);
+    expect(listWebchannelAccountIds(cfg)).toEqual([DEFAULT_WEBCHANNEL_ACCOUNT_ID]);
   });
 
   it("lists accounts-map children", () => {
@@ -249,11 +304,11 @@ describe("account-config: readWebchannelSection / readAccountsMap / resolveAccou
     expect(readAccountsMap(readWebchannelSection(cfg))).toEqual({ a: { x: 1 } });
   });
 
-  it("reads per-account merged nats config", () => {
+  it("rejects a merged per-account devOpen fixture", () => {
     const cfg = {
       channels: { webchannel: { nats: { url: "ws://base" }, accounts: { acctA: { nats: { devOpen: true } } } } },
     };
-    expect(resolveAccountNatsConfig(cfg, "acctA")).toEqual({ url: "ws://base", devOpen: true });
+    expect(() => resolveAccountNatsConfig(cfg, "acctA")).toThrow(/removed config nats.devOpen/);
   });
 
   it("reads flat nats config for default", () => {
@@ -313,14 +368,31 @@ describe("account-config: resolveAcquisitionIdentity", () => {
 });
 
 describe("account-config: credential paths", () => {
-  it("builds the per-account path", () => {
-    expect(accountCredentialPath("acctA", HOME)).toBe(
-      join(HOME, ".openclaw-webchannel", "acctA", "credentials.json"),
+  it("rejects account-less path reads at the API boundary", () => {
+    expect(() => (accountCredentialPath as unknown as () => string)()).toThrow(
+      /storage identity/,
+    );
+  });
+  it("builds the opaque tuple-scoped path", () => {
+    expect(
+      accountCredentialPath(
+        { tenant: "tenant-a", accountId: "acctA" },
+        { home: HOME },
+      ),
+    ).toMatch(
+      new RegExp(
+        `^${HOME}/\\.openclaw-webchannel-v2/v2_[A-Za-z0-9_-]{43}/credentials\\.json$`,
+      ),
     );
   });
 
   it("REJECTS a traversal account id before building a path (security)", () => {
-    expect(() => accountCredentialPath("../../tmp/evil", HOME)).toThrow(/invalid account id/);
+    expect(() =>
+      accountCredentialPath(
+        { tenant: "tenant-a", accountId: "../../tmp/evil" },
+        { home: HOME },
+      ),
+    ).toThrow(/storage\.accountId/);
   });
 
   it("builds the legacy path", () => {
@@ -330,27 +402,31 @@ describe("account-config: credential paths", () => {
   });
 
   it("resolveReadCredentialPath prefers the per-account file when it exists", () => {
-    const perAccount = accountCredentialPath("default", HOME);
-    const path = resolveReadCredentialPath("default", {
+    const scope = { tenant: "tenant-a", accountId: "default" };
+    const perAccount = accountCredentialPath(scope, { home: HOME });
+    const path = resolveReadCredentialPath(scope, {
       home: HOME,
       exists: (p) => p === perAccount,
     });
     expect(path).toBe(perAccount);
   });
 
-  it("resolveReadCredentialPath falls back to legacy for default when per-account is absent", () => {
+  it("resolveReadCredentialPath ignores the legacy file for default", () => {
     const legacy = legacyCredentialPath(HOME);
-    const path = resolveReadCredentialPath("default", {
+    const scope = { tenant: "tenant-a", accountId: "default" };
+    const perAccount = accountCredentialPath(scope, { home: HOME });
+    const path = resolveReadCredentialPath(scope, {
       home: HOME,
       exists: (p) => p === legacy,
     });
-    expect(path).toBe(legacy);
+    expect(path).toBe(perAccount);
   });
 
   it("resolveReadCredentialPath does NOT use legacy for a non-default account", () => {
     const legacy = legacyCredentialPath(HOME);
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const path = resolveReadCredentialPath("acctA", {
+    const scope = { tenant: "tenant-a", accountId: "acctA" };
+    const perAccount = accountCredentialPath(scope, { home: HOME });
+    const path = resolveReadCredentialPath(scope, {
       home: HOME,
       exists: (p) => p === legacy, // only legacy exists
     });
@@ -358,189 +434,212 @@ describe("account-config: credential paths", () => {
   });
 
   it("resolveReadCredentialPath returns the per-account path when nothing exists", () => {
-    const path = resolveReadCredentialPath("default", { home: HOME, exists: () => false });
-    expect(path).toBe(accountCredentialPath("default", HOME));
+    const scope = { tenant: "tenant-a", accountId: "default" };
+    const path = resolveReadCredentialPath(scope, { home: HOME, exists: () => false });
+    expect(path).toBe(accountCredentialPath(scope, { home: HOME }));
   });
 
   it("resolveReadCredentialPath rejects a traversal id", () => {
     expect(() =>
-      resolveReadCredentialPath("../../evil", { home: HOME, exists: () => false }),
-    ).toThrow(/invalid account id/);
+      resolveReadCredentialPath(
+        { tenant: "tenant-a", accountId: "../../evil" },
+        { home: HOME, exists: () => false },
+      ),
+    ).toThrow(/storage\.accountId/);
   });
 });
 
-describe("account-config: loadPersistedEnrolledCreds", () => {
+describe("account-config: loadPersistedCredentialDocument", () => {
+  const pair = generateKeyPair();
+  const key = Buffer.from(pair.publicKey).toString("base64url");
+  const privateKey = Buffer.from(pair.privateKey).toString("base64url");
+  const expected = {
+    tenant: "tenant-a",
+    accountId: "acctA",
+    saasBaseUrl: "https://saas.example",
+  };
   const validFile = JSON.stringify({
-    enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } },
+    credentialIdentity: createCredentialIdentityForEnrollment({
+      ...expected,
+      deliveredIssuer: "https://issuer.example/",
+      relayUrl: "wss://relay.example",
+      agentPublicKey: key,
+    }),
+    identityKey: { publicKey: key, privateKey },
+    enrollment: {
+      creds: { userJwt: "JWT", userSeed: "SEED" },
+      peerId: "peer-a",
+      jwksUrl: "https://keys.example/jwks",
+      bootstrapUrl: "https://bootstrap.example",
+      issuer: "https://issuer.example/",
+      natsUrl: "wss://relay.example",
+    },
+    tenant: expected.tenant,
+    accountId: expected.accountId,
+    saasEnrollUrl: `${expected.saasBaseUrl}/api/enroll`,
+    saasPollUrl: `${expected.saasBaseUrl}/api/poll`,
   });
 
-  it("loads creds from the per-account file", () => {
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
+  it("loads only a complete matching per-account document", () => {
+    const perAccount = accountCredentialPath(expected, { home: HOME });
+    const result = loadPersistedCredentialDocument(expected, {
       home: HOME,
-      exists: (p) => p === perAccount,
-      read: () => validFile,
-    });
-    expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
-  });
-
-  it("threads the SaaS-delivered natsUrl through when persisted", () => {
-    // EnrollmentResult.natsUrl is persisted under `enrollment.natsUrl`; the
-    // consumer dials it in preference to local config, so the loader must surface
-    // it. (Absent → omitted, exercised by the back-compat fixtures above.)
-    const withUrl = JSON.stringify({
-      enrollment: {
-        creds: { userJwt: "JWT", userSeed: "SEED" },
-        natsUrl: "wss://saas-delivered-relay",
+      read: (path) => {
+        expect(path).toBe(perAccount);
+        return validFile;
       },
     });
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
-      home: HOME,
-      exists: (p) => p === perAccount,
-      read: () => withUrl,
-    });
-    expect(creds).toEqual({
-      userJwt: "JWT",
-      userSeed: "SEED",
-      natsUrl: "wss://saas-delivered-relay",
-    });
-  });
-
-  it("threads the SaaS-delivered issuer through when persisted (VERBATIM)", () => {
-    // EnrollmentResult.issuer is persisted under `enrollment.issuer`; the runtime
-    // verifies bootstrap JWTs against it (pin > delivered > derived), so the
-    // loader must surface it — verbatim, trailing slash and all (verify compares
-    // slash-insensitively; the loader must not "helpfully" canonicalize).
-    const withIssuer = JSON.stringify({
-      enrollment: {
-        creds: { userJwt: "JWT", userSeed: "SEED" },
-        natsUrl: "wss://saas-delivered-relay",
-        issuer: "https://saas.local/demo-issuer/",
-      },
-    });
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
-      home: HOME,
-      exists: (p) => p === perAccount,
-      read: () => withIssuer,
-    });
-    expect(creds).toEqual({
-      userJwt: "JWT",
-      userSeed: "SEED",
-      natsUrl: "wss://saas-delivered-relay",
-      issuer: "https://saas.local/demo-issuer/",
-    });
-  });
-
-  it("omits issuer for pre-issuer persisted creds and non-string junk (back-compat)", () => {
-    const junk = JSON.stringify({
-      enrollment: {
-        creds: { userJwt: "JWT", userSeed: "SEED" },
-        issuer: 42,
-      },
-    });
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
-      home: HOME,
-      exists: (p) => p === perAccount,
-      read: () => junk,
-    });
-    expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
-  });
-
-  it("F2: surfaces the agent identity key when both halves decode to 32 bytes", () => {
-    // base64url of a 32-byte X25519 key is 43 chars. Reuse one string for both
-    // halves — the loader only checks decoded length, not that they're a real pair.
-    const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
-    const withIdentity = JSON.stringify({
-      identityKey: { publicKey: KEY43, privateKey: KEY43 },
-      enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } },
-    });
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const creds = loadPersistedEnrolledCreds("acctA", {
-      home: HOME,
-      exists: (p) => p === perAccount,
-      read: () => withIdentity,
-    });
-    expect(creds?.identityKey).toBeDefined();
-    expect(creds!.identityKey!.publicKey).toBeInstanceOf(Uint8Array);
-    expect(creds!.identityKey!.publicKey.length).toBe(32);
-    expect(creds!.identityKey!.privateKey.length).toBe(32);
-  });
-
-  it("F2: omits the identity key when the block is absent, partial, or the wrong length (fail-closed)", () => {
-    const KEY43 = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
-    const perAccount = accountCredentialPath("acctA", HOME);
-    const load = (identityKey: unknown) =>
-      loadPersistedEnrolledCreds("acctA", {
-        home: HOME,
-        exists: (p) => p === perAccount,
-        read: () =>
-          JSON.stringify({ identityKey, enrollment: { creds: { userJwt: "JWT", userSeed: "SEED" } } }),
+    expect(result.status).toBe("match");
+    if (result.status === "match") {
+      expect(result.credentials).toMatchObject({
+        userJwt: "JWT",
+        userSeed: "SEED",
+        issuer: "https://issuer.example/",
+        natsUrl: "wss://relay.example",
       });
-    // Absent entirely.
-    expect(load(undefined)?.identityKey).toBeUndefined();
-    // Only one half present.
-    expect(load({ publicKey: KEY43 })?.identityKey).toBeUndefined();
-    // Wrong length (31 bytes → not an X25519 key).
-    expect(load({ publicKey: "AAAA", privateKey: "AAAA" })?.identityKey).toBeUndefined();
-    // But the rest of the creds still load (identity is optional at this layer).
-    expect(load(undefined)).toMatchObject({ userJwt: "JWT", userSeed: "SEED" });
+      expect(result.credentials.identityKey!.publicKey).toHaveLength(32);
+    }
   });
 
-  it("loads from the legacy file for the default account (backward-compat)", () => {
+  it("upgrades a complete owned v1 exact override before returning secrets", () => {
+    const home = mkdtempSync(join(tmpdir(), "webchannel-exact-v1-load-"));
+    try {
+      const credentialPath = join(home, "operator", "account.json");
+      mkdirSync(dirname(credentialPath), { recursive: true });
+      const legacy = JSON.parse(validFile) as Record<string, unknown>;
+      delete legacy.credentialIdentity;
+      writeFileSync(credentialPath, JSON.stringify(legacy), { mode: 0o600 });
+
+      const loaded = loadPersistedCredentialDocument(expected, {
+        home,
+        credentialPath,
+      });
+
+      expect(loaded.status).toBe("match");
+      expect(
+        JSON.parse(readFileSync(credentialPath, "utf8")),
+      ).toHaveProperty("credentialIdentity");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores the legacy single-file path and distinguishes absence", () => {
     const legacy = legacyCredentialPath(HOME);
-    const creds = loadPersistedEnrolledCreds("default", {
+    const reads: string[] = [];
+    expect(loadPersistedCredentialDocument({
+      ...expected,
+      accountId: "default",
+    }, {
       home: HOME,
-      exists: (p) => p === legacy,
-      read: () => validFile,
+      read: (path) => {
+        reads.push(path);
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      },
+    })).toEqual({ status: "absent" });
+    expect(reads).toEqual([
+      accountCredentialPath(
+        { tenant: expected.tenant, accountId: "default" },
+        { home: HOME },
+      ),
+    ]);
+    expect(reads).not.toContain(legacy);
+  });
+
+  it("distinguishes malformed JSON without exposing its contents", () => {
+    const perAccount = accountCredentialPath(expected, { home: HOME });
+    expect(loadPersistedCredentialDocument(expected, {
+      home: HOME,
+      read: (path) => {
+        expect(path).toBe(perAccount);
+        return "not-json SECRET";
+      },
+    })).toEqual({
+      status: "invalid",
+      code: "invalid-json",
+      fields: [],
     });
-    expect(creds).toEqual({ userJwt: "JWT", userSeed: "SEED" });
   });
 
-  it("returns undefined when no file exists", () => {
-    expect(
-      loadPersistedEnrolledCreds("default", { home: HOME, exists: () => false }),
-    ).toBeUndefined();
+  it("distinguishes an unreadable existing file without exposing the I/O error", () => {
+    const perAccount = accountCredentialPath(expected, { home: HOME });
+    expect(loadPersistedCredentialDocument(expected, {
+      home: HOME,
+      read: (path) => {
+        expect(path).toBe(perAccount);
+        throw Object.assign(new Error("SECRET filesystem detail"), {
+          code: "EACCES",
+        });
+      },
+    })).toEqual({
+      status: "invalid",
+      code: "read-failed",
+      fields: [],
+    });
   });
 
-  it("returns undefined for malformed JSON", () => {
-    const perAccount = accountCredentialPath("default", HOME);
-    expect(
-      loadPersistedEnrolledCreds("default", {
-        home: HOME,
-        exists: (p) => p === perAccount,
-        read: () => "not json{",
-      }),
-    ).toBeUndefined();
+  it("classifies a dangling credential symlink as read-failed", () => {
+    const home = mkdtempSync(join(tmpdir(), "webchannel-dangling-credential-"));
+    try {
+      const path = accountCredentialPath(expected, { home });
+      mkdirSync(dirname(path), { recursive: true });
+      symlinkSync(join(home, "missing-target"), path);
+      expect(loadPersistedCredentialDocument(expected, { home })).toEqual({
+        status: "invalid",
+        code: "read-failed",
+        fields: [],
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
-  it("returns undefined when the enrollment block is missing", () => {
-    const perAccount = accountCredentialPath("default", HOME);
-    expect(
-      loadPersistedEnrolledCreds("default", {
-        home: HOME,
-        exists: (p) => p === perAccount,
-        read: () => JSON.stringify({ identityKey: {} }),
-      }),
-    ).toBeUndefined();
+  it("classifies a dangling parent-component symlink as read-failed", () => {
+    const home = mkdtempSync(join(tmpdir(), "webchannel-dangling-parent-"));
+    try {
+      const path = accountCredentialPath(expected, { home });
+      mkdirSync(dirname(dirname(path)), { recursive: true });
+      symlinkSync(join(home, "missing-account-dir"), dirname(path));
+      expect(loadPersistedCredentialDocument(expected, { home })).toEqual({
+        status: "invalid",
+        code: "read-failed",
+        fields: [],
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
-  it("returns undefined when userJwt/userSeed are empty", () => {
-    const perAccount = accountCredentialPath("default", HOME);
-    expect(
-      loadPersistedEnrolledCreds("default", {
-        home: HOME,
-        exists: (p) => p === perAccount,
-        read: () => JSON.stringify({ enrollment: { creds: { userJwt: "", userSeed: "" } } }),
-      }),
-    ).toBeUndefined();
+  it("keeps genuinely missing normal directories classified as absent", () => {
+    const home = mkdtempSync(join(tmpdir(), "webchannel-missing-credential-"));
+    try {
+      expect(loadPersistedCredentialDocument(expected, { home })).toEqual({
+        status: "absent",
+      });
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("validates effective tenant/SaaS identity before consulting the filesystem", () => {
+    let consulted = false;
+    expect(() => loadPersistedCredentialDocument({
+      ...expected,
+      tenant: "tenant.with.dot",
+    }, {
+      home: HOME,
+      read: () => {
+        consulted = true;
+        throw Object.assign(new Error("missing"), { code: "ENOENT" });
+      },
+    })).toThrow(/storage identity invalid-field/);
+    expect(consulted).toBe(false);
   });
 
   it("rejects a traversal account id", () => {
-    expect(() => loadPersistedEnrolledCreds("../../evil", { home: HOME })).toThrow(
-      /invalid account id/,
-    );
+    expect(() => loadPersistedCredentialDocument({
+      ...expected,
+      accountId: "../../evil",
+    }, { home: HOME })).toThrow(/storage\.accountId/);
   });
 });

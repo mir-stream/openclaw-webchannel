@@ -1,13 +1,89 @@
 /**
  * Public types for the headless WebChannel client.
  *
- * The wire envelopes (`InboundWsMessage` / `OutboundWsMessage`) mirror the
- * plugin side declared in `src/transport.ts`. They are re-declared here (not
- * imported) so this package stays framework- and Node-free; the plugin's
- * contract test guards against drift (PACKAGING.md §3).
+ * Shared state and option types for the NATS-backed browser client. Wire-frame
+ * types remain private to the NATS implementation.
  */
 
 export type ChatRole = "user" | "agent";
+
+/**
+ * P0-4: the send lifecycle of a user message, as tracked authoritatively by the
+ * low-level client's monotonic tracker (`WebChannelNatsClient`).
+ *
+ *   queued -> sent -> accepted           (+ failed, terminal, from any state)
+ *
+ * - `queued`   — held locally; not yet written to the socket (pre-key buffer,
+ *                P1-9 hold, or awaiting a publish retry).
+ * - `sent`     — the encrypted `user_message` frame was written to the socket.
+ *                NOT a plugin acceptance.
+ * - `accepted` — the plugin acked the frame at ingress (P0-7b `ack`).
+ * - `failed`   — terminal; carries a `SendFailure` (reason + retryable +
+ *                lastAttemptAt, and a `WebChannelErrorCause` for `terminal`).
+ *
+ * `completed` is NOT a tracker state — it is a wrapper-level promotion driven by
+ * an explicit `turn_settled{outcome:"ok"}` on the anchor message (see
+ * `ChatMessage.sendState`), so the low-level tracker (which knows nothing about
+ * turns) stays the sole authority for queued/sent/accepted/failed.
+ */
+export type SendState = "queued" | "sent" | "accepted" | "failed";
+
+/**
+ * P0-4: the terminal-failure payload accompanying a `failed` send.
+ *
+ * `reason` distinguishes the cause of the failure; `retryable` means the caller
+ * may initiate a fresh send attempt after this terminal outcome. A failed receipt
+ * never resumes and the client never automatically retries that receipt:
+ * - `closed`      — an explicit `disconnect()`/`close()` retired the instance.
+ * - `evicted`     — the P0-7b unacked ledger exceeded its cap; the oldest entry
+ *                   was dropped (a fresh send on the ready instance can succeed).
+ * - `terminal`    — a non-retryable connection failure (auth/protocol/register);
+ *                   `cause` carries the original `WebChannelErrorCause`.
+ * - `overloaded`  — plugin rejected ingress due to bounded retained-work pressure;
+ *                   caller-directed retry is allowed, but never automatic.
+ * - `turn-failed` — the turn was admitted but settled with `outcome:"error"`;
+ *                   caller-directed re-sending is allowed when ready.
+ * - `cancelled`   — the user intentionally cancelled the send (a `/stop`
+ *                   hold-retraction or `retract()`); never retryable.
+ *
+ * Runtime policy is `true` for `evicted`/`overloaded`/`turn-failed`, and `false`
+ * for `closed`/`terminal`/`cancelled`. Readiness is separate: a caller still must not
+ * retry until the current instance is ready (and terminal recovery needs a new
+ * instance), even where the surrounding application offers a recovery action.
+ */
+export type SendFailure = {
+  reason: "closed" | "evicted" | "terminal" | "overloaded" | "turn-failed" | "cancelled";
+  /** For `reason === "terminal"`: the original connection-failure classification. */
+  cause?: WebChannelErrorCause;
+  retryable: boolean;
+  /** Wall-clock ms of the most recent publish attempt (absent if never attempted). */
+  lastAttemptAt?: number;
+};
+
+/**
+ * P0-4: an observable handle for one `send()`. Its `id` is the message's
+ * immutable receipt key — stable across history adoption (which rewrites the
+ * render bubble's public `id`) and across `retract()` (which removes the render
+ * bubble entirely) — so a caller can always correlate a send to its outcome.
+ *
+ * The handle is a thin view over the wrapper's receipt record: `snapshot()`
+ * reads the current state, `subscribe()` fires on every state transition and
+ * returns an unsubscribe. Both survive `retract()`: a retracted send reports
+ * `failed{reason:"cancelled"}`, never a stuck `queued`.
+ */
+export type SendReceipt = {
+  /** Immutable receipt key — valid across history adoption/release/retract. */
+  readonly id: string;
+  /**
+   * P0-4 (review R5): `NonNullable`, not the optional `ChatMessage["sendState"]`
+   * — a receipt record always carries a concrete state (the record's own field is
+   * non-optional, and the never-taken missing-record fallback returns `"failed"`),
+   * so admitting `undefined` here would force every consumer of this BREAKING API
+   * to narrow a value that cannot occur.
+   */
+  snapshot(): { state: NonNullable<ChatMessage["sendState"]>; failure?: SendFailure };
+  subscribe(cb: (s: ReturnType<SendReceipt["snapshot"]>) => void): () => void;
+};
 
 /**
  * One transcript bubble. `working: true` marks a live progress draft (the
@@ -27,16 +103,52 @@ export type ChatMessage = {
   working?: boolean;
   /**
    * P0-7b: the stable wire `id` the client stamped on the outbound
-   * `user_message` this bubble echoes (user role only). Set at send time so an
-   * `ack` frame can mark the bubble delivered. Absent on server-hydrated bubbles
-   * and on agent messages; not used by the history three-tier adoption.
+   * `user_message` this bubble echoes (user role only). Set at send/release time
+   * so an `ack` frame's `accepted` transition can find the bubble. Absent on
+   * server-hydrated bubbles, on agent messages, and on a still-`queued` P1-9
+   * hold (assigned only at release); not used by the history three-tier adoption.
    */
   wireId?: string;
   /**
-   * P0-7b: flips true once the agent acks this message's `wireId` at ingress
-   * (state-only — a view can render a ✓). Absent until then.
+   * P0-4: the render mirror of this send's authoritative tracker state (user
+   * role only). Replaces the old boolean `delivered` — `accepted`/`completed`
+   * are the two "the agent got it" states a ✓ renders; `failed` renders a ⚠
+   * with `sendFailure.reason`. Absent on server-hydrated and agent bubbles.
+   *
+   * `completed` is a wrapper-level promotion over the tracker's `accepted`,
+   * applied only on an explicit `turn_settled{outcome:"ok"}` for the anchor
+   * message (turnId === wireId); a coalesced non-anchor send stays `accepted`,
+   * and a legacy plugin (no `outcome`) leaves every message at `accepted`.
    */
-  delivered?: boolean;
+  sendState?: "queued" | "sent" | "accepted" | "completed" | "failed";
+  /** P0-4: present only when `sendState === "failed"` — the failure detail. */
+  sendFailure?: SendFailure;
+  /**
+   * P0-4 (internal): immutable receipt key linking this bubble to its
+   * `SendReceipt` record. History adoption rewrites `id` in place but keeps this
+   * key (it spreads the prior bubble), so the receipt survives id churn. Not a
+   * render field. @internal
+   */
+  receiptKey?: string;
+  /** Ephemeral live-turn correlation. History messages intentionally omit it. */
+  turnId?: string;
+  /**
+   * P1-9: true while this user message is HELD locally (a turn was in flight
+   * at send time) and not yet published. Local-only — never on the wire,
+   * never in history. Flips off (with wireId/turnId assigned) at release.
+   */
+  pending?: boolean;
+  /**
+   * P1-9: an explicit /stop converted this held message into a not-sent
+   * marker. Local-only. Text preserved; removable via retract(id).
+   */
+  retracted?: boolean;
+};
+
+export type ReasoningItem = {
+  id: string;
+  turnId: string;
+  text: string;
 };
 
 /** Native HITL approval decision; mirrors the plugin/SDK union. */
@@ -115,6 +227,45 @@ export type ApprovalRequest = {
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "error";
 
 /**
+ * Machine-readable cause of a TERMINAL connection failure (status `"error"`).
+ * Drives per-cause wording + the recovery affordance in the embedder UI, so a
+ * protocol mismatch or an embedder config bug no longer masquerades as the single
+ * hardcoded "Credentials expired" heading. Additive/open string union — a future
+ * producer can add a member and older UIs fall through to `"unknown"`.
+ */
+export type WebChannelErrorCause =
+  // `-ERR …Authentication Expired`: creds were valid, their TTL lapsed. Benign,
+  // expected with short-TTL creds (demo scene ⑤); re-auth mints a fresh one.
+  | "auth-expired"
+  // `-ERR …Authorization Violation` OR a PoP register 401: this credential was
+  // never/no-longer acceptable (possibly revoked). Re-auth. Stays
+  // revocation-NEUTRAL — a benign expiry hitting during a reconnect window is
+  // rejected at CONNECT as a violation, so this cause can cover that user story too.
+  | "auth-rejected"
+  // Explicit 426, version mismatch, malformed/missing `protocolVersion`, or a
+  // register reply with no `wrappedConversationKey`: the two sides speak
+  // incompatible wire contracts.
+  // Re-auth CANNOT help — the older side must be upgraded.
+  | "protocol-mismatch"
+  // Missing SaaS-pinned agent key OR a conversation-key unwrap failure: the E2E
+  // session could not be authenticated/established. Re-auth (which refetches the
+  // bootstrap, incl. the pin) can genuinely recover it — or it is tampering.
+  | "secure-channel-failed"
+  // Embedder-side bug: the bootstrap `jwt` is missing. A code fix, not a retry —
+  // re-auth provably cannot help.
+  | "config"
+  // This OpenClaw WebChannel account has admitted its fixed maximum number of
+  // distinct peer IDs. Re-auth cannot create room; the operator must route new
+  // users to another account.
+  | "capacity"
+  // PoP register error other than 401, 426, 503, or exact capacity 507
+  // (typically 5xx; the reply is deliberately a no-oracle, so another odd 4xx
+  // lands here). Retry later.
+  | "server"
+  // Fallback — any terminal error without a classified cause.
+  | "unknown";
+
+/**
  * The full client state, recomputed immutably on every change. A new object is
  * produced per change (the arrays too), so a `subscribe` listener can cheaply
  * detect updates by identity — and a React adapter can feed it straight into
@@ -122,6 +273,8 @@ export type ConnectionStatus = "connecting" | "connected" | "reconnecting" | "er
  */
 export type WebChannelState = {
   messages: ChatMessage[];
+  /** Ephemeral, non-history reasoning previews, bounded by the clients. */
+  reasoning: ReasoningItem[];
   approvals: ApprovalRequest[];
   status: ConnectionStatus;
   /** Convenience mirror of `status === "connected"`. */
@@ -132,6 +285,15 @@ export type WebChannelState = {
    * embedder show a real message instead of an eternal reconnect spinner.
    */
   error?: string;
+  /**
+   * Set alongside `error` when `status === "error"`: the machine-readable cause
+   * of the terminal failure, so the embedder can pick truthful wording + the
+   * right recovery affordance (not the single "Credentials expired" heading).
+   * P0-4: NEVER cleared on this instance — a CL2 terminal permanently retires
+   * the client (status stays "error" even if a manual `connect()` redials);
+   * recovery is a fresh client with fresh credentials.
+   */
+  errorCause?: WebChannelErrorCause;
   /**
    * Native "Bot is typing…" affordance. The server pushes a single `typing`
    * frame at the start of a turn, which flips this to `true`. The first
@@ -149,11 +311,9 @@ export type WebChannelState = {
   commands?: CommandCatalogEntry[];
   /**
    * The AGENT-plugin's wire-protocol version, learned from the register success
-   * reply (NATS path). `null` until a register completes, and STAYS null against
-   * a pre-v1 plugin whose reply omits the field (non-fatal — see the register
-   * policy in nats-client.ts). A value that DISAGREES with the client's
-   * `WEBCHANNEL_PROTOCOL_VERSION` never lands here: it is a TERMINAL error that
-   * moves `status` to `"error"` instead. Exposed for diagnostics (admin screen).
+   * reply (NATS path). `null` only until a register completes. Under mandatory
+   * protocol v2, an absent, malformed, or mismatched value never lands here: it
+   * is a TERMINAL error that moves `status` to `"error"`. Exposed for diagnostics.
    */
   agentProtocolVersion: number | null;
   /**
@@ -168,131 +328,31 @@ export type WebChannelState = {
 export type Listener = (state: WebChannelState) => void;
 
 /**
- * Client options — all optional. A zero-arg construction connects to
- * `/webchannel/ws` on the current origin with no ticket (the anonymous dev
- * path).
+ * Public aliases used by `WebChannelNATSClient`. All fields are optional so an
+ * embedder can adopt configuration incrementally; production deployments
+ * normally provide the identity and relay fields together.
  */
 export type WebChannelOptions = {
   /**
-   * Full WebSocket URL (`ws://` or `wss://`), e.g. for a CROSS-ORIGIN gateway.
-   * Takes precedence over `path`. Use this when the page and the gateway live on
-   * different origins (the same-origin `path` form can't express that).
-   */
-  url?: string;
-  /**
-   * WS path on the CURRENT origin (ignored when `url` is set). Defaults to
-   * `/webchannel/ws`.
-   */
-  path?: string;
-  /**
-   * Supplies a short-lived token for the `jwt` server strategy (delivered on the
-   * WS upgrade URL as `?ticket=<jwt>`). Called on EVERY (re)connect so a
-   * reconnect always gets a FRESH token (the host session is long-lived, the
-   * token is short-lived — AUTH.md §5). Returning null/empty connects with no
-   * token (cookie / trusted-header auth).
-   */
-  getTicket?: () => Promise<string | null>;
-  // -----------------------------------------------------------------------
-  // NATS mode options (AC 5: NATS cutover)
-  // -----------------------------------------------------------------------
-  /**
-   * NATS WebSocket URL. When provided, client connects directly to NATS
-   * instead of gateway-WS. Requires bootstrapJwt, accountId, tenant, and peerId.
+   * NATS relay WebSocket URL. Defaults to the wrapper's hosted-relay placeholder
+   * when omitted; production callers should supply the enrolled relay URL.
    */
   natsUrl?: string;
   /**
-   * Bootstrap JWT (RS256-signed) from SaaS. Required for NATS mode.
-   * Contains cnf.jwk claim with device public key.
+   * SaaS-issued bootstrap JWT used by register-hop admission. It carries the
+   * peer identity and device confirmation key.
    */
   bootstrapJwt?: string;
   /**
-   * Account (deployment) id — the wire identity (from JWT claims). Required for
-   * NATS mode.
+   * Account/deployment identifier used in the per-account NATS subject prefix.
    */
   accountId?: string;
   /**
-   * Tenant ID (from JWT claims). Required for NATS mode.
+   * Tenant identifier used in the NATS subject namespace.
    */
   tenant?: string;
   /**
-   * Peer ID (JWT sub claim). Required for NATS mode.
+   * Peer identifier, normally the bootstrap JWT `sub`, used for per-peer routing.
    */
   peerId?: string;
 };
-
-/** Wire envelope sent TO the gateway. Mirrors `src/transport.ts`. */
-export type InboundWsMessage =
-  // P0-7a: `id` is a stable, client-minted unique id per logical send, used for
-  // server-side ingress idempotency (a rapid double-submit or a future replay is
-  // deduped). OPTIONAL for back-compat: an older client omits it and the frame
-  // is not deduped.
-  | { type: "user_message"; text: string; id?: string }
-  | { type: "approval_decision"; id: string; decision: ApprovalDecision }
-  /**
-   * History pagination request. The widget emits this when the user scrolls
-   * up past the hydrated bubble list and asks for more. `before` is the
-   * oldest message id currently visible in the widget; `limit` is the page
-   * size (the server falls back to its configured `pageSize` when omitted).
-   * The SDK does NOT auto-fire this on the client's behalf — UI code calls
-   * `client.loadHistory(...)` on user action (e.g. scroll-to-top button).
-   */
-  | { type: "load_history"; before?: string; limit?: number }
-  /**
-   * Slash-command discovery request (P0-3). The widget emits this the first
-   * time the user types `/`; the agent answers with a `commands` frame. No
-   * params — the catalog is not paged. Fired by UI code via
-   * `client.loadCommands()`, never automatically by the SDK.
-   */
-  | { type: "load_commands" };
-
-/** Wire envelope received FROM the gateway. Mirrors `src/transport.ts`. */
-export type OutboundWsMessage =
-  | { type: "agent_message"; text: string; id?: string }
-  | { type: "progress"; id: string; text: string }
-  | {
-      type: "approval_request";
-      id: string;
-      kind: "exec" | "plugin";
-      title: string;
-      description?: string;
-      prompt: string;
-      options: ApprovalOption[];
-      expiresAtMs?: number;
-    }
-  | { type: "approval_resolved"; id: string; decision: ApprovalDecision }
-  /**
-   * Authoritative pending-approval snapshot (#15). Emitted on every successful
-   * register (NATS path) carrying the peer's COMPLETE still-pending set for the
-   * account. The client reconciles its approval state against it: rehydrate lost
-   * cards, retire cards resolved elsewhere, and re-send a lost decision. An
-   * empty `approvals` array is meaningful (nothing pending → retire stale cards).
-   *
-   * `resolved` (#19, OPTIONAL) carries recently-RESOLVED outcomes so the client's
-   * Leg B can render the actual decision instead of a neutral "resolved
-   * (elsewhere)". Optional for back-compat with an older plugin that never sends
-   * it (the client falls back to "unknown").
-   */
-  | { type: "approval_snapshot"; approvals: Array<{
-      id: string;
-      kind: "exec" | "plugin";
-      title: string;
-      description?: string;
-      prompt: string;
-      options: ApprovalOption[];
-      expiresAtMs?: number;
-    }>; resolved?: Array<{ id: string; decision: ApprovalDecision }> }
-  /** Native typing affordance; see `WebChannelState.isTyping`. */
-  | { type: "typing" }
-  /**
-   * History snapshot / pagination response. Emitted exactly ONCE per
-   * connection after the first heartbeat (initial snapshot) AND in response
-   * to `load_history` requests (older pages). The widget prepends `messages`
-   * to its transcript, deduplicating by id.
-   */
-  | { type: "history"; messages: ChatMessage[] }
-  /**
-   * Slash-command discovery catalog (P0-3), sent in reply to `load_commands`.
-   * Config-filtered, alias-free, name-sorted. The client replaces
-   * `WebChannelState.commands` wholesale with it.
-   */
-  | { type: "commands"; commands: CommandCatalogEntry[] };

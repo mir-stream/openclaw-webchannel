@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Hermetic enrolled-NATS-transport E2E (#18 — agent-side). Proves, in ONE running
-# real gateway with devOpen OFF, that the PLUGIN obtains tenant-scoped NATS user
+# real gateway, that the PLUGIN obtains tenant-scoped NATS user
 # credentials via the REAL device-flow enrollment-server (enroll → auto-approve →
 # poll) through the PRODUCTION createEnrolledNatsConnection path, connects
 # (NKEY-authenticated) to a JWT-auth nats-server whose operator/account come from
@@ -15,7 +15,7 @@
 #
 # Everything runs under an isolated OPENCLAW_HOME=/tmp/oc-enrolled-e2e (and
 # HOME=$OCH so the plugin's enrollment credential store is isolated too); your
-# real ~/.openclaw and ~/.openclaw-webchannel are never touched. Distinct ports
+# real ~/.openclaw and ~/.openclaw-webchannel-v2 are never touched. Distinct ports
 # avoid colliding with the other harnesses. Self-cleaning (trap on EXIT).
 set -euo pipefail
 
@@ -32,6 +32,7 @@ NATS_WS=18422
 NATS_TCP=14422
 ECHO_PORT=18902
 ISSUER_PORT=3921
+ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
 
 TENANT=default-tenant
 ACCOUNT_ID=default-agent
@@ -80,6 +81,7 @@ SAAS_ISSUER="$SAAS_ISSUER" \
 NATS_URL="ws://127.0.0.1:$NATS_WS" \
 NATS_CONFIG_OUT="$OCH" \
 ENABLE_TEST_ROUTES=1 \
+ENROLLMENT_ADMIN_TOKEN="$ENROLLMENT_ADMIN_TOKEN" \
 POLL_INTERVAL_SECONDS=1 \
   node --import tsx "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
 ISSUER_PID=$!
@@ -214,8 +216,7 @@ cat > "$OCH/.openclaw/openclaw.json" <<JSON
             "strategy": "jwt",
             "jwt": {
               "jwksUrl": "http://127.0.0.1:$ISSUER_PORT/.well-known/jwks.json",
-              "issuer": "$SAAS_ISSUER",
-              "audience": "$ACCOUNT_ID"
+              "issuer": "$SAAS_ISSUER"
             }
           },
           "dmSecurity": "allowlist",
@@ -233,7 +234,7 @@ echo "[run-enrolled] wrote $OCH/.openclaw/openclaw.json"
 #    After Cycle 1/2 the gateway is CONSUME-ONLY — it no longer enrolls. The
 #    device flow runs HERE, at config time, exactly as a production operator runs
 #    `openclaw channels add`. HOME=$OCH so creds persist to
-#    $OCH/.openclaw-webchannel/<account>/credentials.json, which the gateway
+#    the tuple-scoped v2 credentials path under $OCH, which the gateway
 #    (also HOME=$OCH) consumes. Identity is passed via the generic CLI flags the
 #    webchannel setup adapter maps: --base-url→saas.baseUrl, --url→tenant. The
 #    wire identity is the --account value itself (no --token→agentId mapping
@@ -261,6 +262,7 @@ done
 [ -z "$USER_CODE" ] && { echo "[run-enrolled] TIMEOUT waiting for user_code — channels-add log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-enrolled] enrollment user_code=$USER_CODE — approving…"
 APPROVE="$(curl -fsS -X POST "http://127.0.0.1:$ISSUER_PORT/approve" \
+  -H "Authorization: Bearer $ENROLLMENT_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d "{\"user_code\":\"$USER_CODE\"}" || true)"
 echo "[run-enrolled] approve response: $APPROVE"
 
@@ -271,15 +273,16 @@ ADD_PID=""
 if [ "$ADD_RC" -ne 0 ]; then
   echo "[run-enrolled] channels add failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add.log"; exit 2
 fi
-CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
+CRED_FILE="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+  credentials "$TENANT" "$ACCOUNT_ID" "$OCH")"
 [ -f "$CRED_FILE" ] || { echo "[run-enrolled] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-enrolled] ✓ credentials persisted at $CRED_FILE"
 
 # 6b². Re-assert the register-hop admission shape AFTER `channels add`. The
-#      setup adapter writes the demo-proven block (`admission: "auto"`,
+#      setup adapter writes the demo-proven block (`admission: "register-hop"`,
 #      `dmSecurity: "open"`) into the account — but "auto" is an EXPLICIT
-#      override that disables the HTTP register hop (no aud→account dispatch
-#      entry ⇒ challenge 401 "No account for token audience"), and this harness
+#      override that disables the account-bound NATS register hop (the live
+#      account subject has no prepared verifier/handler), and this harness
 #      exists precisely to drive the register hop. Restore the pre-add intent:
 #      register-hop admission + allowlist DM security.
 node -e '
@@ -306,9 +309,10 @@ HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &
 GW_PID=$!
-echo "[run-enrolled] gateway pid=$GW_PID — waiting for plugin registration (consume persisted creds)…"
+echo "[run-enrolled] gateway pid=$GW_PID — waiting for structured account readiness (consume persisted creds)…"
 for i in $(seq 1 240); do
-  if grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$OCH/gateway.log" 2>/dev/null; then
+  LATEST_AGGREGATE="$(grep "event=webchannel\.account_aggregate" "$OCH/gateway.log" 2>/dev/null | tail -n 1 || true)"
+  if printf '%s\n' "$LATEST_AGGREGATE" | grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=1 totalCount=1"; then
     echo "[run-enrolled] gateway ready (consumed creds + connected)"
     break
   fi
@@ -317,7 +321,7 @@ for i in $(seq 1 240); do
   fi
   sleep 0.5
   if [ "$i" -eq 240 ]; then
-    echo "[run-enrolled] TIMEOUT waiting for gateway registration — log:"; cat "$OCH/gateway.log"; exit 2
+    echo "[run-enrolled] TIMEOUT waiting for structured account readiness — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
 

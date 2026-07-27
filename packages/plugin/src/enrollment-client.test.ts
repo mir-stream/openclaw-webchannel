@@ -11,12 +11,32 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { EnrollmentClient } from "./enrollment-client.js";
+import {
+  EnrollmentClient,
+  deriveEnrollmentEndpoints,
+} from "./enrollment-client.js";
 import type { EnrollmentOptions } from "./enrollment-client.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
-import { mkdirSync, rmSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import {
+  mkdirSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { accountCredentialPath, legacyCredentialPath } from "./account-config.js";
+import { legacyTuplePaths } from "./storage-paths.js";
+import { MemoryEnrollmentRepository } from "../../saas/src/enrollment-repository.js";
+import { DeviceFlowEnrollment } from "../../saas/src/device-flow-enrollment.js";
+import {
+  CREDENTIAL_BINDING_IDENTITY_FIELD,
+  createCredentialIdentityForEnrollment,
+} from "./credential-document.js";
+import { generateKeyPair } from "./e2e-crypto.js";
 
 // ---------------------------------------------------------------------------
 // Test utilities
@@ -26,16 +46,30 @@ const mockFetch = vi.fn();
 
 global.fetch = mockFetch;
 
-const createTestOptions = (override?: Partial<EnrollmentOptions>): EnrollmentOptions => ({
-  saasEnrollUrl: "https://saas.com/api/enroll",
-  saasPollUrl: "https://saas.com/api/poll",
-  tenant: "test-tenant",
-  accountId: "test-agent",
-  credentialPath: join(tmpdir(), `openclaw-test-${Date.now()}`, "credentials.json"),
-  displayInstructions: false,
-  _minPollIntervalMs: 0,
-  ...override,
-});
+const createTestOptions = (override?: Partial<EnrollmentOptions>): EnrollmentOptions => {
+  const defaultCredentialPath = join(
+    tmpdir(),
+    `openclaw-test-${Date.now()}-${Math.random()}`,
+    "credentials.json",
+  );
+  const options: EnrollmentOptions = {
+    saasBaseUrl: "https://saas.com",
+    saasEnrollUrl: "https://saas.com/api/enroll",
+    saasPollUrl: "https://saas.com/api/poll",
+    tenant: "test-tenant",
+    accountId: "test-agent",
+    credentialPath: defaultCredentialPath,
+    displayInstructions: false,
+    _minPollIntervalMs: 0,
+    ...override,
+  };
+  return {
+    ...options,
+    _home:
+      override?._home ??
+      join(dirname(options.credentialPath ?? defaultCredentialPath), "isolated-home"),
+  };
+};
 
 // ---------------------------------------------------------------------------
 // Test suite
@@ -71,6 +105,39 @@ describe("EnrollmentClient", () => {
   });
 
   describe("enroll() - first boot", () => {
+    it("25: accepts a final poll that reaches the server just after expiresAt", async () => {
+      let repositoryNow = 1_001;
+      const repository = new MemoryEnrollmentRepository({ autoSweep: false, retentionMs: 50, clock: () => repositoryNow });
+      const boundaryResult = { creds: { userJwt: "boundary-jwt", userSeed: "boundary-seed", userPubkey: "boundary-pub" }, peerId: "boundary-peer" };
+      await repository.createEnrollment({
+        device_code: "boundary-device", user_code: "BOUND-ARY1", agentPublicKey: "A".repeat(43), tenant: "test-tenant", accountId: "test-agent",
+        createdAt: 0, expiresAt: 1_000, status: "approved", approvedAt: 999, natsCreds: boundaryResult.creds, peerId: boundaryResult.peerId,
+      });
+      const saas = new DeviceFlowEnrollment({
+        repository,
+        saasTrustChain: { rsaPrivateKeyPem: "unused", natsAccountSeed: "unused" },
+        natsAccountConfig: { operatorJwt: "unused", accountJwt: "unused", resolverConfig: {}, accountPublicKey: "unused" },
+        saasBaseUrl: "https://saas.com", jwksUrl: "https://saas.com/jwks", bootstrapUrl: "https://saas.com/bootstrap", natsUrl: "wss://nats.saas.com",
+      });
+      mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({
+        device_code: "boundary-device", user_code: "BOUND-ARY1",
+        verification_uri: "https://saas.com/enroll", verification_uri_complete: "https://saas.com/enroll?user_code=BOUND-ARY1",
+        expires_in: 1, interval: 0,
+      }) });
+      const now = vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValueOnce(999).mockReturnValue(1_001);
+      mockFetch.mockImplementationOnce(async () => {
+        // This is a fixture transport, but the response itself comes from the
+        // shipped DeviceFlowEnrollment + repository transition, not a canned
+        // success. Repository time is already beyond expiresAt.
+        expect(Date.now()).toBeGreaterThan(1_000);
+        repositoryNow = 1_001;
+        const response = await saas.poll({ device_code: "boundary-device" });
+        return { ok: !("error" in response), json: async () => response };
+      });
+      await expect(client.enroll()).resolves.toMatchObject({ peerId: "boundary-peer" });
+      expect(mockFetch).toHaveBeenCalledTimes(2); now.mockRestore();
+    });
+
     it("should generate identity key and initiate enrollment", async () => {
       // Mock enrollment response
       mockFetch.mockResolvedValueOnce({
@@ -105,6 +172,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -146,6 +214,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -156,7 +225,7 @@ describe("EnrollmentClient", () => {
       const body = JSON.parse(init.body) as {
         agentPublicKey: string;
         pluginVersion?: string;
-        protocolVersion?: number;
+        protocolVersion: number;
       };
       expect(typeof body.agentPublicKey).toBe("string");
       expect(typeof body.pluginVersion).toBe("string");
@@ -204,6 +273,7 @@ describe("EnrollmentClient", () => {
             peerId: "mock-peer-id",
             jwksUrl: "https://saas.com/.well-known/jwks.json",
             bootstrapUrl: "https://saas.com/bootstrap",
+            natsUrl: "wss://nats.saas.com",
           }),
         });
 
@@ -243,6 +313,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -250,16 +321,40 @@ describe("EnrollmentClient", () => {
 
       // Credentials should be persisted
       expect(existsSync(credentialPath)).toBe(true);
+      const persisted = JSON.parse(readFileSync(credentialPath, "utf8")) as Record<
+        string,
+        any
+      >;
+      expect(persisted[CREDENTIAL_BINDING_IDENTITY_FIELD]).toEqual(
+        createCredentialIdentityForEnrollment({
+          tenant: "test-tenant",
+          accountId: "test-agent",
+          saasBaseUrl: "https://saas.com",
+          relayUrl: "wss://nats.saas.com",
+          agentPublicKey: persisted.identityKey.publicKey,
+        }),
+      );
     });
   });
 
   describe("enroll() - reconnection", () => {
     it("should load existing credentials and skip enrollment", async () => {
+      const pair = generateKeyPair();
+      const key = Buffer.from(pair.publicKey).toString("base64url");
+      const privateKey = Buffer.from(pair.privateKey).toString("base64url");
       // Create mock credentials file
       const mockCredentials = {
+        [CREDENTIAL_BINDING_IDENTITY_FIELD]:
+          createCredentialIdentityForEnrollment({
+            tenant: "test-tenant",
+            accountId: "test-agent",
+            saasBaseUrl: "https://saas.com",
+            relayUrl: "wss://nats.saas.com",
+            agentPublicKey: key,
+          }),
         identityKey: {
-          publicKey: "mock_public_key",
-          privateKey: "mock_private_key",
+          publicKey: key,
+          privateKey,
         },
         enrollment: {
           creds: {
@@ -269,7 +364,9 @@ describe("EnrollmentClient", () => {
           peerId: "stored-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         },
+        accountId: "test-agent",
         tenant: "test-tenant",
         saasEnrollUrl: "https://saas.com/api/enroll",
         saasPollUrl: "https://saas.com/api/poll",
@@ -293,6 +390,196 @@ describe("EnrollmentClient", () => {
 
       // Should NOT have called SaaS endpoints
       expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("treats an injected credential reader as a complete migration seam", async () => {
+      const isolatedHome = join(dirname(credentialPath), "reader-home");
+      const legacy = legacyTuplePaths("test-agent", isolatedHome);
+      mkdirSync(legacy.directory, { recursive: true });
+      const legacyBytes = Buffer.from("{TOP-SECRET malformed legacy");
+      writeFileSync(legacy.credentialPath, legacyBytes);
+
+      const pair = generateKeyPair();
+      const key = Buffer.from(pair.publicKey).toString("base64url");
+      const serialized = JSON.stringify({
+        [CREDENTIAL_BINDING_IDENTITY_FIELD]:
+          createCredentialIdentityForEnrollment({
+            tenant: "test-tenant",
+            accountId: "test-agent",
+            saasBaseUrl: "https://saas.com",
+            relayUrl: "wss://nats.saas.com",
+            agentPublicKey: key,
+          }),
+        identityKey: {
+          publicKey: key,
+          privateKey: Buffer.from(pair.privateKey).toString("base64url"),
+        },
+        enrollment: {
+          creds: { userJwt: "stored-jwt", userSeed: "stored-seed" },
+          peerId: "stored-peer",
+          jwksUrl: "https://saas.com/jwks",
+          bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
+        },
+        accountId: "test-agent",
+        tenant: "test-tenant",
+        saasEnrollUrl: "https://saas.com/api/enroll",
+        saasPollUrl: "https://saas.com/api/poll",
+      });
+      const read = vi.fn(() => serialized);
+      const injected = new EnrollmentClient(createTestOptions({
+        credentialPath,
+        _home: isolatedHome,
+        _readCredentialFile: read,
+      }));
+
+      await expect(injected.enroll()).resolves.toMatchObject({
+        peerId: "stored-peer",
+      });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(readFileSync(legacy.credentialPath)).toEqual(legacyBytes);
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("upgrades a complete owned v1 exact override and skips enrollment", async () => {
+      const pair = generateKeyPair();
+      const key = Buffer.from(pair.publicKey).toString("base64url");
+      const privateKey = Buffer.from(pair.privateKey).toString("base64url");
+      const legacy = {
+        identityKey: { publicKey: key, privateKey },
+        enrollment: {
+          creds: { userJwt: "LEGACY-JWT", userSeed: "LEGACY-SEED" },
+          peerId: "legacy",
+          jwksUrl: "https://saas.com/jwks",
+          bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
+        },
+        accountId: "test-agent",
+        tenant: "test-tenant",
+        saasEnrollUrl: "https://saas.com/api/enroll",
+        saasPollUrl: "https://saas.com/api/poll",
+      };
+      writeFileSync(credentialPath, JSON.stringify(legacy));
+      await expect(client.enroll()).resolves.toMatchObject({
+        peerId: "legacy",
+      });
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(
+        JSON.parse(readFileSync(credentialPath, "utf8")),
+      ).toHaveProperty(CREDENTIAL_BINDING_IDENTITY_FIELD);
+    });
+  });
+
+  describe("P1-1 offline re-key", () => {
+    const queueSuccessfulEnrollment = (peerId: string) => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: `device-${peerId}`,
+          user_code: "ABCD-1234",
+          verification_uri: "https://saas.com/enroll",
+          verification_uri_complete: "https://saas.com/enroll?user_code=ABCD-1234",
+          expires_in: 600,
+          interval: 5,
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          creds: { userJwt: `jwt-${peerId}`, userSeed: `seed-${peerId}` },
+          peerId,
+          jwksUrl: "https://saas.com/.well-known/jwks.json",
+          bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
+        }),
+      });
+    };
+
+    it("24: archiving an explicit credentialPath preserves old material and permits a fresh identity", async () => {
+      queueSuccessfulEnrollment("first");
+      await client.enroll();
+      const firstKey = Buffer.from(client.getIdentityKey().publicKey).toString("hex");
+      const archivePath = `${credentialPath}.archive`;
+      renameSync(credentialPath, archivePath);
+
+      const replacement = new EnrollmentClient(createTestOptions({ credentialPath }));
+      queueSuccessfulEnrollment("second");
+      await replacement.enroll();
+      const secondKey = Buffer.from(replacement.getIdentityKey().publicKey).toString("hex");
+
+      expect(secondKey).not.toBe(firstKey);
+      expect(existsSync(archivePath)).toBe(true);
+      expect(mockFetch).toHaveBeenCalledTimes(4);
+    });
+
+    it("24: archive-first replacement covers every path shape without key reuse", async () => {
+      const fixtureHome = join(tmpdir(), `openclaw-reset-${Date.now()}`);
+      const cases = [
+        {
+          name: "default-layout",
+          path: accountCredentialPath(
+            { tenant: "test-tenant", accountId: "default-layout" },
+            { home: fixtureHome },
+          ),
+          legacy: false,
+        },
+        { name: "explicit-override", path: join(fixtureHome, "override.json"), legacy: false },
+        {
+          name: "default",
+          path: accountCredentialPath(
+            { tenant: "test-tenant", accountId: "default" },
+            { home: fixtureHome },
+          ),
+          legacy: true,
+        },
+      ];
+      try {
+        for (const scenario of cases) {
+          mockFetch.mockReset();
+          const pathOptions = scenario.legacy
+            ? { credentialPath: undefined, _home: fixtureHome }
+            : { credentialPath: scenario.path };
+          const firstClient = new EnrollmentClient(createTestOptions({ accountId: scenario.name, ...pathOptions }));
+          queueSuccessfulEnrollment(`${scenario.name}-old`);
+          await firstClient.enroll();
+          const oldKey = Buffer.from(firstClient.getIdentityKey().publicKey).toString("base64url");
+          const registry = new MemoryEnrollmentRepository();
+          expect((await registry.register("test-tenant", scenario.name, oldKey, null)).ok).toBe(true);
+          expect(await registry.revokeActive("test-tenant", scenario.name)).toBe(true);
+
+          let legacyArchive: string | undefined;
+          if (scenario.legacy) {
+            const legacy = legacyCredentialPath(fixtureHome);
+            mkdirSync(join(fixtureHome, ".openclaw-webchannel"), { recursive: true });
+            writeFileSync(legacy, JSON.stringify({
+              identityKey: { publicKey: oldKey, privateKey: oldKey },
+              enrollment: { creds: { userJwt: "legacy", userSeed: "legacy" } },
+            }));
+            legacyArchive = `${legacy}.archive-${scenario.name}`;
+            renameSync(legacy, legacyArchive);
+          }
+          const archivePath = `${scenario.path}.archive-${scenario.name}`;
+          renameSync(scenario.path, archivePath);
+
+          let incomingKey = "";
+          mockFetch.mockImplementationOnce(async (_url, init) => {
+            incomingKey = (JSON.parse(String(init?.body)) as { agentPublicKey: string }).agentPublicKey;
+            const registration = await registry.register("test-tenant", scenario.name, incomingKey, null);
+            expect(registration.ok, scenario.name).toBe(true);
+            return { ok: true, json: async () => ({ device_code: `device-${scenario.name}`, user_code: "RESET-1234", verification_uri: "https://saas.com/enroll", verification_uri_complete: "https://saas.com/enroll?user_code=RESET-1234", expires_in: 600, interval: 0 }) };
+          });
+          mockFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ creds: { userJwt: "new-jwt", userSeed: "new-seed" }, peerId: `new-${scenario.name}`, jwksUrl: "https://saas.com/jwks", bootstrapUrl: "https://saas.com/bootstrap", natsUrl: "wss://nats.saas.com" }) });
+          const replacement = new EnrollmentClient(createTestOptions({ accountId: scenario.name, ...pathOptions }));
+          await replacement.enroll();
+          expect(incomingKey).not.toBe(oldKey);
+          expect((await registry.getActive("test-tenant", scenario.name))?.publicKey).toBe(incomingKey);
+          expect(existsSync(archivePath)).toBe(true);
+          if (legacyArchive) expect(existsSync(legacyArchive)).toBe(true);
+          expect(mockFetch).toHaveBeenCalledTimes(4);
+        }
+      } finally {
+        rmSync(fixtureHome, { recursive: true, force: true });
+      }
     });
   });
 
@@ -320,6 +607,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -379,6 +667,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -423,6 +712,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -439,6 +729,116 @@ describe("EnrollmentClient", () => {
   });
 
   describe("Error handling", () => {
+    it("does not enroll through a dangling credential symlink", async () => {
+      symlinkSync(join(dirname(credentialPath), "missing-target"), credentialPath);
+      const generateIdentityKey = vi.fn(() => generateKeyPair());
+      const danglingClient = new EnrollmentClient(
+        createTestOptions({
+          credentialPath,
+          _generateIdentityKey: generateIdentityKey,
+        }),
+      );
+
+      await expect(danglingClient.enroll()).rejects.toMatchObject({
+        code: "credentials-invalid-read-failed",
+        fields: [],
+      });
+      expect(generateIdentityKey).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it("treats EACCES as read-failed before key generation or enrollment", async () => {
+      const read = vi.fn(() => {
+        throw Object.assign(new Error("SECRET denied path"), {
+          code: "EACCES",
+        });
+      });
+      const generateIdentityKey = vi.fn(() => generateKeyPair());
+      const inaccessible = new EnrollmentClient(
+        createTestOptions({
+          _readCredentialFile: read,
+          _generateIdentityKey: generateIdentityKey,
+        }),
+      );
+
+      await expect(inaccessible.enroll()).rejects.toMatchObject({
+        code: "credentials-invalid-read-failed",
+        fields: [],
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(generateIdentityKey).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["tenant", { tenant: "invalid.tenant" }, "storage.tenant"],
+      ["account", { accountId: "../../unsafe" }, "storage.accountId"],
+      ["malformed SaaS URL", { saasBaseUrl: "not a url" }, "binding.saasBaseUrl"],
+      ["relative SaaS URL", { saasBaseUrl: "/control" }, "binding.saasBaseUrl"],
+      ["non-HTTP SaaS URL", { saasBaseUrl: "ftp://saas.example" }, "binding.saasBaseUrl"],
+    ] as const)(
+      "rejects invalid binding %s before fetch even with an explicit credential path",
+      (_label, override, expectedField) => {
+        const explicitPath = join(
+          tmpdir(),
+          `openclaw-invalid-binding-${Date.now()}`,
+          "credentials.json",
+        );
+        expect(() =>
+          new EnrollmentClient(
+            createTestOptions({
+              ...override,
+              credentialPath: explicitPath,
+            }),
+          ),
+        ).toThrow(expectedField);
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(existsSync(explicitPath)).toBe(false);
+      },
+    );
+
+    it("rejects split SaaS base/endpoints before any request or persistence", () => {
+      const splitPath = join(
+        tmpdir(),
+        `openclaw-split-authority-${Date.now()}`,
+        "credentials.json",
+      );
+      expect(() =>
+        new EnrollmentClient(
+          createTestOptions({
+            saasBaseUrl: "https://binding-authority.example/",
+            saasEnrollUrl:
+              "https://different-acquisition.example/api/enroll",
+            saasPollUrl:
+              "https://different-acquisition.example/api/poll",
+            credentialPath: splitPath,
+          }),
+        ),
+      ).toThrow(
+        /enrollment endpoints do not match saasBaseUrl fields=saasEnrollUrl,saasPollUrl/,
+      );
+      expect(mockFetch).not.toHaveBeenCalled();
+      expect(existsSync(splitPath)).toBe(false);
+    });
+
+    it("derives coherent single-slash endpoints from a trailing-slash SaaS base", () => {
+      expect(
+        deriveEnrollmentEndpoints("https://saas.example///"),
+      ).toEqual({
+        saasEnrollUrl: "https://saas.example/api/enroll",
+        saasPollUrl: "https://saas.example/api/poll",
+      });
+      expect(() =>
+        new EnrollmentClient(
+          createTestOptions({
+            saasBaseUrl: "https://saas.example///",
+            saasEnrollUrl: "https://saas.example/api/enroll",
+            saasPollUrl: "https://saas.example/api/poll",
+          }),
+        ),
+      ).not.toThrow();
+    });
+
     it("should throw on HTTP error", async () => {
       mockFetch.mockResolvedValue({
         ok: false,
@@ -471,6 +871,71 @@ describe("EnrollmentClient", () => {
       });
 
       await expect(client.enroll()).rejects.toThrow("Enrollment failed");
+    });
+
+    it("does not persist a malformed successful enrollment payload", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: "test_device_code",
+          user_code: "ABCD-1234",
+          verification_uri: "https://saas.com/enroll",
+          verification_uri_complete:
+            "https://saas.com/enroll?user_code=ABCD-1234",
+          expires_in: 600,
+          interval: 5,
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          creds: {
+            userJwt: "SECRET-JWT",
+            userSeed: "SECRET-SEED",
+          },
+          peerId: "mock-peer-id",
+          jwksUrl: "https://saas.com/.well-known/jwks.json",
+          bootstrapUrl: "https://saas.com/bootstrap",
+          // Untrusted JSON can violate the TypeScript response shape.
+          natsUrl: null,
+        }),
+      });
+
+      await expect(client.enroll()).rejects.toMatchObject({
+        code: "credentials-invalid-invalid-document",
+        fields: ["enrollment.natsUrl"],
+      });
+      expect(existsSync(credentialPath)).toBe(false);
+    });
+
+    it("does not persist a successful enrollment response without a delivered relay", async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: "test_device_code",
+          user_code: "ABCD-1234",
+          verification_uri: "https://saas.com/enroll",
+          verification_uri_complete:
+            "https://saas.com/enroll?user_code=ABCD-1234",
+          expires_in: 600,
+          interval: 5,
+        }),
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          creds: { userJwt: "SECRET-JWT", userSeed: "SECRET-SEED" },
+          peerId: "mock-peer-id",
+          jwksUrl: "https://saas.com/.well-known/jwks.json",
+          bootstrapUrl: "https://saas.com/bootstrap",
+        }),
+      });
+
+      await expect(client.enroll()).rejects.toMatchObject({
+        code: "credentials-invalid-invalid-document",
+        fields: ["enrollment.natsUrl"],
+      });
+      expect(existsSync(credentialPath)).toBe(false);
     });
 
     it("should throw on enrollment expiration", async () => {
@@ -510,6 +975,40 @@ describe("EnrollmentClient", () => {
   });
 
   describe("Credential persistence", () => {
+    it("never overwrites a credential file created while enrollment is polling", async () => {
+      const concurrentDocument = "concurrently-created-credential-document";
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          device_code: "test_device_code",
+          user_code: "ABCD-1234",
+          verification_uri: "https://saas.com/enroll",
+          verification_uri_complete:
+            "https://saas.com/enroll?user_code=ABCD-1234",
+          expires_in: 600,
+          interval: 5,
+        }),
+      });
+      mockFetch.mockImplementationOnce(async () => {
+        writeFileSync(credentialPath, concurrentDocument);
+        return {
+          ok: true,
+          json: async () => ({
+            creds: { userJwt: "new-jwt", userSeed: "new-seed" },
+            peerId: "new-peer",
+            jwksUrl: "https://saas.com/.well-known/jwks.json",
+            bootstrapUrl: "https://saas.com/bootstrap",
+            natsUrl: "wss://nats.saas.com",
+          }),
+        };
+      });
+
+      await expect(client.enroll()).rejects.toMatchObject({
+        code: "storage-io-failed",
+      });
+      expect(readFileSync(credentialPath, "utf8")).toBe(concurrentDocument);
+    });
+
     it("should create credential directory if missing", async () => {
       const options = createTestOptions({
         credentialPath: join(tmpdir(), `openclaw-test-${Date.now()}-nested`, "nested", "credentials.json"),
@@ -539,6 +1038,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 
@@ -550,6 +1050,109 @@ describe("EnrollmentClient", () => {
       // Cleanup
       const dir = require("node:path").dirname(options.credentialPath!);
       require("node:fs").rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("never overwrites credentials published by a concurrent enrollment winner", async () => {
+      const clientA = new EnrollmentClient(
+        createTestOptions({
+          tenant: "tenant-A",
+          accountId: "race-a",
+          credentialPath,
+          _home: join(dirname(credentialPath), "home-race-a"),
+        }),
+      );
+      const clientB = new EnrollmentClient(
+        createTestOptions({
+          tenant: "tenant-B",
+          accountId: "race-b",
+          credentialPath,
+          _home: join(dirname(credentialPath), "home-race-b"),
+        }),
+      );
+      let releaseAPoll = (): void => {};
+      const holdAPoll = new Promise<void>((resolve) => {
+        releaseAPoll = resolve;
+      });
+      let markAPollStarted = (): void => {};
+      const aPollStarted = new Promise<void>((resolve) => {
+        markAPollStarted = resolve;
+      });
+
+      mockFetch.mockImplementation(async (url, init) => {
+        const body = JSON.parse(String(init?.body)) as {
+          accountId?: string;
+          device_code?: string;
+        };
+        if (String(url).endsWith("/api/enroll")) {
+          return {
+            ok: true,
+            json: async () => ({
+              device_code: `device-${body.accountId}`,
+              user_code: `CODE-${body.accountId}`,
+              verification_uri: "https://saas.com/enroll",
+              verification_uri_complete: "https://saas.com/enroll?user_code=RACE",
+              expires_in: 600,
+              interval: 0,
+            }),
+          };
+        }
+
+        const accountId =
+          body.device_code === "device-race-a" ? "race-a" : "race-b";
+        if (accountId === "race-a") {
+          markAPollStarted();
+          await holdAPoll;
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            creds: {
+              userJwt: `JWT-${accountId}`,
+              userSeed: `SEED-${accountId}`,
+            },
+            peerId: `peer-${accountId}`,
+            jwksUrl: "https://saas.com/.well-known/jwks.json",
+            bootstrapUrl: "https://saas.com/bootstrap",
+            natsUrl: "wss://nats.saas.com",
+          }),
+        };
+      });
+
+      const loserPromise = clientA.enroll();
+      await aPollStarted;
+      await expect(clientB.enroll()).resolves.toMatchObject({
+        peerId: "peer-race-b",
+      });
+      const winnerBytes = readFileSync(credentialPath);
+      const winner = JSON.parse(winnerBytes.toString("utf8")) as {
+        credentialIdentity: {
+          storage: { tenant: string; accountId: string };
+        };
+        enrollment: { creds: { userJwt: string; userSeed: string } };
+      };
+      expect(winner.credentialIdentity.storage).toEqual({
+        tenant: "tenant-B",
+        accountId: "race-b",
+      });
+
+      releaseAPoll();
+      let loserError: unknown;
+      try {
+        await loserPromise;
+      } catch (error) {
+        loserError = error;
+      }
+
+      expect(loserError).toMatchObject({
+        code: "storage-io-failed",
+        document: "credentials",
+      });
+      expect(String(loserError)).not.toContain("SEED-race-a");
+      expect(readFileSync(credentialPath)).toEqual(winnerBytes);
+      expect(winner.enrollment.creds).toEqual({
+        userJwt: "JWT-race-b",
+        userSeed: "SEED-race-b",
+      });
     });
 
     it("should set restrictive permissions on credential file", async () => {
@@ -575,6 +1178,7 @@ describe("EnrollmentClient", () => {
           peerId: "mock-peer-id",
           jwksUrl: "https://saas.com/.well-known/jwks.json",
           bootstrapUrl: "https://saas.com/bootstrap",
+          natsUrl: "wss://nats.saas.com",
         }),
       });
 

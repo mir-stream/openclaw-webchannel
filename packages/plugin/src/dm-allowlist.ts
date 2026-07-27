@@ -45,20 +45,6 @@ const OPEN_POLICIES = new Set([
 ]);
 
 /**
- * Is the DM posture "open" — i.e. NOT gated by an allowlist?
- *
- * True when the policy is unset or an explicit open policy
- * ("open"/"all"/"any"/…); false for `allowlist` (default-deny). Reuses the same
- * `OPEN_POLICIES` source of truth as `resolveDmAdmission` so the two never drift.
- * Used at startup to decide whether to warn about an open admission posture.
- */
-export function isDmPostureOpen(dmSecurity: string | undefined): boolean {
-  const policy = dmSecurity?.trim().toLowerCase();
-  if (!policy) return true;
-  return OPEN_POLICIES.has(policy);
-}
-
-/**
  * Decide whether a peer may message the agent over a direct channel.
  *
  * Pure and side-effect free so it can be unit-tested directly and reused by the

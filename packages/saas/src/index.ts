@@ -32,16 +32,42 @@ export { generateRsaKeypair } from "./setup-trust-chain.js";
 export { loadOrCreateTrustChain } from "./persistent-trust-chain.js";
 export {
   DeviceFlowEnrollment,
-  MemoryEnrollmentStore,
-  UserCodeCollisionError,
-  type EnrollmentStore,
+  EnrollmentValidationError,
+  type ApproveOutcome,
 } from "./device-flow-enrollment.js";
 export {
-  MemoryAgentKeyRegistry,
   agentKeyRegistryKey,
-  DEFAULT_REGISTRY_ACCOUNT_ID,
+  type ActivationId,
+  type AgentKeyId,
+  type AgentKeyRecord,
   type AgentKeyRegistry,
+  type RegisterAgentKeyResult,
 } from "./agent-key-registry.js";
+export {
+  MemoryEnrollmentRepository,
+  UserCodeCollisionError,
+  DeviceCodeCollisionError,
+  CommitPayloadMismatchError,
+  type EnrollmentRepository,
+  type MemoryEnrollmentRepositoryOptions,
+  type ClaimApprovalOutcome,
+  type CommitApprovalPayload,
+  type CommitApprovalOutcome,
+  type TryExpireOutcome,
+  type ReconcileOutcome,
+} from "./enrollment-repository.js";
+export { runAgentKeyRegistryConformance } from "./agent-key-registry-conformance.js";
+export {
+  runEnrollmentRepositoryConformance,
+  enrollmentRepositoryConformanceCases,
+  interpose,
+  barrier,
+  type InterposeHooks,
+  type EnrollmentRepositoryFaultControl,
+  type EnrollmentRepositoryConformanceOptions,
+  type EnrollmentRepositoryConformanceCase,
+  type EnrollmentRepositoryConformanceReport,
+} from "./enrollment-repository-conformance.js";
 export { buildBootstrapClaims } from "./bootstrap-claims.js";
 export type {
   BootstrapClaims,
@@ -73,6 +99,7 @@ export type {
   EnrollmentResponse,
   PollRequest,
   PendingEnrollment,
+  EnrollmentRecord,
   NatsUserCredentials,
   EnrollmentResult,
   DeviceFlowError,

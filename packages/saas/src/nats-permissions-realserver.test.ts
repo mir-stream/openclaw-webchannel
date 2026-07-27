@@ -36,8 +36,12 @@ import { encodeUser } from "@nats-io/jwt";
 import { setupTrustChain } from "./setup-trust-chain.js";
 import type { SetupTrustChainResult, NatsSelfContainedAccountConfig } from "./types.js";
 import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
+import { MemoryEnrollmentRepository } from "./enrollment-repository.js";
 import type { NatsUserCredentials } from "./device-flow-types.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
+import { makeNkeySigningCallback } from "../../plugin/src/nkey-sign.js";
+import { NatsTransport } from "../../plugin/src/nats-transport.js";
+import { dialRelayForPreflight } from "../../plugin/src/preflight.js";
 
 // ---------------------------------------------------------------------------
 // Locate the nats-server binary
@@ -182,6 +186,7 @@ beforeAll(async () => {
 
   // Configure enrollment service
   enrollment = new DeviceFlowEnrollment({
+    repository: new MemoryEnrollmentRepository(),
     saasTrustChain: trustChain.private,
     natsAccountConfig: trustChain.natsConfig,
     saasBaseUrl: "https://saas.test.com",
@@ -312,6 +317,72 @@ async function generateAgentCredentials(
   return { userJwt, userSeed, userPubkey: userKp.getPublicKey(), permissions: { pub, sub } };
 }
 
+/**
+ * Agent-like credentials whose ordinary inbound subscription is allowed but
+ * whose mandatory register-admission wildcard is intentionally absent.
+ */
+async function generateRegisterDeniedCredentials(
+  tenant: string,
+  accountId: string,
+): Promise<NatsUserCredentials> {
+  if (!trustChain) throw new Error("Trust chain not initialized");
+  const accountSigner = fromSeed(
+    new TextEncoder().encode(trustChain.private.natsAccountSeed),
+  );
+  const userKp = createUser();
+  const userSeed = new TextDecoder().decode(userKp.getSeed());
+  const pub = [`webchannel.${tenant}.${accountId}.>`];
+  const sub = [`webchannel.${tenant}.${accountId}.*.in`];
+  const userJwt = await encodeUser(
+    `register-denied-${tenant}-${accountId}`,
+    userKp,
+    accountSigner,
+    {
+      pub: { allow: pub },
+      sub: { allow: sub },
+    },
+  );
+  return {
+    userJwt,
+    userSeed,
+    userPubkey: userKp.getPublicKey(),
+    permissions: { pub, sub },
+  };
+}
+
+/** Credentials that would fool the historical synthetic readiness probes. */
+async function generateSyntheticProbeOnlyCredentials(
+  tenant: string,
+  accountId: string,
+): Promise<NatsUserCredentials> {
+  if (!trustChain) throw new Error("Trust chain not initialized");
+  const accountSigner = fromSeed(
+    new TextEncoder().encode(trustChain.private.natsAccountSeed),
+  );
+  const userKp = createUser();
+  const userSeed = new TextDecoder().decode(userKp.getSeed());
+  const pub = [`webchannel.${tenant}.${accountId}.>`];
+  const sub = [
+    `webchannel.${tenant}.${accountId}._preflight`,
+    `webchannel.${tenant}.${accountId}._doctor`,
+  ];
+  const userJwt = await encodeUser(
+    `synthetic-probe-only-${tenant}-${accountId}`,
+    userKp,
+    accountSigner,
+    {
+      pub: { allow: pub },
+      sub: { allow: sub },
+    },
+  );
+  return {
+    userJwt,
+    userSeed,
+    userPubkey: userKp.getPublicKey(),
+    permissions: { pub, sub },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -324,6 +395,35 @@ describe.skipIf(!NATS_SERVER_BIN)(
       expect(trustChain).not.toBeNull();
       expect(trustChain!.natsConfig.operatorJwt).toBeTruthy();
       expect(trustChain!.natsConfig.accountJwt).toBeTruthy();
+    });
+
+    it("a connection WITHOUT NATS credentials is refused by the JWT-auth server", async () => {
+      // authN invariant (previously covered by the deleted e2e/enrolled-jwt-roundtrip.test.ts):
+      // the operator + MEMORY-resolver server grants NO anonymous access, so a CONNECT carrying
+      // no JWT and no signature must be rejected — never flipped to connected.
+      const ws = new WebSocket(WS_URL);
+      const outcome = await new Promise<"refused" | "connected">((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("no server response")), 4000);
+        const settle = (v: "refused" | "connected") => {
+          clearTimeout(timeout);
+          resolve(v);
+        };
+        ws.on("message", (data: Buffer) => {
+          const text = data.toString();
+          if (text.startsWith("INFO ")) {
+            // Reply with an empty CONNECT — no jwt, no sig (an unauthenticated client).
+            ws.send(`CONNECT ${JSON.stringify({ verbose: false, pedantic: false })}\r\nPING\r\n`);
+            return;
+          }
+          if (text.includes("-ERR")) settle("refused");
+          else if (text.includes("PONG")) settle("connected");
+        });
+        // A hard socket close before any PONG is also a refusal (server drops bad auth).
+        ws.on("close", () => settle("refused"));
+        ws.on("error", () => settle("refused"));
+      });
+      ws.close();
+      expect(outcome).toBe("refused");
     });
 
     it("tenant A client can subscribe to its own subjects", async () => {
@@ -373,6 +473,90 @@ describe.skipIf(!NATS_SERVER_BIN)(
       // Verify we got a permissions error
       expect(errorMessages.length).toBeGreaterThan(0);
       expect(errorMessages.some((msg) => msg.includes("Permissions Violation"))).toBe(true);
+    });
+
+    it("production SUB/PING barrier rejects a denied register subscription before serving publication", async () => {
+      const accountId = "test-agent";
+      const creds = await generateRegisterDeniedCredentials(TENANT_A, accountId);
+      const transport = new NatsTransport({
+        url: WS_URL,
+        jwtCredential: creds.userJwt,
+        nkeySigningCallback: makeNkeySigningCallback(creds.userSeed),
+        clientName: "register-denied-readiness",
+      });
+      const errors: Error[] = [];
+      transport.on("error", (error) => errors.push(error));
+
+      await transport.connect();
+      let servingPublished = false;
+      transport.subscribe(
+        `webchannel.${TENANT_A}.${accountId}.*.register`,
+      );
+
+      await expect(
+        transport.flush().then(() => {
+          // Mirrors the production publication fence: this callback must remain
+          // unreachable when the real server rejects the required SUB.
+          servingPublished = true;
+        }),
+      ).rejects.toMatchObject({ code: "authorization-violation" });
+
+      expect(servingPublished).toBe(false);
+      expect(errors).toContainEqual(
+        expect.objectContaining({ code: "authorization-violation" }),
+      );
+      await transport.closeGracefully();
+    });
+
+    it("the readiness helper rejects creds that allow only old synthetic probes", async () => {
+      const accountId = "synthetic-only";
+      const creds = await generateSyntheticProbeOnlyCredentials(
+        TENANT_A,
+        accountId,
+      );
+
+      await expect(
+        dialRelayForPreflight({
+          url: WS_URL,
+          userJwt: creds.userJwt,
+          userSeed: creds.userSeed,
+          subject: `webchannel.${TENANT_A}.${accountId}._preflight`,
+          timeoutMs: 2000,
+        }),
+      ).resolves.toEqual({ ok: true });
+
+      await expect(
+        dialRelayForPreflight({
+          url: WS_URL,
+          userJwt: creds.userJwt,
+          userSeed: creds.userSeed,
+          subject: `webchannel.${TENANT_A}.${accountId}._doctor`,
+          timeoutMs: 2000,
+        }),
+      ).resolves.toEqual({ ok: true });
+
+      await expect(
+        dialRelayForPreflight({
+          url: WS_URL,
+          userJwt: creds.userJwt,
+          userSeed: creds.userSeed,
+          subject: `webchannel.${TENANT_A}.${accountId}.*.register`,
+          timeoutMs: 2000,
+        }),
+      ).resolves.toEqual({ error: "relay subscription rejected" });
+    });
+
+    it("production enrollment agent credentials pass the register wildcard probe", async () => {
+      const creds = await generateTestCredentials(TENANT_A);
+      await expect(
+        dialRelayForPreflight({
+          url: WS_URL,
+          userJwt: creds.userJwt,
+          userSeed: creds.userSeed,
+          subject: `webchannel.${TENANT_A}.test-agent.*.register`,
+          timeoutMs: 2000,
+        }),
+      ).resolves.toEqual({ ok: true });
     });
 
     it("tenant A client can publish to its own subjects", async () => {

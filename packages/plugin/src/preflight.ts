@@ -24,15 +24,13 @@
  *     add-time; documented there).
  *
  * Constraints honored (design §5): read EFFECTIVE/derived values everywhere;
- * fail-closed (a FAIL never downgrades to `auto` / never silently serves); the
+ * fail-closed (a FAIL never silently serves); the
  * readiness line reports the ENFORCED dmScope (per-account-channel-peer) that
  * webchannel imposes itself (`session-route.ts`) — the old dmScope="main" WARN
  * is gone because that leak is now structurally impossible; reuse the JWKS cache;
- * an `auto` account (no verifier / no JWKS) degrades to a graceful line.
  */
 
 import { JWKSCache, JwksUnavailableError } from "./jwks.js";
-import type { AdmissionMode } from "./nats-admission.js";
 import {
   connectNatsCredentialSource,
   type ConnectNatsDeps,
@@ -76,11 +74,11 @@ export type JwksReadiness = { keyCount: number } | { error: string };
 
 export type AccountReadinessInput = {
   accountId: string;
-  /** The RESOLVED admission mode (from `resolveAdmissionMode`). */
-  admission: AdmissionMode;
+  /** Authenticated registration is the only admission mode. */
+  admission: "register-hop";
   /**
    * EFFECTIVE (derived) issuer — read from the DERIVED `accountAuth`, never raw
-   * `account.auth` (design §5). Absent for an `auto`/non-jwt account, or when the
+   * `account.auth` (design §5). Absent when the
    * verifier could not be built.
    */
   issuer?: string;
@@ -95,7 +93,7 @@ export type AccountReadinessInput = {
   jwks?: JwksReadiness;
   /**
    * The account's JWT verifier could not be BUILT (missing/unresolvable
-   * issuer/audience/jwks source — `makeJwtVerifier`/`resolveVerifier` threw).
+   * issuer/JWKS source — cache-free verifier preparation threw).
    * This is a hard CONFIG fault that skips the account (fail-closed, never a
    * downgrade to `auto`); naming it here lets the FAIL line still report the
    * issuer/aud state alongside the reason.
@@ -143,16 +141,6 @@ export function formatAccountReadiness(
         `[webchannel] account "${id}" FAIL · verifier build failed: ${input.buildError}` +
         ` · issuer=${input.issuer ?? '(unresolved)'} · aud=${input.audience ?? '(unresolved)'}` +
         ` · admission=${input.admission}`,
-    };
-  }
-
-  // ── `auto` account: no `channels.webchannel.auth` verifier and no JWKS at all
-  //    (invariant 1). Degrade gracefully — this is NOT a failure, it is a
-  //    bring-your-own-NATS / handshake-admission account.
-  if (input.admission === 'auto') {
-    return {
-      verdict: 'READY',
-      line: `[webchannel] account "${id}" READY · admission=auto · (no JWT verifier)${tail}`,
     };
   }
 
@@ -217,9 +205,7 @@ export function formatAccountReadiness(
 // browser. We do NOT fake one. Instead we run the strongest checks that ARE
 // achievable at add-time and that directly catch the traps this design targets:
 //
-//   1. issuer/aud INTERNAL consistency — the derived audience must equal the
-//      accountId (what the SaaS mints, `bootstrap-claims.ts`); a config-PINNED
-//      audience that disagrees would reject every browser → hard FAIL naming it.
+//   1. issuer/aud INTERNAL consistency — audience is structurally accountId.
 //   2. JWKS reachable + NON-EMPTY at the DERIVED url, AND the SaaS-advertised
 //      `enrollment.jwksUrl` must match the derived url. A mismatch is the exact
 //      issuer-mismatch trap surfaced early: the --base-url used to enroll differs
@@ -236,14 +222,12 @@ export type AddPreflightFacts = {
   accountId: string;
   /** Effective (derived) issuer = saasBaseUrl, unless pinned. */
   effectiveIssuer: string;
-  /** Effective (derived) audience = accountId, unless pinned. */
+  /** Effective audience = accountId by construction. */
   effectiveAudience: string;
   /** The jwksUrl the agent DERIVES at runtime (saasBaseUrl + well-known). */
   derivedJwksUrl: string;
   /** The jwksUrl the SaaS ADVERTISED in the enrollment result (if any). */
   deliveredJwksUrl?: string;
-  /** A config-pinned `auth.jwt.audience` (operator escape hatch), if present. */
-  pinnedAudience?: string;
   /** JWKS resolution outcome against `derivedJwksUrl`. */
   jwks: JwksReadiness;
   /** Relay-dial outcome. */
@@ -260,18 +244,7 @@ export type AddPreflightReport = { ok: boolean; line: string };
 export function evaluateAddPreflight(facts: AddPreflightFacts): AddPreflightReport {
   const prefix = 'channels add preflight';
 
-  // 1. issuer/aud internal consistency (the issuer-mismatch trap, add-time).
-  if (facts.pinnedAudience !== undefined && facts.pinnedAudience !== facts.accountId) {
-    return {
-      ok: false,
-      line:
-        `${prefix}: FAIL — config pins auth.jwt.audience="${facts.pinnedAudience}" but the SaaS ` +
-        `mints aud="${facts.accountId}" (= accountId). The register JWT verify will reject every ` +
-        `browser. Set audience to the accountId or remove the pin.`,
-    };
-  }
-
-  // 2. JWKS reachable + non-empty + derivation matches the SaaS's own base URL.
+  // JWKS reachable + non-empty + derivation matches the SaaS's own base URL.
   if ('error' in facts.jwks) {
     return {
       ok: false,
@@ -350,7 +323,6 @@ export type RunAddPreflightOptions = {
   enrollment: AddPreflightEnrollment;
   /** Config-pinned operator escape hatches (config-present-wins). */
   pinnedIssuer?: string;
-  pinnedAudience?: string;
   /** Progress sink (the setup hook's `runtime.log`, or console). */
   log: (...args: unknown[]) => void;
   /** @internal Test seam: JWKS fetch impl (forwarded to JWKSCache). */
@@ -390,7 +362,7 @@ export async function runAddPreflight(
   // pin > SaaS-delivered (enrollment.issuer) > derived from --base-url.
   const effectiveIssuer =
     opts.pinnedIssuer ?? opts.enrollment.issuer ?? deriveIssuer(opts.saasBaseUrl);
-  const effectiveAudience = opts.pinnedAudience ?? opts.accountId;
+  const effectiveAudience = opts.accountId;
   const derivedJwksUrl = deriveJwksUrl(opts.saasBaseUrl);
 
   // An operator pin that CONTRADICTS what the SaaS just declared it mints is
@@ -433,10 +405,11 @@ export async function runAddPreflight(
     };
   }
 
-  // 2. Relay dial (scoped no-op sub within the account's own subtree, then close).
-  const dialSubject = `webchannel.${opts.tenant}.${opts.accountId}._preflight`;
+  // 2. Relay dial. Fence the exact wildcard subscription runtime installs.
+  const dialSubject =
+    `webchannel.${opts.tenant}.${opts.accountId}.*.register`;
   const relay = opts.enrollment.natsUrl
-    ? await (opts.dial ?? defaultRelayDial)({
+    ? await (opts.dial ?? dialRelayForPreflight)({
         url: opts.enrollment.natsUrl,
         userJwt: opts.enrollment.userJwt,
         userSeed: opts.enrollment.userSeed,
@@ -454,7 +427,6 @@ export async function runAddPreflight(
     ...(opts.enrollment.jwksUrl !== undefined
       ? { deliveredJwksUrl: opts.enrollment.jwksUrl }
       : {}),
-    ...(opts.pinnedAudience !== undefined ? { pinnedAudience: opts.pinnedAudience } : {}),
     jwks,
     relay,
   });
@@ -472,7 +444,8 @@ export async function runAddPreflight(
  * same primitive the runtime uses to dial enrolled creds — so nothing about the
  * auth flow is reinvented here.
  */
-async function defaultRelayDial(input: {
+export async function dialRelayForPreflight(input: {
+  kind?: "static";
   url: string;
   userJwt: string;
   userSeed: string;
@@ -481,31 +454,88 @@ async function defaultRelayDial(input: {
   connectDeps?: ConnectNatsDeps;
 }): Promise<{ ok: true } | { error: string }> {
   let connection: Awaited<ReturnType<typeof connectNatsCredentialSource>> | undefined;
+  const consumeProbeError = () => {};
+  const deadline = Date.now() + input.timeoutMs;
+  let phase: "dial" | "subscription" = "dial";
   try {
     const connected = await withTimeout(
       connectNatsCredentialSource(
-        {
-          mode: 'static',
-          url: input.url,
-          userJwt: input.userJwt,
-          userSeed: input.userSeed,
-        },
+        { mode: "static", url: input.url, userJwt: input.userJwt, userSeed: input.userSeed },
         input.connectDeps ?? {},
       ),
       input.timeoutMs,
       `relay dial timed out after ${input.timeoutMs}ms`,
+      // A timeout does NOT cancel the connect — the promise stays pending and can
+      // still resolve with a live authenticated transport that no one holds. The
+      // `finally` below cannot reach it (`connection` is still undefined), so a
+      // slow relay would leak a connection + its subscription per probe. Doctor/
+      // status probe this path repeatedly, so a late arrival is torn down here.
+      //
+      // RESIDUAL (not covered): this only fires if the connect eventually SETTLES.
+      // `NatsTransport.connect()` has no handshake timeout and no cancellation —
+      // its promise resolves on the first pong, and the only timer in
+      // `nats-transport.ts` is reconnect backoff. So if the relay accepts the
+      // socket and then goes silent, `connect()` never settles, `onLate` never
+      // runs, and that socket stays orphaned — arguably the likeliest reason the
+      // dial timeout fires at all. Closing that needs the dialer to own the
+      // transport (construct it here so it can be disconnected without waiting on
+      // the connect promise), which is a larger change than this fix.
+      (late) => {
+        try {
+          late.transport.disconnect();
+        } catch {
+          /* ignore teardown errors — the probe result is already decided */
+        }
+      },
     );
     connection = connected;
-    // Scoped no-op subscription within the agent's own `webchannel.{tenant}.>`
-    // grant — proves the subject scoping the browser register will ride is
-    // permitted for these creds. Best-effort; a permission fault surfaces via
-    // the transport error event, but the connect handshake is the load-bearing
-    // proof, so we do not block on a settle window (keeps `channels add` fast).
+    phase = "subscription";
+    // The fence below is the authoritative error consumer. Register a listener
+    // so EventEmitter does not classify the same expected denial as unhandled.
+    connected.transport.on("error", consumeProbeError);
+    // NATS processes a connection in order. SUB followed by the production
+    // transport's PING/PONG flush fence therefore cannot report success before
+    // the server has either accepted the scoped subscription or rejected it.
     connected.transport.subscribe(input.subject);
+    const remainingMs = Math.max(0, deadline - Date.now());
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), remainingMs);
+    try {
+      await withTimeout(
+        connected.transport.flush(controller.signal),
+        remainingMs,
+        `relay subscription timed out after ${input.timeoutMs}ms`,
+      );
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(
+          `relay subscription timed out after ${input.timeoutMs}ms`,
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
     return { ok: true };
   } catch (err) {
-    return { error: err instanceof Error ? err.message : String(err) };
+    const message = err instanceof Error ? err.message : "";
+    if (
+      message === `relay dial timed out after ${input.timeoutMs}ms` ||
+      message === `relay subscription timed out after ${input.timeoutMs}ms`
+    ) {
+      return { error: message };
+    }
+    return {
+      error: phase === "subscription"
+        ? "relay subscription rejected"
+        : "relay dial failed",
+    };
   } finally {
+    try {
+      connection?.transport.off("error", consumeProbeError);
+    } catch {
+      /* ignore listener-cleanup errors and still attempt transport teardown */
+    }
     try {
       connection?.transport.disconnect();
     } catch {
@@ -514,13 +544,33 @@ async function defaultRelayDial(input: {
   }
 }
 
-/** Reject with `message` if `p` does not settle within `ms`. */
-function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+/**
+ * Reject with `message` if `p` does not settle within `ms`.
+ *
+ * `onLate` receives a value `p` resolves with AFTER the timeout already rejected.
+ * The returned promise is settled by then, so that value is otherwise dropped on
+ * the floor — which orphans anything holding a resource. Callers whose `T` needs
+ * teardown (a live connection) pass a disposer here.
+ */
+function withTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  message: string,
+  onLate?: (value: T) => void,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), ms);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      reject(new Error(message));
+    }, ms);
     p.then(
       (v) => {
         clearTimeout(timer);
+        if (timedOut) {
+          onLate?.(v);
+          return;
+        }
         resolve(v);
       },
       (err) => {

@@ -17,10 +17,13 @@
  */
 
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  assertNoRemovedAudienceConfig,
+  isWebchannelAccountEnabled,
   listWebchannelAccountIds,
   readAccountsMap,
   readWebchannelSection,
+  resolveAccountStorageRoot,
   resolveWebchannelAccountConfig,
   type WebchannelAccountConfig,
 } from "./account-config.js";
@@ -32,6 +35,7 @@ export type AccountServePlan = {
   accountId: string;
   tenant: string;
   saasBaseUrl?: string;
+  storageRoot?: string;
   /** The merged per-account config (channel-level base + account override). */
   account: WebchannelAccountConfig;
 };
@@ -43,12 +47,47 @@ export type PlanAccountsOptions = {
   warn?: (msg: string) => void;
 };
 
+/** Plan one raw account id without applying cross-account warnings. */
+export function planWebchannelAccount(
+  cfg: unknown,
+  accountId: string,
+  opts: PlanAccountsOptions = {},
+): AccountPlanEntry | undefined {
+  // Share the exact status predicate and skip before acquisition identity,
+  // credential resolution, or any future per-account runtime I/O.
+  if (!isWebchannelAccountEnabled(cfg, accountId)) return undefined;
+
+  // Removed-key policy is evaluated on raw locations before acquisition or the
+  // shallow effective merge, so a channel-base tombstone cannot be shadowed by
+  // an account-local auth.jwt object.
+  assertNoRemovedAudienceConfig(cfg, accountId);
+
+  // Identity with config-over-env precedence. For a named account this is
+  // config-only; for the synthesized default with no config it is env-derived.
+  const { identity } = resolveAcquisitionEnvPrecedence(cfg, accountId, {
+    ...(opts.env !== undefined ? { env: opts.env } : {}),
+    ...(opts.warn !== undefined ? { warn: opts.warn } : {}),
+  });
+
+  const account = resolveWebchannelAccountConfig(cfg, accountId);
+  const storageRoot = resolveAccountStorageRoot(account);
+  return {
+    status: "serve",
+    accountId,
+    tenant: identity.tenant,
+    ...(identity.saasBaseUrl !== undefined ? { saasBaseUrl: identity.saasBaseUrl } : {}),
+    ...(storageRoot !== undefined ? { storageRoot } : {}),
+    account,
+  };
+}
+
 /**
  * Plan which webchannel accounts to serve from a config. Pure (no I/O).
  *
  * Order follows `listWebchannelAccountIds` (sorted) for deterministic serving.
- * Every listed account is served — the accountId is the unique wire identity, so
- * there are no structural (pre-I/O) skips to apply.
+ * Every enabled listed account is served; disabled accounts are omitted before
+ * acquisition identity or later runtime I/O. The accountId is the unique wire
+ * identity, so there are no other structural (pre-I/O) skips to apply.
  */
 export function planAccounts(
   cfg: unknown,
@@ -61,21 +100,8 @@ export function planAccounts(
   const entries: AccountPlanEntry[] = [];
 
   for (const accountId of accountIds) {
-    // Identity with config-over-env precedence. For a named account this is
-    // config-only; for the synthesized default with no config it is env-derived.
-    const { identity } = resolveAcquisitionEnvPrecedence(cfg, accountId, {
-      ...(opts.env !== undefined ? { env: opts.env } : {}),
-      ...(opts.warn !== undefined ? { warn: opts.warn } : {}),
-    });
-
-    const account = resolveWebchannelAccountConfig(cfg, accountId);
-    entries.push({
-      status: "serve",
-      accountId,
-      tenant: identity.tenant,
-      ...(identity.saasBaseUrl !== undefined ? { saasBaseUrl: identity.saasBaseUrl } : {}),
-      account,
-    });
+    const plan = planWebchannelAccount(cfg, accountId, opts);
+    if (plan) entries.push(plan);
   }
 
   return entries;
@@ -93,16 +119,19 @@ export function planAccounts(
  * Intentionally narrow: tuning / tenant / saas-only shared bases are legitimate
  * shapes and stay quiet (that boot noise was the original complaint).
  */
-function warnOnOrphanedDefault(cfg: unknown, warn?: (msg: string) => void): void {
-  if (!warn) return;
+export function detectOrphanedDefault(cfg: unknown): boolean {
   const section = readWebchannelSection(cfg);
-  if (!section) return;
+  if (!section) return false;
   const accounts = readAccountsMap(section);
   const hasNamedAccounts = Object.keys(accounts).length > 0;
-  if (!hasNamedAccounts) return;
-  if (DEFAULT_ACCOUNT_ID in accounts) return;
+  if (!hasNamedAccounts) return false;
+  if (DEFAULT_WEBCHANNEL_ACCOUNT_ID in accounts) return false;
   const hasIdentityBase = "auth" in section || "nats" in section;
-  if (!hasIdentityBase) return;
+  return hasIdentityBase;
+}
+
+export function warnOnOrphanedDefault(cfg: unknown, warn?: (msg: string) => void): void {
+  if (!warn || !detectOrphanedDefault(cfg)) return;
   warn(
     `webchannel: channel-level auth/nats present but no accounts.default — the ` +
       `"default" account is NOT served (channel-level fields are shared base only). ` +

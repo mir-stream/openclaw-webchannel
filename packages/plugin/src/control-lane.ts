@@ -10,20 +10,19 @@
  * it is meant to cancel, it would only run once that turn had already finished —
  * there would be nothing left to abort.
  *
- * So index-nats.ts routes control-lane frames PAST the FIFO, dispatching them
+ * So the NATS account runtime routes control-lane frames PAST the FIFO, dispatching them
  * directly (fire-and-forget) as a control-lane turn (see
  * `handleInboundMessage(..., { controlLane: true })`). Core runs
  * `tryFastAbortFromMessage` BEFORE its per-session reply-operation busy gate, so
  * an out-of-band abort aborts the active run and never collides with the
  * one-turn-per-session invariant the FIFO protects.
  *
- * This module owns only the PREDICATE (the routing decision), kept in `src/` so
- * it is covered by tsc + vitest; index-nats.ts (which is outside tsconfig) just
- * calls it.
+ * This module owns only the PREDICATE (the routing decision), independently
+ * covered by typecheck and behavior tests; the account runtime calls it.
  */
 import { isAbortRequestText } from "openclaw/plugin-sdk/command-primitives-runtime";
 
-import type { InboundWsMessage } from "./transport.js";
+import type { InboundWsMessage } from "./channel-contract.js";
 import type { CommandGate } from "./command-gate.js";
 
 /**

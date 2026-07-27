@@ -2,10 +2,10 @@
 # e2e-gate.yml — Single blocking CI gate for openclaw-webchannel Phase B.
 #
 # Enforces:
-#  - All pre-existing test suites stay green (≥712 test baseline across 3 pkgs)
+#  - All pre-existing test suites stay green (≥1465 test baseline across 3 pkgs)
 #  - 3-package typecheck passes clean
 #  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
-#  - Both dev/open-NATS mode AND enrolled-JWT mode covered
+#  - The register-hop (enrolled-JWT) admission path is covered end-to-end
 #
 # The gate runs on every push and PR to the integration branches AND to the
 # working branches where development actually happens (develop, feature/**) —
@@ -19,9 +19,9 @@ name: E2E Gate
 
 on:
   push:
-    branches: [main, master, develop, "feature/**"]
+    branches: [main, master, develop, review, "feature/**"]
   pull_request:
-    branches: [main, master, develop]
+    branches: [main, master, develop, review]
 
 # Only one gate run per branch/PR at a time; cancel stale in-progress runs.
 concurrency:
@@ -152,6 +152,12 @@ jobs:
       - name: Plugin pack-and-load smoke (F3 remote-install guard)
         run: bash scripts/pack-load-smoke.sh
 
+      - name: Client clean-pack surface smoke (stale dist guard)
+        run: bash scripts/client-pack-smoke.sh
+
+      - name: Removed gateway transport symbol guard
+        run: bash scripts/check-banned-symbols.sh
+
       - name: Examples consumer tests (public-API boundary)
         run: |
           npm test --workspace=examples/minimal-consumer
@@ -159,7 +165,7 @@ jobs:
 
       # ──────────────────────────────────────────────────────────────────────
       # 6. Run all test suites with JSON output for baseline verification
-      #    - Baseline: ≥712 tests across all 3 packages
+      #    - Baseline: ≥1465 tests across all packages
       #    - Real-server suites (skipIf removed in CI) now run against the
       #      real nats-server binary installed in step 3.
       #    - Sub-AC 1: e2e/dev-nats-roundtrip.test.ts — open-NATS E2E gate
@@ -174,16 +180,16 @@ jobs:
           CI: "true"
 
       # ──────────────────────────────────────────────────────────────────────
-      # 7. Verify test count meets baseline (≥712 tests passed)
+      # 7. Verify test count meets baseline (≥1465 tests passed)
       #    Fails the gate if the count regresses below the seed-time baseline.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Verify test baseline (≥712 tests)
+      - name: Verify test baseline (≥1465 tests)
         if: always()
         run: |
           set -euo pipefail
           node - << 'EOF'
           const fs = require('fs');
-          const BASELINE = 712;
+          const BASELINE = 1465;
           let data;
           try {
             data = JSON.parse(fs.readFileSync('/tmp/vitest-results.json', 'utf8'));
@@ -203,34 +209,8 @@ jobs:
           EOF
 
       # ──────────────────────────────────────────────────────────────────────
-      # 8. Real-gateway live e2e (JWT register hop)
-      #    Covers the REAL `openclaw gateway` binary + `index-nats` plugin +
-      #    real `inbound.run` agent path — the one thing the vitest e2e above
-      #    does NOT (those use the deterministic `e2e-roundtrip-agent` seam).
-      #    Boots an isolated gateway (auth.strategy="jwt", wildcard OFF) and
-      #    round-trips through the live NATS register hop (`…{peerId}.register`).
-      #    Reuses the already-installed nats-server (on PATH), npm deps, and the
-      #    openclaw binary in node_modules/.bin. Fully hermetic under /tmp/oc-e2e
-      #    (echo model, no LLM, no registry) — needs NO secret. Any non-zero exit
-      #    FAILS the gate (no continue-on-error).
-      # ──────────────────────────────────────────────────────────────────────
-      - name: Real-gateway live e2e (JWT register hop)
-        run: bash e2e/local/run-jwt-register.sh
-
-      # ──────────────────────────────────────────────────────────────────────
-      # 8b. Live e2e: real SaaS issuer register
-      #    Sibling of step 8 but the JWT SOURCE is the REAL reference
-      #    bootstrap-server (real RS256 issuance + real JWKS-over-HTTP verify),
-      #    not a static fixture. Node driver, no Chromium. Isolated under
-      #    /tmp/oc-saas-e2e (port 18899) — hermetic, no secret. Any non-zero
-      #    exit FAILS the gate.
-      # ──────────────────────────────────────────────────────────────────────
-      - name: "Live e2e: real SaaS issuer register"
-        run: bash e2e/local/run-saas-issuer-register.sh
-
-      # ──────────────────────────────────────────────────────────────────────
       # 8c. Live e2e: enrolled-NATS-transport (device-flow)
-      #    devOpen OFF: the plugin obtains tenant-scoped NATS creds via the REAL
+      #    The plugin obtains tenant-scoped NATS creds via the REAL
       #    device-flow enrollment-server and NKEY-connects to a JWT-auth
       #    nats-server from ONE shared trust chain. Node driver, no Chromium.
       #    Isolated under /tmp/oc-enrolled-e2e (port 18999) — hermetic, no
@@ -238,16 +218,6 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────
       - name: "Live e2e: enrolled-NATS-transport (device-flow)"
         run: bash e2e/local/run-enrolled-transport.sh
-
-      # ──────────────────────────────────────────────────────────────────────
-      # 8d. Live e2e: real-browser JWT+PoP register
-      #    A REAL headless Chromium running the production WebChannelNatsClient
-      #    drives the JWT + Proof-of-Possession register hop (in-page keygen +
-      #    CORS). Isolated under /tmp/oc-browser-e2e (port 19099) — hermetic, no
-      #    secret. Any non-zero exit FAILS the gate.
-      # ──────────────────────────────────────────────────────────────────────
-      - name: "Live e2e: real-browser JWT+PoP register"
-        run: bash e2e/local/run-browser-jwt-register.sh
 
       # ──────────────────────────────────────────────────────────────────────
       # 8e. Live e2e: ALL-REAL fusion
@@ -262,14 +232,15 @@ jobs:
         run: bash e2e/local/run-all-real.sh
 
       # ──────────────────────────────────────────────────────────────────────
-      # 8f. Live e2e: 2-account routing isolation (가-1 Cycle 3 — AC6 gate)
-      #    ONE gateway serves TWO webchannel accounts (acctA→agentA, acctB→agentB),
-      #    each bound to a DISTINCT agent (distinct echo prefix) via binding.account.
-      #    A Node driver messages each account and asserts ROUTING ISOLATION: acctA's
-      #    reply carries agentA's prefix and NOT agentB's (and symmetrically). Proves
-      #    the REAL registerFull multiplex + single-route JWT-aud→account dispatch +
-      #    binding.account routing (no mocks). Node-only (no Chromium). Isolated under
-      #    /tmp/oc-two-acct-e2e (port 19299) — hermetic, no secret. Non-zero exit FAILS.
+      # 8f. Live e2e: one-process/two-account isolation (issue #54 gate)
+      #    ONE gateway serves two account runtimes sharing tenant/relay/issuer/JWKS.
+      #    Its latest structured aggregate record must report complete 2/2.
+      #    Production clients prove A→A and B→B, then an A-authorized token sent
+      #    to B's live register subject must receive exact opaque 401 with no B
+      #    peer/key/history/approval effect, followed by another healthy B→B.
+      #    The host starts both accounts through the coordinator and production
+      #    account-bound NatsChannels plus binding.account routing (no mocks).
+      #    Node-only, hermetic under /tmp/oc-two-acct-e2e; non-zero exit fails.
       # ──────────────────────────────────────────────────────────────────────
       - name: "Live e2e: 2-account routing isolation"
         run: bash e2e/local/run-two-account-isolation.sh

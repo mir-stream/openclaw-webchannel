@@ -167,11 +167,10 @@ You should see:
 [app] relay mode: synadia (account A1b2c3…) → wss://connect.ngs.global
 [app] SaaS backend on http://127.0.0.1:4000
 [app] tenant=app-tenant account=agent-dev
-[app] admin token (for approving enrollments): 3f9a…      ← copy this
 ```
 
-Note the **admin token** — you need it to approve the agent in Step 6. (Set `ADMIN_TOKEN`
-yourself in the env to make it stable across restarts.)
+Configure `ENROLLMENT_ADMIN_TOKEN` before boot — you need it to approve the agent
+in Step 6. The operator routes fail closed with 503 when it is absent.
 
 ## Step 5 — Open the browser widget
 
@@ -187,8 +186,9 @@ The widget will:
 ## Step 6 — Attach your openclaw agent
 
 > ⚠️ **Three strings must match on both sides:** the **tenant** (`app-tenant`), the
-> **SaaS URL** (`http://127.0.0.1:4000`), and the **account / JWT audience**
-> (`agent-dev`). If openclaw uses a different account/audience, the agent will reject the
+> **SaaS URL** (`http://127.0.0.1:4000`), and the **account id**
+> (`agent-dev`). The account id is also the JWT audience; there is no separate audience
+> setting. If openclaw uses a different account, the agent will reject the
 > browser’s bootstrap JWT. Align them: keep the SaaS defaults, or set `APP_TENANT` /
 > `APP_ACCOUNT` on the server to match the account you add in openclaw.
 
@@ -206,7 +206,6 @@ openclaw channels add
 #   → select: WebChannel
 #   → WebChannel tenant id:        app-tenant
 #   → WebChannel SaaS base URL:    http://127.0.0.1:4000
-#   → JWT audience (advanced):     agent-dev     ← match the SaaS account
 #
 #   Enrollment created. user code: WXYZ-1234   (waiting for approval…)
 ```
@@ -221,7 +220,7 @@ openclaw channels add
 credentials, so it is **admin-gated** with the token from Step 4:
 
 ```bash
-curl -X POST -H "x-admin-token: <ADMIN_TOKEN>" \
+curl -X POST -H "Authorization: Bearer <ENROLLMENT_ADMIN_TOKEN>" \
   http://127.0.0.1:4000/admin/enrollments/WXYZ-1234/approve
 ```
 
@@ -244,10 +243,9 @@ replies over the E2E-encrypted NGS relay.
 
 - **Browser stuck on “waiting for agent” after `gateway` is up** → tenant/account
   mismatch (see the callout in Step 6). Confirm the SaaS logs `tenant=app-tenant
-  account=agent-dev` and that the wizard used the same tenant and an audience of
-  `agent-dev`.
+  account=agent-dev` and that the wizard used the same tenant and account id.
 - **`401` when approving** → wrong/missing `x-admin-token`; use the token the server
-  printed at boot (or set `ADMIN_TOKEN`).
+  supplied through `ENROLLMENT_ADMIN_TOKEN`.
 - **`npm install` 401/403** → the PAT lacks `read:packages`, or `.npmrc` is missing the
   `@mir-stream:registry` line.
 - **Agent connects but never replies** → openclaw has no model provider configured. The
@@ -255,7 +253,8 @@ replies over the E2E-encrypted NGS relay.
 - **Browser register rejected with an opaque `unauthorized`** → the agent is verifying
   against a different JWT issuer than the SaaS mints. Two known causes: (1) the agent
   enrolled with an **older** saas/plugin version that predates SaaS-delivered issuer —
-  delete `~/.openclaw-webchannel/<account>/credentials.json` and re-run `channels add`
+  delete `~/.openclaw-webchannel-v2/<v2_namespace>/credentials.json` and re-run
+  `channels add`
   (re-enrollment is what delivers the issuer); (2) a stale `auth.jwt.issuer` **pin** in
   `openclaw.json` — a pin always wins over the delivered value, so remove it unless you
   set it deliberately.

@@ -12,9 +12,10 @@
 > **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-13 (post-#24…#33 tree).** The integrated showcase
 > demo rewrote the demo surface (now `demo/web/src/widget.ts` over the `WebChannelNATSClient` reducer),
 > and the parity stack has since landed several P1 items. **Now built:** **P1-1 markdown (#27)**,
-> **P1-7 error/reconnect UX** (mostly), and **P1-8** (`/stop` control lane #25 + debounce/coalesce
-> #29) — all marked ✅. **Still open:** P1-2 long-response, P1-3 reasoning lane (now **unblocked** —
-> its deps P1-1 + P0-5 partial are met), P1-4 media, P1-6 doctor, P1-7 finer wording, P1-9 unsend.
+> **P1-7 error/reconnect UX** (incl. finer cause-driven wording), and **P1-8** (`/stop` control lane
+> #25 + debounce/coalesce #29), P1-3 reasoning lane, and **P1-9 unsend** (Option A client-side hold)
+> — all marked ✅. **Still open:** P1-2 long-response and P1-4 media.
+> P1-6 doctor is built on `feat/p1-6-doctor` and awaiting merge (#39) — see its section.
 > Note (#14): the plugin has a partial-mode answer-text stream (`streaming.mode:"partial"`, exercised
 > in the demo) — P1-3's reasoning lane builds on that existing stream, not a net-new one.
 >
@@ -112,21 +113,24 @@ the layout, and streaming growth doesn't yank the viewport.
 
 ---
 
-## P1-3 — Reasoning / thinking lane separation — 🔴 MISSING
+## P1-3 — Reasoning / thinking lane separation — ✅ BUILT
 
 **Symptom.** Model "thinking" (when present) is dumped inline with the answer or lost.
 
-**Classification.** 🔴 Missing — but **now unblocked.** Its dependencies (P1-1 markdown ✅ and P0-5
-partial ✅, exercised in the demo) are met, so this is the top remaining P1 lift. Needs a server
-decision (emit reasoning separately) + client render (collapsible lane).
+**Classification.** ✅ Built. Native OpenClaw reasoning callbacks now travel on a dedicated,
+turn-correlated frame and render as collapsed `Reasoning` details independently of the answer
+streaming mode. Reasoning streams to the browser ONLY when the resolved session reasoning level is
+`stream` (default `off` via `agents.defaults.reasoningDefault`), matching the Telegram reference and
+fail-closed on a store-read error.
 
-**Where it stands today.** The plugin already streams **answer text** in `"partial"` mode
-(`inbound.ts:124-136`, `onPartialReply` → `draft.pushAnswerText`) — exercised in the demo since P0-5
-set `streaming.mode:"partial"` — but there is still **no reasoning/answer split**: reasoning is not
-separated from the answer stream. Both `partial` (answer) and `progress` (tool lines) share the
-single `progress` frame and one working draft (reducer `case "progress"`, `nats-client-wrapper.ts:557`).
-A reasoning lane builds **on top of** that existing partial stream (a separate reasoning frame/field
-feeding a collapsible lane), not a new stream from scratch.
+**Where it stands today.** After route resolution `inbound.ts` resolves the session reasoning level
+(`reasoning-level.ts`, Telegram-parity: session-store level wins, throw → `off`, else config default)
+and wires `onReasoningStream` / `onReasoningEnd` ONLY when it is `stream` — in every answer mode
+(`partial` / `progress` / `block` / `off`), while preserving existing mode-specific answer/tool
+callbacks. `ReasoningDraftController` normalizes cumulative/snapshot updates by REPLACE (verified: no
+pinned emitter sends a bare delta) and rotates bursts. Dedicated `reasoning` and `turn_settled` frames
+exist in both transports. Both clients keep bounded ephemeral reasoning state; the demo groups it by
+`turnId` between the matching user message and answer. It is not persisted.
 
 **Telegram reference.**
 - `reasoning-lane-coordinator.ts:68` `splitTelegramReasoningText()` — splits `{reasoningText,
@@ -137,16 +141,14 @@ feeding a collapsible lane), not a new stream from scratch.
   **`openclaw/plugin-sdk/text-chunking` `stripReasoningTagsFromText()`**,
   **`openclaw/plugin-sdk/channel-outbound` `isPotentialTruncatedFinal()` / `selectLongerFinalText()`**.
 
-**Implementation sketch.**
-1. **Server:** add a `reasoning` boolean/kind to `progress` frames (or a new `reasoning` frame type
-   in `nats-channel.ts`) when the turn produces reasoning; reuse `stripReasoningTagsFromText` +
-   `formatReasoningMessage` so the split matches other channels.
-2. **Client:** add a reducer `case` + a `WebChannelState` field; render reasoning in a collapsible
-   `<details>` above the answer bubble (default collapsed); the answer streams/finalizes as in P0-5.
-3. Handle truncation recovery with `selectLongerFinalText` semantics.
+**Decision record.** Native `onReasoningStream` won over parsing `<think>` tags. A dedicated frame
+won over overloading `progress`, and `turnId` prevents multi-turn ordering errors. Reasoning has no
+fallible live/done UI state; `turn_settled` handles only transient Stop/typing activity. Full plan:
+`docs/P1_REASONING_LANE_PLAN.md`.
 
-**Acceptance.** A reasoning-capable turn shows a collapsed "Thoughts" section that expands, with the
-answer rendered separately and streaming normally. Non-reasoning turns show no empty affordance.
+**Acceptance (met).** A reasoning-capable turn shows a collapsed `Reasoning` section that expands,
+with the answer rendered separately and streaming normally. Non-reasoning turns show no empty
+affordance; consecutive turns retain correct reasoning/answer placement.
 
 **Scope note.** Requires a small wire addition — heavier than the pure-render items. Sequence after
 P1-1.
@@ -218,13 +220,45 @@ single biggest P1 lift. Consider splitting into its own tracking doc.
 
 ---
 
-## P1-6 — Doctor / self-diagnosis — 🔴 MISSING
+## P1-6 — Doctor / self-diagnosis — ✅ BUILT
 
-**Symptom.** When misconfigured, failures are opaque (silent skips in logs); no user-facing "what's
-wrong + how to fix".
+**Symptom (original).** When misconfigured, failures were opaque (silent skips in logs); no
+user-facing "what's wrong + how to fix".
 
-**Classification.** 🔴 Missing (we have a setup *wizard* — `docs/SETUP_WIZARD_PLAN.md` — but no
-*doctor* that validates an existing config / live connection).
+**Classification.** ✅ Built (branch `feat/p1-6-doctor`; plan + dist-verified SDK contract in
+`docs/P1_DOCTOR_PLAN.md`). `openclaw doctor` now reports actionable per-account findings with fix
+hints via `ChannelDoctorAdapter.collectPreviewWarnings` (Path A — works with the gateway DOWN), and
+the status surfaces carry a live probe (`status.probeAccount`: effective-JWKS-source check +
+relay dial, never triggers enrollment) plus runtime-only `collectStatusIssues`.
+
+**What was built.**
+- `src/doctor.ts` — finding engine C1–C11 factored from the exact serving-loop skip conditions
+  (`index-nats.ts`): encryption-disabled, creds-missing, register-hop-static-unsupported,
+  identity-key-missing, verifier-unbuildable, audience-override-removed, open-admission, obsolete-cors,
+  auth-strategy-invalid (contextual a/b/c), credential-source-invalid, orphaned-default,
+  deprecated-acquisition-env. Mirror-fidelity rule: never a false positive on a served config,
+  never silent on a skipped one.
+- `src/account-auth.ts` — `deriveAccountAuth` moved verbatim out of the entry +
+  `resolveEffectiveAccountAuth` (single effective-auth resolution shared by serving loop, doctor,
+  and probe; behavior-preserving).
+- `src/auth.ts` — side-effect-free `validateJwtVerifierConfig`/`validateVerifierConfig` (doctor
+  validates without allocating the module-level JWKS cache; `makeJwtVerifier` calls the same
+  validator — one source of truth).
+- `src/consume-credentials.ts` — `resolveDialMaterial` (probe-safe: enrolled mode reads persisted
+  creds only, `persisted.natsUrl ?? source.url`, device flow unreachable).
+- Adapters attached in `createWebChannelPlugin` (`src/channel.ts`) so the doctor CLI's read-only /
+  setup-entry load path gets them; types from `openclaw/plugin-sdk/channel-contract`.
+
+**Gotchas (durable).** The real `ChannelDoctorAdapter` is config-repair hooks, NOT the scanner
+registry this doc originally sketched — status issues/probe live on the separate
+`ChannelStatusAdapter`. `openclaw doctor`'s status-issue leg (Path B) is gateway-RPC-gated and
+silently absent when the gateway is down, so config findings MUST live in Path A. The plain
+`openclaw status` scan builds snapshots via `config.describeAccount`, never
+`status.buildAccountSnapshot` — don't smuggle config findings through snapshots.
+
+**Acceptance (met).** `openclaw doctor` reports actionable issues for a mis-set account (missing
+creds, bad auth strategy, encryption off) with a fix hint, instead of a silent log skip (✅ — plus
+live probe + runtime status issues beyond the original ask).
 
 **Where it stands today.** `packages/plugin/index-nats.ts` already *detects* many failure modes and
 logs them (encryption misconfig skip, missing creds skip, connection failure skip, admission=auto +
@@ -255,13 +289,14 @@ skip.
 
 ---
 
-## P1-7 — Error handling / reconnect UX — ✅ MOSTLY BUILT
+## P1-7 — Error handling / reconnect UX — ✅ BUILT
 
 **Symptom (original).** On failures the demo showed minimal state; terminal errors (PoP/NKEY
 rejection) were hard to distinguish from transient ones.
 
-**Classification.** ✅ Mostly built by the integrated demo. Reconnect mechanics + connection-state UX
-+ terminal-vs-transient classification are done; finer error-cause wording is the remaining polish.
+**Classification.** ✅ Built. Reconnect mechanics + connection-state UX + terminal-vs-transient
+classification, and now the finer per-cause wording slice (a machine-readable cause tag threaded from
+the connection layer to a cause-driven terminal error box).
 
 **Where it stands today.**
 - Reconnect backoff with jitter: `nats-client.ts` `scheduleReconnect` (capped exponential + full
@@ -286,18 +321,22 @@ rejection) were hard to distinguish from transient ones.
 - Reusable: **`openclaw/plugin-sdk/error-runtime`** (`formatErrorMessage`, `extractErrorCode`) —
   classifier building blocks; **`openclaw/plugin-sdk/runtime-env`** (`computeBackoff`).
 
-**Remaining polish (still open).**
-1. **Finer cause wording** — `ErrorListener = (err: Error)` carries **no cause tag**
-   (`nats-client.ts:222`), the classifier lumps `authorization violation` + `authentication expired`
-   into one terminal message (`:588-596`), and the widget shows a single hardcoded "Credentials
-   expired" heading (`widget.ts:163`). Thread a cause tag into the callback so the widget can
-   distinguish "auth failed — reload to re-login" vs "network blip — reconnecting" vs "rate-limited"
-   using `error-runtime` helpers. This is the open P1-7 slice.
+**Polish.**
+1. **Finer cause wording** — ✅ **built.** `ErrorListener` now carries an optional
+   `WebChannelErrorCause` second arg; the `-ERR` classifier splits `authentication expired`
+   (`auth-expired`) from `authorization violation` (`auth-rejected`), and the six register/handshake
+   emit sites each tag their cause (`config`, `auth-rejected`, `server`, `protocol-mismatch`,
+   `secure-channel-failed`). The wrapper lands it in `state.errorCause` (`?? "unknown"`), and the
+   widget renders heading/hint/recovery from `demo/web/src/error-copy.ts` — so a protocol mismatch
+   shows "Upgrade required" with no re-auth button instead of the false "Credentials expired". A
+   `rate-limited` cause was scoped out: there is no rate-limit signal on the browser↔NATS↔plugin path,
+   so inventing one would be dead code (the union stays open for a future producer).
 2. **Send-while-down** — now covered by P0-7 (client replay ledger re-sends on reconnect); the
    terminal case already disables send in the error-box render.
 
-**Acceptance (mostly met).** A network blip shows "reconnecting…"; a credential rejection shows a
-distinct terminal message with a recovery action (✅). Finer per-cause wording is the open slice.
+**Acceptance (met).** A network blip shows "reconnecting…"; a credential rejection shows a distinct
+terminal message with a recovery action (✅); each terminal cause now gets truthful per-cause wording
+and the right recovery affordance (✅).
 
 ---
 
@@ -368,7 +407,7 @@ quick succession produce **one** coalesced turn.
 
 ---
 
-## P1-9 — Pending-message retraction ("unsend" a queued message) — 🟢 WEB ADVANTAGE (no Telegram equiv)
+## P1-9 — Pending-message retraction ("unsend" a queued message) — ✅ BUILT (Option A — client-side hold)
 
 **Symptom.** You send a message while a turn is still running; it sits queued (`inbound-queue.ts`
 FIFO) and is delivered to the agent only after the current turn finishes. There is no way to pull it
@@ -381,15 +420,44 @@ reply-chain cache; it never dequeues a pending turn. Because **we own the browse
 offer genuine retraction — a superset of Telegram. Distinct from P1-8: retraction targets a
 **not-yet-started** queued message; aborting the **in-flight** turn is P1-8.
 
-**Where it stands today (nothing built — sends go straight through).**
-- The widget publishes immediately: `submit()` → `client.send(text)` → the wrapper publishes over
-  NATS at once. Nothing is held locally; there is no pending chip and no retract control.
-- Queueing happens **server-side** (`inbound-queue.ts` per-session FIFO / the P1-8b coalesce buffer).
-  The outbound union has no `retract` frame (`user_message` / `approval_decision` / `load_history` /
-  `load_commands` only), so once published a message is committed to the chain.
-- **Note:** P1-8b already gave the queue a content buffer (`src/inbound-queue.ts` `pending` +
-  `clearPending`) — the same server-side buffer Option B below needs. So Option B's prerequisite now
-  exists; only the `retract` frame + a by-id dequeue would be net-new.
+**What shipped (Option A — client-side hold; zero wire change, zero server-runtime change).** See
+`docs/P1_9_UNSEND_PLAN.md` (v4) for the full design + rationale. The hold lives in the wrapper
+(`packages/client/src/nats-client-wrapper.ts`), not the widget, so any embedder inherits it:
+- `send()` HOLDS when `state.isTyping || a working draft || held.length > 0` (the last is a FIFO latch
+  across disconnects); a held message is a `pending: true` local bubble, published only on release.
+- Release is FIFO-all, gated on `connected && sessionEstablished` (a new `onSession` hook in
+  `nats-client.ts`, fired at BOTH key-establishment sites strictly AFTER `flushQueue()` — drain → flush
+  → notify, so a released hold is ordered behind the P0-7b ledger replay). Released bubbles are moved
+  to the **tail** of the transcript (display position = publish position — load-bearing for the
+  history merge's local-order = transcript-order invariant).
+- Abort text bypasses the hold (`packages/client/src/abort-mirror.ts` mirrors core's `ABORT_TRIGGERS`
+  as a strict SUBSET; a plugin-package contract test enforces the subset against the real SDK
+  predicate). Explicit `/stop` additionally flips held bubbles to `retracted: true` (kept in the
+  transcript, restorable); NL abort words bypass but leave held messages intact.
+- `retract(id)` removes a pending or retracted bubble; a `turn_settled` draft-finalize + a
+  post-reconnect staleness valve (`STALE_DRAFT_GRACE_MS = 30_000`, connection-scoped) prevent a wedged
+  `working` draft from becoming a permanent send lockout. Note: the valve re-arms FRESH on every
+  register, so under a register storm (< 30s apart — the documented duplicate-responder failure mode)
+  its grace keeps resetting and expiry is deferred; non-lossy (chips stay retractable, `/stop`
+  recovers text), just slower to unwedge until the storm itself is fixed.
+- **Maintenance duty:** `abort-mirror.ts` is a VERBATIM pin of the openclaw dist `ABORT_TRIGGERS` +
+  normalization. It accepts a subset of core, so a false positive is impossible, but core GROWING its
+  vocabulary is invisible to the mirror (the new word is held-then-released — a bounded stale-abort
+  residual). **Re-pin the trigger set + normalization on every openclaw upgrade;** the contract test
+  catches a REMOVED word (prune the mirror) but cannot see additions.
+- **Known edge (pre-existing, documented while P1-9 touched the probe):** a bypassed mid-turn immediate
+  send (e.g. an NL abort echo) sitting between the tier-3 anchor and the reply blocks the positional
+  probe when the server does not transcript that text. This is byte-for-byte the SAME path any mid-turn
+  immediate send takes today — not introduced by P1-9, which only made the probe skip local-only
+  pending/retracted chips.
+- **Accepted residual (approval-wait window):** if `approval_request` clears `isTyping` with no working
+  draft live, held messages release into the server coalesce buffer behind the approval-blocked turn
+  (unretractable from that point) — exactly today's behavior for that window; Option A never makes it
+  worse. Fixing it needs Option B.
+
+Option B (server-side dequeue) stays deferred: P1-8b already gave the queue a content buffer
+(`src/inbound-queue.ts` `pending` + `clearPending`), so Option B's prerequisite exists; only a
+`retract` frame + a by-id dequeue + a protocol bump would be net-new. Not now.
 
 **Telegram reference.** None — this affordance does not exist in Telegram (see Classification). This
 item is scoped from our own transport, not benchmarked.
@@ -421,19 +489,25 @@ costs no E2E/server work, and stays purely in `demo/web/src/widget.ts` + a small
 
 | Order | Gap | Effort | Depends on |
 |---|---|---|---|
-| 1 | P1-3 reasoning lane | M | P1-1 ✅ + P0-5 ✅ **now met — unblocked, top lift** |
-| 2 | P1-9 pending-message retraction (unsend) | S | — (Option A: client hold, no server/wire change) |
-| 3 | P1-7 finer error wording | XS | — (mechanics + terminal UX already built; thread a cause tag) |
+| ✅ | P1-3 reasoning lane | M | built — native callback + turn-correlated lane |
+| ✅ | P1-9 pending-message retraction (unsend) | S | built — Option A client hold, no server/wire change |
+| ✅ | P1-7 finer error wording | XS | built — cause tag threaded to a cause-driven terminal error box |
 | 4 | P0-3 argument menus | S | — (catalog entries already carry `args.choices`; render dropdowns) |
 | 5 | P1-2 long-response polish | S | P1-1 ✅ |
-| 6 | P1-6 doctor | M | — (factor existing `index-nats` checks into a `ChannelDoctorAdapter`) |
+| ✅ | P1-6 doctor | M | built — C1–C11 finding engine mirrors the serving-loop skips; doctor + status adapters, probe never enrolls |
 | 7 | P1-4 media | L (mini-project) | **DECIDED: object storage / blob endpoint** |
 | — | ~~P1-5 interactive buttons~~ | — | **MERGED into P0-4** (delta = generalize renderer + 2 wire frames) |
 
 > ✅ **Already built:** P1-1 (markdown, #27), P1-7 (error/reconnect UX — status pill, terminal
-> "Credentials expired" + re-auth, terminal-vs-transient classification; finer per-cause wording is
-> the only remaining slice), P1-8a (`/stop` control lane, #25), P1-8b (debounce/coalesce, #29).
+> error box + re-auth, terminal-vs-transient classification, and finer per-cause wording via a
+> threaded `WebChannelErrorCause` tag), P1-8a (`/stop` control lane, #25), P1-8b (debounce/coalesce,
+> #29).
 
 **Resolved decisions (2026-07-02):**
 - **P1-4 media → object storage (blob endpoint).** See P1-4 above.
 - **P1-5 buttons → merged into P0-4** with the `presentation` + `button_action` delta; see P0-4.
+# Issue #54 audience update
+
+Audience drift/shared-audience diagnosis is closed structurally: an enabled
+account rejects any raw `auth.jwt.audience`, and its expected JWT `aud` is always
+its runtime account id. Doctor exposes the removed-key migration finding.

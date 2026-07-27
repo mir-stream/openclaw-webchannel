@@ -16,7 +16,23 @@ import {
   WEBCHANNEL_PROTOCOL_VERSION,
   type BootstrapPayload,
   type PinnedKeys,
+  type WebChannelErrorCause,
+  type WebChannelNATSClientOptions,
 } from "./index.js";
+import * as publicApi from "./index.js";
+import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+
+// P1-7: compile-time export assertion for the new type. A type-only export has no
+// runtime value, so there is nothing to `expect` at runtime — this TYPE-POSITION
+// use is the whole check: if the barrel stops exporting the name, tsc fails here.
+const _errorCauseExported: WebChannelErrorCause = "protocol-mismatch";
+void _errorCauseExported;
+const _capacityCauseExported: WebChannelErrorCause = "capacity";
+void _capacityCauseExported;
+const registration = {
+  devicePrivateKey: {} as CryptoKey,
+  deviceX25519PrivateKey: {} as CryptoKey,
+};
 
 /** Deterministic 32-byte key (no crypto.getRandomValues — reproducible). */
 function makeKey32(seed: number): Uint8Array {
@@ -40,6 +56,46 @@ function validPayload(): BootstrapPayload {
 }
 
 describe("public export surface (package entry)", () => {
+  it("does not export the removed gateway client", () => {
+    const removedExport = "WebChannel" + "Client";
+    expect(removedExport in publicApi).toBe(false);
+  });
+
+  it("keeps the low-level PopCapacityError off the package root", () => {
+    expect("PopCapacityError" in publicApi).toBe(false);
+  });
+
+  it("keeps generateClientNonce off the package root (single legitimate producer)", () => {
+    // The v3 register freshness anchor has exactly one correct producer:
+    // `registerWithPop`, which mints a fresh one per attempt. Exporting the
+    // generator invites an embedder to supply their own — reused across attempts,
+    // or persisted — which is precisely what the anchor exists to prevent. Kept
+    // as an exact-surface assertion so this is regression-proof, not convention.
+    expect("generateClientNonce" in publicApi).toBe(false);
+    // The teardown helper, by contrast, IS public: it is the only supported way
+    // to send a v3 unregister (a token-only one is a silent no-op).
+    expect("unregisterWithPop" in publicApi).toBe(true);
+  });
+
+  it("constructs the NATS wrapper type without legacy WS options", () => {
+    // Uses the barrel-exported options type (not ConstructorParameters) so tsc
+    // fails here if `WebChannelNATSClientOptions` drops off the public surface.
+    const compileOnly = (options: WebChannelNATSClientOptions) =>
+      new WebChannelNATSClient(options);
+    expect(compileOnly).toBeTypeOf("function");
+    const options: WebChannelNATSClientOptions = {
+      natsUrl: "wss://relay.example.test",
+      bootstrapJwt: "jwt",
+      accountId: "account",
+      tenant: "tenant",
+      peerId: "peer",
+      reconnectBaseMs: 250,
+      reconnectCapMs: 5_000,
+      heartbeatIntervalMs: 20_000,
+      registration,
+    };
+    expect(options.natsUrl).toContain("relay");
+  });
   it("re-exports parseBootstrapResponse and it validates a well-formed payload", () => {
     const keys: PinnedKeys = parseBootstrapResponse(validPayload());
     expect(keys.agentPublicKey).toEqual(makeKey32(2));
@@ -58,6 +114,6 @@ describe("public export surface (package entry)", () => {
   });
 
   it("re-exports the wire-protocol version constant", () => {
-    expect(WEBCHANNEL_PROTOCOL_VERSION).toBe(1);
+    expect(WEBCHANNEL_PROTOCOL_VERSION).toBe(3);
   });
 });

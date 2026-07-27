@@ -6,7 +6,7 @@
  * full `channels.webchannel.accounts.<id>` auth/nats block via `config patch`
  * before `channels add`. This declarative wizard drives the interactive path:
  * bare `openclaw channels add` → pick WebChannel → prompt for tenant + SaaS base
- * URL (plus an advanced JWT audience override) → `finalize` writes the
+ * URL → `finalize` writes the
  * COMPLETE, enroll-ready block. There is deliberately NO issuer prompt: the
  * issuer is SaaS-delivered at enrollment (see the textInputs note).
  *
@@ -32,20 +32,28 @@
  * until `finalize` performs the single atomic full-block write.
  */
 
-import { existsSync } from "node:fs";
-
 import type {
   ChannelSetupWizard,
   ChannelSetupWizardTextInput,
 } from "openclaw/plugin-sdk/setup";
 
-import { WEBCHANNEL_ID } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
-  DEFAULT_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   canonicalizeAccountId,
-  resolveReadCredentialPath,
+  formatAccountIdForLog,
+  isValidAccountId,
+  loadPersistedCredentialDocument,
+  resolveAcquisitionIdentity,
+  resolveAccountStorageRoot,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
+import {
+  parseNatsCredentialMode,
+  resolveEnrolledSaasBaseUrl,
+  type WebchannelNatsConfig,
+} from "./nats-credential-source.js";
+import { isAbsoluteHttpUrl } from "./saas-authority.js";
 import { webchannelSetup } from "./setup.js";
 
 /**
@@ -54,13 +62,12 @@ import { webchannelSetup } from "./setup.js";
  * `applySet` and `finalize` reads the collected values back by these keys, the
  * key is purely a local `credentialValues` label — cast to the required type so
  * we can use semantic names (tenant/saasBaseUrl/issuer) rather than repurposing
- * unrelated generic keys. `audience` happens to be a real key.
+ * unrelated generic keys.
  */
 type InputKey = ChannelSetupWizardTextInput["inputKey"];
 const KEY = {
   tenant: "tenant" as InputKey,
   saasBaseUrl: "saasBaseUrl" as InputKey,
-  audience: "audience" as InputKey,
 } as const;
 
 /** A no-op text-input writer — the real write happens once, in `finalize`. */
@@ -76,6 +83,9 @@ export function validateHttpUrl(value: string): string | undefined {
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     return "URL must use http:// or https://";
+  }
+  if (!isAbsoluteHttpUrl(value)) {
+    return "Enter a valid URL, e.g. https://saas.example.com";
   }
   return undefined;
 }
@@ -95,16 +105,58 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     configuredLabel: "configured",
     unconfiguredLabel: "not configured",
     resolveConfigured: ({ cfg, accountId }) => {
-      const id = canonicalizeAccountId(accountId ?? DEFAULT_ACCOUNT_ID);
+      const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+      if (!isValidAccountId(id)) return false;
       const account = resolveWebchannelAccountConfig(cfg, id);
-      const hasJwt = Boolean((account.auth as { jwt?: unknown } | undefined)?.jwt);
-      if (hasJwt) return true;
-      // Enrolled creds on disk also count as configured (the account is usable
-      // under admission=register-hop even before jwt auth is fully wired).
-      return existsSync(resolveReadCredentialPath(id));
+      let mode: "static" | "enrolled";
+      try {
+        mode =
+          parseNatsCredentialMode(
+            (
+              account.nats as
+                | { credentials?: { mode?: unknown } }
+                | undefined
+            )?.credentials?.mode,
+          ) ?? "enrolled";
+      } catch {
+        return false;
+      }
+      if (mode !== "enrolled") {
+        return Boolean((account.auth as { jwt?: unknown } | undefined)?.jwt);
+      }
+      // A path by itself is not readiness. Count enrolled material only when
+      // its complete v2 identity matches the effective configured account.
+      const identity = resolveAcquisitionIdentity(cfg, id);
+      const saasBaseUrl = resolveEnrolledSaasBaseUrl({
+        natsConfig: account.nats as WebchannelNatsConfig | undefined,
+        ...(identity.saasBaseUrl !== undefined
+          ? { saasBaseUrl: identity.saasBaseUrl }
+          : {}),
+      });
+      if (!saasBaseUrl) return false;
+      try {
+        const storageRoot = resolveAccountStorageRoot(account);
+        return loadPersistedCredentialDocument({
+          tenant: identity.tenant,
+          accountId: id,
+          saasBaseUrl,
+        }, {
+          ...(storageRoot !== undefined ? { storageRoot } : {}),
+        }).status === "match";
+      } catch {
+        // Invalid effective identity or storage path is unconfigured; status
+        // inspection must not turn malformed config into an uncaught failure.
+        return false;
+      }
     },
     resolveStatusLines: ({ cfg, accountId, configured }) => {
-      const id = canonicalizeAccountId(accountId ?? DEFAULT_ACCOUNT_ID);
+      const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+      if (!isValidAccountId(id)) {
+        return [
+          `WebChannel (${formatAccountIdForLog(id)}): not configured — ` +
+            `invalid account id; expected /^[A-Za-z0-9_-]{1,64}$/`,
+        ];
+      }
       const account = resolveWebchannelAccountConfig(cfg, id);
       const tenant = accountString(account, "tenant") ?? "unset";
       const saas =
@@ -144,25 +196,12 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     // non-interactive `--flag` form's issuer param — the pure escape hatch.
     // An EXISTING pin is never clobbered (buildFullAccountPatch no-clobber
     // merge), so re-running the wizard on a pinned account is safe.
-    {
-      // Advanced: defaults to the CANONICAL account id (aud == the canonical
-      // `accounts.<id>` key), so a mixed-case id typed at the prompt cannot make
-      // the default audience diverge from the key finalize writes under.
-      inputKey: KEY.audience,
-      message: "JWT audience (advanced — press enter to default to the account id)",
-      required: false,
-      initialValue: ({ cfg, accountId }) =>
-        (resolveWebchannelAccountConfig(cfg, accountId).auth as { jwt?: { audience?: string } } | undefined)
-          ?.jwt?.audience ?? canonicalizeAccountId(accountId),
-      applySet: noopApplySet,
-    },
   ],
   /**
    * The single atomic write for the interactive path. Maps the collected values
    * onto the setup adapter's full-block seam (`saasBaseUrl` present ⇒
    * `buildFullAccountPatch`), so the interactive and non-interactive paths share
-   * one writer and one merge/no-clobber policy. `issuer`/`audience` are the
-   * advanced overrides (undefined ⇒ derived: issuer = saasBaseUrl, aud = accountId).
+   * one writer and one merge/no-clobber policy. JWT aud is always accountId.
    */
   finalize: ({ cfg, accountId, credentialValues }) => {
     const saasBaseUrl = credentialValues[KEY.saasBaseUrl];
@@ -171,10 +210,8 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       // non-interactive harness) — nothing enroll-ready to write.
       return { cfg };
     }
-    // Canonicalize BEFORE writing so the account key and the derived audience
-    // default (buildFullAccountPatch: `audience ?? accountId`) are the same
-    // canonical id — a mixed-case id typed at the prompt would otherwise write
-    // `aud` ≠ the `accounts.<id>` key.
+    // Canonicalize before writing: the canonical account id is also the JWT
+    // audience expected by the runtime verifier.
     const id = canonicalizeAccountId(accountId);
     const next = webchannelSetup.applyAccountConfig({
       cfg,
@@ -183,7 +220,6 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
         baseUrl: saasBaseUrl,
         url: credentialValues[KEY.tenant],
         // issuer deliberately NOT collected/written — see the textInputs note.
-        audience: credentialValues[KEY.audience],
       },
     });
     return { cfg: next };

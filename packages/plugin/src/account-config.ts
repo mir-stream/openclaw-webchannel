@@ -26,32 +26,87 @@
  * multiplex SERVING is Cycle 2. `"default"` is a NORMAL account id.
  *
  * ── Account id is a TRUST BOUNDARY ──────────────────────────────────────────
- * accountId flows into filesystem paths (`~/.openclaw-webchannel/<account>/…`),
- * so it MUST be validated/canonicalized before any `path.join`. We reuse core's
- * canonicalization rules and additionally HARD-REJECT a non-conforming id at the
- * path boundary so a traversal sequence (`../../evil`) can never escape the root.
+ * accountId participates in the exact storage identity, so it MUST be validated
+ * before deriving an opaque tuple namespace. Raw tenant/account values are
+ * never interpolated into v2 persistence paths.
  */
 
 import { homedir } from "node:os";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  lstatSync,
+  readFileSync,
+  statSync,
+  type Stats,
+} from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 
+import {
+  assertValidAccountId,
+  isBlockedAccountId,
+  isValidAccountId,
+} from "./account-id.js";
+import {
+  assertValidCredentialBindingExpectation,
+  loadBoundCredentialDocumentJson,
+  type BoundCredentialLoadResult,
+  type CredentialBindingExpectation,
+} from "./credential-document.js";
+import { migrateLegacyTupleState } from "./legacy-storage-migration.js";
 import type { WebchannelNatsConfig } from "./nats-credential-source.js";
-import type { KeyPair } from "./e2e-crypto.js";
+import {
+  resolveCredentialPath,
+  type CredentialPathOptions,
+} from "./storage-paths.js";
+import type { StorageScopeIdentity } from "./storage-identity.js";
+import { StorageDocumentError } from "./storage-document.js";
+
+export { assertValidAccountId, isValidAccountId } from "./account-id.js";
+export type { PersistedEnrolledCreds } from "./credential-document.js";
 
 /** The single default account id (mirrors core's `"default"`). */
-export const DEFAULT_ACCOUNT_ID = "default";
+export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = "default";
 
-/**
- * Strict account-id shape accepted at the filesystem trust boundary. Matches the
- * brief's `^[A-Za-z0-9_-]{1,64}$`; intentionally stricter than core's lenient
- * canonicalizer (no leading-dash / dot / slash) so a path component can never
- * contain `.`/`/`/`\`.
- */
-const STRICT_ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+export type InvalidAccountId = { id: string; reason: string };
 
-/** Object keys that must never be used as account ids (prototype pollution). */
-const BLOCKED_ACCOUNT_IDS = new Set(["__proto__", "prototype", "constructor"]);
+export type AccountIdInspection = {
+  validIds: string[];
+  invalid: InvalidAccountId[];
+  usesImplicitDefault: boolean;
+};
+
+/** JSON rendering is deliberately shared by every surface that prints an id. */
+export function formatAccountIdForLog(id: string): string {
+  return JSON.stringify(id);
+}
+
+export function inspectWebchannelAccountIds(cfg: unknown): AccountIdInspection {
+  const section = readWebchannelSection(cfg);
+  const rawIds = Object.keys(readAccountsMap(section));
+  if (rawIds.length === 0) {
+    return {
+      validIds: [DEFAULT_WEBCHANNEL_ACCOUNT_ID],
+      invalid: [],
+      usesImplicitDefault: true,
+    };
+  }
+
+  const validIds: string[] = [];
+  const invalid: InvalidAccountId[] = [];
+  for (const id of rawIds) {
+    if (isValidAccountId(id)) validIds.push(id);
+    else {
+      invalid.push({
+        id,
+        reason: isBlockedAccountId(id)
+          ? "the id is a blocked prototype key"
+          : "the id must match /^[A-Za-z0-9_-]{1,64}$/",
+      });
+    }
+  }
+  validIds.sort((a, b) => a.localeCompare(b));
+  invalid.sort((a, b) => a.id.localeCompare(b.id));
+  return { validIds, invalid, usesImplicitDefault: false };
+}
 
 /**
  * Core-compatible canonicalization (mirrors openclaw's `normalizeAccountId`):
@@ -62,33 +117,14 @@ const BLOCKED_ACCOUNT_IDS = new Set(["__proto__", "prototype", "constructor"]);
  */
 export function canonicalizeAccountId(value: string | undefined | null): string {
   const trimmed = (value ?? "").trim().toLowerCase();
-  if (!trimmed) return DEFAULT_ACCOUNT_ID;
+  if (!trimmed) return DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   const canonical = trimmed
     .replace(/[^a-z0-9_-]+/g, "-")
     .replace(/^-+/, "")
     .replace(/-+$/, "")
     .slice(0, 64);
-  if (!canonical || BLOCKED_ACCOUNT_IDS.has(canonical)) return DEFAULT_ACCOUNT_ID;
+  if (!canonical || isBlockedAccountId(canonical)) return DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   return canonical;
-}
-
-/** True when `id` is a safe account id for use as a filesystem path component. */
-export function isValidAccountId(id: string): boolean {
-  return STRICT_ACCOUNT_ID_RE.test(id) && !BLOCKED_ACCOUNT_IDS.has(id.toLowerCase());
-}
-
-/**
- * Assert that an account id is safe to use in a filesystem path. Throws on a
- * traversal sequence / illegal character / blocked key. This is the last-line
- * defense at every path-building / credential-loading entry point.
- */
-export function assertValidAccountId(id: string): void {
-  if (!isValidAccountId(id)) {
-    throw new Error(
-      `webchannel: invalid account id ${JSON.stringify(id)} — must match ` +
-        `/^[A-Za-z0-9_-]{1,64}$/ (refusing to build a credential path).`,
-    );
-  }
 }
 
 /** Per-account config keys whose nested object values are shallow-merged. */
@@ -112,6 +148,53 @@ const STRUCTURAL_KEYS = new Set(["accounts", "defaultAccount", "enabled"]);
 
 /** A single resolved account's raw config object. */
 export type WebchannelAccountConfig = Record<string, unknown>;
+
+export class RemovedAudienceConfigError extends Error {
+  readonly accountId: string;
+  readonly paths: readonly string[];
+
+  constructor(accountId: string, paths: readonly string[]) {
+    super(
+      `webchannel: removed config ${paths.join(", ")} is no longer supported for account ` +
+        `${JSON.stringify(accountId)}; delete auth.jwt.audience. JWT aud is always the runtime ` +
+        `accountId. Refusing to serve this account.`,
+    );
+    this.name = "RemovedAudienceConfigError";
+    this.accountId = accountId;
+    this.paths = [...paths];
+  }
+}
+
+function hasRawAudience(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const jwt = (value as { jwt?: unknown }).jwt;
+  return Boolean(
+    jwt &&
+      typeof jwt === "object" &&
+      !Array.isArray(jwt) &&
+      Object.prototype.hasOwnProperty.call(jwt, "audience"),
+  );
+}
+
+/** Return the raw removed-key locations that scope to one account before merge. */
+export function findRemovedAudiencePaths(cfg: unknown, accountId: string): string[] {
+  const section = readWebchannelSection(cfg);
+  if (!section) return [];
+  const paths: string[] = [];
+  if (hasRawAudience(section.auth)) {
+    paths.push("channels.webchannel.auth.jwt.audience");
+  }
+  const account = readAccountsMap(section)[accountId];
+  if (account && hasRawAudience(account.auth)) {
+    paths.push(`channels.webchannel.accounts.${accountId}.auth.jwt.audience`);
+  }
+  return paths;
+}
+
+export function assertNoRemovedAudienceConfig(cfg: unknown, accountId: string): void {
+  const paths = findRemovedAudiencePaths(cfg, accountId);
+  if (paths.length > 0) throw new RemovedAudienceConfigError(accountId, paths);
+}
 
 /**
  * Acquisition identity for an account — the inputs the device-flow enroll needs.
@@ -139,6 +222,36 @@ export function readAccountsMap(
   return accounts !== null && typeof accounts === "object"
     ? (accounts as Record<string, WebchannelAccountConfig>)
     : {};
+}
+
+/**
+ * Whether `channels.webchannel` contains actual account configuration data.
+ * Lifecycle/selection metadata alone does not configure an account: an empty
+ * `accounts` map, `defaultAccount`, and `enabled` are structural. Any real flat
+ * field or at least one entry in `accounts` does count as configuration.
+ */
+export function hasWebchannelConfig(cfg: unknown): boolean {
+  const section = readWebchannelSection(cfg);
+  if (!section) return false;
+  if (Object.keys(readAccountsMap(section)).length > 0) return true;
+  return Object.keys(section).some((key) => !STRUCTURAL_KEYS.has(key));
+}
+
+/**
+ * Resolve whether an account is enabled for both status and runtime planning.
+ * A channel-level false disables every account; otherwise an explicit named
+ * account false disables only that account. Missing flags default to enabled.
+ */
+export function isWebchannelAccountEnabled(
+  cfg: unknown,
+  accountId?: string | null,
+): boolean {
+  const section = readWebchannelSection(cfg);
+  if (section?.enabled === false) return false;
+
+  const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+  const account = readAccountsMap(section)[id];
+  return !(account && typeof account === "object" && account.enabled === false);
 }
 
 /** The channel-level shared base (flat fields, excluding structural keys). */
@@ -181,6 +294,32 @@ function mergeAccountConfig(
   return merged;
 }
 
+function assertNoRemovedConfig(account: WebchannelAccountConfig): void {
+  const auth = account.auth;
+  if (auth && typeof auth === "object" && Object.prototype.hasOwnProperty.call(auth, "ticketParam")) {
+    throw new Error(
+      "webchannel: removed config auth.ticketParam is no longer supported because Gateway direct WebSocket authentication was deleted; reconfigure with `openclaw channels add --channel webchannel`.",
+    );
+  }
+  const migrationError = (setting: string): never => {
+    throw new Error(
+      `webchannel: removed config ${setting} is no longer supported; authenticated enrollment is required. Reconfigure with \`openclaw channels add --channel webchannel\`.`,
+    );
+  };
+  if (auth && typeof auth === "object" && (auth as { strategy?: unknown }).strategy === "anonymous") {
+    migrationError('auth.strategy="anonymous"');
+  }
+  const nats = account.nats;
+  if (nats && typeof nats === "object") {
+    if (Object.prototype.hasOwnProperty.call(nats, "devOpen")) migrationError("nats.devOpen");
+    if ((nats as { admission?: unknown }).admission === "auto") migrationError('nats.admission="auto"');
+    const credentials = (nats as { credentials?: unknown }).credentials;
+    if (credentials && typeof credentials === "object" && (credentials as { mode?: unknown }).mode === "open") {
+      migrationError('nats.credentials.mode="open"');
+    }
+  }
+}
+
 /**
  * List the configured account ids (canonical `accounts.<id>` model).
  *
@@ -197,10 +336,7 @@ function mergeAccountConfig(
  * Sorted for stable ordering (mirrors core).
  */
 export function listWebchannelAccountIds(cfg: unknown): string[] {
-  const section = readWebchannelSection(cfg);
-  const ids = new Set<string>(Object.keys(readAccountsMap(section)).filter(Boolean));
-  if (ids.size === 0) return [DEFAULT_ACCOUNT_ID];
-  return [...ids].sort((a, b) => a.localeCompare(b));
+  return inspectWebchannelAccountIds(cfg).validIds;
 }
 
 /**
@@ -213,13 +349,15 @@ export function listWebchannelAccountIds(cfg: unknown): string[] {
  */
 export function resolveWebchannelAccountConfig(
   cfg: unknown,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
 ): WebchannelAccountConfig {
   const section = readWebchannelSection(cfg);
   if (!section) return {};
   const base = channelLevelBase(section);
   const override = readAccountsMap(section)[accountId] ?? {};
-  return mergeAccountConfig(base, override);
+  const resolved = mergeAccountConfig(base, override);
+  assertNoRemovedConfig(resolved);
+  return resolved;
 }
 
 /**
@@ -233,7 +371,7 @@ export function resolveWebchannelAccountConfig(
  */
 export function resolveAcquisitionIdentity(
   cfg: unknown,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
 ): WebchannelAcquisitionIdentity {
   const account = resolveWebchannelAccountConfig(cfg, accountId);
   const top = cfg as
@@ -241,7 +379,7 @@ export function resolveAcquisitionIdentity(
     | undefined;
   const accountSaas = (account.saas as { baseUrl?: string } | undefined)?.baseUrl;
 
-  const isDefault = accountId === DEFAULT_ACCOUNT_ID;
+  const isDefault = accountId === DEFAULT_WEBCHANNEL_ACCOUNT_ID;
   return {
     accountId,
     tenant:
@@ -278,7 +416,7 @@ export function resolveTypingEnabled(accountConfig: WebchannelAccountConfig): bo
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,
-  accountId: string = DEFAULT_ACCOUNT_ID,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
 ): WebchannelNatsConfig | undefined {
   const account = resolveWebchannelAccountConfig(cfg, accountId);
   return account.nats as WebchannelNatsConfig | undefined;
@@ -294,179 +432,251 @@ export function credentialsRootDir(home: string = homedir()): string {
 }
 
 /**
- * Per-account credential path: `~/.openclaw-webchannel/<account>/credentials.json`.
- * Validates `accountId` (rejects traversal) BEFORE the join.
+ * Exact tuple credential path under the opaque v2 namespace.
  */
 export function accountCredentialPath(
-  accountId: string = DEFAULT_ACCOUNT_ID,
-  home: string = homedir(),
+  scope: StorageScopeIdentity,
+  opts: { home?: string; storageRoot?: string; credentialPath?: string } = {},
 ): string {
-  assertValidAccountId(accountId);
-  return join(credentialsRootDir(home), accountId, "credentials.json");
+  return resolveCredentialPath({ ...scope, ...opts });
 }
 
 /**
- * Legacy single-file path: `~/.openclaw-webchannel/credentials.json`.
+ * Migration-only legacy single-file location. Runtime readers must never
+ * consult this path; it is exposed solely for explicit cleanup tooling.
  *
- * Kept for the backward-compat fallback: when the per-account file is absent for
- * the `"default"` account AND this legacy file exists, the runtime reads it.
+ * Readers never consult this location. Operators may use it only for an
+ * explicit one-time migration or for the offline reset cleanup procedure.
  */
 export function legacyCredentialPath(home: string = homedir()): string {
   return join(credentialsRootDir(home), "credentials.json");
 }
 
 /**
- * Resolve the credential path to READ for an account.
+ * Resolve the credential path to READ for one exact tuple.
  *
- * Precedence:
- *   1. The per-account path if it exists.
- *   2. Backward-compat: for `"default"` only, the legacy single-file path.
- *   3. Otherwise the per-account path (callers treat a non-existent path as
- *      "creds missing").
+ * This always returns the tuple-scoped path. The legacy single-file location
+ * is migration/cleanup-only and is deliberately never a read fallback.
  *
- * `assertValidAccountId` runs first (via `accountCredentialPath`).
  */
 export function resolveReadCredentialPath(
-  accountId: string = DEFAULT_ACCOUNT_ID,
-  opts: { home?: string; exists?: (p: string) => boolean } = {},
+  scope: StorageScopeIdentity,
+  opts: {
+    home?: string;
+    storageRoot?: string;
+    credentialPath?: string;
+    exists?: (p: string) => boolean;
+  } = {},
 ): string {
-  const home = opts.home ?? homedir();
-  const exists = opts.exists ?? existsSync;
-  const perAccount = accountCredentialPath(accountId, home);
-  if (exists(perAccount)) return perAccount;
-  if (accountId === DEFAULT_ACCOUNT_ID) {
-    const legacy = legacyCredentialPath(home);
-    if (exists(legacy)) return legacy;
+  return accountCredentialPath(scope, opts);
+}
+
+/** Resolve and validate a common tuple storage root from merged config. */
+export function resolveAccountStorageRoot(
+  account: WebchannelAccountConfig,
+): string | undefined {
+  const value = account.storageRoot;
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw new Error(
+      "webchannel: storageRoot must be a non-empty absolute filesystem path",
+    );
   }
-  return perAccount;
+  if (!isAbsolute(value)) {
+    throw new Error(
+      "webchannel: storageRoot must be an absolute filesystem path",
+    );
+  }
+  return value;
 }
 
 /**
- * Persisted enrolled NATS credentials (the subset `gateway run` consumes).
- * Mirrors the `enrollment.creds` block of the on-disk `PluginCredentials`.
- */
-export type PersistedEnrolledCreds = {
-  userJwt: string;
-  userSeed: string;
-  /**
-   * NATS relay URL the SaaS delivered alongside the creds (EnrollmentResult.natsUrl,
-   * persisted under `enrollment.natsUrl`). The SaaS is the rendezvous authority, so
-   * the consume path dials THIS in preference to any local `nats.url` /
-   * `WEBCHANNEL_NATS_URL`. Absent for creds enrolled before this field existed —
-   * the consumer then falls back to the resolver URL (back-compat).
-   */
-  natsUrl?: string;
-  /**
-   * Bootstrap-JWT issuer the SaaS delivered alongside the creds
-   * (EnrollmentResult.issuer, persisted under `enrollment.issuer`). Same
-   * rendezvous-authority principle as `natsUrl`: the SaaS declares the exact
-   * `iss` it mints, so the runtime verifies against THIS instead of deriving
-   * issuer = saas.baseUrl and hoping the two agree. Precedence: operator pin
-   * (`auth.jwt.issuer`) > this delivered value > derived. Absent for creds
-   * enrolled before this field existed — the runtime then derives (back-compat).
-   * Used VERBATIM (verify already compares slash-insensitively).
-   */
-  issuer?: string;
-  /**
-   * F2 — the agent's SaaS-attested static X25519 identity key pair, read from the
-   * top-level `identityKey.{publicKey,privateKey}` (base64url) that
-   * `enrollment-client.ts` persists in the SAME `credentials.json`. The register
-   * (keyStore) path wraps the conversation key under THIS so the browser can
-   * authenticate K against the SaaS-pinned agent public key. Absent for creds
-   * enrolled before this field existed or a malformed key block — the register-hop
-   * account then fail-closed skips serving (index-nats), while auto/open/static
-   * accounts (which never wrap K) are unaffected.
-   */
-  identityKey?: KeyPair;
-};
-
-/**
- * Load the persisted enrolled creds for an account (CONSUME-only path — 가-1).
+ * Load one complete credential document only after proving its v2 binding.
  *
- * Reads the resolved credential file (per-account, with the legacy fallback for
- * `"default"`) and returns its `enrollment.creds`. Returns `undefined` when the
- * file is absent, unreadable, malformed, or has no enrollment block — the
- * runtime treats that as "creds missing" and applies account-scoped graceful
- * degradation (it never enrolls at runtime). Validates `accountId` first.
+ * The legacy single-file path is never consulted. Unlike the historical loader,
+ * this preserves absent/unbound/mismatch/incomplete/malformed as distinct,
+ * sanitized outcomes and returns secrets only for a complete match.
  *
  * The fs seams are injectable for tests.
  */
-export function loadPersistedEnrolledCreds(
-  accountId: string = DEFAULT_ACCOUNT_ID,
+export function loadPersistedCredentialDocument(
+  expected: CredentialBindingExpectation,
   opts: {
     home?: string;
+    storageRoot?: string;
+    credentialPath?: string;
+    /** @deprecated Retained for source compatibility; direct reads ignore it. */
     exists?: (p: string) => boolean;
     read?: (p: string) => string;
+    migrateLegacy?: boolean;
   } = {},
-): PersistedEnrolledCreds | undefined {
-  assertValidAccountId(accountId);
-  const exists = opts.exists ?? existsSync;
-  const read = opts.read ?? ((p: string) => readFileSync(p, "utf-8"));
-  const path = resolveReadCredentialPath(accountId, {
+): BoundCredentialLoadResult {
+  assertValidCredentialBindingExpectation(expected);
+  const pathOptions: CredentialPathOptions = {
+    tenant: expected.tenant,
+    accountId: expected.accountId,
     ...(opts.home !== undefined ? { home: opts.home } : {}),
-    exists,
-  });
-  if (!exists(path)) return undefined;
-  try {
-    const parsed = JSON.parse(read(path)) as {
-      identityKey?: { publicKey?: unknown; privateKey?: unknown };
-      enrollment?: {
-        creds?: { userJwt?: unknown; userSeed?: unknown };
-        natsUrl?: unknown;
-        issuer?: unknown;
-      };
-    };
-    const creds = parsed.enrollment?.creds;
+    ...(opts.storageRoot !== undefined
+      ? { storageRoot: opts.storageRoot }
+      : {}),
+    ...(opts.credentialPath !== undefined
+      ? { credentialPath: opts.credentialPath }
+      : {}),
+  };
+  const path = resolveReadCredentialPath(expected, opts);
+  const initial = loadCredentialDocumentAtPath(expected, path, opts.read);
+  const shouldMigrate =
+    opts.migrateLegacy !== false &&
+    opts.read === undefined &&
+    opts.exists === undefined;
+  if (!shouldMigrate) return initial;
+  // An exact override may itself be a proven v1 source. Only the complete
+  // unbound classification can enter that migration path; malformed,
+  // mismatched, incomplete, and anomalous reads remain authoritative.
+  if (initial.status !== "absent" && initial.status !== "match") {
     if (
-      creds &&
-      typeof creds.userJwt === "string" &&
-      typeof creds.userSeed === "string" &&
-      creds.userJwt.length > 0 &&
-      creds.userSeed.length > 0
+      initial.status === "unbound" &&
+      opts.credentialPath !== undefined
     ) {
-      // Thread the SaaS-delivered relay URL + issuer through when present. Kept
-      // optional so already-persisted (pre-natsUrl / pre-issuer) creds still
-      // load and fall back gracefully.
-      const natsUrl = parsed.enrollment?.natsUrl;
-      const issuer = parsed.enrollment?.issuer;
-      // F2: decode the agent identity key pair (top-level, base64url). Only
-      // surfaced when BOTH halves decode to exactly 32 bytes — a partial or
-      // malformed block is treated as absent so the register-hop account
-      // fail-closed skips serving rather than wrapping under a bad key.
-      const identityKey = parseIdentityKey(parsed.identityKey);
-      return {
-        userJwt: creds.userJwt,
-        userSeed: creds.userSeed,
-        ...(typeof natsUrl === "string" && natsUrl.length > 0 ? { natsUrl } : {}),
-        ...(typeof issuer === "string" && issuer.length > 0 ? { issuer } : {}),
-        ...(identityKey ? { identityKey } : {}),
-      };
+      try {
+        migrateLegacyTupleState(pathOptions);
+      } catch (error) {
+        if (
+          error instanceof StorageDocumentError &&
+          error.code === "identity-unbound"
+        ) {
+          return initial;
+        }
+        throw error;
+      }
+      return loadCredentialDocumentAtPath(expected, path, opts.read);
     }
-    return undefined;
-  } catch {
-    return undefined;
+    return initial;
   }
+  migrateLegacyTupleState(pathOptions);
+  return loadCredentialDocumentAtPath(expected, path, opts.read);
 }
 
 /**
- * F2 — decode a persisted `identityKey.{publicKey,privateKey}` (base64url) into a
- * raw-bytes `KeyPair`. Returns `undefined` unless BOTH halves are present and
- * decode to exactly 32 bytes (an X25519 key), so a malformed/partial block is
- * treated as "no identity key" (fail-closed downstream) rather than surfacing a
- * bad key into the wrap path.
+ * Read and classify one exact credential path without an existence precheck.
+ *
+ * A direct read avoids check/read races and, critically, distinguishes a
+ * genuinely absent file from an existing store hidden by filesystem denial.
  */
-function parseIdentityKey(
-  raw: { publicKey?: unknown; privateKey?: unknown } | undefined,
-): KeyPair | undefined {
-  if (!raw || typeof raw.publicKey !== "string" || typeof raw.privateKey !== "string") {
-    return undefined;
-  }
+export function loadCredentialDocumentAtPath(
+  expected: CredentialBindingExpectation,
+  path: string,
+  read: (p: string) => string = (p) => readFileSync(p, "utf-8"),
+): BoundCredentialLoadResult {
+  assertValidCredentialBindingExpectation(expected);
+  let serialized: string;
   try {
-    const publicKey = new Uint8Array(Buffer.from(raw.publicKey, "base64url"));
-    const privateKey = new Uint8Array(Buffer.from(raw.privateKey, "base64url"));
-    if (publicKey.length !== 32 || privateKey.length !== 32) return undefined;
-    return { publicKey, privateKey };
-  } catch {
-    return undefined;
+    serialized = read(path);
+  } catch (error) {
+    if (
+      isFilesystemErrorCode(error, "ENOENT") &&
+      isGenuinelyAbsentCredentialPath(path)
+    ) {
+      return Object.freeze({ status: "absent" });
+    }
+    return Object.freeze({
+      status: "invalid",
+      code: "read-failed",
+      fields: Object.freeze([]),
+    });
   }
+  return loadBoundCredentialDocumentJson(expected, serialized);
+}
+
+/**
+ * Prove ENOENT means no credential directory entry exists.
+ *
+ * `readFileSync` follows symlinks, so a dangling symlink at the credential path
+ * or in a parent component also reports ENOENT. Walk upward with lstat (which
+ * does not follow the entry), follow only existing symlink ancestors to prove
+ * they still resolve to directories, then recheck every observation. Any
+ * unexpected entry, permission failure, non-directory, or detected race fails
+ * closed as read-failed.
+ */
+function isGenuinelyAbsentCredentialPath(path: string): boolean {
+  const missing: string[] = [];
+  let cursor = path;
+  let anchor:
+    | { path: string; lstat: Stats; target?: Stats }
+    | undefined;
+
+  while (true) {
+    try {
+      const entry = lstatSync(cursor);
+      if (cursor === path) return false;
+      let target: Stats | undefined;
+      if (entry.isSymbolicLink()) {
+        try {
+          target = statSync(cursor);
+        } catch {
+          return false;
+        }
+        if (!target.isDirectory()) return false;
+      } else if (!entry.isDirectory()) {
+        return false;
+      }
+      anchor = {
+        path: cursor,
+        lstat: entry,
+        ...(target ? { target } : {}),
+      };
+      break;
+    } catch (error) {
+      if (!isFilesystemErrorCode(error, "ENOENT")) return false;
+      missing.push(cursor);
+      const parent = dirname(cursor);
+      if (parent === cursor) return false;
+      cursor = parent;
+    }
+  }
+
+  // Bias races closed: the supporting directory entry must be unchanged and
+  // every component observed missing must still be missing.
+  try {
+    const currentAnchor = lstatSync(anchor.path);
+    if (
+      currentAnchor.dev !== anchor.lstat.dev ||
+      currentAnchor.ino !== anchor.lstat.ino ||
+      currentAnchor.isDirectory() !== anchor.lstat.isDirectory() ||
+      currentAnchor.isSymbolicLink() !== anchor.lstat.isSymbolicLink()
+    ) {
+      return false;
+    }
+    if (currentAnchor.isSymbolicLink()) {
+      const currentTarget = statSync(anchor.path);
+      if (
+        !currentTarget.isDirectory() ||
+        !anchor.target ||
+        currentTarget.dev !== anchor.target.dev ||
+        currentTarget.ino !== anchor.target.ino
+      ) {
+        return false;
+      }
+    }
+  } catch {
+    return false;
+  }
+  for (const missingPath of missing) {
+    try {
+      lstatSync(missingPath);
+      return false;
+    } catch (error) {
+      if (!isFilesystemErrorCode(error, "ENOENT")) return false;
+    }
+  }
+  return true;
+}
+
+function isFilesystemErrorCode(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === code
+  );
 }

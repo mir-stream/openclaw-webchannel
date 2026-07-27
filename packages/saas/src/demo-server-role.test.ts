@@ -144,6 +144,57 @@ describe("demo SaaS /nats-user role-escalation guard (F6)", () => {
     expect(typeof data.userSeedRaw).toBe("string");
   });
 
+  it("session-gated bootstrap signs the fixed tenant/scalar account and returns that tuple's registry pin", async () => {
+    const accountId = "agent-dev";
+    const agentPublicKey = "EpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSo";
+    const devicePublicKey = "QpK8GJc3BntN3yEwx5GtfQFyIilwIXaKsrWiqYNkzSs";
+    const enroll = await fetch(`${BASE}/api/enroll`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentPublicKey, tenant: TENANT, accountId }),
+    });
+    expect(enroll.status).toBe(200);
+    const { user_code: userCode } = await enroll.json() as { user_code: string };
+    const adminCookie = await loginCookie("admin", "demo");
+    const approve = await fetch(`${BASE}/admin/enrollments/${userCode}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", cookie: adminCookie },
+      body: "{}",
+    });
+    expect(approve.status).toBe(200);
+
+    const aliceCookie = await loginCookie("alice", "demo");
+    const bootstrap = async (body: Record<string, unknown>) => {
+      const response = await fetch(`${BASE}/bootstrap`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", cookie: aliceCookie },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json() as Record<string, unknown> };
+    };
+    const valid = await bootstrap({ tenant: TENANT, accountId, deviceX25519PublicKey: devicePublicKey });
+    expect(valid.status).toBe(200);
+    expect(valid.body.agentPublicKey).toBe(agentPublicKey);
+    const claims = JSON.parse(
+      Buffer.from(String(valid.body.jwt).split(".")[1], "base64url").toString("utf8"),
+    ) as Record<string, unknown>;
+    expect(claims.aud).toBe(accountId);
+    expect(claims.tenant).toBe(TENANT);
+    expect(claims.sub).toBe(ALICE_UUID);
+    expect(claims).not.toHaveProperty("accountId");
+
+    expect((await bootstrap({
+      tenant: "foreign-tenant",
+      accountId,
+      deviceX25519PublicKey: devicePublicKey,
+    })).status).toBe(403);
+    expect((await bootstrap({
+      tenant: TENANT,
+      accountId: "foreign-account",
+      deviceX25519PublicKey: devicePublicKey,
+    })).status).toBe(403);
+  });
+
   it("honors ttlSeconds on the browser route (scene ⑤ short-TTL)", async () => {
     const cookie = await loginCookie("alice", "demo");
     const { status, data } = await post("/nats-user", cookie, { ttlSeconds: 60 });

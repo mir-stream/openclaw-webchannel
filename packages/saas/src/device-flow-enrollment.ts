@@ -29,7 +29,9 @@ import type {
 import type { SaasTrustChainPrivate, NatsAccountConfig } from "./types.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
-import type { AgentKeyRegistry } from "./agent-key-registry.js";
+import { createHash, randomBytes } from "node:crypto";
+import type { ActivationId, AgentKeyRecord } from "./agent-key-registry.js";
+import { DeviceCodeCollisionError, UserCodeCollisionError, type EnrollmentRepository } from "./enrollment-repository.js";
 
 // ---------------------------------------------------------------------------
 // Configuration constants
@@ -74,25 +76,24 @@ const DEVICE_CODE_BYTES = 32;
 const MAX_ENROLL_ATTEMPTS = 5;
 
 /**
- * How often the in-memory store's background sweeper runs (default 60s).
- */
-const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
-
-/**
- * How long past `expiresAt` an enrollment is retained before eviction
- * (default 5 min). A grace window so a plugin polling shortly after expiry
- * still observes the correct `expired_token` error rather than the confusing
- * `invalid_device_code` ("not found"). After the window the record is reclaimed.
- */
-const DEFAULT_RETENTION_MS = 300_000;
-
-/**
  * Exact wire format of `agentPublicKey`: base64url (no padding) of a 32-byte
  * X25519 public key = exactly 43 characters. The plugin is the only legitimate
  * caller (`enrollment-client.ts`) and always sends precisely this, so the form
  * is pinned strictly — no length range, no padding, no standard-base64 chars.
  */
 const AGENT_PUBLIC_KEY_FORMAT = /^[A-Za-z0-9_-]{43}$/;
+
+/**
+ * A request-validation failure that is safe for an unauthenticated enrollment
+ * endpoint to return to its caller. Backend/store/runtime errors intentionally
+ * use their original types and must be handled by a sanitized 500 boundary.
+ */
+export class EnrollmentValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EnrollmentValidationError";
+  }
+}
 
 /**
  * Throw unless `key` is the exact `agentPublicKey` wire format.
@@ -104,7 +105,7 @@ const AGENT_PUBLIC_KEY_FORMAT = /^[A-Za-z0-9_-]{43}$/;
  */
 function assertValidAgentPublicKey(key: unknown): void {
   if (typeof key !== "string" || !AGENT_PUBLIC_KEY_FORMAT.test(key)) {
-    throw new Error(
+    throw new EnrollmentValidationError(
       "webchannel: agentPublicKey must be base64url of a 32-byte X25519 public key",
     );
   }
@@ -131,30 +132,6 @@ function sanitizeProtocolVersion(v: unknown): number | undefined {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Enrollment store interface
-// ---------------------------------------------------------------------------
-
-/**
- * Thrown by an {@link EnrollmentStore} when a `saveEnrollment` fails because the
- * `user_code` uniqueness constraint was violated (a rare collision on the
- * approval-UI lookup key). This is the ONE store failure `enroll()` treats as
- * retryable: it re-mints a fresh user_code and retries, bounded. Any other
- * `saveEnrollment` failure is a real store fault and propagates unchanged.
- *
- * Persistent stores SHOULD map their backend's unique-violation (e.g. a
- * Postgres `UNIQUE(user_code)` error) onto this type instead of leaking the
- * backend error format. A store that holds a DIFFERENT copy of this class
- * across package duplication can equivalently set `error.name` to
- * `"UserCodeCollisionError"` — `enroll()` retries on the name too.
- */
-export class UserCodeCollisionError extends Error {
-  constructor(userCode: string) {
-    super(`webchannel: user_code collision: ${userCode}`);
-    this.name = "UserCodeCollisionError";
-  }
-}
-
 /**
  * Is `err` a user_code collision `enroll()` should retry on? Matches both an
  * `instanceof` of our class AND any error whose `name` is
@@ -166,182 +143,6 @@ function isUserCodeCollisionError(err: unknown): boolean {
     err instanceof UserCodeCollisionError ||
     (typeof err === "object" && err !== null && (err as { name?: unknown }).name === "UserCodeCollisionError")
   );
-}
-
-/**
- * Enrollment store interface.
- *
- * Implementations can be in-memory (for testing) or persistent (Redis, DB, etc.)
- */
-export interface EnrollmentStore {
-  /**
-   * Store a pending enrollment.
-   *
-   * SHOULD throw {@link UserCodeCollisionError} (or any error with
-   * `name === "UserCodeCollisionError"`) when the save fails specifically
-   * because `user_code` is already taken by a DIFFERENT live enrollment.
-   * `enroll()` catches exactly that, re-mints a fresh user_code, and retries
-   * (bounded); every other error propagates untouched. Re-saving the SAME
-   * device_code (idempotent) must NOT be treated as a collision.
-   */
-  saveEnrollment(enrollment: PendingEnrollment): Promise<void>;
-
-  /**
-   * Retrieve enrollment by device code.
-   */
-  getEnrollment(deviceCode: string): Promise<PendingEnrollment | null>;
-
-  /**
-   * Retrieve enrollment by user code (for approval UI).
-   */
-  getEnrollmentByUserCode(userCode: string): Promise<PendingEnrollment | null>;
-
-  /**
-   * Update enrollment (status, credentials, etc.).
-   */
-  updateEnrollment(deviceCode: string, updates: Partial<PendingEnrollment>): Promise<void>;
-
-  /**
-   * Clean up expired enrollments.
-   */
-  deleteEnrollment(deviceCode: string): Promise<void>;
-}
-
-/**
- * Options for {@link MemoryEnrollmentStore}.
- */
-export type MemoryEnrollmentStoreOptions = {
-  /** Background sweep cadence in ms. Default 60_000. */
-  sweepIntervalMs?: number;
-  /**
-   * Retention past `expiresAt` before an enrollment is evicted, in ms.
-   * Default 300_000 (5 min grace window). See {@link DEFAULT_RETENTION_MS}.
-   */
-  retentionMs?: number;
-  /**
-   * Start the background interval sweeper automatically (default `true`).
-   * Set `false` in tests that want to drive {@link MemoryEnrollmentStore.sweep}
-   * deterministically without a live timer.
-   */
-  autoSweep?: boolean;
-};
-
-/**
- * In-memory enrollment store implementation.
- *
- * Suitable for single-process deployments. For multi-process, use a persistent
- * store (Redis, database, etc.) that implements the EnrollmentStore interface.
- *
- * Review 2026-07-02 (A1): a background TTL sweeper bounds memory. Without it the
- * `enrollments`/`userCodeIndex` maps grew forever — expired, denied, and consumed
- * records were never removed and `deleteEnrollment` had no caller — so an
- * UNAUTHENTICATED `/enroll` endpoint was an OOM vector (each request added an
- * entry that never left). The sweeper evicts every record once its `expiresAt`
- * plus a grace window has elapsed, regardless of status, so a long-lived issuer's
- * footprint stays bounded even under sustained (or hostile) enrollment traffic.
- */
-export class MemoryEnrollmentStore implements EnrollmentStore {
-  private readonly enrollments = new Map<string, PendingEnrollment>();
-  private readonly userCodeIndex = new Map<string, string>(); // user_code -> device_code
-  private readonly retentionMs: number;
-  private readonly sweepIntervalMs: number;
-  private sweepTimer: ReturnType<typeof setInterval> | undefined;
-
-  constructor(options: MemoryEnrollmentStoreOptions = {}) {
-    this.retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
-    this.sweepIntervalMs = options.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
-    if (options.autoSweep ?? true) this.startSweeper();
-  }
-
-  /**
-   * Evict every enrollment whose retention window (`expiresAt + retentionMs`)
-   * has fully elapsed, in BOTH maps. Pure and deterministic — pass `now` in
-   * tests. Returns the number of records evicted. Deleting from a Map during
-   * its own iteration is well-defined in JS.
-   */
-  sweep(now: number = Date.now()): number {
-    let evicted = 0;
-    for (const [deviceCode, enrollment] of this.enrollments) {
-      if (now > enrollment.expiresAt + this.retentionMs) {
-        // Only drop the user-code index entry if it still points at THIS
-        // record. saveEnrollment now REFUSES a colliding user_code (throws
-        // UserCodeCollisionError) so two live records can no longer share one,
-        // and deleteEnrollment clears the index alongside the record — so this
-        // guard is defensive: it keeps sweep correct even if some path ever
-        // leaves the index pointing at a different (still-live) enrollment.
-        if (this.userCodeIndex.get(enrollment.user_code) === deviceCode) {
-          this.userCodeIndex.delete(enrollment.user_code);
-        }
-        this.enrollments.delete(deviceCode);
-        evicted++;
-      }
-    }
-    return evicted;
-  }
-
-  /**
-   * Start the background sweeper. The timer is `unref`'d so it NEVER keeps the
-   * process alive on its own (a long-lived issuer exits cleanly on SIGINT).
-   * Idempotent.
-   */
-  startSweeper(): void {
-    if (this.sweepTimer) return;
-    const timer = setInterval(() => {
-      this.sweep();
-    }, this.sweepIntervalMs);
-    if (typeof timer.unref === "function") timer.unref();
-    this.sweepTimer = timer;
-  }
-
-  /**
-   * Stop the background sweeper. Call on shutdown (or in tests that started it).
-   * Idempotent.
-   */
-  close(): void {
-    if (this.sweepTimer) {
-      clearInterval(this.sweepTimer);
-      this.sweepTimer = undefined;
-    }
-  }
-
-  async saveEnrollment(enrollment: PendingEnrollment): Promise<void> {
-    // Honor the EnrollmentStore contract: reject a user_code already held by a
-    // DIFFERENT live enrollment instead of silently overwriting the index
-    // (the old last-writer-wins gave two records the same approval-UI key and
-    // orphaned the loser). Re-saving the same device_code is idempotent, and a
-    // stale index entry (its record already deleted/swept) is free to reuse.
-    const owner = this.userCodeIndex.get(enrollment.user_code);
-    if (owner !== undefined && owner !== enrollment.device_code && this.enrollments.has(owner)) {
-      throw new UserCodeCollisionError(enrollment.user_code);
-    }
-    this.enrollments.set(enrollment.device_code, enrollment);
-    this.userCodeIndex.set(enrollment.user_code, enrollment.device_code);
-  }
-
-  async getEnrollment(deviceCode: string): Promise<PendingEnrollment | null> {
-    return this.enrollments.get(deviceCode) ?? null;
-  }
-
-  async getEnrollmentByUserCode(userCode: string): Promise<PendingEnrollment | null> {
-    const deviceCode = this.userCodeIndex.get(userCode);
-    if (!deviceCode) return null;
-    return this.enrollments.get(deviceCode) ?? null;
-  }
-
-  async updateEnrollment(deviceCode: string, updates: Partial<PendingEnrollment>): Promise<void> {
-    const existing = this.enrollments.get(deviceCode);
-    if (!existing) return;
-    const updated = { ...existing, ...updates };
-    this.enrollments.set(deviceCode, updated);
-  }
-
-  async deleteEnrollment(deviceCode: string): Promise<void> {
-    const enrollment = this.enrollments.get(deviceCode);
-    if (enrollment) {
-      this.userCodeIndex.delete(enrollment.user_code);
-    }
-    this.enrollments.delete(deviceCode);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,21 +227,19 @@ export type DeviceFlowOptions = {
    */
   issuer?: string;
 
-  /**
-   * Enrollment store (defaults to in-memory).
-   * Use a persistent store (Redis, DB) for production deployments.
-   */
-  store?: EnrollmentStore;
+  /** Atomic enrollment/key repository. There is deliberately no memory default. */
+  repository: EnrollmentRepository;
 
-  /**
-   * F2 — durable agent identity-key registry. When supplied, enrollment APPROVAL
-   * upserts `(tenant, accountId) → agentPublicKey` here so the bootstrap path can
-   * deliver the attested agent key to the browser LONG after the pending-store
-   * eviction. Omit only in tests that don't exercise the bootstrap-pin path.
-   * Production MUST provide a PERSISTENT implementation (survives restarts).
-   */
-  agentKeyRegistry?: AgentKeyRegistry;
+  /** Maximum mint duration before the repository fence rejects the commit. */
+  approvalLeaseMs?: number;
 };
+
+export type ApproveOutcome =
+  | { kind: "approved"; result: EnrollmentResult }
+  | { kind: "in_progress" }
+  | { kind: "conflict"; existing: { activationId: ActivationId; keyIdFingerprint: string; enrolledAt: number } | null; incoming: { keyIdFingerprint: string } }
+  | { kind: "revoked_key" }
+  | { kind: "rejected" };
 
 /**
  * The delivered-issuer default: trailing-slash-stripped base URL. MUST mirror
@@ -465,10 +264,10 @@ export class DeviceFlowEnrollment {
   // `natsIssuerAccountId` stays optional (external mode only); everything else
   // is defaulted, hence Required.
   private readonly options: Required<
-    Omit<DeviceFlowOptions, "store" | "natsIssuerAccountId" | "agentKeyRegistry">
+    Omit<DeviceFlowOptions, "repository" | "natsIssuerAccountId">
   > &
     Pick<DeviceFlowOptions, "natsIssuerAccountId">;
-  private readonly store: EnrollmentStore;
+  private readonly repository: EnrollmentRepository;
   /**
    * #22: per-userCode serialization gate shared by approve() AND deny(). Maps a
    * userCode to the tail of its running critical-section chain so the next
@@ -482,13 +281,12 @@ export class DeviceFlowEnrollment {
    * approved-with-creds re-return path, which yields the same creds.
    */
   private readonly userCodeLocks = new Map<string, Promise<unknown>>();
-  /** F2: durable agent identity-key registry (undefined = pin delivery disabled). */
-  private readonly agentKeyRegistry?: AgentKeyRegistry;
-
   constructor(options: DeviceFlowOptions) {
+    if (!options.repository) throw new Error("repository is required");
     this.options = {
       expirationSeconds: DEFAULT_EXPIRATION_SECONDS,
       pollIntervalSeconds: MIN_POLL_INTERVAL_SECONDS,
+      approvalLeaseMs: 30_000,
       ...options,
       // After the spread so an absent (or explicitly-undefined) `issuer` gets
       // the derivation, keeping the `Required<>` cast honest. An explicit
@@ -496,8 +294,7 @@ export class DeviceFlowEnrollment {
       // exact string it mints).
       issuer: options.issuer ?? defaultIssuer(options.saasBaseUrl),
     };
-    this.store = options.store ?? new MemoryEnrollmentStore();
-    this.agentKeyRegistry = options.agentKeyRegistry;
+    this.repository = options.repository;
   }
 
   /**
@@ -514,9 +311,13 @@ export class DeviceFlowEnrollment {
   async enroll(request: EnrollmentRequest): Promise<EnrollmentResponse> {
     // Reject tenant/accountId tokens that would break the NATS subject hierarchy
     // or cross tenant boundaries before they are persisted or used in a grant.
-    assertValidSubjectToken(request.tenant, "tenant");
-    if (request.accountId !== undefined) {
+    try {
+      assertValidSubjectToken(request.tenant, "tenant");
       assertValidSubjectToken(request.accountId, "accountId");
+    } catch (error) {
+      throw new EnrollmentValidationError(
+        error instanceof Error ? error.message : "webchannel: invalid enrollment subject",
+      );
     }
     // Reject a malformed/oversized agentPublicKey at ingress rather than late at
     // browser-side cnf binding (and cap store/approval-UI bloat from a huge string).
@@ -526,12 +327,12 @@ export class DeviceFlowEnrollment {
     // "stays absent" in the store record rather than persisting an empty slot.
     const pluginVersion = sanitizePluginVersion(request.pluginVersion);
     const protocolVersion = sanitizeProtocolVersion(request.protocolVersion);
-    const now = Date.now();
+    const now = await this.repository.now();
     const expiresAt = now + this.options.expirationSeconds * 1000;
 
     // Bounded collision-retry: a persistent store with UNIQUE(user_code) can
     // reject a save on a rare code collision (surfaced as UserCodeCollisionError,
-    // per the EnrollmentStore contract). Re-mint BOTH codes and retry — a
+    // per the EnrollmentRepository contract). Re-mint BOTH codes and retry — a
     // device_code collision is negligible, but re-minting both keeps the loop
     // trivially correct. ONLY a collision is retried; any other store error is a
     // real fault and propagates immediately (no retry).
@@ -555,11 +356,12 @@ export class DeviceFlowEnrollment {
         ...(protocolVersion !== undefined ? { protocolVersion } : {}),
       };
       try {
-        await this.store.saveEnrollment(enrollment);
+        await this.repository.createEnrollment(enrollment);
         persisted = true;
         break;
       } catch (err) {
-        if (!isUserCodeCollisionError(err)) throw err;
+        if (!isUserCodeCollisionError(err) && !(err instanceof DeviceCodeCollisionError) &&
+          !(typeof err === "object" && err !== null && (err as { name?: unknown }).name === "DeviceCodeCollisionError")) throw err;
         lastCollision = err;
       }
     }
@@ -587,24 +389,21 @@ export class DeviceFlowEnrollment {
    *  - HTTP 400 + error details if denied/expired/invalid
    */
   async poll(request: PollRequest): Promise<EnrollmentResult | DeviceFlowError> {
-    const enrollment = await this.store.getEnrollment(request.device_code);
+    const { enrollment } = await this.repository.tryExpire(request.device_code);
     if (!enrollment) {
       return { error: "invalid_device_code", error_description: "Device code not found" };
-    }
-
-    // Check expiration
-    if (Date.now() > enrollment.expiresAt) {
-      await this.store.updateEnrollment(request.device_code, { status: "expired" });
-      return { error: "expired_token", error_description: "Device code has expired" };
     }
 
     // Check if denied
     if (enrollment.status === "denied") {
       return { error: "access_denied", error_description: "Enrollment was denied by operator" };
     }
+    if (enrollment.status === "expired") {
+      return { error: "expired_token", error_description: "Device code has expired" };
+    }
 
     // Still pending
-    if (enrollment.status === "pending") {
+    if (enrollment.status === "pending" || enrollment.status === "approving") {
       return { error: "authorization_pending", error_description: "Enrollment is pending operator approval" };
     }
 
@@ -630,39 +429,39 @@ export class DeviceFlowEnrollment {
    * Called by the SaaS approval UI when the operator clicks "Approve".
    * Generates NATS user credentials and updates enrollment status.
    *
-   * A2: idempotent + race-safe WITHIN the enrollment's validity window.
+   * Approval is serialized by the repository's atomic claim/commit operations.
    * `/approve` is an unauthenticated, repeatable action (double-click, retry,
    * replay). Re-minting creds/peerId on a repeat would hand the already-connected
    * plugin a DIFFERENT identity on its next poll and break the live session, so:
    *  - a repeat AFTER the first approval returns the SAME credentials (status
    *    guard on the persisted enrollment), and
-   *  - two CONCURRENT approvals of the same enrollment are SERIALIZED by the
-   *    per-userCode lock (#22), so the second runs only after the first's whole
-   *    read-mint-write span settles and then re-reads → hits the A2 guard and
-   *    re-returns the first-minted identity (never a distinct second one).
-   * The same lock also serializes approve against a concurrent deny (#22): the
-   * two can no longer interleave so that one silently overwrites the other's
-   * terminal write — the loser re-reads and observes the winner via the #11
-   * status guards (deny-after-approve → false, approve-after-deny → null).
-   * Past `expiresAt` this returns null (the expiry check precedes the guard) —
-   * consistent with `poll()`, which also fails an expired record; the whole
-   * enroll→approve→poll cycle must complete inside the device-flow window.
+   * The process-local per-userCode lock only avoids duplicate work; correctness
+   * comes from repository-clock lease fencing and the atomic commit. Approved
+   * results remain recoverable after expiresAt for the configured retention
+   * horizon. An operator may deny an approving record, invalidating its claim so
+   * a late commit is fenced (deny does not join this lock — see `deny()`).
    *
-   * Transition rules: approve is honored only from `pending` (mint) and
-   * `approved` (idempotent re-return of the first-minted creds). `denied` and
-   * `expired` are terminal → null; the operator (or the clock) already
-   * rejected the record and must not have credentials minted after the fact.
+   * Transition rules: pending→approving→approved, with approved idempotently
+   * returning the persisted result; denied and expired remain terminal.
    */
-  async approve(userCode: string): Promise<EnrollmentResult | null> {
-    return this.withUserCodeLock(userCode, () => this.approveInner(userCode));
+  async approve(userCode: string, opts?: { replaceActivationId?: ActivationId }): Promise<ApproveOutcome> {
+    return this.withUserCodeLock(userCode, () => this.approveInner(userCode, opts));
   }
 
   /**
-   * #22: run `fn` as the sole holder of `userCode`'s critical section, serialized
-   * against every other approve/deny on the same userCode. The work is chained
-   * onto the userCode's running tail so it starts only after the prior holder
-   * fully settles (success OR failure), and the whole read→write span — including
-   * approve's async NATS mint — is protected.
+   * Approve-only double-submit guard: run `fn` as the sole holder of
+   * `userCode`'s critical section, serialized against every OTHER approve on the
+   * same userCode. Only `approve()` uses this lock; `deny()` deliberately does
+   * not (it must be able to preempt an in-flight approve — see `deny()`). Its
+   * sole remaining job is de-duplicating concurrent approves so a double-click or
+   * retry does not race a second NATS mint. It is a UX/latency optimization, NOT
+   * a correctness mechanism: correctness — including deny preempting an approving
+   * record — comes entirely from the repository's atomic claim/commit/tryDeny
+   * fencing, not from this queue.
+   *
+   * The work is chained onto the userCode's running tail so it starts only after
+   * the prior holder fully settles (success OR failure), and the whole read→write
+   * span — including approve's async NATS mint — is protected.
    *
    * The stored tail node swallows `fn`'s outcome, so a thrown mint/store error
    * propagates to THIS caller (via the returned promise) yet never wedges the
@@ -690,70 +489,83 @@ export class DeviceFlowEnrollment {
     return result;
   }
 
-  private async approveInner(userCode: string): Promise<EnrollmentResult | null> {
-    const enrollment = await this.store.getEnrollmentByUserCode(userCode);
-    if (!enrollment) return null;
+  private result(natsCreds: NatsUserCredentials, peerId: string): EnrollmentResult {
+    return { creds: natsCreds, peerId, jwksUrl: this.options.jwksUrl, bootstrapUrl: this.options.bootstrapUrl, natsUrl: this.options.natsUrl, issuer: this.options.issuer };
+  }
 
-    // Check expiration
-    if (Date.now() > enrollment.expiresAt) {
-      await this.store.updateEnrollment(enrollment.device_code, { status: "expired" });
-      return null;
+  private conflict(active: AgentKeyRecord | null, incomingKeyId: string): ApproveOutcome {
+    return {
+      kind: "conflict",
+      existing: active ? { activationId: active.activationId, keyIdFingerprint: active.keyId.slice(0, 12), enrolledAt: active.enrolledAt } : null,
+      incoming: { keyIdFingerprint: incomingKeyId.slice(0, 12) },
+    };
+  }
+
+  private async approveInner(userCode: string, opts?: { replaceActivationId?: ActivationId }): Promise<ApproveOutcome> {
+    // Operation identity is exactly 128 random bits encoded without padding;
+    // UUID formatting would expose only 122 random bits and violate the SPI.
+    const opId = randomBytes(16).toString("base64url");
+    const claim = await this.repository.claimApproval(userCode, opId, this.options.approvalLeaseMs);
+    if (claim.kind === "in_progress") return { kind: "in_progress" };
+    if (claim.kind === "already_approved") {
+      const enrollment = claim.enrollment;
+      const reconciled = await this.repository.reconcileApprovedRegistration(enrollment.device_code);
+      const active = await this.repository.getActive(enrollment.tenant, enrollment.accountId);
+      if (reconciled.kind === "noop" && reconciled.reason === "active_present" && active?.publicKey !== enrollment.agentPublicKey)
+        console.warn("approved enrollment registry active key differs from enrollment", active?.activationId);
+      else if (reconciled.kind === "noop" && reconciled.reason !== "active_present")
+        console.warn("approved enrollment registry reconciliation unchanged", reconciled.reason);
+      if (!enrollment.natsCreds || !enrollment.peerId) return { kind: "rejected" };
+      return { kind: "approved", result: this.result(enrollment.natsCreds, enrollment.peerId) };
     }
+    if (claim.kind !== "claimed") return { kind: "rejected" };
+    const enrollment = claim.enrollment;
 
-    // A2: already approved → return the credentials minted the first time
-    // instead of overwriting them with a fresh identity.
-    if (enrollment.status === "approved" && enrollment.natsCreds && enrollment.peerId) {
-      return {
-        creds: enrollment.natsCreds,
-        peerId: enrollment.peerId,
-        jwksUrl: this.options.jwksUrl,
-        bootstrapUrl: this.options.bootstrapUrl,
-        natsUrl: this.options.natsUrl,
-        issuer: this.options.issuer,
-      };
+    const incomingKeyId = createHash("sha256").update(Buffer.from(enrollment.agentPublicKey, "base64url")).digest("base64url");
+    const history = await this.repository.listHistory(enrollment.tenant, enrollment.accountId);
+    if (history.some((record) => record.status === "revoked" && record.keyId === incomingKeyId)) {
+      try { await this.repository.releaseClaim(opId); }
+      catch (releaseError) { console.warn("revoked-key claim release failed; lease expiry will recover", releaseError); }
+      return { kind: "revoked_key" };
     }
-
-    // #11: only a pending enrollment may be (newly) approved. `denied` and
-    // `expired` are terminal — approving them would mint live credentials for a
-    // record the operator (or the clock) already rejected. This also refuses to
-    // re-mint on a corrupt approved-without-creds record (which fell through the
-    // A2 guard above) rather than hand out a second, divergent identity.
-    if (enrollment.status !== "pending") return null;
+    const active = await this.repository.getActive(enrollment.tenant, enrollment.accountId);
+    let expect: ActivationId | null;
+    if (!active && opts?.replaceActivationId === undefined) expect = null;
+    else if (active?.publicKey === enrollment.agentPublicKey) expect = active.activationId;
+    else if (active && opts?.replaceActivationId === active.activationId) expect = active.activationId;
+    else {
+      try { await this.repository.releaseClaim(opId); }
+      catch (releaseError) { console.warn("conflict claim release failed; lease expiry will recover", releaseError); }
+      return this.conflict(active, incomingKeyId);
+    }
 
     // Generate NATS user credentials
-    const natsCreds = await this.generateNatsUserCredentials(enrollment);
+    let natsCreds: NatsUserCredentials;
+    try { natsCreds = await this.generateNatsUserCredentials(enrollment); }
+    catch (error) {
+      // Best-effort release: the MINT failure is the root cause the caller must
+      // see. If releaseClaim itself rejects, log it and still rethrow the mint
+      // error — the lease expiry recovers the claim either way (plan §2.2).
+      try { await this.repository.releaseClaim(opId); }
+      catch (releaseError) { console.warn("mint-failure claim release failed; lease expiry will recover", releaseError); }
+      throw error;
+    }
 
     // Generate peer ID (bootstrap JWT subject)
     const peerId = this.generatePeerId();
 
-    await this.store.updateEnrollment(enrollment.device_code, {
-      status: "approved",
-      natsCreds,
-      peerId,
-    });
-
-    // F2: persist the attested agent identity public key DURABLY so a browser can
-    // pin it at bootstrap long after this pending record is swept. Upsert — a
-    // re-enroll mints a fresh identity key, and this newly-approved record carries
-    // it, so last-writer-wins is exactly right. Done only on the fresh-mint path
-    // (an idempotent re-approve above already returned without re-minting; the key
-    // is unchanged and already registered).
-    if (this.agentKeyRegistry) {
-      await this.agentKeyRegistry.put(
-        enrollment.tenant,
-        enrollment.accountId,
-        enrollment.agentPublicKey,
-      );
+    const payload = { creds: natsCreds, peerId, agentPublicKey: enrollment.agentPublicKey, expect };
+    let committed;
+    try { committed = await this.repository.commitApproval(opId, payload); }
+    catch (error) {
+      console.warn("approval commit failed; evaluating idempotent retry", error);
+      if (error instanceof Error && error.name === "CommitPayloadMismatchError") throw error;
+      committed = await this.repository.commitApproval(opId, payload);
     }
-
-    return {
-      creds: natsCreds,
-      peerId,
-      jwksUrl: this.options.jwksUrl,
-      bootstrapUrl: this.options.bootstrapUrl,
-      natsUrl: this.options.natsUrl,
-      issuer: this.options.issuer,
-    };
+    if (committed.kind === "committed") return { kind: "approved", result: this.result(natsCreds, peerId) };
+    if (committed.kind === "revoked") return { kind: "revoked_key" };
+    if (committed.kind === "conflict") return this.conflict(committed.current, incomingKeyId);
+    return { kind: "rejected" };
   }
 
   /**
@@ -761,35 +573,24 @@ export class DeviceFlowEnrollment {
    *
    * Called by the SaaS approval UI when the operator clicks "Deny".
    *
-   * Transition rules: deny is a `pending`→`denied` transition only. An already
+   * Transition rules: deny is a `pending|approving`→`denied` transition. An already
    * `approved` enrollment has live minted credentials, so flipping it to
    * `denied` would make the record lie about an identity that still works →
    * false, no state change. An expired record is marked `expired` (matching
-   * `poll()`), and any other non-pending status (including already `denied`)
+   * `poll()`), and any other terminal status (including already `denied`)
    * returns false without change.
+   *
+   * Deny deliberately BYPASSES approve's per-userCode lock (`withUserCodeLock`).
+   * It must be able to preempt an approve that is still in flight on this same
+   * instance — an operator who clicks Approve then Deny needs the Deny to land
+   * while the async NATS mint is running, not queue behind it. `tryDeny` is an
+   * atomic repository transition to `denied` that deletes the claim, so a late
+   * `commitApproval` from the in-flight approve is fenced (`claim_lost` →
+   * rejected) with no minted identity ever activated. No orchestrator-side
+   * serialization is needed; the repository supplies all the fencing.
    */
   async deny(userCode: string): Promise<boolean> {
-    // #22: share approve's per-userCode gate so a deny can't interleave with a
-    // concurrent approve's read→mint→write span (and vice versa).
-    return this.withUserCodeLock(userCode, () => this.denyInner(userCode));
-  }
-
-  private async denyInner(userCode: string): Promise<boolean> {
-    const enrollment = await this.store.getEnrollmentByUserCode(userCode);
-    if (!enrollment) return false;
-
-    // Check expiration
-    if (Date.now() > enrollment.expiresAt) {
-      await this.store.updateEnrollment(enrollment.device_code, { status: "expired" });
-      return false;
-    }
-
-    // #11: deny is only a pending→denied transition. An approved enrollment has
-    // live credentials — flipping it to denied would make the record lie.
-    if (enrollment.status !== "pending") return false;
-
-    await this.store.updateEnrollment(enrollment.device_code, { status: "denied" });
-    return true;
+    return this.repository.tryDeny(userCode);
   }
 
   // ---------------------------------------------------------------------------
@@ -883,9 +684,9 @@ export class DeviceFlowEnrollment {
     //     Synadia's nats-server.
     //
     // Tenant scope `webchannel.{tenant}.>` covers the live per-peer channel
-    // subjects `webchannel.{tenant}.{accountId}.{peerId}.{in,out,handshake}` (see
-    // packages/plugin/src/nats-channel.ts) while preserving cross-tenant
-    // isolation. Matches e2e/enrolled-jwt-roundtrip.test.ts.
+    // subjects `webchannel.{tenant}.{accountId}.{peerId}.{in,out}` plus the
+    // `.register`/`.reginbox` admission subjects (see
+    // packages/plugin/src/nats-channel.ts) while preserving cross-tenant isolation.
     const minted = await mintNatsUserCreds({
       accountSeed: this.options.saasTrustChain.natsAccountSeed,
       tenant: enrollment.tenant,

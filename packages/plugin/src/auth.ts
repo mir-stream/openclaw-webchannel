@@ -1,17 +1,10 @@
-import type { IncomingMessage } from "node:http";
+import { verifyJwt, type JwtIdentity } from "./jwt.js";
+import {
+  JWKSCache,
+  JwksUnavailableError,
+  type JsonWebKeySet,
+} from "./jwks.js";
 
-import { verifyJwt } from "./jwt.js";
-import type { JwtIdentity } from "./jwt.js";
-import { JWKSCache, JwksUnavailableError } from "./jwks.js";
-
-/**
- * Verification could NOT be performed because a dependency (the JWKS source) was
- * unavailable — a transient infrastructure fault, NOT a decision about the token.
- * The register handler answers this with a distinct retryable code (503) rather
- * than a terminal 401, so a momentary JWKS/IdP hiccup doesn't permanently kill a
- * session. It is NOT an oracle: a transient failure and a genuine reject are both
- * non-admit; only the client's retry disposition differs (503 → retry, 401 → stop).
- */
 export class TransientVerifyError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options as ErrorOptions);
@@ -19,394 +12,288 @@ export class TransientVerifyError extends Error {
   }
 }
 
-/**
- * The auth seam. AUTH.md §3: every built-in or custom strategy converges to ONE
- * contract — a `ConnectionVerifier` run in `transport.handleUpgrade`. Its result
- * (`peerId`) becomes the session key, so closing the auth hole also gives us
- * per-user session separation. This file is SDK-free and `ws`-free; it needs
- * only `node:http` types + `./jwt.js`.
- */
-
-/**
- * The single anonymous peer id. Defined HERE (the auth module) as the source of
- * truth and re-exported by `transport.ts`, since "what identity an unauthed
- * connection gets" is an auth decision, not a transport one.
- */
 export const ANON_PEER_ID = "web-anon";
 
-// NOTE (Phase 6 / W7): the module-global "pinned device key" store that lived
-// here is GONE. It was peerId-keyed (so two devices of one user collided,
-// last-writer-wins — audit F2) and its only intended consumer, the
-// handshake-time verifier (`handshake-verifier.ts`), was never wired (review
-// finding C2). The register-delivered key model replaces both: the register
-// route wraps the conversation key to the device key presented in THAT
-// request's verified JWT `cnf` claim (`identity.devicePublicKey`), so there is
-// no cross-request key store to poison or collide.
-
-export type ConnectionIdentity = { peerId: string; displayName?: string };
-export type ConnectionVerifier = (
-  req: IncomingMessage,
-) => Promise<ConnectionIdentity | null>;
-
-/**
- * Minimal logger shape we accept (matches OpenClaw's optional-method logger).
- * Kept structural so we don't import the SDK.
- */
 export type AuthLogger = {
   warn?: (msg: string) => void;
   info?: (msg: string) => void;
   error?: (msg: string) => void;
 };
 
-/**
- * A secret may be given inline (a plain string, discouraged) or as an env
- * reference resolved from `process.env` at startup. Richer SecretRef forms
- * (file/exec) are intentionally out of scope here. Consumed by the NATS
- * static-credential source (`nats-credential-source.ts`).
- */
 export type SecretRef = string | { env: string };
 
-export type AnonymousAuthConfig = { strategy: "anonymous" };
-
-/**
- * JWT (RS256 / JWKS) auth config. The gateway validates compact JWTs against
- * an asymmetric public key resolved from a JWKS source. See AUTH.md §10 for
- * the full operator-facing documentation and IdP integration examples.
- *
- * `issuer` / `audience` are required claims: a missing mismatch rejects every
- * token (intentional fail-closed default — no silent "trust any iss/aud"
- * fallback). `jwksUrl` / `jwksFile` / `jwks` is the key source (exactly one;
- * `resolveVerifier` throws if zero or more than one is supplied). `clockSkew`
- * defaults to 60s, `ticketParam` to "ticket".
- */
-export type JwtAuthConfig = {
-  strategy: "jwt";
-  jwt: {
-    /** HTTPS URL that returns a JWKS document. Mutually exclusive with `jwksFile`/`jwks`. */
-    jwksUrl?: string;
-    /** Inline JWKS document (object). Mutually exclusive with `jwksUrl`/`jwksFile`. */
-    jwks?: import("./jwks.js").JsonWebKeySet;
-    /** Path to a JWKS file baked into the deployment. Mutually exclusive with the others. */
-    jwksFile?: string;
-    /** Expected `iss` claim. Rejected on mismatch (constant-time compare). */
-    issuer: string;
-    /** Expected `aud` claim — string OR array containing it. */
-    audience: string;
-    /** Allowed clock-skew leeway in seconds when checking `exp`. Default 60. */
-    clockSkew?: number;
-    /**
-     * @internal Test-only: override the HTTP fetch implementation used when
-     * resolving a `jwksUrl`. Injected by unit tests to simulate a JWKS server
-     * without opening a real socket. Production code never sets this field.
-     */
-    _fetchImpl?: typeof fetch;
-  };
-  /** Query param the JWT arrives in. Default `"ticket"`. */
-  ticketParam?: string;
-  /**
-   * Require Proof-of-Possession at the NATS register hop. Secure-by-default:
-   * when unset the plugin behaves as `true`, so a verified bootstrap JWT that
-   * carries no `pop_jwk` is REJECTED before any peer is registered. Set to
-   * `false` to restore the legacy optional-PoP behavior (dev only).
-   */
-  requirePoP?: boolean;
+/** Raw operator input. Every member is narrowed by {@link resolveVerifierConfig}. */
+export type RawJwtAuthConfig = {
+  strategy?: unknown;
+  jwt?: unknown;
+  requirePoP?: unknown;
+  [key: string]: unknown;
 };
 
-export type AuthConfig = AnonymousAuthConfig | JwtAuthConfig;
+export type ResolvedJwksSource =
+  | { readonly jwksUrl: string; readonly jwksFile?: never; readonly jwks?: never }
+  | { readonly jwksFile: string; readonly jwksUrl?: never; readonly jwks?: never }
+  | { readonly jwks: JsonWebKeySet; readonly jwksUrl?: never; readonly jwksFile?: never };
 
-/** Read a single query param value from a raw request URL (path+query). */
-function readQueryParam(reqUrl: string | undefined, param: string): string | null {
-  if (!reqUrl) return null;
-  // `req.url` is a path+query like "/webchannel/ws?ticket=...". Resolve against
-  // a dummy origin so the URL parser accepts a relative target.
-  let url: URL;
-  try {
-    url = new URL(reqUrl, "http://localhost");
-  } catch {
-    return null;
-  }
-  return url.searchParams.get(param);
-}
+/** Cache-free-validated verifier configuration. Expected audience is intentionally absent. */
+export type ResolvedJwtVerifierConfig = {
+  readonly strategy: "jwt";
+  readonly jwt: {
+    readonly issuer: string;
+    readonly clockSkew: number;
+  } & ResolvedJwksSource;
+};
 
-function makeAnonymousVerifier(logger?: AuthLogger): ConnectionVerifier {
-  // AC 4: Anonymous strategy is now REJECTED to prevent open-admission security hole.
-  // All connections MUST be authenticated with SaaS-attested keys (cnf claim).
-  // Operators must use the 'jwt' strategy with proper verification.
-  const errorMsg =
-    "webchannel: auth strategy 'anonymous' is disabled — " +
-    "AC 4 requires SaaS-attested device keys (cnf claim). " +
-    "Use the 'jwt' strategy with JWKS verification. " +
-    "Refusing to start.";
-  logger?.error?.(errorMsg);
-  throw new Error(errorMsg);
+/** Historical exported name retained for source compatibility; the shape is audience-free. */
+export type JwtAuthConfig = ResolvedJwtVerifierConfig;
+export type AuthConfig = RawJwtAuthConfig;
 
-  // NOTE: The function never returns a verifier — anonymous admission is a
-  // security violation in Phase B. Callers must use authenticated strategies.
-}
+export type VerifyAccountToken = (token: string) => Promise<JwtIdentity | null>;
 
-/**
- * Build a `ConnectionVerifier` for the `jwt` (RS256 / JWKS) strategy.
- *
- * Fail-closed (AC1): throws at construction if any of the three required
- * `auth.jwt.{issuer, audience, (jwksUrl|jwks|jwksFile)}` fields is missing.
- * Missing config means the plugin refuses to start, NOT that the gateway
- * silently accepts unauthed upgrades.
- *
- * The returned verifier resolves the configured JWKS lazily via the injected
- * `JWKSCache` and calls `verifyJwt` per upgrade. JWKS I/O errors propagate as
- * rejections (AC5), so a flaky IdP degrades connection establishment rather
- * than silently authenticating with a stale key.
- */
-/**
- * S3: one long-lived {@link JWKSCache} per account auth config.
- *
- * The live NATS register/challenge routes call `verifyJwtAndExtractIdentity`
- * per pairing. Building a fresh empty cache each call defeated the 5-minute TTL,
- * so every pairing (and every reconnect storm) turned into 2+ JWKS fetches
- * against the IdP — the IdP became a per-request hot dependency.
- *
- * Keyed on the `JwtAuthConfig` object identity: each account's `auth` block is a
- * stable reference for the plugin's lifetime, so this yields exactly one cache
- * per account, shared by the challenge route and the register route. The WeakMap
- * lets the cache be collected when the account config is (no manual eviction).
- */
-const jwksCacheByAuthConfig = new WeakMap<JwtAuthConfig, JWKSCache>();
+export type VerifierFactoryDeps = {
+  fetchImpl?: typeof fetch;
+  readFileImpl?: (path: string, signal?: AbortSignal) => Promise<Uint8Array>;
+};
 
-/**
- * JWKS-fetch timeout for the account's shared cache. Kept UNDER the browser's
- * hard 5s register-request timeout (nats-client `request({timeoutMs:5000})`) so
- * that on a cold/expired cache + slow IdP the agent can VERIFY (or fail with a
- * retryable 503) and reply INSIDE the client's window, instead of blocking past
- * 5s and publishing to a reginbox the browser has already abandoned. The Gate B
- * startup warm uses this same cache; 4s is still generous for a healthy IdP.
- */
+export type AccountJwtVerifier = {
+  readonly verifyIdentity: VerifyAccountToken;
+  readonly warmJwks: (signal?: AbortSignal) => Promise<{ keyCount: number }>;
+};
+
 const LIVE_JWKS_FETCH_TIMEOUT_MS = 4000;
-
-/**
- * Longer JWKS-fetch budget for the browserless Gate B STARTUP warm (no client is
- * waiting), so a healthy-but-cold IdP (serverless cold start, 5–8s) doesn't get a
- * spurious `JWKS FETCH FAILED` readiness line at boot. Applied per-call via
- * `warm(override)`, so it does NOT loosen the 4s hot-path (live-verify) bound.
- */
 const STARTUP_WARM_JWKS_TIMEOUT_MS = 10_000;
 
-function jwksCacheFor(config: JwtAuthConfig): JWKSCache {
-  let cache = jwksCacheByAuthConfig.get(config);
-  if (cache === undefined) {
-    // `JWKSCache.create` enforces the "exactly one source" invariant; calling it
-    // here (rather than on every upgrade) means a misconfig still fails on the
-    // FIRST use — which for the WS path is plugin load — instead of silently
-    // deferring the throw to each request.
-    cache = JWKSCache.create(
-      {
-        jwksUrl: config.jwt.jwksUrl,
-        jwksFile: config.jwt.jwksFile,
-        jwks: config.jwt.jwks,
-      },
-      // `_fetchImpl` is a test-only escape hatch: when set, the JWKSCache uses
-      // the injected function instead of `globalThis.fetch`. This lets unit
-      // tests simulate a JWKS server response without opening a real socket.
-      {
-        fetchTimeoutMs: LIVE_JWKS_FETCH_TIMEOUT_MS,
-        ...(config.jwt._fetchImpl !== undefined ? { fetchImpl: config.jwt._fetchImpl } : {}),
-      },
-    );
-    jwksCacheByAuthConfig.set(config, cache);
-  }
-  return cache;
+type CacheRecord = { cache: JWKSCache; deps: VerifierFactoryDeps };
+const jwksCacheByResolvedConfig = new WeakMap<ResolvedJwtVerifierConfig, CacheRecord>();
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
 }
 
-/**
- * Preflight (Gate B — gateway start): resolve the account's JWKS ONCE and count
- * the keys, reusing the account's long-lived {@link JWKSCache} (keyed on this
- * exact `JwtAuthConfig` object — the same instance the register/challenge routes
- * verify against). This is the readiness gate's most useful diagnostic: an empty
- * or unreachable JWKS means NO bootstrap JWT can ever verify, and surfacing it at
- * startup (not lazily on the first browser register) is the whole point.
- *
- * Does NOT open a second fetcher — it drives {@link JWKSCache.warm}, so warming
- * here also primes the cache the live verify path reuses. A transient fetch
- * failure propagates as {@link JwksUnavailableError} (fail-closed; the caller
- * reports `JWKS FETCH FAILED` and keeps serving — the account is already
- * fail-closed because with no keys every register verify returns non-admit).
- */
-export async function preflightResolveJwks(
-  config: JwtAuthConfig,
-): Promise<{ keyCount: number }> {
-  const cache = jwksCacheFor(config);
-  // Startup warm gets the generous budget (no browser is waiting); the same
-  // cache's live-verify path keeps the tight 4s default set at construction.
-  const doc = await cache.warm(STARTUP_WARM_JWKS_TIMEOUT_MS);
-  return { keyCount: doc.keys.length };
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
 }
 
-function makeJwtVerifier(config: JwtAuthConfig): ConnectionVerifier {
-  const jwtCfg = config.jwt;
-  if (!jwtCfg || typeof jwtCfg !== "object") {
+function resolveJwksSource(jwt: Record<string, unknown>): ResolvedJwksSource {
+  const present = ["jwksUrl", "jwksFile", "jwks"].filter((key) =>
+    Object.prototype.hasOwnProperty.call(jwt, key),
+  );
+  if (present.length !== 1) {
     throw new Error(
-      "webchannel: channels.webchannel.auth.jwt is required when strategy=\"jwt\". Refusing to start.",
+      `webchannel: jwt strategy requires exactly one of jwksUrl, jwksFile, or jwks (got ${present.length}). Refusing to start.`,
     );
   }
-  if (typeof jwtCfg.issuer !== "string" || jwtCfg.issuer.length === 0) {
-    throw new Error(
-      "webchannel: channels.webchannel.auth.jwt.issuer is required (strategy=\"jwt\"). Refusing to start.",
-    );
+  if (present[0] === "jwksUrl") {
+    if (!nonEmptyString(jwt.jwksUrl)) {
+      throw new Error("webchannel: auth.jwt.jwksUrl must be a non-empty string. Refusing to start.");
+    }
+    return { jwksUrl: jwt.jwksUrl };
   }
-  if (typeof jwtCfg.audience !== "string" || jwtCfg.audience.length === 0) {
-    throw new Error(
-      "webchannel: channels.webchannel.auth.jwt.audience is required (strategy=\"jwt\"). Refusing to start.",
-    );
+  if (present[0] === "jwksFile") {
+    if (!nonEmptyString(jwt.jwksFile)) {
+      throw new Error("webchannel: auth.jwt.jwksFile must be a non-empty string. Refusing to start.");
+    }
+    return { jwksFile: jwt.jwksFile };
   }
-  // Exactly one JWKS source must be supplied. `jwksCacheFor` calls
-  // `JWKSCache.create` (which enforces this) once per account and memoizes the
-  // result, so a misconfig fails at plugin load instead of every upgrade, and
-  // the 5-minute TTL is honored across upgrades rather than reset each time.
-  const jwksCache = jwksCacheFor(config);
-  const ticketParam = config.ticketParam ?? "ticket";
-  const issuer = jwtCfg.issuer;
-  const audience = jwtCfg.audience;
-  const clockSkew = jwtCfg.clockSkew;
-  return async (req: IncomingMessage) => {
-    const token = readQueryParam(req.url, ticketParam);
-    if (!token) return null;
-    const identity = await verifyJwt(token, {
-      jwks: jwksCache,
-      issuer,
-      audience,
-      clockSkewSec: clockSkew,
-    });
-    if (!identity) return null;
-
-    return identity.displayName !== undefined
-      ? { peerId: identity.peerId, displayName: identity.displayName }
-      : { peerId: identity.peerId };
+  if (!isPlainObject(jwt.jwks) || !Array.isArray(jwt.jwks.keys)) {
+    throw new Error("webchannel: auth.jwt.jwks must be an object with a keys array. Refusing to start.");
+  }
+  // Detach the resolved trust source from mutable raw config and freeze the
+  // shape used by the long-lived cache/verifier closure.
+  const keys = jwt.jwks.keys.map((key) =>
+    isPlainObject(key) ? Object.freeze({ ...key }) : key,
+  );
+  return {
+    jwks: Object.freeze({
+      keys: Object.freeze(keys) as JsonWebKeySet["keys"],
+    }),
   };
 }
 
-/**
- * Build the `ConnectionVerifier` for the configured auth block.
- *
- * SAFE DEFAULT (AUTH.md §7): an unconfigured / unknown strategy THROWS rather
- * than silently falling back to anonymous. `auth:"plugin"` with zero
- * verification would expose every connection to the world — refusing to start is
- * the safe behavior, and the caller (index.ts) lets this propagate so plugin
- * load fails loudly.
- *
- * AC 4: 'anonymous' strategy is disabled — only the authenticated 'jwt'
- * strategy (with cnf claim) is allowed.
- */
-export function resolveVerifier(
-  authConfig: AuthConfig | undefined | null,
-  logger?: AuthLogger,
-): ConnectionVerifier {
-  if (!authConfig || typeof authConfig !== "object" || !("strategy" in authConfig)) {
+/** Strictly narrow raw operator input without allocating a JWKS cache or doing I/O. */
+export function resolveVerifierConfig(raw: unknown): ResolvedJwtVerifierConfig {
+  if (!isPlainObject(raw) || raw.strategy === undefined) {
     throw new Error(
       "webchannel: channels.webchannel.auth.strategy is required (jwt). Refusing to start.",
     );
   }
-
-  switch (authConfig.strategy) {
-    case "anonymous":
-      // AC 4: Anonymous is now disabled — throw to prevent open-admission hole
-      return makeAnonymousVerifier(logger);
-    case "jwt":
-      return makeJwtVerifier(authConfig);
-    default:
-      throw new Error(
-        `webchannel: unknown auth strategy "${(authConfig as { strategy: unknown }).strategy}" (expected jwt). Refusing to start.`,
-      );
+  if (raw.strategy !== "jwt") {
+    throw new Error(
+      `webchannel: auth strategy ${JSON.stringify(raw.strategy)} is not valid for register-hop JWT verification. Refusing to start.`,
+    );
   }
+  if (!isPlainObject(raw.jwt)) {
+    throw new Error(
+      "webchannel: channels.webchannel.auth.jwt is required when strategy=\"jwt\". Refusing to start.",
+    );
+  }
+  const jwt = raw.jwt;
+  if (Object.prototype.hasOwnProperty.call(jwt, "audience")) {
+    throw new Error(
+      "webchannel: auth.jwt.audience was removed; delete it. JWT aud is always the runtime accountId.",
+    );
+  }
+  if (!nonEmptyString(jwt.issuer)) {
+    throw new Error(
+      "webchannel: channels.webchannel.auth.jwt.issuer is required (strategy=\"jwt\"). Refusing to start.",
+    );
+  }
+  const clockSkew = jwt.clockSkew === undefined ? 60 : jwt.clockSkew;
+  if (
+    typeof clockSkew !== "number" ||
+    !Number.isFinite(clockSkew) ||
+    !Number.isInteger(clockSkew) ||
+    clockSkew < 0
+  ) {
+    throw new Error(
+      "webchannel: auth.jwt.clockSkew must be a finite non-negative integer. Refusing to start.",
+    );
+  }
+  const resolvedJwt = Object.freeze({
+    issuer: jwt.issuer,
+    clockSkew,
+    ...resolveJwksSource(jwt),
+  });
+  return Object.freeze({
+    strategy: "jwt",
+    jwt: resolvedJwt,
+  });
 }
 
-/**
- * Verify a JWT and extract the peerId (for NATS peer registration).
- *
- * This is a helper function for AC 5's NATS mode where browsers register
- * their peerId via HTTP POST with a bootstrap JWT. The function verifies
- * the JWT signature and claims, then returns the peerId from the `sub` claim.
- *
- * @param jwt - The compact JWT string.
- * @param authConfig - The auth configuration (must be 'jwt' strategy).
- * @param logger - Optional logger.
- * @returns The peerId from the JWT `sub` claim, or `null` if verification fails.
- *
- * @throws If authConfig is not configured or strategy is not 'jwt'.
- */
-export async function verifyJwtAndExtractPeerId(
-  jwt: string,
-  authConfig: AuthConfig | undefined | null,
-  logger?: AuthLogger,
-): Promise<string | null> {
-  const identity = await verifyJwtAndExtractIdentity(jwt, authConfig, logger);
-  return identity?.peerId ?? null;
+/** Strict PoP-policy narrowing performed once during account preparation. */
+export function resolveRequirePoPPolicy(raw: unknown): boolean {
+  if (!isPlainObject(raw) || raw.requirePoP === undefined) return true;
+  if (typeof raw.requirePoP !== "boolean") {
+    throw new Error("webchannel: auth.requirePoP must be a boolean. Refusing to start.");
+  }
+  return raw.requirePoP;
 }
 
-/**
- * Like {@link verifyJwtAndExtractPeerId} but returns the full verified identity
- * (peerId + devicePublicKey + popPublicJwk). Used by the NATS register route to
- * obtain the Ed25519 PoP key for the signed-nonce challenge.
- */
+/** Normalize and validate a verifier value without allocating a cache. */
+export function validateJwtVerifierConfig(raw: unknown): ResolvedJwtVerifierConfig {
+  return resolveVerifierConfig(raw);
+}
+
+export function validateVerifierConfig(raw: unknown): ResolvedJwtVerifierConfig {
+  return resolveVerifierConfig(raw);
+}
+
+function isImmutableResolvedConfig(config: ResolvedJwtVerifierConfig): boolean {
+  return Object.isFrozen(config) &&
+    Object.isFrozen(config.jwt) &&
+    (config.jwt.jwks === undefined ||
+      (Object.isFrozen(config.jwt.jwks) && Object.isFrozen(config.jwt.jwks.keys)));
+}
+
+function cacheFor(
+  config: ResolvedJwtVerifierConfig,
+  deps: VerifierFactoryDeps = {},
+): JWKSCache {
+  const existing = jwksCacheByResolvedConfig.get(config);
+  if (existing) return existing.cache;
+  const cache = JWKSCache.create(
+    {
+      ...(config.jwt.jwksUrl !== undefined ? { jwksUrl: config.jwt.jwksUrl } : {}),
+      ...(config.jwt.jwksFile !== undefined ? { jwksFile: config.jwt.jwksFile } : {}),
+      ...(config.jwt.jwks !== undefined ? { jwks: config.jwt.jwks } : {}),
+    },
+    {
+      fetchTimeoutMs: LIVE_JWKS_FETCH_TIMEOUT_MS,
+      ...(deps.fetchImpl !== undefined ? { fetchImpl: deps.fetchImpl } : {}),
+      ...(deps.readFileImpl !== undefined ? { readFileImpl: deps.readFileImpl } : {}),
+    },
+  );
+  jwksCacheByResolvedConfig.set(config, { cache, deps });
+  return cache;
+}
+
+/** Build a token-only verifier whose audience is immutably the runtime account id. */
+export function createAccountJwtVerifier(input: {
+  auth: ResolvedJwtVerifierConfig;
+  accountId: string;
+  logger?: AuthLogger;
+}, deps: VerifierFactoryDeps = {}): AccountJwtVerifier {
+  // Validate again at the factory boundary, but retain the prepared object's
+  // identity so every consumer of one prepared account shares one JWKS cache.
+  const normalized = resolveVerifierConfig(input.auth);
+  const auth = isImmutableResolvedConfig(input.auth) ? input.auth : normalized;
+  if (!nonEmptyString(input.accountId)) {
+    throw new Error("webchannel: runtime accountId is required for JWT verification");
+  }
+  const accountId = input.accountId;
+  const issuer = auth.jwt.issuer;
+  const clockSkew = auth.jwt.clockSkew;
+  const cache = cacheFor(auth, deps);
+  return {
+    verifyIdentity: async (token) => {
+      let identity: JwtIdentity | null;
+      try {
+        identity = await verifyJwt(token, {
+          jwks: cache,
+          issuer,
+          audience: accountId,
+          clockSkewSec: clockSkew,
+        });
+      } catch (err) {
+        if (err instanceof JwksUnavailableError) {
+          input.logger?.error?.(
+            `webchannel: JWT verification unavailable (transient): ${String(err)}`,
+          );
+          throw new TransientVerifyError(
+            "JWKS source unavailable — verification could not be performed",
+            { cause: err },
+          );
+        }
+        input.logger?.error?.(`webchannel: JWT verification error (fail-closed): ${String(err)}`);
+        return null;
+      }
+      if (!identity) {
+        input.logger?.error?.("webchannel: JWT verification failed");
+        return null;
+      }
+      input.logger?.info?.(`webchannel: JWT verified for peerId="${identity.peerId}"`);
+      return identity;
+    },
+    warmJwks: async (signal) => ({
+      keyCount: (await cache.warm(STARTUP_WARM_JWKS_TIMEOUT_MS, signal)).keys.length,
+    }),
+  };
+}
+
+/** Compatibility helper with an explicit expected account target. */
 export async function verifyJwtAndExtractIdentity(
-  jwt: string,
-  authConfig: AuthConfig | undefined | null,
+  token: string,
+  auth: ResolvedJwtVerifierConfig,
+  expectedAccountId: string,
   logger?: AuthLogger,
 ): Promise<JwtIdentity | null> {
-  if (!authConfig || typeof authConfig !== "object") {
-    throw new Error("webchannel: auth config is required for JWT verification");
-  }
+  return createAccountJwtVerifier({ auth, accountId: expectedAccountId, logger }).verifyIdentity(token);
+}
 
-  if (authConfig.strategy !== "jwt") {
-    throw new Error(`webchannel: cannot verify JWT with strategy "${authConfig.strategy}" (expected "jwt")`);
-  }
+export async function verifyJwtAndExtractPeerId(
+  token: string,
+  auth: ResolvedJwtVerifierConfig,
+  expectedAccountId: string,
+  logger?: AuthLogger,
+): Promise<string | null> {
+  return (await verifyJwtAndExtractIdentity(token, auth, expectedAccountId, logger))?.peerId ?? null;
+}
 
-  const jwtCfg: JwtAuthConfig = authConfig;
+export async function preflightResolveJwks(
+  config: ResolvedJwtVerifierConfig,
+  signal?: AbortSignal,
+  deps: VerifierFactoryDeps = {},
+): Promise<{ keyCount: number }> {
+  const normalized = resolveVerifierConfig(config);
+  const auth = isImmutableResolvedConfig(config) ? config : normalized;
+  return {
+    keyCount: (await cacheFor(auth, deps).warm(STARTUP_WARM_JWKS_TIMEOUT_MS, signal)).keys.length,
+  };
+}
 
-  if (!jwtCfg.jwt || typeof jwtCfg.jwt !== "object") {
-    throw new Error("webchannel: auth.jwt block is required for JWT verification");
-  }
-
-  // S3: reuse the account's long-lived JWKS cache (keyed on this config object)
-  // instead of rebuilding an empty one per register/challenge call, which
-  // defeated the TTL and re-fetched the IdP on every pairing.
-  const jwksCache = jwksCacheFor(jwtCfg);
-
-  // Verify JWT. Two distinct throw classes must NOT be conflated:
-  //  - JwksUnavailableError (JWKS source unreachable — network/non-2xx/file I/O):
-  //    verification could not be PERFORMED. Re-thrown as TransientVerifyError so
-  //    the register handler answers a retryable 503, not a terminal 401 — a
-  //    momentary IdP hiccup must not permanently kill a session.
-  //  - any OTHER throw (e.g. an unknown/evicted `kid` that IS a genuine key miss)
-  //    or a `null` verdict (bad signature / claims): a fail-to-authenticate
-  //    condition → treat as `null` so the caller returns a clean 401 (never a 500).
-  // The config guards above still throw (a deploy error, correctly surfaced).
-  let identity: Awaited<ReturnType<typeof verifyJwt>>;
-  try {
-    identity = await verifyJwt(jwt, {
-      jwks: jwksCache,
-      issuer: jwtCfg.jwt.issuer,
-      audience: jwtCfg.jwt.audience,
-      clockSkewSec: jwtCfg.jwt.clockSkew,
-    });
-  } catch (err) {
-    if (err instanceof JwksUnavailableError) {
-      logger?.error?.(`webchannel: JWT verification unavailable (transient): ${String(err)}`);
-      throw new TransientVerifyError(
-        "JWKS source unavailable — verification could not be performed",
-        { cause: err },
-      );
-    }
-    logger?.error?.(`webchannel: JWT verification error (fail-closed): ${String(err)}`);
-    return null;
-  }
-
-  if (!identity) {
-    logger?.error?.("webchannel: JWT verification failed");
-    return null;
-  }
-
-  // The cnf device public key rides on the returned identity itself
-  // (`identity.devicePublicKey`) — the register route wraps the conversation
-  // key to it per-request (Phase 6); nothing is stored module-globally.
-  logger?.info?.(`webchannel: JWT verified for peerId="${identity.peerId}"`);
-  return identity;
+/** Historical name retained; returns the actual normalized immutable value. */
+export function assertJwtAuthConfig(raw: unknown): ResolvedJwtVerifierConfig {
+  return resolveVerifierConfig(raw);
 }

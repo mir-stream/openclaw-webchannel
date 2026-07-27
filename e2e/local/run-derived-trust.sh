@@ -2,19 +2,19 @@
 # TRUST-ANCHOR derivation E2E (docs/TRUST_ANCHOR_DESIGN.md). Proves a fresh
 # `openclaw channels add` reaches a working encrypted register round-trip with
 # ZERO hand-written JWT trust facts in openclaw.json — the derived issuer /
-# jwksUrl / audience code path exercised end-to-end for the first time.
+# issuer/JWKS derivation and account-bound audience path exercised end-to-end.
 #
 # WHY this harness exists (the gap it closes): EVERY other real-SaaS harness
-# (run-all-real.sh, run-saas-issuer-register.sh, run-enrolled-transport.sh, …)
-# and demo/run.sh writes an EXPLICIT `auth.jwt` block (issuer/jwksUrl/audience)
+# (run-all-real.sh, run-enrolled-transport.sh, run-two-account-isolation.sh)
+# and demo/run.sh writes an EXPLICIT `auth.jwt` block (issuer/jwksUrl)
 # into openclaw.json. Because of config-present-wins, NONE of them actually
 # exercise `deriveAccountAuth` (packages/plugin/index-nats.ts). This one does:
 # it writes NO channels.webchannel config at all — the ONLY account config is
 # what `buildFullAccountPatch` (packages/plugin/src/setup.ts) emits at
-# `channels add`, which by design OMITS issuer/jwksUrl/audience.
+# `channels add`, which by design OMITS issuer/jwksUrl and the removed audience key.
 #
 # It asserts three things the design promises:
-#   1. openclaw.json holds NO issuer/jwksUrl/audience (only auth.strategy=jwt,
+#   1. openclaw.json holds NO issuer/jwksUrl or removed audience key (only auth.strategy=jwt,
 #      nats.admission=register-hop, nats.credentials.mode=enrolled) — the
 #      "zero hand-written trust facts" proof.
 #   2. The Gate-B gateway-start readiness line (formatAccountReadiness,
@@ -52,6 +52,7 @@ NATS_WS=18922
 NATS_TCP=14922
 ECHO_PORT=18907
 ISSUER_PORT=3981
+ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
 PAGE_PORT=19494
 
 TENANT=derived-tenant
@@ -101,6 +102,7 @@ SAAS_BASE_URL="$SAAS_BASE_URL" \
 NATS_URL="ws://127.0.0.1:$NATS_WS" \
 NATS_CONFIG_OUT="$OCH" \
 ENABLE_TEST_ROUTES=1 \
+ENROLLMENT_ADMIN_TOKEN="$ENROLLMENT_ADMIN_TOKEN" \
 POLL_INTERVAL_SECONDS=1 \
   node --import tsx "$REPO/packages/saas/reference/enrollment-server.ts" >"$OCH/issuer.log" 2>&1 &
 ISSUER_PID=$!
@@ -261,6 +263,7 @@ done
 [ -z "$USER_CODE" ] && { echo "[run-derived-trust] TIMEOUT waiting for user_code — channels-add log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-derived-trust] enrollment user_code=$USER_CODE — approving…"
 APPROVE="$(curl -fsS -X POST "$SAAS_BASE_URL/approve" \
+  -H "Authorization: Bearer $ENROLLMENT_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' -d "{\"user_code\":\"$USER_CODE\"}" || true)"
 echo "[run-derived-trust] approve response: $APPROVE"
 
@@ -270,7 +273,8 @@ ADD_PID=""
 if [ "$ADD_RC" -ne 0 ]; then
   echo "[run-derived-trust] channels add failed (rc=$ADD_RC) — log:"; cat "$OCH/channels-add.log"; exit 2
 fi
-CRED_FILE="$OCH/.openclaw-webchannel/$ACCOUNT_ID/credentials.json"
+CRED_FILE="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+  credentials "$TENANT" "$ACCOUNT_ID" "$OCH")"
 [ -f "$CRED_FILE" ] || { echo "[run-derived-trust] creds NOT persisted at $CRED_FILE — log:"; cat "$OCH/channels-add.log"; exit 2; }
 echo "[run-derived-trust] ✓ credentials persisted at $CRED_FILE"
 
@@ -311,9 +315,10 @@ HOME="$OCH" OPENCLAW_HOME="$OCH" OPENCLAW_DISABLE_BONJOUR=1 \
   "$REPO/node_modules/.bin/openclaw" gateway --port "$GW_PORT" --force \
   >"$OCH/gateway.log" 2>&1 &
 GW_PID=$!
-echo "[run-derived-trust] gateway pid=$GW_PID — waiting for plugin registration (consume persisted creds)…"
+echo "[run-derived-trust] gateway pid=$GW_PID — waiting for structured account readiness (consume persisted creds)…"
 for i in $(seq 1 240); do
-  if grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$OCH/gateway.log" 2>/dev/null; then
+  LATEST_AGGREGATE="$(grep "event=webchannel\.account_aggregate" "$OCH/gateway.log" 2>/dev/null | tail -n 1 || true)"
+  if printf '%s\n' "$LATEST_AGGREGATE" | grep -Eq "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=1 totalCount=1"; then
     echo "[run-derived-trust] gateway ready (consumed creds + connected)"
     break
   fi
@@ -322,7 +327,7 @@ for i in $(seq 1 240); do
   fi
   sleep 0.5
   if [ "$i" -eq 240 ]; then
-    echo "[run-derived-trust] TIMEOUT waiting for gateway registration — log:"; cat "$OCH/gateway.log"; exit 2
+    echo "[run-derived-trust] TIMEOUT waiting for structured account readiness — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
 

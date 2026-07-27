@@ -7,7 +7,7 @@ import {
   type UserMessageLike,
 } from "./inbound-queue.js";
 import { isControlLaneMessage } from "./control-lane.js";
-import type { InboundWsMessage } from "./transport.js";
+import type { InboundWsMessage } from "./channel-contract.js";
 
 /**
  * P1-8b — the two inbound-smoothing seams as wired in index-nats.ts.
@@ -112,7 +112,7 @@ describe("inbound /stop routing seam (both buffer layers drained)", () => {
     message: InboundWsMessage,
     seam: {
       debouncer: { cancelKey: (key: string) => boolean };
-      dispatcher: { clearPending: (key: string) => number };
+      dispatcher: { clearPending: (key: string) => unknown[] };
       controlLane: (peerId: string, message: InboundWsMessage) => void;
       enqueue: (peerId: string, message: InboundWsMessage) => void;
     },
@@ -130,7 +130,7 @@ describe("inbound /stop routing seam (both buffer layers drained)", () => {
   it("routes /stop to cancelKey + clearPending + the control handler (never the debouncer)", () => {
     const seam = {
       debouncer: { cancelKey: vi.fn(() => true) },
-      dispatcher: { clearPending: vi.fn(() => 2) },
+      dispatcher: { clearPending: vi.fn(() => [{}, {}]) },
       controlLane: vi.fn(),
       enqueue: vi.fn(),
     };
@@ -146,7 +146,7 @@ describe("inbound /stop routing seam (both buffer layers drained)", () => {
   it("routes ordinary text to the debouncer (no buffer drop, no control handler)", () => {
     const seam = {
       debouncer: { cancelKey: vi.fn(() => false) },
-      dispatcher: { clearPending: vi.fn(() => 0) },
+      dispatcher: { clearPending: vi.fn(() => []) },
       controlLane: vi.fn(),
       enqueue: vi.fn(),
     };
@@ -172,7 +172,7 @@ describe("inbound /stop routing seam (both buffer layers drained)", () => {
     dispatcher.dispatch("p1", um("m2"));
     dispatcher.dispatch("p1", um("m3"));
     expect(dispatcher.pendingBuffered("p1")).toBe(2);
-    expect(dispatcher.clearPending("p1")).toBe(2);
+    expect(dispatcher.clearPending("p1")).toEqual([um("m2"), um("m3")]);
     expect(dispatcher.pendingBuffered("p1")).toBe(0);
   });
 });

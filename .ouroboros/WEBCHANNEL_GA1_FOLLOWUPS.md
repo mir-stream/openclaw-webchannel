@@ -50,12 +50,11 @@
 - **완화 방향**: teardown에 토큰이 없어 깔끔한 account 해석이 안 됨 → (택1) peer→account 역인덱스로
   소속 account만 unregister, 또는 unregister에도 경량 auth(자기 peer만 teardown) 요구.
 
-### B7. 동일 audience accounts cross-register (PR #4 리뷰)
-- 두 account가 같은 `jwt.audience`(같은 IdP)를 쓰면 first-wins aud→account 매핑
-  (`index-nats.ts:~705` + `register-dispatch.ts:60-79`)으로 두 번째 account 유저가 첫 account
-  채널에 등록됨. `planAccounts`는 agentId 중복은 막지만 **audience 중복은 미차단**.
-- 현재 완화: 충돌 시 경고 로그 + 문서. **근본 해결**: `planAccounts`에서 served account 간 distinct
-  `jwt.audience` 강제(중복이면 skip + error).
+### B7. 동일 audience accounts cross-register (PR #4 리뷰) ✅ RESOLVED (#54)
+- 설정 가능한 `auth.jwt.audience`와 aud→account/first-wins 라우터를 제거했다.
+  각 account 런타임의 verifier가 expected `aud`를 자기 `accountId`로 캡처하므로,
+  issuer/JWKS를 공유해도 A용 토큰은 B에서 검증되지 않는다.
+- legacy `auth.jwt.audience` 키는 값과 무관하게 targeted migration error로 fail-closed한다.
 
 ## C. 큰 옵션 (요구 발생 시)
 
@@ -65,9 +64,9 @@
   **동시 배포** 필요한 breaking 와이어 변경. 현재 account=agent 1:1이라 불필요. → **구현됨**:
   단일 와이어 신원(subject 중간/JWT aud/enroll 식별자/envelope plaintext routing+history triple)을
   기존 `--account` 키로 대체, `channels add`에서 agentId 제거 → 처리 agent는 `agents bind` 전용
-  (telegram 동형). 클린 브레이크(라이브 배포 없음, 와이어 back-compat 없음). audToAccount 기본
-  항등 매핑(설정 jwt.audience 매핑+first-wins 충돌가드 유지), multiplex의 missing/duplicate-agentId
-  skip 제거(accountId는 config map 키라 구조적으로 유일), creds-missing/connection/encryption graceful
+  (telegram 동형). 클린 브레이크(라이브 배포 없음, 와이어 back-compat 없음). Issue #54에서
+  audToAccount 매핑도 제거되어 expected `aud`는 런타임 `accountId`로 고정된다. multiplex의
+  missing/duplicate-agentId skip 제거(accountId는 config map 키라 구조적으로 유일), creds-missing/connection/encryption graceful
   skip 불변. 2라운드 리뷰 PASS(와이어 대칭+auth+grep 완전성). typecheck clean, tests 968(plugin 724/
   client 155/saas 89). **미push/PR.**
 - 가-1은 가-2의 strict subset(버릴 작업 없음); 개명만 추가하면 됨.

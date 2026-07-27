@@ -1,0 +1,25 @@
+{
+  // `e2e/` was type-checked by NOTHING. The drivers under `local/` run via
+  // `node --import tsx`, which STRIPS types without checking them, so a stale
+  // call into `packages/*` source stayed invisible until the gated CI job ran a
+  // live nats-server. That is exactly how a 3-arg call to the 4-arg `signPop`
+  // shipped: `npm run typecheck` was green the whole time.
+  //
+  // Libs mirror `packages/client` (DOM + ES2022) because the drivers import the
+  // browser client's source (`CryptoKey`, `crypto.subtle`, `WebSocket`), and
+  // `types: ["node"]` is added on top because they are Node programs
+  // (`process.env`, `Buffer`, `node:crypto`).
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true
+  },
+  "include": ["**/*.ts"]
+}

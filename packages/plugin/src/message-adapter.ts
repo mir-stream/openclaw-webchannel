@@ -19,8 +19,8 @@ import {
   stripInlineDirectiveTagsForDelivery,
 } from "openclaw/plugin-sdk/text-chunking";
 
-import { WEBCHANNEL_ID } from "./transport.js";
-import type { WebChannelTransport } from "./transport.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
+import type { WebChannelPeerChannel } from "./channel-contract.js";
 
 /**
  * Stable per-message id we generate for each outbound logical send. This becomes
@@ -88,7 +88,7 @@ export function buildClawReceipt(id: string): MessageReceipt {
  * primary id is our generated per-message id; this is also the fallback send
  * used if core ever drives the adapter directly.
  */
-export function createClawMessageAdapter(transport: WebChannelTransport) {
+export function createClawMessageAdapter(transport: WebChannelPeerChannel) {
   return defineChannelMessageAdapter({
     id: WEBCHANNEL_ID,
     // Final delivery is plain text only.
@@ -105,12 +105,28 @@ export function createClawMessageAdapter(transport: WebChannelTransport) {
         const id = nextMessageId();
         // `ctx.to` is the recorded reply target — the REAL per-peer `wsKey`
         // (inbound.ts records `reply.to = wsKey`). Target it directly; if it's
-        // absent or has no mapped socket, fall back to `sendTextToAnyOpen`,
-        // which delivers only when exactly ONE connection exists and otherwise
-        // refuses to guess — so we never default to the literal `web-anon` key
-        // when real peers are connected.
-        if (!ctx.to || !transport.sendText(ctx.to, ctx.text, id)) {
-          transport.sendTextToAnyOpen(ctx.text);
+        // absent or the targeted send fails, throw before fabricating any
+        // receipt (P0-1 removed recipient guessing; P0-4 makes failure honest).
+        //
+        // P0-4 (review R2): throwing is safe ONLY because core never re-sends a
+        // thrown outbound. Traced in openclaw 2026.6.10 (the installed version and
+        // the floor of the `>=2026.6.10` peer range): `durableFinal.capabilities.
+        // text` below makes this channel eligible for core's durable delivery
+        // queue, whose `failDelivery` does NOT drop the entry (it bumps retryCount
+        // and leaves it pending for `recoverPendingDeliveries`) — but core stamps
+        // `send_attempt_started` immediately BEFORE calling us, and its drain
+        // refuses to blindly replay an entry in that state unless the adapter
+        // supplies `reconcileUnknownSend`, which we deliberately do not. So a
+        // thrown send moves to failed, never re-sent. Adding a
+        // `reconcileUnknownSend` here, or a core bump, re-opens the blind-replay
+        // path → SILENT DUPLICATE DELIVERY. Re-verify then.
+        if (!ctx.to) {
+          throw new Error("[webchannel] message.send.text failed: ctx.to is absent");
+        }
+        if (!transport.sendText(ctx.to, ctx.text, id)) {
+          throw new Error(
+            `[webchannel] message.send.text failed: targeted send returned false for peer ${ctx.to}`,
+          );
         }
         return { receipt: buildClawReceipt(id), messageId: id };
       },
@@ -190,10 +206,10 @@ export type ProgressDraftController = {
   snapshotText: () => string;
   /**
    * Finalize the draft into the final answer (reuses the draft id). Idempotent:
-   * the first call finalizes and stops the loop; later calls are no-ops so the
-   * normal path and the error-recovery path can't double-finalize.
+   * the first call finalizes and stops the loop; later calls return that first
+   * attempt's cached boolean so callers never retry or observe `undefined`.
    */
-  finalize: (text: string) => Promise<void>;
+  finalize: (text: string) => Promise<boolean>;
   /**
    * Stop the draft loop without sending a final frame. Used on cleanup paths so
    * a late background throttled flush can't race error handling. Idempotent.
@@ -202,8 +218,9 @@ export type ProgressDraftController = {
 };
 
 export function createProgressDraftController(params: {
-  transport: WebChannelTransport;
+  transport: WebChannelPeerChannel;
   sessionKey: string;
+  turnId?: string;
   /** Channel config section (for label/maxLines/line formatting). */
   channelConfig: unknown;
   throttleMs?: number;
@@ -234,7 +251,7 @@ export function createProgressDraftController(params: {
   let absorbedMissedBoundaries = 0;
   let stopped = false;
   let started = false;
-  let finalized = false;
+  let finalizeResult: Promise<boolean> | undefined;
 
   // The full streamed answer body so far = completed messages + current one.
   const answerBody = (): string => answerPrefix + answerText;
@@ -266,7 +283,7 @@ export function createProgressDraftController(params: {
 
   const sendOrEditStreamMessage = async (text: string): Promise<boolean> => {
     if (stopped) return false;
-    const sent = transport.sendProgress(sessionKey, id, text);
+    const sent = transport.sendProgress(sessionKey, id, text, params.turnId);
     // Track that a working bubble is now shown to the widget, so the
     // error-recovery path knows it must emit a terminal frame to settle it.
     if (sent) started = true;
@@ -367,33 +384,46 @@ export function createProgressDraftController(params: {
     },
     flush: () => loop.flush(),
     snapshotText: () => (hasPendingContent() ? composeText() : ""),
-    finalize: async (text) => {
+    finalize: (text) => {
       // Idempotent: the normal delivery path and the error-recovery path may
       // both attempt to finalize; only the first wins so we never send two
       // terminal frames (or finalize onto an already-settled bubble).
-      if (finalized) return;
-      finalized = true;
-      // Flush any pending draft text first so the widget has shown the working
-      // bubble at least once (the throttle may not have fired yet for a fast
-      // turn). This must run BEFORE we stop the loop, since flush() bails when
-      // `isStopped()` is true. Then finalize in place onto the same draft id.
-      //
-      // TOCTOU hardening: a pending progress `ws.send` can throw if the socket
-      // slipped to CLOSING between the OPEN check and the send. We must NOT let
-      // that abort finalization — the final answer (and, on the error path, the
-      // settling frame) still has to be delivered. So swallow a flush failure
-      // and proceed to finalizeDraft regardless.
-      if (hasPendingContent()) {
-        loop.update(composeText());
-        try {
-          await loop.flush();
-        } catch {
-          // Pending preview send failed; deliver the final frame anyway below.
+      if (finalizeResult) return finalizeResult;
+      // P0-4 (review R2): arm the latch SYNCHRONOUSLY. `finalizeResult = (async
+      // () => {...})()` only assigns once the body first SUSPENDS, and the body
+      // reaches `transport.finalizeDraft(...)` with no preceding `await` whenever
+      // there is no pending draft content — so the whole terminal-frame send used
+      // to run before the latch existed, leaving it unarmed across exactly the
+      // stretch it exists to protect (the pre-P0-4 code set its `finalized` flag
+      // synchronously). Resolving an already-assigned promise WITH the body's
+      // promise keeps the cached-result contract: every caller, re-entrant or
+      // not, awaits the same single `finalizeDraft` outcome (or rejection).
+      let settleFinalize!: (v: boolean | PromiseLike<boolean>) => void;
+      finalizeResult = new Promise<boolean>((resolve) => { settleFinalize = resolve; });
+      settleFinalize((async () => {
+        // Flush any pending draft text first so the widget has shown the working
+        // bubble at least once (the throttle may not have fired yet for a fast
+        // turn). This must run BEFORE we stop the loop, since flush() bails when
+        // `isStopped()` is true. Then finalize in place onto the same draft id.
+        //
+        // TOCTOU hardening: a pending progress `ws.send` can throw if the socket
+        // slipped to CLOSING between the OPEN check and the send. We must NOT let
+        // that abort finalization — the final answer (and, on the error path, the
+        // settling frame) still has to be delivered. So swallow a flush failure
+        // and proceed to finalizeDraft regardless.
+        if (hasPendingContent()) {
+          loop.update(composeText());
+          try {
+            await loop.flush();
+          } catch {
+            // Pending preview send failed; deliver the final frame anyway below.
+          }
         }
-      }
-      stopped = true;
-      loop.stop();
-      await transport.finalizeDraft(sessionKey, id, text);
+        stopped = true;
+        loop.stop();
+        return transport.finalizeDraft(sessionKey, id, text, params.turnId);
+      })());
+      return finalizeResult;
     },
     stop: () => {
       // Halt the throttled loop so no late background flush can race cleanup.
@@ -401,6 +431,120 @@ export function createProgressDraftController(params: {
       // a working bubble should use finalize(text) instead.
       stopped = true;
       loop.stop();
+    },
+  };
+}
+
+/**
+ * One `onReasoningStream` payload, narrowed to the fields we consume. The pinned
+ * OpenClaw callback delivers `{ text?; mediaUrls?; isReasoningSnapshot? }`
+ * (verified: dist/plugin-sdk/types-B70zVumi.d.ts:1737-1741). `mediaUrls` is
+ * intentionally ignored — the webchannel reasoning lane is text-only.
+ */
+export type ReasoningStreamUpdate = {
+  text?: string;
+  isReasoningSnapshot?: boolean;
+};
+
+export type ReasoningDraftController = {
+  push: (update: ReasoningStreamUpdate) => void;
+  endBurst: () => void;
+  stop: () => void;
+};
+
+/**
+ * Normalizes OpenClaw's reasoning updates into cumulative, replace-by-id wire
+ * frames. Each `onReasoningEnd` boundary rotates the id so separate reasoning
+ * bursts remain distinct in the UI.
+ *
+ * VERIFIED CONTRACT (pinned OpenClaw v2026.6.x): every emitter sends either a
+ * snapshot or the cumulative FULL text so far — NEVER a bare delta:
+ *  - the ACP runner emits the full accumulated text with `isReasoningSnapshot:
+ *    true` (dist/run-attempt-DRhLt3eF.js:4114-4117);
+ *  - the btw runner emits cumulative full text (`reasoningText += delta` then
+ *    emits `reasoningText`, no snapshot flag) (dist/btw-CDO5476N.js:617-627).
+ * So normalization is a plain REPLACE: ignore empty/non-string text, no-op an
+ * exact duplicate of the current text, otherwise replace and send. No
+ * snapshot/startsWith/endsWith/concat heuristic is needed.
+ *
+ * btw STALE-BURST DEFENSE: the btw `reasoningText` accumulator (declared
+ * dist/btw-CDO5476N.js:563) is NEVER reset at `thinking_end` (:626), even though
+ * that same event fires `onReasoningEnd`. So a SECOND thinking burst in one
+ * attempt emits cumulative text that still carries burst 1's full text as a raw
+ * prefix (btw concatenates raw deltas, whitespace and all). Under our per-burst id
+ * rotation that would render burst 1 duplicated inside burst 2's lane. We defend
+ * with a `stalePrefix`: on `endBurst` we set it to the just-closed burst's LAST
+ * RAW payload (that raw cumulative text already contains every prior burst — so
+ * assign, don't append our trimmed display text, which loses inter-burst
+ * whitespace and misfires from burst 3 on), and on `push` we strip that prefix
+ * (plus any leading whitespace) from an incoming cumulative payload before the
+ * replace logic runs. The ACP runner cannot hit this — its
+ * `maybeEndReasoning` (dist/run-attempt-DRhLt3eF.js:4520-4524) fires
+ * `onReasoningEnd` at most once per attempt (a `reasoningEnded` guard). The strip
+ * is conservative: a payload that does NOT start with the accumulated prefix
+ * falls through unchanged, so the worst case is the pre-fix duplicated display,
+ * never lost text — as long as the emitter's accumulator persists for the
+ * controller's lifetime (the pinned single-invocation contract). A fresh runner
+ * re-streaming byte-identical reasoning into a reused controller could jump-strip
+ * mid-stream; no pinned path does that today.
+ */
+export function createReasoningDraftController(params: {
+  transport: WebChannelPeerChannel;
+  sessionKey: string;
+  turnId: string;
+}): ReasoningDraftController {
+  let id = nextMessageId();
+  let currentText = "";
+  // Prefix a later burst's payload carries under btw (stale-burst defense). btw's
+  // `reasoningText` is its RAW cumulative accumulator, so the prefix is exactly the
+  // last raw payload of the just-closed burst — NOT our trimmed display text (the
+  // two differ whenever whitespace separates bursts, e.g. "\n\n" from a thinking
+  // model). `endBurst` therefore ASSIGNS `stalePrefix = lastRawText` (the raw
+  // payload already contains every prior burst), not `+=` our stripped text.
+  let stalePrefix = "";
+  // The last raw payload seen this burst (before stripping), captured so endBurst
+  // can hand the raw cumulative text to `stalePrefix`.
+  let lastRawText = "";
+  let stopped = false;
+
+  const push = (update: ReasoningStreamUpdate): void => {
+    if (stopped) return;
+    const text = typeof update.text === "string" ? update.text : "";
+    if (text.length === 0) return;
+    // Remember the RAW payload before any stripping (see stalePrefix above).
+    lastRawText = text;
+    // btw stale-burst defense (see the contract above): a later burst's cumulative
+    // payload still carries every prior burst's text as a leading prefix. Strip it
+    // (and any whitespace the deltas left between bursts) so this burst's lane
+    // shows only its own text. A payload that does not carry the prefix is left
+    // as-is (conservative — never drop text we can't confidently attribute).
+    let normalized = text;
+    if (stalePrefix.length > 0 && normalized.startsWith(stalePrefix)) {
+      normalized = normalized.slice(stalePrefix.length).replace(/^\s+/, "");
+      if (normalized.length === 0) return;
+    }
+    // Cumulative/snapshot REPLACE (see the verified contract above): a payload is
+    // always the full text so far, so an exact match is a no-op and anything else
+    // replaces the current text wholesale.
+    if (normalized === currentText) return;
+    currentText = normalized;
+    params.transport.sendReasoning(params.sessionKey, id, params.turnId, currentText);
+  };
+
+  return {
+    push,
+    endBurst: () => {
+      if (stopped || currentText.length === 0) return;
+      // The NEXT burst's raw payload carries this closed burst's LAST RAW text as
+      // its prefix (btw's accumulator is cumulative and already holds all prior
+      // bursts), so assign — don't append our trimmed display text, which would
+      // drop any inter-burst whitespace and break the prefix match from burst 3 on.
+      stalePrefix = lastRawText;
+      id = nextMessageId();
+      currentText = "";
+    },
+    stop: () => {
+      stopped = true;
     },
   };
 }

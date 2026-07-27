@@ -259,12 +259,16 @@ boot_agent() {
   # isolates users regardless of this setting. Kept (not removed) because the
   # full browser roundtrip could not be re-verified without it in this env;
   # it is harmless (it only affects non-webchannel channels + the core doctor).
+  #
+  # agents.defaults.reasoningDefault "stream" below opts this demo into the P1-3
+  # reasoning lane (level-gated; default is "off"), so a zai thinking model shows
+  # its reasoning in the widget. The echo stand-in produces no reasoning — harmless.
   cat > "$home/.openclaw/openclaw.json" <<JSON
 {
   "gateway": { "mode": "local", "bind": "loopback" },
   "session": { "dmScope": "per-channel-peer" },
   "models": { "providers": { $PROVIDER_BLOCK } },
-  "agents": { "defaults": { "model": { "primary": "$PRIMARY_MODEL" }, "compaction": { "reserveTokensFloor": 20000 } } },
+  "agents": { "defaults": { "model": { "primary": "$PRIMARY_MODEL" }, "compaction": { "reserveTokensFloor": 20000 }, "reasoningDefault": "stream" } },
   "messages": { "inbound": { "byChannel": { "webchannel": 300 } } },
   "plugins": {
     "load": { "paths": ["$REPO/packages/plugin"] },
@@ -279,8 +283,7 @@ boot_agent() {
         "$acct": {
           "tenant": "$TENANT",
           "auth": { "strategy": "jwt", "jwt": {
-            "jwksUrl": "$SAAS_URL/.well-known/jwks.json",
-            "audience": "$acct"
+            "jwksUrl": "$SAAS_URL/.well-known/jwks.json"
           } },
           "dmSecurity": "allowlist",
           "allowFrom": ["$UUID_ALICE", "$UUID_BOB", "$UUID_ADMIN"],
@@ -318,9 +321,12 @@ JSON
 
   set +e; wait "$add_pid"; local rc=$?; set -e
   [ "$rc" -ne 0 ] && { echo "[demo] $acct channels add failed (rc=$rc):"; cat "$addlog"; exit 2; }
-  [ -f "$home/.openclaw-webchannel/$acct/credentials.json" ] || { echo "[demo] $acct creds not persisted"; cat "$addlog"; exit 2; }
+  local cred_file
+  cred_file="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
+    credentials "$TENANT" "$acct" "$home")"
+  [ -f "$cred_file" ] || { echo "[demo] $acct creds not persisted at $cred_file"; cat "$addlog"; exit 2; }
 
-  # Re-assert register-hop admission (setup adapter may write admission:auto).
+  # Re-assert register-hop admission (setup adapter may write admission:register-hop).
   node -e '
     const fs = require("fs"); const p = process.argv[1], acct = process.argv[2];
     const cfg = JSON.parse(fs.readFileSync(p, "utf8"));
@@ -337,10 +343,16 @@ JSON
     "$REPO/node_modules/.bin/openclaw" gateway --port "$port" --force >"$home/gateway.log" 2>&1 &
   local gw_pid=$!
   GW_PIDS+=("$gw_pid")
-  echo "[demo] $acct gateway pid=$gw_pid — waiting for registration…"
+  echo "[demo] $acct gateway pid=$gw_pid — waiting for structured readiness…"
   for i in $(seq 1 240); do
-    grep -q "\[webchannel\] ✓ NATS mode plugin registered" "$home/gateway.log" 2>/dev/null \
-      && { echo "[demo] $acct gateway ready"; return 0; }
+    local latest_aggregate
+    latest_aggregate="$(grep "event=webchannel\.account_aggregate" "$home/gateway.log" 2>/dev/null | tail -n 1 || true)"
+    if grep -q "account \"$acct\" ✓ encrypted NATS channel" "$home/gateway.log" 2>/dev/null \
+       && printf '%s\n' "$latest_aggregate" | grep -Eq \
+         "event=webchannel\.account_aggregate generation=[^ ]+ state=complete servingCount=1 totalCount=1"; then
+      echo "[demo] $acct gateway ready"
+      return 0
+    fi
     kill -0 "$gw_pid" 2>/dev/null || { echo "[demo] $acct gateway died:"; tail -30 "$home/gateway.log"; exit 2; }
     sleep 0.5
     [ "$i" -eq 240 ] && { echo "[demo] $acct gateway TIMEOUT:"; tail -30 "$home/gateway.log"; exit 2; }

@@ -27,9 +27,12 @@ Server side (`server/index.ts`, all `@mir-stream/webchannel-saas`):
 
 `POST /bootstrap` and `POST /nats-user` are **session-gated**. The `peerId` is
 **always** the authenticated session uuid — a body `peerId` is ignored — and the
-`accountId` is authorized server-side (`canAccess`). Without this gate the server
-would be an unauthenticated oracle minting SaaS-signed bootstrap JWTs for any
-attacker-chosen account / victim peer.
+single target is the server's `ACCOUNT_ID`, authorized server-side (`canAccess`).
+The JWT `aud`, NATS subject account, and returned agent pin all refer to that same
+`(TENANT, ACCOUNT_ID)` tuple. A multi-tenant integrator must authorize the full
+`(user, tenant, accountId)` tuple. Without this gate the server would be an
+unauthenticated oracle minting SaaS-signed bootstrap JWTs for an attacker-chosen
+account or victim peer.
 
 ## Run
 
@@ -81,15 +84,10 @@ This app deliberately does **not** boot openclaw — attaching an agent is *your
 domain. With no agent attached, the browser:
 
 - reaches `status: "connected"` (the NKEY NATS auth succeeds), then
-- ~15s later the PoP `register` request times out (no responder) → the wrapper
-  reports a **terminal** `status: "error"` with message
-  `"[nats-client] request timeout"`.
-
-The app classifies that specific error as a graceful **"⏳ waiting for agent"**
-state (not a red error box) with a **Retry** button. **Retry is a full re-auth**
-(fresh device keys + `/bootstrap` + `/nats-user` + new client) because the
-bootstrap JWT is short-lived (~300s) — re-creating the client alone could present
-an expired JWT.
+- ~15s later, after the bounded PoP `register` attempts time out with no
+  responder, treats the agent-offline condition as transient and enters
+  `status: "reconnecting"` instead of a terminal error. The client keeps
+  retrying until an agent appears.
 
 ## Attach an openclaw agent
 
@@ -99,13 +97,12 @@ approve via `POST /admin/enrollments/<code>/approve`, then `openclaw gateway`.
 Once the agent subscribes, the PoP register completes and the lane goes live.
 
 The approve route returns **tenant-wide agent credentials**, so it is
-**admin-gated**: it requires an `x-admin-token` header (or
-`Authorization: Bearer`) equal to `ADMIN_TOKEN`. Set `ADMIN_TOKEN` in the env, or
-let the server auto-generate one and print it at boot
-(`[app] admin token (for approving enrollments): …`). Approve with:
+**admin-gated**: it requires `Authorization: Bearer <token>` equal to
+`ENROLLMENT_ADMIN_TOKEN`. The routes fail closed with 503 when the variable is
+unset. Approve with:
 
 ```bash
-curl -X POST -H "x-admin-token: <ADMIN_TOKEN>" \
+curl -X POST -H "Authorization: Bearer <ENROLLMENT_ADMIN_TOKEN>" \
   http://127.0.0.1:4000/admin/enrollments/<USER_CODE>/approve
 ```
 
