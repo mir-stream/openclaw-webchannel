@@ -40,9 +40,9 @@ describe("register PoP gate (Item 1)", () => {
     // … and the existing signed-nonce verification then succeeds → peer registered.
     const store = new PopChallengeStore();
     const nonce = store.issue("alice");
-    const sig = dev.sign(popSignedMessage("alice", nonce));
+    const sig = dev.sign(popSignedMessage("register", "alice", nonce));
     expect(
-      store.verify({ peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }),
+      store.verify({ op: "register", peerId: "alice", nonce, signatureB64Url: sig, popPublicJwk: dev.popPublicJwk }),
     ).toEqual({ ok: true, reason: "verified" });
   });
 

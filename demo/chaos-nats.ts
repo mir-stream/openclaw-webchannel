@@ -17,7 +17,12 @@
  * request/reply (the register HTTP route is gone).
  */
 import { importEd25519SeedKey, signNonce } from "../packages/client/src/nats-nkey-browser.js";
-import { generateDevicePopKeyPair, signPop } from "../packages/client/src/pop-register.js";
+import {
+  generateDevicePopKeyPair,
+  signPop,
+  generateClientNonce,
+} from "../packages/client/src/pop-register.js";
+import { WEBCHANNEL_PROTOCOL_VERSION } from "../packages/client/src/protocol.js";
 
 const SAAS_URL = process.env.SAAS_URL || "http://127.0.0.1:3961";
 const TENANT = process.env.DEMO_TENANT || "demo-tenant";
@@ -261,8 +266,23 @@ async function replayJwt(): Promise<number> {
     // 1. Get a single-use challenge nonce.
     const ch = parse(await nats.request(registerSubj, replyPrefix, JSON.stringify({ op: "challenge", token: jwt })));
     if (!ch.nonce) throw new Error(`challenge returned no nonce: ${JSON.stringify(ch)}`);
-    const signature = await signPop(pop.privateKey, peerId, ch.nonce);
-    const registerBody = JSON.stringify({ op: "register", token: jwt, nonce: ch.nonce, signature });
+    // The proof is bound to the OP it authorizes, so this one cannot be
+    // relabelled as an `unregister` (see plugin/src/pop-signed-message.ts).
+    const signature = await signPop(pop.privateKey, "register", peerId, ch.nonce);
+    const registerBody = JSON.stringify({
+      op: "register",
+      token: jwt,
+      nonce: ch.nonce,
+      signature,
+      // Both fields are mandatory on the v3 register request. `protocolVersion`
+      // was already required at v2 and its omission here was a pre-existing bug:
+      // the agent answers 426 before PoP, so this scenario could never reach the
+      // replay it means to test. `clientNonce` is the v3 freshness anchor; this
+      // scenario deliberately reuses one value across both round-trips, since what
+      // it exercises is the single-use PoP nonce, not the anchor.
+      protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
+      clientNonce: generateClientNonce(),
+    });
 
     // 2. Register once with the valid proof — should succeed (burns the nonce).
     const r1 = parse(await nats.request(registerSubj, replyPrefix, registerBody));

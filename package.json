@@ -9,8 +9,9 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "typecheck": "npm run typecheck --workspaces --if-present && npm run typecheck:demo",
+    "typecheck": "npm run typecheck --workspaces --if-present && npm run typecheck:demo && npm run typecheck:e2e",
     "typecheck:demo": "tsc -p demo/tsconfig.json",
+    "typecheck:e2e": "tsc -p e2e/tsconfig.json",
     "build": "npm run build --workspaces --if-present"
   },
   "optionalDependencies": {

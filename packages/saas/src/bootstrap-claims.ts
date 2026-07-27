@@ -9,7 +9,7 @@
  *     `saas-bootstrap.ts`).
  *   - `pop_jwk`  — the device's Ed25519 PoP public key. Proof-of-Possession at
  *     peer registration: the plugin issues a nonce and the device must sign
- *     `webchannel-pop:<peerId>:<nonce>` with the matching Ed25519 PRIVATE key
+ *     `webchannel-pop:<op>:<peerId>:<nonce>` with the matching Ed25519 PRIVATE key
  *     (parsed by the plugin's `jwt.ts`, verified by `pop-challenge.ts`).
  *
  * The two keys are deliberately SEPARATE: X25519 is for ECDH and cannot sign, so

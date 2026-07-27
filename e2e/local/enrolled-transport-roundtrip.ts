@@ -174,11 +174,16 @@ try {
 if (!registerResult.wrappedConversationKey) {
   fail(2, "register response carried no wrappedConversationKey (Phase 6 key delivery)");
 }
+// v3: the wrap AAD is bound to the freshness anchor THIS driver generated for the
+// successful register attempt — `registerWithPop` carries it out on its result.
+// Never source it from the register reply (the agent does not echo it, and an
+// echoed anchor would be relay-chosen).
 const sessionKey = await unwrapConversationKey(
   registerResult.wrappedConversationKey,
   deviceKp.privateKey,
   agentPublicKey!,
   PEER_ID,
+  registerResult.clientNonce,
 ).catch((e: Error) => fail(5, `conversation-key unwrap failed: ${e.message}`));
 console.log(`[driver] PoP register hop (NATS) OK → agent subscribed to ${PEER_ID}, K unwrapped`);
 

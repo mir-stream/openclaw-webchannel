@@ -13,11 +13,20 @@ export {
   popSignedMessage,
   signPop,
   registerWithPop,
+  unregisterWithPop,
   PopRejectedError,
+  type PopOp,
   type DevicePopKeyPair,
   type DevicePopJwk,
   type RegisterWithPopOptions,
+  type UnregisterWithPopOptions,
+  type RegisterPublishFn,
 } from "./pop-register.js";
+// NOTE: `generateClientNonce` is deliberately NOT exported. The register
+// freshness anchor has exactly one legitimate producer — `registerWithPop`,
+// which mints one per attempt internally. Handing embedders a way to supply
+// their own anchor invites reusing or persisting it, which is precisely the
+// property the anchor exists to prevent.
 export { filterCommandCatalog } from "./command-filter.js";
 export type {
   ChatRole,

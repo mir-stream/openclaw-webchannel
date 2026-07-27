@@ -90,6 +90,8 @@ class FakeTransport extends EventEmitter {
 const TENANT = "acme";
 const ACCOUNT = "agent-1";
 const PEER = "user-42";
+/** A well-formed v3 browser freshness anchor (base64url, ≥22 chars). */
+const CLIENT_NONCE = "Y2xpZW50LW5vbmNlLWZpeHR1cmUtMDE";
 const outSubj = `webchannel.${TENANT}.${ACCOUNT}.${PEER}.out`;
 const inSubj = `webchannel.${TENANT}.${ACCOUNT}.${PEER}.in`;
 
@@ -186,11 +188,12 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     const deviceKP = generateKeyPair();
 
     channel.registerPeer(PEER);
-    const wrapped = channel.wrapConversationKeyForDevice(PEER, deviceKP.publicKey);
+    const wrapped = channel.wrapConversationKeyForDevice(PEER, deviceKP.publicKey, CLIENT_NONCE);
     expect(wrapped).not.toBeNull();
     const unwrapped = unwrapConversationKey(wrapped!, deviceKP.privateKey, {
       agentPublicKey: identityKP.publicKey,
       peerId: PEER,
+      clientNonce: CLIENT_NONCE,
     });
     expect(Buffer.from(unwrapped).equals(Buffer.from(original))).toBe(true);
   });
@@ -234,13 +237,14 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     channel.registerPeer(PEER);
     const deviceKP = generateKeyPair();
 
-    const wrapped = channel.wrapConversationKeyForDevice(PEER, deviceKP.publicKey);
+    const wrapped = channel.wrapConversationKeyForDevice(PEER, deviceKP.publicKey, CLIENT_NONCE);
     expect(wrapped).not.toBeNull();
     // F2: unwrap derives from the PINNED agent identity public key (not the wire
     // field) and binds the peerId into the AAD.
     const k = unwrapConversationKey(wrapped!, deviceKP.privateKey, {
       agentPublicKey: identityKP.publicKey,
       peerId: PEER,
+      clientNonce: CLIENT_NONCE,
     });
     expect(Buffer.from(k).equals(Buffer.from(store.get(PEER)!))).toBe(true);
 
@@ -250,6 +254,7 @@ describe("NatsChannel keyStore mode (register admission)", () => {
       unwrapConversationKey(wrapped!, otherKP.privateKey, {
         agentPublicKey: identityKP.publicKey,
         peerId: PEER,
+        clientNonce: CLIENT_NONCE,
       }),
     ).toThrow();
 
@@ -260,6 +265,7 @@ describe("NatsChannel keyStore mode (register admission)", () => {
       unwrapConversationKey(wrapped!, deviceKP.privateKey, {
         agentPublicKey: relayKP.publicKey,
         peerId: PEER,
+        clientNonce: CLIENT_NONCE,
       }),
     ).toThrow();
 
@@ -268,6 +274,7 @@ describe("NatsChannel keyStore mode (register admission)", () => {
       unwrapConversationKey(wrapped!, deviceKP.privateKey, {
         agentPublicKey: identityKP.publicKey,
         peerId: "someone-else",
+        clientNonce: CLIENT_NONCE,
       }),
     ).toThrow();
   });
@@ -294,10 +301,10 @@ describe("NatsChannel keyStore mode (register admission)", () => {
     const broker = new FakeBroker();
     const { channel } = makeKeyStoreChannel(broker);
     const deviceKP = generateKeyPair();
-    expect(channel.wrapConversationKeyForDevice("never-registered", deviceKP.publicKey)).toBeNull();
+    expect(channel.wrapConversationKeyForDevice("never-registered", deviceKP.publicKey, CLIENT_NONCE)).toBeNull();
 
     channel.registerPeer(PEER);
-    expect(() => channel.wrapConversationKeyForDevice(PEER, new Uint8Array(31))).toThrow(/32 bytes/);
+    expect(() => channel.wrapConversationKeyForDevice(PEER, new Uint8Array(31), CLIENT_NONCE)).toThrow(/32 bytes/);
 
   });
 

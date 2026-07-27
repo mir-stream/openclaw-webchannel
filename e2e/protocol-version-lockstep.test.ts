@@ -7,7 +7,7 @@
  * runtime, so if the two constants ever diverge, every deployed client↔plugin
  * pair goes terminal-mismatch.
  *
- * Each side already has a `toBe(1)` unit test, but those are independent: a
+ * Each side already has a `toBe(N)` unit test, but those are independent: a
  * one-sided bump (constant + that side's test) would leave CI green while
  * production breaks. This test imports BOTH real constants in one process (the
  * root vitest sweep runs every package together) and asserts equality, so a

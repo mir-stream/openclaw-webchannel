@@ -67,8 +67,6 @@ dist/e2e-crypto-browser.d.ts
 dist/e2e-crypto-browser.js
 dist/index.d.ts
 dist/index.js
-dist/nats-client-wrapped.test-harness.d.ts
-dist/nats-client-wrapped.test-harness.js
 dist/nats-client-wrapper.d.ts
 dist/nats-client-wrapper.js
 dist/nats-client.d.ts

@@ -638,6 +638,10 @@ export class NatsChannel implements WebChannelPeerChannel {
    *
    * @param peerId - registered peer whose K to wrap.
    * @param devicePublicKey - raw 32-byte X25519 device public key (from cnf.jwk).
+   * @param clientNonce - the BROWSER-generated per-attempt freshness anchor from
+   *        THIS register request. MANDATORY (protocol v3): it is bound into the
+   *        wrap AAD so a captured register reply cannot be replayed onto a later
+   *        attempt. The register handler validates its format before calling.
    * @returns the wrapped key, or `null` when the channel is not in keyStore
    *          mode or the peer has no established key (caller treats as a
    *          server-side registration fault).
@@ -645,6 +649,7 @@ export class NatsChannel implements WebChannelPeerChannel {
   wrapConversationKeyForDevice(
     peerId: string,
     devicePublicKey: Uint8Array,
+    clientNonce: string,
   ): WrappedConversationKey | null {
     if (!this.encryptionRequired || !this.keyStore) return null;
     if (devicePublicKey.length !== 32) {
@@ -654,13 +659,16 @@ export class NatsChannel implements WebChannelPeerChannel {
     }
     const key = this.peerSessionKeys.get(peerId);
     if (!key) return null;
-    // F2: static-static wrap under the agent's attested identity key + peerId-bound
-    // AAD. `identityKeyPair` is guaranteed non-null here (constructor asserts it
-    // whenever `keyStore` is set), so the browser can authenticate K against the
-    // SaaS-pinned agent public key and no relay-injected K′ can pass.
+    // F2 + v3: static-static wrap under the agent's attested identity key, with
+    // the AAD bound to BOTH the peerId (anti-lift) and this attempt's
+    // browser-chosen clientNonce (anti-replay). `identityKeyPair` is guaranteed
+    // non-null here (constructor asserts it whenever `keyStore` is set), so the
+    // browser can authenticate K against the SaaS-pinned agent public key and no
+    // relay-injected K′ can pass.
     return wrapConversationKey(key, devicePublicKey, {
       agentIdentityKeyPair: this.identityKeyPair!,
       peerId,
+      clientNonce,
     });
   }
 

@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+- **Breaking (wire protocol v3):** the client↔plugin register hop changed in four
+  ways. `WEBCHANNEL_PROTOCOL_VERSION` goes 2 → 3, and the plugin, client, and SaaS
+  packages must be released together at `0.4.0`. A v2 browser against a v3 agent is
+  refused with a terminal `protocol_mismatch` (426) before any key work; a v3
+  browser against a v2 agent is refused the same way.
+
+  1. **`clientNonce` register-reply freshness anchor.** The register request now
+     carries a mandatory browser-generated random `clientNonce`, and the agent binds
+     it — together with the peer id — into the wrapped-conversation-key AAD. The
+     wrapped key was authenticated but not fresh, so a hostile relay could capture a
+     register reply and re-serve it verbatim; that is inert only while K never
+     rotates. The anchor is added now, while it is cheap, so a later K rotation
+     cannot turn a captured reply into a session hijack. It is regenerated per
+     register *attempt*, never echoed by the agent, and never read back off the
+     wire. See `docs/AUTH.md`.
+  2. **`unregister` requires proof of possession (issue #51).** Teardown was
+     authenticated by JWT + tenant + subject match alone, and the bootstrap JWT
+     crosses the untrusted relay in plaintext, so a relay-positioned observer could
+     capture `{op:"unregister", token}` and replay it until the JWT expired,
+     dropping the victim's subscription and session key each time with no signal to
+     the victim. It now requires the same single-use PoP challenge/response as
+     `register`.
+  3. **The PoP proof is bound to its operation.** The signed message is now
+     `webchannel-pop:{op}:{peerId}:{nonce}` (was `webchannel-pop:{peerId}:{nonce}`),
+     and the two **exported client function signatures** moved with it:
+     `popSignedMessage(peerId, nonce)` → `popSignedMessage(op, peerId, nonce)` and
+     `signPop(key, peerId, nonce)` → `signPop(key, op, peerId, nonce)`. Any caller
+     that builds register frames by hand must pass the op.
+     Both operations draw from the same per-peer nonce bucket, so a proof minted for
+     `register` was also a valid `unregister` proof — and a relay could obtain an
+     unconsumed one for free by *suppressing* the register frame, which is
+     indistinguishable from the dropped frame the client retry loop absorbs. This
+     breaks the register direction too, which is why it ships in this release
+     rather than costing a second hard break later.
+  4. **Embedder note.** A client that sends a token-only `unregister` to a v3 agent
+     gets a **silent no-op** — unregister is fire-and-forget with no reply on any
+     path, and the version check sits after the unregister branch, so there is no
+     426 and no error. This is required by the no-oracle contract but is
+     undiagnosable client-side. Use `unregisterWithPop()` from
+     `@mir-stream/webchannel-client`, which runs challenge → sign → publish.
+     `generateClientNonce` is intentionally *not* exported: the anchor has exactly
+     one legitimate producer, `registerWithPop`.
+
 - **Breaking (issue #54):** `auth.jwt.audience` has been removed. JWT `aud` is
   now the canonical runtime account id or an array of authorized account ids in
   one tenant; generic/shared IdP audiences are no longer accepted. The signed

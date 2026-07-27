@@ -65,6 +65,18 @@ describe("public export surface (package entry)", () => {
     expect("PopCapacityError" in publicApi).toBe(false);
   });
 
+  it("keeps generateClientNonce off the package root (single legitimate producer)", () => {
+    // The v3 register freshness anchor has exactly one correct producer:
+    // `registerWithPop`, which mints a fresh one per attempt. Exporting the
+    // generator invites an embedder to supply their own — reused across attempts,
+    // or persisted — which is precisely what the anchor exists to prevent. Kept
+    // as an exact-surface assertion so this is regression-proof, not convention.
+    expect("generateClientNonce" in publicApi).toBe(false);
+    // The teardown helper, by contrast, IS public: it is the only supported way
+    // to send a v3 unregister (a token-only one is a silent no-op).
+    expect("unregisterWithPop" in publicApi).toBe(true);
+  });
+
   it("constructs the NATS wrapper type without legacy WS options", () => {
     // Uses the barrel-exported options type (not ConstructorParameters) so tsc
     // fails here if `WebChannelNATSClientOptions` drops off the public surface.
@@ -102,6 +114,6 @@ describe("public export surface (package entry)", () => {
   });
 
   it("re-exports the wire-protocol version constant", () => {
-    expect(WEBCHANNEL_PROTOCOL_VERSION).toBe(2);
+    expect(WEBCHANNEL_PROTOCOL_VERSION).toBe(3);
   });
 });

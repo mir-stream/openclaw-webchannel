@@ -14,13 +14,19 @@
  * Flow (over NATS request/reply on the account's `…{peerId}.register` subject):
  *   1. `{op:"challenge", token}` → server issues a nonce bound to peerId
  *      (single-use, short TTL).
- *   2. Browser signs `popSignedMessage(peerId, nonce)` with the Ed25519 device
- *      private key.
+ *   2. Browser signs `popSignedMessage(op, peerId, nonce)` with the Ed25519
+ *      device private key.
  *   3. `{op:"register", token, nonce, signature}` → server verifies the signature
  *      against the JWT's `pop_jwk`. Missing/invalid/expired/replayed → rejected.
+ *
+ * `unregister` requires its own proof through the same store (#51). The `op` is
+ * part of the signed message, so the two proofs are NOT interchangeable — see
+ * pop-signed-message.ts for the suppress-and-relabel attack that binding closes.
  */
 
 import { randomBytes, createPublicKey, verify as edVerify } from "node:crypto";
+
+import { popSignedMessage, type PopOp } from "./pop-signed-message.js";
 
 /** Ed25519 public key in JWK form (OKP / Ed25519). */
 export type PopPublicJwk = {
@@ -55,14 +61,10 @@ const DEFAULT_TTL_MS = 120_000; // 2 minutes
  */
 const DEFAULT_MAX_NONCES_PER_PEER = 8;
 
-/**
- * The exact message the device signs. Binding `peerId` prevents a signature
- * captured for one peer from registering another, and binding the nonce
- * prevents replay.
- */
-export function popSignedMessage(peerId: string, nonce: string): string {
-  return `webchannel-pop:${peerId}:${nonce}`;
-}
+// The signed-message encoding lives in its own dependency-free module so the
+// cross-package parity test can import it under the client's browser-only lib
+// set. Re-exported here because this is where verifiers reach it.
+export { popSignedMessage, type PopOp } from "./pop-signed-message.js";
 
 /**
  * In-memory, single-use, TTL-bounded PoP nonce store + Ed25519 verifier.
@@ -175,8 +177,13 @@ export class PopChallengeStore {
   /**
    * Verify a PoP proof. Consumes the nonce regardless of signature validity
    * (a failed attempt burns the challenge — the client must request a new one).
+   *
+   * `op` is part of the SIGNED message, so a proof minted for one operation does
+   * not verify for another even though both ops share this per-peer nonce bucket.
+   * Callers MUST pass the op they are actually about to perform.
    */
   verify(params: {
+    op: PopOp;
     peerId: string;
     nonce: string;
     signatureB64Url: string;
@@ -203,7 +210,10 @@ export class PopChallengeStore {
       return { ok: false, reason: "bad-signature-encoding" };
     }
 
-    const msg = Buffer.from(popSignedMessage(params.peerId, params.nonce), "utf8");
+    const msg = Buffer.from(
+      popSignedMessage(params.op, params.peerId, params.nonce),
+      "utf8",
+    );
     const ok = edVerify(null, msg, pub, sig);
     return ok ? { ok: true, reason: "verified" } : { ok: false, reason: "signature-mismatch" };
   }

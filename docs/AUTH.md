@@ -7,9 +7,36 @@ no browser-facing connection or token route.
 
 1. The browser obtains a short-lived bootstrap JWT and NATS credentials from the enrollment service.
 2. Browser and agent connect outbound to the NATS relay.
-3. The browser sends its JWT and proof-of-possession response on the account-scoped register subject.
-4. The plugin verifies signature, issuer, audience, and proof of possession before registering peer subjects.
-5. The agent returns the conversation key wrapped to the SaaS-attested device key.
+3. The browser generates a fresh random `clientNonce` for this register attempt and
+   sends it, with its JWT and proof-of-possession response, on the account-scoped
+   register subject.
+4. The plugin verifies the wire protocol version, then signature, issuer, audience,
+   `clientNonce` format, and proof of possession before registering peer subjects.
+5. The agent returns the conversation key wrapped to the SaaS-attested device key,
+   with both the peer id and that `clientNonce` bound into the wrap AAD.
+
+The wire protocol version is **3**. Client and plugin must ship together; a
+mismatch is refused with a terminal `protocol_mismatch` (426) before any key work.
+
+### Register-reply freshness (`clientNonce`)
+
+The wrapped conversation key is authenticated — it is sealed under the agent's
+SaaS-pinned identity key, so a relay cannot substitute its own — but authentication
+alone does not make it *fresh*. A hostile relay can capture a register reply and
+re-serve it verbatim. That is inert only because the conversation key K never
+rotates today; once rotation exists, a replayed reply becomes a session hijack.
+
+Protocol v3 binds a per-attempt anchor into the wrap so a captured reply cannot open
+on a later attempt. The anchor must be **browser-chosen**: the agent's challenge
+reply is unauthenticated plaintext and the browser only checks that a nonce is
+present, so a relay can answer the challenge itself and replay a *matched* (nonce,
+wrap) pair without the agent participating. The single-use PoP nonce protects the
+agent from replay, not the browser. The agent never echoes `clientNonce` back, and
+the browser always unwraps with the value it generated locally — a value read back
+off the wire would be a relay-chosen value.
+
+The anchor is regenerated per register *attempt*, not per connection, so the retry
+that follows a dropped reply does not inherit the previous attempt's anchor.
 
 The live identity contract is exact: `iss` identifies the trusted SaaS issuer
 and may be shared; signed `tenant` must be non-empty and exactly match the
@@ -21,8 +48,36 @@ signed checks. Authentication failure never downgrades to open admission.
 Challenge, register, and unregister all pass through that common
 issuer/tenant/audience/subject gate. Challenge needs no PoP or `cnf`; register
 then applies the configured PoP policy and always requires a valid X25519 `cnf`
-key for key delivery. Unregister remains token-only and sends no reply, including
-on rejection.
+key for key delivery.
+
+Unregister applies **the same PoP policy as register** (it did not, before
+protocol v3) and still sends no reply, including on rejection. The bootstrap JWT
+crosses the untrusted relay in plaintext, so a token-only teardown was replayable:
+an observer could capture `{op:"unregister", token}` and re-send it until the JWT
+expired, dropping the victim's subscription and session key each time with no
+signal to the victim. Requiring a single-use PoP proof makes each teardown usable
+once.
+
+The proof is bound to the **operation** it authorizes — the device signs
+`webchannel-pop:{op}:{peerId}:{nonce}`. Both operations draw from the same per-peer
+nonce bucket, so without that binding a proof minted for `register` would also
+authorize a teardown; and a relay can obtain an unconsumed one for free by
+*suppressing* the register frame, which is indistinguishable from the dropped frame
+the client's retry loop exists to absorb. Replay protection alone does not cover
+suppression.
+
+Under the `requirePoP: false` operator opt-out with a JWT that carries no
+`pop_jwk`, unregister stays token-only and therefore remains replayable for the
+JWT's lifetime. This is deliberate and matches register exactly — the same gate
+decides both — but it means disabling PoP disables it for the whole register hop,
+not for registration alone.
+
+**Embedder note (breaking).** A client that sends a token-only `unregister` against
+a v3 agent gets a **silent no-op**: unregister is fire-and-forget with no reply on
+any path, and the protocol-version check sits after the unregister branch, so there
+is no `426` and no error of any kind. That is required by the no-oracle contract,
+but it is undiagnosable from the client. Use the client package's
+`unregisterWithPop()`, which performs the challenge → sign → publish sequence.
 
 The enrollment repository conformance factory's controlled `clock` capability
 is optional, but an adapter that omits it certifies strictly less: assert that
