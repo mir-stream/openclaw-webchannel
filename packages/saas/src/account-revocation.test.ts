@@ -8,7 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 import { decode, encodeAccount, type Account } from "@nats-io/jwt";
-import { fromPublic, fromSeed } from "@nats-io/nkeys";
+import { createOperator, fromPublic, fromSeed } from "@nats-io/nkeys";
 
 import { setupTrustChain } from "./setup-trust-chain.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
@@ -84,6 +84,36 @@ describe("addRevocation (issue #7)", () => {
     expect(after.aud).toBe(before.aud);
     expect(after.jti).not.toBe(before.jti);
     expect(after.iss).toBe(before.iss);
+  });
+
+  it("accepts the delegated operator seed that exactly matches the current account issuer", async () => {
+    const { accountJwt, userPubkey } = await fixture();
+    const rootIssued = decode<Account>(accountJwt);
+    const delegatedKp = createOperator();
+    const delegatedSeed = new TextDecoder().decode(delegatedKp.getSeed());
+    const delegatedJwt = await encodeAccount(
+      rootIssued.name,
+      fromPublic(rootIssued.sub),
+      {
+        ...rootIssued.nats,
+        revocations: { ...(rootIssued.nats.revocations ?? {}), "*": 1_700_000_000 },
+      },
+      {
+        signer: delegatedKp,
+        exp: rootIssued.exp,
+        nbf: rootIssued.nbf,
+        aud: rootIssued.aud,
+      },
+    );
+
+    const next = await addRevocation(delegatedJwt, delegatedSeed, userPubkey, 1_800_000_000);
+    const after = decode<Account>(next);
+
+    expect(after.iss).toBe(delegatedKp.getPublicKey());
+    expect(after.sub).toBe(rootIssued.sub);
+    expect(after.nats.revocations?.[userPubkey]).toBe(1_800_000_000);
+    expect(after.nats.revocations?.["*"]).toBe(1_700_000_000);
+    expect(after.nats.limits).toEqual(rootIssued.nats.limits);
   });
 
   it("rejects a valid-but-foreign operator seed (wrong chain)", async () => {
