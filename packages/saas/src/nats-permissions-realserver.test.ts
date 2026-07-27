@@ -28,7 +28,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import WebSocket from "ws";
 import { fromSeed, createUser } from "@nats-io/nkeys";
 import { encodeUser } from "@nats-io/jwt";
@@ -54,10 +54,18 @@ import { dialRelayForPreflight } from "../../plugin/src/preflight.js";
 // convenience — install with `brew install nats-server` to enable).
 // ---------------------------------------------------------------------------
 
+// PATH is searched too, not just the well-known absolute locations: CI installs
+// the pinned binary under $RUNNER_TOOL_CACHE and exports it via $GITHUB_PATH
+// (the publish lane has no passwordless sudo, so it cannot write /usr/local/bin).
+// Without this, the binary is present and on PATH yet invisible here.
 const NATS_SERVER_CANDIDATES = [
   "/opt/homebrew/bin/nats-server",
   "/usr/local/bin/nats-server",
   "/usr/bin/nats-server",
+  ...(process.env.PATH ?? "")
+    .split(delimiter)
+    .filter(Boolean)
+    .map((dir) => join(dir, "nats-server")),
 ];
 const NATS_SERVER_BIN =
   NATS_SERVER_CANDIDATES.find((p) => existsSync(p)) ?? null;

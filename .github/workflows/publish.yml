@@ -46,8 +46,23 @@ permissions:
 
 jobs:
   publish:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: deploy  # 러너 신축 D7 — deploy 레인 단독 라벨(기본 라벨 러너에 안 실림)
     steps:
+      # ── 컷오버 조상 가드 (러너 신축 설계 §6-4) ──
+      # 구 커밋 재태그(전환 이전 세계의 파일·크레덴셜 전제)가 deploy 레인에서 도는 것을 차단한다.
+      # 체크아웃 불필요: API compare 한 방. GITHUB_REF_NAME(태그명) 비교라 annotated 태그 역참조 문제 없음.
+      # 후속 2잡은 needs: publish 라 이 가드 하나로 전부 차단된다.
+      - name: cutover ancestry guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUNNER_CUTOVER_COMMIT: 67b61b91c846482045e260d532b207b8bf869b22
+        run: |
+          status=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${RUNNER_CUTOVER_COMMIT}...${GITHUB_REF_NAME}" --jq .status)
+          case "$status" in
+            ahead|identical) echo "ancestry OK ($status)" ;;
+            *) echo "::error::ref ${GITHUB_REF_NAME} is not a descendant of cutover commit (status=$status) — old-world retag suspected, aborting before any credential use"; exit 1 ;;
+          esac
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -162,7 +177,7 @@ jobs:
     name: Publish plugin to npm (public, OIDC)
     needs: publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, linux, x64]
+    runs-on: deploy  # 러너 신축 D7 — deploy 레인 단독 라벨(기본 라벨 러너에 안 실림)
     permissions:
       contents: read
       # OIDC trusted publishing: npm exchanges this id-token for a short-lived
@@ -258,7 +273,7 @@ jobs:
     name: Publish plugin to ClawHub
     needs: publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, linux, x64]
+    runs-on: deploy  # 러너 신축 D7 — deploy 레인 단독 라벨(기본 라벨 러너에 안 실림)
     permissions:
       contents: read
       # Kept wired for forward-compat: the clawhub CLI tries an OIDC mint
