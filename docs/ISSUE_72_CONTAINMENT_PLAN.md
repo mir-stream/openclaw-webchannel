@@ -29,6 +29,29 @@
 5. runtime은 account당 단일 gateway writer를 전제로 한다. 단, Track A의 **revocation control
    plane**은 복제된 SaaS 요청자 사이에서도 안전해야 하므로 durable 직렬화/CAS를 요구한다.
 
+### 0.1 threat boundary와 acceptance substitution
+
+이 PR의 선택된 방어는 protocol-level old-wrap replay에는 client-chosen `clientNonce`를, rotation 뒤
+새 envelope의 key separation에는 fresh random K_new를 사용한다. 이 계약은 **live key store의
+integrity**와 §2.5의 forensic backup **MUST NOT restore** 규율 준수를 전제로 한다. audit epoch는
+운영 가시성만 제공하며 security-authoritative counter가 아니다.
+
+따라서 이 설계는 privileged operator나 recovery system이 금지된 K_old를 다시 설치하거나 key
+document와 generation sidecar를 포함한 전체 local snapshot을 과거로 돌리는 것을 기술적으로 막지
+않는다. 그것은 containment 뒤의 **새로운 privileged storage compromise**이며, 발생하면 K_old가
+다시 활성화되어 과거 ciphertext가 다시 사용 가능해진다. 이 한계가 backup restore 금지를 완화하는
+근거는 아니다.
+
+epoch를 K와 같은 rollbackable file/snapshot에 넣거나 그 값을 wrap/envelope AAD에 추가하는 것만으로는
+fresh client가 rollback을 판별할 trusted minimum을 얻지 못한다. 진정한 privileged rollback 저항은
+local snapshot 밖의 non-rollbackable trusted minimum/current generation anchor를 요구하며,
+후속 [#85](https://github.com/mir-stream/openclaw-webchannel/issues/85)가 이를 추적한다.
+
+그러므로 원래 #72의 “monotonically security-authoritative epoch”와 “epoch-bound wrap/envelope AAD”
+요구는 이 PR에서 문자 그대로 충족됐다고 주장하지 않는다. 위의 nonce substitution과 fresh-key
+separation을 **명시적으로 선택한 acceptance substitution**으로 기록한다. 현재 audit epoch 의미,
+`clientNonce`, `ENVELOPE_VERSION = 1`, protocol v3 결정은 변경하지 않는다.
+
 ## 1. 현재 상태와 정정된 사실
 
 ### 1.1 revocation primitive
@@ -659,6 +682,7 @@ K_new history snapshot 성공과 fresh browser 양방향 relay 성공이다.
 | 발급분 추적과 비밀 미저장 | §3 | T3, T4, T19 |
 | selected peer K rotation과 새 암호 경계 | §2.7, §8.1~§8.4 | T14, T17, T18 |
 | old wrap replay 방어 | §8.3 | T15, T16, T17 |
+| security-authoritative monotonic epoch와 epoch-bound AAD | §0.1의 **selected substitution**; privileged storage rollback은 #85로 deferred | 이 PR에서 literal satisfaction을 주장하지 않음 |
 | history 정책 명시 | §1.4, §8.5 | T10, T20 |
 | 전체 사고 순서가 노출 창 없이 수렴 | §2.7 | T13, T18, T20 |
 | agent/wildcard·managed·degraded 운영 가능 | §2.2~§2.4, §3.4, §5 | T5, T8, T9, T19 |
@@ -691,6 +715,10 @@ publish 실패는 revoke 성공으로 보고하지 않는다. publish 수용 뒤
 5. resolver migration의 directory backup/restore 운영 주체. 단, K forensic backup처럼 live
    leaked key를 복구하는 용도로 쓰지 않는다.
 
+non-goal/follow-up: privileged operator/recovery system이 full local snapshot 또는 K_old를
+재설치해도 fresh client가 이를 거부하게 만드는 external non-rollbackable generation anchor는 이
+PR의 범위 밖이며 [#85](https://github.com/mir-stream/openclaw-webchannel/issues/85)에서 다룬다.
+
 미결이 **아닌 것**:
 
 - resolver 옵션 2 선택
@@ -712,6 +740,8 @@ v8은 이전 리뷰 기록의 다음 결론을 명시적으로 폐기했다.
 - relay disconnect/restart가 자동 re-register를 만든다는 주장
 - lock/pid probe가 offline writer 부재를 구조적으로 보장한다는 주장
 - backup restore가 `clientNonce`로 탐지될 수 있고 rollback 문제가 wire 호환성뿐이라는 주장
+- audit epoch를 security-authoritative로 보거나 같은 local snapshot의 epoch/AAD만으로 privileged
+  rollback까지 막았다고 보아 원래 epoch AC를 literal satisfaction으로 표시하는 주장
 
 이 로그는 역사적 오답을 규범으로 남기기 위한 것이 아니라, v8의 현재 계약과 혼동하지 않게 하기
 위한 correction record다.
