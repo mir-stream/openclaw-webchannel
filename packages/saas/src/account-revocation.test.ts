@@ -7,8 +7,8 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { decode, type Account } from "@nats-io/jwt";
-import { fromSeed } from "@nats-io/nkeys";
+import { decode, encodeAccount, type Account } from "@nats-io/jwt";
+import { fromPublic, fromSeed } from "@nats-io/nkeys";
 
 import { setupTrustChain } from "./setup-trust-chain.js";
 import { mintNatsUserCreds } from "./nats-user-creds.js";
@@ -59,6 +59,33 @@ describe("addRevocation (issue #7)", () => {
     expect(after.nats.limits?.subs).toBe(-1);
   });
 
+  it("preserves top-level exp, nbf, and aud while regenerating signing metadata", async () => {
+    const { accountJwt, operatorSeed, userPubkey } = await fixture();
+    const decoded = decode<Account>(accountJwt);
+    const operatorKp = fromSeed(new TextEncoder().encode(operatorSeed));
+    const constrained = await encodeAccount(
+      decoded.name,
+      fromPublic(decoded.sub),
+      decoded.nats,
+      {
+        signer: operatorKp,
+        exp: 2_000_000_000,
+        nbf: 1_700_000_000,
+        aud: "containment-control-plane",
+      },
+    );
+    const before = decode<Account>(constrained);
+
+    const next = await addRevocation(constrained, operatorSeed, userPubkey, 1_800_000_000);
+    const after = decode<Account>(next);
+
+    expect(after.exp).toBe(before.exp);
+    expect(after.nbf).toBe(before.nbf);
+    expect(after.aud).toBe(before.aud);
+    expect(after.jti).not.toBe(before.jti);
+    expect(after.iss).toBe(before.iss);
+  });
+
   it("rejects a valid-but-foreign operator seed (wrong chain)", async () => {
     const { accountJwt, userPubkey } = await fixture();
     // Chain B: a distinct, valid trust chain whose operator seed passes the
@@ -88,6 +115,19 @@ describe("addRevocation (issue #7)", () => {
     const next = await addRevocation(accountJwt, operatorSeed, "*", 1500);
     const after = decode<Account>(next);
     expect(after.nats.revocations?.["*"]).toBe(1500);
+  });
+
+  it.each([
+    ["same user key", false],
+    ["wildcard", true],
+  ])("never lowers an existing revocation floor for %s", async (_label, wildcard) => {
+    const { accountJwt, operatorSeed, userPubkey } = await fixture();
+    const key = wildcard ? "*" : userPubkey;
+    const once = await addRevocation(accountJwt, operatorSeed, key, 2000);
+    const twice = await addRevocation(once, operatorSeed, key, 1000);
+    const after = decode<Account>(twice);
+
+    expect(after.nats.revocations?.[key]).toBe(2000);
   });
 
   describe("input validation", () => {

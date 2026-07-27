@@ -11,8 +11,10 @@
  * this helper is to regenerate the entire trust chain (an all-tenant outage).
  * {@link addRevocation} re-encodes the account JWT with an added revocation
  * entry, re-signed by the OPERATOR seed (the trust root that signs the account),
- * preserving every existing account field (limits, prior revocations, signing
- * keys, …). The returned JWT MUST replace the old account JWT in the nats-server
+ * preserving every existing account field (top-level validity constraints,
+ * limits, prior revocations, signing keys, …). Existing revocation floors are
+ * monotonic: asking for an older floor never lowers the accepted floor. The
+ * returned JWT MUST replace the old account JWT in the nats-server
  * resolver (`resolverConfig[accountPublicKey]`) for the revocation to take effect.
  *
  * Self-contained mode ONLY: an externally-managed account (Synadia Cloud / NGS)
@@ -80,7 +82,11 @@ export async function addRevocation(
   // Spread the decoded account body so limits, existing revocations, signing
   // keys, imports/exports, etc. survive — dropping the unlimited `limits` set at
   // setup would brick the account (default JWT caps connections at 0).
-  const revocations = { ...(nats.revocations ?? {}), [userPubkey]: at };
+  const existingFloor = nats.revocations?.[userPubkey];
+  const revocations = {
+    ...(nats.revocations ?? {}),
+    [userPubkey]: Math.max(existingFloor ?? at, at),
+  };
   const account: Partial<Account> = { ...nats, revocations };
 
   // Re-encode against the SAME account public key (`claim.sub`). A public-only
@@ -99,5 +105,13 @@ export async function addRevocation(
     );
   }
   const accountId = fromPublic(claim.sub);
-  return encodeAccount(claim.name, accountId, account, { signer: operatorKp });
+  return encodeAccount(claim.name, accountId, account, {
+    signer: operatorKp,
+    // encodeAccount intentionally regenerates jti/iat/iss, but these standard
+    // validity constraints belong to the account claim and must survive a
+    // revocation-only re-encode.
+    exp: claim.exp,
+    nbf: claim.nbf,
+    aud: claim.aud,
+  });
 }
