@@ -115,6 +115,8 @@ export type LegacyMigrationResult = Readonly<{
 }>;
 
 export type LegacyMigrationOptions = CredentialPathOptions & {
+  /** @internal Test-only seam before an exact source acquires its account mutex. */
+  _beforeExactAccountMutex?: () => void;
   /** @internal Test-only seam inside the account claim critical section. */
   _afterAccountMutex?: () => void;
   /** @internal Test-only seam after an exclusive claim and before source move. */
@@ -189,6 +191,9 @@ export function migrateLegacyTupleState(
       legacy,
       conversationKeyDestination: destination.conversationKeyPath,
       resumed: true,
+      ...(options._beforeExactAccountMutex
+        ? { beforeAccountMutex: options._beforeExactAccountMutex }
+        : {}),
       ...(options._afterAccountMutex
         ? { afterAccountMutex: options._afterAccountMutex }
         : {}),
@@ -220,6 +225,9 @@ export function migrateLegacyTupleState(
         conversationKeyDestination: destination.conversationKeyPath,
         resumed: false,
         exactCredential,
+        ...(options._beforeExactAccountMutex
+          ? { beforeAccountMutex: options._beforeExactAccountMutex }
+          : {}),
         ...(options._afterAccountMutex
           ? { afterAccountMutex: options._afterAccountMutex }
           : {}),
@@ -417,6 +425,7 @@ function migrateExactCredentialSource(input: {
     upgraded: ReturnType<typeof upgradeLegacyCredentialDocument>;
     source: ExactCredentialSource;
   };
+  beforeAccountMutex?: () => void;
   afterAccountMutex?: () => void;
   afterClaim?: () => void;
   afterSourceMove?: () => void;
@@ -570,6 +579,7 @@ function migrateExactCredentialSource(input: {
     }
   }
 
+  input.beforeAccountMutex?.();
   claimMigrationForAccount(
     input.backupRoot,
     input.scope.accountId,
@@ -577,6 +587,13 @@ function migrateExactCredentialSource(input: {
     input.scope,
     input.afterAccountMutex,
   );
+  if (legacySource && !legacySourceWasArchived) {
+    assertLegacySourceAtPath(
+      input.legacy.directory,
+      legacySource,
+      allowedLinkedLegacyCredential,
+    );
+  }
   const authorizedSource: ExactCredentialSource = exactJournal
     ? Object.freeze({
         bytes: exactCredential.source.bytes,
@@ -1189,8 +1206,12 @@ function inspectLegacySourceDirectory(
 function assertLegacySourceAtPath(
   directory: string,
   expected: LegacySourceIdentity,
+  allowedLinkedCredential?: FilesystemIdentity,
 ): void {
-  const current = inspectLegacySourceDirectory(directory);
+  const current = inspectLegacySourceDirectory(
+    directory,
+    allowedLinkedCredential,
+  );
   const same = (
     left: FilesystemIdentity | undefined,
     right: FilesystemIdentity | undefined,
