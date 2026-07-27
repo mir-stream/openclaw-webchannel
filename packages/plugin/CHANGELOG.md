@@ -4,6 +4,27 @@
 
 ### BREAKING
 
+- **Protocol v3 — register-hop wire break.** Ships lockstep with client/SaaS
+  `0.4.0`; `WEBCHANNEL_PROTOCOL_VERSION` is `3` and a mismatched request is
+  refused with a terminal `protocol_mismatch` (426) before PoP or key work.
+  - Authenticated register requests require a new `clientNonce` (base64url, ≥16
+    bytes of entropy), which is bound with the peer id into the
+    wrapped-conversation-key AAD. The wrapped key was authenticated but not
+    fresh, so a hostile relay could capture a register reply and re-serve it
+    verbatim; that is inert only while K never rotates. Validation runs **after**
+    the version check, so an outdated browser gets a terminal 426 instead of a
+    401 that its embedder would route into a re-login loop.
+  - `unregister` now requires the same single-use PoP proof as `register`
+    (issue #51), gated on `auth.requirePoP` identically. The bootstrap JWT
+    crosses the untrusted relay in plaintext, so a token-only teardown could be
+    captured and replayed until the JWT expired, dropping the victim's
+    subscription and session key each time with no signal to the victim. Every
+    failure remains a silent no-op with no reply.
+  - The PoP signed message is now `webchannel-pop:{op}:{peerId}:{nonce}`. Both
+    operations draw from the same per-peer nonce bucket, so without the op a
+    `register` proof also authorized a teardown — obtainable without any replay
+    by *suppressing* the register frame, which is indistinguishable from the
+    dropped frame the client retry loop absorbs.
 - Removed configurable `auth.jwt.audience`. The account-bound verifier always
   expects the runtime account id, and a raw removed key is rejected before any
   credential or relay I/O. Delete the key from shared and named account blocks.

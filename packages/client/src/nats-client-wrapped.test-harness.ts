@@ -86,8 +86,23 @@ export function makeAgentIdentity(): AgentIdentity {
 function rawToSpki(raw: Uint8Array): Buffer {
   return Buffer.concat([Buffer.from("302a300506032b656e032100","hex"),Buffer.from(raw)]);
 }
+/**
+ * The v3 wrap AAD, re-implemented by hand (no import from the modules under test)
+ * so this harness stays an independent agent mirror:
+ *   UTF-8("webchannel-wrap-v2") ‹0x1F› UTF-8(peerId) ‹0x1F› UTF-8(clientNonce)
+ */
+export function wrapAadLikeAgent(peerId: string, clientNonce: string): Buffer {
+  const US = Buffer.from([0x1f]);
+  return Buffer.concat([
+    Buffer.from("webchannel-wrap-v2", "utf8"), US,
+    Buffer.from(peerId, "utf8"), US,
+    Buffer.from(clientNonce, "utf8"),
+  ]);
+}
+
 export function wrapLikeAgent(
-  K: Uint8Array, devicePublicRaw: Uint8Array, identity: AgentIdentity, peerId = PEER,
+  K: Uint8Array, devicePublicRaw: Uint8Array, identity: AgentIdentity,
+  clientNonce: string, peerId = PEER,
 ): WrappedConversationKey {
   const shared = diffieHellman({
     privateKey: createPrivateKey(identity.privatePem),
@@ -96,7 +111,7 @@ export function wrapLikeAgent(
   const key = Buffer.from(hkdfSync("sha256",shared,Buffer.alloc(32),"webchannel-key-wrap-v1",32));
   const nonce=randomBytes(12);
   const cipher=createCipheriv("chacha20-poly1305",key,nonce,{authTagLength:16});
-  cipher.setAAD(Buffer.from(peerId),{plaintextLength:K.length});
+  cipher.setAAD(wrapAadLikeAgent(peerId, clientNonce),{plaintextLength:K.length});
   const ciphertext=Buffer.concat([cipher.update(Buffer.from(K)),cipher.final()]);
   const b64=(v:Uint8Array)=>Buffer.from(v).toString("base64url");
   return {ephemeralPublicKey:b64(identity.publicRaw),nonce:b64(nonce),ciphertext:b64(ciphertext),tag:b64(cipher.getAuthTag())};
@@ -116,7 +131,7 @@ export function registerAgent(
   const subject = registerSubject(TENANT,AGENT,PEER);
   return async (s,p,server,replyTo) => {
     if (s !== subject || !replyTo) return;
-    const body=JSON.parse(p) as {op?:string};
+    const body=JSON.parse(p) as {op?:string; clientNonce?:unknown};
     if (body.op === "challenge") { server.deliverToClient(replyTo,JSON.stringify({nonce:"nonce-abc"})); return; }
     if (body.op !== "register") return;
     if (options.rejectCode) {
@@ -140,7 +155,10 @@ export function registerAgent(
     }
     await options.beforeReply?.();
     const reply:Record<string,unknown>={peerId:PEER,registered:true};
-    if (!options.omitWrappedKey) reply.wrappedConversationKey=wrapLikeAgent(K,devicePublicRaw,identity);
+    // v3: wrap against the anchor THIS request carried, exactly like the real
+    // agent. The reply never echoes it back.
+    const clientNonce = typeof body.clientNonce === "string" ? body.clientNonce : "";
+    if (!options.omitWrappedKey) reply.wrappedConversationKey=wrapLikeAgent(K,devicePublicRaw,identity,clientNonce);
     if (!options.omitProtocolVersion) {
       reply.protocolVersion=options.versions?.protocolVersion ?? WEBCHANNEL_PROTOCOL_VERSION;
     }

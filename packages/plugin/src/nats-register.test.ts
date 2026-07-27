@@ -40,6 +40,12 @@ import { formatCapacityReject } from "./capacity-status.js";
 
 const PEER = "user-42";
 const TENANT = "tenant-1";
+/**
+ * A well-formed v3 browser freshness anchor (base64url, ≥22 chars). The harness
+ * injects it into every `register` payload that does not carry its own, exactly
+ * like it injects `protocolVersion`, so pre-v3 test bodies stay readable.
+ */
+const CLIENT_NONCE = "Y2xpZW50LW5vbmNlLWZpeHR1cmUtMDE";
 const FAKE_WRAPPED: WrappedConversationKey = {
   ephemeralPublicKey: "ephemeral",
   nonce: "nonce",
@@ -118,14 +124,18 @@ type Harness = {
   unregistered: string[];
   snapshots: string[];
   approvalSnapshots: string[];
-  wrapCalls: Array<{ peerId: string; key: Uint8Array }>;
+  wrapCalls: Array<{ peerId: string; key: Uint8Array; clientNonce: string }>;
   run: (payload: unknown) => Promise<void>;
 };
 
 function makeHarness(opts?: {
   identity?: JwtIdentity | null;
   subjectPeerId?: string;
-  wrap?: (peerId: string, key: Uint8Array) => WrappedConversationKey | null;
+  wrap?: (
+    peerId: string,
+    key: Uint8Array,
+    clientNonce: string,
+  ) => WrappedConversationKey | null;
   requirePoP?: boolean;
   verifyIdentity?: RegisterHandlerDeps["verifyIdentity"];
   registerPeer?: (peerId: string) => void;
@@ -137,7 +147,7 @@ function makeHarness(opts?: {
   const unregistered: string[] = [];
   const snapshots: string[] = [];
   const approvalSnapshots: string[] = [];
-  const wrapCalls: Array<{ peerId: string; key: Uint8Array }> = [];
+  const wrapCalls: Array<{ peerId: string; key: Uint8Array; clientNonce: string }> = [];
   const rawIdentity =
     opts && "identity" in opts
       ? opts.identity
@@ -155,8 +165,8 @@ function makeHarness(opts?: {
     registerPeer: opts?.registerPeer ?? ((pid) => registered.push(pid)),
     wrapConversationKeyForDevice:
       opts?.wrap ??
-      ((pid, key) => {
-        wrapCalls.push({ peerId: pid, key });
+      ((pid, key, clientNonce) => {
+        wrapCalls.push({ peerId: pid, key, clientNonce });
         return FAKE_WRAPPED;
       }),
     unregisterPeer: (pid) => unregistered.push(pid),
@@ -168,10 +178,15 @@ function makeHarness(opts?: {
 
   const run = async (payload: unknown): Promise<void> => {
     const body = payload as Record<string, unknown>;
+    const defaults: Record<string, unknown> = {};
+    if (body.op === "register") {
+      if (!("protocolVersion" in body)) defaults.protocolVersion = WEBCHANNEL_PROTOCOL_VERSION;
+      // v3: the freshness anchor is mandatory on every register. Injected here so
+      // a test body only has to spell it out when the anchor itself is under test.
+      if (!("clientNonce" in body)) defaults.clientNonce = CLIENT_NONCE;
+    }
     deps.payload = JSON.stringify(
-      body.op === "register" && !("protocolVersion" in body)
-        ? { ...body, protocolVersion: WEBCHANNEL_PROTOCOL_VERSION }
-        : body,
+      Object.keys(defaults).length > 0 ? { ...defaults, ...body } : body,
     );
     await handleRegisterRequest(deps);
   };
@@ -186,7 +201,7 @@ async function runProvenRegister(h: Harness, device: ReturnType<typeof makeDevic
     op: "register",
     token: "jwt",
     nonce,
-    signature: device.sign(popSignedMessage(PEER, nonce)),
+    signature: device.sign(popSignedMessage("register", PEER, nonce)),
   });
 }
 
@@ -200,6 +215,94 @@ describe("handleRegisterRequest (register over NATS)", () => {
     await h.run({ op: "register", token: "jwt", protocolVersion });
     expect(JSON.parse(h.replies[0])).toEqual({
       error: "protocol_mismatch", code: 426, protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
+    });
+    expect(h.registered).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // v3 — the browser-chosen clientNonce freshness anchor
+  // -------------------------------------------------------------------------
+
+  it.each([
+    ["absent", undefined],
+    ["empty", ""],
+    ["too short (<16 bytes of entropy)", "c2hvcnQ"],
+    ["non-base64url (contains a NATS subject separator)", "Y2xpZW50bm9uY2U.Zml4dHVyZQ"],
+    ["padded base64", "Y2xpZW50LW5vbmNlLWZpeHR1cmUtMDE="],
+    ["contains the 0x1F AAD delimiter", `Y2xpZW50LW5vbmNl${String.fromCharCode(0x1f)}Zml4dHVyZQ`],
+    ["over-long", "A".repeat(129)],
+    ["wrong type", 12345],
+  ])("rejects a register whose clientNonce is %s", async (_label, clientNonce) => {
+    const device = makeDevice();
+    const h = makeHarness({
+      identity: {
+        peerId: PEER,
+        popPublicJwk: device.popPublicJwk,
+        devicePublicKey: randomBytes(32).toString("base64url"),
+      } as JwtIdentity,
+    });
+    await h.run({ op: "challenge", token: "jwt" });
+    const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
+    await h.run({
+      op: "register",
+      token: "jwt",
+      nonce,
+      signature: device.sign(popSignedMessage("register", PEER, nonce)),
+      clientNonce,
+    });
+    expect(h.replies[1]).toBe(REGISTER_UNAUTHORIZED);
+    expect(h.registered).toEqual([]);
+    expect(h.wrapCalls).toEqual([]);
+    expect(h.approvalSnapshots).toEqual([]);
+  });
+
+  it("passes the request's clientNonce straight through to the wrap (AAD freshness anchor)", async () => {
+    const device = makeDevice();
+    const h = makeHarness({
+      identity: {
+        peerId: PEER,
+        popPublicJwk: device.popPublicJwk,
+        devicePublicKey: randomBytes(32).toString("base64url"),
+      } as JwtIdentity,
+    });
+    const mine = "TXktb3duLWFuY2hvci12YWx1ZS0wMDE";
+    await h.run({ op: "challenge", token: "jwt" });
+    const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
+    await h.run({
+      op: "register",
+      token: "jwt",
+      nonce,
+      signature: device.sign(popSignedMessage("register", PEER, nonce)),
+      clientNonce: mine,
+    });
+    expect(h.wrapCalls).toHaveLength(1);
+    expect(h.wrapCalls[0].clientNonce).toBe(mine);
+    // The anchor must NOT be echoed: the browser compares against its own copy,
+    // and an echo would let a relay choose the anchor.
+    expect(JSON.parse(h.replies[1])).not.toHaveProperty("clientNonce");
+  });
+
+  it("ORDERING: a v2-shaped register (no clientNonce, old version) gets 426, never 401", async () => {
+    // A deployed v2 browser sends neither field. If the clientNonce check ran
+    // FIRST it would answer 401 → PopRejectedError → cause "auth-rejected" →
+    // the embedder's re-login flow mints fresh credentials and fails identically:
+    // an infinite re-login loop. Behind the version check it gets a terminal 426.
+    const h = makeHarness();
+    await h.run({
+      op: "register",
+      token: "jwt",
+      protocolVersion: WEBCHANNEL_PROTOCOL_VERSION - 1,
+      // An EXPLICIT undefined: the key is present so the harness does not inject
+      // its default, and JSON.stringify drops it — so the payload that reaches
+      // the handler genuinely has no clientNonce, exactly like a v2 client's.
+      clientNonce: undefined,
+    });
+    expect(h.replies).toHaveLength(1);
+    expect(h.replies[0]).not.toBe(REGISTER_UNAUTHORIZED);
+    expect(JSON.parse(h.replies[0])).toEqual({
+      error: "protocol_mismatch",
+      code: 426,
+      protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
     });
     expect(h.registered).toEqual([]);
   });
@@ -218,7 +321,7 @@ describe("handleRegisterRequest (register over NATS)", () => {
     const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
     expect(typeof nonce).toBe("string");
 
-    const signature = device.sign(popSignedMessage(PEER, nonce));
+    const signature = device.sign(popSignedMessage("register", PEER, nonce));
     await h.run({ op: "register", token: "jwt", nonce, signature });
 
     expect(h.registered).toEqual([PEER]);
@@ -259,7 +362,7 @@ describe("handleRegisterRequest (register over NATS)", () => {
 
     await h.run({ op: "challenge", token: "jwt" });
     const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
-    const signature = device.sign(popSignedMessage(PEER, nonce));
+    const signature = device.sign(popSignedMessage("register", PEER, nonce));
 
     await h.run({ op: "register", token: "jwt", nonce, signature });
     expect(JSON.parse(h.replies[1]).registered).toBe(true);
@@ -339,7 +442,7 @@ describe("handleRegisterRequest (register over NATS)", () => {
     });
     await h.run({ op: "challenge", token: "jwt" });
     const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
-    const signature = device.sign(popSignedMessage(PEER, nonce));
+    const signature = device.sign(popSignedMessage("register", PEER, nonce));
     await h.run({ op: "register", token: "jwt", nonce, signature });
     expect(h.replies[1]).toBe(REGISTER_FAILED);
     // #15: a register that FAILS before the success block must NOT emit the
@@ -356,16 +459,191 @@ describe("handleRegisterRequest (register over NATS)", () => {
   });
 
   it("unregister with the harness' matching signed tenant tears down the verified peer, no reply", async () => {
-    const h = makeHarness();
+    // requirePoP:false = the operator opt-out, where unregister stays token-only
+    // exactly as before #51. The PoP-required path is covered separately below.
+    const h = makeHarness({ requirePoP: false });
     await h.run({ op: "unregister", token: "jwt" });
     expect(h.unregistered).toEqual([PEER]);
     expect(h.replies).toEqual([]); // fire-and-forget
   });
 
   it("unregister with a matching signed tenant tears down the verified peer, no reply", async () => {
-    const h = makeHarness({ identity: { peerId: PEER, tenant: TENANT } as JwtIdentity });
+    const h = makeHarness({
+      identity: { peerId: PEER, tenant: TENANT } as JwtIdentity,
+      requirePoP: false,
+    });
     await h.run({ op: "unregister", token: "jwt" });
     expect(h.unregistered).toEqual([PEER]);
+    expect(h.replies).toEqual([]);
+  });
+
+  // -------------------------------------------------------------------------
+  // #51 — unregister requires proof-of-possession
+  // -------------------------------------------------------------------------
+
+  it("#51: unregister with a valid PoP proof tears down the verified peer, no reply", async () => {
+    const device = makeDevice();
+    const h = makeHarness({
+      identity: { peerId: PEER, popPublicJwk: device.popPublicJwk } as JwtIdentity,
+    });
+    await h.run({ op: "challenge", token: "jwt" });
+    const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
+    await h.run({
+      op: "unregister",
+      token: "jwt",
+      nonce,
+      signature: device.sign(popSignedMessage("unregister", PEER, nonce)),
+    });
+    expect(h.unregistered).toEqual([PEER]);
+    // Still fire-and-forget: the challenge reply is the ONLY reply on the wire.
+    expect(h.replies).toHaveLength(1);
+  });
+
+  it("#51: unregister WITHOUT a PoP proof is a silent no-op (the pre-#51 replayable frame)", async () => {
+    const device = makeDevice();
+    const h = makeHarness({
+      identity: { peerId: PEER, popPublicJwk: device.popPublicJwk } as JwtIdentity,
+    });
+    // The exact frame a relay could capture off the plaintext register subject.
+    await h.run({ op: "unregister", token: "jwt" });
+    expect(h.unregistered).toEqual([]);
+    expect(h.replies).toEqual([]);
+  });
+
+  it("#51: a REPLAYED unregister is a silent no-op (the nonce is single-use)", async () => {
+    const device = makeDevice();
+    const h = makeHarness({
+      identity: { peerId: PEER, popPublicJwk: device.popPublicJwk } as JwtIdentity,
+    });
+    await h.run({ op: "challenge", token: "jwt" });
+    const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
+    const frame = {
+      op: "unregister",
+      token: "jwt",
+      nonce,
+      signature: device.sign(popSignedMessage("unregister", PEER, nonce)),
+    };
+    await h.run(frame);
+    expect(h.unregistered).toEqual([PEER]);
+
+    // A relay re-sending the captured frame verbatim: the nonce was consumed, so
+    // the second teardown never runs — and it is still silent (no oracle).
+    await h.run(frame);
+    expect(h.unregistered).toEqual([PEER]);
+    expect(h.replies).toHaveLength(1);
+  });
+
+  it("#51: unregister with a WRONG signature (or another peer's proof) is a silent no-op", async () => {
+    const device = makeDevice();
+    const attacker = makeDevice();
+    const h = makeHarness({
+      identity: { peerId: PEER, popPublicJwk: device.popPublicJwk } as JwtIdentity,
+    });
+    await h.run({ op: "challenge", token: "jwt" });
+    const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
+    await h.run({
+      op: "unregister",
+      token: "jwt",
+      nonce,
+      signature: attacker.sign(popSignedMessage("unregister", PEER, nonce)),
+    });
+    expect(h.unregistered).toEqual([]);
+    expect(h.replies).toHaveLength(1);
+  });
+
+  // ---- op-confusion: the proof is bound to the operation it authorizes -------
+
+  it("OP BINDING: a register-minted proof is REJECTED as an unregister proof", async () => {
+    // The suppress-and-relabel attack. The relay forwards `challenge` (it wants
+    // the proof to exist), then SUPPRESSES the browser's register frame — which
+    // the agent cannot distinguish from the lost frame the client's retry loop
+    // exists to absorb, so the nonce is never consumed. The relay then re-sends
+    // the IDENTICAL {token, nonce, signature} triple relabelled as a teardown.
+    // No replay is involved, so single-use nonces do not help; only the op inside
+    // the signed message does.
+    const device = makeDevice();
+    const h = makeHarness({
+      identity: { peerId: PEER, popPublicJwk: device.popPublicJwk } as JwtIdentity,
+    });
+    await h.run({ op: "challenge", token: "jwt" });
+    const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
+
+    // Exactly what the browser would have put on the wire for `register`.
+    const registerProof = device.sign(popSignedMessage("register", PEER, nonce));
+    await h.run({ op: "unregister", token: "jwt", nonce, signature: registerProof });
+
+    expect(h.unregistered).toEqual([]);
+    expect(h.replies).toHaveLength(1); // still silent — no oracle
+  });
+
+  it("OP BINDING: an unregister-minted proof is REJECTED as a register proof", async () => {
+    // The mirror direction: a captured teardown proof must not admit a peer.
+    const device = makeDevice();
+    const h = makeHarness({
+      identity: {
+        peerId: PEER,
+        popPublicJwk: device.popPublicJwk,
+        devicePublicKey: randomBytes(32).toString("base64url"),
+      } as JwtIdentity,
+    });
+    await h.run({ op: "challenge", token: "jwt" });
+    const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
+
+    await h.run({
+      op: "register",
+      token: "jwt",
+      nonce,
+      signature: device.sign(popSignedMessage("unregister", PEER, nonce)),
+    });
+    expect(h.replies[1]).toBe(REGISTER_UNAUTHORIZED);
+    expect(h.registered).toEqual([]);
+    expect(h.wrapCalls).toEqual([]);
+  });
+
+  it("#51: unregister with an unsafe (subject-token-invalid) peerId is a silent no-op", async () => {
+    // The unregister branch returns before register's `assertValidSubjectToken`,
+    // so it needs its own — otherwise a loose/compromised issuer could put a
+    // `.`/`*`/`>`/`:` in `sub` and reach `popChallenges.verify` with it.
+    //
+    // The peerId must be the ONLY failing condition, or this proves nothing.
+    // `challenge` also rejects an unsafe peerId (register's shared prologue), so
+    // the nonce is issued DIRECTLY into the store here: that gives the frame a
+    // live, correctly-signed, un-consumed proof. Without the check under test the
+    // teardown runs — which is exactly what the sibling assertion below pins.
+    const BAD = "bad:peer";
+    const device = makeDevice();
+    const h = makeHarness({
+      subjectPeerId: BAD,
+      identity: { peerId: BAD, popPublicJwk: device.popPublicJwk } as JwtIdentity,
+    });
+    const liveNonce = h.deps.popChallenges.issue(BAD);
+    await h.run({
+      op: "unregister",
+      token: "jwt",
+      nonce: liveNonce,
+      signature: device.sign(popSignedMessage("unregister", BAD, liveNonce)),
+    });
+    expect(h.unregistered).toEqual([]);
+    expect(h.replies).toEqual([]);
+    // Control: the SAME frame shape with a safe peerId does tear down, proving
+    // the rejection above is attributable to the peerId and nothing else.
+    const ok = makeHarness({
+      identity: { peerId: PEER, popPublicJwk: device.popPublicJwk } as JwtIdentity,
+    });
+    const okNonce = ok.deps.popChallenges.issue(PEER);
+    await ok.run({
+      op: "unregister",
+      token: "jwt",
+      nonce: okNonce,
+      signature: device.sign(popSignedMessage("unregister", PEER, okNonce)),
+    });
+    expect(ok.unregistered).toEqual([PEER]);
+  });
+
+  it("#51: unregister is refused when PoP is required but the JWT carries no pop_jwk", async () => {
+    const h = makeHarness(); // requirePoP defaults true; harness identity has no pop_jwk
+    await h.run({ op: "unregister", token: "jwt" });
+    expect(h.unregistered).toEqual([]);
     expect(h.replies).toEqual([]);
   });
 
@@ -381,9 +659,13 @@ describe("handleRegisterRequest (register over NATS)", () => {
     expect(h.unregistered).toEqual([]);
   });
 
+  // These four isolate a NON-PoP rejection cause, so they run with
+  // requirePoP:false — otherwise the #51 gate would reject them first and the
+  // assertion would pass for the wrong reason.
   it("unregister with a matching peerId but mismatched signed tenant is a silent no-op", async () => {
     const h = makeHarness({
       identity: { peerId: PEER, tenant: "other-tenant" } as JwtIdentity,
+      requirePoP: false,
     });
     await h.run({ op: "unregister", token: "jwt" });
     expect(h.unregistered).toEqual([]);
@@ -391,14 +673,14 @@ describe("handleRegisterRequest (register over NATS)", () => {
   });
 
   it("unregister WITHOUT a token is a silent no-op (does not tear down)", async () => {
-    const h = makeHarness();
+    const h = makeHarness({ requirePoP: false });
     await h.run({ op: "unregister" }); // no token
     expect(h.unregistered).toEqual([]);
     expect(h.replies).toEqual([]);
   });
 
   it("unregister with a FAILING JWT is a silent no-op", async () => {
-    const h = makeHarness({ verifyIdentity: async () => null });
+    const h = makeHarness({ verifyIdentity: async () => null, requirePoP: false });
     await h.run({ op: "unregister", token: "bad-jwt" });
     expect(h.unregistered).toEqual([]);
     expect(h.replies).toEqual([]);
@@ -407,7 +689,7 @@ describe("handleRegisterRequest (register over NATS)", () => {
   it("unregister with subject peerId ≠ JWT peerId is a silent no-op", async () => {
     // Verified identity is PEER, but the subject targets someone else — do NOT
     // tear down the subject's peer on a mismatched token.
-    const h = makeHarness({ subjectPeerId: "someone-else" });
+    const h = makeHarness({ subjectPeerId: "someone-else", requirePoP: false });
     await h.run({ op: "unregister", token: "jwt" });
     expect(h.unregistered).toEqual([]);
     expect(h.replies).toEqual([]);
@@ -428,7 +710,7 @@ describe("handleRegisterRequest (register over NATS)", () => {
     });
     await h.run({ op: "challenge", token: "jwt" });
     const { nonce } = JSON.parse(h.replies[0]) as { nonce: string };
-    const signature = device.sign(popSignedMessage(PEER, nonce));
+    const signature = device.sign(popSignedMessage("register", PEER, nonce));
     // Must reply REGISTER_FAILED (not throw / unhandledRejection).
     await expect(h.run({ op: "register", token: "jwt", nonce, signature })).resolves.toBeUndefined();
     expect(h.replies[1]).toBe(REGISTER_FAILED);
@@ -770,7 +1052,7 @@ describe("handleRegisterRequest with a real account-bound RSA/JWKS verifier", ()
       op: "register",
       token: popToken,
       nonce,
-      signature: device.sign(popSignedMessage(PEER, nonce)),
+      signature: device.sign(popSignedMessage("register", PEER, nonce)),
     });
     expect(JSON.parse(required.replies[1])).toMatchObject({ registered: true, peerId: PEER });
     expect(required.registered).toEqual([PEER]);
@@ -862,9 +1144,13 @@ describe("handleRegisterRequest with a real account-bound RSA/JWKS verifier", ()
   });
 
   it("keeps unregister token-only/no-reply while applying the same real common gate", async () => {
+    // requirePoP:false throughout: this test pins the COMMON identity gate
+    // (aud/tenant/subject/verify), which runs ahead of the #51 PoP gate. With PoP
+    // required, every case here would reject at the PoP step instead and the
+    // assertions would no longer prove anything about the identity gate.
     const verifyA = await realVerifier(ACCOUNT_A);
     const valid = await signRealToken({ aud: ACCOUNT_A, tenant: TENANT, sub: PEER });
-    const accepted = makeHarness({ verifyIdentity: verifyA });
+    const accepted = makeHarness({ verifyIdentity: verifyA, requirePoP: false });
     await accepted.run({ op: "unregister", token: valid });
     expect(accepted.unregistered).toEqual([PEER]);
     expect(accepted.replies).toEqual([]);
@@ -874,12 +1160,16 @@ describe("handleRegisterRequest with a real account-bound RSA/JWKS verifier", ()
       await signRealToken({ aud: ACCOUNT_A, sub: PEER }),
       await signRealToken({ aud: ACCOUNT_A, tenant: "other-tenant", sub: PEER }),
     ]) {
-      const rejected = makeHarness({ verifyIdentity: verifyA });
+      const rejected = makeHarness({ verifyIdentity: verifyA, requirePoP: false });
       await rejected.run({ op: "unregister", token });
       expect(rejected.unregistered).toEqual([]);
       expect(rejected.replies).toEqual([]);
     }
-    const wrongSubject = makeHarness({ verifyIdentity: verifyA, subjectPeerId: "other-peer" });
+    const wrongSubject = makeHarness({
+      verifyIdentity: verifyA,
+      subjectPeerId: "other-peer",
+      requirePoP: false,
+    });
     await wrongSubject.run({ op: "unregister", token: valid });
     expect(wrongSubject.unregistered).toEqual([]);
     expect(wrongSubject.replies).toEqual([]);
@@ -888,7 +1178,7 @@ describe("handleRegisterRequest with a real account-bound RSA/JWKS verifier", ()
       async () => null,
       async () => { throw new TransientVerifyError("JWKS unavailable"); },
     ]) {
-      const rejected = makeHarness({ verifyIdentity });
+      const rejected = makeHarness({ verifyIdentity, requirePoP: false });
       await rejected.run({ op: "unregister", token: valid });
       expect(rejected.unregistered).toEqual([]);
       expect(rejected.replies).toEqual([]);
@@ -911,7 +1201,10 @@ describe("handleRegisterRequest with a real account-bound RSA/JWKS verifier", ()
       expect(h.replies).toEqual([REGISTER_UNAVAILABLE]);
       expect(h.registered).toEqual([]);
     }
-    const unavailableUnregister = makeHarness({ verifyIdentity: unavailable });
+    const unavailableUnregister = makeHarness({
+      verifyIdentity: unavailable,
+      requirePoP: false,
+    });
     await unavailableUnregister.run({ op: "unregister", token });
     expect(unavailableUnregister.replies).toEqual([]);
     expect(unavailableUnregister.unregistered).toEqual([]);
@@ -923,7 +1216,7 @@ describe("handleRegisterRequest with a real account-bound RSA/JWKS verifier", ()
       expect(h.replies).toEqual([REGISTER_UNAUTHORIZED]);
       expect(h.registered).toEqual([]);
     }
-    const ordinaryUnregister = makeHarness({ verifyIdentity: ordinary });
+    const ordinaryUnregister = makeHarness({ verifyIdentity: ordinary, requirePoP: false });
     await ordinaryUnregister.run({ op: "unregister", token: "ordinary-bad-token" });
     expect(ordinaryUnregister.replies).toEqual([]);
     expect(ordinaryUnregister.unregistered).toEqual([]);
@@ -953,10 +1246,10 @@ describe("handleRegisterRequest with a real account-bound RSA/JWKS verifier", ()
       const h = makeHarness({
         verifyIdentity: await realVerifier(accountId),
         requirePoP: false,
-        wrap: (_peerId, devicePublicKey) => wrapConversationKey(
+        wrap: (_peerId, devicePublicKey, clientNonce) => wrapConversationKey(
           conversationKey,
           devicePublicKey,
-          { agentIdentityKeyPair: agentIdentity, peerId: PEER },
+          { agentIdentityKeyPair: agentIdentity, peerId: PEER, clientNonce },
         ),
       });
       await h.run({ op: "register", token });
@@ -970,14 +1263,17 @@ describe("handleRegisterRequest with a real account-bound RSA/JWKS verifier", ()
     expect(unwrapConversationKey(wrappedA, device.privateKey, {
       agentPublicKey: agentA.publicKey,
       peerId: PEER,
+      clientNonce: CLIENT_NONCE,
     })).toEqual(new Uint8Array(keyA));
     expect(unwrapConversationKey(wrappedB, device.privateKey, {
       agentPublicKey: agentB.publicKey,
       peerId: PEER,
+      clientNonce: CLIENT_NONCE,
     })).toEqual(new Uint8Array(keyB));
     expect(() => unwrapConversationKey(wrappedB, device.privateKey, {
       agentPublicKey: agentA.publicKey,
       peerId: PEER,
+      clientNonce: CLIENT_NONCE,
     })).toThrow();
 
     const nonMember = await signRealToken({ aud: "account-c", tenant: TENANT, sub: PEER, cnf });

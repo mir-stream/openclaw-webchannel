@@ -20,7 +20,7 @@ import {
   NatsClient,
   WebChannelNatsClient,
 } from "../../packages/client/src/nats-client.js";
-import { signPop } from "../../packages/client/src/pop-register.js";
+import { signPop, generateClientNonce } from "../../packages/client/src/pop-register.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "../../packages/client/src/protocol.js";
 
 const NATS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18222";
@@ -217,13 +217,22 @@ if (MODE === "foreign-register") {
   if (typeof liveChallenge.nonce !== "string" || liveChallenge.nonce.length === 0) {
     throw new Error(`target challenge did not return a nonce: ${JSON.stringify(liveChallenge)}`);
   }
-  const signature = await signPop(ed25519.privateKey, PEER_ID, liveChallenge.nonce);
+  // v3: the proof is bound to the OP it authorizes, so a `register` proof cannot
+  // be relabelled as a teardown (packages/plugin/src/pop-signed-message.ts).
+  const signature = await signPop(ed25519.privateKey, "register", PEER_ID, liveChallenge.nonce);
   const registerReply = await request({
     op: "register",
     token: bootstrap.jwt,
     nonce: liveChallenge.nonce,
     signature,
     protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
+    // v3 mandatory freshness anchor. It must be WELL-FORMED here or this
+    // assertion silently changes meaning: a malformed/absent anchor is its own
+    // 401, and the thesis above is that `aud` is the UNIQUE failing condition.
+    // (The anchor check happens after the audience check, so a missing one would
+    // not actually mask THIS rejection — but it would make the reply's cause
+    // ambiguous to a reader, and it breaks the positive register below.)
+    clientNonce: generateClientNonce(),
   });
   expectOpaque401(registerReply, "foreign register");
   await new Promise((resolve) => setTimeout(resolve, 300));
@@ -240,6 +249,10 @@ if (MODE === "foreign-register") {
     nonce: liveChallenge.nonce,
     signature,
     protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
+    // A FRESH anchor: this is a separate register attempt, and the wrap it
+    // receives is bound to this value. Reusing the one above would be exactly
+    // the staleness v3 exists to reject.
+    clientNonce: generateClientNonce(),
   });
   if (
     nonceReuseReply.registered !== true ||

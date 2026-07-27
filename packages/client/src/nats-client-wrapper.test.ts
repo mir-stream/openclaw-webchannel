@@ -1143,16 +1143,32 @@ function makeAgentIdentity(): { privatePem: string; publicRaw: Uint8Array; publi
 }
 
 /**
+ * The v3 wrap AAD, re-implemented by hand (no import from the module under test)
+ * so this file stays an independent agent mirror:
+ *   UTF-8("webchannel-wrap-v2") ‹0x1F› UTF-8(peerId) ‹0x1F› UTF-8(clientNonce)
+ */
+function wrapAadLikeAgent(peerId: string, clientNonce: string): Buffer {
+  const US = Buffer.from([0x1f]);
+  return Buffer.concat([
+    Buffer.from("webchannel-wrap-v2", "utf8"), US,
+    Buffer.from(peerId, "utf8"), US,
+    Buffer.from(clientNonce, "utf8"),
+  ]);
+}
+
+/**
  * Wrap K the AGENT's way (F2 static-static): ECDH(agentIdentity.private,
  * device.public) → HKDF "webchannel-key-wrap-v1" → chacha20-poly1305 sealing K
- * with AAD = UTF-8(peerId). Mirrors packages/plugin/src/late-join-decryptor.ts,
- * independent of the browser unwrap under test.
+ * with AAD = wrapAadLikeAgent(peerId, clientNonce). Mirrors
+ * packages/plugin/src/late-join-decryptor.ts, independent of the browser unwrap
+ * under test.
  */
 function wrapLikeAgent(
   conversationKey: Uint8Array,
   devicePublicKeyRaw: Uint8Array,
   agentIdentity: { privatePem: string; publicRaw: Uint8Array },
   peerId: string,
+  clientNonce: string,
 ): WrappedConversationKey {
   const devicePub = createPublicKey({
     key: x25519RawToSpki(devicePublicKeyRaw),
@@ -1168,7 +1184,9 @@ function wrapLikeAgent(
   );
   const nonce = randomBytes(12);
   const cipher = createCipheriv("chacha20-poly1305", wrapKey, nonce, { authTagLength: 16 });
-  cipher.setAAD(Buffer.from(peerId, "utf8"), { plaintextLength: conversationKey.length });
+  cipher.setAAD(wrapAadLikeAgent(peerId, clientNonce), {
+    plaintextLength: conversationKey.length,
+  });
   const ciphertext = Buffer.concat([cipher.update(Buffer.from(conversationKey)), cipher.final()]);
   const tag = cipher.getAuthTag();
   const b64 = (b: Buffer | Uint8Array) => Buffer.from(b).toString("base64url");
@@ -1268,25 +1286,28 @@ function makeRegisterHandler(
   tenant: string,
   accountId: string,
   peerId: string,
-  wrapped: () => WrappedConversationKey,
+  wrapped: (clientNonce: string) => WrappedConversationKey,
   gate?: Promise<void>,
 ): RegHandler {
   const reg = registerSubject(tenant, accountId, peerId);
   return async (subject, payload, server, replyTo) => {
     if (subject !== reg || !replyTo) return;
-    const body = JSON.parse(payload) as { op?: string };
+    const body = JSON.parse(payload) as { op?: string; clientNonce?: unknown };
     if (body.op === "challenge") {
       server.deliverToClient(replyTo, JSON.stringify({ nonce: "nonce-abc" }));
       return;
     }
     if (body.op === "register") {
       if (gate) await gate;
+      // v3: wrap against the anchor THIS register carried (never echoed back).
       server.deliverToClient(
         replyTo,
         JSON.stringify({
           peerId,
           registered: true,
-          wrappedConversationKey: wrapped(),
+          wrappedConversationKey: wrapped(
+            typeof body.clientNonce === "string" ? body.clientNonce : "",
+          ),
           protocolVersion: WEBCHANNEL_PROTOCOL_VERSION,
         }),
       );
@@ -1590,7 +1611,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     w.connect();
     lastWs().handler = makeRegisterHandler(
       "t", "a", "p",
-      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "p"),
+      (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "p", cn),
       gate,
     );
     await waitFor(() => w.getState().connected);
@@ -1615,7 +1636,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     w.connect();
     lastWs().handler = makeRegisterHandler(
       "t", "a", "p",
-      () => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "p"),
+      (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "p", cn),
     );
     await establishKey(w); // session 1
 

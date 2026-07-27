@@ -122,8 +122,22 @@ Protocol v2 adds explicit retained-work overload rejection. A rejected send
 becomes `failed { reason: "overloaded", retryable: true }`; retry is a deliberate
 caller/user action and creates a new id. Before either ACK or rejection arrives,
 the client reliability layer replays the same id live with capped exponential
-backoff, as well as immediately on reconnect. Client and plugin v2 must be
-upgraded together.
+backoff, as well as immediately on reconnect. Client and plugin must be upgraded
+together — the wire protocol is now **v3**.
+
+### BREAKING: protocol v3 register hop
+
+Three mandatory changes, all breaking:
+
+- the register request carries a required `clientNonce`, generated fresh per
+  register attempt and bound into the wrapped-conversation-key AAD (register-reply
+  replay defence);
+- `unregister` requires proof of possession — use `unregisterWithPop()`, since a
+  token-only teardown against a v3 agent is a **silent no-op**;
+- `popSignedMessage` and `signPop` both gained a leading `op` argument; the signed
+  message is `webchannel-pop:{op}:{peerId}:{nonce}`.
+
+See [`../../docs/AUTH.md`](../../docs/AUTH.md) for the reasoning.
 
 ### BREAKING: `ChatMessage.delivered` removed
 
@@ -131,7 +145,7 @@ The boolean `delivered` is gone. Migration: `delivered === true` ↔
 `sendState === "accepted" || sendState === "completed"`; render a failure from
 `sendState === "failed"` + `sendFailure`. `@mir-stream/webchannel-client` and
 `@mir-stream/webchannel-plugin` ship in lockstep — upgrade both together (the
-protocol v2 registration is mandatory in both directions).
+protocol v3 registration is mandatory in both directions).
 
 See [`../../docs/STATUS.md`](../../docs/STATUS.md) for current deployment status
 and [`../../docs/TRUST_AND_ONBOARDING.md`](../../docs/TRUST_AND_ONBOARDING.md) for

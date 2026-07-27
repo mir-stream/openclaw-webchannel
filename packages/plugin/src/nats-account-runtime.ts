@@ -1267,8 +1267,8 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             requirePoP: accountAuth.requirePoP,
             popChallenges: accountPopChallenges,
             registerPeer: (pid) => registerChannel.registerPeer(pid),
-            wrapConversationKeyForDevice: (pid, key) =>
-              registerChannel.wrapConversationKeyForDevice(pid, key),
+            wrapConversationKeyForDevice: (pid, key, clientNonce) =>
+              registerChannel.wrapConversationKeyForDevice(pid, key, clientNonce),
             unregisterPeer: (pid) => registerChannel.unregisterPeer(pid),
             sendHistorySnapshot: (pid) =>
               sendHistorySnapshot(accountId, channel, historyConfig, pid),

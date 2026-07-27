@@ -9,10 +9,15 @@
  *
  * There is no shared package between the client and the plugin, so the plugin
  * declares its OWN equal constant (see packages/plugin/src/protocol.ts). The
- * handshake itself catches any drift between the two. Protocol v2 is mandatory
- * in both directions; neither side accepts an absent or mismatched version.
+ * handshake itself catches any drift between the two. The current version is
+ * mandatory in both directions; neither side accepts an absent or mismatched
+ * version.
+ *
+ * v3 (breaking): the register request carries a mandatory browser-chosen
+ * `clientNonce` bound into the wrapped-conversation-key AAD (freshness anchor
+ * against a replayed register reply), and `unregister` requires a PoP proof.
  *
  * NOTE: this is a DIFFERENT layer from the E2E message-envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
  */
-export const WEBCHANNEL_PROTOCOL_VERSION = 2;
+export const WEBCHANNEL_PROTOCOL_VERSION = 3;

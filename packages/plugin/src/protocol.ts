@@ -3,9 +3,13 @@
  *
  * `WEBCHANNEL_PROTOCOL_VERSION` MUST equal the client's constant
  * (packages/client/src/protocol.ts). There is no shared package between the two,
- * so each declares its own. Protocol v2 is mandatory in both directions: the
- * plugin rejects a missing, malformed, or mismatched request version and the
+ * so each declares its own. The current version is mandatory in both directions:
+ * the plugin rejects a missing, malformed, or mismatched request version and the
  * client rejects a missing, malformed, or mismatched reply version.
+ *
+ * v3 (breaking): the register request carries a mandatory browser-chosen
+ * `clientNonce` which is bound into the wrapped-conversation-key AAD (freshness
+ * anchor, see client-nonce.ts), and `unregister` requires a PoP proof (#51).
  *
  * NOTE: this is a DIFFERENT layer from the E2E envelope version
  * (`ENVELOPE_VERSION` / `v:1`), which versions the encrypted payload format.
@@ -14,7 +18,7 @@
 import { createRequire } from "node:module";
 
 /** The plugin's wire-protocol version. Kept in lockstep with the client. */
-export const WEBCHANNEL_PROTOCOL_VERSION = 2;
+export const WEBCHANNEL_PROTOCOL_VERSION = 3;
 
 let cachedPluginVersion: string | null | undefined;
 

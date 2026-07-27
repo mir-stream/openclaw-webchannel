@@ -1755,11 +1755,17 @@ export class WebChannelNatsClient {
         }
         let key: Uint8Array;
         try {
+          // v3 freshness anchor: `registerResult.clientNonce` is the value THIS
+          // browser generated for the successful register attempt — it is not,
+          // and must never become, a field read out of the register reply. An
+          // echoed anchor would be a relay-chosen anchor, and a captured register
+          // reply would then replay cleanly onto a fresh attempt.
           key = await unwrapConversationKey(
             wrapped,
             registration.deviceX25519PrivateKey,
             registration.pinnedAgentPublicKey,
             peerId,
+            registerResult.clientNonce,
           );
         } catch (err) {
           if (this.connectionEpoch !== epoch) return;

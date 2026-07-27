@@ -102,15 +102,50 @@ export async function hkdfSha256(
  */
 export const KEY_WRAP_INFO = "webchannel-key-wrap-v1";
 
+/** AAD domain/version prefix. MUST match the agent constant of the same name. */
+export const WRAP_AAD_VERSION = "webchannel-wrap-v2";
+
 /**
- * F2 — build the key-wrap AAD that binds K to exactly ONE peerId. MUST be
- * byte-identical to the agent's `wrapAad` (packages/plugin/src/late-join-decryptor.ts):
- * plain UTF-8 of the peerId (ASCII on both sides). A wrap minted for peerA cannot
- * be lifted into peerB's register reply — peerB unwraps with `wrapAad(peerB)` and
- * Poly1305 fails.
+ * Field delimiter — ASCII 0x1F UNIT SEPARATOR. Written as a numeric constant on
+ * purpose: a literal control character in source is invisible and survives
+ * copy/paste badly, and this byte must be identical on both sides of the wire.
  */
-export function wrapAad(peerId: string): Uint8Array {
-  return new TextEncoder().encode(peerId);
+export const WRAP_AAD_SEPARATOR = 0x1f;
+
+/**
+ * F2 + v3 — build the key-wrap AAD that binds K to exactly ONE peerId AND ONE
+ * register attempt:
+ *
+ *   UTF-8("webchannel-wrap-v2") ‹0x1F› UTF-8(peerId) ‹0x1F› UTF-8(clientNonce)
+ *
+ * MUST be byte-identical to the agent's `wrapAad`
+ * (packages/plugin/src/late-join-decryptor.ts) — asserted by
+ * `wrap-aad-parity.test.ts`.
+ *
+ *   - `peerId` (anti-LIFT): a wrap minted for peerA cannot be lifted into peerB's
+ *     register reply — peerB computes a different AAD and Poly1305 fails.
+ *   - `clientNonce` (anti-REPLAY): this browser generated it locally for THIS
+ *     register attempt, so a register reply the relay captured earlier cannot
+ *     open under the current AAD.
+ *
+ * The `0x1F` delimiter needs no escaping: peerId is a NATS subject token and
+ * clientNonce is base64url, and neither alphabet contains it.
+ */
+export function wrapAad(peerId: string, clientNonce: string): Uint8Array {
+  const enc = new TextEncoder();
+  const version = enc.encode(WRAP_AAD_VERSION);
+  const peer = enc.encode(peerId);
+  const nonce = enc.encode(clientNonce);
+  const out = new Uint8Array(version.length + 1 + peer.length + 1 + nonce.length);
+  let at = 0;
+  out.set(version, at);
+  at += version.length;
+  out[at++] = WRAP_AAD_SEPARATOR;
+  out.set(peer, at);
+  at += peer.length;
+  out[at++] = WRAP_AAD_SEPARATOR;
+  out.set(nonce, at);
+  return out;
 }
 
 /**
@@ -142,23 +177,32 @@ export type WrappedConversationKey = {
  * NEVER from any NATS-carried field. So a relay that injects its own K′ — wrapped
  * under a relay-chosen key — fails Poly1305 under ECDH(device.private, pinnedAgent):
  * this single invariant closes the register-hop MITM. The peerId is bound into the
- * AAD (`wrapAad`) so a genuine wrap cannot be lifted to another peer.
+ * AAD (`wrapAad`) so a genuine wrap cannot be lifted to another peer, and the
+ * per-attempt `clientNonce` is bound alongside it so a genuine wrap captured from
+ * an EARLIER attempt cannot be replayed onto this one (v3 freshness anchor).
  *
  * ECDH(device.private, PINNED agent.public) → HKDF-SHA256(KEY_WRAP_INFO) →
- * ChaCha20-Poly1305 open (aad = wrapAad(peerId)). Poly1305 is verified before
- * anything is returned; a wrong key, tampered payload, or peerId mismatch throws
- * and the caller MUST treat the session as failed (fail-closed).
+ * ChaCha20-Poly1305 open (aad = wrapAad(peerId, clientNonce)). Poly1305 is verified
+ * before anything is returned; a wrong key, tampered payload, peerId mismatch, or
+ * stale clientNonce throws and the caller MUST treat the session as failed
+ * (fail-closed).
  *
  * @param agentPublicKeyB64url - the SaaS-pinned agent X25519 identity public key
  *        (base64url, 32 bytes). The caller obtains it from the bootstrap response
  *        (`parseBootstrapResponse`) and MUST NOT source it from any NATS frame.
  * @param peerId - this device's authenticated peerId (JWT `sub`), bound into the AAD.
+ * @param clientNonce - the freshness anchor THIS browser generated and sent on the
+ *        register request. It MUST be the locally-held value — NEVER one read back
+ *        out of the register reply. If it ever came off the wire the relay would
+ *        choose the anchor and a captured register reply would replay cleanly,
+ *        which is exactly what this parameter exists to prevent.
  */
 export async function unwrapConversationKey(
   wrapped: WrappedConversationKey,
   devicePrivateKey: CryptoKey,
   agentPublicKeyB64url: string,
   peerId: string,
+  clientNonce: string,
 ): Promise<Uint8Array> {
   const wireAgentKey = base64urlDecode(wrapped.ephemeralPublicKey);
   const pinnedAgentKey = base64urlDecode(agentPublicKeyB64url);
@@ -178,7 +222,7 @@ export async function unwrapConversationKey(
     base64urlDecode(wrapped.nonce),
     base64urlDecode(wrapped.ciphertext),
     base64urlDecode(wrapped.tag),
-    wrapAad(peerId),
+    wrapAad(peerId, clientNonce),
   );
 }
 

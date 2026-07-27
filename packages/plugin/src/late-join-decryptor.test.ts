@@ -132,6 +132,87 @@ function buildBacklog(
 
 describe("wrapConversationKey / unwrapConversationKey — key-wrap primitives", () => {
 
+  // ── v3 binding: (peerId, clientNonce) — anti-lift + anti-replay ────────────
+
+  const PEER_A = "peer-A";
+  const N1 = "TjEtY2FwdHVyZWQtYW5jaG9yLXZhbHVl";
+  const N2 = "TjItZnJlc2gtYW5jaG9yLXZhbHVlLTAy";
+
+  it("v3: a bound wrap round-trips when peerId AND clientNonce both match", () => {
+    const convKey = makeConversationKey();
+    const deviceKP = generateKeyPair();
+    const agentKP = generateKeyPair();
+
+    const wrapped = wrapConversationKey(convKey, deviceKP.publicKey, {
+      agentIdentityKeyPair: agentKP,
+      peerId: PEER_A,
+      clientNonce: N1,
+    });
+    const recovered = unwrapConversationKey(wrapped, deviceKP.privateKey, {
+      agentPublicKey: agentKP.publicKey,
+      peerId: PEER_A,
+      clientNonce: N1,
+    });
+    expect(hex(recovered)).toBe(hex(convKey));
+  });
+
+  it("v3 REPLAY DEFENCE: a wrap minted under N1 fails to unwrap under a fresh N2", () => {
+    // The captured-register-reply replay. Everything else about the wrap is
+    // genuine and agent-authenticated; only the freshness anchor has moved on.
+    const convKey = makeConversationKey();
+    const deviceKP = generateKeyPair();
+    const agentKP = generateKeyPair();
+
+    const captured = wrapConversationKey(convKey, deviceKP.publicKey, {
+      agentIdentityKeyPair: agentKP,
+      peerId: PEER_A,
+      clientNonce: N1,
+    });
+    expect(() =>
+      unwrapConversationKey(captured, deviceKP.privateKey, {
+        agentPublicKey: agentKP.publicKey,
+        peerId: PEER_A,
+        clientNonce: N2,
+      }),
+    ).toThrow();
+  });
+
+  it("v3: the peerId anti-lift binding still holds (must not regress)", () => {
+    const convKey = makeConversationKey();
+    const deviceKP = generateKeyPair();
+    const agentKP = generateKeyPair();
+
+    const forA = wrapConversationKey(convKey, deviceKP.publicKey, {
+      agentIdentityKeyPair: agentKP,
+      peerId: PEER_A,
+      clientNonce: N1,
+    });
+    // Same device key, same agent key, same anchor — only the peer differs.
+    expect(() =>
+      unwrapConversationKey(forA, deviceKP.privateKey, {
+        agentPublicKey: agentKP.publicKey,
+        peerId: "peer-B",
+        clientNonce: N1,
+      }),
+    ).toThrow();
+  });
+
+  it("v3: a HALF binding is refused outright, so no path can drop the anchor", () => {
+    // The type system rejects this at compile time; the runtime guard covers an
+    // untyped/JS caller. An anchorless wrap must be impossible to construct, not
+    // merely discouraged — a silent `undefined` AAD would void the whole change.
+    const convKey = makeConversationKey();
+    const deviceKP = generateKeyPair();
+    const half = { peerId: PEER_A } as unknown as { peerId: string; clientNonce: string };
+    expect(() => wrapConversationKey(convKey, deviceKP.publicKey, half)).toThrow(
+      /BOTH peerId and clientNonce/,
+    );
+    const wrapped = wrapConversationKey(convKey, deviceKP.publicKey);
+    expect(() => unwrapConversationKey(wrapped, deviceKP.privateKey, half)).toThrow(
+      /BOTH peerId and clientNonce/,
+    );
+  });
+
   // ── Test 1: Round-trip — wrap then unwrap recovers the original key ─────────
 
   it(

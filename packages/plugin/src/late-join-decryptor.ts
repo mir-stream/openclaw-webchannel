@@ -24,11 +24,13 @@
  *     that K came from the genuine agent — the browser derives the unwrap key
  *     SOLELY from the SaaS-pinned agent public key (never from the wire), so an
  *     untrusted relay that injects its own K′ wrapped under a relay-chosen key
- *     fails Poly1305. The peerId is bound into the AAD (`wrapAad`).
+ *     fails Poly1305. The peerId AND the browser-chosen per-attempt clientNonce
+ *     are bound into the AAD (`wrapAad`).
  *       Agent (wrapConversationKey with opts.agentIdentityKeyPair):
  *         1. ECDH: sharedSecret = X25519(agentIdentity.private, device.publicKey).
  *         2. wrapKey = HKDF(sharedSecret, null, "webchannel-key-wrap-v1", 32).
- *         3. {ciphertext,nonce,tag} = Encrypt(wrapKey, K, aad=wrapAad(peerId)).
+ *         3. {ciphertext,nonce,tag} =
+ *            Encrypt(wrapKey, K, aad=wrapAad(peerId, clientNonce)).
  *         4. `ephemeralPublicKey` field carries the agent IDENTITY public key —
  *            a field-name alias only (a new browser IGNORES it and derives from
  *            the SaaS-pinned key). This gives NO old-client interop: the agent
@@ -38,7 +40,10 @@
  *            alias only keeps the wire field NAME stable.
  *       Device (unwrapConversationKey with opts.agentPublicKey = pinned key):
  *         1. ECDH: sharedSecret = X25519(device.privateKey, PINNED agentPublicKey).
- *         2. wrapKey = HKDF(...); 3. Decrypt(wrapKey, …, aad=wrapAad(peerId)).
+ *         2. wrapKey = HKDF(...);
+ *         3. Decrypt(wrapKey, …, aad=wrapAad(peerId, clientNonce)) — with the
+ *            clientNonce THIS browser generated for THIS register attempt, never
+ *            a value read back off the wire.
  *
  *   • EPHEMERAL (legacy, no identity key supplied). A fresh ephemeral key pair
  *     is generated per wrap and its public half travels in `ephemeralPublicKey`;
@@ -62,6 +67,11 @@
  *     key, so a wrap NOT produced by the agent's identity private key fails
  *     Poly1305 — closing the register-relay MITM. The peerId is bound into the
  *     AAD so a wrap cannot be lifted to another peer.
+ *   • FRESHNESS (v3): the wrap is also bound to a per-attempt, BROWSER-generated
+ *     `clientNonce`. Authentication alone left the register reply REPLAYABLE — a
+ *     relay could re-serve a captured reply verbatim. That is inert only while K
+ *     never rotates; the anchor is added now so a future rotation cannot turn a
+ *     captured reply into a session hijack.
  *   • The Poly1305 tag prevents undetected tampering of the wrapped key.
  *   • Forward secrecy: static-static drops the distribution-step ephemeral, but
  *     this is a NON-loss — K is already persisted on the agent's disk
@@ -89,6 +99,7 @@ import {
 } from "./e2e-crypto.js";
 import type { KeyPair } from "./e2e-crypto.js";
 import { decryptEnvelopeContent } from "./e2e-envelope.js";
+import { wrapAad } from "./wrap-aad.js";
 import type { MessageEnvelope } from "./e2e-envelope.js";
 
 // ---------------------------------------------------------------------------
@@ -104,20 +115,48 @@ import type { MessageEnvelope } from "./e2e-envelope.js";
  */
 export const KEY_WRAP_INFO = "webchannel-key-wrap-v1" as const;
 
+// The AAD encoding lives in its own dependency-free module so the cross-package
+// parity test can import it under the client's browser-only lib set. Re-exported
+// here because this is where wrap/unwrap callers reach it.
+export { wrapAad, WRAP_AAD_VERSION, WRAP_AAD_SEPARATOR } from "./wrap-aad.js";
+
 /**
- * F2 — build the ChaCha20-Poly1305 AAD that binds a wrapped conversation key to
- * exactly ONE peerId. The wrap ciphertext authenticates this AAD, so a wrap
- * minted for peerA cannot be lifted into peerB's register reply: peerB unwraps
- * with `wrapAad(peerB)` and the Poly1305 check fails. MUST be byte-identical to
- * the browser's `wrapAad` (packages/client/src/e2e-crypto-browser.ts) — plain
- * UTF-8 of the peerId, which is ASCII (a uuid / subject token) on both sides.
- *
- * NOTE (K-rotation): if the conversation key K ever rotates and old wraps stay
- * replayable, add a key-epoch to this AAD so an old-K wrap cannot be rolled back
- * onto a new epoch. Today K is stable per peer, so peerId alone is sufficient.
+ * The pair that binds a wrap to one peer AND one register attempt. Both halves
+ * are mandatory together: see `WrapBindingOpts`.
  */
-export function wrapAad(peerId: string): Uint8Array {
-  return new TextEncoder().encode(peerId);
+export type WrapBinding = {
+  /** Verified JWT `sub` of the target peer (F2 anti-lift). */
+  peerId: string;
+  /** The BROWSER-generated per-attempt freshness anchor (v3 anti-replay). */
+  clientNonce: string;
+};
+
+/**
+ * Binding options for wrap/unwrap. The union makes it a COMPILE error to supply
+ * `peerId` without `clientNonce` — the production path must never fall into an
+ * `undefined`-AAD branch, which would silently drop the freshness anchor. The
+ * "neither" arm exists only for the legacy/self-test ephemeral mode, which is
+ * not agent-authenticated and never used by the register hop.
+ */
+export type WrapBindingOpts = WrapBinding | { peerId?: undefined; clientNonce?: undefined };
+
+/**
+ * Resolve the AAD from the binding options. Returns `undefined` ONLY for the
+ * legacy "neither supplied" arm. A half-supplied binding is a programming error
+ * that the type system already rejects; this throw catches an untyped/JS caller
+ * so it can never degrade into an anchorless wrap.
+ */
+function bindingAad(opts: WrapBindingOpts): Uint8Array | undefined {
+  const hasPeer = opts.peerId !== undefined;
+  const hasNonce = opts.clientNonce !== undefined;
+  if (hasPeer !== hasNonce) {
+    throw new Error(
+      "webchannel: wrap binding requires BOTH peerId and clientNonce (or neither) — " +
+        "a peerId-only wrap would drop the v3 freshness anchor",
+    );
+  }
+  if (!hasPeer) return undefined;
+  return wrapAad(opts.peerId as string, opts.clientNonce as string);
 }
 
 // ---------------------------------------------------------------------------
@@ -214,14 +253,16 @@ export type DecryptedBacklog = {
  *        (a field-name alias only — NOT old-client-interoperable, see the module
  *        docstring). When OMITTED, a fresh ephemeral key pair is generated (legacy
  *        / self-test — NOT agent-authenticated).
- * @param opts.peerId - when supplied, binds this peerId into the ChaCha20-Poly1305
- *        AAD (`wrapAad`) so the wrap cannot be lifted to another peer.
+ * @param opts.peerId + opts.clientNonce - the wrap binding. Supplied TOGETHER or
+ *        not at all (enforced by the type AND at runtime): they bind the wrap to
+ *        one peer (anti-lift) and one register attempt (anti-replay) via
+ *        `wrapAad`. The production register path ALWAYS supplies both.
  * @returns WrappedConversationKey — safe to transmit over an authenticated channel.
  */
 export function wrapConversationKey(
   conversationKey: Uint8Array,
   devicePublicKey: Uint8Array,
-  opts: { agentIdentityKeyPair?: KeyPair; peerId?: string } = {},
+  opts: { agentIdentityKeyPair?: KeyPair } & WrapBindingOpts = {},
 ): WrappedConversationKey {
   // STATIC-STATIC when an attested identity key is supplied; else a fresh
   // ephemeral key pair (legacy). Either way, the public half of the wrap key
@@ -236,8 +277,10 @@ export function wrapConversationKey(
   const wrapKey = hkdfSha256(rawSecret, null, KEY_WRAP_INFO, 32);
 
   // ChaCha20-Poly1305: authenticate-encrypt the 32-byte conversation key,
-  // binding peerId into the AAD when provided (F2 anti-lift).
-  const aad = opts.peerId !== undefined ? wrapAad(opts.peerId) : undefined;
+  // binding (peerId, clientNonce) into the AAD when provided — F2 anti-lift plus
+  // the v3 anti-replay freshness anchor. `bindingAad` refuses a half-binding, so
+  // the production path cannot degrade to an anchorless wrap.
+  const aad = bindingAad(opts);
   const { ciphertext, nonce, tag } = encrypt(wrapKey, conversationKey, aad);
 
   return {
@@ -273,16 +316,19 @@ export function wrapConversationKey(
  *        `ephemeralPublicKey`), so a relay's injected K′ — wrapped under any
  *        non-agent key — fails Poly1305. When OMITTED, derives from the wire
  *        `ephemeralPublicKey` (legacy / self-test).
- * @param opts.peerId - when supplied, must match the peerId the agent bound into
- *        the wrap AAD; otherwise the Poly1305 check fails (anti-lift).
+ * @param opts.peerId + opts.clientNonce - must match the binding the agent put
+ *        into the wrap AAD; otherwise the Poly1305 check fails. Supplied
+ *        together or not at all. A wrap captured under an EARLIER clientNonce
+ *        fails here — that is the v3 replay defence.
  * @returns 32-byte plaintext conversation key.
  * @throws `Error` if authentication fails (wrong key, tampered ciphertext/tag,
- *         peerId mismatch, or malformed base64url in the wrapped key fields).
+ *         peerId or clientNonce mismatch, or malformed base64url in the wrapped
+ *         key fields).
  */
 export function unwrapConversationKey(
   wrapped: WrappedConversationKey,
   devicePrivateKey: Uint8Array,
-  opts: { agentPublicKey?: Uint8Array; peerId?: string } = {},
+  opts: { agentPublicKey?: Uint8Array } & WrapBindingOpts = {},
 ): Uint8Array {
   // Derive from the PINNED agent key when supplied (F2 — the browser never trusts
   // the wire-carried key); else fall back to the wire field (legacy path).
@@ -300,7 +346,7 @@ export function unwrapConversationKey(
 
   // ChaCha20-Poly1305: decrypt and verify the Poly1305 tag (over ciphertext + AAD).
   // Throws if authentication fails — caller must not use output on exception.
-  const aad = opts.peerId !== undefined ? wrapAad(opts.peerId) : undefined;
+  const aad = bindingAad(opts);
   return decrypt(wrapKey, nonce, ciphertext, tag, aad);
 }
 
@@ -364,7 +410,7 @@ export function decryptBacklog(
   envelopes: readonly MessageEnvelope[],
   wrappedKey: WrappedConversationKey,
   devicePrivateKey: Uint8Array,
-  opts: { agentPublicKey?: Uint8Array; peerId?: string } = {},
+  opts: { agentPublicKey?: Uint8Array } & WrapBindingOpts = {},
 ): DecryptedBacklog {
   // Step 1: Unwrap the conversation key.
   // This is the gatekeeper — if this fails, no plaintexts are produced.
