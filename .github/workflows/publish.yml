@@ -272,7 +272,23 @@ jobs:
   publish-plugin:
     name: Publish plugin to ClawHub
     needs: publish
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # ClawHub publishing is PROVISIONALLY DISABLED. npm is the distribution
+    # channel that matters and it publishes fine; ClawHub has been sitting behind
+    # a `scan:suspicious` moderation flag that pins `latest` at 0.2.0 regardless
+    # of what we push, so the job could only ever go green while achieving
+    # nothing — and a step that fails (or succeeds pointlessly) on every release
+    # trains people to ignore a red pipeline.
+    #
+    # Left in place rather than deleted because this is provisional: the job body
+    # (including the npm 11 pin for the CLI's `npm pack --json` bug, upstream
+    # openclaw/clawhub#3275) is still correct and ready.
+    #
+    # TO RE-ENABLE: set repository variable PUBLISH_CLAWHUB to "true".
+    # Unset/absent evaluates falsy, so the job stays skipped by default.
+    if: >-
+      github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v')
+      && vars.PUBLISH_CLAWHUB == 'true'
     runs-on: deploy  # 러너 신축 D7 — deploy 레인 단독 라벨(기본 라벨 러너에 안 실림)
     permissions:
       contents: read
