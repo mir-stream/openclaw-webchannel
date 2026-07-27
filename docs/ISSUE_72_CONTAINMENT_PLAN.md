@@ -312,7 +312,8 @@ audit 손실을 인증 장애로 바꾸지 않는다.
 
 `revocationCapable` preflight/reporting은 적어도 배포 유형, 실제 NATS account public key, operator
 signing capability, resolver publish/reload 경로, readback/verification readiness, 전용
-`ClaimPublisher` 배제·credential revoke/rotate capability를 검사한다.
+`ClaimPublisher`와 out-of-band `PublisherRecoveryAuthority`의 all-node offline recovery 실행
+가능성을 검사한다.
 
 - self-contained 기존 chain은 `returnOperatorSeed: true`로 **처음 생성될 때만** operator seed를
   보관한다. 이미 저장된 chain에 옵션을 뒤늦게 켜도 seed가 생기지 않는다. Track A 활성화 전에
@@ -321,8 +322,9 @@ signing capability, resolver publish/reload 경로, readback/verification readin
   revocation control 또는 escalation 경로를 반환한다. 자동화할 API가 없으면 fail-closed하면서
   executable provider 절차를 안내한다.
 - preflight 실패 중에는 admin revoke route를 성공처럼 노출하지 않는다.
-- 이전 publisher process의 stable observed zero와 per-instance NATS credential revocation을
-  증명할 수 없는 topology는 repository가 CAS를 제공해도 Track A를 fail-closed한다.
+- authoritative serving-node membership, API/publisher/all-NATS-node stable observed zero,
+  unreachable-node quarantine, offline resolver seed와 per-instance publisher credential
+  revoke/rotate를 증명할 수 없는 topology는 repository가 CAS를 제공해도 Track A를 fail-closed한다.
 
 ## 4. Track A — revoke operation과 동시성
 
@@ -434,28 +436,60 @@ retry/reconciliation은 floor를 새 `nowSec()`로 올리지 않는다. 따라�
 nats-server v2.14.2 Dir의 `$SYS.REQ...CLAIMS.UPDATE`는 repository fencing token/CAS나 claim `iat`
 monotonic guard를 enforce하지 않는다. 유효하게 서명된 stale full account JWT도 받아 resolver
 state를 과거 revocation 집합으로 되돌릴 수 있다. repository token은 DB transition만 fence하며,
-NATS side effect fence는 **검증된 writer exclusion + publisher credential revocation**이다.
+signer/publisher credential을 나중에 revoke해도 이미 socket/internal queue에 들어간 update를
+취소하지 못한다. 기본 Dir handler에는 store 전 trust-aware CAS guard가 없고 queued stale JWT가
+durable save될 수 있으므로 signer revocation만으로 downstream side effect를 fence했다고 주장하지
+않는다.
 
-operator seed와 direct `$SYS.REQ.ACCOUNT.<account>.CLAIMS.UPDATE` permission은 전용 single-writer
-`ClaimPublisher`만 가진다. replicated SaaS/API worker에는 signing secret과 direct publish
-permission을 주지 않는다. publisher credential은 instance/account별로 좁게 발급한다.
+정상 `ClaimPublisher`는 delegated online signing capability와 direct
+`$SYS.REQ.ACCOUNT.<account>.CLAIMS.UPDATE` permission만 가진다. root operator/recovery signing
+material은 아래 `PublisherRecoveryAuthority`에만 둔다. replicated SaaS/API worker에는 signing
+secret과 direct publish permission을 주지 않는다. publisher credential은 instance/account별로
+좁게 발급한다.
 
-publisher ownership은 lease expiry만으로 steal하지 않는다. takeover/failover 순서는 다음과 같다.
+정상 상태에서는 account별 ClaimPublisher 하나가 직렬화한다. publish 뒤 response가 유실되거나
+어느 serving node라도 exact claim ID/floor readback이 끝나지 않으면 같은 publisher도 다음 publish를
+하지 않고 all-node reconciliation을 끝낸다. authoritative membership의 모든 serving node가 exact
+readback과 대상 eviction을 보고해야 complete다. missing/mixed는
+`acceptance-unknown`/`reconciliation-required`이며 unreachable node는 quarantine 전 complete가
+아니다. quorum 판정은 금지한다.
 
-1. controller가 이전 publisher process를 terminate 또는 network-isolate한다.
-2. publisher ready count가 stable observed zero임을 증명한다.
-3. 이전 instance의 account-scoped publisher credential을 revoke/rotate한다.
-4. live disconnect와 구 credential reconnect failure를 검증한다.
-5. 그 뒤에만 새 publisher를 시작한다.
+publisher crash/partition/acceptance-unknown에서는 lease takeover와 live 새 publisher 시작을
+금지한다. browser/external issuance fence와 operation 상태를 유지하고 admin revoke route를
+fail-closed한다.
 
-이 exclusion/revocation control을 제공할 수 없는 topology는 Track A preflight에서 fail-closed한다.
-향후 CAS-enforcing downstream boundary가 이를 대체할 수 있지만 기본 Dir endpoint를 CAS-safe라고
-간주하지 않는다.
+별도 out-of-band `PublisherRecoveryAuthority`가 offline 복구만 수행한다. online ClaimPublisher/API
+worker와 분리하고 root operator/recovery signing-key custody, system-account publisher-user revoke/rotate,
+resolver durable state offline repair, orchestrator/provider stop·quarantine 권한을 가진다. 이
+authority와 recovery material은 정상 ClaimPublisher/API에 노출하지 않으며 preflight에서 실제
+실행 가능성을 검증한다.
 
-publisher crash 동안 `acceptance-unknown`/`reconciliation-required`와 browser/external issuance
-fence를 유지한다. takeover가 위 절차로 끝나면 새 publisher는 resolver accepted claim을 다시 읽고
-eligible operation revocation union으로 새 candidate를 만들어 재개한다. old candidate JWT는
-재사용하지 않는다.
+기본 Dir 복구 순서는 다음과 같다.
+
+1. authoritative serving-node membership snapshot을 고정하고 external issuer/browser issuance
+   freeze를 유지하며 API와 ClaimPublisher를 stop한다.
+2. old publisher process/network의 stable observed zero를 증명한다.
+3. **모든 affected NATS resolver/server serving node를 stop하고 stable observed zero를 증명한다.**
+   unreachable node는 service/discovery에서 quarantine하고 stale storage로 재합류하지 못하게 한다.
+4. offline authority가 old publisher system-user credential을 revoke/rotate하고, resolver Dir
+   accepted claim과 durable operation의 eligible union으로 claim을 재생성·재서명한다. 모든 NATS
+   node가 stop된 비서빙 상태에서 각 durable store를 **per-store atomic replace**하고, store마다
+   동일한 exact target-claim/system-account hash를 검증한다. old candidate는 재사용하지 않는다.
+   분산 global atomic commit을 요구하지 않으며, 중간 partial seed가 절대 serving되지 않는 것이
+   안전 보장이다.
+5. NATS node를 시작하되 readiness/service discovery에서 quarantine된 non-serving 상태로 유지한다.
+   membership이 바뀌면 snapshot/verification을 처음부터 다시 한다. 모든 node가 exact
+   target/system claim ID·hash·floors, old publisher credential과 revoked client의 **각-node**
+   reconnect failure, stable membership을 보고해야 한다. quorum으로 축약하지 않는다.
+6. 검증 성공 뒤에만 serving을 일괄 enable하고, 그 다음 uniquely credentialed 새 ClaimPublisher를
+   시작해 fence/recovery state를 수렴시킨 뒤 admin route를 재개한다.
+
+all-node stop/start는 pre-accepted route/socket/internal-queue message를 소거하는 downstream
+barrier다. 이 barrier 없이 credential revocation만 하고 live takeover하지 않는다.
+
+향후 CAS-aware custom downstream이 대체하려면 publisher token/epoch을 **store 전에** 원자 검증하고
+delayed stale update를 reject하는 real-server proof가 있어야 한다. 기본 Dir endpoint는 해당하지
+않는다.
 
 ### 4.4 모호한 실패와 reconciliation
 
@@ -475,9 +509,10 @@ broader issuance fence는 resolver acceptance와 대상 ledger convergence가 �
 publish rejection처럼 resolver 미적용이 readback으로 확정된 safe abort에서만 release할 수 있다.
 process crash나 lease expiry만으로 무조건 풀지 않는다. recovery worker가 더 높은 repository fencing
 token으로 operation ownership을 인수하고 readback/reconciliation 또는 safe abort를 완료한 뒤
-release한다. 이는 DB operation ownership 인수일 뿐 publisher lease takeover 권한이 아니다.
-repository token은 stale worker의 DB ledger mark/release를 막지만 NATS publish 자체는 막지 못한다.
-publisher 교체는 §4.3의 process exclusion과 credential revocation을 먼저 완료해야 한다.
+release한다. 이는 DB operation ownership 인수일 뿐 publisher takeover 권한이 아니다. publisher
+crash/partition이 얽히면 §4.3의 all-node offline recovery barrier가 완료되기 전에는 인수한 worker도
+publish하거나 fence를 release할 수 없다. repository token은 stale worker의 DB ledger mark/release를
+막지만 NATS publish 자체는 막지 못한다.
 
 lost response를 이유로 더 새로운 floor를 만들거나, stale account JWT에서 다시 시작해 동시
 revocation을 덮어쓰면 안 된다. `addRevocation`의 per-key monotonic floor는 방어층이지만 durable
@@ -488,6 +523,7 @@ accepted-claim serialization을 대체하지 않는다.
 per-peer reviewed set은 candidate 하나에 모두 병합하고 publish 한 번으로 적용한다. 개별 key마다
 publish하거나 publish 전에 ledger를 revoked로 표시하지 않는다. cluster 일부가 새 claim을 아직
 보지 못하면 operation을 complete로 만들지 않고 reconciliation-required로 유지한다.
+authoritative membership의 모든 serving node가 exact claim ID/floor와 대상 eviction을 확인해야 한다.
 
 ## 5. 확인(confirmation) flow
 
@@ -560,7 +596,8 @@ MEMORY도 reload 시 targeted live eviction을 수행하므로, 옵션 2가 **li
 
 기본 Dir claim-update endpoint는 stale full JWT를 자체 CAS로 거부하지 않는다. 따라서 모든
 production publish는 §4.3의 전용 `ClaimPublisher`를 지나며, system account permission과 operator
-seed 배포도 그 단일 writer/exclusion topology에 맞춘다.
+signing material 배포도 online delegated signer와 offline recovery authority로 분리한다. live
+takeover는 금지하며 recovery는 cluster-wide offline barrier를 따른다.
 
 마이그레이션/검증 inventory는 다음 여섯 곳이다.
 
@@ -572,7 +609,8 @@ seed 배포도 그 단일 writer/exclusion topology에 맞춘다.
 - `examples/webchannel-app/server/nats.ts`
 
 각 profile에서 system account, resolver directory ownership/persistence, publish permission,
-readback/health check를 검증한다.
+authoritative all-node readback/health check와 offline stop/quarantine/per-store atomic-replace
+capability를 검증한다.
 
 ## 7. HTTP routing inventory
 
@@ -771,9 +809,9 @@ forensic backup restore와 protocol v2 rollback은 §2.5에 따라 금지한다.
 | T19 | non-expiring credential과 한 peer의 복수 credential을 exact/per-peer/wildcard dry-run·실행에서 빠짐없이 처리하고 pre-ledger/agent unknown 경고를 고정 |
 | T20 | publish→live drain 확인→key persistence→core history retain/reseal→fresh bootstrap 각 경계에 fault를 주어 operation 상태와 재시작/reconciliation 결과를 검증 |
 | T21 | `revocationCapable`이 operator-seed rollout 제약과 resolver readiness를 보고하고, managed provider 실패가 actionable control/escalation을 반환하며 모든 응답·로그에 secret이 없음 |
-| T22 | active issuance fence 중 mint 전 대기/거부 및 mint 후 persist/return 전 폐기, wildcard 외부 issuer freeze fail-closed, crash/lease expiry·acceptance-unknown·reconciliation-required에서 fence 유지; DB operation ownership takeover는 publisher exclusion 뒤 수행하고 safe abort/complete release 뒤 issuance 재개 |
+| T22 | active issuance fence 중 mint 전 대기/거부 및 mint 후 persist/return 전 폐기, wildcard 외부 issuer freeze fail-closed, crash/lease expiry·acceptance-unknown·reconciliation-required에서 fence 유지; DB operation ownership recovery는 필요 시 all-node offline barrier 뒤 수행하고 safe abort/complete release 뒤 issuance 재개 |
 | T23 | wildcard external freeze를 dry-run/floor보다 먼저 획득: freeze 직전 발급 credential의 decoded issuer high-watermark가 floor에 포함되어 revoke되고 freeze 뒤 mint는 거부됨. lapse/membership drift/invalid attestation은 old ordering을 실행하지 않고 safe abort 후 새 freeze·dry-run·floor를 요구 |
-| T24 | Dir negative contract로 stale signed full JWT도 endpoint가 수용함을 고정. publisher A pause-before-publish 중 B의 lease-only takeover는 거부하고, 강제 takeover는 A process zero+credential revoke/live disconnect/reconnect failure 뒤 수행; A resume publish/reconnect 실패, 새 publisher는 accepted claim+eligible operation union만 병합해 reviewed/aborted/unapproved-failure 오적용과 revocation regression 없이 publish |
+| T24 | Dir negative contract: signer 제거만으로 queued stale JWT durable save를 막지 못함. A가 send 후 response 전 지연/partition되면 live B takeover를 거부한다. offline authority가 membership snapshot, API/A/all-NATS stable zero, unreachable quarantine, queued-message 소거, stop 상태 per-store atomic replace와 동일 target/system hash를 확인한다. 재시작 node는 quarantine/non-serving으로 all-node exact readback·각-node old publisher/revoked-client reconnect failure·stable membership을 통과한 뒤에만 serving 일괄 enable 및 B 시작. partial seed/검증 node는 절대 serving하지 않으며 stale claim/node release·rejoin, authority 부재, membership drift는 fail-closed |
 
 T2-a와 T2-b는 서로 대체하지 않는다. real-server harness는 바이너리 부재 시 명시적으로 skip할 수
 있지만 CI lane에는 v2.14.2 MEMORY와 선택된 Dir/full topology를 둘 다 둔다.
@@ -789,7 +827,7 @@ K_new history snapshot 성공과 fresh browser 양방향 relay 성공이다.
 | 수용 요구 | 규범 설계 | 증명 |
 |---|---|---|
 | one credential 또는 reviewed broader set revoke | §3.2 issuance linearization, §4 batch/CAS/publisher fence, §5 stateful confirmation | T5, T7, T8, T19, T22, T24 |
-| self-contained resolver publish/acceptance와 live 차단 | §1.2, §4.3, §6 | T2-a, T2-b, T24 |
+| self-contained resolver publish/acceptance와 live 차단 | §1.2, §4.3, §6; all-node exact 판정 | T2-a, T2-b, T24 |
 | 발급분 추적과 비밀 미저장 | §3 | T3, T4, T19 |
 | selected peer K rotation과 새 암호 경계 | §2.7, §8.1~§8.4 | T14, T17, T18 |
 | old wrap replay 방어 | §8.3 | T15, T16, T17 |
@@ -803,8 +841,8 @@ K_new history snapshot 성공과 fresh browser 양방향 relay 성공이다.
 
 1. Track C 런북과 MEMORY real-server 검증을 먼저 낸다.
 2. Track A에서는 full/Dir resolver migration을 먼저 착륙시키고 여섯 topology smoke test를 통과한다.
-3. per-account 전용 publisher credential, operator seed custody, controller exclusion/takeover를 갖춘
-   single-writer `ClaimPublisher`를 배포하고 Dir stale-JWT negative contract를 확인한다.
+3. per-account single-writer `ClaimPublisher`와 별도 `PublisherRecoveryAuthority`, cluster-wide
+   offline recovery barrier를 배포하고 Dir queued stale-JWT negative contract를 확인한다.
 4. issuance ledger와 durable operation/claim repository를 **같은 transactional backend**에
    배포하고 fence recovery/reconciliation을 활성화한다.
 5. 모든 issuance wrapper를 private-mint + atomic fence-check/persist-before-return으로 전환하고
@@ -814,7 +852,8 @@ K_new history snapshot 성공과 fresh browser 양방향 relay 성공이다.
 8. Track B를 배포할 때 protocol v3 client/plugin/SaaS를 lockstep roll forward하고 forced
    refresh/bootstrap 절차를 실행한다.
 
-publish 실패는 revoke 성공으로 보고하지 않는다. publish 수용 뒤 ledger failure도 active/revoked
+publish 실패는 revoke 성공으로 보고하지 않는다. all-node exact readback 전에는 다음 publish를
+하지 않는다. publish 수용 뒤 ledger failure도 active/revoked
 둘 중 하나로 거짓 단순화하지 않고 reconciliation-required로 운영한다. resolver health가 나빠지면
 새 revoke를 중단하고 accepted JWT를 readback해 수렴시킨다.
 
@@ -827,9 +866,8 @@ preflight가 준비되기 전에는 활성화하지 않는다.
 
 1. durable operation/claim repository의 첫 production adapter와 보존 기간.
 2. CAS 식별자로 version/hash/JTI 중 무엇을 표준화할지.
-3. partial cluster acceptance를 complete로 판정할 quorum/모든-node health 기준.
-4. confirmation TTL과 최대 reviewed-set 크기.
-5. resolver migration의 directory backup/restore 운영 주체. 단, K forensic backup처럼 live
+3. confirmation TTL과 최대 reviewed-set 크기.
+4. resolver migration의 directory backup/restore 운영 주체. 단, K forensic backup처럼 live
    leaked key를 복구하는 용도로 쓰지 않는다.
 
 non-goal/follow-up: privileged operator/recovery system이 full local snapshot 또는 K_old를
@@ -864,6 +902,8 @@ v8은 이전 리뷰 기록의 다음 결론을 명시적으로 폐기했다.
 - wildcard floor를 external issuer freeze/high-watermark attestation보다 먼저 정해도 된다는 주장
 - repository lease/CAS token이 기본 Dir claim-update side effect까지 fence하며 stale publisher가
   유효하게 서명된 old full JWT를 publish하지 못한다는 주장
+- old publisher process zero와 signer credential revoke만으로 queued Dir update가 소거되어 live
+  ClaimPublisher takeover가 안전하고, ordinary acceptance를 quorum으로 판정해도 된다는 주장
 
 이 로그는 역사적 오답을 규범으로 남기기 위한 것이 아니라, v8의 현재 계약과 혼동하지 않게 하기
 위한 correction record다.
