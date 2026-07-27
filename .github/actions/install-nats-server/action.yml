@@ -9,18 +9,42 @@ inputs:
     # server version silently changes what the real-server suites test against.
     default: "v2.14.0"
 
+# NO SUDO ANYWHERE IN THIS ACTION.
+#
+# It used to install to /usr/local/bin via `sudo mv`, which worked only because
+# the original self-hosted lane happened to have passwordless sudo. The publish
+# jobs moved to the dedicated `deploy` lane (runner cutover, PR #50) and that
+# runner does not, so BOTH halves failed there: `actions/cache` could not restore
+# into /usr/local/bin ("Cannot open: Permission denied") and the download
+# fallback died on `sudo: a password is required`.
+#
+# Installing under $RUNNER_TOOL_CACHE and exporting it via $GITHUB_PATH needs no
+# elevation, works identically on every runner, and removes a root requirement
+# from the lane that holds the publish credentials. Do not reintroduce sudo here.
 runs:
   using: composite
   steps:
+    - name: Resolve install dir
+      shell: bash
+      run: |
+        set -euo pipefail
+        # RUNNER_TOOL_CACHE is always writable by the runner user and survives
+        # between jobs on a self-hosted host; fall back to HOME on the rare
+        # runner that leaves it unset.
+        DIR="${RUNNER_TOOL_CACHE:-$HOME/.cache}/nats-server/${{ inputs.version }}"
+        mkdir -p "$DIR"
+        echo "NATS_SERVER_DIR=$DIR" >> "$GITHUB_ENV"
+        echo "$DIR" >> "$GITHUB_PATH"
+
     - name: Cache nats-server binary
       id: cache-nats
       uses: actions/cache@v4
       with:
-        path: /usr/local/bin/nats-server
-        # Key resolves to e.g. nats-server-v2.14.0-linux-amd64 — identical to the
-        # keys the workflows used before this action existed, so existing caches
-        # still hit.
-        key: nats-server-${{ inputs.version }}-linux-amd64
+        path: ${{ env.NATS_SERVER_DIR }}
+        # Key is bumped (-toolcache) because the old key's cache entries were
+        # saved with an absolute /usr/local/bin path and restore into the new
+        # location as a stray nested tree rather than a usable binary.
+        key: nats-server-${{ inputs.version }}-linux-amd64-toolcache
 
     - name: Install nats-server ${{ inputs.version }}
       if: steps.cache-nats.outputs.cache-hit != 'true'
@@ -30,14 +54,16 @@ runs:
         VERSION="${{ inputs.version }}"
         TARBALL="nats-server-${VERSION}-linux-amd64.tar.gz"
         URL="https://github.com/nats-io/nats-server/releases/download/${VERSION}/${TARBALL}"
-        curl -fsSL "${URL}" -o "/tmp/${TARBALL}"
-        tar -xzf "/tmp/${TARBALL}" -C /tmp
-        sudo mv "/tmp/nats-server-${VERSION}-linux-amd64/nats-server" /usr/local/bin/nats-server
-        sudo chmod +x /usr/local/bin/nats-server
-        rm -rf "/tmp/${TARBALL}" "/tmp/nats-server-${VERSION}-linux-amd64"
+        WORK="$(mktemp -d)"
+        curl -fsSL "${URL}" -o "${WORK}/${TARBALL}"
+        tar -xzf "${WORK}/${TARBALL}" -C "${WORK}"
+        mv "${WORK}/nats-server-${VERSION}-linux-amd64/nats-server" "${NATS_SERVER_DIR}/nats-server"
+        chmod +x "${NATS_SERVER_DIR}/nats-server"
+        rm -rf "${WORK}"
 
     - name: Verify nats-server is on PATH
       shell: bash
       run: |
+        set -euo pipefail
         which nats-server
         nats-server --version
