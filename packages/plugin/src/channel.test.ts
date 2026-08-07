@@ -993,9 +993,12 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
-    // No answer/tool draft AND reasoning level is the default "off": with neither
-    // lane active, replyOptions is omitted entirely (pre-reasoning-lane shape).
-    expect(seenReplyOptions).toBeUndefined();
+    // No answer/tool draft AND reasoning level is the default "off": neither
+    // lane is active, so replyOptions carries nothing but the #87 run-id hook.
+    // That hook is wired on EVERY turn — it is how the turn learns which agent
+    // run's lifecycle terminal decides its `turn_settled` outcome — so unlike
+    // the draft/reasoning callbacks it is not conditional on a streaming mode.
+    expect(seenReplyOptions).toEqual({ onAgentRunStart: expect.any(Function) });
     expect(progressSpy).not.toHaveBeenCalled();
     expect(finalizeSpy).not.toHaveBeenCalled();
     expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
@@ -1027,6 +1030,7 @@ describe("webchannel inbound round-trip", () => {
     // Reasoning lane opened, but no answer/tool draft in block mode: replyOptions
     // carries ONLY the reasoning callbacks — no tool/answer callbacks, no suppression.
     expect(seenReplyOptions).toEqual({
+      onAgentRunStart: expect.any(Function),
       onReasoningStream: expect.any(Function),
       onReasoningEnd: expect.any(Function),
     });

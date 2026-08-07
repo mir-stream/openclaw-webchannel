@@ -21,7 +21,11 @@ import { createCapacityDiagnostics } from "./capacity-diagnostics.js";
 import { resolveEncryptionPolicy } from "./encryption-policy.js";
 import type { WebchannelEncryptionConfig } from "./encryption-policy.js";
 import { createWebChannelPlugin } from "./channel.js";
-import { handleInboundMessage } from "./inbound.js";
+import {
+  handleInboundMessage,
+  startAgentLifecycleSubscription,
+  stopAgentLifecycleSubscription,
+} from "./inbound.js";
 import {
   createSerializedInboundDispatcher,
   coalesceUserMessages,
@@ -1517,6 +1521,18 @@ export default defineChannelPluginEntry({
   plugin: webChannelPlugin,
   registerFull(api) {
     if (api.registrationMode !== "full") return;
+    // #87: one lifecycle subscription per plugin generation, owned here so the
+    // host can tear it down. `onAgentEvent` registers on a process-global
+    // listener set, so without this a reload would stack a listener per
+    // generation for the lifetime of the process.
+    startAgentLifecycleSubscription(api);
+    api.lifecycle?.registerRuntimeLifecycle?.({
+      id: "webchannel-agent-lifecycle-verdicts",
+      description: "Releases the #87 turn-outcome lifecycle subscription.",
+      cleanup: () => {
+        stopAgentLifecycleSubscription();
+      },
+    });
     accountCoordinator.installFull(api);
   },
 });
