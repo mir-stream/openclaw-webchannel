@@ -73,8 +73,10 @@ The browser does not notice because:
 
 ACK is a useful reactive reachability proof because it is an encrypted inbound application
 frame and is emitted at ingress admission, not at turn completion. `deliverInbound()`
-decrypts before `drainAcked()` (`nats-client.ts:1530-1559`); plugin ingress ACK and duplicate
-ACK behavior is pinned in `packages/plugin/src/ingress-dedupe.test.ts:570-668`.
+decrypts before `drainAcked()` (`nats-client.ts:1530-1559`). Production ingress uses the
+outcome/lease branch of `createIngressOnFlush` (`packages/plugin/src/ingress-dedupe.ts:246-251`,
+`:289-318`); §9.2 requires focused durable-restart replay coverage for its duplicate ACK
+contract rather than treating the legacy boolean-dedupe branch as production authority.
 
 ### Credential scope correction
 
@@ -125,13 +127,25 @@ The episode fields survive that clear/reseal and coalesce many unacked IDs into 
 continuous no-result interval.
 
 The successful-first-publish transaction is exact. `seal()` already captures `attemptAt`
-before calling raw `publish()` (`nats-client.ts:1971-1999`). Reuse that value: immediately
-after `publish()` returns `true`, execute `ackStallSinceAt ??= attemptAt` **before**
-`trackerAdvance(id, "sent")` or timer scheduling. Do not call `retryNow()` again. The
-tracker transition invokes public synchronous send-state listeners, and the injected clock
-and scheduler are also synchronous callouts; no episode mutation may trail those callouts.
-When this publish performs the actual null-to-`attemptAt` start, first increment the
-mutation epoch defined below, then assign the timestamp, all before tracker/timer callouts.
+and the ledger entry around raw `publish()` (`nats-client.ts:1971-1999`). Immediately before
+that call, also capture the exact ledger-entry object identity, current `sessionKey` object
+identity, `connectionEpoch`, and `ackStallMutationEpoch`. Raw `publish()` is a synchronous
+callout: `ws.send()` / `FakeNatsWS.send()` may synchronously deliver an authenticated ACK
+or rejection, raw loss, teardown, or a nested episode before returning.
+
+After `publish()` returns `true`, reuse the captured `attemptAt` and perform a null-to-
+`attemptAt` episode start only if all guards still hold: `unackedLedger.get(id)` is the same
+captured entry, the session-key identity and connection epoch are unchanged, the client is
+non-disconnected/non-terminal, and `ackStallMutationEpoch` still equals the captured value.
+If `ackStallSinceAt` is still null, increment the mutation epoch first and assign the
+timestamp **before** `trackerAdvance(id, "sent")` or timer scheduling. Do not call
+`retryNow()` again. If any guard fails, write no episode state; the owned result, raw loss,
+teardown, or nested episode wins. Existing authoritative tracker logic still runs, so a
+synchronously accepted or failed send cannot be regressed to `sent`.
+
+The tracker transition invokes public synchronous send-state listeners, and the injected
+clock and scheduler are also synchronous callouts; no episode mutation may trail those
+callouts.
 An ordinary publish while `ackStallSinceAt` is already non-null does not increment it: an
 outer owned-result transaction legitimately starts one fresh interval for all work that
 remains after its authoritative frame detachment, including that new publish.
@@ -316,8 +330,11 @@ The existing path then supplies all recovery mechanics:
 4. Existing PoP registration re-establishes plugin peer state and installs an authenticated
    conversation key (`:1625-1793`).
 5. `flushQueue()` moves the unacked messages to the front and reseals them with the same
-   wire IDs (`:1863-1876`). Existing plugin ingress dedupe prevents a second turn and ACKs
-   duplicate IDs (`packages/plugin/src/ingress-dedupe.test.ts:621-647`).
+   wire IDs (`:1863-1876`). The production outcome/lease path looks up the durable chosen
+   outcome before dispatcher admission (`packages/plugin/src/ingress-dedupe.ts:246-251`,
+   `:289-318`, `:405-430`): a previously accepted ID is ACKed without a new lease offer or
+   dispatch. The focused restart-composition test required by §9.2 is the authority for
+   this guarantee.
 
 No plugin file, NATS subject, envelope, ACK shape, `SendFailure.reason`, or receipt state is
 changed.
@@ -377,8 +394,9 @@ Expected files:
 | Production | `packages/client/src/nats-client.ts` | Add/validate `ackStallTimeoutMs` on `WebChannelNatsClientOptions` only; reorder cancellation to null the handle before its injected clear hook; add episode state plus monotonic `ackStallMutationEpoch` and exact mutation ordering; minimum-remaining scheduling; raw-loss allowance consumption; one public reconnect trip; owned-result/teardown reset; correct stale credential comment. |
 | Production | `packages/client/src/nats-client-wrapper.ts` | Explicitly forward `ackStallTimeoutMs` in `natsOptions`; separate raw transport state from session readiness; guard reentrant `onSession` work. `WebChannelNATSClientOptions` inherits the field through `DirectClientOptions`. |
 | Unit test (new) | `packages/client/src/nats-client-agent-liveness.test.ts` | Detector, validation boundaries, episode, replay, raw-loss race, result-callout reentrancy, and timer tests using `FakeNatsWS`. The existing `nats-client-liveness.test.ts` remains the raw heartbeat/auth suite and is untouched. |
+| Unit regression | `packages/client/src/nats-client-sendstate.test.ts` | Extend its local setup option seam and construct the existing exact 1/2/4/8/16/30-second backoff test with `ackStallTimeoutMs: 0`, so it remains the legacy retry-schedule authority rather than inheriting the new default stall wake-up. |
 | Unit test | `packages/client/src/nats-client-wrapper.test.ts` or focused wrapper test | Public option acceptance/forwarding and initial/reconnecting/session-ready status tests. |
-| Component test | `packages/plugin/src/nats-channel-s2.test.ts`, `packages/plugin/src/ingress-dedupe.test.ts` | Compose/retain eviction, re-register, same-ID dedupe, and duplicate-ACK contracts; no plugin production change. |
+| Component test | `packages/plugin/src/nats-channel-s2.test.ts`, `packages/plugin/src/ingress-dedupe.test.ts` | Compose eviction/re-register and add a focused production `outcomeStore` + `beginBatch` durable-restart replay test. The legacy `checkAndRecord` tests remain regression evidence only; no plugin production change. |
 | Public docs | `packages/client/README.md` | Document `ackStallTimeoutMs`: default `30_000`, `0` disables only the detector, maximum `2_147_483_647`, ACK absence remains delivery-unknown/replayable, and public `connected` means authenticated `onSession` readiness rather than raw transport. |
 | Release notes | `packages/client/CHANGELOG.md` | Under Unreleased, record the Added public option and Fixed gateway-restart/session-readiness behavior; classify it wire-compatible and non-breaking with no protocol bump. |
 
@@ -405,7 +423,7 @@ wire remains compatible and `WEBCHANNEL_PROTOCOL_VERSION` does not change.
 Implementation order:
 
 1. Add failing client tests for a healthy raw relay with no application ACK and for exact
-   stall-deadline scheduling.
+   stall-deadline scheduling, including synchronous ACK/rejection during raw publish.
 2. Add the option to high-level `WebChannelNatsClientOptions`, validate/default it, verify
    the public type surface, forward it through the wrapper's explicit `natsOptions` object,
    and add the per-client episode fields.
@@ -418,10 +436,12 @@ Implementation order:
    and successful `onSession` preserve an already-consumed allowance.
 5. Make wrapper readiness session-aware and add initial, reconnecting, success, terminal,
    and reentrant-close tests.
-6. Correct the credential-scope comment; update `packages/client/README.md` and the
+6. Isolate the existing exact-backoff sendstate regression with `ackStallTimeoutMs: 0` and
+   add the production outcome/lease persistent-restart dedupe composition test.
+7. Correct the credential-scope comment; update `packages/client/README.md` and the
    Unreleased section of `packages/client/CHANGELOG.md` with the public contract and
    compatibility classification above.
-7. Run focused client tests, mandatory plugin component tests, the client suite, and
+8. Run focused client tests, mandatory plugin component tests, the client suite, and
    structural checks. Qualify the pushed implementation SHA through external Rota S7 as
    specified in §9.3; leave package/version manifests for release cutting.
 
@@ -437,7 +457,7 @@ cannot prove real plugin peer-cap eviction or plugin ingress dedupe.
 | ID | Scenario | Required assertion |
 |---|---|---|
 | C1 | Session established; send publishes; no ACK; raw PONG remains healthy | No reconnect before 30 s; one public recovery reconnect at exactly 30 s even when next retry is later. |
-| C2 | `ackStallTimeoutMs: 0` | Existing retry/reconnect behavior continues and no liveness reconnect occurs; wrapper readiness is still session-aware. |
+| C2 | `ackStallTimeoutMs: 0` | Existing retry/reconnect behavior continues and no liveness reconnect occurs; the isolated sendstate regression retains exact delays `[1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]`; wrapper readiness is still session-aware. The new agent-liveness suite separately owns default `min(stallRemaining, retryRemaining)` scheduling. |
 | C2a | Option validation | Default is 30,000; `0` and `2_147_483_647` are accepted; `-1`, `2_147_483_648`, `NaN`, infinities, and fractional values throw. Public wrapper options accept and forward the field; raw `NatsClientOptions` does not advertise it. |
 | C3 | Several IDs share the expired deadline | Exactly one reconnect call/socket replacement for the episode. |
 | C4 | Recovery registration succeeds and ledger replays | Same IDs are republished; receipt stays `sent` until ACK, then becomes `accepted`. |
@@ -450,6 +470,7 @@ cannot prove real plugin peer-cap eviction or plugin ingress dedupe.
 | C11 | Owned ACK/rejection invokes an injected `_retryNow` that disconnects | Whole frame is detached, tracker results remain authoritative, stale result-reset state does not overwrite teardown/replacement state, and no timer survives. |
 | C12 | Injected `_retryClearTimeout` re-enters `disconnect()` during result cancellation and explicit/terminal retirement | Timer handle is already null. Teardown exposes detached ownership and cleared episode state; result guards prevent stale writes; authenticated tracker result remains authoritative; no timer survives. |
 | C13 | A and B are ledgered; ACK A reaches `_retryNow`, which synchronously delivers an encrypted owned ACK/rejection for B through `FakeNatsWS` | Nested result detaches B and advances `ackStallMutationEpoch`; the outer A transaction fails its fence and writes no stale timestamp. A later send C starts its own interval from its captured attempt and does not reconnect immediately. |
+| C14 | `FakeNatsWS.send()` synchronously emits an encrypted owned ACK, then separately an overloaded rejection, for the just-published ID | Captured ledger/session/connection/mutation guards reject the stale post-`publish(true)` episode start; authoritative accepted/failed state wins. A later send starts from its own captured attempt and does not reconnect immediately. |
 | W1 | Initial raw socket opens before registration resolves | Wrapper remains `connecting`, `connected: false`. |
 | W2 | Established session loses raw transport; replacement raw socket opens | Wrapper remains `reconnecting`, `connected: false` until replacement `onSession`. |
 | W3 | Replacement registration gets transient 503/exhaustion | Raw reconnect loops while wrapper never flashes connected. |
@@ -474,11 +495,23 @@ plugin:
 - extend/compose `packages/plugin/src/nats-channel-s2.test.ts:42-80` to prove cap eviction
   tears down the evicted peer and re-registering that peer restores its subscription while
   remaining bounded;
-- retain `packages/plugin/src/ingress-dedupe.test.ts:570-668` as the authority that same-ID
-  replay is ACKed but not dispatched twice;
-- if a single composed test is practical, connect these two existing contracts at the
-  component level. Otherwise cite both passing tests as the composition evidence. Do not
-  label either as end-to-end self-healing.
+- add a focused test to `packages/plugin/src/ingress-dedupe.test.ts` through the production
+  `createIngressOnFlush({ outcomeStore, beginBatch, ... })` branch. In one isolated
+  `OPENCLAW_STATE_DIR`, construct the real accepted and overloaded
+  `createPersistentDedupe` adapters with their production namespace prefixes, wrap them in
+  `createIngressOutcomeStore` (matching `ingress-outcome.ts:546-553`), and seed/commit a
+  durable `accepted` outcome for one account + `peer:id`;
+- discard those adapter/store instances, recreate both real persistent adapters and the
+  outcome store from the **same** isolated state directory to model a gateway process
+  restart, then replay that peer/id through a fresh production `createIngressOnFlush` with
+  a `beginBatch` lease spy;
+- assert the replay publishes ACK for the ID, but makes no lease `offer`, logical dispatch,
+  or `inbound_rejected` publication. This focused outcome/lease restart test is the
+  production authority for same-ID recovery. The legacy `checkAndRecord` tests at
+  `ingress-dedupe.test.ts:570-668` may remain regression evidence but are not cited as the
+  production contract;
+- the S2 cap test and focused persistent outcome test are composition evidence, not an
+  end-to-end claim or a change to plugin production code.
 
 ### 9.3 Regression and external product gate
 
@@ -487,6 +520,7 @@ Run at minimum:
 ```sh
 npm test --workspace packages/client -- nats-client-liveness.test.ts
 npm test --workspace packages/client -- nats-client-agent-liveness.test.ts
+npm test --workspace packages/client -- nats-client-sendstate.test.ts
 npm test --workspace packages/client -- nats-client-wrapper.test.ts
 npm test --workspace packages/plugin -- nats-channel-s2.test.ts ingress-dedupe.test.ts
 npm test --workspace packages/client
