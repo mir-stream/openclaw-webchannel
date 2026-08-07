@@ -1,4 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+// #87: core marks a NON-terminal tool-error warning through WeakMap-backed
+// payload metadata, which a test cannot attach (the setter is not part of the
+// plugin SDK surface). Mock the reader so both branches are exercised: any
+// payload whose text carries this sentinel reads as a non-terminal warning.
+const WARNING_SENTINEL = "__NON_TERMINAL_TOOL_WARNING__";
+vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
+  isReplyPayloadNonTerminalToolErrorWarning: (payload: { text?: string }) =>
+    typeof payload?.text === "string" && payload.text.includes(WARNING_SENTINEL),
+}));
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
@@ -461,5 +471,76 @@ describe("handleInboundMessage — #87 turn outcome", () => {
     });
 
     expect(settles).toEqual([]);
+  });
+});
+
+/**
+ * #87 follow-up — trust core's own terminal-vs-warning classification.
+ *
+ * `isError` marks BOTH a terminal failure and a merely non-terminal tool-error
+ * warning. Inferring the difference from "did an answer arrive" is not enough:
+ * a warning can ride a turn whose answer never reached this seam as a `final`,
+ * and a terminal error can precede partial answer text. Core distinguishes the
+ * two and exposes it through `isReplyPayloadNonTerminalToolErrorWarning`.
+ */
+describe("handleInboundMessage — #87 terminal vs non-terminal error", () => {
+  const ordinary = { type: "user_message" as const, text: "hello there" };
+
+  it("settles `ok` for a marked tool warning even with no final answer payload", async () => {
+    // The warning's turn DID answer — just not through a `final` payload at
+    // this seam. Without core's marker this reads as a terminal error and the
+    // widget would offer a retry for a possibly mutating turn that succeeded.
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "streamed answer" }, { kind: "block" });
+        await turn.delivery.deliver(
+          { text: `⚠️ read_file failed ${WARNING_SENTINEL}`, isError: true },
+          { kind: "final" },
+        );
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("settles `error` when a terminal error precedes partial answer text", async () => {
+    // Core builds the payload array as [terminal error, …, answers…], so an
+    // unmarked error BEFORE any answer is a real failure — the trailing text is
+    // partial output, not a completed answer.
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "⚠️ The model errored.", isError: true }, { kind: "final" });
+        await turn.delivery.deliver({ text: "here is half an answer" }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["error"]);
+  });
+
+  it("settles `ok` for an unmarked error AFTER an answer (marker-unreadable fail-safe)", async () => {
+    // Ordering fail-safe: if plugin and host ever resolve different copies of
+    // the openclaw module the WeakMap marker silently reads false. An error
+    // arriving after a delivered answer must still be treated as a warning,
+    // so that break degrades to the old behavior instead of failing successes.
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "here is your answer" }, { kind: "final" });
+        await turn.delivery.deliver({ text: "⚠️ a tool failed (marker unreadable)", isError: true }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
   });
 });

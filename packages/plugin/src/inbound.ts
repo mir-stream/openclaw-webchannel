@@ -1,4 +1,5 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+import { isReplyPayloadNonTerminalToolErrorWarning } from "openclaw/plugin-sdk/reply-payload";
 
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
@@ -382,17 +383,36 @@ export async function handleInboundMessage(
               deliver: async (payload, info) => {
                 const text = payload.text;
                 if (!text) return { visibleReplySent: false };
-                // #87: classify this final payload for the turn outcome. We do
-                // NOT treat `isError` as the verdict on its own — core also
-                // flags a NON-terminal tool-error warning that rides along a
-                // turn which DID answer (it is only marked when a user-facing
-                // assistant reply exists). So we record both facts and let the
-                // settle decide on "was there an answer", not "was there an
-                // error". Status/fallback/compaction notices are core's own
-                // chatter, never the turn's answer.
+                // #87: classify this final payload for the turn outcome.
+                //
+                // `isError` alone is NOT the verdict: core flags BOTH a terminal
+                // failure and a merely non-terminal tool-error warning with it.
+                // Core distinguishes them itself and exposes the answer through
+                // `isReplyPayloadNonTerminalToolErrorWarning`, so we read core's
+                // classification rather than infer one.
+                //
+                // `!answerDelivered` is a deliberate second gate, not redundancy.
+                // The warning marker is WeakMap-backed metadata, not a payload
+                // field, so if the plugin and the host ever resolve DIFFERENT
+                // copies of the openclaw module the lookup silently returns
+                // false and every tool warning would read as terminal. Ordering
+                // makes that degrade safely: core builds the payload array as
+                // [terminal error?, ..., answers..., tool warning?], so a
+                // terminal error always PRECEDES the answer while a warning
+                // always FOLLOWS it. An error arriving after an answer is
+                // therefore a warning even when the marker is unreadable.
+                //
+                // Status/fallback/compaction notices are core's own chatter and
+                // never count as the turn's answer.
                 if (info?.kind === "final") {
-                  if (payload.isError === true) terminalErrorSeen = true;
-                  else if (
+                  if (payload.isError === true) {
+                    if (
+                      !isReplyPayloadNonTerminalToolErrorWarning(payload) &&
+                      !answerDelivered
+                    ) {
+                      terminalErrorSeen = true;
+                    }
+                  } else if (
                     !payload.isStatusNotice &&
                     !payload.isFallbackNotice &&
                     !payload.isCompactionNotice
@@ -489,19 +509,20 @@ export async function handleInboundMessage(
     // no-op when no draft was created or it was already stopped by finalize().
     draft?.stop();
     reasoning?.stop();
-    // #87: settle `error` when the turn produced NO answer and core handed us a
-    // terminal error payload instead. This never downgrades an already-`error`
-    // outcome (the `catch` above), and it deliberately leaves `ok` in place when
-    // an answer WAS delivered — a turn that answered and merely carried a
-    // non-terminal tool warning succeeded. A turn that answers nothing WITHOUT
-    // an error payload (tool-only work, an empty/suppressed reply) also stays
-    // `ok`: silence is a legitimate clean completion, not a failure.
+    // #87: settle `error` when core handed us a terminal failure instead of an
+    // answer (see the classification in the delivery seam). This only ever
+    // ASSIGNS `"error"`, so it can never downgrade the `catch` above. A turn
+    // that answers nothing and never errored (tool-only work, an empty or
+    // suppressed reply) stays `ok`: silence is a legitimate clean completion.
+    //
+    // A terminal error that arrives BEFORE partial answer text still wins — the
+    // turn failed, and partial output is not a completed answer.
     //
     // This is distinct from the `visibleReplySent:false` decision at the
     // delivery seam: that one is about our transport failing to ship an answer
     // the turn DID produce, which is recovered by the history snapshot. This is
     // about the turn producing no answer at all.
-    if (terminalErrorSeen && !answerDelivered) turnOutcome = "error";
+    if (terminalErrorSeen) turnOutcome = "error";
     if (settlementEligible && !transport.sendTurnSettled(wsKey, turnId, turnOutcome)) {
       api.logger?.warn?.(
         `webchannel: turn_settled was not delivered for peer=${wsKey} turn=${turnId} outcome=${turnOutcome}`,
