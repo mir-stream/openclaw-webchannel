@@ -94,6 +94,13 @@ export async function handleInboundMessage(
   let reasoning: ReasoningDraftController | undefined;
   let finalReplyDelivered = false;
   let turnOutcome: "ok" | "error" = "ok";
+  // #87: a provider-rejected turn does NOT throw — core absorbs the failure and
+  // returns its terminal error as an ordinary `isError` reply payload, so the
+  // `catch` below never runs and the turn would settle `ok`. These two track the
+  // turn's ANSWER, which is what the outcome actually means (see the settle
+  // computation in `finally`).
+  let answerDelivered = false;
+  let terminalErrorSeen = false;
   // Ordinary messages have already been ACKed by ingress and therefore need one
   // settled outcome even when setup fails. Control-lane turns never settle; an
   // explicit DM denial opts out below because no agent turn was admitted.
@@ -375,6 +382,24 @@ export async function handleInboundMessage(
               deliver: async (payload, info) => {
                 const text = payload.text;
                 if (!text) return { visibleReplySent: false };
+                // #87: classify this final payload for the turn outcome. We do
+                // NOT treat `isError` as the verdict on its own — core also
+                // flags a NON-terminal tool-error warning that rides along a
+                // turn which DID answer (it is only marked when a user-facing
+                // assistant reply exists). So we record both facts and let the
+                // settle decide on "was there an answer", not "was there an
+                // error". Status/fallback/compaction notices are core's own
+                // chatter, never the turn's answer.
+                if (info?.kind === "final") {
+                  if (payload.isError === true) terminalErrorSeen = true;
+                  else if (
+                    !payload.isStatusNotice &&
+                    !payload.isFallbackNotice &&
+                    !payload.isCompactionNotice
+                  ) {
+                    answerDelivered = true;
+                  }
+                }
                 // P0-4 DECISION: `visibleReplySent:false` (a final-frame send that
                 // failed) does NOT suppress the later `turn_settled{outcome:"ok"}`
                 // — the turn genuinely settled without error, so the client's
@@ -464,6 +489,19 @@ export async function handleInboundMessage(
     // no-op when no draft was created or it was already stopped by finalize().
     draft?.stop();
     reasoning?.stop();
+    // #87: settle `error` when the turn produced NO answer and core handed us a
+    // terminal error payload instead. This never downgrades an already-`error`
+    // outcome (the `catch` above), and it deliberately leaves `ok` in place when
+    // an answer WAS delivered — a turn that answered and merely carried a
+    // non-terminal tool warning succeeded. A turn that answers nothing WITHOUT
+    // an error payload (tool-only work, an empty/suppressed reply) also stays
+    // `ok`: silence is a legitimate clean completion, not a failure.
+    //
+    // This is distinct from the `visibleReplySent:false` decision at the
+    // delivery seam: that one is about our transport failing to ship an answer
+    // the turn DID produce, which is recovered by the history snapshot. This is
+    // about the turn producing no answer at all.
+    if (terminalErrorSeen && !answerDelivered) turnOutcome = "error";
     if (settlementEligible && !transport.sendTurnSettled(wsKey, turnId, turnOutcome)) {
       api.logger?.warn?.(
         `webchannel: turn_settled was not delivered for peer=${wsKey} turn=${turnId} outcome=${turnOutcome}`,

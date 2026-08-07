@@ -37,7 +37,13 @@ type AssembledTurnLike = {
   };
   delivery: {
     deliver: (
-      payload: { text?: string },
+      payload: {
+        text?: string;
+        isError?: boolean;
+        isStatusNotice?: boolean;
+        isFallbackNotice?: boolean;
+        isCompactionNotice?: boolean;
+      },
       info?: { kind?: string },
     ) => Promise<{ visibleReplySent: boolean }>;
   };
@@ -108,10 +114,12 @@ function makeFakeTransport(): {
   finalizes: Array<{ id: string; text: string }>;
   progress: Array<{ id: string; text: string }>;
   typing: string[];
+  settles: Array<"ok" | "error">;
 } {
   const finalizes: Array<{ id: string; text: string }> = [];
   const progress: Array<{ id: string; text: string }> = [];
   const typing: string[] = [];
+  const settles: Array<"ok" | "error"> = [];
   const transport = {
     sendTyping: (sessionKey: string) => {
       typing.push(sessionKey);
@@ -119,7 +127,10 @@ function makeFakeTransport(): {
     },
     sendText: () => true,
     sendReasoning: () => true,
-    sendTurnSettled: () => true,
+    sendTurnSettled: (_sessionKey: string, _turnId: string, outcome: "ok" | "error") => {
+      settles.push(outcome);
+      return true;
+    },
     sendProgress: (_sessionKey: string, id: string, text: string) => {
       progress.push({ id, text });
       return true;
@@ -133,7 +144,7 @@ function makeFakeTransport(): {
     sendApprovalResolved: () => true,
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
-  return { transport, finalizes, progress, typing };
+  return { transport, finalizes, progress, typing, settles };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };
@@ -294,5 +305,142 @@ describe("handleInboundMessage — aborted-turn defensive finalize", () => {
     expect(finalizes).toHaveLength(1);
     expect(finalizes[0]!.text).toBe("Final answer complete");
     expect(finalizes[0]!.text).not.toContain("Stopped");
+  });
+});
+
+/**
+ * #87 — a provider-rejected turn must settle `error`, not `ok`.
+ *
+ * Core does NOT throw when the provider rejects: it absorbs the failure and
+ * returns its terminal message as an ordinary reply payload carrying
+ * `isError: true`. The turn therefore resolves cleanly and — before this fix —
+ * settled `ok`, so the widget rendered the user's bubble as `completed` (a ✓)
+ * with no retry affordance, for a turn that produced no answer at all.
+ *
+ * Measured against a real gateway + real plugin + a provider stubbed to reject
+ * (openclaw 2026.6.10): the terminal payload reaches this seam as
+ * `kind:"final"`, `isError:true`, with no notice flags, ~3ms before the settle.
+ *
+ * The outcome keys off THE ANSWER, not off `isError` alone — core also flags a
+ * NON-terminal tool-error warning, and only ever does so on a turn that DID
+ * produce a user-facing reply. Keying off `isError` alone would flip those
+ * successful turns to `failed`.
+ */
+describe("handleInboundMessage — #87 turn outcome", () => {
+  const ordinary = { type: "user_message" as const, text: "hello there" };
+
+  it("settles `error` when the only final payload is a terminal error", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver(
+          { text: "⚠️ Something went wrong while processing your request.", isError: true },
+          { kind: "final" },
+        );
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["error"]);
+  });
+
+  it("settles `ok` for an ordinary answered turn", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "here is your answer" }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("settles `ok` when a non-terminal tool warning trails a delivered answer", async () => {
+    // The regression this fix must NOT introduce: core marks a tool-error
+    // warning `isError` ONLY when the turn also produced a user-facing reply.
+    // Keying the outcome off `isError` alone would report this success as a
+    // failure and hand the user a retry for a turn that already answered.
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "here is your answer" }, { kind: "final" });
+        await turn.delivery.deliver(
+          { text: "⚠️ a tool failed but the turn recovered", isError: true },
+          { kind: "final" },
+        );
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("settles `error` when only core's own notices accompany the terminal error", async () => {
+    // Status/fallback/compaction notices are core chatter, never the answer —
+    // they must not satisfy "this turn answered".
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver(
+          { text: "↩️ switched model", isFallbackNotice: true },
+          { kind: "final" },
+        );
+        await turn.delivery.deliver({ text: "🧹 Compacting context...", isCompactionNotice: true }, { kind: "final" });
+        await turn.delivery.deliver({ text: "⚠️ Request failed.", isError: true }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["error"]);
+  });
+
+  it("settles `ok` for a silent completion (tool-only turn, no final payload)", async () => {
+    // A turn that answers nothing but never errored is a legitimate clean
+    // completion — it must not be reported as a failure.
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("still settles `error` when the turn throws (pre-existing path)", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {
+        throw new Error("dispatch blew up");
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["error"]);
+  });
+
+  it("does not settle a control-lane turn at all", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "⚠️ failed", isError: true }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", { type: "user_message", text: "/stop" }, "default", {
+      controlLane: true,
+    });
+
+    expect(settles).toEqual([]);
   });
 });
