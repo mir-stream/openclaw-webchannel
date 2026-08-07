@@ -220,6 +220,24 @@ jobs:
         run: bash e2e/local/run-enrolled-transport.sh
 
       # ──────────────────────────────────────────────────────────────────────
+      # 8d. Live e2e: turn outcome on provider rejection (issue #87 gate)
+      #    `turn_settled{outcome}` is what the browser client promotes a user
+      #    message's sendState from — `ok` → completed (✓), `error` → failed,
+      #    which is also what gates the retry affordance. A turn rejected by the
+      #    PROVIDER used to settle `ok`: a ✓ with no retry on a turn that never
+      #    answered. Only a live gateway can stage this — core does NOT throw on
+      #    a provider rejection, it returns its terminal message as an ordinary
+      #    `isError` reply payload, so the plugin's turn resolves cleanly and its
+      #    catch never runs. Two turns in one boot: a rejected one (must settle
+      #    `error` and still show the user core's message) and an ordinary one
+      #    (must still settle `ok`, so an "always error" fix cannot pass).
+      #    Isolated under /tmp/oc-turn-outcome-e2e (port 18981) — hermetic, no
+      #    secret. Any non-zero exit FAILS the gate.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Live e2e: turn outcome on provider rejection (#87)"
+        run: bash e2e/local/run-turn-outcome.sh
+
+      # ──────────────────────────────────────────────────────────────────────
       # 8e. Live e2e: ALL-REAL fusion
       #    Fuses the enrolled-transport server topology with the real-browser
       #    driver: the Chromium peer NKEY-auths to the JWT-auth nats-server AND

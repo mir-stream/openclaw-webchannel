@@ -44,6 +44,7 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 | `echo-openai-server.mjs` | ~50-line fake OpenAI `/v1/chat/completions` that returns `echo: <last user msg>`. Pointed at by an openclaw `openai-completions` provider. |
 | `all-real.mjs` | Playwright runner for `run-all-real.sh` and `run-derived-trust.sh`: serves the browser bundle, launches headless Chromium running the production `WebChannelNatsClient`, NKEY-authenticates to the JWT-auth nats-server, drives the JWT + PoP register hop, and asserts the reply echoes the sent text. **This is the "from a real browser" proof.** |
 | `enrolled-transport-roundtrip.ts` | Node driver for `run-enrolled-transport.sh`: an NKEY-authenticated peer that round-trips one message against the device-flow-enrolled plugin. |
+| `turn-outcome-roundtrip.ts` | Node driver for `run-turn-outcome.sh`: runs a provider-rejected turn and an ordinary turn against the same enrolled plugin and asserts the `turn_settled{outcome}` of each. |
 | `two-account-isolation-roundtrip.ts` | Node driver for `run-two-account-isolation.sh`: drives positive round-trips plus an A-authorized token against B's live register subject. |
 | `ci-smoke.html` | The unified demo/chat page served by the SaaS issuer. |
 
@@ -55,7 +56,7 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 
 ## The harnesses
 
-All four boot a real gateway + `nats-server` + echo provider under an isolated
+All five boot a real gateway + `nats-server` + echo provider under an isolated
 `OPENCLAW_HOME`, run one encrypted round-trip through the register hop, and self-clean on exit.
 
 ```bash
@@ -64,6 +65,7 @@ All four boot a real gateway + `nats-server` + echo provider under an isolated
 ./e2e/local/run-enrolled-transport.sh    # agent-side device-flow enrollment → enrolled NATS transport
 ./e2e/local/run-two-account-isolation.sh # one gateway/two accounts, live cross-account rejection
 ./e2e/local/run-derived-trust.sh         # `channels add` with ZERO hand-written JWT trust facts
+./e2e/local/run-turn-outcome.sh          # provider-rejected turn settles `error`, not `ok` (#87)
 ```
 
 Each prints `[REPLY] echo: …<your message>` (and a `[PROOF] …` line) on success, and exits
@@ -99,6 +101,28 @@ still pass afterward.
 Both entries run through `registerFull` → host account start →
 `NatsAccountRuntimeCoordinator`/`NatsChannel`; there is no direct handler/verifier harness here.
 
+### `run-turn-outcome.sh` — a failed turn must look failed (#87 gate)
+
+`turn_settled{outcome}` is the signal the browser client promotes a user message's
+`sendState` from: `ok` → `completed` (a ✓), `error` → `failed{reason:"turn-failed",
+retryable:true}` — which is also what gates the retry affordance. Issue #87: a turn
+rejected by the **provider** settled `ok`, so the widget rendered a ✓ and offered no
+retry for a turn that produced no answer.
+
+This needs a live gateway because the defect lives in a core behavior no unit test can
+stage: core does **not** throw on a provider rejection. It absorbs the failure and hands
+the plugin its terminal message as an ordinary reply payload flagged `isError`, so the
+turn resolves cleanly and the plugin's `catch` never runs.
+`packages/plugin/src/inbound.test.ts` pins the plugin-side logic; this harness pins the
+core behavior that logic reads.
+
+Same topology as `run-enrolled-transport.sh`, with `ECHO_FAIL_MARKER` set so the echo
+provider answers HTTP 500 for any turn carrying the marker. Two turns, one gateway boot:
+a rejected turn (must settle `error` **and** still deliver core's terminal message — the
+fix must not silence the user-visible explanation) and an ordinary turn (must still settle
+`ok`, so an unconditional "always error" fix cannot pass). Verified load-bearing by
+revert-check: with the fix disabled the harness exits 6.
+
 ### `run-derived-trust.sh` — zero hand-written trust facts
 
 Proves a fresh `openclaw channels add` reaches a working encrypted register round-trip with
@@ -123,6 +147,6 @@ asserts a real-issuer JWT verifies against the served JWKS without a gateway.
 
 ## In CI
 
-`run-all-real.sh` and the other three harnesses run in the CI gate
+`run-all-real.sh` and the other four harnesses run in the CI gate
 (`.github/workflows/e2e-gate.yml`), so the real-gateway + `inbound.run` path is
 regression-guarded on every push/PR.

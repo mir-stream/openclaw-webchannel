@@ -7,12 +7,18 @@
  * Lets a real openclaw gateway answer without calling a real LLM — point a
  * provider at http://127.0.0.1:<port>/v1 with api:"openai-completions".
  *
+ * Set ECHO_FAIL_MARKER to make the server REJECT (HTTP 500) any turn whose last
+ * user message contains that marker, the way a provider outage does. Used by the
+ * #87 turn-outcome harness to drive core's terminal-error path. Unset (the
+ * default) means every turn echoes as before.
+ *
  * Usage: node e2e/local/echo-openai-server.mjs [port]   (default 18900)
  */
 import { createServer } from "node:http";
 
 const PORT = parseInt(process.argv[2] || process.env.ECHO_PORT || "18900", 10);
 const PREFIX = process.env.ECHO_PREFIX ?? "echo: ";
+const FAIL_MARKER = process.env.ECHO_FAIL_MARKER || "";
 
 function lastUserText(messages) {
   if (!Array.isArray(messages)) return "";
@@ -50,6 +56,19 @@ const server = createServer(async (req, res) => {
     const raw = await readBody(req);
     let body = {};
     try { body = JSON.parse(raw); } catch { /* ignore */ }
+
+    // Provider-rejection mode (#87 harness). A 500 here is what a real provider
+    // outage looks like to core: it does not throw out of the turn, it absorbs
+    // the failure and returns a terminal error payload instead of an answer.
+    if (FAIL_MARKER && lastUserText(body.messages).includes(FAIL_MARKER)) {
+      console.log(`[echo] REJECT (marker=${FAIL_MARKER})`);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: { message: "echo harness: provider rejected the turn", type: "server_error" },
+      }));
+      return;
+    }
+
     const reply = `${PREFIX}${lastUserText(body.messages)}`;
     const id = "chatcmpl-echo";
     const created = Math.floor(Date.now() / 1000);
