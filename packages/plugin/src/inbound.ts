@@ -68,13 +68,24 @@ function ensureAgentLifecycleSubscription(api: OpenClawPluginApi): void {
     if (evt?.stream !== "lifecycle") return;
     const runId = evt.runId;
     if (!runId) return;
-    const phase = (evt.data as { phase?: unknown } | undefined)?.phase;
+    const data = evt.data as { phase?: unknown; aborted?: unknown } | undefined;
+    const phase = data?.phase;
     if (phase !== "end" && phase !== "error") return;
+    // #89: a user abort is a CANCELLATION, not a turn failure. Core stamps
+    // `aborted` on the terminal (run-termination-*.js:23) and, depending on how
+    // the abort surfaces, the phase can be either `end` or `error`. Recording
+    // the `error` form as a failure would settle a /stop-ed turn as
+    // `failed{reason:"turn-failed", retryable:true}` — mislabelling a
+    // deliberate cancellation and offering to re-run work the user just
+    // stopped. `cancelled` is the right outcome and needs a wire value that
+    // does not exist yet, so an aborted run keeps the pre-existing `ok` until
+    // #89 adds one. This turn deliberately does NOT change /stop behaviour.
     if (agentRunVerdicts.size >= MAX_TRACKED_RUNS && !agentRunVerdicts.has(runId)) {
       const oldest = agentRunVerdicts.keys().next();
       if (!oldest.done) agentRunVerdicts.delete(oldest.value);
     }
-    agentRunVerdicts.set(runId, phase === "error" ? "error" : "ok");
+    const aborted = data?.aborted === true;
+    agentRunVerdicts.set(runId, phase === "error" && !aborted ? "error" : "ok");
   });
 }
 

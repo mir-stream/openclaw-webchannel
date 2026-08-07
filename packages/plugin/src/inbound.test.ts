@@ -787,3 +787,68 @@ describe("handleInboundMessage — #87 lifecycle verdict", () => {
     expect(settles).toEqual(["error"]);
   });
 });
+
+/**
+ * #89 boundary — a user abort must not be reported as a turn failure.
+ *
+ * Core stamps `aborted` on the run's lifecycle terminal, and depending on how
+ * the abort surfaces the phase can be `end` or `error`. Measured live for a
+ * /stop during a provider call at 2026.6.10: `phase:"end"` with
+ * `aborted:true, stopReason:"aborted"`. The `error` form must not be read as a
+ * failure either — that would settle a deliberately cancelled turn as
+ * `failed{reason:"turn-failed", retryable:true}` and offer to re-run work the
+ * user just stopped. `cancelled` is the correct outcome; it needs a wire value
+ * that does not exist yet (#89), so an aborted run keeps the pre-existing `ok`.
+ */
+describe("handleInboundMessage — #89 aborted runs are not failures", () => {
+  const ordinary = { type: "user_message" as const, text: "hello there" };
+  const RUN = "run-aborted";
+
+  function abortedTurn(phase: "end" | "error") {
+    const holder: { emit?: (e: LifecycleEvent) => void } = {};
+    const made = makeFakeApi({
+      streamingMode: "off",
+      withAgentEvents: true,
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAgentRunStart?.(RUN);
+        holder.emit?.({
+          stream: "lifecycle",
+          runId: RUN,
+          data: { phase, aborted: true, stopReason: "aborted" },
+        });
+      },
+    });
+    holder.emit = made.emitLifecycle;
+    return made;
+  }
+
+  it.each(["end", "error"] as const)(
+    "settles `ok` for an aborted run (phase=%s), never a retryable failure",
+    async (phase) => {
+      const { api } = abortedTurn(phase);
+      const { transport, settles } = makeFakeTransport();
+
+      await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+      expect(settles).toEqual(["ok"]);
+    },
+  );
+
+  it("still settles `error` for a NON-aborted lifecycle error", async () => {
+    const holder: { emit?: (e: LifecycleEvent) => void } = {};
+    const made = makeFakeApi({
+      streamingMode: "off",
+      withAgentEvents: true,
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAgentRunStart?.(RUN);
+        holder.emit?.({ stream: "lifecycle", runId: RUN, data: { phase: "error", aborted: false } });
+      },
+    });
+    holder.emit = made.emitLifecycle;
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["error"]);
+  });
+});
