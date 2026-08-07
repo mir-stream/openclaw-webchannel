@@ -403,6 +403,25 @@ describe("handleInboundMessage — #87 turn outcome", () => {
     expect(settles).toEqual(["error"]);
   });
 
+  it("does not count a NON-final payload as the turn's answer", async () => {
+    // The `kind === "final"` guard is load-bearing: block/tool payloads are
+    // interim output, not the turn's answer. If they counted, a turn that
+    // streamed a visible block and THEN failed terminally would settle `ok` —
+    // #87 all over again for that shape.
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "interim block output" }, { kind: "block" });
+        await turn.delivery.deliver({ text: "⚠️ Request failed.", isError: true }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["error"]);
+  });
+
   it("settles `ok` for a silent completion (tool-only turn, no final payload)", async () => {
     // A turn that answers nothing but never errored is a legitimate clean
     // completion — it must not be reported as a failure.
