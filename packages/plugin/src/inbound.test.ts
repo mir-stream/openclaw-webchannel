@@ -40,6 +40,7 @@ type BuildContextParams = {
 
 type AssembledTurnLike = {
   replyOptions?: {
+    onAgentRunStart?: (runId: string) => void;
     onToolStart?: (p: unknown) => void;
     onItemEvent?: (p: unknown) => void;
     onPartialReply?: (p: { text?: string }) => void;
@@ -59,12 +60,19 @@ type AssembledTurnLike = {
   };
 };
 
+type LifecycleEvent = { stream?: string; runId?: string; data?: Record<string, unknown> };
+type LifecycleListener = (evt: LifecycleEvent) => void;
+
 function makeFakeApi(params: {
   streamingMode: "off" | "partial" | "progress";
   runImpl: (turn: AssembledTurnLike) => Promise<void>;
+  /** Expose the host's agent-events surface (#87 lifecycle verdict). */
+  withAgentEvents?: boolean;
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
+  /** Push a lifecycle event to whatever the plugin subscribed. */
+  emitLifecycle: (evt: LifecycleEvent) => void;
 } {
   const captured: { buildContext?: BuildContextParams } = {};
 
@@ -109,13 +117,27 @@ function makeFakeApi(params: {
     },
   };
 
+  const listeners: LifecycleListener[] = [];
+  const events = params.withAgentEvents
+    ? {
+        onAgentEvent: (l: LifecycleListener) => {
+          listeners.push(l);
+          return () => {};
+        },
+      }
+    : undefined;
+
   const api = {
     config,
     logger: { info: () => {}, warn: () => {}, error: () => {} },
-    runtime: { channel },
+    runtime: { channel, ...(events ? { events } : {}) },
   } as unknown as OpenClawPluginApi;
 
-  return { api, captured };
+  const emitLifecycle = (evt: LifecycleEvent): void => {
+    for (const l of [...listeners]) l(evt);
+  };
+
+  return { api, captured, emitLifecycle };
 }
 
 /** A transport that records finalize frames and accepts progress/typing/text. */
@@ -607,5 +629,161 @@ describe("handleInboundMessage — #87 block-streamed answers", () => {
     await handleInboundMessage(api, transport, "peer-1", ordinary);
 
     expect(settles).toEqual(["ok"]);
+  });
+});
+
+/**
+ * #87 follow-up 3 — core's lifecycle verdict is authoritative.
+ *
+ * The payload heuristics cannot separate "answered, then a failed mutating
+ * tool" (a success) from "answered, then timed out" (a failure): both arrive as
+ * an answer followed by an unmarked `isError` final. Core knows which it was
+ * and publishes it as the run's lifecycle terminal, so when a verdict exists it
+ * decides the outcome and the heuristics are not consulted.
+ */
+describe("handleInboundMessage — #87 lifecycle verdict", () => {
+  const ordinary = { type: "user_message" as const, text: "hello there" };
+  const RUN = "run-abc";
+
+  /** Drives a turn that starts run `RUN`, runs `body`, then emits `phase`. */
+  function turnWithVerdict(
+    phase: "end" | "error" | undefined,
+    body: (turn: AssembledTurnLike) => Promise<void>,
+  ) {
+    const holder: { emit?: (e: LifecycleEvent) => void } = {};
+    const made = makeFakeApi({
+      streamingMode: "off",
+      withAgentEvents: true,
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAgentRunStart?.(RUN);
+        await body(turn);
+        if (phase) {
+          holder.emit?.({ stream: "lifecycle", runId: RUN, data: { phase } });
+        }
+      },
+    });
+    holder.emit = made.emitLifecycle;
+    return made;
+  }
+
+  it("settles `error` on a lifecycle error even though an answer was delivered", async () => {
+    // The timeout shape: core appends its terminal error after retained answer
+    // payloads. The heuristic alone reads this as a success.
+    const { api } = turnWithVerdict("error", async (turn) => {
+      await turn.delivery.deliver({ text: "partial answer text" }, { kind: "final" });
+      await turn.delivery.deliver({ text: "⚠️ timed out", isError: true }, { kind: "final" });
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["error"]);
+  });
+
+  it("settles `ok` on a lifecycle end even though an unmarked isError final arrived", async () => {
+    // The failed-mutating-tool shape: the turn answered and core warned about a
+    // failed write. Reading that warning as terminal would fail a successful
+    // turn and offer a retry that could repeat the write.
+    const { api } = turnWithVerdict("end", async (turn) => {
+      await turn.delivery.deliver({ text: "done — I updated the file" }, { kind: "final" });
+      await turn.delivery.deliver({ text: "⚠️ write_file failed", isError: true }, { kind: "final" });
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("settles `ok` on a lifecycle end for a turn with no answer at all", async () => {
+    const { api } = turnWithVerdict("end", async (turn) => {
+      await turn.delivery.deliver({ text: "⚠️ something failed", isError: true }, { kind: "final" });
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("takes the LAST terminal for a run (model fallback emits several attempts)", async () => {
+    const holder: { emit?: (e: LifecycleEvent) => void } = {};
+    const made = makeFakeApi({
+      streamingMode: "off",
+      withAgentEvents: true,
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAgentRunStart?.(RUN);
+        holder.emit?.({ stream: "lifecycle", runId: RUN, data: { phase: "error" } });
+        // A later attempt on the same run succeeds.
+        holder.emit?.({ stream: "lifecycle", runId: RUN, data: { phase: "end" } });
+        await turn.delivery.deliver({ text: "the answer" }, { kind: "final" });
+      },
+    });
+    holder.emit = made.emitLifecycle;
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("ignores a terminal belonging to a DIFFERENT run", async () => {
+    // The event stream is process-global; concurrent turns must not read each
+    // other's verdicts.
+    const holder: { emit?: (e: LifecycleEvent) => void } = {};
+    const made = makeFakeApi({
+      streamingMode: "off",
+      withAgentEvents: true,
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAgentRunStart?.(RUN);
+        holder.emit?.({ stream: "lifecycle", runId: "some-other-run", data: { phase: "error" } });
+        await turn.delivery.deliver({ text: "the answer" }, { kind: "final" });
+      },
+    });
+    holder.emit = made.emitLifecycle;
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("ignores non-lifecycle streams and non-terminal phases", async () => {
+    const holder: { emit?: (e: LifecycleEvent) => void } = {};
+    const made = makeFakeApi({
+      streamingMode: "off",
+      withAgentEvents: true,
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAgentRunStart?.(RUN);
+        // A terminal-looking phase on a NON-lifecycle stream must be ignored;
+        // if it leaked through it would read as a success and mask the failure.
+        holder.emit?.({ stream: "assistant", runId: RUN, data: { phase: "end" } });
+        // `finishing` is not terminal — it carries an error even on attempts
+        // that later succeed.
+        holder.emit?.({ stream: "lifecycle", runId: RUN, data: { phase: "finishing", error: "x" } });
+        await turn.delivery.deliver({ text: "⚠️ failed", isError: true }, { kind: "final" });
+      },
+    });
+    holder.emit = made.emitLifecycle;
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", ordinary);
+
+    // No terminal ⇒ the payload fallback decides, and it reads this as a failure.
+    expect(settles).toEqual(["error"]);
+  });
+
+  it("falls back to the payload reading when the host exposes no events surface", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "⚠️ Request failed.", isError: true }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["error"]);
   });
 });

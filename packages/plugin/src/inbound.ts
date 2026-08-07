@@ -21,6 +21,64 @@ import type {
 } from "./message-adapter.js";
 
 /**
+ * #87: core's own terminal verdict for an agent run, observed off the lifecycle
+ * event stream.
+ *
+ * The delivery seam alone cannot decide a turn's outcome. It sees payloads, and
+ * two different situations produce an identical payload shape — an answer
+ * followed by an `isError` final:
+ *
+ *   - a turn that ANSWERED and then reported a failed (often mutating) tool.
+ *     Core emits that warning specifically for mutating tools even when the
+ *     turn answered (payloads-*.js:108), and only marks it non-terminal for
+ *     MIDDLEWARE errors (payloads-*.js:77), so it usually arrives unmarked.
+ *   - a turn that answered and then TIMED OUT, where core appends its terminal
+ *     error after the retained payloads (embedded-agent-*.js:4105).
+ *
+ * Calling the first terminal fails a successful turn and offers a retry that
+ * can repeat a mutation; calling the second non-terminal is #87 again. No
+ * payload-shape heuristic separates them, so we take the verdict from core
+ * instead: the run's lifecycle terminal is `end` (succeeded) or `error`
+ * (failed). Measured at 2026.6.10 to arrive ~8-15ms BEFORE this plugin settles,
+ * and `onAgentRunStart` hands us the very same `runId` the events carry.
+ *
+ * One `runId` emits several `start`/`finishing` pairs under model fallback;
+ * only `end`/`error` are terminal, and the last one wins.
+ */
+type AgentRunVerdict = "ok" | "error";
+
+/** Terminal verdict per agent run, drained by the turn that owns the run. */
+const agentRunVerdicts = new Map<string, AgentRunVerdict>();
+/** Events surfaces already subscribed, so a plugin reload cannot double-subscribe. */
+const subscribedEventSurfaces = new WeakSet<object>();
+/**
+ * Backstop only. Entries are deleted by the settling turn, so this cap is never
+ * reached in normal operation — it bounds the leak if a run terminates for a
+ * turn that never settles (a control-lane turn, or a crashed dispatch).
+ */
+const MAX_TRACKED_RUNS = 512;
+
+/** Subscribe once per events surface; a no-op when the host predates the API. */
+function ensureAgentLifecycleSubscription(api: OpenClawPluginApi): void {
+  const events = api.runtime?.events;
+  if (!events || typeof events.onAgentEvent !== "function") return;
+  if (subscribedEventSurfaces.has(events)) return;
+  subscribedEventSurfaces.add(events);
+  events.onAgentEvent((evt) => {
+    if (evt?.stream !== "lifecycle") return;
+    const runId = evt.runId;
+    if (!runId) return;
+    const phase = (evt.data as { phase?: unknown } | undefined)?.phase;
+    if (phase !== "end" && phase !== "error") return;
+    if (agentRunVerdicts.size >= MAX_TRACKED_RUNS && !agentRunVerdicts.has(runId)) {
+      const oldest = agentRunVerdicts.keys().next();
+      if (!oldest.done) agentRunVerdicts.delete(oldest.value);
+    }
+    agentRunVerdicts.set(runId, phase === "error" ? "error" : "ok");
+  });
+}
+
+/**
  * Handle one inbound user message from the browser widget.
  *
  * Phase 0 inbound path (walking skeleton) — proper channel inbound lifecycle:
@@ -79,6 +137,11 @@ export async function handleInboundMessage(
   // key (the anonymous strategy is the single-peer special case, where this
   // falls back to ANON_PEER_ID).
   const wsKey = peerId || ANON_PEER_ID;
+
+  // #87: start observing core's lifecycle terminals before the turn runs.
+  ensureAgentLifecycleSubscription(api);
+  /** The agent run this turn owns, learned from `onAgentRunStart`. */
+  let agentRunId: string | undefined;
 
   // Control lane (P1-8a): an out-of-band abort turn ("/stop"). It reaches here
   // directly (NOT via the per-session FIFO) so core's fast-abort can cancel the
@@ -312,9 +375,13 @@ export async function handleInboundMessage(
             // draft (progress/partial mode). When NEITHER is active — block/off
             // with no "stream" reasoning, and every control-lane turn — the whole
             // key is omitted, restoring the pre-reasoning-lane block/off shape.
-            ...(reasoning || draft
-              ? {
-                  replyOptions: {
+            replyOptions: {
+                    // #87: always wired, on every turn and every streaming mode
+                    // — this is how the turn learns which agent run's lifecycle
+                    // terminal is its own.
+                    onAgentRunStart: (runId) => {
+                      agentRunId = runId;
+                    },
                     // Reasoning callbacks are wired iff the lane opened above.
                     ...(reasoning
                       ? {
@@ -370,9 +437,7 @@ export async function handleInboundMessage(
                             : {}),
                         }
                       : {}),
-                  },
-                }
-              : {}),
+            },
             // THIS channel's outbound delivery seam. Forward the assembled reply
             // text to the originating widget's live socket. In either draft mode
             // (progress/partial) we FINALIZE the in-flight draft (reusing its id)
@@ -543,7 +608,26 @@ export async function handleInboundMessage(
     // delivery seam: that one is about our transport failing to ship an answer
     // the turn DID produce, which is recovered by the history snapshot. This is
     // about the turn producing no answer at all.
-    if (terminalErrorSeen) turnOutcome = "error";
+    // #87: core's own verdict for this turn's agent run decides the outcome.
+    // It is authoritative — it separates the two payload shapes this seam
+    // cannot (an answered turn reporting a failed mutating tool vs an answered
+    // turn that then timed out), so when it is present the payload heuristics
+    // below are not consulted at all.
+    const verdict = agentRunId ? agentRunVerdicts.get(agentRunId) : undefined;
+    if (agentRunId) agentRunVerdicts.delete(agentRunId);
+    if (verdict === "error") {
+      turnOutcome = "error";
+    } else if (verdict === undefined && terminalErrorSeen) {
+      // No verdict: the turn never started an agent run (a command-only turn),
+      // or the terminal event has not landed. Fall back to the payload-shape
+      // reading, which is what shipped before the verdict existed. It is the
+      // ambiguous path — it favors `ok` on an answered turn so that a success
+      // is never reported as a failure with a retry that could repeat a
+      // mutation. See the classification comment in the delivery seam.
+      turnOutcome = "error";
+    }
+    // A `verdict === "ok"` never downgrades the `catch` above: this block only
+    // ever ASSIGNS "error".
     if (settlementEligible && !transport.sendTurnSettled(wsKey, turnId, turnOutcome)) {
       api.logger?.warn?.(
         `webchannel: turn_settled was not delivered for peer=${wsKey} turn=${turnId} outcome=${turnOutcome}`,
