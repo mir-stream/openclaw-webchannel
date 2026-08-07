@@ -391,22 +391,43 @@ export async function handleInboundMessage(
                 // `isReplyPayloadNonTerminalToolErrorWarning`, so we read core's
                 // classification rather than infer one.
                 //
-                // `!answerDelivered` is a deliberate second gate, not redundancy.
-                // The warning marker is WeakMap-backed metadata, not a payload
-                // field, so if the plugin and the host ever resolve DIFFERENT
-                // copies of the openclaw module the lookup silently returns
-                // false and every tool warning would read as terminal. Ordering
-                // makes that degrade safely: core builds the payload array as
-                // [terminal error?, ..., answers..., tool warning?], so a
-                // terminal error always PRECEDES the answer while a warning
-                // always FOLLOWS it. An error arriving after an answer is
-                // therefore a warning even when the marker is unreadable.
+                // The marker is NOT sufficient on its own. At 2026.6.10 core
+                // only sets it for MIDDLEWARE tool errors
+                // (`shouldMarkNonTerminalToolErrorWarning = middlewareError ===
+                // true`, payloads-*.js:77), so an ordinary tool warning is
+                // `isError` with no marker at all. It is also WeakMap-backed
+                // metadata rather than a payload field, so a host and plugin
+                // resolving different copies of the openclaw module would make
+                // the lookup silently return false.
+                //
+                // `!answerDelivered` carries those cases. Core builds the payload
+                // array as [terminal error?, ..., answers..., tool warning?]
+                // (payloads-*.js:180/:251/:285) and the dispatcher sends every
+                // element (dispatch-*.js:1966), so a terminal error PRECEDES the
+                // answer while a warning FOLLOWS it: an error arriving after an
+                // answer is a warning even when unmarked.
+                //
+                // Block payloads count as answer output for exactly that reason.
+                // They are visible assistant text, and when core streams the
+                // answer as blocks a trailing unmarked tool warning would
+                // otherwise be the only `final` and read as a terminal failure —
+                // reporting an answered (possibly mutating) turn as failed and
+                // offering a retry. Counting them keeps a block-streamed turn no
+                // worse than it was before this fix. The cost is that partial
+                // block output followed by a real terminal failure still settles
+                // `ok`; that is the pre-existing #87 shape, not a new regression,
+                // and closing it needs a turn-level terminal signal this seam
+                // does not carry. Tool payloads are tool chatter, never an answer.
                 //
                 // Status/fallback/compaction notices are core's own chatter and
                 // never count as the turn's answer.
-                if (info?.kind === "final") {
+                const kind = info?.kind;
+                if (kind === "final" || kind === "block") {
                   if (payload.isError === true) {
+                    // Only a FINAL error can be the turn's verdict; a block-level
+                    // error is interim streamed content, not a settlement.
                     if (
+                      kind === "final" &&
                       !isReplyPayloadNonTerminalToolErrorWarning(payload) &&
                       !answerDelivered
                     ) {

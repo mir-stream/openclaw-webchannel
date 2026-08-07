@@ -413,15 +413,15 @@ describe("handleInboundMessage — #87 turn outcome", () => {
     expect(settles).toEqual(["error"]);
   });
 
-  it("does not count a NON-final payload as the turn's answer", async () => {
-    // The `kind === "final"` guard is load-bearing: block/tool payloads are
-    // interim output, not the turn's answer. If they counted, a turn that
-    // streamed a visible block and THEN failed terminally would settle `ok` —
-    // #87 all over again for that shape.
+  it("does not count a TOOL payload as the turn's answer", async () => {
+    // Tool payloads are tool chatter, never the turn's answer. If they counted,
+    // a turn that emitted tool progress and THEN failed terminally would settle
+    // `ok` — #87 all over again for that shape. (Block payloads DO count; see
+    // the block-streaming case below.)
     const { api } = makeFakeApi({
       streamingMode: "off",
       runImpl: async (turn) => {
-        await turn.delivery.deliver({ text: "interim block output" }, { kind: "block" });
+        await turn.delivery.deliver({ text: "🛠️ read_file" }, { kind: "tool" });
         await turn.delivery.deliver({ text: "⚠️ Request failed.", isError: true }, { kind: "final" });
       },
     });
@@ -486,14 +486,15 @@ describe("handleInboundMessage — #87 turn outcome", () => {
 describe("handleInboundMessage — #87 terminal vs non-terminal error", () => {
   const ordinary = { type: "user_message" as const, text: "hello there" };
 
-  it("settles `ok` for a marked tool warning even with no final answer payload", async () => {
-    // The warning's turn DID answer — just not through a `final` payload at
-    // this seam. Without core's marker this reads as a terminal error and the
-    // widget would offer a retry for a possibly mutating turn that succeeded.
+  it("settles `ok` for a marked tool warning when NO answer reached this seam", async () => {
+    // The marker is what carries this case: the turn answered on a lane this
+    // seam never sees (a message-tool / source-reply delivery), so there is no
+    // block or final answer payload to infer from. Without core's marker the
+    // trailing warning reads as a terminal failure and the widget would offer a
+    // retry for a possibly mutating turn that succeeded.
     const { api } = makeFakeApi({
       streamingMode: "off",
       runImpl: async (turn) => {
-        await turn.delivery.deliver({ text: "streamed answer" }, { kind: "block" });
         await turn.delivery.deliver(
           { text: `⚠️ read_file failed ${WARNING_SENTINEL}`, isError: true },
           { kind: "final" },
@@ -535,6 +536,70 @@ describe("handleInboundMessage — #87 terminal vs non-terminal error", () => {
       runImpl: async (turn) => {
         await turn.delivery.deliver({ text: "here is your answer" }, { kind: "final" });
         await turn.delivery.deliver({ text: "⚠️ a tool failed (marker unreadable)", isError: true }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+});
+
+/**
+ * #87 follow-up 2 — block-streamed answers.
+ *
+ * Core can deliver the assistant's answer as `kind:"block"` payloads
+ * (dispatch-*.js:1885 routes them through this same seam). At 2026.6.10 core
+ * marks a non-terminal tool warning ONLY for middleware errors
+ * (payloads-*.js:77), so an ordinary tool warning arrives `isError` with no
+ * marker. If blocks did not count as answer output, that warning would be the
+ * only `final` on an answered turn and would read as a terminal failure —
+ * reporting a success as failed and offering a retry for a turn that may
+ * already have mutated state.
+ */
+describe("handleInboundMessage — #87 block-streamed answers", () => {
+  const ordinary = { type: "user_message" as const, text: "hello there" };
+
+  it("settles `ok` when the answer streamed as blocks and an UNMARKED tool warning trails it", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "First half of the answer." }, { kind: "block" });
+        await turn.delivery.deliver({ text: "Second half of the answer." }, { kind: "block" });
+        // No marker: core only marks middleware tool errors.
+        await turn.delivery.deliver({ text: "⚠️ write_file failed", isError: true }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["ok"]);
+  });
+
+  it("still settles `error` when a terminal error precedes any block output", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "⚠️ The model errored.", isError: true }, { kind: "final" });
+        await turn.delivery.deliver({ text: "late block output" }, { kind: "block" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", ordinary);
+
+    expect(settles).toEqual(["error"]);
+  });
+
+  it("does not let a block-level error settle the turn", async () => {
+    // A block-level `isError` is interim streamed content, not a verdict.
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "⚠️ interim trouble", isError: true }, { kind: "block" });
+        await turn.delivery.deliver({ text: "the answer arrived anyway" }, { kind: "final" });
       },
     });
     const { transport, settles } = makeFakeTransport();
