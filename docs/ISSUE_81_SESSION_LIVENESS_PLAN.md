@@ -140,11 +140,13 @@ The successful-first-publish transaction is exact. Before sealing, capture the e
 ledger-entry object identity, the sealing `sessionKey` object identity, `connectionEpoch`,
 and `ackStallMutationEpoch`, then seal with that key. `sealMessage()` may generate nonce/time,
 but it invokes no configured client listener or injected retry seam and is not treated as
-an embedder reentrancy point. Next call `retryNow()` exactly once, capture its result as
-`attemptAt`, and re-check the exact entry/key/connection/mutation/lifecycle guards. If the
-initial retry metadata needs `retryDelay()`/`retryRandom()`, call that seam exactly once and
-re-check the same guards again. Only while they still match, commit the guarded
-`nextRetryAt` and tracker `lastAttemptAt` to that same entry.
+an embedder reentrancy point. Resolve and capture the initial retry delay first; if that
+requires `retryDelay()`/`retryRandom()`, call the seam exactly once, capture its result,
+and re-check the exact entry/key/connection/mutation/lifecycle guards. Then call
+`retryNow()` exactly once immediately afterward, capture its result as `attemptAt`, and
+re-check the same guards again. Only while they still match, commit guarded
+`nextRetryAt = attemptAt + capturedDelay` on that exact ledger entry and
+`lastAttemptAt = attemptAt` on the authoritative tracker record.
 
 Perform one final full guard immediately before raw `publish()`
 (`nats-client.ts:1971-1999`): the exact ledger entry remains owned, the sealing key is still
@@ -192,10 +194,14 @@ after authoritative frame detachment. Teardown increments even when both episode
 are already clear, so it invalidates an outer result transaction.
 
 Timer cancellation has its own reentrancy contract. Change `cancelLiveRetryTimer()`
-(`nats-client.ts:2185-2189`) to increment the generation, capture the current timer handle,
-and set `liveRetryTimer = null` **before** invoking injected `retryClearTimeout(handle)`.
-The clear hook is a synchronous callout and may re-enter disconnect/connect. It must always
-observe that the old handle is no longer owned by the client.
+(`nats-client.ts:2185-2189`) to increment and capture an exact cancellation token, capture
+the current timer handle, and set `liveRetryTimer = null` **before** invoking injected
+`retryClearTimeout(handle)`. Return that token to an arming caller. The clear hook is a
+synchronous callout and may re-enter disconnect/connect or install a nested timer. It must
+always observe that the old handle is no longer owned by the client. After the hook, an
+arming caller may proceed only when `liveRetryTimerGeneration` still equals that exact
+token **and** `liveRetryTimer` is still null. A changed generation or non-null handle means
+reentry owns scheduling; the outer caller returns without touching the nested timer.
 
 Its invariants are:
 
@@ -252,32 +258,47 @@ Apply the same transaction shape in `drainAcked()` and `drainRejected()`:
    `sessionKey` identity, and disconnected/terminal state.
 3. Delete **all** frame IDs from the ledger. If `ownedResult`, immediately claim
    `const resultEpoch = ++ackStallMutationEpoch` **after authoritative detachment and before
-   cancellation**. Then call the reordered live-timer cancellation helper.
-   `retryClearTimeout` is the first possible callout: it receives a captured handle
-   after the instance handle was nulled and may re-enter lifecycle methods. This preserves
-   the existing authoritative whole-frame detach rule without falsely claiming cancellation
-   itself is callout-free.
-4. After cancellation returns, keep every episode write behind both the captured lifecycle
-   guards and `ackStallMutationEpoch === resultEpoch`; re-check ledger ownership/size too.
-   A nested owned result, null-episode start, watchdog/raw-loss consumption, or teardown
-   advances the epoch and wins; the outer result must not overwrite it.
-5. If `ownedResult`, the guards/epoch still match, and the ledger is empty, do **not**
-   invoke `retryNow()`; clear `ackStallSinceAt` and `ackStallRecoveryIssued` directly. If
-   the guarded ledger remains nonempty, invoke injected `retryNow()`, then re-check the full
-   lifecycle/session guard, mutation epoch, and nonempty ledger again. Only then write
-   `ackStallSinceAt = resultAt` and `ackStallRecoveryIssued = false`. If the clear hook,
-   clock, nested result, new episode, or teardown changed the fence, do not overwrite it.
+   cancellation**. If that detachment leaves the ledger empty, clear
+   `ackStallSinceAt` and `ackStallRecoveryIssued` immediately under `resultEpoch`, before
+   any reentrant clear hook. The final owned result has already ended the old episode.
+4. Call the tokenized live-timer cancellation helper. `retryClearTimeout` receives a
+   captured handle after the instance handle was nulled and may re-enter lifecycle methods,
+   deliver raw loss, or install a nested timer. If the ledger was empty at step 3, the
+   outer transaction performs **no further episode write** after this hook: raw loss sees
+   the old episode already clear, and a nested/fresh send may start a new episode that wins.
+5. For the nonempty-ledger path only, after cancellation returns keep every episode write
+   behind **semantic** ownership only: the captured lifecycle/session guards,
+   `ackStallMutationEpoch === resultEpoch`, and a fresh nonempty-ledger check. Do not require
+   the cancellation token to remain current or the timer handle to remain null here. If
+   those semantic guards match, invoke injected `retryNow()`, then re-check the same
+   lifecycle/session/result-claim/nonempty-ledger guards. Only then claim a distinct
+   `const resultCommitEpoch = ++ackStallMutationEpoch` and, before any public or injected
+   callout, write `ackStallSinceAt = resultAt` and
+   `ackStallRecoveryIssued = false`. This commit makes any timer installed during
+   cancellation from the old episode fields stale. Capture the post-commit scheduler
+   generation and exact current ledger/session scheduling inputs.
 6. Apply authoritative tracker transitions to every detached frame ID even if `retryNow()`
    or an earlier tracker listener changed lifecycle: ACK advances to `accepted`; rejection
    keeps the existing `failed{overloaded}` path. These results belong to the detached
    authenticated frame.
-7. Call the trailing `armLiveRetryTimer()`; its existing session/disconnected/terminal and
-   generation guards make it a no-op for a retired lifecycle.
+7. The final-ledger-empty path performs no trailing outer write or arm. For the nonempty
+   path, if no `resultCommitEpoch` was claimed, return after authoritative tracker fanout.
+   Otherwise re-check lifecycle/session, `ackStallMutationEpoch === resultCommitEpoch`, the
+   captured ledger scheduling inputs, and timer generation. If a tracker listener, nested
+   send, loss, or result changed any of them, return because that nested path scheduled
+   against the committed fresh episode. If unchanged, call tokenized
+   `armLiveRetryTimer()`: it may intentionally cancel and recompute a timer installed before
+   `resultCommitEpoch`, while its own cancellation token prevents overwriting a timer
+   installed during that cancellation.
 
-This ordering covers three reentrancy seams: an injected `_retryClearTimeout` that
-disconnects during cancellation, an injected `_retryNow` that disconnects during result
-reset, and an `onSendState` listener that disconnects at the first result transition. None
-may leave stale episode fields or a timer on the retired lifecycle.
+This ordering covers an injected `_retryClearTimeout` that disconnects, delivers raw loss,
+or installs a nested timer during cancellation; an injected `_retryNow` that disconnects
+during a nonempty result reset; and an `onSendState` listener that disconnects at the first
+result transition. A nested owned result, raw loss, or teardown changes the semantic guards
+and wins. An unknown ACK or same-episode nested send during clear does not erase A's
+authenticated proof: it does not supersede `resultEpoch`, so A commits one fresh result age
+and allowance for all ledger work that remains, invalidates old-episode timers, and then
+recomputes scheduling unless a post-commit nested path already did so.
 
 ### 4.4 Why there is no N-cycle ceiling in `retryDueUnacked`
 
@@ -339,8 +360,11 @@ advance its generation, and set `heldStallRecoveryIssued = true` **before** call
 `client.requestApplicationRecovery()`. The detector never fails a held receipt, retracts
 it, synthesizes `/stop`, releases FIFO, or reserves/mints a wire ID.
 
-Cancellation is ownership-first and reentrancy-safe: increment the held timer generation,
-capture/null its handle, then clear it. Whenever `maybeRelease`, retract, `/stop`, close,
+Cancellation is ownership-first and tokenized: increment and capture the held timer
+generation as the exact cancellation token, capture/null its handle, then clear it. After
+the clear hook, an arming caller proceeds only if the generation still equals that token
+and `heldStallTimer` is still null; otherwise reentry installed/advanced scheduling and the
+outer caller returns without touching it. Whenever `maybeRelease`, retract, `/stop`, close,
 terminal failure, or another detach/fail path removes the last held owner, detach it and
 clear `heldStallSinceAt`, the latch, and timer before receipt/state callbacks. A raw false
 also clears typing before public state fanout; after replacement readiness, typing-only
@@ -348,14 +372,16 @@ holds can release normally. A still-`working` draft is handled by the existing
 post-`onSession` stale-draft valve (`nats-client-wrapper.ts:174-184`, `:701-758`), which
 eventually finalizes a genuinely stale draft and invokes `maybeRelease()`.
 
-Held timer arming follows a generation transaction: cancel first; capture the post-cancel
-generation, held-owner presence, session/closed/terminal state, timestamp, and latch;
-compute remaining time; increment/capture the installation generation; call `setTimeout`;
-then install the returned handle only if every guard is unchanged. Otherwise clear only
-that returned handle. The expiry callback likewise validates its captured generation and
-all ownership/lifecycle guards before nulling the handle, advancing generation, committing
-the latch, and making the recovery callout. Activity/reset and last-owner cleanup complete
-their state mutation and timer retirement before any reducer/receipt listener fanout.
+Held timer arming follows the same token transaction: cancel first and proceed only if the
+returned cancellation token still matches and the instance handle remains null. Then
+capture held-owner presence, session/closed/terminal state, timestamp, and latch; compute
+remaining time; increment/capture the installation generation; call `setTimeout`; then
+install the returned handle only if every guard is unchanged. Otherwise clear only that
+returned handle, never a nested one. The expiry callback likewise validates its captured
+generation and all ownership/lifecycle guards before nulling the handle, advancing
+generation, committing the latch, and making the recovery callout. Activity/reset and
+last-owner cleanup complete their state mutation and timer retirement before any
+reducer/receipt listener fanout.
 
 Use Vitest fake timers for this wrapper-owned timer. No second public timeout option or
 wire/plugin behavior is introduced.
@@ -384,11 +410,13 @@ value into a reconnect storm rather than a long timeout.
 `armLiveRetryTimer()` is a fenced transaction because injected `retryNow`,
 `retrySetTimeout`, and `retryClearTimeout` are synchronous reentrancy points:
 
-1. Call the reordered `cancelLiveRetryTimer()` first. Then capture its post-cancel
-   `liveRetryTimerGeneration`, `connectionEpoch`, exact `sessionKey` identity,
-   `ackStallMutationEpoch`, disconnected/terminal flags, and the ledger scan inputs
-   (ledger size plus each scanned id → entry object identity/`nextRetryAt`, earliest retry,
-   episode timestamp/latch, and ownership presence).
+1. Call tokenized `cancelLiveRetryTimer()` first. Proceed only if its returned cancellation
+   token still exactly equals `liveRetryTimerGeneration` **and** `liveRetryTimer` remains
+   null after the clear hook. If reentry advanced generation or installed a nested timer,
+   return without touching it. Only then capture `connectionEpoch`, exact `sessionKey`
+   identity, `ackStallMutationEpoch`, disconnected/terminal flags, and the ledger scan
+   inputs (ledger size plus each scanned id → entry object identity/`nextRetryAt`, earliest
+   retry, episode timestamp/latch, and ownership presence).
 2. Call `retryNow()` once. Immediately afterward, compare every captured guard, including
    timer generation and ledger/session ownership. If any changed, return **without**
    cancelling, clearing, installing, or otherwise touching a nested timer. The nested
@@ -468,8 +496,8 @@ The existing path then supplies all recovery mechanics:
    dispatch. The focused restart-composition test required by §9.2 is the authority for
    this guarantee.
 
-No plugin file, NATS subject, envelope, ACK shape, `SendFailure.reason`, or receipt state is
-changed.
+No plugin production file, NATS subject, envelope, ACK shape, `SendFailure.reason`, or
+receipt state is changed.
 
 ### 6.1 Stale-session notification fence
 
@@ -550,7 +578,8 @@ Expected files:
 | Production | `packages/client/src/nats-client-wrapper.ts` | Forward the raw timeout option unchanged, then read the inner client's resolved value through its package-internal getter without duplicate validation/defaulting; add held episode/timer/generation and cleanup across every ownership path; use `requestApplicationRecovery`; separate raw transport from session readiness and guard reentrant `onSession`. `WebChannelNATSClientOptions` inherits the field through `DirectClientOptions`. |
 | Unit test (new) | `packages/client/src/nats-client-agent-liveness.test.ts` | ACK detector/validation, episode/replay races, scheduler reentrancy, raw-loss arbitration, and mid-level stale-`onSession` tests using `FakeNatsWS`. Existing `nats-client-liveness.test.ts` remains raw heartbeat/auth and is untouched. |
 | Unit regression | `packages/client/src/nats-client-sendstate.test.ts` | Extend its local setup option seam and construct the existing exact 1/2/4/8/16/30-second backoff test with `ackStallTimeoutMs: 0`, so it remains the legacy retry-schedule authority rather than inheriting the new default stall wake-up. |
-| Unit test (new) | `packages/client/src/nats-client-wrapper-agent-liveness.test.ts` | Public option forwarding, W1-W5 readiness/stale-session assertions, and deterministic H1-H6 held-work recovery/cleanup/arbitration tests. |
+| Unit regression | `packages/client/src/nats-client-wrapper.test.ts` | Revise the existing raw-open/auth-error assertions around line 200 and delayed register-key assertions around lines 1617-1620 for session-aware public readiness. Prove raw open through `FakeWS`/low-level harness evidence while public state remains `connecting`/false; in the delayed-key case prove register is pending, key absent, and work held before releasing the gate and asserting `onSession` connected/release. |
+| Unit test (new) | `packages/client/src/nats-client-wrapper-agent-liveness.test.ts` | Public option forwarding, W2-W5 readiness/stale-session assertions, and deterministic H1-H7 held-work recovery/cleanup/arbitration tests. W1 and W6 stay in the existing wrapper regression file above. |
 | Component test | `packages/plugin/src/nats-channel-s2.test.ts`, `packages/plugin/src/ingress-dedupe.test.ts` | Compose eviction/re-register and add a focused production `outcomeStore` + `beginBatch` durable-restart replay test. The legacy `checkAndRecord` tests remain regression evidence only; no plugin production change. |
 | Public docs | `packages/client/README.md` | Document the shared ACK/held semantics, default/range/0-disables-both behavior, delivery-unknown/no-auto-release policy and long-silent-turn tradeoff, plus authenticated-session meaning of `connected`. |
 | Release notes | `packages/client/CHANGELOG.md` | Under Unreleased, record the Added public option and Fixed published-send, held-work, stale-session-readiness gateway recovery; classify wire-compatible/non-breaking with no protocol bump. |
@@ -592,8 +621,11 @@ Implementation order:
 5. Make wrapper readiness session-aware; implement held episode start/activity/reset,
    timer expiry, cross-lane raw-loss arbitration, and ownership-first cleanup for
    `maybeRelease`, retract, `/stop`, close, terminal, and reentrant paths.
-6. Isolate the existing exact-backoff sendstate regression with `ackStallTimeoutMs: 0` and
-   add the production outcome/lease persistent-restart dedupe composition test.
+6. Revise the existing `nats-client-wrapper.test.ts` raw-open/auth-error and delayed
+   register-key regressions to use raw/register harness evidence and assert public
+   connecting/false, absent key, held work, then gated `onSession` readiness/release.
+   Isolate the exact-backoff sendstate regression with `ackStallTimeoutMs: 0` and add the
+   production outcome/lease persistent-restart dedupe composition test.
 7. Correct the credential-scope comment; update `packages/client/README.md` and the
    Unreleased section of `packages/client/CHANGELOG.md` with the public contract and
    compatibility classification above.
@@ -629,12 +661,16 @@ cannot prove real plugin peer-cap eviction or plugin ingress dedupe.
 | C14 | `FakeNatsWS.send()` synchronously emits an encrypted owned ACK, then separately an overloaded rejection, for the just-published ID | Captured ledger/session/connection/mutation guards reject the stale post-`publish(true)` episode start; authoritative accepted/failed state wins. A later send starts from its own captured attempt and does not reconnect immediately. |
 | C15 | `_retryNow` inside outer `armLiveRetryTimer()` synchronously delivers an owned result; its tracker callback sends fresh B | Nested result/send owns B's one-second timer. The outer arm observes changed timer/lifecycle/mutation guards, does not clear or replace B's handle, and leaks no orphan. Add result and disconnect variants at arm/tick entry. |
 | C16 | Reconnect replay throws synchronously from `ws.send()` during `flushQueue()` | Raw false increments `connectionEpoch`; stale `onSession` never fires. A later real session can register and notify normally. |
-| C17 | Initial seal/publish and due-retry callouts synchronously re-enter through `retryNow`, `retryRandom`/`retryDelay`, raw publish, owned ACK/rejection, raw loss, or tracker-triggered nested send | Initial publish calls its clock once, its needed randomization once, re-checks after each seam, commits guarded retry metadata, and never sends ciphertext unless the exact sealing-key, connection, entry, and mutation guards still match at the final immediately-pre-publish fence; no hook intervenes between fence and publish. For a retry, `lastAttemptAt` is set before publish; `publish(false)` exits, and every post-`publish(true)` or post-randomization metadata write targets the same entry only after all guards still match. An owned result or nested send wins, with no stale retry metadata and no outer touch of its timer. |
-| W1 | Initial raw socket opens before registration resolves | Wrapper remains `connecting`, `connected: false`. |
+| C17 | Initial seal/publish and due-retry callouts synchronously re-enter through `retryNow`, `retryRandom`/`retryDelay`, raw publish, owned ACK/rejection, raw loss, or tracker-triggered nested send | Initial publish randomizes once before sampling its clock once, re-checks after each seam, commits guarded retry metadata, and never sends ciphertext unless the exact sealing-key, connection, entry, and mutation guards still match at the final immediately-pre-publish fence; no hook intervenes between fence and publish. Include a random hook that advances the shared clock without lifecycle mutation and prove the stall still fires a full configured interval after the successful publish. For a retry, `lastAttemptAt` is set before publish; `publish(false)` exits, and every post-`publish(true)` or post-randomization metadata write targets the same entry only after all guards still match. An owned result or nested send wins, with no stale retry metadata and no outer touch of its timer. |
+| C18 | Final ledger ID receives an owned encrypted ACK, and separately an overloaded rejection, while `_retryClearTimeout` synchronously causes raw loss | Detachment/resultEpoch clears the old timestamp and allowance before the clear hook. Raw loss cannot resurrect/consume the ended episode; no outer post-hook write occurs. A later fresh send starts with a fresh age and unissued allowance. |
+| C19 | `armLiveRetryTimer()` cancellation's injected `_retryClearTimeout` re-enters and installs a nested live timer | The outer armer sees a changed cancellation token or non-null instance handle, returns without clearing/overwriting the nested handle, and no orphan timer remains. |
+| C20 | A and B are ledgered; owned ACK/rejection A enters `_retryClearTimeout`, whose hook installs a timer through (a) an unknown ACK and (b) a same-episode nested send | Neither variant supersedes A's semantic `resultEpoch`. The outer result samples `resultAt`, claims a distinct commit epoch, gives remaining B (and nested work) a fresh age and false allowance, and makes the old-field timer stale. After tracker fanout, exactly one timer reflects the committed episode and no orphan remains. Separate nested-owned-result/raw-loss variants still fail semantic guards and win. |
+| W1 | Existing raw-open/auth-error wrapper regression around line 200 | `FakeWS`/low-level harness evidence proves raw transport opened (and drives the auth-error setup), while public state remains `connecting`, `connected: false`; the test does not use public online as evidence of raw open. |
 | W2 | Established session loses raw transport; replacement raw socket opens | Wrapper remains `reconnecting`, `connected: false` until replacement `onSession`. |
 | W3 | Replacement registration gets transient 503/exhaustion | Raw reconnect loops while wrapper never flashes connected. |
 | W4 | State listener closes synchronously during session-ready notification | No stale watch/release work and no ready-state revival. |
 | W5 | C16 through the public wrapper with held FIFO work | No false public `connected`, stale-draft arm, or held release from the abandoned session; later genuine `onSession` may recover. |
+| W6 | Existing delayed register-key wrapper regression around lines 1617-1620 | Wait for raw-open/register-pending harness evidence, then assert public `connecting`/false, key absent, and ordinary work held. Release the register/key gate and only then assert `onSession` produces connected/true and releases the held work. |
 
 Held-work wrapper tests use Vitest fake timers and the production wrapper:
 
@@ -646,6 +682,7 @@ Held-work wrapper tests use Vitest fake timers and the production wrapper:
 | H4 | `ackStallTimeoutMs: 0` with published and held work | Neither automatic lane requests recovery; readiness correction, ordinary retries, and manual/raw reconnect behavior remain. |
 | H5 | Last held owner is released/retracted by `maybeRelease`, `/stop`, explicit retract, close, or terminal failure, including listener reentry | Ownership and held episode/timer are cleared before callbacks; no wire ID is minted for removed held work and no stale timer fires. |
 | H6 | Hold begins while session readiness is false, including typing-only state cleared by raw false | Allowance is recorded consumed with no parallel timer. `onSession` alone does not re-arm; normal ready release or stale-draft processing clears the final owner safely. |
+| H7 | Held-timer cancellation uses a controllable global timer clear seam under Vitest fake timers; clear-hook reentry installs a nested held timer | The outer armer proceeds only with its exact cancellation token and null instance handle, never overwrites or clears the nested timer, and leaves no orphan after deterministic cleanup. |
 
 The injected quartet `retryNow`, `retryRandom`, `retrySetTimeout`, and
 `retryClearTimeout` (`nats-client.ts:1201-1204`) controls the live-retry scheduler only.
@@ -735,17 +772,21 @@ gateway-only restart** after that existing case. Its executable choreography is:
    the host. The host must wait for that marker, kill and restart the gateway alone while
    keeping the browser and NATS relay alive, and then signal the browser that the gateway
    restart has completed. Killing earlier makes the case invalid rather than green.
-4. The browser waits for eventual authenticated online/session-ready state after the
-   replacement registration and key establishment, then records
-   `S7.gateway-restart-held-session-ready`. Scenario code must record/evaluate this check
-   before evaluating the final completion assertion and must establish eventual
-   authenticated online by the time recovery completes. It must not require a rendered
-   intermediate frame in which online/session-ready is visible while B is still held:
-   React may batch `onSession` readiness and immediate `maybeRelease()` updates. W1-W5 and
-   H1-H6 own exact ordering and status traces.
-5. Then require held-lane recovery/stale-draft FIFO release and B's reply completion,
-   recording `S7.gateway-restart-held-recovered` and
-   `S7.gateway-restart-held-turn-completed`.
+4. After the host's restart-complete marker, the browser must not accept `online` alone:
+   the old wrapper can still render online until the held watchdog initiates reconnect.
+   Wait for the conjunction of (a) authenticated online and (b) B transitioning from its
+   previously proven pending `queued` + Cancel local state into a non-pending published
+   lifecycle (`sent` or `accepted`). That B transition is evidence unique to replacement
+   `onSession` opening the release gate. Scenario code records/evaluates
+   `S7.gateway-restart-held-session-ready` at this session-ready/released checkpoint before
+   evaluating final completion. It need not observe an intermediate rendered frame where
+   online is visible while B remains held, and it does not inspect a wire ID. W1-W6 and
+   H1-H7 own exact ordering and status traces.
+5. Independently require B's harness echo/dispatch metric to transition from the proven
+   pre-restart zero to exactly one, then record `S7.gateway-restart-held-recovered`. This
+   check means FIFO recovery dispatched B once; it must not duplicate the session-ready
+   check or pass from online/reconnect status alone. Finally require B's reply completion
+   and record `S7.gateway-restart-held-turn-completed`.
 
 The original gateway-only phase and this held-work phase each receive their own bounded
 120-second recovery window; neither may borrow unused time from the other. Increase the
@@ -756,7 +797,7 @@ entries in `checks`. Do not expand the artifact schema merely to carry raw obser
 the existing phase/check evidence and harness diagnostics are sufficient unless Rota's
 implementation later demonstrates a concrete need.
 
-Exact status traces remain owned by W1-W5/H1-H6; C4 plus plugin ingress-dedupe tests own
+Exact status traces remain owned by W1-W6/H1-H7; C4 plus plugin ingress-dedupe tests own
 same-ID republish and one-logical-dispatch proof. S7 is the product recovery gate, not a
 duplicate unit-contract oracle.
 
