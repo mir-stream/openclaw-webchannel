@@ -12,7 +12,11 @@ vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
-import { handleInboundMessage } from "./inbound.js";
+import {
+  handleInboundMessage,
+  startAgentLifecycleSubscription,
+  stopAgentLifecycleSubscription,
+} from "./inbound.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
 
 /**
@@ -663,6 +667,7 @@ describe("handleInboundMessage — #87 lifecycle verdict", () => {
       },
     });
     holder.emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
     return made;
   }
 
@@ -720,6 +725,7 @@ describe("handleInboundMessage — #87 lifecycle verdict", () => {
       },
     });
     holder.emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
     const { transport, settles } = makeFakeTransport();
 
     await handleInboundMessage(made.api, transport, "peer-1", ordinary);
@@ -741,6 +747,7 @@ describe("handleInboundMessage — #87 lifecycle verdict", () => {
       },
     });
     holder.emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
     const { transport, settles } = makeFakeTransport();
 
     await handleInboundMessage(made.api, transport, "peer-1", ordinary);
@@ -765,6 +772,7 @@ describe("handleInboundMessage — #87 lifecycle verdict", () => {
       },
     });
     holder.emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
     const { transport, settles } = makeFakeTransport();
 
     await handleInboundMessage(made.api, transport, "peer-1", ordinary);
@@ -819,6 +827,7 @@ describe("handleInboundMessage — #89 aborted runs are not failures", () => {
       },
     });
     holder.emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
     return made;
   }
 
@@ -845,10 +854,73 @@ describe("handleInboundMessage — #89 aborted runs are not failures", () => {
       },
     });
     holder.emit = made.emitLifecycle;
+    startAgentLifecycleSubscription(made.api);
     const { transport, settles } = makeFakeTransport();
 
     await handleInboundMessage(made.api, transport, "peer-1", ordinary);
 
     expect(settles).toEqual(["error"]);
+  });
+});
+
+/**
+ * #87 — the lifecycle subscription's lifetime.
+ *
+ * `onAgentEvent` registers on a PROCESS-GLOBAL listener set, while a plugin
+ * reload hands out a fresh `runtime.events` facade. Subscribing per facade
+ * would stack one listener per reload for the life of the process, so the
+ * subscription keeps its unsubscribe handle: re-starting replaces, and teardown
+ * releases.
+ */
+describe("agent lifecycle subscription lifetime", () => {
+  function makeEventsHost() {
+    const listeners: LifecycleListener[] = [];
+    let unsubscribes = 0;
+    const api = {
+      runtime: {
+        events: {
+          onAgentEvent: (l: LifecycleListener) => {
+            listeners.push(l);
+            return () => {
+              unsubscribes += 1;
+              const i = listeners.indexOf(l);
+              if (i >= 0) listeners.splice(i, 1);
+            };
+          },
+        },
+      },
+    } as unknown as OpenClawPluginApi;
+    return { api, listeners, count: () => listeners.length, unsubscribes: () => unsubscribes };
+  }
+
+  it("replaces rather than stacks when re-started (a reload)", () => {
+    const host = makeEventsHost();
+    startAgentLifecycleSubscription(host.api);
+    startAgentLifecycleSubscription(host.api);
+    startAgentLifecycleSubscription(host.api);
+
+    expect(host.count()).toBe(1);
+    expect(host.unsubscribes()).toBe(2);
+    stopAgentLifecycleSubscription();
+    expect(host.count()).toBe(0);
+  });
+
+  it("replaces across a FRESH events facade, which a reload hands out", () => {
+    // The previous guard keyed on facade identity, so a new facade defeated it.
+    const first = makeEventsHost();
+    startAgentLifecycleSubscription(first.api);
+    const second = makeEventsHost();
+    startAgentLifecycleSubscription(second.api);
+
+    expect(first.count()).toBe(0);
+    expect(second.count()).toBe(1);
+    stopAgentLifecycleSubscription();
+    expect(second.count()).toBe(0);
+  });
+
+  it("is a no-op on a host with no events surface", () => {
+    const api = { runtime: {} } as unknown as OpenClawPluginApi;
+    expect(() => startAgentLifecycleSubscription(api)).not.toThrow();
+    expect(() => stopAgentLifecycleSubscription()).not.toThrow();
   });
 });

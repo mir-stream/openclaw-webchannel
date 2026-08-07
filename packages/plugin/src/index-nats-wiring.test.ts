@@ -204,9 +204,23 @@ describe("index-nats.ts browser-route absence", () => {
 
 describe("index-nats.ts account lifecycle ownership", () => {
   it("keeps registerFull synchronous and network-free", () => {
-    expect(RUNTIME_SOURCE).toMatch(/registerFull\(api\)\s*\{\s*if \(api\.registrationMode !== "full"\) return;\s*accountCoordinator\.installFull\(api\)/);
+    // The guard clause still comes first, and account work is still delegated
+    // wholesale to the coordinator. Registration-time hooks may sit between the
+    // two — that is what `registerFull` is for — provided they stay synchronous.
+    expect(RUNTIME_SOURCE).toMatch(/registerFull\(api\)\s*\{\s*if \(api\.registrationMode !== "full"\) return;/);
+    expect(RUNTIME_SOURCE).toMatch(/accountCoordinator\.installFull\(api\)/);
     expect(RUNTIME_SOURCE).not.toMatch(/async\s+registerFull/);
+    expect(RUNTIME_SOURCE).not.toMatch(/registerFull\(api\)[\s\S]{0,800}?\bawait\b/);
     expect(RUNTIME_SOURCE).not.toContain("accountsBuildStarted");
+
+    // #87: the lifecycle subscription is registered HERE, once per plugin
+    // generation, and must hand the host a cleanup. `onAgentEvent` registers on
+    // a process-global listener set, so a subscription without teardown would
+    // stack one listener per reload for the life of the process.
+    expect(RUNTIME_SOURCE).toContain("startAgentLifecycleSubscription(api)");
+    expect(RUNTIME_SOURCE).toMatch(
+      /registerRuntimeLifecycle[\s\S]{0,400}?stopAgentLifecycleSubscription\(\)/,
+    );
   });
 
   it("builds only the host-selected account and publishes after the flushed register subscription", () => {

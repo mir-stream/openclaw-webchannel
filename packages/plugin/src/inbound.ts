@@ -49,8 +49,8 @@ type AgentRunVerdict = "ok" | "error";
 
 /** Terminal verdict per agent run, drained by the turn that owns the run. */
 const agentRunVerdicts = new Map<string, AgentRunVerdict>();
-/** Events surfaces already subscribed, so a plugin reload cannot double-subscribe. */
-const subscribedEventSurfaces = new WeakSet<object>();
+/** Live subscription, so a reload replaces rather than stacks listeners. */
+let lifecycleUnsubscribe: (() => void) | undefined;
 /**
  * Backstop only. Entries are deleted by the settling turn, so this cap is never
  * reached in normal operation — it bounds the leak if a run terminates for a
@@ -58,13 +58,22 @@ const subscribedEventSurfaces = new WeakSet<object>();
  */
 const MAX_TRACKED_RUNS = 512;
 
-/** Subscribe once per events surface; a no-op when the host predates the API. */
-function ensureAgentLifecycleSubscription(api: OpenClawPluginApi): void {
+/**
+ * Subscribe to the lifecycle stream. A no-op when the host predates the API.
+ *
+ * `onAgentEvent` registers on a PROCESS-GLOBAL listener set
+ * (agent-events-*.js:227), while a reload hands the plugin a fresh
+ * `runtime.events` facade — so identity of the facade cannot be used to detect
+ * "already subscribed", and simply subscribing again on each reload would stack
+ * listeners for the lifetime of the process. We keep the unsubscribe handle
+ * instead and drop the previous listener before installing a new one, and
+ * `stopAgentLifecycleSubscription` releases it at host teardown.
+ */
+export function startAgentLifecycleSubscription(api: OpenClawPluginApi): void {
   const events = api.runtime?.events;
   if (!events || typeof events.onAgentEvent !== "function") return;
-  if (subscribedEventSurfaces.has(events)) return;
-  subscribedEventSurfaces.add(events);
-  events.onAgentEvent((evt) => {
+  stopAgentLifecycleSubscription();
+  lifecycleUnsubscribe = events.onAgentEvent((evt) => {
     if (evt?.stream !== "lifecycle") return;
     const runId = evt.runId;
     if (!runId) return;
@@ -87,6 +96,13 @@ function ensureAgentLifecycleSubscription(api: OpenClawPluginApi): void {
     const aborted = data?.aborted === true;
     agentRunVerdicts.set(runId, phase === "error" && !aborted ? "error" : "ok");
   });
+}
+
+/** Release the lifecycle subscription and drop any verdicts still pending. */
+export function stopAgentLifecycleSubscription(): void {
+  lifecycleUnsubscribe?.();
+  lifecycleUnsubscribe = undefined;
+  agentRunVerdicts.clear();
 }
 
 /**
@@ -149,8 +165,6 @@ export async function handleInboundMessage(
   // falls back to ANON_PEER_ID).
   const wsKey = peerId || ANON_PEER_ID;
 
-  // #87: start observing core's lifecycle terminals before the turn runs.
-  ensureAgentLifecycleSubscription(api);
   /** The agent run this turn owns, learned from `onAgentRunStart`. */
   let agentRunId: string | undefined;
 
