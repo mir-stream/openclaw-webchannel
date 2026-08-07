@@ -110,9 +110,10 @@ recovery can set it to zero.
 
 ### 4.1 Per-client no-result age
 
-Add episode metadata to `WebChannelNatsClient`, conceptually
-`ackStallSinceAt: number | null` plus `ackStallRecoveryIssued: boolean`. The first
-successful raw publish of a ledgered `user_message` starts `ackStallSinceAt` if it is null.
+Add three per-client fields to `WebChannelNatsClient`: the two policy fields
+`ackStallSinceAt: number | null` and `ackStallRecoveryIssued: boolean`, plus the monotonic
+`ackStallMutationEpoch: number` transaction fence. The first successful raw publish of a
+ledgered `user_message` starts `ackStallSinceAt` if it is null.
 Later sends, retries, and session replay do not move it while no owned result arrives. A
 send that never successfully writes is already handled by transport reconnect and does not
 start an application-result clock.
@@ -129,6 +130,11 @@ after `publish()` returns `true`, execute `ackStallSinceAt ??= attemptAt` **befo
 `trackerAdvance(id, "sent")` or timer scheduling. Do not call `retryNow()` again. The
 tracker transition invokes public synchronous send-state listeners, and the injected clock
 and scheduler are also synchronous callouts; no episode mutation may trail those callouts.
+When this publish performs the actual null-to-`attemptAt` start, first increment the
+mutation epoch defined below, then assign the timestamp, all before tracker/timer callouts.
+An ordinary publish while `ackStallSinceAt` is already non-null does not increment it: an
+outer owned-result transaction legitimately starts one fresh interval for all work that
+remains after its authoritative frame detachment, including that new publish.
 
 ### 4.2 Per-client recovery episode
 
@@ -136,7 +142,17 @@ The recovery-issued field is the per-`WebChannelNatsClient` latch:
 
 ```ts
 private ackStallRecoveryIssued = false;
+private ackStallMutationEpoch = 0;
 ```
+
+`ackStallMutationEpoch` is a monotonic same-client transaction fence. It never resets in
+`resetSession()` or `onSession`; it is distinct from connection epochs and the live-timer
+generation. Increment it before any injected/public callout whenever code (a) starts an
+episode from a null timestamp, (b) consumes the watchdog allowance from false to true,
+(c) consumes that allowance on raw loss from false to true, or (d) performs explicit or
+terminal ownership retirement, or (e) claims an owned authenticated-result transaction
+after authoritative frame detachment. Teardown increments even when both episode fields
+are already clear, so it invalidates an outer result transaction.
 
 Timer cancellation has its own reentrancy contract. Change `cancelLiveRetryTimer()`
 (`nats-client.ts:2185-2189`) to increment the generation, capture the current timer handle,
@@ -146,7 +162,8 @@ observe that the old handle is no longer owned by the client.
 
 Its invariants are:
 
-- `false → true` is committed **before** calling `this.client.reconnect()`. The commit is
+- A watchdog `false → true` first increments `ackStallMutationEpoch`, then commits the latch
+  **before** calling `this.client.reconnect()`. The commit is
   complete before a raw state listener, scheduler hook, or other synchronous callout can
   re-enter the client.
 - The latch is per client, not per wire ID. One scan may find many expired IDs, but it
@@ -155,8 +172,10 @@ Its invariants are:
   !terminalReached`) consumes the current episode's recovery
   allowance whenever `ackStallSinceAt !== null` and `unackedLedger` is nonempty. In
   `WebChannelNatsClient`'s already-registered raw state handler
-  (`nats-client.ts:1250-1253`), set `ackStallRecoveryIssued = true` atomically **before**
-  `resetSession()` or any downstream callback. A real socket loss is already a recovery
+  (`nats-client.ts:1250-1253`), if the latch is false, increment the mutation epoch and set
+  `ackStallRecoveryIssued = true` atomically **before** `resetSession()` or any downstream
+  callback. If it is already true, the allowance was already consumed and neither field
+  changes. A real socket loss is already a recovery
   attempt and must not be followed by a watchdog-driven second socket replacement.
 - `resetSession()` must not clear it. A reconnect immediately invokes raw state callbacks,
   and `resetSession()` currently cancels the retry timer and clears the key
@@ -171,7 +190,8 @@ Its invariants are:
   result transaction is specified in §4.3.
 - Explicit `disconnect()` and terminal teardown clear **both** episode fields. Put this in
   `takePendingSendIds()` (or an exact equivalent): first detach queue/ledger ownership,
-  then set `ackStallSinceAt = null` and `ackStallRecoveryIssued = false`, then call the
+  then increment `ackStallMutationEpoch`, set `ackStallSinceAt = null` and
+  `ackStallRecoveryIssued = false`, then call the
   reordered cancellation helper, and finally return IDs for failure callbacks. A single
   JavaScript stack means the timer cannot fire between detachment and cancellation; if the
   injected clear hook re-enters, it sees retired ownership, cleared episode metadata, and
@@ -193,23 +213,28 @@ Apply the same transaction shape in `drainAcked()` and `drainRejected()`:
    unackedLedger.has(id))` before deletion.
 2. Capture guards for the current live lifecycle: `connectionEpoch`, the current
    `sessionKey` identity, and disconnected/terminal state.
-3. Delete **all** frame IDs from the ledger, then call the reordered live-timer cancellation
-   helper. `retryClearTimeout` is the first possible callout: it receives a captured handle
+3. Delete **all** frame IDs from the ledger. If `ownedResult`, immediately claim
+   `const resultEpoch = ++ackStallMutationEpoch` **after authoritative detachment and before
+   cancellation**. Then call the reordered live-timer cancellation helper.
+   `retryClearTimeout` is the first possible callout: it receives a captured handle
    after the instance handle was nulled and may re-enter lifecycle methods. This preserves
    the existing authoritative whole-frame detach rule without falsely claiming cancellation
    itself is callout-free.
-4. After cancellation returns, keep every episode write behind the captured lifecycle
-   guards. If `ownedResult` and the ledger is now empty, do **not** invoke `retryNow()`;
-   guarded-clear `ackStallSinceAt` and `ackStallRecoveryIssued` directly. If owned work
-   remains, invoke injected `retryNow()` and, only if the epoch/session/disconnected/
-   terminal guards still identify the same live lifecycle afterward, start a fresh interval
-   at `resultAt` with `ackStallRecoveryIssued = false`. If the clear hook or clock changed
-   lifecycle, do not overwrite teardown or replacement-lifecycle state.
-5. Apply authoritative tracker transitions to every detached frame ID even if `retryNow()`
+4. After cancellation returns, keep every episode write behind both the captured lifecycle
+   guards and `ackStallMutationEpoch === resultEpoch`; re-check ledger ownership/size too.
+   A nested owned result, null-episode start, watchdog/raw-loss consumption, or teardown
+   advances the epoch and wins; the outer result must not overwrite it.
+5. If `ownedResult`, the guards/epoch still match, and the ledger is empty, do **not**
+   invoke `retryNow()`; clear `ackStallSinceAt` and `ackStallRecoveryIssued` directly. If
+   the guarded ledger remains nonempty, invoke injected `retryNow()`, then re-check the full
+   lifecycle/session guard, mutation epoch, and nonempty ledger again. Only then write
+   `ackStallSinceAt = resultAt` and `ackStallRecoveryIssued = false`. If the clear hook,
+   clock, nested result, new episode, or teardown changed the fence, do not overwrite it.
+6. Apply authoritative tracker transitions to every detached frame ID even if `retryNow()`
    or an earlier tracker listener changed lifecycle: ACK advances to `accepted`; rejection
    keeps the existing `failed{overloaded}` path. These results belong to the detached
    authenticated frame.
-6. Call the trailing `armLiveRetryTimer()`; its existing session/disconnected/terminal and
+7. Call the trailing `armLiveRetryTimer()`; its existing session/disconnected/terminal and
    generation guards make it a no-op for a retired lifecycle.
 
 This ordering covers three reentrancy seams: an injected `_retryClearTimeout` that
@@ -270,8 +295,9 @@ At the start of `retryDueUnacked()`:
 The latch mutation precedes the reconnect callout because `reconnect()` synchronously
 notifies raw state listeners through `forceReconnect()` (`nats-client.ts:987-1013`). The
 existing disconnected/terminal and timer-generation checks remain mandatory around
-injected scheduler callouts (`:2201-2218`). No independent liveness timer or third
-generation counter is added.
+injected scheduler callouts (`:2201-2218`). Add no independent liveness timer. The new
+`ackStallMutationEpoch` is only a synchronous episode-mutation fence; it does not schedule
+work and is intentionally separate from the existing timer generation.
 
 ---
 
@@ -348,17 +374,33 @@ Expected files:
 
 | Category | File | Required change |
 |---|---|---|
-| Production | `packages/client/src/nats-client.ts` | Add/validate `ackStallTimeoutMs` on `WebChannelNatsClientOptions` only; reorder cancellation to null the handle before its injected clear hook; add episode state and exact mutation ordering; minimum-remaining scheduling; raw-loss allowance consumption; one public reconnect trip; owned-result/teardown reset; correct stale credential comment. |
+| Production | `packages/client/src/nats-client.ts` | Add/validate `ackStallTimeoutMs` on `WebChannelNatsClientOptions` only; reorder cancellation to null the handle before its injected clear hook; add episode state plus monotonic `ackStallMutationEpoch` and exact mutation ordering; minimum-remaining scheduling; raw-loss allowance consumption; one public reconnect trip; owned-result/teardown reset; correct stale credential comment. |
 | Production | `packages/client/src/nats-client-wrapper.ts` | Explicitly forward `ackStallTimeoutMs` in `natsOptions`; separate raw transport state from session readiness; guard reentrant `onSession` work. `WebChannelNATSClientOptions` inherits the field through `DirectClientOptions`. |
 | Unit test (new) | `packages/client/src/nats-client-agent-liveness.test.ts` | Detector, validation boundaries, episode, replay, raw-loss race, result-callout reentrancy, and timer tests using `FakeNatsWS`. The existing `nats-client-liveness.test.ts` remains the raw heartbeat/auth suite and is untouched. |
 | Unit test | `packages/client/src/nats-client-wrapper.test.ts` or focused wrapper test | Public option acceptance/forwarding and initial/reconnecting/session-ready status tests. |
 | Component test | `packages/plugin/src/nats-channel-s2.test.ts`, `packages/plugin/src/ingress-dedupe.test.ts` | Compose/retain eviction, re-register, same-ID dedupe, and duplicate-ACK contracts; no plugin production change. |
-| Live harness | `e2e/local/run-all-real.sh`, `e2e/local/all-real.mjs`, `packages/client/src/browser-jwt-entry.ts`, `e2e/local/README.md` | Add the opt-in `WEBCHANNEL_SCENARIO=agent-restart` persistent-browser restart scenario and document prerequisites. |
+| Public docs | `packages/client/README.md` | Document `ackStallTimeoutMs`: default `30_000`, `0` disables only the detector, maximum `2_147_483_647`, ACK absence remains delivery-unknown/replayable, and public `connected` means authenticated `onSession` readiness rather than raw transport. |
+| Release notes | `packages/client/CHANGELOG.md` | Under Unreleased, record the Added public option and Fixed gateway-restart/session-readiness behavior; classify it wire-compatible and non-breaking with no protocol bump. |
 
 Explicitly unchanged: `packages/client/src/types.ts` send-failure unions,
-`packages/plugin/**` production code, SaaS credentials, NATS parser, wire protocol, demo UI.
+`packages/plugin/**` production code, SaaS credentials, NATS parser, wire protocol, demo UI,
+and package/version manifests in the implementation PR.
 Plugin tests may be extended only to compose existing eviction/re-register/dedupe contracts;
-they must not require a production plugin change.
+they must not require a production plugin change. Manifest bumps are deferred to release
+cutting per `docs/PUBLISHING.md`, not forgotten.
+
+### 8.1 Compatibility and release classification
+
+This is an additive exported option plus a visible readiness bug fix. For the pre-1.0
+client, classify it as the next semver-minor release. `v0.4.0` is already tagged, so the
+current target is the next unpublished three-way lockstep minor, presently `0.5.0` (or the
+next minor if the branch advances before release).
+
+The implementation PR does not edit `package.json`, `package-lock.json`, or version
+manifests; they remain unchanged in implementation scope. When the release is cut,
+client/SaaS/plugin versions move together under the
+repository's three-way lockstep rule even though #81 production code is client-only. The
+wire remains compatible and `WEBCHANNEL_PROTOCOL_VERSION` does not change.
 
 Implementation order:
 
@@ -376,9 +418,12 @@ Implementation order:
    and successful `onSession` preserve an already-consumed allowance.
 5. Make wrapper readiness session-aware and add initial, reconnecting, success, terminal,
    and reentrant-close tests.
-6. Correct the credential-scope comment.
-7. Extend the real-browser harness and README, then run focused client tests, mandatory
-   plugin component tests, the client suite, structural checks, and the opt-in live gate.
+6. Correct the credential-scope comment; update `packages/client/README.md` and the
+   Unreleased section of `packages/client/CHANGELOG.md` with the public contract and
+   compatibility classification above.
+7. Run focused client tests, mandatory plugin component tests, the client suite, and
+   structural checks. Qualify the pushed implementation SHA through external Rota S7 as
+   specified in §9.3; leave package/version manifests for release cutting.
 
 ---
 
@@ -404,6 +449,7 @@ cannot prove real plugin peer-cap eviction or plugin ingress dedupe.
 | C10 | First successful `sent` tracker listener disconnects | Episode start was committed from the captured `attemptAt` before the listener; teardown clears it and leaves no timer. |
 | C11 | Owned ACK/rejection invokes an injected `_retryNow` that disconnects | Whole frame is detached, tracker results remain authoritative, stale result-reset state does not overwrite teardown/replacement state, and no timer survives. |
 | C12 | Injected `_retryClearTimeout` re-enters `disconnect()` during result cancellation and explicit/terminal retirement | Timer handle is already null. Teardown exposes detached ownership and cleared episode state; result guards prevent stale writes; authenticated tracker result remains authoritative; no timer survives. |
+| C13 | A and B are ledgered; ACK A reaches `_retryNow`, which synchronously delivers an encrypted owned ACK/rejection for B through `FakeNatsWS` | Nested result detaches B and advances `ackStallMutationEpoch`; the outer A transaction fails its fence and writes no stale timestamp. A later send C starts its own interval from its captured attempt and does not reconnect immediately. |
 | W1 | Initial raw socket opens before registration resolves | Wrapper remains `connecting`, `connected: false`. |
 | W2 | Established session loses raw transport; replacement raw socket opens | Wrapper remains `reconnecting`, `connected: false` until replacement `onSession`. |
 | W3 | Replacement registration gets transient 503/exhaustion | Raw reconnect loops while wrapper never flashes connected. |
@@ -434,7 +480,7 @@ plugin:
   component level. Otherwise cite both passing tests as the composition evidence. Do not
   label either as end-to-end self-healing.
 
-### 9.3 Regression and live gates
+### 9.3 Regression and external product gate
 
 Run at minimum:
 
@@ -451,53 +497,36 @@ The first command above keeps the existing raw heartbeat/auth liveness suite unc
 new application-liveness work belongs in the distinct agent-liveness file. Unit and plugin
 component tests are mandatory even when local live-harness prerequisites are unavailable.
 
-The live acceptance gate is an explicit repository harness mode:
+The authoritative live acceptance gate already exists outside this repository. No new
+`e2e/local` harness is needed, per the maintainer's issue comment.
+
+- Repository: `mir-stream/rota-crew`
+- Branch: `test/wc-v040-product-e2e`
+- Observed head on 2026-08-07: `f05022f3ffb4a57f8d7c6df5ba9226e9cfddb936`
+- Command: `npm run test:webchannel:product-e2e`
+- Artifact:
+  `.artifacts/webchannel-product-e2e/<run-id>/browser/restart-result.json`
+
+Rota scenario S7 already holds one browser alive, restarts NATS, then restarts the gateway
+alone. The release gate requires `S7.gateway-restart-recovered` and
+`S7.gateway-restart-turn-completed` to become green with no gateway-related `known-red`
+checks. Exact wrapper status traces remain owned by W1-W4; C4 plus plugin ingress-dedupe
+tests own same-ID republish and one-logical-dispatch proof. S7 is the product-level recovery
+gate, not a duplicate unit-contract oracle.
+
+Qualification requires a pushed implementation commit. In a Rota test commit, update
+`WC_REF` and `expected-manifest.json.webchannel.checkoutSha` to that exact implementation
+SHA; Rota's `prepare-source` enforces the canonical sibling checkout. This coordination is
+external test work, not a file change in `openclaw-webchannel`, and the current plan-only
+SHA cannot qualify. Run from the Rota branch:
 
 ```sh
-WEBCHANNEL_SCENARIO=agent-restart bash e2e/local/run-all-real.sh
+npm run test:webchannel:product-e2e
 ```
 
-Extend the existing harness as follows:
-
-1. `run-all-real.sh` reuses the setup and prerequisites documented in
-   `e2e/local/README.md`. In `agent-restart` mode it keeps real NATS, issuer, echo model,
-   page server, and one persistent browser/client alive. Create a scenario control
-   directory under the harness's isolated `$OCH`; pass its path plus
-   `WEBCHANNEL_SCENARIO` to `all-real.mjs`; start the driver in the background and add its
-   PID to cleanup. The driver writes a `browser-ready` record after the positive control,
-   waits for a shell-written `gateway-restarted` release record, and writes final JSON for
-   the shell to validate before waiting on its exit status.
-2. After the browser establishes a production `WebChannelNATSClient` wrapper session and completes
-   a positive-control exchange, the shell kills the exact tracked `GW_PID`, waits for that
-   process to exit, and restarts the **same** gateway command with the same HOME, config,
-   ports, and environment. Use a fresh restart log (or record the old log byte offset) so
-   readiness cannot match the old process. It waits for a new structured
-   `event=webchannel.account_aggregate ... state=complete` readiness record from the new
-   process, then atomically creates `gateway-restarted` to release the browser's second
-   phase. NATS, issuer, and browser are never restarted.
-3. `all-real.mjs` and `browser-jwt-entry.ts` implement a two-phase coordination seam so the
-   page and one wrapper instance stay open across the shell-controlled restart. Expose
-   page-side start/continue scenario functions backed by that retained instance; the Node
-   driver calls start, writes `browser-ready`, waits for the shell release, then calls
-   continue. The browser uses the production
-   public wrapper with a shorter explicit `ackStallTimeoutMs` suitable for the harness,
-   sends only after the new gateway readiness record, and records public status trace, the
-   second-phase user bubble's original wire ID, receipt-state trace, reply texts/count, and a
-   detector-driven socket-replacement count. Install a page-init WebSocket constructor
-   counter before the client bundle and assert the stalled-send phase adds one socket; do
-   not expose a production diagnostic solely for this test.
-4. Assert initial/replacement raw connectivity stays `connecting`/`reconnecting` until
-   `onSession`; exactly one detector-driven new WebSocket occurs; the phase-2 bubble's
-   public `wireId` is captured once and remains unchanged through its `accepted` receipt;
-   and exactly one phase-2 logical agent turn/reply is observed (the positive-control
-   baseline has its own separate reply). Do **not** attribute or count ciphertext
-   retransmissions in this live test: C4 and the ingress-dedupe component tests separately
-   prove same-ID republish and one logical dispatch, while the normal live-retry loop may
-   publish that ID more than once before recovery.
-
-A client-only fake is not a substitute for this live gate, but absence of the external
-runtime prerequisites may be reported separately after all mandatory unit/component gates
-pass.
+The external gate may be unavailable from this worktree, but it is mandatory before release
+or issue closure. Focused unit and plugin component gates remain mandatory implementation-
+PR checks regardless of Rota availability.
 
 ---
 
