@@ -58,8 +58,16 @@ import {
 // PluginApprovalRequest).
 import type {
   ExecApprovalRequest,
+  ExecApprovalSessionTarget,
   PluginApprovalRequest,
 } from "openclaw/plugin-sdk/approval-runtime";
+// #93: exported by `openclaw/plugin-sdk/approval-runtime`. The helper can
+// reconcile a request's LIVE turn-source target with the one stored in the
+// session store — but this file calls it with `resolveTurnSourceTarget: () =>
+// null` (see `resolveWebchannelFallbackOriginTarget`), so on our path it reduces
+// to "recover the STORED target for this request/account, or null". The live
+// half of the evidence is the approval-origin lease, not this call.
+import { resolveApprovalRequestOriginTarget } from "openclaw/plugin-sdk/approval-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 // `ChannelApprovalCapability` (the `nativeRuntime` field's erased type) is
 // re-exported here, not from the approval-runtime barrel. Verified:
@@ -70,7 +78,7 @@ import type {
   ChannelOutboundPayloadHint,
 } from "openclaw/plugin-sdk/channel-runtime";
 
-import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
+import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type {
   WebChannelPeerChannel,
   ApprovalDecision,
@@ -79,9 +87,13 @@ import type {
 } from "./channel-contract.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  canonicalizeAccountId,
+  formatAccountIdForLog,
   listWebchannelAccountIds,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
+import { getApprovalOriginRegistry } from "./approval-origin.js";
+import type { ApprovalOriginLeaseResolution } from "./approval-origin.js";
 
 /**
  * Resolve the transport a given account's approval frames should ride. `null`/
@@ -752,16 +764,20 @@ export function createClawApprovalNativeRuntimeSpec(
     transport: {
       // Route the prompt to the ORIGINATING peer's web session. The planned
       // target's `to` was produced by the capability's `resolveOriginTarget`,
-      // which reads `request.turnSourceTo` — the real per-peer `wsKey` we
-      // recorded as the inbound turn's `reply.to` (src/inbound.ts buildContext).
+      // which yields a peer only when core's own turn-source metadata names one
+      // or when a live lease and the persisted session store independently agree
+      // (#93) — either way it is the real per-peer `wsKey` we recorded as the
+      // inbound turn's `reply.to` (src/inbound.ts buildContext).
       // The transport socket map is keyed by that same `peerId`, so it lines up.
       // With 2+ concurrent users this targets the right user's socket; the
       // dedupeKey is per-peer so distinct users never collide.
       prepareTarget: ({ accountId, plannedTarget }) => {
-        // `plannedTarget.target.to` is the per-peer key resolveOriginTarget
-        // produced; default to the anon peer if it's somehow absent so a
-        // single-session deployment still gets its prompt.
-        const sessionKey = plannedTarget?.target?.to || ANON_PEER_ID;
+        // #93: no target, no delivery. `resolveOriginTarget` returns a peer only
+        // when it was PROVEN, so an absent one means the origin is unknown —
+        // substituting a peer here would re-invent the misroute one layer down,
+        // past every check the resolver just made.
+        const sessionKey = plannedTarget?.target?.to;
+        if (!sessionKey) return null;
         return {
           // Scope the dedupe key by account: the SAME peerId registered on two
           // accounts is two distinct delivery targets (each account's channel),
@@ -795,10 +811,11 @@ export function createClawApprovalNativeRuntimeSpec(
           );
           return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
         }
-        // Fail-closed: with 2+ registered peers and an absent `turnSourceTo`
-        // the target falls back to `web-anon`, `sendApprovalRequest` returns
-        // false (no such registered peer), and the prompt is correctly DROPPED
-        // rather than misrouted. That drop is otherwise invisible, so log it
+        // An unproven origin never reaches here — it is dropped at
+        // `resolveOriginTarget`/`prepareTarget` (#93). This drop is the
+        // remaining case: a PROVEN peer with no currently open socket (it
+        // disconnected between the request and the prompt). The frame is
+        // correctly not delivered, and that is otherwise invisible, so log it
         // (no logger in scope here; match the `[webchannel]` console style).
         const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload);
         if (!delivered) {
@@ -853,6 +870,190 @@ export function createClawApprovalNativeRuntimeSpec(
       },
     },
   };
+}
+
+/** The delivery target this channel resolves: the exact originating peer id. */
+type WebchannelOriginTarget = { to: string };
+
+/**
+ * Bounded diagnostic reasons for an unresolved fallback origin (#93). A closed
+ * enum keeps the log line greppable and, more importantly, keeps it from
+ * growing free-form text that could carry user data.
+ */
+type OriginUnresolvedReason =
+  | "missing_session_key"
+  | "invalid_request_time"
+  | "active_no_match"
+  | "active_ambiguous"
+  // Distinct from `active_ambiguous` on purpose: this one means the registry's
+  // whole epoch failed closed, so EVERY fallback approval in the process is
+  // being dropped until the next teardown — a process-wide outage, not one
+  // confusable tuple.
+  | "epoch_poisoned"
+  // The process-global registry itself is unusable (an incompatible co-installed
+  // build owns the versioned slot). Never folded into `sdk_error`, which would
+  // point an operator at core instead of at their own plugin set.
+  | "registry_unavailable"
+  | "stored_target_unavailable"
+  | "stored_binding_mismatch"
+  | "active_stored_mismatch"
+  | "sdk_error";
+
+/**
+ * The single diagnostic for a fallback origin that could not be proven — at most
+ * one line per decision, and this file is its only owner.
+ *
+ * The account is quoted for logging through `formatAccountIdForLog` (an
+ * operator-chosen deployment name, written as-is). The session key, the peer id
+ * and the stored target are NEVER logged: together they identify a user and the
+ * conversation they are having, and a dropped approval does not justify writing
+ * that to an operator's log. `reason` plus the account is enough to tell a clock
+ * problem from a mismatch from a missing store entry.
+ */
+function warnOriginUnresolved(
+  rawAccountId: string,
+  reason: OriginUnresolvedReason,
+  sessionKeyPresent: boolean,
+): void {
+  console.warn(
+    `[webchannel] event=webchannel.approval.origin_unresolved ` +
+      `accountId=${formatAccountIdForLog(rawAccountId)} reason=${reason} ` +
+      `sessionKey_present=${sessionKeyPresent}`,
+  );
+}
+
+/**
+ * #93 — decide the origin of an approval whose turn-source metadata is absent.
+ *
+ * The old code answered this question by inventing `web-anon`. That is not the
+ * real peer in any multi-peer deployment, so the prompt was dropped and the
+ * write tool timed out — and an unproven origin was being asserted as a delivery
+ * target, which is the security half of the bug.
+ *
+ * Two INDEPENDENT pieces of evidence must name the same peer:
+ *
+ *   1. an approval-origin lease that was active BEFORE this request was created
+ *      and is still active now (positive, per-run proof that this exact peer's
+ *      agent run is the one asking), and
+ *   2. the target the pinned SDK helper recovers from the PERSISTED session
+ *      store for this same request and account (corroboration).
+ *
+ * Neither alone is sufficient. A stored `lastTo` can be overwritten by a later
+ * inbound from another peer sharing the session key; a lease alone cannot prove
+ * the request belongs to the session the store recorded. We never parse the
+ * session key ourselves and never re-derive the route from the CURRENT config —
+ * a binding or `identityLinks` reassignment must not retroactively re-interpret
+ * an old request as belonging to a different peer.
+ *
+ * Anything unproven returns `null`: one dropped approval and one diagnostic
+ * line, rather than a permission prompt in someone else's browser.
+ */
+function resolveWebchannelFallbackOriginTarget(params: {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  request: ExecApprovalRequest | PluginApprovalRequest;
+}): WebchannelOriginTarget | null {
+  const { cfg, request } = params;
+  const rawHandlerAccountId = params.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+
+  const rawSessionKey = request.request.sessionKey;
+  const sessionKey = typeof rawSessionKey === "string" ? rawSessionKey.trim() : "";
+  if (!sessionKey) {
+    warnOriginUnresolved(rawHandlerAccountId, "missing_session_key", false);
+    return null;
+  }
+
+  // The registry is read per decision, never cached: a cache-busted module
+  // reload must not leave this resolver looking at a registry that the current
+  // inbound path no longer writes to. The LOOKUP is inside the guard because the
+  // getter itself throws on an incompatible process-global registry, and no
+  // exception may cross the capability boundary — core awaits this hook
+  // unguarded, so a throw here would take down the whole delivery plan.
+  let active: ApprovalOriginLeaseResolution;
+  try {
+    active = getApprovalOriginRegistry().resolve({
+      rawAccountId: rawHandlerAccountId,
+      sessionKey,
+      requestCreatedAtMs: request.createdAtMs,
+    });
+  } catch {
+    warnOriginUnresolved(rawHandlerAccountId, "registry_unavailable", true);
+    return null;
+  }
+  if (active.kind !== "resolved") {
+    const reason: OriginUnresolvedReason =
+      active.kind === "invalid_request_time"
+        ? "invalid_request_time"
+        : active.kind === "ambiguous"
+          ? "active_ambiguous"
+          : active.kind === "epoch_poisoned"
+            ? "epoch_poisoned"
+            : "active_no_match";
+    warnOriginUnresolved(rawHandlerAccountId, reason, true);
+    return null;
+  }
+
+  // Distinguishes "the store had a webchannel target we refused" from "there was
+  // no usable stored target at all" — diagnostics only, never routing.
+  let storedBindingRejected = false;
+  let stored: WebchannelOriginTarget | null;
+  try {
+    stored = resolveApprovalRequestOriginTarget<WebchannelOriginTarget>({
+      cfg,
+      request,
+      channel: WEBCHANNEL_ID,
+      accountId: rawHandlerAccountId,
+      // Deliberately blind to the live metadata here: this path only runs when
+      // the turn source was absent or channel-less, and a `turnSourceTo` with no
+      // channel is uncorroborated. Returning null leaves the STORED target as
+      // the helper's answer.
+      resolveTurnSourceTarget: () => null,
+      resolveSessionTarget: (sessionTarget: ExecApprovalSessionTarget) => {
+        const storedChannel = sessionTarget.channel?.trim().toLowerCase();
+        const to = typeof sessionTarget.to === "string" ? sessionTarget.to : "";
+        // The helper compares the channel but NOT the account, so the account
+        // check has to live here. Canonical comparison only — exact raw account
+        // identity is the lease claim's job, and the store canonicalizes what it
+        // persists anyway.
+        const sameAccount =
+          canonicalizeAccountId(sessionTarget.accountId) ===
+          canonicalizeAccountId(rawHandlerAccountId);
+        if (storedChannel !== WEBCHANNEL_ID || !sameAccount || !to) {
+          storedBindingRejected = true;
+          return null;
+        }
+        return { to };
+      },
+      // Retained for contract completeness, but UNREACHABLE with
+      // `resolveTurnSourceTarget` pinned to null: the helper only compares the
+      // two sides when it has both. The comparison that matters on this path is
+      // ours, against the lease peer, below.
+      targetsMatch: (a, b) => a.to === b.to,
+      // `resolveFallbackTarget` is deliberately NOT passed: it is the SDK's
+      // "guess when nothing is proven" hook, which is exactly what #93 removes.
+    });
+  } catch {
+    // No exception may cross the capability boundary — a store read that throws
+    // must not take the approval runtime down with it.
+    warnOriginUnresolved(rawHandlerAccountId, "sdk_error", true);
+    return null;
+  }
+
+  if (!stored) {
+    warnOriginUnresolved(
+      rawHandlerAccountId,
+      storedBindingRejected ? "stored_binding_mismatch" : "stored_target_unavailable",
+      true,
+    );
+    return null;
+  }
+  if (stored.to !== active.peerId) {
+    // Both sides named a peer and they disagree — a stored entry overwritten by
+    // another peer, or a lease for a different run. Unprovable either way.
+    warnOriginUnresolved(rawHandlerAccountId, "active_stored_mismatch", true);
+    return null;
+  }
+  return { to: stored.to };
 }
 
 /**
@@ -922,21 +1123,31 @@ export function createClawApprovalCapability(
       isWebChannelExecApprovalApprover({ cfg, accountId, senderId }),
     isNativeDeliveryEnabled: ({ cfg, accountId }) => isExecApprovalsEnabled(cfg, accountId),
     resolveNativeDeliveryMode: () => "channel",
-    resolveOriginTarget: ({ request }) => {
-      // The ORIGINATING peer's web session. `request.request.turnSourceTo` is
-      // exactly the wsKey we recorded as the inbound turn's `reply.to`
-      // (src/inbound.ts buildContext), which is also the transport socket-map
-      // key. Filter on turnSourceChannel so we never mis-claim an approval that
-      // originated on a different channel. Fall back to the anon peer when the
-      // turn-source is absent (the anonymous single-session dev path).
+    resolveOriginTarget: ({ cfg, accountId, request }) => {
+      // #93 precedence. Core's own metadata is the fast path when it is
+      // COMPLETE: an explicit `webchannel` channel plus a target is the wsKey we
+      // recorded as the inbound turn's `reply.to`, which is also the transport
+      // socket-map key.
+      //
+      // A channel-less `turnSourceTo` is deliberately DISCARDED rather than
+      // trusted: nothing corroborates which channel it belongs to, and this
+      // resolver's whole job is to stop asserting unproven origins. Those turns
+      // fall through to the evidence-based path below.
+      //
+      // `web-anon` gets no special case. In an anonymous single-session
+      // deployment the lease peer and the stored target are both `web-anon`, so
+      // it passes the ordinary rules on its own merit.
       const src = request.request;
-      const channel = src.turnSourceChannel?.toLowerCase();
+      const channel =
+        typeof src.turnSourceChannel === "string"
+          ? src.turnSourceChannel.trim().toLowerCase()
+          : "";
+      // A different channel's approval is simply not ours — a normal
+      // non-ownership, and deliberately not a diagnostic.
       if (channel && channel !== WEBCHANNEL_ID) return null;
-      const to =
-        typeof src.turnSourceTo === "string" && src.turnSourceTo.length > 0
-          ? src.turnSourceTo
-          : ANON_PEER_ID;
-      return { to };
+      const to = typeof src.turnSourceTo === "string" ? src.turnSourceTo.trim() : "";
+      if (channel === WEBCHANNEL_ID && to) return { to };
+      return resolveWebchannelFallbackOriginTarget({ cfg, accountId, request });
     },
     // `notifyOriginWhenDmOnly` intentionally omitted: `resolveNativeDeliveryMode`
     // is always "channel" (webchannel has no DM surface), so DM-only delivery

@@ -7,6 +7,10 @@ import { resolveDmAdmission } from "./dm-allowlist.js";
 import { DEFAULT_WEBCHANNEL_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
 import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
+import {
+  getApprovalOriginRegistry,
+  type ApprovalOriginLease,
+} from "./approval-origin.js";
 
 /** The inbound path only handles user messages; approvals route separately. */
 type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
@@ -70,6 +74,13 @@ const MAX_TRACKED_RUNS = 512;
  * `stopAgentLifecycleSubscription` releases it at host teardown.
  */
 export function startAgentLifecycleSubscription(api: OpenClawPluginApi): void {
+  // #93: touch the process-global approval-origin registry at INITIALIZATION.
+  // The getter throws when a co-installed build left an incompatible object in
+  // the versioned global slot, and that has to surface here — while the host is
+  // still wiring the plugin up — rather than mid-turn, where the first symptom
+  // would be a failed user turn. Nothing is cached: the reference is deliberately
+  // re-read on every use (see `handleInboundMessage`).
+  getApprovalOriginRegistry();
   const events = api.runtime?.events;
   if (!events || typeof events.onAgentEvent !== "function") return;
   stopAgentLifecycleSubscription();
@@ -103,6 +114,25 @@ export function stopAgentLifecycleSubscription(): void {
   lifecycleUnsubscribe?.();
   lifecycleUnsubscribe = undefined;
   agentRunVerdicts.clear();
+  // #93: host teardown draws a new approval-origin barrier. Any request the
+  // gateway replays from BEFORE this point can no longer be attributed to a
+  // live run, so it is refused rather than matched against whatever is running
+  // after the reload. Rotation deliberately does NOT drop active claims: the
+  // queue lets a running handler settle instead of aborting it
+  // (`inbound-queue.ts:393`), and that handler still owns its lease until its
+  // own `finally` — it can still legitimately emit approvals for requests it
+  // creates after the new barrier.
+  //
+  // Swallowed on failure: the getter throws when the versioned global slot holds
+  // an incompatible registry, and a teardown that cannot rotate must not take
+  // the rest of the host's cleanup down with it. That condition is never silent
+  // overall — the same getter throws loudly at `startAgentLifecycleSubscription`
+  // and on every turn, which is where it is actionable.
+  try {
+    getApprovalOriginRegistry().rotateEpoch();
+  } catch {
+    /* teardown continues */
+  }
 }
 
 /**
@@ -194,6 +224,13 @@ export async function handleInboundMessage(
   // settled outcome even when setup fails. Control-lane turns never settle; an
   // explicit DM denial opts out below because no agent turn was admitted.
   let settlementEligible = !controlLane;
+  /**
+   * #93: this turn's approval-origin lease, held for exactly the window in
+   * which the agent run can emit a tool approval. Declared out here because the
+   * `finally` below must be able to release it — a `let` inside the `try` would
+   * not be in scope there.
+   */
+  let originLease: ApprovalOriginLease | undefined;
 
   try {
     const channelRuntime = api.runtime.channel;
@@ -271,6 +308,36 @@ export async function handleInboundMessage(
   // turn is dispatched under this key, and the history READ sites resolve the
   // SAME key via the SAME helper, so paging/snapshot stay consistent.
   const route = resolveWebchannelSessionRoute(api, accountId, wsKey);
+
+  // #93: build this turn's approval-origin lease handle. Creating it claims
+  // NOTHING — `activate()` in `onAgentRunStart` is what publishes the claim, so
+  // a turn that is denied or fails setup before the agent run starts can never
+  // leave a claim behind that absorbs someone else's approval.
+  //
+  // EVERY turn gets a handle, including the control lane. A `/stop` turn is
+  // exempt from being SELECTABLE as an origin, not from being recorded: when
+  // core's fast-abort finds nothing to consume, the control-lane message falls
+  // through to an ordinary agent turn that can call tools and request approvals.
+  // Leaving that run unrecorded would hide it from the overlap poison, and a
+  // request it created could then be answered with a DIFFERENT peer's claim on
+  // the same session key (`session.identityLinks` collapses distinct peers onto
+  // one key). `evidence: "presence"` records the run while keeping it
+  // permanently unselectable.
+  //
+  // The registry is fetched per turn and never cached in a module-level
+  // variable: a cache-busted reload would pin a stale reference, and old and new
+  // module generations would then see different claims — the exact split the
+  // versioned process-global slot exists to prevent.
+  //
+  // `accountId` goes in VERBATIM. The claim's account is compared byte-for-byte
+  // at resolve time, so normalizing here would let an alias account satisfy a
+  // lookup it did not originate.
+  originLease = getApprovalOriginRegistry().createLease({
+    rawAccountId: accountId,
+    sessionKey: route.sessionKey,
+    peerId: wsKey,
+    evidence: controlLane ? "presence" : "origin",
+  });
 
   // Reasoning display policy (CHANNEL-OWNED). OpenClaw's plugin dispatch path
   // forwards `onReasoningStream` with no reasoning-level gate of its own (ACP
@@ -395,17 +462,26 @@ export async function handleInboundMessage(
             recordInboundSession: channelRuntime.session.recordInboundSession,
             dispatchReplyWithBufferedBlockDispatcher:
               channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher,
-            // `replyOptions` exists ONLY when this turn has a live lane to feed:
-            // the reasoning lane (resolved level "stream") and/or the answer/tool
-            // draft (progress/partial mode). When NEITHER is active — block/off
-            // with no "stream" reasoning, and every control-lane turn — the whole
-            // key is omitted, restoring the pre-reasoning-lane block/off shape.
+            // `replyOptions` is UNCONDITIONAL — it is present on every turn,
+            // including block/off streaming and the control lane, because
+            // `onAgentRunStart` (below) must fire for all of them. Only the
+            // reasoning and draft callbacks inside it are conditional, each on
+            // its own lane having opened.
             replyOptions: {
                     // #87: always wired, on every turn and every streaming mode
                     // — this is how the turn learns which agent run's lifecycle
                     // terminal is its own.
+                    //
+                    // #93: it is also the exact moment the run becomes able to
+                    // emit a tool approval, which is why the origin lease is
+                    // activated HERE and not at dispatch. `activate()` is
+                    // idempotent, so the repeated callbacks core emits under
+                    // model fallback claim once. A control-lane turn that got
+                    // this far is a real agent run and claims too — as
+                    // `presence`, so it is recorded but never selectable.
                     onAgentRunStart: (runId) => {
                       agentRunId = runId;
+                      originLease?.activate();
                     },
                     // Reasoning callbacks are wired iff the lane opened above.
                     ...(reasoning
@@ -615,6 +691,13 @@ export async function handleInboundMessage(
       }
     }
   } finally {
+    // #93: FIRST, so no throw from the cleanup below can skip it. The lease is
+    // the only thing keeping this run's claim in the registry, and a claim that
+    // outlives its run poisons its tuple for every later origin on the same
+    // key. Normal return, throw, provider error and abort all pass through
+    // here; the claim is removed by its own id, so a run retained across a
+    // teardown rotation releases only itself.
+    originLease?.release();
     // Always halt the throttled draft loop so a late background flush can't race
     // the error handling (or linger after a normal finalize). Idempotent and a
     // no-op when no draft was created or it was already stopped by finalize().
