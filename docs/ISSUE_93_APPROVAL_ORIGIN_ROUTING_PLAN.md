@@ -27,25 +27,41 @@ account eligibility는 기존 `shouldHandleWebChannelApprovalRequest`가 계속 
 
 ---
 
-## 2. 검증 기록
+## 2. 전제와 그 출처
 
-이 설계는 아래 사실 위에 서 있다. 전부 pinned `2026.6.10` 번들과 현재 소스에서 직접 확인했다.
+이 설계가 딛고 선 전제를 **출처의 성격별로** 분류한다. hash-named 내부 번들 경로(`dist/<name>-<hash>.js`)는 매 빌드마다 바뀌므로 인용하지 않는다 — 인용하는 순간 레포가 그 빌드에 고정되고, 그것이 지금의 버전 핀이 생긴 원인이다.
 
-| 전제 | 확인 위치 |
+**A. 계약 (`openclaw/plugin-sdk/*` export) — 설계 전제로 삼아도 된다**
+
+| 전제 | 계약 표면 |
 | --- | --- |
-| `resolveApprovalRequestOriginTarget` / `resolveApprovalRequestSessionTarget`가 2026.6.10에 export된다 | `dist/plugin-sdk/approval-runtime.d.ts:14`, `dist/plugin-sdk/exec-approval-session-target-Cxs0XSrV.d.ts:51,56` |
-| helper는 live/stored가 둘 다 있고 불일치하면 `null`, live가 없으면 stored를 반환한다 | `dist/exec-approval-session-target-BaDJBoeh.js:167-183` |
-| stored target은 `request.request.sessionKey`가 가리키는 실제 session-store entry에서 복구된다 | 같은 파일 `:16-25`, `:123-142` |
-| `createdAtMs`는 exec/plugin 양쪽 request 타입에서 required `number`다 | `dist/plugin-sdk/exec-approvals-bouecjdj.d.ts:393`, `plugin-approvals-BJKrB_Dr.d.ts:33` |
-| capability의 `resolveOriginTarget` 훅은 `cfg`와 `accountId`를 받는다 (현재 코드가 `{ request }`만 쓸 뿐) | `dist/plugin-sdk/approval-native-helpers-C9ao-3_P.d.ts:98` |
-| **훅에 오는 `accountId`는 우리가 등록한 raw 문자열 그대로다** (core가 normalize하지 않는다) | `approvals.ts:1013` (`accountId: ctx.accountId`) → `multiplex.ts:74` (pass-through) → `nats-account-runtime.ts:1421` (`accountRuntimes` 키) → `dist/approval-native-runtime-BRZlxWCL.js:479,487` (`adapter.accountId` 고정) |
-| `resolveOriginTarget`은 delivery plan에서 **request당 1회**만 호출된다. forwarding-suppressor 경로는 우리 capability를 타지 않는다 | `dist/approval-native-runtime-BRZlxWCL.js:42,354`; `dist/approval-delivery-helpers-CHYA76Y_.js:73-89` (`resolveOriginTarget`은 `native`에만 배선) |
+| `resolveApprovalRequestOriginTarget` / `resolveApprovalRequestSessionTarget`를 쓸 수 있다 | `openclaw/plugin-sdk/approval-runtime` export |
+| 전자는 "live와 stored binding이 일치할 때만" origin target을 준다 | 같은 export의 선언 JSDoc |
+| `resolveApprovalRequestOriginTarget`은 `{ cfg, request, channel, accountId, resolveTurnSourceTarget, resolveSessionTarget, targetsMatch }`를 받는다 | `ApprovalRequestOriginTargetResolver<TTarget>` 타입 |
+| `resolveSessionTarget`에 오는 `ExecApprovalSessionTarget`은 `{ channel?, to, accountId?, threadId? }`다 | 같은 타입 surface |
+| `createdAtMs`는 `ExecApprovalRequest` / `PluginApprovalRequest` 양쪽에서 required `number`다 | 두 타입의 export된 선언 |
+| capability의 `resolveOriginTarget` 훅은 `{ cfg, accountId, approvalKind, request }`를 받는다 | `createApproverRestrictedNativeApprovalCapability` params 타입 |
+
+**B. 우리 코드 — 읽어서 확인했고 우리가 소유한다**
+
+| 전제 | 위치 |
+| --- | --- |
 | queue dispose는 running handler를 abort하지 않고 settle하도록 둔다 | `inbound-queue.ts:393` |
 | `stopAgentLifecycleSubscription()`은 per-account가 아니라 host teardown에서만 호출된다 | `nats-account-runtime.ts:1533` (`registerFull`의 runtime-lifecycle cleanup) |
 | resolver가 설치된 모드의 transport miss는 closure transport로 fallback하지 않는다 | `approvals.ts:713-717` |
 | webchannel account id는 `/^[A-Za-z0-9_-]{1,64}$/`만 통과한다 | `account-id.ts:4` |
+| 우리는 approval runtime context를 `accountId: ctx.accountId`로 등록한다 | `approvals.ts:1013` → `multiplex.ts:74` (pass-through) → `nats-account-runtime.ts:1421` (`accountRuntimes` 키) |
+| core canonical form과 다른 자체 소문자화를 쓰면 alias가 갈린다 | `account-config.ts:118`의 `canonicalizeAccountId`가 core-호환 구현 |
 
-확인 결과 **철회된 전제**: 기존 초안은 canonical account key를 `rawAccountId.toLowerCase()`로 잡았으나, core의 `normalizeAccountId`는 소문자화에 더해 선행/후행 `-`도 제거한다(`dist/account-id-5IgE9UKY.js`). webchannel은 `-abc`도 유효 id로 받으므로 `-abc`와 `abc`는 core 기준 같은 canonical(`abc`)이지만 `toLowerCase()` 기준으로는 서로 다르다. §3.2의 collision domain은 `account-config.ts:118`의 core-호환 `canonicalizeAccountId`를 쓴다.
+**C. 관찰된 core 동작 — 설계 전제가 아니라 테스트로 고정할 대상**
+
+아래 세 가지는 계약에 명시되어 있지 않고 내부 구현을 읽어서 알아낸 것이다. 설계는 이 값들이 **깨졌을 때 fail-closed 되도록** 짜여 있고, 실제로 유지되는지는 §6의 테스트가 pinned devDependency에 대해 확인한다. 내부 번들 경로를 근거로 남기지 않는다.
+
+1. **훅에 오는 `accountId`는 우리가 등록한 raw 문자열 그대로다** (core가 normalize하지 않는다). §4.4의 exact raw account 필터가 여기 의존한다. 깨지면 transport lookup이 miss하고 판정은 `null`로 닫힌다 → §6.3이 raw/alias 두 handler로 고정한다.
+2. **`resolveOriginTarget`은 delivery 경로에서 request당 1회 호출된다.** Phase 1은 이 값에 정확성을 걸지 않는다(멱등한 판정이다). §8의 동기 I/O 리스크 평가에만 쓰이고, 1:1 pairing에 정확성을 거는 provenance 설계는 [#100](https://github.com/mir-stream/openclaw-webchannel/issues/100)으로 넘겼다.
+3. **stored target은 `request.request.sessionKey`가 가리키는 session-store entry에서 복구된다** (동기 파일 읽기). §4.4가 이 helper를 corroboration으로만 쓰고 유일 근거로 쓰지 않는 이유다 → §8.
+
+**철회된 전제**: 기존 초안은 canonical account key를 `rawAccountId.toLowerCase()`로 잡았다. 그러나 core가 export하는 계정 정규화는 소문자화에 더해 선행/후행 `-`도 제거하며, `account-config.ts:118`이 이미 그 규칙을 복제해 두었다. webchannel은 `-abc`도 유효 id로 받으므로 `-abc`와 `abc`는 core 기준 같은 canonical(`abc`)이지만 `toLowerCase()` 기준으로는 서로 다르다. §4.2의 collision domain은 자체 소문자화 대신 `canonicalizeAccountId`를 재사용한다.
 
 ---
 
@@ -298,7 +314,7 @@ transport-generation 격리 — lease claim의 `transportGeneration` 토큰, res
 ## 8. 리스크와 범위 밖
 
 - **reload/teardown with running handlers:** queue dispose는 running handler를 abort하지 않는다(`inbound-queue.ts:393`). dormant handle은 rotation으로 막되 active claim은 그 handler의 exact release까지 유지한다. old pending replay는 barrier가 막고 retained run의 실제 post-barrier request만 허용한다.
-- **session store 동기 읽기:** `resolveApprovalRequestOriginTarget`은 내부적으로 `loadSessionStore`로 **동기 파일 읽기 + 전체 JSON 파싱**을 수행한다(`dist/exec-approval-session-target-BaDJBoeh.js:16-25`). fallback 판정마다 event loop를 막으므로, 큰 session store에서 지연이 관측되면 별도 이슈로 캐싱을 검토한다. §2에서 확인했듯 호출은 request당 1회로 bounded되어 있어 Phase 1에서는 수용한다.
+- **session store 동기 읽기:** `resolveApprovalRequestOriginTarget`은 persisted session entry를 읽어야 하므로 판정 시점에 session store를 **동기적으로** 읽는다(§2-C-3). fallback 판정마다 event loop를 막으므로, 큰 session store에서 지연이 관측되면 별도 이슈로 캐싱을 검토한다. 호출 빈도는 §2-C-2 관찰상 request당 1회로 bounded되어 Phase 1에서는 수용하되, 이는 계약이 아니므로 지연이 문제가 되면 그때 측정한다.
 - **process restart:** registry와 gateway pending state가 함께 사라진다. durable cross-restart origin을 추측하지 않고 fail-closed 한다.
 - **wall-clock anomaly:** non-finite/future time 또는 epoch 내 regression은 해당 판정을 fail-closed 한다. 일시적 false negative는 허용하지만 later run을 old request에 붙이는 false positive는 허용하지 않는다.
 - **same-ms ordering:** activation과 request creation이 같은 millisecond면 legitimate request도 막힐 수 있다. 순서를 증명할 수 없는 equality에서 availability보다 exact-origin safety를 택한다.
