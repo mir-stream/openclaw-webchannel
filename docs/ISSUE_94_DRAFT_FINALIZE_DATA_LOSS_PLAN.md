@@ -223,6 +223,7 @@ type AssistantDraftLane = {
 
 1. ID는 lane마다 하나씩 만들고, 다음 메시지가 시작되면 새 ID로 회전한다.
 2. 첫 `onAssistantMessageStart`와 내용 없는 중복 경계는 빈 버블을 만들지 않는다.
+2b. **회전한 lane은 실제 어시스턴트 텍스트가 생기기 전까지 `progress` 프레임을 보내지 않는다.** 프로토콜에 버블 삭제 프레임이 없어서(`OutboundWsMessage`에 `progress`/`agent_message`만 있음) 한 번 보낸 id는 반드시 `agent_message`로 정착시켜야 한다. 회전 직후 툴 스캐폴드를 그 lane으로 내보내면 abort 시 스캐폴드 텍스트가 담긴 버블이 강제로 남아 §7("스캐폴드는 완료된 어시스턴트 메시지가 아니다")을 어긴다. 따라서 회전 후의 툴 진행 표시는 억제하고, 메시지 사이 작업의 가시성은 #96에서 다룬다. **첫 lane의 스캐폴드 동작은 지금 그대로 유지한다**(무회귀).
 3. partial은 활성 lane만 갱신한다. `replace:true`도 활성 lane 안에서만 본문을 교체한다.
 4. 경계가 오면 이전 lane에 실제 어시스턴트 텍스트가 있는 경우만 정착한다. partial이 있으면 사용자가 마지막으로 본 정제된 cumulative snapshot을 쓴다. partial이 없었다면 그 lane에 기록된 queued block payload들을 순서대로 이어 본문으로 쓴다. block 하나를 곧바로 assistant 메시지 전체라고 가정하지 않는다.
 5. **`assistantMessageIndex`는 `onBlockReplyQueued`에서만 읽는다.** 용도는 두 가지로 한정한다 — (a) 기록하는 block이 활성 lane 소유인지 대조, (b) 경계 누락 진단 로그. index가 없으면(`when available`) 콜백 직렬 순서와 내부 generation으로 대체한다. **delivery 이음매에는 index가 없으므로**(§5.2) 그쪽 상관에는 쓰지 않는다.
@@ -267,6 +268,17 @@ core callback 타입이 Promise를 허용해도 모든 호출자가 그 Promise�
 
 이 방어는 final과 앞 메시지의 의미를 내용으로 추측하는 로직이 아니다. 구조화된 `replace` 계약이 깨졌을 때 **이미 표시한 데이터를 보존하는 실패 안전장치**다.
 
+#### 6.5.1 방어 회전과 history 형상
+
+방어 회전이 도는 정상 경로에서는 core가 실제로 새 어시스턴트 메시지를 시작했는데 경계만 누락한 것이므로, core transcript에도 메시지가 둘 있다. 즉 라이브 2 = history 2로 형상이 어긋나지 않는다.
+
+어긋나는 경우는 하나뿐이다 — **같은 메시지를 재작성하는 partial이 `replace:true` 없이 왔는데 방어 회전이 오작동**하면 라이브 2 / history 1이 된다. 이 발산은 **수용한다.** 데이터 유실(#94 본체)보다 중복 표시가 낫고, 재접속 시 history가 정본으로 수렴시킨다. 대신 두 가지를 요구한다.
+
+- 방어 회전은 **반드시 contract-violation 진단 로그를 남긴다.** 로그 없는 조용한 회전은 금지한다.
+- `replace:true` 경로는 **절대 회전하지 않는다**(M4/M7로 고정). 오작동 가능 구간을 `replace` 표시가 없는 divergence 하나로 좁힌다.
+
+이 수용은 §13의 "라이브 = history" 항목에 대한 명시적 예외다.
+
 ---
 
 ## 7. progress scaffold와 다른 streaming mode
@@ -289,7 +301,8 @@ core callback 타입이 Promise를 허용해도 모든 호출자가 그 Promise�
 3. inline 재전송은 하지 않는다. ack 없는 재시도는 A 중복 버블을 만들 수 있다.
 4. 재접속/register 시 history snapshot이 빠진 메시지를 복구한다.
 5. B final 자체가 실패해도 기존 P0-4 결정대로 사용자 메시지의 턴 outcome을 거짓 실패로 바꾸지 않는다. `visibleReplySent`와 `finalReplyDelivered`는 B final의 실제 live delivery 결과를 따른다.
-6. abort/error cleanup은 이미 정착한 A를 건드리지 않고 활성 lane만 snapshot으로 정착한다.
+6. abort/error cleanup은 이미 정착한 A를 건드리지 않고 활성 lane만 snapshot으로 정착한다. 정착 조건은 **lane별 `started`**(그 lane이 `progress` 프레임을 하나라도 보냈는가)다. §6.2-2b 때문에 회전 후 텍스트가 없는 lane은 `started === false`라 정착시킬 대상 자체가 없다 — 빈 버블도, 중단 마커도 생기지 않는다.
+7. 기존 `snapshot || "⏹ Stopped."` fallback은 현재도 도달 불가한 방어선이다(`started` ⇒ 프레임 발신 ⇒ 스냅샷 비어있지 않음). lane 모델에서도 같은 이유로 도달 불가로 남는다. 이 fallback을 회전 lane의 표시 수단으로 쓰지 않는다.
 
 ---
 
@@ -363,16 +376,33 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 
 ### 클라이언트 회귀 테스트
 
-- 같은 `turnId`에서 ID A/B의 progress/final frame을 받으면 버블 2개가 유지된다.
-- history snapshot의 A/B와 라이브 형상이 같은지 확인한다.
+reducer(`agent_message`의 id upsert/append)는 이미 다중 ID를 지원하므로 위험 표면이 아니다. **실제 위험은 history 화해 로직**(`nats-client-wrapper.ts`의 3-tier 매칭)이다. 턴당 버블이 하나라는 전제가 깨지면서 tier-3 positional 매칭이 상시 경로가 된다.
+
+| # | 케이스 | 기대 |
+| --- | --- | --- |
+| C1 | 같은 `turnId`로 ID A/B의 progress/final frame 수신 | 버블 2개 유지, 순서 보존 |
+| C2 | 라이브 2 / snapshot 2 (대칭) | tier-2 또는 tier-3로 각각 채택, 중복 없음 |
+| C3 | **라이브 1 / snapshot 2** (A live 정착 실패 후 재접속, §8-1) | `[u, A, B]`로 수렴. tier-3 anchor 전진이 B를 A 자리에 잘못 채택하지 않을 것 |
+| C4 | **라이브 3 / snapshot 2** (§6.5.1 방어 회전) | 앞 2개는 채택, 남는 로컬 버블이 중복/유실을 만들지 않을 것 |
+| C5 | lane 회전으로 턴당 draft id가 N개 | `staleDraftWatch` / `finalizeDraftsForTurn`이 각 id를 정상 disarm·정착 |
+
+C3/C4는 지금 우연히 맞을 수는 있어도 테스트로 고정돼 있지 않다. 이 변경이 그 전제를 상시 경로로 만들므로 반드시 고정한다.
+
+### e2e 게이트
+
+#87이 `test(e2e): gate the #87 turn outcome in CI`로 남긴 선례를 따른다. 라이브 경로 데이터 유실 결함이므로 단위 테스트만으로 닫지 않는다.
+
+- partial 모드 다중 어시스턴트 메시지 턴이 CI에서 **두 개의 서로 다른 id로 정착**하는지 e2e로 확인한다.
+- `e2e/protocol-version-lockstep.test.ts`: 새 프레임 타입이 없으므로 protocol 버전은 올리지 않는다. 이 판단을 테스트로 명시해 둔다.
 
 게이트:
 
 ```bash
+npm install          # 이 워크스페이스에는 node_modules가 없다 — 없으면 아래가 전부 실패한다
 npm run build
 npm run typecheck
 npx vitest run packages/plugin
-npm test
+npm test             # 루트 vitest — client 회귀와 e2e 포함
 ```
 
 ---
@@ -407,10 +437,15 @@ npm test
 - [ ] 한 턴의 완료된 assistant 메시지 N개가 라이브에서도 N개 버블로 남는다.
 - [ ] 각 메시지는 고유 ID를 가지며 partial은 해당 활성 ID만 갱신한다.
 - [ ] final은 마지막 메시지 ID만 확정하고 앞 버블을 변경하지 않는다.
-- [ ] live와 history hydrate의 메시지 수/순서/본문이 일치한다.
+- [ ] live와 history hydrate의 메시지 **수와 순서**가 일치한다(§6.5.1의 방어 회전 예외 제외).
+      **본문 일치는 완료 조건이 아니다** — core는 라이브 응답에서 메타데이터 구획을 걷어내고 transcript에는 원본을 저장하므로 두 텍스트는 애초에 byte-equal이 아니다(`nats-client-wrapper.ts:1052-1054`). 본문 수렴은 hydrate의 정본 텍스트 채택(`adoptAt`)이 담당하며, 이 이슈가 보장할 대상이 아니다.
 - [ ] 메시지 동일성 판정에 `includes`/suffix/문자열 split을 사용하지 않는다.
 - [ ] 앞 lane 전송 실패 후에도 마지막 final 전달이 시도된다.
 - [ ] abort/error/단일 메시지/progress/block/off 경로에 회귀가 없다.
+- [ ] 중단/에러 경로에서 빈 버블도 중단 마커 버블도 생기지 않는다(§6.2-2b, §8-6).
+- [ ] history 화해 비대칭 케이스(C3/C4)와 다중 draft id watchdog(C5)이 테스트로 고정된다.
+- [ ] 다중 어시스턴트 메시지 턴이 e2e에서 두 개의 서로 다른 id로 정착한다.
+- [ ] 계약 밖(core 내부 번들) 의존을 새로 늘리지 않는다 — 신규 근거는 `plugin-sdk` export만 인용한다.
 - [ ] build/typecheck/plugin tests/full tests가 모두 통과한다.
 
 ---
@@ -431,7 +466,9 @@ npm test
 - **`deliver`에는 `assistantMessageIndex`가 없다**(§5.2). index는 `onBlockReplyQueued`의 `BlockReplyContext`에서만 읽는다. 이 필드를 delivery 이음매에서 찾다가 캐스팅으로 뚫으려 하지 않는다.
 - `deliver`는 lane을 식별하지 않는다. `final`은 활성 lane을 정착시키고, partial 모드의 non-final block은 버블을 만들지 않는다.
 - `onBlockReplyQueued`는 같은 assistant 메시지에 여러 번 올 수 있다. **block 하나를 메시지 하나로 가정하지 않는다.**
-- settle latch는 턴별이 아니라 lane별이다.
+- settle latch는 턴별이 아니라 lane별이다. `started`도 lane별이다.
+- 회전한 lane은 어시스턴트 텍스트가 생기기 전까지 `progress`를 보내지 않는다. 프로토콜에 버블 삭제가 없어서, 한 번 보이면 반드시 버블로 남는다(§6.2-2b).
+- 위험한 클라이언트 표면은 reducer가 아니라 history 3-tier 화해 로직이다(§10 C3/C4).
 - 앞 lane send 실패가 queue를 reject 상태로 고정하거나 마지막 final을 막아서는 안 된다.
 - tool/item progress scaffold는 완료된 assistant 메시지가 아니다.
 
