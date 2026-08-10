@@ -103,9 +103,12 @@ narrowed to agent-down durability — see below).
    `execApprovals`/`inlineButtons` (`:137/:163`), and a `streaming.mode` option
    (`off|partial|block|progress`, enum `:110`) with **no manifest default** — but the demo now **sets
    `streaming.mode:"partial"`** (`run.sh:287`, P0-5). The two draft modes differ: `"partial"` streams
-   the **answer text** into the working draft (the "typing out" / Telegram-parity effect, superset of
-   progress), while `"progress"` streams **tool/item lines only** and finalizes the answer atomically
-   (`inbound.ts:124-136`). Setup-wizard nit remains: it does not offer `streaming.mode` (enroll-only).
+   the **current assistant message's answer text** into an active working draft, while `"progress"`
+   streams **tool/item lines only** and finalizes the answer atomically (`inbound.ts:124-136`). The
+   capability is live, but [#94](https://github.com/mir-stream/openclaw-webchannel/issues/94) remains
+   a correctness gap: multiple assistant messages currently share one draft id, so the last final can
+   erase earlier live messages. The accepted fix settles one bubble per assistant-message boundary
+   and rotates to a new id. Setup-wizard nit remains: it does not offer `streaming.mode` (enroll-only).
 
 3. **Slash commands both execute AND are discoverable.** Execution always worked — text commands are
    on by default and WebChannel is not a native-command surface (`channel.ts:115` declares no
@@ -113,10 +116,10 @@ narrowed to agent-down durability — see below).
    **Discovery is now built too** (#30): a `load_commands`→`commands` catalog (config-filtered, from
    `native-command-registry`) feeds a widget typeahead. The only P0-3 residual is **argument menus**.
 
-## Server-side items — now FIXED after the refactor
+## Server-side items — status after the refactor
 
-The three server-side gaps this section previously tracked as open have all landed. Re-verified
-2026-07-13:
+The original enablement gaps landed. Streaming is enabled, with #94 still open as a live-path
+correctness fix:
 
 1. **P0-2 depth cap** — ✅ FIXED (#24). `pageBefore` (`history.ts:277-318`) is now a two-phase fetch
    that widens to the 1000-message upstream ceiling (`MAX_FETCH_WINDOW`) when the small window can't
@@ -127,9 +130,11 @@ The three server-side gaps this section previously tracked as open have all land
    `setTypingEnabled()` (`:502-504`); `sendTyping` (`:509-513`) is gated; wired at
    `index-nats.ts:590` from `resolveTypingEnabled(account)` (`account-config.ts:271-276`). So
    `capabilities.typing:"off"` is now honored on NATS.
-3. **P0-5 streaming flag** — ✅ FIXED. `demo/run.sh:287` now sets `"streaming": { "mode": "partial" }`
-   in the account block, so `resolveStreamingMode(...)` enables the answer-text draft stream in the
-   demo (`inbound.ts:124-136`). Setup-wizard nit: it still doesn't offer `streaming.mode` (enroll-only).
+3. **P0-5 streaming flag** — 🟡 ENABLED, correctness work open. `demo/run.sh:287` sets
+   `"streaming": { "mode": "partial" }`, so `resolveStreamingMode(...)` enables the answer-text draft
+   stream in the demo (`inbound.ts:124-136`). #94 must still replace the turn-wide single draft with
+   per-assistant-message materialize-and-rotate lanes. Setup-wizard nit: it still doesn't offer
+   `streaming.mode` (enroll-only).
 
 ## Reuse principle
 

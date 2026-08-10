@@ -391,15 +391,16 @@ memory `demo-user-login`.
 
 ---
 
-## P0-5 — Streaming / partial responses (progress drafts) — ✅ BUILT (demo streams `partial`)
+## P0-5 — Streaming / partial responses (progress drafts) — 🟡 PARTIAL (#94 open)
 
 **Symptom (original).** The reply appeared all at once; no live "typing out", no tool-progress
 feedback.
 
-**Classification.** ✅ Built. Client render is mode-agnostic; the server gate has two draft modes; and
-the demo now **sets `streaming.mode:"partial"`** (`demo/run.sh:287`, commit `8671d49`), so the
-answer-text "typing out" stream is exercised end-to-end. One nit: the setup wizard does not offer
-`streaming.mode` (deliberately enroll-only — see below).
+**Classification.** 🟡 The streaming capability is built and the demo exercises it, but multi-message
+turns are not yet durable on the live path. [#94](https://github.com/mir-stream/openclaw-webchannel/issues/94)
+tracks the correctness gap: WebChannel currently flattens more than one assistant message into one
+draft id, then replaces that id with the last `final` payload. Earlier assistant messages disappear
+until a history reload restores them.
 
 **Where it stands today.**
 - Server streaming is **gated on config** with **two distinct draft modes** (post-#14):
@@ -409,22 +410,23 @@ answer-text "typing out" stream is exercised end-to-end. One nit: the setup wiza
   const draftEnabled = streamingMode === "progress" || streamingMode === "partial";
   const answerStreamingEnabled = streamingMode === "partial";
   ```
-  - **`"partial"`** streams the **answer text** into the working draft (`onPartialReply` →
-    `draft.pushAnswerText`, `inbound.ts:263-284`) — the core/Telegram-parity "typing out" effect.
-    Partial is a **superset** of progress: it also carries tool/item lines.
+  - **`"partial"`** streams the **current assistant message's answer text** into an active working
+    draft (`onPartialReply` → `draft.pushAnswerText`) — the "typing out" effect. Partial is a
+    **superset** of progress: it also carries tool/item lines.
   - **`"progress"`** streams **tool/item progress lines only** (`onToolStart`/`onItemEvent`,
     `inbound.ts:229-252`); the answer text is **not** streamed — it finalizes atomically.
   - `"block"`/`"off"` take the no-draft fallback.
-- The #14 per-itemId cumulative-partial handling + boundary prefix-rollup (and #23's missed-boundary
-  defense) live in `packages/plugin/src/message-adapter.ts` (`answerText`/`answerPrefix`,
-  `rollCurrentIntoPrefix`, `handleAssistantMessageBoundary`, the "MISSED-BOUNDARY DEFENSE" block in
-  `pushAnswerText`).
-- **Wire is unchanged:** partial reuses the same `{ type:"progress", id, text }` frame
-  (`nats-channel.ts:58`, `sendProgress` `:375`); finalize reuses `agent_message` with the same draft
-  `id` (`finalizeDraft` `:383`).
-- **Reducer is mode-agnostic:** `nats-client-wrapper.ts:557` `case "progress"` upserts a working
-  bubble keyed by draft `id`; the matching `agent_message` (`:569`) finalizes it. **No client work is
-  needed to switch the demo to `partial`.**
+- The current #14/#23 implementation detects assistant-message boundaries but rolls completed text
+  into `answerPrefix` under one turn-wide draft id. That avoids a mid-stream clobber but loses the
+  message boundary; the last `final` then replaces the whole combined draft. #94 replaces this with
+  Telegram-style **materialize-and-rotate** behavior: settle the completed assistant message under
+  its existing id, then stream the next assistant message under a new id.
+- **Wire primitives already fit the target:** partial uses `{ type:"progress", id, text }`; finalize
+  uses `agent_message` with the same `id`. One assistant message uses one id; the id rotates only at
+  an assistant-message boundary.
+- **Reducer is mode-agnostic:** a `progress` frame upserts a working bubble by id and the matching
+  `agent_message` finalizes it. Different ids already create different bubbles, so #94 is expected to
+  be a plugin-side lane change, not a new client protocol.
 - **Widget:** working bubbles render italic/dimmed (`widget.ts:215` `m.working` → `opacity:.7;
   font-style:italic`).
 - ✅ **Demo sets `streaming.mode:"partial"`.** The account block (`run.sh:287`) now carries
@@ -432,18 +434,21 @@ answer-text "typing out" stream is exercised end-to-end. One nit: the setup wiza
   `draftEnabled` + `answerStreamingEnabled` are both true and the answer streams into the working
   bubble.
 
-**Telegram reference.** `draft-stream.ts` `createTelegramDraftStream` (`:176`), throttled edits
-(`DEFAULT_THROTTLE_MS`, min 250ms). Reasoning/answer split is **P1-3**, not P0.
+**Telegram reference.** OpenClaw's Telegram channel materializes the active answer lane before
+rotation, calls `forceNewMessage()`, and serializes `onAssistantMessageStart` /
+`onBlockReplyQueued` work. It does not concatenate completed assistant messages and recover their
+boundaries from the final string. Reasoning/answer split is **P1-3**, not P0.
 
-**Residual (nit).** The setup wizard (`src/setup-wizard.ts`) still does not offer `streaming.mode` —
-it writes CONFIG ONLY and is deliberately enroll-scoped (header comment `:8-15`), so an operator
-enrolling via `channels add` gets no streaming toggle and must set it by hand (as the demo does). Low
-priority. Optional polish: a subtle "working" affordance (cursor/shimmer) beyond the italic dim.
+**Other residual (nit).** The setup wizard (`src/setup-wizard.ts`) still does not offer
+`streaming.mode`; an operator enrolling via `channels add` must set it by hand (as the demo does).
+Optional polish: a subtle "working" affordance (cursor/shimmer) beyond the italic dim.
 
-**Acceptance (met).** With `streaming.mode:"partial"` set, a multi-step / tool-using turn shows
-incremental text in a single bubble that finalizes into the answer — no duplicate bubbles, no infinite
-spinner if the turn errors (the in-flight draft is finalized on error). (With `"progress"`, the same
-holds for tool lines but the answer arrives atomically.)
+**Acceptance (not yet met).** With `streaming.mode:"partial"`, each completed assistant message must
+settle as its own bubble while partial frames edit only the current bubble. A two-message live turn
+must remain two messages after settle and match a fresh history hydrate. No content-based
+`includes`/suffix heuristic may decide whether messages are the same. Error/abort paths must settle
+only the active draft and leave earlier settled bubbles intact. (With `"progress"`, tool lines remain
+an ephemeral scaffold and the answer arrives atomically.)
 
 ---
 
