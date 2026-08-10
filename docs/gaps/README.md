@@ -108,7 +108,9 @@ narrowed to agent-down durability — see below).
    capability is live, but [#94](https://github.com/mir-stream/openclaw-webchannel/issues/94) remains
    a correctness gap: multiple assistant messages currently share one draft id, so the last final can
    erase earlier live messages. The accepted fix settles one bubble per assistant-message boundary
-   and rotates to a new id. Setup-wizard nit remains: it does not offer `streaming.mode` (enroll-only).
+   and rotates to a new id, while retaining empty predecessor lanes for late queued-block callbacks
+   and preserving every payload when core emits more than one `kind:"final"`. Setup-wizard nit remains:
+   it does not offer `streaming.mode` (enroll-only).
 
 3. **Slash commands both execute AND are discoverable.** Execution always worked — text commands are
    on by default and WebChannel is not a native-command surface (`channel.ts:115` declares no

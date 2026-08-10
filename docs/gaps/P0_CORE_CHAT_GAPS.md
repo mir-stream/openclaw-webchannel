@@ -419,8 +419,16 @@ until a history reload restores them.
 - The current #14/#23 implementation detects assistant-message boundaries but rolls completed text
   into `answerPrefix` under one turn-wide draft id. That avoids a mid-stream clobber but loses the
   message boundary; the last `final` then replaces the whole combined draft. #94 replaces this with
-  Telegram-style **materialize-and-rotate** behavior: settle the completed assistant message under
-  its existing id, then stream the next assistant message under a new id.
+  **materialize-and-rotate** behavior: settle the completed assistant message under its existing id,
+  then stream the next assistant message under a new id. The public callback contract is weaker than
+  Telegram's internal seam: `onBlockReplyQueued` may arrive after the next message-start callback and
+  its index is optional. The plugin therefore retains unresolved predecessor lanes, prevents later
+  lanes from overtaking them, and discards a block delivery only when a queued accounting credit proves
+  its payload was already preserved.
+- **`kind:"final"` is a delivery class, not an assistant-message id.** Core may deliver several final
+  payloads in one turn (error/answer/warning orderings). The first available current-lane terminal slot
+  settles once; additional final payloads use fresh ids instead of being swallowed by that lane's
+  settle latch.
 - **Wire primitives already fit the target:** partial uses `{ type:"progress", id, text }`; finalize
   uses `agent_message` with the same `id`. One assistant message uses one id; the id rotates only at
   an assistant-message boundary.

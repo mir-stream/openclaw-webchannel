@@ -903,7 +903,7 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
   });
 
   // --- C4: asymmetric live 3 / snapshot 2 (snapshot predates the last lane). -
-  it("C4: a live bubble newer than every snapshot row is neither duplicated nor dropped", () => {
+  it("C4: a live bubble newer than one snapshot is preserved, then adopted by a later complete snapshot", () => {
     const w = makeWrapper();
     // §8-4, read in the other direction: the register that produced this
     // snapshot happened BEFORE lane C was persisted, so the snapshot is simply
@@ -946,16 +946,49 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       "live C",
     ]);
 
-    // Repeat delivery: the three snapshot ids are all tier-1 hits and lane C is
-    // untouched, so the array must be identical.
+    // Repeat the prefix first: the three snapshot ids are all tier-1 hits and
+    // lane C is still newer than the snapshot, so it remains untouched.
     deliver(w, { type: "history", messages: snapshot });
-    const after = w.getState().messages;
-    expect(after).toHaveLength(4);
-    expect(after.map((m) => m.id)).toEqual([
+    const afterPrefixRepeat = w.getState().messages;
+    expect(afterPrefixRepeat).toHaveLength(4);
+    expect(afterPrefixRepeat.map((m) => m.id)).toEqual([
       "core-u1",
       "core-a1",
       "core-a2",
       "webchannel-c",
+    ]);
+
+    // A later register snapshot now includes lane C. Its stored text differs
+    // from the live rendering, forcing this exact path:
+    //   core-u1/core-a1/core-a2 → tier-1 hits that advance anchor to idx 2;
+    //   core-a3 → tier-2 miss, then tier-3 adopts idx 3 (lane C).
+    // If tier-1 stopped advancing the anchor, or tier-3 stopped probing from
+    // that anchor, core-a3 would fresh-insert and strand webchannel-c as a
+    // duplicate fifth bubble.
+    const completeSnapshot = [
+      ...snapshot,
+      { id: "core-a3", role: "agent", text: "live C\n\n<stored metadata C>", ts: 4 },
+    ];
+    deliver(w, { type: "history", messages: completeSnapshot });
+
+    const adopted = w.getState().messages;
+    expect(adopted).toHaveLength(4);
+    expect(adopted.map((m) => m.id)).toEqual([
+      "core-u1",
+      "core-a1",
+      "core-a2",
+      "core-a3",
+    ]);
+    expect(adopted[3].text).toBe("live C\n\n<stored metadata C>");
+    expect(adopted[3].working).toBe(false);
+
+    // Once adopted, the complete snapshot is a pure tier-1 id no-op.
+    deliver(w, { type: "history", messages: completeSnapshot });
+    expect(w.getState().messages.map((m) => m.id)).toEqual([
+      "core-u1",
+      "core-a1",
+      "core-a2",
+      "core-a3",
     ]);
   });
 
@@ -2313,43 +2346,53 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       expect(pendingBubbles(w)).toHaveLength(0); // released
     });
 
-    it("#94: a progress on ONE lane inside the grace saves only that lane; the others still expire", () => {
-      vi.useFakeTimers();
-      const w = makeWrapper();
-      goOnline(w);
-      deliver(w, { type: "progress", id: "webchannel-a", text: "A partial…", turnId: "T" });
-      deliver(w, { type: "progress", id: "webchannel-b", text: "B partial…", turnId: "T" });
-      deliver(w, { type: "progress", id: "webchannel-c", text: "C partial…", turnId: "T" });
-      fireSession(w);
+    it.each([
+      {
+        frameType: "progress",
+        frame: { type: "progress", id: "webchannel-b", text: "B more…", turnId: "T" },
+        expectedBText: "B more…",
+        expectedBWorking: true,
+      },
+      {
+        frameType: "agent_message",
+        frame: { type: "agent_message", id: "webchannel-b", text: "B final", turnId: "T" },
+        expectedBText: "B final",
+        expectedBWorking: false,
+      },
+    ])(
+      "#94: $frameType on ONE lane inside the grace disarms only that lane; dead siblings still expire",
+      ({ frame, expectedBText, expectedBWorking }) => {
+        vi.useFakeTimers();
+        const w = makeWrapper();
+        goOnline(w);
+        deliver(w, { type: "progress", id: "webchannel-a", text: "A partial…", turnId: "T" });
+        deliver(w, { type: "progress", id: "webchannel-b", text: "B partial…", turnId: "T" });
+        deliver(w, { type: "progress", id: "webchannel-c", text: "C partial…", turnId: "T" });
+        fireSession(w);
 
-      // Proof of life for lane B only. On the PROGRESS and AGENT_MESSAGE disarm
-      // paths the watch entry is dropped by draft ID (`staleDraftWatch.delete(id)`),
-      // so liveness on one lane does not vouch for its siblings. That per-lane
-      // independence is what this test freezes: after #94 the lanes of a turn
-      // genuinely can finish at different times, and a turn-wide disarm on these
-      // paths would re-wedge the composer on whichever lane actually died.
-      // SCOPE: per-lane disarm is a property of THESE two paths, not a global
-      // invariant. Several other paths clear watch entries well beyond a single
-      // lane, none of them covered here:
-      //   - `reasoning` → `disarmStaleDraftsByTurn` — every watched lane of the turn;
-      //   - `turn_settled` → `finalizeDraftsForTurn` — every working draft of the turn;
-      //   - explicit `/stop` → `finalizeLocalTurnState` — every working draft, globally;
-      //   - the terminal-error handler — every working draft, globally.
-      // `clearStaleDraftWatch` (teardown / re-arm) empties the whole set too,
-      // but that one IS covered — by the mid-grace flap test above.
-      vi.advanceTimersByTime(10_000);
-      deliver(w, { type: "progress", id: "webchannel-b", text: "B more…", turnId: "T" });
+        // Draft-touching proof for lane B only. Both PROGRESS and AGENT_MESSAGE
+        // must delete only B's watched id. A turn-wide disarm in either path
+        // would leave A/C working after the timer because expiry would no longer
+        // own them. `agent_message` additionally settles B itself; that expected
+        // state difference is parameterized below.
+        //
+        // SCOPE: reasoning remains turn-wide and is tracked separately in #105.
+        // `turn_settled`, explicit `/stop`, terminal error, and teardown/re-arm
+        // intentionally have broader effects covered by their focused tests.
+        vi.advanceTimersByTime(10_000);
+        deliver(w, frame);
 
-      vi.advanceTimersByTime(30_000);
-      const byId = (id: string) => messages(w).find((m) => m.id === id)!;
-      expect(byId("webchannel-a").working).toBe(false); // expired
-      expect(byId("webchannel-c").working).toBe(false); // expired
-      expect(byId("webchannel-b").working).toBe(true); // survived on its own liveness
-      expect(byId("webchannel-b").text).toBe("B more…");
-      // The survivors' texts are untouched by expiry (in-place flip only).
-      expect(byId("webchannel-a").text).toBe("A partial…");
-      expect(byId("webchannel-c").text).toBe("C partial…");
-    });
+        vi.advanceTimersByTime(30_000);
+        const byId = (id: string) => messages(w).find((m) => m.id === id)!;
+        expect(byId("webchannel-a").working).toBe(false); // expired
+        expect(byId("webchannel-c").working).toBe(false); // expired
+        expect(byId("webchannel-b").working).toBe(expectedBWorking);
+        expect(byId("webchannel-b").text).toBe(expectedBText);
+        // Expiry flips only working state; sibling ids/text remain intact.
+        expect(byId("webchannel-a").text).toBe("A partial…");
+        expect(byId("webchannel-c").text).toBe("C partial…");
+      },
+    );
   });
 
   // 15. turn_settled with matching turnId finalizes a lingering draft.
