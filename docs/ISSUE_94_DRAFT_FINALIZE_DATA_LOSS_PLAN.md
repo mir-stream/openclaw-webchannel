@@ -491,9 +491,16 @@ PR 2에서 고칠 수도 있지만 **클라이언트 소유이고 플러그인 l
 
 ## 14. compact 이후 구현 시작점
 
-이 문서 커밋 시점에는 **문서와 GitHub Issue만 수정됐고 production/test 코드는 아직 그대로다.**
+**현재 상태 (2026-08-10).** PR 1은 끝났고 **PR 2가 남았다.** 플러그인 production 코드는 아직 한 줄도 안 바뀌었다.
 
-**선행 조건: 이 워크스페이스에는 `node_modules`가 없다.** `npm install` 전에는 build/typecheck/test가 하나도 돌지 않는다. 첫 명령이 그것이다.
+| | |
+| --- | --- |
+| PR 1 | [#103](https://github.com/mir-stream/openclaw-webchannel/pull/103) — 계획서 + 클라이언트 특성 테스트. 프로덕션 무변경. **사용자가 직접 리뷰·머지한다.** |
+| PR 2 | 이 문서의 나머지 전부. 브랜치 `mir-stream/issue-94-pr2`, **base는 `mir-stream/issue-94-pr1`** (PR 1 머지 후 `develop`으로 rebase) |
+
+**base 브랜치는 `develop`이다. `main`이 아니다.** main은 #87(PR #88)·#81(PR #98)보다 뒤에 있어서, main을 base로 잡으면 남의 머지 작업이 이 PR의 diff에 딸려 들어온다. `gh pr create` 전에 `git diff --stat origin/develop...HEAD`로 소유하지 않은 파일이 섞였는지 확인한다.
+
+**게이트는 지금 돌아간다.** 워크스페이스 `mir-stream-issue-94`(브랜치 `mir-stream/issue-94-pr2`)에 `node_modules`가 설치돼 있고, PR 1 rebase 직후 기준선을 재확인했다 — plugin 1561 passed, client 447 passed, 전체 2310 passed, build/typecheck exit 0. 유일한 에러는 `spawn nats-server ENOENT`(로컬에 바이너리 없음, CI는 설치). 의존성 drift 없음.
 
 ### 14.1 PR 분할 (확정)
 
