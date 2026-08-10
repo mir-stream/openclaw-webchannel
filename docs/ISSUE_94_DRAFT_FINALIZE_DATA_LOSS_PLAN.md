@@ -593,34 +593,52 @@ push"A msg", push"C msg", block(0), block("B block only",1), block(2), final
 
 ## 13. 완료 정의
 
-- [ ] 한 턴의 완료된 assistant 메시지 N개가 라이브에서도 N개 버블로 남는다.
-- [ ] 각 메시지는 고유 ID를 가지며 partial은 해당 활성 ID만 갱신한다.
-- [ ] final은 마지막 메시지 ID만 확정하고 앞 버블을 변경하지 않는다.
-- [ ] live와 history hydrate의 메시지 **수와 순서**가 일치한다(§6.5.1의 방어 회전 예외 제외).
+**전부 충족(2026-08-10).** 근거를 항목마다 적는다 — 체크만으로는 다음 사람이 재확인할 수 없다.
+
+- [x] 한 턴의 완료된 assistant 메시지 N개가 라이브에서도 N개 버블로 남는다. — M2/M3, I1/I2, e2e 프레임 로그(서로 다른 id 2개).
+- [x] 각 메시지는 고유 ID를 가지며 partial은 해당 활성 ID만 갱신한다. — lane별 `id`, `sendOrEditStreamMessage`가 프레임을 보낸 lane에 귀속.
+- [x] final은 마지막 메시지 ID만 확정하고 앞 버블을 변경하지 않는다. — I5, `finalize`가 활성 lane만 정착.
+- [x] live와 history hydrate의 메시지 **수와 순서**가 일치한다(§6.5.1 예외 제외). — I2, PR 1의 C1~C4.
       **본문 일치는 완료 조건이 아니다** — core는 라이브 응답에서 메타데이터 구획을 걷어내고 transcript에는 원본을 저장하므로 두 텍스트는 애초에 byte-equal이 아니다(`nats-client-wrapper.ts:1052-1054`). 본문 수렴은 hydrate의 정본 텍스트 채택(`adoptAt`)이 담당하며, 이 이슈가 보장할 대상이 아니다.
-- [ ] 메시지 동일성 판정에 `includes`/suffix/문자열 split을 사용하지 않는다.
-- [ ] 앞 lane 전송 실패 후에도 마지막 final 전달이 시도된다.
-- [ ] abort/error/단일 메시지/progress/block/off 경로에 회귀가 없다.
-- [ ] 중단/에러 경로에서 빈 버블도 중단 마커 버블도 생기지 않는다(§6.2-2b, §8-6).
-- [ ] history 화해 비대칭 케이스(C3/C4)와 다중 draft id watchdog(C5)이 테스트로 고정된다.
-- [ ] 다중 어시스턴트 메시지 턴이 e2e에서 두 개의 서로 다른 id로 정착한다.
-- [ ] 계약 밖(core 내부 번들) 의존을 새로 늘리지 않는다 — 신규 근거는 `plugin-sdk` export만 인용한다.
-- [ ] build/typecheck/plugin tests/full tests가 모두 통과한다.
+- [x] 메시지 동일성 판정에 `includes`/suffix/문자열 split을 사용하지 않는다. — I4가 뮤테이션으로 고정(B의 **partial**이 A를 인용하는 형상).
+- [x] 앞 lane 전송 실패 후에도 마지막 final 전달이 시도된다. — M9, I6.
+- [x] abort/error/단일 메시지/progress/block/off 경로에 회귀가 없다. — I3, I7~I11.
+- [x] 중단/에러 경로에서 빈 버블도 중단 마커 버블도 생기지 않는다(§6.2-2b, §8-6). — I8/I8b/I8c. 정착 게이트는 `started`가 아니라 snapshot이다(회전 직후 throttle 창에서 `started`가 거짓이라 텍스트를 흘렸다).
+- [x] history 화해 비대칭 케이스(C3/C4)와 다중 draft id watchdog(C5)이 테스트로 고정된다. — PR 1(#103).
+- [x] 다중 어시스턴트 메시지 턴이 e2e에서 두 개의 서로 다른 id로 정착한다. — `run-multi-message.sh`. revert-check로 load-bearing 확인(되돌리면 exit 6, 고치면 exit 0).
+- [x] 계약 밖(core 내부 번들) 의존을 새로 늘리지 않는다. — 런타임 의존은 `plugin-sdk` export뿐이다. 번들 인용은 **주석의 근거**로만 쓰였고 코드가 그 심볼을 부르지 않는다.
+- [x] build/typecheck/plugin tests/full tests가 모두 통과한다. — build 0, typecheck 0, 전체 2352 passed / 0 failed(로컬 `nats-server` 부재 에러 1건은 CI에서 설치된다).
+
+**남은 것은 §12.2의 잔여 5건이다.** 완료 정의를 어기지 않는다 — 전부 구조적 신호가 닿지 않는 seam에서의 열화이고, 그중 (1) 축소 방향과 (5)만 유실이다. (5)는 국소 해법이 없음을 기록했다.
 
 ---
 
-## 14. compact 이후 구현 시작점
+## 14. 현재 상태
 
-**현재 상태 (2026-08-10).** PR 1은 끝났고 **PR 2가 남았다.** 플러그인 production 코드는 아직 한 줄도 안 바뀌었다.
+**PR 2의 구현·테스트·e2e 게이트가 모두 끝났다(2026-08-10).** §13 전 항목 충족, 워킹트리 clean.
 
 | | |
 | --- | --- |
 | PR 1 | [#103](https://github.com/mir-stream/openclaw-webchannel/pull/103) — 계획서 + 클라이언트 특성 테스트. 프로덕션 무변경. **사용자가 직접 리뷰·머지한다.** |
-| PR 2 | 이 문서의 나머지 전부. 브랜치 `mir-stream/issue-94-pr2`, **base는 `mir-stream/issue-94-pr1`** (PR 1 머지 후 `develop`으로 rebase) |
+| PR 2 | 브랜치 `mir-stream/issue-94-pr2`, base `mir-stream/issue-94-pr1`. **아직 push/PR 없음** — PR 1 머지 후 `develop`으로 rebase. |
 
-**base 브랜치는 `develop`이다. `main`이 아니다.** main은 #87(PR #88)·#81(PR #98)보다 뒤에 있어서, main을 base로 잡으면 남의 머지 작업이 이 PR의 diff에 딸려 들어온다. `gh pr create` 전에 `git diff --stat origin/develop...HEAD`로 소유하지 않은 파일이 섞였는지 확인한다.
+PR 2 커밋:
 
-**게이트는 지금 돌아간다.** 워크스페이스 `mir-stream-issue-94`(브랜치 `mir-stream/issue-94-pr2`)에 `node_modules`가 설치돼 있고, PR 1 rebase 직후 기준선을 재확인했다 — plugin 1561 passed, client 447 passed, 전체 2310 passed, build/typecheck exit 0. 유일한 에러는 `spawn nats-server ENOENT`(로컬에 바이너리 없음, CI는 설치). 의존성 drift 없음.
+```
+0513666 test(e2e): gate the #94 message boundary in CI
+8aca834 docs(plugin): correct §5.5 — the boundary event's frequency is path-dependent
+b1be9f9 docs(plugin): record #94's measured residuals and test matrix
+9a74775 fix(plugin): give each assistant message its own draft lane (#94)
+0c21c3f docs(plugin): correct #94's rotation trigger against the pinned core
+```
+
+**base 브랜치는 `develop`이다. `main`이 아니다.** `gh pr create` 전에 `git diff --stat origin/develop...HEAD`로 소유하지 않은 파일이 섞였는지 확인한다.
+
+### 후속으로 남긴 것 (이 PR에 넣지 않음)
+
+- **e2e 하네스 5개가 stale `dist/`로 부팅한다.** `openclaw.extensions -> ./index-nats.ts` 스왑이 core 2026.6.10에서 무효라, 하네스는 디스크에 있는 아무 `dist/`나 실행한다. `run-multi-message.sh`만 자체 빌드로 막았다. #94 작업 중 revert-check가 **통과**해서 발견했다 — 게이트가 되돌린 코드를 통과시키고 있었다는 뜻이다.
+- §12.1의 인접 결함 2건(다른 기기가 시작한 턴의 영구 중복, `reasoning`의 turn 단위 valve disarm).
+- §12.2의 잔여 5건. (4)는 해법을 알고 유예했고, (5)는 국소 해법이 없다.
 
 ### 14.1 PR 분할 (확정)
 
