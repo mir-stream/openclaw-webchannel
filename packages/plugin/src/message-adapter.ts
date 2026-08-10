@@ -210,32 +210,41 @@ export type PartialAnswerUpdate = { text?: string; delta?: string; replace?: tru
  *
  * Message ownership comes from structured signals, never from comparing one
  * message's text to another's — a final that quotes or repeats the previous
- * message is still its own bubble. Three signals rotate a lane, in descending
- * order of how often the pinned core actually produces them:
+ * message is still its own bubble. THREE signals rotate a lane, and the reason
+ * there are three is that the frequency of the advertised one is PATH-DEPENDENT
+ * (see 3). No trigger may be assumed to be "the live one": which fires depends
+ * on the runner and provider behind the turn, so all three must stay armed and
+ * a single seam must rotate only once no matter which reaches it first.
  *
  *  1. an `assistantMessageIndex` CHANGE across `onBlockReplyQueued` payloads
  *     (`BlockReplyContext.assistantMessageIndex`, types-DNy-f8Hr.d.ts:172) —
  *     the authoritative per-message identity core hands a plugin, and the same
- *     signal core's own channels rotate on;
+ *     signal core's own channels rotate on. Carries a message that streams no
+ *     partials at all, where 2 cannot fire;
  *  2. a non-`replace` partial whose cumulative text DIVERGES from the streamed
  *     body — not a content-identity guess but detection that the STREAM
  *     restarted, which is what a per-item cumulative reset looks like from
- *     here. In the pinned core this is the primary trigger for a partial-mode
- *     multi-message turn (see 3);
+ *     here. Carries a seam that reaches us with no boundary event;
  *  3. `onAssistantMessageStart`. Advertised as "a new assistant message
- *     started". The two runners THIS channel's turns go through latch it to
- *     fire once per RUN: `dist/run-attempt-DRhLt3eF.js:4083-4085` sets
- *     `assistantStarted` (reset nowhere but the constructor at :3876) and
- *     `dist/btw-CDO5476N.js:564`/:597-599 does the same. A THIRD path in the
- *     bundle does fire it per message — `dist/selection-BfRwHcjH.js:3788-3793`
- *     (`handleMessageStart`, no latch) plus the stream-item-change call at
- *     :3860-3865, wired at :13601 and reached from
- *     `dist/embedded-agent-BgF2MOkH.js:3092`. So on our paths it lands once, at
- *     the first delta, when the lane is still empty and rotation correctly
- *     no-ops; on that third path it behaves as advertised. Either way this
- *     handler is correct — a per-message boundary settles and rotates, a
- *     once-per-run one no-ops on the empty lane — so it stays wired as the
- *     contract's stated signal.
+ *     started", and its FREQUENCY DEPENDS ON THE PATH — this is measured, and
+ *     an earlier revision of this comment had it wrong:
+ *       - on the streaming-selection path a turn through this channel takes
+ *         with an OpenAI-completions provider it fires PER ASSISTANT MESSAGE.
+ *         `dist/selection-BfRwHcjH.js:3788-3793` (`handleMessageStart`) calls
+ *         it with NO latch, and so does the stream-item-change site at
+ *         :3858-3868; wired at :13601. The live e2e
+ *         (`e2e/local/run-multi-message.sh`) confirms it on the wire: a
+ *         two-assistant-message tool-call turn rotates, yet the gateway log
+ *         carries NEITHER of the `info` diagnostics that triggers 1 and 2 log
+ *         before rotating — so the boundary event is what rotated;
+ *       - on the ACP and btw runners it IS latched to once per RUN:
+ *         `dist/run-attempt-DRhLt3eF.js:4083-4085` sets `assistantStarted`
+ *         (reset nowhere but the constructor at :3876), and
+ *         `dist/btw-CDO5476N.js:564`/:597-599 does the same. There it lands at
+ *         the first delta with an empty lane and correctly no-ops.
+ *     The handler is correct under both readings — a per-message boundary
+ *     settles and rotates, a once-per-run one no-ops on the empty lane — which
+ *     is precisely why it stays wired rather than being reasoned away.
  */
 export type ProgressDraftController = {
   /** The ACTIVE lane's draft/final id (rotates at each message boundary). */

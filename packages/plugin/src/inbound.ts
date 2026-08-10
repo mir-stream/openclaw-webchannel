@@ -513,25 +513,35 @@ export async function handleInboundMessage(
                                     assistantMessageIndex: context?.assistantMessageIndex,
                                   });
                                 },
-                                // NOTE: the two runners THIS channel's turns go
-                                // through latch this to fire ONCE PER RUN, not
-                                // once per assistant message: ACP sets
-                                // `assistantStarted` at
-                                // dist/run-attempt-DRhLt3eF.js:4083-4085 (reset
-                                // nowhere but its constructor, :3876) and btw at
-                                // dist/btw-CDO5476N.js:564/:597-599. A third
-                                // path in the bundle DOES fire it per message
-                                // (dist/selection-BfRwHcjH.js:3788-3793 and
-                                // :3860-3865, wired :13601, reached from
-                                // dist/embedded-agent-BgF2MOkH.js:3092). On our
-                                // paths it therefore lands at the first delta,
-                                // when the lane is still empty and rotation
-                                // correctly no-ops — so it is NOT the live
-                                // rotation path here (that is the queued block's
-                                // index change, plus the partial stream-restart
-                                // fallback) — while on that third path it
-                                // behaves as advertised. The handler is correct
-                                // under both.
+                                // NOTE: this event's FREQUENCY IS PATH-DEPENDENT
+                                // — measured, and an earlier revision of this
+                                // note claimed the opposite. On the
+                                // streaming-selection path a turn through this
+                                // channel takes with an OpenAI-completions
+                                // provider it fires PER ASSISTANT MESSAGE:
+                                // dist/selection-BfRwHcjH.js:3788-3793
+                                // (handleMessageStart) calls it with NO latch,
+                                // as does the stream-item-change site at
+                                // :3858-3868; wired at :13601. The live e2e
+                                // (e2e/local/run-multi-message.sh) confirms it
+                                // on the wire — a two-message tool-call turn
+                                // rotates while the gateway log carries neither
+                                // `info` diagnostic that the block-index and
+                                // partial-divergence triggers log before
+                                // rotating, so THIS is what rotated it. On the
+                                // ACP and btw runners it IS latched to once per
+                                // RUN (dist/run-attempt-DRhLt3eF.js:4083-4085,
+                                // `assistantStarted` reset nowhere but its
+                                // constructor :3876; dist/btw-CDO5476N.js:564
+                                // /:597-599), where it lands at the first delta
+                                // with an empty lane and correctly no-ops.
+                                // So no trigger may be assumed to be the live
+                                // one: the block-index change and the partial
+                                // stream-restart stay armed alongside this, and
+                                // they carry the shapes this event does not
+                                // (a message with no partials; a seam that
+                                // arrives with no boundary event). The handler
+                                // is correct under both frequencies.
                                 onAssistantMessageStart: () => {
                                   draft!.handleAssistantMessageBoundary();
                                 },

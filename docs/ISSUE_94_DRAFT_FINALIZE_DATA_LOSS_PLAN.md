@@ -178,18 +178,30 @@ core의 Telegram 채널은 delivery 이음매에서 `info.assistantMessageIndex`
 
 이건 #23이 이미 지적한 unpinned cross-package 가정이다. §6.5 fail-safe가 방어하는 대상이 바로 이 둘이며, 새로운 계약 밖 가정을 추가로 도입하지 않는다.
 
-### 5.5 `onAssistantMessageStart`는 메시지마다 오지 않는다 (실측, 2026-08-10)
+### 5.5 `onAssistantMessageStart`의 발화 빈도는 경로마다 다르다 (실측 2회, 2026-08-10)
 
-**첫 번째 가정은 "순서" 문제가 아니라 "빈도" 문제였다.** 핀된 core에서 이 콜백은 **에이전트 실행당 정확히 한 번** 발화한다. 두 러너 모두 latch를 건다.
+> **정정 이력.** 이 절은 처음에 "에이전트 실행당 정확히 한 번 발화한다"고 단정했다(커밋 `0c21c3f`). **틀렸다.** dist 정적 분석만으로 두 러너의 latch를 보고 내린 결론이었고, **이 채널의 턴이 실제로 타는 경로를 확인하지 않았다.** e2e 게이트가 실물 core로 tool-call 턴을 돌리자 두 번째 어시스턴트 메시지에서도 boundary가 발화했다. 아래는 정정된 서술이다.
+
+**정확한 서술: 빈도는 경로에 달려 있고, 어느 쪽도 가정할 수 없다.**
+
+**(a) latch 거는 경로 — 실행당 1회.**
 
 - ACP: `dist/run-attempt-DRhLt3eF.js:4083-4085`가 `if (!this.assistantStarted) { this.assistantStarted = true; await onAssistantMessageStart?.(); }`. `assistantStarted`에 대입하는 곳은 생성자(`:3876`)와 이 줄 **둘뿐**이고, 메시지 사이에서 리셋되지 않는다.
 - btw: `dist/btw-CDO5476N.js:564`에 `let assistantStarted = false`, `:597-599`에서 첫 `text_start`/`start`에 true. 역시 리셋 없음.
 
-즉 어시스턴트 메시지가 셋인 턴도 boundary 이벤트는 **맨 처음 delta 때 한 번**만 온다. 그때 lane은 비어 있어 정상적으로 no-op이 된다. **회전을 이 이벤트에 의존할 수 없다.** §6.1이 그리던 시퀀스는 핀된 core에서 발생하지 않는다.
+**(b) latch 없는 경로 — 메시지마다 발화. 이 채널의 턴이 실제로 타는 쪽이다.**
 
-이 발견은 #94의 실제 증상이 뒷받침한다. 지금의 "한 버블로 평탄화"는 `pushAnswerText`의 **divergence 분기**(새 메시지의 누적 텍스트가 `""`로 재시작하므로 기존 본문의 확장이 아니다)가 만들어낸 결과다. boundary가 메시지마다 왔다면 그 분기에는 애초에 도달하지 않는다.
+- `dist/selection-BfRwHcjH.js:3788-3793`의 `handleMessageStart`는 assistant message-start 이벤트마다 `onAssistantMessageStart?.()`를 **latch 없이** 호출한다.
+- 같은 파일 `:3858-3868`의 stream-item 변경 지점에도 latch 없는 호출이 하나 더 있다.
+- 배선은 `:13601`, 진입은 `embedded-agent-BgF2MOkH.js:3092`.
 
-**실제 회전 신호는 `onBlockReplyQueued`의 `assistantMessageIndex` 변화다.** core 자신의 Telegram 채널이 그렇게 한다 — `dist/bot-Dxj27QDQ.js:6660-6678`의 `prepareQueuedAnswerBlock(payload, blockContext)`:
+**실측(e2e, OpenAI-completions provider + tool call 턴).** 두 번째 어시스턴트 메시지의 회전은 boundary가 냈다. 근거: `rotate()` 호출 지점은 셋뿐이고(`message-adapter.ts:668, 691, 762`) partial·block 경로의 둘은 회전 전에 `logger.info`를 남기는데(`:663`, `:757`), 통과한 실행의 `gateway.log`에는 **두 진단이 모두 없다.** 남는 것은 boundary 경로(`:691`)뿐이다.
+
+**초안의 "증상이 뒷받침한다"는 논증도 틀렸다.** 기존의 평탄화가 divergence 분기 때문이라고 적었으나, 옛 `handleAssistantMessageBoundary`는 `answerText`를 `answerPrefix`로 밀어넣을 뿐 **id는 하나로 유지**했다. 즉 평탄화는 boundary가 **발화했기 때문에**, 그리고 핸들러가 의도적으로 병합했기 때문에 생겼다. 발화하지 않았다는 증거가 아니라 그 반대다.
+
+**결론은 유지되지만 이유가 다르다 — 어느 트리거도 살아 있다고 가정하지 않는다.** boundary가 이 경로에서 발화한다는 사실이 나머지 두 트리거를 불필요하게 만들지 않는다. latch 거는 러너에서는 오지 않고, partial 없는 메시지는 boundary만으로 본문을 얻지 못한다. 그래서 트리거는 셋이고, 셋 중 무엇이 먼저 닿든 seam 하나는 한 번만 회전한다(§6.1).
+
+**두 번째 신호는 `onBlockReplyQueued`의 `assistantMessageIndex` 변화다.** core 자신의 Telegram 채널이 그렇게 한다 — `dist/bot-Dxj27QDQ.js:6660-6678`의 `prepareQueuedAnswerBlock(payload, blockContext)`:
 
 ```js
 const assistantMessageIndex = blockContext?.assistantMessageIndex;
@@ -200,7 +212,9 @@ const shouldRotateBeforeDelivery = previous !== void 0 && assistantMessageIndex 
 
 §5.3의 "Telegram을 근거로 쓰지 않는다"는 Telegram이 **delivery 이음매**에서 index를 읽는 부분에 대한 경고다. 여기는 다른 이음매 — `onBlockReplyQueued`의 `BlockReplyContext`이고, §5.1이 확인했듯 **플러그인에게 열려 있다.** 같은 필드지만 정당한 표면이다.
 
-따라서 §6.2-5의 "index는 대조와 진단에만 쓴다"는 제한을 **완화한다**: index 변화는 일급 회전 트리거다. 반대로 `onAssistantMessageStart` 배선은 **유지한다** — 계약이 광고하는 신호이고, latch를 푼 미래 core에서 무변경으로 동작한다. 다만 그것이 살아 있는 회전 경로라고 가정하지 않는다.
+따라서 §6.2-5의 "index는 대조와 진단에만 쓴다"는 제한을 **완화한다**: index 변화는 일급 회전 트리거다. `onAssistantMessageStart` 배선도 당연히 **유지한다** — 계약이 광고하는 신호이고, 실측상 이 채널의 주 경로에서 실제로 발화한다.
+
+**이 절이 남긴 교훈은 결론이 아니라 방법이다.** dist 정적 분석으로 latch 두 개를 보고 "실행당 1회"를 단정했는데, 그 두 러너는 이 채널의 턴이 타는 경로가 아니었다. **어느 콜백이 언제 오는지는 실물 실행으로만 확정된다.** §10의 e2e 게이트가 이 정정을 만들어냈고, 그것이 게이트를 만든 값어치다.
 
 따라서 core가 단순 문자열만 쏟아내서 관계를 알 수 없는 문제가 아니다. **WebChannel이 제공된 경계를 버리고 ID 하나에 합친 것이 문제다.** 이 이슈에서 core는 바꾸지 않는다.
 
@@ -210,7 +224,7 @@ const shouldRotateBeforeDelivery = previous !== void 0 && assistantMessageIndex 
 
 ### 6.1 정상 시퀀스
 
-§5.5의 실측을 반영한 시퀀스다. 초안은 메시지마다 `onAssistantMessageStart`가 온다고 그렸으나 그 이벤트는 실행당 한 번뿐이다.
+아래는 **boundary가 오지 않는 경우**의 시퀀스다 — latch 거는 러너(§5.5-a)이거나, partial을 흘리지 않은 메시지처럼 boundary만으로는 본문을 얻지 못하는 형상이다. 이 채널의 주 경로(§5.5-b)에서는 boundary가 메시지마다 발화하므로 회전이 첫 번째 트리거로 일어나고, 나머지 둘은 도달하지 않는다. **셋 다 성립해야 하는 이유가 이것이다.**
 
 ```text
 onAssistantMessageStart()             # 실행당 1회. 빈 lane이므로 no-op
