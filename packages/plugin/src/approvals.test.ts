@@ -1,4 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // Mock the unified gateway resolver so we can assert how a widget button click
 // is forwarded WITHOUT a live gateway. We re-export everything else (the real
@@ -39,6 +42,10 @@ import {
   RESOLVED_APPROVAL_CAP,
   __resolvedApprovalsTestHook,
 } from "./approvals.js";
+import {
+  APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY,
+  ApprovalOriginLeaseRegistry,
+} from "./approval-origin.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
 // `presentation.buildPendingPayload`). Verified fields:
@@ -243,14 +250,38 @@ describe("webchannel native approval origin routing (multi-user)", () => {
     expect(target).toBeNull();
   });
 
-  it("falls back to the anon peer when no turn source is present", () => {
+  it("returns null — never an invented peer — when no turn source is present", () => {
+    // #93: the old code answered `web-anon` here. With no turn source AND no
+    // session key there is nothing to prove an origin with, so the only safe
+    // answer is "I don't know". The evidence-based path is exercised against a
+    // real session store further down this file.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     const target = resolveOriginTarget({
       cfg: cfgEnabled,
       accountId: null,
       approvalKind: "exec",
       request: execRequest(undefined, undefined),
     });
-    expect(target).toEqual({ to: "web-anon" });
+    expect(target).toBeNull();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("reason=missing_session_key"),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("ignores a turnSourceTo that arrives without a channel", () => {
+    // Uncorroborated: nothing says which channel that target belongs to. It must
+    // not short-circuit to `{ to }` — the decision falls through to the
+    // evidence-based path, which has no lease here and so answers null.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const target = resolveOriginTarget({
+      cfg: cfgEnabled,
+      accountId: null,
+      approvalKind: "exec",
+      request: execRequest("peer-alice", undefined),
+    });
+    expect(target).toBeNull();
+    warnSpy.mockRestore();
   });
 
   it("prepareTarget keys the prompt to the planned per-peer target", async () => {
@@ -1315,5 +1346,432 @@ describe("webchannel recently-resolved store (#19)", () => {
     const ids = new Set(listResolvedApprovalsForPeer("a", "alice").map((r) => r.id));
     expect(ids.has("id-0")).toBe(false);
     expect(ids.has(`id-${RESOLVED_APPROVAL_CAP}`)).toBe(true);
+  });
+});
+
+/**
+ * #93 — origin resolution from an active lease + the PERSISTED session store.
+ *
+ * This is the bug: a plugin-kind approval arrives with every `turnSource*` field
+ * null, and the old resolver answered `web-anon` — not the real peer, so the
+ * prompt was dropped and the write tool timed out, and an unproven origin was
+ * being asserted as a delivery target.
+ *
+ * These tests run the REAL `resolveApprovalRequestOriginTarget` from
+ * `openclaw/plugin-sdk/approval-runtime` against a REAL session-store document
+ * in a temp directory. The helper is deliberately not stubbed: half the point of
+ * this file is to pin its actual composition behaviour — that returning null
+ * from `resolveTurnSourceTarget` yields the STORED target rather than
+ * short-circuiting. That composition is not part of the exported contract, so if
+ * a core upgrade changes it, this file is what fails.
+ *
+ * The lease registry is planted with an injected clock, because request-time
+ * comparisons are strict and real wall-clock milliseconds cannot be ordered
+ * deterministically in a test.
+ */
+describe("#93 origin routing — active lease + persisted session store", () => {
+  const SESSION_KEY = "agent:rota:webchannel:default:direct:d21d9f07-1f2e";
+  const ORIGIN_PEER = "PeerCase-1"; // deliberately mixed case: `to` is byte-exact
+  const OTHER_PEER = "PeerCase-2";
+
+  const slots = globalThis as unknown as Record<symbol, unknown>;
+  const capability = createClawApprovalCapability(new FakePeerChannel()) as any;
+
+  let dir: string;
+  let storeSeq = 0;
+  let savedRegistry: unknown;
+  let registry: ApprovalOriginLeaseRegistry;
+  let nowMs: number;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "webchannel-approval-origin-"));
+  });
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    savedRegistry = slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY];
+    nowMs = 1_000;
+    registry = new ApprovalOriginLeaseRegistry({ now: () => nowMs });
+    slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = registry;
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    if (savedRegistry === undefined) delete slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY];
+    else slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = savedRegistry;
+    warnSpy.mockRestore();
+  });
+
+  /**
+   * Write a fresh session-store document and return a config pointing at it.
+   * A NEW file per call: core caches the parsed store by (path, mtime, size),
+   * and two same-size rewrites inside one millisecond could otherwise be served
+   * from that cache.
+   */
+  function cfgWithStore(entries: Record<string, unknown>): any {
+    const file = join(dir, `sessions-${++storeSeq}.json`);
+    writeFileSync(file, JSON.stringify(entries));
+    return {
+      session: { store: file },
+      channels: { webchannel: { execApprovals: { enabled: true, approvers: [ORIGIN_PEER] } } },
+    };
+  }
+
+  /** A persisted webchannel session entry, as core records one for our turns. */
+  function entry(to: string, accountId?: string, channel = "webchannel"): unknown {
+    return {
+      lastChannel: channel,
+      lastTo: to,
+      ...(accountId === undefined ? {} : { lastAccountId: accountId }),
+      updatedAt: new Date(1_000).toISOString(),
+    };
+  }
+
+  /** The issue #93 request shape: a session key, and no turn source at all. */
+  function nullMetadataRequest(
+    createdAtMs: number,
+    opts: { sessionKey?: string | null; id?: string } = {},
+  ): any {
+    return {
+      id: opts.id ?? "exec-93",
+      request: {
+        command: "write /etc/hosts",
+        sessionKey: opts.sessionKey === undefined ? SESSION_KEY : opts.sessionKey,
+        turnSourceChannel: null,
+        turnSourceTo: null,
+        turnSourceAccountId: null,
+        turnSourceThreadId: null,
+      },
+      createdAtMs,
+      expiresAtMs: createdAtMs + 60_000,
+    };
+  }
+
+  function resolveOrigin(cfg: any, request: any, accountId: string | null = null): any {
+    return capability.native.resolveOriginTarget({
+      cfg,
+      accountId,
+      approvalKind: "exec",
+      request,
+    });
+  }
+
+  function lease(rawAccountId: string, peerId: string, sessionKey = SESSION_KEY) {
+    const handle = registry.createLease({ rawAccountId, sessionKey, peerId });
+    handle.activate();
+    return handle;
+  }
+
+  /** The reasons emitted by this decision (one line each, `[webchannel] …`). */
+  function warnedReasons(): string[] {
+    return warnSpy.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("origin_unresolved"))
+      .map((line) => /reason=(\w+)/.exec(line)?.[1] ?? "");
+  }
+
+  it("recovers the exact origin peer for an all-null-metadata request (the #93 regression)", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_030;
+
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020))).toEqual({ to: ORIGIN_PEER });
+    expect(warnedReasons()).toEqual([]);
+  });
+
+  it("returns null when the request carries no session key", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_030;
+
+    for (const sessionKey of [null, "", "   "]) {
+      expect(resolveOrigin(cfg, nullMetadataRequest(1_020, { sessionKey }))).toBeNull();
+    }
+    expect(warnedReasons()).toEqual([
+      "missing_session_key",
+      "missing_session_key",
+      "missing_session_key",
+    ]);
+  });
+
+  it("returns null when the session entry is missing or the store is corrupt", () => {
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_030;
+
+    const missing = cfgWithStore({ "agent:other:session": entry(ORIGIN_PEER, "default") });
+    expect(resolveOrigin(missing, nullMetadataRequest(1_020))).toBeNull();
+
+    const corruptFile = join(dir, `corrupt-${++storeSeq}.json`);
+    writeFileSync(corruptFile, "{ this is not json");
+    const corrupt = {
+      session: { store: corruptFile },
+      channels: { webchannel: { execApprovals: { enabled: true, approvers: [ORIGIN_PEER] } } },
+    };
+    expect(resolveOrigin(corrupt, nullMetadataRequest(1_020))).toBeNull();
+
+    expect(warnedReasons()).toEqual([
+      "stored_target_unavailable",
+      "stored_target_unavailable",
+    ]);
+  });
+
+  it("returns null (never throws) when the SDK helper throws", () => {
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_030;
+    // A non-string store path makes the helper's own path resolution throw —
+    // whatever the cause, the exception must not cross the capability boundary.
+    const cfg: any = {
+      session: { store: 123 },
+      channels: { webchannel: { execApprovals: { enabled: true, approvers: [ORIGIN_PEER] } } },
+    };
+
+    expect(() => resolveOrigin(cfg, nullMetadataRequest(1_020))).not.toThrow();
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020))).toBeNull();
+    expect(warnedReasons()).toEqual(["sdk_error", "sdk_error"]);
+  });
+
+  it("returns null when the stored target was overwritten by another peer", () => {
+    // The active run is ORIGIN_PEER's, but a later inbound from OTHER_PEER
+    // overwrote the shared session entry. Corroboration fails: deliver to
+    // neither rather than guess.
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(OTHER_PEER, "default") });
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_030;
+
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020))).toBeNull();
+    expect(warnedReasons()).toEqual(["active_stored_mismatch"]);
+  });
+
+  it("returns null when the stored entry belongs to another channel", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default", "telegram") });
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_030;
+
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020))).toBeNull();
+    expect(warnedReasons()).toEqual(["stored_target_unavailable"]);
+  });
+
+  it("returns null when the stored account does not match the handler's", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "other-account") });
+    nowMs = 1_010;
+    lease("AcctA", ORIGIN_PEER);
+    nowMs = 1_030;
+
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020), "AcctA")).toBeNull();
+    expect(warnedReasons()).toEqual(["stored_target_unavailable"]);
+  });
+
+  it("treats a stored entry with no account as the default account only", () => {
+    // The stored account canonicalizes to "default" when absent, so a NAMED
+    // account's handler refuses it (our own account check, which the SDK helper
+    // does not perform) while the default account's handler accepts it.
+    const named = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER) });
+    nowMs = 1_010;
+    lease("AcctA", ORIGIN_PEER);
+    nowMs = 1_030;
+    expect(resolveOrigin(named, nullMetadataRequest(1_020), "AcctA")).toBeNull();
+    expect(warnedReasons()).toEqual(["stored_binding_mismatch"]);
+
+    const dflt = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER) });
+    nowMs = 1_040;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_060;
+    expect(resolveOrigin(dflt, nullMetadataRequest(1_050))).toEqual({ to: ORIGIN_PEER });
+  });
+
+  it("returns null when two distinct origins shared the canonical tuple", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_012;
+    lease("default", OTHER_PEER);
+    nowMs = 1_030;
+
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020))).toBeNull();
+    expect(warnedReasons()).toEqual(["active_ambiguous"]);
+  });
+
+  it("returns null when an overlapping run released before the request was replayed", () => {
+    // A and B overlapped, so the tuple is poisoned for the epoch. A then aborted
+    // and both the live lease and the store now say B — which is exactly the
+    // shape that would misdeliver A's replayed pending request to B.
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(OTHER_PEER, "default") });
+    nowMs = 1_010;
+    const a = lease("default", ORIGIN_PEER);
+    nowMs = 1_012;
+    lease("default", OTHER_PEER);
+    nowMs = 1_020;
+    a.release();
+    nowMs = 1_040;
+
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_030))).toBeNull();
+    expect(warnedReasons()).toEqual(["active_ambiguous"]);
+  });
+
+  it("returns null for a same-millisecond alias activation after the origin released", () => {
+    // A ran, the request was created, A released; alias-account B then activated
+    // in the SAME injected millisecond as the request and overwrote the store.
+    // Equality cannot prove ordering, so B is not eligible.
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(OTHER_PEER, "default") });
+    nowMs = 1_010;
+    const a = lease("default", ORIGIN_PEER);
+    nowMs = 1_015;
+    a.release();
+    nowMs = 1_020;
+    lease("DEFAULT", OTHER_PEER); // canonical-alias raw account, distinct peer
+    nowMs = 1_040;
+
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020))).toBeNull();
+    expect(warnedReasons()).toEqual(["active_no_match"]);
+  });
+
+  it("returns null for a request replayed from before the current epoch barrier", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    const request = nullMetadataRequest(1_020);
+    nowMs = 1_030;
+    expect(resolveOrigin(cfg, request)).toEqual({ to: ORIGIN_PEER });
+
+    // Host teardown/reload: a fresh lease and a matching store are not enough,
+    // because the request predates the new barrier.
+    nowMs = 1_040;
+    registry.rotateEpoch();
+    nowMs = 1_050;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_070;
+    expect(resolveOrigin(cfg, request)).toBeNull();
+    expect(warnedReasons()).toEqual(["invalid_request_time"]);
+  });
+
+  it("serves the exact raw account only — a canonical alias handler gets nothing", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "accta") });
+    nowMs = 1_010;
+    lease("AcctA", ORIGIN_PEER);
+    nowMs = 1_030;
+    const request = nullMetadataRequest(1_020);
+
+    // The store canonicalizes what it persists, so the stored "accta" matches
+    // the raw "AcctA" handler's canonical form …
+    expect(resolveOrigin(cfg, request, "AcctA")).toEqual({ to: ORIGIN_PEER });
+    // … but the alias handler holds no claim of its own and gets nothing.
+    expect(resolveOrigin(cfg, request, "accta")).toBeNull();
+    expect(warnedReasons()).toEqual(["active_no_match"]);
+  });
+
+  it("ignores a reassigned binding / identityLinks in the CURRENT config", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_030;
+    const request = nullMetadataRequest(1_020);
+    expect(resolveOrigin(cfg, request)).toEqual({ to: ORIGIN_PEER });
+
+    // Reassign everything a route recomputation would read. The decision is made
+    // from the lease and the persisted entry, so nothing moves.
+    cfg.session.identityLinks = [{ channel: "webchannel", ids: [ORIGIN_PEER, OTHER_PEER] }];
+    cfg.channels.webchannel.accounts = { other: { binding: { account: OTHER_PEER } } };
+    cfg.agents = { rota: { bind: [`webchannel:${OTHER_PEER}`] } };
+
+    expect(resolveOrigin(cfg, request)).toEqual({ to: ORIGIN_PEER });
+    expect(warnedReasons()).toEqual([]);
+  });
+
+  it("takes the fast path for explicit webchannel metadata without reading the store", () => {
+    // A store path that would THROW if it were read proves the fast path never
+    // touches it.
+    const cfg: any = {
+      session: { store: 123 },
+      channels: { webchannel: { execApprovals: { enabled: true, approvers: [ORIGIN_PEER] } } },
+    };
+    const request = {
+      id: "exec-fast",
+      request: {
+        command: "ls",
+        sessionKey: SESSION_KEY,
+        turnSourceChannel: " WebChannel ",
+        turnSourceTo: `  ${ORIGIN_PEER}  `,
+      },
+      createdAtMs: 1_020,
+      expiresAtMs: 1_080,
+    };
+
+    expect(resolveOrigin(cfg, request)).toEqual({ to: ORIGIN_PEER });
+    expect(warnedReasons()).toEqual([]);
+  });
+
+  it("stays silent and returns null for an explicit other channel", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_030;
+    const request = nullMetadataRequest(1_020);
+    request.request.turnSourceChannel = "signal";
+    request.request.turnSourceTo = "+15551234";
+
+    expect(resolveOrigin(cfg, request)).toBeNull();
+    // A different channel's approval is a normal non-ownership, not an incident.
+    expect(warnedReasons()).toEqual([]);
+  });
+
+  it("reports a globally poisoned epoch distinctly from a single ambiguous tuple", () => {
+    // A poison-cap overflow drops EVERY fallback in the process until the next
+    // teardown. Reporting that as `active_ambiguous` would leave an operator
+    // unable to tell a process-wide outage from one confusable pair.
+    const capped = new ApprovalOriginLeaseRegistry({ now: () => nowMs, maxPoisonedKeys: 1 });
+    slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = capped;
+    const claim = (peerId: string, sessionKey: string) =>
+      capped.createLease({ rawAccountId: "default", sessionKey, peerId }).activate();
+    nowMs = 1_010;
+    claim(ORIGIN_PEER, "session-x");
+    claim(OTHER_PEER, "session-x");
+    claim(ORIGIN_PEER, "session-y");
+    claim(OTHER_PEER, "session-y"); // exceeds the cap of 1 ⇒ global escalation
+    // A clean tuple with a perfectly matching store is dropped all the same.
+    claim(ORIGIN_PEER, SESSION_KEY);
+    nowMs = 1_030;
+
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020))).toBeNull();
+    expect(warnedReasons()).toEqual(["epoch_poisoned"]);
+  });
+
+  it("returns null (never throws) when the process-global registry is incompatible", () => {
+    // A co-installed build owning the versioned slot must not take the delivery
+    // plan down: core awaits this hook unguarded. It is also NOT `sdk_error` —
+    // that would point an operator at core instead of at their own plugin set.
+    slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = { contractVersion: 2 };
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });
+
+    expect(() => resolveOrigin(cfg, nullMetadataRequest(1_020))).not.toThrow();
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020))).toBeNull();
+    expect(warnedReasons()).toEqual(["registry_unavailable", "registry_unavailable"]);
+  });
+
+  it("never writes the session key, peer id, or stored target into the diagnostic", () => {
+    const cfg = cfgWithStore({ [SESSION_KEY]: entry(OTHER_PEER, "default") });
+    nowMs = 1_010;
+    lease("default", ORIGIN_PEER);
+    nowMs = 1_030;
+    expect(resolveOrigin(cfg, nullMetadataRequest(1_020))).toBeNull();
+
+    const lines = warnSpy.mock.calls.map((call) => String(call[0]));
+    expect(lines).toHaveLength(1);
+    const line = lines[0]!;
+    expect(line).toContain("event=webchannel.approval.origin_unresolved");
+    expect(line).toContain("sessionKey_present=true");
+    // The account is masked; the identifying values are absent entirely.
+    expect(line).toContain('accountId="default"');
+    expect(line).not.toContain(SESSION_KEY);
+    expect(line).not.toContain(ORIGIN_PEER);
+    expect(line).not.toContain(OTHER_PEER);
   });
 });

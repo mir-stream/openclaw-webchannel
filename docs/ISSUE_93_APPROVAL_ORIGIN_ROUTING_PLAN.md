@@ -123,7 +123,11 @@ export type ApprovalOriginLeaseResolution =
   | { kind: "resolved"; peerId: string }
   | { kind: "no_match" }
   | { kind: "ambiguous" }
+  | { kind: "epoch_poisoned" }
   | { kind: "invalid_request_time" };
+
+/** claim이 무엇에 쓰일 수 있는지. 기본값은 `"origin"`. */
+export type ApprovalOriginEvidence = "origin" | "presence";
 
 export type ApprovalOriginLease = Readonly<{
   activate(): void;
@@ -136,6 +140,7 @@ export class ApprovalOriginLeaseRegistry {
     rawAccountId: string;
     sessionKey: string;
     peerId: string;
+    evidence?: ApprovalOriginEvidence;
   }): ApprovalOriginLease;
   resolve(input: {
     rawAccountId: string;
@@ -145,6 +150,15 @@ export class ApprovalOriginLeaseRegistry {
   rotateEpoch(): void;
 }
 ```
+
+**핵심 불변식**: 승인을 낼 수 있는 live run은 예외 없이 자기 canonical tuple에 claim 하나로 표현되며, 그 claim은 증명 가능한 `activatedAtMs`를 갖거나 증명 불가로 표시된다. 기록되지 않은 live run은 overlap poison에 보이지 않고, 그러면 **다른 peer의 claim이 그 run의 요청에 대한 origin으로 반환된다** — 이 모듈이 막으려는 wrong-peer 전달 그 자체다. "선택 불가"와 "존재하지 않음"은 다른 요구사항이고, 둘을 뭉개는 것이 곧 안전성 버그다.
+
+그래서 `evidence`가 있다.
+
+- `origin` — 일반 agent run. 시작 시각을 캡처하고, 그 뒤에 생성된 요청의 origin으로 **선택될 수 있다**.
+- `presence` — live이고 승인을 낼 수 있지만 **답으로 쓰여선 안 되는** run. `activatedAtMs = +Infinity`로 기록되어 `activatedAtMs < requestCreatedAtMs` 필터에 절대 걸리지 않지만, overlap poison에는 그대로 참여한다.
+
+claim 추가는 방향이 한쪽뿐이다 — `resolved`를 `ambiguous`로 바꿀 수는 있어도 없던 `resolved`를 만들 수 없다. 그래서 presence는 availability를 조금 잃는 대신 wrong-peer를 막는, 이 모듈이 다른 모든 곳에서 하는 것과 같은 거래다.
 
 구현 계약:
 
@@ -156,28 +170,33 @@ export class ApprovalOriginLeaseRegistry {
 - poisoned tuple은 한쪽이 release되거나 active claim이 모두 사라지거나 later same-origin run이 시작되어도 epoch 끝까지 poisoned다. 유효한 request time에 대한 `resolve`는 항상 `ambiguous`다.
 - `resolve`는 `requestCreatedAtMs`가 finite이고 `barrierMs`보다 **크며** resolve 시점 `now()`보다 미래가 아닐 때만 진행한다. barrier equality도 `invalid_request_time`이다.
 - resolve는 canonical tuple의 poison을 모든 raw alias에 적용한 뒤, handler가 준 exact raw account가 일치하고 `activatedAtMs < requestCreatedAtMs`인 active claim만 선택한다. 같은 millisecond equality는 순서를 증명할 수 없어 제외한다. eligible exact peer가 0개면 `no_match`, 1개면 `resolved`, 2개 이상이면 `ambiguous`이며 같은 raw account/peer의 여러 eligible lease는 계속 `resolved`다.
-- `rotateEpoch()` 전 dormant handle은 영구 stale이며 이후 `activate()`가 no-op이다. 이미 active인 handle의 claim은 생성 epoch와 무관하게 유지되고, `release()`는 process-global unique claim ID로 자기 retained claim만 지운다. stale/dormant release는 새 claim을 지울 수 없다.
+- `activate()`가 presence claim을 남기는 경로는 셋이고 규칙은 하나다 — **run은 기록되되 쓸 수 있는 시작 시각이 없다**: 호출자가 `presence`를 요청했거나, handle이 rotation을 건너 dormant거나(시작 시각이 이미 차단된 teardown에 속한다), clock read가 비정상이거나(이 경우 epoch도 함께 닫힌다). 이미 active인 handle의 claim은 생성 epoch와 무관하게 유지되고, `release()`는 unique claim ID로 자기 retained claim만 지운다. stale/dormant release는 새 claim을 지울 수 없다.
 - active claim은 생성 epoch와 관계없이 현재 active이고 `activatedAtMs < requestCreatedAtMs`이면 eligible이다. 그래서 retained old run이 barrier 뒤 실제로 만든 새 request는 전달할 수 있고, pre-barrier pending replay는 계속 `invalid_request_time`이다.
 - `rotateEpoch()`는 epoch/barrier와 clock-validity를 갱신하고 old poison을 reset하되 active claims는 지우지 않는다. 이어 retained claims를 canonical tuple별로 다시 scan해 distinct exact origin이 2개 이상이면 새 epoch poison을 즉시 재구성한다.
-- 모든 clock read는 finite·non-decreasing이어야 한다. invalid clock이나 epoch 안의 regression을 감지하면 claim을 추가/선택하지 않고 `invalid_request_time`으로 닫으며, 다음 `rotateEpoch()`가 새 finite barrier를 세울 때까지 그 epoch를 신뢰하지 않는다.
+- 모든 clock read는 finite·non-decreasing이어야 한다. invalid clock이나 epoch 안의 regression을 감지하면 그 epoch의 모든 `resolve`를 `invalid_request_time`으로 닫고, 다음 `rotateEpoch()`가 새 finite barrier를 세울 때까지 신뢰하지 않는다. 그 동안에도 `activate()`는 presence claim을 계속 남긴다 — 신뢰 못 하는 시계 때문에 live run을 증거에서 지워버리면 poison이 무력해진다.
 - active claims는 cap/LRU로 제거하지 않는다. 정상 `finally` cleanup과 host in-flight concurrency가 수명을 소유한다.
-- `maxPoisonedKeys` 기본값은 1,024이며 per-key eviction은 하지 않는다(safety evidence 손실). cap을 넘기려 하면 set을 비우고 `epochGloballyPoisoned=true`로 승격해 그 epoch의 모든 fallback resolve를 `ambiguous`로 만든다. `rotateEpoch()`만 reset한다.
+- `maxPoisonedKeys` 기본값은 1,024이며 per-key eviction은 하지 않는다(safety evidence 손실). cap을 넘기려 하면 set을 비우고 `epochGloballyPoisoned=true`로 승격해 그 epoch의 모든 fallback resolve를 막는다. `rotateEpoch()`만 reset한다. 이때는 per-key poison의 `ambiguous`가 아니라 **`epoch_poisoned`** 를 돌려준다 — tuple 하나가 헷갈리는 것과 프로세스 전체 승인이 죽은 것은 운영자에게 완전히 다른 사건이고, 같은 로그를 내면 구분할 방법이 없다.
 
 production은 module-local singleton이 아니라 versioned `globalThis[Symbol.for("openclaw-webchannel.approval-origin-registry.v1")]` getter를 쓴다. cache-busted module generation도 같은 process-global registry object를 받아 old inbound handle과 new approvals resolver가 동일 claims/epoch를 본다. getter는 `contractVersion`과 required method surface를 structural하게 검사하고 `instanceof`에 의존하지 않는다. incompatible value는 교체해 split state를 만들지 않고 plugin initialization을 fail-closed 한다.
+
+다만 getter가 던지는 것이 **경계를 넘어가서는 안 되는** 자리가 둘 있다. capability의 origin 판정은 core가 감싸주지 않으므로 throw가 delivery plan 전체를 뚫고 나가고(`channel.ts`가 `registrationMode !== "full"`에서도 capability를 만들기 때문에 init 가드가 항상 먼저 도는 것도 아니다), teardown에서 던지면 host의 나머지 cleanup이 중단된다. 전자는 `registry_unavailable` + `null`로 닫고, 후자는 삼킨다. 나머지 경로에서는 그대로 크게 실패한다.
 
 `stopAgentLifecycleSubscription()`(`inbound.ts:102`, host teardown 전용 — §2 확인)이 process-global registry의 `rotateEpoch()`를 호출한다. process restart는 registry와 gateway pending state를 함께 잃으므로 남은 origin을 추측하지 않는다.
 
 ### 4.3 inbound activation과 release
 
-`handleInboundMessage`는 route가 정해진 뒤 ordinary turn마다 immutable lease handle을 만들되 즉시 activate하지 않는다. 기존 `replyOptions.onAgentRunStart`에서만 `handle.activate()`를 호출한다.
+`handleInboundMessage`는 route가 정해진 뒤 **모든** turn마다 immutable lease handle을 만들되 즉시 activate하지 않는다. 기존 `replyOptions.onAgentRunStart`에서만 `handle.activate()`를 호출한다.
 
 ```text
 rawAccountId = handleInboundMessage가 받은 exact account ID
 sessionKey   = 이 turn에 이미 정해진 route.sessionKey
 peerId       = verified transport peer ID (wsKey)
+evidence     = controlLane ? "presence" : "origin"
 ```
 
-이 callback은 실제 agent run이 시작되어 tool approval을 낼 수 있는 시점을 나타내며 successful activation이 `activatedAtMs`를 고정한다. pre-run denial/setup failure는 claim을 만들지 않는다. `controlLane === true`인 `/stop` turn은 activate하지 않는다.
+이 callback은 실제 agent run이 시작되어 tool approval을 낼 수 있는 시점을 나타내며 successful activation이 `activatedAtMs`를 고정한다. pre-run denial/setup failure는 claim을 만들지 않는다.
+
+control lane은 **claim에서 면제되는 것이 아니라 선택 대상에서 면제된다.** `replyOptions`는 무조건 존재하므로 `onAgentRunStart`는 control-lane turn에서도 호출되고, fast-abort가 메시지를 소비하지 못한 control-lane turn은 그대로 **write 툴을 호출할 수 있는 일반 agent turn이 된다.** 그 run을 기록하지 않으면 `identityLinks`로 한 session key를 공유하는 다른 peer의 claim이 그 run의 승인 요청에 대한 origin으로 반환된다 — A의 프롬프트가 B의 브라우저에 뜨고 B가 A의 write를 승인한다. 그래서 `presence`로 claim한다: 절대 선택되지 않지만 overlap poison에는 참여한다. 자기 run 중에 `/stop`을 보내는 흔한 경우는 exact origin이 같으므로 poison되지 않는다.
 
 `handleInboundMessage`의 기존 outer `finally`에서 `handle.release()`를 호출한다. normal return, throw, provider error, abort 모두 같은 cleanup을 지난다. dormant stale handle의 release는 no-op이고, rotation을 건너 살아남은 active handle은 unique claim ID로 자기 claim만 release한다.
 
@@ -203,9 +222,11 @@ SDK helper는 실제 configured session-store path와 request의 persisted entry
 event=webchannel.approval.origin_unresolved accountId=<masked> reason=<reason> sessionKey_present=<true|false>
 ```
 
-reason은 bounded enum이다: `missing_session_key`, `invalid_request_time`, `active_no_match`, `active_ambiguous`, `stored_target_unavailable`, `stored_binding_mismatch`, `active_stored_mismatch`, `sdk_error`.
+reason은 bounded enum이다: `missing_session_key`, `invalid_request_time`, `active_no_match`, `active_ambiguous`, `epoch_poisoned`, `stored_target_unavailable`, `stored_binding_mismatch`, `active_stored_mismatch`, `registry_unavailable`, `sdk_error`.
 
-account는 `formatAccountIdForLog(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)`로 만들며 session key, peer ID, stored target 원문은 기록하지 않는다. 명시적 타 채널의 정상적인 비소유 `null`은 warn하지 않는다. 어떤 예외도 SDK capability 경계 밖으로 던지지 않는다.
+`epoch_poisoned`는 poison cap 초과로 프로세스 전체 fallback이 죽은 상태이고, `registry_unavailable`은 versioned global slot에 호환되지 않는 registry가 심겨 있어 getter가 던진 경우다. 후자를 `sdk_error`로 뭉치지 않는 이유는 깨진 프로세스를 SDK 탓으로 오귀속하기 때문이다.
+
+account는 `formatAccountIdForLog(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)`로 quote해서 적는다(운영자가 정한 배포 이름이라 마스킹 대상이 아니다). session key, peer ID, stored target 원문은 기록하지 않는다. 명시적 타 채널의 정상적인 비소유 `null`은 warn하지 않는다. 어떤 예외도 SDK capability 경계 밖으로 던지지 않는다.
 
 ---
 
@@ -213,7 +234,7 @@ account는 `formatAccountIdForLog(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)`�
 
 1. `packages/plugin/src/approval-origin.ts` — registry class, result type, versioned process-global getter.
 2. `packages/plugin/src/approval-origin.test.ts` — canonical collision tuple, exact raw claim, lease/time semantics.
-3. `packages/plugin/src/inbound.ts` — ordinary `onAgentRunStart` activation, outer `finally` exact release, teardown epoch rotation.
+3. `packages/plugin/src/inbound.ts` — `onAgentRunStart` activation(control lane은 `presence`), outer `finally` exact release, teardown epoch rotation.
 4. `packages/plugin/src/inbound.test.ts` — run timing과 모든 cleanup path.
 5. `packages/plugin/src/approvals.ts` — pinned SDK helper import, §4.1/§4.4 판정, privacy-safe catch/log. 두 `ANON_PEER_ID` fallback과 낡은 주석 제거; `prepareTarget` 대상 없음은 `null`.
 6. `packages/plugin/src/approvals.test.ts` 및 focused integration test — 실제 temp session store와 실제 SDK helper를 통과하는 origin/delivery 검증.
@@ -238,7 +259,8 @@ account는 `formatAccountIdForLog(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)`�
 - clock regression/invalid read는 그 epoch에서 `invalid_request_time`
 - distinct exact-origin overlap은 한쪽 release·전체 release·later run 뒤에도 current epoch에서 계속 `ambiguous`
 - rotate 시 distinct retained claims는 즉시 re-poison; overlap이 사라진 prior poison은 reset되지만 old request는 새 barrier로 `invalid_request_time`
-- 작은 injected `maxPoisonedKeys`를 넘기면 per-key eviction 대신 global poison으로 승격
+- `presence` claim은 어떤 request time에도 선택되지 않지만, 다른 exact origin과 겹치면 poison하고, 같은 exact origin과는 poison하지 않으며(자기 run 중 `/stop`), 자기 claim만 release한다
+- 작은 injected `maxPoisonedKeys`를 넘기면 per-key eviction 대신 global poison으로 승격되고, 그때는 `ambiguous`가 아니라 `epoch_poisoned`
 - 두 simulated module-generation getter가 같은 process-global registry를 공유하고 incompatible structural version은 fail-closed
 - ambiguity에서 순서와 무관하게 peer를 반환하지 않음
 
@@ -248,11 +270,14 @@ account는 `formatAccountIdForLog(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)`�
 - paused fake run 중 approval lookup이 lease를 관찰함
 - normal, throw, abort 모두 outer `finally` 뒤 lease 없음
 - 반복 `onAgentRunStart`는 claim을 중복하지 않음
-- control lane은 callback이 호출되어도 activate하지 않음
+- control lane은 callback이 호출되고 claim도 하지만 origin으로 선택되지 않음
+- **다른 peer의 retained claim 위에서 control-lane run이 시작되면 그 peer가 아니라 `ambiguous`** (fix가 없으면 깨지는 회귀)
 - lifecycle stop/reload가 registry epoch를 rotate함
 - reload 전 dormant paused-run callback은 rotate 뒤 activate되지 않음
 - reload 전 active paused run은 rotate 뒤에도 관찰되고 post-barrier approval만 resolve한 뒤 자기 `finally`에서 exact release됨
 - dispatcher teardown fake는 running old handler가 rotation 뒤 settle을 계속함을 증명
+
+> **함정**: `handleInboundMessage`는 자체 `catch`로 오류를 삼키고 fallback reply를 보낸 뒤 rethrow하지 않는다. 따라서 fake dispatcher **안에서** 한 assertion은 그냥 먹혀서 테스트가 항상 통과한다. 관측값을 변수에 기록하고 turn을 await한 **뒤에** 검증할 것. 이 파일의 테스트는 mutation으로 실패를 확인한 것만 유효하다.
 
 ### 6.3 approvals와 persisted store
 
@@ -316,7 +341,9 @@ transport-generation 격리 — lease claim의 `transportGeneration` 토큰, res
 - **reload/teardown with running handlers:** queue dispose는 running handler를 abort하지 않는다(`inbound-queue.ts:393`). dormant handle은 rotation으로 막되 active claim은 그 handler의 exact release까지 유지한다. old pending replay는 barrier가 막고 retained run의 실제 post-barrier request만 허용한다.
 - **session store 동기 읽기:** `resolveApprovalRequestOriginTarget`은 persisted session entry를 읽어야 하므로 판정 시점에 session store를 **동기적으로** 읽는다(§2-C-3). fallback 판정마다 event loop를 막으므로, 큰 session store에서 지연이 관측되면 별도 이슈로 캐싱을 검토한다. 호출 빈도는 §2-C-2 관찰상 request당 1회로 bounded되어 Phase 1에서는 수용하되, 이는 계약이 아니므로 지연이 문제가 되면 그때 측정한다.
 - **process restart:** registry와 gateway pending state가 함께 사라진다. durable cross-restart origin을 추측하지 않고 fail-closed 한다.
-- **wall-clock anomaly:** non-finite/future time 또는 epoch 내 regression은 해당 판정을 fail-closed 한다. 일시적 false negative는 허용하지만 later run을 old request에 붙이는 false positive는 허용하지 않는다.
+- **wall-clock anomaly:** non-finite/future time 또는 epoch 내 regression은 해당 판정을 fail-closed 한다. later run을 old request에 붙이는 false positive는 허용하지 않는다. 다만 **이 false negative는 일시적이지 않다** — regression 한 번(NTP step, VM snapshot 복원)이 그 epoch를 닫고, epoch은 host teardown에서만 rotate되므로 fallback 승인 라우팅은 재시작까지 죽는다. 진단은 `invalid_request_time` 한 줄로 남는다.
+- **createdAtMs의 시계 도메인:** `requestCreatedAtMs`는 요청을 만든 쪽이 찍고, `barrierMs`/`now()`는 이 프로세스의 `Date.now()`다. 지금 배포에서는 같은 프로세스라 문제가 없지만 계약으로 보장된 것은 아니다. 두 시계가 갈라져서 요청 시각이 우리 시계보다 앞서면 모든 fallback resolve가 `invalid_request_time`으로 닫힌다. skew 허용치를 두지 않는다 — 그건 안전성 조건을 직접 깎는 일이다.
+- **identity-linked peer의 순차 인계:** 두 peer가 `identityLinks`로 한 session key를 공유하면, claim 해제가 core의 reply operation 해제보다 뒤에 일어나므로 실제로는 헷갈릴 일이 없는 순차 turn 인계에서도 두 claim이 겹쳐 poison이 걸린다. poison은 epoch 끝(=host teardown)까지 남으므로 그 쌍은 재시작 전까지 fallback 승인을 받지 못한다. release 시점을 당겨도 core가 dispatch 내부에서 operation을 놓기 때문에 완전히 없앨 수 없어, §8의 fail-closed 입장을 유지하고 진단만 구분한다.
 - **same-ms ordering:** activation과 request creation이 같은 millisecond면 legitimate request도 막힐 수 있다. 순서를 증명할 수 없는 equality에서 availability보다 exact-origin safety를 택한다.
 - **canonical account collision:** core canonical form을 공유하는 raw aliases는 exact raw claim으로 분리하되 overlap 시 모두 poison한다. blanket noncanonical rejection이나 current-config alias enumeration은 하지 않는다.
 - **persistent epoch poison:** distinct exact-origin overlap은 epoch 안에서 모두 release된 뒤에도 canonical tuple을 막는다. rotation은 prior poison을 reset하되 retained overlap을 즉시 다시 poison한다.
@@ -339,13 +366,14 @@ transport-generation 격리 — lease claim의 `transportGeneration` 토큰, res
 **메커니즘**
 
 - [ ] explicit channel/target precedence와 두 `ANON_PEER_ID` fallback 제거가 테스트로 고정된다.
-- [ ] active lease는 ordinary agent run의 `onAgentRunStart`부터 outer `finally`까지만 존재한다.
+- [ ] lease는 `onAgentRunStart`부터 outer `finally`까지만 존재하고, 승인을 낼 수 있는 live run은 control lane을 포함해 빠짐없이 claim된다(control lane은 `presence`라 선택되지 않는다).
 - [ ] registry의 immutable-handle, canonical-account collision(core `normalizeAccountId` 정합 포함), exact raw-account selection, duplicate/ambiguity/release/epoch-time-barrier 불변식이 green이다.
 - [ ] rotate 전 dormant handle은 activate할 수 없고, active claim은 rotation을 넘어 유지되며 exact old release가 자기 claim만 지운다.
 - [ ] pre-barrier request는 거부되지만 retained active run의 post-barrier request는 exact lease/store 일치 시에만 resolve된다.
 - [ ] request time이 non-finite, future 또는 current barrier 이하이면 `invalid_request_time`이고, `activatedAtMs >= requestCreatedAtMs`인 lease는 집계되지 않는다.
 - [ ] distinct exact-origin `(rawAccountId, peerId)` overlap은 release/all-release/later-run 뒤에도 canonical tuple을 epoch 끝까지 poison하며 같은 쌍의 duplicate는 poison하지 않는다.
-- [ ] poison cap overflow는 key eviction 없이 global fail-closed로 승격되고 rotation 때 retained claims로 안전하게 재구성된다.
+- [ ] poison cap overflow는 key eviction 없이 global fail-closed로 승격되고, `epoch_poisoned`로 per-tuple ambiguity와 구분되며, rotation 때 retained claims로 안전하게 재구성된다.
+- [ ] registry getter가 던지는 경우에도 예외가 capability 경계나 host teardown을 넘지 않는다.
 - [ ] 두 cache-busted module generation이 versioned process-global registry 하나를 공유한다.
 - [ ] 실제 SDK helper + temp session store에서 all-null Issue #93 경로가 exact peer를 복구한다.
 - [ ] lease와 stored target 중 하나라도 없거나 다르면 진단 한 줄 + `null`이고 publish는 0건이다.
