@@ -49,6 +49,38 @@ re-authentication will not help; the UI should direct the user to the operator.
 The lower-level `PopCapacityError` remains an internal direct-module detail and
 is not exported from the package root.
 
+### Authenticated readiness and stalled-work recovery
+
+Public `state.connected === true` means an authenticated application session is
+ready: the raw NATS socket opened, registration completed, the conversation key
+was installed, and the replay ledger drained. A raw socket open by itself remains
+`connecting` before the first session or `reconnecting` after a prior session,
+with `connected: false`. This avoids releasing locally-held work into a keyless
+replacement connection.
+
+`ackStallTimeoutMs` controls two reactive recovery signals with one shared policy:
+
+- default `30_000` ms; accepted values are integers from `0` through
+  `2_147_483_647`;
+- a published `user_message` with no authenticated owned ACK/overload rejection
+  requests at most one soft reconnect per continuous no-result interval;
+- an ordinary follow-up held behind a live turn/FIFO gate with no authenticated
+  turn activity requests the same recovery path once;
+- `0` disables both automatic signals. It does not disable live publish retries,
+  heartbeat/raw-loss recovery, manual reconnect, or authenticated readiness.
+
+The timeout is a recovery policy, not a delivery deadline. Missing ACK is
+delivery-unknown: published receipts stay `sent`, replay keeps the same wire ID,
+and the detector never fails or retracts them. Held work stays `queued` without a
+wire ID; the detector never synthesizes `/stop`, releases it, or bypasses FIFO.
+Only the existing reconnect → register → key → same-ID replay → session-ready and
+stale-draft/FIFO paths change those states.
+
+A legitimately silent turn with a held follow-up can therefore cause one harmless
+extra reconnect. Raise the timeout or set it to `0` for workloads where long
+silent turns are normal. A completely idle tab has no active-work signal and is
+not proactively probed by this recovery mode.
+
 ## Send-result contract (P0-4)
 
 Every `send()` returns a `SendReceipt` (or `undefined` for trimmed-empty input —
@@ -111,6 +143,8 @@ is open. `accepted`/`completed`/`failed` are the durable resolutions.
 
 | Window | Lane | Observation |
 |---|---|---|
+| published work receives no owned application result | one bounded soft reconnect, then same-ID ledger replay | remains `sent` until authoritative ACK/rejection |
+| ordinary follow-up remains held with no live-turn activity | one bounded soft reconnect, then existing stale-draft/FIFO release | remains `queued` with no wire ID; never detector-released |
 | `user_message` publish loss | ledger replay (P0-7b) + publish-driven forceReconnect | `queued`→retry→`sent`→… |
 | plugin ack-send failure | client re-register → replay → dedupe → re-ack | `sent` until the next reconnect, then `accepted` |
 | `turn_settled`/final-frame send failure | client stays honestly `accepted`; history snapshot re-hydrates the answer | no false `completed` |

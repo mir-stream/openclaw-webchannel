@@ -276,12 +276,32 @@ export type SendStateListener = (id: string, state: SendState, failure?: SendFai
 export type WebChannelNatsClientOptions = Omit<NatsClientOptions, "jwt" | "registration"> & {
   jwt: string;
   registration: NonNullable<NatsClientOptions["registration"]>;
+  /**
+   * Maximum time published or locally-held application work may receive no
+   * authenticated ingress/turn activity before one soft reconnect is requested.
+   * Default 30,000ms; 0 disables both automatic application-recovery lanes.
+   */
+  ackStallTimeoutMs?: number;
   /** Deterministic live ingress-outcome retry seams (tests/embedded runtimes). */
   _retryNow?: () => number;
   _retryRandom?: () => number;
   _retrySetTimeout?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
   _retryClearTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
 };
+
+type UnackedLedgerEntry = {
+  message: Extract<OutboundMessage, { type: "user_message" }>;
+  retryCount: number;
+  nextRetryAt: number | null;
+  published: boolean;
+};
+
+type LedgerSchedulingSnapshot = Array<{
+  id: string;
+  entry: UnackedLedgerEntry;
+  nextRetryAt: number | null;
+  published: boolean;
+}>;
 
 // ---------------------------------------------------------------------------
 // WebSocket-based NATS client (browser-compatible)
@@ -1187,11 +1207,7 @@ export class WebChannelNatsClient {
    * mid-session drop is exactly when the entries are needed); `disconnect()`
    * clears it (dead instance).
    */
-  private readonly unackedLedger = new Map<string, {
-    message: Extract<OutboundMessage, { type: "user_message" }>;
-    retryCount: number;
-    nextRetryAt: number | null;
-  }>();
+  private readonly unackedLedger = new Map<string, UnackedLedgerEntry>();
   /** P0-7b: cap on the unacked ledger; the oldest entry is evicted (with a warn) past this. */
   private static readonly MAX_UNACKED = 100;
   /** P0-7b: one-shot guard so a full ledger warns once per session, not per evicted send. */
@@ -1202,6 +1218,14 @@ export class WebChannelNatsClient {
   private readonly retryRandom: () => number;
   private readonly retrySetTimeout: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
   private readonly retryClearTimeout: (timer: ReturnType<typeof setTimeout>) => void;
+  /** One resolved policy value shared with the wrapper-held recovery lane. */
+  private readonly resolvedAckStallTimeoutMs: number;
+  /** Start of the current per-client interval with no owned ingress result. */
+  private ackStallSinceAt: number | null = null;
+  /** One recovery allowance per continuous no-owned-result interval. */
+  private ackStallRecoveryIssued = false;
+  /** Semantic transaction fence, separate from timer and connection epochs. */
+  private ackStallMutationEpoch = 0;
   /**
    * Ciphertext `.out` frames that arrived BEFORE the session key existed.
    *
@@ -1238,7 +1262,20 @@ export class WebChannelNatsClient {
     if (typeof options.jwt !== "string" || options.jwt.trim().length === 0) {
       throw new Error("[nats-client] non-empty bootstrap jwt is required");
     }
+    const ackStallTimeoutMs = options.ackStallTimeoutMs === undefined
+      ? 30_000
+      : options.ackStallTimeoutMs;
+    if (
+      !Number.isInteger(ackStallTimeoutMs)
+      || ackStallTimeoutMs < 0
+      || ackStallTimeoutMs > 2_147_483_647
+    ) {
+      throw new RangeError(
+        "[nats-client] ackStallTimeoutMs must be an integer between 0 and 2147483647",
+      );
+    }
     this.options = options;
+    this.resolvedAckStallTimeoutMs = ackStallTimeoutMs;
     this.retryNow = options._retryNow ?? (() => Date.now());
     this.retryRandom = options._retryRandom ?? Math.random;
     this.retrySetTimeout = options._retrySetTimeout ?? ((fn, ms) => setTimeout(fn, ms));
@@ -1249,7 +1286,22 @@ export class WebChannelNatsClient {
     });
     this.client.onState((connected) => {
       if (connected) void this.onConnected();
-      else this.resetSession();
+      else {
+        // Raw false retires every async registration continuation before session
+        // reset or the wrapper's later raw-state callback can run.
+        this.connectionEpoch++;
+        // A genuine socket loss is itself this episode's one recovery attempt.
+        // Explicit close and terminal teardown retire the episode elsewhere.
+        if (
+          !this.disconnected && !this.terminalReached
+          && this.hasPublishedUnackedOwnership()
+          && !this.ackStallRecoveryIssued
+        ) {
+          this.ackStallMutationEpoch++;
+          this.ackStallRecoveryIssued = true;
+        }
+        this.resetSession();
+      }
     });
     // CL2 + P0-4: forward the low-level client's terminal auth failures. The
     // terminal SEQUENCE (D4) is mandatory: ① mark terminal so a re-entrant send
@@ -1436,6 +1488,33 @@ export class WebChannelNatsClient {
     return () => { this.sessionListeners.delete(listener); };
   }
 
+  /** @internal The constructor-resolved shared application stall policy. */
+  getAckStallTimeoutMs(): number {
+    return this.resolvedAckStallTimeoutMs;
+  }
+
+  /**
+   * @internal Request the existing reconnect/register/replay recovery path.
+   * The caller owns its lane allowance; this method also consumes an active
+   * published-work allowance and retires live scheduling before the callout.
+   */
+  requestApplicationRecovery(): boolean {
+    if (this.disconnected || this.terminalReached) return false;
+    if (this.hasPublishedUnackedOwnership() && !this.ackStallRecoveryIssued) {
+      this.ackStallMutationEpoch++;
+      this.ackStallRecoveryIssued = true;
+    }
+    const epoch = this.connectionEpoch;
+    this.cancelLiveRetryTimer();
+    if (
+      this.connectionEpoch !== epoch || this.disconnected || this.terminalReached
+    ) {
+      return false;
+    }
+    this.client.reconnect();
+    return true;
+  }
+
   /**
    * P0-4: subscribe to authoritative send-state transitions (queued/sent/
    * accepted/failed) keyed by wire `id`. Fires only on VALID monotonic
@@ -1547,34 +1626,118 @@ export class WebChannelNatsClient {
    */
   private drainAcked(ids?: string[]): void {
     if (!ids) return;
-    // Relinquish retry ownership for the WHOLE authoritative result frame before
-    // the first public tracker callback. `trackerAdvance` can synchronously run
-    // embedder code, including disconnect()/connect(); if later frame ids were
-    // still ledgered, disconnect's fail-all sweep would incorrectly turn them
-    // into failed{closed} before their accepted transition was applied.
-    const frameIds = [...new Set(ids)];
-    for (const id of frameIds) this.unackedLedger.delete(id);
-    this.cancelLiveRetryTimer();
-    for (const id of frameIds) this.trackerAdvance(id, "accepted");
-    this.armLiveRetryTimer();
+    this.drainOwnedResult([...new Set(ids)], (id) => {
+      this.trackerAdvance(id, "accepted");
+    });
   }
 
   private drainRejected(ids?: string[]): void {
     if (!ids) return;
-    // Same detach-before-callout rule as ACKs: every id in one rejection frame
-    // owns one authoritative overloaded result even when the first callback
-    // tears down or replaces the active connection lifecycle.
-    const frameIds = [...new Set(ids)];
-    for (const id of frameIds) this.unackedLedger.delete(id);
-    this.cancelLiveRetryTimer();
-    for (const id of frameIds) {
+    this.drainOwnedResult([...new Set(ids)], (id) => {
       this.trackerFail(id, {
         reason: "overloaded",
         retryable: true,
         lastAttemptAt: this.sendTracker.get(id)?.lastAttemptAt,
       });
+    });
+  }
+
+  /**
+   * Detach a complete authenticated result frame before tracker fanout. Only a
+   * frame that owned at least one ledger id on entry proves application ingress
+   * and starts a fresh interval for any PUBLISHED work that remains.
+   */
+  private drainOwnedResult(frameIds: string[], apply: (id: string) => void): void {
+    const ownedResult = frameIds.some((id) => this.unackedLedger.has(id));
+    const epoch = this.connectionEpoch;
+    const key = this.sessionKey;
+    const lifecycleLive = !this.disconnected && !this.terminalReached;
+
+    for (const id of frameIds) this.unackedLedger.delete(id);
+
+    // Unknown/late ids remain tracker no-ops and do not disturb the live episode
+    // or its timer. The frame still fans out authoritatively below.
+    if (!ownedResult) {
+      for (const id of frameIds) apply(id);
+      return;
+    }
+
+    const resultEpoch = ++this.ackStallMutationEpoch;
+    const publishedOwnershipRemains = this.hasPublishedUnackedOwnership();
+    // A final PUBLISHED result retires every episode field before the reentrant
+    // clear hook. A null retry deadline is provisional pre-publish ownership
+    // installed by seal(); it stays ledgered for that seal's exact rollback, but
+    // cannot start or preserve an acknowledgement-stall episode before its first
+    // successful raw publish. With genuinely published ownership remaining,
+    // resultEpoch already invalidates the old timer semantically, while keeping
+    // the old timestamp visible lets a same-episode nested send join without
+    // creating a competing episode. The fresh result age is committed after
+    // cancellation below.
+    if (!publishedOwnershipRemains) {
+      this.ackStallSinceAt = null;
+      this.ackStallRecoveryIssued = false;
+    }
+    this.cancelLiveRetryTimer();
+
+    let resultCommitEpoch: number | null = null;
+    let resultAt: number | null = null;
+    let postCommitTimerGeneration: number | null = null;
+    let schedulingSnapshot: LedgerSchedulingSnapshot | null = null;
+    if (
+      publishedOwnershipRemains && lifecycleLive && key !== null
+      && this.connectionEpoch === epoch && this.sessionKey === key
+      && !this.disconnected && !this.terminalReached
+      && this.ackStallMutationEpoch === resultEpoch
+      && this.hasPublishedUnackedOwnership()
+    ) {
+      const sampledResultAt = this.retryNow();
+      if (
+        this.connectionEpoch === epoch && this.sessionKey === key
+        && !this.disconnected && !this.terminalReached
+        && this.ackStallMutationEpoch === resultEpoch
+        && this.hasPublishedUnackedOwnership()
+      ) {
+        resultCommitEpoch = ++this.ackStallMutationEpoch;
+        resultAt = sampledResultAt;
+        this.ackStallSinceAt = sampledResultAt;
+        this.ackStallRecoveryIssued = false;
+        // A timer may have been installed reentrantly during cancellation
+        // against the old interval. The semantic commit above invalidates its
+        // captured fields. Preserve its generation through tracker fanout; the
+        // final guarded armer will cancel and recompute it from the fresh age.
+        postCommitTimerGeneration = this.liveRetryTimerGeneration;
+        schedulingSnapshot = this.captureLedgerScheduling();
+      }
+    }
+
+    // These outcomes belong to the already-detached authenticated frame even if
+    // an injected hook or an earlier tracker listener replaced the lifecycle.
+    for (const id of frameIds) apply(id);
+
+    if (
+      !publishedOwnershipRemains || resultCommitEpoch === null || resultAt === null
+      || postCommitTimerGeneration === null || schedulingSnapshot === null
+    ) {
+      return;
+    }
+    if (
+      this.connectionEpoch !== epoch || this.sessionKey !== key
+      || this.disconnected || this.terminalReached
+      || this.ackStallMutationEpoch !== resultCommitEpoch
+      || this.ackStallSinceAt !== resultAt || this.ackStallRecoveryIssued
+      || this.liveRetryTimerGeneration !== postCommitTimerGeneration
+      || !this.ledgerSchedulingMatches(schedulingSnapshot)
+    ) {
+      return;
     }
     this.armLiveRetryTimer();
+  }
+
+  private hasPublishedUnackedOwnership(): boolean {
+    for (const entry of this.unackedLedger.values()) {
+      if (entry.published) return true;
+    }
+    return false;
   }
 
   private async onConnected(): Promise<void> {
@@ -1610,6 +1773,11 @@ export class WebChannelNatsClient {
 
     // Fresh connection → fresh key establishment.
     this.resetSession();
+    // resetSession() clears an injected timer handle. That clear hook is an
+    // embedder callout and may synchronously disconnect/reconnect, replacing the
+    // raw generation underneath this stack. Never let the abandoned flow issue
+    // registration against the replacement socket.
+    if (!this.connectionFlowMatches(epoch, connectionGeneration)) return;
 
     // PoP registration over NATS request/reply (production). MUST complete AFTER
     // we subscribe to .out (above) but BEFORE any key flows — the agent only
@@ -1645,7 +1813,7 @@ export class WebChannelNatsClient {
         // Epoch guard (mirrors the success path below): a reconnect during the
         // register round-trip may have already spawned a newer onConnected, so a
         // stale flow must not tear down or redial the live connection.
-        if (this.connectionEpoch !== epoch) return;
+        if (!this.connectionFlowMatches(epoch, connectionGeneration)) return;
         console.error("[nats-client] PoP registration failed:", err);
         if (isTerminalRegisterError(err)) {
           // Rejected proof/token or a non-transient server failure — the SAME
@@ -1687,7 +1855,7 @@ export class WebChannelNatsClient {
       // The socket may have dropped during the register round-trip; a reconnect
       // would have spawned a newer onConnected. Bail so this stale flow does not
       // establish a key for a connection generation that is no longer current.
-      if (this.connectionEpoch !== epoch) return;
+      if (!this.connectionFlowMatches(epoch, connectionGeneration)) return;
 
       // Wire-protocol handshake (mirrors the :1080 pin-failure style). The plugin
       // echoes its protocol + package versions in the register reply:
@@ -1714,7 +1882,7 @@ export class WebChannelNatsClient {
         protocolVersion: agentProtocolVersion,
         pluginVersion: agentPluginVersion,
       });
-      if (this.connectionEpoch !== epoch) return;
+      if (!this.connectionFlowMatches(epoch, connectionGeneration)) return;
 
       {
         // Register-delivered key: unwrap K with the cnf device private key.
@@ -1768,7 +1936,7 @@ export class WebChannelNatsClient {
             registerResult.clientNonce,
           );
         } catch (err) {
-          if (this.connectionEpoch !== epoch) return;
+          if (!this.connectionFlowMatches(epoch, connectionGeneration)) return;
           console.error("[nats-client] conversation-key unwrap failed:", err);
           // P1-7: the E2E session could not be established (bad/tampered key or a
           // stale pin) — re-auth to retry with fresh keys.
@@ -1777,7 +1945,7 @@ export class WebChannelNatsClient {
           this.failConnectionEpoch(epoch, connectionGeneration, err as Error, "secure-channel-failed");
           return;
         }
-        if (this.connectionEpoch !== epoch) return;
+        if (!this.connectionFlowMatches(epoch, connectionGeneration)) return;
         this.sessionKey = key;
         // drainPendingInbound() synchronously invokes message listeners; one that
         // calls disconnect()+connect() advances the epoch under us. Re-check before
@@ -1785,15 +1953,30 @@ export class WebChannelNatsClient {
         // "session established" for — a connection generation that is no longer
         // current (session listeners gate P1-9 unsend-hold release).
         this.drainPendingInbound();
-        if (this.connectionEpoch !== epoch) return;
+        if (!this.sessionFlowMatches(epoch, connectionGeneration, key)) return;
         this.flushQueue();
-        if (this.connectionEpoch !== epoch) return;
+        if (!this.sessionFlowMatches(epoch, connectionGeneration, key)) return;
         // P1-9: notify AFTER flushQueue so a released hold is ordered behind the
         // P0-7b ledger replay (drain → flush → notify; see onSession).
-        this.notifySessionListeners();
+        this.notifySessionListeners(() => this.sessionFlowMatches(epoch, connectionGeneration, key));
         return;
       }
     }
+  }
+
+  private connectionFlowMatches(epoch: number, connectionGeneration: number): boolean {
+    return this.connectionEpoch === epoch
+      && this.client.currentConnectionGeneration() === connectionGeneration
+      && !this.disconnected
+      && !this.terminalReached;
+  }
+
+  private sessionFlowMatches(
+    epoch: number,
+    connectionGeneration: number,
+    key: Uint8Array,
+  ): boolean {
+    return this.connectionFlowMatches(epoch, connectionGeneration) && this.sessionKey === key;
   }
 
   /**
@@ -1923,6 +2106,9 @@ export class WebChannelNatsClient {
       this.outboundQueue.push(message);
       return;
     }
+    const sealingKey = this.sessionKey;
+    const sealingConnectionEpoch = this.connectionEpoch;
+    const sealingMutationEpoch = this.ackStallMutationEpoch;
     const { tenant, accountId, peerId } = this.options;
     // P0-7b: record a user_message in the unacked ledger BEFORE publishing so it
     // can be replayed if the session drops before the agent acks it. Recording
@@ -1931,9 +2117,9 @@ export class WebChannelNatsClient {
     // an id-less frame from a caller that bypassed sendUserMessage is not
     // replayable and is skipped.
     //
-    // P0-4 (review R2/R3): `recordUnacked` returns inert eviction metadata rather
-    // than notifying or consulting injected retry hooks inline. Nothing
-    // between the `sessionKey` fail-closed check above and `sealMessage()` below
+    // P0-4 (review R2/R3): `recordUnacked` returns inert insertion/eviction
+    // metadata rather than notifying or consulting injected retry hooks inline.
+    // Nothing between the `sessionKey` fail-closed check above and `sealMessage()` below
     // may call into embedder code: a subscriber reached from here can `close()`,
     // which nulls `sessionKey` mid-seal (TS narrowing from the top-of-function
     // check hides it), and `null` then flows into the AEAD as a raw TypeError
@@ -1944,10 +2130,12 @@ export class WebChannelNatsClient {
     // re-queue there would strand the frame on an already-swept closed instance).
     let evicted: string[] = [];
     let warnEviction = false;
+    let provisionallyInserted = false;
     if (message.type === "user_message" && message.id) {
-      ({ evicted, warnEviction } = this.recordUnacked(message.id, message));
+      ({ evicted, warnEviction, inserted: provisionallyInserted } =
+        this.recordUnacked(message.id, message));
     }
-    const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, message);
+    const wire = sealMessage({ accountId, tenant, sub: peerId }, sealingKey, message);
     const finishPostSeal = () => {
       if (warnEviction) {
         console.warn(
@@ -1969,37 +2157,138 @@ export class WebChannelNatsClient {
     // publish-driven forceReconnect replays it, so a live process never reports
     // false success. Non-replicated frames only warn on failure (§5 recovery lanes).
     if (message.type === "user_message" && message.id) {
-      const ledgerEntry = this.unackedLedger.get(message.id);
-      const attemptAt = this.retryNow();
+      const messageId = message.id;
+      const ledgerEntry = this.unackedLedger.get(messageId);
+      const finishInvalidatedPrePublish = () => {
+        // An injected retry hook may synchronously deliver an owned result for
+        // an OLDER message. That result legitimately advances the episode's
+        // mutation epoch, but this newly inserted message still has not been
+        // published or given a retry deadline. Put that exact owner back at the
+        // front of the live drain (ahead of messages created by result
+        // callbacks), then let the next seal establish ordinary scheduling.
+        // Every other invalidation is fail-closed: never revive an entry that
+        // was itself detached, replaced, scheduled, or moved to another
+        // lifecycle.
+        if (
+          provisionallyInserted && ledgerEntry
+          && this.unackedLedger.get(messageId) === ledgerEntry
+          && ledgerEntry.nextRetryAt === null
+          && this.sessionKey === sealingKey
+          && this.connectionEpoch === sealingConnectionEpoch
+          && this.ackStallMutationEpoch !== sealingMutationEpoch
+          && !this.disconnected && !this.terminalReached
+        ) {
+          this.unackedLedger.delete(messageId);
+          this.outboundQueue.unshift(message);
+        }
+        finishPostSeal();
+      };
       if (
         !ledgerEntry || this.unackedLedger.get(message.id) !== ledgerEntry
-        || !this.sessionKey || this.disconnected || this.terminalReached
+        || this.sessionKey !== sealingKey
+        || this.connectionEpoch !== sealingConnectionEpoch
+        || this.ackStallMutationEpoch !== sealingMutationEpoch
+        || this.disconnected || this.terminalReached
       ) {
         finishPostSeal();
         return;
       }
+      let initialRetryDelay: number | null = null;
       if (ledgerEntry.nextRetryAt === null) {
-        const delay = this.retryDelay(ledgerEntry.retryCount);
+        // Resolve injected retry randomness before sampling the one publish
+        // clock. Either hook may synchronously replace the lifecycle.
+        initialRetryDelay = this.retryDelay(ledgerEntry.retryCount);
         if (
           this.unackedLedger.get(message.id) !== ledgerEntry
-          || !this.sessionKey || this.disconnected || this.terminalReached
+          || this.sessionKey !== sealingKey
+          || this.connectionEpoch !== sealingConnectionEpoch
+          || this.ackStallMutationEpoch !== sealingMutationEpoch
+          || this.disconnected || this.terminalReached
         ) {
-          finishPostSeal();
+          finishInvalidatedPrePublish();
           return;
         }
-        ledgerEntry.nextRetryAt = attemptAt + delay;
       }
+      const attemptAt = this.retryNow();
+      if (
+        this.unackedLedger.get(message.id) !== ledgerEntry
+        || this.sessionKey !== sealingKey
+        || this.connectionEpoch !== sealingConnectionEpoch
+        || this.ackStallMutationEpoch !== sealingMutationEpoch
+        || this.disconnected || this.terminalReached
+      ) {
+        finishInvalidatedPrePublish();
+        return;
+      }
+      if (initialRetryDelay !== null) ledgerEntry.nextRetryAt = attemptAt + initialRetryDelay;
       const entry = this.sendTracker.get(message.id);
       if (entry) entry.lastAttemptAt = attemptAt;
-    }
-    const ok = this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
-    if (message.type === "user_message" && message.id) {
-      if (ok) {
-        this.trackerAdvance(message.id, "sent");
-        this.armLiveRetryTimer();
+
+      // No injected/public hook is allowed between this exact fence and the raw
+      // publish. Ciphertext for a retired key or ledger owner is never sent.
+      if (
+        this.unackedLedger.get(message.id) !== ledgerEntry
+        || this.sessionKey !== sealingKey
+        || this.connectionEpoch !== sealingConnectionEpoch
+        || this.ackStallMutationEpoch !== sealingMutationEpoch
+        || this.disconnected || this.terminalReached
+      ) {
+        finishPostSeal();
+        return;
       }
-    } else if (!ok) {
-      console.warn(`[nats-client] publish failed for non-replicated frame '${message.type}' — recovery via reconnect/register snapshot`);
+      const ok = this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
+      if (ok) {
+        let publishedMutationEpoch: number | null = null;
+        let schedulingSnapshot: LedgerSchedulingSnapshot | null = null;
+        if (
+          this.unackedLedger.get(message.id) === ledgerEntry
+          && this.sessionKey === sealingKey
+          && this.connectionEpoch === sealingConnectionEpoch
+          && !this.disconnected && !this.terminalReached
+        ) {
+          // Retry scheduling is prepared before the raw call, but only a
+          // successful raw publish confirms application-published ownership.
+          // An older message may be ACKed synchronously inside ws.send(),
+          // advancing the mutation epoch while this exact entry remains current;
+          // confirming it here is safe. A result for THIS id detached the entry,
+          // so the identity fence above prevents resurrection.
+          ledgerEntry.published = true;
+          const confirmationMutationEpoch = this.ackStallMutationEpoch;
+          const publishedAt = this.retryNow();
+          if (
+            this.unackedLedger.get(message.id) === ledgerEntry
+            && this.sessionKey === sealingKey
+            && this.connectionEpoch === sealingConnectionEpoch
+            && this.ackStallMutationEpoch === confirmationMutationEpoch
+            && !this.disconnected && !this.terminalReached
+          ) {
+            if (this.ackStallSinceAt === null && !this.ackStallRecoveryIssued) {
+              this.ackStallMutationEpoch++;
+              this.ackStallSinceAt = publishedAt;
+              this.ackStallRecoveryIssued = false;
+            }
+            publishedMutationEpoch = this.ackStallMutationEpoch;
+            schedulingSnapshot = this.captureLedgerScheduling();
+          }
+        }
+        this.trackerAdvance(message.id, "sent");
+        if (
+          publishedMutationEpoch !== null && schedulingSnapshot !== null
+          && this.unackedLedger.get(message.id) === ledgerEntry
+          && this.sessionKey === sealingKey
+          && this.connectionEpoch === sealingConnectionEpoch
+          && this.ackStallMutationEpoch === publishedMutationEpoch
+          && !this.disconnected && !this.terminalReached
+          && this.ledgerSchedulingMatches(schedulingSnapshot)
+        ) {
+          this.armLiveRetryTimer();
+        }
+      }
+    } else {
+      const ok = this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
+      if (!ok) {
+        console.warn(`[nats-client] publish failed for non-replicated frame '${message.type}' — recovery via reconnect/register snapshot`);
+      }
     }
     // P0-4 (review R2): the deferred eviction notifications — the seal is complete,
     // so an embedder that tears the instance down from here can no longer corrupt
@@ -2058,6 +2347,11 @@ export class WebChannelNatsClient {
     for (const id of this.unackedLedger.keys()) ids.add(id);
     this.outboundQueue = [];
     this.unackedLedger.clear();
+    // Explicit/terminal retirement ends the published episode before the
+    // reentrant timer-clear hook and before any failure callback.
+    this.ackStallMutationEpoch++;
+    this.ackStallSinceAt = null;
+    this.ackStallRecoveryIssued = false;
     this.cancelLiveRetryTimer();
     return [...ids];
   }
@@ -2130,7 +2424,8 @@ export class WebChannelNatsClient {
   /**
    * P0-7b: record an unacked user_message, evicting the oldest past the cap.
    *
-   * Returns inert eviction metadata instead of failing/warning here (P0-4 R2/R3).
+   * Returns inert insertion/eviction metadata instead of failing/warning here
+   * (P0-4 R2/R3).
    * `trackerFail` is a synchronous callout into embedder code (emitSendState →
    * the wrapper's receiptTransition → setState → app state subscribers), and the
    * only caller is `seal()`, which runs this BETWEEN its `sessionKey` fail-closed
@@ -2146,16 +2441,19 @@ export class WebChannelNatsClient {
   private recordUnacked(
     id: string,
     message: Extract<OutboundMessage, { type: "user_message" }>,
-  ): { evicted: string[]; warnEviction: boolean } {
+  ): { evicted: string[]; warnEviction: boolean; inserted: boolean } {
     const evicted: string[] = [];
     let warnEviction = false;
+    let inserted = false;
     if (!this.unackedLedger.has(id)) {
+      inserted = true;
       this.unackedLedger.set(id, {
         message,
         retryCount: 0,
         // Injected clock/random callbacks run only after sealMessage has
         // completed; null is inert pre-publish ownership metadata.
         nextRetryAt: null,
+        published: false,
       });
     }
     while (this.unackedLedger.size > WebChannelNatsClient.MAX_UNACKED) {
@@ -2173,7 +2471,7 @@ export class WebChannelNatsClient {
         warnEviction = true;
       }
     }
-    return { evicted, warnEviction };
+    return { evicted, warnEviction, inserted };
   }
 
   private retryDelay(retryCount: number): number {
@@ -2182,22 +2480,83 @@ export class WebChannelNatsClient {
     return Math.min(30_000, Math.round(base * (0.9 + random * 0.2)));
   }
 
-  private cancelLiveRetryTimer(): void {
-    this.liveRetryTimerGeneration++;
-    if (!this.liveRetryTimer) return;
-    this.retryClearTimeout(this.liveRetryTimer);
+  private captureLedgerScheduling(): LedgerSchedulingSnapshot {
+    return [...this.unackedLedger.entries()].map(([id, entry]) => ({
+      id,
+      entry,
+      nextRetryAt: entry.nextRetryAt,
+      published: entry.published,
+    }));
+  }
+
+  private ledgerSchedulingMatches(snapshot: LedgerSchedulingSnapshot): boolean {
+    if (this.unackedLedger.size !== snapshot.length) return false;
+    for (const item of snapshot) {
+      if (
+        this.unackedLedger.get(item.id) !== item.entry
+        || item.entry.nextRetryAt !== item.nextRetryAt
+        || item.entry.published !== item.published
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Null ownership before the injected clear hook; return the exact token. */
+  private cancelLiveRetryTimer(): number {
+    const token = ++this.liveRetryTimerGeneration;
+    const timer = this.liveRetryTimer;
     this.liveRetryTimer = null;
+    if (timer !== null) this.retryClearTimeout(timer);
+    return token;
   }
 
   private armLiveRetryTimer(): void {
-    this.cancelLiveRetryTimer();
-    if (!this.sessionKey || this.unackedLedger.size === 0 || this.disconnected || this.terminalReached) return;
+    const cancellationToken = this.cancelLiveRetryTimer();
+    if (
+      this.liveRetryTimerGeneration !== cancellationToken || this.liveRetryTimer !== null
+      || !this.sessionKey || this.unackedLedger.size === 0
+      || this.disconnected || this.terminalReached
+    ) {
+      return;
+    }
+    const epoch = this.connectionEpoch;
+    const key = this.sessionKey;
+    const mutationEpoch = this.ackStallMutationEpoch;
+    const schedulingSnapshot = this.captureLedgerScheduling();
+    const stallSinceAt = this.ackStallSinceAt;
+    const stallRecoveryIssued = this.ackStallRecoveryIssued;
     let earliest = Number.POSITIVE_INFINITY;
     for (const entry of this.unackedLedger.values()) {
       if (entry.nextRetryAt !== null) earliest = Math.min(earliest, entry.nextRetryAt);
     }
-    if (!Number.isFinite(earliest)) return;
-    const delay = Math.max(0, earliest - this.retryNow());
+    const hasStallCandidate =
+      this.resolvedAckStallTimeoutMs > 0
+      && stallSinceAt !== null
+      && !stallRecoveryIssued;
+    if (!Number.isFinite(earliest) && !hasStallCandidate) return;
+
+    const now = this.retryNow();
+    if (
+      this.liveRetryTimerGeneration !== cancellationToken || this.liveRetryTimer !== null
+      || this.connectionEpoch !== epoch || this.sessionKey !== key
+      || this.ackStallMutationEpoch !== mutationEpoch
+      || this.ackStallSinceAt !== stallSinceAt
+      || this.ackStallRecoveryIssued !== stallRecoveryIssued
+      || this.disconnected || this.terminalReached
+      || !this.ledgerSchedulingMatches(schedulingSnapshot)
+    ) {
+      return;
+    }
+    const retryRemaining = Number.isFinite(earliest)
+      ? Math.max(0, earliest - now)
+      : Number.POSITIVE_INFINITY;
+    const stallRemaining = hasStallCandidate
+      ? Math.max(0, this.resolvedAckStallTimeoutMs - Math.max(0, now - stallSinceAt!))
+      : Number.POSITIVE_INFINITY;
+    const delay = Math.min(retryRemaining, stallRemaining);
+    if (!Number.isFinite(delay)) return;
     const generation = ++this.liveRetryTimerGeneration;
     const timer = this.retrySetTimeout(() => {
       if (generation !== this.liveRetryTimerGeneration) return;
@@ -2210,7 +2569,12 @@ export class WebChannelNatsClient {
     // into the retired session in that case.
     if (
       generation !== this.liveRetryTimerGeneration
-      || !this.sessionKey || this.unackedLedger.size === 0
+      || this.liveRetryTimer !== null
+      || this.connectionEpoch !== epoch || this.sessionKey !== key
+      || this.ackStallMutationEpoch !== mutationEpoch
+      || this.ackStallSinceAt !== stallSinceAt
+      || this.ackStallRecoveryIssued !== stallRecoveryIssued
+      || !this.ledgerSchedulingMatches(schedulingSnapshot)
       || this.disconnected || this.terminalReached
     ) {
       this.retryClearTimeout(timer);
@@ -2223,17 +2587,85 @@ export class WebChannelNatsClient {
 
   private retryDueUnacked(): void {
     if (!this.sessionKey || this.disconnected || this.terminalReached) return;
-    const now = this.retryNow();
+    const timerGeneration = this.liveRetryTimerGeneration;
+    const epoch = this.connectionEpoch;
+    const key = this.sessionKey;
+    const mutationEpoch = this.ackStallMutationEpoch;
+    const schedulingSnapshot = this.captureLedgerScheduling();
+    const stallSinceAt = this.ackStallSinceAt;
+    const stallRecoveryIssued = this.ackStallRecoveryIssued;
+    const schedulerNow = this.retryNow();
+    if (
+      this.liveRetryTimerGeneration !== timerGeneration
+      || this.connectionEpoch !== epoch || this.sessionKey !== key
+      || this.ackStallMutationEpoch !== mutationEpoch
+      || this.ackStallSinceAt !== stallSinceAt
+      || this.ackStallRecoveryIssued !== stallRecoveryIssued
+      || this.disconnected || this.terminalReached
+      || !this.ledgerSchedulingMatches(schedulingSnapshot)
+    ) {
+      return;
+    }
+
+    if (
+      this.resolvedAckStallTimeoutMs > 0
+      && stallSinceAt !== null && !stallRecoveryIssued
+      && this.unackedLedger.size > 0
+      && Math.max(0, schedulerNow - stallSinceAt) >= this.resolvedAckStallTimeoutMs
+    ) {
+      this.ackStallMutationEpoch++;
+      this.ackStallRecoveryIssued = true;
+      this.requestApplicationRecovery();
+      return;
+    }
+
     const { tenant, accountId, peerId } = this.options;
     for (const [id, entry] of this.unackedLedger) {
-      if (entry.nextRetryAt === null || entry.nextRetryAt > now || !this.sessionKey) continue;
-      const wire = sealMessage({ accountId, tenant, sub: peerId }, this.sessionKey, entry.message);
+      if (entry.nextRetryAt === null || entry.nextRetryAt > schedulerNow) continue;
+      const entryMutationEpoch = this.ackStallMutationEpoch;
+      const entryTimerGeneration = this.liveRetryTimerGeneration;
+      const entryKey: Uint8Array | null = this.sessionKey;
+      const entryEpoch = this.connectionEpoch;
+      if (!entryKey || this.disconnected || this.terminalReached) return;
+      // A due retry resolves its randomized next interval before sampling the
+      // publish-attempt clock. Both injected hooks are fenced callouts.
+      const nextRetryCount = entry.retryCount + 1;
+      const delay = this.retryDelay(nextRetryCount);
+      if (
+        this.unackedLedger.get(id) !== entry
+        || this.sessionKey !== entryKey || this.connectionEpoch !== entryEpoch
+        || this.ackStallMutationEpoch !== entryMutationEpoch
+        || this.liveRetryTimerGeneration !== entryTimerGeneration
+        || this.disconnected || this.terminalReached
+      ) {
+        return;
+      }
+      const attemptAt = this.retryNow();
+      if (
+        this.unackedLedger.get(id) !== entry
+        || this.sessionKey !== entryKey || this.connectionEpoch !== entryEpoch
+        || this.ackStallMutationEpoch !== entryMutationEpoch
+        || this.liveRetryTimerGeneration !== entryTimerGeneration
+        || this.disconnected || this.terminalReached
+      ) {
+        return;
+      }
+      const wire = sealMessage({ accountId, tenant, sub: peerId }, entryKey, entry.message);
       const tracker = this.sendTracker.get(id);
-      if (tracker) tracker.lastAttemptAt = now;
+      if (tracker) tracker.lastAttemptAt = attemptAt;
       const ok = this.client.publish(inboundSubject(tenant, accountId, peerId), wire);
-      if (!ok) break; // publish forced reconnect/reset; reconnect replay owns recovery.
-      entry.retryCount++;
-      entry.nextRetryAt = now + this.retryDelay(entry.retryCount);
+      if (!ok) return; // publish forced reconnect/reset; reconnect replay owns recovery.
+      if (
+        this.unackedLedger.get(id) !== entry
+        || this.sessionKey !== entryKey || this.connectionEpoch !== entryEpoch
+        || this.ackStallMutationEpoch !== entryMutationEpoch
+        || this.liveRetryTimerGeneration !== entryTimerGeneration
+        || this.disconnected || this.terminalReached
+      ) {
+        return;
+      }
+      entry.retryCount = nextRetryCount;
+      entry.nextRetryAt = attemptAt + delay;
     }
     this.armLiveRetryTimer();
   }
@@ -2268,13 +2700,14 @@ export class WebChannelNatsClient {
     });
   }
 
-  private notifySessionListeners(): void {
-    this.sessionListeners.forEach((listener) => {
+  private notifySessionListeners(isCurrent?: () => boolean): void {
+    for (const listener of [...this.sessionListeners]) {
+      if (isCurrent && !isCurrent()) return;
       try {
         listener();
       } catch (e) {
         console.error("[nats-client] Session listener error:", e);
       }
-    });
+    }
   }
 }

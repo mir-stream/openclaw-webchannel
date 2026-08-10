@@ -50,6 +50,10 @@ describe("S2 — NatsChannel memory bounds", () => {
     channel.registerPeer("peer-0");
     channel.registerPeer("peer-1");
     channel.registerPeer("peer-2");
+    const originalPeer0Sid = subs.get("peer-0");
+    const originalPeer1Sid = subs.get("peer-1");
+    expect(originalPeer0Sid).toBeDefined();
+    expect(originalPeer1Sid).toBeDefined();
     expect(subs.size).toBe(3);
     expect(transport.subs.size).toBe(3); // one live SUB per peer
 
@@ -60,6 +64,23 @@ describe("S2 — NatsChannel memory bounds", () => {
     expect(subs.has("peer-3")).toBe(true);
     // Its NATS subscription was torn down (no leaked SUB).
     expect(transport.subs.size).toBe(3);
+    expect(transport.subs.has(originalPeer0Sid!)).toBe(false);
+
+    // Re-registering the evicted peer restores exactly one fresh subscription
+    // while keeping both ownership maps bounded and evicting the next oldest.
+    channel.registerPeer("peer-0");
+    const replacementPeer0Sid = subs.get("peer-0");
+    const peer0Subject = "webchannel.tenant.acct.peer-0.in";
+    expect(replacementPeer0Sid).toBeDefined();
+    expect(replacementPeer0Sid).not.toBe(originalPeer0Sid);
+    expect(subs.size).toBe(3);
+    expect(transport.subs.size).toBe(3);
+    expect(subs.has("peer-0")).toBe(true);
+    expect(subs.has("peer-1")).toBe(false);
+    expect(transport.subs.has(originalPeer1Sid!)).toBe(false);
+    expect(
+      [...transport.subs].filter(([, subject]) => subject === peer0Subject),
+    ).toEqual([[replacementPeer0Sid, peer0Subject]]);
   });
 
   it("runs peer-retirement cleanup for cap eviction and explicit unregister", () => {

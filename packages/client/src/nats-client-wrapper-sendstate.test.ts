@@ -99,6 +99,11 @@ const userBubble = (w: WebChannelNATSClient, text: string): ChatMessage | undefi
 const deliverOut = (K: Uint8Array, msg: Record<string, unknown>): void => {
   FakeNatsWS.instances.at(-1)!.deliverToClient(OUT, sealMessage({ accountId: AGENT, tenant: TENANT, sub: PEER }, K, msg as unknown as OutboundMessage));
 };
+const publishedInputs = (socket: FakeNatsWS, K: Uint8Array): OutboundMessage[] =>
+  socket.published
+    .filter(({ subject }) => subject === IN)
+    .map(({ payload }) => openMessage(payload, K) as OutboundMessage | null)
+    .filter((message): message is OutboundMessage => message !== null);
 /** Record the distinct sendState sequence of the first user bubble matching `text`. */
 function trackBubble(w: WebChannelNATSClient, text: string): string[] {
   const seq: string[] = [];
@@ -1286,6 +1291,395 @@ describe("WebChannelNATSClient — P0-4 teardown-then-notify (R3-1)", () => {
 
     unsubscribe();
     h.wrapper.close();
+  });
+
+  it("defers a clear-hook connect+ordinary send until old teardown, then releases it on the replacement session", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, {
+      type: "progress", id: "webchannel-d", text: "working", turnId: "T",
+    });
+    await settle();
+    const oldHeld = h.wrapper.send("old-held-before-clear")!;
+    const oldTimer = (h.wrapper as unknown as {
+      heldStallTimer: ReturnType<typeof setTimeout> | null;
+    }).heldStallTimer;
+    expect(oldTimer).not.toBeNull();
+    const oldSocket = FakeNatsWS.instances.at(-1)!;
+
+    const realClearTimeout = globalThis.clearTimeout;
+    let hookRan = false;
+    let replacement!: SendReceipt;
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+      realClearTimeout(timer);
+      if (!hookRan && timer === oldTimer) {
+        hookRan = true;
+        h.wrapper.connect();
+        replacement = h.wrapper.send("replacement-held-from-clear")!;
+      }
+    });
+
+    try {
+      h.wrapper.close();
+      await settle();
+
+      expect(hookRan).toBe(true);
+      expect(oldHeld.snapshot()).toMatchObject({
+        state: "failed", failure: { reason: "closed", retryable: false },
+      });
+      expect(FakeNatsWS.instances).toHaveLength(2);
+      expect(FakeNatsWS.instances[0]).toBe(oldSocket);
+      expect(coherence(h.wrapper)).toEqual({
+        wrapperClosed: false, lowLevelDisconnected: false, hasSocket: true,
+      });
+      expect(replacement.snapshot()).toEqual({ state: "queued", failure: undefined });
+      expect(userBubble(h.wrapper, "replacement-held-from-clear")).toMatchObject({
+        pending: true, sendState: "queued",
+      });
+      const replacementTimer = (h.wrapper as unknown as {
+        heldStallTimer: ReturnType<typeof setTimeout> | null;
+      }).heldStallTimer;
+      expect(replacementTimer).not.toBeNull();
+      expect(replacementTimer).not.toBe(oldTimer);
+      expect(oldSocket.published.filter(({ subject }) => subject === IN)).toHaveLength(0);
+
+      deliverOut(h.K, { type: "turn_settled", turnId: "T" });
+      await settle();
+      expect(replacement.snapshot().state).toBe("accepted");
+      expect(userBubble(h.wrapper, "replacement-held-from-clear")?.pending).not.toBe(true);
+      expect(oldSocket.published.filter(({ subject }) => subject === IN)).toHaveLength(0);
+      expect(FakeNatsWS.instances[1].published.filter(({ subject }) => subject === IN))
+        .toHaveLength(1);
+    } finally {
+      clearSpy.mockRestore();
+      h.wrapper.close();
+    }
+  });
+
+  it("stages /stop from a clear-hook reconnect so it never publishes on the old socket", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, {
+      type: "progress", id: "webchannel-d", text: "working", turnId: "T",
+    });
+    await settle();
+    const oldHeld = h.wrapper.send("old-held-before-stop")!;
+    const oldTimer = (h.wrapper as unknown as {
+      heldStallTimer: ReturnType<typeof setTimeout> | null;
+    }).heldStallTimer;
+    expect(oldTimer).not.toBeNull();
+    const oldSocket = FakeNatsWS.instances.at(-1)!;
+
+    const realClearTimeout = globalThis.clearTimeout;
+    let hookRan = false;
+    let replacementOrdinary!: SendReceipt;
+    let stopReceipt!: SendReceipt;
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+      realClearTimeout(timer);
+      if (!hookRan && timer === oldTimer) {
+        hookRan = true;
+        h.wrapper.connect();
+        replacementOrdinary = h.wrapper.send("replacement-before-stop")!;
+        stopReceipt = h.wrapper.send("/stop")!;
+      }
+    });
+
+    try {
+      h.wrapper.close();
+      await settle();
+
+      expect(hookRan).toBe(true);
+      expect(oldHeld.snapshot()).toMatchObject({
+        state: "failed", failure: { reason: "closed", retryable: false },
+      });
+      expect(replacementOrdinary.snapshot()).toMatchObject({
+        state: "failed", failure: { reason: "cancelled", retryable: false },
+      });
+      expect(userBubble(h.wrapper, "replacement-before-stop")).toMatchObject({
+        pending: false,
+        retracted: true,
+        sendState: "failed",
+        sendFailure: { reason: "cancelled", retryable: false },
+      });
+      expect(stopReceipt.snapshot().state).toBe("accepted");
+      expect(FakeNatsWS.instances).toHaveLength(2);
+      expect(coherence(h.wrapper)).toEqual({
+        wrapperClosed: false, lowLevelDisconnected: false, hasSocket: true,
+      });
+
+      expect(publishedInputs(oldSocket, h.K)).toEqual([]);
+      expect(publishedInputs(FakeNatsWS.instances[1], h.K)).toMatchObject([
+        { type: "user_message", text: "/stop" },
+      ]);
+      expect(h.received).toContain(userBubble(h.wrapper, "/stop")!.wireId!);
+    } finally {
+      clearSpy.mockRestore();
+      h.wrapper.close();
+    }
+  });
+
+  it("commits user and non-user clear-hook operations FIFO only on the replacement socket", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, {
+      type: "progress", id: "webchannel-d", text: "working", turnId: "T",
+    });
+    await settle();
+    const oldHeld = h.wrapper.send("old-held-before-operation-fifo")!;
+    const oldTimer = (h.wrapper as unknown as {
+      heldStallTimer: ReturnType<typeof setTimeout> | null;
+    }).heldStallTimer;
+    expect(oldTimer).not.toBeNull();
+    const oldSocket = FakeNatsWS.instances.at(-1)!;
+    const inner = (h.wrapper as unknown as { client: { connect: () => void } }).client;
+    const realInnerConnect = inner.connect.bind(inner);
+    const connectSpy = vi.spyOn(inner, "connect").mockImplementation(() => {
+      // A synchronous dial callback is still logically after every operation
+      // staged by the close hook, so it must append to the replacement FIFO.
+      h.wrapper.loadHistory({ before: "from-sync-connect" });
+      realInnerConnect();
+    });
+    let insideDecision = false;
+    let decisionReentered = false;
+    const unsubscribe = h.wrapper.subscribe(() => {
+      if (!insideDecision || decisionReentered) return;
+      decisionReentered = true;
+      h.wrapper.loadHistory({ before: "from-decision-state" });
+    });
+
+    const realClearTimeout = globalThis.clearTimeout;
+    let hookRan = false;
+    let stopReceipt!: SendReceipt;
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+      realClearTimeout(timer);
+      if (!hookRan && timer === oldTimer) {
+        hookRan = true;
+        h.wrapper.connect();
+        h.wrapper.loadHistory({ before: "cursor-7", limit: 7 });
+        stopReceipt = h.wrapper.send("/stop")!;
+        insideDecision = true;
+        h.wrapper.decide("approval-clear", "allow-once");
+        insideDecision = false;
+        h.wrapper.loadCommands();
+      }
+    });
+
+    try {
+      h.wrapper.close();
+      await settle();
+
+      expect(hookRan).toBe(true);
+      expect(oldHeld.snapshot()).toMatchObject({
+        state: "failed", failure: { reason: "closed", retryable: false },
+      });
+      expect(stopReceipt.snapshot().state).toBe("accepted");
+      expect(decisionReentered).toBe(true);
+      expect(FakeNatsWS.instances).toHaveLength(2);
+      expect(publishedInputs(oldSocket, h.K)).toEqual([]);
+      expect(publishedInputs(FakeNatsWS.instances[1], h.K)).toMatchObject([
+        { type: "load_history", before: "cursor-7", limit: 7 },
+        { type: "user_message", text: "/stop" },
+        { type: "approval_decision", id: "approval-clear", decision: "allow-once" },
+        { type: "load_history", before: "from-decision-state" },
+        { type: "load_commands" },
+        { type: "load_history", before: "from-sync-connect" },
+      ]);
+      expect(coherence(h.wrapper)).toEqual({
+        wrapperClosed: false, lowLevelDisconnected: false, hasSocket: true,
+      });
+    } finally {
+      clearSpy.mockRestore();
+      connectSpy.mockRestore();
+      unsubscribe();
+      h.wrapper.close();
+    }
+  });
+
+  it("defers an approval_snapshot lost-decision resend raised from the old socket", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, {
+      type: "approval_request",
+      id: "lost-decision",
+      kind: "exec",
+      title: "Run",
+      prompt: "cmd",
+      options: [{ decision: "allow-once", label: "Allow", style: "success" }],
+    });
+    await settle();
+    h.wrapper.decide("lost-decision", "allow-once");
+    await settle();
+    expect(h.wrapper.getState().approvals[0]).toMatchObject({
+      id: "lost-decision", resolvedDecision: "allow-once",
+    });
+
+    const oldSocket = FakeNatsWS.instances.at(-1)!;
+    oldSocket.published.splice(0);
+    deliverOut(h.K, {
+      type: "progress", id: "webchannel-d", text: "working", turnId: "T",
+    });
+    await settle();
+    const oldHeld = h.wrapper.send("old-held-before-resend")!;
+    const oldTimer = (h.wrapper as unknown as {
+      heldStallTimer: ReturnType<typeof setTimeout> | null;
+    }).heldStallTimer;
+    expect(oldTimer).not.toBeNull();
+
+    const realClearTimeout = globalThis.clearTimeout;
+    let hookRan = false;
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+      realClearTimeout(timer);
+      if (!hookRan && timer === oldTimer) {
+        hookRan = true;
+        h.wrapper.connect();
+        deliverOut(h.K, {
+          type: "approval_snapshot",
+          approvals: [{
+            id: "lost-decision",
+            kind: "exec",
+            title: "Run",
+            prompt: "cmd",
+            options: [{ decision: "allow-once", label: "Allow", style: "success" }],
+          }],
+        });
+      }
+    });
+
+    try {
+      h.wrapper.close();
+      await settle();
+
+      expect(hookRan).toBe(true);
+      expect(oldHeld.snapshot()).toMatchObject({
+        state: "failed", failure: { reason: "closed", retryable: false },
+      });
+      expect(FakeNatsWS.instances).toHaveLength(2);
+      expect(publishedInputs(oldSocket, h.K)).toEqual([]);
+      expect(publishedInputs(FakeNatsWS.instances[1], h.K)).toEqual([
+        { type: "approval_decision", id: "lost-decision", decision: "allow-once" },
+      ]);
+    } finally {
+      clearSpy.mockRestore();
+      h.wrapper.close();
+    }
+  });
+
+  for (const mode of ["nested-close", "terminal"] as const) {
+    it(`drops staged replacement operations on ${mode} without leaving observable ownership`, async () => {
+      const h = await connectWrapper();
+      deliverOut(h.K, {
+        type: "progress", id: "webchannel-d", text: "working", turnId: "T",
+      });
+      await settle();
+      const oldHeld = h.wrapper.send(`old-held-before-${mode}`)!;
+      const oldTimer = (h.wrapper as unknown as {
+        heldStallTimer: ReturnType<typeof setTimeout> | null;
+      }).heldStallTimer;
+      expect(oldTimer).not.toBeNull();
+      const oldSocket = FakeNatsWS.instances.at(-1)!;
+
+      const realClearTimeout = globalThis.clearTimeout;
+      let hookRan = false;
+      let stagedReceipt!: SendReceipt;
+      const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+        realClearTimeout(timer);
+        if (!hookRan && timer === oldTimer) {
+          hookRan = true;
+          h.wrapper.connect();
+          h.wrapper.loadHistory({ before: "discard-me" });
+          stagedReceipt = h.wrapper.send("/stop")!;
+          h.wrapper.loadCommands();
+          if (mode === "nested-close") {
+            h.wrapper.close();
+          } else {
+            oldSocket.onmessage?.({ data: "-ERR 'Authorization Violation'\r\n" });
+          }
+        }
+      });
+
+      try {
+        h.wrapper.close();
+        await settle();
+
+        expect(hookRan).toBe(true);
+        expect(oldHeld.snapshot()).toMatchObject({
+          state: "failed", failure: { reason: "closed", retryable: false },
+        });
+        expect(stagedReceipt.snapshot()).toMatchObject({
+          state: "failed",
+          failure: {
+            reason: mode === "nested-close" ? "closed" : "terminal",
+            retryable: false,
+          },
+        });
+        expect(FakeNatsWS.instances).toHaveLength(1);
+        expect(publishedInputs(oldSocket, h.K)).toEqual([]);
+        const internals = h.wrapper as unknown as {
+          deferredReplacementOperations: unknown[];
+          held: unknown[];
+          client: { outboundQueue: unknown[]; unackedLedger: Map<string, unknown> };
+        };
+        expect(internals.deferredReplacementOperations).toHaveLength(0);
+        expect(internals.held).toHaveLength(0);
+        expect(internals.client.outboundQueue).toHaveLength(0);
+        expect(internals.client.unackedLedger).toHaveLength(0);
+      } finally {
+        clearSpy.mockRestore();
+        h.wrapper.close();
+      }
+    });
+  }
+
+  it("lets close+connect own the final held entry during release timer cleanup", async () => {
+    const h = await connectWrapper();
+    deliverOut(h.K, {
+      type: "progress", id: "webchannel-d", text: "working", turnId: "T",
+    });
+    await settle();
+    const heldReceipt = h.wrapper.send("final-held-clear-close")!;
+    const oldTimer = (h.wrapper as unknown as {
+      heldStallTimer: ReturnType<typeof setTimeout> | null;
+    }).heldStallTimer;
+    expect(oldTimer).not.toBeNull();
+    const oldSocket = FakeNatsWS.instances.at(-1)!;
+
+    const realClearTimeout = globalThis.clearTimeout;
+    let hookRan = false;
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout").mockImplementation((timer) => {
+      realClearTimeout(timer);
+      if (!hookRan && timer === oldTimer) {
+        hookRan = true;
+        h.wrapper.close();
+        h.wrapper.connect();
+      }
+    });
+
+    try {
+      deliverOut(h.K, { type: "turn_settled", turnId: "T" });
+      await settle();
+
+      expect(hookRan).toBe(true);
+      expect(heldReceipt.snapshot()).toMatchObject({
+        state: "failed", failure: { reason: "closed", retryable: false },
+      });
+      expect(userBubble(h.wrapper, "final-held-clear-close")).toMatchObject({
+        pending: false,
+        sendState: "failed",
+        sendFailure: { reason: "closed", retryable: false },
+      });
+      expect(FakeNatsWS.instances).toHaveLength(2);
+      expect(publishedInputs(oldSocket, h.K)).toEqual([]);
+      expect(publishedInputs(FakeNatsWS.instances[1], h.K)).toEqual([]);
+      expect(coherence(h.wrapper)).toEqual({
+        wrapperClosed: false, lowLevelDisconnected: false, hasSocket: true,
+      });
+      const internals = h.wrapper as unknown as {
+        held: unknown[];
+        client: { outboundQueue: unknown[]; unackedLedger: Map<string, unknown> };
+      };
+      expect(internals.held).toHaveLength(0);
+      expect(internals.client.outboundQueue).toHaveLength(0);
+      expect(internals.client.unackedLedger).toHaveLength(0);
+    } finally {
+      clearSpy.mockRestore();
+      h.wrapper.close();
+    }
   });
 
   // R3-1(c): controls — the reorder must not change the non-re-entrant paths.

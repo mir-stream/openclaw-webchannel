@@ -33,6 +33,48 @@ function handlerBySocket(first: ServerHandler, later: ServerHandler): ServerHand
 }
 
 describe("P1-3 connection epoch guards", () => {
+  it("reset-session timer-clear reentry cannot register or notify from the abandoned flow", async () => {
+    let client: Awaited<ReturnType<typeof makeClient>>["client"] | undefined;
+    let invalidated = false;
+    const h = await makeClient({
+      retryClearTimeout: () => {
+        if (invalidated) return;
+        invalidated = true;
+        client!.disconnect();
+        client!.connect();
+      },
+    });
+    client = h.client;
+    const K = new Uint8Array(32).fill(6);
+    FakeNatsWS.sharedHandler = registerAgent(K, h.devicePublicRaw, h.identity);
+    const errors: Error[] = [];
+    let sessions = 0;
+    h.client.onError((error) => errors.push(error));
+    h.client.onSession(() => { sessions++; });
+    // Give the first onConnected/resetSession an owned handle whose injected
+    // clear hook synchronously replaces the raw connection generation.
+    (h.client as unknown as { liveRetryTimer: ReturnType<typeof setTimeout> | null })
+      .liveRetryTimer = 41 as unknown as ReturnType<typeof setTimeout>;
+
+    h.client.connect();
+    await settle(20);
+
+    expect(invalidated).toBe(true);
+    expect(FakeNatsWS.instances).toHaveLength(2);
+    expect(FakeNatsWS.instances[0]!.readyState).toBe(FakeNatsWS.CLOSED);
+    expect(FakeNatsWS.instances[0]!.published.some(
+      (entry) => entry.subject === registerSubject(TENANT, AGENT, PEER),
+    )).toBe(false);
+    // One genuine PoP flow is exactly challenge + register.
+    expect(FakeNatsWS.instances[1]!.published.filter(
+      (entry) => entry.subject === registerSubject(TENANT, AGENT, PEER),
+    )).toHaveLength(2);
+    expect(sessions).toBe(1);
+    expect(errors).toEqual([]);
+    expect((h.client as unknown as { sessionKey: Uint8Array | null }).sessionKey).toBeTruthy();
+    h.client.disconnect();
+  });
+
   it("disconnect during an in-flight register reply cannot install a key or flush", async () => {
     const h = await makeClient(); let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -149,33 +191,35 @@ describe("P1-3 connection epoch guards", () => {
     h.client.disconnect();
   });
 
-  it("a register-path terminal retires the instance; an error-listener connect() after the failed socket closed is refused (no replacement dial)", async () => {
+  it("raw false invalidates a delayed terminal register continuation without error/session revival", async () => {
     const h = await makeClient(); let releaseReply!: () => void;
     const gate = new Promise<void>((resolve) => { releaseReply = resolve; });
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     FakeNatsWS.sharedHandler = handlerBySocket(
       registerAgent(new Uint8Array(32), h.devicePublicRaw, h.identity, { omitWrappedKey: true, beforeReply: () => gate }),
       registerAgent(new Uint8Array(32).fill(8), h.devicePublicRaw, h.identity),
     );
-    let errors = 0;
-    h.client.onError(() => { errors++; h.client.connect(); });
+    let errors = 0, sessions = 0;
+    h.client.onError(() => { errors++; });
+    h.client.onSession(() => { sessions++; });
     h.client.connect(); await settle(5);
 
     // The first socket dies while its register continuation is still pending.
-    // Releasing the (terminal) reply fires the error listener, whose connect() is
-    // now REFUSED because the instance is terminally retired — under the old model
-    // this dialed a live replacement; under P0-4 no replacement is created.
+    // #81 advances the mid-level epoch on raw false before reset/callbacks, so
+    // even a terminal-shaped reply from that abandoned transport is stale.
     FakeNatsWS.instances[0]!.close();
+    // Stop the raw client's ordinary scheduled reconnect so this test isolates
+    // only the delayed continuation and never races a replacement dial.
+    h.client.disconnect();
     releaseReply(); await settle(8);
 
-    expect(errors).toBe(1);
+    expect(errors).toBe(0);
+    expect(sessions).toBe(0);
     expect(FakeNatsWS.instances).toHaveLength(1);
     expect(FakeNatsWS.instances[0]!.readyState).toBe(FakeNatsWS.CLOSED);
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("terminally retired"))).toBe(true);
-    // No replacement ever registered.
+    // No replacement registered and no stale continuation installed a key.
     const registered = FakeNatsWS.instances.filter((ws) => ws.published.some((p) => p.subject === registerSubject(TENANT, AGENT, PEER)));
     expect(registered).toHaveLength(1);
-    warn.mockRestore();
+    expect((h.client as unknown as { sessionKey: Uint8Array | null }).sessionKey).toBeNull();
     h.client.disconnect();
   });
 });
