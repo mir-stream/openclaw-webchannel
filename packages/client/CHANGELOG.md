@@ -48,6 +48,22 @@
 
 ### Added
 
+- **Next minor, non-breaking — reactive application-session liveness.** The
+  high-level `WebChannelNATSClientOptions` adds `ackStallTimeoutMs` (default
+  `30_000`; integer `0..2_147_483_647`; `0` disables both automatic lanes).
+  Published work with no owned authenticated ingress result and ordinary
+  follow-ups held with no authenticated live-turn activity each request at most
+  one existing soft reconnect per continuous stall episode. Both use the same
+  reconnect/register/key/replay/session path. Published work keeps its original
+  ID and remains `sent` while delivery is unknown; held work remains `queued`
+  without a wire ID and is never failed, retracted, stopped, or auto-released by
+  the detector. Long legitimately silent turns can cause one redundant reconnect,
+  so deployments may raise the timeout or disable it.
+- Public `connected: true` now means authenticated-session readiness after
+  registration, key installation, and ledger replay. A raw-open socket remains
+  `connecting/false` initially or `reconnecting/false` after a prior session;
+  this readiness correction is active even when `ackStallTimeoutMs` is `0`.
+
 - Agent account capacity replies (`capacity_exceeded`, code 507) now surface as
   terminal `WebChannelErrorCause: "capacity"` and do not enter a retry or
   re-authentication loop.

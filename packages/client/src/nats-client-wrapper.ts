@@ -113,6 +113,8 @@ export class WebChannelNATSClient {
    * `localId` is the id of its `pending: true` transcript bubble.
    */
   private readonly held: Array<{ localId: string; text: string; receiptKey: string }> = [];
+  /** Prevent reentrant sends from jumping ahead of a final entry being released. */
+  private heldReleaseCommitDepth = 0;
   /**
    * Explicit `/stop` is a small commit transaction. Ordinary sends created by
    * cancellation/finalization callbacks stay held until the outermost stop has
@@ -144,6 +146,19 @@ export class WebChannelNATSClient {
    * ledger replay (FIFO inversion). Cleared on every onState(false).
    */
   private sessionEstablished = false;
+  /** Distinguishes initial authentication from replacement-session readiness. */
+  private everSessionEstablished = false;
+  /** Invalidates ready-notification continuations after raw loss/close/error. */
+  private wrapperLifecycleGeneration = 0;
+  /** Wrapper-owned ordinary-follow-up application-stall episode. */
+  private heldStallSinceAt: number | null = null;
+  private heldStallRecoveryIssued = false;
+  private heldStallMutationEpoch = 0;
+  private heldStallTimer: ReturnType<typeof setTimeout> | null = null;
+  private heldStallTimerGeneration = 0;
+  /** Defers held-admission UI fanout until the first owner's timer commit ends. */
+  private heldAdmissionNotificationDepth = 0;
+  private heldAdmissionNotificationPending = false;
   /**
    * P0-4: true once a terminal failure has been observed (wrapper mirror of the
    * low-level `terminalReached`). PERMANENT — a terminal instance is retired
@@ -208,6 +223,15 @@ export class WebChannelNATSClient {
       // without this the public type advertises `connectTimeoutMs` but the low
       // level always runs its 10s default — 0 (disable) must survive too.
       connectTimeoutMs: options.connectTimeoutMs,
+      // #81 application-level policy remains owned and validated by the inner
+      // high-level client. Forward the caller's raw value unchanged.
+      ackStallTimeoutMs: options.ackStallTimeoutMs,
+      // Preserve the existing deterministic scheduler seams for wrapper-based
+      // tests and embedded runtimes; the held lane uses the global clock/timer.
+      _retryNow: options._retryNow,
+      _retryRandom: options._retryRandom,
+      _retrySetTimeout: options._retrySetTimeout,
+      _retryClearTimeout: options._retryClearTimeout,
     };
 
     this.client = new WebChannelNatsClient(this.natsOptions);
@@ -217,14 +241,13 @@ export class WebChannelNATSClient {
 
     // Wire up state listener.
     this.client.onState((connected: boolean) => {
-      if (!connected) {
-        // P1-9: the conversation key is gone on ANY disconnect — close the
-        // release gate and clear the connection-scoped staleness valve. Done
-        // BEFORE the terminal early-return below so neither depends on that
-        // branch; the valve re-arms fresh on the next onSession (§3.6.2).
-        this.sessionEstablished = false;
-        this.clearStaleDraftWatch();
-      }
+      const wasSessionEstablished = this.sessionEstablished;
+      this.wrapperLifecycleGeneration++;
+      // Raw transport is never public readiness. Invalidate the release gate
+      // before timer cleanup or any wrapper state callback.
+      this.sessionEstablished = false;
+      if (!connected || wasSessionEstablished) this.consumeHeldStallForRawLoss();
+      this.clearStaleDraftWatch();
       // P0-4: a CL2 terminal instance is PERMANENTLY retired — the onState handler
       // must not mutate status/error at all, on EITHER edge. This matters because
       // a registration-path terminal sets only the WCNC-level `terminalReached`
@@ -237,13 +260,10 @@ export class WebChannelNATSClient {
       // Recovery is a fresh client with fresh credentials, never this instance.
       if (this.terminal) return;
       this.setState({
-        status: connected ? "connected" : "reconnecting",
-        connected,
-        ...(connected ? { error: undefined, errorCause: undefined } : { isTyping: false }),
+        status: this.everSessionEstablished ? "reconnecting" : "connecting",
+        connected: false,
+        ...(!connected ? { isTyping: false } : {}),
       });
-      // P1-9: a connection flip is a state transition — re-evaluate the release
-      // gate (a no-op unless the key is up and nothing is in flight).
-      this.maybeRelease();
     });
 
     // P1-9 §3.2/§3.6.2: session KEY established (both register-unwrap and legacy
@@ -254,9 +274,33 @@ export class WebChannelNATSClient {
       // release gate, arm the staleness valve, or release, even if a stray
       // onSession somehow fired. The mid-level `onConnected` terminal guard is the
       // root fix; this makes the wrapper safe regardless.
-      if (this.terminal) return;
+      if (this.terminal || this.closed) return;
+      const lifecycle = this.wrapperLifecycleGeneration;
       this.sessionEstablished = true;
+      this.everSessionEstablished = true;
+      this.setState({
+        status: "connected",
+        connected: true,
+        error: undefined,
+        errorCause: undefined,
+      });
+      // A public ready-state listener may synchronously close or retire this
+      // lifecycle. It wins over every trailing stale-watch/release action.
+      if (
+        this.wrapperLifecycleGeneration !== lifecycle
+        || !this.sessionEstablished || this.terminal || this.closed
+        || !this.state.connected
+      ) {
+        return;
+      }
       this.armStaleDraftWatch();
+      if (
+        this.wrapperLifecycleGeneration !== lifecycle
+        || !this.sessionEstablished || this.terminal || this.closed
+        || !this.state.connected
+      ) {
+        return;
+      }
       this.maybeRelease();
     });
 
@@ -287,6 +331,7 @@ export class WebChannelNATSClient {
       // receipt subscriber during the sweep does NOT hold (shouldHold is gated on
       // this) — it publishes and resolves immediately to failed{terminal}.
       this.terminal = true;
+      this.wrapperLifecycleGeneration++;
       // P0-4 (D5 held/terminal): the queued/ledgered sends were already swept to
       // failed{terminal} by the low-level terminal sequence BEFORE this listener
       // ran; fail the wrapper-owned held[] here (they have no wireId, so the sweep
@@ -361,6 +406,7 @@ export class WebChannelNATSClient {
     // resolve to failed{closed} via the low-level `disconnected` gate, never land
     // in `held[]` whose only drain (onSession) this instance will never fire.
     this.closed = true;
+    this.wrapperLifecycleGeneration++;
     // Detach only this lifecycle's held ownership before the low-level close can
     // notify state listeners. A listener may synchronously connect() and send a
     // fresh held message; the old close must not sweep that replacement entry.
@@ -431,7 +477,8 @@ export class WebChannelNATSClient {
     if (this.shouldHold()) {
       const receiptKey = this.newReceiptKey();
       const localId = `u-${this.uid()}`;
-      this.held.push({ localId, text: trimmed, receiptKey });
+      const heldEntry = { localId, text: trimmed, receiptKey };
+      this.held.push(heldEntry);
       // P0-4: a held send has a receipt (queued) but NO wireId yet — the wireId
       // is minted at release (2-phase). The receiptKey is the stable handle.
       this.receipts.set(receiptKey, {
@@ -441,9 +488,27 @@ export class WebChannelNATSClient {
         pendingTransitions: [],
         drainingTransitions: false,
       });
-      this.appendMessage({
-        id: localId, role: "user", text: trimmed, pending: true, receiptKey, sendState: "queued",
-      });
+      // Install A's bubble silently before the timer callout, then expose the
+      // entire nested admission transaction only after the outer timer/episode
+      // commit finishes. A synchronous setTimeout hook that sends B therefore
+      // preserves both UI and ownership order A,B and cannot expose a timerless
+      // intermediate state.
+      this.heldAdmissionNotificationDepth++;
+      try {
+        this.appendMessage({
+          id: localId, role: "user", text: trimmed, pending: true, receiptKey, sendState: "queued",
+        });
+        this.ensureHeldStallEpisode();
+      } finally {
+        this.heldAdmissionNotificationDepth--;
+        if (
+          this.heldAdmissionNotificationDepth === 0
+          && this.heldAdmissionNotificationPending
+        ) {
+          this.heldAdmissionNotificationPending = false;
+          this.notifyStateListeners();
+        }
+      }
       return this.makeReceipt(receiptKey);
     }
 
@@ -461,7 +526,10 @@ export class WebChannelNATSClient {
     const msg = this.state.messages.find((m) => m.id === id);
     if (!msg || (msg.pending !== true && msg.retracted !== true)) return false;
     const hi = this.held.findIndex((h) => h.localId === id);
-    if (hi !== -1) this.held.splice(hi, 1);
+    if (hi !== -1) {
+      this.held.splice(hi, 1);
+      if (this.held.length === 0) this.endHeldStallEpisode();
+    }
     this.setState({ messages: this.state.messages.filter((m) => m.id !== id) });
     // P0-4 (R3-4): a cancel is still a terminal RECEIPT outcome even though the
     // render bubble is gone. The receipt record outlives the bubble, so
@@ -529,6 +597,7 @@ export class WebChannelNATSClient {
     // Ordinary callback-created sends cannot publish during an explicit-stop
     // transaction. They release only after the outer stop owns its queue slot.
     if (this.stopCommitDepth > 0) return true;
+    if (this.heldReleaseCommitDepth > 0) return true;
     return this.turnInFlight() || this.held.length > 0;
   }
 
@@ -564,6 +633,7 @@ export class WebChannelNATSClient {
   private maybeRelease(): void {
     if (
       this.stopCommitDepth > 0 ||
+      this.heldReleaseCommitDepth > 0 ||
       this.held.length === 0 ||
       this.turnInFlight() ||
       !this.state.connected ||
@@ -571,28 +641,36 @@ export class WebChannelNATSClient {
     ) {
       return;
     }
-    while (this.held.length > 0) {
-      const { localId, text, receiptKey } = this.held.shift()!;
-      // P0-4 commit order: reserve the wireId, register the alias, stage the bubble
-      // at the tail, THEN let the low level own/publish A before exposing that move.
-      const wireId = this.client.reserveWireId();
-      this.wireIdToReceiptKey.set(wireId, receiptKey);
-      const receipt = this.receipts.get(receiptKey);
-      if (receipt) receipt.wireId = wireId;
-      const bubble = this.state.messages.find((m) => m.id === localId);
-      // A re-entrant listener may have already removed the bubble; the text is
-      // still published (correct — release is a commit), so just skip the patch.
-      if (bubble) {
-        const messages = this.state.messages.filter((m) => m.id !== localId);
-        messages.push({ ...bubble, pending: false, wireId, turnId: wireId });
-        this.stageReceiptStateThenCommit(
-          receiptKey,
-          { messages },
-          () => { this.client.sendUserMessage(text, wireId); },
-        );
-      } else {
-        this.client.sendUserMessage(text, wireId);
+    this.heldReleaseCommitDepth++;
+    try {
+      while (this.held.length > 0) {
+        const { localId, text, receiptKey } = this.held.shift()!;
+        // The final owner ends the timer before reserve/publish/state callbacks.
+        // heldReleaseCommitDepth keeps clear-hook reentrant sends behind this item.
+        if (this.held.length === 0) this.endHeldStallEpisode();
+        // P0-4 commit order: reserve the wireId, register the alias, stage the bubble
+        // at the tail, THEN let the low level own/publish A before exposing that move.
+        const wireId = this.client.reserveWireId();
+        this.wireIdToReceiptKey.set(wireId, receiptKey);
+        const receipt = this.receipts.get(receiptKey);
+        if (receipt) receipt.wireId = wireId;
+        const bubble = this.state.messages.find((m) => m.id === localId);
+        // A re-entrant listener may have already removed the bubble; the text is
+        // still published (correct — release is a commit), so just skip the patch.
+        if (bubble) {
+          const messages = this.state.messages.filter((m) => m.id !== localId);
+          messages.push({ ...bubble, pending: false, wireId, turnId: wireId });
+          this.stageReceiptStateThenCommit(
+            receiptKey,
+            { messages },
+            () => { this.client.sendUserMessage(text, wireId); },
+          );
+        } else {
+          this.client.sendUserMessage(text, wireId);
+        }
       }
+    } finally {
+      this.heldReleaseCommitDepth--;
     }
   }
 
@@ -606,6 +684,7 @@ export class WebChannelNATSClient {
   private markHeldRetracted(): void {
     if (this.held.length === 0) return;
     const entries = this.held.splice(0);
+    this.endHeldStallEpisode();
     // P0-4: /stop is a user-intentional cancel — each held receipt ends at
     // failed{cancelled,retryable:false}, and its bubble flips to the retracted
     // marker (text preserved, restorable). receiptTransition patches the bubble
@@ -631,7 +710,11 @@ export class WebChannelNATSClient {
   }
 
   private takeHeld(): Array<{ localId: string; text: string; receiptKey: string }> {
-    return this.held.splice(0);
+    const entries = this.held.splice(0);
+    if (entries.length > 0) {
+      this.endHeldStallEpisode();
+    }
+    return entries;
   }
 
   /** Fail a detached ownership snapshot without consuming replacement holds. */
@@ -642,6 +725,171 @@ export class WebChannelNATSClient {
     for (const e of entries) {
       this.receiptTransition(e.receiptKey, "failed", failure, { pending: false });
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // #81 — wrapper-owned held-work application liveness
+  // ---------------------------------------------------------------------------
+
+  private heldSessionReady(): boolean {
+    return this.sessionEstablished
+      && this.state.connected
+      && !this.closed
+      && !this.terminal;
+  }
+
+  /** Start only the first owner's episode; later held sends preserve its age. */
+  private ensureHeldStallEpisode(): void {
+    if (
+      this.client.getAckStallTimeoutMs() === 0
+      || this.held.length === 0
+      || this.heldStallSinceAt !== null
+      || this.heldStallRecoveryIssued
+    ) {
+      return;
+    }
+    this.beginHeldStallEpisode(this.heldSessionReady());
+  }
+
+  /**
+   * Replace the held interval after authenticated live-turn activity, or record
+   * a non-ready hold as already covered by the connection recovery in progress.
+   */
+  private beginHeldStallEpisode(ready: boolean): void {
+    if (this.client.getAckStallTimeoutMs() === 0 || this.held.length === 0) return;
+    const lifecycleGeneration = this.wrapperLifecycleGeneration;
+    const mutationEpoch = ++this.heldStallMutationEpoch;
+    this.heldStallSinceAt = null;
+    this.heldStallRecoveryIssued = !ready;
+    const cancellationToken = this.cancelHeldStallTimer();
+    if (
+      this.heldStallMutationEpoch !== mutationEpoch
+      || this.heldStallTimerGeneration !== cancellationToken
+      || this.heldStallTimer !== null
+      || this.wrapperLifecycleGeneration !== lifecycleGeneration
+      || this.held.length === 0
+    ) {
+      return;
+    }
+    if (!ready || !this.heldSessionReady()) return;
+
+    const startedAt = Date.now();
+    if (
+      this.heldStallMutationEpoch !== mutationEpoch
+      || this.heldStallTimerGeneration !== cancellationToken
+      || this.heldStallTimer !== null
+      || this.wrapperLifecycleGeneration !== lifecycleGeneration
+      || this.held.length === 0 || !this.heldSessionReady()
+    ) {
+      return;
+    }
+    this.heldStallSinceAt = startedAt;
+    this.heldStallRecoveryIssued = false;
+    this.armHeldStallTimer();
+  }
+
+  /** Null ownership before clearTimeout so reentrant scheduling always wins. */
+  private cancelHeldStallTimer(): number {
+    const token = ++this.heldStallTimerGeneration;
+    const timer = this.heldStallTimer;
+    this.heldStallTimer = null;
+    if (timer !== null) clearTimeout(timer);
+    return token;
+  }
+
+  private armHeldStallTimer(): void {
+    const timeoutMs = this.client.getAckStallTimeoutMs();
+    const cancellationToken = this.cancelHeldStallTimer();
+    if (
+      timeoutMs === 0
+      || this.heldStallTimerGeneration !== cancellationToken
+      || this.heldStallTimer !== null
+      || this.held.length === 0
+      || this.heldStallSinceAt === null
+      || this.heldStallRecoveryIssued
+      || !this.heldSessionReady()
+    ) {
+      return;
+    }
+    const mutationEpoch = this.heldStallMutationEpoch;
+    const lifecycleGeneration = this.wrapperLifecycleGeneration;
+    const sinceAt = this.heldStallSinceAt;
+    const now = Date.now();
+    if (
+      this.heldStallMutationEpoch !== mutationEpoch
+      || this.heldStallTimerGeneration !== cancellationToken
+      || this.heldStallTimer !== null
+      || this.wrapperLifecycleGeneration !== lifecycleGeneration
+      || this.held.length === 0 || this.heldStallSinceAt !== sinceAt
+      || this.heldStallRecoveryIssued || !this.heldSessionReady()
+    ) {
+      return;
+    }
+    const delay = Math.max(0, timeoutMs - Math.max(0, now - sinceAt));
+    const generation = ++this.heldStallTimerGeneration;
+    const timer = setTimeout(() => {
+      if (
+        this.heldStallTimerGeneration !== generation
+        || this.heldStallMutationEpoch !== mutationEpoch
+        || this.wrapperLifecycleGeneration !== lifecycleGeneration
+        || this.held.length === 0 || this.heldStallSinceAt !== sinceAt
+        || this.heldStallRecoveryIssued || !this.heldSessionReady()
+      ) {
+        return;
+      }
+      this.heldStallTimer = null;
+      this.heldStallTimerGeneration++;
+      this.heldStallMutationEpoch++;
+      this.heldStallRecoveryIssued = true;
+      this.client.requestApplicationRecovery();
+    }, delay);
+    if (
+      this.heldStallTimerGeneration !== generation
+      || this.heldStallMutationEpoch !== mutationEpoch
+      || this.heldStallTimer !== null
+      || this.wrapperLifecycleGeneration !== lifecycleGeneration
+      || this.held.length === 0 || this.heldStallSinceAt !== sinceAt
+      || this.heldStallRecoveryIssued || !this.heldSessionReady()
+    ) {
+      clearTimeout(timer);
+      return;
+    }
+    this.heldStallTimer = timer;
+    const unrefTimer = timer as ReturnType<typeof setTimeout> & { unref?: () => void };
+    unrefTimer.unref?.();
+  }
+
+  /** Raw replacement consumes the current allowance and owns all scheduling. */
+  private consumeHeldStallForRawLoss(): void {
+    if (this.client.getAckStallTimeoutMs() === 0 || this.held.length === 0) return;
+    this.heldStallMutationEpoch++;
+    this.heldStallRecoveryIssued = true;
+    this.cancelHeldStallTimer();
+  }
+
+  /** Final-owner removal retires state before any receipt/state/client callback. */
+  private endHeldStallEpisode(): void {
+    this.heldStallMutationEpoch++;
+    this.heldStallSinceAt = null;
+    this.heldStallRecoveryIssued = false;
+    this.cancelHeldStallTimer();
+  }
+
+  private observeHeldTurnActivity(msg: InboundMessage, preFrameLiveTurn: boolean): void {
+    if (
+      !preFrameLiveTurn
+      || this.held.length === 0
+      || !this.heldSessionReady()
+      || (
+        msg.type !== "typing"
+        && msg.type !== "progress"
+        && msg.type !== "reasoning"
+        && msg.type !== "agent_message"
+      )
+    ) {
+      return;
+    }
+    this.beginHeldStallEpisode(true);
   }
 
   // ---------------------------------------------------------------------------
@@ -797,6 +1045,10 @@ export class WebChannelNATSClient {
   }
 
   private notifyStateListeners(): void {
+    if (this.heldAdmissionNotificationDepth > 0) {
+      this.heldAdmissionNotificationPending = true;
+      return;
+    }
     this.stateNotificationSeq++;
     for (const listener of this.listeners) {
       try {
@@ -1016,6 +1268,11 @@ export class WebChannelNATSClient {
   // ---------------------------------------------------------------------------
 
   private handleMessage(msg: InboundMessage): void {
+    // Observe authenticated turn activity against the pre-frame live-turn latch.
+    // Reducers may settle that latch or invoke public listeners, so this must be
+    // the first operation for every decrypted frame.
+    const preFrameLiveTurn = this.turnInFlight();
+    this.observeHeldTurnActivity(msg, preFrameLiveTurn);
     this.handleFrame(msg);
     // P1-9 §3.2: every handled frame is a state transition — re-evaluate the
     // release gate after the reducer settles (a no-op when nothing is held or a

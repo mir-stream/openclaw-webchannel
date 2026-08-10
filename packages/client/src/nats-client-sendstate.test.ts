@@ -54,7 +54,14 @@ async function setup(
   },
 ) {
   const K = new Uint8Array(32).fill(31);
-  const h = await makeClient({ reconnect: true, retryRandom: () => 0.5, ...retryHooks });
+  const h = await makeClient({
+    reconnect: true,
+    retryRandom: () => 0.5,
+    // These legacy send-state tests pin the exact retry cadence independently
+    // from #81's application-stall policy.
+    ackStallTimeoutMs: 0,
+    ...retryHooks,
+  });
   const events: Ev[] = [];
   h.client.onSendState((id, state, failure) => events.push({ id, state, failure }));
   const registration = registerAgent(K, h.devicePublicRaw, h.identity);

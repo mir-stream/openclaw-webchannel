@@ -21,6 +21,7 @@ import {
 } from "./index.js";
 import * as publicApi from "./index.js";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
+import type { NatsClientOptions } from "./nats-client.js";
 
 // P1-7: compile-time export assertion for the new type. A type-only export has no
 // runtime value, so there is nothing to `expect` at runtime — this TYPE-POSITION
@@ -92,9 +93,25 @@ describe("public export surface (package entry)", () => {
       reconnectBaseMs: 250,
       reconnectCapMs: 5_000,
       heartbeatIntervalMs: 20_000,
+      ackStallTimeoutMs: 30_000,
       registration,
     };
     expect(options.natsUrl).toContain("relay");
+    expect(options.ackStallTimeoutMs).toBe(30_000);
+  });
+
+  it("keeps application recovery policy off raw options and inner internals off the barrel", () => {
+    const raw: NatsClientOptions = {
+      url: "wss://relay.example.test",
+      accountId: "account",
+      tenant: "tenant",
+      peerId: "peer",
+      // @ts-expect-error application-session policy belongs only to the high-level client
+      ackStallTimeoutMs: 1_000,
+    };
+    expect(raw.url).toContain("relay");
+    expect("WebChannelNatsClient" in publicApi).toBe(false);
+    expect("getAckStallTimeoutMs" in publicApi).toBe(false);
   });
   it("re-exports parseBootstrapResponse and it validates a well-formed payload", () => {
     const keys: PinnedKeys = parseBootstrapResponse(validPayload());

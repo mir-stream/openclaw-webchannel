@@ -173,6 +173,7 @@ export async function makeClient(options?: {
   retryNow?: () => number;
   retrySetTimeout?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
   retryClearTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
+  ackStallTimeoutMs?: number;
 }): Promise<{client:WebChannelNatsClient; devicePublicRaw:Uint8Array; identity:AgentIdentity}> {
   const identity=options?.identity ?? makeAgentIdentity();
   const pop=await generateDevicePopKeyPair();
@@ -188,6 +189,9 @@ export async function makeClient(options?: {
     ...(options?.retryNow ? {_retryNow: options.retryNow} : {}),
     ...(options?.retrySetTimeout ? {_retrySetTimeout: options.retrySetTimeout} : {}),
     ...(options?.retryClearTimeout ? {_retryClearTimeout: options.retryClearTimeout} : {}),
+    ...(options?.ackStallTimeoutMs !== undefined
+      ? {ackStallTimeoutMs: options.ackStallTimeoutMs}
+      : {}),
   });
   return {client,devicePublicRaw:x.publicRaw,identity};
 }

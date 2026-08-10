@@ -197,7 +197,8 @@ describe("WebChannelNATSClient — CL2 terminal error status", () => {
     });
     wrapper.connect();
     await flush();
-    expect(wrapper.getState().status).toBe("connected");
+    expect(FakeWS.instances[0]?.readyState).toBe(FakeWS.OPEN);
+    expect(wrapper.getState()).toMatchObject({ status: "connecting", connected: false });
 
     FakeWS.instances[0].serverEmit("-ERR 'Authorization Violation'\r\n");
     await flush();
@@ -1369,6 +1370,9 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       tenant: "t",
       peerId: "p",
       heartbeatIntervalMs: 0,
+      // Legacy pending/stale-draft tests isolate the existing FIFO machinery;
+      // #81's held watchdog has its own focused deterministic suite.
+      ackStallTimeoutMs: 0,
       registration,
     });
   }
@@ -1614,9 +1618,9 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "p", cn),
       gate,
     );
-    await waitFor(() => w.getState().connected);
+    await waitFor(() => lowLevel(w).connected);
     await tick(); // let the (gated) register round-trip reach its held reply
-    expect(w.getState().connected).toBe(true);
+    expect(w.getState()).toMatchObject({ status: "connecting", connected: false });
     expect(keyState(w).sessionKey).toBeFalsy(); // connected but keyless → still held
     expect(spy).not.toHaveBeenCalled();
     expect(heldTexts(w)).toEqual(["M"]);
@@ -1624,6 +1628,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     // Key arrives → onSession fires (after flushQueue) → release.
     releaseRegister();
     await establishKey(w);
+    expect(w.getState()).toMatchObject({ status: "connected", connected: true });
     expect(spy).toHaveBeenCalledWith("M", expect.any(String));
     w.close();
   });
