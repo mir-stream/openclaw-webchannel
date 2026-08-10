@@ -247,3 +247,85 @@ describe("index-nats.ts account lifecycle ownership", () => {
     );
   });
 });
+
+describe("nats-account-runtime.ts wiring contract — #99 inbound frame normalization", () => {
+  /**
+   * Layer (a) of #99. `coalescedIds` is plugin-internal state meaning "these
+   * receipts settle with this turn", and the decode path is a cast, not a
+   * validation (`JSON.parse(...) as InboundWsMessage` in nats-channel.ts, whose
+   * `user_message` case forwards the object with no field checks). So the ONLY
+   * thing standing between a peer-supplied member list and the turn handler is
+   * this normalization — and its position: it must run before the control lane,
+   * before the ack, and before the debouncer.
+   *
+   * The handler body itself is untestable routing (it is closed over inside
+   * `buildNatsAccount`); the normalization is a tested pure function
+   * (`inbound-queue.test.ts`). This guard pins the wiring that connects them.
+   */
+  const HANDLER_START = RUNTIME_SOURCE.indexOf("channel.setMessageHandler((peerId, rawMessage)");
+  const NORMALIZE_STATEMENT =
+    "const message: WebchannelUserMessage = normalizeInboundUserMessage(rawMessage);";
+  const NORMALIZE = RUNTIME_SOURCE.indexOf(NORMALIZE_STATEMENT);
+
+  it("normalizes the raw frame through the tested helper", () => {
+    expect(HANDLER_START).toBeGreaterThan(-1);
+    expect(NORMALIZE).toBeGreaterThan(HANDLER_START);
+  });
+
+  it("normalizes BEFORE the control lane, the ack and the debouncer see the frame", () => {
+    // Guard first: a missing statement makes `indexOf` -1, which is "before"
+    // everything and would let this ordering check pass vacuously.
+    expect(NORMALIZE).toBeGreaterThan(HANDLER_START);
+    expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("isControlLaneMessage(message)"));
+    expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf("channel.sendAck(peerId, [message.id])"));
+    expect(NORMALIZE).toBeLessThan(RUNTIME_SOURCE.indexOf(".enqueue({ peerId, message })"));
+  });
+
+  it("lets NOTHING downstream reach the raw frame", () => {
+    // Everything after the normalization, up to the next wiring block, must
+    // speak only of `message`. A single surviving `rawMessage` read would hand
+    // peer-supplied fields back to the pipeline.
+    const downstream = RUNTIME_SOURCE.slice(
+      NORMALIZE + NORMALIZE_STATEMENT.length,
+      RUNTIME_SOURCE.indexOf("channel.setApprovalDecisionHandler("),
+    );
+    expect(downstream).not.toContain("rawMessage");
+  });
+
+  it("lets NOTHING before the strip read the raw frame either", () => {
+    // The ordering assertions above catch a REPLACED normalization, but not an
+    // ADDED early read: an `isControlLaneMessage(rawMessage)` or a
+    // `sendAck(peerId, [rawMessage.id])` inserted ABOVE the strip leaves every
+    // pinned literal intact and every other assertion green, while handing a
+    // peer-supplied field straight to the control lane.
+    //
+    // So pin the pre-strip region exactly. `rawMessage` may appear there TWICE
+    // and only twice: the destructured handler parameter, and the
+    // `rawMessage.type !== "user_message"` early return (which reads the one
+    // field the router must know before it can normalize). A third occurrence
+    // is a new pre-strip read and has to be justified deliberately here.
+    const preStrip = RUNTIME_SOURCE.slice(HANDLER_START, NORMALIZE);
+    expect(preStrip.match(/rawMessage/g)).toHaveLength(2);
+    expect(preStrip).toContain("channel.setMessageHandler((peerId, rawMessage)");
+    expect(preStrip).toContain('if (rawMessage.type !== "user_message") return;');
+  });
+
+  it("#99 cap premise: the process retention budget keeps the DEFAULT limits", () => {
+    // Both #99 caps (`readCoalescedMemberIds` and `coalesceUserMessages`'s
+    // `addId`, inbound-queue.ts) bound a member list at
+    // `DEFAULT_BUSY_TURN_LIMITS.maxMessagesPerSession`. That is safe ONLY
+    // because the one production budget is argument-less, so a real coalesced
+    // group can never exceed it and the cap can only ever bind on a hostile
+    // list.
+    //
+    // Raising it here — `new InboundRetentionBudget({ maxMessagesPerSession: 64
+    // })` for throughput — would silently truncate members 33-64 of a real
+    // burst: ACKed, at `accepted`, never settled. That is #99 verbatim, so the
+    // premise is pinned at the line someone would change. If the budget is
+    // raised deliberately, the two caps must move with it.
+    expect(RUNTIME_SOURCE).toContain("new InboundRetentionBudget()");
+    expect(RUNTIME_SOURCE.match(/new InboundRetentionBudget\(/g)).toHaveLength(1);
+    // Belt and braces: no argument-ful construction anywhere in the runtime.
+    expect(RUNTIME_SOURCE).not.toMatch(/new InboundRetentionBudget\((?!\))/);
+  });
+});

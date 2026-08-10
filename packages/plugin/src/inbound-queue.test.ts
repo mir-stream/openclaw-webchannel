@@ -3,9 +3,13 @@ import { describe, it, expect } from "vitest";
 import {
   createSerializedInboundDispatcher,
   coalesceUserMessages,
+  normalizeInboundUserMessage,
+  readCoalescedMemberIds,
+  MAX_COALESCED_MEMBER_ID_LENGTH,
+  type CoalescedMemberIds,
   type UserMessageLike,
 } from "./inbound-queue.js";
-import { InboundRetentionBudget } from "./inbound-retention.js";
+import { DEFAULT_BUSY_TURN_LIMITS, InboundRetentionBudget } from "./inbound-retention.js";
 
 /**
  * A manually-resolvable promise, so a test can hold a turn "in flight" and
@@ -211,6 +215,9 @@ describe("createSerializedInboundDispatcher", () => {
 
 const um = (text: string): UserMessageLike => ({ type: "user_message", text });
 
+/** The dispatcher-boundary shape (#99): a wire user message plus the internal ids. */
+type Coalescable = UserMessageLike & CoalescedMemberIds;
+
 describe("coalesceUserMessages", () => {
   it("returns a single message unchanged (identity — no-burst pass-through)", () => {
     const m = um("solo");
@@ -244,7 +251,235 @@ describe("coalesceUserMessages", () => {
       { type: "user_message", text: "b", id: "id-2" },
       { type: "user_message", text: "c", id: "id-3" },
     ]);
-    expect(merged).toEqual({ type: "user_message", text: "a\n\nb\n\nc", id: "id-3" });
+    expect(merged).toEqual({
+      type: "user_message",
+      text: "a\n\nb\n\nc",
+      id: "id-3",
+      // #99: the anchor is also the last member of the group (see below).
+      coalescedIds: ["id-1", "id-2", "id-3"],
+    });
+  });
+
+  /**
+   * #99 — the merge must not lose the non-anchor wireIds.
+   *
+   * Each buffered message was ACKed and holds its own P0-4 send receipt, which
+   * only a `turn_settled` naming that exact id can move off `accepted`. The
+   * merge is where the other ids used to disappear, so `inbound.ts` had nothing
+   * to settle them with.
+   */
+  describe("#99 coalesced member ids", () => {
+    it("carries EVERY member id in arrival order, anchor last", () => {
+      const merged = coalesceUserMessages<Coalescable>([
+        { type: "user_message", text: "a", id: "id-1" },
+        { type: "user_message", text: "b", id: "id-2" },
+        { type: "user_message", text: "c", id: "id-3" },
+      ]);
+      expect(merged.coalescedIds).toEqual(["id-1", "id-2", "id-3"]);
+      // The anchor is the last member, so the settle path can emit it last
+      // without reordering anything.
+      expect(merged.coalescedIds?.at(-1)).toBe(merged.id);
+    });
+
+    it("leaves a single message with NO member list (identity, byte-identical)", () => {
+      const solo: Coalescable = { type: "user_message", text: "solo", id: "id-1" };
+      const merged = coalesceUserMessages<Coalescable>([solo]);
+      expect(merged).toBe(solo);
+      expect(merged).not.toHaveProperty("coalescedIds");
+    });
+
+    it("contributes nothing for messages that carry no id", () => {
+      const merged = coalesceUserMessages<Coalescable>([
+        { type: "user_message", text: "a" },
+        { type: "user_message", text: "b", id: "id-2" },
+        { type: "user_message", text: "c" },
+      ]);
+      // Only the one real id; an id-less message has no receipt to settle.
+      expect(merged.coalescedIds).toEqual(["id-2"]);
+    });
+
+    it("omits the field entirely when NO member carries an id", () => {
+      const merged = coalesceUserMessages<Coalescable>([um("a"), um("b")]);
+      expect(merged).not.toHaveProperty("coalescedIds");
+    });
+
+    it("unions pre-existing member ids instead of dropping them (associative)", () => {
+      // Not reachable today — coalesce runs once, over raw pending entries — but
+      // folding a merged message into a later merge must not strand the members
+      // it already speaks for.
+      const merged = coalesceUserMessages<Coalescable>([
+        { type: "user_message", text: "ab", id: "id-2", coalescedIds: ["id-1", "id-2"] },
+        { type: "user_message", text: "c", id: "id-3" },
+      ]);
+      expect(merged.coalescedIds).toEqual(["id-1", "id-2", "id-3"]);
+      expect(merged.id).toBe("id-3");
+    });
+
+    it("dedupes a repeated id (each receipt is settled exactly once)", () => {
+      const merged = coalesceUserMessages<Coalescable>([
+        { type: "user_message", text: "a", id: "dup" },
+        { type: "user_message", text: "b", id: "dup" },
+      ]);
+      expect(merged.coalescedIds).toEqual(["dup"]);
+    });
+
+    it("does NOT carry an empty list in from an input (field present only for a real group)", () => {
+      const merged = coalesceUserMessages<Coalescable>([
+        { type: "user_message", text: "a", coalescedIds: [] },
+        { type: "user_message", text: "b" },
+      ]);
+      expect(merged).not.toHaveProperty("coalescedIds");
+    });
+
+    it("drops an over-long member id and caps the merged list at the session bound", () => {
+      const cap = DEFAULT_BUSY_TURN_LIMITS.maxMessagesPerSession;
+      const merged = coalesceUserMessages<Coalescable>([
+        {
+          type: "user_message",
+          text: "a",
+          id: "id-1",
+          coalescedIds: [
+            "x".repeat(MAX_COALESCED_MEMBER_ID_LENGTH + 1),
+            ...Array.from({ length: cap * 4 }, (_, i) => `flood-${i}`),
+          ],
+        },
+        { type: "user_message", text: "b", id: "id-2" },
+      ]);
+      expect(merged.coalescedIds).toHaveLength(cap);
+      expect(merged.coalescedIds).not.toContain("x".repeat(MAX_COALESCED_MEMBER_ID_LENGTH + 1));
+      expect(merged.coalescedIds?.[0]).toBe("flood-0");
+    });
+
+    /**
+     * Hostile shapes. `coalescedIds` used to be reachable from the wire (the
+     * decode path casts instead of validating), and a throw here is NOT a safe
+     * failure: `startTurn` catches it with `maybeForget(); return;`, so the
+     * whole turn is discarded — ACKed, never run, never answered, never settled.
+     * Strictly worse than the bug #99 fixes.
+     */
+    describe("#99 hostile `coalescedIds` shapes never throw", () => {
+      const hostile: Array<[string, unknown]> = [
+        ["a number", 5],
+        ["a string (would iterate as characters)", "abc"],
+        ["null", null],
+        ["an object", { length: 2 }],
+        ["non-string members", [{}, 7, null]],
+        ["empty-string members", ["", ""]],
+      ];
+
+      for (const [label, value] of hostile) {
+        it(`merges a burst carrying ${label} without throwing, keeping only real ids`, () => {
+          const merge = () =>
+            coalesceUserMessages<Coalescable>([
+              { type: "user_message", text: "a", id: "id-1", coalescedIds: value as never },
+              { type: "user_message", text: "b", id: "id-2" },
+            ]);
+          expect(merge).not.toThrow();
+          const merged = merge();
+          // The turn still runs and still knows its real members.
+          expect(merged.text).toBe("a\n\nb");
+          expect(merged.id).toBe("id-2");
+          expect(merged.coalescedIds).toEqual(["id-1", "id-2"]);
+        });
+      }
+    });
+  });
+});
+
+/**
+ * #99 layer (b): both read sites treat `coalescedIds` as untrusted, so a path
+ * that forgets to strip it degrades to "only the anchor settles" instead of a
+ * thrown (and therefore silently discarded) turn.
+ */
+describe("readCoalescedMemberIds", () => {
+  it("returns the ids of a well-formed list unchanged", () => {
+    expect(readCoalescedMemberIds({ coalescedIds: ["a", "b"] })).toEqual(["a", "b"]);
+  });
+
+  it("is inert for an absent field or a non-object source", () => {
+    expect(readCoalescedMemberIds({ type: "user_message", text: "hi" })).toEqual([]);
+    expect(readCoalescedMemberIds(undefined)).toEqual([]);
+    expect(readCoalescedMemberIds(null)).toEqual([]);
+  });
+
+  it("is inert (never throws) for every non-array shape", () => {
+    for (const value of [5, "abc", true, {}, { length: 3 }, null]) {
+      expect(readCoalescedMemberIds({ coalescedIds: value })).toEqual([]);
+    }
+  });
+
+  it("drops members that are not plausible wire ids", () => {
+    expect(
+      readCoalescedMemberIds({
+        coalescedIds: [{}, 7, null, "", "ok", "x".repeat(MAX_COALESCED_MEMBER_ID_LENGTH + 1)],
+      }),
+    ).toEqual(["ok"]);
+    // The boundary length itself is admitted.
+    const atLimit = "x".repeat(MAX_COALESCED_MEMBER_ID_LENGTH);
+    expect(readCoalescedMemberIds({ coalescedIds: [atLimit] })).toEqual([atLimit]);
+  });
+
+  it("caps the list at the same per-session bound the merge itself obeys", () => {
+    const cap = DEFAULT_BUSY_TURN_LIMITS.maxMessagesPerSession;
+    const flood = Array.from({ length: cap * 100 }, (_, i) => `id-${i}`);
+    const read = readCoalescedMemberIds({ coalescedIds: flood });
+    // Unbounded here would mean that many seal+publish calls (and warn lines)
+    // synchronously in the turn's `finally`.
+    expect(read).toHaveLength(cap);
+    expect(read[0]).toBe("id-0");
+  });
+});
+
+/**
+ * #99 layer (a): the field is stripped where the wire frame enters, so
+ * `coalesceUserMessages` is its only producer. Wired at the runtime's message
+ * handler (pinned by `index-nats-wiring.test.ts`).
+ */
+describe("normalizeInboundUserMessage", () => {
+  it("keeps ONLY the known wire fields", () => {
+    const raw = {
+      type: "user_message",
+      text: "hi",
+      id: "wire-1",
+      coalescedIds: ["victim-1", "victim-2"],
+      somethingElse: "junk",
+    } as unknown as UserMessageLike;
+    expect(normalizeInboundUserMessage(raw)).toEqual({
+      type: "user_message",
+      text: "hi",
+      id: "wire-1",
+    });
+  });
+
+  it("strips a peer-supplied member list of EVERY shape", () => {
+    for (const value of [["victim"], 5, "abc", [{}], [""], null, { a: 1 }]) {
+      const raw = { type: "user_message", text: "hi", coalescedIds: value } as unknown as UserMessageLike;
+      const normalized = normalizeInboundUserMessage(raw);
+      expect(normalized).not.toHaveProperty("coalescedIds");
+      expect(readCoalescedMemberIds(normalized)).toEqual([]);
+    }
+  });
+
+  it("a stripped frame cannot name ids the plugin never coalesced", () => {
+    // The end-to-end property: a peer floods a member list, the frame is
+    // normalized at ingress, and the merge that follows speaks only for the
+    // wireIds actually sent.
+    const raw = {
+      type: "user_message",
+      text: "hi",
+      id: "mine-1",
+      coalescedIds: ["someone-elses-1", "someone-elses-2"],
+    } as unknown as UserMessageLike;
+    const merged = coalesceUserMessages<Coalescable>([
+      normalizeInboundUserMessage(raw),
+      { type: "user_message", text: "hi again", id: "mine-2" },
+    ]);
+    expect(merged.coalescedIds).toEqual(["mine-1", "mine-2"]);
+  });
+
+  it("drops a non-string id (retention already ignores one)", () => {
+    const raw = { type: "user_message", text: "hi", id: 5 } as unknown as UserMessageLike;
+    expect(normalizeInboundUserMessage(raw)).toEqual({ type: "user_message", text: "hi" });
   });
 });
 
