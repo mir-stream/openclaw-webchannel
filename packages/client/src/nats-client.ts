@@ -1294,7 +1294,6 @@ export class WebChannelNatsClient {
         // Explicit close and terminal teardown retire the episode elsewhere.
         if (
           !this.disconnected && !this.terminalReached
-          && this.ackStallSinceAt !== null
           && this.hasPublishedUnackedOwnership()
           && !this.ackStallRecoveryIssued
         ) {
@@ -1501,7 +1500,7 @@ export class WebChannelNatsClient {
    */
   requestApplicationRecovery(): boolean {
     if (this.disconnected || this.terminalReached) return false;
-    if (this.ackStallSinceAt !== null && !this.ackStallRecoveryIssued) {
+    if (this.hasPublishedUnackedOwnership() && !this.ackStallRecoveryIssued) {
       this.ackStallMutationEpoch++;
       this.ackStallRecoveryIssued = true;
     }
@@ -2263,7 +2262,7 @@ export class WebChannelNatsClient {
             && this.ackStallMutationEpoch === confirmationMutationEpoch
             && !this.disconnected && !this.terminalReached
           ) {
-            if (this.ackStallSinceAt === null) {
+            if (this.ackStallSinceAt === null && !this.ackStallRecoveryIssued) {
               this.ackStallMutationEpoch++;
               this.ackStallSinceAt = publishedAt;
               this.ackStallRecoveryIssued = false;
