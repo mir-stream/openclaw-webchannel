@@ -334,6 +334,12 @@ transport-generation 격리 — lease claim의 `transportGeneration` 토큰, res
 
 #100에서 위협 모델부터 정리하며, 답이 "실제 위협 없음"이면 그대로 닫는다.
 
+**결과 (2026-08-10): 닫았다 — 구현하지 않는다.** 근거는
+`docs/ISSUE_100_TRANSPORT_GENERATION_THREAT_MODEL.md`. 요약하면 `(account, peerId)`는 검증된 JWT
+`sub`이므로 이미 principal이고, generation을 경계로 삼아도 막히는 오배송이 없는 반면, config가 그대로인
+평범한 재시작 뒤 정상 peer가 재-register로 자기 pending 승인을 되찾는 유일한 경로를 끊어 #81과 같은
+조용한 영구 뮤트를 하나 더 만든다. 재개 조건은 그 문서 §7에 있다.
+
 ---
 
 ## 8. 리스크와 범위 밖
