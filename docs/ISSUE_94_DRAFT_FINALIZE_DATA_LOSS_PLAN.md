@@ -3,8 +3,8 @@
 - 이슈: [#94](https://github.com/mir-stream/openclaw-webchannel/issues/94) (P1 / kind/bug / area/plugin)
 - 상류 리포트: rota-crew#281-A (Rota 0.4.0 제품 리뷰)
 - 브랜치: `mir-stream/issue-94` (base `develop`, 시작 커밋 `2bea2d8`)
-- 검증 대상: 이 저장소가 pin한 OpenClaw `2026.6.10`; 보고 환경 `2026.7.1`
-- 상태: 제품 의미론 결정 완료, 구현 전
+- 계약 기준: `openclaw/plugin-sdk`의 export 표면. §5의 심볼은 `2026.6.10`(peer floor)과 `2026.7.1-2`(현 npm latest) 양쪽에서 **선언이 동일함을 확인**했다. 따라서 이 변경은 devDependency 상향도 `minGatewayVersion` 상향도 요구하지 않는다.
+- 상태: 제품 의미론 결정 완료, 계약 검증 완료, 구현 전
 
 ---
 
@@ -41,7 +41,8 @@ assistant message B
 | `onPartialReply({ text, delta, replace })` | 현재 어시스턴트 메시지의 스트리밍 갱신. `text`는 현재 누적 본문이고 `replace:true`는 같은 메시지 안의 교체 갱신이다. | 활성 버블 하나를 편집한다. 각 중간 프레임은 영구 보존하지 않는다. |
 | tool/item `progress` | 플러그인이 만드는 `Working…`, 툴명, 상태 줄 같은 작업 진행 표시다. | 휘발성 scaffold다. 실제 어시스턴트 발화로 히스토리에 남기지 않는다. |
 | assistant `commentary` | 모델이 사용자에게 내보낸 가시 텍스트 단계다. reasoning이나 툴 상태 줄이 아니다. | 하나의 어시스턴트 메시지로 완료되면 별도 버블로 보존한다. |
-| `delivery.deliver(..., { kind:"block" })` | core가 전달하는 가시 어시스턴트 block이다. `assistantMessageIndex`가 있으면 원래 메시지 소유권도 안다. | 동일 index의 활성/정착 버블과 연결한다. 내용 비교로 중복 여부를 판정하지 않는다. |
+| `onBlockReplyQueued(payload, ctx)` | block이 논리적으로 방출된 시점의 **동기** 알림이다. `ctx.assistantMessageIndex`가 있으면 어느 어시스턴트 메시지 소유인지도 안다. | 활성 lane에 순서대로 기록한다. 소유권 판정에 내용 비교를 쓰지 않는다. |
+| `delivery.deliver(..., { kind:"block" })` | core가 전달하는 가시 어시스턴트 block이다. **`info`는 `kind`뿐이라 소유권 정보를 담지 않는다**(§5.2). | partial 모드에서는 이미 lane에 반영된 텍스트이므로 회계만 하고 버블을 만들지 않는다. |
 | `delivery.deliver(..., { kind:"final" })` | 현재 턴의 마지막 어시스턴트 메시지에 대한 권위 있는 최종 payload다. | 현재 메시지 버블만 확정한다. 앞 버블을 대체하지 않는다. |
 
 핵심 구분은 간단하다. **스트리밍 프레임은 휘발성이지만, 그 스트림이 완성한 어시스턴트 메시지는 휘발성이 아니다.**
@@ -111,38 +112,73 @@ if (draft && info?.kind === "final") {
 
 ---
 
-## 5. core 계약은 모호하지 않다
+## 5. core 계약이 주는 것과 주지 않는 것
 
-pin된 OpenClaw `2026.6.10`의 공개 타입과 런타임에는 필요한 신호가 이미 있다.
+경계 신호는 계약 표면에 있다. 다만 **index를 읽을 수 있는 자리는 하나뿐**이고, 그 자리는 delivery 이음매가 아니다. 설계는 이 비대칭 위에 세운다.
+
+### 5.1 계약이 주는 것 — `openclaw/plugin-sdk/reply-runtime`
+
+`GetReplyOptions`가 이 경로로 export되고, 콜백들은 그 안에 선언돼 있다.
 
 ```ts
-type PartialReplyPayload = {
-  text?: string;
+type PartialReplyPayload = Pick<ReplyPayload, "text" | "mediaUrls"> & {
   delta?: string;
   replace?: true;
-  mediaUrls?: string[];
 };
 
-onAssistantMessageStart?: () => void | Promise<void>;
-onBlockReplyQueued?: (
-  payload: ReplyPayload,
-  context?: { assistantMessageIndex?: number },
-) => void | Promise<void>;
+onPartialReply?: (payload: PartialReplyPayload) => Promise<void> | void;
 
-type ReplyDispatchRuntimeInfo = {
-  kind: "tool" | "block" | "final";
+/** Called when a new assistant message starts (e.g., after tool call or thinking block). */
+onAssistantMessageStart?: () => Promise<void> | void;
+
+/** Called synchronously when a block reply is logically emitted, before async
+ *  delivery drains. Useful for channels that need to rotate preview state at
+ *  block boundaries without waiting for transport acks. */
+onBlockReplyQueued?: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
+
+type BlockReplyContext = {
+  abortSignal?: AbortSignal;
+  timeoutMs?: number;
+  /** Source assistant message index from the upstream stream, when available. */
   assistantMessageIndex?: number;
 };
 ```
 
 - `onAssistantMessageStart`는 새 어시스턴트 메시지가 시작됐음을 알린다.
 - `replace:true`는 **같은 현재 메시지**의 교체 갱신임을 알린다.
-- `onBlockReplyQueued`와 `assistantMessageIndex`는 block이 어느 어시스턴트 메시지 소유인지 연결한다.
-- `kind:"final"`은 마지막 메시지의 최종 전달이다.
+- `onBlockReplyQueued`는 **동기**로, 비동기 전달이 drain되기 전에 온다. JSDoc이 밝힌 용도가 정확히 "block 경계에서 preview 상태를 회전시키려는 채널"이다. 이 설계는 계약이 허용하는 정도가 아니라 이 훅의 명시된 목적 위에 있다.
+- `assistantMessageIndex`는 `BlockReplyContext`에만 있고, `when available`로 optional이다.
 
-OpenClaw Telegram 채널도 같은 계약을 사용한다. 활성 answer lane을 materialize한 뒤 stream을 멈추고 `forceNewMessage()`로 새 메시지 ID를 만든다. `onAssistantMessageStart`와 `onBlockReplyQueued` 작업은 직렬 queue에 넣어 callback 호출 순서를 transport 완료 순서와 분리한다. `2026.6.10`과 확인 시점의 `2026.7.1` 모두 이 기본 구조를 쓴다.
+### 5.2 계약이 주지 않는 것 — delivery 이음매에는 index가 없다
 
-따라서 core가 단순 문자열만 쏟아내서 관계를 알 수 없는 문제가 아니다. **WebChannel이 제공된 경계를 버리고 ID 하나에 합친 것이 문제다.** Telegram/Discord/Slack이 이미 붙는 core를 이 이슈에서 바꾸지 않는다.
+WebChannel이 쓰는 전달 이음매는 `ChannelEventDeliveryAdapter`이고, 그 `info`는 `kind` 하나뿐이다.
+
+```ts
+type ChannelEventDeliveryAdapter = {
+  deliver: (payload: ReplyPayload, info: ChannelDeliveryInfo) => Promise<ChannelDeliveryResult | void>;
+  // ...
+};
+type ChannelDeliveryInfo = { kind: ReplyDispatchKind };   // 이게 전부다
+```
+
+`assistantMessageIndex`를 담은 `ReplyDispatchRuntimeInfo`는 **별개 타입**이다. `ReplyDispatcher.appendBeforeDeliver` 훅용이고 `plugin-sdk`에서 export되지 않는다. index를 payload 메타데이터에서 뽑는 `getReplyPayloadMetadata`도 미노출이다.
+
+`2026.6.10`과 `2026.7.1-2`에서 동일하다. **버전 문제가 아니라 이음매가 원래 그렇게 생겼다.** 따라서 `deliver` 시점에 index로 lane을 찾는 설계는 어느 버전에서도 성립하지 않는다.
+
+### 5.3 Telegram을 근거로 쓰지 않는다
+
+core의 Telegram 채널은 delivery 이음매에서 `info.assistantMessageIndex`를 실제로 읽는다. 그러나 Telegram은 core에 번들된 내부 채널이라 공개 플러그인 계약보다 넓은 이음매를 쓴다. **플러그인이 설 수 있는 자리가 아니므로 설계 근거로 인용하지 않는다.** 참고 가치는 "core가 메시지 경계를 실제로 보존한다"는 사실까지다.
+
+### 5.4 계약 밖에 남는 가정
+
+다음 두 가지는 계약이 보장하지 않는다. JSDoc에 순서 규정이 없다.
+
+- `onAssistantMessageStart`가 그 메시지의 첫 `onPartialReply`보다 먼저 온다.
+- `onPartialReply.text`가 itemId별 누적이라 다음 메시지에서 `""`로 재시작한다.
+
+이건 #23이 이미 지적한 unpinned cross-package 가정이다. §6.5 fail-safe가 방어하는 대상이 바로 이 둘이며, 새로운 계약 밖 가정을 추가로 도입하지 않는다.
+
+따라서 core가 단순 문자열만 쏟아내서 관계를 알 수 없는 문제가 아니다. **WebChannel이 제공된 경계를 버리고 ID 하나에 합친 것이 문제다.** 이 이슈에서 core는 바꾸지 않는다.
 
 ---
 
@@ -154,15 +190,17 @@ OpenClaw Telegram 채널도 같은 계약을 사용한다. 활성 answer lane을
 onAssistantMessageStart()             # 첫 메시지: 빈 lane이므로 회전 없음
 onPartialReply(A1)                    # progress(id=A, text=A1)
 onPartialReply(A2)                    # progress(id=A, text=A2)
-onBlockReplyQueued(A, index=0)        # block 순서와 메시지 소유권 기록
+onBlockReplyQueued(A, index=0)        # 활성 lane에 block payload 기록 (동기)
 
 onAssistantMessageStart()             # A를 id=A로 정착, 새 lane으로 회전
 onPartialReply(B1)                    # progress(id=B, text=B1), A와 다른 ID
 onPartialReply(B2)                    # progress(id=B, text=B2)
-delivery.deliver(final B, index=1)    # agent_message(id=B, text=final B)
+delivery.deliver(payload=B, {kind:"final"})   # agent_message(id=B) — 활성 lane 정착
 ```
 
 라이브 결과는 `[A 버블, B 버블]`이고 히스토리도 `[A 메시지, B 메시지]`다.
+
+**lane 소유권은 콜백 축이 전부 결정한다.** `deliver`는 `kind` 하나만 받으므로(§5.2) lane을 식별하지 않고 **활성 lane에만** 작용한다. 회전은 `onAssistantMessageStart`가, block 소유권 기록은 `onBlockReplyQueued`가 담당한다.
 
 ### 6.2 활성 lane 상태
 
@@ -186,15 +224,19 @@ type AssistantDraftLane = {
 1. ID는 lane마다 하나씩 만들고, 다음 메시지가 시작되면 새 ID로 회전한다.
 2. 첫 `onAssistantMessageStart`와 내용 없는 중복 경계는 빈 버블을 만들지 않는다.
 3. partial은 활성 lane만 갱신한다. `replace:true`도 활성 lane 안에서만 본문을 교체한다.
-4. 경계가 오면 이전 lane에 실제 어시스턴트 텍스트가 있는 경우만 정착한다. partial이 있으면 사용자가 마지막으로 본 정제된 cumulative snapshot을 쓴다. 같은 index의 queued block payload들은 순서대로 보존해 partial이 없는 경우의 본문과 delayed-delivery correlation에 쓴다. block 하나를 곧바로 assistant 메시지 전체라고 가정하지 않는다.
-5. block/final 전달은 `assistantMessageIndex`가 있으면 그 값으로 lane과 연결한다. index가 없는 경우에도 callback 직렬 순서와 내부 generation으로 연결한다.
-6. 이미 정착한 index의 block delivery가 나중에 drain되면 전송 결과만 회계하고 두 번째 버블을 만들지 않는다. dedupe 키는 index/generation이지 텍스트가 아니다.
+4. 경계가 오면 이전 lane에 실제 어시스턴트 텍스트가 있는 경우만 정착한다. partial이 있으면 사용자가 마지막으로 본 정제된 cumulative snapshot을 쓴다. partial이 없었다면 그 lane에 기록된 queued block payload들을 순서대로 이어 본문으로 쓴다. block 하나를 곧바로 assistant 메시지 전체라고 가정하지 않는다.
+5. **`assistantMessageIndex`는 `onBlockReplyQueued`에서만 읽는다.** 용도는 두 가지로 한정한다 — (a) 기록하는 block이 활성 lane 소유인지 대조, (b) 경계 누락 진단 로그. index가 없으면(`when available`) 콜백 직렬 순서와 내부 generation으로 대체한다. **delivery 이음매에는 index가 없으므로**(§5.2) 그쪽 상관에는 쓰지 않는다.
+6. **`deliver`는 lane을 식별하지 않고 활성 lane에만 작용한다.**
+   - `kind:"final"` → 활성 lane을 정착한다. final은 정의상 현재/마지막 메시지의 최종형이므로 활성 lane이 곧 대상이다.
+   - `kind:"block"` → partial 모드에서 그 텍스트는 이미 partial로 활성 lane에 들어와 있다. 전송 결과만 회계하고 **새 버블을 만들지 않는다.** 회전이 이미 일어난 뒤 늦게 drain된 block도 같은 규칙으로 중복이 생기지 않는다 — 앞 lane은 이미 자기 본문으로 정착했기 때문이다.
+   - draft lane이 없는 모드(block/off)는 기존 plain append 경로를 그대로 유지한다.
+   - 이 규칙은 index도, 텍스트 비교도, queue↔delivery 순서 일치 가정도 요구하지 않는다. dedupe는 lane 상태 자체가 수행한다.
 7. final이 오기 전에 현재 lane이 화면에 나오지 않았어도 final용 새 ID 하나로 버블을 append/정착할 수 있어야 한다.
 8. 정착 latch는 턴 전체가 아니라 lane별이다. A를 정착한 뒤에도 B를 별도로 정착할 수 있어야 한다.
 
 ### 6.3 callback과 delivery를 하나의 직렬 queue로 처리한다
 
-core callback 타입이 Promise를 허용해도 모든 호출자가 그 Promise를 기다린다는 전제에 기대지 않는다. Telegram과 같이 아래 작업을 한 queue에 넣는다.
+core callback 타입이 Promise를 허용해도 모든 호출자가 그 Promise를 기다린다는 전제에 기대지 않는다. 아래 작업을 한 queue에 넣는다.
 
 - partial ingest
 - queued block 기록
@@ -213,7 +255,7 @@ core callback 타입이 Promise를 허용해도 모든 호출자가 그 Promise�
 - `startsWith`/공백 정규화로 메시지 동일성 판정
 - `A + "\n\n" + B`를 나중에 split
 
-`final`이 앞 메시지를 인용하거나 반복해도 메시지 index/boundary가 다르면 별도 버블이다. final이 현재 메시지를 재포맷해 partial과 크게 달라져도 같은 lane만 교체한다.
+`final`이 앞 메시지를 인용하거나 반복해도 boundary가 갈랐으면 별도 버블이다. final이 현재 메시지를 재포맷해 partial과 크게 달라져도 같은 lane만 교체한다.
 
 ### 6.5 contract 위반에 대한 방어
 
@@ -264,8 +306,8 @@ core callback 타입이 Promise를 허용해도 모든 호출자가 그 Promise�
 ### `packages/plugin/src/inbound.ts`
 
 - `onPartialReply`, `onBlockReplyQueued`, `onAssistantMessageStart`, `delivery.deliver`를 같은 lane event queue에 연결한다.
-- `info.assistantMessageIndex`를 controller에 전달한다.
-- final은 현재/해당 index lane만 finalize한다.
+- `onBlockReplyQueued`를 새로 배선하고 `context?.assistantMessageIndex`를 controller에 전달한다. **`delivery.deliver`의 `info`에서는 `kind`만 읽는다**(§5.2 — 그 타입에 index가 없다).
+- final은 활성 lane만 finalize한다. partial 모드의 non-final block은 회계만 하고 버블을 만들지 않는다.
 - 현재의 “final 하나가 턴 전체 draft를 교체한다”는 주석과 분기를 제거한다.
 - 앞 lane 실패를 격리하고 마지막 final delivery 회계를 유지한다.
 
@@ -296,8 +338,9 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 | M2 | A partial → boundary → B partial | A가 정착되고 B는 다른 ID 사용 |
 | M3 | A → B → C | 세 lane/세 ID, 발생 순서 유지 |
 | M4 | `replace:true`로 A 본문 수정 | 새 버블 없이 A lane만 교체 |
-| M5 | 같은 index의 queued block이 하나 이상 있음 | 순서를 보존해 같은 lane과 연결하고 버블은 한 번만 정착 |
-| M6 | 같은 index block delivery가 늦게 도착 | 중복 버블 없음 |
+| M5 | 한 lane에 `onBlockReplyQueued`가 여러 번 (index 있음/없음 둘 다) | 순서를 보존해 같은 lane에 기록하고 버블은 한 번만 정착 |
+| M6 | partial 없이 queued block만 있는 lane | block payload를 순서대로 이은 본문으로 정착 |
+| M6b | 회전 후 `deliver(kind:"block")`가 늦게 도착 | 새 버블 없음, 정착된 앞 lane 불변, 전송 결과만 회계 |
 | M7 | boundary 누락 + non-replace divergence | 기존 lane 보존, 진단 후 방어 회전 |
 | M8 | 늦은 boundary | 방어 회전을 두 번 적용하지 않음 |
 | M9 | A 정착 실패 | queue는 살아 있고 B 정착 실행 |
@@ -342,8 +385,10 @@ npm test
 | 턴 끝에 prefix를 잘라 새 버블로 전송 | 경계를 너무 늦게 복원하며 순서/ID/finalize latch가 복잡해진다. |
 | `final.includes(previous)` 또는 suffix 검사 | 인용/반복/재포맷을 메시지 동일성으로 오판한다. core의 구조화된 경계를 버린다. |
 | 모든 partial 프레임 영구 저장 | 보존 단위를 스트리밍 프레임으로 잘못 잡아 히스토리를 오염시킨다. |
-| core 변경 | 필요한 경계와 index가 이미 있고 Telegram이 같은 계약으로 동작한다. 이 결함의 소유자는 WebChannel 플러그인이다. |
+| core 변경 | 필요한 경계 신호가 `plugin-sdk`에 이미 있다(§5.1). 이 결함의 소유자는 WebChannel 플러그인이다. |
 | 앞 버블 실패 시 턴 전체 실패 | 모델 실행 결과와 transport live-delivery 결과를 혼동한다. history 복구 경로도 있다. |
+| `deliver`의 `info.assistantMessageIndex`로 lane 상관 | 그 필드가 존재하지 않는다. `ChannelDeliveryInfo`는 `{kind}`뿐이고 6.10/7.1-2 동일하다(§5.2). 계약 밖 seam을 캐스팅으로 뚫는 것도 #23의 실패를 반복하는 길이다. |
+| `onBlockReplyQueued`↔`deliver` FIFO 순서로 상관 | queue 순서와 전달 순서가 같다는 보장이 계약에 없다. `preparePayload`가 payload를 교체할 수 있어 참조 동일성도 못 쓴다. 새로운 계약 밖 가정을 도입하느니 §6.2-6처럼 활성 lane만으로 해소한다. |
 
 ---
 
@@ -377,13 +422,15 @@ npm test
 1. `packages/plugin/src/channel.test.ts`의 기존 “두 assistant 메시지가 한 ID에 합쳐진다” 테스트를 두 ID/두 버블 기대값으로 바꾸고, final이 앞 메시지를 인용하는 실패 테스트를 먼저 추가한다.
 2. `packages/plugin/src/message-adapter.ts`의 턴 고정 `id`/`answerPrefix`를 lane별 ID와 settle latch로 교체한다.
 3. `pushAnswerText`가 문자열만 받지 말고 `text`/`delta`/`replace`를 보존하도록 바꾼다.
-4. `packages/plugin/src/inbound.ts`에서 partial/boundary/queued-block/delivery를 같은 직렬 queue에 넣고 `assistantMessageIndex`를 전달한다.
+4. `packages/plugin/src/inbound.ts`에서 partial/boundary/queued-block/delivery를 같은 직렬 queue에 넣는다. `onBlockReplyQueued`를 새로 배선해 `context?.assistantMessageIndex`를 넘기고, `deliver`의 `info`에서는 `kind`만 읽는다.
 5. plugin 테스트가 green이 된 뒤 client의 다중 ID reducer 회귀 테스트와 전체 게이트를 실행한다.
 
 구현 중 다시 열면 안 되는 결정:
 
-- boundary/index가 메시지 소유권의 source of truth다. final 본문을 `includes`/suffix로 비교하지 않는다.
-- `onBlockReplyQueued`는 같은 assistant index에 여러 번 올 수 있다. **block 하나를 메시지 하나로 가정하지 않는다.**
+- boundary가 메시지 소유권의 source of truth다. final 본문을 `includes`/suffix로 비교하지 않는다.
+- **`deliver`에는 `assistantMessageIndex`가 없다**(§5.2). index는 `onBlockReplyQueued`의 `BlockReplyContext`에서만 읽는다. 이 필드를 delivery 이음매에서 찾다가 캐스팅으로 뚫으려 하지 않는다.
+- `deliver`는 lane을 식별하지 않는다. `final`은 활성 lane을 정착시키고, partial 모드의 non-final block은 버블을 만들지 않는다.
+- `onBlockReplyQueued`는 같은 assistant 메시지에 여러 번 올 수 있다. **block 하나를 메시지 하나로 가정하지 않는다.**
 - settle latch는 턴별이 아니라 lane별이다.
 - 앞 lane send 실패가 queue를 reject 상태로 고정하거나 마지막 final을 막아서는 안 된다.
 - tool/item progress scaffold는 완료된 assistant 메시지가 아니다.

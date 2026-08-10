@@ -434,10 +434,14 @@ until a history reload restores them.
   `draftEnabled` + `answerStreamingEnabled` are both true and the answer streams into the working
   bubble.
 
-**Telegram reference.** OpenClaw's Telegram channel materializes the active answer lane before
-rotation, calls `forceNewMessage()`, and serializes `onAssistantMessageStart` /
-`onBlockReplyQueued` work. It does not concatenate completed assistant messages and recover their
-boundaries from the final string. Reasoning/answer split is **P1-3**, not P0.
+**Telegram reference — illustrative only, not a contract basis.** OpenClaw's Telegram channel
+materializes the active answer lane before rotation, calls `forceNewMessage()`, and serializes
+`onAssistantMessageStart` / `onBlockReplyQueued` work rather than recovering boundaries from the
+final string. But Telegram is bundled *inside* core and reads a wider seam than the published
+plugin contract — notably `assistantMessageIndex` at its delivery seam, which
+`ChannelDeliveryInfo` does not carry for plugins. Treat it as evidence that core preserves message
+boundaries, not as a template a plugin can copy. See §5.2/§5.3 of
+`ISSUE_94_DRAFT_FINALIZE_DATA_LOSS_PLAN.md`. Reasoning/answer split is **P1-3**, not P0.
 
 **Other residual (nit).** The setup wizard (`src/setup-wizard.ts`) still does not offer
 `streaming.mode`; an operator enrolling via `channels add` must set it by hand (as the demo does).
