@@ -197,6 +197,23 @@ export class WebChannelNATSClient {
   private readonly staleDraftWatch = new Set<string>();
   private staleDraftTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly STALE_DRAFT_GRACE_MS = 30_000;
+  /**
+   * #96: ids of the turns THIS client started that have not settled yet (the id
+   * is the publish wireId, which the plugin echoes as `turn_settled.turnId`).
+   * A Set, not a boolean: several turns can be outstanding at once (a released
+   * held burst, or sends that land in the quiet gaps of a running turn).
+   * INSERTION ORDER IS LOAD-BEARING — it is publish order, which is what lets a
+   * settle retire the whole coalesced prefix (see `closeTurnsThrough`).
+   * `state.turnActive` is exactly `size > 0`.
+   *
+   * ADVISORY ONLY. It is read NOWHERE outside `turnActive` state construction —
+   * never by `turnInFlight()`/`shouldHold()`/`maybeRelease()`, never by the
+   * receipt machinery, never by the #81 held-stall detector. Widening the
+   * existing `turnInFlight()` instead would have kept held follow-ups held for
+   * the whole turn and made #81's 30s stall detector fire soft reconnects on
+   * ordinary multi-step turns.
+   */
+  private readonly openTurns = new Set<string>();
 
   constructor(options: WebChannelNATSClientOptions) {
     this.natsOptions = {
@@ -259,10 +276,23 @@ export class WebChannelNATSClient {
       // guard, since `terminal` is always set whenever status is "error".
       // Recovery is a fresh client with fresh credentials, never this instance.
       if (this.terminal) return;
+      // #96: a raw loss ends every turn this client was tracking — the same
+      // reason it force-clears isTyping.
+      //
+      // NOT symmetric with isTyping, though: a later `typing` frame re-arms
+      // isTyping, but NOTHING re-opens a turn. `openTurn()` is reachable only
+      // from `publish()` and `maybeRelease()`, so a transient reconnect during a
+      // long multi-step turn leaves `turnActive` false for the REST of that turn
+      // — reinstating, for that turn only, the exact silent gap #96 exists to
+      // close. Accepted as the one-sided direction (under-claiming beats a
+      // spinner for a turn that died with the socket), but do not read this
+      // sweep as recoverable.
+      const turnsCleared = !connected && this.clearOpenTurns();
       this.setState({
         status: this.everSessionEstablished ? "reconnecting" : "connecting",
         connected: false,
         ...(!connected ? { isTyping: false } : {}),
+        ...(turnsCleared ? { turnActive: false } : {}),
       });
     });
 
@@ -353,6 +383,9 @@ export class WebChannelNATSClient {
         }
         return m;
       });
+      // #96: a retired instance can never see another `turn_settled`, so every
+      // open turn ends here too — in the SAME atomic update as isTyping.
+      const turnsCleared = this.clearOpenTurns();
       // P1-7: carry the machine-readable cause onto state so the embedder picks
       // truthful wording + the right recovery affordance. A classified emit site
       // supplies its cause; an unclassified failure falls back to "unknown".
@@ -362,6 +395,7 @@ export class WebChannelNATSClient {
         error: err.message,
         errorCause: cause ?? "unknown",
         isTyping: false,
+        ...(turnsCleared ? { turnActive: false } : {}),
         ...(draftsSettled ? { messages: settledMessages } : {}),
       });
     });
@@ -413,7 +447,18 @@ export class WebChannelNATSClient {
     const heldEntries = this.takeHeld();
     // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
     this.clearStaleDraftWatch();
+    // #96: a closed instance will never see another `turn_settled`, so drop every
+    // open turn. Detach the SET here but publish the flip only after the
+    // teardown: this window must stay free of state fanouts, exactly like it was
+    // before #96 — a listener reacting to one by calling `connect()` would leave
+    // the wrapper (`closed:false`) desynchronized from a low level that is about
+    // to go `disconnected:true`. Nothing here relies on `onState(false)` firing.
+    const turnsCleared = this.clearOpenTurns();
     this.client.disconnect();
+    // A listener the teardown DID notify may have re-opened this instance and
+    // sent again; that replacement turn owns the flag, so only publish the flip
+    // if the set is still empty.
+    if (turnsCleared && this.openTurns.size === 0) this.setState({ turnActive: false });
     // P0-4 (D5): fail the wrapper-owned held[] (no wireId → invisible to the
     // low-level fail-all).
     //
@@ -455,7 +500,10 @@ export class WebChannelNATSClient {
           // Covers both a working-draft hang and a pre-first-token typing-only
           // hang. NL abort words do NOT call this.
           this.finalizeLocalTurnState();
-          const receipt = this.publish(trimmed);
+          // #96: control-lane text — the plugin dispatches it with
+          // `controlLane: true`, which sets `settlementEligible = false`, so this
+          // publish never receives a `turn_settled` and must NOT open a turn.
+          const receipt = this.publish(trimmed, false);
           stopCommitted = true;
           return receipt;
         } finally {
@@ -467,7 +515,10 @@ export class WebChannelNATSClient {
         }
       }
       // Control-lane text is a real published user message → a normal receipt.
-      return this.publish(trimmed);
+      // #96: NL abort words route onto the control lane exactly like `/stop`
+      // (`isControlLaneMessage` uses the FULL abort vocabulary, of which this
+      // client mirror is a subset), so this publish never settles either.
+      return this.publish(trimmed, false);
     }
 
     // P1-9 §3.1: hold while a turn is in flight OR anything is already held. The
@@ -512,7 +563,9 @@ export class WebChannelNATSClient {
       return this.makeReceipt(receiptKey);
     }
 
-    return this.publish(trimmed);
+    // #96: an ordinary user message — the plugin runs it as a normal turn and
+    // answers with `turn_settled`, so this publish opens a turn.
+    return this.publish(trimmed, true);
   }
 
   /**
@@ -550,8 +603,13 @@ export class WebChannelNATSClient {
    * queue position before any state callback can synchronously send B. The queued
    * low-level event exposes the staged bubble; if that event is itself delayed by
    * a nested event drain, the commit helper exposes it once before returning.
+   *
+   * `settlementEligible` (#96) says whether the plugin will answer this publish
+   * with a `turn_settled` — false for the two abort branches of `send()`, whose
+   * text the server routes onto the control lane. The CALLER already knows which
+   * branch it is; publish must never re-sniff the text.
    */
-  private publish(trimmed: string): SendReceipt {
+  private publish(trimmed: string, settlementEligible: boolean): SendReceipt {
     const receiptKey = this.newReceiptKey();
     const wireId = this.client.reserveWireId();
     this.wireIdToReceiptKey.set(wireId, receiptKey);
@@ -572,12 +630,103 @@ export class WebChannelNATSClient {
       receiptKey,
       sendState: "queued",
     };
+    // #96: the turn opens the moment the message that starts it is published, so
+    // it is already open for any listener the commit below fans out to.
+    const opened = this.openTurn(wireId, settlementEligible);
     this.stageReceiptStateThenCommit(
       receiptKey,
-      { messages: [...this.state.messages, bubble] },
+      {
+        messages: [...this.state.messages, bubble],
+        ...(opened ? { turnActive: true } : {}),
+      },
       () => { this.client.sendUserMessage(trimmed, wireId); },
     );
     return this.makeReceipt(receiptKey);
+  }
+
+  // ---------------------------------------------------------------------------
+  // #96 — turn-scoped "this turn is still open" signal (`state.turnActive`)
+  // ---------------------------------------------------------------------------
+  //
+  // Each helper MUTATES the open-turn set and RETURNS whether `state.turnActive`
+  // must change as a result, so the caller can fold the flip into the state patch
+  // it was already emitting rather than emitting a second one of its own.
+  //
+  // That folding is per-CALLER, not a global atomicity claim: a reducer that
+  // already emits several patches still emits several. `turn_settled{error}` is
+  // the case to know about — its `promoteAnchor` fans out the anchor's
+  // `failed{turn-failed}` bubble patch first (P0-4 requires the outcome to commit
+  // before any UI settlement callout), so the `turnActive` flip lands in the
+  // FOLLOWING fanout alongside `isTyping:false`. Both are consistent snapshots;
+  // there is simply no single frame that carries the whole settle.
+
+  /**
+   * Open the turn a publish just minted (`turnId === wireId`). Only for a
+   * SETTLEMENT-ELIGIBLE publish: abort-shaped text rides the plugin's control
+   * lane (`packages/plugin/src/control-lane.ts` → `inbound.ts` `settlementEligible
+   * = !controlLane`), which NEVER emits `turn_settled` — opening a turn for it
+   * would latch `turnActive` true forever. Retired/closed instances are excluded
+   * for the same reason: their publish fails immediately and no turn ever runs.
+   */
+  private openTurn(wireId: string, settlementEligible: boolean): boolean {
+    if (!settlementEligible || this.terminal || this.closed) return false;
+    this.openTurns.add(wireId);
+    return this.state.turnActive !== true;
+  }
+
+  /**
+   * Close a settled turn AND every turn opened before it (insertion order).
+   *
+   * `turn_settled` is NOT 1:1 with a publish. The agent buffers messages that
+   * arrive while a turn runs and merges them: `inbound-queue.ts`
+   * `coalesceUserMessages` folds N buffered messages into one turn keyed by the
+   * LAST id (`messages[messages.length - 1].id`), and `inbound.ts` derives
+   * `turnId = message.id` — so a coalesced group emits exactly ONE settle, for
+   * its last wireId. Every earlier wireId in that group would otherwise sit in
+   * `openTurns` forever on a perfectly healthy connection (no draft, no
+   * disconnect, no `/stop`), which is a permanent false "still working".
+   *
+   * The session's work is processed in publish order and coalescing only ever
+   * merges FORWARD, so a settle for `w3` proves every turn published before `w3`
+   * has been subsumed by it or already settled. `Set` iterates in insertion
+   * order, which is publish order here, so sweeping the prefix is exactly that
+   * proof. Deleting the entry currently being visited is well-defined and does
+   * not disturb the remaining iteration.
+   *
+   * An id we never opened (another device's turn, a replayed frame) sweeps
+   * NOTHING — the forward-compat tolerance is deliberate: a settle we cannot
+   * place must never retire turns we can.
+   */
+  private closeTurnsThrough(turnId: string | undefined): boolean {
+    if (!turnId || !this.openTurns.has(turnId)) return false;
+    for (const id of this.openTurns) {
+      this.openTurns.delete(id);
+      if (id === turnId) break;
+    }
+    return this.openTurns.size === 0 && this.state.turnActive === true;
+  }
+
+  /**
+   * Close exactly one turn whose send can no longer produce one. Used only by
+   * the terminal-`failed` receipt hook (see `receiptTransition`): unlike a
+   * settle, a failure says nothing about the turns published around it, so this
+   * never sweeps the prefix.
+   */
+  private closeTurn(turnId: string | undefined): boolean {
+    if (!turnId || !this.openTurns.delete(turnId)) return false;
+    return this.openTurns.size === 0 && this.state.turnActive === true;
+  }
+
+  /**
+   * Safety-point sweep: close EVERY open turn. Used by exactly the sites that
+   * already force-clear `isTyping` (disconnect, terminal, `close()`, explicit
+   * `/stop`, the post-reconnect staleness valve) — a lost `turn_settled` must
+   * degrade to a missing signal, never a stuck one.
+   */
+  private clearOpenTurns(): boolean {
+    if (this.openTurns.size === 0) return false;
+    this.openTurns.clear();
+    return this.state.turnActive === true;
   }
 
   /** P1-9 §3.1: a turn is in flight when the agent is typing or a draft is working. */
@@ -654,6 +803,10 @@ export class WebChannelNATSClient {
         this.wireIdToReceiptKey.set(wireId, receiptKey);
         const receipt = this.receipts.get(receiptKey);
         if (receipt) receipt.wireId = wireId;
+        // #96: a released entry is ordinary text (abort text never enters the
+        // hold — §3.3), so it starts a settlement-eligible turn keyed by the
+        // wireId minted right here, exactly like an immediate publish.
+        const opened = this.openTurn(wireId, true);
         const bubble = this.state.messages.find((m) => m.id === localId);
         // A re-entrant listener may have already removed the bubble; the text is
         // still published (correct — release is a commit), so just skip the patch.
@@ -662,11 +815,19 @@ export class WebChannelNATSClient {
           messages.push({ ...bubble, pending: false, wireId, turnId: wireId });
           this.stageReceiptStateThenCommit(
             receiptKey,
-            { messages },
+            { messages, ...(opened ? { turnActive: true } : {}) },
             () => { this.client.sendUserMessage(text, wireId); },
           );
         } else {
+          // Publish FIRST, then publish the flip. This arm has no bubble to stage,
+          // so it cannot use `stageReceiptStateThenCommit` — but it must keep that
+          // helper's commit-then-expose shape for the same reason: a listener this
+          // fanout reaches would find `held` already drained and `turnInFlight()`
+          // false, so a re-entrant `send()` would publish AHEAD of the entry being
+          // released and invert the P1-9 FIFO order. `turnActive` is advisory, so
+          // its ordering relative to the publish costs nothing.
           this.client.sendUserMessage(text, wireId);
+          if (opened) this.setState({ turnActive: true });
         }
       }
     } finally {
@@ -939,10 +1100,15 @@ export class WebChannelNATSClient {
       return m;
     });
     const clearTyping = this.state.isTyping === true;
-    if (!changed && !clearTyping) return;
+    // #96: "stop everything" includes the turn-open signal — otherwise a widget
+    // would keep claiming the agent is working on a turn the user just killed
+    // (no `turn_settled` is coming for an aborted turn).
+    const turnsCleared = this.clearOpenTurns();
+    if (!changed && !clearTyping && !turnsCleared) return;
     this.setState({
       ...(changed ? { messages } : {}),
       ...(clearTyping ? { isTyping: false } : {}),
+      ...(turnsCleared ? { turnActive: false } : {}),
     });
   }
 
@@ -1001,8 +1167,29 @@ export class WebChannelNATSClient {
       }
       return m;
     });
+    // #96: the same verdict applies to the turn-open signal — the grace expired
+    // with no proof of life, so stop claiming a turn is running.
+    //
+    // SCOPE, stated honestly: the evidence is PER-DRAFT but this sweep is
+    // ALL-OR-NOTHING. One wedged draft expiring therefore also drops the signal
+    // for any other turn that happens to be open, healthy or not (drafts are
+    // watched by id; turns are not correlated to them at all). Accepted: the
+    // error is one-sided, which is strictly better than a spinner for a turn that
+    // is already dead. But be precise about the cost — unlike a swept `isTyping`,
+    // which a later `typing` frame re-arms, a swept turn is NOT recoverable: no
+    // inbound frame ever calls `openTurn()`. A turn that was really alive loses
+    // its indicator for good, and only its own settle (or a later one sweeping
+    // past it) tidies the set. Swept BEFORE `maybeRelease()`, so a follow-up
+    // released right here opens its own fresh turn rather than being caught by
+    // this same sweep.
+    const turnsCleared = this.clearOpenTurns();
     this.staleDraftWatch.clear();
-    if (changed) this.setState({ messages });
+    if (changed || turnsCleared) {
+      this.setState({
+        ...(changed ? { messages } : {}),
+        ...(turnsCleared ? { turnActive: false } : {}),
+      });
+    }
     this.maybeRelease();
   }
 
@@ -1224,11 +1411,60 @@ export class WebChannelNATSClient {
         if (!this.receiptAdvances(rec.state, next.state)) continue;
         rec.state = next.state;
         rec.failure = next.failure;
-        this.patchBubbleByReceiptKey(receiptKey, {
-          sendState: next.state,
-          sendFailure: next.failure,
-          ...(next.extraBubblePatch ?? {}),
-        });
+        // #96: close the turn of a send whose failure is our best evidence that
+        // no turn will ever settle for it (see the `overloaded` note below — it
+        // is a proxy, not a proof).
+        // This is the one funnel every terminal receipt outcome passes through
+        // (the low-level tracker's `onSendState`, plus the wrapper's own), which
+        // is why the hook lives here and not on any single emit site.
+        //
+        // THE RULE — do not extend this by listing more reasons. An id may be
+        // removed here ONLY if no `turn_settled` can ever name it. Anything a
+        // settle might still name must be left to `closeTurnsThrough`, because
+        // removing it early makes that sweep's `openTurns.has(turnId)` guard fail
+        // and strands EVERY earlier coalesced wireId permanently. Turns left here
+        // are not leaked: they sit earlier in publish order than any later turn,
+        // so the next settle sweeps them as part of its prefix — bounded, the
+        // same way the control-lane residual is bounded.
+        //
+        // `overloaded` is the only reason we treat as clearing that bar — as the
+        // best available PROXY for non-delivery, not as proof of it. The common
+        // case is an ingress rejection before any turn was dispatched, and closing
+        // immediately is worth having. But the agent can also reject a message it
+        // already admitted: the client live-retries an unacked id on the SAME
+        // healthy connection, ack delivery back to us is itself best-effort, and
+        // an accepted-marker loss (a memory-only record evicted from the bounded
+        // dedupe caches, or the dual-marker branch) makes that retry look fresh
+        // and rejectable while its turn is already running. Then a `turn_settled`
+        // DOES name this id, arriving after we removed it, and the prefix bails.
+        // Accepted knowingly: that residual sits inside the bound documented on
+        // `turnActive` — dropping `overloaded` from the hook would instead latch
+        // every genuinely-rejected send until the same next-turn sweep, the
+        // identical bound, while giving up the immediate close in the common case.
+        // Two reasons that look eligible are NOT:
+        //  - `turn-failed` comes FROM a settle (`outcome:"error"`), whose reducer
+        //    promotes the anchor from the top — before the sweep at the bottom —
+        //    so closing here would consume the settle's own id;
+        //  - `evicted` is a CLIENT-side unacked-ledger cap drop. Ack loss is not
+        //    delivery failure: the message may have reached the agent, been
+        //    coalesced, and be the very id its turn settles under.
+        // (`cancelled` and `closed` need no exclusion — a `cancelled` receipt is
+        // still held and has no wireId, and a `closed` send can only happen once
+        // `this.closed` already makes `openTurn` refuse. Neither can reach an
+        // open turn, so neither is a turn-closing mechanism.)
+        const turnClosed =
+          next.state === "failed"
+          && next.failure?.reason === "overloaded"
+          && this.closeTurn(rec.wireId);
+        this.patchBubbleByReceiptKey(
+          receiptKey,
+          {
+            sendState: next.state,
+            sendFailure: next.failure,
+            ...(next.extraBubblePatch ?? {}),
+          },
+          turnClosed ? { turnActive: false } : undefined,
+        );
         for (const cb of [...rec.subscribers]) {
           try {
             cb({ state: next.state, failure: next.failure });
@@ -1242,13 +1478,25 @@ export class WebChannelNATSClient {
     }
   }
 
-  /** Patch the render bubble carrying `receiptKey` (a no-op if it was retracted). */
-  private patchBubbleByReceiptKey(receiptKey: string, patch: Partial<ChatMessage>): void {
+  /**
+   * Patch the render bubble carrying `receiptKey` (a no-op if it was retracted).
+   * `extraState` rides along in the SAME fanout — #96 uses it so a turn closed by
+   * a terminal failure flips `turnActive` atomically with the bubble's
+   * `sendState`, and still lands when the bubble itself is gone.
+   */
+  private patchBubbleByReceiptKey(
+    receiptKey: string,
+    patch: Partial<ChatMessage>,
+    extraState?: Partial<WebChannelState>,
+  ): void {
     const idx = this.state.messages.findIndex((m) => m.receiptKey === receiptKey);
-    if (idx === -1) return;
+    if (idx === -1) {
+      if (extraState) this.setState(extraState);
+      return;
+    }
     const messages = this.state.messages.slice();
     messages[idx] = { ...messages[idx], ...patch };
-    this.setState({ messages });
+    this.setState({ messages, ...(extraState ?? {}) });
   }
 
   /**
@@ -1716,7 +1964,14 @@ export class WebChannelNATSClient {
         // Outcome is authoritative and must be committed before either UI
         // settlement callout. A listener reacting to typing/draft completion may
         // close the client; that teardown cannot overwrite completed/turn-failed.
-        this.setState({ isTyping: false });
+        //
+        // #96: this frame ends the turn it names AND every turn published before
+        // it (server-side coalescing emits one settle for a merged group, keyed
+        // by its LAST wireId — see `closeTurnsThrough`). A legacy plugin's
+        // outcome-less `turn_settled` closes just the same (the settlement is
+        // what matters, not the outcome); a turnId we never opened is a no-op.
+        const turnClosed = this.closeTurnsThrough(msg.turnId);
+        this.setState({ isTyping: false, ...(turnClosed ? { turnActive: false } : {}) });
         // P1-9 §3.6.1: settled ⇒ no more upserts — finalize any lingering working
         // draft whose turnId matches (in the normal flow the final agent_message
         // already did this, a no-op). Never swaps the id.

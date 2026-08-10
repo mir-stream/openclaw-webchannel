@@ -303,6 +303,53 @@ export type WebChannelState = {
    */
   isTyping?: boolean;
   /**
+   * True while at least one turn this client started is still open — i.e. the
+   * user message has been published and its `turn_settled` has not arrived yet.
+   * Unlike `isTyping` (which the server pushes ONCE per turn and which the first
+   * `progress`/`agent_message`/`approval_*` frame clears), this is client-owned
+   * and TURN-SCOPED: it stays `true` across the whole turn, including the gaps
+   * after a first agent bubble has settled while more tool calls, another
+   * assistant message, or an approval wait are still to come. Rendering rule:
+   * `isTyping` means "an answer is being composed right now"; `turnActive` means
+   * "the agent is still working on this turn" — so a widget can keep an
+   * in-flight affordance alive between bubbles instead of showing a silence
+   * indistinguishable from completion (#96).
+   *
+   * Absent until this client starts its first turn. Advisory only: it never
+   * gates sending, the held-message FIFO, or reconnect. An abort/`/stop` publish
+   * (which rides the server's control lane and never settles) never opens one.
+   * Another device sharing this peer id is not tracked — and, because the agent
+   * serializes and coalesces per peer, that device's turn can SUBSUME a message
+   * of ours, so the settle we were waiting for may name an id we cannot place.
+   *
+   * `turn_settled` is not 1:1 with a send — the agent coalesces messages that
+   * arrive during a running turn into ONE turn keyed by the last of them — so a
+   * settle closes the turn it names AND every turn published before it (both
+   * outcomes, and an outcome-less legacy settle, sweep alike). A send that fails
+   * closes its own turn only for the one failure that is a good PROXY for the
+   * agent never having received it — `overloaded`, an ingress rejection (a proxy,
+   * not a proof: the agent can also reject a message it already admitted). A
+   * lost ack is not one: `evicted` is a client-side ledger drop, so that turn may
+   * still be named by a settle and is left to the sweep. Beyond that, a
+   * disconnect, a terminal error, `close()`, and an explicit `/stop` force-close
+   * every open turn, as does the post-reconnect staleness valve — though only
+   * where it arms at all, i.e. when a `working` draft was live when the session
+   * re-established. Force-closing is one-way: no inbound frame re-opens a turn
+   * (unlike `isTyping`, which a later `typing` frame re-arms), so a mid-turn
+   * reconnect leaves this `false` for the remainder of that turn.
+   *
+   * The guarantee is therefore BOUNDED, not absolute. Any published turn whose
+   * settle never arrives — or arrives naming an id this client cannot place —
+   * stays `true` until a later settle sweeps it as part of the prefix or a
+   * safety point fires. Known examples (not an exhaustive list): text the agent
+   * treats as an abort while this client's pinned abort vocabulary, a deliberate
+   * subset, does not; a message denied by the agent's DM allowlist, which is
+   * acked at ingress but dispatches no turn; a turn another device's message
+   * subsumed; and a post-admission `overloaded` rejection, whose turn is already
+   * running. Render it as a soft "still working" hint, never as a hard gate.
+   */
+  turnActive?: boolean;
+  /**
    * Slash-command discovery catalog (P0-3). Absent until the UI calls
    * `client.loadCommands()` and the agent answers with a `commands` frame;
    * then it holds the config-filtered, alias-free, name-sorted command list a
