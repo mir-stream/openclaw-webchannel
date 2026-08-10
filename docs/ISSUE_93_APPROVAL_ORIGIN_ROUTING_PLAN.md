@@ -17,7 +17,7 @@
 
 - `packages/plugin/src/approvals.ts`의 origin 판정, fail-closed 진단, `prepareTarget`의 대상 없음 처리
 - session key 재도출 결과를 유일성까지 판정하는 작은 helper
-- `NatsChannel`의 등록 peer 후보 snapshot 접근자
+- `ConversationKeyStore`와 `NatsChannel`의 non-shrinking admitted-peer proof snapshot 접근자
 - `channel.ts`에서 `nats-account-runtime.ts`까지의 resolver 주입 배선
 - 위 동작을 고정하는 단위·배선·집중 통합 테스트
 
@@ -67,9 +67,9 @@ return { to };
 
 1. 명시된 source channel이 webchannel이 아니면 즉시 `null`이다.
 2. `turnSourceTo`를 직접 신뢰하려면 정규화된 source channel이 명시적으로 `webchannel`이어야 한다.
-3. source channel이 없거나 공백이면 `turnSourceTo`만으로 대상을 정하지 않는다. non-empty `sessionKey`와 등록 후보 재도출 결과가 정확히 하나 일치해야 한다.
+3. source channel이 없거나 공백이면 `turnSourceTo`만으로 대상을 정하지 않는다. non-empty `sessionKey`와 admitted-peer proof 집합의 재도출 결과가 정확히 하나 일치해야 한다.
 4. 일치가 0개이거나 2개 이상이면 `null`이다. 후보 순서에 따른 선택은 금지한다.
-5. resolver 미주입, runtime/install 부재, 예외, session key 부재도 모두 `null`이다. SDK 경계 밖으로 예외를 던지지 않는다.
+5. proof store 미제공, resolver 미주입, runtime/install 부재, 예외, session key 부재도 모두 `null`이다. SDK 경계 밖으로 예외를 던지지 않는다.
 6. 대상 미확정은 자동 승인이나 다른 peer 전달로 바뀌지 않는다.
 7. session key와 peer ID 원문은 진단 로그에 남기지 않는다.
 
@@ -96,11 +96,13 @@ return { to };
 
 명시적 `webchannel` + target 경로는 core가 제공한 exact origin metadata를 사용한다. channel이 없는 경우에는 target이 있더라도 상호 보강되지 않은 metadata이므로 사용하지 않고 session key 증명을 요구한다. resolver가 같은 target을 되찾을 수도 있고 다른 exact peer를 유일하게 되찾을 수도 있다.
 
+account eligibility는 기존 `shouldHandleWebChannelApprovalRequest` gate가 계속 소유한다. 이 설계는 그 gate를 통과한 요청의 origin만 판정하며, explicit/persisted account binding이 없는 agent/cron/proactive 요청의 account 정책은 범위 밖이다.
+
 `createClawApprovalNativeRuntimeSpec().transport.prepareTarget`에서도 `plannedTarget.target.to`가 없으면 `null`을 반환한다. `ANON_PEER_ID` 기본값은 제거한다. 이는 origin resolver 이후의 방어선이며, 승인 origin 경로의 어떤 층도 대상 부재를 임의 peer로 바꾸지 않게 한다.
 
 ### 4.2 파싱이 아닌 재도출과 유일성 판정
 
-`session-route.ts`의 `resolveWebchannelSessionRoute(api, accountId, peerId)`가 inbound와 history에서 사용하는 동일한 route/key 생성 경로다. origin 복구도 등록 후보별로 이 함수를 호출해 byte-equal key를 비교한다. session key 문자열 형식을 역파싱하지 않는다.
+`session-route.ts`의 `resolveWebchannelSessionRoute(api, accountId, peerId)`가 inbound와 history에서 사용하는 동일한 route/key 생성 경로다. origin 복구도 admitted-peer proof ID별로 이 함수를 호출해 byte-equal key를 비교한다. session key 문자열 형식을 역파싱하지 않는다.
 
 판정 알고리즘은 `packages/plugin/src/approval-origin.ts`에 작고 동기적인 helper로 둔다.
 
@@ -112,7 +114,7 @@ export type ApprovalOriginMatch =
 
 export function resolveApprovalOriginCandidate(params: {
   requestedSessionKey: string;
-  candidatePeerIds: readonly string[];
+  admittedPeerIds: readonly string[];
   deriveSessionKey: (peerId: string) => string;
 }): ApprovalOriginMatch;
 ```
@@ -128,13 +130,25 @@ helper 자체는 외부 상태를 소유하지 않고 주입된 derivation을 �
 
 이 방식은 `resolveAgentRoute`, forced `per-account-channel-peer` scope, `buildAgentSessionKey`, `identityLinks`를 inbound와 동일하게 통과시킨다. 다만 동일 key가 exact peer 하나를 뜻한다고 가정하지 않고 유일성을 별도로 증명한다.
 
-### 4.3 후보 집합의 정확한 의미
+### 4.3 non-shrinking admitted-peer proof 집합
 
-`NatsChannel.listRegisteredPeerIds(): string[]`은 `peerSubscriptions` key의 snapshot을 반환한다. 이 목록은 **등록되었고 explicit unregister, cap eviction 또는 dispose로 제거되지 않은 후보 집합**이다.
+유일성 판정의 universe로 `peerSubscriptions`를 사용하면 안 된다. 그 Map은 unregister, cap eviction, dispose 때 줄어든다. 같은 key를 만드는 exact ID가 둘인데 실제 origin이 판정 전에 제거되면, 남은 충돌 peer가 겉보기에는 유일해져 승인 프레임을 받을 수 있다.
 
-NATS 경로에는 browser disconnect 신호가 없으므로 목록에 이미 연결이 끊긴 peer가 남을 수 있다. 따라서 접근자 이름과 JSDoc에서 liveness나 socket 존재를 약속하지 않는다. `registerPeer`/`unregisterPeer` 테스트도 목록 membership만 고정한다. `sendApprovalRequest()`가 `true`여도 publish가 수행되었다는 뜻이지 widget 수신 증명은 아니다.
+기존 per-account `ConversationKeyStore`를 proof universe로 사용한다. register admission이 성공할 때 exact JWT peer ID에 대한 conversation key가 `getOrCreate`로 먼저 영속화되고, store에는 삭제 API가 없으며 정상 운용에서 entry가 제거되지 않는다. 다음 읽기 전용 snapshot을 추가한다.
 
-이 제약은 exact 대상 선택과 별개다. 이번 변경은 후보 중 다른 사람을 고르거나 여러 사람에게 보내지 않도록 하고, liveness 프로토콜은 추가하지 않는다.
+```ts
+// conversation-key-store.ts
+listPeerIds(): string[];
+
+// nats-channel.ts
+listAdmittedPeerIds(): string[] | null;
+```
+
+`ConversationKeyStore.listPeerIds()`는 lazy-load된 persistent Map key의 복사본을 반환한다. `NatsChannel.listAdmittedPeerIds()`는 key store가 있으면 이 API에 위임하고, 없으면 `null`을 반환한다. production resolver는 `null`을 `admission_store_unavailable`로 fail-closed 하며 `peerSubscriptions`로 대체하지 않는다. 빈 store는 정상적인 빈 proof 집합이므로 helper 결과가 `no_match`다.
+
+unregister, cap eviction, channel dispose 또는 gateway 재시작 뒤에도 admitted ID가 proof 집합에 남으므로 collision은 계속 `ambiguous`다. 현재 registration은 origin 증명의 조건이 아니다. 유일하게 증명된 origin이 현재 offline이어도 그 exact ID를 반환할 수 있고, 즉시 publish 실패 시 기존 pending-approval/reconnect snapshot 경로가 같은 ID에 나중에 전달할 수 있다. 반대로 ambiguity에서는 `null`이며 현재 남아 있는 충돌 peer를 포함해 어떤 subject에도 publish하지 않는다.
+
+proof와 delivery liveness는 분리한다. `sendApprovalRequest()`가 `true`여도 publish 수행만 뜻하며 widget receipt를 증명하지 않는다. 이번 변경은 heartbeat/disconnect protocol을 추가하지 않는다.
 
 ### 4.4 주입 계약과 runtime 구현
 
@@ -144,6 +158,7 @@ NATS 경로에는 browser disconnect 신호가 없으므로 목록에 이미 연
 export type ApprovalOriginUnresolvedReason =
   | "runtime_unavailable"
   | "install_unavailable"
+  | "admission_store_unavailable"
   | "no_match"
   | "ambiguous"
   | "resolver_error";
@@ -166,9 +181,10 @@ export type ResolveApprovalOriginPeer = (params: {
 1. `accountId ?? "default"`로 `accountRuntimes`를 조회한다. 없으면 `runtime_unavailable`.
 2. `accountCoordinator.currentInstall()`을 조회한다. 없으면 `install_unavailable`.
 3. `createAccountExecutionApi(install, cfg)`로 현재 config를 포함한 API를 만든다.
-4. `runtime.channel.listRegisteredPeerIds()` snapshot과 실제 `resolveWebchannelSessionRoute` closure를 helper에 전달한다.
-5. helper의 세 결과를 callback 결과로 매핑한다.
-6. snapshot, route, key derivation을 포함한 예외는 catch해서 `resolver_error`로 반환한다.
+4. `runtime.channel.listAdmittedPeerIds()`를 읽는다. `null`이면 `admission_store_unavailable`; 빈 배열은 그대로 helper에 전달한다.
+5. non-shrinking admitted-ID snapshot과 실제 `resolveWebchannelSessionRoute` closure를 helper에 전달한다.
+6. helper의 세 결과를 callback 결과로 매핑한다.
+7. snapshot load, route, key derivation을 포함한 예외는 catch해서 `resolver_error`로 반환한다.
 
 `resolveOriginTarget`도 callback 전체를 `try/catch`로 감싸므로 잘못된 외부 구현이 throw해도 SDK 경계를 넘지 않는다.
 
@@ -180,9 +196,9 @@ export type ResolveApprovalOriginPeer = (params: {
 event=webchannel.approval.origin_unresolved accountId=<masked> reason=<reason> sessionKey_present=<true|false>
 ```
 
-outer layer가 자체적으로 만드는 reason은 `missing_session_key`, `resolver_unavailable`, callback throw의 `resolver_error`다. callback이 반환하는 reason은 그대로 쓴다. `formatAccountIdForLog`를 사용하고 session key, peer ID, candidate ID는 기록하지 않는다. 명시적 타 채널의 `null`은 정상적인 비소유 판정이므로 warn 대상이 아니다. ambiguity 로그에도 raw ID를 넣지 않는다.
+outer layer가 자체적으로 만드는 reason은 `missing_session_key`, `resolver_unavailable`, callback throw의 `resolver_error`다. callback이 반환하는 reason은 그대로 쓴다. account 필드는 `formatAccountIdForLog(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)`로 만들고 session key, peer ID, candidate ID는 기록하지 않는다. 명시적 타 채널의 `null`은 정상적인 비소유 판정이므로 warn 대상이 아니다. ambiguity 로그에도 raw ID를 넣지 않는다.
 
-비용은 승인 한 건마다 후보 수만큼 `resolveAgentRoute`를 호출하는 O(n)이다. 각 후보에 대해 한 번씩 호출하며, 승인은 저빈도이고 후보 수는 제한되어 있다. `identityLinks`나 binding 변경 뒤 stale 결과가 오배송을 만들 수 있으므로 캐시는 두지 않는다.
+비용은 승인 한 건마다 admitted ID 수만큼 `resolveAgentRoute`를 호출하는 O(n)이다. 각 ID에 대해 한 번씩 호출하며 store의 기존 `maxKeys`가 상한을 둔다. `identityLinks`나 binding 변경 뒤 stale 결과가 오배송을 만들 수 있으므로 캐시는 두지 않는다.
 
 ---
 
@@ -192,19 +208,21 @@ outer layer가 자체적으로 만드는 reason은 `missing_session_key`, `resol
    - `ApprovalOriginMatch`와 `resolveApprovalOriginCandidate` 추가.
 2. `packages/plugin/src/approval-origin.test.ts`
    - 실제 `resolveWebchannelSessionRoute`/`buildAgentSessionKey` 경로를 이용한 unique, none/foreign, `identityLinks` ambiguity, `Alice`/`alice` ambiguity 검증.
-3. `packages/plugin/src/nats-channel.ts`
-   - `listRegisteredPeerIds()` snapshot 접근자 추가. `WebChannelPeerChannel` 전송 인터페이스는 확장하지 않는다.
-4. `packages/plugin/src/approvals.ts`
+3. `packages/plugin/src/conversation-key-store.ts`
+   - persistent key ID를 복사하는 `listPeerIds()` 추가. 저장 형식이나 삭제 정책은 바꾸지 않는다.
+4. `packages/plugin/src/nats-channel.ts`
+   - key store에 위임하는 `listAdmittedPeerIds()` 추가. key store가 없으면 `null`; `peerSubscriptions` fallback은 금지한다. `WebChannelPeerChannel` 전송 인터페이스는 확장하지 않는다.
+5. `packages/plugin/src/approvals.ts`
    - callback/result 타입과 세 번째 optional 인자 추가.
    - §4.1 우선순위, callback catch, privacy-safe 단일 진단 구현.
    - `prepareTarget`의 고정 대상 기본값 제거; 대상이 없으면 `null`.
    - 승인 origin 경로에서 불필요해진 `ANON_PEER_ID` import와 낡은 주석 제거.
-5. `packages/plugin/src/channel.ts`
+6. `packages/plugin/src/channel.ts`
    - `opts.resolveApprovalOriginPeer`를 capability에 그대로 전달.
-6. `packages/plugin/src/nats-account-runtime.ts`
+7. `packages/plugin/src/nats-account-runtime.ts`
    - §4.4 callback 구현 후 plugin 생성 option으로 전달.
-7. 관련 테스트 파일
-   - capability, fail-closed, accessor membership, production wiring을 각각 가장 가까운 seam에서 고정.
+8. 관련 테스트 파일
+   - capability, proof-store persistence, fail-closed, production wiring을 각각 가장 가까운 seam에서 고정.
 
 ---
 
@@ -221,6 +239,7 @@ outer layer가 자체적으로 만드는 reason은 `missing_session_key`, `resol
 | `identityLinks`의 두 alias가 같은 canonical identity | `ambiguous` |
 | distinct 후보 `Alice`/`alice`가 같은 normalized key 생성 | `ambiguous` |
 | 유일 후보의 exact ID가 `web-anon`이고 key도 일치 | 일반 `resolved(web-anon)` |
+| colliding origin이 unregister/cap-evict된 뒤에도 admitted snapshot에 둘 다 존재 | 계속 `ambiguous` |
 
 ### 6.2 capability와 실패 경로
 
@@ -231,15 +250,17 @@ outer layer가 자체적으로 만드는 reason은 `missing_session_key`, `resol
 - channel null/공백 + uncorroborated `turnSourceTo`는 target을 직접 쓰지 않고 session-key resolver 결과를 쓴다.
 - resolver 경로에서 session key가 누락/null/공백이면 resolver를 호출하지 않고 `null`이다.
 - resolver 미주입은 `null`이다.
-- `no_match`, `ambiguous`, runtime/install unavailable, callback throw는 모두 `null`이다.
+- `no_match`, `ambiguous`, admission store/runtime/install unavailable, callback throw는 모두 `null`이다.
 - 각 미해결 경로의 warn은 한 줄이고 raw session key/peer ID를 포함하지 않는다.
 - `prepareTarget`은 planned target 부재 시 `null`이며 임의 peer를 만들지 않는다.
 
-### 6.3 후보 membership, 배선, 집중 통합
+### 6.3 proof persistence, 배선, 집중 통합
 
-- `nats-channel` 테스트: register 후 accessor에 포함, unregister 후 제외. 이 테스트는 browser 연결 상태나 전달 성공을 주장하지 않는다.
+- `conversation-key-store.test.ts`: 여러 admitted ID의 `listPeerIds()` snapshot을 검증하고 새 store instance로 reopen한 뒤에도 동일 ID가 남으며 public API 동작으로 줄지 않음을 고정한다.
+- `nats-channel` 테스트: unregister와 cap eviction은 live subscription을 제거하지만 `listAdmittedPeerIds()`에서는 ID를 제거하지 않는다. key store 없는 channel은 `null`을 반환한다.
 - `channel.test.ts`와 `index-nats-wiring.test.ts`: option이 capability까지 전달되고 NATS runtime이 실제 callback을 제공하는지 고정한다.
-- 새 focused routing/delivery integration test: 두 peer를 등록한 `NatsChannel`, capture transport, 실제 session route derivation, 주입 resolver, capability origin 판정, native `prepareTarget`/`deliverPending`을 한 경로로 실행한다. peer A의 key로 만든 승인 프레임이 A의 exact outbound subject에만 publish되고 B subject에는 publish되지 않았음을 검증한다. receipt나 활성 widget은 주장하지 않는다.
+- 새 focused routing/delivery integration test: 두 peer를 admit한 `NatsChannel`, capture transport, 실제 session route derivation, 주입 resolver, capability origin 판정, native `prepareTarget`/`deliverPending`을 한 경로로 실행한다. unique peer A의 key는 A의 exact outbound subject에만 publish되고 B subject에는 publish되지 않음을 검증한다. collision 케이스에서는 origin ID를 unregister 또는 cap-evict한 뒤에도 `ambiguous`이고 남은 peer subject를 포함해 publish가 0건임을 검증한다. unique but offline origin은 그대로 resolve되며 기존 pending/reconnect snapshot이 그 exact ID를 보존하는지도 고정한다.
+- focused two-account test: 두 account에 같은 peer ID를 admit하고 all-null `turnSource*` + account A의 session key를 입력한다. account A resolver만 match/publish하고 account B resolver는 `no_match`로 어떤 frame도 publish하지 않음을 검증한다. 기존 account eligibility 정책 자체는 재설계하지 않는다.
 
 선택적 운영 smoke는 merge gate와 분리한다. 실제 gateway/NATS/browser 형상에서 peer A의 write 툴을 실행해 A widget에만 카드가 보이고 peer B에는 보이지 않는지 확인할 수 있지만, 자동화 게이트의 publish 증명을 대체하지 않는다.
 
@@ -248,7 +269,7 @@ outer layer가 자체적으로 만드는 reason은 `missing_session_key`, `resol
 ```bash
 npm run build
 npm run typecheck
-npx vitest run packages/plugin
+npm test --workspace=packages/plugin
 npm test
 ```
 
@@ -260,7 +281,9 @@ npm test
 
 | 항목 | 판단 |
 | --- | --- |
-| stale 등록 후보 | NATS에는 disconnect 신호가 없어 정확한 subject에 publish해도 browser receipt는 보장하지 못한다. liveness 개선은 별도 기능이다. |
+| admitted proof 집합의 단조 증가 | offline/evicted ID도 남아 collision이 영구 ambiguity가 될 수 있다. 오배송보다 fail-closed를 택하며 기존 `maxKeys`가 공간 상한을 둔다. |
+| key store 부재/읽기 실패 | production resolver는 live subscription으로 대체하지 않고 `admission_store_unavailable`/`resolver_error`로 닫는다. |
+| offline unique origin | exact origin은 증명되지만 즉시 receipt는 보장하지 못한다. 기존 pending/reconnect 경로가 동일 ID를 보존한다. |
 | 같은 key의 여러 exact 후보 | 선택하면 오배송 가능성이 있으므로 `ambiguous`로 fail-closed 한다. upstream exact metadata가 장기 해법이다. |
 | config reload 중 derivation 실패 | 일부 후보만으로 선택하지 않고 전체를 `resolver_error`로 닫는다. 캐시도 두지 않는다. |
 | session key 역파싱 | key 형식에 결합되고 case normalization/`identityLinks`의 비단사성을 해결하지 못해 기각한다. |
@@ -287,9 +310,11 @@ npm test
 
 - [ ] 정규화/우선순위 표의 모든 분기가 capability 테스트로 고정된다.
 - [ ] 실제 route/key 생성 기반 unique, no-match, case-fold ambiguity, `identityLinks` ambiguity 테스트가 green이다.
-- [ ] 0개/복수 일치, missing key, resolver/runtime/install 부재, 예외가 모두 privacy-safe 진단 한 줄과 `null`로 끝난다.
+- [ ] `ConversationKeyStore.listPeerIds()`가 reopen을 넘어 admitted ID를 보존하고, unregister/cap eviction이 proof 집합을 줄이지 않는다.
+- [ ] colliding origin이 live subscription에서 사라진 뒤에도 ambiguity가 유지되며 survivor subject publish는 0건이다.
+- [ ] 0개/복수 일치, missing key, proof store/resolver/runtime/install 부재, 예외가 모두 privacy-safe 진단 한 줄과 `null`로 끝난다.
 - [ ] `web-anon`은 unique-match가 증명한 literal peer 외에는 선택되지 않으며 승인 origin 경로에 고정 대상 fallback이 없다.
-- [ ] register/unregister accessor membership과 production callback 배선 테스트가 green이다.
-- [ ] 집중 통합 테스트가 승인 publish를 resolved exact peer subject 하나로 제한함을 증명한다.
+- [ ] production callback 배선과 two-account all-null-metadata/sessionKey 격리 테스트가 green이다.
+- [ ] 집중 통합 테스트가 unique approval publish를 exact peer subject 하나로 제한하고 ambiguity publish를 막음을 증명한다.
 - [ ] build, typecheck, plugin suite, 전체 test가 실패 0이다.
 - [ ] active-turn registry, liveness, broadcast, UX, approver policy, upstream core 구현이 diff에 들어오지 않는다.
