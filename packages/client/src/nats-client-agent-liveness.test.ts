@@ -563,6 +563,103 @@ describe("WebChannelNatsClient — #81 published-work recovery", () => {
     },
   );
 
+  it.each(["retryRandom", "retryNow"] as const)(
+    "starts B's stall interval at its first publish after a synchronous %s result",
+    async (selectedHook) => {
+      const scheduler = makeScheduler();
+      const timeoutMs = 1_000;
+      const advancedAt = 5_000;
+      const K = new Uint8Array(32).fill(selectedHook === "retryRandom" ? 86 : 87);
+      let socket: FakeNatsWS | undefined;
+      let firstId = "";
+      let callbackId = "";
+      let hookArmed = false;
+      let stallSinceDuringAccepted: number | null | undefined;
+      let timersDuringAccepted = -1;
+      const runSelectedHook = (hook: typeof selectedHook) => {
+        if (!hookArmed || hook !== selectedHook) return;
+        hookArmed = false;
+        deliver(socket!, K, { type: "ack", ids: [firstId] });
+      };
+      const h = await makeClient({
+        ackStallTimeoutMs: timeoutMs,
+        retryNow: () => {
+          runSelectedHook("retryNow");
+          return scheduler.now();
+        },
+        retryRandom: () => {
+          runSelectedHook("retryRandom");
+          return 0.5;
+        },
+        retrySetTimeout: scheduler.set,
+        retryClearTimeout: scheduler.clear,
+      });
+      const published: Array<{ id: string; text: string }> = [];
+      const registration = registerAgent(K, h.devicePublicRaw, h.identity);
+      FakeNatsWS.sharedHandler = (subject, payload, server, replyTo) => {
+        if (subject === IN) {
+          const message = openMessage(payload, K) as {
+            type?: string;
+            id?: string;
+            text?: string;
+          } | null;
+          if (message?.type === "user_message" && message.id && message.text) {
+            published.push({ id: message.id, text: message.text });
+          }
+          return;
+        }
+        return registration(subject, payload, server, replyTo);
+      };
+      h.client.connect();
+      await settle();
+      socket = FakeNatsWS.instances[0];
+      const reconnect = vi.spyOn(internal(h.client).client, "reconnect")
+        .mockImplementation(() => {});
+
+      firstId = h.client.sendUserMessage("A");
+      h.client.onSendState((id, state) => {
+        if (id !== firstId || state !== "accepted") return;
+        scheduler.advanceTo(advancedAt);
+        stallSinceDuringAccepted = internal(h.client).ackStallSinceAt;
+        timersDuringAccepted = scheduler.taskCount();
+      });
+      h.client.onMessage((message) => {
+        if (message.type === "ack" && message.ids?.includes(firstId)) {
+          callbackId = h.client.sendUserMessage("C-from-ack-callback");
+        }
+      });
+      hookArmed = true;
+      const secondId = h.client.sendUserMessage("B");
+
+      expect(callbackId).not.toBe("");
+      expect(stallSinceDuringAccepted).toBeNull();
+      expect(timersDuringAccepted).toBe(0);
+      expect(published).toEqual([
+        { id: firstId, text: "A" },
+        { id: secondId, text: "B" },
+        { id: callbackId, text: "C-from-ack-callback" },
+      ]);
+      expect(internal(h.client).ackStallSinceAt).toBe(advancedAt);
+      expect(internal(h.client).unackedLedger.get(secondId)?.nextRetryAt)
+        .toBe(advancedAt + 1_000);
+      expect(internal(h.client).unackedLedger.get(callbackId)?.nextRetryAt)
+        .toBe(advancedAt + 1_000);
+      expect(h.client.getSendStateSnapshot(secondId)?.state).toBe("sent");
+      expect(h.client.getSendStateSnapshot(callbackId)?.state).toBe("sent");
+      expect(reconnect).not.toHaveBeenCalled();
+
+      // Drain anything incorrectly armed for the already-elapsed provisional
+      // interval. B's real publish above must instead grant a complete timeout.
+      scheduler.advanceTo(advancedAt);
+      expect(reconnect).not.toHaveBeenCalled();
+      scheduler.advanceTo(advancedAt + timeoutMs - 1);
+      expect(reconnect).not.toHaveBeenCalled();
+      scheduler.advanceTo(advancedAt + timeoutMs);
+      expect(reconnect).toHaveBeenCalledTimes(1);
+      h.client.disconnect();
+    },
+  );
+
   it.each(["ack", "inbound_rejected"] as const)(
     "a synchronous owned %s during raw publish wins over stale episode writes",
     async (type) => {
