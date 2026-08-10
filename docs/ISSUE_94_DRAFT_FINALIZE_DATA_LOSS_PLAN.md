@@ -405,28 +405,39 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 | M2 | A partial → boundary → B partial | A가 정착되고 B는 다른 ID 사용 |
 | M3 | A → B → C | 세 lane/세 ID, 발생 순서 유지 |
 | M4 | `replace:true`로 A 본문 수정 | 새 버블 없이 A lane만 교체 |
-| M5 | 한 lane에 `onBlockReplyQueued`가 여러 번 (index 있음/없음 둘 다) | 순서를 보존해 같은 lane에 기록하고 버블은 한 번만 정착 |
+| M5 | 한 lane에 같은 index의 `onBlockReplyQueued`가 여러 번 | 순서를 보존해 같은 lane에 기록하고 버블은 한 번만 정착 |
 | M6 | partial 없이 queued block만 있는 lane | block payload를 순서대로 이은 본문으로 정착 |
-| M6b | 회전 후 `deliver(kind:"block")`가 늦게 도착 | 새 버블 없음, 정착된 앞 lane 불변, 전송 결과만 회계 |
-| M7 | boundary 누락 + non-replace divergence | 기존 lane 보존, 진단 후 방어 회전 |
-| M8 | 늦은 boundary | 방어 회전을 두 번 적용하지 않음 |
-| M9 | A 정착 실패 | queue는 살아 있고 B 정착 실행 |
+| M6b | 정착된 lane에 queued block이 늦게 도착 | 무시. 정착된 본문 불변 |
+| M7 | non-replace divergence (stream restart) | 기존 lane 보존, 진단 후 회전 |
+| M8 | 늦은 boundary | 회전을 두 번 적용하지 않음 |
+| M9 | A 정착 실패 (`false`, 그리고 throw) | 컨트롤러 생존, B 정착 실행 |
 | M10 | lane별 동시/재진입 settle | 각 lane당 terminal frame 정확히 1회 |
+| M11 | queued block의 `assistantMessageIndex` 변화 | 활성 lane 정착 후 회전, block은 새 lane에 기록 |
+| M11b | index 없는 block들 (`when available`) | 회전하지 않고 활성 lane에 기록만 |
+| M12 | 실제 interleaving — A partials → block(A,0) → B partials → block(B,1) | seam 하나에 회전 **한 번**. 뒤이은 block은 index를 채택만 |
+| M13 | index 변화 회전 뒤에 늦은 boundary | 다시 회전하지 않음 |
+
+M11~M13은 §5.5 실측 이후 추가됐다. M5는 초안의 "index 불일치 진단 로그" 기대를 잃었다 — 그 경로는 이제 회전이므로 M11이 가져갔다.
 
 ### inbound 통합 테스트
 
 | # | 케이스 | 기대 |
 | --- | --- | --- |
 | I1 | A partial, boundary, B partial, final=B | A/B 두 버블, 서로 다른 ID, 순서 보존 |
-| I2 | assistant 메시지 3개 | 라이브 세 버블, history와 같은 순서 |
+| I1b | **B가 partial을 하나도 안 흘림.** block index 변화만이 두 메시지를 가른다 | 두 버블. 이 신호가 없으면 B final이 A 버블을 덮어 A가 유실된다 |
+| I2 | assistant 메시지 3개 — **핀된 core의 실제 형상**(선행 boundary 1회, 이후 누적 재시작만) | 라이브 세 버블, history와 같은 순서 |
 | I3 | 단일 메시지 | 한 ID에서 partial→final, 기존 UX 유지 |
-| I4 | final B가 A 문장을 인용/포함 | A와 B는 여전히 별도 버블 (`includes` 회귀 방지) |
+| I4 | **B의 partial이** A 문장을 인용/포함 | A와 B는 여전히 별도 버블 (`includes` 회귀 방지) |
 | I5 | final B가 B partial을 전면 재작성 | B만 교체, A 불변 |
 | I6 | A live 정착 `false`/throw | B final은 시도되고 성공 결과를 반환 |
 | I7 | B final 실패 | 기존 P0-4 턴 outcome 계약 유지 |
 | I8 | abort/clean resolve/error | 정착된 A 불변, 활성 lane만 settle, working 잔존 없음 |
+| I8b | 회전 직후 abort (새 lane은 아직 텍스트 없음) | 빈 lane에 버블을 만들지 않는다 (§6.2-2b/§8-6) |
 | I9 | progress mode | tool scaffold는 휘발성, 답변은 원자적 final |
 | I10 | block/off mode | 기존 append와 delivery 회계 무회귀 |
+| I10b | partial mode에서 `deliver(kind:"block")` | 버블 없음. 그 텍스트는 이미 활성 lane에 있다 (§6.2-6) |
+
+**I4의 fixture 정정.** 초안은 "final이 A를 인용"으로 적었으나, final은 회전을 유발하지 않으므로 그 형상은 아무것도 구속하지 못한다(회전은 이미 끝나 있다). 실제로 `includes` 회귀를 잡으려면 **B의 partial이** A 텍스트를 포함해야 한다 — 그때 divergence 판정이 내용 기반이었다면 두 메시지가 하나로 합쳐진다. 구현 중 뮤테이션으로 확인했다.
 
 ### 클라이언트 회귀 테스트
 
@@ -510,6 +521,59 @@ staleness valve의 disarm은 경로마다 단위가 다르다. `progress`/`agent
 #94 이후에는 갈라진다: lane A의 정착 프레임이 유실되고(§8-1) lane B가 계속 스트리밍하는 중에 turn T의 `reasoning` 프레임이 하나 오면, 죽은 lane A까지 watch에서 빠져 **만료되지 않는다.** `turnInFlight()`가 참으로 남아 `turn_settled`/`​/stop`/재접속 재무장 중 하나가 올 때까지 composer가 잠긴다.
 
 PR 2에서 고칠 수도 있지만 **클라이언트 소유이고 플러그인 lane 모델과 독립**이므로 기본은 별도 처리다. PR 2 안에서 고치기로 한다면 그 결정을 명시적으로 기록하고 범위에 넣어라 — 조용히 흡수하지 마라.
+
+### 12.2 이 수정이 닫지 못하는 것 (구현 중 확인, 2026-08-10)
+
+셋 다 알고 남긴 한계다. 다음 사람이 버그로 재발견하지 않도록 적는다.
+
+**(1) 다음 메시지가 앞 메시지의 텍스트로 시작하면 판정이 무너진다. 방향에 따라 결과가 다르다.**
+
+- **B가 A의 전체 텍스트로 시작(확장 방향)** → 성장과 구분되지 않아 두 메시지가 **한 버블로 합쳐진다**(중복 없음, 유실 없음, 경계만 사라짐).
+- **B가 A의 진부분 문자열로 시작(축소 방향)** → shrink guard가 backwards flicker로 보고 회전을 막는다. 그다음 final이 **A의 id에 B의 텍스트를 정착시켜 A를 덮어쓴다.** 즉 **유실**이다.
+
+```
+A = "Hello world" → B = "Hello" → final "Hello"
+  → terminal frame 1개, {idA, "Hello"}     ← "Hello world" 소멸
+```
+
+초안은 확장 방향만 적었다. **축소 방향이 더 나쁘다** — 병합이 아니라 #94 본체와 같은 유실이다. 두 방향 모두 block index 축(M11/I1b)이 있으면 구제되고, block이 없으면 남는다. 텍스트 모양으로 재시작을 탐지하는 방식에 내재한 한계이고, 내용 비교로 좁히려는 시도는 §6.4가 금지한다 — 인용/반복을 메시지 동일성으로 오판하는 쪽이 더 큰 손해다. 코드의 shrink guard 자리에 이 잔여 위험을 명시해 두었다.
+
+**(2) final 없이 끝난 block 전용 마지막 lane은 정착하지 않는다.** §6.2-4의 본문은 회전/경계에서 materialize 되는데, core가 마지막 메시지의 block만 queue 하고 `final`을 주지 않은 채 abort 되면 그 lane은 `started === false`라 §8-6이 버블 생성을 금지한다. 그 텍스트는 history 스냅샷으로만 도달한다.
+
+**(3) partial 모드의 `deliver(kind:"block")`는 전송 없이 `visibleReplySent: true`를 보고한다.** 근거는 그 텍스트가 lane의 terminal frame으로 도달한다는 것이다. (2)와 뿌리가 같다. 단, core의 notice payload(`isStatusNotice`/`isFallbackNotice`/`isCompactionNotice`)는 이 억제에서 **제외**한다 — compaction notice는 partial로 흐른 적이 없고 final에도 다시 담기지 않으므로 억제하면 유실된다(리뷰 1라운드 실측). 같은 이유로 notice는 lane 본문으로 기록하지도 않는다. 상태 알림이 완료된 어시스턴트 메시지로 승격되면 §2/§7 위반이다.
+
+**(4) 텍스트 없는 block이 앞선 메시지를 닫으면 다음 메시지가 버블 하나를 중복 표시한다 — 의도적 유예.**
+
+block 라우팅은 **ordinal 매핑**이다: 지금까지 본 서로 다른 index 중 n 번째가 n 번째 lane의 것이다. index 값 자체로 소유권을 추정하지 않는다(분기 회전이 이미 지나간 뒤에는 값만으로 판별할 수 없다). base가 0이 아니어도, 중간이 비어 있어도 성립한다.
+
+남는 구멍은 하나다 — **자기 block(텍스트 없음)으로 이미 닫힌 lane에 다음 메시지의 partial이 얹힌다.** 그 lane은 claimed index를 갖고 `answerText`는 비어 있어서 divergence 판정이 걸리지 않는다.
+
+```
+textless block(0), textless block(1), push "X", block("X",2), push "Y", block("Y",3), final
+  → ["X", "X", "Y final"]      ← X가 두 번 보인다
+```
+
+**전제:** core가 그 턴의 **첫 어시스턴트 텍스트보다 먼저** 서로 다른 index의 텍스트 없는(media-only) block을 흘려야 한다. 실패 양상은 **중복 표시이지 유실이 아니다.**
+
+닫는 방법은 알고 있다 — "claimed index가 있고 `answerText`가 비어 있는 lane에 partial이 오면 새 메시지이므로 회전"이다. 근거도 이미 문서화된 것과 같다(block은 메시지 완료 시점에 나오므로 그 뒤에 같은 메시지의 partial은 없다). **그럼에도 이번 PR에서는 넣지 않는다:** partial 경로에 네 번째 회전 트리거를 리뷰 이후에 추가하는 셈이고, 얻는 것은 희귀 형상의 중복 하나뿐이다. 후속 후보로 남긴다.
+
+**(5) partial을 흘리지 않은 메시지의 block이 늦게 drain 되면 그 텍스트가 유실된다 — 국소 해법 없음.**
+
+ordinal 매핑의 전제는 "block을 내는 모든 메시지가 lane도 만들었다"이다. **partial을 하나도 안 흘린 메시지는 자기 block이 도착하기 전까지 lane을 만들지 않는다.** 그런데 block은 다음 메시지의 partial보다 늦게 drain 되는 것이 정상이다(§5.5의 coalescer). 이 둘이 만나면 이후 모든 index가 lane 하나씩 앞으로 밀려 **살아 있는 lane에** 묶이고, `laneBody`가 `answerText`를 우선하므로 그 block 텍스트는 버려진다.
+
+```
+push"B msg", block("A block only",0), block("B msg",1), final"B final"
+  → ["B msg","B final"]                     ← "A block only"이 wire에 나가지 않는다
+
+push"A msg", push"C msg", block(0), block("B block only",1), block(2), final
+  → ["A msg","C msg","C final"]             ← B 유실, C 중복
+```
+
+**국소적으로 고칠 수 없다.** index 0이 도착한 시점에 "index 0은 지금 스트리밍 중인 lane의 것"과 "index 0은 lane이 없는 앞선 메시지의 것"은 관측된 모든 정보와 양립한다. 시도한 보정(claimed-index 기준, settled 기준, `answerText` 보유 기준, 순서를 어긴 lane 추가)은 전부 **평범한 late-drain 경로와 충돌해 희귀한 유실을 흔한 중복으로 바꾸거나**, finalize에서 다시 덮어쓴다. 표시 순서도 복구 불가다 — 뒤 메시지의 버블이 이미 존재하고 프로토콜에 삽입 프레임이 없다.
+
+`inbound.ts`의 block 억제가 이 payload에도 걸려 **유실된 텍스트를 `visibleReplySent: true`로 보고한다.** (3)의 근거("lane의 terminal frame으로 도달한다")가 이 형상에서는 성립하지 않는다.
+
+**이것이 §10 e2e 게이트를 실제로 만들어야 할 가장 강한 근거다.** 이 결함의 발생 빈도는 전적으로 core가 drain을 얼마나 자주 어긋나게 하는지에 달려 있고, 그건 단위 테스트가 답할 수 없는 질문이다 — 두 라운드의 리뷰가 잡아낸 결함이 전부 "core가 실제로 내지 않는 순서를 고정한 fixture"였다.
 
 ---
 
