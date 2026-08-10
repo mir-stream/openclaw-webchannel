@@ -21,6 +21,22 @@ import type {
 } from "./message-adapter.js";
 
 /**
+ * Core's own chatter — a status/fallback/compaction notice — as opposed to the
+ * assistant's answer. Used by all three seams that must agree on the
+ * distinction: the #87 turn-outcome classification, the partial-mode block
+ * swallow, and the draft lane's block recording.
+ */
+function isCoreNoticePayload(payload: {
+  isStatusNotice?: boolean;
+  isFallbackNotice?: boolean;
+  isCompactionNotice?: boolean;
+}): boolean {
+  return Boolean(
+    payload.isStatusNotice || payload.isFallbackNotice || payload.isCompactionNotice,
+  );
+}
+
+/**
  * #87: core's own terminal verdict for an agent run, observed off the lifecycle
  * event stream.
  *
@@ -204,9 +220,10 @@ export async function handleInboundMessage(
   // controller and hook `onToolStart`/`onItemEvent`/`onPartialReply`
   // (GetReplyOptions, dist/plugin-sdk/types-BYvUZFDr.d.ts:274-304) via the turn's
   // `replyOptions` (Omit<GetReplyOptions,"onBlockReply">, AssembledChannelTurn,
-  // dist/plugin-sdk/types-BVAOMoZy.d.ts:5813). Each event refreshes a single
-  // rolling draft pushed to the widget as a `progress` frame; the final answer
-  // (delivered through `delivery.deliver`) finalizes that same draft id.
+  // dist/plugin-sdk/types-BVAOMoZy.d.ts:5813). Each event refreshes the ACTIVE
+  // draft lane, pushed to the widget as a `progress` frame; each completed
+  // assistant message settles into its own bubble at its own id, and the final
+  // answer (delivered through `delivery.deliver`) settles the last lane (#94).
   //
   // `channels.webchannel.streaming.mode` selects WHAT streams, mirroring core's
   // own distinction (`onPartialReply` is wired only when `draftStream &&
@@ -214,7 +231,10 @@ export async function handleInboundMessage(
   //  - "partial": stream ANSWER TEXT. Draft is created; `onPartialReply` feeds
   //    `pushAnswerText`, and tool/item events stay wired too, so a mixed turn
   //    shows "Working… + tool lines" until the first answer text arrives, then
-  //    the answer text replaces the scaffold in the same draft.
+  //    the answer text replaces the scaffold in the FIRST lane. The
+  //    message-boundary callbacks (`onBlockReplyQueued`,
+  //    `onAssistantMessageStart`) are wired here too, so a multi-message reply
+  //    settles one bubble per assistant message.
   //  - "progress": tool-lines-only. Draft is created but `onPartialReply` is
   //    NOT wired — answer text never streams (the deliberate mode distinction).
   //  - "block"/"off": NO draft. Falls through to the plain no-id `agent_message`
@@ -256,6 +276,8 @@ export async function handleInboundMessage(
       sessionKey: wsKey,
       turnId,
       channelConfig,
+      // Lane rotations emit a diagnostic (never silent — §6.5.1).
+      logger: api.logger,
     });
   }
   // Reasoning lane is created AFTER route resolution (below), once we can resolve
@@ -450,11 +472,66 @@ export async function handleInboundMessage(
                             });
                           },
                           // Answer-text streaming remains PARTIAL MODE ONLY.
+                          // These three callbacks are the message-boundary axis
+                          // (#94): each completed assistant message settles into
+                          // its OWN bubble id instead of being merged into one
+                          // turn-wide draft. `onBlockReplyQueued` is wired here
+                          // and NOT in progress mode, where the answer is atomic
+                          // and recording blocks would change behaviour.
                           ...(answerStreamingEnabled
                             ? {
                                 onPartialReply: (p) => {
-                                  draft!.pushAnswerText(p.text ?? "");
+                                  draft!.pushAnswerText({
+                                    text: p.text,
+                                    delta: p.delta,
+                                    replace: p.replace,
+                                  });
                                 },
+                                // `BlockReplyContext.assistantMessageIndex`
+                                // (dist/plugin-sdk/types-DNy-f8Hr.d.ts:172) is
+                                // the only place the plugin contract exposes a
+                                // per-message identity — core populates it from
+                                // payload metadata and AWAITS this callback
+                                // before the async delivery drains
+                                // (dist/dispatch-B2e1grFo.js:1868-1872). The
+                                // delivery seam's `ChannelDeliveryInfo` is
+                                // `{ kind }` and has no index, so this is where
+                                // the controller learns which message a block
+                                // belongs to.
+                                onBlockReplyQueued: (payload, context) => {
+                                  // Core's own notices reach this callback the
+                                  // same way an answer block does, but they are
+                                  // not assistant text. Recording one would let
+                                  // it become a partial-less lane's settled
+                                  // body — a status notice promoted to a
+                                  // completed assistant message (§2/§7). They
+                                  // still reach the user: `deliver` sends them
+                                  // on the plain path (see the block swallow).
+                                  if (isCoreNoticePayload(payload)) return;
+                                  draft!.recordQueuedBlock({
+                                    text: payload.text,
+                                    assistantMessageIndex: context?.assistantMessageIndex,
+                                  });
+                                },
+                                // NOTE: the two runners THIS channel's turns go
+                                // through latch this to fire ONCE PER RUN, not
+                                // once per assistant message: ACP sets
+                                // `assistantStarted` at
+                                // dist/run-attempt-DRhLt3eF.js:4083-4085 (reset
+                                // nowhere but its constructor, :3876) and btw at
+                                // dist/btw-CDO5476N.js:564/:597-599. A third
+                                // path in the bundle DOES fire it per message
+                                // (dist/selection-BfRwHcjH.js:3788-3793 and
+                                // :3860-3865, wired :13601, reached from
+                                // dist/embedded-agent-BgF2MOkH.js:3092). On our
+                                // paths it therefore lands at the first delta,
+                                // when the lane is still empty and rotation
+                                // correctly no-ops — so it is NOT the live
+                                // rotation path here (that is the queued block's
+                                // index change, plus the partial stream-restart
+                                // fallback) — while on that third path it
+                                // behaves as advertised. The handler is correct
+                                // under both.
                                 onAssistantMessageStart: () => {
                                   draft!.handleAssistantMessageBoundary();
                                 },
@@ -465,10 +542,10 @@ export async function handleInboundMessage(
             },
             // THIS channel's outbound delivery seam. Forward the assembled reply
             // text to the originating widget's live socket. In either draft mode
-            // (progress/partial) we FINALIZE the in-flight draft (reusing its id)
-            // so the widget transitions the working bubble into the final answer;
-            // otherwise (block/off, no draft) we send a plain no-id agent_message
-            // (legacy append path).
+            // (progress/partial) we FINALIZE the ACTIVE draft lane (reusing its
+            // id) so the widget transitions that working bubble into the final
+            // answer; otherwise (block/off, no draft) we send a plain no-id
+            // agent_message (legacy append path).
             delivery: {
               deliver: async (payload, info) => {
                 const text = payload.text;
@@ -523,11 +600,7 @@ export async function handleInboundMessage(
                     ) {
                       terminalErrorSeen = true;
                     }
-                  } else if (
-                    !payload.isStatusNotice &&
-                    !payload.isFallbackNotice &&
-                    !payload.isCompactionNotice
-                  ) {
+                  } else if (!isCoreNoticePayload(payload)) {
                     answerDelivered = true;
                   }
                 }
@@ -538,15 +611,45 @@ export async function handleInboundMessage(
                 // message's fate, not answer delivery). The dropped answer text is
                 // recovered by the register-time history snapshot (recovery lanes
                 // §5 L3/L6), never by faking the turn outcome.
-                // Only the final reply replaces the draft. Non-final visible
-                // blocks (rare for this channel) fall through to a plain send.
-                if (draft && info?.kind === "final") {
+                // #94 lane rule: `deliver` does NOT identify a lane — its `info`
+                // is `{ kind }` and carries nothing else (§5.2) — so it acts on
+                // the ACTIVE lane only. A `final` is by definition the finished
+                // form of the CURRENT (last) assistant message, so it settles
+                // the active lane's bubble; earlier messages already settled on
+                // their own ids at their own boundaries and are never touched.
+                if (draft && kind === "final") {
                   const sent = await draft.finalize(text);
                   if (sent) finalReplyDelivered = true;
                   return { visibleReplySent: sent };
                 }
+                // In partial mode a non-final ANSWER block's text is ALREADY in
+                // the active lane (it arrived as partials, and the block itself
+                // was recorded via onBlockReplyQueued), so sending it here would
+                // append a duplicate bubble beside the lane's own terminal
+                // frame. Account for it and send nothing (§6.2-6). This also
+                // covers a block draining AFTER a rotation: the lane that owned
+                // it has already settled with its own body. `visibleReplySent:
+                // true` is honest — the content does reach the user, through
+                // that lane's terminal frame rather than through this call.
+                //
+                // A NOTICE block is excluded. Core's status/fallback/compaction
+                // notices reach this seam as `kind:"block"`
+                // (reply-usage-state-q7j5CVEd.js:488-495 →
+                // agent-runner.runtime-C8N-o26U.js:4126-4133 →
+                // dispatch-B2e1grFo.js:1885) but never stream as a partial and
+                // are never repeated in the final, so swallowing one would
+                // DROP it while claiming it was delivered. They fall through to
+                // the plain send, exactly as in the non-draft modes.
+                if (
+                  draft &&
+                  kind === "block" &&
+                  answerStreamingEnabled &&
+                  !isCoreNoticePayload(payload)
+                ) {
+                  return { visibleReplySent: true };
+                }
                 const sent = transport.sendText(wsKey, text, undefined, turnId);
-                if (sent && info?.kind === "final") finalReplyDelivered = true;
+                if (sent && kind === "final") finalReplyDelivered = true;
                 return { visibleReplySent: sent };
               },
             },
@@ -569,15 +672,26 @@ export async function handleInboundMessage(
     //     to settle with what it streamed, not announce anything; and
     //   - a silent/tool-only completion is correctly settled by its own streamed
     //     content, where any "Stopped"-style marker would be a mislabel.
-    // `finalize` is idempotent (message-adapter.ts), so a turn that already
-    // delivered its final answer is a no-op here. The `|| "⏹ Stopped."` fallback
-    // is defensively unreachable (`started === true` implies a progress frame was
-    // sent, and frames always carry non-empty `composeText()` output, so
-    // `snapshotText()` is non-empty) — it exists only so the bubble can never
-    // finalize to empty text.
-    if (draft?.started) {
+    // `snapshotText()`/`finalize()` both read the ACTIVE LANE (#94, §8-6):
+    // messages that already settled at their own boundaries are never touched
+    // here, and `finalize` is idempotent per lane (message-adapter.ts), so a
+    // turn that already delivered its final answer is a no-op.
+    //
+    // The gate is the SNAPSHOT, not `started`. §8-6 words this condition as
+    // "did the lane emit a frame", which was the same question while one draft
+    // spanned the whole turn — but a per-lane `started` is false for the whole
+    // ~600ms throttle window after a rotation, and a lane whose first frame is
+    // still pending in that window already holds the new message's text. Keying
+    // on `started` drops exactly that text on an abort (a regression against the
+    // old turn-wide flag, which was true by then). The intent §8-6 protects —
+    // never mint an empty bubble, never a stop marker — is what the snapshot
+    // itself expresses: it is "" precisely when the lane has nothing worth
+    // settling (a rotated lane with no text yet, or a bare scaffold header).
+    // `finalize` flushes the pending frame before settling, so the widget still
+    // sees the bubble before it resolves.
+    if (draft) {
       const snapshot = draft.snapshotText();
-      await draft.finalize(snapshot || "⏹ Stopped.");
+      if (snapshot) await draft.finalize(snapshot);
     }
   } catch (err) {
     turnOutcome = "error";

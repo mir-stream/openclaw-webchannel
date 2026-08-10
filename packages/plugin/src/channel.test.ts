@@ -279,10 +279,39 @@ describe("webchannel inbound round-trip", () => {
       // BEFORE delivering the final reply. Simulates core's final-answer stream.
       partialTexts?: string[];
       // A finer-grained answer stream than `partialTexts`: an ordered sequence
-      // mixing cumulative partial texts and assistant-message boundaries, so a
-      // test can drive a MULTI-message reply (boundary → per-item cumulative
-      // restarts from ""). Fired in the same slot as `partialTexts`.
-      partialSteps?: Array<{ text: string } | { boundary: true }>;
+      // of the callback-axis events core can emit for a multi-message reply.
+      // Fired in the same slot as `partialTexts`. Each step only fires if the
+      // turn WIRED the matching callback (i.e. partial mode):
+      //   { text }     cumulative partial for the current message
+      //   { replace }  a `replace: true` rewrite of the current message
+      //   { boundary } onAssistantMessageStart
+      //   { block }    onBlockReplyQueued(payload, { assistantMessageIndex })
+      //   { deliverBlock }  delivery.deliver(payload, { kind: "block" })
+      //   { deliverNotice } the same, flagged as one of core's own notices
+      partialSteps?: Array<
+        | { text: string }
+        | { replace: string }
+        | { boundary: true }
+        | {
+            block: {
+              text?: string;
+              assistantMessageIndex?: number;
+              isCompactionNotice?: true;
+            };
+          }
+        | { deliverBlock: string }
+        | { deliverNotice: string }
+      >;
+      /**
+       * Runs after every `partialSteps` entry. Tests use it to advance fake
+       * timers so the draft loop's throttle window actually elapses (or
+       * deliberately does not) between events.
+       */
+      betweenSteps?: () => Promise<void> | void;
+      /** Text the fake kernel delivers as the turn's `kind:"final"` payload. */
+      finalText?: string;
+      /** Skip the final delivery entirely (abort / silent-completion shape). */
+      skipFinal?: boolean;
       reasoningSteps?: Array<{
         text: string;
         isReasoningSnapshot?: boolean;
@@ -359,9 +388,33 @@ describe("webchannel inbound round-trip", () => {
             for (const step of opts.partialSteps) {
               if ("boundary" in step) {
                 await turn.replyOptions?.onAssistantMessageStart?.();
+              } else if ("block" in step) {
+                await turn.replyOptions?.onBlockReplyQueued?.(
+                  {
+                    text: step.block.text,
+                    ...(step.block.isCompactionNotice
+                      ? { isCompactionNotice: true as const }
+                      : {}),
+                  },
+                  step.block.assistantMessageIndex === undefined
+                    ? {}
+                    : { assistantMessageIndex: step.block.assistantMessageIndex },
+                );
+              } else if ("deliverBlock" in step) {
+                await turn.delivery.deliver({ text: step.deliverBlock }, { kind: "block" });
+              } else if ("deliverNotice" in step) {
+                await turn.delivery.deliver(
+                  { text: step.deliverNotice, isCompactionNotice: true },
+                  { kind: "block" },
+                );
+              } else if ("replace" in step) {
+                if (turn.replyOptions?.onPartialReply) {
+                  await turn.replyOptions.onPartialReply({ text: step.replace, replace: true });
+                }
               } else if (turn.replyOptions?.onPartialReply) {
                 await turn.replyOptions.onPartialReply({ text: step.text });
               }
+              await opts.betweenSteps?.();
             }
           }
           if (opts?.reasoningSteps) {
@@ -375,7 +428,8 @@ describe("webchannel inbound round-trip", () => {
           if (opts?.throwAfterProgress) {
             throw new Error("agent run failed mid-draft");
           }
-          await turn.delivery.deliver({ text: "hi back" }, { kind: "final" });
+          if (opts?.skipFinal) return;
+          await turn.delivery.deliver({ text: opts?.finalText ?? "hi back" }, { kind: "final" });
         }),
       },
     };
@@ -798,7 +852,7 @@ describe("webchannel inbound round-trip", () => {
     for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
   });
 
-  it("preserves earlier message text across an assistant-message boundary in partial mode (no vanish)", async () => {
+  it("settles each assistant message into its OWN bubble across a boundary in partial mode (no vanish)", async () => {
     const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
@@ -807,7 +861,8 @@ describe("webchannel inbound round-trip", () => {
     const { api } = makeFakeApi(captured, {
       channelConfig: { streaming: { mode: "partial" } },
       // Two final_answer messages: the second's cumulative partials restart from
-      // "" after the boundary. The already-streamed "First msg" must NOT vanish.
+      // "" after the boundary. The already-streamed "First msg" must NOT vanish
+      // — it settles into its own bubble instead of being replaced by the final.
       partialSteps: [
         { text: "First msg" },
         { boundary: true },
@@ -821,22 +876,23 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
+    // Two terminal frames on two different ids, in message order: message A
+    // settled with the text the user watched stream, and the final settled
+    // message B. Before #94 there was one id and A's text was gone.
+    expect(finalizeSpy).toHaveBeenCalledTimes(2);
+    const [, idA, textA] = finalizeSpy.mock.calls[0];
+    const [, idB, textB] = finalizeSpy.mock.calls[1];
+    expect(idA).not.toBe(idB);
+    expect(textA).toBe("First msg");
+    expect(textB).toBe("hi back");
+    // NO VANISH: A's text is still delivered — just in A's own bubble.
+    expect(finalizeSpy.mock.calls.map((c) => c[2])).toContain("First msg");
+    // Lane hygiene: A's id never carries B's text and vice versa.
     expect(progressSpy).toHaveBeenCalled();
-    // Every frame after the boundary keeps the first message as a prefix — the
-    // last emitted frame shows both messages joined (prefix preserved).
-    const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
-    expect(lastFrameText).toBe("First msg\n\nSecond msg");
-    // No frame ever drops "First msg" once it has been streamed (no vanish):
-    // the only frames without it are the pre-first-message ones (there are none
-    // here since the first partial IS "First msg").
-    const firstMsgFrames = progressSpy.mock.calls.filter((c) =>
-      (c[2] as string).includes("First msg"),
-    );
-    expect(firstMsgFrames.length).toBe(progressSpy.mock.calls.length);
-    // All frames share one draft id, and the final settles that same id.
-    const progId = progressSpy.mock.calls[0][1];
-    for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
+    for (const [, id, text] of progressSpy.mock.calls) {
+      if (id === idA) expect(text).toBe("First msg");
+      if (id === idB) expect(text as string).not.toContain("First msg");
+    }
   });
 
   it("treats an assistant-message boundary BEFORE the first partial as a no-op (no leading blank prefix)", async () => {
@@ -870,7 +926,7 @@ describe("webchannel inbound round-trip", () => {
     expect(progressSpy.mock.calls[0][2]).toBe("First");
   });
 
-  it("degrades a MISSING assistant-message boundary to correct accumulation (no clobber, no dup)", async () => {
+  it("rotates on a restarted cumulative partial when NO boundary event arrives (no clobber, no dup)", async () => {
     const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
@@ -878,10 +934,10 @@ describe("webchannel inbound round-trip", () => {
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     const { api } = makeFakeApi(captured, {
       channelConfig: { streaming: { mode: "partial" } },
-      // Two messages with NO boundary event between them. The second message's
-      // cumulative partial ("Second msg") restarts from "" and DIVERGES from
-      // the first ("First msg") — neither is a prefix of the other. Without the
-      // missed-boundary defense this would clobber "First msg".
+      // Two messages with NO boundary event between them — the shape the pinned
+      // core actually produces, since both runners latch onAssistantMessageStart
+      // to fire once per RUN. The second message's cumulative partial restarts
+      // from "" and diverges from the first, which is what rotates the lane.
       partialSteps: [{ text: "First msg" }, { text: "Second msg" }],
     });
 
@@ -890,31 +946,31 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
+    // Each message settled into its own bubble, in order.
+    expect(finalizeSpy).toHaveBeenCalledTimes(2);
+    const [, idA, textA] = finalizeSpy.mock.calls[0];
+    const [, idB, textB] = finalizeSpy.mock.calls[1];
+    expect(idA).not.toBe(idB);
+    expect(textA).toBe("First msg");
+    expect(textB).toBe("hi back");
+    // No clobber and no duplication: A's text appears in A's bubble only.
     expect(progressSpy).toHaveBeenCalled();
-    // The seam was rolled up defensively: the last frame keeps BOTH messages.
-    const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
-    expect(lastFrameText).toBe("First msg\n\nSecond msg");
-    // "First msg" is never dropped once streamed (no clobber) and appears once
-    // per frame (no duplication) in the final joined frame.
-    expect((lastFrameText as string).match(/First msg/g)?.length).toBe(1);
-    expect((lastFrameText as string).match(/Second msg/g)?.length).toBe(1);
-    const progId = progressSpy.mock.calls[0][1];
-    for (const call of progressSpy.mock.calls) expect(call[1]).toBe(progId);
-    expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
+    for (const [, id, text] of progressSpy.mock.calls) {
+      if (id === idB) expect(text as string).not.toContain("First msg");
+    }
   });
 
-  it("handles a LATE assistant-message boundary idempotently (no double-roll)", async () => {
+  it("does not rotate twice when a boundary event arrives after the stream already restarted", async () => {
     const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
-    vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     const { api } = makeFakeApi(captured, {
       channelConfig: { streaming: { mode: "partial" } },
       // The boundary arrives LATE — after the second message's first partial has
-      // already been ingested (and rolled up by the missed-boundary defense).
-      // The belated boundary must be a no-op: it must NOT roll "Second msg" a
-      // second time. A subsequent growth partial extends the second message.
+      // already rotated the lane. The belated event must be absorbed: it must
+      // NOT settle the in-progress second message and split it in two.
       partialSteps: [
         { text: "First msg" },
         { text: "Second msg" },
@@ -928,12 +984,488 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
+    // Exactly two bubbles: A (rotated once) and B (settled by the final).
+    expect(finalizeSpy).toHaveBeenCalledTimes(2);
+    expect(finalizeSpy.mock.calls[0][2]).toBe("First msg");
+    expect(finalizeSpy.mock.calls[1][2]).toBe("hi back");
+    const idB = finalizeSpy.mock.calls[1][1];
+    // B's own frames grew in place on B's id (never a third lane).
+    const bFrames = progressSpy.mock.calls.filter((c) => c[1] === idB);
+    expect(bFrames.at(-1)?.[2]).toBe("Second msg more");
+  });
+
+  /**
+   * #94 — inbound integration (plan §10, I1–I10).
+   *
+   * These drive the real controller through `handleInboundMessage`, so they
+   * cover the whole callback axis: partials, queued blocks, boundaries, and the
+   * delivery seam.
+   */
+  it("I1: A partial, boundary, B partial, final=B → two bubbles with distinct ids in order", async () => {
+    const transport = new FakePeerChannel();
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      partialSteps: [
+        { text: "Message A" },
+        { block: { text: "Message A", assistantMessageIndex: 0 } },
+        { boundary: true },
+        { text: "Message B" },
+        { block: { text: "Message B", assistantMessageIndex: 1 } },
+      ],
+      finalText: "Message B final",
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    expect(finalizeSpy.mock.calls.map((c) => c[2])).toEqual(["Message A", "Message B final"]);
+    expect(finalizeSpy.mock.calls[0][1]).not.toBe(finalizeSpy.mock.calls[1][1]);
+  });
+
+  it("I1b: a second message that produced NO partials rotates on its queued block's index", async () => {
+    const transport = new FakePeerChannel();
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // Message B never streams a partial, so the stream-restart trigger cannot
+      // fire — only the queued block's assistantMessageIndex change separates
+      // the two messages. Without that signal reaching the controller, B's
+      // final would replace A's bubble and A's text would be lost live.
+      partialSteps: [
+        { text: "Msg A" },
+        { block: { text: "Msg A", assistantMessageIndex: 0 } },
+        { block: { text: "Msg B", assistantMessageIndex: 1 } },
+      ],
+      finalText: "Msg B final",
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    expect(finalizeSpy.mock.calls.map((c) => c[2])).toEqual(["Msg A", "Msg B final"]);
+    expect(finalizeSpy.mock.calls[0][1]).not.toBe(finalizeSpy.mock.calls[1][1]);
+  });
+
+  it("I2: three assistant messages settle as three bubbles in order", async () => {
+    const transport = new FakePeerChannel();
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // The realistic pinned-core shape: one leading boundary, then each new
+      // message's cumulative partials restart from "".
+      partialSteps: [
+        { boundary: true },
+        { text: "Alpha" },
+        { text: "Bravo" },
+        { text: "Charlie" },
+      ],
+      finalText: "Charlie final",
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    expect(finalizeSpy.mock.calls.map((c) => c[2])).toEqual([
+      "Alpha",
+      "Bravo",
+      "Charlie final",
+    ]);
+    expect(new Set(finalizeSpy.mock.calls.map((c) => c[1])).size).toBe(3);
+  });
+
+  it("I3: a single-message turn still streams and settles on ONE id (no regression)", async () => {
+    const transport = new FakePeerChannel();
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      partialSteps: [
+        { boundary: true },
+        { text: "Hel" },
+        { text: "Hello" },
+        { text: "Hello world" },
+        { block: { text: "Hello world", assistantMessageIndex: 0 } },
+      ],
+      finalText: "Hello world",
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    expect(finalizeSpy).toHaveBeenCalledTimes(1);
+    const id = finalizeSpy.mock.calls[0][1];
+    expect(finalizeSpy.mock.calls[0][2]).toBe("Hello world");
     expect(progressSpy).toHaveBeenCalled();
-    const lastFrameText = progressSpy.mock.calls[progressSpy.mock.calls.length - 1][2];
-    // No double-roll: "First msg" rolled ONCE, second message accumulates in
-    // place — not "First msg\n\nSecond msg\n\nSecond msg more".
-    expect(lastFrameText).toBe("First msg\n\nSecond msg more");
-    expect((lastFrameText as string).match(/First msg/g)?.length).toBe(1);
+    for (const call of progressSpy.mock.calls) expect(call[1]).toBe(id);
+  });
+
+  it("I4: a final that QUOTES the earlier message still leaves two separate bubbles", async () => {
+    const transport = new FakePeerChannel();
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // B's own streamed text QUOTES A's sentence verbatim, and B's final
+      // repeats it again. Any `includes`/suffix-based identity check would read
+      // B as "the same message, extended" and merge the two into one bubble.
+      partialSteps: [
+        { text: "The capital is Paris." },
+        { text: "Yes — The capital is Paris. Anything else?" },
+      ],
+      finalText: "Yes — The capital is Paris. Anything else?",
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    expect(finalizeSpy).toHaveBeenCalledTimes(2);
+    expect(finalizeSpy.mock.calls[0][2]).toBe("The capital is Paris.");
+    expect(finalizeSpy.mock.calls[1][2]).toBe("Yes — The capital is Paris. Anything else?");
+    expect(finalizeSpy.mock.calls[0][1]).not.toBe(finalizeSpy.mock.calls[1][1]);
+  });
+
+  it("I5: a final that fully rewrites B replaces only B; A is untouched", async () => {
+    const transport = new FakePeerChannel();
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      partialSteps: [
+        { text: "First answer" },
+        { text: "draft of second" },
+        // core's declared same-message rewrite: never a new bubble.
+        { replace: "second, rewritten" },
+      ],
+      finalText: "SECOND, FULLY REWRITTEN",
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    expect(finalizeSpy).toHaveBeenCalledTimes(2);
+    expect(finalizeSpy.mock.calls[0][2]).toBe("First answer");
+    expect(finalizeSpy.mock.calls[1][2]).toBe("SECOND, FULLY REWRITTEN");
+  });
+
+  it("I6: lane A failing to settle does not stop B's final from being delivered", async () => {
+    const transport = new FakePeerChannel();
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    // The FIRST terminal frame (lane A) throws; every later one succeeds.
+    let firstSettle = true;
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockImplementation(() => {
+      if (firstSettle) {
+        firstSettle = false;
+        throw new Error("socket closed while settling lane A");
+      }
+      return true;
+    });
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      partialSteps: [{ text: "First msg" }, { text: "Second msg" }],
+      finalText: "Second msg final",
+    });
+
+    await expect(
+      handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" }),
+    ).resolves.toBeUndefined();
+
+    expect(finalizeSpy).toHaveBeenCalledTimes(2);
+    expect(finalizeSpy.mock.calls[1][2]).toBe("Second msg final");
+  });
+
+  it("I7: a failed final keeps the P0-4 turn outcome (settles `ok`, no false failure)", async () => {
+    const transport = new FakePeerChannel();
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    // B's terminal frame is refused by the transport.
+    vi.spyOn(transport, "finalizeDraft").mockReturnValue(false);
+    const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      partialSteps: [{ text: "First msg" }, { text: "Second msg" }],
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      id: "turn-i7",
+      text: "hi",
+    });
+
+    // P0-4: a dropped answer frame is a transport failure, not a turn failure —
+    // the user's message still settles `ok` and the text is recovered by the
+    // history snapshot.
+    expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-i7", "ok");
+  });
+
+  it("I8: an abort settles the ACTIVE lane from its snapshot while its first frame is still throttled", async () => {
+    // TIMING IS THE POINT. Each step advances the clock by 1ms: enough for the
+    // loop to record `lastSentAt` from the previous send, far short of the
+    // ~600ms throttle. So message B's rotation lands its frame in the pending
+    // window — `started` is false for B's lane while its text already exists.
+    // Gating the abort settle on `started` drops that text; gating it on the
+    // snapshot keeps it.
+    vi.useFakeTimers();
+    try {
+      const transport = new FakePeerChannel();
+      const events: string[] = [];
+      vi.spyOn(transport, "sendProgress").mockImplementation((_p, id, text) => {
+        events.push(`progress ${id} ${text}`);
+        return true;
+      });
+      vi.spyOn(transport, "finalizeDraft").mockImplementation((_p, id, text) => {
+        events.push(`final ${id} ${text}`);
+        return true;
+      });
+
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        // The run resolves with no final at all (abort / silent completion).
+        partialSteps: [{ text: "First msg" }, { text: "Second msg partial" }],
+        skipFinal: true,
+        betweenSteps: async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        },
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+      const idA = events[0]!.split(" ")[1];
+      const idB = events[2]!.split(" ")[1];
+      expect(idB).not.toBe(idA);
+      // A settled at its rotation. B's frame was still pending when the run
+      // ended, so the settle path flushed it and THEN settled that same id —
+      // no lost text, no third bubble, no stop marker.
+      expect(events).toEqual([
+        `progress ${idA} First msg`,
+        `final ${idA} First msg`,
+        `progress ${idB} Second msg partial`,
+        `final ${idB} Second msg partial`,
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("I8b: an abort leaves NO bubble for a lane that has nothing to settle", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new FakePeerChannel();
+      const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        // Message A settles on the index change; the run then ends with the new
+        // lane holding no text of its own (§6.2-2b / §8-6).
+        partialSteps: [
+          { text: "First msg" },
+          { block: { text: "First msg", assistantMessageIndex: 0 } },
+          { text: "Second msg" },
+          { block: { text: "Second msg", assistantMessageIndex: 1 } },
+          { text: "Third msg" },
+        ],
+        skipFinal: true,
+        betweenSteps: async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        },
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+      // Three messages, three bubbles, no empty fourth and no "Stopped" marker.
+      expect(finalizeSpy.mock.calls.map((c) => c[2])).toEqual([
+        "First msg",
+        "Second msg",
+        "Third msg",
+      ]);
+      expect(new Set(finalizeSpy.mock.calls.map((c) => c[1])).size).toBe(3);
+      for (const call of finalizeSpy.mock.calls) {
+        expect(call[2] as string).not.toContain("Stopped");
+      }
+      // Every id that was shown as a working bubble was also settled.
+      const shown = new Set(progressSpy.mock.calls.map((c) => c[1]));
+      const settled = new Set(finalizeSpy.mock.calls.map((c) => c[1]));
+      for (const id of shown) expect(settled.has(id)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("I8c: a rotated lane with no text of its own never mints an empty bubble on abort", async () => {
+    const transport = new FakePeerChannel();
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // A settles on the index change and the run ends immediately. The fresh
+      // lane holds B's queued block but never streamed a character, so the
+      // snapshot the abort path reads is empty and nothing is settled for it.
+      partialSteps: [
+        { text: "First msg" },
+        { block: { text: "First msg", assistantMessageIndex: 0 } },
+        { block: { text: "Second msg", assistantMessageIndex: 1 } },
+      ],
+      skipFinal: true,
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    // Lane B holds a queued block but never streamed, so the abort path leaves
+    // it alone rather than promoting it — and lane A keeps its own bubble.
+    expect(finalizeSpy.mock.calls.map((c) => c[2])).toEqual(["First msg"]);
+  });
+
+  it("I11: a compaction notice is delivered plainly and never becomes a lane's body", async () => {
+    const transport = new FakePeerChannel();
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      // Core's notice arrives on the SAME callbacks an answer block uses. It
+      // never streamed as a partial and is never repeated in the final, so the
+      // partial-mode block swallow must not eat it — and recording it would
+      // make it the settled body of this partial-less lane.
+      partialSteps: [
+        { block: { text: "🧹 Compacting context...", assistantMessageIndex: 0, isCompactionNotice: true } },
+        { deliverNotice: "🧹 Compacting context..." },
+        { text: "Here is the answer" },
+      ],
+      finalText: "Here is the answer",
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    // Delivered, once, on the plain path.
+    expect(sendTextSpy.mock.calls.map((c) => c[1])).toEqual(["🧹 Compacting context..."]);
+    // One bubble, holding the answer — not the notice.
+    expect(finalizeSpy.mock.calls.map((c) => c[2])).toEqual(["Here is the answer"]);
+  });
+
+  it("I9: progress mode keeps the volatile scaffold and one atomic final (no regression)", async () => {
+    const transport = new FakePeerChannel();
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    let seenReplyOptions: any;
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "progress" } },
+      fireToolProgress: true,
+      // The callback-axis steps do not fire: progress mode wires neither the
+      // answer stream nor the block/boundary callbacks. The DELIVERED block
+      // does arrive, and it must be sent — progress mode has a draft but never
+      // streams answer text, so nothing else would ever carry that text. The
+      // partial-mode swallow is what its `answerStreamingEnabled` guard keeps
+      // out of this path.
+      partialSteps: [
+        { text: "leaked answer" },
+        { block: { text: "leaked block", assistantMessageIndex: 1 } },
+        { boundary: true },
+        { deliverBlock: "half of the answer" },
+      ],
+      onReplyOptions: (ro) => {
+        seenReplyOptions = ro;
+      },
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    expect(seenReplyOptions?.onToolStart).toBeTypeOf("function");
+    expect(seenReplyOptions?.onPartialReply).toBeUndefined();
+    expect(seenReplyOptions?.onBlockReplyQueued).toBeUndefined();
+    expect(seenReplyOptions?.onAssistantMessageStart).toBeUndefined();
+    // The delivered block went out on the plain path — never swallowed.
+    expect(sendTextSpy.mock.calls.map((c) => c[1])).toEqual(["half of the answer"]);
+    // Tool-lines-only scaffold, then ONE atomic terminal frame on that same id.
+    expect(progressSpy).toHaveBeenCalled();
+    expect(progressSpy.mock.calls[0][2].split("\n")[0]).toMatch(/…$/);
+    for (const call of progressSpy.mock.calls) {
+      expect(call[2]).not.toContain("leaked");
+    }
+    expect(finalizeSpy).toHaveBeenCalledTimes(1);
+    expect(finalizeSpy).toHaveBeenCalledWith(
+      "web-anon",
+      progressSpy.mock.calls[0][1],
+      "hi back",
+      expect.any(String),
+    );
+  });
+
+  it.each(["block", "off"] as const)(
+    "I10: streaming.mode=%s keeps the plain append path and delivery accounting",
+    async (mode) => {
+      const transport = new FakePeerChannel();
+      const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+      const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode } },
+        // Blocks delivered through the seam still take the plain send path in
+        // these modes: there is no lane to absorb them.
+        partialSteps: [{ deliverBlock: "block one" }, { deliverBlock: "block two" }],
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+      expect(progressSpy).not.toHaveBeenCalled();
+      expect(finalizeSpy).not.toHaveBeenCalled();
+      expect(sendTextSpy.mock.calls.map((c) => c[1])).toEqual([
+        "block one",
+        "block two",
+        "hi back",
+      ]);
+      // Plain appends carry no id (the legacy no-id agent_message path).
+      for (const call of sendTextSpy.mock.calls) expect(call[2]).toBeUndefined();
+    },
+  );
+
+  it("I10b: in partial mode a delivered block adds no bubble (its text is already in the lane)", async () => {
+    const transport = new FakePeerChannel();
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      partialSteps: [
+        { text: "First msg" },
+        { block: { text: "First msg", assistantMessageIndex: 0 } },
+        // The block drains through the delivery seam AFTER the lane already
+        // rotated; it must not append a duplicate bubble (§6.2-6).
+        { text: "Second msg" },
+        { deliverBlock: "First msg" },
+      ],
+      finalText: "Second msg final",
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", { type: "user_message", text: "hi" });
+
+    expect(sendTextSpy).not.toHaveBeenCalled();
+    expect(finalizeSpy.mock.calls.map((c) => c[2])).toEqual(["First msg", "Second msg final"]);
   });
 
   it("does NOT stream answer text in progress mode (onPartialReply is not wired — regression)", async () => {
