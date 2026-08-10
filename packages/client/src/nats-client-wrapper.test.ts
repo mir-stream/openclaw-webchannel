@@ -660,6 +660,438 @@ describe("WebChannelNATSClient — #16 ordered history insertion", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #94 multi-bubble turns — PRE-FIX CHARACTERIZATION.
+//
+// Until now the plugin reused ONE draft id per turn, so a turn was exactly one
+// agent bubble and tier-3 positional adoption was an exception path (it fired
+// only when a single live reply's text had been reformatted). The #94 fix
+// rotates the draft lane per assistant message, so a turn becomes N bubbles
+// sharing one turnId under N DIFFERENT ids — and tier-3 becomes the ROUTINE
+// path, because every one of those bubbles carries a live-only
+// `webchannel-…` id that the core transcript never stores.
+//
+// These tests pin the client's existing behavior against that new shape BEFORE
+// the plugin changes. They are deliberately assertions about code that already
+// works by construction rather than by test — the point is to freeze it, so a
+// later refactor of the reconciler cannot silently regress multi-bubble turns
+// into duplicates or dropped replies. Nothing here changes production code.
+//
+// The asymmetric cases (C3/C4) are the interesting ones: live bubble count and
+// snapshot row count are allowed to disagree (a live bubble that never made it
+// into the transcript, or a defensive lane rotation the core coalesced away),
+// and the reconciler must still converge without duplicating or losing text.
+// ---------------------------------------------------------------------------
+describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => {
+  type AnyFrame = { type: string; [k: string]: unknown };
+  function makeWrapper(): WebChannelNATSClient {
+    return new WebChannelNATSClient({
+      natsUrl: "ws://127.0.0.1:4222",
+      bootstrapJwt: "eyJ-bootstrap",
+      accountId: "a",
+      tenant: "t",
+      peerId: "p",
+      registration,
+    });
+  }
+  function deliver(wrapper: WebChannelNATSClient, frame: AnyFrame): void {
+    (wrapper as unknown as { handleMessage: (m: AnyFrame) => void }).handleMessage(frame);
+  }
+
+  /**
+   * One assistant message of a post-#94 turn: a streaming draft on its own lane
+   * id, then the final frame that settles that same lane. Both frames carry the
+   * SHARED turnId — that is the whole shape change #94 introduces.
+   */
+  function liveBubble(
+    w: WebChannelNATSClient,
+    id: string,
+    turnId: string,
+    partial: string,
+    final: string,
+  ): void {
+    deliver(w, { type: "progress", id, turnId, text: partial });
+    deliver(w, { type: "agent_message", id, turnId, text: final });
+  }
+
+  // --- C1: live-only, no snapshot involved. -------------------------------
+  it("C1: two lanes of one turn render as two independent bubbles in arrival order", () => {
+    const w = makeWrapper();
+    // Post-#94 plugin output: one turn, two assistant messages, two lane ids.
+    liveBubble(w, "webchannel-a", "T", "first partial…", "first answer");
+    liveBubble(w, "webchannel-b", "T", "second partial…", "second answer");
+
+    const messages = w.getState().messages;
+    // Distinct ids ⇒ distinct upsert targets: the second lane must APPEND, not
+    // overwrite the first (pre-#94 the shared id made the second frame clobber
+    // the first bubble's text — that is exactly the data loss #94 fixes).
+    expect(messages.map((m) => m.id)).toEqual(["webchannel-a", "webchannel-b"]);
+    expect(messages.map((m) => m.text)).toEqual(["first answer", "second answer"]);
+    // Each lane settled on its own final frame; neither is left streaming.
+    expect(messages.map((m) => m.working)).toEqual([false, false]);
+    // The shared turnId rides along on both (it is what turn_settled and the
+    // reasoning disarm correlate on).
+    expect(messages.map((m) => m.turnId)).toEqual(["T", "T"]);
+  });
+
+  // --- C2: symmetric live 2 / snapshot 2. ---------------------------------
+  it("C2: a snapshot of a two-bubble turn adopts BOTH canonical ids instead of duplicating", () => {
+    const w = makeWrapper();
+    w.send("hello"); // u-0 local echo
+    liveBubble(w, "webchannel-a", "T", "…", "live A");
+    liveBubble(w, "webchannel-b", "T", "…", "live B");
+    expect(w.getState().messages).toHaveLength(3);
+
+    // Snapshot from another device's register. The stored agent text carries the
+    // metadata core strips from live frames, so it is NOT byte-equal to either
+    // live text ⇒ tier 2 cannot match either agent row and tier 3 must carry
+    // BOTH. This is the routine case after #94, not an edge case.
+    const snapshot = [
+      { id: "core-u1", role: "user", text: "hello", ts: 1 },
+      { id: "core-a1", role: "agent", text: "live A\n\n<stored metadata A>", ts: 2 },
+      { id: "core-a2", role: "agent", text: "live B\n\n<stored metadata B>", ts: 3 },
+    ];
+    deliver(w, { type: "history", messages: snapshot });
+
+    const messages = w.getState().messages;
+    // core-u1 tier-2 matches u-0 → anchor=0, cursor=1.
+    // core-a1 tier-3 probes anchor+1=1 (agent, live id, not working) → adopt,
+    //   anchor=1, cursor=2.
+    // core-a2 tier-3 probes anchor+1=2 → adopt.
+    // This case constrains anchor advancement on TIER-3 adoption. Every tier-2
+    // and tier-3 adoption routes through the shared `adoptAt` helper, which
+    // sets `anchor = idx`; the only writes outside it are the tier-1 branch and
+    // the `anchor = null` on a fresh insert.
+    // Mutation-checked — restoring the previous anchor at the tier-3 call site
+    // only (`const a = anchor; adoptAt(cand, m); anchor = a;`) makes core-a2
+    // re-probe idx 1, hit the `claimed` guard and fresh-insert: four bubbles
+    // with a duplicated reply. C2, C4 and C4b all fail on that; C3 and C3b do
+    // NOT — their surviving bubble sits at the first probed slot either way, so
+    // those three tests carry it between them.
+    // (Deleting `anchor = idx` from `adoptAt` wholesale is a far broader break
+    // rather than a sharper version of the same one: the tier-2 user match then
+    // leaves the anchor null, which disables tier 3 entirely. Nine tests across
+    // four describe blocks catch that, C3 and C3b among them.)
+    expect(messages).toHaveLength(3); // no duplicates
+    expect(messages.map((m) => m.id)).toEqual(["core-u1", "core-a1", "core-a2"]);
+    // Adoption keeps the CANONICAL stored text, so this device converges on
+    // exactly what a freshly-reloading device renders.
+    expect(messages.map((m) => m.text)).toEqual([
+      "hello",
+      "live A\n\n<stored metadata A>",
+      "live B\n\n<stored metadata B>",
+    ]);
+
+    // Stateless register re-delivers the same snapshot on every register by any
+    // device, so the repeat must leave the array alone — same count, same ids,
+    // same order — or a busy multi-device room would grow duplicates over time.
+    // (This asserts the OUTCOME only. The reconciler happens to reach it via an
+    // early return, but a rebuild that reproduces the identical array is just as
+    // acceptable here; nothing below pins the mechanism.)
+    deliver(w, { type: "history", messages: snapshot });
+    const after = w.getState().messages;
+    expect(after).toHaveLength(3);
+    expect(after.map((m) => m.id)).toEqual(["core-u1", "core-a1", "core-a2"]);
+  });
+
+  // --- C3: asymmetric live 1 / snapshot 2, the FIRST lane never settled. ---
+  it("C3: when the first lane never settled, the surviving bubble is re-labelled and the array still converges", () => {
+    const w = makeWrapper();
+    // §8-1: lane A never settled on this device (its frames were lost), so the
+    // only agent bubble here is lane B — the SECOND reply. The snapshot carries
+    // both rows.
+    w.send("hello"); // u-0
+    liveBubble(w, "webchannel-b", "T", "…", "live B");
+    expect(w.getState().messages).toHaveLength(2);
+
+    const snapshot = [
+      { id: "core-u1", role: "user", text: "hello", ts: 1 },
+      { id: "core-a1", role: "agent", text: "reply A\n\n<stored>", ts: 2 },
+      { id: "core-a2", role: "agent", text: "live B\n\n<stored>", ts: 3 },
+    ];
+    deliver(w, { type: "history", messages: snapshot });
+
+    const messages = w.getState().messages;
+    // MECHANISM — worth reading carefully, because it is NOT what the plan's
+    // first draft implied. That draft said "tier-3 anchor advancement must not
+    // wrongly adopt B into A's slot" (the plan now records this as an error and
+    // states the real path). What actually happens is the
+    // mirror image of that: core-a1 (lane A's row) is processed FIRST, tier-3
+    // probes anchor+1 = idx 1, finds the lane-B bubble there, and adopts A's
+    // row ONTO IT — the anchor chain reaches that bubble before core-a2 ever
+    // gets a look. core-a2 then probes idx 2 (past the end), misses, and
+    // fresh-inserts at cursor 2.
+    // So the agent bubble's identity shifts by one slot (the user bubble is
+    // unaffected — it matched by text in tier 2). The final
+    // array is still exactly right — `adoptAt` overwrites the adopted bubble
+    // with the row's CANONICAL text, and the leftover row lands after it — so
+    // content and order both converge even though the path is not the one the
+    // plan describes.
+    // WHAT THIS PINS (mutation-checked): that this shape converges at all.
+    // Disabling tier 3 strands the live bubble as a fourth entry (duplicate
+    // reply), and dropping `cursor = idx + 1` from `adoptAt` misplaces the
+    // fresh row; both are caught here. It does NOT pin tier-3 anchor
+    // advancement — see the note in C2.
+    expect(messages).toHaveLength(3);
+    expect(messages.map((m) => m.id)).toEqual(["core-u1", "core-a1", "core-a2"]);
+    expect(messages.map((m) => m.text)).toEqual([
+      "hello",
+      "reply A\n\n<stored>",
+      "live B\n\n<stored>",
+    ]);
+    // The fresh row lands settled — transcript history is never streaming.
+    expect(messages[2].working).toBe(false);
+
+    // Repeat delivery is a plain id no-op.
+    deliver(w, { type: "history", messages: snapshot });
+    const after = w.getState().messages;
+    expect(after).toHaveLength(3);
+    expect(after.map((m) => m.id)).toEqual(["core-u1", "core-a1", "core-a2"]);
+    expect(after.map((m) => m.text)).toEqual([
+      "hello",
+      "reply A\n\n<stored>",
+      "live B\n\n<stored>",
+    ]);
+  });
+
+  // --- C3b: asymmetric live 1 / snapshot 2, the LAST lane never arrived. ---
+  it("C3b: a trailing reply this device never rendered is inserted after the adopted bubble", () => {
+    const w = makeWrapper();
+    // §8-4 (reconnect/register history recovers messages this device missed):
+    // the LATER lane never rendered here at all — the tab was away or the
+    // frames were dropped — so the snapshot carries a trailing reply this
+    // device has no local bubble for.
+    w.send("hello"); // u-0
+    liveBubble(w, "webchannel-a", "T", "…", "live A");
+    expect(w.getState().messages).toHaveLength(2);
+
+    const snapshot = [
+      { id: "core-u1", role: "user", text: "hello", ts: 1 },
+      { id: "core-a1", role: "agent", text: "live A\n\n<stored metadata A>", ts: 2 },
+      { id: "core-a2", role: "agent", text: "the reply this device never saw", ts: 3 },
+    ];
+    deliver(w, { type: "history", messages: snapshot });
+
+    const messages = w.getState().messages;
+    // core-u1 → adopt idx 0, anchor=0, cursor=1.
+    // core-a1 → tier-3 probes idx 1 (the only live agent bubble) → adopt,
+    //   anchor=1, cursor=2.
+    // core-a2 → tier-3 probes idx 2, which is PAST the end of the local array,
+    //   so no adoption happens and it fresh-inserts at cursor=2.
+    // WHAT THIS CASE ACTUALLY CONSTRAINS (mutation-checked): that tier-3 fires
+    // at all, and that `adoptAt` advances the cursor. Disabling tier 3 makes
+    // core-a1 fresh-insert instead of adopting, stranding the live bubble as a
+    // fourth entry (duplicate reply); dropping `cursor = idx + 1` misplaces the
+    // trailing fresh row. Both failures are caught here.
+    // It does NOT constrain the PAIRING, and no claim to that effect belongs
+    // here: the surviving bubble sits at idx 1, the first slot tier-3 probes
+    // (`cand = anchor + 1`) under any positional rule, and core-a1 is processed
+    // before core-a2 — so no probe mutation can hand this bubble the wrong row.
+    // (For core-a2 to land here instead, core-a1's adoption would have to fail,
+    // which sets `anchor = null` and makes core-a2 fresh-insert anyway.)
+    // Tier-3 anchor advancement is pinned by C2/C4/C4b, not here.
+    expect(messages).toHaveLength(3); // nothing lost, nothing duplicated
+    expect(messages.map((m) => m.id)).toEqual(["core-u1", "core-a1", "core-a2"]);
+    expect(messages[1].text).toBe("live A\n\n<stored metadata A>");
+    expect(messages[2].text).toBe("the reply this device never saw");
+    // The fresh row lands settled — it is transcript history, never streaming.
+    expect(messages[2].working).toBe(false);
+
+    deliver(w, { type: "history", messages: snapshot });
+    const after = w.getState().messages;
+    expect(after).toHaveLength(3);
+    expect(after.map((m) => m.id)).toEqual(["core-u1", "core-a1", "core-a2"]);
+  });
+
+  // --- C4: asymmetric live 3 / snapshot 2 (snapshot predates the last lane). -
+  it("C4: a live bubble newer than every snapshot row is neither duplicated nor dropped", () => {
+    const w = makeWrapper();
+    // §8-4, read in the other direction: the register that produced this
+    // snapshot happened BEFORE lane C was persisted, so the snapshot is simply
+    // a prefix of what this device already holds — three live agent bubbles
+    // against two stored rows, with lane C corresponding to no row at all.
+    // (This is NOT the §6.5.1 defensive-rotation divergence, where the last
+    // stored row DOES correspond to the last live bubble. C4b covers that.)
+    w.send("hello"); // u-0
+    liveBubble(w, "webchannel-a", "T", "…", "live A");
+    liveBubble(w, "webchannel-b", "T", "…", "live B");
+    liveBubble(w, "webchannel-c", "T", "…", "live C");
+    expect(w.getState().messages).toHaveLength(4);
+
+    const snapshot = [
+      { id: "core-u1", role: "user", text: "hello", ts: 1 },
+      { id: "core-a1", role: "agent", text: "live A\n\n<stored metadata A>", ts: 2 },
+      { id: "core-a2", role: "agent", text: "live B\n\n<stored metadata B>", ts: 3 },
+    ];
+    deliver(w, { type: "history", messages: snapshot });
+
+    const messages = w.getState().messages;
+    // core-u1 → idx 0; core-a1 → idx 1; core-a2 → idx 2. The snapshot runs out
+    // before the local array does, so idx 3 (lane C) is simply never probed and
+    // keeps its LIVE id and LIVE text.
+    // The invariant being frozen: a live bubble the snapshot does not reach
+    // must survive untouched and in place, and a later snapshot that DOES carry
+    // it will adopt it then. Dropping it would lose a rendered reply; inserting
+    // the snapshot rows around it would duplicate one.
+    expect(messages).toHaveLength(4);
+    expect(messages.map((m) => m.id)).toEqual([
+      "core-u1",
+      "core-a1",
+      "core-a2",
+      "webchannel-c",
+    ]);
+    expect(messages.map((m) => m.text)).toEqual([
+      "hello",
+      "live A\n\n<stored metadata A>",
+      "live B\n\n<stored metadata B>",
+      "live C",
+    ]);
+
+    // Repeat delivery: the three snapshot ids are all tier-1 hits and lane C is
+    // untouched, so the array must be identical.
+    deliver(w, { type: "history", messages: snapshot });
+    const after = w.getState().messages;
+    expect(after).toHaveLength(4);
+    expect(after.map((m) => m.id)).toEqual([
+      "core-u1",
+      "core-a1",
+      "core-a2",
+      "webchannel-c",
+    ]);
+  });
+
+  // --- C4b: the §6.5.1 defensive-rotation divergence. ---------------------
+  //
+  // READ THIS AS A COST LEDGER, NOT AS A CORRECTNESS PIN.
+  //
+  // §6.5.1 of the plan ACCEPTS a known divergence: when the plugin cannot prove
+  // a boundary is the same assistant message it rotates the lane defensively,
+  // so ONE assistant message that got rewritten mid-flight renders as TWO live
+  // bubbles here while the core transcript stores it as ONE row. Unlike C4, the
+  // last stored row DOES correspond to the last live bubble — and that is
+  // precisely what breaks the reconciler's positional assumption.
+  //
+  // The behavior below is the accepted trade-off's actual price, measured:
+  // tier 3 pairs the final stored row onto the WRONG live bubble (the earlier
+  // one, because the anchor chain reaches it first), leaving the rewritten
+  // message on screen TWICE — once with canonical text under the adopted id,
+  // once with live text under the surviving live id. Nothing later in the
+  // session clears it: repeat snapshots are pure id no-ops. Only a full reload
+  // into empty state converges to the correct three bubbles.
+  //
+  // This test exists so that price is visible and cannot change silently. It is
+  // NOT an assertion that the duplicate is correct. If the #94 fix (or a later
+  // reconciler change) makes the session converge, this test SHOULD fail — and
+  // the right response is to update it to the better behavior, not to preserve
+  // the duplicate.
+  it("C4b: §6.5.1 accepted divergence — a defensively-rotated rewrite shows TWICE until a full reload", () => {
+    const w = makeWrapper();
+    w.send("hello"); // u-0
+    liveBubble(w, "webchannel-a", "T", "…", "msg A");
+    // One assistant message, rewritten mid-flight across a defensive rotation:
+    // lane B held the pre-rewrite rendering, lane C the final one.
+    liveBubble(w, "webchannel-b", "T", "…", "msg C draft");
+    liveBubble(w, "webchannel-c", "T", "…", "msg C rewritten");
+    expect(w.getState().messages).toHaveLength(4);
+
+    // The transcript stored the rewrite ONCE — so the last row's text tracks
+    // lane C, not lane B.
+    const snapshot = [
+      { id: "core-u1", role: "user", text: "hello", ts: 1 },
+      { id: "core-a1", role: "agent", text: "msg A\n\n<stored>", ts: 2 },
+      { id: "core-a2", role: "agent", text: "msg C rewritten\n\n<stored>", ts: 3 },
+    ];
+    deliver(w, { type: "history", messages: snapshot });
+
+    const messages = w.getState().messages;
+    // core-u1 → idx 0 (anchor=0); core-a1 → tier-3 idx 1 (anchor=1);
+    // core-a2 → tier-3 probes anchor+1 = idx 2 = lane B and adopts THERE.
+    // Tier 3 is purely positional — it has no way to know the row it is
+    // carrying describes lane C, two slots down — so lane C is left holding an
+    // unadopted second copy of the same message.
+    expect(messages).toHaveLength(4);
+    expect(messages.map((m) => m.id)).toEqual([
+      "core-u1",
+      "core-a1",
+      "core-a2",
+      "webchannel-c",
+    ]);
+    // The last two entries are two renderings of the SAME assistant message:
+    // the canonical stored text under the adopted id, and the live text under
+    // the surviving live id. This is the visible duplicate.
+    expect(messages[2].text).toBe("msg C rewritten\n\n<stored>");
+    expect(messages[3].text).toBe("msg C rewritten");
+
+    // The duplicate is NOT self-healing within the session: every later
+    // snapshot hits all three ids in tier 1 and changes nothing.
+    deliver(w, { type: "history", messages: snapshot });
+    const after = w.getState().messages;
+    expect(after).toHaveLength(4);
+    expect(after.map((m) => m.id)).toEqual([
+      "core-u1",
+      "core-a1",
+      "core-a2",
+      "webchannel-c",
+    ]);
+    expect(after.map((m) => m.text)).toEqual([
+      "hello",
+      "msg A\n\n<stored>",
+      "msg C rewritten\n\n<stored>",
+      "msg C rewritten",
+    ]);
+
+    // Convergence happens only on a full reload — the same snapshot hydrated
+    // into EMPTY state has no live bubbles to mis-pair and yields the correct
+    // three. That gap (session shows 4, reload shows 3) is the accepted cost.
+    const reloaded = makeWrapper();
+    deliver(reloaded, { type: "history", messages: snapshot });
+    const fresh = reloaded.getState().messages;
+    expect(fresh).toHaveLength(3);
+    expect(fresh.map((m) => m.id)).toEqual(["core-u1", "core-a1", "core-a2"]);
+    expect(fresh.map((m) => m.text)).toEqual([
+      "hello",
+      "msg A\n\n<stored>",
+      "msg C rewritten\n\n<stored>",
+    ]);
+  });
+
+  // --- C5(a): one turn_settled must settle EVERY lane of its turn. --------
+  it("C5a: a single turn_settled finalizes every working draft sharing its turnId, in place", () => {
+    const w = makeWrapper();
+    // Three lanes of turn T left streaming (their final frames never arrived),
+    // plus one lane of an unrelated turn U.
+    deliver(w, { type: "progress", id: "webchannel-a", turnId: "T", text: "A partial…" });
+    deliver(w, { type: "progress", id: "webchannel-b", turnId: "T", text: "B partial…" });
+    deliver(w, { type: "progress", id: "webchannel-c", turnId: "T", text: "C partial…" });
+    deliver(w, { type: "progress", id: "webchannel-z", turnId: "U", text: "Z partial…" });
+    expect(w.getState().messages.map((m) => m.working)).toEqual([true, true, true, true]);
+
+    // Settlement correlates by turnId, not by draft id — so ONE frame has to
+    // clear all N lanes of that turn. If it settled only the newest draft, the
+    // older lanes would stay `working` and keep turnInFlight() true, wedging
+    // the composer until some other unwedge path fires — an explicit /stop
+    // (finalizeLocalTurnState) or a reconnect arming the staleness valve.
+    deliver(w, { type: "turn_settled", turnId: "T" });
+
+    const messages = w.getState().messages;
+    expect(messages.map((m) => m.working)).toEqual([false, false, false, true]);
+    // Finalization is IN PLACE: ids and texts must survive untouched, so a late
+    // frame on any lane still re-matches its bubble instead of duplicating it.
+    expect(messages.map((m) => m.id)).toEqual([
+      "webchannel-a",
+      "webchannel-b",
+      "webchannel-c",
+      "webchannel-z",
+    ]);
+    expect(messages.map((m) => m.text)).toEqual([
+      "A partial…",
+      "B partial…",
+      "C partial…",
+      "Z partial…",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // #15 approval rehydration — the wrapper reconciles its approval state against
 // the authoritative `approval_snapshot` frame (Legs A/B/C).
 // ---------------------------------------------------------------------------
@@ -1847,6 +2279,76 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true); // not yet
       vi.advanceTimersByTime(1_000);
       expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(false); // now
+    });
+
+    // #94: after the per-message lane rotation a single turn leaves N working
+    // drafts under N different ids, so the valve has to arm and expire them
+    // individually rather than "the draft" of the turn.
+    it("#94: expires EVERY wedged lane of a multi-bubble turn, each in place", () => {
+      vi.useFakeTimers();
+      const w = makeWrapper();
+      goOnline(w);
+      // One turn, three lanes, all left streaming across the reconnect.
+      deliver(w, { type: "progress", id: "webchannel-a", text: "A partial…", turnId: "T" });
+      deliver(w, { type: "progress", id: "webchannel-b", text: "B partial…", turnId: "T" });
+      deliver(w, { type: "progress", id: "webchannel-c", text: "C partial…", turnId: "T" });
+      w.send("held"); // held behind the working drafts
+      fireSession(w); // arm: the watch set takes ALL THREE ids
+
+      vi.advanceTimersByTime(30_000);
+      const byId = (id: string) => messages(w).find((m) => m.id === id)!;
+      // Arming iterates every `working` message, so one wedged turn arms N
+      // entries and the single grace timer expires all of them together. Leaving
+      // any one lane `working` would keep turnInFlight() true and the composer
+      // wedged — the exact lockout this valve exists to prevent.
+      for (const [id, text] of [
+        ["webchannel-a", "A partial…"],
+        ["webchannel-b", "B partial…"],
+        ["webchannel-c", "C partial…"],
+      ] as const) {
+        expect(byId(id).working).toBe(false); // flipped
+        expect(byId(id).id).toBe(id); // id untouched
+        expect(byId(id).text).toBe(text); // text untouched
+      }
+      expect(pendingBubbles(w)).toHaveLength(0); // released
+    });
+
+    it("#94: a progress on ONE lane inside the grace saves only that lane; the others still expire", () => {
+      vi.useFakeTimers();
+      const w = makeWrapper();
+      goOnline(w);
+      deliver(w, { type: "progress", id: "webchannel-a", text: "A partial…", turnId: "T" });
+      deliver(w, { type: "progress", id: "webchannel-b", text: "B partial…", turnId: "T" });
+      deliver(w, { type: "progress", id: "webchannel-c", text: "C partial…", turnId: "T" });
+      fireSession(w);
+
+      // Proof of life for lane B only. On the PROGRESS and AGENT_MESSAGE disarm
+      // paths the watch entry is dropped by draft ID (`staleDraftWatch.delete(id)`),
+      // so liveness on one lane does not vouch for its siblings. That per-lane
+      // independence is what this test freezes: after #94 the lanes of a turn
+      // genuinely can finish at different times, and a turn-wide disarm on these
+      // paths would re-wedge the composer on whichever lane actually died.
+      // SCOPE: per-lane disarm is a property of THESE two paths, not a global
+      // invariant. Several other paths clear watch entries well beyond a single
+      // lane, none of them covered here:
+      //   - `reasoning` → `disarmStaleDraftsByTurn` — every watched lane of the turn;
+      //   - `turn_settled` → `finalizeDraftsForTurn` — every working draft of the turn;
+      //   - explicit `/stop` → `finalizeLocalTurnState` — every working draft, globally;
+      //   - the terminal-error handler — every working draft, globally.
+      // `clearStaleDraftWatch` (teardown / re-arm) empties the whole set too,
+      // but that one IS covered — by the mid-grace flap test above.
+      vi.advanceTimersByTime(10_000);
+      deliver(w, { type: "progress", id: "webchannel-b", text: "B more…", turnId: "T" });
+
+      vi.advanceTimersByTime(30_000);
+      const byId = (id: string) => messages(w).find((m) => m.id === id)!;
+      expect(byId("webchannel-a").working).toBe(false); // expired
+      expect(byId("webchannel-c").working).toBe(false); // expired
+      expect(byId("webchannel-b").working).toBe(true); // survived on its own liveness
+      expect(byId("webchannel-b").text).toBe("B more…");
+      // The survivors' texts are untouched by expiry (in-place flip only).
+      expect(byId("webchannel-a").text).toBe("A partial…");
+      expect(byId("webchannel-c").text).toBe("C partial…");
     });
   });
 
