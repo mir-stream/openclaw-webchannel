@@ -56,6 +56,17 @@ type ReceiptRecord = {
   }>;
   drainingTransitions: boolean;
 };
+
+/**
+ * Wrapper operations admitted after connect() is requested from inside close().
+ * They share one FIFO so no operation can target the still-live old session or
+ * overtake a user/control publish while the replacement queue is committed.
+ */
+type DeferredReplacementOperation =
+  | { kind: "user"; localId: string; text: string; receiptKey: string }
+  | { kind: "approval-decision"; id: string; decision: ApprovalDecision }
+  | { kind: "load-history"; before?: string; limit?: number }
+  | { kind: "load-commands" };
 // P1-9: the client-side mirror of core's abort predicate (§3.3). Intentionally
 // NOT re-exported from the public barrel; imported directly here and by the
 // plugin-side contract test.
@@ -113,14 +124,10 @@ export class WebChannelNATSClient {
    * `localId` is the id of its `pending: true` transcript bubble.
    */
   private readonly held: Array<{ localId: string; text: string; receiptKey: string }> = [];
-  /** Immediate/control sends staged for a connect requested inside close(). */
-  private readonly deferredReplacementPublishes: Array<{
-    localId: string;
-    text: string;
-    receiptKey: string;
-  }> = [];
-  /** Keeps reentrant publishes behind entries already staged for replacement. */
-  private deferredReplacementPublishCommitDepth = 0;
+  /** Every outbound operation staged for a connect requested inside close(). */
+  private readonly deferredReplacementOperations: DeferredReplacementOperation[] = [];
+  /** Keeps reentrant operations behind entries already staged for replacement. */
+  private deferredReplacementOperationCommitDepth = 0;
   /** Prevent reentrant sends from jumping ahead of a final entry being released. */
   private heldReleaseCommitDepth = 0;
   /**
@@ -361,13 +368,13 @@ export class WebChannelNATSClient {
       this.connectDeferredUntilCloseCompletes = false;
       this.replacementHeldNeedsFreshEpisode = false;
       this.wrapperLifecycleGeneration++;
-      const deferredEntries = this.deferredReplacementPublishes.splice(0);
+      const deferredEntries = this.deferredReplacementOperations.splice(0);
       // P0-4 (D5 held/terminal): the queued/ledgered sends were already swept to
       // failed{terminal} by the low-level terminal sequence BEFORE this listener
       // ran; fail the wrapper-owned held[] here (they have no wireId, so the sweep
       // could not reach them). Retracted bubbles are preserved by failHeld.
       this.failHeld({ reason: "terminal", cause: cause ?? "unknown", retryable: false });
-      this.failDeferredReplacementPublishes(
+      this.failDeferredReplacementOperations(
         deferredEntries,
         { reason: "terminal", cause: cause ?? "unknown", retryable: false },
       );
@@ -458,14 +465,14 @@ export class WebChannelNATSClient {
       // Detach only this lifecycle's wrapper ownership before any timer or raw
       // teardown callout. Work created after a reentrant connect is replacement
       // ownership and remains in the live collections.
-      const deferredEntries = this.deferredReplacementPublishes.splice(0);
+      const deferredEntries = this.deferredReplacementOperations.splice(0);
       const heldEntries = this.takeHeld();
       // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
       this.clearStaleDraftWatch();
       this.client.disconnect();
       // Notify only the detached old lifecycle after raw teardown. Reentrant
       // replacement work cannot be consumed by either failure sweep.
-      this.failDeferredReplacementPublishes(
+      this.failDeferredReplacementOperations(
         deferredEntries,
         { reason: "closed", retryable: false },
       );
@@ -496,9 +503,9 @@ export class WebChannelNATSClient {
     this.connectDeferredUntilCloseCompletes = false;
 
     if (!shouldConnect) {
-      const stranded = this.deferredReplacementPublishes.splice(0);
+      const stranded = this.deferredReplacementOperations.splice(0);
       if (stranded.length > 0) {
-        this.failDeferredReplacementPublishes(
+        this.failDeferredReplacementOperations(
           stranded,
           this.terminal
             ? {
@@ -512,16 +519,17 @@ export class WebChannelNATSClient {
       return;
     }
 
-    // connect() clears the inner disconnected gate and starts the replacement
-    // dial synchronously. The committed sends below therefore enter that new
-    // lifecycle's outbound queue even though registration completes later.
-    this.client.connect();
-    this.deferredReplacementPublishCommitDepth++;
+    this.deferredReplacementOperationCommitDepth++;
     try {
-      while (this.deferredReplacementPublishes.length > 0) {
+      // Own the commit transaction BEFORE connect(): an injected WebSocket
+      // factory or synchronous onState callback may emit wrapper operations
+      // during the dial. They must append behind the already-staged FIFO, never
+      // enter the inner queue ahead of it.
+      this.client.connect();
+      while (this.deferredReplacementOperations.length > 0) {
         if (this.closed || this.terminal) {
-          const entries = this.deferredReplacementPublishes.splice(0);
-          this.failDeferredReplacementPublishes(
+          const entries = this.deferredReplacementOperations.splice(0);
+          this.failDeferredReplacementOperations(
             entries,
             this.terminal
               ? {
@@ -533,12 +541,12 @@ export class WebChannelNATSClient {
           );
           break;
         }
-        this.commitDeferredReplacementPublish(
-          this.deferredReplacementPublishes.shift()!,
+        this.commitDeferredReplacementOperation(
+          this.deferredReplacementOperations.shift()!,
         );
       }
     } finally {
-      this.deferredReplacementPublishCommitDepth--;
+      this.deferredReplacementOperationCommitDepth--;
     }
   }
 
@@ -675,7 +683,7 @@ export class WebChannelNATSClient {
    * a nested event drain, the commit helper exposes it once before returning.
    */
   private publish(trimmed: string): SendReceipt {
-    if (this.shouldDeferReplacementPublish()) {
+    if (this.shouldDeferReplacementOperation()) {
       return this.deferReplacementPublish(trimmed);
     }
     const receiptKey = this.newReceiptKey();
@@ -714,7 +722,9 @@ export class WebChannelNATSClient {
   private deferReplacementPublish(trimmed: string): SendReceipt {
     const receiptKey = this.newReceiptKey();
     const localId = `u-${this.uid()}`;
-    this.deferredReplacementPublishes.push({ localId, text: trimmed, receiptKey });
+    this.deferredReplacementOperations.push({
+      kind: "user", localId, text: trimmed, receiptKey,
+    });
     this.receipts.set(receiptKey, {
       id: receiptKey,
       state: "queued",
@@ -733,18 +743,46 @@ export class WebChannelNATSClient {
   }
 
   /** Preserve staged FIFO while replacement entries are being committed. */
-  private shouldDeferReplacementPublish(): boolean {
+  private shouldDeferReplacementOperation(): boolean {
     if (this.closed || this.terminal) return false;
     return this.deferredReplacementOpen()
-      || this.deferredReplacementPublishCommitDepth > 0;
+      || this.deferredReplacementOperationCommitDepth > 0;
   }
 
-  /** Assign transport identity and hand one staged control to the new lifecycle. */
-  private commitDeferredReplacementPublish(entry: {
-    localId: string;
-    text: string;
-    receiptKey: string;
-  }): void {
+  /** Queue an untracked operation or run it immediately on the current lifecycle. */
+  private deferOrRunReplacementOperation(
+    operation: Exclude<DeferredReplacementOperation, { kind: "user" }>,
+  ): void {
+    if (this.deferReplacementOperation(operation)) return;
+    this.commitDeferredReplacementOperation(operation);
+  }
+
+  /** Reserve FIFO ownership before a public state callout when replacement-bound. */
+  private deferReplacementOperation(
+    operation: Exclude<DeferredReplacementOperation, { kind: "user" }>,
+  ): boolean {
+    if (!this.shouldDeferReplacementOperation()) return false;
+    this.deferredReplacementOperations.push(operation);
+    return true;
+  }
+
+  /** Hand one staged operation to the replacement inner lifecycle. */
+  private commitDeferredReplacementOperation(
+    entry: DeferredReplacementOperation,
+  ): void {
+    if (entry.kind === "approval-decision") {
+      this.client.sendApprovalDecision(entry.id, entry.decision);
+      return;
+    }
+    if (entry.kind === "load-history") {
+      this.client.loadHistory(entry.before, entry.limit);
+      return;
+    }
+    if (entry.kind === "load-commands") {
+      this.client.loadCommands();
+      return;
+    }
+
     const receipt = this.receipts.get(entry.receiptKey);
     if (!receipt || receipt.state === "failed" || receipt.state === "completed") return;
 
@@ -839,10 +877,34 @@ export class WebChannelNATSClient {
     this.heldReleaseCommitDepth++;
     try {
       while (this.held.length > 0) {
-        const { localId, text, receiptKey } = this.held.shift()!;
-        // The final owner ends the timer before reserve/publish/state callbacks.
-        // heldReleaseCommitDepth keeps clear-hook reentrant sends behind this item.
-        if (this.held.length === 0) this.endHeldStallEpisode();
+        const heldEntry = this.held[0];
+        if (this.held.length === 1) {
+          // Keep the final entry explicitly wrapper-owned across timer cleanup.
+          // clearTimeout is an embedder callout: close/retract/terminal must be
+          // able to see and settle this entry before the stale release stack can
+          // assign it a wire id. A plain reentrant send appends behind the exact
+          // owner and is drained FIFO after it.
+          const lifecycle = this.wrapperLifecycleGeneration;
+          const receipt = this.receipts.get(heldEntry.receiptKey);
+          this.endHeldStallEpisode();
+          if (
+            this.wrapperLifecycleGeneration !== lifecycle
+            || !this.heldSessionReady()
+            || this.held[0] !== heldEntry
+            || this.receipts.get(heldEntry.receiptKey) !== receipt
+            || receipt?.state !== "queued"
+            || receipt.wireId !== undefined
+          ) {
+            return;
+          }
+        }
+
+        // No callout exists between the exact-owner fence above and detachment.
+        // For a non-final entry this is the ordinary live FIFO shift; for the
+        // final entry the timer/lifecycle transaction has now committed.
+        if (this.held[0] !== heldEntry) return;
+        this.held.shift();
+        const { localId, text, receiptKey } = heldEntry;
         // P0-4 commit order: reserve the wireId, register the alias, stage the bubble
         // at the tail, THEN let the low level own/publish A before exposing that move.
         const wireId = this.client.reserveWireId();
@@ -922,12 +984,13 @@ export class WebChannelNATSClient {
     }
   }
 
-  /** Fail detached staged-control ownership without touching replacement work. */
-  private failDeferredReplacementPublishes(
-    entries: readonly { localId: string; text: string; receiptKey: string }[],
+  /** Drop detached operations and fail only those with observable receipts. */
+  private failDeferredReplacementOperations(
+    entries: readonly DeferredReplacementOperation[],
     failure: SendFailure,
   ): void {
     for (const entry of entries) {
+      if (entry.kind !== "user") continue;
       this.receiptTransition(entry.receiptKey, "failed", failure);
     }
   }
@@ -1218,17 +1281,24 @@ export class WebChannelNATSClient {
 
   /** Send approval decision */
   decide(id: string, decision: ApprovalDecision): void {
+    const operation = { kind: "approval-decision", id, decision } as const;
+    // In a replacement transaction, reserve the decision's FIFO position before
+    // optimistic UI fanout. A state listener may synchronously emit another
+    // outbound operation; it belongs behind this already-invoked decision.
+    const deferred = this.deferReplacementOperation(operation);
     this.patchApproval(id, (a) =>
       a.resolvedDecision === undefined
         ? { ...a, resolvedDecision: decision }
         : a,
     );
-    this.client.sendApprovalDecision(id, decision);
+    if (!deferred) this.deferOrRunReplacementOperation(operation);
   }
 
   /** Request history page */
   loadHistory(request?: { before?: string; limit?: number }): void {
-    this.client.loadHistory(request?.before, request?.limit);
+    this.deferOrRunReplacementOperation({
+      kind: "load-history", before: request?.before, limit: request?.limit,
+    });
   }
 
   /**
@@ -1238,7 +1308,7 @@ export class WebChannelNATSClient {
    * refresh the catalog.
    */
   loadCommands(): void {
-    this.client.loadCommands();
+    this.deferOrRunReplacementOperation({ kind: "load-commands" });
   }
 
   // ---------------------------------------------------------------------------
@@ -1832,7 +1902,9 @@ export class WebChannelNATSClient {
               // Leg C: re-send the lost decision, keep the card resolved. Stays
               // unconfirmed so the next register retries until the server echoes
               // an authoritative `approval_resolved`.
-              this.client.sendApprovalDecision(a.id, a.resolvedDecision);
+              this.deferOrRunReplacementOperation({
+                kind: "approval-decision", id: a.id, decision: a.resolvedDecision,
+              });
               next.push(a);
             } else {
               // Server-confirmed resolution wins over a stale-by-ms snapshot.
