@@ -705,6 +705,128 @@ describe("real createPersistentDedupe (hermetic, isolated state dir)", () => {
       true,
     );
   });
+
+  it("replays a durable accepted outcome through entirely new stores without redispatch", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "webchannel-ingress-outcome-"));
+    const persistentOptions = {
+      pluginId: "webchannel",
+      ttlMs: 7 * 24 * 60 * 60 * 1_000,
+      // Match the neighboring real-SDK namespace configuration exactly: the
+      // SDK rejects reopening one plugin+namespace with different limits.
+      memoryMaxSize: 8,
+      stateMaxEntries: 32,
+      env: { ...process.env, OPENCLAW_STATE_DIR: dir },
+    } as const;
+    const createStore = () => {
+      const failures: string[] = [];
+      const accepted = createPersistentDedupe({
+        ...persistentOptions,
+        namespacePrefix: "persistent-dedupe",
+      });
+      const overloaded = createPersistentDedupe({
+        ...persistentOptions,
+        namespacePrefix: "webchannel-inbound-overloaded",
+      });
+      return {
+        accepted,
+        overloaded,
+        failures,
+        store: createIngressOutcomeStore({
+          accepted,
+          overloaded,
+          warnFailure: (_accountId, category) => failures.push(category),
+        }),
+      };
+    };
+    const key = "peer-0:stable-id";
+
+    const first = createStore();
+    const firstDispatch = vi.fn();
+    const firstRollback = vi.fn();
+    const firstOffer = vi.fn(() => ({
+      status: "accepted" as const,
+      commit: firstDispatch,
+      rollback: firstRollback,
+    }));
+    const firstFinish = vi.fn();
+    const firstBeginBatch = vi.fn(() => ({ offer: firstOffer, finish: firstFinish }));
+    const firstAck = vi.fn(() => true);
+    const firstRejected = vi.fn(() => true);
+    const firstRecord = vi.spyOn(first.store, "record");
+    const firstFlush = createIngressOnFlush<Item>({
+      accountId: "acct",
+      outcomeStore: first.store,
+      beginBatch: firstBeginBatch,
+      sendAck: firstAck,
+      sendInboundRejected: firstRejected,
+    });
+
+    await firstFlush([item("peer-0", "original text", "stable-id")]);
+    expect(first.failures).toEqual([]);
+    expect(firstBeginBatch).toHaveBeenCalledOnce();
+    expect(firstBeginBatch).toHaveBeenCalledWith("peer-0");
+    expect(firstOffer).toHaveBeenCalledTimes(1);
+    expect(firstRecord).toHaveBeenCalledTimes(1);
+    expect(firstRecord).toHaveBeenCalledWith("acct", key, "accepted");
+    expect(firstDispatch).toHaveBeenCalledTimes(1);
+    expect(firstRollback).not.toHaveBeenCalled();
+    expect(firstAck).toHaveBeenCalledTimes(1);
+    expect(firstAck).toHaveBeenCalledWith("peer-0", ["stable-id"]);
+    expect(firstRejected).not.toHaveBeenCalled();
+    expect(firstFinish).toHaveBeenCalledTimes(1);
+    expect(first.store.peek("acct", key)).toBe("accepted");
+
+    // New dedupe instances and a new outcome store begin with empty hot caches;
+    // the accepted classification must be recovered from the shared SQLite state.
+    const replay = createStore();
+    expect(replay.accepted).not.toBe(first.accepted);
+    expect(replay.overloaded).not.toBe(first.overloaded);
+    expect(replay.store).not.toBe(first.store);
+    expect(replay.store.peek("acct", key)).toBeUndefined();
+    const replayLookups: unknown[] = [];
+    const realReplayLookup = replay.store.lookup.bind(replay.store);
+    const replayLookup = vi.spyOn(replay.store, "lookup").mockImplementation(async (...args) => {
+      const result = await realReplayLookup(...args);
+      replayLookups.push(result);
+      return result;
+    });
+    const replayRecord = vi.spyOn(replay.store, "record");
+    const replayDispatch = vi.fn();
+    const replayRollback = vi.fn();
+    const replayOffer = vi.fn(() => ({
+      status: "accepted" as const,
+      commit: replayDispatch,
+      rollback: replayRollback,
+    }));
+    const replayFinish = vi.fn();
+    const replayBeginBatch = vi.fn(() => ({ offer: replayOffer, finish: replayFinish }));
+    const replayAck = vi.fn(() => true);
+    const replayRejected = vi.fn(() => true);
+    const replayFlush = createIngressOnFlush<Item>({
+      accountId: "acct",
+      outcomeStore: replay.store,
+      beginBatch: replayBeginBatch,
+      sendAck: replayAck,
+      sendInboundRejected: replayRejected,
+    });
+
+    await replayFlush([item("peer-0", "changed replay text", "stable-id")]);
+    expect(replay.failures).toEqual([]);
+    expect(replayBeginBatch).toHaveBeenCalledOnce();
+    expect(replayBeginBatch).toHaveBeenCalledWith("peer-0");
+    expect(replayLookup).toHaveBeenCalledTimes(1);
+    expect(replayLookup).toHaveBeenCalledWith("acct", key);
+    expect(replayLookups).toEqual([{ status: "found", outcome: "accepted" }]);
+    expect(replay.store.peek("acct", key)).toBe("accepted");
+    expect(replayRecord).not.toHaveBeenCalled();
+    expect(replayOffer).not.toHaveBeenCalled();
+    expect(replayDispatch).not.toHaveBeenCalled();
+    expect(replayRollback).not.toHaveBeenCalled();
+    expect(replayRejected).not.toHaveBeenCalled();
+    expect(replayAck).toHaveBeenCalledTimes(1);
+    expect(replayAck).toHaveBeenCalledWith("peer-0", ["stable-id"]);
+    expect(replayFinish).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("protocol-v2 outcome/lease ingress ordering", () => {
