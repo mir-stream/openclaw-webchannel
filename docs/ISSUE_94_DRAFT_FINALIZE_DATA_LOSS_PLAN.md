@@ -178,6 +178,30 @@ core의 Telegram 채널은 delivery 이음매에서 `info.assistantMessageIndex`
 
 이건 #23이 이미 지적한 unpinned cross-package 가정이다. §6.5 fail-safe가 방어하는 대상이 바로 이 둘이며, 새로운 계약 밖 가정을 추가로 도입하지 않는다.
 
+### 5.5 `onAssistantMessageStart`는 메시지마다 오지 않는다 (실측, 2026-08-10)
+
+**첫 번째 가정은 "순서" 문제가 아니라 "빈도" 문제였다.** 핀된 core에서 이 콜백은 **에이전트 실행당 정확히 한 번** 발화한다. 두 러너 모두 latch를 건다.
+
+- ACP: `dist/run-attempt-DRhLt3eF.js:4083-4085`가 `if (!this.assistantStarted) { this.assistantStarted = true; await onAssistantMessageStart?.(); }`. `assistantStarted`에 대입하는 곳은 생성자(`:3876`)와 이 줄 **둘뿐**이고, 메시지 사이에서 리셋되지 않는다.
+- btw: `dist/btw-CDO5476N.js:564`에 `let assistantStarted = false`, `:597-599`에서 첫 `text_start`/`start`에 true. 역시 리셋 없음.
+
+즉 어시스턴트 메시지가 셋인 턴도 boundary 이벤트는 **맨 처음 delta 때 한 번**만 온다. 그때 lane은 비어 있어 정상적으로 no-op이 된다. **회전을 이 이벤트에 의존할 수 없다.** §6.1이 그리던 시퀀스는 핀된 core에서 발생하지 않는다.
+
+이 발견은 #94의 실제 증상이 뒷받침한다. 지금의 "한 버블로 평탄화"는 `pushAnswerText`의 **divergence 분기**(새 메시지의 누적 텍스트가 `""`로 재시작하므로 기존 본문의 확장이 아니다)가 만들어낸 결과다. boundary가 메시지마다 왔다면 그 분기에는 애초에 도달하지 않는다.
+
+**실제 회전 신호는 `onBlockReplyQueued`의 `assistantMessageIndex` 변화다.** core 자신의 Telegram 채널이 그렇게 한다 — `dist/bot-Dxj27QDQ.js:6660-6678`의 `prepareQueuedAnswerBlock(payload, blockContext)`:
+
+```js
+const assistantMessageIndex = blockContext?.assistantMessageIndex;
+if (assistantMessageIndex === void 0) { /* 기록만, 회전 없음 */ }
+const previous = /* 마지막으로 본 index */;
+const shouldRotateBeforeDelivery = previous !== void 0 && assistantMessageIndex !== previous;
+```
+
+§5.3의 "Telegram을 근거로 쓰지 않는다"는 Telegram이 **delivery 이음매**에서 index를 읽는 부분에 대한 경고다. 여기는 다른 이음매 — `onBlockReplyQueued`의 `BlockReplyContext`이고, §5.1이 확인했듯 **플러그인에게 열려 있다.** 같은 필드지만 정당한 표면이다.
+
+따라서 §6.2-5의 "index는 대조와 진단에만 쓴다"는 제한을 **완화한다**: index 변화는 일급 회전 트리거다. 반대로 `onAssistantMessageStart` 배선은 **유지한다** — 계약이 광고하는 신호이고, latch를 푼 미래 core에서 무변경으로 동작한다. 다만 그것이 살아 있는 회전 경로라고 가정하지 않는다.
+
 따라서 core가 단순 문자열만 쏟아내서 관계를 알 수 없는 문제가 아니다. **WebChannel이 제공된 경계를 버리고 ID 하나에 합친 것이 문제다.** 이 이슈에서 core는 바꾸지 않는다.
 
 ---
@@ -186,21 +210,33 @@ core의 Telegram 채널은 delivery 이음매에서 `info.assistantMessageIndex`
 
 ### 6.1 정상 시퀀스
 
+§5.5의 실측을 반영한 시퀀스다. 초안은 메시지마다 `onAssistantMessageStart`가 온다고 그렸으나 그 이벤트는 실행당 한 번뿐이다.
+
 ```text
-onAssistantMessageStart()             # 첫 메시지: 빈 lane이므로 회전 없음
+onAssistantMessageStart()             # 실행당 1회. 빈 lane이므로 no-op
 onPartialReply(A1)                    # progress(id=A, text=A1)
 onPartialReply(A2)                    # progress(id=A, text=A2)
-onBlockReplyQueued(A, index=0)        # 활성 lane에 block payload 기록 (동기)
+onBlockReplyQueued(A, index=0)        # 활성 lane에 기록, lane.index := 0
 
-onAssistantMessageStart()             # A를 id=A로 정착, 새 lane으로 회전
-onPartialReply(B1)                    # progress(id=B, text=B1), A와 다른 ID
+onPartialReply(B1)                    # 누적이 ""로 재시작 → A의 확장이 아니다
+                                      #   → A를 id=A로 정착하고 새 lane으로 회전
+                                      #   → progress(id=B, text=B1), A와 다른 ID
+onBlockReplyQueued(B, index=1)        # 새 lane은 index가 없으므로 1을 채택. 재회전 없음
 onPartialReply(B2)                    # progress(id=B, text=B2)
 delivery.deliver(payload=B, {kind:"final"})   # agent_message(id=B) — 활성 lane 정착
 ```
 
 라이브 결과는 `[A 버블, B 버블]`이고 히스토리도 `[A 메시지, B 메시지]`다.
 
-**lane 소유권은 콜백 축이 전부 결정한다.** `deliver`는 `kind` 하나만 받으므로(§5.2) lane을 식별하지 않고 **활성 lane에만** 작용한다. 회전은 `onAssistantMessageStart`가, block 소유권 기록은 `onBlockReplyQueued`가 담당한다.
+**회전 트리거는 셋이고, 우선순위가 아니라 도달 순서로 결정된다.**
+
+1. **partial divergence** — 누적 텍스트가 활성 lane 본문의 확장이 아님. partial 모드 다중 메시지 턴의 **주 경로**다(§5.5).
+2. **`onBlockReplyQueued`의 index 변화** — partial이 전혀 없던 lane(block 전용 메시지)과, block이 먼저 도착하는 순서를 덮는다.
+3. **`onAssistantMessageStart`** — 계약이 광고하는 신호. 핀된 core에서는 실행당 1회라 사실상 첫 no-op뿐이지만 배선은 유지한다.
+
+셋 중 어느 것이 먼저 닿든 **하나의 seam은 한 번만 회전해야 한다.** 회전 직후 새 lane은 곧바로 발산 텍스트를 받으므로 "lane이 비었는가"만으로는 중복 회전을 막지 못한다. 따라서 `absorbedMissedBoundaries` 카운터를 유지하고, 1·2번 회전에서 증가시켜 뒤늦은 boundary 이벤트가 메시지 하나를 둘로 쪼개지 못하게 한다.
+
+**lane 소유권은 콜백 축이 전부 결정한다.** `deliver`는 `kind` 하나만 받으므로(§5.2) lane을 식별하지 않고 **활성 lane에만** 작용한다.
 
 ### 6.2 활성 lane 상태
 
@@ -226,7 +262,9 @@ type AssistantDraftLane = {
 2b. **회전한 lane은 실제 어시스턴트 텍스트가 생기기 전까지 `progress` 프레임을 보내지 않는다.** 프로토콜에 버블 삭제 프레임이 없어서(`OutboundWsMessage`에 `progress`/`agent_message`만 있음) 한 번 보낸 id는 반드시 `agent_message`로 정착시켜야 한다. 회전 직후 툴 스캐폴드를 그 lane으로 내보내면 abort 시 스캐폴드 텍스트가 담긴 버블이 강제로 남아 §7("스캐폴드는 완료된 어시스턴트 메시지가 아니다")을 어긴다. 따라서 회전 후의 툴 진행 표시는 억제하고, 메시지 사이 작업의 가시성은 #96에서 다룬다. **첫 lane의 스캐폴드 동작은 지금 그대로 유지한다**(무회귀).
 3. partial은 활성 lane만 갱신한다. `replace:true`도 활성 lane 안에서만 본문을 교체한다.
 4. 경계가 오면 이전 lane에 실제 어시스턴트 텍스트가 있는 경우만 정착한다. partial이 있으면 사용자가 마지막으로 본 정제된 cumulative snapshot을 쓴다. partial이 없었다면 그 lane에 기록된 queued block payload들을 순서대로 이어 본문으로 쓴다. block 하나를 곧바로 assistant 메시지 전체라고 가정하지 않는다.
-5. **`assistantMessageIndex`는 `onBlockReplyQueued`에서만 읽는다.** 용도는 두 가지로 한정한다 — (a) 기록하는 block이 활성 lane 소유인지 대조, (b) 경계 누락 진단 로그. index가 없으면(`when available`) 콜백 직렬 순서와 내부 generation으로 대체한다. **delivery 이음매에는 index가 없으므로**(§5.2) 그쪽 상관에는 쓰지 않는다.
+5. **`assistantMessageIndex`는 `onBlockReplyQueued`에서만 읽는다.** 활성 lane에 이미 다른 index가 기록돼 있는데 새 block이 다른 index를 들고 오면 **그 block은 새 어시스턴트 메시지의 것이다 — 정착 후 회전한 다음 기록한다**(§5.5, core의 Telegram이 같은 필드로 같은 판단을 한다). index가 없으면(`when available`) 회전하지 않고 활성 lane에 기록만 한다. **delivery 이음매에는 index가 없으므로**(§5.2) 그쪽 상관에는 쓰지 않는다.
+
+   초안은 이 필드를 "대조와 진단 로그"로만 제한했다. §5.5의 실측이 그 제한을 뒤집었다 — `onAssistantMessageStart`가 실행당 1회뿐이라, index 변화는 partial이 없는 lane에 남은 **유일한** 구조적 경계 신호다.
 6. **`deliver`는 lane을 식별하지 않고 활성 lane에만 작용한다.**
    - `kind:"final"` → 활성 lane을 정착한다. final은 정의상 현재/마지막 메시지의 최종형이므로 활성 lane이 곧 대상이다.
    - `kind:"block"` → partial 모드에서 그 텍스트는 이미 partial로 활성 lane에 들어와 있다. 전송 결과만 회계하고 **새 버블을 만들지 않는다.** 회전이 이미 일어난 뒤 늦게 drain된 block도 같은 규칙으로 중복이 생기지 않는다 — 앞 lane은 이미 자기 본문으로 정착했기 때문이다.
@@ -260,21 +298,25 @@ core callback 타입이 Promise를 허용해도 모든 호출자가 그 Promise�
 
 ### 6.5 contract 위반에 대한 방어
 
-정상 소유권은 구조화된 이벤트가 결정한다. 다만 `onAssistantMessageStart`가 누락된 비정상 stream에서도 이미 화면에 보인 텍스트를 조용히 덮지는 않는다.
+**초안은 이 절 전체를 "비정상 stream 방어"로 규정했다. §5.5의 실측이 그 규정을 바꾼다** — divergence 회전은 예외가 아니라 partial 모드 다중 메시지 턴의 정상 경로다. 규칙 자체는 그대로 두되, **성격과 로그 등급을 바꾼다.**
 
-- `replace:true`: 명시된 같은-message 교체이므로 활성 lane을 갱신한다.
-- `replace`가 아닌 cumulative partial이 기존 본문을 확장하지 않고 갑자기 갈라짐: boundary 누락으로 진단 로그를 남기고 기존 lane을 보존한 뒤 새 lane으로 회전한다.
-- 뒤늦은 boundary: 이미 방어 회전한 generation을 다시 회전시키지 않는다.
+- `replace:true`: 명시된 같은-message 교체이므로 활성 lane을 갱신한다. **절대 회전하지 않는다.**
+- `replace`가 아닌 cumulative partial이 기존 본문을 확장하지 않고 갑자기 갈라짐: 기존 lane을 정착시키고 새 lane으로 회전한다. **정상 경로이므로 `warn`이 아니라 `info` 등급의 중립적 진단으로 기록한다.** 이걸 contract violation으로 찍으면 건강한 트래픽마다 경고가 뜨고, 진짜 이상을 가려버린다.
+- 뒤늦은 boundary: 이미 회전한 seam을 다시 회전시키지 않는다(§6.1의 카운터).
 
-이 방어는 final과 앞 메시지의 의미를 내용으로 추측하는 로직이 아니다. 구조화된 `replace` 계약이 깨졌을 때 **이미 표시한 데이터를 보존하는 실패 안전장치**다.
+**로그를 남긴다는 요구는 유지한다.** §6.5.1의 진짜 요구는 "등급"이 아니라 "조용한 회전 금지"다 — 어떤 회전이든 흔적 없이 일어나서는 안 된다.
+
+이 방어는 final과 앞 메시지의 의미를 내용으로 추측하는 로직이 아니다. 구조화된 신호(`replace`, index, boundary)가 닿지 않는 seam에서 **이미 표시한 데이터를 보존하는 안전장치**다.
 
 #### 6.5.1 방어 회전과 history 형상
 
-방어 회전이 도는 정상 경로에서는 core가 실제로 새 어시스턴트 메시지를 시작했는데 경계만 누락한 것이므로, core transcript에도 메시지가 둘 있다. 즉 라이브 2 = history 2로 형상이 어긋나지 않는다.
+divergence 회전이 도는 정상 경로에서는 core가 실제로 새 어시스턴트 메시지를 시작한 것이므로(§5.5 — 경계 이벤트가 애초에 그 메시지에 대해 발화하지 않을 뿐이다), core transcript에도 메시지가 둘 있다. 즉 라이브 2 = history 2로 형상이 어긋나지 않는다.
+
+**§5.5 이후 이 절의 무게가 달라졌다.** 초안은 divergence 회전을 드문 예외로 보고 아래 발산 위험을 "거의 안 도는 구간"으로 취급했다. 실제로는 partial 모드 다중 메시지 턴마다 도는 주 경로다. 결론(수용)은 그대로지만, **아래 두 요구는 선택이 아니라 이 설계의 안전 마진 전부**다.
 
 어긋나는 경우는 하나뿐이다 — **같은 메시지를 재작성하는 partial이 `replace:true` 없이 왔는데 방어 회전이 오작동**하면 라이브 2 / history 1이 된다. 이 발산은 **수용한다.** 데이터 유실(#94 본체)보다 중복 표시가 낫다. 대신 두 가지를 요구한다.
 
-- 방어 회전은 **반드시 contract-violation 진단 로그를 남긴다.** 로그 없는 조용한 회전은 금지한다.
+- 방어 회전은 **반드시 진단 로그를 남긴다.** 로그 없는 조용한 회전은 금지한다. (초안은 `contract-violation` 등급을 지정했으나 §5.5·§6.5의 정정에 따라 **중립적 `info`**로 남긴다 — 이 회전은 정상 경로다.)
 - `replace:true` 경로는 **절대 회전하지 않는다**(M4/M7로 고정). 오작동 가능 구간을 `replace` 표시가 없는 divergence 하나로 좁힌다.
 
 이 수용은 §13의 "라이브 = history" 항목에 대한 명시적 예외다.
