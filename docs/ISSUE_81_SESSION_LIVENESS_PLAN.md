@@ -1,6 +1,6 @@
 # Issue #81 — Session liveness recovery — Concise implementation plan
 
-> Status: **implementation-ready; decisions frozen, implementation not started.**
+> Status: **implemented and locally verified; external product E2E gate pending.**
 > Branch: `mir-stream/issue-81`
 > Scope: client-only reactive v1; no plugin production or wire-contract change.
 > The former v3 transaction-by-transaction design remains available in Git history. This
