@@ -113,6 +113,14 @@ export class WebChannelNATSClient {
    * `localId` is the id of its `pending: true` transcript bubble.
    */
   private readonly held: Array<{ localId: string; text: string; receiptKey: string }> = [];
+  /** Immediate/control sends staged for a connect requested inside close(). */
+  private readonly deferredReplacementPublishes: Array<{
+    localId: string;
+    text: string;
+    receiptKey: string;
+  }> = [];
+  /** Keeps reentrant publishes behind entries already staged for replacement. */
+  private deferredReplacementPublishCommitDepth = 0;
   /** Prevent reentrant sends from jumping ahead of a final entry being released. */
   private heldReleaseCommitDepth = 0;
   /**
@@ -185,6 +193,11 @@ export class WebChannelNATSClient {
    * a send is stranded at `queued` — the exact failure P0-4 exists to eliminate.
    */
   private closed = false;
+  /** Nested close() calls share one teardown; the latest connect/close intent wins. */
+  private closeTransactionDepth = 0;
+  private connectDeferredUntilCloseCompletes = false;
+  /** Replacement-held work gets a fresh timer only after its new session exists. */
+  private replacementHeldNeedsFreshEpisode = false;
   /**
    * P1-9 §3.6.2: post-reconnect staleness valve. `staleDraftWatch` holds the ids
    * of `working` drafts recorded when onSession fired; the timer flips any still
@@ -293,6 +306,20 @@ export class WebChannelNATSClient {
       ) {
         return;
       }
+      // A hold admitted after connect() was requested from inside close() could
+      // not age against the old session. Its application-stall interval starts
+      // only now, when the replacement session is authenticated and usable.
+      if (this.replacementHeldNeedsFreshEpisode) {
+        this.replacementHeldNeedsFreshEpisode = false;
+        if (this.held.length > 0) this.beginHeldStallEpisode(true);
+      }
+      if (
+        this.wrapperLifecycleGeneration !== lifecycle
+        || !this.sessionEstablished || this.terminal || this.closed
+        || !this.state.connected
+      ) {
+        return;
+      }
       this.armStaleDraftWatch();
       if (
         this.wrapperLifecycleGeneration !== lifecycle
@@ -331,12 +358,19 @@ export class WebChannelNATSClient {
       // receipt subscriber during the sweep does NOT hold (shouldHold is gated on
       // this) — it publishes and resolves immediately to failed{terminal}.
       this.terminal = true;
+      this.connectDeferredUntilCloseCompletes = false;
+      this.replacementHeldNeedsFreshEpisode = false;
       this.wrapperLifecycleGeneration++;
+      const deferredEntries = this.deferredReplacementPublishes.splice(0);
       // P0-4 (D5 held/terminal): the queued/ledgered sends were already swept to
       // failed{terminal} by the low-level terminal sequence BEFORE this listener
       // ran; fail the wrapper-owned held[] here (they have no wireId, so the sweep
       // could not reach them). Retracted bubbles are preserved by failHeld.
       this.failHeld({ reason: "terminal", cause: cause ?? "unknown", retryable: false });
+      this.failDeferredReplacementPublishes(
+        deferredEntries,
+        { reason: "terminal", cause: cause ?? "unknown", retryable: false },
+      );
       // P0-4 (R4): settle the live-turn UI in the SAME terminal update. A terminal
       // mid-turn otherwise leaves an eternal "typing…" (or a spinning `working`
       // draft): the gated onState(false) skips the normal cleanup, and the
@@ -395,7 +429,16 @@ export class WebChannelNATSClient {
     // own `disconnected` flag; the ordering mirrors it too — that method REFUSES
     // outright on a terminally-retired instance, so a retired wrapper must stay
     // closed rather than silently re-enable holding onto a dead instance.
-    if (!this.terminal) this.closed = false;
+    if (!this.terminal) {
+      this.closed = false;
+      if (this.closeTransactionDepth > 0) {
+        // The old raw socket has not been disconnected yet. Record the reopen
+        // intent, but never let this connect (or sends following it) target that
+        // socket; the outermost close replays it after teardown completes.
+        this.connectDeferredUntilCloseCompletes = true;
+        return;
+      }
+    }
     this.client.connect();
   }
 
@@ -406,20 +449,97 @@ export class WebChannelNATSClient {
     // resolve to failed{closed} via the low-level `disconnected` gate, never land
     // in `held[]` whose only drain (onSession) this instance will never fire.
     this.closed = true;
+    // A later nested close overrides an earlier deferred connect. A connect
+    // occurring from one of THIS close's callouts can set the intent again.
+    this.connectDeferredUntilCloseCompletes = false;
     this.wrapperLifecycleGeneration++;
-    // Detach only this lifecycle's held ownership before the low-level close can
-    // notify state listeners. A listener may synchronously connect() and send a
-    // fresh held message; the old close must not sweep that replacement entry.
-    const heldEntries = this.takeHeld();
-    // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
-    this.clearStaleDraftWatch();
-    this.client.disconnect();
-    // P0-4 (D5): fail the wrapper-owned held[] (no wireId → invisible to the
-    // low-level fail-all).
-    //
-    // Notifications still run after teardown, but target only the detached old
-    // entries. Replacement held work remains owned by the reopened lifecycle.
-    this.failHeldEntries(heldEntries, { reason: "closed", retryable: false });
+    this.closeTransactionDepth++;
+    try {
+      // Detach only this lifecycle's wrapper ownership before any timer or raw
+      // teardown callout. Work created after a reentrant connect is replacement
+      // ownership and remains in the live collections.
+      const deferredEntries = this.deferredReplacementPublishes.splice(0);
+      const heldEntries = this.takeHeld();
+      // P1-9: tear down the connection-scoped staleness valve (§3.6.2).
+      this.clearStaleDraftWatch();
+      this.client.disconnect();
+      // Notify only the detached old lifecycle after raw teardown. Reentrant
+      // replacement work cannot be consumed by either failure sweep.
+      this.failDeferredReplacementPublishes(
+        deferredEntries,
+        { reason: "closed", retryable: false },
+      );
+      this.failHeldEntries(heldEntries, { reason: "closed", retryable: false });
+    } finally {
+      this.closeTransactionDepth--;
+      if (this.closeTransactionDepth === 0) this.finishDeferredCloseConnect();
+    }
+  }
+
+  /** True only for the replacement lifecycle opened from an active close(). */
+  private deferredReplacementOpen(): boolean {
+    return this.closeTransactionDepth > 0
+      && this.connectDeferredUntilCloseCompletes
+      && !this.closed
+      && !this.terminal;
+  }
+
+  /**
+   * Finish the latest connect intent after the old inner lifecycle is completely
+   * torn down. Staged controls are then committed live/FIFO into the new inner
+   * queue; callbacks that publish during the drain append behind existing work.
+   */
+  private finishDeferredCloseConnect(): void {
+    const shouldConnect = this.connectDeferredUntilCloseCompletes
+      && !this.closed
+      && !this.terminal;
+    this.connectDeferredUntilCloseCompletes = false;
+
+    if (!shouldConnect) {
+      const stranded = this.deferredReplacementPublishes.splice(0);
+      if (stranded.length > 0) {
+        this.failDeferredReplacementPublishes(
+          stranded,
+          this.terminal
+            ? {
+                reason: "terminal",
+                cause: this.state.errorCause ?? "unknown",
+                retryable: false,
+              }
+            : { reason: "closed", retryable: false },
+        );
+      }
+      return;
+    }
+
+    // connect() clears the inner disconnected gate and starts the replacement
+    // dial synchronously. The committed sends below therefore enter that new
+    // lifecycle's outbound queue even though registration completes later.
+    this.client.connect();
+    this.deferredReplacementPublishCommitDepth++;
+    try {
+      while (this.deferredReplacementPublishes.length > 0) {
+        if (this.closed || this.terminal) {
+          const entries = this.deferredReplacementPublishes.splice(0);
+          this.failDeferredReplacementPublishes(
+            entries,
+            this.terminal
+              ? {
+                  reason: "terminal",
+                  cause: this.state.errorCause ?? "unknown",
+                  retryable: false,
+                }
+              : { reason: "closed", retryable: false },
+          );
+          break;
+        }
+        this.commitDeferredReplacementPublish(
+          this.deferredReplacementPublishes.shift()!,
+        );
+      }
+    } finally {
+      this.deferredReplacementPublishCommitDepth--;
+    }
   }
 
   /**
@@ -479,6 +599,9 @@ export class WebChannelNATSClient {
       const localId = `u-${this.uid()}`;
       const heldEntry = { localId, text: trimmed, receiptKey };
       this.held.push(heldEntry);
+      if (this.deferredReplacementOpen()) {
+        this.replacementHeldNeedsFreshEpisode = true;
+      }
       // P0-4: a held send has a receipt (queued) but NO wireId yet — the wireId
       // is minted at release (2-phase). The receiptKey is the stable handle.
       this.receipts.set(receiptKey, {
@@ -552,6 +675,9 @@ export class WebChannelNATSClient {
    * a nested event drain, the commit helper exposes it once before returning.
    */
   private publish(trimmed: string): SendReceipt {
+    if (this.shouldDeferReplacementPublish()) {
+      return this.deferReplacementPublish(trimmed);
+    }
     const receiptKey = this.newReceiptKey();
     const wireId = this.client.reserveWireId();
     this.wireIdToReceiptKey.set(wireId, receiptKey);
@@ -580,6 +706,70 @@ export class WebChannelNATSClient {
     return this.makeReceipt(receiptKey);
   }
 
+  /**
+   * Stage an immediate/control send for the replacement lifecycle. Ownership is
+   * installed before exposing the bubble, so a nested close can detach and fail
+   * it without leaving a queued receipt behind.
+   */
+  private deferReplacementPublish(trimmed: string): SendReceipt {
+    const receiptKey = this.newReceiptKey();
+    const localId = `u-${this.uid()}`;
+    this.deferredReplacementPublishes.push({ localId, text: trimmed, receiptKey });
+    this.receipts.set(receiptKey, {
+      id: receiptKey,
+      state: "queued",
+      subscribers: new Set(),
+      pendingTransitions: [],
+      drainingTransitions: false,
+    });
+    this.appendMessage({
+      id: localId,
+      role: "user",
+      text: trimmed,
+      receiptKey,
+      sendState: "queued",
+    });
+    return this.makeReceipt(receiptKey);
+  }
+
+  /** Preserve staged FIFO while replacement entries are being committed. */
+  private shouldDeferReplacementPublish(): boolean {
+    if (this.closed || this.terminal) return false;
+    return this.deferredReplacementOpen()
+      || this.deferredReplacementPublishCommitDepth > 0;
+  }
+
+  /** Assign transport identity and hand one staged control to the new lifecycle. */
+  private commitDeferredReplacementPublish(entry: {
+    localId: string;
+    text: string;
+    receiptKey: string;
+  }): void {
+    const receipt = this.receipts.get(entry.receiptKey);
+    if (!receipt || receipt.state === "failed" || receipt.state === "completed") return;
+
+    const wireId = this.client.reserveWireId();
+    this.wireIdToReceiptKey.set(wireId, entry.receiptKey);
+    receipt.wireId = wireId;
+    const bubble = this.state.messages.find(
+      (message) => message.receiptKey === entry.receiptKey,
+    );
+    if (bubble) {
+      const messages = this.state.messages.map((message) =>
+        message.receiptKey === entry.receiptKey
+          ? { ...message, wireId, turnId: wireId }
+          : message,
+      );
+      this.stageReceiptStateThenCommit(
+        entry.receiptKey,
+        { messages },
+        () => { this.client.sendUserMessage(entry.text, wireId); },
+      );
+    } else {
+      this.client.sendUserMessage(entry.text, wireId);
+    }
+  }
+
   /** P1-9 §3.1: a turn is in flight when the agent is typing or a draft is working. */
   private turnInFlight(): boolean {
     return this.state.isTyping === true || this.state.messages.some((m) => m.working);
@@ -590,6 +780,10 @@ export class WebChannelNATSClient {
     // P0-4: never hold after a terminal failure (a held send would escape the
     // held[] sweep and orphan). Publish instead → immediate failed{terminal}.
     if (this.terminal) return false;
+    // A connect requested from a close() callout opens the replacement wrapper
+    // lifecycle before the old socket is gone. Ordinary sends belong to that
+    // replacement, but must remain held until its own session is established.
+    if (this.deferredReplacementOpen()) return true;
     // P0-4 (review): never hold after an explicit close() either — held[] drains
     // only on onSession, which a closed instance never fires, so a hold here is a
     // permanent `queued`. Publish instead → immediate failed{closed}.
@@ -632,6 +826,7 @@ export class WebChannelNATSClient {
    */
   private maybeRelease(): void {
     if (
+      this.deferredReplacementOpen() ||
       this.stopCommitDepth > 0 ||
       this.heldReleaseCommitDepth > 0 ||
       this.held.length === 0 ||
@@ -727,6 +922,16 @@ export class WebChannelNATSClient {
     }
   }
 
+  /** Fail detached staged-control ownership without touching replacement work. */
+  private failDeferredReplacementPublishes(
+    entries: readonly { localId: string; text: string; receiptKey: string }[],
+    failure: SendFailure,
+  ): void {
+    for (const entry of entries) {
+      this.receiptTransition(entry.receiptKey, "failed", failure);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // #81 — wrapper-owned held-work application liveness
   // ---------------------------------------------------------------------------
@@ -734,6 +939,7 @@ export class WebChannelNATSClient {
   private heldSessionReady(): boolean {
     return this.sessionEstablished
       && this.state.connected
+      && !this.deferredReplacementOpen()
       && !this.closed
       && !this.terminal;
   }
@@ -869,6 +1075,10 @@ export class WebChannelNATSClient {
 
   /** Final-owner removal retires state before any receipt/state/client callback. */
   private endHeldStallEpisode(): void {
+    // Clear the retired owner's marker before canceling its timer. A synchronous
+    // clearTimeout hook may connect+send replacement work and set the marker
+    // again; that newer ownership must win when this method resumes.
+    this.replacementHeldNeedsFreshEpisode = false;
     this.heldStallMutationEpoch++;
     this.heldStallSinceAt = null;
     this.heldStallRecoveryIssued = false;
