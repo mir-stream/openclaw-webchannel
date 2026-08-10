@@ -452,7 +452,25 @@ npm test             # 루트 vitest — client 회귀와 e2e 포함
 
 ## 14. compact 이후 구현 시작점
 
-이 문서 커밋 시점에는 **문서와 GitHub Issue만 수정됐고 production/test 코드는 아직 그대로다.** 다음 세션은 재조사보다 아래 순서로 바로 시작한다.
+이 문서 커밋 시점에는 **문서와 GitHub Issue만 수정됐고 production/test 코드는 아직 그대로다.**
+
+**선행 조건: 이 워크스페이스에는 `node_modules`가 없다.** `npm install` 전에는 build/typecheck/test가 하나도 돌지 않는다. 첫 명령이 그것이다.
+
+### 14.1 PR 분할 (확정)
+
+**PR 1 — 클라이언트 화해 특성 테스트 (테스트 전용, 소)**
+`packages/client/src/nats-client-wrapper.test.ts`에 §10의 C1~C5를 추가한다. 플러그인 변경과 완전히 독립이며 합성 프레임만으로 검증된다. 목표는 프로덕션 무변경이다.
+
+이걸 먼저 떼는 이유: C3(라이브 1 / snapshot 2)와 C4(라이브 3 / snapshot 2)는 3-tier 매칭을 추적해 보면 **현재 우연히 맞지만 테스트로 고정된 적이 없다.** 만약 실제로 틀렸다면 그건 `nats-client-wrapper.ts` 프로덕션 수정이고, 메인 PR 안에서 터지면 "메시지 경계 수정"이 클라이언트 화해 로직 수정까지 껴안게 된다. 먼저 확인하면 어느 쪽이든 메인 PR이 깨끗하다.
+
+**PR 2 — #94 본체 (대, 원자적)**
+adapter lane 모델 + inbound 배선 + M1~M10 / I1~I10 + e2e 게이트. **더 쪼개면 깨진다** — inbound가 경계를 넘기지 않으면 adapter는 회전할 수 없고, adapter에 lane이 없으면 "활성 lane만 정착"이 성립하지 않는다. §6.5 fail-safe도 못 뗀다. 현재 코드에 이미 `absorbedMissedBoundaries` 방어가 있어서, 빼고 먼저 내보내면 #23이 막아둔 것을 되돌리는 셈이다.
+
+**기각한 분할:** "id는 하나로 둔 채 `answerPrefix`만 배열로 바꾸는 무동작 리팩터를 먼저" 안. 회전 없는 lane 구조는 2단계에서 다시 쓰이므로 버려질 코드를 리뷰시키게 된다. 대신 **PR 2 안에서 커밋을 ① adapter lane 모델 ② inbound 배선 ③ 테스트 ④ e2e 순으로 나눈다.** 분할 PR의 리뷰 이점 대부분을 얻으면서 버려지는 중간 상태를 만들지 않는다.
+
+### 14.2 구현 순서 (PR 2)
+
+아래 순서로 바로 시작한다. 재조사는 필요 없다.
 
 1. `packages/plugin/src/channel.test.ts`의 기존 “두 assistant 메시지가 한 ID에 합쳐진다” 테스트를 두 ID/두 버블 기대값으로 바꾸고, final이 앞 메시지를 인용하는 실패 테스트를 먼저 추가한다.
 2. `packages/plugin/src/message-adapter.ts`의 턴 고정 `id`/`answerPrefix`를 lane별 ID와 settle latch로 교체한다.
