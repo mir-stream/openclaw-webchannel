@@ -1260,7 +1260,9 @@ export class WebChannelNatsClient {
     if (typeof options.jwt !== "string" || options.jwt.trim().length === 0) {
       throw new Error("[nats-client] non-empty bootstrap jwt is required");
     }
-    const ackStallTimeoutMs = options.ackStallTimeoutMs ?? 30_000;
+    const ackStallTimeoutMs = options.ackStallTimeoutMs === undefined
+      ? 30_000
+      : options.ackStallTimeoutMs;
     if (
       !Number.isInteger(ackStallTimeoutMs)
       || ackStallTimeoutMs < 0
@@ -2103,9 +2105,9 @@ export class WebChannelNatsClient {
     // an id-less frame from a caller that bypassed sendUserMessage is not
     // replayable and is skipped.
     //
-    // P0-4 (review R2/R3): `recordUnacked` returns inert eviction metadata rather
-    // than notifying or consulting injected retry hooks inline. Nothing
-    // between the `sessionKey` fail-closed check above and `sealMessage()` below
+    // P0-4 (review R2/R3): `recordUnacked` returns inert insertion/eviction
+    // metadata rather than notifying or consulting injected retry hooks inline.
+    // Nothing between the `sessionKey` fail-closed check above and `sealMessage()` below
     // may call into embedder code: a subscriber reached from here can `close()`,
     // which nulls `sessionKey` mid-seal (TS narrowing from the top-of-function
     // check hides it), and `null` then flows into the AEAD as a raw TypeError
@@ -2116,8 +2118,10 @@ export class WebChannelNatsClient {
     // re-queue there would strand the frame on an already-swept closed instance).
     let evicted: string[] = [];
     let warnEviction = false;
+    let provisionallyInserted = false;
     if (message.type === "user_message" && message.id) {
-      ({ evicted, warnEviction } = this.recordUnacked(message.id, message));
+      ({ evicted, warnEviction, inserted: provisionallyInserted } =
+        this.recordUnacked(message.id, message));
     }
     const wire = sealMessage({ accountId, tenant, sub: peerId }, sealingKey, message);
     const finishPostSeal = () => {
@@ -2141,7 +2145,32 @@ export class WebChannelNatsClient {
     // publish-driven forceReconnect replays it, so a live process never reports
     // false success. Non-replicated frames only warn on failure (§5 recovery lanes).
     if (message.type === "user_message" && message.id) {
-      const ledgerEntry = this.unackedLedger.get(message.id);
+      const messageId = message.id;
+      const ledgerEntry = this.unackedLedger.get(messageId);
+      const finishInvalidatedPrePublish = () => {
+        // An injected retry hook may synchronously deliver an owned result for
+        // an OLDER message. That result legitimately advances the episode's
+        // mutation epoch, but this newly inserted message still has not been
+        // published or given a retry deadline. Put that exact owner back at the
+        // front of the live drain (ahead of messages created by result
+        // callbacks), then let the next seal establish ordinary scheduling.
+        // Every other invalidation is fail-closed: never revive an entry that
+        // was itself detached, replaced, scheduled, or moved to another
+        // lifecycle.
+        if (
+          provisionallyInserted && ledgerEntry
+          && this.unackedLedger.get(messageId) === ledgerEntry
+          && ledgerEntry.nextRetryAt === null
+          && this.sessionKey === sealingKey
+          && this.connectionEpoch === sealingConnectionEpoch
+          && this.ackStallMutationEpoch !== sealingMutationEpoch
+          && !this.disconnected && !this.terminalReached
+        ) {
+          this.unackedLedger.delete(messageId);
+          this.outboundQueue.unshift(message);
+        }
+        finishPostSeal();
+      };
       if (
         !ledgerEntry || this.unackedLedger.get(message.id) !== ledgerEntry
         || this.sessionKey !== sealingKey
@@ -2164,7 +2193,7 @@ export class WebChannelNatsClient {
           || this.ackStallMutationEpoch !== sealingMutationEpoch
           || this.disconnected || this.terminalReached
         ) {
-          finishPostSeal();
+          finishInvalidatedPrePublish();
           return;
         }
       }
@@ -2176,7 +2205,7 @@ export class WebChannelNatsClient {
         || this.ackStallMutationEpoch !== sealingMutationEpoch
         || this.disconnected || this.terminalReached
       ) {
-        finishPostSeal();
+        finishInvalidatedPrePublish();
         return;
       }
       if (initialRetryDelay !== null) ledgerEntry.nextRetryAt = attemptAt + initialRetryDelay;
@@ -2367,7 +2396,8 @@ export class WebChannelNatsClient {
   /**
    * P0-7b: record an unacked user_message, evicting the oldest past the cap.
    *
-   * Returns inert eviction metadata instead of failing/warning here (P0-4 R2/R3).
+   * Returns inert insertion/eviction metadata instead of failing/warning here
+   * (P0-4 R2/R3).
    * `trackerFail` is a synchronous callout into embedder code (emitSendState →
    * the wrapper's receiptTransition → setState → app state subscribers), and the
    * only caller is `seal()`, which runs this BETWEEN its `sessionKey` fail-closed
@@ -2383,10 +2413,12 @@ export class WebChannelNatsClient {
   private recordUnacked(
     id: string,
     message: Extract<OutboundMessage, { type: "user_message" }>,
-  ): { evicted: string[]; warnEviction: boolean } {
+  ): { evicted: string[]; warnEviction: boolean; inserted: boolean } {
     const evicted: string[] = [];
     let warnEviction = false;
+    let inserted = false;
     if (!this.unackedLedger.has(id)) {
+      inserted = true;
       this.unackedLedger.set(id, {
         message,
         retryCount: 0,
@@ -2410,7 +2442,7 @@ export class WebChannelNatsClient {
         warnEviction = true;
       }
     }
-    return { evicted, warnEviction };
+    return { evicted, warnEviction, inserted };
   }
 
   private retryDelay(retryCount: number): number {
