@@ -48,6 +48,59 @@
 
 ### Added
 
+- **Next minor, non-breaking — turn-scoped in-flight signal.**
+  `WebChannelState` adds optional `turnActive?: boolean`: `true` while at least
+  one turn this client started is still open. A turn opens when the user message
+  that starts it is published — immediately, or later when a held follow-up is
+  released — and closes when that turn settles (an outcome-less legacy
+  `turn_settled` closes it too). It is unaffected by `progress`, `agent_message`,
+  and `reasoning`, and an actionable approval keeps it `true` while `isTyping`
+  goes `false`, so the whole of a multi-step turn is covered rather than only the
+  window before the first agent bubble. `isTyping` is unchanged in every respect;
+  the two are complementary ("composing an answer right now" vs "still working on
+  this turn"). Abort text (`/stop` and the NL abort vocabulary) rides the agent's
+  control lane, which never settles, so it opens no turn.
+  Settlement is **not** one-per-send: messages arriving during a running turn are
+  coalesced into one turn keyed by the LAST of them (`inbound-queue.ts`
+  `coalesceUserMessages`), so a single `turn_settled` may be the only answer
+  several sends receive. A settle therefore closes the turn it names and every
+  turn published before it (publish order is processing order); a settle for an
+  unknown turn sweeps nothing; both outcomes and an outcome-less legacy settle
+  sweep alike. (The coalesced non-anchor *receipt* still rests at `accepted` — a
+  separate pre-existing defect, tracked as #99.) A failed send closes its own
+  turn ONLY for the failure that is a good proxy for the agent never having
+  received it — `overloaded`, an ingress rejection. A proxy, not a proof: the
+  agent can also reject a message it already admitted (a live same-connection
+  retry of an unacked id whose accepted marker was lost), whose turn is already
+  running. Anything a settle might still name is otherwise left to the sweep,
+  since removing such an id early would break the sweep for every turn behind it:
+  notably `turn-failed` (it arrives FROM a settle that already sweeps) and
+  `evicted` (a CLIENT-side unacked-ledger cap drop — a lost ack is not a failed
+  delivery, so the message may have reached the agent, been coalesced, and be the
+  very id its turn settles under).
+  The flag is advisory: it does not gate `send()`, the P1-9 held-message FIFO,
+  send receipts, or reconnect, and nothing inside the client reads it back.
+  **The guarantee is bounded, not absolute.** A terminal error, `close()`, an
+  explicit `/stop`, and the transition to disconnected each force-close every
+  open turn; the post-reconnect staleness valve does too, but only where it arms
+  at all (a `working` draft live at session re-establishment), so it is an extra
+  rescue rather than a general timeout. The residual has one shape and its causes
+  are deliberately not enumerated: any published turn whose settle never arrives,
+  or arrives naming an id this client cannot place, stays `true` until a later
+  settle sweeps it as part of the prefix or a safety point fires — `turn_settled`
+  delivery is itself best-effort (warn-logged and dropped on failure, unlike
+  acks), and several agent-side paths ack at ingress then abandon the message.
+  Named examples, not a complete list: text the agent routes to its control lane
+  while this client's pinned abort vocabulary — a deliberate subset
+  (`abort-mirror.ts`) — does not recognize it; a message denied by the agent's DM
+  allowlist, already acked at ingress but dropped without dispatching a turn
+  (`packages/plugin/src/inbound.ts` sets `settlementEligible = false` on denial;
+  the admission/settlement asymmetry is a separate defect, not addressed here);
+  a second device on the same peer id, whose message can absorb ours into a turn
+  keyed by its own wire id; and a post-admission `overloaded` rejection, closed
+  eagerly while its turn is still running. Force-closing is also one-way — no
+  inbound frame re-opens a turn, so a mid-turn reconnect leaves `turnActive`
+  false for the rest of that turn. Render it as a soft hint, never a hard gate.
 - **Next minor, non-breaking — reactive application-session liveness.** The
   high-level `WebChannelNATSClientOptions` adds `ackStallTimeoutMs` (default
   `30_000`; integer `0..2_147_483_647`; `0` disables both automatic lanes).
