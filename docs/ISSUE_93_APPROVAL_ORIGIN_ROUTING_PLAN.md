@@ -51,7 +51,7 @@ plugin lifecycle도 곧바로 run lifetime을 끝내지 않는다. `packages/plu
 
 그러나 persisted `lastTo`만으로도 부족하다. case 또는 `identityLinks` 충돌로 두 peer가 같은 session key를 공유하면 뒤의 inbound가 entry를 덮어쓸 수 있다. 따라서 이 설계는 다음 두 증거를 **모두** 요구한다.
 
-1. request 생성 시점에 이미 active였고 현재도 `handleInboundMessage`가 await 중인 agent run의 exact peer lease
+1. request 생성 시점보다 먼저 active가 되었고 현재도 `handleInboundMessage`가 await 중인 agent run의 exact peer lease
 2. pinned SDK helper가 같은 request/account의 session store에서 복구한 exact target
 
 두 값이 byte-equal일 때만 origin이 확정된다. session key 문자열을 파싱하지 않고 현재 config route도 다시 계산하지 않는다.
@@ -99,12 +99,12 @@ export class ApprovalOriginLeaseRegistry {
     maxPoisonedKeys?: number;
   });
   createLease(input: {
-    accountId: string;
+    rawAccountId: string;
     sessionKey: string;
     peerId: string;
   }): ApprovalOriginLease;
   resolve(input: {
-    accountId: string;
+    rawAccountId: string;
     sessionKey: string;
     requestCreatedAtMs: number;
   }): ApprovalOriginLeaseResolution;
@@ -114,21 +114,21 @@ export class ApprovalOriginLeaseRegistry {
 
 구현 계약:
 
-- key는 exact `(accountId, sessionKey)` tuple이며 문자열 case를 정규화하지 않는다.
+- OpenClaw/config의 account collision domain에 맞춰 registry/poison key는 `(canonicalAccountId = rawAccountId.toLowerCase(), sessionKey)`다. claim은 exact raw `accountId`와 exact `peerId`를 별도로 보존하며 현재 config route나 alias 열거로 identity를 추론하지 않는다.
 - clock은 test에 주입 가능한 `now()`를 사용하고 production registry는 `Date.now`를 쓴다. construction과 각 `rotateEpoch()`는 현재 값을 새 epoch의 `barrierMs`로 캡처한다.
 - `createLease`는 immutable handle을 만들며 exact claim, 내부 고유 ID, 생성 당시 registry epoch를 closure에 캡처한다. 호출자가 claim field를 나중에 바꿀 수 없다.
 - 같은 handle의 successful `activate()`는 `now()`를 `activatedAtMs`로 한 번만 캡처하며 반복 호출은 no-op이다. `onAgentRunStart`가 같은 turn에 반복되어도 claim과 시간이 바뀌지 않는다.
-- successful activation으로 exact tuple의 active claims에 distinct peer가 동시에 존재하게 되면 그 tuple을 current epoch의 `poisonedKeys`에 넣는다. 같은 peer의 duplicate lease는 poison하지 않는다.
-- poisoned tuple은 peer 하나가 release되거나 active claim이 모두 사라지거나 later same-peer run이 시작되어도 epoch 끝까지 poisoned다. 유효한 request time에 대한 `resolve`는 항상 `ambiguous`이며 peer를 반환하지 않는다.
+- successful activation으로 같은 canonical tuple의 active claims에 distinct exact origin `(rawAccountId, peerId)`가 동시에 존재하게 되면 그 tuple을 current epoch의 `poisonedKeys`에 넣는다. raw account와 peer가 모두 같은 duplicate lease만 poison하지 않는다. peer 문자열이 같아도 raw account가 다르면 서로 다른 transport origin이므로 poison한다.
+- poisoned tuple은 origin 하나가 release되거나 active claim이 모두 사라지거나 later same-origin run이 시작되어도 epoch 끝까지 poisoned다. 유효한 request time에 대한 `resolve`는 항상 `ambiguous`이며 peer를 반환하지 않는다.
 - `resolve`는 `requestCreatedAtMs`가 finite이고 `barrierMs`보다 **크며**, resolve 시 `now()`보다 미래가 아닐 때만 진행한다. barrier equality도 `invalid_request_time`이다. millisecond 단위로 reload 전후 순서를 증명할 수 없는 동일 시각에는 가용성보다 false-positive 방지를 택한다.
-- distinct peer 집계에는 `activatedAtMs <= requestCreatedAtMs`인 현재 active claim만 포함한다. request 뒤 시작한 lease는 같은 account/session/peer여도 증거가 아니다. eligible peer가 0개면 `no_match`, 1개면 `resolved`, 2개 이상이면 `ambiguous`이며 같은 peer의 여러 eligible lease는 계속 `resolved`다.
+- resolve는 canonical tuple의 poison을 모든 raw aliases에 적용한 뒤, handler가 준 exact raw account와 일치하고 `activatedAtMs < requestCreatedAtMs`인 현재 active claim만 선택한다. 같은 millisecond equality는 순서를 증명할 수 없어 제외한다. eligible exact peer가 0개면 `no_match`, 1개면 `resolved`, 2개 이상이면 `ambiguous`이며 같은 raw account/peer의 여러 eligible lease는 계속 `resolved`다.
 - `rotateEpoch()` 전 dormant handle은 영구 stale이며 이후 `activate()`가 no-op이다. 반면 이미 successfully active인 handle의 claim은 생성 epoch와 무관하게 유지되고, repeated `activate()`는 no-op이며, `release()`는 process-global unique claim ID로 자기 retained claim만 지운다. stale/dormant release는 새 claim을 지울 수 없다.
-- active claim은 생성 epoch와 관계없이 현재 active이고 `activatedAtMs <= requestCreatedAtMs`이면 eligible이다. 그래서 retained old run이 barrier 뒤 실제로 만든 새 request는 exact stored target과 일치할 때 전달할 수 있고, pre-barrier pending replay는 계속 `invalid_request_time`이다.
-- `rotateEpoch()`는 epoch/barrier와 clock-validity를 갱신하고 old per-key/global poison을 reset하지만 active claims는 지우지 않는다. 이어 retained claims를 exact tuple별로 다시 scan해 distinct peer가 2개 이상이면 새 epoch poison을 즉시 재구성한다. 이 rebuild도 `maxPoisonedKeys` overflow 시 global poison으로 승격한다.
+- active claim은 생성 epoch와 관계없이 현재 active이고 `activatedAtMs < requestCreatedAtMs`이면 eligible이다. 그래서 retained old run이 barrier 뒤 더 늦게 실제로 만든 새 request는 canonical stored account/target과 일치할 때 전달할 수 있고, pre-barrier pending replay는 계속 `invalid_request_time`이다.
+- `rotateEpoch()`는 epoch/barrier와 clock-validity를 갱신하고 old per-key/global poison을 reset하지만 active claims는 지우지 않는다. 이어 retained claims를 canonical tuple별로 다시 scan해 distinct exact `(rawAccountId, peerId)`가 2개 이상이면 새 epoch poison을 즉시 재구성한다. 이 rebuild도 `maxPoisonedKeys` overflow 시 global poison으로 승격한다.
 - 모든 clock read는 finite·non-decreasing이어야 한다. invalid clock이나 epoch 안의 regression을 감지하면 claim을 추가/선택하지 않고 `invalid_request_time`으로 닫으며, 다음 `rotateEpoch()`가 새 finite barrier를 세울 때까지 그 epoch를 신뢰하지 않는다. clock anomaly와 future request는 false negative만 만들 수 있다.
 - active claims는 cap/LRU 때문에 제거하지 않는다. 정상 `finally` cleanup과 host in-flight concurrency가 이 부분의 수명을 제한한다.
 - `maxPoisonedKeys`는 positive safe integer이며 기본값은 1,024다. per-key poison을 cap/LRU eviction하면 false-safe가 깨지므로 eviction하지 않는다. 새 poisoned key가 cap을 넘기려 하면 set을 비우고 `epochGloballyPoisoned=true`로 승격한다. 이후 그 epoch의 모든 valid-time fallback resolve는 `ambiguous`; `rotateEpoch()`만 reset한 뒤 retained-overlap scan으로 안전한 poison 상태를 재구성한다. 따라서 poison 메모리는 최대 1,024 keys 또는 boolean 하나로 bounded되며, 용량 압박도 오배송이 아니라 availability 손실로 끝난다.
-- `AcctA`와 `accta`는 session key 문자열이 같더라도 서로 다른 registry key다.
+- `AcctA`와 `accta`는 같은 canonical registry key를 공유하지만 claim identity는 다르다. resolve는 handler raw account를 exact-filter하고, 둘이 overlap하면 canonical poison이 양쪽 handler를 모두 막는다.
 
 production은 module-local singleton이 아니라 versioned `globalThis[Symbol.for("openclaw-webchannel.approval-origin-registry.v1")]` getter를 사용한다. cache-busted module generation도 같은 process-global registry object를 받아 old inbound handle과 new approvals resolver가 동일 claims/epoch를 본다. getter는 `contractVersion`과 required method surface를 structural하게 검사하고 `instanceof`에 의존하지 않는다. incompatible value는 교체해 split state를 만들지 않고 plugin initialization을 fail-closed 한다. 테스트는 isolated global holder/key seam으로 두 simulated generation이 같은 object를 받는지 고정한다.
 
@@ -139,7 +139,7 @@ plugin reload/teardown의 기존 `stopAgentLifecycleSubscription()`는 process-g
 `handleInboundMessage`는 route가 정해진 뒤 ordinary turn마다 immutable lease handle을 만들되 즉시 activate하지 않는다. 기존 `replyOptions.onAgentRunStart`에서만 `handle.activate()`를 호출한다. handle이 캡처하는 exact claim은 다음과 같다.
 
 ```text
-accountId = handleInboundMessage가 받은 exact account ID
+rawAccountId = handleInboundMessage가 받은 exact account ID
 sessionKey = 이 turn에 이미 정해진 route.sessionKey
 peerId = verified transport peer ID
 ```
@@ -150,13 +150,13 @@ peerId = verified transport peer ID
 
 ### 3.4 persisted corroboration과 최종 비교
 
-fallback 판정은 handler의 exact account를 `accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID`로 만들고 다음 순서로 실행한다.
+fallback 판정은 handler의 raw account를 `rawHandlerAccountId = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID`, canonical form을 `rawHandlerAccountId.toLowerCase()`로 만들고 다음 순서로 실행한다.
 
 1. non-empty `request.sessionKey`와 outer request의 required `createdAtMs`를 읽는다.
-2. registry를 exact `(accountId, sessionKey, requestCreatedAtMs)`로 resolve한다. `invalid_request_time`, `no_match`, `ambiguous`면 `null`.
-3. pinned SDK `resolveApprovalRequestOriginTarget`을 `channel: WEBCHANNEL_ID`, exact handler account로 호출한다.
+2. registry를 `(rawHandlerAccountId, sessionKey, requestCreatedAtMs)`로 resolve한다. canonical poison을 확인한 뒤 exact raw account claim만 선택하며, `invalid_request_time`, `no_match`, `ambiguous`면 `null`.
+3. pinned SDK `resolveApprovalRequestOriginTarget`을 `channel: WEBCHANNEL_ID`, raw handler account로 호출한다.
 4. 이 fallback에서는 `resolveTurnSourceTarget: () => null`로 두어 channel 없는 `turnSourceTo`를 의도적으로 무시한다.
-5. `resolveSessionTarget` mapping boundary에서 stored channel이 normalized `webchannel`, stored account가 exact handler account, `to`가 non-empty인지 다시 확인한다. 하나라도 아니면 `null`.
+5. `resolveSessionTarget` mapping boundary에서 stored channel이 normalized `webchannel`, SDK가 canonicalize한 stored account가 `rawHandlerAccountId.toLowerCase()`, `to`가 non-empty인지 확인한다. exact raw handler/transport identity는 registry claim이 보강한다. 하나라도 아니면 `null`.
 6. `targetsMatch`는 exact `to` equality다. SDK helper가 throw하거나 `null`이면 `null`.
 7. active lease peer와 SDK 결과 `to`가 exact equality일 때만 `{ to }`; 다르면 `null`.
 
@@ -179,7 +179,7 @@ reason은 `missing_session_key`, `invalid_request_time`, `active_no_match`, `act
 1. `packages/plugin/src/approval-origin.ts`
    - registry class, result type, versioned process-global getter 추가.
 2. `packages/plugin/src/approval-origin.test.ts`
-   - registry의 exact tuple/lease semantics 검증.
+   - registry의 canonical collision tuple, exact raw claim, lease/time semantics 검증.
 3. `packages/plugin/src/inbound.ts`
    - ordinary `onAgentRunStart` activation, outer `finally` exact release, lifecycle teardown epoch rotation 추가.
 4. `packages/plugin/src/inbound.test.ts`
@@ -198,15 +198,17 @@ reason은 `missing_session_key`, `invalid_request_time`, `active_no_match`, `act
 
 ### 5.1 registry
 
-- `no_match`, unique peer, 같은 peer의 duplicate lease, distinct peer ambiguity
-- exact account-case isolation (`AcctA` 대 `accta`)
+- `no_match`, unique exact origin, 같은 raw account/peer의 duplicate lease, distinct origin ambiguity
+- `AcctA` 단독 claim은 raw handler `AcctA` resolve에만 eligible하고 alias handler `accta`에는 `no_match`
+- `AcctA/A`와 `accta/B`가 같은 canonical tuple에서 overlap하면 poison; peer ID가 같아도 raw account가 다르면 poison
 - 같은 handle의 idempotent activate와 unique-ID exact release
 - rotate 전 dormant handle은 activate 불가; active handle은 claim을 유지하고 repeated activate는 no-op이며 old release가 다른/new claim을 건드리지 않음
 - retained active claim은 pre-barrier request를 거부하지만 post-barrier request에는 exact peer로 resolve됨
 - injected `now()`로 activation 전/후 request time filtering, non-finite time, future time, constructor/rotate barrier보다 작거나 같은 time을 검증
+- strict time: `activatedAtMs === requestCreatedAtMs`인 claim은 제외되고 더 이른 activation만 eligible
 - clock regression/invalid read는 그 epoch에서 `invalid_request_time`이며 어떤 peer도 선택하지 않음
-- A/B overlap은 tuple을 poison하고, A release·모든 release·later run 뒤에도 current epoch에서 계속 `ambiguous`
-- same-peer duplicate는 poison하지 않으며 정상 unique resolution을 유지
+- distinct exact-origin overlap은 canonical tuple을 poison하고, 한쪽 release·모든 release·later run 뒤에도 current epoch에서 계속 `ambiguous`
+- same raw account/peer duplicate는 poison하지 않으며 정상 unique resolution을 유지
 - rotate 시 distinct retained claims는 즉시 re-poison; distinct overlap이 사라진 prior poison은 reset되지만 old request는 새 barrier로 `invalid_request_time`
 - 작은 injected `maxPoisonedKeys`를 넘기면 per-key eviction 대신 global poison으로 승격되어 모든 fallback이 fail-closed
 - 두 simulated module-generation getter가 같은 process-global registry를 공유하고 incompatible structural version은 fail-closed
@@ -231,15 +233,18 @@ temp directory에 실제 OpenClaw session-store document를 만들고 pinned `re
 - Issue #93 all-null metadata: active lease와 stored case-preserved peer가 일치할 때만 exact target
 - missing/corrupt session entry, nullable/blank key, SDK throw는 `null`
 - active/stored mismatch와 stored account/channel mismatch는 `null`
-- 같은 key에 distinct active peer lease 둘이면 `ambiguous` + `null`
+- 같은 canonical tuple에 distinct exact-origin lease 둘이면 `ambiguous` + `null`
 - explicit other channel은 `null`; explicit webchannel + target은 fast path
 - channel 없는 `turnSourceTo`는 무시
 - warn 한 줄에 raw key/peer/target이 없음
 - config generation의 binding/`identityLinks`를 재할당해도 current-config route를 호출하지 않고 wrong-peer publish가 0건
 - stored target이 B로 덮인 동안 active lease가 A면 `null`
+- A request/release 뒤 같은 injected millisecond에 alias B가 activate되고 store를 B로 덮어도 strict time filter로 `null`이고 publish 0건
 - replay된 old request 뒤 같은 key의 새 lease와 stored target B가 모두 일치해도 request time이 current barrier 이하이므로 `null`이고 publish 0건
 - A/B가 request 전에 overlap한 뒤 A abort/release, live/store B 상태로 old A request를 replay해도 persistent tuple poison으로 `null`이고 publish 0건
-- `AcctA`/`accta`가 같은 session key/peer를 써도 exact active account handler만 resolve하고 다른 handler publish는 0건
+- `AcctA` 단독 active + canonical stored `accta`는 raw handler `AcctA` transport로만 resolve하고 alias handler publish는 0건
+- `AcctA/A`와 `accta/B` overlap 후 release/replay/store overwrite에도 wrong-account/peer publish는 0건
+- sequential later alias activation은 old request보다 늦거나 같은 시각이므로 old request를 가져가지 못함
 
 ### 5.4 focused NATS capture integration
 
@@ -251,7 +256,7 @@ active lease + real stored target → capability `resolveOriginTarget` → nativ
 - reload 뒤 later lease/store B와 replay된 old request를 결합해도 publish 0건
 - A/B overlap 후 A release + replay에서는 B subject를 포함해 publish 0건
 - poison cap overflow로 global poison이 된 epoch에서는 모든 fallback publish 0건
-- distinct-peer ambiguity에서 publish 0건
+- canonical tuple의 distinct exact-origin ambiguity에서 publish 0건
 - 다른 peer subject에는 모든 경우 publish 0건
 
 의존성이 repository 표준 절차로 준비된 뒤 다음을 통과해야 한다.
@@ -270,8 +275,10 @@ npm test
 - **reload/teardown with running handlers:** queue dispose는 running handler를 abort하지 않는다. dormant handle은 rotation으로 막되 active claim은 그 handler의 exact release까지 process-global registry에 유지한다. old pending replay는 barrier가 막고 retained run의 실제 post-barrier request는 허용한다.
 - **process restart:** registry와 gateway pending state가 함께 사라진다. durable cross-restart origin을 추측하지 않고 fail-closed 한다.
 - **wall-clock anomaly:** non-finite/future time 또는 epoch 내 regression은 해당 판정을 fail-closed 한다. 일시적인 false negative는 허용하지만 later run을 old request에 붙이는 false positive는 허용하지 않는다.
-- **unexpected overlap:** 같은 account/session에 distinct peer run이 겹치면 모두 막힌다. order-based 선택보다 안전한 실패다.
-- **persistent epoch poison:** distinct-peer overlap은 epoch 안에서 모두 release된 뒤에도 해당 tuple을 막는다. rotation은 prior poison을 reset하되 retained active overlap을 즉시 다시 poison하고, 과거 request는 새 barrier가 막는다.
+- **same-ms ordering:** activation과 request creation이 같은 millisecond면 legitimate request도 막힐 수 있다. 순서를 증명할 수 없는 equality에서 availability보다 exact-origin safety를 택한다.
+- **canonical account collision:** lowercased account/session domain을 공유하는 raw aliases는 exact raw claim으로 분리하되 overlap 시 모두 poison한다. blanket noncanonical rejection이나 current-config alias enumeration은 하지 않는다.
+- **unexpected overlap:** 같은 canonical account/session에 distinct `(rawAccountId, peerId)` run이 겹치면 모든 raw aliases를 막는다. order-based 선택보다 안전한 실패다.
+- **persistent epoch poison:** distinct exact-origin overlap은 epoch 안에서 모두 release된 뒤에도 canonical tuple을 막는다. rotation은 prior poison을 reset하되 retained active overlap을 즉시 다시 poison하고, 과거 request는 새 barrier가 막는다.
 - **poison capacity:** per-key poison set이 1,024개를 넘으려 하면 epoch 전체 fallback을 막는다. eviction으로 safety evidence를 잃지 않고 bounded memory를 유지하는 fail-closed escalation이다.
 - **hung run:** 실제 active run이 끝나지 않으면 lease도 유지된다. active claim을 임의 eviction하지 않으며 host abort/concurrency가 active-claim 수명을 소유한다. poison state는 별도 bounded escalation 계약을 따른다.
 - **stored entry overwrite:** active peer와 다르면 전달하지 않는다. availability 손실을 감수하고 wrong-peer delivery를 막는다.
@@ -285,17 +292,18 @@ npm test
 
 - [ ] explicit channel/target precedence와 두 `ANON_PEER_ID` fallback 제거가 테스트로 고정된다.
 - [ ] active lease는 ordinary agent run의 `onAgentRunStart`부터 outer `finally`까지만 존재한다.
-- [ ] registry의 immutable-handle, duplicate/ambiguity/exact-account/release/epoch-time-barrier 불변식이 green이다.
+- [ ] registry의 immutable-handle, canonical-account collision, exact-raw-account selection, duplicate/ambiguity/release/epoch-time-barrier 불변식이 green이다.
 - [ ] rotate 전 dormant handle은 activate할 수 없고, active claim은 rotation을 넘어 유지되며 exact old release가 자기 claim만 지운다.
 - [ ] pre-barrier request는 거부되지만 retained active run의 post-barrier request는 exact lease/store 일치 시 resolve된다.
-- [ ] request time이 non-finite, future 또는 current barrier 이하이면 `invalid_request_time`이고, request 뒤 activation된 lease는 집계되지 않는다.
-- [ ] distinct-peer overlap은 release/all-release/later-run 뒤에도 epoch 끝까지 poisoned이며 same-peer duplicate는 poison하지 않는다.
+- [ ] request time이 non-finite, future 또는 current barrier 이하이면 `invalid_request_time`이고, `activatedAtMs >= requestCreatedAtMs`인 lease는 집계되지 않는다.
+- [ ] distinct exact-origin overlap은 release/all-release/later-run 뒤에도 canonical tuple을 epoch 끝까지 poison하며 same raw account/peer duplicate는 poison하지 않는다.
 - [ ] rotation은 retained distinct claims를 re-poison하고, 남은 distinct overlap이 없는 prior poison만 reset한다.
 - [ ] poison cap overflow는 key eviction 없이 global fail-closed로 승격되고 rotation 때 retained claims로 안전하게 재구성된다.
 - [ ] 두 cache-busted module generation이 versioned process-global registry 하나를 공유한다.
 - [ ] 실제 SDK helper + temp session store에서 all-null Issue #93 경로가 exact peer를 복구한다.
 - [ ] lease와 stored target 중 하나라도 없거나 다르면 진단 한 줄 + `null`이고 publish는 0건이다.
-- [ ] config reassignment, stored overwrite, account case collision, reload replay, dispatcher teardown 중 retained A/new B overlap에서 wrong-peer publish가 0건이다.
+- [ ] `AcctA` claim/canonical stored `accta`는 raw `AcctA` handler만 resolve하고 alias handler는 `no_match`다.
+- [ ] config reassignment, same-ms sequential alias, stored overwrite, canonical account collision/overlap, reload replay, dispatcher teardown 중 retained A/new B에서 wrong-account/peer publish가 0건이다.
 - [ ] focused integration은 일치한 exact subject 하나에만 publish함을 증명한다.
 - [ ] production diff는 `approval-origin.ts`, `inbound.ts`, `approvals.ts`로 제한된다.
 - [ ] build, typecheck, plugin test, full test가 모두 실패 0이다.
