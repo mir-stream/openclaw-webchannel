@@ -293,12 +293,14 @@ type UnackedLedgerEntry = {
   message: Extract<OutboundMessage, { type: "user_message" }>;
   retryCount: number;
   nextRetryAt: number | null;
+  published: boolean;
 };
 
 type LedgerSchedulingSnapshot = Array<{
   id: string;
   entry: UnackedLedgerEntry;
   nextRetryAt: number | null;
+  published: boolean;
 }>;
 
 // ---------------------------------------------------------------------------
@@ -1293,7 +1295,7 @@ export class WebChannelNatsClient {
         if (
           !this.disconnected && !this.terminalReached
           && this.ackStallSinceAt !== null
-          && this.unackedLedger.size > 0
+          && this.hasPublishedUnackedOwnership()
           && !this.ackStallRecoveryIssued
         ) {
           this.ackStallMutationEpoch++;
@@ -1734,7 +1736,7 @@ export class WebChannelNatsClient {
 
   private hasPublishedUnackedOwnership(): boolean {
     for (const entry of this.unackedLedger.values()) {
-      if (entry.nextRetryAt !== null) return true;
+      if (entry.published) return true;
     }
     return false;
   }
@@ -2243,16 +2245,32 @@ export class WebChannelNatsClient {
           this.unackedLedger.get(message.id) === ledgerEntry
           && this.sessionKey === sealingKey
           && this.connectionEpoch === sealingConnectionEpoch
-          && this.ackStallMutationEpoch === sealingMutationEpoch
           && !this.disconnected && !this.terminalReached
         ) {
-          if (this.ackStallSinceAt === null) {
-            this.ackStallMutationEpoch++;
-            this.ackStallSinceAt = attemptAt;
-            this.ackStallRecoveryIssued = false;
+          // Retry scheduling is prepared before the raw call, but only a
+          // successful raw publish confirms application-published ownership.
+          // An older message may be ACKed synchronously inside ws.send(),
+          // advancing the mutation epoch while this exact entry remains current;
+          // confirming it here is safe. A result for THIS id detached the entry,
+          // so the identity fence above prevents resurrection.
+          ledgerEntry.published = true;
+          const confirmationMutationEpoch = this.ackStallMutationEpoch;
+          const publishedAt = this.retryNow();
+          if (
+            this.unackedLedger.get(message.id) === ledgerEntry
+            && this.sessionKey === sealingKey
+            && this.connectionEpoch === sealingConnectionEpoch
+            && this.ackStallMutationEpoch === confirmationMutationEpoch
+            && !this.disconnected && !this.terminalReached
+          ) {
+            if (this.ackStallSinceAt === null) {
+              this.ackStallMutationEpoch++;
+              this.ackStallSinceAt = publishedAt;
+              this.ackStallRecoveryIssued = false;
+            }
+            publishedMutationEpoch = this.ackStallMutationEpoch;
+            schedulingSnapshot = this.captureLedgerScheduling();
           }
-          publishedMutationEpoch = this.ackStallMutationEpoch;
-          schedulingSnapshot = this.captureLedgerScheduling();
         }
         this.trackerAdvance(message.id, "sent");
         if (
@@ -2436,6 +2454,7 @@ export class WebChannelNatsClient {
         // Injected clock/random callbacks run only after sealMessage has
         // completed; null is inert pre-publish ownership metadata.
         nextRetryAt: null,
+        published: false,
       });
     }
     while (this.unackedLedger.size > WebChannelNatsClient.MAX_UNACKED) {
@@ -2467,6 +2486,7 @@ export class WebChannelNatsClient {
       id,
       entry,
       nextRetryAt: entry.nextRetryAt,
+      published: entry.published,
     }));
   }
 
@@ -2476,6 +2496,7 @@ export class WebChannelNatsClient {
       if (
         this.unackedLedger.get(item.id) !== item.entry
         || item.entry.nextRetryAt !== item.nextRetryAt
+        || item.entry.published !== item.published
       ) {
         return false;
       }

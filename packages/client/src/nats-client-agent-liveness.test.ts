@@ -85,7 +85,7 @@ function internal(client: WebChannelNatsClient) {
     ackStallSinceAt: number | null;
     ackStallRecoveryIssued: boolean;
     ackStallMutationEpoch: number;
-    unackedLedger: Map<string, { nextRetryAt: number | null }>;
+    unackedLedger: Map<string, { nextRetryAt: number | null; published: boolean }>;
     liveRetryTimer: unknown;
     liveRetryTimerGeneration: number;
     armLiveRetryTimer: () => void;
@@ -413,6 +413,129 @@ describe("WebChannelNatsClient — #81 published-work recovery", () => {
     expect(internal(h.client).ackStallSinceAt).toBeNull();
     expect(internal(h.client).ackStallRecoveryIssued).toBe(false);
     expect(scheduler.taskCount()).toBe(0);
+    h.client.disconnect();
+  });
+
+  it("does not spend B's allowance when its first raw publish ACKs A then throws", async () => {
+    const scheduler = makeScheduler();
+    const timeoutMs = 2_500;
+    const K = new Uint8Array(32).fill(88);
+    const h = await makeClient({
+      reconnect: true,
+      ackStallTimeoutMs: timeoutMs,
+      retryNow: scheduler.now,
+      retryRandom: () => 0.5,
+      retrySetTimeout: scheduler.set,
+      retryClearTimeout: scheduler.clear,
+    });
+    const registration = registerAgent(K, h.devicePublicRaw, h.identity);
+    const attempts: Array<{ id: string; text: string; socket: number }> = [];
+    let ackThenThrow = true;
+    let firstId = "";
+    FakeNatsWS.sharedHandler = (subject, payload, server, replyTo) => {
+      if (subject !== IN) return registration(subject, payload, server, replyTo);
+      const message = openMessage(payload, K) as {
+        type?: string;
+        id?: string;
+        text?: string;
+      } | null;
+      if (message?.type !== "user_message" || !message.id || !message.text) return;
+      attempts.push({
+        id: message.id,
+        text: message.text,
+        socket: FakeNatsWS.instances.indexOf(server),
+      });
+      if (message.text === "B" && ackThenThrow) {
+        ackThenThrow = false;
+        deliver(server, K, { type: "ack", ids: [firstId] });
+        throw new Error("B raw write failed after synchronously accepting A");
+      }
+    };
+    h.client.connect();
+    await settle();
+    const reconnect = vi.spyOn(internal(h.client).client, "reconnect")
+      .mockImplementation(() => {});
+
+    firstId = h.client.sendUserMessage("A");
+    const secondId = h.client.sendUserMessage("B");
+
+    expect(ackThenThrow).toBe(false);
+    expect(h.client.getSendStateSnapshot(firstId)?.state).toBe("accepted");
+    expect(h.client.getSendStateSnapshot(secondId)?.state).toBe("queued");
+    expect(internal(h.client).unackedLedger.get(secondId)?.published).toBe(false);
+    expect(internal(h.client).ackStallSinceAt).toBeNull();
+    expect(internal(h.client).ackStallRecoveryIssued).toBe(false);
+    expect(reconnect).not.toHaveBeenCalled();
+
+    await settle(30);
+    expect(FakeNatsWS.instances.length).toBeGreaterThanOrEqual(2);
+    expect(h.client.getSendStateSnapshot(secondId)?.state).toBe("sent");
+    expect(internal(h.client).unackedLedger.get(secondId)?.published).toBe(true);
+    expect(internal(h.client).ackStallSinceAt).toBe(0);
+    expect(internal(h.client).ackStallRecoveryIssued).toBe(false);
+    expect(attempts.filter(({ text }) => text === "B")).toEqual([
+      { id: secondId, text: "B", socket: 0 },
+      { id: secondId, text: "B", socket: 1 },
+    ]);
+
+    scheduler.advanceTo(timeoutMs - 1);
+    expect(reconnect).not.toHaveBeenCalled();
+    scheduler.advanceTo(timeoutMs);
+    expect(reconnect).toHaveBeenCalledTimes(1);
+    scheduler.advanceTo(10_000);
+    expect(reconnect).toHaveBeenCalledTimes(1);
+    h.client.disconnect();
+  });
+
+  it("ages B from confirmed success when its raw publish ACKs A and advances time", async () => {
+    const scheduler = makeScheduler();
+    const timeoutMs = 2_500;
+    const advancedAt = 5_000;
+    const K = new Uint8Array(32).fill(89);
+    const h = await makeClient({
+      ackStallTimeoutMs: timeoutMs,
+      retryNow: scheduler.now,
+      retryRandom: () => 0.5,
+      retrySetTimeout: scheduler.set,
+      retryClearTimeout: scheduler.clear,
+    });
+    const registration = registerAgent(K, h.devicePublicRaw, h.identity);
+    let acceptAndAdvance = true;
+    let firstId = "";
+    FakeNatsWS.sharedHandler = (subject, payload, server, replyTo) => {
+      if (subject !== IN) return registration(subject, payload, server, replyTo);
+      const message = openMessage(payload, K) as { type?: string; text?: string } | null;
+      if (message?.type === "user_message" && message.text === "B" && acceptAndAdvance) {
+        acceptAndAdvance = false;
+        deliver(server, K, { type: "ack", ids: [firstId] });
+        scheduler.advanceTo(advancedAt);
+      }
+    };
+    h.client.connect();
+    await settle();
+    const reconnect = vi.spyOn(internal(h.client).client, "reconnect")
+      .mockImplementation(() => {});
+
+    firstId = h.client.sendUserMessage("A");
+    const secondId = h.client.sendUserMessage("B");
+
+    expect(acceptAndAdvance).toBe(false);
+    expect(h.client.getSendStateSnapshot(firstId)?.state).toBe("accepted");
+    expect(h.client.getSendStateSnapshot(secondId)?.state).toBe("sent");
+    expect(internal(h.client).unackedLedger.get(secondId)?.published).toBe(true);
+    expect(internal(h.client).ackStallSinceAt).toBe(advancedAt);
+    expect(internal(h.client).ackStallRecoveryIssued).toBe(false);
+    expect(reconnect).not.toHaveBeenCalled();
+
+    // The pre-call retry deadline is already elapsed, so an ordinary retry may
+    // run now; it must not turn the newly confirmed stall interval into an
+    // immediate application recovery.
+    scheduler.advanceTo(advancedAt);
+    expect(reconnect).not.toHaveBeenCalled();
+    scheduler.advanceTo(advancedAt + timeoutMs - 1);
+    expect(reconnect).not.toHaveBeenCalled();
+    scheduler.advanceTo(advancedAt + timeoutMs);
+    expect(reconnect).toHaveBeenCalledTimes(1);
     h.client.disconnect();
   });
 
