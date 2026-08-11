@@ -250,7 +250,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
-  it("M6b: an indexed late A reservation keeps B behind the terminal epoch", async () => {
+  it("M6b: an indexed late A reservation orders fresh fallback before B", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.handleAssistantMessageBoundary();
@@ -261,10 +261,9 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await expect(h.draft.deliverAuthorizedBlock({ text: "postHookA" })).resolves.toBe(true);
     expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA"]);
     h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
-    expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA"]);
+    expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA", "B partial"]);
 
     await h.draft.finalize("B final");
-    expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA", "B final"]);
     expect(successfulIds(h.frames)).toHaveLength(2);
   });
 
@@ -368,7 +367,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(rewritten.frames.at(-1)).toEqual({ type: "progress", id: laneId, text: "lane later" });
   });
 
-  it("M6h: indexed cleanup retires records while an empty predecessor waits for drain", async () => {
+  it("M6h: indexed lifecycle cleanup releases B; ambiguous cleanup waits for drain", async () => {
     for (const lifecycle of ["skip", "cancel"] as const) {
       const h = makeDraftHarness();
       h.draft.handleAssistantMessageBoundary();
@@ -376,8 +375,6 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       h.draft.pushAnswerText({ text: "B" });
       h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
       h.draft.noteDeliveryLifecycle(lifecycle, { assistantMessageIndex: 0 });
-      expect(h.frames).toEqual([]);
-      await h.draft.drain();
       expect(h.frames.map((frame) => frame.text)).toEqual(["B"]);
     }
 
@@ -389,8 +386,6 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     });
     cleanupBeforeBoundary.draft.handleAssistantMessageBoundary();
     cleanupBeforeBoundary.draft.pushAnswerText({ text: "B after early cleanup" });
-    expect(cleanupBeforeBoundary.frames).toEqual([]);
-    await cleanupBeforeBoundary.draft.drain();
     expect(cleanupBeforeBoundary.frames.map((frame) => frame.text)).toEqual([
       "B after early cleanup",
     ]);
@@ -456,18 +451,32 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "F-A", "B partial"]);
   });
 
-  it("M6h/F4: a first indexed retirement keeps the lane open to a later indexless callback", async () => {
+  it("M6h/F4: an indexed lifecycle opens an empty predecessor barrier", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "B partial" });
+    await h.draft.flush();
+    expect(h.attempts).toEqual([]);
+
+    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    await h.draft.flush();
+    expect(h.attempts.map((attempt) => attempt.text)).toEqual(["B partial"]);
+  });
+
+  it("M6h/F4: an attached indexless epoch survives the first indexed retirement", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B partial" });
+    h.draft.noteBlockReplyQueued({});
 
     await h.draft.deliverAuthorizedBlock({ text: "F-A1" });
     h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
     expect(h.frames.map((frame) => frame.text)).toEqual(["F-A1"]);
 
-    h.draft.noteBlockReplyQueued({});
     await h.draft.deliverAuthorizedBlock({ text: "F-A2" });
     h.draft.noteDeliveryLifecycle("settled", {});
     expect(h.frames.map((frame) => frame.text)).toEqual(["F-A1", "F-A2"]);

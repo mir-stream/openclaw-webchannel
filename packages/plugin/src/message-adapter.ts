@@ -162,6 +162,7 @@ type AssistantDraftLane = {
   tentativeBarrierReservationIds: string[];
   closed: boolean;
   resolution: LaneResolution;
+  /** Armed only by an attached indexless reservation; terminal drain disarms it. */
   acceptsLateIndexlessReservations: boolean;
   started: boolean;
   settled: boolean;
@@ -277,11 +278,13 @@ export type PartialAnswerUpdate = { text?: string; delta?: string; replace?: tru
  */
 export type ProgressDraftController = {
   /**
-   * True after a successful frame while the ordinary-answer terminal slot is
-   * still open. An ownerless provisional tool preview can therefore make this
-   * true while `snapshotText()` is empty. A silent-completion caller must use
-   * `drain()` so a lone preview settles as itself; it must not finalize an empty
-   * lane with a synthetic stop marker.
+   * Legacy cleanup signal for inbound: true means some wire frame succeeded
+   * while the ordinary-answer terminal slot is still open. Inbound may use it
+   * only to decide whether legacy tool-only preview cleanup may be needed. An
+   * ownerless provisional preview can make it true while `snapshotText()` is
+   * empty, and false after an ordinary answer settles does not mean that no
+   * wire activity or durable delivery occurred. Silent completion must call
+   * `drain()`; it must not infer an empty lane needs a synthetic stop marker.
    */
   readonly started: boolean;
   /** Queue one tool/item event for the provisional preview writer. */
@@ -773,7 +776,6 @@ export function createProgressDraftController(params: {
       lane.resolution !== "empty"
     ) {
       lane.resolution = "unresolved";
-      lane.acceptsLateIndexlessReservations = true;
     }
     const next = newLane(lane.generation + 1);
     state.lanes.push(next);
@@ -790,6 +792,14 @@ export function createProgressDraftController(params: {
     lane.tentativeBarrierReservationIds = lane.tentativeBarrierReservationIds.filter(
       (token) => token !== reservation.token,
     );
+    if (
+      lane.tentativeBarrierReservationIds.length === 0 &&
+      !lane.acceptsLateIndexlessReservations &&
+      !lane.answerText &&
+      lane.resolution !== "materialized"
+    ) {
+      lane.resolution = "empty";
+    }
   };
 
   type OutstandingLifecycleRecord =
@@ -1057,6 +1067,12 @@ export function createProgressDraftController(params: {
             const disposition = state.blockDispositions.find((candidate) => !candidate.settled);
             if (disposition) {
               disposition.settled = true;
+              retireSoleLifecycleRecord(input.assistantMessageIndex);
+            } else if (state.blockDispositions.length === 0) {
+              // The indexed lifecycle signal is itself sufficient when no
+              // actual-block disposition has ever been recorded. Once a
+              // disposition exists, its unsettled state is the idempotence
+              // guard against a stale duplicate retiring a later callback.
               retireSoleLifecycleRecord(input.assistantMessageIndex);
             }
           } else {
