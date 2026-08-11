@@ -331,10 +331,12 @@ export type WebChannelState = {
    * not a proof: the agent can also reject a message it already admitted). A
    * lost ack is not one: `evicted` is a client-side ledger drop, so that turn may
    * still be named by a settle and is left to the sweep. Beyond that, a
-   * disconnect, a terminal error, `close()`, and an explicit `/stop` force-close
-   * every open turn, as does the post-reconnect staleness valve — though only
-   * where it arms at all, i.e. when a `working` draft was live when the session
-   * re-established. Force-closing is one-way: no inbound frame re-opens a turn
+   * disconnect, a terminal error, and `close()` force-close every open turn. An
+   * explicit `/stop` also consumes existing queued turn candidates so their
+   * later publication cannot re-open stopped work. The post-reconnect staleness
+   * valve force-closes open turns too — though only where it arms at all, i.e.
+   * when a `working` draft was live when the session re-established.
+   * Force-closing is one-way: no inbound frame re-opens a turn
    * (unlike `isTyping`, which a later `typing` frame re-arms), so a mid-turn
    * reconnect leaves this `false` for the remainder of that turn.
    *

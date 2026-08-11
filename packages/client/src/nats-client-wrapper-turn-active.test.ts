@@ -71,7 +71,10 @@ const MAX_UNACKED = (WebChannelNatsClient as unknown as { MAX_UNACKED: number })
  * into one turn keyed by the LAST id, so a group emits exactly one settle. Every
  * test below delivers the settles it is modelling by hand.
  */
-async function connectWrapper(control: { ack: boolean } = { ack: true }): Promise<Setup> {
+async function connectWrapper(
+  control: { ack: boolean } = { ack: true },
+  opts: { connect?: boolean } = {},
+): Promise<Setup> {
   const pop = await generateDevicePopKeyPair();
   const x = await generateDeviceX25519();
   const identity: AgentIdentity = makeAgentIdentity();
@@ -107,8 +110,10 @@ async function connectWrapper(control: { ack: boolean } = { ack: true }): Promis
       pinnedAgentPublicKey: identity.publicB64url,
     },
   });
-  wrapper.connect();
-  await settle();
+  if (opts.connect !== false) {
+    wrapper.connect();
+    await settle();
+  }
   return { wrapper, K, received, control };
 }
 
@@ -126,6 +131,51 @@ const openTurnsOf = (w: WebChannelNATSClient): Set<string> =>
   (w as unknown as { openTurns: Set<string> }).openTurns;
 
 describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)", () => {
+  it("a pre-connect queued send opens only after its first real publication", async () => {
+    const h = await connectWrapper({ ack: false }, { connect: false });
+    const receipt = h.wrapper.send("queued before connect")!;
+    const wireId = wireIdOf(h.wrapper, "queued before connect");
+    const publishedSnapshots: Array<{ sendState: string | undefined; turnActive: boolean | undefined }> = [];
+    h.wrapper.subscribe((state) => {
+      const bubble = state.messages.find((m) => m.wireId === wireId);
+      if (bubble?.sendState === "sent") {
+        publishedSnapshots.push({ sendState: bubble.sendState, turnActive: state.turnActive });
+      }
+    });
+
+    expect(receipt.snapshot().state).toBe("queued");
+    expect([...openTurnsOf(h.wrapper)]).toEqual([]);
+    expect(h.wrapper.getState().turnActive).toBeUndefined();
+
+    h.wrapper.connect();
+    await settle();
+
+    expect(h.received).toEqual([wireId]);
+    expect(receipt.snapshot().state).toBe("sent");
+    expect([...openTurnsOf(h.wrapper)]).toEqual([wireId]);
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    expect(publishedSnapshots).toContainEqual({ sendState: "sent", turnActive: true });
+    h.wrapper.close();
+  });
+
+  it("connect(); send() keeps a queued turn closed until publication", async () => {
+    const h = await connectWrapper({ ack: true }, { connect: false });
+
+    h.wrapper.connect();
+    const receipt = h.wrapper.send("README sequence")!;
+    const wireId = wireIdOf(h.wrapper, "README sequence");
+    expect(receipt.snapshot().state).toBe("queued");
+    expect([...openTurnsOf(h.wrapper)]).toEqual([]);
+    expect(h.wrapper.getState().turnActive).toBeUndefined();
+
+    await settle();
+    expect(h.received).toEqual([wireId]);
+    expect(receipt.snapshot().state).toBe("accepted");
+    expect([...openTurnsOf(h.wrapper)]).toEqual([wireId]);
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    h.wrapper.close();
+  });
+
   // THE core defect: the gap after the first agent bubble settles.
   it("stays true after the first agent bubble settles (isTyping false, no working draft)", async () => {
     const h = await connectWrapper();
@@ -494,17 +544,142 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     h.wrapper.close();
   });
 
+  it("an explicit /stop consumes a pre-connect queued turn before replay", async () => {
+    const h = await connectWrapper({ ack: true }, { connect: false });
+    const queued = h.wrapper.send("queued before stop")!;
+    h.wrapper.send("/stop");
+
+    expect(queued.snapshot().state).toBe("queued");
+    expect([...openTurnsOf(h.wrapper)]).toEqual([]);
+    expect(h.wrapper.getState().turnActive).not.toBe(true);
+
+    h.wrapper.connect();
+    await settle();
+
+    expect(h.received).toHaveLength(2);
+    expect(queued.snapshot().state).toBe("accepted");
+    expect([...openTurnsOf(h.wrapper)]).toEqual([]);
+    expect(h.wrapper.getState().turnActive).not.toBe(true);
+    h.wrapper.close();
+  });
+
+  it("an explicit /stop preserves a follow-up created by its cancellation fanout", async () => {
+    const h = await connectWrapper();
+    h.wrapper.send("active");
+    await settle();
+    deliverOut(h.K, { type: "typing" });
+    await settle();
+    const cancelled = h.wrapper.send("cancel me")!;
+    let followUp: ReturnType<WebChannelNATSClient["send"]>;
+    cancelled.subscribe((snapshot) => {
+      if (snapshot.state === "failed") followUp = h.wrapper.send("after stop");
+    });
+
+    h.wrapper.send("/stop");
+    await settle();
+
+    const followUpBubble = h.wrapper.getState().messages.find((m) => m.text === "after stop")!;
+    expect(followUp!.snapshot().state).toBe("accepted");
+    expect(followUpBubble.wireId).toBeDefined();
+    expect([...openTurnsOf(h.wrapper)]).toEqual([followUpBubble.wireId]);
+    expect(h.wrapper.getState().turnActive).toBe(true);
+    h.wrapper.close();
+  });
+
   describe("safety points force-close every open turn", () => {
     it("a raw disconnect closes them", async () => {
-      const h = await connectWrapper();
+      const h = await connectWrapper({ ack: false });
       h.wrapper.send("in flight");
       await settle();
+      const wireId = wireIdOf(h.wrapper, "in flight");
       expect(h.wrapper.getState().turnActive).toBe(true);
 
       FakeNatsWS.instances.at(-1)!.close();
       await settle();
       expect(h.wrapper.getState().connected).toBe(false);
       expect(h.wrapper.getState().turnActive).toBe(false);
+
+      // A delayed ack/replay is a later authoritative transition, but this turn
+      // already spent its one-way opening latch before the disconnect sweep.
+      (h.wrapper as unknown as {
+        client: { emitSendState: (id: string, state: "accepted") => void };
+      }).client.emitSendState(wireId, "accepted");
+      expect([...openTurnsOf(h.wrapper)]).toEqual([]);
+      expect(h.wrapper.getState().turnActive).toBe(false);
+      h.wrapper.close();
+    });
+
+    it("a raw disconnect consumes a sent callback still queued in the global fanout", async () => {
+      const h = await connectWrapper();
+      let injected = false;
+      const unsubscribe = h.wrapper.subscribe((state) => {
+        const a = state.messages.find((m) => m.text === "A");
+        if (injected || a?.sendState !== "accepted") return;
+        injected = true;
+        h.wrapper.send("B"); // low tracker reaches sent; wrapper callback is queued behind A's ack
+        FakeNatsWS.instances.at(-1)!.close();
+      });
+
+      h.wrapper.send("A");
+      await settle();
+
+      expect(injected).toBe(true);
+      expect(h.wrapper.getState().messages.find((m) => m.text === "B")?.sendState).not.toBe("queued");
+      expect(h.wrapper.getState().connected).toBe(false);
+      expect([...openTurnsOf(h.wrapper)]).toEqual([]);
+      expect(h.wrapper.getState().turnActive).toBe(false);
+      unsubscribe();
+      h.wrapper.close();
+    });
+
+    it("a synchronous raw loss inside ws.send cannot open on trailing sent", async () => {
+      const h = await connectWrapper({ ack: false });
+      const socket = FakeNatsWS.instances.at(-1)!;
+      socket.handler = (subject, _payload, server) => {
+        if (subject === IN) server.close(); // ws.send still returns normally
+      };
+
+      const receipt = h.wrapper.send("loss inside publish")!;
+      await settle();
+
+      expect(receipt.snapshot().state).toBe("sent");
+      expect(h.wrapper.getState().connected).toBe(false);
+      expect([...openTurnsOf(h.wrapper)]).toEqual([]);
+      expect(h.wrapper.getState().turnActive).not.toBe(true);
+      h.wrapper.close();
+    });
+
+    it("a raw disconnect consumes sent queued ahead of failed{evicted}", async () => {
+      const h = await connectWrapper();
+      let injected = false;
+      const unsubscribe = h.wrapper.subscribe((state) => {
+        const a = state.messages.find((m) => m.text === "A");
+        if (injected || a?.sendState !== "accepted") return;
+        injected = true;
+        h.wrapper.send("B");
+        const b = wireIdOf(h.wrapper, "B");
+        (h.wrapper as unknown as {
+          client: {
+            trackerFail: (
+              id: string,
+              failure: { reason: "evicted"; retryable: true },
+            ) => void;
+          };
+        }).client.trackerFail(b, { reason: "evicted", retryable: true });
+        FakeNatsWS.instances.at(-1)!.close();
+      });
+
+      h.wrapper.send("A");
+      await settle();
+
+      expect(injected).toBe(true);
+      expect(h.wrapper.getState().messages.find((m) => m.text === "B")).toMatchObject({
+        sendState: "failed",
+        sendFailure: { reason: "evicted", retryable: true },
+      });
+      expect([...openTurnsOf(h.wrapper)]).toEqual([]);
+      expect(h.wrapper.getState().turnActive).toBe(false);
+      unsubscribe();
       h.wrapper.close();
     });
 
@@ -644,12 +819,16 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
         )!;
         expect(stop.wireId).toBeDefined();
         expect(replacement.wireId).toBeDefined();
-        expect([...openTurnsOf(h.wrapper)]).toEqual([replacement.wireId]);
+        expect(stop.sendState).toBe("queued");
+        expect(replacement.sendState).toBe("queued");
+        expect([...openTurnsOf(h.wrapper)]).toEqual([]);
         expect(openTurnsOf(h.wrapper).has(stop.wireId!)).toBe(false);
-        expect(h.wrapper.getState().turnActive).toBe(true);
+        expect(h.wrapper.getState().turnActive).toBe(false);
 
         await settle();
-        expect(h.wrapper.getState().turnActive).toBe(true); // an ack is not a settle
+        expect([...openTurnsOf(h.wrapper)]).toEqual([replacement.wireId]);
+        expect(openTurnsOf(h.wrapper).has(stop.wireId!)).toBe(false);
+        expect(h.wrapper.getState().turnActive).toBe(true); // publish/ack opened; no settle yet
         deliverOut(h.K, { type: "turn_settled", turnId: replacement.wireId, outcome: "ok" });
         await settle();
         expect(h.wrapper.getState().turnActive).toBe(false);
@@ -755,21 +934,43 @@ describe("WebChannelNATSClient — #96 turnActive, valve and release edges", () 
       } as NonNullable<NatsClientOptions["registration"]>,
     });
   const inner = (w: WebChannelNATSClient) =>
-    (w as unknown as { client: { sendUserMessage: (t: string, id?: string) => string; notifySessionListeners: () => void } }).client;
+    (w as unknown as {
+      client: {
+        sendUserMessage: (t: string, id?: string) => string;
+        notifySessionListeners: () => void;
+        emitSendState: (id: string, state: "sent" | "accepted") => void;
+      };
+    }).client;
+  const publishAs = (
+    w: WebChannelNATSClient,
+    id: string | undefined,
+    state: "sent" | "accepted" = "sent",
+  ): string => {
+    const wireId = id ?? "w-1";
+    inner(w).emitSendState(wireId, state);
+    return wireId;
+  };
   const deliver = (w: WebChannelNATSClient, frame: Frame): void =>
     (w as unknown as { handleMessage: (m: Frame) => void }).handleMessage(frame);
   /** Open the release gate without a socket (the §3.6.2 suite's idiom). */
   function goOnline(w: WebChannelNATSClient): void {
-    const holder = w as unknown as { state: Record<string, unknown>; sessionEstablished: boolean };
+    const holder = w as unknown as {
+      state: Record<string, unknown>;
+      sessionEstablished: boolean;
+      rawTransportConnected: boolean;
+    };
     holder.state = { ...holder.state, connected: true, status: "connected" };
     holder.sessionEstablished = true;
+    holder.rawTransportConnected = true;
   }
 
   it("the expiring valve sweeps open turns alongside the wedged draft", () => {
     vi.useFakeTimers();
     const w = makeWrapper();
     goOnline(w);
-    vi.spyOn(inner(w), "sendUserMessage").mockReturnValue("w-1");
+    vi.spyOn(inner(w), "sendUserMessage").mockImplementation(
+      (_text, id) => publishAs(w, id),
+    );
 
     w.send("wedged turn");
     expect(w.getState().turnActive).toBe(true);
@@ -786,6 +987,86 @@ describe("WebChannelNATSClient — #96 turnActive, valve and release edges", () 
     w.close();
   });
 
+  it("an accepted callback that skips sent opens atomically with the receipt", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const snapshots: Array<{ sendState: string | undefined; turnActive: boolean | undefined }> = [];
+    w.subscribe((state) => {
+      const bubble = state.messages.find((m) => m.text === "fast ack");
+      if (bubble?.sendState === "accepted") {
+        snapshots.push({ sendState: bubble.sendState, turnActive: state.turnActive });
+      }
+    });
+    vi.spyOn(inner(w), "sendUserMessage").mockImplementation(
+      (_text, id) => publishAs(w, id, "accepted"),
+    );
+
+    const receipt = w.send("fast ack")!;
+
+    expect(receipt.snapshot().state).toBe("accepted");
+    expect(openTurnsOf(w).size).toBe(1);
+    expect(w.getState().turnActive).toBe(true);
+    expect(snapshots).toEqual([{ sendState: "accepted", turnActive: true }]);
+    w.close();
+  });
+
+  it("an early outcome-less settle closes the open prefix but its replay is a no-op", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    vi.spyOn(inner(w), "sendUserMessage").mockImplementation((text, id) => {
+      const wireId = id ?? "w-1";
+      if (text === "B") deliver(w, { type: "turn_settled", turnId: wireId });
+      return publishAs(w, wireId);
+    });
+
+    w.send("A");
+    const a = wireIdOf(w, "A");
+    expect([...openTurnsOf(w)]).toEqual([a]);
+    const bReceipt = w.send("B")!;
+    const b = wireIdOf(w, "B");
+
+    expect(bReceipt.snapshot().state).toBe("sent");
+    expect([...openTurnsOf(w)]).toEqual([]);
+    expect(w.getState().turnActive).toBe(false);
+
+    w.send("C");
+    const c = wireIdOf(w, "C");
+    expect([...openTurnsOf(w)]).toEqual([c]);
+    deliver(w, { type: "turn_settled", turnId: b }); // replayed old local settle
+    expect([...openTurnsOf(w)]).toEqual([c]);
+    expect(w.getState().turnActive).toBe(true);
+    w.close();
+  });
+
+  it("a normal settle does not rescan lifetime-retained wire history", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    vi.spyOn(inner(w), "sendUserMessage").mockImplementation(
+      (_text, id) => publishAs(w, id),
+    );
+
+    for (let i = 0; i < 3; i++) {
+      w.send(`history-${i}`);
+      deliver(w, {
+        type: "turn_settled",
+        turnId: wireIdOf(w, `history-${i}`),
+        outcome: "ok",
+      });
+    }
+    w.send("current");
+    const current = wireIdOf(w, "current");
+    const retainedWireMap = (w as unknown as {
+      wireIdToReceiptKey: Map<string, string>;
+    }).wireIdToReceiptKey;
+    const wireHistoryScan = vi.spyOn(retainedWireMap, Symbol.iterator);
+
+    deliver(w, { type: "turn_settled", turnId: current, outcome: "ok" });
+
+    expect(wireHistoryScan).not.toHaveBeenCalled();
+    expect(w.getState().turnActive).toBe(false);
+    w.close();
+  });
+
   // The release loop's bubble-absent arm: a re-entrant listener can remove a held
   // bubble while the drain is running. The text is still published (a release is
   // a commit), so the turn still opens — and with no staged bubble patch to ride
@@ -796,9 +1077,9 @@ describe("WebChannelNATSClient — #96 turnActive, valve and release edges", () 
     const w = makeWrapper();
     goOnline(w);
     const order: string[] = [];
-    vi.spyOn(inner(w), "sendUserMessage").mockImplementation(() => {
+    vi.spyOn(inner(w), "sendUserMessage").mockImplementation((_text, id) => {
       order.push("send");
-      return "w-1";
+      return publishAs(w, id);
     });
 
     deliver(w, { type: "typing" }); // turn in flight → the send is held
@@ -831,10 +1112,11 @@ describe("WebChannelNATSClient — #96 turnActive, valve and release edges", () 
     const w = makeWrapper();
     goOnline(w);
     let publishes = 0;
-    vi.spyOn(inner(w), "sendUserMessage").mockImplementation(() => {
+    vi.spyOn(inner(w), "sendUserMessage").mockImplementation((_text, id) => {
       publishes++;
+      const wireId = publishAs(w, id);
       if (publishes === 2) w.close();
-      return "w-1";
+      return wireId;
     });
 
     w.send("active");

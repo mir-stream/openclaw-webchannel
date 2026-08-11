@@ -127,14 +127,19 @@ nothing in this client reads it back.
 The guarantee is **bounded, not absolute**: `turnActive` can be `true` for longer
 than the agent was really working, but it is not designed to stick forever. A
 terminal error, `close()`, and an explicit `/stop` force-close every open turn,
-and so does the transition to disconnected (a `send()` issued *while* already
-disconnected opens a turn that this particular sweep has already passed; it is
-closed by the next one). The post-reconnect staleness valve force-closes them
-too, but only in the case where it arms at all — when a `working` draft was live
-as the session re-established — so it is a bonus rescue, not a general timeout.
-Force-closing is one-way: unlike `isTyping`, which a later `typing` frame
-re-arms, nothing re-opens a turn, so a transient reconnect in the middle of a
-long turn leaves `turnActive` false for the rest of it.
+and so does the transition to disconnected. A send that is only queued while
+disconnected opens no turn until its first successful publication after
+reconnect. An explicit `/stop` also consumes ordinary sends already queued at
+that boundary, so their later publication cannot re-open the stopped work; a
+follow-up created by the stop's own cancellation fanout belongs after that
+boundary and remains eligible. The post-reconnect staleness valve force-closes
+open turns too, but only in the case where it arms at all — when a `working`
+draft was live as the session re-established — so it is a bonus rescue, not a
+general timeout.
+Force-closing an already-open turn is one-way: unlike `isTyping`, which a later
+`typing` frame re-arms, an ack or replay does not re-open it, so a transient
+reconnect in the middle of a long turn leaves `turnActive` false for the rest of
+it.
 
 The residual has one shape, and no attempt is made to enumerate its causes: **any
 published turn whose settle never arrives — or arrives naming an id this client
