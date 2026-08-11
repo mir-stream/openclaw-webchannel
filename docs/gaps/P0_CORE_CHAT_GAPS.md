@@ -425,7 +425,7 @@ until a history reload restores them.
   **materialize-and-rotate** behavior: settle the completed assistant message under its existing id,
   then stream the next assistant message under a new id. A first-lane tool scaffold is not assigned to
   an empty assistant lane: it remains a turn-level provisional preview whose id is claimed by the first
-  materialized assistant lane or first successful independent delivery, so `Working…` cannot survive
+  successful assistant lane or independent delivery, so `Working…` cannot survive
   beside the payload as a settled ghost. An independent claim never creates a lane. The
   public callback contract is weaker than Telegram's internal seam: `onBlockReplyQueued` may arrive
   after the next message-start callback, its index is optional, and its payload is pre-TTS/media and
@@ -434,11 +434,14 @@ until a history reload restores them.
   `kind:"block"` delivery is wire-authoritative, but no public identity correlates it to a reservation:
   even a sole reservation can be unrelated after callback omission or notice→non-notice rewrite.
   Every authorized block in partial mode therefore uses an independent non-lane delivery path. If P
-  is visible and unclaimed, the delivery reserves P, sends with P's id, and commits only when
-  `visibleReplySent:true`; `false`/throw rolls back so the next lane or successful independent payload
-  can reuse P. If P is absent or already claimed, it uses a fresh id. The queue serializes this
-  reserve/send/commit-or-rollback transaction. Any lane claim or successful independent commit also
-  stops/invalidates the provisional scaffold writer. Later tool/item events must never send
+  is visible and unclaimed, both a lane's first `progress`/final-only `agent_message` and an independent
+  delivery reserve P and send with P's id. The lane transport boolean or independent delivery's
+  `visibleReplySent` must be actual `true` before that owner commits;
+  `false`/throw rolls back P and any tentative lane ID, keeps the writer active, records the failure
+  without blind inline retry, and lets the next successful lane/independent payload reuse P. If another
+  consumer claims P before a failed partial lane's later update, that lane uses a fresh id. The queue
+  serializes this reserve/send/commit-or-rollback transaction. Any successful lane/independent commit
+  also stops/invalidates the provisional scaffold writer. Later tool/item events must never send
   `progress(P,Working…)`, because the reducer would overwrite the durable lane/independent payload at
   P and mark it working again. The `turnActive` signal already landed through #96/#101 and preserves
   turn-level in-flight visibility between bubbles; structured tool detail remains #97. Public
@@ -493,8 +496,10 @@ must reuse one provisional id, and final `[error,A1,A2,B]` must not infer owners
 cardinality. Both the zero-callback default path and the coalesced
 `[A1+"\n\n"+A2@0,B@1]` callback path must leave materialized A/B unchanged and preserve error
 plus every uncorrelated final through the independent provisional-or-fresh path, explicitly accepting
-duplicates until #111. (Each independent send reports its real delivery result; only success commits
-P, false/throw rolls back, and one failure must not stop later payloads.)
+duplicates until #111. (Each lane/independent send reports its real delivery result; only success
+commits P, false/throw rolls back P plus tentative lane assignment, and one failure must not stop later
+payloads. Partial-first/final-only × false/throw × later lane/independent success requires pinned-runtime
+coverage, with the later success on P and no blind retry or ghost.)
 (Queued payloads must never reach wire; rewrite/cancel, actual send `true`/`false`/throw, cancel(A) → B,
 and all three notice flags with/without partial and interleaved A/B require pinned-runtime coverage.)
 (Every authorized block in partial mode is independent regardless of whether zero, one, or several
@@ -611,7 +616,7 @@ UX and P0-5 needs #94's multi-message finalize correctness:
 | Order | Gap | Effort | Why |
 |---|---|---|---|
 | 1 | P0-3 argument menus | S | Catalog entries already carry `args.choices`; render a dropdown from them (widget currently inserts the name only). Ties into the P1-5 control renderer. |
-| 2 | P0-5 multi-message finalize (#94) | L | Replace the turn-wide draft with ordered lanes, lane/independent provisional ownership, claim-time scaffold-writer invalidation, tentative block reservations + lifecycle cleanup, success-only independent claim/rollback, and at-least-once claim-or-fresh delivery. |
+| 2 | P0-5 multi-message finalize (#94) | L | Replace the turn-wide draft with ordered lanes, two-phase lane/independent provisional ownership, success-only scaffold-writer invalidation, tentative block reservations + lifecycle cleanup, and at-least-once claim-or-fresh delivery. |
 
 > ✅ **Done:** P0-1 (history restore), P0-2 (depth cap, #24 — optional scroll-UX polish is all that
 > remains there), P0-3 (slash discovery, #30 — arg menus excepted above), P0-4 (approval cards +

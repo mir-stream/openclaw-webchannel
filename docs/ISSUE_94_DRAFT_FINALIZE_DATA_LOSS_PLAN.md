@@ -16,12 +16,12 @@
 2. **라이브 화면도 어시스턴트 메시지마다 별도 버블이다.** partial/final ordinary 경로의 라이브와 히스토리 하이드레이트는 메시지 수와 순서가 같아야 한다. 단, public identity가 없는 authorized block과 leading-terminal-error 후속 final은 §6.2의 at-least-once 예외라 이미 materialize된 본문이 fallback으로 중복될 수 있다. exact-once 화해는 [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111)로 분리한다.
 3. **partial/delta는 현재 메시지를 만드는 동안의 임시 갱신이다.** 임시 갱신 자체를 모두 저장하지는 않지만, 메시지가 완료되면 그 버블은 정착되고 다음 메시지가 같은 버블을 덮지 못한다.
 4. **`kind:"final"`은 메시지 식별자가 아니라 core의 최종-payload 전달 분류다.** 한 턴에 error/answer/warning뿐 아니라 이미 materialize된 assistant block의 replay도 올 수 있다. terminal notice는 assistant lane을 소비하지 않는다. leading terminal error 뒤 identity 없는 non-notice final은 모두 **uncorrelated independent delivery**로 보존한다. 이미 materialize된 본문과 중복될 수 있지만 current/existing/stale lane에 오귀속하거나 payload를 버리지 않는다. 앞 메시지와 합칠지 텍스트 내용으로 추측하지 않는다.
-5. **툴/item progress는 휘발성 상태 UI다.** 첫 durable consumer가 정해지기 전에는 turn-level provisional preview 하나로만 보인다. 첫 lane 또는 첫 성공한 authoritative independent delivery가 preview ID를 claim해 scaffold를 실제 payload로 교체한다. 어느 쪽이 claim해도 provisional scaffold writer를 즉시 invalidate하며, 이후 tool/item event는 claimed ID로 `progress`를 보내지 않는다. independent claim은 assistant lane 소유권을 만들지 않는다.
+5. **툴/item progress는 휘발성 상태 UI다.** 첫 durable consumer가 정해지기 전에는 turn-level provisional preview 하나로만 보인다. 첫 성공한 lane 또는 authoritative independent delivery가 preview ID를 claim해 scaffold를 실제 payload로 교체한다. lane/independent 모두 send 전에는 reserve만 하고 실제 `true`에만 commit하며, commit 때 provisional scaffold writer를 invalidate한다. 이후 tool/item event는 claimed ID로 `progress`를 보내지 않는다. independent claim은 assistant lane 소유권을 만들지 않는다.
 6. **ordinary #94는 이 저장소의 플러그인에서 고친다.** core는 메시지 시작과 partial 교체 경계를 제공한다. 다만 queued block은 승인 전 tentative 신호이고 실제 승인된 delivery에는 lane identity가 없으므로, block partial dedupe/same-message grouping/exact lane ownership과 leading-error replay 화해에는 #111의 public identity 확장이 필요하다.
 7. **앞 메시지의 라이브 전송 실패와 에이전트 턴 결과는 별개다.** 실패를 기록하고 마지막 메시지 전달을 계속 시도하며, 재접속 시 히스토리로 복구한다.
 8. **queued payload는 wire 본문이 아니다.** `onBlockReplyQueued`는 TTS/media 준비와 `beforeDeliver` rewrite/cancel 전 신호이므로 tentative ordering reservation만 만든다. 사용자가 볼 수 있는 본문과 `visibleReplySent`는 실제 post-hook `delivery.deliver(kind:"block")`만 결정한다.
 9. **notice는 block 소유권보다 먼저 분류한다.** `isStatusNotice`/`isFallbackNotice`/`isCompactionNotice` 중 하나인 block은 독립 notice 경로를 쓰며 assistant lane을 만들거나 정착하거나 막지 않는다.
-10. **visible provisional preview는 첫 materialized lane 또는 첫 성공한 independent delivery가 원자적으로 claim한다.** authoritative independent delivery 전에 P가 visible+unclaimed면 그 delivery sequence가 P를 reserve하고 P ID로 보낸다. `visibleReplySent:true`일 때만 non-lane claim을 commit하며 `false`/throw면 rollback한다. claim commit은 provisional draft loop를 stop/invalidate한다. 성공한 independent claim 뒤 cleanup은 scaffold를 다시 settle하지 않고 뒤 lane은 fresh ID를 쓴다.
+10. **visible provisional preview는 첫 성공한 lane/independent delivery가 원자적으로 claim한다.** P가 visible+unclaimed면 lane generation 또는 independent delivery sequence가 P를 reserve하고 P ID로 보낸다. lane transport boolean 또는 independent delivery의 `visibleReplySent`가 실제 `true`일 때만 claim과 writer invalidation을 commit하며 `false`/throw면 P와 tentative lane assignment를 rollback한다. 성공한 claim 뒤 cleanup은 scaffold를 다시 settle하지 않고 뒤 consumer는 fresh ID를 쓴다.
 
 따라서 ordinary 경로의 목표 형상은 아래와 같다.
 
@@ -42,7 +42,7 @@ assistant message B
 | 값/이벤트 | 의미 | 화면/저장 계약 |
 | --- | --- | --- |
 | `onPartialReply({ text, delta, replace })` | 현재 어시스턴트 메시지의 스트리밍 갱신. `text`는 현재 누적 본문이고 `replace:true`는 같은 메시지 안의 교체 갱신이다. | 활성 버블 하나를 편집한다. 각 중간 프레임은 영구 보존하지 않는다. |
-| tool/item `progress` | 플러그인이 만드는 `Working…`, 툴명, 상태 줄 같은 작업 진행 표시다. | 첫 durable consumer 전에는 provisional preview ID 하나를 쓴다. lane 또는 authoritative independent delivery가 claim해 같은 ID의 실제 payload로 교체하면 provisional writer를 invalidate한다. 이후 tool/item scaffold emission은 suppress하고 claimed P를 다시 `progress`로 덮지 않는다. 이미 `develop`에 랜딩한 #96/#101의 `turnActive`가 bubble 사이 turn-level in-flight 표시를 유지한다. |
+| tool/item `progress` | 플러그인이 만드는 `Working…`, 툴명, 상태 줄 같은 작업 진행 표시다. | 첫 durable consumer 전에는 provisional preview ID 하나를 쓴다. lane 또는 authoritative independent delivery가 P를 reserve해 같은 ID로 보내고 성공했을 때만 claim/writer invalidation을 commit한다. 실패하면 P는 unclaimed/active로 돌아간다. claim 뒤 tool/item scaffold emission은 suppress하고 claimed P를 다시 `progress`로 덮지 않는다. 이미 `develop`에 랜딩한 #96/#101의 `turnActive`가 bubble 사이 turn-level in-flight 표시를 유지한다. |
 | assistant `commentary` | 모델이 사용자에게 내보낸 가시 텍스트 단계다. reasoning이나 툴 상태 줄이 아니다. | 하나의 어시스턴트 메시지로 완료되면 별도 버블로 보존한다. |
 | `onBlockReplyQueued(payload, ctx)` | block이 논리적으로 방출된 뒤 그 block의 async delivery보다 먼저 오는 **승인 전** 알림이다. TTS/media 준비와 `beforeDeliver` rewrite/cancel 전이며, 다음 `onAssistantMessageStart`보다 먼저 온다는 보장도 없다. `ctx.assistantMessageIndex`는 optional이다. | notice flag를 먼저 분류한 뒤 tentative ordering reservation 또는 독립 tentative notice token만 만든다. callback payload 본문은 복사·materialize·전송하지 않고, callback 결과로 실제 delivery를 억제하거나 lane ID를 고르지 않는다. count/order/index는 final payload 분류에도 쓰지 않는다. |
 | `delivery.deliver(..., { kind:"block" })` | `beforeDeliver`와 `delivery.preparePayload`를 통과해 실제 전송이 승인된 wire-authoritative block이다. **`info`는 `kind`뿐이라 소유권 정보를 담지 않는다**(§5.2). | actual payload의 notice flag를 lane logic보다 먼저 다시 분류한다. partial mode의 block은 reservation 수/상태와 무관한 authoritative independent delivery다. visible+unclaimed P를 성공 시 claim하고, 아니면 fresh ID를 쓴다. queued callback이 전송을 suppress하거나 lane ID를 고르지 않는다. |
@@ -213,7 +213,7 @@ delivery 이음매에는 payload index나 배열 시작/끝 표지가 없으므�
 
 ---
 
-## 6. 채택 설계 — provisional preview를 첫 lane/성공 independent delivery에 넘기고 메시지별 lane을 회전한다
+## 6. 채택 설계 — provisional preview를 첫 성공한 lane/independent delivery에 넘기고 메시지별 lane을 회전한다
 
 ### 6.1 정상 시퀀스
 
@@ -266,14 +266,22 @@ delivery.deliver(payload=B, final)    # terminal callback drain에서 A=empty �
 type AssistantDraftLane = {
   generation: number;
   assistantMessageIndex?: number;
-  id?: string;
+  id?: string; // successful send 뒤 commit된 ID만 저장
+  tentativeProvisionalId?: string;
   answerText: string;
+  answerRevision: number;
   tentativeBarrierReservationIds: string[];
   closed: boolean;
   resolution: "open" | "unresolved" | "materialized" | "empty";
   acceptsLateIndexlessReservations: boolean;
   started: boolean;
   settled: boolean;
+  failedDeliveryCount: number;
+  lastFailedDelivery?: {
+    revision: number;
+    frameType: "progress" | "final";
+    error: "false" | "throw";
+  };
   settleResult?: Promise<boolean>;
 };
 
@@ -321,17 +329,19 @@ type FinalReconciliationState = {
 
 세부 규칙:
 
-1. 첫 `onAssistantMessageStart`는 최초 lane을 가리키는 no-op이고, 이후 경계는 이전 lane을 `closed`로 표시한 뒤 새 current lane을 연다. lane ID는 경계에서 미리 확정하지 않고 그 lane이 실제 partial/final assistant text로 wire-visible해질 때 할당한다.
+1. 첫 `onAssistantMessageStart`는 최초 lane을 가리키는 no-op이고, 이후 경계는 이전 lane을 `closed`로 표시한 뒤 새 current lane을 연다. lane ID는 경계에서 미리 확정하지 않는다. 첫 partial/progress 또는 final-only frame의 **성공한 wire send 뒤에만** committed `lane.id`와 `started=true`를 기록한다.
 2. 경계 시점에 내용이 없는 앞 lane은 버블을 만들지 않지만 **즉시 폐기하지도 않는다.** queued callback이 뒤늦게 ordering reservation을 제공할 수 있으므로 `unresolved` predecessor로 남긴다. 뒤 lane의 partial/final은 메모리에 ingest하되 unresolved predecessor를 추월해 wire에 내보내지 않는다. lifecycle/terminal drain에서 앞 lane이 실제로 비어 있었음이 확정된 뒤 generation 순서로 푼다. actual block independent delivery는 그 predecessor의 body/ID를 선택하지 않는다.
-3. tool/item event가 durable assistant text보다 먼저 오면 `ProvisionalPreview.id`로만 `progress`를 보낸다. 이 ID는 아직 어느 lane에도 속하지 않으며 `claim.state="unclaimed"`, `scaffoldWriter="active"`다.
-   - generation 순서에서 처음 materialize되는 assistant lane은 `{kind:"lane", generation}` owner로 preview ID를 claim하고 같은 ID의 lane `progress`/`agent_message`로 scaffold를 본문으로 교체한다. 이때 provisional scaffold writer를 invalidate한다. 이후 같은 lane의 answer partial은 lane writer로 P를 갱신할 수 있지만 tool/item scaffold는 P를 덮을 수 없다. A가 실제로 비고 B가 답하면 B가 claim한다.
-   - **모든 authoritative independent visible delivery**—actual block notice/non-notice, terminal notice/error, leading-error 또는 ordinary-answer 뒤 extra uncorrelated final—도 send 직전에 같은 claim state machine을 쓴다. P가 visible+unclaimed면 `{kind:"independent", deliverySequence}`로 reserve하고 P ID로 보낸다. P가 없거나 아직 visible하지 않거나 이미 reserved/claimed면 fresh ID를 쓴다. independent owner는 assistant lane을 만들지 않는다.
-   - independent send가 `visibleReplySent:true`면 reservation을 `claimed`로 commit하고 provisional scaffold writer/draft loop를 stop/invalidate한다. `false` 또는 throw면 `unclaimed`로 rollback하고 writer를 active로 유지해 다음 lane이나 다음 successful independent delivery가 P를 재사용하게 한다. reserve → send → commit/rollback 전체를 event queue 한 작업으로 직렬화한다.
-   - independent claim이 commit되면 뒤 lane은 fresh ID를 받고 cleanup은 예전 scaffold를 settle하지 않는다. block-only turn도 P를 actual block으로 교체한 버블 하나로 끝난다. 반대로 실패한 independent send는 P를 소비하지 않는다.
+3. tool/item event가 durable assistant text보다 먼저 오면 `ProvisionalPreview.id`로만 `progress`를 보낸다. 이 ID는 아직 어느 lane에도 속하지 않으며 `claim.state="unclaimed"`, `scaffoldWriter="active"`다. **lane generation과 independent delivery sequence는 같은 two-phase claim helper를 쓴다.**
+   - 첫 lane frame이 streaming partial의 `progress`이든 progress-mode/final-only의 `agent_message`이든, P가 visible+unclaimed면 `{kind:"lane", generation}`으로 P를 reserve하고 그 lane에 `tentativeProvisionalId=P`만 붙인 채 해당 frame을 P로 보낸다. 실제 send가 `true`면 `lane.id=P`, `started=true`, `claim.state="claimed"`를 commit하고 scaffold writer를 invalidate한다.
+   - 그 lane send가 `false` 또는 throw면 P를 `unclaimed`로 rollback하고 `tentativeProvisionalId`를 지우며 committed `lane.id`/`started`를 만들지 않는다. 실패한 revision/frame/result와 진단은 그 delivery에 기록하고 해당 revision의 generation-order barrier를 **failed로 해소**해 뒤 consumer를 막지 않는다. queue를 계속 살리되 같은 revision을 그 자리나 terminal cleanup에서 blind retry하지 않으며, lane의 최신 answer snapshot은 메모리에 남는다.
+   - 실패 lane의 **나중 별도 partial/final update**는 ID 선택을 새로 수행한다. 그때도 P가 unclaimed면 다시 reserve할 수 있지만, 그 사이 뒤 lane이나 independent delivery가 P를 성공적으로 claim했다면 실패 lane은 P를 재사용하지 않고 fresh ID로 보낸다. 실패한 tentative P assignment가 lane에 남아 later upsert를 오귀속해서는 안 된다.
+   - **모든 authoritative independent visible delivery**—actual block notice/non-notice, terminal notice/error, leading-error 또는 ordinary-answer 뒤 extra uncorrelated final—도 send 직전에 같은 helper를 쓴다. P가 visible+unclaimed면 `{kind:"independent", deliverySequence}`로 reserve하고 P ID로 보낸다. P가 없거나 아직 visible하지 않거나 이미 reserved/claimed면 fresh ID를 쓴다. independent owner는 assistant lane을 만들지 않는다.
+   - independent send도 `true`에만 claim/writer invalidation을 commit한다. `false` 또는 throw면 P를 `unclaimed`로 rollback하고 writer를 active로 유지한다. lane/independent 모두 reserve → send → commit/rollback 전체를 event queue 한 작업으로 직렬화하며 실제 delivery 결과를 보존한다.
+   - 어느 owner든 claim이 commit되면 뒤 consumer는 fresh ID를 받고 cleanup은 예전 scaffold를 settle하지 않는다. block-only turn도 P를 actual block으로 교체한 버블 하나로 끝난다. 반대로 실패한 send는 P를 소비하거나 writer를 끄지 않는다.
    - preview가 lane/independent owner에게 claim된 뒤에는 후속 tool/item scaffold emission을 전부 suppress한다. 새 ID로 두 번째 scaffold를 만들지 않을 뿐 아니라, claimed P에도 `progress(P, Working…)`를 절대 보내지 않는다. client는 ID upsert이므로 durable `agent_message(P,F)` 뒤 그런 progress가 오면 F를 `Working…`으로 덮고 다시 working 상태로 연다(C8). bubble 사이 turn-level 활동은 새 base에 랜딩한 #96/#101의 `turnActive`가 나타낸다. 후속 tool 상세를 별도 bubble에 보이는 구조화 surface는 #97 범위다.
    - turn 전체가 tool-only/clean-silent이고 lane/independent delivery 모두 끝내 성공하지 않으면, 이미 보낸 preview는 삭제할 수 없으므로 기존 동작대로 그 scaffold 자체를 같은 ID에서 settle한다. 이는 실제 durable delivery가 하나도 없는 no-delete 비용에만 한정한다.
-4. partial은 current lane만 갱신한다. `replace:true`도 그 lane 안에서만 본문을 교체한다. predecessor barrier 때문에 아직 wire에 못 나갔더라도 freshest snapshot을 보관했다가 순서가 열리면 한 번에 내보낸다.
-5. partial-mode lane의 durable 본문은 partial snapshot 또는 ordinary final만 만든다. tentative callback payload는 물론 actual block independent delivery도 draft lane을 materialize하거나 settle하지 않는다.
+4. partial은 current lane만 갱신한다. `replace:true`도 그 lane 안에서만 본문을 교체한다. predecessor barrier나 앞선 send 실패 때문에 아직 wire에 못 나갔더라도 freshest snapshot을 보관한다. 순서가 열리거나 나중 별도 update가 왔을 때 다시 ID를 선택해 한 번 보내되, 실패 직후 같은 frame을 자동 재전송하지 않는다.
+5. partial-mode lane의 durable 본문은 성공한 partial snapshot 또는 ordinary final send만 materialize한다. tentative callback payload는 물론 actual block independent delivery도 draft lane을 materialize하거나 settle하지 않는다.
 6. **모든 queued block callback은 notice flag부터 분류한다.** `isStatusNotice`/`isFallbackNotice`/`isCompactionNotice` 중 하나면 lane을 찾기 전에 독립 `TentativeNoticeToken`을 만들고 끝낸다. 이 token은 assistant lane을 생성·정착·차단하지 않으며 actual delivery 전에는 아무 본문도 보내지 않는다. non-notice callback만 `TentativeBlockReservation`을 만든다.
    - `assistantMessageIndex`가 있으면 matching retained lane의 ordering barrier에 기록한다. index가 없으면 기존 `acceptsLateIndexlessReservations` barrier, 가장 이른 unresolved predecessor, current lane 순으로 **보수적인 지연 범위**만 정한다. 이는 actual payload의 owner/ID를 고르는 상관이 아니다.
    - late indexless barrier는 첫 callback이나 actual delivery만으로 닫지 않고 terminal callback drain까지 유지한다. callback payload를 이어 붙이지 않으며 reservation 수/순서를 actual delivery에 대응시키지 않는다.
@@ -351,17 +361,17 @@ type FinalReconciliationState = {
    - 첫 final을 처리하기 전에 이미 enqueue된 callback/delivery/lifecycle 작업을 drain한다. 이 terminal barrier는 tentative state를 정리할 뿐 final 상관표를 만들지 않는다.
    - status/fallback/compaction/terminal-error notice는 assistant lane의 terminal slot을 소비하지 않고 independent claim-or-fresh 경로를 탄다.
    - terminal error가 ordinary answer보다 먼저 오면 `leadingTerminalErrorSeen=true`로 만든다. callback 유무/개수/본문은 이 전이에 관여하지 않는다.
-   - `leadingTerminalErrorSeen`이 false인 첫 ordinary non-notice answer final은 current lane을 정착하고 `ordinaryAnswerSettled=true`로 만든다. current lane이 아직 wire-visible하지 않으면 provisional preview를 claim하거나 새 ID를 할당한다.
+   - `leadingTerminalErrorSeen`이 false인 첫 ordinary non-notice answer final은 current lane의 논리 terminal slot을 소비하고 `ordinaryAnswerSettled=true`로 만든다. current lane이 아직 wire-visible하지 않으면 partial과 같은 two-phase lane claim helper로 P를 reserve하거나 fresh ID를 고른다. final-only first send도 `true`에만 P claim/lane ID를 commit하고 `false`/throw에는 rollback하되 terminal payload를 blind retry하지 않는다.
    - leading terminal error 뒤의 모든 non-notice final은 public identity가 없으므로 uncorrelated independent delivery다. payload마다 진단하고 claim-or-fresh로 전송한다. current/existing/stale lane ID를 사용하지 않고, block ordering reservation을 소비하거나 payload를 accounting-drop하지 않는다.
    - ordinary answer가 이미 정착된 뒤 또 온 identity 없는 non-notice final도 settle latch에 삼키지 않고 independent claim-or-fresh로 보존한다. timeout/warning 같은 notice도 같은 independent claim transaction을 쓴다.
    - draft lane이 없는 mode(block/off)는 기존 plain append 경로를 그대로 유지한다.
-10. 각 independent delivery의 `visibleReplySent`는 **실제 claim-ID 또는 fresh-ID send 결과**다. `false`/throw도 해당 payload에서 격리하고 claim을 rollback한 뒤 다음 delivery를 계속 시도한다. turn 단위 `finalReplyDelivered`는 final payload의 실제 send 결과만 OR로 누적한다.
-11. final이 오기 전에 current lane이 화면에 나오지 않았어도 preview claim 또는 새 ID로 버블을 append/정착할 수 있어야 한다. terminal notice는 ordinary completed-assistant subsequence의 구성원이 아니다. P가 보였다면 앞선 successful independent delivery가 먼저 P를 claim해야 append-only client에서 뒤 lane이 앞 위치를 탈취하지 않는다. partial/final ordinary 경로에서는 A/B가 generation 순서로 정확히 한 번씩 존재한다. authorized block과 leading-error 후속 final은 #111 전까지 의미상 중복될 수 있다.
-12. final 없는 clean resolve/abort/error에서는 `inbound.run`이 끝난 뒤 callback/delivery/lifecycle queue를 drain하고 late-reservation epoch를 닫는다. 그 뒤 truly empty predecessor를 제거하고, **실제** assistant text가 있는 lane만 generation 순서로 정착한다. tentative reservation/token만 있는 lane은 정착하지 않는다.
+10. lane transport boolean과 independent delivery의 `visibleReplySent`는 각각 **실제 claim-ID 또는 fresh-ID send 결과**다. `false`/throw도 해당 payload에서 격리하고 tentative P claim을 rollback한 뒤 다음 delivery를 계속 시도한다. turn 단위 `finalReplyDelivered`는 final payload의 실제 send 결과만 OR로 누적하며, lane progress 실패를 성공으로 회계하거나 queue failure로 승격하지 않는다.
+11. final이 오기 전에 current lane이 화면에 나오지 않았어도 two-phase preview claim 또는 새 ID로 버블을 append/정착할 수 있어야 한다. terminal notice는 ordinary completed-assistant subsequence의 구성원이 아니다. P가 보였다면 앞선 **successful lane 또는 independent delivery**만 P를 claim할 수 있어 append-only client에서 실패한 consumer가 위치를 독점하지 않는다. 성공한 partial/final ordinary 경로에서는 A/B가 generation 순서로 정확히 한 번씩 존재한다. authorized block과 leading-error 후속 final은 #111 전까지 의미상 중복될 수 있다.
+12. final 없는 clean resolve/abort/error에서는 `inbound.run`이 끝난 뒤 callback/delivery/lifecycle queue를 drain하고 late-reservation epoch를 닫는다. 그 뒤 truly empty predecessor를 제거하고, **실제** assistant text가 있는 lane만 generation 순서로 정착한다. 단, 마지막 전송에서 실패한 것과 같은 content revision을 cleanup이 재전송하지 않는다. 이후 들어온 새 revision만 새 delivery attempt가 될 수 있다. tentative reservation/token만 있는 lane은 정착하지 않는다.
 
 **명시적 비용:** index 없는 경계 뒤 predecessor가 실제로 빈 메시지였으면, 다음 lane의 preview는 terminal drain이 그 predecessor를 `empty`로 확정할 때까지 지연될 수 있다. timeout으로 임의 확정하면 원래 data-loss race가 다시 열린다. authorized block은 이미 partial로 materialize된 lane과 별도 independent 버블로 보일 수 있다. 첫 successful independent delivery는 eligible P를 재사용하지만, P가 없거나 이미 claimed면 fresh ID를 쓰므로 같은 assistant message의 여러 block도 여러 버블이 된다. leading terminal error 뒤 `[A1,A2,B]`도 materialized A/B와 함께 다시 보일 수 있다. 모두 stable approved-delivery identity가 없는 #111 전까지의 at-least-once 비용이다. 어느 경우에도 pre-hook payload를 게시하거나 actual/final payload를 current lane에 조용히 덮어쓰거나 버리지는 않는다.
 
-**provisional ID의 순서/단일-writer 불변식:** visible+unclaimed P가 있을 때 independent F를 fresh ID로 먼저 append하고 뒤 B가 P를 claim하면 client는 P의 기존 배열 위치를 유지해 `[B(P), F]`가 된다. block-only turn이면 cleanup이 P scaffold를 settle해 `[ghost P, F]`가 된다. 따라서 authoritative independent delivery는 lane보다 먼저 P claim 기회를 가져야 한다. 성공한 F는 `[F(P), B(new)]`를 만들고 block-only면 한 버블만 남긴다. 실패한 F는 claim을 rollback하므로 B 또는 다음 successful independent payload가 P를 claim한다. 또한 성공한 claim 뒤 provisional writer가 살아서 `progress(P, Working…)`를 보내면 reducer가 durable F를 같은 자리에서 덮어쓴다. claim commit은 writer invalidation과 같은 queue transaction이어야 하며, C8은 올바른 same-P 형상, fresh-F→P-B 역전, late-scaffold overwrite 비용을 모두 고정한다.
+**provisional ID의 순서/단일-writer 불변식:** visible+unclaimed P가 있을 때 independent F를 fresh ID로 먼저 append하고 뒤 B가 P를 claim하면 client는 P의 기존 배열 위치를 유지해 `[B(P), F]`가 된다. block-only turn이면 cleanup이 P scaffold를 settle해 `[ghost P, F]`가 된다. 따라서 authoritative independent delivery는 lane보다 먼저 P claim 기회를 가져야 한다. 성공한 F는 `[F(P), B(new)]`를 만들고 block-only면 한 버블만 남긴다. 실패한 F는 claim을 rollback하므로 B 또는 다음 successful independent payload가 P를 claim한다. 같은 원칙으로 첫 lane A의 `progress(P)`/`agent_message(P)`가 실패했는데 A가 P를 committed claim하면 뒤의 성공한 B/F가 P를 교체하지 못해 scaffold ghost가 남는다. A도 성공 전에는 tentative owner일 뿐이며, 실패 시 P와 lane assignment를 함께 rollback해야 한다. 그 뒤 B/F가 P를 성공적으로 claim하고 A의 later update가 오면 A는 fresh ID를 쓴다. 또한 성공한 claim 뒤 provisional writer가 살아서 `progress(P, Working…)`를 보내면 reducer가 durable payload를 같은 자리에서 덮어쓴다. 모든 owner의 claim commit은 writer invalidation과 같은 queue transaction이어야 하며, C8은 올바른 same-P 형상, fresh-F→P-B 역전, late-scaffold overwrite 비용을 고정한다.
 
 **상관하지 않는 이유:** queued callback이 자기 delivery보다 먼저 온다는 순서만으로 둘 사이 shared identity가 생기지는 않는다. actual X의 callback이 누락되었거나 queued notice가 actual non-notice로 rewrite된 동안 unrelated A reservation 하나만 남을 수 있다. 그러므로 pending reservation이 정확히 하나여도 X를 A에 적용하지 않는다. reservation/token은 predecessor ordering barrier와 lifecycle/terminal cleanup에만 사용하고 body/ID/owner 선택에는 절대 사용하지 않는다.
 
@@ -427,8 +437,8 @@ ordinary final이 leading terminal error보다 먼저 current lane의 terminal s
 
 ## 7. progress scaffold와 다른 streaming mode
 
-- `streaming.mode:"partial"`: 이 이슈의 주 경로다. 첫 assistant text 전 tool scaffold는 provisional preview이고, 이후 답변 partial/final은 메시지별 durable lane을 사용한다. authorized `kind:"block"`은 lane과 상관하지 않는 independent delivery이며 P가 eligible하면 성공 시 claim하고 아니면 fresh ID로 append한다. lane/independent claim 뒤에는 provisional tool writer를 invalidate하므로 후속 tool/item event가 durable P를 덮지 않는다.
-- `streaming.mode:"progress"`: tool/item 줄은 P가 unclaimed인 동안만 provisional preview에 보인다. leading error 없는 ordinary answer final이 오면 lane owner로 P를 claim해 원자적으로 교체/정착한다. 그보다 먼저 성공한 terminal notice/error 또는 uncorrelated independent payload가 있으면 그 delivery가 P를 claim하고 뒤 answer는 fresh ID를 쓴다. 어느 claim 뒤든 후속 tool/item scaffold는 suppress하며, turn-level 활동은 #96/#101의 `turnActive`가 계속 표시한다. durable delivery가 전혀 없는 clean-silent turn만 no-delete 제약 때문에 scaffold 자체를 settle한다.
+- `streaming.mode:"partial"`: 이 이슈의 주 경로다. 첫 assistant text 전 tool scaffold는 provisional preview이고, 이후 답변 partial/final은 메시지별 durable lane을 사용한다. 첫 lane `progress`도 P를 tentatively reserve할 뿐이며 실제 send `true`에만 lane ID/claim을 commit한다. `false`/throw면 P와 lane assignment를 rollback하고 다음 consumer를 계속 처리한다. authorized `kind:"block"`은 lane과 상관하지 않는 independent delivery이며 같은 two-phase helper를 쓴다. 성공한 lane/independent claim 뒤에는 provisional tool writer를 invalidate하므로 후속 tool/item event가 durable P를 덮지 않는다.
+- `streaming.mode:"progress"`: tool/item 줄은 P가 unclaimed인 동안만 provisional preview에 보인다. answer text는 final-only `agent_message`가 첫 lane wire frame이므로 partial과 동일하게 P reserve → send → success-only commit / failure rollback을 수행한다. 그보다 먼저 성공한 terminal notice/error 또는 uncorrelated independent payload가 있으면 그 delivery가 P를 claim하고 뒤 answer는 fresh ID를 쓴다. 어느 successful claim 뒤든 후속 tool/item scaffold는 suppress하며, turn-level 활동은 #96/#101의 `turnActive`가 계속 표시한다. durable delivery가 전혀 없는 clean-silent turn만 no-delete 제약 때문에 scaffold 자체를 settle한다.
 - `streaming.mode:"block"` / `"off"`: draft lane이 없다. core가 넘긴 각 authorized block/final은 기존 append 경로를 유지하고, pre-hook callback payload가 아니라 actual delivery의 append/순서/결과 동작을 회귀 테스트로 확인한다.
 - reasoning lane: 이 계획의 대상이 아니다. reasoning과 사용자에게 발화한 commentary를 혼동하지 않는다.
 
@@ -440,12 +450,12 @@ ordinary final이 leading terminal error보다 먼저 current lane의 terminal s
 
 메시지별 live delivery와 agent-run 결과를 분리한다.
 
-1. A lane 정착이 `false`를 반환하거나 throw해도 진단 로그를 남기고 B lane 및 모든 final payload 전달을 계속한다.
+1. A lane의 첫 partial/progress 또는 final-only 정착이 `false`를 반환하거나 throw하면 tentative P claim/ID를 rollback하고 진단 로그를 남긴 뒤 B lane 및 모든 final payload 전달을 계속한다. P 실패를 lane materialization으로 기록하지 않는다.
 2. A 실패 때문에 `turn_settled{outcome:"error"}`로 바꾸지 않는다. 모델 실행은 성공했을 수 있고 transcript에는 A가 남아 있다.
-3. inline 재전송은 하지 않는다. ack 없는 재시도는 A 중복 버블을 만들 수 있다.
+3. inline 재전송은 하지 않고 실패 revision/frame을 기록한다. ack 없는 재시도는 A 중복 버블을 만들 수 있으므로 terminal cleanup도 같은 revision을 다시 보내지 않는다. 이후 별도 callback이 만든 새 revision만 새 delivery attempt가 될 수 있다.
 4. 재접속/register 시 history snapshot이 빠진 메시지를 복구한다.
 5. 어떤 final payload send가 실패해도 기존 P0-4 결정대로 사용자 메시지의 턴 outcome을 거짓 실패로 바꾸지 않는다. 각 `visibleReplySent`는 해당 delivery의 실제 결과이고, 턴 단위 `finalReplyDelivered`는 final payload 중 하나라도 실제 전송됐는지 OR로 누적한다.
-6. abort/error cleanup은 이미 정착한 lane을 normal-finalize로 다시 보내지 않는다. 먼저 event queue를 drain하고 late indexless barrier 및 남은 tentative state를 닫는다. partial/final로 채워진 predecessor를 generation 순서로 정착한 뒤 current lane만 snapshot으로 방어 정착한다. 정착 조건은 **실제 assistant text 존재**다. block ordering reservation/token과 `ProvisionalPreview.started`는 lane content의 증거가 아니다. lane/independent claim은 P를 durable payload로 교체하고 scaffold writer도 invalidate했으므로 cleanup 대상에서 제외한다. lane/independent claim이 모두 없었던 tool-only turn에서만 legacy scaffold settle 조건을 쓴다.
+6. abort/error cleanup은 이미 정착한 lane을 normal-finalize로 다시 보내지 않는다. 먼저 event queue를 drain하고 late indexless barrier 및 남은 tentative state를 닫는다. partial/final로 채워진 predecessor를 generation 순서로 정착한 뒤 current lane만 snapshot으로 방어 정착한다. 정착 조건은 **실제 assistant text 존재**다. block ordering reservation/token과 `ProvisionalPreview.started`, 실패한 tentative lane claim은 wire content의 증거가 아니다. successful lane/independent claim은 P를 durable payload로 교체하고 scaffold writer도 invalidate했으므로 cleanup 대상에서 제외한다. successful claim이 하나도 없었던 tool-only turn에서만 legacy scaffold settle 조건을 쓴다.
 7. 기존 `snapshot || "⏹ Stopped."` fallback은 현재도 도달 불가한 방어선이다(`started` ⇒ 프레임 발신 ⇒ 스냅샷 비어있지 않음). lane 모델에서도 같은 이유로 도달 불가로 남는다. 이 fallback을 빈 lane이나 새 ghost bubble의 표시 수단으로 쓰지 않는다.
 
 ---
@@ -456,13 +466,14 @@ ordinary final이 leading terminal error보다 먼저 current lane의 terminal s
 
 - 단일 `id` + `answerPrefix` 누적 모델을 turn-level `ProvisionalPreview` + generation 순서가 있는 `AssistantDraftLane[]` 모델로 교체한다.
 - `pushAnswerText(text)` 대신 `text`/`delta`/`replace`를 보존해 받는 API로 바꾼다.
-- 메시지 경계 close/rotate, lane generation 또는 independent delivery sequence가 소유하는 preview reserve/commit/rollback, scaffold-writer active/invalidated state, unresolved predecessor 보존, persistent late-indexless barrier, generation-order emission barrier, tentative block reservation/notice token, actual block independent disposition, final phase state, lane별 settle latch를 추가한다.
-- tool/item progress scaffold는 첫 materialized lane 또는 성공한 independent delivery가 claim하기 전의 소유자 없는 휘발성 표시로 유지한다. claim과 같은 queue 작업에서 writer를 invalidate하고 이후 scaffold emissions를 suppress한다. 빈 first assistant message에 ID를 귀속하거나 claimed P를 tool progress로 갱신하지 않는다.
+- 메시지 경계 close/rotate, lane generation 또는 independent delivery sequence가 소유하는 preview reserve/commit/rollback, tentative lane ID와 failed revision/frame 기록, scaffold-writer active/invalidated state, unresolved predecessor 보존, persistent late-indexless barrier, generation-order emission barrier, tentative block reservation/notice token, actual block independent disposition, final phase state, lane별 settle latch를 추가한다.
+- tool/item progress scaffold는 첫 successful lane 또는 independent delivery가 claim하기 전의 소유자 없는 휘발성 표시로 유지한다. 모든 owner가 같은 reserve/send/commit-or-rollback helper를 쓰고, success commit과 같은 queue 작업에서만 writer를 invalidate한다. 빈 first assistant message나 failed lane에 ID를 귀속하거나 claimed P를 tool progress로 갱신하지 않는다.
 - `snapshotText()`는 **현재 활성 lane**의 방어 정착용 snapshot만 반환하게 명확히 한다.
 
 ### `packages/plugin/src/inbound.ts`
 
 - `onPartialReply`, `onBlockReplyQueued`, `onAssistantMessageStart`, `delivery.deliver`, dispatcher `onSkip`/`onBeforeDeliverCancelled`/`onDeliverySettled`, delivery `onError`를 같은 lane event queue에 연결한다.
+- `onPartialReply`가 만드는 첫 lane `progress`와 ordinary final-only `agent_message`의 실제 boolean/throw 결과를 controller의 공통 provisional transaction에 돌려준다. 실패 lane의 tentative P ID를 clear하고 뒤 callback을 계속 처리하며, 실패 frame을 같은 호출에서 재전송하지 않는다.
 - `onToolStart`/`onItemEvent`의 scaffold writer도 같은 preview claim state를 읽는다. P가 claim되는 즉시 loop를 stop/invalidate하고, 이미 enqueue된 late tool/item 작업도 claim state를 재확인해 wire emission 없이 끝낸다.
 - `onBlockReplyQueued`를 새로 배선하고 `context?.assistantMessageIndex`를 controller에 전달하되 payload는 tentative reservation/token 분류에만 쓴다. **`delivery.deliver`의 `info`에서는 `kind`만 읽는다**(§5.2 — 그 타입에 index가 없다).
 - custom `dispatcherOptions.beforeDeliver`는 추가하지 않는다. existing reply pipeline의 정상 rewrite/cancel hook을 대체할 수 있기 때문이다. 실제 `delivery.deliver`가 받은 post-hook/post-`preparePayload` payload만 전송·materialize한다.
@@ -471,7 +482,7 @@ ordinary final이 leading terminal error보다 먼저 current lane의 terminal s
 - first-final 직전에 queued callback/delivery/lifecycle 작업을 drain해 empty predecessor와 late-owner epoch를 닫는다. callback 기록은 final 분류에 사용하지 않는다. final payload는 terminal notice, ordinary current-lane answer, leading-error 뒤 uncorrelated fallback으로 분류한다.
 - terminal notice/error, leading-error 후속 및 ordinary-answer 뒤 extra uncorrelated final은 assistant lane을 소비하지 않고 모두 같은 independent claim-or-fresh helper를 쓴다. current/existing/stale lane ID를 추측하지 않는다.
 - 현재의 “final 하나가 턴 전체 draft를 교체한다”는 주석과 분기를 제거한다.
-- 앞 lane/fallback send 실패를 격리하고 final delivery별 실제 결과 및 턴 단위 OR 회계를 유지한다.
+- 앞 lane/independent send 실패를 격리하고 delivery별 실제 결과 및 final의 턴 단위 OR 회계를 유지한다.
 
 ### 클라이언트
 
@@ -498,7 +509,7 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 | # | 케이스 | 기대 |
 | --- | --- | --- |
 | M1 | 첫 boundary 후 A partial | 빈 버블 없이 A ID 하나 생성 |
-| M1b | tool scaffold P → 빈 first lane boundary → B partial/final | B가 P를 claim해 한 버블로 교체, scaffold sibling 없음 |
+| M1b | tool scaffold P → 빈 first lane boundary → B partial/final send `true` | B가 P claim을 commit해 한 버블로 교체, scaffold sibling 없음 |
 | M2 | A partial → boundary → B partial | A가 정착되고 B는 다른 ID 사용 |
 | M3 | A → B → C | 세 lane/세 ID, 발생 순서 유지 |
 | M4 | `replace:true`로 A 본문 수정 | 새 버블 없이 A lane만 교체 |
@@ -514,7 +525,7 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 | M6i | authorized block independent send가 `true`/`false`/throw | actual 결과를 그대로 반환/진단하고 success에만 P claim commit, false/throw는 rollback한 뒤 settled cleanup; callback 결과로 성공 처리하거나 delivery suppress하지 않음 |
 | M7 | boundary 누락 + non-replace divergence | 기존 lane 보존, 진단 후 방어 회전 |
 | M8 | 늦은 boundary | 방어 회전을 두 번 적용하지 않음 |
-| M9 | A 정착 실패 | queue는 살아 있고 B 정착 실행 |
+| M9 | A 정착 실패 | tentative ID/claim을 남기지 않고 queue는 살아 있으며 B 정착 실행 |
 | M10 | 같은 lane의 동시/재진입 settle | 그 lane의 terminal frame 정확히 1회; 별도 final delivery slot은 막지 않음 |
 | M11a | **기본 partial / block streaming off**: queued callback 0개, A/B materialized(P도 이미 lane-claimed) 뒤 final `[terminal error,A1,A2,B]` | A/B lane 불변; error와 uncorrelated A1/A2/B를 각각 fresh ID로 전송; materialized 내용과의 중복을 at-least-once 비용으로 수용 |
 | M11b | **block streaming enabled + effective coalescing**: queued callbacks `[A1+"\n\n"+A2(index=0),B(index=1)]`, final은 동일한 `[terminal error,A1,A2,B]` | callbacks는 ordering reservation일 뿐; actual blocks와 final 세 개 모두 independent claim-or-fresh, callback 수로 dedupe/group하지 않음; 이미 lane-claimed P와 partial/final A/B 불변 |
@@ -524,7 +535,9 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 | M13c | visible P → block send `false`/throw → B | independent reservation rollback; B lane이 P를 claim, failed block ghost 없음 |
 | M13d | visible P → block notice 또는 terminal notice/error/fallback success → 뒤 lane/independent payload | 첫 successful independent payload가 P를 non-lane claim; 뒤 payload는 fresh ID, lane 소유권 변화 없음 |
 | M13e | visible P → terminal error send `false` → retained A success | error rollback 뒤 uncorrelated A가 P를 claim; 실제 visible 버블은 A(P) 하나 |
-| M13f | visible P → block/notice/error success 또는 lane materialize로 P claim → 후속 tool/item event → B 또는 block-only end | claim이 provisional writer를 invalidate; 후속 tool scaffold wire 0회, durable payload(P) 불변, independent claim 뒤 B가 있으면 fresh ID |
+| M13f | visible P → block/notice/error 또는 lane send `true`로 P claim → 후속 tool/item event → B 또는 block-only end | successful claim이 provisional writer를 invalidate; 후속 tool scaffold wire 0회, durable payload(P) 불변, independent claim 뒤 B가 있으면 fresh ID |
+| M13g | visible P → A의 첫 lane frame `progress(partial)`/`agent_message(final-only)` × send `false`/throw → B lane send `true` | A는 P reserve 뒤 rollback, tentative lane ID clear, writer active, inline retry 0회; B가 P를 reserve/commit해 한 버블, A failure 결과 보존, queue 생존 |
+| M13h | visible P → A의 첫 `progress(partial)` send 실패 → independent F send `true` → A의 later partial update | F가 P를 reserve/commit하고 writer invalidate; A later update는 fresh ID를 사용해 P를 mutate하지 않음, ghost/tentative owner 없음 |
 
 ### inbound 통합 테스트
 
@@ -535,17 +548,17 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 | I3 | 단일 메시지 | 한 ID에서 partial→final, 기존 UX 유지 |
 | I4 | final B가 A 문장을 인용/포함 | A와 B는 여전히 별도 버블 (`includes` 회귀 방지) |
 | I5 | final B가 B partial을 전면 재작성 | B만 교체, A 불변 |
-| I6 | A live 정착 `false`/throw | B final은 시도되고 성공 결과를 반환 |
+| I6 | A live 정착 `false`/throw | A tentative ID가 남지 않고 B final은 시도되어 실제 성공 결과를 반환 |
 | I7 | B final 실패 | 기존 P0-4 턴 outcome 계약 유지 |
 | I8 | abort/clean resolve/error | 정착된 A 불변, queue drain 뒤 unresolved/current만 settle, working 잔존 없음 |
-| I9 | progress mode | 첫 materialized lane 또는 successful independent delivery가 provisional scaffold ID를 claim; 뒤 payload는 fresh ID |
+| I9 | progress mode | final-only lane/independent delivery가 P를 two-phase reserve하고 첫 successful send만 claim; 뒤 payload는 fresh ID |
 | I10 | block/off mode | 기존 append/순서와 실제 delivery 결과 처리 무회귀 |
 | I11 | P 없는 commentary-only A의 queued callback 하나가 B boundary/partial 뒤 도착 (index 있음/없음 parameterize), actual block 승인 | callback text는 미전송; actual post-hook A는 fresh independent fallback, empty predecessor는 lifecycle/terminal drain에서 제거, B는 별도 ID |
 | I12a | 기본 partial / block streaming off에서 callback 없이 A/B materialized, core final `[terminal error,A1,A2,B]` | 기존 A/B 불변; error와 A1/A2/B fresh fallback 모두 보존, fallback별 실제 send 결과, outcome error; 의미상 중복 명시 수용 |
 | I12b | block streaming enabled에서 callbacks `[A1+"\n\n"+A2(index=0),B(index=1)]`, core final은 같은 `[terminal error,A1,A2,B]` | actual block fallback들과 final error/A1/A2/B fallback을 모두 독립 보존; 기존 partial/final A/B 불변, 중복 명시 수용, outcome error |
 | I13 | partial 모드에서 answer final → timeout/tool-warning final | 두 payload 모두 보존, lifecycle verdict가 outcome 결정 |
 | I14 | partial 모드에서 reservation 0개/1개/여러 개인 authorized block delivery | 모든 actual payload를 independent claim-or-fresh로 보존; callback payload/owner는 사용하지 않음 |
-| I15 | tool-only assistant A가 scaffold를 띄운 뒤 answer B가 시작 | B가 provisional ID를 재사용해 final 뒤 버블 하나, `turn_settled` 후 ghost scaffold 없음 |
+| I15 | tool-only assistant A가 scaffold를 띄운 뒤 answer B가 시작하고 send `true` | B가 provisional ID claim을 commit해 final 뒤 버블 하나, `turn_settled` 후 ghost scaffold 없음 |
 | I16 | P 없는 commentary-only A의 A1/A2 queued callback이 B boundary/partial 뒤 모두 index 없이 도착 | callbacks는 ordering barrier일 뿐; actual A1/A2는 각각 fresh independent fallback, empty A는 terminal drain에서 제거, B 별도 정착 |
 | I17 | queued 원문 뒤 `beforeDeliver`가 text/media를 rewrite하고 actual block 승인 | provisional-or-fresh independent wire에는 post-hook/post-prepare payload만 1회; queued 원문 0회 |
 | I18 | A queued block이 normalize skip 또는 beforeDeliver cancel/throw된 뒤 answer B (index 있음/없음) | exact-index lifecycle 또는 terminal cleanup 뒤 A ghost/영구 barrier 없이 B가 provisional ID를 claim해 정착 |
@@ -556,6 +569,7 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 | I23 | tool scaffold P → block `false`/throw → answer B | claim rollback 뒤 B가 P를 재사용; queue 생존, failed block/ghost 없음 |
 | I24 | P와 block notice/terminal error/fallback sequence (error false → retained A success 포함) | 각 independent send가 같은 reserve/commit/rollback helper 사용; 첫 성공만 P claim, 뒤 성공은 fresh ID |
 | I25 | P → successful independent block/notice/error → late `onToolStart`/`onItemEvent` → B 및 block-only cleanup | late scaffold emission 0회, `agent_message(P,F)` 본문 불변/settled, B는 fresh ID; lane이 P를 claim한 variant도 scaffold가 lane text를 덮지 않음 |
+| I26 | pinned runtime에서 첫 lane frame (`progress` partial / final-only `agent_message`) × 결과 (`false`/throw) × 다음 successful consumer (lane B / independent F) | 2×2×2 모두 A의 tentative P/ID rollback·inline retry 0회·실제 실패 결과·queue 생존; 다음 consumer가 P로 성공해 ghost 없음. partial-first + F-claim branch의 later A update는 fresh ID |
 
 ### 클라이언트 회귀 테스트
 
@@ -588,6 +602,7 @@ C3/C4는 지금 우연히 맞을 수는 있어도 테스트로 고정돼 있지 
 - queued block의 rewrite/cancel 및 actual send `true`/`false`/throw는 I17~I19의 pinned-runtime integration으로 고정한다. 특히 cancel(A) → B가 ghost/barrier 없이 끝나고 pre-hook text/media가 wire에 한 번도 나오지 않아야 한다.
 - 세 notice flag는 I20에서 partial 유/무와 A/B interleave를 교차해 고정한다. callback token은 wire를 만들지 않고 actual authorized notice만 독립 전송되며 lane 상태를 건드리지 않아야 한다.
 - provisional claim 뒤 late tool/item event는 I25에서 block/notice/error와 lane owner를 교차한다. claimed P에 scaffold `progress`가 0회여야 하고 B는 fresh ID를 써야 한다.
+- lane-owned P failure는 I26의 pinned-runtime 2×2×2 matrix로 고정한다. partial-progress/final-only 첫 frame이 `false`/throw여도 tentative P가 남지 않고, 뒤 lane/independent success가 P를 차지하며 queue가 살아 있어야 한다.
 - terminal-error fixture는 plugin integration I12a/I12b에서 (a) callback 0개와 (b) coalesced callback 2개를 각각 만들되 final `[error,A1,A2,B]`는 같게 고정한다. 두 경우 모두 wire에는 기존 materialized A/B에 더해 error와 fresh fallback A1/A2/B가 남아야 한다. provider별 error 재현에 기대지 않으므로 live e2e를 불안정하게 만들지 않는다.
 - `e2e/protocol-version-lockstep.test.ts`: 새 프레임 타입이 없으므로 protocol 버전은 올리지 않는다. 이 판단을 테스트로 명시해 둔다.
 
@@ -611,7 +626,7 @@ npm test             # 루트 vitest — client 회귀와 e2e 포함
 | 턴 끝에 prefix를 잘라 새 버블로 전송 | 경계를 너무 늦게 복원하며 순서/ID/finalize latch가 복잡해진다. |
 | `final.includes(previous)` 또는 suffix 검사 | 인용/반복/재포맷을 메시지 동일성으로 오판한다. core의 구조화된 경계를 버린다. |
 | 모든 partial 프레임 영구 저장 | 보존 단위를 스트리밍 프레임으로 잘못 잡아 히스토리를 오염시킨다. |
-| 첫 `Working…` ID를 first assistant lane에 즉시 귀속 | first assistant message가 tool-only/empty면 B가 새 ID를 쓰고, delete 없는 client가 A scaffold를 `turn_settled`에서 영구 정착한다. preview는 첫 materialized lane 또는 successful independent delivery가 나올 때까지 소유자 없이 둔다. |
+| 첫 `Working…` ID를 first assistant lane에 즉시 귀속 | first assistant message가 tool-only/empty면 B가 새 ID를 쓰고, delete 없는 client가 A scaffold를 `turn_settled`에서 영구 정착한다. preview는 첫 successful lane/independent delivery가 나올 때까지 committed owner 없이 둔다. |
 | ordinary partial/final #94 수정을 위한 core 변경 | assistant-message 경계 신호는 `plugin-sdk`에 이미 있어 기존 draft 평탄화의 소유자는 WebChannel 플러그인이다(§5.1). block partial dedupe/grouping/exact ownership 및 leading-error exact-once에 필요한 stable public identity는 예외이며 #111의 core 계약 gap이다. |
 | 앞 버블 실패 시 턴 전체 실패 | 모델 실행 결과와 transport live-delivery 결과를 혼동한다. history 복구 경로도 있다. |
 | `deliver`의 `info.assistantMessageIndex`로 lane 상관 | 그 필드가 존재하지 않는다. `ChannelDeliveryInfo`는 `{kind}`뿐이고 6.10/7.1-2 동일하다(§5.2). 계약 밖 seam을 캐스팅으로 뚫는 것도 #23의 실패를 반복하는 길이다. |
@@ -622,6 +637,7 @@ npm test             # 루트 vitest — client 회귀와 e2e 포함
 | queued callback 수를 delivery credit으로 삼아 actual block suppress | callback은 승인 전이고 actual delivery는 wire-authoritative다. callback-side 결과로 승인된 payload를 폐기하거나 성공으로 회계하면 rewrite/cancel/실패 계약을 깨뜨린다. |
 | visible+unclaimed P가 있는데 independent delivery를 무조건 fresh ID로 append | 뒤 lane이 P를 claim하면 reducer가 기존 P 위치를 갱신해 `[B(P),F]`로 역전되고, block-only cleanup은 `[ghost P,F]`를 남긴다. independent delivery도 먼저 P를 reserve해야 한다(C8). |
 | independent delivery가 P를 send 전에 영구 claim | transport가 `false`/throw여도 P가 소비되어 뒤 lane/성공 payload가 fresh ID를 쓰고 scaffold가 남는다. send 전에는 reserve만 하고 `visibleReplySent:true`에만 commit하며 실패에는 rollback한다. |
+| lane의 첫 partial/final send 전에 P와 `lane.id`를 영구 assign | send가 `false`/throw여도 실패 lane이 P를 독점하고 writer를 끄면 뒤의 성공한 lane/independent payload가 scaffold를 교체하지 못한다. P와 lane assignment 모두 tentative로 두고 실제 `true`에만 commit하며 실패에는 둘 다 rollback한다. |
 | claim 뒤 기존 tool/item draft loop를 계속 실행 | client는 ID로 upsert하므로 durable `agent_message(P,F)` 뒤 `progress(P,Working)`가 F를 덮고 working 상태를 다시 연다. lane/independent claim과 동시에 provisional writer를 invalidate하고 이후 scaffold emission을 suppress한다(C8). |
 | partial 모드의 모든 `kind:"block"` 무조건 폐기 | actual block은 승인된 가시 payload다. lane dedupe는 못 해도 provisional-or-fresh independent 경로로 전부 보존한다. |
 | block notice를 lane/reservation 뒤에 분류 | notice callback이 empty predecessor barrier를 만들거나 actual notice가 assistant lane을 settle한다. 세 notice flag를 callback/actual 양쪽에서 가장 먼저 분류해 독립 경로로 보낸다. |
@@ -674,22 +690,24 @@ staleness valve의 disarm은 경로마다 단위가 다르다. `progress`/`agent
 
 - [ ] partial/final ordinary 경로에서 한 턴의 완료된 assistant 메시지 N개가 라이브에서도 N개 버블로 남는다. authorized block과 leading-terminal-error 후속 final은 #111 전까지 provisional-or-fresh independent 중복을 허용한다.
 - [ ] 각 메시지는 고유 ID를 가지며 partial은 해당 활성 ID만 갱신한다.
-- [ ] first-lane tool scaffold는 provisional ID로 남고 첫 materialized lane 또는 첫 successful independent delivery가 재사용한다. independent owner는 assistant lane을 만들지 않는다.
-- [ ] lane/independent claim은 provisional scaffold writer를 같은 queue transaction에서 invalidate한다. 이후 tool/item event는 claimed P나 새 scaffold ID로 wire emission하지 않으며, durable P 본문을 덮지 않는다. bubble 사이 in-flight 표시는 base의 `turnActive`(#96/#101)를 사용한다.
+- [ ] first-lane tool scaffold는 provisional ID로 남고 첫 successful lane 또는 independent delivery가 재사용한다. independent owner는 assistant lane을 만들지 않는다.
+- [ ] lane generation과 independent delivery sequence 모두 P를 reserve → send하고 lane transport boolean / independent `visibleReplySent`가 실제 `true`일 때만 owner/lane ID와 provisional scaffold-writer invalidation을 commit한다. `false`/throw에는 P와 tentative lane assignment를 rollback하고 writer를 active로 유지한다.
+- [ ] successful claim 뒤 tool/item event는 claimed P나 새 scaffold ID로 wire emission하지 않으며 durable P 본문을 덮지 않는다. bubble 사이 in-flight 표시는 base의 `turnActive`(#96/#101)를 사용한다.
 - [ ] 다음 boundary 뒤에 늦게 온 `onBlockReplyQueued`도 앞 commentary-only lane의 tentative reservation을 유지한다. callback payload는 wire/body가 아니며, skip/cancel/failure/terminal drain은 empty predecessor를 retire해 뒤 lane의 barrier를 푼다.
 - [ ] partial mode의 actual post-hook block delivery를 조용히 폐기하거나 lane에 추측 적용하지 않는다. notice를 먼저 분류한 뒤 reservation 수/상태와 무관한 independent delivery로 보내며, visible+unclaimed P면 reserve/send 후 성공에만 commit하고 P가 없거나 claimed면 fresh ID를 쓴다.
 - [ ] queued 원문이 rewrite/cancel되면 원문은 wire에 0회다. cancel(A) → B에서 A ghost/barrier가 없고, actual send `true`/`false`/throw가 모두 lifecycle cleanup 뒤 queue를 살려 둔다.
 - [ ] `isStatusNotice`/`isFallbackNotice`/`isCompactionNotice` block은 callback과 actual 양쪽에서 lane logic보다 먼저 분류된다. actual notice만 독립 전송되고 assistant lane을 생성·정착·차단하지 않는다.
 - [ ] leading error 없는 첫 ordinary answer final만 current lane의 terminal slot을 확정한다. terminal notice와 leading error 뒤 identity 없는 모든 non-notice payload는 lane을 소비하지 않고 같은 provisional-or-fresh independent 경로로 보존한다.
 - [ ] (a) block callback 0개와 (b) coalesced callbacks `[A1+"\n\n"+A2@0,B@1]` 모두 final `[error,A1,A2,B]`를 만나면 기존 A/B는 불변이고 error/A1/A2/B가 모두 보존된다. callback 수로 final을 drop/group하지 않으며 의미상 중복은 명시적으로 수용한다.
-- [ ] 각 independent claim-or-fresh delivery는 실제 `visibleReplySent`를 반환한다. `true`에만 provisional claim을 commit하고 `false`/throw에는 rollback하며, 나머지 final을 계속 시도한다. answer → timeout/warning 순서에서도 어느 payload도 settle latch에 삼켜지지 않는다.
+- [ ] 각 lane transport boolean / independent `visibleReplySent`의 실제 결과를 보존한다. `true`에만 provisional claim을 commit하고 `false`/throw에는 rollback하며 queue와 나머지 delivery를 계속 처리한다. 실패 frame은 blind inline retry하지 않는다. answer → timeout/warning 순서에서도 어느 payload도 settle latch에 삼켜지지 않는다.
+- [ ] 첫 lane frame `progress(partial)`/`agent_message(final-only)` × `false`/throw × 뒤 successful lane/independent의 조합에서 실패 lane은 committed P/ID를 남기지 않고 뒤 성공이 P를 사용한다. partial-first 실패 lane의 later update는 이미 claimed P 대신 fresh ID를 쓴다.
 - [ ] history snapshot이 live A/B ID를 canonical ID로 adopt한 뒤 fresh fallback은 canonical A/B를 mutate하지 않고 append된다. old live ID 추측도 하지 않으며 exact-once는 #111 범위다.
 - [ ] ordinary partial/final 경로의 live와 history hydrate 메시지 **수와 순서**가 일치한다(§6.5.1의 방어 회전, authorized-block 및 leading-error at-least-once 예외 제외).
       **본문 일치는 완료 조건이 아니다** — core는 라이브 응답에서 메타데이터 구획을 걷어내고 transcript에는 원본을 저장하므로 두 텍스트는 애초에 byte-equal이 아니다(`nats-client-wrapper.ts:1052-1054`). 본문 수렴은 hydrate의 정본 텍스트 채택(`adoptAt`)이 담당하며, 이 이슈가 보장할 대상이 아니다.
 - [ ] 메시지 동일성 판정에 `includes`/suffix/문자열 split을 사용하지 않는다.
-- [ ] 앞 lane 전송 실패 후에도 모든 final payload 전달이 시도된다.
+- [ ] 앞 lane 전송 실패 후에도 모든 final payload 전달이 시도되고 실패 delivery의 실제 결과가 보존되며 queue가 살아 있다.
 - [ ] abort/error/단일 메시지/progress/block/off 경로에 회귀가 없다.
-- [ ] 중단/에러 경로에서 빈 lane 버블도 중단 마커 버블도 생기지 않는다. successful independent claim은 scaffold cleanup을 금지하고, lane/independent delivery가 모두 실패하거나 없는 unclaimed tool-only preview만 no-delete 예외로 같은 ID에서 settle한다(§6.2-3, §8-6).
+- [ ] 중단/에러 경로에서 빈 lane 버블도 중단 마커 버블도 생기지 않는다. successful lane/independent claim은 scaffold cleanup을 금지하고, 모든 durable delivery가 실패하거나 없는 unclaimed tool-only preview만 no-delete 예외로 같은 ID에서 settle한다(§6.2-3, §8-6).
 - [ ] history 화해 비대칭(C3/C4), later-snapshot adoption, 다중 draft watchdog(C5a/C5b), lane provisional-ID reuse(C6), snapshot adoption 뒤 fresh-fallback/stale-ID append 비용(C7), independent same-P 순서와 fresh-first 역전/ghost 및 late-scaffold overwrite 비용(C8)이 테스트로 고정된다.
 - [ ] 다중 어시스턴트 메시지 턴이 e2e에서 두 개의 서로 다른 id로 정착한다.
 - [ ] 계약 밖(core 내부 번들) 의존을 새로 늘리지 않는다 — 신규 근거는 `plugin-sdk` export만 인용한다.
@@ -713,7 +731,7 @@ PR 1 완료 시점에는 **문서와 client characterization test만 수정되�
 이걸 먼저 떼는 이유: C3(라이브 1 / snapshot 2)와 C4(라이브 3 / snapshot 2)는 3-tier 매칭을 추적해 보면 **현재 우연히 맞지만 테스트로 고정된 적이 없다.** 만약 실제로 틀렸다면 그건 `nats-client-wrapper.ts` 프로덕션 수정이고, 메인 PR 안에서 터지면 "메시지 경계 수정"이 클라이언트 화해 로직 수정까지 껴안게 된다. 먼저 확인하면 어느 쪽이든 메인 PR이 깨끗하다.
 
 **PR 2 — #94 본체 (대, 원자적)**
-provisional preview + lane/independent claim owner + scaffold-writer invalidation + ordered/unresolved lane 모델 + tentative ordering reservation/notice token + dispatcher lifecycle cleanup + authoritative independent claim-or-fresh 처리 + inbound 배선 + M1~M13(세분 케이스 포함) / I1~I25 + e2e 게이트. **더 쪼개면 깨진다** — inbound가 tool/item, 경계, queued block, actual delivery, lifecycle을 함께 넘기지 않으면 adapter는 preview reserve/commit/rollback, writer invalidation, late barrier, cancellation cleanup과 generation-order emission을 운용할 수 없다. adapter에 retained lane/reservation이 없으면 cancel(A) → B의 ghost/영구 barrier 방지도 성립하지 않는다. §6.5 fail-safe도 못 뗀다. 현재 코드에 이미 `absorbedMissedBoundaries` 방어가 있어서, 빼고 먼저 내보내면 #23이 막아둔 것을 되돌리는 셈이다.
+provisional preview + lane/independent two-phase claim owner + success-only scaffold-writer invalidation + ordered/unresolved lane 모델 + tentative ordering reservation/notice token + dispatcher lifecycle cleanup + authoritative independent claim-or-fresh 처리 + inbound 배선 + M1~M13(세분 케이스 포함) / I1~I26 + e2e 게이트. **더 쪼개면 깨진다** — inbound가 tool/item, partial/final, 경계, queued block, actual delivery, lifecycle을 함께 넘기지 않으면 adapter는 preview reserve/commit/rollback, tentative lane-ID cleanup, writer invalidation, late barrier, cancellation cleanup과 generation-order emission을 운용할 수 없다. adapter에 retained lane/reservation이 없으면 cancel(A) → B의 ghost/영구 barrier 방지도 성립하지 않는다. §6.5 fail-safe도 못 뗀다. 현재 코드에 이미 `absorbedMissedBoundaries` 방어가 있어서, 빼고 먼저 내보내면 #23이 막아둔 것을 되돌리는 셈이다.
 
 **기각한 분할:** "id는 하나로 둔 채 `answerPrefix`만 배열로 바꾸는 무동작 리팩터를 먼저" 안. 회전 없는 lane 구조는 2단계에서 다시 쓰이므로 버려질 코드를 리뷰시키게 된다. 대신 **PR 2 안에서 커밋을 ① adapter lane 모델 ② inbound 배선 ③ 테스트 ④ e2e 순으로 나눈다.** 분할 PR의 리뷰 이점 대부분을 얻으면서 버려지는 중간 상태를 만들지 않는다.
 
@@ -721,10 +739,10 @@ provisional preview + lane/independent claim owner + scaffold-writer invalidatio
 
 아래 순서로 바로 시작한다. 재조사는 필요 없다.
 
-1. `packages/plugin/src/channel.test.ts`의 기존 “두 assistant 메시지가 한 ID에 합쳐진다” 테스트를 두 ID/두 버블 기대값으로 바꾸고, final이 앞 메시지를 인용하는 실패 테스트를 먼저 추가한다. 이어 tool scaffold → empty boundary → answer, late reservation, rewrite/cancel, cancel(A) → B, actual send `true`/`false`/throw, 세 notice flag, (a) callback 0개 및 (b) coalesced callback 2개 + 동일 final `[error,A1,A2,B]`의 at-least-once red test를 추가한다. M13/I21~I25의 P→block success→B, block-only, false/throw→B, notice/error/fallback claim 순서와 claim 뒤 late tool/item suppression도 먼저 red로 만든다.
-2. `packages/plugin/src/message-adapter.ts`의 턴 고정 `id`/`answerPrefix`를 owner가 lane generation 또는 independent delivery sequence인 provisional claim state, ordered lane 목록, unresolved predecessor, persistent late-indexless barrier, tentative reservation/notice token, actual independent disposition, final phase, lane별 settle latch로 교체한다. 모든 independent send의 reserve → send → success-only commit / false·throw rollback을 queue 안에서 원자적으로 처리한다.
+1. `packages/plugin/src/channel.test.ts`의 기존 “두 assistant 메시지가 한 ID에 합쳐진다” 테스트를 두 ID/두 버블 기대값으로 바꾸고, final이 앞 메시지를 인용하는 실패 테스트를 먼저 추가한다. 이어 tool scaffold → empty boundary → answer, late reservation, rewrite/cancel, cancel(A) → B, actual send `true`/`false`/throw, 세 notice flag, (a) callback 0개 및 (b) coalesced callback 2개 + 동일 final `[error,A1,A2,B]`의 at-least-once red test를 추가한다. M13/I21~I26의 independent claim 순서/late tool suppression과 lane first-frame partial/final × false/throw × later lane/independent success matrix도 먼저 red로 만든다.
+2. `packages/plugin/src/message-adapter.ts`의 턴 고정 `id`/`answerPrefix`를 owner가 lane generation 또는 independent delivery sequence인 provisional claim state, tentative lane ID, ordered lane 목록, unresolved predecessor, persistent late-indexless barrier, tentative reservation/notice token, actual independent disposition, final phase, lane별 settle latch로 교체한다. 모든 P-bound lane/independent send의 reserve → send → success-only commit / false·throw rollback을 queue 안에서 원자적으로 처리한다.
 3. `pushAnswerText`가 문자열만 받지 말고 `text`/`delta`/`replace`를 보존하도록 바꾼다.
-4. `packages/plugin/src/inbound.ts`에서 partial/boundary/queued-block/actual delivery와 dispatcher `onSkip`/`onBeforeDeliverCancelled`/`onDeliverySettled`, delivery `onError`를 같은 직렬 queue에 넣는다. `onBlockReplyQueued`의 optional index는 reservation에만 쓰고, `deliver`의 `info`에서는 `kind`만 읽는다. custom `beforeDeliver`는 추가하지 않는다.
+4. `packages/plugin/src/inbound.ts`에서 tool/item, partial/final, boundary, queued-block/actual delivery와 dispatcher `onSkip`/`onBeforeDeliverCancelled`/`onDeliverySettled`, delivery `onError`를 같은 직렬 queue에 넣는다. lane progress/final 실제 결과를 claim helper에 반환하고, `onBlockReplyQueued`의 optional index는 reservation에만 쓰며 `deliver`의 `info`에서는 `kind`만 읽는다. custom `beforeDeliver`는 추가하지 않는다.
 5. plugin 테스트가 green이 된 뒤 client의 다중 ID reducer 회귀 테스트와 전체 게이트를 실행한다.
 
 구현 중 다시 열면 안 되는 결정:
@@ -739,8 +757,8 @@ provisional preview + lane/independent claim owner + scaffold-writer invalidatio
 - `onBlockReplyQueued`가 다음 boundary보다 늦게 호출될 수 있다. 직렬 queue만으로 고쳐졌다고 가정하지 않고 unresolved predecessor/emission barrier를 유지한다. indexless late owner는 lifecycle/terminal drain까지 유지하되 callback만으로 materialize하지 않는다.
 - `onSkip`/`onBeforeDeliverCancelled`/`onDeliverySettled`와 delivery `onError`는 같은 queue로 들어가며 cleanup은 idempotent하다. skip/cancel/failure한 tentative A가 B를 영구 차단하거나 ghost를 만들면 안 된다.
 - settle latch는 턴별이 아니라 lane별 normal terminal send용이다. preview claim owner와 lane의 `started`를 분리하고, leading-error 후속 final은 cached settle 결과에 삼키거나 기존/stale lane ID에 적용하지 않고 independent claim-or-fresh로 실제 전송한다.
-- visible provisional preview는 event queue에서 첫 materialized lane 또는 첫 successful independent delivery가 claim한다. lane이 먼저 materialize되면 lane generation이 P를 쓰고, independent delivery가 먼저 오면 sequence가 P를 reserve/send한 뒤 `true`에만 non-lane claim을 commit한다. 성공한 independent claim 뒤 lane은 fresh ID를 쓰고 cleanup은 scaffold를 settle하지 않는다. 실패한 independent send는 rollback해 뒤 lane/성공 payload가 P를 재사용한다.
-- lane claim 또는 successful independent commit과 동시에 provisional scaffold writer/draft loop를 invalidate한다. 이미 enqueue된 tool/item event도 claim state를 재확인해 claimed P와 새 ID 모두에 scaffold `progress`를 보내지 않는다. lane의 answer partial writer는 별개라 자기 lane ID 갱신을 계속할 수 있다. bubble 사이 in-flight 표시는 base에 랜딩한 #96/#101 `turnActive`를 유지하고, 구조화된 tool 상세는 #97 범위로 남긴다.
+- visible provisional preview는 event queue에서 첫 **successful** lane 또는 independent delivery가 claim한다. lane generation과 independent sequence 모두 P를 reserve/send한 뒤 실제 `true`에만 owner를 commit한다. lane `progress`/final이 `false`/throw면 P와 tentative lane ID를 rollback하고 writer를 active로 둔다. 같은 frame을 inline retry하지 않으며, 뒤 lane/independent success가 P를 재사용할 수 있다. 그 뒤 실패 lane의 later update는 P가 이미 claimed면 fresh ID를 쓴다.
+- successful lane/independent commit과 동시에만 provisional scaffold writer/draft loop를 invalidate한다. 이미 enqueue된 tool/item event도 claim state를 재확인해 claimed P와 새 ID 모두에 scaffold `progress`를 보내지 않는다. committed lane의 answer partial writer는 별개라 자기 lane ID 갱신을 계속할 수 있다. bubble 사이 in-flight 표시는 base에 랜딩한 #96/#101 `turnActive`를 유지하고, 구조화된 tool 상세는 #97 범위로 남긴다.
 - preview가 claim된 뒤 회전한 lane은 어시스턴트 텍스트가 생기기 전까지 새 answer `progress` ID를 보내지 않는다. 프로토콜에 버블 삭제가 없어서, 한 번 보이면 반드시 버블로 남는다(§6.2-3).
 - 위험한 클라이언트 표면은 reducer가 아니라 history 3-tier 화해 로직이다(§10 C3/C4).
 - 앞 lane send 실패가 queue를 reject 상태로 고정하거나 뒤 lane/추가 final을 막아서는 안 된다.
