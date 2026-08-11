@@ -110,15 +110,25 @@ narrowed to agent-down durability — see below).
    capability is live, but [#94](https://github.com/mir-stream/openclaw-webchannel/issues/94) remains
    a correctness gap: multiple assistant messages currently share one draft id, so the last final can
    erase earlier live messages. The accepted fix settles one bubble per assistant-message boundary
-   and rotates to a new id, while letting the first durable lane claim the provisional tool-scaffold id,
+   and rotates to a new id, while letting the first materialized lane or first successful independent
+   delivery claim the provisional tool-scaffold id,
    retaining late indexless reservations through lifecycle/terminal drain. Queued callbacks are
    pre-TTS/media and pre-rewrite/cancel, so they never supply wire body or a delivery-suppression
    credit. Only the actual post-hook block delivery is authoritative, but no public identity correlates
-   it to a reservation—even one remaining reservation can be unrelated. Every authorized non-notice
-   block in partial mode therefore uses a fresh fallback id. Skip/cancel/settled/error lifecycle
-   signals retire reservations, and all three block notice flags take an independent non-lane path.
+   it to a reservation—even one remaining reservation can be unrelated. Every authorized block in
+   partial mode therefore takes an independent non-lane path. If a provisional preview is visible and
+   unclaimed, the delivery reserves that id and commits the non-lane claim only after a successful
+   send; `false`/throw rolls it back for the next lane or successful independent payload. Otherwise it
+   uses a fresh id. This preserves independent-before-lane order and prevents block-only scaffold
+   ghosts without inferring block→lane ownership. Any lane claim or successful independent claim also
+   invalidates the provisional scaffold writer: later tool/item events must never send `progress` on
+   claimed P, which would overwrite the durable payload. The `turnActive` signal already landed via
+   #96/#101 and preserves turn-level activity between bubbles; structured tool detail remains #97.
+   Skip/cancel/settled/error lifecycle signals retire tentative reservations, and all three block
+   notice flags are classified before lane logic.
    Queued callback cardinality still cannot classify finals. After a leading terminal error,
-   non-notice finals without public identity, such as `[A1,A2,B]`, each use a fresh fallback id.
+   non-notice finals without public identity, such as `[A1,A2,B]`, use the same independent
+   provisional-or-fresh path.
    This deliberately preserves at least once and may duplicate materialized A/B; block partial dedupe,
    same-message grouping, exact lane ownership, and final exact-once need a stable public identity that
    reaches actual delivery and are deferred to

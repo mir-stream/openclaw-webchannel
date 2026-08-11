@@ -682,8 +682,12 @@ describe("WebChannelNATSClient — #16 ordered history insertion", () => {
 // and the reconciler must still converge without duplicating or losing text.
 // C7 records the complementary protocol constraint: once history adopts a
 // canonical id, the reducer keeps no alias for the old live id. An ambiguous
-// final must therefore use a fresh fallback id rather than mutating either the
-// canonical id or the now-stale live id.
+// final must therefore avoid mutating either the canonical id or the now-stale
+// live id. C8 pins the separate provisional-id ordering constraint: the first
+// successful independent delivery must replace a visible preview in place;
+// appending it under a fresh id lets a later lane rewrite the older array slot.
+// Once claimed, the old scaffold writer must also stop: a later progress frame
+// on P would overwrite the durable payload because the reducer upserts by id.
 // ---------------------------------------------------------------------------
 describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => {
   type AnyFrame = { type: string; [k: string]: unknown };
@@ -1272,6 +1276,156 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       "webchannel-a",
     ]);
     expect(w.getState().messages.at(-1)?.text).toBe("A stale old-id upsert");
+  });
+
+  // --- C8: independent delivery must claim a visible provisional id. ------
+  it("C8: preview claim preserves order and exposes fresh-first and late-scaffold mutation costs", () => {
+    const claimed = makeWrapper();
+
+    // Correct post-#94 shape. The independent block is not assigned to an
+    // assistant lane, but it is the first successful durable consumer of P.
+    // Reusing P replaces the scaffold at its existing array position; B must
+    // then append under a new lane id.
+    deliver(claimed, {
+      type: "progress",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "Working…",
+    });
+    deliver(claimed, {
+      type: "agent_message",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "A authorized block",
+    });
+    liveBubble(claimed, "webchannel-b", "T", "B partial…", "B final");
+    deliver(claimed, { type: "turn_settled", turnId: "T", outcome: "ok" });
+
+    expect(claimed.getState().messages.map((m) => m.id)).toEqual([
+      "webchannel-preview",
+      "webchannel-b",
+    ]);
+    expect(claimed.getState().messages.map((m) => m.text)).toEqual([
+      "A authorized block",
+      "B final",
+    ]);
+    expect(claimed.getState().messages.map((m) => m.working)).toEqual([false, false]);
+
+    const claimedBlockOnly = makeWrapper();
+
+    // The same successful P claim in a block-only turn replaces the scaffold
+    // and gives cleanup exactly one already-settled durable bubble.
+    deliver(claimedBlockOnly, {
+      type: "progress",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "Working…",
+    });
+    deliver(claimedBlockOnly, {
+      type: "agent_message",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "A authorized block",
+    });
+    deliver(claimedBlockOnly, { type: "turn_settled", turnId: "T", outcome: "ok" });
+
+    expect(claimedBlockOnly.getState().messages).toHaveLength(1);
+    expect(claimedBlockOnly.getState().messages[0]).toMatchObject({
+      id: "webchannel-preview",
+      text: "A authorized block",
+      working: false,
+    });
+
+    const freshFirst = makeWrapper();
+
+    // Mutation/cost ledger: deliberately append F while P is still unclaimed,
+    // then let B reuse P. Upsert preserves P's older array slot, so the reducer
+    // produces [B(P), F] even though F arrived first. This is why the plugin
+    // must reserve P before the independent send and commit only on success.
+    deliver(freshFirst, {
+      type: "progress",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "Working…",
+    });
+    deliver(freshFirst, {
+      type: "agent_message",
+      id: "webchannel-fallback-a",
+      turnId: "T",
+      text: "A authorized block",
+    });
+    liveBubble(freshFirst, "webchannel-preview", "T", "B partial…", "B final");
+    deliver(freshFirst, { type: "turn_settled", turnId: "T", outcome: "ok" });
+
+    expect(freshFirst.getState().messages.map((m) => m.id)).toEqual([
+      "webchannel-preview",
+      "webchannel-fallback-a",
+    ]);
+    expect(freshFirst.getState().messages.map((m) => m.text)).toEqual([
+      "B final",
+      "A authorized block",
+    ]);
+
+    const blockOnlyFresh = makeWrapper();
+
+    // The same invalid fresh-first shape in a block-only turn leaves P with no
+    // payload that can replace it. turn_settled therefore exposes the exact
+    // two-bubble [ghost P, F] cost that successful P-claiming prevents.
+    deliver(blockOnlyFresh, {
+      type: "progress",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "Working…",
+    });
+    deliver(blockOnlyFresh, {
+      type: "agent_message",
+      id: "webchannel-fallback-a",
+      turnId: "T",
+      text: "A authorized block",
+    });
+    deliver(blockOnlyFresh, { type: "turn_settled", turnId: "T", outcome: "ok" });
+
+    expect(blockOnlyFresh.getState().messages.map((m) => m.id)).toEqual([
+      "webchannel-preview",
+      "webchannel-fallback-a",
+    ]);
+    expect(blockOnlyFresh.getState().messages.map((m) => m.text)).toEqual([
+      "Working…",
+      "A authorized block",
+    ]);
+    expect(blockOnlyFresh.getState().messages.map((m) => m.working)).toEqual([false, false]);
+
+    const lateScaffoldMutation = makeWrapper();
+
+    // Second mutation/cost ledger: even after agent_message(P) made A durable,
+    // the reducer accepts a later progress(P) as an in-place update. The plugin
+    // must therefore invalidate the provisional scaffold writer on ANY claim;
+    // otherwise a late tool/item event replaces A with Working… and reopens it.
+    deliver(lateScaffoldMutation, {
+      type: "progress",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "Working…",
+    });
+    deliver(lateScaffoldMutation, {
+      type: "agent_message",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "A authorized block",
+    });
+    deliver(lateScaffoldMutation, {
+      type: "progress",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "Working… after claim",
+    });
+
+    expect(lateScaffoldMutation.getState().messages).toHaveLength(1);
+    expect(lateScaffoldMutation.getState().messages[0]).toMatchObject({
+      id: "webchannel-preview",
+      text: "Working… after claim",
+      working: true,
+    });
   });
 });
 
