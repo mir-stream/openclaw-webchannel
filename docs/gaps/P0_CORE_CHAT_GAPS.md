@@ -9,9 +9,12 @@
 > `../openclaw/extensions/telegram/` (absolute: `/Users/mircorn/workspace/openclaw/extensions/telegram/`).
 >
 > **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-13 (post-#24…#33 tree).** The integrated
-> showcase demo rewrote the demo surface, and the P0/P1 parity stack has since **landed** — **P0 is
-> now fully built except one residual** (P0-3 argument menus). The demo drives the production
-> `WebChannelNATSClient` state reducer, so all P0 client render is done (marked ✅). Since the 07-10
+> showcase demo rewrote the demo surface, and the P0/P1 parity stack has since largely **landed**.
+> P0 capability enablement is built, but **two P0 correctness/UX residuals remain**: P0-3 argument
+> menus and P0-5 multi-message finalize correctness
+> ([#94](https://github.com/mir-stream/openclaw-webchannel/issues/94)). The demo drives the production
+> `WebChannelNATSClient` state reducer, so the P0 client surfaces exist; statuses below distinguish
+> enablement from unresolved correctness. Since the 07-10
 > re-verify develop merged: **P0-2 depth cap (#24)**, the **/stop control lane + typing gate + slash
 > discovery + debounce/coalesce + ingress dedupe (#25/#26/#28/#29/#30)**, **markdown (#27, P1)**,
 > **client replay+ack (#31)**, and the **protocol-version registration (#33)**. Corrected below for:
@@ -115,7 +118,7 @@ boolean `delivered`), `approvals`, `status`, `connected`, `error?`, `isTyping?`,
 | `history.enabled` | **`true`** (`:174-178`) | **`true`** (`:234`) | ✅ P0-1 works E2E |
 | `execApprovals` + `capabilities.inlineButtons` | first-class (`:137/:163`) | **enabled + approvers** (`:235`) | ✅ P0-4 works E2E |
 | `capabilities.typing` | **`"on"`** (`:167-170`) | unset → default on | ✅ P0-6 — gate now wired on NATS (`typing:"off"` honored) |
-| `streaming.mode` | option only (enum `off\|partial\|block\|progress`, `:110`), **no default** | **`"partial"`** (`run.sh:287`) | ✅ P0-5 — answer-text stream exercised in the demo |
+| `streaming.mode` | option only (enum `off\|partial\|block\|progress`, `:110`), **no default** | **`"partial"`** (`run.sh:287`) | 🟡 P0-5 — enablement built; multi-message finalize correctness #94 open |
 | `messages.inbound.byChannel.webchannel` (core key) | core default `0` (inert) | **`300`** (`run.sh:268`) | ✅ P1-8b pre-run debounce active |
 
 ### Reuse note — openclaw `plugin-sdk` runtimes (VERIFIED available)
@@ -430,10 +433,13 @@ until a history reload restores them.
   stay together, and discards a block delivery only when a queued accounting credit proves its payload
   was already preserved.
 - **`kind:"final"` is a delivery class, not an assistant-message id.** Core may deliver several final
-  payloads in one turn and the pinned builder can replay materialized messages as `[error,A,B]`.
-  Notices do not consume assistant lanes; a leading terminal error opens generation-order retained-answer
-  reconciliation so A/B update their existing ids. Only structurally unmatched payloads use diagnosed
-  fresh fallback ids instead of being swallowed by a settle latch.
+  payloads in one turn and the pinned builder can replay assistant blocks as `[error,A1,A2,B]`, where
+  A1/A2 belong to one lane. After terminal callback drain, queued-block ordinal and lane ownership form
+  replay atom/groups `[A:{A1,A2},B:{B}]`. Notices do not consume assistant lanes; correlated retained
+  finals are dedupe/accounting only because callback data already materialized each lane exactly once.
+  They are not re-emitted with live ids that a history snapshot may already have adopted away. Only
+  structurally unmatched payloads use diagnosed fresh fallback ids instead of being swallowed by a
+  settle latch.
 - **Wire primitives already fit the target:** partial uses `{ type:"progress", id, text }`; finalize
   uses `agent_message` with the same `id`. One assistant message uses one id; the id rotates only at
   an assistant-message boundary.
@@ -465,7 +471,9 @@ settle as its own bubble while partial frames edit only the current bubble. A tw
 must remain two messages after settle and match a fresh history hydrate. No content-based
 `includes`/suffix heuristic may decide whether messages are the same. Error/abort paths must settle
 only the active draft and leave earlier settled bubbles intact. A tool scaffold followed by an answer
-must reuse one provisional id, and `[error,A,B]` retained-final delivery must leave A/B exactly once.
+must reuse one provisional id, and callback `[A1@0,A2@0,B@1]` plus final
+`[error,A1,A2,B]` must group A1/A2 into A, keep B separate, and leave A/B exactly once even if a
+history snapshot adopted their old live ids before replay delivery.
 (With `"progress"`, tool lines remain an ephemeral scaffold and the answer arrives atomically.)
 
 ---
@@ -568,15 +576,18 @@ remains **P2-4**. P0-7 covers the client→agent replay + idempotency side; P2-4
 
 ## Suggested execution order (remaining work only)
 
-**P0 is fully closed except one residual.** Every numbered P0 gap is ✅; the only open P0 work is:
+**P0 capability enablement is built, with two residuals still open.** P0-3 needs its argument-menu
+UX and P0-5 needs #94's multi-message finalize correctness:
 
 | Order | Gap | Effort | Why |
 |---|---|---|---|
 | 1 | P0-3 argument menus | S | Catalog entries already carry `args.choices`; render a dropdown from them (widget currently inserts the name only). Ties into the P1-5 control renderer. |
+| 2 | P0-5 multi-message finalize (#94) | L | Replace the turn-wide draft with ordered lanes, provisional-preview ownership, late block ownership, and structural retained-replay accounting. |
 
 > ✅ **Done:** P0-1 (history restore), P0-2 (depth cap, #24 — optional scroll-UX polish is all that
 > remains there), P0-3 (slash discovery, #30 — arg menus excepted above), P0-4 (approval cards +
-> rehydration), P0-5 (streaming, demo streams `partial`), P0-6 (typing render + NATS gate, #26),
+> rehydration), P0-5 **enablement only** (demo streams `partial`; #94 correctness remains above),
+> P0-6 (typing render + NATS gate, #26),
 > P0-7 (client replay + server dedupe + ack, #30/#31). See each section for the residual notes.
 
 ## Cross-cutting: the reducer is the shared seam
