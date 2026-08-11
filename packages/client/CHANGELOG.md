@@ -60,16 +60,17 @@
   the two are complementary ("composing an answer right now" vs "still working on
   this turn"). Abort text (`/stop` and the NL abort vocabulary) rides the agent's
   control lane, which never settles, so it opens no turn.
-  Settlement is **not** one-per-send: messages arriving during a running turn are
+  Turns are **not** one-per-send: messages arriving during a running turn are
   coalesced into one turn keyed by the LAST of them (`inbound-queue.ts`
-  `coalesceUserMessages`), so a single `turn_settled` may be the only answer
-  several sends receive. A settle therefore closes the turn it names and every
-  turn published before it (publish order is processing order); a settle for an
-  unknown turn sweeps nothing; both outcomes and an outcome-less legacy settle
-  sweep alike. (The coalesced non-anchor *receipt* still rests at `accepted` — a
-  separate pre-existing defect, tracked as #99.) A failed send closes its own
-  turn ONLY for the failure that is a good proxy for the agent never having
-  received it — `overloaded`, an ingress rejection. A proxy, not a proof: the
+  `coalesceUserMessages`). The current plugin emits one same-outcome
+  `turn_settled` per member in arrival order, anchor last, and the client promotes
+  each exact named receipt. A settle also closes the turn it names and every turn
+  published before it (publish order is processing order); that prefix sweep
+  remains for older anchor-only v3 plugin builds and lost/missing
+  earlier member frames. A settle for an unknown turn sweeps nothing; both
+  outcomes and an outcome-less legacy settle sweep alike. A failed send closes
+  its own turn ONLY for the failure that is a good proxy for the agent never
+  having received it — `overloaded`, an ingress rejection. A proxy, not a proof: the
   agent can also reject a message it already admitted (a live same-connection
   retry of an unacked id whose accepted marker was lost), whose turn is already
   running. Anything a settle might still name is otherwise left to the sweep,
@@ -96,8 +97,9 @@
   allowlist, already acked at ingress but dropped without dispatching a turn
   (`packages/plugin/src/inbound.ts` sets `settlementEligible = false` on denial;
   the admission/settlement asymmetry is a separate defect, not addressed here);
-  a second device on the same peer id, whose message can absorb ours into a turn
-  keyed by its own wire id; and a post-admission `overloaded` rejection, closed
+  a lost coalesced-member frame whose remaining frames belong to a second device
+  on the same peer id (or the same shape from an older anchor-only plugin); and a
+  post-admission `overloaded` rejection, closed
   eagerly while its turn is still running. Force-closing is also one-way — no
   inbound frame re-opens a turn, so a mid-turn reconnect leaves `turnActive`
   false for the rest of that turn. Render it as a soft hint, never a hard gate.
@@ -128,8 +130,11 @@
 - Authoritative monotonic send tracker: every user message resolves to an
   observable `queued → sent → accepted → completed` (or `failed{reason,retryable,
   cause,lastAttemptAt}`) — no more console-only drops or fabricated success.
-- `completed` is promoted **only** on an explicit `turn_settled{outcome:"ok"}` for
-  the anchor message; a legacy plugin (no `outcome`) honestly rests at `accepted`.
+- `completed` is promoted **only** when an explicit
+  `turn_settled{outcome:"ok"}` names that message's exact wire id. The current
+  plugin emits one same-outcome frame per coalesced member, anchor last; older
+  anchor-only v3 plugin builds leave non-anchors at `accepted`, and
+  a legacy frame with no `outcome` leaves its named message there too.
 
 ### Fixed
 

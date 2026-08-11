@@ -66,10 +66,11 @@ const MAX_UNACKED = (WebChannelNatsClient as unknown as { MAX_UNACKED: number })
  * A registered wrapper over the fake socket; acks user_messages unless
  * `control.ack` is turned off (the ingress-failure cases below need no ack).
  *
- * The fake server ONLY acks — it never fabricates a `turn_settled` per publish,
- * because the real dispatcher does not do that: buffered messages are coalesced
- * into one turn keyed by the LAST id, so a group emits exactly one settle. Every
- * test below delivers the settles it is modelling by hand.
+ * The fake server ONLY acks — it never fabricates `turn_settled`. The current
+ * dispatcher emits one same-outcome frame per coalesced member, in arrival order
+ * with the LAST-id anchor last. Every test below delivers the frames it models
+ * by hand; the one-frame prefix-sweep cases deliberately cover an older
+ * anchor-only plugin or a missing earlier member frame.
  */
 async function connectWrapper(
   control: { ack: boolean } = { ack: true },
@@ -283,11 +284,10 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     h.wrapper.close();
   });
 
-  // Several turns can be outstanding, and they do NOT settle one-for-one: the
-  // agent buffers messages that arrive while a turn runs and coalesces them into
-  // ONE turn keyed by the LAST id (`inbound-queue.ts` coalesceUserMessages →
-  // `inbound.ts` turnId = message.id). B is therefore never named by any settle.
-  it("a settle sweeps the coalesced prefix — no orphan is left behind", async () => {
+  // Compatibility/fallback: an older plugin emits only the LAST-id anchor for a
+  // coalesced turn, or the current plugin's earlier member frame is lost. The
+  // later anchor must still sweep the prefix so B is not orphaned.
+  it("a legacy/missing-member anchor settle sweeps the coalesced prefix", async () => {
     const h = await connectWrapper();
     h.wrapper.send("A");
     await settle();
@@ -310,9 +310,9 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     expect(h.wrapper.getState().turnActive).toBe(true); // B+C still running
     expect([...openTurnsOf(h.wrapper)]).toEqual([b, c]);
 
-    // The server merged B and C into one turn and settles it under C's id ONLY.
-    // B never gets a settle of its own — without the prefix sweep it would sit in
-    // the set forever on a healthy connection (a permanent false spinner).
+    // Model either an older anchor-only producer or loss of B's current-plugin
+    // member frame: only C's later anchor frame reaches this client. Without the
+    // prefix sweep B would sit in the set forever (a permanent false spinner).
     deliverOut(h.K, { type: "turn_settled", turnId: c, outcome: "ok" });
     await settle();
     expect([...openTurnsOf(h.wrapper)]).toEqual([]);
@@ -320,11 +320,11 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     h.wrapper.close();
   });
 
-  // Same sweep, but the coalesced turn THROWS. `turn_settled{error}` promotes the
-  // anchor receipt to failed{turn-failed} from the top of the reducer; that must
-  // not consume the settle's own id before the prefix sweep at the bottom runs,
-  // or every earlier wireId is stranded on a healthy connection.
-  it("a settle with outcome:error sweeps the coalesced prefix too", async () => {
+  // Same legacy/missing-member fallback, but the coalesced turn THROWS. The
+  // anchor's `turn_settled{error}` promotes its exact receipt to
+  // failed{turn-failed}; that must not consume the settle's own id before the
+  // prefix sweep runs, or every earlier wireId is stranded.
+  it("a legacy/missing-member error settle sweeps the coalesced prefix too", async () => {
     const h = await connectWrapper();
     h.wrapper.send("A");
     await settle();
@@ -342,7 +342,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     await settle();
     expect([...openTurnsOf(h.wrapper)]).toEqual([b, c]);
 
-    // B+C ran as ONE coalesced turn keyed by C, and it failed.
+    // B+C ran as one coalesced turn and only C's anchor frame arrives here.
     deliverOut(h.K, { type: "turn_settled", turnId: c, outcome: "error" });
     await settle();
     expect([...openTurnsOf(h.wrapper)]).toEqual([]); // B swept, not stranded
@@ -354,7 +354,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     h.wrapper.close();
   });
 
-  it("a released held burst is swept by the single settle its coalesced turn emits", async () => {
+  it("a legacy/missing-member anchor settle sweeps a released held burst", async () => {
     const h = await connectWrapper();
     h.wrapper.send("first");
     await settle();
@@ -374,6 +374,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
     expect([...openTurnsOf(h.wrapper)]).toEqual([h1, h2]);
     expect(h.wrapper.getState().turnActive).toBe(true);
 
+    // Model an older anchor-only producer or a lost h1 member frame.
     deliverOut(h.K, { type: "turn_settled", turnId: h2, outcome: "ok" });
     await settle();
     expect([...openTurnsOf(h.wrapper)]).toEqual([]);
@@ -460,7 +461,8 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
       });
       expect(openTurnsOf(h.wrapper).has(w3)).toBe(true); // left for the sweep
 
-      // The agent DID get W3, coalesced {W1,W2,W3}, and settles under the last id.
+      // Model an older anchor-only producer or lost W1/W2 member frames: the
+      // agent got and coalesced {W1,W2,W3}, and W3's anchor frame still arrives.
       deliverOut(h.K, { type: "turn_settled", turnId: w3, outcome: "ok" });
       await settle();
       for (const id of [w1, w2, w3]) expect(openTurnsOf(h.wrapper).has(id)).toBe(false);

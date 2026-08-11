@@ -236,7 +236,7 @@ describe("WebChannelNATSClient — P0-4 receipt + sendState (wrapper)", () => {
   // one `turn_settled` per member wireId (same outcome, anchor last), and this
   // pins that the SHIPPING client already resolves each of them — no client
   // change and no protocol change is needed to fix #99. Characterization of
-  // existing behavior: nothing in `packages/client` moved for this.
+  // existing behavior: no production client behavior changed for this.
   it("#99: one turn_settled per member wireId resolves EVERY receipt of a coalesced burst", async () => {
     const h = await connectWrapper();
     const r1 = h.wrapper.send("m1")!;
