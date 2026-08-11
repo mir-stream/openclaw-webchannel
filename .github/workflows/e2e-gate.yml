@@ -238,6 +238,31 @@ jobs:
         run: bash e2e/local/run-turn-outcome.sh
 
       # ──────────────────────────────────────────────────────────────────────
+      # 8d². Live e2e: multi-assistant-message turn (issue #94 gate)
+      #    In `streaming.mode:"partial"` the channel used to mint ONE draft id
+      #    per TURN and accumulate every assistant message into it; the turn's
+      #    `final` then replaced that merged bubble with the LAST message's text,
+      #    erasing earlier assistant text the user had already watched stream.
+      #    The fix gives each assistant message its own lane, id and terminal
+      #    frame, so a multi-message turn must settle as TWO DISTINCT ids.
+      #    Only a live gateway can stage this: the second assistant message comes
+      #    from core's own agent loop over a real tool call (the echo provider
+      #    answers phase 1 with text + `tool_calls`, core executes `agents_list`
+      #    and comes back for phase 2), which is also the only way to observe how
+      #    core interleaves partials with block drains — the ordering that both
+      #    review rounds on the fix found unit fixtures getting wrong.
+      #    Asserts: >=2 `agent_message` frames with distinct ids, message A
+      #    present and not overwritten by B, model order preserved, and
+      #    `turn_settled{outcome:"ok"}` still delivered (so an unconditional-
+      #    rotation fix cannot pass). The driver logs EVERY inbound frame first.
+      #    Isolated under /tmp/oc-multi-message-e2e (port 18991) — hermetic, no
+      #    secret. Verified load-bearing by revert-check: with the fix reverted
+      #    the harness exits 6. Any non-zero exit FAILS the gate.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: "Live e2e: multi-assistant-message turn settles two ids (#94)"
+        run: bash e2e/local/run-multi-message.sh
+
+      # ──────────────────────────────────────────────────────────────────────
       # 8e. Live e2e: ALL-REAL fusion
       #    Fuses the enrolled-transport server topology with the real-browser
       #    driver: the Chromium peer NKEY-auths to the JWT-auth nats-server AND

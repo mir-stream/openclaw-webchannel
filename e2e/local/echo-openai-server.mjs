@@ -12,6 +12,25 @@
  * #87 turn-outcome harness to drive core's terminal-error path. Unset (the
  * default) means every turn echoes as before.
  *
+ * Set ECHO_MULTI_MSG_MARKER to make a turn carrying that marker produce TWO real
+ * assistant messages instead of one (the #94 multi-message harness). The only way
+ * a provider drives a second assistant message in one turn is a tool call, so the
+ * two phases are:
+ *   phase 1 (no tool result in `messages` yet) → assistant content = message A's
+ *     text PLUS a `tool_calls` entry, `finish_reason:"tool_calls"`;
+ *   phase 2 (a `role:"tool"` message is present) → ordinary assistant content =
+ *     message B's text, `finish_reason:"stop"`.
+ * Core's openai-completions adapter parses streamed `tool_calls` deltas
+ * (node_modules/openclaw/dist/openai-completions-vbhA-xck.js:579-581) and maps
+ * `finish_reason:"tool_calls"` to `stopReason:"toolUse"` (:1017-1018), so this
+ * really does run core's tool loop — it is not a synthetic second message.
+ * ECHO_MULTI_MSG_TOOL must name a tool core ACTUALLY advertises in `body.tools`
+ * and can execute; the default `agents_list` is side-effect-free, takes no
+ * arguments, and touches no filesystem or network state.
+ *
+ * With ECHO_MULTI_MSG_MARKER unset (the default) behaviour is byte-identical to
+ * before this mode existed — every other harness shares this file.
+ *
  * Usage: node e2e/local/echo-openai-server.mjs [port]   (default 18900)
  */
 import { createServer } from "node:http";
@@ -19,6 +38,18 @@ import { createServer } from "node:http";
 const PORT = parseInt(process.argv[2] || process.env.ECHO_PORT || "18900", 10);
 const PREFIX = process.env.ECHO_PREFIX ?? "echo: ";
 const FAIL_MARKER = process.env.ECHO_FAIL_MARKER || "";
+
+// #94 multi-assistant-message mode. All four are inert while the marker is unset.
+const MULTI_MARKER = process.env.ECHO_MULTI_MSG_MARKER || "";
+const MULTI_TOOL = process.env.ECHO_MULTI_MSG_TOOL || "agents_list";
+// A and B must NOT be prefix-related: the plugin's lane rotation reads a partial
+// whose cumulative text stops extending the active lane, and a shrink guard
+// deliberately suppresses rotation for a strict prefix (plan §12.2(1)). Prefix-
+// related fixtures would test the residual, not the boundary.
+const MULTI_TEXT_A = process.env.ECHO_MULTI_MSG_TEXT_A || "ISSUE94_MESSAGE_A checking the roster now.";
+const MULTI_TEXT_B = process.env.ECHO_MULTI_MSG_TEXT_B || "ZZZ94_SECOND_ANSWER here is what came back.";
+
+let multiToolCallSeq = 0;
 
 function lastUserText(messages) {
   if (!Array.isArray(messages)) return "";
@@ -69,22 +100,104 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const reply = `${PREFIX}${lastUserText(body.messages)}`;
     const id = "chatcmpl-echo";
     const created = Math.floor(Date.now() / 1000);
     const model = body.model || "echo";
-
-    if (body.stream) {
+    const sseHead = () =>
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
       });
-      const chunk = (delta, finish = null) =>
-        `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
-      res.write(chunk({ role: "assistant" }));
-      res.write(chunk({ content: reply }));
-      res.write(chunk({}, "stop"));
+    const sseChunk = (delta, finish = null) =>
+      `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+
+    // #94 multi-assistant-message mode. Gated on the marker AND on the request
+    // actually carrying a tool catalogue: an agent turn advertises `tools`, while
+    // core's auxiliary completions (title/summary generation) do not, and driving
+    // a tool call from one of those would deadlock the turn rather than test it.
+    if (
+      MULTI_MARKER &&
+      lastUserText(body.messages).includes(MULTI_MARKER) &&
+      Array.isArray(body.tools) &&
+      body.tools.length > 0
+    ) {
+      const advertised = body.tools.some((t) => t?.function?.name === MULTI_TOOL);
+      if (!advertised) {
+        console.log(
+          `[echo] WARN multi-msg tool ${JSON.stringify(MULTI_TOOL)} is NOT in body.tools ` +
+            `(${body.tools.map((t) => t?.function?.name).join(",")}) — core will not be able to execute it`,
+        );
+      }
+      // Phase is decided by the transcript, not by a counter: once core has run
+      // the tool it feeds the result back as a `role:"tool"` message.
+      const toolResultSeen = Array.isArray(body.messages)
+        && body.messages.some((m) => m && m.role === "tool");
+
+      if (!toolResultSeen) {
+        const callId = `call_issue94_${++multiToolCallSeq}`;
+        console.log(`[echo] multi-msg phase 1 → text A + tool_call ${MULTI_TOOL} (${callId})`);
+        if (body.stream) {
+          sseHead();
+          res.write(sseChunk({ role: "assistant" }));
+          // Split A across two deltas so the partial lane really streams.
+          const cut = Math.ceil(MULTI_TEXT_A.length / 2);
+          res.write(sseChunk({ content: MULTI_TEXT_A.slice(0, cut) }));
+          res.write(sseChunk({ content: MULTI_TEXT_A.slice(cut) }));
+          res.write(sseChunk({
+            tool_calls: [{ index: 0, id: callId, type: "function", function: { name: MULTI_TOOL, arguments: "" } }],
+          }));
+          res.write(sseChunk({ tool_calls: [{ index: 0, function: { arguments: "{}" } }] }));
+          res.write(sseChunk({}, "tool_calls"));
+          res.write("data: [DONE]\n\n");
+          res.end();
+          return;
+        }
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({
+          id, object: "chat.completion", created, model,
+          choices: [{
+            index: 0,
+            message: {
+              role: "assistant",
+              content: MULTI_TEXT_A,
+              tool_calls: [{ id: callId, type: "function", function: { name: MULTI_TOOL, arguments: "{}" } }],
+            },
+            finish_reason: "tool_calls",
+          }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        }));
+        return;
+      }
+
+      console.log(`[echo] multi-msg phase 2 → text B (finish stop)`);
+      if (body.stream) {
+        sseHead();
+        res.write(sseChunk({ role: "assistant" }));
+        const cut = Math.ceil(MULTI_TEXT_B.length / 2);
+        res.write(sseChunk({ content: MULTI_TEXT_B.slice(0, cut) }));
+        res.write(sseChunk({ content: MULTI_TEXT_B.slice(cut) }));
+        res.write(sseChunk({}, "stop"));
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({
+        id, object: "chat.completion", created, model,
+        choices: [{ index: 0, message: { role: "assistant", content: MULTI_TEXT_B }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      }));
+      return;
+    }
+
+    const reply = `${PREFIX}${lastUserText(body.messages)}`;
+
+    if (body.stream) {
+      sseHead();
+      res.write(sseChunk({ role: "assistant" }));
+      res.write(sseChunk({ content: reply }));
+      res.write(sseChunk({}, "stop"));
       res.write("data: [DONE]\n\n");
       res.end();
       console.log(`[echo] stream → ${JSON.stringify(reply)}`);
@@ -106,4 +219,7 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`[echo] fake OpenAI chat-completions on http://127.0.0.1:${PORT}/v1 (prefix=${JSON.stringify(PREFIX)})`);
+  if (MULTI_MARKER) {
+    console.log(`[echo] multi-assistant-message mode armed (marker=${JSON.stringify(MULTI_MARKER)}, tool=${JSON.stringify(MULTI_TOOL)})`);
+  }
 });
