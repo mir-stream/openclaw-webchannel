@@ -334,11 +334,23 @@ transport-generation 격리 — lease claim의 `transportGeneration` 토큰, res
 
 #100에서 위협 모델부터 정리하며, 답이 "실제 위협 없음"이면 그대로 닫는다.
 
-**결과 (2026-08-10): 닫았다 — 구현하지 않는다.** 근거는
-`docs/ISSUE_100_TRANSPORT_GENERATION_THREAT_MODEL.md`. 요약하면 `(account, peerId)`는 검증된 JWT
-`sub`이므로 이미 principal이고, generation을 경계로 삼아도 막히는 오배송이 없는 반면, config가 그대로인
-평범한 재시작 뒤 정상 peer가 재-register로 자기 pending 승인을 되찾는 유일한 경로를 끊어 #81과 같은
-조용한 영구 뮤트를 하나 더 만든다. 재개 조건은 그 문서 §7에 있다.
+**결과 수정 (2026-08-11): #100을 구현 대상으로 유지한다(닫혔다면 재개한다).** 근거는
+`docs/ISSUE_100_TRANSPORT_GENERATION_THREAT_MODEL.md`. `(account, peerId)`만으로는 principal이 완성되지
+않는다. register admission이 signed tenant를 별도로 검증하는데도 session/lease/approval state에는 tenant가
+없어, verifier 설정이 그대로인 `T1/account/P → T2/account/P` reload도 retained G1 approval을 G2로 넘길 수
+있다. 또한 #100의 generation-scoped pending/resolved snapshot까지 적용하면 G2가 G1 approval을 받지 않는
+실질적인 보안 효과가 있으므로 “막히는 오배송 없음”이라는 이전 결론은 철회한다.
+
+다만 raw transport 객체 identity는 경계로 쓰기에 너무 좁다. #100의 stable authorization-scope
+fingerprint는 최소한 exact tenant, account identity, issuer/audience/JWKS configuration, `requirePoP` policy를
+포함한다. 이 목록은 하한이다. `dmSecurity`/`allowFrom`, effective approval approvers(`ownerAllowFrom` fallback
+포함), `identityLinks`/bindings처럼 등록·수신·결정 권한이나 routing identity를 바꾸는 입력도 전수 감사해
+token에 포함하거나 명시적 reauthorization semantics를 정해야 한다. 같은-scope reload도 정의된
+reauthorization을 통과할 때 정상 snapshot 복구를 허용하고, scope가 바뀌거나 reauthorization이 실패한 경우
+fallback·fast path·snapshot·결정 역경로를 모두 fail-closed 한다.
+coordinator의 기존 full-config hash는 이 상태에 전달되지 않고 너무 넓어 직접 대체재가 아니다. tenant-aware
+core session/history namespace는 별도 [#112](https://github.com/mir-stream/openclaw-webchannel/issues/112)가
+소유한다.
 
 ---
 
