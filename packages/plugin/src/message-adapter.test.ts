@@ -201,7 +201,9 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it("M5: repeated indexed and indexless callbacks remain body-free ordering state", async () => {
+  it("M5: repeated indexed and indexless callbacks are silent until actual delivery", async () => {
+    // The callback input has index/notice metadata but no body; actual wire text
+    // enters this controller through `deliverAuthorizedBlock` below.
     for (const assistantMessageIndex of [0, undefined]) {
       const h = makeDraftHarness();
       h.draft.handleAssistantMessageBoundary();
@@ -248,7 +250,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
-  it("M6b: an indexed late A reservation orders fresh fallback before B", async () => {
+  it("M6b: an indexed late A reservation keeps B behind the terminal epoch", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.handleAssistantMessageBoundary();
@@ -259,9 +261,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await expect(h.draft.deliverAuthorizedBlock({ text: "postHookA" })).resolves.toBe(true);
     expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA"]);
     h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
-    expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA", "B partial"]);
+    expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA"]);
 
     await h.draft.finalize("B final");
+    expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA", "B final"]);
     expect(successfulIds(h.frames)).toHaveLength(2);
   });
 
@@ -282,8 +285,9 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
   });
 
   it("M6d: the controller publishes only the rewritten actual payload", async () => {
-    // Hook/media/TTS rewrite wiring belongs to inbound; the controller half
-    // records no pre-hook body and receives only the post-hook text to publish.
+    // `noteBlockReplyQueued` has no body parameter. This controller fixture
+    // therefore supplies post-hook text only through `deliverAuthorizedBlock`;
+    // hook/media/TTS rewrite coverage belongs to inbound.
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
@@ -360,10 +364,11 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     rewritten.draft.noteBlockReplyQueued({ isStatusNotice: true });
     await rewritten.draft.deliverAuthorizedBlock({ text: "rewritten non-notice" });
     expect(rewritten.frames.at(-1)?.id).not.toBe(laneId);
-    expect(rewritten.draft.snapshotText()).toBe("lane");
+    rewritten.draft.pushAnswerText({ text: "lane later" });
+    expect(rewritten.frames.at(-1)).toEqual({ type: "progress", id: laneId, text: "lane later" });
   });
 
-  it("M6h: indexed lifecycle cleanup releases B; ambiguous cleanup waits for drain", async () => {
+  it("M6h: indexed cleanup retires records while an empty predecessor waits for drain", async () => {
     for (const lifecycle of ["skip", "cancel"] as const) {
       const h = makeDraftHarness();
       h.draft.handleAssistantMessageBoundary();
@@ -371,6 +376,8 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       h.draft.pushAnswerText({ text: "B" });
       h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
       h.draft.noteDeliveryLifecycle(lifecycle, { assistantMessageIndex: 0 });
+      expect(h.frames).toEqual([]);
+      await h.draft.drain();
       expect(h.frames.map((frame) => frame.text)).toEqual(["B"]);
     }
 
@@ -382,6 +389,8 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     });
     cleanupBeforeBoundary.draft.handleAssistantMessageBoundary();
     cleanupBeforeBoundary.draft.pushAnswerText({ text: "B after early cleanup" });
+    expect(cleanupBeforeBoundary.frames).toEqual([]);
+    await cleanupBeforeBoundary.draft.drain();
     expect(cleanupBeforeBoundary.frames.map((frame) => frame.text)).toEqual([
       "B after early cleanup",
     ]);
@@ -406,6 +415,95 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(duplicate.frames).toEqual([]);
     await duplicate.draft.drain();
     expect(duplicate.frames.map((frame) => frame.text)).toEqual(["B"]);
+  });
+
+  it("M6h/F3: lifecycle notice flags retire only a matching sole record", () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "A" });
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0, isStatusNotice: true });
+    h.draft.noteDeliveryLifecycle("skip", {
+      assistantMessageIndex: 0,
+      isStatusNotice: true,
+    });
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B" });
+
+    expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A"]);
+    h.draft.noteDeliveryLifecycle("cancel", { assistantMessageIndex: 0 });
+    expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "B"]);
+  });
+
+  it("M6h/F3: block and notice records at one index remain ambiguous as a union", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "A" });
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0, isStatusNotice: true });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B partial" });
+
+    h.draft.noteDeliveryLifecycle("skip", {
+      assistantMessageIndex: 0,
+      isStatusNotice: true,
+    });
+    await h.draft.deliverAuthorizedBlock({ text: "F-A" });
+    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "F-A"]);
+
+    await h.draft.drain();
+    expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "F-A", "B partial"]);
+  });
+
+  it("M6h/F4: a first indexed retirement keeps the lane open to a later indexless callback", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B partial" });
+
+    await h.draft.deliverAuthorizedBlock({ text: "F-A1" });
+    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    expect(h.frames.map((frame) => frame.text)).toEqual(["F-A1"]);
+
+    h.draft.noteBlockReplyQueued({});
+    await h.draft.deliverAuthorizedBlock({ text: "F-A2" });
+    h.draft.noteDeliveryLifecycle("settled", {});
+    expect(h.frames.map((frame) => frame.text)).toEqual(["F-A1", "F-A2"]);
+
+    await h.draft.finalize("B final");
+    expect(h.frames.map((frame) => frame.text)).toEqual(["F-A1", "F-A2", "B final"]);
+  });
+
+  it("M6h/F6: settled lifecycle consumes one recorded actual-block disposition", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "A" });
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B" });
+
+    await h.draft.deliverAuthorizedBlock({ text: "actual-1" });
+    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "actual-1", "B"]);
+
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "C" });
+    const beforeDuplicateSettled = [...h.frames];
+    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    expect(h.frames).toEqual(beforeDuplicateSettled);
+
+    await h.draft.drain();
+    expect(h.frames.map((frame) => frame.text)).toEqual([
+      "A",
+      "A",
+      "actual-1",
+      "B",
+      "B",
+      "C",
+    ]);
   });
 
   it("M6i: independent true commits P while false/throw roll back and keep the queue alive", async () => {
@@ -495,7 +593,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       finalizeDraft: (_peer: string, id: string, text: string) => {
         attempts.push({ type: "final", id, text });
         if (text === "ordinary") reentrant ??= draft.finalize("re-entrant");
-        return true;
+        return text !== "cleanup";
       },
       sendProgress: () => true,
     } as unknown as WebChannelPeerChannel;
@@ -504,15 +602,40 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       sessionKey: "peer-1",
       channelConfig: {},
       throttleMs: 0,
+      logger: { warn: () => {} },
     });
 
     await expect(draft.finalize("ordinary")).resolves.toBe(true);
-    await expect(reentrant).resolves.toBe(true);
-    await expect(draft.finalize("cleanup")).resolves.toBe(true);
+    await expect(reentrant).resolves.toBe(false);
+    await expect(draft.finalize("cleanup")).resolves.toBe(false);
     await expect(draft.deliverIndependentFinal({ text: "extra" })).resolves.toBe(true);
 
-    expect(attempts.map((attempt) => attempt.text)).toEqual(["ordinary", "extra"]);
-    expect(attempts[0]!.id).not.toBe(attempts[1]!.id);
+    expect(attempts.map((attempt) => attempt.text)).toEqual(["ordinary", "cleanup", "extra"]);
+    expect(new Set(attempts.map((attempt) => attempt.id)).size).toBe(3);
+  });
+
+  it("M10: a later final after a failed lane settle reports its own successful send", async () => {
+    const h = makeDraftHarness({
+      decide: (attempt) => attempt.text !== "ordinary failed",
+    });
+
+    await expect(h.draft.finalize("ordinary failed")).resolves.toBe(false);
+    await expect(h.draft.finalize("timeout warning")).resolves.toBe(true);
+
+    expect(h.attempts.map((attempt) => attempt.text)).toEqual([
+      "ordinary failed",
+      "timeout warning",
+    ]);
+    expect(h.attempts[0]!.id).not.toBe(h.attempts[1]!.id);
+  });
+
+  it("an ordinary terminal slot disarms the legacy started cleanup signal", async () => {
+    const h = makeDraftHarness();
+    h.draft.pushAnswerText({ text: "visible partial" });
+    expect(h.draft.started).toBe(true);
+
+    await expect(h.draft.finalize("ordinary final")).resolves.toBe(true);
+    expect(h.draft.started).toBe(false);
   });
 });
 
@@ -671,9 +794,12 @@ describe("ProgressDraftController — provisional preview transactions", () => {
       const provisionalId = h.frames[0]!.id;
       await deliverFirst(h);
       await h.draft.deliverIndependentFinal({ text: "second" });
-      expect(h.frames.find((frame) => frame.text === "first")!.id).toBe(provisionalId);
-      expect(h.frames.find((frame) => frame.text === "second")!.id).not.toBe(provisionalId);
-      expect(h.draft.snapshotText()).toBe("");
+      h.draft.pushAnswerText({ text: "lane after independent" });
+      const first = h.frames.find((frame) => frame.text === "first")!;
+      const second = h.frames.find((frame) => frame.text === "second")!;
+      const lane = h.frames.find((frame) => frame.text === "lane after independent")!;
+      expect(first.id).toBe(provisionalId);
+      expect(new Set([first.id, second.id, lane.id]).size).toBe(3);
     }
 
     const ordered = makeDraftHarness();
@@ -728,6 +854,16 @@ describe("ProgressDraftController — provisional preview transactions", () => {
     independent.draft.pushAnswerText({ text: "B" });
     expect(independent.frames.filter((frame) => frame.id === independentP)).toHaveLength(2);
     expect(independent.frames.find((frame) => frame.text === "B")!.id).not.toBe(independentP);
+  });
+
+  it("M13f: a successful fresh-id delivery suppresses later scaffold creation", async () => {
+    const h = makeDraftHarness();
+    await expect(h.draft.deliverAuthorizedBlock({ text: "durable first" })).resolves.toBe(true);
+    h.draft.pushEvent(toolStart("late-tool"));
+    await h.draft.flush();
+
+    expect(h.attempts).toHaveLength(1);
+    expect(h.attempts[0]).toMatchObject({ type: "final", text: "durable first" });
   });
 
   it("M13g: failed first progress/final lane frames leave P for B and are not retried", async () => {
@@ -801,9 +937,30 @@ describe("ProgressDraftController — provisional preview transactions", () => {
     const h = makeDraftHarness();
     h.draft.pushEvent(toolStart());
     const preview = h.frames[0]!;
+    expect(h.draft.started).toBe(true);
     expect(h.draft.snapshotText()).toBe("");
     await h.draft.drain();
     expect(h.frames.at(-1)).toEqual({ type: "final", id: preview.id, text: preview.text });
+  });
+
+  it("an empty independent payload logs a skip without reporting transport failure", async () => {
+    const warn = vi.fn();
+    const h = makeDraftHarness({ logger: { warn } });
+
+    await expect(h.draft.deliverIndependentFinal({ text: "" })).resolves.toBe(false);
+    expect(h.attempts).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("skipped empty text without a transport attempt"),
+    );
+  });
+
+  it("drain after stop does not emit a terminal frame", async () => {
+    const h = makeDraftHarness();
+    h.draft.pushAnswerText({ text: "visible partial" });
+    h.draft.stop();
+    await h.draft.drain();
+
+    expect(h.attempts.map((attempt) => attempt.type)).toEqual(["progress"]);
   });
 
   it("delta updates extend only the current lane", () => {
@@ -944,10 +1101,8 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
   });
 
   it("handles three bursts with whitespace BETWEEN them in btw's raw accumulator", () => {
-    // Thinking models emit "\n" / "\n\n" between blocks, so btw's raw cumulative
-    // payload carries inter-burst whitespace. The stale prefix must be the raw
-    // payload (not our trimmed display text), or burst 3's prefix match fails and
-    // its lane shows the fully duplicated text.
+    // These inputs model btw's raw cumulative payload with inter-burst
+    // whitespace, including that whitespace in the third burst's prefix.
     const { controller, frames } = setup();
     controller.push({ text: "AAA" });
     controller.endBurst();
@@ -959,9 +1114,8 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
   });
 
   it("preserves the stale prefix through an all-stale burst (endBurst early-return)", () => {
-    // A burst whose every payload strips to nothing sends no frame, so its
-    // endBurst early-returns on empty currentText — the PRIOR burst's stale
-    // prefix must survive so the NEXT real burst still strips correctly.
+    // The middle burst strips to empty and emits no frame before `endBurst`;
+    // the final input still carries the prior raw prefix.
     const { controller, frames } = setup();
     controller.push({ text: "AAA" });
     controller.endBurst();

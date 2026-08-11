@@ -153,7 +153,6 @@ type DeliveryFailureKind = "false" | "throw";
 
 type AssistantDraftLane = {
   generation: number;
-  assistantMessageIndex?: number;
   /** Assigned only after a successful first wire frame for this lane. */
   id?: string;
   /** A provisional id is tentative for the duration of one send transaction. */
@@ -203,15 +202,11 @@ type TentativeBlockReservation = {
 };
 
 type TentativeNoticeToken = {
-  token: string;
-  noticeKind: "status" | "fallback" | "compaction";
   assistantMessageIndex?: number;
   state: "pending" | "retired";
 };
 
 type AuthorizedBlockDisposition = {
-  sequence: number;
-  route: "provisional-claim" | "fresh-fallback";
   settled: boolean;
 };
 
@@ -281,7 +276,13 @@ export type PartialAnswerUpdate = { text?: string; delta?: string; replace?: tru
  * they are delivered independently with their own sequence and wire id.
  */
 export type ProgressDraftController = {
-  /** True after any transport call for this controller has returned true. */
+  /**
+   * True after a successful frame while the ordinary-answer terminal slot is
+   * still open. An ownerless provisional tool preview can therefore make this
+   * true while `snapshotText()` is empty. A silent-completion caller must use
+   * `drain()` so a lone preview settles as itself; it must not finalize an empty
+   * lane with a synthetic stop marker.
+   */
   readonly started: boolean;
   /** Queue one tool/item event for the provisional preview writer. */
   pushEvent(input: ChannelProgressDraftLineInput): void;
@@ -310,7 +311,7 @@ export type ProgressDraftController = {
   /** Retire unambiguous callback lifecycle state without selecting an owner. */
   noteDeliveryLifecycle(
     kind: "skip" | "cancel" | "settled" | "error",
-    input: { assistantMessageIndex?: number },
+    input: { assistantMessageIndex?: number } & NoticeFlags,
   ): void;
   /** Use the current lane's one ordinary-answer terminal slot. */
   finalize(text: string): Promise<boolean>;
@@ -325,7 +326,12 @@ export type ProgressDraftController = {
   noteLeadingTerminalError(): void;
   /** Retire tentative state and settle real text (or a lone tool preview). */
   drain(): Promise<void>;
-  /** Side-effect-free snapshot of the current assistant lane only. */
+  /**
+   * Side-effect-free snapshot of the current assistant lane only. This can be
+   * empty while `started` is true because a provisional tool preview is not
+   * lane text; silent completion must call `drain()` rather than
+   * `finalize(snapshotText() || marker)`.
+   */
   snapshotText(): string;
   /** Flush the newest throttled progress frame through the serial queue. */
   flush(): Promise<void>;
@@ -391,6 +397,7 @@ export function createProgressDraftController(params: {
     stopped: false,
   };
   const queue: SerialQueueState = { running: false, tasks: [] };
+  let ordinaryFinalSendInProgress = false;
 
   const warn = (message: string): void => {
     try {
@@ -431,15 +438,12 @@ export function createProgressDraftController(params: {
 
   const currentLane = (): AssistantDraftLane => state.lanes[state.lanes.length - 1]!;
 
-  const noticeKind = (input: NoticeFlags): TentativeNoticeToken["noticeKind"] | undefined => {
-    if (input.isStatusNotice) return "status";
-    if (input.isFallbackNotice) return "fallback";
-    if (input.isCompactionNotice) return "compaction";
-    return undefined;
-  };
+  const isNotice = (input: NoticeFlags): boolean =>
+    input.isStatusNotice === true ||
+    input.isFallbackNotice === true ||
+    input.isCompactionNotice === true;
 
-  const nextToken = (prefix: "block" | "notice"): string =>
-    `${prefix}-${++state.nextTokenSequence}`;
+  const nextBlockToken = (): string => `block-${++state.nextTokenSequence}`;
 
   const clearProgressTimer = (): void => {
     if (state.progressTimer === undefined) return;
@@ -486,6 +490,9 @@ export function createProgressDraftController(params: {
       };
       if (lane) lane.tentativeProvisionalId = undefined;
     }
+    // Every successful durable delivery ends the scaffold-writing phase. A
+    // fresh-id success must also invalidate it, or a later tool event could
+    // create a second scaffold after durable output already exists.
     invalidateScaffoldWriter();
     state.durableDeliverySucceeded = true;
     state.started = true;
@@ -550,18 +557,15 @@ export function createProgressDraftController(params: {
   };
 
   const sendIndependent = (text: string, recordBlockDisposition = false): boolean => {
-    if (!text) return false;
+    if (!text) {
+      warn("independent delivery skipped empty text without a transport attempt");
+      return false;
+    }
     const sequence = ++state.nextDeliverySequence;
     const owner: ProvisionalClaimOwner = { kind: "independent", deliverySequence: sequence };
     const reservation = reserveProvisional(owner);
-    let disposition: AuthorizedBlockDisposition | undefined;
     if (recordBlockDisposition) {
-      disposition = {
-        sequence,
-        route: reservation.usesPreview ? "provisional-claim" : "fresh-fallback",
-        settled: false,
-      };
-      state.blockDispositions.push(disposition);
+      state.blockDispositions.push({ settled: false });
     }
     let sent = false;
     let failure: DeliveryFailureKind | undefined;
@@ -571,7 +575,6 @@ export function createProgressDraftController(params: {
     } catch {
       failure = "throw";
     }
-    if (disposition) disposition.settled = true;
     if (sent) {
       commitReservation(reservation);
       return true;
@@ -606,8 +609,9 @@ export function createProgressDraftController(params: {
     if (lane.settleOutcome !== undefined) return lane.settleOutcome;
     if (lane.settleResult) return false;
 
-    // Arm the per-lane latch before the synchronous transport call. A
-    // re-entrant settle observes this promise and cannot emit a second frame.
+    // Record lane settlement before the synchronous transport call. Internal
+    // callers cannot emit a second lane terminal frame; `finalize` separately
+    // distinguishes call-stack re-entry from later independent payloads.
     let resolveSettle!: (value: boolean) => void;
     lane.settleResult = new Promise<boolean>((resolve) => {
       resolveSettle = resolve;
@@ -729,18 +733,30 @@ export function createProgressDraftController(params: {
     }
   };
 
+  const assistantMessageIndexMatchesLane = (
+    assistantMessageIndex: number,
+    lane: AssistantDraftLane,
+  ): boolean => {
+    // Core exposes no index-base metadata. We use the observed 0-based,
+    // gapless contract (`assistantMessageIndex === generation`) only as an
+    // ordering barrier. With a 1-based producer the reservation can attach to
+    // the following lane and withhold a later partial until terminal drain;
+    // that turn-bounded delay is safer than guessing an owner or index base.
+    return assistantMessageIndex === lane.generation;
+  };
+
   const attachIndexedReservations = (lane: AssistantDraftLane): void => {
     if (!state.lateReservationEpochOpen) return;
     for (const reservation of state.blockReservations) {
       if (
         reservation.state !== "pending" ||
         reservation.barrierGeneration !== undefined ||
-        reservation.assistantMessageIndex !== lane.generation
+        reservation.assistantMessageIndex === undefined ||
+        !assistantMessageIndexMatchesLane(reservation.assistantMessageIndex, lane)
       ) {
         continue;
       }
       reservation.barrierGeneration = lane.generation;
-      lane.assistantMessageIndex ??= reservation.assistantMessageIndex;
       lane.tentativeBarrierReservationIds.push(reservation.token);
     }
   };
@@ -774,11 +790,41 @@ export function createProgressDraftController(params: {
     lane.tentativeBarrierReservationIds = lane.tentativeBarrierReservationIds.filter(
       (token) => token !== reservation.token,
     );
-    if (lane.tentativeBarrierReservationIds.length === 0) {
-      lane.acceptsLateIndexlessReservations = false;
-      if (!lane.answerText && lane.resolution !== "materialized") {
-        lane.resolution = "empty";
-      }
+  };
+
+  type OutstandingLifecycleRecord =
+    | { kind: "block"; record: TentativeBlockReservation }
+    | { kind: "notice"; record: TentativeNoticeToken };
+
+  const outstandingRecordsAtIndex = (assistantMessageIndex: number): OutstandingLifecycleRecord[] => [
+    ...state.blockReservations
+      .filter(
+        (reservation) =>
+          reservation.state === "pending" &&
+          reservation.assistantMessageIndex === assistantMessageIndex,
+      )
+      .map((record) => ({ kind: "block" as const, record })),
+    ...state.noticeTokens
+      .filter(
+        (token) =>
+          token.state === "pending" && token.assistantMessageIndex === assistantMessageIndex,
+      )
+      .map((record) => ({ kind: "notice" as const, record })),
+  ];
+
+  const retireSoleLifecycleRecord = (
+    assistantMessageIndex: number | undefined,
+    expectedKind?: OutstandingLifecycleRecord["kind"],
+  ): void => {
+    if (assistantMessageIndex === undefined) return;
+    const candidates = outstandingRecordsAtIndex(assistantMessageIndex);
+    if (candidates.length !== 1) return;
+    const candidate = candidates[0]!;
+    if (expectedKind !== undefined && candidate.kind !== expectedKind) return;
+    if (candidate.kind === "block") {
+      retireReservation(candidate.record);
+    } else {
+      candidate.record.state = "retired";
     }
   };
 
@@ -853,7 +899,7 @@ export function createProgressDraftController(params: {
 
   return {
     get started() {
-      return state.started;
+      return state.started && !state.finalReconciliation.ordinaryAnswerSettled;
     },
     pushEvent: (input) => {
       void enqueue(
@@ -917,7 +963,6 @@ export function createProgressDraftController(params: {
 
           lane.answerText = cleaned;
           lane.answerRevision += 1;
-          lane.lastFailedDelivery = undefined;
           if (lane.resolution === "empty" || lane.resolution === "unresolved") {
             lane.resolution = "open";
           }
@@ -950,11 +995,8 @@ export function createProgressDraftController(params: {
         "queued block observation",
         () => {
           // Classification precedes every lane lookup or reservation decision.
-          const classifiedNotice = noticeKind(input);
-          if (classifiedNotice) {
+          if (isNotice(input)) {
             state.noticeTokens.push({
-              token: nextToken("notice"),
-              noticeKind: classifiedNotice,
               assistantMessageIndex: input.assistantMessageIndex,
               state: state.lateReservationEpochOpen ? "pending" : "retired",
             });
@@ -962,7 +1004,7 @@ export function createProgressDraftController(params: {
           }
 
           const reservation: TentativeBlockReservation = {
-            token: nextToken("block"),
+            token: nextBlockToken(),
             assistantMessageIndex: input.assistantMessageIndex,
             state: state.lateReservationEpochOpen ? "pending" : "retired",
           };
@@ -972,11 +1014,8 @@ export function createProgressDraftController(params: {
           let barrierLane: AssistantDraftLane | undefined;
           if (input.assistantMessageIndex !== undefined) {
             barrierLane = state.lanes.find(
-              (lane) =>
-                lane.assistantMessageIndex === input.assistantMessageIndex ||
-                lane.generation === input.assistantMessageIndex,
+              (lane) => assistantMessageIndexMatchesLane(input.assistantMessageIndex!, lane),
             );
-            if (barrierLane) barrierLane.assistantMessageIndex ??= input.assistantMessageIndex;
           } else {
             const unresolvedCandidates = state.lanes.filter(
               (lane) => lane.resolution === "unresolved",
@@ -1003,37 +1042,28 @@ export function createProgressDraftController(params: {
     deliverAuthorizedBlock: (input) =>
       enqueue(
         "authorized block delivery",
-        () => {
-          // Re-classify the wire-authoritative payload before touching lane or
-          // reservation state. Both notice and non-notice blocks use the same
-          // independent claim-or-fresh transaction.
-          const actualNotice = noticeKind(input);
-          if (actualNotice) return sendIndependent(input.text, true);
-          return sendIndependent(input.text, true);
-        },
+        () => sendIndependent(input.text, true),
         false,
       ),
     noteDeliveryLifecycle: (kind, input) => {
       void enqueue(
         `delivery lifecycle ${kind}`,
         () => {
+          const classifiedNotice =
+            kind === "skip" || kind === "cancel" ? isNotice(input) : false;
           if (kind === "error") {
             warn("delivery adapter reported an error; ambiguous reservations await terminal drain");
-          }
-          const index = input.assistantMessageIndex;
-          if (index !== undefined) {
-            const reservations = state.blockReservations.filter(
-              (reservation) =>
-                reservation.state === "pending" &&
-                reservation.assistantMessageIndex === index,
+          } else if (kind === "settled") {
+            const disposition = state.blockDispositions.find((candidate) => !candidate.settled);
+            if (disposition) {
+              disposition.settled = true;
+              retireSoleLifecycleRecord(input.assistantMessageIndex);
+            }
+          } else {
+            retireSoleLifecycleRecord(
+              input.assistantMessageIndex,
+              classifiedNotice ? "notice" : "block",
             );
-            if (reservations.length === 1) retireReservation(reservations[0]!);
-
-            const notices = state.noticeTokens.filter(
-              (token) =>
-                token.state === "pending" && token.assistantMessageIndex === index,
-            );
-            if (notices.length === 1) notices[0]!.state = "retired";
           }
           releaseReadyLanes();
         },
@@ -1041,21 +1071,24 @@ export function createProgressDraftController(params: {
       );
     },
     finalize: (text) => {
-      const lane = currentLane();
-      if (lane.settleResult) return lane.settleResult;
+      // Queue serialization would erase the fact that this call was made from
+      // inside the current lane's synchronous transport send. Capture only that
+      // call-stack fact; all reconciliation and state mutation stays queued.
+      const reentrantOrdinarySettle = ordinaryFinalSendInProgress;
       return enqueue(
         "ordinary answer final",
         () => {
           const active = currentLane();
-          if (active.settleOutcome !== undefined) return active.settleOutcome;
-          if (active.settleResult) return false;
+          if (reentrantOrdinarySettle) return false;
+          if (active.settleResult && active.settleOutcome === undefined) return false;
           if (!text) {
             terminalDrain(false);
             return false;
           }
           if (
             state.finalReconciliation.leadingTerminalErrorSeen ||
-            state.finalReconciliation.ordinaryAnswerSettled
+            state.finalReconciliation.ordinaryAnswerSettled ||
+            active.settleOutcome !== undefined
           ) {
             return deliverTerminalIndependent(text);
           }
@@ -1063,11 +1096,15 @@ export function createProgressDraftController(params: {
           state.finalReconciliation.ordinaryAnswerSettled = true;
           active.answerText = text;
           active.answerRevision += 1;
-          active.lastFailedDelivery = undefined;
           discardPendingProgress(
             (frame) => frame.kind === "lane" && frame.generation === active.generation,
           );
-          return settleLane(active, text);
+          ordinaryFinalSendInProgress = true;
+          try {
+            return settleLane(active, text);
+          } finally {
+            ordinaryFinalSendInProgress = false;
+          }
         },
         false,
       );
@@ -1075,13 +1112,7 @@ export function createProgressDraftController(params: {
     deliverIndependentFinal: (input) =>
       enqueue(
         "independent final delivery",
-        () => {
-          // The actual flags, not any earlier callback classification, decide
-          // that this payload is independent. Terminal delivery also closes the
-          // late-reservation epoch before sending.
-          noticeKind(input);
-          return deliverTerminalIndependent(input.text);
-        },
+        () => deliverTerminalIndependent(input.text),
         false,
       ),
     noteLeadingTerminalError: () => {
@@ -1099,6 +1130,7 @@ export function createProgressDraftController(params: {
       enqueue(
         "terminal draft drain",
         () => {
+          if (state.stopped) return;
           clearProgressTimer();
           state.pendingProgress = undefined;
           terminalDrain(true);
