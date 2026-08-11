@@ -569,10 +569,11 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
       h.wrapper.close();
     });
 
-    // The other half of the same guard: if that listener also SENDS, the
-    // replacement lifecycle owns a live turn, and the trailing flip must not
-    // publish a stale `turnActive:false` over it.
-    it("close() does not clear a turn the reopening listener started", async () => {
+    // The other half of the same guard: a send admitted by the reopening
+    // listener belongs to the replacement lifecycle. #81 now holds it until the
+    // replacement session exists, so the old turn closes first and the new turn
+    // opens only when that held send is actually published.
+    it("close() hands turn ownership to the reopening listener's published replacement", async () => {
       const h = await connectWrapper();
       h.wrapper.send("in flight");
       await settle();
@@ -588,12 +589,75 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
 
       h.wrapper.close();
       expect(reopened).toBe(true);
-      const replacement = h.wrapper.getState().messages.find((m) => m.text === "replacement")!;
-      expect([...openTurnsOf(h.wrapper)]).toEqual([replacement.wireId]); // only the new one
-      expect(h.wrapper.getState().turnActive).toBe(true); // the replacement owns it
+      let replacement = h.wrapper.getState().messages.find((m) => m.text === "replacement")!;
+      expect(replacement.pending).toBe(true);
+      expect(replacement.wireId).toBeUndefined();
+      expect([...openTurnsOf(h.wrapper)]).toEqual([]);
+      expect(h.wrapper.getState().turnActive).toBe(false); // the old turn is gone
+
+      await settle();
+      replacement = h.wrapper.getState().messages.find((m) => m.text === "replacement")!;
+      expect(replacement.pending).not.toBe(true);
+      expect(replacement.wireId).toBeDefined();
+      expect([...openTurnsOf(h.wrapper)]).toEqual([replacement.wireId]);
+      expect(h.wrapper.getState().turnActive).toBe(true); // the published replacement owns it
 
       unsubscribe();
       h.wrapper.close();
+    });
+
+    it("preserves turn eligibility for publishes staged in the replacement FIFO", async () => {
+      const h = await connectWrapper();
+      h.wrapper.send("old turn");
+      await settle();
+      expect(h.wrapper.getState().turnActive).toBe(true);
+
+      const inner = (h.wrapper as unknown as { client: { connect: () => void } }).client;
+      const realInnerConnect = inner.connect.bind(inner);
+      let injected = false;
+      const connectSpy = vi.spyOn(inner, "connect").mockImplementation(() => {
+        if (!injected) {
+          injected = true;
+          // Both calls occur while the replacement FIFO is being committed.
+          // Control-lane text must remain non-settling; ordinary text must open.
+          h.wrapper.send("/stop");
+          h.wrapper.send("replacement from dial");
+        }
+        realInnerConnect();
+      });
+
+      let reopened = false;
+      const unsubscribe = h.wrapper.subscribe((state) => {
+        if (reopened || state.turnActive !== false) return;
+        reopened = true;
+        h.wrapper.connect();
+      });
+
+      try {
+        h.wrapper.close();
+        expect(reopened).toBe(true);
+        expect(injected).toBe(true);
+
+        const stop = h.wrapper.getState().messages.find((m) => m.text === "/stop")!;
+        const replacement = h.wrapper.getState().messages.find(
+          (m) => m.text === "replacement from dial",
+        )!;
+        expect(stop.wireId).toBeDefined();
+        expect(replacement.wireId).toBeDefined();
+        expect([...openTurnsOf(h.wrapper)]).toEqual([replacement.wireId]);
+        expect(openTurnsOf(h.wrapper).has(stop.wireId!)).toBe(false);
+        expect(h.wrapper.getState().turnActive).toBe(true);
+
+        await settle();
+        expect(h.wrapper.getState().turnActive).toBe(true); // an ack is not a settle
+        deliverOut(h.K, { type: "turn_settled", turnId: replacement.wireId, outcome: "ok" });
+        await settle();
+        expect(h.wrapper.getState().turnActive).toBe(false);
+      } finally {
+        unsubscribe();
+        connectSpy.mockRestore();
+        h.wrapper.close();
+      }
     });
   });
 

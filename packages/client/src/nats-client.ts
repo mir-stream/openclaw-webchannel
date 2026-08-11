@@ -293,12 +293,14 @@ type UnackedLedgerEntry = {
   message: Extract<OutboundMessage, { type: "user_message" }>;
   retryCount: number;
   nextRetryAt: number | null;
+  published: boolean;
 };
 
 type LedgerSchedulingSnapshot = Array<{
   id: string;
   entry: UnackedLedgerEntry;
   nextRetryAt: number | null;
+  published: boolean;
 }>;
 
 // ---------------------------------------------------------------------------
@@ -1292,8 +1294,7 @@ export class WebChannelNatsClient {
         // Explicit close and terminal teardown retire the episode elsewhere.
         if (
           !this.disconnected && !this.terminalReached
-          && this.ackStallSinceAt !== null
-          && this.unackedLedger.size > 0
+          && this.hasPublishedUnackedOwnership()
           && !this.ackStallRecoveryIssued
         ) {
           this.ackStallMutationEpoch++;
@@ -1499,7 +1500,7 @@ export class WebChannelNatsClient {
    */
   requestApplicationRecovery(): boolean {
     if (this.disconnected || this.terminalReached) return false;
-    if (this.ackStallSinceAt !== null && !this.ackStallRecoveryIssued) {
+    if (this.hasPublishedUnackedOwnership() && !this.ackStallRecoveryIssued) {
       this.ackStallMutationEpoch++;
       this.ackStallRecoveryIssued = true;
     }
@@ -1644,7 +1645,7 @@ export class WebChannelNatsClient {
   /**
    * Detach a complete authenticated result frame before tracker fanout. Only a
    * frame that owned at least one ledger id on entry proves application ingress
-   * and starts a fresh interval for any work that remains.
+   * and starts a fresh interval for any PUBLISHED work that remains.
    */
   private drainOwnedResult(frameIds: string[], apply: (id: string) => void): void {
     const ownedResult = frameIds.some((id) => this.unackedLedger.has(id));
@@ -1662,13 +1663,17 @@ export class WebChannelNatsClient {
     }
 
     const resultEpoch = ++this.ackStallMutationEpoch;
-    const emptyAfterDetach = this.unackedLedger.size === 0;
-    // A final result retires every episode field before the reentrant clear hook.
-    // With remaining ownership, resultEpoch already invalidates the old timer
-    // semantically, while keeping the old timestamp visible lets a same-episode
-    // nested send join without creating a competing episode. The fresh result
-    // age is committed after cancellation below.
-    if (emptyAfterDetach) {
+    const publishedOwnershipRemains = this.hasPublishedUnackedOwnership();
+    // A final PUBLISHED result retires every episode field before the reentrant
+    // clear hook. A null retry deadline is provisional pre-publish ownership
+    // installed by seal(); it stays ledgered for that seal's exact rollback, but
+    // cannot start or preserve an acknowledgement-stall episode before its first
+    // successful raw publish. With genuinely published ownership remaining,
+    // resultEpoch already invalidates the old timer semantically, while keeping
+    // the old timestamp visible lets a same-episode nested send join without
+    // creating a competing episode. The fresh result age is committed after
+    // cancellation below.
+    if (!publishedOwnershipRemains) {
       this.ackStallSinceAt = null;
       this.ackStallRecoveryIssued = false;
     }
@@ -1679,18 +1684,18 @@ export class WebChannelNatsClient {
     let postCommitTimerGeneration: number | null = null;
     let schedulingSnapshot: LedgerSchedulingSnapshot | null = null;
     if (
-      !emptyAfterDetach && lifecycleLive && key !== null
+      publishedOwnershipRemains && lifecycleLive && key !== null
       && this.connectionEpoch === epoch && this.sessionKey === key
       && !this.disconnected && !this.terminalReached
       && this.ackStallMutationEpoch === resultEpoch
-      && this.unackedLedger.size > 0
+      && this.hasPublishedUnackedOwnership()
     ) {
       const sampledResultAt = this.retryNow();
       if (
         this.connectionEpoch === epoch && this.sessionKey === key
         && !this.disconnected && !this.terminalReached
         && this.ackStallMutationEpoch === resultEpoch
-        && this.unackedLedger.size > 0
+        && this.hasPublishedUnackedOwnership()
       ) {
         resultCommitEpoch = ++this.ackStallMutationEpoch;
         resultAt = sampledResultAt;
@@ -1710,7 +1715,7 @@ export class WebChannelNatsClient {
     for (const id of frameIds) apply(id);
 
     if (
-      emptyAfterDetach || resultCommitEpoch === null || resultAt === null
+      !publishedOwnershipRemains || resultCommitEpoch === null || resultAt === null
       || postCommitTimerGeneration === null || schedulingSnapshot === null
     ) {
       return;
@@ -1726,6 +1731,13 @@ export class WebChannelNatsClient {
       return;
     }
     this.armLiveRetryTimer();
+  }
+
+  private hasPublishedUnackedOwnership(): boolean {
+    for (const entry of this.unackedLedger.values()) {
+      if (entry.published) return true;
+    }
+    return false;
   }
 
   private async onConnected(): Promise<void> {
@@ -2232,16 +2244,32 @@ export class WebChannelNatsClient {
           this.unackedLedger.get(message.id) === ledgerEntry
           && this.sessionKey === sealingKey
           && this.connectionEpoch === sealingConnectionEpoch
-          && this.ackStallMutationEpoch === sealingMutationEpoch
           && !this.disconnected && !this.terminalReached
         ) {
-          if (this.ackStallSinceAt === null) {
-            this.ackStallMutationEpoch++;
-            this.ackStallSinceAt = attemptAt;
-            this.ackStallRecoveryIssued = false;
+          // Retry scheduling is prepared before the raw call, but only a
+          // successful raw publish confirms application-published ownership.
+          // An older message may be ACKed synchronously inside ws.send(),
+          // advancing the mutation epoch while this exact entry remains current;
+          // confirming it here is safe. A result for THIS id detached the entry,
+          // so the identity fence above prevents resurrection.
+          ledgerEntry.published = true;
+          const confirmationMutationEpoch = this.ackStallMutationEpoch;
+          const publishedAt = this.retryNow();
+          if (
+            this.unackedLedger.get(message.id) === ledgerEntry
+            && this.sessionKey === sealingKey
+            && this.connectionEpoch === sealingConnectionEpoch
+            && this.ackStallMutationEpoch === confirmationMutationEpoch
+            && !this.disconnected && !this.terminalReached
+          ) {
+            if (this.ackStallSinceAt === null && !this.ackStallRecoveryIssued) {
+              this.ackStallMutationEpoch++;
+              this.ackStallSinceAt = publishedAt;
+              this.ackStallRecoveryIssued = false;
+            }
+            publishedMutationEpoch = this.ackStallMutationEpoch;
+            schedulingSnapshot = this.captureLedgerScheduling();
           }
-          publishedMutationEpoch = this.ackStallMutationEpoch;
-          schedulingSnapshot = this.captureLedgerScheduling();
         }
         this.trackerAdvance(message.id, "sent");
         if (
@@ -2425,6 +2453,7 @@ export class WebChannelNatsClient {
         // Injected clock/random callbacks run only after sealMessage has
         // completed; null is inert pre-publish ownership metadata.
         nextRetryAt: null,
+        published: false,
       });
     }
     while (this.unackedLedger.size > WebChannelNatsClient.MAX_UNACKED) {
@@ -2456,6 +2485,7 @@ export class WebChannelNatsClient {
       id,
       entry,
       nextRetryAt: entry.nextRetryAt,
+      published: entry.published,
     }));
   }
 
@@ -2465,6 +2495,7 @@ export class WebChannelNatsClient {
       if (
         this.unackedLedger.get(item.id) !== item.entry
         || item.entry.nextRetryAt !== item.nextRetryAt
+        || item.entry.published !== item.published
       ) {
         return false;
       }
