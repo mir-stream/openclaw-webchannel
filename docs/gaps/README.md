@@ -8,14 +8,16 @@ sketch → acceptance*.
 
 > **⚠️ Re-anchored 2026-07-03 (post integrated-demo rebase); re-verified 2026-07-13 (post-#24…#33
 > tree).** This branch was rebased onto the integrated showcase demo, which *rewrote the entire demo
-> surface*, and the P0/P1 parity stack has since **landed** — **P0 is now fully built except one
-> residual** (P0-3 argument menus), and several P1 items shipped too. The demo drives the production
+> surface*, and the P0/P1 parity stack has since largely **landed**. P0 capability enablement is built,
+> but **two P0 residuals remain**: P0-3 argument menus and P0-5 multi-message finalize correctness
+> ([#94](https://github.com/mir-stream/openclaw-webchannel/issues/94)). Several P1 items shipped too.
+> The demo drives the production
 > `WebChannelNATSClient` state reducer and renders history, typing, approvals, streaming drafts,
 > markdown, slash-command discovery, and terminal-error UX. Since the 07-10 re-verify develop merged:
 > **P0-2 depth cap (#24)**; the P0/P1 parity stack **#25/#26/#28/#29/#30** = `/stop` control lane +
 > NATS typing gate + slash discovery + debounce/coalesce + ingress dedupe; **markdown (#27)**;
 > **client replay+ack (#31)**; and the **protocol-version handshake (#33)**. Those areas are corrected
-> below. See **["What the integrated demo already closed"](#what-the-integrated-demo-already-closed)**.
+> below. See **["What the integrated demo built — and what remains"](#what-the-integrated-demo-built--and-what-remains)**.
 >
 > **⚠️ Line numbers drift — trust the symbol, not the number.** The demo is still under active
 > development, so every `file:line` anchor in these docs is approximate and *will* keep moving. The
@@ -24,7 +26,7 @@ sketch → acceptance*.
 
 | File | Covers | Headline |
 |---|---|---|
-| [`P0_CORE_CHAT_GAPS.md`](P0_CORE_CHAT_GAPS.md) | history, slash commands, HITL approvals, streaming, typing, send reliability | **✅ P0 fully built except one residual.** Client render is done via `nats-client-wrapper.ts` + `demo/web/src/widget.ts`; the server-side halves (P0-2 depth cap #24, P0-5 streaming flag, P0-6 typing gate #26) and the net-new work (P0-3 discovery #30, P0-7 idempotency #30/#31) all landed. **Only P0-3 argument menus remain open.** |
+| [`P0_CORE_CHAT_GAPS.md`](P0_CORE_CHAT_GAPS.md) | history, slash commands, HITL approvals, streaming, typing, send reliability | **🟡 P0 enablement built; two residuals open.** Client render is done via `nats-client-wrapper.ts` + `demo/web/src/widget.ts`; the server-side halves (P0-2 depth cap #24, P0-5 streaming flag, P0-6 typing gate #26) and the net-new work (P0-3 discovery #30, P0-7 idempotency #30/#31) all landed. Remaining: **P0-3 argument menus and P0-5/#94 multi-message finalize correctness.** |
 | [`P1_RICH_UX_GAPS.md`](P1_RICH_UX_GAPS.md) | markdown rendering, long responses, reasoning lane, media, buttons, doctor, error UX, **turn control (P1-8)**, **pending-message retraction (P1-9)** | **✅ P1-1 markdown, P1-3 reasoning, P1-7 error UX, and P1-8 `/stop`+debounce built.** Still open: **P1-9 unsend** (web advantage), **P1-2 long-response**, **P1-6 doctor**, **P1-7 finer wording**, and **media (P1-4) — a mini-project**. |
 | [`P2_ADVANCED_GAPS.md`](P2_ADVANCED_GAPS.md) | multi-conversation, reactions, edit/quote, ingress durability, throttle, audit, access depth | **Ingress durability (P2-4) matters most for our NATS transport.** P0-7 now covers the client-reconnect side; P2-4 narrows to **agent-down durability** (JetStream vs spool, still deferred). Multi-conversation is the biggest product lift. *(Rest of P2 unchanged — still backlog.)* |
 
@@ -58,7 +60,7 @@ which glues together the split modules:
 | multi-account multiplex | `src/multiplex.ts` (`planAccounts`) |
 | legacy WS transport (retained) | `src/transport.ts` (`typingEnabled`/`historyEnabled` gates) |
 
-## What the integrated demo already closed
+## What the integrated demo built — and what remains
 
 The demo config (`demo/run.sh:268-291`) ships `history.enabled:true` and `execApprovals` with
 approvers, so these run **end-to-end** in the demo. The reducer (`nats-client-wrapper.ts`) handles
@@ -70,7 +72,7 @@ every inbound frame; the widget renders each.
 | **P0-2** history pagination | ✅ **built** (#24): two-phase `pageBefore` to the 1000-msg ceiling + `planHistoryFetch` call-site fix; >1000-turn residual stays upstream-blocked | `pageBefore` `history.ts:277-318`; `planHistoryFetch` `:218-231` |
 | **P0-3** slash-command discovery | ✅ **built** (#30): server catalog (`load_commands`→`commands`) + client typeahead. **Residual: argument menus** | `commands-catalog.ts`; `sendCommands` `nats-channel.ts:527-530`; widget `cmdMenu` `:78`, `renderMenu` `:238` |
 | **P0-4** approval cards | ✅ **built** (card render + `decide`); **rehydration built** (#15/#19 `approval_snapshot` Legs A/B/C) | `renderApproval` `widget.ts:81`; reducer `:381/:421/:435`; `decide` `:145` |
-| **P0-5** streaming drafts | ✅ **built** — demo sets `streaming.mode:"partial"` (`run.sh:287`), so answer-text streaming is exercised | reducer `case "progress"` `:557`; server gate `inbound.ts:124-136` |
+| **P0-5** streaming drafts | 🟡 **enablement built; correctness open** — demo sets `streaming.mode:"partial"` (`run.sh:287`), but #94 must preserve multiple assistant-message lanes through finalize | reducer `case "progress"` `:557`; server gate `inbound.ts:124-136`; #94 |
 | **P0-6** typing indicator | ✅ **built** — client render + **NATS gate wired** (#26): `typing:"off"` now honored | reducer `case "typing"` `:376`; gate `nats-channel.ts:509-513` wired `index-nats.ts:590` |
 | **P0-7** send reliability | ✅ **built** (#30/#31): client replay ledger + server ingress dedupe + `ack` frame | `nats-client.ts` `unackedLedger`/`flushQueue`/`drainAcked`; `src/ingress-dedupe.ts`; `sendAck` `nats-channel.ts:539-543` |
 | **P1-1** markdown | ✅ **built** (#27): sanitized markdown DOM for agent bubbles (zero-dep, no `innerHTML`) | `demo/web/src/markdown.ts`; `renderMarkdown` at `widget.ts:201` |
@@ -78,8 +80,8 @@ every inbound frame; the widget renders each.
 | **P1-7** error / reconnect UX | ✅ **built** (status pill + cause-driven terminal error box + re-auth); a `WebChannelErrorCause` tag threads from the `-ERR`/register emit sites through `state.errorCause` to per-cause wording | terminal classify `nats-client.ts` `-ERR` split; `error-copy.ts`; error box `widget.ts` |
 | **P1-8** turn control | ✅ **built**: `/stop` control lane (#25, `control-lane.ts`) + debounce/coalesce (#29, `inbound-queue.ts`) | control lane `index-nats.ts:724-822`; Stop button `widget.ts:182-186,381-386` |
 
-**Still genuinely open** (accurately described in the files): **P0-3** argument menus (the only P0
-residual), **P1-2** long-response,
+**Still genuinely open** (accurately described in the files): **P0-3** argument menus,
+**P0-5/#94** multi-message finalize correctness, **P1-2** long-response,
 **P1-4** media (mini-project), **P1-6** doctor, **P1-9** pending-message
 retraction / unsend (web advantage — no Telegram equivalent), and **all of P2** (with P2-4 now
 narrowed to agent-down durability — see below).
@@ -103,9 +105,37 @@ narrowed to agent-down durability — see below).
    `execApprovals`/`inlineButtons` (`:137/:163`), and a `streaming.mode` option
    (`off|partial|block|progress`, enum `:110`) with **no manifest default** — but the demo now **sets
    `streaming.mode:"partial"`** (`run.sh:287`, P0-5). The two draft modes differ: `"partial"` streams
-   the **answer text** into the working draft (the "typing out" / Telegram-parity effect, superset of
-   progress), while `"progress"` streams **tool/item lines only** and finalizes the answer atomically
-   (`inbound.ts:124-136`). Setup-wizard nit remains: it does not offer `streaming.mode` (enroll-only).
+   the **current assistant message's answer text** into an active working draft, while `"progress"`
+   streams **tool/item lines only** and finalizes the answer atomically (`inbound.ts:124-136`). The
+   capability is live, but [#94](https://github.com/mir-stream/openclaw-webchannel/issues/94) remains
+   a correctness gap: multiple assistant messages currently share one draft id, so the last final can
+   erase earlier live messages. The accepted fix settles one bubble per assistant-message boundary
+   and rotates to a new id, while letting the first successful lane or independent delivery claim the
+   provisional tool-scaffold id,
+   retaining late indexless reservations through lifecycle/terminal drain. Queued callbacks are
+   pre-TTS/media and pre-rewrite/cancel, so they never supply wire body or a delivery-suppression
+   credit. Only the actual post-hook block delivery is authoritative, but no public identity correlates
+   it to a reservation—even one remaining reservation can be unrelated. Every authorized block in
+   partial mode therefore takes an independent non-lane path. If a provisional preview is visible and
+   unclaimed, **both** a lane's first partial/final and an independent delivery reserve that id and
+   commit owner/ID only after an actual successful send. `false`/throw rolls back P plus any tentative
+   lane assignment, keeps the writer active, records the failed delivery without blind inline retry,
+   and lets the next successful lane/independent payload reuse P. A failed partial lane updating after
+   another consumer claimed P uses a fresh id. This preserves delivery order and prevents scaffold ghosts
+   without inferring block→lane ownership. Any successful lane/independent commit also invalidates the
+   provisional scaffold writer: later tool/item events must never send `progress` on
+   claimed P, which would overwrite the durable payload. The `turnActive` signal already landed via
+   #96/#101 and preserves turn-level activity between bubbles; structured tool detail remains #97.
+   Skip/cancel/settled/error lifecycle signals retire tentative reservations, and all three block
+   notice flags are classified before lane logic.
+   Queued callback cardinality still cannot classify finals. After a leading terminal error,
+   non-notice finals without public identity, such as `[A1,A2,B]`, use the same independent
+   provisional-or-fresh path.
+   This deliberately preserves at least once and may duplicate materialized A/B; block partial dedupe,
+   same-message grouping, exact lane ownership, and final exact-once need a stable public identity that
+   reaches actual delivery and are deferred to
+   [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111). Setup-wizard nit remains:
+   it does not offer `streaming.mode` (enroll-only).
 
 3. **Slash commands both execute AND are discoverable.** Execution always worked — text commands are
    on by default and WebChannel is not a native-command surface (`channel.ts:115` declares no
@@ -113,10 +143,10 @@ narrowed to agent-down durability — see below).
    **Discovery is now built too** (#30): a `load_commands`→`commands` catalog (config-filtered, from
    `native-command-registry`) feeds a widget typeahead. The only P0-3 residual is **argument menus**.
 
-## Server-side items — now FIXED after the refactor
+## Server-side items — status after the refactor
 
-The three server-side gaps this section previously tracked as open have all landed. Re-verified
-2026-07-13:
+The original enablement gaps landed. Streaming is enabled, with #94 still open as a live-path
+correctness fix:
 
 1. **P0-2 depth cap** — ✅ FIXED (#24). `pageBefore` (`history.ts:277-318`) is now a two-phase fetch
    that widens to the 1000-message upstream ceiling (`MAX_FETCH_WINDOW`) when the small window can't
@@ -127,9 +157,11 @@ The three server-side gaps this section previously tracked as open have all land
    `setTypingEnabled()` (`:502-504`); `sendTyping` (`:509-513`) is gated; wired at
    `index-nats.ts:590` from `resolveTypingEnabled(account)` (`account-config.ts:271-276`). So
    `capabilities.typing:"off"` is now honored on NATS.
-3. **P0-5 streaming flag** — ✅ FIXED. `demo/run.sh:287` now sets `"streaming": { "mode": "partial" }`
-   in the account block, so `resolveStreamingMode(...)` enables the answer-text draft stream in the
-   demo (`inbound.ts:124-136`). Setup-wizard nit: it still doesn't offer `streaming.mode` (enroll-only).
+3. **P0-5 streaming flag** — 🟡 ENABLED, correctness work open. `demo/run.sh:287` sets
+   `"streaming": { "mode": "partial" }`, so `resolveStreamingMode(...)` enables the answer-text draft
+   stream in the demo (`inbound.ts:124-136`). #94 must still replace the turn-wide single draft with
+   per-assistant-message materialize-and-rotate lanes. Setup-wizard nit: it still doesn't offer
+   `streaming.mode` (enroll-only).
 
 ## Reuse principle
 

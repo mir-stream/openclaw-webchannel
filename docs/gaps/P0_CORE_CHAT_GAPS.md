@@ -9,9 +9,12 @@
 > `../openclaw/extensions/telegram/` (absolute: `/Users/mircorn/workspace/openclaw/extensions/telegram/`).
 >
 > **⚠️ Re-anchored 2026-07-03; re-verified 2026-07-13 (post-#24…#33 tree).** The integrated
-> showcase demo rewrote the demo surface, and the P0/P1 parity stack has since **landed** — **P0 is
-> now fully built except one residual** (P0-3 argument menus). The demo drives the production
-> `WebChannelNATSClient` state reducer, so all P0 client render is done (marked ✅). Since the 07-10
+> showcase demo rewrote the demo surface, and the P0/P1 parity stack has since largely **landed**.
+> P0 capability enablement is built, but **two P0 correctness/UX residuals remain**: P0-3 argument
+> menus and P0-5 multi-message finalize correctness
+> ([#94](https://github.com/mir-stream/openclaw-webchannel/issues/94)). The demo drives the production
+> `WebChannelNATSClient` state reducer, so the P0 client surfaces exist; statuses below distinguish
+> enablement from unresolved correctness. Since the 07-10
 > re-verify develop merged: **P0-2 depth cap (#24)**, the **/stop control lane + typing gate + slash
 > discovery + debounce/coalesce + ingress dedupe (#25/#26/#28/#29/#30)**, **markdown (#27, P1)**,
 > **client replay+ack (#31)**, and the **protocol-version registration (#33)**. Corrected below for:
@@ -115,7 +118,7 @@ boolean `delivered`), `approvals`, `status`, `connected`, `error?`, `isTyping?`,
 | `history.enabled` | **`true`** (`:174-178`) | **`true`** (`:234`) | ✅ P0-1 works E2E |
 | `execApprovals` + `capabilities.inlineButtons` | first-class (`:137/:163`) | **enabled + approvers** (`:235`) | ✅ P0-4 works E2E |
 | `capabilities.typing` | **`"on"`** (`:167-170`) | unset → default on | ✅ P0-6 — gate now wired on NATS (`typing:"off"` honored) |
-| `streaming.mode` | option only (enum `off\|partial\|block\|progress`, `:110`), **no default** | **`"partial"`** (`run.sh:287`) | ✅ P0-5 — answer-text stream exercised in the demo |
+| `streaming.mode` | option only (enum `off\|partial\|block\|progress`, `:110`), **no default** | **`"partial"`** (`run.sh:287`) | 🟡 P0-5 — enablement built; multi-message finalize correctness #94 open |
 | `messages.inbound.byChannel.webchannel` (core key) | core default `0` (inert) | **`300`** (`run.sh:268`) | ✅ P1-8b pre-run debounce active |
 
 ### Reuse note — openclaw `plugin-sdk` runtimes (VERIFIED available)
@@ -391,15 +394,16 @@ memory `demo-user-login`.
 
 ---
 
-## P0-5 — Streaming / partial responses (progress drafts) — ✅ BUILT (demo streams `partial`)
+## P0-5 — Streaming / partial responses (progress drafts) — 🟡 PARTIAL (#94 open)
 
 **Symptom (original).** The reply appeared all at once; no live "typing out", no tool-progress
 feedback.
 
-**Classification.** ✅ Built. Client render is mode-agnostic; the server gate has two draft modes; and
-the demo now **sets `streaming.mode:"partial"`** (`demo/run.sh:287`, commit `8671d49`), so the
-answer-text "typing out" stream is exercised end-to-end. One nit: the setup wizard does not offer
-`streaming.mode` (deliberately enroll-only — see below).
+**Classification.** 🟡 The streaming capability is built and the demo exercises it, but multi-message
+turns are not yet durable on the live path. [#94](https://github.com/mir-stream/openclaw-webchannel/issues/94)
+tracks the correctness gap: WebChannel currently flattens more than one assistant message into one
+draft id, then replaces that id with the last `final` payload. Earlier assistant messages disappear
+until a history reload restores them.
 
 **Where it stands today.**
 - Server streaming is **gated on config** with **two distinct draft modes** (post-#14):
@@ -409,22 +413,60 @@ answer-text "typing out" stream is exercised end-to-end. One nit: the setup wiza
   const draftEnabled = streamingMode === "progress" || streamingMode === "partial";
   const answerStreamingEnabled = streamingMode === "partial";
   ```
-  - **`"partial"`** streams the **answer text** into the working draft (`onPartialReply` →
-    `draft.pushAnswerText`, `inbound.ts:263-284`) — the core/Telegram-parity "typing out" effect.
-    Partial is a **superset** of progress: it also carries tool/item lines.
+  - **`"partial"`** streams the **current assistant message's answer text** into an active working
+    draft (`onPartialReply` → `draft.pushAnswerText`) — the "typing out" effect. Partial is a
+    **superset** of progress: it also carries tool/item lines.
   - **`"progress"`** streams **tool/item progress lines only** (`onToolStart`/`onItemEvent`,
     `inbound.ts:229-252`); the answer text is **not** streamed — it finalizes atomically.
   - `"block"`/`"off"` take the no-draft fallback.
-- The #14 per-itemId cumulative-partial handling + boundary prefix-rollup (and #23's missed-boundary
-  defense) live in `packages/plugin/src/message-adapter.ts` (`answerText`/`answerPrefix`,
-  `rollCurrentIntoPrefix`, `handleAssistantMessageBoundary`, the "MISSED-BOUNDARY DEFENSE" block in
-  `pushAnswerText`).
-- **Wire is unchanged:** partial reuses the same `{ type:"progress", id, text }` frame
-  (`nats-channel.ts:58`, `sendProgress` `:375`); finalize reuses `agent_message` with the same draft
-  `id` (`finalizeDraft` `:383`).
-- **Reducer is mode-agnostic:** `nats-client-wrapper.ts:557` `case "progress"` upserts a working
-  bubble keyed by draft `id`; the matching `agent_message` (`:569`) finalizes it. **No client work is
-  needed to switch the demo to `partial`.**
+- The current #14/#23 implementation detects assistant-message boundaries but rolls completed text
+  into `answerPrefix` under one turn-wide draft id. That avoids a mid-stream clobber but loses the
+  message boundary; the last `final` then replaces the whole combined draft. #94 replaces this with
+  **materialize-and-rotate** behavior: settle the completed assistant message under its existing id,
+  then stream the next assistant message under a new id. A first-lane tool scaffold is not assigned to
+  an empty assistant lane: it remains a turn-level provisional preview whose id is claimed by the first
+  successful assistant lane or independent delivery, so `Working…` cannot survive
+  beside the payload as a settled ghost. An independent claim never creates a lane. The
+  public callback contract is weaker than Telegram's internal seam: `onBlockReplyQueued` may arrive
+  after the next message-start callback, its index is optional, and its payload is pre-TTS/media and
+  pre-`beforeDeliver` rewrite/cancel. The plugin therefore retains unresolved predecessor lanes and
+  records only tentative ordering reservations—never queued text/media. Actual post-hook
+  `kind:"block"` delivery is wire-authoritative, but no public identity correlates it to a reservation:
+  even a sole reservation can be unrelated after callback omission or notice→non-notice rewrite.
+  Every authorized block in partial mode therefore uses an independent non-lane delivery path. If P
+  is visible and unclaimed, both a lane's first `progress`/final-only `agent_message` and an independent
+  delivery reserve P and send with P's id. The lane transport boolean or independent delivery's
+  `visibleReplySent` must be actual `true` before that owner commits;
+  `false`/throw rolls back P and any tentative lane ID, keeps the writer active, records the failure
+  without blind inline retry, and lets the next successful lane/independent payload reuse P. If another
+  consumer claims P before a failed partial lane's later update, that lane uses a fresh id. The queue
+  serializes this reserve/send/commit-or-rollback transaction. Any successful lane/independent commit
+  also stops/invalidates the provisional scaffold writer. Later tool/item events must never send
+  `progress(P,Working…)`, because the reducer would overwrite the durable lane/independent payload at
+  P and mark it working again. The `turnActive` signal already landed through #96/#101 and preserves
+  turn-level in-flight visibility between bubbles; structured tool detail remains #97. Public
+  `onSkip`/`onBeforeDeliverCancelled`/
+  `onDeliverySettled` observers plus delivery `onError` retire tentative state so cancel(A) cannot
+  leave a ghost or permanently block B. The three block notice flags are classified first and take an
+  independent path that never creates, settles, or blocks an assistant lane.
+- **`kind:"final"` is a delivery class, not an assistant-message id.** Core may deliver several final
+  payloads in one turn and the pinned builder can replay assistant blocks as `[error,A1,A2,B]`, where
+  A1/A2 belong to one lane. Queued callbacks cannot correlate that array: default partial mode may
+  produce zero callbacks, while block streaming may coalesce A1/A2 into one callback and still emit
+  three terminal assistant texts. Notices do not consume assistant lanes. After a leading error, every
+  non-notice final without public identity uses the same independent provisional-or-fresh path. This at-least-once
+  policy may duplicate
+  already-materialized A/B, but never drops or guesses ownership. Authorized blocks likewise use
+  at-least-once independent delivery, so partial duplication and one bubble per block are explicit costs. Block
+  dedupe/same-message grouping/exact lane ownership require a stable public dispatch/message identity
+  that survives rewrite/cancel into actual delivery and are deferred to
+  [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111).
+- **Wire primitives already fit the target:** partial uses `{ type:"progress", id, text }`; finalize
+  uses `agent_message` with the same `id`. One assistant message uses one id; the id rotates only at
+  an assistant-message boundary.
+- **Reducer is mode-agnostic:** a `progress` frame upserts a working bubble by id and the matching
+  `agent_message` finalizes it. Different ids already create different bubbles, so #94 is expected to
+  be a plugin-side lane change, not a new client protocol.
 - **Widget:** working bubbles render italic/dimmed (`widget.ts:215` `m.working` → `opacity:.7;
   font-style:italic`).
 - ✅ **Demo sets `streaming.mode:"partial"`.** The account block (`run.sh:287`) now carries
@@ -432,18 +474,41 @@ answer-text "typing out" stream is exercised end-to-end. One nit: the setup wiza
   `draftEnabled` + `answerStreamingEnabled` are both true and the answer streams into the working
   bubble.
 
-**Telegram reference.** `draft-stream.ts` `createTelegramDraftStream` (`:176`), throttled edits
-(`DEFAULT_THROTTLE_MS`, min 250ms). Reasoning/answer split is **P1-3**, not P0.
+**Telegram reference — illustrative only, not a contract basis.** OpenClaw's Telegram channel
+materializes the active answer lane before rotation, calls `forceNewMessage()`, and serializes
+`onAssistantMessageStart` / `onBlockReplyQueued` work rather than recovering boundaries from the
+final string. But Telegram is bundled *inside* core and reads a wider seam than the published
+plugin contract — notably `assistantMessageIndex` at its delivery seam, which
+`ChannelDeliveryInfo` does not carry for plugins. Treat it as evidence that core preserves message
+boundaries, not as a template a plugin can copy. See §5.2/§5.3 of
+`ISSUE_94_DRAFT_FINALIZE_DATA_LOSS_PLAN.md`. Reasoning/answer split is **P1-3**, not P0.
 
-**Residual (nit).** The setup wizard (`src/setup-wizard.ts`) still does not offer `streaming.mode` —
-it writes CONFIG ONLY and is deliberately enroll-scoped (header comment `:8-15`), so an operator
-enrolling via `channels add` gets no streaming toggle and must set it by hand (as the demo does). Low
-priority. Optional polish: a subtle "working" affordance (cursor/shimmer) beyond the italic dim.
+**Other residual (nit).** The setup wizard (`src/setup-wizard.ts`) still does not offer
+`streaming.mode`; an operator enrolling via `channels add` must set it by hand (as the demo does).
+Optional polish: a subtle "working" affordance (cursor/shimmer) beyond the italic dim.
 
-**Acceptance (met).** With `streaming.mode:"partial"` set, a multi-step / tool-using turn shows
-incremental text in a single bubble that finalizes into the answer — no duplicate bubbles, no infinite
-spinner if the turn errors (the in-flight draft is finalized on error). (With `"progress"`, the same
-holds for tool lines but the answer arrives atomically.)
+**Acceptance (not yet met).** On the ordinary path with `streaming.mode:"partial"`, each completed assistant message must
+settle as its own bubble while partial frames edit only the current bubble. A two-message live turn
+must remain two messages after settle and match a fresh history hydrate. No content-based
+`includes`/suffix heuristic may decide whether messages are the same. Error/abort paths must settle
+only the active draft and leave earlier settled bubbles intact. A tool scaffold followed by an answer
+must reuse one provisional id, and final `[error,A1,A2,B]` must not infer ownership from callback
+cardinality. Both the zero-callback default path and the coalesced
+`[A1+"\n\n"+A2@0,B@1]` callback path must leave materialized A/B unchanged and preserve error
+plus every uncorrelated final through the independent provisional-or-fresh path, explicitly accepting
+duplicates until #111. (Each lane/independent send reports its real delivery result; only success
+commits P, false/throw rolls back P plus tentative lane assignment, and one failure must not stop later
+payloads. Partial-first/final-only × false/throw × later lane/independent success requires pinned-runtime
+coverage, with the later success on P and no blind retry or ghost.)
+(Queued payloads must never reach wire; rewrite/cancel, actual send `true`/`false`/throw, cancel(A) → B,
+and all three notice flags with/without partial and interleaved A/B require pinned-runtime coverage.)
+(Every authorized block in partial mode is independent regardless of whether zero, one, or several
+queued reservations are pending; reservations only hold/retire ordering barriers and never select a
+lane. With visible+unclaimed P, block/notice/error/fallback success must claim P before a later lane;
+false/throw must leave P reusable. P→block success→B is `[block(P),B(new)]`, block-only leaves one
+bubble, and failed block→B lets B claim P. Once lane or independent delivery claims P, late tool/item
+events must produce zero scaffold frames; B still uses a fresh id after an independent claim.)
+(With `"progress"`, tool lines remain an ephemeral scaffold and the answer arrives atomically.)
 
 ---
 
@@ -545,15 +610,18 @@ remains **P2-4**. P0-7 covers the client→agent replay + idempotency side; P2-4
 
 ## Suggested execution order (remaining work only)
 
-**P0 is fully closed except one residual.** Every numbered P0 gap is ✅; the only open P0 work is:
+**P0 capability enablement is built, with two residuals still open.** P0-3 needs its argument-menu
+UX and P0-5 needs #94's multi-message finalize correctness:
 
 | Order | Gap | Effort | Why |
 |---|---|---|---|
 | 1 | P0-3 argument menus | S | Catalog entries already carry `args.choices`; render a dropdown from them (widget currently inserts the name only). Ties into the P1-5 control renderer. |
+| 2 | P0-5 multi-message finalize (#94) | L | Replace the turn-wide draft with ordered lanes, two-phase lane/independent provisional ownership, success-only scaffold-writer invalidation, tentative block reservations + lifecycle cleanup, and at-least-once claim-or-fresh delivery. |
 
 > ✅ **Done:** P0-1 (history restore), P0-2 (depth cap, #24 — optional scroll-UX polish is all that
 > remains there), P0-3 (slash discovery, #30 — arg menus excepted above), P0-4 (approval cards +
-> rehydration), P0-5 (streaming, demo streams `partial`), P0-6 (typing render + NATS gate, #26),
+> rehydration), P0-5 **enablement only** (demo streams `partial`; #94 correctness remains above),
+> P0-6 (typing render + NATS gate, #26),
 > P0-7 (client replay + server dedupe + ack, #30/#31). See each section for the residual notes.
 
 ## Cross-cutting: the reducer is the shared seam
