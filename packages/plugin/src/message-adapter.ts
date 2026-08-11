@@ -1,7 +1,6 @@
 import {
   defineChannelMessageAdapter,
   createMessageReceiptFromOutboundResults,
-  createDraftStreamLoop,
   resolveChannelPreviewStreamMode,
   resolveChannelProgressDraftLabel,
   resolveChannelProgressDraftMaxLines,
@@ -12,7 +11,6 @@ import type {
   MessageReceipt,
   StreamingMode,
   ChannelProgressDraftLineInput,
-  DraftStreamLoop,
 } from "openclaw/plugin-sdk/channel-outbound";
 import {
   stripReasoningTagsFromText,
@@ -149,288 +147,976 @@ export function resolveStreamingMode(
   );
 }
 
+type LaneResolution = "open" | "unresolved" | "materialized" | "empty";
+type LaneFrameType = "progress" | "final";
+type DeliveryFailureKind = "false" | "throw";
+
+type AssistantDraftLane = {
+  generation: number;
+  assistantMessageIndex?: number;
+  /** Assigned only after a successful first wire frame for this lane. */
+  id?: string;
+  /** A provisional id is tentative for the duration of one send transaction. */
+  tentativeProvisionalId?: string;
+  answerText: string;
+  answerRevision: number;
+  tentativeBarrierReservationIds: string[];
+  closed: boolean;
+  resolution: LaneResolution;
+  acceptsLateIndexlessReservations: boolean;
+  started: boolean;
+  settled: boolean;
+  failedDeliveryCount: number;
+  lastFailedDelivery?: {
+    revision: number;
+    frameType: LaneFrameType;
+    error: DeliveryFailureKind;
+  };
+  lastProgressAttemptRevision: number;
+  settleResult?: Promise<boolean>;
+  settleOutcome?: boolean;
+};
+
+type ProvisionalClaimOwner =
+  | { kind: "lane"; generation: number }
+  | { kind: "independent"; deliverySequence: number };
+
+type ProvisionalPreview = {
+  id: string;
+  text: string;
+  revision: number;
+  started: boolean;
+  scaffoldWriter: "active" | "invalidated";
+  claim:
+    | { state: "unclaimed" }
+    | { state: "reserved"; owner: ProvisionalClaimOwner }
+    | { state: "claimed"; owner: ProvisionalClaimOwner };
+  settleResult?: Promise<boolean>;
+  settleOutcome?: boolean;
+};
+
+type TentativeBlockReservation = {
+  token: string;
+  barrierGeneration?: number;
+  assistantMessageIndex?: number;
+  state: "pending" | "retired";
+};
+
+type TentativeNoticeToken = {
+  token: string;
+  noticeKind: "status" | "fallback" | "compaction";
+  assistantMessageIndex?: number;
+  state: "pending" | "retired";
+};
+
+type AuthorizedBlockDisposition = {
+  sequence: number;
+  route: "provisional-claim" | "fresh-fallback";
+  settled: boolean;
+};
+
+type FinalReconciliationState = {
+  ordinaryAnswerSettled: boolean;
+  leadingTerminalErrorSeen: boolean;
+};
+
+type PendingProgressFrame =
+  | { kind: "preview"; revision: number; text: string }
+  | { kind: "lane"; generation: number; revision: number; text: string };
+
+type ProgressDraftState = {
+  provisionalPreview: ProvisionalPreview;
+  lanes: AssistantDraftLane[];
+  blockReservations: TentativeBlockReservation[];
+  noticeTokens: TentativeNoticeToken[];
+  blockDispositions: AuthorizedBlockDisposition[];
+  finalReconciliation: FinalReconciliationState;
+  lines: string[];
+  pendingProgress?: PendingProgressFrame;
+  progressTimer?: ReturnType<typeof setTimeout>;
+  lastProgressSentAt: number;
+  firstBoundarySeen: boolean;
+  absorbedMissedBoundaries: number;
+  lateReservationEpochOpen: boolean;
+  nextTokenSequence: number;
+  nextDeliverySequence: number;
+  durableDeliverySucceeded: boolean;
+  started: boolean;
+  stopped: boolean;
+};
+
+type SerialQueueTask = {
+  label: string;
+  run: () => unknown;
+  fallback: unknown;
+  resolve: (value: unknown) => void;
+};
+
+type SerialQueueState = {
+  running: boolean;
+  tasks: SerialQueueTask[];
+};
+
+type NoticeFlags = {
+  isStatusNotice?: boolean;
+  isFallbackNotice?: boolean;
+  isCompactionNotice?: boolean;
+};
+
+type ProvisionalReservation = {
+  owner: ProvisionalClaimOwner;
+  id: string;
+  usesPreview: boolean;
+};
+
+/** One structured partial update from the public reply callback. */
+export type PartialAnswerUpdate = { text?: string; delta?: string; replace?: true };
+
 /**
- * Per-turn progress-draft controller for one originating session.
+ * Per-turn draft state for partial/progress streaming.
  *
- * Composes a rolling "Working… / 🔎 … / 🛠️ …" text block from agent tool/item
- * progress events and pushes it to the widget via the transport's `progress`
- * frame, throttled by `createDraftStreamLoop`
- * (dist/plugin-sdk/draft-stream-controls-C4f0z7_6.d.ts: `update(text)`/`flush()`
- * backed by `sendOrEditStreamMessage(text)`). All frames reuse a single draft
- * `id` so the widget updates ONE bubble; `finalize(text)` reuses that id.
+ * The provisional preview is turn-scoped and ownerless until a successful
+ * durable delivery claims it. Assistant text is held in ordered, rotatable
+ * lanes. Actual block and uncorrelated final payloads never acquire a lane;
+ * they are delivered independently with their own sequence and wire id.
  */
 export type ProgressDraftController = {
-  /** The stable draft/final id shared by every frame of this turn. */
-  readonly id: string;
-  /**
-   * True once at least one `progress` frame has been emitted to the widget, so
-   * a working bubble is currently shown. The error-recovery path uses this to
-   * decide whether the widget needs a terminal frame to settle the bubble.
-   */
+  /** True after any transport call for this controller has returned true. */
   readonly started: boolean;
-  /** Record a structured progress event and refresh the draft. */
-  pushEvent: (input: ChannelProgressDraftLineInput) => void;
-  /**
-   * Replace the cumulative answer text and refresh the draft (partial mode).
-   * Core's `onPartialReply` delivers the FULL assistant text so far each call
-   * (`text` is cumulative: `${assistantTextByItem.get(itemId) ?? ""}${delta}`,
-   * verified: dist/run-attempt-DRhLt3eF.js:4088-4097), so we REPLACE rather than
-   * append. Once answer text is present the draft body becomes that answer (the
-   * "Label…"/tool scaffold is dropped — the answer replaces the working view).
-   * Empty/undefined text is a no-op so a trailing empty frame can't clobber a
-   * non-empty draft.
-   */
-  pushAnswerText: (text: string) => void;
-  /**
-   * Mark an assistant-message boundary (partial mode). Core's cumulative
-   * `onPartialReply.text` is PER-itemId: on a reply with multiple `final_answer`
-   * assistant messages, the next item's partials restart from `""`. Without
-   * this, our REPLACE semantics would make the already-streamed text of the
-   * prior message visibly vanish until the final lands. Core fires
-   * `onAssistantMessageStart` once per assistant message start — including
-   * before the FIRST message (verified: dist/run-attempt-DRhLt3eF.js:4083-4086);
-   * so this rolls the current `answerText` into an accumulated prefix and resets
-   * it. The first-message call is a no-op (answerText empty).
-   */
-  handleAssistantMessageBoundary: () => void;
-  /** Push the freshest pending draft text to the socket now. */
-  flush: () => Promise<void>;
-  /**
-   * Read-only snapshot of the draft text the flush loop would currently send —
-   * the streamed answer body (partial mode) or the "Working…" scaffold + tool
-   * lines. Returns "" when nothing has been pushed yet (there is no scaffold
-   * worth preserving). Side-effect-free: used by the aborted-turn defensive
-   * finalize (inbound.ts) to settle the bubble with the streamed content alone
-   * (no marker).
-   */
-  snapshotText: () => string;
-  /**
-   * Finalize the draft into the final answer (reuses the draft id). Idempotent:
-   * the first call finalizes and stops the loop; later calls return that first
-   * attempt's cached boolean so callers never retry or observe `undefined`.
-   */
-  finalize: (text: string) => Promise<boolean>;
-  /**
-   * Stop the draft loop without sending a final frame. Used on cleanup paths so
-   * a late background throttled flush can't race error handling. Idempotent.
-   */
-  stop: () => void;
+  /** Queue one tool/item event for the provisional preview writer. */
+  pushEvent(input: ChannelProgressDraftLineInput): void;
+  /** Queue one cumulative/delta partial update for the current lane. */
+  pushAnswerText: {
+    (update: PartialAnswerUpdate): void;
+    /** Transitional compatibility for inbound.ts until the wiring round. */
+    (text: string): void;
+  };
+  /** Close the current assistant lane and open the next ordered lane. */
+  handleAssistantMessageBoundary(): void;
+  /** Record only tentative ordering/notice state from a queued callback. */
+  noteBlockReplyQueued(input: {
+    assistantMessageIndex?: number;
+    isStatusNotice?: boolean;
+    isFallbackNotice?: boolean;
+    isCompactionNotice?: boolean;
+  }): void;
+  /** Deliver an authorized block independently from every assistant lane. */
+  deliverAuthorizedBlock(input: {
+    text: string;
+    isStatusNotice?: boolean;
+    isFallbackNotice?: boolean;
+    isCompactionNotice?: boolean;
+  }): Promise<boolean>;
+  /** Retire unambiguous callback lifecycle state without selecting an owner. */
+  noteDeliveryLifecycle(
+    kind: "skip" | "cancel" | "settled" | "error",
+    input: { assistantMessageIndex?: number },
+  ): void;
+  /** Use the current lane's one ordinary-answer terminal slot. */
+  finalize(text: string): Promise<boolean>;
+  /** Deliver a terminal notice/error/uncorrelated final independently. */
+  deliverIndependentFinal(input: {
+    text: string;
+    isStatusNotice?: boolean;
+    isFallbackNotice?: boolean;
+    isCompactionNotice?: boolean;
+  }): Promise<boolean>;
+  /** Record that a terminal error preceded any ordinary answer final. */
+  noteLeadingTerminalError(): void;
+  /** Retire tentative state and settle real text (or a lone tool preview). */
+  drain(): Promise<void>;
+  /** Side-effect-free snapshot of the current assistant lane only. */
+  snapshotText(): string;
+  /** Flush the newest throttled progress frame through the serial queue. */
+  flush(): Promise<void>;
+  /** Stop timers and discard pending progress without sending a terminal frame. */
+  stop(): void;
 };
 
 export function createProgressDraftController(params: {
   transport: WebChannelPeerChannel;
   sessionKey: string;
   turnId?: string;
-  /** Channel config section (for label/maxLines/line formatting). */
   channelConfig: unknown;
   throttleMs?: number;
+  logger?: { warn?: (message: string) => void; info?: (message: string) => void };
 }): ProgressDraftController {
-  const { transport, sessionKey, channelConfig } = params;
-  const id = nextMessageId();
-
+  const { transport, sessionKey, channelConfig, logger } = params;
+  const throttleMs = Math.max(0, params.throttleMs ?? 600);
   const label =
     resolveChannelProgressDraftLabel({ entry: channelConfig as never, seed: sessionKey }) ??
     "Working";
   const maxLines = resolveChannelProgressDraftMaxLines(channelConfig as never, 6);
 
-  // Rolling, de-duplicated tool/item lines (most-recent-last, capped).
-  const lines: string[] = [];
-  // Cumulative answer text streamed via onPartialReply (partial mode only).
-  // Non-empty once the agent starts emitting final-answer text; it then owns
-  // the whole draft body (see composeText). `answerPrefix` accumulates the text
-  // of ALREADY-COMPLETED assistant messages (per-itemId partials restart from
-  // ""), so a multi-message reply doesn't visibly drop earlier text — see
-  // handleAssistantMessageBoundary.
-  let answerText = "";
-  let answerPrefix = "";
-  // Count of message boundaries we ALREADY rolled up ourselves because we
-  // detected the seam from the partial stream before core's
-  // `onAssistantMessageStart` arrived (or when it never arrives). A belated
-  // start event for such an already-rolled seam must be a no-op — see
-  // handleAssistantMessageBoundary. Guards against a double-roll.
-  let absorbedMissedBoundaries = 0;
-  let stopped = false;
-  let started = false;
-  let finalizeResult: Promise<boolean> | undefined;
+  const newLane = (generation: number): AssistantDraftLane => ({
+    generation,
+    answerText: "",
+    answerRevision: 0,
+    tentativeBarrierReservationIds: [],
+    closed: false,
+    resolution: "open",
+    acceptsLateIndexlessReservations: false,
+    started: false,
+    settled: false,
+    failedDeliveryCount: 0,
+    lastProgressAttemptRevision: 0,
+  });
 
-  // The full streamed answer body so far = completed messages + current one.
-  const answerBody = (): string => answerPrefix + answerText;
+  const state: ProgressDraftState = {
+    provisionalPreview: {
+      id: nextMessageId(),
+      text: "",
+      revision: 0,
+      started: false,
+      scaffoldWriter: "active",
+      claim: { state: "unclaimed" },
+    },
+    lanes: [newLane(0)],
+    blockReservations: [],
+    noticeTokens: [],
+    blockDispositions: [],
+    finalReconciliation: {
+      ordinaryAnswerSettled: false,
+      leadingTerminalErrorSeen: false,
+    },
+    lines: [],
+    lastProgressSentAt: 0,
+    firstBoundarySeen: false,
+    absorbedMissedBoundaries: 0,
+    lateReservationEpochOpen: true,
+    nextTokenSequence: 0,
+    nextDeliverySequence: 0,
+    durableDeliverySucceeded: false,
+    started: false,
+    stopped: false,
+  };
+  const queue: SerialQueueState = { running: false, tasks: [] };
 
-  // Roll the just-completed message's text into the accumulated prefix and
-  // reset the per-item cumulative buffer for the next message. No-op when
-  // there is nothing to roll (answerText empty), so a redundant/leading
-  // boundary never appends an empty "\n\n" segment.
-  const rollCurrentIntoPrefix = (): void => {
-    if (answerText.length === 0) return;
-    answerPrefix += answerText + "\n\n";
-    answerText = "";
+  const warn = (message: string): void => {
+    try {
+      (logger?.warn ?? console.warn)(`[webchannel] ${message}`);
+    } catch {
+      // Diagnostics never own the delivery queue's lifecycle.
+    }
   };
 
-  const composeText = (): string => {
-    // Once answer text is streaming, it REPLACES the working scaffold (the
-    // "Label…" header + tool lines) — matching draft.update-style text
-    // replacement. Before any answer text arrives, show the working scaffold.
-    const body = answerBody();
-    if (body.length > 0) return body;
-    const shown = lines.slice(-maxLines);
-    return [`${label}…`, ...shown].join("\n");
+  const pumpQueue = (): void => {
+    if (queue.running) return;
+    queue.running = true;
+    try {
+      while (queue.tasks.length > 0) {
+        const task = queue.tasks.shift()!;
+        try {
+          task.resolve(task.run());
+        } catch (error) {
+          warn(`${task.label} failed without latching the draft queue: ${String(error)}`);
+          task.resolve(task.fallback);
+        }
+      }
+    } finally {
+      queue.running = false;
+    }
   };
 
-  // True when the draft has any content worth flushing before finalize — a
-  // tool/item line OR pending streamed answer text (a partial-mode no-tool turn
-  // has no lines but must still flush its answer text before finalizing).
-  const hasPendingContent = (): boolean => lines.length > 0 || answerBody().length > 0;
+  const enqueue = <T>(label: string, run: () => T, fallback: T): Promise<T> =>
+    new Promise<T>((resolve) => {
+      queue.tasks.push({
+        label,
+        run,
+        fallback,
+        resolve: resolve as (value: unknown) => void,
+      });
+      pumpQueue();
+    });
 
-  const sendOrEditStreamMessage = async (text: string): Promise<boolean> => {
-    if (stopped) return false;
-    const sent = transport.sendProgress(sessionKey, id, text, params.turnId);
-    // Track that a working bubble is now shown to the widget, so the
-    // error-recovery path knows it must emit a terminal frame to settle it.
-    if (sent) started = true;
+  const currentLane = (): AssistantDraftLane => state.lanes[state.lanes.length - 1]!;
+
+  const noticeKind = (input: NoticeFlags): TentativeNoticeToken["noticeKind"] | undefined => {
+    if (input.isStatusNotice) return "status";
+    if (input.isFallbackNotice) return "fallback";
+    if (input.isCompactionNotice) return "compaction";
+    return undefined;
+  };
+
+  const nextToken = (prefix: "block" | "notice"): string =>
+    `${prefix}-${++state.nextTokenSequence}`;
+
+  const clearProgressTimer = (): void => {
+    if (state.progressTimer === undefined) return;
+    clearTimeout(state.progressTimer);
+    state.progressTimer = undefined;
+  };
+
+  const discardPendingProgress = (predicate: (frame: PendingProgressFrame) => boolean): void => {
+    if (!state.pendingProgress || !predicate(state.pendingProgress)) return;
+    state.pendingProgress = undefined;
+    clearProgressTimer();
+  };
+
+  const invalidateScaffoldWriter = (): void => {
+    state.provisionalPreview.scaffoldWriter = "invalidated";
+    discardPendingProgress((frame) => frame.kind === "preview");
+  };
+
+  const reserveProvisional = (
+    owner: ProvisionalClaimOwner,
+    lane?: AssistantDraftLane,
+  ): ProvisionalReservation => {
+    const preview = state.provisionalPreview;
+    if (
+      preview.started &&
+      !state.durableDeliverySucceeded &&
+      preview.claim.state === "unclaimed"
+    ) {
+      preview.claim = { state: "reserved", owner };
+      if (lane) lane.tentativeProvisionalId = preview.id;
+      return { owner, id: preview.id, usesPreview: true };
+    }
+    return { owner, id: nextMessageId(), usesPreview: false };
+  };
+
+  const commitReservation = (
+    reservation: ProvisionalReservation,
+    lane?: AssistantDraftLane,
+  ): void => {
+    if (reservation.usesPreview) {
+      state.provisionalPreview.claim = {
+        state: "claimed",
+        owner: reservation.owner,
+      };
+      if (lane) lane.tentativeProvisionalId = undefined;
+    }
+    invalidateScaffoldWriter();
+    state.durableDeliverySucceeded = true;
+    state.started = true;
+  };
+
+  const rollbackReservation = (
+    reservation: ProvisionalReservation,
+    lane?: AssistantDraftLane,
+  ): void => {
+    if (!reservation.usesPreview) return;
+    state.provisionalPreview.claim = { state: "unclaimed" };
+    if (lane) lane.tentativeProvisionalId = undefined;
+  };
+
+  const recordLaneFailure = (
+    lane: AssistantDraftLane,
+    frameType: LaneFrameType,
+    error: DeliveryFailureKind,
+  ): void => {
+    lane.failedDeliveryCount += 1;
+    lane.lastFailedDelivery = {
+      revision: lane.answerRevision,
+      frameType,
+      error,
+    };
+    warn(
+      `draft lane generation ${lane.generation} ${frameType} delivery returned ${error}; ` +
+        `revision ${lane.answerRevision} remains memory-only`,
+    );
+  };
+
+  const sendLaneFrame = (
+    lane: AssistantDraftLane,
+    frameType: LaneFrameType,
+    text: string,
+  ): boolean => {
+    const owner: ProvisionalClaimOwner = { kind: "lane", generation: lane.generation };
+    const reservation = lane.id
+      ? { owner, id: lane.id, usesPreview: false }
+      : reserveProvisional(owner, lane);
+    let sent = false;
+    let failure: DeliveryFailureKind | undefined;
+    try {
+      sent =
+        frameType === "progress"
+          ? transport.sendProgress(sessionKey, reservation.id, text, params.turnId) === true
+          : transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId) === true;
+      if (!sent) failure = "false";
+    } catch {
+      failure = "throw";
+    }
+    if (sent) {
+      lane.id ??= reservation.id;
+      lane.started = true;
+      lane.resolution = "materialized";
+      commitReservation(reservation, lane);
+      return true;
+    }
+    rollbackReservation(reservation, lane);
+    recordLaneFailure(lane, frameType, failure ?? "false");
+    return false;
+  };
+
+  const sendIndependent = (text: string, recordBlockDisposition = false): boolean => {
+    if (!text) return false;
+    const sequence = ++state.nextDeliverySequence;
+    const owner: ProvisionalClaimOwner = { kind: "independent", deliverySequence: sequence };
+    const reservation = reserveProvisional(owner);
+    let disposition: AuthorizedBlockDisposition | undefined;
+    if (recordBlockDisposition) {
+      disposition = {
+        sequence,
+        route: reservation.usesPreview ? "provisional-claim" : "fresh-fallback",
+        settled: false,
+      };
+      state.blockDispositions.push(disposition);
+    }
+    let sent = false;
+    let failure: DeliveryFailureKind | undefined;
+    try {
+      sent = transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId) === true;
+      if (!sent) failure = "false";
+    } catch {
+      failure = "throw";
+    }
+    if (disposition) disposition.settled = true;
+    if (sent) {
+      commitReservation(reservation);
+      return true;
+    }
+    rollbackReservation(reservation);
+    warn(
+      `independent delivery sequence ${sequence} returned ${failure ?? "false"}; ` +
+        "its provisional claim was rolled back",
+    );
+    return false;
+  };
+
+  const laneHasFailedCurrentRevision = (lane: AssistantDraftLane): boolean =>
+    lane.answerRevision > 0 && lane.lastFailedDelivery?.revision === lane.answerRevision;
+
+  const laneOrderResolved = (lane: AssistantDraftLane): boolean => {
+    if (!lane.closed) return false;
+    if (lane.tentativeBarrierReservationIds.length > 0) return false;
+    if (lane.resolution === "materialized" || lane.resolution === "empty") return true;
+    return laneHasFailedCurrentRevision(lane);
+  };
+
+  const predecessorsResolved = (lane: AssistantDraftLane): boolean => {
+    for (const predecessor of state.lanes) {
+      if (predecessor.generation >= lane.generation) break;
+      if (!laneOrderResolved(predecessor)) return false;
+    }
+    return true;
+  };
+
+  const settleLane = (lane: AssistantDraftLane, text: string): boolean => {
+    if (lane.settleOutcome !== undefined) return lane.settleOutcome;
+    if (lane.settleResult) return false;
+
+    // Arm the per-lane latch before the synchronous transport call. A
+    // re-entrant settle observes this promise and cannot emit a second frame.
+    let resolveSettle!: (value: boolean) => void;
+    lane.settleResult = new Promise<boolean>((resolve) => {
+      resolveSettle = resolve;
+    });
+    lane.settled = true;
+    const sent = sendLaneFrame(lane, "final", text);
+    lane.settleOutcome = sent;
+    resolveSettle(sent);
     return sent;
   };
 
-  const loop: DraftStreamLoop = createDraftStreamLoop({
-    throttleMs: params.throttleMs ?? 600,
-    isStopped: () => stopped,
-    sendOrEditStreamMessage,
-  });
+  const attemptProgress = (frame: PendingProgressFrame): boolean => {
+    if (state.stopped) return false;
+    if (frame.kind === "preview") {
+      const preview = state.provisionalPreview;
+      if (
+        preview.scaffoldWriter !== "active" ||
+        preview.revision !== frame.revision
+      ) {
+        return false;
+      }
+      let sent = false;
+      try {
+        sent = transport.sendProgress(sessionKey, preview.id, frame.text, params.turnId) === true;
+      } catch {
+        warn(`provisional preview revision ${frame.revision} progress delivery threw`);
+      }
+      if (sent) {
+        preview.started = true;
+        state.started = true;
+        state.lastProgressSentAt = Date.now();
+      }
+      return sent;
+    }
+
+    const lane = state.lanes[frame.generation];
+    if (
+      !lane ||
+      lane.closed ||
+      lane.settled ||
+      lane.answerRevision !== frame.revision ||
+      !predecessorsResolved(lane)
+    ) {
+      return false;
+    }
+    lane.lastProgressAttemptRevision = frame.revision;
+    const sent = sendLaneFrame(lane, "progress", frame.text);
+    if (sent) state.lastProgressSentAt = Date.now();
+    return sent;
+  };
+
+  const flushPendingProgress = (): void => {
+    clearProgressTimer();
+    const pending = state.pendingProgress;
+    state.pendingProgress = undefined;
+    if (pending) attemptProgress(pending);
+  };
+
+  const schedulePendingProgress = (): void => {
+    if (state.progressTimer !== undefined || !state.pendingProgress || state.stopped) return;
+    const delay = Math.max(0, throttleMs - (Date.now() - state.lastProgressSentAt));
+    state.progressTimer = setTimeout(() => {
+      state.progressTimer = undefined;
+      void enqueue("throttled progress flush", flushPendingProgress, undefined);
+    }, delay);
+  };
+
+  const queueProgress = (frame: PendingProgressFrame): void => {
+    if (state.stopped) return;
+    const throttleOpen =
+      state.lastProgressSentAt === 0 || Date.now() - state.lastProgressSentAt >= throttleMs;
+    if (throttleOpen) {
+      discardPendingProgress(() => true);
+      attemptProgress(frame);
+      return;
+    }
+    state.pendingProgress = frame;
+    schedulePendingProgress();
+  };
+
+  const releaseReadyLanes = (options?: {
+    emitCurrentProgress?: boolean;
+    settleCurrent?: boolean;
+  }): void => {
+    const active = currentLane();
+    for (const lane of state.lanes) {
+      if (!predecessorsResolved(lane)) continue;
+      if (lane.closed) {
+        discardPendingProgress(
+          (frame) => frame.kind === "lane" && frame.generation === lane.generation,
+        );
+        if (
+          lane.answerText &&
+          !lane.settled &&
+          !laneHasFailedCurrentRevision(lane)
+        ) {
+          settleLane(lane, lane.answerText);
+        }
+        continue;
+      }
+      if (lane !== active || !lane.answerText || lane.settled) continue;
+      if (options?.settleCurrent) {
+        discardPendingProgress(
+          (frame) => frame.kind === "lane" && frame.generation === lane.generation,
+        );
+        if (!laneHasFailedCurrentRevision(lane)) settleLane(lane, lane.answerText);
+      } else if (
+        options?.emitCurrentProgress !== false &&
+        lane.lastProgressAttemptRevision < lane.answerRevision &&
+        !laneHasFailedCurrentRevision(lane)
+      ) {
+        queueProgress({
+          kind: "lane",
+          generation: lane.generation,
+          revision: lane.answerRevision,
+          text: lane.answerText,
+        });
+      }
+    }
+  };
+
+  const attachIndexedReservations = (lane: AssistantDraftLane): void => {
+    if (!state.lateReservationEpochOpen) return;
+    for (const reservation of state.blockReservations) {
+      if (
+        reservation.state !== "pending" ||
+        reservation.barrierGeneration !== undefined ||
+        reservation.assistantMessageIndex !== lane.generation
+      ) {
+        continue;
+      }
+      reservation.barrierGeneration = lane.generation;
+      lane.assistantMessageIndex ??= reservation.assistantMessageIndex;
+      lane.tentativeBarrierReservationIds.push(reservation.token);
+    }
+  };
+
+  const closeAndRotate = (): void => {
+    const lane = currentLane();
+    discardPendingProgress(
+      (frame) => frame.kind === "lane" && frame.generation === lane.generation,
+    );
+    lane.closed = true;
+    if (
+      lane.answerText.length === 0 &&
+      lane.resolution !== "materialized" &&
+      lane.resolution !== "empty"
+    ) {
+      lane.resolution = "unresolved";
+      lane.acceptsLateIndexlessReservations = true;
+    }
+    const next = newLane(lane.generation + 1);
+    state.lanes.push(next);
+    attachIndexedReservations(next);
+    releaseReadyLanes({ emitCurrentProgress: false });
+  };
+
+  const retireReservation = (reservation: TentativeBlockReservation): void => {
+    if (reservation.state === "retired") return;
+    reservation.state = "retired";
+    if (reservation.barrierGeneration === undefined) return;
+    const lane = state.lanes[reservation.barrierGeneration];
+    if (!lane) return;
+    lane.tentativeBarrierReservationIds = lane.tentativeBarrierReservationIds.filter(
+      (token) => token !== reservation.token,
+    );
+    if (lane.tentativeBarrierReservationIds.length === 0) {
+      lane.acceptsLateIndexlessReservations = false;
+      if (!lane.answerText && lane.resolution !== "materialized") {
+        lane.resolution = "empty";
+      }
+    }
+  };
+
+  const retireTentativeState = (): void => {
+    state.lateReservationEpochOpen = false;
+    for (const reservation of state.blockReservations) retireReservation(reservation);
+    for (const token of state.noticeTokens) token.state = "retired";
+    for (const disposition of state.blockDispositions) disposition.settled = true;
+    for (const lane of state.lanes) {
+      lane.acceptsLateIndexlessReservations = false;
+      if (
+        lane.closed &&
+        !lane.answerText &&
+        lane.tentativeBarrierReservationIds.length === 0 &&
+        lane.resolution !== "materialized"
+      ) {
+        lane.resolution = "empty";
+      }
+    }
+  };
+
+  const settlePreviewIfAlone = (): boolean => {
+    const preview = state.provisionalPreview;
+    if (
+      state.durableDeliverySucceeded ||
+      !preview.started ||
+      !preview.text ||
+      preview.claim.state !== "unclaimed"
+    ) {
+      return false;
+    }
+    if (preview.settleOutcome !== undefined) return preview.settleOutcome;
+    if (preview.settleResult) return false;
+    let resolveSettle!: (value: boolean) => void;
+    preview.settleResult = new Promise<boolean>((resolve) => {
+      resolveSettle = resolve;
+    });
+    invalidateScaffoldWriter();
+    let sent = false;
+    try {
+      sent = transport.finalizeDraft(sessionKey, preview.id, preview.text, params.turnId) === true;
+    } catch {
+      warn("provisional preview cleanup delivery threw");
+    }
+    preview.settleOutcome = sent;
+    if (sent) {
+      state.durableDeliverySucceeded = true;
+      state.started = true;
+    }
+    resolveSettle(sent);
+    return sent;
+  };
+
+  const terminalDrain = (settleCurrent: boolean): void => {
+    retireTentativeState();
+    releaseReadyLanes({
+      emitCurrentProgress: false,
+      settleCurrent,
+    });
+    if (settleCurrent) settlePreviewIfAlone();
+  };
+
+  const deliverTerminalIndependent = (text: string): boolean => {
+    // Retirement opens ordering barriers, but the authoritative terminal
+    // payload gets the first P claim attempt before any newly released lane.
+    // On failure its rollback lets the first released lane claim P instead.
+    retireTentativeState();
+    const sent = sendIndependent(text);
+    releaseReadyLanes({ emitCurrentProgress: false });
+    return sent;
+  };
 
   return {
-    id,
     get started() {
-      return started;
+      return state.started;
     },
     pushEvent: (input) => {
-      // `formatChannelProgressDraftLineForEntry(entry, input, options)` renders
-      // one icon+detail line (e.g. "🔎 web_search …"), honoring the channel's
-      // command-text config. Verified: dist/plugin-sdk/streaming-DZCVNyI3.d.ts:112.
-      const line = formatChannelProgressDraftLineForEntry(channelConfig as never, input);
-      if (!line) return;
-      if (lines[lines.length - 1] !== line) lines.push(line);
-      loop.update(composeText());
+      void enqueue(
+        "progress event",
+        () => {
+          const preview = state.provisionalPreview;
+          if (state.stopped || preview.scaffoldWriter !== "active") {
+            return;
+          }
+          const line = formatChannelProgressDraftLineForEntry(channelConfig as never, input);
+          if (!line) return;
+          if (state.lines[state.lines.length - 1] !== line) state.lines.push(line);
+          const shown = state.lines.slice(-maxLines);
+          preview.text = [`${label}…`, ...shown].join("\n");
+          preview.revision += 1;
+          queueProgress({
+            kind: "preview",
+            revision: preview.revision,
+            text: preview.text,
+          });
+        },
+        undefined,
+      );
     },
-    pushAnswerText: (text) => {
-      // No-op on empty/undefined so a trailing empty partial can't clobber a
-      // non-empty draft. Cumulative REPLACE (not append) — see the doc on the
-      // controller type. Routes through the SAME throttled loop as pushEvent,
-      // so `started` is set on the first emitted frame identically.
-      if (!text) return;
-      // Mirror core's Discord partial hygiene exactly (verified:
-      // dist/message-handler.process-CcPQD8zK.js:687-700): strip reasoning +
-      // inline-directive tags, drop a "Reasoning:\n"-prefixed partial, skip an
-      // identical text, and ignore a SHRINKING cumulative text (a shorter
-      // prefix of the current one) to avoid backwards flicker. Signatures
-      // verified: stripReasoningTagsFromText(text,{mode,trim}): string
-      // (chunk-items-DszNsY2v.d.ts:111-114); stripInlineDirectiveTagsForDelivery(
-      // text): { text } (:153).
-      const cleaned = stripInlineDirectiveTagsForDelivery(
-        stripReasoningTagsFromText(text, { mode: "strict", trim: "both" }),
-      ).text;
-      if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
-      if (cleaned === answerText) return;
-      if (
-        answerText &&
-        answerText.startsWith(cleaned) &&
-        cleaned.length < answerText.length
-      ) {
-        return;
-      }
-      // MISSED-BOUNDARY DEFENSE. Correctness of the REPLACE semantics rests on
-      // core rolling the prior message into the prefix (via
-      // handleAssistantMessageBoundary) BEFORE the first partial of a new
-      // message. That is an unpinned cross-package contract; if the boundary
-      // event is late or never fires, a new message's cumulative partial (which
-      // restarts from "") would otherwise CLOBBER the prior message's streamed
-      // text and later duplicate it against the assembled final.
-      //
-      // Within a single message the cumulative `text` only grows, so each
-      // partial has the current body as a PREFIX. A partial that is neither an
-      // extension of `answerText` nor a shrinking prefix of it (both handled
-      // above) has therefore DIVERGED — a new message began without a boundary.
-      // We perform the same prefix-rollup the boundary would have and count it,
-      // so a belated boundary for this seam degrades to a no-op instead of
-      // rolling twice.
-      //
-      // NOTE: core's `onPartialReply` payload carries no itemId in the pinned
-      // dist (PartialReplyPayload = { text; delta? }), so this seam is detected
-      // from the cumulative text, not an itemId compare.
-      if (answerText.length > 0 && !cleaned.startsWith(answerText)) {
-        rollCurrentIntoPrefix();
-        absorbedMissedBoundaries += 1;
-      }
-      answerText = cleaned;
-      loop.update(composeText());
+    pushAnswerText: (input: PartialAnswerUpdate | string) => {
+      void enqueue(
+        "partial answer update",
+        () => {
+          let lane = currentLane();
+          if (state.stopped || lane.settled) return;
+          const update = typeof input === "string" ? { text: input } : input;
+          const raw =
+            typeof update.text === "string" && update.text.length > 0
+              ? update.text
+              : typeof update.delta === "string" && update.delta.length > 0
+                ? lane.answerText + update.delta
+                : undefined;
+          if (raw === undefined) return;
+          const cleaned = stripInlineDirectiveTagsForDelivery(
+            stripReasoningTagsFromText(raw, { mode: "strict", trim: "both" }),
+          ).text;
+          if (!cleaned || cleaned === lane.answerText) return;
+
+          // This is the sole content-prefix check in the answer state machine.
+          // It is a fail-safe for a missing structured boundary, not an attempt
+          // to correlate callback bodies or final payloads. Explicit replace
+          // updates stay in the same lane even when their text diverges.
+          if (
+            update.replace !== true &&
+            lane.answerText.length > 0 &&
+            !cleaned.startsWith(lane.answerText)
+          ) {
+            warn(
+              `contract violation: cumulative partial diverged without an assistant-message ` +
+                `boundary; preserving generation ${lane.generation} and rotating defensively`,
+            );
+            closeAndRotate();
+            state.absorbedMissedBoundaries += 1;
+            lane = currentLane();
+          }
+
+          lane.answerText = cleaned;
+          lane.answerRevision += 1;
+          lane.lastFailedDelivery = undefined;
+          if (lane.resolution === "empty" || lane.resolution === "unresolved") {
+            lane.resolution = "open";
+          }
+          releaseReadyLanes();
+        },
+        undefined,
+      );
     },
     handleAssistantMessageBoundary: () => {
-      // Roll the just-completed message's text into the prefix and reset the
-      // per-item cumulative buffer for the next message. No-op before the first
-      // message (answerText empty). No loop.update: the composed body is
-      // unchanged at the boundary (answerPrefix += answerText; answerText = "")
-      // so nothing visually changes until the next partial arrives. The final
-      // deliver settles the bubble with the fully assembled reply, so any
-      // prefix-vs-final join divergence (e.g. separator spacing) is transient
-      // and self-correcting.
-      //
-      // IDEMPOTENCY: if the partial-ingest path already detected and rolled this
-      // seam (a boundary that arrived late, after the new message's first
-      // partial), consume the count and no-op — otherwise we would roll the new
-      // (in-progress) message's text into the prefix a second time.
-      if (absorbedMissedBoundaries > 0) {
-        absorbedMissedBoundaries -= 1;
-        return;
-      }
-      rollCurrentIntoPrefix();
-    },
-    flush: () => loop.flush(),
-    snapshotText: () => (hasPendingContent() ? composeText() : ""),
-    finalize: (text) => {
-      // Idempotent: the normal delivery path and the error-recovery path may
-      // both attempt to finalize; only the first wins so we never send two
-      // terminal frames (or finalize onto an already-settled bubble).
-      if (finalizeResult) return finalizeResult;
-      // P0-4 (review R2): arm the latch SYNCHRONOUSLY. `finalizeResult = (async
-      // () => {...})()` only assigns once the body first SUSPENDS, and the body
-      // reaches `transport.finalizeDraft(...)` with no preceding `await` whenever
-      // there is no pending draft content — so the whole terminal-frame send used
-      // to run before the latch existed, leaving it unarmed across exactly the
-      // stretch it exists to protect (the pre-P0-4 code set its `finalized` flag
-      // synchronously). Resolving an already-assigned promise WITH the body's
-      // promise keeps the cached-result contract: every caller, re-entrant or
-      // not, awaits the same single `finalizeDraft` outcome (or rejection).
-      let settleFinalize!: (v: boolean | PromiseLike<boolean>) => void;
-      finalizeResult = new Promise<boolean>((resolve) => { settleFinalize = resolve; });
-      settleFinalize((async () => {
-        // Flush any pending draft text first so the widget has shown the working
-        // bubble at least once (the throttle may not have fired yet for a fast
-        // turn). This must run BEFORE we stop the loop, since flush() bails when
-        // `isStopped()` is true. Then finalize in place onto the same draft id.
-        //
-        // TOCTOU hardening: a pending progress `ws.send` can throw if the socket
-        // slipped to CLOSING between the OPEN check and the send. We must NOT let
-        // that abort finalization — the final answer (and, on the error path, the
-        // settling frame) still has to be delivered. So swallow a flush failure
-        // and proceed to finalizeDraft regardless.
-        if (hasPendingContent()) {
-          loop.update(composeText());
-          try {
-            await loop.flush();
-          } catch {
-            // Pending preview send failed; deliver the final frame anyway below.
+      void enqueue(
+        "assistant-message boundary",
+        () => {
+          if (state.stopped) return;
+          if (state.absorbedMissedBoundaries > 0) {
+            state.absorbedMissedBoundaries -= 1;
+            state.firstBoundarySeen = true;
+            return;
           }
-        }
-        stopped = true;
-        loop.stop();
-        return transport.finalizeDraft(sessionKey, id, text, params.turnId);
-      })());
-      return finalizeResult;
+          if (!state.firstBoundarySeen) {
+            state.firstBoundarySeen = true;
+            return;
+          }
+          closeAndRotate();
+        },
+        undefined,
+      );
     },
+    noteBlockReplyQueued: (input) => {
+      void enqueue(
+        "queued block observation",
+        () => {
+          // Classification precedes every lane lookup or reservation decision.
+          const classifiedNotice = noticeKind(input);
+          if (classifiedNotice) {
+            state.noticeTokens.push({
+              token: nextToken("notice"),
+              noticeKind: classifiedNotice,
+              assistantMessageIndex: input.assistantMessageIndex,
+              state: state.lateReservationEpochOpen ? "pending" : "retired",
+            });
+            return;
+          }
+
+          const reservation: TentativeBlockReservation = {
+            token: nextToken("block"),
+            assistantMessageIndex: input.assistantMessageIndex,
+            state: state.lateReservationEpochOpen ? "pending" : "retired",
+          };
+          state.blockReservations.push(reservation);
+          if (reservation.state === "retired") return;
+
+          let barrierLane: AssistantDraftLane | undefined;
+          if (input.assistantMessageIndex !== undefined) {
+            barrierLane = state.lanes.find(
+              (lane) =>
+                lane.assistantMessageIndex === input.assistantMessageIndex ||
+                lane.generation === input.assistantMessageIndex,
+            );
+            if (barrierLane) barrierLane.assistantMessageIndex ??= input.assistantMessageIndex;
+          } else {
+            const unresolvedCandidates = state.lanes.filter(
+              (lane) => lane.resolution === "unresolved",
+            );
+            if (unresolvedCandidates.length > 1) {
+              warn(
+                `ambiguous indexless block reservation has ${unresolvedCandidates.length} ` +
+                  "unresolved predecessors; retaining the earliest ordering barrier",
+              );
+            }
+            barrierLane =
+              state.lanes.find((lane) => lane.acceptsLateIndexlessReservations) ??
+              unresolvedCandidates[0] ??
+              currentLane();
+            barrierLane.acceptsLateIndexlessReservations = true;
+          }
+          if (!barrierLane) return;
+          reservation.barrierGeneration = barrierLane.generation;
+          barrierLane.tentativeBarrierReservationIds.push(reservation.token);
+        },
+        undefined,
+      );
+    },
+    deliverAuthorizedBlock: (input) =>
+      enqueue(
+        "authorized block delivery",
+        () => {
+          // Re-classify the wire-authoritative payload before touching lane or
+          // reservation state. Both notice and non-notice blocks use the same
+          // independent claim-or-fresh transaction.
+          const actualNotice = noticeKind(input);
+          if (actualNotice) return sendIndependent(input.text, true);
+          return sendIndependent(input.text, true);
+        },
+        false,
+      ),
+    noteDeliveryLifecycle: (kind, input) => {
+      void enqueue(
+        `delivery lifecycle ${kind}`,
+        () => {
+          if (kind === "error") {
+            warn("delivery adapter reported an error; ambiguous reservations await terminal drain");
+          }
+          const index = input.assistantMessageIndex;
+          if (index !== undefined) {
+            const reservations = state.blockReservations.filter(
+              (reservation) =>
+                reservation.state === "pending" &&
+                reservation.assistantMessageIndex === index,
+            );
+            if (reservations.length === 1) retireReservation(reservations[0]!);
+
+            const notices = state.noticeTokens.filter(
+              (token) =>
+                token.state === "pending" && token.assistantMessageIndex === index,
+            );
+            if (notices.length === 1) notices[0]!.state = "retired";
+          }
+          releaseReadyLanes();
+        },
+        undefined,
+      );
+    },
+    finalize: (text) => {
+      const lane = currentLane();
+      if (lane.settleResult) return lane.settleResult;
+      return enqueue(
+        "ordinary answer final",
+        () => {
+          const active = currentLane();
+          if (active.settleOutcome !== undefined) return active.settleOutcome;
+          if (active.settleResult) return false;
+          if (!text) {
+            terminalDrain(false);
+            return false;
+          }
+          if (
+            state.finalReconciliation.leadingTerminalErrorSeen ||
+            state.finalReconciliation.ordinaryAnswerSettled
+          ) {
+            return deliverTerminalIndependent(text);
+          }
+          terminalDrain(false);
+          state.finalReconciliation.ordinaryAnswerSettled = true;
+          active.answerText = text;
+          active.answerRevision += 1;
+          active.lastFailedDelivery = undefined;
+          discardPendingProgress(
+            (frame) => frame.kind === "lane" && frame.generation === active.generation,
+          );
+          return settleLane(active, text);
+        },
+        false,
+      );
+    },
+    deliverIndependentFinal: (input) =>
+      enqueue(
+        "independent final delivery",
+        () => {
+          // The actual flags, not any earlier callback classification, decide
+          // that this payload is independent. Terminal delivery also closes the
+          // late-reservation epoch before sending.
+          noticeKind(input);
+          return deliverTerminalIndependent(input.text);
+        },
+        false,
+      ),
+    noteLeadingTerminalError: () => {
+      void enqueue(
+        "leading terminal error",
+        () => {
+          if (!state.finalReconciliation.ordinaryAnswerSettled) {
+            state.finalReconciliation.leadingTerminalErrorSeen = true;
+          }
+        },
+        undefined,
+      );
+    },
+    drain: () =>
+      enqueue(
+        "terminal draft drain",
+        () => {
+          clearProgressTimer();
+          state.pendingProgress = undefined;
+          terminalDrain(true);
+        },
+        undefined,
+      ),
+    snapshotText: () => currentLane().answerText,
+    flush: () => enqueue("progress flush", flushPendingProgress, undefined),
     stop: () => {
-      // Halt the throttled loop so no late background flush can race cleanup.
-      // Does NOT send a terminal frame; callers that need the widget to settle
-      // a working bubble should use finalize(text) instead.
-      stopped = true;
-      loop.stop();
+      void enqueue(
+        "draft stop",
+        () => {
+          state.stopped = true;
+          clearProgressTimer();
+          state.pendingProgress = undefined;
+        },
+        undefined,
+      );
     },
   };
 }
