@@ -111,12 +111,17 @@ narrowed to agent-down durability — see below).
    a correctness gap: multiple assistant messages currently share one draft id, so the last final can
    erase earlier live messages. The accepted fix settles one bubble per assistant-message boundary
    and rotates to a new id, while letting the first durable lane claim the provisional tool-scaffold id,
-   retaining late indexless callback ownership through terminal drain. Queued callbacks remain
-   independent block-body/credit signals: their cardinality cannot classify finals. After a leading
-   terminal error, non-notice finals without public identity, such as `[A1,A2,B]`, each use a fresh
-   fallback id.
-   This deliberately preserves at least once and may duplicate materialized A/B; exact-once needs a
-   stable public identity and is deferred to
+   retaining late indexless reservations through lifecycle/terminal drain. Queued callbacks are
+   pre-TTS/media and pre-rewrite/cancel, so they never supply wire body or a delivery-suppression
+   credit. Only the actual post-hook block delivery is authoritative, but no public identity correlates
+   it to a reservation—even one remaining reservation can be unrelated. Every authorized non-notice
+   block in partial mode therefore uses a fresh fallback id. Skip/cancel/settled/error lifecycle
+   signals retire reservations, and all three block notice flags take an independent non-lane path.
+   Queued callback cardinality still cannot classify finals. After a leading terminal error,
+   non-notice finals without public identity, such as `[A1,A2,B]`, each use a fresh fallback id.
+   This deliberately preserves at least once and may duplicate materialized A/B; block partial dedupe,
+   same-message grouping, exact lane ownership, and final exact-once need a stable public identity that
+   reaches actual delivery and are deferred to
    [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111). Setup-wizard nit remains:
    it does not offer `streaming.mode` (enroll-only).
 

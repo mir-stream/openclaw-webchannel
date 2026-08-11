@@ -426,12 +426,17 @@ until a history reload restores them.
   then stream the next assistant message under a new id. A first-lane tool scaffold is not assigned to
   an empty assistant lane: it remains a turn-level provisional preview whose id is claimed by the first
   durable assistant message, so `Working…` cannot survive beside the answer as a settled ghost. The
-  public callback contract is weaker than
-  Telegram's internal seam: `onBlockReplyQueued` may arrive after the next message-start callback and
-  its index is optional. The plugin therefore retains unresolved predecessor lanes, prevents later
-  lanes from overtaking them, keeps an indexless late owner open through terminal callback drain so A1/A2
-  stay together, and discards a block delivery only when a queued accounting credit proves its payload
-  was already preserved.
+  public callback contract is weaker than Telegram's internal seam: `onBlockReplyQueued` may arrive
+  after the next message-start callback, its index is optional, and its payload is pre-TTS/media and
+  pre-`beforeDeliver` rewrite/cancel. The plugin therefore retains unresolved predecessor lanes and
+  records only tentative ordering reservations—never queued text/media. Actual post-hook
+  `kind:"block"` delivery is wire-authoritative, but no public identity correlates it to a reservation:
+  even a sole reservation can be unrelated after callback omission or notice→non-notice rewrite.
+  Every authorized non-notice block in partial mode therefore uses a fresh fallback id. Public
+  `onSkip`/`onBeforeDeliverCancelled`/
+  `onDeliverySettled` observers plus delivery `onError` retire tentative state so cancel(A) cannot
+  leave a ghost or permanently block B. The three block notice flags are classified first and take an
+  independent path that never creates, settles, or blocks an assistant lane.
 - **`kind:"final"` is a delivery class, not an assistant-message id.** Core may deliver several final
   payloads in one turn and the pinned builder can replay assistant blocks as `[error,A1,A2,B]`, where
   A1/A2 belong to one lane. Queued callbacks cannot correlate that array: default partial mode may
@@ -439,8 +444,10 @@ until a history reload restores them.
   three terminal assistant texts. Notices do not consume assistant lanes. After a leading error, every
   non-notice final without public identity is preserved under a fresh fallback id. This at-least-once
   policy may duplicate
-  already-materialized A/B, but never drops or guesses ownership; exact-once requires a stable public
-  assistant message/block identity and is deferred to
+  already-materialized A/B, but never drops or guesses ownership. Authorized blocks likewise use
+  at-least-once fallback, so partial duplication and one bubble per block are explicit costs. Block
+  dedupe/same-message grouping/exact lane ownership require a stable public dispatch/message identity
+  that survives rewrite/cancel into actual delivery and are deferred to
   [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111).
 - **Wire primitives already fit the target:** partial uses `{ type:"progress", id, text }`; finalize
   uses `agent_message` with the same `id`. One assistant message uses one id; the id rotates only at
@@ -478,6 +485,10 @@ cardinality. Both the zero-callback default path and the coalesced
 `[A1+"\n\n"+A2@0,B@1]` callback path must leave materialized A/B unchanged and preserve error
 plus every uncorrelated final under fresh fallback ids, explicitly accepting duplicates until #111.
 (Each fallback reports its real delivery result and one failure must not stop later payloads.)
+(Queued payloads must never reach wire; rewrite/cancel, actual send `true`/`false`/throw, cancel(A) → B,
+and all three notice flags with/without partial and interleaved A/B require pinned-runtime coverage.)
+(Every authorized non-notice block in partial mode must use a fresh fallback id regardless of whether
+zero, one, or several reservations are pending; reservations only hold/retire ordering barriers.)
 (With `"progress"`, tool lines remain an ephemeral scaffold and the answer arrives atomically.)
 
 ---
@@ -586,7 +597,7 @@ UX and P0-5 needs #94's multi-message finalize correctness:
 | Order | Gap | Effort | Why |
 |---|---|---|---|
 | 1 | P0-3 argument menus | S | Catalog entries already carry `args.choices`; render a dropdown from them (widget currently inserts the name only). Ties into the P1-5 control renderer. |
-| 2 | P0-5 multi-message finalize (#94) | L | Replace the turn-wide draft with ordered lanes, provisional-preview ownership, late block ownership, independent block credits, and at-least-once final fallback. |
+| 2 | P0-5 multi-message finalize (#94) | L | Replace the turn-wide draft with ordered lanes, provisional-preview ownership, tentative block reservations + lifecycle cleanup, authoritative-delivery fallback, and at-least-once final fallback. |
 
 > ✅ **Done:** P0-1 (history restore), P0-2 (depth cap, #24 — optional scroll-UX polish is all that
 > remains there), P0-3 (slash discovery, #30 — arg menus excepted above), P0-4 (approval cards +
