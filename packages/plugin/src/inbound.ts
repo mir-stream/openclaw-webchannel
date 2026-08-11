@@ -35,6 +35,28 @@ import type {
   ReasoningDraftController,
 } from "./message-adapter.js";
 
+type NoticeFlagPayload = {
+  isStatusNotice?: boolean;
+  isFallbackNotice?: boolean;
+  isCompactionNotice?: boolean;
+};
+
+function noticeFlagsOf(payload: NoticeFlagPayload): NoticeFlagPayload {
+  return {
+    isStatusNotice: payload.isStatusNotice,
+    isFallbackNotice: payload.isFallbackNotice,
+    isCompactionNotice: payload.isCompactionNotice,
+  };
+}
+
+function isCoreNoticePayload(payload: NoticeFlagPayload): boolean {
+  return (
+    payload.isStatusNotice === true ||
+    payload.isFallbackNotice === true ||
+    payload.isCompactionNotice === true
+  );
+}
+
 /**
  * #87: core's own terminal verdict for an agent run, observed off the lifecycle
  * event stream.
@@ -231,6 +253,12 @@ export async function handleInboundMessage(
   // computation in `finally`).
   let answerDelivered = false;
   let terminalErrorSeen = false;
+  // Final reconciliation is deliberately independent of block callback counts
+  // and of `answerDelivered` (which also tracks actual block output for #87).
+  // Only the first ordinary, non-notice final before a leading terminal error
+  // consumes the current assistant lane.
+  let ordinaryAnswerFinalSeen = false;
+  let leadingTerminalErrorSeen = false;
   // Ordinary messages have already been ACKed by ingress and therefore need one
   // settled outcome even when setup fails. Control-lane turns never settle; an
   // explicit DM denial opts out below because no agent turn was admitted.
@@ -304,6 +332,7 @@ export async function handleInboundMessage(
       sessionKey: wsKey,
       turnId,
       channelConfig,
+      logger: api.logger,
     });
   }
   // Reasoning lane is created AFTER route resolution (below), once we can resolve
@@ -540,24 +569,58 @@ export async function handleInboundMessage(
                           ...(answerStreamingEnabled
                             ? {
                                 onPartialReply: (p) => {
-                                  draft!.pushAnswerText(p.text ?? "");
+                                  draft!.pushAnswerText({
+                                    text: p.text,
+                                    delta: p.delta,
+                                    replace: p.replace,
+                                  });
                                 },
                                 onAssistantMessageStart: () => {
                                   draft!.handleAssistantMessageBoundary();
+                                },
+                                onBlockReplyQueued: (payload, context) => {
+                                  draft!.noteBlockReplyQueued({
+                                    assistantMessageIndex: context?.assistantMessageIndex,
+                                    ...noticeFlagsOf(payload),
+                                  });
                                 },
                               }
                             : {}),
                         }
                       : {}),
             },
+            ...(draft
+              ? {
+                  dispatcherOptions: {
+                    onSkip: (payload, info) => {
+                      draft!.noteDeliveryLifecycle("skip", {
+                        assistantMessageIndex: info.assistantMessageIndex,
+                        ...noticeFlagsOf(payload),
+                      });
+                    },
+                    onBeforeDeliverCancelled: (payload, info) => {
+                      draft!.noteDeliveryLifecycle("cancel", {
+                        assistantMessageIndex: info.assistantMessageIndex,
+                        ...noticeFlagsOf(payload),
+                      });
+                    },
+                    onDeliverySettled: (info) => {
+                      draft!.noteDeliveryLifecycle("settled", {
+                        assistantMessageIndex: info.assistantMessageIndex,
+                      });
+                    },
+                  },
+                }
+              : {}),
             // THIS channel's outbound delivery seam. Forward the assembled reply
-            // text to the originating widget's live socket. In either draft mode
-            // (progress/partial) we FINALIZE the in-flight draft (reusing its id)
-            // so the widget transitions the working bubble into the final answer;
-            // otherwise (block/off, no draft) we send a plain no-id agent_message
-            // (legacy append path).
+            // text to the originating widget's live socket. Draft-mode blocks
+            // and non-ordinary finals use the controller's independent delivery
+            // path; only the first ordinary final settles the current lane.
             delivery: {
               deliver: async (payload, info) => {
+                const kind = info.kind;
+                const noticeFlags = noticeFlagsOf(payload);
+                const isNotice = isCoreNoticePayload(payload);
                 const text = payload.text;
                 if (!text) return { visibleReplySent: false };
                 // #87: classify this final payload for the turn outcome.
@@ -598,7 +661,6 @@ export async function handleInboundMessage(
                 //
                 // Status/fallback/compaction notices are core's own chatter and
                 // never count as the turn's answer.
-                const kind = info?.kind;
                 if (kind === "final" || kind === "block") {
                   if (payload.isError === true) {
                     // Only a FINAL error can be the turn's verdict; a block-level
@@ -610,11 +672,7 @@ export async function handleInboundMessage(
                     ) {
                       terminalErrorSeen = true;
                     }
-                  } else if (
-                    !payload.isStatusNotice &&
-                    !payload.isFallbackNotice &&
-                    !payload.isCompactionNotice
-                  ) {
+                  } else if (!isNotice) {
                     answerDelivered = true;
                   }
                 }
@@ -625,16 +683,46 @@ export async function handleInboundMessage(
                 // message's fate, not answer delivery). The dropped answer text is
                 // recovered by the register-time history snapshot (recovery lanes
                 // §5 L3/L6), never by faking the turn outcome.
-                // Only the final reply replaces the draft. Non-final visible
-                // blocks (rare for this channel) fall through to a plain send.
-                if (draft && info?.kind === "final") {
-                  const sent = await draft.finalize(text);
+                if (draft && kind === "block") {
+                  const sent = await draft.deliverAuthorizedBlock({
+                    text,
+                    ...noticeFlags,
+                  });
+                  return { visibleReplySent: sent };
+                }
+                if (draft && kind === "final") {
+                  const isMarkedNonTerminalWarning =
+                    payload.isError === true &&
+                    isReplyPayloadNonTerminalToolErrorWarning(payload);
+                  const isTerminalError =
+                    payload.isError === true && !isMarkedNonTerminalWarning;
+                  if (
+                    isTerminalError &&
+                    !ordinaryAnswerFinalSeen &&
+                    !leadingTerminalErrorSeen
+                  ) {
+                    leadingTerminalErrorSeen = true;
+                    draft.noteLeadingTerminalError();
+                  }
+
+                  const independent =
+                    isNotice ||
+                    payload.isError === true ||
+                    leadingTerminalErrorSeen ||
+                    ordinaryAnswerFinalSeen;
+                  if (!independent) ordinaryAnswerFinalSeen = true;
+                  const sent = independent
+                    ? await draft.deliverIndependentFinal({ text, ...noticeFlags })
+                    : await draft.finalize(text);
                   if (sent) finalReplyDelivered = true;
                   return { visibleReplySent: sent };
                 }
                 const sent = transport.sendText(wsKey, text, undefined, turnId);
-                if (sent && info?.kind === "final") finalReplyDelivered = true;
+                if (sent && kind === "final") finalReplyDelivered = true;
                 return { visibleReplySent: sent };
+              },
+              onError: () => {
+                draft?.noteDeliveryLifecycle("error", {});
               },
             },
           };
@@ -642,50 +730,24 @@ export async function handleInboundMessage(
       },
     });
 
-    // Draft settle (P1-8a). If `inbound.run` resolves WITHOUT ever calling our
-    // `delivery.deliver` with kind:"final", a started progress draft would hang
-    // as an italic "working" bubble forever (the catch below only fires on a
-    // THROW, not this clean resolve). This happens on two clean-resolve paths we
-    // can't tell apart here: (a) core aborted the run (an out-of-band /stop
-    // reached fast-abort while this turn was live), and (b) a silent completion
-    // — a tool-only turn, or an empty/suppressed answer where `deliver`
-    // early-returns on falsy text. So we settle the bubble with the streamed
-    // SNAPSHOT ALONE and add no marker:
-    //   - a genuine abort already gets explicit feedback — core's "/stop" turn
-    //     separately delivers "⚙️ Agent was aborted." — so this bubble only needs
-    //     to settle with what it streamed, not announce anything; and
-    //   - a silent/tool-only completion is correctly settled by its own streamed
-    //     content, where any "Stopped"-style marker would be a mislabel.
-    // `finalize` is idempotent (message-adapter.ts), so a turn that already
-    // delivered its final answer is a no-op here. The `|| "⏹ Stopped."` fallback
-    // is defensively unreachable (`started === true` implies a progress frame was
-    // sent, and frames always carry non-empty `composeText()` output, so
-    // `snapshotText()` is non-empty) — it exists only so the bubble can never
-    // finalize to empty text.
-    if (draft?.started) {
-      const snapshot = draft.snapshotText();
-      await draft.finalize(snapshot || "⏹ Stopped.");
-    }
+    // A clean resolve can have no final delivery (abort, tool-only, or a silent
+    // completion). The controller owns terminal cleanup because `started` and
+    // `snapshotText()` describe different state under the lane model: drain
+    // retires tentative barriers, settles real lane text in generation order,
+    // and settles a lone unclaimed tool preview only for the no-delete case.
+    await draft?.drain();
   } catch (err) {
     turnOutcome = "error";
     api.logger.error?.(`webchannel: inbound dispatch failed: ${String(err)}`);
-    // BLOCKING recovery: if the turn threw AFTER a progress frame was emitted,
-    // the widget is showing a working bubble that will otherwise hang forever
-    // (no terminal frame for that id is ever sent and the draft loop keeps
-    // running). Reuse the finalize path to send a settling `agent_message` for
-    // the SAME draft id with a short apologetic text, so the widget transitions
-    // the bubble out of its italic "working" state into a settled message.
-    //
-    // `finalize` is idempotent, so on the (impossible-here, but defensive) case
-    // where the normal path already finalized before throwing, this is a no-op.
-    if (draft?.started) {
+    // Error cleanup uses the same terminal drain as silent completion. It never
+    // replaces real assistant text with a synthetic marker and never retries a
+    // failed content revision inline.
+    if (draft) {
       try {
-        await draft.finalize(
-          "Sorry — something went wrong while answering. Please try again.",
-        );
-      } catch (finalizeErr) {
+        await draft.drain();
+      } catch (drainErr) {
         api.logger.error?.(
-          `webchannel: draft error-finalize failed: ${String(finalizeErr)}`,
+          `webchannel: draft error-drain failed: ${String(drainErr)}`,
         );
       }
     } else if (!controlLane && !finalReplyDelivered) {

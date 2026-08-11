@@ -36,11 +36,11 @@ import { DEFAULT_BUSY_TURN_LIMITS } from "./inbound-retention.js";
  *  - The abort authorization stamp (`access.commands.authorized`) is passed into
  *    core's `buildContext` ONLY for control-lane turns — never for ordinary
  *    turns (we must not broadly authorize text commands for every peer).
- *  - The aborted-turn defensive finalize: when core aborts the RUNNING turn its
- *    `inbound.run` resolves WITHOUT delivering a final, so a started progress
- *    draft would hang forever. We must finalize it in place with a "Stopped"
- *    marker — but a turn that DID deliver its final must finalize exactly once
- *    with the delivered text (idempotence, no "Stopped" suffix).
+ *  - Terminal draft drain: when core aborts the RUNNING turn its `inbound.run`
+ *    resolves WITHOUT delivering a final. The controller settles real lane
+ *    text in generation order, or a lone visible tool scaffold for the
+ *    no-delete case, without manufacturing a stop-marker bubble. A turn that
+ *    DID deliver its final still finalizes exactly once with that payload.
  *
  * The fake `api.runtime.channel` captures the `buildContext` params and lets each
  * test drive the assembled turn (invoke replyOptions callbacks / delivery) via a
@@ -273,7 +273,7 @@ describe("handleInboundMessage — typing indicator gating", () => {
   });
 });
 
-describe("handleInboundMessage — aborted-turn defensive finalize", () => {
+describe("handleInboundMessage — terminal draft drain", () => {
   it("reports visibleReplySent=false when draft finalization returns false", async () => {
     let visible: boolean | undefined;
     const { api } = makeFakeApi({
@@ -363,7 +363,7 @@ describe("handleInboundMessage — aborted-turn defensive finalize", () => {
       text: "answer me",
     });
 
-    // The delivered final wins; the defensive finalize is an idempotent no-op.
+    // The delivered final wins; terminal drain is an idempotent no-op here.
     expect(finalizes).toHaveLength(1);
     expect(finalizes[0]!.text).toBe("Final answer complete");
     expect(finalizes[0]!.text).not.toContain("Stopped");

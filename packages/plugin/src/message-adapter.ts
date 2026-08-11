@@ -290,11 +290,7 @@ export type ProgressDraftController = {
   /** Queue one tool/item event for the provisional preview writer. */
   pushEvent(input: ChannelProgressDraftLineInput): void;
   /** Queue one cumulative/delta partial update for the current lane. */
-  pushAnswerText: {
-    (update: PartialAnswerUpdate): void;
-    /** Transitional compatibility for inbound.ts until the wiring round. */
-    (text: string): void;
-  };
+  pushAnswerText(update: PartialAnswerUpdate): void;
   /** Close the current assistant lane and open the next ordered lane. */
   handleAssistantMessageBoundary(): void;
   /** Record only tentative ordering/notice state from a queued callback. */
@@ -934,13 +930,12 @@ export function createProgressDraftController(params: {
         undefined,
       );
     },
-    pushAnswerText: (input: PartialAnswerUpdate | string) => {
+    pushAnswerText: (update: PartialAnswerUpdate) => {
       void enqueue(
         "partial answer update",
         () => {
           let lane = currentLane();
           if (state.stopped || lane.settled) return;
-          const update = typeof input === "string" ? { text: input } : input;
           const raw =
             typeof update.text === "string" && update.text.length > 0
               ? update.text
