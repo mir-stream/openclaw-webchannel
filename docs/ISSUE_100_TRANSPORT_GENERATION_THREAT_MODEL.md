@@ -1,11 +1,14 @@
-# #100 — 승인 전달을 transport generation에 바인딩할 것인가
+# #100 — 승인 상태를 무엇에 바인딩할 것인가 (authorization scope)
 
 > 상태: **결정 수정 — #100을 구현 대상으로 유지한다(닫혔다면 재개한다).**
 > 전제: #93 Phase 1(`docs/ISSUE_93_APPROVAL_ORIGIN_ROUTING_PLAN.md`)이 develop에 있다(`c002611`).
 > 범위: 이 문서는 위협 모델과 구현 경계를 정한다. 아직 production 격리가 구현됐다는 뜻은 아니다.
+> 파일명의 `TRANSPORT_GENERATION`은 이 문서가 처음 답하려 한 질문의 잔재다. §6이 정리하듯 채택된
+> 경계는 transport generation이 **아니다**.
 
-#100은 두 단계짜리 이슈다. 먼저 **account runtime 교체(G1 → G2)를 승인 origin 경계로 볼 것인지**
-답하고, 그 경계를 fallback·fast path·snapshot·결정 역경로에 일관되게 적용한다.
+#100은 **승인의 생성·전달·결정 수명 전체를 어떤 경계에 묶을 것인지** 정하고, 그 경계를
+fallback·fast path·snapshot·결정 역경로에 일관되게 적용한다. 최초의 질문은 "account runtime 교체
+(G1 → G2)를 승인 origin 경계로 볼 것인가"였으나, §6이 보이듯 그 축은 경계와 일치하지 않는다.
 
 초기 결론은 raw transport 객체 identity와 인가 경계를 같은 것으로 보고 “구현하지 않는다”였다. 그 결론은
 tenant를 principal에서 빠뜨렸고, #100이 제안한 generation-scoped pending/resolved snapshot까지 적용한 경우를
