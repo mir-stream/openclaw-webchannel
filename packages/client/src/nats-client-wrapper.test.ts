@@ -1122,6 +1122,94 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       "Z partial…",
     ]);
   });
+
+  // --- C6: the first tool scaffold is a provisional preview, not a lane. --
+  it("C6: reusing the provisional scaffold id for the first durable answer leaves no ghost bubble", () => {
+    const w = makeWrapper();
+
+    // The plugin may show tool activity before it knows which assistant-message
+    // lane will first produce durable text. The post-#94 wire contract keeps
+    // that id provisional: if an empty/tool-only assistant message is followed
+    // by answer B, B claims the SAME id and replaces the scaffold in place.
+    deliver(w, {
+      type: "progress",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "Working…\n🛠️ read_file",
+    });
+    deliver(w, {
+      type: "progress",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "B partial…",
+    });
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "B final",
+    });
+    deliver(w, { type: "turn_settled", turnId: "T", outcome: "ok" });
+
+    const messages = w.getState().messages;
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      id: "webchannel-preview",
+      turnId: "T",
+      text: "B final",
+      working: false,
+    });
+    expect(messages.some((m) => m.text.includes("Working"))).toBe(false);
+  });
+
+  // --- C7: retained finals update their lane ids; notices stay separate. ---
+  it("C7: error plus retained A/B final replays update existing lanes without duplicating them", () => {
+    const w = makeWrapper();
+
+    // Before core's terminal array arrives, A is already settled and B is a
+    // visible draft. OpenClaw 2026.6.10 can then deliver [error, A, B]. The
+    // plugin's reconciliation contract gives the notice a fresh id but reuses
+    // A/B's existing ids for the retained assistant payloads.
+    liveBubble(w, "webchannel-a", "T", "A partial…", "A streamed");
+    deliver(w, {
+      type: "progress",
+      id: "webchannel-b",
+      turnId: "T",
+      text: "B partial…",
+    });
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-error",
+      turnId: "T",
+      text: "⚠️ The model errored.",
+    });
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-a",
+      turnId: "T",
+      text: "A retained final",
+    });
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-b",
+      turnId: "T",
+      text: "B retained final",
+    });
+    deliver(w, { type: "turn_settled", turnId: "T", outcome: "error" });
+
+    const messages = w.getState().messages;
+    expect(messages.map((m) => m.id)).toEqual([
+      "webchannel-a",
+      "webchannel-b",
+      "webchannel-error",
+    ]);
+    expect(messages.map((m) => m.text)).toEqual([
+      "A retained final",
+      "B retained final",
+      "⚠️ The model errored.",
+    ]);
+    expect(messages.map((m) => m.working)).toEqual([false, false, false]);
+  });
 });
 
 // ---------------------------------------------------------------------------

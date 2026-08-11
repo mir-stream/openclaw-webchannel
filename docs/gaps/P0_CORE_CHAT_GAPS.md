@@ -420,15 +420,20 @@ until a history reload restores them.
   into `answerPrefix` under one turn-wide draft id. That avoids a mid-stream clobber but loses the
   message boundary; the last `final` then replaces the whole combined draft. #94 replaces this with
   **materialize-and-rotate** behavior: settle the completed assistant message under its existing id,
-  then stream the next assistant message under a new id. The public callback contract is weaker than
+  then stream the next assistant message under a new id. A first-lane tool scaffold is not assigned to
+  an empty assistant lane: it remains a turn-level provisional preview whose id is claimed by the first
+  durable assistant message, so `Working…` cannot survive beside the answer as a settled ghost. The
+  public callback contract is weaker than
   Telegram's internal seam: `onBlockReplyQueued` may arrive after the next message-start callback and
   its index is optional. The plugin therefore retains unresolved predecessor lanes, prevents later
-  lanes from overtaking them, and discards a block delivery only when a queued accounting credit proves
-  its payload was already preserved.
+  lanes from overtaking them, keeps an indexless late owner open through terminal callback drain so A1/A2
+  stay together, and discards a block delivery only when a queued accounting credit proves its payload
+  was already preserved.
 - **`kind:"final"` is a delivery class, not an assistant-message id.** Core may deliver several final
-  payloads in one turn (error/answer/warning orderings). The first available current-lane terminal slot
-  settles once; additional final payloads use fresh ids instead of being swallowed by that lane's
-  settle latch.
+  payloads in one turn and the pinned builder can replay materialized messages as `[error,A,B]`.
+  Notices do not consume assistant lanes; a leading terminal error opens generation-order retained-answer
+  reconciliation so A/B update their existing ids. Only structurally unmatched payloads use diagnosed
+  fresh fallback ids instead of being swallowed by a settle latch.
 - **Wire primitives already fit the target:** partial uses `{ type:"progress", id, text }`; finalize
   uses `agent_message` with the same `id`. One assistant message uses one id; the id rotates only at
   an assistant-message boundary.
@@ -459,8 +464,9 @@ Optional polish: a subtle "working" affordance (cursor/shimmer) beyond the itali
 settle as its own bubble while partial frames edit only the current bubble. A two-message live turn
 must remain two messages after settle and match a fresh history hydrate. No content-based
 `includes`/suffix heuristic may decide whether messages are the same. Error/abort paths must settle
-only the active draft and leave earlier settled bubbles intact. (With `"progress"`, tool lines remain
-an ephemeral scaffold and the answer arrives atomically.)
+only the active draft and leave earlier settled bubbles intact. A tool scaffold followed by an answer
+must reuse one provisional id, and `[error,A,B]` retained-final delivery must leave A/B exactly once.
+(With `"progress"`, tool lines remain an ephemeral scaffold and the answer arrives atomically.)
 
 ---
 
