@@ -1095,7 +1095,9 @@ export class WebChannelNATSClient {
           // released and invert the P1-9 FIFO order. `turnActive` is advisory, so
           // its ordering relative to the publish costs nothing.
           this.client.sendUserMessage(text, wireId);
-          if (opened) this.setState({ turnActive: true });
+          if (opened && this.openTurns.has(wireId)) {
+            this.setState({ turnActive: true });
+          }
         }
       }
     } finally {

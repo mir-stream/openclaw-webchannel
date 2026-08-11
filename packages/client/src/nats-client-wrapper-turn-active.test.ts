@@ -826,4 +826,33 @@ describe("WebChannelNATSClient — #96 turnActive, valve and release edges", () 
     expect(order).toEqual(["send", "flip"]);
     w.close();
   });
+
+  it("a bubble-less release cannot resurrect turnActive after re-entrant close", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    let publishes = 0;
+    vi.spyOn(inner(w), "sendUserMessage").mockImplementation(() => {
+      publishes++;
+      if (publishes === 2) w.close();
+      return "w-1";
+    });
+
+    w.send("active");
+    const activeTurnId = wireIdOf(w, "active");
+    deliver(w, { type: "typing" }); // turn in flight → the follow-up is held
+    w.send("held");
+    const localId = heldOf(w)[0].localId;
+    const holder = w as unknown as { state: { messages: Array<{ id: string }> } };
+    holder.state = {
+      ...holder.state,
+      messages: holder.state.messages.filter((m) => m.id !== localId),
+    };
+
+    deliver(w, { type: "turn_settled", turnId: activeTurnId });
+
+    expect(publishes).toBe(2);
+    expect(heldOf(w)).toHaveLength(0);
+    expect([...openTurnsOf(w)]).toEqual([]);
+    expect(w.getState().turnActive).toBe(false);
+  });
 });
