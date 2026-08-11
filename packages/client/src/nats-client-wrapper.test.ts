@@ -282,6 +282,18 @@ describe("WebChannelNATSClient — P1-7 error cause on state", () => {
     expect(s.status).toBe("error");
     expect(s.error).toBe("boom");
     expect(s.errorCause).toBe("secure-channel-failed");
+    // #92: the connected event above runs the register hop, which fails ("not
+    // connected" — there is no socket) and answers with a REAL-timer redial.
+    // Left open, this instance keeps dialing for the rest of the FILE, and its
+    // stray sockets land in whatever fake a later describe has installed
+    // globally. Close it so the leak dies with the test that caused it.
+    //
+    // The redial is a HARNESS artifact, not the production shape: `emitError`
+    // only fires the error listeners, so `terminalReached` is never set here and
+    // `onConnected`'s retirement guard (`nats-client.ts`, "a terminally-retired
+    // instance must NOT re-register") does not fire. A real registration-path
+    // terminal sets that latch and disconnects instead of redialing.
+    w.close();
   });
 
   it("sticky guard: a trailing onState(false) after an error does NOT clear the cause", () => {
@@ -2177,7 +2189,23 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   const fireSession = (w: Wrapper) => inner(w).notifySessionListeners();
 
   // Real socket + real conversation key over the register-delivered-K path.
-  const lastWs = () => FakeRegisterWS.instances[FakeRegisterWS.instances.length - 1];
+  /**
+   * Connect and CAPTURE the socket THIS wrapper dialed. Load-bearing (#92): never
+   * reach for "the newest FakeRegisterWS" — `instances` is a module-global the
+   * fake appends to from its own constructor, and a wrapper an earlier test never
+   * closed keeps redialing on REAL timers long after that test returned. Its stray
+   * dial appends here MID-test and silently becomes "the newest", so a wire
+   * assertion reads the intruder's empty `sent` instead of ours — which is exactly
+   * how 10b failed in CI (`expected [] to have a length of 1 but got +0`) while
+   * the behavior under test was fine. The specific leak is now closed at its
+   * source (the P1-7 retirement test), but capturing is what makes these
+   * assertions structurally immune to the next one. `connect()` dials
+   * synchronously, so the instance appended by this call is unambiguously ours.
+   */
+  function dial(w: Wrapper): FakeRegisterWS {
+    w.connect();
+    return FakeRegisterWS.instances[FakeRegisterWS.instances.length - 1];
+  }
   const keyState = (w: Wrapper) => inner(w) as unknown as { sessionKey: unknown };
   async function waitFor(pred: () => boolean, n = 100): Promise<void> {
     for (let i = 0; i < n; i++) {
@@ -2188,8 +2216,9 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   }
   /**
    * Wait for the (already-wired) register round-trip to deliver + unwrap K, then
-   * let the onSession-driven release settle. The caller sets `lastWs().handler`
-   * after connect (and, for the delayed-key test, gates the register reply).
+   * let the onSession-driven release settle. The caller sets `.handler` on the
+   * socket `dial()` captured (and, for the delayed-key test, gates the register
+   * reply).
    */
   async function establishKey(w: Wrapper): Promise<void> {
     await waitFor(() => Boolean(keyState(w).sessionKey));
@@ -2382,8 +2411,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     // onState(true) fires (connected) while sessionEstablished stays false.
     let releaseRegister = () => {};
     const gate = new Promise<void>((r) => { releaseRegister = r; });
-    w.connect();
-    lastWs().handler = makeRegisterHandler(
+    dial(w).handler = makeRegisterHandler(
       "t", "a", "p",
       (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "p", cn),
       gate,
@@ -2408,8 +2436,8 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
   it("10b: on reconnect a ledgered M1 replays on the wire BEFORE a released hold M2", async () => {
     const { registration, deviceKP, agentId, K } = await realRegistration();
     const w = makeWrapper(registration);
-    w.connect();
-    lastWs().handler = makeRegisterHandler(
+    const ws = dial(w); // every wire assertion below reads OUR socket (see `dial`)
+    ws.handler = makeRegisterHandler(
       "t", "a", "p",
       (cn) => wrapLikeAgent(K, deviceKP.publicKeyBytes, agentId, "p", cn),
     );
@@ -2420,14 +2448,14 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     const c = inner(w);
     const realSUM = c.sendUserMessage.bind(c);
     vi.spyOn(c, "sendUserMessage").mockImplementation((text: string) => {
-      counts.push(inboundPubs(lastWs()).length);
+      counts.push(inboundPubs(ws).length);
       return realSUM(text);
     });
 
     w.send("M1"); // sealed publish + recorded in the P0-7b unacked ledger
     deliver(w, { type: "typing" }); // start a turn so the next send holds
     w.send("M2"); // held
-    expect(inboundPubs(lastWs())).toHaveLength(1); // only M1 on the wire so far
+    expect(inboundPubs(ws)).toHaveLength(1); // only M1 on the wire so far
 
     // Session drop that KEEPS the unacked ledger (resetSession keeps it), then
     // reconnect on the same socket → onConnected re-runs register + key delivery.
@@ -2439,7 +2467,7 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     await establishKey(w); // session 2: flushQueue replays M1, THEN onSession releases M2
 
     // Wire: [M1 (initial), M1 (ledger replay), M2 (released hold)] — three publishes.
-    expect(inboundPubs(lastWs())).toHaveLength(3);
+    expect(inboundPubs(ws)).toHaveLength(3);
     // sendUserMessage fired for M1 (0 prior `.in`) then M2 (2 prior `.in` — its own
     // send + the ledger replay). The "2" proves the replay preceded the release.
     expect(counts).toEqual([0, 2]);

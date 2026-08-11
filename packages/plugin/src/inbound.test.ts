@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 // #87: core marks a NON-terminal tool-error warning through WeakMap-backed
 // payload metadata, which a test cannot attach (the setter is not part of the
@@ -18,6 +18,11 @@ import {
   stopAgentLifecycleSubscription,
 } from "./inbound.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
+import {
+  APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY,
+  ApprovalOriginLeaseRegistry,
+} from "./approval-origin.js";
+import { resolveWebchannelSessionRoute } from "./session-route.js";
 
 /**
  * P1-8a — `handleInboundMessage` control-lane behaviour.
@@ -922,5 +927,427 @@ describe("agent lifecycle subscription lifetime", () => {
     const api = { runtime: {} } as unknown as OpenClawPluginApi;
     expect(() => startAgentLifecycleSubscription(api)).not.toThrow();
     expect(() => stopAgentLifecycleSubscription()).not.toThrow();
+  });
+});
+
+/**
+ * #93 — the approval-origin lease window (plan §4.3 / §6.2).
+ *
+ * The lease must exist for EXACTLY the window in which the agent run can emit a
+ * tool approval: from `onAgentRunStart` to the outer `finally`. Both boundaries
+ * are safety boundaries, in opposite directions — claiming before the run starts
+ * lets a denied or failed-setup turn absorb someone else's approval, and failing
+ * to release on any exit path leaves a claim that poisons the tuple for every
+ * later origin on the same key.
+ *
+ * The production registry runs on `Date.now` and compares request times
+ * STRICTLY, so these tests plant their own registry with an injected clock in
+ * the versioned global slot. The getter validates structurally, which is what
+ * makes that possible — and `handleInboundMessage` re-reads the slot per turn,
+ * which is what makes it take effect.
+ */
+describe("handleInboundMessage — approval-origin lease", () => {
+  const slots = globalThis as unknown as Record<symbol, unknown>;
+  const ordinary = { type: "user_message" as const, text: "please write the file" };
+
+  let saved: unknown;
+  let nowMs: number;
+  let registry: ApprovalOriginLeaseRegistry;
+
+  beforeEach(() => {
+    saved = slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY];
+    nowMs = 1_000;
+    registry = new ApprovalOriginLeaseRegistry({ now: () => nowMs });
+    slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = registry;
+  });
+
+  afterEach(() => {
+    if (saved === undefined) delete slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY];
+    else slots[APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY] = saved;
+  });
+
+  /**
+   * Ask the registry exactly what the approval resolver will ask it, deriving
+   * the session key through the SAME helper the inbound path uses so the key is
+   * byte-identical rather than hand-copied.
+   */
+  function resolveOrigin(
+    api: OpenClawPluginApi,
+    requestCreatedAtMs: number,
+    peerId = "peer-1",
+    accountId = "default",
+  ): ReturnType<ApprovalOriginLeaseRegistry["resolve"]> {
+    return registry.resolve({
+      rawAccountId: accountId,
+      sessionKey: resolveWebchannelSessionRoute(api, accountId, peerId).sessionKey,
+      requestCreatedAtMs,
+    });
+  }
+
+  function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  it("claims nothing until onAgentRunStart, then resolves the exact peer", async () => {
+    // NOTE: observations are recorded and asserted AFTER the turn.
+    // `handleInboundMessage` catches everything the dispatcher throws, so an
+    // `expect` inside `runImpl` would be swallowed and the test would pass
+    // whatever happened.
+    let beforeStart: unknown;
+    let afterStart: unknown;
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        // Dispatched, route resolved, handle created — but the run has not
+        // started, so a request arriving now belongs to nobody.
+        nowMs = 1_030;
+        beforeStart = resolveOrigin(made.api, 1_020);
+
+        nowMs = 1_040;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        nowMs = 1_060;
+        afterStart = resolveOrigin(made.api, 1_050);
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", ordinary);
+
+    expect(beforeStart).toEqual({ kind: "no_match" });
+    expect(afterStart).toEqual({ kind: "resolved", peerId: "peer-1" });
+  });
+
+  it("is observable to an approval lookup while the run is paused mid-turn", async () => {
+    // The shape the real bug takes: the approval arrives from OUTSIDE this
+    // turn's call stack while the run is still awaiting a tool decision.
+    const started = deferred();
+    const finish = deferred();
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        started.resolve();
+        await finish.promise;
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    await started.promise;
+
+    nowMs = 1_060;
+    expect(resolveOrigin(made.api, 1_050)).toEqual({
+      kind: "resolved",
+      peerId: "peer-1",
+    });
+
+    finish.resolve();
+    await turnPromise;
+    expect(resolveOrigin(made.api, 1_050)).toEqual({ kind: "no_match" });
+  });
+
+  it("releases on a normal completion", async () => {
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        await turn.delivery.deliver({ text: "done" }, { kind: "final" });
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    nowMs = 1_060;
+    expect(resolveOrigin(made.api, 1_050)).toEqual({ kind: "no_match" });
+  });
+
+  it("releases when the turn throws", async () => {
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        throw new Error("provider exploded");
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    nowMs = 1_060;
+    expect(resolveOrigin(made.api, 1_050)).toEqual({ kind: "no_match" });
+  });
+
+  it("releases on an abort (run resolves with no final delivered)", async () => {
+    const made = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        turn.replyOptions?.onPartialReply?.({ text: "half an ans" });
+        // Core aborted the run: it resolves without ever delivering a final.
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    nowMs = 1_060;
+    expect(resolveOrigin(made.api, 1_050)).toEqual({ kind: "no_match" });
+  });
+
+  it("claims once when onAgentRunStart repeats (model fallback)", async () => {
+    let duringRun: unknown;
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        // A second start must neither add a claim nor re-capture the time: a
+        // re-captured 1_100 would make the 1_050 request ineligible.
+        nowMs = 1_100;
+        turn.replyOptions?.onAgentRunStart?.("run-2");
+        nowMs = 1_120;
+        duringRun = resolveOrigin(made.api, 1_050);
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", ordinary);
+
+    expect(duringRun).toEqual({ kind: "resolved", peerId: "peer-1" });
+    // One release ends the turn's ownership. A duplicated claim would have
+    // survived it, because release removes exactly one claim by id.
+    nowMs = 1_140;
+    expect(resolveOrigin(made.api, 1_130)).toEqual({ kind: "no_match" });
+  });
+
+  it("claims on the control lane but is never selectable there", async () => {
+    // A `/stop` whose fast-abort finds nothing to consume falls through to an
+    // ordinary agent turn that can call tools and request approvals. It is
+    // exempt from being ANSWERED with, not from being recorded — see the
+    // cross-peer test below for what being unrecorded would cost.
+    let callbackType: string | undefined;
+    let duringRun: unknown;
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        // Record that the callback really is wired for this turn — otherwise
+        // the assertion below would pass for the wrong reason.
+        callbackType = typeof turn.replyOptions?.onAgentRunStart;
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        nowMs = 1_060;
+        duringRun = resolveOrigin(made.api, 1_050);
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    await handleInboundMessage(made.api, transport, "peer-1", userMessage, "default", {
+      controlLane: true,
+    });
+
+    expect(callbackType).toBe("function");
+    expect(duringRun).toEqual({ kind: "no_match" });
+    nowMs = 1_080;
+    expect(resolveOrigin(made.api, 1_070)).toEqual({ kind: "no_match" });
+  });
+
+  it("a control-lane run over another peer's claim yields ambiguous, not that peer", async () => {
+    // Two peers collapsed onto ONE session key by `session.identityLinks` — the
+    // collision that makes a stored `lastTo` insufficient on its own.
+    //
+    // peer-2 holds an ordinary claim. peer-1's control-lane message falls
+    // through to a real agent run and requests an approval. If that run were
+    // unrecorded, the registry would find exactly one eligible claim — peer-2's
+    // — and peer-1's permission prompt would land in peer-2's browser.
+    const identityLinks = { "shared-user": ["peer-1", "peer-2"] };
+    const started = deferred();
+    const finish = deferred();
+    const ordinaryRun = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-peer-2");
+        started.resolve();
+        await finish.promise;
+      },
+    });
+    (ordinaryRun.api.config as { session?: unknown }).session = { identityLinks };
+    const { transport: transport2 } = makeFakeTransport();
+    const ordinaryTurn = handleInboundMessage(
+      ordinaryRun.api,
+      transport2,
+      "peer-2",
+      ordinary,
+    );
+    await started.promise;
+
+    // Both peers now share one session key, so this is the same canonical tuple.
+    const linkedKey = resolveWebchannelSessionRoute(ordinaryRun.api, "default", "peer-2")
+      .sessionKey;
+    expect(
+      resolveWebchannelSessionRoute(ordinaryRun.api, "default", "peer-1").sessionKey,
+    ).toBe(linkedKey);
+
+    let duringControlRun: unknown;
+    const controlRun = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        // The fast-abort found nothing; this is a real agent run now.
+        nowMs = 1_020;
+        turn.replyOptions?.onAgentRunStart?.("run-peer-1");
+        nowMs = 1_040;
+        // peer-1's own request must NOT be answered with peer-2.
+        duringControlRun = registry.resolve({
+          rawAccountId: "default",
+          sessionKey: linkedKey,
+          requestCreatedAtMs: 1_030,
+        });
+      },
+    });
+    (controlRun.api.config as { session?: unknown }).session = { identityLinks };
+    const { transport: transport1 } = makeFakeTransport();
+    await handleInboundMessage(controlRun.api, transport1, "peer-1", userMessage, "default", {
+      controlLane: true,
+    });
+
+    expect(duringControlRun).toEqual({ kind: "ambiguous" });
+
+    finish.resolve();
+    await ordinaryTurn;
+  });
+
+  it("rotates the epoch on teardown, refusing requests stamped before it", async () => {
+    const started = deferred();
+    const finish = deferred();
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        started.resolve();
+        await finish.promise;
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    await started.promise;
+    nowMs = 1_030;
+    expect(resolveOrigin(made.api, 1_020)).toEqual({
+      kind: "resolved",
+      peerId: "peer-1",
+    });
+
+    stopAgentLifecycleSubscription(); // draws a new barrier at 1_030
+    // The same request the registry answered a moment ago is now unattributable:
+    // it predates the barrier, so a gateway replay of it cannot be delivered.
+    expect(resolveOrigin(made.api, 1_020)).toEqual({ kind: "invalid_request_time" });
+
+    finish.resolve();
+    await turnPromise;
+  });
+
+  it("never resolves a handle left dormant across the rotation", async () => {
+    let afterLateStart: unknown;
+    const started = deferred();
+    const finish = deferred();
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        // The handle exists (the route resolved) but the run has NOT started.
+        started.resolve();
+        await finish.promise;
+        nowMs = 1_040;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        nowMs = 1_060;
+        afterLateStart = resolveOrigin(made.api, 1_050);
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    await started.promise;
+    nowMs = 1_030;
+    stopAgentLifecycleSubscription(); // barrier 1_030, epoch rotated
+
+    finish.resolve();
+    await turnPromise;
+
+    expect(afterLateStart).toEqual({ kind: "no_match" });
+    nowMs = 1_080;
+    expect(resolveOrigin(made.api, 1_070)).toEqual({ kind: "no_match" });
+  });
+
+  it("keeps a run active across the rotation, post-barrier only, released by its own finally", async () => {
+    const started = deferred();
+    const finish = deferred();
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        started.resolve();
+        await finish.promise;
+      },
+    });
+    const { transport } = makeFakeTransport();
+
+    const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    await started.promise;
+    nowMs = 1_030;
+    stopAgentLifecycleSubscription(); // barrier 1_030; the claim is NOT cleared
+
+    nowMs = 1_060;
+    // A replayed pre-barrier request stays refused …
+    expect(resolveOrigin(made.api, 1_020)).toEqual({ kind: "invalid_request_time" });
+    // … but a request this still-running run genuinely creates afterwards is
+    // deliverable to its exact peer.
+    expect(resolveOrigin(made.api, 1_050)).toEqual({
+      kind: "resolved",
+      peerId: "peer-1",
+    });
+
+    finish.resolve();
+    await turnPromise;
+    expect(resolveOrigin(made.api, 1_050)).toEqual({ kind: "no_match" });
+  });
+
+  it("lets a handler that was in flight at teardown settle and release itself", async () => {
+    // The dispatcher fake holds the handler in flight across the rotation,
+    // which is what the queue really does — dispose settles running handlers
+    // rather than aborting them.
+    const started = deferred();
+    const finish = deferred();
+    const made = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        nowMs = 1_010;
+        turn.replyOptions?.onAgentRunStart?.("run-1");
+        started.resolve();
+        await finish.promise;
+        await turn.delivery.deliver({ text: "finished after teardown" }, { kind: "final" });
+      },
+    });
+    const { transport, settles } = makeFakeTransport();
+
+    const turnPromise = handleInboundMessage(made.api, transport, "peer-1", ordinary);
+    await started.promise;
+    nowMs = 1_030;
+    stopAgentLifecycleSubscription();
+
+    finish.resolve();
+    await turnPromise;
+
+    // The handler ran to completion after the rotation …
+    expect(settles).toEqual(["ok"]);
+    // … and its own `finally` released its own claim.
+    nowMs = 1_080;
+    expect(resolveOrigin(made.api, 1_070)).toEqual({ kind: "no_match" });
   });
 });
