@@ -34,7 +34,7 @@ import {
 } from "./nats-client-wrapped.test-harness.js";
 
 // REAL plugin ingress seams (dependency-free pure functions).
-import { coalesceUserMessages } from "../../plugin/src/inbound-queue.js";
+import { coalesceUserMessages, readCoalescedMemberIds } from "../../plugin/src/inbound-queue.js";
 import { recordCancelledInboundItems, type IngressDedupeCheck } from "../../plugin/src/ingress-dedupe.js";
 
 const OUT = outboundSubject(TENANT, AGENT, PEER);
@@ -88,15 +88,15 @@ const userBubble = (w: WebChannelNATSClient, text: string) =>
 // seam coverage — the full-loop behavior is pinned by the client-side T-co/T-st
 // over fake frames plus the plugin's own ingress tests.
 describe("P0-4 cross-package SEAM integration", () => {
-  // T-co seam: a real 3-message burst → the real coalescer picks the LAST id as
-  // the turn anchor; the client completes ONLY that receipt, the earlier two rest
-  // at accepted. The turnId the client promotes on is the coalescer's output over
-  // the client's own wire ids.
-  it("T-co seam: the real coalescer's last-id anchor completes ONLY that client receipt", async () => {
+  // T-co seam: a real 3-message burst → the real coalescer preserves every
+  // member wireId in arrival order, with the LAST id as the turn anchor. The
+  // current plugin emits one same-outcome settle per member, anchor last; the
+  // real client promotes each frame's exact wireId.
+  it("T-co seam: the real coalescer's member list completes every client receipt", async () => {
     const h = await connectWrapper();
-    h.wrapper.send("c1");
-    h.wrapper.send("c2");
-    h.wrapper.send("c3");
+    const r1 = h.wrapper.send("c1")!;
+    const r2 = h.wrapper.send("c2")!;
+    const r3 = h.wrapper.send("c3")!;
     await settle();
     const w1 = userBubble(h.wrapper, "c1").wireId!;
     const w2 = userBubble(h.wrapper, "c2").wireId!;
@@ -109,14 +109,24 @@ describe("P0-4 cross-package SEAM integration", () => {
       { type: "user_message", id: w3, text: "c3" },
     ]);
     expect(merged.id).toBe(w3); // inbound.ts derives turnId = message.id
+    const memberIds = [...readCoalescedMemberIds(merged)];
+    expect(memberIds).toEqual([w1, w2, w3]);
+    expect(memberIds.at(-1)).toBe(merged.id);
 
-    // Admit all three (ingress acks the whole batch), then settle the ONE turn.
+    // Admit all three (ingress acks the whole batch), then model the current
+    // plugin's settle producer from the REAL coalescer member list: same outcome,
+    // arrival order, anchor last.
     deliverOut(h.K, { type: "ack", ids: [w1, w2, w3] });
-    deliverOut(h.K, { type: "turn_settled", turnId: merged.id, outcome: "ok" });
+    const settleFrames = memberIds.map((turnId) => ({ type: "turn_settled", turnId, outcome: "ok" } as const));
+    expect(settleFrames.map((frame) => frame.turnId)).toEqual([w1, w2, merged.id]);
+    for (const frame of settleFrames) deliverOut(h.K, frame);
     await settle();
 
-    expect(userBubble(h.wrapper, "c1").sendState).toBe("accepted");
-    expect(userBubble(h.wrapper, "c2").sendState).toBe("accepted");
+    expect(r1.snapshot().state).toBe("completed");
+    expect(r2.snapshot().state).toBe("completed");
+    expect(r3.snapshot().state).toBe("completed");
+    expect(userBubble(h.wrapper, "c1").sendState).toBe("completed");
+    expect(userBubble(h.wrapper, "c2").sendState).toBe("completed");
     expect(userBubble(h.wrapper, "c3").sendState).toBe("completed");
     h.wrapper.close();
   });

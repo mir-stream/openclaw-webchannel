@@ -920,14 +920,16 @@ export class WebChannelNATSClient {
   /**
    * Close a settled turn AND every turn opened before it (insertion order).
    *
-   * `turn_settled` is NOT 1:1 with a publish. The agent buffers messages that
-   * arrive while a turn runs and merges them: `inbound-queue.ts`
+   * Turns are NOT 1:1 with publishes. The agent buffers messages that arrive
+   * while a turn runs and merges them: `inbound-queue.ts`
    * `coalesceUserMessages` folds N buffered messages into one turn keyed by the
-   * LAST id (`messages[messages.length - 1].id`), and `inbound.ts` derives
-   * `turnId = message.id` — so a coalesced group emits exactly ONE settle, for
-   * its last wireId. Every earlier wireId in that group would otherwise sit in
-   * `openTurns` forever on a perfectly healthy connection (no draft, no
-   * disconnect, no `/stop`), which is a permanent false "still working".
+   * LAST id (`messages[messages.length - 1].id`). The current plugin emits one
+   * same-outcome `turn_settled` per member, in arrival order with that anchor
+   * last. Exact-id receipt promotion handles the normal path. The prefix sweep
+   * here remains necessary when an earlier member frame is lost/missing and for
+   * older anchor-only v3 plugin builds; without
+   * it an earlier wireId could sit in `openTurns` forever on a healthy
+   * connection, a permanent false "still working".
    *
    * The session's work is processed in publish order and coalescing only ever
    * merges FORWARD, so a settle for `w3` proves every turn published before `w3`
@@ -1903,11 +1905,13 @@ export class WebChannelNATSClient {
   }
 
   /**
-   * P0-4 (§1 coalesce anchor): promote the ANCHOR user bubble of `turnId` — the
-   * one whose wireId === turnId — to `completed` (outcome ok) or fail it
-   * `turn-failed` (outcome error). A coalesced non-anchor send (wireId ≠ turnId)
-   * is intentionally left at `accepted`: admission is guaranteed, turn outcome is
-   * observed per turn.
+   * P0-4: promote the exact user bubble named by `turnId` (wireId === turnId) to
+   * `completed` (outcome ok) or fail it `turn-failed` (outcome error). The method
+   * keeps its historical anchor name, but the current plugin sends one frame per
+   * coalesced member, so repeated exact-id promotion resolves the whole group.
+   * An older anchor-only producer, or a missing member frame, leaves an unnamed
+   * non-anchor receipt at `accepted`; the turn-activity prefix sweep does not
+   * fabricate a receipt outcome.
    */
   private promoteAnchor(turnId: string, state: "completed" | "failed", failure?: SendFailure): void {
     const anchor = this.state.messages.find((m) => m.role === "user" && m.wireId === turnId);
@@ -2358,10 +2362,12 @@ export class WebChannelNATSClient {
         // can fan out synchronously, and a delayed publish callback must not open
         // a turn whose settle has already arrived.
         const turnPlacement = this.consumeTurnOpeningsThrough(msg.turnId);
-        // P0-4 (§1): promote the send only on an EXPLICIT outcome. `"ok"` →
-        // `accepted → completed` on the anchor (turnId === wireId); `"error"` →
-        // `failed{turn-failed, retryable:true}`. ABSENT `outcome` = legacy plugin
-        // (fires turn_settled from a finally regardless of success): the UI still
+        // P0-4 (§1): promote the exact send named by an EXPLICIT outcome.
+        // `"ok"` → `accepted → completed` where turnId === wireId; `"error"`
+        // → `failed{turn-failed, retryable:true}`. The current plugin emits one
+        // same-outcome frame per coalesced member, anchor last. ABSENT `outcome`
+        // means a legacy plugin (fires turn_settled from a finally regardless of
+        // success): the UI still
         // settles below, but the send honestly stays `accepted` — never a
         // fabricated `completed`. A turn_settled that beats the ack promotes
         // straight past `sent` (the receipt guard allows the monotonic upgrade).
@@ -2375,12 +2381,14 @@ export class WebChannelNATSClient {
         // close the client; that teardown cannot overwrite completed/turn-failed.
         //
         // #96: this frame ends the turn it names AND every turn published before
-        // it (server-side coalescing emits one settle for a merged group, keyed
-        // by its LAST wireId — see `closeTurnsThrough`). A legacy plugin's
-        // outcome-less `turn_settled` closes just the same (the settlement is
-        // what matters, not the outcome). Unknown/foreign ids and replays of an
-        // already-consumed local settle remain no-ops; a local settle racing its
-        // first sent callback still closes the already-open prefix.
+        // it. Current coalesced groups emit one frame per member, anchor last;
+        // the prefix behavior preserves compatibility with older anchor-only
+        // producers and recovers from lost/missing earlier member frames (see
+        // `closeTurnsThrough`). An outcome-less legacy `turn_settled` closes just
+        // the same (the settlement is what matters, not the outcome).
+        // Unknown/foreign ids and replays of an already-consumed local settle
+        // remain no-ops; a local settle racing its first sent callback still
+        // closes the already-open prefix.
         const turnClosed = this.closeTurnsThrough(turnPlacement);
         this.setState({ isTyping: false, ...(turnClosed ? { turnActive: false } : {}) });
         // P1-9 §3.6.1: settled ⇒ no more upserts — finalize any lingering working

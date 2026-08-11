@@ -12,8 +12,19 @@ import {
   type ApprovalOriginLease,
 } from "./approval-origin.js";
 
-/** The inbound path only handles user messages; approvals route separately. */
-type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }>;
+import { readCoalescedMemberIds, type CoalescedMemberIds } from "./inbound-queue.js";
+
+/**
+ * The inbound path only handles user messages; approvals route separately.
+ *
+ * #99: a turn handed down by the per-session FIFO may be the MERGE of several
+ * buffered user messages, in which case it carries their wireIds internally
+ * (`coalescedIds`). That field is added by `coalesceUserMessages` after the
+ * frame left the wire — it is not part of `InboundWsMessage` — and is absent
+ * on an ordinary single-message turn.
+ */
+type InboundUserMessage = Extract<InboundWsMessage, { type: "user_message" }> &
+  CoalescedMemberIds;
 import {
   resolveStreamingMode,
   createProgressDraftController,
@@ -736,10 +747,58 @@ export async function handleInboundMessage(
     }
     // A `verdict === "ok"` never downgrades the `catch` above: this block only
     // ever ASSIGNS "error".
-    if (settlementEligible && !transport.sendTurnSettled(wsKey, turnId, turnOutcome)) {
-      api.logger?.warn?.(
-        `webchannel: turn_settled was not delivered for peer=${wsKey} turn=${turnId} outcome=${turnOutcome}`,
-      );
+    if (settlementEligible) {
+      // #99: this turn may be the merge of N buffered user messages (P1-8b layer
+      // (b) coalescing). Each of them was ACKed and holds its own P0-4 receipt,
+      // and only a `turn_settled` naming that exact wireId can move it off
+      // `accepted` — the client's `promoteAnchor` matches strictly on the id.
+      // Settling only the anchor strands the other N-1 receipts forever, so we
+      // settle EVERY member with THIS turn's outcome: the group ran as one turn,
+      // so it succeeded or failed as one.
+      //
+      // No protocol change and no client change: `turn_settled{turnId,outcome}`
+      // already exists, and an already-deployed client promotes whichever
+      // receipt each frame names (`finalizeDraftsForTurn` is a no-op for a
+      // non-anchor id — drafts and `agent_message` frames only ever carry the
+      // anchor turnId).
+      //
+      // Anchor LAST, exactly once each: the anchor is the id the UI ends the
+      // turn on, so the member frames must not trail it.
+      //
+      // The member list is read through `readCoalescedMemberIds`, which cannot
+      // throw and cannot return an unbounded or non-string list. That matters
+      // here specifically: this loop runs BEFORE the anchor is pushed, so a
+      // throw would emit ZERO settle frames — the dispatcher swallows the
+      // rejection and every receipt in the turn, anchor included, would be
+      // stranded at `accepted`.
+      const settleIds: string[] = [];
+      const seenSettleIds = new Set<string>([turnId]);
+      for (const memberId of readCoalescedMemberIds(message)) {
+        if (seenSettleIds.has(memberId)) continue;
+        seenSettleIds.add(memberId);
+        settleIds.push(memberId);
+      }
+      settleIds.push(turnId);
+      for (const settleId of settleIds) {
+        // One frame must never take the group down with it. `transport` is an
+        // interface: the shipped channel wraps its publish and returns a
+        // boolean, but a throwing implementation here would skip every id still
+        // queued — including the ANCHOR, which is emitted last — and the throw
+        // would escape from a `finally` (masking any in-flight error) into the
+        // dispatcher's `.catch(() => {})`. A thrown send is treated exactly like
+        // a `false` one: warn, then keep settling.
+        let delivered = false;
+        try {
+          delivered = transport.sendTurnSettled(wsKey, settleId, turnOutcome);
+        } catch {
+          delivered = false;
+        }
+        if (!delivered) {
+          api.logger?.warn?.(
+            `webchannel: turn_settled was not delivered for peer=${wsKey} turn=${settleId} outcome=${turnOutcome}`,
+          );
+        }
+      }
     }
   }
 }

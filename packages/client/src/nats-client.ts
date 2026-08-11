@@ -174,12 +174,14 @@ export type InboundMessage = {
   turnId?: string;
   /**
    * P0-4 (additive; older plugins omit it): on a `turn_settled` frame, whether
-   * the turn settled cleanly. `"ok"` promotes the anchor message `accepted →
-   * completed`; `"error"` fails it `turn-failed`; ABSENT means a legacy plugin
-   * that fires `turn_settled` from a `finally` regardless of outcome — the client
-   * then leaves the message at `accepted` (an honest degradation) and never
-   * fabricates `completed`. Client re-declares this wire type (zero-dep package),
-   * so a new field here needs no plugin import.
+   * the turn settled cleanly. `"ok"` promotes the message whose wire id exactly
+   * matches `turnId` from `accepted → completed`; `"error"` fails that message
+   * `turn-failed`. The current plugin emits one such frame per coalesced member.
+   * ABSENT means a legacy plugin that fires `turn_settled` from a `finally`
+   * regardless of outcome — the client then leaves the named message at
+   * `accepted` (an honest degradation) and never fabricates `completed`. Client
+   * re-declares this wire type (zero-dep package), so a new field here needs no
+   * plugin import.
    */
   outcome?: "ok" | "error";
   kind?: "exec" | "plugin";

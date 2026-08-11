@@ -23,6 +23,11 @@ import {
   ApprovalOriginLeaseRegistry,
 } from "./approval-origin.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
+import {
+  MAX_COALESCED_MEMBER_ID_LENGTH,
+  normalizeInboundUserMessage,
+} from "./inbound-queue.js";
+import { DEFAULT_BUSY_TURN_LIMITS } from "./inbound-retention.js";
 
 /**
  * P1-8a — `handleInboundMessage` control-lane behaviour.
@@ -77,6 +82,8 @@ function makeFakeApi(params: {
   runImpl: (turn: AssembledTurnLike) => Promise<void>;
   /** Expose the host's agent-events surface (#87 lifecycle verdict). */
   withAgentEvents?: boolean;
+  /** Extra `channels.webchannel` keys, e.g. the DM allowlist (#99 denial case). */
+  channelConfig?: Record<string, unknown>;
 }): {
   api: OpenClawPluginApi;
   captured: { buildContext?: BuildContextParams };
@@ -86,7 +93,9 @@ function makeFakeApi(params: {
   const captured: { buildContext?: BuildContextParams } = {};
 
   const config = {
-    channels: { webchannel: { streaming: { mode: params.streamingMode } } },
+    channels: {
+      webchannel: { streaming: { mode: params.streamingMode }, ...params.channelConfig },
+    },
   };
 
   const channel = {
@@ -150,17 +159,25 @@ function makeFakeApi(params: {
 }
 
 /** A transport that records finalize frames and accepts progress/typing/text. */
-function makeFakeTransport(): {
+function makeFakeTransport(options?: {
+  /** #99: return false from `sendTurnSettled` for these turnIds (delivery failure). */
+  failSettleFor?: readonly string[];
+  /** #99: THROW from `sendTurnSettled` for these turnIds (hostile implementation). */
+  throwSettleFor?: readonly string[];
+}): {
   transport: WebChannelPeerChannel;
   finalizes: Array<{ id: string; text: string }>;
   progress: Array<{ id: string; text: string }>;
   typing: string[];
   settles: Array<"ok" | "error">;
+  /** #99: the full settle frames, in emission order — turnId matters per member. */
+  settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }>;
 } {
   const finalizes: Array<{ id: string; text: string }> = [];
   const progress: Array<{ id: string; text: string }> = [];
   const typing: string[] = [];
   const settles: Array<"ok" | "error"> = [];
+  const settleFrames: Array<{ turnId: string; outcome: "ok" | "error" }> = [];
   const transport = {
     sendTyping: (sessionKey: string) => {
       typing.push(sessionKey);
@@ -168,9 +185,13 @@ function makeFakeTransport(): {
     },
     sendText: () => true,
     sendReasoning: () => true,
-    sendTurnSettled: (_sessionKey: string, _turnId: string, outcome: "ok" | "error") => {
+    sendTurnSettled: (_sessionKey: string, turnId: string, outcome: "ok" | "error") => {
       settles.push(outcome);
-      return true;
+      settleFrames.push({ turnId, outcome });
+      if (options?.throwSettleFor?.includes(turnId)) {
+        throw new Error(`settle blew up for ${turnId}`);
+      }
+      return !options?.failSettleFor?.includes(turnId);
     },
     sendProgress: (_sessionKey: string, id: string, text: string) => {
       progress.push({ id, text });
@@ -185,7 +206,7 @@ function makeFakeTransport(): {
     sendApprovalResolved: () => true,
     sendApprovalSnapshot: () => true,
   } as WebChannelPeerChannel;
-  return { transport, finalizes, progress, typing, settles };
+  return { transport, finalizes, progress, typing, settles, settleFrames };
 }
 
 const userMessage = { type: "user_message" as const, text: "/stop" };
@@ -502,6 +523,248 @@ describe("handleInboundMessage — #87 turn outcome", () => {
     });
 
     expect(settles).toEqual([]);
+  });
+});
+
+/**
+ * #99 — every accepted send must reach a terminal receipt state.
+ *
+ * P1-8b layer (b) merges N buffered user messages into ONE turn keyed by the
+ * LAST id. Each of those messages was ACKed and holds its own P0-4 receipt, and
+ * the client's `promoteAnchor` matches strictly on `turnId === wireId`, so a
+ * single settle frame stranded the other N-1 receipts at `accepted` forever.
+ * The turn now settles every member wireId with the same outcome.
+ *
+ * NOTE (test trap): `handleInboundMessage` swallows its own errors — a failed
+ * `expect` inside a transport/dispatcher fake would be caught and logged, and
+ * the test would pass vacuously. Every assertion below runs AFTER the awaited
+ * turn, over recorded observations.
+ */
+describe("handleInboundMessage — #99 coalesced-group settlement", () => {
+  /** What the coalescer hands down for the burst A, B, C (anchor = id-3). */
+  const coalescedTurn = {
+    type: "user_message" as const,
+    text: "a\n\nb\n\nc",
+    id: "id-3",
+    coalescedIds: ["id-1", "id-2", "id-3"],
+  };
+
+  it("settles EVERY member wireId with the turn's outcome, each once, anchor last", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver({ text: "here is your answer" }, { kind: "final" });
+      },
+    });
+    const { transport, settleFrames } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", coalescedTurn);
+
+    // Order is load-bearing: the anchor is the id the drafts and `agent_message`
+    // frames carry, so it is what ends the turn for the UI and must go last.
+    expect(settleFrames).toEqual([
+      { turnId: "id-1", outcome: "ok" },
+      { turnId: "id-2", outcome: "ok" },
+      { turnId: "id-3", outcome: "ok" },
+    ]);
+  });
+
+  it("settles every member `error` when the turn fails (no member is left `ok`)", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async (turn) => {
+        await turn.delivery.deliver(
+          { text: "⚠️ Something went wrong while processing your request.", isError: true },
+          { kind: "final" },
+        );
+      },
+    });
+    const { transport, settleFrames } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", coalescedTurn);
+
+    // The group ran as one turn, so it fails as one: every receipt resolves to
+    // `failed{turn-failed}`, none is left waiting.
+    expect(settleFrames).toEqual([
+      { turnId: "id-1", outcome: "error" },
+      { turnId: "id-2", outcome: "error" },
+      { turnId: "id-3", outcome: "error" },
+    ]);
+  });
+
+  it("settles each member exactly once when the member list repeats the anchor", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, settleFrames } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "a\n\nb",
+      id: "id-2",
+      // The anchor appears mid-list AND a member repeats: a duplicate settle is
+      // harmless on the client but is noise on the wire, and the anchor must
+      // still be emitted last.
+      coalescedIds: ["id-1", "id-2", "id-1"],
+    });
+
+    expect(settleFrames).toEqual([
+      { turnId: "id-1", outcome: "ok" },
+      { turnId: "id-2", outcome: "ok" },
+    ]);
+  });
+
+  it("emits EXACTLY ONE settle for a non-coalesced turn (no member list)", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, settleFrames } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "hello there",
+      id: "solo-1",
+    });
+
+    expect(settleFrames).toEqual([{ turnId: "solo-1", outcome: "ok" }]);
+  });
+
+  it("emits NO settle for an admission-denied coalesced turn", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {},
+      channelConfig: { dmSecurity: "allowlist", allowFrom: ["alice"] },
+    });
+    const { transport, settleFrames } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "mallory", coalescedTurn);
+
+    // `settlementEligible` gates the whole group, not just the anchor: no agent
+    // turn was admitted, so nothing settles (ingress owns those receipts).
+    expect(settleFrames).toEqual([]);
+  });
+
+  /**
+   * The settle loop reads `coalescedIds` off the turn message, and that message
+   * used to be reachable from the wire verbatim (the decode path casts instead
+   * of validating). Layer (a) strips the field at ingress; these pin layer (b),
+   * the read-site guard, so a path that ever forgets to strip degrades to "only
+   * the anchor settles" instead of stranding the whole turn.
+   *
+   * The failure this prevents is severe and silent: the member loop runs BEFORE
+   * the anchor is pushed, so a throw here emits ZERO settle frames, the
+   * dispatcher swallows the rejection, and every receipt in the turn — anchor
+   * included — is stuck at `accepted` with the draft never finalized.
+   */
+  describe("hostile `coalescedIds` still settles the anchor", () => {
+    const hostile: Array<[string, unknown]> = [
+      ["a number (not iterable — would throw)", 5],
+      ["a string (would iterate as characters)", "abc"],
+      ["null", null],
+      ["an object", { length: 2 }],
+      ["non-string members", [{}, 7]],
+      ["empty-string members", ["", ""]],
+    ];
+
+    for (const [label, value] of hostile) {
+      it(`settles exactly once for ${label}`, async () => {
+        const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+        const { transport, settleFrames } = makeFakeTransport();
+
+        await handleInboundMessage(api, transport, "peer-1", {
+          type: "user_message",
+          text: "hi",
+          id: "anchor-1",
+          coalescedIds: value as never,
+        });
+
+        expect(settleFrames).toEqual([{ turnId: "anchor-1", outcome: "ok" }]);
+      });
+    }
+
+    it("drops an over-long member id and caps a flooded member list", async () => {
+      const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+      const { transport, settleFrames } = makeFakeTransport();
+      const overLong = "x".repeat(MAX_COALESCED_MEMBER_ID_LENGTH + 1);
+
+      await handleInboundMessage(api, transport, "peer-1", {
+        type: "user_message",
+        text: "hi",
+        id: "anchor-1",
+        // A frame can hold far more ids than a real group ever has while
+        // staying inside the payload/session byte budgets; each one costs a
+        // seal+publish in the turn's `finally`.
+        coalescedIds: [
+          overLong,
+          ...Array.from({ length: DEFAULT_BUSY_TURN_LIMITS.maxMessagesPerSession * 50 }, (_, i) => `flood-${i}`),
+        ],
+      });
+
+      // Capped at the bound the honest producer obeys, plus the anchor.
+      expect(settleFrames).toHaveLength(DEFAULT_BUSY_TURN_LIMITS.maxMessagesPerSession + 1);
+      expect(settleFrames.map((f) => f.turnId)).not.toContain(overLong);
+      expect(settleFrames.at(-1)).toEqual({ turnId: "anchor-1", outcome: "ok" });
+    });
+
+    it("a NORMALIZED wire frame settles only its own id — a peer cannot name others", async () => {
+      // The end-to-end property of layer (a): what a peer actually sends is
+      // `{…, coalescedIds:[victim ids]}`; ingress rebuilds the frame from its
+      // known wire fields, and the turn then speaks only for the sender's own
+      // wireId. Without the strip, this peer would make the agent settle two
+      // receipts belonging to messages it never sent.
+      const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+      const { transport, settleFrames } = makeFakeTransport();
+      const wireFrame = {
+        type: "user_message" as const,
+        text: "hi",
+        id: "mine-1",
+        coalescedIds: ["victim-1", "victim-2"],
+      };
+
+      await handleInboundMessage(
+        api,
+        transport,
+        "peer-1",
+        normalizeInboundUserMessage(wireFrame),
+      );
+
+      expect(settleFrames).toEqual([{ turnId: "mine-1", outcome: "ok" }]);
+    });
+  });
+
+  it("a THROWING member send cannot take the group — or the anchor — down", async () => {
+    // `transport` is an interface; the shipped channel returns a boolean, but a
+    // throwing implementation here would skip every id still queued. The anchor
+    // is emitted LAST, so it is the one that would be lost — and the throw would
+    // escape from a `finally` into the dispatcher's `.catch(() => {})`, leaving
+    // the whole turn unsettled and the draft hanging.
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, settleFrames } = makeFakeTransport({ throwSettleFor: ["id-1"] });
+    const warn = vi.fn();
+    (api as unknown as { logger: { warn: (m: string) => void } }).logger.warn = warn;
+
+    await expect(
+      handleInboundMessage(api, transport, "peer-1", coalescedTurn),
+    ).resolves.toBeUndefined();
+
+    expect(settleFrames.map((f) => f.turnId)).toEqual(["id-1", "id-2", "id-3"]);
+    // Treated exactly like a `false` return: same warn shape, then keep going.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("turn_settled was not delivered");
+    expect(warn.mock.calls[0]?.[0]).toContain("turn=id-1");
+  });
+
+  it("warns per undelivered member and still settles the rest", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport, settleFrames } = makeFakeTransport({ failSettleFor: ["id-2"] });
+    const warn = vi.fn();
+    (api as unknown as { logger: { warn: (m: string) => void } }).logger.warn = warn;
+
+    await handleInboundMessage(api, transport, "peer-1", coalescedTurn);
+
+    // A member whose frame does not ship must not abort the group — the anchor
+    // and the other members still settle — and it warns in the same shape the
+    // anchor always has.
+    expect(settleFrames.map((f) => f.turnId)).toEqual(["id-1", "id-2", "id-3"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]?.[0]).toContain("turn_settled was not delivered");
+    expect(warn.mock.calls[0]?.[0]).toContain("turn=id-2");
   });
 });
 

@@ -211,8 +211,12 @@ describe("WebChannelNATSClient — P0-4 receipt + sendState (wrapper)", () => {
     h.wrapper.close();
   });
 
-  // T-co: a coalesced 3-send burst settles as ONE turn — only the anchor
-  // (wireId === turnId) reaches completed; the earlier two stay accepted.
+  // T-co: ONE settle frame promotes ONLY the receipt it names — the anchor
+  // (wireId === turnId) reaches completed, the earlier two stay accepted.
+  // This is the client half of the #99 defect, and it is deliberately kept:
+  // promotion is by exact wireId and never by inference over ordering (a
+  // receipt is a delivery contract). The plugin-side fix is to name every
+  // member id in its own frame — see the #99 test immediately below.
   it("T-co: coalesce anchor — only the anchor bubble completes, prior sends stay accepted", async () => {
     const h = await connectWrapper();
     h.wrapper.send("c1");
@@ -225,6 +229,37 @@ describe("WebChannelNATSClient — P0-4 receipt + sendState (wrapper)", () => {
     expect(userBubble(h.wrapper, "c1")!.sendState).toBe("accepted");
     expect(userBubble(h.wrapper, "c2")!.sendState).toBe("accepted");
     expect(userBubble(h.wrapper, "c3")!.sendState).toBe("completed");
+    h.wrapper.close();
+  });
+
+  // #99: the client end of the coalesced-group contract. The plugin now emits
+  // one `turn_settled` per member wireId (same outcome, anchor last), and this
+  // pins that the SHIPPING client already resolves each of them — no client
+  // change and no protocol change is needed to fix #99. Characterization of
+  // existing behavior: no production client behavior changed for this.
+  it("#99: one turn_settled per member wireId resolves EVERY receipt of a coalesced burst", async () => {
+    const h = await connectWrapper();
+    const r1 = h.wrapper.send("m1")!;
+    const r2 = h.wrapper.send("m2")!;
+    await settle();
+    const w1 = userBubble(h.wrapper, "m1")!.wireId!;
+    const w2 = userBubble(h.wrapper, "m2")!.wireId!;
+    expect(r1.snapshot().state).toBe("accepted");
+    expect(r2.snapshot().state).toBe("accepted");
+
+    // Exactly what the merged turn emits: the non-anchor member first, the
+    // anchor (the id the drafts/agent_message frames carry) last.
+    deliverOut(h.K, { type: "turn_settled", turnId: w1, outcome: "ok" });
+    deliverOut(h.K, { type: "turn_settled", turnId: w2, outcome: "ok" });
+    await settle();
+
+    expect(r1.snapshot().state).toBe("completed");
+    expect(r2.snapshot().state).toBe("completed");
+    expect(userBubble(h.wrapper, "m1")!.sendState).toBe("completed");
+    expect(userBubble(h.wrapper, "m2")!.sendState).toBe("completed");
+    // The extra frame is not a second turn: the UI still settles once and stays
+    // settled (`isTyping` is idempotent, drafts only ever key off the anchor).
+    expect(h.wrapper.getState().isTyping).toBe(false);
     h.wrapper.close();
   });
 

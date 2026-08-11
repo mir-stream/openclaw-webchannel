@@ -96,14 +96,15 @@ tool calls, a second assistant bubble, an approval wait. Several turns can be
 outstanding at once; the flag is `true` while any of them is open. It is absent
 until this client starts its first turn.
 
-Settlement is not one-per-send. Messages that arrive while a turn is running are
-buffered and coalesced into a single turn keyed by the last of them, so one
-`turn_settled` can be the only answer several sends ever get. A settle therefore
-closes the turn it names **and every turn published before it** — the agent
-processes a session's work in order, so an earlier send named by no settle has
-been subsumed. Both outcomes sweep, as does an outcome-less legacy settle. (A
-coalesced non-anchor *receipt* still rests at `accepted`; that is a separate
-pre-existing defect, tracked as #99.)
+Turns are not one-per-send. Messages that arrive while a turn is running are
+buffered and coalesced into a single turn keyed by the last of them. The current
+plugin emits one same-outcome `turn_settled` per coalesced member, in arrival
+order with the anchor last; the client promotes the exact receipt each frame
+names. A settle also closes the turn it names **and every turn published before
+it**. That prefix sweep remains for older anchor-only v3 plugin builds and for
+lost/missing earlier member frames. Both outcomes
+sweep, as does an outcome-less legacy settle; sweeping turn activity never
+fabricates a receipt outcome.
 
 A failed send closes its own turn only for the one failure that is a good **proxy
 for non-delivery** — `overloaded`, an ingress rejection. That is a proxy, not a
@@ -159,9 +160,11 @@ running a turn. Named examples, not a complete list:
   has already acked the message at ingress but dispatches no turn and emits no
   `turn_settled` (`packages/plugin/src/inbound.ts`). Fixing the
   admission/settlement asymmetry is tracked separately.
-- **A second device on the same peer id.** The agent serializes and coalesces per
-  peer, so another device's message can absorb ours into a turn keyed by *its*
-  wire id — a settle this client has no way to place.
+- **A lost coalesced-member frame.** The current plugin names every member, but
+  delivery is best-effort. If this client's member frame is lost and the group
+  anchor belongs to a second device sharing the peer id, the remaining frames
+  name ids this client cannot place. An older anchor-only plugin has the same
+  shape.
 - **A post-admission `overloaded` rejection.** The client live-retries an unacked
   id on the same connection; if the agent's accepted marker for it was lost, the
   retry can be rejected while the original turn is still running. The client
@@ -197,9 +200,10 @@ queued -> sent -> accepted -> completed        (+ failed, terminal, from any pre
 - `queued` — held locally; not yet written to the socket.
 - `sent` — the encrypted frame reached the socket (NOT plugin acceptance).
 - `accepted` — the plugin acked the message at ingress (P0-7b).
-- `completed` — the turn settled with an **explicit** `turn_settled{outcome:"ok"}`
-  on the anchor message. A legacy plugin that omits `outcome` leaves the message
-  at `accepted` (an honest degradation — `completed` never appears, never faked).
+- `completed` — an **explicit** `turn_settled{outcome:"ok"}` named this message's
+  exact wire id. The current plugin emits one same-outcome frame per coalesced
+  member. A legacy plugin that omits `outcome` leaves the named message at
+  `accepted` (an honest degradation — `completed` never appears, never faked).
 - `failed` — terminal; `sendFailure.reason` is one of `closed` | `evicted` |
   `terminal` (+ `cause`) | `overloaded` | `turn-failed` | `cancelled`, with `retryable` and
   `lastAttemptAt`. `retryable` means the caller/embedder may initiate a **fresh**
@@ -215,9 +219,13 @@ subsequent `send()` resolves immediately to `failed{terminal}`. Recovery means
 constructing a NEW client with fresh credentials — reviving the same instance is
 unsupported.
 
-**Coalesce anchor:** a burst that the agent coalesces into ONE turn completes only
-the ANCHOR message (the last one — `turnId === wireId`); the earlier messages rest
-at `accepted` (admission is guaranteed; turn outcome is observed per turn).
+**Coalesced receipts:** a burst still has one ANCHOR (the last member, used by
+draft and answer frames), but the current plugin emits a `turn_settled` for every
+member with the same outcome, anchor last. The client promotes only the exact
+`turnId === wireId` match, so all member receipts resolve. Older anchor-only v3
+plugin builds leave non-anchor receipts at
+`accepted`; the turn-activity prefix sweep closes their indicators without
+inventing receipt success.
 
 **Answer-delivery vs turn outcome:** if the agent's final answer frame fails to
 send but the turn itself settled without error, the message still reaches

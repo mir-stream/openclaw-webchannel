@@ -22,9 +22,10 @@ export type ChatRole = "user" | "agent";
  *                lastAttemptAt, and a `WebChannelErrorCause` for `terminal`).
  *
  * `completed` is NOT a tracker state — it is a wrapper-level promotion driven by
- * an explicit `turn_settled{outcome:"ok"}` on the anchor message (see
- * `ChatMessage.sendState`), so the low-level tracker (which knows nothing about
- * turns) stays the sole authority for queued/sent/accepted/failed.
+ * an explicit `turn_settled{outcome:"ok"}` whose `turnId` exactly matches the
+ * message wire id (see `ChatMessage.sendState`), so the low-level tracker (which
+ * knows nothing about turns) stays the sole authority for
+ * queued/sent/accepted/failed.
  */
 export type SendState = "queued" | "sent" | "accepted" | "failed";
 
@@ -116,9 +117,12 @@ export type ChatMessage = {
    * with `sendFailure.reason`. Absent on server-hydrated and agent bubbles.
    *
    * `completed` is a wrapper-level promotion over the tracker's `accepted`,
-   * applied only on an explicit `turn_settled{outcome:"ok"}` for the anchor
-   * message (turnId === wireId); a coalesced non-anchor send stays `accepted`,
-   * and a legacy plugin (no `outcome`) leaves every message at `accepted`.
+   * applied only when an explicit `turn_settled{outcome:"ok"}` names this exact
+   * message (`turnId === wireId`). The current plugin emits one same-outcome
+   * frame per coalesced member, in arrival order with the anchor last, so every
+   * member is promoted. Older anchor-only v3 plugin builds leave non-anchors at
+   * `accepted`; an outcome-less legacy frame
+   * leaves even the member it names at `accepted`.
    */
   sendState?: "queued" | "sent" | "accepted" | "completed" | "failed";
   /** P0-4: present only when `sendState === "failed"` — the failure detail. */
@@ -318,15 +322,19 @@ export type WebChannelState = {
    * Absent until this client starts its first turn. Advisory only: it never
    * gates sending, the held-message FIFO, or reconnect. An abort/`/stop` publish
    * (which rides the server's control lane and never settles) never opens one.
-   * Another device sharing this peer id is not tracked — and, because the agent
-   * serializes and coalesces per peer, that device's turn can SUBSUME a message
-   * of ours, so the settle we were waiting for may name an id we cannot place.
+   * Another device sharing this peer id is not tracked. The current plugin emits
+   * a settle for every coalesced member, including ours, but if our member frame
+   * is lost (or an older plugin emits only the other device's anchor), the
+   * remaining settle may name an id this client cannot place.
    *
-   * `turn_settled` is not 1:1 with a send — the agent coalesces messages that
-   * arrive during a running turn into ONE turn keyed by the last of them — so a
-   * settle closes the turn it names AND every turn published before it (both
-   * outcomes, and an outcome-less legacy settle, sweep alike). A send that fails
-   * closes its own turn only for the one failure that is a good PROXY for the
+   * Turns are not 1:1 with sends: the agent coalesces messages that arrive during
+   * a running turn into ONE turn keyed by the last of them. The current plugin
+   * emits one `turn_settled` per member (same outcome, anchor last), and the
+   * client promotes only the exact id each frame names. A settle also closes the
+   * turn it names AND every turn published before it; that prefix sweep remains
+   * for older anchor-only plugins and for lost/missing earlier member frames.
+   * Both outcomes, and an outcome-less legacy settle, sweep alike. A send that
+   * fails closes its own turn only for the one failure that is a good PROXY for the
    * agent never having received it — `overloaded`, an ingress rejection (a proxy,
    * not a proof: the agent can also reject a message it already admitted). A
    * lost ack is not one: `evicted` is a client-side ledger drop, so that turn may

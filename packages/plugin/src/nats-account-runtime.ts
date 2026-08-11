@@ -29,8 +29,9 @@ import {
 import {
   createSerializedInboundDispatcher,
   coalesceUserMessages,
+  normalizeInboundUserMessage,
 } from "./inbound-queue.js";
-import type { SerializedInboundDispatcher } from "./inbound-queue.js";
+import type { CoalescedMemberIds, SerializedInboundDispatcher } from "./inbound-queue.js";
 import {
   estimateRetainedMessageBytes,
   InboundRetentionBudget,
@@ -838,10 +839,16 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         `[webchannel] account "${accountId}" ✓ encrypted NATS channel (tenant=${tenant}, accountId=${accountId})`,
       );
 
+      // #99: the dispatcher's message type is the wire frame PLUS the internal
+      // member-id list `coalesceUserMessages` stamps on a merged turn. Widened
+      // here, at the dispatcher boundary, and nowhere else: `InboundWsMessage`
+      // itself stays exactly as deployed clients know it (no protocol change),
+      // and the extra field only ever travels plugin-internally, from the merge
+      // to `handleInboundMessage`'s settle path.
       type WebchannelUserMessage = Extract<
         InboundWsMessage,
         { type: "user_message" }
-      >;
+      > & CoalescedMemberIds;
       type DebounceItem = {
         peerId: string;
         message: WebchannelUserMessage;
@@ -1035,9 +1042,29 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // send the peer a hedged notice. See src/command-gate.ts for the traced
       // core paths (all testable logic lives in the imported typed helpers).
       const commandGate = resolveCommandGate(api.config, accountId);
-      channel.setMessageHandler((peerId, message) => {
+      channel.setMessageHandler((peerId, rawMessage) => {
         if (!runtimeActive) return;
-        if (message.type !== "user_message") return; // approvals routed below
+        if (rawMessage.type !== "user_message") return; // approvals routed below
+        // #99: rebuild the frame from its KNOWN wire fields before anything else
+        // touches it. The decode path is a cast (`JSON.parse(...) as
+        // InboundWsMessage`, nats-channel.ts) and its `user_message` case
+        // forwards the object with no field checks, so a peer could attach ANY
+        // property — including `coalescedIds`, which is plugin-internal state
+        // meaning "these receipts settle with this turn". Stripping it here is
+        // what makes `coalesceUserMessages` its ONLY producer: a peer cannot
+        // name ids it never sent, cannot make the settle loop iterate a
+        // non-iterable, and cannot make the merge throw (which the dispatcher
+        // absorbs by discarding the whole turn — ACKed, never run, never
+        // settled). The read sites guard the field too; this is the layer that
+        // makes the "never from the wire" claim true.
+        //
+        // The normalization itself is a tested pure function; this file just
+        // routes (same split as `isControlLaneMessage` below). The ORDER is the
+        // part that matters here and is pinned by the source guard in
+        // `index-nats-wiring.test.ts`: nothing — not the control lane, not the
+        // ack, not the debouncer — may see the raw frame, and that guard counts
+        // the reads above this line, so do not add one.
+        const message: WebchannelUserMessage = normalizeInboundUserMessage(rawMessage);
         // Control lane (P1-8a): an abort ("/stop"/"stop"/…) must reach core's
         // fast-abort WHILE the running turn is live, so it must NOT queue behind
         // that turn on the per-session FIFO. Dispatch it directly, fire-and-

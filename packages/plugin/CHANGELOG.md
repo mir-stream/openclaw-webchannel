@@ -65,6 +65,29 @@ keep the accounts disabled and escalate through incident response.
 
 ### Fixed
 
+- **#99 — a coalesced turn now settles EVERY message it merged.** When busy-time
+  coalescing folds N buffered user messages into one turn, the turn used to emit
+  a single `turn_settled` naming only the last (anchor) wireId, so the other
+  N-1 P0-4 receipts sat at `accepted` for the lifetime of the client: an
+  embedder awaiting a terminal state waited forever, silently, because the text
+  itself was delivered and answered. The merge now carries every member wireId
+  plugin-internally and the turn emits one `turn_settled` per member with the
+  same outcome, each exactly once, anchor last (it is the id the drafts and
+  `agent_message` frames reference). An admission-denied turn still settles
+  nothing. A non-coalesced turn still emits exactly one frame, because inbound
+  `user_message` frames are now normalized to their known wire fields at ingress
+  — a peer cannot supply the internal member list, so a turn's members are only
+  ever the messages the plugin itself merged. Both read sites additionally treat
+  the field as untrusted (a non-array is inert rather than thrown, members must
+  be plausible ids, and the list is capped at the same per-session bound the
+  merge itself obeys).
+  - **No client change and no protocol change.** `WEBCHANNEL_PROTOCOL_VERSION`
+    stays `3`, no new frame type and no new wire field: `turn_settled{turnId,
+    outcome}` already exists, and an already-deployed client promotes whichever
+    receipt each frame names (its draft finalization is keyed on the anchor
+    turnId only, so a member frame is a no-op there). Fixing this on the client
+    instead would have required inferring terminality from ordering, which a
+    delivery contract must not do.
 - Added per-account pure planning and immutable account-bound auth preparation
   before that account consumes transport credentials or performs network I/O,
   token-only prepared verifiers, Gate-B-before-subscribe activation,
