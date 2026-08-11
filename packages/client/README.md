@@ -81,6 +81,98 @@ extra reconnect. Raise the timeout or set it to `0` for workloads where long
 silent turns are normal. A completely idle tab has no active-work signal and is
 not proactively probed by this recovery mode.
 
+### Turn activity: `turnActive` vs `isTyping`
+
+`state.isTyping` mirrors the agent's single per-turn `typing` frame and is
+cleared by the first `progress` / `agent_message` / `approval_*` frame. It answers
+"is an answer being composed right now?", so it is deliberately silent for the
+rest of a multi-step turn.
+
+`state.turnActive` answers the other question — "is the agent still working on
+this turn?" — and is owned by the client, not the wire. It becomes `true` the
+moment a user message is published (including a held follow-up released later)
+and stays `true` until that turn settles, across every gap in between: further
+tool calls, a second assistant bubble, an approval wait. Several turns can be
+outstanding at once; the flag is `true` while any of them is open. It is absent
+until this client starts its first turn.
+
+Settlement is not one-per-send. Messages that arrive while a turn is running are
+buffered and coalesced into a single turn keyed by the last of them, so one
+`turn_settled` can be the only answer several sends ever get. A settle therefore
+closes the turn it names **and every turn published before it** — the agent
+processes a session's work in order, so an earlier send named by no settle has
+been subsumed. Both outcomes sweep, as does an outcome-less legacy settle. (A
+coalesced non-anchor *receipt* still rests at `accepted`; that is a separate
+pre-existing defect, tracked as #99.)
+
+A failed send closes its own turn only for the one failure that is a good **proxy
+for non-delivery** — `overloaded`, an ingress rejection. That is a proxy, not a
+proof: the agent can also reject a message it already admitted (a live retry of
+an unacked id whose accepted marker was lost), and such a turn is already
+running, so its settle arrives for an id we already closed. Everything else is
+left to the sweep, because removing an id a settle might still name would break
+the sweep for every turn behind it. Two that look eligible but are not:
+`turn-failed` comes *from* a settle, which already sweeps; and `evicted` is a
+**client-side** unacked-ledger cap drop, where a lost ack is not a failed
+delivery — the message may have reached the agent, been coalesced, and be the
+very id its turn settles under.
+
+Render `isTyping` as "typing…", and `turnActive` as a lower-key "still working"
+affordance that survives between bubbles — with an actionable approval card
+taking priority over both, since an approval wait keeps `turnActive` true while
+`isTyping` is false. The flag is advisory: it never gates sending, the held
+follow-up FIFO, or reconnect, so a widget may drive a `/stop` button off it, but
+nothing in this client reads it back.
+
+The guarantee is **bounded, not absolute**: `turnActive` can be `true` for longer
+than the agent was really working, but it is not designed to stick forever. A
+terminal error, `close()`, and an explicit `/stop` force-close every open turn,
+and so does the transition to disconnected. A send that is only queued while
+disconnected opens no turn until its first successful publication after
+reconnect. An explicit `/stop` also consumes ordinary sends already queued at
+that boundary, so their later publication cannot re-open the stopped work; a
+follow-up created by the stop's own cancellation fanout belongs after that
+boundary and remains eligible. The post-reconnect staleness valve force-closes
+open turns too, but only in the case where it arms at all — when a `working`
+draft was live as the session re-established — so it is a bonus rescue, not a
+general timeout.
+Force-closing an already-open turn is one-way: unlike `isTyping`, which a later
+`typing` frame re-arms, an ack or replay does not re-open it, so a transient
+reconnect in the middle of a long turn leaves `turnActive` false for the rest of
+it.
+
+The residual has one shape, and no attempt is made to enumerate its causes: **any
+published turn whose settle never arrives — or arrives naming an id this client
+cannot place — stays `true` until a later settle sweeps it as part of the prefix,
+or a safety point fires.** `turn_settled` delivery is best-effort (the agent
+warn-logs and drops it if publishing fails, unlike acks, which are retried), and
+several agent-side paths ack a message at ingress and then abandon it without
+running a turn. Named examples, not a complete list:
+
+- **Text the agent treats as an abort but this client does not.** Abort text
+  rides a control lane that never settles, so the client deliberately opens no
+  turn for it — but its abort vocabulary is a pinned *subset* of the agent's
+  (see `abort-mirror.ts`). Something the agent classifies as an abort and this
+  client does not (e.g. an abort command with trailing text on a second line)
+  opens a turn that never settles.
+- **DM-allowlist denial.** When the agent's allowlist denies a peer, the plugin
+  has already acked the message at ingress but dispatches no turn and emits no
+  `turn_settled` (`packages/plugin/src/inbound.ts`). Fixing the
+  admission/settlement asymmetry is tracked separately.
+- **A second device on the same peer id.** The agent serializes and coalesces per
+  peer, so another device's message can absorb ours into a turn keyed by *its*
+  wire id — a settle this client has no way to place.
+- **A post-admission `overloaded` rejection.** The client live-retries an unacked
+  id on the same connection; if the agent's accepted marker for it was lost, the
+  retry can be rejected while the original turn is still running. The client
+  closes that turn on the rejection, so the settle that follows names an id it no
+  longer holds — leaving any turn published *before* it open until the next sweep.
+
+So treat `turnActive` as a soft hint that survives between bubbles, never as a
+hard gate: showing a spinner slightly too long is the intended failure, and any
+UI that would wedge on a stuck `true` should key off `isTyping` or an explicit
+user action instead.
+
 ## Send-result contract (P0-4)
 
 Every `send()` returns a `SendReceipt` (or `undefined` for trimmed-empty input —
