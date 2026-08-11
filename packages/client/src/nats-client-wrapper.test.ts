@@ -681,8 +681,9 @@ describe("WebChannelNATSClient — #16 ordered history insertion", () => {
 // into the transcript, or a defensive lane rotation the core coalesced away),
 // and the reconciler must still converge without duplicating or losing text.
 // C7 records the complementary protocol constraint: once history adopts a
-// canonical id, the reducer keeps no alias for the old live id, so the plugin
-// must consume structurally-correlated retained finals without replaying them.
+// canonical id, the reducer keeps no alias for the old live id. An ambiguous
+// final must therefore use a fresh fallback id rather than mutating either the
+// canonical id or the now-stale live id.
 // ---------------------------------------------------------------------------
 describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => {
   type AnyFrame = { type: string; [k: string]: unknown };
@@ -1166,11 +1167,11 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
   });
 
   // --- C7: history adoption makes the old live ids stale. -----------------
-  it("C7: snapshot-adopted lane ids stay unique only when correlated retained finals remain off wire", () => {
+  it("C7: snapshot-adopted lanes stay unchanged while fresh fallback and stale ids append independently", () => {
     const w = makeWrapper();
 
     // Before core's terminal array arrives, both lanes have been materialized
-    // from the callback axis. A register snapshot may then replace their live
+    // by the ordinary lane path. A register snapshot may then replace their live
     // webchannel ids with the transcript's canonical ids. The client does not
     // retain aliases for those old ids.
     w.send("hello"); // u-0 local echo supplies the positional-adoption anchor
@@ -1190,15 +1191,34 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       "core-a2",
     ]);
 
-    // OpenClaw 2026.6.10 can now deliver [error, A1, A2, B]. Under the #94
-    // contract, A1/A2/B correlate to queued-block replay atoms and are consumed
-    // as accounting only: the plugin emits no stale-id upserts for them. The
-    // terminal notice is the only new client frame.
+    // OpenClaw 2026.6.10 can now deliver [error, A1, A2, B]. The public final
+    // seam has no assistant-message/block identity, so after the leading error
+    // the plugin preserves every non-notice payload under a FRESH fallback id.
+    // This is intentionally at-least-once: canonical A/B stay untouched while
+    // the uncorrelated payloads append, even when their content repeats A/B.
     deliver(w, {
       type: "agent_message",
       id: "webchannel-error",
       turnId: "T",
       text: "⚠️ The model errored.",
+    });
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-fallback-a1",
+      turnId: "T",
+      text: "A1 uncorrelated final",
+    });
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-fallback-a2",
+      turnId: "T",
+      text: "A2 uncorrelated final",
+    });
+    deliver(w, {
+      type: "agent_message",
+      id: "webchannel-fallback-b",
+      turnId: "T",
+      text: "B uncorrelated final",
     });
     deliver(w, { type: "turn_settled", turnId: "T", outcome: "error" });
 
@@ -1208,33 +1228,50 @@ describe("WebChannelNATSClient — #94 multi-bubble turn reconciliation", () => 
       "core-a1",
       "core-a2",
       "webchannel-error",
+      "webchannel-fallback-a1",
+      "webchannel-fallback-a2",
+      "webchannel-fallback-b",
     ]);
     expect(messages.map((m) => m.text)).toEqual([
       "hello",
       "A retained canonical",
       "B retained canonical",
       "⚠️ The model errored.",
+      "A1 uncorrelated final",
+      "A2 uncorrelated final",
+      "B uncorrelated final",
     ]);
-    expect(messages.map((m) => m.working)).toEqual([undefined, false, false, false]);
+    expect(messages.map((m) => m.working)).toEqual([
+      undefined,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+    ]);
 
-    // Cost/ban ledger: deliberately inject the old-id replay that PR2 must NOT
-    // emit. Since history adoption forgot the alias, ordinary id upsert appends
-    // a second A bubble. This is characterization of today's reducer, not a
-    // desired protocol sequence and not a request for a client production fix.
+    // Cost/ban ledger: deliberately inject an old-id upsert. Since history
+    // adoption forgot the alias, it appends another bubble. This proves why an
+    // uncorrelated final must use a fresh id rather than guessing an old lane;
+    // it does NOT claim that the fresh fallback avoids semantic duplicates.
     deliver(w, {
       type: "agent_message",
       id: "webchannel-a",
       turnId: "T",
-      text: "A stale retained replay",
+      text: "A stale old-id upsert",
     });
     expect(w.getState().messages.map((m) => m.id)).toEqual([
       "core-u1",
       "core-a1",
       "core-a2",
       "webchannel-error",
+      "webchannel-fallback-a1",
+      "webchannel-fallback-a2",
+      "webchannel-fallback-b",
       "webchannel-a",
     ]);
-    expect(w.getState().messages.at(-1)?.text).toBe("A stale retained replay");
+    expect(w.getState().messages.at(-1)?.text).toBe("A stale old-id upsert");
   });
 });
 

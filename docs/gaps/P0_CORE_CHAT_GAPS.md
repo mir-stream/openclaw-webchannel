@@ -434,12 +434,14 @@ until a history reload restores them.
   was already preserved.
 - **`kind:"final"` is a delivery class, not an assistant-message id.** Core may deliver several final
   payloads in one turn and the pinned builder can replay assistant blocks as `[error,A1,A2,B]`, where
-  A1/A2 belong to one lane. After terminal callback drain, queued-block ordinal and lane ownership form
-  replay atom/groups `[A:{A1,A2},B:{B}]`. Notices do not consume assistant lanes; correlated retained
-  finals are dedupe/accounting only because callback data already materialized each lane exactly once.
-  They are not re-emitted with live ids that a history snapshot may already have adopted away. Only
-  structurally unmatched payloads use diagnosed fresh fallback ids instead of being swallowed by a
-  settle latch.
+  A1/A2 belong to one lane. Queued callbacks cannot correlate that array: default partial mode may
+  produce zero callbacks, while block streaming may coalesce A1/A2 into one callback and still emit
+  three terminal assistant texts. Notices do not consume assistant lanes. After a leading error, every
+  non-notice final without public identity is preserved under a fresh fallback id. This at-least-once
+  policy may duplicate
+  already-materialized A/B, but never drops or guesses ownership; exact-once requires a stable public
+  assistant message/block identity and is deferred to
+  [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111).
 - **Wire primitives already fit the target:** partial uses `{ type:"progress", id, text }`; finalize
   uses `agent_message` with the same `id`. One assistant message uses one id; the id rotates only at
   an assistant-message boundary.
@@ -466,14 +468,16 @@ boundaries, not as a template a plugin can copy. See §5.2/§5.3 of
 `streaming.mode`; an operator enrolling via `channels add` must set it by hand (as the demo does).
 Optional polish: a subtle "working" affordance (cursor/shimmer) beyond the italic dim.
 
-**Acceptance (not yet met).** With `streaming.mode:"partial"`, each completed assistant message must
+**Acceptance (not yet met).** On the ordinary path with `streaming.mode:"partial"`, each completed assistant message must
 settle as its own bubble while partial frames edit only the current bubble. A two-message live turn
 must remain two messages after settle and match a fresh history hydrate. No content-based
 `includes`/suffix heuristic may decide whether messages are the same. Error/abort paths must settle
 only the active draft and leave earlier settled bubbles intact. A tool scaffold followed by an answer
-must reuse one provisional id, and callback `[A1@0,A2@0,B@1]` plus final
-`[error,A1,A2,B]` must group A1/A2 into A, keep B separate, and leave A/B exactly once even if a
-history snapshot adopted their old live ids before replay delivery.
+must reuse one provisional id, and final `[error,A1,A2,B]` must not infer ownership from callback
+cardinality. Both the zero-callback default path and the coalesced
+`[A1+"\n\n"+A2@0,B@1]` callback path must leave materialized A/B unchanged and preserve error
+plus every uncorrelated final under fresh fallback ids, explicitly accepting duplicates until #111.
+(Each fallback reports its real delivery result and one failure must not stop later payloads.)
 (With `"progress"`, tool lines remain an ephemeral scaffold and the answer arrives atomically.)
 
 ---
@@ -582,7 +586,7 @@ UX and P0-5 needs #94's multi-message finalize correctness:
 | Order | Gap | Effort | Why |
 |---|---|---|---|
 | 1 | P0-3 argument menus | S | Catalog entries already carry `args.choices`; render a dropdown from them (widget currently inserts the name only). Ties into the P1-5 control renderer. |
-| 2 | P0-5 multi-message finalize (#94) | L | Replace the turn-wide draft with ordered lanes, provisional-preview ownership, late block ownership, and structural retained-replay accounting. |
+| 2 | P0-5 multi-message finalize (#94) | L | Replace the turn-wide draft with ordered lanes, provisional-preview ownership, late block ownership, independent block credits, and at-least-once final fallback. |
 
 > ✅ **Done:** P0-1 (history restore), P0-2 (depth cap, #24 — optional scroll-UX polish is all that
 > remains there), P0-3 (slash discovery, #30 — arg menus excepted above), P0-4 (approval cards +

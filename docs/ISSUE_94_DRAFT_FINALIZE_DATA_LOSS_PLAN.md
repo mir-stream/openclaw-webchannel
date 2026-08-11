@@ -12,15 +12,15 @@
 
 이 이슈에 남은 가치판단은 없다. 다음을 구현 계약으로 확정한다.
 
-1. **보존 단위는 완료된 어시스턴트 메시지다.** 한 턴에 어시스턴트가 사용자에게 두 번 발화했다면 두 메시지 모두 남는다.
-2. **라이브 화면도 어시스턴트 메시지마다 별도 버블이다.** 라이브와 히스토리 하이드레이트의 메시지 수와 순서가 같아야 한다.
+1. **보존 단위는 완료된 어시스턴트 메시지다.** ordinary 경로에서 한 턴에 어시스턴트가 사용자에게 두 번 발화했다면 두 메시지 모두 남는다.
+2. **라이브 화면도 어시스턴트 메시지마다 별도 버블이다.** ordinary 경로의 라이브와 히스토리 하이드레이트는 메시지 수와 순서가 같아야 한다. 단, 공개 identity가 없는 leading-terminal-error 후속 final은 §6.2의 at-least-once 예외라 이미 materialize된 본문이 fallback으로 중복될 수 있다. exact-once 화해는 [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111)로 분리한다.
 3. **partial/delta는 현재 메시지를 만드는 동안의 임시 갱신이다.** 임시 갱신 자체를 모두 저장하지는 않지만, 메시지가 완료되면 그 버블은 정착되고 다음 메시지가 같은 버블을 덮지 못한다.
-4. **`kind:"final"`은 메시지 식별자가 아니라 core의 최종-payload 전달 분류다.** 한 턴에 error/answer/warning뿐 아니라 이미 materialize된 assistant block의 replay도 올 수 있다. terminal notice는 assistant lane을 소비하지 않는다. terminal callback drain 뒤 queued-block 축과 구조적으로 상관된 retained final은 이미 materialize된 lane의 **dedupe/accounting**으로 소비하고 wire에 다시 보내지 않으며, 정말 상관되지 않는 payload만 보존 fallback으로 append한다. 앞 메시지와 합칠지 텍스트 내용으로 추측하지 않는다.
+4. **`kind:"final"`은 메시지 식별자가 아니라 core의 최종-payload 전달 분류다.** 한 턴에 error/answer/warning뿐 아니라 이미 materialize된 assistant block의 replay도 올 수 있다. terminal notice는 assistant lane을 소비하지 않는다. leading terminal error 뒤 identity 없는 non-notice final은 모두 **uncorrelated**로 취급해 각자 fresh fallback ID로 보존한다. 이미 materialize된 본문과 중복될 수 있지만 current/existing/stale lane에 오귀속하거나 payload를 버리지 않는다. 앞 메시지와 합칠지 텍스트 내용으로 추측하지 않는다.
 5. **툴/item progress는 휘발성 상태 UI다.** 첫 durable assistant lane이 정해지기 전에는 turn-level provisional preview 하나로만 보이며, 그 lane이 preview ID를 인계받아 scaffold를 실제 답변으로 교체한다. 어시스턴트가 실제로 발화한 commentary/final-answer 텍스트와 같은 보존 단위가 아니다.
 6. **이 저장소의 플러그인에서 고친다.** core는 이미 메시지 시작, partial 교체, block 소유권, 최종 전달에 대한 구조화된 경계를 제공한다.
 7. **앞 메시지의 라이브 전송 실패와 에이전트 턴 결과는 별개다.** 실패를 기록하고 마지막 메시지 전달을 계속 시도하며, 재접속 시 히스토리로 복구한다.
 
-따라서 목표 형상은 아래와 같다.
+따라서 ordinary 경로의 목표 형상은 아래와 같다.
 
 ```text
 assistant message A
@@ -41,9 +41,9 @@ assistant message B
 | `onPartialReply({ text, delta, replace })` | 현재 어시스턴트 메시지의 스트리밍 갱신. `text`는 현재 누적 본문이고 `replace:true`는 같은 메시지 안의 교체 갱신이다. | 활성 버블 하나를 편집한다. 각 중간 프레임은 영구 보존하지 않는다. |
 | tool/item `progress` | 플러그인이 만드는 `Working…`, 툴명, 상태 줄 같은 작업 진행 표시다. | 첫 durable lane 전에는 provisional preview ID 하나를 쓴다. 첫 durable lane이 그 ID를 인계받아 본문으로 교체하며, 실제 어시스턴트 발화로 히스토리에 남기지 않는다. |
 | assistant `commentary` | 모델이 사용자에게 내보낸 가시 텍스트 단계다. reasoning이나 툴 상태 줄이 아니다. | 하나의 어시스턴트 메시지로 완료되면 별도 버블로 보존한다. |
-| `onBlockReplyQueued(payload, ctx)` | block이 논리적으로 방출된 뒤 그 block의 async delivery보다 먼저 오는 알림이다. **다음 `onAssistantMessageStart`보다 먼저 온다는 보장은 없다.** `ctx.assistantMessageIndex`도 optional이다. | 닫혔지만 아직 해소되지 않은 앞 lane까지 보존해 기록한다. 기록마다 뒤따를 block delivery용 회계 credit을 만든다. |
+| `onBlockReplyQueued(payload, ctx)` | block이 논리적으로 방출된 뒤 그 block의 async delivery보다 먼저 오는 알림이다. **다음 `onAssistantMessageStart`보다 먼저 온다는 보장은 없다.** `ctx.assistantMessageIndex`도 optional이다. | 닫혔지만 아직 해소되지 않은 앞 lane까지 보존해 기록한다. 기록마다 뒤따를 block delivery용 회계 credit을 만든다. callback 수/순서는 final payload의 분류·개수·억제·grouping에 쓰지 않는다. |
 | `delivery.deliver(..., { kind:"block" })` | core가 전달하는 가시 어시스턴트 block이다. **`info`는 `kind`뿐이라 소유권 정보를 담지 않는다**(§5.2). | 대응 queued credit이 있을 때만 이미 보존된 payload로 보고 회계한다. credit이 없으면 버리지 않고 fallback 버블로 보존한다. |
-| `delivery.deliver(..., { kind:"final" })` | core 최종-payload 배열의 한 원소다. 한 턴에 여러 번 올 수 있고 `kind`만으로 assistant-message 소유권을 알 수 없다. 지원 하한의 terminal-error 경로는 `[error, ...retained assistantTexts]`를 만들 수 있으며 `assistantTexts`의 원소 하나가 lane 하나라는 보장도 없다. | notice/error는 별도 ID로 보존하고 assistant lane을 소비하지 않는다. ordinary answer는 current lane을 정착한다. leading-error 뒤 retained block은 terminal drain에서 만든 queued-block replay atom/group으로 회계만 하고 다시 보내지 않는다. 구조적으로 상관할 수 없는 payload만 진단 후 fresh fallback으로 보존한다. |
+| `delivery.deliver(..., { kind:"final" })` | core 최종-payload 배열의 한 원소다. 한 턴에 여러 번 올 수 있고 `kind`만으로 assistant-message/block 소유권을 알 수 없다. 지원 하한의 terminal-error 경로는 `[error, ...retained assistantTexts]`를 만들 수 있으며 callback cardinality도 이에 대응하지 않는다. | notice/error는 별도 ID로 보존하고 assistant lane을 소비하지 않는다. leading error 전 ordinary answer는 current lane을 정착한다. leading error 뒤 identity 없는 non-notice payload는 매번 fresh fallback ID로 전송하고 실제 send 결과를 반환한다. |
 
 핵심 구분은 간단하다. **스트리밍 프레임은 휘발성이지만, 그 스트림이 완성한 어시스턴트 메시지는 휘발성이 아니다.**
 
@@ -182,11 +182,11 @@ core의 Telegram 채널은 delivery 이음매에서 `info.assistantMessageIndex`
 
 `kind:"final"`의 다중성과 replay는 가정이 아니라 지원 하한 `2026.6.10`의 관측 가능한 동작이다. `replyResult`가 배열이면 dispatcher가 각 원소를 같은 `kind:"final"` delivery seam으로 순서대로 보낸다. 고정 builder는 errored run에서 먼저 `errorText`를 넣고, canonical single-answer 경로를 쓸 수 없으면 보존된 `assistantTexts`를 앞에서부터 모두 뒤에 넣는다. 여기서 `assistantTexts` 원소는 assistant-message lane이 아니라 방출된 assistant block일 수 있다. A lane이 A1/A2 두 block, B lane이 B 한 block을 만들면 이미 두 lane이 스트리밍된 뒤에도 `[error, A1, A2, B]`가 된다. 이 저장소도 terminal error → retained answer와 answer → timeout/tool warning을 `inbound.test.ts`에서 모델링하지만, 기존 fixture가 `streaming.mode:"off"`라 draft settle/replay 중복을 검출하지 못한다.
 
-delivery 이음매에는 payload index나 배열 시작/끝 표지가 없으므로 **final payload 하나를 lane 하나로 세거나 임의의 미래 final 배열을 완전하게 상관할 수 있다는 계약은 없다.** 대신 terminal callback drain까지 모은 `onBlockReplyQueued` 기록에는 각 block의 lane 소유권이 있다. callback ingress 순서의 block record를 lane별 연속 group으로 묶으면 `[A1,A2,B]`에 대응하는 replay atom은 `[A:A1, A:A2, B:B]`가 된다. leading terminal error 뒤의 non-notice final은 atom을 하나씩 소비하되 같은 group의 마지막 atom을 소비할 때만 다음 lane group으로 전진한다. 그 block 본문은 callback 축에서 이미 해당 lane에 materialize되었으므로 replay 소비는 **wire upsert가 아닌 dedupe/accounting**이고 `visibleReplySent:false`를 정직하게 반환한다. 특히 history snapshot이 `webchannel-a`를 `core-a1`로 채택한 뒤 stale `webchannel-a`를 다시 보내는 경로를 만들지 않는다.
+**queued callback은 final 배열과 cardinality-isomorphic하지 않다.** 기본 partial 모드는 block streaming이 꺼져 있어 callback이 0개여도 terminal final은 `[error,A1,A2,B]`일 수 있다. block streaming을 켜도 같은 lane의 A1/A2가 `A1 + "\n\n" + A2` callback 하나로 coalesce되고 B callback 하나가 따로 오는 동안 final 배열은 여전히 세 assistant text를 보낼 수 있다. 따라서 `onBlockReplyQueued`의 count/order/index는 late lane ownership, 본문 보존, 독립적인 block-delivery credit에만 쓰며 final payload를 분류·계수·억제·grouping하는 근거로 쓰지 않는다.
 
-그 밖의 모호한 추가 non-error final, 즉 terminal drain에서 만든 atom보다 많은 payload나 atom 구조를 시작할 수 없는 payload는 기존 버블을 내용으로 dedupe하지 않고 진단 후 fresh fallback으로 보존한다. 예상 밖 배열에서 중복 가능성은 데이터 유실보다 낫다는 fail-safe 비용으로 명시적으로 수용한다. exact-text/substring/참조 동일성이나 final payload의 비공개 metadata는 어느 경로에서도 쓰지 않는다.
+delivery 이음매에는 payload index나 배열 시작/끝 표지가 없으므로 **leading terminal error 뒤의 non-notice final을 기존 lane/block에 정확히 상관할 공개 계약이 없다.** ordinary non-notice final이 terminal error보다 먼저 오면 causal current lane을 정착한다. terminal error/notice는 lane을 소비하지 않는다. leading terminal error가 먼저 왔다면 뒤의 identity 없는 non-notice final은 모두 uncorrelated로 진단하고 각자 fresh fallback ID로 한 번 전송한다. fallback delivery는 실제 send 결과를 `visibleReplySent`에 반환한다. 이 at-least-once 정책은 materialized A/B와 fallback A1/A2/B의 의미상 중복을 명시적으로 수용하지만 payload 유실, current-lane 오귀속, history adoption 전 stale live ID 재사용은 피한다. exact-once에는 core가 stable assistant message/block identity를 공개 callback과 terminal delivery 양쪽에 전달해야 하며 [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111)이 그 의존성과 후속 화해를 추적한다. exact-text/substring/참조 동일성이나 비공개 metadata는 쓰지 않는다.
 
-따라서 core가 단순 문자열만 쏟아내서 관계를 알 수 없는 문제가 아니다. **WebChannel이 제공된 경계를 버리고 ID 하나에 합친 것이 문제다.** 이 이슈에서 core는 바꾸지 않는다.
+따라서 **ordinary #94 데이터 유실은** core가 제공한 assistant-message 경계를 WebChannel이 버리고 ID 하나에 합친 문제이며, 그 수정에는 core 변경이 필요 없다. 반면 leading-terminal-error 후속 final의 exact-once는 공개 relationship identity가 실제로 부족한 별도 core 계약 gap이고 #111이 추적한다.
 
 ---
 
@@ -245,7 +245,7 @@ type AssistantDraftLane = {
   assistantMessageIndex?: number;
   id?: string;
   answerText: string;
-  queuedBlocks: QueuedBlockRecord[];
+  queuedBlocks: Array<{ text?: string; assistantMessageIndex?: number }>;
   closed: boolean;
   resolution: "open" | "unresolved" | "materialized" | "empty";
   acceptsLateIndexlessBlocks: boolean;
@@ -262,35 +262,14 @@ type ProvisionalPreview = {
   settleResult?: Promise<boolean>;
 };
 
-type QueuedBlockRecord = {
-  ordinal: number; // callback ingress에서 동기 할당한 turn-local 순번
-  text?: string;
-  assistantMessageIndex?: number;
-  laneGeneration: number;
-};
-
 type QueuedBlockDeliveryCredit = {
-  queuedBlockOrdinal: number;
   laneGeneration: number;
   accounted: boolean;
 };
 
-type RetainedReplayAtom = {
-  queuedBlockOrdinal: number;
-  laneGeneration: number;
-  consumed: boolean;
-};
-
-type RetainedReplayGroup = {
-  laneGeneration: number;
-  atoms: RetainedReplayAtom[];
-};
-
 type FinalReconciliationState = {
-  mode: "ordinary" | "retained-answer-replay";
-  replayGroups: RetainedReplayGroup[];
-  groupCursor: number;
-  atomCursor: number;
+  ordinaryAnswerSettled: boolean;
+  leadingTerminalErrorSeen: boolean;
 };
 ```
 
@@ -303,28 +282,29 @@ type FinalReconciliationState = {
    - preview가 한 lane에 claim된 뒤 메시지 사이 tool scaffold는 새 ID로 보내지 않는다. 현재 프로토콜에는 delete가 없으므로 두 번째 provisional bubble을 안전하게 회수할 수 없다. 그 가시성은 #96의 별도 activity surface 범위다.
    - turn 전체가 tool-only/clean-silent라 durable lane이 끝내 없으면, 이미 보낸 preview는 삭제할 수 없으므로 기존 동작대로 그 scaffold 자체를 같은 ID에서 settle한다. 이는 기존 no-delete 비용이지, 뒤 answer와 나란히 남는 ghost sibling을 허용한다는 뜻이 아니다.
 4. partial은 current lane만 갱신한다. `replace:true`도 그 lane 안에서만 본문을 교체한다. predecessor barrier 때문에 아직 wire에 못 나갔더라도 freshest snapshot을 보관했다가 순서가 열리면 한 번에 내보낸다.
-5. 닫힌 lane을 정착할 때 queued block이 있으면 callback ingress 순서로 그 payload들을 이어 **완료 block 집합**을 본문으로 쓴다. queued block이 없을 때만 사용자가 마지막으로 본 정제된 cumulative partial snapshot을 쓴다. block 하나를 곧바로 assistant 메시지 전체라고 가정하지 않으며, callback-retained data로 각 lane을 정확히 한 번 materialize/settle한다.
+5. 닫힌 lane을 정착할 때 partial이 있으면 사용자가 마지막으로 본 정제된 cumulative snapshot을 쓴다. partial이 없었다면 그 lane에 기록된 queued block payload들을 순서대로 이어 본문으로 쓴다. block 하나를 곧바로 assistant 메시지 전체라고 가정하지 않는다.
 6. **`assistantMessageIndex`는 `onBlockReplyQueued`에서만 읽는다.** index가 있으면 matching retained lane에 기록한다. index가 없으면 다음 순서를 따른다.
    - `acceptsLateIndexlessBlocks`인 owner가 있으면 그 lane이 이미 materialize됐더라도 계속 거기에 기록한다. 첫 callback의 materialization이나 첫 delivery credit 소비가 ownership epoch를 닫지 않는다.
    - owner가 없고 후보가 하나뿐인 unresolved predecessor면 그 lane에 결합하고 `acceptsLateIndexlessBlocks=true`로 만든다. commentary-only A 뒤에서 B 경계가 먼저 온 late-callback 복구다.
    - unresolved predecessor와 late owner가 모두 없을 때만 current lane에 기록한다.
    - 후보가 여러 개라 유일하게 판정할 수 없으면 가장 이른 unresolved 위치에 보존 전용 fallback lane을 만들고 진단한다. 정확한 그룹화보다 데이터/순서 보존을 우선하며 current B에 조용히 오귀속하지 않는다.
    - late indexless owner는 first-final 직전의 terminal callback drain 또는 final 없는 `inbound.run` 종료 drain에서만 닫는다. 따라서 A1이 A를 materialize한 뒤 A2가 와도 둘 다 A에 남는다. 공개 계약에 indexless callback group ID가 없으므로 서로 겹치는 두 indexless owner를 정확히 분리할 수는 없다. 이 모호한 경로는 earliest-owner/fallback으로 데이터와 순서를 보존하고 진단한다.
-   - callback entry에서 async queue에 넣기 전에 turn-local `ordinal`을 동기 할당한다. callback 하나마다 block record와 뒤따를 `kind:"block"`용 delivery credit을 하나 만든다. 여러 callback이 같은 lane에 오면 block 본문/ordinal 순서를 보존하면서 credit은 각각 유지한다. ordinal은 final payload metadata가 아니라 callback 축의 관측 순서다.
+   - callback 하나마다 뒤따를 `kind:"block"`용 delivery credit을 하나 만든다. 여러 callback이 같은 lane에 오면 block 본문 순서를 보존하면서 credit은 각각 유지한다.
+   - queued callback count/order/index는 **final payload reconciliation과 완전히 독립**이다. callback이 0개이거나 A1/A2가 하나로 coalesce돼도 terminal final cardinality를 추론하지 않는다.
 7. **`deliver(kind:"block")`는 소유권을 재구성하지 않는다.** outstanding queued credit 하나를 소비할 수 있을 때만 이미 callback 축에서 보존된 payload로 보고 새 버블을 만들지 않는다. credit이 없다면 callback 누락/억제/상관 실패 진단을 남기고 delivery payload를 새 fallback lane으로 보존한다. payload 텍스트나 참조 동일성으로 credit을 찾지 않는다.
 8. **`deliver(kind:"final")`은 payload 분류와 final-reconciliation state로 처리한다.**
-   - 첫 final을 처리하기 전에 이미 enqueue된 callback/delivery 작업을 drain하고 late-owner epoch를 닫는다. 이 terminal barrier에서 본문·queued block·credit이 없는 closed predecessor를 `empty`로 확정해 preview claim/emission barrier를 푼다. 동시에 retained block record를 callback ordinal 순서로 놓고, 인접한 동일 `laneGeneration`을 묶어 `RetainedReplayGroup[]`을 만든다. delivery credit의 소비 여부와 final replay atom의 소비 여부는 서로 다른 회계다.
+   - 첫 final을 처리하기 전에 이미 enqueue된 callback/delivery 작업을 drain하고 late-owner epoch를 닫는다. 이 terminal barrier에서 본문·queued block·credit이 없는 closed predecessor를 `empty`로 확정해 preview claim/emission barrier를 푼다. 이 drain은 late lane을 보존하기 위한 것이며 final 상관표를 만들지 않는다.
    - status/fallback/compaction/terminal-error notice는 assistant lane의 terminal slot을 소비하지 않는다. unclaimed provisional preview가 있으면 같은 ID를 settle해 ghost를 회수할 수 있고, 아니면 fresh notice ID를 쓴다.
-   - terminal error가 ordinary answer보다 먼저 오고 replay group이 있으면 `retained-answer-replay` mode를 연다. 이후 non-notice final 하나가 atom 하나를 소비한다. `[A:A1,A:A2]` group에서는 A1 뒤에도 A group에 머물고 A2를 소비한 뒤에만 `[B:B]` group으로 전진한다.
-   - atom에 상관된 retained final은 callback-retained lane data의 중복 전달이므로 **어떤 lane ID로도 wire update를 보내지 않는다.** 해당 delivery는 `visibleReplySent:false`를 반환하며, history adoption이 live ID를 canonical ID로 바꿨어도 stale ID가 부활하지 않는다.
-   - replay mode가 아닌 ordinary answer final은 current lane을 정착한다. current lane이 아직 wire-visible하지 않으면 provisional preview를 claim하거나 새 ID를 할당한다.
-   - 소비할 replay atom이 없거나 replay 구조를 시작할 수 없는 예상 밖의 추가 non-error final은 내용을 비교해 버리지 않고 진단 후 fresh fallback ID로 보존한다. 이 계약 밖 배열에서는 중복 가능성을 명시적으로 수용하지만 데이터는 잃지 않는다.
+   - terminal error가 ordinary answer보다 먼저 오면 `leadingTerminalErrorSeen=true`로 만든다. callback 유무/개수/본문은 이 전이에 관여하지 않는다.
+   - `leadingTerminalErrorSeen`이 false인 첫 ordinary non-notice answer final은 current lane을 정착하고 `ordinaryAnswerSettled=true`로 만든다. current lane이 아직 wire-visible하지 않으면 provisional preview를 claim하거나 새 ID를 할당한다.
+   - leading terminal error 뒤의 모든 non-notice final은 public identity가 없으므로 uncorrelated다. payload마다 진단하고 fresh fallback ID로 전송한다. current/existing/stale lane ID를 사용하지 않고, callback credit을 소비하거나 payload를 accounting-drop하지 않는다.
+   - ordinary answer가 이미 정착된 뒤 또 온 identity 없는 non-notice final도 settle latch에 삼키지 않고 fresh fallback으로 보존한다. timeout/warning 같은 notice는 계속 notice 경로를 탄다.
    - draft lane이 없는 mode(block/off)는 기존 plain append 경로를 그대로 유지한다.
-9. retained-answer replay는 **lane settle latch의 재진입도 wire send도 아니다.** 같은 lane의 materialize/finalize/cleanup은 `settleResult`로 한 번만 보내고, 상관된 replay delivery는 atom만 한 번 소비한다. 각 delivery 호출의 `visibleReplySent`는 그 호출이 실제 수행한 send 결과이므로 replay accounting은 `false`이며, turn 단위 `finalReplyDelivered`는 실제 send 결과만 OR로 누적한다.
-10. final이 오기 전에 current lane이 화면에 나오지 않았어도 preview claim 또는 새 ID로 버블을 append/정착할 수 있어야 한다. terminal notice는 completed-assistant subsequence의 구성원이 아니며 append-only wire 때문에 A/B 앞에 소급 삽입하지 않는다. 보장 대상은 A/B가 generation 순서로 정확히 한 번씩 존재하는 것이다.
+9. 각 fallback delivery의 `visibleReplySent`는 **그 fresh-ID send의 실제 결과**다. `false`/throw도 해당 payload에서 격리하고 다음 final 전달을 계속 시도하며, turn 단위 `finalReplyDelivered`는 실제 send 결과만 OR로 누적한다.
+10. final이 오기 전에 current lane이 화면에 나오지 않았어도 preview claim 또는 새 ID로 버블을 append/정착할 수 있어야 한다. terminal notice는 ordinary completed-assistant subsequence의 구성원이 아니며 append-only wire 때문에 A/B 앞에 소급 삽입하지 않는다. ordinary 경로에서는 A/B가 generation 순서로 정확히 한 번씩 존재한다. leading-error 후속 final은 #111 전까지 fresh fallback으로 중복될 수 있다.
 11. final 없는 clean resolve/abort/error에서는 `inbound.run`이 끝난 뒤 callback/delivery queue를 drain하고 late-owner epoch를 닫는다. 그 뒤 truly empty predecessor를 제거하고, 실제 assistant text/queued block이 있는 lane을 generation 순서로 정착한다. cleanup이 unresolved lane을 조기 GC해서 늦은 callback을 잃게 하지 않는다.
 
-**명시적 비용:** index 없는 경계 뒤 predecessor가 실제로 빈 메시지였으면, 다음 lane의 preview는 first-final/terminal drain이 그 predecessor를 `empty`로 확정할 때까지 지연될 수 있다. timeout으로 임의 확정하면 원래 data-loss race가 다시 열린다. 또한 delivery seam에 final identity가 없으므로 queued replay atom을 초과하거나 구조를 시작할 수 없는 ambiguous final 배열은 보존 fallback에서 중복될 수 있고, 서로 겹치는 indexless callback group은 정확한 grouping 대신 earliest-owner/fallback을 쓴다. 클라이언트는 history adoption 전 live ID alias를 보존하지 않으므로, 상관된 replay를 wire에 다시 보내는 것은 금지한다. 어느 경우에도 payload를 current lane에 조용히 덮어써서 잃지는 않는다.
+**명시적 비용:** index 없는 경계 뒤 predecessor가 실제로 빈 메시지였으면, 다음 lane의 preview는 first-final/terminal drain이 그 predecessor를 `empty`로 확정할 때까지 지연될 수 있다. timeout으로 임의 확정하면 원래 data-loss race가 다시 열린다. 또한 delivery seam에 final identity가 없으므로 leading terminal error 뒤 `[A1,A2,B]`는 이미 materialize된 A/B와 함께 fresh fallback으로 다시 보일 수 있다. 이는 #111 전까지의 at-least-once 비용이다. 서로 겹치는 indexless callback group은 정확한 ownership grouping 대신 earliest-owner/fallback을 쓴다. 어느 경우에도 final payload를 current lane에 조용히 덮어쓰거나 버려서 잃지는 않는다.
 
 ### 6.3 callback과 delivery를 하나의 직렬 queue로 처리한다
 
@@ -333,7 +313,7 @@ core callback 타입이 Promise를 허용해도 모든 호출자가 그 Promise�
 - partial ingest
 - queued block 기록
 - assistant-message boundary close/rotate, provisional preview claim, unresolved predecessor 관리
-- block delivery credit 소비/fallback 및 final notice/queued-block replay-atom accounting/ordinary-answer reconciliation
+- block delivery credit 소비/fallback 및 final notice/ordinary-answer/leading-error fallback reconciliation
 - abort/error cleanup
 
 queue는 호출된 이벤트의 순서와 mutual exclusion을 제공할 뿐이다. 다음 boundary가 먼저 호출되고 앞 block callback이 나중에 호출되면 queue도 그대로 boundary → block 순서로 처리한다. §6.2의 retained predecessor와 generation-order emission barrier가 의미를 복구하며, "한 queue에 넣었으니 late callback도 안전하다"고 가정하지 않는다.
@@ -349,7 +329,7 @@ queue는 호출된 이벤트의 순서와 mutual exclusion을 제공할 뿐이�
 - `startsWith`/공백 정규화로 메시지 동일성 판정
 - `A + "\n\n" + B`를 나중에 split
 
-ordinary final이 current lane의 terminal slot을 소비할 때 앞 메시지를 인용하거나 반복해도 boundary가 갈랐으면 별도 버블이다. 그 final이 current partial을 크게 재포맷해도 해당 lane만 교체한다. leading-error retained-answer replay는 텍스트가 같아서가 아니라 §5.4의 queued-block atom/group 구조 때문에 이미 materialize된 lane의 accounting으로 소비된다. 소비할 atom이 없는 추가 final만 §6.2-8의 fresh fallback을 탄다.
+ordinary final이 leading terminal error보다 먼저 current lane의 terminal slot을 소비할 때 앞 메시지를 인용하거나 반복해도 boundary가 갈랐으면 별도 버블이다. 그 final이 current partial을 크게 재포맷해도 해당 lane만 교체한다. 반대로 leading error 뒤의 non-notice final은 내용이 기존 A/B와 같아 보여도 공개 identity가 없으므로 모두 fresh fallback을 탄다. callback count/order, exact text, substring, 참조 동일성으로 suppress하거나 lane을 고르지 않는다.
 
 ### 6.5 contract 위반에 대한 방어
 
@@ -389,8 +369,8 @@ ordinary final이 current lane의 terminal slot을 소비할 때 앞 메시지�
 ## 7. progress scaffold와 다른 streaming mode
 
 - `streaming.mode:"partial"`: 이 이슈의 주 경로다. 첫 assistant text 전 tool scaffold는 provisional preview이고, 이후 답변 partial은 메시지별 durable lane을 사용한다.
-- `streaming.mode:"progress"`: tool/item 줄만 provisional preview에 보인다. ordinary answer final이 오면 그 ID를 claim해 원자적으로 교체/정착한다. terminal notice와 retained block atom accounting도 §6.2-8의 같은 reconciliation을 쓰며, 상관된 replay를 stale ID로 다시 보내거나 모든 추가 final을 무조건 fresh append하지 않는다. durable answer가 전혀 없는 clean-silent turn만 no-delete 제약 때문에 기존처럼 scaffold 자체를 settle한다.
-- `streaming.mode:"block"` / `"off"`: draft lane이 없다. core가 넘긴 각 block/final은 기존 append 경로를 유지하되, 회귀 테스트로 전달 순서와 중복 부재를 확인한다.
+- `streaming.mode:"progress"`: tool/item 줄만 provisional preview에 보인다. leading error 없는 ordinary answer final이 오면 그 ID를 claim해 원자적으로 교체/정착한다. terminal notice는 lane을 소비하지 않고, leading error 뒤 identity 없는 non-notice final은 partial과 마찬가지로 각자 fresh fallback을 쓴다. durable answer가 전혀 없는 clean-silent turn만 no-delete 제약 때문에 기존처럼 scaffold 자체를 settle한다.
+- `streaming.mode:"block"` / `"off"`: draft lane이 없다. core가 넘긴 각 block/final은 기존 append 경로를 유지하고, 그 전달 순서와 회계 동작을 회귀 테스트로 확인한다.
 - reasoning lane: 이 계획의 대상이 아니다. reasoning과 사용자에게 발화한 commentary를 혼동하지 않는다.
 
 `progress`/`block`/`off`에 숨겨진 문자열을 partial처럼 복원하는 기능은 이 변경에 넣지 않는다. #94는 WebChannel이 실제로 받은 메시지 경계를 보존하지 못한 결함을 고친다.
@@ -417,7 +397,7 @@ ordinary final이 current lane의 terminal slot을 소비할 때 앞 메시지�
 
 - 단일 `id` + `answerPrefix` 누적 모델을 turn-level `ProvisionalPreview` + generation 순서가 있는 `AssistantDraftLane[]` 모델로 교체한다.
 - `pushAnswerText(text)` 대신 `text`/`delta`/`replace`를 보존해 받는 API로 바꾼다.
-- 메시지 경계 close/rotate, preview ID claim/reuse, unresolved predecessor 보존, persistent late-indexless owner, generation-order emission barrier, queued block delivery credit/fallback, callback-ordinal retained replay atom/group, lane별 settle latch를 추가한다.
+- 메시지 경계 close/rotate, preview ID claim/reuse, unresolved predecessor 보존, persistent late-indexless owner, generation-order emission barrier, queued block delivery credit/fallback, final phase state, lane별 settle latch를 추가한다.
 - tool/item progress scaffold는 첫 durable lane이 claim하기 전의 소유자 없는 휘발성 표시로 유지한다. 빈 첫 assistant message에 ID를 귀속하지 않는다.
 - `snapshotText()`는 **현재 활성 lane**의 방어 정착용 snapshot만 반환하게 명확히 한다.
 
@@ -426,10 +406,10 @@ ordinary final이 current lane의 terminal slot을 소비할 때 앞 메시지�
 - `onPartialReply`, `onBlockReplyQueued`, `onAssistantMessageStart`, `delivery.deliver`를 같은 lane event queue에 연결한다.
 - `onBlockReplyQueued`를 새로 배선하고 `context?.assistantMessageIndex`를 controller에 전달한다. **`delivery.deliver`의 `info`에서는 `kind`만 읽는다**(§5.2 — 그 타입에 index가 없다).
 - partial 모드의 block delivery는 queued credit이 있을 때만 회계로 끝내고, credit이 없으면 보존 fallback을 실행한다.
-- first-final 직전에 queued callback 작업을 drain해 empty predecessor와 late-owner epoch를 닫고, callback ordinal/lane 소유권으로 retained replay atom/group을 만든다. final payload는 terminal notice, retained-block accounting, ordinary current-lane answer, ambiguous fallback으로 분류한다.
-- leading terminal error는 assistant lane을 소비하지 않고 replay group을 연다. 뒤의 retained payload는 atom 하나씩 회계하되 같은 lane의 A1/A2를 모두 소비한 뒤에만 B group으로 전진한다. callback data로 이미 한 번 materialize된 lane을 stale live ID로 다시 보내지 않으며, 예상 밖 unmatched payload만 fresh fallback으로 append한다.
+- first-final 직전에 queued callback 작업을 drain해 empty predecessor와 late-owner epoch를 닫는다. callback 기록은 final 분류에 사용하지 않는다. final payload는 terminal notice, ordinary current-lane answer, leading-error 뒤 uncorrelated fallback으로 분류한다.
+- leading terminal error는 assistant lane을 소비하지 않는다. 뒤의 identity 없는 non-notice payload는 callback 유무/개수와 무관하게 모두 fresh fallback ID로 append한다. current/existing/stale lane ID를 추측하지 않는다.
 - 현재의 “final 하나가 턴 전체 draft를 교체한다”는 주석과 분기를 제거한다.
-- 앞 lane send 실패를 격리하고 final delivery별 결과 및 턴 단위 OR 회계를 유지한다. retained replay accounting은 실제 send가 아니므로 `visibleReplySent:false`다.
+- 앞 lane/fallback send 실패를 격리하고 final delivery별 실제 결과 및 턴 단위 OR 회계를 유지한다.
 
 ### 클라이언트
 
@@ -439,7 +419,7 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 - 서로 다른 `id`: 서로 다른 버블 append
 - history adoption: live `webchannel-*` ID를 canonical `core-*` ID로 교체하며 old-ID alias는 보존하지 않음
 
-따라서 서버가 A/B에 다른 ID를 주면 원하는 형상이 나온다. 단, adoption 뒤 settled lane의 old ID를 다시 쓰면 새 버블이 append되므로 correlated retained replay는 서버에서 accounting으로 끝내야 한다. C7이 정상 no-replay 형상과 금지된 stale-ID frame의 실제 비용을 함께 고정한다.
+따라서 서버가 ordinary A/B에 다른 ID를 주면 원하는 형상이 나온다. adoption 뒤 settled lane의 old ID를 다시 쓰면 새 버블이 append되므로 identity 없는 leading-error 후속 final은 old ID가 아닌 fresh fallback ID를 써야 한다. C7은 canonical A/B가 불변인 fresh fallback 형상과 stale-ID 추측의 실제 비용을 함께 고정한다. semantic exact-once는 client alias가 아니라 #111의 public identity 없이는 보장하지 않는다.
 
 ### 문서
 
@@ -471,8 +451,9 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 | M8 | 늦은 boundary | 방어 회전을 두 번 적용하지 않음 |
 | M9 | A 정착 실패 | queue는 살아 있고 B 정착 실행 |
 | M10 | 같은 lane의 동시/재진입 settle | 그 lane의 terminal frame 정확히 1회; 별도 final delivery slot은 막지 않음 |
-| M11 | queued callback `[A1(index=0), A2(index=0), B(index=1)]`와 A/B materialize 뒤 final `[terminal error, A1, A2, B]` | atom/group은 `[A:{A1,A2}, B:{B}]`; A1 뒤 A group 유지, A2 뒤 B로 전진, 세 retained delivery 모두 no-send accounting, lane A/B는 정확히 한 번 |
-| M12 | M11의 replay atom을 모두 소비한 뒤 추가 non-notice final C, 또는 atom 없이 replay처럼 온 final | 진단 + fresh fallback으로 C 보존, 기존 lane 불변 |
+| M11a | **기본 partial / block streaming off**: queued callback 0개, A/B materialized 뒤 final `[terminal error,A1,A2,B]` | A/B lane 불변; error와 uncorrelated A1/A2/B를 각각 fresh ID로 전송; materialized 내용과의 중복을 at-least-once 비용으로 수용 |
+| M11b | **block streaming enabled + effective coalescing**: queued callbacks `[A1+"\n\n"+A2(index=0),B(index=1)]`, final은 동일한 `[terminal error,A1,A2,B]` | 두 callback/credit은 block 경로에서만 회계; final 세 개 모두 callback 수와 무관하게 fresh fallback; A/B lane 불변 |
+| M12 | leading error 뒤 fallback send가 `true`/`false`/throw를 섞어 반환 | 모든 non-notice final 전송을 계속 시도하고 delivery별 실제 `visibleReplySent` 반환; queue 생존, 기존 lane 불변 |
 
 ### inbound 통합 테스트
 
@@ -486,10 +467,11 @@ production 변경은 예상하지 않는다. 현재 reducer는 다음을 이미 
 | I6 | A live 정착 `false`/throw | B final은 시도되고 성공 결과를 반환 |
 | I7 | B final 실패 | 기존 P0-4 턴 outcome 계약 유지 |
 | I8 | abort/clean resolve/error | 정착된 A 불변, queue drain 뒤 unresolved/current만 settle, working 잔존 없음 |
-| I9 | progress mode | provisional scaffold ID를 ordinary answer가 claim; notice/replay-atom accounting은 partial과 같은 reconciliation |
+| I9 | progress mode | provisional scaffold ID를 ordinary answer가 claim; leading-error 후속 final은 partial과 같은 fresh-fallback reconciliation |
 | I10 | block/off mode | 기존 append와 delivery 회계 무회귀 |
 | I11 | commentary-only A의 queued callback이 B boundary/partial 뒤 도착 (index 있음/없음 parameterize) | A/B 두 버블, A가 먼저, block delivery 중복 없음 |
-| I12 | partial 모드에서 queued callbacks `[A1(index=0),A2(index=0),B(index=1)]` 뒤 core final `[terminal error,A1,A2,B]` | callback data로 A1+A2 한 lane, B 한 lane을 각각 한 번만 전송; error notice 한 번; 세 replay delivery는 wire frame 없이 accounting; outcome error |
+| I12a | 기본 partial / block streaming off에서 callback 없이 A/B materialized, core final `[terminal error,A1,A2,B]` | 기존 A/B 불변; error와 A1/A2/B fresh fallback 모두 보존, fallback별 실제 send 결과, outcome error; 의미상 중복 명시 수용 |
+| I12b | block streaming enabled에서 callbacks `[A1+"\n\n"+A2(index=0),B(index=1)]`, core final은 같은 `[terminal error,A1,A2,B]` | block credit 2개와 final fallback 3개를 독립 처리; 기존 A/B 불변; error/A1/A2/B 모두 보존, outcome error |
 | I13 | partial 모드에서 answer final → timeout/tool-warning final | 두 payload 모두 보존, lifecycle verdict가 outcome 결정 |
 | I14 | partial 모드에서 queued credit 없는 block delivery | payload를 버리지 않고 fallback 버블로 보존 |
 | I15 | tool-only assistant A가 scaffold를 띄운 뒤 answer B가 시작 | B가 provisional ID를 재사용해 final 뒤 버블 하나, `turn_settled` 후 ghost scaffold 없음 |
@@ -510,7 +492,7 @@ reducer(`agent_message`의 id upsert/append)는 이미 다중 ID를 지원하므
 | C5a | lane 회전으로 턴당 draft id가 N개 | `turn_settled`가 같은 turn의 모든 working lane을 정착 |
 | C5b | grace 중 B 하나에 `progress` 또는 `agent_message` 도착 (두 frame type parameterize) | B id만 disarm되고 죽은 A/C는 계속 watch되어 만료 |
 | C6 | provisional scaffold와 첫 durable answer가 같은 ID의 progress/final을 사용 | answer 버블 하나만 남고 `turn_settled`가 ghost scaffold를 만들지 않음 |
-| C7 | live A/B가 history snapshot으로 `core-a1/core-a2`에 adopt된 뒤 terminal error; 이어 금지된 old-id replay를 별도로 주입 | 정상 계약은 error만 새로 보내 canonical A/B가 한 번씩 유지됨. `webchannel-a` stale replay를 보내면 alias가 없어 duplicate append된다는 비용/금지 조건도 실측 |
+| C7 | live A/B가 history snapshot으로 `core-a1/core-a2`에 adopt된 뒤 error + fresh fallback A1/A2/B; 이어 old-id upsert를 별도로 주입 | canonical A/B는 mutate되지 않고 fresh fallback은 append됨. old `webchannel-a`도 alias가 없어 별도 append됨을 실측; exact-once를 주장하지 않음 |
 
 C3/C4는 지금 우연히 맞을 수는 있어도 테스트로 고정돼 있지 않다. 이 변경이 그 전제를 상시 경로로 만들므로 반드시 고정한다.
 
@@ -522,7 +504,7 @@ C3/C4는 지금 우연히 맞을 수는 있어도 테스트로 고정돼 있지 
 
 - partial 모드 다중 어시스턴트 메시지 턴이 CI에서 **두 개의 서로 다른 id로 정착**하는지 e2e로 확인한다.
 - tool scaffold 뒤 빈 assistant boundary와 answer가 오는 partial turn이 **같은 provisional ID를 재사용해 한 버블**로 끝나는지 확인한다.
-- terminal-error retained-answer fixture는 plugin integration(I12)에서 callback `[A1@0,A2@0,B@1]`와 final `[error,A1,A2,B]` exact sequence를 고정한다. wire에는 materialized A/B와 error만 있고 retained replay upsert는 없어야 한다. provider별 error 재현에 기대지 않으므로 live e2e를 불안정하게 만들지 않는다.
+- terminal-error fixture는 plugin integration I12a/I12b에서 (a) callback 0개와 (b) coalesced callback 2개를 각각 만들되 final `[error,A1,A2,B]`는 같게 고정한다. 두 경우 모두 wire에는 기존 materialized A/B에 더해 error와 fresh fallback A1/A2/B가 남아야 한다. provider별 error 재현에 기대지 않으므로 live e2e를 불안정하게 만들지 않는다.
 - `e2e/protocol-version-lockstep.test.ts`: 새 프레임 타입이 없으므로 protocol 버전은 올리지 않는다. 이 판단을 테스트로 명시해 둔다.
 
 게이트:
@@ -546,15 +528,17 @@ npm test             # 루트 vitest — client 회귀와 e2e 포함
 | `final.includes(previous)` 또는 suffix 검사 | 인용/반복/재포맷을 메시지 동일성으로 오판한다. core의 구조화된 경계를 버린다. |
 | 모든 partial 프레임 영구 저장 | 보존 단위를 스트리밍 프레임으로 잘못 잡아 히스토리를 오염시킨다. |
 | 첫 `Working…` ID를 first assistant lane에 즉시 귀속 | first assistant message가 tool-only/empty면 B가 새 ID를 쓰고, delete 없는 client가 A scaffold를 `turn_settled`에서 영구 정착한다. preview는 첫 durable lane이 나올 때까지 소유자 없이 둔다. |
-| core 변경 | 필요한 경계 신호가 `plugin-sdk`에 이미 있다(§5.1). 이 결함의 소유자는 WebChannel 플러그인이다. |
+| ordinary #94 수정을 위한 core 변경 | assistant-message 경계 신호는 `plugin-sdk`에 이미 있어 ordinary 데이터 유실의 소유자는 WebChannel 플러그인이다(§5.1). leading-error exact-once에 필요한 stable public identity는 예외이며 #111의 core 계약 gap이다. |
 | 앞 버블 실패 시 턴 전체 실패 | 모델 실행 결과와 transport live-delivery 결과를 혼동한다. history 복구 경로도 있다. |
 | `deliver`의 `info.assistantMessageIndex`로 lane 상관 | 그 필드가 존재하지 않는다. `ChannelDeliveryInfo`는 `{kind}`뿐이고 6.10/7.1-2 동일하다(§5.2). 계약 밖 seam을 캐스팅으로 뚫는 것도 #23의 실패를 반복하는 길이다. |
 | `onBlockReplyQueued`↔`deliver`를 payload FIFO/참조/텍스트로 1:1 동일성 상관 | queue 순서와 delivery 순서가 같다는 보장이 없고 `preparePayload`가 payload를 교체할 수 있다. §6.2의 credit은 "앞서 보존된 queued callback 수"만 회계하며 payload identity나 lane 소유권을 delivery에서 재구성하지 않는다. |
 | partial 모드의 모든 `kind:"block"` 무조건 폐기 | queued callback이 다음 boundary보다 늦으면 앞 lane이 아직 materialize되지 않았을 수 있다. credit 없는 delivery는 fallback으로 보존한다. |
 | 모든 `kind:"final"`을 active lane settle latch로 전달 | `final`은 메시지 ID가 아니며 error/notice/replay가 current assistant lane을 소비해서는 안 된다. first-final-wins latch는 뒤 payload를 삼킨다. |
-| 첫 final 뒤 모든 payload를 fresh ID로 append | 고정 builder의 `[error,A1,A2,B]`에서 이미 materialize된 A/B까지 복제한다. queued-block replay atom과 상관된 payload는 accounting으로만 소비하고 unmatched payload만 fallback append한다. |
-| leading-error 뒤 non-notice final 하나마다 lane cursor 전진 | assistant lane A가 A1/A2 여러 block을 낼 수 있어 A2를 lane B에 오귀속한다. callback ordinal과 lane 소유권으로 `[A:{A1,A2},B:{B}]` group을 만든 뒤 atom 단위로 소비한다. |
-| 상관된 retained final을 기존 live lane ID로 다시 upsert | history adoption은 `webchannel-a`를 `core-a1`로 바꾸고 old-id alias를 보존하지 않는다. 뒤늦은 `webchannel-a` upsert는 duplicate를 append하므로, callback에서 이미 materialize한 payload는 wire 재전송 없이 accounting만 한다. |
+| 모든 `kind:"final"`을 무조건 fresh ID로 append | leading error 없는 ordinary answer는 causal current lane의 권위 있는 terminal payload이므로 그 lane을 정착해야 한다. fresh fallback은 leading error 뒤 identity 없는 non-notice final과 이미 ordinary answer가 settle된 뒤의 추가 uncorrelated final에만 쓴다. |
+| leading-error 뒤 non-notice final 하나마다 lane cursor 전진 | assistant lane A가 A1/A2 여러 block을 낼 수 있고 final seam에는 identity가 없어 A2를 lane B에 오귀속한다. current/existing lane을 추측하지 않고 모두 fresh fallback으로 보존한다. |
+| queued callback count/order로 final replay atom/group 생성 | 기본 partial에서는 callback 0개 대 final 3개가 가능하고, block mode에서는 coalesced callback 2개 대 final 3개가 가능하다. callback은 lane 본문/late ownership/block credit에만 쓴다. |
+| retained final을 기존/old live lane ID로 upsert | history adoption은 `webchannel-a`를 `core-a1`로 바꾸고 old-id alias를 보존하지 않는다. 기존 canonical ID도 public final identity 없이 고를 수 없다. 각 uncorrelated payload에 fresh fallback ID를 쓴다. |
+| leading-error 후속 final을 이미 보낸 payload라 보고 drop/accounting-only 처리 | callback과 final의 cardinality가 달라 실제 새 payload를 버릴 수 있다. 모든 uncorrelated payload를 전송하고 실제 send 결과를 반환한다. |
 
 ---
 
@@ -567,6 +551,7 @@ npm test             # 루트 vitest — client 회귀와 e2e 포함
 - reasoning lane의 별도 제품 정책
 - 다른 기기에서 시작한 턴의 history/live 영구 중복 → #104
 - reasoning activity가 죽은 sibling draft의 stale recovery까지 disarm → #105
+- leading-terminal-error 후속 final의 exact-once 화해 → [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111). core가 stable assistant message/block identity를 공개 callback과 terminal delivery 양쪽에 전달해야 안전하게 dedupe할 수 있다. #94/PR2는 그 전까지 fresh-ID at-least-once로 보존한다.
 
 ### 12.1 PR 1에서 발견한 인접 결함 (실측, 2026-08-10)
 
@@ -595,21 +580,22 @@ staleness valve의 disarm은 경로마다 단위가 다르다. `progress`/`agent
 
 ## 13. 완료 정의
 
-- [ ] 한 턴의 완료된 assistant 메시지 N개가 라이브에서도 N개 버블로 남는다.
+- [ ] ordinary 경로에서 한 턴의 완료된 assistant 메시지 N개가 라이브에서도 N개 버블로 남는다. leading-terminal-error 후속 final은 #111 전까지 fresh fallback 중복을 허용한다.
 - [ ] 각 메시지는 고유 ID를 가지며 partial은 해당 활성 ID만 갱신한다.
 - [ ] first-lane tool scaffold는 provisional ID로 남고 첫 durable assistant lane이 재사용한다. tool-only A → answer B에서 ghost scaffold가 남지 않는다.
 - [ ] 다음 boundary 뒤에 늦게 온 `onBlockReplyQueued`도 index 유무와 관계없이 앞 commentary-only lane을 보존하며, 뒤 lane이 앞 lane을 추월하지 않는다. index 없는 A1/A2가 연속으로 늦게 와도 둘 다 A에 남는다.
 - [ ] queued credit 없는 block delivery를 조용히 폐기하지 않는다.
-- [ ] ordinary answer final만 current lane의 terminal slot을 확정한다. terminal notice는 lane을 소비하지 않고, structurally correlated retained block은 queued replay atom accounting으로 wire 재전송 없이 소비하며, unmatched payload만 fresh fallback으로 보존한다.
-- [ ] callback `[A1@0,A2@0,B@1]`와 final `[error,A1,A2,B]`에서 A1/A2는 같은 A lane, B는 다음 lane에 속하고 assistant A/B는 wire에 정확히 한 번씩 남으며 error notice도 한 번 보인다. answer → timeout/warning 순서에서도 어느 payload도 settle latch에 삼켜지지 않는다.
-- [ ] history snapshot이 live A/B ID를 canonical ID로 adopt한 뒤에도 correlated replay가 old live ID를 다시 보내 duplicate를 만들지 않는다. 상관된 delivery는 `visibleReplySent:false`이고 atom을 초과한 payload만 fresh fallback을 쓴다.
-- [ ] live와 history hydrate의 메시지 **수와 순서**가 일치한다(§6.5.1의 방어 회전 예외 제외).
+- [ ] leading error 없는 첫 ordinary answer final만 current lane의 terminal slot을 확정한다. terminal notice는 lane을 소비하지 않고, leading error 뒤 identity 없는 모든 non-notice payload는 fresh fallback으로 보존한다.
+- [ ] (a) block callback 0개와 (b) coalesced callbacks `[A1+"\n\n"+A2@0,B@1]` 모두 final `[error,A1,A2,B]`를 만나면 기존 A/B는 불변이고 error/A1/A2/B가 모두 보존된다. callback 수로 final을 drop/group하지 않으며 의미상 중복은 명시적으로 수용한다.
+- [ ] 각 fresh fallback delivery는 실제 `visibleReplySent`를 반환하고 `false`/throw 뒤에도 나머지 final을 계속 시도한다. answer → timeout/warning 순서에서도 어느 payload도 settle latch에 삼켜지지 않는다.
+- [ ] history snapshot이 live A/B ID를 canonical ID로 adopt한 뒤 fresh fallback은 canonical A/B를 mutate하지 않고 append된다. old live ID 추측도 하지 않으며 exact-once는 #111 범위다.
+- [ ] ordinary 경로의 live와 history hydrate 메시지 **수와 순서**가 일치한다(§6.5.1의 방어 회전 및 leading-error at-least-once 예외 제외).
       **본문 일치는 완료 조건이 아니다** — core는 라이브 응답에서 메타데이터 구획을 걷어내고 transcript에는 원본을 저장하므로 두 텍스트는 애초에 byte-equal이 아니다(`nats-client-wrapper.ts:1052-1054`). 본문 수렴은 hydrate의 정본 텍스트 채택(`adoptAt`)이 담당하며, 이 이슈가 보장할 대상이 아니다.
 - [ ] 메시지 동일성 판정에 `includes`/suffix/문자열 split을 사용하지 않는다.
 - [ ] 앞 lane 전송 실패 후에도 모든 final payload 전달이 시도된다.
 - [ ] abort/error/단일 메시지/progress/block/off 경로에 회귀가 없다.
 - [ ] 중단/에러 경로에서 빈 lane 버블도 중단 마커 버블도 생기지 않는다. 이미 표시된 unclaimed tool-only preview만 no-delete 예외로 같은 ID에서 settle한다(§6.2-3, §8-6).
-- [ ] history 화해 비대칭(C3/C4), later-snapshot adoption, 다중 draft watchdog(C5a/C5b), provisional-ID reuse(C6), snapshot adoption 뒤 stale-ID replay 금지 비용(C7)이 테스트로 고정된다.
+- [ ] history 화해 비대칭(C3/C4), later-snapshot adoption, 다중 draft watchdog(C5a/C5b), provisional-ID reuse(C6), snapshot adoption 뒤 fresh-fallback/stale-ID append 비용(C7)이 테스트로 고정된다.
 - [ ] 다중 어시스턴트 메시지 턴이 e2e에서 두 개의 서로 다른 id로 정착한다.
 - [ ] 계약 밖(core 내부 번들) 의존을 새로 늘리지 않는다 — 신규 근거는 `plugin-sdk` export만 인용한다.
 - [ ] build/typecheck/plugin tests/full tests가 모두 통과한다.
@@ -625,14 +611,14 @@ PR 1 완료 시점에는 **문서와 client characterization test만 수정되�
 ### 14.1 PR 분할 (확정)
 
 **PR 1 — 클라이언트 화해 특성 테스트 (테스트 전용, 소)**
-`packages/client/src/nats-client-wrapper.test.ts`에 §10의 C1~C7을 추가한다. 플러그인 변경과 완전히 독립이며 합성 프레임만으로 검증된다. 목표는 프로덕션 무변경이다. C6은 새 프로토콜 없이 provisional ID reuse가 ghost 없이 작동함을 고정한다. C7은 snapshot adoption 뒤 old live ID alias가 보존되지 않아 stale replay가 duplicate를 만든다는 현재 client 제약을 실측하고, PR 2가 correlated replay를 wire에 내보내지 않아야 함을 고정한다. client production alias map은 이 PR에 추가하지 않는다.
+`packages/client/src/nats-client-wrapper.test.ts`에 §10의 C1~C7을 추가한다. 플러그인 변경과 완전히 독립이며 합성 프레임만으로 검증된다. 목표는 프로덕션 무변경이다. C6은 새 프로토콜 없이 provisional ID reuse가 ghost 없이 작동함을 고정한다. C7은 snapshot adoption 뒤 canonical A/B를 건드리지 않는 fresh fallback과 old live ID alias가 없어 stale-ID upsert도 append되는 현재 client 제약을 실측한다. exact-once나 alias 보존을 주장하지 않고 client production alias map도 이 PR에 추가하지 않는다.
 
 **작성 규칙 (리뷰 2라운드에서 두 번 어겨 정한다).** 특성 테스트의 가치는 주석에 있고, 주석이 테스트보다 강한 주장을 하면 다음 사람을 오도한다. **"이 테스트가 X를 구속한다"고 쓸 거면 X를 깨는 뮤테이션을 실제로 돌려 확인하고 쓴다.** 확인하지 못하면 "이 형상이 이렇게 수렴한다"는 사실 기록으로만 쓴다. 실제로 이 규칙 없이 쓴 주석 두 개가 자명하게 참인 assertion(C4 오라벨, 구 C3의 짝짓기 주장)을 감추고 있었다.
 
 이걸 먼저 떼는 이유: C3(라이브 1 / snapshot 2)와 C4(라이브 3 / snapshot 2)는 3-tier 매칭을 추적해 보면 **현재 우연히 맞지만 테스트로 고정된 적이 없다.** 만약 실제로 틀렸다면 그건 `nats-client-wrapper.ts` 프로덕션 수정이고, 메인 PR 안에서 터지면 "메시지 경계 수정"이 클라이언트 화해 로직 수정까지 껴안게 된다. 먼저 확인하면 어느 쪽이든 메인 PR이 깨끗하다.
 
 **PR 2 — #94 본체 (대, 원자적)**
-provisional preview + ordered/unresolved lane 모델 + callback-ordinal replay atom/group + inbound 배선 + M1~M12(세분 케이스 포함) / I1~I16 + e2e 게이트. **더 쪼개면 깨진다** — inbound가 경계/queued block/delivery를 넘기지 않으면 adapter는 preview claim, late ownership, final replay accounting과 emission barrier를 운용할 수 없고, adapter에 retained lane/credit/atom이 없으면 late callback 보존과 `[A1,A2,B]` grouping이 성립하지 않는다. §6.5 fail-safe도 못 뗀다. 현재 코드에 이미 `absorbedMissedBoundaries` 방어가 있어서, 빼고 먼저 내보내면 #23이 막아둔 것을 되돌리는 셈이다.
+provisional preview + ordered/unresolved lane 모델 + independent block-delivery credit + final-phase/fresh-fallback 처리 + inbound 배선 + M1~M12(세분 케이스 포함) / I1~I16 + e2e 게이트. **더 쪼개면 깨진다** — inbound가 경계/queued block/delivery를 넘기지 않으면 adapter는 preview claim, late ownership, final fallback과 emission barrier를 운용할 수 없고, adapter에 retained lane/credit이 없으면 late callback 보존이 성립하지 않는다. §6.5 fail-safe도 못 뗀다. 현재 코드에 이미 `absorbedMissedBoundaries` 방어가 있어서, 빼고 먼저 내보내면 #23이 막아둔 것을 되돌리는 셈이다.
 
 **기각한 분할:** "id는 하나로 둔 채 `answerPrefix`만 배열로 바꾸는 무동작 리팩터를 먼저" 안. 회전 없는 lane 구조는 2단계에서 다시 쓰이므로 버려질 코드를 리뷰시키게 된다. 대신 **PR 2 안에서 커밋을 ① adapter lane 모델 ② inbound 배선 ③ 테스트 ④ e2e 순으로 나눈다.** 분할 PR의 리뷰 이점 대부분을 얻으면서 버려지는 중간 상태를 만들지 않는다.
 
@@ -640,8 +626,8 @@ provisional preview + ordered/unresolved lane 모델 + callback-ordinal replay a
 
 아래 순서로 바로 시작한다. 재조사는 필요 없다.
 
-1. `packages/plugin/src/channel.test.ts`의 기존 “두 assistant 메시지가 한 ID에 합쳐진다” 테스트를 두 ID/두 버블 기대값으로 바꾸고, final이 앞 메시지를 인용하는 실패 테스트를 먼저 추가한다. 이어 tool scaffold → empty boundary → answer, late A1/A2(index 없음), callback `[A1@0,A2@0,B@1]` + final `[error,A1,A2,B]` retained replay의 red test를 추가한다.
-2. `packages/plugin/src/message-adapter.ts`의 턴 고정 `id`/`answerPrefix`를 provisional preview, ordered lane 목록, unresolved predecessor, persistent late-indexless owner, block-delivery credit, callback-ordinal final replay atom/group, lane별 settle latch로 교체한다.
+1. `packages/plugin/src/channel.test.ts`의 기존 “두 assistant 메시지가 한 ID에 합쳐진다” 테스트를 두 ID/두 버블 기대값으로 바꾸고, final이 앞 메시지를 인용하는 실패 테스트를 먼저 추가한다. 이어 tool scaffold → empty boundary → answer, late A1/A2(index 없음), (a) callback 0개 및 (b) coalesced callback 2개 + 동일 final `[error,A1,A2,B]`의 fresh-fallback red test를 추가한다.
+2. `packages/plugin/src/message-adapter.ts`의 턴 고정 `id`/`answerPrefix`를 provisional preview, ordered lane 목록, unresolved predecessor, persistent late-indexless owner, block-delivery credit, final phase, lane별 settle latch로 교체한다.
 3. `pushAnswerText`가 문자열만 받지 말고 `text`/`delta`/`replace`를 보존하도록 바꾼다.
 4. `packages/plugin/src/inbound.ts`에서 partial/boundary/queued-block/delivery를 같은 직렬 queue에 넣는다. `onBlockReplyQueued`를 새로 배선해 `context?.assistantMessageIndex`를 넘기고, `deliver`의 `info`에서는 `kind`만 읽는다.
 5. plugin 테스트가 green이 된 뒤 client의 다중 ID reducer 회귀 테스트와 전체 게이트를 실행한다.
@@ -651,10 +637,11 @@ provisional preview + ordered/unresolved lane 모델 + callback-ordinal replay a
 - boundary는 lane 순서를, `onBlockReplyQueued`는 block 소유권/본문과 delivery credit을 제공한다. first tool scaffold는 lane 소유가 아니라 provisional preview다. final 본문을 `includes`/suffix로 비교하지 않는다.
 - **`deliver`에는 `assistantMessageIndex`가 없다**(§5.2). index는 `onBlockReplyQueued`의 `BlockReplyContext`에서만 읽는다. 이 필드를 delivery 이음매에서 찾다가 캐스팅으로 뚫으려 하지 않는다.
 - `deliver`는 lane identity를 제공하지 않는다. block은 queued credit이 있을 때만 회계로 끝내고, credit이 없으면 보존 fallback을 쓴다.
-- ordinary answer final만 current lane terminal slot을 소비한다. leading terminal error는 retained-answer replay group을 열고, callback 축과 상관된 A1/A2/B는 이미 materialize된 lane의 atom accounting으로만 소비한다. notice와 unmatched fallback만 별도 ID를 쓴다.
+- leading error 없는 첫 ordinary answer final만 current lane terminal slot을 소비한다. leading terminal error는 lane을 소비하지 않고, 그 뒤 identity 없는 모든 non-notice final은 callback과 무관하게 fresh fallback ID를 쓴다.
 - `onBlockReplyQueued`는 같은 assistant 메시지에 여러 번 올 수 있다. **block 하나를 메시지 하나로 가정하지 않는다.**
+- `onBlockReplyQueued` count/order/index는 final payload를 classify/count/suppress/group하지 않는다. 기본 partial의 callback 0개와 block coalescing의 callback 2개가 같은 final 3개를 만들 수 있다.
 - `onBlockReplyQueued`가 다음 boundary보다 늦게 호출될 수 있다. 직렬 queue만으로 고쳐졌다고 가정하지 않고 unresolved predecessor/emission barrier를 유지한다. indexless late owner는 첫 callback materialization/credit 뒤에도 terminal drain까지 유지한다.
-- settle latch는 턴별이 아니라 lane별 normal terminal send용이다. preview의 `started`와 lane의 `started`를 분리하고, correlated retained replay는 cached settle 결과에 삼키거나 stale lane ID로 다시 보내지 않고 별도 atom accounting으로 소비한다.
+- settle latch는 턴별이 아니라 lane별 normal terminal send용이다. preview의 `started`와 lane의 `started`를 분리하고, leading-error 후속 final은 cached settle 결과에 삼키거나 기존/stale lane ID에 적용하지 않고 fresh fallback으로 실제 전송한다.
 - 첫 durable lane은 이미 표시된 provisional preview ID를 claim한다. 그 뒤 회전한 lane은 어시스턴트 텍스트가 생기기 전까지 새 `progress` ID를 보내지 않는다. 프로토콜에 버블 삭제가 없어서, 한 번 보이면 반드시 버블로 남는다(§6.2-3).
 - 위험한 클라이언트 표면은 reducer가 아니라 history 3-tier 화해 로직이다(§10 C3/C4).
 - 앞 lane send 실패가 queue를 reject 상태로 고정하거나 뒤 lane/추가 final을 막아서는 안 된다.
@@ -666,4 +653,4 @@ provisional preview + ordered/unresolved lane 모델 + callback-ordinal replay a
 - `inbound.ts`: `onPartialReply`가 `p.text`만 넘기는 부분, `onAssistantMessageStart`, `draft.finalize(text)` final 분기
 - `channel.test.ts`: `preserves earlier message text across an assistant-message boundary...` 테스트가 현재 잘못된 one-id 계약을 고정함
 
-GitHub #94의 제목/본문도 이 문서와 같은 확정안으로 이미 갱신돼 있다.
+GitHub #94의 제목/본문도 이 문서와 같은 확정안으로 유지한다. exact-once identity 의존성은 #111에 링크한다.

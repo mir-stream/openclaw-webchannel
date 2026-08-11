@@ -111,9 +111,13 @@ narrowed to agent-down durability — see below).
    a correctness gap: multiple assistant messages currently share one draft id, so the last final can
    erase earlier live messages. The accepted fix settles one bubble per assistant-message boundary
    and rotates to a new id, while letting the first durable lane claim the provisional tool-scaffold id,
-   retaining late indexless callback ownership through terminal drain, and grouping queued blocks such
-   as `[A1@0,A2@0,B@1]` into replay atoms for `[error,A1,A2,B]`. Correlated retained finals are
-   dedupe/accounting only, not stale live-id upserts after history adoption. Setup-wizard nit remains:
+   retaining late indexless callback ownership through terminal drain. Queued callbacks remain
+   independent block-body/credit signals: their cardinality cannot classify finals. After a leading
+   terminal error, non-notice finals without public identity, such as `[A1,A2,B]`, each use a fresh
+   fallback id.
+   This deliberately preserves at least once and may duplicate materialized A/B; exact-once needs a
+   stable public identity and is deferred to
+   [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111). Setup-wizard nit remains:
    it does not offer `streaming.mode` (enroll-only).
 
 3. **Slash commands both execute AND are discoverable.** Execution always worked — text commands are
