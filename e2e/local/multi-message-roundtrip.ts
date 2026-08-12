@@ -28,7 +28,8 @@
 // multi-message turn.
 //
 // Exit codes: 0 ok · 2 setup/HTTP failure · 3 timeout · 5 decrypt/mismatch ·
-// 6 multi-message assertion failed.
+// 6 multi-message assertion failed. The runner adds 7 — a fixture that never
+// actually ran (see the provider-log assertion in run-multi-message.sh).
 
 import { randomBytes, webcrypto } from "node:crypto";
 
@@ -54,6 +55,14 @@ const MULTI_MARKER = process.env.ECHO_MULTI_MSG_MARKER ?? "ISSUE94_TWO_MESSAGES"
 const TEXT_A = process.env.ECHO_MULTI_MSG_TEXT_A ?? "ISSUE94_MESSAGE_A checking the roster now.";
 const TEXT_B = process.env.ECHO_MULTI_MSG_TEXT_B ?? "ZZZ94_SECOND_ANSWER here is what came back.";
 const MULTI_MESSAGE = `list the agents ${MULTI_MARKER}`;
+
+// Turn 2 — the TOOL-ONLY FIRST assistant message (the ordinary "call a tool,
+// then answer" turn). Phase 1 emits the tool call with no assistant text at all,
+// so the turn's first assistant message carries nothing and the channel's first
+// draft lane can never materialize.
+const TOOL_FIRST_MARKER = process.env.ECHO_TOOL_FIRST_MARKER ?? "ISSUE94_TOOL_FIRST";
+const TOOL_FIRST_TEXT = process.env.ECHO_TOOL_FIRST_TEXT ?? "TOOLFIRST94_ANSWER after the tool ran.";
+const TOOL_FIRST_MESSAGE = `list the agents ${TOOL_FIRST_MARKER}`;
 
 const inboundSubj = `webchannel.${TENANT}.${ACCOUNT_ID}.${PEER_ID}.in`;
 const outboundSubj = `webchannel.${TENANT}.${ACCOUNT_ID}.${PEER_ID}.out`;
@@ -210,37 +219,11 @@ transport.subscribe(outboundSubj);
 // flush server-side before the first publish.
 await sleep(300);
 
-const before = frames.length;
-transport.publish(
-  inboundSubj,
-  sealMessage({ accountId: ACCOUNT_ID, tenant: TENANT, sub: PEER_ID }, sessionKey, {
-    type: "user_message",
-    text: MULTI_MESSAGE,
-  }),
-);
-console.log(`[driver] sent ${JSON.stringify(MULTI_MESSAGE)}`);
-
-// Wait for `turn_settled` — the turn's terminal frame. Then drain briefly so a
-// trailing frame that arrives after settlement is in the record too (if the
-// plugin ever emitted one, the log must show it rather than hide it).
-const deadline = Date.now() + 90_000;
-for (;;) {
-  if (frames.slice(before).some((f) => f.type === "turn_settled")) break;
-  if (Date.now() > deadline) {
-    dumpFrames();
-    fail(3, `TIMEOUT waiting for turn_settled after ${JSON.stringify(MULTI_MESSAGE)}`);
-  }
-  await sleep(100);
-}
-await sleep(1_000);
-
-const turnFrames = frames.slice(before);
-
 // ---------------------------------------------------------------------------
 // 5a. THE FRAME LOG. Printed before any assertion so a failing run still yields
 //     the full record of what core+plugin actually put on the wire.
 //
-//     Measured shape on the pinned core (2026.6.10), for the record:
+//     Measured shape on the pinned core (2026.6.10) for turn 1, for the record:
 //       typing · progress(A) · agent_message(A) · progress(B) · agent_message(B)
 //       · turn_settled(ok)
 //     A settles BEFORE B's first partial, so no partial of B is ever applied to
@@ -253,9 +236,9 @@ const turnFrames = frames.slice(before);
 //     boundary event at all is not reachable through this provider and stays
 //     covered by the unit fixtures alone.
 // ---------------------------------------------------------------------------
-function dumpFrames(): void {
-  const all = frames.slice(before);
-  console.log(`[driver] ── inbound frame log (${all.length} frames) ──────────────────────`);
+function dumpFrames(from: number, label: string): void {
+  const all = frames.slice(from);
+  console.log(`[driver] ── ${label}: inbound frame log (${all.length} frames) ─────────────`);
   all.forEach((f, i) => {
     const parts = [
       `#${String(i).padStart(2, "0")}`,
@@ -269,7 +252,38 @@ function dumpFrames(): void {
   });
   console.log("[driver] ── end frame log ─────────────────────────────────────────");
 }
-dumpFrames();
+
+/** Publish one user message, wait for its `turn_settled`, log and return its frames. */
+async function driveTurn(label: string, text: string): Promise<Frame[]> {
+  const from = frames.length;
+  transport.publish(
+    inboundSubj,
+    sealMessage({ accountId: ACCOUNT_ID, tenant: TENANT, sub: PEER_ID }, sessionKey, {
+      type: "user_message",
+      text,
+    }),
+  );
+  console.log(`[driver] ${label}: sent ${JSON.stringify(text)}`);
+
+  // Wait for `turn_settled` — the turn's terminal frame. Then drain briefly so a
+  // trailing frame that arrives after settlement is in the record too (if the
+  // plugin ever emitted one, the log must show it rather than hide it).
+  const deadline = Date.now() + 90_000;
+  for (;;) {
+    if (frames.slice(from).some((f) => f.type === "turn_settled")) break;
+    if (Date.now() > deadline) {
+      dumpFrames(from, label);
+      fail(3, `TIMEOUT waiting for turn_settled after ${JSON.stringify(text)}`);
+    }
+    await sleep(100);
+  }
+  await sleep(1_000);
+  dumpFrames(from, label);
+  return frames.slice(from);
+}
+
+const turnFrames = await driveTurn("turn 1 (text A + tool → text B)", MULTI_MESSAGE);
+
 
 const agentMessages = turnFrames.filter((f) => f.type === "agent_message");
 const settled = turnFrames.find((f) => f.type === "turn_settled");
@@ -352,6 +366,84 @@ console.log(
   `[PROOF] #94: one turn produced ${agentMessages.length} settled assistant bubbles at ` +
     `${distinctIds.size} distinct ids (A=${aFrame.id}, B=${bFrame.id}), in model order, ` +
     `with message A intact; turn_settled outcome=ok`,
+);
+
+// ---------------------------------------------------------------------------
+// 6. TURN 2 — the TOOL-ONLY FIRST assistant message.
+//
+// This is the ordinary shape of "call a tool, then answer", and it is the most
+// common multi-assistant-message turn there is: phase 1 emits ONLY the tool
+// call, so the turn's first assistant message carries no text and the channel's
+// first draft lane can never materialize.
+//
+// WHAT IT GUARDS: the lane model resolves a closed, text-less lane only at
+// TERMINAL DRAIN. Until then that lane is an unresolved ordering barrier in
+// front of every later lane, so the answer that follows the tool call cannot
+// emit a single `progress` frame — the whole turn streams NOTHING and the user
+// watches a static "Working…" scaffold until the final lands. The turn's end
+// state is correct, which is why turn 1 above cannot see this: only the LIVE
+// path is broken, and only when the first message is text-less.
+//
+// The assertion is therefore about streaming, not about the settled text: the
+// answer must have appeared in a `progress` frame BEFORE it settled, and it must
+// settle exactly once, in the same bubble it streamed in.
+// ---------------------------------------------------------------------------
+const toolFirstFrames = await driveTurn("turn 2 (tool-only first message)", TOOL_FIRST_MESSAGE);
+
+const toolFirstSettled = toolFirstFrames.filter((f) => f.type === "agent_message");
+const toolFirstCarriers = toolFirstSettled.filter((f) => (f.text ?? "").includes(TOOL_FIRST_TEXT));
+if (toolFirstCarriers.length !== 1) {
+  fail(
+    6,
+    `#94 tool-only-first: ${toolFirstCarriers.length} settled bubble(s) carry the answer ` +
+      `${JSON.stringify(TOOL_FIRST_TEXT)}, expected exactly 1 — ` +
+      `${JSON.stringify(toolFirstSettled.map((f) => ({ id: f.id, text: f.text })))}`,
+  );
+}
+const toolFirstAnswer = toolFirstCarriers[0]!;
+
+// The live half. A `progress` frame whose text is a PREFIX of the answer is the
+// answer streaming; the tool scaffold ("Working…") is not a prefix of it, so a
+// turn that only ever showed the scaffold fails here.
+const toolFirstProgress = toolFirstFrames.filter((f) => f.type === "progress");
+const streamedAnswer = toolFirstProgress.filter(
+  (f) => (f.text ?? "").length > 0 && TOOL_FIRST_TEXT.startsWith(f.text!),
+);
+if (streamedAnswer.length === 0) {
+  fail(
+    6,
+    `#94 REGRESSION (tool-only first message): the answer never streamed. ` +
+      `${toolFirstProgress.length} progress frame(s) were sent ` +
+      `(${JSON.stringify(toolFirstProgress.map((f) => f.text))}) and none of them carried any ` +
+      `prefix of ${JSON.stringify(TOOL_FIRST_TEXT)} — the text-less first lane held the answer ` +
+      `lane behind an ordering barrier until terminal drain, so the user saw a static scaffold ` +
+      `for the whole turn and the answer appeared only as a finished bubble.`,
+  );
+}
+
+// …and it must settle in the SAME bubble it streamed in, not beside it.
+if (!streamedAnswer.some((f) => f.id === toolFirstAnswer.id)) {
+  fail(
+    6,
+    `#94 tool-only-first: the answer streamed at ${JSON.stringify(
+      streamedAnswer.map((f) => f.id),
+    )} but settled at a different id (${toolFirstAnswer.id}) — the streamed bubble was abandoned.`,
+  );
+}
+
+const toolFirstTurnSettled = toolFirstFrames.find((f) => f.type === "turn_settled");
+if (toolFirstTurnSettled?.outcome !== "ok") {
+  fail(
+    6,
+    `#94 tool-only-first: turn settled ${JSON.stringify(toolFirstTurnSettled?.outcome)}, ` +
+      `expected "ok".`,
+  );
+}
+
+console.log(
+  `[PROOF] #94 tool-only first message: the answer streamed in ${streamedAnswer.length} ` +
+    `progress frame(s) and settled once, in the same bubble (id=${toolFirstAnswer.id}); ` +
+    `turn_settled outcome=ok`,
 );
 transport.disconnect();
 process.exit(0);

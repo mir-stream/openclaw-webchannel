@@ -28,8 +28,16 @@
  * and can execute; the default `agents_list` is side-effect-free, takes no
  * arguments, and touches no filesystem or network state.
  *
- * With ECHO_MULTI_MSG_MARKER unset (the default) behaviour is byte-identical to
- * before this mode existed — every other harness shares this file.
+ * Set ECHO_TOOL_FIRST_MARKER for the same two-phase tool loop with ONE
+ * difference: phase 1 emits the `tool_calls` entry and NO assistant content at
+ * all, so the turn's FIRST assistant message is tool-only and the channel's
+ * first draft lane can never materialize. That is the ordinary shape of "call a
+ * tool, then answer" — the most common multi-message turn there is — and it is
+ * the one the #94 lane model stalls on, so it gets its own fixture.
+ *
+ * With ECHO_MULTI_MSG_MARKER and ECHO_TOOL_FIRST_MARKER unset (the default)
+ * behaviour is byte-identical to before these modes existed — every other
+ * harness shares this file.
  *
  * Usage: node e2e/local/echo-openai-server.mjs [port]   (default 18900)
  */
@@ -48,6 +56,11 @@ const MULTI_TOOL = process.env.ECHO_MULTI_MSG_TOOL || "agents_list";
 // related fixtures would test the residual, not the boundary.
 const MULTI_TEXT_A = process.env.ECHO_MULTI_MSG_TEXT_A || "ISSUE94_MESSAGE_A checking the roster now.";
 const MULTI_TEXT_B = process.env.ECHO_MULTI_MSG_TEXT_B || "ZZZ94_SECOND_ANSWER here is what came back.";
+
+// #94 tool-only-first mode: same loop, but phase 1 carries NO assistant text.
+const TOOL_FIRST_MARKER = process.env.ECHO_TOOL_FIRST_MARKER || "";
+const TOOL_FIRST_TEXT =
+  process.env.ECHO_TOOL_FIRST_TEXT || "TOOLFIRST94_ANSWER after the tool ran.";
 
 let multiToolCallSeq = 0;
 
@@ -116,12 +129,20 @@ const server = createServer(async (req, res) => {
     // actually carrying a tool catalogue: an agent turn advertises `tools`, while
     // core's auxiliary completions (title/summary generation) do not, and driving
     // a tool call from one of those would deadlock the turn rather than test it.
-    if (
-      MULTI_MARKER &&
-      lastUserText(body.messages).includes(MULTI_MARKER) &&
-      Array.isArray(body.tools) &&
-      body.tools.length > 0
-    ) {
+    const userText = lastUserText(body.messages);
+    const toolLoopMode =
+      Array.isArray(body.tools) && body.tools.length > 0
+        ? TOOL_FIRST_MARKER && userText.includes(TOOL_FIRST_MARKER)
+          ? "tool-first"
+          : MULTI_MARKER && userText.includes(MULTI_MARKER)
+            ? "multi"
+            : null
+        : null;
+    if (toolLoopMode) {
+      // Phase 1 assistant content: message A's text, or NOTHING at all in
+      // tool-first mode (the tool-only first assistant message).
+      const phase1Text = toolLoopMode === "tool-first" ? "" : MULTI_TEXT_A;
+      const phase2Text = toolLoopMode === "tool-first" ? TOOL_FIRST_TEXT : MULTI_TEXT_B;
       const advertised = body.tools.some((t) => t?.function?.name === MULTI_TOOL);
       if (!advertised) {
         console.log(
@@ -131,19 +152,36 @@ const server = createServer(async (req, res) => {
       }
       // Phase is decided by the transcript, not by a counter: once core has run
       // the tool it feeds the result back as a `role:"tool"` message.
-      const toolResultSeen = Array.isArray(body.messages)
-        && body.messages.some((m) => m && m.role === "tool");
+      //
+      // Scope that to THIS turn — messages after the last `role:"user"` one.
+      // A second marker turn in the same session still carries the PREVIOUS
+      // turn's `role:"tool"` message, so scanning the whole array reports
+      // phase 2 on the very first request and the turn never makes a tool call
+      // at all. That silently downgrades a two-assistant-message fixture to an
+      // ordinary one-message turn, and the harness then passes while testing
+      // nothing.
+      const messages = Array.isArray(body.messages) ? body.messages : [];
+      const lastUserIndex = messages.map((m) => m?.role).lastIndexOf("user");
+      const toolResultSeen = messages
+        .slice(lastUserIndex + 1)
+        .some((m) => m && m.role === "tool");
 
       if (!toolResultSeen) {
         const callId = `call_issue94_${++multiToolCallSeq}`;
-        console.log(`[echo] multi-msg phase 1 → text A + tool_call ${MULTI_TOOL} (${callId})`);
+        console.log(
+          `[echo] ${toolLoopMode} phase 1 → ${phase1Text ? "text A + " : "NO text, "}` +
+            `tool_call ${MULTI_TOOL} (${callId})`,
+        );
         if (body.stream) {
           sseHead();
           res.write(sseChunk({ role: "assistant" }));
-          // Split A across two deltas so the partial lane really streams.
-          const cut = Math.ceil(MULTI_TEXT_A.length / 2);
-          res.write(sseChunk({ content: MULTI_TEXT_A.slice(0, cut) }));
-          res.write(sseChunk({ content: MULTI_TEXT_A.slice(cut) }));
+          // Split A across two deltas so the partial lane really streams. In
+          // tool-first mode there is no content delta at all.
+          if (phase1Text) {
+            const cut = Math.ceil(phase1Text.length / 2);
+            res.write(sseChunk({ content: phase1Text.slice(0, cut) }));
+            res.write(sseChunk({ content: phase1Text.slice(cut) }));
+          }
           res.write(sseChunk({
             tool_calls: [{ index: 0, id: callId, type: "function", function: { name: MULTI_TOOL, arguments: "" } }],
           }));
@@ -160,7 +198,7 @@ const server = createServer(async (req, res) => {
             index: 0,
             message: {
               role: "assistant",
-              content: MULTI_TEXT_A,
+              content: phase1Text,
               tool_calls: [{ id: callId, type: "function", function: { name: MULTI_TOOL, arguments: "{}" } }],
             },
             finish_reason: "tool_calls",
@@ -170,13 +208,13 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      console.log(`[echo] multi-msg phase 2 → text B (finish stop)`);
+      console.log(`[echo] ${toolLoopMode} phase 2 → text B (finish stop)`);
       if (body.stream) {
         sseHead();
         res.write(sseChunk({ role: "assistant" }));
-        const cut = Math.ceil(MULTI_TEXT_B.length / 2);
-        res.write(sseChunk({ content: MULTI_TEXT_B.slice(0, cut) }));
-        res.write(sseChunk({ content: MULTI_TEXT_B.slice(cut) }));
+        const cut = Math.ceil(phase2Text.length / 2);
+        res.write(sseChunk({ content: phase2Text.slice(0, cut) }));
+        res.write(sseChunk({ content: phase2Text.slice(cut) }));
         res.write(sseChunk({}, "stop"));
         res.write("data: [DONE]\n\n");
         res.end();
@@ -185,13 +223,13 @@ const server = createServer(async (req, res) => {
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({
         id, object: "chat.completion", created, model,
-        choices: [{ index: 0, message: { role: "assistant", content: MULTI_TEXT_B }, finish_reason: "stop" }],
+        choices: [{ index: 0, message: { role: "assistant", content: phase2Text }, finish_reason: "stop" }],
         usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
       }));
       return;
     }
 
-    const reply = `${PREFIX}${lastUserText(body.messages)}`;
+    const reply = `${PREFIX}${userText}`;
 
     if (body.stream) {
       sseHead();

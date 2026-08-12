@@ -55,6 +55,11 @@ ECHO_PORT=18992
 ISSUER_PORT=3991
 export ECHO_MULTI_MSG_MARKER="${ECHO_MULTI_MSG_MARKER:-ISSUE94_TWO_MESSAGES}"
 export ECHO_MULTI_MSG_TOOL="${ECHO_MULTI_MSG_TOOL:-agents_list}"
+# Turn 2's fixture: the same tool loop with a TEXT-LESS first assistant message.
+# Both the echo server and the driver read this name, so it must be exported
+# here — if it is unset the server never enters tool-first mode and turn 2
+# degenerates into a plain echo, which the driver reports as a missing answer.
+export ECHO_TOOL_FIRST_MARKER="${ECHO_TOOL_FIRST_MARKER:-ISSUE94_TOOL_FIRST}"
 ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
 
 TENANT=default-tenant
@@ -399,11 +404,29 @@ WEBCHANNEL_TENANT="$TENANT" WEBCHANNEL_ACCOUNT_ID="$ACCOUNT_ID" WEBCHANNEL_PEER_
 RC=$?
 set -e
 
-# The echo log is the record of what the PROVIDER did (both phases fired, and
+# The echo log is the record of what the PROVIDER did (which phases fired, and
 # with which tool). Print it next to the driver's frame log so a CI failure can
 # be diagnosed without re-running.
 echo "[run-multi-message] echo provider log:"
-grep -E '^\[echo\] (multi-msg|WARN)' "$OCH/echo.log" || echo "  (no multi-msg lines — the marker never reached the provider)"
+grep -E '^\[echo\] (multi|tool-first|WARN)' "$OCH/echo.log" || echo "  (none)"
+
+# …and ASSERT on it. The driver can only see frames; it cannot tell "the plugin
+# handled two assistant messages correctly" from "the provider never produced a
+# second one." Both fixtures are two-phase, so a missing `phase 1` line means
+# that turn made no tool call and silently degenerated into an ordinary
+# one-message turn — the harness would then pass while testing nothing.
+#
+# This is not hypothetical: phase detection originally scanned the whole
+# transcript, so turn 2 saw turn 1's `role:"tool"` message and skipped straight
+# to phase 2. The driver stayed green.
+for phase in 'multi phase 1' 'multi phase 2' 'tool-first phase 1' 'tool-first phase 2'; do
+  if ! grep -qF "[echo] $phase" "$OCH/echo.log"; then
+    echo "[run-multi-message] FAIL: the provider never logged '$phase' — that fixture did not run."
+    echo "[run-multi-message] the turn produced fewer assistant messages than the harness asserts on;"
+    echo "[run-multi-message] a green driver here would be testing nothing."
+    RC=7
+  fi
+done
 
 echo "[run-multi-message] driver exit code = $RC"
 exit "$RC"
