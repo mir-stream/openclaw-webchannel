@@ -80,6 +80,14 @@
 
 live 경로를 정답으로 쓸 수 없다는 것이 출발점이었다. #111이 문서화한 대로 live는 bubble을 **과다 생성**할 수 있다(측정: assistant 메시지 2개가 bubble 4개로 정착). 그래서 저장된 transcript를 기준으로 삼았다. 그러나 측정해 보니 **transcript도 row를 과다 생성한다** — 방향만 다를 뿐이다.
 
+> **증거의 성격 — 아직 합성이다.** 이 절의 근거는
+> `packages/plugin/src/history-utterance-correspondence.test.ts`의 **합성 픽스처**다.
+> 계약 타입(`AssistantMessage`/`ToolResultMessage`/`ToolCall`, `openclaw/plugin-sdk/llm`)
+> 으로 조립했고 mutation으로 고정했지만, **실제 에이전트 루프가 이 shape을 만들어내는
+> 것을 아직 관측하지 못했다.** 라이브 확인은 [#109](https://github.com/mir-stream/openclaw-webchannel/pull/109)의
+> tool-calling fixture가 머지된 뒤에 한다. 둘이 어긋나면 화해시키지 않고 **어긋났다는
+> 사실을 보고**한다 — 합성 쪽을 실측에 맞춰 고치는 순간 이 절은 근거를 잃는다.
+
 `packages/plugin/src/history-utterance-correspondence.test.ts`가 고정한 실측:
 
 ```
