@@ -70,8 +70,17 @@ const TOOL_FIRST_TEXT =
 // correct behaviour and the stall are indistinguishable on the wire. Only the
 // tool-first fixture pays this cost; every other harness sharing this file is
 // unaffected.
+//
+// DERIVED, not picked. The channel holds a text-less predecessor lane for one
+// draft-throttle window before releasing the answer lane, and that window opens
+// when the PLUGIN sees the first partial — one echo→gateway→core→plugin hop
+// after this server writes it. So the gap must cover `hop + window`, and a
+// value close to the window turns every slow CI box into a false failure that
+// reads exactly like the regression the fixture exists to catch. The multiplier
+// leaves more than a full window of slack for the hop.
+const DRAFT_THROTTLE_MS = parseInt(process.env.WEBCHANNEL_DRAFT_THROTTLE_MS || "600", 10);
 const TOOL_FIRST_STREAM_GAP_MS = parseInt(
-  process.env.ECHO_TOOL_FIRST_STREAM_GAP_MS || "900",
+  process.env.ECHO_TOOL_FIRST_STREAM_GAP_MS || String(Math.round(DRAFT_THROTTLE_MS * 2.5)),
   10,
 );
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

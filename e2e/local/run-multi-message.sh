@@ -424,7 +424,9 @@ for phase in 'multi phase 1' 'multi phase 2' 'tool-first phase 1' 'tool-first ph
     echo "[run-multi-message] FAIL: the provider never logged '$phase' — that fixture did not run."
     echo "[run-multi-message] the turn produced fewer assistant messages than the harness asserts on;"
     echo "[run-multi-message] a green driver here would be testing nothing."
-    RC=7
+    # Never clobber a more specific driver failure: a run that fails an
+    # assertion AND misses a phase line must still report the assertion.
+    [ "$RC" -eq 0 ] && RC=7
   fi
 done
 
