@@ -473,14 +473,14 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
    * round removes: two records at one index meant NEITHER ever retired, which
    * with the turn-wide release gate stalled the whole turn.
    *
-   * Both halves are still asserted. The CLASSIFIED path (a `skip` carrying the
-   * payload) must still refuse the union — it cannot tell which record the skip
-   * belongs to. What changes is the SETTLEMENT: it is now paired with the real
-   * block delivery it belongs to, so it retires that block's reservation and the
-   * barrier is released as soon as its own block has settled, rather than
-   * waiting for drain because an unrelated notice token shared the index.
+   * Cardinality is gone from BOTH paths now. The `skip` carries its payload, so
+   * it retires the NOTICE token it names; the settlement is paired with the real
+   * block delivery, so it retires that block's reservation. Each record is
+   * released by its own event and the barrier lifts as soon as its own block has
+   * settled, instead of both sitting pending until drain because they happened
+   * to share an index.
    */
-  it("M6h/F3: a shared index is ambiguous to a skip, but a settlement still releases its own block", async () => {
+  it("M6h/F3: a shared index strands nothing — each record retires on its own event", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "A" });
@@ -499,9 +499,9 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       deliveryKind: "block",
       assistantMessageIndex: 0,
     });
-    // The skip could not disambiguate the union, so it retired nothing; the real
-    // block's own settlement then released ITS reservation, and B follows in
-    // order — no longer stranded until drain.
+    // The skip retired the notice token it named; the real block's own
+    // settlement then released ITS reservation, and B follows in order — no
+    // longer stranded until drain.
     expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "F-A", "B partial"]);
 
     await h.draft.drain();
@@ -954,6 +954,52 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       vi.useRealTimers();
     }
   });
+
+  /**
+   * #94 — the cancel/skip sibling of the round-8 settlement stall.
+   *
+   * CROSSES TWO GUARDS: the classified `skip`/`cancel` retirement and the
+   * turn-wide pending-reservation gate. A real block cancelled by `beforeDeliver`
+   * at an index it shares with a notice used to hit the cardinality bail — two
+   * records, retire neither — so its reservation stayed pending, the gate stayed
+   * closed, and no later lane streamed for the rest of the turn. Bubbles still
+   * settled at drain, so this cost liveness rather than text.
+   */
+  it.each([["cancel", "cancel" as const], ["skip", "skip" as const]])(
+    "M6y: a %s at an index shared with a notice leaves nothing pending",
+    async (_name, lifecycle) => {
+      vi.useFakeTimers();
+      try {
+        const h = makeDraftHarness({ throttleMs: 600 });
+        h.draft.handleAssistantMessageBoundary();
+        h.draft.pushEvent(toolStart());
+        h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 });
+        h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1, isStatusNotice: true });
+        // The real block never reaches delivery — cancelled/skipped upstream.
+        h.draft.noteDeliveryLifecycle(lifecycle, {
+          deliveryKind: "block",
+          assistantMessageIndex: 1,
+        });
+        // …and the notice does the same, so nothing is left outstanding.
+        h.draft.noteDeliveryLifecycle(lifecycle, {
+          deliveryKind: "block",
+          assistantMessageIndex: 1,
+          isStatusNotice: true,
+        });
+
+        h.draft.handleAssistantMessageBoundary();
+        h.draft.pushAnswerText({ text: "B streams" });
+        await h.draft.flush();
+        await vi.advanceTimersByTimeAsync(2_000);
+
+        expect(
+          h.frames.filter((frame) => frame.type === "progress").map((frame) => frame.text),
+        ).toContain("B streams");
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("M6n: a reservation arriving PAST the window inverts order — accepted, not a bug", async () => {
     // The cost of the time-boxed release, recorded so it cannot be mistaken for

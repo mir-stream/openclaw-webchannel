@@ -1092,6 +1092,21 @@ export function createProgressDraftController(params: {
     lane.tentativeBarrierReservationIds = lane.tentativeBarrierReservationIds.filter(
       (token) => token !== reservation.token,
     );
+    // Deliberately has NO `lane.closed` term, unlike the otherwise identical flip
+    // in `retireTentativeState`. Adding one for symmetry looks right and is
+    // wrong: this flip is what lets an EARLY cleanup pre-resolve a lane that has
+    // demonstrably produced nothing — its last pending claim just retired and it
+    // holds no text — so the next lane streams immediately instead of waiting for
+    // the release window or drain. M6h's `cleanupBeforeBoundary` case pins
+    // exactly that, and gating this on `closed` turns it red: the lane is still
+    // the open one when its reservation retires.
+    //
+    // Marking a LIVE lane `"empty"` is safe for reasons local to the transition:
+    // the lane has no text by the condition below, `pushAnswerText` resets the
+    // resolution to `"open"` the moment it gets any, and a live lane is never
+    // anyone's predecessor. `retireTentativeState` needs the `closed` term
+    // because it runs at terminal drain, where the current lane is settled by
+    // `settleCurrent` rather than resolved.
     if (
       lane.tentativeBarrierReservationIds.length === 0 &&
       !lane.acceptsLateIndexlessReservations &&
@@ -1121,22 +1136,6 @@ export function createProgressDraftController(params: {
       )
       .map((record) => ({ kind: "notice" as const, record })),
   ];
-
-  const retireSoleLifecycleRecord = (
-    assistantMessageIndex: number | undefined,
-    expectedKind?: OutstandingLifecycleRecord["kind"],
-  ): void => {
-    if (assistantMessageIndex === undefined) return;
-    const candidates = outstandingRecordsAtIndex(assistantMessageIndex);
-    if (candidates.length !== 1) return;
-    const candidate = candidates[0]!;
-    if (expectedKind !== undefined && candidate.kind !== expectedKind) return;
-    if (candidate.kind === "block") {
-      retireReservation(candidate.record);
-    } else {
-      candidate.record.state = "retired";
-    }
-  };
 
   /**
    * Retire the EARLIEST pending record of `recordKind` at this index.
@@ -1510,7 +1509,14 @@ export function createProgressDraftController(params: {
               retireOneRecordAtIndex(input.assistantMessageIndex, disposition.kind);
             }
           } else {
-            retireSoleLifecycleRecord(
+            // `skip`/`cancel` carry the payload, so the kind is known exactly —
+            // no counting needed, and no cardinality condition either. Bailing
+            // when two records shared an index was the same defect the
+            // settlement path had: a real block cancelled at an index it shares
+            // with a notice, or one of a message's two blocks skipped by
+            // normalize, left a reservation pending for the whole turn and no
+            // later lane streamed anything.
+            retireOneRecordAtIndex(
               input.assistantMessageIndex,
               classifiedNotice ? "notice" : "block",
             );
