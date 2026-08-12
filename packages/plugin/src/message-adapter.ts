@@ -862,6 +862,84 @@ export function createProgressDraftController(params: {
     return sent;
   };
 
+  /**
+   * #94 — everything this controller puts on the wire for a turn has to leave in
+   * MESSAGE ORDER, and there are two emission paths that do not know about each
+   * other.
+   *
+   * Lane text can be held back: a lane may not stream ahead of an unresolved
+   * text-less predecessor, and that predecessor is only released after one
+   * throttle window. An independent delivery is authorized visible output, so it
+   * is deliberately neither throttled nor queued behind anything. Cross the two
+   * inside the release window and the held lane owns no bubble id yet, so the
+   * later payload takes the next slot — the widget appends on an unknown id, so
+   * the later assistant message renders ABOVE the earlier one PERMANENTLY. Drain
+   * does not repair it; drain is what finally emits the earlier text, into the
+   * wrong slot.
+   *
+   * So an independent delivery emits any held lane text FIRST, in generation
+   * order: earlier lanes are settled (a closed lane can gain no more text, so
+   * its terminal frame is owed anyway), and the CURRENT lane — which may still
+   * be mid-message — merely claims its slot with a progress frame. This picks no
+   * lane by body text, arrival order or candidate count, so §5.2 is untouched:
+   * it changes only WHEN text we already hold is emitted, never whose it is.
+   *
+   * IT DOES NOT ALWAYS FIRE, and that is the correction the fixtures forced. The
+   * dispatcher really is strictly serial —
+   * `sendChain = sendChain.then(… deliver …).catch(…).finally(… onDeliverySettled …)`
+   * (reply-dispatcher.types-CVYQHGPk.js:95-131), with the block pipeline
+   * enqueueing onto its own serial chain the same way
+   * (block-reply-pipeline-CsIUOKQ6.js:241) — so an earlier message's block is
+   * delivered AND settled before a later message's payload arrives, and that is
+   * why emitting held text ahead of the arriving payload is SAFE WHEN IT FIRES.
+   * It is not a reason to fire unconditionally, because "a block is still
+   * outstanding" is reachable at this API regardless, and then the arriving
+   * payload may BE that earlier message's block — which has to land ABOVE the
+   * held text, not below it (M6z4). Nothing here can tell whose payload just
+   * arrived; that identity is #111's. So with any reservation still pending the
+   * whole thing stands down and today's ordering is kept.
+   *
+   * Scoping the stand-down to the slot claim alone was tried in round 10 and
+   * measured: it fixes the M6z3 residual and inverts M6z4. Both fixtures ship,
+   * one as the fix and one as its limit.
+   */
+  const emitHeldLaneTextBeforeIndependentDelivery = (): void => {
+    // The stand-down (see the docblock for why it is not unconditional). Whole
+    // function, not just the slot claim: M6m/M6t pin the barrier it protects and
+    // M6z4 the inversion that scoping it would cause.
+    if (state.blockReservations.some((reservation) => reservation.state === "pending")) {
+      return;
+    }
+    const active = currentLane();
+    for (const lane of state.lanes) {
+      if (lane.generation >= active.generation) break;
+      if (lane.settled || !lane.answerText) continue;
+      if (laneTerminalSuppressed(lane)) continue;
+      // A closed earlier lane can never gain more text, so its terminal frame is
+      // owed anyway; sending it now is only a question of when.
+      discardPendingProgress(
+        (frame) => frame.kind === "lane" && frame.generation === lane.generation,
+      );
+      settleLane(lane, lane.answerText);
+    }
+    // The CURRENT lane can be holding text too — it is the common case for a
+    // notice arriving mid-message. It must not be settled (the message is still
+    // being written), but it does need to CLAIM ITS SLOT, so it gets its progress
+    // frame now: bypassing the throttle, which exists to rate-limit edits to a
+    // visible bubble, and the predecessor gate, which is the thing holding it.
+    // Only when it owns no bubble yet — once it has an id its slot is already
+    // above this payload and nothing needs to change.
+    if (active.id || active.settled || !active.answerText) return;
+    if (laneTerminalSuppressed(active)) return;
+    discardPendingProgress(
+      (frame) => frame.kind === "lane" && frame.generation === active.generation,
+    );
+    active.lastProgressAttemptRevision = active.answerRevision;
+    if (sendLaneFrame(active, "progress", active.answerText)) {
+      state.lastProgressSentAt = Date.now();
+    }
+  };
+
   const attemptProgress = (frame: PendingProgressFrame): boolean => {
     if (state.stopped) return false;
     if (frame.kind === "preview") {
@@ -1229,6 +1307,11 @@ export function createProgressDraftController(params: {
     // payload gets the first P claim attempt before any newly released lane.
     // On failure its rollback lets the first released lane claim P instead.
     retireTentativeState();
+    // Earlier messages' held text goes out FIRST regardless — the P-claim
+    // question is "who owns the scaffold id", the ordering question is "who is
+    // above whom", and they are separable: a lane flushed here has text of its
+    // own to show and would otherwise land below this payload forever.
+    emitHeldLaneTextBeforeIndependentDelivery();
     const sent = sendIndependent(text);
     releaseReadyLanes({ emitCurrentProgress: false });
     return sent;
@@ -1453,6 +1536,7 @@ export function createProgressDraftController(params: {
             kind: isNotice(input) ? "notice" : "block",
           });
           if (!input.text) return false;
+          emitHeldLaneTextBeforeIndependentDelivery();
           return sendIndependent(input.text);
         },
         false,

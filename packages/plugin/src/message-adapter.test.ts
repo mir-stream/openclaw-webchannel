@@ -113,6 +113,16 @@ const toolStart = (itemId = "tool-1") => ({
   phase: "start" as const,
 });
 
+function bubbleOrder(frames: DraftAttempt[]): string[] {
+  const order: string[] = [];
+  const last = new Map<string, string>();
+  for (const frame of frames) {
+    if (!last.has(frame.id)) order.push(frame.id);
+    last.set(frame.id, frame.text);
+  }
+  return order.map((id) => last.get(id)!);
+}
+
 function successfulIds(frames: DraftAttempt[]): string[] {
   return [...new Set(frames.map((frame) => frame.id))];
 }
@@ -1001,6 +1011,118 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     },
   );
 
+  /**
+   * #94 — held lane text must not be overtaken by a later message's payload.
+   *
+   * CROSSES TWO GUARDS: the predecessor barrier (a lane may not stream ahead of
+   * an unresolved text-less predecessor, released only after one throttle
+   * window) and independent delivery (authorized visible output, deliberately
+   * neither throttled nor queued). Inside the window the held lane owns no bubble
+   * id, so a later payload takes the next slot — and because the widget appends
+   * on an unknown id, the later assistant message sits ABOVE the earlier one
+   * permanently. Drain does not repair it; drain is what emits the earlier text,
+   * into the wrong slot.
+   *
+   * Needs no `assistantMessageIndex` anywhere: a plain tool-only first message
+   * is enough to hold M1 back.
+   */
+  it("M6z: a later message's block never overtakes earlier held text", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary(); // M0: tool-only
+      h.draft.pushEvent(toolStart());
+      h.draft.handleAssistantMessageBoundary(); // M1
+      h.draft.pushAnswerText({ text: "M1-STREAMED-TEXT" });
+      h.draft.handleAssistantMessageBoundary(); // M2
+      await h.draft.deliverAuthorizedBlock({ text: "M2-BLOCK-BODY" });
+      await h.draft.drain();
+
+      expect(bubbleOrder(h.frames)).toEqual(["M1-STREAMED-TEXT", "M2-BLOCK-BODY"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("M6z2: a terminal notice does not overtake earlier held text either", async () => {
+    // Same crossing through `deliverIndependentFinal`. Here the held text is in
+    // the CURRENT lane, which must claim its slot with a progress frame rather
+    // than be settled — the message is still being written.
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary(); // M0: tool-only
+      h.draft.pushEvent(toolStart());
+      h.draft.handleAssistantMessageBoundary(); // M1
+      h.draft.pushAnswerText({ text: "M1-STREAMED-TEXT" });
+      await h.draft.deliverIndependentFinal({
+        text: "Context is getting long, compacting…",
+        isStatusNotice: true,
+      });
+      await h.draft.drain();
+
+      expect(bubbleOrder(h.frames)).toEqual([
+        "M1-STREAMED-TEXT",
+        "Context is getting long, compacting…",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("M6z3: with a block still outstanding, the order is left alone", async () => {
+    // The in-flight case, and the limit of this fix. A pending reservation means
+    // the arriving payload may BE an earlier message's block, which has to land
+    // ABOVE the held text — and nothing at this seam can tell whose payload it
+    // is (that identity is #111's). So the flush stands down and today's
+    // behaviour is kept, rather than risking the inverse inversion.
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushEvent(toolStart());
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "M1-STREAMED-TEXT" });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 3 }); // outstanding
+      await h.draft.deliverAuthorizedBlock({ text: "M2-BLOCK-BODY" });
+      await h.draft.drain();
+
+      expect(bubbleOrder(h.frames)).toEqual(["M2-BLOCK-BODY", "M1-STREAMED-TEXT"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("M6z4: an in-flight earlier block still lands above later held text", async () => {
+    // The counterexample that keeps M6z3's stand-down whole-function rather than
+    // scoped to the current-lane slot claim. Measured in round 10: letting the
+    // earlier-lanes loop run while a block is outstanding fixes M6z3's residual
+    // but inverts THIS — lane 0's own block arrives while lane 1 holds text, and
+    // the loop settles lane 1 first, putting assistant message 1 above message 0.
+    //
+    // The two shapes are distinguished only by WHOSE block just arrived, which is
+    // the delivery identity this seam does not have (#111). Scoping the loop by
+    // `barrierGeneration` instead would rest the ordering on the 1-based index
+    // matcher that is already documented as unsound, so it is not a way out.
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary(); // M0, text-less
+      h.draft.pushEvent(toolStart());
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 }); // M0's block, in flight
+      h.draft.handleAssistantMessageBoundary(); // M1
+      h.draft.pushAnswerText({ text: "M1-HELD-TEXT" });
+      h.draft.handleAssistantMessageBoundary(); // M2 is current
+      await h.draft.deliverAuthorizedBlock({ text: "M0-BLOCK-BODY" });
+      await h.draft.drain();
+
+      expect(bubbleOrder(h.frames)).toEqual(["M0-BLOCK-BODY", "M1-HELD-TEXT"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("M6n: a reservation arriving PAST the window inverts order — accepted, not a bug", async () => {
     // The cost of the time-boxed release, recorded so it cannot be mistaken for
     // a defect later. Once the window closes, the empty predecessor is treated
@@ -1667,9 +1789,30 @@ describe("ProgressDraftController — provisional preview transactions", () => {
     await ordered.draft.drain();
     const terminal = ordered.frames.find((frame) => frame.text === "terminal notice")!;
     const retained = ordered.frames.find((frame) => frame.text === "retained lane")!;
-    expect(terminal.id).toBe(orderedP);
-    expect(retained.id).not.toBe(orderedP);
-    expect(ordered.frames.indexOf(terminal)).toBeLessThan(ordered.frames.indexOf(retained));
+    // POLICY: message order wins over notice-claims-P. Signed off by the tech
+    // lead in round 10, for these reasons — recorded so it is not re-litigated:
+    //
+    //  - a terminal notice is about the TURN ending, so it belongs after the
+    //    answer, not above it. "One utterance, one bubble, in model order" has
+    //    no carve-out for notices; and
+    //  - the scaffold bubble was the progress indicator for the message still
+    //    being written, so that message's lane is the natural owner of the slot.
+    //    Handing P to the held lane satisfies the no-ghost rule (§6.2-3) exactly
+    //    as well as handing it to the notice, and gets the order right too — the
+    //    notice-claims-P version was paying a correctness cost for nothing.
+    //
+    // This case used to assert the terminal notice claims P and renders ABOVE
+    // the lane text held behind an unresolved predecessor — the same permanent
+    // inversion this round fixes everywhere else, since the widget appends on an
+    // unknown id and whoever emits first owns the higher slot forever.
+    //
+    // The P-claim RULE is unchanged ("the first successful claimant owns P", and
+    // the three cases above still pin it for a notice). What changed is who is
+    // first once a lane is holding text: message order now decides, so the
+    // retained answer claims the scaffold slot and the notice appends below it.
+    expect(retained.id).toBe(orderedP);
+    expect(terminal.id).not.toBe(orderedP);
+    expect(ordered.frames.indexOf(retained)).toBeLessThan(ordered.frames.indexOf(terminal));
   });
 
   it("M13e: a failed leading error rolls P back for the retained answer", async () => {
