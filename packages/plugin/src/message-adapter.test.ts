@@ -672,6 +672,134 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
+  /**
+   * The release must refuse to go PAST a predecessor that is unresolved for any
+   * reason other than being empty. The M6b/M6c fixtures pin that barrier before
+   * the window — they run on resolved-promise chains, so no macrotask boundary
+   * is crossed and the timer never fires — which leaves the timer path itself
+   * unpinned. These are their in-window twins.
+   */
+  it.each([
+    ["an indexed reservation", { assistantMessageIndex: 0 }],
+    ["an indexless reservation", {}],
+  ])("M6m: the release never crosses a predecessor holding %s", async (_name, queued) => {
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "B partial" });
+      // The late block for the text-less first message lands INSIDE the window:
+      // this is the shape the barrier exists for.
+      h.draft.noteBlockReplyQueued(queued);
+      await h.draft.flush();
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(h.frames).toEqual([]);
+
+      // …and the barrier still resolves the ordinary way.
+      await h.draft.deliverAuthorizedBlock({ text: "fallback-A" });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        ...queued,
+      });
+      await h.draft.drain();
+      // Message 0's block is on the wire FIRST — the ordering the barrier
+      // exists to protect — and B settles exactly once behind it. (The indexed
+      // variant also emits B's progress once the reservation retires, so assert
+      // the order and the settle count rather than an exact frame list.)
+      const texts = h.frames.map((frame) => frame.text);
+      expect(texts[0]).toBe("fallback-A");
+      expect(texts.slice(1).every((text) => text === "B partial")).toBe(true);
+      expect(
+        h.frames.filter((frame) => frame.type === "final" && frame.text === "B partial"),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("M6n: a reservation arriving PAST the window inverts order — accepted, not a bug", async () => {
+    // The cost of the time-boxed release, recorded so it cannot be mistaken for
+    // a defect later. Once the window closes, the empty predecessor is treated
+    // as a tool-only message; a block that arrives afterwards is delivered
+    // independently and therefore lands BELOW the answer that already streamed.
+    // The alternative is the stall the release exists to fix, and a settle is
+    // never delayed to avoid this.
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "B partial" });
+      await h.draft.flush();
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(h.frames.map((frame) => frame.text)).toEqual(["B partial"]);
+
+      // Too late to hold anything back.
+      h.draft.noteBlockReplyQueued({});
+      await h.draft.deliverAuthorizedBlock({ text: "late block for message 0" });
+      await h.draft.drain();
+
+      expect(h.frames.map((frame) => frame.text)).toEqual([
+        "B partial",
+        "late block for message 0",
+        "B partial",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("M6o: an answer that finishes inside the window streams nothing, and that is correct", async () => {
+    // The counterpart to M6j. A turn shorter than one streaming window settles
+    // straight from the scaffold: no answer `progress` frame is expected, and
+    // the settle is not delayed to manufacture one.
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushEvent(toolStart());
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "quick answer" });
+      await expect(h.draft.finalize("quick answer")).resolves.toBe(true);
+
+      expect(h.frames.filter((frame) => frame.type === "progress")).toHaveLength(1);
+      expect(h.frames.at(-1)).toMatchObject({ type: "final", text: "quick answer" });
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(h.frames.filter((frame) => frame.type === "final")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("M6p: stop() clears a pending release timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "B partial" });
+      await h.draft.flush();
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+      h.draft.stop();
+      await h.draft.flush();
+      expect(vi.getTimerCount()).toBe(0);
+
+      // A lifecycle event after stop still reaches `releaseReadyLanes`, which
+      // must not arm a new timer that nothing will ever clear.
+      h.draft.noteDeliveryLifecycle("settled", { deliveryKind: "block" });
+      await h.draft.flush();
+      expect(vi.getTimerCount()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(h.frames).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("M6k: a settle inside the window never waits for the release timer", async () => {
     vi.useFakeTimers();
     try {
@@ -754,6 +882,77 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     h.draft.pushAnswerText({ text: "The answer is 4." });
     await h.draft.flush();
     expect(h.frames.map((frame) => frame.text)).toEqual(["The answer is 4."]);
+  });
+
+  /**
+   * #94 — the raw baseline must never move BACKWARDS.
+   *
+   * The missed-boundary fail-safe compares each payload against the lane's last
+   * raw partial. Rewinding that baseline to a swallowed shorter payload disables
+   * the fail-safe for the rest of the turn: everything afterwards "extends" the
+   * rewound value, so a genuinely new assistant message is never recognised and
+   * the previous message's body is overwritten in place — the #94 data-loss
+   * class, reintroduced through the guard meant to prevent a split.
+   *
+   * The trigger is ordinary: message 2's FIRST streamed chunk being a prefix of
+   * message 1's text. With token-sized deltas a one-character collision ("D"
+   * here) is the common case, not a contrived one.
+   */
+  it("M7d: a swallowed shrink never disarms the missed-boundary fail-safe", async () => {
+    const warn = vi.fn();
+    const h = makeDraftHarness({ logger: { warn } });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Done." });
+    h.draft.pushAnswerText({ text: "Done. Roster listed." });
+    // --- core misses the structured boundary here ---
+    h.draft.pushAnswerText({ text: "D" }); // shrink: swallowed for display
+    h.draft.pushAnswerText({ text: "Different answer entirely." });
+    await h.draft.drain();
+
+    const finals = h.frames.filter((frame) => frame.type === "final");
+    expect(finals.map((frame) => frame.text)).toEqual([
+      "Done. Roster listed.",
+      "Different answer entirely.",
+    ]);
+    expect(new Set(finals.map((frame) => frame.id)).size).toBe(2);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("contract violation"));
+  });
+
+  it("M7e: a non-prefix first chunk still rotates, unchanged", async () => {
+    // The control for M7d: nothing about the fix may weaken the fail-safe on the
+    // shape it exists for.
+    const warn = vi.fn();
+    const h = makeDraftHarness({ logger: { warn } });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Done." });
+    h.draft.pushAnswerText({ text: "Done. Roster listed." });
+    h.draft.pushAnswerText({ text: "Oops" });
+    h.draft.pushAnswerText({ text: "Oops, different answer." });
+    await h.draft.drain();
+
+    const finals = h.frames.filter((frame) => frame.type === "final");
+    expect(finals.map((frame) => frame.text)).toEqual([
+      "Done. Roster listed.",
+      "Oops, different answer.",
+    ]);
+    expect(new Set(finals.map((frame) => frame.id)).size).toBe(2);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("contract violation"));
+  });
+
+  it("M7f: delta-only updates compose on the raw stream across a swallowed shrink", async () => {
+    // `{delta}` without `{text}` is its own path: the accumulator has to compose
+    // on the RAW baseline, or a swallowed shrink folds the stripped tag fragment
+    // back into the text ("Hi <thiz</thinking> there").
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ delta: "Hi" });
+    h.draft.pushAnswerText({ delta: " <thi" });
+    h.draft.pushAnswerText({ delta: "nking>" }); // cleaned shrinks to "Hi"
+    h.draft.pushAnswerText({ delta: "z</thinking> there" });
+    await h.draft.flush();
+
+    expect(h.draft.snapshotText()).toBe("Hi  there");
+    expect(successfulIds(h.frames)).toHaveLength(1);
   });
 
   it("M8: a late structured boundary after defensive rotation does not rotate twice", async () => {

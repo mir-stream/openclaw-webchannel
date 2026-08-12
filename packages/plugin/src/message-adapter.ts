@@ -602,6 +602,28 @@ export function createProgressDraftController(params: {
     return false;
   };
 
+  /**
+   * Advance a lane's RAW partial baseline — forward only, never backwards.
+   *
+   * The baseline is what the missed-boundary fail-safe compares against, so a
+   * write that moves it BACKWARDS silently disables that fail-safe for the rest
+   * of the message: every later payload then "extends" the rewound baseline and
+   * can never be recognised as a new message. The way that happened was subtle
+   * — the shrink guard swallowed a payload for display and advanced the
+   * baseline with the shorter text anyway — and the consequence was the #94 data
+   * loss class, not a cosmetic one: with message 2's first chunk a prefix of
+   * message 1's text (a one-character collision like "D" is the common case for
+   * token-sized deltas), message 1 never reached the wire at all.
+   *
+   * Enforced here rather than at each call site so the hazard is structurally
+   * unrepresentable: a payload that does not extend the baseline leaves it
+   * alone, whatever the caller decided to do about displaying it.
+   */
+  const acceptRawBaseline = (lane: AssistantDraftLane, raw: string): void => {
+    if (lane.lastRawAnswerText && !raw.startsWith(lane.lastRawAnswerText)) return;
+    lane.lastRawAnswerText = raw;
+  };
+
   const laneHasFailedCurrentRevision = (lane: AssistantDraftLane): boolean =>
     lane.answerRevision > 0 && lane.lastFailedDelivery?.revision === lane.answerRevision;
 
@@ -627,6 +649,17 @@ export function createProgressDraftController(params: {
    * `undefined` means something else is in the way — a tentative block
    * reservation, a lane armed for a late indexless one, or a lane with real
    * text — and that barrier is never released on a timer.
+   *
+   * These terms are LOCAL DEFENCE-IN-DEPTH, not the barrier itself. Mutation
+   * testing showed they can each be removed with the whole suite still green,
+   * and the reason is that `laneOrderResolved` already refuses everything they
+   * refuse: it checks `tentativeBarrierReservationIds` before any resolution
+   * state, so flipping a reservation-held lane to `"empty"` changes nothing,
+   * and a closed lane WITH text is settled immediately by `releaseReadyLanes`
+   * rather than lingering unresolved. The in-window barrier behaviour is pinned
+   * end to end by the M6m fixtures; these conditions exist so that this
+   * function is still correct on its own terms if that upstream ordering ever
+   * changes. Do not read their redundancy as permission to delete them.
    */
   const releasableEmptyPredecessors = (
     lane: AssistantDraftLane,
@@ -676,6 +709,20 @@ export function createProgressDraftController(params: {
    * it the barrier holds as before; if nothing arrives, the lane is treated as
    * the tool-only case and the live lane is released.
    *
+   * OUTSIDE the window the barrier is gone, and that is an accepted cost, not
+   * an oversight: a block that arrives after the release is delivered
+   * independently and therefore lands BELOW the answer that already streamed —
+   * message 0's bubble under message 1's. The alternative is the stall this
+   * exists to fix, and a settle is never delayed to avoid it. Recorded as
+   * accepted behaviour by the M6n fixture so it cannot be mistaken for a bug.
+   *
+   * One further consequence, conservative rather than lossy: once a predecessor
+   * flips to `"empty"` it leaves `unresolvedCandidates`, so an indexless
+   * reservation arriving later arms `acceptsLateIndexlessReservations` on the
+   * LIVE answer lane instead of the empty predecessor it probably belonged to.
+   * That withholds the live lane rather than losing anything, and terminal drain
+   * clears it.
+   *
    * This delays the FIRST PROGRESS FRAME of a later lane and nothing else. Every
    * settle path (`finalize`, `deliverTerminalIndependent`, terminal drain) runs
    * `retireTentativeState`, which resolves these lanes synchronously — so a turn
@@ -699,8 +746,12 @@ export function createProgressDraftController(params: {
         "empty predecessor release",
         () => {
           if (state.stopped) return;
+          // No `settled`/`no-text` fast path here on purpose: it was redundant
+          // and therefore untestable. A settle has already run
+          // `retireTentativeState`, so every predecessor is resolved and
+          // `releasableEmptyPredecessors` returns nothing; with no active text
+          // `releaseReadyLanes` emits nothing either.
           const active = currentLane();
-          if (active.settled || !active.answerText) return;
           const releasable = releasableEmptyPredecessors(active);
           if (!releasable) return;
           for (const predecessor of releasable) predecessor.resolution = "empty";
@@ -857,9 +908,10 @@ export function createProgressDraftController(params: {
     // The live lane has text to show but is held behind a text-less predecessor.
     // Give the predecessor one streaming window to declare itself (see
     // `scheduleEmptyPredecessorRelease`); a settle never waits on this.
+    // `settleCurrent`/`emitCurrentProgress` are deliberately NOT re-checked:
+    // both paths leave the active lane settled or text-less by the time this
+    // runs, so the conditions below already cover them.
     if (
-      options?.settleCurrent !== true &&
-      options?.emitCurrentProgress !== false &&
       active.answerText &&
       !active.settled &&
       !predecessorsResolved(active) &&
@@ -1096,9 +1148,17 @@ export function createProgressDraftController(params: {
           const cleaned = stripInlineDirectiveTagsForDelivery(
             stripReasoningTagsFromText(raw, { mode: "strict", trim: "both" }),
           ).text;
+          // Deliberately does NOT touch the raw baseline. A reasoning payload is
+          // not this message's answer, so letting it set the baseline would force
+          // the real answer to "extend" reasoning text it has nothing to do with,
+          // and a provider that stops prefixing mid-message would then read as a
+          // new assistant message. Leaving the baseline alone is inert: an empty
+          // baseline cannot trigger the fail-safe (which also requires existing
+          // lane text), and a non-empty one still describes the last real answer
+          // payload.
           if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
           if (cleaned === lane.answerText) {
-            lane.lastRawAnswerText = raw;
+            acceptRawBaseline(lane, raw);
             return;
           }
           // SHRINK. Mid-stream an unclosed `<thinking>` strips away text the
@@ -1114,7 +1174,7 @@ export function createProgressDraftController(params: {
             lane.answerText.startsWith(cleaned) &&
             cleaned.length < lane.answerText.length
           ) {
-            lane.lastRawAnswerText = raw;
+            acceptRawBaseline(lane, raw);
             return;
           }
 
@@ -1144,7 +1204,7 @@ export function createProgressDraftController(params: {
           }
 
           lane.answerText = cleaned;
-          lane.lastRawAnswerText = raw;
+          acceptRawBaseline(lane, raw);
           lane.answerRevision += 1;
           if (lane.resolution === "empty" || lane.resolution === "unresolved") {
             lane.resolution = "open";
