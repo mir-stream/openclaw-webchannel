@@ -1123,6 +1123,103 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
+  /**
+   * #94 — the ordering flush must never cost a held message.
+   *
+   * CROSSES TWO GUARDS: the flush's slot claim and `laneTerminalSuppressed`. A
+   * held lane has text but no wire presence. When the flush claimed its slot and
+   * the transport blipped, `recordLaneFailure` stamped the lane, `resolution`
+   * stayed `"open"` (only a SUCCESSFUL send materializes), and the stamp then
+   * read as "this lane may never be delivered" — so terminal drain skipped it and
+   * the message was gone. A speculative attempt had reduced what the lane was
+   * guaranteed at drain.
+   *
+   * M14c is the case that MUST keep suppressing: that lane attempted the wire
+   * through the ordinary path and has no predecessors. The distinction is whether
+   * the lane asked for the attempt, which is what the speculative mode encodes.
+   */
+  it.each([
+    ["returns false", false as const],
+    ["throws", "throw" as const],
+  ])("M6z5: a slot claim that %s still leaves the held message intact", async (_n, outcome) => {
+    const h = makeDraftHarness({
+      throttleMs: 10_000,
+      decide: (attempt) =>
+        attempt.type === "progress" && attempt.text === "M1-STREAMED-TEXT" ? outcome : true,
+    });
+    h.draft.handleAssistantMessageBoundary(); // M0: tool-only, closes text-less
+    h.draft.pushEvent(toolStart());
+    h.draft.handleAssistantMessageBoundary(); // M1
+    h.draft.pushAnswerText({ text: "M1-STREAMED-TEXT" }); // held behind M0
+    await h.draft.deliverAuthorizedBlock({ text: "NOTICE", isStatusNotice: true });
+    await h.draft.drain();
+
+    expect(h.frames.map((frame) => frame.text)).toContain("M1-STREAMED-TEXT");
+  });
+
+  it("M6z6: the same through the terminal-independent path", async () => {
+    const h = makeDraftHarness({
+      throttleMs: 10_000,
+      decide: (attempt) =>
+        !(attempt.type === "progress" && attempt.text === "M1-STREAMED-TEXT"),
+    });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushEvent(toolStart());
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "M1-STREAMED-TEXT" });
+    await h.draft.deliverIndependentFinal({ text: "SORRY-ERROR" });
+    await h.draft.drain();
+
+    expect(h.frames.map((frame) => frame.text)).toContain("M1-STREAMED-TEXT");
+  });
+
+  it("M6z7: CONTROL — the same transport failure with no independent delivery", async () => {
+    // This is what makes the diagnosis unarguable: identical blip, no flush, and
+    // the message survives. It is the flush that turns a survivable failure into
+    // permanent loss, not the transport.
+    const h = makeDraftHarness({
+      throttleMs: 10_000,
+      decide: (attempt) =>
+        !(attempt.type === "progress" && attempt.text === "M1-STREAMED-TEXT"),
+    });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushEvent(toolStart());
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "M1-STREAMED-TEXT" });
+    await h.draft.drain();
+
+    expect(h.frames.map((frame) => frame.text)).toContain("M1-STREAMED-TEXT");
+  });
+
+  it("M6z8: a claimed earlier lane settles in place, at the id it claimed", async () => {
+    // The flush now claims a slot for CLOSED earlier lanes too, so they emit a
+    // progress frame before their terminal one. Harmless by construction — a
+    // closed lane can gain no more text, so the bubble is created with exactly
+    // the text drain will settle — and asserted here rather than assumed.
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary(); // M0 tool-only
+      h.draft.pushEvent(toolStart());
+      h.draft.handleAssistantMessageBoundary(); // M1
+      h.draft.pushAnswerText({ text: "M1-TEXT" });
+      h.draft.handleAssistantMessageBoundary(); // M2 current: M1 is now closed
+      await h.draft.deliverAuthorizedBlock({ text: "M2-BLOCK" });
+      await h.draft.drain();
+
+      const claim = h.frames.find(
+        (frame) => frame.type === "progress" && frame.text === "M1-TEXT",
+      )!;
+      const terminal = h.frames.find(
+        (frame) => frame.type === "final" && frame.text === "M1-TEXT",
+      )!;
+      expect(claim.id).toBe(terminal.id);
+      expect(bubbleOrder(h.frames)).toEqual(["M1-TEXT", "M2-BLOCK"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("M6n: a reservation arriving PAST the window inverts order — accepted, not a bug", async () => {
     // The cost of the time-boxed release, recorded so it cannot be mistaken for
     // a defect later. Once the window closes, the empty predecessor is treated
