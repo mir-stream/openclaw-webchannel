@@ -643,6 +643,34 @@ export function createProgressDraftController(params: {
   const laneHasFailedCurrentRevision = (lane: AssistantDraftLane): boolean =>
     lane.answerRevision > 0 && lane.lastFailedDelivery?.revision === lane.answerRevision;
 
+  /**
+   * May this lane be left without a terminal frame?
+   *
+   * ONLY if it never put anything on the wire. `laneHasFailedCurrentRevision`
+   * exists to stop us blind-retrying a revision whose send just failed, and that
+   * is the right rule for the PROGRESS path — but reading it as "this lane may
+   * never be delivered" truncates a message the user is already looking at: one
+   * transient `false`/`throw` on the latest progress send, and the lane's bubble
+   * stays frozen at whatever text last succeeded while `finalizeDraft` is never
+   * even attempted. The client finalizes the working draft in place on
+   * `turn_settled`, so that truncation is permanent and silent — the #94
+   * data-loss class itself.
+   *
+   * `develop` hardened against exactly this at its finalize path ("a pending
+   * progress `ws.send` can throw … We must NOT let that abort finalization — the
+   * final answer … still has to be delivered"), and a control run of that
+   * controller confirms it: after a failed progress send it still attempts the
+   * terminal frame, carrying the FULL text. The lane rewrite lost the guarantee
+   * per-lane; this restores it per-lane.
+   *
+   * `materialized` is the distinction, and it is already recorded for us:
+   * `sendLaneFrame` sets it on any successful send. A lane that never
+   * materialized has shown the user nothing, so suppressing its terminal frame
+   * invents no bubble — that is the defensible case M13g pins, and it stays.
+   */
+  const laneTerminalSuppressed = (lane: AssistantDraftLane): boolean =>
+    lane.resolution !== "materialized" && laneHasFailedCurrentRevision(lane);
+
   const laneOrderResolved = (lane: AssistantDraftLane): boolean => {
     if (!lane.closed) return false;
     if (lane.tentativeBarrierReservationIds.length > 0) return false;
@@ -941,11 +969,7 @@ export function createProgressDraftController(params: {
         discardPendingProgress(
           (frame) => frame.kind === "lane" && frame.generation === lane.generation,
         );
-        if (
-          lane.answerText &&
-          !lane.settled &&
-          !laneHasFailedCurrentRevision(lane)
-        ) {
+        if (lane.answerText && !lane.settled && !laneTerminalSuppressed(lane)) {
           settleLane(lane, lane.answerText);
         }
         continue;
@@ -955,10 +979,17 @@ export function createProgressDraftController(params: {
         discardPendingProgress(
           (frame) => frame.kind === "lane" && frame.generation === lane.generation,
         );
-        if (!laneHasFailedCurrentRevision(lane)) settleLane(lane, lane.answerText);
+        if (!laneTerminalSuppressed(lane)) settleLane(lane, lane.answerText);
       } else if (
         options?.emitCurrentProgress !== false &&
         lane.lastProgressAttemptRevision < lane.answerRevision &&
+        // Redundant in practice and kept deliberately: `attemptProgress` stamps
+        // `lastProgressAttemptRevision` BEFORE the send, so the term above
+        // already blocks a retry of the revision that just failed (removing this
+        // one leaves the whole suite green). It stays as the explicit statement
+        // of the rule, because the terminal path now deliberately does NOT honour
+        // the failed stamp and the difference between the two paths should be
+        // readable here rather than inferred.
         !laneHasFailedCurrentRevision(lane)
       ) {
         queueProgress({

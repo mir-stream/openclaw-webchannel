@@ -1266,6 +1266,94 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
+  /**
+   * #94 — a transient send failure must not TRUNCATE a visible message.
+   *
+   * CROSSES TWO GUARDS: `recordLaneFailure`'s revision stamp (right: never
+   * blind-retry the frame that just failed) and the terminal-frame gate (was
+   * reading that stamp as "this lane may never be delivered"). They agree for a
+   * lane that never materialized and diverge for one that already owns a bubble:
+   * the user is left staring at whatever text last succeeded, permanently,
+   * because the client finalizes the working draft in place on `turn_settled`.
+   *
+   * The transport recovers immediately here — lane B's frames all succeed — so
+   * nothing about the failure is sticky except the guard.
+   *
+   * Control against `origin/develop`'s controller, same shape: it attempts the
+   * terminal frame and carries the FULL text. This restores that per-lane.
+   */
+  it("M14a: a materialized lane still settles after a transient progress failure", async () => {
+    const h = makeDraftHarness({
+      decide: (attempt) => !(attempt.type === "progress" && attempt.text.startsWith("A par tial")),
+    });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "A par" });
+    const idA = h.frames[0]!.id;
+    h.draft.pushAnswerText({ text: "A par tial answer" });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B draft" });
+    await h.draft.finalize("B final");
+    await h.draft.drain();
+
+    // Lane A reaches a terminal frame, at its own id, carrying the text the
+    // failed revision was trying to show — not the stale prefix.
+    const terminalA = h.frames.find((frame) => frame.type === "final" && frame.id === idA);
+    expect(terminalA?.text).toBe("A par tial answer");
+    expect(h.frames.map((frame) => `${frame.type}:${frame.text}`)).toEqual([
+      "progress:A par",
+      "final:A par tial answer",
+      "progress:B draft",
+      "final:B final",
+    ]);
+  });
+
+  it("M14b: the drain-only shape settles too", async () => {
+    // Same defect reached without a second message or an ordinary final — the
+    // turn just ends. `develop` settles this shape as well (verified against its
+    // controller), so leaving it stuck was a regression, not inherited.
+    const h = makeDraftHarness({
+      decide: (attempt) => !attempt.text.includes("Hello world"),
+    });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Hel" });
+    const id = h.frames[0]!.id;
+    h.draft.pushAnswerText({ text: "Hello world" });
+    await h.draft.drain();
+
+    expect(h.attempts.some((attempt) => attempt.type === "final" && attempt.id === id)).toBe(true);
+  });
+
+  it("M14c: a lane that never materialized is still suppressed, and never retries", async () => {
+    // The other side of the same gate, and the reason it cannot simply be
+    // deleted: a lane whose FIRST frame failed has shown the user nothing, so
+    // settling it would invent a bubble. It must also not retry in a loop now
+    // that the terminal path is open — `releaseReadyLanes` runs repeatedly.
+    const h = makeDraftHarness({ decide: () => false });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "never seen" });
+    await h.draft.drain();
+    await h.draft.drain();
+
+    expect(h.frames).toEqual([]);
+    expect(h.attempts.filter((attempt) => attempt.type === "final")).toHaveLength(0);
+    expect(h.attempts).toHaveLength(1);
+  });
+
+  it("M14d: a lane whose TERMINAL frame fails attempts it exactly once", async () => {
+    // The fix opens a settle path that was previously closed, and
+    // `releaseReadyLanes` iterates — so the failed terminal must latch.
+    const h = makeDraftHarness({ decide: (attempt) => attempt.type !== "final" });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "visible" });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "second" });
+    await h.draft.drain();
+    await h.draft.drain();
+
+    expect(h.attempts.filter((attempt) => attempt.type === "final" && attempt.text === "visible"))
+      .toHaveLength(1);
+  });
+
   it("M8: a late structured boundary after defensive rotation does not rotate twice", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
