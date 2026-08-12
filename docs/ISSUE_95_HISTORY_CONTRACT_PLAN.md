@@ -21,7 +21,7 @@
 - `packages/plugin/src/history.ts` — `failed` 파생
 - `packages/plugin/src/channel-contract.ts` — wire 타입 + 계약 문서화
 - `packages/client/src/nats-client.ts`, `types.ts` — client 측 타입 재선언
-- `packages/client/src/nats-client-wrapper.ts` — `history` reducer의 fresh-insert / adopt 두 지점
+- `packages/client/src/nats-client-wrapper.ts` — `history` reducer의 fresh-insert / adopt / canonical-ID reconcile 경로
 
 `WEBCHANNEL_PROTOCOL_VERSION`은 **올리지 않는다**(§5.2). live 측 과다 생성 교정(#111), delivery mirror(#114), 슬래시 명령 durability는 범위 밖이다.
 
@@ -244,9 +244,9 @@ export type HistoryMessage = {
 
 §3의 실측(row가 utterance보다 많다), §3.1의 경계 shape 4종, `failed` 파생과 생략, user row 비오염, 에러 상세 비유출, 봉투에서 `id`만 읽는다는 사실, 그리고 §6.1의 귀결.
 
-### 7.2 `packages/client/src/nats-client-wrapper-hydration.test.ts` (14)
+### 7.2 `packages/client/src/nats-client-wrapper-hydration.test.ts` (15)
 
-cold reload = row당 bubble 하나(계약), 결정성, 멱등성, 동일 text 인접 row의 분리 유지, 페이지네이션 순서, tier-3 positional 양방향(정상 경로 + row가 bubble보다 많은 경우), working draft 비침해, `failed` 전파와 adopt/cold 등가.
+cold reload = row당 bubble 하나(계약), 결정성, 멱등성, 동일 text 인접 row의 분리 유지, 페이지네이션 순서, tier-3 positional 양방향(정상 경로 + row가 bubble보다 많은 경우), working draft 비침해, `failed` 전파와 adopt/cold 등가, canonical-ID 반복 snapshot의 단조로운 `failed` 승격.
 
 ### 7.3 추가 필드 불변식 — 범위를 정직하게 적는다
 

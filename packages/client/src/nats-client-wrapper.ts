@@ -1956,8 +1956,9 @@ export class WebChannelNATSClient {
         //     core transcript NEVER stores that platform id, so history ids
         //     can never match live ids for agent messages either.
         // Matching happens in three tiers, in snapshot order:
-        //   1. id — a message whose canonical id we already hold (a prior
-        //      snapshot placed or adopted it) is a no-op;
+        //   1. id — retain a message whose canonical id we already hold (a
+        //      prior snapshot placed or adopted it), while monotonically
+        //      reconciling authoritative failure metadata;
         //   2. exact text+role — adopt the server id onto the first
         //      text-matching local bubble (covers user echoes always; covers
         //      agent replies only when live text == stored text);
@@ -2015,6 +2016,7 @@ export class WebChannelNATSClient {
         });
 
         let adopted = false;
+        let failureMetadataChanged = false;
         /**
          * Fresh (unmatched) snapshot messages, grouped by the INSERTION CURSOR
          * value in effect when each was seen — the index into `next` BEFORE
@@ -2069,7 +2071,17 @@ export class WebChannelNATSClient {
             // later fresh messages insert after it. An id we can't locate
             // locally (should not happen — `seen` is seeded from `next`) leaves
             // the cursor untouched.
-            if (li !== undefined) cursor = li + 1;
+            if (li !== undefined) {
+              cursor = li + 1;
+              // A newer plugin can add authoritative failure metadata to a row
+              // first hydrated from an older plugin. Promote it monotonically:
+              // absence/false is ambiguous during a staggered rollout and must
+              // never clear an already-observed failure.
+              if (m.failed === true && next[li].failed !== true) {
+                next[li] = { ...next[li], failed: true };
+                failureMetadataChanged = true;
+              }
+            }
             continue;
           }
 
@@ -2125,7 +2137,7 @@ export class WebChannelNATSClient {
           anchor = null;
         }
 
-        if (inserts.size === 0 && !adopted) return;
+        if (inserts.size === 0 && !adopted && !failureMetadataChanged) return;
 
         // Rebuild `next` with each fresh group spliced in at its cursor. Slot i
         // holds the messages that must precede `next[i]`; slot `next.length`

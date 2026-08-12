@@ -315,6 +315,51 @@ describe("#95 WP B — additive wire fields (no protocol bump)", () => {
   });
 
   /**
+   * During a staggered rollout, the same canonical row can first arrive from an
+   * older plugin without `failed`, then from an upgraded plugin with
+   * `failed:true`. Tier 1 must reconcile that metadata without disturbing the
+   * already-hydrated timeline, and older/duplicate snapshots must not undo it or
+   * emit redundant state updates.
+   */
+  it("promotes `failed` monotonically on a repeated canonical-id snapshot", () => {
+    const w = makeWrapper();
+    const initialRows: Row[] = [
+      { id: "core-1", role: "user", text: "do the thing", ts: 1 },
+      { id: "core-2", role: "agent", text: "it broke", ts: 2 },
+    ];
+    deliver(w, history(...initialRows));
+
+    const initialIds = w.getState().messages.map((m) => m.id);
+    const initialTimeline = timeline(w);
+    let stateUpdates = 0;
+    const unsubscribe = w.subscribe(() => { stateUpdates++; });
+
+    deliver(
+      w,
+      history(
+        initialRows[0],
+        { ...initialRows[1], failed: true },
+      ),
+    );
+
+    const promotedMessages = w.getState().messages;
+    expect(promotedMessages).toHaveLength(initialRows.length);
+    expect(promotedMessages.map((m) => m.id)).toEqual(initialIds);
+    expect(timeline(w)).toEqual(initialTimeline);
+    expect(promotedMessages[1].failed).toBe(true);
+    expect(stateUpdates).toBe(1);
+
+    deliver(w, history(initialRows[0], { ...initialRows[1], failed: true }));
+    deliver(w, history(initialRows[0], { ...initialRows[1], failed: false }));
+    deliver(w, history(...initialRows));
+
+    expect(w.getState().messages).toBe(promotedMessages);
+    expect(w.getState().messages[1].failed).toBe(true);
+    expect(stateUpdates).toBe(1);
+    unsubscribe();
+  });
+
+  /**
    * A bubble ADOPTED mid-session must end up identical to a freshly hydrated
    * one — otherwise the same transcript renders differently depending on whether
    * the tab was open, which is the whole class of defect #95 exists to close.
