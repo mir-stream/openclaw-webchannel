@@ -2134,7 +2134,7 @@ describe("webchannel inbound round-trip", () => {
     },
   );
 
-  it("recovers the working bubble when the turn throws mid-draft in progress mode", async () => {
+  it("replaces a thrown tool-only turn's provisional preview with the independent apology", async () => {
     vi.useFakeTimers();
     try {
       const transport = new FakePeerChannel();
@@ -2167,15 +2167,14 @@ describe("webchannel inbound round-trip", () => {
       expect(progressSpy).toHaveBeenCalled();
       const progId = progressSpy.mock.calls[0][1];
 
-      // ...and on the error path the SAME draft id was finalized with a visible
-      // (non-empty) settling message, so the widget transitions the bubble out
-      // of its "working" state instead of hanging forever.
+      // The authoritative apology gets the first claim attempt before cleanup,
+      // so it REPLACES the ownerless preview instead of leaving a settled
+      // "Working…" scaffold beside a second bubble.
       expect(finalizeSpy).toHaveBeenCalledTimes(1);
       const [finSession, finId, finText] = finalizeSpy.mock.calls[0];
       expect(finSession).toBe("web-anon");
       expect(finId).toBe(progId);
-      expect(typeof finText).toBe("string");
-      expect((finText as string).length).toBeGreaterThan(0);
+      expect(finText).toBe("Sorry — something went wrong while answering. Please try again.");
       expect(settledSpy).toHaveBeenCalledWith("web-anon", expect.any(String), "error");
 
       // The draft loop was stopped: no late background throttled flush fires
@@ -2188,7 +2187,7 @@ describe("webchannel inbound round-trip", () => {
     }
   });
 
-  it("recovers the working bubble when the turn throws mid-draft in partial mode (answer-text-only, no tool events)", async () => {
+  it("settles streamed text unchanged and surfaces a separate apology when the turn throws", async () => {
     vi.useFakeTimers();
     try {
       const transport = new FakePeerChannel();
@@ -2219,12 +2218,19 @@ describe("webchannel inbound round-trip", () => {
       expect(progressSpy).toHaveBeenCalled();
       const progId = progressSpy.mock.calls[0][1];
 
-      // ...and terminal drain settles the real streamed text on that same id.
-      expect(finalizeSpy).toHaveBeenCalledTimes(1);
-      const [finSession, finId, finText] = finalizeSpy.mock.calls[0];
-      expect(finSession).toBe("web-anon");
-      expect(finId).toBe(progId);
-      expect(finText).toBe("Partial ans");
+      // The apology is an independent authoritative delivery, then terminal
+      // drain settles the real lane text on its original id. In particular,
+      // the apology must never overwrite the already-materialized lane.
+      expect(finalizeSpy.mock.calls.map((call) => call[2])).toEqual([
+        "Sorry — something went wrong while answering. Please try again.",
+        "Partial ans",
+      ]);
+      const apologyCall = finalizeSpy.mock.calls[0]!;
+      const laneCall = finalizeSpy.mock.calls[1]!;
+      expect(apologyCall[0]).toBe("web-anon");
+      expect(apologyCall[1]).not.toBe(progId);
+      expect(laneCall[0]).toBe("web-anon");
+      expect(laneCall[1]).toBe(progId);
 
       // Loop stopped: no late background flush after error handling.
       const progressCountAfterError = progressSpy.mock.calls.length;
@@ -2233,6 +2239,26 @@ describe("webchannel inbound round-trip", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("does not append a catch-path apology after a final was already delivered", async () => {
+    const transport = new FakePeerChannel();
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      steps: [{ deliverFinal: { text: "Completed answer" } }],
+      throwAfterProgress: true,
+    });
+
+    await expect(
+      handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        text: "hello",
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(finalizeSpy.mock.calls.map((call) => call[2])).toEqual(["Completed answer"]);
   });
 
   it("sends exactly one typing frame after route resolution, before agent dispatch (AC2)", async () => {

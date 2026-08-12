@@ -739,11 +739,18 @@ export async function handleInboundMessage(
   } catch (err) {
     turnOutcome = "error";
     api.logger.error?.(`webchannel: inbound dispatch failed: ${String(err)}`);
-    // Error cleanup uses the same terminal drain as silent completion. It never
-    // replaces real assistant text with a synthetic marker and never retries a
-    // failed content revision inline.
+    // Surface a thrown turn independently before terminal cleanup. That gives
+    // the apology the first claim attempt on an ownerless tool preview without
+    // replacing any assistant lane that already streamed real text. A turn
+    // whose final was delivered already needs no appended apology; the drain
+    // below remains its idempotent terminal cleanup.
     if (draft) {
       try {
+        if (!controlLane && !finalReplyDelivered) {
+          await draft.deliverIndependentFinal({
+            text: "Sorry — something went wrong while answering. Please try again.",
+          });
+        }
         await draft.drain();
       } catch (drainErr) {
         api.logger.error?.(
