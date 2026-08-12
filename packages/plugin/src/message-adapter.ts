@@ -239,6 +239,8 @@ type ProgressDraftState = {
   lines: string[];
   pendingProgress?: PendingProgressFrame;
   progressTimer?: ReturnType<typeof setTimeout>;
+  /** One-shot release of a text-less predecessor that is holding a live lane. */
+  emptyPredecessorTimer?: ReturnType<typeof setTimeout>;
   lastProgressSentAt: number;
   firstBoundarySeen: boolean;
   absorbedMissedBoundaries: number;
@@ -618,6 +620,114 @@ export function createProgressDraftController(params: {
     return true;
   };
 
+  /**
+   * The predecessors holding `lane` back, IF every one of them is a closed,
+   * text-less lane with nothing outstanding that could still claim it.
+   *
+   * `undefined` means something else is in the way — a tentative block
+   * reservation, a lane armed for a late indexless one, or a lane with real
+   * text — and that barrier is never released on a timer.
+   */
+  const releasableEmptyPredecessors = (
+    lane: AssistantDraftLane,
+  ): AssistantDraftLane[] | undefined => {
+    const releasable: AssistantDraftLane[] = [];
+    for (const predecessor of state.lanes) {
+      if (predecessor.generation >= lane.generation) break;
+      if (laneOrderResolved(predecessor)) continue;
+      if (
+        predecessor.closed &&
+        predecessor.resolution === "unresolved" &&
+        !predecessor.answerText &&
+        predecessor.tentativeBarrierReservationIds.length === 0 &&
+        !predecessor.acceptsLateIndexlessReservations
+      ) {
+        releasable.push(predecessor);
+        continue;
+      }
+      return undefined;
+    }
+    return releasable.length > 0 ? releasable : undefined;
+  };
+
+  const clearEmptyPredecessorTimer = (): void => {
+    if (state.emptyPredecessorTimer === undefined) return;
+    clearTimeout(state.emptyPredecessorTimer);
+    state.emptyPredecessorTimer = undefined;
+  };
+
+  /**
+   * #94 — time-boxed release of a text-less predecessor lane.
+   *
+   * A closed lane with no text is in one of two states that are INDISTINGUISHABLE
+   * at the moment the next lane starts streaming: a tool-only assistant message,
+   * which will never produce anything else, or a message whose text is still
+   * coming as an out-of-band block (plan §12.2(5)). The information that
+   * separates them — a queued-block callback — arrives later or not at all, so
+   * no rule evaluated at that instant can be right.
+   *
+   * Resolving it immediately would drop the ordering barrier a late block
+   * depends on. Never resolving it is what shipped, and it is worse: a tool-only
+   * first message is the ordinary "call a tool, then answer" turn, and it left
+   * every later lane stalled behind the barrier until terminal drain, so the
+   * answer streamed NOTHING and appeared only as a finished bubble.
+   *
+   * So we wait exactly one streaming window. If the queued callback lands inside
+   * it the barrier holds as before; if nothing arrives, the lane is treated as
+   * the tool-only case and the live lane is released.
+   *
+   * This delays the FIRST PROGRESS FRAME of a later lane and nothing else. Every
+   * settle path (`finalize`, `deliverTerminalIndependent`, terminal drain) runs
+   * `retireTentativeState`, which resolves these lanes synchronously — so a turn
+   * that finishes inside the window settles exactly as it does today. The worst
+   * case is unchanged behaviour; the best case is a streaming answer.
+   *
+   * NOT USED, and why: "the lane saw tool activity, so it is a tool-only
+   * message" is unsound. Tool activity does not imply the message had no text —
+   * a message can call a tool AND answer (the first message of this repo's own
+   * multi-message fixture does exactly that), and whenever such a message's text
+   * arrives as a block rather than as partials, its lane closes text-less with
+   * tool activity while a block is genuinely still coming. That is precisely the
+   * shape the barrier exists for, and it is reachable from any non-streaming
+   * provider, in any streaming mode.
+   */
+  const scheduleEmptyPredecessorRelease = (): void => {
+    if (state.emptyPredecessorTimer !== undefined || state.stopped) return;
+    const timer = setTimeout(() => {
+      state.emptyPredecessorTimer = undefined;
+      void enqueue(
+        "empty predecessor release",
+        () => {
+          if (state.stopped) return;
+          const active = currentLane();
+          if (active.settled || !active.answerText) return;
+          const releasable = releasableEmptyPredecessors(active);
+          if (!releasable) return;
+          for (const predecessor of releasable) predecessor.resolution = "empty";
+          releaseReadyLanes();
+          // Send the released frame NOW rather than letting the progress
+          // throttle hold it another window. The throttle rate-limits repeated
+          // edits to a bubble the user can already see; this lane has shown
+          // nothing yet and has just waited a full window for the barrier. On a
+          // turn whose answer is shorter than one throttle interval — measured
+          // on the tool-only e2e fixture — the queued frame would otherwise be
+          // discarded by the settle and the answer would never stream at all,
+          // which is the whole defect this release exists to fix.
+          if (
+            state.pendingProgress?.kind === "lane" &&
+            state.pendingProgress.generation === active.generation
+          ) {
+            flushPendingProgress();
+          }
+        },
+        undefined,
+      );
+    }, throttleMs);
+    // Never hold the host process open for a draft frame.
+    (timer as { unref?: () => void }).unref?.();
+    state.emptyPredecessorTimer = timer;
+  };
+
   const settleLane = (lane: AssistantDraftLane, text: string): boolean => {
     if (lane.settleOutcome !== undefined) return lane.settleOutcome;
     if (lane.settleResult) return false;
@@ -743,6 +853,19 @@ export function createProgressDraftController(params: {
           text: lane.answerText,
         });
       }
+    }
+    // The live lane has text to show but is held behind a text-less predecessor.
+    // Give the predecessor one streaming window to declare itself (see
+    // `scheduleEmptyPredecessorRelease`); a settle never waits on this.
+    if (
+      options?.settleCurrent !== true &&
+      options?.emitCurrentProgress !== false &&
+      active.answerText &&
+      !active.settled &&
+      !predecessorsResolved(active) &&
+      releasableEmptyPredecessors(active)
+    ) {
+      scheduleEmptyPredecessorRelease();
     }
   };
 
@@ -1205,6 +1328,7 @@ export function createProgressDraftController(params: {
         () => {
           if (state.stopped) return;
           clearProgressTimer();
+          clearEmptyPredecessorTimer();
           state.pendingProgress = undefined;
           terminalDrain(true);
         },
@@ -1218,6 +1342,7 @@ export function createProgressDraftController(params: {
         () => {
           state.stopped = true;
           clearProgressTimer();
+          clearEmptyPredecessorTimer();
           state.pendingProgress = undefined;
         },
         undefined,

@@ -61,6 +61,20 @@ const MULTI_TEXT_B = process.env.ECHO_MULTI_MSG_TEXT_B || "ZZZ94_SECOND_ANSWER h
 const TOOL_FIRST_MARKER = process.env.ECHO_TOOL_FIRST_MARKER || "";
 const TOOL_FIRST_TEXT =
   process.env.ECHO_TOOL_FIRST_TEXT || "TOOLFIRST94_ANSWER after the tool ran.";
+// Gap between the first content delta of the tool-first answer and the rest of
+// the stream. A real model streams an answer over hundreds of ms to seconds;
+// this server otherwise emits the whole turn in about a millisecond, which is
+// not merely unrealistic — it makes LIVE streaming unobservable, because the
+// turn's final lands before any draft could be shown. The channel deliberately
+// never delays a settle to wait for a draft, so with a zero-gap provider the
+// correct behaviour and the stall are indistinguishable on the wire. Only the
+// tool-first fixture pays this cost; every other harness sharing this file is
+// unaffected.
+const TOOL_FIRST_STREAM_GAP_MS = parseInt(
+  process.env.ECHO_TOOL_FIRST_STREAM_GAP_MS || "900",
+  10,
+);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let multiToolCallSeq = 0;
 
@@ -214,6 +228,13 @@ const server = createServer(async (req, res) => {
         res.write(sseChunk({ role: "assistant" }));
         const cut = Math.ceil(phase2Text.length / 2);
         res.write(sseChunk({ content: phase2Text.slice(0, cut) }));
+        if (toolLoopMode === "tool-first" && TOOL_FIRST_STREAM_GAP_MS > 0) {
+          console.log(
+            `[echo] tool-first phase 2 → holding ${TOOL_FIRST_STREAM_GAP_MS}ms mid-answer ` +
+              `so the answer is streamable before the turn settles`,
+          );
+          await sleep(TOOL_FIRST_STREAM_GAP_MS);
+        }
         res.write(sseChunk({ content: phase2Text.slice(cut) }));
         res.write(sseChunk({}, "stop"));
         res.write("data: [DONE]\n\n");

@@ -626,6 +626,81 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
    * missed-boundary check the fifth rotates the lane on its own. Either failure
    * splits one answer across two bubbles.
    */
+  /**
+   * #94 — the tool-only first assistant message.
+   *
+   * Lane 0 closes with no text (the message was only a tool call), so it is an
+   * unresolved ordering barrier in front of lane 1. Until this fix it stayed
+   * that way until terminal drain and the answer streamed NOTHING — the live
+   * defect the e2e turn-2 fixture reproduces against a real gateway.
+   *
+   * The barrier is real for a DIFFERENT lane shape (a message whose text is
+   * still coming as a block), and the two are indistinguishable at this instant,
+   * so the release is time-boxed to one streaming window rather than immediate.
+   */
+  it("M6j: a text-less predecessor releases the live lane after one streaming window", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushEvent(toolStart());
+      await h.draft.flush();
+      const scaffoldFrames = h.frames.length;
+      expect(scaffoldFrames).toBe(1);
+
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "the answer" });
+      await h.draft.flush();
+      // Inside the window the barrier still holds — a late block for lane 0
+      // would still land first.
+      expect(h.frames).toHaveLength(scaffoldFrames);
+
+      // A tool event lands just before the release, so the progress throttle is
+      // freshly closed. The released frame must not wait behind it: on a turn
+      // whose answer is shorter than one throttle interval, that wait means the
+      // settle discards the frame and the answer never streams at all.
+      await vi.advanceTimersByTimeAsync(590);
+      h.draft.pushEvent(toolStart("tool-2"));
+      await h.draft.flush();
+      const beforeRelease = h.frames.length;
+
+      await vi.advanceTimersByTimeAsync(10);
+      expect(h.frames).toHaveLength(beforeRelease + 1);
+      expect(h.frames.at(-1)).toMatchObject({ type: "progress", text: "the answer" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("M6k: a settle inside the window never waits for the release timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushEvent(toolStart());
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "the answer" });
+
+      // No timer advance at all: the settle path resolves the empty predecessor
+      // itself, so a turn that finishes inside the window behaves exactly as it
+      // did before the timer existed.
+      await expect(h.draft.finalize("the answer")).resolves.toBe(true);
+      expect(h.frames.at(-1)).toMatchObject({ type: "final", text: "the answer" });
+
+      // …and the pending timer is CLEARED by drain, not merely harmless when it
+      // fires. A timer surviving its turn is a leak, and a live one would keep
+      // the host process awake; the frame count alone cannot see either, so
+      // assert the timer itself is gone.
+      const settledFrames = h.frames.length;
+      await h.draft.drain();
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(h.frames).toHaveLength(settledFrames);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("M7b: a mid-stream <thinking> tag never splits one answer into two bubbles", async () => {
     const warn = vi.fn();
     const h = makeDraftHarness({ logger: { warn } });
