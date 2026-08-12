@@ -292,6 +292,7 @@ describe("webchannel inbound round-trip", () => {
     | {
         lifecycle: {
           kind: "skip" | "cancel" | "settled";
+          deliveryKind?: "tool" | "block" | "final";
           payload?: TestReplyPayload;
           assistantMessageIndex?: number;
         };
@@ -441,7 +442,7 @@ describe("webchannel inbound round-trip", () => {
                 opts.onDeliveryResult?.(result, step.deliverFinal, "final");
               } else if ("lifecycle" in step) {
                 const info = {
-                  kind: "block" as const,
+                  kind: step.lifecycle.deliveryKind ?? ("block" as const),
                   ...(step.lifecycle.assistantMessageIndex === undefined
                     ? {}
                     : { assistantMessageIndex: step.lifecycle.assistantMessageIndex }),
@@ -861,6 +862,43 @@ describe("webchannel inbound round-trip", () => {
     );
   });
 
+  it("I3: the last emitted progress frame carries the freshest coalesced snapshot", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new FakePeerChannel();
+      const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      let stepCount = 0;
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        steps: [
+          { partial: { text: "Hel" } },
+          { partial: { text: "Hello wor" } },
+          { partial: { text: "Hello world" } },
+        ],
+        finalPayloads: [{ text: "Hello world" }],
+        betweenSteps: async () => {
+          stepCount += 1;
+          if (stepCount === 3) await vi.advanceTimersByTimeAsync(601);
+        },
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        text: "hello",
+      });
+
+      expect(progressSpy.mock.calls.map((call) => call[2])).toEqual([
+        "Hel",
+        "Hello world",
+      ]);
+      expect(progressSpy.mock.calls.at(-1)?.[2]).toBe("Hello world");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("strips reasoning tags from streamed partials in partial mode (mirrors core hygiene)", async () => {
     const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
@@ -894,6 +932,7 @@ describe("webchannel inbound round-trip", () => {
     const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
 
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     const { api } = makeFakeApi(captured, {
@@ -903,6 +942,8 @@ describe("webchannel inbound round-trip", () => {
       partialTexts: ["Hello world", "Hello"],
       finalPayloads: [{ text: "Hello final" }],
     });
+    const warn = vi.fn();
+    api.logger.warn = warn;
 
     await handleInboundMessage(api, transport, "web-anon", {
       type: "user_message",
@@ -916,6 +957,9 @@ describe("webchannel inbound round-trip", () => {
       "Hello final",
     ]);
     expect(finalizeSpy.mock.calls[0]![1]).not.toBe(finalizeSpy.mock.calls[1]![1]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("contract violation: cumulative partial diverged"),
+    );
   });
 
   it("I15: lets the mixed-turn answer claim and finalize the provisional scaffold id", async () => {
@@ -1291,6 +1335,65 @@ describe("webchannel inbound round-trip", () => {
     },
   );
 
+  it.each(["skip", "cancel", "settled"] as const)(
+    "I11/F2: a pre-delivery final %s lifecycle cannot release block A ahead of its wire bubble",
+    async (lifecycleKind) => {
+      const transport = new FakePeerChannel();
+      const wireEvents: string[] = [];
+      vi.spyOn(transport, "sendProgress").mockImplementation((_peer, _id, text) => {
+        wireEvents.push(`progress:${text}`);
+        return true;
+      });
+      vi.spyOn(transport, "finalizeDraft").mockImplementation((_peer, _id, text) => {
+        wireEvents.push(`final:${text}`);
+        return true;
+      });
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        steps: [
+          { boundary: true },
+          { boundary: true },
+          { partial: { text: "B draft" } },
+          {
+            queuedBlock: {
+              payload: { text: "queued A" },
+              assistantMessageIndex: 0,
+            },
+          },
+          {
+            lifecycle: {
+              kind: lifecycleKind,
+              deliveryKind: "final",
+              payload: { text: "unrelated final" },
+              assistantMessageIndex: 0,
+            },
+          },
+          { deliverBlock: { text: "F-A" } },
+          {
+            lifecycle: {
+              kind: "settled",
+              deliveryKind: "block",
+              assistantMessageIndex: 0,
+            },
+          },
+        ],
+        finalPayloads: [{ text: "B final" }],
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        text: "hello",
+      });
+
+      expect(wireEvents).toEqual([
+        "final:F-A",
+        "progress:B draft",
+        "final:B final",
+      ]);
+    },
+  );
+
   it("I16: two late indexless callbacks remain tentative while both actual blocks are preserved", async () => {
     const transport = new FakePeerChannel();
     vi.spyOn(transport, "sendProgress").mockReturnValue(true);
@@ -1357,7 +1460,6 @@ describe("webchannel inbound round-trip", () => {
     { lifecycleKind: "skip" as const, assistantMessageIndex: 0 },
     { lifecycleKind: "cancel" as const, assistantMessageIndex: 0 },
     { lifecycleKind: "cancel" as const, assistantMessageIndex: undefined },
-    { lifecycleKind: "error" as const, assistantMessageIndex: undefined },
   ])(
     "I18: $lifecycleKind cleanup (index=$assistantMessageIndex) leaves no queued-A ghost",
     async ({ lifecycleKind, assistantMessageIndex }) => {
@@ -1365,16 +1467,13 @@ describe("webchannel inbound round-trip", () => {
       const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
       const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
       const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
-      const lifecycleStep: KernelStep =
-        lifecycleKind === "error"
-          ? { deliveryError: { kind: "block" } }
-          : {
-              lifecycle: {
-                kind: lifecycleKind,
-                payload: { text: "queued A" },
-                ...(assistantMessageIndex === undefined ? {} : { assistantMessageIndex }),
-              },
-            };
+      const lifecycleStep: KernelStep = {
+        lifecycle: {
+          kind: lifecycleKind,
+          payload: { text: "queued A" },
+          ...(assistantMessageIndex === undefined ? {} : { assistantMessageIndex }),
+        },
+      };
       const { api } = makeFakeApi(captured, {
         channelConfig: { streaming: { mode: "partial" } },
         steps: [
@@ -1405,6 +1504,32 @@ describe("webchannel inbound round-trip", () => {
       }
     },
   );
+
+  it("I18/F4: a block delivery error is diagnosed through the injected logger", async () => {
+    const transport = new FakePeerChannel();
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      steps: [{ deliveryError: { kind: "block" } }],
+      skipFinal: true,
+    });
+    const warn = vi.fn();
+    api.logger.warn = warn;
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      text: "hello",
+    });
+
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "delivery adapter reported an error; ambiguous reservations await terminal drain",
+      ),
+    );
+  });
 
   it.each([
     { label: "I12a callback-free", coalescedCallbacks: false },
@@ -1490,34 +1615,143 @@ describe("webchannel inbound round-trip", () => {
     "isFallbackNotice",
     "isCompactionNotice",
   ] as const)(
-    "I20: queued %s lifecycle remains a notice token rather than an empty-lane barrier",
+    "I20/F3: queued %s classification is the only difference between B release and a barrier",
+    async (flag) => {
+      vi.useFakeTimers();
+      try {
+        const transport = new FakePeerChannel();
+        const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+        const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+        const notice = { text: "queued notice", [flag]: true } as TestReplyPayload;
+        const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+        const { api } = makeFakeApi(captured, {
+          channelConfig: { streaming: { mode: "partial" } },
+          steps: [
+            { boundary: true },
+            { partial: { text: "A" } },
+            { boundary: true },
+            {
+              queuedBlock: {
+                payload: notice,
+                assistantMessageIndex: 0,
+              },
+            },
+            { partial: { text: "B draft" } },
+            {
+              lifecycle: {
+                kind: "skip",
+                payload: notice,
+                assistantMessageIndex: 0,
+              },
+            },
+          ],
+          finalPayloads: [{ text: "B final" }],
+          betweenSteps: async () => {
+            await vi.advanceTimersByTimeAsync(601);
+          },
+        });
+
+        await handleInboundMessage(api, transport, "web-anon", {
+          type: "user_message",
+          text: "hello",
+        });
+
+        expect(progressSpy.mock.calls.map((call) => call[2])).toEqual(["A", "B draft"]);
+        expect(finalizeSpy.mock.calls.map((call) => call[2])).toEqual(["A", "B final"]);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each([
+    { noticeLifecycle: "skip" as const, cleanupLifecycle: "cancel" as const },
+    { noticeLifecycle: "cancel" as const, cleanupLifecycle: "skip" as const },
+  ])(
+    "I20/F3: $noticeLifecycle notice flags retire the token so $cleanupLifecycle can release B",
+    async ({ noticeLifecycle, cleanupLifecycle }) => {
+      vi.useFakeTimers();
+      try {
+        const transport = new FakePeerChannel();
+        const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+        vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+        const notice = {
+          text: "queued notice",
+          isFallbackNotice: true,
+        } as TestReplyPayload;
+        const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+        const { api } = makeFakeApi(captured, {
+          channelConfig: { streaming: { mode: "partial" } },
+          steps: [
+            { boundary: true },
+            { partial: { text: "A" } },
+            { boundary: true },
+            {
+              queuedBlock: {
+                payload: notice,
+                assistantMessageIndex: 0,
+              },
+            },
+            {
+              lifecycle: {
+                kind: noticeLifecycle,
+                payload: notice,
+                assistantMessageIndex: 0,
+              },
+            },
+            {
+              queuedBlock: {
+                payload: { text: "queued real block" },
+                assistantMessageIndex: 0,
+              },
+            },
+            {
+              lifecycle: {
+                kind: cleanupLifecycle,
+                payload: { text: "queued real block" },
+                assistantMessageIndex: 0,
+              },
+            },
+            { partial: { text: "B draft" } },
+          ],
+          finalPayloads: [{ text: "B final" }],
+          betweenSteps: async () => {
+            await vi.advanceTimersByTimeAsync(601);
+          },
+        });
+
+        await handleInboundMessage(api, transport, "web-anon", {
+          type: "user_message",
+          text: "hello",
+        });
+
+        expect(progressSpy.mock.calls.map((call) => call[2])).toEqual(["A", "B draft"]);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each([
+    "isStatusNotice",
+    "isFallbackNotice",
+    "isCompactionNotice",
+  ] as const)(
+    "I20/F1: a final %s notice does not consume the streamed answer lane",
     async (flag) => {
       const transport = new FakePeerChannel();
       const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
       const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
-      const notice = { text: "queued notice", [flag]: true } as TestReplyPayload;
+      const notice = { text: "switched model", [flag]: true } as TestReplyPayload;
       const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
       const { api } = makeFakeApi(captured, {
         channelConfig: { streaming: { mode: "partial" } },
         steps: [
-          { boundary: true },
-          { boundary: true },
-          { partial: { text: "B draft" } },
-          {
-            queuedBlock: {
-              payload: notice,
-              assistantMessageIndex: 0,
-            },
-          },
-          {
-            lifecycle: {
-              kind: "skip",
-              payload: notice,
-              assistantMessageIndex: 0,
-            },
-          },
+          { partial: { text: "Real answer draft" } },
+          { deliverFinal: notice },
+          { deliverFinal: { text: "Real answer final" } },
         ],
-        finalPayloads: [{ text: "B final" }],
+        skipFinal: true,
       });
 
       await handleInboundMessage(api, transport, "web-anon", {
@@ -1525,8 +1759,13 @@ describe("webchannel inbound round-trip", () => {
         text: "hello",
       });
 
-      expect(progressSpy).not.toHaveBeenCalled();
-      expect(finalizeSpy.mock.calls.map((call) => call[2])).toEqual(["B final"]);
+      expect(finalizeSpy.mock.calls.map((call) => call[2])).toEqual([
+        "switched model",
+        "Real answer final",
+      ]);
+      const streamedLaneId = progressSpy.mock.calls[0]![1];
+      expect(finalizeSpy.mock.calls[0]![1]).not.toBe(streamedLaneId);
+      expect(finalizeSpy.mock.calls[1]![1]).toBe(streamedLaneId);
     },
   );
 
@@ -1558,6 +1797,27 @@ describe("webchannel inbound round-trip", () => {
     ]);
     expect(finalizeSpy.mock.calls[0]![1]).not.toBe(finalizeSpy.mock.calls[1]![1]);
     expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-i13", "ok");
+  });
+
+  it("I13/F7: a sent independent terminal error suppresses the catch-path apology", async () => {
+    const transport = new FakePeerChannel();
+    vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+    const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      steps: [{ deliverFinal: { text: "terminal error", isError: true } }],
+      throwAfterProgress: true,
+    });
+
+    await expect(
+      handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        text: "hello",
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(finalizeSpy.mock.calls.map((call) => call[2])).toEqual(["terminal error"]);
   });
 
   it.each([0, 1, 3])(
@@ -1733,7 +1993,7 @@ describe("webchannel inbound round-trip", () => {
     "isFallbackNotice",
     "isCompactionNotice",
   ] as const)(
-    "I20: callback-to-actual rewrites reclassify %s at the actual delivery",
+    "I20: callback-to-actual %s rewrites preserve both authorized payloads outside the lane",
     async (flag) => {
       const transport = new FakePeerChannel();
       const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
@@ -1777,6 +2037,97 @@ describe("webchannel inbound round-trip", () => {
       expect(finalizeSpy.mock.calls[0]![1]).not.toBe(laneId);
       expect(finalizeSpy.mock.calls[1]![1]).not.toBe(laneId);
       expect(finalizeSpy.mock.calls[2]![1]).toBe(laneId);
+    },
+  );
+
+  it.each([
+    "isStatusNotice",
+    "isFallbackNotice",
+    "isCompactionNotice",
+  ] as const)(
+    "I20/F5: an actual %s notice cannot settle a real-block reservation",
+    async (flag) => {
+      vi.useFakeTimers();
+      try {
+        const transport = new FakePeerChannel();
+        const wireEvents: string[] = [];
+        vi.spyOn(transport, "sendProgress").mockImplementation((_peer, _id, text) => {
+          wireEvents.push(`progress:${text}`);
+          return true;
+        });
+        vi.spyOn(transport, "finalizeDraft").mockImplementation((_peer, _id, text) => {
+          wireEvents.push(`final:${text}`);
+          return true;
+        });
+        const actualNotice = { text: "actual notice", [flag]: true } as TestReplyPayload;
+        const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+        const { api } = makeFakeApi(captured, {
+          channelConfig: { streaming: { mode: "partial" } },
+          steps: [
+            { boundary: true },
+            { partial: { text: "A" } },
+            {
+              queuedBlock: {
+                payload: { text: "queued prior block" },
+                assistantMessageIndex: 0,
+              },
+            },
+            { deliverBlock: { text: "actual prior block" } },
+            {
+              lifecycle: {
+                kind: "settled",
+                deliveryKind: "block",
+                assistantMessageIndex: 0,
+              },
+            },
+            { boundary: true },
+            {
+              queuedBlock: {
+                payload: { text: "queued real block" },
+                assistantMessageIndex: 0,
+              },
+            },
+            { partial: { text: "B draft" } },
+            { deliverBlock: actualNotice },
+            {
+              lifecycle: {
+                kind: "settled",
+                deliveryKind: "block",
+                assistantMessageIndex: 0,
+              },
+            },
+            { deliverBlock: { text: "actual real block" } },
+            {
+              lifecycle: {
+                kind: "settled",
+                deliveryKind: "block",
+                assistantMessageIndex: 0,
+              },
+            },
+          ],
+          finalPayloads: [{ text: "B final" }],
+          betweenSteps: async () => {
+            await vi.advanceTimersByTimeAsync(601);
+          },
+        });
+
+        await handleInboundMessage(api, transport, "web-anon", {
+          type: "user_message",
+          text: "hello",
+        });
+
+        expect(wireEvents).toEqual([
+          "progress:A",
+          "final:actual prior block",
+          "final:A",
+          "final:actual notice",
+          "final:actual real block",
+          "progress:B draft",
+          "final:B final",
+        ]);
+      } finally {
+        vi.useRealTimers();
+      }
     },
   );
 

@@ -13,11 +13,14 @@ vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import {
+  deliverDraftFinalPayload,
   handleInboundMessage,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
+  type FinalReconciliationState,
 } from "./inbound.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
+import type { ProgressDraftController } from "./message-adapter.js";
 import {
   APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY,
   ApprovalOriginLeaseRegistry,
@@ -367,6 +370,78 @@ describe("handleInboundMessage — terminal draft drain", () => {
     expect(finalizes).toHaveLength(1);
     expect(finalizes[0]!.text).toBe("Final answer complete");
     expect(finalizes[0]!.text).not.toContain("Stopped");
+  });
+});
+
+describe("deliverDraftFinalPayload — independent routing policy", () => {
+  const makeDraft = () => {
+    const finalize = vi.fn(async () => true);
+    const deliverIndependentFinal = vi.fn(async () => true);
+    const noteLeadingTerminalError = vi.fn();
+    const draft = {
+      finalize,
+      deliverIndependentFinal,
+      noteLeadingTerminalError,
+    } as unknown as ProgressDraftController;
+    return { draft, finalize, deliverIndependentFinal, noteLeadingTerminalError };
+  };
+
+  it.each([
+    {
+      reason: "isNotice",
+      payload: { text: "notice", isFallbackNotice: true },
+      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
+    },
+    {
+      reason: "payload.isError",
+      payload: { text: WARNING_SENTINEL, isError: true },
+      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
+    },
+    {
+      reason: "leadingTerminalErrorSeen",
+      payload: { text: "retained answer" },
+      state: { leadingTerminalErrorSeen: true, ordinaryAnswerFinalSeen: false },
+    },
+    {
+      reason: "ordinaryAnswerFinalSeen",
+      payload: { text: "extra answer" },
+      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
+    },
+  ] satisfies Array<{
+    reason: string;
+    payload: {
+      text: string;
+      isError?: boolean;
+      isFallbackNotice?: boolean;
+    };
+    state: FinalReconciliationState;
+  }>)("F1: $reason alone selects the independent final route", async ({ payload, state }) => {
+    const h = makeDraft();
+
+    await expect(
+      deliverDraftFinalPayload(h.draft, payload, payload.text, { ...state }),
+    ).resolves.toEqual({ sent: true, independent: true });
+
+    expect(h.deliverIndependentFinal).toHaveBeenCalledOnce();
+    expect(h.finalize).not.toHaveBeenCalled();
+  });
+
+  it("F7: a first terminal error records the adapter reconciliation guard", async () => {
+    const h = makeDraft();
+    const state: FinalReconciliationState = {
+      leadingTerminalErrorSeen: false,
+      ordinaryAnswerFinalSeen: false,
+    };
+
+    await deliverDraftFinalPayload(
+      h.draft,
+      { text: "terminal error", isError: true },
+      "terminal error",
+      state,
+    );
+
+    expect(state.leadingTerminalErrorSeen).toBe(true);
+    expect(h.noteLeadingTerminalError).toHaveBeenCalledOnce();
   });
 });
 

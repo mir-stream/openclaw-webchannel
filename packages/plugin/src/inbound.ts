@@ -1,5 +1,8 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
-import { isReplyPayloadNonTerminalToolErrorWarning } from "openclaw/plugin-sdk/reply-payload";
+import {
+  isReplyPayloadNonTerminalToolErrorWarning,
+  type ReplyPayload,
+} from "openclaw/plugin-sdk/reply-payload";
 
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
@@ -55,6 +58,50 @@ function isCoreNoticePayload(payload: NoticeFlagPayload): boolean {
     payload.isFallbackNotice === true ||
     payload.isCompactionNotice === true
   );
+}
+
+export type FinalReconciliationState = {
+  ordinaryAnswerFinalSeen: boolean;
+  leadingTerminalErrorSeen: boolean;
+};
+
+/**
+ * Route one draft-mode final without consuming a lane more than once.
+ *
+ * Notice classification is the only guard here that the downstream lane state
+ * cannot reconstruct: notices deliberately bypass the controller's ordinary
+ * final reconciliation. The error and prior-final predicates are retained as
+ * defence-in-depth at this seam so every identity-less final after either
+ * condition remains independent even if controller state changes later.
+ */
+export async function deliverDraftFinalPayload(
+  draft: ProgressDraftController,
+  payload: ReplyPayload,
+  text: string,
+  state: FinalReconciliationState,
+): Promise<{ sent: boolean; independent: boolean }> {
+  const isMarkedNonTerminalWarning =
+    payload.isError === true && isReplyPayloadNonTerminalToolErrorWarning(payload);
+  const isTerminalError = payload.isError === true && !isMarkedNonTerminalWarning;
+  if (
+    isTerminalError &&
+    !state.ordinaryAnswerFinalSeen &&
+    !state.leadingTerminalErrorSeen
+  ) {
+    state.leadingTerminalErrorSeen = true;
+    draft.noteLeadingTerminalError();
+  }
+
+  const independent =
+    isCoreNoticePayload(payload) ||
+    payload.isError === true ||
+    state.leadingTerminalErrorSeen ||
+    state.ordinaryAnswerFinalSeen;
+  if (!independent) state.ordinaryAnswerFinalSeen = true;
+  const sent = independent
+    ? await draft.deliverIndependentFinal({ text, ...noticeFlagsOf(payload) })
+    : await draft.finalize(text);
+  return { sent, independent };
 }
 
 /**
@@ -257,8 +304,10 @@ export async function handleInboundMessage(
   // and of `answerDelivered` (which also tracks actual block output for #87).
   // Only the first ordinary, non-notice final before a leading terminal error
   // consumes the current assistant lane.
-  let ordinaryAnswerFinalSeen = false;
-  let leadingTerminalErrorSeen = false;
+  const finalReconciliation: FinalReconciliationState = {
+    ordinaryAnswerFinalSeen: false,
+    leadingTerminalErrorSeen: false,
+  };
   // Ordinary messages have already been ACKed by ingress and therefore need one
   // settled outcome even when setup fails. Control-lane turns never settle; an
   // explicit DM denial opts out below because no agent turn was admitted.
@@ -594,18 +643,21 @@ export async function handleInboundMessage(
                   dispatcherOptions: {
                     onSkip: (payload, info) => {
                       draft!.noteDeliveryLifecycle("skip", {
+                        deliveryKind: info.kind,
                         assistantMessageIndex: info.assistantMessageIndex,
                         ...noticeFlagsOf(payload),
                       });
                     },
                     onBeforeDeliverCancelled: (payload, info) => {
                       draft!.noteDeliveryLifecycle("cancel", {
+                        deliveryKind: info.kind,
                         assistantMessageIndex: info.assistantMessageIndex,
                         ...noticeFlagsOf(payload),
                       });
                     },
                     onDeliverySettled: (info) => {
                       draft!.noteDeliveryLifecycle("settled", {
+                        deliveryKind: info.kind,
                         assistantMessageIndex: info.assistantMessageIndex,
                       });
                     },
@@ -691,29 +743,12 @@ export async function handleInboundMessage(
                   return { visibleReplySent: sent };
                 }
                 if (draft && kind === "final") {
-                  const isMarkedNonTerminalWarning =
-                    payload.isError === true &&
-                    isReplyPayloadNonTerminalToolErrorWarning(payload);
-                  const isTerminalError =
-                    payload.isError === true && !isMarkedNonTerminalWarning;
-                  if (
-                    isTerminalError &&
-                    !ordinaryAnswerFinalSeen &&
-                    !leadingTerminalErrorSeen
-                  ) {
-                    leadingTerminalErrorSeen = true;
-                    draft.noteLeadingTerminalError();
-                  }
-
-                  const independent =
-                    isNotice ||
-                    payload.isError === true ||
-                    leadingTerminalErrorSeen ||
-                    ordinaryAnswerFinalSeen;
-                  if (!independent) ordinaryAnswerFinalSeen = true;
-                  const sent = independent
-                    ? await draft.deliverIndependentFinal({ text, ...noticeFlags })
-                    : await draft.finalize(text);
+                  const { sent } = await deliverDraftFinalPayload(
+                    draft,
+                    payload,
+                    text,
+                    finalReconciliation,
+                  );
                   if (sent) finalReplyDelivered = true;
                   return { visibleReplySent: sent };
                 }
@@ -721,8 +756,10 @@ export async function handleInboundMessage(
                 if (sent && kind === "final") finalReplyDelivered = true;
                 return { visibleReplySent: sent };
               },
-              onError: () => {
-                draft?.noteDeliveryLifecycle("error", {});
+              onError: (_error, info) => {
+                draft?.noteDeliveryLifecycle("error", {
+                  deliveryKind: info.kind,
+                });
               },
             },
           };
@@ -746,7 +783,7 @@ export async function handleInboundMessage(
     // below remains its idempotent terminal cleanup.
     if (draft) {
       try {
-        if (!controlLane && !finalReplyDelivered) {
+        if (!finalReplyDelivered) {
           await draft.deliverIndependentFinal({
             text: "Sorry — something went wrong while answering. Please try again.",
           });

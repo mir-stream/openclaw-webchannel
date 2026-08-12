@@ -684,6 +684,10 @@ staleness valve의 disarm은 경로마다 단위가 다르다. `progress`/`agent
 
 이 문제는 **클라이언트 소유이고 플러그인 lane 모델과 독립**이므로 #105로 배출한다. PR 1의 C5b는 `progress`와 `agent_message`가 lane-local임을 각각 고정하지만 reasoning의 turn-wide 정책을 정당화하거나 수정하지 않는다.
 
+### 12.2 PR 2 inbound 리뷰에서 확인한 잔여 위험 (dist 실측, 2026-08-12)
+
+- **leading `errorText` 없는 multi-final도 가능하다 — #111로 유예.** 고정 core 번들의 `node_modules/openclaw/dist/payloads-DMxgzxEO.js:238-241`에서 run의 마지막 assistant message가 tool-only라 `fallbackAnswerSourceText`가 비어 있으면 `shouldUseCanonicalFinalAnswer`가 `false`가 된다. 동시에 `nonEmptyAssistantTexts.length >= 2`이면 core는 leading error/notice 없이 non-error final을 2개 이상 방출할 수 있다. 이미 partial로 A/B가 보인 턴에서 이 final 배열이 오면 첫 ordinary final이 current B lane의 terminal slot을 소비해 B의 streamed body를 A 본문으로 교체하고, 다음 final만 fresh independent bubble로 남는 #94형 live loss가 도달 가능하다. 이 payload들에는 stable final identity가 없어서 플러그인이 어느 lane의 final인지 구분할 수 없고, 본문 비교는 §6.4가 금지한다. 따라서 로컬 text guard는 추가하지 않으며 queued callback과 actual/terminal delivery를 잇는 stable identity를 소유한 #111에서 화해한다.
+
 ---
 
 ## 13. 완료 정의

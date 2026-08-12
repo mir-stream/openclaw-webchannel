@@ -243,7 +243,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       if (lifecycle === "drain") {
         await h.draft.drain();
       } else {
-        h.draft.noteDeliveryLifecycle(lifecycle, { assistantMessageIndex: 0 });
+        h.draft.noteDeliveryLifecycle(lifecycle, {
+          deliveryKind: "block",
+          assistantMessageIndex: 0,
+        });
         await h.draft.drain();
       }
       expect(h.frames).toEqual([]);
@@ -260,7 +263,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
 
     await expect(h.draft.deliverAuthorizedBlock({ text: "postHookA" })).resolves.toBe(true);
     expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA"]);
-    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    h.draft.noteDeliveryLifecycle("settled", {
+      deliveryKind: "block",
+      assistantMessageIndex: 0,
+    });
     expect(h.frames.map((frame) => frame.text)).toEqual(["postHookA", "B partial"]);
 
     await h.draft.finalize("B final");
@@ -275,7 +281,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     h.draft.noteBlockReplyQueued({});
 
     await h.draft.deliverAuthorizedBlock({ text: "fallback-A" });
-    h.draft.noteDeliveryLifecycle("settled", {});
+    h.draft.noteDeliveryLifecycle("settled", { deliveryKind: "block" });
     expect(h.frames.map((frame) => frame.text)).toEqual(["fallback-A"]);
 
     await h.draft.drain();
@@ -333,7 +339,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(successfulIds(h.frames)).toHaveLength(2);
   });
 
-  it("M6g: actual notice flags and callback-to-actual rewrites stay independent", async () => {
+  it("M6g/F5: actual notices stay independent without settling a real-block barrier", async () => {
     const actualNoticeFlags = [
       { isStatusNotice: true },
       { isFallbackNotice: true },
@@ -345,13 +351,31 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       h.draft.pushAnswerText({ text: "A" });
       const idA = h.frames[0]!.id;
       h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
+      await h.draft.deliverAuthorizedBlock({ text: "prior actual block" });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 0,
+      });
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
       h.draft.handleAssistantMessageBoundary();
       h.draft.pushAnswerText({ text: "B" });
       await h.draft.deliverAuthorizedBlock({ text: "actual notice", ...flag });
-      h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 0,
+      });
+      expect(h.frames.some((frame) => frame.text === "B")).toBe(false);
+
+      await h.draft.deliverAuthorizedBlock({ text: "actual block" });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 0,
+      });
       const idB = h.frames.find((frame) => frame.text === "B")!.id;
       const noticeId = h.frames.find((frame) => frame.text === "actual notice")!.id;
-      expect(new Set([idA, idB, noticeId]).size).toBe(3);
+      const blockId = h.frames.find((frame) => frame.text === "actual block")!.id;
+      const priorBlockId = h.frames.find((frame) => frame.text === "prior actual block")!.id;
+      expect(new Set([idA, idB, noticeId, blockId, priorBlockId]).size).toBe(5);
       h.draft.pushAnswerText({ text: "B later" });
       expect(h.frames.at(-1)?.id).toBe(idB);
     }
@@ -374,7 +398,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       h.draft.handleAssistantMessageBoundary();
       h.draft.pushAnswerText({ text: "B" });
       h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
-      h.draft.noteDeliveryLifecycle(lifecycle, { assistantMessageIndex: 0 });
+      h.draft.noteDeliveryLifecycle(lifecycle, {
+        deliveryKind: "block",
+        assistantMessageIndex: 0,
+      });
       expect(h.frames.map((frame) => frame.text)).toEqual(["B"]);
     }
 
@@ -382,6 +409,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     cleanupBeforeBoundary.draft.handleAssistantMessageBoundary();
     cleanupBeforeBoundary.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
     cleanupBeforeBoundary.draft.noteDeliveryLifecycle("skip", {
+      deliveryKind: "block",
       assistantMessageIndex: 0,
     });
     cleanupBeforeBoundary.draft.handleAssistantMessageBoundary();
@@ -395,7 +423,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     indexless.draft.handleAssistantMessageBoundary();
     indexless.draft.pushAnswerText({ text: "B" });
     indexless.draft.noteBlockReplyQueued({});
-    indexless.draft.noteDeliveryLifecycle("cancel", {});
+    indexless.draft.noteDeliveryLifecycle("cancel", { deliveryKind: "block" });
     expect(indexless.frames).toEqual([]);
     await indexless.draft.drain();
     expect(indexless.frames.map((frame) => frame.text)).toEqual(["B"]);
@@ -406,7 +434,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     duplicate.draft.pushAnswerText({ text: "B" });
     duplicate.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
     duplicate.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
-    duplicate.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    duplicate.draft.noteDeliveryLifecycle("settled", {
+      deliveryKind: "block",
+      assistantMessageIndex: 0,
+    });
     expect(duplicate.frames).toEqual([]);
     await duplicate.draft.drain();
     expect(duplicate.frames.map((frame) => frame.text)).toEqual(["B"]);
@@ -418,6 +449,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     h.draft.pushAnswerText({ text: "A" });
     h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0, isStatusNotice: true });
     h.draft.noteDeliveryLifecycle("skip", {
+      deliveryKind: "block",
       assistantMessageIndex: 0,
       isStatusNotice: true,
     });
@@ -426,7 +458,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     h.draft.pushAnswerText({ text: "B" });
 
     expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A"]);
-    h.draft.noteDeliveryLifecycle("cancel", { assistantMessageIndex: 0 });
+    h.draft.noteDeliveryLifecycle("cancel", {
+      deliveryKind: "block",
+      assistantMessageIndex: 0,
+    });
     expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "B"]);
   });
 
@@ -440,18 +475,22 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     h.draft.pushAnswerText({ text: "B partial" });
 
     h.draft.noteDeliveryLifecycle("skip", {
+      deliveryKind: "block",
       assistantMessageIndex: 0,
       isStatusNotice: true,
     });
     await h.draft.deliverAuthorizedBlock({ text: "F-A" });
-    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    h.draft.noteDeliveryLifecycle("settled", {
+      deliveryKind: "block",
+      assistantMessageIndex: 0,
+    });
     expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "F-A"]);
 
     await h.draft.drain();
     expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "F-A", "B partial"]);
   });
 
-  it("M6h/F4: an indexed lifecycle opens an empty predecessor barrier", async () => {
+  it("M6h/F4: an indexed skip opens an empty predecessor barrier", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
@@ -460,7 +499,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await h.draft.flush();
     expect(h.attempts).toEqual([]);
 
-    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    h.draft.noteDeliveryLifecycle("skip", {
+      deliveryKind: "block",
+      assistantMessageIndex: 0,
+    });
     await h.draft.flush();
     expect(h.attempts.map((attempt) => attempt.text)).toEqual(["B partial"]);
   });
@@ -474,11 +516,14 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     h.draft.noteBlockReplyQueued({});
 
     await h.draft.deliverAuthorizedBlock({ text: "F-A1" });
-    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    h.draft.noteDeliveryLifecycle("settled", {
+      deliveryKind: "block",
+      assistantMessageIndex: 0,
+    });
     expect(h.frames.map((frame) => frame.text)).toEqual(["F-A1"]);
 
     await h.draft.deliverAuthorizedBlock({ text: "F-A2" });
-    h.draft.noteDeliveryLifecycle("settled", {});
+    h.draft.noteDeliveryLifecycle("settled", { deliveryKind: "block" });
     expect(h.frames.map((frame) => frame.text)).toEqual(["F-A1", "F-A2"]);
 
     await h.draft.finalize("B final");
@@ -494,14 +539,20 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     h.draft.pushAnswerText({ text: "B" });
 
     await h.draft.deliverAuthorizedBlock({ text: "actual-1" });
-    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    h.draft.noteDeliveryLifecycle("settled", {
+      deliveryKind: "block",
+      assistantMessageIndex: 0,
+    });
     expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "actual-1", "B"]);
 
     h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "C" });
     const beforeDuplicateSettled = [...h.frames];
-    h.draft.noteDeliveryLifecycle("settled", { assistantMessageIndex: 0 });
+    h.draft.noteDeliveryLifecycle("settled", {
+      deliveryKind: "block",
+      assistantMessageIndex: 0,
+    });
     expect(h.frames).toEqual(beforeDuplicateSettled);
 
     await h.draft.drain();
@@ -539,7 +590,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       } else {
         expect(next.id).toBe(provisionalId);
       }
-      h.draft.noteDeliveryLifecycle("settled", {});
+      h.draft.noteDeliveryLifecycle("settled", { deliveryKind: "block" });
     }
   });
 

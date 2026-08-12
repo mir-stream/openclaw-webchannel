@@ -310,7 +310,11 @@ export type ProgressDraftController = {
   /** Retire unambiguous callback lifecycle state without selecting an owner. */
   noteDeliveryLifecycle(
     kind: "skip" | "cancel" | "settled" | "error",
-    input: { assistantMessageIndex?: number } & NoticeFlags,
+    input: {
+      /** Dispatcher callbacks are a union; delivery.onError exposes string. */
+      deliveryKind: string;
+      assistantMessageIndex?: number;
+    } & NoticeFlags,
   ): void;
   /** Use the current lane's one ordinary-answer terminal slot. */
   finalize(text: string): Promise<boolean>;
@@ -1047,13 +1051,20 @@ export function createProgressDraftController(params: {
     deliverAuthorizedBlock: (input) =>
       enqueue(
         "authorized block delivery",
-        () => sendIndependent(input.text, true),
+        // A block-kind notice is authoritative visible output, but it owns no
+        // tentative block reservation. Recording a disposition for it would
+        // let its later settled event retire an unrelated real-block barrier.
+        () => sendIndependent(input.text, !isNotice(input)),
         false,
       ),
     noteDeliveryLifecycle: (kind, input) => {
       void enqueue(
         `delivery lifecycle ${kind}`,
         () => {
+          // The pinned dispatcher emits every lifecycle observer for tool,
+          // block, and final payloads. Only block-kind events can describe the
+          // tentative block state owned by this controller.
+          if (input.deliveryKind !== "block") return;
           const classifiedNotice =
             kind === "skip" || kind === "cancel" ? isNotice(input) : false;
           if (kind === "error") {
@@ -1064,10 +1075,10 @@ export function createProgressDraftController(params: {
               disposition.settled = true;
               retireSoleLifecycleRecord(input.assistantMessageIndex);
             } else if (state.blockDispositions.length === 0) {
-              // The indexed lifecycle signal is itself sufficient when no
-              // actual-block disposition has ever been recorded. Once a
-              // disposition exists, its unsettled state is the idempotence
-              // guard against a stale duplicate retiring a later callback.
+              // A block-kind settlement with no disposition history can still
+              // retire its indexed sole callback record. The delivery-kind
+              // gate above is what prevents unrelated tool/final settlements
+              // from taking this fallback.
               retireSoleLifecycleRecord(input.assistantMessageIndex);
             }
           } else {
