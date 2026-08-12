@@ -678,6 +678,17 @@ export function createProgressDraftController(params: {
   const releasableEmptyPredecessors = (
     lane: AssistantDraftLane,
   ): AssistantDraftLane[] | undefined => {
+    // A block queued ANYWHERE in this turn and not yet retired means we cannot
+    // know a text-less predecessor is genuinely empty — its body may still be in
+    // flight. Deliberately turn-wide and lane-agnostic: which lane a reservation
+    // attached to (or whether it attached at all) is decided by
+    // `assistantMessageIndexMatchesLane`, whose index base is known-unsound on
+    // the pinned core, so the release must not depend on that answer. With a
+    // block outstanding we fall back to the documented turn-bounded delay, which
+    // `retireReservation` and terminal drain both clear.
+    if (state.blockReservations.some((reservation) => reservation.state === "pending")) {
+      return undefined;
+    }
     const releasable: AssistantDraftLane[] = [];
     for (const predecessor of state.lanes) {
       if (predecessor.generation >= lane.generation) break;
@@ -949,11 +960,31 @@ export function createProgressDraftController(params: {
     assistantMessageIndex: number,
     lane: AssistantDraftLane,
   ): boolean => {
-    // Core exposes no index-base metadata. We use the observed 0-based,
-    // gapless contract (`assistantMessageIndex === generation`) only as an
-    // ordering barrier. With a 1-based producer the reservation can attach to
-    // the following lane and withhold a later partial until terminal drain;
-    // that turn-bounded delay is safer than guessing an owner or index base.
+    // KNOWN-UNSOUND ON THE PINNED CORE, and tolerated deliberately.
+    //
+    // Core stamps the queued-block context from the same payload metadata the
+    // delivery seam reads, and that stream is 1-BASED (measured on a real
+    // gateway: message A = 1, B = 2). Lane generations are 0-based, so this
+    // predicate is wrong on EVERY indexed turn, not in some edge case:
+    //   - it matches A's reservation (index 1) against lane generation 1 = B, so
+    //     the barrier lands on the SUCCESSOR, which never blocks that lane's own
+    //     progress (`predecessorsResolved` looks only at predecessors); and
+    //   - more commonly, when the block is queued while its own lane is still
+    //     current, generation 1 does not exist yet, `state.lanes.find` returns
+    //     undefined and NO barrier is created at all until the next rotation.
+    //
+    // An earlier version of this comment called the consequence a turn-bounded
+    // delay. That stopped being true when the empty-predecessor release timer
+    // landed: a mis-attached (or unattached) reservation leaves the real
+    // predecessor text-less with an empty barrier list, i.e. releasable, and the
+    // successor then streams ahead of a block that is still in flight —
+    // inverting the two bubbles rather than delaying one.
+    //
+    // What makes tolerating it safe is `releasableEmptyPredecessors`, which
+    // refuses to release while ANY reservation in the turn is still pending,
+    // whatever lane it did or did not attach to. Correcting the mapping itself
+    // needs a real index→lane identity and belongs to #111; guessing an offset
+    // here would bind us to an observed core version instead of a contract.
     return assistantMessageIndex === lane.generation;
   };
 

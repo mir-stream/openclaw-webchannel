@@ -753,6 +753,75 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
+  /**
+   * #94 — the index base and the release timer meet.
+   *
+   * Core's queued-block context is 1-BASED on the pinned core (message A = 1),
+   * while lane generations are 0-based, so `assistantMessageIndexMatchesLane`
+   * mis-attaches A's reservation to B — or, when A's block is queued while A is
+   * still the current lane, attaches it nowhere at all because generation 1 does
+   * not exist yet. Either way lane A is left text-less with an EMPTY barrier
+   * list, which is exactly the shape the release timer treats as "tool-only,
+   * nothing is coming". It then releases A and B streams ahead of A's block.
+   *
+   * Measured before the fix, as bubble first-appearance order (which is what
+   * decides screen position — a terminal frame lands in the bubble its first
+   * frame created):  ["B text", "A block"].
+   *
+   * These fixtures are deliberately 1-BASED. A 0-based fixture cannot see this
+   * defect at all, and 0 is a value the pinned core never emits.
+   */
+  it("M6t: a pending block reservation blocks the release, whatever lane it attached to", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary(); // lane 0 = A, text-less
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 }); // A's block, 1-based
+      h.draft.handleAssistantMessageBoundary(); // lane 1 = B
+      h.draft.pushAnswerText({ text: "B text" });
+      await h.draft.flush();
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(h.frames).toEqual([]); // B must not stream while A's block is in flight
+
+      await h.draft.deliverAuthorizedBlock({ text: "A block" });
+      await h.draft.drain();
+
+      const firstAppearance: string[] = [];
+      for (const frame of h.frames) {
+        if (!firstAppearance.includes(frame.id)) firstAppearance.push(frame.id);
+      }
+      const textOf = (id: string) => h.frames.find((frame) => frame.id === id)!.text;
+      expect(firstAppearance.map(textOf)).toEqual(["A block", "B text"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("M6u: a retired reservation stops blocking the release", async () => {
+    // The gate is turn-wide, so it has to clear the ordinary way or it would
+    // reintroduce the stall it is guarding.
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "B text" });
+      await h.draft.deliverAuthorizedBlock({ text: "A block" });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 1,
+      });
+      await h.draft.flush();
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      expect(h.frames.map((frame) => frame.text)).toEqual(["A block", "B text"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("M6n: a reservation arriving PAST the window inverts order — accepted, not a bug", async () => {
     // The cost of the time-boxed release, recorded so it cannot be mistaken for
     // a defect later. Once the window closes, the empty predecessor is treated
