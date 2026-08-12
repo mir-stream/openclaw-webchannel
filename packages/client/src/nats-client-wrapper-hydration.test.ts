@@ -264,7 +264,7 @@ describe("#95 WP B — additive wire fields (no protocol bump)", () => {
    *
    * `WEBCHANNEL_PROTOCOL_VERSION` is enforced as strict equality in both
    * directions with no negotiation (`nats-register.ts:392-398`,
-   * `nats-client.ts:1872-1881`), so a bump hard-fails every deployed pair until
+   * `nats-client.ts:1878-1887`), so a bump hard-fails every deployed pair until
    * both redeploy. Keeping additive fields genuinely additive is what avoids it.
    */
   it("tolerates rows carrying unknown/future optional fields", () => {

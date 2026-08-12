@@ -26,8 +26,8 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
  *    `inbound.ts:541-547` streams it into the progress draft via `onPartialReply`,
  *    and `inbound.ts:629-633` then OVERWRITES that same draft with the final
  *    answer (`draft.finalize(text)`). One bubble results. Text extraction is
- *    `history.ts:76-93`; role filtering `history.ts:95-100`; id recovery
- *    `history.ts:116-120`.
+ *    `history.ts:90-107`; role filtering `history.ts:109-114`; id recovery
+ *    `history.ts:130-134`.
  *
  * C. OBSERVED CORE BEHAVIOUR — not contract, not a design premise, pinned HERE
  *    rather than cited to an internal bundle path (those are hash-named and change
@@ -80,7 +80,7 @@ const ZERO_USAGE = {
  * One transcript record as the session-messages read hands it to the plugin: the
  * stored message plus the untyped `__openclaw` envelope (source C5). We synthesize
  * the envelope because no contract type declares it — that undeclared shape is
- * itself one of the findings, and `history.ts:116-120` is the only consumer.
+ * itself one of the findings, and `history.ts:130-134` is the only consumer.
  */
 function record(seq: number, message: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -202,7 +202,7 @@ describe("#95 WP A — transcript rows vs. assistant utterances", () => {
   });
 
   /**
-   * `ThinkingContent` carries `.thinking`, not `.text`, so `history.ts:76-93`
+   * `ThinkingContent` carries `.thinking`, not `.text`, so `history.ts:90-107`
    * never lifts it. Reasoning cannot leak into a hydrated bubble.
    */
   it("a thinking-only assistant step is dropped (no row)", async () => {
@@ -365,7 +365,7 @@ describe("#95 WP A — failed-turn persistence", () => {
 describe("#95 WP A — transcript metadata the plugin does not read", () => {
   /**
    * The `__openclaw` envelope is undeclared by any contract type (source C5). The
-   * plugin reads only `.id` from it (`history.ts:116-120`). #95 does NOT start
+   * plugin reads only `.id` from it (`history.ts:130-134`). #95 does NOT start
    * reading more of it: `seq` was considered and DEFERRED, because retiring the
    * `h-{ts}-{idx}` synthesis would change row `id` VALUES and break tier-1 dedupe
    * and the `pageBefore` cursor — leaving a new dependency on an untyped envelope
