@@ -168,6 +168,11 @@
                 "type": "string",
                 "enum": ["on", "off"],
                 "default": "on"
+              },
+              "reasoning": {
+                "type": "boolean",
+                "default": false,
+                "description": "Whether the agent's reasoning/thinking stream is delivered to browser peers. Default false — reasoning can restate file contents, credentials, or the user's prompt, so it must be opted into per deployment. Enabling it is necessary but NOT sufficient: the agent's own thinking level must also be something other than \"off\", which channel config cannot force."
               }
             }
           },
@@ -308,6 +313,10 @@
         "capabilities.typing": {
           "label": "Typing indicator",
           "help": "Whether the server pushes a native \"Bot is typing…\" frame at the start of each turn. Default \"on\"; set to \"off\" to disable (typing is then never emitted, regardless of inbound flow)."
+        },
+        "capabilities.reasoning": {
+          "label": "Reasoning stream",
+          "help": "Whether the agent's reasoning/thinking stream is delivered to browser peers. Default false (off) — reasoning may restate file contents, credentials, or the user's own prompt, so each deployment opts in explicitly. Note this alone is not enough: the agent's thinking level must also be other than \"off\", or the lane stays empty."
         },
         "history.enabled": {
           "label": "History pagination",

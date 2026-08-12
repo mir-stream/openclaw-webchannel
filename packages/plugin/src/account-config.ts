@@ -413,6 +413,41 @@ export function resolveTypingEnabled(accountConfig: WebchannelAccountConfig): bo
   return (capabilities?.typing ?? "on") !== "off";
 }
 
+/**
+ * Resolve whether the REASONING lane is enabled for an account (#113).
+ *
+ * Reads the account's merged `capabilities.reasoning` (channel-level shared base
+ * under the account override — pass a config already resolved via
+ * `resolveWebchannelAccountConfig`), exactly like `resolveTypingEnabled` above.
+ *
+ * DEFAULT OFF, and deliberately the opposite polarity to `typing`. Reasoning is
+ * model-internal deliberation, not a UI affordance: it can restate file contents,
+ * credentials, or a user's private prompt, and browser peers are the least
+ * trusted surface this plugin serves. An operator must therefore opt IN per
+ * deployment. `typing` defaults ON because an omitted key there means "keep the
+ * legacy behaviour"; there is no legacy reasoning behaviour to keep — the lane
+ * has never once emitted to a browser peer.
+ *
+ * STRICTLY BOOLEAN `true`. Any other value — absent, `false`, `"true"`, `"on"`,
+ * `1` — resolves OFF. A truthiness test would turn the string `"off"` (the
+ * spelling an operator who copied `capabilities.typing` would reach for first)
+ * into ON, i.e. silently enabling the lane for someone trying to disable it. The
+ * JSON schema rejects that spelling, but this resolver must not depend on the
+ * schema having been applied — `resolveTypingEnabled` documents the same rule.
+ *
+ * Note this is only the OPERATOR half of the gate. Reasoning also requires the
+ * model's own thinking level to be something other than "off" (`canShowReasoning`
+ * in core), which no amount of channel config can force. That precondition is
+ * why enabling this key must surface a diagnostic rather than silently producing
+ * an empty lane — see the turn-scoped warning owed by the wiring change.
+ */
+export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig): boolean {
+  const capabilities = accountConfig?.capabilities as
+    | { reasoning?: unknown }
+    | undefined;
+  return capabilities?.reasoning === true;
+}
+
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,

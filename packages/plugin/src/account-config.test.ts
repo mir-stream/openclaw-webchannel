@@ -21,6 +21,7 @@ import {
   resolveAcquisitionIdentity,
   resolveAccountNatsConfig,
   resolveTypingEnabled,
+  resolveReasoningEnabled,
   readAccountsMap,
   readWebchannelSection,
   accountCredentialPath,
@@ -176,6 +177,95 @@ describe("account-config: resolveTypingEnabled (P0-6)", () => {
       },
     };
     expect(resolveTypingEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
+  });
+});
+
+describe("account-config: resolveReasoningEnabled (#113)", () => {
+  it("defaults OFF when capabilities is absent or empty", () => {
+    // The whole point of #113: the reasoning lane is unreachable UNLESS a
+    // deployment turned it on. An omitted key must never open it.
+    expect(resolveReasoningEnabled({})).toBe(false);
+    expect(resolveReasoningEnabled({ capabilities: {} })).toBe(false);
+  });
+
+  it("ON only for boolean true", () => {
+    expect(resolveReasoningEnabled({ capabilities: { reasoning: true } })).toBe(true);
+  });
+
+  it("OFF for explicit false", () => {
+    expect(resolveReasoningEnabled({ capabilities: { reasoning: false } })).toBe(false);
+  });
+
+  it("OFF for every truthy non-boolean spelling, including the string 'off'", () => {
+    // Load-bearing. A truthiness test here would read the string "off" — the
+    // spelling an operator who copied `capabilities.typing` reaches for first —
+    // as ON, silently enabling the lane for someone trying to disable it. The
+    // JSON schema rejects these, but the resolver must not depend on the schema
+    // having been applied (same rule `resolveTypingEnabled` documents).
+    for (const value of ["off", "on", "true", "false", 1, 0, {}, []]) {
+      expect(
+        resolveReasoningEnabled({ capabilities: { reasoning: value } }),
+        `reasoning: ${JSON.stringify(value)} must resolve OFF`,
+      ).toBe(false);
+    }
+  });
+
+  it("honors an account override true over an unset channel-level base (through the merge)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: { acctA: { capabilities: { reasoning: true } } },
+        },
+      },
+    };
+    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(true);
+  });
+
+  it("honors an account override false over a channel-level true base (through the merge)", () => {
+    // One noisy account can be silenced without disarming the deployment.
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { reasoning: true },
+          accounts: { acctA: { capabilities: { reasoning: false } } },
+        },
+      },
+    };
+    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
+  });
+
+  it("inherits the channel-level base when the account omits capabilities (shared-base merge)", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { reasoning: true },
+          accounts: { acctA: { tenant: "t" } },
+        },
+      },
+    };
+    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(true);
+  });
+
+  it("keeps the base reasoning:true when the account sets OTHER capabilities (nested merge, no clobber)", () => {
+    // Locks `capabilities` staying in NESTED_OBJECT_KEYS, same as the typing
+    // case above: an account touching a sibling capability must not silently
+    // drop the deployment's reasoning opt-in.
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { reasoning: true },
+          accounts: { acctA: { capabilities: { typing: "off" } } },
+        },
+      },
+    };
+    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(true);
+  });
+
+  it("is independent of capabilities.typing in both directions", () => {
+    // The two capabilities have OPPOSITE defaults; a shared-default refactor
+    // would break exactly one of these.
+    expect(resolveReasoningEnabled({ capabilities: { typing: "on" } })).toBe(false);
+    expect(resolveTypingEnabled({ capabilities: { reasoning: true } })).toBe(true);
   });
 });
 
