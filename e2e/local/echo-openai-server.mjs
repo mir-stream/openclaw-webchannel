@@ -87,15 +87,49 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let multiToolCallSeq = 0;
 
+/**
+ * True for openclaw's RUNTIME-CONTEXT message — a `role:"user"` message the
+ * runtime appends AFTER the real user turn, not authored by the user.
+ *
+ * Since openclaw 2026.7.1 this arrives as its own trailing `role:"user"` entry
+ * (at 2026.6.10 the equivalent metadata was PREPENDED into the single user
+ * message instead). A naive "last user message" scan therefore echoes the
+ * runtime preamble instead of what the user typed, and every echo-based e2e
+ * assertion fails.
+ *
+ * The predicate mirrors core's own `isRuntimeContextPromptHeader` +
+ * preface check, verified at 2026.7.1-2 in
+ * `node_modules/openclaw/dist/internal-runtime-context-BW7WOTKc.js:125-127`
+ * (the two accepted headers) and `:134` (the mandatory second line).
+ */
+function isRuntimeContextText(text) {
+  const [first = "", second = ""] = text.split(/\r?\n/);
+  const header = first.trim();
+  return (
+    (header === "OpenClaw runtime context for the immediately preceding user message." ||
+      header === "OpenClaw runtime event.") &&
+    second.trim() === "This context is runtime-generated, not user-authored. Keep internal details private."
+  );
+}
+
+function messageText(m) {
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content)) {
+    return m.content.map((p) => (typeof p === "string" ? p : p?.text ?? "")).join("");
+  }
+  return null;
+}
+
 function lastUserText(messages) {
   if (!Array.isArray(messages)) return "";
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m && m.role === "user") {
-      if (typeof m.content === "string") return m.content;
-      if (Array.isArray(m.content)) {
-        return m.content.map((p) => (typeof p === "string" ? p : p?.text ?? "")).join("");
-      }
+      const text = messageText(m);
+      if (text === null) continue;
+      // Skip runtime-generated context so the echo reflects the USER's turn.
+      if (isRuntimeContextText(text)) continue;
+      return text;
     }
   }
   return "";
