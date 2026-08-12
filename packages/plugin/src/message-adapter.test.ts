@@ -609,6 +609,78 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(warn.mock.calls[0]![0]).toContain("contract violation");
   });
 
+  /**
+   * #94 — mid-stream `<thinking>`: the cleaned cumulative text goes BACKWARDS
+   * while the provider is still appending to the same message.
+   *
+   * Measured through the SDK's own strippers (the exact sequence below):
+   *   "Hi"                              -> "Hi"
+   *   "Hi <"                            -> "Hi <"
+   *   "Hi <thi"                         -> "Hi <thi"
+   *   "Hi <thinking>"                   -> "Hi"        <- SHRINK
+   *   "Hi <thinking>z</thinking> there" -> "Hi  there" <- and now it diverges
+   *
+   * Two separate guards are needed and BOTH are load-bearing here: without the
+   * shrink guard the fourth partial renders backwards flicker AND makes the
+   * fifth look like a new message; without the raw-extension term in the
+   * missed-boundary check the fifth rotates the lane on its own. Either failure
+   * splits one answer across two bubbles.
+   */
+  it("M7b: a mid-stream <thinking> tag never splits one answer into two bubbles", async () => {
+    const warn = vi.fn();
+    const h = makeDraftHarness({ logger: { warn } });
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of [
+      "Hi",
+      "Hi <",
+      "Hi <thi",
+      "Hi <thinking>",
+      "Hi <thinking>z</thinking> there",
+    ]) {
+      h.draft.pushAnswerText({ text });
+      await h.draft.flush();
+    }
+    await expect(h.draft.finalize("Hi there")).resolves.toBe(true);
+
+    expect(successfulIds(h.frames)).toHaveLength(1);
+    expect(h.frames.filter((frame) => frame.type === "final")).toEqual([
+      { type: "final", id: h.frames[0]!.id, text: "Hi there" },
+    ]);
+    // The 4th partial ("Hi", shorter than the "Hi <thi" already on screen) is
+    // dropped rather than rendered — the text never moves backwards…
+    expect(h.frames.map((frame) => frame.text)).toEqual([
+      "Hi",
+      "Hi <",
+      "Hi <thi",
+      "Hi  there",
+      "Hi there",
+    ]);
+    // …and no partial of this one message is ever read as a new message.
+    expect(warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("contract violation"),
+    );
+  });
+
+  it("M7c: a Reasoning:-prefixed partial never reaches the wire", async () => {
+    // Some providers emit the model's reasoning as ordinary partial text under a
+    // "Reasoning:\n" prefix — the tag strippers leave it untouched (measured),
+    // so the prefix is the only signal. Core drops those partials
+    // (message-handler.process-CcPQD8zK.js:691) and so must this channel: they
+    // are not the answer, and rendering them leaks reasoning into the bubble.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Reasoning:\nweighing the options" });
+    await h.draft.flush();
+
+    expect(h.frames).toEqual([]);
+    expect(h.draft.snapshotText()).toBe("");
+
+    // The real answer that follows still streams normally.
+    h.draft.pushAnswerText({ text: "The answer is 4." });
+    await h.draft.flush();
+    expect(h.frames.map((frame) => frame.text)).toEqual(["The answer is 4."]);
+  });
+
   it("M8: a late structured boundary after defensive rotation does not rotate twice", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();

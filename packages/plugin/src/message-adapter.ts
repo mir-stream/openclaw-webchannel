@@ -158,6 +158,15 @@ type AssistantDraftLane = {
   /** A provisional id is tentative for the duration of one send transaction. */
   tentativeProvisionalId?: string;
   answerText: string;
+  /**
+   * The last RAW cumulative partial accepted into this lane, before reasoning /
+   * inline-directive stripping. Tag stripping makes the CLEANED text
+   * non-monotonic (an unclosed `<thinking>` shortens it), so cleaned text alone
+   * cannot tell tag noise from a new assistant message — the raw stream can:
+   * a provider appending to the same message always extends it, while a new
+   * message restarts it. Used only by the missed-boundary defense.
+   */
+  lastRawAnswerText: string;
   answerRevision: number;
   tentativeBarrierReservationIds: string[];
   closed: boolean;
@@ -360,6 +369,7 @@ export function createProgressDraftController(params: {
   const newLane = (generation: number): AssistantDraftLane => ({
     generation,
     answerText: "",
+    lastRawAnswerText: "",
     answerRevision: 0,
     tentativeBarrierReservationIds: [],
     closed: false,
@@ -940,26 +950,66 @@ export function createProgressDraftController(params: {
         () => {
           let lane = currentLane();
           if (state.stopped || lane.settled) return;
+          // A delta extends the RAW stream, not the displayed text: composing on
+          // the cleaned text would fold stripped tag fragments back into the
+          // accumulator. They are identical until something is actually
+          // stripped, so this only differs on the path the guards below exist
+          // for.
+          const deltaBase = lane.lastRawAnswerText || lane.answerText;
           const raw =
             typeof update.text === "string" && update.text.length > 0
               ? update.text
               : typeof update.delta === "string" && update.delta.length > 0
-                ? lane.answerText + update.delta
+                ? deltaBase + update.delta
                 : undefined;
           if (raw === undefined) return;
+          // Mirror core's own partial hygiene exactly (verified:
+          // dist/message-handler.process-CcPQD8zK.js:685-698): strip reasoning +
+          // inline-directive tags, drop a "Reasoning:\n"-prefixed partial, skip
+          // an identical text, and ignore a SHRINKING cumulative text (a shorter
+          // prefix of the current one) to avoid backwards flicker. Restored from
+          // `develop` — the lane rewrite (34da088) dropped the first and third
+          // of those while keeping the strip itself.
           const cleaned = stripInlineDirectiveTagsForDelivery(
             stripReasoningTagsFromText(raw, { mode: "strict", trim: "both" }),
           ).text;
-          if (!cleaned || cleaned === lane.answerText) return;
+          if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
+          if (cleaned === lane.answerText) {
+            lane.lastRawAnswerText = raw;
+            return;
+          }
+          // SHRINK. Mid-stream an unclosed `<thinking>` strips away text the
+          // lane has already shown, so the cleaned cumulative text goes
+          // BACKWARDS ("Hi <thi" → "Hi"). Rendering that would flicker, and —
+          // under the lane model, unlike core's single-draft path — the next
+          // partial would then look like a diverged message and rotate the lane,
+          // splitting one answer across two bubbles. An explicit `replace`
+          // update is authoritative and is never treated as a shrink.
+          if (
+            update.replace !== true &&
+            lane.answerText.length > 0 &&
+            lane.answerText.startsWith(cleaned) &&
+            cleaned.length < lane.answerText.length
+          ) {
+            lane.lastRawAnswerText = raw;
+            return;
+          }
 
           // This is the sole content-prefix check in the answer state machine.
           // It is a fail-safe for a missing structured boundary, not an attempt
           // to correlate callback bodies or final payloads. Explicit replace
           // updates stay in the same lane even when their text diverges.
+          //
+          // The RAW stream is what decides. Cleaned text diverges whenever a tag
+          // closes mid-stream ("Hi <thi" → "Hi  there") even though the provider
+          // is still appending to the SAME message; rotating there would split
+          // one answer into two bubbles. A real missed boundary restarts the
+          // cumulative text, so the raw text stops extending too.
           if (
             update.replace !== true &&
             lane.answerText.length > 0 &&
-            !cleaned.startsWith(lane.answerText)
+            !cleaned.startsWith(lane.answerText) &&
+            !raw.startsWith(lane.lastRawAnswerText)
           ) {
             warn(
               `contract violation: cumulative partial diverged without an assistant-message ` +
@@ -971,6 +1021,7 @@ export function createProgressDraftController(params: {
           }
 
           lane.answerText = cleaned;
+          lane.lastRawAnswerText = raw;
           lane.answerRevision += 1;
           if (lane.resolution === "empty" || lane.resolution === "unresolved") {
             lane.resolution = "open";

@@ -928,7 +928,15 @@ describe("webchannel inbound round-trip", () => {
     expect(finalizeSpy).toHaveBeenCalledWith("web-anon", progId, "hi back", expect.any(String));
   });
 
-  it("preserves a prior lane when an unmarked cumulative partial shrinks", async () => {
+  // RESTORED BEHAVIOUR (#94). This test used to assert the opposite — that a
+  // shorter cumulative payload is a "contract divergence" that rotates the lane
+  // and yields two bubbles. That expectation was written against 34da088, which
+  // dropped `develop`'s shrink guard; it pinned the regression in place rather
+  // than catching it. Core's own partial hygiene ignores a shrinking cumulative
+  // text (message-handler.process-CcPQD8zK.js:697), because mid-stream tag
+  // stripping makes the cleaned text go backwards while the message is still
+  // being appended to. One answer, one bubble.
+  it("ignores a shrinking cumulative partial instead of splitting the answer", async () => {
     const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
@@ -937,8 +945,8 @@ describe("webchannel inbound round-trip", () => {
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     const { api } = makeFakeApi(captured, {
       channelConfig: { streaming: { mode: "partial" } },
-      // Without `replace:true`, a shorter cumulative payload is a contract
-      // divergence and takes the controller's defensive rotation path.
+      // A shorter cumulative payload is backwards movement in ONE message, not
+      // a new message.
       partialTexts: ["Hello world", "Hello"],
       finalPayloads: [{ text: "Hello final" }],
     });
@@ -952,12 +960,10 @@ describe("webchannel inbound round-trip", () => {
 
     expect(progressSpy).toHaveBeenCalled();
     expect(progressSpy.mock.calls[0]![2]).toBe("Hello world");
-    expect(finalizeSpy.mock.calls.map((call) => call[2])).toEqual([
-      "Hello world",
-      "Hello final",
-    ]);
-    expect(finalizeSpy.mock.calls[0]![1]).not.toBe(finalizeSpy.mock.calls[1]![1]);
-    expect(warn).toHaveBeenCalledWith(
+    // The shrink never reaches the wire, and never splits the answer.
+    expect(progressSpy.mock.calls.map((call) => call[2])).not.toContain("Hello");
+    expect(finalizeSpy.mock.calls.map((call) => call[2])).toEqual(["Hello final"]);
+    expect(warn).not.toHaveBeenCalledWith(
       expect.stringContaining("contract violation: cumulative partial diverged"),
     );
   });
