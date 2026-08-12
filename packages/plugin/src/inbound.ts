@@ -66,6 +66,46 @@ export type FinalReconciliationState = {
 };
 
 /**
+ * The delivery seam's info object, taken from core's own adapter type rather
+ * than restated here — `ChannelDeliveryInfo` (dist/plugin-sdk/
+ * types-B70zVumi.d.ts:5974) is declared in a shared chunk that no plugin-sdk
+ * entrypoint re-exports by name, so it can only be reached structurally.
+ */
+type ChannelInboundRun = OpenClawPluginApi["runtime"]["channel"]["inbound"]["run"];
+type ResolvedChannelTurn = Awaited<
+  ReturnType<Parameters<ChannelInboundRun>[0]["adapter"]["resolveTurn"]>
+>;
+type ChannelDeliveryInfo = Parameters<
+  Extract<ResolvedChannelTurn, { delivery: unknown }>["delivery"]["deliver"]
+>[1];
+
+/**
+ * #111: read the assistant-message identity core attached to THIS delivery.
+ *
+ * Core hands the channel adapter the reply dispatcher's own
+ * `ReplyDispatchRuntimeInfo` verbatim — `preparePayload(payload, info)` at
+ * kernel-BROH42tr.js:696 and `params.delivery.deliver(preparedPayload, info)` at
+ * :721, with `info` built by `buildReplyDispatchRuntimeInfo`
+ * (reply-dispatcher.types-CVYQHGPk.js:12-18, which copies
+ * `getReplyPayloadMetadata(payload)?.assistantMessageIndex` when it is set).
+ * The PUBLIC `ChannelDeliveryInfo` narrows that object to `{ kind }`, so the
+ * field is invisible to the type system while being present at runtime —
+ * measured at 2026.6.10 on indexed block and final payloads, and ABSENT on a
+ * terminal error final (`{"kind":"final"}` with no index at all).
+ *
+ * Read defensively for exactly that reason: an absent, non-numeric, negative or
+ * non-integral value is treated as "core told us nothing", and every caller
+ * then behaves exactly as it did before this existed. No cast of the whole info
+ * object, no import of anything internal, no throw, no logging — a missing
+ * identity is an ordinary, expected shape, not an anomaly.
+ */
+function deliveryAssistantMessageIndex(info: ChannelDeliveryInfo): number | undefined {
+  const value = (info as { assistantMessageIndex?: unknown }).assistantMessageIndex;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return undefined;
+  return value;
+}
+
+/**
  * Route one draft-mode final without consuming a lane more than once.
  *
  * Notice classification is the only guard here that the downstream lane state
@@ -73,12 +113,21 @@ export type FinalReconciliationState = {
  * final reconciliation. The error and prior-final predicates are retained as
  * defence-in-depth at this seam so every identity-less final after either
  * condition remains independent even if controller state changes later.
+ *
+ * #111: `assistantMessageIndex` (when core supplied one) relaxes exactly ONE of
+ * those predicates. `ordinaryAnswerFinalSeen` is a fallback for finals we cannot
+ * tell apart — with an identity in hand a later final is not "uncorrelated", it
+ * belongs to a specific assistant message, and the controller can settle that
+ * message's lane instead of appending a second bubble. The other predicates are
+ * about delivery CLASS, not identity: a notice, an error, or anything after a
+ * leading terminal error stays independent no matter what index it carries.
  */
 export async function deliverDraftFinalPayload(
   draft: ProgressDraftController,
   payload: ReplyPayload,
   text: string,
   state: FinalReconciliationState,
+  assistantMessageIndex?: number,
 ): Promise<{ sent: boolean; independent: boolean }> {
   const isMarkedNonTerminalWarning =
     payload.isError === true && isReplyPayloadNonTerminalToolErrorWarning(payload);
@@ -92,12 +141,22 @@ export async function deliverDraftFinalPayload(
     draft.noteLeadingTerminalError();
   }
 
-  const independent =
+  const independentByClass =
     isCoreNoticePayload(payload) ||
     payload.isError === true ||
-    state.leadingTerminalErrorSeen ||
-    state.ordinaryAnswerFinalSeen;
+    state.leadingTerminalErrorSeen;
+  const independent = independentByClass || state.ordinaryAnswerFinalSeen;
   if (!independent) state.ordinaryAnswerFinalSeen = true;
+  if (independent && !independentByClass && assistantMessageIndex !== undefined) {
+    // An ordinary answer final that core attributed to a specific assistant
+    // message. The controller settles that message's lane when the binding is
+    // unambiguous and falls back to independent delivery itself otherwise, so
+    // an unbindable index costs nothing. `independent` keeps reporting this
+    // seam's CLASSIFICATION — the controller's internal fallback is not visible
+    // from here, and no caller reads the flag for anything else.
+    const sent = await draft.deliverAttributedFinal({ text, assistantMessageIndex });
+    return { sent, independent };
+  }
   const sent = independent
     ? await draft.deliverIndependentFinal({ text, ...noticeFlagsOf(payload) })
     : await draft.finalize(text);
@@ -735,9 +794,22 @@ export async function handleInboundMessage(
                 // message's fate, not answer delivery). The dropped answer text is
                 // recovered by the register-time history snapshot (recovery lanes
                 // §5 L3/L6), never by faking the turn outcome.
+
+                // #111: the identity core attached to THIS payload, when it
+                // attached one. An error payload is deliberately excluded from
+                // attribution on both seams below — like a notice, its delivery
+                // class keeps it independent of every assistant lane, and that
+                // classification is not something an identity may override.
+                const attributableIndex =
+                  payload.isError === true || isNotice
+                    ? undefined
+                    : deliveryAssistantMessageIndex(info);
                 if (draft && kind === "block") {
                   const sent = await draft.deliverAuthorizedBlock({
                     text,
+                    ...(attributableIndex !== undefined
+                      ? { assistantMessageIndex: attributableIndex }
+                      : {}),
                     ...noticeFlags,
                   });
                   return { visibleReplySent: sent };
@@ -748,6 +820,7 @@ export async function handleInboundMessage(
                     payload,
                     text,
                     finalReconciliation,
+                    attributableIndex,
                   );
                   if (sent) finalReplyDelivered = true;
                   return { visibleReplySent: sent };

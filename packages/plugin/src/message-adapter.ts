@@ -153,6 +153,15 @@ type DeliveryFailureKind = "false" | "throw";
 
 type AssistantDraftLane = {
   generation: number;
+  /**
+   * #111: the assistant-message identity core attributed to this lane, learned
+   * from an indexed queued-block observation while this lane was the open one.
+   * Set at most once; a second, different index against the same open lane
+   * poisons the lane instead (see `bindAssistantMessageIndexToLane`).
+   */
+  boundAssistantMessageIndex?: number;
+  /** Once true this lane can never be bound to an index again. */
+  assistantMessageIndexAmbiguous?: boolean;
   /** Assigned only after a successful first wire frame for this lane. */
   id?: string;
   /** A provisional id is tentative for the duration of one send transaction. */
@@ -223,6 +232,14 @@ type PendingProgressFrame =
 type ProgressDraftState = {
   provisionalPreview: ProvisionalPreview;
   lanes: AssistantDraftLane[];
+  /**
+   * #111: `assistantMessageIndex` → the generation of the lane that owns it.
+   * The ONLY key here is the index value core itself supplied; nothing in this
+   * map is derived from payload text, arrival order, or candidate counts.
+   */
+  assistantMessageIndexLanes: Map<number, number>;
+  /** Index values whose ownership was contradicted; never attributed again. */
+  ambiguousAssistantMessageIndexes: Set<number>;
   blockReservations: TentativeBlockReservation[];
   noticeTokens: TentativeNoticeToken[];
   blockDispositions: AuthorizedBlockDisposition[];
@@ -300,12 +317,28 @@ export type ProgressDraftController = {
     isFallbackNotice?: boolean;
     isCompactionNotice?: boolean;
   }): void;
-  /** Deliver an authorized block independently from every assistant lane. */
+  /**
+   * Deliver an authorized block. It settles the assistant lane bound to
+   * `assistantMessageIndex` when core supplied one and the binding is
+   * unambiguous (#111); otherwise — and always for notices — it is delivered
+   * independently from every assistant lane, exactly as before.
+   */
   deliverAuthorizedBlock(input: {
     text: string;
+    /** The identity core attached to this delivery, when it supplied one. */
+    assistantMessageIndex?: number;
     isStatusNotice?: boolean;
     isFallbackNotice?: boolean;
     isCompactionNotice?: boolean;
+  }): Promise<boolean>;
+  /**
+   * Settle the assistant lane bound to `assistantMessageIndex` with a terminal
+   * payload, falling back to independent delivery when nothing unambiguous is
+   * bound. Callers must classify first: notices and errors never reach here.
+   */
+  deliverAttributedFinal(input: {
+    text: string;
+    assistantMessageIndex: number;
   }): Promise<boolean>;
   /** Retire unambiguous callback lifecycle state without selecting an owner. */
   noteDeliveryLifecycle(
@@ -381,6 +414,8 @@ export function createProgressDraftController(params: {
       claim: { state: "unclaimed" },
     },
     lanes: [newLane(0)],
+    assistantMessageIndexLanes: new Map<number, number>(),
+    ambiguousAssistantMessageIndexes: new Set<number>(),
     blockReservations: [],
     noticeTokens: [],
     blockDispositions: [],
@@ -736,6 +771,123 @@ export function createProgressDraftController(params: {
     }
   };
 
+  /**
+   * #111 — bind one assistant-message identity to the lane that owns it.
+   *
+   * A lane carries no identity of its own: `onAssistantMessageStart` takes no
+   * arguments (dist/plugin-sdk/types-DNy-f8Hr.d.ts:247) and `onPartialReply`
+   * carries no index either, so the ONLY place core names the assistant message
+   * a lane is streaming is the queued-block callback, whose context index is
+   * read off the very same payload metadata the later delivery info is built
+   * from (`getReplyPayloadMetadata(payload)?.assistantMessageIndex` —
+   * dispatch-B2e1grFo.js:1868 for the callback,
+   * reply-dispatcher.types-CVYQHGPk.js:13 for the delivery). Same source, same
+   * value: an index observed here identifies the same assistant message the
+   * delivery seam will later name.
+   *
+   * MEASURED interleaving (real gateway, real agent loop, pinned 2026.6.10,
+   * blockStreamingDefault "on", two assistant messages in one turn):
+   *   assistantMessageStart · partials(A) · queued(idx=1) · deliver(block,1) ·
+   *   settled(1) · assistantMessageStart · partials(B) · queued(idx=2) ·
+   *   deliver(block,2) · settled(2)
+   * so each queued observation lands while its own lane is still the open one.
+   * Note the index is 1-BASED against 0-based lane generations in that run —
+   * this binding never assumes any base, it records whatever pairing core's own
+   * callback order produced.
+   *
+   * WHAT THIS REFUSES TO DO: core's block pipeline may coalesce and flush a
+   * block later than the message that produced it
+   * (block-reply-pipeline-CsIUOKQ6.js:299-305 flushes a buffered block when a
+   * DIFFERENT index arrives), so a queued observation is not guaranteed to be
+   * on time. Two distinct indexes observed against ONE open lane is exactly
+   * what that skew looks like, and it poisons both indexes rather than guessing
+   * — the payloads then take the pre-#111 independent path (a duplicate bubble,
+   * never a misattributed one). The residual it cannot see: a single skewed
+   * observation whose own lane never produces an index of its own. Preserving
+   * "never misattribute" outranks removing the duplicate, but that case is
+   * silent, so keep it in mind when this code is next touched.
+   */
+  const bindAssistantMessageIndexToLane = (
+    assistantMessageIndex: number,
+    lane: AssistantDraftLane,
+  ): void => {
+    // Terminal drain closes the epoch for every other piece of tentative state,
+    // and identity is no different. Defence-in-depth rather than load-bearing:
+    // no delivery reaches this controller after its turn's drain, and drain
+    // leaves every text-bearing lane settled — which the next guard refuses on
+    // its own. It is kept so the two epochs cannot drift apart later.
+    if (!state.lateReservationEpochOpen) return;
+    // Only the OPEN lane core is currently streaming into can be claimed. A
+    // closed or settled lane is history; binding it would let a late callback
+    // rewrite a bubble the user has already seen finalize.
+    if (lane.closed || lane.settled || lane.assistantMessageIndexAmbiguous) return;
+    if (state.ambiguousAssistantMessageIndexes.has(assistantMessageIndex)) return;
+
+    const boundGeneration = state.assistantMessageIndexLanes.get(assistantMessageIndex);
+    // Core emits one queued callback per block, and a message can produce
+    // several blocks — repeat observations of the same pairing are the norm.
+    if (boundGeneration === lane.generation) return;
+    if (boundGeneration !== undefined) {
+      poisonAssistantMessageIndex(assistantMessageIndex);
+      return;
+    }
+    if (lane.boundAssistantMessageIndex !== undefined) {
+      poisonAssistantMessageIndex(lane.boundAssistantMessageIndex);
+      poisonAssistantMessageIndex(assistantMessageIndex);
+      lane.assistantMessageIndexAmbiguous = true;
+      return;
+    }
+    state.assistantMessageIndexLanes.set(assistantMessageIndex, lane.generation);
+    lane.boundAssistantMessageIndex = assistantMessageIndex;
+  };
+
+  function poisonAssistantMessageIndex(assistantMessageIndex: number): void {
+    state.ambiguousAssistantMessageIndexes.add(assistantMessageIndex);
+    const generation = state.assistantMessageIndexLanes.get(assistantMessageIndex);
+    state.assistantMessageIndexLanes.delete(assistantMessageIndex);
+    if (generation === undefined) return;
+    const lane = state.lanes[generation];
+    if (lane?.boundAssistantMessageIndex === assistantMessageIndex) {
+      lane.boundAssistantMessageIndex = undefined;
+      lane.assistantMessageIndexAmbiguous = true;
+    }
+  }
+
+  /**
+   * #111 — settle the lane that owns `assistantMessageIndex` with an authorized
+   * payload core attributed to that same assistant message.
+   *
+   * Returns `"unattributed"` when nothing unambiguous is bound, which leaves the
+   * caller on its pre-#111 routing byte for byte. Attribution is refused for a
+   * lane that already settled (its bubble is final) and for a lane whose
+   * predecessors are still unresolved (settling it now would put this bubble
+   * ahead of an earlier assistant message that has not materialized yet).
+   */
+  const settleBoundAssistantMessageLane = (
+    assistantMessageIndex: number,
+    text: string,
+  ): boolean | "unattributed" => {
+    if (!text) return "unattributed";
+    if (state.ambiguousAssistantMessageIndexes.has(assistantMessageIndex)) return "unattributed";
+    const generation = state.assistantMessageIndexLanes.get(assistantMessageIndex);
+    if (generation === undefined) return "unattributed";
+    const lane = state.lanes[generation];
+    if (!lane || lane.assistantMessageIndexAmbiguous) return "unattributed";
+    if (lane.settled || lane.settleResult || lane.settleOutcome !== undefined) {
+      return "unattributed";
+    }
+    if (!predecessorsResolved(lane)) return "unattributed";
+
+    lane.answerText = text;
+    lane.answerRevision += 1;
+    discardPendingProgress(
+      (frame) => frame.kind === "lane" && frame.generation === lane.generation,
+    );
+    const sent = settleLane(lane, text);
+    releaseReadyLanes({ emitCurrentProgress: false });
+    return sent;
+  };
+
   const assistantMessageIndexMatchesLane = (
     assistantMessageIndex: number,
     lane: AssistantDraftLane,
@@ -745,6 +897,12 @@ export function createProgressDraftController(params: {
     // ordering barrier. With a 1-based producer the reservation can attach to
     // the following lane and withhold a later partial until terminal drain;
     // that turn-bounded delay is safer than guessing an owner or index base.
+    //
+    // #111: this is NOT the ownership question. Nothing here may select the
+    // lane an authorized payload settles — that is
+    // `settleBoundAssistantMessageLane`, which reads the base-agnostic binding
+    // recorded by `bindAssistantMessageIndexToLane`. This predicate stays a
+    // conservative ordering heuristic whose worst case is a delay.
     return assistantMessageIndex === lane.generation;
   };
 
@@ -1018,6 +1176,14 @@ export function createProgressDraftController(params: {
             state: state.lateReservationEpochOpen ? "pending" : "retired",
           };
           state.blockReservations.push(reservation);
+          // #111: core has just named the assistant message it is queuing a
+          // block for, while that message's lane is still the open one. Record
+          // the pairing BEFORE the barrier bookkeeping below — the two answer
+          // different questions (identity vs ordering) and the barrier
+          // heuristic must never feed the identity map.
+          if (input.assistantMessageIndex !== undefined) {
+            bindAssistantMessageIndexToLane(input.assistantMessageIndex, currentLane());
+          }
           if (reservation.state === "retired") return;
 
           let barrierLane: AssistantDraftLane | undefined;
@@ -1051,10 +1217,39 @@ export function createProgressDraftController(params: {
     deliverAuthorizedBlock: (input) =>
       enqueue(
         "authorized block delivery",
-        // A block-kind notice is authoritative visible output, but it owns no
-        // tentative block reservation. Recording a disposition for it would
-        // let its later settled event retire an unrelated real-block barrier.
-        () => sendIndependent(input.text, !isNotice(input)),
+        () => {
+          const notice = isNotice(input);
+          // #111: a block core attributed to an assistant message settles that
+          // message's lane instead of minting a second bubble for text the lane
+          // already streamed. Notices are core's own chatter and never own an
+          // assistant lane, so they keep the independent path regardless of the
+          // index they carry. Everything without an unambiguous binding falls
+          // through to the pre-#111 behaviour below, unchanged.
+          if (!notice && input.assistantMessageIndex !== undefined) {
+            const attributed = settleBoundAssistantMessageLane(
+              input.assistantMessageIndex,
+              input.text,
+            );
+            if (attributed !== "unattributed") return attributed;
+          }
+          // A block-kind notice is authoritative visible output, but it owns no
+          // tentative block reservation. Recording a disposition for it would
+          // let its later settled event retire an unrelated real-block barrier.
+          return sendIndependent(input.text, !notice);
+        },
+        false,
+      ),
+    deliverAttributedFinal: (input) =>
+      enqueue(
+        "attributed final delivery",
+        () => {
+          const attributed = settleBoundAssistantMessageLane(
+            input.assistantMessageIndex,
+            input.text,
+          );
+          if (attributed !== "unattributed") return attributed;
+          return deliverTerminalIndependent(input.text);
+        },
         false,
       ),
     noteDeliveryLifecycle: (kind, input) => {

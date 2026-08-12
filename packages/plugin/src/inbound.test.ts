@@ -62,6 +62,19 @@ type AssembledTurnLike = {
     onItemEvent?: (p: unknown) => void;
     onPartialReply?: (p: { text?: string }) => void;
     onAssistantMessageStart?: () => void;
+    /**
+     * #111: the queued-block callback is where core names the assistant message
+     * a lane is streaming — the seam's only source of lane↔index identity.
+     */
+    onBlockReplyQueued?: (
+      payload: {
+        text?: string;
+        isStatusNotice?: boolean;
+        isFallbackNotice?: boolean;
+        isCompactionNotice?: boolean;
+      },
+      context?: { assistantMessageIndex?: number },
+    ) => void;
   };
   delivery: {
     deliver: (
@@ -72,7 +85,12 @@ type AssembledTurnLike = {
         isFallbackNotice?: boolean;
         isCompactionNotice?: boolean;
       },
-      info?: { kind?: string },
+      /**
+       * #111: `assistantMessageIndex` is NOT part of the public
+       * `ChannelDeliveryInfo`, but core passes the dispatcher's own runtime
+       * info here verbatim, so the seam does receive it at runtime.
+       */
+      info?: { kind?: string; assistantMessageIndex?: number },
     ) => Promise<{ visibleReplySent: boolean }>;
   };
 };
@@ -373,17 +391,180 @@ describe("handleInboundMessage — terminal draft drain", () => {
   });
 });
 
+/**
+ * #111 — CORE CONTRACT PIN: the assistant-message identity at the delivery seam.
+ *
+ * The whole routing fix rests on one fact that the PUBLIC type system denies:
+ * `ChannelDeliveryInfo` declares only `{ kind }` (dist/plugin-sdk/
+ * types-B70zVumi.d.ts:5974), yet core hands the channel adapter the reply
+ * dispatcher's own `ReplyDispatchRuntimeInfo` VERBATIM —
+ * `preparePayload(payload, info)` (kernel-BROH42tr.js:696) and
+ * `params.delivery.deliver(preparedPayload, info)` (:721), with `info` built by
+ * `buildReplyDispatchRuntimeInfo` (reply-dispatcher.types-CVYQHGPk.js:12-18).
+ * So `assistantMessageIndex` is there at runtime, and losing it silently reverts
+ * this channel to one duplicated bubble per block-streamed assistant message.
+ *
+ * This test pins the two halves CI can check without a gateway:
+ *   1. core still DECLARES the field on the dispatcher runtime info it hands
+ *      this plugin. The pinned literal below is checked by `tsc`, so a core bump
+ *      that drops the field fails `npm run typecheck` with
+ *      "Object literal may only specify known properties, and
+ *       'assistantMessageIndex' does not exist in type ..." — pointing here.
+ *   2. the delivery seam READS it: an indexed block settles the lane that
+ *      streamed that assistant message instead of minting a second bubble.
+ *
+ * What it deliberately cannot check: that core still POPULATES the field at
+ * runtime (a mock can always supply it). That is `e2e/local/run-block-streaming.sh`,
+ * which drives a real gateway with `blockStreamingDefault:"on"` and fails on the
+ * 4-bubble shape the moment attribution stops happening.
+ */
+describe("#111 delivery identity contract — assistantMessageIndex reaches the delivery seam", () => {
+  type ChannelInboundRun = OpenClawPluginApi["runtime"]["channel"]["inbound"]["run"];
+  type ResolvedChannelTurn = Awaited<
+    ReturnType<Parameters<ChannelInboundRun>[0]["adapter"]["resolveTurn"]>
+  >;
+  type AssembledTurn = Extract<ResolvedChannelTurn, { delivery: unknown }>;
+  type DispatchRuntimeInfo = Parameters<
+    NonNullable<NonNullable<AssembledTurn["dispatcherOptions"]>["onDeliverySettled"]>
+  >[0];
+
+  it("core declares the index on its dispatch runtime info, and an indexed block settles its own lane", async () => {
+    // (1) Compile-time pin. If core stops declaring `assistantMessageIndex`,
+    // THIS LINE stops compiling — the contract changed, and the channel's
+    // block attribution has to be re-verified against the new core.
+    const pinnedRuntimeInfo: DispatchRuntimeInfo = { kind: "block", assistantMessageIndex: 2 };
+    expect(pinnedRuntimeInfo.assistantMessageIndex).toBe(2);
+
+    // (2) Runtime pin at OUR seam: the measured callback order for one
+    // block-streamed assistant message (1-based index, 0-based lane).
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAssistantMessageStart?.();
+        turn.replyOptions?.onPartialReply?.({ text: "ANSWER streaming" });
+        turn.replyOptions?.onBlockReplyQueued?.(
+          { text: "ANSWER complete" },
+          { assistantMessageIndex: 1 },
+        );
+        await turn.delivery.deliver(
+          { text: "ANSWER complete" },
+          { kind: "block", assistantMessageIndex: 1 },
+        );
+      },
+    });
+    const { transport, progress, finalizes } = makeFakeTransport();
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "hello there",
+    });
+
+    expect(progress).toHaveLength(1);
+    expect(finalizes).toEqual([{ id: progress[0]!.id, text: "ANSWER complete" }]);
+  });
+});
+
+/**
+ * #111 — the seam's classification decides WHICH deliveries may be attributed.
+ * An identity never overrides a delivery class: notices and errors are
+ * independent of every assistant lane no matter what index they carry.
+ */
+describe("handleInboundMessage — indexed delivery routing", () => {
+  const driveBlock = async (payload: {
+    text: string;
+    isError?: boolean;
+    isStatusNotice?: boolean;
+  }) => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAssistantMessageStart?.();
+        turn.replyOptions?.onPartialReply?.({ text: "lane text" });
+        turn.replyOptions?.onBlockReplyQueued?.({ text: payload.text }, { assistantMessageIndex: 1 });
+        await turn.delivery.deliver(payload, { kind: "block", assistantMessageIndex: 1 });
+      },
+    });
+    const h = makeFakeTransport();
+    await handleInboundMessage(api, h.transport, "peer-1", {
+      type: "user_message",
+      text: "hello there",
+    });
+    return h;
+  };
+
+  it("attributes an ordinary indexed block to its lane", async () => {
+    const h = await driveBlock({ text: "ordinary block" });
+    expect(h.finalizes).toEqual([{ id: h.progress[0]!.id, text: "ordinary block" }]);
+  });
+
+  it.each([
+    ["an error", { text: "block error", isError: true }],
+    ["a status notice", { text: "block notice", isStatusNotice: true }],
+  ])("keeps %s independent of the lane despite its index", async (_name, payload) => {
+    const h = await driveBlock(payload);
+    const laneId = h.progress[0]!.id;
+    // Two bubbles: the independent payload, then the lane's own text at drain.
+    expect(h.finalizes.map((f) => f.text)).toEqual([payload.text, "lane text"]);
+    expect(h.finalizes[0]!.id).not.toBe(laneId);
+    expect(h.finalizes[1]!.id).toBe(laneId);
+  });
+
+  // The malformed value is used on BOTH callbacks, so it would bind and then
+  // attribute if the reader accepted it (`Map` keys match on SameValueZero, so
+  // even NaN or a string would pair up with itself). Only the reader's
+  // non-negative-safe-integer guard keeps these on the pre-#111 path.
+  it.each([
+    ["negative", -1],
+    ["fractional", 1.5],
+    ["NaN", Number.NaN],
+    ["non-numeric", "1" as unknown as number],
+  ])("ignores a %s index and keeps the pre-#111 independent path", async (_name, malformed) => {
+    const { api } = makeFakeApi({
+      streamingMode: "partial",
+      runImpl: async (turn) => {
+        turn.replyOptions?.onAssistantMessageStart?.();
+        turn.replyOptions?.onPartialReply?.({ text: "lane text" });
+        turn.replyOptions?.onBlockReplyQueued?.(
+          { text: "malformed block" },
+          { assistantMessageIndex: malformed },
+        );
+        await turn.delivery.deliver(
+          { text: "malformed block" },
+          { kind: "block", assistantMessageIndex: malformed },
+        );
+      },
+    });
+    const h = makeFakeTransport();
+    await handleInboundMessage(api, h.transport, "peer-1", {
+      type: "user_message",
+      text: "hello there",
+    });
+
+    expect(h.finalizes.map((f) => f.text)).toEqual(["malformed block", "lane text"]);
+    expect(h.finalizes[0]!.id).not.toBe(h.progress[0]!.id);
+    expect(h.finalizes[1]!.id).toBe(h.progress[0]!.id);
+  });
+});
+
 describe("deliverDraftFinalPayload — independent routing policy", () => {
   const makeDraft = () => {
     const finalize = vi.fn(async () => true);
     const deliverIndependentFinal = vi.fn(async () => true);
+    const deliverAttributedFinal = vi.fn(async () => true);
     const noteLeadingTerminalError = vi.fn();
     const draft = {
       finalize,
       deliverIndependentFinal,
+      deliverAttributedFinal,
       noteLeadingTerminalError,
     } as unknown as ProgressDraftController;
-    return { draft, finalize, deliverIndependentFinal, noteLeadingTerminalError };
+    return {
+      draft,
+      finalize,
+      deliverIndependentFinal,
+      deliverAttributedFinal,
+      noteLeadingTerminalError,
+    };
   };
 
   it.each([
@@ -424,6 +605,80 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
 
     expect(h.deliverIndependentFinal).toHaveBeenCalledOnce();
     expect(h.finalize).not.toHaveBeenCalled();
+    expect(h.deliverAttributedFinal).not.toHaveBeenCalled();
+  });
+
+  // #111: an identity relaxes exactly ONE of those four reasons.
+  it("F1b: an index re-routes only the prior-ordinary-final case to its own lane", async () => {
+    const priorFinal = makeDraft();
+    await expect(
+      deliverDraftFinalPayload(
+        priorFinal.draft,
+        { text: "second answer" },
+        "second answer",
+        { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
+        3,
+      ),
+    ).resolves.toEqual({ sent: true, independent: true });
+    expect(priorFinal.deliverAttributedFinal).toHaveBeenCalledWith({
+      text: "second answer",
+      assistantMessageIndex: 3,
+    });
+    expect(priorFinal.deliverIndependentFinal).not.toHaveBeenCalled();
+    expect(priorFinal.finalize).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      reason: "isNotice",
+      payload: { text: "notice", isFallbackNotice: true },
+      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
+    },
+    {
+      reason: "payload.isError",
+      payload: { text: WARNING_SENTINEL, isError: true },
+      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
+    },
+    {
+      reason: "leadingTerminalErrorSeen",
+      payload: { text: "retained answer" },
+      state: { leadingTerminalErrorSeen: true, ordinaryAnswerFinalSeen: false },
+    },
+  ] satisfies Array<{
+    reason: string;
+    payload: { text: string; isError?: boolean; isFallbackNotice?: boolean };
+    state: FinalReconciliationState;
+  }>)(
+    "F1c: $reason stays independent even with an assistant-message index",
+    async ({ payload, state }) => {
+      const h = makeDraft();
+
+      await expect(
+        deliverDraftFinalPayload(h.draft, payload, payload.text, { ...state }, 3),
+      ).resolves.toEqual({ sent: true, independent: true });
+
+      expect(h.deliverIndependentFinal).toHaveBeenCalledOnce();
+      expect(h.deliverAttributedFinal).not.toHaveBeenCalled();
+      expect(h.finalize).not.toHaveBeenCalled();
+    },
+  );
+
+  it("F1d: the FIRST ordinary final still consumes the current lane, index or not", async () => {
+    const h = makeDraft();
+
+    await expect(
+      deliverDraftFinalPayload(
+        h.draft,
+        { text: "the answer" },
+        "the answer",
+        { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
+        3,
+      ),
+    ).resolves.toEqual({ sent: true, independent: false });
+
+    expect(h.finalize).toHaveBeenCalledOnce();
+    expect(h.deliverAttributedFinal).not.toHaveBeenCalled();
+    expect(h.deliverIndependentFinal).not.toHaveBeenCalled();
   });
 
   it("F7: a first terminal error records the adapter reconciliation guard", async () => {

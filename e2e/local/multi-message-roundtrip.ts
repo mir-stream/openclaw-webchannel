@@ -1,5 +1,9 @@
-// Driver for the #94 multi-assistant-message E2E — does a turn that produced TWO
-// assistant messages settle as TWO DISTINCT bubbles on the wire?
+// Driver for the #94/#111 multi-assistant-message E2E — does a turn that produced
+// TWO assistant messages settle as EXACTLY TWO DISTINCT bubbles on the wire?
+//
+// Two harnesses share this driver: run-multi-message.sh (block streaming off)
+// and run-block-streaming.sh (`agents.defaults.blockStreamingDefault:"on"`).
+// Same assertions, two different core dispatch shapes.
 //
 // WHAT THIS GUARDS: in `streaming.mode:"partial"` the channel used to mint ONE
 // draft id per TURN and accumulate every assistant message into it. The turn's
@@ -7,6 +11,14 @@
 // earlier assistant text the user had already watched stream was erased from the
 // live view (the transcript kept it; the live path lost it). The fix gives each
 // assistant message its own lane, its own wire id and its own terminal frame.
+//
+// AND (#111) THE OTHER DIRECTION: too MANY bubbles is the same defect wearing the
+// opposite mask. With block streaming on, core delivers each completed assistant
+// message a second time as a `kind:"block"` payload carrying that message's
+// `assistantMessageIndex`; routing every block to a fresh id settled the same
+// answer twice (4 bubbles for a 2-message turn). The bar here is therefore
+// EQUALITY — one settled bubble, at one distinct id, per assistant message — not
+// the `>= 2` this file originally shipped with, which the 4-bubble shape passed.
 //
 // WHY A LIVE HARNESS: both review rounds on the fix caught defects that were unit
 // fixtures encoding an ordering core does not actually produce, and the fix's
@@ -274,22 +286,61 @@ dumpFrames();
 const agentMessages = turnFrames.filter((f) => f.type === "agent_message");
 const settled = turnFrames.find((f) => f.type === "turn_settled");
 
-// (1) THE #94 ASSERTION: at least two agent_message frames with DISTINCT ids.
+// The turn's utterances, in model order. This is the yardstick for BOTH halves
+// of the assertion below: one bubble per utterance, no more and no less.
+const UTTERANCES = [TEXT_A, TEXT_B];
+
+// (1) THE #94/#111 ASSERTION: EXACTLY one settled bubble per assistant message.
+//
+// `>= 2` was the original #94 bar and it is not enough. #111: with block
+// streaming on, core dispatches each completed assistant message a SECOND time
+// as a `kind:"block"` delivery, and a channel that routes every block to a fresh
+// wire id settles the same answer twice — 4 bubbles for a 2-message turn, each
+// text duplicated. That shape satisfies "at least two distinct ids" and would
+// sail through the old bar. Count equality is what catches it: the number of
+// settled bubbles, and the number of distinct ids they carry, must both equal
+// the number of assistant messages the model actually produced.
 const ids = agentMessages.map((f) => f.id ?? "");
 const distinctIds = new Set(ids.filter((x) => x.length > 0));
-if (agentMessages.length < 2) {
+if (agentMessages.length < UTTERANCES.length) {
   fail(
     6,
-    `#94 REGRESSION: the turn produced ${agentMessages.length} agent_message frame(s), expected >= 2. ` +
-      `Two assistant messages were flattened into one bubble; the earlier one was erased from the live view.`,
+    `#94 REGRESSION: the turn produced ${agentMessages.length} agent_message frame(s), expected ` +
+      `${UTTERANCES.length}. Two assistant messages were flattened into one bubble; the earlier ` +
+      `one was erased from the live view.`,
   );
 }
-if (distinctIds.size < 2) {
+if (agentMessages.length > UTTERANCES.length) {
+  fail(
+    6,
+    `#111 REGRESSION: the turn produced ${agentMessages.length} settled agent_message frame(s) for ` +
+      `${UTTERANCES.length} assistant message(s) — ${JSON.stringify(
+        agentMessages.map((f) => ({ id: f.id, text: f.text })),
+      )}. Every payload core attributes to one assistant message must land in ONE bubble; an ` +
+      `extra bubble means a block delivery was routed independently of the lane that already ` +
+      `streamed the same text.`,
+  );
+}
+if (distinctIds.size !== UTTERANCES.length) {
   fail(
     6,
     `#94 REGRESSION: ${agentMessages.length} agent_message frames carried ${distinctIds.size} distinct id(s) ` +
-      `(${JSON.stringify(ids)}). Each completed assistant message must settle at its OWN wire id.`,
+      `(${JSON.stringify(ids)}), expected ${UTTERANCES.length}. Each completed assistant message must ` +
+      `settle at its OWN wire id, exactly once.`,
   );
+}
+// Count equality alone could still be satisfied by two bubbles of the SAME text
+// (a duplicate plus a lost message), so pin each utterance to exactly one.
+for (const utterance of UTTERANCES) {
+  const carriers = agentMessages.filter((f) => (f.text ?? "").includes(utterance));
+  if (carriers.length !== 1) {
+    fail(
+      6,
+      `#111 REGRESSION: ${carriers.length} settled bubble(s) carry ${JSON.stringify(utterance)}, ` +
+        `expected exactly 1 (ids=${JSON.stringify(carriers.map((f) => f.id))}). The same assistant ` +
+        `message reached the user more than once, or not at all.`,
+    );
+  }
 }
 
 // (2) Message A's text must be PRESENT and must not have been erased or replaced
@@ -349,9 +400,10 @@ if (settled.outcome !== "ok") {
 }
 
 console.log(
-  `[PROOF] #94: one turn produced ${agentMessages.length} settled assistant bubbles at ` +
-    `${distinctIds.size} distinct ids (A=${aFrame.id}, B=${bFrame.id}), in model order, ` +
-    `with message A intact; turn_settled outcome=ok`,
+  `[PROOF] #94/#111: one turn produced ${UTTERANCES.length} assistant messages and exactly ` +
+    `${agentMessages.length} settled assistant bubbles at ${distinctIds.size} distinct ids ` +
+    `(A=${aFrame.id}, B=${bFrame.id}) — one per message, in model order, with message A intact; ` +
+    `turn_settled outcome=ok`,
 );
 transport.disconnect();
 process.exit(0);
