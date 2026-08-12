@@ -218,6 +218,11 @@ type TentativeNoticeToken = {
 
 type AuthorizedBlockDisposition = {
   settled: boolean;
+  /**
+   * What the delivered payload WAS. Recorded at the delivery seam, which is the
+   * only place the payload — and therefore its notice flags — is available.
+   */
+  kind: "block" | "notice";
 };
 
 type FinalReconciliationState = {
@@ -571,7 +576,7 @@ export function createProgressDraftController(params: {
     return false;
   };
 
-  const sendIndependent = (text: string, recordBlockDisposition = false): boolean => {
+  const sendIndependent = (text: string): boolean => {
     if (!text) {
       warn("independent delivery skipped empty text without a transport attempt");
       return false;
@@ -579,9 +584,6 @@ export function createProgressDraftController(params: {
     const sequence = ++state.nextDeliverySequence;
     const owner: ProvisionalClaimOwner = { kind: "independent", deliverySequence: sequence };
     const reservation = reserveProvisional(owner);
-    if (recordBlockDisposition) {
-      state.blockDispositions.push({ settled: false });
-    }
     let sent = false;
     let failure: DeliveryFailureKind | undefined;
     try {
@@ -896,9 +898,20 @@ export function createProgressDraftController(params: {
     // path below (the open-throttle path discards the pending frame outright).
     // Answer text outranks the scaffold, so the scaffold yields.
     //
-    // Dropping it costs nothing: `attemptProgress` re-checks
-    // `preview.revision !== frame.revision`, so a superseded scaffold revision
-    // could never have been sent anyway.
+    // The dropped frame is NOT free and the earlier claim that it was — that
+    // `attemptProgress`'s revision re-check made it a superseded frame — was
+    // wrong: `pushEvent` has just incremented `preview.revision`, so this IS the
+    // current revision and nothing re-queues it. If no further tool event
+    // arrives, that scaffold line never reaches the wire.
+    //
+    // It is safe for a different, verified reason. A lane frame can only be
+    // PENDING when `lastProgressSentAt !== 0`, and that is assigned only by
+    // `attemptProgress` after a SUCCESSFUL send — either of a preview (so
+    // `preview.started` is already true and the P-claim path is preserved) or of
+    // a lane frame (which has already run `invalidateScaffoldWriter`, so no
+    // scaffold was going out anyway). Worst case is therefore a scaffold that is
+    // one line stale on screen, and `settlePreviewIfAlone` still settles with the
+    // newest `preview.text` because `pushEvent` updates the text before queuing.
     //
     // BOUNDED, and worth knowing where: the window shuts permanently once a lane
     // frame actually sends, because `commitReservation` calls
@@ -1087,6 +1100,34 @@ export function createProgressDraftController(params: {
     if (candidates.length !== 1) return;
     const candidate = candidates[0]!;
     if (expectedKind !== undefined && candidate.kind !== expectedKind) return;
+    if (candidate.kind === "block") {
+      retireReservation(candidate.record);
+    } else {
+      candidate.record.state = "retired";
+    }
+  };
+
+  /**
+   * Retire the EARLIEST pending record of `recordKind` at this index.
+   *
+   * Cardinality is deliberately not a condition. One assistant message can emit
+   * several block payloads and core stamps them all with that message's index
+   * (plan §14.4), and a notice can share an index with a real block — so
+   * "exactly one record here" is the uncommon case, and bailing on anything else
+   * left BOTH records pending forever. Every payload gets its own settlement, so
+   * retiring one record per settlement drains them all whatever order they
+   * arrive in, and the block reservation — the only record that is an ordering
+   * barrier — is released last at its index.
+   */
+  const retireOneRecordAtIndex = (
+    assistantMessageIndex: number | undefined,
+    recordKind: OutstandingLifecycleRecord["kind"],
+  ): void => {
+    if (assistantMessageIndex === undefined) return;
+    const candidate = outstandingRecordsAtIndex(assistantMessageIndex).find(
+      (entry) => entry.kind === recordKind,
+    );
+    if (!candidate) return;
     if (candidate.kind === "block") {
       retireReservation(candidate.record);
     } else {
@@ -1358,10 +1399,32 @@ export function createProgressDraftController(params: {
     deliverAuthorizedBlock: (input) =>
       enqueue(
         "authorized block delivery",
-        // A block-kind notice is authoritative visible output, but it owns no
-        // tentative block reservation. Recording a disposition for it would
-        // let its later settled event retire an unrelated real-block barrier.
-        () => sendIndependent(input.text, !isNotice(input)),
+        // A block-kind notice is authoritative visible output and owns no
+        // tentative block reservation. It DOES now record a disposition — an
+        // earlier version of this comment said doing so would let its settled
+        // event retire an unrelated real-block barrier, and that was true only
+        // while dispositions were untyped. Tagging each one with what the
+        // payload was is what makes recording it safe, and is what lets the
+        // settlement seam stop guessing.
+        () => {
+          // THE classification point: this is the only seam that sees the
+          // payload, so this is where "was it a notice?" is answered and
+          // recorded. The settlement seam later consumes these in order rather
+          // than guessing (see `noteDeliveryLifecycle`).
+          //
+          // Recorded BEFORE the empty-text bail on purpose. A media-only or
+          // otherwise text-less block sends nothing, but the dispatcher still
+          // settles it, and a settlement with no disposition to pair against used
+          // to leave that block's reservation pending forever — which, with the
+          // turn-wide release gate, stalled every later message for the rest of
+          // the turn.
+          state.blockDispositions.push({
+            settled: false,
+            kind: isNotice(input) ? "notice" : "block",
+          });
+          if (!input.text) return false;
+          return sendIndependent(input.text);
+        },
         false,
       ),
     noteDeliveryLifecycle: (kind, input) => {
@@ -1375,40 +1438,45 @@ export function createProgressDraftController(params: {
           const classifiedNotice =
             kind === "skip" || kind === "cancel" ? isNotice(input) : false;
           if (kind === "error") {
+            // Retires nothing on purpose: an adapter error says a delivery
+            // failed, not WHICH record it belonged to, and this seam has no
+            // payload to classify. Terminal drain clears whatever is left. Note
+            // the cost is now turn-wide rather than per-lane — a reservation
+            // surviving here keeps the empty-predecessor release gate closed for
+            // the rest of the turn — which is the price of not guessing.
             warn("delivery adapter reported an error; ambiguous reservations await terminal drain");
           } else if (kind === "settled") {
+            // `onDeliverySettled` carries no payload — core hands this seam only
+            // `{kind, assistantMessageIndex}`, and it marks real blocks and
+            // notices alike as `kind:"block"` — so nothing here can classify the
+            // settling payload. Every previous attempt to infer it was a guess
+            // that misfired: "no outstanding disposition ⇒ notice" is false for a
+            // text-less block, and untagged FIFO pairing let a notice consume the
+            // next real block's disposition.
+            //
+            // So the classification is taken from where the payload actually was:
+            // `deliverAuthorizedBlock` records one disposition per authorized
+            // block delivery, tagged with what that payload was. Settlements pair
+            // with deliveries in order, and each retires the earliest pending
+            // record OF THAT KIND at its index.
+            //
+            // That pairing rests on one premise, so state it: core fires
+            // `onDeliverySettled` from the `.finally()` of the SAME promise chain
+            // that awaited `deliver`, and every disposition here is pushed inside
+            // this controller's serialized queue. So dispositions are recorded in
+            // the order deliveries complete, and settlements arrive in that same
+            // order. If a future core dispatches block deliveries concurrently
+            // without awaiting each in turn, this pairing is what breaks first.
+            //
+            // No disposition left means this settlement belongs to a payload this
+            // controller never saw delivered — a callback-free notice is the
+            // reachable case — so it owns no record and retires nothing. That is
+            // what keeps F5 true: a notice settlement can never consume a real
+            // block's ordering reservation.
             const disposition = state.blockDispositions.find((candidate) => !candidate.settled);
             if (disposition) {
               disposition.settled = true;
-              retireSoleLifecycleRecord(input.assistantMessageIndex);
-            } else if (state.blockDispositions.length === 0) {
-              // A block-kind settlement with no disposition history can still
-              // retire its indexed sole callback record. The delivery-kind
-              // gate above is what prevents unrelated tool/final settlements
-              // from taking this fallback.
-              retireSoleLifecycleRecord(input.assistantMessageIndex);
-            } else {
-              // Dispositions exist but none is outstanding, which is the shape a
-              // NOTICE settlement makes: notices are delivered independently and
-              // deliberately record no disposition, so there is nothing for them
-              // to consume. `onDeliverySettled` carries no payload — core hands
-              // it only `{kind, assistantMessageIndex}` — so this seam cannot
-              // classify the settling payload directly; the absent disposition is
-              // the only signal it has.
-              //
-              // Until now this branch did not exist, so once ANY earlier block
-              // had settled a notice's token was never retired: it sat `pending`
-              // beside the next real block at the same index, made that index
-              // ambiguous, and left the real block's ordering reservation holding
-              // its lane until terminal drain. Measured with one notice between
-              // two real blocks, a later message's partials never streamed at all
-              // (M6s; its control without the notice streams).
-              //
-              // `"notice"` is load-bearing, not decoration. Without it this
-              // retires whatever single record sits at the index — including a
-              // REAL block's reservation — which is exactly the misattribution
-              // F5 forbids and which five existing fixtures catch.
-              retireSoleLifecycleRecord(input.assistantMessageIndex, "notice");
+              retireOneRecordAtIndex(input.assistantMessageIndex, disposition.kind);
             }
           } else {
             retireSoleLifecycleRecord(

@@ -465,7 +465,22 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "B"]);
   });
 
-  it("M6h/F3: block and notice records at one index remain ambiguous as a union", async () => {
+  /**
+   * SUPERSEDED EXPECTATION, deliberately rewritten (#94 round 8). This fixture
+   * used to assert that a block and a notice sharing an index stay ambiguous
+   * FOREVER — B was held until terminal drain. That was the old
+   * `retireSoleLifecycleRecord` cardinality bail, and it is the defect this
+   * round removes: two records at one index meant NEITHER ever retired, which
+   * with the turn-wide release gate stalled the whole turn.
+   *
+   * Both halves are still asserted. The CLASSIFIED path (a `skip` carrying the
+   * payload) must still refuse the union — it cannot tell which record the skip
+   * belongs to. What changes is the SETTLEMENT: it is now paired with the real
+   * block delivery it belongs to, so it retires that block's reservation and the
+   * barrier is released as soon as its own block has settled, rather than
+   * waiting for drain because an unrelated notice token shared the index.
+   */
+  it("M6h/F3: a shared index is ambiguous to a skip, but a settlement still releases its own block", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "A" });
@@ -484,10 +499,19 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       deliveryKind: "block",
       assistantMessageIndex: 0,
     });
-    expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "F-A"]);
+    // The skip could not disambiguate the union, so it retired nothing; the real
+    // block's own settlement then released ITS reservation, and B follows in
+    // order — no longer stranded until drain.
+    expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "F-A", "B partial"]);
 
     await h.draft.drain();
-    expect(h.frames.map((frame) => frame.text)).toEqual(["A", "A", "F-A", "B partial"]);
+    expect(h.frames.map((frame) => frame.text)).toEqual([
+      "A",
+      "A",
+      "F-A",
+      "B partial",
+      "B partial",
+    ]);
   });
 
   it("M6h/F4: an indexed skip opens an empty predecessor barrier", async () => {
@@ -843,6 +867,89 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
 
       await vi.advanceTimersByTimeAsync(600);
       expect(h.frames.at(-1)).toMatchObject({ type: "progress", text: "answer text" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * #94 — one assistant message emitting TWO block payloads.
+   *
+   * CROSSES TWO GUARDS: `retireSoleLifecycleRecord`'s cardinality bail and the
+   * turn-wide pending-reservation gate. Core stamps every block payload of a
+   * message with that message's index (plan §14.4), so two blocks means two
+   * records at one index — which the old "exactly one candidate" rule refused to
+   * retire, leaving BOTH pending and, through the gate, stalling the whole turn.
+   * One settlement retires one record, so N records drain in N settlements.
+   */
+  it("M6w: two blocks in one assistant message both retire, and the turn keeps streaming", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushEvent(toolStart());
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 });
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 });
+      await h.draft.deliverAuthorizedBlock({ text: "A block one" });
+      await h.draft.deliverAuthorizedBlock({ text: "A block two" });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 1,
+      });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 1,
+      });
+
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "B streams" });
+      await h.draft.flush();
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(
+        h.frames.filter((frame) => frame.type === "progress").map((frame) => frame.text),
+      ).toContain("B streams");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * #94 — a notice sharing an index with a real block, queued SECOND.
+   *
+   * CROSSES TWO GUARDS: the notice/real classification at the settlement seam
+   * and the same cardinality bail. Order must not matter: each settlement is
+   * paired with the delivery it belongs to, so the notice token and the block
+   * reservation each retire on their own payload's settlement whichever was
+   * queued first.
+   */
+  it("M6x: a notice queued after a real block at one index leaves nothing stuck", async () => {
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushEvent(toolStart());
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 });
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1, isStatusNotice: true });
+      await h.draft.deliverAuthorizedBlock({ text: "real-1" });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 1,
+      });
+      await h.draft.deliverAuthorizedBlock({ text: "notice-1", isStatusNotice: true });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 1,
+      });
+
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "B streams" });
+      await h.draft.flush();
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(
+        h.frames.filter((frame) => frame.type === "progress").map((frame) => frame.text),
+      ).toContain("B streams");
     } finally {
       vi.useRealTimers();
     }
