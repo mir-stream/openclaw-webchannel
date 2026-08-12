@@ -405,19 +405,44 @@ const toolFirstAnswer = toolFirstCarriers[0]!;
 // The live half. A `progress` frame whose text is a PREFIX of the answer is the
 // answer streaming; the tool scaffold ("Working…") is not a prefix of it, so a
 // turn that only ever showed the scaffold fails here.
+//
+// POSITION IS THE ASSERTION, not mere presence. "Streamed" means the user saw
+// the text BEFORE the bubble settled, so a qualifying progress frame has to
+// appear EARLIER IN THE FRAME SEQUENCE than the terminal frame. Filtering alone
+// would also accept a progress frame that arrived after `agent_message`, or even
+// after `turn_settled` — which is not streaming, it is a late scaffold write.
+const answerPosition = toolFirstFrames.indexOf(toolFirstAnswer);
 const toolFirstProgress = toolFirstFrames.filter((f) => f.type === "progress");
-const streamedAnswer = toolFirstProgress.filter(
-  (f) => (f.text ?? "").length > 0 && TOOL_FIRST_TEXT.startsWith(f.text!),
+const streamedAnswer = toolFirstFrames.filter(
+  (f, i) =>
+    f.type === "progress" &&
+    i < answerPosition &&
+    (f.text ?? "").length > 0 &&
+    TOOL_FIRST_TEXT.startsWith(f.text!),
 );
 if (streamedAnswer.length === 0) {
+  const late = toolFirstFrames
+    .map((f, i) => ({ f, i }))
+    .filter(
+      ({ f, i }) =>
+        f.type === "progress" &&
+        i > answerPosition &&
+        (f.text ?? "").length > 0 &&
+        TOOL_FIRST_TEXT.startsWith(f.text!),
+    );
   fail(
     6,
-    `#94 REGRESSION (tool-only first message): the answer never streamed. ` +
-      `${toolFirstProgress.length} progress frame(s) were sent ` +
-      `(${JSON.stringify(toolFirstProgress.map((f) => f.text))}) and none of them carried any ` +
-      `prefix of ${JSON.stringify(TOOL_FIRST_TEXT)} — the text-less first lane held the answer ` +
-      `lane behind an ordering barrier until terminal drain, so the user saw a static scaffold ` +
-      `for the whole turn and the answer appeared only as a finished bubble.`,
+    `#94 REGRESSION (tool-only first message): the answer never streamed BEFORE it settled. ` +
+      `The answer settled at frame #${answerPosition}; ${toolFirstProgress.length} progress ` +
+      `frame(s) were sent (${JSON.stringify(toolFirstProgress.map((f) => f.text))}) and none ` +
+      `before that position carried any prefix of ${JSON.stringify(TOOL_FIRST_TEXT)}` +
+      (late.length > 0
+        ? ` — though ${late.length} did AFTER it, at frame(s) ${JSON.stringify(
+            late.map(({ i }) => i),
+          )}, which is a late scaffold write, not streaming.`
+        : ` — the text-less first lane held the answer lane behind an ordering barrier until ` +
+          `terminal drain, so the user saw a static scaffold for the whole turn and the answer ` +
+          `appeared only as a finished bubble.`),
   );
 }
 
