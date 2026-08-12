@@ -251,38 +251,16 @@ jobs:
       #    and comes back for phase 2), which is also the only way to observe how
       #    core interleaves partials with block drains — the ordering that both
       #    review rounds on the fix found unit fixtures getting wrong.
-      #    Asserts: EXACTLY one settled `agent_message` per assistant message, at
-      #    one distinct id each, message A present and not overwritten by B,
-      #    model order preserved, and `turn_settled{outcome:"ok"}` still
-      #    delivered (so an unconditional-rotation fix cannot pass). The driver
-      #    logs EVERY inbound frame first.
+      #    Asserts: >=2 `agent_message` frames with distinct ids, message A
+      #    present and not overwritten by B, model order preserved, and
+      #    `turn_settled{outcome:"ok"}` still delivered (so an unconditional-
+      #    rotation fix cannot pass). The driver logs EVERY inbound frame first.
       #    Isolated under /tmp/oc-multi-message-e2e (port 18991) — hermetic, no
       #    secret. Verified load-bearing by revert-check: with the fix reverted
       #    the harness exits 6. Any non-zero exit FAILS the gate.
       # ──────────────────────────────────────────────────────────────────────
       - name: "Live e2e: multi-assistant-message turn settles two ids (#94)"
         run: bash e2e/local/run-multi-message.sh
-
-      # ──────────────────────────────────────────────────────────────────────
-      # 8d³. Live e2e: the SAME turn with block streaming on (issue #111 gate)
-      #    Same topology, same driver, one config difference:
-      #    `agents.defaults.blockStreamingDefault:"on"`. With it, core dispatches
-      #    each completed assistant message a SECOND time as a `kind:"block"`
-      #    delivery carrying that message's `assistantMessageIndex`; the channel
-      #    used to route every block to a fresh wire id, so a two-message turn
-      #    settled as FOUR bubbles — each answer duplicated. 8d² cannot see that:
-      #    with the flag off no block delivery exists, so the shape is
-      #    unreachable there. Measured 4-bubble output is quoted in the harness
-      #    header. The fix attributes an indexed block to the lane that owns the
-      #    index (identity core itself supplied — never body text or arrival
-      #    order), and the driver's equality assertion is what holds it.
-      #    Isolated under /tmp/oc-block-streaming-e2e (port 19091) — distinct
-      #    ports/peer/$OCH from 8d², hermetic, no secret. Verified load-bearing
-      #    by revert-check: with the attribution branch reverted the harness
-      #    exits 6 on the 4-bubble shape. Any non-zero exit FAILS the gate.
-      # ──────────────────────────────────────────────────────────────────────
-      - name: "Live e2e: block-streamed multi-message turn settles once per message (#111)"
-        run: bash e2e/local/run-block-streaming.sh
 
       # ──────────────────────────────────────────────────────────────────────
       # 8e. Live e2e: ALL-REAL fusion

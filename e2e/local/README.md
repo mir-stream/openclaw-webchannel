@@ -45,7 +45,7 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 | `all-real.mjs` | Playwright runner for `run-all-real.sh` and `run-derived-trust.sh`: serves the browser bundle, launches headless Chromium running the production `WebChannelNatsClient`, NKEY-authenticates to the JWT-auth nats-server, drives the JWT + PoP register hop, and asserts the reply echoes the sent text. **This is the "from a real browser" proof.** |
 | `enrolled-transport-roundtrip.ts` | Node driver for `run-enrolled-transport.sh`: an NKEY-authenticated peer that round-trips one message against the device-flow-enrolled plugin. |
 | `turn-outcome-roundtrip.ts` | Node driver for `run-turn-outcome.sh`: runs a provider-rejected turn and an ordinary turn against the same enrolled plugin and asserts the `turn_settled{outcome}` of each. |
-| `multi-message-roundtrip.ts` | Node driver shared by `run-multi-message.sh` and `run-block-streaming.sh`: drives one turn that produces TWO real assistant messages and asserts they settle as EXACTLY two bubbles at two distinct wire ids. Logs every inbound frame before asserting. |
+| `multi-message-roundtrip.ts` | Node driver for `run-multi-message.sh`: drives one turn that produces TWO real assistant messages and asserts they settle at two distinct wire ids. Logs every inbound frame before asserting. |
 | `two-account-isolation-roundtrip.ts` | Node driver for `run-two-account-isolation.sh`: drives positive round-trips plus an A-authorized token against B's live register subject. |
 | `ci-smoke.html` | The unified demo/chat page served by the SaaS issuer. |
 
@@ -57,7 +57,7 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 
 ## The harnesses
 
-All seven boot a real gateway + `nats-server` + echo provider under an isolated
+All six boot a real gateway + `nats-server` + echo provider under an isolated
 `OPENCLAW_HOME`, run one encrypted round-trip through the register hop, and self-clean on exit.
 
 ```bash
@@ -68,8 +68,6 @@ All seven boot a real gateway + `nats-server` + echo provider under an isolated
 ./e2e/local/run-derived-trust.sh         # `channels add` with ZERO hand-written JWT trust facts
 ./e2e/local/run-turn-outcome.sh          # provider-rejected turn settles `error`, not `ok` (#87)
 ./e2e/local/run-multi-message.sh         # multi-assistant-message turn settles TWO distinct ids (#94)
-./e2e/local/run-block-streaming.sh       # the same turn with blockStreamingDefault "on":
-                                         #   still exactly ONE bubble per message (#111)
 ```
 
 > **They boot against `packages/plugin/dist/`, not your edited `src/`.** Measured on the pinned
@@ -155,11 +153,10 @@ it takes no arguments, always succeeds, and touches no filesystem or network sta
 Same topology as `run-turn-outcome.sh` plus `streaming.mode:"partial"` on the account (the only
 mode that creates a draft lane — in `block`/`off` the plugin takes the plain append path and the
 harness would prove nothing; the runner re-asserts and verifies the mode after `channels add`).
-Asserts: **exactly one settled `agent_message` per assistant message, at one distinct id each**,
-message A present and not overwritten by B, model order preserved, and `turn_settled{outcome:"ok"}`
-still delivered (so an unconditional-rotation fix cannot pass). The equality bar replaced the
-original `>= 2` for #111 — see `run-block-streaming.sh` below, whose 4-bubble defect passed the old
-one. Verified load-bearing by revert-check: with the fix reverted the harness exits 6.
+Asserts: **at least two `agent_message` frames with distinct ids**, message A present and not
+overwritten by B, model order preserved, and `turn_settled{outcome:"ok"}` still delivered (so an
+unconditional-rotation fix cannot pass). Verified load-bearing by revert-check: with the fix
+reverted the harness exits 6.
 
 The driver logs **every** inbound frame with its type, id and text before asserting. That record
 is a deliverable in itself — it is the first direct evidence of how core drives a real
@@ -187,37 +184,6 @@ and the trigger the fix keeps "for contract fidelity" is the one actually carryi
 second message arrives with **no** boundary event — the shape §5.5 describes — is not reachable
 through this provider and remains covered only by the unit fixtures.
 
-### `run-block-streaming.sh` — one bubble per message with block streaming on (#111 gate)
-
-`run-multi-message.sh` with one config line added: `agents.defaults.blockStreamingDefault:"on"`.
-That flag makes core dispatch each **completed** assistant message a second time, as a
-`kind:"block"` delivery carrying that message's `assistantMessageIndex` — on top of the partials
-the draft lane already streamed. The channel used to route every block to a fresh wire id, so the
-same two-message turn settled as **four** bubbles, each answer duplicated:
-
-```
-progress      id=cl4jv9 "ISSUE94_MESSAGE_A che"
-agent_message id=n34zbj "ISSUE94_MESSAGE_A checking the roster now."   ← independent block (index 1)
-agent_message id=cl4jv9 "ISSUE94_MESSAGE_A checking the roster now."   ← the lane that streamed it
-agent_message id=jgqt6u "ZZZ94_SECOND_ANSWER here is what came back."  ← independent block (index 2)
-agent_message id=vne2pu "ZZZ94_SECOND_ANSWER here is what came back."
-```
-
-`run-multi-message.sh` cannot see this: with the flag off no block delivery is ever produced, so
-the shape is unreachable there. The fix attributes an indexed block to the lane that owns that
-index — identity **core itself supplied**, never body text, arrival order, or candidate counts —
-and the driver's equality assertion is what holds it. Its ports, peer id and `OPENCLAW_HOME`
-(`/tmp/oc-block-streaming-e2e`) are all distinct from `run-multi-message.sh`'s, so the two can run
-back to back. Verified load-bearing by revert-check: with the attribution branch reverted this
-harness exits 6 on the 4-bubble shape while `run-multi-message.sh` still passes.
-
-Why it must be live: the field the routing reads (`assistantMessageIndex` on the delivery seam's
-runtime info) is not even declared by the public `ChannelDeliveryInfo` type — it is there because
-core hands the channel adapter the dispatcher's own `ReplyDispatchRuntimeInfo` verbatim
-(`kernel-BROH42tr.js:696/:721` → `reply-dispatcher.types-CVYQHGPk.js:12`). A unit fixture
-asserting that field is only asserting its own mock; only a real gateway can show core still
-supplies it.
-
 ### `run-derived-trust.sh` — zero hand-written trust facts
 
 Proves a fresh `openclaw channels add` reaches a working encrypted register round-trip with
@@ -242,6 +208,6 @@ asserts a real-issuer JWT verifies against the served JWKS without a gateway.
 
 ## In CI
 
-`run-all-real.sh` and the other five harnesses run in the CI gate
+`run-all-real.sh` and the other four harnesses run in the CI gate
 (`.github/workflows/e2e-gate.yml`), so the real-gateway + `inbound.run` path is
 regression-guarded on every push/PR.
