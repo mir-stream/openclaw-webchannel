@@ -619,7 +619,21 @@ export function createProgressDraftController(params: {
    * unrepresentable: a payload that does not extend the baseline leaves it
    * alone, whatever the caller decided to do about displaying it.
    */
-  const acceptRawBaseline = (lane: AssistantDraftLane, raw: string): void => {
+  const acceptRawBaseline = (
+    lane: AssistantDraftLane,
+    raw: string,
+    options?: { replace?: boolean },
+  ): void => {
+    // An explicit `replace` is authoritative: it does not continue the previous
+    // cumulative text, it REPLACES it, so it starts a new baseline instead of
+    // being measured against the old one. Forward-only holds WITHIN a message;
+    // a replace begins a new one. Without this the baseline stays pinned to the
+    // superseded text and every later delta composes on it — "old" + "er"
+    // rather than "new" + "er".
+    if (options?.replace === true) {
+      lane.lastRawAnswerText = raw;
+      return;
+    }
     if (lane.lastRawAnswerText && !raw.startsWith(lane.lastRawAnswerText)) return;
     lane.lastRawAnswerText = raw;
   };
@@ -668,17 +682,27 @@ export function createProgressDraftController(params: {
     for (const predecessor of state.lanes) {
       if (predecessor.generation >= lane.generation) break;
       if (laneOrderResolved(predecessor)) continue;
+      // A REAL barrier: something can still legitimately claim this lane, so the
+      // whole scan gives up and the timer releases nothing.
       if (
-        predecessor.closed &&
-        predecessor.resolution === "unresolved" &&
-        !predecessor.answerText &&
-        predecessor.tentativeBarrierReservationIds.length === 0 &&
-        !predecessor.acceptsLateIndexlessReservations
+        predecessor.tentativeBarrierReservationIds.length > 0 ||
+        predecessor.acceptsLateIndexlessReservations
       ) {
+        return undefined;
+      }
+      // Text-less and unclaimed: the tool-only shape this release exists for.
+      if (predecessor.closed && predecessor.resolution === "unresolved" && !predecessor.answerText) {
         releasable.push(predecessor);
         continue;
       }
-      return undefined;
+      // Anything else here is an unresolved lane WITH text — a fellow VICTIM of
+      // the same block, not a barrier. Bailing on it deadlocks the release: with
+      // two successors (tool-only lane 0, then B, then C) the scan runs against
+      // C, finds B unresolved-with-text and gives up, so lane 0 is never
+      // released, so B never resolves, so the scan fails identically forever and
+      // NEITHER message streams. Skipping it releases lane 0 and lets ordinary
+      // ordering settle B before C.
+      continue;
     }
     return releasable.length > 0 ? releasable : undefined;
   };
@@ -1158,7 +1182,7 @@ export function createProgressDraftController(params: {
           // payload.
           if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
           if (cleaned === lane.answerText) {
-            acceptRawBaseline(lane, raw);
+            acceptRawBaseline(lane, raw, { replace: update.replace === true });
             return;
           }
           // SHRINK. Mid-stream an unclosed `<thinking>` strips away text the
@@ -1174,6 +1198,8 @@ export function createProgressDraftController(params: {
             lane.answerText.startsWith(cleaned) &&
             cleaned.length < lane.answerText.length
           ) {
+            // No `replace` flag needed: this branch is unreachable for a replace
+            // update (the condition above requires `replace !== true`).
             acceptRawBaseline(lane, raw);
             return;
           }
@@ -1204,7 +1230,7 @@ export function createProgressDraftController(params: {
           }
 
           lane.answerText = cleaned;
-          acceptRawBaseline(lane, raw);
+          acceptRawBaseline(lane, raw, { replace: update.replace === true });
           lane.answerRevision += 1;
           if (lane.resolution === "empty" || lane.resolution === "unresolved") {
             lane.resolution = "open";
@@ -1314,6 +1340,28 @@ export function createProgressDraftController(params: {
               // gate above is what prevents unrelated tool/final settlements
               // from taking this fallback.
               retireSoleLifecycleRecord(input.assistantMessageIndex);
+            } else {
+              // Dispositions exist but none is outstanding, which is the shape a
+              // NOTICE settlement makes: notices are delivered independently and
+              // deliberately record no disposition, so there is nothing for them
+              // to consume. `onDeliverySettled` carries no payload — core hands
+              // it only `{kind, assistantMessageIndex}` — so this seam cannot
+              // classify the settling payload directly; the absent disposition is
+              // the only signal it has.
+              //
+              // Until now this branch did not exist, so once ANY earlier block
+              // had settled a notice's token was never retired: it sat `pending`
+              // beside the next real block at the same index, made that index
+              // ambiguous, and left the real block's ordering reservation holding
+              // its lane until terminal drain. Measured with one notice between
+              // two real blocks, a later message's partials never streamed at all
+              // (M6s; its control without the notice streams).
+              //
+              // `"notice"` is load-bearing, not decoration. Without it this
+              // retires whatever single record sits at the index — including a
+              // REAL block's reservation — which is exactly the misattribution
+              // F5 forbids and which five existing fixtures catch.
+              retireSoleLifecycleRecord(input.assistantMessageIndex, "notice");
             }
           } else {
             retireSoleLifecycleRecord(

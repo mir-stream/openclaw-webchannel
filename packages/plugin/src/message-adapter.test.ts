@@ -719,6 +719,40 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
+  it("M6r: a tool-only lane releases TWO following messages, not just the first", async () => {
+    // The release scan runs against `currentLane()` at FIRE time. With a second
+    // successor, that is C — and B is by then closed, unresolved and holding
+    // text, because lane 0 is still blocking it. Treating B as a barrier
+    // deadlocks the pair: lane 0 blocks B, B's unresolved state blocks lane 0's
+    // release, and rescheduling fails identically forever, so NEITHER message
+    // streams. B is a fellow victim of the same block, not a barrier.
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushEvent(toolStart()); // lane 0: tool-only
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "B text" }); // lane 1 — schedules the release
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "C text" }); // lane 2 — B closes before it fires
+      await h.draft.flush();
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      // B settles in model order, C streams live behind it.
+      expect(h.frames.some((frame) => frame.type === "final" && frame.text === "B text")).toBe(
+        true,
+      );
+      expect(h.frames.some((frame) => frame.text === "C text")).toBe(true);
+
+      await h.draft.drain();
+      const finals = h.frames.filter((frame) => frame.type === "final");
+      expect(finals.map((frame) => frame.text)).toEqual(["B text", "C text"]);
+      expect(new Set(finals.map((frame) => frame.id)).size).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("M6n: a reservation arriving PAST the window inverts order — accepted, not a bug", async () => {
     // The cost of the time-boxed release, recorded so it cannot be mistaken for
     // a defect later. Once the window closes, the empty predecessor is treated
@@ -939,6 +973,24 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("contract violation"));
   });
 
+  it("M7g: an authoritative replace starts a new baseline for later deltas", async () => {
+    // Forward-only holds WITHIN a message. A `replace:true` update supersedes
+    // the cumulative text rather than continuing it, so measuring it against the
+    // old baseline pins the baseline to superseded text and every later delta
+    // composes on the wrong thing — "old" + "er" instead of "new" + "er". This
+    // crosses two guards that are individually correct: the replace exemption in
+    // the shrink path, and the forward-only rule in the baseline write.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "old" });
+    h.draft.pushAnswerText({ text: "new", replace: true });
+    h.draft.pushAnswerText({ delta: "er" });
+    await h.draft.drain();
+
+    const finals = h.frames.filter((frame) => frame.type === "final");
+    expect(finals.map((frame) => frame.text)).toEqual(["newer"]);
+  });
+
   it("M7f: delta-only updates compose on the raw stream across a swallowed shrink", async () => {
     // `{delta}` without `{text}` is its own path: the accumulator has to compose
     // on the RAW baseline, or a swallowed shrink folds the stripped tag fragment
@@ -953,6 +1005,63 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
 
     expect(h.draft.snapshotText()).toBe("Hi  there");
     expect(successfulIds(h.frames)).toHaveLength(1);
+  });
+
+  /**
+   * #94 — a notice block between two real blocks used to stall every later
+   * message for the rest of the turn.
+   *
+   * A notice delivery records no disposition, so its `settled` event finds none
+   * outstanding; the old code then required `blockDispositions.length === 0` to
+   * retire anything, which is false the moment any earlier block has settled. Its
+   * token stayed `pending`, the next real block at the same index became
+   * ambiguous, and that block's ordering reservation held its lane until terminal
+   * drain — so a following message's partials never reached the wire.
+   *
+   * The control is the same sequence with the notice removed: it must stream.
+   * Both run past the release window, so the stall cannot be confused with the
+   * ordinary text-less-predecessor hold.
+   */
+  it.each([
+    ["a notice between the real blocks", true],
+    ["control: no notice", false],
+  ])("M6s: %s never stalls a later message", async (_name, withNotice) => {
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 0 });
+      await h.draft.deliverAuthorizedBlock({ text: "real-0" });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 0,
+      });
+
+      h.draft.handleAssistantMessageBoundary();
+      if (withNotice) {
+        h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1, isStatusNotice: true });
+        await h.draft.deliverAuthorizedBlock({ text: "notice-1", isStatusNotice: true });
+        h.draft.noteDeliveryLifecycle("settled", {
+          deliveryKind: "block",
+          assistantMessageIndex: 1,
+        });
+      }
+      h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 });
+      await h.draft.deliverAuthorizedBlock({ text: "real-1" });
+      h.draft.noteDeliveryLifecycle("settled", {
+        deliveryKind: "block",
+        assistantMessageIndex: 1,
+      });
+
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "C text" });
+      await h.draft.flush();
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(h.frames.map((frame) => frame.text)).toContain("C text");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("M8: a late structured boundary after defensive rotation does not rotate twice", async () => {
