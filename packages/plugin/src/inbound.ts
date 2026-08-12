@@ -641,6 +641,16 @@ export async function handleInboundMessage(
             ...(draft
               ? {
                   dispatcherOptions: {
+                    // [PROBE111] TEMPORARY — not for commit. Does a plugin-supplied
+                    // beforeDeliver reach the dispatcher, and does its info carry
+                    // assistantMessageIndex? Inert: returns the payload unchanged
+                    // (same shape Telegram installs).
+                    beforeDeliver: async (payload, info) => {
+                      api.logger.warn?.(
+                        `[PROBE111] beforeDeliver info=${JSON.stringify(info)} keys=${JSON.stringify(Object.keys(info))} textHead=${JSON.stringify(String(payload.text ?? "").slice(0, 24))}`,
+                      );
+                      return payload;
+                    },
                     onSkip: (payload, info) => {
                       draft!.noteDeliveryLifecycle("skip", {
                         deliveryKind: info.kind,
@@ -669,7 +679,22 @@ export async function handleInboundMessage(
             // and non-ordinary finals use the controller's independent delivery
             // path; only the first ordinary final settles the current lane.
             delivery: {
+              // [PROBE111] TEMPORARY — not for commit. Inert pass-through: does the
+              // channel adapter's preparePayload seam receive the dispatcher's
+              // runtime info (with assistantMessageIndex) or only {kind}?
+              preparePayload: (payload, info) => {
+                api.logger.warn?.(
+                  `[PROBE111] preparePayload info=${JSON.stringify(info)} keys=${JSON.stringify(Object.keys(info))} textHead=${JSON.stringify(String(payload.text ?? "").slice(0, 24))}`,
+                );
+                return payload;
+              },
               deliver: async (payload, info) => {
+                // [PROBE111] TEMPORARY — not for commit. The load-bearing question:
+                // is `assistantMessageIndex` present at the ACTUAL delivery seam at
+                // runtime, even though ChannelDeliveryInfo declares only `kind`?
+                api.logger.warn?.(
+                  `[PROBE111] deliver info=${JSON.stringify(info)} keys=${JSON.stringify(Object.keys(info))} textHead=${JSON.stringify(String(payload.text ?? "").slice(0, 24))}`,
+                );
                 const kind = info.kind;
                 const noticeFlags = noticeFlagsOf(payload);
                 const isNotice = isCoreNoticePayload(payload);

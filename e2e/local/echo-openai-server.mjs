@@ -170,6 +170,18 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      // [PROBE111] TEMPORARY — not for the product harness. With ECHO_FAIL_PHASE2=1
+      // phase 2 fails at the provider, so the run errors AFTER message A was
+      // retained. That is the `[error, A, …]` terminal-builder shape #111 cites as
+      // the path with no queued text callbacks.
+      if (process.env.ECHO_FAIL_PHASE2 === "1") {
+        console.log(`[echo] multi-msg phase 2 → HTTP 500 (PROBE111 forced provider failure)`);
+        res.statusCode = 500;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ error: { message: "PROBE111 forced provider failure", type: "server_error" } }));
+        return;
+      }
+
       console.log(`[echo] multi-msg phase 2 → text B (finish stop)`);
       if (body.stream) {
         sseHead();
