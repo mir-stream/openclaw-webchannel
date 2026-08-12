@@ -968,6 +968,116 @@ describe("webchannel inbound round-trip", () => {
     );
   });
 
+  /**
+   * #94 — a TEXT-LESS block must not stall the rest of the turn.
+   *
+   * CROSSES TWO GUARDS: the delivery seam's `if (!text) return` early exit, and
+   * the turn-wide pending-reservation gate on the empty-predecessor release. A
+   * media-only block sends nothing, so the seam used to return before telling the
+   * controller anything — while core still SETTLED it. The settlement had no
+   * delivery to pair with, so that block's reservation stayed pending forever,
+   * and the release gate (correctly) refuses to release while any reservation is
+   * pending. Result: every later assistant message streamed nothing at all.
+   *
+   * This lives at the inbound seam and NOT in the controller fixtures on purpose.
+   * At the controller boundary a text-less block is byte-identical to a
+   * callback-free notice — same `settled{kind:"block", index}` with no delivery —
+   * and those two must behave OPPOSITELY (F5 requires the notice to retire
+   * nothing). Only this seam has the payload that tells them apart.
+   */
+  it("I27: a text-less block still retires its reservation, so later messages stream", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new FakePeerChannel();
+      const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        steps: [
+          { boundary: true },
+          { toolStart: { name: "web_search", phase: "start" } },
+          // A's block is queued and then delivered with NO text at all.
+          { queuedBlock: { payload: {}, assistantMessageIndex: 1 } },
+          { deliverBlock: {} },
+          { lifecycle: { kind: "settled", deliveryKind: "block", assistantMessageIndex: 1 } },
+          { boundary: true },
+          { partial: { text: "B streams" } },
+        ],
+        betweenSteps: async () => {
+          await vi.advanceTimersByTimeAsync(700);
+        },
+        finalPayloads: [{ text: "B streams" }],
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        text: "hello",
+      });
+
+      expect(progressSpy.mock.calls.map((call) => call[2])).toContain("B streams");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * #94 — the stuck reservation is ALSO a permanent lane barrier, so a third
+   * message stalls even where the turn-wide release gate is not the cause.
+   *
+   * CROSSES TWO GUARDS: the same text-less delivery exit, and
+   * `laneOrderResolved`'s per-lane barrier check (not the release gate). A's
+   * stuck reservation attaches to a lane, and that lane then blocks every
+   * successor through ordinary ordering — which is why fixing the retirement,
+   * rather than loosening the gate, is the right repair.
+   */
+  it("I28: a stuck reservation does not strand the third assistant message", async () => {
+    vi.useFakeTimers();
+    try {
+      const transport = new FakePeerChannel();
+      const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { streaming: { mode: "partial" } },
+        steps: [
+          { boundary: true },
+          { partial: { text: "A text" } },
+          { queuedBlock: { payload: { text: "A block one" }, assistantMessageIndex: 1 } },
+          { deliverBlock: { text: "A block one" } },
+          { lifecycle: { kind: "settled", deliveryKind: "block", assistantMessageIndex: 1 } },
+          // A's second block carries no text — the shape that used to stick.
+          { queuedBlock: { payload: {}, assistantMessageIndex: 1 } },
+          { deliverBlock: {} },
+          { lifecycle: { kind: "settled", deliveryKind: "block", assistantMessageIndex: 1 } },
+          { boundary: true },
+          { partial: { text: "B text" } },
+          { boundary: true },
+          { partial: { text: "C text" } },
+        ],
+        betweenSteps: async () => {
+          await vi.advanceTimersByTimeAsync(700);
+        },
+        finalPayloads: [{ text: "C text" }],
+      });
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        text: "hello",
+      });
+
+      const streamed = progressSpy.mock.calls.map((call) => call[2]);
+      expect(streamed).toContain("B text");
+      expect(streamed).toContain("C text");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("I15: lets the mixed-turn answer claim and finalize the provisional scaffold id", async () => {
     const transport = new FakePeerChannel();
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);

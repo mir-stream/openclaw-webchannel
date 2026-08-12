@@ -674,7 +674,19 @@ export async function handleInboundMessage(
                 const noticeFlags = noticeFlagsOf(payload);
                 const isNotice = isCoreNoticePayload(payload);
                 const text = payload.text;
-                if (!text) return { visibleReplySent: false };
+                if (!text) {
+                  // #94: a text-less BLOCK — media-only, or text stripped by a
+                  // hook — sends nothing, but core still SETTLES it at the
+                  // dispatcher. The controller has to hear about it anyway: it
+                  // pairs each settlement with the delivery it belongs to, and a
+                  // settlement with no delivery to pair against used to leave
+                  // that block's ordering reservation pending for the rest of the
+                  // turn, stalling every later assistant message.
+                  if (draft && kind === "block") {
+                    await draft.deliverAuthorizedBlock({ text: "", ...noticeFlags });
+                  }
+                  return { visibleReplySent: false };
+                }
                 // #87: classify this final payload for the turn outcome.
                 //
                 // `isError` alone is NOT the verdict: core flags BOTH a terminal
