@@ -838,30 +838,65 @@ describe("ProgressDraftController — indexed delivery attribution (#111)", () =
     expect(finals[1]!.id).not.toBe(idA);
   });
 
-  it("N7: an attributed final settles its bound lane and falls back when unbound", async () => {
-    const bound = makeDraftHarness();
-    bound.draft.handleAssistantMessageBoundary();
-    bound.draft.pushAnswerText({ text: "A partial" });
-    const idA = bound.frames[0]!.id;
-    bound.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 });
+  // N9/N10 are the #94 data-loss class, re-entering through the identity path:
+  // a LATE first observation of an earlier message's index, landing while a
+  // different message's lane is open. Attributing it settles that lane with the
+  // wrong body and the streamed text is GONE — strictly worse than the
+  // duplicate bubble the fallback costs. Both fixtures use the measured 1-based
+  // shape; with 0-based indices the ordering barrier accidentally masks the
+  // defect, which is precisely why the suite must not be written 0-based.
+  it("N9: a late first observation of an earlier index never claims the open lane", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "A partial" });
+    await h.draft.flush();
+    const idA = h.frames[0]!.id;
 
-    await expect(
-      bound.draft.deliverAttributedFinal({ text: "A final", assistantMessageIndex: 1 }),
-    ).resolves.toBe(true);
-    expect(bound.frames.at(-1)).toEqual({ type: "final", id: idA, text: "A final" });
-    await bound.draft.drain();
-    expect(bound.frames.filter((frame) => frame.type === "final")).toHaveLength(1);
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B partial" });
+    await h.draft.flush();
+    const idB = h.frames.find((frame) => frame.id !== idA)!.id;
 
-    const unbound = makeDraftHarness();
-    unbound.draft.handleAssistantMessageBoundary();
-    unbound.draft.pushAnswerText({ text: "A partial" });
-    const unboundLaneId = unbound.frames[0]!.id;
+    // A's queued-block callback flushed LATE: the first observation of A's
+    // index lands while lane B is the open, unbound lane.
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 });
+    await h.draft.deliverAuthorizedBlock({ text: "A block body", assistantMessageIndex: 1 });
+    await h.draft.drain();
 
-    await expect(
-      unbound.draft.deliverAttributedFinal({ text: "uncorrelated", assistantMessageIndex: 4 }),
-    ).resolves.toBe(true);
-    expect(unbound.frames.at(-1)!.id).not.toBe(unboundLaneId);
-    expect(unbound.draft.snapshotText()).toBe("A partial");
+    const finals = h.frames.filter((frame) => frame.type === "final");
+    // B keeps its own body at its own id, A's block takes the independent path.
+    expect(finals.find((frame) => frame.id === idB)?.text).toBe("B partial");
+    expect(finals.find((frame) => frame.id === idA)?.text).toBe("A partial");
+    expect(finals.some((frame) => frame.text === "A block body")).toBe(true);
+    expect(new Set(finals.map((frame) => frame.id)).size).toBe(3);
+  });
+
+  it("N10: an unbound NON-materialized earlier lane also blocks a late first observation", async () => {
+    // Narrowing the guard to "an earlier MATERIALIZED lane is unbound" is not
+    // enough. A lane whose only wire attempt FAILED holds real text, is never
+    // materialized, and still satisfies `laneOrderResolved` through
+    // `laneHasFailedCurrentRevision` — so the ordering check waves the settle
+    // through and B's body is destroyed. It is a candidate owner of the late
+    // index like any other unbound predecessor.
+    const h = makeDraftHarness({ decide: (attempt) => attempt.text !== "A partial" });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "A partial" });
+    await h.draft.flush();
+    expect(h.frames).toEqual([]);
+
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "B partial" });
+    await h.draft.flush();
+    const idB = h.frames[0]!.id;
+
+    h.draft.noteBlockReplyQueued({ assistantMessageIndex: 1 });
+    await h.draft.deliverAuthorizedBlock({ text: "A block body", assistantMessageIndex: 1 });
+    await h.draft.drain();
+
+    const finals = h.frames.filter((frame) => frame.type === "final");
+    expect(finals.find((frame) => frame.id === idB)?.text).toBe("B partial");
+    expect(finals.some((frame) => frame.text === "A block body")).toBe(true);
+    expect(finals.find((frame) => frame.text === "A block body")!.id).not.toBe(idB);
   });
 
   // N8 holds the post-drain BEHAVIOUR, not one specific guard: the settled-lane

@@ -550,21 +550,13 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
   const makeDraft = () => {
     const finalize = vi.fn(async () => true);
     const deliverIndependentFinal = vi.fn(async () => true);
-    const deliverAttributedFinal = vi.fn(async () => true);
     const noteLeadingTerminalError = vi.fn();
     const draft = {
       finalize,
       deliverIndependentFinal,
-      deliverAttributedFinal,
       noteLeadingTerminalError,
     } as unknown as ProgressDraftController;
-    return {
-      draft,
-      finalize,
-      deliverIndependentFinal,
-      deliverAttributedFinal,
-      noteLeadingTerminalError,
-    };
+    return { draft, finalize, deliverIndependentFinal, noteLeadingTerminalError };
   };
 
   it.each([
@@ -605,80 +597,6 @@ describe("deliverDraftFinalPayload — independent routing policy", () => {
 
     expect(h.deliverIndependentFinal).toHaveBeenCalledOnce();
     expect(h.finalize).not.toHaveBeenCalled();
-    expect(h.deliverAttributedFinal).not.toHaveBeenCalled();
-  });
-
-  // #111: an identity relaxes exactly ONE of those four reasons.
-  it("F1b: an index re-routes only the prior-ordinary-final case to its own lane", async () => {
-    const priorFinal = makeDraft();
-    await expect(
-      deliverDraftFinalPayload(
-        priorFinal.draft,
-        { text: "second answer" },
-        "second answer",
-        { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
-        3,
-      ),
-    ).resolves.toEqual({ sent: true, independent: true });
-    expect(priorFinal.deliverAttributedFinal).toHaveBeenCalledWith({
-      text: "second answer",
-      assistantMessageIndex: 3,
-    });
-    expect(priorFinal.deliverIndependentFinal).not.toHaveBeenCalled();
-    expect(priorFinal.finalize).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    {
-      reason: "isNotice",
-      payload: { text: "notice", isFallbackNotice: true },
-      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
-    },
-    {
-      reason: "payload.isError",
-      payload: { text: WARNING_SENTINEL, isError: true },
-      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
-    },
-    {
-      reason: "leadingTerminalErrorSeen",
-      payload: { text: "retained answer" },
-      state: { leadingTerminalErrorSeen: true, ordinaryAnswerFinalSeen: false },
-    },
-  ] satisfies Array<{
-    reason: string;
-    payload: { text: string; isError?: boolean; isFallbackNotice?: boolean };
-    state: FinalReconciliationState;
-  }>)(
-    "F1c: $reason stays independent even with an assistant-message index",
-    async ({ payload, state }) => {
-      const h = makeDraft();
-
-      await expect(
-        deliverDraftFinalPayload(h.draft, payload, payload.text, { ...state }, 3),
-      ).resolves.toEqual({ sent: true, independent: true });
-
-      expect(h.deliverIndependentFinal).toHaveBeenCalledOnce();
-      expect(h.deliverAttributedFinal).not.toHaveBeenCalled();
-      expect(h.finalize).not.toHaveBeenCalled();
-    },
-  );
-
-  it("F1d: the FIRST ordinary final still consumes the current lane, index or not", async () => {
-    const h = makeDraft();
-
-    await expect(
-      deliverDraftFinalPayload(
-        h.draft,
-        { text: "the answer" },
-        "the answer",
-        { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
-        3,
-      ),
-    ).resolves.toEqual({ sent: true, independent: false });
-
-    expect(h.finalize).toHaveBeenCalledOnce();
-    expect(h.deliverAttributedFinal).not.toHaveBeenCalled();
-    expect(h.deliverIndependentFinal).not.toHaveBeenCalled();
   });
 
   it("F7: a first terminal error records the adapter reconciliation guard", async () => {

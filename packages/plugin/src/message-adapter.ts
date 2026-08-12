@@ -331,15 +331,6 @@ export type ProgressDraftController = {
     isFallbackNotice?: boolean;
     isCompactionNotice?: boolean;
   }): Promise<boolean>;
-  /**
-   * Settle the assistant lane bound to `assistantMessageIndex` with a terminal
-   * payload, falling back to independent delivery when nothing unambiguous is
-   * bound. Callers must classify first: notices and errors never reach here.
-   */
-  deliverAttributedFinal(input: {
-    text: string;
-    assistantMessageIndex: number;
-  }): Promise<boolean>;
   /** Retire unambiguous callback lifecycle state without selecting an owner. */
   noteDeliveryLifecycle(
     kind: "skip" | "cancel" | "settled" | "error",
@@ -798,14 +789,31 @@ export function createProgressDraftController(params: {
    * WHAT THIS REFUSES TO DO: core's block pipeline may coalesce and flush a
    * block later than the message that produced it
    * (block-reply-pipeline-CsIUOKQ6.js:299-305 flushes a buffered block when a
-   * DIFFERENT index arrives), so a queued observation is not guaranteed to be
-   * on time. Two distinct indexes observed against ONE open lane is exactly
-   * what that skew looks like, and it poisons both indexes rather than guessing
-   * — the payloads then take the pre-#111 independent path (a duplicate bubble,
-   * never a misattributed one). The residual it cannot see: a single skewed
-   * observation whose own lane never produces an index of its own. Preserving
-   * "never misattribute" outranks removing the duplicate, but that case is
-   * silent, so keep it in mind when this code is next touched.
+   * DIFFERENT index arrives; plan §14.4 states the late-callback shape as
+   * settled fact), so a queued observation is not guaranteed to be on time.
+   * Two guards, in order of how much damage the shape they catch would do:
+   *
+   *  - UNBOUND PREDECESSOR (the load-bearing one). An index whose FIRST
+   *    observation arrives late names an assistant message that is already
+   *    behind us, and the open lane it lands on belongs to a DIFFERENT message
+   *    — attributing it would settle that lane with the wrong body and destroy
+   *    the text it streamed (the #94 data-loss class this whole PR exists to
+   *    end). Nothing in the callback stream distinguishes a late first
+   *    observation from an on-time one, so the binding is refused whenever any
+   *    earlier lane is still unbound: any such lane is a candidate owner for
+   *    this index, and "which of several candidates" is not a question this
+   *    controller is allowed to answer. On the measured on-time ordering every
+   *    predecessor is already bound by the time the next index is observed, so
+   *    the happy path is unaffected. "Earlier lane is MATERIALIZED but unbound"
+   *    is not enough: a message that streams no partials has an empty lane and
+   *    still owns a block (plan §12.2(5)), so an empty predecessor is a
+   *    candidate owner too — see the N10 fixture.
+   *  - CONTRADICTION. Two distinct indexes against ONE open lane, or one index
+   *    against two lanes, poisons the indexes involved rather than guessing.
+   *
+   * Both refusals cost at most ONE duplicate bubble — the payload falls back to
+   * the pre-#111 independent path, which is exactly what that path is for.
+   * Preserving "never misattribute" outranks removing the duplicate.
    */
   const bindAssistantMessageIndexToLane = (
     assistantMessageIndex: number,
@@ -822,6 +830,13 @@ export function createProgressDraftController(params: {
     // rewrite a bubble the user has already seen finalize.
     if (lane.closed || lane.settled || lane.assistantMessageIndexAmbiguous) return;
     if (state.ambiguousAssistantMessageIndexes.has(assistantMessageIndex)) return;
+    // An earlier lane with no identity of its own may be the message this index
+    // actually names (see the guard list above). Bindings therefore only ever
+    // form as an unbroken chain from the first lane forward.
+    for (const predecessor of state.lanes) {
+      if (predecessor.generation >= lane.generation) break;
+      if (predecessor.boundAssistantMessageIndex === undefined) return;
+    }
 
     const boundGeneration = state.assistantMessageIndexLanes.get(assistantMessageIndex);
     // Core emits one queued callback per block, and a message can produce
@@ -856,6 +871,26 @@ export function createProgressDraftController(params: {
   /**
    * #111 — settle the lane that owns `assistantMessageIndex` with an authorized
    * payload core attributed to that same assistant message.
+   *
+   * BLOCK PAYLOADS ONLY — verified, and the distinction is the whole safety
+   * argument:
+   *
+   *  - a BLOCK's index is genuinely per-message. It comes from the live
+   *    `state.assistantMessageIndex` counter, bumped once per assistant message
+   *    (selection-BfRwHcjH.js:4925) and stamped on the block payload as it is
+   *    produced (:4845). The queued callback and the delivery then read that
+   *    same value off that same payload's metadata (dispatch-B2e1grFo.js:1868 /
+   *    reply-dispatcher.types-CVYQHGPk.js:13), so both sides of the binding
+   *    describe one message.
+   *  - a FINAL's is TURN-LEVEL. Core builds the retained payload array with a
+   *    single `assistantMessageIndex: attempt.lastAssistantTextMessageIndex`
+   *    (embedded-agent-BgF2MOkH.js:4031) and stamps that one value on EVERY
+   *    non-error item of the array (payloads-DMxgzxEO.js:297) — so for a
+   *    retained `[A, B]` both finals carry B's index. Attributing final A by it
+   *    would settle B's lane with A's text: the exact misattribution this
+   *    function exists to prevent. Plan §12.2's "final payload에는 stable final
+   *    identity가 없다" deferral is correct and stands — do NOT wire this into
+   *    `finalize`, however tempting the field's presence there looks.
    *
    * Returns `"unattributed"` when nothing unambiguous is bound, which leaves the
    * caller on its pre-#111 routing byte for byte. Attribution is refused for a
@@ -1239,19 +1274,6 @@ export function createProgressDraftController(params: {
         },
         false,
       ),
-    deliverAttributedFinal: (input) =>
-      enqueue(
-        "attributed final delivery",
-        () => {
-          const attributed = settleBoundAssistantMessageLane(
-            input.assistantMessageIndex,
-            input.text,
-          );
-          if (attributed !== "unattributed") return attributed;
-          return deliverTerminalIndependent(input.text);
-        },
-        false,
-      ),
     noteDeliveryLifecycle: (kind, input) => {
       void enqueue(
         `delivery lifecycle ${kind}`,
@@ -1302,6 +1324,9 @@ export function createProgressDraftController(params: {
             terminalDrain(false);
             return false;
           }
+          // #111 does NOT attribute finals, deliberately — see the note on
+          // `settleBoundAssistantMessageLane`. Lane selection here stays
+          // position-based because a final payload's index is turn-level.
           if (
             state.finalReconciliation.leadingTerminalErrorSeen ||
             state.finalReconciliation.ordinaryAnswerSettled ||

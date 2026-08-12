@@ -114,20 +114,20 @@ function deliveryAssistantMessageIndex(info: ChannelDeliveryInfo): number | unde
  * defence-in-depth at this seam so every identity-less final after either
  * condition remains independent even if controller state changes later.
  *
- * #111: `assistantMessageIndex` (when core supplied one) relaxes exactly ONE of
- * those predicates. `ordinaryAnswerFinalSeen` is a fallback for finals we cannot
- * tell apart — with an identity in hand a later final is not "uncorrelated", it
- * belongs to a specific assistant message, and the controller can settle that
- * message's lane instead of appending a second bubble. The other predicates are
- * about delivery CLASS, not identity: a notice, an error, or anything after a
- * leading terminal error stays independent no matter what index it carries.
+ * #111 deliberately does NOT reach this seam. A final payload DOES carry an
+ * `assistantMessageIndex` at runtime, but it is a TURN-LEVEL value: core stamps
+ * `attempt.lastAssistantTextMessageIndex` (embedded-agent-BgF2MOkH.js:4031) on
+ * every non-error item of the retained payload array (payloads-DMxgzxEO.js:297),
+ * so in a `[A, B]` array both finals carry B's index and attributing A by it
+ * would settle B's lane with A's text. Only `kind:"block"` payloads carry a
+ * per-message index (see `settleBoundAssistantMessageLane`). Plan §12.2's
+ * multi-final deferral stands on that fact, not on the field's absence.
  */
 export async function deliverDraftFinalPayload(
   draft: ProgressDraftController,
   payload: ReplyPayload,
   text: string,
   state: FinalReconciliationState,
-  assistantMessageIndex?: number,
 ): Promise<{ sent: boolean; independent: boolean }> {
   const isMarkedNonTerminalWarning =
     payload.isError === true && isReplyPayloadNonTerminalToolErrorWarning(payload);
@@ -141,22 +141,12 @@ export async function deliverDraftFinalPayload(
     draft.noteLeadingTerminalError();
   }
 
-  const independentByClass =
+  const independent =
     isCoreNoticePayload(payload) ||
     payload.isError === true ||
-    state.leadingTerminalErrorSeen;
-  const independent = independentByClass || state.ordinaryAnswerFinalSeen;
+    state.leadingTerminalErrorSeen ||
+    state.ordinaryAnswerFinalSeen;
   if (!independent) state.ordinaryAnswerFinalSeen = true;
-  if (independent && !independentByClass && assistantMessageIndex !== undefined) {
-    // An ordinary answer final that core attributed to a specific assistant
-    // message. The controller settles that message's lane when the binding is
-    // unambiguous and falls back to independent delivery itself otherwise, so
-    // an unbindable index costs nothing. `independent` keeps reporting this
-    // seam's CLASSIFICATION — the controller's internal fallback is not visible
-    // from here, and no caller reads the flag for anything else.
-    const sent = await draft.deliverAttributedFinal({ text, assistantMessageIndex });
-    return { sent, independent };
-  }
   const sent = independent
     ? await draft.deliverIndependentFinal({ text, ...noticeFlagsOf(payload) })
     : await draft.finalize(text);
@@ -796,12 +786,13 @@ export async function handleInboundMessage(
                 // §5 L3/L6), never by faking the turn outcome.
 
                 // #111: the identity core attached to THIS payload, when it
-                // attached one. An error payload is deliberately excluded from
-                // attribution on both seams below — like a notice, its delivery
-                // class keeps it independent of every assistant lane, and that
-                // classification is not something an identity may override.
+                // attached one. BLOCK ONLY — a final's index is turn-level and
+                // must never select a lane (see `deliverDraftFinalPayload`).
+                // An error payload is excluded as well: like a notice, its
+                // delivery CLASS keeps it independent of every assistant lane,
+                // and that is not something an identity may override.
                 const attributableIndex =
-                  payload.isError === true || isNotice
+                  kind !== "block" || payload.isError === true || isNotice
                     ? undefined
                     : deliveryAssistantMessageIndex(info);
                 if (draft && kind === "block") {
@@ -820,7 +811,6 @@ export async function handleInboundMessage(
                     payload,
                     text,
                     finalReconciliation,
-                    attributableIndex,
                   );
                   if (sent) finalReplyDelivered = true;
                   return { visibleReplySent: sent };
