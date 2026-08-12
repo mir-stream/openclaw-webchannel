@@ -890,6 +890,22 @@ export function createProgressDraftController(params: {
 
   const queueProgress = (frame: PendingProgressFrame): void => {
     if (state.stopped) return;
+    // A single pending slot is last-write-wins across BOTH frame kinds, so a
+    // tool event's scaffold frame could evict an answer frame that was queued
+    // but not yet sent — losing the answer's first visible update, on either
+    // path below (the open-throttle path discards the pending frame outright).
+    // Answer text outranks the scaffold, so the scaffold yields.
+    //
+    // Dropping it costs nothing: `attemptProgress` re-checks
+    // `preview.revision !== frame.revision`, so a superseded scaffold revision
+    // could never have been sent anyway.
+    //
+    // BOUNDED, and worth knowing where: the window shuts permanently once a lane
+    // frame actually sends, because `commitReservation` calls
+    // `invalidateScaffoldWriter()` and `attemptProgress` gates previews on
+    // `scaffoldWriter === "active"`. So this only bites before the answer's
+    // first sent frame — which is exactly the opening of a tool-first turn.
+    if (frame.kind === "preview" && state.pendingProgress?.kind === "lane") return;
     const throttleOpen =
       state.lastProgressSentAt === 0 || Date.now() - state.lastProgressSentAt >= throttleMs;
     if (throttleOpen) {

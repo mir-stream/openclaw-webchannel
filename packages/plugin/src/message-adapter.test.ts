@@ -822,6 +822,32 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
+  it("M6v: a scaffold frame never evicts a pending answer frame", async () => {
+    // One pending slot, last-write-wins across kinds: a tool event arriving
+    // while an answer frame is queued-but-unsent used to replace it, and the
+    // answer's first visible update was simply lost. Bounded to before the
+    // answer's first SENT frame (after that, previews are gated off), which is
+    // precisely the opening of a tool-first turn.
+    vi.useFakeTimers();
+    try {
+      const h = makeDraftHarness({ throttleMs: 600 });
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushEvent(toolStart()); // sends, closing the throttle window
+      expect(h.frames).toHaveLength(1);
+
+      // No `flush()` anywhere in here: flushing force-sends the pending frame
+      // and would hide the very eviction this pins.
+      h.draft.pushAnswerText({ text: "answer text" }); // queued, not yet sent
+      h.draft.pushEvent(toolStart("tool-2")); // must NOT take the pending slot
+      expect(h.frames).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(600);
+      expect(h.frames.at(-1)).toMatchObject({ type: "progress", text: "answer text" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("M6n: a reservation arriving PAST the window inverts order — accepted, not a bug", async () => {
     // The cost of the time-boxed release, recorded so it cannot be mistaken for
     // a defect later. Once the window closes, the empty predecessor is treated
