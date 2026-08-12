@@ -26,12 +26,12 @@
       "blurb": "End-to-end encrypted web chat over an outbound NATS relay."
     },
     "compat": {
-      "pluginApi": ">=2026.6.10",
-      "minGatewayVersion": "2026.6.10"
+      "pluginApi": ">=2026.7.1",
+      "minGatewayVersion": "2026.7.1"
     },
     "build": {
-      "openclawVersion": "2026.6.10",
-      "pluginSdkVersion": "2026.6.10"
+      "openclawVersion": "2026.7.1-2",
+      "pluginSdkVersion": "2026.7.1-2"
     }
   },
   "engines": {
@@ -43,7 +43,7 @@
     "build": "esbuild index-nats.ts setup-entry.ts --bundle --platform=node --format=esm --target=es2023 --outdir=dist --packages=external"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.6.10"
+    "openclaw": ">=2026.7.1-2"
   },
   "peerDependenciesMeta": {
     "openclaw": {
@@ -53,7 +53,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.10",
-    "openclaw": "2026.6.10",
+    "openclaw": "2026.7.1-2",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"
   },

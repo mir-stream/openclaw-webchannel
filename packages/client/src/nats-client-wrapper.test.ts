@@ -2356,9 +2356,9 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(w.retract(heldId)).toBe(true);
   });
 
-  // 8. NL "stop"/"wait"/"Stop." mid-turn → bypass: published immediately, held untouched.
+  // 8. NL "stop"/"abort"/"Stop." mid-turn → bypass: published immediately, held untouched.
   it("8: NL abort words bypass the hold (publish immediately) and DO NOT touch held messages", () => {
-    for (const word of ["stop", "wait", "Stop."]) {
+    for (const word of ["stop", "abort", "Stop."]) {
       const w = makeWrapper();
       const spy = vi.spyOn(inner(w), "sendUserMessage");
       deliver(w, { type: "typing" });
@@ -2841,15 +2841,15 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(drafts[0].working).toBe(true); // re-engaged
   });
 
-  // 18c. Fix B1 scope: an NL abort word ("wait") must NOT finalize a working draft.
+  // 18c. Fix B1 scope: an NL abort word ("abort") must NOT finalize a working draft.
   it("18c: an NL abort word does not finalize a live working draft (only explicit /stop does)", () => {
     const w = makeWrapper();
     goOnline(w);
     const spy = vi.spyOn(inner(w), "sendUserMessage");
     deliver(w, { type: "progress", id: "webchannel-d", text: "partial…", turnId: "T" });
 
-    w.send("wait"); // NL abort → bypasses the hold, published, but NO finalize
-    expect(spy).toHaveBeenCalledWith("wait", expect.any(String));
+    w.send("abort"); // NL abort → bypasses the hold, published, but NO finalize
+    expect(spy).toHaveBeenCalledWith("abort", expect.any(String));
     expect(messages(w).find((m) => m.id === "webchannel-d")?.working).toBe(true);
   });
 

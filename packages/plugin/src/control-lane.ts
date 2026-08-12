@@ -32,7 +32,7 @@ import type { CommandGate } from "./command-gate.js";
  * Only `user_message` frames carry abort text — approvals and history frames are
  * never control-lane. `isAbortRequestText`
  * (openclaw/plugin-sdk/command-primitives-runtime) matches `/stop` plus the
- * natural-language abort vocabulary ("stop", "abort", "wait", …) after
+ * natural-language abort vocabulary ("stop", "abort", "halt", …) after
  * command-body normalization.
  */
 export function isControlLaneMessage(message: InboundWsMessage): boolean {
@@ -43,10 +43,10 @@ export function isControlLaneMessage(message: InboundWsMessage): boolean {
  * True ONLY for the unambiguous typed `/stop` command (case- and
  * surrounding-whitespace-insensitive), and nothing else.
  *
- * The NL abort vocabulary ("wait", "stop", "abort", …) still ABORTS the running
+ * The NL abort vocabulary ("halt", "stop", "abort", …) still ABORTS the running
  * turn — `isControlLaneMessage` keeps that full vocabulary for core/Telegram
  * parity, and must NOT be narrowed. But those NL words must not additionally
- * DESTROY the peer's buffered input: a user mid-conversation who types "wait" or
+ * DESTROY the peer's buffered input: a user mid-conversation who types "halt" or
  * "stop please" (a false-positive against the running turn) should lose at most
  * a spurious abort, never a queued follow-up message. Only the explicit typed
  * "/stop" — and the widget Stop button, which sends the literal "/stop" — opts
@@ -89,7 +89,7 @@ export function isExplicitAbortCommand(message: InboundWsMessage): boolean {
  * data loss is worse than a skipped cleanup. Core remains the authority for the
  * abort itself either way; this predicate only governs the destructive cleanup.
  *
- * NL abort vocabulary ("wait", "stop please") is excluded here exactly as in
+ * NL abort vocabulary ("halt", "stop please") is excluded here exactly as in
  * `isExplicitAbortCommand` — those still abort, but must never destroy buffered
  * input.
  */

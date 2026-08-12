@@ -523,7 +523,7 @@ describe("WebChannelNATSClient — #96 turnActive (turn-scoped in-flight signal)
   // ever arrives, so opening a turn for it would latch the flag forever.
   it("an NL abort publish does not open a turn (no latch)", async () => {
     const h = await connectWrapper();
-    h.wrapper.send("wait");
+    h.wrapper.send("abort");
     await settle();
     expect(h.received).toHaveLength(1); // it really was published
     expect(h.wrapper.getState().turnActive).toBeUndefined();
