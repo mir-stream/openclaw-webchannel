@@ -294,11 +294,11 @@ describe("#95 WP A — failed-turn persistence", () => {
   });
 
   /**
-   * `stopReason` is a declared field of the contract's `AssistantMessage`, so it
-   * is a safe basis for the additive `failed` field. It is discarded today — this
-   * pins the CURRENT loss, and flips when `failed` lands.
+   * `stopReason` is a declared field of the contract's `AssistantMessage`, which
+   * is why it is a safe basis for the additive `failed` field — no internal
+   * dependency.
    */
-  it("currently discards stopReason and the error detail", async () => {
+  it("marks a stopReason:'error' assistant row as failed", async () => {
     const out = await recent(
       makeApi([
         assistantMsg(1, [{ type: "text", text: "boom" }], "error", {
@@ -311,7 +311,54 @@ describe("#95 WP A — failed-turn persistence", () => {
     );
 
     expect(out).toHaveLength(1);
+    expect(out[0].failed).toBe(true);
+  });
+
+  /**
+   * `failed` is OMITTED, not `false`, on a healthy row — one representation for
+   * "not failed", which is also what an older plugin produces.
+   */
+  it("omits `failed` entirely on a healthy row", async () => {
+    const out = await recent(
+      makeApi([assistantMsg(1, [{ type: "text", text: "fine" }], "stop")]),
+      "session-key",
+      50,
+    );
+
+    expect(out).toHaveLength(1);
+    expect("failed" in out[0]).toBe(false);
     expect(Object.keys(out[0]).sort()).toEqual(["id", "role", "text", "ts"]);
+  });
+
+  /** A user row never carries `failed`; only assistant messages have stopReason. */
+  it("never marks a user row as failed", async () => {
+    const out = await recent(
+      makeApi([{ ...userMsg(1, "hi"), stopReason: "error" }]),
+      "session-key",
+      50,
+    );
+
+    expect(out).toHaveLength(1);
+    expect("failed" in out[0]).toBe(false);
+  });
+
+  /**
+   * The error DETAIL stays out of the wire. `errorMessage`/`errorCode` are
+   * provider strings that were never shown live; #95 surfaces only the boolean.
+   */
+  it("does not leak errorMessage or errorCode onto the wire", async () => {
+    const out = await recent(
+      makeApi([
+        assistantMsg(1, [{ type: "text", text: "boom" }], "error", {
+          errorMessage: "upstream 503 from api.example.com",
+          errorCode: "UNAVAILABLE",
+        }),
+      ]),
+      "session-key",
+      50,
+    );
+
+    expect(Object.keys(out[0]).sort()).toEqual(["failed", "id", "role", "text", "ts"]);
   });
 });
 

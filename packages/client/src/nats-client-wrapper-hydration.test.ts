@@ -299,6 +299,46 @@ describe("#95 WP B — additive wire fields (no protocol bump)", () => {
     expect(timeline(withFields)).toEqual(timeline(withoutFields));
   });
 
+  /** A `failed` row hydrates with the flag intact — the point of the field. */
+  it("carries `failed` onto a cold-hydrated bubble", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      history(
+        { id: "core-1", role: "user", text: "do the thing", ts: 1 },
+        { id: "core-2", role: "agent", text: "it broke", ts: 2, failed: true },
+      ),
+    );
+
+    const [, agent] = w.getState().messages;
+    expect(agent.failed).toBe(true);
+  });
+
+  /**
+   * A bubble ADOPTED mid-session must end up identical to a freshly hydrated
+   * one — otherwise the same transcript renders differently depending on whether
+   * the tab was open, which is the whole class of defect #95 exists to close.
+   */
+  it("an adopted bubble ends up identical to a cold-hydrated one", () => {
+    const rows: Row[] = [
+      { id: "core-1", role: "user", text: "do the thing", ts: 1 },
+      { id: "core-2", role: "agent", text: "it broke", ts: 2, failed: true },
+    ];
+
+    const live = makeWrapper();
+    live.send("do the thing");
+    deliver(live, { type: "agent_message", id: "webchannel-1", text: "it broke" });
+    deliver(live, history(...rows));
+
+    const cold = makeWrapper();
+    deliver(cold, history(...rows));
+
+    expect(live.getState().messages.map((m) => m.failed)).toEqual(
+      cold.getState().messages.map((m) => m.failed),
+    );
+    expect(live.getState().messages[1].failed).toBe(true);
+  });
+
   /** `ts` is optional on the wire; a row without it must still hydrate in order. */
   it("hydrates rows with no ts, preserving row order", () => {
     const w = makeWrapper();

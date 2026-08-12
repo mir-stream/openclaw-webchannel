@@ -16,6 +16,18 @@ export type HistoryMessage = {
   role: "user" | "agent";
   text: string;
   ts: number;
+  /**
+   * #95: the stored assistant message settled as a FAILURE. Derived from the
+   * contract-typed `AssistantMessage.stopReason === "error"` (exported from
+   * `openclaw/plugin-sdk/llm`), which the session-messages read path preserves.
+   *
+   * ADDITIVE AND OMITTED WHEN FALSE. Absent therefore means "not failed", and an
+   * older plugin — which never sets it — is indistinguishable from a healthy
+   * turn. That is a deliberate, documented degradation: a failed turn from an old
+   * plugin renders as an ordinary bubble, exactly today's behaviour. See
+   * `docs/ISSUE_95_HISTORY_CONTRACT_PLAN.md`.
+   */
+  failed?: boolean;
 };
 
 /** Resolved `channels.webchannel.history` config block. */
@@ -64,6 +76,8 @@ type RawSessionMessage = {
   content?: unknown;
   text?: unknown;
   timestamp?: unknown;
+  /** Contract field of `AssistantMessage` (`openclaw/plugin-sdk/llm`). */
+  stopReason?: unknown;
   __openclaw?: { id?: unknown };
 };
 
@@ -132,11 +146,15 @@ function normalize(raw: unknown, idx: number): HistoryMessage | null {
   const text = sanitizeHistoryText(role, rawText);
   if (!text) return null;
   const ts = extractTs(r.timestamp);
+  // Only an assistant message carries `stopReason`; a user row is never failed.
+  const failed = role === "agent" && r.stopReason === "error";
   return {
     id: extractId(r, ts, idx),
     role,
     text,
     ts,
+    // Omitted when false — absent is the single "not failed" representation.
+    ...(failed ? { failed: true } : {}),
   };
 }
 

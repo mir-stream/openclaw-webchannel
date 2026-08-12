@@ -191,7 +191,14 @@ export type InboundMessage = {
   options?: Array<{ decision: string; label: string; style: string }>;
   expiresAtMs?: number;
   decision?: string;
-  messages?: Array<{ id: string; role: string; text: string; ts?: number }>;
+  /**
+   * #95 (additive; older plugins omit `failed`): hydrated transcript rows. The
+   * client re-declares this wire type (zero-dep package), so a new optional field
+   * here needs no plugin import. `failed` absent means "not failed" — an older
+   * plugin's failed turn is indistinguishable from a healthy one, a documented
+   * degradation rather than a silent one.
+   */
+  messages?: Array<{ id: string; role: string; text: string; ts?: number; failed?: boolean }>;
   /** #15: the still-pending approval set on an `approval_snapshot` frame. */
   approvals?: Array<{
     id: string;

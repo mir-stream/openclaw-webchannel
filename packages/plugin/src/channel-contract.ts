@@ -3,7 +3,36 @@ import type { CommandCatalogEntry } from "./commands-catalog.js";
 
 export const WEBCHANNEL_ID = "webchannel";
 export { ANON_PEER_ID };
-export type HistoryMessage = { id: string; role: "user" | "agent"; text: string; ts?: number };
+/**
+ * A hydrated transcript row on the wire.
+ *
+ * WHAT HYDRATION PRESERVES, and what it does not (#95). A reloaded timeline
+ * carries role, text, order, row identity, and failure state — and NOTHING a
+ * client derived while live. Specifically absent by design:
+ *
+ *  - `turnId`. The live turn id is the CLIENT's own `user_message.id`
+ *    (`inbound.ts:220-222`); core never stores it, and no field on a stored
+ *    message correlates two assistant messages to one agent turn. There is no
+ *    value to put here, so grouping cannot survive a reload. See #114 for the
+ *    mechanism that would change this.
+ *  - `working`, `wireId`, `sendState` — live-only client state.
+ *  - reasoning previews, typing, and tool progress — ephemeral by design
+ *    (`docs/P1_REASONING_LANE_PLAN.md`), matching what Telegram does.
+ *
+ * `failed` is ADDITIVE and OMITTED WHEN FALSE; absent means "not failed".
+ * Additive optional fields deliberately do NOT bump
+ * `WEBCHANNEL_PROTOCOL_VERSION`: the handshake is strict equality with no
+ * negotiation, so a bump hard-fails every deployed pair until both redeploy.
+ *
+ * Full rationale: `docs/ISSUE_95_HISTORY_CONTRACT_PLAN.md`.
+ */
+export type HistoryMessage = {
+  id: string;
+  role: "user" | "agent";
+  text: string;
+  ts?: number;
+  failed?: boolean;
+};
 
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
 export type ApprovalOption = { decision: ApprovalDecision; label: string; style: string };

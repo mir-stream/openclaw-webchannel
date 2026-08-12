@@ -2035,10 +2035,21 @@ export class WebChannelNATSClient {
          */
         let cursor = 0;
 
-        const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
+        const adoptAt = (
+          idx: number,
+          m: { id: string; text: string; ts?: number; failed?: boolean },
+        ): void => {
           // Keep the canonical stored text on adoption, so this device
-          // converges to exactly what a reloading device would render.
-          next[idx] = { ...next[idx], id: m.id, text: m.text, ts: m.ts };
+          // converges to exactly what a reloading device would render. #95: the
+          // row's `failed` is authoritative for the same reason — an adopted
+          // bubble must end up identical to a freshly hydrated one.
+          next[idx] = {
+            ...next[idx],
+            id: m.id,
+            text: m.text,
+            ts: m.ts,
+            ...(m.failed === true ? { failed: true } : {}),
+          };
           claimed.add(idx);
           localIndexById.set(m.id, idx);
           adopted = true;
@@ -2106,6 +2117,9 @@ export class WebChannelNATSClient {
             text: m.text,
             ts: m.ts,
             working: false,
+            // #95: omitted when absent/false, so "not failed" has one
+            // representation and an older plugin's rows are unchanged.
+            ...(m.failed === true ? { failed: true } : {}),
           });
           inserts.set(cursor, atCursor);
           anchor = null;
