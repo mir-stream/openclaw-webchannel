@@ -408,7 +408,7 @@ set -e
 # with which tool). Print it next to the driver's frame log so a CI failure can
 # be diagnosed without re-running.
 echo "[run-multi-message] echo provider log:"
-grep -E '^\[echo\] (multi|tool-first|WARN)' "$OCH/echo.log" || echo "  (none)"
+grep -E '^\[echo\] (multi|tool-first|WARN|FAIL)' "$OCH/echo.log" || echo "  (none)"
 
 # …and ASSERT on it. The driver can only see frames; it cannot tell "the plugin
 # handled two assistant messages correctly" from "the provider never produced a

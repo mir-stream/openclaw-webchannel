@@ -20,10 +20,14 @@
  *     text PLUS a `tool_calls` entry, `finish_reason:"tool_calls"`;
  *   phase 2 (a `role:"tool"` message is present) → ordinary assistant content =
  *     message B's text, `finish_reason:"stop"`.
- * Core's openai-completions adapter parses streamed `tool_calls` deltas
- * (node_modules/openclaw/dist/openai-completions-vbhA-xck.js:579-581) and maps
- * `finish_reason:"tool_calls"` to `stopReason:"toolUse"` (:1017-1018), so this
- * really does run core's tool loop — it is not a synthetic second message.
+ * Core's openai-completions adapter parses the streamed `tool_calls` deltas and
+ * maps `finish_reason:"tool_calls"` onto its tool loop, so this really does run
+ * core's own loop — it is not a synthetic second message. That is asserted
+ * empirically rather than cited: run-multi-message.sh requires BOTH phase lines
+ * in the provider log, and the phase-2 request carries a real `role:"tool"`
+ * result core produced by executing the tool. (An earlier version of this note
+ * cited a hashed dist path; that path does not exist in 2026.7.1-2, which is
+ * exactly how such citations rot.)
  * ECHO_MULTI_MSG_TOOL must name a tool core ACTUALLY advertises in `body.tools`
  * and can execute; the default `agents_list` is side-effect-free, takes no
  * arguments, and touches no filesystem or network state.
@@ -86,6 +90,10 @@ const TOOL_FIRST_STREAM_GAP_MS = parseInt(
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let multiToolCallSeq = 0;
+// Runaway-tool-loop guard; see the phase scan below. A healthy turn issues
+// exactly one phase-1 response, so anything above a couple is already broken.
+const TOOL_LOOP_MAX = parseInt(process.env.ECHO_TOOL_LOOP_MAX || "4", 10);
+let consecutivePhase1 = 0;
 
 /**
  * True for openclaw's RUNTIME-CONTEXT message — a `role:"user"` message the
@@ -210,18 +218,61 @@ const server = createServer(async (req, res) => {
       // Phase is decided by the transcript, not by a counter: once core has run
       // the tool it feeds the result back as a `role:"tool"` message.
       //
-      // Scope that to THIS turn — messages after the last `role:"user"` one.
-      // A second marker turn in the same session still carries the PREVIOUS
-      // turn's `role:"tool"` message, so scanning the whole array reports
-      // phase 2 on the very first request and the turn never makes a tool call
-      // at all. That silently downgrades a two-assistant-message fixture to an
-      // ordinary one-message turn, and the harness then passes while testing
-      // nothing.
+      // Scope that to THIS turn — the messages after the last USER-AUTHORED
+      // one. Both halves of that phrase are load-bearing, and each has already
+      // broken this fixture once:
+      //
+      //  - Not scoping to the turn: a second marker turn in the same session
+      //    still carries the PREVIOUS turn's `role:"tool"` message, so a
+      //    whole-array scan reports phase 2 on the very first request and the
+      //    turn makes no tool call at all — silently downgrading a
+      //    two-assistant-message fixture to an ordinary one-message turn.
+      //  - Not requiring USER-AUTHORED: since 2026.7.1 core appends its runtime
+      //    context as its own trailing `role:"user"` entry, and — measured on
+      //    the wire at 2026.7.1-2 — it lands AFTER the tool result, not beside
+      //    the user's turn:
+      //
+      //      0 system  1 user(real)  2 assistant(tool_calls)  3 tool  4 user(rtctx)
+      //
+      //    so a plain `lastIndexOf("user")` lands on index 4, slices an EMPTY
+      //    tail, reports phase 1 forever, and spins core's tool loop without
+      //    bound (observed: 1195 iterations, the transcript growing an
+      //    assistant/tool pair each time). Same 2026.7.1 change, and the same
+      //    fix, as `lastUserText` above.
+      //
+      // Either way the harness would pass while testing nothing, so the
+      // runaway guard below and run-multi-message.sh's phase-line assertions
+      // both exist to make that failure loud instead of green.
       const messages = Array.isArray(body.messages) ? body.messages : [];
-      const lastUserIndex = messages.map((m) => m?.role).lastIndexOf("user");
+      const lastUserIndex = messages.reduce(
+        (found, m, i) =>
+          m?.role === "user" && !isRuntimeContextText(messageText(m) ?? "") ? i : found,
+        -1,
+      );
       const toolResultSeen = messages
         .slice(lastUserIndex + 1)
         .some((m) => m && m.role === "tool");
+
+      // Runaway guard. If phase detection ever breaks again the failure mode is
+      // an unbounded tool loop, which previously showed up only as a post-hoc
+      // grep of a 2500-line log. Fail loudly on the spot instead.
+      if (!toolResultSeen && ++consecutivePhase1 > TOOL_LOOP_MAX) {
+        // Once only: core retries the 500 a few times, and the first line
+        // already carries everything needed to diagnose it.
+        if (consecutivePhase1 === TOOL_LOOP_MAX + 1) {
+          console.log(
+            `[echo] FAIL runaway tool loop — ${consecutivePhase1} consecutive phase-1 responses ` +
+              `with no tool result in the tail. Roles seen: ` +
+              `[${messages.map((m) => m?.role).join(",")}], lastUserIndex=${lastUserIndex}. ` +
+              `Phase detection is broken; refusing to spin core's tool loop further.`,
+          );
+        }
+        res.statusCode = 500;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ error: { message: "echo harness: runaway tool loop" } }));
+        return;
+      }
+      if (toolResultSeen) consecutivePhase1 = 0;
 
       if (!toolResultSeen) {
         const callId = `call_issue94_${++multiToolCallSeq}`;
