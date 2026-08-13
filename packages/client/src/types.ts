@@ -134,7 +134,12 @@ export type ChatMessage = {
    * render field. @internal
    */
   receiptKey?: string;
-  /** Ephemeral live-turn correlation. History messages intentionally omit it. */
+  /**
+   * Ephemeral live-turn correlation. History messages omit it because the exact
+   * client-generated `user_message.id` is not available on the stored messages
+   * returned to the history projection. Raw transcript boundaries may still
+   * provide structural grouping evidence, but cannot recover this exact id.
+   */
   turnId?: string;
   /**
    * P1-9: true while this user message is HELD locally (a turn was in flight
