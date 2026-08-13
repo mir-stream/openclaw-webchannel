@@ -260,15 +260,23 @@ boot_agent() {
   # full browser roundtrip could not be re-verified without it in this env;
   # it is harmless (it only affects non-webchannel channels + the core doctor).
   #
-  # agents.defaults.reasoningDefault "stream" below opts this demo into the P1-3
-  # reasoning lane (level-gated; default is "off"), so a zai thinking model shows
-  # its reasoning in the widget. The echo stand-in produces no reasoning — harmless.
+  # The webchannel reasoning lane is gated on the CHANNEL-PRIVATE
+  # `channels.webchannel.capabilities.reasoning`, which defaults ON (#113), so
+  # this demo needs no config to show reasoning — a zai thinking model streams it
+  # into the widget out of the box. The echo stand-in produces none, harmless.
+  #
+  # `agents.defaults.reasoningDefault` is deliberately NOT set: the plugin stopped
+  # reading it. Core co-parses that key and INVALIDATES it for unauthorized
+  # senders, which our browser peers are by design, so it resolved to "off" and
+  # the lane never emitted. What actually makes core stream is the plugin passing
+  # `streamReasoningInNonStreamModes`. To turn the lane OFF here, add
+  # "capabilities": { "reasoning": false } to the webchannel block below.
   cat > "$home/.openclaw/openclaw.json" <<JSON
 {
   "gateway": { "mode": "local", "bind": "loopback" },
   "session": { "dmScope": "per-channel-peer" },
   "models": { "providers": { $PROVIDER_BLOCK } },
-  "agents": { "defaults": { "model": { "primary": "$PRIMARY_MODEL" }, "compaction": { "reserveTokensFloor": 20000 }, "reasoningDefault": "stream" } },
+  "agents": { "defaults": { "model": { "primary": "$PRIMARY_MODEL" }, "compaction": { "reserveTokensFloor": 20000 } } },
   "messages": { "inbound": { "byChannel": { "webchannel": 300 } } },
   "plugins": {
     "load": { "paths": ["$REPO/packages/plugin"] },

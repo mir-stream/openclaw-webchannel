@@ -413,6 +413,70 @@ export function resolveTypingEnabled(accountConfig: WebchannelAccountConfig): bo
   return (capabilities?.typing ?? "on") !== "off";
 }
 
+/**
+ * Resolve whether the REASONING lane is enabled for an account (#113).
+ *
+ * Reads the account's merged `capabilities.reasoning` (channel-level shared base
+ * under the account override — pass a config already resolved via
+ * `resolveWebchannelAccountConfig`), exactly like `resolveTypingEnabled` above.
+ *
+ * DEFAULT ON — an ABSENT key enables the lane. The consumer already ships the
+ * reasoning UI, so a deployment that has not hand-edited its config renders an
+ * empty Reasoning shell on every turn; that empty shell is the exact symptom
+ * #113 exists to remove, and defaulting OFF would have left it in place for
+ * everyone who never read this file.
+ *
+ * The rule is `absent → ON; present-and-not-boolean-true → OFF`, NOT a `!== false`
+ * truthiness test. That distinction is the whole safety argument and it survives
+ * the default flip intact:
+ *
+ *   - `capabilities.typing` next door spells its values `"on"` / `"off"`, so
+ *     `reasoning: "off"` is the FIRST thing an operator copying the sibling key
+ *     reaches for when they want the lane disabled;
+ *   - under `!== false` that string is truthy and would KEEP reasoning on, i.e.
+ *     silently defeat the operator's intent — and now in the privacy-losing
+ *     direction, because reasoning can restate file contents, credentials, or the
+ *     user's own prompt to the least trusted surface this plugin serves;
+ *   - so every PRESENT value that is not boolean `true` fails CLOSED: `false`,
+ *     `"off"`, `"false"`, `"true"`, `"on"`, `0`, `1`, `null`. Someone who typed
+ *     something gets the safe reading of it; only someone who typed NOTHING gets
+ *     the new default.
+ *
+ * The channel-level JSON schema rejects the string spellings, but named-account
+ * leaves are deliberately unvalidated. This resolver therefore owns the final
+ * privacy boundary: a present malformed `capabilities` container fails closed,
+ * as does every present `reasoning` value other than boolean `true`.
+ *
+ * Note this is only the CHANNEL half of the gate. Reasoning also requires the
+ * model's own thinking level to be something other than "off" (`canShowReasoning`
+ * in core), which no amount of channel config can force. That precondition is why
+ * an opened-but-silent lane surfaces a diagnostic rather than an empty section —
+ * see the turn-scoped warning in inbound.ts.
+ */
+export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig): boolean {
+  const capabilities = accountConfig?.capabilities;
+  // Only an omitted container gets the ON default. Named-account leaves are
+  // intentionally schema-unvalidated, so `null`, arrays, strings, numbers and
+  // class instances can reach this seam and must not erase an inherited opt-out
+  // by being mistaken for an absent object.
+  if (capabilities === undefined) return true;
+  if (
+    capabilities === null ||
+    typeof capabilities !== "object" ||
+    Array.isArray(capabilities)
+  ) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(capabilities);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+
+  // A valid plain object with no key keeps the default ON. Once the key is
+  // present, only literal boolean `true` opens the lane; even an explicit
+  // `undefined` fails closed rather than being confused with omission.
+  if (!Object.prototype.hasOwnProperty.call(capabilities, "reasoning")) return true;
+  return (capabilities as { reasoning?: unknown }).reasoning === true;
+}
+
 /** Read an account's merged `nats` config block (for credential-source resolution). */
 export function resolveAccountNatsConfig(
   cfg: unknown,

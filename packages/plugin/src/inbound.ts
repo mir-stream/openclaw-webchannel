@@ -1,4 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+// #113: the reply-options contract, used to compile-check the reasoning fragment
+// below against the SDK rather than trusting the field name by eye.
+import type { GetReplyOptions } from "openclaw/plugin-sdk/reply-runtime";
 import {
   isReplyPayloadNonTerminalToolErrorWarning,
   type ReplyPayload,
@@ -7,9 +10,16 @@ import {
 import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
-import { DEFAULT_WEBCHANNEL_ACCOUNT_ID, resolveWebchannelAccountConfig } from "./account-config.js";
+import {
+  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  resolveWebchannelAccountConfig,
+  resolveReasoningEnabled,
+} from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
-import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
+import {
+  hasExplicitSessionReasoningOptOut,
+  type ReasoningOptOutStoreAccess,
+} from "./reasoning-opt-out.js";
 import {
   getApprovalOriginRegistry,
   type ApprovalOriginLease,
@@ -128,8 +138,18 @@ export async function deliverDraftFinalPayload(
  *
  * One `runId` emits several `start`/`finishing` pairs under model fallback;
  * only `end`/`error` are terminal, and the last one wins.
+ *
+ * #113: `"aborted"` is a THIRD verdict that is deliberately outcome-equivalent to
+ * `"ok"`. The `aborted` bit was previously computed and thrown away, collapsing a
+ * user cancellation into `"ok"` and leaving nothing downstream able to tell the
+ * two apart. The turn-outcome reader below tests `=== "error"` and `=== undefined`
+ * ONLY, so `"aborted"` takes exactly the same branches `"ok"` did and #89's
+ * settlement semantics are unchanged (an abort still settles `ok` until #89 adds
+ * a `cancelled` wire value). The distinction exists so the reasoning diagnostic
+ * can stay silent on a cancelled turn, which produced no reasoning because the
+ * user stopped it — not because anything is misconfigured.
  */
-type AgentRunVerdict = "ok" | "error";
+type AgentRunVerdict = "ok" | "error" | "aborted";
 
 /** Terminal verdict per agent run, drained by the turn that owns the run. */
 const agentRunVerdicts = new Map<string, AgentRunVerdict>();
@@ -141,6 +161,36 @@ let lifecycleUnsubscribe: (() => void) | undefined;
  * turn that never settles (a control-lane turn, or a crashed dispatch).
  */
 const MAX_TRACKED_RUNS = 512;
+
+/**
+ * #113: accounts that have already been told their reasoning lane is coming up
+ * empty. ONE warning per account per process, not per turn.
+ *
+ * Per-turn was the first cut and it was wrong once `capabilities.reasoning`
+ * defaulted ON. A deployment whose model simply does not emit reasoning is
+ * indistinguishable, from this side, from one that is misconfigured — so a
+ * per-turn warning fires on EVERY answered turn, forever. That does not inform an
+ * operator; it gets filtered out of the log pipeline, after which the diagnostic
+ * does not fire at all in any sense that matters. A warning is worth as much as it
+ * is rare.
+ *
+ * The latch is deliberately SEPARATE from the qualifying guards at the warn site.
+ * Those decide whether a turn COUNTS (it answered successfully and was not known
+ * to be aborted); this decides whether we have already said it. Folding them
+ * together would lose the distinction the next reader needs.
+ *
+ * Cleared by `stopAgentLifecycleSubscription`, i.e. a reload re-arms it. That is
+ * intended — a reload is the seam where config can change, so an operator who just
+ * edited their config gets told again whether it worked.
+ */
+const reasoningEmptyLaneWarned = new Set<string>();
+
+/**
+ * Backstop only, mirroring MAX_TRACKED_RUNS above. Accounts come from config, not
+ * from peers, so this cap is not reachable in normal operation; it bounds the leak
+ * rather than trusting that. Eviction only costs a repeat warning.
+ */
+const MAX_WARNED_ACCOUNTS = 512;
 
 /**
  * Subscribe to the lifecycle stream. A no-op when the host predates the API.
@@ -163,7 +213,9 @@ export function startAgentLifecycleSubscription(api: OpenClawPluginApi): void {
   getApprovalOriginRegistry();
   const events = api.runtime?.events;
   if (!events || typeof events.onAgentEvent !== "function") return;
-  stopAgentLifecycleSubscription();
+  // Replace, don't stack. NOT a teardown: this must not re-arm the #113
+  // empty-lane warning (see releaseAgentLifecycleSubscription).
+  releaseAgentLifecycleSubscription({ rearmDiagnostics: false });
   lifecycleUnsubscribe = events.onAgentEvent((evt) => {
     if (evt?.stream !== "lifecycle") return;
     const runId = evt.runId;
@@ -184,16 +236,45 @@ export function startAgentLifecycleSubscription(api: OpenClawPluginApi): void {
       const oldest = agentRunVerdicts.keys().next();
       if (!oldest.done) agentRunVerdicts.delete(oldest.value);
     }
+    // #113: record the abort instead of collapsing it into "ok". Outcome-
+    // equivalent by construction (see AgentRunVerdict) — this does NOT change
+    // what any turn settles.
     const aborted = data?.aborted === true;
-    agentRunVerdicts.set(runId, phase === "error" && !aborted ? "error" : "ok");
+    agentRunVerdicts.set(
+      runId,
+      aborted ? "aborted" : phase === "error" ? "error" : "ok",
+    );
   });
 }
 
-/** Release the lifecycle subscription and drop any verdicts still pending. */
+/**
+ * Release the lifecycle subscription and drop any verdicts still pending.
+ *
+ * #113: also re-arms the empty-reasoning-lane warning. Teardown is where config
+ * can change, so the next generation gets to say its piece once more.
+ */
 export function stopAgentLifecycleSubscription(): void {
+  releaseAgentLifecycleSubscription({ rearmDiagnostics: true });
+}
+
+/**
+ * The teardown body, shared by the exported stop and by
+ * `startAgentLifecycleSubscription`'s replace-don't-stack path.
+ *
+ * #113: `rearmDiagnostics` is why this split exists. `start` calls teardown to
+ * avoid stacking listeners, so folding the empty-reasoning-lane re-arm into the
+ * exported `stop` alone would ALSO re-arm on every subscription start — and
+ * `registerFull` runs per plugin generation, so a multi-account host would clear
+ * one account's latch by starting another's runtime. "Once per process" has to
+ * mean once per process. Only a real teardown re-arms.
+ */
+function releaseAgentLifecycleSubscription(options: {
+  rearmDiagnostics: boolean;
+}): void {
   lifecycleUnsubscribe?.();
   lifecycleUnsubscribe = undefined;
   agentRunVerdicts.clear();
+  if (options.rearmDiagnostics) reasoningEmptyLaneWarned.clear();
   // #93: host teardown draws a new approval-origin barrier. Any request the
   // gateway replays from BEFORE this point can no longer be attributed to a
   // live run, so it is refused rather than matched against whatever is running
@@ -268,7 +349,11 @@ export async function handleInboundMessage(
   peerId: string,
   message: InboundUserMessage,
   accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  options?: { controlLane?: boolean },
+  options?: {
+    controlLane?: boolean;
+    /** Injectable only so the session opt-out privacy boundary is testable. */
+    reasoningOptOutStore?: ReasoningOptOutStoreAccess;
+  },
 ): Promise<void> {
   // `wsKey` is the verified per-peer id the transport uses as its socket-map
   // key (the anonymous strategy is the single-peer special case, where this
@@ -291,6 +376,14 @@ export async function handleInboundMessage(
     `webchannel-turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   let draft: ProgressDraftController | undefined;
   let reasoning: ReasoningDraftController | undefined;
+  // #113: did core hand us even ONE reasoning payload this turn? Counted at the
+  // native callback / durable-delivery boundaries, NOT inside the controller:
+  // the controller legitimately drops payloads (empty text, exact-duplicate
+  // cumulative snapshots, the btw stale-prefix strip), and those drops mean
+  // "core emitted reasoning, we filtered", which is NOT the misconfiguration
+  // the turn-end warning is about. A lane that saw neither form is the surprising
+  // case the warning diagnoses.
+  let reasoningPayloadSeen = false;
   let finalReplyDelivered = false;
   let turnOutcome: "ok" | "error" = "ok";
   // #87: a provider-rejected turn does NOT throw — core absorbs the failure and
@@ -384,8 +477,9 @@ export async function handleInboundMessage(
       logger: api.logger,
     });
   }
-  // Reasoning lane is created AFTER route resolution (below), once we can resolve
-  // the session's reasoning display level.
+  // Reasoning lane is created after route resolution (below), alongside the other
+  // per-turn lanes. Its gate reads only `channelConfig`, so the placement is for
+  // locality with the reply-options wiring, not a data dependency on the route.
 
   // Resolve the channel-scoped agent route, then FORCE the per-account-channel-
   // peer session scope (see `resolveWebchannelSessionRoute`). Binding-based agent
@@ -428,27 +522,50 @@ export async function handleInboundMessage(
     evidence: controlLane ? "presence" : "origin",
   });
 
-  // Reasoning display policy (CHANNEL-OWNED). OpenClaw's plugin dispatch path
-  // forwards `onReasoningStream` with no reasoning-level gate of its own (ACP
-  // always snapshots; btw emits at any level != "off" — dist/run-attempt
-  // -DRhLt3eF.js:4114-4117, dist/btw-CDO5476N.js:617-627), so the CHANNEL decides
-  // whether reasoning reaches the browser. Mirroring the Telegram reference
-  // (streams only at "stream", suppresses at "off" — dist/bot-Dxj27QDQ.js:6441,
-  // :6582), we wire the lane ONLY when the resolved session reasoning level is
-  // "stream". Resolution is session-store-first, fail-closed to "off" on a store
-  // read error, with the `agents.*.reasoningDefault` config default otherwise
-  // (see reasoning-level.ts). Default is "off": no ambient reasoning ever streams
-  // to a widget unless the operator/session explicitly opted into "stream". The
-  // control lane (/stop) never opens a reasoning lane while aborting another turn.
-  if (!controlLane) {
-    const reasoningLevel = resolveWebchannelReasoningLevel({
+  // Reasoning display policy (CHANNEL-OWNED, #113). The primary gate is this
+  // channel's OWN `capabilities.reasoning` key — see resolveReasoningEnabled in
+  // account-config.ts. Default ON: an ABSENT key opens the lane, while a PRESENT
+  // value that is not boolean `true` closes it (so `reasoning: "off"`, the
+  // spelling the `capabilities.typing` sibling invites, fails closed instead of
+  // reading as truthy).
+  //
+  // It deliberately does NOT read `agents.*.reasoningDefault`. That key is
+  // co-parsed by core, which INVALIDATES it for the ordinary unauthorized sender
+  // and forces "off". Reading the same key here made the two resolvers disagree —
+  // we opened the lane, core resolved "off" and (before the non-stream lever)
+  // never emitted — so the lane could not be turned on at all, and failed
+  // SILENTLY: the turn settled `ok` with the answer intact and simply zero
+  // reasoning frames. A channel-private key that core does not co-parse is the
+  // whole point. Deployments may separately authorize named peers through core's
+  // supported command allowlist; the explicit-session veto below covers them.
+  //
+  // One session value remains authoritative as a privacy VETO: an allowlisted
+  // browser peer can legitimately run `/reasoning off`, and core persists that
+  // explicit choice as `sessionEntry.reasoningLevel="off"`. The non-stream lever
+  // treats core mode `off` as streamable, so without this narrow read a later
+  // turn would contradict core's "Reasoning visibility disabled" acknowledgement.
+  // We therefore close only for the persisted explicit `off` (or an unreadable
+  // store, where it cannot be ruled out). Absent state and `on`/`stream` do not
+  // veto; config defaults remain intentionally ignored.
+  //
+  // Opening the lane is necessary but NOT sufficient. `canShowReasoning` in core
+  // (thinkingLevel !== "off") is an independent precondition that no channel
+  // config can force, which is why the `finally` below warns when an opted-in lane
+  // ends having received nothing.
+  //
+  // The control lane (/stop) never opens a reasoning lane while aborting another
+  // turn.
+  const reasoningEnabled =
+    !controlLane &&
+    resolveReasoningEnabled(channelConfig) &&
+    !hasExplicitSessionReasoningOptOut({
       cfg: api.config,
       agentId: route.agentId,
       sessionKey: route.sessionKey,
+      store: options?.reasoningOptOutStore,
     });
-    if (reasoningLevel === "stream") {
-      reasoning = createReasoningDraftController({ transport, sessionKey: wsKey, turnId });
-    }
+  if (reasoningEnabled) {
+    reasoning = createReasoningDraftController({ transport, sessionKey: wsKey, turnId });
   }
 
   // Native "Bot is typing…" affordance. We push the frame right after route
@@ -572,12 +689,58 @@ export async function handleInboundMessage(
                       agentRunId = runId;
                       originLease?.activate();
                     },
-                    // Reasoning callbacks are wired iff the lane opened above.
+                    // Reasoning callbacks and durable reasoning payloads are
+                    // enabled iff the lane opened above.
+                    //
+                    // #113: `streamReasoningInNonStreamModes` is the LEVER that
+                    // makes core actually emit. Without it core suppresses
+                    // reasoning on this dispatch path and the lane receives zero
+                    // payloads no matter what the channel wires — measured
+                    // against a live gateway: 0 frames without it, 5 with it, on
+                    // an otherwise identical unauthorized-peer config. It is a
+                    // public reply-options field declared next to
+                    // `onReasoningStream` on the pinned plugin-sdk contract
+                    // (openclaw >= 2026.7.1, which is why compat.pluginApi has
+                    // that floor); it does not exist at 2026.6.10.
+                    //
+                    // Passed ONLY when the lane is open. Asking core to stream
+                    // reasoning we would immediately discard is pointless, and
+                    // for an account that never opted in it would be a real
+                    // behaviour change in core's emission, not a no-op.
+                    //
+                    // The `satisfies` is load-bearing, not decoration. This
+                    // object reaches core through an inferred return type, so
+                    // the surrounding literal gets NO excess-property check —
+                    // verified by misspelling the field and watching tsc stay
+                    // green. A silently-ignored typo here reproduces the exact
+                    // bug this issue fixes (lane open, zero frames, turn `ok`).
+                    // Pinning the fragment to the SDK contract makes the field
+                    // name a compile error when it is wrong or when a future
+                    // pin drops it.
                     ...(reasoning
-                      ? {
-                          onReasoningStream: (p) => reasoning!.push(p),
+                      ? ({
+                          streamReasoningInNonStreamModes: true,
+                          // Core can emit `isReasoning:true` durable payloads for
+                          // mode `on`; its CLI runtime also emits the same final
+                          // snapshot through BOTH the live callback and durable
+                          // result paths. Opt durable payloads in only while our
+                          // separate lane exists; the controller suppresses that
+                          // exact replay only while its live burst remains open.
+                          // Independent durable blocks retain full text under
+                          // distinct ids and never enter live prefix accounting.
+                          reasoningPayloadsEnabled: true,
+                          onReasoningStream: (p) => {
+                            reasoningPayloadSeen = true;
+                            reasoning!.push(p);
+                          },
                           onReasoningEnd: () => reasoning!.endBurst(),
-                        }
+                        } satisfies Pick<
+                          GetReplyOptions,
+                          | "streamReasoningInNonStreamModes"
+                          | "reasoningPayloadsEnabled"
+                          | "onReasoningStream"
+                          | "onReasoningEnd"
+                        >)
                       : {}),
                     // Progress-draft callbacks (only when a draft exists, i.e.
                     // streaming.mode "progress"/"partial"). These fire DURING the
@@ -628,6 +791,12 @@ export async function handleInboundMessage(
                                   draft!.handleAssistantMessageBoundary();
                                 },
                                 onBlockReplyQueued: (payload, context) => {
+                                  // Durable reasoning belongs exclusively to the
+                                  // reasoning lane. Letting it reserve an answer
+                                  // lane would stall later answer partials and a
+                                  // reasoning cancel could retire an unrelated
+                                  // same-index answer reservation.
+                                  if (payload.isReasoning === true) return;
                                   draft!.noteBlockReplyQueued({
                                     assistantMessageIndex: context?.assistantMessageIndex,
                                     ...noticeFlagsOf(payload),
@@ -642,6 +811,7 @@ export async function handleInboundMessage(
               ? {
                   dispatcherOptions: {
                     onSkip: (payload, info) => {
+                      if (payload.isReasoning === true) return;
                       draft!.noteDeliveryLifecycle("skip", {
                         deliveryKind: info.kind,
                         assistantMessageIndex: info.assistantMessageIndex,
@@ -649,6 +819,7 @@ export async function handleInboundMessage(
                       });
                     },
                     onBeforeDeliverCancelled: (payload, info) => {
+                      if (payload.isReasoning === true) return;
                       draft!.noteDeliveryLifecycle("cancel", {
                         deliveryKind: info.kind,
                         assistantMessageIndex: info.assistantMessageIndex,
@@ -671,6 +842,24 @@ export async function handleInboundMessage(
             delivery: {
               deliver: async (payload, info) => {
                 const kind = info.kind;
+                // A durable reasoning payload is visible content, but never an
+                // ANSWER. Core emits this form for durable reasoning and as the
+                // CLI runtime's final replay of an open live snapshot; without
+                // this interception it either gets dropped (the pre-fix
+                // behavior) or leaks into the ordinary answer bubble. Always
+                // suppress it from that path, even defensively when no lane
+                // exists. Text-less payloads still count as core emission,
+                // matching the native callback boundary semantics.
+                if (payload.isReasoning === true) {
+                  if (reasoning) {
+                    reasoningPayloadSeen = true;
+                    reasoning.pushDurableBlock({
+                      text: payload.text,
+                      isReasoningSnapshot: payload.isReasoningSnapshot,
+                    });
+                  }
+                  return { visibleReplySent: false };
+                }
                 const noticeFlags = noticeFlagsOf(payload);
                 const isNotice = isCoreNoticePayload(payload);
                 const text = payload.text;
@@ -865,6 +1054,95 @@ export async function handleInboundMessage(
     }
     // A `verdict === "ok"` never downgrades the `catch` above: this block only
     // ever ASSIGNS "error".
+
+    // #113: the diagnostic that `capabilities.reasoning` owes its operator. The
+    // lane opened and core delivered neither a live callback nor a durable
+    // reasoning payload, so the widget showed an empty Reasoning section — the
+    // silent failure this issue exists to end.
+    //
+    // Placed AFTER the verdict resolution on purpose. It fires on a turn that
+    // ANSWERED SUCCESSFULLY and was not positively known to be aborted — that is
+    // the case where zero reasoning frames is actually surprising. Three ways a
+    // turn legitimately produces none, and what excludes each:
+    //   - the turn answered nothing the USER can see — tool-only work, a
+    //     suppressed reply, a final our transport could not ship, or a turn whose
+    //     only final was core chatter. `answerDelivered` excludes all of them;
+    //   - the provider failed terminally before emitting anything —
+    //     `turnOutcome === "ok"` excludes it, whether it threw or arrived as an
+    //     `isError` payload;
+    //   - the user aborted (/stop) — `verdict !== "aborted"` excludes it.
+    // Warning on any of those would make the operator learn to skip it, and it is
+    // worth only as much as it is rare.
+    //
+    // `answerDelivered` IS the completion signal, and it is what makes the loose
+    // verdict test safe. `answerDelivered`, NOT `finalReplyDelivered`: the two
+    // differ deliberately. `finalReplyDelivered` is set for any sent
+    // `kind === "final"` INCLUDING notices, while `answerDelivered` excludes them,
+    // because core's status, fallback and compaction chatter is not the turn's
+    // answer. So an aborted turn — whose terminal is core's own "agent was
+    // aborted" notice — and a command-only turn both fail this guard before the
+    // verdict is ever consulted.
+    //
+    // `verdict` is therefore a VETO on a positively-known abort, never the
+    // positive proof of normal completion. It is belt and braces for the one case
+    // the guards above miss: an abort landing after a real answer was already
+    // delivered.
+    //
+    // DO NOT tighten this to `verdict === "ok"`. That was tried and is wrong —
+    // measured on the live two-account gate, where `acctb`'s turns are ordinary,
+    // successfully-answered turns that carry a real `agentRunId` for which the
+    // map simply holds no entry:
+    //
+    //   acct=accta lane=true seen=false outcome=ok verdict=ok        answer=true -> warns
+    //   acct=acctb lane=true seen=false outcome=ok verdict=undefined answer=true -> SILENT
+    //   acct=acctb lane=true seen=false outcome=ok verdict=undefined answer=true -> SILENT
+    //
+    // A missing verdict is NORMAL for a multi-account deployment today, not the
+    // exotic no-lifecycle-host case: `startAgentLifecycleSubscription` releases
+    // the previous subscription before subscribing, so with N accounts only the
+    // last-registered account's `api` stays subscribed and only its runs ever
+    // record a verdict. That is pre-existing (it predates #113 and also degrades
+    // #87's turn-outcome classification for those accounts) and is filed
+    // separately — it is deliberately NOT worked around here. Under
+    // `=== "ok"` this diagnostic would be dead for every account but one.
+    //
+    // Scope is ONE warning per ACCOUNT per process (`reasoningEmptyLaneWarned`),
+    // NOT one per turn. The guards above decide whether this turn counts; the
+    // latch decides whether we have already said it. See the latch's own
+    // comment for why per-turn had to go: with the lane defaulting ON, a model
+    // that simply never reasons would emit this on every answered turn forever
+    // and get filtered out of the log pipeline entirely.
+    //
+    // The wording deliberately does NOT assert the cause. The plugin cannot
+    // observe the agent's thinking level, and a model that simply does not emit
+    // reasoning for this provider or this prompt produces an identical zero-frame
+    // turn. Claiming `thinkingLevel === "off"` would send an operator who already
+    // set it to `medium` hunting a misconfiguration that does not exist.
+    if (
+      reasoning &&
+      !reasoningPayloadSeen &&
+      turnOutcome === "ok" &&
+      answerDelivered &&
+      verdict !== "aborted" &&
+      !reasoningEmptyLaneWarned.has(accountId)
+    ) {
+      if (reasoningEmptyLaneWarned.size >= MAX_WARNED_ACCOUNTS) {
+        const oldest = reasoningEmptyLaneWarned.values().next();
+        if (!oldest.done) reasoningEmptyLaneWarned.delete(oldest.value);
+      }
+      reasoningEmptyLaneWarned.add(accountId);
+      api.logger?.warn?.(
+        `webchannel: reasoning lane received no frames for account=${JSON.stringify(accountId)} ` +
+          `peer=${JSON.stringify(wsKey)} turn=${JSON.stringify(turnId)} — ` +
+          `channels.webchannel.capabilities.reasoning is on, but core delivered no reasoning ` +
+          `for this turn. The most likely cause is an agent ` +
+          `thinking level of "off" (a model-side precondition this channel cannot override); ` +
+          `some models and providers also emit no reasoning at all. Check the agent's thinking ` +
+          `setting, or set capabilities.reasoning=false to stop opening the lane. ` +
+          `Logged once per account per process, so this is not a count of affected turns.`,
+      );
+    }
+
     if (settlementEligible) {
       // #99: this turn may be the merge of N buffered user messages (P1-8b layer
       // (b) coalescing). Each of them was ACKed and holds its own P0-4 receipt,

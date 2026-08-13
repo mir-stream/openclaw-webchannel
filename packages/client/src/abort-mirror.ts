@@ -44,14 +44,21 @@
  * NOT via the public barrel) so `packages/plugin/src/abort-mirror-contract.test.ts`
  * can enumerate exactly what the mirror accepts and assert the subset property
  * against the real SDK predicate.
- * `abort-primitives-*.js` `ABORT_TRIGGERS` (44 entries, including the non-Latin
+ * `abort-primitives-*.js` `ABORT_TRIGGERS` (43 entries, including the non-Latin
  * ones — do not transcribe by hand, re-copy on upgrade).
+ *
+ * RE-PINNED at openclaw 2026.7.1-2 (`dist/abort-primitives-Eo9j6lAM.js`). Core
+ * DROPPED `"wait"` between 2026.6.10 (44 entries,
+ * `dist/abort-primitives-aPROyEVZ.js`) and 2026.7.1-2 (43 entries); nothing was
+ * added. `abort-mirror-contract.test.ts` caught the removal mechanically, exactly
+ * as its header predicts, and the word is pruned here to restore the subset
+ * property. User-visible consequence: typing "wait" mid-turn no longer aborts —
+ * it is now ordinary text on BOTH sides, which is core's behaviour.
  */
 export const ABORT_TRIGGERS: ReadonlySet<string> = new Set([
   "stop",
   "esc",
   "abort",
-  "wait",
   "exit",
   "interrupt",
   "detente",

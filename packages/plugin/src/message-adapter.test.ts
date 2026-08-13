@@ -2149,12 +2149,14 @@ describe("ProgressDraftController — provisional preview transactions", () => {
 });
 
 describe("ReasoningDraftController", () => {
-  function setup() {
+  function setup(sendResults: boolean[] = []) {
     const frames: Array<{ id: string; turnId: string; text: string }> = [];
+    let sendIndex = 0;
     const transport = {
       sendReasoning: (_peer: string, id: string, turnId: string, text: string) => {
-        frames.push({ id, turnId, text });
-        return true;
+        const sent = sendResults[sendIndex++] ?? true;
+        if (sent) frames.push({ id, turnId, text });
+        return sent;
       },
     } as unknown as WebChannelPeerChannel;
     const controller = createReasoningDraftController({
@@ -2191,8 +2193,52 @@ describe("ReasoningDraftController", () => {
     controller.push({ text: "" });
     controller.push({});
     controller.push({ text: undefined });
+    controller.pushDurableBlock({ text: "" });
+    controller.pushDurableBlock({});
     controller.push({ text: "real" });
     expect(frames.map((frame) => frame.text)).toEqual(["real"]);
+  });
+
+  it("emits equal and shared-prefix durable blocks in full under distinct ids", () => {
+    const { controller, frames } = setup();
+    controller.pushDurableBlock({ text: "Plan" });
+    controller.pushDurableBlock({ text: "Plan" });
+    controller.pushDurableBlock({ text: "Plan carefully" });
+
+    expect(frames.map((frame) => frame.text)).toEqual(["Plan", "Plan", "Plan carefully"]);
+    expect(new Set(frames.map((frame) => frame.id)).size).toBe(3);
+  });
+
+  it("suppresses the CLI final replay only while its equal live burst is open", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "Plan" });
+    // Pinned CLI shape: no onReasoningEnd; the final live snapshot is prepended
+    // to the result as an equal durable isReasoning payload.
+    controller.pushDurableBlock({ text: "Plan" });
+    expect(frames.map((frame) => frame.text)).toEqual(["Plan"]);
+
+    // Once the live burst was closed, an equal independent durable block is not
+    // a proven replay and must retain its own wire id.
+    controller.pushDurableBlock({ text: "Plan" });
+    expect(frames.map((frame) => frame.text)).toEqual(["Plan", "Plan"]);
+    expect(frames[0]?.id).not.toBe(frames[1]?.id);
+  });
+
+  it("emits the CLI durable replay when its matching live send was rejected", () => {
+    const { controller, frames } = setup([false, true]);
+    controller.push({ text: "Plan" });
+    controller.pushDurableBlock({ text: "Plan" });
+
+    expect(frames.map((frame) => frame.text)).toEqual(["Plan"]);
+  });
+
+  it("closes live reasoning before emitting a non-equal durable block in full", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "Plan" });
+    controller.pushDurableBlock({ text: "Plan carefully" });
+
+    expect(frames.map((frame) => frame.text)).toEqual(["Plan", "Plan carefully"]);
+    expect(frames[0]?.id).not.toBe(frames[1]?.id);
   });
 
   it("rotates ids at a reasoning-end boundary and ignores late updates after stop", () => {
@@ -2252,6 +2298,21 @@ describe("ReasoningDraftController — btw stale-burst defense", () => {
     controller.endBurst();
     controller.push({ text: "AAA\n\nBBB" });
     expect(frames.map((f) => f.text)).toEqual(["AAA", "BBB"]);
+  });
+
+  it("recognizes an open burst's exact raw snapshot after display-prefix stripping", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "AAA" });
+    controller.endBurst();
+    controller.push({ text: "AAABBB" }); // displayed as BBB; raw snapshot is AAABBB
+
+    controller.pushDurableBlock({ text: "AAABBB" });
+    expect(frames.map((frame) => frame.text)).toEqual(["AAA", "BBB"]);
+
+    // The replay closed the live burst; equality no longer suppresses an
+    // independent durable block.
+    controller.pushDurableBlock({ text: "AAABBB" });
+    expect(frames.map((frame) => frame.text)).toEqual(["AAA", "BBB", "AAABBB"]);
   });
 
   it("falls through to a plain replace when a later burst does not carry the stale prefix", () => {

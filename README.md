@@ -35,6 +35,14 @@ to the JWT-attested device key, so review finding **C2** â€” active-relay MITM â
 Full detail, and reconciliation of the conflicting "AC 100% / complete" signals, is in
 [`docs/STATUS.md`](docs/STATUS.md).
 
+> **Upgrading: reasoning now streams to browsers by default.** As of #113 the
+> agent's reasoning/thinking stream is delivered to widgets unless you turn it
+> off. Reasoning can restate file contents, credentials, or the user's own
+> prompt, and browser peers are the least trusted surface this plugin serves, so
+> decide deliberately. To opt out, set `"capabilities": { "reasoning": false }`
+> in the `channels.webchannel` block (or per account under `accounts.<id>`).
+> Full note in [the changelog](packages/plugin/CHANGELOG.md).
+
 ## Repository layout
 
 ```

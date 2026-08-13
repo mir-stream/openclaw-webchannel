@@ -14,12 +14,38 @@ Reasoning delivery is independent of `channels.webchannel.streaming.mode` (the
 ANSWER streaming mode). `partial`, `progress`, `block`, and `off` still decide how
 answer/tool progress is rendered; they do not decide whether reasoning is shown.
 
-The reasoning lane is instead gated on the resolved SESSION reasoning level: it
-streams to the browser ONLY when that level is `stream`, mirroring the Telegram
-reference channel. The level is resolved session-store-first, fail-closed to `off`
-on a store-read error, otherwise from the `agents.*.reasoningDefault` config
-default (default `off`). So no ambient reasoning ever reaches a widget unless the
-operator/session explicitly opted into `stream`.
+The reasoning lane is instead gated on this channel's OWN
+`channels.webchannel.capabilities.reasoning` key (`resolveReasoningEnabled`,
+`account-config.ts`), which defaults **ON**: the lane opens unless the key is
+PRESENT and set to something other than boolean `true`. A persisted explicit
+session `/reasoning off` remains a privacy veto; absent session state does not.
+
+The default is ON because the consumer already ships the reasoning UI, so every
+deployment that has not hand-edited its config renders an empty `Reasoning` shell
+on each turn — the exact symptom this issue removes. A deployment that does not
+want reasoning on the wire sets `capabilities.reasoning: false`.
+
+> **Superseded (#113).** This section previously described the gate as the
+> resolved SESSION reasoning level, read session-store-first with
+> `agents.*.reasoningDefault` as the config default, mirroring Telegram. That
+> could never be turned on here, and failed silently. `agents.*.reasoningDefault`
+> is CO-PARSED by core, which invalidates it for unauthorized senders and forces
+> `off`. Ordinary WebChannel browser peers are unauthorized by default —
+> `inbound.ts` stamps `access.commands.authorized` on the control (`/stop`) lane
+> ONLY, though an operator may separately authorize named peers through core's
+> supported command allowlist. So on the default path the two
+> resolvers disagreed: ours said `stream` and opened the lane, core's said `off`
+> and never emitted. The turn settled `ok` with the answer intact and zero
+> reasoning frames. The gate is now a channel-private key that core does not
+> co-parse. The former effective-level resolver is deleted; the replacement
+> `reasoning-opt-out.ts` reads only an explicit persisted `off` and never falls
+> back to `agents.*.reasoningDefault`.
+
+Opening the lane is only the CHANNEL half of the gate. Core's `canShowReasoning`
+(the agent's own thinking level `!== "off"`) is an independent precondition that no
+channel config can override. When an opted-in lane ends a turn having received no
+payload at all, `inbound.ts` logs one warning naming that cause — see §3.2 — so the
+combination is diagnosed instead of showing an empty section.
 
 ## 2. Current-state facts
 
@@ -39,9 +65,43 @@ operator/session explicitly opted into `stream`.
   btw runner emits cumulative full text whenever the resolved level is not `off`,
   i.e. it emits at level `on` too (`dist/btw-CDO5476N.js:617-627`). WHETHER a
   channel shows reasoning to its client is therefore CHANNEL-OWNED display policy.
-  (The fields `requiresReasoningProgressOptIn` and
-  `streamReasoningInNonStreamModes` do NOT exist anywhere in the pinned dist —
-  an earlier draft of this plan invented them.)
+- `streamReasoningInNonStreamModes` and `requiresReasoningProgressOptIn` DO exist,
+  as public reply-options fields declared next to `onReasoningStream` on the
+  plugin-sdk reply-options contract.
+
+  > **Corrected (#113).** This section previously asserted that both fields "do
+  > NOT exist anywhere in the pinned dist — an earlier draft of this plan invented
+  > them." That was true at the then-current pin `2026.6.10` and is FALSE now.
+  > Both were added by `2026.7.1`, which is why `compat.pluginApi` was raised to
+  > `>=2026.7.1`. `streamReasoningInNonStreamModes: true` turns out to be the
+  > LEVER that makes core emit at all on this dispatch path: measured against a
+  > live gateway on an otherwise identical unauthorized-peer config, 0 reasoning
+  > frames without it and 5 with it. `inbound.ts` now passes it, but only on turns
+  > where the lane is actually open.
+  >
+  > `requiresReasoningProgressOptIn` is a marker core sets to say "the channel
+  > opted into this progress info; the user did not request a reasoning stream."
+  > Deferred to **#121** and deliberately NOT implemented: on this channel the
+  > marker is a CONSTANT. Core forces `reasoningMode` to `"off"` for our
+  > unauthorized peers, so EVERY payload carries it — it has zero runtime
+  > discriminating power, and a wire field that is always the same value earns
+  > nothing on either side. Reasoning therefore ships unmarked for now and the
+  > wire frame shape in §3.3 is unchanged.
+- Core has a second, durable reasoning form: at resolved reasoning mode `on`,
+  `includeReasoning` produces reply payloads marked `isReasoning: true`. The
+  public `reasoningPayloadsEnabled` reply
+  option admits those payloads only for channels with a separate lane. WebChannel
+  enables it with the lane, intercepts those payloads at `delivery.deliver`, and
+  feeds each one to the controller's complete-durable-block operation; they never
+  enter the ordinary answer path or its draft reservations. That operation emits
+  each full block under a distinct id and does not apply the live callback's btw
+  stale-prefix normalization. One pinned CLI exception is deduplicated: CLI
+  bridges its final snapshot through `onReasoningStream`, does not close that
+  burst, then prepends the exact same text as a durable payload. An exact match
+  while that live burst is still open and its last live send succeeded
+  closes/rotates it without a second frame; a rejected live send retains the
+  durable block as fallback. Independent equal or shared-prefix durable blocks
+  are never deduplicated.
 - Plugin and client wire unions independently declare frame shapes. A new frame
   must be added to every declaration; importing the Node-side plugin contract
   into the zero-dependency browser client is intentionally avoided.
@@ -62,38 +122,115 @@ WebChannel consumes the channel callback it intentionally exposes.
 An empty or non-string `payload.text` is ignored. WebChannel must not fall back to
 answer text when reasoning is absent.
 
-### 3.2 Reasoning is gated on the session reasoning level, not the answer mode
+### 3.2 Reasoning is gated on `capabilities.reasoning`, not the answer mode
 
 When the lane is active, an ordinary turn supplies:
 
+- `streamReasoningInNonStreamModes: true`
+- `reasoningPayloadsEnabled: true`
 - `onReasoningStream`
 - `onReasoningEnd`
 
 These are supplied (or not) INDEPENDENTLY of WebChannel's `partial`, `progress`,
 `block`, or `off` answer mode — including when no answer draft exists. What decides
-whether they are wired is the resolved SESSION reasoning level: the lane is wired
-ONLY when that level is `stream`.
+whether they are wired is `channels.webchannel.capabilities.reasoning`:
 
-Because the plugin dispatch path applies no reasoning-level gate of its own (see
-§2 — the ACP/btw runners emit at any level `!= off`), display policy is
-channel-owned, and WebChannel implements the same gate as the Telegram reference:
+- resolve it via `resolveReasoningEnabled` (`account-config.ts`) against the merged
+  account config, exactly like `capabilities.typing`;
+- the rule is `absent → ON; present-and-not-boolean-true → OFF`. It is deliberately
+  NOT a `!== false` truthiness test: `capabilities.typing` next door spells its
+  values `"on"`/`"off"`, so `reasoning: "off"` is the first thing an operator
+  reaches for to disable the lane, and under `!== false` that string is truthy and
+  would KEEP reasoning on — defeating their intent in the privacy-losing direction.
+  So `false`, `"off"`, `"false"`, `"true"`, `"on"`, `0`, `1`, `null` all fail
+  CLOSED; only an ABSENT key gets the ON default. A present malformed
+  `capabilities` container also fails closed. Channel-level malformed values are
+  schema errors, while deliberately unvalidated named-account leaves rely on
+  this runtime boundary;
+- wire the reasoning callbacks only when it resolves `true`.
 
-- resolve the level via `resolveWebchannelReasoningLevel` (`reasoning-level.ts`),
-  mirroring `resolveTelegramReasoningLevel` (`dist/bot-Dxj27QDQ.js:6029-6044`):
-  the session-store entry's `reasoningLevel` wins when it is `on`/`stream`/`off`;
-  a store-read throw is fail-closed to `off`; otherwise the config default from
-  `agents.list[…].reasoningDefault` → `agents.defaults.reasoningDefault` → `off`;
-- wire the reasoning callbacks only when that resolves to `stream`. At `off` or
-  `on` the callbacks are NOT wired and no reasoning frame is ever sent (Telegram
-  likewise streams its draft only at `stream`, `dist/bot-Dxj27QDQ.js:6441`, and
-  suppresses at `off`, `:6582`).
+After the capability opens the lane, `hasExplicitSessionReasoningOptOut` applies
+one narrow veto. An allowlisted peer can issue `/reasoning off`; pinned core
+persists `sessionEntry.reasoningLevel="off"` and acknowledges that visibility is
+disabled. Because the non-stream lever otherwise streams core mode `off`, the
+plugin must honor that explicit stored choice. An absent entry and explicit
+`on`/`stream` do not veto, so unauthorized peers with core's synthesized `off`
+still get the channel-owned default. The helper resolves the configured store
+path, reads and parses one raw snapshot, then gives that same verified object to
+pinned core's `resolveSessionStoreEntry` for target/alias resolution. `ENOENT`
+means an empty store; every other read error, empty/malformed JSON, or invalid
+top-level/entry shape fails closed. Core's `loadSessionStore` is deliberately not used
+because it converts those failures to `{}`. The helper never reads
+`agents.*.reasoningDefault`.
+
+`streamReasoningInNonStreamModes: true` and `reasoningPayloadsEnabled: true` are
+passed ONLY on turns where the lane is open. The first makes core emit live
+reasoning outside session mode `stream`; the second preserves mode `on`'s durable
+reasoning at the channel delivery seam. Asking core to emit reasoning we would
+immediately discard is pointless, and for an account that turned the lane off it
+would be a real behaviour change in core's emission rather than a no-op.
 
 The `/stop` control-lane turn is excluded: it never opens a reasoning lane while
-aborting another turn.
+aborting another turn, regardless of the config.
 
-This decision does not force reasoning generation. Existing OpenClaw/model/session
-reasoning policy remains authoritative; WebChannel only displays reasoning when the
-resolved level opts into `stream`.
+This decision does not force reasoning GENERATION. Core's `canShowReasoning` — the
+agent's own thinking level `!== "off"` — remains an independent precondition that
+no channel config can override. Because that combination (channel ON, model side
+impossible) would otherwise present as an empty section on an `ok` turn,
+`inbound.ts` logs ONE warning per ACCOUNT per PROCESS when an opened lane ends a
+qualifying turn having received no payload.
+
+The warning fires on a turn that ANSWERED SUCCESSFULLY and was not positively
+known to be aborted — that is where zero frames is surprising. It is suppressed
+when:
+
+- no answer was delivered (`answerDelivered` false) — tool-only work, a suppressed
+  reply, a final the transport could not ship, or a turn whose only final was core
+  chatter. `answerDelivered` excludes notices by design, where
+  `finalReplyDelivered` would not; with no answer on screen there is no empty
+  section beside it to explain;
+- the turn failed terminally (`turnOutcome === "error"`) — the operator already has
+  a real error and a second, wrong diagnosis is noise;
+- the user aborted (`/stop`), vetoed by `verdict !== "aborted"`. #89's settled
+  value for an abort is still `ok`, so `turnOutcome` alone cannot see it.
+
+`answerDelivered` is the COMPLETION signal; `verdict` is only a veto on a
+positively-known abort, never positive proof of normal completion. An aborted
+turn's terminal is core's own "agent was aborted" chatter, which `answerDelivered`
+already excludes, so the veto exists for the single case the other guards miss: an
+abort landing after a real answer was delivered.
+
+The verdict test must NOT be tightened to `verdict === "ok"`. That was tried and
+measured wrong on the live two-account gate: a second account's ordinary,
+successfully-answered turns carry a real `agentRunId` for which
+`agentRunVerdicts` holds no entry, so they resolve `verdict === undefined` and go
+silent. A missing verdict is normal for multi-account deployments today —
+`startAgentLifecycleSubscription` releases the previous subscription before
+subscribing, so only the last-registered account's runs ever record one. That is
+pre-existing (it predates #113 and also degrades #87's classification for those
+accounts), filed separately, and deliberately not worked around here. Under
+`=== "ok"` the diagnostic would be dead for every account but one.
+
+The wording deliberately does NOT assert the cause. The plugin cannot observe the
+agent's thinking level, and a model that simply does not emit reasoning for this
+provider or prompt produces an identical zero-frame turn; claiming
+`thinkingLevel === "off"` would send an operator who already set it to `medium`
+hunting a misconfiguration that does not exist. The message names the likely cause,
+mentions the other, and points at both remedies.
+
+Scope is per ACCOUNT per PROCESS, latched in `reasoningEmptyLaneWarned` and
+re-armed by `stopAgentLifecycleSubscription`. Per-TURN was the first cut and it did
+not survive the default flip: a deployment whose model simply never reasons is
+indistinguishable from a misconfigured one from this side, so a per-turn warning
+fires on every answered turn forever, gets filtered out of the log pipeline, and
+then does not inform anyone at all. A diagnostic is worth as much as it is rare.
+
+The latch is deliberately separate from the three qualifying guards above: those
+decide whether a turn COUNTS, the latch decides whether we have already said it.
+Re-arming on teardown matters — that is the seam where config changes land, so an
+operator who just edited config and reloaded is told again whether it worked. The
+message says it is latched, so a single line is not read as a count of affected
+turns.
 
 ### 3.3 Add a dedicated wire frame
 
@@ -288,9 +425,17 @@ silently enable tool progress or answer partials.
 
 ## 5. Lifecycle and edge cases
 
-- **No reasoning, or reasoning level not `stream`:** no reasoning callback is
-  wired, no frame is sent, and no client item appears. Level `off` and `on` both
-  fall here; only `stream` opens the lane.
+- **No model reasoning / thinking level `off`:** the open lane receives nothing
+  and no client item appears. The turn-end diagnostic applies when the other
+  guards qualify.
+- **Persisted explicit session reasoning level `off`:** the privacy veto closes
+  the lane before reply options are assembled.
+- **Reasoning level `on`:** core emits durable `isReasoning:true` payloads. The
+  delivery seam consumes each as one complete dedicated-lane block with its full
+  text and a distinct id, excluding it from ordinary answer text, answer
+  completion accounting, draft reservations, and live stale-prefix state. The
+  sole exception is an exact durable replay of a currently open CLI live burst,
+  which closes that burst without emitting the same text twice.
 - **Reasoning before answer (level `stream`):** lane appears; answer later follows
   its existing path. The textual typing indicator is hidden while reasoning is
   visible, but the internal turn-control signal stays active.
@@ -324,9 +469,9 @@ silently enable tool progress or answer partials.
 ## 6. Non-goals
 
 - Enabling a model's reasoning or changing session `reasoningLevel`.
-- Exposing arbitrary internal chain-of-thought. The UI presents reasoning only
-  when the resolved session reasoning level is `stream`; at `off`/`on` no lane is
-  wired and nothing is shown.
+- Exposing arbitrary internal chain-of-thought. The UI presents only reasoning
+  payloads that pinned core deliberately emits through its live or durable
+  channel contracts while the channel-private lane is enabled.
 - Persisting reasoning in session history or server storage.
 - Persisted correlation for historical reasoning after a fresh load.
 - Adding user controls for reasoning level.
@@ -346,10 +491,16 @@ silently enable tool progress or answer partials.
      unknown-frame compatibility tests.
 2. **Plugin callback/controller**
    - implement the per-turn controller (cumulative REPLACE, verified contract);
-   - wire callbacks independently of the answer `streaming.mode`, gated on the
-     resolved session reasoning level === `stream` (`reasoning-level.ts`);
+   - wire callbacks independently of the answer `streaming.mode`, gated on
+     `capabilities.reasoning` (`resolveReasoningEnabled`, `account-config.ts`;
+     absent → ON, present non-`true` → OFF, and NO schema default in the manifest
+     so the absent case stays reachable), and pass
+     `streamReasoningInNonStreamModes: true` plus
+     `reasoningPayloadsEnabled: true` with the open lane;
    - rotate on reasoning-end and stop on turn settlement;
-   - add level `off`/`on`/`stream` × partial/progress/block/off and control-lane tests.
+   - warn once per account per process when an opened lane completed a normal turn
+     with no payload (suppressed on abort, terminal failure, and undelivered answers);
+   - add enabled/disabled × partial/progress/block/off and control-lane tests.
 3. **Headless client reducer**
    - expose `ReasoningItem` and initialize `reasoning: []`;
    - upsert by id and prune to the retention bound;
@@ -372,8 +523,9 @@ silently enable tool progress or answer partials.
 | Level `stream`, `progress` mode | Separate reasoning lane; tool progress unchanged |
 | Level `stream`, `block` mode | Reasoning lane plus atomic final answer; Stop remains armed |
 | Level `stream`, `off` mode | Same as block; proves answer-mode independence |
-| Level `on` (any mode) | No reasoning lane wired; no reasoning frame (btw emits at `on` upstream, channel suppresses) |
-| Level `off` (any mode) | No reasoning lane wired; no reasoning frame |
+| Persisted explicit level `off` (any mode) | Session privacy veto closes the lane |
+| Level `on` (any mode) | Durable `isReasoning` payloads become complete distinct dedicated-lane blocks; shared prefixes remain intact; no answer duplication |
+| Core-synthesized mode `off` with no stored opt-out | Non-stream lever can emit live reasoning through the channel-owned lane |
 | No reasoning callback | No empty `Reasoning` UI |
 | Snapshot updates | Text replaces without duplication |
 | Cumulative updates | Text replaces without duplication |
@@ -385,7 +537,8 @@ silently enable tool progress or answer partials.
 | Settlement frame lost, then reconnect | Reconnect clears stale activity |
 | Two consecutive turns | Each reasoning group stays with its own answer |
 | History prepend during live turn | Live reasoning keeps its turn placement |
-| Store-read error during level resolution | Fail-closed to `off`; no reasoning lane |
+| Missing session store | Empty state; no explicit-off veto |
+| Non-ENOENT read error, empty/malformed JSON, or invalid store/entry shape | Fail-closed to `off`; no reasoning lane |
 | More than 100 bursts | Oldest/orphaned reasoning is bounded and pruned |
 | Expanded lane receives update | Remains expanded |
 | Hostile markdown/HTML | Inert text/safe markdown DOM |
@@ -398,9 +551,9 @@ silently enable tool progress or answer partials.
    can be expanded while it streams.
 2. The answer remains a separate bubble and preserves the existing behavior for
    all four streaming modes.
-3. When the resolved session reasoning level is `stream`, the reasoning callback
-   is wired in all four answer modes; at level `off`/`on` it is not wired; the
-   `/stop` control lane is always excluded.
+3. When the channel capability is on and no persisted explicit session `off`
+   veto exists, live and durable reasoning are wired in all four answer modes;
+   the `/stop` control lane is always excluded.
 4. Non-reasoning turns render no empty affordance.
 5. Incremental updates neither duplicate text nor close a lane the user expanded.
 6. Two or more consecutive turns keep each reasoning lane attached to the correct

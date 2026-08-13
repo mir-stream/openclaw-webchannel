@@ -117,18 +117,37 @@ the layout, and streaming growth doesn't yank the viewport.
 
 **Symptom.** Model "thinking" (when present) is dumped inline with the answer or lost.
 
-**Classification.** ✅ Built. Native OpenClaw reasoning callbacks now travel on a dedicated,
+**Classification.** ✅ Built. OpenClaw live callbacks and durable reasoning payloads now travel on a dedicated,
 turn-correlated frame and render as collapsed `Reasoning` details independently of the answer
-streaming mode. Reasoning streams to the browser ONLY when the resolved session reasoning level is
-`stream` (default `off` via `agents.defaults.reasoningDefault`), matching the Telegram reference and
-fail-closed on a store-read error.
+streaming mode. Reasoning streams to the browser ONLY when this channel's own
+`capabilities.reasoning` is not switched off (default ON, #113) — a channel-private key, deliberately
+NOT `agents.*.reasoningDefault`, which core co-parses and invalidates for our unauthorized browser
+peers — and no persisted explicit session `/reasoning off` veto exists.
 
-**Where it stands today.** After route resolution `inbound.ts` resolves the session reasoning level
-(`reasoning-level.ts`, Telegram-parity: session-store level wins, throw → `off`, else config default)
-and wires `onReasoningStream` / `onReasoningEnd` ONLY when it is `stream` — in every answer mode
+**Where it stands today.** `inbound.ts` resolves `capabilities.reasoning` (`resolveReasoningEnabled`,
+`account-config.ts`; absent → ON, any present non-boolean-`true` value or malformed capabilities
+container → OFF, merged channel base under account override), then preserves a persisted explicit
+session `/reasoning off` as a narrow privacy veto without consulting `agents.*.reasoningDefault`.
+The veto reads and validates one raw session-store snapshot (`ENOENT` alone means
+empty; other read/parse/store-entry-shape failures close the lane) before pinned core's
+`resolveSessionStoreEntry` resolves its target/aliases from that same snapshot.
+It wires `onReasoningStream` /
+`onReasoningEnd` ONLY when it is on — in every answer mode
 (`partial` / `progress` / `block` / `off`), while preserving existing mode-specific answer/tool
-callbacks. `ReasoningDraftController` normalizes cumulative/snapshot updates by REPLACE (verified: no
-pinned emitter sends a bare delta) and rotates bursts. Dedicated `reasoning` and `turn_settled` frames
+callbacks — together with `streamReasoningInNonStreamModes: true` for live snapshots and
+`reasoningPayloadsEnabled: true` for core's durable `isReasoning` form. The delivery seam intercepts
+the latter before ordinary answer/draft handling and emits each complete durable
+block at full length under a distinct id, outside the live stale-prefix state.
+Pinned CLI also prepends its last live snapshot as a durable payload without an
+end callback; only that exact replay while the matching live burst is still open
+and its live send succeeded is suppressed. A rejected live send retains the
+durable fallback. Equal or shared-prefix independent durable blocks remain distinct.
+`ReasoningDraftController` normalizes live cumulative/snapshot updates by REPLACE
+(verified: no pinned emitter sends a bare delta) and rotates live bursts. An opened lane that ends its turn having
+received no payload logs one warning per account per process — suppressed on abort, terminal failure, and turns that
+delivered no answer, so it only fires where zero frames is genuinely surprising. It names the likely
+cause without asserting it: core's `canShowReasoning` (the agent's thinking level `!== "off"`) is an
+independent precondition the channel cannot observe or override, and some models emit no reasoning. Dedicated `reasoning` and `turn_settled` frames
 exist in both transports. Both clients keep bounded ephemeral reasoning state; the demo groups it by
 `turnId` between the matching user message and answer. It is not persisted.
 
@@ -359,7 +378,8 @@ debounce/coalesce (P1-8b, #29). Both close a Telegram parity gap.
   invariant).
 - **Abort vocabulary.** `isControlLaneMessage` matches `isAbortRequestText`
   (`openclaw/plugin-sdk/command-primitives-runtime`) = `/stop` **plus** the natural-language abort
-  vocabulary ("stop", "abort", "wait", …). The full vocabulary all aborts, for core/Telegram parity.
+  vocabulary (43 entries at the pinned 2026.7.1-2 runtime: "stop", "abort", "halt", …). The full
+  current vocabulary all aborts, for core/Telegram parity; `wait` is ordinary text under this pin.
 - **Control-lane turns** stamp `access.commands.authorized:true` (`inbound.ts:215-223`), hedged
   through `commandGate` (`index-nats.ts:814-820` / `src/command-gate.ts` — the allowlist trap: core
   ignores our stamp when a commands/owner allowlist is configured); they run **draftless** and skip
@@ -377,7 +397,7 @@ debounce/coalesce (P1-8b, #29). Both close a Telegram parity gap.
 > - **Explicit-`/stop`-only buffer drop.** The *destructive* buffer drop (`inboundDebouncer.cancelKey`
 >   + `inboundDispatcher.clearPending`, `index-nats.ts:773-781`) is gated by `isExplicitAbortCommand`
 >   (`text === "/stop"` only, `control-lane.ts:56-61`), **not** the broader `isControlLaneMessage`.
->   Rationale: the NL vocabulary ("wait", "stop please") must still ABORT the running turn but must
+>   Rationale: the NL vocabulary ("halt", "stop please") must still ABORT the running turn but must
 >   NOT destroy a user's queued follow-up — a false-positive there should cost at most a spurious
 >   abort, never a lost message. The drop is further gated by `shouldDropBufferedInputOnStop` (`:97`)
 >   = `!gate.delegated || gate.isListed(peerId)`, biased toward NOT dropping when the abort may be a

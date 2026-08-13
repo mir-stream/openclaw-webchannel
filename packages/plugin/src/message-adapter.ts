@@ -1739,15 +1739,26 @@ export type ReasoningStreamUpdate = {
 };
 
 export type ReasoningDraftController = {
+  /** Consume one cumulative update from the native live-reasoning callback. */
   push: (update: ReasoningStreamUpdate) => void;
+  /** Consume one complete durable reasoning block from the delivery adapter. */
+  pushDurableBlock: (update: ReasoningStreamUpdate) => void;
   endBurst: () => void;
   stop: () => void;
 };
 
 /**
- * Normalizes OpenClaw's reasoning updates into cumulative, replace-by-id wire
- * frames. Each `onReasoningEnd` boundary rotates the id so separate reasoning
- * bursts remain distinct in the UI.
+ * Normalizes OpenClaw's LIVE reasoning updates into cumulative, replace-by-id
+ * wire frames. Each `onReasoningEnd` boundary rotates the id so separate live
+ * reasoning bursts remain distinct in the UI. Complete durable blocks take the
+ * separate `pushDurableBlock` path: each is emitted whole under a fresh id and
+ * never participates in live-stream stale-prefix accounting. The sole replay
+ * exception is pinned core's CLI path: while a live burst is still OPEN, its
+ * exact final raw/display snapshot is delivered again as a durable block. A
+ * successfully delivered exact match closes the live burst without emitting a
+ * duplicate; equality or prefix overlap between independent durable blocks is
+ * never deduplicated. If the live transport rejected its latest snapshot, the
+ * durable block remains the fallback and is emitted normally.
  *
  * VERIFIED CONTRACT (pinned OpenClaw v2026.6.x): every emitter sends either a
  * snapshot or the cumulative FULL text so far — NEVER a bare delta:
@@ -1797,7 +1808,24 @@ export function createReasoningDraftController(params: {
   // The last raw payload seen this burst (before stripping), captured so endBurst
   // can hand the raw cumulative text to `stalePrefix`.
   let lastRawText = "";
+  // Replay suppression is safe only when the matching live snapshot actually
+  // reached the transport. A rejected live send leaves the durable result as the
+  // only delivery path, so it must not be discarded merely because its text
+  // matches the controller's in-memory snapshot.
+  let liveSnapshotDelivered = false;
   let stopped = false;
+
+  const closeLiveBurst = (): void => {
+    if (currentText.length === 0) return;
+    // The NEXT live burst's raw payload carries this closed burst's LAST RAW text
+    // as its prefix (btw's accumulator is cumulative and already holds all prior
+    // bursts), so assign — don't append our trimmed display text, which would
+    // drop any inter-burst whitespace and break the prefix match from burst 3 on.
+    stalePrefix = lastRawText;
+    id = nextMessageId();
+    currentText = "";
+    liveSnapshotDelivered = false;
+  };
 
   const push = (update: ReasoningStreamUpdate): void => {
     if (stopped) return;
@@ -1820,20 +1848,46 @@ export function createReasoningDraftController(params: {
     // replaces the current text wholesale.
     if (normalized === currentText) return;
     currentText = normalized;
-    params.transport.sendReasoning(params.sessionKey, id, params.turnId, currentText);
+    liveSnapshotDelivered = params.transport.sendReasoning(
+      params.sessionKey,
+      id,
+      params.turnId,
+      currentText,
+    );
   };
 
   return {
     push,
+    pushDurableBlock: (update) => {
+      if (stopped) return;
+      const text = typeof update.text === "string" ? update.text : "";
+      if (text.length === 0) return;
+
+      // Pinned core's CLI runtime bridges each thinking snapshot to the live
+      // callback, then prepends the captured FINAL snapshot to its result as an
+      // `isReasoning:true` payload without firing `onReasoningEnd`. Suppress only
+      // that proven shape: an exact raw/display match while the live burst is
+      // still OPEN. No prefix matching, and no memory after close — equal
+      // independent durable blocks must each render.
+      if (
+        liveSnapshotDelivered &&
+        currentText.length > 0 &&
+        (text === currentText || text === lastRawText)
+      ) {
+        closeLiveBurst();
+        return;
+      }
+
+      // Preserve an in-flight live burst before emitting this independent block.
+      // Only closing LIVE state updates `stalePrefix`; the durable text itself is
+      // sent whole and then rotates the id without touching that accumulator.
+      closeLiveBurst();
+      params.transport.sendReasoning(params.sessionKey, id, params.turnId, text);
+      id = nextMessageId();
+    },
     endBurst: () => {
       if (stopped || currentText.length === 0) return;
-      // The NEXT burst's raw payload carries this closed burst's LAST RAW text as
-      // its prefix (btw's accumulator is cumulative and already holds all prior
-      // bursts), so assign — don't append our trimmed display text, which would
-      // drop any inter-burst whitespace and break the prefix match from burst 3 on.
-      stalePrefix = lastRawText;
-      id = nextMessageId();
-      currentText = "";
+      closeLiveBurst();
     },
     stop: () => {
       stopped = true;

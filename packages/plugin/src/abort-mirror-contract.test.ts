@@ -93,7 +93,9 @@ describe("P1-9 abort-mirror contract — the client mirror is a strict subset of
   });
 
   it("does NOT over-accept: near-miss text is neither a mirror abort nor an SDK abort", () => {
-    for (const negative of ["stop it now", "/stop now", "stopwatch"]) {
+    // `wait` was removed from core's vocabulary in the pinned 2026.7.1-2
+    // runtime. It is ordinary text on both sides and must remain holdable.
+    for (const negative of ["wait", "stop it now", "/stop now", "stopwatch"]) {
       expect(isLikelyAbortText(negative), `mirror should reject ${JSON.stringify(negative)}`).toBe(false);
       // The server also does not treat these as bare aborts (defensive — pins that
       // the negatives are genuine non-aborts, not merely mirror-invisible).

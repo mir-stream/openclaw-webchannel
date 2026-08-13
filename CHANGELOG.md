@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Reasoning delivery now suppresses the pinned CLI runtime's exact durable
+  replay only while its matching live burst remains open and its live send
+  succeeded. A rejected live send retains the durable fallback. Independent
+  durable blocks — including equal or shared-prefix text — still render in full
+  under distinct reasoning ids and never enter the answer lane.
+
 - **Breaking (wire protocol v3):** the client↔plugin register hop changed in four
   ways. `WEBCHANNEL_PROTOCOL_VERSION` goes 2 → 3, and the plugin, client, and SaaS
   packages must be released together at `0.4.0`. A v2 browser against a v3 agent is
