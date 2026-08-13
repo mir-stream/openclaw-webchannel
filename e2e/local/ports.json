@@ -1,0 +1,156 @@
+{
+  "$schema-note": [
+    "SINGLE SOURCE OF TRUTH for every hard-coded port in the two test families that",
+    "bind real sockets on a developer/CI machine:",
+    "",
+    "  (a) `harnesses` — the six live e2e gates under e2e/local/run-*.sh. Consumed by",
+    "      e2e/local/lib/harness.sh (`harness_ports <name>`), which exports each key",
+    "      as a shell variable of the same name.",
+    "  (b) `vitest`    — the *-realserver.test.ts suites that spawn a real nats-server.",
+    "      Consumed directly by those suites via readFileSync of this file.",
+    "",
+    "WHY THIS FILE EXISTS (#118, #119): these two families used to pick ports",
+    "independently. When they overlapped, nats-server could not bind and the suite",
+    "died in beforeAll — or worse, a gate silently exercised nothing. Two real",
+    "collisions were shipped this way:",
+    "  * 18222 — nats-transport-realserver's monitor port vs the default NATS URL",
+    "            baked into two-account-isolation-roundtrip.ts.",
+    "  * 3981  — run-turn-outcome.sh and run-derived-trust.sh both claimed it.",
+    "",
+    "RULES:",
+    "  1. Every port under `harnesses` and `vitest` must be globally unique. Two",
+    "     harnesses may NOT share a port even if they never run concurrently today:",
+    "     that assumption is what #119 was. e2e/local/ports.test.ts enforces this.",
+    "  2. Nothing may claim a port listed in `reserved`.",
+    "  3. Adding a port means editing THIS file. Two branches adding ports collide",
+    "     here as a merge conflict — which is the point. A collision must never be",
+    "     discoverable only as a flaky `nats-server did not become ready`.",
+    "  4. Do not re-introduce a hard-coded port default in a driver. The gate passes",
+    "     every port via env; drivers must fail loudly on a missing env var rather",
+    "     than fall back to a literal that silently drifts out of sync (that drift",
+    "     is exactly how the 18222 collision survived)."
+  ],
+
+  "harnesses": {
+    "run-enrolled-transport": {
+      "GW_PORT": 18999,
+      "NATS_WS": 18422,
+      "NATS_TCP": 14422,
+      "ECHO_PORT": 18902,
+      "ISSUER_PORT": 3921
+    },
+    "run-turn-outcome": {
+      "GW_PORT": 18981,
+      "NATS_WS": 18481,
+      "NATS_TCP": 14481,
+      "ECHO_PORT": 18982,
+      "ISSUER_PORT": 3981
+    },
+    "run-multi-message": {
+      "GW_PORT": 18991,
+      "NATS_WS": 18491,
+      "NATS_TCP": 14491,
+      "ECHO_PORT": 18992,
+      "ISSUER_PORT": 3991
+    },
+    "run-two-account-isolation": {
+      "GW_PORT": 19299,
+      "NATS_WS": 18722,
+      "NATS_TCP": 14722,
+      "ECHO_A_PORT": 18906,
+      "ECHO_B_PORT": 18907,
+      "ISSUER_PORT": 3971
+    },
+    "run-derived-trust": {
+      "$note": [
+        "ECHO_PORT was 18907 — the same port run-two-account-isolation.sh uses for",
+        "its account-B echo server. ISSUER_PORT was 3981 — the same port",
+        "run-turn-outcome.sh uses (#119). Both were moved here, not there: the other",
+        "two harnesses' values sit inside coherent per-harness blocks (…06/…07 as an",
+        "A/B pair; the …81 family), so this harness was the interloper in each case."
+      ],
+      "GW_PORT": 19399,
+      "NATS_WS": 18922,
+      "NATS_TCP": 14922,
+      "ECHO_PORT": 18909,
+      "ISSUER_PORT": 3901,
+      "PAGE_PORT": 19494
+    },
+    "run-all-real": {
+      "GW_PORT": 19199,
+      "NATS_WS": 18622,
+      "NATS_TCP": 14622,
+      "ECHO_PORT": 18904,
+      "ISSUER_PORT": 3941,
+      "PAGE_PORT": 19393
+    }
+  },
+
+  "vitest": {
+    "$note": [
+      "Root-sweep suites that bind real sockets — a spawned nats-server, or a real",
+      "HTTP server. They run on every `npm test`, so they contend with the gate",
+      "family for ports exactly like another gate would.",
+      "",
+      "MONITOR_PORT is the nats-server `http:` monitoring listener — it binds like",
+      "any other port and collides like one, so it belongs here even though no",
+      "client connects to it. That port (18222) is what #118 actually was."
+    ],
+    "packages/plugin/src/nats-transport-realserver.test.ts": {
+      "CLIENT_PORT": 14223,
+      "WS_PORT": 18080,
+      "MONITOR_PORT": 18222
+    },
+    "packages/saas/src/nats-permissions-realserver.test.ts": {
+      "CLIENT_PORT": 14224,
+      "WS_PORT": 18081
+    },
+    "packages/saas/src/ac6-device-flow-e2e.test.ts": {
+      "$note": [
+        "Also a root-sweep suite that binds real sockets, so it belongs under the",
+        "same authority. It spawns `nats-server -p 4222 -js` (binding 0.0.0.0:4222,",
+        "not loopback) plus two HTTP servers. 4222 was previously listed under",
+        "`reserved` as merely 'a dev server may hold it' — that was wrong: this",
+        "repo claims it on every `npm test`.",
+        "",
+        "The ports are declared here so ports.test.ts enforces them like any other",
+        "allocation. The suite still hard-codes its own literals; wiring it to read",
+        "this file is deliberately NOT done here, because that suite has separate",
+        "defects under review (its skip guard does not fire on a dead child, and",
+        "Test 10 never connects to NATS at all)."
+      ],
+      "NATS_CLIENT_PORT": 4222,
+      "ENROLLMENT_SERVER_PORT": 3456,
+      "BOOTSTRAP_SERVER_PORT": 3457
+    },
+    "packages/saas/src/demo-ui-smoke.test.ts": {
+      "PORT": 3468
+    },
+    "packages/saas/src/demo-server-role.test.ts": {
+      "PORT": 3471
+    }
+  },
+
+  "tools": {
+    "$note": [
+      "Non-suite files that legitimately hard-code a port of their own. They are",
+      "declared owners: the literal in the file IS the allocation, so ports.test.ts",
+      "allows exactly these numbers in exactly these files and nothing else."
+    ],
+    "e2e/local/echo-openai-server.mjs": {
+      "DEFAULT_PORT": 18900
+    }
+  },
+
+  "reserved": {
+    "$note": [
+      "Ports nothing in this repo's test families may claim, with the reason. These",
+      "are not allocations — they are exclusions."
+    ],
+    "3000": "packages/saas/reference/enrollment-server.ts default PORT",
+    "3001": "packages/saas/reference/bootstrap-server.ts default PORT",
+    "3951": "a developer's live SaaS issuer, by local convention",
+    "3961": "a developer's live SaaS base URL, by local convention",
+    "8080": "stock dev HTTP port — a dev server may hold it"
+  }
+}

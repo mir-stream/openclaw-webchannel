@@ -47,13 +47,11 @@ PKG_JSON="$REPO/packages/plugin/package.json"
 # Keep the backup OUTSIDE $OCH ($OCH is rm -rf'd at startup).
 PKG_BAK=/tmp/oc-two-acct-e2e.pkgbak.json
 
-# Distinct ports — no collision with the other harnesses.
-GW_PORT=19299
-NATS_WS=18722
-NATS_TCP=14722
-ISSUER_PORT=3971
-ECHO_A_PORT=18906
-ECHO_B_PORT=18907
+# Ports (GW_PORT/NATS_WS/NATS_TCP/ISSUER_PORT/ECHO_A_PORT/ECHO_B_PORT) come from
+# e2e/local/ports.json — the single source of truth for both this harness family
+# and the *-realserver.test.ts suites (#118/#119). Never hard-code one here.
+. "$REPO/e2e/local/lib/harness.sh"
+harness_ports run-two-account-isolation run-two-acct
 
 TENANT=default-tenant
 AGENT_A=agentA
@@ -98,7 +96,17 @@ pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
 
-# 0. Point the webchannel plugin entry at index-nats.ts (restore on exit).
+# ---------------------------------------------------------------------------
+# 0a. Build the plugin bundle from the working tree (#125).
+#
+#     The gateway loads packages/plugin/dist/index-nats.js. Without this step the
+#     gate boots whatever bundle happened to be on disk — which is exactly how
+#     this harness twice reported "this guard is not the cause" for an edit that
+#     had never executed. See the incident note in e2e/local/lib/harness.sh.
+# ---------------------------------------------------------------------------
+harness_build_plugin run-two-acct "$OCH/plugin-build.log"
+
+# 0b. Point the webchannel plugin entry at index-nats.ts (restore on exit).
 if [ -f "$PKG_BAK" ]; then
   echo "[run-two-acct] stale $PKG_BAK found — restoring original package.json before re-swapping"
   cp "$PKG_BAK" "$PKG_JSON"
@@ -269,6 +277,11 @@ for i in $(seq 1 120); do
     echo "[run-two-acct] TIMEOUT waiting for structured multiplex readiness — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
+
+# ASSERT the gateway loaded the bundle step 0 built (#125). Building the right
+# file and the gateway LOADING it are two different claims; the build step only
+# ever established the first. Reads core own resolution record from the log.
+harness_assert_loaded_dist run-two-acct "$OCH/gateway.log"
 
 # Sanity: both accounts must have crossed their private commit fences.
 if ! grep -q "account \"$ACCT_A\" ✓ encrypted NATS channel" "$OCH/gateway.log" 2>/dev/null \

@@ -28,7 +28,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { fromSeed, createUser } from "@nats-io/nkeys";
 import { encodeUser } from "@nats-io/jwt";
@@ -79,9 +80,31 @@ if (!NATS_SERVER_BIN && process.env.CI === "true") {
   );
 }
 
-// Dedicated ports for this suite (avoid clashes).
-const CLIENT_PORT = 14224;
-const WS_PORT = 18081;
+// ---------------------------------------------------------------------------
+// Dedicated ports for this suite — from e2e/local/ports.json, the single source
+// of truth shared with the e2e/local/run-*.sh gate family (#118). A literal here
+// is invisible to the gate harnesses; when the two families overlap this suite
+// dies in beforeAll with "nats-server did not become ready".
+// ---------------------------------------------------------------------------
+const PORTS = JSON.parse(
+  readFileSync(
+    join(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../e2e/local/ports.json",
+    ),
+    "utf8",
+  ),
+) as { vitest: Record<string, Record<string, number>> };
+
+const SUITE_PORTS = PORTS.vitest["packages/saas/src/nats-permissions-realserver.test.ts"];
+if (!SUITE_PORTS) {
+  throw new Error(
+    "e2e/local/ports.json has no vitest entry for nats-permissions-realserver.test.ts",
+  );
+}
+
+const CLIENT_PORT = SUITE_PORTS.CLIENT_PORT;
+const WS_PORT = SUITE_PORTS.WS_PORT;
 const WS_URL = `ws://127.0.0.1:${WS_PORT}`;
 
 let server: ChildProcess | null = null;

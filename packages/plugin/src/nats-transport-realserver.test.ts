@@ -20,9 +20,10 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { NatsTransport } from "./nats-transport.js";
 import type { NatsMessage } from "./nats-transport.js";
@@ -69,10 +70,38 @@ if (!NATS_SERVER_BIN && process.env.CI === "true") {
   );
 }
 
-// Dedicated ports for this suite (avoid clashing with any dev server on 4222/8080).
-const CLIENT_PORT = 14223;
-const WS_PORT = 18080;
-const MONITOR_PORT = 18222;
+// ---------------------------------------------------------------------------
+// Dedicated ports for this suite — from e2e/local/ports.json, the single source
+// of truth shared with the e2e/local/run-*.sh gate family (#118).
+//
+// These were literals here, chosen only to dodge a dev server on 4222/8080. That
+// left them invisible to the gate harnesses, and MONITOR_PORT (18222) ended up
+// colliding with the default NATS URL baked into
+// e2e/local/two-account-isolation-roundtrip.ts. When both ran, nats-server could
+// not bind and this suite died in beforeAll with "nats-server did not become
+// ready". Reading the shared file means a future collision is a merge conflict
+// in ports.json plus a red e2e/local/ports.test.ts — not a flake.
+// ---------------------------------------------------------------------------
+const PORTS = JSON.parse(
+  readFileSync(
+    join(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../e2e/local/ports.json",
+    ),
+    "utf8",
+  ),
+) as { vitest: Record<string, Record<string, number>> };
+
+const SUITE_PORTS = PORTS.vitest["packages/plugin/src/nats-transport-realserver.test.ts"];
+if (!SUITE_PORTS) {
+  throw new Error(
+    "e2e/local/ports.json has no vitest entry for nats-transport-realserver.test.ts",
+  );
+}
+
+const CLIENT_PORT = SUITE_PORTS.CLIENT_PORT;
+const WS_PORT = SUITE_PORTS.WS_PORT;
+const MONITOR_PORT = SUITE_PORTS.MONITOR_PORT;
 const WS_URL = `ws://127.0.0.1:${WS_PORT}`;
 
 let server: ChildProcess | null = null;

@@ -22,9 +22,14 @@ import {
 } from "../../packages/client/src/nats-client.js";
 import { signPop, generateClientNonce } from "../../packages/client/src/pop-register.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "../../packages/client/src/protocol.js";
+import { requireEnv } from "./require-env.js";
 
-const NATS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18222";
-const ISSUER = process.env.WEBCHANNEL_ISSUER_URL ?? "http://127.0.0.1:3971";
+// Ports come from the gate (e2e/local/ports.json), never from a literal here:
+// NATS used to default to :18222, which is the nats-server MONITOR port of
+// packages/plugin/src/nats-transport-realserver.test.ts (#118). See
+// e2e/local/require-env.ts.
+const NATS = requireEnv("WEBCHANNEL_NATS_URL", "run-two-account-isolation.sh");
+const ISSUER = requireEnv("WEBCHANNEL_ISSUER_URL", "run-two-account-isolation.sh");
 const PEER_ID = process.env.WEBCHANNEL_PEER_ID ?? "web-acctA-peer";
 const ACCOUNT_ID = process.env.WEBCHANNEL_ACCOUNT_ID ?? "accta";
 const TOKEN_ACCOUNT_ID = process.env.WEBCHANNEL_TOKEN_ACCOUNT_ID ?? ACCOUNT_ID;

@@ -33,15 +33,15 @@ PKG_JSON="$REPO/packages/plugin/package.json"
 # permanently stranding the swapped (index-nats.ts) package.json in git.
 PKG_BAK=/tmp/oc-allreal-e2e.pkgbak.json
 
-# Distinct ports — no collision with the other harnesses
-# (18799/18899/18999/19099/18222/18422/18522/3911/3921/3931/etc.).
-GW_PORT=19199
-NATS_WS=18622
-NATS_TCP=14622
-ECHO_PORT=18904
-ISSUER_PORT=3941
+# Ports (GW_PORT/NATS_WS/NATS_TCP/ECHO_PORT/ISSUER_PORT/PAGE_PORT) come from
+# e2e/local/ports.json — the single source of truth for both this harness family
+# and the *-realserver.test.ts suites (#118/#119). Never hard-code one here. The
+# hand-maintained "no collision with …" list this replaced was decorative: it
+# named 18222 as avoided while a driver default was actively colliding with the
+# nats-transport-realserver monitor port on exactly that number.
+. "$REPO/e2e/local/lib/harness.sh"
+harness_ports run-all-real
 ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
-PAGE_PORT=19393
 
 TENANT=default-tenant
 ACCOUNT_ID=default-agent
@@ -77,6 +77,16 @@ pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
 pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
+
+# ---------------------------------------------------------------------------
+# 0. Build the plugin bundle from the working tree (#125).
+#
+#    The gateway loads packages/plugin/dist/index-nats.js. Without this step the
+#    gate boots whatever bundle happened to be on disk, so a green run says
+#    nothing about your edit — see the incident note in e2e/local/lib/harness.sh.
+#    Done before any server starts so a broken build fails fast.
+# ---------------------------------------------------------------------------
+harness_build_plugin run-all-real "$OCH/plugin-build.log"
 
 # ---------------------------------------------------------------------------
 # 1. REAL device-flow enrollment-server (single trust chain). Writes the public
@@ -329,6 +339,11 @@ for i in $(seq 1 240); do
     echo "[run-all-real] TIMEOUT waiting for structured account readiness — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
+
+# ASSERT the gateway loaded the bundle step 0 built (#125). Building the right
+# file and the gateway LOADING it are two different claims; the build step only
+# ever established the first. Reads core own resolution record from the log.
+harness_assert_loaded_dist run-all-real "$OCH/gateway.log"
 
 # P0-1 T3b: a real gateway boot must expose no browser-facing WEBCHANNEL socket
 # endpoint. Reality check (probed live): the OpenClaw CORE gateway accepts a WS
