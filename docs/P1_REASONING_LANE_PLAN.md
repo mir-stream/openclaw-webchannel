@@ -88,14 +88,20 @@ combination is diagnosed instead of showing an empty section.
   > nothing on either side. Reasoning therefore ships unmarked for now and the
   > wire frame shape in §3.3 is unchanged.
 - Core has a second, durable reasoning form: at resolved reasoning mode `on`,
-  `includeReasoning` produces reply payloads marked `isReasoning: true` instead
-  of calling `onReasoningStream`. The public `reasoningPayloadsEnabled` reply
+  `includeReasoning` produces reply payloads marked `isReasoning: true`. The
+  public `reasoningPayloadsEnabled` reply
   option admits those payloads only for channels with a separate lane. WebChannel
   enables it with the lane, intercepts those payloads at `delivery.deliver`, and
   feeds each one to the controller's complete-durable-block operation; they never
   enter the ordinary answer path or its draft reservations. That operation emits
   each full block under a distinct id and does not apply the live callback's btw
-  stale-prefix normalization.
+  stale-prefix normalization. One pinned CLI exception is deduplicated: CLI
+  bridges its final snapshot through `onReasoningStream`, does not close that
+  burst, then prepends the exact same text as a durable payload. An exact match
+  while that live burst is still open and its last live send succeeded
+  closes/rotates it without a second frame; a rejected live send retains the
+  durable block as fallback. Independent equal or shared-prefix durable blocks
+  are never deduplicated.
 - Plugin and client wire unions independently declare frame shapes. A new frame
   must be added to every declaration; importing the Node-side plugin contract
   into the zero-dependency browser client is intentionally avoided.
@@ -427,7 +433,9 @@ silently enable tool progress or answer partials.
 - **Reasoning level `on`:** core emits durable `isReasoning:true` payloads. The
   delivery seam consumes each as one complete dedicated-lane block with its full
   text and a distinct id, excluding it from ordinary answer text, answer
-  completion accounting, draft reservations, and live stale-prefix state.
+  completion accounting, draft reservations, and live stale-prefix state. The
+  sole exception is an exact durable replay of a currently open CLI live burst,
+  which closes that burst without emitting the same text twice.
 - **Reasoning before answer (level `stream`):** lane appears; answer later follows
   its existing path. The textual typing indicator is hidden while reasoning is
   visible, but the internal turn-control signal stays active.

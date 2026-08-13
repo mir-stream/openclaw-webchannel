@@ -720,14 +720,13 @@ export async function handleInboundMessage(
                     ...(reasoning
                       ? ({
                           streamReasoningInNonStreamModes: true,
-                          // When an authorized sender/session resolves core's
-                          // reasoning mode to `on`, core deliberately suppresses
-                          // the live callback above and emits `isReasoning:true`
-                          // durable payloads instead. Opt those in only while our
-                          // separate lane exists; the delivery seam below removes
-                          // them from the ordinary answer path and feeds the
-                          // controller's complete-block operation. Independent
-                          // durable blocks always retain their full text under
+                          // Core can emit `isReasoning:true` durable payloads for
+                          // mode `on`; its CLI runtime also emits the same final
+                          // snapshot through BOTH the live callback and durable
+                          // result paths. Opt durable payloads in only while our
+                          // separate lane exists; the controller suppresses that
+                          // exact replay only while its live burst remains open.
+                          // Independent durable blocks retain full text under
                           // distinct ids and never enter live prefix accounting.
                           reasoningPayloadsEnabled: true,
                           onReasoningStream: (p) => {
@@ -844,12 +843,13 @@ export async function handleInboundMessage(
               deliver: async (payload, info) => {
                 const kind = info.kind;
                 // A durable reasoning payload is visible content, but never an
-                // ANSWER. Core emits this form when its resolved reasoning mode
-                // is `on`; without this interception it either gets dropped
-                // (the pre-fix behavior) or leaks into the ordinary answer
-                // bubble. Always suppress it from that path, even defensively
-                // when no lane exists. Text-less payloads still count as core
-                // emission, matching the native callback boundary semantics.
+                // ANSWER. Core emits this form for durable reasoning and as the
+                // CLI runtime's final replay of an open live snapshot; without
+                // this interception it either gets dropped (the pre-fix
+                // behavior) or leaks into the ordinary answer bubble. Always
+                // suppress it from that path, even defensively when no lane
+                // exists. Text-less payloads still count as core emission,
+                // matching the native callback boundary semantics.
                 if (payload.isReasoning === true) {
                   if (reasoning) {
                     reasoningPayloadSeen = true;

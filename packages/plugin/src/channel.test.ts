@@ -2647,6 +2647,43 @@ describe("webchannel inbound round-trip", () => {
     expect(ordinaryTexts).not.toContain("Plan carefully");
   });
 
+  it("deduplicates the CLI live snapshot's exact durable replay without answer leakage", async () => {
+    // Pinned CLI shape: thinking is bridged live, no onReasoningEnd fires, then
+    // the captured final snapshot is prepended to the durable result payloads.
+    const transport = new FakePeerChannel();
+    const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const deliveryResults: boolean[] = [];
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { ...REASONING_ON, streaming: { mode: "block" } },
+      reasoningSteps: [{ text: "Plan", isReasoningSnapshot: true }],
+      finalPayloads: [
+        { text: "Plan", isReasoning: true },
+        { text: "hi back" },
+      ],
+      onDeliveryResult: (result) => {
+        deliveryResults.push(result?.visibleReplySent === true);
+      },
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      id: "turn-cli-reasoning-replay",
+      text: "hello",
+    });
+
+    expect(reasoningSpy).toHaveBeenCalledTimes(1);
+    expect(reasoningSpy).toHaveBeenCalledWith(
+      "web-anon",
+      expect.any(String),
+      "turn-cli-reasoning-replay",
+      "Plan",
+    );
+    expect(deliveryResults).toEqual([false, true]);
+    expect(sendTextSpy.mock.calls.map((call) => String(call[1]))).toEqual(["hi back"]);
+  });
+
   it("does not let a cancelled reasoning block retire a same-index answer reservation", async () => {
     // Answer A owns the indexed reservation that keeps later partial B behind
     // it. A cancelled durable-reasoning payload at the same index is a separate

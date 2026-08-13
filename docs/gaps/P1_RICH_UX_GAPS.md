@@ -138,6 +138,10 @@ callbacks — together with `streamReasoningInNonStreamModes: true` for live sna
 `reasoningPayloadsEnabled: true` for core's durable `isReasoning` form. The delivery seam intercepts
 the latter before ordinary answer/draft handling and emits each complete durable
 block at full length under a distinct id, outside the live stale-prefix state.
+Pinned CLI also prepends its last live snapshot as a durable payload without an
+end callback; only that exact replay while the matching live burst is still open
+and its live send succeeded is suppressed. A rejected live send retains the
+durable fallback. Equal or shared-prefix independent durable blocks remain distinct.
 `ReasoningDraftController` normalizes live cumulative/snapshot updates by REPLACE
 (verified: no pinned emitter sends a bare delta) and rotates live bursts. An opened lane that ends its turn having
 received no payload logs one warning per account per process — suppressed on abort, terminal failure, and turns that
