@@ -46,10 +46,11 @@ After this change:
   guarantees on top).
 - **A4.** Nothing regresses when no turn is in flight and nothing is held:
   `send()` publishes immediately, exactly as today.
-- **A5.** Abort text — explicit `/stop`, the widget Stop button, AND the NL
-  abort vocabulary (`stop`, `wait`, `abort`, …) — still aborts the running
-  turn mid-turn: abort-shaped text **bypasses** the hold. (Holding it would
-  deadlock; releasing it later would abort the WRONG turn — see §3.3.)
+- **A5.** Abort text — explicit `/stop`, the widget Stop button, AND the current
+  43-entry NL abort vocabulary (`stop`, `halt`, `abort`, …) — still aborts the
+  running turn mid-turn: abort-shaped text **bypasses** the hold. (Holding it would
+  deadlock; releasing it later would abort the WRONG turn — see §3.3.) Under
+  the pinned OpenClaw 2026.7.1-2 runtime, `wait` is ordinary text and is held.
 - **A6.** User text is never silently destroyed: retraction is an explicit ✕
   tap; the only other path that removes a pending send (`/stop`, §3.4) leaves
   the text visible and restorable.
@@ -183,7 +184,7 @@ arrival time** (`packages/plugin/src/control-lane.ts:39` `isControlLaneMessage`
    next" then "stop" mid-turn (aimed at the RUNNING turn); both held; turn
    settles; release-ALL publishes the first message (starts a new turn) then
    the "stop" — which control-lanes and kills the user's own just-started
-   turn. Multi-device variant: a released "wait" kills a turn another device
+   turn. Multi-device variant: a released "halt" kills a turn another device
    started. So abort text must **never enter `held[]` at all** — bypassing
    only explicit `/stop` (v1) is not enough; the whole vocabulary must bypass
    at send time.
@@ -192,7 +193,7 @@ The client therefore mirrors the abort predicate:
 
 ```ts
 // packages/client/src/abort-mirror.ts (new)
-const ABORT_TRIGGERS: ReadonlySet<string> = new Set([ /* the 44-entry set
+const ABORT_TRIGGERS: ReadonlySet<string> = new Set([ /* the 43-entry set
   pinned VERBATIM (copy mechanically, do not hand-transcribe) from openclaw
   dist abort-primitives ABORT_TRIGGERS */ ]);
 const TRAILING_PUNCT = /[.!?！？…,，。;；:：'"’”)\]}]+$/u;
@@ -231,9 +232,10 @@ fails the test mechanically instead of silently becoming a held stale abort.
 
 Bypassed abort text publishes immediately → the server control lane remains
 the single authority on what an abort DOES. A mirror false-positive-in-spirit
-(e.g. bare "wait" meant literally) behaves exactly as it does today —
+(e.g. bare "halt" meant literally) behaves exactly as it does today —
 published mid-turn — so the bypass never makes anything worse than the status
-quo.
+quo. `wait`, removed from the abort set at the 2026.7.1-2 pin, is ordinary held
+text on both client and server.
 
 Other slash commands (`/status`, …) are held like normal text — an
 improvement: today a mid-turn `/status` gets text-coalesced into another
@@ -533,8 +535,9 @@ are actually exercisable), new describe block:
 7. explicit `/stop` mid-turn → published immediately (A5) AND held bubbles
    flip to `retracted` (still in transcript, removable via retract);
    case/whitespace variants (`" /STOP "`).
-8. NL `"stop"` / `"wait"` / `"Stop."` mid-turn → bypass: published
-   immediately, `held` untouched (A5; pins the §3.3 reversal).
+8. NL `"stop"` / `"halt"` / `"Stop."` mid-turn → bypass: published
+   immediately, `held` untouched (A5; pins the §3.3 reversal); `"wait"`
+   follows the ordinary-text hold/release path under the current pin.
 9. **latch:** typing-only turn → M1 held → `onState(false)` (isTyping drops)
    → send M2 → M2 held (not published); reconnect + session → release order
    M1, M2 (pins §3.1).

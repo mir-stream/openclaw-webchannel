@@ -32,15 +32,18 @@ import type { InboundWsMessage } from "./channel-contract.js";
 const userMessage = (text: string): InboundWsMessage => ({ type: "user_message", text });
 
 describe("isControlLaneMessage", () => {
-  it("is true for abort requests ('/stop', 'stop', 'Stop.')", () => {
+  it("is true for abort requests ('/stop', 'stop', 'halt', 'Stop.')", () => {
     expect(isControlLaneMessage(userMessage("/stop"))).toBe(true);
     expect(isControlLaneMessage(userMessage("stop"))).toBe(true);
+    expect(isControlLaneMessage(userMessage("halt"))).toBe(true);
     expect(isControlLaneMessage(userMessage("Stop."))).toBe(true);
   });
 
   it("is false for ordinary user text", () => {
     expect(isControlLaneMessage(userMessage("what is the weather"))).toBe(false);
     expect(isControlLaneMessage(userMessage("please continue"))).toBe(false);
+    // Removed from core's abort vocabulary in the pinned 2026.7.1-2 runtime.
+    expect(isControlLaneMessage(userMessage("wait"))).toBe(false);
     expect(isControlLaneMessage(userMessage(""))).toBe(false);
   });
 
@@ -62,7 +65,7 @@ describe("isExplicitAbortCommand", () => {
     // These abort the running turn (isControlLaneMessage true) but must NOT
     // drop buffered input — so isExplicitAbortCommand is false for them.
     expect(isExplicitAbortCommand(userMessage("stop"))).toBe(false);
-    expect(isExplicitAbortCommand(userMessage("wait"))).toBe(false);
+    expect(isExplicitAbortCommand(userMessage("halt"))).toBe(false);
     expect(isExplicitAbortCommand(userMessage("/stop now"))).toBe(false);
   });
 
@@ -107,7 +110,7 @@ describe("shouldDropBufferedInputOnStop", () => {
     expect(shouldDropBufferedInputOnStop(userMessage("stop please"), noAllowlist, "alice")).toBe(
       false,
     );
-    expect(shouldDropBufferedInputOnStop(userMessage("wait"), noAllowlist, "alice")).toBe(false);
+    expect(shouldDropBufferedInputOnStop(userMessage("halt"), noAllowlist, "alice")).toBe(false);
     // Even a listed peer under no allowlist: NL text is not an explicit /stop.
     expect(shouldDropBufferedInputOnStop(userMessage("stop"), allowlistWithPeer, "alice")).toBe(
       false,

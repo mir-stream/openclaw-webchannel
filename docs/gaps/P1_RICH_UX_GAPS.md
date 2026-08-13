@@ -374,7 +374,8 @@ debounce/coalesce (P1-8b, #29). Both close a Telegram parity gap.
   invariant).
 - **Abort vocabulary.** `isControlLaneMessage` matches `isAbortRequestText`
   (`openclaw/plugin-sdk/command-primitives-runtime`) = `/stop` **plus** the natural-language abort
-  vocabulary ("stop", "abort", "wait", …). The full vocabulary all aborts, for core/Telegram parity.
+  vocabulary (43 entries at the pinned 2026.7.1-2 runtime: "stop", "abort", "halt", …). The full
+  current vocabulary all aborts, for core/Telegram parity; `wait` is ordinary text under this pin.
 - **Control-lane turns** stamp `access.commands.authorized:true` (`inbound.ts:215-223`), hedged
   through `commandGate` (`index-nats.ts:814-820` / `src/command-gate.ts` — the allowlist trap: core
   ignores our stamp when a commands/owner allowlist is configured); they run **draftless** and skip
@@ -392,7 +393,7 @@ debounce/coalesce (P1-8b, #29). Both close a Telegram parity gap.
 > - **Explicit-`/stop`-only buffer drop.** The *destructive* buffer drop (`inboundDebouncer.cancelKey`
 >   + `inboundDispatcher.clearPending`, `index-nats.ts:773-781`) is gated by `isExplicitAbortCommand`
 >   (`text === "/stop"` only, `control-lane.ts:56-61`), **not** the broader `isControlLaneMessage`.
->   Rationale: the NL vocabulary ("wait", "stop please") must still ABORT the running turn but must
+>   Rationale: the NL vocabulary ("halt", "stop please") must still ABORT the running turn but must
 >   NOT destroy a user's queued follow-up — a false-positive there should cost at most a spurious
 >   abort, never a lost message. The drop is further gated by `shouldDropBufferedInputOnStop` (`:97`)
 >   = `!gate.delegated || gate.isListed(peerId)`, biased toward NOT dropping when the abort may be a

@@ -2356,9 +2356,9 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
     expect(w.retract(heldId)).toBe(true);
   });
 
-  // 8. NL "stop"/"abort"/"Stop." mid-turn → bypass: published immediately, held untouched.
+  // 8. Current NL abort words mid-turn → bypass: published immediately, held untouched.
   it("8: NL abort words bypass the hold (publish immediately) and DO NOT touch held messages", () => {
-    for (const word of ["stop", "abort", "Stop."]) {
+    for (const word of ["stop", "halt", "abort", "Stop."]) {
       const w = makeWrapper();
       const spy = vi.spyOn(inner(w), "sendUserMessage");
       deliver(w, { type: "typing" });
@@ -2373,6 +2373,21 @@ describe("WebChannelNATSClient — P1-9 pending-message retraction (unsend)", ()
       expect(stillHeld.retracted).toBeUndefined();
       expect(heldTexts(w)).toEqual(["keep me"]);
     }
+  });
+
+  it("8b: wait is ordinary text under the current pin and follows the hold/release path", () => {
+    const w = makeWrapper();
+    goOnline(w);
+    const spy = vi.spyOn(inner(w), "sendUserMessage");
+    deliver(w, { type: "typing" });
+
+    w.send("wait");
+    expect(spy).not.toHaveBeenCalled();
+    expect(heldTexts(w)).toEqual(["wait"]);
+
+    deliver(w, { type: "turn_settled", turnId: "T" });
+    expect(spy).toHaveBeenCalledWith("wait", expect.any(String));
+    expect(held(w)).toHaveLength(0);
   });
 
   // 9. latch: typing-only turn → M1 held → onState(false) → send M2 → M2 held → reconnect → release M1,M2.

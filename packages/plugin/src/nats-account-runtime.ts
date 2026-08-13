@@ -1097,7 +1097,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // The destructive drop is gated by `shouldDropBufferedInputOnStop`,
           // which narrows on TWO axes (both live in the tested predicate):
           //  1. EXPLICIT "/stop" only, NOT the broader `isControlLaneMessage`
-          //     vocabulary — a "wait"/"stop please" still aborts the running turn
+          //     vocabulary — a "halt"/"stop please" still aborts the running turn
           //     for core parity, but a false-positive NL match must never
           //     silently destroy a queued follow-up. Only the unambiguous "/stop"
           //     opts in.
