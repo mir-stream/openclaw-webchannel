@@ -3,7 +3,35 @@ import type { CommandCatalogEntry } from "./commands-catalog.js";
 
 export const WEBCHANNEL_ID = "webchannel";
 export { ANON_PEER_ID };
-export type HistoryMessage = { id: string; role: "user" | "agent"; text: string; ts?: number };
+/**
+ * A normalized transcript row on the hydration wire.
+ *
+ * #95: hydration reproduces the role, sanitized text, order, row identity, and
+ * optional timestamp present in this projection. It does not reproduce every
+ * live-bubble property or every relationship available in the raw transcript.
+ * Specifically absent:
+ *
+ *  - `turnId`. `handleInboundMessage` derives the live value from the client's
+ *    `user_message.id`; that exact client-generated id is not available on the
+ *    stored messages returned to this projection. Raw user boundaries and tool
+ *    structure can still provide structural grouping evidence, but they cannot
+ *    recover the exact live correlation id.
+ *  - a terminal-turn failure verdict. `AssistantMessage.stopReason === "error"`
+ *    describes a stored model attempt/message and may precede a successful
+ *    retry or fallback. Textless or sanitized-away attempts produce no row, so
+ *    the projection cannot expose a retry-safe terminal failure signal.
+ *  - `working`, `wireId`, `sendState` — live-only client state.
+ *  - reasoning previews, typing, and tool progress — ephemeral by design
+ *    (`docs/P1_REASONING_LANE_PLAN.md`), matching what Telegram does.
+ *
+ * Full rationale: `docs/ISSUE_95_HISTORY_CONTRACT_PLAN.md`.
+ */
+export type HistoryMessage = {
+  id: string;
+  role: "user" | "agent";
+  text: string;
+  ts?: number;
+};
 
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
 export type ApprovalOption = { decision: ApprovalDecision; label: string; style: string };
