@@ -171,7 +171,7 @@
               },
               "reasoning": {
                 "type": "boolean",
-                "description": "Whether the agent's reasoning/thinking stream is delivered to browser peers. Defaults to true when the key is OMITTED; set it to boolean false to turn the lane off. Deliberately carries NO schema default: core hydrates defaults into the stored config, so declaring one here would write the key into every deployment and the omitted-means-on default could never be reached. Note the \"on\"/\"off\" strings that capabilities.typing accepts are REJECTED here as a config error, since this key is a boolean. Enabling it is necessary but NOT sufficient: the agent's own thinking level must also be something other than \"off\", which channel config cannot force."
+                "description": "Whether the agent's reasoning/thinking stream is delivered to browser peers. Defaults to true when the key is OMITTED; set it to boolean false to turn the lane off. A persisted explicit session /reasoning off also vetoes delivery. Deliberately carries NO schema default: core hydrates defaults into the stored config, so declaring one here would write the key into every deployment and the omitted-means-on default could never be reached. Note the \"on\"/\"off\" strings that capabilities.typing accepts are rejected by this channel-level schema; deliberately unvalidated named-account leaves fail closed at runtime. Enabling it is necessary but NOT sufficient: the agent's own thinking level must also be something other than \"off\", which channel config cannot force."
               }
             }
           },
@@ -315,7 +315,7 @@
         },
         "capabilities.reasoning": {
           "label": "Reasoning stream",
-          "help": "Whether the agent's reasoning/thinking stream is delivered to browser peers. Default true when omitted; set boolean false to turn the lane off. This key is a boolean — the \"on\"/\"off\" strings capabilities.typing uses are rejected as a config error here. Note this alone is not enough: the agent's thinking level must also be other than \"off\", or the lane stays empty."
+          "help": "Whether the agent's reasoning/thinking stream is delivered to browser peers. Default true when omitted; set boolean false to turn the lane off. A persisted explicit session /reasoning off also vetoes delivery. This key is a boolean: malformed channel-level values are rejected, while deliberately unvalidated named-account values fail closed at runtime. Note this alone is not enough: the agent's thinking level must also be other than \"off\", or the lane stays empty."
         },
         "history.enabled": {
           "label": "History pagination",

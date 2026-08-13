@@ -117,19 +117,23 @@ the layout, and streaming growth doesn't yank the viewport.
 
 **Symptom.** Model "thinking" (when present) is dumped inline with the answer or lost.
 
-**Classification.** ✅ Built. Native OpenClaw reasoning callbacks now travel on a dedicated,
+**Classification.** ✅ Built. OpenClaw live callbacks and durable reasoning payloads now travel on a dedicated,
 turn-correlated frame and render as collapsed `Reasoning` details independently of the answer
 streaming mode. Reasoning streams to the browser ONLY when this channel's own
 `capabilities.reasoning` is not switched off (default ON, #113) — a channel-private key, deliberately
 NOT `agents.*.reasoningDefault`, which core co-parses and invalidates for our unauthorized browser
-peers.
+peers — and no persisted explicit session `/reasoning off` veto exists.
 
 **Where it stands today.** `inbound.ts` resolves `capabilities.reasoning` (`resolveReasoningEnabled`,
-`account-config.ts`; absent → ON, any present non-boolean-`true` value → OFF, merged channel base
-under account override) and wires `onReasoningStream` / `onReasoningEnd` ONLY when it is on — in every answer mode
+`account-config.ts`; absent → ON, any present non-boolean-`true` value or malformed capabilities
+container → OFF, merged channel base under account override), then preserves a persisted explicit
+session `/reasoning off` as a narrow privacy veto without consulting `agents.*.reasoningDefault`.
+It wires `onReasoningStream` /
+`onReasoningEnd` ONLY when it is on — in every answer mode
 (`partial` / `progress` / `block` / `off`), while preserving existing mode-specific answer/tool
-callbacks — together with `streamReasoningInNonStreamModes: true`, which is what makes core actually
-emit on this path (without it the lane opens and receives nothing). `ReasoningDraftController`
+callbacks — together with `streamReasoningInNonStreamModes: true` for live snapshots and
+`reasoningPayloadsEnabled: true` for core's durable `isReasoning` form. The delivery seam intercepts
+the latter before ordinary answer/draft handling. `ReasoningDraftController`
 normalizes cumulative/snapshot updates by REPLACE (verified: no
 pinned emitter sends a bare delta) and rotates bursts. An opened lane that ends its turn having
 received no payload logs one warning per account per process — suppressed on abort, terminal failure, and turns that

@@ -35,7 +35,9 @@
   change required to turn it on, and none was needed to turn it off before,
   because the lane could not previously be enabled at all.
   - **Opt out with `"capabilities": { "reasoning": false }`** in the webchannel
-    block (channel-level, or per account under `accounts.<id>`).
+    block (channel-level, or per account under `accounts.<id>`). A persisted,
+    explicit session `/reasoning off` also remains a privacy veto for peers an
+    operator has authorized through core's command allowlist.
   - Consider whether you want this before upgrading. Reasoning is model-internal
     deliberation, not a UI affordance: it can restate file contents, credentials,
     or the user's own prompt, and browser peers are the least trusted surface
@@ -43,7 +45,9 @@
   - Only boolean `true` enables it. Every PRESENT value that is not boolean
     `true` fails closed, so a mistyped value disables the lane rather than
     leaking; note the `"on"`/`"off"` strings that the sibling
-    `capabilities.typing` accepts are rejected outright here as a config error.
+    `capabilities.typing` accepts are rejected by the channel-level schema.
+    Named-account leaves are deliberately schema-unvalidated, so malformed
+    values there fail closed at the runtime resolver instead.
   - Enabling is necessary but not sufficient — the agent's own thinking level
     must also be something other than `"off"`, which no channel config can force.
     When an enabled lane completes a normal turn having received nothing, the
@@ -51,8 +55,10 @@
     cause.
   - The lane previously keyed off `agents.*.reasoningDefault`. It no longer reads
     that key at all, and setting it has no effect on this channel; core
-    invalidates it for unauthorized senders, which webchannel's browser peers are
-    by design. Requires openclaw `>=2026.7.1`.
+    invalidates it for ordinary unauthorized senders. Webchannel leaves ordinary
+    turns unauthorized by default, while still supporting operators who
+    deliberately authorize named peers through core's command allowlist.
+    Requires openclaw `>=2026.7.1`.
 - Generic/shared IdP audiences are no longer accepted. `aud` is the account id
   or an array of authorized account ids in one tenant; this supersedes #65's
   partial audience-pin proposal.

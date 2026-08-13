@@ -17,6 +17,7 @@ import {
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
 } from "./inbound.js";
+import type { ReasoningOptOutStoreAccess } from "./reasoning-opt-out.js";
 // Reasoning display policy is CHANNEL-PRIVATE config (#113): the lane opens
 // unless `channels.webchannel.capabilities.reasoning` is PRESENT and not boolean
 // `true` (account-config.ts). These channel tests exercise the callback WIRING
@@ -285,6 +286,8 @@ describe("webchannel inbound round-trip", () => {
   type TestReplyPayload = NoticeFlags & {
     text?: string;
     isError?: boolean;
+    isReasoning?: boolean;
+    isReasoningSnapshot?: boolean;
   };
 
   type KernelStep =
@@ -2547,7 +2550,7 @@ describe("webchannel inbound round-trip", () => {
     });
 
     // Reasoning lane opened, but no answer/tool draft in block mode: replyOptions
-    // carries ONLY the reasoning callbacks — no tool/answer callbacks, no suppression.
+    // carries ONLY the reasoning lane options — no tool/answer callbacks, no suppression.
     //
     // `streamReasoningInNonStreamModes: true` rides WITH the open lane. This is
     // the #113 lever: core suppresses reasoning on this dispatch path without it,
@@ -2556,6 +2559,7 @@ describe("webchannel inbound round-trip", () => {
     expect(seenReplyOptions).toEqual({
       onAgentRunStart: expect.any(Function),
       streamReasoningInNonStreamModes: true,
+      reasoningPayloadsEnabled: true,
       onReasoningStream: expect.any(Function),
       onReasoningEnd: expect.any(Function),
     });
@@ -2594,6 +2598,131 @@ describe("webchannel inbound round-trip", () => {
     },
   );
 
+  it("routes durable isReasoning payloads as distinct bursts without answer duplication", async () => {
+    // This is delivery-contract coverage, not a synthetic core mode-resolution
+    // harness: pinned core uses this delivery form when an authorized sender /
+    // session resolves reasoning mode `on`. Drive the actual delivery adapter;
+    // calling the native callback here would miss the defect.
+    const transport = new FakePeerChannel();
+    const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+    const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
+    const deliveryResults: boolean[] = [];
+    let seenReplyOptions: any = "unset";
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { ...REASONING_ON, streaming: { mode: "block" } },
+      steps: [
+        { deliverBlock: { text: "first durable thought", isReasoning: true } },
+        { deliverBlock: { text: "second durable thought", isReasoning: true } },
+        // A text-less durable reasoning payload is consumed safely and never
+        // falls through into the ordinary answer transport.
+        { deliverBlock: { isReasoning: true } },
+      ],
+      onReplyOptions: (replyOptions) => {
+        seenReplyOptions = replyOptions;
+      },
+      onDeliveryResult: (result) => {
+        deliveryResults.push(result?.visibleReplySent === true);
+      },
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      id: "turn-durable-reasoning",
+      text: "hello",
+    });
+
+    expect(seenReplyOptions?.reasoningPayloadsEnabled).toBe(true);
+    expect(reasoningSpy).toHaveBeenCalledTimes(2);
+    const reasoningCalls = reasoningSpy.mock.calls;
+    expect(reasoningCalls.map((call) => call[3])).toEqual([
+      "first durable thought",
+      "second durable thought",
+    ]);
+    expect(reasoningCalls[0]?.[1]).not.toBe(reasoningCalls[1]?.[1]);
+    expect(reasoningCalls.every((call) => call[2] === "turn-durable-reasoning")).toBe(true);
+    // The three reasoning deliveries are consumed (`false`); the ordinary final
+    // still reports its successful visible delivery (`true`).
+    expect(deliveryResults).toEqual([false, false, false, true]);
+    const ordinaryTexts = sendTextSpy.mock.calls.map((call) => String(call[1]));
+    expect(ordinaryTexts).toContain("hi back");
+    expect(ordinaryTexts).not.toContain("first durable thought");
+    expect(ordinaryTexts).not.toContain("second durable thought");
+  });
+
+  it("does not let a cancelled reasoning block retire a same-index answer reservation", async () => {
+    // Answer A owns the indexed reservation that keeps later partial B behind
+    // it. A cancelled durable-reasoning payload at the same index is a separate
+    // lane: if its lifecycle enters the answer controller, B jumps ahead of A.
+    const transport = new FakePeerChannel();
+    const frameOrder: string[] = [];
+    vi.spyOn(transport, "sendProgress").mockImplementation(
+      (_peer, _id, text) => {
+        frameOrder.push(text);
+        return true;
+      },
+    );
+    vi.spyOn(transport, "finalizeDraft").mockImplementation(
+      (_peer, _id, text) => {
+        frameOrder.push(text);
+        return true;
+      },
+    );
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+      steps: [
+        { boundary: true },
+        {
+          queuedBlock: {
+            payload: { text: "answer A" },
+            assistantMessageIndex: 0,
+          },
+        },
+        {
+          queuedBlock: {
+            payload: { text: "cancelled thought", isReasoning: true },
+            assistantMessageIndex: 0,
+          },
+        },
+        { boundary: true },
+        { partial: { text: "answer B" } },
+        {
+          lifecycle: {
+            kind: "cancel",
+            deliveryKind: "block",
+            payload: { text: "cancelled thought", isReasoning: true },
+            assistantMessageIndex: 0,
+          },
+        },
+        { deliverBlock: { text: "answer A" } },
+        {
+          lifecycle: {
+            kind: "settled",
+            deliveryKind: "block",
+            assistantMessageIndex: 0,
+          },
+        },
+        // Awaiting another controller delivery drains the prior settlement
+        // queue, proving B was released before terminal drain rather than merely
+        // repaired at turn cleanup.
+        { deliverBlock: { text: "answer C" } },
+      ],
+      skipFinal: true,
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      id: "turn-reasoning-cancel",
+      text: "hello",
+    });
+
+    // Drain finalizes the already-previewed B once more with the same id/text;
+    // first appearance is the ordering invariant under test.
+    expect(frameOrder.slice(0, 3)).toEqual(["answer A", "answer B", "answer C"]);
+    expect(frameOrder).toEqual(["answer A", "answer B", "answer C", "answer B"]);
+  });
+
   it("wires the reasoning lane by DEFAULT when capabilities.reasoning is omitted (#113 decision ①)", async () => {
     // The default flip, asserted end to end through a real turn. The consumer
     // ships the reasoning UI, so a deployment that never edited its config must
@@ -2619,7 +2748,50 @@ describe("webchannel inbound round-trip", () => {
 
     expect(seenReplyOptions?.onReasoningStream).toEqual(expect.any(Function));
     expect(seenReplyOptions?.streamReasoningInNonStreamModes).toBe(true);
+    expect(seenReplyOptions?.reasoningPayloadsEnabled).toBe(true);
     expect(reasoningSpy).toHaveBeenCalledWith("web-anon", expect.any(String), "turn-42", "safe");
+  });
+
+  it("honors a persisted explicit /reasoning off as a lane veto", async () => {
+    // End-to-end wiring coverage for the privacy veto. This injects only the
+    // store access; route resolution, capability resolution and reply-option
+    // assembly remain the real production path.
+    const transport = new FakePeerChannel();
+    const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+    let seenReplyOptions: any = "unset";
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { ...REASONING_ON, streaming: { mode: "block" } },
+      reasoningSteps: [{ text: "must stay private" }],
+      onReplyOptions: (replyOptions) => {
+        seenReplyOptions = replyOptions;
+      },
+    });
+    const reasoningOptOutStore = {
+      resolveStorePath: vi.fn(() => "/tmp/webchannel-reasoning-store.json"),
+      loadSessionStore: vi.fn(() => ({})),
+      resolveSessionStoreEntry: vi.fn(() => ({
+        normalizedKey: "k",
+        existing: { reasoningLevel: "off" },
+        legacyKeys: [],
+      })),
+    } as unknown as ReasoningOptOutStoreAccess;
+
+    await handleInboundMessage(
+      api,
+      transport,
+      "web-anon",
+      { type: "user_message", id: "turn-explicit-off", text: "hello" },
+      "default",
+      { reasoningOptOutStore },
+    );
+
+    expect(reasoningOptOutStore.loadSessionStore).toHaveBeenCalledOnce();
+    expect(seenReplyOptions?.onReasoningStream).toBeUndefined();
+    expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
+    expect(seenReplyOptions?.streamReasoningInNonStreamModes).toBeUndefined();
+    expect(seenReplyOptions?.reasoningPayloadsEnabled).toBeUndefined();
+    expect(reasoningSpy).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -2665,6 +2837,7 @@ describe("webchannel inbound round-trip", () => {
       expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
       // And core is never asked to emit reasoning we would only discard.
       expect(seenReplyOptions?.streamReasoningInNonStreamModes).toBeUndefined();
+      expect(seenReplyOptions?.reasoningPayloadsEnabled).toBeUndefined();
       expect(reasoningSpy).not.toHaveBeenCalled();
       // turn_settled still fires — it is a lifecycle frame, not a reasoning frame.
       expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42", "ok");
@@ -2728,6 +2901,7 @@ describe("webchannel inbound round-trip", () => {
       expect(seenReplyOptions?.onReasoningStream).toBeUndefined();
       expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
       expect(seenReplyOptions?.streamReasoningInNonStreamModes).toBeUndefined();
+      expect(seenReplyOptions?.reasoningPayloadsEnabled).toBeUndefined();
       expect(reasoningSpy).not.toHaveBeenCalled();
       // Via the shared helper — the previous hand-rolled filter searched for
       // "produced no frames" while the code logs "received no frames", so it
@@ -2772,7 +2946,7 @@ describe("webchannel inbound round-trip", () => {
 
       await handleInboundMessage(api, transport, "web-anon", {
         type: "user_message",
-        id: "turn-42",
+        id: "turn-42\nforged=true",
         text: "hello",
       });
 
@@ -2785,6 +2959,9 @@ describe("webchannel inbound round-trip", () => {
       expect(text).toContain("capabilities.reasoning");
       expect(text).toContain("thinking");
       expect(text).toContain("turn-42");
+      expect(text).toContain('turn="turn-42\\nforged=true"');
+      expect(text).not.toContain("turn-42\nforged=true");
+      expect(text.split("\n")).toHaveLength(1);
       // But it must NOT claim to have observed the thinking level. The plugin
       // cannot see it, and an operator who already set thinking to "medium" would
       // be sent hunting a misconfiguration that does not exist. Hedged wording
@@ -2867,8 +3044,8 @@ describe("webchannel inbound round-trip", () => {
 
       const warnings = reasoningWarningsIn(warn).map((call) => String(call[0]));
       expect(warnings).toHaveLength(2);
-      expect(warnings[0]).toContain("account=acctA");
-      expect(warnings[1]).toContain("account=acctB");
+      expect(warnings[0]).toContain('account="acctA"');
+      expect(warnings[1]).toContain('account="acctB"');
     });
 
     it("re-arms the empty-lane latch on teardown, so a reload can report again (#113)", async () => {

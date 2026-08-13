@@ -442,9 +442,10 @@ export function resolveTypingEnabled(accountConfig: WebchannelAccountConfig): bo
  *     something gets the safe reading of it; only someone who typed NOTHING gets
  *     the new default.
  *
- * The JSON schema rejects the string spellings, but this resolver must not depend
- * on the schema having been applied — `resolveTypingEnabled` documents the same
- * rule.
+ * The channel-level JSON schema rejects the string spellings, but named-account
+ * leaves are deliberately unvalidated. This resolver therefore owns the final
+ * privacy boundary: a present malformed `capabilities` container fails closed,
+ * as does every present `reasoning` value other than boolean `true`.
  *
  * Note this is only the CHANNEL half of the gate. Reasoning also requires the
  * model's own thinking level to be something other than "off" (`canShowReasoning`
@@ -453,13 +454,27 @@ export function resolveTypingEnabled(accountConfig: WebchannelAccountConfig): bo
  * see the turn-scoped warning in inbound.ts.
  */
 export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig): boolean {
-  const capabilities = accountConfig?.capabilities as
-    | { reasoning?: unknown }
-    | undefined;
-  const value = capabilities?.reasoning;
-  // Absent → the new default ON. Present → strictly boolean `true`, everything
-  // else fails closed (see the docblock: `reasoning: "off"` must never mean on).
-  return value === undefined ? true : value === true;
+  const capabilities = accountConfig?.capabilities;
+  // Only an omitted container gets the ON default. Named-account leaves are
+  // intentionally schema-unvalidated, so `null`, arrays, strings, numbers and
+  // class instances can reach this seam and must not erase an inherited opt-out
+  // by being mistaken for an absent object.
+  if (capabilities === undefined) return true;
+  if (
+    capabilities === null ||
+    typeof capabilities !== "object" ||
+    Array.isArray(capabilities)
+  ) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(capabilities);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+
+  // A valid plain object with no key keeps the default ON. Once the key is
+  // present, only literal boolean `true` opens the lane; even an explicit
+  // `undefined` fails closed rather than being confused with omission.
+  if (!Object.prototype.hasOwnProperty.call(capabilities, "reasoning")) return true;
+  return (capabilities as { reasoning?: unknown }).reasoning === true;
 }
 
 /** Read an account's merged `nats` config block (for credential-source resolution). */

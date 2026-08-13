@@ -17,6 +17,10 @@ import {
 } from "./account-config.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
 import {
+  hasExplicitSessionReasoningOptOut,
+  type ReasoningOptOutStoreAccess,
+} from "./reasoning-opt-out.js";
+import {
   getApprovalOriginRegistry,
   type ApprovalOriginLease,
 } from "./approval-origin.js";
@@ -345,7 +349,11 @@ export async function handleInboundMessage(
   peerId: string,
   message: InboundUserMessage,
   accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  options?: { controlLane?: boolean },
+  options?: {
+    controlLane?: boolean;
+    /** Injectable only so the session opt-out privacy boundary is testable. */
+    reasoningOptOutStore?: ReasoningOptOutStoreAccess;
+  },
 ): Promise<void> {
   // `wsKey` is the verified per-peer id the transport uses as its socket-map
   // key (the anonymous strategy is the single-peer special case, where this
@@ -369,12 +377,12 @@ export async function handleInboundMessage(
   let draft: ProgressDraftController | undefined;
   let reasoning: ReasoningDraftController | undefined;
   // #113: did core hand us even ONE reasoning payload this turn? Counted at the
-  // callback boundary, NOT inside the controller: the controller legitimately
-  // drops payloads (empty text, exact-duplicate cumulative snapshots, the btw
-  // stale-prefix strip), and those drops mean "core is streaming, we filtered",
-  // which is NOT the misconfiguration the turn-end warning is about. Only a lane
-  // that core never called at all indicates the operator opted in while the
-  // model side made reasoning impossible.
+  // native callback / durable-delivery boundaries, NOT inside the controller:
+  // the controller legitimately drops payloads (empty text, exact-duplicate
+  // cumulative snapshots, the btw stale-prefix strip), and those drops mean
+  // "core emitted reasoning, we filtered", which is NOT the misconfiguration
+  // the turn-end warning is about. A lane that saw neither form is the surprising
+  // case the warning diagnoses.
   let reasoningPayloadSeen = false;
   let finalReplyDelivered = false;
   let turnOutcome: "ok" | "error" = "ok";
@@ -514,22 +522,31 @@ export async function handleInboundMessage(
     evidence: controlLane ? "presence" : "origin",
   });
 
-  // Reasoning display policy (CHANNEL-OWNED, #113). The gate is this channel's
-  // OWN `capabilities.reasoning` key and nothing else — see resolveReasoningEnabled
-  // in account-config.ts. Default ON: an ABSENT key opens the lane, while a
-  // PRESENT value that is not boolean `true` closes it (so `reasoning: "off"`,
-  // the spelling the `capabilities.typing` sibling invites, fails closed instead
-  // of reading as truthy).
+  // Reasoning display policy (CHANNEL-OWNED, #113). The primary gate is this
+  // channel's OWN `capabilities.reasoning` key — see resolveReasoningEnabled in
+  // account-config.ts. Default ON: an ABSENT key opens the lane, while a PRESENT
+  // value that is not boolean `true` closes it (so `reasoning: "off"`, the
+  // spelling the `capabilities.typing` sibling invites, fails closed instead of
+  // reading as truthy).
   //
   // It deliberately does NOT read `agents.*.reasoningDefault`. That key is
-  // co-parsed by core, which INVALIDATES it for unauthorized senders and forces
-  // "off"; our browser peers are unauthorized by design, because inbound.ts stamps
-  // `access.commands.authorized` on the control (/stop) lane ONLY and we are not
-  // opening a text-command surface to a browser. Reading the same key here made
-  // the two resolvers disagree — we opened the lane, core resolved "off" and never
-  // emitted — so the lane could not be turned on at all, and failed SILENTLY: the
-  // turn settled `ok` with the answer intact and simply zero reasoning frames. A
-  // channel-private key that core does not co-parse is the whole point.
+  // co-parsed by core, which INVALIDATES it for the ordinary unauthorized sender
+  // and forces "off". Reading the same key here made the two resolvers disagree —
+  // we opened the lane, core resolved "off" and (before the non-stream lever)
+  // never emitted — so the lane could not be turned on at all, and failed
+  // SILENTLY: the turn settled `ok` with the answer intact and simply zero
+  // reasoning frames. A channel-private key that core does not co-parse is the
+  // whole point. Deployments may separately authorize named peers through core's
+  // supported command allowlist; the explicit-session veto below covers them.
+  //
+  // One session value remains authoritative as a privacy VETO: an allowlisted
+  // browser peer can legitimately run `/reasoning off`, and core persists that
+  // explicit choice as `sessionEntry.reasoningLevel="off"`. The non-stream lever
+  // treats core mode `off` as streamable, so without this narrow read a later
+  // turn would contradict core's "Reasoning visibility disabled" acknowledgement.
+  // We therefore close only for the persisted explicit `off` (or an unreadable
+  // store, where it cannot be ruled out). Absent state and `on`/`stream` do not
+  // veto; config defaults remain intentionally ignored.
   //
   // Opening the lane is necessary but NOT sufficient. `canShowReasoning` in core
   // (thinkingLevel !== "off") is an independent precondition that no channel
@@ -538,7 +555,15 @@ export async function handleInboundMessage(
   //
   // The control lane (/stop) never opens a reasoning lane while aborting another
   // turn.
-  const reasoningEnabled = !controlLane && resolveReasoningEnabled(channelConfig);
+  const reasoningEnabled =
+    !controlLane &&
+    resolveReasoningEnabled(channelConfig) &&
+    !hasExplicitSessionReasoningOptOut({
+      cfg: api.config,
+      agentId: route.agentId,
+      sessionKey: route.sessionKey,
+      store: options?.reasoningOptOutStore,
+    });
   if (reasoningEnabled) {
     reasoning = createReasoningDraftController({ transport, sessionKey: wsKey, turnId });
   }
@@ -664,7 +689,8 @@ export async function handleInboundMessage(
                       agentRunId = runId;
                       originLease?.activate();
                     },
-                    // Reasoning callbacks are wired iff the lane opened above.
+                    // Reasoning callbacks and durable reasoning payloads are
+                    // enabled iff the lane opened above.
                     //
                     // #113: `streamReasoningInNonStreamModes` is the LEVER that
                     // makes core actually emit. Without it core suppresses
@@ -694,6 +720,16 @@ export async function handleInboundMessage(
                     ...(reasoning
                       ? ({
                           streamReasoningInNonStreamModes: true,
+                          // When an authorized sender/session resolves core's
+                          // reasoning mode to `on`, core deliberately suppresses
+                          // the live callback above and emits `isReasoning:true`
+                          // durable payloads instead. Opt those in only while our
+                          // separate lane exists; the delivery seam below removes
+                          // them from the ordinary answer path and feeds this same
+                          // controller. Streamed modes do not duplicate visually:
+                          // their cumulative final snapshot is an exact duplicate
+                          // that the controller already suppresses.
+                          reasoningPayloadsEnabled: true,
                           onReasoningStream: (p) => {
                             reasoningPayloadSeen = true;
                             reasoning!.push(p);
@@ -702,6 +738,7 @@ export async function handleInboundMessage(
                         } satisfies Pick<
                           GetReplyOptions,
                           | "streamReasoningInNonStreamModes"
+                          | "reasoningPayloadsEnabled"
                           | "onReasoningStream"
                           | "onReasoningEnd"
                         >)
@@ -755,6 +792,12 @@ export async function handleInboundMessage(
                                   draft!.handleAssistantMessageBoundary();
                                 },
                                 onBlockReplyQueued: (payload, context) => {
+                                  // Durable reasoning belongs exclusively to the
+                                  // reasoning lane. Letting it reserve an answer
+                                  // lane would stall later answer partials and a
+                                  // reasoning cancel could retire an unrelated
+                                  // same-index answer reservation.
+                                  if (payload.isReasoning === true) return;
                                   draft!.noteBlockReplyQueued({
                                     assistantMessageIndex: context?.assistantMessageIndex,
                                     ...noticeFlagsOf(payload),
@@ -769,6 +812,7 @@ export async function handleInboundMessage(
               ? {
                   dispatcherOptions: {
                     onSkip: (payload, info) => {
+                      if (payload.isReasoning === true) return;
                       draft!.noteDeliveryLifecycle("skip", {
                         deliveryKind: info.kind,
                         assistantMessageIndex: info.assistantMessageIndex,
@@ -776,6 +820,7 @@ export async function handleInboundMessage(
                       });
                     },
                     onBeforeDeliverCancelled: (payload, info) => {
+                      if (payload.isReasoning === true) return;
                       draft!.noteDeliveryLifecycle("cancel", {
                         deliveryKind: info.kind,
                         assistantMessageIndex: info.assistantMessageIndex,
@@ -798,6 +843,30 @@ export async function handleInboundMessage(
             delivery: {
               deliver: async (payload, info) => {
                 const kind = info.kind;
+                // A durable reasoning payload is visible content, but never an
+                // ANSWER. Core emits this form when its resolved reasoning mode
+                // is `on`; without this interception it either gets dropped
+                // (the pre-fix behavior) or leaks into the ordinary answer
+                // bubble. Always suppress it from that path, even defensively
+                // when no lane exists. Text-less payloads still count as core
+                // emission, matching the native callback boundary semantics.
+                if (payload.isReasoning === true) {
+                  if (reasoning) {
+                    reasoningPayloadSeen = true;
+                    reasoning.push({
+                      text: payload.text,
+                      isReasoningSnapshot: payload.isReasoningSnapshot,
+                    });
+                    // A durable payload is one completed reasoning block, not a
+                    // cumulative update in an open live stream. Rotate after
+                    // each one so a later tool-loop block cannot replace it at
+                    // the same wire id. If this is the final snapshot of an
+                    // already-streamed burst, push() suppresses the duplicate and
+                    // endBurst() closes the existing burst naturally.
+                    reasoning.endBurst();
+                  }
+                  return { visibleReplySent: false };
+                }
                 const noticeFlags = noticeFlagsOf(payload);
                 const isNotice = isCoreNoticePayload(payload);
                 const text = payload.text;
@@ -994,9 +1063,9 @@ export async function handleInboundMessage(
     // ever ASSIGNS "error".
 
     // #113: the diagnostic that `capabilities.reasoning` owes its operator. The
-    // lane opened and core never called `onReasoningStream` even once, so the
-    // widget showed an empty Reasoning section — the silent failure this issue
-    // exists to end.
+    // lane opened and core delivered neither a live callback nor a durable
+    // reasoning payload, so the widget showed an empty Reasoning section — the
+    // silent failure this issue exists to end.
     //
     // Placed AFTER the verdict resolution on purpose. It fires on a turn that
     // ANSWERED SUCCESSFULLY and was not positively known to be aborted — that is
@@ -1070,9 +1139,10 @@ export async function handleInboundMessage(
       }
       reasoningEmptyLaneWarned.add(accountId);
       api.logger?.warn?.(
-        `webchannel: reasoning lane received no frames for account=${accountId} ` +
-          `peer=${wsKey} turn=${turnId} — channels.webchannel.capabilities.reasoning is on, ` +
-          `but core streamed no reasoning for this turn. The most likely cause is an agent ` +
+        `webchannel: reasoning lane received no frames for account=${JSON.stringify(accountId)} ` +
+          `peer=${JSON.stringify(wsKey)} turn=${JSON.stringify(turnId)} — ` +
+          `channels.webchannel.capabilities.reasoning is on, but core delivered no reasoning ` +
+          `for this turn. The most likely cause is an agent ` +
           `thinking level of "off" (a model-side precondition this channel cannot override); ` +
           `some models and providers also emit no reasoning at all. Check the agent's thinking ` +
           `setting, or set capabilities.reasoning=false to stop opening the lane. ` +

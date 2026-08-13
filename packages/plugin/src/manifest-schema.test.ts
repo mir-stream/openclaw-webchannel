@@ -52,16 +52,26 @@ describe("shipped WebChannel manifest schema", () => {
     ).toBe(true);
   });
 
-  it("rejects the on/off spelling for capabilities.reasoning", () => {
+  it("rejects malformed channel-level capabilities.reasoning values", () => {
     // `capabilities.typing` next door IS "on"/"off", so that is the wrong
     // spelling an operator reaches for first. Rejecting it at the schema means
-    // they get a config error instead of a silently-ignored key. (The resolver
-    // independently refuses to read those as ON — see account-config.test.ts.)
+    // they get a config error instead of a silently-ignored key. Named-account
+    // leaves are deliberately unvalidated and therefore rely on the resolver's
+    // independent fail-closed handling — see account-config.test.ts.
     for (const value of ["off", "on", "true", "false", 0, 1, null, {}, []]) {
       expect(
         runtime.safeParse({ capabilities: { reasoning: value } }).success,
         `capabilities.reasoning: ${JSON.stringify(value)} must be rejected`,
       ).toBe(false);
+    }
+  });
+
+  it("leaves malformed named-account capabilities for the runtime fail-closed boundary", () => {
+    for (const capabilities of [null, "off", false, 0, [], { reasoning: "off" }]) {
+      expect(
+        runtime.safeParse({ accounts: { named: { capabilities } } }).success,
+        `named capabilities: ${JSON.stringify(capabilities)} remains schema-unvalidated`,
+      ).toBe(true);
     }
   });
 

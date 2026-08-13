@@ -207,12 +207,27 @@ describe("account-config: resolveReasoningEnabled (#113)", () => {
     // is not boolean `true` must fail CLOSED. The JSON schema rejects these, but
     // the resolver must not depend on the schema having been applied (same rule
     // `resolveTypingEnabled` documents).
-    for (const value of ["off", "on", "true", "false", 1, 0, {}, [], null]) {
+    for (const value of ["off", "on", "true", "false", 1, 0, {}, [], null, undefined]) {
       expect(
         resolveReasoningEnabled({ capabilities: { reasoning: value } }),
         `reasoning: ${JSON.stringify(value)} must resolve OFF`,
       ).toBe(false);
     }
+  });
+
+  it("fails closed for every present malformed capabilities container", () => {
+    for (const capabilities of [null, "off", [], 0, 1, false, new Date(0)]) {
+      expect(
+        resolveReasoningEnabled({ capabilities }),
+        `capabilities: ${String(capabilities)} must resolve OFF`,
+      ).toBe(false);
+    }
+  });
+
+  it("accepts plain capabilities objects, including null-prototype records", () => {
+    const inheritedSafeRecord = Object.assign(Object.create(null), { reasoning: true });
+    expect(resolveReasoningEnabled({ capabilities: {} })).toBe(true);
+    expect(resolveReasoningEnabled({ capabilities: inheritedSafeRecord })).toBe(true);
   });
 
   it("honors an account override false over an unset channel-level base (through the merge)", () => {
@@ -268,6 +283,33 @@ describe("account-config: resolveReasoningEnabled (#113)", () => {
         webchannel: {
           capabilities: { reasoning: false },
           accounts: { acctA: { capabilities: { typing: "off" } } },
+        },
+      },
+    };
+    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
+  });
+
+  it.each([null, "off", [], 0, false] as const)(
+    "keeps an inherited base opt-out closed when a named account replaces capabilities with %s",
+    (capabilities) => {
+      const cfg = {
+        channels: {
+          webchannel: {
+            capabilities: { reasoning: false },
+            accounts: { acctA: { capabilities } },
+          },
+        },
+      };
+      expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
+    },
+  );
+
+  it("lets a malformed named-account container fail closed over a channel-level true", () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          capabilities: { reasoning: true },
+          accounts: { acctA: { capabilities: "off" } },
         },
       },
     };
