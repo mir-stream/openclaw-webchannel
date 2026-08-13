@@ -248,7 +248,6 @@ type ProgressDraftState = {
   emptyPredecessorTimer?: ReturnType<typeof setTimeout>;
   lastProgressSentAt: number;
   firstBoundarySeen: boolean;
-  absorbedMissedBoundaries: number;
   lateReservationEpochOpen: boolean;
   nextTokenSequence: number;
   nextDeliverySequence: number;
@@ -408,7 +407,6 @@ export function createProgressDraftController(params: {
     lines: [],
     lastProgressSentAt: 0,
     firstBoundarySeen: false,
-    absorbedMissedBoundaries: 0,
     lateReservationEpochOpen: true,
     nextTokenSequence: 0,
     nextDeliverySequence: 0,
@@ -1444,7 +1442,6 @@ export function createProgressDraftController(params: {
                 `boundary; preserving generation ${lane.generation} and rotating defensively`,
             );
             closeAndRotate();
-            state.absorbedMissedBoundaries += 1;
             lane = currentLane();
           }
 
@@ -1464,11 +1461,28 @@ export function createProgressDraftController(params: {
         "assistant-message boundary",
         () => {
           if (state.stopped) return;
-          if (state.absorbedMissedBoundaries > 0) {
-            state.absorbedMissedBoundaries -= 1;
-            state.firstBoundarySeen = true;
-            return;
-          }
+          // NO absorb counter. #23 added one so that a boundary arriving LATE
+          // for a seam the fail-safe had already rotated would no-op instead of
+          // rolling twice — a real hazard in that controller, where a double
+          // roll appended a spurious separator inside the single per-turn
+          // bubble. Two things have changed since:
+          //
+          //  - its premise is false. #23 recorded that core "fires
+          //    onAssistantMessageStart exactly ONCE per run"; the live harness
+          //    later showed it firing per assistant message. And a boundary
+          //    cannot arrive late for its OWN message: core fires it before that
+          //    message's first chunk is processed (selection-BfRwHcjH.js:3788
+          //    `handleMessageStart`, and :3859-3867 where a stream-item-id change
+          //    fires the boundary and only then handles the chunk), and this seam
+          //    enqueues boundaries and partials onto one FIFO, so neither can
+          //    overtake the other. The counter therefore never consumed a
+          //    duplicate — it consumed the NEXT message's real boundary.
+          //  - the failure modes inverted. Under lanes, swallowing a boundary
+          //    does not merge two paragraphs: the next message's final lands on
+          //    the previous message's lane and OVERWRITES it. Deleting the
+          //    counter can at worst cause one spurious rotation, and an empty
+          //    lane emits no bubble at all (§6.2-3, M6). A stray empty lane is
+          //    not the same order of defect as deleted text.
           if (!state.firstBoundarySeen) {
             state.firstBoundarySeen = true;
             return;

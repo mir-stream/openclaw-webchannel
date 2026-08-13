@@ -1619,20 +1619,104 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       .toHaveLength(1);
   });
 
-  it("M8: a late structured boundary after defensive rotation does not rotate twice", async () => {
+  /**
+   * FLAGGED FOR JUDGEMENT — this expectation is INVERTED from what it was, and
+   * it is one half of a pair. If the absorb counter comes back, so does the old
+   * assertion; revert them together or neither.
+   *
+   * WHAT IT USED TO PROTECT: after the fail-safe rotated on a missed boundary,
+   * a boundary arriving afterwards was treated as the LATE arrival for that same
+   * seam and swallowed, so it could not rotate a second time. In #23's
+   * controller a double roll appended a spurious separator inside the single
+   * per-turn bubble, so swallowing was the cheaper error.
+   *
+   * WHY THE SHAPE IS NOT REACHABLE: core fires the boundary BEFORE that
+   * message's first chunk is processed — `handleMessageStart`
+   * (selection-BfRwHcjH.js:3788) and the stream-item-id change at :3859-3867,
+   * which fires the boundary and only then handles the chunk — and this seam
+   * puts boundaries and partials on one FIFO, so a boundary cannot trail its own
+   * message's partials. The fixture's own body shows the inconsistency: the text
+   * after the boundary is `"B later"`, a CONTINUATION of B's cumulative text. A
+   * real boundary means a new message, whose cumulative text restarts. So this
+   * sequence needs core both to omit B's boundary and to emit a boundary
+   * mid-message, and the swallow it justified is what deleted the next real
+   * message.
+   *
+   * The cost of the new behaviour is the reverse and much smaller: one spurious
+   * rotation, whose empty lane emits no bubble at all (§6.2-3, M6).
+   */
+  it("M8: a boundary after a defensive rotation opens a new lane", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "A" });
-    h.draft.pushAnswerText({ text: "B" });
+    h.draft.pushAnswerText({ text: "B" }); // missed boundary -> defensive rotation
     const idB = h.frames.at(-1)!.id;
 
-    h.draft.handleAssistantMessageBoundary();
+    h.draft.handleAssistantMessageBoundary(); // a REAL boundary: a new message
     h.draft.pushAnswerText({ text: "B later" });
     await h.draft.finalize("B final");
 
-    expect(h.frames.at(-2)).toEqual({ type: "progress", id: idB, text: "B later" });
-    expect(h.frames.at(-1)).toEqual({ type: "final", id: idB, text: "B final" });
-    expect(successfulIds(h.frames)).toHaveLength(2);
+    // B keeps its own bubble and its own text; the new message gets its own id.
+    const idC = h.frames.at(-1)!.id;
+    expect(idC).not.toBe(idB);
+    expect(h.frames.filter((frame) => frame.id === idB).at(-1)!.text).toBe("B");
+    expect(h.frames.at(-1)).toEqual({ type: "final", id: idC, text: "B final" });
+    expect(successfulIds(h.frames)).toHaveLength(3);
+  });
+
+  /**
+   * #94 — a real boundary after a defensive rotation must open a new lane.
+   *
+   * CROSSES TWO GUARDS: the missed-boundary fail-safe and the boundary handler.
+   * The fail-safe rotated for B's missing boundary and left a counter saying "one
+   * boundary already handled"; the next REAL boundary — C's — was then swallowed
+   * by that counter, so C's finalize landed on B's lane and overwrote it. B was
+   * gone from the wire entirely.
+   *
+   * The control is the important half: the identical no-partial-for-C shape with
+   * all three boundaries present renders all three messages. That is what shows
+   * the absorb, not the missing partial, is the cause. Note the shape only bites
+   * when C has no partial of its own — give C a partial and the fail-safe fires
+   * a second time and happens to compensate, which is how this hid.
+   */
+  it("M15a: a real boundary after a defensive rotation is not swallowed", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "message A" });
+    h.draft.pushAnswerText({ text: "message B" }); // B's boundary missing
+    h.draft.handleAssistantMessageBoundary(); // C's REAL boundary
+    await h.draft.finalize("message C");
+    await h.draft.drain();
+
+    expect(bubbleOrder(h.frames)).toEqual(["message A", "message B", "message C"]);
+  });
+
+  it("M15b: CONTROL — all boundaries present, same no-partial-for-C shape", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "message A" });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "message B" });
+    h.draft.handleAssistantMessageBoundary();
+    await h.draft.finalize("message C");
+    await h.draft.drain();
+
+    expect(bubbleOrder(h.frames)).toEqual(["message A", "message B", "message C"]);
+  });
+
+  it("M15c: the fail-safe itself still rotates on a diverging partial", async () => {
+    // The other side of the deletion: removing the counter must not weaken the
+    // fail-safe it was bolted onto.
+    const warn = vi.fn();
+    const h = makeDraftHarness({ logger: { warn } });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "message A" });
+    h.draft.pushAnswerText({ text: "message B" }); // no boundary ever arrives
+    await h.draft.finalize("message B final");
+    await h.draft.drain();
+
+    expect(bubbleOrder(h.frames)).toEqual(["message A", "message B final"]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("contract violation"));
   });
 
   it("M9: A settle failure leaves no rejected queue tail and B still settles", async () => {
