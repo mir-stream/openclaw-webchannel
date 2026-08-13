@@ -180,8 +180,8 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
     } catch (err) {
       if (!isActive()) return [];
       sinks?.warn?.(
-        `webchannel: ingress dedupe check failed for peer=${item.peerId} id=${id} — ` +
-          `keeping message (fail-open): ${String(err)}`,
+        `webchannel: ingress dedupe check failed for peer=${logSafe(item.peerId)} id=${logSafe(id)} — ` +
+          `keeping message (fail-open): ${logSafe(err)}`,
       );
       survivors.push(item);
       continue;
@@ -190,7 +190,7 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
       survivors.push(item);
     } else {
       sinks?.info?.(
-        `webchannel: dropped duplicate inbound message peer=${item.peerId} id=${id}`,
+        `webchannel: dropped duplicate inbound message peer=${logSafe(item.peerId)} id=${logSafe(id)}`,
       );
     }
   }
@@ -570,7 +570,21 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         ),
       ];
       if (ackIds.length > 0 && !sendAck(anchor.peerId, ackIds)) {
-        logWarn?.(`webchannel: ingress admission ack failed for peer=${anchor.peerId} ids=${ackIds.join(",")}`);
+        // #123: escape each id BEFORE joining, not the joined string. These ids
+        // are peer-supplied, so an id containing a comma would forge a list
+        // boundary — wrapping the join as one value (`ids="a,b"`) still lets a
+        // single id read as two. Per-element quoting keeps every comma that
+        // separates entries outside the quotes and every comma inside an id
+        // inside them.
+        //
+        // Bracketed because a bare `ids="a","b"` is not valid logfmt: a spec
+        // parser reads the value as `a` and then treats `,"b"` as a stray bare
+        // key, silently losing every id after the first. `["a","b"]` is one
+        // unambiguous value to a human and parseable as JSON by a machine.
+        logWarn?.(
+          `webchannel: ingress admission ack failed for peer=${logSafe(anchor.peerId)} ` +
+            `ids=[${ackIds.map((id) => logSafe(id)).join(",")}]`,
+        );
       }
     }
     const fresh = await filterFreshInboundItems(
@@ -669,3 +683,5 @@ import type {
 import { createRateLimitedOutcomeFailureWarning } from "./ingress-outcome.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
 import type { IngressResultFrame } from "./ingress-result-chunks.js";
+// #123: peer ids and message ids reach these log lines straight off the wire.
+import { logSafe } from "./log-safe.js";
