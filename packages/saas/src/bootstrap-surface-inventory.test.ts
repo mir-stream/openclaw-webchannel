@@ -41,6 +41,9 @@ const EXPECTED: Record<string, InventoryEntry> = {
   "e2e/local/enrolled-transport-roundtrip.ts :: /test/bootstrap-jwt template": {
     count: 1, classification: "explicitly gated local E2E harness consumer",
   },
+  "e2e/local/multi-message-roundtrip.ts :: /test/bootstrap-jwt template": {
+    count: 1, classification: "explicitly gated local E2E harness consumer",
+  },
   "e2e/local/turn-outcome-roundtrip.ts :: /test/bootstrap-jwt template": {
     count: 1, classification: "explicitly gated local E2E harness consumer",
   },

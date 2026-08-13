@@ -13,11 +13,14 @@ vi.mock("openclaw/plugin-sdk/reply-payload", () => ({
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import {
+  deliverDraftFinalPayload,
   handleInboundMessage,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
+  type FinalReconciliationState,
 } from "./inbound.js";
 import type { WebChannelPeerChannel } from "./channel-contract.js";
+import type { ProgressDraftController } from "./message-adapter.js";
 import {
   APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY,
   ApprovalOriginLeaseRegistry,
@@ -36,11 +39,11 @@ import { DEFAULT_BUSY_TURN_LIMITS } from "./inbound-retention.js";
  *  - The abort authorization stamp (`access.commands.authorized`) is passed into
  *    core's `buildContext` ONLY for control-lane turns — never for ordinary
  *    turns (we must not broadly authorize text commands for every peer).
- *  - The aborted-turn defensive finalize: when core aborts the RUNNING turn its
- *    `inbound.run` resolves WITHOUT delivering a final, so a started progress
- *    draft would hang forever. We must finalize it in place with a "Stopped"
- *    marker — but a turn that DID deliver its final must finalize exactly once
- *    with the delivered text (idempotence, no "Stopped" suffix).
+ *  - Terminal draft drain: when core aborts the RUNNING turn its `inbound.run`
+ *    resolves WITHOUT delivering a final. The controller settles real lane
+ *    text in generation order, or a lone visible tool scaffold for the
+ *    no-delete case, without manufacturing a stop-marker bubble. A turn that
+ *    DID deliver its final still finalizes exactly once with that payload.
  *
  * The fake `api.runtime.channel` captures the `buildContext` params and lets each
  * test drive the assembled turn (invoke replyOptions callbacks / delivery) via a
@@ -273,7 +276,7 @@ describe("handleInboundMessage — typing indicator gating", () => {
   });
 });
 
-describe("handleInboundMessage — aborted-turn defensive finalize", () => {
+describe("handleInboundMessage — terminal draft drain", () => {
   it("reports visibleReplySent=false when draft finalization returns false", async () => {
     let visible: boolean | undefined;
     const { api } = makeFakeApi({
@@ -363,10 +366,82 @@ describe("handleInboundMessage — aborted-turn defensive finalize", () => {
       text: "answer me",
     });
 
-    // The delivered final wins; the defensive finalize is an idempotent no-op.
+    // The delivered final wins; terminal drain is an idempotent no-op here.
     expect(finalizes).toHaveLength(1);
     expect(finalizes[0]!.text).toBe("Final answer complete");
     expect(finalizes[0]!.text).not.toContain("Stopped");
+  });
+});
+
+describe("deliverDraftFinalPayload — independent routing policy", () => {
+  const makeDraft = () => {
+    const finalize = vi.fn(async () => true);
+    const deliverIndependentFinal = vi.fn(async () => true);
+    const noteLeadingTerminalError = vi.fn();
+    const draft = {
+      finalize,
+      deliverIndependentFinal,
+      noteLeadingTerminalError,
+    } as unknown as ProgressDraftController;
+    return { draft, finalize, deliverIndependentFinal, noteLeadingTerminalError };
+  };
+
+  it.each([
+    {
+      reason: "isNotice",
+      payload: { text: "notice", isFallbackNotice: true },
+      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
+    },
+    {
+      reason: "payload.isError",
+      payload: { text: WARNING_SENTINEL, isError: true },
+      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: false },
+    },
+    {
+      reason: "leadingTerminalErrorSeen",
+      payload: { text: "retained answer" },
+      state: { leadingTerminalErrorSeen: true, ordinaryAnswerFinalSeen: false },
+    },
+    {
+      reason: "ordinaryAnswerFinalSeen",
+      payload: { text: "extra answer" },
+      state: { leadingTerminalErrorSeen: false, ordinaryAnswerFinalSeen: true },
+    },
+  ] satisfies Array<{
+    reason: string;
+    payload: {
+      text: string;
+      isError?: boolean;
+      isFallbackNotice?: boolean;
+    };
+    state: FinalReconciliationState;
+  }>)("F1: $reason alone selects the independent final route", async ({ payload, state }) => {
+    const h = makeDraft();
+
+    await expect(
+      deliverDraftFinalPayload(h.draft, payload, payload.text, { ...state }),
+    ).resolves.toEqual({ sent: true, independent: true });
+
+    expect(h.deliverIndependentFinal).toHaveBeenCalledOnce();
+    expect(h.finalize).not.toHaveBeenCalled();
+  });
+
+  it("F7: a first terminal error records the adapter reconciliation guard", async () => {
+    const h = makeDraft();
+    const state: FinalReconciliationState = {
+      leadingTerminalErrorSeen: false,
+      ordinaryAnswerFinalSeen: false,
+    };
+
+    await deliverDraftFinalPayload(
+      h.draft,
+      { text: "terminal error", isError: true },
+      "terminal error",
+      state,
+    );
+
+    expect(state.leadingTerminalErrorSeen).toBe(true);
+    expect(h.noteLeadingTerminalError).toHaveBeenCalledOnce();
   });
 });
 
