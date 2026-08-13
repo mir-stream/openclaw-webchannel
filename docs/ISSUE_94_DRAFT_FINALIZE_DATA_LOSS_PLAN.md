@@ -3,8 +3,9 @@
 - 이슈: [#94](https://github.com/mir-stream/openclaw-webchannel/issues/94) (P1 / kind/bug / area/plugin)
 - 상류 리포트: rota-crew#281-A (Rota 0.4.0 제품 리뷰)
 - PR 1 브랜치: `mir-stream/issue-94-pr1` (base `develop`)
+- PR 2: [#109](https://github.com/mir-stream/openclaw-webchannel/pull/109), 브랜치 `mir-stream/issue-94-pr2` (base `develop`)
 - 계약 기준: `openclaw/plugin-sdk`의 export 표면. §5의 심볼은 `2026.6.10`(peer floor)과 `2026.7.1-2`(현 npm latest) 양쪽에서 **선언이 동일함을 확인**했다. 따라서 이 변경은 devDependency 상향도 `minGatewayVersion` 상향도 요구하지 않는다.
-- 상태: 제품 의미론 결정 완료, 계약 검증 완료, 구현 전
+- 상태: PR 2 구현·검증 완료, `cf69076`까지 push 완료. §12의 후속 이슈를 제외한 #94 범위는 닫혔다.
 
 ---
 
@@ -257,6 +258,8 @@ delivery.deliver(payload=B, final)    # terminal callback drain에서 A=empty �
 ```
 
 결과는 **B 버블 하나**다. `Working…` ID를 A에 귀속한 뒤 B에 새 ID를 주면 `turn_settled`가 A의 scaffold를 그대로 정착시켜 ghost bubble을 만들므로 그 설계는 금지한다.
+
+**라이브 스트리밍 비용(의도된 동작):** 위처럼 assistant message A가 tool/commentary-only이고 boundary 뒤 answer B가 별도 assistant message로 오면, B partial은 앞의 unresolved A가 terminal drain에서 `empty`로 확정될 때까지 wire로 나가지 않는다. 따라서 사용자는 `Working…`을 본 뒤 B가 토큰 단위로 흐르는 대신 terminal drain에서 완성된 답 전체를 한 번에 보게 된다. 늦은 `onBlockReplyQueued`가 아직 A에 붙을 수 있으므로 timer로 A를 임의로 `empty` 확정하면 원래 data-loss race를 다시 연다. 이는 §6.2-2와 아래 명시적 비용의 결과이지 회귀가 아니다. 반대로 tool과 answer가 **같은 assistant message** 안에 있어 boundary가 없으면 answer partial은 정상적으로 스트리밍된다.
 
 ### 6.2 provisional preview, 순서가 있는 lane 상태, unresolved 보존
 
@@ -609,12 +612,40 @@ C3/C4는 지금 우연히 맞을 수는 있어도 테스트로 고정돼 있지 
 게이트:
 
 ```bash
-npm install          # 이 워크스페이스에는 node_modules가 없다 — 없으면 아래가 전부 실패한다
+npm install          # clean checkout에 node_modules가 없을 때
 npm run build
 npm run typecheck
 npx vitest run packages/plugin
 npm test             # 루트 vitest — client 회귀와 e2e 포함
+bash e2e/local/run-multi-message.sh
 ```
+
+**typecheck 판독 주의:** `npm run typecheck --workspaces`는 한 workspace가 실패해도 뒤 workspace를 계속 실행한 다음 마지막에 전체 실패를 보고한다. 따라서 출력을 `| tail -n`으로 잘라 보면 마지막 package가 green인 것만 보고 전체가 통과한 것으로 오인할 수 있다. 반드시 파이프 없는 명령의 **최종 exit code**를 확인한다. 루트 `npm run typecheck`는 workspace typecheck 뒤 demo와 e2e typecheck까지 이어진다.
+
+**`cf69076` 실측(2026-08-12, sandbox 밖에서 최종 exit code 확인):**
+
+- `npm run build` — exit 0
+- `npm run typecheck` — exit 0 (모든 workspace + demo + e2e)
+- `npx vitest run packages/plugin` — 1794 passed, 7 skipped, 0 failed
+- `npm test` — 144 files passed, 2582 passed, 0 failed
+- `bash e2e/local/run-multi-message.sh` — `nats-server v2.14.0`으로 exit 0
+
+```text
+#01 progress      id=webchannel-…-sf5tnl  "ISSUE94_MESSAGE_A che"
+#02 agent_message id=webchannel-…-sf5tnl  "ISSUE94_MESSAGE_A checking the roster now."
+#03 agent_message id=webchannel-…-8hf4it  "ZZZ94_SECOND_ANSWER here is what came back."
+#04 turn_settled  outcome=ok
+```
+
+이 e2e는 장식용 smoke가 아니다. `packages/plugin/src/message-adapter.ts`와 `packages/plugin/src/inbound.ts`만 `origin/develop`로 되돌린 revert-check에서 같은 gate가 exit 6으로 실패했다.
+
+```text
+#02 progress      id=…cnhgsh  "ISSUE94_MESSAGE_A checking the roster now.\n\nZZZ94_SECOND_ANSWER here is what came back."
+#03 agent_message id=…cnhgsh  "ZZZ94_SECOND_ANSWER here is what came back."
+[FAIL] #94 REGRESSION: the turn produced 1 agent_message frame(s), expected >= 2.
+```
+
+두 메시지가 한 ID로 평탄화된 뒤 terminal frame B가 같은 버블을 교체해 라이브 A를 지우는 #94 증상 그대로다. 즉 production fix를 빼면 이 gate가 실제로 실패한다.
 
 ---
 
@@ -684,68 +715,86 @@ staleness valve의 disarm은 경로마다 단위가 다르다. `progress`/`agent
 
 이 문제는 **클라이언트 소유이고 플러그인 lane 모델과 독립**이므로 #105로 배출한다. PR 1의 C5b는 `progress`와 `agent_message`가 lane-local임을 각각 고정하지만 reasoning의 turn-wide 정책을 정당화하거나 수정하지 않는다.
 
+### 12.2 PR 2 inbound 리뷰에서 확인한 잔여 위험 (dist 실측, 2026-08-12)
+
+- **leading `errorText` 없는 multi-final도 가능하다 — #111로 유예.** 고정 core 번들의 `node_modules/openclaw/dist/payloads-DMxgzxEO.js:238-241`에서 run의 마지막 assistant message가 tool-only라 `fallbackAnswerSourceText`가 비어 있으면 `shouldUseCanonicalFinalAnswer`가 `false`가 된다. 동시에 `nonEmptyAssistantTexts.length >= 2`이면 core는 leading error/notice 없이 non-error final을 2개 이상 방출할 수 있다. 이미 partial로 A/B가 보인 턴에서 이 final 배열이 오면 첫 ordinary final이 current B lane의 terminal slot을 소비해 B의 streamed body를 A 본문으로 교체하고, 다음 final만 fresh independent bubble로 남는 #94형 live loss가 도달 가능하다. 이 payload들에는 stable final identity가 없어서 플러그인이 어느 lane의 final인지 구분할 수 없고, 본문 비교는 §6.4가 금지한다. 따라서 로컬 text guard는 추가하지 않으며 queued callback과 actual/terminal delivery를 잇는 stable identity를 소유한 #111에서 화해한다.
+
 ---
 
 ## 13. 완료 정의
 
-- [ ] partial/final ordinary 경로에서 한 턴의 완료된 assistant 메시지 N개가 라이브에서도 N개 버블로 남는다. authorized block과 leading-terminal-error 후속 final은 #111 전까지 provisional-or-fresh independent 중복을 허용한다.
-- [ ] 각 메시지는 고유 ID를 가지며 partial은 해당 활성 ID만 갱신한다.
-- [ ] first-lane tool scaffold는 provisional ID로 남고 첫 successful lane 또는 independent delivery가 재사용한다. independent owner는 assistant lane을 만들지 않는다.
-- [ ] lane generation과 independent delivery sequence 모두 P를 reserve → send하고 lane transport boolean / independent `visibleReplySent`가 실제 `true`일 때만 owner/lane ID와 provisional scaffold-writer invalidation을 commit한다. `false`/throw에는 P와 tentative lane assignment를 rollback하고 writer를 active로 유지한다.
-- [ ] successful claim 뒤 tool/item event는 claimed P나 새 scaffold ID로 wire emission하지 않으며 durable P 본문을 덮지 않는다. bubble 사이 in-flight 표시는 base의 `turnActive`(#96/#101)를 사용한다.
-- [ ] 다음 boundary 뒤에 늦게 온 `onBlockReplyQueued`도 앞 commentary-only lane의 tentative reservation을 유지한다. callback payload는 wire/body가 아니며, skip/cancel/failure/terminal drain은 empty predecessor를 retire해 뒤 lane의 barrier를 푼다.
-- [ ] partial mode의 actual post-hook block delivery를 조용히 폐기하거나 lane에 추측 적용하지 않는다. notice를 먼저 분류한 뒤 reservation 수/상태와 무관한 independent delivery로 보내며, visible+unclaimed P면 reserve/send 후 성공에만 commit하고 P가 없거나 claimed면 fresh ID를 쓴다.
-- [ ] queued 원문이 rewrite/cancel되면 원문은 wire에 0회다. cancel(A) → B에서 A ghost/barrier가 없고, actual send `true`/`false`/throw가 모두 lifecycle cleanup 뒤 queue를 살려 둔다.
-- [ ] `isStatusNotice`/`isFallbackNotice`/`isCompactionNotice` block은 callback과 actual 양쪽에서 lane logic보다 먼저 분류된다. actual notice만 독립 전송되고 assistant lane을 생성·정착·차단하지 않는다.
-- [ ] leading error 없는 첫 ordinary answer final만 current lane의 terminal slot을 확정한다. terminal notice와 leading error 뒤 identity 없는 모든 non-notice payload는 lane을 소비하지 않고 같은 provisional-or-fresh independent 경로로 보존한다.
-- [ ] (a) block callback 0개와 (b) coalesced callbacks `[A1+"\n\n"+A2@0,B@1]` 모두 final `[error,A1,A2,B]`를 만나면 기존 A/B는 불변이고 error/A1/A2/B가 모두 보존된다. callback 수로 final을 drop/group하지 않으며 의미상 중복은 명시적으로 수용한다.
-- [ ] 각 lane transport boolean / independent `visibleReplySent`의 실제 결과를 보존한다. `true`에만 provisional claim을 commit하고 `false`/throw에는 rollback하며 queue와 나머지 delivery를 계속 처리한다. 실패 frame은 blind inline retry하지 않는다. answer → timeout/warning 순서에서도 어느 payload도 settle latch에 삼켜지지 않는다.
-- [ ] 첫 lane frame `progress(partial)`/`agent_message(final-only)` × `false`/throw × 뒤 successful lane/independent의 조합에서 실패 lane은 committed P/ID를 남기지 않고 뒤 성공이 P를 사용한다. partial-first 실패 lane의 later update는 이미 claimed P 대신 fresh ID를 쓴다.
-- [ ] history snapshot이 live A/B ID를 canonical ID로 adopt한 뒤 fresh fallback은 canonical A/B를 mutate하지 않고 append된다. old live ID 추측도 하지 않으며 exact-once는 #111 범위다.
-- [ ] ordinary partial/final 경로의 live와 history hydrate 메시지 **수와 순서**가 일치한다(§6.5.1의 방어 회전, authorized-block 및 leading-error at-least-once 예외 제외).
+- [ ] partial/final ordinary 경로에서 한 턴의 완료된 assistant 메시지 N개가 라이브에서도 N개 버블로 남는다. authorized block과 leading-terminal-error 후속 final은 #111 전까지 provisional-or-fresh independent 중복을 허용한다. — **미충족:** §12.2의 leading-error 없는 multi-final은 첫 final을 current B lane에 오귀속해 N↔N을 깨뜨릴 수 있으며, 이를 닫을 stable final identity와 화해는 #111에 남아 있다.
+- [ ] 각 메시지는 고유 ID를 가지며 partial은 해당 활성 ID만 갱신한다. — **미충족:** structured boundary의 lane/partial ID는 고정됐지만 §12.2 multi-final의 semantic message→lane 소유권은 식별할 수 없으므로 one-message↔one-ID를 일반적으로 보장하려면 #111의 exact lane identity가 필요하다.
+- [x] first-lane tool scaffold는 provisional ID로 남고 첫 successful lane 또는 independent delivery가 재사용한다. independent owner는 assistant lane을 만들지 않는다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M1b: tool P plus an empty first lane converges to one B bubble`; `packages/plugin/src/message-adapter.test.ts:M13d: the first successful notice/error claimant owns P and later payloads are fresh`; `packages/plugin/src/channel.test.ts:I15: lets the mixed-turn answer claim and finalize the provisional scaffold id`.
+- [x] lane generation과 independent delivery sequence 모두 P를 reserve → send하고 lane transport boolean / independent `visibleReplySent`가 실제 `true`일 때만 owner/lane ID와 provisional scaffold-writer invalidation을 commit한다. `false`/throw에는 P와 tentative lane assignment를 rollback하고 writer를 active로 유지한다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M6i: independent true commits P while false/throw roll back and keep the queue alive`; `packages/plugin/src/message-adapter.test.ts:M13g: failed first progress/final lane frames leave P for B and are not retried`; `packages/plugin/src/channel.test.ts:I26: first $firstFrame frame $failure rolls P back for the next $nextConsumer consumer`.
+- [x] successful claim 뒤 tool/item event는 claimed P나 새 scaffold ID로 wire emission하지 않으며 durable P 본문을 덮지 않는다. bubble 사이 in-flight 표시는 base의 `turnActive`(#96/#101)를 사용한다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M13f: lane and independent P claims both suppress every later scaffold write`; `packages/plugin/src/channel.test.ts:I25: a successful $owner P claim suppresses later tool and item scaffold frames`; `packages/client/src/nats-client-wrapper-turn-active.test.ts:stays true after the first agent bubble settles (isTyping false, no working draft)`.
+- [x] 다음 boundary 뒤에 늦게 온 `onBlockReplyQueued`도 앞 commentary-only lane의 tentative reservation을 유지한다. callback payload는 wire/body가 아니며, skip/cancel/failure/terminal drain은 empty predecessor를 retire해 뒤 lane의 barrier를 푼다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M6b: an indexed late A reservation orders fresh fallback before B`; `packages/plugin/src/message-adapter.test.ts:M6c: an indexless late reservation holds B until terminal drain`; `packages/plugin/src/message-adapter.test.ts:M6h: indexed lifecycle cleanup releases B; ambiguous cleanup waits for drain`; `packages/plugin/src/channel.test.ts:I11: a late queued A reservation (index=%s) never supplies the wire body or B lane id`.
+- [x] partial mode의 actual post-hook block delivery를 조용히 폐기하거나 lane에 추측 적용하지 않는다. notice를 먼저 분류한 뒤 reservation 수/상태와 무관한 independent delivery로 보내며, visible+unclaimed P면 reserve/send 후 성공에만 commit하고 P가 없거나 claimed면 fresh ID를 쓴다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M6e: zero, one, or many reservations never route an actual block into a lane`; `packages/plugin/src/message-adapter.test.ts:M6i: independent true commits P while false/throw roll back and keep the queue alive`; `packages/plugin/src/channel.test.ts:I14: an authorized block stays independent with %i tentative reservations`; `packages/plugin/src/channel.test.ts:I19/I21/I23: tool P plus an authorized block %s reports the real result and orders B`.
+- [x] queued 원문이 rewrite/cancel되면 원문은 wire에 0회다. cancel(A) → B에서 A ghost/barrier가 없고, actual send `true`/`false`/throw가 모두 lifecycle cleanup 뒤 queue를 살려 둔다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M6d: the controller publishes only the rewritten actual payload`; `packages/plugin/src/message-adapter.test.ts:M6h: indexed lifecycle cleanup releases B; ambiguous cleanup waits for drain`; `packages/plugin/src/channel.test.ts:I17: only the post-hook authorized block text reaches the wire`; `packages/plugin/src/channel.test.ts:I18: $lifecycleKind cleanup (index=$assistantMessageIndex) leaves no queued-A ghost`; `packages/plugin/src/channel.test.ts:I19/I21/I23: tool P plus an authorized block %s reports the real result and orders B`.
+- [x] `isStatusNotice`/`isFallbackNotice`/`isCompactionNotice` block은 callback과 actual 양쪽에서 lane logic보다 먼저 분류된다. actual notice만 독립 전송되고 assistant lane을 생성·정착·차단하지 않는다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M6f: a queued %s notice never becomes a predecessor barrier`; `packages/plugin/src/message-adapter.test.ts:M6g/F5: actual notices stay independent without settling a real-block barrier`; `packages/plugin/src/channel.test.ts:I20: callback-to-actual %s rewrites preserve both authorized payloads outside the lane`; `packages/plugin/src/channel.test.ts:I20/F5: an actual %s notice cannot settle a real-block reservation`.
+- [x] leading error 없는 첫 ordinary answer final만 current lane의 terminal slot을 확정한다. terminal notice와 leading error 뒤 identity 없는 모든 non-notice payload는 lane을 소비하지 않고 같은 provisional-or-fresh independent 경로로 보존한다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M10: a lane settle is re-entrantly latched while an independent final remains available`; `packages/plugin/src/message-adapter.test.ts:M11a: callback-free leading error finals are all independent of materialized A/B`; `packages/plugin/src/channel.test.ts:I20/F1: a final %s notice does not consume the streamed answer lane`; `packages/plugin/src/inbound.test.ts:F1: $reason alone selects the independent final route`.
+- [x] (a) block callback 0개와 (b) coalesced callbacks `[A1+"\n\n"+A2@0,B@1]` 모두 final `[error,A1,A2,B]`를 만나면 기존 A/B는 불변이고 error/A1/A2/B가 모두 보존된다. callback 수로 final을 drop/group하지 않으며 의미상 중복은 명시적으로 수용한다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M11a: callback-free leading error finals are all independent of materialized A/B`; `packages/plugin/src/message-adapter.test.ts:M11b: coalesced callback counts never group or suppress actual blocks/finals`; `packages/plugin/src/channel.test.ts:I12a callback-free leading-error replay preserves every final independently of callback cardinality`; `packages/plugin/src/channel.test.ts:I12b coalesced callbacks leading-error replay preserves every final independently of callback cardinality`.
+- [x] 각 lane transport boolean / independent `visibleReplySent`의 실제 결과를 보존한다. `true`에만 provisional claim을 commit하고 `false`/throw에는 rollback하며 queue와 나머지 delivery를 계속 처리한다. 실패 frame은 blind inline retry하지 않는다. answer → timeout/warning 순서에서도 어느 payload도 settle latch에 삼켜지지 않는다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M6i: independent true commits P while false/throw roll back and keep the queue alive`; `packages/plugin/src/message-adapter.test.ts:M10: a later final after a failed lane settle reports its own successful send`; `packages/plugin/src/message-adapter.test.ts:M12: mixed true/false/throw leading-error fallbacks all run with actual results`; `packages/plugin/src/channel.test.ts:I13: an ordinary answer and a trailing tool-warning final both remain visible`.
+- [x] 첫 lane frame `progress(partial)`/`agent_message(final-only)` × `false`/throw × 뒤 successful lane/independent의 조합에서 실패 lane은 committed P/ID를 남기지 않고 뒤 성공이 P를 사용한다. partial-first 실패 lane의 later update는 이미 claimed P 대신 fresh ID를 쓴다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M13g: failed first progress/final lane frames leave P for B and are not retried`; `packages/plugin/src/message-adapter.test.ts:M13h: F claims P after A progress failure; A's later revision uses fresh id`; `packages/plugin/src/channel.test.ts:I26: first $firstFrame frame $failure rolls P back for the next $nextConsumer consumer`.
+- [x] history snapshot이 live A/B ID를 canonical ID로 adopt한 뒤 fresh fallback은 canonical A/B를 mutate하지 않고 append된다. old live ID 추측도 하지 않으며 exact-once는 #111 범위다. — **EVIDENCE:** `packages/client/src/nats-client-wrapper.test.ts:C7: snapshot-adopted lanes stay unchanged while fresh fallback and stale ids append independently`.
+- [ ] ordinary partial/final 경로의 live와 history hydrate 메시지 **수와 순서**가 일치한다(§6.5.1의 방어 회전, authorized-block 및 leading-error at-least-once 예외 제외). — **미충족:** `packages/client/src/nats-client-wrapper.test.ts:C2: a snapshot of a two-bubble turn adopts BOTH canonical ids instead of duplicating`는 지원되는 two-lane 경로를 고정하지만, §12.2 leading-error 없는 multi-final 잔여는 예외 목록 밖에서 live 수/본문 소유권을 깨뜨릴 수 있어 #111 화해가 필요하다.
       **본문 일치는 완료 조건이 아니다** — core는 라이브 응답에서 메타데이터 구획을 걷어내고 transcript에는 원본을 저장하므로 두 텍스트는 애초에 byte-equal이 아니다(`nats-client-wrapper.ts:1052-1054`). 본문 수렴은 hydrate의 정본 텍스트 채택(`adoptAt`)이 담당하며, 이 이슈가 보장할 대상이 아니다.
-- [ ] 메시지 동일성 판정에 `includes`/suffix/문자열 split을 사용하지 않는다.
-- [ ] 앞 lane 전송 실패 후에도 모든 final payload 전달이 시도되고 실패 delivery의 실제 결과가 보존되며 queue가 살아 있다.
-- [ ] abort/error/단일 메시지/progress/block/off 경로에 회귀가 없다.
-- [ ] 중단/에러 경로에서 빈 lane 버블도 중단 마커 버블도 생기지 않는다. successful lane/independent claim은 scaffold cleanup을 금지하고, 모든 durable delivery가 실패하거나 없는 unclaimed tool-only preview만 no-delete 예외로 같은 ID에서 settle한다(§6.2-3, §8-6).
-- [ ] history 화해 비대칭(C3/C4), later-snapshot adoption, 다중 draft watchdog(C5a/C5b), lane provisional-ID reuse(C6), snapshot adoption 뒤 fresh-fallback/stale-ID append 비용(C7), independent same-P 순서와 fresh-first 역전/ghost 및 late-scaffold overwrite 비용(C8)이 테스트로 고정된다.
-- [ ] 다중 어시스턴트 메시지 턴이 e2e에서 두 개의 서로 다른 id로 정착한다.
-- [ ] 계약 밖(core 내부 번들) 의존을 새로 늘리지 않는다 — 신규 근거는 `plugin-sdk` export만 인용한다.
-- [ ] build/typecheck/plugin tests/full tests가 모두 통과한다.
+- [x] 메시지 동일성 판정에 `includes`/suffix/문자열 split을 사용하지 않는다. — **EVIDENCE:** `packages/plugin/src/channel.test.ts:I4: keeps B separate when its final quotes the complete text of A`가 `includes`형 반례를 고정한다. suffix/split 금지는 production routing에 해당 연산이 없어 **구조상 성립, 별도 회귀 테스트 없음**.
+- [x] 앞 lane 전송 실패 후에도 모든 final payload 전달이 시도되고 실패 delivery의 실제 결과가 보존되며 queue가 살아 있다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M12: mixed true/false/throw leading-error fallbacks all run with actual results`; `packages/plugin/src/channel.test.ts:I6: a lane-A terminal %s leaves the queue alive for B`; `packages/plugin/src/channel.test.ts:I26: first $firstFrame frame $failure rolls P back for the next $nextConsumer consumer`.
+- [x] abort/error/단일 메시지/progress/block/off 경로에 회귀가 없다. — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:drain after stop does not emit a terminal frame`; `packages/plugin/src/channel.test.ts:I3: keeps a single partial-mode message on one id from its first progress through final`; `packages/plugin/src/channel.test.ts:I9: streams a progress draft then finalizes the same provisional id`; `packages/plugin/src/channel.test.ts:I10: streaming.mode=%s keeps authorized blocks and final on the plain append path`; `packages/plugin/src/channel.test.ts:settles streamed text unchanged and surfaces a separate apology when the turn throws`.
+- [x] 중단/에러 경로에서 빈 lane 버블도 중단 마커 버블도 생기지 않는다. successful lane/independent claim은 scaffold cleanup을 금지하고, 모든 durable delivery가 실패하거나 없는 unclaimed tool-only preview만 no-delete 예외로 같은 ID에서 settle한다(§6.2-3, §8-6). — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M6: a callback-only lane produces no bubble after skip, cancel, or drain`; `packages/plugin/src/message-adapter.test.ts:M13b: block-only success replaces P and drain does not re-settle scaffold`; `packages/plugin/src/message-adapter.test.ts:drain settles a visible unclaimed tool-only preview at the same id`; `packages/plugin/src/channel.test.ts:I8: a clean resolve drains all real lane text without a marker bubble`.
+- [x] history 화해 비대칭(C3/C4), later-snapshot adoption, 다중 draft watchdog(C5a/C5b), lane provisional-ID reuse(C6), snapshot adoption 뒤 fresh-fallback/stale-ID append 비용(C7), independent same-P 순서와 fresh-first 역전/ghost 및 late-scaffold overwrite 비용(C8)이 테스트로 고정된다. — **EVIDENCE:** `packages/client/src/nats-client-wrapper.test.ts:C3: when the first lane never settled, the surviving bubble is re-labelled and the array still converges`; `packages/client/src/nats-client-wrapper.test.ts:C4: a live bubble newer than one snapshot is preserved, then adopted by a later complete snapshot`; `packages/client/src/nats-client-wrapper.test.ts:C5a: a single turn_settled finalizes every working draft sharing its turnId, in place`; `packages/client/src/nats-client-wrapper.test.ts:#94: $frameType on ONE lane inside the grace disarms only that lane; dead siblings still expire`; `packages/client/src/nats-client-wrapper.test.ts:C6: reusing the provisional scaffold id for the first durable answer leaves no ghost bubble`; `packages/client/src/nats-client-wrapper.test.ts:C7: snapshot-adopted lanes stay unchanged while fresh fallback and stale ids append independently`; `packages/client/src/nats-client-wrapper.test.ts:C8: preview claim preserves order and exposes fresh-first and late-scaffold mutation costs`.
+- [x] 다중 어시스턴트 메시지 턴이 e2e에서 두 개의 서로 다른 id로 정착한다. — **EVIDENCE:** `e2e/local/multi-message-roundtrip.ts:#94 assertion: at least two agent_message frames with DISTINCT ids`; `cf69076`에서 `bash e2e/local/run-multi-message.sh` exit 0(서로 다른 A/B id), production 두 파일 revert-check exit 6(한 `agent_message`) 실측.
+- [x] **tool-only 첫 assistant message 턴이 라이브로 스트리밍된다.** — **충족:** "도구를 부르고 나서 답한다"는 가장 흔한 multi-message 형상에서 첫 lane이 text 없이 닫히면 `laneOrderResolved`가 그 lane을 terminal drain 전까지 unresolved ordering barrier로 유지해, 뒤따르는 답변 lane이 `progress` 프레임을 하나도 내보내지 못했다. 최종 버블과 `turn_settled`는 정상이므로 turn 1 fixture로는 보이지 않는다. e2e로 재현 고정(`287c1e8`, `e2e/local/multi-message-roundtrip.ts:turn 2 (tool-only first message)`) 후 `823a8ba`로 수정했다.
+  즉시 판정하는 규칙은 원리적으로 불가능하다 — 후속 lane이 스트리밍하는 시점에 "영영 아무것도 내지 않을 lane"과 "block이 아직 오는 중인 lane"은 구분되지 않고, 구분 정보는 나중에 도착한다. 그래서 후속 lane의 **첫 progress 프레임만** throttle 한 window(600ms) 기다린 뒤, 그 사이 reservation이 오지 않으면 predecessor를 resolve한다. 측정된 gateway 순서에서 queued callback은 block dispatch와 같은 event-loop batch에 도착하므로 barrier가 실재할 때는 그대로 유지되며, 충돌하던 fixture 7개(`M6b`/`M6c`/`M6h`/I11·F2×3/`I18`)는 **수정 없이** 통과한다.
+  타이머는 progress만 막고 settle은 막지 않는다. 모든 settle 경로가 `retireTentativeState`로 해당 lane을 동기 resolve하므로 window 안에 끝나는 턴은 오늘과 동일하게 완성된 버블을 보여준다 — 최악은 그대로, 최선은 스트리밍. 고정 테스트는 `M6j`(release + throttle bypass), `M6k`(settle은 대기하지 않음, drain 후 `getTimerCount()`가 0).
+  **window 밖 비용 두 가지를 기록해 둔다 — 다음 독자가 다시 유도하지 않도록.** (1) window가 닫힌 뒤 도착한 reservation은 predecessor를 이미 resolve한 뒤이므로 순서가 뒤집힌다(`M6n`, 결함이 아니라 시간 제한의 대가로 수용). (2) `skip`/`cancel`이 notice와 인덱스를 공유하는 real block을 정리하면 예약이 턴 끝까지 pending으로 남아 뒤 lane이 progress를 하나도 못 낸다 — 버블은 drain에서 정착하므로 손실은 없다. 두 비용의 뿌리는 같다: 인덱스당 레코드 **개수**를 조건으로 쓰던 `retireSoleLifecycleRecord`의 cardinality bail이고, `9a5557c`(settlement)와 `9f7e935`(skip/cancel)에서 제거해 (2)는 해소했다(`M6y`).
+- [x] **materialize된 lane은 progress 전송이 실패해도 terminal frame에 도달한다.** — **충족:** `laneHasFailedCurrentRevision`이 실패한 progress revision의 재시도뿐 아니라 그 lane의 **terminal frame까지** 막고 있었다. 일시적 `false`/`throw` 한 번이면 이미 화면에 뜬 버블이 마지막으로 성공한 텍스트에 얼어붙고 `finalizeDraft`는 시도조차 되지 않는다 — 클라이언트가 `turn_settled`에서 작업 중 draft를 제자리 확정하므로 잘림은 영구적이고 무징후다. `develop`은 이를 막고 있었고(finalize 경로 주석: 실패한 flush를 삼키고 finalizeDraft로 진행), `develop` 컨트롤러 대조 실행에서 실패 뒤에도 **전체 텍스트**로 terminal frame을 시도하는 것을 확인했다. 34da088이 lane 단위로 잃은 보장을 `00cc9fb`이 lane 단위로 복원한다. 구분자는 `materialized`(`sendLaneFrame`이 성공 시 기록) — wire에 아무것도 못 올린 lane은 계속 억제되어 없던 버블을 만들지 않는다(`M13g`). **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M14a`/`M14b`/`M14c`/`M14d`. 두 형상은 mutation으로 분리 확인: 옛 gate 복원 시 `M14a`/`M14b`만, 억제 제거 시 `M14c`/`M13g`/`I26`×4만 red.
+- [x] mid-stream tag stripping이 한 답변을 두 버블로 쪼개지 않는다(`develop`의 partial hygiene 복원). — **EVIDENCE:** `packages/plugin/src/message-adapter.test.ts:M7b: a mid-stream <thinking> tag never splits one answer into two bubbles`; `packages/plugin/src/message-adapter.test.ts:M7c: a Reasoning:-prefixed partial never reaches the wire`; `packages/plugin/src/channel.test.ts:ignores a shrinking cumulative partial instead of splitting the answer`. 세 guard 모두 mutation 확인(각각 제거 시 해당 테스트 red). 34da088이 `develop`의 shrink/`Reasoning:` guard를 떨어뜨렸고, 당시 테스트가 회귀한 동작을 그대로 고정하고 있었다.
+- [x] 계약 밖(core 내부 번들) 의존을 새로 늘리지 않는다 — 신규 근거는 `plugin-sdk` export만 인용한다. — **EVIDENCE:** production 변경은 public `openclaw/plugin-sdk/reply-payload` export만 추가 사용하며 private core import/cast가 없다. §12.2의 번들 경로는 잔여 위험을 기록한 실측일 뿐 runtime 의존이 아니다. **구조상 성립, 회귀 테스트 없음**.
+- [x] build/typecheck/plugin tests/full tests가 모두 통과한다. — **EVIDENCE:** `9f7e935` 시점 실측: `npm run build` exit 0; `npm run typecheck` exit 0; `npx vitest run packages/plugin` 88 files/1823 passed/7 skipped/0 failed; `npx vitest run` 146 files/2634 passed/7 skipped/0 failed; `bash e2e/local/run-multi-message.sh` exit 0(양쪽 턴). (직전 값 1796/2607은 리뷰 라운드 7–9의 수정과 fixture 추가 이전이라 대체한다.)
 
 ---
 
-## 14. compact 이후 구현 시작점
+## 14. 현재 구현·PR 상태와 후속 작업
 
-PR 1 완료 시점에는 **문서와 client characterization test만 수정되고 production 코드는 그대로다.** 플러그인 구현과 M/I/e2e 테스트는 PR 2에서 함께 들어간다.
+#94의 PR 2 구현은 끝났고 `cf69076`까지 remote에 push되어 있다. 현재 브랜치는 `mir-stream/issue-94-pr2`, PR은 [#109](https://github.com/mir-stream/openclaw-webchannel/pull/109), base는 `develop`이다. 다음 독자는 이 문서의 §9를 새 구현 시작점으로 사용하지 말고, 아래 deferred 범위만 별도 이슈에서 이어간다.
 
-**선행 조건:** clean checkout에 `node_modules`가 없으면 `npm install`을 먼저 실행한다.
+**#109는 #94를 close하지 않는다.** §13 체크리스트에 미충족 항목이 남아 있고(§12.2 multi-final 오귀속, live↔hydrate 수/순서), delivery identity 작업 일체는 브랜치 `mir-stream/issue-111`로 옮겼다 — `cdd6ea7`(actual block delivery의 `assistantMessageIndex` 귀속 + block-streaming e2e gate)은 `a772560`으로 revert되어 `mir-stream/issue-111`에만 남아 있다. #109는 lane 모델과 partial hygiene 회귀 수정까지를 범위로 하고 #94를 **advance**한다.
 
-### 14.1 PR 분할 (확정)
+### 14.1 PR 분할 (확정, 완료)
 
-**PR 1 — 클라이언트 화해 특성 테스트 (테스트 전용, 소)**
-`packages/client/src/nats-client-wrapper.test.ts`에 §10의 C1~C8을 추가한다. 플러그인 변경과 완전히 독립이며 합성 프레임만으로 검증된다. 목표는 프로덕션 무변경이다. C6은 새 프로토콜 없이 lane의 provisional ID reuse가 ghost 없이 작동함을 고정한다. C7은 snapshot adoption 뒤 canonical A/B를 건드리지 않는 fresh fallback과 old live ID alias가 없어 stale-ID upsert도 append되는 현재 client 제약을 실측한다. C8은 independent delivery가 P를 먼저 쓴 올바른 `[F(P),B(new)]`/block-only `[F(P)]` 형상과, 일부러 fresh-F 뒤 P-B/turn settle을 주입했을 때 `[B(P),F]`/`[ghost P,F]`가 되는 reducer 비용을 함께 실측한다. 또한 durable `agent_message(P,F)` 뒤 late scaffold `progress(P,Working)`가 F를 덮고 working으로 되돌리는 비용을 고정한다. exact-once나 alias 보존을 주장하지 않고 client production alias map도 이 PR에 추가하지 않는다.
+**PR 1 — 클라이언트 화해 특성 테스트 (테스트 전용, 소; #103으로 merge)**
+`packages/client/src/nats-client-wrapper.test.ts`의 C1~C8을 플러그인 변경과 분리해 합성 프레임으로 먼저 검증했고 client production은 바꾸지 않았다. C6은 새 프로토콜 없이 lane의 provisional ID reuse가 ghost 없이 작동함을 고정한다. C7은 snapshot adoption 뒤 canonical A/B를 건드리지 않는 fresh fallback과 old live ID alias가 없어 stale-ID upsert도 append되는 현재 client 제약을 실측한다. C8은 independent delivery가 P를 먼저 쓴 올바른 `[F(P),B(new)]`/block-only `[F(P)]` 형상과, 일부러 fresh-F 뒤 P-B/turn settle을 주입했을 때 `[B(P),F]`/`[ghost P,F]`가 되는 reducer 비용을 함께 실측한다. 또한 durable `agent_message(P,F)` 뒤 late scaffold `progress(P,Working)`가 F를 덮고 working으로 되돌리는 비용을 고정한다. exact-once나 alias 보존을 주장하지 않고 client production alias map도 추가하지 않았다.
 
-**작성 규칙 (리뷰 2라운드에서 두 번 어겨 정한다).** 특성 테스트의 가치는 주석에 있고, 주석이 테스트보다 강한 주장을 하면 다음 사람을 오도한다. **"이 테스트가 X를 구속한다"고 쓸 거면 X를 깨는 뮤테이션을 실제로 돌려 확인하고 쓴다.** 확인하지 못하면 "이 형상이 이렇게 수렴한다"는 사실 기록으로만 쓴다. 실제로 이 규칙 없이 쓴 주석 두 개가 자명하게 참인 assertion(C4 오라벨, 구 C3의 짝짓기 주장)을 감추고 있었다.
+**작성 규칙 (리뷰 2라운드에서 두 번 어겨 정했다).** 특성 테스트의 가치는 주석에 있고, 주석이 테스트보다 강한 주장을 하면 다음 사람을 오도한다. **"이 테스트가 X를 구속한다"고 쓸 거면 X를 깨는 뮤테이션을 실제로 돌려 확인하고 쓴다.** 확인하지 못하면 "이 형상이 이렇게 수렴한다"는 사실 기록으로만 쓴다. 실제로 이 규칙 없이 쓴 주석 두 개가 자명하게 참인 assertion(C4 오라벨, 구 C3의 짝짓기 주장)을 감추고 있었다.
 
-이걸 먼저 떼는 이유: C3(라이브 1 / snapshot 2)와 C4(라이브 3 / snapshot 2)는 3-tier 매칭을 추적해 보면 **현재 우연히 맞지만 테스트로 고정된 적이 없다.** 만약 실제로 틀렸다면 그건 `nats-client-wrapper.ts` 프로덕션 수정이고, 메인 PR 안에서 터지면 "메시지 경계 수정"이 클라이언트 화해 로직 수정까지 껴안게 된다. 먼저 확인하면 어느 쪽이든 메인 PR이 깨끗하다.
+PR 1을 먼저 뗀 이유는 C3(라이브 1 / snapshot 2)와 C4(라이브 3 / snapshot 2)의 3-tier history 화해가 당시 우연히 맞을 수는 있어도 테스트로 고정된 적이 없었기 때문이다. 이 로직이 틀렸다면 `nats-client-wrapper.ts` production 수정이 필요해 #94 메시지 경계 변경과 별도 리뷰가 필요했다. 먼저 characterization을 끝내 PR 2가 client reconciliation 변경까지 껴안지 않게 했다.
 
-**PR 2 — #94 본체 (대, 원자적)**
-provisional preview + lane/independent two-phase claim owner + success-only scaffold-writer invalidation + ordered/unresolved lane 모델 + tentative ordering reservation/notice token + dispatcher lifecycle cleanup + authoritative independent claim-or-fresh 처리 + inbound 배선 + M1~M13(세분 케이스 포함) / I1~I26 + e2e 게이트. **더 쪼개면 깨진다** — inbound가 tool/item, partial/final, 경계, queued block, actual delivery, lifecycle을 함께 넘기지 않으면 adapter는 preview reserve/commit/rollback, tentative lane-ID cleanup, writer invalidation, late barrier, cancellation cleanup과 generation-order emission을 운용할 수 없다. adapter에 retained lane/reservation이 없으면 cancel(A) → B의 ghost/영구 barrier 방지도 성립하지 않는다. §6.5 fail-safe도 못 뗀다. 현재 코드에 이미 `absorbedMissedBoundaries` 방어가 있어서, 빼고 먼저 내보내면 #23이 막아둔 것을 되돌리는 셈이다.
+**PR 2 — #94 본체 (대, 원자적; #109)**
+provisional preview + lane/independent two-phase claim owner + success-only scaffold-writer invalidation + ordered/unresolved lane 모델 + tentative ordering reservation/notice token + dispatcher lifecycle cleanup + authoritative independent claim-or-fresh 처리 + inbound 배선 + M1~M13(세분 케이스 포함) / I1~I26 + e2e 게이트가 함께 랜딩했다. **더 쪼개면 깨진다** — inbound가 tool/item, partial/final, 경계, queued block, actual delivery, lifecycle을 함께 넘기지 않으면 adapter는 preview reserve/commit/rollback, tentative lane-ID cleanup, writer invalidation, late barrier, cancellation cleanup과 generation-order emission을 운용할 수 없다. adapter에 retained lane/reservation이 없으면 cancel(A) → B의 ghost/영구 barrier 방지도 성립하지 않는다. §6.5 fail-safe도 못 뗀다. `absorbedMissedBoundaries` 방어를 빼고 중간 상태를 내보내면 #23이 막아둔 회귀도 다시 연다.
 
-**기각한 분할:** "id는 하나로 둔 채 `answerPrefix`만 배열로 바꾸는 무동작 리팩터를 먼저" 안. 회전 없는 lane 구조는 2단계에서 다시 쓰이므로 버려질 코드를 리뷰시키게 된다. 대신 **PR 2 안에서 커밋을 ① adapter lane 모델 ② inbound 배선 ③ 테스트 ④ e2e 순으로 나눈다.** 분할 PR의 리뷰 이점 대부분을 얻으면서 버려지는 중간 상태를 만들지 않는다.
+**기각한 분할:** "id는 하나로 둔 채 `answerPrefix`만 배열로 바꾸는 무동작 리팩터를 먼저" 안. 회전 없는 lane 구조는 다음 단계에서 다시 쓰이지 않아 버려질 코드를 리뷰시키게 된다. PR 2 내부의 논리적 커밋 분할로 리뷰 단위를 제공하면서 버려지는 중간 production 상태는 만들지 않았다.
 
-### 14.2 구현 순서 (PR 2)
+### 14.2 랜딩한 커밋 순서
 
-아래 순서로 바로 시작한다. 재조사는 필요 없다.
+`160934c → 34da088 → 14c4cf1 → 9ce4894 → 1cbde13 → f20527b → cf69076`
 
-1. `packages/plugin/src/channel.test.ts`의 기존 “두 assistant 메시지가 한 ID에 합쳐진다” 테스트를 두 ID/두 버블 기대값으로 바꾸고, final이 앞 메시지를 인용하는 실패 테스트를 먼저 추가한다. 이어 tool scaffold → empty boundary → answer, late reservation, rewrite/cancel, cancel(A) → B, actual send `true`/`false`/throw, 세 notice flag, (a) callback 0개 및 (b) coalesced callback 2개 + 동일 final `[error,A1,A2,B]`의 at-least-once red test를 추가한다. M13/I21~I26의 independent claim 순서/late tool suppression과 lane first-frame partial/final × false/throw × later lane/independent success matrix도 먼저 red로 만든다.
-2. `packages/plugin/src/message-adapter.ts`의 턴 고정 `id`/`answerPrefix`를 owner가 lane generation 또는 independent delivery sequence인 provisional claim state, tentative lane ID, ordered lane 목록, unresolved predecessor, persistent late-indexless barrier, tentative reservation/notice token, actual independent disposition, final phase, lane별 settle latch로 교체한다. 모든 P-bound lane/independent send의 reserve → send → success-only commit / false·throw rollback을 queue 안에서 원자적으로 처리한다.
-3. `pushAnswerText`가 문자열만 받지 말고 `text`/`delta`/`replace`를 보존하도록 바꾼다.
-4. `packages/plugin/src/inbound.ts`에서 tool/item, partial/final, boundary, queued-block/actual delivery와 dispatcher `onSkip`/`onBeforeDeliverCancelled`/`onDeliverySettled`, delivery `onError`를 같은 직렬 queue에 넣는다. lane progress/final 실제 결과를 claim helper에 반환하고, `onBlockReplyQueued`의 optional index는 reservation에만 쓰며 `deliver`의 `info`에서는 `kind`만 읽는다. custom `beforeDeliver`는 추가하지 않는다.
-5. plugin 테스트가 green이 된 뒤 client의 다중 ID reducer 회귀 테스트와 전체 게이트를 실행한다.
+1. `160934c` — `test(e2e): gate the #94 message boundary in CI`: 실제 gateway/tool loop에서 두 assistant message가 서로 다른 ID로 정착하는 live gate와 CI 배선을 추가했다.
+2. `34da088` — `fix(plugin): give each assistant message its own draft lane (#94)`: provisional preview, ordered lane, two-phase claim/rollback의 본체를 추가했다.
+3. `14c4cf1` — `fix(plugin): stop the lane settle latch from swallowing later finals`: lane settle latch와 independent later-final 보존을 분리했다.
+4. `9ce4894` — `fix(plugin): let an unambiguous indexed lifecycle open the lane barrier`: 명확한 indexed lifecycle cleanup이 predecessor barrier를 해소하게 했다.
+5. `1cbde13` — `fix(plugin): route every #94 seam through the draft controller's queue`: boundary/partial/final/block/lifecycle/tool-item seam과 inbound 배선을 controller queue로 통합했다.
+6. `f20527b` — `fix(plugin): keep the thrown-turn apology without overwriting a lane`: thrown-turn apology를 independent delivery로 보존했다.
+7. `cf69076` — `fix(plugin): constrain the final routing policy and scope lifecycle to blocks`: final routing policy, block-scoped lifecycle, leading-error guard와 마지막 리뷰 반례를 고정했다.
 
-구현 중 다시 열면 안 되는 결정:
+### 14.3 deferred 범위
+
+- [#111](https://github.com/mir-stream/openclaw-webchannel/issues/111): authorized block dedupe, 같은 assistant message의 block grouping, queued/lifecycle/actual delivery의 exact lane ownership, leading-terminal-error 후속 final exact-once를 담당한다. §12.2의 **leading-error 없는 multi-final 잔여**도 stable final identity 없이는 안전하게 고칠 수 없으므로 같은 이슈로 넘겼다.
+- [#104](https://github.com/mir-stream/openclaw-webchannel/issues/104): 다른 기기에서 시작한 턴의 history/live 영구 중복 (§12.1(1)).
+- [#105](https://github.com/mir-stream/openclaw-webchannel/issues/105): reasoning activity가 죽은 sibling draft의 stale recovery까지 turn-wide로 disarm하는 client 결함 (§12.1(2)).
+
+### 14.4 구현 중 다시 열면 안 되는 결정
 
 - boundary는 lane 순서를, `onBlockReplyQueued`는 tentative ordering reservation만 제공한다. callback text/media는 body가 아니고 actual block owner도 고르지 않는다. first tool scaffold는 lane 소유가 아니라 provisional preview다. final 본문을 `includes`/suffix로 비교하지 않는다.
 - **actual `deliver`에는 `assistantMessageIndex`가 없다**(§5.2). lifecycle observer의 optional index는 cleanup을 돕지만 이미 승인된 wire ID를 고르지 못한다. private cast나 custom `beforeDeliver`로 우회하지 않는다.
@@ -763,11 +812,5 @@ provisional preview + lane/independent two-phase claim owner + success-only scaf
 - 위험한 클라이언트 표면은 reducer가 아니라 history 3-tier 화해 로직이다(§10 C3/C4).
 - 앞 lane send 실패가 queue를 reject 상태로 고정하거나 뒤 lane/추가 final을 막아서는 안 된다.
 - tool/item progress scaffold는 완료된 assistant 메시지가 아니며, 빈 first lane의 durable ID도 아니다.
-
-현재 코드에서 바로 볼 지점:
-
-- `message-adapter.ts`: `const id = nextMessageId()`, `answerText`, `answerPrefix`, `handleAssistantMessageBoundary`, turn-wide `finalizeResult`
-- `inbound.ts`: `onPartialReply`가 `p.text`만 넘기는 부분, `onAssistantMessageStart`, `draft.finalize(text)` final 분기
-- `channel.test.ts`: `preserves earlier message text across an assistant-message boundary...` 테스트가 현재 잘못된 one-id 계약을 고정함
 
 GitHub #94의 제목/본문도 이 문서와 같은 확정안으로 유지한다. exact-once identity 의존성은 #111에 링크한다.

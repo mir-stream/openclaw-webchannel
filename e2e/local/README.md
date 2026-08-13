@@ -45,6 +45,7 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 | `all-real.mjs` | Playwright runner for `run-all-real.sh` and `run-derived-trust.sh`: serves the browser bundle, launches headless Chromium running the production `WebChannelNatsClient`, NKEY-authenticates to the JWT-auth nats-server, drives the JWT + PoP register hop, and asserts the reply echoes the sent text. **This is the "from a real browser" proof.** |
 | `enrolled-transport-roundtrip.ts` | Node driver for `run-enrolled-transport.sh`: an NKEY-authenticated peer that round-trips one message against the device-flow-enrolled plugin. |
 | `turn-outcome-roundtrip.ts` | Node driver for `run-turn-outcome.sh`: runs a provider-rejected turn and an ordinary turn against the same enrolled plugin and asserts the `turn_settled{outcome}` of each. |
+| `multi-message-roundtrip.ts` | Node driver for `run-multi-message.sh`: drives one turn that produces TWO real assistant messages and asserts they settle at two distinct wire ids. Logs every inbound frame before asserting. |
 | `two-account-isolation-roundtrip.ts` | Node driver for `run-two-account-isolation.sh`: drives positive round-trips plus an A-authorized token against B's live register subject. |
 | `ci-smoke.html` | The unified demo/chat page served by the SaaS issuer. |
 
@@ -56,7 +57,7 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 
 ## The harnesses
 
-All five boot a real gateway + `nats-server` + echo provider under an isolated
+All six boot a real gateway + `nats-server` + echo provider under an isolated
 `OPENCLAW_HOME`, run one encrypted round-trip through the register hop, and self-clean on exit.
 
 ```bash
@@ -66,7 +67,18 @@ All five boot a real gateway + `nats-server` + echo provider under an isolated
 ./e2e/local/run-two-account-isolation.sh # one gateway/two accounts, live cross-account rejection
 ./e2e/local/run-derived-trust.sh         # `channels add` with ZERO hand-written JWT trust facts
 ./e2e/local/run-turn-outcome.sh          # provider-rejected turn settles `error`, not `ok` (#87)
+./e2e/local/run-multi-message.sh         # multi-assistant-message turn settles TWO distinct ids (#94)
 ```
+
+> **They boot against `packages/plugin/dist/`, not your edited `src/`.** Measured on the pinned
+> core (2026.6.10): the gateway logs
+> `channel "webchannel" registered … source=…/packages/plugin/dist/index-nats.js`, so the
+> `openclaw.extensions → ./index-nats.ts` swap each runner performs does **not** make it load TS
+> source. CI is fine (it builds the plugin at step 5c before any harness runs), but locally a
+> stale bundle silently tests code you did not write — with the #94 fix reverted in `src/` and a
+> stale fixed `dist/` on disk, `run-multi-message.sh` passed. `run-multi-message.sh` therefore
+> builds the plugin itself before booting; run `npm run build --workspace=packages/plugin` before
+> the other five.
 
 Each prints `[REPLY] echo: …<your message>` (and a `[PROOF] …` line) on success, and exits
 non-zero if the register hop fails to admit the peer.
@@ -122,6 +134,55 @@ a rejected turn (must settle `error` **and** still deliver core's terminal messa
 fix must not silence the user-visible explanation) and an ordinary turn (must still settle
 `ok`, so an unconditional "always error" fix cannot pass). Verified load-bearing by
 revert-check: with the fix disabled the harness exits 6.
+
+### `run-multi-message.sh` — two assistant messages, two bubbles (#94 gate)
+
+In `streaming.mode:"partial"` the channel used to mint **one** draft id per **turn** and
+accumulate every assistant message into it. The turn's `final` then replaced that merged bubble
+with the **last** message's text, so earlier assistant text the user had already watched stream
+was erased from the live view (the transcript kept it; the live path lost it). The fix gives each
+assistant message its own lane — its own wire id, its own body, its own terminal frame.
+
+The second assistant message is **real**, not staged: the only way a provider drives one is a tool
+call, so the echo server (`ECHO_MULTI_MSG_MARKER`) answers phase 1 with assistant text A **plus** a
+`tool_calls` entry and `finish_reason:"tool_calls"`, core executes the tool and comes back for
+phase 2, which returns assistant text B. `ECHO_MULTI_MSG_TOOL` defaults to `agents_list` — captured
+from the `body.tools` core actually advertises in this minimal config (27 tools), and picked because
+it takes no arguments, always succeeds, and touches no filesystem or network state.
+
+Same topology as `run-turn-outcome.sh` plus `streaming.mode:"partial"` on the account (the only
+mode that creates a draft lane — in `block`/`off` the plugin takes the plain append path and the
+harness would prove nothing; the runner re-asserts and verifies the mode after `channels add`).
+Asserts: **at least two `agent_message` frames with distinct ids**, message A present and not
+overwritten by B, model order preserved, and `turn_settled{outcome:"ok"}` still delivered (so an
+unconditional-rotation fix cannot pass). Verified load-bearing by revert-check: with the fix
+reverted the harness exits 6.
+
+The driver logs **every** inbound frame with its type, id and text before asserting. That record
+is a deliverable in itself — it is the first direct evidence of how core drives a real
+multi-message turn, which is the question plan §12.2(5) leaves open and no unit test can answer.
+Measured shape on the pinned core (2026.6.10):
+
+```
+typing
+progress      id=A  "ISSUE94_MESSAGE_A che"                     ← A mid-stream
+agent_message id=A  "ISSUE94_MESSAGE_A checking the roster now." ← A settles, lane rotates
+progress      id=B  "ZZZ94_SECOND_ANSWER here is what came back."
+agent_message id=B  "ZZZ94_SECOND_ANSWER here is what came back."
+turn_settled  outcome=ok
+```
+
+Two things in that record are worth carrying forward. **A settles before B's first `progress`**,
+so no partial of B is ever applied to A's lane. And the rotation came from
+**`onAssistantMessageStart`**, not from the partial-divergence path plan §5.5 designates as the
+primary trigger: `rotate()` has exactly three call sites and the two on the partial/block paths
+both log at `info` before rotating, yet the gateway log for a passing run contains neither
+diagnostic. So on the pinned core the boundary event *does* fire for the second assistant message
+of a tool-call turn — §5.5's "exactly once per agent run" does not hold across a tool boundary,
+and the trigger the fix keeps "for contract fidelity" is the one actually carrying this shape.
+(The gate is still load-bearing for #94 as a whole: the reverted plugin fails it.) A turn whose
+second message arrives with **no** boundary event — the shape §5.5 describes — is not reachable
+through this provider and remains covered only by the unit fixtures.
 
 ### `run-derived-trust.sh` — zero hand-written trust facts
 

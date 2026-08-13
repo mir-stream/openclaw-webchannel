@@ -1,7 +1,6 @@
 import {
   defineChannelMessageAdapter,
   createMessageReceiptFromOutboundResults,
-  createDraftStreamLoop,
   resolveChannelPreviewStreamMode,
   resolveChannelProgressDraftLabel,
   resolveChannelProgressDraftMaxLines,
@@ -12,7 +11,6 @@ import type {
   MessageReceipt,
   StreamingMode,
   ChannelProgressDraftLineInput,
-  DraftStreamLoop,
 } from "openclaw/plugin-sdk/channel-outbound";
 import {
   stripReasoningTagsFromText,
@@ -149,288 +147,1582 @@ export function resolveStreamingMode(
   );
 }
 
+type LaneResolution = "open" | "unresolved" | "materialized" | "empty";
+type LaneFrameType = "progress" | "final";
+type DeliveryFailureKind = "false" | "throw";
+
+type AssistantDraftLane = {
+  generation: number;
+  /** Assigned only after a successful first wire frame for this lane. */
+  id?: string;
+  /** A provisional id is tentative for the duration of one send transaction. */
+  tentativeProvisionalId?: string;
+  answerText: string;
+  /**
+   * The last RAW cumulative partial accepted into this lane, before reasoning /
+   * inline-directive stripping. Tag stripping makes the CLEANED text
+   * non-monotonic (an unclosed `<thinking>` shortens it), so cleaned text alone
+   * cannot tell tag noise from a new assistant message — the raw stream can:
+   * a provider appending to the same message always extends it, while a new
+   * message restarts it. Used only by the missed-boundary defense.
+   */
+  lastRawAnswerText: string;
+  answerRevision: number;
+  tentativeBarrierReservationIds: string[];
+  closed: boolean;
+  resolution: LaneResolution;
+  /** Armed only by an attached indexless reservation; terminal drain disarms it. */
+  acceptsLateIndexlessReservations: boolean;
+  started: boolean;
+  settled: boolean;
+  failedDeliveryCount: number;
+  lastFailedDelivery?: {
+    revision: number;
+    frameType: LaneFrameType;
+    error: DeliveryFailureKind;
+  };
+  lastProgressAttemptRevision: number;
+  settleResult?: Promise<boolean>;
+  settleOutcome?: boolean;
+};
+
+type ProvisionalClaimOwner =
+  | { kind: "lane"; generation: number }
+  | { kind: "independent"; deliverySequence: number };
+
+type ProvisionalPreview = {
+  id: string;
+  text: string;
+  revision: number;
+  started: boolean;
+  scaffoldWriter: "active" | "invalidated";
+  claim:
+    | { state: "unclaimed" }
+    | { state: "reserved"; owner: ProvisionalClaimOwner }
+    | { state: "claimed"; owner: ProvisionalClaimOwner };
+  settleResult?: Promise<boolean>;
+  settleOutcome?: boolean;
+};
+
+type TentativeBlockReservation = {
+  token: string;
+  barrierGeneration?: number;
+  assistantMessageIndex?: number;
+  state: "pending" | "retired";
+};
+
+type TentativeNoticeToken = {
+  assistantMessageIndex?: number;
+  state: "pending" | "retired";
+};
+
+type AuthorizedBlockDisposition = {
+  settled: boolean;
+  /**
+   * What the delivered payload WAS. Recorded at the delivery seam, which is the
+   * only place the payload — and therefore its notice flags — is available.
+   */
+  kind: "block" | "notice";
+};
+
+type FinalReconciliationState = {
+  ordinaryAnswerSettled: boolean;
+  leadingTerminalErrorSeen: boolean;
+};
+
+type PendingProgressFrame =
+  | { kind: "preview"; revision: number; text: string }
+  | { kind: "lane"; generation: number; revision: number; text: string };
+
+type ProgressDraftState = {
+  provisionalPreview: ProvisionalPreview;
+  lanes: AssistantDraftLane[];
+  blockReservations: TentativeBlockReservation[];
+  noticeTokens: TentativeNoticeToken[];
+  blockDispositions: AuthorizedBlockDisposition[];
+  finalReconciliation: FinalReconciliationState;
+  lines: string[];
+  pendingProgress?: PendingProgressFrame;
+  progressTimer?: ReturnType<typeof setTimeout>;
+  /** One-shot release of a text-less predecessor that is holding a live lane. */
+  emptyPredecessorTimer?: ReturnType<typeof setTimeout>;
+  lastProgressSentAt: number;
+  firstBoundarySeen: boolean;
+  lateReservationEpochOpen: boolean;
+  nextTokenSequence: number;
+  nextDeliverySequence: number;
+  durableDeliverySucceeded: boolean;
+  started: boolean;
+  stopped: boolean;
+};
+
+type SerialQueueTask = {
+  label: string;
+  run: () => unknown;
+  fallback: unknown;
+  resolve: (value: unknown) => void;
+};
+
+type SerialQueueState = {
+  running: boolean;
+  tasks: SerialQueueTask[];
+};
+
+type NoticeFlags = {
+  isStatusNotice?: boolean;
+  isFallbackNotice?: boolean;
+  isCompactionNotice?: boolean;
+};
+
+type ProvisionalReservation = {
+  owner: ProvisionalClaimOwner;
+  id: string;
+  usesPreview: boolean;
+};
+
+/** One structured partial update from the public reply callback. */
+export type PartialAnswerUpdate = { text?: string; delta?: string; replace?: true };
+
 /**
- * Per-turn progress-draft controller for one originating session.
+ * Per-turn draft state for partial/progress streaming.
  *
- * Composes a rolling "Working… / 🔎 … / 🛠️ …" text block from agent tool/item
- * progress events and pushes it to the widget via the transport's `progress`
- * frame, throttled by `createDraftStreamLoop`
- * (dist/plugin-sdk/draft-stream-controls-C4f0z7_6.d.ts: `update(text)`/`flush()`
- * backed by `sendOrEditStreamMessage(text)`). All frames reuse a single draft
- * `id` so the widget updates ONE bubble; `finalize(text)` reuses that id.
+ * The provisional preview is turn-scoped and ownerless until a successful
+ * durable delivery claims it. Assistant text is held in ordered, rotatable
+ * lanes. Actual block and uncorrelated final payloads never acquire a lane;
+ * they are delivered independently with their own sequence and wire id.
  */
 export type ProgressDraftController = {
-  /** The stable draft/final id shared by every frame of this turn. */
-  readonly id: string;
   /**
-   * True once at least one `progress` frame has been emitted to the widget, so
-   * a working bubble is currently shown. The error-recovery path uses this to
-   * decide whether the widget needs a terminal frame to settle the bubble.
+   * Legacy cleanup signal for inbound: true means some wire frame succeeded
+   * while the ordinary-answer terminal slot is still open. Inbound may use it
+   * only to decide whether legacy tool-only preview cleanup may be needed. An
+   * ownerless provisional preview can make it true while `snapshotText()` is
+   * empty, and false after an ordinary answer settles does not mean that no
+   * wire activity or durable delivery occurred. Silent completion must call
+   * `drain()`; it must not infer an empty lane needs a synthetic stop marker.
    */
   readonly started: boolean;
-  /** Record a structured progress event and refresh the draft. */
-  pushEvent: (input: ChannelProgressDraftLineInput) => void;
+  /** Queue one tool/item event for the provisional preview writer. */
+  pushEvent(input: ChannelProgressDraftLineInput): void;
+  /** Queue one cumulative/delta partial update for the current lane. */
+  pushAnswerText(update: PartialAnswerUpdate): void;
+  /** Close the current assistant lane and open the next ordered lane. */
+  handleAssistantMessageBoundary(): void;
+  /** Record only tentative ordering/notice state from a queued callback. */
+  noteBlockReplyQueued(input: {
+    assistantMessageIndex?: number;
+    isStatusNotice?: boolean;
+    isFallbackNotice?: boolean;
+    isCompactionNotice?: boolean;
+  }): void;
+  /** Deliver an authorized block independently from every assistant lane. */
+  deliverAuthorizedBlock(input: {
+    text: string;
+    isStatusNotice?: boolean;
+    isFallbackNotice?: boolean;
+    isCompactionNotice?: boolean;
+  }): Promise<boolean>;
+  /** Retire unambiguous callback lifecycle state without selecting an owner. */
+  noteDeliveryLifecycle(
+    kind: "skip" | "cancel" | "settled" | "error",
+    input: {
+      /** Dispatcher callbacks are a union; delivery.onError exposes string. */
+      deliveryKind: string;
+      assistantMessageIndex?: number;
+    } & NoticeFlags,
+  ): void;
+  /** Use the current lane's one ordinary-answer terminal slot. */
+  finalize(text: string): Promise<boolean>;
+  /** Deliver a terminal notice/error/uncorrelated final independently. */
+  deliverIndependentFinal(input: {
+    text: string;
+    isStatusNotice?: boolean;
+    isFallbackNotice?: boolean;
+    isCompactionNotice?: boolean;
+  }): Promise<boolean>;
+  /** Record that a terminal error preceded any ordinary answer final. */
+  noteLeadingTerminalError(): void;
+  /** Retire tentative state and settle real text (or a lone tool preview). */
+  drain(): Promise<void>;
   /**
-   * Replace the cumulative answer text and refresh the draft (partial mode).
-   * Core's `onPartialReply` delivers the FULL assistant text so far each call
-   * (`text` is cumulative: `${assistantTextByItem.get(itemId) ?? ""}${delta}`,
-   * verified: dist/run-attempt-DRhLt3eF.js:4088-4097), so we REPLACE rather than
-   * append. Once answer text is present the draft body becomes that answer (the
-   * "Label…"/tool scaffold is dropped — the answer replaces the working view).
-   * Empty/undefined text is a no-op so a trailing empty frame can't clobber a
-   * non-empty draft.
+   * Side-effect-free snapshot of the current assistant lane only. This can be
+   * empty while `started` is true because a provisional tool preview is not
+   * lane text; silent completion must call `drain()` rather than
+   * `finalize(snapshotText() || marker)`.
    */
-  pushAnswerText: (text: string) => void;
-  /**
-   * Mark an assistant-message boundary (partial mode). Core's cumulative
-   * `onPartialReply.text` is PER-itemId: on a reply with multiple `final_answer`
-   * assistant messages, the next item's partials restart from `""`. Without
-   * this, our REPLACE semantics would make the already-streamed text of the
-   * prior message visibly vanish until the final lands. Core fires
-   * `onAssistantMessageStart` once per assistant message start — including
-   * before the FIRST message (verified: dist/run-attempt-DRhLt3eF.js:4083-4086);
-   * so this rolls the current `answerText` into an accumulated prefix and resets
-   * it. The first-message call is a no-op (answerText empty).
-   */
-  handleAssistantMessageBoundary: () => void;
-  /** Push the freshest pending draft text to the socket now. */
-  flush: () => Promise<void>;
-  /**
-   * Read-only snapshot of the draft text the flush loop would currently send —
-   * the streamed answer body (partial mode) or the "Working…" scaffold + tool
-   * lines. Returns "" when nothing has been pushed yet (there is no scaffold
-   * worth preserving). Side-effect-free: used by the aborted-turn defensive
-   * finalize (inbound.ts) to settle the bubble with the streamed content alone
-   * (no marker).
-   */
-  snapshotText: () => string;
-  /**
-   * Finalize the draft into the final answer (reuses the draft id). Idempotent:
-   * the first call finalizes and stops the loop; later calls return that first
-   * attempt's cached boolean so callers never retry or observe `undefined`.
-   */
-  finalize: (text: string) => Promise<boolean>;
-  /**
-   * Stop the draft loop without sending a final frame. Used on cleanup paths so
-   * a late background throttled flush can't race error handling. Idempotent.
-   */
-  stop: () => void;
+  snapshotText(): string;
+  /** Flush the newest throttled progress frame through the serial queue. */
+  flush(): Promise<void>;
+  /** Stop timers and discard pending progress without sending a terminal frame. */
+  stop(): void;
 };
 
 export function createProgressDraftController(params: {
   transport: WebChannelPeerChannel;
   sessionKey: string;
   turnId?: string;
-  /** Channel config section (for label/maxLines/line formatting). */
   channelConfig: unknown;
   throttleMs?: number;
+  logger?: { warn?: (message: string) => void; info?: (message: string) => void };
 }): ProgressDraftController {
-  const { transport, sessionKey, channelConfig } = params;
-  const id = nextMessageId();
-
+  const { transport, sessionKey, channelConfig, logger } = params;
+  const throttleMs = Math.max(0, params.throttleMs ?? 600);
   const label =
     resolveChannelProgressDraftLabel({ entry: channelConfig as never, seed: sessionKey }) ??
     "Working";
   const maxLines = resolveChannelProgressDraftMaxLines(channelConfig as never, 6);
 
-  // Rolling, de-duplicated tool/item lines (most-recent-last, capped).
-  const lines: string[] = [];
-  // Cumulative answer text streamed via onPartialReply (partial mode only).
-  // Non-empty once the agent starts emitting final-answer text; it then owns
-  // the whole draft body (see composeText). `answerPrefix` accumulates the text
-  // of ALREADY-COMPLETED assistant messages (per-itemId partials restart from
-  // ""), so a multi-message reply doesn't visibly drop earlier text — see
-  // handleAssistantMessageBoundary.
-  let answerText = "";
-  let answerPrefix = "";
-  // Count of message boundaries we ALREADY rolled up ourselves because we
-  // detected the seam from the partial stream before core's
-  // `onAssistantMessageStart` arrived (or when it never arrives). A belated
-  // start event for such an already-rolled seam must be a no-op — see
-  // handleAssistantMessageBoundary. Guards against a double-roll.
-  let absorbedMissedBoundaries = 0;
-  let stopped = false;
-  let started = false;
-  let finalizeResult: Promise<boolean> | undefined;
+  const newLane = (generation: number): AssistantDraftLane => ({
+    generation,
+    answerText: "",
+    lastRawAnswerText: "",
+    answerRevision: 0,
+    tentativeBarrierReservationIds: [],
+    closed: false,
+    resolution: "open",
+    acceptsLateIndexlessReservations: false,
+    started: false,
+    settled: false,
+    failedDeliveryCount: 0,
+    lastProgressAttemptRevision: 0,
+  });
 
-  // The full streamed answer body so far = completed messages + current one.
-  const answerBody = (): string => answerPrefix + answerText;
+  const state: ProgressDraftState = {
+    provisionalPreview: {
+      id: nextMessageId(),
+      text: "",
+      revision: 0,
+      started: false,
+      scaffoldWriter: "active",
+      claim: { state: "unclaimed" },
+    },
+    lanes: [newLane(0)],
+    blockReservations: [],
+    noticeTokens: [],
+    blockDispositions: [],
+    finalReconciliation: {
+      ordinaryAnswerSettled: false,
+      leadingTerminalErrorSeen: false,
+    },
+    lines: [],
+    lastProgressSentAt: 0,
+    firstBoundarySeen: false,
+    lateReservationEpochOpen: true,
+    nextTokenSequence: 0,
+    nextDeliverySequence: 0,
+    durableDeliverySucceeded: false,
+    started: false,
+    stopped: false,
+  };
+  const queue: SerialQueueState = { running: false, tasks: [] };
+  let ordinaryFinalSendInProgress = false;
 
-  // Roll the just-completed message's text into the accumulated prefix and
-  // reset the per-item cumulative buffer for the next message. No-op when
-  // there is nothing to roll (answerText empty), so a redundant/leading
-  // boundary never appends an empty "\n\n" segment.
-  const rollCurrentIntoPrefix = (): void => {
-    if (answerText.length === 0) return;
-    answerPrefix += answerText + "\n\n";
-    answerText = "";
+  const warn = (message: string): void => {
+    try {
+      (logger?.warn ?? console.warn)(`[webchannel] ${message}`);
+    } catch {
+      // Diagnostics never own the delivery queue's lifecycle.
+    }
   };
 
-  const composeText = (): string => {
-    // Once answer text is streaming, it REPLACES the working scaffold (the
-    // "Label…" header + tool lines) — matching draft.update-style text
-    // replacement. Before any answer text arrives, show the working scaffold.
-    const body = answerBody();
-    if (body.length > 0) return body;
-    const shown = lines.slice(-maxLines);
-    return [`${label}…`, ...shown].join("\n");
+  const pumpQueue = (): void => {
+    if (queue.running) return;
+    queue.running = true;
+    try {
+      while (queue.tasks.length > 0) {
+        const task = queue.tasks.shift()!;
+        try {
+          task.resolve(task.run());
+        } catch (error) {
+          warn(`${task.label} failed without latching the draft queue: ${String(error)}`);
+          task.resolve(task.fallback);
+        }
+      }
+    } finally {
+      queue.running = false;
+    }
   };
 
-  // True when the draft has any content worth flushing before finalize — a
-  // tool/item line OR pending streamed answer text (a partial-mode no-tool turn
-  // has no lines but must still flush its answer text before finalizing).
-  const hasPendingContent = (): boolean => lines.length > 0 || answerBody().length > 0;
+  const enqueue = <T>(label: string, run: () => T, fallback: T): Promise<T> =>
+    new Promise<T>((resolve) => {
+      queue.tasks.push({
+        label,
+        run,
+        fallback,
+        resolve: resolve as (value: unknown) => void,
+      });
+      pumpQueue();
+    });
 
-  const sendOrEditStreamMessage = async (text: string): Promise<boolean> => {
-    if (stopped) return false;
-    const sent = transport.sendProgress(sessionKey, id, text, params.turnId);
-    // Track that a working bubble is now shown to the widget, so the
-    // error-recovery path knows it must emit a terminal frame to settle it.
-    if (sent) started = true;
+  const currentLane = (): AssistantDraftLane => state.lanes[state.lanes.length - 1]!;
+
+  const isNotice = (input: NoticeFlags): boolean =>
+    input.isStatusNotice === true ||
+    input.isFallbackNotice === true ||
+    input.isCompactionNotice === true;
+
+  const nextBlockToken = (): string => `block-${++state.nextTokenSequence}`;
+
+  const clearProgressTimer = (): void => {
+    if (state.progressTimer === undefined) return;
+    clearTimeout(state.progressTimer);
+    state.progressTimer = undefined;
+  };
+
+  const discardPendingProgress = (predicate: (frame: PendingProgressFrame) => boolean): void => {
+    if (!state.pendingProgress || !predicate(state.pendingProgress)) return;
+    state.pendingProgress = undefined;
+    clearProgressTimer();
+  };
+
+  const invalidateScaffoldWriter = (): void => {
+    state.provisionalPreview.scaffoldWriter = "invalidated";
+    discardPendingProgress((frame) => frame.kind === "preview");
+  };
+
+  const reserveProvisional = (
+    owner: ProvisionalClaimOwner,
+    lane?: AssistantDraftLane,
+  ): ProvisionalReservation => {
+    const preview = state.provisionalPreview;
+    if (
+      preview.started &&
+      !state.durableDeliverySucceeded &&
+      preview.claim.state === "unclaimed"
+    ) {
+      preview.claim = { state: "reserved", owner };
+      if (lane) lane.tentativeProvisionalId = preview.id;
+      return { owner, id: preview.id, usesPreview: true };
+    }
+    return { owner, id: nextMessageId(), usesPreview: false };
+  };
+
+  const commitReservation = (
+    reservation: ProvisionalReservation,
+    lane?: AssistantDraftLane,
+  ): void => {
+    if (reservation.usesPreview) {
+      state.provisionalPreview.claim = {
+        state: "claimed",
+        owner: reservation.owner,
+      };
+      if (lane) lane.tentativeProvisionalId = undefined;
+    }
+    // Every successful durable delivery ends the scaffold-writing phase. A
+    // fresh-id success must also invalidate it, or a later tool event could
+    // create a second scaffold after durable output already exists.
+    invalidateScaffoldWriter();
+    state.durableDeliverySucceeded = true;
+    state.started = true;
+  };
+
+  const rollbackReservation = (
+    reservation: ProvisionalReservation,
+    lane?: AssistantDraftLane,
+  ): void => {
+    if (!reservation.usesPreview) return;
+    state.provisionalPreview.claim = { state: "unclaimed" };
+    if (lane) lane.tentativeProvisionalId = undefined;
+  };
+
+  const recordLaneFailure = (
+    lane: AssistantDraftLane,
+    frameType: LaneFrameType,
+    error: DeliveryFailureKind,
+  ): void => {
+    lane.failedDeliveryCount += 1;
+    lane.lastFailedDelivery = {
+      revision: lane.answerRevision,
+      frameType,
+      error,
+    };
+    warn(
+      `draft lane generation ${lane.generation} ${frameType} delivery returned ${error}; ` +
+        `revision ${lane.answerRevision} remains memory-only`,
+    );
+  };
+
+  const sendLaneFrame = (
+    lane: AssistantDraftLane,
+    frameType: LaneFrameType,
+    text: string,
+    /**
+     * A SPECULATIVE attempt is one this lane did not ask for — the ordering
+     * flush claiming a slot early. Its failure says nothing about the lane: the
+     * lane had no wire presence to protect and has not spent its turn. So it
+     * records no failure, which keeps the lane's drain-time guarantee intact.
+     * A speculative attempt that SUCCEEDS is an ordinary materialization and is
+     * treated exactly like one.
+     */
+    options?: { speculative?: boolean },
+  ): boolean => {
+    const owner: ProvisionalClaimOwner = { kind: "lane", generation: lane.generation };
+    const reservation = lane.id
+      ? { owner, id: lane.id, usesPreview: false }
+      : reserveProvisional(owner, lane);
+    let sent = false;
+    let failure: DeliveryFailureKind | undefined;
+    try {
+      sent =
+        frameType === "progress"
+          ? transport.sendProgress(sessionKey, reservation.id, text, params.turnId) === true
+          : transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId) === true;
+      if (!sent) failure = "false";
+    } catch {
+      failure = "throw";
+    }
+    if (sent) {
+      lane.id ??= reservation.id;
+      lane.started = true;
+      lane.resolution = "materialized";
+      commitReservation(reservation, lane);
+      return true;
+    }
+    rollbackReservation(reservation, lane);
+    // A speculative attempt must never reduce what the lane is guaranteed at
+    // drain: stamping `lastFailedDelivery` here would make
+    // `laneTerminalSuppressed` true and delete text that was only ever HELD, not
+    // shown. That is the loss this mode exists to prevent.
+    if (options?.speculative !== true) {
+      recordLaneFailure(lane, frameType, failure ?? "false");
+    }
+    return false;
+  };
+
+  const sendIndependent = (text: string): boolean => {
+    if (!text) {
+      warn("independent delivery skipped empty text without a transport attempt");
+      return false;
+    }
+    const sequence = ++state.nextDeliverySequence;
+    const owner: ProvisionalClaimOwner = { kind: "independent", deliverySequence: sequence };
+    const reservation = reserveProvisional(owner);
+    let sent = false;
+    let failure: DeliveryFailureKind | undefined;
+    try {
+      sent = transport.finalizeDraft(sessionKey, reservation.id, text, params.turnId) === true;
+      if (!sent) failure = "false";
+    } catch {
+      failure = "throw";
+    }
+    if (sent) {
+      commitReservation(reservation);
+      return true;
+    }
+    rollbackReservation(reservation);
+    warn(
+      `independent delivery sequence ${sequence} returned ${failure ?? "false"}; ` +
+        "its provisional claim was rolled back",
+    );
+    return false;
+  };
+
+  /**
+   * Advance a lane's RAW partial baseline — forward only, never backwards.
+   *
+   * The baseline is what the missed-boundary fail-safe compares against, so a
+   * write that moves it BACKWARDS silently disables that fail-safe for the rest
+   * of the message: every later payload then "extends" the rewound baseline and
+   * can never be recognised as a new message. The way that happened was subtle
+   * — the shrink guard swallowed a payload for display and advanced the
+   * baseline with the shorter text anyway — and the consequence was the #94 data
+   * loss class, not a cosmetic one: with message 2's first chunk a prefix of
+   * message 1's text (a one-character collision like "D" is the common case for
+   * token-sized deltas), message 1 never reached the wire at all.
+   *
+   * Enforced here rather than at each call site so the hazard is structurally
+   * unrepresentable: a payload that does not extend the baseline leaves it
+   * alone, whatever the caller decided to do about displaying it.
+   */
+  const acceptRawBaseline = (
+    lane: AssistantDraftLane,
+    raw: string,
+    options?: { replace?: boolean },
+  ): void => {
+    // An explicit `replace` is authoritative: it does not continue the previous
+    // cumulative text, it REPLACES it, so it starts a new baseline instead of
+    // being measured against the old one. Forward-only holds WITHIN a message;
+    // a replace begins a new one. Without this the baseline stays pinned to the
+    // superseded text and every later delta composes on it — "old" + "er"
+    // rather than "new" + "er".
+    if (options?.replace === true) {
+      lane.lastRawAnswerText = raw;
+      return;
+    }
+    if (lane.lastRawAnswerText && !raw.startsWith(lane.lastRawAnswerText)) return;
+    lane.lastRawAnswerText = raw;
+  };
+
+  const laneHasFailedCurrentRevision = (lane: AssistantDraftLane): boolean =>
+    lane.answerRevision > 0 && lane.lastFailedDelivery?.revision === lane.answerRevision;
+
+  /**
+   * May this lane be left without a terminal frame?
+   *
+   * ONLY if it never put anything on the wire. `laneHasFailedCurrentRevision`
+   * exists to stop us blind-retrying a revision whose send just failed, and that
+   * is the right rule for the PROGRESS path — but reading it as "this lane may
+   * never be delivered" truncates a message the user is already looking at: one
+   * transient `false`/`throw` on the latest progress send, and the lane's bubble
+   * stays frozen at whatever text last succeeded while `finalizeDraft` is never
+   * even attempted. The client finalizes the working draft in place on
+   * `turn_settled`, so that truncation is permanent and silent — the #94
+   * data-loss class itself.
+   *
+   * `develop` hardened against exactly this at its finalize path ("a pending
+   * progress `ws.send` can throw … We must NOT let that abort finalization — the
+   * final answer … still has to be delivered"), and a control run of that
+   * controller confirms it: after a failed progress send it still attempts the
+   * terminal frame, carrying the FULL text. The lane rewrite lost the guarantee
+   * per-lane; this restores it per-lane.
+   *
+   * `materialized` is the distinction, and it is already recorded for us:
+   * `sendLaneFrame` sets it on any successful send. A lane that never
+   * materialized has shown the user nothing, so suppressing its terminal frame
+   * invents no bubble — that is the defensible case M13g pins, and it stays.
+   */
+  const laneTerminalSuppressed = (lane: AssistantDraftLane): boolean =>
+    lane.resolution !== "materialized" && laneHasFailedCurrentRevision(lane);
+
+  const laneOrderResolved = (lane: AssistantDraftLane): boolean => {
+    if (!lane.closed) return false;
+    if (lane.tentativeBarrierReservationIds.length > 0) return false;
+    if (lane.resolution === "materialized" || lane.resolution === "empty") return true;
+    return laneHasFailedCurrentRevision(lane);
+  };
+
+  const predecessorsResolved = (lane: AssistantDraftLane): boolean => {
+    for (const predecessor of state.lanes) {
+      if (predecessor.generation >= lane.generation) break;
+      if (!laneOrderResolved(predecessor)) return false;
+    }
+    return true;
+  };
+
+  /**
+   * The predecessors holding `lane` back, IF every one of them is a closed,
+   * text-less lane with nothing outstanding that could still claim it.
+   *
+   * `undefined` means something else is in the way — a tentative block
+   * reservation, a lane armed for a late indexless one, or a lane with real
+   * text — and that barrier is never released on a timer.
+   *
+   * These terms are LOCAL DEFENCE-IN-DEPTH, not the barrier itself. Mutation
+   * testing showed they can each be removed with the whole suite still green,
+   * and the reason is that `laneOrderResolved` already refuses everything they
+   * refuse: it checks `tentativeBarrierReservationIds` before any resolution
+   * state, so flipping a reservation-held lane to `"empty"` changes nothing,
+   * and a closed lane WITH text is settled immediately by `releaseReadyLanes`
+   * rather than lingering unresolved. The in-window barrier behaviour is pinned
+   * end to end by the M6m fixtures; these conditions exist so that this
+   * function is still correct on its own terms if that upstream ordering ever
+   * changes. Do not read their redundancy as permission to delete them.
+   */
+  const releasableEmptyPredecessors = (
+    lane: AssistantDraftLane,
+  ): AssistantDraftLane[] | undefined => {
+    // A block queued ANYWHERE in this turn and not yet retired means we cannot
+    // know a text-less predecessor is genuinely empty — its body may still be in
+    // flight. Deliberately turn-wide and lane-agnostic: which lane a reservation
+    // attached to (or whether it attached at all) is decided by
+    // `assistantMessageIndexMatchesLane`, whose index base is known-unsound on
+    // the pinned core, so the release must not depend on that answer. With a
+    // block outstanding we fall back to the documented turn-bounded delay, which
+    // `retireReservation` and terminal drain both clear.
+    if (state.blockReservations.some((reservation) => reservation.state === "pending")) {
+      return undefined;
+    }
+    const releasable: AssistantDraftLane[] = [];
+    for (const predecessor of state.lanes) {
+      if (predecessor.generation >= lane.generation) break;
+      if (laneOrderResolved(predecessor)) continue;
+      // A REAL barrier: something can still legitimately claim this lane, so the
+      // whole scan gives up and the timer releases nothing.
+      if (
+        predecessor.tentativeBarrierReservationIds.length > 0 ||
+        predecessor.acceptsLateIndexlessReservations
+      ) {
+        return undefined;
+      }
+      // Text-less and unclaimed: the tool-only shape this release exists for.
+      if (predecessor.closed && predecessor.resolution === "unresolved" && !predecessor.answerText) {
+        releasable.push(predecessor);
+        continue;
+      }
+      // Anything else here is an unresolved lane WITH text — a fellow VICTIM of
+      // the same block, not a barrier. Bailing on it deadlocks the release: with
+      // two successors (tool-only lane 0, then B, then C) the scan runs against
+      // C, finds B unresolved-with-text and gives up, so lane 0 is never
+      // released, so B never resolves, so the scan fails identically forever and
+      // NEITHER message streams. Skipping it releases lane 0 and lets ordinary
+      // ordering settle B before C.
+      continue;
+    }
+    return releasable.length > 0 ? releasable : undefined;
+  };
+
+  const clearEmptyPredecessorTimer = (): void => {
+    if (state.emptyPredecessorTimer === undefined) return;
+    clearTimeout(state.emptyPredecessorTimer);
+    state.emptyPredecessorTimer = undefined;
+  };
+
+  /**
+   * #94 — time-boxed release of a text-less predecessor lane.
+   *
+   * A closed lane with no text is in one of two states that are INDISTINGUISHABLE
+   * at the moment the next lane starts streaming: a tool-only assistant message,
+   * which will never produce anything else, or a message whose text is still
+   * coming as an out-of-band block (plan §12.2(5)). The information that
+   * separates them — a queued-block callback — arrives later or not at all, so
+   * no rule evaluated at that instant can be right.
+   *
+   * Resolving it immediately would drop the ordering barrier a late block
+   * depends on. Never resolving it is what shipped, and it is worse: a tool-only
+   * first message is the ordinary "call a tool, then answer" turn, and it left
+   * every later lane stalled behind the barrier until terminal drain, so the
+   * answer streamed NOTHING and appeared only as a finished bubble.
+   *
+   * So we wait exactly one streaming window. If the queued callback lands inside
+   * it the barrier holds as before; if nothing arrives, the lane is treated as
+   * the tool-only case and the live lane is released.
+   *
+   * OUTSIDE the window the barrier is gone, and that is an accepted cost, not
+   * an oversight: a block that arrives after the release is delivered
+   * independently and therefore lands BELOW the answer that already streamed —
+   * message 0's bubble under message 1's. The alternative is the stall this
+   * exists to fix, and a settle is never delayed to avoid it. Recorded as
+   * accepted behaviour by the M6n fixture so it cannot be mistaken for a bug.
+   *
+   * One further consequence, conservative rather than lossy: once a predecessor
+   * flips to `"empty"` it leaves `unresolvedCandidates`, so an indexless
+   * reservation arriving later arms `acceptsLateIndexlessReservations` on the
+   * LIVE answer lane instead of the empty predecessor it probably belonged to.
+   * That withholds the live lane rather than losing anything, and terminal drain
+   * clears it.
+   *
+   * This delays the FIRST PROGRESS FRAME of a later lane and nothing else. Every
+   * settle path (`finalize`, `deliverTerminalIndependent`, terminal drain) runs
+   * `retireTentativeState`, which resolves these lanes synchronously — so a turn
+   * that finishes inside the window settles exactly as it does today. The worst
+   * case is unchanged behaviour; the best case is a streaming answer.
+   *
+   * NOT USED, and why: "the lane saw tool activity, so it is a tool-only
+   * message" is unsound. Tool activity does not imply the message had no text —
+   * a message can call a tool AND answer (the first message of this repo's own
+   * multi-message fixture does exactly that), and whenever such a message's text
+   * arrives as a block rather than as partials, its lane closes text-less with
+   * tool activity while a block is genuinely still coming. That is precisely the
+   * shape the barrier exists for, and it is reachable from any non-streaming
+   * provider, in any streaming mode.
+   */
+  const scheduleEmptyPredecessorRelease = (): void => {
+    if (state.emptyPredecessorTimer !== undefined || state.stopped) return;
+    const timer = setTimeout(() => {
+      state.emptyPredecessorTimer = undefined;
+      void enqueue(
+        "empty predecessor release",
+        () => {
+          if (state.stopped) return;
+          // No `settled`/`no-text` fast path here on purpose: it was redundant
+          // and therefore untestable. A settle has already run
+          // `retireTentativeState`, so every predecessor is resolved and
+          // `releasableEmptyPredecessors` returns nothing; with no active text
+          // `releaseReadyLanes` emits nothing either.
+          const active = currentLane();
+          const releasable = releasableEmptyPredecessors(active);
+          if (!releasable) return;
+          for (const predecessor of releasable) predecessor.resolution = "empty";
+          releaseReadyLanes();
+          // Send the released frame NOW rather than letting the progress
+          // throttle hold it another window. The throttle rate-limits repeated
+          // edits to a bubble the user can already see; this lane has shown
+          // nothing yet and has just waited a full window for the barrier. On a
+          // turn whose answer is shorter than one throttle interval — measured
+          // on the tool-only e2e fixture — the queued frame would otherwise be
+          // discarded by the settle and the answer would never stream at all,
+          // which is the whole defect this release exists to fix.
+          if (
+            state.pendingProgress?.kind === "lane" &&
+            state.pendingProgress.generation === active.generation
+          ) {
+            flushPendingProgress();
+          }
+        },
+        undefined,
+      );
+    }, throttleMs);
+    // Never hold the host process open for a draft frame.
+    (timer as { unref?: () => void }).unref?.();
+    state.emptyPredecessorTimer = timer;
+  };
+
+  const settleLane = (lane: AssistantDraftLane, text: string): boolean => {
+    if (lane.settleOutcome !== undefined) return lane.settleOutcome;
+    if (lane.settleResult) return false;
+
+    // Record lane settlement before the synchronous transport call. Internal
+    // callers cannot emit a second lane terminal frame; `finalize` separately
+    // distinguishes call-stack re-entry from later independent payloads.
+    let resolveSettle!: (value: boolean) => void;
+    lane.settleResult = new Promise<boolean>((resolve) => {
+      resolveSettle = resolve;
+    });
+    lane.settled = true;
+    const sent = sendLaneFrame(lane, "final", text);
+    lane.settleOutcome = sent;
+    resolveSettle(sent);
     return sent;
   };
 
-  const loop: DraftStreamLoop = createDraftStreamLoop({
-    throttleMs: params.throttleMs ?? 600,
-    isStopped: () => stopped,
-    sendOrEditStreamMessage,
-  });
+  /**
+   * #94 — everything this controller puts on the wire for a turn has to leave in
+   * MESSAGE ORDER, and there are two emission paths that do not know about each
+   * other.
+   *
+   * Lane text can be held back: a lane may not stream ahead of an unresolved
+   * text-less predecessor, and that predecessor is only released after one
+   * throttle window. An independent delivery is authorized visible output, so it
+   * is deliberately neither throttled nor queued behind anything. Cross the two
+   * inside the release window and the held lane owns no bubble id yet, so the
+   * later payload takes the next slot — the widget appends on an unknown id, so
+   * the later assistant message renders ABOVE the earlier one PERMANENTLY. Drain
+   * does not repair it; drain is what finally emits the earlier text, into the
+   * wrong slot.
+   *
+   * So an independent delivery emits any held lane text FIRST, in generation
+   * order: earlier lanes are settled (a closed lane can gain no more text, so
+   * its terminal frame is owed anyway), and the CURRENT lane — which may still
+   * be mid-message — merely claims its slot with a progress frame. This picks no
+   * lane by body text, arrival order or candidate count, so §5.2 is untouched:
+   * it changes only WHEN text we already hold is emitted, never whose it is.
+   *
+   * IT DOES NOT ALWAYS FIRE, and that is the correction the fixtures forced. The
+   * dispatcher really is strictly serial —
+   * `sendChain = sendChain.then(… deliver …).catch(…).finally(… onDeliverySettled …)`
+   * (reply-dispatcher.types-CVYQHGPk.js:95-131), with the block pipeline
+   * enqueueing onto its own serial chain the same way
+   * (block-reply-pipeline-CsIUOKQ6.js:241) — so an earlier message's block is
+   * delivered AND settled before a later message's payload arrives, and that is
+   * why emitting held text ahead of the arriving payload is SAFE WHEN IT FIRES.
+   * It is not a reason to fire unconditionally, because "a block is still
+   * outstanding" is reachable at this API regardless, and then the arriving
+   * payload may BE that earlier message's block — which has to land ABOVE the
+   * held text, not below it (M6z4). Nothing here can tell whose payload just
+   * arrived; that identity is #111's. So with any reservation still pending the
+   * whole thing stands down and today's ordering is kept.
+   *
+   * Scoping the stand-down to the slot claim alone was tried in round 10 and
+   * measured: it fixes the M6z3 residual and inverts M6z4. Both fixtures ship,
+   * one as the fix and one as its limit.
+   */
+  const emitHeldLaneTextBeforeIndependentDelivery = (): void => {
+    // The stand-down (see the docblock for why it is not unconditional). Whole
+    // function, not just the current lane: M6m/M6t pin the barrier it protects
+    // and M6z4 the inversion that scoping it would cause.
+    if (state.blockReservations.some((reservation) => reservation.state === "pending")) {
+      return;
+    }
+    // CLAIM ONLY — never settle. Ordering is decided by whichever frame first
+    // creates a bubble, so a slot claim is all this needs, and a claim costs the
+    // lane nothing it cannot recover: on success the lane is materialized and is
+    // then GUARANTEED its terminal frame; on failure the speculative mode leaves
+    // no trace and drain still settles the text through the ordinary path.
+    //
+    // An earlier version settled the earlier lanes here. That spent each lane's
+    // one latched terminal attempt at flush time instead of at drain, where a
+    // recovered transport would have carried it — the weaker form of the same
+    // loss. One rule for every lane now, closed or current.
+    for (const lane of state.lanes) {
+      if (lane.id || lane.settled || !lane.answerText) continue;
+      if (laneTerminalSuppressed(lane)) continue;
+      discardPendingProgress(
+        (frame) => frame.kind === "lane" && frame.generation === lane.generation,
+      );
+      if (sendLaneFrame(lane, "progress", lane.answerText, { speculative: true })) {
+        lane.lastProgressAttemptRevision = lane.answerRevision;
+        state.lastProgressSentAt = Date.now();
+      }
+    }
+  };
+
+  const attemptProgress = (frame: PendingProgressFrame): boolean => {
+    if (state.stopped) return false;
+    if (frame.kind === "preview") {
+      const preview = state.provisionalPreview;
+      if (
+        preview.scaffoldWriter !== "active" ||
+        preview.revision !== frame.revision
+      ) {
+        return false;
+      }
+      let sent = false;
+      try {
+        sent = transport.sendProgress(sessionKey, preview.id, frame.text, params.turnId) === true;
+      } catch {
+        warn(`provisional preview revision ${frame.revision} progress delivery threw`);
+      }
+      if (sent) {
+        preview.started = true;
+        state.started = true;
+        state.lastProgressSentAt = Date.now();
+      }
+      return sent;
+    }
+
+    const lane = state.lanes[frame.generation];
+    if (
+      !lane ||
+      lane.closed ||
+      lane.settled ||
+      lane.answerRevision !== frame.revision ||
+      !predecessorsResolved(lane)
+    ) {
+      return false;
+    }
+    lane.lastProgressAttemptRevision = frame.revision;
+    const sent = sendLaneFrame(lane, "progress", frame.text);
+    if (sent) state.lastProgressSentAt = Date.now();
+    return sent;
+  };
+
+  const flushPendingProgress = (): void => {
+    clearProgressTimer();
+    const pending = state.pendingProgress;
+    state.pendingProgress = undefined;
+    if (pending) attemptProgress(pending);
+  };
+
+  const schedulePendingProgress = (): void => {
+    if (state.progressTimer !== undefined || !state.pendingProgress || state.stopped) return;
+    const delay = Math.max(0, throttleMs - (Date.now() - state.lastProgressSentAt));
+    state.progressTimer = setTimeout(() => {
+      state.progressTimer = undefined;
+      void enqueue("throttled progress flush", flushPendingProgress, undefined);
+    }, delay);
+  };
+
+  const queueProgress = (frame: PendingProgressFrame): void => {
+    if (state.stopped) return;
+    // A single pending slot is last-write-wins across BOTH frame kinds, so a
+    // tool event's scaffold frame could evict an answer frame that was queued
+    // but not yet sent — losing the answer's first visible update, on either
+    // path below (the open-throttle path discards the pending frame outright).
+    // Answer text outranks the scaffold, so the scaffold yields.
+    //
+    // The dropped frame is NOT free and the earlier claim that it was — that
+    // `attemptProgress`'s revision re-check made it a superseded frame — was
+    // wrong: `pushEvent` has just incremented `preview.revision`, so this IS the
+    // current revision and nothing re-queues it. If no further tool event
+    // arrives, that scaffold line never reaches the wire.
+    //
+    // It is safe for a different, verified reason. A lane frame can only be
+    // PENDING when `lastProgressSentAt !== 0`, and that is assigned only by
+    // `attemptProgress` after a SUCCESSFUL send — either of a preview (so
+    // `preview.started` is already true and the P-claim path is preserved) or of
+    // a lane frame (which has already run `invalidateScaffoldWriter`, so no
+    // scaffold was going out anyway). Worst case is therefore a scaffold that is
+    // one line stale on screen, and `settlePreviewIfAlone` still settles with the
+    // newest `preview.text` because `pushEvent` updates the text before queuing.
+    //
+    // BOUNDED, and worth knowing where: the window shuts permanently once a lane
+    // frame actually sends, because `commitReservation` calls
+    // `invalidateScaffoldWriter()` and `attemptProgress` gates previews on
+    // `scaffoldWriter === "active"`. So this only bites before the answer's
+    // first sent frame — which is exactly the opening of a tool-first turn.
+    if (frame.kind === "preview" && state.pendingProgress?.kind === "lane") return;
+    const throttleOpen =
+      state.lastProgressSentAt === 0 || Date.now() - state.lastProgressSentAt >= throttleMs;
+    if (throttleOpen) {
+      discardPendingProgress(() => true);
+      attemptProgress(frame);
+      return;
+    }
+    state.pendingProgress = frame;
+    schedulePendingProgress();
+  };
+
+  const releaseReadyLanes = (options?: {
+    emitCurrentProgress?: boolean;
+    settleCurrent?: boolean;
+  }): void => {
+    const active = currentLane();
+    for (const lane of state.lanes) {
+      if (!predecessorsResolved(lane)) continue;
+      if (lane.closed) {
+        discardPendingProgress(
+          (frame) => frame.kind === "lane" && frame.generation === lane.generation,
+        );
+        if (lane.answerText && !lane.settled && !laneTerminalSuppressed(lane)) {
+          settleLane(lane, lane.answerText);
+        }
+        continue;
+      }
+      if (lane !== active || !lane.answerText || lane.settled) continue;
+      if (options?.settleCurrent) {
+        discardPendingProgress(
+          (frame) => frame.kind === "lane" && frame.generation === lane.generation,
+        );
+        if (!laneTerminalSuppressed(lane)) settleLane(lane, lane.answerText);
+      } else if (
+        options?.emitCurrentProgress !== false &&
+        lane.lastProgressAttemptRevision < lane.answerRevision &&
+        // Redundant in practice and kept deliberately: `attemptProgress` stamps
+        // `lastProgressAttemptRevision` BEFORE the send, so the term above
+        // already blocks a retry of the revision that just failed (removing this
+        // one leaves the whole suite green). It stays as the explicit statement
+        // of the rule, because the terminal path now deliberately does NOT honour
+        // the failed stamp and the difference between the two paths should be
+        // readable here rather than inferred.
+        !laneHasFailedCurrentRevision(lane)
+      ) {
+        queueProgress({
+          kind: "lane",
+          generation: lane.generation,
+          revision: lane.answerRevision,
+          text: lane.answerText,
+        });
+      }
+    }
+    // The live lane has text to show but is held behind a text-less predecessor.
+    // Give the predecessor one streaming window to declare itself (see
+    // `scheduleEmptyPredecessorRelease`); a settle never waits on this.
+    // `settleCurrent`/`emitCurrentProgress` are deliberately NOT re-checked:
+    // both paths leave the active lane settled or text-less by the time this
+    // runs, so the conditions below already cover them.
+    if (
+      active.answerText &&
+      !active.settled &&
+      !predecessorsResolved(active) &&
+      releasableEmptyPredecessors(active)
+    ) {
+      scheduleEmptyPredecessorRelease();
+    }
+  };
+
+  const assistantMessageIndexMatchesLane = (
+    assistantMessageIndex: number,
+    lane: AssistantDraftLane,
+  ): boolean => {
+    // KNOWN-UNSOUND ON THE PINNED CORE, and tolerated deliberately.
+    //
+    // Core stamps the queued-block context from the same payload metadata the
+    // delivery seam reads, and that stream is 1-BASED (measured on a real
+    // gateway: message A = 1, B = 2). Lane generations are 0-based, so this
+    // predicate is wrong on EVERY indexed turn, not in some edge case:
+    //   - it matches A's reservation (index 1) against lane generation 1 = B, so
+    //     the barrier lands on the SUCCESSOR, which never blocks that lane's own
+    //     progress (`predecessorsResolved` looks only at predecessors); and
+    //   - more commonly, when the block is queued while its own lane is still
+    //     current, generation 1 does not exist yet, `state.lanes.find` returns
+    //     undefined and NO barrier is created at all until the next rotation.
+    //
+    // An earlier version of this comment called the consequence a turn-bounded
+    // delay. That stopped being true when the empty-predecessor release timer
+    // landed: a mis-attached (or unattached) reservation leaves the real
+    // predecessor text-less with an empty barrier list, i.e. releasable, and the
+    // successor then streams ahead of a block that is still in flight —
+    // inverting the two bubbles rather than delaying one.
+    //
+    // What makes tolerating it safe is `releasableEmptyPredecessors`, which
+    // refuses to release while ANY reservation in the turn is still pending,
+    // whatever lane it did or did not attach to. Correcting the mapping itself
+    // needs a real index→lane identity and belongs to #111; guessing an offset
+    // here would bind us to an observed core version instead of a contract.
+    return assistantMessageIndex === lane.generation;
+  };
+
+  const attachIndexedReservations = (lane: AssistantDraftLane): void => {
+    if (!state.lateReservationEpochOpen) return;
+    for (const reservation of state.blockReservations) {
+      if (
+        reservation.state !== "pending" ||
+        reservation.barrierGeneration !== undefined ||
+        reservation.assistantMessageIndex === undefined ||
+        !assistantMessageIndexMatchesLane(reservation.assistantMessageIndex, lane)
+      ) {
+        continue;
+      }
+      reservation.barrierGeneration = lane.generation;
+      lane.tentativeBarrierReservationIds.push(reservation.token);
+    }
+  };
+
+  const closeAndRotate = (): void => {
+    const lane = currentLane();
+    discardPendingProgress(
+      (frame) => frame.kind === "lane" && frame.generation === lane.generation,
+    );
+    lane.closed = true;
+    if (
+      lane.answerText.length === 0 &&
+      lane.resolution !== "materialized" &&
+      lane.resolution !== "empty"
+    ) {
+      lane.resolution = "unresolved";
+    }
+    const next = newLane(lane.generation + 1);
+    state.lanes.push(next);
+    attachIndexedReservations(next);
+    releaseReadyLanes({ emitCurrentProgress: false });
+  };
+
+  const retireReservation = (reservation: TentativeBlockReservation): void => {
+    if (reservation.state === "retired") return;
+    reservation.state = "retired";
+    if (reservation.barrierGeneration === undefined) return;
+    const lane = state.lanes[reservation.barrierGeneration];
+    if (!lane) return;
+    lane.tentativeBarrierReservationIds = lane.tentativeBarrierReservationIds.filter(
+      (token) => token !== reservation.token,
+    );
+    // Deliberately has NO `lane.closed` term, unlike the otherwise identical flip
+    // in `retireTentativeState`. Adding one for symmetry looks right and is
+    // wrong: this flip is what lets an EARLY cleanup pre-resolve a lane that has
+    // demonstrably produced nothing — its last pending claim just retired and it
+    // holds no text — so the next lane streams immediately instead of waiting for
+    // the release window or drain. M6h's `cleanupBeforeBoundary` case pins
+    // exactly that, and gating this on `closed` turns it red: the lane is still
+    // the open one when its reservation retires.
+    //
+    // Marking a LIVE lane `"empty"` is safe for reasons local to the transition:
+    // the lane has no text by the condition below, `pushAnswerText` resets the
+    // resolution to `"open"` the moment it gets any, and a live lane is never
+    // anyone's predecessor. `retireTentativeState` needs the `closed` term
+    // because it runs at terminal drain, where the current lane is settled by
+    // `settleCurrent` rather than resolved.
+    if (
+      lane.tentativeBarrierReservationIds.length === 0 &&
+      !lane.acceptsLateIndexlessReservations &&
+      !lane.answerText &&
+      lane.resolution !== "materialized"
+    ) {
+      lane.resolution = "empty";
+    }
+  };
+
+  type OutstandingLifecycleRecord =
+    | { kind: "block"; record: TentativeBlockReservation }
+    | { kind: "notice"; record: TentativeNoticeToken };
+
+  const outstandingRecordsAtIndex = (assistantMessageIndex: number): OutstandingLifecycleRecord[] => [
+    ...state.blockReservations
+      .filter(
+        (reservation) =>
+          reservation.state === "pending" &&
+          reservation.assistantMessageIndex === assistantMessageIndex,
+      )
+      .map((record) => ({ kind: "block" as const, record })),
+    ...state.noticeTokens
+      .filter(
+        (token) =>
+          token.state === "pending" && token.assistantMessageIndex === assistantMessageIndex,
+      )
+      .map((record) => ({ kind: "notice" as const, record })),
+  ];
+
+  /**
+   * Retire the EARLIEST pending record of `recordKind` at this index.
+   *
+   * Cardinality is deliberately not a condition. One assistant message can emit
+   * several block payloads and core stamps them all with that message's index
+   * (plan §14.4), and a notice can share an index with a real block — so
+   * "exactly one record here" is the uncommon case, and bailing on anything else
+   * left BOTH records pending forever. Every payload gets its own settlement, so
+   * retiring one record per settlement drains them all whatever order they
+   * arrive in, and the block reservation — the only record that is an ordering
+   * barrier — is released last at its index.
+   */
+  const retireOneRecordAtIndex = (
+    assistantMessageIndex: number | undefined,
+    recordKind: OutstandingLifecycleRecord["kind"],
+  ): void => {
+    if (assistantMessageIndex === undefined) return;
+    const candidate = outstandingRecordsAtIndex(assistantMessageIndex).find(
+      (entry) => entry.kind === recordKind,
+    );
+    if (!candidate) return;
+    if (candidate.kind === "block") {
+      retireReservation(candidate.record);
+    } else {
+      candidate.record.state = "retired";
+    }
+  };
+
+  const retireTentativeState = (): void => {
+    state.lateReservationEpochOpen = false;
+    for (const reservation of state.blockReservations) retireReservation(reservation);
+    for (const token of state.noticeTokens) token.state = "retired";
+    for (const disposition of state.blockDispositions) disposition.settled = true;
+    for (const lane of state.lanes) {
+      lane.acceptsLateIndexlessReservations = false;
+      if (
+        lane.closed &&
+        !lane.answerText &&
+        lane.tentativeBarrierReservationIds.length === 0 &&
+        lane.resolution !== "materialized"
+      ) {
+        lane.resolution = "empty";
+      }
+    }
+  };
+
+  const settlePreviewIfAlone = (): boolean => {
+    const preview = state.provisionalPreview;
+    if (
+      state.durableDeliverySucceeded ||
+      !preview.started ||
+      !preview.text ||
+      preview.claim.state !== "unclaimed"
+    ) {
+      return false;
+    }
+    if (preview.settleOutcome !== undefined) return preview.settleOutcome;
+    if (preview.settleResult) return false;
+    let resolveSettle!: (value: boolean) => void;
+    preview.settleResult = new Promise<boolean>((resolve) => {
+      resolveSettle = resolve;
+    });
+    invalidateScaffoldWriter();
+    let sent = false;
+    try {
+      sent = transport.finalizeDraft(sessionKey, preview.id, preview.text, params.turnId) === true;
+    } catch {
+      warn("provisional preview cleanup delivery threw");
+    }
+    preview.settleOutcome = sent;
+    if (sent) {
+      state.durableDeliverySucceeded = true;
+      state.started = true;
+    }
+    resolveSettle(sent);
+    return sent;
+  };
+
+  const terminalDrain = (settleCurrent: boolean): void => {
+    retireTentativeState();
+    releaseReadyLanes({
+      emitCurrentProgress: false,
+      settleCurrent,
+    });
+    if (settleCurrent) settlePreviewIfAlone();
+  };
+
+  const deliverTerminalIndependent = (text: string): boolean => {
+    // ONE STORY, in the order it happens:
+    //
+    // 1. Retire tentative state, which opens ordering barriers.
+    // 2. Emit any HELD lane text, claiming its slot. Message order outranks this
+    //    payload: a lane holding text produced it BEFORE this terminal payload
+    //    arrived, and the widget appends on an unknown id, so a lane that has
+    //    not claimed its bubble yet would sit below this one forever.
+    // 3. Send this payload.
+    // 4. Release whatever the retirement in (1) unblocked.
+    //
+    // P-CLAIM: whoever sends first owns the scaffold id, so after (2) that can
+    // be a held lane rather than this payload — deliberately, and signed off in
+    // round 10 (see M13d). The scaffold was the progress indicator for the
+    // message still being written, so that message's lane is its natural owner,
+    // and handing P over satisfies the no-ghost rule (§6.2-3) exactly as well.
+    // The RULE is unchanged — first successful claimant owns P — only who is
+    // first. A failed claim in (2) rolls back and leaves P for this payload.
+    retireTentativeState();
+    emitHeldLaneTextBeforeIndependentDelivery();
+    const sent = sendIndependent(text);
+    releaseReadyLanes({ emitCurrentProgress: false });
+    return sent;
+  };
 
   return {
-    id,
     get started() {
-      return started;
+      return state.started && !state.finalReconciliation.ordinaryAnswerSettled;
     },
     pushEvent: (input) => {
-      // `formatChannelProgressDraftLineForEntry(entry, input, options)` renders
-      // one icon+detail line (e.g. "🔎 web_search …"), honoring the channel's
-      // command-text config. Verified: dist/plugin-sdk/streaming-DZCVNyI3.d.ts:112.
-      const line = formatChannelProgressDraftLineForEntry(channelConfig as never, input);
-      if (!line) return;
-      if (lines[lines.length - 1] !== line) lines.push(line);
-      loop.update(composeText());
+      void enqueue(
+        "progress event",
+        () => {
+          const preview = state.provisionalPreview;
+          if (state.stopped || preview.scaffoldWriter !== "active") {
+            return;
+          }
+          const line = formatChannelProgressDraftLineForEntry(channelConfig as never, input);
+          if (!line) return;
+          if (state.lines[state.lines.length - 1] !== line) state.lines.push(line);
+          const shown = state.lines.slice(-maxLines);
+          preview.text = [`${label}…`, ...shown].join("\n");
+          preview.revision += 1;
+          queueProgress({
+            kind: "preview",
+            revision: preview.revision,
+            text: preview.text,
+          });
+        },
+        undefined,
+      );
     },
-    pushAnswerText: (text) => {
-      // No-op on empty/undefined so a trailing empty partial can't clobber a
-      // non-empty draft. Cumulative REPLACE (not append) — see the doc on the
-      // controller type. Routes through the SAME throttled loop as pushEvent,
-      // so `started` is set on the first emitted frame identically.
-      if (!text) return;
-      // Mirror core's Discord partial hygiene exactly (verified:
-      // dist/message-handler.process-CcPQD8zK.js:687-700): strip reasoning +
-      // inline-directive tags, drop a "Reasoning:\n"-prefixed partial, skip an
-      // identical text, and ignore a SHRINKING cumulative text (a shorter
-      // prefix of the current one) to avoid backwards flicker. Signatures
-      // verified: stripReasoningTagsFromText(text,{mode,trim}): string
-      // (chunk-items-DszNsY2v.d.ts:111-114); stripInlineDirectiveTagsForDelivery(
-      // text): { text } (:153).
-      const cleaned = stripInlineDirectiveTagsForDelivery(
-        stripReasoningTagsFromText(text, { mode: "strict", trim: "both" }),
-      ).text;
-      if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
-      if (cleaned === answerText) return;
-      if (
-        answerText &&
-        answerText.startsWith(cleaned) &&
-        cleaned.length < answerText.length
-      ) {
-        return;
-      }
-      // MISSED-BOUNDARY DEFENSE. Correctness of the REPLACE semantics rests on
-      // core rolling the prior message into the prefix (via
-      // handleAssistantMessageBoundary) BEFORE the first partial of a new
-      // message. That is an unpinned cross-package contract; if the boundary
-      // event is late or never fires, a new message's cumulative partial (which
-      // restarts from "") would otherwise CLOBBER the prior message's streamed
-      // text and later duplicate it against the assembled final.
-      //
-      // Within a single message the cumulative `text` only grows, so each
-      // partial has the current body as a PREFIX. A partial that is neither an
-      // extension of `answerText` nor a shrinking prefix of it (both handled
-      // above) has therefore DIVERGED — a new message began without a boundary.
-      // We perform the same prefix-rollup the boundary would have and count it,
-      // so a belated boundary for this seam degrades to a no-op instead of
-      // rolling twice.
-      //
-      // NOTE: core's `onPartialReply` payload carries no itemId in the pinned
-      // dist (PartialReplyPayload = { text; delta? }), so this seam is detected
-      // from the cumulative text, not an itemId compare.
-      if (answerText.length > 0 && !cleaned.startsWith(answerText)) {
-        rollCurrentIntoPrefix();
-        absorbedMissedBoundaries += 1;
-      }
-      answerText = cleaned;
-      loop.update(composeText());
+    pushAnswerText: (update: PartialAnswerUpdate) => {
+      void enqueue(
+        "partial answer update",
+        () => {
+          let lane = currentLane();
+          if (state.stopped || lane.settled) return;
+          // A delta extends the RAW stream, not the displayed text: composing on
+          // the cleaned text would fold stripped tag fragments back into the
+          // accumulator. They are identical until something is actually
+          // stripped, so this only differs on the path the guards below exist
+          // for.
+          const deltaBase = lane.lastRawAnswerText || lane.answerText;
+          const raw =
+            typeof update.text === "string" && update.text.length > 0
+              ? update.text
+              : typeof update.delta === "string" && update.delta.length > 0
+                ? deltaBase + update.delta
+                : undefined;
+          if (raw === undefined) return;
+          // Mirror core's own partial hygiene exactly (verified:
+          // dist/message-handler.process-CcPQD8zK.js:685-698): strip reasoning +
+          // inline-directive tags, drop a "Reasoning:\n"-prefixed partial, skip
+          // an identical text, and ignore a SHRINKING cumulative text (a shorter
+          // prefix of the current one) to avoid backwards flicker. Restored from
+          // `develop` — the lane rewrite (34da088) dropped the first and third
+          // of those while keeping the strip itself.
+          const cleaned = stripInlineDirectiveTagsForDelivery(
+            stripReasoningTagsFromText(raw, { mode: "strict", trim: "both" }),
+          ).text;
+          // Deliberately does NOT touch the raw baseline. A reasoning payload is
+          // not this message's answer, so letting it set the baseline would force
+          // the real answer to "extend" reasoning text it has nothing to do with,
+          // and a provider that stops prefixing mid-message would then read as a
+          // new assistant message. Leaving the baseline alone is inert: an empty
+          // baseline cannot trigger the fail-safe (which also requires existing
+          // lane text), and a non-empty one still describes the last real answer
+          // payload.
+          if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
+          if (cleaned === lane.answerText) {
+            acceptRawBaseline(lane, raw, { replace: update.replace === true });
+            return;
+          }
+          // SHRINK. Mid-stream an unclosed `<thinking>` strips away text the
+          // lane has already shown, so the cleaned cumulative text goes
+          // BACKWARDS ("Hi <thi" → "Hi"). Rendering that would flicker, and —
+          // under the lane model, unlike core's single-draft path — the next
+          // partial would then look like a diverged message and rotate the lane,
+          // splitting one answer across two bubbles. An explicit `replace`
+          // update is authoritative and is never treated as a shrink.
+          if (
+            update.replace !== true &&
+            lane.answerText.length > 0 &&
+            lane.answerText.startsWith(cleaned) &&
+            cleaned.length < lane.answerText.length
+          ) {
+            // No `replace` flag needed: this branch is unreachable for a replace
+            // update (the condition above requires `replace !== true`).
+            acceptRawBaseline(lane, raw);
+            return;
+          }
+
+          // This is the sole content-prefix check in the answer state machine.
+          // It is a fail-safe for a missing structured boundary, not an attempt
+          // to correlate callback bodies or final payloads. Explicit replace
+          // updates stay in the same lane even when their text diverges.
+          //
+          // The RAW stream is what decides. Cleaned text diverges whenever a tag
+          // closes mid-stream ("Hi <thi" → "Hi  there") even though the provider
+          // is still appending to the SAME message; rotating there would split
+          // one answer into two bubbles. A real missed boundary restarts the
+          // cumulative text, so the raw text stops extending too.
+          if (
+            update.replace !== true &&
+            lane.answerText.length > 0 &&
+            !cleaned.startsWith(lane.answerText) &&
+            !raw.startsWith(lane.lastRawAnswerText)
+          ) {
+            warn(
+              `contract violation: cumulative partial diverged without an assistant-message ` +
+                `boundary; preserving generation ${lane.generation} and rotating defensively`,
+            );
+            closeAndRotate();
+            lane = currentLane();
+          }
+
+          lane.answerText = cleaned;
+          acceptRawBaseline(lane, raw, { replace: update.replace === true });
+          lane.answerRevision += 1;
+          if (lane.resolution === "empty" || lane.resolution === "unresolved") {
+            lane.resolution = "open";
+          }
+          releaseReadyLanes();
+        },
+        undefined,
+      );
     },
     handleAssistantMessageBoundary: () => {
-      // Roll the just-completed message's text into the prefix and reset the
-      // per-item cumulative buffer for the next message. No-op before the first
-      // message (answerText empty). No loop.update: the composed body is
-      // unchanged at the boundary (answerPrefix += answerText; answerText = "")
-      // so nothing visually changes until the next partial arrives. The final
-      // deliver settles the bubble with the fully assembled reply, so any
-      // prefix-vs-final join divergence (e.g. separator spacing) is transient
-      // and self-correcting.
-      //
-      // IDEMPOTENCY: if the partial-ingest path already detected and rolled this
-      // seam (a boundary that arrived late, after the new message's first
-      // partial), consume the count and no-op — otherwise we would roll the new
-      // (in-progress) message's text into the prefix a second time.
-      if (absorbedMissedBoundaries > 0) {
-        absorbedMissedBoundaries -= 1;
-        return;
-      }
-      rollCurrentIntoPrefix();
-    },
-    flush: () => loop.flush(),
-    snapshotText: () => (hasPendingContent() ? composeText() : ""),
-    finalize: (text) => {
-      // Idempotent: the normal delivery path and the error-recovery path may
-      // both attempt to finalize; only the first wins so we never send two
-      // terminal frames (or finalize onto an already-settled bubble).
-      if (finalizeResult) return finalizeResult;
-      // P0-4 (review R2): arm the latch SYNCHRONOUSLY. `finalizeResult = (async
-      // () => {...})()` only assigns once the body first SUSPENDS, and the body
-      // reaches `transport.finalizeDraft(...)` with no preceding `await` whenever
-      // there is no pending draft content — so the whole terminal-frame send used
-      // to run before the latch existed, leaving it unarmed across exactly the
-      // stretch it exists to protect (the pre-P0-4 code set its `finalized` flag
-      // synchronously). Resolving an already-assigned promise WITH the body's
-      // promise keeps the cached-result contract: every caller, re-entrant or
-      // not, awaits the same single `finalizeDraft` outcome (or rejection).
-      let settleFinalize!: (v: boolean | PromiseLike<boolean>) => void;
-      finalizeResult = new Promise<boolean>((resolve) => { settleFinalize = resolve; });
-      settleFinalize((async () => {
-        // Flush any pending draft text first so the widget has shown the working
-        // bubble at least once (the throttle may not have fired yet for a fast
-        // turn). This must run BEFORE we stop the loop, since flush() bails when
-        // `isStopped()` is true. Then finalize in place onto the same draft id.
-        //
-        // TOCTOU hardening: a pending progress `ws.send` can throw if the socket
-        // slipped to CLOSING between the OPEN check and the send. We must NOT let
-        // that abort finalization — the final answer (and, on the error path, the
-        // settling frame) still has to be delivered. So swallow a flush failure
-        // and proceed to finalizeDraft regardless.
-        if (hasPendingContent()) {
-          loop.update(composeText());
-          try {
-            await loop.flush();
-          } catch {
-            // Pending preview send failed; deliver the final frame anyway below.
+      void enqueue(
+        "assistant-message boundary",
+        () => {
+          if (state.stopped) return;
+          // NO absorb counter. #23 added one so that a boundary arriving LATE
+          // for a seam the fail-safe had already rotated would no-op instead of
+          // rolling twice — a real hazard in that controller, where a double
+          // roll appended a spurious separator inside the single per-turn
+          // bubble. Two things have changed since:
+          //
+          //  - its premise is false. #23 recorded that core "fires
+          //    onAssistantMessageStart exactly ONCE per run"; the live harness
+          //    later showed it firing per assistant message. And a boundary
+          //    cannot arrive late for its OWN message: core fires it before that
+          //    message's first chunk is processed (selection-BfRwHcjH.js:3788
+          //    `handleMessageStart`, and :3859-3867 where a stream-item-id change
+          //    fires the boundary and only then handles the chunk), and this seam
+          //    enqueues boundaries and partials onto one FIFO, so neither can
+          //    overtake the other. The counter therefore never consumed a
+          //    duplicate — it consumed the NEXT message's real boundary.
+          //  - the failure modes inverted. Under lanes, swallowing a boundary
+          //    does not merge two paragraphs: the next message's final lands on
+          //    the previous message's lane and OVERWRITES it. Deleting the
+          //    counter can at worst cause one spurious rotation, and an empty
+          //    lane emits no bubble at all (§6.2-3, M6). A stray empty lane is
+          //    not the same order of defect as deleted text.
+          if (!state.firstBoundarySeen) {
+            state.firstBoundarySeen = true;
+            return;
           }
-        }
-        stopped = true;
-        loop.stop();
-        return transport.finalizeDraft(sessionKey, id, text, params.turnId);
-      })());
-      return finalizeResult;
+          closeAndRotate();
+        },
+        undefined,
+      );
     },
+    noteBlockReplyQueued: (input) => {
+      void enqueue(
+        "queued block observation",
+        () => {
+          // Classification precedes every lane lookup or reservation decision.
+          if (isNotice(input)) {
+            state.noticeTokens.push({
+              assistantMessageIndex: input.assistantMessageIndex,
+              state: state.lateReservationEpochOpen ? "pending" : "retired",
+            });
+            return;
+          }
+
+          const reservation: TentativeBlockReservation = {
+            token: nextBlockToken(),
+            assistantMessageIndex: input.assistantMessageIndex,
+            state: state.lateReservationEpochOpen ? "pending" : "retired",
+          };
+          state.blockReservations.push(reservation);
+          if (reservation.state === "retired") return;
+
+          let barrierLane: AssistantDraftLane | undefined;
+          if (input.assistantMessageIndex !== undefined) {
+            barrierLane = state.lanes.find(
+              (lane) => assistantMessageIndexMatchesLane(input.assistantMessageIndex!, lane),
+            );
+          } else {
+            const unresolvedCandidates = state.lanes.filter(
+              (lane) => lane.resolution === "unresolved",
+            );
+            if (unresolvedCandidates.length > 1) {
+              warn(
+                `ambiguous indexless block reservation has ${unresolvedCandidates.length} ` +
+                  "unresolved predecessors; retaining the earliest ordering barrier",
+              );
+            }
+            barrierLane =
+              state.lanes.find((lane) => lane.acceptsLateIndexlessReservations) ??
+              unresolvedCandidates[0] ??
+              currentLane();
+            barrierLane.acceptsLateIndexlessReservations = true;
+          }
+          if (!barrierLane) return;
+          reservation.barrierGeneration = barrierLane.generation;
+          barrierLane.tentativeBarrierReservationIds.push(reservation.token);
+        },
+        undefined,
+      );
+    },
+    deliverAuthorizedBlock: (input) =>
+      enqueue(
+        "authorized block delivery",
+        // A block-kind notice is authoritative visible output and owns no
+        // tentative block reservation. It DOES now record a disposition — an
+        // earlier version of this comment said doing so would let its settled
+        // event retire an unrelated real-block barrier, and that was true only
+        // while dispositions were untyped. Tagging each one with what the
+        // payload was is what makes recording it safe, and is what lets the
+        // settlement seam stop guessing.
+        () => {
+          // THE classification point: this is the only seam that sees the
+          // payload, so this is where "was it a notice?" is answered and
+          // recorded. The settlement seam later consumes these in order rather
+          // than guessing (see `noteDeliveryLifecycle`).
+          //
+          // Recorded BEFORE the empty-text bail on purpose. A media-only or
+          // otherwise text-less block sends nothing, but the dispatcher still
+          // settles it, and a settlement with no disposition to pair against used
+          // to leave that block's reservation pending forever — which, with the
+          // turn-wide release gate, stalled every later message for the rest of
+          // the turn.
+          state.blockDispositions.push({
+            settled: false,
+            kind: isNotice(input) ? "notice" : "block",
+          });
+          if (!input.text) return false;
+          emitHeldLaneTextBeforeIndependentDelivery();
+          return sendIndependent(input.text);
+        },
+        false,
+      ),
+    noteDeliveryLifecycle: (kind, input) => {
+      void enqueue(
+        `delivery lifecycle ${kind}`,
+        () => {
+          // The pinned dispatcher emits every lifecycle observer for tool,
+          // block, and final payloads. Only block-kind events can describe the
+          // tentative block state owned by this controller.
+          if (input.deliveryKind !== "block") return;
+          const classifiedNotice =
+            kind === "skip" || kind === "cancel" ? isNotice(input) : false;
+          if (kind === "error") {
+            // Retires nothing on purpose: an adapter error says a delivery
+            // failed, not WHICH record it belonged to, and this seam has no
+            // payload to classify. Terminal drain clears whatever is left. Note
+            // the cost is now turn-wide rather than per-lane — a reservation
+            // surviving here keeps the empty-predecessor release gate closed for
+            // the rest of the turn — which is the price of not guessing.
+            warn("delivery adapter reported an error; ambiguous reservations await terminal drain");
+          } else if (kind === "settled") {
+            // `onDeliverySettled` carries no payload — core hands this seam only
+            // `{kind, assistantMessageIndex}`, and it marks real blocks and
+            // notices alike as `kind:"block"` — so nothing here can classify the
+            // settling payload. Every previous attempt to infer it was a guess
+            // that misfired: "no outstanding disposition ⇒ notice" is false for a
+            // text-less block, and untagged FIFO pairing let a notice consume the
+            // next real block's disposition.
+            //
+            // So the classification is taken from where the payload actually was:
+            // `deliverAuthorizedBlock` records one disposition per authorized
+            // block delivery, tagged with what that payload was. Settlements pair
+            // with deliveries in order, and each retires the earliest pending
+            // record OF THAT KIND at its index.
+            //
+            // That pairing rests on one premise, so state it: core fires
+            // `onDeliverySettled` from the `.finally()` of the SAME promise chain
+            // that awaited `deliver`, and every disposition here is pushed inside
+            // this controller's serialized queue. So dispositions are recorded in
+            // the order deliveries complete, and settlements arrive in that same
+            // order. If a future core dispatches block deliveries concurrently
+            // without awaiting each in turn, this pairing is what breaks first.
+            //
+            // No disposition left means this settlement belongs to a payload this
+            // controller never saw delivered — a callback-free notice is the
+            // reachable case — so it owns no record and retires nothing. That is
+            // what keeps F5 true: a notice settlement can never consume a real
+            // block's ordering reservation.
+            const disposition = state.blockDispositions.find((candidate) => !candidate.settled);
+            if (disposition) {
+              disposition.settled = true;
+              retireOneRecordAtIndex(input.assistantMessageIndex, disposition.kind);
+            }
+          } else {
+            // `skip`/`cancel` carry the payload, so the kind is known exactly —
+            // no counting needed, and no cardinality condition either. Bailing
+            // when two records shared an index was the same defect the
+            // settlement path had: a real block cancelled at an index it shares
+            // with a notice, or one of a message's two blocks skipped by
+            // normalize, left a reservation pending for the whole turn and no
+            // later lane streamed anything.
+            retireOneRecordAtIndex(
+              input.assistantMessageIndex,
+              classifiedNotice ? "notice" : "block",
+            );
+          }
+          releaseReadyLanes();
+        },
+        undefined,
+      );
+    },
+    finalize: (text) => {
+      // Queue serialization would erase the fact that this call was made from
+      // inside the current lane's synchronous transport send. Capture only that
+      // call-stack fact; all reconciliation and state mutation stays queued.
+      const reentrantOrdinarySettle = ordinaryFinalSendInProgress;
+      return enqueue(
+        "ordinary answer final",
+        () => {
+          const active = currentLane();
+          if (reentrantOrdinarySettle) return false;
+          if (active.settleResult && active.settleOutcome === undefined) return false;
+          if (!text) {
+            terminalDrain(false);
+            return false;
+          }
+          if (
+            state.finalReconciliation.leadingTerminalErrorSeen ||
+            state.finalReconciliation.ordinaryAnswerSettled ||
+            active.settleOutcome !== undefined
+          ) {
+            return deliverTerminalIndependent(text);
+          }
+          terminalDrain(false);
+          state.finalReconciliation.ordinaryAnswerSettled = true;
+          active.answerText = text;
+          active.answerRevision += 1;
+          discardPendingProgress(
+            (frame) => frame.kind === "lane" && frame.generation === active.generation,
+          );
+          ordinaryFinalSendInProgress = true;
+          try {
+            return settleLane(active, text);
+          } finally {
+            ordinaryFinalSendInProgress = false;
+          }
+        },
+        false,
+      );
+    },
+    deliverIndependentFinal: (input) =>
+      enqueue(
+        "independent final delivery",
+        () => deliverTerminalIndependent(input.text),
+        false,
+      ),
+    noteLeadingTerminalError: () => {
+      void enqueue(
+        "leading terminal error",
+        () => {
+          if (!state.finalReconciliation.ordinaryAnswerSettled) {
+            state.finalReconciliation.leadingTerminalErrorSeen = true;
+          }
+        },
+        undefined,
+      );
+    },
+    drain: () =>
+      enqueue(
+        "terminal draft drain",
+        () => {
+          if (state.stopped) return;
+          clearProgressTimer();
+          clearEmptyPredecessorTimer();
+          state.pendingProgress = undefined;
+          terminalDrain(true);
+        },
+        undefined,
+      ),
+    snapshotText: () => currentLane().answerText,
+    flush: () => enqueue("progress flush", flushPendingProgress, undefined),
     stop: () => {
-      // Halt the throttled loop so no late background flush can race cleanup.
-      // Does NOT send a terminal frame; callers that need the widget to settle
-      // a working bubble should use finalize(text) instead.
-      stopped = true;
-      loop.stop();
+      void enqueue(
+        "draft stop",
+        () => {
+          state.stopped = true;
+          clearProgressTimer();
+          clearEmptyPredecessorTimer();
+          state.pendingProgress = undefined;
+        },
+        undefined,
+      );
     },
   };
 }
