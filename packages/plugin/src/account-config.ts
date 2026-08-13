@@ -420,32 +420,46 @@ export function resolveTypingEnabled(accountConfig: WebchannelAccountConfig): bo
  * under the account override — pass a config already resolved via
  * `resolveWebchannelAccountConfig`), exactly like `resolveTypingEnabled` above.
  *
- * DEFAULT OFF, and deliberately the opposite polarity to `typing`. Reasoning is
- * model-internal deliberation, not a UI affordance: it can restate file contents,
- * credentials, or a user's private prompt, and browser peers are the least
- * trusted surface this plugin serves. An operator must therefore opt IN per
- * deployment. `typing` defaults ON because an omitted key there means "keep the
- * legacy behaviour"; there is no legacy reasoning behaviour to keep — the lane
- * has never once emitted to a browser peer.
+ * DEFAULT ON — an ABSENT key enables the lane. The consumer already ships the
+ * reasoning UI, so a deployment that has not hand-edited its config renders an
+ * empty Reasoning shell on every turn; that empty shell is the exact symptom
+ * #113 exists to remove, and defaulting OFF would have left it in place for
+ * everyone who never read this file.
  *
- * STRICTLY BOOLEAN `true`. Any other value — absent, `false`, `"true"`, `"on"`,
- * `1` — resolves OFF. A truthiness test would turn the string `"off"` (the
- * spelling an operator who copied `capabilities.typing` would reach for first)
- * into ON, i.e. silently enabling the lane for someone trying to disable it. The
- * JSON schema rejects that spelling, but this resolver must not depend on the
- * schema having been applied — `resolveTypingEnabled` documents the same rule.
+ * The rule is `absent → ON; present-and-not-boolean-true → OFF`, NOT a `!== false`
+ * truthiness test. That distinction is the whole safety argument and it survives
+ * the default flip intact:
  *
- * Note this is only the OPERATOR half of the gate. Reasoning also requires the
+ *   - `capabilities.typing` next door spells its values `"on"` / `"off"`, so
+ *     `reasoning: "off"` is the FIRST thing an operator copying the sibling key
+ *     reaches for when they want the lane disabled;
+ *   - under `!== false` that string is truthy and would KEEP reasoning on, i.e.
+ *     silently defeat the operator's intent — and now in the privacy-losing
+ *     direction, because reasoning can restate file contents, credentials, or the
+ *     user's own prompt to the least trusted surface this plugin serves;
+ *   - so every PRESENT value that is not boolean `true` fails CLOSED: `false`,
+ *     `"off"`, `"false"`, `"true"`, `"on"`, `0`, `1`, `null`. Someone who typed
+ *     something gets the safe reading of it; only someone who typed NOTHING gets
+ *     the new default.
+ *
+ * The JSON schema rejects the string spellings, but this resolver must not depend
+ * on the schema having been applied — `resolveTypingEnabled` documents the same
+ * rule.
+ *
+ * Note this is only the CHANNEL half of the gate. Reasoning also requires the
  * model's own thinking level to be something other than "off" (`canShowReasoning`
- * in core), which no amount of channel config can force. That precondition is
- * why enabling this key must surface a diagnostic rather than silently producing
- * an empty lane — see the turn-scoped warning owed by the wiring change.
+ * in core), which no amount of channel config can force. That precondition is why
+ * an opened-but-silent lane surfaces a diagnostic rather than an empty section —
+ * see the turn-scoped warning in inbound.ts.
  */
 export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig): boolean {
   const capabilities = accountConfig?.capabilities as
     | { reasoning?: unknown }
     | undefined;
-  return capabilities?.reasoning === true;
+  const value = capabilities?.reasoning;
+  // Absent → the new default ON. Present → strictly boolean `true`, everything
+  // else fails closed (see the docblock: `reasoning: "off"` must never mean on).
+  return value === undefined ? true : value === true;
 }
 
 /** Read an account's merged `nats` config block (for credential-source resolution). */

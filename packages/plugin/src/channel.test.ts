@@ -17,23 +17,32 @@ import {
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
 } from "./inbound.js";
-import { resolveWebchannelReasoningLevel } from "./reasoning-level.js";
+// Reasoning display policy is CHANNEL-PRIVATE config (#113): the lane opens
+// unless `channels.webchannel.capabilities.reasoning` is PRESENT and not boolean
+// `true` (account-config.ts). These channel tests exercise the callback WIRING
+// per streaming mode, so they steer the lane through that REAL config key via
+// `channelConfig` — there is no resolver mock.
+//
+// The default is ON, so a test that wants the lane SHUT must say so explicitly:
+// `REASONING_OFF` exists because omitting the key no longer means off, and a
+// test isolating some other axis would otherwise silently acquire a reasoning
+// lane it never intended to assert about.
+const REASONING_ON = { capabilities: { reasoning: true } } as const;
+const REASONING_OFF = { capabilities: { reasoning: false } } as const;
 
-// Reasoning display policy is resolved from the session store / config default in
-// production (reasoning-level.ts, Telegram parity). These channel tests exercise
-// the callback WIRING per streaming mode + reasoning level, so we mock the
-// resolver to drive the level deterministically. Default is "off" — matching the
-// real default — so the reasoning lane is NOT wired unless a test opts into
-// "stream".
-vi.mock("./reasoning-level.js", () => ({
-  resolveWebchannelReasoningLevel: vi.fn(() => "off"),
-}));
-const mockReasoningLevel = vi.mocked(resolveWebchannelReasoningLevel);
+/** The #113 empty-lane diagnostic, picked out of everything else a turn logs. */
+function reasoningWarningsIn(warn: { mock: { calls: any[][] } }) {
+  return warn.mock.calls.filter((call) =>
+    String(call[0]).includes("reasoning lane received no frames"),
+  );
+}
 
-beforeEach(() => {
-  mockReasoningLevel.mockReset();
-  mockReasoningLevel.mockReturnValue("off");
-});
+/** The outcome a turn settled with, read off the transport's turn_settled call. */
+function settleOutcomeFor(transport: any, turnId: string): string | undefined {
+  return transport.sendTurnSettled.mock.calls.find(
+    (call: unknown[]) => call[1] === turnId,
+  )?.[2];
+}
 
 describe("account lifecycle composition", () => {
   const context = (abortSignal: AbortSignal) => ({
@@ -335,6 +344,11 @@ describe("webchannel inbound round-trip", () => {
         kind: "block" | "final",
       ) => void;
       lifecyclePhase?: "end" | "error";
+      // #113: stamp `aborted` on the lifecycle terminal, the way core does for a
+      // user /stop. Either phase can carry it (#89), and it is what separates a
+      // cancelled turn from a failed one — both of which legitimately produce
+      // zero reasoning frames.
+      abortedTerminal?: boolean;
       reasoningSteps?: Array<{
         text: string;
         isReasoningSnapshot?: boolean;
@@ -487,7 +501,7 @@ describe("webchannel inbound round-trip", () => {
                 listener({
                   stream: "lifecycle",
                   runId: testRunId,
-                  data: { phase: opts.lifecyclePhase },
+                  data: { phase: opts.lifecyclePhase, aborted: opts.abortedTerminal === true },
                 });
               }
             }
@@ -502,7 +516,7 @@ describe("webchannel inbound round-trip", () => {
               listener({
                 stream: "lifecycle",
                 runId: testRunId,
-                data: { phase: opts.lifecyclePhase },
+                data: { phase: opts.lifecyclePhase, aborted: opts.abortedTerminal === true },
               });
             }
           }
@@ -542,7 +556,12 @@ describe("webchannel inbound round-trip", () => {
     const transport = new FakePeerChannel();
     const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(false);
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
-    const { api } = makeFakeApi(captured);
+    // Reasoning explicitly OFF so `warn` has exactly one possible source and the
+    // strict once-only assertion below stays meaningful. Since #113 the reasoning
+    // lane defaults ON, and this answered turn streams no reasoning, so an
+    // unconfigured account would ALSO emit the empty-lane diagnostic here — a
+    // second, legitimate warning that has nothing to do with turn_settled.
+    const { api } = makeFakeApi(captured, { channelConfig: { ...REASONING_OFF } });
     const warn = vi.fn();
     api.logger.warn = warn;
     await handleInboundMessage(api, transport, "web-anon", {
@@ -2475,7 +2494,11 @@ describe("webchannel inbound round-trip", () => {
     let seenReplyOptions: any = "unset";
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     const { api } = makeFakeApi(captured, {
-      channelConfig: { streaming: { mode: "block" } },
+      // Reasoning explicitly OFF: this test isolates the ANSWER streaming mode,
+      // and since #113 flipped the reasoning default to ON an unconfigured
+      // account would open a reasoning lane and add callbacks this exact-match
+      // assertion is not about.
+      channelConfig: { ...REASONING_OFF, streaming: { mode: "block" } },
       fireToolProgress: true,
       partialTexts: ["should not stream"],
       onReplyOptions: (ro) => {
@@ -2488,8 +2511,10 @@ describe("webchannel inbound round-trip", () => {
       text: "hello",
     });
 
-    // No answer/tool draft AND reasoning level is the default "off": neither
-    // lane is active, so replyOptions carries nothing but the #87 run-id hook.
+    // No answer/tool draft AND reasoning turned off: neither lane is active, so
+    // replyOptions carries nothing but the #87 run-id hook. In particular no
+    // `streamReasoningInNonStreamModes` — we never ask core to emit reasoning
+    // for an account that opted out.
     // That hook is wired on EVERY turn — it is how the turn learns which agent
     // run's lifecycle terminal decides its `turn_settled` outcome — so unlike
     // the draft/reasoning callbacks it is not conditional on a streaming mode.
@@ -2499,17 +2524,16 @@ describe("webchannel inbound round-trip", () => {
     expect(sendTextSpy).toHaveBeenCalledWith("web-anon", "hi back", undefined, expect.any(String));
   });
 
-  it("streaming.mode=block with reasoning level 'stream' wires ONLY the reasoning callbacks (no tool/answer draft)", async () => {
+  it("streaming.mode=block with capabilities.reasoning wires ONLY the reasoning callbacks (no tool/answer draft)", async () => {
     const transport = new FakePeerChannel();
     const sendTextSpy = vi.spyOn(transport, "sendText").mockReturnValue(true);
     const progressSpy = vi.spyOn(transport, "sendProgress").mockReturnValue(true);
     const finalizeSpy = vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
-    mockReasoningLevel.mockReturnValue("stream");
 
     let seenReplyOptions: any = "unset";
     const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
     const { api } = makeFakeApi(captured, {
-      channelConfig: { streaming: { mode: "block" } },
+      channelConfig: { ...REASONING_ON, streaming: { mode: "block" } },
       fireToolProgress: true,
       partialTexts: ["should not stream"],
       onReplyOptions: (ro) => {
@@ -2524,8 +2548,14 @@ describe("webchannel inbound round-trip", () => {
 
     // Reasoning lane opened, but no answer/tool draft in block mode: replyOptions
     // carries ONLY the reasoning callbacks — no tool/answer callbacks, no suppression.
+    //
+    // `streamReasoningInNonStreamModes: true` rides WITH the open lane. This is
+    // the #113 lever: core suppresses reasoning on this dispatch path without it,
+    // so asserting the callbacks alone would pass while the lane stayed empty in
+    // production — which is exactly the failure that shipped.
     expect(seenReplyOptions).toEqual({
       onAgentRunStart: expect.any(Function),
+      streamReasoningInNonStreamModes: true,
       onReasoningStream: expect.any(Function),
       onReasoningEnd: expect.any(Function),
     });
@@ -2535,15 +2565,14 @@ describe("webchannel inbound round-trip", () => {
   });
 
   it.each(["off", "block", "progress", "partial"] as const)(
-    "streams reasoning independently of the answer streaming mode when the level is 'stream' (mode=%s)",
+    "streams reasoning independently of the answer streaming mode when capabilities.reasoning is on (mode=%s)",
     async (mode) => {
       const transport = new FakePeerChannel();
       const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
       const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
-      mockReasoningLevel.mockReturnValue("stream");
       const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
       const { api } = makeFakeApi(captured, {
-        channelConfig: { streaming: { mode } },
+        channelConfig: { ...REASONING_ON, streaming: { mode } },
         reasoningSteps: [{ text: "safe" }],
       });
 
@@ -2565,20 +2594,59 @@ describe("webchannel inbound round-trip", () => {
     },
   );
 
-  it.each(["off", "on"] as const)(
-    "does NOT wire the reasoning lane when the resolved level is '%s' (Telegram parity: only 'stream' streams)",
-    async (level) => {
-      // btw emits reasoning upstream at level "on" too (dist/btw-CDO5476N.js:617-627),
-      // but the webchannel display policy — like Telegram — streams reasoning ONLY
-      // at "stream". At "off"/"on" no reasoning callback is wired and no frame is sent.
+  it("wires the reasoning lane by DEFAULT when capabilities.reasoning is omitted (#113 decision ①)", async () => {
+    // The default flip, asserted end to end through a real turn. The consumer
+    // ships the reasoning UI, so a deployment that never edited its config must
+    // get real frames instead of an empty shell — that shell is the symptom
+    // #113 exists to remove.
+    const transport = new FakePeerChannel();
+    const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+    let seenReplyOptions: any = "unset";
+    const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+    const { api } = makeFakeApi(captured, {
+      channelConfig: { streaming: { mode: "partial" } },
+      reasoningSteps: [{ text: "safe" }],
+      onReplyOptions: (ro) => {
+        seenReplyOptions = ro;
+      },
+    });
+
+    await handleInboundMessage(api, transport, "web-anon", {
+      type: "user_message",
+      id: "turn-42",
+      text: "hello",
+    });
+
+    expect(seenReplyOptions?.onReasoningStream).toEqual(expect.any(Function));
+    expect(seenReplyOptions?.streamReasoningInNonStreamModes).toBe(true);
+    expect(reasoningSpy).toHaveBeenCalledWith("web-anon", expect.any(String), "turn-42", "safe");
+  });
+
+  it.each([
+    ["false", { reasoning: false }],
+    ["the string 'off'", { reasoning: "off" }],
+    ["the string 'on'", { reasoning: "on" }],
+    ["the string 'true'", { reasoning: "true" }],
+  ] as const)(
+    "does NOT wire the reasoning lane when capabilities.reasoning is %s",
+    async (_label, capabilities) => {
+      // The resolver's full value-space is account-config.test.ts's job; what
+      // this covers is the WIRING consequence of a PRESENT non-`true` value, end
+      // to end through a real turn.
+      //
+      // The string spellings carry the weight now that the default is ON. The
+      // gate must be `absent → ON; present-and-not-true → OFF`, never `!== false`:
+      // `reasoning: "off"` is what an operator copying the `capabilities.typing`
+      // sibling types when they want the lane SHUT, and under a `!== false` test
+      // it would stay on — defeating their intent in the privacy-losing
+      // direction. That regression goes red here.
       const transport = new FakePeerChannel();
       const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
       const settledSpy = vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
-      mockReasoningLevel.mockReturnValue(level);
       let seenReplyOptions: any = "unset";
       const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
       const { api } = makeFakeApi(captured, {
-        channelConfig: { streaming: { mode: "partial" } },
+        channelConfig: { capabilities, streaming: { mode: "partial" } },
         reasoningSteps: [{ text: "safe" }],
         onReplyOptions: (ro) => {
           seenReplyOptions = ro;
@@ -2595,11 +2663,535 @@ describe("webchannel inbound round-trip", () => {
       // just not the reasoning lane) and no reasoning frame emitted.
       expect(seenReplyOptions?.onReasoningStream).toBeUndefined();
       expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
+      // And core is never asked to emit reasoning we would only discard.
+      expect(seenReplyOptions?.streamReasoningInNonStreamModes).toBeUndefined();
       expect(reasoningSpy).not.toHaveBeenCalled();
       // turn_settled still fires — it is a lifecycle frame, not a reasoning frame.
       expect(settledSpy).toHaveBeenCalledWith("web-anon", "turn-42", "ok");
     },
   );
+
+  // ── #113 reasoning-lane diagnostics ──────────────────────────────────────
+  // Grouped so the latch reset below is scoped to the tests that need it. The
+  // empty-lane warning latches per account per PROCESS, i.e. module state shared
+  // by every test in this file, and with the lane defaulting ON plenty of
+  // unrelated turns qualify to latch it — so without a reset these assertions
+  // would pass or fail on test ORDER.
+  //
+  // `stopAgentLifecycleSubscription` is the production re-arm seam and clears it,
+  // but it also rotates the #93 approval-origin epoch. That is a far wider reset
+  // than this needs, so it is confined to this block rather than run before all
+  // ~120 tests in the file; every test outside keeps its own #93 preconditions.
+  describe("reasoning lane diagnostics (#113)", () => {
+    beforeEach(() => {
+      stopAgentLifecycleSubscription();
+    });
+
+    it("does NOT open the reasoning lane on the control (/stop) lane even with capabilities.reasoning on (#113)", async () => {
+      // Two guards crossing: the account opted IN, and the turn is an abort. An
+      // abort is not the agent deliberating — it cancels the turn already in
+      // flight — so it must never stream reasoning, and must never ask core to
+      // emit any. Nor may it fire the empty-lane warning, which would then go off
+      // on every /stop in an opted-in deployment.
+      const transport = new FakePeerChannel();
+      const reasoningSpy = vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      // Same as every sibling here: without these the control-lane turn delivers
+      // nothing, and the answer-delivered guard alone would suppress the warning —
+      // so the assertion would pass without the `!controlLane` term ever being
+      // exercised. It has to be the LANE that is shut, not the answer that is
+      // missing.
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      let seenReplyOptions: any = "unset";
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        lifecyclePhase: "end",
+        reasoningSteps: [{ text: "safe" }],
+        onReplyOptions: (ro) => {
+          seenReplyOptions = ro;
+        },
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      await handleInboundMessage(
+        api,
+        transport,
+        "web-anon",
+        { type: "user_message", id: "turn-stop", text: "/stop" },
+        "default",
+        { controlLane: true },
+      );
+
+      expect(seenReplyOptions?.onReasoningStream).toBeUndefined();
+      expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
+      expect(seenReplyOptions?.streamReasoningInNonStreamModes).toBeUndefined();
+      expect(reasoningSpy).not.toHaveBeenCalled();
+      // Via the shared helper — the previous hand-rolled filter searched for
+      // "produced no frames" while the code logs "received no frames", so it
+      // matched nothing and the assertion was `expect([]).toHaveLength(0)`:
+      // unconditionally true, and the control-lane guard had no coverage at all.
+      expect(reasoningWarningsIn(warn)).toHaveLength(0);
+    });
+
+    it("warns when an enabled reasoning lane receives no frames (#113)", async () => {
+      // The diagnostic `capabilities.reasoning` owes its operator. Opening the lane
+      // is only the CHANNEL half of the gate; core's `canShowReasoning`
+      // (thinkingLevel !== "off") is an independent precondition no channel config
+      // can force. Without this warning that combination is silent: the turn
+      // settles `ok`, the answer arrives, and the Reasoning section is just empty.
+      const transport = new FakePeerChannel();
+      // The answer must actually reach the peer: the warning is about a delivered
+      // answer with an empty Reasoning section next to it, so it is gated on
+      // `finalReplyDelivered`, and NullPeerChannel.sendText returns false.
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      // Partial mode delivers the final through the DRAFT, not sendText; both are
+      // mocked so the turn looks like a real delivered answer end to end. The
+      // warning's guard is `answerDelivered` (an ordinary, non-notice final was
+      // produced), which does not depend on transport success — but a test
+      // asserting "no warning" must not be able to pass merely because nothing
+      // landed, so these stay.
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      // `reasoningSteps` omitted: the lane opens and core never calls it, which is
+      // exactly what a non-reasoning agent looks like from this side.
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        // #113: a real `ok` lifecycle verdict. The warning requires
+        // `verdict === "ok"` — a POSITIVE test, so an unwired `runtime.events`
+        // (verdict `undefined`) no longer reaches it. Without this the test would
+        // be asserting the warning fires on a path where we cannot actually claim
+        // the turn completed normally.
+        lifecyclePhase: "end",
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      const reasoningWarnings = warn.mock.calls.filter((call) =>
+        String(call[0]).includes("reasoning lane received no frames"),
+      );
+      expect(reasoningWarnings).toHaveLength(1);
+      const text = String(reasoningWarnings[0]?.[0]);
+      // Actionable: names the key and the turn, and points at the thinking level.
+      expect(text).toContain("capabilities.reasoning");
+      expect(text).toContain("thinking");
+      expect(text).toContain("turn-42");
+      // But it must NOT claim to have observed the thinking level. The plugin
+      // cannot see it, and an operator who already set thinking to "medium" would
+      // be sent hunting a misconfiguration that does not exist. Hedged wording
+      // plus the second possible cause are both required.
+      expect(text).not.toMatch(/thinking level (is|resolved to) "off"/);
+      expect(text).toMatch(/most often|likely|usually/i);
+      expect(text).toMatch(/models?\/providers?|some models/i);
+      // And it must say it is latched, so an operator reading a single line does
+      // not conclude the problem occurred exactly once.
+      expect(text).toMatch(/once per account per process/i);
+    });
+
+    it("latches the empty-lane warning to ONCE PER ACCOUNT, not once per turn (#113)", async () => {
+      // Two qualifying turns on ONE account produce ONE warning. Per-turn scoping
+      // was the first cut; with `capabilities.reasoning` defaulting ON, a model
+      // that simply never reasons made it fire on every answered turn forever,
+      // which gets the diagnostic filtered out of the log pipeline and so stops it
+      // informing anyone at all.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        // #113: a real `ok` lifecycle verdict. The warning requires
+        // `verdict === "ok"` — a POSITIVE test, so an unwired `runtime.events`
+        // (verdict `undefined`) no longer reaches it. Without this the test would
+        // be asserting the warning fires on a path where we cannot actually claim
+        // the turn completed normally.
+        lifecyclePhase: "end",
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      for (const id of ["turn-1", "turn-2"]) {
+        await handleInboundMessage(api, transport, "web-anon", {
+          type: "user_message",
+          id,
+          text: "hello",
+        });
+      }
+
+      const warnings = reasoningWarningsIn(warn);
+      expect(warnings).toHaveLength(1);
+      // The one that survived is the FIRST turn's — the latch suppresses later
+      // turns rather than replacing the message.
+      expect(String(warnings[0]?.[0])).toContain("turn-1");
+    });
+
+    it("latches PER ACCOUNT — a second account still gets its own warning (#113)", async () => {
+      // The latch must not silence a whole deployment because one account already
+      // reported. Accounts are configured independently and can differ in exactly
+      // the setting this warning is about.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: {
+          ...REASONING_ON,
+          streaming: { mode: "partial" },
+          accounts: { acctA: {}, acctB: {} },
+        },
+        lifecyclePhase: "end",
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      for (const accountId of ["acctA", "acctA", "acctB"]) {
+        await handleInboundMessage(
+          api,
+          transport,
+          "web-anon",
+          { type: "user_message", id: `turn-${accountId}`, text: "hello" },
+          accountId,
+        );
+      }
+
+      const warnings = reasoningWarningsIn(warn).map((call) => String(call[0]));
+      expect(warnings).toHaveLength(2);
+      expect(warnings[0]).toContain("account=acctA");
+      expect(warnings[1]).toContain("account=acctB");
+    });
+
+    it("re-arms the empty-lane latch on teardown, so a reload can report again (#113)", async () => {
+      // Teardown is where config changes land. An operator who just edited their
+      // config and reloaded must be told again whether it worked, otherwise the
+      // once-per-process latch would make the diagnostic unfalsifiable.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        // #113: a real `ok` lifecycle verdict. The warning requires
+        // `verdict === "ok"` — a POSITIVE test, so an unwired `runtime.events`
+        // (verdict `undefined`) no longer reaches it. Without this the test would
+        // be asserting the warning fires on a path where we cannot actually claim
+        // the turn completed normally.
+        lifecyclePhase: "end",
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      const turn = (id: string) =>
+        handleInboundMessage(api, transport, "web-anon", {
+          type: "user_message",
+          id,
+          text: "hello",
+        });
+
+      await turn("turn-1");
+      await turn("turn-2");
+      expect(reasoningWarningsIn(warn)).toHaveLength(1);
+
+      // A reload: teardown, then the new generation re-registers. Restarting the
+      // subscription is not incidental — the warning needs a real `ok` verdict, and
+      // teardown dropped the listener that produces one.
+      stopAgentLifecycleSubscription();
+      startAgentLifecycleSubscription(api);
+      await turn("turn-3");
+
+      const warnings = reasoningWarningsIn(warn).map((call) => String(call[0]));
+      expect(warnings).toHaveLength(2);
+      expect(warnings[1]).toContain("turn-3");
+    });
+
+    it("does NOT re-arm the latch when a lifecycle subscription merely (re)starts (#113)", async () => {
+      // `startAgentLifecycleSubscription` tears the old listener down to avoid
+      // stacking, and `registerFull` runs it per plugin generation. When the
+      // re-arm lived in the shared teardown, STARTING one account's runtime
+      // cleared another account's latch — so "once per process" silently became
+      // "once per subscription start", and a multi-account host would repeat the
+      // warning. Only a real teardown may re-arm.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        lifecyclePhase: "end",
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      const turn = (id: string) =>
+        handleInboundMessage(api, transport, "web-anon", {
+          type: "user_message",
+          id,
+          text: "hello",
+        });
+
+      await turn("turn-1");
+      expect(reasoningWarningsIn(warn)).toHaveLength(1);
+
+      // A restart, NOT a teardown.
+      startAgentLifecycleSubscription(api);
+      await turn("turn-2");
+
+      expect(reasoningWarningsIn(warn)).toHaveLength(1);
+    });
+
+    it("does NOT warn when the enabled reasoning lane actually received a frame (#113)", async () => {
+      // Guards the other half: a warning that fires on healthy turns is noise that
+      // teaches operators to ignore it.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendReasoning").mockReturnValue(true);
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      // Partial mode delivers the final through the DRAFT, not sendText; both are
+      // mocked so the turn looks like a real delivered answer end to end. The
+      // warning's guard is `answerDelivered` (an ordinary, non-notice final was
+      // produced), which does not depend on transport success — but a test
+      // asserting "no warning" must not be able to pass merely because nothing
+      // landed, so these stay.
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        reasoningSteps: [{ text: "safe" }],
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningWarningsIn(warn)).toHaveLength(0);
+    });
+
+    it("does NOT warn about an empty reasoning lane when the lane never opened (#113)", async () => {
+      // An account that opted OUT has no empty lane to complain about.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      // Partial mode delivers the final through the DRAFT, not sendText; both are
+      // mocked so the turn looks like a real delivered answer end to end. The
+      // warning's guard is `answerDelivered` (an ordinary, non-notice final was
+      // produced), which does not depend on transport success — but a test
+      // asserting "no warning" must not be able to pass merely because nothing
+      // landed, so these stay.
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_OFF, streaming: { mode: "partial" } },
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningWarningsIn(warn)).toHaveLength(0);
+    });
+
+    // ── The two guard crossings (#113 review round 1) ────────────────────────
+    // A turn can legitimately produce zero reasoning frames without anything
+    // being misconfigured. Each of these is an individually-correct guard (the
+    // lane opened; the turn did not complete normally) meeting the other, which
+    // is where this repo's defects live. A test that exercises only the warning
+    // cannot see this class — it needs the crossing.
+
+    it("does NOT warn when the lane opened but the USER ABORTED the turn (#113)", async () => {
+      // /stop before the model reasoned. Warning here would tell the user who
+      // just pressed Stop that their deployment is misconfigured.
+      //
+      // This fixture is the ONLY thing that exercises the `verdict !== "aborted"`
+      // veto, so it is deliberately built as the one case the other guards miss:
+      // an abort landing AFTER a real answer was delivered. `turnOutcome` is `ok`
+      // (#89 maps an abort to the settled outcome `ok` on purpose — a
+      // cancellation is not a failure) and `answerDelivered` is true (the default
+      // `hi back` final is an ordinary non-notice payload). Both other guards
+      // therefore pass, and only the veto suppresses the warning. Delete the veto
+      // and this test — and only this test — goes red.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      // Partial mode delivers the final through the DRAFT, not sendText; both are
+      // mocked so the turn looks like a real delivered answer end to end. The
+      // warning's guard is `answerDelivered` (an ordinary, non-notice final was
+      // produced), which does not depend on transport success — but a test
+      // asserting "no warning" must not be able to pass merely because nothing
+      // landed, so these stay.
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        lifecyclePhase: "end",
+        abortedTerminal: true,
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningWarningsIn(warn)).toHaveLength(0);
+      // The abort must still settle `ok` — #89's semantics are unchanged by the
+      // new verdict value. If widening AgentRunVerdict perturbed the outcome, this
+      // is where it shows.
+      expect(settleOutcomeFor(transport, "turn-42")).toBe("ok");
+      stopAgentLifecycleSubscription();
+    });
+
+    it("does NOT warn when the lane opened but the turn FAILED terminally (#113)", async () => {
+      // A provider error before the model emits anything. The empty lane is a
+      // consequence of the failure, not of config; the operator already has an
+      // error to act on and a second, wrong diagnosis is pure noise.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      // Partial mode delivers the final through the DRAFT, not sendText; both are
+      // mocked so the turn looks like a real delivered answer end to end. The
+      // warning's guard is `answerDelivered` (an ordinary, non-notice final was
+      // produced), which does not depend on transport success — but a test
+      // asserting "no warning" must not be able to pass merely because nothing
+      // landed, so these stay.
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      vi.spyOn(transport, "sendTurnSettled").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        lifecyclePhase: "error",
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningWarningsIn(warn)).toHaveLength(0);
+      expect(settleOutcomeFor(transport, "turn-42")).toBe("error");
+      stopAgentLifecycleSubscription();
+    });
+
+    it("DOES warn on an answered turn with no lifecycle verdict recorded (#113)", async () => {
+      // `runtime.events` is deliberately not wired, so `verdict` is `undefined`
+      // while the turn answers normally. This must still warn.
+      //
+      // Tightening the guard to `verdict === "ok"` was tried and is wrong.
+      // Measured on the live two-account gate: `acctb`'s turns are ordinary,
+      // successfully-answered turns carrying a real `agentRunId` for which the
+      // map holds no entry —
+      //
+      //   acct=accta … outcome=ok verdict=ok        answer=true -> warns
+      //   acct=acctb … outcome=ok verdict=undefined answer=true -> SILENT
+      //
+      // A missing verdict is NORMAL for a multi-account deployment today (only
+      // the last-registered account stays subscribed; filed separately, and not
+      // worked around here), so `=== "ok"` makes the diagnostic dead for every
+      // account but one. `answerDelivered` is the completion signal; `verdict` is
+      // only a veto on a positively-known abort.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      // No `lifecyclePhase`: makeFakeApi leaves `runtime.events` off entirely.
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningWarningsIn(warn)).toHaveLength(1);
+      expect(String(reasoningWarningsIn(warn)[0]?.[0])).toContain("turn-42");
+    });
+
+    it("does NOT warn when the turn's only final was a core NOTICE, not an answer (#113)", async () => {
+      // The `finalReplyDelivered` vs `answerDelivered` distinction, crossed with an
+      // open lane. `finalReplyDelivered` is set for ANY sent `kind === "final"`,
+      // notices included; `answerDelivered` deliberately excludes them, because
+      // core's status/fallback/compaction chatter is not the turn's answer. A turn
+      // whose only final is a compaction notice therefore has no answer on screen —
+      // no empty Reasoning section beside it to explain — and warning here would
+      // burn the account's one latched warning on a non-problem.
+      const transport = new FakePeerChannel();
+      vi.spyOn(transport, "sendText").mockReturnValue(true);
+      vi.spyOn(transport, "sendProgress").mockReturnValue(true);
+      vi.spyOn(transport, "finalizeDraft").mockReturnValue(true);
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        lifecyclePhase: "end",
+        finalPayloads: [
+          { text: "Context was compacted to free up space.", isCompactionNotice: true },
+        ],
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningWarningsIn(warn)).toHaveLength(0);
+    });
+
+    it("does NOT warn when the lane opened but no answer was delivered (#113)", async () => {
+      // Tool-only work, a suppressed reply, or a final the transport could not
+      // ship. With no answer on screen there is no empty Reasoning section beside
+      // it to explain. `sendText` is left at NullPeerChannel's `false` here, which
+      // is exactly the undelivered-final case.
+      const transport = new FakePeerChannel();
+      const captured: { recordedSessionKey?: string; recordedTo?: string } = {};
+      const { api } = makeFakeApi(captured, {
+        channelConfig: { ...REASONING_ON, streaming: { mode: "partial" } },
+        skipFinal: true,
+      });
+      const warn = vi.fn();
+      api.logger.warn = warn;
+
+      await handleInboundMessage(api, transport, "web-anon", {
+        type: "user_message",
+        id: "turn-42",
+        text: "hello",
+      });
+
+      expect(reasoningWarningsIn(warn)).toHaveLength(0);
+    });
+  });
+
 
   it("replaces a thrown tool-only turn's provisional preview with the independent apology", async () => {
     vi.useFakeTimers();

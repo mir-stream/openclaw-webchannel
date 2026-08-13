@@ -119,16 +119,23 @@ the layout, and streaming growth doesn't yank the viewport.
 
 **Classification.** ✅ Built. Native OpenClaw reasoning callbacks now travel on a dedicated,
 turn-correlated frame and render as collapsed `Reasoning` details independently of the answer
-streaming mode. Reasoning streams to the browser ONLY when the resolved session reasoning level is
-`stream` (default `off` via `agents.defaults.reasoningDefault`), matching the Telegram reference and
-fail-closed on a store-read error.
+streaming mode. Reasoning streams to the browser ONLY when this channel's own
+`capabilities.reasoning` is not switched off (default ON, #113) — a channel-private key, deliberately
+NOT `agents.*.reasoningDefault`, which core co-parses and invalidates for our unauthorized browser
+peers.
 
-**Where it stands today.** After route resolution `inbound.ts` resolves the session reasoning level
-(`reasoning-level.ts`, Telegram-parity: session-store level wins, throw → `off`, else config default)
-and wires `onReasoningStream` / `onReasoningEnd` ONLY when it is `stream` — in every answer mode
+**Where it stands today.** `inbound.ts` resolves `capabilities.reasoning` (`resolveReasoningEnabled`,
+`account-config.ts`; absent → ON, any present non-boolean-`true` value → OFF, merged channel base
+under account override) and wires `onReasoningStream` / `onReasoningEnd` ONLY when it is on — in every answer mode
 (`partial` / `progress` / `block` / `off`), while preserving existing mode-specific answer/tool
-callbacks. `ReasoningDraftController` normalizes cumulative/snapshot updates by REPLACE (verified: no
-pinned emitter sends a bare delta) and rotates bursts. Dedicated `reasoning` and `turn_settled` frames
+callbacks — together with `streamReasoningInNonStreamModes: true`, which is what makes core actually
+emit on this path (without it the lane opens and receives nothing). `ReasoningDraftController`
+normalizes cumulative/snapshot updates by REPLACE (verified: no
+pinned emitter sends a bare delta) and rotates bursts. An opened lane that ends its turn having
+received no payload logs one warning per account per process — suppressed on abort, terminal failure, and turns that
+delivered no answer, so it only fires where zero frames is genuinely surprising. It names the likely
+cause without asserting it: core's `canShowReasoning` (the agent's thinking level `!== "off"`) is an
+independent precondition the channel cannot observe or override, and some models emit no reasoning. Dedicated `reasoning` and `turn_settled` frames
 exist in both transports. Both clients keep bounded ephemeral reasoning state; the demo groups it by
 `turnId` between the matching user message and answer. It is not persisted.
 

@@ -181,14 +181,16 @@ describe("account-config: resolveTypingEnabled (P0-6)", () => {
 });
 
 describe("account-config: resolveReasoningEnabled (#113)", () => {
-  it("defaults OFF when capabilities is absent or empty", () => {
-    // The whole point of #113: the reasoning lane is unreachable UNLESS a
-    // deployment turned it on. An omitted key must never open it.
-    expect(resolveReasoningEnabled({})).toBe(false);
-    expect(resolveReasoningEnabled({ capabilities: {} })).toBe(false);
+  it("defaults ON when the key is absent (capabilities missing or empty)", () => {
+    // Decision ①: the consumer already ships the reasoning UI, so a deployment
+    // that never hand-edited its config would otherwise render an empty
+    // Reasoning shell on every turn — the exact symptom #113 removes.
+    expect(resolveReasoningEnabled({})).toBe(true);
+    expect(resolveReasoningEnabled({ capabilities: {} })).toBe(true);
+    expect(resolveReasoningEnabled({ capabilities: { typing: "on" } })).toBe(true);
   });
 
-  it("ON only for boolean true", () => {
+  it("ON for explicit boolean true", () => {
     expect(resolveReasoningEnabled({ capabilities: { reasoning: true } })).toBe(true);
   });
 
@@ -196,13 +198,16 @@ describe("account-config: resolveReasoningEnabled (#113)", () => {
     expect(resolveReasoningEnabled({ capabilities: { reasoning: false } })).toBe(false);
   });
 
-  it("OFF for every truthy non-boolean spelling, including the string 'off'", () => {
-    // Load-bearing. A truthiness test here would read the string "off" — the
-    // spelling an operator who copied `capabilities.typing` reaches for first —
-    // as ON, silently enabling the lane for someone trying to disable it. The
-    // JSON schema rejects these, but the resolver must not depend on the schema
-    // having been applied (same rule `resolveTypingEnabled` documents).
-    for (const value of ["off", "on", "true", "false", 1, 0, {}, []]) {
+  it("OFF for every PRESENT non-boolean-true value, including the string 'off'", () => {
+    // Load-bearing, and it survives the default flip. The rule is
+    // `absent → ON; present-and-not-true → OFF`, NOT `!== false`. Under `!== false`
+    // the string "off" — the spelling an operator who copied `capabilities.typing`
+    // reaches for first — is truthy and would KEEP the lane on, defeating the
+    // operator's intent in the privacy-losing direction. Every present value that
+    // is not boolean `true` must fail CLOSED. The JSON schema rejects these, but
+    // the resolver must not depend on the schema having been applied (same rule
+    // `resolveTypingEnabled` documents).
+    for (const value of ["off", "on", "true", "false", 1, 0, {}, [], null]) {
       expect(
         resolveReasoningEnabled({ capabilities: { reasoning: value } }),
         `reasoning: ${JSON.stringify(value)} must resolve OFF`,
@@ -210,15 +215,20 @@ describe("account-config: resolveReasoningEnabled (#113)", () => {
     }
   });
 
-  it("honors an account override true over an unset channel-level base (through the merge)", () => {
+  it("honors an account override false over an unset channel-level base (through the merge)", () => {
+    // Asserts the OFF direction on purpose. With the default now ON, an
+    // account override of `true` over an unset base would pass even if the merge
+    // dropped the key entirely — a false green. Only the `false` override can
+    // distinguish "the merge carried my value" from "the default happened to
+    // agree with me". Every merge case below is written the same way.
     const cfg = {
       channels: {
         webchannel: {
-          accounts: { acctA: { capabilities: { reasoning: true } } },
+          accounts: { acctA: { capabilities: { reasoning: false } } },
         },
       },
     };
-    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(true);
+    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
   });
 
   it("honors an account override false over a channel-level true base (through the merge)", () => {
@@ -235,37 +245,45 @@ describe("account-config: resolveReasoningEnabled (#113)", () => {
   });
 
   it("inherits the channel-level base when the account omits capabilities (shared-base merge)", () => {
+    // Base OFF, account silent: the deployment-wide opt-OUT must reach the
+    // account. A merge that dropped the base would fall back to the ON default
+    // and leak reasoning to every account that did not restate it.
     const cfg = {
       channels: {
         webchannel: {
-          capabilities: { reasoning: true },
+          capabilities: { reasoning: false },
           accounts: { acctA: { tenant: "t" } },
         },
       },
     };
-    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(true);
+    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
   });
 
-  it("keeps the base reasoning:true when the account sets OTHER capabilities (nested merge, no clobber)", () => {
+  it("keeps a base reasoning:false when the account sets OTHER capabilities (nested merge, no clobber)", () => {
     // Locks `capabilities` staying in NESTED_OBJECT_KEYS, same as the typing
-    // case above: an account touching a sibling capability must not silently
-    // drop the deployment's reasoning opt-in.
+    // case above: an account touching a SIBLING capability must not silently
+    // drop the deployment's reasoning opt-out and re-enable the lane by default.
     const cfg = {
       channels: {
         webchannel: {
-          capabilities: { reasoning: true },
+          capabilities: { reasoning: false },
           accounts: { acctA: { capabilities: { typing: "off" } } },
         },
       },
     };
-    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(true);
+    expect(resolveReasoningEnabled(resolveWebchannelAccountConfig(cfg, "acctA"))).toBe(false);
   });
 
   it("is independent of capabilities.typing in both directions", () => {
-    // The two capabilities have OPPOSITE defaults; a shared-default refactor
-    // would break exactly one of these.
-    expect(resolveReasoningEnabled({ capabilities: { typing: "on" } })).toBe(false);
-    expect(resolveTypingEnabled({ capabilities: { reasoning: true } })).toBe(true);
+    // Both now default ON, so the two resolvers agree on an absent key and this
+    // no longer discriminates by default alone. What it locks is that each reads
+    // its OWN key: setting one must not move the other off its default, and the
+    // two disagree on how a PRESENT string is read (typing accepts "on"/"off",
+    // reasoning fails closed on both).
+    expect(resolveReasoningEnabled({ capabilities: { typing: "off" } })).toBe(true);
+    expect(resolveTypingEnabled({ capabilities: { reasoning: false } })).toBe(true);
+    expect(resolveReasoningEnabled({ capabilities: { reasoning: "on" } })).toBe(false);
+    expect(resolveTypingEnabled({ capabilities: { typing: "on" } })).toBe(true);
   });
 });
 
