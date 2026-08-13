@@ -2598,7 +2598,7 @@ describe("webchannel inbound round-trip", () => {
     },
   );
 
-  it("routes durable isReasoning payloads as distinct bursts without answer duplication", async () => {
+  it("routes complete durable reasoning blocks without prefix loss or answer duplication", async () => {
     // This is delivery-contract coverage, not a synthetic core mode-resolution
     // harness: pinned core uses this delivery form when an authorized sender /
     // session resolves reasoning mode `on`. Drive the actual delivery adapter;
@@ -2612,8 +2612,8 @@ describe("webchannel inbound round-trip", () => {
     const { api } = makeFakeApi(captured, {
       channelConfig: { ...REASONING_ON, streaming: { mode: "block" } },
       steps: [
-        { deliverBlock: { text: "first durable thought", isReasoning: true } },
-        { deliverBlock: { text: "second durable thought", isReasoning: true } },
+        { deliverBlock: { text: "Plan", isReasoning: true } },
+        { deliverBlock: { text: "Plan carefully", isReasoning: true } },
         // A text-less durable reasoning payload is consumed safely and never
         // falls through into the ordinary answer transport.
         { deliverBlock: { isReasoning: true } },
@@ -2635,10 +2635,7 @@ describe("webchannel inbound round-trip", () => {
     expect(seenReplyOptions?.reasoningPayloadsEnabled).toBe(true);
     expect(reasoningSpy).toHaveBeenCalledTimes(2);
     const reasoningCalls = reasoningSpy.mock.calls;
-    expect(reasoningCalls.map((call) => call[3])).toEqual([
-      "first durable thought",
-      "second durable thought",
-    ]);
+    expect(reasoningCalls.map((call) => call[3])).toEqual(["Plan", "Plan carefully"]);
     expect(reasoningCalls[0]?.[1]).not.toBe(reasoningCalls[1]?.[1]);
     expect(reasoningCalls.every((call) => call[2] === "turn-durable-reasoning")).toBe(true);
     // The three reasoning deliveries are consumed (`false`); the ordinary final
@@ -2646,8 +2643,8 @@ describe("webchannel inbound round-trip", () => {
     expect(deliveryResults).toEqual([false, false, false, true]);
     const ordinaryTexts = sendTextSpy.mock.calls.map((call) => String(call[1]));
     expect(ordinaryTexts).toContain("hi back");
-    expect(ordinaryTexts).not.toContain("first durable thought");
-    expect(ordinaryTexts).not.toContain("second durable thought");
+    expect(ordinaryTexts).not.toContain("Plan");
+    expect(ordinaryTexts).not.toContain("Plan carefully");
   });
 
   it("does not let a cancelled reasoning block retire a same-index answer reservation", async () => {
@@ -2769,7 +2766,7 @@ describe("webchannel inbound round-trip", () => {
     });
     const reasoningOptOutStore = {
       resolveStorePath: vi.fn(() => "/tmp/webchannel-reasoning-store.json"),
-      loadSessionStore: vi.fn(() => ({})),
+      readFile: vi.fn(() => "{}"),
       resolveSessionStoreEntry: vi.fn(() => ({
         normalizedKey: "k",
         existing: { reasoningLevel: "off" },
@@ -2786,7 +2783,7 @@ describe("webchannel inbound round-trip", () => {
       { reasoningOptOutStore },
     );
 
-    expect(reasoningOptOutStore.loadSessionStore).toHaveBeenCalledOnce();
+    expect(reasoningOptOutStore.readFile).toHaveBeenCalledOnce();
     expect(seenReplyOptions?.onReasoningStream).toBeUndefined();
     expect(seenReplyOptions?.onReasoningEnd).toBeUndefined();
     expect(seenReplyOptions?.streamReasoningInNonStreamModes).toBeUndefined();

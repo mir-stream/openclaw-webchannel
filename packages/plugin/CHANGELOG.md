@@ -37,7 +37,9 @@
   - **Opt out with `"capabilities": { "reasoning": false }`** in the webchannel
     block (channel-level, or per account under `accounts.<id>`). A persisted,
     explicit session `/reasoning off` also remains a privacy veto for peers an
-    operator has authorized through core's command allowlist.
+    operator has authorized through core's command allowlist. The veto reads one
+    verified session-store snapshot: only a missing file means empty state;
+    every other read, parse, or store-shape failure closes the lane.
   - Consider whether you want this before upgrading. Reasoning is model-internal
     deliberation, not a UI affordance: it can restate file contents, credentials,
     or the user's own prompt, and browser peers are the least trusted surface
@@ -50,6 +52,9 @@
     values there fail closed at the runtime resolver instead.
   - Enabling is necessary but not sufficient — the agent's own thinking level
     must also be something other than `"off"`, which no channel config can force.
+    Authorized mode-`on` sessions receive core's complete durable reasoning
+    blocks at full length under distinct ids; they never enter the answer path or
+    the live stream's cumulative-prefix normalization.
     When an enabled lane completes a normal turn having received nothing, the
     plugin logs one warning per account per process naming that as the likely
     cause.

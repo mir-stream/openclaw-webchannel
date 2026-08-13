@@ -92,8 +92,10 @@ combination is diagnosed instead of showing an empty section.
   of calling `onReasoningStream`. The public `reasoningPayloadsEnabled` reply
   option admits those payloads only for channels with a separate lane. WebChannel
   enables it with the lane, intercepts those payloads at `delivery.deliver`, and
-  feeds their text into the same `ReasoningDraftController`; they never enter the
-  ordinary answer path or its draft reservations.
+  feeds each one to the controller's complete-durable-block operation; they never
+  enter the ordinary answer path or its draft reservations. That operation emits
+  each full block under a distinct id and does not apply the live callback's btw
+  stale-prefix normalization.
 - Plugin and client wire unions independently declare frame shapes. A new frame
   must be added to every declaration; importing the Node-side plugin contract
   into the zero-dependency browser client is intentionally avoided.
@@ -147,8 +149,13 @@ persists `sessionEntry.reasoningLevel="off"` and acknowledges that visibility is
 disabled. Because the non-stream lever otherwise streams core mode `off`, the
 plugin must honor that explicit stored choice. An absent entry and explicit
 `on`/`stream` do not veto, so unauthorized peers with core's synthesized `off`
-still get the channel-owned default. A store-read error fails closed. The helper
-never reads `agents.*.reasoningDefault`.
+still get the channel-owned default. The helper resolves the configured store
+path, reads and parses one raw snapshot, then gives that same verified object to
+pinned core's `resolveSessionStoreEntry` for target/alias resolution. `ENOENT`
+means an empty store; every other read error, empty/malformed JSON, or invalid
+top-level/entry shape fails closed. Core's `loadSessionStore` is deliberately not used
+because it converts those failures to `{}`. The helper never reads
+`agents.*.reasoningDefault`.
 
 `streamReasoningInNonStreamModes: true` and `reasoningPayloadsEnabled: true` are
 passed ONLY on turns where the lane is open. The first makes core emit live
@@ -418,8 +425,9 @@ silently enable tool progress or answer partials.
 - **Persisted explicit session reasoning level `off`:** the privacy veto closes
   the lane before reply options are assembled.
 - **Reasoning level `on`:** core emits durable `isReasoning:true` payloads. The
-  delivery seam consumes them into the dedicated lane, excluding them from
-  ordinary answer text, answer completion accounting, and draft reservations.
+  delivery seam consumes each as one complete dedicated-lane block with its full
+  text and a distinct id, excluding it from ordinary answer text, answer
+  completion accounting, draft reservations, and live stale-prefix state.
 - **Reasoning before answer (level `stream`):** lane appears; answer later follows
   its existing path. The textual typing indicator is hidden while reasoning is
   visible, but the internal turn-control signal stays active.
@@ -508,7 +516,7 @@ silently enable tool progress or answer partials.
 | Level `stream`, `block` mode | Reasoning lane plus atomic final answer; Stop remains armed |
 | Level `stream`, `off` mode | Same as block; proves answer-mode independence |
 | Persisted explicit level `off` (any mode) | Session privacy veto closes the lane |
-| Level `on` (any mode) | Durable `isReasoning` payloads become distinct dedicated-lane bursts; no answer duplication |
+| Level `on` (any mode) | Durable `isReasoning` payloads become complete distinct dedicated-lane blocks; shared prefixes remain intact; no answer duplication |
 | Core-synthesized mode `off` with no stored opt-out | Non-stream lever can emit live reasoning through the channel-owned lane |
 | No reasoning callback | No empty `Reasoning` UI |
 | Snapshot updates | Text replaces without duplication |
@@ -521,7 +529,8 @@ silently enable tool progress or answer partials.
 | Settlement frame lost, then reconnect | Reconnect clears stale activity |
 | Two consecutive turns | Each reasoning group stays with its own answer |
 | History prepend during live turn | Live reasoning keeps its turn placement |
-| Store-read error during level resolution | Fail-closed to `off`; no reasoning lane |
+| Missing session store | Empty state; no explicit-off veto |
+| Non-ENOENT read error, empty/malformed JSON, or invalid store/entry shape | Fail-closed to `off`; no reasoning lane |
 | More than 100 bursts | Oldest/orphaned reasoning is bounded and pruned |
 | Expanded lane receives update | Remains expanded |
 | Hostile markdown/HTML | Inert text/safe markdown DOM |

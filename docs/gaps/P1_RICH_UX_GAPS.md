@@ -128,14 +128,18 @@ peers — and no persisted explicit session `/reasoning off` veto exists.
 `account-config.ts`; absent → ON, any present non-boolean-`true` value or malformed capabilities
 container → OFF, merged channel base under account override), then preserves a persisted explicit
 session `/reasoning off` as a narrow privacy veto without consulting `agents.*.reasoningDefault`.
+The veto reads and validates one raw session-store snapshot (`ENOENT` alone means
+empty; other read/parse/store-entry-shape failures close the lane) before pinned core's
+`resolveSessionStoreEntry` resolves its target/aliases from that same snapshot.
 It wires `onReasoningStream` /
 `onReasoningEnd` ONLY when it is on — in every answer mode
 (`partial` / `progress` / `block` / `off`), while preserving existing mode-specific answer/tool
 callbacks — together with `streamReasoningInNonStreamModes: true` for live snapshots and
 `reasoningPayloadsEnabled: true` for core's durable `isReasoning` form. The delivery seam intercepts
-the latter before ordinary answer/draft handling. `ReasoningDraftController`
-normalizes cumulative/snapshot updates by REPLACE (verified: no
-pinned emitter sends a bare delta) and rotates bursts. An opened lane that ends its turn having
+the latter before ordinary answer/draft handling and emits each complete durable
+block at full length under a distinct id, outside the live stale-prefix state.
+`ReasoningDraftController` normalizes live cumulative/snapshot updates by REPLACE
+(verified: no pinned emitter sends a bare delta) and rotates live bursts. An opened lane that ends its turn having
 received no payload logs one warning per account per process — suppressed on abort, terminal failure, and turns that
 delivered no answer, so it only fires where zero frames is genuinely surprising. It names the likely
 cause without asserting it: core's `canShowReasoning` (the agent's thinking level `!== "off"`) is an

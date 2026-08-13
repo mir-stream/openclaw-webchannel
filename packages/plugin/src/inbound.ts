@@ -725,10 +725,10 @@ export async function handleInboundMessage(
                           // the live callback above and emits `isReasoning:true`
                           // durable payloads instead. Opt those in only while our
                           // separate lane exists; the delivery seam below removes
-                          // them from the ordinary answer path and feeds this same
-                          // controller. Streamed modes do not duplicate visually:
-                          // their cumulative final snapshot is an exact duplicate
-                          // that the controller already suppresses.
+                          // them from the ordinary answer path and feeds the
+                          // controller's complete-block operation. Independent
+                          // durable blocks always retain their full text under
+                          // distinct ids and never enter live prefix accounting.
                           reasoningPayloadsEnabled: true,
                           onReasoningStream: (p) => {
                             reasoningPayloadSeen = true;
@@ -853,17 +853,10 @@ export async function handleInboundMessage(
                 if (payload.isReasoning === true) {
                   if (reasoning) {
                     reasoningPayloadSeen = true;
-                    reasoning.push({
+                    reasoning.pushDurableBlock({
                       text: payload.text,
                       isReasoningSnapshot: payload.isReasoningSnapshot,
                     });
-                    // A durable payload is one completed reasoning block, not a
-                    // cumulative update in an open live stream. Rotate after
-                    // each one so a later tool-loop block cannot replace it at
-                    // the same wire id. If this is the final snapshot of an
-                    // already-streamed burst, push() suppresses the duplicate and
-                    // endBurst() closes the existing burst naturally.
-                    reasoning.endBurst();
                   }
                   return { visibleReplySent: false };
                 }

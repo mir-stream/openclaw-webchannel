@@ -2191,8 +2191,28 @@ describe("ReasoningDraftController", () => {
     controller.push({ text: "" });
     controller.push({});
     controller.push({ text: undefined });
+    controller.pushDurableBlock({ text: "" });
+    controller.pushDurableBlock({});
     controller.push({ text: "real" });
     expect(frames.map((frame) => frame.text)).toEqual(["real"]);
+  });
+
+  it("emits complete durable blocks with shared prefixes under distinct ids", () => {
+    const { controller, frames } = setup();
+    controller.pushDurableBlock({ text: "Plan" });
+    controller.pushDurableBlock({ text: "Plan carefully" });
+
+    expect(frames.map((frame) => frame.text)).toEqual(["Plan", "Plan carefully"]);
+    expect(frames[0]?.id).not.toBe(frames[1]?.id);
+  });
+
+  it("preserves a complete durable block even when it equals adjacent live text", () => {
+    const { controller, frames } = setup();
+    controller.push({ text: "Plan" });
+    controller.pushDurableBlock({ text: "Plan" });
+
+    expect(frames.map((frame) => frame.text)).toEqual(["Plan", "Plan"]);
+    expect(frames[0]?.id).not.toBe(frames[1]?.id);
   });
 
   it("rotates ids at a reasoning-end boundary and ignores late updates after stop", () => {
