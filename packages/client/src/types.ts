@@ -135,23 +135,12 @@ export type ChatMessage = {
    */
   receiptKey?: string;
   /**
-   * Ephemeral live-turn correlation. History messages intentionally omit it —
-   * and #95 established this is not an oversight that can be fixed: the value is
-   * the client's own `user_message.id`, which core never stores, and no field on
-   * a stored transcript message correlates two assistant messages to one agent
-   * turn. Grouping by `turnId` therefore cannot survive a reload.
+   * Ephemeral live-turn correlation. History messages omit it because the exact
+   * client-generated `user_message.id` is not available on the stored messages
+   * returned to the history projection. Raw transcript boundaries may still
+   * provide structural grouping evidence, but cannot recover this exact id.
    */
   turnId?: string;
-  /**
-   * #95: this bubble is a hydrated transcript row whose turn settled as a
-   * FAILURE. Set only from a `history` frame's `failed` row; live failures are
-   * carried by `sendState`/`sendFailure` on the USER bubble instead.
-   *
-   * Absent means "not failed", which an older plugin (that never sends the
-   * field) is indistinguishable from — a failed turn then renders as an ordinary
-   * bubble, exactly today's behaviour.
-   */
-  failed?: boolean;
   /**
    * P1-9: true while this user message is HELD locally (a turn was in flight
    * at send time) and not yet published. Local-only — never on the wire,

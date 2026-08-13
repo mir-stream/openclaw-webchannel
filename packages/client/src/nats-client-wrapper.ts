@@ -1956,9 +1956,8 @@ export class WebChannelNATSClient {
         //     core transcript NEVER stores that platform id, so history ids
         //     can never match live ids for agent messages either.
         // Matching happens in three tiers, in snapshot order:
-        //   1. id — retain a message whose canonical id we already hold (a
-        //      prior snapshot placed or adopted it), while monotonically
-        //      reconciling authoritative failure metadata;
+        //   1. id — a message whose canonical id we already hold (a prior
+        //      snapshot placed or adopted it) is a no-op;
         //   2. exact text+role — adopt the server id onto the first
         //      text-matching local bubble (covers user echoes always; covers
         //      agent replies only when live text == stored text);
@@ -2016,7 +2015,6 @@ export class WebChannelNATSClient {
         });
 
         let adopted = false;
-        let failureMetadataChanged = false;
         /**
          * Fresh (unmatched) snapshot messages, grouped by the INSERTION CURSOR
          * value in effect when each was seen — the index into `next` BEFORE
@@ -2037,21 +2035,10 @@ export class WebChannelNATSClient {
          */
         let cursor = 0;
 
-        const adoptAt = (
-          idx: number,
-          m: { id: string; text: string; ts?: number; failed?: boolean },
-        ): void => {
+        const adoptAt = (idx: number, m: { id: string; text: string; ts?: number }): void => {
           // Keep the canonical stored text on adoption, so this device
-          // converges to exactly what a reloading device would render. #95: the
-          // row's `failed` is authoritative for the same reason — an adopted
-          // bubble must end up identical to a freshly hydrated one.
-          next[idx] = {
-            ...next[idx],
-            id: m.id,
-            text: m.text,
-            ts: m.ts,
-            ...(m.failed === true ? { failed: true } : {}),
-          };
+          // converges to exactly what a reloading device would render.
+          next[idx] = { ...next[idx], id: m.id, text: m.text, ts: m.ts };
           claimed.add(idx);
           localIndexById.set(m.id, idx);
           adopted = true;
@@ -2071,17 +2058,7 @@ export class WebChannelNATSClient {
             // later fresh messages insert after it. An id we can't locate
             // locally (should not happen — `seen` is seeded from `next`) leaves
             // the cursor untouched.
-            if (li !== undefined) {
-              cursor = li + 1;
-              // A newer plugin can add authoritative failure metadata to a row
-              // first hydrated from an older plugin. Promote it monotonically:
-              // absence/false is ambiguous during a staggered rollout and must
-              // never clear an already-observed failure.
-              if (m.failed === true && next[li].failed !== true) {
-                next[li] = { ...next[li], failed: true };
-                failureMetadataChanged = true;
-              }
-            }
+            if (li !== undefined) cursor = li + 1;
             continue;
           }
 
@@ -2129,15 +2106,12 @@ export class WebChannelNATSClient {
             text: m.text,
             ts: m.ts,
             working: false,
-            // #95: omitted when absent/false, so "not failed" has one
-            // representation and an older plugin's rows are unchanged.
-            ...(m.failed === true ? { failed: true } : {}),
           });
           inserts.set(cursor, atCursor);
           anchor = null;
         }
 
-        if (inserts.size === 0 && !adopted && !failureMetadataChanged) return;
+        if (inserts.size === 0 && !adopted) return;
 
         // Rebuild `next` with each fresh group spliced in at its cursor. Slot i
         // holds the messages that must precede `next[i]`; slot `next.length`

@@ -3,25 +3,20 @@ import { describe, it, expect } from "vitest";
 import { WebChannelNATSClient } from "./nats-client-wrapper.js";
 
 /**
- * WP B (#95): hydration contract — the transcript row is CANONICAL and the live
- * timeline must converge to it.
+ * WP B (#95): hydration contract — reproduce the current normalizer's history
+ * row projection deterministically.
  *
- * SCOPE OF "CANONICAL", stated precisely because the naive reading is false:
- * the transcript is canonical for ORDER and BOUNDARY IDENTITY. It is NOT
- * row-set-equal to the set of live utterances — WP A
- * (`packages/plugin/src/history-utterance-correspondence.test.ts`) measured a
- * single-tool-round turn rendering as ONE live bubble while producing TWO
- * transcript rows, because core appends one assistant message per model step and
- * the mid-turn status text is overwritten in the live progress draft rather than
- * settled as its own bubble.
+ * This does not claim that raw transcript rows equal live utterances, or that the
+ * projection preserves every transcript relationship. WP A
+ * (`packages/plugin/src/history-utterance-correspondence.test.ts`) constructs a
+ * contract-compatible fixture in which two visible assistant messages produce
+ * two projected rows; separately, the live progress path can settle one draft.
  *
  * So these tests assert two different things, and the distinction matters:
  *   - For a COLD reload (hydration into empty state) the timeline MUST be exactly
  *     one bubble per row, in row order. That is the contract.
- *   - For a MID-SESSION snapshot landing on live bubbles, the timeline must
- *     CONVERGE to the row sequence without duplicating or losing anything. Where
- *     rows outnumber live bubbles, convergence necessarily mutates a live bubble
- *     and appends — that is characterized here, not asserted to be desirable.
+ *   - For a MID-SESSION snapshot landing on live bubbles, these tests
+ *     characterize the current reconciliation with the projected row sequence.
  *
  * Everything here is category B (our own code): no core behaviour is assumed.
  */
@@ -59,8 +54,7 @@ function timeline(wrapper: WebChannelNATSClient): string[] {
 }
 
 /**
- * A transcript for one user question answered across two model steps. This is
- * the exact shape WP A measured: two agent rows, one live utterance.
+ * A projected history sequence built from WP A's explicit multi-step fixture.
  */
 const TWO_STEP_ROWS: Row[] = [
   { id: "core-1", role: "user", text: "which agents are configured?", ts: 1 },
@@ -151,6 +145,20 @@ describe("#95 WP B — cold reload is a faithful reconstruction of the row seque
       "agent:You have three: alpha, beta, gamma.",
     ]);
   });
+
+  /** `ts` is optional on the wire; a row without it still hydrates in order. */
+  it("hydrates rows with no ts, preserving row order", () => {
+    const w = makeWrapper();
+    deliver(
+      w,
+      history(
+        { id: "core-1", role: "user", text: "first" },
+        { id: "core-2", role: "agent", text: "second" },
+      ),
+    );
+
+    expect(timeline(w)).toEqual(["user:first", "agent:second"]);
+  });
 });
 
 describe("#95 WP B — live timeline converges to the row sequence", () => {
@@ -176,9 +184,8 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
   });
 
   /**
-   * TIER 3, the fragile path. Core stores raw model output while the live path
-   * delivers sanitized text, so tier 2 misses on agent rows and the POSITIONAL
-   * anchor must carry the adoption. Boundaries and order must still converge.
+   * TIER 3, the fragile path. When the live and stored text differ, tier 2
+   * misses and the POSITIONAL anchor must carry the adoption.
    */
   it("tier 3 adopts positionally when live text differs from stored text", () => {
     const w = makeWrapper();
@@ -193,27 +200,26 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
       ),
     );
 
-    // One user bubble and one agent bubble — no duplicate — and the canonical
+    // One user bubble and one agent bubble — no duplicate — and the incoming
     // stored text won.
     expect(timeline(w)).toEqual(["user:which agents are configured?", "agent:STORED raw answer"]);
     expect(w.getState().messages.map((m) => m.id)).toEqual(["core-1", "core-2"]);
   });
 
   /**
-   * TIER 3 WHERE ROWS OUTNUMBER LIVE BUBBLES — the case WP A proved is real.
+   * TIER 3 WHERE THIS FIXTURE'S ROWS OUTNUMBER ITS SEEDED LIVE BUBBLES.
    *
-   * Live produced ONE agent bubble for this turn (the mid-turn status text was
-   * overwritten in the progress draft). The snapshot carries TWO agent rows.
-   * CHARACTERIZATION of what the reducer actually does, not an endorsement:
-   * convergence to the transcript is achieved by REWRITING the live bubble's text
-   * to the first row and APPENDING the second. The user-visible artifact is a
-   * bubble that mutates its text under them.
+   * The seeded state contains ONE agent bubble while the snapshot carries TWO
+   * agent rows. This does not claim how a particular live/core execution reached
+   * either shape. It characterizes what the reducer does: convergence to the
+   * projection rewrites the live bubble's text to the first row and appends the
+   * second.
    *
    * What matters for the contract is the post-condition, and it does hold: the
    * final timeline equals the cold-reload timeline exactly — same boundaries,
    * same order, nothing duplicated, nothing lost.
    */
-  it("converges to the row sequence when a turn's rows outnumber its live bubbles", () => {
+  it("converges when incoming rows outnumber seeded live bubbles", () => {
     const w = makeWrapper();
     w.send("which agents are configured?");
     deliver(w, {
@@ -251,150 +257,5 @@ describe("#95 WP B — live timeline converges to the row sequence", () => {
 
     const draftAfter = w.getState().messages.find((m) => m.working === true);
     expect(draftAfter?.id).toBe("draft-1");
-  });
-});
-
-describe("#95 WP B — additive wire fields (no protocol bump)", () => {
-  /**
-   * REGRESSION GUARD, scoped honestly: nothing in the reducer ACCEPTS unknown
-   * fields — it builds a fresh row from known fields and never enumerates the
-   * input, so unknown fields are ignored by omission. This test exists to fail if
-   * someone later adds a strict validator that would REJECT them, which is what
-   * would silently force a protocol bump.
-   *
-   * `WEBCHANNEL_PROTOCOL_VERSION` is enforced as strict equality in both
-   * directions with no negotiation (`nats-register.ts:392-398`,
-   * `nats-client.ts:1878-1887`), so a bump hard-fails every deployed pair until
-   * both redeploy. Keeping additive fields genuinely additive is what avoids it.
-   */
-  it("tolerates rows carrying unknown/future optional fields", () => {
-    const w = makeWrapper();
-    deliver(
-      w,
-      history(
-        { id: "core-1", role: "user", text: "hi", ts: 1, somethingNew: { nested: true } },
-        { id: "core-2", role: "agent", text: "hello", ts: 2, failed: false, seq: 42 },
-      ),
-    );
-
-    expect(timeline(w)).toEqual(["user:hi", "agent:hello"]);
-  });
-
-  /**
-   * The mirror property: a row from an OLDER plugin omits the new optional fields
-   * entirely and must hydrate identically. Absent `failed` reads as "not failed" —
-   * a genuinely failed turn from an old plugin renders as an ordinary bubble,
-   * which is exactly today's behaviour. Named in the plan as a documented
-   * degradation, not a silent one.
-   */
-  it("hydrates rows that omit the new optional fields", () => {
-    const withFields = makeWrapper();
-    deliver(
-      withFields,
-      history({ id: "core-1", role: "agent", text: "boom", ts: 1, failed: false }),
-    );
-    const withoutFields = makeWrapper();
-    deliver(withoutFields, history({ id: "core-1", role: "agent", text: "boom", ts: 1 }));
-
-    expect(timeline(withFields)).toEqual(timeline(withoutFields));
-  });
-
-  /** A `failed` row hydrates with the flag intact — the point of the field. */
-  it("carries `failed` onto a cold-hydrated bubble", () => {
-    const w = makeWrapper();
-    deliver(
-      w,
-      history(
-        { id: "core-1", role: "user", text: "do the thing", ts: 1 },
-        { id: "core-2", role: "agent", text: "it broke", ts: 2, failed: true },
-      ),
-    );
-
-    const [, agent] = w.getState().messages;
-    expect(agent.failed).toBe(true);
-  });
-
-  /**
-   * During a staggered rollout, the same canonical row can first arrive from an
-   * older plugin without `failed`, then from an upgraded plugin with
-   * `failed:true`. Tier 1 must reconcile that metadata without disturbing the
-   * already-hydrated timeline, and older/duplicate snapshots must not undo it or
-   * emit redundant state updates.
-   */
-  it("promotes `failed` monotonically on a repeated canonical-id snapshot", () => {
-    const w = makeWrapper();
-    const initialRows: Row[] = [
-      { id: "core-1", role: "user", text: "do the thing", ts: 1 },
-      { id: "core-2", role: "agent", text: "it broke", ts: 2 },
-    ];
-    deliver(w, history(...initialRows));
-
-    const initialIds = w.getState().messages.map((m) => m.id);
-    const initialTimeline = timeline(w);
-    let stateUpdates = 0;
-    const unsubscribe = w.subscribe(() => { stateUpdates++; });
-
-    deliver(
-      w,
-      history(
-        initialRows[0],
-        { ...initialRows[1], failed: true },
-      ),
-    );
-
-    const promotedMessages = w.getState().messages;
-    expect(promotedMessages).toHaveLength(initialRows.length);
-    expect(promotedMessages.map((m) => m.id)).toEqual(initialIds);
-    expect(timeline(w)).toEqual(initialTimeline);
-    expect(promotedMessages[1].failed).toBe(true);
-    expect(stateUpdates).toBe(1);
-
-    deliver(w, history(initialRows[0], { ...initialRows[1], failed: true }));
-    deliver(w, history(initialRows[0], { ...initialRows[1], failed: false }));
-    deliver(w, history(...initialRows));
-
-    expect(w.getState().messages).toBe(promotedMessages);
-    expect(w.getState().messages[1].failed).toBe(true);
-    expect(stateUpdates).toBe(1);
-    unsubscribe();
-  });
-
-  /**
-   * A bubble ADOPTED mid-session must end up identical to a freshly hydrated
-   * one — otherwise the same transcript renders differently depending on whether
-   * the tab was open, which is the whole class of defect #95 exists to close.
-   */
-  it("an adopted bubble ends up identical to a cold-hydrated one", () => {
-    const rows: Row[] = [
-      { id: "core-1", role: "user", text: "do the thing", ts: 1 },
-      { id: "core-2", role: "agent", text: "it broke", ts: 2, failed: true },
-    ];
-
-    const live = makeWrapper();
-    live.send("do the thing");
-    deliver(live, { type: "agent_message", id: "webchannel-1", text: "it broke" });
-    deliver(live, history(...rows));
-
-    const cold = makeWrapper();
-    deliver(cold, history(...rows));
-
-    expect(live.getState().messages.map((m) => m.failed)).toEqual(
-      cold.getState().messages.map((m) => m.failed),
-    );
-    expect(live.getState().messages[1].failed).toBe(true);
-  });
-
-  /** `ts` is optional on the wire; a row without it must still hydrate in order. */
-  it("hydrates rows with no ts, preserving row order", () => {
-    const w = makeWrapper();
-    deliver(
-      w,
-      history(
-        { id: "core-1", role: "user", text: "first" },
-        { id: "core-2", role: "agent", text: "second" },
-      ),
-    );
-
-    expect(timeline(w)).toEqual(["user:first", "agent:second"]);
   });
 });

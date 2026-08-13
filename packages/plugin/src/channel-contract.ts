@@ -4,25 +4,25 @@ import type { CommandCatalogEntry } from "./commands-catalog.js";
 export const WEBCHANNEL_ID = "webchannel";
 export { ANON_PEER_ID };
 /**
- * A hydrated transcript row on the wire.
+ * A normalized transcript row on the hydration wire.
  *
- * WHAT HYDRATION PRESERVES, and what it does not (#95). A reloaded timeline
- * carries role, text, order, row identity, and failure state — and NOTHING a
- * client derived while live. Specifically absent by design:
+ * #95: hydration reproduces the role, sanitized text, order, row identity, and
+ * optional timestamp present in this projection. It does not reproduce every
+ * live-bubble property or every relationship available in the raw transcript.
+ * Specifically absent:
  *
- *  - `turnId`. The live turn id is the CLIENT's own `user_message.id`
- *    (`inbound.ts:220-222`); core never stores it, and no field on a stored
- *    message correlates two assistant messages to one agent turn. There is no
- *    value to put here, so grouping cannot survive a reload. See #114 for the
- *    mechanism that would change this.
+ *  - `turnId`. `handleInboundMessage` derives the live value from the client's
+ *    `user_message.id`; that exact client-generated id is not available on the
+ *    stored messages returned to this projection. Raw user boundaries and tool
+ *    structure can still provide structural grouping evidence, but they cannot
+ *    recover the exact live correlation id.
+ *  - a terminal-turn failure verdict. `AssistantMessage.stopReason === "error"`
+ *    describes a stored model attempt/message and may precede a successful
+ *    retry or fallback. Textless or sanitized-away attempts produce no row, so
+ *    the projection cannot expose a retry-safe terminal failure signal.
  *  - `working`, `wireId`, `sendState` — live-only client state.
  *  - reasoning previews, typing, and tool progress — ephemeral by design
  *    (`docs/P1_REASONING_LANE_PLAN.md`), matching what Telegram does.
- *
- * `failed` is ADDITIVE and OMITTED WHEN FALSE; absent means "not failed".
- * Additive optional fields deliberately do NOT bump
- * `WEBCHANNEL_PROTOCOL_VERSION`: the handshake is strict equality with no
- * negotiation, so a bump hard-fails every deployed pair until both redeploy.
  *
  * Full rationale: `docs/ISSUE_95_HISTORY_CONTRACT_PLAN.md`.
  */
@@ -31,7 +31,6 @@ export type HistoryMessage = {
   role: "user" | "agent";
   text: string;
   ts?: number;
-  failed?: boolean;
 };
 
 export type ApprovalDecision = "allow-once" | "allow-always" | "deny";
