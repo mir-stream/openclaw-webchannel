@@ -236,6 +236,30 @@ await sleep(300);
 //     boundary event at all is not reachable through this provider and stays
 //     covered by the unit fixtures alone.
 // ---------------------------------------------------------------------------
+/**
+ * Bubble order AS THE WIDGET BUILDS IT: the first frame carrying an id fixes
+ * that bubble's slot (`upsertMessage` appends on an unknown id), and every later
+ * frame for that id edits it in place, so the LAST text wins the content.
+ *
+ * The gate used to compare positions inside the filtered `agent_message` array,
+ * which cannot see ordering at all: `progress(B), progress(A), final(A),
+ * final(B)` passed it while rendering B above A permanently. Three of the last
+ * five review rounds were ordering defects and this gate was structurally unable
+ * to catch any of them. Same shape as the unit fixtures' `bubbleOrder` so the
+ * two agree on what "order" means.
+ */
+function bubbleOrder(all: Frame[]): Array<{ id: string; text: string }> {
+  const order: string[] = [];
+  const last = new Map<string, string>();
+  for (const f of all) {
+    const id = f.id;
+    if (!id || (f.type !== "progress" && f.type !== "agent_message")) continue;
+    if (!last.has(id)) order.push(id);
+    last.set(id, f.text ?? "");
+  }
+  return order.map((id) => ({ id, text: last.get(id)! }));
+}
+
 function dumpFrames(from: number, label: string): void {
   const all = frames.slice(from);
   console.log(`[driver] ── ${label}: inbound frame log (${all.length} frames) ─────────────`);
@@ -309,7 +333,14 @@ if (distinctIds.size < 2) {
 // (2) Message A's text must be PRESENT and must not have been erased or replaced
 //     by message B's text. "Erased" is the #94 failure: the id that carried A
 //     ends up holding B.
-const aFrames = agentMessages.filter((f) => (f.text ?? "").includes(TEXT_A));
+// Reduce each id to its FINAL state first: taking the first terminal frame for a
+// text would miss a later overwrite of that same id.
+const finalStateById = new Map<string, Frame>();
+for (const f of turnFrames) {
+  if (f.type === "agent_message" && f.id) finalStateById.set(f.id, f);
+}
+const settledFinalState = [...finalStateById.values()];
+const aFrames = settledFinalState.filter((f) => (f.text ?? "").includes(TEXT_A));
 if (aFrames.length === 0) {
   fail(
     6,
@@ -325,7 +356,7 @@ if ((aFrame.text ?? "").includes(TEXT_B)) {
       `(${JSON.stringify(aFrame.text)}). The message boundary was flattened.`,
   );
 }
-const bFrames = agentMessages.filter((f) => (f.text ?? "").includes(TEXT_B));
+const bFrames = settledFinalState.filter((f) => (f.text ?? "").includes(TEXT_B));
 if (bFrames.length === 0) {
   fail(6, `no settled agent_message carries message B's text ${JSON.stringify(TEXT_B)}`);
 }
@@ -338,14 +369,19 @@ if (aFrame.id === bFrame.id) {
   );
 }
 
-// (3) Order on the wire must match the order the MODEL produced them (A, then B).
-const aIndex = agentMessages.indexOf(aFrame);
-const bIndex = agentMessages.indexOf(bFrame);
-if (aIndex > bIndex) {
+// (3) Order AS RENDERED must match the order the MODEL produced them (A, then B).
+//     Derived from every frame, not from the filtered terminal ones: the slot is
+//     fixed by whichever frame first carried each id, usually a `progress`.
+const turn1Bubbles = bubbleOrder(turnFrames);
+const aBubble = turn1Bubbles.findIndex((b) => b.text.includes(TEXT_A));
+const bBubble = turn1Bubbles.findIndex((b) => b.text.includes(TEXT_B));
+if (aBubble === -1 || bBubble === -1 || aBubble > bBubble) {
   fail(
     6,
-    `#94: the two assistant messages settled out of order — B (id=${bFrame.id}) landed at ` +
-      `position ${bIndex} before A (id=${aFrame.id}) at position ${aIndex}.`,
+    `#94: the two assistant messages RENDER out of order. Derived bubble order ` +
+      `${JSON.stringify(turn1Bubbles.map((b) => b.text))} — message A is at slot ${aBubble}, ` +
+      `message B at slot ${bBubble}. A bubble's slot is fixed by the FIRST frame carrying ` +
+      `its id, so a later message that streams first sits above an earlier one permanently.`,
   );
 }
 
@@ -362,6 +398,9 @@ if (settled.outcome !== "ok") {
   );
 }
 
+console.log(
+  `[PROOF] #94 derived bubble order: ${JSON.stringify(turn1Bubbles.map((b) => b.text))}`,
+);
 console.log(
   `[PROOF] #94: one turn produced ${agentMessages.length} settled assistant bubbles at ` +
     `${distinctIds.size} distinct ids (A=${aFrame.id}, B=${bFrame.id}), in model order, ` +
