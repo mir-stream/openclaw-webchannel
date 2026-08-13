@@ -6,10 +6,32 @@
  * key `resolveAgentRoute` returned with a `per-account-channel-peer` key, so a
  * multi-user register-hop account can never collapse peers onto one session —
  * regardless of the operator's global `session.dmScope`.
+ *
+ * Since #112 the key also carries a `:tenant:<t>` component. Tenant ISOLATION
+ * itself is covered in `session-route-tenant-isolation.test.ts`; here the tenant
+ * is pinned to a fixture value only so these per-user assertions can spell the
+ * whole key. The fixture config declares it explicitly rather than leaning on
+ * the fallback, so an ambient `WEBCHANNEL_TENANT` in a developer shell cannot
+ * change what these tests assert.
  */
+import { createHash } from "node:crypto";
+
 import { describe, it, expect, vi } from "vitest";
 
 import { resolveWebchannelSessionRoute } from "./session-route.js";
+
+/** The tenant every account in this file's fixture config is served under. */
+const TENANT = "fixture-tenant";
+/**
+ * The `:tenant:` component the derivation appends for `TENANT` (#112):
+ * `<lowercased tenant>-<16 hex of sha256(verbatim tenant)>`. The digest is what
+ * survives core's lowercase fold at the store boundary; the isolation suite in
+ * `session-route-tenant-isolation.test.ts` is what proves that end-to-end.
+ */
+const TENANT_SUFFIX = `:tenant:${TENANT}-${createHash("sha256")
+  .update(TENANT, "utf8")
+  .digest("hex")
+  .slice(0, 16)}`;
 
 /**
  * Fake api whose `resolveAgentRoute` returns a route built under an arbitrary
@@ -35,6 +57,9 @@ function makeApi(opts?: {
   }));
   const api = {
     config: {
+      // A channel-level `tenant` is the shared base for every account id these
+      // tests use, so `acme`/`acctA`/`acctB` all resolve to TENANT.
+      channels: { webchannel: { tenant: TENANT } },
       session: opts?.identityLinks ? { identityLinks: opts.identityLinks } : {},
     },
     runtime: { channel: { routing: { resolveAgentRoute } } },
@@ -47,7 +72,7 @@ describe("resolveWebchannelSessionRoute (forced per-user isolation)", () => {
     const { api } = makeApi({ mockSessionKey: "agent:main:main" });
     const route = resolveWebchannelSessionRoute(api, "acme", "alice");
     // The naive main key is discarded for the isolated per-peer key.
-    expect(route.sessionKey).toBe("agent:main:webchannel:acme:direct:alice");
+    expect(route.sessionKey).toBe(`agent:main:webchannel:acme:direct:alice${TENANT_SUFFIX}`);
   });
 
   it("gives DISTINCT keys to two users on the SAME account (no cross-user collapse)", () => {
@@ -55,8 +80,8 @@ describe("resolveWebchannelSessionRoute (forced per-user isolation)", () => {
     const alice = resolveWebchannelSessionRoute(api, "acme", "alice").sessionKey;
     const bob = resolveWebchannelSessionRoute(api, "acme", "bob").sessionKey;
     expect(alice).not.toBe(bob);
-    expect(alice).toBe("agent:main:webchannel:acme:direct:alice");
-    expect(bob).toBe("agent:main:webchannel:acme:direct:bob");
+    expect(alice).toBe(`agent:main:webchannel:acme:direct:alice${TENANT_SUFFIX}`);
+    expect(bob).toBe(`agent:main:webchannel:acme:direct:bob${TENANT_SUFFIX}`);
   });
 
   it("gives DISTINCT keys to the SAME user on two accounts (multiplex isolation)", () => {
@@ -71,7 +96,7 @@ describe("resolveWebchannelSessionRoute (forced per-user isolation)", () => {
     const { api } = makeApi({ resolvedAgentId: "support-bot", resolvedAccountId: "acme" });
     const route = resolveWebchannelSessionRoute(api, "acme", "alice");
     expect(route.agentId).toBe("support-bot");
-    expect(route.sessionKey).toBe("agent:support-bot:webchannel:acme:direct:alice");
+    expect(route.sessionKey).toBe(`agent:support-bot:webchannel:acme:direct:alice${TENANT_SUFFIX}`);
   });
 
   it("returns an internally-consistent route (lastRoutePolicy re-derived to 'session')", () => {

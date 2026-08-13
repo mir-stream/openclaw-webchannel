@@ -22,6 +22,7 @@
 
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_TENANT,
   hasWebchannelConfig,
   resolveAcquisitionIdentity,
   type WebchannelAcquisitionIdentity,
@@ -45,6 +46,37 @@ let deprecationWarned = false;
 /** @internal Test-only: reset the one-time warning guard. */
 export function _resetAcquisitionEnvWarning(): void {
   deprecationWarned = false;
+}
+
+/**
+ * The tenant an account is SERVED under — the pure identity half of
+ * `resolveAcquisitionEnvPrecedence`, with none of its one-time-warning
+ * machinery.
+ *
+ * #112 promoted the tenant to a component of the webchannel session key, so it
+ * is now read on the per-turn dispatch and per-read history paths, not just at
+ * startup planning. Those paths must not emit operator warnings and must not
+ * trip the once-per-process deprecation guard (doing so would SUPPRESS the real
+ * startup warning). They call this; `resolveAcquisitionEnvPrecedence` calls it
+ * too, so the serving tenant and the session-key tenant are the same value by
+ * construction rather than by two implementations agreeing.
+ */
+export function resolveAccountTenant(
+  cfg: unknown,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  if (hasWebchannelConfig(cfg)) return resolveAcquisitionIdentity(cfg, accountId).tenant;
+  // No webchannel config at all: the legacy synthesized-default account, whose
+  // tenant comes from env (see the module docstring's precedence rule).
+  //
+  // NOTE the asymmetry this branch carries: the serving plan reads env ONCE at
+  // startup, while the session-key caller reads it per turn and per history
+  // read. They agree only while `process.env` is stable within a process, which
+  // it is today. If that ever stops holding, snapshot the value at plan time and
+  // thread it, rather than letting the two readers drift — a tenant that differs
+  // between the write and the read is a silently split transcript.
+  return env["WEBCHANNEL_TENANT"] ?? DEFAULT_WEBCHANNEL_TENANT;
 }
 
 export type AcquisitionEnvResult = {
@@ -105,7 +137,7 @@ export function resolveAcquisitionEnvPrecedence(
   // No config: synthesize the legacy "default" account identity from env.
   const identity: WebchannelAcquisitionIdentity = {
     accountId,
-    tenant: env["WEBCHANNEL_TENANT"] ?? "default-tenant",
+    tenant: resolveAccountTenant(cfg, accountId, env),
     ...(env["WEBCHANNEL_SAAS_BASE_URL"] !== undefined
       ? { saasBaseUrl: env["WEBCHANNEL_SAAS_BASE_URL"] }
       : {}),

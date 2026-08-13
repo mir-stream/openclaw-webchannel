@@ -1,4 +1,19 @@
+import { createHash } from "node:crypto";
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
+
+/**
+ * Tenant every fake api in this file is served under. Declared explicitly (not
+ * left to the `default-tenant` fallback) so an ambient `WEBCHANNEL_TENANT` in a
+ * developer shell cannot change the session key these tests assert — the same
+ * guard `session-route.test.ts` uses.
+ */
+const FIXTURE_TENANT = "fixture-tenant";
+/** The `:tenant:` token #112 appends for `FIXTURE_TENANT`. */
+const FIXTURE_TENANT_TOKEN = `${FIXTURE_TENANT}-${createHash("sha256")
+  .update(FIXTURE_TENANT, "utf8")
+  .digest("hex")
+  .slice(0, 16)}`;
 
 import { NullPeerChannel } from "./channel-contract.js";
 class FakePeerChannel extends NullPeerChannel {
@@ -528,7 +543,15 @@ describe("webchannel inbound round-trip", () => {
     };
 
     const api = {
-      config: { channels: { webchannel: opts?.channelConfig ?? {} } },
+      // A `tenant` is always present so the #112 session-key derivation reads it
+      // from config rather than falling through to `WEBCHANNEL_TENANT` in the
+      // ambient environment — otherwise `WEBCHANNEL_TENANT=… vitest` changes the
+      // key these tests assert. Per-test `channelConfig` still wins on any key.
+      config: {
+        channels: {
+          webchannel: { tenant: FIXTURE_TENANT, ...(opts?.channelConfig ?? {}) },
+        },
+      },
       runtime: {
         channel,
         ...(opts?.lifecyclePhase
@@ -674,10 +697,15 @@ describe("webchannel inbound round-trip", () => {
     );
     // An originating session/route was recorded carrying the FORCED
     // per-account-channel-peer key (webchannel self-isolates regardless of the
-    // global session.dmScope — the empty accountId normalizes to "default").
+    // global session.dmScope). `handleInboundMessage` is called without an
+    // accountId here, so the account component is the parameter default,
+    // DEFAULT_WEBCHANNEL_ACCOUNT_ID ("default").
+    // The `:tenant:` suffix is #112: the key is also scoped to the account's
+    // authorization namespace, which for a config with no webchannel section
+    // falls back to `DEFAULT_WEBCHANNEL_TENANT`.
     expect(recordInboundSession).toHaveBeenCalledTimes(1);
     expect(captured.recordedSessionKey).toBe(
-      "agent:main:webchannel:default:direct:web-anon",
+      `agent:main:webchannel:default:direct:web-anon:tenant:${FIXTURE_TENANT_TOKEN}`,
     );
     // The recorded reply `to` lines up with the socket-map key we deliver to.
     expect(captured.recordedTo).toBe("web-anon");

@@ -69,6 +69,45 @@
   partial audience-pin proposal.
 - Register admission now requires a non-empty signed tenant claim matching the
   configured tenant for challenge, register, and unregister.
+- **The tenant is now part of the session-key derivation, so EVERY existing
+  session key changes on upgrade** (#112). Webchannel keyed sessions on
+  (agent, channel, account, peer) only, but the protocol permits the same
+  account id under different tenants — so serving `(tenant=T1, account=A,
+  peer=P)`, then reconfiguring that account as `(tenant=T2, account=A)` and
+  registering with a valid T2 token for the same peer string, resolved T1's
+  session key and returned T1's transcript through the register-time history
+  snapshot and `load_history`. Admission could not catch it: it checks the
+  signed tenant claim against the *configured* tenant, and after the change T2
+  is legitimately that tenant. Keys are now
+  `agent:<agent>:webchannel:<account>:direct:<peer>:tenant:<tenant>-<digest>`,
+  where `<tenant>` is **lowercased** — grepping `sessions.json` for a tenant
+  configured as `Acme` finds nothing; search for `acme` — and `<digest>` is a
+  short hash of the tenant exactly as configured. The digest is
+  there because openclaw lowercases the whole session key when it stores it, and
+  NATS treats `Acme` and `acme` as two tenants with different credentials — the
+  digest is what keeps those two from sharing one stored key.
+  - **What an operator sees after upgrading:** existing conversations appear
+    empty. The history snapshot a widget receives at register time, and every
+    `load_history` page, read the new key and find nothing under it. Per-session
+    `/reasoning off` opt-outs also reset to the configured default, because that
+    preference is stored against the session key.
+  - **Nothing is deleted at upgrade time**, but do not treat the old entries as
+    archived. Previous transcripts remain in openclaw's `sessions.json` under
+    their previous keys; nothing writes to them again, so they age out under
+    core's normal session-store maintenance (pruning, capping, rotation on
+    write), and as the oldest entries they are evicted first. There is no
+    automated migration in this release — **capture that file before upgrading**
+    if the old transcripts matter to you.
+  - **No re-enrollment, and no credential or key change.** Conversation keys and
+    enrolled credentials are stored per `(tenant, accountId)` and peer id, never
+    per session key, so they are unaffected. Browsers reconnect and register
+    normally; a fresh conversation simply starts under the new key.
+  - This applies to single-tenant deployments too, including any that never set
+    `tenant` and use the `default-tenant` fallback. Preserving those keys by
+    omitting the component for the default tenant was considered and rejected:
+    every deployment that *had* configured a tenant — the entire population the
+    bug can affect — breaks either way, so the exception would buy no security
+    and would leave a confidentiality boundary conditional on a magic value.
 - **Protocol v2:** authenticated register requests require v2 and bounded
   retained-work overload uses `inbound_rejected`; client and plugin must upgrade
   together.
