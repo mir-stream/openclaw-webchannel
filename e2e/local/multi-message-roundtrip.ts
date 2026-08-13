@@ -495,6 +495,24 @@ if (!streamedAnswer.some((f) => f.id === toolFirstAnswer.id)) {
   );
 }
 
+// …and it must be the ONLY bubble the turn leaves behind. Counting
+// answer-carrying terminal frames cannot see a leftover scaffold: the sequence
+// `progress("Working…", P) → progress(answer, Q) → agent_message(answer, Q)`
+// satisfies every assertion above, while the client finalizes BOTH drafts on
+// settlement and the user is left with a dead "Working…" bubble beside the
+// answer. The protocol has no bubble deletion (§6.2-3), so a scaffold the answer
+// never claimed is permanent.
+const toolFirstBubbles = bubbleOrder(toolFirstFrames);
+if (toolFirstBubbles.length !== 1 || toolFirstBubbles[0]!.id !== toolFirstAnswer.id) {
+  fail(
+    6,
+    `#94 tool-only-first: the turn left ${toolFirstBubbles.length} bubble(s) — ` +
+      `${JSON.stringify(toolFirstBubbles)} — expected exactly one, the answer's ` +
+      `(${toolFirstAnswer.id}). A scaffold the answer never claimed is a ghost bubble the ` +
+      `protocol cannot remove.`,
+  );
+}
+
 const toolFirstTurnSettled = toolFirstFrames.find((f) => f.type === "turn_settled");
 if (toolFirstTurnSettled?.outcome !== "ok") {
   fail(
