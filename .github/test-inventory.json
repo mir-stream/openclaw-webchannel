@@ -88,7 +88,7 @@
     "packages/plugin/src/late-join-decryptor.test.ts": 27,
     "packages/plugin/src/legacy-storage-migration.test.ts": 50,
     "packages/plugin/src/manifest-schema.test.ts": 12,
-    "packages/plugin/src/message-adapter.test.ts": 106,
+    "packages/plugin/src/message-adapter.test.ts": 109,
     "packages/plugin/src/multidevice-broadcast.test.ts": 12,
     "packages/plugin/src/multiplex.test.ts": 21,
     "packages/plugin/src/nats-account-runtime.test.ts": 38,
