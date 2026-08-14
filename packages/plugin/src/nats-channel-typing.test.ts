@@ -85,12 +85,16 @@ describe("approval decision reverse path", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     transport.emit("message", { subject: "webchannel.tenant.acct.peer-0.in", payload: Buffer.from(JSON.stringify({ type: "approval_decision", id: "exec-1", decision: "bogus" })) });
     expect(handler).not.toHaveBeenCalled();
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Invalid approval_decision from peer-0"));
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Invalid approval_decision from "peer-0"'),
+    );
 
     warnSpy.mockClear();
     transport.emit("message", { subject: "webchannel.tenant.acct.peer-0.in", payload: Buffer.from(JSON.stringify({ type: "approval_decision", id: 42, decision: "deny" })) });
     expect(handler).not.toHaveBeenCalled();
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("Invalid approval_decision from peer-0"));
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Invalid approval_decision from "peer-0"'),
+    );
     warnSpy.mockRestore();
   });
 });

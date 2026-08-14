@@ -34,10 +34,9 @@ import ts from "typescript";
  * INSIDE an enforced file too, not just between files. `nats-account-runtime.ts`
  * writes six structured records as `event=webchannel.*` with no `webchannel:`
  * anywhere; until that prefix was added, the scanner reported 16 statements for
- * that file and silently skipped them. `nats-channel.ts` is out for the same
- * reason (`[nats-channel]`), so adding it to an enforced list without adding
- * its prefix would enforce nothing while looking like it did. Same for
- * `ingress-outcome.ts`.
+ * that file and silently skipped them. `nats-channel.ts` had the same blind
+ * spot through its `[nats-channel]` prefix; callers must list that prefix when
+ * enforcing the file. The same rule applies to `ingress-outcome.ts`.
  *
  * FAIL LOUD ON WHAT IT CANNOT READ. Outside templates, strings and comments, a
  * log argument may contain only punctuation and literals; any bare identifier
@@ -100,6 +99,12 @@ export const ALLOWED_RAW_INTERPOLATIONS: readonly AllowedRawInterpolation[] = [
     expression: "turnOutcome",
     reason: 'the literal union "ok" | "error" (inbound.ts:392)',
   },
+  {
+    file: "approvals.ts",
+    site: "[webchannel] event=webchannel.approval.origin_unresolved accountId= reason= sessionKey_present=",
+    expression: "reason",
+    reason: "OriginUnresolvedReason string-literal union",
+  },
   // Numerics and booleans: cannot contain a newline or a delimiter.
   {
     file: "auth.ts",
@@ -109,15 +114,57 @@ export const ALLOWED_RAW_INTERPOLATIONS: readonly AllowedRawInterpolation[] = [
   },
   {
     file: "approvals.ts",
-    site: '[webchannel] pending-approval cap reached; evicting a still-pending approval "" (account "", peer "") — a client may show it as resolved-elsewhere',
+    site: "[webchannel] pending-approval cap reached; evicting a still-pending approval (account , peer ) — a client may show it as resolved-elsewhere",
     expression: "PENDING_APPROVAL_CAP",
     reason: "numeric module constant",
   },
   {
     file: "approvals.ts",
-    site: '[webchannel] pending-approval "" (account "", peer "") pruned after ms with no finalize — likely an orphaned approval (monitor disposed?)',
+    site: "[webchannel] pending-approval (account , peer ) pruned after ms with no finalize — likely an orphaned approval (monitor disposed?)",
     expression: "PENDING_APPROVAL_MAX_AGE_MS",
     reason: "numeric module constant",
+  },
+  {
+    file: "approvals.ts",
+    site: "[webchannel] event=webchannel.approval.origin_unresolved accountId= reason= sessionKey_present=",
+    expression: "sessionKeyPresent",
+    reason: "boolean",
+  },
+  {
+    file: "nats-channel.ts",
+    site: "[nats-channel] peer cap reached; evicting oldest peer",
+    expression: "this.maxPeers",
+    reason: "readonly number",
+  },
+  {
+    file: "nats-channel.ts",
+    site: "webchannel: device public key must be 32 bytes (got )",
+    expression: "devicePublicKey.length",
+    reason: "Uint8Array length (number)",
+  },
+  {
+    file: "nats-channel.ts",
+    site: '"[nats-channel] ingress result frame cannot fit effective NATS max_payload; "increase the server limit (suppressed=)',
+    expression: "suppressed",
+    reason: "suppressed-warning counter (number)",
+  },
+  {
+    file: "nats-channel.ts",
+    site: "[nats-channel] Dropping inbound from : ts outside ±ms window (skew=ms, messageId=) — stale replay or client clock skew",
+    expression: "this.replayWindowMs",
+    reason: "readonly millisecond duration (number)",
+  },
+  {
+    file: "nats-channel.ts",
+    site: "[nats-channel] Dropping inbound from : ts outside ±ms window (skew=ms, messageId=) — stale replay or client clock skew",
+    expression: "skew",
+    reason: "Date.now() minus authenticated numeric timestamp (number)",
+  },
+  {
+    file: "nats-channel.ts",
+    site: "[nats-channel] Dropping inbound from : ts outside ±ms window (skew=ms, messageId=) — stale replay or client clock skew",
+    expression: "logSafe(messageId)",
+    reason: "canonical quoted token; the static prose parenthesis is outside the attacker-controlled value",
   },
   // Retry/lifecycle counters on the `event=webchannel.*` records.
   {

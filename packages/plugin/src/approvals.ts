@@ -88,7 +88,6 @@ import type {
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   canonicalizeAccountId,
-  formatAccountIdForLog,
   listWebchannelAccountIds,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
@@ -233,8 +232,8 @@ function recordPendingApproval(
     if (evicted && !(typeof evictedExpiry === "number" && evictedExpiry <= Date.now())) {
       console.warn(
         `[webchannel] pending-approval cap ${PENDING_APPROVAL_CAP} reached; evicting a ` +
-          `still-pending approval "${evicted.payload.id}" (account "${evicted.accountKey}", ` +
-          `peer "${evicted.sessionKey}") — a client may show it as resolved-elsewhere`,
+          `still-pending approval ${logSafe(evicted.payload.id)} (account ${logSafe(evicted.accountKey)}, ` +
+          `peer ${logSafe(evicted.sessionKey)}) — a client may show it as resolved-elsewhere`,
       );
     }
     pendingApprovals.delete(oldest);
@@ -280,8 +279,8 @@ export function listPendingApprovalsForPeer(
       // expiry-driven prune is routine and stays quiet.
       if (tooOld) {
         console.warn(
-          `[webchannel] pending-approval "${entry.payload.id}" (account "${entry.accountKey}", ` +
-            `peer "${entry.sessionKey}") pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
+          `[webchannel] pending-approval ${logSafe(entry.payload.id)} (account ${logSafe(entry.accountKey)}, ` +
+            `peer ${logSafe(entry.sessionKey)}) pruned after ${PENDING_APPROVAL_MAX_AGE_MS}ms with no ` +
             `finalize — likely an orphaned approval (monitor disposed?)`,
         );
       }
@@ -809,8 +808,8 @@ export function createClawApprovalNativeRuntimeSpec(
           // F2 fail-closed: no live channel for this account (skipped/unknown).
           // Refuse to misroute onto the primary channel; drop with a warn.
           console.warn(
-            `[webchannel] approval ${pendingPayload.id} not delivered: no live channel for ` +
-              `account "${accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}" (skipped or unknown) — refusing to misroute`,
+            `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no live channel for ` +
+              `account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)} (skipped or unknown) — refusing to misroute`,
           );
           return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
         }
@@ -823,8 +822,8 @@ export function createClawApprovalNativeRuntimeSpec(
         const delivered = channel.sendApprovalRequest(sessionKey, pendingPayload);
         if (!delivered) {
           console.warn(
-            `[webchannel] approval ${pendingPayload.id} not delivered: no matching open ` +
-              `socket for "${sessionKey}" (account "${accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}")`,
+            `[webchannel] approval ${logSafe(pendingPayload.id)} not delivered: no matching open ` +
+              `socket for ${logSafe(sessionKey)} (account ${logSafe(accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)})`,
           );
         }
         return { approvalId: pendingPayload.id, sessionKey, accountId: accountId ?? null };
@@ -860,8 +859,8 @@ export function createClawApprovalNativeRuntimeSpec(
         const channel = transportFor(accountId ?? entry.accountId);
         if (!channel) {
           console.warn(
-            `[webchannel] approval ${entry.approvalId} resolve frame dropped: no live channel ` +
-              `for account "${accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID}"`,
+            `[webchannel] approval ${logSafe(entry.approvalId)} resolve frame dropped: no live channel ` +
+              `for account ${logSafe(accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID)}`,
           );
           return;
         }
@@ -906,12 +905,11 @@ type OriginUnresolvedReason =
  * The single diagnostic for a fallback origin that could not be proven — at most
  * one line per decision, and this file is its only owner.
  *
- * The account is quoted for logging through `formatAccountIdForLog` (an
- * operator-chosen deployment name, written as-is). The session key, the peer id
- * and the stored target are NEVER logged: together they identify a user and the
- * conversation they are having, and a dropped approval does not justify writing
- * that to an operator's log. `reason` plus the account is enough to tell a clock
- * problem from a mismatch from a missing store entry.
+ * The account is delimited through the canonical log-record helper. The session
+ * key, the peer id and the stored target are NEVER logged: together they identify
+ * a user and the conversation they are having, and a dropped approval does not
+ * justify writing that to an operator's log. `reason` plus the account is enough
+ * to tell a clock problem from a mismatch from a missing store entry.
  */
 function warnOriginUnresolved(
   rawAccountId: string,
@@ -920,7 +918,7 @@ function warnOriginUnresolved(
 ): void {
   console.warn(
     `[webchannel] event=webchannel.approval.origin_unresolved ` +
-      `accountId=${formatAccountIdForLog(rawAccountId)} reason=${reason} ` +
+      `accountId=${logSafe(rawAccountId)} reason=${reason} ` +
       `sessionKey_present=${sessionKeyPresent}`,
   );
 }

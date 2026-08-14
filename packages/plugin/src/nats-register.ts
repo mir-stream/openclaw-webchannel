@@ -67,6 +67,7 @@ import { popRequirementUnmet } from "./register-pop-gate.js";
 import { isValidClientNonce } from "./client-nonce.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 import { WEBCHANNEL_PROTOCOL_VERSION, readPluginVersion } from "./protocol.js";
+import { logSafe } from "./log-safe.js";
 
 /**
  * Generic register-reply payloads. ANY verification failure collapses to
@@ -246,7 +247,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
       unregIdentity = await deps.verifyIdentity(token);
     } catch (err) {
       // Transient or verify error → do NOT act on an unverified peerId.
-      logger?.error?.(`webchannel: unregister verify error (ignored): ${String(err)}`);
+      logger?.error?.(`webchannel: unregister verify error (ignored): ${logSafe(err)}`);
       return;
     }
     if (!unregIdentity) return;
@@ -258,7 +259,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     }
     if (subjectPeerId !== unregIdentity.peerId) {
       logger?.error?.(
-        `webchannel: unregister subject peerId "${subjectPeerId}" != JWT peerId "${unregIdentity.peerId}" — ignoring`,
+        `webchannel: unregister subject peerId ${logSafe(subjectPeerId)} != JWT peerId ${logSafe(unregIdentity.peerId)} — ignoring`,
       );
       return;
     }
@@ -275,7 +276,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     try {
       assertValidSubjectToken(unregIdentity.peerId, "peerId");
     } catch (err) {
-      logger?.error?.(`webchannel: unregister ${(err as Error).message}`);
+      logger?.error?.(`webchannel: unregister ${logSafe((err as Error).message)}`);
       return;
     }
 
@@ -284,7 +285,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     // BOTH ops rather than getting a teardown path that can never succeed.
     if (popRequirementUnmet(deps.requirePoP, Boolean(unregIdentity.popPublicJwk))) {
       logger?.error?.(
-        `webchannel: unregister ignored for ${unregIdentity.peerId} — proof-of-possession required (JWT has no pop_jwk)`,
+        `webchannel: unregister ignored for ${logSafe(unregIdentity.peerId)} — proof-of-possession required (JWT has no pop_jwk)`,
       );
       return;
     }
@@ -309,7 +310,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
         // the second lookup is "nonce-missing" and the teardown never runs. A
         // register-minted proof lands here too, as "signature-mismatch".
         logger?.error?.(
-          `webchannel: unregister PoP verification failed for ${unregIdentity.peerId} (${unregVerdict.reason})`,
+          `webchannel: unregister PoP verification failed for ${logSafe(unregIdentity.peerId)} (${logSafe(unregVerdict.reason)})`,
         );
         return;
       }
@@ -335,11 +336,11 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
     identity = await deps.verifyIdentity(token);
   } catch (err) {
     if (err instanceof TransientVerifyError) {
-      logger?.error?.(`webchannel: register verify unavailable (transient): ${String(err)}`);
+      logger?.error?.(`webchannel: register verify unavailable (transient): ${logSafe(err)}`);
       reply(REGISTER_UNAVAILABLE);
       return;
     }
-    logger?.error?.(`webchannel: register verify error: ${String(err)}`);
+    logger?.error?.(`webchannel: register verify error: ${logSafe(err)}`);
     reply(REGISTER_UNAUTHORIZED);
     return;
   }
@@ -361,7 +362,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   // subject peerId. Reject a mismatch.
   if (subjectPeerId !== peerId) {
     logger?.error?.(
-      `webchannel: register subject peerId "${subjectPeerId}" != JWT peerId "${peerId}" — rejecting`,
+      `webchannel: register subject peerId ${logSafe(subjectPeerId)} != JWT peerId ${logSafe(peerId)} — rejecting`,
     );
     reply(REGISTER_UNAUTHORIZED);
     return;
@@ -372,7 +373,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   try {
     assertValidSubjectToken(peerId, "peerId");
   } catch (err) {
-    logger?.error?.(`webchannel: ${(err as Error).message}`);
+    logger?.error?.(`webchannel: ${logSafe((err as Error).message)}`);
     reply(REGISTER_UNAUTHORIZED);
     return;
   }
@@ -409,7 +410,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   // it to upgrade.
   if (!isValidClientNonce(parsed.clientNonce)) {
     logger?.error?.(
-      `webchannel: register rejected for ${peerId} — missing or malformed clientNonce`,
+      `webchannel: register rejected for ${logSafe(peerId)} — missing or malformed clientNonce`,
     );
     reply(REGISTER_UNAUTHORIZED);
     return;
@@ -419,7 +420,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   // PoP gate (secure-by-default): PoP is REQUIRED unless auth.requirePoP=false.
   if (popRequirementUnmet(deps.requirePoP, Boolean(identity.popPublicJwk))) {
     logger?.error?.(
-      `webchannel: register rejected for ${peerId} — proof-of-possession required (JWT has no pop_jwk)`,
+      `webchannel: register rejected for ${logSafe(peerId)} — proof-of-possession required (JWT has no pop_jwk)`,
     );
     reply(REGISTER_UNAUTHORIZED);
     return;
@@ -443,7 +444,9 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
       popPublicJwk: identity.popPublicJwk,
     });
     if (!verdict.ok) {
-      logger?.error?.(`webchannel: PoP verification failed for ${peerId} (${verdict.reason})`);
+      logger?.error?.(
+        `webchannel: PoP verification failed for ${logSafe(peerId)} (${logSafe(verdict.reason)})`,
+      );
       reply(REGISTER_UNAUTHORIZED);
       return;
     }
@@ -453,7 +456,7 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
   // cnf device key. A register token without cnf has no key path, so reject it.
   if (!identity.devicePublicKey) {
     logger?.error?.(
-      `webchannel: register rejected for ${peerId} — JWT has no cnf device key (key delivery impossible)`,
+      `webchannel: register rejected for ${logSafe(peerId)} — JWT has no cnf device key (key delivery impossible)`,
     );
     reply(REGISTER_UNAUTHORIZED);
     return;
@@ -484,7 +487,9 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
       clientNonce,
     );
     if (!wrappedConversationKey) {
-      logger?.error?.(`webchannel: no conversation key established for ${peerId} at register`);
+      logger?.error?.(
+        `webchannel: no conversation key established for ${logSafe(peerId)} at register`,
+      );
       reply(REGISTER_FAILED);
       return;
     }
@@ -575,7 +580,9 @@ export async function handleRegisterRequest(deps: RegisterHandlerDeps): Promise<
       return;
     }
 
-    logger?.error?.(`webchannel: register failed for ${peerId}: ${String(err)}`);
+    logger?.error?.(
+      `webchannel: register failed for ${logSafe(peerId)}: ${logSafe(err)}`,
+    );
     reply(REGISTER_FAILED);
   }
 }

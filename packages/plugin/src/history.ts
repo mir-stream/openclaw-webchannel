@@ -1,6 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import { sanitizeHistoryText } from "./history-sanitize.js";
+import { logSafe } from "./log-safe.js";
 
 /**
  * History messages that travel on the wire and live in client state.
@@ -189,7 +190,9 @@ export async function recent(
   try {
     return await readFromStore(api, sessionKey, limit);
   } catch (err) {
-    logger?.warn?.(`webchannel: history.recent failed for ${sessionKey}: ${String(err)}`);
+    logger?.warn?.(
+      `webchannel: history.recent failed for ${logSafe(sessionKey)}: ${logSafe(err)}`,
+    );
     return [];
   }
 }
@@ -312,7 +315,9 @@ export async function pageBefore(
     // page is the honest signal — newest-N would only feed the client dupes.
     return [];
   } catch (err) {
-    logger?.warn?.(`webchannel: history.pageBefore failed for ${sessionKey}: ${String(err)}`);
+    logger?.warn?.(
+      `webchannel: history.pageBefore failed for ${logSafe(sessionKey)}: ${logSafe(err)}`,
+    );
     return [];
   }
 }
