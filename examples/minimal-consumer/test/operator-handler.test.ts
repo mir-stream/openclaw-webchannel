@@ -1,8 +1,10 @@
-import assert from "node:assert/strict";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { EnrollmentValidationError } from "@mir-stream/webchannel-saas";
 import { createMinimalConsumerEnrollmentHandler } from "../src/operator.ts";
+import { exampleAssert as assert, exampleTest } from "../../../scripts/example-test-guard.mjs";
+
+exampleTest("I132-E2: minimal consumer handler keeps enrollment semantics", async () => {
 
 async function invoke(handler: ReturnType<typeof createMinimalConsumerEnrollmentHandler>, path: string, value: unknown, authorization?: string) {
   const req = Readable.from([JSON.stringify(value)]) as IncomingMessage;
@@ -73,3 +75,4 @@ console.log("ok - in-progress approval is a distinct 409 and never falls through
 
 assert.deepEqual(await invoke(handler, "/enroll", {}), { status: 400, body: { error: "invalid enrollment" } });
 console.log("ok - EnrollmentValidationError maps to 400");
+});
