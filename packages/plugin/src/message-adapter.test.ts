@@ -1512,7 +1512,8 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
    * restart cumulative `onPartialReply` text with no second boundary.
    */
   it("M7h: KNOWN DEFECT #120 — a strict-prefix second message erases the first", async () => {
-    const h = makeDraftHarness();
+    const warn = vi.fn();
+    const h = makeDraftHarness({ logger: { warn } });
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "Done." });
     h.draft.pushAnswerText({ text: "Done. Roster listed." });
@@ -1552,6 +1553,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       () => expect(successfulIds(h.frames).length).toBe(2),
       { actual: 1, expected: 2 },
     );
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("M7i: a single backwards partial is swallowed, never read as a restart", async () => {
