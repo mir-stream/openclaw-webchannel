@@ -1549,7 +1549,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       { actual: ["Done."], expected: desiredTexts },
     );
     expectKnownAssertionFailure(
-      () => expect(new Set(finals.map((frame) => frame.id)).size).toBe(2),
+      () => expect(successfulIds(h.frames).length).toBe(2),
       { actual: 1, expected: 2 },
     );
   });
