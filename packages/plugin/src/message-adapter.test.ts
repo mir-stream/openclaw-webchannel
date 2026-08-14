@@ -1475,6 +1475,160 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
   });
 
   /**
+   * #120, KNOWN UNFIXED — a second message whose WHOLE text is a strict prefix
+   * of the first is erased from the wire. This test pins the exact two assertion
+   * failures produced by the defect: it PASSES only while the current one-final,
+   * one-id signature is present and turns RED the moment someone fixes or changes
+   * it, so the fix cannot land without updating the expectations deliberately.
+   *
+   * The shape crosses two guards, both correct in isolation. M7d pins the case
+   * where message 2's first chunk is a prefix and a LATER chunk grows past
+   * message 1 — that later chunk is what the missed-boundary fail-safe sees.
+   * Here no chunk ever grows past it: "Done." is a strict prefix of
+   * "Done. Roster listed." from its first character to its last, so every
+   * partial of message 2 is swallowed by the shrink guard, the fail-safe never
+   * sees a divergence, and `finalize` writes "Done." onto message 1's bubble.
+   *
+   * WHY IT IS NOT FIXED HERE. Every candidate signal is produced by ordinary
+   * single-message turns too, because core runs `sanitizeUserFacingText` over
+   * every cumulative payload and its tag strippers make our input a sawtooth
+   * (see `lastRawAnswerText`):
+   *
+   *   - "the raw text went backwards"            -> every completing core tag
+   *   - "...twice in a row, growing"             -> M7k, two adjacent tool calls
+   *   - "the final is a strict prefix of what
+   *      the lane displayed"                     -> every message ENDING in a
+   *                                                 tool call: the sanitized
+   *                                                 final drops the tag text
+   *
+   * Measured on core 2026.7.1-2. The last one also rules out deferring the
+   * decision to the end of the stream, since that is where it is evaluated.
+   * The distinction is not carried by the text at all — it has to come from the
+   * boundary signal, which is precisely what is missing in this scenario.
+   *
+   * The premise is real, not hypothetical: the pinned core's provider-capabilities/
+   * Codex native path gates `onAssistantMessageStart` behind a sticky per-run
+   * `assistantStarted` flag while successive eligible `final_answer` items can
+   * restart cumulative `onPartialReply` text with no second boundary.
+   */
+  it("M7h: KNOWN DEFECT #120 — a strict-prefix second message erases the first", async () => {
+    const warn = vi.fn();
+    const h = makeDraftHarness({ logger: { warn } });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Done." });
+    h.draft.pushAnswerText({ text: "Done. Roster listed." });
+    // --- core misses the structured boundary here ---
+    h.draft.pushAnswerText({ text: "D" });
+    h.draft.pushAnswerText({ text: "Don" });
+    h.draft.pushAnswerText({ text: "Done." });
+    await expect(h.draft.finalize("Done.")).resolves.toBe(true);
+    await h.draft.drain();
+
+    const finals = h.frames.filter((frame) => frame.type === "final");
+    const desiredTexts = [
+      "Done. Roster listed.",
+      "Done.",
+    ];
+
+    const expectKnownAssertionFailure = (
+      assertion: () => void,
+      signature: { actual: unknown; expected: unknown },
+    ) => {
+      let failure: unknown;
+      try {
+        assertion();
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({ name: "AssertionError", ...signature });
+    };
+
+    // What SHOULD happen. Today only "Done." is finalised, on message 1's id:
+    // "Done. Roster listed." is overwritten and never survives as a bubble.
+    expectKnownAssertionFailure(
+      () => expect(finals.map((frame) => frame.text)).toEqual(desiredTexts),
+      { actual: ["Done."], expected: desiredTexts },
+    );
+    expectKnownAssertionFailure(
+      () => expect(successfulIds(h.frames).length).toBe(2),
+      { actual: 1, expected: 2 },
+    );
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("M7i: a single backwards partial is swallowed, never read as a restart", async () => {
+    // The controller-level twin of channel.test.ts "ignores a shrinking
+    // cumulative partial". A backwards cumulative payload is what core emits
+    // the instant one of ITS tag strippers closes a tag, so it is ordinary
+    // in-message traffic; rotating on it splits one answer into two bubbles.
+    const warn = vi.fn();
+    const h = makeDraftHarness({ logger: { warn } });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Hello world" });
+    h.draft.pushAnswerText({ text: "Hello" });
+    await expect(h.draft.finalize("Hello final")).resolves.toBe(true);
+    await h.draft.drain();
+
+    expect(h.frames.map((frame) => frame.text)).toEqual(["Hello world", "Hello final"]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
+  });
+
+  /**
+   * M7k — THE TRAP. Two adjacent tool-call tags in ONE assistant message.
+   *
+   * This is a real core payload stream, not a hand-written one: the text
+   * `Here you go.<tool_call>{"n":1}</tool_call><tool_call>{"n":2}</tool_call> Done.`
+   * fed one character at a time through `sanitizeUserFacingText` on core
+   * 2026.7.1-2, keeping each distinct output. It is inlined rather than
+   * regenerated because reaching that function means importing a hash-bearing
+   * `dist/` path, which rots at every pin bump (#122).
+   *
+   * The stream is a SAWTOOTH: it climbs to "Here you go.<tool_call>", drops to
+   * "Here you go." when core strips the completed pair, climbs the identical
+   * path again for the second tag, drops again, then finishes. Two consecutive
+   * backwards payloads, the second growing from the first — inside one message.
+   *
+   * That is why #120 cannot be fixed by reading the text (see M7h). A guard
+   * keying on that pair shipped in review and produced THREE bubbles here, the
+   * first two byte-identical: the user saw "Here you go.<tool_call>" twice.
+   * Assert distinctness so no future attempt can reintroduce a duplicate.
+   */
+  it("M7k: an in-message tag sawtooth never emits a duplicate bubble", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of [
+      "H", "He", "Her", "Here", "Here ", "Here y", "Here yo", "Here you",
+      "Here you ", "Here you g", "Here you go", "Here you go.",
+      "Here you go.<", "Here you go.<t", "Here you go.<to", "Here you go.<too",
+      "Here you go.<tool", "Here you go.<tool_", "Here you go.<tool_c",
+      "Here you go.<tool_ca", "Here you go.<tool_cal", "Here you go.<tool_call",
+      "Here you go.<tool_call>",
+      "Here you go.", // core strips the first completed pair
+      "Here you go.<", "Here you go.<t", "Here you go.<to", "Here you go.<too",
+      "Here you go.<tool", "Here you go.<tool_", "Here you go.<tool_c",
+      "Here you go.<tool_ca", "Here you go.<tool_cal", "Here you go.<tool_call",
+      "Here you go.<tool_call>",
+      "Here you go.", // and the second
+      "Here you go. ", "Here you go. D", "Here you go. Do", "Here you go. Don",
+      "Here you go. Done", "Here you go. Done.",
+    ]) {
+      h.draft.pushAnswerText({ text });
+    }
+    await expect(h.draft.finalize("Here you go. Done.")).resolves.toBe(true);
+    await h.draft.drain();
+
+    const finals = h.frames.filter((frame) => frame.type === "final");
+    const texts = finals.map((frame) => frame.text);
+    // The invariant that the reverted guard broke: never the same text twice.
+    expect(new Set(texts).size).toBe(texts.length);
+    // Current shape. The 2 is #129 (this one message still splits at the
+    // fail-safe, which is a separate open defect) — whoever fixes #129 should
+    // change this to 1 deliberately. It must never grow.
+    expect(texts).toEqual(["Here you go.<tool_call>", "Here you go. Done."]);
+  });
+
+  /**
    * #94 — a notice block between two real blocks used to stall every later
    * message for the rest of the turn.
    *
