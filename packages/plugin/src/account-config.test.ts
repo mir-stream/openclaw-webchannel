@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import {
   mkdirSync,
   mkdtempSync,
@@ -12,7 +13,6 @@ import { dirname, join } from "node:path";
 
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  canonicalizeAccountId,
   isValidAccountId,
   assertValidAccountId,
   listWebchannelAccountIds,
@@ -67,7 +67,16 @@ describe("P0-2 removed config migration", () => {
 
 describe("account-config: account id validation (TRUST BOUNDARY)", () => {
   it("accepts safe ids", () => {
-    for (const id of ["default", "acctA", "acct-1", "a_b-C9", "x".repeat(64)]) {
+    for (const id of [
+      "default",
+      "acctA",
+      "acct-1",
+      "a_b-C9",
+      "_a",
+      "-a",
+      "99-",
+      "x".repeat(64),
+    ]) {
       expect(isValidAccountId(id)).toBe(true);
     }
   });
@@ -93,20 +102,33 @@ describe("account-config: account id validation (TRUST BOUNDARY)", () => {
     expect(() => assertValidAccountId("../../tmp/evil")).toThrow(/invalid account id/);
   });
 
-  it("canonicalizeAccountId collapses a traversal sequence to a safe id (core-compatible)", () => {
-    expect(canonicalizeAccountId("../../tmp/evil")).toBe("tmp-evil");
-    expect(isValidAccountId(canonicalizeAccountId("../../tmp/evil"))).toBe(true);
+  it("uses the SDK contract to collapse a traversal sequence to a safe id", () => {
+    expect(normalizeAccountId("../../tmp/evil")).toBe("tmp-evil");
+    expect(isValidAccountId(normalizeAccountId("../../tmp/evil"))).toBe(true);
   });
 
-  it("canonicalizeAccountId defaults empty/blocked to 'default'", () => {
-    expect(canonicalizeAccountId(undefined)).toBe("default");
-    expect(canonicalizeAccountId("   ")).toBe("default");
-    expect(canonicalizeAccountId("__proto__")).toBe("default");
+  it("keeps the plugin blocked-key policy aligned with the SDK contract", () => {
+    expect(normalizeAccountId(undefined)).toBe("default");
+    expect(normalizeAccountId("   ")).toBe("default");
+    for (const id of [
+      "__proto__",
+      "prototype",
+      "constructor",
+      "__PROTO__",
+      "Prototype",
+      "CONSTRUCTOR",
+    ]) {
+      expect(isValidAccountId(id)).toBe(false);
+      expect(normalizeAccountId(id)).toBe("default");
+    }
   });
 
-  it("canonicalizeAccountId lowercases and preserves valid ids", () => {
-    expect(canonicalizeAccountId("AcctA")).toBe("accta");
-    expect(canonicalizeAccountId("acct-1")).toBe("acct-1");
+  it("keeps raw path safety separate from SDK identity normalization", () => {
+    expect(normalizeAccountId("AcctA")).toBe("accta");
+    expect(normalizeAccountId("acct-1")).toBe("acct-1");
+    expect(normalizeAccountId("_a")).toBe("_a");
+    expect(normalizeAccountId("-a")).toBe("a");
+    expect(normalizeAccountId("99-")).toBe("99-");
   });
 });
 
@@ -330,6 +352,74 @@ describe("account-config: resolveReasoningEnabled (#113)", () => {
 });
 
 describe("account-config: listWebchannelAccountIds", () => {
+  function expectNormalizedCollision(ids: readonly string[], normalized: string): void {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: Object.fromEntries(ids.map((id) => [id, { tenant: "t" }])),
+        },
+      },
+    };
+    const inspection = inspectWebchannelAccountIds(cfg);
+
+    expect(inspection.validIds).toEqual([]);
+    expect(inspection.usesImplicitDefault).toBe(false);
+    expect(inspection.invalid.map(({ id }) => id)).toEqual(
+      [...ids].sort((a, b) => a.localeCompare(b)),
+    );
+    for (const { reason } of inspection.invalid) {
+      expect(reason).toContain(JSON.stringify(normalized));
+      for (const id of ids) expect(reason).toContain(JSON.stringify(id));
+    }
+    expect(planAccounts(cfg, { env: {} })).toEqual([]);
+  }
+
+  it("rejects a case-fold collision and identifies both configured ids (#135)", () => {
+    expectNormalizedCollision(["Acme", "acme"], "acme");
+  });
+
+  it("rejects an invalid-character replacement collision (#135)", () => {
+    expectNormalizedCollision(["a.b", "a-b"], "a-b");
+  });
+
+  it("rejects a whitespace-trimming collision (#135)", () => {
+    expectNormalizedCollision([" acme", "acme "], "acme");
+  });
+
+  it("rejects a 64-character clamp collision (#135)", () => {
+    const sharedPrefix = "a".repeat(64);
+    expectNormalizedCollision([`${sharedPrefix}x`, `${sharedPrefix}y`], sharedPrefix);
+  });
+
+  it.each([
+    ["99", "99-"],
+    ["a", "a-"],
+    ["x-y", "x-y-"],
+  ])(
+    "serves %s and %s as distinct SDK identities (#135 false-positive guard)",
+    (left, right) => {
+      const cfg = {
+        channels: {
+          webchannel: {
+            accounts: {
+              [left]: { tenant: "t" },
+              [right]: { tenant: "t" },
+            },
+          },
+        },
+      };
+
+      expect(inspectWebchannelAccountIds(cfg)).toEqual({
+        validIds: [left, right].sort((a, b) => a.localeCompare(b)),
+        invalid: [],
+        usesImplicitDefault: false,
+      });
+      expect(planAccounts(cfg, { env: {} }).map(({ accountId }) => accountId)).toEqual(
+        [left, right].sort((a, b) => a.localeCompare(b)),
+      );
+    },
+  );
+
   it("isolates invalid raw keys and does not synthesize default for an explicit all-invalid map", () => {
     const mixed = { channels: { webchannel: { accounts: { good: {}, "bad.id": {}, constructor: {}, Zed: {} } } } };
     expect(inspectWebchannelAccountIds(mixed)).toEqual({

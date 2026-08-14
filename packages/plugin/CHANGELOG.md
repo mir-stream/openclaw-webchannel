@@ -149,6 +149,21 @@ keep the accounts disabled and escalate through incident response.
 
 ### Fixed
 
+- **#135 — account ids that the OpenClaw SDK normalizes to one value are now
+  rejected before serving.** A config such as `accounts.Acme` plus
+  `accounts.acme` previously started both authorization namespaces while core
+  folded their session keys together. Inspection now groups every raw account
+  key through `openclaw/plugin-sdk/account-id` and rejects every member of a
+  shared group, including aliases created by case folding, invalid-character
+  replacement, whitespace trimming, or the 64-character clamp. Valid ids that
+  the SDK keeps distinct remain distinct (`99` and `99-`, for example).
+  Startup emits `event=webchannel.invalid_account_id` for each rejected raw id;
+  the reason names the normalized value and the complete conflicting id list.
+  Operators must rename or remove entries until every normalized account id is
+  unique. This does not change the key format, but a deployment that previously
+  ran a colliding config will skip all members of that collision after
+  restart/reload. Inspection compares one config generation only; a sequential
+  case-only rename across a hot reload remains outside this fix.
 - **#99 — a coalesced turn now settles EVERY message it merged.** When busy-time
   coalescing folds N buffered user messages into one turn, the turn used to emit
   a single `turn_settled` naming only the last (anchor) wireId, so the other

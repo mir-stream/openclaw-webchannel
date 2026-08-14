@@ -36,11 +36,11 @@ import type {
   ChannelSetupWizard,
   ChannelSetupWizardTextInput,
 } from "openclaw/plugin-sdk/setup";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  canonicalizeAccountId,
   formatAccountIdForLog,
   isValidAccountId,
   loadPersistedCredentialDocument,
@@ -210,9 +210,9 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       // non-interactive harness) — nothing enroll-ready to write.
       return { cfg };
     }
-    // Canonicalize before writing: the canonical account id is also the JWT
+    // Normalize before writing: the normalized account id is also the JWT
     // audience expected by the runtime verifier.
-    const id = canonicalizeAccountId(accountId);
+    const id = normalizeAccountId(accountId);
     const next = webchannelSetup.applyAccountConfig({
       cfg,
       accountId: id,
