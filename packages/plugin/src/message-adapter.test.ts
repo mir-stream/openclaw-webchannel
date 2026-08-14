@@ -1476,9 +1476,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
 
   /**
    * #120, KNOWN UNFIXED — a second message whose WHOLE text is a strict prefix
-   * of the first is erased from the wire. `it.fails` pins the defect: this test
-   * PASSES while the bug is present and turns RED the moment someone fixes it,
-   * so the fix cannot land without deleting the `.fails` and reading this note.
+   * of the first is erased from the wire. This test pins the exact two assertion
+   * failures produced by the defect: it PASSES only while the current one-final,
+   * one-id signature is present and turns RED the moment someone fixes or changes
+   * it, so the fix cannot land without updating the expectations deliberately.
    *
    * The shape crosses two guards, both correct in isolation. M7d pins the case
    * where message 2's first chunk is a prefix and a LATER chunk grows past
@@ -1505,11 +1506,12 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
    * The distinction is not carried by the text at all — it has to come from the
    * boundary signal, which is precisely what is missing in this scenario.
    *
-   * The premise is real, not hypothetical: three core backends gate
-   * `onAssistantMessageStart` behind a sticky per-run `assistantStarted` flag,
-   * so message 2 of a run emits partials with no boundary at all.
+   * The premise is real, not hypothetical: the pinned core's provider-capabilities/
+   * Codex native path gates `onAssistantMessageStart` behind a sticky per-run
+   * `assistantStarted` flag while successive eligible `final_answer` items can
+   * restart cumulative `onPartialReply` text with no second boundary.
    */
-  it.fails("M7h: KNOWN DEFECT #120 — a strict-prefix second message erases the first", async () => {
+  it("M7h: KNOWN DEFECT #120 — a strict-prefix second message erases the first", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "Done." });
@@ -1521,13 +1523,35 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await expect(h.draft.finalize("Done.")).resolves.toBe(true);
     await h.draft.drain();
 
-    // What SHOULD happen. Today only the second element is delivered, on
-    // message 1's bubble: "Done. Roster listed." never reaches the user.
     const finals = h.frames.filter((frame) => frame.type === "final");
-    expect(finals.map((frame) => frame.text)).toEqual([
+    const desiredTexts = [
       "Done. Roster listed.",
       "Done.",
-    ]);
+    ];
+
+    const expectKnownAssertionFailure = (
+      assertion: () => void,
+      signature: { actual: unknown; expected: unknown },
+    ) => {
+      let failure: unknown;
+      try {
+        assertion();
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({ name: "AssertionError", ...signature });
+    };
+
+    // What SHOULD happen. Today only "Done." is finalised, on message 1's id:
+    // "Done. Roster listed." is overwritten and never survives as a bubble.
+    expectKnownAssertionFailure(
+      () => expect(finals.map((frame) => frame.text)).toEqual(desiredTexts),
+      { actual: ["Done."], expected: desiredTexts },
+    );
+    expectKnownAssertionFailure(
+      () => expect(new Set(finals.map((frame) => frame.id)).size).toBe(2),
+      { actual: 1, expected: 2 },
+    );
   });
 
   it("M7i: a single backwards partial is swallowed, never read as a restart", async () => {
