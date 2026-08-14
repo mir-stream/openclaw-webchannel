@@ -6,7 +6,7 @@
   "description": "Minimal downstream consumer proving the public package boundary of @mir-stream/webchannel-{saas,client}.",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node test/boundary.test.mjs; boundary=$?; node --import tsx test/operator-handler.test.ts; behavior=$?; test $boundary -eq 0 -a $behavior -eq 0"
+    "test": "node --import ../../scripts/example-test-guard.mjs --test --test-isolation=none test/boundary.test.mjs; boundary=$?; node --import tsx --import ../../scripts/example-test-guard.mjs --test --test-isolation=none test/operator-handler.test.ts; behavior=$?; test $boundary -eq 0 -a $behavior -eq 0"
   },
   "dependencies": {
     "@mir-stream/webchannel-saas": "*",
