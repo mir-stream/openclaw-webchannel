@@ -80,7 +80,7 @@
  * USAGE — the gate runs the first form, so a green local run IS the gate:
  *   npm run test:inventory                  # check (collects via `vitest list`)
  *   npm run test:inventory:update           # regenerate the snapshot
- *   npm run test:inventory:update -- --accept-deletions   # …for real deletions
+ *   npm run test:inventory:update -- --accept-deletions   # …to accept deletions
  *                                                         # or first bootstrap
  *   node scripts/check-test-inventory.mjs <list.json>            # check a
  *                                                                # captured list
@@ -105,6 +105,10 @@ const SNAPSHOT = join(REPO, ".github", "test-inventory.json");
 const SNAPSHOT_REL = relative(REPO, SNAPSHOT).split(sep).join("/");
 const UPDATE_CMD = "npm run test:inventory:update";
 const ACCEPT_UPDATE_CMD = `${UPDATE_CMD} -- --accept-deletions`;
+const NATS_COLLECTION_SENTINELS = [
+  "packages/plugin/src/nats-transport-realserver.test.ts",
+  "packages/saas/src/nats-permissions-realserver.test.ts",
+];
 
 class FatalError extends Error {}
 
@@ -319,21 +323,28 @@ function loadSnapshot() {
  * after which the developer's own check is green with 23 tests' worth of
  * enforcement gone. CI catches it as DRIFT, but the commit already happened.
  *
- * THE TRIGGER IS THE TOTAL, NOT THE PER-FILE DELTA, and that choice is what
- * keeps this guard alive. Per-file, any test MOVED between files trips it — one
- * file loses 3, another gains 3 — so `--accept-deletions` would become the
- * incantation for routine refactors, and a flag typed by habit guards nothing.
- * The failure this exists to catch can only SUBTRACT: a collection gap (missing
- * binary, a suite gone dormant) never invents tests. So a net drop is refused,
- * while count-neutral and growing rewrites pass — and any file that lost tests
- * is still PRINTED, so a move is visible without being blocked, and the
- * committed snapshot still carries the per-file negative diff for review.
+ * THE DEFAULT TRIGGER IS THE TOTAL, NOT THE PER-FILE DELTA, and that choice is
+ * what keeps this guard alive. Per-file, any test MOVED between files trips it
+ * — one file loses 3, another gains 3 — so `--accept-deletions` would become
+ * the incantation for routine refactors, and a flag typed by habit guards
+ * nothing. A collection gap (missing binary, a suite gone dormant) only
+ * subtracts, so a net drop is refused while count-neutral and growing rewrites
+ * pass — and any file that lost tests is still PRINTED, so a move is visible
+ * without being blocked.
+ *
+ * One known collection gap gets an independent check: without nats-server both
+ * real-server files disappear together (-23), but unrelated additions can
+ * offset that loss and defeat a total-only guard. Those files are therefore
+ * collection sentinels: either one missing requires explicit acceptance even
+ * when the total holds. This applies equally to fresh and captured lists; the
+ * latter cannot prove which environment originally collected it.
  *
  * The counts cannot prove a move: N tests leaving file A and N unrelated tests
  * arriving in file B is indistinguishable from a move by any count-only check.
  * Naming test names in the snapshot would settle it and cost a 2700-line file
- * that churns on every rename. Refusing on the total is the honest line: it
- * catches every environmental shrink exactly, and it never fires on a refactor.
+ * that churns on every rename. The total catches every uncompensated shrink
+ * without firing on a refactor; the sentinel exception covers the known
+ * compensable environmental gap above.
  *
  * Refusing rather than warning (when it does fire) is deliberate — a warning
  * scrolls past in the same terminal that is about to `git commit`, and the
@@ -356,6 +367,23 @@ function reviewShrink(next, accepted) {
   // parseable-but-corrupt baseline is no more useful for detecting shrinkage
   // than a missing one, and must never be overwritten by a bare update.
   const prev = loadSnapshot();
+
+  const missingNatsSentinels = NATS_COLLECTION_SENTINELS.filter(
+    (file) => file in prev && !(file in next),
+  );
+  if (missingNatsSentinels.length > 0) {
+    const details = missingNatsSentinels.map((file) => `  ${file}: GONE`).join("\n");
+    if (!accepted) {
+      fail(
+        `refusing to write an inventory missing ${missingNatsSentinels.length} nats-server collection ` +
+          `sentinel(s):\n${details}\n\n` +
+          "  These files disappear when nats-server is unavailable during collection; additions\n" +
+          "  elsewhere cannot prove that collection was complete. Install nats-server and re-run\n" +
+          `  (or recapture the list). If the files were intentionally removed: ${ACCEPT_UPDATE_CMD}`,
+      );
+    }
+    console.warn(`Accepting missing nats-server collection sentinel(s):\n${details}`);
+  }
 
   const losses = [];
   const gains = [];
@@ -404,7 +432,8 @@ function reviewShrink(next, accepted) {
     "\nIf you did not just delete those tests, this is a collection gap rather than a\n" +
       "deletion — most often nats-server missing with CI unset, which drops the two\n" +
       "`skipIf` real-server suites (-23). Install it and re-run.\n" +
-      "Moving tests between files does NOT need a flag; only a net loss does.\n" +
+      "Moving tests between ordinary files does NOT need a flag; only a net loss or\n" +
+      "the disappearance of a required nats-server collection sentinel does.\n" +
       `If tests really were deleted: ${UPDATE_CMD} -- --accept-deletions`,
   );
   process.exit(1);
@@ -455,8 +484,9 @@ function check(listPath) {
       `\nNet: ${expectedTotal} → ${actualTotal} collected tests (${actualTotal - expectedTotal}).\n` +
         "A test was deleted, skipped, moved, or stopped being collected. Restore it, or —\n" +
         `if the change is intentional — run '${UPDATE_CMD}' and commit ${SNAPSHOT_REL},\n` +
-        "so a reviewer sees the change as an explicit per-file diff. A move needs nothing\n" +
-        "more; only a NET loss of tests will make that command ask you to confirm.\n" +
+        "so a reviewer sees the change as an explicit per-file diff. An ordinary move needs\n" +
+        "nothing more; a NET loss or a nats-server sentinel disappearing will ask you\n" +
+        "to confirm explicitly.\n" +
         "\nTwo false alarms to rule out first:\n" +
         "  - running locally without nats-server: the `skipIf` real-server suites do not\n" +
         "    collect without it (-23). Install it — CI always has it.\n" +

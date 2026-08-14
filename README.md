@@ -95,8 +95,12 @@ than a real deletion. Confirm the deletion explicitly:
 npm run test:inventory:update -- --accept-deletions
 ```
 
-Only a **net** loss needs that flag: moving tests between files leaves the total
-unchanged and goes through without it (the affected files are still printed).
+Only a **net** loss normally needs that flag: moving tests between files leaves
+the total unchanged and goes through without it (the affected files are still
+printed). The fail-closed exception is either of the two `nats-server`
+real-server files disappearing from the inventory: that needs explicit
+acceptance even when new tests elsewhere offset the loss, because a missing
+`nats-server` produces the same misleading count-neutral result.
 
 Both commands need `nats-server` — on `PATH`, or in `/usr/local/bin`,
 `/usr/bin` or `/opt/homebrew/bin`, which the suites probe unconditionally. It is
