@@ -80,8 +80,8 @@
  * USAGE — the gate runs the first form, so a green local run IS the gate:
  *   npm run test:inventory                  # check (collects via `vitest list`)
  *   npm run test:inventory:update           # regenerate the snapshot
- *   npm run test:inventory:update -- --accept-deletions   # …when tests really
- *                                                         # were removed
+ *   npm run test:inventory:update -- --accept-deletions   # …for real deletions
+ *                                                         # or first bootstrap
  *   node scripts/check-test-inventory.mjs <list.json>            # check a
  *                                                                # captured list
  *   node scripts/check-test-inventory.mjs --scope <results.json> # assert a run
@@ -104,10 +104,12 @@ const REPO = fileURLToPath(new URL("..", import.meta.url));
 const SNAPSHOT = join(REPO, ".github", "test-inventory.json");
 const SNAPSHOT_REL = relative(REPO, SNAPSHOT).split(sep).join("/");
 const UPDATE_CMD = "npm run test:inventory:update";
+const ACCEPT_UPDATE_CMD = `${UPDATE_CMD} -- --accept-deletions`;
+
+class FatalError extends Error {}
 
 function fail(msg) {
-  console.error(`FATAL: ${msg}`);
-  process.exit(1);
+  throw new FatalError(msg);
 }
 
 function readJson(path, what) {
@@ -249,11 +251,26 @@ const SNAPSHOT_KEYS = new Set(["note", "files"]);
  * excusing that file.
  */
 function loadSnapshot() {
-  if (!existsSync(SNAPSHOT)) fail(`${SNAPSHOT_REL} is missing. Regenerate it with '${UPDATE_CMD}'.`);
-  const snapshot = readJson(SNAPSHOT, "test inventory snapshot");
+  if (!existsSync(SNAPSHOT)) {
+    fail(`${SNAPSHOT_REL} is missing. Restore it, or bootstrap a new baseline with '${ACCEPT_UPDATE_CMD}'.`);
+  }
+  let snapshot;
+  try {
+    snapshot = JSON.parse(readFileSync(SNAPSHOT, "utf8"));
+  } catch (err) {
+    fail(
+      `${SNAPSHOT_REL} exists but is not valid JSON: ${err.message}\n` +
+        "  Left-over merge conflict markers are the usual cause. Resolve them (the\n" +
+        "  per-file lines merge cleanly; take both sides). If the baseline cannot be\n" +
+        `  recovered, delete the file and explicitly bootstrap it with '${ACCEPT_UPDATE_CMD}'.`,
+    );
+  }
 
   if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) {
-    fail(`${SNAPSHOT_REL} is not a JSON object. Regenerate it with '${UPDATE_CMD}'.`);
+    fail(
+      `${SNAPSHOT_REL} is not a JSON object. Repair it, or delete it and bootstrap a new baseline with ` +
+        `'${ACCEPT_UPDATE_CMD}'.`,
+    );
   }
 
   const unknown = Object.keys(snapshot).filter((k) => !SNAPSHOT_KEYS.has(k));
@@ -268,7 +285,10 @@ function loadSnapshot() {
 
   const expected = snapshot.files;
   if (expected === null || typeof expected !== "object" || Array.isArray(expected) || Object.keys(expected).length === 0) {
-    fail(`${SNAPSHOT_REL} has no usable 'files' map. Regenerate it with '${UPDATE_CMD}'.`);
+    fail(
+      `${SNAPSHOT_REL} has no usable 'files' map. Repair it, or delete it and bootstrap a new baseline with ` +
+        `'${ACCEPT_UPDATE_CMD}'.`,
+    );
   }
 
   const bad = [];
@@ -282,7 +302,9 @@ function loadSnapshot() {
   if (bad.length > 0) {
     console.error(`FATAL: ${SNAPSHOT_REL} is corrupt — ${bad.length} bad entr(y/ies):`);
     console.error(bad.join("\n"));
-    console.error(`\nRegenerate it with '${UPDATE_CMD}' rather than hand-editing.`);
+    console.error(
+      `\nRepair it, or delete it and explicitly bootstrap a new baseline with '${ACCEPT_UPDATE_CMD}'.`,
+    );
     process.exit(1);
   }
 
@@ -318,28 +340,22 @@ function loadSnapshot() {
  * recovery is a follow-up commit.
  */
 function reviewShrink(next, accepted) {
-  if (!existsSync(SNAPSHOT)) return;
+  if (!existsSync(SNAPSHOT)) {
+    if (!accepted) {
+      fail(
+        `${SNAPSHOT_REL} is missing; refusing to bootstrap an inventory without explicit acceptance.\n` +
+          "  A missing snapshot removes the prior baseline, so collection gaps cannot be detected.\n" +
+          `  Restore it, or intentionally create a new baseline with '${ACCEPT_UPDATE_CMD}'.`,
+      );
+    }
+    console.warn(`Bootstrapping missing ${SNAPSHOT_REL} with --accept-deletions.`);
+    return;
+  }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(readFileSync(SNAPSHOT, "utf8"));
-  } catch (err) {
-    // An unreadable snapshot must be LOUD. Returning quietly here would disable
-    // the guard in exactly the scenario the SHAPE note names as its driver: a
-    // merge leaves conflict markers in this file, and the next `--update` on a
-    // machine with a collection gap overwrites it with a short inventory and no
-    // warning at all.
-    fail(
-      `${SNAPSHOT_REL} exists but is not valid JSON: ${err.message}\n` +
-        "  Left-over merge conflict markers are the usual cause. Resolve them (the\n" +
-        "  per-file lines merge cleanly; take both sides), or delete the file and\n" +
-        `  re-run '${UPDATE_CMD}' to regenerate it from scratch.`,
-    );
-  }
-  const prev = parsed?.files;
-  if (!prev || typeof prev !== "object" || Array.isArray(prev)) {
-    fail(`${SNAPSHOT_REL} has no usable 'files' map. Delete it and re-run '${UPDATE_CMD}' to regenerate.`);
-  }
+  // Update must trust exactly the same snapshot shapes as check mode. A
+  // parseable-but-corrupt baseline is no more useful for detecting shrinkage
+  // than a missing one, and must never be overwritten by a bare update.
+  const prev = loadSnapshot();
 
   const losses = [];
   const gains = [];
@@ -482,10 +498,16 @@ function usage(code) {
   process.exit(code);
 }
 
-if (unknownFlags.length > 0 || positional.length > 1) usage(2);
-else if (flags.has("--update") && !flags.has("--scope")) update(positional[0], flags.has("--accept-deletions"));
-else if (flags.has("--scope") && !flags.has("--update") && !flags.has("--accept-deletions")) {
-  if (positional.length !== 1) usage(2);
-  scope(positional[0]);
-} else if (flags.size === 0) check(positional[0] ?? null);
-else usage(2);
+try {
+  if (unknownFlags.length > 0 || positional.length > 1) usage(2);
+  else if (flags.has("--update") && !flags.has("--scope")) update(positional[0], flags.has("--accept-deletions"));
+  else if (flags.has("--scope") && !flags.has("--update") && !flags.has("--accept-deletions")) {
+    if (positional.length !== 1) usage(2);
+    scope(positional[0]);
+  } else if (flags.size === 0) check(positional[0] ?? null);
+  else usage(2);
+} catch (err) {
+  if (!(err instanceof FatalError)) throw err;
+  console.error(`FATAL: ${err.message}`);
+  process.exitCode = 1;
+}
