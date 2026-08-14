@@ -1,0 +1,15 @@
+{
+  "note": "Maximum runtime-skipped collected tests per file. Unlisted files allow zero. Each width is visible debt: up to that many tests in the named file can disappear at runtime without failing this guard, so every entry is source-liveness checked and must be removed when its ctx.skip callsites disappear.",
+  "files": {
+    "packages/plugin/src/nats-transport.test.ts": {
+      "maxRuntimeSkips": 2,
+      "ctxSkipCallsites": 2,
+      "reason": "Two port-scan tests may become inconclusive when the Vitest worker's per-PID LISTEN floor drifts under full-suite load."
+    },
+    "packages/saas/src/p1-1-http-ui-contract.test.ts": {
+      "maxRuntimeSkips": 2,
+      "ctxSkipCallsites": 1,
+      "reason": "Two real-HTTP matrix cases share one helper that skips when the sandbox denies listen(2) with EPERM."
+    }
+  }
+}
