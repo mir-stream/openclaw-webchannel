@@ -161,6 +161,8 @@ type DeferredCoreTagTail = {
   terminalFallbackText?: string;
   /** A plural wrapper previously exposed a recognized nested XML payload. */
   pluralWrapperSawRecognizedXmlPayload?: boolean;
+  /** Last viable-but-incomplete plural XML source, retained across a suppressed exact name. */
+  pluralWrapperPendingXmlPayloadSource?: string;
   /** Unmatched inline-code opener preceding the held sanitizer marker. */
   inlineCodeOpeningStart?: number;
   /** A line-start `[tool:name]` block may emit another XML parameter after a suppressed gap. */
@@ -2600,6 +2602,7 @@ function deferCoreStrippedTagTail(
     visiblePrefix: string;
     terminalRestorable: boolean;
     pluralWrapperSawRecognizedXmlPayload?: boolean;
+    pluralWrapperPendingXmlPayloadSource?: string;
     inlineCodeOpeningStart?: number;
     plainToolParameterContinuation?: boolean;
   };
@@ -2620,6 +2623,8 @@ function deferCoreStrippedTagTail(
             cleanPartialAnswerText(visiblePrefix).trim().length > 0,
           pluralWrapperSawRecognizedXmlPayload:
             previous.pluralWrapperSawRecognizedXmlPayload,
+          pluralWrapperPendingXmlPayloadSource:
+            previous.pluralWrapperPendingXmlPayloadSource,
           inlineCodeOpeningStart: previous.inlineCodeOpeningStart,
           plainToolParameterContinuation: true,
         },
@@ -2652,10 +2657,38 @@ function deferCoreStrippedTagTail(
           terminalRestorable: true,
           pluralWrapperSawRecognizedXmlPayload:
             previous.pluralWrapperSawRecognizedXmlPayload,
+          pluralWrapperPendingXmlPayloadSource:
+            previous.pluralWrapperPendingXmlPayloadSource,
           inlineCodeOpeningStart: previous.inlineCodeOpeningStart,
           plainToolParameterContinuation:
             previous.plainToolParameterContinuation,
         },
+      };
+    }
+  }
+  if (
+    previous &&
+    (previous.pluralWrapperSawRecognizedXmlPayload === true ||
+      previous.pluralWrapperPendingXmlPayloadSource !== undefined)
+  ) {
+    const visiblePrefix = matchingDeferredVisiblePrefix(text, previous.visiblePrefix);
+    if (visiblePrefix !== undefined && text === visiblePrefix) {
+      // An exact nested parameter name can retract to the wrapper's safe prefix
+      // before standalone parameter unwrapping later exposes its body. Preserve
+      // the outer plural provenance across that non-monotonic callback. Anchor
+      // zero sees no callback here, so its pending source remains in lane state.
+      return {
+        visibleText: text,
+        deferred: {
+          visiblePrefix: previous.visiblePrefix,
+          terminalRestorable:
+            cleanPartialAnswerText(text).trim().length > 0,
+          pluralWrapperSawRecognizedXmlPayload: true,
+          inlineCodeOpeningStart: previous.inlineCodeOpeningStart,
+          plainToolParameterContinuation:
+            previous.plainToolParameterContinuation,
+        },
+        coreRetraction: true,
       };
     }
   }
@@ -2668,6 +2701,7 @@ function deferCoreStrippedTagTail(
   }
   let anchor = composedEarlierStageAnchor(context);
   let anchoredPluralWrapperSawRecognizedXmlPayload: boolean | undefined;
+  let anchoredPluralWrapperPendingXmlPayloadSource: string | undefined;
   if (
     previous &&
     text !== previous.visiblePrefix &&
@@ -2675,13 +2709,24 @@ function deferCoreStrippedTagTail(
   ) {
     const tagStart = previous.visiblePrefix.length;
     const anchored = context.candidateByStart.get(tagStart);
+    const anchoredXmlPayload =
+      anchored?.kind === "tool" &&
+      anchored.tool.exactName !== undefined &&
+      PLURAL_CORE_WRAPPER_TAG_NAMES.has(anchored.tool.exactName) &&
+      anchored.tool.tagEnd !== undefined
+        ? classifyCoreToolXmlPayloadPrefix(text, anchored.tool.tagEnd)
+        : "invalid";
+    const pendingPayloadWasRetracted =
+      previous.pluralWrapperPendingXmlPayloadSource !== undefined &&
+      !text.startsWith(previous.pluralWrapperPendingXmlPayloadSource);
     const pluralWrapperSawRecognizedXmlPayload =
       previous.pluralWrapperSawRecognizedXmlPayload === true ||
-      (anchored?.kind === "tool" &&
-        anchored.tool.exactName !== undefined &&
-        PLURAL_CORE_WRAPPER_TAG_NAMES.has(anchored.tool.exactName) &&
-        anchored.tool.tagEnd !== undefined &&
-        classifyCoreToolXmlPayloadPrefix(text, anchored.tool.tagEnd) === "recognized");
+      pendingPayloadWasRetracted ||
+      anchoredXmlPayload === "recognized";
+    const pluralWrapperPendingXmlPayloadSource =
+      !pluralWrapperSawRecognizedXmlPayload && anchoredXmlPayload === "possible"
+        ? text
+        : undefined;
     if (
       anchored &&
       coreStreamCandidateCanStillBeControl(context, anchored, {
@@ -2692,6 +2737,8 @@ function deferCoreStrippedTagTail(
       if (anchor === tagStart) {
         anchoredPluralWrapperSawRecognizedXmlPayload =
           pluralWrapperSawRecognizedXmlPayload || undefined;
+        anchoredPluralWrapperPendingXmlPayloadSource =
+          pluralWrapperPendingXmlPayloadSource;
       }
     }
   }
@@ -2713,14 +2760,22 @@ function deferCoreStrippedTagTail(
     previous.visiblePrefix.startsWith(visiblePrefix);
   const hasVisiblePrefix = cleanPartialAnswerText(visiblePrefix).trim().length > 0;
   const candidate = context.candidateByStart.get(anchor);
-  const pluralWrapperSawRecognizedXmlPayload =
-    anchoredPluralWrapperSawRecognizedXmlPayload ??
-    (candidate?.kind === "tool" &&
+  const candidateXmlPayload =
+    candidate?.kind === "tool" &&
     candidate.tool.exactName !== undefined &&
     PLURAL_CORE_WRAPPER_TAG_NAMES.has(candidate.tool.exactName) &&
-    candidate.tool.tagEnd !== undefined &&
-    classifyCoreToolXmlPayloadPrefix(text, candidate.tool.tagEnd) === "recognized"
+    candidate.tool.tagEnd !== undefined
+      ? classifyCoreToolXmlPayloadPrefix(text, candidate.tool.tagEnd)
+      : "invalid";
+  const pluralWrapperSawRecognizedXmlPayload =
+    anchoredPluralWrapperSawRecognizedXmlPayload ??
+    (candidateXmlPayload === "recognized"
       ? true
+      : undefined);
+  const pluralWrapperPendingXmlPayloadSource =
+    anchoredPluralWrapperPendingXmlPayloadSource ??
+    (pluralWrapperSawRecognizedXmlPayload !== true && candidateXmlPayload === "possible"
+      ? text
       : undefined);
   const isDirectCoreCandidate =
     candidate !== undefined &&
@@ -2732,6 +2787,7 @@ function deferCoreStrippedTagTail(
     deferred: {
       visiblePrefix,
       pluralWrapperSawRecognizedXmlPayload,
+      pluralWrapperPendingXmlPayloadSource,
       inlineCodeOpeningStart,
       plainToolParameterContinuation,
       terminalRestorable: isDirectCoreCandidate
@@ -3904,6 +3960,8 @@ export function createProgressDraftController(params: {
                 visiblePrefix: deferredTail.deferred.visiblePrefix,
                 pluralWrapperSawRecognizedXmlPayload:
                   deferredTail.deferred.pluralWrapperSawRecognizedXmlPayload,
+                pluralWrapperPendingXmlPayloadSource:
+                  deferredTail.deferred.pluralWrapperPendingXmlPayloadSource,
                 inlineCodeOpeningStart:
                   deferredTail.deferred.inlineCodeOpeningStart,
                 plainToolParameterContinuation:

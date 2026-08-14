@@ -3191,6 +3191,113 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     ).toBe(true);
   });
 
+  it("M7l28: plural wrappers retain parameter-unwrapping provenance", async () => {
+    for (const source of [
+      "<tool_calls><parameter>x</parameter></tool_calls>",
+      "<function_calls><parameter>x</parameter></function_calls>",
+      "<tool_calls><parameter><parameter>x</parameter></parameter></tool_calls>",
+      "<function_calls><parameter>a<parameter>b</parameter>c</parameter></function_calls>",
+      "<tool_calls><parameter>x</parameter><parameter>y</parameter></tool_calls>",
+      "<function_calls><parameter/><parameter>x</parameter></function_calls>",
+      "<tool_calls><parameter><parameter/>x</parameter></tool_calls>",
+      '<Tool_Calls data-x="1"><Parameter name="p">x</Parameter></Tool_Calls>',
+      '< tool_calls data-x="1" > \n <parameter name="p">x</parameter> \n </ tool_calls >',
+      '<function_calls><parameter>x</parameter><function_call>{"x":1}</function_call></function_calls>',
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source), source).toBe("");
+      const hidden = makeDraftHarness();
+      hidden.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(source)) {
+        hidden.draft.pushAnswerText({ text });
+        await hidden.draft.flush();
+      }
+      await hidden.draft.drain();
+      expect(hidden.frames, source).toEqual([]);
+    }
+
+    for (const source of [
+      "Hello <tool_calls><parameter>x</parameter></tool_calls> Answer",
+      "Hello <function_calls><parameter/><parameter>x</parameter></function_calls> Answer",
+    ]) {
+      const expected = sanitizeAssistantVisibleStreamText(source);
+      expect(expected, source).toBe("Hello  Answer");
+      const visible = makeDraftHarness();
+      visible.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(source)) {
+        visible.draft.pushAnswerText({ text });
+        await visible.draft.flush();
+      }
+      await visible.draft.drain();
+      expect(
+        visible.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+        source,
+      ).toEqual([expected]);
+      expect(successfulIds(visible.frames), source).toHaveLength(1);
+      expect(
+        visible.frames.every(
+          (frame) =>
+            expected.startsWith(frame.text) &&
+            !frame.text.includes("_calls") &&
+            !frame.text.includes("<parameter"),
+        ),
+        source,
+      ).toBe(true);
+    }
+
+    for (const [observed, completed] of [
+      [
+        "<tool_calls><paramete",
+        "<tool_calls><parameter>x</parameter></tool_calls>",
+      ],
+      [
+        "<function_calls><paramete",
+        "<function_calls><parameter>x</parameter></function_calls>",
+      ],
+    ] as const) {
+      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
+      expect(sanitizeAssistantVisibleStreamText(completed)).toBe("");
+      const coalesced = makeDraftHarness();
+      coalesced.draft.handleAssistantMessageBoundary();
+      coalesced.draft.pushAnswerText({ text: observed });
+      await coalesced.draft.flush();
+      expect(coalesced.frames, observed).toEqual([]);
+      // Core suppresses the completed empty callback.
+      await coalesced.draft.drain();
+      expect(coalesced.frames, observed).toEqual([]);
+    }
+
+    const malformed =
+      "<tool_calls><parameterX>x</parameterX></tool_calls> literal";
+    expect(sanitizeAssistantVisibleStreamText(malformed)).toBe(malformed);
+    const literal = makeDraftHarness();
+    literal.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedStreamDistinctPartials(malformed)) {
+      literal.draft.pushAnswerText({ text });
+      await literal.draft.flush();
+    }
+    await literal.draft.drain();
+    expect(
+      literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+    ).toEqual([malformed]);
+    expect(successfulIds(literal.frames)).toHaveLength(1);
+
+    const code =
+      'Use `<function_calls><parameter>x</parameter></function_calls>` literally';
+    expect(sanitizeAssistantVisibleStreamText(code)).toBe(code);
+    const codeLiteral = makeDraftHarness();
+    codeLiteral.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedStreamDistinctPartials(code)) {
+      codeLiteral.draft.pushAnswerText({ text });
+      await codeLiteral.draft.flush();
+    }
+    await codeLiteral.draft.drain();
+    expect(
+      codeLiteral.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+    ).toEqual([code]);
+    expect(successfulIds(codeLiteral.frames)).toHaveLength(1);
+    expect(codeLiteral.frames.every((frame) => code.startsWith(frame.text))).toBe(true);
+  });
+
   it("M7l11: an inline close plus suffix restores in-lane across unequal delimiters", async () => {
     const source = 'Use ``<tool_call>{"x":1}</tool_call> after` literally';
     const beforeClosingDelimiter = source.slice(0, source.indexOf("` literally"));
