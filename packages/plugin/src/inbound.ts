@@ -11,7 +11,6 @@ import { WEBCHANNEL_ID, ANON_PEER_ID } from "./channel-contract.js";
 import type { WebChannelPeerChannel, InboundWsMessage } from "./channel-contract.js";
 import { resolveDmAdmission } from "./dm-allowlist.js";
 import {
-  DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   resolveWebchannelAccountConfig,
   resolveReasoningEnabled,
 } from "./account-config.js";
@@ -342,13 +341,18 @@ function releaseAgentLifecycleSubscription(options: {
  *  - ChannelEventDeliveryAdapter.deliver(payload: ReplyPayload, info):
  *      dist/plugin-sdk/types-BVAOMoZy.d.ts:5760-5769; ReplyPayload.text:
  *      dist/plugin-sdk/types-BYvUZFDr.d.ts:8-9.
+ *
+ * `servingTenant` is the immutable tenant captured by the account's startup
+ * plan. It is required rather than re-resolved here because this function runs
+ * for every turn while OpenClaw may temporarily override ambient process env.
  */
 export async function handleInboundMessage(
   api: OpenClawPluginApi,
   transport: WebChannelPeerChannel,
   peerId: string,
   message: InboundUserMessage,
-  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  accountId: string,
+  servingTenant: string,
   options?: {
     controlLane?: boolean;
     /** Injectable only so the session opt-out privacy boundary is testable. */
@@ -490,7 +494,7 @@ export async function handleInboundMessage(
   // snapshot / load_history read paths cannot happen. This is the WRITE site: the
   // turn is dispatched under this key, and the history READ sites resolve the
   // SAME key via the SAME helper, so paging/snapshot stay consistent.
-  const route = resolveWebchannelSessionRoute(api, accountId, wsKey);
+  const route = resolveWebchannelSessionRoute(api, accountId, wsKey, servingTenant);
 
   // #93: build this turn's approval-origin lease handle. Creating it claims
   // NOTHING — `activate()` in `onAgentRunStart` is what publishes the claim, so
