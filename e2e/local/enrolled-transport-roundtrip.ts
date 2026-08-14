@@ -37,9 +37,12 @@ import {
   openMessage,
 } from "../../packages/client/src/e2e-crypto-browser.js";
 import { generateDevicePopKeyPair, registerWithPop } from "../../packages/client/src/pop-register.js";
+import { requireEnv } from "./require-env.js";
 
-const NATS_WS = process.env.WEBCHANNEL_NATS_URL ?? "ws://127.0.0.1:18422";
-const ISSUER = process.env.WEBCHANNEL_ISSUER_URL ?? "http://127.0.0.1:3921";
+// Ports come from the gate (e2e/local/ports.json), never a literal here — a
+// driver default that never runs is a default that silently drifts (#118).
+const NATS_WS = requireEnv("WEBCHANNEL_NATS_URL", "run-enrolled-transport.sh");
+const ISSUER = requireEnv("WEBCHANNEL_ISSUER_URL", "run-enrolled-transport.sh");
 const TENANT = process.env.WEBCHANNEL_TENANT ?? "default-tenant";
 const ACCOUNT_ID = process.env.WEBCHANNEL_ACCOUNT_ID ?? "default-agent";
 const PEER_ID = process.env.WEBCHANNEL_PEER_ID ?? "enrolled-driver-peer";

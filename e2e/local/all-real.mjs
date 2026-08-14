@@ -24,15 +24,32 @@ const __dirname = dirname(fileURLToPath(import.meta.url)); // e2e/local
 const ROOT = join(__dirname, "..", "..");
 const require = createRequire(import.meta.url);
 
-const NATS_URL   = process.env.WEBCHANNEL_NATS_URL   ?? "ws://127.0.0.1:18622";
-const ISSUER_URL = process.env.WEBCHANNEL_ISSUER_URL ?? "http://127.0.0.1:3941";
+// Ports come from the launching gate, which reads e2e/local/ports.json — never
+// from a literal here. This runner is shared by run-all-real.sh AND
+// run-derived-trust.sh, which use DIFFERENT ports, so a default is guaranteed
+// wrong for one of them; a silent fallback proves nothing (#118). Mirrors
+// e2e/local/require-env.ts, inlined because this file is plain .mjs.
+const requireEnv = (name) => {
+  const value = process.env[name];
+  if (value === undefined || value === "") {
+    console.error(
+      `[all-real] FAIL — ${name} is not set. This runner does not guess ports; ` +
+        `launch it via ./e2e/local/run-all-real.sh or ./e2e/local/run-derived-trust.sh`,
+    );
+    process.exit(2);
+  }
+  return value;
+};
+
+const NATS_URL   = requireEnv("WEBCHANNEL_NATS_URL");
+const ISSUER_URL = requireEnv("WEBCHANNEL_ISSUER_URL");
 // Deprecated/unused compatibility input retained for the browser harness shape;
 // the production register hop is account-subject NATS request/reply.
-const GW_URL     = process.env.WEBCHANNEL_GW_URL     ?? "http://127.0.0.1:19199";
+const GW_URL     = requireEnv("WEBCHANNEL_GW_URL");
 const ACCOUNT_ID   = process.env.WEBCHANNEL_ACCOUNT_ID   ?? "default-agent";
 const TENANT     = process.env.WEBCHANNEL_TENANT     ?? "default-tenant";
 const PEER_ID    = process.env.WEBCHANNEL_PEER_ID    ?? "web-allreal-peer";
-const PAGE_PORT  = parseInt(process.env.WEBCHANNEL_PAGE_PORT ?? "19393", 10);
+const PAGE_PORT  = parseInt(requireEnv("WEBCHANNEL_PAGE_PORT"), 10);
 const TEXT       = process.env.WEBCHANNEL_TEXT       ?? "hello from an all-real browser (NKEY + PoP)";
 const TIMEOUT_MS = parseInt(process.env.WEBCHANNEL_TIMEOUT_MS ?? "25000", 10);
 

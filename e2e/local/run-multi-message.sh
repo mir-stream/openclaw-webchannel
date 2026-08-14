@@ -48,11 +48,11 @@ PKG_JSON="$REPO/packages/plugin/package.json"
 # permanently stranding the swapped (index-nats.ts) package.json in git.
 PKG_BAK=/tmp/oc-multi-message-e2e.pkgbak.json
 
-GW_PORT=18991
-NATS_WS=18491
-NATS_TCP=14491
-ECHO_PORT=18992
-ISSUER_PORT=3991
+# Ports (GW_PORT/NATS_WS/NATS_TCP/ECHO_PORT/ISSUER_PORT) come from
+# e2e/local/ports.json — the single source of truth for both this harness family
+# and the *-realserver.test.ts suites (#118/#119). Never hard-code one here.
+. "$REPO/e2e/local/lib/harness.sh"
+harness_ports run-multi-message
 export ECHO_MULTI_MSG_MARKER="${ECHO_MULTI_MSG_MARKER:-ISSUE94_TWO_MESSAGES}"
 export ECHO_MULTI_MSG_TOOL="${ECHO_MULTI_MSG_TOOL:-agents_list}"
 # Turn 2's fixture: the same tool loop with a TEXT-LESS first assistant message.
@@ -98,6 +98,17 @@ pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
 pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
+
+# ---------------------------------------------------------------------------
+# 0. Build the plugin bundle from the working tree (#125).
+#
+#    This harness pioneered the build step; as of #125 all six do it here, via
+#    the shared helper, so the rationale and the bisection evidence live once in
+#    e2e/local/lib/harness.sh. It used to run at step 4, after the issuer,
+#    nats-server and echo server were already up; moved here so a broken build
+#    fails fast and this gate matches the other five.
+# ---------------------------------------------------------------------------
+harness_build_plugin run-multi-message "$OCH/plugin-build.log"
 
 # ---------------------------------------------------------------------------
 # 1. REAL device-flow enrollment-server (single trust chain). Writes the public
@@ -178,28 +189,8 @@ ECHO_PID=$!
 echo "[run-multi-message] echo server pid=$ECHO_PID (multi-msg marker=$ECHO_MULTI_MSG_MARKER, tool=$ECHO_MULTI_MSG_TOOL)"
 
 # ---------------------------------------------------------------------------
-# 4. Build the plugin bundle, THEN point the entry at index-nats.ts.
-#
-#     The build is not optional here, and it is not what the other harnesses do.
-#     MEASURED on the pinned core (2026.6.10): the gateway resolves this plugin's
-#     BUILT bundle regardless of the entry swap below —
-#       [plugins] channel "webchannel" registered … (plugin=webchannel,
-#         source=…/packages/plugin/dist/index-nats.js)
-#     Proven by bisection while validating this gate: with the #94 fix reverted in
-#     `src/` but a stale FIXED `dist/` on disk the harness PASSED (exit 0); with
-#     `dist/` rebuilt from the same reverted `src/` it FAILED (exit 6). A harness
-#     that boots against a stale bundle is exactly the "passes without exercising
-#     the boundary" gate this is supposed to prevent, so the working tree is built
-#     first and the run always reflects `src/`.
-#
-#     In CI this is redundant (the gate builds the plugin at step 5c before any
-#     harness runs) and costs ~20ms of esbuild; locally it is the difference
-#     between a real gate and a green light for code that never ran.
+# 4. Point the entry at index-nats.ts. (The build moved to step 0 — see there.)
 # ---------------------------------------------------------------------------
-echo "[run-multi-message] building plugin dist/ from the working tree…"
-( cd "$REPO" && npm run build --workspace=packages/plugin ) >"$OCH/plugin-build.log" 2>&1 || {
-  echo "[run-multi-message] plugin build FAILED — log:"; cat "$OCH/plugin-build.log"; exit 2
-}
 
 # The entry swap itself is kept for parity with the other five harnesses (and so
 # a core that DOES honour a .ts entry loads the same source the build above came
@@ -390,6 +381,11 @@ for i in $(seq 1 240); do
     echo "[run-multi-message] TIMEOUT waiting for structured account readiness — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
+
+# ASSERT the gateway loaded the bundle step 0 built (#125). Building the right
+# file and the gateway LOADING it are two different claims; the build step only
+# ever established the first. Reads core own resolution record from the log.
+harness_assert_loaded_dist run-multi-message "$OCH/gateway.log"
 
 # ---------------------------------------------------------------------------
 # 7. Drive the NKEY-authenticated encrypted round-trip.
