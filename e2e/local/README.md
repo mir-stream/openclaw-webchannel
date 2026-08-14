@@ -138,8 +138,8 @@ were found in one sitting (`port: 14481` inside the `node -e` block that writes 
 was itself an enumeration, and the `nats.conf` case — a JS object literal inside a `.sh` — is
 what walked through it. So the polarity is inverted: **every integer in the unprivileged port
 range, in any scanned file, outside comments and not part of a longer token, is a port** unless
-it is a documented non-port constant, a port that file is the declared owner of, or a named
-waiver tied to a filed issue.
+it is a documented non-port occurrence scoped to that file and an exact expected count, a port
+that file is the declared owner of, or a named waiver tied to a filed issue.
 
 **The scan set is discovered, not listed.** It walks `e2e/local/` recursively — `lib/harness.sh`
 is in scope, and a literal there would override `harness_ports` for all six gates at once — plus
@@ -152,19 +152,13 @@ Earlier the `packages/` half was a hand-maintained list, and a new suite spawnin
 `packages/*/reference/**` is out of scope on purpose: those servers take their port from env in
 every harness use, and their defaults are recorded under `reserved`.
 
-**The exemption and waiver lists are forced to shrink.** `NOT_PORTS` is asserted disjoint from
-every live allocation, so one "constant" line can no longer disarm the guard for a real port; and
-every `NOT_PORTS` entry and every `WAIVED` entry must still occur in the scan set, so fixing a
-waived defect fails the build until the waiver is deleted rather than leaving a silent blind spot.
+**The exemption and waiver lists are forced to shrink.** Each `NOT_PORTS` entry names its source,
+value, and exact occurrence count. The same value in another source receives no allowance, and
+an extra occurrence in the named source exceeds the allowance, so a timeout cannot hide a fixed
+listener. Removing an occurrence also makes the count stale. Every `WAIVED` entry must likewise
+still occur in the scan set, so fixing a waived defect fails the build until the waiver is deleted
+rather than leaving a silent blind spot.
 
-> **Residual, stated so it does not have to be rediscovered.** The exemption is by *value*: a
-> number on `NOT_PORTS` is not flagged as a literal anywhere. Binding `:8000` in a gate would
-> therefore go unflagged by the literal scan. What *is* now guaranteed is that such a value can
-> never be a live allocation — `NOT_PORTS` is asserted disjoint from `ports.json`, so nothing the
-> authority hands out can be silently exempt, and an exemption that stops being used must be
-> removed. The uncovered case is narrow and specific: a hard-coded bind, in a scanned file, on a
-> number that is simultaneously a documented non-port constant and not allocated to anything.
->
 > Known evasions of the token rule, listed because that rule is the design's load-bearing claim:
 > numeric separators (`18_991`), hex/octal, and runtime concatenation of sub-4-digit parts. Each
 > takes intent; the scan is aimed at the accident.

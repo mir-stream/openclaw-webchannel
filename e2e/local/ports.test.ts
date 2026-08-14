@@ -66,6 +66,12 @@ function gateScripts(): string[] {
 }
 
 const SOURCE_EXT = /\.(sh|ts|mts|cts|js|mjs|cjs)$/;
+const BINDS =
+  /nats-server|\.listen\s*\(|createServer\s*\(|\bnew\s+WebSocketServer\s*\(|ws_port|\bspawn\s*\(/;
+
+function isBindingSource(codeWithoutComments: string): boolean {
+  return BINDS.test(codeWithoutComments);
+}
 
 /**
  * Files that bind or spawn a listener, discovered by CONTENT under
@@ -84,8 +90,6 @@ const SOURCE_EXT = /\.(sh|ts|mts|cts|js|mjs|cjs)$/;
  * reason, not an item-by-item exclusion list.
  */
 function bindingSources(): string[] {
-  const BINDS =
-    /nats-server|\.listen\s*\(|createServer\s*\(|\bnew\s+WebSocketServer\s*\(|ws_port|\bspawn\s*\(/;
   const out: string[] = [];
   const walk = (dir: string, rel: string) => {
     let entries;
@@ -100,7 +104,7 @@ function bindingSources(): string[] {
       if (e.isDirectory()) walk(join(dir, e.name), childRel);
       else if (SOURCE_EXT.test(e.name)) {
         const code = decomment(readFileSync(join(dir, e.name), "utf8"), false).join("\n");
-        if (BINDS.test(code)) out.push(childRel);
+        if (isBindingSource(code)) out.push(childRel);
       }
     }
   };
@@ -356,7 +360,7 @@ describe("e2e/local/ports.json", () => {
   //
   // Every integer in the unprivileged port range, in any scanned file, outside
   // comments and not part of a longer token, IS a port unless it is
-  //   (a) a documented non-port constant (NOT_PORTS),
+  //   (a) a documented, source-scoped non-port occurrence (NOT_PORTS),
   //   (b) a port the file is the declared owner of, or
   //   (c) a named waiver tied to a filed issue (WAIVED).
   // Gates, drivers and lib/ own nothing — asserted below, not merely asserted in
@@ -368,21 +372,60 @@ describe("e2e/local/ports.json", () => {
   // intent; the scan targets the accident.
   // -------------------------------------------------------------------------
 
-  /** Integers inside the port range that are not ports. Each needs a reason. */
-  const NOT_PORTS = new Map<number, string>([
-    [65535, "upper bound of the port range, used in range validation"],
-    [2000, "timeout/delay in ms"],
-    [3000, "timeout/delay in ms"],
-    [4000, "timeout/delay in ms"],
-    [5000, "timeout/delay in ms"],
-    [8000, "timeout/delay in ms"],
-    [10000, "timeout/delay in ms"],
-    [15000, "timeout/delay in ms"],
-    [20000, "openclaw compaction reserveTokensFloor in the gate configs"],
-    [25000, "timeout/delay in ms"],
-    [30000, "timeout/delay in ms"],
-    [8192, "openclaw maxTokens in the gate configs"],
-  ]);
+  type PortLiteral = [rel: string, line: number, value: number];
+  type NonPortExemption = {
+    file: string;
+    value: number;
+    count: number;
+    reason: string;
+  };
+
+  /**
+   * Exact source occurrences inside the port range that are not ports.
+   *
+   * The count is load-bearing: the same value in another file has no allowance,
+   * and another occurrence in this file exceeds the allowance. This avoids
+   * brittle line numbers while preventing a timeout from globally exempting a
+   * listener that happens to use the same number.
+   */
+  const NOT_PORTS: NonPortExemption[] = [
+    { file: "e2e/local/require-env.ts", value: 65535, count: 1, reason: "port-range validation upper bound" },
+    { file: "e2e/local/lib/harness.sh", value: 65535, count: 1, reason: "port-range validation upper bound" },
+    { file: "e2e/local/run-multi-message.sh", value: 8192, count: 1, reason: "OpenClaw maxTokens" },
+    { file: "e2e/local/run-multi-message.sh", value: 20000, count: 1, reason: "OpenClaw reserveTokensFloor" },
+    { file: "e2e/local/run-two-account-isolation.sh", value: 8192, count: 2, reason: "OpenClaw maxTokens" },
+    { file: "e2e/local/run-two-account-isolation.sh", value: 20000, count: 1, reason: "OpenClaw reserveTokensFloor" },
+    { file: "e2e/local/run-derived-trust.sh", value: 8192, count: 1, reason: "OpenClaw maxTokens" },
+    { file: "e2e/local/run-derived-trust.sh", value: 20000, count: 1, reason: "OpenClaw reserveTokensFloor" },
+    { file: "e2e/local/run-enrolled-transport.sh", value: 8192, count: 1, reason: "OpenClaw maxTokens" },
+    { file: "e2e/local/run-enrolled-transport.sh", value: 20000, count: 1, reason: "OpenClaw reserveTokensFloor" },
+    { file: "e2e/local/run-all-real.sh", value: 8192, count: 1, reason: "OpenClaw maxTokens" },
+    { file: "e2e/local/run-all-real.sh", value: 20000, count: 1, reason: "OpenClaw reserveTokensFloor" },
+    { file: "e2e/local/run-turn-outcome.sh", value: 8192, count: 1, reason: "OpenClaw maxTokens" },
+    { file: "e2e/local/run-turn-outcome.sh", value: 20000, count: 1, reason: "OpenClaw reserveTokensFloor" },
+    { file: "e2e/local/two-account-isolation-roundtrip.ts", value: 5000, count: 1, reason: "timeout in ms" },
+    { file: "e2e/local/two-account-isolation-roundtrip.ts", value: 25000, count: 1, reason: "timeout in ms" },
+    { file: "e2e/local/multi-message-roundtrip.ts", value: 5000, count: 1, reason: "timeout in ms" },
+    { file: "e2e/local/enrolled-transport-roundtrip.ts", value: 5000, count: 1, reason: "timeout in ms" },
+    { file: "e2e/local/enrolled-transport-roundtrip.ts", value: 30000, count: 1, reason: "timeout in ms" },
+    { file: "e2e/local/turn-outcome-roundtrip.ts", value: 5000, count: 1, reason: "timeout in ms" },
+    { file: "e2e/local/all-real.mjs", value: 25000, count: 1, reason: "timeout in ms" },
+    { file: "e2e/local/all-real.mjs", value: 30000, count: 1, reason: "timeout in ms" },
+    { file: "packages/saas/src/ac6-device-flow-e2e.test.ts", value: 2000, count: 1, reason: "startup delay in ms" },
+    { file: "packages/saas/src/nats-permissions-realserver.test.ts", value: 65535, count: 1, reason: "port-range validation upper bound" },
+    { file: "packages/saas/src/nats-permissions-realserver.test.ts", value: 5000, count: 1, reason: "waitFor default timeout in ms" },
+    { file: "packages/saas/src/nats-permissions-realserver.test.ts", value: 4000, count: 2, reason: "connection timeout in ms" },
+    { file: "packages/saas/src/nats-permissions-realserver.test.ts", value: 10000, count: 1, reason: "server readiness timeout in ms" },
+    { file: "packages/saas/src/nats-permissions-realserver.test.ts", value: 20000, count: 1, reason: "Vitest hook timeout in ms" },
+    { file: "packages/saas/src/nats-permissions-realserver.test.ts", value: 2000, count: 9, reason: "assertion timeout in ms" },
+    { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 65535, count: 1, reason: "port-range validation upper bound" },
+    { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 2000, count: 1, reason: "waitFor default timeout in ms" },
+    { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 8000, count: 1, reason: "server readiness timeout in ms" },
+    { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 15000, count: 1, reason: "Vitest hook timeout in ms" },
+    { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 5000, count: 1, reason: "message fixture amount" },
+    { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 3000, count: 2, reason: "assertion timeout in ms" },
+    { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 4000, count: 1, reason: "assertion timeout in ms" },
+  ];
 
   /**
    * Known-bad literals waived pending a filed fix. Every entry must still be
@@ -405,52 +448,119 @@ describe("e2e/local/ports.json", () => {
     ],
   ]);
 
-  /** [rel, line, port] for every non-exempt port-range integer in the scan set. */
-  function scanLiterals(): Array<[string, number, number]> {
-    const found: Array<[string, number, number]> = [];
+  /** Every port-range integer in one source, with comments ignored. */
+  function literalsInSource(rel: string, text: string): PortLiteral[] {
+    const found: PortLiteral[] = [];
+    decomment(text, rel.endsWith(".sh")).forEach((line, i) => {
+      for (const m of line.matchAll(/(?<![\w.\-])(\d{4,5})(?![\w.\-])/g)) {
+        const value = Number(m[1]);
+        if (value >= 1024 && value <= 65535) found.push([rel, i + 1, value]);
+      }
+    });
+    return found;
+  }
+
+  /** Every port-range integer in the scan set. */
+  function scanLiterals(): PortLiteral[] {
+    const found: PortLiteral[] = [];
     for (const rel of scannedFiles()) {
       const abs = join(REPO, rel);
       if (!existsSync(abs)) continue;
-      decomment(readFileSync(abs, "utf8"), rel.endsWith(".sh")).forEach((line, i) => {
-        for (const m of line.matchAll(/(?<![\w.\-])(\d{4,5})(?![\w.\-])/g)) {
-          const port = Number(m[1]);
-          if (port >= 1024 && port <= 65535) found.push([rel, i + 1, port]);
-        }
-      });
+      found.push(...literalsInSource(rel, readFileSync(abs, "utf8")));
     }
     return found;
   }
 
-  it("exempts nothing that is actually allocated", () => {
-    // One NOT_PORTS line used to disarm the guard for a live allocation across
-    // every scanned file at once: adding [14491, "poll budget in ms"] made a
-    // literal NATS_TCP=14491 in lib/harness.sh green.
-    const allocated = new Map(allocations.map(([o, k, p]) => [p, `${o}.${k}`]));
-    const clashes = [...NOT_PORTS.keys()]
-      .filter((p) => allocated.has(p))
-      .map((p) => `  ${p} is exempt as "${NOT_PORTS.get(p)}" but ports.json allocates it to ${allocated.get(p)}`);
-    expect(
-      clashes,
-      `NOT_PORTS overlaps live allocations:\n${clashes.join("\n")}`,
-    ).toEqual([]);
+  function exemptionKey(file: string, value: number): string {
+    return `${file}:${value}`;
+  }
+
+  /** Remove only the occurrence budget explicitly allowed for each source. */
+  function withoutNonPortExemptions(
+    literals: PortLiteral[],
+    exemptions: NonPortExemption[] = NOT_PORTS,
+  ): PortLiteral[] {
+    const allowed = new Map(
+      exemptions.map((rule) => [exemptionKey(rule.file, rule.value), rule.count]),
+    );
+    const seen = new Map<string, number>();
+    return literals.filter(([file, , value]) => {
+      const key = exemptionKey(file, value);
+      const occurrence = (seen.get(key) ?? 0) + 1;
+      seen.set(key, occurrence);
+      return occurrence > (allowed.get(key) ?? 0);
+    });
+  }
+
+  it("never exempts a port owned by the same source", () => {
+    const clashes = NOT_PORTS
+      .filter((rule) => ownedPorts(rule.file).has(rule.value))
+      .map(
+        (rule) =>
+          `  ${exemptionKey(rule.file, rule.value)} (${rule.reason}) is also owned by that file`,
+      );
+    expect(clashes, `NOT_PORTS hides owned ports:\n${clashes.join("\n")}`).toEqual([]);
   });
 
-  it("keeps no dead exemption or waiver", () => {
-    // Both lists must shrink on their own. An exemption nothing uses, or a waiver
-    // whose literal is gone, is a blind spot waiting for a future collision.
+  it("keeps exemption counts exact and no waiver dead", () => {
+    // Exemption counts are exact, so both deletion and an extra same-file use
+    // turn red. Waivers likewise must disappear when their literal does.
     const literals = scanLiterals();
-    const seen = new Set(literals.map(([, , p]) => p));
+    const counts = new Map<string, number>();
+    for (const [file, , value] of literals) {
+      const key = exemptionKey(file, value);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
     const seenWaivers = new Set(literals.map(([rel, , p]) => `${rel}:${p}`));
 
     const dead = [
-      ...[...NOT_PORTS.keys()]
-        .filter((p) => !seen.has(p))
-        .map((p) => `  NOT_PORTS ${p} ("${NOT_PORTS.get(p)}") no longer appears anywhere — remove it`),
+      ...NOT_PORTS
+        .filter((rule) => counts.get(exemptionKey(rule.file, rule.value)) !== rule.count)
+        .map((rule) => {
+          const key = exemptionKey(rule.file, rule.value);
+          return `  NOT_PORTS ${key} expects ${rule.count}, found ${counts.get(key) ?? 0} (${rule.reason})`;
+        }),
       ...[...WAIVED.keys()]
         .filter((k) => !seenWaivers.has(k))
         .map((k) => `  WAIVED ${k} no longer appears — the defect is fixed, remove the waiver`),
     ];
     expect(dead, `dead exemptions/waivers:\n${dead.join("\n")}`).toEqual([]);
+  });
+
+  it("scopes a timeout exemption away from a discovered fixed listener", () => {
+    const timeoutFile = "e2e/local/timeout-fixture.ts";
+    const listenerFile = "packages/fixture/src/listener.test.ts";
+    const listener = "new WebSocketServer({ port: 3000 });";
+    const exemptions: NonPortExemption[] = [
+      { file: timeoutFile, value: 3000, count: 1, reason: "timeout in ms" },
+    ];
+    const timeoutLiterals = literalsInSource(timeoutFile, "setTimeout(done, 3000);");
+    const listenerLiterals = literalsInSource(listenerFile, listener);
+
+    expect(isBindingSource(listener)).toBe(true);
+    expect(doc.reserved["3000"]).toBeDefined();
+    expect(withoutNonPortExemptions(timeoutLiterals, exemptions)).toEqual([]);
+    expect(
+      withoutNonPortExemptions(
+        [...timeoutLiterals, ...listenerLiterals],
+        exemptions,
+      ),
+    ).toEqual(listenerLiterals);
+  });
+
+  it("does not let an extra same-file literal share an exemption", () => {
+    const file = "packages/fixture/src/listener.test.ts";
+    const source = [
+      "setTimeout(done, 3000);",
+      "new WebSocketServer({ port: 3000 });",
+    ].join("\n");
+    const exemptions: NonPortExemption[] = [
+      { file, value: 3000, count: 1, reason: "timeout in ms" },
+    ];
+
+    expect(withoutNonPortExemptions(literalsInSource(file, source), exemptions)).toEqual([
+      [file, 2, 3000],
+    ]);
   });
 
   it("grants literal rights to no gate, driver or helper", () => {
@@ -478,8 +588,7 @@ describe("e2e/local/ports.json", () => {
       allocatedBy.set(p, `${allocatedBy.get(p) ? `${allocatedBy.get(p)}, ` : ""}${o}.${k}`);
     }
 
-    for (const [rel, line, port] of scanLiterals()) {
-      if (NOT_PORTS.has(port)) continue;
+    for (const [rel, line, port] of withoutNonPortExemptions(scanLiterals())) {
       if (ownedPorts(rel).has(port)) continue;
       if (WAIVED.has(`${rel}:${port}`)) continue;
       const whose = allocatedBy.has(port)
