@@ -9,7 +9,7 @@ agent's reply back — encrypted end-to-end.
 headless Chromium (WebChannelNatsClient)
       │  authenticated registration + ChaCha20-Poly1305
       ▼
-  nats-server (ws://…:18222)         ← relay sees ciphertext only
+  nats-server (ws://127.0.0.1:$NATS_WS)   ← relay sees ciphertext only
       ▼
   index-nats plugin  ──►  openclaw inbound.run  ──►  echo model (fake OpenAI server)
       ▲                                                     │
@@ -48,6 +48,10 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 | `multi-message-roundtrip.ts` | Node driver for `run-multi-message.sh`: drives one turn that produces TWO real assistant messages and asserts they settle at two distinct wire ids. Logs every inbound frame before asserting. |
 | `two-account-isolation-roundtrip.ts` | Node driver for `run-two-account-isolation.sh`: drives positive round-trips plus an A-authorized token against B's live register subject. |
 | `ci-smoke.html` | The unified demo/chat page served by the SaaS issuer. |
+| `ports.json` | **Single source of truth for every port** in the gate family and in the root-sweep suites that bind real sockets (#118/#119). Also records non-suite owners (`tools`) and exclusions (`reserved`). |
+| `ports.test.ts` | Guards `ports.json`: allocation globally disjoint, no reserved port claimed, an entry per `run-*.sh` declaring every key that gate references, bidirectional sync with the suites it declares, and — by allowlist, not by enumerated spelling — no unauthorized port literal anywhere in `e2e/local/**` (recursive, `lib/` included) or in a discovered listener/provenance source. |
+| `lib/harness.sh` | Shared gate helpers: `harness_ports` (exports a harness's ports from `ports.json`), `harness_build_plugin` (rebuilds `packages/plugin/dist/` from the working tree, records its hash), and `harness_assert_loaded_dist` (asserts, after readiness, that the gateway resolved that exact bundle). |
+| `require-env.ts` | Makes drivers demand their topology from the launching gate instead of falling back to a port literal that silently drifts. |
 
 ## Prerequisites
 
@@ -70,15 +74,121 @@ All six boot a real gateway + `nats-server` + echo provider under an isolated
 ./e2e/local/run-multi-message.sh         # multi-assistant-message turn settles TWO distinct ids (#94)
 ```
 
-> **They boot against `packages/plugin/dist/`, not your edited `src/`.** Measured on the pinned
-> core (2026.6.10): the gateway logs
+> **Every harness builds `packages/plugin/dist/` from your working tree before booting** (#125).
+> Measured on the pinned core: the gateway logs
 > `channel "webchannel" registered … source=…/packages/plugin/dist/index-nats.js`, so the
 > `openclaw.extensions → ./index-nats.ts` swap each runner performs does **not** make it load TS
-> source. CI is fine (it builds the plugin at step 5c before any harness runs), but locally a
-> stale bundle silently tests code you did not write — with the #94 fix reverted in `src/` and a
-> stale fixed `dist/` on disk, `run-multi-message.sh` passed. `run-multi-message.sh` therefore
-> builds the plugin itself before booting; run `npm run build --workspace=packages/plugin` before
-> the other five.
+> source — the built bundle is what runs. A stale bundle therefore tests code you did not write:
+> with the #94 fix reverted in `src/` and a stale fixed `dist/` on disk, `run-multi-message.sh`
+> passed; and during #113 `run-two-account-isolation.sh` twice reported "this guard is not the
+> cause" for an edit that had never executed.
+>
+> Only `run-multi-message.sh` used to build. Now all six call `harness_build_plugin` from
+> [`lib/harness.sh`](lib/harness.sh), so you no longer need to remember
+> `npm run build --workspace=packages/plugin`, and running one gate in isolation is as trustworthy
+> as running them in a particular order. The build is unconditional — one esbuild bundle, ~0.3s —
+> because a redundant rebuild is free and a skipped one costs a wrong conclusion.
+>
+> Building the right file and the gateway **loading** it are two different claims, so each
+> harness records the first and asserts the second:
+>
+> ```
+> [run-enrolled] built dist: /…/packages/plugin/dist/index-nats.js (2026-08-13T10:26:17.907Z, 535083 bytes, sha256 b0e2cb20388b55d3)
+> [run-enrolled] ✓ DIST-ASSERT: gateway loaded the bundle this gate built (source=/…/dist/index-nats.js, sha256 b0e2cb20388b55d3)
+> ```
+>
+> The `built dist:` line is **provenance, not a check** — it is printed straight after an
+> unconditional build that always rewrites the output, so it can never report anything but
+> success. Do not read it as evidence the build ran.
+>
+> The `DIST-ASSERT` line is the check. After gateway readiness, `harness_assert_loaded_dist`
+> extracts core's complete `source` values from every `plugin=webchannel` resolution record.
+> Their deduplicated set must contain exactly the one bundle this gate built (duplicate identical
+> records are harmless; one expected plus one stale source is a failure), and the helper re-hashes
+> it to catch anything that rewrote `dist/` in between. A mismatch aborts the gate before the
+> driver runs. That is what catches a core update
+> changing plugin resolution — the class of failure where your build was fine and irrelevant.
+
+### Ports
+
+Every port that anything under `e2e/local/` binds or dials is **allocated** in
+[`ports.json`](ports.json), and nothing here may hard-code one — gates get theirs from
+`harness_ports`, drivers from their gate's env.
+
+Root-sweep suites with intentionally fixed listeners are allocated there too. Three hard-code
+their own numbers and are *declared* — `ac6-device-flow-e2e.test.ts` and the two demo smokes.
+For those three the literal is the allocation, and `ports.test.ts` pins the two together in both
+directions so neither side can drift. The two real nats-server suites instead ask nats-server to
+bind OS-assigned ports atomically, then read its per-process ports file; they remain in the
+literal scan so reintroducing a fixed port is still rejected.
+
+The two families used to allocate independently, and overlapped: `18222` was both the
+transport-realserver monitor port and the default NATS URL in
+`two-account-isolation-roundtrip.ts` (#118), and `3981` was claimed by both `run-turn-outcome.sh`
+and `run-derived-trust.sh` (#119). When they collide, `nats-server` cannot bind and the suite
+dies in `beforeAll` — or skips its tests and reports nothing.
+
+One file means a concurrent addition is a merge conflict. [`ports.test.ts`](ports.test.ts)
+covers the rest: the allocation is globally disjoint, claims no reserved port, has an entry for
+every `run-*.sh` that declares every key its gate references, and stays in sync with the suites
+it declares.
+
+**The literal scan is an allowlist, not a list of forbidden spellings.** An earlier version
+enumerated shapes — `NAME=1234`, a `ws://host:port` URL, a port-named binding — and three more
+were found in one sitting (`port: 14481` inside the `node -e` block that writes `nats.conf`,
+`local ECHO_PORT=…`, and an `NAME=… cmd` env prefix). Deciding which rules ran by file extension
+was itself an enumeration, and the `nats.conf` case — a JS object literal inside a `.sh` — is
+what walked through it. So the polarity is inverted: **every integer in the unprivileged port
+range, in any scanned file, outside comments and not part of a longer token, is a port** unless
+it is a documented non-port occurrence scoped to that file and an exact expected count, a real
+product port documented as outside the test topology, a port that file is the declared owner of,
+or a named waiver tied to a filed issue.
+
+**The scan set is discovered, not listed.** It walks `e2e/local/` recursively — `lib/harness.sh`
+is in scope, and a literal there would override `harness_ports` for all six gates at once. For
+root-sweep Vitest `*.test.*`/`*.spec.*` sources, the guard first traverses every suite's complete
+local static component, then finds listener roots anywhere in those components by content
+(`nats-server`, `.listen(`, `createServer(`, `ws_port`, `spawn(`, or
+`new WebSocketServer(`). If a component contains a listener, the complete component enters the
+literal scan. Thus a `demo/server.test.ts` that merely calls `startServer(18491)` is covered even
+when only its imported helper contains the binding API. The suite universe honors Vitest's
+current default exclusions plus this repo's `docker/**` and `examples/**` exclusions.
+
+The original #118 family retains a separate broad listener-content sweep across every source
+under `packages/*/src/**`; each package listener root brings its downward recursive local static
+ESM import/re-export and CommonJS `require()` provenance into the literal scan. Resolution prefers
+TypeScript source behind `.js`/`.cjs` specifiers and supports source/index variants, so a helper
+cannot move its fixed literal out of view. Computed/dynamic imports, package specifiers,
+excluded/generated trees, JSON, and product sources unreachable from a root suite or package
+listener are not followed; this is a contained provenance graph, not a sweep of the whole tree.
+
+One reachable product module, `demo/saas-server.ts`, intentionally exposes both a request handler
+used by unit tests and the `startDemoSaasServer` listener entrypoint. Its product HTTP/NATS
+defaults are outside the test topology only while root Vitest suites do not reference that named
+start entrypoint. A live, reasoned boundary rule enforces that condition while continuing to allow
+the existing handler-only imports; direct, aliased, namespace, and intermediate re-export
+references all trip the rule.
+
+**Every literal allowance is an exact budget.** `NOT_PORTS` contains only genuine non-port
+constants and names source, value, count, and reason. `WAIVED` records the same fields for each
+filed existing defect. A small `OUTSIDE_TEST_TOPOLOGY` category honestly records real product
+dial/listen defaults reached through provenance but not activated by the discovered tests; those
+are ports, not mislabeled constants, and the demo start-entrypoint rule keeps that classification
+checkable. In every category the same value in another source receives no
+allowance, an extra same-file occurrence exceeds the count, and removing an occurrence makes the
+budget stale.
+
+> Known evasions of the token rule, listed because that rule is the design's load-bearing claim:
+> numeric separators (`18_991`), hex/octal, and runtime concatenation of sub-4-digit parts. Each
+> takes intent; the scan is aimed at the accident.
+>
+> Scanned extensions are source only (`.sh`, JS/TS including `jsx`/`tsx`, `mts`/`cts`, and
+> `mjs`/`cjs`). `.json` is excluded
+> because the authority is itself JSON; `.yaml` because the CI workflow is owned by another lane.
+
+Drivers take their topology from the gate via env and **fail** if it is missing rather than
+falling back to a literal — a default that never runs during a real gate is a default that
+silently drifts (see [`require-env.ts`](require-env.ts)).
 
 Each prints `[REPLY] echo: …<your message>` (and a `[PROOF] …` line) on success, and exits
 non-zero if the register hop fails to admit the peer.

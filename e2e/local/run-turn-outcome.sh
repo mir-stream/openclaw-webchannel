@@ -39,12 +39,12 @@ PKG_JSON="$REPO/packages/plugin/package.json"
 # permanently stranding the swapped (index-nats.ts) package.json in git.
 PKG_BAK=/tmp/oc-turn-outcome-e2e.pkgbak.json
 
-GW_PORT=18981
-NATS_WS=18481
-NATS_TCP=14481
-ECHO_PORT=18982
+# Ports (GW_PORT/NATS_WS/NATS_TCP/ECHO_PORT/ISSUER_PORT) come from
+# e2e/local/ports.json — the single source of truth for both this harness family
+# and the *-realserver.test.ts suites (#118/#119). Never hard-code one here.
+. "$REPO/e2e/local/lib/harness.sh"
+harness_ports run-turn-outcome
 export ECHO_FAIL_MARKER="${ECHO_FAIL_MARKER:-ISSUE87_ALWAYS_ERROR}"
-ISSUER_PORT=3981
 ENROLLMENT_ADMIN_TOKEN="${ENROLLMENT_ADMIN_TOKEN:-local-e2e-admin-token}"
 
 TENANT=default-tenant
@@ -83,6 +83,16 @@ pkill -f "echo-openai-server.mjs $ECHO_PORT" 2>/dev/null || true
 pkill -f "gateway --port $GW_PORT" 2>/dev/null || true
 rm -rf "$OCH"
 mkdir -p "$OCH/.openclaw"
+
+# ---------------------------------------------------------------------------
+# 0. Build the plugin bundle from the working tree (#125).
+#
+#    The gateway loads packages/plugin/dist/index-nats.js. Without this step the
+#    gate boots whatever bundle happened to be on disk, so a green run says
+#    nothing about your edit — see the incident note in e2e/local/lib/harness.sh.
+#    Done before any server starts so a broken build fails fast.
+# ---------------------------------------------------------------------------
+harness_build_plugin run-turn-outcome "$OCH/plugin-build.log"
 
 # ---------------------------------------------------------------------------
 # 1. REAL device-flow enrollment-server (single trust chain). Writes the public
@@ -337,6 +347,11 @@ for i in $(seq 1 240); do
     echo "[run-turn-outcome] TIMEOUT waiting for structured account readiness — log:"; cat "$OCH/gateway.log"; exit 2
   fi
 done
+
+# ASSERT the gateway loaded the bundle step 0 built (#125). Building the right
+# file and the gateway LOADING it are two different claims; the build step only
+# ever established the first. Reads core own resolution record from the log.
+harness_assert_loaded_dist run-turn-outcome "$OCH/gateway.log"
 
 # ---------------------------------------------------------------------------
 # 7. Drive the NKEY-authenticated encrypted round-trip.
