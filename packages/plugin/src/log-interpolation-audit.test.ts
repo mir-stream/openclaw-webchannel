@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, it, expect } from "vitest";
 
+import { logSafe } from "./log-safe.js";
 import {
   ALLOWED_RAW_INTERPOLATIONS,
   findLogStatements,
@@ -11,6 +12,7 @@ import {
   rawInterpolationAllowanceKey,
   violationKey,
 } from "./test-fixtures/log-interpolation-audit.js";
+import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
 
 /**
  * #123 — no peer-controlled value reaches a log record raw.
@@ -306,6 +308,68 @@ describe("the checker catches every known evasion (#123)", () => {
     expect(
       check("api.logger.error?.(`webchannel: probe: ${logSafe(err as Error)}`);"),
     ).toEqual([]);
+  });
+
+  it("EVASION 15: static quotes cannot wrap a logSafe token", () => {
+    const violations = check(
+      'api.logger.warn(`webchannel: peer="${logSafe(peerId)}" outcome=ok`);',
+    );
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("logSafe(peerId)");
+    expect(
+      check('console.warn(`webchannel: peer="` + `${logSafe(peerId)}` + `"`);'),
+    ).toHaveLength(1);
+
+    const emitted = `webchannel: peer="${logSafe("x outcome=forged")}" outcome=ok`;
+    expect(emitted).toBe('webchannel: peer=""x outcome=forged"" outcome=ok');
+    expect(() => decodeStrictLogfmt(emitted)).toThrow(
+      /invalid character after quoted logfmt value/,
+    );
+  });
+
+  it("rejects identifier-like token prefixes and suffixes around logSafe", () => {
+    expect(check("console.warn(`webchannel: peer=prefix${logSafe(peerId)}`);")).toHaveLength(1);
+    expect(check("console.warn(`webchannel: peer=${logSafe(peerId)}suffix`);")).toHaveLength(1);
+    // Concatenation cannot hide the same runtime adjacency on another fragment.
+    expect(
+      check("console.warn(`webchannel: peer=${logSafe(peerId)}` + `suffix`);"),
+    ).toHaveLength(1);
+
+    const prefixed = `webchannel: peer=prefix${logSafe("x outcome=forged")}`;
+    const suffixed = `webchannel: peer=${logSafe("x outcome=forged")}suffix outcome=ok`;
+    expect(() => decodeStrictLogfmt(prefixed)).toThrow(/invalid bare logfmt value/);
+    expect(() => decodeStrictLogfmt(suffixed)).toThrow(
+      /invalid character after quoted logfmt value/,
+    );
+  });
+
+  it("rejects directly adjacent logSafe interpolations", () => {
+    expect(
+      check("console.warn(`webchannel: pair=${logSafe(first)}${logSafe(second)}`);"),
+    ).toHaveLength(2);
+    expect(
+      check("console.warn(`webchannel: pair=${logSafe(first)}` + `${logSafe(second)}`);"),
+    ).toHaveLength(2);
+  });
+
+  it.each([
+    [
+      "quotes",
+      "console.warn(`webchannel: peer=\\u0022${logSafe(peerId)}\\x22`);",
+    ],
+    ["token prefix", "console.warn(`webchannel: peer=\\u0078${logSafe(peerId)}`);"],
+    ["token suffix", "console.warn(`webchannel: peer=${logSafe(peerId)}\\u0078`);"],
+    ["backslash", "console.warn(`webchannel: peer=\\\\${logSafe(peerId)}`);"],
+  ])("rejects a source-escaped static %s boundary", (_name, source) => {
+    expect(check(source)).toHaveLength(1);
+  });
+
+  it.each([
+    ["logfmt field", "console.warn(`webchannel: peer=${logSafe(peerId)} outcome=ok`);"],
+    ["prose colon", "console.warn(`webchannel: failed for ${logSafe(peerId)}: retrying`);"],
+    ["parenthesized", "console.warn(`webchannel: approval (${logSafe(id)}): ignored`);"],
+  ])("accepts the owned %s token boundary", (_name, source) => {
+    expect(check(source)).toEqual([]);
   });
 
   it("scopes raw allowances by file and concrete statement, with one-use semantics", () => {

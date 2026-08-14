@@ -61,6 +61,15 @@ export interface LogInterpolation {
   readonly statement: string;
   /** Full normalized static text, used for exact site identity. */
   readonly site: string;
+  /** Runtime-cooked static fragment immediately before this template value. */
+  readonly cookedLeft: string;
+  /** Runtime-cooked static fragment immediately after this template value. */
+  readonly cookedRight: string;
+  /** Whether another interpolation supplies the immediately adjacent value. */
+  readonly interpolationBefore: boolean;
+  readonly interpolationAfter: boolean;
+  /** False only when the AST could not prove the runtime boundary. */
+  readonly boundaryKnown: boolean;
 }
 
 /**
@@ -281,10 +290,38 @@ function hasCanonicalUnshadowedLogSafe(source: string, file: string): boolean {
  * closing quote, destroying the delimiting the whole fix rests on; and
  * `${logSafe(a) || String(peerId)}`, which reaches the record raw. Both are
  * things an author writes to shorten a long line or add a fallback.
+ *
+ * `logSafe` returns one complete JSON-quoted token. Its template boundary must
+ * preserve that token: an adjacent quote/backslash can consume one of its
+ * quotes, and an adjacent ECMAScript identifier-part character merges it into
+ * a larger token that strict logfmt rejects. Another interpolation (including
+ * across a `+` concatenation) is dynamic adjacency and is rejected too. Empty
+ * record boundaries, whitespace and punctuation remain valid, which preserves
+ * the owned `=${logSafe(x)} `, ` ${logSafe(x)}: ` and
+ * `(${logSafe(x)}):` shapes.
  */
-function isSafeWrapperCall(expression: string, canonicalBinding: boolean): boolean {
+function isUnsafeQuotedTokenNeighbor(fragment: string, side: "left" | "right"): boolean {
+  const codePoints = Array.from(fragment);
+  const neighbor = side === "left" ? codePoints.at(-1) : codePoints[0];
+  if (neighbor === undefined) return false;
+  return /["'`\\$\u200c\u200d\p{ID_Continue}]/u.test(neighbor);
+}
+
+function isSafeWrapperCall(interpolation: LogInterpolation, canonicalBinding: boolean): boolean {
+  const expression = interpolation.expression;
   if (!canonicalBinding || !expression.startsWith("logSafe(")) return false;
-  return scanToCloseParen(expression, "logSafe".length) === expression.length - 1;
+  if (scanToCloseParen(expression, "logSafe".length) !== expression.length - 1) return false;
+  if (
+    !interpolation.boundaryKnown ||
+    interpolation.interpolationBefore ||
+    interpolation.interpolationAfter
+  ) {
+    return false;
+  }
+  return (
+    !isUnsafeQuotedTokenNeighbor(interpolation.cookedLeft, "left") &&
+    !isUnsafeQuotedTokenNeighbor(interpolation.cookedRight, "right")
+  );
 }
 
 /**
@@ -340,6 +377,192 @@ function collectCookedStaticText(node: ts.Node): string {
     text += collectCookedStaticText(child);
   });
   return text;
+}
+
+type RuntimeEdge =
+  | { readonly kind: "none" }
+  | { readonly kind: "static"; readonly text: string }
+  | { readonly kind: "interpolation" }
+  | { readonly kind: "unknown" };
+
+interface TemplateInterpolationBoundary {
+  readonly cookedLeft: string;
+  readonly cookedRight: string;
+  readonly interpolationBefore: boolean;
+  readonly interpolationAfter: boolean;
+  readonly boundaryKnown: boolean;
+}
+
+function isTransparentRuntimeWrapper(parent: ts.Node, child: ts.Node): boolean {
+  return (
+    (ts.isParenthesizedExpression(parent) && parent.expression === child) ||
+    (ts.isAsExpression(parent) && parent.expression === child) ||
+    (ts.isTypeAssertionExpression(parent) && parent.expression === child) ||
+    (ts.isNonNullExpression(parent) && parent.expression === child) ||
+    (ts.isSatisfiesExpression(parent) && parent.expression === child) ||
+    (ts.isAwaitExpression(parent) && parent.expression === child) ||
+    (ts.isConditionalExpression(parent) &&
+      (parent.whenTrue === child || parent.whenFalse === child)) ||
+    (ts.isBinaryExpression(parent) &&
+      [
+        ts.SyntaxKind.AmpersandAmpersandToken,
+        ts.SyntaxKind.BarBarToken,
+        ts.SyntaxKind.QuestionQuestionToken,
+      ].includes(parent.operatorToken.kind) &&
+      (parent.left === child || parent.right === child)) ||
+    (ts.isBinaryExpression(parent) &&
+      parent.operatorToken.kind === ts.SyntaxKind.CommaToken &&
+      parent.right === child)
+  );
+}
+
+/** The first/last runtime value contributed by an expression in a `+` chain. */
+function runtimeEdge(node: ts.Expression, side: "left" | "right"): RuntimeEdge {
+  if (
+    ts.isParenthesizedExpression(node) ||
+    ts.isAsExpression(node) ||
+    ts.isTypeAssertionExpression(node) ||
+    ts.isNonNullExpression(node) ||
+    ts.isSatisfiesExpression(node)
+  ) {
+    return runtimeEdge(node.expression, side);
+  }
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    return node.text.length === 0 ? { kind: "none" } : { kind: "static", text: node.text };
+  }
+  if (ts.isTemplateExpression(node)) {
+    const text =
+      side === "left"
+        ? node.head.text
+        : node.templateSpans[node.templateSpans.length - 1]!.literal.text;
+    return text.length === 0 ? { kind: "interpolation" } : { kind: "static", text };
+  }
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const first = side === "left" ? node.left : node.right;
+    const second = side === "left" ? node.right : node.left;
+    const edge = runtimeEdge(first, side);
+    return edge.kind === "none" ? runtimeEdge(second, side) : edge;
+  }
+  if (ts.isConditionalExpression(node)) {
+    const whenTrue = runtimeEdge(node.whenTrue, side);
+    const whenFalse = runtimeEdge(node.whenFalse, side);
+    if (whenTrue.kind === "none" && whenFalse.kind === "none") return { kind: "none" };
+    if (
+      whenTrue.kind === "static" &&
+      whenFalse.kind === "static" &&
+      (side === "left"
+        ? Array.from(whenTrue.text)[0] === Array.from(whenFalse.text)[0]
+        : Array.from(whenTrue.text).at(-1) === Array.from(whenFalse.text).at(-1))
+    ) {
+      return whenTrue;
+    }
+    if (whenTrue.kind === "interpolation" && whenFalse.kind === "interpolation") {
+      return { kind: "interpolation" };
+    }
+    return { kind: "unknown" };
+  }
+  if (
+    ts.isNumericLiteral(node) ||
+    ts.isBigIntLiteral(node) ||
+    node.kind === ts.SyntaxKind.TrueKeyword ||
+    node.kind === ts.SyntaxKind.FalseKeyword ||
+    node.kind === ts.SyntaxKind.NullKeyword
+  ) {
+    return { kind: "static", text: node.getText() };
+  }
+  return { kind: "unknown" };
+}
+
+/**
+ * Find a value adjacent at runtime when an interpolation sits at the edge of a
+ * template in a string-concatenation chain. This closes the equivalent split
+ * spelling: `` `peer=${logSafe(x)}` + `suffix` ``.
+ */
+function externalRuntimeEdge(
+  template: ts.TemplateExpression,
+  side: "left" | "right",
+): RuntimeEdge {
+  let current: ts.Expression = template;
+  while (true) {
+    const parent = current.parent;
+    if (isTransparentRuntimeWrapper(parent, current)) {
+      current = parent as ts.Expression;
+      continue;
+    }
+    if (
+      ts.isBinaryExpression(parent) &&
+      parent.operatorToken.kind === ts.SyntaxKind.PlusToken
+    ) {
+      const hasSibling =
+        (side === "left" && parent.right === current) ||
+        (side === "right" && parent.left === current);
+      if (hasSibling) {
+        const sibling = side === "left" ? parent.left : parent.right;
+        const edge = runtimeEdge(sibling, side === "left" ? "right" : "left");
+        if (edge.kind !== "none") return edge;
+      }
+      current = parent;
+      continue;
+    }
+    if (
+      ((ts.isCallExpression(parent) || ts.isNewExpression(parent)) &&
+        parent.arguments?.some((argument) => argument === current)) ||
+      (ts.isTemplateSpan(parent) && parent.expression === current)
+    ) {
+      return { kind: "none" };
+    }
+    // A transformation this checker does not model is not a proven record
+    // boundary. Fail loud instead of quietly blessing the wrapped value.
+    return { kind: "unknown" };
+  }
+}
+
+/** Runtime-cooked neighbors for every `${...}` in every template. */
+function collectTemplateInterpolationBoundaries(
+  sourceFile: ts.SourceFile,
+): ReadonlyMap<number, TemplateInterpolationBoundary> {
+  const boundaries = new Map<number, TemplateInterpolationBoundary>();
+  const visit = (node: ts.Node): void => {
+    if (ts.isTemplateExpression(node)) {
+      for (let index = 0; index < node.templateSpans.length; index += 1) {
+        const span = node.templateSpans[index]!;
+        const localLeft = index === 0 ? node.head.text : node.templateSpans[index - 1]!.literal.text;
+        const localRight = span.literal.text;
+        const externalLeft =
+          index === 0 && localLeft.length === 0
+            ? externalRuntimeEdge(node, "left")
+            : { kind: "none" as const };
+        const externalRight =
+          index === node.templateSpans.length - 1 && localRight.length === 0
+            ? externalRuntimeEdge(node, "right")
+            : { kind: "none" as const };
+        boundaries.set(span.expression.pos, {
+          cookedLeft:
+            localLeft.length > 0
+              ? localLeft
+              : externalLeft.kind === "static"
+                ? externalLeft.text
+                : "",
+          cookedRight:
+            localRight.length > 0
+              ? localRight
+              : externalRight.kind === "static"
+                ? externalRight.text
+                : "",
+          interpolationBefore:
+            (index > 0 && localLeft.length === 0) || externalLeft.kind === "interpolation",
+          interpolationAfter:
+            (index < node.templateSpans.length - 1 && localRight.length === 0) ||
+            externalRight.kind === "interpolation",
+          boundaryKnown:
+            externalLeft.kind !== "unknown" && externalRight.kind !== "unknown",
+        });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return boundaries;
 }
 
 function createAuditSourceFile(source: string): ts.SourceFile {
@@ -746,6 +969,7 @@ export function findLogStatements(
   const consumed: Array<[number, number]> = [];
   const sourceFile = createAuditSourceFile(source);
   const scanSource = maskRegularExpressionLiterals(source, sourceFile);
+  const templateBoundaries = collectTemplateInterpolationBoundaries(sourceFile);
   for (const { open, close, prefixText } of findLogCallBoundaries(source, sourceFile)) {
     // Skip a call we already swallowed as part of an enclosing log statement.
     if (consumed.some(([s, e]) => open > s && open < e)) continue;
@@ -761,12 +985,20 @@ export function findLogStatements(
       site,
       line: source.slice(0, open).split("\n").length,
       unreadable: findUnreadableValues(scanSource, source, sourceFile, open + 1, close),
-      interpolations: found.map((interp) => ({
-        expression: interp.text.replace(/\s+/g, " ").trim(),
-        line: source.slice(0, interp.index).split("\n").length,
-        statement,
-        site,
-      })),
+      interpolations: found.map((interp) => {
+        const boundary = templateBoundaries.get(interp.index);
+        return {
+          expression: interp.text.replace(/\s+/g, " ").trim(),
+          line: source.slice(0, interp.index).split("\n").length,
+          statement,
+          site,
+          cookedLeft: boundary?.cookedLeft ?? "",
+          cookedRight: boundary?.cookedRight ?? "",
+          interpolationBefore: boundary?.interpolationBefore ?? true,
+          interpolationAfter: boundary?.interpolationAfter ?? true,
+          boundaryKnown: boundary !== undefined && boundary.boundaryKnown,
+        };
+      }),
     });
   }
   return statements;
@@ -791,7 +1023,7 @@ export function findUnsafeLogInterpolations(
   for (const statement of findLogStatements(source, options.prefixes)) {
     for (const interp of statement.interpolations) {
       const expr = interp.expression;
-      if (isSafeWrapperCall(expr, canonicalBinding)) continue;
+      if (isSafeWrapperCall(interp, canonicalBinding)) continue;
       const allowanceIndex = ALLOWED_RAW_INTERPOLATIONS.findIndex(
         (allowance, index) =>
           !consumedAllowances.has(index) &&
@@ -812,6 +1044,11 @@ export function findUnsafeLogInterpolations(
         line: statement.line,
         statement: statement.literal,
         site: statement.site,
+        cookedLeft: "",
+        cookedRight: "",
+        interpolationBefore: false,
+        interpolationAfter: false,
+        boundaryKnown: false,
         file: options.file,
       });
     }
