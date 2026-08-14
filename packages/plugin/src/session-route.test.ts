@@ -104,7 +104,7 @@ describe("resolveWebchannelSessionRoute (forced per-user isolation)", () => {
     expect(route.lastRoutePolicy).toBe("session");
   });
 
-  it("keeps a maximum-component route within core's 512-character chat-send boundary", () => {
+  it("keeps maximum validated raw components within 512 when identityLinks are absent", () => {
     const maxAgentId = "g".repeat(64);
     const maxAccountId = "a".repeat(64);
     const maxPeerId = "p".repeat(128);
@@ -113,6 +113,7 @@ describe("resolveWebchannelSessionRoute (forced per-user isolation)", () => {
       resolvedAgentId: maxAgentId,
       resolvedAccountId: maxAccountId,
     });
+    expect(api.config.session.identityLinks).toBeUndefined();
 
     const route = resolveWebchannelSessionRoute(
       api,
@@ -123,6 +124,9 @@ describe("resolveWebchannelSessionRoute (forced per-user isolation)", () => {
     const tenantToken = route.sessionKey.split(":tenant:")[1];
 
     expect(tenantToken).toMatch(/^[a-f0-9]{64}$/);
+    // Canonical identityLinks names are not validator-bounded; 354 is the
+    // maximum validated raw-component case exercised here, not a universal
+    // bound for arbitrary identityLinks configuration.
     expect(route.sessionKey).toHaveLength(354);
     expect(route.sessionKey.length).toBeLessThanOrEqual(512);
   });

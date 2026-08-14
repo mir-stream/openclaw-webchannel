@@ -24,11 +24,13 @@
  *
  * ── Why these tests are shaped this way ─────────────────────────────────────
  * The leak is at the seam between key derivation and the session store, so the
- * store here is a `Map` keyed by session key — which is faithful: the real read
- * path bottoms out at `api.runtime.subagent.getSessionMessages({ sessionKey })`
- * (see `history.ts` `readFromStore`), and core's on-disk `sessions.json` is a
- * flat map whose top-level keys ARE session keys. The snapshot and
- * `load_history` bodies below are transcribed from the two production READ
+ * harness uses a `Map` keyed by session key. That is faithful to the lookup
+ * boundary: the real read path bottoms out at
+ * `api.runtime.subagent.getSessionMessages({ sessionKey })` (see `history.ts`
+ * `readFromStore`), and core's on-disk `sessions.json` uses session keys for its
+ * metadata/key-to-file mapping. It is not a literal disk-shape model: message
+ * bodies live in the referenced per-agent `sessions/*.jsonl` files. The snapshot
+ * and `load_history` bodies below are transcribed from the two production READ
  * sites in `nats-account-runtime.ts` (`sendHistorySnapshot` and
  * `setLoadHistoryHandler`); keep them in step if those change.
  *
@@ -76,10 +78,11 @@ const T2 = "tenant-two";
 const CLIENT_NONCE = "Y2xpZW50LW5vbmNlLWZpeHR1cmUtMDE";
 
 /**
- * The core session store: a flat map from session key to raw transcript, which
- * is the shape `getSessionMessages` reads and the shape `sessions.json` has on
- * disk. ONE instance is shared by the T1 and T2 apis — that sharing is the
- * whole point, because on a hot-reload the store on disk does not change.
+ * A lookup-level model from session key to raw messages. Core persists this in
+ * two layers (`sessions.json` metadata/key mapping plus referenced per-agent
+ * `sessions/*.jsonl` message bodies), but `getSessionMessages` exposes the same
+ * key-to-messages behavior. ONE instance is shared by the T1 and T2 apis — that
+ * sharing models the complete session storage surviving a hot reload.
  */
 type SessionStore = Map<string, unknown[]>;
 

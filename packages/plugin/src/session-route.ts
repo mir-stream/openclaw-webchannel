@@ -120,9 +120,13 @@
  * those of single-tenant deployments that never configured a tenant and land on
  * `DEFAULT_WEBCHANNEL_TENANT`. At upgrade a live session loses its history
  * binding: the register-time snapshot and `load_history` come back empty. No
- * data is deleted — the old transcripts stay in core's `sessions.json` under
- * their previous keys — and no credential or conversation key changes, because
- * those are keyed by `(tenant, accountId)` + peerId and never by the session key.
+ * credential or conversation key changes, because those are keyed by
+ * `(tenant, accountId)` + peerId and never by the session key. Core's
+ * `sessions.json` contains metadata/key-to-file mappings; transcript messages
+ * are in the referenced per-agent `sessions/*.jsonl` files. Preserving old
+ * history therefore requires stopping/quiescing the gateway and copying the
+ * complete relevant per-agent sessions directory/storage (both `sessions.json`
+ * and its referenced JSONLs), not copying `sessions.json` alone.
  *
  * Eliding the component when the tenant is `DEFAULT_WEBCHANNEL_TENANT` would
  * spare exactly those deployments, and it was rejected: a deployment that HAS
@@ -164,8 +168,11 @@ const TENANT_KEY_SEGMENT = "tenant";
  * one stored key (see the module docstring, point 1 — this is the crux of the
  * fix, not a detail). The full SHA-256 digest of the verbatim tenant is lowercase
  * hex, so it distinguishes `Acme` from `acme` under standard collision-resistance
- * assumptions while leaving ample room under core's 512-character session-key
- * boundary even when every validated component is at its maximum length.
+ * assumptions. With no `session.identityLinks` rewrite, the maximum validated
+ * raw agent/account/peer/tenant components leave ample room under core's
+ * 512-character session-key boundary. Canonical names supplied by
+ * `identityLinks` are not bounded by those raw-component validators, so this is
+ * not a universal length guarantee for arbitrary configuration.
  */
 function tenantScopeToken(tenant: string): string {
   return createHash("sha256").update(tenant, "utf8").digest("hex");

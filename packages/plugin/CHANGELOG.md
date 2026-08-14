@@ -85,9 +85,10 @@
   stores it, while NATS treats `Acme` and `acme` as different tenants with
   different credentials. Hashing the verbatim tenant before the store fold
   keeps those authorization namespaces separate; the digest is not truncated.
-  A lossless UTF-8 hex encoding was rejected because maximum-size valid
-  agent/account/peer/tenant components could push the resulting key past
-  OpenClaw's 512-character chat-send session-key boundary.
+  A lossless UTF-8 hex encoding was rejected because maximum-size validated raw
+  agent/account/peer/tenant components, even without an `identityLinks` rewrite,
+  could push the resulting key past OpenClaw's 512-character chat-send
+  session-key boundary.
   - The serving runtime freezes the tenant selected by its startup account plan
     and uses that same value for inbound writes, register-time snapshots, and
     `load_history`. Temporary process-environment overrides during a skill run
@@ -97,13 +98,15 @@
     `load_history` page, read the new key and find nothing under it. Per-session
     `/reasoning off` opt-outs also reset to the configured default, because that
     preference is stored against the session key.
-  - **Nothing is deleted at upgrade time**, but do not treat the old entries as
-    archived. Previous transcripts remain in openclaw's `sessions.json` under
-    their previous keys; nothing writes to them again, so they age out under
-    core's normal session-store maintenance (pruning, capping, rotation on
-    write), and as the oldest entries they are evicted first. There is no
-    automated migration in this release — **capture that file before upgrading**
-    if the old transcripts matter to you.
+  - There is no automated transcript migration in this release. `sessions.json`
+    contains session metadata and key-to-file mappings, not the message bodies;
+    messages live in the referenced per-agent `sessions/*.jsonl` files. To
+    preserve pre-upgrade history, stop or otherwise quiesce the gateway and copy
+    the complete relevant per-agent sessions directory/session storage before
+    upgrading, including both `sessions.json` and its referenced JSONLs. Copying
+    `sessions.json` alone is insufficient. The pinned OpenClaw
+    `openclaw backup create` command omits active session transcript JSONLs, so
+    it is not a substitute for this stopped copy.
   - **No re-enrollment, and no credential or key change.** Conversation keys and
     enrolled credentials are stored per `(tenant, accountId)` and peer id, never
     per session key, so they are unaffected. Browsers reconnect and register
