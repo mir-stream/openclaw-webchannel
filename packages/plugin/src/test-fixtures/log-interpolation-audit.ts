@@ -1,3 +1,5 @@
+import ts from "typescript";
+
 /**
  * #123 — the log-record integrity checker.
  *
@@ -19,13 +21,13 @@
  * So this scans the whole log STATEMENT — through concatenation, parenthesised
  * sub-expressions and nested templates — and applies a POSITIVE rule:
  *
- *   every `${…}` inside a log statement must be a `logSafe(…)` call,
- *   unless its exact text is on the allowlist below.
+ *   every `${…}` inside a log statement must call the canonical imported
+ *   `logSafe(…)`, unless its exact file + statement + text site is allowlisted.
  *
- * An allowlist of values known to be safe is auditable and stays correct as the
- * code grows. A denylist of dangerous spellings is neither: it is only ever as
- * complete as the last person's imagination, which is exactly how the six-entry
- * version shipped green over two live evasions.
+ * A site-scoped allowlist of values known to be safe is auditable and stays
+ * correct as the code grows. A denylist of dangerous spellings is neither: it
+ * is only ever as complete as the last person's imagination, which is exactly
+ * how the six-entry version shipped green over two live evasions.
  *
  * SCOPE IS SET BY PREFIX, NOT BY FILE. A statement is only checked if its
  * static text carries one of the caller-supplied prefixes — and that cuts
@@ -61,36 +63,116 @@ export interface LogInterpolation {
 
 /**
  * Interpolations that may stay raw, each with the reason it cannot carry
- * peer-controlled bytes. Keyed by EXACT expression text so a rename or a
- * change of shape re-triggers review rather than silently inheriting the
- * exemption.
+ * peer-controlled bytes. Every allowance names the file and the statement's
+ * full normalized static text, and is consumed at most once per scan. An
+ * unrelated binding with the same spelling therefore cannot inherit a safety
+ * decision made for another file or another site.
  */
-export const ALLOWED_RAW_INTERPOLATIONS: ReadonlyMap<string, string> = new Map([
+export interface AllowedRawInterpolation {
+  readonly file: string;
+  readonly site: string;
+  readonly expression: string;
+  readonly reason: string;
+}
+
+export const ALLOWED_RAW_INTERPOLATIONS: readonly AllowedRawInterpolation[] = [
   // Closed enums — the full value set is spelled out in the source.
-  ["admission.reason", "six-literal union (dm-allowlist.ts:29-36)"],
-  ["turnOutcome", 'the literal union "ok" | "error" (inbound.ts:392)'],
+  {
+    file: "inbound.ts",
+    site: "webchannel: inbound denied for peer (); turn not dispatched",
+    expression: "admission.reason",
+    reason: "six-literal union (dm-allowlist.ts:29-36)",
+  },
+  {
+    file: "inbound.ts",
+    site: "webchannel: turn_settled was not delivered for peer= turn= outcome=",
+    expression: "turnOutcome",
+    reason: 'the literal union "ok" | "error" (inbound.ts:392)',
+  },
   // Numerics and booleans: cannot contain a newline or a delimiter.
-  ["debounceCancelled", "boolean"],
-  ["pendingDropped.length", "number"],
-  ["PENDING_APPROVAL_CAP", "numeric module constant"],
-  ["PENDING_APPROVAL_MAX_AGE_MS", "numeric module constant"],
+  {
+    file: "auth.ts",
+    site: "webchannel: jwt strategy requires exactly one of jwksUrl, jwksFile, or jwks (got ). Refusing to start.",
+    expression: "present.length",
+    reason: "number",
+  },
+  {
+    file: "approvals.ts",
+    site: '[webchannel] pending-approval cap reached; evicting a still-pending approval "" (account "", peer "") — a client may show it as resolved-elsewhere',
+    expression: "PENDING_APPROVAL_CAP",
+    reason: "numeric module constant",
+  },
+  {
+    file: "approvals.ts",
+    site: '[webchannel] pending-approval "" (account "", peer "") pruned after ms with no finalize — likely an orphaned approval (monitor disposed?)',
+    expression: "PENDING_APPROVAL_MAX_AGE_MS",
+    reason: "numeric module constant",
+  },
   // Retry/lifecycle counters on the `event=webchannel.*` records.
-  ["failedAttempts", "retry counter (number)"],
-  ["delayMs", "backoff delay (number)"],
-  ["attempt", "attempt counter (number)"],
-  ["outageMs", "outage duration (number)"],
-  ["disposeReport.errors.length", "number"],
-  // Escaped PER ELEMENT before joining, so a comma inside one id cannot forge a
-  // list boundary. Wrapping the joined string instead would be weaker — see the
-  // test in ingress-dedupe.test.ts.
-  [
-    'ackIds.map((id) => logSafe(id)).join(",")',
-    "each element escaped before the join (ingress-dedupe.ts:581)",
-  ],
-]);
+  {
+    file: "nats-account-runtime.ts",
+    site: '"warn"event=webchannel.account_startup accountId= state=retry_scheduled attempt= delayMs= code=',
+    expression: "failedAttempts",
+    reason: "retry counter (number)",
+  },
+  {
+    file: "nats-account-runtime.ts",
+    site: '"warn"event=webchannel.account_startup accountId= state=retry_scheduled attempt= delayMs= code=',
+    expression: "delayMs",
+    reason: "backoff delay (number)",
+  },
+  {
+    file: "nats-account-runtime.ts",
+    site: '"info"event=webchannel.account_startup accountId= state=recovered attempt= failedAttempts= outageMs=',
+    expression: "attempt",
+    reason: "attempt counter (number)",
+  },
+  {
+    file: "nats-account-runtime.ts",
+    site: '"info"event=webchannel.account_startup accountId= state=recovered attempt= failedAttempts= outageMs=',
+    expression: "failedAttempts",
+    reason: "retry counter (number)",
+  },
+  {
+    file: "nats-account-runtime.ts",
+    site: '"info"event=webchannel.account_startup accountId= state=recovered attempt= failedAttempts= outageMs=',
+    expression: "outageMs",
+    reason: "outage duration (number)",
+  },
+  {
+    file: "nats-account-runtime.ts",
+    site: "webchannel: /stop dropped buffered input (debounced=, pending=)",
+    expression: "debounceCancelled",
+    reason: "boolean",
+  },
+  {
+    file: "nats-account-runtime.ts",
+    site: "webchannel: /stop dropped buffered input (debounced=, pending=)",
+    expression: "pendingDropped.length",
+    reason: "number",
+  },
+  {
+    file: "nats-account-runtime.ts",
+    site: '"warn"event=webchannel.account_cleanup accountId= errors=',
+    expression: "disposeReport.errors.length",
+    reason: "number",
+  },
+  {
+    file: "nats-account-runtime.ts",
+    site: '"info"event=webchannel.account_startup accountId= state=stopped attempt=',
+    expression: "attempt",
+    reason: "attempt counter (number)",
+  },
+] as const;
+
+export function rawInterpolationAllowanceKey(
+  allowance: Pick<AllowedRawInterpolation, "file" | "site" | "expression">,
+): string {
+  return `${allowance.file}\u0000${allowance.site}\u0000${allowance.expression}`;
+}
 
 /**
- * Functions whose RETURN value is safe to interpolate.
+ * The function whose RETURN value is safe to interpolate.
  *
  * `logSafe` ONLY. `formatAccountIdForLog` was here on the reasoning that it
  * "sanitises the account id" — it does not: `account-config.ts:78-80` is bare
@@ -115,7 +197,80 @@ export const ALLOWED_RAW_INTERPOLATIONS: ReadonlyMap<string, string> = new Map([
  * over any argument in any file added to `ENFORCED` later. Its uses ride the
  * documented baseline instead, where the reason gets re-read.
  */
-const SAFE_WRAPPERS = ["logSafe"] as const;
+const CANONICAL_LOG_SAFE_MODULE = "./log-safe.js";
+
+/** Collect the identifiers introduced by one binding name, including destructuring. */
+function bindingIdentifiers(name: ts.BindingName): ts.Identifier[] {
+  if (ts.isIdentifier(name)) return [name];
+  return name.elements.flatMap((element) =>
+    ts.isOmittedExpression(element) ? [] : bindingIdentifiers(element.name),
+  );
+}
+
+/**
+ * `logSafe(…)` is trustworthy only when `logSafe` is the canonical named import
+ * and no lexical declaration shadows it anywhere in the file. Requiring the
+ * whole file to be shadow-free is intentionally conservative: it keeps this
+ * source scanner from having to approximate JavaScript scope at every nested
+ * interpolation while still proving that every accepted spelling resolves to
+ * the one implementation whose contract this audit relies on.
+ */
+function hasCanonicalUnshadowedLogSafe(source: string, file: string): boolean {
+  const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const canonicalImports: ts.ImportSpecifier[] = [];
+  const bindings: Array<{ readonly identifier: ts.Identifier; readonly owner: ts.Node }> = [];
+
+  const addBinding = (name: ts.BindingName | ts.Identifier | undefined, owner: ts.Node): void => {
+    if (!name) return;
+    const identifiers = ts.isIdentifier(name) ? [name] : bindingIdentifiers(name);
+    for (const identifier of identifiers) {
+      if (identifier.text === "logSafe") bindings.push({ identifier, owner });
+    }
+  };
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isImportSpecifier(node)) {
+      const declaration = node.parent.parent.parent;
+      const imported = node.propertyName?.text ?? node.name.text;
+      if (
+        ts.isImportDeclaration(declaration) &&
+        !node.isTypeOnly &&
+        !declaration.importClause?.isTypeOnly &&
+        ts.isStringLiteral(declaration.moduleSpecifier) &&
+        declaration.moduleSpecifier.text === CANONICAL_LOG_SAFE_MODULE &&
+        imported === "logSafe" &&
+        node.name.text === "logSafe"
+      ) {
+        canonicalImports.push(node);
+      }
+      addBinding(node.name, node);
+    } else if (ts.isImportClause(node)) {
+      addBinding(node.name, node);
+    } else if (ts.isNamespaceImport(node)) {
+      addBinding(node.name, node);
+    } else if (ts.isImportEqualsDeclaration(node)) {
+      addBinding(node.name, node);
+    } else if (ts.isVariableDeclaration(node) || ts.isParameter(node)) {
+      addBinding(node.name, node);
+    } else if (
+      ts.isFunctionDeclaration(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isClassDeclaration(node) ||
+      ts.isClassExpression(node) ||
+      ts.isEnumDeclaration(node)
+    ) {
+      addBinding(node.name, node);
+    } else if (ts.isModuleDeclaration(node) && ts.isIdentifier(node.name)) {
+      addBinding(node.name, node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+
+  if (canonicalImports.length !== 1) return false;
+  const canonical = canonicalImports[0]!;
+  return bindings.every(({ owner }) => owner === canonical);
+}
 
 /**
  * True only when the expression IS the call — not merely when it starts and
@@ -125,14 +280,10 @@ const SAFE_WRAPPERS = ["logSafe"] as const;
  * `${logSafe(a) || String(peerId)}`, which reaches the record raw. Both are
  * things an author writes to shorten a long line or add a fallback.
  */
-function isSafeWrapperCall(expression: string): boolean {
-  return SAFE_WRAPPERS.some((fn) => {
-    if (!expression.startsWith(`${fn}(`)) return false;
-    return scanToCloseParen(expression, fn.length) === expression.length - 1;
-  });
+function isSafeWrapperCall(expression: string, canonicalBinding: boolean): boolean {
+  if (!canonicalBinding || !expression.startsWith("logSafe(")) return false;
+  return scanToCloseParen(expression, "logSafe".length) === expression.length - 1;
 }
-
-const LOG_CALLEE = /([A-Za-z_$][A-Za-z0-9_$]*(?:\s*\??\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*)\s*\??\.?\s*\(/g;
 
 /**
  * Is this callee a logging (or log-destined error-construction) sink?
@@ -151,6 +302,77 @@ function isLogCallee(chain: string): boolean {
     ) ||
     ["log", "warn", "error"].some((noun) => last.endsWith(noun))
   );
+}
+
+interface CallBoundary {
+  /** Index of the call's opening `(`. */
+  readonly open: number;
+  /** Index of the matching closing `)`. */
+  readonly close: number;
+}
+
+/**
+ * Locate logging calls with the TypeScript parser so comments, strings and
+ * regex literals cannot forge a `)` boundary. The previous regex found the
+ * callee and then scanned punctuation itself; `/)/` in argument one therefore
+ * truncated the call before a raw interpolation in argument two and skipped it
+ * quietly. AST argument ranges give the exact outer parentheses while leaving
+ * the existing fail-loud value walk unchanged.
+ */
+function findLogCallBoundaries(source: string): CallBoundary[] {
+  const sourceFile = ts.createSourceFile(
+    "log-interpolation-audit-input.ts",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  const boundaries: CallBoundary[] = [];
+  const visit = (node: ts.Node): void => {
+    if ((ts.isCallExpression(node) || ts.isNewExpression(node)) && node.arguments) {
+      const callee = node.expression.getText(sourceFile);
+      const open = node.arguments.pos - 1;
+      // `arguments.end` stops after a trailing comma; the expression's end is
+      // always just past the syntactic closing parenthesis.
+      const close = node.end - 1;
+      if (isLogCallee(callee) && source[open] === "(" && source[close] === ")") {
+        boundaries.push({ open, close });
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return boundaries.sort((a, b) => a.open - b.open || b.close - a.close);
+}
+
+/**
+ * Hide regex literal bytes from the legacy inner scanner without changing any
+ * source offset. TypeScript has already distinguished regex from division, so
+ * a quote or backtick inside `/…/` cannot masquerade as a string/template
+ * delimiter; preserving CR/LF also preserves every reported line number.
+ */
+function maskRegularExpressionLiterals(source: string): string {
+  const sourceFile = ts.createSourceFile(
+    "log-interpolation-audit-input.ts",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  // `split("")` deliberately preserves UTF-16 code-unit offsets used by the
+  // TypeScript AST (unlike `[...source]`, which combines surrogate pairs).
+  const masked = source.split("");
+  const visit = (node: ts.Node): void => {
+    if (ts.isRegularExpressionLiteral(node)) {
+      for (let index = node.getStart(sourceFile); index < node.end; index += 1) {
+        if (masked[index] !== "\r" && masked[index] !== "\n") masked[index] = " ";
+      }
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return masked.join("");
 }
 
 function skipString(src: string, start: number): number {
@@ -349,6 +571,8 @@ function scanToCloseParen(src: string, open: number): number {
 /** A log statement: one logging call whose text carries a known log prefix. */
 export interface LogStatement {
   readonly literal: string;
+  /** Full normalized static text: the stable identity used by site-scoped exemptions. */
+  readonly site: string;
   readonly line: number;
   readonly interpolations: readonly LogInterpolation[];
   /**
@@ -453,25 +677,23 @@ export function findLogStatements(
   prefixes: readonly string[],
 ): LogStatement[] {
   const statements: LogStatement[] = [];
-  LOG_CALLEE.lastIndex = 0;
-  let match: RegExpExecArray | null;
   const consumed: Array<[number, number]> = [];
-  while ((match = LOG_CALLEE.exec(source)) !== null) {
-    if (!isLogCallee(match[1]!)) continue;
-    const open = match.index + match[0].length - 1;
+  const scanSource = maskRegularExpressionLiterals(source);
+  for (const { open, close } of findLogCallBoundaries(source)) {
     // Skip a call we already swallowed as part of an enclosing log statement.
     if (consumed.some(([s, e]) => open > s && open < e)) continue;
-    const close = scanToCloseParen(source, open);
     const found: Array<{ text: string; index: number }> = [];
     const literalOut = { text: "" };
-    collectInterpolations(source, open + 1, close, found, literalOut);
+    collectInterpolations(scanSource, open + 1, close, found, literalOut);
     if (!prefixes.some((prefix) => literalOut.text.includes(prefix))) continue;
     consumed.push([open, close]);
-    const statement = literalOut.text.replace(/\s+/g, " ").trim().slice(0, 90);
+    const site = literalOut.text.replace(/\s+/g, " ").trim();
+    const statement = site.slice(0, 90);
     statements.push({
       literal: statement,
+      site,
       line: source.slice(0, open).split("\n").length,
-      unreadable: findUnreadableValues(source, open + 1, close),
+      unreadable: findUnreadableValues(scanSource, open + 1, close),
       interpolations: found.map((interp) => ({
         expression: interp.text.replace(/\s+/g, " ").trim(),
         line: source.slice(0, interp.index).split("\n").length,
@@ -496,11 +718,23 @@ export function findUnsafeLogInterpolations(
   options: { readonly file: string; readonly prefixes: readonly string[] },
 ): LogViolation[] {
   const violations: LogViolation[] = [];
+  const canonicalBinding = hasCanonicalUnshadowedLogSafe(source, options.file);
+  const consumedAllowances = new Set<number>();
   for (const statement of findLogStatements(source, options.prefixes)) {
     for (const interp of statement.interpolations) {
       const expr = interp.expression;
-      if (isSafeWrapperCall(expr)) continue;
-      if (ALLOWED_RAW_INTERPOLATIONS.has(expr)) continue;
+      if (isSafeWrapperCall(expr, canonicalBinding)) continue;
+      const allowanceIndex = ALLOWED_RAW_INTERPOLATIONS.findIndex(
+        (allowance, index) =>
+          !consumedAllowances.has(index) &&
+          allowance.file === options.file &&
+          allowance.site === statement.site &&
+          allowance.expression === expr,
+      );
+      if (allowanceIndex >= 0) {
+        consumedAllowances.add(allowanceIndex);
+        continue;
+      }
       violations.push({ ...interp, file: options.file });
     }
     // Report what the scanner cannot read, rather than passing it silently.

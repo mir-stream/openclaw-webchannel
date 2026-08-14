@@ -4,6 +4,7 @@ import {
   JwksUnavailableError,
   type JsonWebKeySet,
 } from "./jwks.js";
+import { logSafe } from "./log-safe.js";
 
 export class TransientVerifyError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -121,7 +122,7 @@ export function resolveVerifierConfig(raw: unknown): ResolvedJwtVerifierConfig {
   }
   if (raw.strategy !== "jwt") {
     throw new Error(
-      `webchannel: auth strategy ${JSON.stringify(raw.strategy)} is not valid for register-hop JWT verification. Refusing to start.`,
+      `webchannel: auth strategy ${logSafe(raw.strategy)} is not valid for register-hop JWT verification. Refusing to start.`,
     );
   }
   if (!isPlainObject(raw.jwt)) {
@@ -239,21 +240,21 @@ export function createAccountJwtVerifier(input: {
       } catch (err) {
         if (err instanceof JwksUnavailableError) {
           input.logger?.error?.(
-            `webchannel: JWT verification unavailable (transient): ${String(err)}`,
+            `webchannel: JWT verification unavailable (transient): ${logSafe(err)}`,
           );
           throw new TransientVerifyError(
             "JWKS source unavailable — verification could not be performed",
             { cause: err },
           );
         }
-        input.logger?.error?.(`webchannel: JWT verification error (fail-closed): ${String(err)}`);
+        input.logger?.error?.(`webchannel: JWT verification error (fail-closed): ${logSafe(err)}`);
         return null;
       }
       if (!identity) {
         input.logger?.error?.("webchannel: JWT verification failed");
         return null;
       }
-      input.logger?.info?.(`webchannel: JWT verified for peerId="${identity.peerId}"`);
+      input.logger?.info?.(`webchannel: JWT verified for peerId=${logSafe(identity.peerId)}`);
       return identity;
     },
     warmJwks: async (signal) => ({

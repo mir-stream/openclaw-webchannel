@@ -88,6 +88,53 @@ function fakeChecker() {
   return { checkAndRecord, calls };
 }
 
+/** Decode the strict logfmt subset emitted by this diagnostic. */
+function decodeStrictLogfmt(record: string): Map<string, string> {
+  if (/\r|\n/.test(record)) throw new Error("logfmt records must be single-line");
+  const fields = new Map<string, string>();
+  let index = 0;
+  while (index < record.length) {
+    while (/\s/.test(record[index] ?? "")) index += 1;
+    if (index >= record.length) break;
+
+    const keyStart = index;
+    while (index < record.length && !/[\s=]/.test(record[index]!)) {
+      if (record[index] === '"') throw new Error(`quote in logfmt key at ${index}`);
+      index += 1;
+    }
+    if (index === keyStart) throw new Error(`invalid logfmt key at ${index}`);
+    const key = record.slice(keyStart, index);
+    let value = "";
+
+    if (record[index] === "=") {
+      index += 1;
+      if (record[index] === '"') {
+        const valueStart = index;
+        index += 1;
+        while (index < record.length && record[index] !== '"') {
+          if (record[index] === "\\") index += 1;
+          index += 1;
+        }
+        if (record[index] !== '"') throw new Error(`unterminated logfmt value for ${key}`);
+        index += 1;
+        const decoded = JSON.parse(record.slice(valueStart, index)) as unknown;
+        if (typeof decoded !== "string") throw new Error(`non-string logfmt value for ${key}`);
+        value = decoded;
+        if (index < record.length && !/\s/.test(record[index]!)) {
+          throw new Error(`invalid character after quoted logfmt value for ${key}`);
+        }
+      } else {
+        const valueStart = index;
+        while (index < record.length && !/\s/.test(record[index]!)) index += 1;
+        value = record.slice(valueStart, index);
+        if (/["=]/.test(value)) throw new Error(`invalid bare logfmt value for ${key}`);
+      }
+    }
+    fields.set(key, value);
+  }
+  return fields;
+}
+
 describe("cancelled inbound fallback tombstones", () => {
   it("does not register when only the ack fails, and warns once", async () => {
     const fallback = new CancelledInboundFallbackTombstones();
@@ -1562,11 +1609,7 @@ describe("ingress-dedupe log-record integrity (#123)", () => {
     expect(record).toContain("p1");
   });
 
-  it("escapes ack ids PER ELEMENT, so a comma in one id cannot forge a list boundary", async () => {
-    // The deciding case for escaping before the join rather than after it.
-    // Wrapping the joined string would render `ids="a,forged-b"` — one value a
-    // reader and a parser both split into two ids. Per-element quoting puts the
-    // separator commas outside the quotes and the injected comma inside.
+  it("encodes ack ids as JSON inside one strict logfmt value", async () => {
     const warn = vi.fn();
     const onFlush = createIngressOnFlush<Item>({
       accountId: "acct",
@@ -1584,13 +1627,11 @@ describe("ingress-dedupe log-record integrity (#123)", () => {
       .filter((text) => text.includes("ingress admission ack failed"));
     expect(acks).toHaveLength(1);
     const record = acks[0]!;
-    expect(record).toContain('ids=["real-1,forged-2","real-3"]');
-    // Two quoted ids, not three — the injected comma did not create an entry.
-    expect(record.match(/"real-[^"]*"/g)).toHaveLength(2);
-    // Bracketed so the list is one unambiguous logfmt value; a bare
-    // `ids="a","b"` parses as `ids=a` plus a stray key, losing every id but the
-    // first.
-    expect(JSON.parse(record.slice(record.indexOf("ids=") + 4))).toEqual([
+    // The representation this replaces starts bare and becomes invalid at its
+    // first quote; keep the decoder red-proofed against that exact regression.
+    expect(() => decodeStrictLogfmt('ids=["a","b"]')).toThrow(/invalid bare/);
+    const fields = decodeStrictLogfmt(record);
+    expect(JSON.parse(fields.get("ids")!)).toEqual([
       "real-1,forged-2",
       "real-3",
     ]);

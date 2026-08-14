@@ -8,6 +8,7 @@ import {
   findLogStatements,
   findUnsafeLogInterpolations,
   formatViolations,
+  rawInterpolationAllowanceKey,
   violationKey,
 } from "./test-fixtures/log-interpolation-audit.js";
 
@@ -46,9 +47,9 @@ import {
  *      ENFORCED without adding its prefix enforces nothing while looking like
  *      it does.
  *
- * Regex literals are also not tokenised, so an expression containing one may
- * mis-parse — but it fails LOUD (a spurious violation), and the exact coverage
- * floors below catch a silent drop.
+ * The TypeScript AST supplies exact outer call boundaries (including across
+ * regex literals); the inner value walk remains deliberately conservative and
+ * reports shapes it cannot read.
  */
 
 const read = (name: string) =>
@@ -70,6 +71,7 @@ const ENFORCED = [
   "ingress-dedupe.ts",
   "approvals.ts",
   "nats-account-runtime.ts",
+  "auth.ts",
 ] as const;
 
 /**
@@ -135,6 +137,7 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
     'formatAccountIdForLog(accountId)  @  "warn"event=webchannel.account_cleanup accountId= errors=',
     'formatAccountIdForLog(accountId)  @  "info"event=webchannel.account_startup accountId= state=stop',
   ],
+  "auth.ts": [],
 };
 
 /**
@@ -154,6 +157,7 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   "ingress-dedupe.ts": { statements: 13, interpolations: 7 },
   "approvals.ts": { statements: 9, interpolations: 24 },
   "nats-account-runtime.ts": { statements: 22, interpolations: 44 },
+  "auth.ts": { statements: 16, interpolations: 5 },
 };
 
 describe("log-record integrity — enforced files (#123)", () => {
@@ -192,19 +196,31 @@ describe("log-record integrity — enforced files (#123)", () => {
   });
 
   it("every allowlist entry is still LIVE in a scanned file", () => {
-    // Mirrors the KNOWN_RAW staleness test. Without it, blanket file-agnostic
-    // exemptions rot: five entries here were already dead, naming expressions
-    // in `nats-channel.ts` and `ingress-outcome.ts` — files no prefix reaches.
+    // Mirrors the KNOWN_RAW staleness test. Without it, exemptions rot: five
+    // entries here were already dead, naming expressions in `nats-channel.ts`
+    // and `ingress-outcome.ts` — files no prefix reaches.
     // If either is ever added to ENFORCED they would arrive PRE-EXEMPTED on
     // reasons nobody re-verified.
-    const live = new Set(
-      ENFORCED.flatMap((file) =>
-        findLogStatements(read(file), WEBCHANNEL_PREFIXES).flatMap((s) =>
-          s.interpolations.map((i) => i.expression),
-        ),
-      ),
-    );
-    const dead = [...ALLOWED_RAW_INTERPOLATIONS.keys()].filter((key) => !live.has(key));
+    const liveCounts = new Map<string, number>();
+    for (const file of ENFORCED) {
+      for (const statement of findLogStatements(read(file), WEBCHANNEL_PREFIXES)) {
+        for (const interpolation of statement.interpolations) {
+          const key = rawInterpolationAllowanceKey({
+            file,
+            site: statement.site,
+            expression: interpolation.expression,
+          });
+          liveCounts.set(key, (liveCounts.get(key) ?? 0) + 1);
+        }
+      }
+    }
+    const dead = ALLOWED_RAW_INTERPOLATIONS.filter((allowance) => {
+      const key = rawInterpolationAllowanceKey(allowance);
+      const remaining = liveCounts.get(key) ?? 0;
+      if (remaining === 0) return true;
+      liveCounts.set(key, remaining - 1);
+      return false;
+    });
     expect(dead).toEqual([]);
   });
 });
@@ -217,8 +233,14 @@ describe("log-record integrity — enforced files (#123)", () => {
  * is a shape that walked through the previous regex version green.
  */
 describe("the checker catches every known evasion (#123)", () => {
-  const check = (src: string) =>
-    formatViolations(findUnsafeLogInterpolations(src, { file: "probe.ts", prefixes: WEBCHANNEL_PREFIXES }));
+  const canonicalImport = 'import { logSafe } from "./log-safe.js";\n';
+  const check = (
+    src: string,
+    options: { readonly file?: string; readonly prependCanonicalImport?: boolean } = {},
+  ) => formatViolations(findUnsafeLogInterpolations(
+    `${options.prependCanonicalImport === false ? "" : canonicalImport}${src}`,
+    { file: options.file ?? "probe.ts", prefixes: WEBCHANNEL_PREFIXES },
+  ));
 
   it("EVASION 1: a raw value on a continuation fragment", () => {
     // The house style for long records — and the shape the regex version could
@@ -272,14 +294,30 @@ describe("the checker catches every known evasion (#123)", () => {
     ).toEqual([]);
   });
 
-  it("allows an explicitly allowlisted safe value, and nothing near it", () => {
-    expect(check("api.logger?.info?.(`webchannel: probe (${admission.reason})`);")).toEqual([]);
-    // A neighbouring raw value in the same statement is still caught.
-    const mixed = check(
-      "api.logger?.info?.(`webchannel: probe (${admission.reason}) peer=${wsKey}`);",
-    );
-    expect(mixed).toHaveLength(1);
-    expect(mixed[0]).toContain("${wsKey}");
+  it("scopes raw allowances by file and concrete statement, with one-use semantics", () => {
+    const allowedSite =
+      "api.logger?.warn?.(`webchannel: turn_settled was not delivered for " +
+      "peer=${logSafe(wsKey)} turn=${logSafe(settleId)} outcome=${turnOutcome}`);";
+
+    // The exact expression at an unrelated site cannot inherit the allowance.
+    expect(check("api.logger?.info?.(`webchannel: attacker=${turnOutcome}`);", {
+      file: "inbound.ts",
+    })).toHaveLength(1);
+    // Nor can the exact allowed statement in another file.
+    expect(check(allowedSite)).toHaveLength(1);
+    // One allowance cannot silently absorb a duplicated site in its own file.
+    expect(check(`${allowedSite}\n${allowedSite}`, { file: "inbound.ts" })).toHaveLength(1);
+  });
+
+  it("trusts only the unshadowed canonical logSafe named import", () => {
+    const call = "api.logger?.warn?.(`webchannel: peer=${logSafe(peerId)}`);";
+    expect(check(call)).toEqual([]);
+    expect(check(
+      `import { logSafe } from "./not-log-safe.js";\n${call}`,
+      { prependCanonicalImport: false },
+    )).toHaveLength(1);
+    expect(check(`function probe() { const logSafe = String; ${call} }`)).toHaveLength(1);
+    expect(check(`function probe(logSafe: (value: unknown) => string) { ${call} }`)).toHaveLength(1);
   });
 
   it("EVASION 6: `logSafe(x)` that is only the PREFIX of a bigger expression", () => {
@@ -360,6 +398,21 @@ describe("the checker catches every known evasion (#123)", () => {
     expect(violations).toHaveLength(2);
     expect(violations.join("\n")).toContain("${peerId}");
     expect(violations.join("\n")).toContain("${message.id}");
+  });
+
+  it.each([
+    ["closing parenthesis", "console.warn(/)/, `webchannel: peer=${peerId}`);"],
+    ["backtick", "console.warn(/`/, `webchannel: peer=${peerId}`);"],
+    ["quote", 'console.warn(/"/, `webchannel: peer=${peerId}`);'],
+  ])("EVASION 12: regex content (%s) cannot hide a later raw value", (_name, source) => {
+    expect(findLogStatements(source, WEBCHANNEL_PREFIXES)).toHaveLength(1);
+    const violations = check(source);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("${peerId}");
+  });
+
+  it("accepts canonical logSafe whose argument contains a regex delimiter trap", () => {
+    expect(check("console.warn(`webchannel: pattern=${logSafe(/`/)}`);")).toEqual([]);
   });
 
   it("EVASION 8: `debugLog`, the callee spelling that fails both name rules", () => {

@@ -570,20 +570,14 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         ),
       ];
       if (ackIds.length > 0 && !sendAck(anchor.peerId, ackIds)) {
-        // #123: escape each id BEFORE joining, not the joined string. These ids
-        // are peer-supplied, so an id containing a comma would forge a list
-        // boundary — wrapping the join as one value (`ids="a,b"`) still lets a
-        // single id read as two. Per-element quoting keeps every comma that
-        // separates entries outside the quotes and every comma inside an id
-        // inside them.
-        //
-        // Bracketed because a bare `ids="a","b"` is not valid logfmt: a spec
-        // parser reads the value as `a` and then treats `,"b"` as a stray bare
-        // key, silently losing every id after the first. `["a","b"]` is one
-        // unambiguous value to a human and parseable as JSON by a machine.
+        // #123: serialize the whole array as JSON, then pass that JSON text to
+        // logSafe so logfmt sees one outer quoted value. A bare `["a","b"]`
+        // starts as an unquoted logfmt value and the first `"` makes the record
+        // invalid; `logSafe` preserves the JSON boundaries behind that outer
+        // logfmt delimiter.
         logWarn?.(
           `webchannel: ingress admission ack failed for peer=${logSafe(anchor.peerId)} ` +
-            `ids=[${ackIds.map((id) => logSafe(id)).join(",")}]`,
+            `ids=${logSafe(JSON.stringify(ackIds))}`,
         );
       }
     }

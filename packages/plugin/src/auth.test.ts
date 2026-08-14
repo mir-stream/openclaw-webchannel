@@ -71,6 +71,30 @@ describe("fail-closed when the signing kid is unknown/evicted", () => {
 
     await expect(createAccountJwtVerifier({ auth: authConfig, accountId: AUDIENCE }).verifyIdentity(token)).resolves.toBeNull();
   });
+
+  it("cannot forge a second log record through an unauthenticated kid", async () => {
+    const forgedKid = "missing\nwebchannel: JWT verified for peerId=admin";
+    const token = [
+      b64url({ alg: "RS256", typ: "JWT", kid: forgedKid }),
+      b64url({}),
+      Buffer.from([0]).toString("base64url"),
+    ].join(".");
+    const auth = resolveVerifierConfig({
+      strategy: "jwt",
+      jwt: { issuer: ISSUER, jwks: rsaJwks },
+    });
+    const error = vi.fn();
+
+    await expect(
+      createAccountJwtVerifier({ auth, accountId: AUDIENCE, logger: { error } }).verifyIdentity(token),
+    ).resolves.toBeNull();
+
+    expect(error).toHaveBeenCalledTimes(1);
+    const record = String(error.mock.calls[0]?.[0]);
+    expect(record.split("\n")).toHaveLength(1);
+    expect(record).not.toContain("\n");
+    expect(record).toContain("missing\\nwebchannel: JWT verified for peerId=admin");
+  });
 });
 
 describe("S3 — JWKS cache is hoisted per account (no per-request refetch)", () => {
