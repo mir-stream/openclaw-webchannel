@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 /**
@@ -10,10 +8,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
  */
 const FIXTURE_TENANT = "fixture-tenant";
 /** The `:tenant:` token #112 appends for `FIXTURE_TENANT`. */
-const FIXTURE_TENANT_TOKEN = `${FIXTURE_TENANT}-${createHash("sha256")
-  .update(FIXTURE_TENANT, "utf8")
-  .digest("hex")
-  .slice(0, 16)}`;
+const FIXTURE_TENANT_TOKEN =
+  "d8db6d6c78c77dfb1e522cfefe25df4fdbbccdc19955306c41633804e12d135d";
 
 import { NullPeerChannel } from "./channel-contract.js";
 class FakePeerChannel extends NullPeerChannel {
@@ -28,11 +24,36 @@ class FakePeerChannel extends NullPeerChannel {
 }
 import { composeAccountLifecycles, createWebChannelPlugin } from "./channel.js";
 import {
-  handleInboundMessage,
+  handleInboundMessage as handleInboundMessageForServingTenant,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
 } from "./inbound.js";
 import type { ReasoningOptOutStoreAccess } from "./reasoning-opt-out.js";
+
+/**
+ * Unit-level adapter: production callers must supply the immutable tenant from
+ * the startup serving plan. Every fake runtime in this file is bound to the
+ * same explicit fixture tenant, so keep the individual call sites focused on
+ * the behavior under test while exercising the required production signature.
+ */
+function handleInboundMessage(
+  api: Parameters<typeof handleInboundMessageForServingTenant>[0],
+  transport: Parameters<typeof handleInboundMessageForServingTenant>[1],
+  peerId: string,
+  message: Parameters<typeof handleInboundMessageForServingTenant>[3],
+  accountId = "default",
+  options?: Parameters<typeof handleInboundMessageForServingTenant>[6],
+) {
+  return handleInboundMessageForServingTenant(
+    api,
+    transport,
+    peerId,
+    message,
+    accountId,
+    FIXTURE_TENANT,
+    options,
+  );
+}
 // Reasoning display policy is CHANNEL-PRIVATE config (#113): the lane opens
 // unless `channels.webchannel.capabilities.reasoning` is PRESENT and not boolean
 // `true` (account-config.ts). These channel tests exercise the callback WIRING
@@ -697,12 +718,10 @@ describe("webchannel inbound round-trip", () => {
     );
     // An originating session/route was recorded carrying the FORCED
     // per-account-channel-peer key (webchannel self-isolates regardless of the
-    // global session.dmScope). `handleInboundMessage` is called without an
-    // accountId here, so the account component is the parameter default,
-    // DEFAULT_WEBCHANNEL_ACCOUNT_ID ("default").
+    // global session.dmScope). The local unit adapter supplies the default
+    // account id and the startup-frozen fixture tenant.
     // The `:tenant:` suffix is #112: the key is also scoped to the account's
-    // authorization namespace, which for a config with no webchannel section
-    // falls back to `DEFAULT_WEBCHANNEL_TENANT`.
+    // authorization namespace.
     expect(recordInboundSession).toHaveBeenCalledTimes(1);
     expect(captured.recordedSessionKey).toBe(
       `agent:main:webchannel:default:direct:web-anon:tenant:${FIXTURE_TENANT_TOKEN}`,

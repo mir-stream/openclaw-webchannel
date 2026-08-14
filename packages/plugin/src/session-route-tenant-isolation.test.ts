@@ -47,7 +47,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
 
@@ -64,6 +64,7 @@ import {
 import { PopChallengeStore } from "./pop-challenge.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import { resolveWebchannelSessionRoute } from "./session-route.js";
+import { planWebchannelAccount } from "./multiplex.js";
 import type { JwtIdentity } from "./jwt.js";
 import type { WrappedConversationKey } from "./late-join-decryptor.js";
 
@@ -102,8 +103,7 @@ type SessionStore = Map<string, unknown[]>;
  * a change to the format and stop asserting anything.
  */
 function scopeToken(tenant: string): string {
-  const digest = createHash("sha256").update(tenant, "utf8").digest("hex").slice(0, 16);
-  return `${tenant.toLowerCase()}-${digest}`;
+  return createHash("sha256").update(tenant, "utf8").digest("hex");
 }
 
 function storeKey(sessionKey: string): string {
@@ -120,8 +120,9 @@ function rawMessage(id: string, role: "user" | "assistant", text: string, ts: nu
 /**
  * A plugin api serving `accountId` under `tenant`. `resolveAgentRoute` is a
  * stub (the helper discards its session key and rebuilds one with the REAL
- * `buildAgentSessionKey`), but the tenant is read from the config exactly as
- * production reads it, so flipping `tenant` here IS the hot-reload.
+ * `buildAgentSessionKey`). The tenant is also present in config so the fixtures
+ * model a real account, but session routing receives the immutable serving-plan
+ * tenant explicitly, exactly as production does.
  */
 function makeApi(tenant: string, store: SessionStore) {
   return {
@@ -162,19 +163,27 @@ function makeApi(tenant: string, store: SessionStore) {
 }
 
 /** Transcribed from `nats-account-runtime.ts` `sendHistorySnapshot`. */
-async function readSnapshot(api: any, peerId: string, limit = 50): Promise<HistoryMessage[]> {
-  const route = resolveWebchannelSessionRoute(api, ACCOUNT, peerId);
+async function readSnapshot(
+  api: any,
+  servingTenant: string,
+  peerId: string,
+  limit = 50,
+  accountId = ACCOUNT,
+): Promise<HistoryMessage[]> {
+  const route = resolveWebchannelSessionRoute(api, accountId, peerId, servingTenant);
   return await historyRecent(api, route.sessionKey, limit, api.logger);
 }
 
 /** Transcribed from `nats-account-runtime.ts` `setLoadHistoryHandler`. */
 async function readLoadHistory(
   api: any,
+  servingTenant: string,
   peerId: string,
   request: { before?: string; limit?: number },
   pageSize = 50,
+  accountId = ACCOUNT,
 ): Promise<HistoryMessage[]> {
-  const route = resolveWebchannelSessionRoute(api, ACCOUNT, peerId);
+  const route = resolveWebchannelSessionRoute(api, accountId, peerId, servingTenant);
   const plan = planHistoryFetch(request, pageSize);
   return plan.kind === "page"
     ? await historyPageBefore(api, route.sessionKey, plan.beforeId, plan.limit, api.logger)
@@ -195,7 +204,7 @@ function seedThenReload(
   const store: SessionStore = new Map();
   const apiServed = makeApi(served, store);
   const storedKey = storeKey(
-    resolveWebchannelSessionRoute(apiServed, ACCOUNT, PEER).sessionKey,
+    resolveWebchannelSessionRoute(apiServed, ACCOUNT, PEER, served).sessionKey,
   );
   store.set(storedKey, [
     rawMessage("m1", "user", T1_TRANSCRIPT[0]!, 1_000),
@@ -258,7 +267,7 @@ async function registerAndSnapshot(api: any, tenant: string): Promise<{
       snapshotPeers.push(pid);
       // The production dep resolves the route and reads; do the same, so the
       // snapshot this test inspects came through the real admission path.
-      void readSnapshot(api, pid).then((m) => {
+      void readSnapshot(api, tenant, pid).then((m) => {
         snapshot = m;
       });
     },
@@ -275,8 +284,8 @@ async function registerAndSnapshot(api: any, tenant: string): Promise<{
 describe("#112 — tenant scoping of the webchannel session key", () => {
   it("gives DIFFERENT STORED keys to the same (account, peer) in two tenants", () => {
     const store: SessionStore = new Map();
-    const t1 = resolveWebchannelSessionRoute(makeApi(T1, store), ACCOUNT, PEER).sessionKey;
-    const t2 = resolveWebchannelSessionRoute(makeApi(T2, store), ACCOUNT, PEER).sessionKey;
+    const t1 = resolveWebchannelSessionRoute(makeApi(T1, store), ACCOUNT, PEER, T1).sessionKey;
+    const t2 = resolveWebchannelSessionRoute(makeApi(T2, store), ACCOUNT, PEER, T2).sessionKey;
 
     // Asserted after core's canonicalization, not on the derived string: two
     // derived strings differing only in case are ONE stored key.
@@ -289,11 +298,83 @@ describe("#112 — tenant scoping of the webchannel session key", () => {
     );
   });
 
+  it("keeps config-less inbound and history routing on the startup-planned tenant when env mutates", async () => {
+    vi.stubEnv("WEBCHANNEL_TENANT", "startup-tenant");
+    try {
+      const store: SessionStore = new Map();
+      const api = makeApi("unused-config-tenant", store);
+      api.config = { channels: {}, session: {} };
+
+      // This is the one startup read made by `buildNatsAccount`. The resulting
+      // tenant is also captured by its NATS channel and admission verifier.
+      const plan = planWebchannelAccount(api.config, "default");
+      expect(plan?.tenant).toBe("startup-tenant");
+      const servingTenant = plan!.tenant;
+
+      const inboundRoute = resolveWebchannelSessionRoute(
+        api,
+        "default",
+        PEER,
+        servingTenant,
+      );
+      store.set(storeKey(inboundRoute.sessionKey), [
+        rawMessage("m1", "user", "startup-bound one", 1_000),
+        rawMessage("m2", "assistant", "startup-bound two", 2_000),
+        rawMessage("m3", "user", "startup-bound three", 3_000),
+      ]);
+
+      // Model OpenClaw's temporary per-skill environment override after this
+      // account has started. The live runtime must remain wholly startup-bound.
+      vi.stubEnv("WEBCHANNEL_TENANT", "skill-override-tenant");
+      expect(
+        resolveWebchannelSessionRoute(
+          api,
+          "default",
+          PEER,
+          process.env.WEBCHANNEL_TENANT!,
+        ).sessionKey,
+      ).not.toBe(inboundRoute.sessionKey);
+
+      const expected = ["startup-bound one", "startup-bound two", "startup-bound three"];
+      expect(
+        (await readSnapshot(api, servingTenant, PEER, 50, "default")).map((m) => m.text),
+      ).toEqual(expected);
+      expect(
+        (await readLoadHistory(api, servingTenant, PEER, {}, 50, "default")).map(
+          (m) => m.text,
+        ),
+      ).toEqual(expected);
+      expect(
+        (
+          await readLoadHistory(
+            api,
+            servingTenant,
+            PEER,
+            { before: "m3" },
+            50,
+            "default",
+          )
+        ).map((m) => m.text),
+      ).toEqual(expected.slice(0, 2));
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("survives core's lowercase fold: the tenant component is already canonical", () => {
     // If the component were verbatim, this is the assertion that would fail —
     // the derived string would still carry `Acme` while the stored key did not.
     const store: SessionStore = new Map();
-    const derived = resolveWebchannelSessionRoute(makeApi("Acme", store), ACCOUNT, PEER).sessionKey;
+    const derived = resolveWebchannelSessionRoute(
+      makeApi("Acme", store),
+      ACCOUNT,
+      PEER,
+      "Acme",
+    ).sessionKey;
+    expect(derived).toBe(
+      `agent:main:webchannel:${ACCOUNT}:direct:${PEER}:tenant:` +
+        "37036cd8f9746d335038eca92f8a73ae5f1bca4779a1e55e5812e37743b2f5bf",
+    );
     expect(storeKey(derived)).toBe(derived);
   });
 
@@ -303,8 +384,10 @@ describe("#112 — tenant scoping of the webchannel session key", () => {
     // lowercase on the way into the store, so a verbatim tenant component would
     // merge these two authorization scopes onto one stored key — #112 again.
     const store: SessionStore = new Map();
-    const lower = resolveWebchannelSessionRoute(makeApi("acme", store), ACCOUNT, PEER).sessionKey;
-    const upper = resolveWebchannelSessionRoute(makeApi("Acme", store), ACCOUNT, PEER).sessionKey;
+    const lower = resolveWebchannelSessionRoute(makeApi("acme", store), ACCOUNT, PEER, "acme")
+      .sessionKey;
+    const upper = resolveWebchannelSessionRoute(makeApi("Acme", store), ACCOUNT, PEER, "Acme")
+      .sessionKey;
     expect(storeKey(lower)).not.toBe(storeKey(upper));
   });
 
@@ -317,8 +400,8 @@ describe("#112 — tenant scoping of the webchannel session key", () => {
     const { snapshotPeers, snapshot } = await registerAndSnapshot(api, "acme");
     expect(snapshotPeers).toEqual([PEER]);
     expect(snapshot).toEqual([]);
-    expect(await readLoadHistory(api, PEER, {})).toEqual([]);
-    expect(await readLoadHistory(api, PEER, { before: "m3" })).toEqual([]);
+    expect(await readLoadHistory(api, "acme", PEER, {})).toEqual([]);
+    expect(await readLoadHistory(api, "acme", PEER, { before: "m3" })).toEqual([]);
   });
 
   it("CONTROL: reloading onto the SAME case does return the transcript", async () => {
@@ -335,7 +418,12 @@ describe("#112 — tenant scoping of the webchannel session key", () => {
     // splice asserts rather than trusting upstream validation alone.
     const store: SessionStore = new Map();
     expect(() =>
-      resolveWebchannelSessionRoute(makeApi(`${T2}:direct:${PEER}`, store), ACCOUNT, PEER),
+      resolveWebchannelSessionRoute(
+        makeApi(`${T2}:direct:${PEER}`, store),
+        ACCOUNT,
+        PEER,
+        `${T2}:direct:${PEER}`,
+      ),
     ).toThrow(/tenant/);
   });
 
@@ -365,19 +453,19 @@ describe("#112 — tenant scoping of the webchannel session key", () => {
 
   it("denies a T2 peer T1's load_history tail fetch", async () => {
     const { api } = seedT1Then(T2);
-    expect(await readLoadHistory(api, PEER, {})).toEqual([]);
+    expect(await readLoadHistory(api, T2, PEER, {})).toEqual([]);
   });
 
   it("denies a T2 peer T1's load_history page fetch", async () => {
     // Even holding a real cursor id out of T1's transcript.
     const { api } = seedT1Then(T2);
-    expect(await readLoadHistory(api, PEER, { before: "m3" })).toEqual([]);
+    expect(await readLoadHistory(api, T2, PEER, { before: "m3" })).toEqual([]);
   });
 
   it("CONTROL: the same load_history reads under T1 do return T1's messages", async () => {
     const { api } = seedT1Then(T1);
-    expect((await readLoadHistory(api, PEER, {})).map((m) => m.text)).toEqual(T1_TRANSCRIPT);
-    expect((await readLoadHistory(api, PEER, { before: "m3" })).map((m) => m.text)).toEqual(
+    expect((await readLoadHistory(api, T1, PEER, {})).map((m) => m.text)).toEqual(T1_TRANSCRIPT);
+    expect((await readLoadHistory(api, T1, PEER, { before: "m3" })).map((m) => m.text)).toEqual(
       T1_TRANSCRIPT.slice(0, 2),
     );
   });
@@ -387,6 +475,8 @@ describe("#112 — tenant scoping of the webchannel session key", () => {
     // the SAME (tenant, account, peer) must still resolve the SAME key across
     // two independently constructed apis, or every reload would orphan history.
     const { api, storedKey } = seedT1Then(T1);
-    expect(storeKey(resolveWebchannelSessionRoute(api, ACCOUNT, PEER).sessionKey)).toBe(storedKey);
+    expect(storeKey(resolveWebchannelSessionRoute(api, ACCOUNT, PEER, T1).sessionKey)).toBe(
+      storedKey,
+    );
   });
 });

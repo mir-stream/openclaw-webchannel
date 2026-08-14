@@ -61,7 +61,7 @@
  * CONFIGURED tenant, which after the reload is legitimately T2.
  *
  * So the tenant is appended as its own `:tenant:<token>` component, where the
- * token is `<lowercased tenant>-<16 hex chars of sha256(verbatim tenant)>`.
+ * token is the full lowercase SHA-256 digest of the verbatim tenant.
  * Three properties that shape buys, each of which a rejected alternative loses:
  *
  *   1. CASE STABILITY — the reason for the digest, and NOT optional. Core
@@ -73,25 +73,25 @@
  *      therefore be STORED as `:tenant:acme`. NATS subjects are case-sensitive,
  *      so `Acme` and `acme` are different tenants holding different credentials;
  *      folding them would merge two authorization scopes onto one stored key —
- *      #112 again, with a smaller blast radius. The digest is computed over the
- *      VERBATIM tenant and is already lowercase hex, so it survives the fold and
- *      keeps the component injective. The lowercased name is carried alongside
- *      purely so an operator reading `sessions.json` can tell whose key it is.
- *      Because the digest is FIXED length, `<name>-<digest>` decomposes
- *      unambiguously even when the tenant itself contains `-`.
- *   2. INJECTIVITY against the neighbouring components. Folding the tenant into
+ *      #112 again, with a smaller blast radius. The digest covers the VERBATIM
+ *      tenant and is already lowercase hex, so it survives the fold and keeps
+ *      case-distinct tenants apart under SHA-256's collision resistance. It is
+ *      deliberately NOT truncated: a 64-bit public digest admits chosen
+ *      collisions in roughly 2^32 work.
+ *   2. UNAMBIGUOUS COMPONENT BOUNDARY. Folding the tenant into
  *      the `accountId` argument (`"<tenant>-<account>"`) is unsafe: core's
  *      `normalizeAccountId` lowercases, collapses runs of non-`[a-z0-9_-]` into
  *      `-`, and TRUNCATES to 64 chars — so `(t="a", acct="b-c")` and
  *      `(t="a-b", acct="c")` would collide, as would any sufficiently long pair.
  *      A separate component, separated by a `:` that `assertValidSubjectToken`
  *      forbids inside a tenant, cannot be confused with its neighbours.
- *      NOTE, precisely because the point above is easy to over-read: this makes
- *      the TENANT COMPONENT collision-free, not the whole key. `normalizeAccountId`
- *      still folds accounts `Acme` and `acme` onto one account component, and
- *      nothing guards against two config keys with the same canonical form. That
- *      is the same defect one axis over, it is NOT fixed here, and it is tracked
- *      separately — do not read this docstring as a claim that it is handled.
+ *      NOTE, precisely because the point above is easy to over-read: this avoids
+ *      structural tuple ambiguity; it does not make the whole key collision-free.
+ *      `normalizeAccountId` still folds accounts `Acme` and `acme` onto one
+ *      account component, and nothing guards against two config keys with the
+ *      same canonical form. That is the same defect one axis over, it is NOT
+ *      fixed here, and it is tracked separately — do not read this docstring as
+ *      a claim that it is handled.
  *   3. The peer component keeps its meaning, so `session.identityLinks`
  *      resolution (which matches on the peer id) is unaffected.
  *
@@ -106,13 +106,14 @@
  * to be the same mechanism as core's `:thread:<id>` suffix: core really does
  * parse that one (`parseThreadSessionSuffix`), and ours only resembles it.
  *
- * The tenant is RESOLVED HERE from `api.config` rather than threaded in as a
- * parameter. That is deliberate: the module's whole premise is that every site
- * derives a byte-identical key, and a parameter is a place for one call site to
- * pass something different. `resolveAccountTenant` is the same resolver the
- * serving plan uses (`planWebchannelAccount` → `resolveAcquisitionEnvPrecedence`),
- * so the key's tenant and the tenant the account is actually served under are
- * the same value, read from the same config.
+ * The tenant is REQUIRED from the startup serving plan. This is deliberate:
+ * the NATS subject namespace and register-admission verifier already capture
+ * that planned tenant, while OpenClaw may temporarily mutate `process.env` for
+ * skill overrides and config objects may be replaced on reload. Re-resolving on
+ * each turn/history read could therefore produce a key in a different tenant
+ * while the runtime still authenticates under the original one. The per-account
+ * runtime closes over `plan.tenant` and supplies that same immutable value at
+ * the inbound WRITE, register-snapshot READ, and `load_history` READ sites.
  *
  * CONTINUITY (breaking, decided — do not "restore" this): the component is
  * appended UNCONDITIONALLY, so every pre-existing session key changes, including
@@ -139,7 +140,6 @@ import {
   type ResolvedAgentRoute,
 } from "openclaw/plugin-sdk/routing";
 
-import { resolveAccountTenant } from "./acquisition-env.js";
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import { assertValidSubjectToken } from "./subject-token.js";
 
@@ -157,46 +157,18 @@ export const WEBCHANNEL_ENFORCED_DM_SCOPE = "per-account-channel-peer" as const;
 const TENANT_KEY_SEGMENT = "tenant";
 
 /**
- * Hex length of the verbatim-tenant digest. 16 hex chars = 64 bits, which is
- * far more than enough to separate the handful of tenants one deployment
- * configures, and keeps the key readable.
- */
-const TENANT_DIGEST_HEX_LENGTH = 16;
-
-/**
- * Bounded memo: this runs on the per-turn dispatch and every history read.
- *
- * The cap is unreachable by construction and is not a defence against
- * attacker-controlled input — the key space is the set of tenants an operator
- * configures, so it cannot approach 256. It is a bound on a module-global map,
- * nothing more. Past the cap the function still returns the correct token; it
- * simply stops memoizing. Do not read the cap as evidence that this input is
- * untrusted.
- */
-const tenantScopeTokenCache = new Map<string, string>();
-const TENANT_SCOPE_TOKEN_CACHE_MAX = 256;
-
-/**
  * The case-STABLE token that represents `tenant` inside a session key.
  *
  * Core lowercases the whole key at the store boundary, so the token must already
  * be equal to its own lowercase form or two case-distinct tenants would land on
  * one stored key (see the module docstring, point 1 — this is the crux of the
- * fix, not a detail). `<lowercased name>-<digest of the VERBATIM name>` is
- * lowercase by construction and still distinguishes `Acme` from `acme`.
+ * fix, not a detail). The full SHA-256 digest of the verbatim tenant is lowercase
+ * hex, so it distinguishes `Acme` from `acme` under standard collision-resistance
+ * assumptions while leaving ample room under core's 512-character session-key
+ * boundary even when every validated component is at its maximum length.
  */
 function tenantScopeToken(tenant: string): string {
-  const cached = tenantScopeTokenCache.get(tenant);
-  if (cached !== undefined) return cached;
-  const digest = createHash("sha256")
-    .update(tenant, "utf8")
-    .digest("hex")
-    .slice(0, TENANT_DIGEST_HEX_LENGTH);
-  const token = `${tenant.toLowerCase()}-${digest}`;
-  if (tenantScopeTokenCache.size < TENANT_SCOPE_TOKEN_CACHE_MAX) {
-    tenantScopeTokenCache.set(tenant, token);
-  }
-  return token;
+  return createHash("sha256").update(tenant, "utf8").digest("hex");
 }
 
 /**
@@ -231,6 +203,7 @@ export function resolveWebchannelSessionRoute(
   api: OpenClawPluginApi,
   accountId: string,
   peerId: string,
+  servingTenant: string,
 ): ResolvedAgentRoute {
   const route = api.runtime.channel.routing.resolveAgentRoute({
     cfg: api.config,
@@ -252,14 +225,11 @@ export function resolveWebchannelSessionRoute(
     identityLinks: api.config.session?.identityLinks,
   });
 
-  // #112: bind the key to the account's authorization namespace. Read from the
-  // SAME config the serving plan reads, so the key's tenant is the tenant the
-  // account is served (and admitted) under — never a separately-threaded value
-  // that one call site could get wrong.
-  const sessionKey = withTenantScope(
-    baseSessionKey,
-    resolveAccountTenant(api.config, accountId),
-  );
+  // #112: bind the key to the immutable authorization namespace captured by the
+  // account serving plan. Never re-read config or process.env here: OpenClaw can
+  // temporarily mutate ambient env while a skill runs, but the live NATS channel
+  // and register admission remain bound to this startup-planned tenant.
+  const sessionKey = withTenantScope(baseSessionKey, servingTenant);
 
   return {
     ...route,

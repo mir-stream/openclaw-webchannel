@@ -79,13 +79,19 @@
   snapshot and `load_history`. Admission could not catch it: it checks the
   signed tenant claim against the *configured* tenant, and after the change T2
   is legitimately that tenant. Keys are now
-  `agent:<agent>:webchannel:<account>:direct:<peer>:tenant:<tenant>-<digest>`,
-  where `<tenant>` is **lowercased** — grepping `sessions.json` for a tenant
-  configured as `Acme` finds nothing; search for `acme` — and `<digest>` is a
-  short hash of the tenant exactly as configured. The digest is
-  there because openclaw lowercases the whole session key when it stores it, and
-  NATS treats `Acme` and `acme` as two tenants with different credentials — the
-  digest is what keeps those two from sharing one stored key.
+  `agent:<agent>:webchannel:<account>:direct:<peer>:tenant:<sha256>`, where
+  `<sha256>` is the full 64-character lowercase SHA-256 digest of the tenant
+  exactly as configured. OpenClaw lowercases the whole session key when it
+  stores it, while NATS treats `Acme` and `acme` as different tenants with
+  different credentials. Hashing the verbatim tenant before the store fold
+  keeps those authorization namespaces separate; the digest is not truncated.
+  A lossless UTF-8 hex encoding was rejected because maximum-size valid
+  agent/account/peer/tenant components could push the resulting key past
+  OpenClaw's 512-character chat-send session-key boundary.
+  - The serving runtime freezes the tenant selected by its startup account plan
+    and uses that same value for inbound writes, register-time snapshots, and
+    `load_history`. Temporary process-environment overrides during a skill run
+    cannot move one of those routes away from the NATS/admission tenant.
   - **What an operator sees after upgrading:** existing conversations appear
     empty. The history snapshot a widget receives at register time, and every
     `load_history` page, read the new key and find nothing under it. Per-session

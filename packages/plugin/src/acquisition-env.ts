@@ -49,33 +49,24 @@ export function _resetAcquisitionEnvWarning(): void {
 }
 
 /**
- * The tenant an account is SERVED under — the pure identity half of
- * `resolveAcquisitionEnvPrecedence`, with none of its one-time-warning
- * machinery.
+ * Resolve the tenant while building the immutable account serving plan.
  *
- * #112 promoted the tenant to a component of the webchannel session key, so it
- * is now read on the per-turn dispatch and per-read history paths, not just at
- * startup planning. Those paths must not emit operator warnings and must not
- * trip the once-per-process deprecation guard (doing so would SUPPRESS the real
- * startup warning). They call this; `resolveAcquisitionEnvPrecedence` calls it
- * too, so the serving tenant and the session-key tenant are the same value by
- * construction rather than by two implementations agreeing.
+ * In the config-less compatibility path this samples `WEBCHANNEL_TENANT` once.
+ * The resulting `identity.tenant` is then carried by the serving runtime; turn
+ * dispatch and history reads must never consult the ambient environment again.
+ * OpenClaw can temporarily override process env while running a skill, so a
+ * later read could otherwise route a session under a tenant different from the
+ * NATS channel and register-admission tenant captured at startup.
  */
-export function resolveAccountTenant(
+function resolveAccountTenant(
   cfg: unknown,
   accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   env: Record<string, string | undefined> = process.env,
 ): string {
   if (hasWebchannelConfig(cfg)) return resolveAcquisitionIdentity(cfg, accountId).tenant;
   // No webchannel config at all: the legacy synthesized-default account, whose
-  // tenant comes from env (see the module docstring's precedence rule).
-  //
-  // NOTE the asymmetry this branch carries: the serving plan reads env ONCE at
-  // startup, while the session-key caller reads it per turn and per history
-  // read. They agree only while `process.env` is stable within a process, which
-  // it is today. If that ever stops holding, snapshot the value at plan time and
-  // thread it, rather than letting the two readers drift — a tenant that differs
-  // between the write and the read is a silently split transcript.
+  // tenant comes from the environment snapshot supplied to startup planning
+  // (see the module docstring's precedence rule).
   return env["WEBCHANNEL_TENANT"] ?? DEFAULT_WEBCHANNEL_TENANT;
 }
 
