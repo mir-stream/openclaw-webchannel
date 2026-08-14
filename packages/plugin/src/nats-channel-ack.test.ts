@@ -21,6 +21,7 @@ class RecordingTransport extends EventEmitter {
   effectiveOutboundLimit = 8 * 1024 * 1024;
   readonly published: Array<{ subject: string; payload: string }> = [];
   failPublishCalls = new Set<number>();
+  publishFailure: unknown = new Error("publish failed");
   publishCalls = 0;
   private sid = 0;
   subscribe(): number {
@@ -31,7 +32,7 @@ class RecordingTransport extends EventEmitter {
   }
   publish(subject: string, payload: string): void {
     this.publishCalls++;
-    if (this.failPublishCalls.has(this.publishCalls)) throw new Error("publish failed");
+    if (this.failPublishCalls.has(this.publishCalls)) throw this.publishFailure;
     this.published.push({ subject, payload });
   }
 }
@@ -86,12 +87,39 @@ describe("P0-7b — NatsChannel.sendAck", () => {
   it("splits at 64 ids and still attempts a later chunk after the first publish fails", () => {
     const transport = new RecordingTransport();
     transport.failPublishCalls.add(1);
+    let getterCalls = 0;
+    let customInspectCalls = 0;
+    const diagnostic = {
+      visible: "publish-custom-sentinel",
+      get hidden(): string {
+        getterCalls++;
+        return "getter-must-not-run";
+      },
+      [Symbol.for("nodejs.util.inspect.custom")](): string {
+        customInspectCalls++;
+        return "custom-inspect-must-not-run";
+      },
+    };
+    const publishFailure = new Error("publish failed", { cause: "publish-cause-sentinel" });
+    publishFailure.stack = "Error: publish failed\n    at publish-stack-sentinel";
+    Object.assign(publishFailure, { diagnostic });
+    transport.publishFailure = publishFailure;
     const channel = new NatsChannel(transport as unknown as NatsTransport, "acct", "tenant");
     const ids = Array.from({ length: 65 }, (_, index) => `id-${index}`);
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
 
     expect(channel.sendAck("peer-0", ids)).toBe(false);
     expect(error).toHaveBeenCalledTimes(1);
+    expect(error.mock.calls[0]).toHaveLength(1);
+    const record = String(error.mock.calls[0]?.[0]);
+    expect(record.split("\n")).toHaveLength(1);
+    expect(record).toContain("publish-stack-sentinel");
+    expect(record).toContain("publish-cause-sentinel");
+    expect(record).toContain("publish-custom-sentinel");
+    expect(record).not.toContain("getter-must-not-run");
+    expect(record).not.toContain("custom-inspect-must-not-run");
+    expect(getterCalls).toBe(0);
+    expect(customInspectCalls).toBe(0);
     expect(transport.publishCalls).toBe(2);
     expect(ackFrames(transport)).toEqual([{
       subject: "webchannel.tenant.acct.peer-0.out",

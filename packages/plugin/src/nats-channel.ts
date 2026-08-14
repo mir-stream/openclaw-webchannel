@@ -16,6 +16,7 @@
  * - Approval deduplication: approvalId-based first-write-wins exactly-once
  */
 
+import { inspect } from "node:util";
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
 import type { ApprovalDecision, ApprovalRequestPayload, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import type { KeyPair } from "./e2e-crypto.js";
@@ -28,6 +29,27 @@ import type { CommandCatalogEntry } from "./commands-catalog.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
 import type { IngressResultFrame } from "./ingress-result-chunks.js";
 import { logSafe } from "./log-safe.js";
+
+/** Preserve caught-error detail without changing primitive thrown-value rendering. */
+function formatCaughtDiagnostic(value: unknown): unknown {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+    return value;
+  }
+  try {
+    return inspect(value, {
+      breakLength: Number.POSITIVE_INFINITY,
+      colors: false,
+      compact: true,
+      customInspect: false,
+      depth: 5,
+      getters: false,
+      maxArrayLength: 50,
+      maxStringLength: 8_192,
+    });
+  } catch {
+    return "<uninspectable>";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -720,7 +742,9 @@ export class NatsChannel implements WebChannelPeerChannel {
       this.transport.publish(subject, JSON.stringify(payload));
       return true;
     } catch (err) {
-      console.error(`[nats-channel] Failed to send to peer ${logSafe(peerId)}: ${logSafe(err)}`);
+      console.error(
+        `[nats-channel] Failed to send to peer ${logSafe(peerId)}: ${logSafe(formatCaughtDiagnostic(err))}`,
+      );
       return false;
     }
   }
@@ -755,7 +779,7 @@ export class NatsChannel implements WebChannelPeerChannel {
       return writer.finish();
     } catch (err) {
       console.error(
-        `[nats-channel] Failed to prepare bounded ingress result frame: ${logSafe(err)}`,
+        `[nats-channel] Failed to prepare bounded ingress result frame: ${logSafe(formatCaughtDiagnostic(err))}`,
       );
       return false;
     }
@@ -807,7 +831,7 @@ export class NatsChannel implements WebChannelPeerChannel {
       this.dispatchInbound(peerId, message);
     } catch (err) {
       console.error(
-        `[nats-channel] Failed to parse message from ${logSafe(peerId)}: ${logSafe(err)}`,
+        `[nats-channel] Failed to parse message from ${logSafe(peerId)}: ${logSafe(formatCaughtDiagnostic(err))}`,
       );
     }
   }
