@@ -150,6 +150,52 @@ const CORE_FUNCTION_CALLS_SAWTOOTH = [
   ...cumulativeExtensions("Hello ", " there"),
 ];
 
+function coreJsonTagSawtooth(tag: string): string[] {
+  return [
+    ...cumulativePrefixes(`Hello <${tag}>`),
+    "Hello ",
+    ...cumulativeExtensions("Hello ", " there"),
+  ];
+}
+
+// Further distinct callback streams measured from the same pinned core. The
+// function/parameter passes delay their backwards jump until the close tag;
+// MiniMax strips its wrapper, then exposes and later retracts its nested XML.
+const CORE_STANDALONE_FUNCTION_SAWTOOTH = [
+  ...cumulativePrefixes('<function name="bash">{"x":1}</functio'),
+  // The empty sanitized callback produced when the closing name completes is suppressed.
+  ...cumulativePrefixes("Answer"),
+];
+
+const CORE_STANDALONE_PARAMETER_SAWTOOTH = [
+  ...cumulativePrefixes("Hello <parameter>x</parameter"),
+  "Hello x",
+  ...cumulativeExtensions("Hello x", " there"),
+];
+
+const CORE_NESTED_TOOL_CALL_SAWTOOTH = [
+  ...cumulativePrefixes("Hello <tool_call><functio"),
+  "Hello ",
+  ...cumulativeExtensions("Hello <tool_call><function", "_cal"),
+  "Hello ",
+  ...cumulativeExtensions("Hello ", " there"),
+];
+
+const CORE_MINIMAX_TOOL_CALL_SAWTOOTH = [
+  ...cumulativePrefixes("Hello <minimax:tool_call"),
+  "Hello ",
+  ...cumulativeExtensions(
+    "Hello ",
+    '<invoke name="x"><parameter name="a">1</parameter',
+  ),
+  'Hello <invoke name="x">1',
+  ...cumulativeExtensions('Hello <invoke name="x">1', "</invoke"),
+  "Hello ",
+  ...cumulativeExtensions("Hello ", "</minimax:tool_call"),
+  "Hello ",
+  ...cumulativeExtensions("Hello ", " there"),
+];
+
 const CORE_FINAL_SAWTOOTH = [
   ...cumulativePrefixes("Hello <final"),
   "Hello ",
@@ -1699,6 +1745,125 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
     },
   );
+
+  it.each([
+    ["tool_calls", coreJsonTagSawtooth("tool_calls"), "Hello  there"],
+    ["function_call", coreJsonTagSawtooth("function_call"), "Hello  there"],
+    ["tool_result", coreJsonTagSawtooth("tool_result"), "Hello  there"],
+    ["function_response", coreJsonTagSawtooth("function_response"), "Hello  there"],
+    ["antml:invoke", coreJsonTagSawtooth("antml:invoke"), "Hello  there"],
+    ["antml:parameter", coreJsonTagSawtooth("antml:parameter"), "Hello  there"],
+    ["function", CORE_STANDALONE_FUNCTION_SAWTOOTH, "Answer"],
+  ])(
+    "M7l2: pinned core's <%s> grammar stays one clean bubble",
+    async (_tag, partials, finalText) => {
+      const warn = vi.fn();
+      const h = makeDraftHarness({ logger: { warn } });
+      h.draft.handleAssistantMessageBoundary();
+      for (const text of partials) h.draft.pushAnswerText({ text });
+      await expect(h.draft.finalize(finalText)).resolves.toBe(true);
+      await h.draft.drain();
+
+      const finals = h.frames.filter((frame) => frame.type === "final");
+      expect(finals.map((frame) => frame.text)).toEqual([finalText]);
+      expect(successfulIds(h.frames)).toHaveLength(1);
+      expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<");
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
+    },
+  );
+
+  it("M7l3: the outer marker remains anchored across nested tool-call XML", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of CORE_NESTED_TOOL_CALL_SAWTOOTH) h.draft.pushAnswerText({ text });
+    await expect(h.draft.finalize("Hello  there")).resolves.toBe(true);
+    await h.draft.drain();
+
+    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      "Hello  there",
+    ]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+    expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<tool_call");
+  });
+
+  it("M7l4: post-marker whitespace stays held until JSON disambiguates", async () => {
+    const partials = [
+      ...cumulativePrefixes("Hello <tool_call>\n  "),
+      "Hello ",
+      ...cumulativeExtensions("Hello ", " there"),
+    ];
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of partials) h.draft.pushAnswerText({ text });
+    await expect(h.draft.finalize("Hello  there")).resolves.toBe(true);
+    await h.draft.drain();
+
+    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      "Hello  there",
+    ]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+    expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<tool_call");
+  });
+
+  it("M7l5: standalone parameter unwrapping and MiniMax XML do not split lanes", async () => {
+    for (const [partials, finalText] of [
+      [CORE_STANDALONE_PARAMETER_SAWTOOTH, "Hello x there"],
+      [CORE_MINIMAX_TOOL_CALL_SAWTOOTH, "Hello  there"],
+    ] as const) {
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      for (const text of partials) h.draft.pushAnswerText({ text });
+      await expect(h.draft.finalize(finalText)).resolves.toBe(true);
+      await h.draft.drain();
+
+      expect(
+        h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+      ).toEqual([finalText]);
+      expect(successfulIds(h.frames)).toHaveLength(1);
+      expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<");
+    }
+  });
+
+  it("M7l6: a tool-only marker cannot survive a suppressed empty callback", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of cumulativePrefixes("<tool_call>")) h.draft.pushAnswerText({ text });
+    // Pinned core suppresses the sanitized empty partial here.
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Answer" });
+    await expect(h.draft.finalize("Answer")).resolves.toBe(true);
+    await h.draft.drain();
+
+    const finals = h.frames.filter((frame) => frame.type === "final");
+    expect(finals.map((frame) => frame.text)).toEqual(["Answer"]);
+    expect(new Set(finals.map((frame) => frame.id)).size).toBe(1);
+    expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<tool_call");
+  });
+
+  it("M7l7: exact control names have no terminal fallback, but explicit empty clears one", async () => {
+    for (const marker of ["<tool_call>", "<minimax:tool_call>"]) {
+      const drained = makeDraftHarness();
+      drained.draft.handleAssistantMessageBoundary();
+      const visiblePrefixes =
+        marker === "<minimax:tool_call>"
+          ? cumulativePrefixes(marker.slice(0, -1))
+          : cumulativePrefixes(marker);
+      for (const text of visiblePrefixes) drained.draft.pushAnswerText({ text });
+      await drained.draft.drain();
+      expect(drained.frames).toEqual([]);
+    }
+
+    const forwardedEmpty = makeDraftHarness();
+    forwardedEmpty.draft.handleAssistantMessageBoundary();
+    forwardedEmpty.draft.pushAnswerText({ text: "<tool_cal" });
+    forwardedEmpty.draft.pushAnswerText({ text: "" });
+    forwardedEmpty.draft.pushAnswerText({ text: "Answer" });
+    await expect(forwardedEmpty.draft.finalize("Answer")).resolves.toBe(true);
+    await forwardedEmpty.draft.drain();
+    expect(
+      forwardedEmpty.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+    ).toEqual(["Answer"]);
+  });
 
   it("M7m: a same-length tag-free control with a literal less-than stays intact", async () => {
     const source = "Hello 1 < 2 is literal text.".padEnd(50, ".");

@@ -151,6 +151,13 @@ type LaneResolution = "open" | "unresolved" | "materialized" | "empty";
 type LaneFrameType = "progress" | "final";
 type DeliveryFailureKind = "false" | "throw";
 
+type DeferredCoreTagTail = {
+  /** Raw prefix known to be safe to expose while the control tail is ambiguous. */
+  visiblePrefix: string;
+  /** Present only while the current tag name is still genuinely incomplete. */
+  terminalFallbackText?: string;
+};
+
 type AssistantDraftLane = {
   generation: number;
   /** Assigned only after a successful first wire frame for this lane. */
@@ -176,8 +183,8 @@ type AssistantDraftLane = {
   lastRawAnswerText: string;
   /** Latest accepted callback text, used only to compose a following delta. */
   lastPartialSourceText: string;
-  /** Terminal fallback from `deferCoreStrippedTagTail`; never a rotation signal. */
-  deferredCoreTagTailText?: string;
+  /** Structured hold from `deferCoreStrippedTagTail`; never a rotation signal. */
+  deferredCoreTagTail?: DeferredCoreTagTail;
   answerRevision: number;
   tentativeBarrierReservationIds: string[];
   closed: boolean;
@@ -294,87 +301,115 @@ type ProvisionalReservation = {
 /** One structured partial update from the public reply callback. */
 export type PartialAnswerUpdate = { text?: string; delta?: string; replace?: true };
 
-const CORE_STRIPPED_STREAM_TAG_NAMES = ["tool_call", "function_calls", "final"] as const;
+/**
+ * Pinned OpenClaw 2026.7.1-2 streaming grammar: TOOL_CALL_TAG_NAMES, the
+ * reasoning sanitizer's `final`, plus the separate MiniMax wrapper and
+ * standalone-parameter passes. Keep this list in sync when the core pin moves.
+ */
+const CORE_STRIPPED_STREAM_TAG_NAMES = [
+  "tool_call",
+  "tool_calls",
+  "tool_result",
+  "function_call",
+  "function_calls",
+  "function_response",
+  "function",
+  "antml:invoke",
+  "antml:parameter",
+  "final",
+  "minimax:tool_call",
+  "invoke",
+  "parameter",
+] as const;
 const XML_TAG_NAME_CHAR_RE = /[A-Za-z0-9_.:-]/;
 
-function tagRemainderCanEndAtTail(remainder: string): boolean {
-  let quote: "\"" | "'" | undefined;
-  let escaped = false;
-  for (let index = 0; index < remainder.length; index += 1) {
-    const char = remainder[index]!;
-    if (quote) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === quote) {
-        quote = undefined;
-      }
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === "<") return false;
-    if (char === ">") return index === remainder.length - 1;
-  }
-  return true;
-}
-
-function isCoreStrippedTagTailCandidate(tail: string): boolean {
-  if (!tail.startsWith("<")) return false;
-  let cursor = 1;
-  while (/\s/.test(tail[cursor] ?? "")) cursor += 1;
-  if (tail[cursor] === "/") {
+function classifyCoreStrippedTagAt(
+  text: string,
+  tagStart: number,
+): { exactName: boolean } | undefined {
+  if (text[tagStart] !== "<") return undefined;
+  let cursor = tagStart + 1;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (text[cursor] === "/") {
     cursor += 1;
-    while (/\s/.test(tail[cursor] ?? "")) cursor += 1;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
   }
-  if (cursor === tail.length) return true;
+  if (cursor === text.length) return { exactName: false };
 
   const nameStart = cursor;
-  while (XML_TAG_NAME_CHAR_RE.test(tail[cursor] ?? "")) cursor += 1;
-  if (cursor === nameStart) return false;
-  const nameFragment = tail.slice(nameStart, cursor).toLowerCase();
+  while (XML_TAG_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === nameStart) return undefined;
+  const nameFragment = text.slice(nameStart, cursor).toLowerCase();
   const matchingNames = CORE_STRIPPED_STREAM_TAG_NAMES.filter((name) =>
     name.startsWith(nameFragment),
   );
-  if (matchingNames.length === 0) return false;
-  if (
-    !matchingNames.includes(nameFragment as (typeof CORE_STRIPPED_STREAM_TAG_NAMES)[number])
-  ) {
-    return cursor === tail.length;
-  }
+  if (matchingNames.length === 0) return undefined;
+  const exactName = matchingNames.includes(
+    nameFragment as (typeof CORE_STRIPPED_STREAM_TAG_NAMES)[number],
+  );
+  if (!exactName && cursor !== text.length) return undefined;
 
-  const boundary = tail[cursor];
+  const boundary = text[cursor];
   if (boundary !== undefined && !/\s/.test(boundary) && boundary !== "/" && boundary !== ">") {
-    return false;
+    return undefined;
   }
-  return tagRemainderCanEndAtTail(tail.slice(cursor));
+  return { exactName };
 }
 
 /**
- * Hold the one ambiguous suffix that core can erase on its next cumulative
+ * Hold the earliest ambiguous suffix that core can erase on a later cumulative
  * partial. Core sanitizes every payload independently, so a completed control
  * tag makes its output jump backwards (`"Hello <tool_call>"` -> `"Hello "`).
  * Letting the prefix reach the lane makes that ordinary jump look like a missed
  * message boundary and permanently finalizes the raw fragment in its own
  * bubble.
  *
- * The names are a closed set matching the core markers this channel receives.
- * Only the suffix beginning at the final `<` is eligible; a disambiguating
- * character releases the whole literal naturally. A real boundary or terminal
- * drain releases an unresolved suffix too, because at end-of-stream it is text,
- * not a control tag. The deferred value is never consulted by lane rotation.
+ * The names are a closed set matching the pinned core passes this channel
+ * receives. Once a name is exact, keep the OUTER anchor while attributes,
+ * whitespace, JSON, nested XML, bodies, and closing prefixes arrive: several
+ * core grammars do not strip until payload or close-tag recognition. A fragment
+ * that becomes definitively nonmatching releases naturally. At a real boundary
+ * or terminal drain only a genuinely incomplete name is restored as literal;
+ * an exact control marker is discarded even when core suppressed its empty
+ * sanitized callback. The deferred value is never consulted by lane rotation.
  */
 function deferCoreStrippedTagTail(
   text: string,
-): { visibleText: string; deferred: boolean } {
-  const tailStart = text.lastIndexOf("<");
-  if (tailStart < 0 || !isCoreStrippedTagTailCandidate(text.slice(tailStart))) {
-    return { visibleText: text, deferred: false };
+  previous?: DeferredCoreTagTail,
+): {
+  visibleText: string;
+  deferred?: { visiblePrefix: string; terminalRestorable: boolean };
+} {
+  if (previous && text !== previous.visiblePrefix && text.startsWith(previous.visiblePrefix)) {
+    const anchored = classifyCoreStrippedTagAt(text, previous.visiblePrefix.length);
+    if (anchored) {
+      return {
+        visibleText: previous.visiblePrefix,
+        deferred: {
+          visiblePrefix: previous.visiblePrefix,
+          terminalRestorable: !anchored.exactName,
+        },
+      };
+    }
   }
-  return { visibleText: text.slice(0, tailStart), deferred: true };
+
+  for (
+    let tagStart = text.indexOf("<");
+    tagStart >= 0;
+    tagStart = text.indexOf("<", tagStart + 1)
+  ) {
+    const candidate = classifyCoreStrippedTagAt(text, tagStart);
+    if (!candidate) continue;
+    const visiblePrefix = text.slice(0, tagStart);
+    return {
+      visibleText: visiblePrefix,
+      deferred: {
+        visiblePrefix,
+        terminalRestorable: !candidate.exactName,
+      },
+    };
+  }
+  return { visibleText: text };
 }
 
 function cleanPartialAnswerText(text: string): string {
@@ -755,8 +790,8 @@ export function createProgressDraftController(params: {
   };
 
   const releaseDeferredCoreTagTail = (lane: AssistantDraftLane): void => {
-    const deferredText = lane.deferredCoreTagTailText;
-    lane.deferredCoreTagTailText = undefined;
+    const deferredText = lane.deferredCoreTagTail?.terminalFallbackText;
+    lane.deferredCoreTagTail = undefined;
     if (
       deferredText === undefined ||
       !deferredText ||
@@ -1493,10 +1528,24 @@ export function createProgressDraftController(params: {
           // rotation signal; `raw` below is what the lane actually admits.
           const deltaBase =
             lane.lastPartialSourceText || lane.lastRawAnswerText || lane.answerText;
+          const hasNonemptyDelta =
+            typeof update.delta === "string" && update.delta.length > 0;
+          if (
+            typeof update.text === "string" &&
+            update.text.length === 0 &&
+            !hasNonemptyDelta
+          ) {
+            // Core normally suppresses an empty sanitized partial. Preserve the
+            // same semantics if one is forwarded: it clears the source-side
+            // ambiguity without erasing already-visible answer text.
+            lane.deferredCoreTagTail = undefined;
+            lane.lastPartialSourceText = "";
+            return;
+          }
           const sourceRaw =
             typeof update.text === "string" && update.text.length > 0
               ? update.text
-              : typeof update.delta === "string" && update.delta.length > 0
+              : hasNonemptyDelta
                 ? deltaBase + update.delta
                 : undefined;
           if (sourceRaw === undefined) return;
@@ -1508,11 +1557,19 @@ export function createProgressDraftController(params: {
           // prefix of the current one) to avoid backwards flicker. Restored from
           // `develop` — the lane rewrite (34da088) dropped the first and third
           // of those while keeping the strip itself.
-          const deferredTail = deferCoreStrippedTagTail(sourceRaw);
+          const deferredTail = deferCoreStrippedTagTail(
+            sourceRaw,
+            update.replace === true ? undefined : lane.deferredCoreTagTail,
+          );
           const raw = deferredTail.visibleText;
           const cleaned = cleanPartialAnswerText(raw);
-          const deferredText = deferredTail.deferred
-            ? cleanPartialAnswerText(sourceRaw)
+          const deferredCoreTagTail: DeferredCoreTagTail | undefined = deferredTail.deferred
+            ? {
+                visiblePrefix: deferredTail.deferred.visiblePrefix,
+                terminalFallbackText: deferredTail.deferred.terminalRestorable
+                  ? cleanPartialAnswerText(sourceRaw)
+                  : undefined,
+              }
             : undefined;
           // Deliberately does NOT touch the raw baseline. A reasoning payload is
           // not this message's answer, so letting it set the baseline would force
@@ -1523,22 +1580,22 @@ export function createProgressDraftController(params: {
           // lane text), and a non-empty one still describes the last real answer
           // payload.
           if (cleaned.startsWith("Reasoning:\n")) {
-            lane.deferredCoreTagTailText = undefined;
+            lane.deferredCoreTagTail = undefined;
             return;
           }
           if (!cleaned) {
-            lane.deferredCoreTagTailText = deferredText;
+            lane.deferredCoreTagTail = deferredCoreTagTail;
             // A suffix-only candidate still belongs to the raw accumulator. Its
             // terminal fallback is stored separately and never participates in
             // the missed-boundary decision.
-            if (deferredTail.deferred) {
+            if (deferredCoreTagTail) {
               lane.lastPartialSourceText = sourceRaw;
               acceptRawBaseline(lane, raw, { replace: update.replace === true });
             }
             return;
           }
           if (cleaned === lane.answerText) {
-            lane.deferredCoreTagTailText = deferredText;
+            lane.deferredCoreTagTail = deferredCoreTagTail;
             lane.lastPartialSourceText = sourceRaw;
             acceptRawBaseline(lane, raw, { replace: update.replace === true });
             return;
@@ -1563,7 +1620,7 @@ export function createProgressDraftController(params: {
             //
             // No `replace` flag needed: this branch is unreachable for a replace
             // update (the condition above requires `replace !== true`).
-            lane.deferredCoreTagTailText = deferredText;
+            lane.deferredCoreTagTail = deferredCoreTagTail;
             lane.lastPartialSourceText = sourceRaw;
             acceptRawBaseline(lane, raw);
             return;
@@ -1593,7 +1650,7 @@ export function createProgressDraftController(params: {
             lane = currentLane();
           }
 
-          lane.deferredCoreTagTailText = deferredText;
+          lane.deferredCoreTagTail = deferredCoreTagTail;
           lane.answerText = cleaned;
           lane.lastPartialSourceText = sourceRaw;
           acceptRawBaseline(lane, raw, { replace: update.replace === true });
@@ -1816,7 +1873,7 @@ export function createProgressDraftController(params: {
           }
           // The terminal payload is authoritative. Do not release an older
           // ambiguous partial over it during terminalDrain.
-          active.deferredCoreTagTailText = undefined;
+          active.deferredCoreTagTail = undefined;
           terminalDrain(false);
           state.finalReconciliation.ordinaryAnswerSettled = true;
           active.answerText = text;
