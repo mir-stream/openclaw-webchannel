@@ -1,6 +1,8 @@
 /** Decode the strict logfmt subset emitted by webchannel diagnostics. */
 export function decodeStrictLogfmt(record: string): Map<string, string> {
-  if (/\r|\n/.test(record)) throw new Error("logfmt records must be single-line");
+  if (/[\r\n\u0085\u2028\u2029]/u.test(record)) {
+    throw new Error("logfmt records must be single-line");
+  }
   const fields = new Map<string, string>();
   let index = 0;
   while (index < record.length) {

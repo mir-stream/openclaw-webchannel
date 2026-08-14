@@ -610,7 +610,8 @@ function findLogCallBoundaries(source: string, sourceFile: ts.SourceFile): CallB
  * Hide regex literal bytes from the legacy inner scanner without changing any
  * source offset. TypeScript has already distinguished regex from division, so
  * a quote or backtick inside `/…/` cannot masquerade as a string/template
- * delimiter; preserving CR/LF also preserves every reported line number.
+ * delimiter; preserving every ECMAScript line terminator also preserves every
+ * reported line number.
  */
 function maskRegularExpressionLiterals(source: string, sourceFile: ts.SourceFile): string {
   // `split("")` deliberately preserves UTF-16 code-unit offsets used by the
@@ -619,7 +620,7 @@ function maskRegularExpressionLiterals(source: string, sourceFile: ts.SourceFile
   const visit = (node: ts.Node): void => {
     if (ts.isRegularExpressionLiteral(node)) {
       for (let index = node.getStart(sourceFile); index < node.end; index += 1) {
-        if (masked[index] !== "\r" && masked[index] !== "\n") masked[index] = " ";
+        if (!isEcmascriptLineTerminator(masked[index])) masked[index] = " ";
       }
       return;
     }
@@ -627,6 +628,25 @@ function maskRegularExpressionLiterals(source: string, sourceFile: ts.SourceFile
   };
   visit(sourceFile);
   return masked.join("");
+}
+
+function isEcmascriptLineTerminator(ch: string | undefined): boolean {
+  return ch === "\r" || ch === "\n" || ch === "\u2028" || ch === "\u2029";
+}
+
+/** 1-based source line, treating CRLF as the single terminator sequence it is. */
+function sourceLineNumber(source: string, end: number): number {
+  let line = 1;
+  for (let index = 0; index < end; index += 1) {
+    const ch = source[index];
+    if (ch === "\r") {
+      line += 1;
+      if (source[index + 1] === "\n") index += 1;
+    } else if (ch === "\n" || ch === "\u2028" || ch === "\u2029") {
+      line += 1;
+    }
+  }
+  return line;
 }
 
 function skipString(src: string, start: number): number {
@@ -645,8 +665,9 @@ function skipString(src: string, start: number): number {
 
 function skipComment(src: string, i: number): number {
   if (src[i + 1] === "/") {
-    const nl = src.indexOf("\n", i);
-    return nl < 0 ? src.length : nl;
+    let end = i + 2;
+    while (end < src.length && !isEcmascriptLineTerminator(src[end])) end += 1;
+    return end;
   }
   const close = src.indexOf("*/", i);
   return close < 0 ? src.length : close + 2;
@@ -983,13 +1004,13 @@ export function findLogStatements(
     statements.push({
       literal: statement,
       site,
-      line: source.slice(0, open).split("\n").length,
+      line: sourceLineNumber(source, open),
       unreadable: findUnreadableValues(scanSource, source, sourceFile, open + 1, close),
       interpolations: found.map((interp) => {
         const boundary = templateBoundaries.get(interp.index);
         return {
           expression: interp.text.replace(/\s+/g, " ").trim(),
-          line: source.slice(0, interp.index).split("\n").length,
+          line: sourceLineNumber(source, interp.index),
           statement,
           site,
           cookedLeft: boundary?.cookedLeft ?? "",

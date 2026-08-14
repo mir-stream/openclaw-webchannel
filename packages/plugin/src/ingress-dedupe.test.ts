@@ -1513,7 +1513,7 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
  * #123 — a peer must not be able to write into the log stream.
  *
  * `peerId` and `message.id` arrive straight off the wire and were raw-interpolated
- * into these three records, so a newline forged a second, fully-formed line.
+ * into these three records, so a record terminator forged a second line.
  * Every assertion below is on the EMITTED RECORD: one line out, injected text
  * present but inert. A test that only checked "did not throw" would have passed
  * against the vulnerable code.
@@ -1521,6 +1521,14 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
 describe("ingress-dedupe log-record integrity (#123)", () => {
   const FORGED_ID = "id-1\nwebchannel: dropped duplicate inbound message peer=admin";
   const FORGED_PEER = "p1\nwebchannel: ingress admission ack failed for peer=admin";
+  const RECORD_TERMINATORS = [
+    ["LF", "\n"],
+    ["CR", "\r"],
+    ["CRLF", "\r\n"],
+    ["NEL", "\u0085"],
+    ["LINE SEPARATOR", "\u2028"],
+    ["PARAGRAPH SEPARATOR", "\u2029"],
+  ] as const;
 
   it("a newline-bearing message id cannot forge a second duplicate-drop record", async () => {
     const { checkAndRecord } = fakeChecker();
@@ -1592,26 +1600,31 @@ describe("ingress-dedupe log-record integrity (#123)", () => {
     expect(record.split("\n")).toHaveLength(1);
   });
 
-  it("a newline-bearing peer id cannot forge a second ack-failure record", async () => {
-    const warn = vi.fn();
-    const onFlush = createIngressOnFlush<Item>({
-      accountId: "acct",
-      checkAndRecord: async () => true,
-      dispatch: vi.fn(),
-      coalesce: (messages) => messages[0]!,
-      sendAck: () => false,
-      logWarn: warn,
-    });
+  it.each(RECORD_TERMINATORS)(
+    "a %s-bearing peer id cannot forge a second ack-failure field",
+    async (_name, terminator) => {
+      const warn = vi.fn();
+      const onFlush = createIngressOnFlush<Item>({
+        accountId: "acct",
+        checkAndRecord: async () => true,
+        dispatch: vi.fn(),
+        coalesce: (messages) => messages[0]!,
+        sendAck: () => false,
+        logWarn: warn,
+      });
 
-    await onFlush([item(FORGED_PEER, "a", "id-1")]);
+      const hostilePeer = `p1${terminator}forged=true`;
+      await onFlush([item(hostilePeer, "a", "id-1")]);
 
-    const acks = warn.mock.calls
-      .map((call) => String(call[0]))
-      .filter((text) => text.includes("ingress admission ack failed"));
-    expect(acks).toHaveLength(1);
-    const record = acks[0]!;
-    expect(record.split("\n")).toHaveLength(1);
-    expect(record).not.toContain("\n");
-    expect(record).toContain("\\n");
-  });
+      const acks = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((text) => text.includes("ingress admission ack failed"));
+      expect(acks).toHaveLength(1);
+      const record = acks[0]!;
+      expect(record).not.toContain(terminator);
+      const fields = decodeStrictLogfmt(record);
+      expect(fields.get("peer")).toBe(hostilePeer);
+      expect(fields.has("forged")).toBe(false);
+    },
+  );
 });

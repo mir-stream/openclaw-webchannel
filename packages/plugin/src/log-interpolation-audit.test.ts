@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import ts from "typescript";
 import { describe, it, expect } from "vitest";
 
 import { logSafe } from "./log-safe.js";
@@ -224,6 +225,33 @@ describe("log-record integrity — enforced files (#123)", () => {
       return false;
     });
     expect(dead).toEqual([]);
+  });
+});
+
+describe("strict logfmt record terminators (#123)", () => {
+  const terminators = [
+    ["LF", "\n"],
+    ["CR", "\r"],
+    ["CRLF", "\r\n"],
+    ["NEL", "\u0085"],
+    ["LINE SEPARATOR", "\u2028"],
+    ["PARAGRAPH SEPARATOR", "\u2029"],
+  ] as const;
+
+  it.each(terminators)("rejects a raw %s before it can start a second field", (_name, mark) => {
+    expect(() => decodeStrictLogfmt(`peer=trusted${mark}forged=true`)).toThrow(
+      /logfmt records must be single-line/,
+    );
+  });
+
+  it.each(terminators)("accepts a logSafe-escaped %s as one field value", (_name, mark) => {
+    const hostile = `trusted${mark}forged=true`;
+    const record = `peer=${logSafe(hostile)} outcome=ok`;
+    expect(record).not.toContain(mark);
+    const fields = decodeStrictLogfmt(record);
+    expect(fields.get("peer")).toBe(hostile);
+    expect(fields.has("forged")).toBe(false);
+    expect(fields.get("outcome")).toBe("ok");
   });
 });
 
@@ -513,6 +541,32 @@ describe("the checker catches every known evasion (#123)", () => {
     const violations = check(source);
     expect(violations).toHaveLength(1);
     expect(violations[0]).toContain("${peerId}");
+  });
+
+  it.each([
+    ["LF", "\n"],
+    ["CR", "\r"],
+    ["CRLF", "\r\n"],
+    ["LINE SEPARATOR", "\u2028"],
+    ["PARAGRAPH SEPARATOR", "\u2029"],
+  ])("EVASION 16: a %s ends a line comment", (_name, separator) => {
+    const source = `console.warn("webchannel: peer=" + // comment${separator} peerId);`;
+    const diagnostics = ts.transpileModule(source, {
+      compilerOptions: { target: ts.ScriptTarget.Latest },
+      reportDiagnostics: true,
+    }).diagnostics ?? [];
+    expect(diagnostics).toEqual([]);
+    expect(findLogStatements(source, WEBCHANNEL_PREFIXES)).toHaveLength(1);
+    const violations = check(source);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("peerId");
+
+    // The same terminator drives diagnostic lines; CRLF counts only once.
+    const templated =
+      `console.warn("webchannel: peer=" + // comment${separator}` +
+      "`peer=${peerId}`);";
+    const interpolation = findLogStatements(templated, WEBCHANNEL_PREFIXES)[0]?.interpolations[0];
+    expect(interpolation?.line).toBe(2);
   });
 
   it("accepts canonical logSafe whose argument contains a regex delimiter trap", () => {
