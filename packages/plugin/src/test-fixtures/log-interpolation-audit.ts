@@ -59,6 +59,8 @@ export interface LogInterpolation {
   readonly line: number;
   /** The statement's static text, for a readable failure message. */
   readonly statement: string;
+  /** Full normalized static text, used for exact site identity. */
+  readonly site: string;
 }
 
 /**
@@ -309,6 +311,45 @@ interface CallBoundary {
   readonly open: number;
   /** Index of the matching closing `)`. */
   readonly close: number;
+  /** Runtime-cooked static text from quoted strings and template fragments. */
+  readonly prefixText: string;
+}
+
+/**
+ * Concatenate runtime-cooked static text in source order. `node.text` is cooked
+ * by the TypeScript parser, so `"webchannel" + ":"`, `"\x77ebchannel:"`, and
+ * their template equivalents all expose the same prefix they produce at
+ * runtime. Dynamic identifiers contribute nothing; nested literals remain
+ * conservatively visible, matching the previous scanner's broad scope.
+ */
+function collectCookedStaticText(node: ts.Node): string {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    return node.text;
+  }
+  if (ts.isRegularExpressionLiteral(node)) return "";
+  if (ts.isTemplateExpression(node)) {
+    let text = node.head.text;
+    for (const span of node.templateSpans) {
+      text += collectCookedStaticText(span.expression);
+      text += span.literal.text;
+    }
+    return text;
+  }
+  let text = "";
+  ts.forEachChild(node, (child) => {
+    text += collectCookedStaticText(child);
+  });
+  return text;
+}
+
+function createAuditSourceFile(source: string): ts.SourceFile {
+  return ts.createSourceFile(
+    "log-interpolation-audit-input.ts",
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
 }
 
 /**
@@ -319,14 +360,7 @@ interface CallBoundary {
  * quietly. AST argument ranges give the exact outer parentheses while leaving
  * the existing fail-loud value walk unchanged.
  */
-function findLogCallBoundaries(source: string): CallBoundary[] {
-  const sourceFile = ts.createSourceFile(
-    "log-interpolation-audit-input.ts",
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TS,
-  );
+function findLogCallBoundaries(source: string, sourceFile: ts.SourceFile): CallBoundary[] {
   const boundaries: CallBoundary[] = [];
   const visit = (node: ts.Node): void => {
     if ((ts.isCallExpression(node) || ts.isNewExpression(node)) && node.arguments) {
@@ -336,7 +370,11 @@ function findLogCallBoundaries(source: string): CallBoundary[] {
       // always just past the syntactic closing parenthesis.
       const close = node.end - 1;
       if (isLogCallee(callee) && source[open] === "(" && source[close] === ")") {
-        boundaries.push({ open, close });
+        boundaries.push({
+          open,
+          close,
+          prefixText: node.arguments.map(collectCookedStaticText).join(""),
+        });
       }
     }
     ts.forEachChild(node, visit);
@@ -351,14 +389,7 @@ function findLogCallBoundaries(source: string): CallBoundary[] {
  * a quote or backtick inside `/…/` cannot masquerade as a string/template
  * delimiter; preserving CR/LF also preserves every reported line number.
  */
-function maskRegularExpressionLiterals(source: string): string {
-  const sourceFile = ts.createSourceFile(
-    "log-interpolation-audit-input.ts",
-    source,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TS,
-  );
+function maskRegularExpressionLiterals(source: string, sourceFile: ts.SourceFile): string {
   // `split("")` deliberately preserves UTF-16 code-unit offsets used by the
   // TypeScript AST (unlike `[...source]`, which combines surrogate pairs).
   const masked = source.split("");
@@ -624,7 +655,13 @@ function stepMeaningful(src: string, i: number, dir: 1 | -1, lo: number, hi: num
  * — the live shape at approvals.ts — stays legal. `??` is deliberately NOT
  * exempt: its left operand IS emitted.
  */
-function findUnreadableValues(src: string, start: number, end: number): string[] {
+function findUnreadableValues(
+  src: string,
+  source: string,
+  sourceFile: ts.SourceFile,
+  start: number,
+  end: number,
+): string[] {
   const found = new Set<string>();
   let i = start;
   while (i < end) {
@@ -665,6 +702,35 @@ function findUnreadableValues(src: string, start: number, end: number): string[]
     }
     i++;
   }
+  // The byte walker above deliberately retains its readable member-chain
+  // diagnostics, but ASCII character classes cannot recognize valid Unicode
+  // identifiers and skip the digits in source escapes such as `\u0061`.
+  // Supplement only those spellings from the TypeScript AST. Ordinary ASCII
+  // identifiers keep the established scanner output and count behavior.
+  const visitIdentifier = (node: ts.Node): void => {
+    const nodeStart = node.getStart(sourceFile);
+    if (node.end <= start || nodeStart >= end) return;
+    if (
+      ts.isStringLiteral(node) ||
+      ts.isNoSubstitutionTemplateLiteral(node) ||
+      ts.isTemplateExpression(node) ||
+      ts.isRegularExpressionLiteral(node)
+    ) {
+      return;
+    }
+    if (ts.isIdentifier(node) && nodeStart >= start && node.end <= end) {
+      const raw = source.slice(nodeStart, node.end);
+      if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(raw)) {
+        const isTernaryCondition =
+          ts.isConditionalExpression(node.parent) && node.parent.condition === node;
+        if (!isTernaryCondition) {
+          found.add(`bare value \`${raw}\` at code level — this scanner cannot read it`);
+        }
+      }
+    }
+    ts.forEachChild(node, visitIdentifier);
+  };
+  visitIdentifier(sourceFile);
   return [...found];
 }
 
@@ -678,14 +744,15 @@ export function findLogStatements(
 ): LogStatement[] {
   const statements: LogStatement[] = [];
   const consumed: Array<[number, number]> = [];
-  const scanSource = maskRegularExpressionLiterals(source);
-  for (const { open, close } of findLogCallBoundaries(source)) {
+  const sourceFile = createAuditSourceFile(source);
+  const scanSource = maskRegularExpressionLiterals(source, sourceFile);
+  for (const { open, close, prefixText } of findLogCallBoundaries(source, sourceFile)) {
     // Skip a call we already swallowed as part of an enclosing log statement.
     if (consumed.some(([s, e]) => open > s && open < e)) continue;
     const found: Array<{ text: string; index: number }> = [];
     const literalOut = { text: "" };
     collectInterpolations(scanSource, open + 1, close, found, literalOut);
-    if (!prefixes.some((prefix) => literalOut.text.includes(prefix))) continue;
+    if (!prefixes.some((prefix) => prefixText.includes(prefix))) continue;
     consumed.push([open, close]);
     const site = literalOut.text.replace(/\s+/g, " ").trim();
     const statement = site.slice(0, 90);
@@ -693,11 +760,12 @@ export function findLogStatements(
       literal: statement,
       site,
       line: source.slice(0, open).split("\n").length,
-      unreadable: findUnreadableValues(scanSource, open + 1, close),
+      unreadable: findUnreadableValues(scanSource, source, sourceFile, open + 1, close),
       interpolations: found.map((interp) => ({
         expression: interp.text.replace(/\s+/g, " ").trim(),
         line: source.slice(0, interp.index).split("\n").length,
         statement,
+        site,
       })),
     });
   }
@@ -743,6 +811,7 @@ export function findUnsafeLogInterpolations(
         expression: warning,
         line: statement.line,
         statement: statement.literal,
+        site: statement.site,
         file: options.file,
       });
     }
@@ -758,10 +827,10 @@ export function formatViolations(violations: readonly LogViolation[]): string[] 
 }
 
 /**
- * A line-number-free identity for a violation, so a documented baseline of
- * known debt survives edits elsewhere in the file instead of churning on every
- * line shift.
+ * A line-number-free but exact identity for a violation. Diagnostics abbreviate
+ * `statement` for readability; baselines use the full site and file so one long
+ * same-expression record cannot transfer an exemption to a neighbouring site.
  */
 export function violationKey(violation: LogViolation): string {
-  return `${violation.expression}  @  ${violation.statement.slice(0, 60)}`;
+  return `${violation.file}  ::  ${violation.expression}  @  ${violation.site}`;
 }

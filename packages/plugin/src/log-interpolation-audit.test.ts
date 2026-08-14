@@ -23,7 +23,7 @@ import {
  * review have found the guard's claim to be the defect, not the fix.
  *
  * For a call in one of the ENFORCED files, reached through a callee
- * `isLogCallee` recognises, whose STATIC TEXT carries one of
+ * `isLogCallee` recognises, whose runtime-cooked STATIC TEXT carries one of
  * `WEBCHANNEL_PREFIXES`: every value that reaches the record is either a
  * `logSafe(…)` call, an allowlisted safe value, a documented baseline entry, or
  * a reported violation. There is no quiet fourth case — anything the scanner
@@ -97,22 +97,22 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
    * file ARE enforced (empty baseline entries below would show as failures).
    */
   "approvals.ts": [
-    'evicted.payload.id  @  [webchannel] pending-approval cap reached; evicting a still-',
-    'evicted.accountKey  @  [webchannel] pending-approval cap reached; evicting a still-',
-    'evicted.sessionKey  @  [webchannel] pending-approval cap reached; evicting a still-',
-    'entry.payload.id  @  [webchannel] pending-approval "" (account "", peer "") prune',
-    'entry.accountKey  @  [webchannel] pending-approval "" (account "", peer "") prune',
-    'entry.sessionKey  @  [webchannel] pending-approval "" (account "", peer "") prune',
-    "pendingPayload.id  @  [webchannel] approval not delivered: no live channel for acc",
-    "accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID  @  [webchannel] approval not delivered: no live channel for acc",
-    "pendingPayload.id  @  [webchannel] approval not delivered: no matching open socket",
-    "sessionKey  @  [webchannel] approval not delivered: no matching open socket",
-    "accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID  @  [webchannel] approval not delivered: no matching open socket",
-    "entry.approvalId  @  [webchannel] approval resolve frame dropped: no live channel",
-    "accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID  @  [webchannel] approval resolve frame dropped: no live channel",
-    "formatAccountIdForLog(rawAccountId)  @  [webchannel] event=webchannel.approval.origin_unresolved acc",
-    "reason  @  [webchannel] event=webchannel.approval.origin_unresolved acc",
-    "sessionKeyPresent  @  [webchannel] event=webchannel.approval.origin_unresolved acc",
+    `approvals.ts  ::  evicted.payload.id  @  [webchannel] pending-approval cap reached; evicting a still-pending approval "" (account "", peer "") — a client may show it as resolved-elsewhere`,
+    `approvals.ts  ::  evicted.accountKey  @  [webchannel] pending-approval cap reached; evicting a still-pending approval "" (account "", peer "") — a client may show it as resolved-elsewhere`,
+    `approvals.ts  ::  evicted.sessionKey  @  [webchannel] pending-approval cap reached; evicting a still-pending approval "" (account "", peer "") — a client may show it as resolved-elsewhere`,
+    `approvals.ts  ::  entry.payload.id  @  [webchannel] pending-approval "" (account "", peer "") pruned after ms with no finalize — likely an orphaned approval (monitor disposed?)`,
+    `approvals.ts  ::  entry.accountKey  @  [webchannel] pending-approval "" (account "", peer "") pruned after ms with no finalize — likely an orphaned approval (monitor disposed?)`,
+    `approvals.ts  ::  entry.sessionKey  @  [webchannel] pending-approval "" (account "", peer "") pruned after ms with no finalize — likely an orphaned approval (monitor disposed?)`,
+    `approvals.ts  ::  pendingPayload.id  @  [webchannel] approval not delivered: no live channel for account "" (skipped or unknown) — refusing to misroute`,
+    `approvals.ts  ::  accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID  @  [webchannel] approval not delivered: no live channel for account "" (skipped or unknown) — refusing to misroute`,
+    `approvals.ts  ::  pendingPayload.id  @  [webchannel] approval not delivered: no matching open socket for "" (account "")`,
+    `approvals.ts  ::  sessionKey  @  [webchannel] approval not delivered: no matching open socket for "" (account "")`,
+    `approvals.ts  ::  accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID  @  [webchannel] approval not delivered: no matching open socket for "" (account "")`,
+    `approvals.ts  ::  entry.approvalId  @  [webchannel] approval resolve frame dropped: no live channel for account ""`,
+    `approvals.ts  ::  accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID  @  [webchannel] approval resolve frame dropped: no live channel for account ""`,
+    `approvals.ts  ::  formatAccountIdForLog(rawAccountId)  @  [webchannel] event=webchannel.approval.origin_unresolved accountId= reason= sessionKey_present=`,
+    `approvals.ts  ::  reason  @  [webchannel] event=webchannel.approval.origin_unresolved accountId= reason= sessionKey_present=`,
+    `approvals.ts  ::  sessionKeyPresent  @  [webchannel] event=webchannel.approval.origin_unresolved accountId= reason= sessionKey_present=`,
   ],
 
   /**
@@ -122,20 +122,20 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
    * out of #123's scope, which is peer-controlled values.
    */
   "nats-account-runtime.ts": [
-    'accountId  @  "warn"[webchannel] account "": auth.cors is OBSOLETE and IGN',
-    'formatAccountIdForLog(accountId)  @  "warn"event=webchannel.account_startup accountId= state=retr',
-    'failure.code  @  "warn"event=webchannel.account_startup accountId= state=retr',
-    'formatAccountIdForLog(accountId)  @  "info"event=webchannel.account_startup accountId= state=reco',
-    'formatAccountIdForLog(accountId)  @  "info"event=webchannel.account_transport accountId= state=re',
-    'formatAccountIdForLog(accountId)  @  "error"event=webchannel.account_transport accountId= state=e',
-    'formatAccountIdForLog(accountId)  @  "info"[webchannel] account credential source: \u2192',
-    'source.mode  @  "info"[webchannel] account credential source: \u2192',
-    'formatRelayOrigin(consumed.dialedUrl)  @  "info"[webchannel] account credential source: \u2192',
-    'accountId  @  "info"[webchannel] account "" \u2713 encrypted NATS channel (tena',
-    'tenant  @  "info"[webchannel] account "" \u2713 encrypted NATS channel (tena',
-    'accountId  @  "info"[webchannel] account "" \u2713 encrypted NATS channel (tena',
-    'formatAccountIdForLog(accountId)  @  "warn"event=webchannel.account_cleanup accountId= errors=',
-    'formatAccountIdForLog(accountId)  @  "info"event=webchannel.account_startup accountId= state=stop',
+    `nats-account-runtime.ts  ::  accountId  @  "warn"[webchannel] account "": auth.cors is OBSOLETE and IGNORED — the register hop moved from HTTP to NATS, so browser-origin allowlisting no longer applies. Remove the auth.cors block. Access control is the SaaS-minted per-peer NATS credential scope.`,
+    `nats-account-runtime.ts  ::  formatAccountIdForLog(accountId)  @  "warn"event=webchannel.account_startup accountId= state=retry_scheduled attempt= delayMs= code=`,
+    `nats-account-runtime.ts  ::  failure.code  @  "warn"event=webchannel.account_startup accountId= state=retry_scheduled attempt= delayMs= code=`,
+    `nats-account-runtime.ts  ::  formatAccountIdForLog(accountId)  @  "info"event=webchannel.account_startup accountId= state=recovered attempt= failedAttempts= outageMs=`,
+    `nats-account-runtime.ts  ::  formatAccountIdForLog(accountId)  @  "info"event=webchannel.account_transport accountId= state=recovered`,
+    `nats-account-runtime.ts  ::  formatAccountIdForLog(accountId)  @  "error"event=webchannel.account_transport accountId= state=error code=transport-error`,
+    `nats-account-runtime.ts  ::  formatAccountIdForLog(accountId)  @  "info"[webchannel] account credential source: →`,
+    `nats-account-runtime.ts  ::  source.mode  @  "info"[webchannel] account credential source: →`,
+    `nats-account-runtime.ts  ::  formatRelayOrigin(consumed.dialedUrl)  @  "info"[webchannel] account credential source: →`,
+    `nats-account-runtime.ts  ::  accountId  @  "info"[webchannel] account "" ✓ encrypted NATS channel (tenant=, accountId=)`,
+    `nats-account-runtime.ts  ::  tenant  @  "info"[webchannel] account "" ✓ encrypted NATS channel (tenant=, accountId=)`,
+    `nats-account-runtime.ts  ::  accountId  @  "info"[webchannel] account "" ✓ encrypted NATS channel (tenant=, accountId=)`,
+    `nats-account-runtime.ts  ::  formatAccountIdForLog(accountId)  @  "warn"event=webchannel.account_cleanup accountId= errors=`,
+    `nats-account-runtime.ts  ::  formatAccountIdForLog(accountId)  @  "info"event=webchannel.account_startup accountId= state=stopped attempt=`,
   ],
   "auth.ts": [],
 };
@@ -165,11 +165,11 @@ describe("log-record integrity — enforced files (#123)", () => {
    * Exact MULTISET equality against the baseline, in one assertion.
    *
    * Was two tests using `includes`, which made a baseline key a PATTERN: one
-   * entry silently absorbed any number of matching violations, so a new site
-   * reusing an expression and sharing the first 60 static characters would
-   * arrive pre-exempted. Counts now have to match, so a second occurrence is a
-   * failure. It also collapses "no new violation" and "no stale entry" into the
-   * single property both were approximating.
+   * entry silently absorbed any number of matching violations. Counts now have
+   * to match, and `violationKey` includes the full file + static site, so neither
+   * a duplicate occurrence nor a different record sharing a long prefix can
+   * arrive pre-exempted. This also collapses "no new violation" and "no stale
+   * entry" into the single property both were approximating.
    */
   it.each(ENFORCED)("%s matches its documented baseline exactly", (file) => {
     const live = findUnsafeLogInterpolations(read(file), {
@@ -284,6 +284,20 @@ describe("the checker catches every known evasion (#123)", () => {
     expect(violations).toHaveLength(1);
   });
 
+  it.each([
+    ["non-ASCII", "const π = peerId; console.warn(\"webchannel: peer=\" + π);", "π"],
+    [
+      "source-escaped",
+      "const \\u0061 = peerId; console.warn(\"webchannel: peer=\" + \\u0061);",
+      "\\u0061",
+    ],
+  ])("EVASION 13: a valid %s TypeScript identifier fails loud", (_name, source, spelling) => {
+    expect(findLogStatements(source, WEBCHANNEL_PREFIXES)).toHaveLength(1);
+    const violations = check(source);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain(spelling);
+  });
+
   it("accepts logSafe across the same shapes it rejects raw", () => {
     expect(
       check("api.logger?.warn?.(`webchannel: probe ` +\n  `peer=${logSafe(peerId)}`);"),
@@ -307,6 +321,22 @@ describe("the checker catches every known evasion (#123)", () => {
     expect(check(allowedSite)).toHaveLength(1);
     // One allowance cannot silently absorb a duplicated site in its own file.
     expect(check(`${allowedSite}\n${allowedSite}`, { file: "inbound.ts" })).toHaveLength(1);
+  });
+
+  it("keys baseline debt by the full site, not the abbreviated diagnostic prefix", () => {
+    const common = `webchannel: ${"same-prefix-".repeat(10)}`;
+    const source = [
+      `console.warn(\`${common}first peer=\${peerId}\`);`,
+      `console.warn(\`${common}second peer=\${peerId}\`);`,
+    ].join("\n");
+    const violations = findUnsafeLogInterpolations(`${canonicalImport}${source}`, {
+      file: "probe.ts",
+      prefixes: WEBCHANNEL_PREFIXES,
+    });
+    expect(violations).toHaveLength(2);
+    expect(violations[0]!.statement).toBe(violations[1]!.statement);
+    expect(violations[0]!.site).not.toBe(violations[1]!.site);
+    expect(new Set(violations.map(violationKey)).size).toBe(2);
   });
 
   it("trusts only the unshadowed canonical logSafe named import", () => {
@@ -398,6 +428,16 @@ describe("the checker catches every known evasion (#123)", () => {
     expect(violations).toHaveLength(2);
     expect(violations.join("\n")).toContain("${peerId}");
     expect(violations.join("\n")).toContain("${message.id}");
+  });
+
+  it.each([
+    ["quoted fragments", 'console.warn("webchannel" + ": peer=" + peerId);'],
+    ["source escape", 'console.warn("\\u0077ebchannel: peer=" + peerId);'],
+  ])("EVASION 14: detects a runtime-cooked prefix across %s", (_name, source) => {
+    expect(findLogStatements(source, WEBCHANNEL_PREFIXES)).toHaveLength(1);
+    const violations = check(source);
+    expect(violations).toHaveLength(1);
+    expect(violations[0]).toContain("peerId");
   });
 
   it.each([
