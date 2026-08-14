@@ -13,6 +13,9 @@ import type {
   ChannelProgressDraftLineInput,
 } from "openclaw/plugin-sdk/channel-outbound";
 import {
+  findCodeRegions,
+  isInsideCode,
+  sanitizeAssistantVisibleText,
   stripReasoningTagsFromText,
   stripInlineDirectiveTagsForDelivery,
 } from "openclaw/plugin-sdk/text-chunking";
@@ -154,8 +157,10 @@ type DeliveryFailureKind = "false" | "throw";
 type DeferredCoreTagTail = {
   /** Raw prefix known to be safe to expose while the control tail is ambiguous. */
   visiblePrefix: string;
-  /** Present only while the current tag name is still genuinely incomplete. */
+  /** Literal fallback proven safe from a suppressed core retraction. */
   terminalFallbackText?: string;
+  /** A plural wrapper previously exposed a recognized nested XML payload. */
+  pluralWrapperSawRecognizedXmlPayload?: boolean;
 };
 
 type AssistantDraftLane = {
@@ -321,20 +326,94 @@ const CORE_STRIPPED_STREAM_TAG_NAMES = [
   "invoke",
   "parameter",
 ] as const;
+type CoreStrippedStreamTagName = (typeof CORE_STRIPPED_STREAM_TAG_NAMES)[number];
+
+const CORE_TOOL_XML_PAYLOAD_TAG_NAMES = [
+  "function_call",
+  "tool_call",
+  "function",
+  "invoke",
+  "parameter",
+  "parameters",
+  "argument",
+  "arguments",
+  "antml:function_call",
+  "antml:tool_call",
+  "antml:function",
+  "antml:invoke",
+  "antml:parameter",
+  "antml:parameters",
+  "antml:argument",
+  "antml:arguments",
+] as const;
+const CORE_TOOL_XML_PAYLOAD_START_RE =
+  /^\s*(?:\r?\n\s*)?<(?:antml:)?(?:function_call|tool_call|function|invoke|parameters?|arguments?)\b/i;
 const XML_TAG_NAME_CHAR_RE = /[A-Za-z0-9_.:-]/;
+const PLURAL_CORE_WRAPPER_TAG_NAMES = new Set<CoreStrippedStreamTagName>([
+  "function_calls",
+  "tool_calls",
+]);
+
+type CoreStrippedTagCandidate = {
+  exactName?: CoreStrippedStreamTagName;
+  isClose: boolean;
+  isSelfClosing: boolean;
+  nameEnd: number;
+  nameFragment: string;
+  tagEnd?: number;
+};
+
+function findXmlTagEnd(text: string, start: number): number | undefined {
+  let quote: "\"" | "'" | undefined;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+    if (char === "<") return undefined;
+    if (char === ">") return index + 1;
+  }
+  return undefined;
+}
 
 function classifyCoreStrippedTagAt(
   text: string,
   tagStart: number,
-): { exactName: boolean } | undefined {
+): CoreStrippedTagCandidate | undefined {
   if (text[tagStart] !== "<") return undefined;
   let cursor = tagStart + 1;
+  const afterOpen = cursor;
   while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  const hasWhitespaceAfterOpen = cursor > afterOpen;
+  let isClose = false;
+  let hasWhitespaceAfterSlash = false;
   if (text[cursor] === "/") {
+    isClose = true;
     cursor += 1;
+    const afterSlash = cursor;
     while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+    hasWhitespaceAfterSlash = cursor > afterSlash;
   }
-  if (cursor === text.length) return { exactName: false };
+  if (cursor === text.length) {
+    return {
+      isClose,
+      isSelfClosing: false,
+      nameEnd: cursor,
+      nameFragment: "",
+    };
+  }
 
   const nameStart = cursor;
   while (XML_TAG_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
@@ -344,16 +423,541 @@ function classifyCoreStrippedTagAt(
     name.startsWith(nameFragment),
   );
   if (matchingNames.length === 0) return undefined;
-  const exactName = matchingNames.includes(
-    nameFragment as (typeof CORE_STRIPPED_STREAM_TAG_NAMES)[number],
-  );
+  if (
+    (hasWhitespaceAfterOpen || hasWhitespaceAfterSlash) &&
+    matchingNames.every((name) => name === "minimax:tool_call" || name === "invoke")
+  ) {
+    // MiniMax's literal regexes are `</?minimax:tool_call>` and
+    // `<invoke\b...>...</invoke>`; unlike core's general tool XML parser they
+    // do not allow whitespace after `<` or `</`.
+    return undefined;
+  }
+  const exactName = matchingNames.includes(nameFragment as CoreStrippedStreamTagName)
+    ? (nameFragment as CoreStrippedStreamTagName)
+    : undefined;
   if (!exactName && cursor !== text.length) return undefined;
 
   const boundary = text[cursor];
+  if (
+    exactName === "minimax:tool_call" &&
+    boundary !== undefined &&
+    boundary !== ">"
+  ) {
+    // The wrapper regex accepts no attributes, whitespace, or self-close slash.
+    return undefined;
+  }
+  if (
+    exactName === "invoke" &&
+    isClose &&
+    boundary !== undefined &&
+    boundary !== ">"
+  ) {
+    // The opening invoke permits attributes; its matching close is exact.
+    return undefined;
+  }
   if (boundary !== undefined && !/\s/.test(boundary) && boundary !== "/" && boundary !== ">") {
     return undefined;
   }
-  return { exactName };
+  const tagEnd = exactName ? findXmlTagEnd(text, cursor) : undefined;
+  return {
+    exactName,
+    isClose,
+    isSelfClosing:
+      !isClose && tagEnd !== undefined && /\/\s*$/.test(text.slice(cursor, tagEnd - 1)),
+    nameEnd: cursor,
+    nameFragment,
+    tagEnd,
+  };
+}
+
+function deferredCoreTagIsTerminalRestorable(
+  text: string,
+  tagStart: number,
+  candidate: CoreStrippedTagCandidate,
+  hasVisiblePrefix: boolean,
+): boolean {
+  // A real control after visible prose retracts to that nonempty prefix, so
+  // core forwards the retraction and clears this fallback. At anchor zero the
+  // same retraction is an empty callback that the dispatcher suppresses. Do
+  // not assume providers yield every intermediate byte: any one later chunk
+  // may complete an incomplete name, payload, and close before we hear again.
+  if (hasVisiblePrefix) return true;
+  if (candidate.isClose) return false;
+
+  if (!candidate.exactName) return false;
+
+  if (candidate.tagEnd !== undefined) {
+    if (candidate.exactName === "invoke") {
+      const closeEnd = findCompleteMatchingCoreCloseEnd(
+        text,
+        candidate.tagEnd,
+        candidate.exactName,
+      );
+      // MiniMax may strip a completed bare invoke after a later global gate.
+      // Only irrevocable trailing literal text makes that retraction nonempty.
+      return (
+        closeEnd !== undefined &&
+        hasIrrevocableVisibleCoreTagText(text.slice(closeEnd))
+      );
+    }
+    if (candidate.exactName === "parameter" && !candidate.isSelfClosing) {
+      const nextTagStart = text.indexOf("<", candidate.tagEnd);
+      const bodyEnd = nextTagStart < 0 ? text.length : nextTagStart;
+      // A later matching close unwraps a nonempty body into a delivered
+      // callback, but an apparent body consisting only of another incomplete
+      // control can disappear in that same coalesced callback.
+      return hasIrrevocableVisibleCoreTagText(text.slice(candidate.tagEnd, bodyEnd));
+    }
+    return false;
+  }
+  return false;
+}
+
+function isClosedInlineCodeRestoration(text: string, previousAnswer: string): boolean {
+  if (!text.includes("`") || !text.includes("<")) return false;
+  for (const region of findCodeRegions(text)) {
+    let openingEnd = region.start;
+    while (text[openingEnd] === "`") openingEnd += 1;
+    // Pinned findCodeRegions allows any backtick-run length for an inline span;
+    // a 3+ run after prose is not a line-start fence. The counterfactual below
+    // is what proves restoration, so no delimiter-length guess is needed.
+    if (openingEnd === region.start) continue;
+
+    let closingStart = region.end;
+    while (closingStart > openingEnd && text[closingStart - 1] === "`") {
+      closingStart -= 1;
+    }
+    if (closingStart === region.end) continue;
+
+    let containsCoreTag = false;
+    for (
+      let tagStart = text.indexOf("<", openingEnd);
+      tagStart >= 0 && tagStart < closingStart;
+      tagStart = text.indexOf("<", tagStart + 1)
+    ) {
+      const candidate = classifyCoreStrippedTagAt(text, tagStart);
+      if (
+        candidate?.exactName &&
+        candidate.tagEnd !== undefined &&
+        candidate.tagEnd <= closingStart
+      ) {
+        containsCoreTag = true;
+        break;
+      }
+    }
+    if (!containsCoreTag) continue;
+
+    // Before the closing delimiter, core treated the same bytes as ordinary
+    // text and sanitized the apparent control. Recreate precisely that prior
+    // callback. Equality or an ordinary cumulative extension proves this is a
+    // restoration of the current lane, not a new message that merely happens
+    // to contain code.
+    const withoutClosingDelimiter = text.slice(0, closingStart) + text.slice(region.end);
+    if (sanitizeAssistantVisibleText(withoutClosingDelimiter).startsWith(previousAnswer)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isPotentialCoreToolXmlPayload(text: string, start: number): boolean {
+  let cursor = start;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (text[cursor] !== "<") return false;
+  cursor += 1;
+  if (cursor === text.length) return true;
+  // Pinned TOOL_CALL_XML_PAYLOAD_START_RE permits whitespace before `<`, not
+  // between `<` and the nested name.
+  if (/\s/.test(text[cursor] ?? "")) return false;
+  if (text[cursor] === "/") return false;
+
+  const nameStart = cursor;
+  while (XML_TAG_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === nameStart) return false;
+  const fragment = text.slice(nameStart, cursor).toLowerCase();
+  const matches = CORE_TOOL_XML_PAYLOAD_TAG_NAMES.filter((name) => name.startsWith(fragment));
+  if (matches.length === 0) return false;
+  if (matches.includes(fragment as (typeof CORE_TOOL_XML_PAYLOAD_TAG_NAMES)[number])) {
+    const boundary = text[cursor];
+    return (
+      boundary === undefined ||
+      /\s/.test(boundary) ||
+      boundary === "/" ||
+      boundary === ">"
+    );
+  }
+  return cursor === text.length;
+}
+
+type CorePayloadPrefix = "invalid" | "possible" | "recognized";
+
+function classifyCoreToolXmlPayloadPrefix(text: string, start: number): CorePayloadPrefix {
+  if (CORE_TOOL_XML_PAYLOAD_START_RE.test(text.slice(start))) return "recognized";
+  return isPotentialCoreToolXmlPayload(text, start) ? "possible" : "invalid";
+}
+
+/** Prefix recognizer for pinned core's TOOL_CALL_JSON_PAYLOAD_START_RE. */
+function classifyCoreJsonPayloadPrefix(text: string, start: number): CorePayloadPrefix {
+  let cursor = start;
+  while (cursor < text.length) {
+    const whitespaceStart = cursor;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+    const hadLeadingWhitespace = cursor > whitespaceStart;
+    if (cursor === text.length) return "possible";
+    if (text[cursor] === "{" || text[cursor] === "[") return "recognized";
+    if (!hadLeadingWhitespace || !/[A-Za-z_:]/.test(text[cursor]!)) return "invalid";
+
+    cursor += 1;
+    while (/[-A-Za-z0-9_:.]/.test(text[cursor] ?? "")) cursor += 1;
+    if (cursor === text.length) return "possible";
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+    if (cursor === text.length) return "possible";
+    if (text[cursor] !== "=") return "invalid";
+
+    cursor += 1;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+    if (cursor === text.length) return "possible";
+    const quote = text[cursor];
+    if (quote === "\"" || quote === "'") {
+      cursor += 1;
+      const close = text.indexOf(quote, cursor);
+      if (close < 0) return "possible";
+      cursor = close + 1;
+      continue;
+    }
+
+    const valueStart = cursor;
+    while (cursor < text.length && !/\s/.test(text[cursor]!)) {
+      const char = text[cursor]!;
+      if (
+        char === "\"" ||
+        char === "'" ||
+        char === "=" ||
+        char === "<" ||
+        char === ">" ||
+        char === "`"
+      ) {
+        return "invalid";
+      }
+      cursor += 1;
+    }
+    if (cursor === valueStart) return "invalid";
+    if (cursor === text.length) return "possible";
+  }
+  return "possible";
+}
+
+function endsInsideQuotedString(text: string, start: number, end: number): boolean {
+  let quote: "\"" | "'" | undefined;
+  let escaped = false;
+  for (let index = start; index < end; index += 1) {
+    const char = text[index]!;
+    if (!quote) {
+      if (char === "\"" || char === "'") quote = char;
+      continue;
+    }
+    if (escaped) {
+      escaped = false;
+    } else if (char === "\\") {
+      escaped = true;
+    } else if (char === quote) {
+      quote = undefined;
+    }
+  }
+  return quote !== undefined;
+}
+
+function findCompleteMatchingCoreCloseEnd(
+  text: string,
+  contentStart: number,
+  tagName: CoreStrippedStreamTagName,
+): number | undefined {
+  let depth = 1;
+  for (
+    let tagStart = text.indexOf("<", contentStart);
+    tagStart >= 0;
+    tagStart = text.indexOf("<", tagStart + 1)
+  ) {
+    const tag = classifyCoreStrippedTagAt(text, tagStart);
+    if (
+      tag?.exactName !== tagName ||
+      tag.tagEnd === undefined ||
+      (tagName === "function" && endsInsideQuotedString(text, contentStart, tagStart))
+    ) {
+      continue;
+    }
+    if (tag.isClose) {
+      depth -= 1;
+      if (depth === 0) return tag.tagEnd;
+    } else if (!tag.isSelfClosing) {
+      depth += 1;
+    }
+  }
+  return undefined;
+}
+
+function isPotentialMatchingCoreClosePrefix(
+  text: string,
+  contentStart: number,
+  tagName: CoreStrippedStreamTagName,
+): boolean {
+  let cursor = contentStart;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (text[cursor] !== "<") return false;
+  cursor += 1;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (text[cursor] !== "/") return false;
+  cursor += 1;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === text.length) return true;
+
+  const nameStart = cursor;
+  while (XML_TAG_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === nameStart) return false;
+  const fragment = text.slice(nameStart, cursor).toLowerCase();
+  if (!tagName.startsWith(fragment)) return false;
+  if (fragment !== tagName) return cursor === text.length;
+  const boundary = text[cursor];
+  return (
+    boundary === undefined ||
+    /\s/.test(boundary) ||
+    boundary === "/" ||
+    boundary === ">"
+  );
+}
+
+function isEmptyPluralWrapper(
+  text: string,
+  contentStart: number,
+  tagName: CoreStrippedStreamTagName,
+  matchingCloseEnd: number,
+): boolean {
+  let closeStart = contentStart;
+  while (/\s/.test(text[closeStart] ?? "")) closeStart += 1;
+  const close = classifyCoreStrippedTagAt(text, closeStart);
+  return (
+    close?.isClose === true &&
+    close.exactName === tagName &&
+    close.tagEnd === matchingCloseEnd
+  );
+}
+
+type AdjacentFunctionResponsePrefix = "invalid" | "possible" | "danger";
+
+function classifyAdjacentFunctionResponsePrefix(
+  text: string,
+  wrapperCloseEnd: number,
+): AdjacentFunctionResponsePrefix {
+  let cursor = wrapperCloseEnd;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === text.length) return "possible";
+  if (text[cursor] !== "<") return "invalid";
+  cursor += 1;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === text.length) return "possible";
+  if (text[cursor] === "/") return "invalid";
+
+  const nameStart = cursor;
+  while (XML_TAG_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === nameStart) return "invalid";
+  const fragment = text.slice(nameStart, cursor).toLowerCase();
+  const target = "function_response";
+  if (!target.startsWith(fragment)) return "invalid";
+  if (fragment === target) {
+    // In the hidden plural-call path core retracts to empty as soon as this
+    // exact name arrives, before `>`. Therefore an exact-name suffix that was
+    // actually forwarded proves the empty wrapper was literal, not a stripped
+    // nested-call remnant.
+    return "invalid";
+  }
+  if (cursor !== text.length) return "invalid";
+  return fragment === target.slice(0, -1) ? "danger" : "possible";
+}
+
+function hasCompleteMatchingCoreOpenBefore(
+  text: string,
+  closeStart: number,
+  tagName: CoreStrippedStreamTagName,
+): boolean {
+  for (
+    let tagStart = text.indexOf("<");
+    tagStart >= 0 && tagStart < closeStart;
+    tagStart = text.indexOf("<", tagStart + 1)
+  ) {
+    const tag = classifyCoreStrippedTagAt(text, tagStart);
+    if (
+      tag?.isClose === false &&
+      tag.exactName === tagName &&
+      tag.tagEnd !== undefined &&
+      !tag.isSelfClosing &&
+      tag.tagEnd <= closeStart
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isStandaloneFunctionToolCandidate(
+  text: string,
+  tagStart: number,
+  tagEnd: number,
+): boolean {
+  if (!/\bname\s*=/.test(text.slice(tagStart, tagEnd))) return false;
+  let cursor = tagStart - 1;
+  while (cursor >= 0 && (text[cursor] === " " || text[cursor] === "\t")) cursor -= 1;
+  return (
+    cursor < 0 ||
+    text[cursor] === "\n" ||
+    text[cursor] === "\r" ||
+    /[.!?:]/.test(text[cursor]!)
+  );
+}
+
+function coreStrippedTagCanStillBeControl(
+  text: string,
+  tagStart: number,
+  tag: CoreStrippedTagCandidate,
+  options?: { pluralWrapperSawRecognizedXmlPayload?: boolean },
+): boolean {
+  const tagName = tag.exactName;
+  if (!tagName) {
+    const possibleNames = CORE_STRIPPED_STREAM_TAG_NAMES.filter((name) =>
+      name.startsWith(tag.nameFragment),
+    );
+    const soleBareClose = possibleNames.length === 1 ? possibleNames[0] : undefined;
+    if (
+      tag.isClose &&
+      tag.nameFragment.length > 0 &&
+      (soleBareClose === "invoke" || soleBareClose === "parameter") &&
+      !hasCompleteMatchingCoreOpenBefore(text, tagStart, soleBareClose)
+    ) {
+      return false;
+    }
+    return true;
+  }
+  if (tag.tagEnd === undefined) {
+    if (
+      tag.isClose &&
+      (tagName === "invoke" || tagName === "parameter") &&
+      !hasCompleteMatchingCoreOpenBefore(text, tagStart, tagName)
+    ) {
+      // A standalone unfinished close cannot acquire a matching opening tag by
+      // appending text. Pinned MiniMax/parameter passes therefore preserve it.
+      return false;
+    }
+    return true;
+  }
+
+  if (tagName === "final" || tagName === "minimax:tool_call") {
+    // These two passes have narrower complete-tag grammars than the general XML
+    // parser above. Ask the public pinned sanitizer whether this exact isolated
+    // tag disappears; malformed lookalikes are deterministic literal text.
+    return sanitizeAssistantVisibleText(text.slice(tagStart, tag.tagEnd)).length === 0;
+  }
+
+  // Core preserves completed bare invoke/parameter close tags. Every other
+  // allowlisted close (and a truncated close of either bare form) can still
+  // disappear on the next cumulative callback.
+  if (tag.isClose) {
+    if (
+      PLURAL_CORE_WRAPPER_TAG_NAMES.has(tagName) &&
+      hasCompleteMatchingCoreOpenBefore(text, tagStart, tagName)
+    ) {
+      return false;
+    }
+    if (tagName === "invoke" || tagName === "parameter") {
+      return hasCompleteMatchingCoreOpenBefore(text, tagStart, tagName);
+    }
+    return true;
+  }
+  if (tag.isSelfClosing) {
+    if (tagName === "parameter") {
+      // A direct top-level self-closing parameter is removed before callbacks.
+      // Seeing the completed marker is therefore evidence from core's one-pass
+      // outer parameter unwrap, where the nested marker is preserved.
+      return false;
+    }
+    // MiniMax's invoke pass is textual rather than XML-semantic:
+    // `<invoke/>` still matches its opening half and can later be consumed by
+    // `</invoke>` once the global minimax gate appears.
+    return true;
+  }
+
+  const matchingCloseEnd = findCompleteMatchingCoreCloseEnd(text, tag.tagEnd, tagName);
+  const xmlPayload = classifyCoreToolXmlPayloadPrefix(text, tag.tagEnd);
+  const isPluralWrapper = PLURAL_CORE_WRAPPER_TAG_NAMES.has(tagName);
+  const pluralXmlPath =
+    isPluralWrapper &&
+    (options?.pluralWrapperSawRecognizedXmlPayload === true || xmlPayload !== "invalid");
+  if (matchingCloseEnd !== undefined) {
+    if (tagName === "invoke") return true;
+    return (
+      isPluralWrapper &&
+      (pluralXmlPath ||
+        isEmptyPluralWrapper(text, tag.tagEnd, tagName, matchingCloseEnd)) &&
+      classifyAdjacentFunctionResponsePrefix(text, matchingCloseEnd) !== "invalid"
+    );
+  }
+  if (
+    pluralXmlPath ||
+    (isPluralWrapper && isPotentialMatchingCoreClosePrefix(text, tag.tagEnd, tagName))
+  ) {
+    return true;
+  }
+
+  if (
+    tagName === "function" &&
+    !isStandaloneFunctionToolCandidate(text, tagStart, tag.tagEnd)
+  ) {
+    return false;
+  }
+
+  let payloadStart = tag.tagEnd;
+  while (/\s/.test(text[payloadStart] ?? "")) payloadStart += 1;
+  if (payloadStart === text.length) return true;
+
+  if (tagName === "parameter" || tagName === "invoke") return true;
+
+  const payloadStartChar = text[payloadStart]!;
+  const jsonPayload = classifyCoreJsonPayloadPrefix(text, tag.tagEnd);
+  if (tagName === "function") {
+    return jsonPayload !== "invalid" || xmlPayload !== "invalid";
+  }
+
+  // For the ordinary tool-call tags, JSON recognition retracts the callback as
+  // soon as `[`/`{` arrives. If either byte is still present here, core already
+  // proved this occurrence was literal. XML recognition is delayed until its
+  // nested tag name becomes unambiguous, so keep holding only that prefix set.
+  return (
+    jsonPayload === "possible" ||
+    ((tagName === "tool_call" || tagName === "antml:invoke") &&
+      payloadStartChar === "<" &&
+      xmlPayload !== "invalid")
+  );
+}
+
+/**
+ * Is some already-observed text guaranteed to survive any later completion of
+ * an ambiguous core-tag suffix? This is intentionally conservative: once the
+ * first still-viable marker begins, only the clean prefix before it is
+ * irrevocable. A suffix such as `<tool_cal` is nonempty today but may vanish
+ * entirely when one coalesced provider chunk completes its payload and close.
+ */
+function hasIrrevocableVisibleCoreTagText(text: string): boolean {
+  const codeRegions = findCodeRegions(text);
+  for (
+    let tagStart = text.indexOf("<");
+    tagStart >= 0;
+    tagStart = text.indexOf("<", tagStart + 1)
+  ) {
+    if (isInsideCode(tagStart, codeRegions)) continue;
+    const candidate = classifyCoreStrippedTagAt(text, tagStart);
+    if (candidate && coreStrippedTagCanStillBeControl(text, tagStart, candidate)) {
+      return cleanPartialAnswerText(text.slice(0, tagStart)).trim().length > 0;
+    }
+  }
+  return cleanPartialAnswerText(text).trim().length > 0;
 }
 
 /**
@@ -365,29 +969,71 @@ function classifyCoreStrippedTagAt(
  * bubble.
  *
  * The names are a closed set matching the pinned core passes this channel
- * receives. Once a name is exact, keep the OUTER anchor while attributes,
- * whitespace, JSON, nested XML, bodies, and closing prefixes arrive: several
- * core grammars do not strip until payload or close-tag recognition. A fragment
- * that becomes definitively nonmatching releases naturally. At a real boundary
- * or terminal drain only a genuinely incomplete name is restored as literal;
- * an exact control marker is discarded even when core suppressed its empty
- * sanitized callback. The deferred value is never consulted by lane rotation.
+ * receives. Keep the OUTER anchor only while its whole suffix can still become
+ * one of those controls: ordinary prose continuation releases immediately,
+ * while nested XML and the delayed function/parameter/MiniMax forms remain
+ * held until core retracts them. Core excludes Markdown code regions, so this
+ * guard uses the same public region helpers. A real control after nonempty prose
+ * retracts to that prose in a delivered callback; this makes the held literal a
+ * safe terminal fallback there. Anchor-zero fallback is allowed only when the
+ * already-observed suffix makes every future core retraction nonempty. This is
+ * deliberately independent of provider chunk size: a single cumulative chunk
+ * may complete a name, payload, and close, and core suppresses the resulting
+ * empty callback. The deferred value is never consulted by rotation.
  */
 function deferCoreStrippedTagTail(
   text: string,
   previous?: DeferredCoreTagTail,
 ): {
   visibleText: string;
-  deferred?: { visiblePrefix: string; terminalRestorable: boolean };
+  deferred?: {
+    visiblePrefix: string;
+    terminalRestorable: boolean;
+    pluralWrapperSawRecognizedXmlPayload?: boolean;
+  };
+  coreRetraction?: boolean;
 } {
-  if (previous && text !== previous.visiblePrefix && text.startsWith(previous.visiblePrefix)) {
-    const anchored = classifyCoreStrippedTagAt(text, previous.visiblePrefix.length);
-    if (anchored) {
+  if (
+    previous &&
+    previous.visiblePrefix.trimEnd() !== previous.visiblePrefix &&
+    text === previous.visiblePrefix.trimEnd()
+  ) {
+    return { visibleText: text, coreRetraction: true };
+  }
+  const codeRegions = findCodeRegions(text);
+  if (
+    previous &&
+    text !== previous.visiblePrefix &&
+    text.startsWith(previous.visiblePrefix) &&
+    !isInsideCode(previous.visiblePrefix.length, codeRegions)
+  ) {
+    const tagStart = previous.visiblePrefix.length;
+    const anchored = classifyCoreStrippedTagAt(text, tagStart);
+    const pluralWrapperSawRecognizedXmlPayload =
+      previous.pluralWrapperSawRecognizedXmlPayload === true ||
+      (anchored?.exactName !== undefined &&
+        PLURAL_CORE_WRAPPER_TAG_NAMES.has(anchored.exactName) &&
+        anchored.tagEnd !== undefined &&
+        classifyCoreToolXmlPayloadPrefix(text, anchored.tagEnd) === "recognized");
+    if (
+      anchored &&
+      coreStrippedTagCanStillBeControl(text, tagStart, anchored, {
+        pluralWrapperSawRecognizedXmlPayload,
+      })
+    ) {
+      const hasVisiblePrefix = cleanPartialAnswerText(previous.visiblePrefix).trim().length > 0;
       return {
         visibleText: previous.visiblePrefix,
         deferred: {
           visiblePrefix: previous.visiblePrefix,
-          terminalRestorable: !anchored.exactName,
+          pluralWrapperSawRecognizedXmlPayload:
+            pluralWrapperSawRecognizedXmlPayload || undefined,
+          terminalRestorable: deferredCoreTagIsTerminalRestorable(
+            text,
+            tagStart,
+            anchored,
+            hasVisiblePrefix,
+          ),
         },
       };
     }
@@ -398,14 +1044,35 @@ function deferCoreStrippedTagTail(
     tagStart >= 0;
     tagStart = text.indexOf("<", tagStart + 1)
   ) {
+    if (isInsideCode(tagStart, codeRegions)) continue;
     const candidate = classifyCoreStrippedTagAt(text, tagStart);
-    if (!candidate) continue;
+    const pluralWrapperSawRecognizedXmlPayload =
+      candidate?.exactName !== undefined &&
+      PLURAL_CORE_WRAPPER_TAG_NAMES.has(candidate.exactName) &&
+      candidate.tagEnd !== undefined &&
+      classifyCoreToolXmlPayloadPrefix(text, candidate.tagEnd) === "recognized";
+    if (
+      !candidate ||
+      !coreStrippedTagCanStillBeControl(text, tagStart, candidate, {
+        pluralWrapperSawRecognizedXmlPayload,
+      })
+    ) {
+      continue;
+    }
     const visiblePrefix = text.slice(0, tagStart);
+    const hasVisiblePrefix = cleanPartialAnswerText(visiblePrefix).trim().length > 0;
     return {
       visibleText: visiblePrefix,
       deferred: {
         visiblePrefix,
-        terminalRestorable: !candidate.exactName,
+        pluralWrapperSawRecognizedXmlPayload:
+          pluralWrapperSawRecognizedXmlPayload || undefined,
+        terminalRestorable: deferredCoreTagIsTerminalRestorable(
+          text,
+          tagStart,
+          candidate,
+          hasVisiblePrefix,
+        ),
       },
     };
   }
@@ -773,15 +1440,16 @@ export function createProgressDraftController(params: {
   const acceptRawBaseline = (
     lane: AssistantDraftLane,
     raw: string,
-    options?: { replace?: boolean },
+    options?: { replace?: boolean; rebase?: boolean },
   ): void => {
     // An explicit `replace` is authoritative: it does not continue the previous
     // cumulative text, it REPLACES it, so it starts a new baseline instead of
     // being measured against the old one. Forward-only holds WITHIN a message;
     // a replace begins a new one. Without this the baseline stays pinned to the
     // superseded text and every later delta composes on it — "old" + "er"
-    // rather than "new" + "er".
-    if (options?.replace === true) {
+    // rather than "new" + "er". A proven core retraction/restoration likewise
+    // rebases because its non-monotonic callback is known to belong to this lane.
+    if (options?.replace === true || options?.rebase === true) {
       lane.lastRawAnswerText = raw;
       return;
     }
@@ -1561,11 +2229,14 @@ export function createProgressDraftController(params: {
             sourceRaw,
             update.replace === true ? undefined : lane.deferredCoreTagTail,
           );
+          const coreTailRetraction = deferredTail.coreRetraction === true;
           const raw = deferredTail.visibleText;
           const cleaned = cleanPartialAnswerText(raw);
           const deferredCoreTagTail: DeferredCoreTagTail | undefined = deferredTail.deferred
             ? {
                 visiblePrefix: deferredTail.deferred.visiblePrefix,
+                pluralWrapperSawRecognizedXmlPayload:
+                  deferredTail.deferred.pluralWrapperSawRecognizedXmlPayload,
                 terminalFallbackText: deferredTail.deferred.terminalRestorable
                   ? cleanPartialAnswerText(sourceRaw)
                   : undefined,
@@ -1597,7 +2268,10 @@ export function createProgressDraftController(params: {
           if (cleaned === lane.answerText) {
             lane.deferredCoreTagTail = deferredCoreTagTail;
             lane.lastPartialSourceText = sourceRaw;
-            acceptRawBaseline(lane, raw, { replace: update.replace === true });
+            acceptRawBaseline(lane, raw, {
+              replace: update.replace === true,
+              rebase: coreTailRetraction,
+            });
             return;
           }
           // SHRINK. Mid-stream an unclosed `<thinking>` strips away text the
@@ -1609,6 +2283,7 @@ export function createProgressDraftController(params: {
           // update is authoritative and is never treated as a shrink.
           if (
             update.replace !== true &&
+            !coreTailRetraction &&
             lane.answerText.length > 0 &&
             lane.answerText.startsWith(cleaned) &&
             cleaned.length < lane.answerText.length
@@ -1636,8 +2311,16 @@ export function createProgressDraftController(params: {
           // is still appending to the SAME message; rotating there would split
           // one answer into two bubbles. A real missed boundary restarts the
           // cumulative text, so the raw text stops extending too.
+          const isInlineCodeRestoration =
+            update.replace !== true &&
+            lane.answerText.length > 0 &&
+            !cleaned.startsWith(lane.answerText) &&
+            !raw.startsWith(lane.lastRawAnswerText) &&
+            isClosedInlineCodeRestoration(sourceRaw, lane.answerText);
           if (
             update.replace !== true &&
+            !coreTailRetraction &&
+            !isInlineCodeRestoration &&
             lane.answerText.length > 0 &&
             !cleaned.startsWith(lane.answerText) &&
             !raw.startsWith(lane.lastRawAnswerText)
@@ -1653,7 +2336,10 @@ export function createProgressDraftController(params: {
           lane.deferredCoreTagTail = deferredCoreTagTail;
           lane.answerText = cleaned;
           lane.lastPartialSourceText = sourceRaw;
-          acceptRawBaseline(lane, raw, { replace: update.replace === true });
+          acceptRawBaseline(lane, raw, {
+            replace: update.replace === true,
+            rebase: coreTailRetraction || isInlineCodeRestoration,
+          });
           lane.answerRevision += 1;
           if (lane.resolution === "empty" || lane.resolution === "unresolved") {
             lane.resolution = "open";

@@ -92,7 +92,7 @@
     "packages/plugin/src/log-interpolation-audit.test.ts": 80,
     "packages/plugin/src/log-safe.test.ts": 18,
     "packages/plugin/src/manifest-schema.test.ts": 12,
-    "packages/plugin/src/message-adapter.test.ts": 129,
+    "packages/plugin/src/message-adapter.test.ts": 148,
     "packages/plugin/src/multidevice-broadcast.test.ts": 12,
     "packages/plugin/src/multiplex.test.ts": 21,
     "packages/plugin/src/nats-account-runtime.test.ts": 38,
