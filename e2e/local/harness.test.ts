@@ -26,10 +26,17 @@ afterEach(() => {
   rmSync(testDir, { recursive: true, force: true });
 });
 
-function assertLoaded(source: string, plugin = "webchannel") {
+type PluginSource = { source: string; plugin?: string };
+
+function assertLoadedRecords(records: PluginSource[]) {
   writeFileSync(
     gatewayLog,
-    `[plugins] channel registered (plugin=${plugin}, source=${source})\n`,
+    records
+      .map(
+        ({ source, plugin = "webchannel" }) =>
+          `[plugins] channel registered (plugin=${plugin}, source=${source})`,
+      )
+      .join("\n") + "\n",
   );
   return spawnSync(
     "bash",
@@ -51,6 +58,10 @@ function assertLoaded(source: string, plugin = "webchannel") {
   );
 }
 
+function assertLoaded(source: string, plugin = "webchannel") {
+  return assertLoadedRecords([{ source, plugin }]);
+}
+
 describe("harness_assert_loaded_dist", () => {
   it("accepts an exact webchannel bundle source", () => {
     const result = assertLoaded(dist);
@@ -69,6 +80,30 @@ describe("harness_assert_loaded_dist", () => {
 
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain(`source=${dist}`);
+  });
+
+  it("accepts duplicate identical webchannel source records", () => {
+    const result = assertLoadedRecords([{ source: dist }, { source: dist }]);
+
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  it("rejects exact then wrong webchannel sources and reports both", () => {
+    const wrong = `${dist}.backup`;
+    const result = assertLoadedRecords([{ source: dist }, { source: wrong }]);
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`source=${dist}\n`);
+    expect(result.stderr).toContain(`source=${wrong}\n`);
+  });
+
+  it("rejects wrong then exact webchannel sources and reports both", () => {
+    const wrong = `${dist}.backup`;
+    const result = assertLoadedRecords([{ source: wrong }, { source: dist }]);
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`source=${dist}\n`);
+    expect(result.stderr).toContain(`source=${wrong}\n`);
   });
 
   it("rejects a source for which the expected path is only a prefix", () => {

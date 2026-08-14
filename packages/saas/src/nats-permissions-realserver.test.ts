@@ -112,6 +112,44 @@ function natsListenerPort(
   return port;
 }
 
+/**
+ * Readiness is not a publication barrier for `--ports_file_dir`: nats-server
+ * may log "Server is ready" just before the file appears. Treat both signals as
+ * one bounded startup condition, and also retry a file observed mid-write.
+ */
+async function waitForNatsListenerPort(
+  portsDir: string,
+  listener: "nats" | "monitoring" | "websocket",
+  serverReady: () => boolean,
+  timeoutMs: number,
+  stepMs: number,
+): Promise<number> {
+  let port: number | null = null;
+  let lastPortsError = "server readiness not observed";
+  await waitFor(
+    () => {
+      if (!serverReady()) return false;
+      try {
+        port = natsListenerPort(portsDir, listener);
+        return true;
+      } catch (error) {
+        lastPortsError = error instanceof Error ? error.message : String(error);
+        return false;
+      }
+    },
+    timeoutMs,
+    stepMs,
+  ).catch(() => {
+    throw new Error(
+      `nats-server did not publish a valid ${listener} listener in ${portsDir}: ${lastPortsError}`,
+    );
+  });
+  if (port === null) {
+    throw new Error(`nats-server listener wait completed without ${listener}`);
+  }
+  return port;
+}
+
 // ---------------------------------------------------------------------------
 // Trust chain and enrollment service
 // ---------------------------------------------------------------------------
@@ -274,10 +312,21 @@ beforeAll(async () => {
   server.stdout?.on("data", onData);
   server.stderr?.on("data", onData);
 
-  await waitFor(() => ready, 10000, 100).catch(() => {
-    throw new Error(`nats-server did not become ready:\n${serverLog}`);
-  });
-  wsUrl = `ws://127.0.0.1:${natsListenerPort(testDir, "websocket")}`;
+  let websocketPort: number;
+  try {
+    websocketPort = await waitForNatsListenerPort(
+      testDir,
+      "websocket",
+      () => ready,
+      10000,
+      100,
+    );
+  } catch (error) {
+    throw new Error(
+      `nats-server did not become ready with a published listener:\n${serverLog}\n${String(error)}`,
+    );
+  }
+  wsUrl = `ws://127.0.0.1:${websocketPort}`;
 }, 20000);
 
 afterAll(async () => {

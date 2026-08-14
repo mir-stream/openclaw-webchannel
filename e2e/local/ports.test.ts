@@ -1,8 +1,8 @@
 /**
  * Guard for e2e/local/ports.json — the single source of truth for every
  * hard-coded port in the two families that bind real sockets: the six live e2e
- * gates (plus their drivers), and the root-sweep vitest suites that spawn a real
- * nats-server or HTTP server.
+ * gates (plus their drivers), and the static components of root-sweep Vitest
+ * suites that spawn or delegate a real nats-server or HTTP server.
  *
  * WHY (#118, #119): the families used to allocate independently. Overlap meant
  * `nats-server did not become ready` in beforeAll, or — worse — a gate that
@@ -183,14 +183,43 @@ function vitestSuiteFiles(repo = REPO): string[] {
     .sort();
 }
 
+/** Every local static source reachable from the supplied roots. */
+function provenanceSources(repo: string, roots: string[]): string[] {
+  const discovered = new Set<string>();
+  const pending = [...roots];
+  while (pending.length > 0) {
+    const rel = pending.pop()!;
+    if (discovered.has(rel)) continue;
+    discovered.add(rel);
+    const code = decomment(
+      readFileSync(join(repo, ...rel.split("/")), "utf8"),
+      false,
+    ).join("\n");
+    for (const specifier of staticRelativeModules(code)) {
+      const dependency = resolveLocalSource(repo, rel, specifier);
+      if (dependency && !discovered.has(dependency)) pending.push(dependency);
+    }
+  }
+  return [...discovered].sort();
+}
+
 /**
- * Direct listener roots. Preserve the broad packages/<name>/src content scan
- * that covers #118's original family, then add every root Vitest test/spec source
- * shape outside configDefaults/repo exclusions. This catches future demo tests
- * without turning the whole product tree into a literal scan.
+ * Listener roots. First traverse every root Vitest suite's complete local static
+ * component, then select binders anywhere in those components. Preserve the
+ * broad packages/<name>/src content scan that covers #118's original family.
+ * This catches a suite that delegates its listener to a helper without turning
+ * the whole product tree into a literal scan.
  */
 function directBindingSources(repo = REPO): string[] {
-  const candidates = new Set(vitestSuiteFiles(repo));
+  const candidates = new Set(
+    provenanceSources(repo, vitestSuiteFiles(repo)).filter((rel) => {
+      const code = decomment(
+        readFileSync(join(repo, ...rel.split("/")), "utf8"),
+        false,
+      ).join("\n");
+      return isBindingSource(code);
+    }),
+  );
   let packages: Dirent[];
   try {
     packages = readdirSync(join(repo, "packages"), { withFileTypes: true });
@@ -204,19 +233,15 @@ function directBindingSources(repo = REPO): string[] {
       `packages/${pkg.name}/src`,
       false,
     )) {
-      candidates.add(rel);
-    }
-  }
-
-  return [...candidates]
-    .filter((rel) => {
       const code = decomment(
         readFileSync(join(repo, ...rel.split("/")), "utf8"),
         false,
       ).join("\n");
-      return isBindingSource(code);
-    })
-    .sort();
+      if (isBindingSource(code)) candidates.add(rel);
+    }
+  }
+
+  return [...candidates].sort();
 }
 
 function staticRelativeModules(codeWithoutComments: string): string[] {
@@ -279,29 +304,96 @@ function resolveLocalSource(
 }
 
 /**
- * Direct binding roots plus their recursive local static ESM and CommonJS
+ * Discovered binding roots plus their recursive local static ESM and CommonJS
  * provenance. `.js` specifiers prefer their TS source and extensionless
  * specifiers resolve source/index variants. Dynamic, package, and excluded-tree
  * imports are deliberately outside this static provenance boundary; product
- * files unrelated to a binding root are never swept.
+ * files unrelated to a root suite or package binding root are never swept.
  */
 function bindingSources(repo = REPO): string[] {
-  const discovered = new Set<string>();
-  const pending = [...directBindingSources(repo)];
-  while (pending.length > 0) {
-    const rel = pending.pop()!;
-    if (discovered.has(rel)) continue;
-    discovered.add(rel);
+  return provenanceSources(repo, directBindingSources(repo));
+}
+
+type NonTestBinderEntrypoint = {
+  source: string;
+  symbol: string;
+  reason: string;
+};
+
+/**
+ * Product binder entrypoints that root suites must not call. Their existing
+ * listener defaults are outside the test topology only while this boundary is
+ * intact; handler-only imports from the same source remain allowed.
+ */
+const NON_TEST_BINDER_ENTRYPOINTS: NonTestBinderEntrypoint[] = [
+  {
+    source: "demo/saas-server.ts",
+    symbol: "startDemoSaasServer",
+    reason:
+      "starts the product demo HTTP listener whose defaults are outside the test topology",
+  },
+];
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Exact-symbol liveness plus the root-suite no-call boundary. */
+function nonTestBinderEntrypointProblems(
+  repo = REPO,
+  rules = NON_TEST_BINDER_ENTRYPOINTS,
+): string[] {
+  const problems: string[] = [];
+  const suites = vitestSuiteFiles(repo);
+  const components = new Map(
+    suites.map((suite) => [suite, provenanceSources(repo, [suite])]),
+  );
+  const codeBySource = new Map<string, string>();
+  const sourceCode = (rel: string): string => {
+    const cached = codeBySource.get(rel);
+    if (cached !== undefined) return cached;
     const code = decomment(
       readFileSync(join(repo, ...rel.split("/")), "utf8"),
       false,
     ).join("\n");
-    for (const specifier of staticRelativeModules(code)) {
-      const dependency = resolveLocalSource(repo, rel, specifier);
-      if (dependency && !discovered.has(dependency)) pending.push(dependency);
+    codeBySource.set(rel, code);
+    return code;
+  };
+
+  for (const rule of rules) {
+    const sourcePath = join(repo, ...rule.source.split("/"));
+    if (!existsSync(sourcePath)) {
+      problems.push(
+        `  stale entrypoint rule: ${rule.source} does not exist (${rule.reason})`,
+      );
+      continue;
+    }
+    const entrypointSourceCode = sourceCode(rule.source);
+    const symbol = new RegExp(`\\b${escapeRegExp(rule.symbol)}\\b`);
+    if (
+      !symbol.test(entrypointSourceCode) ||
+      !isBindingSource(entrypointSourceCode)
+    ) {
+      problems.push(
+        `  stale entrypoint rule: ${rule.source} no longer defines ${rule.symbol} in a binding source (${rule.reason})`,
+      );
+      continue;
+    }
+    for (const [suite, component] of components) {
+      // The declared source naturally contains its own entrypoint. Handler-only
+      // suites may import that module, so exclude only the source itself; a
+      // direct reference or any intermediate alias/re-export remains visible.
+      const referenceSource = component.find(
+        (rel) => rel !== rule.source && symbol.test(sourceCode(rel)),
+      );
+      if (referenceSource) {
+        problems.push(
+          `  ${suite} references ${rule.symbol} through ${referenceSource} from ${rule.source} (${rule.reason})`,
+        );
+      }
     }
   }
-  return [...discovered].sort();
+  return problems;
 }
 
 /**
@@ -608,6 +700,41 @@ describe("e2e/local/ports.json", () => {
     );
   });
 
+  it("discovers a listener delegated by a root suite to a helper", () => {
+    withFixtureRepo(
+      {
+        "demo/server.test.ts": [
+          'import { startServer } from "./server-helper.js";',
+          "startServer();",
+          "",
+        ].join("\n"),
+        "demo/server-helper.ts": [
+          "export function startServer() {",
+          "  return new WebSocketServer({ port: 18491 });",
+          "}",
+          "",
+        ].join("\n"),
+      },
+      (repo) => {
+        const suite = readFileSync(join(repo, "demo/server.test.ts"), "utf8");
+        expect(isBindingSource(decomment(suite, false).join("\n"))).toBe(false);
+        expect(directBindingSources(repo)).toEqual(["demo/server-helper.ts"]);
+        expect(bindingSources(repo)).toEqual(["demo/server-helper.ts"]);
+        const literals = literalsInFiles(repo, bindingSources(repo));
+        expect(literals).toContainEqual([
+          "demo/server-helper.ts",
+          2,
+          18491,
+        ]);
+        expect(withoutLiteralBudgets(literals, [])).toContainEqual([
+          "demo/server-helper.ts",
+          2,
+          18491,
+        ]);
+      },
+    );
+  });
+
   it("includes recursive local import provenance for a binding suite", () => {
     withFixtureRepo(
       {
@@ -657,6 +784,69 @@ describe("e2e/local/ports.json", () => {
           "demo/fixed-port.cts",
           1,
           18491,
+        ]);
+      },
+    );
+  });
+
+  it("keeps product binder entrypoints out of root Vitest suites", () => {
+    expect(
+      nonTestBinderEntrypointProblems(),
+      "non-test binder entrypoint boundary violations",
+    ).toEqual([]);
+  });
+
+  it("rejects direct, aliased, re-exported, and namespace product binder entrypoints", () => {
+    withFixtureRepo(
+      {
+        "demo/saas-server.ts": [
+          "const server = createServer();",
+          "export function startDemoSaasServer() { server.listen(3961); }",
+          "export function demoSaasRequestHandler() {}",
+          "",
+        ].join("\n"),
+        "demo/handler.test.ts": [
+          'import { demoSaasRequestHandler } from "./saas-server.js";',
+          "demoSaasRequestHandler();",
+          "",
+        ].join("\n"),
+        "demo/direct.test.ts": [
+          'import { startDemoSaasServer } from "./saas-server.js";',
+          "startDemoSaasServer();",
+          "",
+        ].join("\n"),
+        "demo/aliased.test.ts": [
+          'import { startDemoSaasServer as start } from "./saas-server.js";',
+          "start();",
+          "",
+        ].join("\n"),
+        "demo/namespace.test.ts": [
+          'import * as demo from "./saas-server.js";',
+          "demo.startDemoSaasServer();",
+          "",
+        ].join("\n"),
+        "demo/bridge.ts":
+          'export { startDemoSaasServer as start } from "./saas-server.js";\n',
+        "demo/bridge.test.ts": [
+          'import { start } from "./bridge.js";',
+          "start();",
+          "",
+        ].join("\n"),
+      },
+      (repo) => {
+        const rules: NonTestBinderEntrypoint[] = [
+          {
+            source: "demo/saas-server.ts",
+            symbol: "startDemoSaasServer",
+            reason: "fixture product listener",
+          },
+        ];
+
+        expect(nonTestBinderEntrypointProblems(repo, rules)).toEqual([
+          expect.stringContaining("demo/aliased.test.ts references startDemoSaasServer"),
+          expect.stringContaining("demo/bridge.test.ts references startDemoSaasServer through demo/bridge.ts"),
+          expect.stringContaining("demo/direct.test.ts references startDemoSaasServer"),
+          expect.stringContaining("demo/namespace.test.ts references startDemoSaasServer"),
         ]);
       },
     );
@@ -735,6 +925,7 @@ describe("e2e/local/ports.json", () => {
    * listener that happens to use the same number.
    */
   const NOT_PORTS: LiteralBudget[] = [
+    { file: "demo/saas-server.ts", value: 3600, count: 2, reason: "enrollment and session TTL upper bounds in seconds" },
     { file: "e2e/local/require-env.ts", value: 65535, count: 1, reason: "port-range validation upper bound" },
     { file: "e2e/local/lib/harness.sh", value: 65535, count: 1, reason: "port-range validation upper bound" },
     { file: "e2e/local/run-multi-message.sh", value: 8192, count: 1, reason: "OpenClaw maxTokens" },
@@ -780,11 +971,23 @@ describe("e2e/local/ports.json", () => {
   ];
 
   /**
-   * Real product dial defaults reached only through provenance imports. They are
-   * ports, so they are deliberately not called NOT_PORTS; the discovered tests
-   * inject their own listener URLs and these defaults do not bind test sockets.
+   * Real product dial/listen defaults reached only through provenance imports.
+   * They are ports, so they are deliberately not called NOT_PORTS; the
+   * discovered tests do not activate these defaults as test sockets.
    */
   const OUTSIDE_TEST_TOPOLOGY: LiteralBudget[] = [
+    {
+      file: "demo/saas-server.ts",
+      value: 3961,
+      count: 1,
+      reason: "product demo HTTP listen fallback; outside topology only while root suites do not reference startDemoSaasServer",
+    },
+    {
+      file: "demo/saas-server.ts",
+      value: 18722,
+      count: 1,
+      reason: "product demo NATS dial fallback; outside topology only while root suites do not reference startDemoSaasServer",
+    },
     {
       file: "packages/plugin/src/nats-credential-source.ts",
       value: 4222,

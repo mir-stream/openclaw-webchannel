@@ -203,7 +203,10 @@ harness_assert_loaded_dist() {
     ' "$gwlog" | sort -u
   )"
 
-  if ! printf '%s\n' "$loaded_sources" | grep -Fxq "$HARNESS_DIST"; then
+  # `sort -u` deliberately permits duplicate identical registration records,
+  # but the complete resolved-source SET must be the singleton built bundle.
+  # One correct record must never mask a second stale/foreign resolution.
+  if [ "$loaded_sources" != "$HARNESS_DIST" ]; then
     echo "[$tag] DIST-ASSERT FAIL: the gateway did not load the bundle this gate built." >&2
     echo "[$tag]   expected: source=$HARNESS_DIST" >&2
     echo "[$tag]   sources resolved for plugin=webchannel:" >&2

@@ -25,6 +25,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -98,6 +99,44 @@ function natsListenerPort(
     throw new Error(
       `nats-server ports file has no valid ${listener} listener: ${JSON.stringify(ports)}`,
     );
+  }
+  return port;
+}
+
+/**
+ * Readiness is not a publication barrier for `--ports_file_dir`: nats-server
+ * may log "Server is ready" just before the file appears. Treat both signals as
+ * one bounded startup condition, and also retry a file observed mid-write.
+ */
+async function waitForNatsListenerPort(
+  portsDir: string,
+  listener: "nats" | "monitoring" | "websocket",
+  serverReady: () => boolean,
+  timeoutMs: number,
+  stepMs: number,
+): Promise<number> {
+  let port: number | null = null;
+  let lastPortsError = "server readiness not observed";
+  await waitFor(
+    () => {
+      if (!serverReady()) return false;
+      try {
+        port = natsListenerPort(portsDir, listener);
+        return true;
+      } catch (error) {
+        lastPortsError = error instanceof Error ? error.message : String(error);
+        return false;
+      }
+    },
+    timeoutMs,
+    stepMs,
+  ).catch(() => {
+    throw new Error(
+      `nats-server did not publish a valid ${listener} listener in ${portsDir}: ${lastPortsError}`,
+    );
+  });
+  if (port === null) {
+    throw new Error(`nats-server listener wait completed without ${listener}`);
   }
   return port;
 }
@@ -189,8 +228,14 @@ beforeAll(async () => {
   server.stdout?.on("data", onData);
   server.stderr?.on("data", onData);
 
-  await waitFor(() => ready, 8000, 25);
-  wsUrl = `ws://127.0.0.1:${natsListenerPort(dir, "websocket")}`;
+  const websocketPort = await waitForNatsListenerPort(
+    dir,
+    "websocket",
+    () => ready,
+    8000,
+    25,
+  );
+  wsUrl = `ws://127.0.0.1:${websocketPort}`;
 }, 15000);
 
 afterAll(async () => {
@@ -217,6 +262,29 @@ const HISTORY = "chat.tenant1.agent1.user42.history";
 describe.skipIf(!NATS_SERVER_BIN)(
   "NatsTransport against a REAL nats-server (Phase 1 interop)",
   () => {
+    it("waits for delayed nats-server ports-file publication", async () => {
+      const portsDir = mkdtempSync(join(tmpdir(), "nats-ports-publication-"));
+      try {
+        const pending = waitForNatsListenerPort(
+          portsDir,
+          "websocket",
+          () => true,
+          500,
+          5,
+        );
+        setTimeout(() => {
+          writeFileSync(
+            join(portsDir, "nats-server_1.ports"),
+            JSON.stringify({ websocket: ["ws://127.0.0.1:1"] }),
+          );
+        }, 25);
+
+        await expect(pending).resolves.toBe(1);
+      } finally {
+        rmSync(portsDir, { recursive: true, force: true });
+      }
+    });
+
     it("connects to the real server and round-trips an E2E-encrypted message (plaintext never on the wire)", async () => {
       const agentKeys = generateKeyPair();
       const browserKeys = generateKeyPair();

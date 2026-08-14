@@ -49,7 +49,7 @@ Your real `~/.openclaw` and gateway are **never touched** — everything runs un
 | `two-account-isolation-roundtrip.ts` | Node driver for `run-two-account-isolation.sh`: drives positive round-trips plus an A-authorized token against B's live register subject. |
 | `ci-smoke.html` | The unified demo/chat page served by the SaaS issuer. |
 | `ports.json` | **Single source of truth for every port** in the gate family and in the root-sweep suites that bind real sockets (#118/#119). Also records non-suite owners (`tools`) and exclusions (`reserved`). |
-| `ports.test.ts` | Guards `ports.json`: allocation globally disjoint, no reserved port claimed, an entry per `run-*.sh` declaring every key that gate references, bidirectional sync with the suites it declares, and — by allowlist, not by enumerated spelling — no port literal anywhere in `e2e/local/**` (recursive, `lib/` included) or in a declared suite. |
+| `ports.test.ts` | Guards `ports.json`: allocation globally disjoint, no reserved port claimed, an entry per `run-*.sh` declaring every key that gate references, bidirectional sync with the suites it declares, and — by allowlist, not by enumerated spelling — no unauthorized port literal anywhere in `e2e/local/**` (recursive, `lib/` included) or in a discovered listener/provenance source. |
 | `lib/harness.sh` | Shared gate helpers: `harness_ports` (exports a harness's ports from `ports.json`), `harness_build_plugin` (rebuilds `packages/plugin/dist/` from the working tree, records its hash), and `harness_assert_loaded_dist` (asserts, after readiness, that the gateway resolved that exact bundle). |
 | `require-env.ts` | Makes drivers demand their topology from the launching gate instead of falling back to a port literal that silently drifts. |
 
@@ -102,9 +102,11 @@ All six boot a real gateway + `nats-server` + echo provider under an isolated
 > success. Do not read it as evidence the build ran.
 >
 > The `DIST-ASSERT` line is the check. After gateway readiness, `harness_assert_loaded_dist`
-> greps core's own resolution record (`… (plugin=webchannel, source=<path>)`) for the exact
-> bundle this gate built, and re-hashes it to catch anything that rewrote `dist/` in between.
-> A mismatch aborts the gate before the driver runs. That is what catches a core update
+> extracts core's complete `source` values from every `plugin=webchannel` resolution record.
+> Their deduplicated set must contain exactly the one bundle this gate built (duplicate identical
+> records are harmless; one expected plus one stale source is a failure), and the helper re-hashes
+> it to catch anything that rewrote `dist/` in between. A mismatch aborts the gate before the
+> driver runs. That is what catches a core update
 > changing plugin resolution — the class of failure where your build was fine and irrelevant.
 
 ### Ports
@@ -143,25 +145,35 @@ product port documented as outside the test topology, a port that file is the de
 or a named waiver tied to a filed issue.
 
 **The scan set is discovered, not listed.** It walks `e2e/local/` recursively — `lib/harness.sh`
-is in scope, and a literal there would override `harness_ports` for all six gates at once. Direct
-listener roots are then discovered by content (`nats-server`, `.listen(`, `createServer(`,
-`ws_port`, `spawn(`, or `new WebSocketServer(`) from two universes: every source under
-`packages/*/src/**` (the original #118 family), and every root-sweep Vitest `*.test.*`/`*.spec.*`
-source in the repository. The latter honors Vitest's current default exclusions plus this repo's
-`docker/**` and `examples/**` exclusions, so a future `demo/server.test.ts` is covered on arrival.
+is in scope, and a literal there would override `harness_ports` for all six gates at once. For
+root-sweep Vitest `*.test.*`/`*.spec.*` sources, the guard first traverses every suite's complete
+local static component, then selects listener roots anywhere in those components by content
+(`nats-server`, `.listen(`, `createServer(`, `ws_port`, `spawn(`, or
+`new WebSocketServer(`). Thus a `demo/server.test.ts` that merely calls a binding helper is
+covered even though the suite itself contains no listener token. The suite universe honors
+Vitest's current default exclusions plus this repo's `docker/**` and `examples/**` exclusions.
 
-Every direct listener root brings its recursive local static ESM import/re-export and CommonJS
-`require()` provenance into the scan. Resolution prefers TypeScript source behind `.js`/`.cjs`
-specifiers and supports source/index variants, so a test that imports `FIXED_PORT` from a helper
-cannot move its literal out of view. Computed/dynamic imports, package specifiers,
-excluded/generated trees, JSON, and unrelated product sources are not followed; this is a
-contained provenance graph, not a sweep of the whole product tree.
+The original #118 family retains a separate broad listener-content sweep across every source
+under `packages/*/src/**`. Every listener root from either route then brings its recursive local
+static ESM import/re-export and CommonJS `require()` provenance into the literal scan. Resolution
+prefers TypeScript source behind `.js`/`.cjs` specifiers and supports source/index variants, so a
+helper cannot move its fixed literal out of view. Computed/dynamic imports, package specifiers,
+excluded/generated trees, JSON, and product sources unreachable from a root suite or package
+listener are not followed; this is a contained provenance graph, not a sweep of the whole tree.
+
+One reachable product module, `demo/saas-server.ts`, intentionally exposes both a request handler
+used by unit tests and the `startDemoSaasServer` listener entrypoint. Its product HTTP/NATS
+defaults are outside the test topology only while root Vitest suites do not reference that named
+start entrypoint. A live, reasoned boundary rule enforces that condition while continuing to allow
+the existing handler-only imports; direct, aliased, namespace, and intermediate re-export
+references all trip the rule.
 
 **Every literal allowance is an exact budget.** `NOT_PORTS` contains only genuine non-port
 constants and names source, value, count, and reason. `WAIVED` records the same fields for each
 filed existing defect. A small `OUTSIDE_TEST_TOPOLOGY` category honestly records real product
-dial defaults reached through provenance whose discovered tests inject their own URLs; those are
-ports, not mislabeled constants. In every category the same value in another source receives no
+dial/listen defaults reached through provenance but not activated by the discovered tests; those
+are ports, not mislabeled constants, and the demo start-entrypoint rule keeps that classification
+checkable. In every category the same value in another source receives no
 allowance, an extra same-file occurrence exceeds the count, and removing an occurrence makes the
 budget stale.
 
