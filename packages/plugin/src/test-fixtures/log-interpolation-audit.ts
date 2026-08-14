@@ -317,7 +317,14 @@ function isUnsafeQuotedTokenNeighbor(fragment: string, side: "left" | "right"): 
  */
 function hasSafeLogfmtFieldBoundary(interpolation: LogInterpolation): boolean {
   const field = /(?:^|\s)([^"=\s]+)=([^\s]*)$/u.exec(interpolation.cookedLeft);
-  if (!field) return true;
+  if (!field) {
+    // A trailing token that contains `=` but does not include a complete valid
+    // key is not proven prose. This is what an unknown outer edge leaves behind
+    // in ``unknown + `=${logSafe(value)}```: treating the local `=` as a complete
+    // boundary blessed `="value"`, which strict logfmt rejects as an empty key.
+    const trailingToken = /(?:^|\s)([^\s]*)$/u.exec(interpolation.cookedLeft)?.[1] ?? "";
+    return !trailingToken.includes("=");
+  }
   if (field[2] !== "") return false;
   const right = Array.from(interpolation.cookedRight)[0];
   if (right === undefined) return true;
@@ -499,12 +506,13 @@ function runtimeEdge(node: ts.Expression, side: "left" | "right"): RuntimeEdge {
     const whenTrue = runtimeEdge(node.whenTrue, side);
     const whenFalse = runtimeEdge(node.whenFalse, side);
     if (whenTrue.kind === "none" && whenFalse.kind === "none") return { kind: "none" };
+    // The field checker consumes the complete cooked edge, not just the byte
+    // adjacent to the interpolation. If branches differ anywhere, choosing one
+    // would hide the other branch's possible `key=<prefix>` shape.
     if (
       whenTrue.kind === "static" &&
       whenFalse.kind === "static" &&
-      (side === "left"
-        ? Array.from(whenTrue.text)[0] === Array.from(whenFalse.text)[0]
-        : Array.from(whenTrue.text).at(-1) === Array.from(whenFalse.text).at(-1))
+      whenTrue.text === whenFalse.text
     ) {
       return whenTrue;
     }

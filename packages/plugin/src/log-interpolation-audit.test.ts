@@ -416,6 +416,25 @@ describe("the checker catches every known evasion (#123)", () => {
     expect(check(source)).toHaveLength(1);
   });
 
+  it("EVASION 18: checks the complete conditional runtime edge, not its last byte", () => {
+    const source =
+      'console.warn("webchannel:" + (flag ? " peer=" : " peer=-=") + ' +
+      '`${logSafe(peerId)} outcome=ok`);';
+    expect(check(source)).toHaveLength(1);
+
+    const emitted = `webchannel:${false ? " peer=" : " peer=-="}${logSafe("id")} outcome=ok`;
+    expect(() => decodeStrictLogfmt(emitted)).toThrow(/invalid bare logfmt value/);
+  });
+
+  it("fails loud when an unknown outer edge leaves only an incomplete field delimiter", () => {
+    const source =
+      'console.warn("webchannel: " + [] + `=${logSafe(peerId)} outcome=ok`);';
+    expect(check(source)).toHaveLength(1);
+
+    const emitted = `webchannel: ${[]}=${logSafe("id")} outcome=ok`;
+    expect(() => decodeStrictLogfmt(emitted)).toThrow(/invalid logfmt key/);
+  });
+
   it("rejects directly adjacent logSafe interpolations", () => {
     expect(
       check("console.warn(`webchannel: pair=${logSafe(first)}${logSafe(second)}`);"),
@@ -448,6 +467,15 @@ describe("the checker catches every known evasion (#123)", () => {
     ["parenthesized", "console.warn(`webchannel: approval (${logSafe(id)}): ignored`);"],
   ])("accepts the owned %s token boundary", (_name, source) => {
     expect(check(source)).toEqual([]);
+  });
+
+  it("accepts a conditional field edge only when every cooked branch is identical", () => {
+    expect(
+      check(
+        'console.warn("webchannel:" + (flag ? " peer=" : " pe\\u0065r=") + ' +
+          '`${logSafe(peerId)} outcome=ok`);',
+      ),
+    ).toEqual([]);
   });
 
   it("scopes raw allowances by file and concrete statement, with one-use semantics", () => {
