@@ -66,6 +66,15 @@ export type { PersistedEnrolledCreds } from "./credential-document.js";
 /** The single default account id (mirrors core's `"default"`). */
 export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = "default";
 
+/**
+ * The tenant an account falls back to when neither the account config nor the
+ * legacy top-level `cfg.tenant` names one. Named (rather than re-spelled at each
+ * fallback) because #112 makes the tenant part of the SESSION-KEY derivation:
+ * every site that answers "which tenant is this account served under?" must
+ * answer identically, or history silently splits.
+ */
+export const DEFAULT_WEBCHANNEL_TENANT = "default-tenant";
+
 export type InvalidAccountId = { id: string; reason: string };
 
 export type AccountIdInspection = {
@@ -385,7 +394,7 @@ export function resolveAcquisitionIdentity(
     tenant:
       (account.tenant as string | undefined) ??
       (isDefault ? top?.tenant : undefined) ??
-      "default-tenant",
+      DEFAULT_WEBCHANNEL_TENANT,
     saasBaseUrl: accountSaas ?? (isDefault ? top?.saas?.baseUrl : undefined),
   };
 }

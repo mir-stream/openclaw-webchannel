@@ -69,6 +69,54 @@
   partial audience-pin proposal.
 - Register admission now requires a non-empty signed tenant claim matching the
   configured tenant for challenge, register, and unregister.
+- **The tenant is now part of the session-key derivation, so EVERY existing
+  session key changes on upgrade** (#112). Webchannel keyed sessions on
+  (agent, channel, account, peer) only, but the protocol permits the same
+  account id under different tenants — so serving `(tenant=T1, account=A,
+  peer=P)`, then reconfiguring that account as `(tenant=T2, account=A)` and
+  registering with a valid T2 token for the same peer string, resolved T1's
+  session key and returned T1's transcript through the register-time history
+  snapshot and `load_history`. Admission could not catch it: it checks the
+  signed tenant claim against the *configured* tenant, and after the change T2
+  is legitimately that tenant. Keys are now
+  `agent:<agent>:webchannel:<account>:direct:<peer>:tenant:<sha256>`, where
+  `<sha256>` is the full 64-character lowercase SHA-256 digest of the tenant
+  exactly as configured. OpenClaw lowercases the whole session key when it
+  stores it, while NATS treats `Acme` and `acme` as different tenants with
+  different credentials. Hashing the verbatim tenant before the store fold
+  keeps those authorization namespaces separate; the digest is not truncated.
+  A lossless UTF-8 hex encoding was rejected because maximum-size validated raw
+  agent/account/peer/tenant components, even without an `identityLinks` rewrite,
+  could push the resulting key past OpenClaw's 512-character chat-send
+  session-key boundary.
+  - The serving runtime freezes the tenant selected by its startup account plan
+    and uses that same value for inbound writes, register-time snapshots, and
+    `load_history`. Temporary process-environment overrides during a skill run
+    cannot move one of those routes away from the NATS/admission tenant.
+  - **What an operator sees after upgrading:** existing conversations appear
+    empty. The history snapshot a widget receives at register time, and every
+    `load_history` page, read the new key and find nothing under it. Per-session
+    `/reasoning off` opt-outs also reset to the configured default, because that
+    preference is stored against the session key.
+  - There is no automated transcript migration in this release. `sessions.json`
+    contains session metadata and key-to-file mappings, not the message bodies;
+    messages live in the referenced per-agent `sessions/*.jsonl` files. To
+    preserve pre-upgrade history, stop or otherwise quiesce the gateway and copy
+    the complete relevant per-agent sessions directory/session storage before
+    upgrading, including both `sessions.json` and its referenced JSONLs. Copying
+    `sessions.json` alone is insufficient. The pinned OpenClaw
+    `openclaw backup create` command omits active session transcript JSONLs, so
+    it is not a substitute for this stopped copy.
+  - **No re-enrollment, and no credential or key change.** Conversation keys and
+    enrolled credentials are stored per `(tenant, accountId)` and peer id, never
+    per session key, so they are unaffected. Browsers reconnect and register
+    normally; a fresh conversation simply starts under the new key.
+  - This applies to single-tenant deployments too, including any that never set
+    `tenant` and use the `default-tenant` fallback. Preserving those keys by
+    omitting the component for the default tenant was considered and rejected:
+    every deployment that *had* configured a tenant — the entire population the
+    bug can affect — breaks either way, so the exception would buy no security
+    and would leave a confidentiality boundary conditional on a magic value.
 - **Protocol v2:** authenticated register requests require v2 and bounded
   retained-work overload uses `inbound_rejected`; client and plugin must upgrade
   together.

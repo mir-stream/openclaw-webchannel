@@ -74,8 +74,44 @@ walkthrough (real browser on the Mac ↔ agent in a container over the LAN), see
 ```bash
 npm install
 npm run typecheck     # all workspaces
-npm test              # 731 tests (component/unit level — see STATUS.md on coverage gaps)
+npm test              # component/unit level — see STATUS.md on coverage gaps
 ```
+
+The CI gate additionally checks that no test file lost tests, by comparing the
+collected count per file against `.github/test-inventory.json`. Any change to
+the test count — adding, removing or moving tests — makes it red until you
+regenerate and commit the snapshot:
+
+```bash
+npm run test:inventory         # what the gate checks
+npm run test:inventory:update  # regenerate after adding or moving tests
+```
+
+**If you deleted tests**, `:update` refuses rather than quietly shrinking the
+snapshot, because the usual cause of a shrink is a missing `nats-server` rather
+than a real deletion. Confirm the deletion explicitly:
+
+```bash
+npm run test:inventory:update -- --accept-deletions
+```
+
+Only a **net** loss normally needs that flag: moving tests between files leaves
+the total unchanged and goes through without it (the affected files are still
+printed). The fail-closed exception is either of the two `nats-server`
+real-server files disappearing from the inventory: that needs explicit
+acceptance even when new tests elsewhere offset the loss, because a missing
+`nats-server` produces the same misleading count-neutral result.
+
+Both commands need `nats-server` — on `PATH`, or in `/usr/local/bin`,
+`/usr/bin` or `/opt/homebrew/bin`, which the suites probe unconditionally. It is
+not an npm dependency; CI installs it via
+[`.github/actions/install-nats-server`](.github/actions/install-nats-server).
+Without it the real-server suites do not collect, so on a dev box the check
+reports them as deleted (−23) and `:update` refuses; with `CI=true` set they
+throw at import instead and collection fails outright.
+
+The snapshot covers everything the root vitest sweep collects; `examples/**` is
+excluded from that sweep and is guarded only by each example's own `npm test`.
 
 ## License
 

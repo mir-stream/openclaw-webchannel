@@ -2,7 +2,14 @@
 # e2e-gate.yml — Single blocking CI gate for openclaw-webchannel Phase B.
 #
 # Enforces:
-#  - All pre-existing test suites stay green (≥1465 test baseline across 3 pkgs)
+#  - All pre-existing test suites stay green, and none of them QUIETLY VANISH:
+#    every file the ROOT VITEST SWEEP collects (packages/*/src/**, demo/**,
+#    e2e/*.test.ts) must match its count in .github/test-inventory.json exactly
+#    (see step 7 — the old "≥1465" constant could not fail).
+#    NOT covered by that count: examples/** — vitest.config.ts excludes it, so
+#    the four consumer suites are guarded only by the "Examples consumer tests"
+#    step's own `node` runner, which has no count floor. Emptying those files is
+#    green today.
 #  - 3-package typecheck passes clean
 #  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
 #  - The register-hop (enrolled-JWT) admission path is covered end-to-end
@@ -62,10 +69,16 @@ jobs:
       #      - packages/plugin/src/nats-transport-realserver.test.ts
       #      - packages/saas/src/nats-permissions-realserver.test.ts
       #      - packages/saas/src/ac6-device-flow-e2e.test.ts
-      #    Without this binary the real-server suites HARD FAIL (not skip).
+      #    Without this binary, under CI=true the first two THROW at module top
+      #    level — a hard fail, not a skip, and one that also fails collection in
+      #    step 7. The third (ac6) is NOT hard-failing: it warns "nats-server not
+      #    available" and returns early, passing vacuously (issue #133).
       #    The pinned version + cache key live in the composite action
       #    (.github/actions/install-nats-server) — the single source of truth
-      #    shared with publish.yml; the action also verifies it is on PATH.
+      #    shared with publish.yml. It installs under $RUNNER_TOOL_CACHE and
+      #    exports that dir via $GITHUB_PATH (PR #50; it is NOT /usr/local/bin),
+      #    which is why every later step — the run AND step 7's collection —
+      #    resolves the binary identically.
       # ──────────────────────────────────────────────────────────────────────
       - name: Install nats-server (pinned, cached)
         uses: ./.github/actions/install-nats-server
@@ -164,49 +177,98 @@ jobs:
           npm test --workspace=examples/webchannel-app
 
       # ──────────────────────────────────────────────────────────────────────
-      # 6. Run all test suites with JSON output for baseline verification
-      #    - Baseline: ≥1465 tests across all packages
-      #    - Real-server suites (skipIf removed in CI) now run against the
-      #      real nats-server binary installed in step 3.
-      #    - Sub-AC 1: e2e/dev-nats-roundtrip.test.ts — open-NATS E2E gate
-      #    - Sub-AC 2: e2e/enrolled-jwt-roundtrip.test.ts — enrolled-JWT E2E gate
-      #      (both drive real headless Chromium via playwright-core installed above)
+      # 6. Run all test suites. This step owns FAILURES; step 7 owns DELETIONS,
+      #    and the two are independent — step 7 collects the suite itself rather
+      #    than reading a count this step produces, because a run COUNT is
+      #    unusable as a gate (see step 7 on the runtime self-skips).
+      #
+      #    DO NOT NARROW THIS COMMAND. Its scope is what decides how much of the
+      #    suite actually executes, and nothing else in the gate depends on it:
+      #    add a path, --project, --shard or --changed and this step still exits
+      #    0 while thousands of tests never run. The --scope assertion below is
+      #    the guard — it holds the run to the file list in the inventory, and
+      #    it lives INSIDE this step so it cannot be separated from the command
+      #    it constrains. It compares file paths only, never counts, so the
+      #    runtime self-skips cannot flake it.
+      #    One hole it cannot close: anything that filters by test NAME or swaps
+      #    the config — `-t <pattern>`, `--config <other>`, or a config-level
+      #    `test.testNamePattern`. Vitest reports filtered-out tests as pending in
+      #    files that still APPEAR in the report, so a name filter is
+      #    indistinguishable from a runtime skip by any measure that tolerates the
+      #    flake, and a swapped config takes step 7's collection with it. Step 7
+      #    collects with the default config, so it cannot see either. Add none of
+      #    them here.
+      #
+      #    - Real-server suites run against the real nats-server from step 3:
+      #      their `skipIf(!NATS_SERVER_BIN)` is SATISFIED (the binary is found),
+      #      not removed — and under CI=true its absence throws instead.
+      #    - The browser-driven roundtrips are NOT in this sweep; they are the
+      #      live-e2e harness steps (8c-8g) below.
       # ──────────────────────────────────────────────────────────────────────
       - name: Run full test suite
-        run: npx vitest run --reporter=default --reporter=json --outputFile=/tmp/vitest-results.json
+        run: |
+          rm -f "$VITEST_RESULTS"
+          npx vitest run --reporter=default --reporter=json --outputFile="$VITEST_RESULTS"
+          node scripts/check-test-inventory.mjs --scope "$VITEST_RESULTS"
         env:
-          # Ensure real-server suites see the binary at /usr/local/bin/nats-server
-          # The test files probe NATS_SERVER_CANDIDATES which includes this path.
+          VITEST_RESULTS: ${{ runner.temp }}/vitest-results.json
+          # CI=true turns a missing nats-server into a hard throw in the two
+          # realserver suites instead of a silent skip. The binary itself is found
+          # via $GITHUB_PATH from step 3 — NATS_SERVER_CANDIDATES probes PATH plus
+          # /usr/local/bin, /usr/bin and /opt/homebrew/bin.
           CI: "true"
 
       # ──────────────────────────────────────────────────────────────────────
-      # 7. Verify test count meets baseline (≥1465 tests passed)
-      #    Fails the gate if the count regresses below the seed-time baseline.
+      # 7. Verify no test disappeared — per-file inventory, exact match.
+      #
+      #    This step used to assert `numPassedTests >= 1465`, a seed-time
+      #    constant nobody ever revisited. The suite has since grown to nearly
+      #    double that, so the assertion became unfailable: whole packages could
+      #    be deleted and it would still print "Baseline check passed". It sat
+      #    green and useless for a month. Bumping the number would only restart
+      #    that clock, so the expectation now lives in a COMMITTED per-file
+      #    snapshot (.github/test-inventory.json) compared EXACTLY, both ways:
+      #      - a file with fewer collected tests (or gone)  → REGRESSION, red
+      #      - a file with more, or a brand-new file        → DRIFT, red
+      #    Growth failing is the anti-rot mechanism: the first PR that adds a
+      #    test must regenerate the snapshot (`npm run test:inventory:update`),
+      #    so the snapshot can never quietly fall behind the suite, and every
+      #    deletion lands in review as an explicit negative diff.
+      #
+      #    Skipped tests count for nobody: `.skip`/`.todo`-ing a test reads as a
+      #    count drop and fails here, because `vitest list` omits them. A dormant
+      #    `skipIf` real-server suite is red too, but by a different route in this
+      #    job than on a dev box: here CI=true makes both realserver files throw at
+      #    module top level, so collection FAILS ("'vitest list' exited 1"); with
+      #    CI unset `skipIf` merely drops them and it is a count drop (-23).
+      #
+      #    It counts what `vitest list` COLLECTS, never what a run reported.
+      #    Three suites self-skip at runtime on environment noise: the port-scan
+      #    pair in nats-transport.test.ts, the listen(2)/EPERM path in
+      #    p1-1-http-ui-contract.test.ts, and ac6-device-flow-e2e.test.ts, which
+      #    warns and returns early — passing VACUOUSLY rather than skipping
+      #    (issue #133). All three are unobserved by this check, by design. Counting what ran would let that
+      #    noise print "tests disappeared" on a good tree — and the fix that
+      #    message prints could not clear it, because regenerating collects
+      #    statically. The only way out would be committing the flake-lowered
+      #    number, which would then make deleting those tests green forever.
+      #    Collection sees no runtime skips, so the guard cannot be flaked into
+      #    being disarmed. It is the same `npm run test:inventory` a developer
+      #    runs locally — a green local check IS this gate, not an approximation.
+      #
+      #    Three things it cannot see, stated so nobody assumes otherwise:
+      #    a test replaced in-place by a vacuous one (nothing count-based can —
+      #    that is review's job); a collected test that self-skips at runtime
+      #    (deliberate, above); and examples/**, which vitest.config.ts excludes
+      #    from the sweep and the "Examples consumer tests" step runs without any
+      #    count floor.
+      #
+      #    Costs one collection pass — ~25s measured, no test body, no hook, no
+      #    listener — and needs nats-server from step 3 on PATH, as the run does.
       # ──────────────────────────────────────────────────────────────────────
-      - name: Verify test baseline (≥1465 tests)
+      - name: Verify test inventory (no test silently deleted or skipped)
         if: always()
-        run: |
-          set -euo pipefail
-          node - << 'EOF'
-          const fs = require('fs');
-          const BASELINE = 1465;
-          let data;
-          try {
-            data = JSON.parse(fs.readFileSync('/tmp/vitest-results.json', 'utf8'));
-          } catch (e) {
-            console.error('FATAL: Could not read vitest results JSON:', e.message);
-            process.exit(1);
-          }
-          const passed = data.numPassedTests ?? 0;
-          const total  = data.numTotalTests  ?? 0;
-          const skipped = data.numSkippedTests ?? 0;
-          console.log(`Test results: ${passed} passed / ${total} total / ${skipped} skipped`);
-          if (passed < BASELINE) {
-            console.error(`FATAL: ${passed} passing tests < ${BASELINE} baseline. Regression detected.`);
-            process.exit(1);
-          }
-          console.log(`Baseline check passed: ${passed} >= ${BASELINE}`);
-          EOF
+        run: npm run test:inventory
 
       # ──────────────────────────────────────────────────────────────────────
       # 8c. Live e2e: enrolled-NATS-transport (device-flow)

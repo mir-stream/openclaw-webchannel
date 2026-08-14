@@ -396,6 +396,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
     // registers, so nothing is lost.
     const sendHistorySnapshot = (
       accountId: string,
+      servingTenant: string,
       channel: NatsChannel,
       historyConfig: ReturnType<typeof resolveHistoryConfig>,
       peerId: string,
@@ -403,7 +404,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       try {
         // Same forced per-account-channel-peer key as the inbound WRITE site —
         // so the snapshot reads THIS user's session, never the shared "main" one.
-        const route = resolveWebchannelSessionRoute(api, accountId, peerId);
+        const route = resolveWebchannelSessionRoute(
+          api,
+          accountId,
+          peerId,
+          servingTenant,
+        );
         void runDetachedHistoryRead(() =>
           historyRecent(api, route.sessionKey, historyConfig.limit, api.logger),
         )
@@ -916,6 +922,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               peerId,
               message,
               accountId,
+              tenant,
             ),
           {
             // P1-8b layer (b): busy-time coalesce. A message that arrives while a
@@ -1140,6 +1147,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             peerId,
             message,
             accountId,
+            tenant,
             { controlLane: true },
           ).catch((err) =>
             api.logger?.error?.(
@@ -1209,7 +1217,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
         try {
           // Same forced key as the WRITE + snapshot sites — pagination reads
           // THIS user's session, so older pages never leak another user's turns.
-          const route = resolveWebchannelSessionRoute(api, accountId, peerId);
+          const route = resolveWebchannelSessionRoute(api, accountId, peerId, tenant);
           // `planHistoryFetch` validates the wire `limit` (the NATS dispatch
           // forwards it unvalidated) and picks paginate-vs-tail from `before`.
           const plan = planHistoryFetch(request, historyConfig.pageSize);
@@ -1305,7 +1313,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               registerChannel.wrapConversationKeyForDevice(pid, key, clientNonce),
             unregisterPeer: (pid) => registerChannel.unregisterPeer(pid),
             sendHistorySnapshot: (pid) =>
-              sendHistorySnapshot(accountId, channel, historyConfig, pid),
+              sendHistorySnapshot(accountId, tenant, channel, historyConfig, pid),
             // #15/#19: authoritative pending-approval snapshot PLUS recently-
             // resolved outcomes. BOTH store reads and the publish MUST be
             // synchronous — one event-loop turn, NO await/.then() between them (do
