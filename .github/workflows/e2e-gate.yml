@@ -6,10 +6,10 @@
 #    every file the ROOT VITEST SWEEP collects (packages/*/src/**, demo/**,
 #    e2e/*.test.ts) must match its count in .github/test-inventory.json exactly
 #    (see step 7 — the old "≥1465" constant could not fail).
-#    NOT covered by that count: examples/** — vitest.config.ts excludes it, so
-#    the four consumer suites are guarded only by the "Examples consumer tests"
-#    step's own `node` runner, which has no count floor. Emptying those files is
-#    green today.
+#    examples/** remains outside that count because it exercises packed public
+#    entries with Node resolution semantics. Each of its four consumer files is
+#    run separately under node:test with a zero-registration guard, so an empty
+#    file cannot inherit Node's successful file-level wrapper result.
 #  - 3-package typecheck passes clean
 #  - Real nats-server v2.14 installed so real-server suites run (not silently skipped)
 #  - The register-hop (enrolled-JWT) admission path is covered end-to-end
@@ -132,7 +132,7 @@ jobs:
 
       # ──────────────────────────────────────────────────────────────────────
       # 5b. Build the publishable packages (dist/) and run the examples'
-      #     CONSUMER tests with their own runner (plain node, node:test/TAP).
+      #     CONSUMER tests with their own node:test/TAP runner.
       #     They import @mir-stream/* by package ENTRY (main/exports → dist/),
       #     exactly like a downstream consumer — no dist ⇒ no resolve. They are
       #     deliberately EXCLUDED from the root vitest sweep (vitest.config.ts):
@@ -190,14 +190,11 @@ jobs:
       #    it lives INSIDE this step so it cannot be separated from the command
       #    it constrains. It compares file paths only, never counts, so the
       #    runtime self-skips cannot flake it.
-      #    One hole it cannot close: anything that filters by test NAME or swaps
-      #    the config — `-t <pattern>`, `--config <other>`, or a config-level
-      #    `test.testNamePattern`. Vitest reports filtered-out tests as pending in
-      #    files that still APPEAR in the report, so a name filter is
-      #    indistinguishable from a runtime skip by any measure that tolerates the
-      #    flake, and a swapped config takes step 7's collection with it. Step 7
-      #    collects with the default config, so it cannot see either. Add none of
-      #    them here.
+      #    The path-only scope assertion cannot itself see a test-name filter,
+      #    but step 6b compares completed counts and makes filtered assertions
+      #    red outside its two explicit width-2 flake budgets. A swapped/narrowed
+      #    config likewise leaves missing or under-completed inventory files.
+      #    Add none of those filters here.
       #
       #    - Real-server suites run against the real nats-server from step 3:
       #      their `skipIf(!NATS_SERVER_BIN)` is SATISFIED (the binary is found),
@@ -217,6 +214,24 @@ jobs:
           # via $GITHUB_PATH from step 3 — NATS_SERVER_CANDIDATES probes PATH plus
           # /usr/local/bin, /usr/bin and /opt/homebrew/bin.
           CI: "true"
+
+      # ──────────────────────────────────────────────────────────────────────
+      # 6b. Bound runtime self-skips independently from collection inventory.
+      #
+      #     The report is compared file-by-file with the collected snapshot:
+      #     collected minus passed/failed is the runtime skip count. Static
+      #     .skip/.todo entries do not inflate it because they were never in the
+      #     collected count. Unlisted files allow zero; the two noisy files and
+      #     their width-2 budgets are committed in
+      #     .github/runtime-skip-allowances.json. The checker also requires each
+      #     allowance's ctx.skip source sites to remain live, forcing obsolete
+      #     exceptions to be removed.
+      # ──────────────────────────────────────────────────────────────────────
+      - name: Verify runtime skip budgets (unlisted files allow zero)
+        if: always()
+        run: npm run test:runtime-skips -- "$VITEST_RESULTS"
+        env:
+          VITEST_RESULTS: ${{ runner.temp }}/vitest-results.json
 
       # ──────────────────────────────────────────────────────────────────────
       # 7. Verify no test disappeared — per-file inventory, exact match.
@@ -256,12 +271,11 @@ jobs:
       #    being disarmed. It is the same `npm run test:inventory` a developer
       #    runs locally — a green local check IS this gate, not an approximation.
       #
-      #    Three things it cannot see, stated so nobody assumes otherwise:
-      #    a test replaced in-place by a vacuous one (nothing count-based can —
-      #    that is review's job); a collected test that self-skips at runtime
-      #    (deliberate, above); and examples/**, which vitest.config.ts excludes
-      #    from the sweep and the "Examples consumer tests" step runs without any
-      #    count floor.
+      #    Three things this COLLECTION step cannot see, stated so nobody assumes
+      #    otherwise: a test replaced in-place by a vacuous one (nothing
+      #    count-based can — that is review's job); a collected test that
+      #    self-skips at runtime (step 6b bounds it); and examples/**, whose
+      #    node:test zero-registration guard lives in the consumer step.
       #
       #    Costs one collection pass — ~25s measured, no test body, no hook, no
       #    listener — and needs nats-server from step 3 on PATH, as the run does.
