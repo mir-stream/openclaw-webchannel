@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { sanitizeAssistantVisibleStreamText } from "openclaw/plugin-sdk/agent-runtime";
 import { sanitizeAssistantVisibleText } from "openclaw/plugin-sdk/text-chunking";
 
 import { createClawMessageAdapter, createProgressDraftController, createReasoningDraftController } from "./message-adapter.js";
@@ -144,6 +145,18 @@ function pinnedCoreDistinctPartials(source: string): string[] {
     if (sanitized === previous) continue;
     previous = sanitized;
     // Pinned core suppresses empty partial callbacks after sanitization.
+    if (sanitized) outputs.push(sanitized);
+  }
+  return outputs;
+}
+
+function pinnedStreamDistinctPartials(source: string): string[] {
+  const outputs: string[] = [];
+  let previous: string | undefined;
+  for (const prefix of cumulativePrefixes(source)) {
+    const sanitized = sanitizeAssistantVisibleStreamText(prefix);
+    if (sanitized === previous) continue;
+    previous = sanitized;
     if (sanitized) outputs.push(sanitized);
   }
   return outputs;
@@ -2401,7 +2414,6 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
 
     for (const source of [
       "<relevant_memoriesX>",
-      "<relevant_memories<",
       'Use `<relevant_memories>x</relevant_memories>` literally',
     ]) {
       expect(sanitizeAssistantVisibleText(source)).toBe(source);
@@ -2417,6 +2429,8 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
 
     for (const [observed, completed] of [
       ["<relevant_mem", "<relevant_memories>x</relevant_memories>"],
+      ["<relevant_memories<", "<relevant_memories<|x|>>secret"],
+      ["<relevant_memories a=<", "<relevant_memories a=<|x|>>secret"],
       [
         "<parameter><relevant_mem",
         "<parameter><relevant_memories>x</relevant_memories></parameter>",
@@ -2504,7 +2518,9 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
       await h.draft.drain();
       const expected = sanitizeAssistantVisibleText(source);
-      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual(
+      expect(
+        h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+      ).toEqual(
         expected ? [expected] : [],
       );
       expect(successfulIds(h.frames)).toHaveLength(expected ? 1 : 0);
@@ -2575,6 +2591,419 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(coalesced.frames).toEqual([]);
   });
 
+  it("M7l23: actual stream-only bracket and emoji scaffolding never becomes a bubble", async () => {
+    const hiddenTraceSources = new Set([
+      "🛠️ Exec: ls",
+      "🛠️ run",
+      "🛠️ ` ls",
+      "🛠️ ``bash",
+      "🛠️ elevated · run",
+      "🛠️ pty, bash",
+      "🛠️ elevated, pty · run",
+      "> 🛠️ elevated · run",
+      "⚠️ 🛠️ task (agent) failed",
+      "> ⚠️ 🛠️ task (agent) failed",
+    ]);
+    for (const source of [
+      "[Tool Call: bash]",
+      "[Historical context:x]\n",
+      '[TOOL_CALL] tool => "bash" args => {}',
+      '[TOOL_CALL] garbage `[/TOOL_CALL]` tool => "bash" args => {}',
+      '[TOOL_CALL] garbage `[/TOOL_CALL]` tool => "bash" args => {}[/TOOL_CALL]',
+      '[TOOL_RESULT] garbage `[/TOOL_RESULT]` result => x',
+      '[TOOL_RESULT] garbage `[/TOOL_RESULT]` result => x[/TOOL_RESULT]',
+      '[bash]\n{"x":1}[/bash]',
+      "[tool:bash]<parameter=x>y</parameter>",
+      ...hiddenTraceSources,
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe("");
+      const hidden = makeDraftHarness();
+      hidden.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(source)) {
+        hidden.draft.pushAnswerText({ text });
+        if (hiddenTraceSources.has(source)) await hidden.draft.flush();
+      }
+      await hidden.draft.drain();
+      expect(hidden.frames).toEqual([]);
+    }
+
+    const visible = "Hello\n🛠️ Exec: ls\nthere";
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedStreamDistinctPartials(visible)) {
+      h.draft.pushAnswerText({ text });
+    }
+    await h.draft.drain();
+    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      sanitizeAssistantVisibleStreamText(visible),
+    ]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+
+    for (const source of [
+      "⚠️ 🛠️ hello\nAnswer",
+      "🛠️ elevated · runx\nAnswer",
+      "🛠️ elevated x\nAnswer",
+      "> ⚠️ 🛠️ hello\nAnswer",
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+      const literal = makeDraftHarness();
+      literal.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(source)) {
+        literal.draft.pushAnswerText({ text });
+        await literal.draft.flush();
+      }
+      await literal.draft.drain();
+      expect(
+        literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+      ).toEqual([source]);
+      expect(successfulIds(literal.frames)).toHaveLength(1);
+      expect(literal.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+    }
+
+    for (const source of [
+      'Use `[TOOL_CALL] tool => "bash" args => {}[/TOOL_CALL] after` literally',
+      'Use `[TOOL_RESULT] result => "ok"[/TOOL_RESULT] after` literally',
+      'Use `<tool_call>{"x":1}</tool_call> after` literally',
+      'Use ```<tool_call>{"x":1}</tool_call> after` literally',
+      'Use `<relevant_memories>secret</relevant_memories> after` literally',
+      'Use `<invoke>x</invoke><minimax:tool_call> after` literally',
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+      const code = makeDraftHarness();
+      code.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(source)) {
+        code.draft.pushAnswerText({ text });
+      }
+      await code.draft.drain();
+      expect(code.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+        source,
+      ]);
+      expect(successfulIds(code.frames)).toHaveLength(1);
+      expect(code.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+    }
+
+    const nonCodeSource =
+      'Before [TOOL_CALL] tool => "bash" args => {}[/TOOL_CALL] after';
+    const nonCodeExpected = sanitizeAssistantVisibleStreamText(nonCodeSource);
+    const nonCode = makeDraftHarness();
+    nonCode.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedStreamDistinctPartials(nonCodeSource)) {
+      nonCode.draft.pushAnswerText({ text });
+    }
+    await nonCode.draft.drain();
+    expect(nonCode.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      nonCodeExpected,
+    ]);
+    expect(successfulIds(nonCode.frames)).toHaveLength(1);
+    expect(nonCode.frames.every((frame) => nonCodeExpected.startsWith(frame.text))).toBe(true);
+
+    const largeXmlObserved = `[tool:bash]<parameter=x>${"a".repeat(256e3)}`;
+    const largeXmlCompleted = `${largeXmlObserved}</parameter>`;
+    expect(sanitizeAssistantVisibleStreamText(largeXmlObserved)).toBe(largeXmlObserved);
+    expect(sanitizeAssistantVisibleStreamText(largeXmlCompleted)).toBe("");
+    const largeXml = makeDraftHarness();
+    largeXml.draft.handleAssistantMessageBoundary();
+    largeXml.draft.pushAnswerText({ text: largeXmlObserved });
+    await largeXml.draft.drain();
+    expect(largeXml.frames).toEqual([]);
+
+    for (const source of [
+      "[tool:bash]<parameter=x>y</parameter><parameter=>literal",
+      "[tool:bash]<parameter=x>y</parameter> literal",
+    ]) {
+      const expected = sanitizeAssistantVisibleStreamText(source);
+      expect(expected).not.toBe("");
+      const suffix = makeDraftHarness();
+      suffix.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(source)) {
+        suffix.draft.pushAnswerText({ text });
+      }
+      await suffix.draft.drain();
+      expect(suffix.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+        expected,
+      ]);
+      expect(successfulIds(suffix.frames)).toHaveLength(1);
+      expect(suffix.frames.every((frame) => expected.startsWith(frame.text))).toBe(true);
+    }
+  });
+
+  it("M7l24: model-token deletion composes with every later assistant sanitizer family", async () => {
+    const pairs = [
+      ["<relevant_memories a=<|x|", "<relevant_memories a=<|x|>>secret"],
+      ['<tool_call a=<|x|', '<tool_call a=<|x|>>{"x":1}</tool_call>'],
+      ["<tool_call><|x|", '<tool_call><|x|>{"x":1}</tool_call>'],
+      [
+        '<function name="bash"><|x|',
+        '<function name="bash"><|x|>{"x":1}</function>',
+      ],
+      ["🛠️ Exec<|x|", "🛠️ Exec<|x|>: ls"],
+      [
+        "[TOOL_CALL] <|x|",
+        '[TOOL_CALL] <|x|>tool => "bash" args => {}',
+      ],
+      ["[bash]\n<|x|", '[bash]\n<|x|>{"x":1}[/bash]'],
+      ["[Tool Call: bash<|x|", "[Tool Call: bash<|x|>]"],
+      ["[Historical context:<|x|", "[Historical context:<|x|>]\n"],
+      ["<final <|x|", "<final <|x|>>secret</final>"],
+    ] as const;
+
+    for (const [observed, completed] of pairs) {
+      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
+      const expected = sanitizeAssistantVisibleStreamText(completed);
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(completed)) {
+        h.draft.pushAnswerText({ text });
+      }
+      await h.draft.drain();
+      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual(
+        expected ? [expected] : [],
+      );
+      expect(successfulIds(h.frames), observed).toHaveLength(expected ? 1 : 0);
+      if (expected) {
+        expect(h.frames.every((frame) => expected.startsWith(frame.text)), observed).toBe(true);
+      }
+    }
+
+    for (const observed of [
+      "tool <|x|",
+      "analysis to=bash code<|x|",
+      "<thinking <|x|",
+    ]) {
+      const counterfactual = makeDraftHarness();
+      counterfactual.draft.handleAssistantMessageBoundary();
+      counterfactual.draft.pushAnswerText({ text: observed });
+      await counterfactual.draft.drain();
+      expect(counterfactual.frames, observed).toEqual([]);
+    }
+
+    const completed = "Answer <relevant_memories a=<|x|>>secret";
+    const visible = makeDraftHarness();
+    visible.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedStreamDistinctPartials(completed)) {
+      visible.draft.pushAnswerText({ text });
+    }
+    await visible.draft.drain();
+    expect(visible.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      "Answer",
+    ]);
+    expect(successfulIds(visible.frames)).toHaveLength(1);
+  });
+
+  it("M7l25: same-pass substages and the second pass keep the outer anchor", async () => {
+    for (const [observed, completed] of [
+      [
+        "<tool_[Tool Call:x",
+        '<tool_[Tool Call:x]call>{"x":1}</tool_call>',
+      ],
+      [
+        "[bash]\n[Tool Call:x",
+        '[bash]\n[Tool Call:x]{"x":1}[/bash]',
+      ],
+      [
+        "<param<tool_call",
+        '<param<tool_call>{"x":1}</tool_call>eter>x</parameter>',
+      ],
+    ] as const) {
+      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
+      const expected = sanitizeAssistantVisibleStreamText(completed);
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(completed)) {
+        h.draft.pushAnswerText({ text });
+      }
+      await h.draft.drain();
+      expect(
+        h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+        observed,
+      ).toEqual(
+        expected ? [expected] : [],
+      );
+      expect(successfulIds(h.frames), observed).toHaveLength(expected ? 1 : 0);
+      if (expected) {
+        expect(h.frames.every((frame) => expected.startsWith(frame.text)), observed).toBe(true);
+      }
+    }
+
+    // This public-helper cascade is upstream-preprocessed by stripBlockTags in
+    // the real stream path. Keep the same-substage classifier assertion, but
+    // do not replay helper-only intermediate `<thinking>` bodies as callbacks.
+    const reasoningObserved = "<think<final";
+    const reasoningCompleted = "<think<final></final>ing>secret</thinking>";
+    expect(sanitizeAssistantVisibleStreamText(reasoningObserved)).toBe(reasoningObserved);
+    expect(sanitizeAssistantVisibleStreamText(reasoningCompleted)).toBe("");
+    const reasoning = makeDraftHarness();
+    reasoning.draft.handleAssistantMessageBoundary();
+    reasoning.draft.pushAnswerText({ text: reasoningObserved });
+    await reasoning.draft.drain();
+    expect(reasoning.frames).toEqual([]);
+
+    for (const [source, expected] of [
+      ['<tool_<parameter></parameter>call>{"x":1}</tool_call>', ""],
+      [
+        '<tool_<parameter>x</parameter>call>{"x":1}</tool_call>',
+        '<tool_xcall>{"x":1}',
+      ],
+      [
+        '<tool_<invoke attr>x</invoke><minimax:tool_call>call>{"x":1}</tool_call>',
+        "",
+      ],
+      [
+        '<tool_<invoke attr>x</invoke>calligraphy>{"x":1}',
+        '<tool_<invoke attr>x</invoke>calligraphy>{"x":1}',
+      ],
+      [
+        'analysis to=bash code<|x|>{"x":bad',
+        'analysis to=bash code {"x":bad',
+      ],
+    ] as const) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe(expected);
+      const staged = makeDraftHarness();
+      staged.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(source)) {
+        staged.draft.pushAnswerText({ text });
+      }
+      await staged.draft.drain();
+      expect(
+        staged.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+        source,
+      ).toEqual(expected ? [expected] : []);
+      expect(successfulIds(staged.frames), source).toHaveLength(expected ? 1 : 0);
+      if (expected) {
+        expect(staged.frames.every((frame) => expected.startsWith(frame.text)), source).toBe(
+          true,
+        );
+      }
+    }
+
+    const invokeObserved =
+      '<tool_<invoke attr>x</invoke>call>{"x":1}</tool_call>';
+    const invokeCompleted = `${invokeObserved}<minimax:tool_call>`;
+    expect(sanitizeAssistantVisibleStreamText(invokeObserved)).toBe(
+      '<tool_<invoke attr>x</invoke>call>{"x":1}',
+    );
+    expect(sanitizeAssistantVisibleStreamText(invokeCompleted)).toBe("");
+    const coalescedInvoke = makeDraftHarness();
+    coalescedInvoke.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedStreamDistinctPartials(invokeObserved)) {
+      coalescedInvoke.draft.pushAnswerText({ text });
+    }
+    // A later one-chunk gate completion retracts to suppressed empty, so the
+    // observed control-looking outer suffix cannot be terminal-restored.
+    await coalescedInvoke.draft.drain();
+    expect(coalescedInvoke.frames).toEqual([]);
+  });
+
+  it("M7l26: punctuation-delimited user-facing sentinels defer but malformed literals release", async () => {
+    for (const [observed, completed] of [
+      [
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONT",
+        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nx\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
+      ],
+      ["[tool calls omitted", "[tool calls omitted]"],
+    ] as const) {
+      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
+      expect(sanitizeAssistantVisibleStreamText(completed)).toBe("");
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: observed });
+      await h.draft.drain();
+      expect(h.frames).toEqual([]);
+    }
+
+    for (const source of [
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXTX>>>",
+      "[tool calls omitted x]",
+      "analysis",
+      "final",
+      "commentary",
+      "tool",
+      "tool call",
+      "function call",
+      "`🛠️ Exec: ls`",
+      "Use `<relevant_memories a=<|x|>>secret` literally",
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+      const literal = makeDraftHarness();
+      literal.draft.handleAssistantMessageBoundary();
+      literal.draft.pushAnswerText({ text: source });
+      await literal.draft.drain();
+      expect(literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+        source,
+      ]);
+    }
+
+    for (const invalidJson of ["[bash]\n{bad", '[bash]\n{"x":bad']) {
+      expect(sanitizeAssistantVisibleStreamText(invalidJson)).toBe(invalidJson);
+      const released = makeDraftHarness();
+      released.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(invalidJson)) {
+        released.draft.pushAnswerText({ text });
+      }
+      await released.draft.drain();
+      expect(released.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+        invalidJson,
+      ]);
+      expect(successfulIds(released.frames)).toHaveLength(1);
+    }
+
+    for (const source of [
+      "🛠️ Exec\nAnswer",
+      "🛠️ ru\nAnswer",
+      "[tool calls omitted\nAnswer",
+      '[bash]\n{"x":1}[/other]',
+      "[bash]\n<parameter=x>y</parameter>",
+      "<function=bash><parameter=x>y</parameter>",
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+      const literalLine = makeDraftHarness();
+      literalLine.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(source)) {
+        literalLine.draft.pushAnswerText({ text });
+      }
+      await literalLine.draft.drain();
+      expect(literalLine.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+        source,
+      ]);
+      expect(successfulIds(literalLine.frames)).toHaveLength(1);
+    }
+
+    const overLimitJson = `[bash]\n{"x":"${"a".repeat(256e3)}"}[/bash]`;
+    expect(sanitizeAssistantVisibleStreamText(overLimitJson)).toBe(overLimitJson);
+    const overLimit = makeDraftHarness();
+    overLimit.draft.handleAssistantMessageBoundary();
+    overLimit.draft.pushAnswerText({ text: overLimitJson });
+    await overLimit.draft.drain();
+    expect(overLimit.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      overLimitJson,
+    ]);
+    expect(successfulIds(overLimit.frames)).toHaveLength(1);
+
+    for (const [observed, completed] of [
+      ["[hello]", '[hello]\n{"x":1}[/hello]'],
+      ["[bash]\n{\"x\":", '[bash]\n{"x":1}[/bash]'],
+      [
+        "[TOOL_CALL] garbage",
+        '[TOOL_CALL] garbage tool => "bash" args => {}',
+      ],
+      [
+        "[TOOL_CALL] tool => x args => {}",
+        '[TOOL_CALL] tool => x args => {} tool => "bash" args => {}',
+      ],
+      ["<invoke attr>literal", "<invoke attr>literal</invoke><minimax:tool_call>"],
+    ] as const) {
+      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
+      expect(sanitizeAssistantVisibleStreamText(completed)).toBe("");
+      const ambiguous = makeDraftHarness();
+      ambiguous.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(observed)) {
+        ambiguous.draft.pushAnswerText({ text });
+      }
+      await ambiguous.draft.drain();
+      expect(ambiguous.frames, observed).toEqual([]);
+    }
+  });
+
   it("M7l21: core-marker scanning grows linearly for repeated invalid opens and closes", async () => {
     const nativeIndexOf = String.prototype.indexOf;
     const measureExactSourceScans = async (source: string): Promise<number> => {
@@ -2611,6 +3040,155 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       expect(largeScans).toBeLessThanOrEqual(largeN * 2 + 20);
       expect(largeScans).toBeLessThanOrEqual(smallScans * 5 + 20);
     }
+
+    const nativeSlice = String.prototype.slice;
+    const measureComposedOperations = (
+      n: number,
+      repeated: string,
+      tail: string,
+    ): number => {
+      const source = "PERF\n" + repeated.repeat(n) + tail;
+      let operations = 0;
+      const indexOf = vi
+        .spyOn(String.prototype, "indexOf")
+        .mockImplementation(function (this: string, search: string, position?: number) {
+          if (String(this).startsWith("PERF\n") && ["<", "[", "\n"].includes(search)) {
+            operations += 1;
+          }
+          return nativeIndexOf.call(this, search, position);
+        });
+      const slice = vi
+        .spyOn(String.prototype, "slice")
+        .mockImplementation(function (this: string, start?: number, end?: number) {
+          if (String(this).startsWith("PERF\n")) operations += 1;
+          return nativeSlice.call(this, start, end);
+        });
+      try {
+        const h = makeDraftHarness();
+        h.draft.handleAssistantMessageBoundary();
+        h.draft.pushAnswerText({ text: source });
+      } finally {
+        slice.mockRestore();
+        indexOf.mockRestore();
+      }
+      return operations;
+    };
+
+    for (const [repeated, tail] of [
+      [
+        "[TOOL_CALL] garbage ",
+        "[/TOOL_CALL]\n<relevant_memories a=<|x|",
+      ],
+      ["<thinkx literal\n", "<relevant_memories a=<|x|"],
+    ] as const) {
+      const smallOperations = measureComposedOperations(128, repeated, tail);
+      const largeOperations = measureComposedOperations(512, repeated, tail);
+      expect(largeOperations).toBeLessThanOrEqual(smallOperations * 5 + 100);
+    }
+
+    const measureInlineRestorationSliceWork = async (
+      n: number,
+    ): Promise<{ copiedCharacters: number; sourceLength: number }> => {
+      const source = `B ${"`<tool_call>` ".repeat(n)}`;
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      h.draft.pushAnswerText({ text: "A" });
+      await h.draft.flush();
+
+      let copiedCharacters = 0;
+      const slice = vi
+        .spyOn(String.prototype, "slice")
+        .mockImplementation(function (this: string, start?: number, end?: number) {
+          if (String(this) === source) {
+            const normalize = (value: number | undefined, fallback: number): number => {
+              const index = value ?? fallback;
+              return index < 0
+                ? Math.max(source.length + index, 0)
+                : Math.min(index, source.length);
+            };
+            const from = normalize(start, 0);
+            const to = normalize(end, source.length);
+            copiedCharacters += Math.max(0, to - from);
+          }
+          return nativeSlice.call(this, start, end);
+        });
+      try {
+        h.draft.pushAnswerText({ text: source });
+        await h.draft.flush();
+      } finally {
+        slice.mockRestore();
+      }
+      return { copiedCharacters, sourceLength: source.length };
+    };
+
+    const smallInlineWork = await measureInlineRestorationSliceWork(256);
+    const largeInlineWork = await measureInlineRestorationSliceWork(1024);
+    expect(largeInlineWork.copiedCharacters).toBeLessThanOrEqual(
+      smallInlineWork.copiedCharacters * 5 + 100,
+    );
+    expect(largeInlineWork.copiedCharacters).toBeLessThanOrEqual(
+      largeInlineWork.sourceLength * 50,
+    );
+  });
+
+  it("M7l27: plain-tool XML provenance survives suppressed gaps between parameters", async () => {
+    for (const source of [
+      "[tool:bash]<parameter=x>y</parameter><parameter=z>w</parameter>",
+      "[tool:search]<parameter=x>y</parameter><parameter=z>w</parameter><parameter=q>r</parameter>",
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe("");
+      const hidden = makeDraftHarness();
+      hidden.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedStreamDistinctPartials(source)) {
+        hidden.draft.pushAnswerText({ text });
+        await hidden.draft.flush();
+      }
+      await hidden.draft.drain();
+      expect(hidden.frames, source).toEqual([]);
+    }
+
+    const firstComplete = "[tool:bash]<parameter=x>y</parameter>";
+    const secondIncomplete = `${firstComplete}<parameter=z>w`;
+    const secondComplete = `${secondIncomplete}</parameter>`;
+    expect(sanitizeAssistantVisibleStreamText(firstComplete)).toBe("");
+    expect(sanitizeAssistantVisibleStreamText(secondIncomplete)).toBe("<parameter=z>w");
+    expect(sanitizeAssistantVisibleStreamText(secondComplete)).toBe("");
+    const staged = makeDraftHarness();
+    staged.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedStreamDistinctPartials(firstComplete)) {
+      staged.draft.pushAnswerText({ text });
+      await staged.draft.flush();
+    }
+    staged.draft.pushAnswerText({
+      text: sanitizeAssistantVisibleStreamText(secondIncomplete),
+    });
+    await staged.draft.flush();
+    expect(staged.frames).toEqual([]);
+    // The completed callback is empty and therefore suppressed by core.
+    await staged.draft.drain();
+    expect(staged.frames).toEqual([]);
+
+    const visibleSource =
+      "Hello\n[tool:bash]<parameter=x>y</parameter><parameter=z>w</parameter>\nAnswer";
+    const visibleExpected = sanitizeAssistantVisibleStreamText(visibleSource);
+    expect(visibleExpected).toBe("Hello\nAnswer");
+    const visible = makeDraftHarness();
+    visible.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedStreamDistinctPartials(visibleSource)) {
+      visible.draft.pushAnswerText({ text });
+      await visible.draft.flush();
+    }
+    await visible.draft.drain();
+    expect(
+      visible.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+    ).toEqual([visibleExpected]);
+    expect(successfulIds(visible.frames)).toHaveLength(1);
+    expect(visible.frames.every((frame) => visibleExpected.startsWith(frame.text))).toBe(true);
+    expect(
+      visible.frames.every(
+        (frame) => !frame.text.includes("[tool:") && !frame.text.includes("<parameter"),
+      ),
+    ).toBe(true);
   });
 
   it("M7l11: an inline close plus suffix restores in-lane across unequal delimiters", async () => {
@@ -2630,6 +3208,39 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       source,
     ]);
     expect(successfulIds(h.frames)).toHaveLength(1);
+    expect(h.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+
+    const priorRegionsSource =
+      `Prior ${"`<tool_call>` ".repeat(12)}` +
+      '`<tool_call>{"x":1}</tool_call> after` done';
+    const priorRegions = makeDraftHarness();
+    priorRegions.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedCoreDistinctPartials(priorRegionsSource)) {
+      priorRegions.draft.pushAnswerText({ text });
+    }
+    await priorRegions.draft.drain();
+    expect(
+      priorRegions.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+    ).toEqual([priorRegionsSource]);
+    expect(successfulIds(priorRegions.frames)).toHaveLength(1);
+
+    const unclosedRaw = 'Use `<tool_call>{"x":1}</tool_call> after';
+    const restoredSource = `${unclosedRaw}\` literally`;
+    const sanitizedUnclosed = sanitizeAssistantVisibleText(unclosedRaw);
+    expect(sanitizedUnclosed).toBe("Use ` after");
+    expect(sanitizeAssistantVisibleText(restoredSource)).toBe(restoredSource);
+    const coalesced = makeDraftHarness();
+    coalesced.draft.handleAssistantMessageBoundary();
+    // No raw marker prefix reached the adapter, so this restoration exercises
+    // the bounded fallback rather than deferred opener provenance.
+    coalesced.draft.pushAnswerText({ text: sanitizedUnclosed });
+    await coalesced.draft.flush();
+    coalesced.draft.pushAnswerText({ text: restoredSource });
+    await coalesced.draft.drain();
+    expect(
+      coalesced.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+    ).toEqual([restoredSource]);
+    expect(successfulIds(coalesced.frames)).toHaveLength(1);
   });
 
   it("M7m: a same-length tag-free control with a literal less-than stays intact", async () => {

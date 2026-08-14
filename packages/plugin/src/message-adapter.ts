@@ -161,6 +161,10 @@ type DeferredCoreTagTail = {
   terminalFallbackText?: string;
   /** A plural wrapper previously exposed a recognized nested XML payload. */
   pluralWrapperSawRecognizedXmlPayload?: boolean;
+  /** Unmatched inline-code opener preceding the held sanitizer marker. */
+  inlineCodeOpeningStart?: number;
+  /** A line-start `[tool:name]` block may emit another XML parameter after a suppressed gap. */
+  plainToolParameterContinuation?: boolean;
 };
 
 type AssistantDraftLane = {
@@ -364,6 +368,7 @@ type CoreStrippedTagCandidate = {
 
 type CoreMemoryMarkerCandidate = {
   isClose: boolean;
+  nameFragment: string;
   markerEnd?: number;
 };
 
@@ -377,6 +382,7 @@ type CoreStreamCandidate =
       start: number;
       tool: CoreStrippedTagCandidate;
       insideCode: boolean;
+      matchingCloseStart?: number;
       matchingCloseEnd?: number;
       firstInvokeCloseEnd?: number;
       completeOpenBeforeMask: number;
@@ -578,7 +584,7 @@ function classifyCoreMemoryMarkerAt(
   }
   if (!exactName) {
     return cursor === text.length && names.some((name) => name.startsWith(fragment))
-      ? { isClose }
+      ? { isClose, nameFragment: fragment }
       : undefined;
   }
   // Pinned MEMORY_TAG_RE uses `\b` after the final `s`.
@@ -586,9 +592,9 @@ function classifyCoreMemoryMarkerAt(
   for (; cursor < text.length; cursor += 1) {
     const char = text[cursor]!;
     if (char === "<") return undefined;
-    if (char === ">") return { isClose, markerEnd: cursor + 1 };
+    if (char === ">") return { isClose, nameFragment: fragment, markerEnd: cursor + 1 };
   }
-  return { isClose };
+  return { isClose, nameFragment: fragment };
 }
 
 function classifyCoreModelTokenAt(
@@ -712,7 +718,10 @@ function indexQuoteAwareFunctionCloseEnds(
 
     if (functionCandidate.tool.isClose) {
       const opening = openings.pop();
-      if (opening) opening.matchingCloseEnd = functionCandidate.tool.tagEnd;
+      if (opening) {
+        opening.matchingCloseStart = functionCandidate.start;
+        opening.matchingCloseEnd = functionCandidate.tool.tagEnd;
+      }
     } else if (!functionCandidate.tool.isSelfClosing) {
       openings.push(functionCandidate);
     }
@@ -793,7 +802,10 @@ function buildCoreStreamScanContext(text: string): CoreStreamScanContext {
       if (tagName !== "function") {
         const stack = openStacks.get(tagName);
         const opening = stack?.pop();
-        if (opening?.kind === "tool") opening.matchingCloseEnd = tag.tagEnd;
+        if (opening?.kind === "tool") {
+          opening.matchingCloseStart = candidate.start;
+          opening.matchingCloseEnd = tag.tagEnd;
+        }
       }
       continue;
     }
@@ -890,15 +902,21 @@ function deferredCoreTagIsTerminalRestorable(
   return false;
 }
 
-function isClosedInlineCodeRestoration(text: string, previousAnswer: string): boolean {
-  if (!text.includes("`") || !text.includes("<")) return false;
-  const context = buildCoreStreamScanContext(text);
-  for (const region of context.codeRegions) {
+type ClosedInlineCodeRegion = {
+  start: number;
+  end: number;
+  openingEnd: number;
+  closingStart: number;
+};
+
+function indexClosedInlineCodeRegions(
+  text: string,
+  codeRegions: ReturnType<typeof findCodeRegions>,
+): ClosedInlineCodeRegion[] {
+  const indexed: ClosedInlineCodeRegion[] = [];
+  for (const region of codeRegions) {
     let openingEnd = region.start;
     while (text[openingEnd] === "`") openingEnd += 1;
-    // Pinned findCodeRegions allows any backtick-run length for an inline span;
-    // a 3+ run after prose is not a line-start fence. The counterfactual below
-    // is what proves restoration, so no delimiter-length guess is needed.
     if (openingEnd === region.start) continue;
 
     let closingStart = region.end;
@@ -906,36 +924,157 @@ function isClosedInlineCodeRestoration(text: string, previousAnswer: string): bo
       closingStart -= 1;
     }
     if (closingStart === region.end) continue;
-
-    const containsCoreTag = context.candidates.some((candidate) => {
-      const end =
-        candidate.kind === "tool"
-          ? candidate.tool.tagEnd
-          : candidate.kind === "memory"
-            ? candidate.memory.markerEnd
-            : candidate.modelToken.tokenEnd;
-      if (end === undefined || end > closingStart) return false;
-      if (candidate.kind === "model-token") {
-        // MODEL_SPECIAL_TOKEN_RE preserves a whole token when any part of its
-        // match overlaps a code region, including a backtick that begins in
-        // the middle of the token.
-        return candidate.start < closingStart && end > region.start;
-      }
-      return candidate.start >= openingEnd && candidate.start < closingStart;
+    indexed.push({
+      start: region.start,
+      end: region.end,
+      openingEnd,
+      closingStart,
     });
-    if (!containsCoreTag) continue;
+  }
+  return indexed;
+}
 
-    // Before the closing delimiter, core treated the same bytes as ordinary
-    // text and sanitized the apparent control. Recreate precisely that prior
-    // callback. Equality or an ordinary cumulative extension proves this is a
-    // restoration of the current lane, not a new message that merely happens
-    // to contain code.
-    const withoutClosingDelimiter = text.slice(0, closingStart) + text.slice(region.end);
-    if (sanitizeAssistantVisibleText(withoutClosingDelimiter).startsWith(previousAnswer)) {
-      return true;
+function indexClosedRegionsContainingCoreCandidate(
+  context: CoreStreamScanContext,
+  regions: readonly ClosedInlineCodeRegion[],
+): Uint8Array {
+  const contains = new Uint8Array(regions.length);
+  const ordinary: Array<{ start: number; end: number }> = [];
+  // Model tokens can begin before a code opener and overlap the region. Their
+  // ends are enough for the old overlap predicate, so a prefix count answers
+  // every region query in O(1) without revisiting long overlapping tokens.
+  const modelEnds = new Uint32Array(context.text.length + 1);
+  for (const candidate of context.candidates) {
+    const end =
+      candidate.kind === "tool"
+        ? candidate.tool.tagEnd
+        : candidate.kind === "memory"
+          ? candidate.memory.markerEnd
+          : candidate.modelToken.tokenEnd;
+    if (end === undefined) continue;
+    if (candidate.kind === "model-token") {
+      modelEnds[end] += 1;
+    } else {
+      ordinary.push({ start: candidate.start, end });
     }
   }
-  return false;
+  for (let index = 1; index < modelEnds.length; index += 1) {
+    modelEnds[index] += modelEnds[index - 1]!;
+  }
+
+  let ordinaryCursor = 0;
+  for (let index = 0; index < regions.length; index += 1) {
+    const region = regions[index]!;
+    while (
+      ordinaryCursor < ordinary.length &&
+      ordinary[ordinaryCursor]!.start < region.openingEnd
+    ) {
+      ordinaryCursor += 1;
+    }
+    let probe = ordinaryCursor;
+    while (probe < ordinary.length && ordinary[probe]!.start < region.closingStart) {
+      if (ordinary[probe]!.end <= region.closingStart) contains[index] = 1;
+      probe += 1;
+    }
+    ordinaryCursor = probe;
+    if (
+      modelEnds[region.closingStart]! - modelEnds[region.start]! > 0
+    ) {
+      contains[index] = 1;
+    }
+  }
+  return contains;
+}
+
+function isClosedInlineCodeRestoration(
+  text: string,
+  previousAnswer: string,
+  preferredOpeningStart?: number,
+): boolean {
+  if (!text.includes("`")) return false;
+  const context = buildCoreStreamScanContext(text);
+  const regions = indexClosedInlineCodeRegions(text, context.codeRegions);
+  const containsCoreCandidate = indexClosedRegionsContainingCoreCandidate(
+    context,
+    regions,
+  );
+  let divergence = 0;
+  while (
+    divergence < text.length &&
+    divergence < previousAnswer.length &&
+    text[divergence] === previousAnswer[divergence]
+  ) {
+    divergence += 1;
+  }
+  let selected: ClosedInlineCodeRegion | undefined;
+  for (let index = 0; index < regions.length; index += 1) {
+    const region = regions[index]!;
+    if (
+      preferredOpeningStart !== undefined &&
+      region.start !== preferredOpeningStart
+    ) {
+      continue;
+    }
+    if (preferredOpeningStart === undefined && region.end <= divergence) continue;
+    let containsMarker = containsCoreCandidate[index] === 1;
+    if (!containsMarker) {
+      const regionBody = text.slice(region.openingEnd, region.closingStart);
+      const wrappedRegionBody = `visible-prefix\n${regionBody}\nvisible-suffix`;
+      containsMarker =
+        earliestAdditionalSanitizerCandidate(regionBody, {
+          afterStage: -1,
+          includeReasoning: false,
+        }) !== undefined &&
+        sanitizeAssistantVisibleText(wrappedRegionBody) !== wrappedRegionBody;
+    }
+    if (containsMarker) {
+      selected = region;
+      break;
+    }
+  }
+  if (!selected) return false;
+
+  // Before the closing delimiter, core treated the same bytes as ordinary
+  // text and sanitized the apparent control. Recreate precisely that prior
+  // callback once for the provenance-selected region (or, defensively, the
+  // first matching region after the divergence). Equality or an ordinary
+  // cumulative extension proves this is a restoration of the current lane.
+  const withoutClosingDelimiter =
+    text.slice(0, selected.closingStart) + text.slice(selected.end);
+  return sanitizeAssistantVisibleText(withoutClosingDelimiter).startsWith(previousAnswer);
+}
+
+function unmatchedInlineCodeOpeningStart(
+  text: string,
+  anchor: number,
+  codeRegions: ReturnType<typeof findCodeRegions>,
+): number | undefined {
+  let runEnd = text.lastIndexOf("`", anchor - 1);
+  if (runEnd < 0) return undefined;
+  let runStart = runEnd;
+  while (runStart > 0 && text[runStart - 1] === "`") runStart -= 1;
+
+  // A final delimiter of an already-closed span is itself inside that region.
+  // An unmatched inline opener is not reported by findCodeRegions yet. Fenced
+  // code at line start is reported through end-of-text and therefore excluded.
+  return candidateIsInsideCode(runStart, codeRegions) ? undefined : runStart;
+}
+
+function hasClosedInlineCodeRegionAt(
+  text: string,
+  openingStart: number,
+  codeRegions: ReturnType<typeof findCodeRegions>,
+): boolean {
+  const region = codeRegions.find((candidate) => candidate.start === openingStart);
+  if (!region) return false;
+  let closingStart = region.end;
+  while (closingStart > region.start && text[closingStart - 1] === "`") {
+    closingStart -= 1;
+  }
+  // An unclosed line-start fence is represented through end-of-text without a
+  // closing delimiter. Inline runs (including 3+ backticks after prose) end in
+  // at least one backtick once core can prove the literal code region.
+  return closingStart < region.end;
 }
 
 type CorePayloadPrefix = "invalid" | "possible" | "recognized";
@@ -1260,6 +1399,1151 @@ function coreStreamCandidateCanStillBeControl(
   return coreStrippedTagCanStillBeControl(context, candidate, options);
 }
 
+const POST_MODEL_REASONING_TAG_NAMES = [
+  "think",
+  "thinking",
+  "thought",
+  "antthinking",
+  "antml:think",
+  "antml:thinking",
+  "antml:thought",
+  "mm:think",
+  "mm:thinking",
+  "mm:thought",
+] as const;
+const INTERNAL_TRACE_LABELS = [
+  "session status",
+  "exec",
+  "read",
+  "edit",
+  "write",
+  "patch",
+  "search",
+  "open",
+  "click",
+  "find",
+  "screenshot",
+  "update plan",
+  "tool call",
+  "tool result",
+  "function call",
+  "shell",
+  "command",
+] as const;
+const INTERNAL_COMMAND_PREFIXES = [
+  "run",
+  "check",
+  "fetch",
+  "pull",
+  "push",
+  "view",
+  "show",
+  "list",
+  "switch",
+  "create",
+  "merge",
+  "rebase",
+  "stage",
+  "restore",
+  "reset",
+  "stash",
+  "search",
+  "find",
+  "print",
+  "copy",
+  "move",
+  "remove",
+  "install",
+  "start",
+  "cd",
+  "git",
+  "pnpm",
+  "npm",
+  "yarn",
+  "bun",
+  "node",
+  "python",
+  "python3",
+  "bash",
+  "sh",
+] as const;
+
+// `sanitizeAssistantVisibleStreamText` is two ordered sanitizer passes:
+// `sanitizeAssistantVisibleText`, followed by `sanitizeUserFacingText`. Some
+// first-pass deletions make a marker recognizable only in the second pass, so
+// this must stay an unrolled order rather than a single-cycle stage number.
+const SANITIZER_STAGE_A_MINIMAX = 0;
+const SANITIZER_STAGE_A_MODEL_TOKEN = 1;
+const SANITIZER_STAGE_A_MEMORY = 2;
+const SANITIZER_STAGE_A_TOOL_XML = 3;
+const SANITIZER_STAGE_A_PARAMETER_UNWRAP = 4;
+const SANITIZER_STAGE_A_INTERNAL_TRACE = 5;
+const SANITIZER_STAGE_A_LEGACY_BRACKET = 6;
+const SANITIZER_STAGE_A_PLAIN_TEXT = 7;
+const SANITIZER_STAGE_A_DOWNGRADED_CALL = 8;
+const SANITIZER_STAGE_A_DOWNGRADED_RESULT = 9;
+const SANITIZER_STAGE_A_DOWNGRADED_HISTORY = 10;
+const SANITIZER_STAGE_A_FINAL = 11;
+const SANITIZER_STAGE_A_REASONING = 12;
+const SANITIZER_STAGE_B_FINAL = 13;
+const SANITIZER_STAGE_B_RUNTIME_CONTEXT = 14;
+const SANITIZER_STAGE_B_MINIMAX = 15;
+const SANITIZER_STAGE_B_TOOL_XML = 16;
+const SANITIZER_STAGE_B_PARAMETER_UNWRAP = 17;
+const SANITIZER_STAGE_B_OMITTED_PLACEHOLDER = 18;
+const SANITIZER_STAGE_B_LEGACY_BRACKET = 19;
+const SANITIZER_STAGE_B_PLAIN_TEXT = 20;
+const SANITIZER_LAST_STAGE = SANITIZER_STAGE_B_PLAIN_TEXT;
+
+type PotentialSanitizerCandidate = {
+  start: number;
+  stage: number;
+};
+
+function nextSanitizerStage(
+  stages: readonly number[],
+  afterStage: number,
+): number | undefined {
+  return stages.find((stage) => stage > afterStage);
+}
+
+function asciiStartsWithAt(text: string, start: number, target: string): boolean {
+  if (text.length - start < target.length) return false;
+  for (let offset = 0; offset < target.length; offset += 1) {
+    if (text[start + offset]!.toLowerCase() !== target[offset]) return false;
+  }
+  return true;
+}
+
+function asciiTailIsPrefixAt(text: string, start: number, target: string): boolean {
+  const length = text.length - start;
+  if (length >= target.length) return false;
+  for (let offset = 0; offset < length; offset += 1) {
+    if (text[start + offset]!.toLowerCase() !== target[offset]) return false;
+  }
+  return true;
+}
+
+/** Prefix language for pinned INTERNAL_COMPACT_COMMAND_TRACE_LINE_RE. */
+function compactCommandTraceBodyCanStillMatch(text: string): boolean {
+  let cursor = 0;
+  while (cursor < text.length) {
+    const modifier = (["elevated", "pty"] as const).find(
+      (candidate) =>
+        asciiStartsWithAt(text, cursor, candidate) &&
+        !/[A-Za-z0-9_]/.test(text[cursor + candidate.length] ?? ""),
+    );
+    if (!modifier) {
+      if (
+        (["elevated", "pty"] as const).some((candidate) =>
+          asciiTailIsPrefixAt(text, cursor, candidate),
+        )
+      ) {
+        return true;
+      }
+      break;
+    }
+
+    cursor += modifier.length;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+    if (cursor === text.length) return true;
+    if (text[cursor] !== "·" && text[cursor] !== ",") return false;
+    cursor += 1;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+    if (cursor === text.length) return true;
+  }
+
+  if (text[cursor] === "`") {
+    cursor += 1;
+    if (text[cursor] === "`") cursor += 1;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+    return cursor === text.length || !/\s/.test(text[cursor] ?? "");
+  }
+
+  for (const command of INTERNAL_COMMAND_PREFIXES) {
+    if (asciiTailIsPrefixAt(text, cursor, command)) return true;
+    if (!asciiStartsWithAt(text, cursor, command)) continue;
+    const boundary = text[cursor + command.length];
+    if (boundary === undefined || !/[A-Za-z0-9_]/.test(boundary)) return true;
+  }
+  return cursor === text.length;
+}
+
+function fixedLabelCanStillMatch(text: string, targets: readonly string[]): boolean {
+  const lower = text.toLowerCase();
+  return targets.some((target) => {
+    if (target.startsWith(lower)) return true;
+    if (!lower.startsWith(target)) return false;
+    const rest = text.slice(target.length);
+    const trimmed = rest.trimStart();
+    return trimmed.length === 0 || trimmed.startsWith(":");
+  });
+}
+
+function reasoningMarkerCanStillMatch(
+  text: string,
+  start: number,
+  nextLessThanAt: Int32Array,
+  nextGreaterThanAt: Int32Array,
+): boolean {
+  let cursor = start + 1;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (text[cursor] === "/") {
+    cursor += 1;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  }
+  const nameStart = cursor;
+  while (XML_TAG_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
+  const fragment = text.slice(nameStart, cursor).toLowerCase();
+  for (const name of POST_MODEL_REASONING_TAG_NAMES) {
+    if (name.startsWith(fragment)) {
+      if (fragment !== name) return cursor === text.length;
+    } else {
+      continue;
+    }
+    const boundary = text[cursor];
+    if (boundary !== undefined && /\w/.test(boundary)) continue;
+    const nextLessThan = nextLessThanAt[Math.min(cursor, text.length)]!;
+    const nextGreaterThan = nextGreaterThanAt[Math.min(cursor, text.length)]!;
+    return nextLessThan < 0 || nextGreaterThan >= 0 && nextGreaterThan < nextLessThan;
+  }
+  return false;
+}
+
+function downgradedBracketMarkerStages(text: string, start: number): number[] {
+  const stages: number[] = [];
+  for (const [marker, stage] of [
+    ["[tool call:", SANITIZER_STAGE_A_DOWNGRADED_CALL],
+    ["[tool result for id", SANITIZER_STAGE_A_DOWNGRADED_RESULT],
+    ["[historical context:", SANITIZER_STAGE_A_DOWNGRADED_HISTORY],
+  ] as const) {
+    const available = Math.min(marker.length, text.length - start);
+    const probe = text.slice(start, start + available).toLowerCase();
+    if (marker.startsWith(probe) || probe === marker) stages.push(stage);
+  }
+  return stages;
+}
+
+type IndexedTextMatch = {
+  start: number;
+  end: number;
+  insideCode?: boolean;
+  insidePotentialCode?: boolean;
+};
+type LegacyBracketScanContext = {
+  argsEvidence: IndexedTextMatch[];
+  argsEvidenceCursor: number;
+  resultEvidence: IndexedTextMatch[];
+  resultEvidenceCursor: number;
+  toolCallCloses: IndexedTextMatch[];
+  toolCallCloseCursor: number;
+  toolEvidence: IndexedTextMatch[];
+  toolEvidenceCursor: number;
+  toolResultCloses: IndexedTextMatch[];
+  toolResultCloseCursor: number;
+};
+
+function indexedTextMatches(text: string, pattern: RegExp): IndexedTextMatch[] {
+  return [...text.matchAll(pattern)].map((match) => ({
+    start: match.index ?? 0,
+    end: (match.index ?? 0) + match[0].length,
+  }));
+}
+
+function buildLegacyBracketScanContext(
+  text: string,
+  codeRegions: ReturnType<typeof findCodeRegions>,
+): LegacyBracketScanContext {
+  const potentialInlineCodeAt = new Uint8Array(text.length + 1);
+  let unmatchedBacktickRun = false;
+  for (let cursor = 0; cursor < text.length; ) {
+    if (text[cursor] === "`") {
+      const runStart = cursor;
+      while (text[cursor] === "`") cursor += 1;
+      unmatchedBacktickRun = !candidateIsInsideCode(runStart, codeRegions);
+      continue;
+    }
+    if (unmatchedBacktickRun) potentialInlineCodeAt[cursor] = 1;
+    cursor += 1;
+  }
+  const markCodeRegion = (match: IndexedTextMatch): IndexedTextMatch => ({
+    ...match,
+    insideCode: candidateIsInsideCode(match.start, codeRegions),
+    // Before its closing delimiter arrives, findCodeRegions cannot yet mark an
+    // inline span. Keep the legacy opener held because one later backtick can
+    // retroactively make this first close code-protected.
+    insidePotentialCode: potentialInlineCodeAt[match.start] === 1,
+  });
+  return {
+    argsEvidence: indexedTextMatches(text, /\bargs\s*=>/gi),
+    argsEvidenceCursor: 0,
+    resultEvidence: indexedTextMatches(
+      text,
+      /\b(?:tool|result|output|content)\s*(?:=>|:)/gi,
+    ),
+    resultEvidenceCursor: 0,
+    // Pinned core tests exactly the first textual close. If it starts in code,
+    // core treats the block as open through end-of-text; it does not search for
+    // a later outside-code close. Retain every close plus its precomputed code
+    // bit so each opener preserves that behavior without rescanning.
+    toolCallCloses: indexedTextMatches(text, /\[\s*\/\s*TOOL_CALL\s*\]/gi).map(
+      markCodeRegion,
+    ),
+    toolCallCloseCursor: 0,
+    toolEvidence: indexedTextMatches(
+      text,
+      /\btool\s*=>\s*["'][A-Za-z_][A-Za-z0-9_.:-]{0,119}["']/gi,
+    ),
+    toolEvidenceCursor: 0,
+    toolResultCloses: indexedTextMatches(text, /\[\s*\/\s*TOOL_RESULT\s*\]/gi).map(
+      markCodeRegion,
+    ),
+    toolResultCloseCursor: 0,
+  };
+}
+
+function nextIndexedTextMatch(
+  context: LegacyBracketScanContext,
+  matchesKey:
+    | "argsEvidence"
+    | "resultEvidence"
+    | "toolCallCloses"
+    | "toolEvidence"
+    | "toolResultCloses",
+  cursorKey:
+    | "argsEvidenceCursor"
+    | "resultEvidenceCursor"
+    | "toolCallCloseCursor"
+    | "toolEvidenceCursor"
+    | "toolResultCloseCursor",
+  start: number,
+): IndexedTextMatch | undefined {
+  const matches = context[matchesKey] as IndexedTextMatch[];
+  let cursor = context[cursorKey] as number;
+  while (cursor < matches.length && matches[cursor]!.start < start) cursor += 1;
+  context[cursorKey] = cursor;
+  return matches[cursor];
+}
+
+function legacyBracketMarkerCanStillMatch(
+  text: string,
+  start: number,
+  scan: LegacyBracketScanContext,
+): boolean {
+  let cursor = start + 1;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  const nameStart = cursor;
+  while (/[A-Za-z_]/.test(text[cursor] ?? "")) cursor += 1;
+  const fragment = text.slice(nameStart, cursor).toLowerCase();
+  const names = ["tool_call", "tool_result"] as const;
+  const exact = names.find((name) => name === fragment);
+  if (!exact) return cursor === text.length && names.some((name) => name.startsWith(fragment));
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === text.length) return true;
+  if (text[cursor] !== "]") return false;
+  const payloadStart = cursor + 1;
+  const firstClose =
+    exact === "tool_call"
+      ? nextIndexedTextMatch(
+          scan,
+          "toolCallCloses",
+          "toolCallCloseCursor",
+          payloadStart,
+        )
+      : nextIndexedTextMatch(
+          scan,
+          "toolResultCloses",
+          "toolResultCloseCursor",
+          payloadStart,
+        );
+  const close =
+    firstClose?.insideCode || firstClose?.insidePotentialCode ? undefined : firstClose;
+  if (!close) return true;
+  if (exact === "tool_call") {
+    const tool = nextIndexedTextMatch(
+      scan,
+      "toolEvidence",
+      "toolEvidenceCursor",
+      payloadStart,
+    );
+    const args = nextIndexedTextMatch(
+      scan,
+      "argsEvidence",
+      "argsEvidenceCursor",
+      payloadStart,
+    );
+    return Boolean(tool && tool.end <= close.start && args && args.end <= close.start);
+  }
+  let payloadCursor = payloadStart;
+  while (/\s/.test(text[payloadCursor] ?? "")) payloadCursor += 1;
+  if (text[payloadCursor] === "{" || text[payloadCursor] === "[") return true;
+  const evidence = nextIndexedTextMatch(
+    scan,
+    "resultEvidence",
+    "resultEvidenceCursor",
+    payloadStart,
+  );
+  return Boolean(evidence && evidence.end <= close.start);
+}
+
+type JsonObjectPrefixState =
+  | { kind: "invalid" }
+  | { kind: "possible" }
+  | { kind: "complete"; end: number };
+
+type JsonPrefixFrame =
+  | {
+      kind: "object";
+      state: "key-or-end" | "key" | "colon" | "value" | "after";
+    }
+  | { kind: "array"; state: "value-or-end" | "value" | "after" };
+
+const MAX_PLAIN_TEXT_TOOL_PAYLOAD_BYTES = 256e3;
+
+function classifyJsonStringPrefix(
+  text: string,
+  start: number,
+  maxEnd: number,
+): { kind: "invalid" | "possible" } | { kind: "complete"; end: number } {
+  let cursor = start + 1;
+  while (cursor < text.length) {
+    if (cursor >= maxEnd) return { kind: "invalid" };
+    const char = text[cursor]!;
+    if (char === "\"") return { kind: "complete", end: cursor + 1 };
+    if (char.charCodeAt(0) < 0x20) return { kind: "invalid" };
+    if (char !== "\\") {
+      cursor += 1;
+      continue;
+    }
+    cursor += 1;
+    if (cursor === text.length) {
+      return cursor >= maxEnd ? { kind: "invalid" } : { kind: "possible" };
+    }
+    const escaped = text[cursor]!;
+    if ('"\\/bfnrt'.includes(escaped)) {
+      cursor += 1;
+      continue;
+    }
+    if (escaped !== "u") return { kind: "invalid" };
+    for (let hex = 0; hex < 4; hex += 1) {
+      cursor += 1;
+      if (cursor === text.length) {
+        return cursor >= maxEnd ? { kind: "invalid" } : { kind: "possible" };
+      }
+      if (!/[0-9A-Fa-f]/.test(text[cursor]!)) return { kind: "invalid" };
+    }
+    cursor += 1;
+  }
+  return cursor >= maxEnd ? { kind: "invalid" } : { kind: "possible" };
+}
+
+/** Exact prefix state for the JSON object consumed by pinned plain-tool blocks. */
+function classifyJsonObjectPrefix(text: string, start: number): JsonObjectPrefixState {
+  if (text[start] !== "{") return { kind: "invalid" };
+  const frames: JsonPrefixFrame[] = [{ kind: "object", state: "key-or-end" }];
+  const maxEnd = start + MAX_PLAIN_TEXT_TOOL_PAYLOAD_BYTES;
+  let cursor = start + 1;
+
+  const completeContainer = (): JsonObjectPrefixState | undefined => {
+    frames.pop();
+    if (frames.length === 0) {
+      return cursor <= maxEnd ? { kind: "complete", end: cursor } : { kind: "invalid" };
+    }
+    frames[frames.length - 1]!.state = "after";
+    return undefined;
+  };
+
+  while (frames.length > 0) {
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+    if (cursor >= maxEnd) return { kind: "invalid" };
+    if (cursor === text.length) return { kind: "possible" };
+    const frame = frames[frames.length - 1]!;
+    const char = text[cursor]!;
+
+    if (frame.kind === "object" && (frame.state === "key-or-end" || frame.state === "key")) {
+      if (frame.state === "key-or-end" && char === "}") {
+        cursor += 1;
+        const completed = completeContainer();
+        if (completed) return completed;
+        continue;
+      }
+      if (char !== "\"") return { kind: "invalid" };
+      const string = classifyJsonStringPrefix(text, cursor, maxEnd);
+      if (string.kind !== "complete") return string;
+      cursor = string.end;
+      frame.state = "colon";
+      continue;
+    }
+
+    if (frame.kind === "object" && frame.state === "colon") {
+      if (char !== ":") return { kind: "invalid" };
+      cursor += 1;
+      frame.state = "value";
+      continue;
+    }
+
+    const expectsValue =
+      frame.state === "value" || frame.kind === "array" && frame.state === "value-or-end";
+    if (expectsValue) {
+      if (frame.kind === "array" && frame.state === "value-or-end" && char === "]") {
+        cursor += 1;
+        const completed = completeContainer();
+        if (completed) return completed;
+        continue;
+      }
+      if (char === "{") {
+        frames.push({ kind: "object", state: "key-or-end" });
+        cursor += 1;
+        continue;
+      }
+      if (char === "[") {
+        frames.push({ kind: "array", state: "value-or-end" });
+        cursor += 1;
+        continue;
+      }
+      if (char === "\"") {
+        const string = classifyJsonStringPrefix(text, cursor, maxEnd);
+        if (string.kind !== "complete") return string;
+        cursor = string.end;
+        frame.state = "after";
+        continue;
+      }
+      const literal = ["true", "false", "null"].find((value) => value[0] === char);
+      if (literal) {
+        const available = text.slice(cursor, Math.min(text.length, cursor + literal.length));
+        if (!literal.startsWith(available)) return { kind: "invalid" };
+        if (available.length < literal.length) return { kind: "possible" };
+        cursor += literal.length;
+        frame.state = "after";
+        continue;
+      }
+      if (char === "-" || /[0-9]/.test(char)) {
+        if (text[cursor] === "-") {
+          cursor += 1;
+          if (cursor === text.length) return { kind: "possible" };
+        }
+        if (text[cursor] === "0") {
+          cursor += 1;
+          if (/[0-9]/.test(text[cursor] ?? "")) return { kind: "invalid" };
+        } else if (/[1-9]/.test(text[cursor] ?? "")) {
+          while (/[0-9]/.test(text[cursor] ?? "")) cursor += 1;
+        } else {
+          return { kind: "invalid" };
+        }
+        if (text[cursor] === ".") {
+          cursor += 1;
+          if (cursor === text.length) return { kind: "possible" };
+          if (!/[0-9]/.test(text[cursor] ?? "")) return { kind: "invalid" };
+          while (/[0-9]/.test(text[cursor] ?? "")) cursor += 1;
+        }
+        if (text[cursor] === "e" || text[cursor] === "E") {
+          cursor += 1;
+          if (cursor === text.length) return { kind: "possible" };
+          if (text[cursor] === "+" || text[cursor] === "-") {
+            cursor += 1;
+            if (cursor === text.length) return { kind: "possible" };
+          }
+          if (!/[0-9]/.test(text[cursor] ?? "")) return { kind: "invalid" };
+          while (/[0-9]/.test(text[cursor] ?? "")) cursor += 1;
+        }
+        const boundary = text[cursor];
+        if (
+          boundary !== undefined &&
+          !/\s/.test(boundary) &&
+          boundary !== "," &&
+          boundary !== "}" &&
+          boundary !== "]"
+        ) {
+          return { kind: "invalid" };
+        }
+        frame.state = "after";
+        continue;
+      }
+      return { kind: "invalid" };
+    }
+
+    if (frame.state === "after") {
+      if (char === ",") {
+        cursor += 1;
+        frame.state = frame.kind === "object" ? "key" : "value";
+        continue;
+      }
+      const closing = frame.kind === "object" ? "}" : "]";
+      if (char !== closing) return { kind: "invalid" };
+      cursor += 1;
+      const completed = completeContainer();
+      if (completed) return completed;
+      continue;
+    }
+  }
+  return { kind: "invalid" };
+}
+
+function xmlishParameterPayloadCanStillMatch(text: string, payloadStart: number): boolean {
+  let cursor = payloadStart;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  const marker = "<parameter=";
+  const available = text.slice(cursor, Math.min(text.length, cursor + marker.length));
+  if (!marker.startsWith(available.toLowerCase())) return false;
+  if (available.length < marker.length) return true;
+  cursor += marker.length;
+
+  const nameStart = cursor;
+  while (/[A-Za-z0-9_.:-]/.test(text[cursor] ?? "")) cursor += 1;
+  const nameLength = cursor - nameStart;
+  if (cursor === text.length) return nameLength <= 120;
+  if (nameLength === 0 || nameLength > 120 || text[cursor] !== ">") return false;
+  // Pinned findXmlishParameterBlock treats every subsequent byte as body until
+  // the first textual `</parameter>`. The delivery EndAt path is intentionally
+  // uncapped (unlike promotion's parse-at helper), so any later close can
+  // finish this `[tool:name]` block.
+  return true;
+}
+
+function plainToolXmlParameterBlockCanStillMatch(text: string, start: number): boolean {
+  let cursor = start;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  if (!text.startsWith("[tool:", cursor)) return false;
+  cursor += "[tool:".length;
+  const nameStart = cursor;
+  while (/[A-Za-z0-9_-]/.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === nameStart || text[cursor] !== "]") return false;
+  const payloadStart = cursor + 1;
+  cursor = payloadStart;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  return text[cursor] === "<" && xmlishParameterPayloadCanStillMatch(text, payloadStart);
+}
+
+function plainToolParameterContinuationCanStillMatch(
+  text: string,
+  visiblePrefix: string,
+): boolean {
+  let cursor = visiblePrefix.length;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === text.length) return true;
+  return (
+    text[cursor] === "<" &&
+    xmlishParameterPayloadCanStillMatch(text, visiblePrefix.length)
+  );
+}
+
+function plainBracketBlockCanStillMatch(text: string, start: number): boolean {
+  let cursor = start + 1;
+  const hasToolPrefix = text.startsWith("tool:", cursor);
+  if (hasToolPrefix) cursor += 5;
+  const nameStart = cursor;
+  while (/[A-Za-z0-9_-]/.test(text[cursor] ?? "")) cursor += 1;
+  const toolName = text.slice(nameStart, cursor);
+  if (cursor === text.length) return true;
+  if (cursor === nameStart || text[cursor] !== "]") return false;
+  cursor += 1;
+  const payloadStart = cursor;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  if (!hasToolPrefix) {
+    if (cursor === text.length) return true;
+    if (text[cursor] === "\r") cursor += text[cursor + 1] === "\n" ? 2 : 1;
+    else if (text[cursor] === "\n") cursor += 1;
+    else return false;
+  }
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === text.length) return true;
+  if (hasToolPrefix && text[cursor] === "<") {
+    return xmlishParameterPayloadCanStillMatch(text, payloadStart);
+  }
+  const json = classifyJsonObjectPrefix(text, cursor);
+  if (json.kind !== "complete") return json.kind === "possible";
+  if (hasToolPrefix) return true;
+
+  cursor = json.end;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  const rest = text.slice(cursor);
+  const closings = [`[/${toolName}]`, "[END_TOOL_REQUEST]"];
+  return closings.some((closing) => closing.startsWith(rest) || rest.startsWith(closing));
+}
+
+function harmonyBlockCanStillMatch(text: string, start: number): boolean {
+  let cursor = start;
+  const channelStart = cursor;
+  while (/[A-Za-z_]/.test(text[cursor] ?? "")) cursor += 1;
+  const fragment = text.slice(channelStart, cursor);
+  const channels = ["commentary", "analysis", "final"] as const;
+  const channel = channels.find((candidate) => candidate === fragment);
+  if (!channel) {
+    return (
+      fragment.length > 0 &&
+      cursor === text.length &&
+      channels.some((candidate) => candidate.startsWith(fragment))
+    );
+  }
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  const toRemainder = text.slice(cursor);
+  if ("to=".startsWith(toRemainder)) return true;
+  if (!toRemainder.startsWith("to=")) return false;
+  cursor += 3;
+  const nameStart = cursor;
+  while (/[A-Za-z0-9_-]/.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === text.length) return cursor > nameStart;
+  if (cursor === nameStart) return false;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  const codeRemainder = text.slice(cursor);
+  if ("code".startsWith(codeRemainder)) return true;
+  if (!codeRemainder.startsWith("code")) return false;
+  cursor += 4;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === text.length) return true;
+  return classifyJsonObjectPrefix(text, cursor).kind !== "invalid";
+}
+
+function internalTraceLineCanStillMatch(line: string): boolean {
+  let cursor = 0;
+  while (/\s/.test(line[cursor] ?? "")) cursor += 1;
+  if (line[cursor] === ">") {
+    cursor += 1;
+    while (/\s/.test(line[cursor] ?? "")) cursor += 1;
+  }
+  let warned = false;
+  if ("⚠️".startsWith(line.slice(cursor))) return true;
+  if (line.startsWith("⚠️", cursor)) {
+    warned = true;
+    cursor += "⚠️".length;
+    while (/\s/.test(line[cursor] ?? "")) cursor += 1;
+  }
+  const rest = line.slice(cursor);
+  if (!warned && rest.length === 0) return false;
+  for (const emoji of ["📊", "🛠️", "📖", "📝", "🔍", "🔎", "⚙️"]) {
+    if (emoji.startsWith(rest)) return true;
+    if (!rest.startsWith(emoji)) continue;
+    let body = rest.slice(emoji.length);
+    const hadWhitespace = /^\s/.test(body);
+    body = body.trimStart();
+    if (warned && emoji === "🛠️" && (body.length === 0 || hadWhitespace)) return true;
+    if (fixedLabelCanStillMatch(body, INTERNAL_TRACE_LABELS)) return true;
+    if (emoji === "🛠️") {
+      if (compactCommandTraceBodyCanStillMatch(body)) return true;
+    }
+    return false;
+  }
+  return fixedLabelCanStillMatch(rest, [
+    "toolcall",
+    "tool-call",
+    "tool_call",
+    "tool call",
+    "toolresult",
+    "tool-result",
+    "tool_result",
+    "tool result",
+    "functioncall",
+    "function-call",
+    "function_call",
+    "function call",
+  ]);
+}
+
+function distinctiveInternalTraceLineCanStillMatch(line: string): boolean {
+  let cursor = 0;
+  while (/\s/.test(line[cursor] ?? "")) cursor += 1;
+  if (line[cursor] === ">") {
+    cursor += 1;
+    while (/\s/.test(line[cursor] ?? "")) cursor += 1;
+  }
+  const warningRemainder = line.slice(cursor);
+  if (warningRemainder.length > 0 && "⚠️".startsWith(warningRemainder)) {
+    return true;
+  }
+  if (line.startsWith("⚠️", cursor)) {
+    cursor += "⚠️".length;
+    while (/\s/.test(line[cursor] ?? "")) cursor += 1;
+  }
+  return ["📊", "🛠️", "📖", "📝", "🔍", "🔎", "⚙️"].some(
+    (emoji) => emoji.startsWith(line.slice(cursor)) || line.startsWith(emoji, cursor),
+  ) && internalTraceLineCanStillMatch(line);
+}
+
+function coreCandidateSanitizerStages(candidate: CoreStreamCandidate): readonly number[] {
+  if (candidate.kind === "model-token") return [SANITIZER_STAGE_A_MODEL_TOKEN];
+  if (candidate.kind === "memory") {
+    return candidate.memory.nameFragment.length === 0
+      ? [
+          SANITIZER_STAGE_A_MINIMAX,
+          SANITIZER_STAGE_A_MODEL_TOKEN,
+          SANITIZER_STAGE_A_MEMORY,
+          SANITIZER_STAGE_A_TOOL_XML,
+          SANITIZER_STAGE_A_FINAL,
+          SANITIZER_STAGE_B_FINAL,
+          SANITIZER_STAGE_B_MINIMAX,
+          SANITIZER_STAGE_B_TOOL_XML,
+        ]
+      : [SANITIZER_STAGE_A_MEMORY];
+  }
+  if (
+    candidate.tool.exactName === "minimax:tool_call" ||
+    candidate.tool.exactName === "invoke"
+  ) {
+    return [SANITIZER_STAGE_A_MINIMAX, SANITIZER_STAGE_B_MINIMAX];
+  }
+  if (candidate.tool.exactName === "final") {
+    return [SANITIZER_STAGE_A_FINAL, SANITIZER_STAGE_B_FINAL];
+  }
+  if (
+    candidate.tool.exactName === "parameter" ||
+    candidate.tool.exactName === undefined &&
+      "parameter".startsWith(candidate.tool.nameFragment)
+  ) {
+    return [
+      SANITIZER_STAGE_A_PARAMETER_UNWRAP,
+      SANITIZER_STAGE_B_PARAMETER_UNWRAP,
+    ];
+  }
+  if (
+    candidate.tool.exactName === undefined &&
+    "invoke".startsWith(candidate.tool.nameFragment)
+  ) {
+    return [SANITIZER_STAGE_A_MINIMAX, SANITIZER_STAGE_B_MINIMAX];
+  }
+  return [SANITIZER_STAGE_A_TOOL_XML, SANITIZER_STAGE_B_TOOL_XML];
+}
+
+function earliestOrdinaryCoreCandidate(
+  context: CoreStreamScanContext,
+  afterStage = -1,
+  allowRecognizedAfterEarlierDeletion = false,
+): PotentialSanitizerCandidate | undefined {
+  for (const candidate of context.candidates) {
+    const stage = nextSanitizerStage(coreCandidateSanitizerStages(candidate), afterStage);
+    if (
+      stage !== undefined &&
+      (coreStreamCandidateCanStillBeControl(context, candidate) ||
+        allowRecognizedAfterEarlierDeletion &&
+          coreStreamCandidateIsRecognizedAfterEarlierDeletion(context, candidate))
+    ) {
+      return { start: candidate.start, stage };
+    }
+  }
+  return undefined;
+}
+
+function coreStreamCandidateIsRecognizedAfterEarlierDeletion(
+  context: CoreStreamScanContext,
+  candidate: CoreStreamCandidate,
+): boolean {
+  if (coreStreamCandidateIsCodeProtected(candidate) || candidate.kind !== "tool") {
+    return false;
+  }
+  const tag = candidate.tool;
+  const tagName = tag.exactName;
+  if (!tagName || tag.isClose || tag.isSelfClosing || tag.tagEnd === undefined) return false;
+  const json = classifyCoreJsonPayloadPrefix(context.text, tag.tagEnd);
+  const xml = classifyCoreToolXmlPayloadPrefix(context.text, tag.tagEnd);
+  if (tagName === "function") {
+    return (
+      candidate.matchingCloseEnd !== undefined &&
+      isStandaloneFunctionToolCandidate(context.text, candidate.start, tag.tagEnd) &&
+      (json === "recognized" || xml === "recognized")
+    );
+  }
+  if (tagName === "tool_call" || tagName === "antml:invoke") {
+    return json === "recognized" || xml === "recognized";
+  }
+  if (
+    tagName !== "invoke" &&
+    tagName !== "parameter" &&
+    tagName !== "final" &&
+    tagName !== "minimax:tool_call" &&
+    !PLURAL_CORE_WRAPPER_TAG_NAMES.has(tagName)
+  ) {
+    return json === "recognized";
+  }
+  return false;
+}
+
+// Punctuation-delimited marker families removed by sanitizeUserFacingText,
+// the second half of the pinned stream sanitizer. Word-start runtime/inbound
+// headers are deliberately excluded: safely recognizing their first byte
+// would require buffering ordinary prose such as "Open" or "Conversation".
+const RUNTIME_CONTEXT_BEGIN = "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>";
+const OMITTED_TOOL_CALLS_PLACEHOLDER = "[tool calls omitted]";
+
+function runtimeContextCanStillMatch(
+  text: string,
+  firstRaw: string,
+  lineEnd: number,
+): boolean {
+  const hasLineBreak = lineEnd < text.length;
+  if (!hasLineBreak && firstRaw.startsWith("<<<")) {
+    return RUNTIME_CONTEXT_BEGIN.startsWith(firstRaw);
+  }
+  if (firstRaw === RUNTIME_CONTEXT_BEGIN) return true;
+  return false;
+}
+
+function omittedPlaceholderCanStillMatch(line: string, lineComplete: boolean): boolean {
+  if (lineComplete) return /^[ \t]*\[tool calls omitted\][ \t]*$/i.test(line);
+  const value = line.trimStart().toLowerCase();
+  if (!value.startsWith("[tool calls")) return false;
+  const target = OMITTED_TOOL_CALLS_PLACEHOLDER;
+  if (target.startsWith(value)) return true;
+  return value.startsWith(target) && value.slice(target.length).trim().length === 0;
+}
+
+function earliestAdditionalSanitizerCandidate(
+  text: string,
+  options: { afterStage?: number; includeReasoning: boolean },
+): PotentialSanitizerCandidate | undefined {
+  const afterStage = options.afterStage ?? -1;
+  const codeRegions = findCodeRegions(text);
+  const nextLessThanAt = new Int32Array(text.length + 1);
+  const nextGreaterThanAt = new Int32Array(text.length + 1);
+  let nextLessThan = -1;
+  let nextGreaterThan = -1;
+  nextLessThanAt[text.length] = -1;
+  nextGreaterThanAt[text.length] = -1;
+  for (let index = text.length - 1; index >= 0; index -= 1) {
+    if (text[index] === "<") nextLessThan = index;
+    if (text[index] === ">") nextGreaterThan = index;
+    nextLessThanAt[index] = nextLessThan;
+    nextGreaterThanAt[index] = nextGreaterThan;
+  }
+  let earliest: PotentialSanitizerCandidate | undefined;
+  const remember = (start: number, stages: readonly number[]): void => {
+    const stage = nextSanitizerStage(stages, afterStage);
+    if (stage === undefined) return;
+    if (
+      earliest === undefined ||
+      start < earliest.start ||
+      (start === earliest.start && stage < earliest.stage)
+    ) {
+      earliest = { start, stage };
+    }
+  };
+
+  if (options.includeReasoning && SANITIZER_STAGE_A_REASONING > afterStage) {
+    for (let start = text.indexOf("<"); start >= 0; start = text.indexOf("<", start + 1)) {
+      if (
+        !candidateIsInsideCode(start, codeRegions) &&
+        reasoningMarkerCanStillMatch(text, start, nextLessThanAt, nextGreaterThanAt)
+      ) {
+        remember(start, [SANITIZER_STAGE_A_REASONING]);
+        break;
+      }
+    }
+  }
+  let legacyScan: LegacyBracketScanContext | undefined;
+  for (let start = text.indexOf("["); start >= 0; start = text.indexOf("[", start + 1)) {
+    remember(start, downgradedBracketMarkerStages(text, start));
+    if (
+      !candidateIsInsideCode(start, codeRegions) &&
+      legacyBracketMarkerCanStillMatch(
+        text,
+        start,
+        (legacyScan ??= buildLegacyBracketScanContext(text, codeRegions)),
+      )
+    ) {
+      remember(start, [
+        SANITIZER_STAGE_A_LEGACY_BRACKET,
+        SANITIZER_STAGE_B_LEGACY_BRACKET,
+      ]);
+    }
+    if (earliest?.start === start) break;
+  }
+  for (
+    let lineStart = 0;
+    lineStart <= text.length && (earliest === undefined || lineStart <= earliest.start);
+  ) {
+    const lineEnd = text.indexOf("\n", lineStart);
+    const end = lineEnd < 0 ? text.length : lineEnd;
+    const lineComplete = lineEnd >= 0;
+    const line = text.slice(lineStart, end);
+    let blockStart = 0;
+    while (line[blockStart] === " " || line[blockStart] === "\t") blockStart += 1;
+    const traceCanStillMatch = options.includeReasoning
+      ? internalTraceLineCanStillMatch(line)
+      : distinctiveInternalTraceLineCanStillMatch(line);
+    if (
+      !candidateIsInsideCode(lineStart, codeRegions) &&
+      traceCanStillMatch &&
+      (!lineComplete || sanitizeAssistantVisibleText(line).length === 0)
+    ) {
+      remember(lineStart, [SANITIZER_STAGE_A_INTERNAL_TRACE]);
+    }
+    if (options.includeReasoning && harmonyBlockCanStillMatch(line, blockStart)) {
+      remember(lineStart, [SANITIZER_STAGE_A_PLAIN_TEXT, SANITIZER_STAGE_B_PLAIN_TEXT]);
+    }
+    if (
+      line[blockStart] === "[" &&
+      plainBracketBlockCanStillMatch(text, lineStart + blockStart)
+    ) {
+      remember(lineStart, [SANITIZER_STAGE_A_PLAIN_TEXT, SANITIZER_STAGE_B_PLAIN_TEXT]);
+    }
+    if (runtimeContextCanStillMatch(text, line.replace(/\r$/, ""), end)) {
+      remember(lineStart, [SANITIZER_STAGE_B_RUNTIME_CONTEXT]);
+    }
+    if (omittedPlaceholderCanStillMatch(line, lineComplete)) {
+      remember(lineStart, [SANITIZER_STAGE_B_OMITTED_PLACEHOLDER]);
+    }
+    if (lineEnd < 0) break;
+    lineStart = lineEnd + 1;
+  }
+  return earliest;
+}
+
+function earliestCounterfactualSanitizerCandidate(
+  text: string,
+  afterStage: number,
+): PotentialSanitizerCandidate | undefined {
+  const core = earliestOrdinaryCoreCandidate(
+    buildCoreStreamScanContext(text),
+    afterStage,
+    true,
+  );
+  const additional = earliestAdditionalSanitizerCandidate(text, {
+    afterStage,
+    includeReasoning: true,
+  });
+  if (!core) return additional;
+  if (!additional) return core;
+  return additional.start < core.start ||
+    (additional.start === core.start && additional.stage < core.stage)
+    ? additional
+    : core;
+}
+
+function earlierCandidate(
+  first: PotentialSanitizerCandidate | undefined,
+  second: PotentialSanitizerCandidate | undefined,
+): PotentialSanitizerCandidate | undefined {
+  if (!first) return second;
+  if (!second) return first;
+  return second.start < first.start ||
+    (second.start === first.start && second.stage < first.stage)
+    ? second
+    : first;
+}
+
+function earliestSanitizerCandidate(
+  text: string,
+  afterStage: number,
+  includeReasoning: boolean,
+  context = buildCoreStreamScanContext(text),
+): PotentialSanitizerCandidate | undefined {
+  return earlierCandidate(
+    earliestOrdinaryCoreCandidate(context, afterStage),
+    earliestAdditionalSanitizerCandidate(text, { afterStage, includeReasoning }),
+  );
+}
+
+function composedEarlierStageAnchor(context: CoreStreamScanContext): number | undefined {
+  const initial = earliestSanitizerCandidate(context.text, -1, false, context);
+  if (!initial) return undefined;
+
+  let earliest = initial.start;
+  const initialCore = context.candidateByStart.get(initial.start);
+  const initialCoreIsCompleted =
+    initialCore !== undefined &&
+    (coreStreamCandidateIsCodeProtected(initialCore) ||
+      (initialCore.kind === "tool" &&
+        (initialCore.tool.isClose ||
+          (initialCore.tool.exactName !== undefined &&
+            initialCore.tool.tagEnd !== undefined))) ||
+      (initialCore.kind === "memory" && initialCore.memory.markerEnd !== undefined) ||
+      (initialCore.kind === "model-token" && initialCore.modelToken.tokenEnd !== undefined));
+  const initialPrefix = context.text.slice(0, initial.start);
+  let preciseCompletedDeletion = false;
+  let prefixes = [initialPrefix];
+  if (initialCore?.kind === "model-token" && initialCore.modelToken.tokenEnd !== undefined) {
+    const after = context.text.slice(initialCore.modelToken.tokenEnd);
+    const separator =
+      initialPrefix &&
+      after &&
+      !/\s/.test(initialPrefix.at(-1) ?? "") &&
+      !/\s/.test(after[0] ?? "")
+        ? " "
+        : "";
+    prefixes = [`${initialPrefix}${separator}${after}`];
+    preciseCompletedDeletion = true;
+  } else if (initialCore?.kind === "memory" && initialCore.memory.markerEnd !== undefined) {
+    prefixes = [initialPrefix + context.text.slice(initialCore.memory.markerEnd)];
+    preciseCompletedDeletion = true;
+  } else if (
+    initialCore?.kind === "tool" &&
+    initialCore.tool.exactName === "parameter" &&
+    !initialCore.tool.isClose &&
+    initialCore.tool.tagEnd !== undefined
+  ) {
+    if (initialCore.matchingCloseStart !== undefined) {
+      prefixes = [
+        initialPrefix +
+          context.text.slice(initialCore.tool.tagEnd, initialCore.matchingCloseStart) +
+          context.text.slice(initialCore.matchingCloseEnd),
+      ];
+    } else if (
+      isPotentialMatchingCoreClosePrefix(
+        context.text,
+        initialCore.tool.tagEnd,
+        "parameter",
+      )
+    ) {
+      prefixes = [initialPrefix];
+    } else {
+      prefixes = [initialPrefix + context.text.slice(initialCore.tool.tagEnd)];
+    }
+    preciseCompletedDeletion = true;
+  } else if (
+    initialCore?.kind === "tool" &&
+    initialCore.tool.exactName === "invoke" &&
+    !initialCore.tool.isClose &&
+    initialCore.firstInvokeCloseEnd !== undefined
+  ) {
+    // MiniMax's non-nesting regex removes through the first textual close but
+    // preserves every already-observed byte after it. Keeping that suffix is
+    // what distinguishes `<tool_call...>` from literal `<tool_calligraphy>`.
+    prefixes = [initialPrefix + context.text.slice(initialCore.firstInvokeCloseEnd)];
+    preciseCompletedDeletion = true;
+  } else if (
+    initial.stage === SANITIZER_STAGE_A_MODEL_TOKEN &&
+    initialCore?.kind === "model-token" &&
+    !/\s/.test(initialPrefix.at(-1) ?? "")
+  ) {
+    // Model-token deletion inserts one separator when both future neighbors
+    // are non-whitespace. At an unfinished tail either branch is possible.
+    prefixes.push(`${initialPrefix} `);
+  }
+
+  for (const initialPrefix of prefixes) {
+    let current = initialPrefix;
+    let afterStage = initial.stage;
+    for (let depth = 0; depth <= SANITIZER_LAST_STAGE; depth += 1) {
+      if (afterStage === SANITIZER_STAGE_A_REASONING) current = current.trim();
+      const outer = earliestCounterfactualSanitizerCandidate(current, afterStage);
+      if (!outer) break;
+      if (initialCoreIsCompleted && !preciseCompletedDeletion && depth === 0) {
+        const outerCore = buildCoreStreamScanContext(current).candidateByStart.get(
+          outer.start,
+        );
+        const outerIsIncompleteCore =
+          outerCore !== undefined &&
+          !coreStreamCandidateIsCodeProtected(outerCore) &&
+          (outerCore.kind === "tool"
+            ? !outerCore.tool.isClose &&
+              (outerCore.tool.exactName === undefined || outerCore.tool.tagEnd === undefined)
+            : outerCore.kind === "memory"
+              ? outerCore.memory.markerEnd === undefined
+              : outerCore.modelToken.tokenEnd === undefined);
+        if (outerCore && !outerIsIncompleteCore) {
+          // A complete inner tag can promote a genuinely unfinished outer
+          // marker (`<param<tool_call>`), but must not reinterpret complete
+          // one-pass evidence (`<parameter>x</parameter>` or XML-invalid
+          // nested literals) as a zero-width deletion.
+          break;
+        }
+      }
+      earliest = Math.min(earliest, outer.start);
+      current = current.slice(0, outer.start);
+      afterStage = outer.stage;
+    }
+  }
+  return earliest;
+}
+
 /**
  * Is some already-observed text guaranteed to survive any later completion of
  * an ambiguous core-tag suffix? This is intentionally conservative: once the
@@ -1269,12 +2553,20 @@ function coreStreamCandidateCanStillBeControl(
  */
 function hasIrrevocableVisibleCoreTagText(text: string): boolean {
   const context = buildCoreStreamScanContext(text);
-  for (const candidate of context.candidates) {
-    if (coreStreamCandidateCanStillBeControl(context, candidate)) {
-      return cleanPartialAnswerText(text.slice(0, candidate.start)).trim().length > 0;
-    }
+  const anchor = composedEarlierStageAnchor(context);
+  if (anchor !== undefined) {
+    return cleanPartialAnswerText(text.slice(0, anchor)).trim().length > 0;
   }
   return cleanPartialAnswerText(text).trim().length > 0;
+}
+
+function matchingDeferredVisiblePrefix(
+  text: string,
+  visiblePrefix: string,
+): string | undefined {
+  if (text.startsWith(visiblePrefix)) return visiblePrefix;
+  const trimmed = visiblePrefix.trimEnd();
+  return trimmed !== visiblePrefix && text.startsWith(trimmed) ? trimmed : undefined;
 }
 
 /**
@@ -1285,9 +2577,10 @@ function hasIrrevocableVisibleCoreTagText(text: string): boolean {
  * message boundary and permanently finalizes the raw fragment in its own
  * bubble.
  *
- * The names are a closed set matching the pinned core passes this channel
- * receives. Keep the OUTER anchor only while its whole suffix can still become
- * one of those controls: ordinary prose continuation releases immediately,
+ * The XML names and punctuation-led marker grammars are a closed set matching
+ * the two pinned sanitizer passes this channel receives. Keep the OUTER anchor
+ * only while its whole suffix can still become one of those controls: ordinary
+ * prose continuation releases immediately,
  * while nested XML and the delayed function/parameter/MiniMax forms remain
  * held until core retracts them. Core excludes Markdown code regions, so this
  * guard uses the same public region helpers. A real control after nonempty prose
@@ -1307,9 +2600,65 @@ function deferCoreStrippedTagTail(
     visiblePrefix: string;
     terminalRestorable: boolean;
     pluralWrapperSawRecognizedXmlPayload?: boolean;
+    inlineCodeOpeningStart?: number;
+    plainToolParameterContinuation?: boolean;
   };
   coreRetraction?: boolean;
 } {
+  const context = buildCoreStreamScanContext(text);
+  if (previous?.plainToolParameterContinuation === true) {
+    const visiblePrefix = matchingDeferredVisiblePrefix(text, previous.visiblePrefix);
+    if (
+      visiblePrefix !== undefined &&
+      plainToolParameterContinuationCanStillMatch(text, visiblePrefix)
+    ) {
+      return {
+        visibleText: visiblePrefix,
+        deferred: {
+          visiblePrefix,
+          terminalRestorable:
+            cleanPartialAnswerText(visiblePrefix).trim().length > 0,
+          pluralWrapperSawRecognizedXmlPayload:
+            previous.pluralWrapperSawRecognizedXmlPayload,
+          inlineCodeOpeningStart: previous.inlineCodeOpeningStart,
+          plainToolParameterContinuation: true,
+        },
+        // The original `[tool:name]` bytes disappeared in a suppressed or
+        // non-monotonic sanitizer callback. Rebase the raw lane while keeping
+        // its safe visible prefix and outer-block provenance.
+        coreRetraction: true,
+      };
+    }
+  }
+  if (
+    previous?.inlineCodeOpeningStart !== undefined &&
+    !hasClosedInlineCodeRegionAt(
+      text,
+      previous.inlineCodeOpeningStart,
+      context.codeRegions,
+    )
+  ) {
+    const visiblePrefix = matchingDeferredVisiblePrefix(text, previous.visiblePrefix);
+    if (visiblePrefix !== undefined) {
+      // Before its closing delimiter arrives, core does not yet recognize the
+      // inline-code span and can strip the apparent control, producing a
+      // shortened callback such as "Use ` after". Keep that callback behind
+      // the opener; once the delimiter closes, the full literal restoration is
+      // admitted in-lane. The nonempty opener makes terminal restoration safe.
+      return {
+        visibleText: visiblePrefix,
+        deferred: {
+          visiblePrefix,
+          terminalRestorable: true,
+          pluralWrapperSawRecognizedXmlPayload:
+            previous.pluralWrapperSawRecognizedXmlPayload,
+          inlineCodeOpeningStart: previous.inlineCodeOpeningStart,
+          plainToolParameterContinuation:
+            previous.plainToolParameterContinuation,
+        },
+      };
+    }
+  }
   if (
     previous &&
     previous.visiblePrefix.trimEnd() !== previous.visiblePrefix &&
@@ -1317,7 +2666,8 @@ function deferCoreStrippedTagTail(
   ) {
     return { visibleText: text, coreRetraction: true };
   }
-  const context = buildCoreStreamScanContext(text);
+  let anchor = composedEarlierStageAnchor(context);
+  let anchoredPluralWrapperSawRecognizedXmlPayload: boolean | undefined;
   if (
     previous &&
     text !== previous.visiblePrefix &&
@@ -1338,55 +2688,58 @@ function deferCoreStrippedTagTail(
         pluralWrapperSawRecognizedXmlPayload,
       })
     ) {
-      const hasVisiblePrefix = cleanPartialAnswerText(previous.visiblePrefix).trim().length > 0;
-      return {
-        visibleText: previous.visiblePrefix,
-        deferred: {
-          visiblePrefix: previous.visiblePrefix,
-          pluralWrapperSawRecognizedXmlPayload:
-            pluralWrapperSawRecognizedXmlPayload || undefined,
-          terminalRestorable: deferredCoreTagIsTerminalRestorable(
-            context,
-            anchored,
-            hasVisiblePrefix,
-          ),
-        },
-      };
+      anchor = anchor === undefined ? tagStart : Math.min(anchor, tagStart);
+      if (anchor === tagStart) {
+        anchoredPluralWrapperSawRecognizedXmlPayload =
+          pluralWrapperSawRecognizedXmlPayload || undefined;
+      }
     }
   }
 
-  for (const candidate of context.candidates) {
-    const pluralWrapperSawRecognizedXmlPayload =
-      candidate.kind === "tool" &&
-      candidate.tool.exactName !== undefined &&
-      PLURAL_CORE_WRAPPER_TAG_NAMES.has(candidate.tool.exactName) &&
-      candidate.tool.tagEnd !== undefined &&
-      classifyCoreToolXmlPayloadPrefix(text, candidate.tool.tagEnd) === "recognized";
-    if (
-      !coreStreamCandidateCanStillBeControl(context, candidate, {
-        pluralWrapperSawRecognizedXmlPayload,
-      })
-    ) {
-      continue;
-    }
-    const tagStart = candidate.start;
-    const visiblePrefix = text.slice(0, tagStart);
-    const hasVisiblePrefix = cleanPartialAnswerText(visiblePrefix).trim().length > 0;
-    return {
-      visibleText: visiblePrefix,
-      deferred: {
-        visiblePrefix,
-        pluralWrapperSawRecognizedXmlPayload:
-          pluralWrapperSawRecognizedXmlPayload || undefined,
-        terminalRestorable: deferredCoreTagIsTerminalRestorable(
-          context,
-          candidate,
-          hasVisiblePrefix,
-        ),
-      },
-    };
-  }
-  return { visibleText: text };
+  if (anchor === undefined) return { visibleText: text };
+
+  const visiblePrefix = text.slice(0, anchor);
+  const inlineCodeOpeningStart = unmatchedInlineCodeOpeningStart(
+    text,
+    anchor,
+    context.codeRegions,
+  );
+  const plainToolParameterContinuation =
+    plainToolXmlParameterBlockCanStillMatch(text, anchor) || undefined;
+  const promotedOuterAnchor =
+    previous !== undefined &&
+    text.startsWith(previous.visiblePrefix) &&
+    visiblePrefix.length < previous.visiblePrefix.length &&
+    previous.visiblePrefix.startsWith(visiblePrefix);
+  const hasVisiblePrefix = cleanPartialAnswerText(visiblePrefix).trim().length > 0;
+  const candidate = context.candidateByStart.get(anchor);
+  const pluralWrapperSawRecognizedXmlPayload =
+    anchoredPluralWrapperSawRecognizedXmlPayload ??
+    (candidate?.kind === "tool" &&
+    candidate.tool.exactName !== undefined &&
+    PLURAL_CORE_WRAPPER_TAG_NAMES.has(candidate.tool.exactName) &&
+    candidate.tool.tagEnd !== undefined &&
+    classifyCoreToolXmlPayloadPrefix(text, candidate.tool.tagEnd) === "recognized"
+      ? true
+      : undefined);
+  const isDirectCoreCandidate =
+    candidate !== undefined &&
+    coreStreamCandidateCanStillBeControl(context, candidate, {
+      pluralWrapperSawRecognizedXmlPayload,
+    });
+  return {
+    visibleText: visiblePrefix,
+    deferred: {
+      visiblePrefix,
+      pluralWrapperSawRecognizedXmlPayload,
+      inlineCodeOpeningStart,
+      plainToolParameterContinuation,
+      terminalRestorable: isDirectCoreCandidate
+        ? deferredCoreTagIsTerminalRestorable(context, candidate, hasVisiblePrefix)
+        : hasVisiblePrefix,
+    },
+    coreRetraction: promotedOuterAnchor || undefined,
+  };
 }
 
 function cleanPartialAnswerText(text: string): string {
@@ -2527,6 +3880,10 @@ export function createProgressDraftController(params: {
                 ? deltaBase + update.delta
                 : undefined;
           if (sourceRaw === undefined) return;
+          const previousInlineCodeOpeningStart =
+            update.replace === true
+              ? undefined
+              : lane.deferredCoreTagTail?.inlineCodeOpeningStart;
           // After isolating core's ambiguous suffix, mirror its remaining
           // partial hygiene (verified:
           // dist/message-handler.process-CcPQD8zK.js:685-698): strip reasoning +
@@ -2547,6 +3904,10 @@ export function createProgressDraftController(params: {
                 visiblePrefix: deferredTail.deferred.visiblePrefix,
                 pluralWrapperSawRecognizedXmlPayload:
                   deferredTail.deferred.pluralWrapperSawRecognizedXmlPayload,
+                inlineCodeOpeningStart:
+                  deferredTail.deferred.inlineCodeOpeningStart,
+                plainToolParameterContinuation:
+                  deferredTail.deferred.plainToolParameterContinuation,
                 terminalFallbackText: deferredTail.deferred.terminalRestorable
                   ? cleanPartialAnswerText(sourceRaw)
                   : undefined,
@@ -2571,7 +3932,13 @@ export function createProgressDraftController(params: {
             // the missed-boundary decision.
             if (deferredCoreTagTail) {
               lane.lastPartialSourceText = sourceRaw;
-              acceptRawBaseline(lane, raw, { replace: update.replace === true });
+              if (coreTailRetraction) {
+                lane.answerText = "";
+              }
+              acceptRawBaseline(lane, raw, {
+                replace: update.replace === true,
+                rebase: coreTailRetraction,
+              });
             }
             return;
           }
@@ -2626,7 +3993,11 @@ export function createProgressDraftController(params: {
             lane.answerText.length > 0 &&
             !cleaned.startsWith(lane.answerText) &&
             !raw.startsWith(lane.lastRawAnswerText) &&
-            isClosedInlineCodeRestoration(sourceRaw, lane.answerText);
+            isClosedInlineCodeRestoration(
+              sourceRaw,
+              lane.answerText,
+              previousInlineCodeOpeningStart,
+            );
           if (
             update.replace !== true &&
             !coreTailRetraction &&
