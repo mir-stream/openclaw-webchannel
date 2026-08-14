@@ -2370,6 +2370,249 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
+  it("M7l18: pinned memory markers stay deferred without hiding malformed literals or code", async () => {
+    for (const source of [
+      "Hello <relevant_memories>secret</relevant_memories> there",
+      'Hello < relevant-memories-x="1">secret</ relevant-memories> there',
+      "Hello <relevant_memories>a<relevant_memories>b</relevant_memories>c</relevant_memories> there",
+    ]) {
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
+      await h.draft.drain();
+      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+        sanitizeAssistantVisibleText(source),
+      ]);
+      expect(successfulIds(h.frames)).toHaveLength(1);
+    }
+
+    for (const source of [
+      "<relevant_memories>secret</relevant_memories>",
+      "<relevant-memories>secret</relevant-memories>",
+      "</relevant_memories>",
+    ]) {
+      expect(sanitizeAssistantVisibleText(source)).toBe("");
+      const hidden = makeDraftHarness();
+      hidden.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedCoreDistinctPartials(source)) hidden.draft.pushAnswerText({ text });
+      await hidden.draft.drain();
+      expect(hidden.frames).toEqual([]);
+    }
+
+    for (const source of [
+      "<relevant_memoriesX>",
+      "<relevant_memories<",
+      'Use `<relevant_memories>x</relevant_memories>` literally',
+    ]) {
+      expect(sanitizeAssistantVisibleText(source)).toBe(source);
+      const literal = makeDraftHarness();
+      literal.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedCoreDistinctPartials(source)) literal.draft.pushAnswerText({ text });
+      await literal.draft.drain();
+      expect(literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+        source,
+      ]);
+      expect(successfulIds(literal.frames)).toHaveLength(1);
+    }
+
+    for (const [observed, completed] of [
+      ["<relevant_mem", "<relevant_memories>x</relevant_memories>"],
+      [
+        "<parameter><relevant_mem",
+        "<parameter><relevant_memories>x</relevant_memories></parameter>",
+      ],
+    ] as const) {
+      expect(sanitizeAssistantVisibleText(observed)).toBe(observed);
+      expect(sanitizeAssistantVisibleText(completed)).toBe("");
+      const coalesced = makeDraftHarness();
+      coalesced.draft.handleAssistantMessageBoundary();
+      coalesced.draft.pushAnswerText({ text: observed });
+      // The completed cumulative provider chunk sanitizes to empty, so core
+      // never forwards it to clear an unsafe anchor-zero fallback.
+      await coalesced.draft.drain();
+      expect(coalesced.frames).toEqual([]);
+    }
+  });
+
+  it("M7l19: model special tokens follow mixed-pipe and overlap-code grammar", async () => {
+    for (const source of [
+      "Hello<|assistant|>there",
+      "Hello<｜assistant|>there",
+      "Hello<|a>b｜>there",
+    ]) {
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
+      await h.draft.drain();
+      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+        sanitizeAssistantVisibleText(source),
+      ]);
+      expect(successfulIds(h.frames)).toHaveLength(1);
+    }
+
+    for (const source of ["<|assistant|>", "<｜assistant|>", "<｜assistant｜>"]) {
+      expect(sanitizeAssistantVisibleText(source)).toBe("");
+      const hidden = makeDraftHarness();
+      hidden.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedCoreDistinctPartials(source)) hidden.draft.pushAnswerText({ text });
+      await hidden.draft.drain();
+      expect(hidden.frames).toEqual([]);
+    }
+
+    for (const source of [
+      "<|a|x>",
+      "Use `<|assistant|>` literally",
+      "<|a`x|>`",
+    ]) {
+      expect(sanitizeAssistantVisibleText(source)).toBe(source);
+      const literal = makeDraftHarness();
+      literal.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedCoreDistinctPartials(source)) literal.draft.pushAnswerText({ text });
+      await literal.draft.drain();
+      expect(literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+        source,
+      ]);
+      expect(successfulIds(literal.frames)).toHaveLength(1);
+    }
+
+    for (const [observed, completed] of [
+      ["<|assist", "<|assistant|>"],
+      ["<parameter><|assist", "<parameter><|assistant|></parameter>"],
+    ] as const) {
+      expect(sanitizeAssistantVisibleText(observed)).toBe(observed);
+      expect(sanitizeAssistantVisibleText(completed)).toBe("");
+      const coalesced = makeDraftHarness();
+      coalesced.draft.handleAssistantMessageBoundary();
+      coalesced.draft.pushAnswerText({ text: observed });
+      await coalesced.draft.drain();
+      expect(coalesced.frames).toEqual([]);
+    }
+  });
+
+  it("M7l20: MiniMax invoke terminal safety uses the first textual close", async () => {
+    for (const source of [
+      "<invoke><invoke>x</invoke>safe</invoke>",
+      "<invoke><invoke>x</invoke>safe",
+      "<invoke><invoke>x</invoke>safe</invoke><minimax:tool_call>",
+      "<invoke><invoke>x</invoke>safe<minimax:tool_call>",
+      "Hello <invoke><invoke>x</invoke>safe</invoke><minimax:tool_call> there",
+      "Hello <invoke-x>x</invoke><minimax:tool_call> there",
+    ]) {
+      const warn = vi.fn();
+      const h = makeDraftHarness({ logger: { warn } });
+      h.draft.handleAssistantMessageBoundary();
+      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
+      await h.draft.drain();
+      const expected = sanitizeAssistantVisibleText(source);
+      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual(
+        expected ? [expected] : [],
+      );
+      expect(successfulIds(h.frames)).toHaveLength(expected ? 1 : 0);
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
+    }
+
+    const observed = "<invoke><invoke>x</invoke>safe</invoke>";
+    const completed = `${observed}<minimax:tool_call>`;
+    expect(sanitizeAssistantVisibleText(observed)).toBe(observed);
+    expect(sanitizeAssistantVisibleText(completed)).toBe("safe</invoke>");
+    const coalesced = makeDraftHarness();
+    coalesced.draft.handleAssistantMessageBoundary();
+    coalesced.draft.pushAnswerText({ text: observed });
+    coalesced.draft.pushAnswerText({ text: sanitizeAssistantVisibleText(completed) });
+    await coalesced.draft.drain();
+    expect(coalesced.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      "safe</invoke>",
+    ]);
+    expect(successfulIds(coalesced.frames)).toHaveLength(1);
+
+    for (const observedWithQuotedClose of [
+      '<invoke a="</invoke>">x</invoke>',
+      '<invoke-x>x</invoke>',
+    ]) {
+      const completedWithGate = `${observedWithQuotedClose}<minimax:tool_call>`;
+      expect(sanitizeAssistantVisibleText(observedWithQuotedClose)).toBe(
+        observedWithQuotedClose,
+      );
+      expect(sanitizeAssistantVisibleText(completedWithGate)).toBe("");
+      const suppressed = makeDraftHarness();
+      suppressed.draft.handleAssistantMessageBoundary();
+      suppressed.draft.pushAnswerText({ text: observedWithQuotedClose });
+      // MiniMax's first `>` / first-close regex can consume this entire prefix
+      // when a coalesced provider chunk adds the global gate.
+      await suppressed.draft.drain();
+      expect(suppressed.frames).toEqual([]);
+    }
+  });
+
+  it("M7l22: standalone-function close matching ignores quoted close lookalikes", async () => {
+    const toolOnly = '<function name="bash">{"x":"</function>"}</function>';
+    expect(sanitizeAssistantVisibleText(toolOnly)).toBe("");
+    const hidden = makeDraftHarness();
+    hidden.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedCoreDistinctPartials(toolOnly)) hidden.draft.pushAnswerText({ text });
+    await hidden.draft.drain();
+    expect(hidden.frames).toEqual([]);
+
+    const visible = `Hello: ${toolOnly} there`;
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of pinnedCoreDistinctPartials(visible)) h.draft.pushAnswerText({ text });
+    await h.draft.drain();
+    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      sanitizeAssistantVisibleText(visible),
+    ]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+
+    const observed = '<function name="bash">{"x":"</function>"';
+    expect(sanitizeAssistantVisibleText(observed)).toBe(observed);
+    expect(toolOnly.startsWith(observed)).toBe(true);
+    const coalesced = makeDraftHarness();
+    coalesced.draft.handleAssistantMessageBoundary();
+    coalesced.draft.pushAnswerText({ text: observed });
+    // The full provider callback sanitizes to a suppressed empty string. The
+    // quoted inner close must not make the earlier prefix terminal-restorable.
+    await coalesced.draft.drain();
+    expect(coalesced.frames).toEqual([]);
+  });
+
+  it("M7l21: core-marker scanning grows linearly for repeated invalid opens and closes", async () => {
+    const nativeIndexOf = String.prototype.indexOf;
+    const measureExactSourceScans = async (source: string): Promise<number> => {
+      let scans = 0;
+      const indexOf = vi
+        .spyOn(String.prototype, "indexOf")
+        .mockImplementation(function (this: string, search: string, position?: number) {
+          if (String(this) === source && search === "<") scans += 1;
+          return nativeIndexOf.call(this, search, position);
+        });
+      try {
+        const h = makeDraftHarness();
+        h.draft.handleAssistantMessageBoundary();
+        h.draft.pushAnswerText({ text: source });
+        await h.draft.drain();
+        expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+          source,
+        ]);
+      } finally {
+        indexOf.mockRestore();
+      }
+      return scans;
+    };
+
+    for (const repeated of [
+      (n: number) => "<tool_call>literal ".repeat(n) + "<parameter>x",
+      (n: number) => "</invoke>literal ".repeat(n) + "<parameter>x",
+    ]) {
+      const smallN = 256;
+      const largeN = 1024;
+      const smallScans = await measureExactSourceScans(repeated(smallN));
+      const largeScans = await measureExactSourceScans(repeated(largeN));
+      expect(smallScans).toBeLessThanOrEqual(smallN * 2 + 20);
+      expect(largeScans).toBeLessThanOrEqual(largeN * 2 + 20);
+      expect(largeScans).toBeLessThanOrEqual(smallScans * 5 + 20);
+    }
+  });
+
   it("M7l11: an inline close plus suffix restores in-lane across unequal delimiters", async () => {
     const source = 'Use ``<tool_call>{"x":1}</tool_call> after` literally';
     const beforeClosingDelimiter = source.slice(0, source.indexOf("` literally"));

@@ -308,8 +308,9 @@ export type PartialAnswerUpdate = { text?: string; delta?: string; replace?: tru
 
 /**
  * Pinned OpenClaw 2026.7.1-2 streaming grammar: TOOL_CALL_TAG_NAMES, the
- * reasoning sanitizer's `final`, plus the separate MiniMax wrapper and
- * standalone-parameter passes. Keep this list in sync when the core pin moves.
+ * reasoning sanitizer's `final`, plus the separate MiniMax, memory-block, and
+ * model-special-token passes. Keep these classifiers in sync when the core pin
+ * moves.
  */
 const CORE_STRIPPED_STREAM_TAG_NAMES = [
   "tool_call",
@@ -346,8 +347,6 @@ const CORE_TOOL_XML_PAYLOAD_TAG_NAMES = [
   "antml:argument",
   "antml:arguments",
 ] as const;
-const CORE_TOOL_XML_PAYLOAD_START_RE =
-  /^\s*(?:\r?\n\s*)?<(?:antml:)?(?:function_call|tool_call|function|invoke|parameters?|arguments?)\b/i;
 const XML_TAG_NAME_CHAR_RE = /[A-Za-z0-9_.:-]/;
 const PLURAL_CORE_WRAPPER_TAG_NAMES = new Set<CoreStrippedStreamTagName>([
   "function_calls",
@@ -363,34 +362,95 @@ type CoreStrippedTagCandidate = {
   tagEnd?: number;
 };
 
-function findXmlTagEnd(text: string, start: number): number | undefined {
-  let quote: "\"" | "'" | undefined;
-  let escaped = false;
-  for (let index = start; index < text.length; index += 1) {
+type CoreMemoryMarkerCandidate = {
+  isClose: boolean;
+  markerEnd?: number;
+};
+
+type CoreModelTokenCandidate = {
+  tokenEnd?: number;
+};
+
+type CoreStreamCandidate =
+  | {
+      kind: "tool";
+      start: number;
+      tool: CoreStrippedTagCandidate;
+      insideCode: boolean;
+      matchingCloseEnd?: number;
+      firstInvokeCloseEnd?: number;
+      completeOpenBeforeMask: number;
+    }
+  | {
+      kind: "memory";
+      start: number;
+      memory: CoreMemoryMarkerCandidate;
+      insideCode: boolean;
+    }
+  | {
+      kind: "model-token";
+      start: number;
+      modelToken: CoreModelTokenCandidate;
+      insideCode: boolean;
+      overlapsCode: boolean;
+    };
+
+type CoreStreamScanContext = {
+  text: string;
+  codeRegions: ReturnType<typeof findCodeRegions>;
+  candidates: CoreStreamCandidate[];
+  candidateByStart: Map<number, CoreStreamCandidate>;
+};
+
+const CORE_TAG_NAME_BITS = new Map<CoreStrippedStreamTagName, number>(
+  CORE_STRIPPED_STREAM_TAG_NAMES.map((name, index) => [name, 1 << index]),
+);
+
+function buildXmlTagEndAt(text: string): Int32Array {
+  // `findXmlTagEnd` is a five-state automaton. Evaluate every suffix once so
+  // many exact-name candidates inside escaped quoted attributes cannot each
+  // rescan the same remainder. Zero means no unquoted `>` before an unquoted
+  // `<`; every real end offset is positive.
+  const normal = new Int32Array(text.length + 1);
+  const singleQuoted = new Int32Array(text.length + 1);
+  const doubleQuoted = new Int32Array(text.length + 1);
+  const singleEscaped = new Int32Array(text.length + 1);
+  const doubleEscaped = new Int32Array(text.length + 1);
+  for (let index = text.length - 1; index >= 0; index -= 1) {
     const char = text[index]!;
-    if (quote) {
-      if (escaped) {
-        escaped = false;
-      } else if (char === "\\") {
-        escaped = true;
-      } else if (char === quote) {
-        quote = undefined;
-      }
-      continue;
-    }
-    if (char === "\"" || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === "<") return undefined;
-    if (char === ">") return index + 1;
+    normal[index] =
+      char === "<"
+        ? 0
+        : char === ">"
+          ? index + 1
+          : char === "'"
+            ? singleQuoted[index + 1]!
+            : char === "\""
+              ? doubleQuoted[index + 1]!
+              : normal[index + 1]!;
+    singleQuoted[index] =
+      char === "\\"
+        ? singleEscaped[index + 1]!
+        : char === "'"
+          ? normal[index + 1]!
+          : singleQuoted[index + 1]!;
+    doubleQuoted[index] =
+      char === "\\"
+        ? doubleEscaped[index + 1]!
+        : char === "\""
+          ? normal[index + 1]!
+          : doubleQuoted[index + 1]!;
+    singleEscaped[index] = singleQuoted[index + 1]!;
+    doubleEscaped[index] = doubleQuoted[index + 1]!;
   }
-  return undefined;
+  return normal;
 }
 
 function classifyCoreStrippedTagAt(
   text: string,
   tagStart: number,
+  nextGreaterThanIndex: number,
+  xmlTagEndAt: Int32Array,
 ): CoreStrippedTagCandidate | undefined {
   if (text[tagStart] !== "<") return undefined;
   let cursor = tagStart + 1;
@@ -416,6 +476,26 @@ function classifyCoreStrippedTagAt(
   }
 
   const nameStart = cursor;
+  if (
+    !isClose &&
+    !hasWhitespaceAfterOpen &&
+    text.slice(nameStart, nameStart + "invoke".length).toLowerCase() === "invoke" &&
+    !/\w/.test(text[nameStart + "invoke".length] ?? "")
+  ) {
+    // Pinned MiniMax uses `<invoke\b[^>]*>` rather than an XML parser: any
+    // non-word suffix is allowed and quotes do not protect `>`.
+    const nameEnd = nameStart + "invoke".length;
+    const tagEnd = nextGreaterThanIndex >= nameEnd ? nextGreaterThanIndex + 1 : undefined;
+    return {
+      exactName: "invoke",
+      isClose: false,
+      isSelfClosing:
+        tagEnd !== undefined && /\/\s*$/.test(text.slice(nameEnd, tagEnd - 1)),
+      nameEnd,
+      nameFragment: "invoke",
+      tagEnd,
+    };
+  }
   while (XML_TAG_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
   if (cursor === nameStart) return undefined;
   const nameFragment = text.slice(nameStart, cursor).toLowerCase();
@@ -458,7 +538,8 @@ function classifyCoreStrippedTagAt(
   if (boundary !== undefined && !/\s/.test(boundary) && boundary !== "/" && boundary !== ">") {
     return undefined;
   }
-  const tagEnd = exactName ? findXmlTagEnd(text, cursor) : undefined;
+  const encodedTagEnd = exactName ? xmlTagEndAt[cursor]! : 0;
+  const tagEnd = encodedTagEnd > 0 ? encodedTagEnd : undefined;
   return {
     exactName,
     isClose,
@@ -470,10 +551,306 @@ function classifyCoreStrippedTagAt(
   };
 }
 
-function deferredCoreTagIsTerminalRestorable(
+function classifyCoreMemoryMarkerAt(
   text: string,
-  tagStart: number,
-  candidate: CoreStrippedTagCandidate,
+  markerStart: number,
+): CoreMemoryMarkerCandidate | undefined {
+  if (text[markerStart] !== "<") return undefined;
+  let cursor = markerStart + 1;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  let isClose = false;
+  if (text[cursor] === "/") {
+    isClose = true;
+    cursor += 1;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  }
+  const names = ["relevant_memories", "relevant-memories"] as const;
+  let fragment = "";
+  let exactName: (typeof names)[number] | undefined;
+  while (cursor < text.length) {
+    const nextFragment = fragment + text[cursor]!.toLowerCase();
+    const matchingNames = names.filter((name) => name.startsWith(nextFragment));
+    if (matchingNames.length === 0) break;
+    fragment = nextFragment;
+    cursor += 1;
+    exactName = matchingNames.find((name) => name === fragment);
+    if (exactName) break;
+  }
+  if (!exactName) {
+    return cursor === text.length && names.some((name) => name.startsWith(fragment))
+      ? { isClose }
+      : undefined;
+  }
+  // Pinned MEMORY_TAG_RE uses `\b` after the final `s`.
+  if (/\w/.test(text[cursor] ?? "")) return undefined;
+  for (; cursor < text.length; cursor += 1) {
+    const char = text[cursor]!;
+    if (char === "<") return undefined;
+    if (char === ">") return { isClose, markerEnd: cursor + 1 };
+  }
+  return { isClose };
+}
+
+function classifyCoreModelTokenAt(
+  text: string,
+  tokenStart: number,
+  nextPipeIndex: number,
+): CoreModelTokenCandidate | undefined {
+  if (text[tokenStart] !== "<") return undefined;
+  const openingPipe = text[tokenStart + 1];
+  if (openingPipe !== "|" && openingPipe !== "｜") return undefined;
+  if (nextPipeIndex < 0) return {};
+  if (nextPipeIndex + 1 === text.length) return {};
+  return text[nextPipeIndex + 1] === ">"
+    ? { tokenEnd: nextPipeIndex + 2 }
+    : undefined;
+}
+
+function classifyCoreStreamCandidateAt(
+  text: string,
+  start: number,
+  nextModelPipeIndex: number,
+  nextGreaterThanIndex: number,
+  xmlTagEndAt: Int32Array,
+):
+  | { kind: "tool"; tool: CoreStrippedTagCandidate }
+  | { kind: "memory"; memory: CoreMemoryMarkerCandidate }
+  | { kind: "model-token"; modelToken: CoreModelTokenCandidate }
+  | undefined {
+  const modelToken = classifyCoreModelTokenAt(text, start, nextModelPipeIndex);
+  if (modelToken) return { kind: "model-token", modelToken };
+  const memory = classifyCoreMemoryMarkerAt(text, start);
+  if (memory) return { kind: "memory", memory };
+  const tool = classifyCoreStrippedTagAt(
+    text,
+    start,
+    nextGreaterThanIndex,
+    xmlTagEndAt,
+  );
+  return tool ? { kind: "tool", tool } : undefined;
+}
+
+function candidateIsInsideCode(
+  start: number,
+  regions: ReturnType<typeof findCodeRegions>,
+): boolean {
+  // Regions are sorted by the public helper. Binary search keeps membership
+  // bounded when a message contains many code spans and many candidate tags.
+  let low = 0;
+  let high = regions.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (regions[mid]!.end <= start) low = mid + 1;
+    else high = mid;
+  }
+  const region = regions[low];
+  return region !== undefined && start >= region.start && start < region.end;
+}
+
+function candidateOverlapsCode(
+  start: number,
+  end: number,
+  regions: ReturnType<typeof findCodeRegions>,
+): boolean {
+  let low = 0;
+  let high = regions.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (regions[mid]!.end <= start) low = mid + 1;
+    else high = mid;
+  }
+  const region = regions[low];
+  return region !== undefined && start < region.end && end > region.start;
+}
+
+function indexQuoteAwareFunctionCloseEnds(
+  text: string,
+  candidateByStart: Map<number, CoreStreamCandidate>,
+): void {
+  const openings: Array<Extract<CoreStreamCandidate, { kind: "tool" }>> = [];
+  let quote: "\"" | "'" | undefined;
+  let escaped = false;
+
+  for (let index = 0; index < text.length; ) {
+    const parsed = candidateByStart.get(index);
+    const functionCandidate =
+      parsed?.kind === "tool" &&
+      parsed.tool.exactName === "function" &&
+      parsed.tool.tagEnd !== undefined
+        ? parsed
+        : undefined;
+
+    if (openings.length === 0) {
+      if (functionCandidate && !functionCandidate.tool.isClose) {
+        if (!functionCandidate.tool.isSelfClosing) openings.push(functionCandidate);
+        index = functionCandidate.tool.tagEnd!;
+      } else {
+        index += 1;
+      }
+      quote = undefined;
+      escaped = false;
+      continue;
+    }
+
+    const char = text[index]!;
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = undefined;
+      index += 1;
+      continue;
+    }
+    if (char === "\"" || char === "'") {
+      quote = char;
+      index += 1;
+      continue;
+    }
+    if (!functionCandidate) {
+      index += 1;
+      continue;
+    }
+
+    if (functionCandidate.tool.isClose) {
+      const opening = openings.pop();
+      if (opening) opening.matchingCloseEnd = functionCandidate.tool.tagEnd;
+    } else if (!functionCandidate.tool.isSelfClosing) {
+      openings.push(functionCandidate);
+    }
+    index = functionCandidate.tool.tagEnd!;
+  }
+}
+
+function buildCoreStreamScanContext(text: string): CoreStreamScanContext {
+  const codeRegions = findCodeRegions(text);
+  const candidates: CoreStreamCandidate[] = [];
+  const candidateByStart = new Map<number, CoreStreamCandidate>();
+  // MODEL_SPECIAL_TOKEN_RE may span arbitrary `<` / `>` bytes until its first
+  // narrow or full-width pipe. Precomputing that next pipe keeps a run of
+  // incomplete `<|...` candidates linear instead of rescanning the tail for
+  // every opening byte.
+  const nextModelPipeAt = new Int32Array(text.length + 1);
+  const nextGreaterThanAt = new Int32Array(text.length + 1);
+  const xmlTagEndAt = buildXmlTagEndAt(text);
+  let nextModelPipe = -1;
+  let nextGreaterThan = -1;
+  nextModelPipeAt[text.length] = nextModelPipe;
+  nextGreaterThanAt[text.length] = nextGreaterThan;
+  for (let index = text.length - 1; index >= 0; index -= 1) {
+    if (text[index] === "|" || text[index] === "｜") nextModelPipe = index;
+    if (text[index] === ">") nextGreaterThan = index;
+    nextModelPipeAt[index] = nextModelPipe;
+    nextGreaterThanAt[index] = nextGreaterThan;
+  }
+
+  for (
+    let start = text.indexOf("<");
+    start >= 0;
+    start = text.indexOf("<", start + 1)
+  ) {
+    const parsed = classifyCoreStreamCandidateAt(
+      text,
+      start,
+      nextModelPipeAt[Math.min(start + 2, text.length)]!,
+      nextGreaterThanAt[start]!,
+      xmlTagEndAt,
+    );
+    if (!parsed) continue;
+    const insideCode = candidateIsInsideCode(start, codeRegions);
+    let candidate: CoreStreamCandidate;
+    if (parsed.kind === "tool") {
+      candidate = {
+        kind: "tool",
+        start,
+        tool: parsed.tool,
+        insideCode,
+        completeOpenBeforeMask: 0,
+      };
+    } else if (parsed.kind === "memory") {
+      candidate = { kind: "memory", start, memory: parsed.memory, insideCode };
+    } else {
+      const potentialEnd = parsed.modelToken.tokenEnd ?? text.length;
+      candidate = {
+        kind: "model-token",
+        start,
+        modelToken: parsed.modelToken,
+        insideCode,
+        overlapsCode: candidateOverlapsCode(start, potentialEnd, codeRegions),
+      };
+    }
+    candidates.push(candidate);
+    candidateByStart.set(start, candidate);
+  }
+
+  let completeOpenMask = 0;
+  const openStacks = new Map<CoreStrippedStreamTagName, CoreStreamCandidate[]>();
+  for (const candidate of candidates) {
+    if (candidate.kind !== "tool") continue;
+    const tag = candidate.tool;
+    candidate.completeOpenBeforeMask = completeOpenMask;
+    const tagName = tag.exactName;
+    if (!tagName || tag.tagEnd === undefined) continue;
+    if (tag.isClose) {
+      if (tagName !== "function") {
+        const stack = openStacks.get(tagName);
+        const opening = stack?.pop();
+        if (opening?.kind === "tool") opening.matchingCloseEnd = tag.tagEnd;
+      }
+      continue;
+    }
+    const textualInvokeOpening = tagName === "invoke";
+    if (!tag.isSelfClosing || textualInvokeOpening) {
+      completeOpenMask |= CORE_TAG_NAME_BITS.get(tagName) ?? 0;
+    }
+    if (!tag.isSelfClosing && tagName !== "function") {
+      const stack = openStacks.get(tagName) ?? [];
+      stack.push(candidate);
+      openStacks.set(tagName, stack);
+    }
+  }
+  // Pinned standalone-function parsing ignores same-name markers while its
+  // body is inside a quoted string. One quote-state walk preserves that rule
+  // without rescanning the remainder for every opening candidate.
+  indexQuoteAwareFunctionCloseEnds(text, candidateByStart);
+
+  const invokeCloses = candidates.filter(
+    (candidate): candidate is Extract<CoreStreamCandidate, { kind: "tool" }> =>
+      candidate.kind === "tool" &&
+      candidate.tool.exactName === "invoke" &&
+      candidate.tool.isClose &&
+      candidate.tool.tagEnd !== undefined,
+  );
+  let invokeCloseIndex = 0;
+  for (const candidate of candidates) {
+    if (
+      candidate.kind !== "tool" ||
+      candidate.tool.exactName !== "invoke" ||
+      candidate.tool.isClose
+    ) {
+      continue;
+    }
+    // MiniMax uses `<invoke\b[^>]*>`: quotes are not special, so its opening
+    // ends at the first textual `>` after the name. A close-like substring in
+    // an attribute before that byte cannot terminate the regex body.
+    const openingGreaterThan = nextGreaterThanAt[
+      Math.min(candidate.tool.nameEnd, text.length)
+    ]!;
+    if (openingGreaterThan < 0) continue;
+    const textualOpeningEnd = openingGreaterThan + 1;
+    while (
+      invokeCloseIndex < invokeCloses.length &&
+      invokeCloses[invokeCloseIndex]!.start < textualOpeningEnd
+    ) {
+      invokeCloseIndex += 1;
+    }
+    candidate.firstInvokeCloseEnd = invokeCloses[invokeCloseIndex]?.tool.tagEnd;
+  }
+
+  return { text, codeRegions, candidates, candidateByStart };
+}
+
+function deferredCoreTagIsTerminalRestorable(
+  context: CoreStreamScanContext,
+  candidate: CoreStreamCandidate,
   hasVisiblePrefix: boolean,
 ): boolean {
   // A real control after visible prose retracts to that nonempty prefix, so
@@ -482,31 +859,31 @@ function deferredCoreTagIsTerminalRestorable(
   // not assume providers yield every intermediate byte: any one later chunk
   // may complete an incomplete name, payload, and close before we hear again.
   if (hasVisiblePrefix) return true;
-  if (candidate.isClose) return false;
+  if (candidate.kind !== "tool") return false;
+  const text = context.text;
+  const tool = candidate.tool;
+  if (tool.isClose) return false;
 
-  if (!candidate.exactName) return false;
+  if (!tool.exactName) return false;
 
-  if (candidate.tagEnd !== undefined) {
-    if (candidate.exactName === "invoke") {
-      const closeEnd = findCompleteMatchingCoreCloseEnd(
-        text,
-        candidate.tagEnd,
-        candidate.exactName,
-      );
-      // MiniMax may strip a completed bare invoke after a later global gate.
-      // Only irrevocable trailing literal text makes that retraction nonempty.
-      return (
-        closeEnd !== undefined &&
-        hasIrrevocableVisibleCoreTagText(text.slice(closeEnd))
-      );
-    }
-    if (candidate.exactName === "parameter" && !candidate.isSelfClosing) {
-      const nextTagStart = text.indexOf("<", candidate.tagEnd);
+  if (tool.exactName === "invoke") {
+    const closeEnd = candidate.firstInvokeCloseEnd;
+    // MiniMax may strip a completed bare invoke after a later global gate.
+    // Only irrevocable trailing literal text makes that retraction nonempty.
+    return (
+      closeEnd !== undefined &&
+      hasIrrevocableVisibleCoreTagText(text.slice(closeEnd))
+    );
+  }
+
+  if (tool.tagEnd !== undefined) {
+    if (tool.exactName === "parameter" && !tool.isSelfClosing) {
+      const nextTagStart = text.indexOf("<", tool.tagEnd);
       const bodyEnd = nextTagStart < 0 ? text.length : nextTagStart;
       // A later matching close unwraps a nonempty body into a delivered
       // callback, but an apparent body consisting only of another incomplete
       // control can disappear in that same coalesced callback.
-      return hasIrrevocableVisibleCoreTagText(text.slice(candidate.tagEnd, bodyEnd));
+      return hasIrrevocableVisibleCoreTagText(text.slice(tool.tagEnd, bodyEnd));
     }
     return false;
   }
@@ -515,7 +892,8 @@ function deferredCoreTagIsTerminalRestorable(
 
 function isClosedInlineCodeRestoration(text: string, previousAnswer: string): boolean {
   if (!text.includes("`") || !text.includes("<")) return false;
-  for (const region of findCodeRegions(text)) {
+  const context = buildCoreStreamScanContext(text);
+  for (const region of context.codeRegions) {
     let openingEnd = region.start;
     while (text[openingEnd] === "`") openingEnd += 1;
     // Pinned findCodeRegions allows any backtick-run length for an inline span;
@@ -529,22 +907,22 @@ function isClosedInlineCodeRestoration(text: string, previousAnswer: string): bo
     }
     if (closingStart === region.end) continue;
 
-    let containsCoreTag = false;
-    for (
-      let tagStart = text.indexOf("<", openingEnd);
-      tagStart >= 0 && tagStart < closingStart;
-      tagStart = text.indexOf("<", tagStart + 1)
-    ) {
-      const candidate = classifyCoreStrippedTagAt(text, tagStart);
-      if (
-        candidate?.exactName &&
-        candidate.tagEnd !== undefined &&
-        candidate.tagEnd <= closingStart
-      ) {
-        containsCoreTag = true;
-        break;
+    const containsCoreTag = context.candidates.some((candidate) => {
+      const end =
+        candidate.kind === "tool"
+          ? candidate.tool.tagEnd
+          : candidate.kind === "memory"
+            ? candidate.memory.markerEnd
+            : candidate.modelToken.tokenEnd;
+      if (end === undefined || end > closingStart) return false;
+      if (candidate.kind === "model-token") {
+        // MODEL_SPECIAL_TOKEN_RE preserves a whole token when any part of its
+        // match overlaps a code region, including a backtick that begins in
+        // the middle of the token.
+        return candidate.start < closingStart && end > region.start;
       }
-    }
+      return candidate.start >= openingEnd && candidate.start < closingStart;
+    });
     if (!containsCoreTag) continue;
 
     // Before the closing delimiter, core treated the same bytes as ordinary
@@ -560,40 +938,29 @@ function isClosedInlineCodeRestoration(text: string, previousAnswer: string): bo
   return false;
 }
 
-function isPotentialCoreToolXmlPayload(text: string, start: number): boolean {
-  let cursor = start;
-  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
-  if (text[cursor] !== "<") return false;
-  cursor += 1;
-  if (cursor === text.length) return true;
-  // Pinned TOOL_CALL_XML_PAYLOAD_START_RE permits whitespace before `<`, not
-  // between `<` and the nested name.
-  if (/\s/.test(text[cursor] ?? "")) return false;
-  if (text[cursor] === "/") return false;
-
-  const nameStart = cursor;
-  while (XML_TAG_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
-  if (cursor === nameStart) return false;
-  const fragment = text.slice(nameStart, cursor).toLowerCase();
-  const matches = CORE_TOOL_XML_PAYLOAD_TAG_NAMES.filter((name) => name.startsWith(fragment));
-  if (matches.length === 0) return false;
-  if (matches.includes(fragment as (typeof CORE_TOOL_XML_PAYLOAD_TAG_NAMES)[number])) {
-    const boundary = text[cursor];
-    return (
-      boundary === undefined ||
-      /\s/.test(boundary) ||
-      boundary === "/" ||
-      boundary === ">"
-    );
-  }
-  return cursor === text.length;
-}
-
 type CorePayloadPrefix = "invalid" | "possible" | "recognized";
 
 function classifyCoreToolXmlPayloadPrefix(text: string, start: number): CorePayloadPrefix {
-  if (CORE_TOOL_XML_PAYLOAD_START_RE.test(text.slice(start))) return "recognized";
-  return isPotentialCoreToolXmlPayload(text, start) ? "possible" : "invalid";
+  let cursor = start;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (text[cursor] !== "<") return "invalid";
+  cursor += 1;
+  if (cursor === text.length) return "possible";
+  if (/\s/.test(text[cursor] ?? "") || text[cursor] === "/") return "invalid";
+
+  const nameStart = cursor;
+  while (XML_TAG_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === nameStart) return "invalid";
+  const fragment = text.slice(nameStart, cursor).toLowerCase();
+  const matches = CORE_TOOL_XML_PAYLOAD_TAG_NAMES.filter((name) => name.startsWith(fragment));
+  if (matches.length === 0) return "invalid";
+  if (!matches.includes(fragment as (typeof CORE_TOOL_XML_PAYLOAD_TAG_NAMES)[number])) {
+    return cursor === text.length ? "possible" : "invalid";
+  }
+  const boundary = text[cursor];
+  return boundary === undefined || /\s/.test(boundary) || boundary === "/" || boundary === ">"
+    ? "recognized"
+    : "invalid";
 }
 
 /** Prefix recognizer for pinned core's TOOL_CALL_JSON_PAYLOAD_START_RE. */
@@ -647,55 +1014,6 @@ function classifyCoreJsonPayloadPrefix(text: string, start: number): CorePayload
   return "possible";
 }
 
-function endsInsideQuotedString(text: string, start: number, end: number): boolean {
-  let quote: "\"" | "'" | undefined;
-  let escaped = false;
-  for (let index = start; index < end; index += 1) {
-    const char = text[index]!;
-    if (!quote) {
-      if (char === "\"" || char === "'") quote = char;
-      continue;
-    }
-    if (escaped) {
-      escaped = false;
-    } else if (char === "\\") {
-      escaped = true;
-    } else if (char === quote) {
-      quote = undefined;
-    }
-  }
-  return quote !== undefined;
-}
-
-function findCompleteMatchingCoreCloseEnd(
-  text: string,
-  contentStart: number,
-  tagName: CoreStrippedStreamTagName,
-): number | undefined {
-  let depth = 1;
-  for (
-    let tagStart = text.indexOf("<", contentStart);
-    tagStart >= 0;
-    tagStart = text.indexOf("<", tagStart + 1)
-  ) {
-    const tag = classifyCoreStrippedTagAt(text, tagStart);
-    if (
-      tag?.exactName !== tagName ||
-      tag.tagEnd === undefined ||
-      (tagName === "function" && endsInsideQuotedString(text, contentStart, tagStart))
-    ) {
-      continue;
-    }
-    if (tag.isClose) {
-      depth -= 1;
-      if (depth === 0) return tag.tagEnd;
-    } else if (!tag.isSelfClosing) {
-      depth += 1;
-    }
-  }
-  return undefined;
-}
-
 function isPotentialMatchingCoreClosePrefix(
   text: string,
   contentStart: number,
@@ -727,19 +1045,29 @@ function isPotentialMatchingCoreClosePrefix(
 }
 
 function isEmptyPluralWrapper(
-  text: string,
+  context: CoreStreamScanContext,
   contentStart: number,
   tagName: CoreStrippedStreamTagName,
   matchingCloseEnd: number,
 ): boolean {
+  const text = context.text;
   let closeStart = contentStart;
   while (/\s/.test(text[closeStart] ?? "")) closeStart += 1;
-  const close = classifyCoreStrippedTagAt(text, closeStart);
+  const candidate = context.candidateByStart.get(closeStart);
+  const close = candidate?.kind === "tool" ? candidate.tool : undefined;
   return (
     close?.isClose === true &&
     close.exactName === tagName &&
     close.tagEnd === matchingCloseEnd
   );
+}
+
+function candidateHasCompleteOpenBefore(
+  candidate: Extract<CoreStreamCandidate, { kind: "tool" }>,
+  tagName: CoreStrippedStreamTagName,
+): boolean {
+  const bit = CORE_TAG_NAME_BITS.get(tagName) ?? 0;
+  return (candidate.completeOpenBeforeMask & bit) !== 0;
 }
 
 type AdjacentFunctionResponsePrefix = "invalid" | "possible" | "danger";
@@ -774,30 +1102,6 @@ function classifyAdjacentFunctionResponsePrefix(
   return fragment === target.slice(0, -1) ? "danger" : "possible";
 }
 
-function hasCompleteMatchingCoreOpenBefore(
-  text: string,
-  closeStart: number,
-  tagName: CoreStrippedStreamTagName,
-): boolean {
-  for (
-    let tagStart = text.indexOf("<");
-    tagStart >= 0 && tagStart < closeStart;
-    tagStart = text.indexOf("<", tagStart + 1)
-  ) {
-    const tag = classifyCoreStrippedTagAt(text, tagStart);
-    if (
-      tag?.isClose === false &&
-      tag.exactName === tagName &&
-      tag.tagEnd !== undefined &&
-      !tag.isSelfClosing &&
-      tag.tagEnd <= closeStart
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function isStandaloneFunctionToolCandidate(
   text: string,
   tagStart: number,
@@ -815,11 +1119,13 @@ function isStandaloneFunctionToolCandidate(
 }
 
 function coreStrippedTagCanStillBeControl(
-  text: string,
-  tagStart: number,
-  tag: CoreStrippedTagCandidate,
+  context: CoreStreamScanContext,
+  candidate: Extract<CoreStreamCandidate, { kind: "tool" }>,
   options?: { pluralWrapperSawRecognizedXmlPayload?: boolean },
 ): boolean {
+  const text = context.text;
+  const tagStart = candidate.start;
+  const tag = candidate.tool;
   const tagName = tag.exactName;
   if (!tagName) {
     const possibleNames = CORE_STRIPPED_STREAM_TAG_NAMES.filter((name) =>
@@ -830,7 +1136,7 @@ function coreStrippedTagCanStillBeControl(
       tag.isClose &&
       tag.nameFragment.length > 0 &&
       (soleBareClose === "invoke" || soleBareClose === "parameter") &&
-      !hasCompleteMatchingCoreOpenBefore(text, tagStart, soleBareClose)
+      !candidateHasCompleteOpenBefore(candidate, soleBareClose)
     ) {
       return false;
     }
@@ -840,7 +1146,7 @@ function coreStrippedTagCanStillBeControl(
     if (
       tag.isClose &&
       (tagName === "invoke" || tagName === "parameter") &&
-      !hasCompleteMatchingCoreOpenBefore(text, tagStart, tagName)
+      !candidateHasCompleteOpenBefore(candidate, tagName)
     ) {
       // A standalone unfinished close cannot acquire a matching opening tag by
       // appending text. Pinned MiniMax/parameter passes therefore preserve it.
@@ -862,12 +1168,12 @@ function coreStrippedTagCanStillBeControl(
   if (tag.isClose) {
     if (
       PLURAL_CORE_WRAPPER_TAG_NAMES.has(tagName) &&
-      hasCompleteMatchingCoreOpenBefore(text, tagStart, tagName)
+      candidateHasCompleteOpenBefore(candidate, tagName)
     ) {
       return false;
     }
     if (tagName === "invoke" || tagName === "parameter") {
-      return hasCompleteMatchingCoreOpenBefore(text, tagStart, tagName);
+      return candidateHasCompleteOpenBefore(candidate, tagName);
     }
     return true;
   }
@@ -884,7 +1190,7 @@ function coreStrippedTagCanStillBeControl(
     return true;
   }
 
-  const matchingCloseEnd = findCompleteMatchingCoreCloseEnd(text, tag.tagEnd, tagName);
+  const matchingCloseEnd = candidate.matchingCloseEnd;
   const xmlPayload = classifyCoreToolXmlPayloadPrefix(text, tag.tagEnd);
   const isPluralWrapper = PLURAL_CORE_WRAPPER_TAG_NAMES.has(tagName);
   const pluralXmlPath =
@@ -895,7 +1201,7 @@ function coreStrippedTagCanStillBeControl(
     return (
       isPluralWrapper &&
       (pluralXmlPath ||
-        isEmptyPluralWrapper(text, tag.tagEnd, tagName, matchingCloseEnd)) &&
+        isEmptyPluralWrapper(context, tag.tagEnd, tagName, matchingCloseEnd)) &&
       classifyAdjacentFunctionResponsePrefix(text, matchingCloseEnd) !== "invalid"
     );
   }
@@ -937,6 +1243,23 @@ function coreStrippedTagCanStillBeControl(
   );
 }
 
+function coreStreamCandidateIsCodeProtected(candidate: CoreStreamCandidate): boolean {
+  return (
+    candidate.insideCode ||
+    (candidate.kind === "model-token" && candidate.overlapsCode)
+  );
+}
+
+function coreStreamCandidateCanStillBeControl(
+  context: CoreStreamScanContext,
+  candidate: CoreStreamCandidate,
+  options?: { pluralWrapperSawRecognizedXmlPayload?: boolean },
+): boolean {
+  if (coreStreamCandidateIsCodeProtected(candidate)) return false;
+  if (candidate.kind !== "tool") return true;
+  return coreStrippedTagCanStillBeControl(context, candidate, options);
+}
+
 /**
  * Is some already-observed text guaranteed to survive any later completion of
  * an ambiguous core-tag suffix? This is intentionally conservative: once the
@@ -945,16 +1268,10 @@ function coreStrippedTagCanStillBeControl(
  * entirely when one coalesced provider chunk completes its payload and close.
  */
 function hasIrrevocableVisibleCoreTagText(text: string): boolean {
-  const codeRegions = findCodeRegions(text);
-  for (
-    let tagStart = text.indexOf("<");
-    tagStart >= 0;
-    tagStart = text.indexOf("<", tagStart + 1)
-  ) {
-    if (isInsideCode(tagStart, codeRegions)) continue;
-    const candidate = classifyCoreStrippedTagAt(text, tagStart);
-    if (candidate && coreStrippedTagCanStillBeControl(text, tagStart, candidate)) {
-      return cleanPartialAnswerText(text.slice(0, tagStart)).trim().length > 0;
+  const context = buildCoreStreamScanContext(text);
+  for (const candidate of context.candidates) {
+    if (coreStreamCandidateCanStillBeControl(context, candidate)) {
+      return cleanPartialAnswerText(text.slice(0, candidate.start)).trim().length > 0;
     }
   }
   return cleanPartialAnswerText(text).trim().length > 0;
@@ -1000,24 +1317,24 @@ function deferCoreStrippedTagTail(
   ) {
     return { visibleText: text, coreRetraction: true };
   }
-  const codeRegions = findCodeRegions(text);
+  const context = buildCoreStreamScanContext(text);
   if (
     previous &&
     text !== previous.visiblePrefix &&
-    text.startsWith(previous.visiblePrefix) &&
-    !isInsideCode(previous.visiblePrefix.length, codeRegions)
+    text.startsWith(previous.visiblePrefix)
   ) {
     const tagStart = previous.visiblePrefix.length;
-    const anchored = classifyCoreStrippedTagAt(text, tagStart);
+    const anchored = context.candidateByStart.get(tagStart);
     const pluralWrapperSawRecognizedXmlPayload =
       previous.pluralWrapperSawRecognizedXmlPayload === true ||
-      (anchored?.exactName !== undefined &&
-        PLURAL_CORE_WRAPPER_TAG_NAMES.has(anchored.exactName) &&
-        anchored.tagEnd !== undefined &&
-        classifyCoreToolXmlPayloadPrefix(text, anchored.tagEnd) === "recognized");
+      (anchored?.kind === "tool" &&
+        anchored.tool.exactName !== undefined &&
+        PLURAL_CORE_WRAPPER_TAG_NAMES.has(anchored.tool.exactName) &&
+        anchored.tool.tagEnd !== undefined &&
+        classifyCoreToolXmlPayloadPrefix(text, anchored.tool.tagEnd) === "recognized");
     if (
       anchored &&
-      coreStrippedTagCanStillBeControl(text, tagStart, anchored, {
+      coreStreamCandidateCanStillBeControl(context, anchored, {
         pluralWrapperSawRecognizedXmlPayload,
       })
     ) {
@@ -1029,8 +1346,7 @@ function deferCoreStrippedTagTail(
           pluralWrapperSawRecognizedXmlPayload:
             pluralWrapperSawRecognizedXmlPayload || undefined,
           terminalRestorable: deferredCoreTagIsTerminalRestorable(
-            text,
-            tagStart,
+            context,
             anchored,
             hasVisiblePrefix,
           ),
@@ -1039,26 +1355,21 @@ function deferCoreStrippedTagTail(
     }
   }
 
-  for (
-    let tagStart = text.indexOf("<");
-    tagStart >= 0;
-    tagStart = text.indexOf("<", tagStart + 1)
-  ) {
-    if (isInsideCode(tagStart, codeRegions)) continue;
-    const candidate = classifyCoreStrippedTagAt(text, tagStart);
+  for (const candidate of context.candidates) {
     const pluralWrapperSawRecognizedXmlPayload =
-      candidate?.exactName !== undefined &&
-      PLURAL_CORE_WRAPPER_TAG_NAMES.has(candidate.exactName) &&
-      candidate.tagEnd !== undefined &&
-      classifyCoreToolXmlPayloadPrefix(text, candidate.tagEnd) === "recognized";
+      candidate.kind === "tool" &&
+      candidate.tool.exactName !== undefined &&
+      PLURAL_CORE_WRAPPER_TAG_NAMES.has(candidate.tool.exactName) &&
+      candidate.tool.tagEnd !== undefined &&
+      classifyCoreToolXmlPayloadPrefix(text, candidate.tool.tagEnd) === "recognized";
     if (
-      !candidate ||
-      !coreStrippedTagCanStillBeControl(text, tagStart, candidate, {
+      !coreStreamCandidateCanStillBeControl(context, candidate, {
         pluralWrapperSawRecognizedXmlPayload,
       })
     ) {
       continue;
     }
+    const tagStart = candidate.start;
     const visiblePrefix = text.slice(0, tagStart);
     const hasVisiblePrefix = cleanPartialAnswerText(visiblePrefix).trim().length > 0;
     return {
@@ -1068,8 +1379,7 @@ function deferCoreStrippedTagTail(
         pluralWrapperSawRecognizedXmlPayload:
           pluralWrapperSawRecognizedXmlPayload || undefined,
         terminalRestorable: deferredCoreTagIsTerminalRestorable(
-          text,
-          tagStart,
+          context,
           candidate,
           hasVisiblePrefix,
         ),
