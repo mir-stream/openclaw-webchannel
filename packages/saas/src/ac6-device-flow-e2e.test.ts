@@ -840,8 +840,19 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     };
 
     // Step 2: Approve enrollment
-    await postJson(`${SAAS_BASE_URL}/approve`, {
+    const approveResponse = await postJson(`${SAAS_BASE_URL}/approve`, {
       user_code: enrollResponse.user_code,
+    }) as {
+      success: boolean;
+      peerId: string;
+      tenant: string;
+      accountId: string;
+    };
+
+    expect(approveResponse).toMatchObject({
+      success: true,
+      tenant: TEST_TENANT,
+      accountId,
     });
 
     // Step 3: Poll for credentials (poll interval is 0 in tests)
@@ -856,26 +867,44 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       peerId: string;
     };
 
-    expect(pollResponse.creds).toBeDefined();
+    expect(pollResponse.creds.userJwt).toBeDefined();
+    expect(pollResponse.creds.userSeed).toBeDefined();
+    expect(pollResponse.peerId).toBe(approveResponse.peerId);
 
-    // Step 4: Get bootstrap JWT for browser
+    // Step 4: Bootstrap the enrolled tuple through the issuer that owns the
+    // enrollment registry. Its response must pin the key approved above.
     const deviceKey = await generateDeviceKey();
     const bootstrapResponse = await postJson(
-      `${BOOTSTRAP_BASE_URL}/bootstrap`,
+      `${SAAS_BASE_URL}/test/bootstrap-jwt`,
       {
-        devicePublicKey: deviceKey,
-        accountId: TEST_ACCOUNT_ID,
+        deviceX25519PublicKey: deviceKey,
+        peerId: pollResponse.peerId,
+        accountId,
         tenant: TEST_TENANT,
       },
     ) as {
       jwt: string;
+      peerId: string;
+      agentPublicKey?: string;
     };
 
     expect(bootstrapResponse.jwt).toBeDefined();
+    expect(bootstrapResponse.peerId).toBe(pollResponse.peerId);
+    expect(bootstrapResponse.agentPublicKey).toBe(pluginKeyPair.publicKey);
+
+    const bootstrapClaims = JSON.parse(
+      Buffer.from(bootstrapResponse.jwt.split(".")[1], "base64url").toString("utf-8"),
+    );
+    expect(bootstrapClaims).toMatchObject({
+      sub: pollResponse.peerId,
+      aud: accountId,
+      tenant: TEST_TENANT,
+      cnf: { jwk: { x: deviceKey } },
+    });
 
     console.log(`[AC6 E2E] Full HTTP flow completed:`);
     console.log(`[AC6 E2E]   - Plugin enrolled and approved`);
     console.log(`[AC6 E2E]   - NATS credentials received`);
-    console.log(`[AC6 E2E]   - Bootstrap JWT issued`);
+    console.log(`[AC6 E2E]   - Bootstrap JWT linked to the enrolled tuple and agent key`);
   });
 });

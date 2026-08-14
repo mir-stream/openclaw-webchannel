@@ -68,11 +68,8 @@ jobs:
       #    Required by:
       #      - packages/plugin/src/nats-transport-realserver.test.ts
       #      - packages/saas/src/nats-permissions-realserver.test.ts
-      #      - packages/saas/src/ac6-device-flow-e2e.test.ts
-      #    Without this binary, under CI=true the first two THROW at module top
-      #    level — a hard fail, not a skip, and one that also fails collection in
-      #    step 7. The third (ac6) is NOT hard-failing: it warns "nats-server not
-      #    available" and returns early, passing vacuously (issue #133).
+      #    Without this binary, under CI=true both THROW at module top level — a
+      #    hard fail, not a skip, and one that also fails collection in step 7.
       #    The pinned version + cache key live in the composite action
       #    (.github/actions/install-nats-server) — the single source of truth
       #    shared with publish.yml. It installs under $RUNNER_TOOL_CACHE and
@@ -243,11 +240,10 @@ jobs:
       #    CI unset `skipIf` merely drops them and it is a count drop (-23).
       #
       #    It counts what `vitest list` COLLECTS, never what a run reported.
-      #    Three suites self-skip at runtime on environment noise: the port-scan
-      #    pair in nats-transport.test.ts, the listen(2)/EPERM path in
-      #    p1-1-http-ui-contract.test.ts, and ac6-device-flow-e2e.test.ts, which
-      #    warns and returns early — passing VACUOUSLY rather than skipping
-      #    (issue #133). All three are unobserved by this check, by design. Counting what ran would let that
+      #    Two suites self-skip at runtime on environment noise: the port-scan
+      #    pair in nats-transport.test.ts and the listen(2)/EPERM path in
+      #    p1-1-http-ui-contract.test.ts. Both are unobserved by this check, by
+      #    design. Counting what ran would let that
       #    noise print "tests disappeared" on a good tree — and the fix that
       #    message prints could not clear it, because regenerating collects
       #    statically. The only way out would be committing the flake-lowered
