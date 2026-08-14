@@ -203,23 +203,38 @@ function provenanceSources(repo: string, roots: string[]): string[] {
   return [...discovered].sort();
 }
 
+function fileIsBindingSource(repo: string, rel: string): boolean {
+  const code = decomment(
+    readFileSync(join(repo, ...rel.split("/")), "utf8"),
+    false,
+  ).join("\n");
+  return isBindingSource(code);
+}
+
+type BindingDiscovery = { roots: string[]; sources: string[] };
+
 /**
- * Listener roots. First traverse every root Vitest suite's complete local static
- * component, then select binders anywhere in those components. Preserve the
- * broad packages/<name>/src content scan that covers #118's original family.
- * This catches a suite that delegates its listener to a helper without turning
- * the whole product tree into a literal scan.
+ * Retain the complete local static component of each root Vitest suite whose
+ * component contains a listener. A fixed port may live in the caller even when
+ * the actual bind is delegated to a helper. Separately preserve the broad
+ * packages/<name>/src listener scan that covers #118's original family, adding
+ * downward provenance from those package roots.
  */
-function directBindingSources(repo = REPO): string[] {
-  const candidates = new Set(
-    provenanceSources(repo, vitestSuiteFiles(repo)).filter((rel) => {
-      const code = decomment(
-        readFileSync(join(repo, ...rel.split("/")), "utf8"),
-        false,
-      ).join("\n");
-      return isBindingSource(code);
-    }),
-  );
+function discoverBindingSources(repo = REPO): BindingDiscovery {
+  const roots = new Set<string>();
+  const sources = new Set<string>();
+
+  for (const suite of vitestSuiteFiles(repo)) {
+    const component = provenanceSources(repo, [suite]);
+    const componentRoots = component.filter((rel) =>
+      fileIsBindingSource(repo, rel),
+    );
+    if (componentRoots.length === 0) continue;
+    for (const rel of componentRoots) roots.add(rel);
+    for (const rel of component) sources.add(rel);
+  }
+
+  const packageRoots: string[] = [];
   let packages: Dirent[];
   try {
     packages = readdirSync(join(repo, "packages"), { withFileTypes: true });
@@ -233,15 +248,18 @@ function directBindingSources(repo = REPO): string[] {
       `packages/${pkg.name}/src`,
       false,
     )) {
-      const code = decomment(
-        readFileSync(join(repo, ...rel.split("/")), "utf8"),
-        false,
-      ).join("\n");
-      if (isBindingSource(code)) candidates.add(rel);
+      if (!fileIsBindingSource(repo, rel)) continue;
+      roots.add(rel);
+      packageRoots.push(rel);
     }
   }
 
-  return [...candidates].sort();
+  for (const rel of provenanceSources(repo, packageRoots)) sources.add(rel);
+  return { roots: [...roots].sort(), sources: [...sources].sort() };
+}
+
+function directBindingSources(repo = REPO): string[] {
+  return discoverBindingSources(repo).roots;
 }
 
 function staticRelativeModules(codeWithoutComments: string): string[] {
@@ -304,14 +322,13 @@ function resolveLocalSource(
 }
 
 /**
- * Discovered binding roots plus their recursive local static ESM and CommonJS
- * provenance. `.js` specifiers prefer their TS source and extensionless
- * specifiers resolve source/index variants. Dynamic, package, and excluded-tree
- * imports are deliberately outside this static provenance boundary; product
- * files unrelated to a root suite or package binding root are never swept.
+ * Complete binding-suite components plus package binding-root provenance.
+ * `.js` specifiers prefer their TS source and extensionless specifiers resolve
+ * source/index variants. Dynamic, package, and excluded-tree imports are
+ * deliberately outside this static provenance boundary.
  */
 function bindingSources(repo = REPO): string[] {
-  return provenanceSources(repo, directBindingSources(repo));
+  return discoverBindingSources(repo).sources;
 }
 
 type NonTestBinderEntrypoint = {
@@ -705,12 +722,12 @@ describe("e2e/local/ports.json", () => {
       {
         "demo/server.test.ts": [
           'import { startServer } from "./server-helper.js";',
-          "startServer();",
+          "startServer(18491);",
           "",
         ].join("\n"),
         "demo/server-helper.ts": [
-          "export function startServer() {",
-          "  return new WebSocketServer({ port: 18491 });",
+          "export function startServer(port: number) {",
+          "  return new WebSocketServer({ port });",
           "}",
           "",
         ].join("\n"),
@@ -719,15 +736,18 @@ describe("e2e/local/ports.json", () => {
         const suite = readFileSync(join(repo, "demo/server.test.ts"), "utf8");
         expect(isBindingSource(decomment(suite, false).join("\n"))).toBe(false);
         expect(directBindingSources(repo)).toEqual(["demo/server-helper.ts"]);
-        expect(bindingSources(repo)).toEqual(["demo/server-helper.ts"]);
+        expect(bindingSources(repo)).toEqual([
+          "demo/server-helper.ts",
+          "demo/server.test.ts",
+        ]);
         const literals = literalsInFiles(repo, bindingSources(repo));
         expect(literals).toContainEqual([
-          "demo/server-helper.ts",
+          "demo/server.test.ts",
           2,
           18491,
         ]);
         expect(withoutLiteralBudgets(literals, [])).toContainEqual([
-          "demo/server-helper.ts",
+          "demo/server.test.ts",
           2,
           18491,
         ]);

@@ -147,17 +147,18 @@ or a named waiver tied to a filed issue.
 **The scan set is discovered, not listed.** It walks `e2e/local/` recursively — `lib/harness.sh`
 is in scope, and a literal there would override `harness_ports` for all six gates at once. For
 root-sweep Vitest `*.test.*`/`*.spec.*` sources, the guard first traverses every suite's complete
-local static component, then selects listener roots anywhere in those components by content
+local static component, then finds listener roots anywhere in those components by content
 (`nats-server`, `.listen(`, `createServer(`, `ws_port`, `spawn(`, or
-`new WebSocketServer(`). Thus a `demo/server.test.ts` that merely calls a binding helper is
-covered even though the suite itself contains no listener token. The suite universe honors
-Vitest's current default exclusions plus this repo's `docker/**` and `examples/**` exclusions.
+`new WebSocketServer(`). If a component contains a listener, the complete component enters the
+literal scan. Thus a `demo/server.test.ts` that merely calls `startServer(18491)` is covered even
+when only its imported helper contains the binding API. The suite universe honors Vitest's
+current default exclusions plus this repo's `docker/**` and `examples/**` exclusions.
 
 The original #118 family retains a separate broad listener-content sweep across every source
-under `packages/*/src/**`. Every listener root from either route then brings its recursive local
-static ESM import/re-export and CommonJS `require()` provenance into the literal scan. Resolution
-prefers TypeScript source behind `.js`/`.cjs` specifiers and supports source/index variants, so a
-helper cannot move its fixed literal out of view. Computed/dynamic imports, package specifiers,
+under `packages/*/src/**`; each package listener root brings its downward recursive local static
+ESM import/re-export and CommonJS `require()` provenance into the literal scan. Resolution prefers
+TypeScript source behind `.js`/`.cjs` specifiers and supports source/index variants, so a helper
+cannot move its fixed literal out of view. Computed/dynamic imports, package specifiers,
 excluded/generated trees, JSON, and product sources unreachable from a root suite or package
 listener are not followed; this is a contained provenance graph, not a sweep of the whole tree.
 
