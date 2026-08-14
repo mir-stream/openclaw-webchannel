@@ -371,6 +371,51 @@ describe("the checker catches every known evasion (#123)", () => {
     );
   });
 
+  it.each([
+    ["prefix", "-"],
+    ["suffix", "-"],
+    ["prefix", ","],
+    ["suffix", ","],
+    ["prefix", ":"],
+    ["suffix", ":"],
+    ["prefix", "="],
+    ["suffix", "="],
+  ] as const)(
+    "EVASION 17: rejects a logfmt field with a %s %s",
+    (position, punctuation) => {
+      const source =
+        position === "prefix"
+          ? `console.warn(\`webchannel: peer=${punctuation}\${logSafe(peerId)}\`);`
+          : `console.warn(\`webchannel: peer=\${logSafe(peerId)}${punctuation}\`);`;
+      expect(check(source)).toHaveLength(1);
+
+      const emitted =
+        position === "prefix"
+          ? `peer=${punctuation}${logSafe("id")}`
+          : `peer=${logSafe("id")}${punctuation}`;
+      expect(() => decodeStrictLogfmt(emitted)).toThrow();
+    },
+  );
+
+  it.each([
+    ["split prefix", 'console.warn("webchannel: peer=" + `-${logSafe(peerId)}`);'],
+    ["split suffix", 'console.warn(`webchannel: peer=${logSafe(peerId)}` + "-suffix");'],
+    [
+      "multi-fragment prefix",
+      'console.warn("webchannel: " + "peer=" + `-${logSafe(peerId)}`);',
+    ],
+    [
+      "source-cooked prefix",
+      'console.warn("webchannel: pe\\u0065r=" + `\\u002d${logSafe(peerId)}`);',
+    ],
+    [
+      "source-cooked suffix",
+      'console.warn(`webchannel: peer=${logSafe(peerId)}` + "\\u002dsuffix");',
+    ],
+  ])("rejects a field boundary hidden by a %s", (_name, source) => {
+    expect(check(source)).toHaveLength(1);
+  });
+
   it("rejects directly adjacent logSafe interpolations", () => {
     expect(
       check("console.warn(`webchannel: pair=${logSafe(first)}${logSafe(second)}`);"),
@@ -394,6 +439,11 @@ describe("the checker catches every known evasion (#123)", () => {
 
   it.each([
     ["logfmt field", "console.warn(`webchannel: peer=${logSafe(peerId)} outcome=ok`);"],
+    ["logfmt field at end", "console.warn(`webchannel: peer=${logSafe(peerId)}`);"],
+    [
+      "split logfmt field",
+      'console.warn("webchannel: peer=" + `${logSafe(peerId)}` + " outcome=ok");',
+    ],
     ["prose colon", "console.warn(`webchannel: failed for ${logSafe(peerId)}: retrying`);"],
     ["parenthesized", "console.warn(`webchannel: approval (${logSafe(id)}): ignored`);"],
   ])("accepts the owned %s token boundary", (_name, source) => {

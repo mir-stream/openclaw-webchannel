@@ -296,15 +296,32 @@ function hasCanonicalUnshadowedLogSafe(source: string, file: string): boolean {
  * quotes, and an adjacent ECMAScript identifier-part character merges it into
  * a larger token that strict logfmt rejects. Another interpolation (including
  * across a `+` concatenation) is dynamic adjacency and is rejected too. Empty
- * record boundaries, whitespace and punctuation remain valid, which preserves
- * the owned `=${logSafe(x)} `, ` ${logSafe(x)}: ` and
- * `(${logSafe(x)}):` shapes.
+ * record boundaries and whitespace remain valid. Punctuation remains valid in
+ * prose, but not inside a statically recognisable logfmt field: for `key=...`,
+ * `logSafe` must begin immediately after `=` and end at whitespace or record
+ * end. This preserves the owned `=${logSafe(x)} `, ` ${logSafe(x)}: ` and
+ * `(${logSafe(x)}):` shapes without blessing `key=-${logSafe(x)}` or
+ * `key=${logSafe(x)}-suffix`.
  */
 function isUnsafeQuotedTokenNeighbor(fragment: string, side: "left" | "right"): boolean {
   const codePoints = Array.from(fragment);
   const neighbor = side === "left" ? codePoints.at(-1) : codePoints[0];
   if (neighbor === undefined) return false;
   return /["'`\\$\u200c\u200d\p{ID_Continue}]/u.test(neighbor);
+}
+
+/**
+ * If the contiguous cooked prefix is a logfmt `key=value` token, prove that
+ * the wrapper supplies the whole value. The key grammar mirrors the strict
+ * test decoder: non-whitespace/non-`=` bytes, with quotes rejected.
+ */
+function hasSafeLogfmtFieldBoundary(interpolation: LogInterpolation): boolean {
+  const field = /(?:^|\s)([^"=\s]+)=([^\s]*)$/u.exec(interpolation.cookedLeft);
+  if (!field) return true;
+  if (field[2] !== "") return false;
+  const right = Array.from(interpolation.cookedRight)[0];
+  if (right === undefined) return true;
+  return /\s/u.test(right) && !/[\r\n\u0085\u2028\u2029]/u.test(right);
 }
 
 function isSafeWrapperCall(interpolation: LogInterpolation, canonicalBinding: boolean): boolean {
@@ -318,6 +335,7 @@ function isSafeWrapperCall(interpolation: LogInterpolation, canonicalBinding: bo
   ) {
     return false;
   }
+  if (!hasSafeLogfmtFieldBoundary(interpolation)) return false;
   return (
     !isUnsafeQuotedTokenNeighbor(interpolation.cookedLeft, "left") &&
     !isUnsafeQuotedTokenNeighbor(interpolation.cookedRight, "right")
@@ -393,6 +411,28 @@ interface TemplateInterpolationBoundary {
   readonly boundaryKnown: boolean;
 }
 
+/** Entire runtime text when an expression is statically a string. */
+function runtimeStaticString(node: ts.Expression): string | undefined {
+  if (
+    ts.isParenthesizedExpression(node) ||
+    ts.isAsExpression(node) ||
+    ts.isTypeAssertionExpression(node) ||
+    ts.isNonNullExpression(node) ||
+    ts.isSatisfiesExpression(node)
+  ) {
+    return runtimeStaticString(node.expression);
+  }
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    return node.text;
+  }
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+    const left = runtimeStaticString(node.left);
+    const right = runtimeStaticString(node.right);
+    return left === undefined || right === undefined ? undefined : left + right;
+  }
+  return undefined;
+}
+
 function isTransparentRuntimeWrapper(parent: ts.Node, child: ts.Node): boolean {
   return (
     (ts.isParenthesizedExpression(parent) && parent.expression === child) ||
@@ -440,6 +480,18 @@ function runtimeEdge(node: ts.Expression, side: "left" | "right"): RuntimeEdge {
   if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
     const first = side === "left" ? node.left : node.right;
     const second = side === "left" ? node.right : node.left;
+    const wholeFirst = runtimeStaticString(first);
+    if (wholeFirst !== undefined) {
+      const next = runtimeEdge(second, side);
+      if (wholeFirst.length === 0) return next;
+      if (next.kind === "static") {
+        return {
+          kind: "static",
+          text: side === "left" ? wholeFirst + next.text : next.text + wholeFirst,
+        };
+      }
+      return { kind: "static", text: wholeFirst };
+    }
     const edge = runtimeEdge(first, side);
     return edge.kind === "none" ? runtimeEdge(second, side) : edge;
   }
@@ -483,6 +535,7 @@ function externalRuntimeEdge(
   side: "left" | "right",
 ): RuntimeEdge {
   let current: ts.Expression = template;
+  let staticText = "";
   while (true) {
     const parent = current.parent;
     if (isTransparentRuntimeWrapper(parent, current)) {
@@ -498,8 +551,20 @@ function externalRuntimeEdge(
         (side === "right" && parent.left === current);
       if (hasSibling) {
         const sibling = side === "left" ? parent.left : parent.right;
-        const edge = runtimeEdge(sibling, side === "left" ? "right" : "left");
-        if (edge.kind !== "none") return edge;
+        const wholeSibling = runtimeStaticString(sibling);
+        if (wholeSibling !== undefined) {
+          staticText =
+            side === "left" ? wholeSibling + staticText : staticText + wholeSibling;
+        } else {
+          const edge = runtimeEdge(sibling, side === "left" ? "right" : "left");
+          if (edge.kind === "static") {
+            return {
+              kind: "static",
+              text: side === "left" ? edge.text + staticText : staticText + edge.text,
+            };
+          }
+          return staticText.length > 0 ? { kind: "static", text: staticText } : edge;
+        }
       }
       current = parent;
       continue;
@@ -509,11 +574,11 @@ function externalRuntimeEdge(
         parent.arguments?.some((argument) => argument === current)) ||
       (ts.isTemplateSpan(parent) && parent.expression === current)
     ) {
-      return { kind: "none" };
+      return staticText.length > 0 ? { kind: "static", text: staticText } : { kind: "none" };
     }
     // A transformation this checker does not model is not a proven record
     // boundary. Fail loud instead of quietly blessing the wrapped value.
-    return { kind: "unknown" };
+    return staticText.length > 0 ? { kind: "static", text: staticText } : { kind: "unknown" };
   }
 }
 
@@ -529,33 +594,25 @@ function collectTemplateInterpolationBoundaries(
         const localLeft = index === 0 ? node.head.text : node.templateSpans[index - 1]!.literal.text;
         const localRight = span.literal.text;
         const externalLeft =
-          index === 0 && localLeft.length === 0
-            ? externalRuntimeEdge(node, "left")
-            : { kind: "none" as const };
+          index === 0 ? externalRuntimeEdge(node, "left") : { kind: "none" as const };
         const externalRight =
-          index === node.templateSpans.length - 1 && localRight.length === 0
+          index === node.templateSpans.length - 1
             ? externalRuntimeEdge(node, "right")
             : { kind: "none" as const };
         boundaries.set(span.expression.pos, {
           cookedLeft:
-            localLeft.length > 0
-              ? localLeft
-              : externalLeft.kind === "static"
-                ? externalLeft.text
-                : "",
+            (externalLeft.kind === "static" ? externalLeft.text : "") + localLeft,
           cookedRight:
-            localRight.length > 0
-              ? localRight
-              : externalRight.kind === "static"
-                ? externalRight.text
-                : "",
+            localRight + (externalRight.kind === "static" ? externalRight.text : ""),
           interpolationBefore:
-            (index > 0 && localLeft.length === 0) || externalLeft.kind === "interpolation",
+            (index > 0 && localLeft.length === 0) ||
+            (localLeft.length === 0 && externalLeft.kind === "interpolation"),
           interpolationAfter:
             (index < node.templateSpans.length - 1 && localRight.length === 0) ||
-            externalRight.kind === "interpolation",
+            (localRight.length === 0 && externalRight.kind === "interpolation"),
           boundaryKnown:
-            externalLeft.kind !== "unknown" && externalRight.kind !== "unknown",
+            (localLeft.length > 0 || externalLeft.kind !== "unknown") &&
+            (localRight.length > 0 || externalRight.kind !== "unknown"),
         });
       }
     }

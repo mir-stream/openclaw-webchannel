@@ -89,7 +89,7 @@
     "packages/plugin/src/jwt.test.ts": 34,
     "packages/plugin/src/late-join-decryptor.test.ts": 27,
     "packages/plugin/src/legacy-storage-migration.test.ts": 50,
-    "packages/plugin/src/log-interpolation-audit.test.ts": 62,
+    "packages/plugin/src/log-interpolation-audit.test.ts": 77,
     "packages/plugin/src/log-safe.test.ts": 18,
     "packages/plugin/src/manifest-schema.test.ts": 12,
     "packages/plugin/src/message-adapter.test.ts": 109,
