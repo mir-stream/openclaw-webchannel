@@ -55,8 +55,8 @@
  * barrier, while any pre-barrier request replayed by the gateway is rejected as
  * `invalid_request_time`.
  *
- * Pure and in-memory by construction: no I/O, no OpenClaw imports, an injectable
- * clock, and no dependency on the current config route or on alias enumeration.
+ * Pure and in-memory by construction: no I/O, an injectable clock, and no
+ * dependency on the current config route or on alias enumeration.
  */
 
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";

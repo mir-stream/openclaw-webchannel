@@ -42,6 +42,7 @@ import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   formatAccountIdForLog,
+  inspectWebchannelAccountIds,
   isValidAccountId,
   loadPersistedCredentialDocument,
   resolveAcquisitionIdentity,
@@ -106,7 +107,7 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     unconfiguredLabel: "not configured",
     resolveConfigured: ({ cfg, accountId }) => {
       const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
-      if (!isValidAccountId(id)) return false;
+      if (!inspectWebchannelAccountIds(cfg).validIds.includes(id)) return false;
       const account = resolveWebchannelAccountConfig(cfg, id);
       let mode: "static" | "enrolled";
       try {
@@ -151,6 +152,15 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     },
     resolveStatusLines: ({ cfg, accountId, configured }) => {
       const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+      const inspectedInvalid = inspectWebchannelAccountIds(cfg).invalid.find(
+        (candidate) => candidate.id === id,
+      );
+      if (inspectedInvalid) {
+        return [
+          `WebChannel (${formatAccountIdForLog(id)}): not configured — ` +
+            `invalid account id; ${inspectedInvalid.reason}`,
+        ];
+      }
       if (!isValidAccountId(id)) {
         return [
           `WebChannel (${formatAccountIdForLog(id)}): not configured — ` +

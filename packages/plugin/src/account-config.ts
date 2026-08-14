@@ -80,7 +80,11 @@ export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = DEFAULT_ACCOUNT_ID;
  */
 export const DEFAULT_WEBCHANNEL_TENANT = "default-tenant";
 
-export type InvalidAccountId = { id: string; reason: string };
+export type InvalidAccountId = {
+  id: string;
+  reason: string;
+  reasonKind: "normalized-collision" | "blocked-prototype-key" | "invalid-format";
+};
 
 export type AccountIdInspection = {
   validIds: string[];
@@ -130,14 +134,18 @@ export function inspectWebchannelAccountIds(cfg: unknown): AccountIdInspection {
   const invalid: InvalidAccountId[] = [];
   for (const id of rawIds) {
     const collisionReason = collisionReasonById.get(id);
-    if (collisionReason !== undefined) invalid.push({ id, reason: collisionReason });
-    else if (isValidAccountId(id)) validIds.push(id);
-    else {
+    if (collisionReason !== undefined) {
+      invalid.push({ id, reason: collisionReason, reasonKind: "normalized-collision" });
+    } else if (isValidAccountId(id)) {
+      validIds.push(id);
+    } else {
+      const blocked = isBlockedAccountId(id);
       invalid.push({
         id,
-        reason: isBlockedAccountId(id)
+        reason: blocked
           ? "the id is a blocked prototype key"
           : "the id must match /^[A-Za-z0-9_-]{1,64}$/",
+        reasonKind: blocked ? "blocked-prototype-key" : "invalid-format",
       });
     }
   }

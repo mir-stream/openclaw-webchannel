@@ -367,7 +367,8 @@ describe("account-config: listWebchannelAccountIds", () => {
     expect(inspection.invalid.map(({ id }) => id)).toEqual(
       [...ids].sort((a, b) => a.localeCompare(b)),
     );
-    for (const { reason } of inspection.invalid) {
+    for (const { reason, reasonKind } of inspection.invalid) {
+      expect(reasonKind).toBe("normalized-collision");
       expect(reason).toContain(JSON.stringify(normalized));
       for (const id of ids) expect(reason).toContain(JSON.stringify(id));
     }
@@ -425,8 +426,16 @@ describe("account-config: listWebchannelAccountIds", () => {
     expect(inspectWebchannelAccountIds(mixed)).toEqual({
       validIds: ["good", "Zed"].sort((a, b) => a.localeCompare(b)),
       invalid: [
-        { id: "bad.id", reason: "the id must match /^[A-Za-z0-9_-]{1,64}$/" },
-        { id: "constructor", reason: "the id is a blocked prototype key" },
+        {
+          id: "bad.id",
+          reason: "the id must match /^[A-Za-z0-9_-]{1,64}$/",
+          reasonKind: "invalid-format",
+        },
+        {
+          id: "constructor",
+          reason: "the id is a blocked prototype key",
+          reasonKind: "blocked-prototype-key",
+        },
       ].sort((a, b) => a.id.localeCompare(b.id)),
       usesImplicitDefault: false,
     });

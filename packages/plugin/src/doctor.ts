@@ -89,6 +89,10 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
 
   const inspection = inspectWebchannelAccountIds(cfg);
   for (const invalid of inspection.invalid) {
+    const fix =
+      invalid.reasonKind === "normalized-collision"
+        ? "Rename or remove configured account entries until their OpenClaw SDK-normalized account ids are unique, then rerun account setup/enrollment for each renamed account so credentials and JWT audience stay aligned."
+        : "Rename the config key to match /^[A-Za-z0-9_-]{1,64}$/ (excluding __proto__, prototype, and constructor), then rerun account setup/enrollment so credentials and JWT audience stay aligned.";
     findings.push({
       accountId: invalid.id,
       checkId: "invalid-account-id",
@@ -96,8 +100,7 @@ export function evaluateWebchannelDoctor(cfg: unknown, deps: DoctorDeps = {}): D
       severity: "error",
       message:
         `Account key ${JSON.stringify(invalid.id)} is invalid (${invalid.reason}) and was not started.`,
-      fix:
-        "Rename the config key to match /^[A-Za-z0-9_-]{1,64}$/ (excluding __proto__, prototype, and constructor), then rerun account setup/enrollment so credentials and JWT audience stay aligned.",
+      fix,
     });
   }
 
