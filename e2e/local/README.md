@@ -113,13 +113,12 @@ Every port that anything under `e2e/local/` binds or dials is **allocated** in
 [`ports.json`](ports.json), and nothing here may hard-code one — gates get theirs from
 `harness_ports`, drivers from their gate's env.
 
-The root-sweep suites that bind real sockets are allocated there too, but they are not all
-wired the same way. Two read the authority at runtime and contain no literal
-(`nats-transport-realserver.test.ts`, `nats-permissions-realserver.test.ts`); three still
-hard-code their own numbers and are merely *declared* — `ac6-device-flow-e2e.test.ts` and the
-two demo smokes. For those three the literal is the allocation, and `ports.test.ts` pins the two
-together in both directions so neither side can drift. Wiring them to read the authority is
-deliberately not done here: `ac6-device-flow-e2e.test.ts` has separate defects under review.
+Root-sweep suites with intentionally fixed listeners are allocated there too. Three hard-code
+their own numbers and are *declared* — `ac6-device-flow-e2e.test.ts` and the two demo smokes.
+For those three the literal is the allocation, and `ports.test.ts` pins the two together in both
+directions so neither side can drift. The two real nats-server suites instead ask nats-server to
+bind OS-assigned ports atomically, then read its per-process ports file; they remain in the
+literal scan so reintroducing a fixed port is still rejected.
 
 The two families used to allocate independently, and overlapped: `18222` was both the
 transport-realserver monitor port and the default NATS URL in
@@ -146,7 +145,8 @@ waiver tied to a filed issue.
 is in scope, and a literal there would override `harness_ports` for all six gates at once — plus
 every file under `packages/*/src/**` that *binds or spawns a listener*, found by content
 (`nats-server`, `.listen(`, `createServer(`, `ws_port`, `spawn(`). That predicate is the analogue
-of `run-*.sh`: a new realserver suite is covered the day it lands, without anyone registering it.
+of `run-*.sh` and also recognizes `new WebSocketServer({ port })`: a new realserver suite is
+covered the day it lands, without anyone registering it.
 Earlier the `packages/` half was a hand-maintained list, and a new suite spawning
 `nats-server -p 14491 --ws_port 18491` — `run-multi-message`'s live ports — was invisible.
 `packages/*/reference/**` is out of scope on purpose: those servers take their port from env in

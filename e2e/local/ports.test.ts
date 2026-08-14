@@ -84,7 +84,8 @@ const SOURCE_EXT = /\.(sh|ts|mts|cts|js|mjs|cjs)$/;
  * reason, not an item-by-item exclusion list.
  */
 function bindingSources(): string[] {
-  const BINDS = /nats-server|\.listen\s*\(|createServer\s*\(|ws_port|\bspawn\s*\(/;
+  const BINDS =
+    /nats-server|\.listen\s*\(|createServer\s*\(|\bnew\s+WebSocketServer\s*\(|ws_port|\bspawn\s*\(/;
   const out: string[] = [];
   const walk = (dir: string, rel: string) => {
     let entries;
@@ -158,9 +159,8 @@ function ownedPorts(rel: string): Set<number> {
 /**
  * Does this file actually resolve e2e/local/ports.json at runtime?
  *
- * Judged on CODE, never a substring: the prose in nats-transport-realserver
- * mentions "ports.json" four times, which was enough to switch the old check off
- * for the two suites #118 lived in.
+ * Judged on CODE, never a substring: prose mentioning ports.json used to be
+ * enough to switch this check off for the suites #118 lived in.
  */
 function readsAuthority(codeWithoutComments: string): boolean {
   return (
@@ -297,6 +297,12 @@ describe("e2e/local/ports.json", () => {
       .sort();
 
     expect(registered).toEqual(scripts);
+  });
+
+  it("discovers WebSocketServer constructor listeners", () => {
+    expect(bindingSources()).toContain(
+      "packages/plugin/src/nats-cutover-e2e.test.ts",
+    );
   });
 
   it("makes every gate load its OWN block", () => {

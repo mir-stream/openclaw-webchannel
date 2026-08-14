@@ -6,8 +6,9 @@
     "  (a) `harnesses` — the six live e2e gates under e2e/local/run-*.sh. Consumed by",
     "      e2e/local/lib/harness.sh (`harness_ports <name>`), which exports each key",
     "      as a shell variable of the same name.",
-    "  (b) `vitest`    — the *-realserver.test.ts suites that spawn a real nats-server.",
-    "      Consumed directly by those suites via readFileSync of this file.",
+    "  (b) `vitest`    — root-sweep suites with intentionally hard-coded listeners.",
+    "      Real nats-server suites use atomic OS-assigned ports and are still scanned",
+    "      by e2e/local/ports.test.ts so a reintroduced fixed port fails the guard.",
     "",
     "WHY THIS FILE EXISTS (#118, #119): these two families used to pick ports",
     "independently. When they overlapped, nats-server could not bind and the suite",
@@ -18,7 +19,7 @@
     "  * 3981  — run-turn-outcome.sh and run-derived-trust.sh both claimed it.",
     "",
     "RULES:",
-    "  1. Every port under `harnesses` and `vitest` must be globally unique. Two",
+    "  1. Every hard-coded port under `harnesses` and `vitest` must be globally unique. Two",
     "     harnesses may NOT share a port even if they never run concurrently today:",
     "     that assumption is what #119 was. e2e/local/ports.test.ts enforces this.",
     "  2. Nothing may claim a port listed in `reserved`.",
@@ -88,23 +89,11 @@
 
   "vitest": {
     "$note": [
-      "Root-sweep suites that bind real sockets — a spawned nats-server, or a real",
-      "HTTP server. They run on every `npm test`, so they contend with the gate",
-      "family for ports exactly like another gate would.",
-      "",
-      "MONITOR_PORT is the nats-server `http:` monitoring listener — it binds like",
-      "any other port and collides like one, so it belongs here even though no",
-      "client connects to it. That port (18222) is what #118 actually was."
+      "Root-sweep suites that intentionally hard-code real socket listeners. They",
+      "run on every `npm test`, so they contend with the gate family for ports",
+      "exactly like another gate would. Suites whose server atomically requests",
+      "OS-assigned ports do not allocate entries here."
     ],
-    "packages/plugin/src/nats-transport-realserver.test.ts": {
-      "CLIENT_PORT": 14223,
-      "WS_PORT": 18080,
-      "MONITOR_PORT": 18222
-    },
-    "packages/saas/src/nats-permissions-realserver.test.ts": {
-      "CLIENT_PORT": 14224,
-      "WS_PORT": 18081
-    },
     "packages/saas/src/ac6-device-flow-e2e.test.ts": {
       "$note": [
         "Also a root-sweep suite that binds real sockets, so it belongs under the",

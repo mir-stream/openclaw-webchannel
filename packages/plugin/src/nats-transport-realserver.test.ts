@@ -20,10 +20,15 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { delimiter, join } from "node:path";
 
 import { NatsTransport } from "./nats-transport.js";
 import type { NatsMessage } from "./nats-transport.js";
@@ -70,42 +75,32 @@ if (!NATS_SERVER_BIN && process.env.CI === "true") {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Dedicated ports for this suite — from e2e/local/ports.json, the single source
-// of truth shared with the e2e/local/run-*.sh gate family (#118).
-//
-// These were literals here, chosen only to dodge a dev server on 4222/8080. That
-// left them invisible to the gate harnesses, and MONITOR_PORT (18222) ended up
-// colliding with the default NATS URL baked into
-// e2e/local/two-account-isolation-roundtrip.ts. When both ran, nats-server could
-// not bind and this suite died in beforeAll with "nats-server did not become
-// ready". Reading the shared file means a future collision is a merge conflict
-// in ports.json plus a red e2e/local/ports.test.ts — not a flake.
-// ---------------------------------------------------------------------------
-const PORTS = JSON.parse(
-  readFileSync(
-    join(
-      dirname(fileURLToPath(import.meta.url)),
-      "../../../e2e/local/ports.json",
-    ),
-    "utf8",
-  ),
-) as { vitest: Record<string, Record<string, number>> };
-
-const SUITE_PORTS = PORTS.vitest["packages/plugin/src/nats-transport-realserver.test.ts"];
-if (!SUITE_PORTS) {
-  throw new Error(
-    "e2e/local/ports.json has no vitest entry for nats-transport-realserver.test.ts",
-  );
-}
-
-const CLIENT_PORT = SUITE_PORTS.CLIENT_PORT;
-const WS_PORT = SUITE_PORTS.WS_PORT;
-const MONITOR_PORT = SUITE_PORTS.MONITOR_PORT;
-const WS_URL = `ws://127.0.0.1:${WS_PORT}`;
-
+// `-1` delegates allocation to the OS inside nats-server's bind, so independent
+// test processes cannot race between a free-port probe and the real listener.
 let server: ChildProcess | null = null;
+let wsUrl = "";
 const transports: NatsTransport[] = [];
+
+/** Read a listener selected atomically by nats-server from its ports file. */
+function natsListenerPort(
+  portsDir: string,
+  listener: "nats" | "monitoring" | "websocket",
+): number {
+  const portsFile = readdirSync(portsDir).find((name) => name.endsWith(".ports"));
+  if (!portsFile) {
+    throw new Error(`nats-server wrote no .ports file in ${portsDir}`);
+  }
+  const ports = JSON.parse(readFileSync(join(portsDir, portsFile), "utf8")) as
+    Partial<Record<typeof listener, string[]>>;
+  const address = ports[listener]?.[0];
+  const port = address ? Number(new URL(address).port) : Number.NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `nats-server ports file has no valid ${listener} listener: ${JSON.stringify(ports)}`,
+    );
+  }
+  return port;
+}
 
 /** Encrypt a UTF-8 string into a JSON wire frame {n,t,c} of base64url parts. */
 function sealToWire(key: Uint8Array, plaintext: string): Buffer {
@@ -151,7 +146,7 @@ async function waitFor(
 }
 
 async function makeTransport(name: string): Promise<NatsTransport> {
-  const t = new NatsTransport({ url: WS_URL, clientName: name });
+  const t = new NatsTransport({ url: wsUrl, clientName: name });
   transports.push(t);
   await t.connect();
   return t;
@@ -165,17 +160,24 @@ beforeAll(async () => {
   writeFileSync(
     confPath,
     [
-      `port: ${CLIENT_PORT}`,
-      `http: ${MONITOR_PORT}`,
+      `host: "127.0.0.1"`,
+      `port: -1`,
+      `http: -1`,
       `websocket {`,
-      `  port: ${WS_PORT}`,
+      `  host: "127.0.0.1"`,
+      `  port: -1`,
       `  no_tls: true`,
       `}`,
       "",
     ].join("\n"),
   );
 
-  server = spawn(NATS_SERVER_BIN, ["-c", confPath], {
+  server = spawn(NATS_SERVER_BIN, [
+    "-c",
+    confPath,
+    "--ports_file_dir",
+    dir,
+  ], {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -188,6 +190,7 @@ beforeAll(async () => {
   server.stderr?.on("data", onData);
 
   await waitFor(() => ready, 8000, 25);
+  wsUrl = `ws://127.0.0.1:${natsListenerPort(dir, "websocket")}`;
 }, 15000);
 
 afterAll(async () => {

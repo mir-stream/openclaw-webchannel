@@ -26,10 +26,15 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { delimiter, join } from "node:path";
 import WebSocket from "ws";
 import { fromSeed, createUser } from "@nats-io/nkeys";
 import { encodeUser } from "@nats-io/jwt";
@@ -80,35 +85,32 @@ if (!NATS_SERVER_BIN && process.env.CI === "true") {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Dedicated ports for this suite — from e2e/local/ports.json, the single source
-// of truth shared with the e2e/local/run-*.sh gate family (#118). A literal here
-// is invisible to the gate harnesses; when the two families overlap this suite
-// dies in beforeAll with "nats-server did not become ready".
-// ---------------------------------------------------------------------------
-const PORTS = JSON.parse(
-  readFileSync(
-    join(
-      dirname(fileURLToPath(import.meta.url)),
-      "../../../e2e/local/ports.json",
-    ),
-    "utf8",
-  ),
-) as { vitest: Record<string, Record<string, number>> };
-
-const SUITE_PORTS = PORTS.vitest["packages/saas/src/nats-permissions-realserver.test.ts"];
-if (!SUITE_PORTS) {
-  throw new Error(
-    "e2e/local/ports.json has no vitest entry for nats-permissions-realserver.test.ts",
-  );
-}
-
-const CLIENT_PORT = SUITE_PORTS.CLIENT_PORT;
-const WS_PORT = SUITE_PORTS.WS_PORT;
-const WS_URL = `ws://127.0.0.1:${WS_PORT}`;
-
+// `-1` delegates allocation to the OS inside nats-server's bind, so independent
+// test processes cannot race between a free-port probe and the real listener.
 let server: ChildProcess | null = null;
 let testDir: string | null = null;
+let wsUrl = "";
+
+/** Read a listener selected atomically by nats-server from its ports file. */
+function natsListenerPort(
+  portsDir: string,
+  listener: "nats" | "monitoring" | "websocket",
+): number {
+  const portsFile = readdirSync(portsDir).find((name) => name.endsWith(".ports"));
+  if (!portsFile) {
+    throw new Error(`nats-server wrote no .ports file in ${portsDir}`);
+  }
+  const ports = JSON.parse(readFileSync(join(portsDir, portsFile), "utf8")) as
+    Partial<Record<typeof listener, string[]>>;
+  const address = ports[listener]?.[0];
+  const port = address ? Number(new URL(address).port) : Number.NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(
+      `nats-server ports file has no valid ${listener} listener: ${JSON.stringify(ports)}`,
+    );
+  }
+  return port;
+}
 
 // ---------------------------------------------------------------------------
 // Trust chain and enrollment service
@@ -147,7 +149,7 @@ async function connectWithJwt(
   seed: string,
   _clientName: string,
 ): Promise<{ ws: WebSocket; ready: Promise<void> }> {
-  const ws = new WebSocket(WS_URL);
+  const ws = new WebSocket(wsUrl);
   const userKp = fromSeed(new TextEncoder().encode(seed));
 
   const ready = new Promise<void>((resolve, reject) => {
@@ -236,9 +238,11 @@ beforeAll(async () => {
   writeFileSync(
     confPath,
     [
-      `port: ${CLIENT_PORT}`,
+      `host: "127.0.0.1"`,
+      `port: -1`,
       `websocket {`,
-      `  port: ${WS_PORT}`,
+      `  host: "127.0.0.1"`,
+      `  port: -1`,
       `  no_tls: true`,
       `}`,
       `operator: "${operatorJwtPath}"`,
@@ -251,7 +255,12 @@ beforeAll(async () => {
   );
 
   // Start nats-server
-  server = spawn(NATS_SERVER_BIN, ["-c", confPath], {
+  server = spawn(NATS_SERVER_BIN, [
+    "-c",
+    confPath,
+    "--ports_file_dir",
+    testDir,
+  ], {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -268,6 +277,7 @@ beforeAll(async () => {
   await waitFor(() => ready, 10000, 100).catch(() => {
     throw new Error(`nats-server did not become ready:\n${serverLog}`);
   });
+  wsUrl = `ws://127.0.0.1:${natsListenerPort(testDir, "websocket")}`;
 }, 20000);
 
 afterAll(async () => {
@@ -432,7 +442,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
       // authN invariant (previously covered by the deleted e2e/enrolled-jwt-roundtrip.test.ts):
       // the operator + MEMORY-resolver server grants NO anonymous access, so a CONNECT carrying
       // no JWT and no signature must be rejected — never flipped to connected.
-      const ws = new WebSocket(WS_URL);
+      const ws = new WebSocket(wsUrl);
       const outcome = await new Promise<"refused" | "connected">((resolve, reject) => {
         const timeout = setTimeout(() => reject(new Error("no server response")), 4000);
         const settle = (v: "refused" | "connected") => {
@@ -510,7 +520,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
       const accountId = "test-agent";
       const creds = await generateRegisterDeniedCredentials(TENANT_A, accountId);
       const transport = new NatsTransport({
-        url: WS_URL,
+        url: wsUrl,
         jwtCredential: creds.userJwt,
         nkeySigningCallback: makeNkeySigningCallback(creds.userSeed),
         clientName: "register-denied-readiness",
@@ -548,7 +558,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
 
       await expect(
         dialRelayForPreflight({
-          url: WS_URL,
+          url: wsUrl,
           userJwt: creds.userJwt,
           userSeed: creds.userSeed,
           subject: `webchannel.${TENANT_A}.${accountId}._preflight`,
@@ -558,7 +568,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
 
       await expect(
         dialRelayForPreflight({
-          url: WS_URL,
+          url: wsUrl,
           userJwt: creds.userJwt,
           userSeed: creds.userSeed,
           subject: `webchannel.${TENANT_A}.${accountId}._doctor`,
@@ -568,7 +578,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
 
       await expect(
         dialRelayForPreflight({
-          url: WS_URL,
+          url: wsUrl,
           userJwt: creds.userJwt,
           userSeed: creds.userSeed,
           subject: `webchannel.${TENANT_A}.${accountId}.*.register`,
@@ -581,7 +591,7 @@ describe.skipIf(!NATS_SERVER_BIN)(
       const creds = await generateTestCredentials(TENANT_A);
       await expect(
         dialRelayForPreflight({
-          url: WS_URL,
+          url: wsUrl,
           userJwt: creds.userJwt,
           userSeed: creds.userSeed,
           subject: `webchannel.${TENANT_A}.test-agent.*.register`,

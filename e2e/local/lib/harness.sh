@@ -194,12 +194,24 @@ harness_assert_loaded_dist() {
     return 2
   fi
 
-  if ! grep -qF "source=$HARNESS_DIST" "$gwlog"; then
+  local loaded_sources
+  loaded_sources="$(
+    sed -nE '
+      /[(,][[:space:]]*plugin=webchannel[[:space:]]*[,)]/ {
+        s/^.*[(,][[:space:]]*source=([^)]*)\).*$/\1/p
+      }
+    ' "$gwlog" | sort -u
+  )"
+
+  if ! printf '%s\n' "$loaded_sources" | grep -Fxq "$HARNESS_DIST"; then
     echo "[$tag] DIST-ASSERT FAIL: the gateway did not load the bundle this gate built." >&2
     echo "[$tag]   expected: source=$HARNESS_DIST" >&2
-    echo "[$tag]   plugin sources the gateway actually resolved:" >&2
-    grep -oE 'source=[^)]*' "$gwlog" | sort -u | sed "s|^|[$tag]     |" >&2 \
-      || echo "[$tag]     (none — core logged no plugin source at all)" >&2
+    echo "[$tag]   sources resolved for plugin=webchannel:" >&2
+    if [ -n "$loaded_sources" ]; then
+      printf '%s\n' "$loaded_sources" | sed "s|^|[$tag]     source=|" >&2
+    else
+      echo "[$tag]     (none — core logged no source for plugin=webchannel)" >&2
+    fi
     return 2
   fi
 
