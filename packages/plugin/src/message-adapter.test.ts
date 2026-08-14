@@ -127,6 +127,37 @@ function successfulIds(frames: DraftAttempt[]): string[] {
   return [...new Set(frames.map((frame) => frame.id))];
 }
 
+function cumulativePrefixes(text: string): string[] {
+  return Array.from({ length: text.length }, (_, index) => text.slice(0, index + 1));
+}
+
+function cumulativeExtensions(base: string, suffix: string): string[] {
+  return cumulativePrefixes(suffix).map((prefix) => base + prefix);
+}
+
+// Measured distinct onPartialReply payloads from OpenClaw 2026.7.1-2. Keep
+// these fixtures independent of core's hash-bearing dist paths; a pin bump
+// must not silently rewrite the regression stimulus under test.
+const CORE_TOOL_CALL_SAWTOOTH = [
+  ...cumulativePrefixes("Hello <tool_call>"),
+  "Hello ",
+  ...cumulativeExtensions("Hello ", " there"),
+];
+
+const CORE_FUNCTION_CALLS_SAWTOOTH = [
+  ...cumulativePrefixes("Hello <function_calls>"),
+  "Hello ",
+  ...cumulativeExtensions("Hello ", " there"),
+];
+
+const CORE_FINAL_SAWTOOTH = [
+  ...cumulativePrefixes("Hello <final"),
+  "Hello ",
+  ...cumulativeExtensions("Hello ", "done</final"),
+  "Hello done",
+  ...cumulativeExtensions("Hello done", " there"),
+];
+
 describe("ProgressDraftController — ordered assistant lanes", () => {
   it("M1: the first boundary is a no-op and A partial creates one lane", async () => {
     const h = makeDraftHarness();
@@ -1350,11 +1381,13 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(h.frames.filter((frame) => frame.type === "final")).toEqual([
       { type: "final", id: h.frames[0]!.id, text: "Hi there" },
     ]);
-    // The 4th partial ("Hi", shorter than the "Hi <thi" already on screen) is
-    // dropped rather than rendered — the text never moves backwards…
+    // The ambiguous trailing `<` is replaced by its safe prefix, then `<thi`
+    // disambiguates it as the locally handled thinking path. The 4th partial
+    // ("Hi", shorter than the "Hi <thi" already on screen) is dropped rather
+    // than rendered — the text never moves backwards…
     expect(h.frames.map((frame) => frame.text)).toEqual([
       "Hi",
-      "Hi <",
+      "Hi ",
       "Hi <thi",
       "Hi  there",
       "Hi there",
@@ -1622,10 +1655,143 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     const texts = finals.map((frame) => frame.text);
     // The invariant that the reverted guard broke: never the same text twice.
     expect(new Set(texts).size).toBe(texts.length);
-    // Current shape. The 2 is #129 (this one message still splits at the
-    // fail-safe, which is a separate open defect) — whoever fixes #129 should
-    // change this to 1 deliberately. It must never grow.
-    expect(texts).toEqual(["Here you go.<tool_call>", "Here you go. Done."]);
+    // #129: both core-stripped tag prefixes are held before they can become a
+    // lane body, so the sawtooth remains one bubble. It must never grow.
+    expect(texts).toEqual(["Here you go. Done."]);
+  });
+
+  it.each([
+    {
+      marker: "<tool_call>",
+      partials: CORE_TOOL_CALL_SAWTOOTH,
+      payloadCount: 24,
+      finalText: "Hello  there",
+    },
+    {
+      marker: "<function_calls>",
+      partials: CORE_FUNCTION_CALLS_SAWTOOTH,
+      payloadCount: 29,
+      finalText: "Hello  there",
+    },
+    {
+      marker: "<final>",
+      partials: CORE_FINAL_SAWTOOTH,
+      payloadCount: 31,
+      finalText: "Hello done there",
+    },
+  ])(
+    "M7l: a measured $marker core sawtooth stays one clean bubble",
+    async ({ partials, payloadCount, finalText }) => {
+      const warn = vi.fn();
+      const h = makeDraftHarness({ logger: { warn } });
+      h.draft.handleAssistantMessageBoundary();
+      expect(partials).toHaveLength(payloadCount);
+      for (const text of partials) h.draft.pushAnswerText({ text });
+      await h.draft.flush();
+      expect(h.draft.snapshotText()).toBe(finalText);
+      await expect(h.draft.finalize(finalText)).resolves.toBe(true);
+      await h.draft.drain();
+
+      const finals = h.frames.filter((frame) => frame.type === "final");
+      expect(finals.map((frame) => frame.text)).toEqual([finalText]);
+      expect(successfulIds(h.frames)).toHaveLength(1);
+      expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<");
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
+    },
+  );
+
+  it("M7m: a same-length tag-free control with a literal less-than stays intact", async () => {
+    const source = "Hello 1 < 2 is literal text.".padEnd(50, ".");
+    expect(source).toHaveLength(50);
+
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of cumulativePrefixes(source)) h.draft.pushAnswerText({ text });
+    await h.draft.flush();
+    expect(h.draft.snapshotText()).toBe(source);
+    expect(h.frames.at(-1)?.text).toBe(source);
+    await expect(h.draft.finalize(source)).resolves.toBe(true);
+    await h.draft.drain();
+
+    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      source,
+    ]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+  });
+
+  it("M7n: the locally-stripped thinking path remains one bubble", async () => {
+    const source = "Hello <thinking>zzz</thinking> there";
+    const warn = vi.fn();
+    const h = makeDraftHarness({ logger: { warn } });
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of cumulativePrefixes(source)) h.draft.pushAnswerText({ text });
+    await h.draft.flush();
+    expect(h.draft.snapshotText()).toBe("Hello  there");
+    await expect(h.draft.finalize("Hello  there")).resolves.toBe(true);
+    await h.draft.drain();
+
+    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      "Hello  there",
+    ]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
+  });
+
+  it("M7o: terminal settlement preserves literal incomplete tag-like tails", async () => {
+    const finalized = makeDraftHarness();
+    finalized.draft.handleAssistantMessageBoundary();
+    finalized.draft.pushAnswerText({ text: "see <div" });
+    await finalized.draft.flush();
+    expect(finalized.draft.snapshotText()).toBe("see <div");
+    await expect(finalized.draft.finalize("see <div")).resolves.toBe(true);
+    await finalized.draft.drain();
+    expect(
+      finalized.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+    ).toEqual(["see <div"]);
+
+    // This one is ambiguous with an allowlisted tag until the stream ends. A
+    // silent terminal drain is still an end-of-stream signal, so it must release
+    // the held suffix as literal text rather than truncate it.
+    const drained = makeDraftHarness();
+    drained.draft.handleAssistantMessageBoundary();
+    drained.draft.pushAnswerText({ text: "see <tool_cal" });
+    await drained.draft.drain();
+    expect(
+      drained.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
+    ).toEqual(["see <tool_cal"]);
+  });
+
+  it("M7p: a measured sawtooth followed by a real boundary yields exactly two messages", async () => {
+    // Cross the new tail-hold guard with the structured-boundary guard. The
+    // first message must not rotate on its sawtooth, while the real boundary
+    // must still rotate exactly once before the second message.
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    for (const text of CORE_TOOL_CALL_SAWTOOTH) h.draft.pushAnswerText({ text });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Second message" });
+    await expect(h.draft.finalize("Second message")).resolves.toBe(true);
+    await h.draft.drain();
+
+    const finals = h.frames.filter((frame) => frame.type === "final");
+    expect(finals.map((frame) => frame.text)).toEqual(["Hello  there", "Second message"]);
+    expect(new Set(finals.map((frame) => frame.id)).size).toBe(2);
+    expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<tool_call");
+  });
+
+  it("M7q: delta composition retains a temporarily deferred literal suffix", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ delta: "see " });
+    h.draft.pushAnswerText({ delta: "<" });
+    h.draft.pushAnswerText({ delta: "d" });
+    h.draft.pushAnswerText({ delta: "iv" });
+    await h.draft.drain();
+
+    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
+      "see <div",
+    ]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
   });
 
   /**
