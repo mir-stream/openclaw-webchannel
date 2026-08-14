@@ -162,9 +162,25 @@ type AssistantDraftLane = {
    * The last RAW cumulative partial accepted into this lane, before reasoning /
    * inline-directive stripping. Tag stripping makes the CLEANED text
    * non-monotonic (an unclosed `<thinking>` shortens it), so cleaned text alone
-   * cannot tell tag noise from a new assistant message — the raw stream can:
-   * a provider appending to the same message always extends it, while a new
-   * message restarts it. Used only by the missed-boundary defense.
+   * cannot tell tag noise from a new assistant message. The raw stream is the
+   * better signal — but NOT a monotonic one, and #94 recorded the opposite
+   * ("a provider appending to the same message always extends it"). Measured
+   * false on the pinned core 2026.7.1-2: what reaches `onPartialReply` is not
+   * the provider's text but `sanitizeUserFacingText(cumulative)`, applied by
+   * core to EVERY payload, and its tool-call / `<function_calls>` / `<final>`
+   * strippers shorten their output the instant such a tag completes. Feeding
+   * `Hello <tool_call>{...}</tool_call> there` one character at a time yields
+   * the payload pair `"Hello <tool_call>"` then `"Hello "` — a strict prefix,
+   * inside ONE message.
+   *
+   * Nothing here acts on that, deliberately. #120 (a second message whose whole
+   * text is a strict prefix of the first is erased by `finalize`) was attacked
+   * by treating a backwards raw as a restart signal, and every variant of that
+   * misfires on ordinary tag-bearing turns — see M7h for the defect and M7k for
+   * the stream that defeats the cure. The distinction is not in the text; it
+   * has to come from the boundary signal. #120 stays open.
+   *
+   * Used only by the missed-boundary defense.
    */
   lastRawAnswerText: string;
   answerRevision: number;
@@ -1415,6 +1431,12 @@ export function createProgressDraftController(params: {
             lane.answerText.startsWith(cleaned) &&
             cleaned.length < lane.answerText.length
           ) {
+            // Tag stripping shortens the CLEANED text while the RAW payload keeps
+            // growing — but only for OUR strippers (`<thinking>`, inline
+            // directives), which core leaves in place. Core's own strippers
+            // shorten the raw too, so a backwards raw is NOT a reliable
+            // new-message signal; see `lastRawAnswerText` and #120.
+            //
             // No `replace` flag needed: this branch is unreachable for a replace
             // update (the condition above requires `replace !== true`).
             acceptRawBaseline(lane, raw);
