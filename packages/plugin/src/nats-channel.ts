@@ -926,7 +926,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     if (Math.abs(skew) > this.replayWindowMs) {
       console.warn(
         `[nats-channel] Dropping inbound from ${logSafe(peerId)}: ts outside ±${this.replayWindowMs}ms window ` +
-          `(skew=${skew}ms, messageId=${logSafe(messageId)}) — stale replay or client clock skew`,
+          `(skew=${skew}ms) — stale replay or client clock skew; messageId=${logSafe(messageId)}`,
       );
       return false;
     }

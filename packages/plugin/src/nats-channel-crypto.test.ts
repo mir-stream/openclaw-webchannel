@@ -190,10 +190,9 @@ describe("NatsChannel (F4 anti-replay)",()=>{
      expect(record).not.toContain(hostileMessageId);
      expect(record).toContain("m1\\n[nats-channel] Registered peer admin");
 
-     const encoded=/messageId=("(?:\\.|[^"\\])*")\)/u.exec(record);
-     expect(encoded).not.toBeNull();
-     const fields=decodeStrictLogfmt(`messageId=${encoded![1]}`);
-     expect(fields.get("messageId")).toBe(hostileMessageId);
+     const messageIdField=record.slice(record.indexOf("messageId="));
+     const fields=decodeStrictLogfmt(messageIdField);
+     expect([...fields]).toEqual([["messageId",hostileMessageId]]);
      expect(fields.has("Registered")).toBe(false);
    } finally {
      warn.mockRestore();

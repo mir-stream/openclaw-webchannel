@@ -150,21 +150,15 @@ export const ALLOWED_RAW_INTERPOLATIONS: readonly AllowedRawInterpolation[] = [
   },
   {
     file: "nats-channel.ts",
-    site: "[nats-channel] Dropping inbound from : ts outside ±ms window (skew=ms, messageId=) — stale replay or client clock skew",
+    site: "[nats-channel] Dropping inbound from : ts outside ±ms window (skew=ms) — stale replay or client clock skew; messageId=",
     expression: "this.replayWindowMs",
     reason: "readonly millisecond duration (number)",
   },
   {
     file: "nats-channel.ts",
-    site: "[nats-channel] Dropping inbound from : ts outside ±ms window (skew=ms, messageId=) — stale replay or client clock skew",
+    site: "[nats-channel] Dropping inbound from : ts outside ±ms window (skew=ms) — stale replay or client clock skew; messageId=",
     expression: "skew",
     reason: "Date.now() minus authenticated numeric timestamp (number)",
-  },
-  {
-    file: "nats-channel.ts",
-    site: "[nats-channel] Dropping inbound from : ts outside ±ms window (skew=ms, messageId=) — stale replay or client clock skew",
-    expression: "logSafe(messageId)",
-    reason: "canonical quoted token; the static prose parenthesis is outside the attacker-controlled value",
   },
   // Retry/lifecycle counters on the `event=webchannel.*` records.
   {
