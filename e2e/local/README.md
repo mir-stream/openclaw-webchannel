@@ -138,32 +138,39 @@ were found in one sitting (`port: 14481` inside the `node -e` block that writes 
 was itself an enumeration, and the `nats.conf` case — a JS object literal inside a `.sh` — is
 what walked through it. So the polarity is inverted: **every integer in the unprivileged port
 range, in any scanned file, outside comments and not part of a longer token, is a port** unless
-it is a documented non-port occurrence scoped to that file and an exact expected count, a port
-that file is the declared owner of, or a named waiver tied to a filed issue.
+it is a documented non-port occurrence scoped to that file and an exact expected count, a real
+product port documented as outside the test topology, a port that file is the declared owner of,
+or a named waiver tied to a filed issue.
 
 **The scan set is discovered, not listed.** It walks `e2e/local/` recursively — `lib/harness.sh`
-is in scope, and a literal there would override `harness_ports` for all six gates at once — plus
-every file under `packages/*/src/**` that *binds or spawns a listener*, found by content
-(`nats-server`, `.listen(`, `createServer(`, `ws_port`, `spawn(`). That predicate is the analogue
-of `run-*.sh` and also recognizes `new WebSocketServer({ port })`: a new realserver suite is
-covered the day it lands, without anyone registering it.
-Earlier the `packages/` half was a hand-maintained list, and a new suite spawning
-`nats-server -p 14491 --ws_port 18491` — `run-multi-message`'s live ports — was invisible.
-`packages/*/reference/**` is out of scope on purpose: those servers take their port from env in
-every harness use, and their defaults are recorded under `reserved`.
+is in scope, and a literal there would override `harness_ports` for all six gates at once. Direct
+listener roots are then discovered by content (`nats-server`, `.listen(`, `createServer(`,
+`ws_port`, `spawn(`, or `new WebSocketServer(`) from two universes: every source under
+`packages/*/src/**` (the original #118 family), and every root-sweep Vitest `*.test.*`/`*.spec.*`
+source in the repository. The latter honors Vitest's current default exclusions plus this repo's
+`docker/**` and `examples/**` exclusions, so a future `demo/server.test.ts` is covered on arrival.
 
-**The exemption and waiver lists are forced to shrink.** Each `NOT_PORTS` entry names its source,
-value, and exact occurrence count. The same value in another source receives no allowance, and
-an extra occurrence in the named source exceeds the allowance, so a timeout cannot hide a fixed
-listener. Removing an occurrence also makes the count stale. Every `WAIVED` entry must likewise
-still occur in the scan set, so fixing a waived defect fails the build until the waiver is deleted
-rather than leaving a silent blind spot.
+Every direct listener root brings its recursive local static ESM import/re-export and CommonJS
+`require()` provenance into the scan. Resolution prefers TypeScript source behind `.js`/`.cjs`
+specifiers and supports source/index variants, so a test that imports `FIXED_PORT` from a helper
+cannot move its literal out of view. Computed/dynamic imports, package specifiers,
+excluded/generated trees, JSON, and unrelated product sources are not followed; this is a
+contained provenance graph, not a sweep of the whole product tree.
+
+**Every literal allowance is an exact budget.** `NOT_PORTS` contains only genuine non-port
+constants and names source, value, count, and reason. `WAIVED` records the same fields for each
+filed existing defect. A small `OUTSIDE_TEST_TOPOLOGY` category honestly records real product
+dial defaults reached through provenance whose discovered tests inject their own URLs; those are
+ports, not mislabeled constants. In every category the same value in another source receives no
+allowance, an extra same-file occurrence exceeds the count, and removing an occurrence makes the
+budget stale.
 
 > Known evasions of the token rule, listed because that rule is the design's load-bearing claim:
 > numeric separators (`18_991`), hex/octal, and runtime concatenation of sub-4-digit parts. Each
 > takes intent; the scan is aimed at the accident.
 >
-> Scanned extensions are source only (`.sh .ts .mts .cts .js .mjs .cjs`). `.json` is excluded
+> Scanned extensions are source only (`.sh`, JS/TS including `jsx`/`tsx`, `mts`/`cts`, and
+> `mjs`/`cjs`). `.json` is excluded
 > because the authority is itself JSON; `.yaml` because the CI workflow is owned by another lane.
 
 Drivers take their topology from the gate via env and **fail** if it is missing rather than

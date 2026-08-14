@@ -198,7 +198,7 @@ harness_assert_loaded_dist() {
   loaded_sources="$(
     sed -nE '
       /[(,][[:space:]]*plugin=webchannel[[:space:]]*[,)]/ {
-        s/^.*[(,][[:space:]]*source=([^)]*)\).*$/\1/p
+        s/^.*[(,][[:space:]]*source=(.*)\)[[:space:]]*$/\1/p
       }
     ' "$gwlog" | sort -u
   )"

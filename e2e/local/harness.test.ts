@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,6 +57,18 @@ describe("harness_assert_loaded_dist", () => {
 
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("DIST-ASSERT: gateway loaded the bundle");
+  });
+
+  it("accepts an exact source path containing parentheses", () => {
+    const parenthesizedDir = join(testDir, "bundle (candidate)");
+    mkdirSync(parenthesizedDir);
+    dist = join(parenthesizedDir, "index-nats.js");
+    writeFileSync(dist, "export {};\n");
+
+    const result = assertLoaded(dist);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`source=${dist}`);
   });
 
   it("rejects a source for which the expected path is only a prefix", () => {

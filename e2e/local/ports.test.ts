@@ -15,9 +15,28 @@
  * free number in different blocks — a red test instead of a flake.
  */
 import { describe, expect, it } from "vitest";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import type { Dirent } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import {
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -65,31 +84,71 @@ function gateScripts(): string[] {
     .sort();
 }
 
-const SOURCE_EXT = /\.(sh|ts|mts|cts|js|mjs|cjs)$/;
+const SOURCE_EXT = /\.(?:sh|[cm]?[jt]sx?)$/;
+const MODULE_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+] as const;
+const EMITTED_TO_SOURCE_EXTENSIONS: Record<string, readonly string[]> = {
+  ".js": [".ts", ".tsx"],
+  ".jsx": [".tsx", ".ts"],
+  ".mjs": [".mts"],
+  ".cjs": [".cts"],
+};
+const VITEST_SUITE = /\.(?:test|spec)\.[cm]?[jt]sx?$/;
+const VITEST_DEFAULT_EXCLUDED_DIRS = new Set([
+  "node_modules",
+  "dist",
+  "cypress",
+  ".idea",
+  ".git",
+  ".cache",
+  ".output",
+  ".temp",
+]);
+const REPO_EXCLUDED_ROOTS = new Set(["docker", "examples"]);
+const CONFIG_EXCLUSION =
+  /^(?:karma|rollup|webpack|vite|vitest|jest|ava|babel|nyc|cypress|tsup|build|eslint|prettier)\.config\./;
 const BINDS =
   /nats-server|\.listen\s*\(|createServer\s*\(|\bnew\s+WebSocketServer\s*\(|ws_port|\bspawn\s*\(/;
+const STATIC_RELATIVE_MODULE =
+  /\b(?:import|export)\s+(?:type\s+)?(?:[^"'`;]*?\s+from\s+)?["'](\.{1,2}\/[^"']+)["']/g;
+const STATIC_RELATIVE_REQUIRE =
+  /\brequire\s*\(\s*["'](\.{1,2}\/[^"']+)["']\s*\)/g;
 
 function isBindingSource(codeWithoutComments: string): boolean {
   return BINDS.test(codeWithoutComments);
 }
 
-/**
- * Files that bind or spawn a listener, discovered by CONTENT under
- * packages/-/src/.
- *
- * WHY A PREDICATE AND NOT A LIST (review round 3): the previous version scanned
- * exactly `Object.keys(doc.vitest)` outside e2e/local, so a brand-new suite
- * spawning `nats-server -p 14491 --ws_port 18491` — run-multi-message's live
- * ports — was invisible until somebody remembered to register it. `run-*.sh`
- * gets real discovery; the packages half got a hand-maintained enumeration, in a
- * guard whose whole thesis is that those leak. #118's home was a suite in here.
- *
- * Scope is `packages/-/src/-` deliberately. `packages/saas/reference/-` is out:
- * those are reference servers every harness launches with an explicit PORT, and
- * their defaults are recorded under `reserved`. That is a scope boundary with a
- * reason, not an item-by-item exclusion list.
- */
-function bindingSources(): string[] {
+function repoRelative(repo: string, abs: string): string {
+  return relative(repo, abs).split(sep).join("/");
+}
+
+function hasExcludedDirectory(rel: string): boolean {
+  const parts = rel.split("/");
+  return (
+    parts.some((part) => VITEST_DEFAULT_EXCLUDED_DIRS.has(part)) ||
+    REPO_EXCLUDED_ROOTS.has(parts[0] ?? "")
+  );
+}
+
+function isExcludedRelativePath(rel: string): boolean {
+  const basename = rel.split("/").at(-1) ?? "";
+  return hasExcludedDirectory(rel) || CONFIG_EXCLUSION.test(basename);
+}
+
+/** Walk source files beneath one relative directory, tolerating absent roots. */
+function sourceFilesUnder(
+  repo: string,
+  startRel: string,
+  honorVitestExclusions = true,
+): string[] {
   const out: string[] = [];
   const walk = (dir: string, rel: string) => {
     let entries;
@@ -99,20 +158,150 @@ function bindingSources(): string[] {
       return;
     }
     for (const e of entries) {
-      if (e.name === "node_modules") continue;
-      const childRel = `${rel}/${e.name}`;
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      const excluded = honorVitestExclusions
+        ? e.isDirectory()
+          ? hasExcludedDirectory(childRel)
+          : isExcludedRelativePath(childRel)
+        : e.name === "node_modules";
+      if (e.isDirectory() && excluded) continue;
       if (e.isDirectory()) walk(join(dir, e.name), childRel);
-      else if (SOURCE_EXT.test(e.name)) {
-        const code = decomment(readFileSync(join(dir, e.name), "utf8"), false).join("\n");
-        if (isBindingSource(code)) out.push(childRel);
-      }
+      else if (SOURCE_EXT.test(e.name) && !excluded) out.push(childRel);
     }
   };
-  for (const pkg of readdirSync(join(REPO, "packages"), { withFileTypes: true })) {
-    if (!pkg.isDirectory()) continue;
-    walk(join(REPO, "packages", pkg.name, "src"), `packages/${pkg.name}/src`);
-  }
+  walk(join(repo, ...startRel.split("/").filter(Boolean)), startRel);
   return out.sort();
+}
+
+/** The root Vitest universe implied by configDefaults.include and exclusions. */
+function vitestSuiteFiles(repo = REPO): string[] {
+  return sourceFilesUnder(repo, "")
+    .filter(
+      (rel) =>
+        VITEST_SUITE.test(rel) && rel !== "e2e/local/ports.test.ts",
+    )
+    .sort();
+}
+
+/**
+ * Direct listener roots. Preserve the broad packages/<name>/src content scan
+ * that covers #118's original family, then add every root Vitest test/spec source
+ * shape outside configDefaults/repo exclusions. This catches future demo tests
+ * without turning the whole product tree into a literal scan.
+ */
+function directBindingSources(repo = REPO): string[] {
+  const candidates = new Set(vitestSuiteFiles(repo));
+  let packages: Dirent[];
+  try {
+    packages = readdirSync(join(repo, "packages"), { withFileTypes: true });
+  } catch {
+    packages = [];
+  }
+  for (const pkg of packages) {
+    if (!pkg.isDirectory()) continue;
+    for (const rel of sourceFilesUnder(
+      repo,
+      `packages/${pkg.name}/src`,
+      false,
+    )) {
+      candidates.add(rel);
+    }
+  }
+
+  return [...candidates]
+    .filter((rel) => {
+      const code = decomment(
+        readFileSync(join(repo, ...rel.split("/")), "utf8"),
+        false,
+      ).join("\n");
+      return isBindingSource(code);
+    })
+    .sort();
+}
+
+function staticRelativeModules(codeWithoutComments: string): string[] {
+  return [
+    ...new Set([
+      ...[...codeWithoutComments.matchAll(STATIC_RELATIVE_MODULE)].map(
+        (match) => match[1]!,
+      ),
+      ...[...codeWithoutComments.matchAll(STATIC_RELATIVE_REQUIRE)].map(
+        (match) => match[1]!,
+      ),
+    ]),
+  ];
+}
+
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve a local source import, preferring TS behind emitted `.js` names. */
+function resolveLocalSource(
+  repo: string,
+  importerRel: string,
+  specifier: string,
+): string | null {
+  const base = resolve(dirname(join(repo, ...importerRel.split("/"))), specifier);
+  const relBase = relative(repo, base);
+  if (relBase === ".." || relBase.startsWith(`..${sep}`) || isAbsolute(relBase)) {
+    return null;
+  }
+
+  const extension = extname(base);
+  const candidates: string[] = [];
+  const sourceExtensions = EMITTED_TO_SOURCE_EXTENSIONS[extension];
+  if (sourceExtensions) {
+    const stem = base.slice(0, -extension.length);
+    for (const ext of sourceExtensions) candidates.push(`${stem}${ext}`);
+    candidates.push(base);
+  } else if (
+    extension &&
+    (MODULE_EXTENSIONS as readonly string[]).includes(extension)
+  ) {
+    candidates.push(base);
+  } else if (extension) {
+    return null;
+  } else {
+    for (const ext of MODULE_EXTENSIONS) candidates.push(`${base}${ext}`);
+    for (const ext of MODULE_EXTENSIONS) candidates.push(join(base, `index${ext}`));
+  }
+
+  for (const candidate of candidates) {
+    const rel = repoRelative(repo, candidate);
+    if (!isExcludedRelativePath(rel) && isFile(candidate)) return rel;
+  }
+  return null;
+}
+
+/**
+ * Direct binding roots plus their recursive local static ESM and CommonJS
+ * provenance. `.js` specifiers prefer their TS source and extensionless
+ * specifiers resolve source/index variants. Dynamic, package, and excluded-tree
+ * imports are deliberately outside this static provenance boundary; product
+ * files unrelated to a binding root are never swept.
+ */
+function bindingSources(repo = REPO): string[] {
+  const discovered = new Set<string>();
+  const pending = [...directBindingSources(repo)];
+  while (pending.length > 0) {
+    const rel = pending.pop()!;
+    if (discovered.has(rel)) continue;
+    discovered.add(rel);
+    const code = decomment(
+      readFileSync(join(repo, ...rel.split("/")), "utf8"),
+      false,
+    ).join("\n");
+    for (const specifier of staticRelativeModules(code)) {
+      const dependency = resolveLocalSource(repo, rel, specifier);
+      if (dependency && !discovered.has(dependency)) pending.push(dependency);
+    }
+  }
+  return [...discovered].sort();
 }
 
 /**
@@ -123,17 +312,9 @@ function bindingSources(): string[] {
  */
 function scannedFiles(): string[] {
   const out = new Set<string>();
-  const walk = (dir: string, rel: string) => {
-    for (const e of readdirSync(dir, { withFileTypes: true })) {
-      if (e.name === "node_modules") continue;
-      const childRel = `${rel}/${e.name}`;
-      if (e.isDirectory()) walk(join(dir, e.name), childRel);
-      else if (SOURCE_EXT.test(e.name) && childRel !== "e2e/local/ports.test.ts") {
-        out.add(childRel);
-      }
-    }
-  };
-  walk(HERE, "e2e/local");
+  for (const rel of sourceFilesUnder(REPO, "e2e/local", false)) {
+    if (rel !== "e2e/local/ports.test.ts") out.add(rel);
+  }
   for (const f of bindingSources()) out.add(f);
   for (const group of ["vitest", "tools"] as const) {
     for (const k of Object.keys(doc[group] ?? {})) {
@@ -244,6 +425,103 @@ function decomment(text: string, shell: boolean): string[] {
   return out.join("").split("\n");
 }
 
+type PortLiteral = [rel: string, line: number, value: number];
+type LiteralBudget = {
+  file: string;
+  value: number;
+  count: number;
+  reason: string;
+};
+
+/** Every port-range integer in one source, with comments ignored. */
+function literalsInSource(rel: string, text: string): PortLiteral[] {
+  const found: PortLiteral[] = [];
+  decomment(text, rel.endsWith(".sh")).forEach((line, i) => {
+    for (const match of line.matchAll(/(?<![\w.\-])(\d{4,5})(?![\w.\-])/g)) {
+      const value = Number(match[1]);
+      if (value >= 1024 && value <= 65535) found.push([rel, i + 1, value]);
+    }
+  });
+  return found;
+}
+
+function literalsInFiles(repo: string, files: string[]): PortLiteral[] {
+  return files.flatMap((rel) =>
+    literalsInSource(
+      rel,
+      readFileSync(join(repo, ...rel.split("/")), "utf8"),
+    ),
+  );
+}
+
+function budgetKey(file: string, value: number): string {
+  return `${file}:${value}`;
+}
+
+/** Consume only the exact occurrence allowance for each source/value pair. */
+function withoutLiteralBudgets(
+  literals: PortLiteral[],
+  budgets: LiteralBudget[],
+): PortLiteral[] {
+  const allowed = new Map(
+    budgets.map((rule) => [budgetKey(rule.file, rule.value), rule.count]),
+  );
+  const seen = new Map<string, number>();
+  return literals.filter(([file, , value]) => {
+    const key = budgetKey(file, value);
+    const occurrence = (seen.get(key) ?? 0) + 1;
+    seen.set(key, occurrence);
+    return occurrence > (allowed.get(key) ?? 0);
+  });
+}
+
+/** Exact-count liveness in both directions, including duplicate rule keys. */
+function literalBudgetProblems(
+  literals: PortLiteral[],
+  budgets: LiteralBudget[],
+  label: string,
+): string[] {
+  const counts = new Map<string, number>();
+  for (const [file, , value] of literals) {
+    const key = budgetKey(file, value);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  const ruleKeys = new Set<string>();
+  const problems: string[] = [];
+  for (const rule of budgets) {
+    const key = budgetKey(rule.file, rule.value);
+    if (ruleKeys.has(key)) {
+      problems.push(`  ${label} ${key} is declared more than once`);
+      continue;
+    }
+    ruleKeys.add(key);
+    const actual = counts.get(key) ?? 0;
+    if (actual !== rule.count) {
+      problems.push(
+        `  ${label} ${key} expects ${rule.count}, found ${actual} (${rule.reason})`,
+      );
+    }
+  }
+  return problems;
+}
+
+function withFixtureRepo(
+  files: Record<string, string>,
+  assertion: (repo: string) => void,
+): void {
+  const repo = mkdtempSync(join(tmpdir(), "webchannel-port-discovery-"));
+  try {
+    for (const [rel, contents] of Object.entries(files)) {
+      const abs = join(repo, ...rel.split("/"));
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, contents);
+    }
+    assertion(repo);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+}
+
 describe("e2e/local/ports.json", () => {
   it("allocates only well-formed ports", () => {
     for (const [owner, key, port] of allAllocations()) {
@@ -309,6 +587,81 @@ describe("e2e/local/ports.json", () => {
     );
   });
 
+  it("discovers a root-sweep binding suite outside packages", () => {
+    withFixtureRepo(
+      {
+        "demo/server.test.ts":
+          'new WebSocketServer({ port: 18491, host: "127.0.0.1" });\n',
+        "examples/ignored.test.ts":
+          'new WebSocketServer({ port: 18491, host: "127.0.0.1" });\n',
+        "dist/ignored.spec.js": "new WebSocketServer({ port: 18491 });\n",
+      },
+      (repo) => {
+        expect(vitestSuiteFiles(repo)).toEqual(["demo/server.test.ts"]);
+        expect(bindingSources(repo)).toEqual(["demo/server.test.ts"]);
+        expect(literalsInFiles(repo, bindingSources(repo))).toContainEqual([
+          "demo/server.test.ts",
+          1,
+          18491,
+        ]);
+      },
+    );
+  });
+
+  it("includes recursive local import provenance for a binding suite", () => {
+    withFixtureRepo(
+      {
+        "demo/server.test.ts": [
+          'import { FIXED_PORT } from "./fixed-port.js";',
+          "new WebSocketServer({ port: FIXED_PORT });",
+          "",
+        ].join("\n"),
+        "demo/fixed-port.ts":
+          'export { FIXED_PORT } from "./ports";\n',
+        "demo/ports/index.ts": "export const FIXED_PORT = 18491;\n",
+      },
+      (repo) => {
+        expect(bindingSources(repo)).toEqual([
+          "demo/fixed-port.ts",
+          "demo/ports/index.ts",
+          "demo/server.test.ts",
+        ]);
+        expect(literalsInFiles(repo, bindingSources(repo))).toContainEqual([
+          "demo/ports/index.ts",
+          1,
+          18491,
+        ]);
+      },
+    );
+  });
+
+  it("includes CommonJS require provenance for a binding suite", () => {
+    withFixtureRepo(
+      {
+        "demo/server.test.cjs": [
+          'const { FIXED_PORT } = require("./fixed-port.cjs");',
+          'require("./ignored.json");',
+          "new WebSocketServer({ port: FIXED_PORT });",
+          "",
+        ].join("\n"),
+        "demo/fixed-port.cts": "export const FIXED_PORT = 18491;\n",
+        "demo/fixed-port.ts": "export const FIXED_PORT = 3000;\n",
+        "demo/ignored.json": "{ \"port\": 18491 }\n",
+      },
+      (repo) => {
+        expect(bindingSources(repo)).toEqual([
+          "demo/fixed-port.cts",
+          "demo/server.test.cjs",
+        ]);
+        expect(literalsInFiles(repo, bindingSources(repo))).toContainEqual([
+          "demo/fixed-port.cts",
+          1,
+          18491,
+        ]);
+      },
+    );
+  });
+
   it("makes every gate load its OWN block", () => {
     // Nothing used to tie run-X.sh to block X: `harness_ports run-turn-outcome
     // run-multi-message` inside run-multi-message.sh was 7/7 green while giving
@@ -361,8 +714,9 @@ describe("e2e/local/ports.json", () => {
   // Every integer in the unprivileged port range, in any scanned file, outside
   // comments and not part of a longer token, IS a port unless it is
   //   (a) a documented, source-scoped non-port occurrence (NOT_PORTS),
-  //   (b) a port the file is the declared owner of, or
-  //   (c) a named waiver tied to a filed issue (WAIVED).
+  //   (b) a documented product port outside the test topology,
+  //   (c) a port the file is the declared owner of, or
+  //   (d) a named waiver tied to a filed issue (WAIVED).
   // Gates, drivers and lib/ own nothing — asserted below, not merely asserted in
   // a comment.
   //
@@ -372,14 +726,6 @@ describe("e2e/local/ports.json", () => {
   // intent; the scan targets the accident.
   // -------------------------------------------------------------------------
 
-  type PortLiteral = [rel: string, line: number, value: number];
-  type NonPortExemption = {
-    file: string;
-    value: number;
-    count: number;
-    reason: string;
-  };
-
   /**
    * Exact source occurrences inside the port range that are not ports.
    *
@@ -388,7 +734,7 @@ describe("e2e/local/ports.json", () => {
    * brittle line numbers while preventing a timeout from globally exempting a
    * listener that happens to use the same number.
    */
-  const NOT_PORTS: NonPortExemption[] = [
+  const NOT_PORTS: LiteralBudget[] = [
     { file: "e2e/local/require-env.ts", value: 65535, count: 1, reason: "port-range validation upper bound" },
     { file: "e2e/local/lib/harness.sh", value: 65535, count: 1, reason: "port-range validation upper bound" },
     { file: "e2e/local/run-multi-message.sh", value: 8192, count: 1, reason: "OpenClaw maxTokens" },
@@ -425,113 +771,95 @@ describe("e2e/local/ports.json", () => {
     { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 5000, count: 1, reason: "message fixture amount" },
     { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 3000, count: 2, reason: "assertion timeout in ms" },
     { file: "packages/plugin/src/nats-transport-realserver.test.ts", value: 4000, count: 1, reason: "assertion timeout in ms" },
+    { file: "packages/plugin/src/auth.ts", value: 4000, count: 1, reason: "JWKS fetch timeout in ms" },
+    { file: "packages/plugin/src/enrollment-client.ts", value: 5000, count: 1, reason: "RFC 8628 polling floor in ms" },
+    { file: "packages/plugin/src/ingress-result-chunks.ts", value: 1024, count: 1, reason: "byte-size multiplier" },
+    { file: "packages/plugin/src/nats-transport.ts", value: 1024, count: 4, reason: "protocol buffer-size multiplier" },
+    { file: "packages/plugin/src/preflight.ts", value: 5000, count: 1, reason: "relay-dial timeout in ms" },
+    { file: "packages/saas/src/setup-trust-chain.ts", value: 2048, count: 2, reason: "RSA key size in bits" },
   ];
 
   /**
-   * Known-bad literals waived pending a filed fix. Every entry must still be
-   * present in its file — see the reciprocal test below, which forces the list
-   * to shrink when the underlying defect is fixed. Without that, fixing the
-   * filed issue would silently turn these into permanent blind spots.
+   * Real product dial defaults reached only through provenance imports. They are
+   * ports, so they are deliberately not called NOT_PORTS; the discovered tests
+   * inject their own listener URLs and these defaults do not bind test sockets.
    */
-  const WAIVED = new Map<string, string>([
-    [
-      "packages/saas/src/demo-server-role.test.ts:18722",
-      "= run-two-account-isolation NATS_WS; spawn env for a demo server that never dials it. Filed by review round 2.",
-    ],
-    [
-      "packages/saas/src/demo-ui-smoke.test.ts:19299",
-      "= run-two-account-isolation GW_PORT; spawn env (DEMO_GW_URL) for a demo server that never dials it. Filed by review round 2.",
-    ],
-    [
-      "packages/saas/src/demo-ui-smoke.test.ts:4222",
-      "= ac6-device-flow-e2e NATS_CLIENT_PORT; spawn env (NATS_URL), same defect, four lines above the DEMO_GW_URL case.",
-    ],
-  ]);
+  const OUTSIDE_TEST_TOPOLOGY: LiteralBudget[] = [
+    {
+      file: "packages/plugin/src/nats-credential-source.ts",
+      value: 4222,
+      count: 1,
+      reason: "product NATS dial fallback; discovered tests inject their own URL",
+    },
+    {
+      file: "packages/plugin/src/nats-credential-source.ts",
+      value: 3001,
+      count: 1,
+      reason: "product SaaS dial fallback; discovered tests inject their own base URL",
+    },
+  ];
 
-  /** Every port-range integer in one source, with comments ignored. */
-  function literalsInSource(rel: string, text: string): PortLiteral[] {
-    const found: PortLiteral[] = [];
-    decomment(text, rel.endsWith(".sh")).forEach((line, i) => {
-      for (const m of line.matchAll(/(?<![\w.\-])(\d{4,5})(?![\w.\-])/g)) {
-        const value = Number(m[1]);
-        if (value >= 1024 && value <= 65535) found.push([rel, i + 1, value]);
-      }
-    });
-    return found;
-  }
+  /**
+   * Known-bad literals waived pending a filed fix. Every entry's exact count
+   * must remain present in its file — see the reciprocal test below, which
+   * forces the list to shrink when the defect is fixed and grow red when a
+   * second occurrence appears.
+   */
+  const WAIVED: LiteralBudget[] = [
+    {
+      file: "packages/saas/src/demo-server-role.test.ts",
+      value: 18722,
+      count: 1,
+      reason: "= run-two-account-isolation NATS_WS; spawn env for a demo server that never dials it. Issue #138.",
+    },
+    {
+      file: "packages/saas/src/demo-ui-smoke.test.ts",
+      value: 19299,
+      count: 1,
+      reason: "= run-two-account-isolation GW_PORT; spawn env (DEMO_GW_URL) for a demo server that never dials it. Issue #138.",
+    },
+    {
+      file: "packages/saas/src/demo-ui-smoke.test.ts",
+      value: 4222,
+      count: 1,
+      reason: "= ac6-device-flow-e2e NATS_CLIENT_PORT; spawn env (NATS_URL), same defect, four lines above the DEMO_GW_URL case. Issue #138.",
+    },
+  ];
 
   /** Every port-range integer in the scan set. */
   function scanLiterals(): PortLiteral[] {
-    const found: PortLiteral[] = [];
-    for (const rel of scannedFiles()) {
-      const abs = join(REPO, rel);
-      if (!existsSync(abs)) continue;
-      found.push(...literalsInSource(rel, readFileSync(abs, "utf8")));
-    }
-    return found;
-  }
-
-  function exemptionKey(file: string, value: number): string {
-    return `${file}:${value}`;
-  }
-
-  /** Remove only the occurrence budget explicitly allowed for each source. */
-  function withoutNonPortExemptions(
-    literals: PortLiteral[],
-    exemptions: NonPortExemption[] = NOT_PORTS,
-  ): PortLiteral[] {
-    const allowed = new Map(
-      exemptions.map((rule) => [exemptionKey(rule.file, rule.value), rule.count]),
-    );
-    const seen = new Map<string, number>();
-    return literals.filter(([file, , value]) => {
-      const key = exemptionKey(file, value);
-      const occurrence = (seen.get(key) ?? 0) + 1;
-      seen.set(key, occurrence);
-      return occurrence > (allowed.get(key) ?? 0);
-    });
+    return literalsInFiles(REPO, scannedFiles());
   }
 
   it("never exempts a port owned by the same source", () => {
-    const clashes = NOT_PORTS
+    const clashes = [...NOT_PORTS, ...OUTSIDE_TEST_TOPOLOGY, ...WAIVED]
       .filter((rule) => ownedPorts(rule.file).has(rule.value))
       .map(
         (rule) =>
-          `  ${exemptionKey(rule.file, rule.value)} (${rule.reason}) is also owned by that file`,
+          `  ${budgetKey(rule.file, rule.value)} (${rule.reason}) is also owned by that file`,
       );
-    expect(clashes, `NOT_PORTS hides owned ports:\n${clashes.join("\n")}`).toEqual([]);
+    expect(clashes, `literal budget hides owned ports:\n${clashes.join("\n")}`).toEqual([]);
   });
 
-  it("keeps exemption counts exact and no waiver dead", () => {
-    // Exemption counts are exact, so both deletion and an extra same-file use
-    // turn red. Waivers likewise must disappear when their literal does.
+  it("keeps every literal occurrence budget exact", () => {
     const literals = scanLiterals();
-    const counts = new Map<string, number>();
-    for (const [file, , value] of literals) {
-      const key = exemptionKey(file, value);
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-    const seenWaivers = new Set(literals.map(([rel, , p]) => `${rel}:${p}`));
-
     const dead = [
-      ...NOT_PORTS
-        .filter((rule) => counts.get(exemptionKey(rule.file, rule.value)) !== rule.count)
-        .map((rule) => {
-          const key = exemptionKey(rule.file, rule.value);
-          return `  NOT_PORTS ${key} expects ${rule.count}, found ${counts.get(key) ?? 0} (${rule.reason})`;
-        }),
-      ...[...WAIVED.keys()]
-        .filter((k) => !seenWaivers.has(k))
-        .map((k) => `  WAIVED ${k} no longer appears — the defect is fixed, remove the waiver`),
+      ...literalBudgetProblems(literals, NOT_PORTS, "NOT_PORTS"),
+      ...literalBudgetProblems(
+        literals,
+        OUTSIDE_TEST_TOPOLOGY,
+        "OUTSIDE_TEST_TOPOLOGY",
+      ),
+      ...literalBudgetProblems(literals, WAIVED, "WAIVED"),
     ];
-    expect(dead, `dead exemptions/waivers:\n${dead.join("\n")}`).toEqual([]);
+    expect(dead, `stale literal budgets:\n${dead.join("\n")}`).toEqual([]);
   });
 
   it("scopes a timeout exemption away from a discovered fixed listener", () => {
     const timeoutFile = "e2e/local/timeout-fixture.ts";
     const listenerFile = "packages/fixture/src/listener.test.ts";
     const listener = "new WebSocketServer({ port: 3000 });";
-    const exemptions: NonPortExemption[] = [
+    const exemptions: LiteralBudget[] = [
       { file: timeoutFile, value: 3000, count: 1, reason: "timeout in ms" },
     ];
     const timeoutLiterals = literalsInSource(timeoutFile, "setTimeout(done, 3000);");
@@ -539,9 +867,9 @@ describe("e2e/local/ports.json", () => {
 
     expect(isBindingSource(listener)).toBe(true);
     expect(doc.reserved["3000"]).toBeDefined();
-    expect(withoutNonPortExemptions(timeoutLiterals, exemptions)).toEqual([]);
+    expect(withoutLiteralBudgets(timeoutLiterals, exemptions)).toEqual([]);
     expect(
-      withoutNonPortExemptions(
+      withoutLiteralBudgets(
         [...timeoutLiterals, ...listenerLiterals],
         exemptions,
       ),
@@ -554,12 +882,29 @@ describe("e2e/local/ports.json", () => {
       "setTimeout(done, 3000);",
       "new WebSocketServer({ port: 3000 });",
     ].join("\n");
-    const exemptions: NonPortExemption[] = [
+    const exemptions: LiteralBudget[] = [
       { file, value: 3000, count: 1, reason: "timeout in ms" },
     ];
 
-    expect(withoutNonPortExemptions(literalsInSource(file, source), exemptions)).toEqual([
+    expect(withoutLiteralBudgets(literalsInSource(file, source), exemptions)).toEqual([
       [file, 2, 3000],
+    ]);
+  });
+
+  it("does not let a second same-file listener share a waiver", () => {
+    const file = "packages/saas/src/demo-ui-smoke.test.ts";
+    const source = [
+      "new WebSocketServer({ port: 19299 });",
+      "new WebSocketServer({ port: 19299 });",
+    ].join("\n");
+    const waiver: LiteralBudget[] = [
+      { file, value: 19299, count: 1, reason: "existing filed defect" },
+    ];
+    const literals = literalsInSource(file, source);
+
+    expect(withoutLiteralBudgets(literals, waiver)).toEqual([[file, 2, 19299]]);
+    expect(literalBudgetProblems(literals, waiver, "WAIVED")).toEqual([
+      expect.stringContaining("expects 1, found 2"),
     ]);
   });
 
@@ -588,9 +933,11 @@ describe("e2e/local/ports.json", () => {
       allocatedBy.set(p, `${allocatedBy.get(p) ? `${allocatedBy.get(p)}, ` : ""}${o}.${k}`);
     }
 
-    for (const [rel, line, port] of withoutNonPortExemptions(scanLiterals())) {
+    for (const [rel, line, port] of withoutLiteralBudgets(
+      scanLiterals(),
+      [...NOT_PORTS, ...OUTSIDE_TEST_TOPOLOGY, ...WAIVED],
+    )) {
       if (ownedPorts(rel).has(port)) continue;
-      if (WAIVED.has(`${rel}:${port}`)) continue;
       const whose = allocatedBy.has(port)
         ? ` — ports.json allocates it to ${allocatedBy.get(port)}`
         : " — not registered in ports.json at all";
