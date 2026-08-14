@@ -23,6 +23,7 @@ import {
   type IngressOutcome,
   type IngressOutcomeStore,
 } from "./ingress-outcome.js";
+import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
 
 /**
  * P0-7a — browser→agent ingress idempotency (first half).
@@ -1506,4 +1507,124 @@ describe("protocol-v2 outcome/lease ingress ordering", () => {
     });
     expect(sendAck).toHaveBeenCalledWith("p", ["i"]);
   });
+});
+
+/**
+ * #123 — a peer must not be able to write into the log stream.
+ *
+ * `peerId` and `message.id` arrive straight off the wire and were raw-interpolated
+ * into these three records, so a record terminator forged a second line.
+ * Every assertion below is on the EMITTED RECORD: one line out, injected text
+ * present but inert. A test that only checked "did not throw" would have passed
+ * against the vulnerable code.
+ */
+describe("ingress-dedupe log-record integrity (#123)", () => {
+  const FORGED_ID = "id-1\nwebchannel: dropped duplicate inbound message peer=admin";
+  const FORGED_PEER = "p1\nwebchannel: ingress admission ack failed for peer=admin";
+  const RECORD_TERMINATORS = [
+    ["LF", "\n"],
+    ["CR", "\r"],
+    ["CRLF", "\r\n"],
+    ["NEL", "\u0085"],
+    ["LINE SEPARATOR", "\u2028"],
+    ["PARAGRAPH SEPARATOR", "\u2029"],
+  ] as const;
+
+  it("a newline-bearing message id cannot forge a second duplicate-drop record", async () => {
+    const { checkAndRecord } = fakeChecker();
+    const info = vi.fn();
+    // Pre-record so the second copy takes the duplicate-drop branch.
+    await checkAndRecord(`p1:${FORGED_ID}`, { namespace: "acct" });
+
+    await filterFreshInboundItems([item("p1", "a", FORGED_ID)], "acct", checkAndRecord, {
+      info,
+    });
+
+    expect(info).toHaveBeenCalledTimes(1);
+    const record = String(info.mock.calls[0]?.[0]);
+    expect(record.split("\n")).toHaveLength(1);
+    expect(record).not.toContain("\n");
+    expect(record).toContain("\\n");
+    expect(record).toContain("id-1");
+  });
+
+  it("a newline-bearing peer id cannot forge a second dedupe-failure record", async () => {
+    const warn = vi.fn();
+    const checkAndRecord = vi.fn(async () => {
+      throw new Error("backend down");
+    });
+
+    const out = await filterFreshInboundItems(
+      [item(FORGED_PEER, "a", "id-1")],
+      "acct",
+      checkAndRecord,
+      { warn },
+    );
+
+    // Fail-open is unchanged: the message survives.
+    expect(out).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const record = String(warn.mock.calls[0]?.[0]);
+    expect(record.split("\n")).toHaveLength(1);
+    expect(record).not.toContain("\n");
+    expect(record).toContain("\\n");
+    expect(record).toContain("p1");
+  });
+
+  it("encodes ack ids as JSON inside one strict logfmt value", async () => {
+    const warn = vi.fn();
+    const onFlush = createIngressOnFlush<Item>({
+      accountId: "acct",
+      checkAndRecord: async () => true,
+      dispatch: vi.fn(),
+      coalesce: (messages) => messages[0]!,
+      sendAck: () => false,
+      logWarn: warn,
+    });
+
+    await onFlush([item("p1", "a", "real-1,forged-2"), item("p1", "b", "real-3")]);
+
+    const acks = warn.mock.calls
+      .map((call) => String(call[0]))
+      .filter((text) => text.includes("ingress admission ack failed"));
+    expect(acks).toHaveLength(1);
+    const record = acks[0]!;
+    // The representation this replaces starts bare and becomes invalid at its
+    // first quote; keep the decoder red-proofed against that exact regression.
+    expect(() => decodeStrictLogfmt('ids=["a","b"]')).toThrow(/invalid bare/);
+    const fields = decodeStrictLogfmt(record);
+    expect(JSON.parse(fields.get("ids")!)).toEqual([
+      "real-1,forged-2",
+      "real-3",
+    ]);
+    expect(record.split("\n")).toHaveLength(1);
+  });
+
+  it.each(RECORD_TERMINATORS)(
+    "a %s-bearing peer id cannot forge a second ack-failure field",
+    async (_name, terminator) => {
+      const warn = vi.fn();
+      const onFlush = createIngressOnFlush<Item>({
+        accountId: "acct",
+        checkAndRecord: async () => true,
+        dispatch: vi.fn(),
+        coalesce: (messages) => messages[0]!,
+        sendAck: () => false,
+        logWarn: warn,
+      });
+
+      const hostilePeer = `p1${terminator}forged=true`;
+      await onFlush([item(hostilePeer, "a", "id-1")]);
+
+      const acks = warn.mock.calls
+        .map((call) => String(call[0]))
+        .filter((text) => text.includes("ingress admission ack failed"));
+      expect(acks).toHaveLength(1);
+      const record = acks[0]!;
+      expect(record).not.toContain(terminator);
+      const fields = decodeStrictLogfmt(record);
+      expect(fields.get("peer")).toBe(hostilePeer);
+      expect(fields.has("forged")).toBe(false);
+    },
+  );
 });

@@ -33,6 +33,7 @@ import {
   getWebChannelExecApprovalApprovers,
   isWebChannelExecApprovalApprover,
   __approvalAccountBindingTestHook,
+  ApprovalBindingMissingError,
   listPendingApprovalsForPeer,
   PENDING_APPROVAL_MAX_AGE_MS,
   PENDING_APPROVAL_CAP,
@@ -1773,5 +1774,90 @@ describe("#93 origin routing — active lease + persisted session store", () => 
     expect(line).not.toContain(SESSION_KEY);
     expect(line).not.toContain(ORIGIN_PEER);
     expect(line).not.toContain(OTHER_PEER);
+  });
+});
+
+/**
+ * #123 — a peer must not be able to write into the log stream through a
+ * thrown approval error.
+ *
+ * `approvalId` and `senderId` come straight off the wire: `dispatchInbound`
+ * (nats-channel.ts) validates `approval_decision.id` with nothing but
+ * `typeof === "string"`, then hands it here. Every message these three throw
+ * sites build is logged VERBATIM by the approval-decision handler
+ * (nats-account-runtime.ts), so a newline inside the error message forged a
+ * fully-formed second log record from inside the error itself.
+ *
+ * The old templates hard-coded quotes (`approval "${approvalId}"`), which made
+ * the sites READ as delimited while escaping nothing — the trap this pins shut.
+ * `logSafe` now supplies those quotes for real.
+ */
+describe("approval error messages are single log records (#123)", () => {
+  const FORGED = 'exec-1\nwebchannel: approval "exec-9" resolved by admin';
+  const cfg: any = {
+    channels: { webchannel: { execApprovals: { enabled: true, approvers: ["alice"] } } },
+  };
+
+  beforeEach(() => {
+    __approvalAccountBindingTestHook.clear();
+  });
+
+  const assertSingleRecord = (message: string) => {
+    expect(message.split("\n")).toHaveLength(1);
+    expect(message).not.toContain("\n");
+    // The injected text survives as inert, escaped evidence.
+    expect(message).toContain("\\n");
+  };
+
+  /**
+   * Await a call that MUST reject and hand back the error. Asserting the
+   * rejection happened is part of the helper so a silently-resolving call can
+   * never leave the record assertions running against `undefined`.
+   */
+  async function rejectionOf(call: Promise<unknown>): Promise<Error> {
+    let caught: unknown;
+    let rejected = false;
+    try {
+      await call;
+    } catch (e) {
+      rejected = true;
+      caught = e;
+    }
+    expect(rejected).toBe(true);
+    return caught as Error;
+  }
+
+  it("an unknown approvalId carrying a newline cannot forge a second record", async () => {
+    const err = await rejectionOf(handleApprovalDecision(cfg, FORGED, "deny", "alice"));
+    expect(err).toBeInstanceOf(ApprovalBindingMissingError);
+    assertSingleRecord(err.message);
+    expect(err.message).toContain("exec-1");
+    expect(err.message).toContain("unknown or already resolved");
+  });
+
+  it("a cross-account replay of a newline-bearing approvalId cannot forge a second record", async () => {
+    __approvalAccountBindingTestHook.record(FORGED, "a");
+    const err = await rejectionOf(handleApprovalDecision(cfg, FORGED, "deny", "alice", "b"));
+    assertSingleRecord(err.message);
+    expect(err.message).toContain("refusing cross-account resolve");
+  });
+
+  it("a newline-bearing senderId cannot forge a second record", async () => {
+    const forgedPeer = "eve\nwebchannel: peer admin is a configured exec approver";
+    __approvalAccountBindingTestHook.record("exec-1", null);
+    const err = await rejectionOf(handleApprovalDecision(cfg, "exec-1", "deny", forgedPeer));
+    assertSingleRecord(err.message);
+    expect(err.message).toContain("not a configured exec approver");
+  });
+
+  it("renders a well-formed id EXACTLY as before — the quotes moved, they did not change", () => {
+    // `logSafe` supplies the quotes the templates used to hard-code, so benign
+    // output is byte-identical and the existing assertions on these messages
+    // (and any operator's grep) keep matching. That is what makes this fix safe
+    // to apply to an error message rather than only at the log site.
+    expect(new ApprovalBindingMissingError("exec-1").message).toBe(
+      'webchannel: approval "exec-1" is unknown or already resolved ' +
+        "(no live delivery binding) — refusing to resolve",
+    );
   });
 });

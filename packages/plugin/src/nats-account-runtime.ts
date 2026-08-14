@@ -32,6 +32,9 @@ import {
   normalizeInboundUserMessage,
 } from "./inbound-queue.js";
 import type { CoalescedMemberIds, SerializedInboundDispatcher } from "./inbound-queue.js";
+// #123: the control-lane ack warning interpolates a peer-supplied peer id and
+// message id.
+import { logSafe } from "./log-safe.js";
 import {
   estimateRetainedMessageBytes,
   InboundRetentionBudget,
@@ -415,12 +418,12 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           })
           .catch((err) => {
             api.logger.error?.(
-              `webchannel: history snapshot failed for ${peerId}: ${String(err)}`,
+              `webchannel: history snapshot failed for ${logSafe(peerId)}: ${logSafe(err)}`,
             );
           });
       } catch (err) {
         api.logger.error?.(
-          `webchannel: history snapshot resolution failed for ${peerId}: ${String(err)}`,
+          `webchannel: history snapshot resolution failed for ${logSafe(peerId)}: ${logSafe(err)}`,
         );
       }
     };
@@ -1025,7 +1028,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             () => entries.every((entry) => !entry.isRetired()),
           ).catch((err) => {
             api.logger?.warn?.(
-              `webchannel: cancelled-inbound handling failed: ${String(err)}`,
+              `webchannel: cancelled-inbound handling failed: ${logSafe(err)}`,
             );
           });
         },
@@ -1135,7 +1138,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // harmless no-op abort (accepted).
           if (message.id && !channel.sendAck(peerId, [message.id])) {
             api.logger?.warn?.(
-              `webchannel: control-lane ack failed for peer=${peerId} id=${message.id}`,
+              `webchannel: control-lane ack failed for peer=${logSafe(peerId)} id=${logSafe(message.id)}`,
             );
           }
           void handleInboundMessage(
@@ -1148,7 +1151,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             { controlLane: true },
           ).catch((err) =>
             api.logger?.error?.(
-              `webchannel: control-lane dispatch failed: ${String(err)}`,
+              `webchannel: control-lane dispatch failed: ${logSafe(err)}`,
             ),
           );
           // Feedback-only hedge for the stamp-ignored trap. Core's
@@ -1183,7 +1186,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           .enqueue({ peerId, message })
           .catch((err) =>
             api.logger?.error?.(
-              `webchannel: inbound enqueue failed: ${String(err)}`,
+              `webchannel: inbound enqueue failed: ${logSafe(err)}`,
             ),
           );
       });
@@ -1199,9 +1202,9 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           // clicking) — log it at warn, not error. Genuine authz rejections
           // (non-approver, cross-account) stay at error.
           if (err instanceof ApprovalBindingMissingError) {
-            api.logger.warn?.(`webchannel: approval resolve ignored (${id}): ${err.message}`);
+            api.logger.warn?.(`webchannel: approval resolve ignored (${logSafe(id)}): ${logSafe(err.message)}`);
           } else {
-            api.logger.error?.(`webchannel: approval resolve failed (${id}): ${String(err)}`);
+            api.logger.error?.(`webchannel: approval resolve failed (${logSafe(id)}): ${logSafe(err)}`);
           }
         });
       });
@@ -1227,10 +1230,10 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               channel.sendHistory(peerId, messages);
             })
             .catch((err) => {
-              api.logger.error?.(`webchannel: history page failed for ${peerId}: ${String(err)}`);
+              api.logger.error?.(`webchannel: history page failed for ${logSafe(peerId)}: ${logSafe(err)}`);
             });
         } catch (err) {
-          api.logger.error?.(`webchannel: history resolution failed for ${peerId}: ${String(err)}`);
+          api.logger.error?.(`webchannel: history resolution failed for ${logSafe(peerId)}: ${logSafe(err)}`);
         }
       });
 
@@ -1260,7 +1263,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
           channel.sendCommands(peerId, catalogProvider());
         } catch (err) {
           api.logger.error?.(
-            `webchannel: command catalog failed for ${peerId}: ${String(err)}`,
+            `webchannel: command catalog failed for ${logSafe(peerId)}: ${logSafe(err)}`,
           );
         }
       });
@@ -1334,7 +1337,7 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
             logger: api.logger,
           }).catch((err) => {
             api.logger?.error?.(
-              `webchannel: register handler rejected for subject peerId "${subjectPeerId}": ${String(err)}`,
+              `webchannel: register handler rejected for subject peerId ${logSafe(subjectPeerId)}: ${logSafe(err)}`,
             );
           });
         });

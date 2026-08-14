@@ -94,6 +94,9 @@ import {
 } from "./account-config.js";
 import { getApprovalOriginRegistry } from "./approval-origin.js";
 import type { ApprovalOriginLeaseResolution } from "./approval-origin.js";
+// #123: these error messages are logged verbatim by the approval-decision
+// handler, and `approvalId`/`senderId` are peer-supplied.
+import { logSafe } from "./log-safe.js";
 
 /**
  * Resolve the transport a given account's approval frames should ride. `null`/
@@ -1283,7 +1286,13 @@ function waitForAbort(signal: AbortSignal): Promise<void> {
 export class ApprovalBindingMissingError extends Error {
   constructor(approvalId: string) {
     super(
-      `webchannel: approval "${approvalId}" is unknown or already resolved ` +
+      // #123: `logSafe` supplies the quotes that used to be hard-coded here.
+      // For a well-formed id the rendered text is byte-identical; for a hostile
+      // one the quotes now actually delimit. The old literal quotes made this
+      // site READ as escaped while providing none — this message is logged
+      // verbatim by the approval-decision handler, so a newline in `approvalId`
+      // forged a log record from inside the error itself.
+      `webchannel: approval ${logSafe(approvalId)} is unknown or already resolved ` +
         `(no live delivery binding) — refusing to resolve`,
     );
     this.name = "ApprovalBindingMissingError";
@@ -1313,8 +1322,8 @@ export async function handleApprovalDecision(
   }
   if (boundAccount !== bindingAccountKey(accountId)) {
     throw new Error(
-      `webchannel: approval "${approvalId}" was delivered on account ` +
-        `"${boundAccount}", not "${bindingAccountKey(accountId)}" — refusing cross-account resolve`,
+      `webchannel: approval ${logSafe(approvalId)} was delivered on account ` +
+        `${logSafe(boundAccount)}, not ${logSafe(bindingAccountKey(accountId))} — refusing cross-account resolve`,
     );
   }
 
@@ -1326,8 +1335,8 @@ export async function handleApprovalDecision(
   // channel. Legacy callers omit accountId and keep the default-account read.
   if (!isWebChannelExecApprovalApprover({ cfg, senderId, accountId })) {
     throw new Error(
-      `webchannel: peer "${senderId}" is not a configured exec approver` +
-        (accountId ? ` for account "${accountId}"` : ""),
+      `webchannel: peer ${logSafe(senderId)} is not a configured exec approver` +
+        (accountId ? ` for account ${logSafe(accountId)}` : ""),
     );
   }
   await resolveApprovalOverGateway({

@@ -180,8 +180,8 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
     } catch (err) {
       if (!isActive()) return [];
       sinks?.warn?.(
-        `webchannel: ingress dedupe check failed for peer=${item.peerId} id=${id} — ` +
-          `keeping message (fail-open): ${String(err)}`,
+        `webchannel: ingress dedupe check failed for peer=${logSafe(item.peerId)} id=${logSafe(id)} — ` +
+          `keeping message (fail-open): ${logSafe(err)}`,
       );
       survivors.push(item);
       continue;
@@ -190,7 +190,7 @@ export async function filterFreshInboundItems<T extends IngressDedupeItem>(
       survivors.push(item);
     } else {
       sinks?.info?.(
-        `webchannel: dropped duplicate inbound message peer=${item.peerId} id=${id}`,
+        `webchannel: dropped duplicate inbound message peer=${logSafe(item.peerId)} id=${logSafe(id)}`,
       );
     }
   }
@@ -570,7 +570,15 @@ export function createIngressOnFlush<T extends IngressDedupeItem>(
         ),
       ];
       if (ackIds.length > 0 && !sendAck(anchor.peerId, ackIds)) {
-        logWarn?.(`webchannel: ingress admission ack failed for peer=${anchor.peerId} ids=${ackIds.join(",")}`);
+        // #123: serialize the whole array as JSON, then pass that JSON text to
+        // logSafe so logfmt sees one outer quoted value. A bare `["a","b"]`
+        // starts as an unquoted logfmt value and the first `"` makes the record
+        // invalid; `logSafe` preserves the JSON boundaries behind that outer
+        // logfmt delimiter.
+        logWarn?.(
+          `webchannel: ingress admission ack failed for peer=${logSafe(anchor.peerId)} ` +
+            `ids=${logSafe(JSON.stringify(ackIds))}`,
+        );
       }
     }
     const fresh = await filterFreshInboundItems(
@@ -669,3 +677,5 @@ import type {
 import { createRateLimitedOutcomeFailureWarning } from "./ingress-outcome.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
 import type { IngressResultFrame } from "./ingress-result-chunks.js";
+// #123: peer ids and message ids reach these log lines straight off the wire.
+import { logSafe } from "./log-safe.js";

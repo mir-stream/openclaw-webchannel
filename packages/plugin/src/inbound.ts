@@ -25,6 +25,10 @@ import {
 } from "./approval-origin.js";
 
 import { readCoalescedMemberIds, type CoalescedMemberIds } from "./inbound-queue.js";
+// #123: every peer-controlled value in a log line goes through this. `turnId`
+// is the browser's own `message.id`, so raw interpolation let a peer end the
+// record and forge the next one.
+import { logSafe } from "./log-safe.js";
 
 /**
  * The inbound path only handles user messages; approvals route separately.
@@ -460,7 +464,7 @@ export async function handleInboundMessage(
   if (!admission.allowed) {
     settlementEligible = false;
     api.logger?.info?.(
-      `webchannel: inbound denied for peer ${wsKey} (${admission.reason}); turn not dispatched`,
+      `webchannel: inbound denied for peer ${logSafe(wsKey)} (${admission.reason}); turn not dispatched`,
     );
     return;
   }
@@ -980,7 +984,7 @@ export async function handleInboundMessage(
     await draft?.drain();
   } catch (err) {
     turnOutcome = "error";
-    api.logger.error?.(`webchannel: inbound dispatch failed: ${String(err)}`);
+    api.logger.error?.(`webchannel: inbound dispatch failed: ${logSafe(err)}`);
     // Surface a thrown turn independently before terminal cleanup. That gives
     // the apology the first claim attempt on an ownerless tool preview without
     // replacing any assistant lane that already streamed real text. A turn
@@ -996,7 +1000,7 @@ export async function handleInboundMessage(
         await draft.drain();
       } catch (drainErr) {
         api.logger.error?.(
-          `webchannel: draft error-drain failed: ${String(drainErr)}`,
+          `webchannel: draft error-drain failed: ${logSafe(drainErr)}`,
         );
       }
     } else if (!controlLane && !finalReplyDelivered) {
@@ -1008,7 +1012,7 @@ export async function handleInboundMessage(
       );
       if (!sent) {
         api.logger?.warn?.(
-          `webchannel: error fallback reply was not delivered for peer=${wsKey} turn=${turnId}`,
+          `webchannel: error fallback reply was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(turnId)}`,
         );
       }
     }
@@ -1136,8 +1140,8 @@ export async function handleInboundMessage(
       }
       reasoningEmptyLaneWarned.add(accountId);
       api.logger?.warn?.(
-        `webchannel: reasoning lane received no frames for account=${JSON.stringify(accountId)} ` +
-          `peer=${JSON.stringify(wsKey)} turn=${JSON.stringify(turnId)} — ` +
+        `webchannel: reasoning lane received no frames for account=${logSafe(accountId)} ` +
+          `peer=${logSafe(wsKey)} turn=${logSafe(turnId)} — ` +
           `channels.webchannel.capabilities.reasoning is on, but core delivered no reasoning ` +
           `for this turn. The most likely cause is an agent ` +
           `thinking level of "off" (a model-side precondition this channel cannot override); ` +
@@ -1195,7 +1199,7 @@ export async function handleInboundMessage(
         }
         if (!delivered) {
           api.logger?.warn?.(
-            `webchannel: turn_settled was not delivered for peer=${wsKey} turn=${settleId} outcome=${turnOutcome}`,
+            `webchannel: turn_settled was not delivered for peer=${logSafe(wsKey)} turn=${logSafe(settleId)} outcome=${turnOutcome}`,
           );
         }
       }

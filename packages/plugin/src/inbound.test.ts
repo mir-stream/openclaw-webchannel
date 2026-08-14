@@ -844,7 +844,9 @@ describe("handleInboundMessage — #99 coalesced-group settlement", () => {
     // Treated exactly like a `false` return: same warn shape, then keep going.
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0]?.[0]).toContain("turn_settled was not delivered");
-    expect(warn.mock.calls[0]?.[0]).toContain("turn=id-1");
+    // #123: peer-controlled ids are quoted in log records. The id is still
+    // verbatim inside the quotes, so scraping for it keeps working.
+    expect(warn.mock.calls[0]?.[0]).toContain('turn="id-1"');
   });
 
   it("warns per undelivered member and still settles the rest", async () => {
@@ -861,7 +863,66 @@ describe("handleInboundMessage — #99 coalesced-group settlement", () => {
     expect(settleFrames.map((f) => f.turnId)).toEqual(["id-1", "id-2", "id-3"]);
     expect(warn).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls[0]?.[0]).toContain("turn_settled was not delivered");
-    expect(warn.mock.calls[0]?.[0]).toContain("turn=id-2");
+    expect(warn.mock.calls[0]?.[0]).toContain('turn="id-2"');
+  });
+
+  /**
+   * #123 — a peer must not be able to write into the log stream.
+   *
+   * `turnId` is just the browser's `message.id` and `wsKey` is the peer key, so
+   * before this both were raw-interpolated into warn records and a newline
+   * forged a second, fully-formed line. These assert on the EMITTED RECORD:
+   * one line out, with the injected text visibly escaped inside it. A test that
+   * only checked "did not throw" would have passed on the vulnerable code.
+   */
+  it("a newline-bearing turn id cannot forge a second log record", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const forgedId = 'evil-1\nwebchannel: turn_settled was not delivered for peer="admin" turn="x"';
+    const { transport } = makeFakeTransport({ failSettleFor: [forgedId] });
+    const warn = vi.fn();
+    (api as unknown as { logger: { warn: (m: string) => void } }).logger.warn = warn;
+
+    await handleInboundMessage(api, transport, "peer-1", {
+      type: "user_message",
+      text: "hi",
+      id: forgedId,
+    });
+
+    const settleWarnings = warn.mock.calls
+      .map((call) => String(call[0]))
+      .filter((text) => text.includes("turn_settled was not delivered"));
+    expect(settleWarnings).toHaveLength(1);
+    const record = settleWarnings[0]!;
+    // ONE record. This is the whole property.
+    expect(record.split("\n")).toHaveLength(1);
+    expect(record).not.toContain("\n");
+    // The injected payload survives as inert, escaped evidence — not as syntax.
+    expect(record).toContain("\\n");
+    expect(record).toContain("evil-1");
+  });
+
+  it("a newline-bearing peer key cannot forge a second log record", async () => {
+    const { api } = makeFakeApi({ streamingMode: "off", runImpl: async () => {} });
+    const { transport } = makeFakeTransport({ failSettleFor: ["id-1"] });
+    const warn = vi.fn();
+    (api as unknown as { logger: { warn: (m: string) => void } }).logger.warn = warn;
+    const forgedPeer = "peer-1\nwebchannel: inbound denied for peer admin";
+
+    await handleInboundMessage(api, transport, forgedPeer, {
+      type: "user_message",
+      text: "hi",
+      id: "id-1",
+    });
+
+    const settleWarnings = warn.mock.calls
+      .map((call) => String(call[0]))
+      .filter((text) => text.includes("turn_settled was not delivered"));
+    expect(settleWarnings).toHaveLength(1);
+    const record = settleWarnings[0]!;
+    expect(record.split("\n")).toHaveLength(1);
+    expect(record).not.toContain("\n");
+    expect(record).toContain("\\n");
+    expect(record).toContain("peer-1");
   });
 });
 
@@ -1723,5 +1784,52 @@ describe("handleInboundMessage — approval-origin lease", () => {
     // … and its own `finally` released its own claim.
     nowMs = 1_080;
     expect(resolveOrigin(made.api, 1_070)).toEqual({ kind: "no_match" });
+  });
+});
+
+/**
+ * #123 — `logSafe` must be handed the RAW value, never `logSafe(String(err))`.
+ *
+ * Coercing outside the helper defeats its no-throw guarantee, and that
+ * guarantee is load-bearing here: this warn site sits in the dispatch `catch`,
+ * one statement above the error-fallback reply. `String(Object.create(null))`
+ * throws `TypeError: Cannot convert object to primitive value`, so the old
+ * form turned "a turn threw" into "a turn threw AND the user got no apology
+ * and the turn never settled".
+ */
+describe("dispatch-failure logging cannot itself throw (#123)", () => {
+  it("still delivers the error-fallback reply when String(err) would throw", async () => {
+    const { api } = makeFakeApi({
+      streamingMode: "off",
+      runImpl: async () => {
+        // A null-prototype object has no `toString`/`valueOf`, so ANY coercion
+        // of it throws. Nothing stops a dependency throwing one.
+        throw Object.create(null);
+      },
+    });
+    const { transport, settleFrames } = makeFakeTransport();
+    const sendText = vi.spyOn(transport, "sendText");
+    const error = vi.fn();
+    (api as unknown as { logger: { error: (m: string) => void } }).logger.error = error;
+
+    await expect(
+      handleInboundMessage(api, transport, "peer-1", {
+        type: "user_message",
+        text: "hi",
+        id: "id-1",
+      }),
+    ).resolves.toBeUndefined();
+
+    // The apology still ships — the logging statement did not eat the turn.
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(sendText.mock.calls[0]?.[1]).toContain("something went wrong");
+    // And the turn still settles, as `error`.
+    expect(settleFrames).toEqual([{ turnId: "id-1", outcome: "error" }]);
+    // The record is still emitted, and is still one line.
+    const records = error.mock.calls
+      .map((call) => String(call[0]))
+      .filter((text) => text.includes("inbound dispatch failed"));
+    expect(records).toHaveLength(1);
+    expect(records[0]!.split("\n")).toHaveLength(1);
   });
 });
