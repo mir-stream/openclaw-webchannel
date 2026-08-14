@@ -22,6 +22,7 @@
 
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  DEFAULT_WEBCHANNEL_TENANT,
   hasWebchannelConfig,
   resolveAcquisitionIdentity,
   type WebchannelAcquisitionIdentity,
@@ -45,6 +46,28 @@ let deprecationWarned = false;
 /** @internal Test-only: reset the one-time warning guard. */
 export function _resetAcquisitionEnvWarning(): void {
   deprecationWarned = false;
+}
+
+/**
+ * Resolve the tenant while building the immutable account serving plan.
+ *
+ * In the config-less compatibility path this samples `WEBCHANNEL_TENANT` once.
+ * The resulting `identity.tenant` is then carried by the serving runtime; turn
+ * dispatch and history reads must never consult the ambient environment again.
+ * OpenClaw can temporarily override process env while running a skill, so a
+ * later read could otherwise route a session under a tenant different from the
+ * NATS channel and register-admission tenant captured at startup.
+ */
+function resolveAccountTenant(
+  cfg: unknown,
+  accountId: string = DEFAULT_WEBCHANNEL_ACCOUNT_ID,
+  env: Record<string, string | undefined> = process.env,
+): string {
+  if (hasWebchannelConfig(cfg)) return resolveAcquisitionIdentity(cfg, accountId).tenant;
+  // No webchannel config at all: the legacy synthesized-default account, whose
+  // tenant comes from the environment snapshot supplied to startup planning
+  // (see the module docstring's precedence rule).
+  return env["WEBCHANNEL_TENANT"] ?? DEFAULT_WEBCHANNEL_TENANT;
 }
 
 export type AcquisitionEnvResult = {
@@ -105,7 +128,7 @@ export function resolveAcquisitionEnvPrecedence(
   // No config: synthesize the legacy "default" account identity from env.
   const identity: WebchannelAcquisitionIdentity = {
     accountId,
-    tenant: env["WEBCHANNEL_TENANT"] ?? "default-tenant",
+    tenant: resolveAccountTenant(cfg, accountId, env),
     ...(env["WEBCHANNEL_SAAS_BASE_URL"] !== undefined
       ? { saasBaseUrl: env["WEBCHANNEL_SAAS_BASE_URL"] }
       : {}),

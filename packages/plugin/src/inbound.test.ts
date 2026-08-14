@@ -14,7 +14,7 @@ import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 import {
   deliverDraftFinalPayload,
-  handleInboundMessage,
+  handleInboundMessage as handleInboundMessageForServingTenant,
   startAgentLifecycleSubscription,
   stopAgentLifecycleSubscription,
   type FinalReconciliationState,
@@ -31,6 +31,28 @@ import {
   normalizeInboundUserMessage,
 } from "./inbound-queue.js";
 import { DEFAULT_BUSY_TURN_LIMITS } from "./inbound-retention.js";
+
+const TEST_SERVING_TENANT = "fixture-tenant";
+
+/** Bind direct inbound unit tests to the same kind of startup-frozen tenant. */
+function handleInboundMessage(
+  api: Parameters<typeof handleInboundMessageForServingTenant>[0],
+  transport: Parameters<typeof handleInboundMessageForServingTenant>[1],
+  peerId: string,
+  message: Parameters<typeof handleInboundMessageForServingTenant>[3],
+  accountId = "default",
+  options?: Parameters<typeof handleInboundMessageForServingTenant>[6],
+) {
+  return handleInboundMessageForServingTenant(
+    api,
+    transport,
+    peerId,
+    message,
+    accountId,
+    TEST_SERVING_TENANT,
+    options,
+  );
+}
 
 /**
  * P1-8a — `handleInboundMessage` control-lane behaviour.
@@ -1317,7 +1339,12 @@ describe("handleInboundMessage — approval-origin lease", () => {
   ): ReturnType<ApprovalOriginLeaseRegistry["resolve"]> {
     return registry.resolve({
       rawAccountId: accountId,
-      sessionKey: resolveWebchannelSessionRoute(api, accountId, peerId).sessionKey,
+      sessionKey: resolveWebchannelSessionRoute(
+        api,
+        accountId,
+        peerId,
+        TEST_SERVING_TENANT,
+      ).sessionKey,
       requestCreatedAtMs,
     });
   }
@@ -1526,10 +1553,19 @@ describe("handleInboundMessage — approval-origin lease", () => {
     await started.promise;
 
     // Both peers now share one session key, so this is the same canonical tuple.
-    const linkedKey = resolveWebchannelSessionRoute(ordinaryRun.api, "default", "peer-2")
-      .sessionKey;
+    const linkedKey = resolveWebchannelSessionRoute(
+      ordinaryRun.api,
+      "default",
+      "peer-2",
+      TEST_SERVING_TENANT,
+    ).sessionKey;
     expect(
-      resolveWebchannelSessionRoute(ordinaryRun.api, "default", "peer-1").sessionKey,
+      resolveWebchannelSessionRoute(
+        ordinaryRun.api,
+        "default",
+        "peer-1",
+        TEST_SERVING_TENANT,
+      ).sessionKey,
     ).toBe(linkedKey);
 
     let duringControlRun: unknown;
