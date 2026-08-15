@@ -6,9 +6,11 @@
  * Problem
  * ───────
  * A device that joins an existing conversation after some messages have already
- * been exchanged has missed live broadcasts.  The agent — the single authority
- * store — holds those messages as at-rest ciphertext envelopes.  To replay them,
- * the agent paginates the stored envelopes out over NATS (history subject).
+ * been exchanged has missed live broadcasts.  The agent is the single history
+ * authority, but it keeps no ciphertext store of its own: it reads the past
+ * messages from OpenClaw core's session transcript (plaintext, core-owned) and
+ * encrypts them with the current K as it paginates them out over NATS (history
+ * subject).  See `history.ts` and `docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4.
  *
  * But ciphertext alone is not enough: the device also needs the conversation key
  * used to encrypt those envelopes.  That key is delivered out-of-band, wrapped

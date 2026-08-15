@@ -14,10 +14,19 @@
  * `~/.openclaw-webchannel-v2/<tuple-namespace>/conversation-keys.json` — the
  * same exact `(tenant, accountId)` secret directory (and the same plaintext-JSON + owner-only-perms
  * posture) as `credentials.json`, which already holds the strictly more
- * powerful NATS user seed. K must survive a gateway restart: history at rest
- * is sealed with it, and live devices hold an unwrapped copy that must stay
- * valid across agent restarts. K-at-rest encryption is deferred (a co-located
- * master key adds no real protection).
+ * powerful NATS user seed. K must survive a gateway restart because live
+ * devices hold an unwrapped copy that must stay valid across agent restarts.
+ * K-at-rest encryption is deferred (a co-located master key adds no real
+ * protection).
+ *
+ * K seals NO history at rest. The production history authority is OpenClaw
+ * core's session transcript — plaintext JSONL at owner-only perms, written by
+ * core, never by this plugin. `history.ts` reads it through
+ * `getSessionMessages` and seals it with the CURRENT K at read time, so
+ * replacing K costs no re-encryption: the next read reseals
+ * (`docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4, RETAIN + RESEAL). The agent-side
+ * ciphertext store an earlier revision of this comment described is
+ * `history-store.ts`, which has no production caller.
  *
  * File shape: `{ "version": 2, "storageIdentity": { ... }, "keys": { ... } }`.
  * Writes are atomic (tmp + rename), file mode 0600, directory mode 0700.

@@ -5,6 +5,15 @@
  * on the NATS-WebSocket transport that are explicitly excluded from message
  * persistence and replay.
  *
+ * NOT WIRED IN PRODUCTION. All four exports here — `TYPING_ENVELOPE_TYPE`,
+ * `isEphemeralEnvelope`, `sendTypingSignal`, `persistIfNotEphemeral` — have
+ * zero references outside this file and its test. The typing frame that
+ * actually ships is `NatsChannel.sendTyping` / `setTypingEnabled` in
+ * `nats-channel.ts`, which does not go through this module. Everything below
+ * describes the Phase 6 Sub-AC 2 design paired with `history-store.ts`; that
+ * pairing was never connected, so read it as a design record, not as the
+ * behaviour of the running channel.
+ *
  * Design
  * ──────
  * Typing signals use the existing `MessageEnvelope` wire format with
@@ -119,10 +128,13 @@ export function sendTypingSignal(
 /**
  * Append an envelope to the `HistoryStore` ONLY if it is not ephemeral.
  *
- * This is the recommended integration point for all inbound message handlers
- * on the agent side.  Wire it into the `'message'` event callback so that
- * ephemeral envelopes (typing signals, future presence pings) are silently
- * excluded from storage without requiring caller-side type checks.
+ * This was the intended integration point for inbound message handlers on the
+ * agent side: wire it into the `'message'` event callback so that ephemeral
+ * envelopes (typing signals, future presence pings) are silently excluded from
+ * storage without requiring caller-side type checks. **No caller ever wired
+ * it**, and the store it appends to (`HistoryStore`) is in-memory and equally
+ * unwired — so the invariant below is proven by the test suite, not by the
+ * running agent.
  *
  * Example wiring:
  *
@@ -136,7 +148,7 @@ export function sendTypingSignal(
  * Invariant: after any sequence of calls, `store` will contain ZERO envelopes
  * whose `envelopeType === "typing"`.
  *
- * @param store    - The authority `HistoryStore` instance.
+ * @param store    - An in-memory `HistoryStore` instance (tests only today).
  * @param conv     - Conversation identifier (accountId + tenant + sub).
  * @param envelope - The raw `MessageEnvelope` (always ciphertext; never plaintext).
  */
