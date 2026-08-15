@@ -1,5 +1,5 @@
 /**
- * Static boundary test (plain node, no framework).
+ * Static boundary test (node:test).
  *
  * Asserts the app's OWN source (server/** + web/**) never reaches into package
  * internals — every library import must be the bare published package name
@@ -20,7 +20,9 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import assert from "node:assert/strict";
+import { exampleAssert as assert, exampleTest } from "../../../scripts/example-test-guard.mjs";
+
+exampleTest("I132-E3: webchannel app source imports only public package entries", () => {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = join(__dirname, "..");
@@ -79,8 +81,7 @@ for (const file of files) {
   }
 }
 
-if (failed > 0) {
-  console.error(`\n${failed} boundary violation(s)`);
-  process.exit(1);
-}
+if (failed > 0) console.error(`\n${failed} boundary violation(s)`);
+assert.equal(failed, 0, `${failed} source-boundary assertion(s) failed`);
 console.log("\nall no-internal-imports assertions passed");
+});

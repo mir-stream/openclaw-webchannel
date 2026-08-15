@@ -15,7 +15,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,9 +24,18 @@ import { setTimeout as sleep } from "node:timers/promises";
 const HERE = dirname(fileURLToPath(import.meta.url)); // packages/saas/src
 const REPO_ROOT = join(HERE, "..", "..", "..");
 const SERVER_PATH = join(REPO_ROOT, "demo", "saas-server.ts");
+const PORTS = JSON.parse(
+  readFileSync(join(REPO_ROOT, "e2e", "local", "ports.json"), "utf8"),
+) as {
+  harnesses: Record<string, Record<string, number>>;
+  vitest: Record<string, Record<string, number>>;
+};
+const SUITE_PORTS = PORTS.vitest["packages/saas/src/demo-server-role.test.ts"];
+const TWO_ACCOUNT_PORTS = PORTS.harnesses["run-two-account-isolation"];
 
 // Unique port (avoid the reference-server smoke on 3468 + the saas HTTP tests).
-const PORT = 3471;
+const PORT = SUITE_PORTS.PORT;
+const NATS_WS = TWO_ACCOUNT_PORTS.NATS_WS;
 const BASE = `http://127.0.0.1:${PORT}`;
 
 const TENANT = "smoke-demo-tenant";
@@ -99,7 +108,7 @@ describe("demo SaaS /nats-user role-escalation guard (F6)", () => {
         SAAS_BASE_URL: BASE,
         DEMO_TENANT: TENANT,
         DEMO_LLM_MODE: "echo",
-        NATS_URL: "ws://127.0.0.1:18722",
+        NATS_URL: `ws://127.0.0.1:${NATS_WS}`,
         // The demo server persists its trust chain here (run.sh always sets this);
         // a per-run temp file keeps the smoke hermetic.
         TRUST_CHAIN_PATH: join(tmpdir(), `demo-role-smoke-${process.pid}-${Date.now()}.json`),

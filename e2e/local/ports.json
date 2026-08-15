@@ -96,17 +96,12 @@
     ],
     "packages/saas/src/ac6-device-flow-e2e.test.ts": {
       "$note": [
-        "Also a root-sweep suite that binds real sockets, so it belongs under the",
-        "same authority. It spawns `nats-server -p 4222 -js` (binding 0.0.0.0:4222,",
-        "not loopback) plus two HTTP servers. 4222 was previously listed under",
-        "`reserved` as merely 'a dev server may hold it' — that was wrong: this",
-        "repo claims it on every `npm test`.",
+        "This root-sweep suite binds two HTTP servers. NATS_CLIENT_PORT is only the",
+        "relay coordinate advertised in enrollment responses; the suite neither",
+        "starts nats-server nor connects a client to it.",
         "",
-        "The ports are declared here so ports.test.ts enforces them like any other",
-        "allocation. The suite still hard-codes its own literals; wiring it to read",
-        "this file is deliberately NOT done here, because that suite has separate",
-        "defects under review (its skip guard does not fire on a dead child, and",
-        "Test 10 never connects to NATS at all)."
+        "The advertised coordinate remains here with the HTTP listeners so every",
+        "smoke that reuses it follows authority changes instead of drifting."
       ],
       "NATS_CLIENT_PORT": 4222,
       "ENROLLMENT_SERVER_PORT": 3456,

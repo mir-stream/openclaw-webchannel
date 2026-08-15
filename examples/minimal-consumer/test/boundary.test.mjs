@@ -1,5 +1,5 @@
 /**
- * Encapsulation boundary test (plain node, no framework).
+ * Encapsulation boundary test (node:test).
  *
  * Asserts BOTH directions of the package boundary:
  *   1. PUBLIC works  — the barrel exports the expected operator/widget symbols.
@@ -10,7 +10,9 @@
  * Exits non-zero on the first failed assertion.
  */
 
-import assert from "node:assert/strict";
+import { exampleAssert as assert, exampleTest } from "../../../scripts/example-test-guard.mjs";
+
+exampleTest("I132-E1: minimal consumer enforces the public package boundary", async () => {
 
 let failed = 0;
 function ok(name, fn) {
@@ -85,8 +87,7 @@ await ok("client internal nats-client is not exported", () =>
   assertNotExported("@mir-stream/webchannel-client/nats-client"),
 );
 
-if (failed > 0) {
-  console.error(`\n${failed} assertion(s) failed`);
-  process.exit(1);
-}
+if (failed > 0) console.error(`\n${failed} assertion(s) failed`);
+assert.equal(failed, 0, `${failed} package-boundary assertion(s) failed`);
 console.log("\nall boundary assertions passed");
+});

@@ -6,7 +6,7 @@
   "description": "Reference WebChannel app (SaaS backend + browser client) built with ONLY the public @mir-stream/webchannel-{saas,client} API.",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "node test/no-internal-imports.test.mjs; boundary=$?; node --import tsx test/enroll-validation.test.ts; behavior=$?; test $boundary -eq 0 -a $behavior -eq 0",
+    "test": "node --import ../../scripts/example-test-guard.mjs --test --experimental-test-isolation=none test/no-internal-imports.test.mjs; boundary=$?; node --import tsx --import ../../scripts/example-test-guard.mjs --test --experimental-test-isolation=none test/enroll-validation.test.ts; behavior=$?; test $boundary -eq 0 -a $behavior -eq 0",
     "bundle": "esbuild web/app.ts --bundle --format=iife --global-name=WebChannelApp --outfile=web/app.js",
     "start": "tsx server/index.ts"
   },
