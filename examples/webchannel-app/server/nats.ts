@@ -11,10 +11,10 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  renderFullResolverNatsConfig,
+  prepareFullResolverNatsConfig,
   type NatsSelfContainedAccountConfig,
 } from "@mir-stream/webchannel-saas";
 
@@ -54,10 +54,9 @@ export function bootNatsServer(opts: NatsBootOptions): NatsHandle {
   writeFileSync(systemCredentialsPath, opts.systemAccountCredentials, { mode: 0o600 });
   chmodSync(systemCredentialsPath, 0o600);
 
-  const resolverDir = mkdtempSync(join(opts.configDir, "resolver-jwt-"));
-  const conf = renderFullResolverNatsConfig({
+  const { config: conf } = prepareFullResolverNatsConfig({
+    configDir: opts.configDir,
     operatorJwtPath,
-    resolverDir,
     systemAccountPublicKey: opts.natsConfig.systemAccountPublicKey,
     resolverConfig: opts.natsConfig.resolverConfig,
     tcpPort: opts.tcpPort,

@@ -147,7 +147,7 @@
     "packages/saas/src/enrollment-repository.test.ts": 18,
     "packages/saas/src/external-nats-account.test.ts": 10,
     "packages/saas/src/issuer-single-source.test.ts": 2,
-    "packages/saas/src/nats-permissions-realserver.test.ts": 21,
+    "packages/saas/src/nats-permissions-realserver.test.ts": 22,
     "packages/saas/src/nats-user-jwt.test.ts": 6,
     "packages/saas/src/nkey-sign-parity.test.ts": 2,
     "packages/saas/src/p1-1-http-ui-contract.test.ts": 13,

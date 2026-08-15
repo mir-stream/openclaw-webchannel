@@ -2,14 +2,13 @@
 
 import {
   existsSync,
-  mkdtempSync,
   readFileSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
 
-import { renderFullResolverNatsConfig } from "../packages/saas/src/nats-server-config.ts";
+import { prepareFullResolverNatsConfig } from "../packages/saas/src/nats-server-config.ts";
 
 const configDir = requiredEnv("NATS_CONFIG_DIR");
 const tcpPort = parsePort(requiredEnv("NATS_TCP"), "NATS_TCP");
@@ -32,11 +31,10 @@ if (credentialMode !== 0o600) {
 const operatorJwt = readFileSync(operatorJwtPath, "utf8").trim();
 const systemAccountPublicKey = operatorSystemAccount(operatorJwt, operatorJwtPath);
 const resolverConfig = JSON.parse(readFileSync(resolverPath, "utf8"));
-const resolverDir = mkdtempSync(join(configDir, "resolver-jwt-"));
 
-const config = renderFullResolverNatsConfig({
+const { config } = prepareFullResolverNatsConfig({
+  configDir,
   operatorJwtPath,
-  resolverDir,
   systemAccountPublicKey,
   resolverConfig,
   tcpPort,

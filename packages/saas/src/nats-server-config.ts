@@ -1,14 +1,23 @@
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+
 import type { NatsResolverConfig } from "./types.js";
 
 export type FullResolverNatsConfigOptions = {
   /** Path to the operator JWT read by nats-server. */
   operatorJwtPath: string;
-  /** Fresh, run-local directory owned by the full resolver. */
+  /** Stable, caller-owned directory used by the full resolver. */
   resolverDir: string;
   /** Public NKEY of the operator's system account. */
   systemAccountPublicKey: string;
   /** Account JWTs used to seed the writable resolver at startup. */
   resolverConfig: NatsResolverConfig;
+  /**
+   * Optional subset of `resolverConfig` to seed on this startup. Omit to seed
+   * every configured account; pass an empty object to preserve an initialized
+   * resolver without replaying stale bootstrap claims.
+   */
+  resolverPreload?: NatsResolverConfig;
   /** Plain NATS listener port. `-1` lets nats-server choose an ephemeral port. */
   tcpPort: number;
   /** WebSocket listener port. `-1` lets nats-server choose an ephemeral port. */
@@ -16,6 +25,57 @@ export type FullResolverNatsConfigOptions = {
   /** Optional bind host applied to both listeners. */
   host?: string;
 };
+
+export type PrepareFullResolverNatsConfigOptions = Omit<
+  FullResolverNatsConfigOptions,
+  "resolverDir" | "resolverPreload"
+> & {
+  /** Caller-owned run/deployment root that persists across server restarts. */
+  configDir: string;
+};
+
+export type PreparedFullResolverNatsConfig = {
+  config: string;
+  resolverDir: string;
+};
+
+const RESOLVER_DIRECTORY_NAME = "resolver-jwt";
+
+/**
+ * Prepare a restart-safe full-resolver configuration beneath `configDir`.
+ *
+ * The fixed directory name makes runtime claim updates survive regenerated
+ * `nats.conf` files. Existing account JWT files are deliberately excluded from
+ * `resolver_preload`: replaying the caller's bootstrap JWT on every boot could
+ * otherwise replace a newer accepted claim (including a revocation).
+ *
+ * Callers retain isolation by providing a distinct run/deployment root.
+ */
+export function prepareFullResolverNatsConfig(
+  options: PrepareFullResolverNatsConfigOptions,
+): PreparedFullResolverNatsConfig {
+  const { configDir, ...renderOptions } = options;
+  assertNonEmpty(configDir, "configDir");
+  const resolverDir = join(configDir, RESOLVER_DIRECTORY_NAME);
+  mkdirSync(resolverDir, { recursive: true, mode: 0o700 });
+  chmodSync(resolverDir, 0o700);
+
+  const resolverPreload = Object.fromEntries(
+    Object.entries(options.resolverConfig).filter(
+      ([accountPublicKey]) =>
+        !existsSync(join(resolverDir, `${accountPublicKey}.jwt`)),
+    ),
+  );
+
+  return {
+    resolverDir,
+    config: renderFullResolverNatsConfig({
+      ...renderOptions,
+      resolverDir,
+      resolverPreload,
+    }),
+  };
+}
 
 /**
  * Render the single full/Dir resolver configuration used by every
@@ -44,6 +104,10 @@ export function renderFullResolverNatsConfig(
     throw new Error("resolverConfig does not contain the configured system account");
   }
 
+  const preloadEntries = Object.entries(
+    options.resolverPreload ?? options.resolverConfig,
+  ).sort(([a], [b]) => a.localeCompare(b));
+
   const lines: string[] = [];
   if (options.host) lines.push(`host: ${quote(options.host)}`);
   lines.push(`port: ${options.tcpPort}`, "websocket {");
@@ -60,17 +124,27 @@ export function renderFullResolverNatsConfig(
     "  allow_delete: false",
     '  interval: "2m"',
     "}",
-    "resolver_preload: {",
   );
-  for (const [accountPublicKey, accountJwt] of entries) {
+  for (const [accountPublicKey] of entries) {
     if (!/^A[A-Z2-7]+$/.test(accountPublicKey)) {
       throw new Error(
         `resolverConfig contains an invalid account public key: ${accountPublicKey}`,
       );
     }
-    lines.push(`  ${accountPublicKey}: ${quote(accountJwt)}`);
   }
-  lines.push("}", "");
+  if (preloadEntries.length > 0) {
+    lines.push("resolver_preload: {");
+    for (const [accountPublicKey, accountJwt] of preloadEntries) {
+      if (!options.resolverConfig[accountPublicKey]) {
+        throw new Error(
+          `resolverPreload contains an account absent from resolverConfig: ${accountPublicKey}`,
+        );
+      }
+      lines.push(`  ${accountPublicKey}: ${quote(accountJwt)}`);
+    }
+    lines.push("}");
+  }
+  lines.push("");
   return lines.join("\n");
 }
 
