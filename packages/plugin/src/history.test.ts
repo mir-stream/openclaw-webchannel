@@ -329,6 +329,35 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     expect(warning).not.toContain("21");
   });
 
+  it.each([
+    ["negative", -1, "h--1-0"],
+    ["fractional", 1.5, "h-1.5-0"],
+    ["exponent", 1e21, "h-1e+21-0"],
+  ])(
+    "classifies an emitted %s-timestamp synthetic cursor miss",
+    async (_case, timestamp, expectedCursor) => {
+      const transcript = makeIdlessConversation(30).map((message, index) =>
+        index === 20
+          ? { ...(message as Record<string, unknown>), timestamp }
+          : message,
+      );
+      const { api } = makeApi(transcript);
+      const cursor = (await recent(api, SESSION_KEY, 10))[0].id;
+      const logger = { warn: vi.fn() };
+
+      expect(cursor).toBe(expectedCursor);
+      expect(await pageBefore(api, SESSION_KEY, cursor, 2, logger)).toEqual([]);
+
+      expect(logger.warn).toHaveBeenCalledOnce();
+      const warning = logger.warn.mock.calls[0][0];
+      expect(warning).toContain("cursorKind=window-relative-synthetic");
+      expect(warning).toContain("cause=window-relative-synthetic-id");
+      expect(warning).not.toContain(cursor);
+      expect(warning).not.toContain(SESSION_KEY);
+      expect(warning).not.toContain("21");
+    },
+  );
+
   it("classifies a final opaque cursor miss", async () => {
     const cursor = "ghost";
     const { api } = makeApi(FIXTURE);

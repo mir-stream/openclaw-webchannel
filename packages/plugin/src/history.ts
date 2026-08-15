@@ -81,7 +81,21 @@ export function _resetHistoryShapeDriftWarningForTest(): void {
   shapeDriftWarned = false;
 }
 
-const WINDOW_RELATIVE_SYNTHETIC_ID_PATTERN = /^h-\d+-\d+$/;
+const WINDOW_RELATIVE_SYNTHETIC_ID_PATTERN =
+  /^h-(-?(?:0|[1-9]\d*)(?:\.\d+)?(?:e[+-]\d+)?)-(0|[1-9]\d*)$/;
+
+function isWindowRelativeSyntheticId(cursor: string): boolean {
+  const match = WINDOW_RELATIVE_SYNTHETIC_ID_PATTERN.exec(cursor);
+  if (!match) return false;
+  const timestamp = Number(match[1]);
+  const index = Number(match[2]);
+  return (
+    Number.isFinite(timestamp) &&
+    String(timestamp) === match[1] &&
+    Number.isSafeInteger(index) &&
+    String(index) === match[2]
+  );
+}
 
 /**
  * Pull the visible text out of an OpenAI-style `content` array (the SDK's
@@ -305,7 +319,7 @@ type CursorKind = "window-relative-synthetic" | "opaque";
 
 /** Positive recognition of the window-relative synthetic id form this module emits. */
 function classifyCursorKind(cursor: string): CursorKind {
-  if (WINDOW_RELATIVE_SYNTHETIC_ID_PATTERN.test(cursor)) {
+  if (isWindowRelativeSyntheticId(cursor)) {
     return "window-relative-synthetic";
   }
   return "opaque";
