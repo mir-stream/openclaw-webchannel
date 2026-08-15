@@ -176,6 +176,40 @@ describe("evaluateWebchannelDoctor findings", () => {
     expect(warnings[0]).toMatch(/invalid-account-id.*account key.*\.\.\/bad.*was not started/i);
   });
 
+  it("gives normalized-collision victims collision-specific remediation (#135)", () => {
+    const findings = evaluateWebchannelDoctor(cfg({
+      accounts: {
+        Acme: { auth: validAuth("Acme") },
+        acme: { auth: validAuth("acme") },
+      },
+    }), { env: {} });
+
+    expect(findings).toHaveLength(2);
+    for (const finding of findings) {
+      expect(finding).toMatchObject({
+        checkId: "invalid-account-id",
+        severity: "error",
+      });
+      expect(finding.message).toContain('normalized account id "acme"');
+      expect(finding.fix).toMatch(/rename or remove.*SDK-normalized account ids are unique/i);
+      expect(finding.fix).not.toContain("must match /^[A-Za-z0-9_-]{1,64}$/");
+    }
+  });
+
+  it("retains regex remediation for a raw-format-invalid account key", () => {
+    const finding = evaluateWebchannelDoctor(
+      cfg({ accounts: { "../bad": {} } }),
+      { env: {} },
+    )[0];
+
+    expect(finding).toMatchObject({
+      accountId: "../bad",
+      checkId: "invalid-account-id",
+    });
+    expect(finding?.fix).toContain("match /^[A-Za-z0-9_-]{1,64}$/");
+    expect(finding?.fix).not.toContain("SDK-normalized");
+  });
+
   it("isolates removed config planning failures and still diagnoses a sibling", async () => {
     const adapter = createWebchannelDoctorAdapter({
       env: {},

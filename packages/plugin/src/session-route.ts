@@ -87,11 +87,11 @@
  *      forbids inside a tenant, cannot be confused with its neighbours.
  *      NOTE, precisely because the point above is easy to over-read: this avoids
  *      structural tuple ambiguity; it does not make the whole key collision-free.
- *      `normalizeAccountId` still folds accounts `Acme` and `acme` onto one
- *      account component, and nothing guards against two config keys with the
- *      same canonical form. That is the same defect one axis over, it is NOT
- *      fixed here, and it is tracked separately — do not read this docstring as
- *      a claim that it is handled.
+ *      `normalizeAccountId` still folds accounts such as `Acme` and `acme` onto
+ *      one account component. `inspectWebchannelAccountIds` now rejects every
+ *      such alias group when both spellings occur in one enumerated config.
+ *      Inspection does not compare successive config generations, so a
+ *      case-only account rename across a hot reload remains a separate problem.
  *   3. The peer component keeps its meaning, so `session.identityLinks`
  *      resolution (which matches on the peer id) is unaffected.
  *

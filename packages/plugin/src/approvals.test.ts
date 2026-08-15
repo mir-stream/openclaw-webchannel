@@ -47,6 +47,9 @@ import {
   APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY,
   ApprovalOriginLeaseRegistry,
 } from "./approval-origin.js";
+import { DEFAULT_WEBCHANNEL_TENANT } from "./account-config.js";
+import { resolveWebchannelSessionRoute } from "./session-route.js";
+import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
 // `presentation.buildPendingPayload`). Verified fields:
@@ -1164,6 +1167,46 @@ describe("webchannel pending-approval store (#15)", () => {
     expect(ids.has("id-0")).toBe(false);
     expect(ids.has(`id-${PENDING_APPROVAL_CAP}`)).toBe(true);
   });
+
+  it("#130: quoted key=value text stays inside every cap-warning value", () => {
+    const hostileId = 'exec-" outcome=ok';
+    const hostileAccount = 'account-" peer=trusted';
+    const hostilePeer = 'peer-" forged=true';
+    const now = Date.now();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      __pendingApprovalsTestHook.record(
+        hostileAccount,
+        payload(hostileId),
+        hostilePeer,
+        now,
+      );
+      for (let i = 0; i < PENDING_APPROVAL_CAP; i++) {
+        __pendingApprovalsTestHook.record("safe", payload(`safe-${i}`), "safe-peer", now);
+      }
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      const record = String(warn.mock.calls[0]![0]);
+      expect(record.split("\n")).toHaveLength(1);
+      const encoded = record.match(/"(?:\\.|[^"\\])*"/gu) ?? [];
+      expect(encoded.map((token) => JSON.parse(token))).toEqual([
+        hostileId,
+        hostileAccount,
+        hostilePeer,
+      ]);
+
+      const fields = decodeStrictLogfmt(
+        `approval=${encoded[0]} account=${encoded[1]} peer=${encoded[2]}`,
+      );
+      expect(fields.get("approval")).toBe(hostileId);
+      expect(fields.get("account")).toBe(hostileAccount);
+      expect(fields.get("peer")).toBe(hostilePeer);
+      expect(fields.has("outcome")).toBe(false);
+      expect(fields.has("forged")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1371,9 +1414,34 @@ describe("webchannel recently-resolved store (#19)", () => {
  * deterministically in a test.
  */
 describe("#93 origin routing — active lease + persisted session store", () => {
-  const SESSION_KEY = "agent:rota:webchannel:default:direct:d21d9f07-1f2e";
   const ORIGIN_PEER = "PeerCase-1"; // deliberately mixed case: `to` is byte-exact
   const OTHER_PEER = "PeerCase-2";
+
+  // This suite crosses the real persisted-store routing boundary, so its key
+  // comes from production derivation instead of resembling a route by hand.
+  const SESSION_KEY = resolveWebchannelSessionRoute(
+    {
+      config: { session: {} },
+      runtime: {
+        channel: {
+          routing: {
+            resolveAgentRoute: (input: any) => ({
+              agentId: "rota",
+              channel: input.channel,
+              accountId: input.accountId ?? "",
+              sessionKey: "ignored-by-webchannel-routing",
+              mainSessionKey: "agent:rota:main",
+              lastRoutePolicy: "main",
+              matchedBy: "default",
+            }),
+          },
+        },
+      },
+    } as any,
+    "default",
+    ORIGIN_PEER,
+    DEFAULT_WEBCHANNEL_TENANT,
+  ).sessionKey;
 
   const slots = globalThis as unknown as Record<symbol, unknown>;
   const capability = createClawApprovalCapability(new FakePeerChannel()) as any;
@@ -1472,6 +1540,13 @@ describe("#93 origin routing — active lease + persisted session store", () => 
       .filter((line) => line.includes("origin_unresolved"))
       .map((line) => /reason=(\w+)/.exec(line)?.[1] ?? "");
   }
+
+  it("#131: derives the persisted approval-origin key through production routing", () => {
+    expect(SESSION_KEY).toBe(
+      "agent:rota:webchannel:default:direct:peercase-1:tenant:" +
+        "91e0a4247f5124d880e9876cb8ff7fefdfd74782832996312741357aa8b7fa4e",
+    );
+  });
 
   it("recovers the exact origin peer for an all-null-metadata request (the #93 regression)", () => {
     const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });

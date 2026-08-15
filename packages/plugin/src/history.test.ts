@@ -9,6 +9,10 @@ import {
 } from "./history.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
+// history.ts accepts an opaque store key; route-shape assertions belong at the routing seam.
+const SESSION_KEY = "opaque-session-key-1";
+const OTHER_SESSION_KEY = "opaque-session-key-2";
+
 /**
  * Build a minimal OpenClawPluginApi stub whose `runtime.subagent.getSessionMessages`
  * is the only call history.ts makes. The mock honors the `limit` parameter
@@ -90,39 +94,39 @@ describe("history — recent (AC2)", () => {
       },
     ]);
 
-    const out = await recent(api, "agent:main:webchannel:web-anon", 50);
+    const out = await recent(api, SESSION_KEY, 50);
 
     expect(out).toEqual([
       { id: "m-1", role: "user", text: "hi", ts: 1700000000000 },
       { id: "m-2", role: "agent", text: "hello there", ts: 1700000001000 },
     ]);
     expect(getSessionMessages).toHaveBeenCalledWith({
-      sessionKey: "agent:main:webchannel:web-anon",
+      sessionKey: SESSION_KEY,
       limit: 50,
     });
   });
 
   it("scopes EVERY call by sessionKey (no cross-peer leak) (AC2)", async () => {
     const { api, getSessionMessages } = makeApi([]);
-    await recent(api, "agent:main:webchannel:alice", 25);
-    await recent(api, "agent:main:webchannel:bob", 10);
+    await recent(api, SESSION_KEY, 25);
+    await recent(api, OTHER_SESSION_KEY, 10);
     const calls = getSessionMessages.mock.calls;
     expect(calls).toHaveLength(2);
-    expect(calls[0][0]).toEqual({ sessionKey: "agent:main:webchannel:alice", limit: 25 });
-    expect(calls[1][0]).toEqual({ sessionKey: "agent:main:webchannel:bob", limit: 10 });
+    expect(calls[0][0]).toEqual({ sessionKey: SESSION_KEY, limit: 25 });
+    expect(calls[1][0]).toEqual({ sessionKey: OTHER_SESSION_KEY, limit: 10 });
   });
 
   it("returns [] for an empty sessionKey or non-positive limit (defensive)", async () => {
     const { api } = makeApi([{ role: "user", content: [{ type: "text", text: "x" }] }]);
     expect(await recent(api, "", 10)).toEqual([]);
-    expect(await recent(api, "agent:main:webchannel:web-anon", 0)).toEqual([]);
-    expect(await recent(api, "agent:main:webchannel:web-anon", -5)).toEqual([]);
+    expect(await recent(api, SESSION_KEY, 0)).toEqual([]);
+    expect(await recent(api, SESSION_KEY, -5)).toEqual([]);
   });
 
   it("treats a throwing store as 'no history' (best-effort, never crashes)", async () => {
     const { api } = makeApi(new Error("kernel exploded"));
     const logger = { warn: vi.fn() };
-    const out = await recent(api, "agent:main:webchannel:web-anon", 10, logger);
+    const out = await recent(api, SESSION_KEY, 10, logger);
     expect(out).toEqual([]);
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(logger.warn.mock.calls[0][0]).toMatch(/history\.recent failed/);
@@ -130,7 +134,7 @@ describe("history — recent (AC2)", () => {
 
   it("treats a non-array payload as 'no history'", async () => {
     const { api } = makeApi("not-an-array" as unknown as unknown[]);
-    expect(await recent(api, "agent:main:webchannel:web-anon", 10)).toEqual([]);
+    expect(await recent(api, SESSION_KEY, 10)).toEqual([]);
   });
 
   it("drops messages that are not user/agent (system, tool, etc.)", async () => {
@@ -139,7 +143,7 @@ describe("history — recent (AC2)", () => {
       { role: "tool", content: [{ type: "text", text: "tool result" }] },
       { role: "user", content: [{ type: "text", text: "real user text" }] },
     ]);
-    const out = await recent(api, "agent:main:webchannel:web-anon", 10);
+    const out = await recent(api, SESSION_KEY, 10);
     expect(out).toEqual([
       { id: expect.any(String), role: "user", text: "real user text", ts: expect.any(Number) },
     ]);
@@ -149,7 +153,7 @@ describe("history — recent (AC2)", () => {
     const { api } = makeApi([
       { role: "user", content: [{ type: "text", text: "x" }], timestamp: 1700000000000 },
     ]);
-    const out = await recent(api, "agent:main:webchannel:web-anon", 10);
+    const out = await recent(api, SESSION_KEY, 10);
     expect(out[0].id).toMatch(/^h-1700000000000-0$/);
   });
 
@@ -157,13 +161,13 @@ describe("history — recent (AC2)", () => {
     const { api } = makeApi([
       { role: "user", content: [{ type: "text", text: "x" }], timestamp: "2026-06-19T00:00:00Z" },
     ]);
-    const out = await recent(api, "agent:main:webchannel:web-anon", 10);
+    const out = await recent(api, SESSION_KEY, 10);
     expect(out[0].ts).toBe(Date.parse("2026-06-19T00:00:00Z"));
   });
 
   it("returns [] when the runtime binding is absent (defensive)", async () => {
     const api = { runtime: {} } as unknown as OpenClawPluginApi;
-    expect(await recent(api, "agent:main:webchannel:web-anon", 10)).toEqual([]);
+    expect(await recent(api, SESSION_KEY, 10)).toEqual([]);
   });
 });
 
@@ -193,11 +197,11 @@ describe("history — pageBefore (AC2 / AC4)", () => {
   it("returns messages strictly older than beforeId, never the cursor", async () => {
     const { api, getSessionMessages } = makeApi(FIXTURE);
     // limit=10 → fetchLimit=20 → window = last 20 = ALL 5 items.
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-4", 10);
+    const out = await pageBefore(api, SESSION_KEY, "m-4", 10);
     // Cursor is m-4 → strictly older = [m-1, m-2, m-3]
     expect(out.map((m) => m.id)).toEqual(["m-1", "m-2", "m-3"]);
     expect(getSessionMessages).toHaveBeenCalledWith({
-      sessionKey: "agent:main:webchannel:web-anon",
+      sessionKey: SESSION_KEY,
       // limit * 2 so the slice still has room after filtering
       limit: 20,
     });
@@ -208,7 +212,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // page is capped at 3: [m-17, m-18, m-19]. (The cursor is outside the
     // phase-1 window, so this also exercises the widen path.)
     const { api } = makeApi(makeConversation(30));
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-20", 3);
+    const out = await pageBefore(api, SESSION_KEY, "m-20", 3);
     expect(out.map((m) => m.id)).toEqual(["m-17", "m-18", "m-19"]);
   });
 
@@ -218,7 +222,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // `limit` items (which the client dedups → silent stop); the honest
     // signal is an empty page. Both phases must have run.
     const { api, getSessionMessages } = makeApi(FIXTURE);
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "ghost", 2);
+    const out = await pageBefore(api, SESSION_KEY, "ghost", 2);
     expect(out).toEqual([]);
     expect(getSessionMessages).toHaveBeenCalledTimes(2);
     expect(getSessionMessages.mock.calls[0][0].limit).toBe(4);
@@ -231,7 +235,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // re-fetches at limit 1000, finds m-10, and returns the 2 items strictly
     // older: [m-8, m-9].
     const { api, getSessionMessages } = makeApi(makeConversation(30));
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-10", 2);
+    const out = await pageBefore(api, SESSION_KEY, "m-10", 2);
     expect(out.map((m) => m.id)).toEqual(["m-8", "m-9"]);
     expect(getSessionMessages).toHaveBeenCalledTimes(2);
     expect(getSessionMessages.mock.calls[0][0].limit).toBe(4);
@@ -243,7 +247,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // m-29 is at idx 2 (>= limit), so a full page of older messages is already
     // in the window — return [m-27, m-28] with no wasteful 1000-fetch.
     const { api, getSessionMessages } = makeApi(makeConversation(30));
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-29", 2);
+    const out = await pageBefore(api, SESSION_KEY, "m-29", 2);
     expect(out.map((m) => m.id)).toEqual(["m-27", "m-28"]);
     expect(getSessionMessages).toHaveBeenCalledTimes(1);
     expect(getSessionMessages.mock.calls[0][0].limit).toBe(4);
@@ -256,7 +260,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // limit=2, cursor m-27 → phase-1 window = m-27..m-30 (idx 0). Must widen
     // and return the real older page [m-25, m-26], not [].
     const { api, getSessionMessages } = makeApi(makeConversation(30));
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-27", 2);
+    const out = await pageBefore(api, SESSION_KEY, "m-27", 2);
     expect(out.map((m) => m.id)).toEqual(["m-25", "m-26"]);
     expect(getSessionMessages).toHaveBeenCalledTimes(2);
     expect(getSessionMessages.mock.calls[0][0].limit).toBe(4);
@@ -268,7 +272,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // already fetched the maximal window, so a cursor miss returns [] with no
     // second call.
     const { api, getSessionMessages } = makeApi(FIXTURE);
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "ghost", 600);
+    const out = await pageBefore(api, SESSION_KEY, "ghost", 600);
     expect(out).toEqual([]);
     expect(getSessionMessages).toHaveBeenCalledTimes(1);
     expect(getSessionMessages.mock.calls[0][0].limit).toBe(1000);
@@ -280,7 +284,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // the (truncated) older slice IS the genuine answer: [m-1, m-2, m-3], one
     // call only.
     const { api, getSessionMessages } = makeApi(FIXTURE);
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-4", 600);
+    const out = await pageBefore(api, SESSION_KEY, "m-4", 600);
     expect(out.map((m) => m.id)).toEqual(["m-1", "m-2", "m-3"]);
     expect(getSessionMessages).toHaveBeenCalledTimes(1);
     expect(getSessionMessages.mock.calls[0][0].limit).toBe(1000);
@@ -291,7 +295,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // idx < limit, so we cannot trust the small window and MUST widen first;
     // phase 2 also finds m-1 at idx 0 → nothing older → [] (confirmed wall).
     const { api, getSessionMessages } = makeApi(FIXTURE);
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-1", 10);
+    const out = await pageBefore(api, SESSION_KEY, "m-1", 10);
     expect(out).toEqual([]);
     expect(getSessionMessages).toHaveBeenCalledTimes(2);
     expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
@@ -302,7 +306,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // finds m-1 at idx 0 → older slice empty → [] (genuine wall, not a silent
     // stop). Two calls confirm the widening ran.
     const { api, getSessionMessages } = makeApi(FIXTURE);
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-1", 2);
+    const out = await pageBefore(api, SESSION_KEY, "m-1", 2);
     expect(out).toEqual([]);
     expect(getSessionMessages).toHaveBeenCalledTimes(2);
     expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
@@ -310,22 +314,22 @@ describe("history — pageBefore (AC2 / AC4)", () => {
 
   it("scopes every call by sessionKey (no cross-peer leak) (AC4)", async () => {
     const { api, getSessionMessages } = makeApi(FIXTURE);
-    await pageBefore(api, "agent:main:webchannel:alice", "m-4", 10);
+    await pageBefore(api, SESSION_KEY, "m-4", 10);
     const lastCall = getSessionMessages.mock.calls.at(-1)![0];
-    expect(lastCall.sessionKey).toBe("agent:main:webchannel:alice");
+    expect(lastCall.sessionKey).toBe(SESSION_KEY);
   });
 
   it("returns [] for a missing cursor / non-positive limit (defensive)", async () => {
     const { api } = makeApi(FIXTURE);
-    expect(await pageBefore(api, "agent:main:webchannel:web-anon", "", 10)).toEqual([]);
+    expect(await pageBefore(api, SESSION_KEY, "", 10)).toEqual([]);
     expect(await pageBefore(api, "", "m-4", 10)).toEqual([]);
-    expect(await pageBefore(api, "agent:main:webchannel:web-anon", "m-4", 0)).toEqual([]);
+    expect(await pageBefore(api, SESSION_KEY, "m-4", 0)).toEqual([]);
   });
 
   it("treats a throwing store as 'no history' (best-effort)", async () => {
     const { api } = makeApi(new Error("store unreachable"));
     const logger = { warn: vi.fn() };
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "m-4", 10, logger);
+    const out = await pageBefore(api, SESSION_KEY, "m-4", 10, logger);
     expect(out).toEqual([]);
     expect(logger.warn.mock.calls[0][0]).toMatch(/history\.pageBefore failed/);
   });
@@ -340,7 +344,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     });
     const api = { runtime: { subagent: { getSessionMessages } } } as unknown as OpenClawPluginApi;
     const logger = { warn: vi.fn() };
-    const out = await pageBefore(api, "agent:main:webchannel:web-anon", "ghost", 2, logger);
+    const out = await pageBefore(api, SESSION_KEY, "ghost", 2, logger);
     expect(out).toEqual([]);
     expect(getSessionMessages).toHaveBeenCalledTimes(2);
     expect(logger.warn.mock.calls[0][0]).toMatch(/history\.pageBefore failed/);
@@ -401,7 +405,7 @@ describe("history — read-time sanitization (live/history text parity)", () => 
         __openclaw: { id: "m-1" },
       },
     ]);
-    const out = await recent(api, "agent:main:webchannel:web-anon", 10);
+    const out = await recent(api, SESSION_KEY, 10);
     expect(out).toEqual([
       { id: "m-1", role: "agent", text: "답변 본문.", ts: 1700000000000 },
     ]);
@@ -413,7 +417,7 @@ describe("history — read-time sanitization (live/history text parity)", () => 
       { role: "assistant", content: [{ type: "text", text: "NO_REPLY" }], __openclaw: { id: "a-1" } },
       { role: "assistant", content: [{ type: "text", text: "real reply" }], __openclaw: { id: "a-2" } },
     ]);
-    const out = await recent(api, "agent:main:webchannel:web-anon", 10);
+    const out = await recent(api, SESSION_KEY, 10);
     expect(out.map((m) => m.id)).toEqual(["u-1", "a-2"]);
     expect(out.map((m) => m.text)).toEqual(["hi", "real reply"]);
   });
@@ -428,7 +432,7 @@ describe("history — read-time sanitization (live/history text parity)", () => 
     const { api } = makeApi([
       { role: "user", content: [{ type: "text", text: rawUser }], __openclaw: { id: "u-1" } },
     ]);
-    const out = await recent(api, "agent:main:webchannel:web-anon", 10);
+    const out = await recent(api, SESSION_KEY, 10);
     expect(out).toEqual([
       { id: "u-1", role: "user", text: "실제 사용자 질문입니다.", ts: expect.any(Number) },
     ]);

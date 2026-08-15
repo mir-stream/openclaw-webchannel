@@ -1,8 +1,10 @@
-import assert from "node:assert/strict";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { DeviceFlowEnrollment } from "@mir-stream/webchannel-saas";
 import { createAccount } from "@nats-io/nkeys";
+import { exampleAssert as assert, exampleTest } from "../../../scripts/example-test-guard.mjs";
+
+exampleTest("I132-E4: webchannel app preserves enrollment validation semantics", async () => {
 
 process.env.TRUST_CHAIN_PATH = `/tmp/openclaw-example-enroll-validation-${process.pid}.json`;
 process.env.RELAY = "synadia";
@@ -76,8 +78,8 @@ try {
   assert.equal(confirmed.status, 200);
   assert.equal((confirmed.body as { approved: boolean }).approved, true);
   console.log("ok - conflict response confirms replacement through replaceActivationId");
-  process.exit(0);
 } catch (error) {
   console.error(error);
-  process.exit(1);
+  throw error;
 }
+});

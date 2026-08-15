@@ -123,6 +123,25 @@ describe("webchannel plugin", () => {
     expect(plugin.config.listAccountIds(allInvalid)).toEqual([]);
   });
 
+  it("rejects and reports both normalized-colliding account ids (#135)", () => {
+    const reporter = vi.fn();
+    const plugin = createWebChannelPlugin(new FakePeerChannel(), { onInvalidAccountId: reporter });
+    const cfg = {
+      channels: { webchannel: { accounts: { Acme: {}, acme: {} } } },
+    } as any;
+
+    expect(plugin.config.listAccountIds(cfg)).toEqual([]);
+    expect(reporter).toHaveBeenCalledTimes(2);
+    const reports = reporter.mock.calls.map(([, invalid]) => invalid);
+    expect(reports.map(({ id }) => id)).toEqual(
+      ["Acme", "acme"].sort((a, b) => a.localeCompare(b)),
+    );
+    for (const { reason } of reports) {
+      expect(reason).toContain('"Acme"');
+      expect(reason).toContain('"acme"');
+    }
+  });
+
   it("resolves an account from config", () => {
     const transport = new FakePeerChannel();
     const plugin = createWebChannelPlugin(transport);
@@ -410,7 +429,8 @@ describe("webchannel inbound round-trip", () => {
       // resolveWebchannelSessionRoute IGNORES this sessionKey and rebuilds it via
       // the REAL buildAgentSessionKey with the forced per-account-channel-peer
       // scope — so the recorded key below is the ENFORCED isolation key
-      // (agent:main:webchannel:<accountId>:direct:<peer>), not this naive value.
+      // (agent:main:webchannel:<accountId>:direct:<peer>:tenant:<sha256>), not
+      // this naive value.
       // We still return a value here to prove the override wins.
       sessionKey: `agent:main:${input.channel}:${input.peer.id}`,
       mainSessionKey: "agent:main:main",

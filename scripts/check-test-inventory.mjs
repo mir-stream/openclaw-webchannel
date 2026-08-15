@@ -23,15 +23,12 @@
  * sides. Never a run report. This is a deliberate reversal, and the reason is
  * the whole difference between a guard and a flake:
  *
- *   Counting what RAN sounds stronger and is worse. THREE suites self-skip at
+ *   Counting what RAN sounds stronger and is worse. TWO suites self-skip at
  *   RUNTIME on environment noise — nats-transport.test.ts's port-scan pair
  *   calls ctx.skip() when the per-PID LISTEN floor drifts (which its docstring
- *   says happens "under full-suite load", i.e. exactly how CI runs it),
- *   p1-1-http-ui-contract.test.ts skips when a sandbox denies listen(2), and
- *   ac6-device-flow-e2e.test.ts warns "nats-server not available" and returns
- *   early, passing VACUOUSLY rather than skipping (that last one is issue #133;
- *   named here so a reader counting unobserved suites gets three, not two). Off
- *   a run report those tests vanish from the count on a bad day, so the gate goes
+ *   says happens "under full-suite load", i.e. exactly how CI runs it), and
+ *   p1-1-http-ui-contract.test.ts skips when a sandbox denies listen(2). Off a
+ *   run report those tests vanish from the count on a bad day, so the gate goes
  *   red with "tests disappeared" when nothing was deleted — and the remedy the
  *   red message prints (regenerate the snapshot) collects statically, produces
  *   no diff, and cannot clear it. The only thing that clears it is committing
@@ -56,8 +53,9 @@
  * identical and passes here. Weakening a test's assertions is likewise
  * invisible, and so is a test that collects but self-skips at runtime (above).
  * It also says nothing about examples/**, which vitest.config.ts excludes from
- * the sweep. Only review catches those; this guard is strictly about tests
- * disappearing from the suite.
+ * the sweep. Those two gaps are enforced by check-runtime-skips.mjs and the
+ * examples' zero-registration guard respectively; they stay separate because
+ * their failure modes are not deterministic collection drift.
  *
  * SHAPE — why the snapshot carries no `totalTests`/`totalFiles`, and why the
  * check refuses any top-level key it does not validate: a total is one line
@@ -207,11 +205,11 @@ function inventoryFrom(listPath) {
  * a file whose every test is statically skipped is absent from the inventory by
  * design, and failing on it would be a red with no snapshot-shaped remedy.
  *
- * NOT CAUGHT: `-t <pattern>`. Vitest reports filtered-out tests as pending in
- * files that still appear, so a name filter is indistinguishable from a runtime
- * skip by any measure that tolerates the flake — measured: `-t` with a pattern
- * matching nothing gives 0 passed / 25 pending across both files, and
- * passed+pending is identical to a full run. Do not add `-t` to the suite step.
+ * NOT CAUGHT HERE: `-t <pattern>`. Vitest reports filtered-out tests as pending
+ * in files that still appear, so this path-only assertion cannot distinguish a
+ * name filter from a runtime skip. check-runtime-skips.mjs now compares the
+ * completed count with this inventory and makes that red outside the two small
+ * committed flake widths. Do not add `-t` to the suite step regardless.
  */
 function scope(resultsPath) {
   const expected = loadSnapshot();

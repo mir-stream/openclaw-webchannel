@@ -105,10 +105,10 @@ const EXPECTED: Record<string, InventoryEntry> = {
     count: 2, classification: "session-authorized issuer plus gated test issuer",
   },
   "packages/saas/src/ac6-device-flow-e2e.test.ts :: /bootstrap template": {
-    count: 5, classification: "standalone fixed-tuple integration fixtures",
+    count: 4, classification: "standalone fixed-tuple integration fixtures",
   },
   "packages/saas/src/ac6-device-flow-e2e.test.ts :: /test/bootstrap-jwt template": {
-    count: 2, classification: "explicitly gated reference-server fixtures including malformed peer rejection",
+    count: 3, classification: "explicitly gated reference-server fixtures including malformed peer rejection",
   },
   "packages/saas/src/bootstrap-claims.test.ts :: buildBootstrapClaims call": {
     count: 16, classification: "isolated primitive claim-builder unit tests",

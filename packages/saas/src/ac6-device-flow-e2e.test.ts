@@ -5,24 +5,19 @@
  * 1. Reference SaaS serves /enroll+/poll+/bootstrap endpoints
  * 2. Plugin enrolls via device flow (RFC 8628)
  * 3. Test operator approves enrollment
- * 4. Plugin polls and receives NATS user credentials
- * 5. Plugin connects to real nats-server
- * 6. Complete E2E message round-trip (browser ↔ plugin ↔ agent)
- * 7. All Phase A tests still pass unchanged
+ * 4. Plugin polls and receives tenant-scoped NATS credentials and the relay URL
+ * 5. Browser bootstrap JWTs interoperate with the plugin verifier
  *
  * SECURITY PROPERTIES VERIFIED:
  *  - Plugin is ingress-free (outbound-only HTTP requests)
  *  - No secret pasting (operator 1-click approval)
- *  - Real nats-server enforces tenant account/subject permissions
  *  - SaaS-attested device keys via bootstrap JWT cnf claims
- *  - Complete NATS transport (no gateway-WS fallback)
  *
  * references:
  *  - RFC 8628 (OAuth 2.0 Device Authorization Grant)
  *  - AC 2 (device flow enrollment)
  *  - AC 3 (NATS user JWT/creds)
  *  - AC 4 (cnf/PoP verification)
- *  - AC 5 (NATS-only channel)
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
@@ -43,8 +38,16 @@ import { JWKSCache } from "../../plugin/src/jwks.js";
 // Test configuration
 // ---------------------------------------------------------------------------
 
-const ENROLLMENT_SERVER_PORT = 3456;
-const BOOTSTRAP_SERVER_PORT = 3457;
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(HERE, "..", "..", "..");
+const PORTS = JSON.parse(
+  readFileSync(join(REPO_ROOT, "e2e", "local", "ports.json"), "utf8"),
+) as { vitest: Record<string, Record<string, number>> };
+const SUITE_PORTS = PORTS.vitest["packages/saas/src/ac6-device-flow-e2e.test.ts"];
+const NATS_CLIENT_PORT = SUITE_PORTS.NATS_CLIENT_PORT;
+const ENROLLMENT_SERVER_PORT = SUITE_PORTS.ENROLLMENT_SERVER_PORT;
+const BOOTSTRAP_SERVER_PORT = SUITE_PORTS.BOOTSTRAP_SERVER_PORT;
+const NATS_URL = `ws://localhost:${NATS_CLIENT_PORT}`;
 const SAAS_BASE_URL = `http://localhost:${ENROLLMENT_SERVER_PORT}`;
 const BOOTSTRAP_BASE_URL = `http://localhost:${BOOTSTRAP_SERVER_PORT}`;
 const TEST_TENANT = "test-tenant";
@@ -56,16 +59,14 @@ const TEST_ACCOUNT_ID = "test-agent";
 
 let enrollmentServer: ReturnType<typeof spawn> | null = null;
 let bootstrapServer: ReturnType<typeof spawn> | null = null;
-let natsServer: ReturnType<typeof spawn> | null = null;
 let bootstrapAgentPublicKey = "";
 
 // Resolve the tsx binary from node_modules (a bare `npx tsx` is flaky under a
 // spawned shell — it may miss the cache and report "command not found").
 const TSX_BIN = (() => {
-  const here = dirname(fileURLToPath(import.meta.url));
   for (const p of [
-    join(here, "../node_modules/.bin/tsx"),
-    join(here, "../../../node_modules/.bin/tsx"),
+    join(HERE, "../node_modules/.bin/tsx"),
+    join(HERE, "../../../node_modules/.bin/tsx"),
   ]) {
     if (existsSync(p)) return p;
   }
@@ -107,7 +108,7 @@ async function startEnrollmentServer(): Promise<void> {
       ...process.env,
       PORT: String(ENROLLMENT_SERVER_PORT),
       SAAS_BASE_URL: SAAS_BASE_URL,
-      NATS_URL: "ws://localhost:4222",
+      NATS_URL,
       // Poll instantly in tests so the flow doesn't wait the RFC 8628 5s interval.
       POLL_INTERVAL_SECONDS: "0",
       EXPIRATION_SECONDS: "600",
@@ -160,26 +161,6 @@ async function startBootstrapServer(): Promise<void> {
 }
 
 /**
- * Start a simple nats-server for testing.
- */
-async function startNatsServer(): Promise<void> {
-  // Try to start nats-server if available
-  natsServer = spawn("nats-server", ["-p", "4222", "-js"], {
-    stdio: "pipe",
-  });
-
-  // Wait for NATS to start
-  await setTimeout(2000);
-
-  if (!natsServer.pid) {
-    console.warn("[AC6 E2E] nats-server not available, skipping real NATS tests");
-    return;
-  }
-
-  console.log("[AC6 E2E] NATS server started on port 4222");
-}
-
-/**
  * Stop all servers.
  */
 function stopAllServers(): void {
@@ -190,10 +171,6 @@ function stopAllServers(): void {
   if (bootstrapServer) {
     bootstrapServer.kill("SIGTERM");
     bootstrapServer = null;
-  }
-  if (natsServer) {
-    natsServer.kill("SIGTERM");
-    natsServer = null;
   }
 }
 
@@ -289,10 +266,9 @@ async function generateDeviceKey(): Promise<string> {
 
 describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
   beforeAll(async () => {
-    // Start all servers
+    // Start both HTTP servers.
     await startEnrollmentServer();
     await startBootstrapServer();
-    await startNatsServer();
 
     // Additional wait for servers to be fully ready
     await setTimeout(1000);
@@ -494,7 +470,7 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     // The SaaS is the rendezvous authority: the relay URL travels WITH the minted
     // creds, so the plugin never has to be told where NATS lives out-of-band. This
     // is the exact NATS_URL the enrollment-server was booted with (see env above).
-    expect(pollResponse.natsUrl).toBe("ws://localhost:4222");
+    expect(pollResponse.natsUrl).toBe(NATS_URL);
 
     console.log(`[AC6 E2E] Step 3: Plugin received NATS credentials for peerId: ${pollResponse.peerId}`);
 
@@ -840,15 +816,10 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Test 10: Full E2E integration (if NATS available)
+  // Test 10: Full HTTP enrollment/bootstrap integration
   // -------------------------------------------------------------------------
 
-  it("should complete full E2E flow: enrollment → NATS connection → messaging", async () => {
-    if (!natsServer || !natsServer.pid) {
-      console.log(`[AC6 E2E] Skipping NATS integration test (nats-server not available)`);
-      return;
-    }
-
+  it("should complete full HTTP flow: enrollment → credential issuance → bootstrap", async () => {
     // Own slot: a plain approve here must land as "approved", not "conflict"
     // with whatever key another approving test already activated for
     // TEST_ACCOUNT_ID. See the "full-flow" test above for the same reasoning.
@@ -869,8 +840,19 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
     };
 
     // Step 2: Approve enrollment
-    await postJson(`${SAAS_BASE_URL}/approve`, {
+    const approveResponse = await postJson(`${SAAS_BASE_URL}/approve`, {
       user_code: enrollResponse.user_code,
+    }) as {
+      success: boolean;
+      peerId: string;
+      tenant: string;
+      accountId: string;
+    };
+
+    expect(approveResponse).toMatchObject({
+      success: true,
+      tenant: TEST_TENANT,
+      accountId,
     });
 
     // Step 3: Poll for credentials (poll interval is 0 in tests)
@@ -885,27 +867,44 @@ describe("AC 6 E2E: Real-HTTP Device Flow Enrollment", () => {
       peerId: string;
     };
 
-    expect(pollResponse.creds).toBeDefined();
+    expect(pollResponse.creds.userJwt).toBeDefined();
+    expect(pollResponse.creds.userSeed).toBeDefined();
+    expect(pollResponse.peerId).toBe(approveResponse.peerId);
 
-    // Step 4: Get bootstrap JWT for browser
+    // Step 4: Bootstrap the enrolled tuple through the issuer that owns the
+    // enrollment registry. Its response must pin the key approved above.
     const deviceKey = await generateDeviceKey();
     const bootstrapResponse = await postJson(
-      `${BOOTSTRAP_BASE_URL}/bootstrap`,
+      `${SAAS_BASE_URL}/test/bootstrap-jwt`,
       {
-        devicePublicKey: deviceKey,
-        accountId: TEST_ACCOUNT_ID,
+        deviceX25519PublicKey: deviceKey,
+        peerId: pollResponse.peerId,
+        accountId,
         tenant: TEST_TENANT,
       },
     ) as {
       jwt: string;
+      peerId: string;
+      agentPublicKey?: string;
     };
 
     expect(bootstrapResponse.jwt).toBeDefined();
+    expect(bootstrapResponse.peerId).toBe(pollResponse.peerId);
+    expect(bootstrapResponse.agentPublicKey).toBe(pluginKeyPair.publicKey);
 
-    console.log(`[AC6 E2E] Full E2E flow completed:`);
+    const bootstrapClaims = JSON.parse(
+      Buffer.from(bootstrapResponse.jwt.split(".")[1], "base64url").toString("utf-8"),
+    );
+    expect(bootstrapClaims).toMatchObject({
+      sub: pollResponse.peerId,
+      aud: accountId,
+      tenant: TEST_TENANT,
+      cnf: { jwk: { x: deviceKey } },
+    });
+
+    console.log(`[AC6 E2E] Full HTTP flow completed:`);
     console.log(`[AC6 E2E]   - Plugin enrolled and approved`);
     console.log(`[AC6 E2E]   - NATS credentials received`);
-    console.log(`[AC6 E2E]   - Bootstrap JWT issued`);
-    console.log(`[AC6 E2E]   - Ready for NATS connection and E2E messaging`);
+    console.log(`[AC6 E2E]   - Bootstrap JWT linked to the enrolled tuple and agent key`);
   });
 });

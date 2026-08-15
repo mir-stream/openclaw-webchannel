@@ -5,11 +5,12 @@
  * accounts a single `gateway run` should serve.
  *
  * 가-2: the WIRE identity is the `accountId` itself (the `--account` flag / the
- * `accounts.<id>` key), which is unique by construction (it is a map key). The
+ * `accounts.<id>` key). `inspectWebchannelAccountIds` is the boundary that makes
+ * this identity unique: it rejects every group of raw keys that the SDK account
+ * contract normalizes to one id before this planner can receive them. The
  * handling agent is fully decoupled — it is now purely an `agents bind` concern
  * (telegram-like) and no per-account `agentId` is read here. As a result the old
- * structural skip rules (missing-own-agentId, duplicate-agentId) no longer apply:
- * the accountId can neither be missing nor collide.
+ * structural skip rules (missing-own-agentId, duplicate-agentId) no longer apply.
  *
  * The encryption-policy / credential / connection I/O (which CAN still skip an
  * account — creds-missing, connect failure, encryption misconfig) lives in the
@@ -86,8 +87,8 @@ export function planWebchannelAccount(
  *
  * Order follows `listWebchannelAccountIds` (sorted) for deterministic serving.
  * Every enabled listed account is served; disabled accounts are omitted before
- * acquisition identity or later runtime I/O. The accountId is the unique wire
- * identity, so there are no other structural (pre-I/O) skips to apply.
+ * acquisition identity or later runtime I/O. Account ids reaching this point
+ * have already passed the module-level uniqueness boundary above.
  */
 export function planAccounts(
   cfg: unknown,

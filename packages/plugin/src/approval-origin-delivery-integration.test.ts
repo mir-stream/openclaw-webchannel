@@ -35,15 +35,46 @@ import {
   APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY,
   ApprovalOriginLeaseRegistry,
 } from "./approval-origin.js";
+import { resolveWebchannelSessionRoute } from "./session-route.js";
 
 const TENANT = "tenant";
 const ACCOUNT = "acct";
-const SESSION_KEY = "agent:rota:webchannel:acct:direct:d21d9f07-1f2e";
-const OTHER_SESSION_KEY = "agent:rota:webchannel:acct:direct:9f07d21d-2e1f";
 const ORIGIN_PEER = "PeerCase-A";
 const OTHER_PEER = "PeerCase-B";
 const ORIGIN_SUBJECT = `webchannel.${TENANT}.${ACCOUNT}.${ORIGIN_PEER}.out`;
 const OTHER_SUBJECT = `webchannel.${TENANT}.${ACCOUNT}.${OTHER_PEER}.out`;
+
+// Delivery integrates the persisted store with an account-bound route, so use
+// the production derivation for every realistic session fixture in this file.
+function deriveSessionKey(peerId: string): string {
+  return resolveWebchannelSessionRoute(
+    {
+      config: { session: {} },
+      runtime: {
+        channel: {
+          routing: {
+            resolveAgentRoute: (input: any) => ({
+              agentId: "rota",
+              channel: input.channel,
+              accountId: input.accountId ?? "",
+              sessionKey: "ignored-by-webchannel-routing",
+              mainSessionKey: "agent:rota:main",
+              lastRoutePolicy: "main",
+              matchedBy: "default",
+            }),
+          },
+        },
+      },
+    } as any,
+    ACCOUNT,
+    peerId,
+    TENANT,
+  ).sessionKey;
+}
+
+const SESSION_KEY = deriveSessionKey(ORIGIN_PEER);
+const OTHER_SESSION_KEY = deriveSessionKey(OTHER_PEER);
+const THIRD_SESSION_KEY = deriveSessionKey("third-peer");
 
 /** Transport that RECORDS published subject/payload pairs (plaintext mode). */
 class RecordingTransport extends EventEmitter {
@@ -211,6 +242,13 @@ describe("#93 approval delivery — exact origin subject or nothing", () => {
     } as any);
   }
 
+  it("#131: derives delivery's persisted session key through production routing", () => {
+    expect(SESSION_KEY).toBe(
+      "agent:rota:webchannel:acct:direct:peercase-a:tenant:" +
+        "e9da86d351cf9a7642d8c50195c3f466220911a15c177809bd1161a51e8c5f24",
+    );
+  });
+
   it("publishes to exactly one subject — the proven origin's — when lease and store agree", async () => {
     const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER) });
     nowMs = 1_010;
@@ -315,8 +353,8 @@ describe("#93 approval delivery — exact origin subject or nothing", () => {
     claim(ORIGIN_PEER, OTHER_SESSION_KEY);
     claim(OTHER_PEER, OTHER_SESSION_KEY);
     nowMs = 1_012;
-    claim(ORIGIN_PEER, "agent:rota:webchannel:acct:direct:third");
-    claim(OTHER_PEER, "agent:rota:webchannel:acct:direct:third");
+    claim(ORIGIN_PEER, THIRD_SESSION_KEY);
+    claim(OTHER_PEER, THIRD_SESSION_KEY);
     // A tuple that never overlapped at all, with a perfectly matching store.
     nowMs = 1_014;
     claim(ORIGIN_PEER, SESSION_KEY);

@@ -22,12 +22,12 @@
  *
  * Consequences of that bias, each of which is load-bearing:
  *
- *   - The collision domain is the CORE-canonical account form
- *     (`canonicalizeAccountId`, not `toLowerCase()`): core also strips leading
- *     and trailing `-`, so `-abc` and `abc` are the SAME account to core. A
- *     private lowercase-only key would keep them distinct and silently defeat
- *     the overlap poison below. Claims still carry the EXACT raw account id, so
- *     an alias never satisfies a resolve.
+ *   - The collision domain is the SDK-normalized account form
+ *     (`normalizeAccountId`, not `toLowerCase()`): the SDK folds `-abc` to
+ *     `abc`, so those spellings are the SAME account to core. A private
+ *     lowercase-only key would keep them distinct and silently defeat the
+ *     overlap poison below. Claims still carry the EXACT raw account id, so an
+ *     alias never satisfies a resolve.
  *   - Two distinct exact origins `(rawAccountId, peerId)` alive at once on one
  *     canonical key POISON that key for the rest of the epoch — after a release,
  *     after every claim is gone, and across a later same-origin run. Once two
@@ -55,11 +55,11 @@
  * barrier, while any pre-barrier request replayed by the gateway is rejected as
  * `invalid_request_time`.
  *
- * Pure and in-memory by construction: no I/O, no OpenClaw imports, an injectable
- * clock, and no dependency on the current config route or on alias enumeration.
+ * Pure and in-memory by construction: no I/O, an injectable clock, and no
+ * dependency on the current config route or on alias enumeration.
  */
 
-import { canonicalizeAccountId } from "./account-config.js";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 
 /**
  * Outcome of a lease lookup. Only `resolved` names a delivery target.
@@ -197,12 +197,12 @@ const RESOLUTION_INVALID_REQUEST_TIME: ApprovalOriginLeaseResolution =
  * The collision domain key: `(core-canonical account, sessionKey)`.
  *
  * The separator is a space, which the canonical account form can never contain
- * (`canonicalizeAccountId` emits `[a-z0-9_-]{1,64}` only), so the two fields
+ * (`normalizeAccountId` emits `[a-z0-9_-]{1,64}` only), so the two fields
  * cannot be confused across the boundary. `sessionKey` is last and therefore
  * unconstrained.
  */
 function composeCanonicalKey(rawAccountId: string, sessionKey: string): string {
-  return `${canonicalizeAccountId(rawAccountId)} ${sessionKey}`;
+  return `${normalizeAccountId(rawAccountId)} ${sessionKey}`;
 }
 
 /** Unambiguous identity of one exact origin, used only for overlap counting. */

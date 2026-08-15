@@ -348,7 +348,47 @@ describe("setup-wizard: declarative detection", () => {
     expect(lines[0]).toContain("WebChannel (Account_A): configured");
   });
 
-  it("status rejects invalid exact account ids without canonicalizing them", async () => {
+  it("status rejects normalized-collision victims and surfaces the inspection reason (#135)", async () => {
+    const cfg = {
+      channels: {
+        webchannel: {
+          accounts: {
+            Acme: {
+              auth: { jwt: {} },
+              nats: { credentials: { mode: "static" } },
+            },
+            acme: {
+              auth: { jwt: {} },
+              nats: { credentials: { mode: "static" } },
+            },
+          },
+        },
+      },
+    } as never;
+
+    for (const accountId of ["Acme", "acme"]) {
+      expect(
+        webchannelSetupWizard.status.resolveConfigured({ cfg, accountId }),
+      ).toBe(false);
+      const lines = await Promise.resolve(
+        webchannelSetupWizard.status.resolveStatusLines!({
+          cfg,
+          accountId,
+          configured: true,
+        }),
+      );
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(
+        'not configured — invalid account id; the normalized account id "acme"',
+      );
+      expect(lines[0]).toContain('configured account ids');
+      expect(lines[0]).toContain('"Acme"');
+      expect(lines[0]).toContain('"acme"');
+    }
+    expect(readMock).not.toHaveBeenCalled();
+  });
+
+  it("status distinguishes caller-supplied from configured invalid exact ids", async () => {
     const cfg = { channels: { webchannel: {} } } as never;
     expect(
       webchannelSetupWizard.status.resolveConfigured({
@@ -365,6 +405,25 @@ describe("setup-wizard: declarative detection", () => {
       }),
     );
     expect(lines[0]).toContain("not configured — invalid account id");
+    expect(lines[0]).toContain("expected /^[A-Za-z0-9_-]{1,64}$/");
+
+    const configuredInvalid = {
+      channels: { webchannel: { accounts: { constructor: {} } } },
+    } as never;
+    expect(
+      webchannelSetupWizard.status.resolveConfigured({
+        cfg: configuredInvalid,
+        accountId: "constructor",
+      }),
+    ).toBe(false);
+    const configuredLines = await Promise.resolve(
+      webchannelSetupWizard.status.resolveStatusLines!({
+        cfg: configuredInvalid,
+        accountId: "constructor",
+        configured: true,
+      }),
+    );
+    expect(configuredLines[0]).toContain("the id is a blocked prototype key");
   });
 
   it("status rejects an unknown explicit credential mode even with auth.jwt", () => {
