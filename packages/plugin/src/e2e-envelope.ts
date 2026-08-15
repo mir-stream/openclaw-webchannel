@@ -41,11 +41,11 @@
  *
  * Backlog replay
  * ──────────────
- * Replay reuses this exact format: `history.ts` reads past messages from
- * OpenClaw core's session transcript and emits them as `MessageEnvelope`s, so
- * no conversion is needed between a replayed frame and a live one. The agent
- * keeps no at-rest ciphertext store of its own — `history-store.ts` has no
- * production caller.
+ * Replay uses this same outer wire format: `history.ts` reads and normalizes
+ * past messages from OpenClaw core's session transcript, then
+ * `NatsChannel.sendHistory` seals the resulting `{ type: "history" }` payload
+ * as a `MessageEnvelope`. The agent keeps no at-rest ciphertext store of its
+ * own — `history-store.ts` has no production caller.
  */
 
 import { encrypt, decrypt } from "./e2e-crypto.js";

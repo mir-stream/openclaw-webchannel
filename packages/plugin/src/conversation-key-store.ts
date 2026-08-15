@@ -21,9 +21,10 @@
  *
  * K seals NO history at rest. The production history authority is OpenClaw
  * core's session transcript — plaintext JSONL at owner-only perms, written by
- * core, never by this plugin. `history.ts` reads it through
- * `getSessionMessages` and seals it with the CURRENT K at read time, so
- * replacing K costs no re-encryption: the next read reseals
+ * core, never by this plugin. `history.ts` reads and normalizes it through
+ * `getSessionMessages`; `NatsChannel.sendHistory` seals the resulting frame
+ * with the CURRENT K at delivery time, so replacing K costs no
+ * re-encryption: the next read-and-deliver cycle reseals
  * (`docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4, RETAIN + RESEAL). The agent-side
  * ciphertext store an earlier revision of this comment described is
  * `history-store.ts`, which has no production caller.
