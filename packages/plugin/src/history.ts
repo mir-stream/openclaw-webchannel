@@ -65,8 +65,26 @@ type RawSessionMessage = {
   content?: unknown;
   text?: unknown;
   timestamp?: unknown;
-  __openclaw?: { id?: unknown };
+  __openclaw?: unknown;
 };
+
+/**
+ * Public `getSessionMessages` elements are `unknown`; this is an observed,
+ * private envelope, not an SDK contract. In particular, `__openclaw.seq` is
+ * not a safer replacement for `.id` — both would bind pagination to the same
+ * undeclared shape.
+ */
+let shapeDriftWarned = false;
+
+/** @internal Test-only: reset the process-wide shape-drift warning latch. */
+export function _resetHistoryShapeDriftWarningForTest(): void {
+  shapeDriftWarned = false;
+}
+
+const SYNTHETIC_ID_PREFIX = "webchannel-history-synthetic-v1:";
+const SYNTHETIC_ID_PATTERN =
+  /^webchannel-history-synthetic-v1:-?\d+(?:\.\d+)?(?:e[+-]?\d+)?:\d+$/i;
+const LEGACY_SYNTHETIC_ID_PATTERN = /^h-\d+-\d+$/;
 
 /**
  * Pull the visible text out of an OpenAI-style `content` array (the SDK's
@@ -110,19 +128,59 @@ function extractTs(raw: unknown): number {
 }
 
 /**
- * Best-effort id recovery: OpenClaw transcripts attach the canonical message id
- * on `__openclaw.id`; if absent we synthesize a stable fallback (`h-{ts}-{idx}`)
- * so the client can still dedupe across reconnects of an empty transcript.
+ * Best-effort id recovery from an observed OpenClaw transcript shape.
+ *
+ * Absence of `__openclaw` is a pre-existing benign case. Once the envelope is
+ * present, however, only an own, non-empty string `id` is accepted: every other
+ * shape is drift in the private convention we rely on and is warned once per
+ * process. We still return a row because history reads are best-effort.
+ *
+ * The fallback deliberately names itself as synthetic and window-relative.
+ * `idx` is the fetched window index, not a transcript position, so this value
+ * is useful for in-frame dedupe but is not promised to work as a later cursor.
  */
-function extractId(raw: RawSessionMessage, ts: number, idx: number): string {
+function extractId(
+  raw: RawSessionMessage,
+  ts: number,
+  idx: number,
+  logger?: LoggerLike,
+): string {
+  if (!Object.hasOwn(raw, "__openclaw")) {
+    return `${SYNTHETIC_ID_PREFIX}${ts}:${idx}`;
+  }
+
   const inner = raw.__openclaw;
-  if (inner && typeof inner.id === "string" && inner.id.length > 0) return inner.id;
-  return `h-${ts}-${idx}`;
+  if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+    const record = inner as Record<string, unknown>;
+    if (
+      Object.hasOwn(record, "id") &&
+      typeof record.id === "string" &&
+      record.id.length > 0
+    ) {
+      return record.id;
+    }
+  }
+
+  if (!shapeDriftWarned && typeof logger?.warn === "function") {
+    shapeDriftWarned = true;
+    try {
+      logger.warn(
+        "webchannel: history transcript __openclaw shape drift; expected an own non-empty string id",
+      );
+    } catch {
+      // Diagnostics must not take down this best-effort history read.
+    }
+  }
+  return `${SYNTHETIC_ID_PREFIX}${ts}:${idx}`;
 }
 
-function normalize(raw: unknown, idx: number): HistoryMessage | null {
+function normalize(raw: unknown, idx: number, logger?: LoggerLike): HistoryMessage | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const r = raw as RawSessionMessage;
+  // Inspect identity before projection filters so drift on a transcript entry
+  // cannot hide merely because its role or sanitized text is not emitted.
+  const ts = extractTs(r.timestamp);
+  const id = extractId(r, ts, idx, logger);
   const role = normalizeRole(r.role);
   if (!role) return null;
   const rawText = typeof r.text === "string" ? r.text : extractText(r.content);
@@ -132,19 +190,21 @@ function normalize(raw: unknown, idx: number): HistoryMessage | null {
   // saw live. An empty result (NO_REPLY-only or noise-only) drops the message.
   const text = sanitizeHistoryText(role, rawText);
   if (!text) return null;
-  const ts = extractTs(r.timestamp);
   return {
-    id: extractId(r, ts, idx),
+    id,
     role,
     text,
     ts,
   };
 }
 
-function normalizeAll(rawMessages: readonly unknown[]): HistoryMessage[] {
+function normalizeAll(
+  rawMessages: readonly unknown[],
+  logger?: LoggerLike,
+): HistoryMessage[] {
   const out: HistoryMessage[] = [];
   for (let i = 0; i < rawMessages.length; i++) {
-    const m = normalize(rawMessages[i], i);
+    const m = normalize(rawMessages[i], i, logger);
     if (m) out.push(m);
   }
   return out;
@@ -164,6 +224,7 @@ async function readFromStore(
   api: OpenClawPluginApi,
   sessionKey: string,
   limit: number,
+  logger?: LoggerLike,
 ): Promise<HistoryMessage[]> {
   const subagent = api.runtime?.subagent as
     | { getSessionMessages?: (params: { sessionKey: string; limit?: number }) => Promise<{ messages?: unknown[] }> }
@@ -171,7 +232,7 @@ async function readFromStore(
   if (!subagent || typeof subagent.getSessionMessages !== "function") return [];
   const payload = await subagent.getSessionMessages({ sessionKey, limit });
   const raw = Array.isArray(payload?.messages) ? payload.messages : [];
-  return normalizeAll(raw);
+  return normalizeAll(raw, logger);
 }
 
 /**
@@ -188,7 +249,7 @@ export async function recent(
 ): Promise<HistoryMessage[]> {
   if (!sessionKey || limit <= 0) return [];
   try {
-    return await readFromStore(api, sessionKey, limit);
+    return await readFromStore(api, sessionKey, limit, logger);
   } catch (err) {
     logger?.warn?.(
       `webchannel: history.recent failed for ${logSafe(sessionKey)}: ${logSafe(err)}`,
@@ -242,6 +303,37 @@ export function planHistoryFetch(
  */
 const MAX_FETCH_WINDOW = 1000;
 
+type CursorKind = "synthetic-v1" | "synthetic-legacy" | "opaque";
+
+/** Positive recognition of only the two synthetic id forms this module emits/emitted. */
+function classifyCursorKind(cursor: string): CursorKind {
+  if (SYNTHETIC_ID_PATTERN.test(cursor)) return "synthetic-v1";
+  if (LEGACY_SYNTHETIC_ID_PATTERN.test(cursor)) return "synthetic-legacy";
+  return "opaque";
+}
+
+function warnCursorMiss(logger: LoggerLike | undefined, beforeId: string): void {
+  if (typeof logger?.warn !== "function") return;
+  const cursorKind = classifyCursorKind(beforeId);
+  try {
+    if (cursorKind === "synthetic-v1") {
+      logger.warn(
+        "webchannel: history.pageBefore cursor miss; cursorKind=synthetic-v1 cause=window-relative-synthetic-id",
+      );
+      return;
+    }
+    if (cursorKind === "synthetic-legacy") {
+      logger.warn(
+        "webchannel: history.pageBefore cursor miss; cursorKind=synthetic-legacy cause=window-relative-synthetic-id",
+      );
+      return;
+    }
+    logger.warn("webchannel: history.pageBefore cursor miss; cursorKind=opaque cause=unknown");
+  } catch {
+    // Diagnostics must not take down this best-effort history read.
+  }
+}
+
 /**
  * Returns up to `limit` messages older than `beforeId` for `sessionKey`.
  *
@@ -288,7 +380,7 @@ export async function pageBefore(
   try {
     // Phase 1: the common path — a small window around the cursor.
     const phase1Limit = Math.min(limit * 2, MAX_FETCH_WINDOW);
-    const window = await readFromStore(api, sessionKey, phase1Limit);
+    const window = await readFromStore(api, sessionKey, phase1Limit, logger);
     const idx = window.findIndex((m) => m.id === beforeId);
     // Trust the small window only when the older slice is bounded by the store,
     // not by the window's left edge: a full page is already present (idx >=
@@ -298,11 +390,14 @@ export async function pageBefore(
     }
     // Phase 1 was already the maximal window and the cursor missed — no wider
     // search to try.
-    if (phase1Limit >= MAX_FETCH_WINDOW) return [];
+    if (phase1Limit >= MAX_FETCH_WINDOW) {
+      warnCursorMiss(logger, beforeId);
+      return [];
+    }
 
     // Phase 2: a miss, or a hit at the left edge that phase 1 couldn't fully
     // serve — widen to the upstream cap and search again.
-    const wide = await readFromStore(api, sessionKey, MAX_FETCH_WINDOW);
+    const wide = await readFromStore(api, sessionKey, MAX_FETCH_WINDOW, logger);
     const wideIdx = wide.findIndex((m) => m.id === beforeId);
     // At the maximal window a short/empty older slice IS the genuine wall.
     if (wideIdx !== -1) return wide.slice(Math.max(0, wideIdx - limit), wideIdx);
@@ -310,9 +405,12 @@ export async function pageBefore(
     // Cursor is not in the maximal window we can fetch. Usually that means the
     // client holds messages older than anything reachable (conversation >1000
     // or start-of-history), but the id could also miss because it was
-    // synthesized window-relative (`h-${ts}-${idx}`, see extractId) or the
-    // message was dropped by read-time sanitization. In every case an empty
-    // page is the honest signal — newest-N would only feed the client dupes.
+    // synthesized window-relative (the current marker or legacy
+    // `h-${ts}-${idx}`, see extractId) or the message was dropped by read-time
+    // sanitization. Classify the miss without logging the cursor/session/message
+    // itself, then return the honest empty signal — newest-N would only feed the
+    // client dupes.
+    warnCursorMiss(logger, beforeId);
     return [];
   } catch (err) {
     logger?.warn?.(

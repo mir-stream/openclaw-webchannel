@@ -302,11 +302,10 @@ describe("#95 WP A — no terminal-turn failure signal", () => {
 describe("#95 WP A — transcript metadata the plugin does not read", () => {
   /**
    * The `__openclaw` envelope is undeclared by any contract type (source C4). The
-   * plugin reads only `.id` from it (`extractId`). #95 does NOT start
-   * reading more of it: `seq` was considered and DEFERRED, because retiring the
-   * `h-{ts}-{idx}` synthesis would change row `id` VALUES and break tier-1 dedupe
-   * and the `pageBefore` cursor — leaving a new dependency on an untyped envelope
-   * for a field with no consumer. See the plan's deferred-work section.
+   * plugin reads only `.id` from it (`extractId`). `seq` is deliberately ignored:
+   * adopting another field from the same private envelope would only rename the
+   * contract defect. #128 keeps `.id` as the observed best-effort value while
+   * making envelope drift and synthetic-cursor misses explicit diagnostics.
    */
   it("reads only __openclaw.id, ignoring the rest of the envelope", async () => {
     const out = await recent(makeApi([userMsg(7, "hi")]), "session-key", 50);
