@@ -39,11 +39,13 @@
  * subject or an approvalId). The same `aad` MUST be passed to
  * `decryptEnvelopeContent` for authentication to succeed.
  *
- * At-rest storage
- * ───────────────
- * The `MessageEnvelope` is the same format used for at-rest storage — the
- * agent stores encrypted envelopes and replays them outbound during backlog
- * replay. No conversion is needed between at-rest and wire formats.
+ * Backlog replay
+ * ──────────────
+ * Replay uses this same outer wire format: `history.ts` reads and normalizes
+ * past messages from OpenClaw core's session transcript, then
+ * `NatsChannel.sendHistory` seals the resulting `{ type: "history" }` payload
+ * as a `MessageEnvelope`. The agent keeps no at-rest ciphertext store of its
+ * own — `history-store.ts` has no production caller.
  */
 
 import { encrypt, decrypt } from "./e2e-crypto.js";

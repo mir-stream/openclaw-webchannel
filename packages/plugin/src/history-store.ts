@@ -1,12 +1,28 @@
 /**
- * HistoryStore — at-rest authority store for E2E ciphertext history envelopes.
+ * HistoryStore — in-memory ciphertext history store. Sub-AC 2a.
  *
- * Sub-AC 2a: load_history cursor-pagination.
+ * NOT WIRED IN PRODUCTION, AND NOT AT REST. The backing field is a plain
+ * `Map<string, MessageEnvelope[]>` and this file makes no filesystem call at
+ * all; nothing survives process exit. Nothing constructs a `HistoryStore`
+ * outside `.test.ts`, and its only importer — `typing-indicator.ts`, itself
+ * unwired — takes it as a type.
  *
- * The agent is the single authority for conversation and approval history.
- * Inbound messages are stored as opaque `MessageEnvelope` ciphertext blobs;
- * the store never sees or stores plaintext content. Decryption keys remain
- * exclusively with the communicating parties (browser devices + agent).
+ * The production history authority is OpenClaw core's session transcript.
+ * `history.ts` reads and normalizes it through `getSessionMessages`, and
+ * `NatsChannel.sendHistory` seals the resulting frame with the current
+ * conversation key at delivery time
+ * (`docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4). Retiring this module is
+ * explicitly out of scope for #72 per that section.
+ *
+ * Do not cite this file as evidence of how history is stored. Four comments
+ * elsewhere did, and they described an at-rest ciphertext store that exists
+ * neither at rest nor in the running system.
+ *
+ * The unrealized Sub-AC 2a design treated the agent as the single authority
+ * for conversation and approval history. Within this class, callers append
+ * opaque `MessageEnvelope` ciphertext blobs; the store never sees or stores
+ * plaintext content. Decryption keys remain exclusively with the communicating
+ * parties (browser devices + agent).
  *
  * Storage model
  * ─────────────
@@ -48,7 +64,8 @@
  * retrieved, or logged by this module.
  *
  * Deferred: persistence (this implementation is in-process only).
- * Deferred: key rotation / revocation rekey of stored envelopes.
+ * Deferred within this unrealized design: key rotation / revocation rekey of
+ * its in-memory envelopes.
  */
 
 import type { MessageEnvelope } from "./e2e-envelope.js";
@@ -93,7 +110,8 @@ export type HistoryPage = {
 // ---------------------------------------------------------------------------
 
 /**
- * In-process authority store for E2E ciphertext `MessageEnvelope` history.
+ * In-process store for E2E ciphertext `MessageEnvelope` history. Not the
+ * production history authority — see the file header.
  *
  * Implements append-only insertion and forward-cursor pagination via
  * `loadHistory(conv, before, limit)` for backlog replay.

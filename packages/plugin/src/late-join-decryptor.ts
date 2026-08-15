@@ -6,9 +6,11 @@
  * Problem
  * ───────
  * A device that joins an existing conversation after some messages have already
- * been exchanged has missed live broadcasts.  The agent — the single authority
- * store — holds those messages as at-rest ciphertext envelopes.  To replay them,
- * the agent paginates the stored envelopes out over NATS (history subject).
+ * been exchanged has missed live broadcasts. The production history authority
+ * is OpenClaw core's session transcript (plaintext, core-owned); the plugin
+ * reads and normalizes those messages, then `NatsChannel.sendHistory` seals a
+ * history frame with the current K and publishes it on the peer's `.out`
+ * subject. See `history.ts` and `docs/ISSUE_72_CONTAINMENT_PLAN.md` §1.4.
  *
  * But ciphertext alone is not enough: the device also needs the conversation key
  * used to encrypt those envelopes.  That key is delivered out-of-band, wrapped
@@ -82,11 +84,14 @@
  *
  * Deferred
  * ────────
- *   • Message-level forward secrecy: the shared conversation key covers the
- *     entire backlog — compromise of the key exposes all stored messages.
- *     Per-message ratchets (e.g. Double Ratchet) are deferred (see Seed).
- *   • Key rotation / revocation rekey: rotating the conversation key and
- *     re-wrapping all stored envelopes is deferred.
+ *   • Message-level forward secrecy: the shared conversation key covers every
+ *     live or history envelope sealed under it — compromise of the key exposes
+ *     any such ciphertext available to the attacker. Per-message ratchets
+ *     (e.g. Double Ratchet) are deferred (see Seed).
+ *   • Key rotation / revocation rekey is deferred. Rotation replaces K;
+ *     devices receive a fresh wrap when they register, and later history reads
+ *     seal the retained core transcript with the replacement key. There are no
+ *     stored envelopes to bulk re-wrap.
  *   • Operator-keyless enterprise mode: deferred.
  */
 
@@ -355,42 +360,19 @@ export function unwrapConversationKey(
 // ---------------------------------------------------------------------------
 
 /**
- * Decrypt a full backlog of paginated ciphertext envelopes as a late-joining device.
+ * Decrypt an already-collected array of ciphertext envelopes.
  *
- * This is the primary late-join API.  It combines key unwrapping and envelope
- * decryption into a single call, matching the late-join device flow:
+ * TEST/DESIGN HELPER, NOT THE PRODUCTION BROWSER HISTORY PATH. The production
+ * browser unwraps K during registration and incrementally opens each frame on
+ * the peer's `.out` subscription. A history page is a single outer envelope
+ * whose plaintext payload is `{ type: "history", messages: [...] }`; it is not
+ * an array passed to this function.
+ *
+ * This helper combines key unwrapping and envelope decryption into one call:
  *
  *   1. Unwrap the conversation key using this device's X25519 private key.
- *   2. Decrypt every envelope in the (already-paginated) backlog using the key.
+ *   2. Decrypt every caller-supplied envelope using the key.
  *   3. Return the recovered plaintexts in insertion order.
- *
- * Callers are responsible for paginating the HistoryStore (or history replay
- * subject) and collecting envelopes before calling this function.  The typical
- * pattern for a late-joining device:
- *
- *   ```ts
- *   // (a) Collect all history envelopes via the paginated load_history request.
- *   let cursor: string | null = null;
- *   const allEnvelopes: MessageEnvelope[] = [];
- *   do {
- *     const { envelopes, nextCursor } = await requestHistory(sub, cursor, PAGE_SIZE);
- *     allEnvelopes.push(...envelopes);
- *     cursor = nextCursor;
- *   } while (cursor !== null);
- *
- *   // (b) Unwrap the conversation key and decrypt all envelopes.
- *   const { plaintexts, conversationKey } = decryptBacklog(
- *     allEnvelopes,
- *     wrappedKey,          // delivered via SaaS-authenticated channel
- *     device.privateKey,   // never leaves the device
- *   );
- *
- *   // (c) Use plaintexts[i] to render message i in the conversation history.
- *   for (const pt of plaintexts) {
- *     const message = JSON.parse(new TextDecoder().decode(pt));
- *     renderMessage(message);
- *   }
- *   ```
  *
  * Failure semantics:
  *   - If key unwrapping fails (wrong device key or tampered wrapped key), the
@@ -399,8 +381,7 @@ export function unwrapConversationKey(
  *     the function throws at that envelope.  Partially-decrypted results are NOT
  *     returned — the caller receives either all M plaintexts or an exception.
  *
- * @param envelopes        - Ordered ciphertext `MessageEnvelope` array (all history pages
- *                           concatenated, oldest-first as returned by `load_history`).
+ * @param envelopes        - Ordered ciphertext `MessageEnvelope` array supplied by the caller.
  * @param wrappedKey       - Conversation key wrapped for this device (from agent key distribution).
  * @param devicePrivateKey - 32-byte X25519 device private key.
  * @returns `DecryptedBacklog` with `plaintexts` (in insertion order) and the recovered key.
