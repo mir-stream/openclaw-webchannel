@@ -1687,28 +1687,6 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       "Hello  Answer",
     ],
     ["final", "Hello <final>Answer</final>", "Hello Answer"],
-    [
-      "minimax:tool_call",
-      'Hello <minimax:tool_call><invoke name="x"><parameter name="a">1</parameter></invoke></minimax:tool_call> Answer',
-      "Hello  Answer",
-    ],
-    [
-      "invoke",
-      "Hello <invoke>x</invoke> minimax:tool_call Answer",
-      "Hello  minimax:tool_call Answer",
-    ],
-    ["parameter", "Hello <parameter>x</parameter> Answer", "Hello x Answer"],
-    [
-      "relevant_memories",
-      "Hello <relevant_memories>secret</relevant_memories> Answer",
-      "Hello  Answer",
-    ],
-    [
-      "relevant-memories",
-      "Hello <relevant-memories>secret</relevant-memories> Answer",
-      "Hello  Answer",
-    ],
-    ["model token", "Hello <|assistant｜>Answer", "Hello Answer"],
   ] as const;
 
   it.each(angleMarkerCases)(
@@ -1722,7 +1700,7 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
 
       expect(bubbleOrder(h.frames)).toEqual([expected]);
       expect(successfulIds(h.frames)).toHaveLength(1);
-      expect(h.frames.every((frame) => !/<(?:\/?\s*)?(?:tool_|function|antml:|final\b|minimax:|invoke\b|parameter\b|relevant[-_]memories\b|[|｜])/.test(frame.text))).toBe(
+      expect(h.frames.every((frame) => !/<(?:\/?\s*)?(?:tool_|function|antml:|final\b)/.test(frame.text))).toBe(
         true,
       );
     },
@@ -1831,10 +1809,10 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(successfulIds(h.frames)).toHaveLength(2);
   });
 
-  it("M7l6: an incomplete literal claims its lane before an independent terminal", async () => {
+  it("M7l6: a deferred tail resolves before an independent terminal", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
-    h.draft.pushAnswerText({ text: "<parameter>x" });
+    h.draft.pushAnswerText({ text: "<tool_call>" });
     await h.draft.flush();
     await h.draft.deliverIndependentFinal({ text: "ERROR" });
     await h.draft.drain();
@@ -1892,23 +1870,6 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(successfulIds(replace.frames)).toHaveLength(1);
   });
 
-  it("M7l9: nested model-token deletion promotes the earliest outer probe", async () => {
-    const h = makeDraftHarness();
-    h.draft.handleAssistantMessageBoundary();
-    h.draft.pushAnswerText({ text: "<tool_<|x" });
-    h.draft.pushAnswerText({ text: "<tool_" });
-    await h.draft.drain();
-    expect(h.frames).toEqual([]);
-
-    const memory = makeDraftHarness();
-    memory.draft.handleAssistantMessageBoundary();
-    const source = "<relevant_memories a=<|x|>>secret";
-    expect(sanitizeAssistantVisibleStreamText(source)).toBe("");
-    await replayPinnedStreamPrefixes(memory.draft, source);
-    await memory.draft.drain();
-    expect(memory.frames).toEqual([]);
-  });
-
   it("M7l10: the angle scan stays bounded on repeated target-like literals", async () => {
     const callbackCount = 256;
     let source = "";
@@ -1930,24 +1891,6 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     await h.draft.finalize(source);
     expect(bubbleOrder(h.frames)).toEqual([source]);
     expect(successfulIds(h.frames)).toHaveLength(1);
-  });
-
-  it("M7l11: model-token bodies may contain > and use either pipe width", async () => {
-    for (const source of [
-      "Hello <|assistant>foo|> Answer",
-      "Hello <｜assistant>foo|> Answer",
-      "Hello <|assistant>foo｜> Answer",
-    ]) {
-      expect(sanitizeAssistantVisibleStreamText(source)).toBe("Hello  Answer");
-      const h = makeDraftHarness();
-      h.draft.handleAssistantMessageBoundary();
-      await replayPinnedStreamPrefixes(h.draft, source);
-      await h.draft.finalize("Hello  Answer");
-      await h.draft.drain();
-      expect(bubbleOrder(h.frames)).toEqual(["Hello  Answer"]);
-      expect(successfulIds(h.frames)).toHaveLength(1);
-      expect(h.frames.some((frame) => frame.text.includes("<|assistant"))).toBe(false);
-    }
   });
 
   it("M7l12: a nonextension rotates only when it loses the held safe prefix", async () => {
@@ -2022,35 +1965,31 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
   });
 
   it("M7l14: end-of-callback names remain literal until a boundary proves otherwise", async () => {
-    for (const [name, source] of [
-      ["tool_call", "Use <tool_calligraphy> literally."],
-      ["relevant_memories", "Use <relevant_memoriesx> literally."],
-    ] as const) {
-      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+    const source = "Use <tool_calligraphy> literally.";
+    expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
 
-      const charwise = makeDraftHarness();
-      charwise.draft.handleAssistantMessageBoundary();
-      await replayPinnedStreamPrefixes(charwise.draft, source);
-      await charwise.draft.drain();
-      expect(bubbleOrder(charwise.frames)).toEqual([source]);
-      expect(successfulIds(charwise.frames)).toHaveLength(1);
-      expect(charwise.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+    const charwise = makeDraftHarness();
+    charwise.draft.handleAssistantMessageBoundary();
+    await replayPinnedStreamPrefixes(charwise.draft, source);
+    await charwise.draft.drain();
+    expect(bubbleOrder(charwise.frames)).toEqual([source]);
+    expect(successfulIds(charwise.frames)).toHaveLength(1);
+    expect(charwise.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
 
-      const exactPrefix = `Use <${name}`;
-      expect(sanitizeAssistantVisibleStreamText(exactPrefix)).toBe(exactPrefix);
-      const twoCallbacks = makeDraftHarness();
-      twoCallbacks.draft.handleAssistantMessageBoundary();
-      twoCallbacks.draft.pushAnswerText({ text: exactPrefix });
-      twoCallbacks.draft.pushAnswerText({ text: source });
-      await twoCallbacks.draft.drain();
-      expect(bubbleOrder(twoCallbacks.frames)).toEqual([source]);
+    const exactPrefix = "Use <tool_call";
+    expect(sanitizeAssistantVisibleStreamText(exactPrefix)).toBe(exactPrefix);
+    const twoCallbacks = makeDraftHarness();
+    twoCallbacks.draft.handleAssistantMessageBoundary();
+    twoCallbacks.draft.pushAnswerText({ text: exactPrefix });
+    twoCallbacks.draft.pushAnswerText({ text: source });
+    await twoCallbacks.draft.drain();
+    expect(bubbleOrder(twoCallbacks.frames)).toEqual([source]);
 
-      const noFinal = makeDraftHarness();
-      noFinal.draft.handleAssistantMessageBoundary();
-      noFinal.draft.pushAnswerText({ text: exactPrefix });
-      await noFinal.draft.drain();
-      expect(bubbleOrder(noFinal.frames)).toEqual([exactPrefix]);
-    }
+    const noFinal = makeDraftHarness();
+    noFinal.draft.handleAssistantMessageBoundary();
+    noFinal.draft.pushAnswerText({ text: exactPrefix });
+    await noFinal.draft.drain();
+    expect(bubbleOrder(noFinal.frames)).toEqual([exactPrefix]);
 
     const fifo = makeDraftHarness();
     fifo.draft.handleAssistantMessageBoundary();
@@ -2067,8 +2006,6 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
       "Use <tool_call!> literally.",
       "Use <function=> literally.",
       "Use <final!> literally.",
-      "Use <invoke?> literally.",
-      "Use <parameter!> literally.",
     ]) {
       expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
       const h = makeDraftHarness();
@@ -2081,13 +2018,11 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     }
   });
 
-  it("M7l16: valid XML and memory boundaries retain hidden-tag quarantine", async () => {
+  it("M7l16: valid XML boundaries retain hidden-tag quarantine", async () => {
     for (const source of [
       '<tool_call >{"x":1}</tool_call>',
       "<tool_call/>",
       '<tool_call>{"x":1}</tool_call>',
-      "<relevant_memories!>secret",
-      "<relevant_memories<|x|>>secret",
     ]) {
       expect(sanitizeAssistantVisibleStreamText(source)).toBe("");
       const hidden = makeDraftHarness();

@@ -315,10 +315,8 @@ type ProvisionalReservation = {
 export type PartialAnswerUpdate = { text?: string; delta?: string; replace?: true };
 
 /**
- * Distinctive angle-led markers stripped by the pinned OpenClaw stream path.
- * The first nine mirror TOOL_CALL_TAG_NAMES. The remaining entries cover the
- * adjacent final, MiniMax, standalone-parameter, memory, and model-token passes
- * without copying any of their payload/close-tag grammars.
+ * The pinned OpenClaw TOOL_CALL_TAG_NAMES plus its adjacent `final` tag.
+ * Keep this fixed allowlist in sync when the core pin moves.
  */
 const CORE_ANGLE_MARKER_NAMES = [
   "tool_call",
@@ -331,13 +329,8 @@ const CORE_ANGLE_MARKER_NAMES = [
   "antml:invoke",
   "antml:parameter",
   "final",
-  "minimax:tool_call",
-  "invoke",
-  "parameter",
 ] as const;
-const MEMORY_MARKER_NAMES = ["relevant_memories", "relevant-memories"] as const;
 const XML_NAME_CHAR_RE = /[A-Za-z0-9_.:-]/;
-const MODEL_PIPE_CHARS = new Set(["|", "｜"]);
 
 type AngleMarkerCandidate = { start: number; exact: boolean };
 type AngleMarkerScan = {
@@ -351,49 +344,11 @@ function cleanPartialAnswerText(text: string): string {
   ).text;
 }
 
-function classifyMemoryMarkerAt(
-  text: string,
-  nameStart: number,
-): "incomplete" | "exact" | undefined {
-  for (const target of MEMORY_MARKER_NAMES) {
-    let offset = 0;
-    while (
-      offset < target.length &&
-      nameStart + offset < text.length &&
-      text[nameStart + offset]!.toLowerCase() === target[offset]
-    ) {
-      offset += 1;
-    }
-    if (offset === target.length) {
-      const boundary = text[nameStart + offset];
-      if (boundary === undefined || boundary === "<") return "incomplete";
-      if (!/\w/.test(boundary)) return "exact";
-      continue;
-    }
-    if (
-      nameStart + offset === text.length ||
-      text[nameStart + offset] === "<"
-    ) {
-      return "incomplete";
-    }
-  }
-  return undefined;
-}
-
 function classifyAngleMarkerAt(
   text: string,
   start: number,
-  nextModelPipe: Int32Array,
 ): "incomplete" | "exact" | undefined {
   if (text[start] !== "<") return undefined;
-  const afterOpen = text[start + 1];
-  if (MODEL_PIPE_CHARS.has(afterOpen ?? "")) {
-    const closePipe = nextModelPipe[start + 2] ?? -1;
-    if (closePipe < 0) return "incomplete";
-    const afterClose = text[closePipe + 1];
-    if (afterClose === undefined) return "incomplete";
-    return afterClose === ">" ? "exact" : undefined;
-  }
 
   let cursor = start + 1;
   while (/\s/.test(text[cursor] ?? "")) cursor += 1;
@@ -404,9 +359,6 @@ function classifyAngleMarkerAt(
   // A bare `<` is still a viable distinctive marker prefix. The next name byte
   // either promotes the hold or proves ordinary literal text immediately.
   if (cursor === text.length) return "incomplete";
-
-  const memory = classifyMemoryMarkerAt(text, cursor);
-  if (memory) return memory;
 
   const nameStart = cursor;
   while (XML_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
@@ -432,17 +384,9 @@ function scanAngleMarkers(text: string): AngleMarkerScan {
   const firstAngle = text.indexOf("<");
   if (firstAngle < 0) return {};
 
-  const nextModelPipe = new Int32Array(text.length + 1);
-  let nextPipe = -1;
-  nextModelPipe[text.length] = -1;
-  for (let index = text.length - 1; index >= 0; index -= 1) {
-    if (MODEL_PIPE_CHARS.has(text[index] ?? "")) nextPipe = index;
-    nextModelPipe[index] = nextPipe;
-  }
-
   const result: AngleMarkerScan = {};
   for (let start = firstAngle; start >= 0; start = text.indexOf("<", start + 1)) {
-    const classification = classifyAngleMarkerAt(text, start, nextModelPipe);
+    const classification = classifyAngleMarkerAt(text, start);
     if (!classification) continue;
     const candidate = { start, exact: classification === "exact" };
     result.first ??= candidate;
