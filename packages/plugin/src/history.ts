@@ -81,10 +81,7 @@ export function _resetHistoryShapeDriftWarningForTest(): void {
   shapeDriftWarned = false;
 }
 
-const SYNTHETIC_ID_PREFIX = "webchannel-history-synthetic-v1:";
-const SYNTHETIC_ID_PATTERN =
-  /^webchannel-history-synthetic-v1:-?\d+(?:\.\d+)?(?:e[+-]?\d+)?:\d+$/i;
-const LEGACY_SYNTHETIC_ID_PATTERN = /^h-\d+-\d+$/;
+const WINDOW_RELATIVE_SYNTHETIC_ID_PATTERN = /^h-\d+-\d+$/;
 
 /**
  * Pull the visible text out of an OpenAI-style `content` array (the SDK's
@@ -135,7 +132,8 @@ function extractTs(raw: unknown): number {
  * shape is drift in the private convention we rely on and is warned once per
  * process. We still return a row because history reads are best-effort.
  *
- * The fallback deliberately names itself as synthetic and window-relative.
+ * The fallback retains the existing `h-${ts}-${idx}` wire encoding so a live
+ * tab can dedupe snapshots emitted before and after this diagnostic change.
  * `idx` is the fetched window index, not a transcript position, so this value
  * is useful for in-frame dedupe but is not promised to work as a later cursor.
  */
@@ -146,7 +144,7 @@ function extractId(
   logger?: LoggerLike,
 ): string {
   if (!Object.hasOwn(raw, "__openclaw")) {
-    return `${SYNTHETIC_ID_PREFIX}${ts}:${idx}`;
+    return `h-${ts}-${idx}`;
   }
 
   const inner = raw.__openclaw;
@@ -171,7 +169,7 @@ function extractId(
       // Diagnostics must not take down this best-effort history read.
     }
   }
-  return `${SYNTHETIC_ID_PREFIX}${ts}:${idx}`;
+  return `h-${ts}-${idx}`;
 }
 
 function normalize(raw: unknown, idx: number, logger?: LoggerLike): HistoryMessage | null {
@@ -303,12 +301,13 @@ export function planHistoryFetch(
  */
 const MAX_FETCH_WINDOW = 1000;
 
-type CursorKind = "synthetic-v1" | "synthetic-legacy" | "opaque";
+type CursorKind = "window-relative-synthetic" | "opaque";
 
-/** Positive recognition of only the two synthetic id forms this module emits/emitted. */
+/** Positive recognition of the window-relative synthetic id form this module emits. */
 function classifyCursorKind(cursor: string): CursorKind {
-  if (SYNTHETIC_ID_PATTERN.test(cursor)) return "synthetic-v1";
-  if (LEGACY_SYNTHETIC_ID_PATTERN.test(cursor)) return "synthetic-legacy";
+  if (WINDOW_RELATIVE_SYNTHETIC_ID_PATTERN.test(cursor)) {
+    return "window-relative-synthetic";
+  }
   return "opaque";
 }
 
@@ -316,15 +315,9 @@ function warnCursorMiss(logger: LoggerLike | undefined, beforeId: string): void 
   if (typeof logger?.warn !== "function") return;
   const cursorKind = classifyCursorKind(beforeId);
   try {
-    if (cursorKind === "synthetic-v1") {
+    if (cursorKind === "window-relative-synthetic") {
       logger.warn(
-        "webchannel: history.pageBefore cursor miss; cursorKind=synthetic-v1 cause=window-relative-synthetic-id",
-      );
-      return;
-    }
-    if (cursorKind === "synthetic-legacy") {
-      logger.warn(
-        "webchannel: history.pageBefore cursor miss; cursorKind=synthetic-legacy cause=window-relative-synthetic-id",
+        "webchannel: history.pageBefore cursor miss; cursorKind=window-relative-synthetic cause=window-relative-synthetic-id",
       );
       return;
     }
@@ -405,11 +398,10 @@ export async function pageBefore(
     // Cursor is not in the maximal window we can fetch. Usually that means the
     // client holds messages older than anything reachable (conversation >1000
     // or start-of-history), but the id could also miss because it was
-    // synthesized window-relative (the current marker or legacy
-    // `h-${ts}-${idx}`, see extractId) or the message was dropped by read-time
-    // sanitization. Classify the miss without logging the cursor/session/message
-    // itself, then return the honest empty signal — newest-N would only feed the
-    // client dupes.
+    // synthesized window-relative (`h-${ts}-${idx}`, see extractId) or the
+    // message was dropped by read-time sanitization. Classify the miss without
+    // logging the cursor/session/message itself, then return the honest empty
+    // signal — newest-N would only feed the client dupes.
     warnCursorMiss(logger, beforeId);
     return [];
   } catch (err) {

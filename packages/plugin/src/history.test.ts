@@ -159,7 +159,7 @@ describe("history — recent (AC2)", () => {
       { role: "user", content: [{ type: "text", text: "x" }], timestamp: 1700000000000 },
     ]);
     const out = await recent(api, SESSION_KEY, 10);
-    expect(out[0].id).toBe("webchannel-history-synthetic-v1:1700000000000:0");
+    expect(out[0].id).toBe("h-1700000000000-0");
   });
 
   it("does not warn for the benign absent-envelope case or a valid observed id", async () => {
@@ -177,7 +177,7 @@ describe("history — recent (AC2)", () => {
     const out = await recent(api, SESSION_KEY, 10, logger);
 
     expect(out.map((message) => message.id)).toEqual([
-      "webchannel-history-synthetic-v1:1000:0",
+      "h-1000-0",
       "m-valid",
     ]);
     expect(logger.warn).not.toHaveBeenCalled();
@@ -204,7 +204,7 @@ describe("history — recent (AC2)", () => {
 
     const out = await recent(api, privateSessionKey, 10, logger);
 
-    expect(out[0].id).toBe("webchannel-history-synthetic-v1:1700000000000:0");
+    expect(out[0].id).toBe("h-1700000000000-0");
     expect(logger.warn).toHaveBeenCalledOnce();
     const warning = logger.warn.mock.calls[0][0];
     expect(warning).toContain("webchannel: history transcript __openclaw shape drift");
@@ -305,7 +305,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
   });
 
-  it("diagnoses a current synthetic cursor miss without logging cursor, session, or text", async () => {
+  it("diagnoses a window-relative synthetic cursor miss without logging cursor, session, or text", async () => {
     const { api } = makeApi(makeIdlessConversation(30));
     const narrow = await recent(api, SESSION_KEY, 10);
     const cursor = narrow[0].id;
@@ -315,44 +315,34 @@ describe("history — pageBefore (AC2 / AC4)", () => {
 
     // The marker is honest: the same message has a different id in another
     // tail window, so this cursor cannot be resolved by either paging phase.
-    expect(cursor).toMatch(/^webchannel-history-synthetic-v1:/);
+    expect(cursor).toMatch(/^h-\d+-\d+$/);
     expect(sameMessageWideId).not.toBe(cursor);
     expect(await pageBefore(api, SESSION_KEY, cursor, 2, logger)).toEqual([]);
 
     expect(logger.warn).toHaveBeenCalledOnce();
     const warning = logger.warn.mock.calls[0][0];
     expect(warning).toContain("history.pageBefore cursor miss");
-    expect(warning).toContain("cursorKind=synthetic-v1");
+    expect(warning).toContain("cursorKind=window-relative-synthetic");
     expect(warning).toContain("cause=window-relative-synthetic-id");
     expect(warning).not.toContain(cursor);
     expect(warning).not.toContain(SESSION_KEY);
     expect(warning).not.toContain("21");
   });
 
-  it.each([
-    {
-      cursor: "h-1700000000000-3",
-      limit: 2,
-      cursorKind: "synthetic-legacy",
-      cause: "window-relative-synthetic-id",
-    },
-    { cursor: "ghost", limit: 600, cursorKind: "opaque", cause: "unknown" },
-  ])(
-    "classifies a final $cursorKind cursor miss",
-    async ({ cursor, limit, cursorKind, cause }) => {
-      const { api } = makeApi(FIXTURE);
-      const logger = { warn: vi.fn() };
+  it("classifies a final opaque cursor miss", async () => {
+    const cursor = "ghost";
+    const { api } = makeApi(FIXTURE);
+    const logger = { warn: vi.fn() };
 
-      expect(await pageBefore(api, SESSION_KEY, cursor, limit, logger)).toEqual([]);
+    expect(await pageBefore(api, SESSION_KEY, cursor, 600, logger)).toEqual([]);
 
-      expect(logger.warn).toHaveBeenCalledOnce();
-      const warning = logger.warn.mock.calls[0][0];
-      expect(warning).toContain(`cursorKind=${cursorKind}`);
-      expect(warning).toContain(`cause=${cause}`);
-      expect(warning).not.toContain(cursor);
-      expect(warning).not.toContain(SESSION_KEY);
-    },
-  );
+    expect(logger.warn).toHaveBeenCalledOnce();
+    const warning = logger.warn.mock.calls[0][0];
+    expect(warning).toContain("cursorKind=opaque");
+    expect(warning).toContain("cause=unknown");
+    expect(warning).not.toContain(cursor);
+    expect(warning).not.toContain(SESSION_KEY);
+  });
 
   it("finds a cursor beyond the phase-1 window via the phase-2 1000-fetch", async () => {
     // 30-message conversation, limit=2 → phase-1 fetches the last 4

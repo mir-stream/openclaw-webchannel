@@ -634,6 +634,35 @@ describe("WebChannelNATSClient — #16 ordered history insertion", () => {
     expect(w.getState().messages.map((m) => m.id)).toEqual(["c-1", "c-2", "c-10", "c-11"]);
   });
 
+  it("keeps repeated agent rows distinct when paginating h-form synthetic history ids", () => {
+    const w = makeWrapper();
+
+    // The plugin's id-less fallback is `h-<timestamp>-<window-index>`. These
+    // rows are settled history, never live agent bubbles eligible for id
+    // adoption, even when an older page repeats the same agent text.
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "h-3000-0", role: "user", text: "newer question", ts: 3000 },
+        { id: "h-4000-1", role: "agent", text: "OK", ts: 4000 },
+      ],
+    });
+    deliver(w, {
+      type: "history",
+      messages: [
+        { id: "h-1000-0", role: "user", text: "older question", ts: 1000 },
+        { id: "h-2000-1", role: "agent", text: "OK", ts: 2000 },
+      ],
+    });
+
+    expect(w.getState().messages.map(({ id, text, ts }) => ({ id, text, ts }))).toEqual([
+      { id: "h-1000-0", text: "older question", ts: 1000 },
+      { id: "h-2000-1", text: "OK", ts: 2000 },
+      { id: "h-3000-0", text: "newer question", ts: 3000 },
+      { id: "h-4000-1", text: "OK", ts: 4000 },
+    ]);
+  });
+
   it("initial hydration: snapshot order preserved into empty state", () => {
     const w = makeWrapper();
     deliver(w, {
