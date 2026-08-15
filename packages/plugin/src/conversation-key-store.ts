@@ -289,19 +289,19 @@ export class ConversationKeyStore {
         "webchannel: conversation-key rotation target does not exist",
       );
     }
-    let freshGenerations = this.readGenerationsAuditOnly();
+    const freshGenerations = compactStaleGenerations(
+      this.readGenerationsAuditOnly(),
+      freshKeys,
+    );
     const currentGeneration = freshGenerations.get(peerId);
-    if (!currentGeneration) {
-      freshGenerations = compactStaleGenerations(
-        freshGenerations,
-        freshKeys,
+    const generationCapacityExceeded = currentGeneration
+      ? freshGenerations.size > this.maxKeys
+      : freshGenerations.size >= this.maxKeys;
+    if (generationCapacityExceeded) {
+      throw new ConversationKeyGenerationCapacityError(
+        freshGenerations.size,
+        this.maxKeys,
       );
-      if (freshGenerations.size >= this.maxKeys) {
-        throw new ConversationKeyGenerationCapacityError(
-          freshGenerations.size,
-          this.maxKeys,
-        );
-      }
     }
 
     const epoch = currentGeneration
@@ -341,7 +341,7 @@ export class ConversationKeyStore {
       throw error;
     }
     this.keys = nextKeys;
-    return { key, epoch, rotatedAtSec };
+    return { key: new Uint8Array(key), epoch, rotatedAtSec };
   }
 
   // -------------------------------------------------------------------------

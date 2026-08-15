@@ -258,6 +258,22 @@ describe("ConversationKeyStore.rotate", () => {
     expect(() => openEnvelope(envelope, oldKey)).toThrow();
   });
 
+  it("returns a defensive key copy that cannot mutate the cached or durable K_new", () => {
+    const store = createStore();
+    store.getOrCreate(PEER);
+    const result = store.rotate(PEER);
+    const expectedNewKey = new Uint8Array(result.key);
+
+    expect(sameBytes(result.key, store.get(PEER)!)).toBe(true);
+    expect(sameBytes(result.key, durableKey())).toBe(true);
+    expect(result.key).not.toBe(store.get(PEER));
+
+    result.key.fill(0);
+    expect(sameBytes(result.key, expectedNewKey)).toBe(false);
+    expect(sameBytes(store.get(PEER)!, expectedNewKey)).toBe(true);
+    expect(sameBytes(durableKey(), expectedNewKey)).toBe(true);
+  });
+
   it("rejects an unknown peer without creating either key or generation state", () => {
     const store = createStore();
     expect(() => store.rotate("unknown")).toThrow(/target does not exist/);
@@ -329,6 +345,48 @@ describe("ConversationKeyStore.rotate", () => {
     const rotated = store.rotate("p1");
     expect(rotated.epoch).toBe(2);
     expect(sameBytes(rotated.key, oldKey)).toBe(false);
+  });
+
+  it("compacts a stale generation before rotating a recorded peer at capacity", () => {
+    const store = createStore({ maxKeys: 1 });
+    const oldKey = store.getOrCreate(PEER);
+    writeGenerations(new Map([
+      [PEER, { epoch: 1, rotatedAtSec: 1 }],
+      ["stale-peer", { epoch: 9, rotatedAtSec: 9 }],
+    ]));
+
+    const rotated = store.rotate(PEER);
+
+    expect(rotated.epoch).toBe(2);
+    expect(sameBytes(rotated.key, oldKey)).toBe(false);
+    expect([...durableGenerations()]).toEqual([
+      [PEER, { epoch: 2, rotatedAtSec: 1_700_000_000 }],
+    ]);
+  });
+
+  it("rejects a recorded target when lowered capacity is below all live generations", () => {
+    const roomy = createStore({ maxKeys: 2 });
+    const oldTarget = roomy.getOrCreate("p1");
+    roomy.getOrCreate("p2");
+    const beforeKeys = readFileSync(paths().conversationKeyPath);
+    const beforeGenerations = readFileSync(
+      paths().conversationKeyGenerationsPath,
+    );
+
+    const constrained = createStore({ maxKeys: 1 });
+    expect(sameBytes(constrained.get("p1")!, oldTarget)).toBe(true);
+    expect(() => constrained.rotate("p1")).toThrow(
+      ConversationKeyGenerationCapacityError,
+    );
+    expect(readFileSync(paths().conversationKeyPath).equals(beforeKeys)).toBe(
+      true,
+    );
+    expect(
+      readFileSync(paths().conversationKeyGenerationsPath).equals(
+        beforeGenerations,
+      ),
+    ).toBe(true);
+    expect(sameBytes(constrained.get("p1")!, oldTarget)).toBe(true);
   });
 });
 

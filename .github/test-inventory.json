@@ -60,7 +60,7 @@
     "packages/plugin/src/commands-catalog.test.ts": 11,
     "packages/plugin/src/consume-credentials.test.ts": 13,
     "packages/plugin/src/control-lane.test.ts": 14,
-    "packages/plugin/src/conversation-key-rotation.test.ts": 22,
+    "packages/plugin/src/conversation-key-rotation.test.ts": 25,
     "packages/plugin/src/conversation-key-store.test.ts": 30,
     "packages/plugin/src/credential-document.test.ts": 39,
     "packages/plugin/src/crypto-nats-channel-integration.test.ts": 10,
