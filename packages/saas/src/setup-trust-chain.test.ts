@@ -12,6 +12,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { parseCreds } from "@nats-io/jwt";
 import { setupTrustChain } from "./setup-trust-chain.js";
 import type {
   SetupTrustChainResult,
@@ -72,6 +73,7 @@ describe("setupTrustChain (AC 1)", () => {
     expect(payload.sub).toMatch(/^O/);
     expect(payload.iss).toBe(payload.sub);
     expect(payload.name).toEqual(expect.any(String));
+    expect(payload.nats.system_account).toBe(result.natsConfig.systemAccountPublicKey);
   });
 
   it("emits account JWT with required claims", async () => {
@@ -100,18 +102,40 @@ describe("setupTrustChain (AC 1)", () => {
     expect(result.natsConfig.resolverConfig).toBeTruthy();
     expect(typeof result.natsConfig.resolverConfig).toBe("object");
 
-    // Must contain exactly one entry (the account)
+    // Must contain the tenant account and the dedicated system account.
     const entries = Object.entries(result.natsConfig.resolverConfig);
-    expect(entries).toHaveLength(1);
-
-    const [accountPublicKey, accountJwt] = entries[0]!;
+    expect(entries).toHaveLength(2);
 
     // Key must be the account public NKEY (starts with "A")
-    expect(accountPublicKey).toBe(result.natsConfig.accountPublicKey);
-    expect(accountPublicKey).toMatch(/^A/);
+    expect(result.natsConfig.accountPublicKey).toMatch(/^A/);
+    expect(result.natsConfig.systemAccountPublicKey).toMatch(/^A/);
+    expect(result.natsConfig.systemAccountPublicKey).not.toBe(
+      result.natsConfig.accountPublicKey,
+    );
 
-    // Value must be the account JWT
-    expect(accountJwt).toBe(result.natsConfig.accountJwt);
+    // Tenant and system account JWTs are both seeded into the resolver.
+    expect(result.natsConfig.resolverConfig[result.natsConfig.accountPublicKey]).toBe(
+      result.natsConfig.accountJwt,
+    );
+    const systemAccountJwt =
+      result.natsConfig.resolverConfig[result.natsConfig.systemAccountPublicKey];
+    expect(systemAccountJwt).toBeTruthy();
+    const systemPayload = JSON.parse(atob(systemAccountJwt!.split(".")[1]!));
+    expect(systemPayload.sub).toBe(result.natsConfig.systemAccountPublicKey);
+    expect(systemPayload.iss).toMatch(/^O/);
+
+    // The update user credential stays in the private half and is canonical
+    // NATS `.creds` material (including a user seed).
+    const systemCredentialText = result.private.systemAccountCredentials;
+    expect(systemCredentialText).toContain("BEGIN NATS USER JWT");
+    expect(systemCredentialText).toContain("BEGIN USER NKEY SEED");
+    if (!systemCredentialText) throw new Error("missing system credential");
+    const systemCredentials = await parseCreds(
+      new TextEncoder().encode(systemCredentialText),
+    );
+    expect(systemCredentials.aid).toBe(result.natsConfig.systemAccountPublicKey);
+    expect(systemCredentials.uc.nats.pub?.allow).toEqual(["$SYS.REQ.CLAIMS.UPDATE"]);
+    expect(systemCredentials.uc.nats.sub?.allow).toEqual(["_INBOX.>"]);
   });
 
   it("emits JWKS document with RSA public key", async () => {
@@ -160,7 +184,7 @@ describe("setupTrustChain (AC 1)", () => {
   it("separates private from public artifacts", async () => {
     const result = await setupTrustChain();
 
-    // Private artifacts must not contain any public keys or JWTs
+    // Public server artifacts do not leak any private key material.
     expect(result.private).not.toHaveProperty("operatorJwt");
     expect(result.private).not.toHaveProperty("accountJwt");
     expect(result.private).not.toHaveProperty("jwks");
@@ -168,8 +192,10 @@ describe("setupTrustChain (AC 1)", () => {
     // Public artifacts must not contain private keys
     expect(result.natsConfig).not.toHaveProperty("rsaPrivateKeyPem");
     expect(result.natsConfig).not.toHaveProperty("natsAccountSeed");
+    expect(result.natsConfig).not.toHaveProperty("systemAccountCredentials");
     expect(result.jwks).not.toHaveProperty("rsaPrivateKeyPem");
     expect(result.jwks).not.toHaveProperty("natsAccountSeed");
+    expect(result.jwks).not.toHaveProperty("systemAccountCredentials");
   });
 
   it("supports custom operator and account names", async () => {

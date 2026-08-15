@@ -130,10 +130,14 @@ async function setupRelay(): Promise<RelaySetup> {
     operatorName: "example-operator",
     accountName: "example-account",
   });
+  if (!trustChain.private.systemAccountCredentials) {
+    throw new Error("self-contained trust chain is missing its system-account credential");
+  }
   // Overload without `externalNatsAccount` narrows natsConfig to the
   // self-contained shape bootNatsServer needs.
   const natsHandle = bootNatsServer({
     natsConfig: trustChain.natsConfig,
+    systemAccountCredentials: trustChain.private.systemAccountCredentials,
     configDir: CONFIG_DIR,
     wsPort: NATS_WS,
     tcpPort: NATS_TCP,

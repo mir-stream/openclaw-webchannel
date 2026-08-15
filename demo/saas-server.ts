@@ -29,7 +29,7 @@
  *                        expected issuer from the SaaS URL, so leave it UNSET for
  *                        the zero-config trust-anchor path (§4 change 3).
  *   NATS_URL             relay ws:// URL delivered WITH minted creds
- *   NATS_CONFIG_OUT      dir to write operator.jwt + resolver.json (for nats-server)
+ *   NATS_CONFIG_OUT      dir to write nats-server trust artifacts
  *   TRUST_CHAIN_PATH     persist the trust chain here (stable across restarts)
  *   DEMO_TENANT          tenant scope (default demo-tenant)
  *   DEMO_ACCOUNTS        JSON object keyed by accountId (value ignored, e.g.
@@ -63,7 +63,7 @@ import type { EnrollmentRequest, PollRequest } from "../packages/saas/src/device
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createDemoEnrollmentHttpHandler } from "../packages/saas/src/enrollment-http-handler.js";
 import { serializeBootstrapResponse, serializeEnrollmentResponse } from "../packages/saas/src/p1-1-wire-adapter.js";
-import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -174,6 +174,9 @@ const externalNatsAccount =
 const trustChainOptions = {
   operatorName: "demo-operator",
   accountName: "demo-account",
+  // The demo exercises the runtime claim-update channel, so it explicitly
+  // opts into retaining the operator root. The general API default stays false.
+  returnOperatorSeed: true,
   ...(externalNatsAccount ? { externalNatsAccount } : {}),
 };
 // Separate persisted file per relay mode so a self-contained chain is never
@@ -186,12 +189,21 @@ const natsConfig = trustChain.natsConfig;
 // self-contained → no external issuer_account; synadia → the managed account id.
 const natsIssuerAccountId: string | undefined = externalNatsAccount?.accountId;
 
-// Publish the public NATS config (operator JWT + memory resolver) so run.sh can
+// Publish the NATS trust artifacts so run.sh can
 // assemble a JWT-auth nats-server that trusts the SAME account this SaaS mints for.
-// Only meaningful for a self-contained account — a managed relay runs its own server.
+// The system credential is written 0600 and is never logged. Only meaningful
+// for a self-contained account — a managed relay runs its own server.
 if (NATS_CONFIG_OUT && natsConfig.mode !== "external") {
   mkdirSync(NATS_CONFIG_OUT, { recursive: true });
+  if (!privateChain.systemAccountCredentials) {
+    throw new Error("self-contained trust chain is missing its system-account credential");
+  }
   writeFileSync(join(NATS_CONFIG_OUT, "operator.jwt"), natsConfig.operatorJwt);
+  const systemCredentialsPath = join(NATS_CONFIG_OUT, "system-account.creds");
+  writeFileSync(systemCredentialsPath, privateChain.systemAccountCredentials, { mode: 0o600 });
+  chmodSync(systemCredentialsPath, 0o600);
+  // resolver.json is run.sh's readiness barrier, so write it only after the
+  // credential exists with its final owner-only permissions.
   writeFileSync(
     join(NATS_CONFIG_OUT, "resolver.json"),
     JSON.stringify(natsConfig.resolverConfig, null, 2),

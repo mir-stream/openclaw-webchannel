@@ -38,6 +38,7 @@ const mockNatsConfig: NatsAccountConfig = {
   accountJwt: "MOCK_ACCOUNT_JWT",
   resolverConfig: {},
   accountPublicKey: "MOCK_ACCOUNT_PUBLIC_KEY",
+  systemAccountPublicKey: "MOCK_SYSTEM_ACCOUNT_PUBLIC_KEY",
 };
 
 const createEnrollment = (store?: EnrollmentRepository) => {

@@ -135,27 +135,8 @@ done
 # ---------------------------------------------------------------------------
 # 2. JWT-auth nats-server, built from the SAME trust chain's operator + resolver.
 # ---------------------------------------------------------------------------
-OCH="$OCH" NATS_TCP="$NATS_TCP" NATS_WS="$NATS_WS" node -e '
-  const fs = require("fs");
-  const dir = process.env.OCH;
-  const operatorJwtPath = dir + "/operator.jwt";
-  const resolver = JSON.parse(fs.readFileSync(dir + "/resolver.json", "utf8"));
-  const preload = Object.entries(resolver).map(([k, v]) => `  ${k}: "${v}"`).join("\n");
-  const conf = [
-    `port: ${process.env.NATS_TCP}`,
-    `websocket {`,
-    `  port: ${process.env.NATS_WS}`,
-    `  no_tls: true`,
-    `}`,
-    `operator: "${operatorJwtPath}"`,
-    `resolver: MEMORY`,
-    `resolver_preload: {`,
-    preload,
-    `}`,
-    "",
-  ].join("\n");
-  fs.writeFileSync(dir + "/nats.conf", conf);
-'
+NATS_CONFIG_DIR="$OCH" NATS_TCP="$NATS_TCP" NATS_WS="$NATS_WS" \
+  node --import tsx "$REPO/scripts/generate-nats-server-config.mjs"
 nats-server -c "$OCH/nats.conf" >"$OCH/nats.log" 2>&1 &
 NATS_PID=$!
 echo "[run-derived-trust] nats-server pid=$NATS_PID (JWT-auth, ws://127.0.0.1:$NATS_WS) — waiting…"

@@ -5,12 +5,13 @@
  *
  *  PRIVATE (SaaS-only):
  *   - RS256 private key (PEM) — signs bootstrap JWTs
- *   - NATS account signing seed (NKEY) — signs NATS operator/account JWTs
+ *   - NATS tenant-account signing seed (NKEY) — signs enrolled user JWTs
+ *   - NATS system-account credential — publishes runtime account-claim updates
  *
  *  PUBLIC (nats-server + JWKS endpoint):
  *   - NATS operator JWT (signed by operator NKEY)
- *   - NATS account JWT (signed by operator NKEY)
- *   - Resolver config (maps account public NKEY to account JWT)
+ *   - NATS tenant + system account JWTs (signed by operator NKEY)
+ *   - Resolver config (maps both account public NKEYs to their JWTs)
  *   - JWKS document (RSA public key for bootstrap JWT verification)
  *
  * INVARIANTS:
@@ -26,8 +27,14 @@
  *   - RFC 7518 (JWK RSA)
  */
 
-import { createOperator, createAccount, fromSeed, fromPublic } from "@nats-io/nkeys";
-import { encodeOperator, encodeAccount } from "@nats-io/jwt";
+import {
+  createOperator,
+  createAccount,
+  createUser,
+  fromSeed,
+  fromPublic,
+} from "@nats-io/nkeys";
+import { encodeOperator, encodeAccount, encodeUser, fmtCreds } from "@nats-io/jwt";
 
 import type {
   SetupTrustChainResult,
@@ -413,10 +420,10 @@ async function signRs256Jwt(
  *
  * This is the one-time offline initialization function that creates:
  *   1. RSA keypair for bootstrap JWT signing (SaaS private)
- *   2. NKEY seed for NATS account signing (SaaS private)
- *   3. NATS operator JWT (public, loaded by nats-server)
- *   4. NATS account JWT (public, loaded by nats-server)
- *   5. Resolver config (public, loaded by nats-server)
+ *   2. NKEY seed for NATS tenant user signing (SaaS private)
+ *   3. System-account update credential (SaaS private)
+ *   4. NATS operator + account JWTs (public, loaded by nats-server)
+ *   5. Resolver seed config (public, loaded by nats-server)
  *   6. JWKS document (public, hosted at SaaS JWKS endpoint)
  *
  * CONSTRAINTS:
@@ -474,7 +481,7 @@ export async function setupTrustChain(
   }
 
   // -----------------------------------------------------------------------
-  // Step 2: Generate operator + account NKEYs (ed25519, NATS standard)
+  // Step 2: Generate operator, tenant-account, and system-account NKEYs
   // -----------------------------------------------------------------------
   //
   // The operator is the trust root; the account is signed BY the operator.
@@ -483,8 +490,11 @@ export async function setupTrustChain(
 
   const operatorKp = createOperator();
   const accountKp = createAccount();
+  const systemAccountKp = createAccount();
+  const systemUserKp = createUser();
   const operatorPublicKey = operatorKp.getPublicKey();
   const natsAccountPublicKey = accountKp.getPublicKey();
+  const systemAccountPublicKey = systemAccountKp.getPublicKey();
   const natsAccountSeed = new TextDecoder().decode(accountKp.getSeed());
   const operatorSeed = new TextDecoder().decode(operatorKp.getSeed());
 
@@ -492,7 +502,9 @@ export async function setupTrustChain(
   // Step 3: Encode the operator JWT (self-signed by the operator NKEY)
   // -----------------------------------------------------------------------
 
-  const operatorJwt = await encodeOperator(operatorName, operatorKp, {});
+  const operatorJwt = await encodeOperator(operatorName, operatorKp, {
+    system_account: systemAccountPublicKey,
+  });
 
   // -----------------------------------------------------------------------
   // Step 4: Encode the account JWT (signed by the operator NKEY)
@@ -517,12 +529,46 @@ export async function setupTrustChain(
     { signer: operatorKp },
   );
 
+  // A writable full resolver accepts account-claim updates on the system
+  // account. Keep the system user intentionally narrow: it may publish only
+  // the update request and subscribe only to request/reply inboxes.
+  const systemAccountJwt = await encodeAccount(
+    `${operatorName}-system-account`,
+    systemAccountKp,
+    {
+      limits: {
+        conn: -1,
+        subs: -1,
+        data: -1,
+        payload: -1,
+        imports: -1,
+        exports: -1,
+        wildcards: true,
+        leaf: -1,
+      },
+    },
+    { signer: operatorKp },
+  );
+  const systemUserJwt = await encodeUser(
+    `${operatorName}-claims-update`,
+    systemUserKp,
+    systemAccountKp,
+    {
+      pub: { allow: ["$SYS.REQ.CLAIMS.UPDATE"] },
+      sub: { allow: ["_INBOX.>"] },
+    },
+  );
+  const systemAccountCredentials = new TextDecoder().decode(
+    fmtCreds(systemUserJwt, systemUserKp),
+  );
+
   // -----------------------------------------------------------------------
   // Step 5: Create resolver config (account NKEY → account JWT)
   // -----------------------------------------------------------------------
 
   const resolverConfig: NatsResolverConfig = {
     [natsAccountPublicKey]: accountJwt,
+    [systemAccountPublicKey]: systemAccountJwt,
   };
 
   // -----------------------------------------------------------------------
@@ -532,6 +578,7 @@ export async function setupTrustChain(
   const privateKey: SaasTrustChainPrivate = {
     rsaPrivateKeyPem: privateKeyPem,
     natsAccountSeed,
+    systemAccountCredentials,
     ...(returnOperatorSeed ? { operatorSeed } : {}),
   };
 
@@ -541,6 +588,7 @@ export async function setupTrustChain(
     accountJwt,
     resolverConfig,
     accountPublicKey: natsAccountPublicKey,
+    systemAccountPublicKey,
   };
 
   return {

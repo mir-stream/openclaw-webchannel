@@ -37,7 +37,7 @@ describe("P1-1 HTTP callers and reference approval UI", () => {
     const registry = new MemoryEnrollmentRepository();
     const enrollment = new DeviceFlowEnrollment({
       saasTrustChain: { rsaPrivateKeyPem: "TEST", natsAccountSeed: new TextDecoder().decode(account.getSeed()) },
-      natsAccountConfig: { operatorJwt: "op", accountJwt: "acct", resolverConfig: {}, accountPublicKey: "pub" },
+      natsAccountConfig: { operatorJwt: "op", accountJwt: "acct", resolverConfig: {}, accountPublicKey: "pub", systemAccountPublicKey: "sys" },
       saasBaseUrl: "https://saas", jwksUrl: "https://saas/jwks", bootstrapUrl: "https://saas/bootstrap", natsUrl: "wss://nats",
       repository: registry,
     });

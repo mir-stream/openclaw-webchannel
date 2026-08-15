@@ -33,11 +33,12 @@ Generates the complete SaaS trust-chain artifacts:
 **PRIVATE** (`SaasTrustChainPrivate`, SaaS-only infrastructure):
 - RS256 private key (PKCS#8 PEM) — signs bootstrap JWTs
 - NATS account signing seed (NKEY, `SA…`) — signs NATS operator/account JWTs
+- System-account user credential — publishes runtime account-claim updates
 
 **PUBLIC** (`NatsAccountConfig` + `JwksDocument`, for nats-server + JWKS endpoint):
 - NATS operator JWT (signed by operator NKEY)
 - NATS account JWT (signed by operator NKEY)
-- Resolver config (maps account public NKEY → account JWT; memory-resolver format)
+- Resolver seed config (maps tenant + system account NKEYs to their JWTs)
 - JWKS document (RSA public key for bootstrap-JWT verification)
 - `kid` — a UUID minted per invocation, embedded in JWT headers for JWKS lookup
 
@@ -177,7 +178,7 @@ webchannel.{tenant}.{service}.>
 
 Each tenant's permissions are bounded by its subject prefix, so cross-tenant
 access is structurally impossible. This is enforced by a **real** `nats-server`
-(memory resolver loaded from `setupTrustChain` output), not a fake broker — a
+(full/Dir resolver seeded from `setupTrustChain` output), not a fake broker — a
 tenant-A client attempting `PUB webchannel.tenant-b.outbound.test` gets a real
 `-ERR 'Permissions Violation for Publish to "webchannel.tenant-b.outbound.test"'`.
 Covered by `src/nats-permissions-realserver.test.ts` (spawns nats-server with JWT

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { loadOrCreateTrustChain } from "./persistent-trust-chain.js";
+import type { NatsSelfContainedAccountConfig } from "./types.js";
 
 describe("loadOrCreateTrustChain", () => {
   let dir: string;
@@ -23,7 +24,9 @@ describe("loadOrCreateTrustChain", () => {
     expect(existsSync(path)).toBe(true);
     expect(chain.private.rsaPrivateKeyPem).toContain("BEGIN PRIVATE KEY");
     expect(chain.private.natsAccountSeed).toBeTruthy();
+    expect(chain.private.systemAccountCredentials).toContain("BEGIN USER NKEY SEED");
     expect(chain.natsConfig.operatorJwt).toBeTruthy();
+    expect(chain.natsConfig.systemAccountPublicKey).toMatch(/^A/);
     expect(chain.kid).toBeTruthy();
   });
 
@@ -39,6 +42,7 @@ describe("loadOrCreateTrustChain", () => {
     expect(b.natsConfig.accountPublicKey).toBe(a.natsConfig.accountPublicKey);
     expect(b.private.natsAccountSeed).toBe(a.private.natsAccountSeed);
     expect(b.private.rsaPrivateKeyPem).toBe(a.private.rsaPrivateKeyPem);
+    expect(b.private.systemAccountCredentials).toBe(a.private.systemAccountCredentials);
   });
 
   it("round-trips the opt-in operatorSeed across reload (issue #7)", async () => {
@@ -57,10 +61,32 @@ describe("loadOrCreateTrustChain", () => {
     expect(b.natsConfig.accountJwt).toBe(a.natsConfig.accountJwt);
   });
 
-  it("throws loudly on a truncated/invalid persisted file", async () => {
+  it("throws loudly on a truncated or pre-system-account persisted file", async () => {
     const flat = join(dir, "trust-chain.json"); // dir already exists (mkdtemp)
     writeFileSync(flat, JSON.stringify({ private: {} }));
     await expect(loadOrCreateTrustChain(flat)).rejects.toThrow(/missing required fields/);
+
+    const legacyPath = join(dir, "legacy-trust-chain.json");
+    const legacy = await loadOrCreateTrustChain(legacyPath);
+    const systemAccount = legacy.natsConfig.systemAccountPublicKey;
+    delete legacy.private.systemAccountCredentials;
+    delete legacy.natsConfig.resolverConfig[systemAccount];
+    delete (legacy.natsConfig as Partial<NatsSelfContainedAccountConfig>)
+      .systemAccountPublicKey;
+    writeFileSync(legacyPath, JSON.stringify(legacy));
+
+    let error: unknown;
+    try {
+      await loadOrCreateTrustChain(legacyPath);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toContain(legacyPath);
+    expect(message).toContain("created without an operator seed");
+    expect(message).toContain(`delete ${legacyPath} and restart`);
+    expect(message).toContain("disposable demo/e2e chain");
   });
 
   // A3: a corrupt (non-JSON) file must fail with an actionable message, not a

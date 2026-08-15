@@ -27,19 +27,24 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { fromSeed, createUser } from "@nats-io/nkeys";
-import { encodeUser } from "@nats-io/jwt";
+import { fromPublic, fromSeed, createUser } from "@nats-io/nkeys";
+import { decode, encodeAccount, encodeUser, parseCreds } from "@nats-io/jwt";
 
 import { setupTrustChain } from "./setup-trust-chain.js";
+import { renderFullResolverNatsConfig } from "./nats-server-config.js";
 import type { SetupTrustChainResult, NatsSelfContainedAccountConfig } from "./types.js";
 import { DeviceFlowEnrollment } from "./device-flow-enrollment.js";
 import { MemoryEnrollmentRepository } from "./enrollment-repository.js";
@@ -235,6 +240,66 @@ async function connectWithJwt(
   return { ws, ready };
 }
 
+/** Send one NATS request over the already-tested raw WebSocket protocol. */
+async function requestWithJwt(
+  jwt: string,
+  seed: string,
+  subject: string,
+  payload: string,
+): Promise<string> {
+  const { ws, ready } = await connectWithJwt(jwt, seed, "claims-update");
+  await ready;
+
+  const inbox = `_INBOX.claims_update.${randomUUID().replaceAll("-", "")}`;
+  const response = new Promise<string>((resolve, reject) => {
+    let protocol = "";
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error("CLAIMS.UPDATE request timed out without a reply"));
+    }, 4000);
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      ws.off("message", onMessage);
+    };
+    const onMessage = (data: Buffer) => {
+      protocol += data.toString();
+      if (protocol.includes("-ERR")) {
+        cleanup();
+        reject(new Error(protocol.trim()));
+        return;
+      }
+
+      const marker = `MSG ${inbox} 1 `;
+      const headerStart = protocol.indexOf(marker);
+      if (headerStart < 0) return;
+      const headerEnd = protocol.indexOf("\r\n", headerStart);
+      if (headerEnd < 0) return;
+      const size = Number(protocol.slice(headerStart + marker.length, headerEnd));
+      if (!Number.isInteger(size) || size < 0) {
+        cleanup();
+        reject(new Error("CLAIMS.UPDATE reply has an invalid NATS MSG size"));
+        return;
+      }
+      const bodyStart = headerEnd + 2;
+      if (protocol.length < bodyStart + size + 2) return;
+      cleanup();
+      resolve(protocol.slice(bodyStart, bodyStart + size));
+    };
+    ws.on("message", onMessage);
+  });
+
+  ws.send(`SUB ${inbox} 1\r\n`);
+  ws.send(
+    `PUB ${subject} ${inbox} ${Buffer.byteLength(payload)}\r\n${payload}\r\nPING\r\n`,
+  );
+  try {
+    return await response;
+  } finally {
+    ws.close();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Test setup
 // ---------------------------------------------------------------------------
@@ -249,11 +314,23 @@ beforeAll(async () => {
   trustChain = await setupTrustChain({
     operatorName: "test-operator",
     accountName: "test-account",
+    returnOperatorSeed: true,
   });
 
   // Write operator JWT
   const operatorJwtPath = join(testDir, "operator.jwt");
   writeFileSync(operatorJwtPath, trustChain.natsConfig.operatorJwt);
+  const systemCredentialsPath = join(testDir, "system-account.creds");
+  if (!trustChain.private.systemAccountCredentials) {
+    throw new Error("self-contained trust chain is missing its system-account credential");
+  }
+  writeFileSync(systemCredentialsPath, trustChain.private.systemAccountCredentials, {
+    mode: 0o600,
+  });
+  chmodSync(systemCredentialsPath, 0o600);
+  if ((statSync(systemCredentialsPath).mode & 0o777) !== 0o600) {
+    throw new Error("system-account credential file is not owner-readable only");
+  }
 
   // Configure enrollment service
   enrollment = new DeviceFlowEnrollment({
@@ -266,30 +343,22 @@ beforeAll(async () => {
     natsUrl: "wss://nats.test.com",
   });
 
-  // Create nats-server config with JWT authentication. A real nats-server needs
-  // a trusted `operator` JWT plus a MEMORY resolver preloaded with each account
-  // JWT keyed by its public NKEY (not a bare file path).
-  const preload = Object.entries(trustChain.natsConfig.resolverConfig)
-    .map(([accPub, accJwt]) => `  ${accPub}: "${accJwt}"`)
-    .join("\n");
+  // Create nats-server config with JWT authentication and a writable full/Dir
+  // resolver. The directory is unique to this run, so no prior JWT can seed a
+  // false-positive test result.
+  const resolverDir = mkdtempSync(join(testDir, "resolver-jwt-"));
   const confPath = join(testDir, "nats.conf");
   writeFileSync(
     confPath,
-    [
-      `host: "127.0.0.1"`,
-      `port: -1`,
-      `websocket {`,
-      `  host: "127.0.0.1"`,
-      `  port: -1`,
-      `  no_tls: true`,
-      `}`,
-      `operator: "${operatorJwtPath}"`,
-      `resolver: MEMORY`,
-      `resolver_preload: {`,
-      preload,
-      `}`,
-      "",
-    ].join("\n"),
+    renderFullResolverNatsConfig({
+      operatorJwtPath,
+      resolverDir,
+      systemAccountPublicKey: trustChain.natsConfig.systemAccountPublicKey,
+      resolverConfig: trustChain.natsConfig.resolverConfig,
+      tcpPort: -1,
+      websocketPort: -1,
+      host: "127.0.0.1",
+    }),
   );
 
   // Start nats-server
@@ -334,6 +403,7 @@ afterAll(async () => {
     server.kill("SIGKILL");
     server = null;
   }
+  if (testDir) rmSync(testDir, { recursive: true, force: true });
   testDir = null;
   trustChain = null;
   enrollment = null;
@@ -487,9 +557,59 @@ describe.skipIf(!NATS_SERVER_BIN)(
       expect(trustChain!.natsConfig.accountJwt).toBeTruthy();
     });
 
+    it("accepts an operator-signed account JWT over $SYS.REQ.CLAIMS.UPDATE", async () => {
+      const chain = trustChain!;
+      const operatorSeed = chain.private.operatorSeed;
+      const systemCredentials = chain.private.systemAccountCredentials;
+      expect(operatorSeed).toMatch(/^SO/);
+      expect(systemCredentials).toBeTruthy();
+
+      // Ensure the replacement claim has a later `iat`, as a real control-plane
+      // update would. The payload change is deliberately non-revocation scope.
+      const original = decode(chain.natsConfig.accountJwt);
+      while (Math.floor(Date.now() / 1000) <= original.iat) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      const updatedAccountJwt = await encodeAccount(
+        "test-account",
+        fromPublic(chain.natsConfig.accountPublicKey),
+        {
+          description: "runtime resolver update acceptance probe",
+          limits: {
+            conn: -1,
+            subs: -1,
+            data: -1,
+            payload: -1,
+            imports: -1,
+            exports: -1,
+            wildcards: true,
+            leaf: -1,
+          },
+        },
+        { signer: fromSeed(new TextEncoder().encode(operatorSeed!)) },
+      );
+      expect(updatedAccountJwt).not.toBe(chain.natsConfig.accountJwt);
+
+      const credentials = await parseCreds(new TextEncoder().encode(systemCredentials!));
+      const rawReply = await requestWithJwt(
+        credentials.jwt,
+        credentials.key,
+        "$SYS.REQ.CLAIMS.UPDATE",
+        updatedAccountJwt,
+      );
+      const reply = JSON.parse(rawReply) as {
+        data?: { account?: string; code?: number; message?: string };
+      };
+      expect(reply.data).toMatchObject({
+        account: chain.natsConfig.accountPublicKey,
+        code: 200,
+        message: expect.stringMatching(/updated/i),
+      });
+    });
+
     it("a connection WITHOUT NATS credentials is refused by the JWT-auth server", async () => {
       // authN invariant (previously covered by the deleted e2e/enrolled-jwt-roundtrip.test.ts):
-      // the operator + MEMORY-resolver server grants NO anonymous access, so a CONNECT carrying
+      // the operator + full-resolver server grants NO anonymous access, so a CONNECT carrying
       // no JWT and no signature must be rejected — never flipped to connected.
       const ws = new WebSocket(wsUrl);
       const outcome = await new Promise<"refused" | "connected">((resolve, reject) => {

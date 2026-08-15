@@ -7,9 +7,9 @@
  * NATS user creds (NKEY auth fails) and every bootstrap JWT (the JWKS kid changes).
  *
  * A SetupTrustChainResult is ENTIRELY serializable (RSA private PEM, NATS account
- * seed, operator/account JWTs, resolver map, JWKS, kid) — the issuer only ever
- * needs those values, never the live nkey KeyPair objects. So persistence is
- * simply: generate once, JSON-serialize to a 0600 file, reload thereafter.
+ * seed, system credential, operator/account JWTs, resolver map, JWKS, kid) — the
+ * issuer only ever needs those values, never the live nkey KeyPair objects. So
+ * persistence is simply: generate once, JSON-serialize to a 0600 file, reload.
  */
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
@@ -163,5 +163,20 @@ function assertPersistedShape(parsed: SetupTrustChainResult, path: string): void
     !parsed.natsConfig.resolverConfig
   ) {
     throw new Error(`persisted trust chain at ${path} is missing required fields`);
+  }
+
+  const hasSystemAccount =
+    parsed.natsConfig.systemAccountPublicKey &&
+    parsed.private.systemAccountCredentials &&
+    parsed.natsConfig.resolverConfig[parsed.natsConfig.systemAccountPublicKey];
+  if (!hasSystemAccount) {
+    const cause = parsed.private.operatorSeed
+      ? "it predates system-account support, and automatic migration is intentionally disabled"
+      : "it was created without an operator seed, so it cannot sign the system account required for runtime account-claim updates";
+    throw new Error(
+      `persisted trust chain at ${path} has no usable system account: ${cause}. ` +
+        `For a disposable demo/e2e chain, delete ${path} and restart to regenerate it; ` +
+        `do not delete a production trust root as a migration strategy.`,
+    );
   }
 }
