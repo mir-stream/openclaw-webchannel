@@ -45,10 +45,11 @@ import { buildBootstrapClaims } from "../src/bootstrap-claims.js";
 import { DemoUserDirectory, seedDemoUsers, type DemoUser } from "../src/demo-users.js";
 import { mintNatsUserCreds, issueBrowserCredentials, type NatsUserRole } from "../src/nats-user-creds.js";
 import { assertValidSubjectToken } from "../src/subject-token.js";
+import { atomicWritePrivateFile } from "../src/private-file.js";
 import type { EnrollmentRequest, PollRequest } from "../src/device-flow-types.js";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { chmodSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -149,7 +150,7 @@ if (NATS_CONFIG_OUT) {
       "[nats-config] external mode — skipping operator/resolver output (Synadia hosts the server)",
     );
   } else {
-    mkdirSync(NATS_CONFIG_OUT, { recursive: true });
+    mkdirSync(NATS_CONFIG_OUT, { recursive: true, mode: 0o700 });
     const operatorJwtPath = join(NATS_CONFIG_OUT, "operator.jwt");
     const resolverPath = join(NATS_CONFIG_OUT, "resolver.json");
     const systemCredentialsPath = join(NATS_CONFIG_OUT, "system-account.creds");
@@ -157,8 +158,7 @@ if (NATS_CONFIG_OUT) {
       throw new Error("self-contained trust chain is missing its system-account credential");
     }
     writeFileSync(operatorJwtPath, mockNatsConfig.operatorJwt);
-    writeFileSync(systemCredentialsPath, mockTrustChain.systemAccountCredentials, { mode: 0o600 });
-    chmodSync(systemCredentialsPath, 0o600);
+    atomicWritePrivateFile(systemCredentialsPath, mockTrustChain.systemAccountCredentials);
     // resolver.json is the harness readiness barrier, so publish it only after
     // the private credential has been written and permission-hardened.
     writeFileSync(resolverPath, JSON.stringify(mockNatsConfig.resolverConfig, null, 2));

@@ -59,11 +59,12 @@ import {
 } from "../packages/saas/src/demo-users.js";
 import { mintNatsUserCreds, issueBrowserCredentials, type NatsUserRole } from "../packages/saas/src/nats-user-creds.js";
 import { assertValidSubjectToken } from "../packages/saas/src/subject-token.js";
+import { atomicWritePrivateFile } from "../packages/saas/src/private-file.js";
 import type { EnrollmentRequest, PollRequest } from "../packages/saas/src/device-flow-types.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createDemoEnrollmentHttpHandler } from "../packages/saas/src/enrollment-http-handler.js";
 import { serializeBootstrapResponse, serializeEnrollmentResponse } from "../packages/saas/src/p1-1-wire-adapter.js";
-import { chmodSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -194,14 +195,13 @@ const natsIssuerAccountId: string | undefined = externalNatsAccount?.accountId;
 // The system credential is written 0600 and is never logged. Only meaningful
 // for a self-contained account — a managed relay runs its own server.
 if (NATS_CONFIG_OUT && natsConfig.mode !== "external") {
-  mkdirSync(NATS_CONFIG_OUT, { recursive: true });
+  mkdirSync(NATS_CONFIG_OUT, { recursive: true, mode: 0o700 });
   if (!privateChain.systemAccountCredentials) {
     throw new Error("self-contained trust chain is missing its system-account credential");
   }
   writeFileSync(join(NATS_CONFIG_OUT, "operator.jwt"), natsConfig.operatorJwt);
   const systemCredentialsPath = join(NATS_CONFIG_OUT, "system-account.creds");
-  writeFileSync(systemCredentialsPath, privateChain.systemAccountCredentials, { mode: 0o600 });
-  chmodSync(systemCredentialsPath, 0o600);
+  atomicWritePrivateFile(systemCredentialsPath, privateChain.systemAccountCredentials);
   // resolver.json is run.sh's readiness barrier, so write it only after the
   // credential exists with its final owner-only permissions.
   writeFileSync(

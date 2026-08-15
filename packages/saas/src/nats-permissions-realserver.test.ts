@@ -69,6 +69,7 @@ import { mintNatsUserCreds } from "./nats-user-creds.js";
 import { makeNkeySigningCallback } from "../../plugin/src/nkey-sign.js";
 import { NatsTransport } from "../../plugin/src/nats-transport.js";
 import { dialRelayForPreflight } from "../../plugin/src/preflight.js";
+import { resolveWebchannelAppStatePaths } from "../../../examples/webchannel-app/server/runtime-paths.js";
 
 // ---------------------------------------------------------------------------
 // Locate the nats-server binary
@@ -704,8 +705,32 @@ describe.skipIf(!NATS_SERVER_BIN)(
     });
 
     it("preserves an accepted account claim across config regeneration and restart", async () => {
-      const configDir = join(testDir!, "resolver-restart-probe");
+      // Mirror two full example-app boots: a persisted trust chain with no
+      // explicit NATS_CONFIG_OUT must resolve to the same state root each time.
+      const explicitTrustChainPath = join(testDir!, "example-trust-chain.json");
+      const firstAppPaths = resolveWebchannelAppStatePaths(
+        { TRUST_CHAIN_PATH: explicitTrustChainPath },
+        testDir!,
+      );
+      expect(firstAppPaths.natsConfigDir).toBe(`${explicitTrustChainPath}.nats`);
+      const callerOwnedConfigDir = join(testDir!, "caller-owned-nats-config");
+      expect(
+        resolveWebchannelAppStatePaths(
+          {
+            TRUST_CHAIN_PATH: explicitTrustChainPath,
+            NATS_CONFIG_OUT: callerOwnedConfigDir,
+          },
+          testDir!,
+        ).natsConfigDir,
+      ).toBe(callerOwnedConfigDir);
+      const configDir = firstAppPaths.natsConfigDir;
       mkdirSync(configDir, { recursive: true });
+
+      const ephemeralFirst = resolveWebchannelAppStatePaths({}, testDir!);
+      const ephemeralSecond = resolveWebchannelAppStatePaths({}, testDir!);
+      expect(ephemeralFirst.ephemeralRoot).not.toBe(ephemeralSecond.ephemeralRoot);
+      expect(statSync(ephemeralFirst.ephemeralRoot!).mode & 0o777).toBe(0o700);
+      expect(statSync(ephemeralSecond.ephemeralRoot!).mode & 0o777).toBe(0o700);
 
       // This isolated chain deliberately grants lookup only to the test probe.
       // Production's temporary global-update credential remains unchanged; the
@@ -822,8 +847,13 @@ describe.skipIf(!NATS_SERVER_BIN)(
         // file: missing accounts should still be seeded without replaying the
         // older tenant claim that remains present.
         rmSync(join(firstBoot.resolverDir, `${systemAccountPublicKey}.jwt`));
+        const secondAppPaths = resolveWebchannelAppStatePaths(
+          { TRUST_CHAIN_PATH: explicitTrustChainPath },
+          testDir!,
+        );
+        expect(secondAppPaths.natsConfigDir).toBe(firstAppPaths.natsConfigDir);
         secondBoot = await startRestartProbeServer({
-          configDir,
+          configDir: secondAppPaths.natsConfigDir,
           operatorJwtPath,
           systemAccountPublicKey,
           resolverConfig,

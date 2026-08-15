@@ -152,6 +152,7 @@
     "packages/saas/src/nkey-sign-parity.test.ts": 2,
     "packages/saas/src/p1-1-http-ui-contract.test.ts": 13,
     "packages/saas/src/persistent-trust-chain.test.ts": 8,
+    "packages/saas/src/private-file.test.ts": 3,
     "packages/saas/src/setup-trust-chain.test.ts": 12,
     "packages/saas/src/subject-token.test.ts": 8,
     "scripts/test-gap-guards.test.mjs": 5

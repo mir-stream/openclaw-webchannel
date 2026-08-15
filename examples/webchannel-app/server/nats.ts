@@ -11,9 +11,10 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  atomicWritePrivateFile,
   prepareFullResolverNatsConfig,
   type NatsSelfContainedAccountConfig,
 } from "@mir-stream/webchannel-saas";
@@ -43,7 +44,7 @@ export type NatsHandle = {
  * Requires the `nats-server` binary on PATH.
  */
 export function bootNatsServer(opts: NatsBootOptions): NatsHandle {
-  mkdirSync(opts.configDir, { recursive: true });
+  mkdirSync(opts.configDir, { recursive: true, mode: 0o700 });
   const operatorJwtPath = join(opts.configDir, "operator.jwt");
   writeFileSync(operatorJwtPath, opts.natsConfig.operatorJwt);
   writeFileSync(
@@ -51,8 +52,7 @@ export function bootNatsServer(opts: NatsBootOptions): NatsHandle {
     JSON.stringify(opts.natsConfig.resolverConfig, null, 2),
   );
   const systemCredentialsPath = join(opts.configDir, "system-account.creds");
-  writeFileSync(systemCredentialsPath, opts.systemAccountCredentials, { mode: 0o600 });
-  chmodSync(systemCredentialsPath, 0o600);
+  atomicWritePrivateFile(systemCredentialsPath, opts.systemAccountCredentials);
 
   const { config: conf } = prepareFullResolverNatsConfig({
     configDir: opts.configDir,

@@ -37,6 +37,7 @@ export {
   type PrepareFullResolverNatsConfigOptions,
   type PreparedFullResolverNatsConfig,
 } from "./nats-server-config.js";
+export { atomicWritePrivateFile } from "./private-file.js";
 export {
   DeviceFlowEnrollment,
   EnrollmentValidationError,
