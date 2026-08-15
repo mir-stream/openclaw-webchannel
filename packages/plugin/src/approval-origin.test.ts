@@ -14,8 +14,8 @@
  */
 
 import { describe, it, expect, afterEach, beforeEach } from "vitest";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 
-import { canonicalizeAccountId } from "./account-config.js";
 import {
   APPROVAL_ORIGIN_REGISTRY_CONTRACT_VERSION,
   APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY,
@@ -24,8 +24,9 @@ import {
   type ApprovalOriginLease,
 } from "./approval-origin.js";
 
-const SESSION = "agent:rota:webchannel:review-agent:direct:d21d9f07";
-const OTHER_SESSION = "agent:rota:webchannel:review-agent:direct:9f07d21d";
+// Registry semantics accept an opaque tuple key; production route shape is irrelevant here.
+const SESSION = "opaque-session-key-1";
+const OTHER_SESSION = "opaque-session-key-2";
 
 type Harness = {
   registry: ApprovalOriginLeaseRegistry;
@@ -166,10 +167,10 @@ describe("ApprovalOriginLeaseRegistry — exact raw account identity", () => {
   });
 
   it("folds `-abc` and `abc` into one canonical tuple (core normalizeAccountId parity)", () => {
-    // The regression this pins: core's account normalization strips leading and
-    // trailing `-`, so these are ONE account to core. A private `toLowerCase()`
-    // collision domain would keep them apart and silently defeat the poison.
-    expect(canonicalizeAccountId("-abc")).toBe(canonicalizeAccountId("abc"));
+    // The regression this pins: the SDK folds this leading-dash spelling, so
+    // these are ONE account to core. A private `toLowerCase()` collision domain
+    // would keep them apart and silently defeat the poison.
+    expect(normalizeAccountId("-abc")).toBe(normalizeAccountId("abc"));
 
     const h = harness();
     h.set(1_010);

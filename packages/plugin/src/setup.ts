@@ -50,13 +50,13 @@
  */
 
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
   accountCredentialPath,
   assertNoRemovedAudienceConfig,
-  canonicalizeAccountId,
   loadPersistedCredentialDocument,
   readAccountsMap,
   readWebchannelSection,
@@ -295,15 +295,15 @@ function writeAccountConfig(
  */
 export const webchannelSetup = {
   /**
-   * Resolve + CANONICALIZE the account id. Returning a value here means core
-   * skips its own `normalizeAccountId`, so we MUST canonicalize ourselves — an
+   * Resolve + NORMALIZE the account id. Returning a value here means core skips
+   * its own `normalizeAccountId`, so we MUST call that SDK contract here — an
    * un-sanitized id would otherwise flow into a credential filesystem path.
-   * `canonicalizeAccountId` mirrors core's rules (lowercase, strip illegal
-   * chars, clamp 64, default to `"default"`), so a traversal sequence like
-   * `../../tmp/evil` collapses to a safe `tmp-evil`.
+   * Binding directly to `openclaw/plugin-sdk/account-id` avoids a local copy of
+   * those rules drifting; a traversal sequence like `../../tmp/evil` still
+   * collapses to a safe `tmp-evil`.
    */
   resolveAccountId: ({ accountId }: { accountId?: string }): string =>
-    canonicalizeAccountId(accountId),
+    normalizeAccountId(accountId),
 
   /**
    * Sync config WRITE: shape the account from flags.
@@ -330,9 +330,9 @@ export const webchannelSetup = {
     accountId: string;
     input: WebchannelSetupInput;
   }): OpenClawConfig => {
-    // Defensive: even though core/our resolveAccountId canonicalizes, re-derive
+    // Defensive: even though core/our resolveAccountId normalizes, re-derive
     // here so a direct/programmatic caller can never inject a raw id.
-    const id = canonicalizeAccountId(accountId);
+    const id = normalizeAccountId(accountId);
     assertNoRemovedAudienceConfig(cfg, id);
     if (Object.prototype.hasOwnProperty.call(input, "audience")) {
       throw new Error(
@@ -385,7 +385,7 @@ export const webchannelSetup = {
     input: WebchannelSetupInput;
     runtime: SetupRuntime;
   }): Promise<void> => {
-    const id = canonicalizeAccountId(accountId);
+    const id = normalizeAccountId(accountId);
 
     // Resolve the effective account config (channel-level base merged under the
     // account override), then the credential mode (config > input > enrolled).

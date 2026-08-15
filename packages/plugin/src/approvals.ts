@@ -77,6 +77,7 @@ import type {
   ChannelGatewayContext,
   ChannelOutboundPayloadHint,
 } from "openclaw/plugin-sdk/channel-runtime";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import type {
@@ -87,7 +88,6 @@ import type {
 } from "./channel-contract.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  canonicalizeAccountId,
   listWebchannelAccountIds,
   resolveWebchannelAccountConfig,
 } from "./account-config.js";
@@ -1017,8 +1017,8 @@ function resolveWebchannelFallbackOriginTarget(params: {
         // identity is the lease claim's job, and the store canonicalizes what it
         // persists anyway.
         const sameAccount =
-          canonicalizeAccountId(sessionTarget.accountId) ===
-          canonicalizeAccountId(rawHandlerAccountId);
+          normalizeAccountId(sessionTarget.accountId) ===
+          normalizeAccountId(rawHandlerAccountId);
         if (storedChannel !== WEBCHANNEL_ID || !sameAccount || !to) {
           storedBindingRejected = true;
           return null;

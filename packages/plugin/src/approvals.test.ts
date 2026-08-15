@@ -47,6 +47,8 @@ import {
   APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY,
   ApprovalOriginLeaseRegistry,
 } from "./approval-origin.js";
+import { DEFAULT_WEBCHANNEL_TENANT } from "./account-config.js";
+import { resolveWebchannelSessionRoute } from "./session-route.js";
 import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
@@ -1412,9 +1414,34 @@ describe("webchannel recently-resolved store (#19)", () => {
  * deterministically in a test.
  */
 describe("#93 origin routing — active lease + persisted session store", () => {
-  const SESSION_KEY = "agent:rota:webchannel:default:direct:d21d9f07-1f2e";
   const ORIGIN_PEER = "PeerCase-1"; // deliberately mixed case: `to` is byte-exact
   const OTHER_PEER = "PeerCase-2";
+
+  // This suite crosses the real persisted-store routing boundary, so its key
+  // comes from production derivation instead of resembling a route by hand.
+  const SESSION_KEY = resolveWebchannelSessionRoute(
+    {
+      config: { session: {} },
+      runtime: {
+        channel: {
+          routing: {
+            resolveAgentRoute: (input: any) => ({
+              agentId: "rota",
+              channel: input.channel,
+              accountId: input.accountId ?? "",
+              sessionKey: "ignored-by-webchannel-routing",
+              mainSessionKey: "agent:rota:main",
+              lastRoutePolicy: "main",
+              matchedBy: "default",
+            }),
+          },
+        },
+      },
+    } as any,
+    "default",
+    ORIGIN_PEER,
+    DEFAULT_WEBCHANNEL_TENANT,
+  ).sessionKey;
 
   const slots = globalThis as unknown as Record<symbol, unknown>;
   const capability = createClawApprovalCapability(new FakePeerChannel()) as any;
@@ -1513,6 +1540,13 @@ describe("#93 origin routing — active lease + persisted session store", () => 
       .filter((line) => line.includes("origin_unresolved"))
       .map((line) => /reason=(\w+)/.exec(line)?.[1] ?? "");
   }
+
+  it("#131: derives the persisted approval-origin key through production routing", () => {
+    expect(SESSION_KEY).toBe(
+      "agent:rota:webchannel:default:direct:peercase-1:tenant:" +
+        "91e0a4247f5124d880e9876cb8ff7fefdfd74782832996312741357aa8b7fa4e",
+    );
+  });
 
   it("recovers the exact origin peer for an all-null-metadata request (the #93 regression)", () => {
     const cfg = cfgWithStore({ [SESSION_KEY]: entry(ORIGIN_PEER, "default") });

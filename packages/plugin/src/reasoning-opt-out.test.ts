@@ -9,7 +9,8 @@ import {
   type ReasoningOptOutStoreAccess,
 } from "./reasoning-opt-out.js";
 
-const SESSION_KEY = "agent:main:webchannel:default:direct:peer";
+// This unit exercises store validation, not routing; keep the key unmistakably opaque.
+const SESSION_KEY = "opaque-session-key-1";
 const temporaryDirectories: string[] = [];
 
 function temporaryStorePath(): string {

@@ -41,6 +41,11 @@ import {
 import { dirname, isAbsolute, join } from "node:path";
 
 import {
+  DEFAULT_ACCOUNT_ID,
+  normalizeAccountId,
+} from "openclaw/plugin-sdk/account-id";
+
+import {
   assertValidAccountId,
   isBlockedAccountId,
   isValidAccountId,
@@ -63,8 +68,8 @@ import { StorageDocumentError } from "./storage-document.js";
 export { assertValidAccountId, isValidAccountId } from "./account-id.js";
 export type { PersistedEnrolledCreds } from "./credential-document.js";
 
-/** The single default account id (mirrors core's `"default"`). */
-export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = "default";
+/** The plugin's single default account id, selected from the SDK contract. */
+export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = DEFAULT_ACCOUNT_ID;
 
 /**
  * The tenant an account falls back to when neither the account config nor the
@@ -75,7 +80,11 @@ export const DEFAULT_WEBCHANNEL_ACCOUNT_ID = "default";
  */
 export const DEFAULT_WEBCHANNEL_TENANT = "default-tenant";
 
-export type InvalidAccountId = { id: string; reason: string };
+export type InvalidAccountId = {
+  id: string;
+  reason: string;
+  reasonKind: "normalized-collision" | "blocked-prototype-key" | "invalid-format";
+};
 
 export type AccountIdInspection = {
   validIds: string[];
@@ -99,41 +108,50 @@ export function inspectWebchannelAccountIds(cfg: unknown): AccountIdInspection {
     };
   }
 
+  // Normalize through the SDK contract, then reject every shared result. This
+  // is an allowlist of unique canonical identities: new core normalization
+  // behavior automatically participates instead of escaping a local pattern
+  // list. Every member is rejected so map order cannot choose the winner.
+  const idsByNormalized = new Map<string, string[]>();
+  for (const id of rawIds) {
+    const normalized = normalizeAccountId(id);
+    const aliases = idsByNormalized.get(normalized);
+    if (aliases) aliases.push(id);
+    else idsByNormalized.set(normalized, [id]);
+  }
+
+  const collisionReasonById = new Map<string, string>();
+  for (const [normalized, aliases] of idsByNormalized) {
+    if (aliases.length < 2) continue;
+    const sortedAliases = [...aliases].sort((a, b) => a.localeCompare(b));
+    const reason =
+      `the normalized account id ${formatAccountIdForLog(normalized)} is shared by ` +
+      `configured account ids ${JSON.stringify(sortedAliases)}`;
+    for (const id of aliases) collisionReasonById.set(id, reason);
+  }
+
   const validIds: string[] = [];
   const invalid: InvalidAccountId[] = [];
   for (const id of rawIds) {
-    if (isValidAccountId(id)) validIds.push(id);
-    else {
+    const collisionReason = collisionReasonById.get(id);
+    if (collisionReason !== undefined) {
+      invalid.push({ id, reason: collisionReason, reasonKind: "normalized-collision" });
+    } else if (isValidAccountId(id)) {
+      validIds.push(id);
+    } else {
+      const blocked = isBlockedAccountId(id);
       invalid.push({
         id,
-        reason: isBlockedAccountId(id)
+        reason: blocked
           ? "the id is a blocked prototype key"
           : "the id must match /^[A-Za-z0-9_-]{1,64}$/",
+        reasonKind: blocked ? "blocked-prototype-key" : "invalid-format",
       });
     }
   }
   validIds.sort((a, b) => a.localeCompare(b));
   invalid.sort((a, b) => a.id.localeCompare(b.id));
   return { validIds, invalid, usesImplicitDefault: false };
-}
-
-/**
- * Core-compatible canonicalization (mirrors openclaw's `normalizeAccountId`):
- * lowercase, replace runs of invalid chars with `-`, strip leading/trailing
- * `-`, clamp to 64 chars, default to `"default"` when empty. Use this when
- * accepting an operator-supplied id (e.g. `channels add --account …`) so the
- * stored id matches what core would store and can never be a traversal sequence.
- */
-export function canonicalizeAccountId(value: string | undefined | null): string {
-  const trimmed = (value ?? "").trim().toLowerCase();
-  if (!trimmed) return DEFAULT_WEBCHANNEL_ACCOUNT_ID;
-  const canonical = trimmed
-    .replace(/[^a-z0-9_-]+/g, "-")
-    .replace(/^-+/, "")
-    .replace(/-+$/, "")
-    .slice(0, 64);
-  if (!canonical || isBlockedAccountId(canonical)) return DEFAULT_WEBCHANNEL_ACCOUNT_ID;
-  return canonical;
 }
 
 /** Per-account config keys whose nested object values are shallow-merged. */

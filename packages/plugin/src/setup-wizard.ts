@@ -36,12 +36,13 @@ import type {
   ChannelSetupWizard,
   ChannelSetupWizardTextInput,
 } from "openclaw/plugin-sdk/setup";
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 
 import { WEBCHANNEL_ID } from "./channel-contract.js";
 import {
   DEFAULT_WEBCHANNEL_ACCOUNT_ID,
-  canonicalizeAccountId,
   formatAccountIdForLog,
+  inspectWebchannelAccountIds,
   isValidAccountId,
   loadPersistedCredentialDocument,
   resolveAcquisitionIdentity,
@@ -106,7 +107,7 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     unconfiguredLabel: "not configured",
     resolveConfigured: ({ cfg, accountId }) => {
       const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
-      if (!isValidAccountId(id)) return false;
+      if (!inspectWebchannelAccountIds(cfg).validIds.includes(id)) return false;
       const account = resolveWebchannelAccountConfig(cfg, id);
       let mode: "static" | "enrolled";
       try {
@@ -151,6 +152,15 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
     },
     resolveStatusLines: ({ cfg, accountId, configured }) => {
       const id = accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID;
+      const inspectedInvalid = inspectWebchannelAccountIds(cfg).invalid.find(
+        (candidate) => candidate.id === id,
+      );
+      if (inspectedInvalid) {
+        return [
+          `WebChannel (${formatAccountIdForLog(id)}): not configured — ` +
+            `invalid account id; ${inspectedInvalid.reason}`,
+        ];
+      }
       if (!isValidAccountId(id)) {
         return [
           `WebChannel (${formatAccountIdForLog(id)}): not configured — ` +
@@ -210,9 +220,9 @@ export const webchannelSetupWizard: ChannelSetupWizard = {
       // non-interactive harness) — nothing enroll-ready to write.
       return { cfg };
     }
-    // Canonicalize before writing: the canonical account id is also the JWT
+    // Normalize before writing: the normalized account id is also the JWT
     // audience expected by the runtime verifier.
-    const id = canonicalizeAccountId(accountId);
+    const id = normalizeAccountId(accountId);
     const next = webchannelSetup.applyAccountConfig({
       cfg,
       accountId: id,
