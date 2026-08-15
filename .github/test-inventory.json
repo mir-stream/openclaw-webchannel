@@ -72,7 +72,7 @@
     "packages/plugin/src/history-sanitize.test.ts": 32,
     "packages/plugin/src/history-store.test.ts": 20,
     "packages/plugin/src/history-utterance-correspondence.test.ts": 9,
-    "packages/plugin/src/history.test.ts": 46,
+    "packages/plugin/src/history.test.ts": 47,
     "packages/plugin/src/inbound-debounce.test.ts": 6,
     "packages/plugin/src/inbound-overflow-resolver.test.ts": 9,
     "packages/plugin/src/inbound-pressure-log.test.ts": 1,

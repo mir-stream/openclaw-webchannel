@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  _resetHistoryShapeDriftWarningForTest,
+  _resetHistoryWarningLatchesForTest,
   recent,
   pageBefore,
   planHistoryFetch,
@@ -15,7 +15,7 @@ const SESSION_KEY = "opaque-session-key-1";
 const OTHER_SESSION_KEY = "opaque-session-key-2";
 
 beforeEach(() => {
-  _resetHistoryShapeDriftWarningForTest();
+  _resetHistoryWarningLatchesForTest();
 });
 
 /**
@@ -305,7 +305,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
   });
 
-  it("diagnoses a window-relative synthetic cursor miss without logging cursor, session, or text", async () => {
+  it("diagnoses repeated window-relative synthetic cursor misses once without logging private context", async () => {
     const { api } = makeApi(makeIdlessConversation(30));
     const narrow = await recent(api, SESSION_KEY, 10);
     const cursor = narrow[0].id;
@@ -317,6 +317,7 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // tail window, so this cursor cannot be resolved by either paging phase.
     expect(cursor).toMatch(/^h-\d+-\d+$/);
     expect(sameMessageWideId).not.toBe(cursor);
+    expect(await pageBefore(api, SESSION_KEY, cursor, 2, logger)).toEqual([]);
     expect(await pageBefore(api, SESSION_KEY, cursor, 2, logger)).toEqual([]);
 
     expect(logger.warn).toHaveBeenCalledOnce();
@@ -358,11 +359,12 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     },
   );
 
-  it("classifies a final opaque cursor miss", async () => {
+  it("classifies repeated final opaque cursor misses once", async () => {
     const cursor = "ghost";
     const { api } = makeApi(FIXTURE);
     const logger = { warn: vi.fn() };
 
+    expect(await pageBefore(api, SESSION_KEY, cursor, 600, logger)).toEqual([]);
     expect(await pageBefore(api, SESSION_KEY, cursor, 600, logger)).toEqual([]);
 
     expect(logger.warn).toHaveBeenCalledOnce();
@@ -371,6 +373,24 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     expect(warning).toContain("cause=unknown");
     expect(warning).not.toContain(cursor);
     expect(warning).not.toContain(SESSION_KEY);
+  });
+
+  it("allows one cursor-miss warning for each kind without consuming latches when no logger exists", async () => {
+    const syntheticCursor = "h-1700000000000-3";
+    const opaqueCursor = "ghost";
+    const { api } = makeApi(FIXTURE);
+
+    expect(await pageBefore(api, SESSION_KEY, syntheticCursor, 600)).toEqual([]);
+    expect(await pageBefore(api, SESSION_KEY, opaqueCursor, 600)).toEqual([]);
+
+    const logger = { warn: vi.fn() };
+    expect(await pageBefore(api, SESSION_KEY, syntheticCursor, 600, logger)).toEqual([]);
+    expect(await pageBefore(api, SESSION_KEY, opaqueCursor, 600, logger)).toEqual([]);
+
+    expect(logger.warn.mock.calls.map(([warning]) => warning)).toEqual([
+      "webchannel: history.pageBefore cursor miss; cursorKind=window-relative-synthetic cause=window-relative-synthetic-id",
+      "webchannel: history.pageBefore cursor miss; cursorKind=opaque cause=unknown",
+    ]);
   });
 
   it("finds a cursor beyond the phase-1 window via the phase-2 1000-fetch", async () => {

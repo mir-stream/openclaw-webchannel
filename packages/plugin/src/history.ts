@@ -60,6 +60,8 @@ type LoggerLike = {
   error?: (message: string) => void;
 };
 
+type CursorKind = "window-relative-synthetic" | "opaque";
+
 type RawSessionMessage = {
   role?: unknown;
   content?: unknown;
@@ -75,10 +77,12 @@ type RawSessionMessage = {
  * undeclared shape.
  */
 let shapeDriftWarned = false;
+const cursorMissWarnedKinds = new Set<CursorKind>();
 
-/** @internal Test-only: reset the process-wide shape-drift warning latch. */
-export function _resetHistoryShapeDriftWarningForTest(): void {
+/** @internal Test-only: reset all process-wide history diagnostic latches. */
+export function _resetHistoryWarningLatchesForTest(): void {
   shapeDriftWarned = false;
+  cursorMissWarnedKinds.clear();
 }
 
 const WINDOW_RELATIVE_SYNTHETIC_ID_PATTERN =
@@ -315,8 +319,6 @@ export function planHistoryFetch(
  */
 const MAX_FETCH_WINDOW = 1000;
 
-type CursorKind = "window-relative-synthetic" | "opaque";
-
 /** Positive recognition of the window-relative synthetic id form this module emits. */
 function classifyCursorKind(cursor: string): CursorKind {
   if (isWindowRelativeSyntheticId(cursor)) {
@@ -328,6 +330,10 @@ function classifyCursorKind(cursor: string): CursorKind {
 function warnCursorMiss(logger: LoggerLike | undefined, beforeId: string): void {
   if (typeof logger?.warn !== "function") return;
   const cursorKind = classifyCursorKind(beforeId);
+  if (cursorMissWarnedKinds.has(cursorKind)) return;
+  // Publish before entering external code so a throwing or reentrant logger
+  // cannot amplify this diagnostic.
+  cursorMissWarnedKinds.add(cursorKind);
   try {
     if (cursorKind === "window-relative-synthetic") {
       logger.warn(
