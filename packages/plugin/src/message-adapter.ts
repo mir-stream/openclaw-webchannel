@@ -13,7 +13,6 @@ import type {
   ChannelProgressDraftLineInput,
 } from "openclaw/plugin-sdk/channel-outbound";
 import {
-  findCodeRegions,
   stripReasoningTagsFromText,
   stripInlineDirectiveTagsForDelivery,
 } from "openclaw/plugin-sdk/text-chunking";
@@ -383,14 +382,13 @@ function classifyMemoryMarkerAt(
 function classifyAngleMarkerAt(
   text: string,
   start: number,
-  nextModelBoundary: Int32Array,
+  nextModelPipe: Int32Array,
 ): "incomplete" | "exact" | undefined {
   if (text[start] !== "<") return undefined;
   const afterOpen = text[start + 1];
   if (MODEL_PIPE_CHARS.has(afterOpen ?? "")) {
-    const closePipe = nextModelBoundary[start + 2] ?? -1;
+    const closePipe = nextModelPipe[start + 2] ?? -1;
     if (closePipe < 0) return "incomplete";
-    if (!MODEL_PIPE_CHARS.has(text[closePipe] ?? "")) return undefined;
     const afterClose = text[closePipe + 1];
     if (afterClose === undefined) return "incomplete";
     return afterClose === ">" ? "exact" : undefined;
@@ -424,24 +422,20 @@ function classifyAngleMarkerAt(
 
 /** One bounded linear scan; no candidate rescans a suffix or sanitizer stage. */
 function scanAngleMarkers(text: string): AngleMarkerScan {
-  const codeRegions = findCodeRegions(text);
-  const nextModelBoundary = new Int32Array(text.length + 1);
-  let nextBoundary = -1;
-  nextModelBoundary[text.length] = -1;
+  const firstAngle = text.indexOf("<");
+  if (firstAngle < 0) return {};
+
+  const nextModelPipe = new Int32Array(text.length + 1);
+  let nextPipe = -1;
+  nextModelPipe[text.length] = -1;
   for (let index = text.length - 1; index >= 0; index -= 1) {
-    if (MODEL_PIPE_CHARS.has(text[index] ?? "") || text[index] === ">") {
-      nextBoundary = index;
-    }
-    nextModelBoundary[index] = nextBoundary;
+    if (MODEL_PIPE_CHARS.has(text[index] ?? "")) nextPipe = index;
+    nextModelPipe[index] = nextPipe;
   }
 
   const result: AngleMarkerScan = {};
-  let codeIndex = 0;
-  for (let start = text.indexOf("<"); start >= 0; start = text.indexOf("<", start + 1)) {
-    while (codeRegions[codeIndex] && codeRegions[codeIndex]!.end <= start) codeIndex += 1;
-    const region = codeRegions[codeIndex];
-    if (region && region.start <= start && start < region.end) continue;
-    const classification = classifyAngleMarkerAt(text, start, nextModelBoundary);
+  for (let start = firstAngle; start >= 0; start = text.indexOf("<", start + 1)) {
+    const classification = classifyAngleMarkerAt(text, start, nextModelPipe);
     if (!classification) continue;
     const candidate = { start, exact: classification === "exact" };
     result.first ??= candidate;
@@ -470,7 +464,12 @@ function buildDeferredAngleMarkerTail(
 function deferAngleMarkerTail(
   text: string,
   previous?: DeferredAngleMarkerTail,
-): { visibleText: string; deferred?: DeferredAngleMarkerTail; alreadyQuarantined?: boolean } {
+): {
+  visibleText: string;
+  deferred?: DeferredAngleMarkerTail;
+  alreadyQuarantined?: boolean;
+  restart?: boolean;
+} {
   if (previous?.exact) {
     return { visibleText: previous.sourcePrefix, deferred: previous, alreadyQuarantined: true };
   }
@@ -479,6 +478,12 @@ function deferAngleMarkerTail(
   if (previous) {
     const anchor = previous.sourcePrefix.length;
     if (!text.startsWith(previous.probeSource)) {
+      const cleanPrefix = cleanPartialAnswerText(previous.sourcePrefix).trimEnd();
+      const keepsSafePrefix =
+        previous.sourcePrefix.length === 0 ||
+        text.startsWith(previous.sourcePrefix) ||
+        (cleanPrefix.length > 0 && cleanPartialAnswerText(text).startsWith(cleanPrefix));
+      if (!keepsSafePrefix) return { visibleText: text, restart: true };
       return {
         visibleText: previous.sourcePrefix,
         deferred: buildDeferredAngleMarkerTail(text, previous.sourcePrefix, true),
@@ -1690,6 +1695,7 @@ export function createProgressDraftController(params: {
           if (
             update.replace !== true &&
             !deferredResult.deferred &&
+            !deferredResult.restart &&
             lane.answerText.length > 0 &&
             lane.answerText.startsWith(cleaned) &&
             cleaned.length < lane.answerText.length
@@ -1722,8 +1728,9 @@ export function createProgressDraftController(params: {
             update.replace !== true &&
             !deferredResult.deferred &&
             lane.answerText.length > 0 &&
-            !cleaned.startsWith(lane.answerText) &&
-            !visibleRaw.startsWith(lane.lastRawAnswerText)
+            (deferredResult.restart === true ||
+              (!cleaned.startsWith(lane.answerText) &&
+                !visibleRaw.startsWith(lane.lastRawAnswerText)))
           ) {
             warn(
               `contract violation: cumulative partial diverged without an assistant-message ` +
