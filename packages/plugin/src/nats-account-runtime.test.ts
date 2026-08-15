@@ -16,7 +16,6 @@ import {
   AccountRunFailure,
   AccountPermanentFailureReporter,
   AccountServingAggregateTracker,
-  ConversationKeyBootRotationGate,
   NatsAccountRuntimeCoordinator,
   accountNeverServedStatusPatch,
   accountTransportStatusPatch,
@@ -92,32 +91,6 @@ const tick = async () => {
   await Promise.resolve();
 };
 
-describe("conversation-key boot rotation lifecycle gate", () => {
-  it("claims exactly once across three startup retry attempts", () => {
-    const gate = new ConversationKeyBootRotationGate(true);
-    expect([gate.claim(), gate.claim(), gate.claim()]).toEqual([
-      true,
-      false,
-      false,
-    ]);
-  });
-
-  it("never claims when the opt-in is omitted or false", () => {
-    const gate = new ConversationKeyBootRotationGate(false);
-    expect(gate.claim()).toBe(false);
-    expect(gate.claim()).toBe(false);
-  });
-
-  it("a new account lifecycle gets one fresh claim", () => {
-    const firstLifecycle = new ConversationKeyBootRotationGate(true);
-    expect(firstLifecycle.claim()).toBe(true);
-    expect(firstLifecycle.claim()).toBe(false);
-
-    const restartedLifecycle = new ConversationKeyBootRotationGate(true);
-    expect(restartedLifecycle.claim()).toBe(true);
-  });
-});
-
 describe("account startup failure classification", () => {
   it("classifies structured DNS, HTTP, NATS, timeout, abort, and TLS failures", () => {
     expect(classifyAccountStartupFailure(Object.assign(new Error(), { code: "ENOTFOUND" })).kind).toBe("transient");
@@ -168,36 +141,6 @@ describe("account startup failure classification", () => {
 });
 
 describe("account startup attempt transaction", () => {
-  it("runs the boot-rotation claim once even when startup succeeds on attempt three", async () => {
-    const gate = new ConversationKeyBootRotationGate(true);
-    let attempts = 0;
-    let rotationRuns = 0;
-    const result = await runAccountStartupLoop({
-      signal: new AbortController().signal,
-      random: () => 0,
-      delay: async () => {},
-      attempt: async ({ markCommitted }) => {
-        attempts += 1;
-        if (gate.claim()) rotationRuns += 1;
-        if (attempts < 3) {
-          return {
-            kind: "failed",
-            cause: Object.assign(new Error("relay down"), {
-              code: "ECONNREFUSED",
-            }),
-            closeReport: closed(),
-          };
-        }
-        markCommitted();
-        return { kind: "completed", closeReport: closed() };
-      },
-    });
-
-    expect(result).toEqual(closed());
-    expect(attempts).toBe(3);
-    expect(rotationRuns).toBe(1);
-  });
-
   it("recovers after two transient failures with one fresh jitter delay per failed attempt", async () => {
     const events: string[] = [];
     const delays: number[] = [];

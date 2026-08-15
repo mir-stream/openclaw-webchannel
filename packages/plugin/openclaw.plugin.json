@@ -37,17 +37,6 @@
             "minLength": 1,
             "description": "Absolute common local base directory for tuple-scoped credentials and conversation keys. Relative paths are rejected rather than resolved against the process working directory. Each account uses an opaque namespace derived from the exact (tenant, accountId). This does not change the meaning of an exact credentialPath API override."
           },
-          "conversationKeys": {
-            "type": "object",
-            "additionalProperties": false,
-            "description": "Conversation-key lifecycle policy. Omission keeps boot rotation off.",
-            "properties": {
-              "rotateOnBoot": {
-                "type": "boolean",
-                "description": "Rotate every durable peer conversation key once per account lifecycle before register admission begins. Defaults off when omitted. Partial failures are logged and do not block gateway startup."
-              }
-            }
-          },
           "saas": {
             "type": "object",
             "additionalProperties": false,
@@ -303,10 +292,6 @@
         },
         "allowFrom": {
           "label": "Allowed user ids"
-        },
-        "conversationKeys.rotateOnBoot": {
-          "label": "Rotate keys on boot",
-          "help": "Opt in to rotating each durable peer conversation key once per account lifecycle before register admission. Omitted means off. A failed peer rotation is logged and does not block the remaining peers or gateway startup."
         },
         "streaming.mode": {
           "label": "Streaming mode",

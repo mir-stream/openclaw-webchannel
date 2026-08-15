@@ -164,7 +164,6 @@ const NESTED_OBJECT_KEYS = [
   "streaming",
   "execApprovals",
   "encryption",
-  "conversationKeys",
 ] as const;
 
 /**
@@ -503,38 +502,6 @@ export function resolveReasoningEnabled(accountConfig: WebchannelAccountConfig):
   // `undefined` fails closed rather than being confused with omission.
   if (!Object.prototype.hasOwnProperty.call(capabilities, "reasoning")) return true;
   return (capabilities as { reasoning?: unknown }).reasoning === true;
-}
-
-/**
- * Resolve the opt-in conversation-key boot rotation policy.
- *
- * DEFAULT OFF is represented by omission, not a schema default. Named-account
- * leaves bypass the channel-level schema, so only a plain container with an own
- * literal boolean `true` enables this destructive availability boundary. Every
- * malformed or merely truthy spelling fails closed to OFF.
- */
-export function resolveConversationKeyRotateOnBoot(
-  accountConfig: WebchannelAccountConfig,
-): boolean {
-  const conversationKeys = accountConfig?.conversationKeys;
-  if (
-    conversationKeys === null ||
-    typeof conversationKeys !== "object" ||
-    Array.isArray(conversationKeys)
-  ) {
-    return false;
-  }
-  const prototype = Object.getPrototypeOf(conversationKeys);
-  if (prototype !== Object.prototype && prototype !== null) return false;
-  if (
-    !Object.prototype.hasOwnProperty.call(
-      conversationKeys,
-      "rotateOnBoot",
-    )
-  ) {
-    return false;
-  }
-  return (conversationKeys as { rotateOnBoot?: unknown }).rotateOnBoot === true;
 }
 
 /** Read an account's merged `nats` config block (for credential-source resolution). */

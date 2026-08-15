@@ -15,7 +15,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ConversationKeyGenerationCapacityError,
   ConversationKeyStore,
-  type ConversationKeyBootRotationReport,
   type ConversationKeyStoreOptions,
 } from "./conversation-key-store.js";
 import {
@@ -418,119 +417,6 @@ describe("direct rotate five crash contracts", () => {
     expect(sameBytes(store.get(PEER)!, result.key)).toBe(true);
     expect(sameBytes(durableKey(), result.key)).toBe(true);
     expect(durableGenerations().get(PEER)?.epoch).toBe(2);
-  });
-});
-
-describe("boot rotate five crash contracts", () => {
-  function boot(
-    options: Partial<ConversationKeyStoreOptions> = {},
-  ): { store: ConversationKeyStore; report: ConversationKeyBootRotationReport } {
-    let report: ConversationKeyBootRotationReport | undefined;
-    const store = createStore({
-      rotateOnBoot: true,
-      onBootRotationReport: (value) => {
-        report = value;
-      },
-      ...options,
-    });
-    expect(report).toBeDefined();
-    return { store, report: report! };
-  }
-
-  it("1: candidate failure is reported and startup receives the old key", () => {
-    const seeded = seedPeer();
-    const { store, report } = boot({
-      _randomBytes: () => {
-        throw new Error("injected random failure");
-      },
-    });
-    expect(report).toEqual({
-      totalPeers: 1,
-      rotatedPeers: 0,
-      failedPeers: 1,
-      discoveryFailed: false,
-    });
-    expectOnlyOldKey(store, seeded.key, seeded.keyBytes);
-  });
-
-  it("2: generation failure is reported before key mutation", () => {
-    const seeded = seedPeer();
-    const { store, report } = boot({
-      _beforeGenerationPersist: () => {
-        throw new Error("injected generation failure");
-      },
-    });
-    expect(report.failedPeers).toBe(1);
-    expectOnlyOldKey(store, seeded.key, seeded.keyBytes);
-    expect(
-      readFileSync(paths().conversationKeyGenerationsPath).equals(
-        seeded.generationBytes,
-      ),
-    ).toBe(true);
-  });
-
-  it("3: key failure reports sidecar-ahead while startup keeps K_old", () => {
-    const seeded = seedPeer();
-    const { store, report } = boot({
-      _beforePersist: () => {
-        throw new Error("injected key failure");
-      },
-    });
-    expect(report.failedPeers).toBe(1);
-    expectOnlyOldKey(store, seeded.key, seeded.keyBytes);
-    expect(durableGenerations().get(PEER)?.epoch).toBe(2);
-  });
-
-  it("4: post-key-rename failure is reported and startup reloads K_new", () => {
-    const seeded = seedPeer();
-    const { store, report } = boot({
-      _beforeCachePublish: () => {
-        throw new Error("simulated post-key-rename crash");
-      },
-    });
-    expect(report.failedPeers).toBe(1);
-    const newKey = durableKey();
-    expect(sameBytes(newKey, seeded.key)).toBe(false);
-    expect(sameBytes(store.get(PEER)!, newKey)).toBe(true);
-    expect(durableGenerations().get(PEER)?.epoch).toBe(2);
-  });
-
-  it("5: successful boot publishes K_new and a complete aggregate", () => {
-    const seeded = seedPeer();
-    const { store, report } = boot();
-    expect(report).toEqual({
-      totalPeers: 1,
-      rotatedPeers: 1,
-      failedPeers: 0,
-      discoveryFailed: false,
-    });
-    const newKey = durableKey();
-    expect(sameBytes(newKey, seeded.key)).toBe(false);
-    expect(sameBytes(store.get(PEER)!, newKey)).toBe(true);
-  });
-
-  it("continues after one peer fails and never exposes a public account-wide method", () => {
-    const seeded = createStore();
-    const oldA = seeded.getOrCreate("peer-a");
-    const oldB = seeded.getOrCreate("peer-b");
-    let generationWrites = 0;
-    const { store, report } = boot({
-      _beforeGenerationPersist: () => {
-        generationWrites += 1;
-        if (generationWrites === 1) throw new Error("first peer fails");
-      },
-    });
-
-    expect(report).toEqual({
-      totalPeers: 2,
-      rotatedPeers: 1,
-      failedPeers: 1,
-      discoveryFailed: false,
-    });
-    expect(sameBytes(store.get("peer-a")!, oldA)).toBe(true);
-    expect(sameBytes(store.get("peer-b")!, oldB)).toBe(false);
-    expect("rotateAll" in store).toBe(false);
-    expect("rotateAccount" in store).toBe(false);
   });
 });
 

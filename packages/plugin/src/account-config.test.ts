@@ -22,7 +22,6 @@ import {
   resolveAccountNatsConfig,
   resolveTypingEnabled,
   resolveReasoningEnabled,
-  resolveConversationKeyRotateOnBoot,
   readAccountsMap,
   readWebchannelSection,
   accountCredentialPath,
@@ -349,86 +348,6 @@ describe("account-config: resolveReasoningEnabled (#113)", () => {
     expect(resolveTypingEnabled({ capabilities: { reasoning: false } })).toBe(true);
     expect(resolveReasoningEnabled({ capabilities: { reasoning: "on" } })).toBe(false);
     expect(resolveTypingEnabled({ capabilities: { typing: "on" } })).toBe(true);
-  });
-});
-
-describe("account-config: resolveConversationKeyRotateOnBoot (#149)", () => {
-  it("defaults OFF only through omission", () => {
-    expect(resolveConversationKeyRotateOnBoot({})).toBe(false);
-    expect(resolveConversationKeyRotateOnBoot({ conversationKeys: {} })).toBe(false);
-  });
-
-  it("enables only an own literal boolean true", () => {
-    expect(
-      resolveConversationKeyRotateOnBoot({
-        conversationKeys: { rotateOnBoot: true },
-      }),
-    ).toBe(true);
-    for (const value of [false, "true", "on", 1, 0, null, {}, [], undefined]) {
-      expect(
-        resolveConversationKeyRotateOnBoot({
-          conversationKeys: { rotateOnBoot: value },
-        }),
-        `rotateOnBoot: ${JSON.stringify(value)} must resolve OFF`,
-      ).toBe(false);
-    }
-  });
-
-  it("fails closed for malformed named-account containers", () => {
-    for (const conversationKeys of [null, true, "on", 1, [], new Date(0)]) {
-      expect(
-        resolveConversationKeyRotateOnBoot({ conversationKeys }),
-        `conversationKeys: ${String(conversationKeys)} must resolve OFF`,
-      ).toBe(false);
-    }
-  });
-
-  it("inherits and overrides the channel-level policy through the nested merge", () => {
-    const inherited = {
-      channels: {
-        webchannel: {
-          conversationKeys: { rotateOnBoot: true },
-          accounts: { named: { tenant: "t" } },
-        },
-      },
-    };
-    expect(
-      resolveConversationKeyRotateOnBoot(
-        resolveWebchannelAccountConfig(inherited, "named"),
-      ),
-    ).toBe(true);
-
-    const overridden = {
-      channels: {
-        webchannel: {
-          conversationKeys: { rotateOnBoot: true },
-          accounts: {
-            named: { conversationKeys: { rotateOnBoot: false } },
-          },
-        },
-      },
-    };
-    expect(
-      resolveConversationKeyRotateOnBoot(
-        resolveWebchannelAccountConfig(overridden, "named"),
-      ),
-    ).toBe(false);
-
-    const malformedOverride = {
-      channels: {
-        webchannel: {
-          conversationKeys: { rotateOnBoot: true },
-          accounts: {
-            named: { conversationKeys: "truthy-but-invalid" },
-          },
-        },
-      },
-    };
-    expect(
-      resolveConversationKeyRotateOnBoot(
-        resolveWebchannelAccountConfig(malformedOverride, "named"),
-      ),
-    ).toBe(false);
   });
 });
 

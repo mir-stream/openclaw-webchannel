@@ -70,13 +70,6 @@ export type ConversationKeyRotationResult = ConversationKeyGeneration & {
   key: Uint8Array;
 };
 
-export type ConversationKeyBootRotationReport = Readonly<{
-  totalPeers: number;
-  rotatedPeers: number;
-  failedPeers: number;
-  discoveryFailed: boolean;
-}>;
-
 /**
  * S2 posture: ceiling on stored keys per account. peerIds on the register path
  * come from verified JWT `sub` claims, so real growth is bounded by real users;
@@ -104,10 +97,6 @@ export type ConversationKeyStoreOptions = {
   maxKeys?: number;
   /** Best-effort operational signal; does not alter the fixed ceiling. */
   onCapacityWarning?: (status: CapacityStatus) => void;
-  /** Rotate every durable peer once while this store is being bootstrapped. */
-  rotateOnBoot?: boolean;
-  /** @internal Content-free boot result sink used by the account runtime. */
-  onBootRotationReport?: (report: ConversationKeyBootRotationReport) => void;
   /** @internal Test-only failure seam before a key-document atomic write. */
   _beforePersist?: () => void;
   /** @internal Test-only failure seam before a generation atomic write. */
@@ -172,9 +161,6 @@ export class ConversationKeyStore {
   private readonly beforeCachePublish?: () => void;
   private readonly randomKeyBytes: (size: number) => Uint8Array;
   private readonly nowSec: () => number;
-  private readonly onBootRotationReport?: (
-    report: ConversationKeyBootRotationReport,
-  ) => void;
   /** Lazily loaded on first access. Entries are never removed by this store. */
   private keys: Map<string, Uint8Array> | null = null;
   private capacityWarningEmitted = false;
@@ -215,11 +201,6 @@ export class ConversationKeyStore {
     this.beforeCachePublish = options._beforeCachePublish;
     this.randomKeyBytes = options._randomBytes ?? ((size) => randomBytes(size));
     this.nowSec = options._nowSec ?? (() => Math.floor(Date.now() / 1_000));
-    this.onBootRotationReport = options.onBootRotationReport;
-
-    if (options.rotateOnBoot === true) {
-      this.publishBootRotationReport(this.rotateStoredPeersOnBoot());
-    }
   }
 
   /**
@@ -539,59 +520,6 @@ export class ConversationKeyStore {
     }
   }
 
-  private rotateStoredPeersOnBoot(): ConversationKeyBootRotationReport {
-    let peerIds: string[];
-    try {
-      this.prepareMigration();
-      peerIds = [...this.readFresh().keys()];
-    } catch {
-      return Object.freeze({
-        totalPeers: 0,
-        rotatedPeers: 0,
-        failedPeers: 0,
-        discoveryFailed: true,
-      });
-    }
-
-    let rotatedPeers = 0;
-    let failedPeers = 0;
-    for (const peerId of peerIds) {
-      try {
-        this.rotate(peerId);
-        rotatedPeers += 1;
-      } catch {
-        // Boot rotation deliberately promises no account-wide atomicity. One
-        // peer's failed commit is visible in the aggregate but cannot block the
-        // remaining peers or gateway startup.
-        failedPeers += 1;
-      }
-    }
-    return Object.freeze({
-      totalPeers: peerIds.length,
-      rotatedPeers,
-      failedPeers,
-      discoveryFailed: false,
-    });
-  }
-
-  private publishBootRotationReport(
-    report: ConversationKeyBootRotationReport,
-  ): void {
-    try {
-      if (this.onBootRotationReport) {
-        this.onBootRotationReport(report);
-        return;
-      }
-      console.warn(formatBootRotationReport(report));
-    } catch {
-      try {
-        console.warn(formatBootRotationReport(report));
-      } catch {
-        // Diagnostics never alter durable key state or gateway startup.
-      }
-    }
-  }
-
   private makeRandomKey(): Uint8Array {
     const bytes = new Uint8Array(this.randomKeyBytes(CONVERSATION_KEY_BYTES));
     if (bytes.length !== CONVERSATION_KEY_BYTES) {
@@ -685,21 +613,6 @@ function nextEpoch(epoch: number): number {
     );
   }
   return epoch + 1;
-}
-
-function formatBootRotationReport(
-  report: ConversationKeyBootRotationReport,
-): string {
-  const state = report.discoveryFailed
-    ? "discovery_failed"
-    : report.failedPeers > 0
-      ? "partial"
-      : "complete";
-  return (
-    `[conversation-key-store] event=boot-rotation state=${state} ` +
-    `total=${report.totalPeers} rotated=${report.rotatedPeers} ` +
-    `failed=${report.failedPeers}`
-  );
 }
 
 function isEnoent(err: unknown): boolean {
