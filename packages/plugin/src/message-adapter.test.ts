@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
 import { sanitizeAssistantVisibleStreamText } from "openclaw/plugin-sdk/agent-runtime";
-import { sanitizeAssistantVisibleText } from "openclaw/plugin-sdk/text-chunking";
 
 import { createClawMessageAdapter, createProgressDraftController, createReasoningDraftController } from "./message-adapter.js";
 import { NullPeerChannel } from "./channel-contract.js";
@@ -129,107 +128,23 @@ function successfulIds(frames: DraftAttempt[]): string[] {
   return [...new Set(frames.map((frame) => frame.id))];
 }
 
-function cumulativePrefixes(text: string): string[] {
-  return Array.from({ length: text.length }, (_, index) => text.slice(0, index + 1));
-}
-
-function cumulativeExtensions(base: string, suffix: string): string[] {
-  return cumulativePrefixes(suffix).map((prefix) => base + prefix);
-}
-
-function pinnedCoreDistinctPartials(source: string): string[] {
-  const outputs: string[] = [];
+async function replayPinnedStreamPrefixes(
+  draft: ReturnType<typeof makeDraftHarness>["draft"],
+  source: string,
+): Promise<string> {
   let previous: string | undefined;
-  for (const prefix of cumulativePrefixes(source)) {
-    const sanitized = sanitizeAssistantVisibleText(prefix);
-    if (sanitized === previous) continue;
-    previous = sanitized;
-    // Pinned core suppresses empty partial callbacks after sanitization.
-    if (sanitized) outputs.push(sanitized);
+  for (let end = 1; end <= source.length; end += 1) {
+    const visible = sanitizeAssistantVisibleStreamText(source.slice(0, end));
+    if (visible === previous) continue;
+    previous = visible;
+    // Core suppresses empty partial callbacks; preserving that omission is what
+    // makes the tool-only and coalesced regressions realistic.
+    if (!visible) continue;
+    draft.pushAnswerText({ text: visible });
+    await draft.flush();
   }
-  return outputs;
+  return sanitizeAssistantVisibleStreamText(source);
 }
-
-function pinnedStreamDistinctPartials(source: string): string[] {
-  const outputs: string[] = [];
-  let previous: string | undefined;
-  for (const prefix of cumulativePrefixes(source)) {
-    const sanitized = sanitizeAssistantVisibleStreamText(prefix);
-    if (sanitized === previous) continue;
-    previous = sanitized;
-    if (sanitized) outputs.push(sanitized);
-  }
-  return outputs;
-}
-
-// Measured distinct onPartialReply payloads from OpenClaw 2026.7.1-2. Keep
-// these fixtures independent of core's hash-bearing dist paths; a pin bump
-// must not silently rewrite the regression stimulus under test.
-const CORE_TOOL_CALL_SAWTOOTH = [
-  ...cumulativePrefixes("Hello <tool_call>"),
-  "Hello ",
-  ...cumulativeExtensions("Hello ", " there"),
-];
-
-const CORE_FUNCTION_CALLS_SAWTOOTH = [
-  ...cumulativePrefixes("Hello <function_calls>"),
-  "Hello ",
-  ...cumulativeExtensions("Hello ", " there"),
-];
-
-function coreJsonTagSawtooth(tag: string): string[] {
-  return [
-    ...cumulativePrefixes(`Hello <${tag}>`),
-    "Hello ",
-    ...cumulativeExtensions("Hello ", " there"),
-  ];
-}
-
-// Further distinct callback streams measured from the same pinned core. The
-// function/parameter passes delay their backwards jump until the close tag;
-// MiniMax strips its wrapper, then exposes and later retracts its nested XML.
-const CORE_STANDALONE_FUNCTION_SAWTOOTH = [
-  ...cumulativePrefixes('<function name="bash">{"x":1}</functio'),
-  // The empty sanitized callback produced when the closing name completes is suppressed.
-  ...cumulativePrefixes("Answer"),
-];
-
-const CORE_STANDALONE_PARAMETER_SAWTOOTH = [
-  ...cumulativePrefixes("Hello <parameter>x</parameter"),
-  "Hello x",
-  ...cumulativeExtensions("Hello x", " there"),
-];
-
-const CORE_NESTED_TOOL_CALL_SAWTOOTH = [
-  ...cumulativePrefixes("Hello <tool_call><functio"),
-  "Hello ",
-  ...cumulativeExtensions("Hello <tool_call><function", "_cal"),
-  "Hello ",
-  ...cumulativeExtensions("Hello ", " there"),
-];
-
-const CORE_MINIMAX_TOOL_CALL_SAWTOOTH = [
-  ...cumulativePrefixes("Hello <minimax:tool_call"),
-  "Hello ",
-  ...cumulativeExtensions(
-    "Hello ",
-    '<invoke name="x"><parameter name="a">1</parameter',
-  ),
-  'Hello <invoke name="x">1',
-  ...cumulativeExtensions('Hello <invoke name="x">1', "</invoke"),
-  "Hello ",
-  ...cumulativeExtensions("Hello ", "</minimax:tool_call"),
-  "Hello ",
-  ...cumulativeExtensions("Hello ", " there"),
-];
-
-const CORE_FINAL_SAWTOOTH = [
-  ...cumulativePrefixes("Hello <final"),
-  "Hello ",
-  ...cumulativeExtensions("Hello ", "done</final"),
-  "Hello done",
-  ...cumulativeExtensions("Hello done", " there"),
-];
 
 describe("ProgressDraftController — ordered assistant lanes", () => {
   it("M1: the first boundary is a no-op and A partial creates one lane", async () => {
@@ -1454,10 +1369,9 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(h.frames.filter((frame) => frame.type === "final")).toEqual([
       { type: "final", id: h.frames[0]!.id, text: "Hi there" },
     ]);
-    // The ambiguous trailing `<` is replaced by its safe prefix, then `<thi`
-    // disambiguates it as the locally handled thinking path. The 4th partial
-    // ("Hi", shorter than the "Hi <thi" already on screen) is dropped rather
-    // than rendered — the text never moves backwards…
+    // The ambiguous bare `<` is held at its safe prefix; once `thi` proves this
+    // is not one of the distinctive tool markers, literal streaming resumes.
+    // The 4th partial ("Hi", shorter than "Hi <thi") is still dropped.
     expect(h.frames.map((frame) => frame.text)).toEqual([
       "Hi",
       "Hi ",
@@ -1728,1740 +1642,285 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     const texts = finals.map((frame) => frame.text);
     // The invariant that the reverted guard broke: never the same text twice.
     expect(new Set(texts).size).toBe(texts.length);
-    // #129: both core-stripped tag prefixes are held before they can become a
-    // lane body, so the sawtooth remains one bubble. It must never grow.
+    // #129: the first exact marker makes the lane sticky until the durable
+    // final, so neither raw marker is finalized as a separate bubble.
     expect(texts).toEqual(["Here you go. Done."]);
-  });
-
-  it.each([
-    {
-      marker: "<tool_call>",
-      partials: CORE_TOOL_CALL_SAWTOOTH,
-      payloadCount: 24,
-      finalText: "Hello  there",
-    },
-    {
-      marker: "<function_calls>",
-      partials: CORE_FUNCTION_CALLS_SAWTOOTH,
-      payloadCount: 29,
-      finalText: "Hello  there",
-    },
-    {
-      marker: "<final>",
-      partials: CORE_FINAL_SAWTOOTH,
-      payloadCount: 31,
-      finalText: "Hello done there",
-    },
-  ])(
-    "M7l: a measured $marker core sawtooth stays one clean bubble",
-    async ({ partials, payloadCount, finalText }) => {
-      const warn = vi.fn();
-      const h = makeDraftHarness({ logger: { warn } });
-      h.draft.handleAssistantMessageBoundary();
-      expect(partials).toHaveLength(payloadCount);
-      for (const text of partials) h.draft.pushAnswerText({ text });
-      await h.draft.flush();
-      expect(h.draft.snapshotText()).toBe(finalText);
-      await expect(h.draft.finalize(finalText)).resolves.toBe(true);
-      await h.draft.drain();
-
-      const finals = h.frames.filter((frame) => frame.type === "final");
-      expect(finals.map((frame) => frame.text)).toEqual([finalText]);
-      expect(successfulIds(h.frames)).toHaveLength(1);
-      expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<");
-      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
-    },
-  );
-
-  it.each([
-    ["tool_calls", coreJsonTagSawtooth("tool_calls"), "Hello  there"],
-    ["function_call", coreJsonTagSawtooth("function_call"), "Hello  there"],
-    ["tool_result", coreJsonTagSawtooth("tool_result"), "Hello  there"],
-    ["function_response", coreJsonTagSawtooth("function_response"), "Hello  there"],
-    ["antml:invoke", coreJsonTagSawtooth("antml:invoke"), "Hello  there"],
-    ["antml:parameter", coreJsonTagSawtooth("antml:parameter"), "Hello  there"],
-    ["function", CORE_STANDALONE_FUNCTION_SAWTOOTH, "Answer"],
-  ])(
-    "M7l2: pinned core's <%s> grammar stays one clean bubble",
-    async (_tag, partials, finalText) => {
-      const warn = vi.fn();
-      const h = makeDraftHarness({ logger: { warn } });
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of partials) h.draft.pushAnswerText({ text });
-      await expect(h.draft.finalize(finalText)).resolves.toBe(true);
-      await h.draft.drain();
-
-      const finals = h.frames.filter((frame) => frame.type === "final");
-      expect(finals.map((frame) => frame.text)).toEqual([finalText]);
-      expect(successfulIds(h.frames)).toHaveLength(1);
-      expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<");
-      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
-    },
-  );
-
-  it("M7l3: the outer marker remains anchored across nested tool-call XML", async () => {
-    const h = makeDraftHarness();
-    h.draft.handleAssistantMessageBoundary();
-    for (const text of CORE_NESTED_TOOL_CALL_SAWTOOTH) h.draft.pushAnswerText({ text });
-    await expect(h.draft.finalize("Hello  there")).resolves.toBe(true);
-    await h.draft.drain();
-
-    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      "Hello  there",
-    ]);
     expect(successfulIds(h.frames)).toHaveLength(1);
-    expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<tool_call");
   });
 
-  it("M7l4: post-marker whitespace stays held until JSON disambiguates", async () => {
-    const source =
-      'Hello <TOOL_CALL mode="outer>a"> name="bash>shell"\n  {"x":1}</TOOL_CALL> there';
-    const partials = pinnedCoreDistinctPartials(source);
-    const h = makeDraftHarness();
-    h.draft.handleAssistantMessageBoundary();
-    for (const text of partials) h.draft.pushAnswerText({ text });
-    await expect(h.draft.finalize("Hello  there")).resolves.toBe(true);
-    await h.draft.drain();
+  const angleMarkerCases = [
+    ["tool_call", 'Hello <tool_call>{"x":1}</tool_call> Answer', "Hello  Answer"],
+    [
+      "tool_calls",
+      "Hello <tool_calls><parameter>x</parameter></tool_calls> Answer",
+      "Hello  Answer",
+    ],
+    ["tool_result", 'Hello <tool_result>{"x":1}</tool_result> Answer', "Hello  Answer"],
+    [
+      "function_call",
+      'Hello <function_call>{"x":1}</function_call> Answer',
+      "Hello  Answer",
+    ],
+    [
+      "function_calls",
+      "Hello <function_calls><parameter>x</parameter></function_calls> Answer",
+      "Hello  Answer",
+    ],
+    [
+      "function_response",
+      'Hello <function_response>{"x":1}</function_response> Answer',
+      "Hello  Answer",
+    ],
+    [
+      "function",
+      'Hello\n<function name="bash">{"x":1}</function>\nAnswer',
+      "Hello\n\nAnswer",
+    ],
+    [
+      "antml:invoke",
+      'Hello <antml:invoke>{"x":1}</antml:invoke> Answer',
+      "Hello  Answer",
+    ],
+    [
+      "antml:parameter",
+      'Hello <antml:parameter>{"x":1}</antml:parameter> Answer',
+      "Hello  Answer",
+    ],
+    ["final", "Hello <final>Answer</final>", "Hello Answer"],
+    [
+      "minimax:tool_call",
+      'Hello <minimax:tool_call><invoke name="x"><parameter name="a">1</parameter></invoke></minimax:tool_call> Answer',
+      "Hello  Answer",
+    ],
+    [
+      "invoke",
+      "Hello <invoke>x</invoke> minimax:tool_call Answer",
+      "Hello  minimax:tool_call Answer",
+    ],
+    ["parameter", "Hello <parameter>x</parameter> Answer", "Hello x Answer"],
+    [
+      "relevant_memories",
+      "Hello <relevant_memories>secret</relevant_memories> Answer",
+      "Hello  Answer",
+    ],
+    [
+      "relevant-memories",
+      "Hello <relevant-memories>secret</relevant-memories> Answer",
+      "Hello  Answer",
+    ],
+    ["model token", "Hello <|assistant｜>Answer", "Hello Answer"],
+  ] as const;
 
-    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      "Hello  there",
-    ]);
-    expect(successfulIds(h.frames)).toHaveLength(1);
-    expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<TOOL_CALL");
-
-    // Delivery sanitization trims the safe delimiter when the stripped block
-    // ends the message. That exact backwards callback must replace the held
-    // prefix, not leave its sliced space/newline behind.
-    const terminal = makeDraftHarness();
-    terminal.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(
-      'Hello <tool_call>{"x":1}</tool_call>',
-    )) {
-      terminal.draft.pushAnswerText({ text });
-    }
-    await terminal.draft.drain();
-    expect(
-      terminal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual(["Hello"]);
-  });
-
-  it("M7l5: standalone parameter unwrapping and MiniMax XML do not split lanes", async () => {
-    for (const [partials, finalText] of [
-      [CORE_STANDALONE_PARAMETER_SAWTOOTH, "Hello x there"],
-      [CORE_MINIMAX_TOOL_CALL_SAWTOOTH, "Hello  there"],
-    ] as const) {
+  it.each(angleMarkerCases)(
+    "M7l: pinned %s sanitizer prefixes stay on one clean lane",
+    async (_name, source, expected) => {
       const h = makeDraftHarness();
       h.draft.handleAssistantMessageBoundary();
-      for (const text of partials) h.draft.pushAnswerText({ text });
-      await expect(h.draft.finalize(finalText)).resolves.toBe(true);
+      await expect(replayPinnedStreamPrefixes(h.draft, source)).resolves.toBe(expected);
+      await expect(h.draft.finalize(expected)).resolves.toBe(true);
       await h.draft.drain();
 
-      expect(
-        h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-      ).toEqual([finalText]);
+      expect(bubbleOrder(h.frames)).toEqual([expected]);
       expect(successfulIds(h.frames)).toHaveLength(1);
-      expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<");
-    }
-  });
+      expect(h.frames.every((frame) => !/<(?:\/?\s*)?(?:tool_|function|antml:|final\b|minimax:|invoke\b|parameter\b|relevant[-_]memories\b|[|｜])/.test(frame.text))).toBe(
+        true,
+      );
+    },
+  );
 
-  it("M7l6: a tool-only marker cannot survive a suppressed empty callback", async () => {
+  it("M7l1: a suppressed-empty tool-only marker cannot escape at the next boundary", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
-    for (const text of cumulativePrefixes("<tool_call>")) h.draft.pushAnswerText({ text });
-    // Pinned core suppresses the sanitized empty partial here.
+    h.draft.pushAnswerText({ text: "<tool_call>" });
+    await h.draft.flush();
+    expect(h.frames).toEqual([]);
+
+    // Core's later empty callback is suppressed. The next boundary must discard
+    // the exact quarantine instead of restoring the opening marker.
     h.draft.handleAssistantMessageBoundary();
     h.draft.pushAnswerText({ text: "Answer" });
-    await expect(h.draft.finalize("Answer")).resolves.toBe(true);
+    await h.draft.drain();
+    expect(bubbleOrder(h.frames)).toEqual(["Answer"]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+  });
+
+  it("M7l2: the earliest outer marker survives nested sanitized sawteeth", async () => {
+    const source =
+      'Hello <tool_call><function_call>{"name":"x"}</function_call></tool_call> there';
+    const expected = "Hello  there";
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    await expect(replayPinnedStreamPrefixes(h.draft, source)).resolves.toBe(expected);
+    await h.draft.finalize(expected);
     await h.draft.drain();
 
-    const finals = h.frames.filter((frame) => frame.type === "final");
-    expect(finals.map((frame) => frame.text)).toEqual(["Answer"]);
-    expect(new Set(finals.map((frame) => frame.id)).size).toBe(1);
-    expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<tool_call");
-  });
-
-  it("M7l7: anchor-zero controls that can retract to empty have no fallback", async () => {
-    // Each list ends at the last nonempty callback before pinned core strips the
-    // completed construct to an empty callback that the dispatcher suppresses.
-    for (const visiblePrefixes of [
-      cumulativePrefixes("<tool_call>"),
-      cumulativePrefixes("<minimax:tool_call"),
-      cumulativePrefixes("<tool_call/"),
-      cumulativePrefixes("</tool_call"),
-      cumulativePrefixes('<tool_call> name="bash" '),
-      cumulativePrefixes("<tool_call><functio"),
-    ]) {
-      const drained = makeDraftHarness();
-      drained.draft.handleAssistantMessageBoundary();
-      for (const text of visiblePrefixes) drained.draft.pushAnswerText({ text });
-      await drained.draft.drain();
-      expect(drained.frames).toEqual([]);
-    }
-
-    // Unlike the other ordinary names, pinned core strips function_response
-    // at the exact-name byte. The final delivered callback is therefore the
-    // one-character-short prefix, which must not become literal at drain.
-    const functionResponse = makeDraftHarness();
-    functionResponse.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(
-      '<function_response>{"x":1}</function_response>',
-    )) {
-      functionResponse.draft.pushAnswerText({ text });
-    }
-    await functionResponse.draft.drain();
-    expect(functionResponse.frames).toEqual([]);
-
-    for (const source of [
-      '<tool_call {"x":1}',
-      "<tool_call <function_call",
-    ]) {
-      const truncatedPayload = makeDraftHarness();
-      truncatedPayload.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        truncatedPayload.draft.pushAnswerText({ text });
-      }
-      await truncatedPayload.draft.drain();
-      expect(truncatedPayload.frames).toEqual([]);
-    }
-
-    const forwardedEmpty = makeDraftHarness();
-    forwardedEmpty.draft.handleAssistantMessageBoundary();
-    forwardedEmpty.draft.pushAnswerText({ text: "<tool_cal" });
-    forwardedEmpty.draft.pushAnswerText({ text: "" });
-    forwardedEmpty.draft.pushAnswerText({ text: "Answer" });
-    await expect(forwardedEmpty.draft.finalize("Answer")).resolves.toBe(true);
-    await forwardedEmpty.draft.drain();
-    expect(
-      forwardedEmpty.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual(["Answer"]);
-  });
-
-  it.each(["tool_call", "tool_calls", "function_call", "tool_result", "antml:invoke"])(
-    "M7l8: pinned core's literal <%s> continuation releases intact",
-    async (tag) => {
-      const source = `See <${tag}>literal`;
-      const h = makeDraftHarness();
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
-      await h.draft.flush();
-      expect(h.draft.snapshotText()).toBe(source);
-      await h.draft.drain();
-
-      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        source,
-      ]);
-      expect(successfulIds(h.frames)).toHaveLength(1);
-    },
-  );
-
-  it("M7l9: an attribute-ambiguous literal restores on drain and before a real boundary", async () => {
-    const source = "Use <tool_call> literally.";
-    const drained = makeDraftHarness();
-    drained.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(source)) {
-      drained.draft.pushAnswerText({ text });
-    }
-    await drained.draft.drain();
-    expect(
-      drained.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual([source]);
-
-    const bounded = makeDraftHarness();
-    bounded.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(source)) {
-      bounded.draft.pushAnswerText({ text });
-    }
-    bounded.draft.handleAssistantMessageBoundary();
-    bounded.draft.pushAnswerText({ text: "Second" });
-    await expect(bounded.draft.finalize("Second")).resolves.toBe(true);
-    await bounded.draft.drain();
-    const finals = bounded.frames.filter((frame) => frame.type === "final");
-    expect(finals.map((frame) => frame.text)).toEqual([source, "Second"]);
-    expect(new Set(finals.map((frame) => frame.id)).size).toBe(2);
+    expect(bubbleOrder(h.frames)).toEqual([expected]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+    expect(h.frames.some((frame) => frame.text.includes("<tool_call"))).toBe(false);
   });
 
   it.each([
-    "Use `<tool_call>` literally.",
-    '```xml\n<tool_call>{"x":1}</tool_call>\n```',
-    'Use `<tool_call>{"x":1}</tool_call> after` literally',
-    '`<final>{"x":1}</final>`',
-    '`<parameter>x</parameter>`',
-    'P ```xml\n<final>{"x":1}</final>\n```',
-  ])("M7l10: pinned core's code-region literal stays intact: %s", async (source) => {
-    const h = makeDraftHarness();
-    h.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
-    await h.draft.drain();
-
-    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      source,
-    ]);
-    expect(successfulIds(h.frames)).toHaveLength(1);
-  });
-
-  it("M7l12: pinned deterministic literals release or restore at terminal", async () => {
-    for (const source of [
-      "<function>",
-      'Use <function name="bash">',
-      "<minimax:tool_call/>",
-      "<final foo=>literal",
-      "<minimax:tool_call foo>literal",
-    ]) {
-      const immediate = makeDraftHarness();
-      immediate.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        immediate.draft.pushAnswerText({ text });
-      }
-      await immediate.draft.flush();
-      expect(immediate.draft.snapshotText()).toBe(source);
-      await immediate.draft.drain();
-      expect(
-        immediate.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-      ).toEqual([source]);
-    }
-
-    for (const source of [
-      "<parameter>literal",
-      "<parameter> literal.",
-      "<tool_call>< function_call>",
-    ]) {
-      const terminal = makeDraftHarness();
-      terminal.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        terminal.draft.pushAnswerText({ text });
-      }
-      await terminal.draft.drain();
-      expect(
-        terminal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-      ).toEqual([source]);
-    }
-
-    for (const source of [
-      '<function name="bash">',
-      '<function name="bash"> literal',
-      '<function name="bash"> name=x{',
-      '<function name="bash"> {',
-      '<function name="bash">{"x":1}',
-      '<function name="bash"><function_call',
-      '<function name="bash"> name=x {',
-    ]) {
-      const recognizedPayload = makeDraftHarness();
-      recognizedPayload.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        recognizedPayload.draft.pushAnswerText({ text });
-      }
-      await recognizedPayload.draft.drain();
-      expect(recognizedPayload.frames).toEqual([]);
-    }
-  });
-
-  it("M7l13: plural wrappers stay held through an adjacent function response", async () => {
-    const visibleCases = [
-      'Hello <function_calls><function_call>{"x":1}</function_call></function_calls><function_response>ok</function_response> there',
-      'Hello <tool_calls><tool_call>{"x":1}</tool_call></tool_calls><function_response>ok</function_response> there',
-      'Hello <function_calls><function_call>{"x":1}</function_call></function_calls> \n <function_response>ok</function_response> there',
-    ];
-    for (const source of visibleCases) {
-      const warn = vi.fn();
-      const h = makeDraftHarness({ logger: { warn } });
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
-      await h.draft.drain();
-
-      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        sanitizeAssistantVisibleText(source),
+    ["tool_calls", [12, 48, 56]],
+    ["function_calls", [16, 56, 64]],
+  ] as const)(
+    "M7l3: pinned coalesced %s unwrap cuts cannot release an exact wrapper",
+    async (tag, cuts) => {
+      const source = `<${tag}><parameter>x</parameter></${tag}> Answer`;
+      const callbacks = cuts.map((end) =>
+        sanitizeAssistantVisibleStreamText(source.slice(0, end)),
+      );
+      expect(callbacks).toEqual([
+        `<${tag}>`,
+        `<${tag}>x</${tag}`,
+        " Answer",
       ]);
-      expect(successfulIds(h.frames)).toHaveLength(1);
-      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
-    }
 
-    for (const source of [
-      '<function_calls><function_call>{"x":1}</function_call></function_calls><function_response>ok</function_response>',
-      '<tool_calls><tool_call>{"x":1}</tool_call></tool_calls><function_response>ok</function_response>',
-    ]) {
-      const toolOnly = makeDraftHarness();
-      toolOnly.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        toolOnly.draft.pushAnswerText({ text });
-      }
-      await toolOnly.draft.drain();
-      expect(toolOnly.frames).toEqual([]);
-    }
-
-    for (const source of [
-      "Hello <function_calls></function_calls>",
-      "Hello <tool_calls></tool_calls>",
-    ]) {
-      const literal = makeDraftHarness();
-      literal.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) literal.draft.pushAnswerText({ text });
-      await literal.draft.drain();
-      expect(
-        literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-      ).toEqual([sanitizeAssistantVisibleText(source)]);
-      expect(successfulIds(literal.frames)).toHaveLength(1);
-    }
-
-    for (const source of [
-      "<function_calls></function_calls><function_response>ok</function_response>",
-      "<tool_calls></tool_calls><function_response>ok</function_response>",
-    ]) {
-      expect(sanitizeAssistantVisibleText(source)).toBe(source);
-      const provenLiteral = makeDraftHarness();
-      provenLiteral.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        provenLiteral.draft.pushAnswerText({ text });
-      }
-      await provenLiteral.draft.drain();
-      expect(
-        provenLiteral.frames
-          .filter((frame) => frame.type === "final")
-          .map((frame) => frame.text),
-      ).toEqual([source]);
-      expect(successfulIds(provenLiteral.frames)).toHaveLength(1);
-    }
-
-    for (const source of [
-      "<tool_result><function_call>",
-      "<function_call><tool_call>",
-      "<function_response><function_call>",
-      "<antml:parameter><function_call>",
-    ]) {
-      const literal = makeDraftHarness();
-      literal.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) literal.draft.pushAnswerText({ text });
-      await literal.draft.drain();
-      expect(
-        literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-      ).toEqual([source]);
-    }
-
-    for (const source of [
-      "<tool_call><function_call>",
-      "<antml:invoke><function_call>",
-      // Even a directly observed empty wrapper can be the sanitized result of
-      // a coalesced nested call. At anchor zero its later retraction is empty.
-      "<function_calls></function_calls>",
-      "<tool_calls></tool_calls>",
-      // Core exposes only this empty plural wrapper after stripping the nested
-      // call. A later coalesced adjacent response can still retract it to a
-      // suppressed empty callback, so it carries no safe terminal fallback.
-      '<function_calls><function_call>{"x":1}</function_call></function_calls>',
-      // A plural wrapper can consume this preserved prefix if one coalesced
-      // suffix completes the nested call, outer close, and adjacent response.
-      "<tool_calls><function_call>",
-      "<function_calls><function_call>",
-    ]) {
       const hidden = makeDraftHarness();
       hidden.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) hidden.draft.pushAnswerText({ text });
+      for (const text of callbacks) hidden.draft.pushAnswerText({ text });
       await hidden.draft.drain();
       expect(hidden.frames).toEqual([]);
-    }
 
-    const code =
-      'Use `<function_calls><function_call>{"x":1}</function_call></function_calls><function_response>ok</function_response>` literally';
-    const codeLiteral = makeDraftHarness();
-    codeLiteral.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(code)) codeLiteral.draft.pushAnswerText({ text });
-    await codeLiteral.draft.drain();
-    expect(
-      codeLiteral.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual([code]);
-    expect(successfulIds(codeLiteral.frames)).toHaveLength(1);
-  });
-
-  it("M7l14: nested parameter closes remain depth-aware and one-pass exact", async () => {
-    for (const source of [
-      "Hello <parameter><parameter>x</parameter></parameter> there",
-      "Hello <parameter>a<parameter>b</parameter>c</parameter> there",
-      "Hello <parameter>x</parameter> there",
-      "<parameter><parameter>x</parameter></parameter>",
-      "<parameter>a<parameter>b</parameter>c</parameter>",
-      "<parameter><parameter/></parameter>",
-      "<parameter><parameter/>x</parameter>",
-    ]) {
-      const warn = vi.fn();
-      const h = makeDraftHarness({ logger: { warn } });
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
-      await h.draft.drain();
-
-      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        sanitizeAssistantVisibleText(source),
-      ]);
-      expect(successfulIds(h.frames)).toHaveLength(1);
-      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
-    }
-  });
-
-  it("M7l15: a later MiniMax gate retroactively strips completed bare invoke XML", async () => {
-    for (const source of [
-      "Hello <invoke>x</invoke> then <minimax:tool_call> there",
-      "Hello <invoke>x</invoke> then minimax:tool_call literal",
-      "<invoke>x</invoke> <minimax:tool_call>",
-      "<invoke>x</invoke> minimax:tool_call literal",
-      "<invoke>x</invoke> literal",
-      "Use `<invoke>x</invoke>` then <minimax:tool_call> there",
-      "`<invoke>x</invoke> <minimax:tool_call>`",
-    ]) {
-      const warn = vi.fn();
-      const h = makeDraftHarness({ logger: { warn } });
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
-      await h.draft.drain();
-
-      const expected = sanitizeAssistantVisibleText(source);
-      const finals = h.frames.filter((frame) => frame.type === "final");
-      expect(finals.map((frame) => frame.text)).toEqual(expected ? [expected] : []);
-      expect(successfulIds(h.frames)).toHaveLength(expected ? 1 : 0);
-      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
-    }
-  });
-
-  it("M7l16: anchor-zero fallback is safe under coalesced suppressed-empty callbacks", async () => {
-    const cases = [
-      ["<tool_cal", '<tool_call>{"x":1}</tool_call>'],
-      ['<function name="bash">', '<function name="bash">{"x":1}</function>'],
-      ["<function", '<function name="bash">{"x":1}</function>'],
-      ["<parameter", "<parameter></parameter>"],
-      ["<parameter><tool_cal", '<parameter><tool_call>{"x":1}</tool_call></parameter>'],
-      ["<invoke", "<invoke>x</invoke><minimax:tool_call>"],
-      ["<invoke/>", "<invoke/></invoke><minimax:tool_call>"],
-      ["<invoke />", "<invoke /></invoke><minimax:tool_call>"],
-      [
-        "<function_calls><function_call>",
-        '<function_calls><function_call>{"x":1}</function_call></function_calls><function_response>ok</function_response>',
-      ],
-      [
-        "<tool_calls><tool_call>",
-        '<tool_calls><tool_call>{"x":1}</tool_call></tool_calls><function_response>ok</function_response>',
-      ],
-    ] as const;
-
-    for (const [observed, completed] of cases) {
-      expect(completed.startsWith(observed)).toBe(true);
-      expect(sanitizeAssistantVisibleText(observed)).toBe(observed);
-      expect(sanitizeAssistantVisibleText(completed)).toBe("");
-
-      const h = makeDraftHarness();
-      h.draft.handleAssistantMessageBoundary();
-      h.draft.pushAnswerText({ text: observed });
-      // The provider's next cumulative callback is `completed`, but pinned core
-      // sanitizes it to empty and the dispatcher therefore never calls us.
-      await h.draft.drain();
-      expect(h.frames).toEqual([]);
-    }
-
-    for (const [wrapper, nested] of [
-      ["function_calls", "function_call"],
-      ["tool_calls", "tool_call"],
-    ] as const) {
-      const rawChunks = [
-        `<${wrapper}>`,
-        `<${wrapper}><${nested}>{"x":1}</${nested}></${wrapper}>`,
-        `<${wrapper}><${nested}>{"x":1}</${nested}></${wrapper}><function_response>ok</function_response>`,
-      ];
-      const sanitized = rawChunks.map((raw) => sanitizeAssistantVisibleText(raw));
-      expect(sanitized).toEqual([
-        `<${wrapper}>`,
-        `<${wrapper}></${wrapper}>`,
-        "",
-      ]);
-
-      const coalescedNested = makeDraftHarness();
-      coalescedNested.draft.handleAssistantMessageBoundary();
-      // The dispatcher forwards chunks 1 and 2, but suppresses chunk 3.
-      for (const output of sanitized) {
-        if (output) coalescedNested.draft.pushAnswerText({ text: output });
-      }
-      await coalescedNested.draft.drain();
-      expect(coalescedNested.frames).toEqual([]);
-    }
-
-    for (const source of [
-      "Hello <invoke/> literal",
-      "Hello <invoke /> literal",
-      "Hello <invoke/></invoke><minimax:tool_call>",
-      "Hello <invoke /></invoke><minimax:tool_call>",
-    ]) {
-      const expected = sanitizeAssistantVisibleText(source);
-      const visiblePrefix = makeDraftHarness();
-      visiblePrefix.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        visiblePrefix.draft.pushAnswerText({ text });
-      }
-      await visiblePrefix.draft.drain();
-      expect(
-        visiblePrefix.frames
-          .filter((frame) => frame.type === "final")
-          .map((frame) => frame.text),
-      ).toEqual([expected]);
-      expect(successfulIds(visiblePrefix.frames)).toHaveLength(1);
-    }
-
-    const bounded = makeDraftHarness();
-    bounded.draft.handleAssistantMessageBoundary();
-    bounded.draft.pushAnswerText({ text: "<tool_cal" });
-    expect(sanitizeAssistantVisibleText('<tool_call>{"x":1}</tool_call>')).toBe("");
-    bounded.draft.handleAssistantMessageBoundary();
-    bounded.draft.pushAnswerText({ text: "Answer" });
-    await expect(bounded.draft.finalize("Answer")).resolves.toBe(true);
-    await bounded.draft.drain();
-    expect(
-      bounded.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual(["Answer"]);
-  });
-
-  it("M7l17: MiniMax prefix viability matches its exact wrapper and invoke regexes", async () => {
-    for (const source of [
-      "<invoke>x</invoke> minimax:tool_cal",
-      "<invoke>x</invoke> prefix minimax:tool_cal",
-      "< minimax:tool_cal",
-      "< /minimax:tool_cal",
-      "</ minimax:tool_cal",
-      "<invoke>x</invoke> < minimax:tool_cal",
-      "<invoke>x</invoke> < /minimax:tool_cal",
-      "<invoke>x</invoke> </ minimax:tool_cal",
-      "<minimax:tool_call x",
-      "<minimax:tool_call/",
-      "</minimax:tool_call x",
-      "</minimax:tool_call/",
-      "< invoke",
-      "< /invoke",
-      "</ invoke",
-      "</invoke",
-      "</inv",
-      "</parameter",
-      "</param",
-    ]) {
-      const expected = sanitizeAssistantVisibleText(source);
-      expect(expected).not.toBe("");
-      const literal = makeDraftHarness();
-      literal.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        literal.draft.pushAnswerText({ text });
-      }
-      await literal.draft.drain();
-      expect(
-        literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-      ).toEqual([expected]);
-      expect(successfulIds(literal.frames)).toHaveLength(1);
-    }
-
-    for (const source of [
-      "<invoke>x</invoke> <minimax:tool_cal",
-      "<invoke>x</invoke> </minimax:tool_cal",
-      "<invoke>x</inv",
-      "<parameter></param",
-    ]) {
-      expect(sanitizeAssistantVisibleText(source)).toBe(source);
-      const stillViable = makeDraftHarness();
-      stillViable.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        stillViable.draft.pushAnswerText({ text });
-      }
-      await stillViable.draft.drain();
-      expect(stillViable.frames).toEqual([]);
-    }
-
-    // The public sanitizer trims a terminal space before dispatch, collapsing
-    // these malformed raw prefixes onto the byte-identical viable no-space
-    // prefixes. Preserve tool-only safety for that irrecoverable collision;
-    // the visible-byte cases above prove the grammar releases once evidence
-    // survives sanitization.
-    for (const source of ["<minimax:tool_call ", "</minimax:tool_call "]) {
-      const sanitized = sanitizeAssistantVisibleText(source);
-      expect(sanitized).toBe(source.trimEnd());
-      const trimmedCollision = makeDraftHarness();
-      trimmedCollision.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        trimmedCollision.draft.pushAnswerText({ text });
-      }
-      await trimmedCollision.draft.drain();
-      expect(trimmedCollision.frames).toEqual([]);
-    }
-  });
-
-  it("M7l18: pinned memory markers stay deferred without hiding malformed literals or code", async () => {
-    for (const source of [
-      "Hello <relevant_memories>secret</relevant_memories> there",
-      'Hello < relevant-memories-x="1">secret</ relevant-memories> there',
-      "Hello <relevant_memories>a<relevant_memories>b</relevant_memories>c</relevant_memories> there",
-    ]) {
-      const h = makeDraftHarness();
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
-      await h.draft.drain();
-      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        sanitizeAssistantVisibleText(source),
-      ]);
-      expect(successfulIds(h.frames)).toHaveLength(1);
-    }
-
-    for (const source of [
-      "<relevant_memories>secret</relevant_memories>",
-      "<relevant-memories>secret</relevant-memories>",
-      "</relevant_memories>",
-    ]) {
-      expect(sanitizeAssistantVisibleText(source)).toBe("");
-      const hidden = makeDraftHarness();
-      hidden.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) hidden.draft.pushAnswerText({ text });
-      await hidden.draft.drain();
-      expect(hidden.frames).toEqual([]);
-    }
-
-    for (const source of [
-      "<relevant_memoriesX>",
-      'Use `<relevant_memories>x</relevant_memories>` literally',
-    ]) {
-      expect(sanitizeAssistantVisibleText(source)).toBe(source);
-      const literal = makeDraftHarness();
-      literal.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) literal.draft.pushAnswerText({ text });
-      await literal.draft.drain();
-      expect(literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        source,
-      ]);
-      expect(successfulIds(literal.frames)).toHaveLength(1);
-    }
-
-    for (const [observed, completed] of [
-      ["<relevant_mem", "<relevant_memories>x</relevant_memories>"],
-      ["<relevant_memories<", "<relevant_memories<|x|>>secret"],
-      ["<relevant_memories a=<", "<relevant_memories a=<|x|>>secret"],
-      [
-        "<parameter><relevant_mem",
-        "<parameter><relevant_memories>x</relevant_memories></parameter>",
-      ],
-    ] as const) {
-      expect(sanitizeAssistantVisibleText(observed)).toBe(observed);
-      expect(sanitizeAssistantVisibleText(completed)).toBe("");
-      const coalesced = makeDraftHarness();
-      coalesced.draft.handleAssistantMessageBoundary();
-      coalesced.draft.pushAnswerText({ text: observed });
-      // The completed cumulative provider chunk sanitizes to empty, so core
-      // never forwards it to clear an unsafe anchor-zero fallback.
-      await coalesced.draft.drain();
-      expect(coalesced.frames).toEqual([]);
-    }
-  });
-
-  it("M7l19: model special tokens follow mixed-pipe and overlap-code grammar", async () => {
-    for (const source of [
-      "Hello<|assistant|>there",
-      "Hello<｜assistant|>there",
-      "Hello<|a>b｜>there",
-    ]) {
-      const h = makeDraftHarness();
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
-      await h.draft.drain();
-      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        sanitizeAssistantVisibleText(source),
-      ]);
-      expect(successfulIds(h.frames)).toHaveLength(1);
-    }
-
-    for (const source of ["<|assistant|>", "<｜assistant|>", "<｜assistant｜>"]) {
-      expect(sanitizeAssistantVisibleText(source)).toBe("");
-      const hidden = makeDraftHarness();
-      hidden.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) hidden.draft.pushAnswerText({ text });
-      await hidden.draft.drain();
-      expect(hidden.frames).toEqual([]);
-    }
-
-    for (const source of [
-      "<|a|x>",
-      "Use `<|assistant|>` literally",
-      "<|a`x|>`",
-    ]) {
-      expect(sanitizeAssistantVisibleText(source)).toBe(source);
-      const literal = makeDraftHarness();
-      literal.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) literal.draft.pushAnswerText({ text });
-      await literal.draft.drain();
-      expect(literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        source,
-      ]);
-      expect(successfulIds(literal.frames)).toHaveLength(1);
-    }
-
-    for (const [observed, completed] of [
-      ["<|assist", "<|assistant|>"],
-      ["<parameter><|assist", "<parameter><|assistant|></parameter>"],
-    ] as const) {
-      expect(sanitizeAssistantVisibleText(observed)).toBe(observed);
-      expect(sanitizeAssistantVisibleText(completed)).toBe("");
-      const coalesced = makeDraftHarness();
-      coalesced.draft.handleAssistantMessageBoundary();
-      coalesced.draft.pushAnswerText({ text: observed });
-      await coalesced.draft.drain();
-      expect(coalesced.frames).toEqual([]);
-    }
-  });
-
-  it("M7l20: MiniMax invoke terminal safety uses the first textual close", async () => {
-    for (const source of [
-      "<invoke><invoke>x</invoke>safe</invoke>",
-      "<invoke><invoke>x</invoke>safe",
-      "<invoke><invoke>x</invoke>safe</invoke><minimax:tool_call>",
-      "<invoke><invoke>x</invoke>safe<minimax:tool_call>",
-      "Hello <invoke><invoke>x</invoke>safe</invoke><minimax:tool_call> there",
-      "Hello <invoke-x>x</invoke><minimax:tool_call> there",
-    ]) {
-      const warn = vi.fn();
-      const h = makeDraftHarness({ logger: { warn } });
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) h.draft.pushAnswerText({ text });
-      await h.draft.drain();
-      const expected = sanitizeAssistantVisibleText(source);
-      expect(
-        h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-      ).toEqual(
-        expected ? [expected] : [],
+      const visibleCallbacks = cuts.map((end) =>
+        sanitizeAssistantVisibleStreamText(`Hello ${source.slice(0, end)}`),
       );
-      expect(successfulIds(h.frames)).toHaveLength(expected ? 1 : 0);
-      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
-    }
-
-    const observed = "<invoke><invoke>x</invoke>safe</invoke>";
-    const completed = `${observed}<minimax:tool_call>`;
-    expect(sanitizeAssistantVisibleText(observed)).toBe(observed);
-    expect(sanitizeAssistantVisibleText(completed)).toBe("safe</invoke>");
-    const coalesced = makeDraftHarness();
-    coalesced.draft.handleAssistantMessageBoundary();
-    coalesced.draft.pushAnswerText({ text: observed });
-    coalesced.draft.pushAnswerText({ text: sanitizeAssistantVisibleText(completed) });
-    await coalesced.draft.drain();
-    expect(coalesced.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      "safe</invoke>",
-    ]);
-    expect(successfulIds(coalesced.frames)).toHaveLength(1);
-
-    for (const observedWithQuotedClose of [
-      '<invoke a="</invoke>">x</invoke>',
-      '<invoke-x>x</invoke>',
-    ]) {
-      const completedWithGate = `${observedWithQuotedClose}<minimax:tool_call>`;
-      expect(sanitizeAssistantVisibleText(observedWithQuotedClose)).toBe(
-        observedWithQuotedClose,
-      );
-      expect(sanitizeAssistantVisibleText(completedWithGate)).toBe("");
-      const suppressed = makeDraftHarness();
-      suppressed.draft.handleAssistantMessageBoundary();
-      suppressed.draft.pushAnswerText({ text: observedWithQuotedClose });
-      // MiniMax's first `>` / first-close regex can consume this entire prefix
-      // when a coalesced provider chunk adds the global gate.
-      await suppressed.draft.drain();
-      expect(suppressed.frames).toEqual([]);
-    }
-  });
-
-  it("M7l22: standalone-function close matching ignores quoted close lookalikes", async () => {
-    const toolOnly = '<function name="bash">{"x":"</function>"}</function>';
-    expect(sanitizeAssistantVisibleText(toolOnly)).toBe("");
-    const hidden = makeDraftHarness();
-    hidden.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(toolOnly)) hidden.draft.pushAnswerText({ text });
-    await hidden.draft.drain();
-    expect(hidden.frames).toEqual([]);
-
-    const visible = `Hello: ${toolOnly} there`;
-    const h = makeDraftHarness();
-    h.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(visible)) h.draft.pushAnswerText({ text });
-    await h.draft.drain();
-    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      sanitizeAssistantVisibleText(visible),
-    ]);
-    expect(successfulIds(h.frames)).toHaveLength(1);
-
-    const observed = '<function name="bash">{"x":"</function>"';
-    expect(sanitizeAssistantVisibleText(observed)).toBe(observed);
-    expect(toolOnly.startsWith(observed)).toBe(true);
-    const coalesced = makeDraftHarness();
-    coalesced.draft.handleAssistantMessageBoundary();
-    coalesced.draft.pushAnswerText({ text: observed });
-    // The full provider callback sanitizes to a suppressed empty string. The
-    // quoted inner close must not make the earlier prefix terminal-restorable.
-    await coalesced.draft.drain();
-    expect(coalesced.frames).toEqual([]);
-  });
-
-  it("M7l23: actual stream-only bracket and emoji scaffolding never becomes a bubble", async () => {
-    const hiddenTraceSources = new Set([
-      "🛠️ Exec: ls",
-      "🛠️ run",
-      "🛠️ ` ls",
-      "🛠️ ``bash",
-      "🛠️ elevated · run",
-      "🛠️ pty, bash",
-      "🛠️ elevated, pty · run",
-      "> 🛠️ elevated · run",
-      "⚠️ 🛠️ task (agent) failed",
-      "> ⚠️ 🛠️ task (agent) failed",
-    ]);
-    for (const source of [
-      "[Tool Call: bash]",
-      "[Historical context:x]\n",
-      '[TOOL_CALL] tool => "bash" args => {}',
-      '[TOOL_CALL] garbage `[/TOOL_CALL]` tool => "bash" args => {}',
-      '[TOOL_CALL] garbage `[/TOOL_CALL]` tool => "bash" args => {}[/TOOL_CALL]',
-      '[TOOL_RESULT] garbage `[/TOOL_RESULT]` result => x',
-      '[TOOL_RESULT] garbage `[/TOOL_RESULT]` result => x[/TOOL_RESULT]',
-      '[bash]\n{"x":1}[/bash]',
-      "[tool:bash]<parameter=x>y</parameter>",
-      ...hiddenTraceSources,
-    ]) {
-      expect(sanitizeAssistantVisibleStreamText(source)).toBe("");
-      const hidden = makeDraftHarness();
-      hidden.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(source)) {
-        hidden.draft.pushAnswerText({ text });
-        if (hiddenTraceSources.has(source)) await hidden.draft.flush();
-      }
-      await hidden.draft.drain();
-      expect(hidden.frames).toEqual([]);
-    }
-
-    const visible = "Hello\n🛠️ Exec: ls\nthere";
-    const h = makeDraftHarness();
-    h.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedStreamDistinctPartials(visible)) {
-      h.draft.pushAnswerText({ text });
-    }
-    await h.draft.drain();
-    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      sanitizeAssistantVisibleStreamText(visible),
-    ]);
-    expect(successfulIds(h.frames)).toHaveLength(1);
-
-    for (const source of [
-      "⚠️ 🛠️ hello\nAnswer",
-      "🛠️ elevated · runx\nAnswer",
-      "🛠️ elevated x\nAnswer",
-      "> ⚠️ 🛠️ hello\nAnswer",
-    ]) {
-      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
-      const literal = makeDraftHarness();
-      literal.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(source)) {
-        literal.draft.pushAnswerText({ text });
-        await literal.draft.flush();
-      }
-      await literal.draft.drain();
-      expect(
-        literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-      ).toEqual([source]);
-      expect(successfulIds(literal.frames)).toHaveLength(1);
-      expect(literal.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
-    }
-
-    for (const source of [
-      'Use `[TOOL_CALL] tool => "bash" args => {}[/TOOL_CALL] after` literally',
-      'Use `[TOOL_RESULT] result => "ok"[/TOOL_RESULT] after` literally',
-      'Use `<tool_call>{"x":1}</tool_call> after` literally',
-      'Use ```<tool_call>{"x":1}</tool_call> after` literally',
-      'Use `<relevant_memories>secret</relevant_memories> after` literally',
-      'Use `<invoke>x</invoke><minimax:tool_call> after` literally',
-    ]) {
-      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
-      const code = makeDraftHarness();
-      code.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(source)) {
-        code.draft.pushAnswerText({ text });
-      }
-      await code.draft.drain();
-      expect(code.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        source,
+      expect(visibleCallbacks).toEqual([
+        `Hello <${tag}>`,
+        `Hello <${tag}>x</${tag}`,
+        "Hello  Answer",
       ]);
-      expect(successfulIds(code.frames)).toHaveLength(1);
-      expect(code.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
-    }
-
-    const nonCodeSource =
-      'Before [TOOL_CALL] tool => "bash" args => {}[/TOOL_CALL] after';
-    const nonCodeExpected = sanitizeAssistantVisibleStreamText(nonCodeSource);
-    const nonCode = makeDraftHarness();
-    nonCode.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedStreamDistinctPartials(nonCodeSource)) {
-      nonCode.draft.pushAnswerText({ text });
-    }
-    await nonCode.draft.drain();
-    expect(nonCode.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      nonCodeExpected,
-    ]);
-    expect(successfulIds(nonCode.frames)).toHaveLength(1);
-    expect(nonCode.frames.every((frame) => nonCodeExpected.startsWith(frame.text))).toBe(true);
-
-    const largeXmlObserved = `[tool:bash]<parameter=x>${"a".repeat(256e3)}`;
-    const largeXmlCompleted = `${largeXmlObserved}</parameter>`;
-    expect(sanitizeAssistantVisibleStreamText(largeXmlObserved)).toBe(largeXmlObserved);
-    expect(sanitizeAssistantVisibleStreamText(largeXmlCompleted)).toBe("");
-    const largeXml = makeDraftHarness();
-    largeXml.draft.handleAssistantMessageBoundary();
-    largeXml.draft.pushAnswerText({ text: largeXmlObserved });
-    await largeXml.draft.drain();
-    expect(largeXml.frames).toEqual([]);
-
-    for (const source of [
-      "[tool:bash]<parameter=x>y</parameter><parameter=>literal",
-      "[tool:bash]<parameter=x>y</parameter> literal",
-    ]) {
-      const expected = sanitizeAssistantVisibleStreamText(source);
-      expect(expected).not.toBe("");
-      const suffix = makeDraftHarness();
-      suffix.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(source)) {
-        suffix.draft.pushAnswerText({ text });
-      }
-      await suffix.draft.drain();
-      expect(suffix.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        expected,
-      ]);
-      expect(successfulIds(suffix.frames)).toHaveLength(1);
-      expect(suffix.frames.every((frame) => expected.startsWith(frame.text))).toBe(true);
-    }
-  });
-
-  it("M7l24: model-token deletion composes with every later assistant sanitizer family", async () => {
-    const pairs = [
-      ["<relevant_memories a=<|x|", "<relevant_memories a=<|x|>>secret"],
-      ['<tool_call a=<|x|', '<tool_call a=<|x|>>{"x":1}</tool_call>'],
-      ["<tool_call><|x|", '<tool_call><|x|>{"x":1}</tool_call>'],
-      [
-        '<function name="bash"><|x|',
-        '<function name="bash"><|x|>{"x":1}</function>',
-      ],
-      ["🛠️ Exec<|x|", "🛠️ Exec<|x|>: ls"],
-      [
-        "[TOOL_CALL] <|x|",
-        '[TOOL_CALL] <|x|>tool => "bash" args => {}',
-      ],
-      ["[bash]\n<|x|", '[bash]\n<|x|>{"x":1}[/bash]'],
-      ["[Tool Call: bash<|x|", "[Tool Call: bash<|x|>]"],
-      ["[Historical context:<|x|", "[Historical context:<|x|>]\n"],
-      ["<final <|x|", "<final <|x|>>secret</final>"],
-    ] as const;
-
-    for (const [observed, completed] of pairs) {
-      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
-      const expected = sanitizeAssistantVisibleStreamText(completed);
-      const h = makeDraftHarness();
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(completed)) {
-        h.draft.pushAnswerText({ text });
-      }
-      await h.draft.drain();
-      expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual(
-        expected ? [expected] : [],
-      );
-      expect(successfulIds(h.frames), observed).toHaveLength(expected ? 1 : 0);
-      if (expected) {
-        expect(h.frames.every((frame) => expected.startsWith(frame.text)), observed).toBe(true);
-      }
-    }
-
-    for (const observed of [
-      "tool <|x|",
-      "analysis to=bash code<|x|",
-      "<thinking <|x|",
-    ]) {
-      const counterfactual = makeDraftHarness();
-      counterfactual.draft.handleAssistantMessageBoundary();
-      counterfactual.draft.pushAnswerText({ text: observed });
-      await counterfactual.draft.drain();
-      expect(counterfactual.frames, observed).toEqual([]);
-    }
-
-    const completed = "Answer <relevant_memories a=<|x|>>secret";
-    const visible = makeDraftHarness();
-    visible.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedStreamDistinctPartials(completed)) {
-      visible.draft.pushAnswerText({ text });
-    }
-    await visible.draft.drain();
-    expect(visible.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      "Answer",
-    ]);
-    expect(successfulIds(visible.frames)).toHaveLength(1);
-  });
-
-  it("M7l25: same-pass substages and the second pass keep the outer anchor", async () => {
-    for (const [observed, completed] of [
-      [
-        "<tool_[Tool Call:x",
-        '<tool_[Tool Call:x]call>{"x":1}</tool_call>',
-      ],
-      [
-        "[bash]\n[Tool Call:x",
-        '[bash]\n[Tool Call:x]{"x":1}[/bash]',
-      ],
-      [
-        "<param<tool_call",
-        '<param<tool_call>{"x":1}</tool_call>eter>x</parameter>',
-      ],
-    ] as const) {
-      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
-      const expected = sanitizeAssistantVisibleStreamText(completed);
-      const h = makeDraftHarness();
-      h.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(completed)) {
-        h.draft.pushAnswerText({ text });
-      }
-      await h.draft.drain();
-      expect(
-        h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-        observed,
-      ).toEqual(
-        expected ? [expected] : [],
-      );
-      expect(successfulIds(h.frames), observed).toHaveLength(expected ? 1 : 0);
-      if (expected) {
-        expect(h.frames.every((frame) => expected.startsWith(frame.text)), observed).toBe(true);
-      }
-    }
-
-    // This public-helper cascade is upstream-preprocessed by stripBlockTags in
-    // the real stream path. Keep the same-substage classifier assertion, but
-    // do not replay helper-only intermediate `<thinking>` bodies as callbacks.
-    const reasoningObserved = "<think<final";
-    const reasoningCompleted = "<think<final></final>ing>secret</thinking>";
-    expect(sanitizeAssistantVisibleStreamText(reasoningObserved)).toBe(reasoningObserved);
-    expect(sanitizeAssistantVisibleStreamText(reasoningCompleted)).toBe("");
-    const reasoning = makeDraftHarness();
-    reasoning.draft.handleAssistantMessageBoundary();
-    reasoning.draft.pushAnswerText({ text: reasoningObserved });
-    await reasoning.draft.drain();
-    expect(reasoning.frames).toEqual([]);
-
-    for (const [source, expected] of [
-      ['<tool_<parameter></parameter>call>{"x":1}</tool_call>', ""],
-      [
-        '<tool_<parameter>x</parameter>call>{"x":1}</tool_call>',
-        '<tool_xcall>{"x":1}',
-      ],
-      [
-        '<tool_<invoke attr>x</invoke><minimax:tool_call>call>{"x":1}</tool_call>',
-        "",
-      ],
-      [
-        '<tool_<invoke attr>x</invoke>calligraphy>{"x":1}',
-        '<tool_<invoke attr>x</invoke>calligraphy>{"x":1}',
-      ],
-      [
-        'analysis to=bash code<|x|>{"x":bad',
-        'analysis to=bash code {"x":bad',
-      ],
-    ] as const) {
-      expect(sanitizeAssistantVisibleStreamText(source)).toBe(expected);
-      const staged = makeDraftHarness();
-      staged.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(source)) {
-        staged.draft.pushAnswerText({ text });
-      }
-      await staged.draft.drain();
-      expect(
-        staged.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-        source,
-      ).toEqual(expected ? [expected] : []);
-      expect(successfulIds(staged.frames), source).toHaveLength(expected ? 1 : 0);
-      if (expected) {
-        expect(staged.frames.every((frame) => expected.startsWith(frame.text)), source).toBe(
-          true,
-        );
-      }
-    }
-
-    const invokeObserved =
-      '<tool_<invoke attr>x</invoke>call>{"x":1}</tool_call>';
-    const invokeCompleted = `${invokeObserved}<minimax:tool_call>`;
-    expect(sanitizeAssistantVisibleStreamText(invokeObserved)).toBe(
-      '<tool_<invoke attr>x</invoke>call>{"x":1}',
-    );
-    expect(sanitizeAssistantVisibleStreamText(invokeCompleted)).toBe("");
-    const coalescedInvoke = makeDraftHarness();
-    coalescedInvoke.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedStreamDistinctPartials(invokeObserved)) {
-      coalescedInvoke.draft.pushAnswerText({ text });
-    }
-    // A later one-chunk gate completion retracts to suppressed empty, so the
-    // observed control-looking outer suffix cannot be terminal-restored.
-    await coalescedInvoke.draft.drain();
-    expect(coalescedInvoke.frames).toEqual([]);
-  });
-
-  it("M7l26: punctuation-delimited user-facing sentinels defer but malformed literals release", async () => {
-    for (const [observed, completed] of [
-      [
-        "<<<BEGIN_OPENCLAW_INTERNAL_CONT",
-        "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nx\n<<<END_OPENCLAW_INTERNAL_CONTEXT>>>",
-      ],
-      ["[tool calls omitted", "[tool calls omitted]"],
-    ] as const) {
-      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
-      expect(sanitizeAssistantVisibleStreamText(completed)).toBe("");
-      const h = makeDraftHarness();
-      h.draft.handleAssistantMessageBoundary();
-      h.draft.pushAnswerText({ text: observed });
-      await h.draft.drain();
-      expect(h.frames).toEqual([]);
-    }
-
-    for (const source of [
-      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXTX>>>",
-      "[tool calls omitted x]",
-      "analysis",
-      "final",
-      "commentary",
-      "tool",
-      "tool call",
-      "function call",
-      "`🛠️ Exec: ls`",
-      "Use `<relevant_memories a=<|x|>>secret` literally",
-    ]) {
-      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
-      const literal = makeDraftHarness();
-      literal.draft.handleAssistantMessageBoundary();
-      literal.draft.pushAnswerText({ text: source });
-      await literal.draft.drain();
-      expect(literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        source,
-      ]);
-    }
-
-    for (const invalidJson of ["[bash]\n{bad", '[bash]\n{"x":bad']) {
-      expect(sanitizeAssistantVisibleStreamText(invalidJson)).toBe(invalidJson);
-      const released = makeDraftHarness();
-      released.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(invalidJson)) {
-        released.draft.pushAnswerText({ text });
-      }
-      await released.draft.drain();
-      expect(released.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        invalidJson,
-      ]);
-      expect(successfulIds(released.frames)).toHaveLength(1);
-    }
-
-    for (const source of [
-      "🛠️ Exec\nAnswer",
-      "🛠️ ru\nAnswer",
-      "[tool calls omitted\nAnswer",
-      '[bash]\n{"x":1}[/other]',
-      "[bash]\n<parameter=x>y</parameter>",
-      "<function=bash><parameter=x>y</parameter>",
-    ]) {
-      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
-      const literalLine = makeDraftHarness();
-      literalLine.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(source)) {
-        literalLine.draft.pushAnswerText({ text });
-      }
-      await literalLine.draft.drain();
-      expect(literalLine.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-        source,
-      ]);
-      expect(successfulIds(literalLine.frames)).toHaveLength(1);
-    }
-
-    const overLimitJson = `[bash]\n{"x":"${"a".repeat(256e3)}"}[/bash]`;
-    expect(sanitizeAssistantVisibleStreamText(overLimitJson)).toBe(overLimitJson);
-    const overLimit = makeDraftHarness();
-    overLimit.draft.handleAssistantMessageBoundary();
-    overLimit.draft.pushAnswerText({ text: overLimitJson });
-    await overLimit.draft.drain();
-    expect(overLimit.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      overLimitJson,
-    ]);
-    expect(successfulIds(overLimit.frames)).toHaveLength(1);
-
-    for (const [observed, completed] of [
-      ["[hello]", '[hello]\n{"x":1}[/hello]'],
-      ["[bash]\n{\"x\":", '[bash]\n{"x":1}[/bash]'],
-      [
-        "[TOOL_CALL] garbage",
-        '[TOOL_CALL] garbage tool => "bash" args => {}',
-      ],
-      [
-        "[TOOL_CALL] tool => x args => {}",
-        '[TOOL_CALL] tool => x args => {} tool => "bash" args => {}',
-      ],
-      ["<invoke attr>literal", "<invoke attr>literal</invoke><minimax:tool_call>"],
-    ] as const) {
-      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
-      expect(sanitizeAssistantVisibleStreamText(completed)).toBe("");
-      const ambiguous = makeDraftHarness();
-      ambiguous.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(observed)) {
-        ambiguous.draft.pushAnswerText({ text });
-      }
-      await ambiguous.draft.drain();
-      expect(ambiguous.frames, observed).toEqual([]);
-    }
-  });
-
-  it("M7l21: core-marker scanning grows linearly for repeated invalid opens and closes", async () => {
-    const nativeIndexOf = String.prototype.indexOf;
-    const measureExactSourceScans = async (source: string): Promise<number> => {
-      let scans = 0;
-      const indexOf = vi
-        .spyOn(String.prototype, "indexOf")
-        .mockImplementation(function (this: string, search: string, position?: number) {
-          if (String(this) === source && search === "<") scans += 1;
-          return nativeIndexOf.call(this, search, position);
-        });
-      try {
-        const h = makeDraftHarness();
-        h.draft.handleAssistantMessageBoundary();
-        h.draft.pushAnswerText({ text: source });
-        await h.draft.drain();
-        expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-          source,
-        ]);
-      } finally {
-        indexOf.mockRestore();
-      }
-      return scans;
-    };
-
-    for (const repeated of [
-      (n: number) => "<tool_call>literal ".repeat(n) + "<parameter>x",
-      (n: number) => "</invoke>literal ".repeat(n) + "<parameter>x",
-    ]) {
-      const smallN = 256;
-      const largeN = 1024;
-      const smallScans = await measureExactSourceScans(repeated(smallN));
-      const largeScans = await measureExactSourceScans(repeated(largeN));
-      expect(smallScans).toBeLessThanOrEqual(smallN * 2 + 20);
-      expect(largeScans).toBeLessThanOrEqual(largeN * 2 + 20);
-      expect(largeScans).toBeLessThanOrEqual(smallScans * 5 + 20);
-    }
-
-    const nativeSlice = String.prototype.slice;
-    const measureComposedOperations = (
-      n: number,
-      repeated: string,
-      tail: string,
-    ): number => {
-      const source = "PERF\n" + repeated.repeat(n) + tail;
-      let operations = 0;
-      const indexOf = vi
-        .spyOn(String.prototype, "indexOf")
-        .mockImplementation(function (this: string, search: string, position?: number) {
-          if (String(this).startsWith("PERF\n") && ["<", "[", "\n"].includes(search)) {
-            operations += 1;
-          }
-          return nativeIndexOf.call(this, search, position);
-        });
-      const slice = vi
-        .spyOn(String.prototype, "slice")
-        .mockImplementation(function (this: string, start?: number, end?: number) {
-          if (String(this).startsWith("PERF\n")) operations += 1;
-          return nativeSlice.call(this, start, end);
-        });
-      try {
-        const h = makeDraftHarness();
-        h.draft.handleAssistantMessageBoundary();
-        h.draft.pushAnswerText({ text: source });
-      } finally {
-        slice.mockRestore();
-        indexOf.mockRestore();
-      }
-      return operations;
-    };
-
-    for (const [repeated, tail] of [
-      [
-        "[TOOL_CALL] garbage ",
-        "[/TOOL_CALL]\n<relevant_memories a=<|x|",
-      ],
-      ["<thinkx literal\n", "<relevant_memories a=<|x|"],
-    ] as const) {
-      const smallOperations = measureComposedOperations(128, repeated, tail);
-      const largeOperations = measureComposedOperations(512, repeated, tail);
-      expect(largeOperations).toBeLessThanOrEqual(smallOperations * 5 + 100);
-    }
-
-    const measureInlineRestorationSliceWork = async (
-      n: number,
-    ): Promise<{ copiedCharacters: number; sourceLength: number }> => {
-      const source = `B ${"`<tool_call>` ".repeat(n)}`;
-      const h = makeDraftHarness();
-      h.draft.handleAssistantMessageBoundary();
-      h.draft.pushAnswerText({ text: "A" });
-      await h.draft.flush();
-
-      let copiedCharacters = 0;
-      const slice = vi
-        .spyOn(String.prototype, "slice")
-        .mockImplementation(function (this: string, start?: number, end?: number) {
-          if (String(this) === source) {
-            const normalize = (value: number | undefined, fallback: number): number => {
-              const index = value ?? fallback;
-              return index < 0
-                ? Math.max(source.length + index, 0)
-                : Math.min(index, source.length);
-            };
-            const from = normalize(start, 0);
-            const to = normalize(end, source.length);
-            copiedCharacters += Math.max(0, to - from);
-          }
-          return nativeSlice.call(this, start, end);
-        });
-      try {
-        h.draft.pushAnswerText({ text: source });
-        await h.draft.flush();
-      } finally {
-        slice.mockRestore();
-      }
-      return { copiedCharacters, sourceLength: source.length };
-    };
-
-    const smallInlineWork = await measureInlineRestorationSliceWork(256);
-    const largeInlineWork = await measureInlineRestorationSliceWork(1024);
-    expect(largeInlineWork.copiedCharacters).toBeLessThanOrEqual(
-      smallInlineWork.copiedCharacters * 5 + 100,
-    );
-    expect(largeInlineWork.copiedCharacters).toBeLessThanOrEqual(
-      largeInlineWork.sourceLength * 50,
-    );
-  });
-
-  it("M7l27: plain-tool XML provenance survives suppressed gaps between parameters", async () => {
-    for (const source of [
-      "[tool:bash]<parameter=x>y</parameter><parameter=z>w</parameter>",
-      "[tool:search]<parameter=x>y</parameter><parameter=z>w</parameter><parameter=q>r</parameter>",
-    ]) {
-      expect(sanitizeAssistantVisibleStreamText(source)).toBe("");
-      const hidden = makeDraftHarness();
-      hidden.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(source)) {
-        hidden.draft.pushAnswerText({ text });
-        await hidden.draft.flush();
-      }
-      await hidden.draft.drain();
-      expect(hidden.frames, source).toEqual([]);
-    }
-
-    const firstComplete = "[tool:bash]<parameter=x>y</parameter>";
-    const secondIncomplete = `${firstComplete}<parameter=z>w`;
-    const secondComplete = `${secondIncomplete}</parameter>`;
-    expect(sanitizeAssistantVisibleStreamText(firstComplete)).toBe("");
-    expect(sanitizeAssistantVisibleStreamText(secondIncomplete)).toBe("<parameter=z>w");
-    expect(sanitizeAssistantVisibleStreamText(secondComplete)).toBe("");
-    const staged = makeDraftHarness();
-    staged.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedStreamDistinctPartials(firstComplete)) {
-      staged.draft.pushAnswerText({ text });
-      await staged.draft.flush();
-    }
-    staged.draft.pushAnswerText({
-      text: sanitizeAssistantVisibleStreamText(secondIncomplete),
-    });
-    await staged.draft.flush();
-    expect(staged.frames).toEqual([]);
-    // The completed callback is empty and therefore suppressed by core.
-    await staged.draft.drain();
-    expect(staged.frames).toEqual([]);
-
-    const visibleSource =
-      "Hello\n[tool:bash]<parameter=x>y</parameter><parameter=z>w</parameter>\nAnswer";
-    const visibleExpected = sanitizeAssistantVisibleStreamText(visibleSource);
-    expect(visibleExpected).toBe("Hello\nAnswer");
-    const visible = makeDraftHarness();
-    visible.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedStreamDistinctPartials(visibleSource)) {
-      visible.draft.pushAnswerText({ text });
-      await visible.draft.flush();
-    }
-    await visible.draft.drain();
-    expect(
-      visible.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual([visibleExpected]);
-    expect(successfulIds(visible.frames)).toHaveLength(1);
-    expect(visible.frames.every((frame) => visibleExpected.startsWith(frame.text))).toBe(true);
-    expect(
-      visible.frames.every(
-        (frame) => !frame.text.includes("[tool:") && !frame.text.includes("<parameter"),
-      ),
-    ).toBe(true);
-  });
-
-  it("M7l28: plural wrappers retain parameter-unwrapping provenance", async () => {
-    for (const source of [
-      "<tool_calls><parameter>x</parameter></tool_calls>",
-      "<function_calls><parameter>x</parameter></function_calls>",
-      "<tool_calls><parameter><parameter>x</parameter></parameter></tool_calls>",
-      "<function_calls><parameter>a<parameter>b</parameter>c</parameter></function_calls>",
-      "<tool_calls><parameter>x</parameter><parameter>y</parameter></tool_calls>",
-      "<function_calls><parameter/><parameter>x</parameter></function_calls>",
-      "<tool_calls><parameter><parameter/>x</parameter></tool_calls>",
-      '<Tool_Calls data-x="1"><Parameter name="p">x</Parameter></Tool_Calls>',
-      '< tool_calls data-x="1" > \n <parameter name="p">x</parameter> \n </ tool_calls >',
-      '<function_calls><parameter>x</parameter><function_call>{"x":1}</function_call></function_calls>',
-    ]) {
-      expect(sanitizeAssistantVisibleStreamText(source), source).toBe("");
-      const hidden = makeDraftHarness();
-      hidden.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(source)) {
-        hidden.draft.pushAnswerText({ text });
-        await hidden.draft.flush();
-      }
-      await hidden.draft.drain();
-      expect(hidden.frames, source).toEqual([]);
-    }
-
-    for (const source of [
-      "Hello <tool_calls><parameter>x</parameter></tool_calls> Answer",
-      "Hello <function_calls><parameter/><parameter>x</parameter></function_calls> Answer",
-    ]) {
-      const expected = sanitizeAssistantVisibleStreamText(source);
-      expect(expected, source).toBe("Hello  Answer");
       const visible = makeDraftHarness();
       visible.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedStreamDistinctPartials(source)) {
-        visible.draft.pushAnswerText({ text });
-        await visible.draft.flush();
-      }
+      for (const text of visibleCallbacks) visible.draft.pushAnswerText({ text });
+      await visible.draft.finalize("Hello  Answer");
       await visible.draft.drain();
-      expect(
-        visible.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-        source,
-      ).toEqual([expected]);
-      expect(successfulIds(visible.frames), source).toHaveLength(1);
-      expect(
-        visible.frames.every(
-          (frame) =>
-            expected.startsWith(frame.text) &&
-            !frame.text.includes("_calls") &&
-            !frame.text.includes("<parameter"),
-        ),
-        source,
-      ).toBe(true);
-    }
+      expect(bubbleOrder(visible.frames)).toEqual(["Hello  Answer"]);
+      expect(successfulIds(visible.frames)).toHaveLength(1);
+      expect(visible.frames.some((frame) => frame.text.includes(`<${tag}`))).toBe(false);
+    },
+  );
 
-    for (const [observed, completed] of [
-      [
-        "<tool_calls><paramete",
-        "<tool_calls><parameter>x</parameter></tool_calls>",
-      ],
-      [
-        "<function_calls><paramete",
-        "<function_calls><parameter>x</parameter></function_calls>",
-      ],
-    ] as const) {
-      expect(sanitizeAssistantVisibleStreamText(observed)).toBe(observed);
-      expect(sanitizeAssistantVisibleStreamText(completed)).toBe("");
-      const coalesced = makeDraftHarness();
-      coalesced.draft.handleAssistantMessageBoundary();
-      coalesced.draft.pushAnswerText({ text: observed });
-      await coalesced.draft.flush();
-      expect(coalesced.frames, observed).toEqual([]);
-      // Core suppresses the completed empty callback.
-      await coalesced.draft.drain();
-      expect(coalesced.frames, observed).toEqual([]);
-    }
+  it("M7l4: incomplete terminal fallback is visible-prefix-only", async () => {
+    const visible = makeDraftHarness();
+    visible.draft.handleAssistantMessageBoundary();
+    visible.draft.pushAnswerText({ text: "see <tool_cal" });
+    await visible.draft.drain();
+    expect(bubbleOrder(visible.frames)).toEqual(["see <tool_cal"]);
 
-    const malformed =
-      "<tool_calls><parameterX>x</parameterX></tool_calls> literal";
-    expect(sanitizeAssistantVisibleStreamText(malformed)).toBe(malformed);
-    const literal = makeDraftHarness();
-    literal.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedStreamDistinctPartials(malformed)) {
-      literal.draft.pushAnswerText({ text });
-      await literal.draft.flush();
-    }
-    await literal.draft.drain();
-    expect(
-      literal.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual([malformed]);
-    expect(successfulIds(literal.frames)).toHaveLength(1);
+    const anchorZero = makeDraftHarness();
+    anchorZero.draft.handleAssistantMessageBoundary();
+    anchorZero.draft.pushAnswerText({ text: "<tool_cal" });
+    await anchorZero.draft.drain();
+    expect(anchorZero.frames).toEqual([]);
 
-    const code =
-      'Use `<function_calls><parameter>x</parameter></function_calls>` literally';
-    expect(sanitizeAssistantVisibleStreamText(code)).toBe(code);
-    const codeLiteral = makeDraftHarness();
-    codeLiteral.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedStreamDistinctPartials(code)) {
-      codeLiteral.draft.pushAnswerText({ text });
-      await codeLiteral.draft.flush();
-    }
-    await codeLiteral.draft.drain();
-    expect(
-      codeLiteral.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual([code]);
-    expect(successfulIds(codeLiteral.frames)).toHaveLength(1);
-    expect(codeLiteral.frames.every((frame) => code.startsWith(frame.text))).toBe(true);
+    const exact = makeDraftHarness();
+    exact.draft.handleAssistantMessageBoundary();
+    exact.draft.pushAnswerText({ text: "see <tool_call>" });
+    await exact.draft.drain();
+    expect(bubbleOrder(exact.frames)).toEqual(["see "]);
   });
 
-  it("M7l11: an inline close plus suffix restores in-lane across unequal delimiters", async () => {
-    const source = 'Use ``<tool_call>{"x":1}</tool_call> after` literally';
-    const beforeClosingDelimiter = source.slice(0, source.indexOf("` literally"));
+  it("M7l5: a boundary restores an incomplete literal before the next lane", async () => {
     const h = makeDraftHarness();
     h.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(beforeClosingDelimiter)) {
-      h.draft.pushAnswerText({ text });
-    }
-    // The provider may coalesce the closing backtick and following prose into
-    // one callback instead of yielding at the delimiter byte.
-    h.draft.pushAnswerText({ text: sanitizeAssistantVisibleText(source) });
+    h.draft.pushAnswerText({ text: "see <tool_cal" });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Second" });
+    await h.draft.drain();
+    expect(bubbleOrder(h.frames)).toEqual(["see <tool_cal", "Second"]);
+    expect(successfulIds(h.frames)).toHaveLength(2);
+  });
+
+  it("M7l6: an incomplete literal claims its lane before an independent terminal", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "<parameter>x" });
+    await h.draft.flush();
+    await h.draft.deliverIndependentFinal({ text: "ERROR" });
     await h.draft.drain();
 
-    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      source,
-    ]);
+    expect(bubbleOrder(h.frames)).toEqual(["ERROR"]);
+
+    const visible = makeDraftHarness();
+    visible.draft.handleAssistantMessageBoundary();
+    visible.draft.pushAnswerText({ text: "before <tool_cal" });
+    await visible.draft.flush();
+    await visible.draft.deliverIndependentFinal({ text: "ERROR" });
+    await visible.draft.drain();
+    expect(bubbleOrder(visible.frames)).toEqual(["before <tool_cal", "ERROR"]);
+    expect(successfulIds(visible.frames)).toHaveLength(2);
+  });
+
+  it.each([
+    ["plain", "Use <tool_call> literally."],
+    ["inline code", 'Use `<tool_call>{"x":1}</tool_call>` literally.'],
+    ["fenced code", '```xml\n<tool_call>{"x":1}</tool_call>\n```'],
+  ])("M7l7: an authoritative final restores %s control-looking text", async (_name, source) => {
+    expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    await replayPinnedStreamPrefixes(h.draft, source);
+    await h.draft.finalize(source);
+    await h.draft.drain();
+    expect(bubbleOrder(h.frames)).toEqual([source]);
     expect(successfulIds(h.frames)).toHaveLength(1);
     expect(h.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+  });
 
-    const priorRegionsSource =
-      `Prior ${"`<tool_call>` ".repeat(12)}` +
-      '`<tool_call>{"x":1}</tool_call> after` done';
-    const priorRegions = makeDraftHarness();
-    priorRegions.draft.handleAssistantMessageBoundary();
-    for (const text of pinnedCoreDistinctPartials(priorRegionsSource)) {
-      priorRegions.draft.pushAnswerText({ text });
+  it("M7l8: delta and replace updates cannot unlock an exact quarantine", async () => {
+    const delta = makeDraftHarness();
+    delta.draft.handleAssistantMessageBoundary();
+    delta.draft.pushAnswerText({ text: "Hello <tool_cal" });
+    delta.draft.pushAnswerText({ delta: 'l>{"x":1}</tool_call> Answer' });
+    await delta.draft.finalize("Hello  Answer");
+    await delta.draft.drain();
+    expect(bubbleOrder(delta.frames)).toEqual(["Hello  Answer"]);
+    expect(successfulIds(delta.frames)).toHaveLength(1);
+
+    const replace = makeDraftHarness();
+    replace.draft.handleAssistantMessageBoundary();
+    replace.draft.pushAnswerText({ text: "Hello <tool_call>" });
+    replace.draft.pushAnswerText({ text: "replacement", replace: true });
+    await replace.draft.flush();
+    expect(replace.frames.some((frame) => frame.text === "replacement")).toBe(false);
+    await replace.draft.finalize("replacement");
+    expect(bubbleOrder(replace.frames)).toEqual(["replacement"]);
+    expect(successfulIds(replace.frames)).toHaveLength(1);
+  });
+
+  it("M7l9: nested model-token deletion promotes the earliest outer probe", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "<tool_<|x" });
+    h.draft.pushAnswerText({ text: "<tool_" });
+    await h.draft.drain();
+    expect(h.frames).toEqual([]);
+
+    const memory = makeDraftHarness();
+    memory.draft.handleAssistantMessageBoundary();
+    const source = "<relevant_memories a=<|x|>>secret";
+    expect(sanitizeAssistantVisibleStreamText(source)).toBe("");
+    await replayPinnedStreamPrefixes(memory.draft, source);
+    await memory.draft.drain();
+    expect(memory.frames).toEqual([]);
+  });
+
+  it("M7l10: the angle scan stays bounded on repeated target-like literals", async () => {
+    const candidateCount = 8_000;
+    const source = `${"<tool_calligraphy> literal ".repeat(candidateCount)}done`;
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    const indexOf = vi.spyOn(String.prototype, "indexOf");
+    try {
+      h.draft.pushAnswerText({ text: source });
+      await h.draft.flush();
+      const angleSearches = indexOf.mock.calls.filter(([needle]) => needle === "<").length;
+      expect(angleSearches).toBeLessThanOrEqual(candidateCount * 2 + 50);
+    } finally {
+      indexOf.mockRestore();
     }
-    await priorRegions.draft.drain();
-    expect(
-      priorRegions.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual([priorRegionsSource]);
-    expect(successfulIds(priorRegions.frames)).toHaveLength(1);
-
-    const unclosedRaw = 'Use `<tool_call>{"x":1}</tool_call> after';
-    const restoredSource = `${unclosedRaw}\` literally`;
-    const sanitizedUnclosed = sanitizeAssistantVisibleText(unclosedRaw);
-    expect(sanitizedUnclosed).toBe("Use ` after");
-    expect(sanitizeAssistantVisibleText(restoredSource)).toBe(restoredSource);
-    const coalesced = makeDraftHarness();
-    coalesced.draft.handleAssistantMessageBoundary();
-    // No raw marker prefix reached the adapter, so this restoration exercises
-    // the bounded fallback rather than deferred opener provenance.
-    coalesced.draft.pushAnswerText({ text: sanitizedUnclosed });
-    await coalesced.draft.flush();
-    coalesced.draft.pushAnswerText({ text: restoredSource });
-    await coalesced.draft.drain();
-    expect(
-      coalesced.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual([restoredSource]);
-    expect(successfulIds(coalesced.frames)).toHaveLength(1);
-  });
-
-  it("M7m: a same-length tag-free control with a literal less-than stays intact", async () => {
-    const source = "Hello 1 < 2 is literal text.".padEnd(50, ".");
-    expect(source).toHaveLength(50);
-
-    const h = makeDraftHarness();
-    h.draft.handleAssistantMessageBoundary();
-    for (const text of cumulativePrefixes(source)) h.draft.pushAnswerText({ text });
-    await h.draft.flush();
-    expect(h.draft.snapshotText()).toBe(source);
-    expect(h.frames.at(-1)?.text).toBe(source);
-    await expect(h.draft.finalize(source)).resolves.toBe(true);
-    await h.draft.drain();
-
-    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      source,
-    ]);
-    expect(successfulIds(h.frames)).toHaveLength(1);
-  });
-
-  it("M7n: the locally-stripped thinking path remains one bubble", async () => {
-    const source = "Hello <thinking>zzz</thinking> there";
-    const warn = vi.fn();
-    const h = makeDraftHarness({ logger: { warn } });
-    h.draft.handleAssistantMessageBoundary();
-    for (const text of cumulativePrefixes(source)) h.draft.pushAnswerText({ text });
-    await h.draft.flush();
-    expect(h.draft.snapshotText()).toBe("Hello  there");
-    await expect(h.draft.finalize("Hello  there")).resolves.toBe(true);
-    await h.draft.drain();
-
-    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      "Hello  there",
-    ]);
-    expect(successfulIds(h.frames)).toHaveLength(1);
-    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("contract violation"));
-  });
-
-  it("M7o: terminal settlement preserves literal incomplete tag-like tails", async () => {
-    const finalized = makeDraftHarness();
-    finalized.draft.handleAssistantMessageBoundary();
-    finalized.draft.pushAnswerText({ text: "see <div" });
-    await finalized.draft.flush();
-    expect(finalized.draft.snapshotText()).toBe("see <div");
-    await expect(finalized.draft.finalize("see <div")).resolves.toBe(true);
-    await finalized.draft.drain();
-    expect(
-      finalized.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual(["see <div"]);
-
-    // This one is ambiguous with an allowlisted tag until the stream ends. A
-    // silent terminal drain is still an end-of-stream signal, so it must release
-    // the held suffix as literal text rather than truncate it.
-    const drained = makeDraftHarness();
-    drained.draft.handleAssistantMessageBoundary();
-    drained.draft.pushAnswerText({ text: "see <tool_cal" });
-    await drained.draft.drain();
-    expect(
-      drained.frames.filter((frame) => frame.type === "final").map((frame) => frame.text),
-    ).toEqual(["see <tool_cal"]);
-
-    // At anchor zero the same incomplete NAME is not safe: one provider chunk
-    // may complete its payload and close, producing only a suppressed empty
-    // callback. Tool-only safety therefore wins this information-theoretic tie.
-    const anchorless = makeDraftHarness();
-    anchorless.draft.handleAssistantMessageBoundary();
-    anchorless.draft.pushAnswerText({ text: "<tool_cal" });
-    await anchorless.draft.drain();
-    expect(anchorless.frames).toEqual([]);
-
-    // The same chunk-coalescing rule applies even when core would expose an
-    // intermediate completion during a one-character replay.
-    for (const source of ["<function", "<parameter", "<invoke"]) {
-      const exactOpening = makeDraftHarness();
-      exactOpening.draft.handleAssistantMessageBoundary();
-      for (const text of pinnedCoreDistinctPartials(source)) {
-        exactOpening.draft.pushAnswerText({ text });
-      }
-      await exactOpening.draft.drain();
-      expect(exactOpening.frames).toEqual([]);
-    }
-  });
-
-  it("M7p: a measured sawtooth followed by a real boundary yields exactly two messages", async () => {
-    // Cross the new tail-hold guard with the structured-boundary guard. The
-    // first message must not rotate on its sawtooth, while the real boundary
-    // must still rotate exactly once before the second message.
-    const h = makeDraftHarness();
-    h.draft.handleAssistantMessageBoundary();
-    for (const text of CORE_TOOL_CALL_SAWTOOTH) h.draft.pushAnswerText({ text });
-    h.draft.handleAssistantMessageBoundary();
-    h.draft.pushAnswerText({ text: "Second message" });
-    await expect(h.draft.finalize("Second message")).resolves.toBe(true);
-    await h.draft.drain();
-
-    const finals = h.frames.filter((frame) => frame.type === "final");
-    expect(finals.map((frame) => frame.text)).toEqual(["Hello  there", "Second message"]);
-    expect(new Set(finals.map((frame) => frame.id)).size).toBe(2);
-    expect(h.frames.map((frame) => frame.text).join("\n")).not.toContain("<tool_call");
-  });
-
-  it("M7q: delta composition retains a temporarily deferred literal suffix", async () => {
-    const h = makeDraftHarness();
-    h.draft.handleAssistantMessageBoundary();
-    h.draft.pushAnswerText({ delta: "see " });
-    h.draft.pushAnswerText({ delta: "<" });
-    h.draft.pushAnswerText({ delta: "d" });
-    h.draft.pushAnswerText({ delta: "iv" });
-    await h.draft.drain();
-
-    expect(h.frames.filter((frame) => frame.type === "final").map((frame) => frame.text)).toEqual([
-      "see <div",
-    ]);
+    await h.draft.finalize(source);
+    expect(bubbleOrder(h.frames)).toEqual([source]);
     expect(successfulIds(h.frames)).toHaveLength(1);
   });
 
