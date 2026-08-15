@@ -366,7 +366,8 @@ function classifyMemoryMarkerAt(
     }
     if (offset === target.length) {
       const boundary = text[nameStart + offset];
-      if (boundary === undefined || !/\w/.test(boundary)) return "exact";
+      if (boundary === undefined || boundary === "<") return "incomplete";
+      if (!/\w/.test(boundary)) return "exact";
       continue;
     }
     if (
@@ -412,7 +413,13 @@ function classifyAngleMarkerAt(
   if (cursor === nameStart) return undefined;
   const fragment = text.slice(nameStart, cursor).toLowerCase();
   for (const name of CORE_ANGLE_MARKER_NAMES) {
-    if (fragment === name) return "exact";
+    if (fragment === name) {
+      const boundary = text[cursor];
+      if (boundary === undefined || boundary === "<") return "incomplete";
+      return /\s/.test(boundary) || boundary === "/" || boundary === ">"
+        ? "exact"
+        : undefined;
+    }
     if ((cursor === text.length || text[cursor] === "<") && name.startsWith(fragment)) {
       return "incomplete";
     }

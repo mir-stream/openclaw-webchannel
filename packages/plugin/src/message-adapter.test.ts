@@ -2021,6 +2021,99 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(bubbleOrder(literal.frames)).toEqual([disproved]);
   });
 
+  it("M7l14: end-of-callback names remain literal until a boundary proves otherwise", async () => {
+    for (const [name, source] of [
+      ["tool_call", "Use <tool_calligraphy> literally."],
+      ["relevant_memories", "Use <relevant_memoriesx> literally."],
+    ] as const) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+
+      const charwise = makeDraftHarness();
+      charwise.draft.handleAssistantMessageBoundary();
+      await replayPinnedStreamPrefixes(charwise.draft, source);
+      await charwise.draft.drain();
+      expect(bubbleOrder(charwise.frames)).toEqual([source]);
+      expect(successfulIds(charwise.frames)).toHaveLength(1);
+      expect(charwise.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+
+      const exactPrefix = `Use <${name}`;
+      expect(sanitizeAssistantVisibleStreamText(exactPrefix)).toBe(exactPrefix);
+      const twoCallbacks = makeDraftHarness();
+      twoCallbacks.draft.handleAssistantMessageBoundary();
+      twoCallbacks.draft.pushAnswerText({ text: exactPrefix });
+      twoCallbacks.draft.pushAnswerText({ text: source });
+      await twoCallbacks.draft.drain();
+      expect(bubbleOrder(twoCallbacks.frames)).toEqual([source]);
+
+      const noFinal = makeDraftHarness();
+      noFinal.draft.handleAssistantMessageBoundary();
+      noFinal.draft.pushAnswerText({ text: exactPrefix });
+      await noFinal.draft.drain();
+      expect(bubbleOrder(noFinal.frames)).toEqual([exactPrefix]);
+    }
+
+    const fifo = makeDraftHarness();
+    fifo.draft.handleAssistantMessageBoundary();
+    fifo.draft.pushAnswerText({ text: "Use <tool_call" });
+    await fifo.draft.flush();
+    await fifo.draft.deliverIndependentFinal({ text: "ERROR" });
+    await fifo.draft.drain();
+    expect(bubbleOrder(fifo.frames)).toEqual(["Use <tool_call", "ERROR"]);
+    expect(successfulIds(fifo.frames)).toHaveLength(2);
+  });
+
+  it("M7l15: non-XML core-name boundaries monotonically release literals", async () => {
+    for (const source of [
+      "Use <tool_call!> literally.",
+      "Use <function=> literally.",
+      "Use <final!> literally.",
+      "Use <invoke?> literally.",
+      "Use <parameter!> literally.",
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      await replayPinnedStreamPrefixes(h.draft, source);
+      await h.draft.drain();
+      expect(bubbleOrder(h.frames)).toEqual([source]);
+      expect(successfulIds(h.frames)).toHaveLength(1);
+      expect(h.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+    }
+  });
+
+  it("M7l16: valid XML and memory boundaries retain hidden-tag quarantine", async () => {
+    for (const source of [
+      '<tool_call >{"x":1}</tool_call>',
+      "<tool_call/>",
+      '<tool_call>{"x":1}</tool_call>',
+      "<relevant_memories!>secret",
+      "<relevant_memories<|x|>>secret",
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe("");
+      const hidden = makeDraftHarness();
+      hidden.draft.handleAssistantMessageBoundary();
+      await replayPinnedStreamPrefixes(hidden.draft, source);
+      await hidden.draft.drain();
+      expect(hidden.frames).toEqual([]);
+    }
+
+    for (const source of [
+      'Hello <tool_call >{"x":1}</tool_call> Answer',
+      "Hello <tool_call/> Answer",
+      'Hello <tool_call>{"x":1}</tool_call> Answer',
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe("Hello  Answer");
+      const visible = makeDraftHarness();
+      visible.draft.handleAssistantMessageBoundary();
+      await replayPinnedStreamPrefixes(visible.draft, source);
+      await visible.draft.finalize("Hello  Answer");
+      await visible.draft.drain();
+      expect(bubbleOrder(visible.frames)).toEqual(["Hello  Answer"]);
+      expect(successfulIds(visible.frames)).toHaveLength(1);
+      expect(visible.frames.some((frame) => frame.text.includes("<tool_call"))).toBe(false);
+    }
+  });
+
   /**
    * #94 — a notice block between two real blocks used to stall every later
    * message for the rest of the turn.
