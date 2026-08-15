@@ -1,9 +1,15 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { rmSync } from "node:fs";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
-vi.hoisted(() => {
-  process.env.TRUST_CHAIN_PATH = `/tmp/openclaw-demo-enroll-validation-${process.pid}.json`;
+const trustRoot = await vi.hoisted(async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const root = mkdtempSync(join(tmpdir(), "openclaw-demo-enroll-validation-"));
+  process.env.TRUST_CHAIN_PATH = join(root, "trust-chain.json");
+  return root;
 });
 import { DeviceFlowEnrollment } from "../packages/saas/src/device-flow-enrollment.js";
 import { demoSaasRequestHandler } from "./saas-server.js";
@@ -29,6 +35,7 @@ async function invoke(body: unknown) {
 }
 
 afterEach(() => vi.restoreAllMocks());
+afterAll(() => rmSync(trustRoot, { recursive: true, force: true }));
 
 describe("demo /api/enroll validation boundary", () => {
   it("returns the intentional validation error as 400", async () => {

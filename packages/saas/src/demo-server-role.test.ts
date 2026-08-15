@@ -15,7 +15,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -53,6 +53,7 @@ const TSX_BIN = (() => {
 })();
 
 let server: ReturnType<typeof spawn> | null = null;
+let trustRoot: string | null = null;
 
 async function waitForHttp(url: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -100,6 +101,7 @@ function jwtExp(jwt: string): number | undefined {
 
 describe("demo SaaS /nats-user role-escalation guard (F6)", () => {
   beforeAll(async () => {
+    trustRoot = mkdtempSync(join(tmpdir(), "demo-role-smoke-"));
     server = spawn(TSX_BIN, [SERVER_PATH], {
       cwd: dirname(SERVER_PATH),
       env: {
@@ -111,7 +113,7 @@ describe("demo SaaS /nats-user role-escalation guard (F6)", () => {
         NATS_URL: `ws://127.0.0.1:${NATS_WS}`,
         // The demo server persists its trust chain here (run.sh always sets this);
         // a per-run temp file keeps the smoke hermetic.
-        TRUST_CHAIN_PATH: join(tmpdir(), `demo-role-smoke-${process.pid}-${Date.now()}.json`),
+        TRUST_CHAIN_PATH: join(trustRoot, "trust-chain.json"),
       },
       stdio: "pipe",
     });
@@ -122,6 +124,8 @@ describe("demo SaaS /nats-user role-escalation guard (F6)", () => {
   afterAll(() => {
     server?.kill("SIGTERM");
     server = null;
+    if (trustRoot) rmSync(trustRoot, { recursive: true, force: true });
+    trustRoot = null;
   });
 
   const perPeer = `webchannel.${TENANT}.*.${ALICE_UUID}.>`;

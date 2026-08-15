@@ -12,9 +12,13 @@
  * persistence is simply: generate once, JSON-serialize to a 0600 file, reload.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
+import {
+  atomicWritePrivateFile,
+  ensurePrivateDirectory,
+  readPrivateFileIfExists,
+} from "./private-file.js";
 import { setupTrustChain, type SetupTrustChainOptions } from "./setup-trust-chain.js";
 import type {
   SetupTrustChainResult,
@@ -26,11 +30,17 @@ import type {
  * Load a persisted trust chain from `path`, or create + persist a new one.
  *
  * The file holds the SaaS trust root (RSA private key + NATS account signing
- * seed), so it is written with mode 0600 and its parent dir created mode 0700. On
- * every subsequent boot the SAME chain is returned verbatim, so already-enrolled
- * agents keep NKEY-authenticating and issued bootstrap JWTs keep verifying across
- * restarts — the invariant a launchd-managed issuer (and the live gateway that
- * depends on it) requires.
+ * seed, system credential, and optionally operator seed), so new parent dirs are
+ * 0700 and the file is exactly 0600. Existing roots and files are loaded only
+ * after owner/mode/type checks and an O_NOFOLLOW descriptor/inode binding. This
+ * closes disclosure through paths writable by a different OS user; Node's
+ * path-based APIs do not provide a complete malicious-same-uid boundary.
+ *
+ * Creation fsyncs a unique same-directory temporary file and atomically renames
+ * it, so a crash cannot publish a partial JSON document. Two concurrent FIRST
+ * boots can still race at the final rename (the deployment contract remains one
+ * issuer process). On every subsequent boot the SAME chain is returned verbatim,
+ * preserving enrolled NATS credentials and bootstrap-JWT verification.
  */
 // Overloads mirror setupTrustChain: a self-contained caller (no external
 // account) keeps the concrete operator/account/resolver fields.
@@ -55,9 +65,17 @@ export async function loadOrCreateTrustChain(
   // only the RSA key + JWKS + account id, and the seed is re-overlaid from the
   // env-provided material on every load/create.
   const external = options.externalNatsAccount;
+  const parent = dirname(path);
+  let persisted: string | undefined;
+  try {
+    ensurePrivateDirectory(parent);
+    persisted = readPrivateFileIfExists(path);
+  } catch (error) {
+    throw persistedStorageError(path, "read", error);
+  }
 
-  if (existsSync(path)) {
-    const parsed = parsePersistedFile(path);
+  if (persisted !== undefined) {
+    const parsed = parsePersistedFile(path, persisted);
     // Legacy files predate the `mode` discriminator — treat them as self-contained.
     if (parsed?.natsConfig && parsed.natsConfig.mode === undefined) {
       (parsed.natsConfig as { mode?: string }).mode = "self-contained";
@@ -81,15 +99,29 @@ export async function loadOrCreateTrustChain(
   }
 
   const chain = await setupTrustChain(options);
-  const dir = dirname(path);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   // In external mode, strip the signing seed before writing it to disk. The
   // in-memory `chain` we return keeps it.
   const toPersist: SetupTrustChainResult = external
     ? { ...chain, private: { ...chain.private, natsAccountSeed: "" } }
     : chain;
-  writeFileAtomic(path, JSON.stringify(toPersist, null, 2));
+  try {
+    atomicWritePrivateFile(path, JSON.stringify(toPersist, null, 2));
+  } catch (error) {
+    throw persistedStorageError(path, "write", error);
+  }
   return chain;
+}
+
+function persistedStorageError(
+  path: string,
+  operation: "read" | "write",
+  cause: unknown,
+): Error {
+  const detail = cause instanceof Error ? cause.message : "unknown filesystem failure";
+  return new Error(
+    `persisted trust chain at ${path} failed secure ${operation}: ${detail}`,
+    { cause },
+  );
 }
 
 /**
@@ -99,44 +131,18 @@ export async function loadOrCreateTrustChain(
  * invalidate every enrolled agent. This just makes the failure legible: which
  * file, that it's corrupt, and how to recover.
  */
-function parsePersistedFile(path: string): SetupTrustChainResult {
-  const raw = readFileSync(path, "utf-8");
+function parsePersistedFile(path: string, raw: string): SetupTrustChainResult {
   try {
     return JSON.parse(raw) as SetupTrustChainResult;
-  } catch (err) {
+  } catch {
+    // Recent Node versions may include a slice of the rejected input in the
+    // SyntaxError message. The persisted document contains authority secrets,
+    // so do not attach or interpolate the parser error here.
     throw new Error(
-      `persisted trust chain at ${path} is corrupt (not valid JSON): ${(err as Error).message}. ` +
+      `persisted trust chain at ${path} is corrupt (not valid JSON). ` +
         `This usually means a previous write was interrupted. Restore it from backup, or — only if ` +
         `you accept re-enrolling every agent — delete the file to mint a fresh chain on next boot.`,
     );
-  }
-}
-
-/**
- * A3: write `path` atomically so an interrupted write (crash / disk-full) can
- * NEVER leave a partial file that bricks every subsequent boot. We write to a
- * process-unique temp file in the SAME directory (so `rename` is a same-filesystem
- * atomic swap) and rename it into place; readers only ever see a fully-written
- * file or the previous one, never a truncated mix. The temp is cleaned up on a
- * write failure.
- *
- * Note: this eliminates corruption from a partial write. Two processes doing a
- * concurrent FIRST boot (no file yet) still race on the final rename (last writer
- * wins, loser runs an in-memory chain not on disk) — acceptable because the
- * deployment model is a single launchd-managed issuer.
- */
-function writeFileAtomic(path: string, data: string): void {
-  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
-  try {
-    writeFileSync(tmp, data, { mode: 0o600 });
-    renameSync(tmp, path);
-  } catch (err) {
-    try {
-      if (existsSync(tmp)) unlinkSync(tmp);
-    } catch {
-      // best-effort temp cleanup; surface the original write error below
-    }
-    throw err;
   }
 }
 

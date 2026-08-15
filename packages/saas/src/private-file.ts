@@ -1,11 +1,15 @@
 import { randomBytes } from "node:crypto";
 import {
+  chmodSync,
   closeSync,
+  constants,
   fchmodSync,
   fstatSync,
   fsyncSync,
   lstatSync,
+  mkdirSync,
   openSync,
+  readFileSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -14,6 +18,117 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 
 type DirectoryIdentity = Pick<Stats, "dev" | "ino" | "uid">;
+
+/**
+ * Create an absent private directory and validate the caller-owned leaf.
+ *
+ * Newly created leaves are forced to 0700. Existing directories retain their
+ * mode but must be real, owned by the current uid, and not writable by group or
+ * others (0755/0750 caller-owned deployment roots remain compatible).
+ *
+ * @internal Not barrel-exported; persistence code shares the file policy
+ * without expanding the package's public API.
+ */
+export function ensurePrivateDirectory(directory: string): void {
+  const resolvedDirectory = resolve(directory);
+  const firstCreated = mkdirSync(resolvedDirectory, {
+    recursive: true,
+    mode: 0o700,
+  });
+  if (firstCreated !== undefined) {
+    chmodSync(resolvedDirectory, 0o700);
+    fsyncCreatedDirectoryChain(firstCreated, resolvedDirectory);
+  }
+  assertSafeOwnedDirectory(resolvedDirectory);
+}
+
+function fsyncCreatedDirectoryChain(firstCreated: string, directory: string): void {
+  const first = resolve(firstCreated);
+  let current = resolve(directory);
+  const parents: string[] = [];
+
+  while (true) {
+    parents.unshift(dirname(current));
+    if (current === first) break;
+    const parent = dirname(current);
+    if (parent === current) {
+      // `mkdirSync({ recursive: true })` should return an ancestor. If a
+      // platform violates that contract, retain safe modes and make only the
+      // directory-entry durability enhancement best effort.
+      fsyncDirectoryBestEffort(dirname(first));
+      return;
+    }
+    current = parent;
+  }
+
+  for (const parent of parents) fsyncDirectoryBestEffort(parent);
+}
+
+/**
+ * Securely read an optional owner-only regular file without following its
+ * final path component.
+ *
+ * Directory and file identity are rebound around the descriptor read. These
+ * checks defend against a different OS user controlling a writable path; Node's
+ * path APIs do not promise complete protection against a malicious same-uid
+ * process, so callers must not claim that stronger boundary.
+ *
+ * @internal Not barrel-exported.
+ */
+export function readPrivateFileIfExists(filePath: string): string | undefined {
+  const source = resolve(filePath);
+  const directory = dirname(source);
+  const initialDirectory = assertSafeOwnedDirectory(directory);
+
+  let initialEntry: Stats;
+  try {
+    initialEntry = lstatSync(source);
+  } catch (error) {
+    if (isFilesystemErrorCode(error, "ENOENT")) {
+      assertSameSafeOwnedDirectory(directory, initialDirectory);
+      return undefined;
+    }
+    throw new Error(`private-file source is unavailable: ${source}`, { cause: error });
+  }
+  assertSecurePrivateFile(initialEntry, source);
+
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(
+      source,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+    );
+    const opened = fstatSync(descriptor);
+    assertSecurePrivateFile(opened, source);
+    assertSameFileIdentity(initialEntry, opened, source);
+    assertSameSafeOwnedDirectory(directory, initialDirectory);
+
+    const contents = readFileSync(descriptor, "utf8");
+
+    const openedAfterRead = fstatSync(descriptor);
+    assertSecurePrivateFile(openedAfterRead, source);
+    assertSameFileIdentity(opened, openedAfterRead, source);
+    const pathAfterRead = lstatSync(source);
+    assertSecurePrivateFile(pathAfterRead, source);
+    assertSameFileIdentity(openedAfterRead, pathAfterRead, source);
+    assertSameSafeOwnedDirectory(directory, initialDirectory);
+    return contents;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unknown filesystem failure";
+    throw new Error(
+      `private-file source could not be read safely: ${source}: ${detail}`,
+      { cause: error },
+    );
+  } finally {
+    if (descriptor !== undefined) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // Preserve the read result or the original validation failure.
+      }
+    }
+  }
+}
 
 /**
  * Atomically publish private bytes as a regular, owner-only file.
@@ -149,6 +264,22 @@ function assertReplaceableDestination(destination: string): void {
   } catch (error) {
     if (isFilesystemErrorCode(error, "ENOENT")) return;
     throw error;
+  }
+}
+
+function assertSecurePrivateFile(entry: Stats, source: string): void {
+  if (entry.isSymbolicLink() || !entry.isFile()) {
+    throw new Error(`private-file source must be a real regular file: ${source}`);
+  }
+  assertCurrentOwner(entry, `private-file source at ${source}`);
+  if ((entry.mode & 0o777) !== 0o600) {
+    throw new Error(`private-file source must have exact mode 0600: ${source}`);
+  }
+}
+
+function assertSameFileIdentity(expected: Stats, current: Stats, source: string): void {
+  if (expected.dev !== current.dev || expected.ino !== current.ino) {
+    throw new Error(`private-file source changed during read: ${source}`);
   }
 }
 

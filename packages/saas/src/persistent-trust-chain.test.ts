@@ -1,6 +1,18 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { loadOrCreateTrustChain } from "./persistent-trust-chain.js";
@@ -53,6 +65,68 @@ describe("loadOrCreateTrustChain", () => {
     expect(b.private.operatorSeed).toBe(a.private.operatorSeed);
   });
 
+  it("does not follow the legacy predictable temp symlink when persisting authority secrets", async () => {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const fixedNow = 1_700_000_000_000;
+    const legacyTempPath = `${path}.tmp.${process.pid}.${fixedNow}`;
+    const sentinelPath = join(dir, "sentinel");
+    writeFileSync(sentinelPath, "sentinel unchanged");
+    symlinkSync(sentinelPath, legacyTempPath);
+    const now = vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+
+    const created = await (async () => {
+      try {
+        return await loadOrCreateTrustChain(path, { returnOperatorSeed: true });
+      } finally {
+        now.mockRestore();
+      }
+    })();
+
+    expect(readFileSync(sentinelPath, "utf8")).toBe("sentinel unchanged");
+    const persistedEntry = lstatSync(path);
+    expect(persistedEntry.isFile()).toBe(true);
+    expect(persistedEntry.isSymbolicLink()).toBe(false);
+    expect(persistedEntry.mode & 0o777).toBe(0o600);
+    expect(created.private.operatorSeed).toMatch(/^SO/);
+    expect(created.private.systemAccountCredentials).toContain("BEGIN USER NKEY SEED");
+
+    const reloaded = await loadOrCreateTrustChain(path, { returnOperatorSeed: true });
+    expect(reloaded.private.operatorSeed).toBe(created.private.operatorSeed);
+    expect(reloaded.private.systemAccountCredentials).toBe(
+      created.private.systemAccountCredentials,
+    );
+  });
+
+  it("refuses to load a persisted trust chain through a symlink", async () => {
+    const realPath = join(dir, "real", "trust-chain.json");
+    await loadOrCreateTrustChain(realPath, { returnOperatorSeed: true });
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    symlinkSync(realPath, path);
+
+    await expect(loadOrCreateTrustChain(path, { returnOperatorSeed: true })).rejects.toThrow(
+      new RegExp(`real regular file: ${escapeRegExp(path)}`),
+    );
+  });
+
+  it("refuses unsafe parent permissions and loose persisted-file permissions", async () => {
+    const unsafeParent = join(dir, "unsafe-parent");
+    mkdirSync(unsafeParent, { mode: 0o700 });
+    chmodSync(unsafeParent, 0o777);
+    const unsafePath = join(unsafeParent, "trust-chain.json");
+    await expect(loadOrCreateTrustChain(unsafePath)).rejects.toThrow(
+      /must not be writable by group or others/,
+    );
+    expect(existsSync(unsafePath)).toBe(false);
+
+    const looseParent = join(dir, "loose-parent");
+    mkdirSync(looseParent, { mode: 0o700 });
+    const loosePath = join(looseParent, "trust-chain.json");
+    writeFileSync(loosePath, JSON.stringify({ private: {} }), { mode: 0o644 });
+    await expect(loadOrCreateTrustChain(loosePath)).rejects.toThrow(
+      /exact mode 0600/,
+    );
+  });
+
   it("does NOT regenerate when a file already exists", async () => {
     const a = await loadOrCreateTrustChain(path);
     const b = await loadOrCreateTrustChain(path);
@@ -63,7 +137,7 @@ describe("loadOrCreateTrustChain", () => {
 
   it("throws loudly on a truncated or pre-system-account persisted file", async () => {
     const flat = join(dir, "trust-chain.json"); // dir already exists (mkdtemp)
-    writeFileSync(flat, JSON.stringify({ private: {} }));
+    writeFileSync(flat, JSON.stringify({ private: {} }), { mode: 0o600 });
     await expect(loadOrCreateTrustChain(flat)).rejects.toThrow(/missing required fields/);
 
     const legacyPath = join(dir, "legacy-trust-chain.json");
@@ -73,7 +147,7 @@ describe("loadOrCreateTrustChain", () => {
     delete legacy.natsConfig.resolverConfig[systemAccount];
     delete (legacy.natsConfig as Partial<NatsSelfContainedAccountConfig>)
       .systemAccountPublicKey;
-    writeFileSync(legacyPath, JSON.stringify(legacy));
+    writeFileSync(legacyPath, JSON.stringify(legacy), { mode: 0o600 });
 
     let error: unknown;
     try {
@@ -93,10 +167,20 @@ describe("loadOrCreateTrustChain", () => {
   // raw JSON SyntaxError — and must NOT be silently regenerated.
   it("throws a legible, recovery-guiding error on a corrupt (non-JSON) file", async () => {
     const flat = join(dir, "trust-chain.json");
-    writeFileSync(flat, "{ this is not json"); // e.g. a half-written file
-    await expect(loadOrCreateTrustChain(flat)).rejects.toThrow(
+    const secretMarker = "SUPER_SECRET_AUTHORITY_VALUE";
+    writeFileSync(flat, secretMarker, { mode: 0o600 }); // e.g. a half-written file
+
+    let error: unknown;
+    try {
+      await loadOrCreateTrustChain(flat);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(
       /corrupt \(not valid JSON\)[\s\S]*delete the file/,
     );
+    expect((error as Error).message).not.toContain(secretMarker);
   });
 
   // A3: the write is atomic — after a successful create, only the real file
@@ -109,3 +193,7 @@ describe("loadOrCreateTrustChain", () => {
     expect(entries.some((f) => f.includes(".tmp"))).toBe(false);
   });
 });
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}

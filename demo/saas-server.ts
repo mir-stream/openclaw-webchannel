@@ -64,7 +64,14 @@ import type { EnrollmentRequest, PollRequest } from "../packages/saas/src/device
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createDemoEnrollmentHttpHandler } from "../packages/saas/src/enrollment-http-handler.js";
 import { serializeBootstrapResponse, serializeEnrollmentResponse } from "../packages/saas/src/p1-1-wire-adapter.js";
-import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  mkdirSync,
+  readFileSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -183,7 +190,7 @@ const trustChainOptions = {
 // Separate persisted file per relay mode so a self-contained chain is never
 // reused as an external one (they share the RSA key but differ in NATS account).
 const trustChainPath =
-  TRUST_CHAIN_PATH ?? join(tmpdir(), `demo-trust-${DEMO_RELAY}-${process.pid}.json`);
+  TRUST_CHAIN_PATH || createEphemeralTrustChainPath();
 const trustChain = await loadOrCreateTrustChain(trustChainPath, trustChainOptions);
 const privateChain = trustChain.private;
 const natsConfig = trustChain.natsConfig;
@@ -211,6 +218,19 @@ if (NATS_CONFIG_OUT && natsConfig.mode !== "external") {
   console.log(`[demo-saas] wrote operator.jwt + resolver.json → ${NATS_CONFIG_OUT}`);
 }
 console.log(`[demo-saas] relay mode: ${DEMO_RELAY}${externalNatsAccount ? ` (account ${externalNatsAccount.accountId.slice(0, 8)}…)` : ""} → ${NATS_URL}`);
+
+function createEphemeralTrustChainPath(): string {
+  const root = mkdtempSync(join(tmpdir(), `demo-trust-${DEMO_RELAY}-`));
+  chmodSync(root, 0o700);
+  process.once("exit", () => {
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup of an intentionally ephemeral trust root.
+    }
+  });
+  return join(root, "trust-chain.json");
+}
 
 // ---------------------------------------------------------------------------
 // RS256 bootstrap-JWT signing — reuses THIS SaaS's trust chain RSA key.
