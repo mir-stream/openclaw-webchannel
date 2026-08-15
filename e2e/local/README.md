@@ -115,12 +115,13 @@ Every port that anything under `e2e/local/` binds or dials is **allocated** in
 [`ports.json`](ports.json), and nothing here may hard-code one — gates get theirs from
 `harness_ports`, drivers from their gate's env.
 
-Root-sweep suites with intentionally fixed listeners are allocated there too. Three hard-code
-their own numbers and are *declared* — `ac6-device-flow-e2e.test.ts` and the two demo smokes.
-For those three the literal is the allocation, and `ports.test.ts` pins the two together in both
-directions so neither side can drift. The two real nats-server suites instead ask nats-server to
-bind OS-assigned ports atomically, then read its per-process ports file; they remain in the
-literal scan so reintroducing a fixed port is still rejected.
+Root-sweep suites with intentionally fixed listeners are allocated there too. Three consume
+declared blocks — `ac6-device-flow-e2e.test.ts` and the two demo smokes — and `ports.test.ts`
+keeps each declaration and its `SUITE_PORTS` reads in sync. AC6 binds two HTTP listeners; its
+`NATS_CLIENT_PORT` is only a relay coordinate advertised in enrollment responses, not a listener.
+The two real nats-server suites instead ask nats-server to bind OS-assigned ports atomically, then
+read its per-process ports file; they remain in the literal scan so reintroducing a fixed port is
+still rejected.
 
 The two families used to allocate independently, and overlapped: `18222` was both the
 transport-realserver monitor port and the default NATS URL in

@@ -968,7 +968,6 @@ describe("e2e/local/ports.json", () => {
     { file: "e2e/local/turn-outcome-roundtrip.ts", value: 5000, count: 1, reason: "timeout in ms" },
     { file: "e2e/local/all-real.mjs", value: 25000, count: 1, reason: "timeout in ms" },
     { file: "e2e/local/all-real.mjs", value: 30000, count: 1, reason: "timeout in ms" },
-    { file: "packages/saas/src/ac6-device-flow-e2e.test.ts", value: 2000, count: 1, reason: "startup delay in ms" },
     { file: "packages/saas/src/nats-permissions-realserver.test.ts", value: 65535, count: 1, reason: "port-range validation upper bound" },
     { file: "packages/saas/src/nats-permissions-realserver.test.ts", value: 5000, count: 1, reason: "waitFor default timeout in ms" },
     { file: "packages/saas/src/nats-permissions-realserver.test.ts", value: 4000, count: 2, reason: "connection timeout in ms" },
@@ -1028,26 +1027,7 @@ describe("e2e/local/ports.json", () => {
    * forces the list to shrink when the defect is fixed and grow red when a
    * second occurrence appears.
    */
-  const WAIVED: LiteralBudget[] = [
-    {
-      file: "packages/saas/src/demo-server-role.test.ts",
-      value: 18722,
-      count: 1,
-      reason: "= run-two-account-isolation NATS_WS; spawn env for a demo server that never dials it. Issue #138.",
-    },
-    {
-      file: "packages/saas/src/demo-ui-smoke.test.ts",
-      value: 19299,
-      count: 1,
-      reason: "= run-two-account-isolation GW_PORT; spawn env (DEMO_GW_URL) for a demo server that never dials it. Issue #138.",
-    },
-    {
-      file: "packages/saas/src/demo-ui-smoke.test.ts",
-      value: 4222,
-      count: 1,
-      reason: "= ac6-device-flow-e2e NATS_CLIENT_PORT; spawn env (NATS_URL), same defect, four lines above the DEMO_GW_URL case. Issue #138.",
-    },
-  ];
+  const WAIVED: LiteralBudget[] = [];
 
   /** Every port-range integer in the scan set. */
   function scanLiterals(): PortLiteral[] {

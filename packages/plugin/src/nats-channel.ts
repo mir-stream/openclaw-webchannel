@@ -16,6 +16,7 @@
  * - Approval deduplication: approvalId-based first-write-wins exactly-once
  */
 
+import { inspect } from "node:util";
 import type { NatsTransport, NatsMessage } from "./nats-transport.js";
 import type { ApprovalDecision, ApprovalRequestPayload, HistoryMessage, InboundWsMessage, OutboundWsMessage, WebChannelPeerChannel } from "./channel-contract.js";
 import type { KeyPair } from "./e2e-crypto.js";
@@ -27,6 +28,28 @@ import { isValidSubjectToken } from "./subject-token.js";
 import type { CommandCatalogEntry } from "./commands-catalog.js";
 import { createIngressResultChunkWriter } from "./ingress-result-chunks.js";
 import type { IngressResultFrame } from "./ingress-result-chunks.js";
+import { logSafe } from "./log-safe.js";
+
+/** Preserve caught-error detail without changing primitive thrown-value rendering. */
+function formatCaughtDiagnostic(value: unknown): unknown {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+    return value;
+  }
+  try {
+    return inspect(value, {
+      breakLength: Number.POSITIVE_INFINITY,
+      colors: false,
+      compact: true,
+      customInspect: false,
+      depth: 5,
+      getters: false,
+      maxArrayLength: 50,
+      maxStringLength: 8_192,
+    });
+  } catch {
+    return "<uninspectable>";
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -286,7 +309,7 @@ export class NatsChannel implements WebChannelPeerChannel {
 
     if (this.peerSubscriptions.has(peerId)) {
       if (conversationKey) this.peerSessionKeys.set(peerId, conversationKey);
-      console.warn(`[nats-channel] Peer ${peerId} already registered`);
+      console.warn(`[nats-channel] Peer ${logSafe(peerId)} already registered`);
       return;
     }
 
@@ -302,7 +325,7 @@ export class NatsChannel implements WebChannelPeerChannel {
       const oldest = this.peerSubscriptions.keys().next().value as string | undefined;
       if (oldest === undefined) break;
       console.warn(
-        `[nats-channel] peer cap ${this.maxPeers} reached; evicting oldest peer ${oldest}`,
+        `[nats-channel] peer cap ${this.maxPeers} reached; evicting oldest peer ${logSafe(oldest)}`,
       );
       this.unregisterPeer(oldest);
     }
@@ -312,7 +335,9 @@ export class NatsChannel implements WebChannelPeerChannel {
     this.peerSubscriptions.set(peerId, sid);
     if (conversationKey) this.peerSessionKeys.set(peerId, conversationKey);
 
-    console.log(`[nats-channel] Registered peer ${peerId}, subscribed to ${inboundSubject}`);
+    console.log(
+      `[nats-channel] Registered peer ${logSafe(peerId)}, subscribed to ${logSafe(inboundSubject)}`,
+    );
   }
 
   /**
@@ -333,7 +358,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     const regWild = `webchannel.${this.tenant}.${this.accountId}.*.register`;
     const sid = this.transport.subscribe(regWild);
     this.registerSid = sid;
-    console.log(`[nats-channel] Subscribed to register wildcard ${regWild}`);
+    console.log(`[nats-channel] Subscribed to register wildcard ${logSafe(regWild)}`);
     return this.registerDisposer(sid);
   }
 
@@ -375,7 +400,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     if (sid) {
       this.transport.unsubscribe(sid);
       this.peerSubscriptions.delete(peerId);
-      console.log(`[nats-channel] Unregistered peer ${peerId}`);
+      console.log(`[nats-channel] Unregistered peer ${logSafe(peerId)}`);
     }
     // Drop the in-memory session key: a reconnecting peer must re-register,
     // which reloads the stable key K from the
@@ -544,7 +569,9 @@ export class NatsChannel implements WebChannelPeerChannel {
     const existingResolver = this.approvalResolutions.get(id);
     if (existingResolver !== undefined) {
       if (existingResolver !== peerId) {
-        console.log(`[nats-channel] Approval ${id} already resolved by ${existingResolver}, dropping duplicate from ${peerId}`);
+        console.log(
+          `[nats-channel] Approval ${logSafe(id)} already resolved by ${logSafe(existingResolver)}, dropping duplicate from ${logSafe(peerId)}`,
+        );
         return false;
       }
     } else {
@@ -699,7 +726,7 @@ export class NatsChannel implements WebChannelPeerChannel {
         const key = this.peerSessionKeys.get(peerId);
         if (!key) {
           console.warn(
-            `[nats-channel] Refusing to send to ${peerId}: no session key yet (fail-closed, no plaintext)`,
+            `[nats-channel] Refusing to send to ${logSafe(peerId)}: no session key yet (fail-closed, no plaintext)`,
           );
           return false;
         }
@@ -715,7 +742,9 @@ export class NatsChannel implements WebChannelPeerChannel {
       this.transport.publish(subject, JSON.stringify(payload));
       return true;
     } catch (err) {
-      console.error(`[nats-channel] Failed to send to peer ${peerId}:`, err);
+      console.error(
+        `[nats-channel] Failed to send to peer ${logSafe(peerId)}: ${logSafe(formatCaughtDiagnostic(err))}`,
+      );
       return false;
     }
   }
@@ -749,7 +778,9 @@ export class NatsChannel implements WebChannelPeerChannel {
       for (const candidate of candidates) writer.add(candidate);
       return writer.finish();
     } catch (err) {
-      console.error("[nats-channel] Failed to prepare bounded ingress result frame:", err);
+      console.error(
+        `[nats-channel] Failed to prepare bounded ingress result frame: ${logSafe(formatCaughtDiagnostic(err))}`,
+      );
       return false;
     }
   }
@@ -773,7 +804,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     // Subject format: webchannel.{tenant}.{accountId}.{peerId}.{in|register}
     const parts = msg.subject.split(".");
     if (parts.length < 5) {
-      console.warn(`[nats-channel] Invalid subject format: ${msg.subject}`);
+      console.warn(`[nats-channel] Invalid subject format: ${logSafe(msg.subject)}`);
       return;
     }
 
@@ -799,7 +830,9 @@ export class NatsChannel implements WebChannelPeerChannel {
       const message = JSON.parse(msg.payload.toString()) as InboundWsMessage;
       this.dispatchInbound(peerId, message);
     } catch (err) {
-      console.error(`[nats-channel] Failed to parse message from ${peerId}:`, err);
+      console.error(
+        `[nats-channel] Failed to parse message from ${logSafe(peerId)}: ${logSafe(formatCaughtDiagnostic(err))}`,
+      );
     }
   }
 
@@ -851,8 +884,8 @@ export class NatsChannel implements WebChannelPeerChannel {
         !isValidSubjectToken(replyTo.slice(ownReginboxPrefix.length))
       ) {
         console.warn(
-          `[nats-channel] Dropping register reply for ${peerId}: reply-to "${replyTo}" ` +
-            `is not the requester's own reginbox (expected "${ownReginboxPrefix}{token}")`,
+          `[nats-channel] Dropping register reply for ${logSafe(peerId)}: reply-to ${logSafe(replyTo)} ` +
+            `is not the requester's own reginbox (expected ${logSafe(ownReginboxPrefix + "{token}")})`,
         );
         return;
       }
@@ -872,7 +905,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     const key = this.peerSessionKeys.get(peerId);
     if (!key) {
       console.warn(
-        `[nats-channel] Dropping inbound from ${peerId}: no registered session key`,
+        `[nats-channel] Dropping inbound from ${logSafe(peerId)}: no registered session key`,
       );
       return;
     }
@@ -886,7 +919,7 @@ export class NatsChannel implements WebChannelPeerChannel {
       ts = opened.routing.ts;
     } catch (err) {
       console.warn(
-        `[nats-channel] Dropping inbound from ${peerId}: decrypt/parse failed: ${String(err)}`,
+        `[nats-channel] Dropping inbound from ${logSafe(peerId)}: decrypt/parse failed: ${logSafe(err)}`,
       );
       return;
     }
@@ -916,8 +949,8 @@ export class NatsChannel implements WebChannelPeerChannel {
     const skew = Date.now() - ts;
     if (Math.abs(skew) > this.replayWindowMs) {
       console.warn(
-        `[nats-channel] Dropping inbound from ${peerId}: ts outside ±${this.replayWindowMs}ms window ` +
-          `(skew=${skew}ms, messageId=${messageId}) — stale replay or client clock skew`,
+        `[nats-channel] Dropping inbound from ${logSafe(peerId)}: ts outside ±${this.replayWindowMs}ms window ` +
+          `(skew=${skew}ms) — stale replay or client clock skew; messageId=${logSafe(messageId)}`,
       );
       return false;
     }
@@ -928,7 +961,7 @@ export class NatsChannel implements WebChannelPeerChannel {
     }
     if (seen.has(messageId)) {
       console.warn(
-        `[nats-channel] Dropping inbound from ${peerId}: replayed messageId ${messageId}`,
+        `[nats-channel] Dropping inbound from ${logSafe(peerId)}: replayed messageId ${logSafe(messageId)}`,
       );
       return false;
     }
@@ -957,7 +990,7 @@ export class NatsChannel implements WebChannelPeerChannel {
           typeof message.id !== "string" ||
           !(["allow-once", "allow-always", "deny"] as const).includes(message.decision)
         ) {
-          console.warn(`[nats-channel] Invalid approval_decision from ${peerId}`);
+          console.warn(`[nats-channel] Invalid approval_decision from ${logSafe(peerId)}`);
           break;
         }
         this.onApprovalDecision?.(peerId, message.id, message.decision);
@@ -972,7 +1005,9 @@ export class NatsChannel implements WebChannelPeerChannel {
         break;
 
       default:
-        console.warn(`[nats-channel] Unknown message type: ${(message as { type: string }).type}`);
+        console.warn(
+          `[nats-channel] Unknown message type: ${logSafe((message as { type: string }).type)}`,
+        );
     }
   }
 }

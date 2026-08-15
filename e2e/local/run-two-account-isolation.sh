@@ -324,7 +324,12 @@ B_KEYS="$(node --import tsx "$REPO/scripts/resolve-storage-path.ts" \
 B_KEYS_BEFORE="$OCH/b-keys-before.json"
 [ -f "$B_KEYS" ] || { echo "[run-two-acct] missing B conversation key store after positive B→B"; exit 3; }
 cp "$B_KEYS" "$B_KEYS_BEFORE"
-B_REGISTER_CALLS_BEFORE="$(grep -Ec "\[nats-channel\] (Registered peer|Peer) $PEER_B" "$OCH/gateway.log" || true)"
+B_REGISTER_CALLS_BEFORE="$(
+  grep -F -c \
+    -e "[nats-channel] Registered peer \"$PEER_B\"" \
+    -e "[nats-channel] Peer \"$PEER_B\"" \
+    "$OCH/gateway.log" || true
+)"
 WEBCHANNEL_TEST_MODE=foreign-register \
 WEBCHANNEL_NATS_URL="ws://127.0.0.1:$NATS_WS" \
 WEBCHANNEL_ISSUER_URL="$ISS" WEBCHANNEL_TENANT="$TENANT" \
@@ -345,7 +350,12 @@ cmp -s "$B_KEYS_BEFORE" "$B_KEYS" || {
   echo "[run-two-acct] FAIL — B conversation-key store mutated after rejected A token"
   exit 4
 }
-B_REGISTER_CALLS_AFTER="$(grep -Ec "\[nats-channel\] (Registered peer|Peer) $PEER_B" "$OCH/gateway.log" || true)"
+B_REGISTER_CALLS_AFTER="$(
+  grep -F -c \
+    -e "[nats-channel] Registered peer \"$PEER_B\"" \
+    -e "[nats-channel] Peer \"$PEER_B\"" \
+    "$OCH/gateway.log" || true
+)"
 if [ "$B_REGISTER_CALLS_AFTER" -ne "$((B_REGISTER_CALLS_BEFORE + 2))" ]; then
   echo "[run-two-acct] FAIL — expected exactly two valid-control B register calls; before=$B_REGISTER_CALLS_BEFORE after=$B_REGISTER_CALLS_AFTER"
   exit 4
