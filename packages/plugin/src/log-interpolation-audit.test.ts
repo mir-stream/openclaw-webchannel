@@ -45,10 +45,9 @@ import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
  *   3. PREFIX SCOPE. A statement inside an enforced file is skipped if its text
  *      carries no listed prefix. This bit us: the `event=webchannel.*` family
  *      was invisible in `nats-account-runtime.ts` until `event=webchannel` was
- *      added below. `nats-channel.ts` is excluded the same way — by PREFIX, not
- *      by file — since its records read `[nats-channel]`. Adding a file to
- *      ENFORCED without adding its prefix enforces nothing while looking like
- *      it does.
+ *      added below. `nats-channel.ts` had the same gap until `[nats-channel]`
+ *      was added below. Adding a file to ENFORCED without its prefix enforces
+ *      nothing while looking like it does.
  *
  * The TypeScript AST supplies exact outer call boundaries (including across
  * regex literals); the inner value walk remains deliberately conservative and
@@ -66,7 +65,12 @@ const read = (name: string) =>
  * it the scanner reported 16 statements for that file and silently skipped
  * them, so a peer field added to the `event=` family would have shipped green.
  */
-const WEBCHANNEL_PREFIXES = ["webchannel:", "[webchannel]", "event=webchannel"];
+const WEBCHANNEL_PREFIXES = [
+  "webchannel:",
+  "[webchannel]",
+  "event=webchannel",
+  "[nats-channel]",
+];
 
 /** The files #123 hardened. These must stay clean. */
 const ENFORCED = [
@@ -75,6 +79,9 @@ const ENFORCED = [
   "approvals.ts",
   "nats-account-runtime.ts",
   "auth.ts",
+  "nats-channel.ts",
+  "history.ts",
+  "nats-register.ts",
 ] as const;
 
 /**
@@ -91,32 +98,7 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
   "inbound.ts": [],
   "ingress-dedupe.ts": [],
 
-  /**
-   * The `[webchannel]` console sites in the pending-approval store. These are
-   * peer-derived (approval ids, session keys) and several carry the same
-   * hard-coded-quote trap #123 fixed in the thrown messages — they are a filed
-   * follow-up, deliberately NOT fixed here to keep this diff out of #93/#100
-   * approval logic. The `webchannel:`-prefixed thrown messages in this same
-   * file ARE enforced (empty baseline entries below would show as failures).
-   */
-  "approvals.ts": [
-    `approvals.ts  ::  evicted.payload.id  @  [webchannel] pending-approval cap reached; evicting a still-pending approval "" (account "", peer "") — a client may show it as resolved-elsewhere`,
-    `approvals.ts  ::  evicted.accountKey  @  [webchannel] pending-approval cap reached; evicting a still-pending approval "" (account "", peer "") — a client may show it as resolved-elsewhere`,
-    `approvals.ts  ::  evicted.sessionKey  @  [webchannel] pending-approval cap reached; evicting a still-pending approval "" (account "", peer "") — a client may show it as resolved-elsewhere`,
-    `approvals.ts  ::  entry.payload.id  @  [webchannel] pending-approval "" (account "", peer "") pruned after ms with no finalize — likely an orphaned approval (monitor disposed?)`,
-    `approvals.ts  ::  entry.accountKey  @  [webchannel] pending-approval "" (account "", peer "") pruned after ms with no finalize — likely an orphaned approval (monitor disposed?)`,
-    `approvals.ts  ::  entry.sessionKey  @  [webchannel] pending-approval "" (account "", peer "") pruned after ms with no finalize — likely an orphaned approval (monitor disposed?)`,
-    `approvals.ts  ::  pendingPayload.id  @  [webchannel] approval not delivered: no live channel for account "" (skipped or unknown) — refusing to misroute`,
-    `approvals.ts  ::  accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID  @  [webchannel] approval not delivered: no live channel for account "" (skipped or unknown) — refusing to misroute`,
-    `approvals.ts  ::  pendingPayload.id  @  [webchannel] approval not delivered: no matching open socket for "" (account "")`,
-    `approvals.ts  ::  sessionKey  @  [webchannel] approval not delivered: no matching open socket for "" (account "")`,
-    `approvals.ts  ::  accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID  @  [webchannel] approval not delivered: no matching open socket for "" (account "")`,
-    `approvals.ts  ::  entry.approvalId  @  [webchannel] approval resolve frame dropped: no live channel for account ""`,
-    `approvals.ts  ::  accountId ?? entry.accountId ?? DEFAULT_WEBCHANNEL_ACCOUNT_ID  @  [webchannel] approval resolve frame dropped: no live channel for account ""`,
-    `approvals.ts  ::  formatAccountIdForLog(rawAccountId)  @  [webchannel] event=webchannel.approval.origin_unresolved accountId= reason= sessionKey_present=`,
-    `approvals.ts  ::  reason  @  [webchannel] event=webchannel.approval.origin_unresolved accountId= reason= sessionKey_present=`,
-    `approvals.ts  ::  sessionKeyPresent  @  [webchannel] event=webchannel.approval.origin_unresolved accountId= reason= sessionKey_present=`,
-  ],
+  "approvals.ts": [],
 
   /**
    * Startup/config logging, NOT the peer path: `accountId` and `tenant` are
@@ -141,6 +123,9 @@ const KNOWN_RAW: Record<string, readonly string[]> = {
     `nats-account-runtime.ts  ::  formatAccountIdForLog(accountId)  @  "info"event=webchannel.account_startup accountId= state=stopped attempt=`,
   ],
   "auth.ts": [],
+  "nats-channel.ts": [],
+  "history.ts": [],
+  "nats-register.ts": [],
 };
 
 /**
@@ -161,6 +146,9 @@ const COVERAGE_FLOOR: Record<string, { statements: number; interpolations: numbe
   "approvals.ts": { statements: 9, interpolations: 24 },
   "nats-account-runtime.ts": { statements: 22, interpolations: 44 },
   "auth.ts": { statements: 16, interpolations: 5 },
+  "nats-channel.ts": { statements: 22, interpolations: 33 },
+  "history.ts": { statements: 2, interpolations: 4 },
+  "nats-register.ts": { statements: 18, interpolations: 20 },
 };
 
 describe("log-record integrity — enforced files (#123)", () => {
@@ -196,6 +184,37 @@ describe("log-record integrity — enforced files (#123)", () => {
       statements: statements.length,
       interpolations,
     }).toEqual(COVERAGE_FLOOR[file]);
+  });
+
+  it("approvals.ts sweeps every console.warn even when its prefix is new", () => {
+    // Like index-nats-wiring's whole-source contracts, discover the complete
+    // production surface instead of pinning a list of today's call sites.
+    // A future warning with a new prefix is isolated and checked with the empty
+    // prefix, so it cannot land outside WEBCHANNEL_PREFIXES and disappear.
+    const source = read("approvals.ts");
+    const sourceFile = ts.createSourceFile(
+      "approvals.ts",
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TS,
+    );
+    const calls: string[] = [];
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && node.expression.getText(sourceFile) === "console.warn") {
+        calls.push(node.getText(sourceFile));
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+
+    const violations = calls.flatMap((call) =>
+      findUnsafeLogInterpolations(
+        `import { logSafe } from "./log-safe.js";\n${call}`,
+        { file: "approvals.ts", prefixes: [""] },
+      ),
+    );
+    expect(formatViolations(violations)).toEqual([]);
   });
 
   it("every allowlist entry is still LIVE in a scanned file", () => {

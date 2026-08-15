@@ -3,7 +3,14 @@ import { describe, expect, it, vi } from "vitest";
 import { NatsChannel, type InboundWsMessage } from "./nats-channel.js";
 import type { NatsTransport } from "./nats-transport.js";
 import { encrypt, generateKeyPair } from "./e2e-crypto.js";
+import {
+  canonicalAad,
+  encodeEnvelope,
+  serializeEnvelope,
+  type EnvelopeRouting,
+} from "./e2e-envelope.js";
 import { openEnvelope, sealEnvelope } from "./e2e-session.js";
+import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
 
 function subjectMatches(pattern: string, subject: string): boolean {
   const p = pattern.split("."), s = subject.split(".");
@@ -152,5 +159,44 @@ describe("NatsChannel (F4 anti-replay)",()=>{
    expect(h.inbound).toEqual([]);
    h.browser.publish(inSubj,sealEnvelope(routing,h.sessionKey,{type:"user_message",text:"fresh"}));
    expect(h.inbound).toEqual([{type:"user_message",text:"fresh"}]); vi.useRealTimers();
+ });
+ it("#134: a stale authenticated messageId cannot forge a second nats-channel record",()=>{
+   vi.useFakeTimers();
+   const now=1_700_000_000_000;
+   vi.setSystemTime(now);
+   const h=makeHarness();
+   const hostileMessageId="m1\n[nats-channel] Registered peer admin";
+   const hostileRouting:EnvelopeRouting={
+     ...routing,
+     messageId:hostileMessageId,
+     envelopeType:"conversation",
+     ts:now-11*60*1000,
+   };
+   const stale=serializeEnvelope(encodeEnvelope(
+     hostileRouting,
+     JSON.stringify({type:"user_message",text:"old"}),
+     h.sessionKey,
+     canonicalAad(hostileRouting),
+   ));
+   const warn=vi.spyOn(console,"warn").mockImplementation(()=>{});
+   try {
+     h.browser.publish(inSubj,stale);
+     expect(h.inbound).toEqual([]);
+     expect(warn).toHaveBeenCalledTimes(1);
+     expect(warn.mock.calls[0]).toHaveLength(1);
+
+     const record=String(warn.mock.calls[0]![0]);
+     expect(record.split("\n")).toHaveLength(1);
+     expect(record).not.toContain(hostileMessageId);
+     expect(record).toContain("m1\\n[nats-channel] Registered peer admin");
+
+     const messageIdField=record.slice(record.indexOf("messageId="));
+     const fields=decodeStrictLogfmt(messageIdField);
+     expect([...fields]).toEqual([["messageId",hostileMessageId]]);
+     expect(fields.has("Registered")).toBe(false);
+   } finally {
+     warn.mockRestore();
+     vi.useRealTimers();
+   }
  });
 });

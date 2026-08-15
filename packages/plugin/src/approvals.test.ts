@@ -47,6 +47,7 @@ import {
   APPROVAL_ORIGIN_REGISTRY_GLOBAL_KEY,
   ApprovalOriginLeaseRegistry,
 } from "./approval-origin.js";
+import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
 
 // A minimal valid pending exec approval view (the shape core hands to
 // `presentation.buildPendingPayload`). Verified fields:
@@ -1163,6 +1164,46 @@ describe("webchannel pending-approval store (#15)", () => {
     const ids = new Set(listPendingApprovalsForPeer("a", "alice").map((p) => p.id));
     expect(ids.has("id-0")).toBe(false);
     expect(ids.has(`id-${PENDING_APPROVAL_CAP}`)).toBe(true);
+  });
+
+  it("#130: quoted key=value text stays inside every cap-warning value", () => {
+    const hostileId = 'exec-" outcome=ok';
+    const hostileAccount = 'account-" peer=trusted';
+    const hostilePeer = 'peer-" forged=true';
+    const now = Date.now();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      __pendingApprovalsTestHook.record(
+        hostileAccount,
+        payload(hostileId),
+        hostilePeer,
+        now,
+      );
+      for (let i = 0; i < PENDING_APPROVAL_CAP; i++) {
+        __pendingApprovalsTestHook.record("safe", payload(`safe-${i}`), "safe-peer", now);
+      }
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      const record = String(warn.mock.calls[0]![0]);
+      expect(record.split("\n")).toHaveLength(1);
+      const encoded = record.match(/"(?:\\.|[^"\\])*"/gu) ?? [];
+      expect(encoded.map((token) => JSON.parse(token))).toEqual([
+        hostileId,
+        hostileAccount,
+        hostilePeer,
+      ]);
+
+      const fields = decodeStrictLogfmt(
+        `approval=${encoded[0]} account=${encoded[1]} peer=${encoded[2]}`,
+      );
+      expect(fields.get("approval")).toBe(hostileId);
+      expect(fields.get("account")).toBe(hostileAccount);
+      expect(fields.get("peer")).toBe(hostilePeer);
+      expect(fields.has("outcome")).toBe(false);
+      expect(fields.has("forged")).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

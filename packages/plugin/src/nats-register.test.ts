@@ -37,6 +37,7 @@ import type { JsonWebKeySet } from "./jwks.js";
 import { WEBCHANNEL_PROTOCOL_VERSION } from "./protocol.js";
 import { ConversationKeyCapacityError } from "./conversation-key-store.js";
 import { formatCapacityReject } from "./capacity-status.js";
+import { decodeStrictLogfmt } from "./test-fixtures/strict-logfmt.js";
 
 const PEER = "user-42";
 const TENANT = "tenant-1";
@@ -389,6 +390,32 @@ describe("handleRegisterRequest (register over NATS)", () => {
     expect(h.replies[0]).toBe(REGISTER_UNAUTHORIZED);
     // No nonce was issued to the spoofed subject.
     expect(h.deps.popChallenges.size).toBe(0);
+  });
+
+  it("#137: quotes and key=value text cannot escape a subject peerId boundary", async () => {
+    const hostileSubject = 'spoofed" outcome=ok peer=trusted';
+    const error = vi.fn();
+    const h = makeHarness({
+      subjectPeerId: hostileSubject,
+      logger: { error },
+    });
+
+    await h.run({ op: "challenge", token: "jwt" });
+    expect(h.replies).toEqual([REGISTER_UNAUTHORIZED]);
+    expect(error).toHaveBeenCalledTimes(1);
+
+    const record = String(error.mock.calls[0]![0]);
+    expect(record.split("\n")).toHaveLength(1);
+    const encoded = record.match(/"(?:\\.|[^"\\])*"/gu) ?? [];
+    expect(encoded.map((token) => JSON.parse(token))).toEqual([hostileSubject, PEER]);
+
+    const fields = decodeStrictLogfmt(
+      `subjectPeerId=${encoded[0]} jwtPeerId=${encoded[1]}`,
+    );
+    expect(fields.get("subjectPeerId")).toBe(hostileSubject);
+    expect(fields.get("jwtPeerId")).toBe(PEER);
+    expect(fields.has("outcome")).toBe(false);
+    expect(fields.has("peer")).toBe(false);
   });
 
   it("JWT failure → generic unauthorized (no oracle detail)", async () => {
