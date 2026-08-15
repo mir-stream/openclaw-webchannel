@@ -18,7 +18,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -28,9 +28,20 @@ const REPO_ROOT = join(HERE, "..", "..", "..");
 const SERVER_PATH = join(HERE, "..", "reference", "enrollment-server.ts");
 const DEMO_APP_HTML = join(REPO_ROOT, "e2e", "local", "ci-smoke.html");
 const DEMO_CLIENT_ENTRY = join(REPO_ROOT, "packages", "client", "src", "browser-demo-entry.ts");
+const PORTS = JSON.parse(
+  readFileSync(join(REPO_ROOT, "e2e", "local", "ports.json"), "utf8"),
+) as {
+  harnesses: Record<string, Record<string, number>>;
+  vitest: Record<string, Record<string, number>>;
+};
+const SUITE_PORTS = PORTS.vitest["packages/saas/src/demo-ui-smoke.test.ts"];
+const AC6_PORTS = PORTS.vitest["packages/saas/src/ac6-device-flow-e2e.test.ts"];
+const TWO_ACCOUNT_PORTS = PORTS.harnesses["run-two-account-isolation"];
 
 // Unique port (avoid the other saas HTTP-server tests: 3456/3457 etc.).
-const PORT = 3468;
+const PORT = SUITE_PORTS.PORT;
+const NATS_CLIENT_PORT = AC6_PORTS.NATS_CLIENT_PORT;
+const GW_PORT = TWO_ACCOUNT_PORTS.GW_PORT;
 const BASE = `http://localhost:${PORT}`;
 
 const TENANT = "smoke-tenant";
@@ -97,12 +108,12 @@ describe("unified-demo server surface (ENABLE_DEMO_UI)", () => {
         PORT: String(PORT),
         SAAS_BASE_URL: BASE,
         SAAS_ISSUER: "https://saas.local/smoke-issuer",
-        NATS_URL: "ws://localhost:4222",
+        NATS_URL: `ws://localhost:${NATS_CLIENT_PORT}`,
         POLL_INTERVAL_SECONDS: "0",
         ENABLE_DEMO_UI: "1",
         DEMO_APP_HTML,
         DEMO_CLIENT_ENTRY,
-        DEMO_GW_URL: "http://127.0.0.1:19299",
+        DEMO_GW_URL: `http://127.0.0.1:${GW_PORT}`,
         DEMO_ACCOUNT_ID: ACCOUNT_ID,
         DEMO_TENANT: TENANT,
         DEMO_PEER_ID: "smoke-peer",

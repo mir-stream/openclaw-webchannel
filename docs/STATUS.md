@@ -88,7 +88,7 @@ long-lived branches:
 | Browser ↔ agent chat over NATS, E2E-encrypted, zero-inbound, real LLM | Live-proven on real hardware (split host/container + real NGS relay); `demo/verify-e2e.mjs` + CI `run-all-real` |
 | Register-over-NATS admission (PoP challenge→sign→verify, opaque reject, reply-to reginbox guard) | `nats-register.ts` + `nats-register.test.ts`; PR #6 review PASS; N2 guard `949b3a9` |
 | SaaS-delivered trust facts (natsUrl + issuer), pin>delivered>derived | `device-flow-types.ts` / `account-config.ts` / `index-nats.ts:deriveAccountAuth`; `issuer-single-source.test.ts`; demo fake-issuer boots pin-less |
-| Device-flow enrollment + `channels add` wizard (config-only interactive; `--flag` form enrolls) | `setup-wizard.ts` + Gate A preflight; AC6 device-flow E2E on real nats-server |
+| Device-flow enrollment + `channels add` wizard (config-only interactive; `--flag` form enrolls) | `setup-wizard.ts` + Gate A preflight; AC6 real-HTTP device-flow E2E; `run-enrolled-transport` real-NATS harness |
 | Multi-device conversation keys (wrap-delivered at register; no registration on register path) | `conversation-key-store.ts`, `nats-client-wrapped-key.test.ts` (fail-closed terminals), `demo/verify-multidevice.mjs` 6/6 |
 | Multi-account multiplex + accountId-aware approvals | `multiplex.ts`, `approvals.ts` (+3-lens adversarial review F1/F2 fixed); `demo/verify-multiplex.mjs`, `demo/multiplex.sh` |
 | JWKS rotation + eviction (admin-driven, 500→401 fix) | `jwks.ts`; `demo/verify-rotate.mjs`, `verify-evict.mjs` |
