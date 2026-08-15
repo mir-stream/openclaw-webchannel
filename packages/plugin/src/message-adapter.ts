@@ -151,6 +151,17 @@ type LaneResolution = "open" | "unresolved" | "materialized" | "empty";
 type LaneFrameType = "progress" | "final";
 type DeliveryFailureKind = "false" | "throw";
 
+type DeferredAngleMarkerTail = {
+  /** Raw callback prefix before the earliest still-ambiguous `<`. */
+  sourcePrefix: string;
+  /** Latest cumulative callback observed while this was only a probe. */
+  probeSource: string;
+  /** Once true, only an ordinary durable final may replace this quarantine. */
+  exact: boolean;
+  /** Safe only for an incomplete probe after nonempty visible prose. */
+  terminalFallbackText?: string;
+};
+
 type AssistantDraftLane = {
   generation: number;
   /** Assigned only after a successful first wire frame for this lane. */
@@ -183,6 +194,10 @@ type AssistantDraftLane = {
    * Used only by the missed-boundary defense.
    */
   lastRawAnswerText: string;
+  /** Latest callback source, kept separate while an angle tail is quarantined. */
+  lastPartialSourceText: string;
+  /** Sticky hold for a distinctive marker that core may erase retroactively. */
+  deferredAngleMarkerTail?: DeferredAngleMarkerTail;
   answerRevision: number;
   tentativeBarrierReservationIds: string[];
   closed: boolean;
@@ -300,6 +315,160 @@ type ProvisionalReservation = {
 export type PartialAnswerUpdate = { text?: string; delta?: string; replace?: true };
 
 /**
+ * The pinned OpenClaw TOOL_CALL_TAG_NAMES plus its adjacent `final` tag.
+ * Keep this fixed allowlist in sync when the core pin moves.
+ */
+const CORE_ANGLE_MARKER_NAMES = [
+  "tool_call",
+  "tool_calls",
+  "tool_result",
+  "function_call",
+  "function_calls",
+  "function_response",
+  "function",
+  "antml:invoke",
+  "antml:parameter",
+  "final",
+] as const;
+const XML_NAME_CHAR_RE = /[A-Za-z0-9_.:-]/;
+
+type AngleMarkerCandidate = { start: number; exact: boolean };
+type AngleMarkerScan = {
+  first?: AngleMarkerCandidate;
+  earliestExactStart?: number;
+};
+
+function cleanPartialAnswerText(text: string): string {
+  return stripInlineDirectiveTagsForDelivery(
+    stripReasoningTagsFromText(text, { mode: "strict", trim: "both" }),
+  ).text;
+}
+
+function classifyAngleMarkerAt(
+  text: string,
+  start: number,
+): "incomplete" | "exact" | undefined {
+  if (text[start] !== "<") return undefined;
+
+  let cursor = start + 1;
+  while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  if (text[cursor] === "/") {
+    cursor += 1;
+    while (/\s/.test(text[cursor] ?? "")) cursor += 1;
+  }
+  // A bare `<` is still a viable distinctive marker prefix. The next name byte
+  // either promotes the hold or proves ordinary literal text immediately.
+  if (cursor === text.length) return "incomplete";
+
+  const nameStart = cursor;
+  while (XML_NAME_CHAR_RE.test(text[cursor] ?? "")) cursor += 1;
+  if (cursor === nameStart) return undefined;
+  const fragment = text.slice(nameStart, cursor).toLowerCase();
+  for (const name of CORE_ANGLE_MARKER_NAMES) {
+    if (fragment === name) {
+      const boundary = text[cursor];
+      if (boundary === undefined || boundary === "<") return "incomplete";
+      return /\s/.test(boundary) || boundary === "/" || boundary === ">"
+        ? "exact"
+        : undefined;
+    }
+    if ((cursor === text.length || text[cursor] === "<") && name.startsWith(fragment)) {
+      return "incomplete";
+    }
+  }
+  return undefined;
+}
+
+/** One bounded linear scan; no candidate rescans a suffix or sanitizer stage. */
+function scanAngleMarkers(text: string): AngleMarkerScan {
+  const firstAngle = text.indexOf("<");
+  if (firstAngle < 0) return {};
+
+  const result: AngleMarkerScan = {};
+  for (let start = firstAngle; start >= 0; start = text.indexOf("<", start + 1)) {
+    const classification = classifyAngleMarkerAt(text, start);
+    if (!classification) continue;
+    const candidate = { start, exact: classification === "exact" };
+    result.first ??= candidate;
+    if (candidate.exact && result.earliestExactStart === undefined) {
+      result.earliestExactStart = start;
+    }
+  }
+  return result;
+}
+
+function buildDeferredAngleMarkerTail(
+  text: string,
+  sourcePrefix: string,
+  exact: boolean,
+): DeferredAngleMarkerTail {
+  const hasVisiblePrefix = cleanPartialAnswerText(sourcePrefix).length > 0;
+  return {
+    sourcePrefix,
+    probeSource: text,
+    exact,
+    terminalFallbackText:
+      !exact && hasVisiblePrefix ? cleanPartialAnswerText(text) : undefined,
+  };
+}
+
+function deferAngleMarkerTail(
+  text: string,
+  previous?: DeferredAngleMarkerTail,
+): {
+  visibleText: string;
+  deferred?: DeferredAngleMarkerTail;
+  alreadyQuarantined?: boolean;
+  restart?: boolean;
+} {
+  if (previous?.exact) {
+    return { visibleText: previous.sourcePrefix, deferred: previous, alreadyQuarantined: true };
+  }
+
+  const scan = scanAngleMarkers(text);
+  if (previous) {
+    const anchor = previous.sourcePrefix.length;
+    if (!text.startsWith(previous.probeSource)) {
+      const cleanPrefix = cleanPartialAnswerText(previous.sourcePrefix).trimEnd();
+      const keepsSafePrefix =
+        previous.sourcePrefix.length === 0 ||
+        text.startsWith(previous.sourcePrefix) ||
+        (cleanPrefix.length > 0 && cleanPartialAnswerText(text).startsWith(cleanPrefix));
+      if (!keepsSafePrefix) return { visibleText: text, restart: true };
+      return {
+        visibleText: previous.sourcePrefix,
+        deferred: buildDeferredAngleMarkerTail(text, previous.sourcePrefix, true),
+        alreadyQuarantined: true,
+      };
+    }
+    if (scan.first?.start === anchor) {
+      const nestedExact =
+        scan.earliestExactStart !== undefined && scan.earliestExactStart >= anchor;
+      return {
+        visibleText: previous.sourcePrefix,
+        deferred: buildDeferredAngleMarkerTail(
+          text,
+          previous.sourcePrefix,
+          scan.first.exact || nestedExact,
+        ),
+      };
+    }
+    // A monotonic continuation proved that the incomplete name was literal.
+    // Re-scan below so a later independent candidate can start its own hold.
+  }
+
+  if (!scan.first) return { visibleText: text };
+  const exact =
+    scan.first.exact ||
+    (scan.earliestExactStart !== undefined && scan.earliestExactStart >= scan.first.start);
+  const sourcePrefix = text.slice(0, scan.first.start);
+  return {
+    visibleText: sourcePrefix,
+    deferred: buildDeferredAngleMarkerTail(text, sourcePrefix, exact),
+  };
+}
+
+/**
  * Per-turn draft state for partial/progress streaming.
  *
  * The provisional preview is turn-scoped and ownerless until a successful
@@ -392,6 +561,7 @@ export function createProgressDraftController(params: {
     generation,
     answerText: "",
     lastRawAnswerText: "",
+    lastPartialSourceText: "",
     answerRevision: 0,
     tentativeBarrierReservationIds: [],
     closed: false,
@@ -667,6 +837,27 @@ export function createProgressDraftController(params: {
     }
     if (lane.lastRawAnswerText && !raw.startsWith(lane.lastRawAnswerText)) return;
     lane.lastRawAnswerText = raw;
+  };
+
+  /** Resolve a no-final hold: incomplete prose may return; exact markers may not. */
+  const resolveDeferredAngleMarkerTail = (
+    lane: AssistantDraftLane,
+    options?: { preserveExact?: boolean },
+  ): void => {
+    const deferred = lane.deferredAngleMarkerTail;
+    if (!deferred) return;
+    if (deferred.exact && options?.preserveExact) return;
+    lane.deferredAngleMarkerTail = undefined;
+    lane.lastPartialSourceText = "";
+    if (deferred.exact || !deferred.terminalFallbackText) return;
+    const restored = deferred.terminalFallbackText;
+    if (restored === lane.answerText) return;
+    lane.answerText = restored;
+    lane.answerRevision += 1;
+    acceptRawBaseline(lane, restored, { replace: true });
+    if (lane.resolution === "empty" || lane.resolution === "unresolved") {
+      lane.resolution = "open";
+    }
   };
 
   const laneHasFailedCurrentRevision = (lane: AssistantDraftLane): boolean =>
@@ -1166,6 +1357,7 @@ export function createProgressDraftController(params: {
 
   const closeAndRotate = (): void => {
     const lane = currentLane();
+    resolveDeferredAngleMarkerTail(lane);
     discardPendingProgress(
       (frame) => frame.kind === "lane" && frame.generation === lane.generation,
     );
@@ -1316,6 +1508,7 @@ export function createProgressDraftController(params: {
   };
 
   const terminalDrain = (settleCurrent: boolean): void => {
+    resolveDeferredAngleMarkerTail(currentLane());
     retireTentativeState();
     releaseReadyLanes({
       emitCurrentProgress: false,
@@ -1342,6 +1535,7 @@ export function createProgressDraftController(params: {
     // and handing P over satisfies the no-ghost rule (§6.2-3) exactly as well.
     // The RULE is unchanged — first successful claimant owns P — only who is
     // first. A failed claim in (2) rolls back and leaves P for this payload.
+    resolveDeferredAngleMarkerTail(currentLane(), { preserveExact: true });
     retireTentativeState();
     emitHeldLaneTextBeforeIndependentDelivery();
     const sent = sendIndependent(text);
@@ -1382,19 +1576,38 @@ export function createProgressDraftController(params: {
         () => {
           let lane = currentLane();
           if (state.stopped || lane.settled) return;
-          // A delta extends the RAW stream, not the displayed text: composing on
-          // the cleaned text would fold stripped tag fragments back into the
-          // accumulator. They are identical until something is actually
-          // stripped, so this only differs on the path the guards below exist
-          // for.
-          const deltaBase = lane.lastRawAnswerText || lane.answerText;
-          const raw =
+          const nonemptyDelta = typeof update.delta === "string" && update.delta.length > 0;
+          if (update.text === "" && !nonemptyDelta) {
+            lane.lastPartialSourceText = "";
+            if (!lane.deferredAngleMarkerTail?.exact) {
+              lane.deferredAngleMarkerTail = undefined;
+            }
+            return;
+          }
+
+          // A delta composes on the latest callback source even while its suffix
+          // is quarantined and therefore absent from `answerText`.
+          const deltaBase =
+            lane.lastPartialSourceText || lane.lastRawAnswerText || lane.answerText;
+          const sourceRaw =
             typeof update.text === "string" && update.text.length > 0
               ? update.text
-              : typeof update.delta === "string" && update.delta.length > 0
+              : nonemptyDelta
                 ? deltaBase + update.delta
                 : undefined;
-          if (raw === undefined) return;
+          if (sourceRaw === undefined) return;
+
+          const previousDeferred =
+            lane.deferredAngleMarkerTail?.exact || update.replace !== true
+              ? lane.deferredAngleMarkerTail
+              : undefined;
+          let deferredResult = deferAngleMarkerTail(sourceRaw, previousDeferred);
+          if (deferredResult.alreadyQuarantined) {
+            lane.lastPartialSourceText = sourceRaw;
+            lane.deferredAngleMarkerTail = deferredResult.deferred;
+            return;
+          }
+
           // Mirror core's own partial hygiene exactly (verified:
           // dist/message-handler.process-CcPQD8zK.js:685-698): strip reasoning +
           // inline-directive tags, drop a "Reasoning:\n"-prefixed partial, skip
@@ -1402,9 +1615,8 @@ export function createProgressDraftController(params: {
           // prefix of the current one) to avoid backwards flicker. Restored from
           // `develop` — the lane rewrite (34da088) dropped the first and third
           // of those while keeping the strip itself.
-          const cleaned = stripInlineDirectiveTagsForDelivery(
-            stripReasoningTagsFromText(raw, { mode: "strict", trim: "both" }),
-          ).text;
+          let visibleRaw = deferredResult.visibleText;
+          let cleaned = cleanPartialAnswerText(visibleRaw);
           // Deliberately does NOT touch the raw baseline. A reasoning payload is
           // not this message's answer, so letting it set the baseline would force
           // the real answer to "extend" reasoning text it has nothing to do with,
@@ -1413,9 +1625,15 @@ export function createProgressDraftController(params: {
           // baseline cannot trigger the fail-safe (which also requires existing
           // lane text), and a non-empty one still describes the last real answer
           // payload.
-          if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
+          if (!cleaned || cleaned.startsWith("Reasoning:\n")) {
+            lane.lastPartialSourceText = sourceRaw;
+            lane.deferredAngleMarkerTail = deferredResult.deferred;
+            return;
+          }
           if (cleaned === lane.answerText) {
-            acceptRawBaseline(lane, raw, { replace: update.replace === true });
+            lane.lastPartialSourceText = sourceRaw;
+            lane.deferredAngleMarkerTail = deferredResult.deferred;
+            acceptRawBaseline(lane, visibleRaw, { replace: update.replace === true });
             return;
           }
           // SHRINK. Mid-stream an unclosed `<thinking>` strips away text the
@@ -1427,6 +1645,8 @@ export function createProgressDraftController(params: {
           // update is authoritative and is never treated as a shrink.
           if (
             update.replace !== true &&
+            !deferredResult.deferred &&
+            !deferredResult.restart &&
             lane.answerText.length > 0 &&
             lane.answerText.startsWith(cleaned) &&
             cleaned.length < lane.answerText.length
@@ -1439,7 +1659,9 @@ export function createProgressDraftController(params: {
             //
             // No `replace` flag needed: this branch is unreachable for a replace
             // update (the condition above requires `replace !== true`).
-            acceptRawBaseline(lane, raw);
+            lane.lastPartialSourceText = sourceRaw;
+            lane.deferredAngleMarkerTail = deferredResult.deferred;
+            acceptRawBaseline(lane, visibleRaw);
             return;
           }
 
@@ -1455,9 +1677,11 @@ export function createProgressDraftController(params: {
           // cumulative text, so the raw text stops extending too.
           if (
             update.replace !== true &&
+            !deferredResult.deferred &&
             lane.answerText.length > 0 &&
-            !cleaned.startsWith(lane.answerText) &&
-            !raw.startsWith(lane.lastRawAnswerText)
+            (deferredResult.restart === true ||
+              (!cleaned.startsWith(lane.answerText) &&
+                !visibleRaw.startsWith(lane.lastRawAnswerText)))
           ) {
             warn(
               `contract violation: cumulative partial diverged without an assistant-message ` +
@@ -1465,10 +1689,16 @@ export function createProgressDraftController(params: {
             );
             closeAndRotate();
             lane = currentLane();
+            deferredResult = deferAngleMarkerTail(sourceRaw);
+            visibleRaw = deferredResult.visibleText;
+            cleaned = cleanPartialAnswerText(visibleRaw);
           }
 
+          lane.lastPartialSourceText = sourceRaw;
+          lane.deferredAngleMarkerTail = deferredResult.deferred;
+          if (!cleaned || cleaned.startsWith("Reasoning:\n")) return;
           lane.answerText = cleaned;
-          acceptRawBaseline(lane, raw, { replace: update.replace === true });
+          acceptRawBaseline(lane, visibleRaw, { replace: update.replace === true });
           lane.answerRevision += 1;
           if (lane.resolution === "empty" || lane.resolution === "unresolved") {
             lane.resolution = "open";
@@ -1686,6 +1916,11 @@ export function createProgressDraftController(params: {
           ) {
             return deliverTerminalIndependent(text);
           }
+          // Unlike partial callbacks, the ordinary final is durable and
+          // authoritative. It is the only event allowed to replace an exact
+          // quarantine with text that merely looks like a control marker.
+          active.deferredAngleMarkerTail = undefined;
+          active.lastPartialSourceText = "";
           terminalDrain(false);
           state.finalReconciliation.ordinaryAnswerSettled = true;
           active.answerText = text;

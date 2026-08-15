@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { sanitizeAssistantVisibleStreamText } from "openclaw/plugin-sdk/agent-runtime";
 
 import { createClawMessageAdapter, createProgressDraftController, createReasoningDraftController } from "./message-adapter.js";
 import { NullPeerChannel } from "./channel-contract.js";
@@ -125,6 +126,24 @@ function bubbleOrder(frames: DraftAttempt[]): string[] {
 
 function successfulIds(frames: DraftAttempt[]): string[] {
   return [...new Set(frames.map((frame) => frame.id))];
+}
+
+async function replayPinnedStreamPrefixes(
+  draft: ReturnType<typeof makeDraftHarness>["draft"],
+  source: string,
+): Promise<string> {
+  let previous: string | undefined;
+  for (let end = 1; end <= source.length; end += 1) {
+    const visible = sanitizeAssistantVisibleStreamText(source.slice(0, end));
+    if (visible === previous) continue;
+    previous = visible;
+    // Core suppresses empty partial callbacks; preserving that omission is what
+    // makes the tool-only and coalesced regressions realistic.
+    if (!visible) continue;
+    draft.pushAnswerText({ text: visible });
+    await draft.flush();
+  }
+  return sanitizeAssistantVisibleStreamText(source);
 }
 
 describe("ProgressDraftController — ordered assistant lanes", () => {
@@ -1350,11 +1369,12 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     expect(h.frames.filter((frame) => frame.type === "final")).toEqual([
       { type: "final", id: h.frames[0]!.id, text: "Hi there" },
     ]);
-    // The 4th partial ("Hi", shorter than the "Hi <thi" already on screen) is
-    // dropped rather than rendered — the text never moves backwards…
+    // The ambiguous bare `<` is held at its safe prefix; once `thi` proves this
+    // is not one of the distinctive tool markers, literal streaming resumes.
+    // The 4th partial ("Hi", shorter than "Hi <thi") is still dropped.
     expect(h.frames.map((frame) => frame.text)).toEqual([
       "Hi",
-      "Hi <",
+      "Hi ",
       "Hi <thi",
       "Hi  there",
       "Hi there",
@@ -1622,10 +1642,411 @@ describe("ProgressDraftController — ordered assistant lanes", () => {
     const texts = finals.map((frame) => frame.text);
     // The invariant that the reverted guard broke: never the same text twice.
     expect(new Set(texts).size).toBe(texts.length);
-    // Current shape. The 2 is #129 (this one message still splits at the
-    // fail-safe, which is a separate open defect) — whoever fixes #129 should
-    // change this to 1 deliberately. It must never grow.
-    expect(texts).toEqual(["Here you go.<tool_call>", "Here you go. Done."]);
+    // #129: the first exact marker makes the lane sticky until the durable
+    // final, so neither raw marker is finalized as a separate bubble.
+    expect(texts).toEqual(["Here you go. Done."]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+  });
+
+  const angleMarkerCases = [
+    ["tool_call", 'Hello <tool_call>{"x":1}</tool_call> Answer', "Hello  Answer"],
+    [
+      "tool_calls",
+      "Hello <tool_calls><parameter>x</parameter></tool_calls> Answer",
+      "Hello  Answer",
+    ],
+    ["tool_result", 'Hello <tool_result>{"x":1}</tool_result> Answer', "Hello  Answer"],
+    [
+      "function_call",
+      'Hello <function_call>{"x":1}</function_call> Answer',
+      "Hello  Answer",
+    ],
+    [
+      "function_calls",
+      "Hello <function_calls><parameter>x</parameter></function_calls> Answer",
+      "Hello  Answer",
+    ],
+    [
+      "function_response",
+      'Hello <function_response>{"x":1}</function_response> Answer',
+      "Hello  Answer",
+    ],
+    [
+      "function",
+      'Hello\n<function name="bash">{"x":1}</function>\nAnswer',
+      "Hello\n\nAnswer",
+    ],
+    [
+      "antml:invoke",
+      'Hello <antml:invoke>{"x":1}</antml:invoke> Answer',
+      "Hello  Answer",
+    ],
+    [
+      "antml:parameter",
+      'Hello <antml:parameter>{"x":1}</antml:parameter> Answer',
+      "Hello  Answer",
+    ],
+    ["final", "Hello <final>Answer</final>", "Hello Answer"],
+  ] as const;
+
+  it.each(angleMarkerCases)(
+    "M7l: pinned %s sanitizer prefixes stay on one clean lane",
+    async (_name, source, expected) => {
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      await expect(replayPinnedStreamPrefixes(h.draft, source)).resolves.toBe(expected);
+      await expect(h.draft.finalize(expected)).resolves.toBe(true);
+      await h.draft.drain();
+
+      expect(bubbleOrder(h.frames)).toEqual([expected]);
+      expect(successfulIds(h.frames)).toHaveLength(1);
+      expect(h.frames.every((frame) => !/<(?:\/?\s*)?(?:tool_|function|antml:|final\b)/.test(frame.text))).toBe(
+        true,
+      );
+    },
+  );
+
+  it("M7l1: a suppressed-empty tool-only marker cannot escape at the next boundary", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "<tool_call>" });
+    await h.draft.flush();
+    expect(h.frames).toEqual([]);
+
+    // Core's later empty callback is suppressed. The next boundary must discard
+    // the exact quarantine instead of restoring the opening marker.
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Answer" });
+    await h.draft.drain();
+    expect(bubbleOrder(h.frames)).toEqual(["Answer"]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+  });
+
+  it("M7l2: the earliest outer marker survives nested sanitized sawteeth", async () => {
+    const source =
+      'Hello <tool_call><function_call>{"name":"x"}</function_call></tool_call> there';
+    const expected = "Hello  there";
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    await expect(replayPinnedStreamPrefixes(h.draft, source)).resolves.toBe(expected);
+    await h.draft.finalize(expected);
+    await h.draft.drain();
+
+    expect(bubbleOrder(h.frames)).toEqual([expected]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+    expect(h.frames.some((frame) => frame.text.includes("<tool_call"))).toBe(false);
+  });
+
+  it.each([
+    ["tool_calls", [12, 48, 56]],
+    ["function_calls", [16, 56, 64]],
+  ] as const)(
+    "M7l3: pinned coalesced %s unwrap cuts cannot release an exact wrapper",
+    async (tag, cuts) => {
+      const source = `<${tag}><parameter>x</parameter></${tag}> Answer`;
+      const callbacks = cuts.map((end) =>
+        sanitizeAssistantVisibleStreamText(source.slice(0, end)),
+      );
+      expect(callbacks).toEqual([
+        `<${tag}>`,
+        `<${tag}>x</${tag}`,
+        " Answer",
+      ]);
+
+      const hidden = makeDraftHarness();
+      hidden.draft.handleAssistantMessageBoundary();
+      for (const text of callbacks) hidden.draft.pushAnswerText({ text });
+      await hidden.draft.drain();
+      expect(hidden.frames).toEqual([]);
+
+      const visibleCallbacks = cuts.map((end) =>
+        sanitizeAssistantVisibleStreamText(`Hello ${source.slice(0, end)}`),
+      );
+      expect(visibleCallbacks).toEqual([
+        `Hello <${tag}>`,
+        `Hello <${tag}>x</${tag}`,
+        "Hello  Answer",
+      ]);
+      const visible = makeDraftHarness();
+      visible.draft.handleAssistantMessageBoundary();
+      for (const text of visibleCallbacks) visible.draft.pushAnswerText({ text });
+      await visible.draft.finalize("Hello  Answer");
+      await visible.draft.drain();
+      expect(bubbleOrder(visible.frames)).toEqual(["Hello  Answer"]);
+      expect(successfulIds(visible.frames)).toHaveLength(1);
+      expect(visible.frames.some((frame) => frame.text.includes(`<${tag}`))).toBe(false);
+    },
+  );
+
+  it("M7l4: incomplete terminal fallback is visible-prefix-only", async () => {
+    const visible = makeDraftHarness();
+    visible.draft.handleAssistantMessageBoundary();
+    visible.draft.pushAnswerText({ text: "see <tool_cal" });
+    await visible.draft.drain();
+    expect(bubbleOrder(visible.frames)).toEqual(["see <tool_cal"]);
+
+    const anchorZero = makeDraftHarness();
+    anchorZero.draft.handleAssistantMessageBoundary();
+    anchorZero.draft.pushAnswerText({ text: "<tool_cal" });
+    await anchorZero.draft.drain();
+    expect(anchorZero.frames).toEqual([]);
+
+    const exact = makeDraftHarness();
+    exact.draft.handleAssistantMessageBoundary();
+    exact.draft.pushAnswerText({ text: "see <tool_call>" });
+    await exact.draft.drain();
+    expect(bubbleOrder(exact.frames)).toEqual(["see "]);
+  });
+
+  it("M7l5: a boundary restores an incomplete literal before the next lane", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "see <tool_cal" });
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "Second" });
+    await h.draft.drain();
+    expect(bubbleOrder(h.frames)).toEqual(["see <tool_cal", "Second"]);
+    expect(successfulIds(h.frames)).toHaveLength(2);
+  });
+
+  it("M7l6: a deferred tail resolves before an independent terminal", async () => {
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    h.draft.pushAnswerText({ text: "<tool_call>" });
+    await h.draft.flush();
+    await h.draft.deliverIndependentFinal({ text: "ERROR" });
+    await h.draft.drain();
+
+    expect(bubbleOrder(h.frames)).toEqual(["ERROR"]);
+
+    const visible = makeDraftHarness();
+    visible.draft.handleAssistantMessageBoundary();
+    visible.draft.pushAnswerText({ text: "before <tool_cal" });
+    await visible.draft.flush();
+    await visible.draft.deliverIndependentFinal({ text: "ERROR" });
+    await visible.draft.drain();
+    expect(bubbleOrder(visible.frames)).toEqual(["before <tool_cal", "ERROR"]);
+    expect(successfulIds(visible.frames)).toHaveLength(2);
+  });
+
+  it.each([
+    ["plain", "Use <tool_call> literally."],
+    ["inline code", 'Use `<tool_call>{"x":1}</tool_call>` literally.'],
+    ["fenced code", '```xml\n<tool_call>{"x":1}</tool_call>\n```'],
+  ])("M7l7: an authoritative final restores %s control-looking text", async (_name, source) => {
+    expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    await replayPinnedStreamPrefixes(h.draft, source);
+    // Code regions are intentionally not parsed in the adapter: doing so was
+    // cubic over cumulative callbacks with many spans. A control-looking
+    // partial stays quarantined until this authoritative final.
+    expect(h.frames.some((frame) => frame.text.includes("<tool_call"))).toBe(false);
+    await h.draft.finalize(source);
+    await h.draft.drain();
+    expect(bubbleOrder(h.frames)).toEqual([source]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+    expect(h.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+  });
+
+  it("M7l8: delta and replace updates cannot unlock an exact quarantine", async () => {
+    const delta = makeDraftHarness();
+    delta.draft.handleAssistantMessageBoundary();
+    delta.draft.pushAnswerText({ text: "Hello <tool_cal" });
+    delta.draft.pushAnswerText({ delta: 'l>{"x":1}</tool_call> Answer' });
+    await delta.draft.finalize("Hello  Answer");
+    await delta.draft.drain();
+    expect(bubbleOrder(delta.frames)).toEqual(["Hello  Answer"]);
+    expect(successfulIds(delta.frames)).toHaveLength(1);
+
+    const replace = makeDraftHarness();
+    replace.draft.handleAssistantMessageBoundary();
+    replace.draft.pushAnswerText({ text: "Hello <tool_call>" });
+    replace.draft.pushAnswerText({ text: "replacement", replace: true });
+    await replace.draft.flush();
+    expect(replace.frames.some((frame) => frame.text === "replacement")).toBe(false);
+    await replace.draft.finalize("replacement");
+    expect(bubbleOrder(replace.frames)).toEqual(["replacement"]);
+    expect(successfulIds(replace.frames)).toHaveLength(1);
+  });
+
+  it("M7l10: the angle scan stays bounded on repeated target-like literals", async () => {
+    const callbackCount = 256;
+    let source = "";
+    const h = makeDraftHarness();
+    h.draft.handleAssistantMessageBoundary();
+    const indexOf = vi.spyOn(String.prototype, "indexOf");
+    try {
+      for (let index = 0; index < callbackCount; index += 1) {
+        source += "`<tool_calligraphy>` ";
+        h.draft.pushAnswerText({ text: source });
+        await h.draft.flush();
+      }
+      const angleSearches = indexOf.mock.calls.filter(([needle]) => needle === "<").length;
+      const cumulativeCandidateBound = (callbackCount * (callbackCount + 3)) / 2;
+      expect(angleSearches).toBeLessThanOrEqual(cumulativeCandidateBound + callbackCount * 2);
+    } finally {
+      indexOf.mockRestore();
+    }
+    await h.draft.finalize(source);
+    expect(bubbleOrder(h.frames)).toEqual([source]);
+    expect(successfulIds(h.frames)).toHaveLength(1);
+  });
+
+  it("M7l12: a nonextension rotates only when it loses the held safe prefix", async () => {
+    const restart = makeDraftHarness();
+    restart.draft.handleAssistantMessageBoundary();
+    restart.draft.pushAnswerText({ text: "First <tool_cal" });
+    await restart.draft.flush();
+    restart.draft.pushAnswerText({ text: "Second" });
+    await restart.draft.finalize("Second final");
+    await restart.draft.drain();
+    expect(bubbleOrder(restart.frames)).toEqual(["First <tool_cal", "Second final"]);
+    expect(successfulIds(restart.frames)).toHaveLength(2);
+
+    for (const retraction of ["Hello", "Hello Answer"]) {
+      const hidden = makeDraftHarness();
+      hidden.draft.handleAssistantMessageBoundary();
+      hidden.draft.pushAnswerText({ text: "Hello <tool_cal" });
+      hidden.draft.pushAnswerText({ text: retraction });
+      await hidden.draft.finalize("Hello Answer");
+      await hidden.draft.drain();
+      expect(bubbleOrder(hidden.frames)).toEqual(["Hello Answer"]);
+      expect(successfulIds(hidden.frames)).toHaveLength(1);
+    }
+
+    const anchorZero = makeDraftHarness();
+    anchorZero.draft.handleAssistantMessageBoundary();
+    anchorZero.draft.pushAnswerText({ text: "<tool_cal" });
+    anchorZero.draft.pushAnswerText({ text: "Second" });
+    await anchorZero.draft.drain();
+    expect(anchorZero.frames).toEqual([]);
+  });
+
+  it("M7l13: no-final exact literals retain the suppressed-empty safety policy", async () => {
+    const exactPrefix = "Use <tool_call>";
+    const literalSource = `${exactPrefix} literally.`;
+    const hiddenSource = `${exactPrefix}{"x":1}</tool_call>`;
+    expect(sanitizeAssistantVisibleStreamText(exactPrefix)).toBe(exactPrefix);
+    expect(sanitizeAssistantVisibleStreamText(literalSource)).toBe(literalSource);
+    expect(sanitizeAssistantVisibleStreamText(hiddenSource)).toBe("Use");
+
+    // Both raw histories produce the same exact-prefix callback. Releasing it
+    // at that point would leak the hidden history when its later empty callback
+    // is suppressed, so without a durable final both settle only the safe text.
+    for (const source of [literalSource, hiddenSource]) {
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      await replayPinnedStreamPrefixes(h.draft, source);
+      await h.draft.drain();
+      expect(bubbleOrder(h.frames)).toEqual(["Use "]);
+      expect(h.frames.some((frame) => frame.text.includes("<tool_call"))).toBe(false);
+    }
+
+    for (const source of [
+      "<tool_call> literally.",
+      '<tool_call>{"x":1}</tool_call>',
+    ]) {
+      const anchorZero = makeDraftHarness();
+      anchorZero.draft.handleAssistantMessageBoundary();
+      await replayPinnedStreamPrefixes(anchorZero.draft, source);
+      await anchorZero.draft.drain();
+      expect(anchorZero.frames).toEqual([]);
+    }
+
+    // A complete callback that lexically disproves every allowlisted name is
+    // safe without reconstructing any payload grammar.
+    const disproved = "Use <tool_calligraphy> literally.";
+    const literal = makeDraftHarness();
+    literal.draft.handleAssistantMessageBoundary();
+    literal.draft.pushAnswerText({ text: disproved });
+    await literal.draft.drain();
+    expect(bubbleOrder(literal.frames)).toEqual([disproved]);
+  });
+
+  it("M7l14: end-of-callback names remain literal until a boundary proves otherwise", async () => {
+    const source = "Use <tool_calligraphy> literally.";
+    expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+
+    const charwise = makeDraftHarness();
+    charwise.draft.handleAssistantMessageBoundary();
+    await replayPinnedStreamPrefixes(charwise.draft, source);
+    await charwise.draft.drain();
+    expect(bubbleOrder(charwise.frames)).toEqual([source]);
+    expect(successfulIds(charwise.frames)).toHaveLength(1);
+    expect(charwise.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+
+    const exactPrefix = "Use <tool_call";
+    expect(sanitizeAssistantVisibleStreamText(exactPrefix)).toBe(exactPrefix);
+    const twoCallbacks = makeDraftHarness();
+    twoCallbacks.draft.handleAssistantMessageBoundary();
+    twoCallbacks.draft.pushAnswerText({ text: exactPrefix });
+    twoCallbacks.draft.pushAnswerText({ text: source });
+    await twoCallbacks.draft.drain();
+    expect(bubbleOrder(twoCallbacks.frames)).toEqual([source]);
+
+    const noFinal = makeDraftHarness();
+    noFinal.draft.handleAssistantMessageBoundary();
+    noFinal.draft.pushAnswerText({ text: exactPrefix });
+    await noFinal.draft.drain();
+    expect(bubbleOrder(noFinal.frames)).toEqual([exactPrefix]);
+
+    const fifo = makeDraftHarness();
+    fifo.draft.handleAssistantMessageBoundary();
+    fifo.draft.pushAnswerText({ text: "Use <tool_call" });
+    await fifo.draft.flush();
+    await fifo.draft.deliverIndependentFinal({ text: "ERROR" });
+    await fifo.draft.drain();
+    expect(bubbleOrder(fifo.frames)).toEqual(["Use <tool_call", "ERROR"]);
+    expect(successfulIds(fifo.frames)).toHaveLength(2);
+  });
+
+  it("M7l15: non-XML core-name boundaries monotonically release literals", async () => {
+    for (const source of [
+      "Use <tool_call!> literally.",
+      "Use <function=> literally.",
+      "Use <final!> literally.",
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe(source);
+      const h = makeDraftHarness();
+      h.draft.handleAssistantMessageBoundary();
+      await replayPinnedStreamPrefixes(h.draft, source);
+      await h.draft.drain();
+      expect(bubbleOrder(h.frames)).toEqual([source]);
+      expect(successfulIds(h.frames)).toHaveLength(1);
+      expect(h.frames.every((frame) => source.startsWith(frame.text))).toBe(true);
+    }
+  });
+
+  it("M7l16: valid XML boundaries retain hidden-tag quarantine", async () => {
+    for (const source of [
+      '<tool_call >{"x":1}</tool_call>',
+      "<tool_call/>",
+      '<tool_call>{"x":1}</tool_call>',
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe("");
+      const hidden = makeDraftHarness();
+      hidden.draft.handleAssistantMessageBoundary();
+      await replayPinnedStreamPrefixes(hidden.draft, source);
+      await hidden.draft.drain();
+      expect(hidden.frames).toEqual([]);
+    }
+
+    for (const source of [
+      'Hello <tool_call >{"x":1}</tool_call> Answer',
+      "Hello <tool_call/> Answer",
+      'Hello <tool_call>{"x":1}</tool_call> Answer',
+    ]) {
+      expect(sanitizeAssistantVisibleStreamText(source)).toBe("Hello  Answer");
+      const visible = makeDraftHarness();
+      visible.draft.handleAssistantMessageBoundary();
+      await replayPinnedStreamPrefixes(visible.draft, source);
+      await visible.draft.finalize("Hello  Answer");
+      await visible.draft.drain();
+      expect(bubbleOrder(visible.frames)).toEqual(["Hello  Answer"]);
+      expect(successfulIds(visible.frames)).toHaveLength(1);
+      expect(visible.frames.some((frame) => frame.text.includes("<tool_call"))).toBe(false);
+    }
   });
 
   /**
