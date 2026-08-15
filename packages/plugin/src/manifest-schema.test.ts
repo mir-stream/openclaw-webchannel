@@ -7,7 +7,10 @@ import {
   type JsonSchemaObject,
 } from "openclaw/plugin-sdk/json-schema-runtime";
 
-import { resolveReasoningEnabled } from "./account-config.js";
+import {
+  resolveConversationKeyRotateOnBoot,
+  resolveReasoningEnabled,
+} from "./account-config.js";
 
 const manifest = JSON.parse(
   readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
@@ -15,6 +18,7 @@ const manifest = JSON.parse(
   channelConfigs: {
     webchannel: {
       schema: Parameters<typeof buildJsonChannelConfigSchema>[0];
+      uiHints: Record<string, { label?: string; help?: string }>;
     };
   };
 };
@@ -33,6 +37,86 @@ describe("shipped WebChannel manifest schema", () => {
 
   it("retains strict unknown-key rejection", () => {
     expect(runtime.safeParse({ unknownLifecycleKey: true }).success).toBe(false);
+  });
+
+  it("accepts only boolean conversationKeys.rotateOnBoot at channel level", () => {
+    expect(
+      runtime.safeParse({ conversationKeys: { rotateOnBoot: true } }).success,
+    ).toBe(true);
+    expect(
+      runtime.safeParse({ conversationKeys: { rotateOnBoot: false } }).success,
+    ).toBe(true);
+    for (const value of ["true", "on", 1, 0, null, {}, []]) {
+      expect(
+        runtime.safeParse({ conversationKeys: { rotateOnBoot: value } }).success,
+        `conversationKeys.rotateOnBoot: ${JSON.stringify(value)} must be rejected`,
+      ).toBe(false);
+    }
+    expect(
+      runtime.safeParse({ conversationKeys: { unknown: true } }).success,
+    ).toBe(false);
+  });
+
+  it("ships an operator-facing hint for conversationKeys.rotateOnBoot", () => {
+    expect(
+      manifest.channelConfigs.webchannel.uiHints[
+        "conversationKeys.rotateOnBoot"
+      ],
+    ).toMatchObject({
+      label: expect.any(String),
+      help: expect.stringContaining("Omitted means off"),
+    });
+  });
+
+  it("leaves named-account conversationKeys to the runtime fail-closed boundary", () => {
+    for (const conversationKeys of [null, "on", false, [], { rotateOnBoot: "true" }]) {
+      expect(
+        runtime.safeParse({ accounts: { named: { conversationKeys } } }).success,
+      ).toBe(true);
+      expect(resolveConversationKeyRotateOnBoot({ conversationKeys })).toBe(false);
+    }
+  });
+
+  describe("conversationKeys.rotateOnBoot declares no schema default (#149)", () => {
+    const hydrate = (value: unknown) => {
+      const result = validateJsonSchemaValue({
+        schema: manifest.channelConfigs.webchannel.schema as JsonSchemaObject,
+        cacheKey: `webchannel-conversation-keys-default-${Math.random()}`,
+        value,
+        applyDefaults: true,
+      });
+      if (!result.ok) {
+        throw new Error(
+          `unexpected validation failure: ${JSON.stringify(result.errors)}`,
+        );
+      }
+      return result.value as { conversationKeys?: Record<string, unknown> };
+    };
+
+    it("does not materialize the group or key when omitted", () => {
+      const hydrated = hydrate({ enabled: true });
+      expect(hydrated.conversationKeys).toBeUndefined();
+      expect(resolveConversationKeyRotateOnBoot(hydrated)).toBe(false);
+    });
+
+    it("does not materialize rotateOnBoot in an empty group", () => {
+      const hydrated = hydrate({ enabled: true, conversationKeys: {} });
+      expect(hydrated).not.toHaveProperty(
+        "conversationKeys.rotateOnBoot",
+      );
+      expect(resolveConversationKeyRotateOnBoot(hydrated)).toBe(false);
+    });
+
+    it("preserves both explicit boolean values", () => {
+      expect(
+        hydrate({ conversationKeys: { rotateOnBoot: true } })
+          .conversationKeys,
+      ).toEqual({ rotateOnBoot: true });
+      expect(
+        hydrate({ conversationKeys: { rotateOnBoot: false } })
+          .conversationKeys,
+      ).toEqual({ rotateOnBoot: false });
+    });
   });
 
   // #113. The operator-facing half of the reasoning gate. These run through

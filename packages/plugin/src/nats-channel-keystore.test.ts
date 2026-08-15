@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { NatsChannel } from "./nats-channel.js";
 import { ConversationKeyStore } from "./conversation-key-store.js";
 import { generateKeyPair } from "./e2e-crypto.js";
+import { recent } from "./history.js";
 import { unwrapConversationKey } from "./late-join-decryptor.js";
 import { sealEnvelope, openEnvelope } from "./e2e-session.js";
 
@@ -277,6 +278,183 @@ describe("NatsChannel keyStore mode (register admission)", () => {
         clientNonce: CLIENT_NONCE,
       }),
     ).toThrow();
+  });
+
+  it("a captured K_old register reply cannot be replayed under a fresh nonce after rotation", () => {
+    const broker = new FakeBroker();
+    const { channel, store, identityKP } = makeKeyStoreChannel(broker);
+    const deviceKP = generateKeyPair();
+    const oldNonce = "b2xkLXJlZ2lzdGVyLW5vbmNlLTAx";
+    const freshNonce = "ZnJlc2gtcmVnaXN0ZXItbm9uY2UtMDI";
+
+    channel.registerPeer(PEER);
+    const oldKey = store.get(PEER)!;
+    const captured = channel.wrapConversationKeyForDevice(
+      PEER,
+      deviceKP.publicKey,
+      oldNonce,
+    )!;
+
+    const rotated = store.rotate(PEER);
+    // A successful re-register refreshes the channel's live key from durable
+    // storage before it mints the reply for this fresh browser attempt.
+    channel.registerPeer(PEER);
+    const current = channel.wrapConversationKeyForDevice(
+      PEER,
+      deviceKP.publicKey,
+      freshNonce,
+    )!;
+    expect(Buffer.from(unwrapConversationKey(current, deviceKP.privateKey, {
+      agentPublicKey: identityKP.publicKey,
+      peerId: PEER,
+      clientNonce: freshNonce,
+    })).equals(Buffer.from(rotated.key))).toBe(true);
+    expect(Buffer.from(unwrapConversationKey(captured, deviceKP.privateKey, {
+      agentPublicKey: identityKP.publicKey,
+      peerId: PEER,
+      clientNonce: oldNonce,
+    })).equals(Buffer.from(oldKey))).toBe(true);
+    expect(() => unwrapConversationKey(captured, deviceKP.privateKey, {
+      agentPublicKey: identityKP.publicKey,
+      peerId: PEER,
+      clientNonce: freshNonce,
+    })).toThrow();
+  });
+
+  it("finishes boot rotation before constructing the register-facing channel", () => {
+    const oldKey = new ConversationKeyStore({
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      home,
+    }).getOrCreate(PEER);
+    const events: string[] = [];
+    const bootStore = new ConversationKeyStore({
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      home,
+      rotateOnBoot: true,
+      onBootRotationReport: (report) => {
+        expect(report).toMatchObject({ rotatedPeers: 1, failedPeers: 0 });
+        events.push("rotation-complete");
+      },
+    });
+    const newKey = bootStore.get(PEER)!;
+    expect(Buffer.from(newKey).equals(Buffer.from(oldKey))).toBe(false);
+
+    const broker = new FakeBroker();
+    const transport = new FakeTransport(broker);
+    const identityKP = generateKeyPair();
+    const channel = new NatsChannel(
+      transport as unknown as ConstructorParameters<typeof NatsChannel>[0],
+      ACCOUNT,
+      TENANT,
+      { keyStore: bootStore, identityKeyPair: identityKP },
+    );
+    events.push("channel-constructed");
+    channel.subscribeRegister();
+    events.push("register-listening");
+    expect(events).toEqual([
+      "rotation-complete",
+      "channel-constructed",
+      "register-listening",
+    ]);
+
+    channel.registerPeer(PEER);
+    const deviceKP = generateKeyPair();
+    const wrapped = channel.wrapConversationKeyForDevice(
+      PEER,
+      deviceKP.publicKey,
+      CLIENT_NONCE,
+    )!;
+    expect(Buffer.from(unwrapConversationKey(wrapped, deviceKP.privateKey, {
+      agentPublicKey: identityKP.publicKey,
+      peerId: PEER,
+      clientNonce: CLIENT_NONCE,
+    })).equals(Buffer.from(newKey))).toBe(true);
+  });
+
+  it("starts register admission after a partial boot rotation failure", () => {
+    const seeded = new ConversationKeyStore({
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      home,
+    });
+    const oldA = seeded.getOrCreate("peer-a");
+    const oldB = seeded.getOrCreate("peer-b");
+    let generationWrites = 0;
+    const bootStore = new ConversationKeyStore({
+      tenant: TENANT,
+      accountId: ACCOUNT,
+      home,
+      rotateOnBoot: true,
+      _beforeGenerationPersist: () => {
+        generationWrites += 1;
+        if (generationWrites === 1) throw new Error("injected peer failure");
+      },
+    });
+
+    const broker = new FakeBroker();
+    const transport = new FakeTransport(broker);
+    const channel = new NatsChannel(
+      transport as unknown as ConstructorParameters<typeof NatsChannel>[0],
+      ACCOUNT,
+      TENANT,
+      { keyStore: bootStore, identityKeyPair: generateKeyPair() },
+    );
+    expect(() => channel.subscribeRegister()).not.toThrow();
+    expect(() => channel.registerPeer("peer-a")).not.toThrow();
+    expect(() => channel.registerPeer("peer-b")).not.toThrow();
+    expect(Buffer.from(bootStore.get("peer-a")!).equals(Buffer.from(oldA))).toBe(true);
+    expect(Buffer.from(bootStore.get("peer-b")!).equals(Buffer.from(oldB))).toBe(false);
+  });
+
+  it("reads retained core history after rotation and reseals it only under K_new", async () => {
+    const broker = new FakeBroker();
+    const { channel, store } = makeKeyStoreChannel(broker);
+    channel.registerPeer(PEER);
+    const oldKey = store.get(PEER)!;
+    const rotated = store.rotate(PEER);
+    channel.registerPeer(PEER);
+
+    const oldDevice = makeDevice(broker, () => oldKey);
+    const newDevice = makeDevice(broker, () => rotated.key);
+    const calls: Array<{ sessionKey: string; limit?: number }> = [];
+    const api = {
+      runtime: {
+        subagent: {
+          getSessionMessages: async (params: { sessionKey: string; limit?: number }) => {
+            calls.push(params);
+            return {
+              messages: [{
+                role: "assistant",
+                content: [{ type: "text", text: "retained transcript" }],
+                timestamp: 1_700_000_000_000,
+                __openclaw: { id: "history-1" },
+              }],
+            };
+          },
+        },
+      },
+    } as unknown as Parameters<typeof recent>[0];
+
+    const messages = await recent(api, "webchannel:agent-1:user-42", 10);
+    expect(calls).toEqual([{
+      sessionKey: "webchannel:agent-1:user-42",
+      limit: 10,
+    }]);
+    expect(channel.sendHistory(PEER, messages)).toBe(true);
+    expect(newDevice.decrypted).toEqual([{
+      type: "history",
+      messages: [{
+        id: "history-1",
+        role: "agent",
+        text: "retained transcript",
+        ts: 1_700_000_000_000,
+      }],
+    }]);
+    expect(newDevice.failed).toBe(0);
+    expect(oldDevice.decrypted).toEqual([]);
+    expect(oldDevice.failed).toBe(1);
   });
 
   it("F2: constructing a keyStore channel WITHOUT an identity key is fail-closed (throws)", () => {

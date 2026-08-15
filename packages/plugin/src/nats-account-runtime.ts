@@ -92,6 +92,7 @@ import {
 import { planWebchannelAccount } from "./multiplex.js";
 import {
   loadPersistedCredentialDocument,
+  resolveConversationKeyRotateOnBoot,
   resolveTypingEnabled,
 } from "./account-config.js";
 import {
@@ -247,6 +248,24 @@ export function connectedPublishedAccountIds<T extends { transport: { connected:
   return [...runtimes.entries()]
     .filter(([accountId, runtime]) => runtimes.get(accountId) === runtime && runtime.transport.connected)
     .map(([accountId]) => accountId);
+}
+
+/**
+ * One claim per account lifecycle, shared by every startup retry attempt.
+ * A process restart constructs a new gate and therefore performs one new boot
+ * rotation, while relay/readiness flapping inside this lifecycle cannot rotate
+ * already-invalidated browser keys repeatedly.
+ */
+export class ConversationKeyBootRotationGate {
+  private attempted = false;
+
+  constructor(private readonly enabled: boolean) {}
+
+  claim(): boolean {
+    if (!this.enabled || this.attempted) return false;
+    this.attempted = true;
+    return true;
+  }
 }
 
 function reportServingAggregate(api: any): void {
@@ -659,6 +678,13 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // Keep one limiter per account lifecycle so transport restart attempts do
       // not reset capacity-rejection suppression and create a fresh log burst.
       const capacityDiagnostics = createCapacityDiagnostics({ logger: api.logger });
+      // This gate lives OUTSIDE the retry closure. The boot policy intentionally
+      // permits per-peer partial failure and promises no account-wide atomicity;
+      // it is therefore not the public rotateAccount()/rotateAll() API that §8.2
+      // forbids implementing as a loop over rotate(peerId).
+      const bootRotationGate = new ConversationKeyBootRotationGate(
+        resolveConversationKeyRotateOnBoot(account),
+      );
       return await runAccountStartupLoop({
         signal: ctx.abortSignal,
         onRetryScheduled: ({ failure, failedAttempts, delayMs }) => {
@@ -826,6 +852,10 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
       // accountId is the wire identity (one namespace per account).
       let channel: NatsChannel;
       try {
+        // Claim immediately before store construction. This synchronous boot
+        // rotation completes before NatsChannel exists, and therefore before
+        // the register wildcard can be installed or a browser can receive K_old.
+        const rotateOnBoot = bootRotationGate.claim();
         channel = new NatsChannel(transport, accountId, tenant, {
           ...cryptoOptions,
           keyStore: new ConversationKeyStore({
@@ -835,6 +865,33 @@ async function buildNatsAccount(api: any, ctx: any, ownerIdentity: object): Prom
               ? { storageRoot: plan.storageRoot }
               : {}),
             onCapacityWarning: capacityDiagnostics.onCapacityWarning,
+            rotateOnBoot,
+            onBootRotationReport: (report) => {
+              const state = report.discoveryFailed
+                ? "discovery_failed"
+                : report.failedPeers > 0
+                  ? "partial"
+                  : "complete";
+              if (state === "complete") {
+                log(
+                  "info",
+                  `event=webchannel.conversation_key_boot_rotation ` +
+                    `accountId=${logSafe(accountId)} state=${logSafe(state)} ` +
+                    `total=${logSafe(report.totalPeers)} ` +
+                    `rotated=${logSafe(report.rotatedPeers)} ` +
+                    `failed=${logSafe(report.failedPeers)}`,
+                );
+              } else {
+                log(
+                  "warn",
+                  `event=webchannel.conversation_key_boot_rotation ` +
+                    `accountId=${logSafe(accountId)} state=${logSafe(state)} ` +
+                    `total=${logSafe(report.totalPeers)} ` +
+                    `rotated=${logSafe(report.rotatedPeers)} ` +
+                    `failed=${logSafe(report.failedPeers)}`,
+                );
+              }
+            },
           }),
           identityKeyPair: attemptIdentityKey,
         });
