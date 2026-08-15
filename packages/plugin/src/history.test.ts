@@ -183,6 +183,65 @@ describe("history — recent (AC2)", () => {
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
+  it("rejects an inherited id from an own __openclaw envelope", async () => {
+    const privateInheritedId = "private-inherited-id";
+    const privateText = "private inherited-id transcript";
+    const envelope = Object.create({ id: privateInheritedId }) as Record<string, unknown>;
+    const { api } = makeApi([
+      {
+        role: "user",
+        content: privateText,
+        timestamp: 3000,
+        __openclaw: envelope,
+      },
+    ]);
+    const logger = { warn: vi.fn() };
+
+    expect(await recent(api, SESSION_KEY, 10, logger)).toEqual([
+      { id: "h-3000-0", role: "user", text: privateText, ts: 3000 },
+    ]);
+    expect(logger.warn).toHaveBeenCalledOnce();
+    const warning = logger.warn.mock.calls[0][0];
+    expect(warning).toContain("history transcript __openclaw shape drift");
+    expect(warning).not.toContain(privateInheritedId);
+    expect(warning).not.toContain(privateText);
+    expect(warning).not.toContain(SESSION_KEY);
+  });
+
+  it("never substitutes __openclaw.seq for a missing own id", async () => {
+    const privateSeq = "private-seq-value";
+    const { api } = makeApi([
+      {
+        role: "assistant",
+        content: "seq fallback",
+        timestamp: 4000,
+        __openclaw: { seq: privateSeq },
+      },
+    ]);
+    const logger = { warn: vi.fn() };
+
+    expect(await recent(api, SESSION_KEY, 10, logger)).toEqual([
+      { id: "h-4000-0", role: "agent", text: "seq fallback", ts: 4000 },
+    ]);
+    expect(logger.warn).toHaveBeenCalledOnce();
+    expect(logger.warn.mock.calls[0][0]).not.toContain(privateSeq);
+  });
+
+  it("treats a prototype-only __openclaw envelope as benign absence", async () => {
+    const raw = Object.assign(Object.create({ __openclaw: { id: "prototype-id" } }), {
+      role: "user",
+      content: "prototype envelope",
+      timestamp: 5000,
+    });
+    const { api } = makeApi([raw]);
+    const logger = { warn: vi.fn() };
+
+    expect(await recent(api, SESSION_KEY, 10, logger)).toEqual([
+      { id: "h-5000-0", role: "user", text: "prototype envelope", ts: 5000 },
+    ]);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["missing id", {}],
     ["empty id", { id: "" }],
@@ -308,26 +367,35 @@ describe("history — pageBefore (AC2 / AC4)", () => {
   it("diagnoses repeated window-relative synthetic cursor misses once without logging private context", async () => {
     const { api } = makeApi(makeIdlessConversation(30));
     const narrow = await recent(api, SESSION_KEY, 10);
-    const cursor = narrow[0].id;
+    const firstCursor = narrow[0].id;
+    const secondCursor = narrow[1].id;
     const wide = await recent(api, SESSION_KEY, 30);
-    const sameMessageWideId = wide.find((message) => message.text === "21")?.id;
-    const logger = { warn: vi.fn() };
+    const firstWideId = wide.find((message) => message.text === "21")?.id;
+    const secondWideId = wide.find((message) => message.text === "22")?.id;
+    const firstLogger = { warn: vi.fn() };
+    const secondLogger = { warn: vi.fn() };
 
     // The marker is honest: the same message has a different id in another
     // tail window, so this cursor cannot be resolved by either paging phase.
-    expect(cursor).toMatch(/^h-\d+-\d+$/);
-    expect(sameMessageWideId).not.toBe(cursor);
-    expect(await pageBefore(api, SESSION_KEY, cursor, 2, logger)).toEqual([]);
-    expect(await pageBefore(api, SESSION_KEY, cursor, 2, logger)).toEqual([]);
+    expect(firstCursor).toMatch(/^h-\d+-\d+$/);
+    expect(secondCursor).toMatch(/^h-\d+-\d+$/);
+    expect(firstCursor).not.toBe(secondCursor);
+    expect(firstWideId).not.toBe(firstCursor);
+    expect(secondWideId).not.toBe(secondCursor);
+    expect(await pageBefore(api, SESSION_KEY, firstCursor, 2, firstLogger)).toEqual([]);
+    expect(await pageBefore(api, SESSION_KEY, secondCursor, 2, secondLogger)).toEqual([]);
 
-    expect(logger.warn).toHaveBeenCalledOnce();
-    const warning = logger.warn.mock.calls[0][0];
+    expect(firstLogger.warn).toHaveBeenCalledOnce();
+    expect(secondLogger.warn).not.toHaveBeenCalled();
+    const warning = firstLogger.warn.mock.calls[0][0];
     expect(warning).toContain("history.pageBefore cursor miss");
     expect(warning).toContain("cursorKind=window-relative-synthetic");
     expect(warning).toContain("cause=window-relative-synthetic-id");
-    expect(warning).not.toContain(cursor);
+    expect(warning).not.toContain(firstCursor);
+    expect(warning).not.toContain(secondCursor);
     expect(warning).not.toContain(SESSION_KEY);
     expect(warning).not.toContain("21");
+    expect(warning).not.toContain("22");
   });
 
   it.each([
@@ -360,18 +428,22 @@ describe("history — pageBefore (AC2 / AC4)", () => {
   );
 
   it("classifies repeated final opaque cursor misses once", async () => {
-    const cursor = "ghost";
+    const firstCursor = "private-ghost-one";
+    const secondCursor = "private-ghost-two";
     const { api } = makeApi(FIXTURE);
-    const logger = { warn: vi.fn() };
+    const firstLogger = { warn: vi.fn() };
+    const secondLogger = { warn: vi.fn() };
 
-    expect(await pageBefore(api, SESSION_KEY, cursor, 600, logger)).toEqual([]);
-    expect(await pageBefore(api, SESSION_KEY, cursor, 600, logger)).toEqual([]);
+    expect(await pageBefore(api, SESSION_KEY, firstCursor, 600, firstLogger)).toEqual([]);
+    expect(await pageBefore(api, SESSION_KEY, secondCursor, 600, secondLogger)).toEqual([]);
 
-    expect(logger.warn).toHaveBeenCalledOnce();
-    const warning = logger.warn.mock.calls[0][0];
+    expect(firstLogger.warn).toHaveBeenCalledOnce();
+    expect(secondLogger.warn).not.toHaveBeenCalled();
+    const warning = firstLogger.warn.mock.calls[0][0];
     expect(warning).toContain("cursorKind=opaque");
     expect(warning).toContain("cause=unknown");
-    expect(warning).not.toContain(cursor);
+    expect(warning).not.toContain(firstCursor);
+    expect(warning).not.toContain(secondCursor);
     expect(warning).not.toContain(SESSION_KEY);
   });
 
@@ -383,14 +455,21 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     expect(await pageBefore(api, SESSION_KEY, syntheticCursor, 600)).toEqual([]);
     expect(await pageBefore(api, SESSION_KEY, opaqueCursor, 600)).toEqual([]);
 
-    const logger = { warn: vi.fn() };
-    expect(await pageBefore(api, SESSION_KEY, syntheticCursor, 600, logger)).toEqual([]);
-    expect(await pageBefore(api, SESSION_KEY, opaqueCursor, 600, logger)).toEqual([]);
+    const syntheticLogger = { warn: vi.fn() };
+    const opaqueLogger = { warn: vi.fn() };
+    expect(await pageBefore(api, SESSION_KEY, syntheticCursor, 600, syntheticLogger)).toEqual([]);
+    expect(await pageBefore(api, SESSION_KEY, opaqueCursor, 600, opaqueLogger)).toEqual([]);
 
-    expect(logger.warn.mock.calls.map(([warning]) => warning)).toEqual([
+    expect(syntheticLogger.warn).toHaveBeenCalledWith(
       "webchannel: history.pageBefore cursor miss; cursorKind=window-relative-synthetic cause=window-relative-synthetic-id",
+    );
+    expect(opaqueLogger.warn).toHaveBeenCalledWith(
       "webchannel: history.pageBefore cursor miss; cursorKind=opaque cause=unknown",
-    ]);
+    );
+    expect(syntheticLogger.warn.mock.calls[0][0]).not.toContain(syntheticCursor);
+    expect(opaqueLogger.warn.mock.calls[0][0]).not.toContain(opaqueCursor);
+    expect(syntheticLogger.warn.mock.calls[0][0]).not.toContain(SESSION_KEY);
+    expect(opaqueLogger.warn.mock.calls[0][0]).not.toContain(SESSION_KEY);
   });
 
   it("finds a cursor beyond the phase-1 window via the phase-2 1000-fetch", async () => {
@@ -399,11 +478,13 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // re-fetches at limit 1000, finds m-10, and returns the 2 items strictly
     // older: [m-8, m-9].
     const { api, getSessionMessages } = makeApi(makeConversation(30));
-    const out = await pageBefore(api, SESSION_KEY, "m-10", 2);
+    const logger = { warn: vi.fn() };
+    const out = await pageBefore(api, SESSION_KEY, "m-10", 2, logger);
     expect(out.map((m) => m.id)).toEqual(["m-8", "m-9"]);
     expect(getSessionMessages).toHaveBeenCalledTimes(2);
     expect(getSessionMessages.mock.calls[0][0].limit).toBe(4);
     expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 
   it("hits the store exactly once when a FULL page sits inside the phase-1 window", async () => {
@@ -459,10 +540,12 @@ describe("history — pageBefore (AC2 / AC4)", () => {
     // idx < limit, so we cannot trust the small window and MUST widen first;
     // phase 2 also finds m-1 at idx 0 → nothing older → [] (confirmed wall).
     const { api, getSessionMessages } = makeApi(FIXTURE);
-    const out = await pageBefore(api, SESSION_KEY, "m-1", 10);
+    const logger = { warn: vi.fn() };
+    const out = await pageBefore(api, SESSION_KEY, "m-1", 10, logger);
     expect(out).toEqual([]);
     expect(getSessionMessages).toHaveBeenCalledTimes(2);
     expect(getSessionMessages.mock.calls[1][0].limit).toBe(1000);
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 
   it("returns [] when the cursor is the oldest message but sits OUTSIDE the phase-1 window", async () => {
