@@ -52,6 +52,11 @@ function storePath(account = ACCOUNT, tenant = TENANT): string {
     .conversationKeyPath;
 }
 
+function generationPath(account = ACCOUNT, tenant = TENANT): string {
+  return tupleStoragePaths({ tenant, accountId: account, home })
+    .conversationKeyGenerationsPath;
+}
+
 function storedKeys(account = ACCOUNT): Record<string, string> {
   return (JSON.parse(readFileSync(storePath(account), "utf8")) as {
     version: number;
@@ -85,6 +90,33 @@ describe("ConversationKeyStore", () => {
     const reborn = createStore({ accountId: ACCOUNT, home });
     expect(sameBytes(reborn.getOrCreate("user-42"), key)).toBe(true);
     expect(reborn.get("never-seen")).toBeNull();
+  });
+
+  it("get and getOrCreate never advance an existing key's durable generation", () => {
+    let nowSec = 1_700_000_000;
+    const first = createStore({
+      accountId: ACCOUNT,
+      home,
+      _nowSec: () => nowSec++,
+    });
+    const key = first.getOrCreate("user-42");
+    const generationBefore = readFileSync(generationPath());
+
+    expect(sameBytes(first.get("user-42")!, key)).toBe(true);
+    expect(sameBytes(first.getOrCreate("user-42"), key)).toBe(true);
+
+    const restarted = createStore({
+      accountId: ACCOUNT,
+      home,
+      _nowSec: () => nowSec++,
+    });
+    expect(sameBytes(restarted.get("user-42")!, key)).toBe(true);
+    expect(sameBytes(restarted.getOrCreate("user-42"), key)).toBe(true);
+    expect(readFileSync(generationPath())).toEqual(generationBefore);
+    expect(restarted.generationOf("user-42")).toEqual({
+      epoch: 1,
+      rotatedAtSec: 1_700_000_000,
+    });
   });
 
   it("persists a __proto__ peerId as an own key across instances", () => {

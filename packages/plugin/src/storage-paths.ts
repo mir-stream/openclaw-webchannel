@@ -17,6 +17,8 @@ export const LEGACY_STORAGE_ROOT_NAME = ".openclaw-webchannel";
 
 export const CREDENTIAL_FILE_NAME = "credentials.json";
 export const CONVERSATION_KEY_FILE_NAME = "conversation-keys.json";
+export const CONVERSATION_KEY_GENERATIONS_FILE_NAME =
+  "conversation-key-generations.json";
 
 export type TupleStoragePathOptions = StorageScopeIdentity & {
   /** Common v2 root for both tuple-scoped secret-bearing stores. */
@@ -32,6 +34,7 @@ export type TupleStoragePaths = Readonly<{
   directory: string;
   credentialPath: string;
   conversationKeyPath: string;
+  conversationKeyGenerationsPath: string;
 }>;
 
 export type CredentialPathOptions = TupleStoragePathOptions & {
@@ -77,6 +80,10 @@ export function tupleStoragePaths(
     directory,
     credentialPath: join(directory, CREDENTIAL_FILE_NAME),
     conversationKeyPath: join(directory, CONVERSATION_KEY_FILE_NAME),
+    conversationKeyGenerationsPath: join(
+      directory,
+      CONVERSATION_KEY_GENERATIONS_FILE_NAME,
+    ),
   });
 }
 
